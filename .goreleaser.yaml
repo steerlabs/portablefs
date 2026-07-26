@@ -1,0 +1,97 @@
+version: 2
+
+project_name: portablefs
+
+builds:
+  - id: portablefs
+    dir: vcs
+    main: ./cmd/portablefs
+    binary: portablefs
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+  - id: vcs
+    dir: vcs
+    main: ./cmd/vcs
+    binary: vcs
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+
+  - id: portablefs-mount
+    dir: vcs
+    main: ./cmd/mount
+    binary: portablefs-mount
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+
+  - id: fsio
+    dir: vcs
+    main: ./cmd/fsio
+    binary: fsio
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+
+  - id: portablefsd
+    dir: vcs
+    main: ./cmd/portablefsd
+    binary: portablefsd
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: portablefs
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+brews:
+  - name: portablefs
+    repository:
+      owner: steerlabs
+      name: homebrew-tap
+    directory: Formula
+    homepage: https://github.com/steerlabs/portablefs-oss
+    description: "Live, durable, branchable network filesystem for AI agent workspaces"
+    install: |
+      bin.install "portablefs"
+      # portablefs mount discovers this daemon as a sibling of the CLI.
+      bin.install "portablefsd"
+    test: |
+      system "#{bin}/portablefs", "version"
+    skip_upload: auto
+
+changelog:
+  # git history, not the GitHub compare API: the API path infers the repo from
+  # the origin remote, which in dev checkouts points at the internal repo.
+  use: git
+
+release:
+  draft: true
+  # Pin the target explicitly: this checkout can be a worktree whose origin
+  # remote points at a different repository, and goreleaser must never infer
+  # the release destination from that.
+  github:
+    owner: steerlabs
+    name: portablefs-oss

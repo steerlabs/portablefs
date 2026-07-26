@@ -1,0 +1,75 @@
+import Foundation
+
+enum MountCommandError: Error, CustomStringConvertible {
+    case failed(command: String, exitCode: Int32, output: String)
+
+    var description: String {
+        switch self {
+        case let .failed(command, exitCode, output):
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "`\(command)` exited \(exitCode)" + (trimmed.isEmpty ? "" : ":\n\(trimmed)")
+        }
+    }
+}
+
+/// Kernel mount plumbing. The mount invocation is exactly the one the manual
+/// FSKit verification loop and the live 15-check battery use:
+/// `/sbin/mount -t portablefs pfs://<attachRef> <mountPath>`.
+enum MountCommand {
+    static func mount(attachRef: String, mountPath: String) async throws {
+        try await run(["/sbin/mount", "-t", "portablefs", "pfs://\(attachRef)", mountPath])
+    }
+
+    /// `/sbin/umount` first, `diskutil unmount` as fallback — the same
+    /// attempt order as the Go CLI's platformUnmount for darwin.
+    static func unmount(mountPath: String) async throws {
+        do {
+            try await run(["/sbin/umount", mountPath])
+        } catch {
+            do {
+                try await run(["/usr/sbin/diskutil", "unmount", mountPath])
+            } catch let diskutilError {
+                throw MountCommandError.failed(
+                    command: "umount + diskutil unmount \(mountPath)",
+                    exitCode: 1,
+                    output: "\(error)\n\(diskutilError)"
+                )
+            }
+        }
+    }
+
+    private static func run(_ argv: [String]) async throws {
+        let result = await capture(argv)
+        guard result.exitCode == 0 else {
+            throw MountCommandError.failed(
+                command: argv.joined(separator: " "),
+                exitCode: result.exitCode,
+                output: result.output
+            )
+        }
+    }
+
+    private static func capture(_ argv: [String]) async -> (exitCode: Int32, output: String) {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: argv[0])
+            process.arguments = Array(argv.dropFirst())
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            process.terminationHandler = { finished in
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                continuation.resume(returning: (
+                    finished.terminationStatus,
+                    String(data: data, encoding: .utf8) ?? ""
+                ))
+            }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(returning: (127, String(describing: error)))
+            }
+        }
+    }
+}

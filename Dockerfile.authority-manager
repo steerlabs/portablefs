@@ -1,0 +1,72 @@
+# node:22-bookworm
+FROM node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37 AS authority-manager-build
+WORKDIR /app
+
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY apps/authority-manager/package.json apps/authority-manager/package.json
+COPY packages/protocol/package.json packages/protocol/package.json
+RUN pnpm install --frozen-lockfile --filter @portablefs/authority-manager...
+
+COPY apps/authority-manager apps/authority-manager
+COPY packages/protocol packages/protocol
+RUN pnpm --filter @portablefs/authority-manager... build
+
+# golang:1.26-bookworm
+FROM golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS vcs-build
+WORKDIR /src/vcs
+
+COPY vcs/go.mod vcs/go.sum ./
+RUN go mod download
+
+COPY vcs ./
+RUN CGO_ENABLED=0 go build -o /out/vcs ./cmd/vcs
+
+# node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runtime
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable
+
+# The manager has runtime workspace dependencies (@portablefs/protocol, zod),
+# so the runtime stage installs production node_modules like the other images.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/authority-manager/package.json apps/authority-manager/package.json
+COPY packages/protocol/package.json packages/protocol/package.json
+RUN pnpm install --prod --frozen-lockfile --filter @portablefs/authority-manager...
+
+COPY --from=authority-manager-build /app/apps/authority-manager/dist apps/authority-manager/dist
+COPY --from=authority-manager-build /app/packages/protocol/dist packages/protocol/dist
+COPY --from=vcs-build /out/vcs /usr/local/bin/vcs
+
+# Exact release identity baked by release tooling (served at
+# /v1/release-identity). Unset for local builds: the route answers 404, the
+# honest "unpinned dev image" signal.
+ARG PORTABLEFS_RELEASE_ID=""
+ARG PORTABLEFS_SOURCE_REVISION=""
+ENV PORTABLEFS_RELEASE_ID=${PORTABLEFS_RELEASE_ID} \
+    PORTABLEFS_SOURCE_REVISION=${PORTABLEFS_SOURCE_REVISION}
+
+# Production (journal-native) defaults. The deployment supplies the rest:
+# PORTABLEFS_MANAGER_CONTROL_DATABASE_URL, PORTABLEFS_MANAGED_VCS_JOURNAL_DSN,
+# PORTABLEFS_MANAGED_VCS_JOURNAL_HA_POLICY_JSON, the access-token root secret,
+# router listen/URL + TLS, and the volume-api URL/token.
+ENV NODE_ENV=production
+ENV PORTABLEFS_AUTHORITY_MODE=production
+ENV PORTABLEFS_MANAGED_VCS_BIN=/usr/local/bin/vcs
+
+EXPOSE 8788 2050
+
+WORKDIR /app/apps/authority-manager
+
+# Unprivileged runtime: the manager reads /app (root-owned, world-readable)
+# and spawns vcs children under os.tmpdir() (1777), so it needs no writable
+# image paths and no dedicated data directory.
+USER node
+
+ENTRYPOINT ["tini", "--"]
+CMD ["node", "dist/main.js"]

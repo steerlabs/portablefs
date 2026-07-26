@@ -1,0 +1,14 @@
+.git
+node_modules
+**/node_modules
+**/dist
+.env
+.env.*
+.volume-cache
+vcs-bin
+mount-bin
+portablefsd-bin
+nfsio-bin
+fsio-bin
+linux-bins
+*.wal

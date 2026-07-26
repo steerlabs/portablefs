@@ -1,0 +1,350 @@
+package fsproto
+
+// Client side of the managed (journaled) coordination protocol: lock,
+// checkout, checkin, open-pin, flush, and barrier mutations ride the SAME
+// exact session-slot machinery as tree mutations — one identity per decision,
+// definite replies commit the identity, transport failures replay the
+// IDENTICAL identity (an identity is NEVER reused after any send until a
+// durable outcome or replay resolves it), and every definite status —
+// EAGAIN, EBUSY, ENOENT, EDQUOT, ENOSPC included — is a durably recorded
+// outcome, so a later attempt uses a fresh slot sequence. There is no
+// unrecorded definite reply: when the authority cannot record durably, the
+// connection drops (UNKNOWN) and the identity parks for replay.
+
+import (
+	"errors"
+	"time"
+
+	"github.com/trendup-ai/portablefs/vcs/internal/wal"
+)
+
+// ErrLegacyAuthority reports a managed coordination call against an authority
+// that never negotiated exact sessions (legacy v1 server).
+var ErrLegacyAuthority = errors.New("fsproto: authority does not speak the exact session protocol")
+
+// serverManagedActive reports whether the authority negotiated the managed
+// journaled-coordination protocol for this client.
+func (c *Client) serverManagedActive() bool {
+	c.exactMu.RLock()
+	defer c.exactMu.RUnlock()
+	return c.serverManaged
+}
+
+// ServerManaged reports whether the authority negotiated managed journaled
+// coordination. Frontends use it to route locks, checkouts, and open pins
+// through the exact coordination surface.
+func (c *Client) ServerManaged() bool { return c.serverManagedActive() }
+
+// doCoordinate executes one coordination mutation under an exact identity
+// against a managed authority. It mirrors doExactOnce's transport contract;
+// EAGAIN/EBUSY are returned to the caller (definite, identity consumed —
+// retries use a fresh identity at the caller's cadence).
+func (c *Client) doCoordinate(req *Request) (*Response, error) {
+	if live, err := c.EnsureExactSession(); err != nil {
+		return nil, err
+	} else if !live {
+		return nil, ErrLegacyAuthority
+	}
+	es := c.exactState()
+	if es == nil || es.isFenced() {
+		return &Response{Status: ESTALE}, nil
+	}
+	slot, seq, err := es.acquire(opTimeout)
+	if err != nil {
+		return nil, err
+	}
+	req.Env = es.envelope(slot, seq)
+	if req.Owner == "" {
+		req.Owner = c.owner
+	}
+	sent := false
+	for attempt := 0; attempt < exactForegroundAttempts; attempt++ {
+		resp, wasSent, rerr := c.roundtripExact(req)
+		if rerr == nil {
+			c.finishExact(es, slot, seq, resp)
+			return resp, nil
+		}
+		sent = sent || wasSent
+		if !sent {
+			es.abort(slot)
+			if es.isFenced() {
+				return &Response{Status: ESTALE}, nil
+			}
+			return nil, rerr
+		}
+	}
+	c.parkExact(es, slot, seq, req)
+	return nil, ErrMutationUnknown
+}
+
+// LockManaged performs a managed (journaled, inode-keyed) lock operation.
+// handleIno is the open handle's stable inode (rename/unlink stable); zero
+// lets the authority resolve the path at decision time. Setlk/unlock are
+// non-blocking; Setlkw blocks server-side (volatile, bounded per RPC) and
+// returns a definite EAGAIN when the bounded wait expires — the caller
+// re-issues at its own cadence with a fresh identity.
+func (c *Client) LockManaged(path string, handleIno uint64, mode uint8, lkID, start, end uint64, write, unlock bool) (LockResult, error) {
+	if mode == LkGetlk {
+		r, err := c.Do(&Request{
+			Op: OpLock, Path: path, HandleIno: handleIno, Owner: c.owner,
+			LkMode: LkGetlk, LkID: lkID, LkStart: start, LkEnd: end, LkWrite: write,
+		})
+		if err != nil {
+			return LockResult{Status: EIO}, err
+		}
+		return LockResult{Status: r.Status, Conflict: r.LkConflict, CStart: r.LkStart, CEnd: r.LkEnd, CWrite: r.LkWrite}, nil
+	}
+	resp, err := c.doCoordinate(&Request{
+		Op: OpLock, Path: path, HandleIno: handleIno, Owner: c.owner,
+		LkMode: mode, LkID: lkID, LkStart: start, LkEnd: end, LkWrite: write, LkUnlock: unlock,
+	})
+	if err != nil {
+		return LockResult{Status: EIO}, err
+	}
+	return LockResult{Status: resp.Status}, nil
+}
+
+// CheckoutManaged acquires a managed checkout and returns its durable grant
+// epoch. A definite EBUSY reports the holder (best effort) with granted=false.
+func (c *Client) CheckoutManaged(path string) (granted bool, heldBy, epoch string, err error) {
+	resp, err := c.doCoordinate(&Request{Op: OpCheckout, Path: path, Owner: c.owner})
+	if err != nil {
+		return false, "", "", err
+	}
+	switch resp.Status {
+	case OK:
+		return true, "", resp.CheckoutEpoch, nil
+	case EBUSY:
+		return false, resp.Owner, "", nil
+	default:
+		return false, "", "", statusError("managed checkout", resp.Status)
+	}
+}
+
+// CheckinManaged releases the caller's managed checkout grant (path, epoch).
+// ENOENT (not the caller's live grant) is reported as an error.
+func (c *Client) CheckinManaged(path, epoch string) error {
+	resp, err := c.doCoordinate(&Request{Op: OpCheckin, Path: path, CheckoutEpoch: epoch, Owner: c.owner})
+	if err != nil {
+		return err
+	}
+	if resp.Status != OK {
+		return statusError("managed checkin", resp.Status)
+	}
+	return nil
+}
+
+// FlushBatchWriteBack ships one write-back session batch. Against a managed
+// (journal-native) authority it rides the mount's exact session under a flush
+// identity (doCoordinate), carrying the durable checkout grant (grantPath,
+// grantEpoch) the authority pins its per-grant flush watermark to — so a lost
+// reply replays the IDENTICAL identity and the server returns the stored
+// AppliedThrough (Duplicate) instead of re-applying. Against a legacy authority
+// it degrades to the envelope-less v1 watermark FlushBatch, unchanged.
+func (c *Client) FlushBatchWriteBack(writebackID string, epoch uint64, owner, grantPath, grantEpoch string, records []wal.Record) (uint64, int32, error) {
+	if !c.serverManagedActive() {
+		return c.FlushBatch(writebackID, epoch, owner, records)
+	}
+	resp, err := c.doCoordinate(&Request{
+		Op:            OpFlushBatch,
+		SessionID:     writebackID,
+		Epoch:         epoch,
+		Owner:         owner,
+		CheckoutPath:  grantPath,
+		CheckoutEpoch: grantEpoch,
+		Records:       records,
+	})
+	if err != nil {
+		return 0, EIO, err
+	}
+	return resp.AppliedThrough, resp.Status, nil
+}
+
+// MarkOpenManaged journals the durable open pin transition for ino.
+// ENOENT means the inode is gone (reaped): the open must fail.
+func (c *Client) MarkOpenManaged(ino uint64, open bool) (int32, error) {
+	resp, err := c.doCoordinate(&Request{Op: OpMarkOpen, OpenIno: ino, OpenState: open, Owner: c.owner})
+	if err != nil {
+		return EIO, err
+	}
+	return resp.Status, nil
+}
+
+// unmarkOpenBatchManaged releases a batch of open pins under ONE exact
+// identity (OpUnmarkOpenInodes) and does not return until that identity
+// RESOLVES — the stored outcome, a fence, or client teardown. It must never
+// park the identity with the background replayer: the open registry
+// serializes per-ino mark/unmark transitions on this call's return, so a
+// backgrounded unresolved release could execute AFTER a fresh MarkOpen of
+// the same ino and strip the new pin. Blocking here keeps the registry's
+// per-ino pending barrier spanning the whole resolution instead.
+func (c *Client) unmarkOpenBatchManaged(req *Request) (int32, error) {
+	if live, err := c.EnsureExactSession(); err != nil {
+		return EIO, err
+	} else if !live {
+		return EIO, ErrLegacyAuthority
+	}
+	es := c.exactState()
+	if es == nil || es.isFenced() {
+		return ESTALE, nil
+	}
+	slot, seq, err := es.acquire(opTimeout)
+	if err != nil {
+		return EIO, err
+	}
+	req.Env = es.envelope(slot, seq)
+	if req.Owner == "" {
+		req.Owner = c.owner
+	}
+	sent := false
+	backoff := parkRetryMin
+	for {
+		resp, wasSent, rerr := c.roundtripExact(req)
+		if rerr == nil {
+			c.finishExact(es, slot, seq, resp)
+			return resp.Status, nil
+		}
+		sent = sent || wasSent
+		if !sent {
+			// Nothing ever hit a connection: the identity is provably unused.
+			es.abort(slot)
+			if es.isFenced() {
+				return ESTALE, nil
+			}
+			return EIO, rerr
+		}
+		select {
+		case <-es.stop:
+			// Fenced with the identity unresolved: the slot retires with the
+			// session, and the authority releases every pin at the terminal.
+			return ESTALE, nil
+		case <-c.closed:
+			return EIO, rerr
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > parkRetryMax {
+			backoff = parkRetryMax
+		}
+	}
+}
+
+// Sync is the envelope-less durability + apply barrier (per-file fsync
+// semantics): it returns nil only after every journal row admitted before
+// the call is durable, applied, and its invalidations are published.
+func (c *Client) Sync() error {
+	deadline := time.Now().Add(opTimeout)
+	backoff := 100 * time.Millisecond
+	for {
+		r, err := c.Do(&Request{Op: OpFsync})
+		if err == nil && r.Status == OK {
+			return nil
+		}
+		if err == nil {
+			return statusError("sync barrier", r.Status)
+		}
+		// The barrier is idempotent (a pure wait): transport failures retry
+		// within the op budget.
+		if !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > time.Second {
+			backoff = time.Second
+		}
+	}
+}
+
+// SyncVolume is the VOLUME sync barrier: it (1) GATES new local mutations and
+// waits for every earlier and parked exact identity to resolve by holding the
+// whole slot budget, (2) submits one journaled control-only barrier row under
+// an exact identity, whose ordered apply proves every earlier journal row is
+// durable, applied, and published, then (3) releases the gate. Against a
+// legacy authority it degrades to the envelope-less barrier. Callers flush
+// their write-back sessions FIRST (the flush consumes slots itself).
+func (c *Client) SyncVolume() error {
+	if !c.serverManagedActive() {
+		return c.Sync()
+	}
+	es := c.exactState()
+	if es == nil {
+		live, err := c.EnsureExactSession()
+		if err != nil {
+			return err
+		}
+		if !live {
+			return c.Sync()
+		}
+		es = c.exactState()
+	}
+	if es.isFenced() {
+		return ErrSessionFenced
+	}
+	// GATE: acquire the whole slot budget. Every in-flight or parked
+	// identity must resolve first, and no new local mutation can start.
+	held := make([]uint32, 0, es.slots)
+	releaseHeld := func() {
+		for _, slot := range held {
+			es.avail <- slot
+		}
+		held = held[:0]
+	}
+	deadline := time.NewTimer(opTimeout)
+	defer deadline.Stop()
+	for uint32(len(held)) < es.slots {
+		select {
+		case slot := <-es.avail:
+			held = append(held, slot)
+		case <-es.stop:
+			releaseHeld()
+			return ErrSessionFenced
+		case <-deadline.C:
+			releaseHeld()
+			return statusError("volume barrier gate timed out awaiting outstanding identities", EAGAIN)
+		}
+	}
+	defer releaseHeld()
+
+	// The barrier identity rides one of the held slots; the gate stays
+	// closed until the barrier resolves.
+	slot := held[0]
+	es.mu.Lock()
+	seq := es.seq[slot] + 1
+	es.mu.Unlock()
+	req := &Request{Op: OpFsync, Env: es.envelope(slot, seq), Owner: c.owner}
+	sent := false
+	for attempt := 0; attempt < exactForegroundAttempts; attempt++ {
+		resp, wasSent, rerr := c.roundtripExact(req)
+		if rerr == nil {
+			es.mu.Lock()
+			es.seq[slot] = seq // consumed; the deferred release re-opens the gate
+			fenced := es.fenced
+			es.mu.Unlock()
+			switch {
+			case resp.Status == OK:
+				return nil
+			case resp.Status == ESTALE:
+				if !fenced {
+					es.fence()
+				}
+				return ErrSessionFenced
+			default:
+				return statusError("volume barrier", resp.Status)
+			}
+		}
+		sent = sent || wasSent
+		if !sent {
+			return rerr
+		}
+	}
+	// UNKNOWN: the barrier identity parks and replays; the slot must stay
+	// out of the pool until it resolves, so hand it to the replayer instead
+	// of the deferred release.
+	for i, s := range held {
+		if s == slot {
+			held = append(held[:i], held[i+1:]...)
+			break
+		}
+	}
+	c.parkExact(es, slot, seq, req)
+	return ErrMutationUnknown
+}
