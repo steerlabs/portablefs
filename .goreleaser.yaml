@@ -66,20 +66,17 @@ archives:
 checksum:
   name_template: checksums.txt
 
-brews:
+homebrew_casks:
   - name: portablefs
     repository:
       owner: steerlabs
       name: homebrew-tap
-    directory: Formula
     homepage: https://github.com/steerlabs/portablefs
     description: "Live, durable, branchable network filesystem for AI agent workspaces"
-    install: |
-      bin.install "portablefs"
-      # portablefs mount discovers this daemon as a sibling of the CLI.
-      bin.install "portablefsd"
-    test: |
-      system "#{bin}/portablefs", "version"
+    # The CLI discovers portablefsd as a sibling binary, so the cask links both.
+    binaries:
+      - portablefs
+      - portablefsd
     skip_upload: auto
 
 changelog:
