@@ -1,0 +1,61 @@
+name: Bug report
+description: Report incorrect behavior, a crash, data loss, or a coherence violation
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. For suspected security vulnerabilities, do NOT
+        open a public issue — follow [SECURITY.md](../blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+      placeholder: A clear description of the bug and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps (commands, mount ops, workload) to reproduce.
+      placeholder: |
+        1. portablefs mount ...
+        2. ...
+        3. observed ...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - VCS data plane (authority / journal / WAL)
+        - Mount client (Linux FUSE)
+        - Mount client (macOS FSKit / portablefsd)
+        - volume-api
+        - authority-manager
+        - CLI
+        - Docs
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + arch, mount transport, deployment shape (production flags, TLS, self-hosted vs quickstart), and version / commit.
+      placeholder: |
+        - OS/arch: macOS 15 arm64 / Ubuntu 24.04 amd64
+        - Transport: FSKit / FUSE
+        - Deployment: quickstart / self-hosted (production mode?)
+        - Version or commit:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant logs (redact secrets). Include the x-portablefs-request-id if you have one.
+      render: text

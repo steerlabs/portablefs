@@ -1,0 +1,34 @@
+# golang:1.26-bookworm
+FROM golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS history-worker-build
+WORKDIR /src/vcs
+
+COPY vcs/go.mod vcs/go.sum ./
+RUN go mod download
+
+COPY vcs ./
+RUN CGO_ENABLED=0 go build -o /out/history-worker ./cmd/history-worker
+
+# debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=history-worker-build /out/history-worker /usr/local/bin/history-worker
+
+# Unprivileged runtime user (fixed uid 10001: Dockerfile.volume-api chowns
+# the shared quickstart history dir to this uid). The exact-key store root
+# is created and chowned BEFORE USER so a FRESH named volume mounted at
+# /data/blobs (or /data/blobs/history) inherits worker-writable ownership.
+RUN useradd --system --uid 10001 --user-group portablefs \
+    && mkdir -p /data/blobs/history \
+    && chown -R portablefs:portablefs /data
+USER portablefs
+
+# Health/metrics listener (PFH_WORKER_LISTEN_ADDR): /healthz, /readyz,
+# /metrics. There is deliberately no data-plane surface on the worker.
+EXPOSE 8790
+
+ENTRYPOINT ["tini", "--"]
+CMD ["history-worker"]

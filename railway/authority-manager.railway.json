@@ -1,0 +1,15 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile.authority-manager"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "healthcheckPath": "/readyz",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "drainingSeconds": 60
+  }
+}

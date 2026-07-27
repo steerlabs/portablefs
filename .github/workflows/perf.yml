@@ -1,0 +1,89 @@
+name: perf
+
+# Advisory performance tracking: the quick pfsbench profile + a short
+# pfstorture crash-durability loop, on demand and weekly. It never runs on
+# pull requests and the job is continue-on-error, so it can never block a
+# merge; its output is the uploaded results JSON + the step-summary tables.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+# At most one bench run at a time; let an in-flight run finish (results are
+# advisory and a half-cancelled torture loop wastes the whole run).
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+
+      - name: Build harness
+        run: |
+          go -C vcs build -o "$RUNNER_TEMP/pfsbench" ./bench/cmd/pfsbench
+          go -C vcs build -o "$RUNNER_TEMP/pfstorture" ./bench/cmd/pfstorture
+          go -C vcs build -o "$RUNNER_TEMP/pfsmount" ./cmd/mount
+
+      - name: Quick profile (local baseline + core transport)
+        working-directory: vcs
+        run: |
+          "$RUNNER_TEMP/pfsbench" run -transport local -profile quick -n 2 -label default -out bench/results/quick-default-local.json
+          "$RUNNER_TEMP/pfsbench" run -transport core -profile quick -n 2 -label default -out bench/results/quick-default-core.json
+          "$RUNNER_TEMP/pfsbench" run -transport core -profile quick -n 2 -writeback -label writeback -out bench/results/quick-writeback-core.json
+          "$RUNNER_TEMP/pfsbench" run -transport core -profile quick -n 2 -negcache -label negcache -out bench/results/quick-negcache-core.json
+          "$RUNNER_TEMP/pfsbench" run -transport core -profile quick -n 2 -writeback -negcache -label writeback-neg -out bench/results/quick-writeback-neg-core.json
+
+      - name: FUSE availability
+        id: fuse
+        run: |
+          if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+            echo "ok=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Quick profile (fuse transport)
+        if: steps.fuse.outputs.ok == 'true'
+        working-directory: vcs
+        env:
+          PFSBENCH_MOUNT_ONLY: skip # belt and braces: skip, don't fail, if the mount can't start
+        run: |
+          "$RUNNER_TEMP/pfsbench" run -transport fuse -mount-bin "$RUNNER_TEMP/pfsmount" -profile quick -n 2 -label default -out bench/results/quick-default-fuse.json
+          "$RUNNER_TEMP/pfsbench" run -transport fuse -mount-bin "$RUNNER_TEMP/pfsmount" -profile quick -n 2 -writeback -negcache -label writeback-neg -out bench/results/quick-writeback-neg-fuse.json
+
+      - name: Torture (kill -9 crash durability, K=3)
+        working-directory: vcs
+        run: |
+          "$RUNNER_TEMP/pfstorture" -serve-bin "$RUNNER_TEMP/pfsbench" -k 3 -out bench/results/torture-ci.json
+
+      - name: Report
+        if: always()
+        working-directory: vcs
+        run: |
+          "$RUNNER_TEMP/pfsbench" report -dir bench/results | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: vcs/bench/results/*.json
+          if-no-files-found: warn

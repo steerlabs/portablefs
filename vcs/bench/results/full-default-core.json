@@ -1,0 +1,216 @@
+{
+  "label": "default",
+  "transport": "core",
+  "profile": {
+    "name": "full",
+    "w1Files": 10000,
+    "w1Dirs": 500,
+    "w2Files": 5000,
+    "w2Dirs": 100,
+    "w2ProbeMiss": 2000,
+    "w2ProbeIter": 3,
+    "w3Appends": 1000,
+    "w3ChunkB": 256,
+    "w5MiB": 256
+  },
+  "n": 3,
+  "config": {
+    "writeBack": false,
+    "negativeCache": false,
+    "noReaddirPlus": false,
+    "flushMs": 250,
+    "flushMaxRecords": 0,
+    "flushMaxBytes": 0,
+    "sessionTTLMs": 0,
+    "pool": 16
+  },
+  "machine": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "numCPU": 18,
+    "goVersion": "go1.26.2",
+    "cpu": "Apple M5 Max",
+    "memBytes": 137438953472,
+    "hostname": "redacted"
+  },
+  "startedAt": "2026-07-03T20:34:02.253772-07:00",
+  "phases": [
+    {
+      "workload": "W1",
+      "phase": "walk_cold",
+      "runsSec": [
+        0.022863042,
+        0.024053041,
+        0.037450417
+      ],
+      "p50Sec": 0.024053041,
+      "ops": 10500,
+      "opsPerSec": 436535.23893298977,
+      "rpcs": 500,
+      "serverOps": {
+        "readdir": 500
+      },
+      "note": "fresh client caches per run"
+    },
+    {
+      "workload": "W1",
+      "phase": "walk_warm",
+      "runsSec": [
+        0.001455167,
+        0.001455833,
+        0.001619084
+      ],
+      "p50Sec": 0.001455833,
+      "ops": 10500,
+      "opsPerSec": 7212365.704033362,
+      "note": "immediately after a cold walk"
+    },
+    {
+      "workload": "W2",
+      "phase": "storm_visible",
+      "runsSec": [
+        38.324186667,
+        38.378855333,
+        39.013911375
+      ],
+      "p50Sec": 38.378855333,
+      "ops": 5000,
+      "opsPerSec": 130.28007106039865,
+      "rpcs": 25101,
+      "serverOps": {
+        "create": 5000,
+        "getattr": 5000,
+        "mark_open": 10000,
+        "mkdir": 101,
+        "write": 5000
+      },
+      "note": "create+write returned"
+    },
+    {
+      "workload": "W2",
+      "phase": "storm_durable",
+      "runsSec": [
+        3.75e-7,
+        5.42e-7,
+        6.25e-7
+      ],
+      "p50Sec": 5.42e-7,
+      "ops": 5000,
+      "opsPerSec": 9225092250.92251,
+      "note": "durability barrier after storm"
+    },
+    {
+      "workload": "W2",
+      "phase": "probe_miss",
+      "runsSec": [
+        0.110721458,
+        0.124189792,
+        0.133479208
+      ],
+      "p50Sec": 0.124189792,
+      "ops": 6000,
+      "opsPerSec": 48313.149602505175,
+      "rpcs": 6000,
+      "serverOps": {
+        "getattr": 6000
+      },
+      "note": "lstat storm on missing names in existing dirs"
+    },
+    {
+      "workload": "W3",
+      "phase": "append",
+      "runsSec": [
+        3.532833709,
+        3.663163542,
+        3.702769375
+      ],
+      "p50Sec": 3.663163542,
+      "ops": 1000,
+      "opsPerSec": 272.98808489834005,
+      "rpcs": 1004,
+      "serverOps": {
+        "create": 1,
+        "getattr": 1,
+        "mark_open": 2,
+        "write": 1000
+      },
+      "note": "sequential appends to one log"
+    },
+    {
+      "workload": "W4",
+      "phase": "grep_cold",
+      "runsSec": [
+        0.944206292,
+        0.951614958,
+        0.995510375
+      ],
+      "p50Sec": 0.951614958,
+      "ops": 10000,
+      "opsPerSec": 10508.451885851926,
+      "rpcs": 40000,
+      "serverOps": {
+        "getattr": 10000,
+        "mark_open": 20000,
+        "read": 10000
+      },
+      "note": "fresh client caches per run"
+    },
+    {
+      "workload": "W4",
+      "phase": "grep_warm",
+      "runsSec": [
+        0.686222541,
+        0.69512225,
+        0.708774708
+      ],
+      "p50Sec": 0.69512225,
+      "ops": 10000,
+      "opsPerSec": 14385.958728842299,
+      "rpcs": 30000,
+      "serverOps": {
+        "mark_open": 20000,
+        "read": 10000
+      },
+      "note": "immediately after a cold scan"
+    },
+    {
+      "workload": "W5",
+      "phase": "write_seq",
+      "runsSec": [
+        1.068157958,
+        1.074103792,
+        1.113697875
+      ],
+      "p50Sec": 1.074103792,
+      "ops": 256,
+      "opsPerSec": 238.3382331453495,
+      "rpcs": 260,
+      "serverOps": {
+        "create": 1,
+        "getattr": 1,
+        "mark_open": 2,
+        "write": 256
+      },
+      "note": "1MiB chunks + durability barrier"
+    },
+    {
+      "workload": "W5",
+      "phase": "read_seq_cold",
+      "runsSec": [
+        0.161922833,
+        0.164717625,
+        0.1808555
+      ],
+      "p50Sec": 0.164717625,
+      "ops": 256,
+      "opsPerSec": 1554.1749099405724,
+      "rpcs": 259,
+      "serverOps": {
+        "getattr": 1,
+        "mark_open": 2,
+        "read": 256
+      },
+      "note": "fresh client caches; 1MiB chunks"
+    }
+  ]
+}

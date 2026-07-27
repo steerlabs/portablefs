@@ -1,0 +1,46 @@
+name: dco
+
+# Enforces the Developer Certificate of Origin that CONTRIBUTING.md requires:
+# every commit in a pull request must carry a `Signed-off-by:` trailer
+# (`git commit -s`). Pure git + shell, no third-party actions.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  signoff:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base..head commit range is resolvable.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Every commit is signed off (DCO)
+        # SHAs flow through env, never interpolated into the script body, so a
+        # crafted ref can never inject shell (they are hex anyway).
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            if ! git log -1 --format='%B' "${sha}" \
+              | grep -qiE '^Signed-off-by: .+ <[^@ ]+@[^@ ]+>'; then
+              echo "::error::commit ${sha} is missing a Signed-off-by trailer"
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "All commits must be signed off (git commit -s). See CONTRIBUTING.md#sign-your-work-dco."
+            exit 1
+          fi
+          echo "DCO: all commits are signed off."

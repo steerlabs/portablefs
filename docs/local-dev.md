@@ -1,0 +1,124 @@
+# Local Development
+
+Run the normal local suite:
+
+```bash
+pnpm install
+pnpm build
+pnpm test
+pnpm typecheck
+pnpm verify
+```
+
+`pnpm verify` is the broad local gate: frozen install, TypeScript build/test/typecheck, Go VCS
+tests, Go vet, VCS race tests, the manifest-index benchmark, and stale architecture reference scan.
+
+Run only the VCS mount/runtime suite:
+
+```bash
+pnpm vcs:build
+pnpm vcs:test
+pnpm vcs:test:race
+```
+
+Run the TypeScript API packages against local Postgres:
+
+```bash
+docker compose up -d postgres
+export VOLUME_DATABASE_URL=postgres://postgres:postgres@localhost:5432/portablefs
+export VOLUME_DATABASE_CONNECT_TIMEOUT_MS=10000
+pnpm test:postgres
+```
+
+Or let the repo start and clean up local Postgres for you:
+
+```bash
+pnpm verify:postgres
+```
+
+Run against a real Railway Bucket:
+
+```bash
+docker compose up -d postgres
+export VOLUME_DATABASE_URL=postgres://postgres:postgres@localhost:5432/portablefs
+export VOLUME_DATABASE_CONNECT_TIMEOUT_MS=10000
+set -a
+eval "$(railway bucket credentials --bucket portablefs-blobs)"
+set +a
+export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
+pnpm test:railway-bucket
+```
+
+See [railway-buckets.md](./railway-buckets.md) for the full bucket setup.
+
+## Run The API Locally
+
+Use filesystem blob storage for a fully local PortableFS stack:
+
+```bash
+docker compose up -d postgres
+export VOLUME_DATABASE_URL=postgres://postgres:postgres@localhost:5432/portablefs
+export VOLUME_API_TOKEN=local-admin-token
+export VOLUME_BLOB_STORE=filesystem
+export VOLUME_FILESYSTEM_BLOB_ROOT="$HOME/.local/share/portablefs/blobs"
+pnpm --filter @portablefs/volume-api dev
+```
+
+Provision a local tenant token for agents or VCS:
+
+```bash
+curl -X POST http://localhost:8787/v1/admin/tenants \
+  -H "authorization: Bearer local-admin-token" \
+  -H "content-type: application/json" \
+  -d '{"tenantId":"local","token":"local-tenant-token","label":"local-dev"}'
+```
+
+Railway Bucket remains the default blob backend when `VOLUME_BLOB_STORE` is not
+set. `VOLUME_BLOB_STORE=s3` is the canonical name for the same S3-compatible
+store (`railway-bucket` keeps working as an alias):
+
+```bash
+export VOLUME_DATABASE_URL=postgres://postgres:postgres@localhost:5432/portablefs
+set -a
+eval "$(railway bucket credentials --bucket portablefs-blobs)"
+set +a
+export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
+pnpm --filter @portablefs/volume-api dev
+```
+
+## Run A Writable VCS
+
+Build the server and mount client:
+
+```bash
+go build -C vcs -o ../vcs-bin ./cmd/vcs
+go build -C vcs -o ../mount-bin ./cmd/mount
+```
+
+Start a writable authority:
+
+```bash
+VCS_WRITABLE=1 \
+VOLUME_API_URL=http://localhost:8787 \
+VOLUME_API_TOKEN=<token> \
+VCS_VOLUME_ID=vol_... \
+VCS_ADDR=127.0.0.1:2049 \
+VCS_FS_ADDR=127.0.0.1:2050 \
+./vcs-bin
+```
+
+Mount it through the custom protocol:
+
+```bash
+mkdir -p /mnt/vol
+./mount-bin -addr 127.0.0.1:2050 -mount /mnt/vol
+```
+
+Run agents and tools inside `/mnt/vol`. That mounted filesystem is the live source of truth for
+the active volume.
+
+Production mounts use the same command shape, but set `VCS_TLS_CA` and `VCS_AUTH_TOKEN` so the
+client verifies and authenticates to the VCS authority.
+
+For NFS mounting, the managed journal child, TLS/auth, metrics, and real-backend VCS tests, see
+[../vcs/README.md](../vcs/README.md).

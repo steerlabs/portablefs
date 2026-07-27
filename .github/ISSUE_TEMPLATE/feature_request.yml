@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a capability, API, or behavior change
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and why is it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like PortableFS to do? Sketch the API/CLI/behavior if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you have tried or other designs you weighed.
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This preserves the single-active-authority / read-after-write coherence model (see the README "What PortableFS Is Not").
+        - label: I have checked this is not already tracked by an existing issue.

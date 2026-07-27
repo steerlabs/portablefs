@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege by default; each job asks only for what it publishes.
+permissions:
+  contents: read
+
+# One release pipeline per tag; never cancel a publish in flight.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-24.04
+    # Gates publishing behind the `release` GitHub environment. Required
+    # reviewers / deployment branch+tag policies must be configured on that
+    # environment in the repository settings.
+    environment: release
+    permissions:
+      contents: write # create the GitHub release + upload archives
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # goreleaser needs full history for the changelog
+          persist-credentials: false # release auth flows via GITHUB_TOKEN env below
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          # Exact pin (not a "~> v2" moving band) so a tagged release builds with
+          # a known GoReleaser; bump deliberately.
+          version: "2.17.1"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    runs-on: ubuntu-24.04
+    # Gates publishing behind the `release` GitHub environment. Required
+    # reviewers / deployment branch+tag policies must be configured on that
+    # environment in the repository settings.
+    environment: release
+    permissions:
+      contents: read
+      packages: write # push images to ghcr.io
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: portablefs-volume-api
+            dockerfile: Dockerfile.volume-api
+          - image: portablefs-volume-worker
+            dockerfile: Dockerfile.volume-worker
+          - image: portablefs-authority-manager
+            dockerfile: Dockerfile.authority-manager
+          - image: portablefs-history-worker
+            dockerfile: Dockerfile.history-worker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Lowercase image owner (ghcr requires it)
+        id: owner
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}:${{ github.ref_name }}
+            ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}:latest
+          build-args: |
+            PORTABLEFS_RELEASE_ID=${{ github.ref_name }}
+            PORTABLEFS_SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

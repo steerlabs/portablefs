@@ -1,0 +1,128 @@
+{
+  "k": 10,
+  "passed": 10,
+  "runs": [
+    {
+      "iteration": 0,
+      "seed": 42,
+      "killAfterMs": 166,
+      "ackedCreates": 15,
+      "ackedWrites": 14,
+      "ackedBytes": 117500,
+      "appendAckedChunks": 2,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.004796708,
+      "ok": true
+    },
+    {
+      "iteration": 1,
+      "seed": 43,
+      "killAfterMs": 1538,
+      "ackedCreates": 180,
+      "ackedWrites": 179,
+      "ackedBytes": 1447001,
+      "appendAckedChunks": 35,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.02196025,
+      "ok": true
+    },
+    {
+      "iteration": 2,
+      "seed": 44,
+      "killAfterMs": 2286,
+      "ackedCreates": 173,
+      "ackedWrites": 173,
+      "ackedBytes": 1480485,
+      "appendAckedChunks": 34,
+      "stormCompletedBeforeKill": true,
+      "verifySec": 0.02239225,
+      "ok": true
+    },
+    {
+      "iteration": 3,
+      "seed": 45,
+      "killAfterMs": 720,
+      "ackedCreates": 76,
+      "ackedWrites": 75,
+      "ackedBytes": 653932,
+      "appendAckedChunks": 15,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.010368834,
+      "ok": true
+    },
+    {
+      "iteration": 4,
+      "seed": 46,
+      "killAfterMs": 2882,
+      "ackedCreates": 171,
+      "ackedWrites": 171,
+      "ackedBytes": 1581131,
+      "appendAckedChunks": 34,
+      "stormCompletedBeforeKill": true,
+      "verifySec": 0.021824709,
+      "ok": true
+    },
+    {
+      "iteration": 5,
+      "seed": 47,
+      "killAfterMs": 1076,
+      "ackedCreates": 121,
+      "ackedWrites": 121,
+      "ackedBytes": 1026650,
+      "appendAckedChunks": 24,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.016941167,
+      "ok": true
+    },
+    {
+      "iteration": 6,
+      "seed": 48,
+      "killAfterMs": 2380,
+      "ackedCreates": 177,
+      "ackedWrites": 177,
+      "ackedBytes": 1561551,
+      "appendAckedChunks": 35,
+      "stormCompletedBeforeKill": true,
+      "verifySec": 0.022229709,
+      "ok": true
+    },
+    {
+      "iteration": 7,
+      "seed": 49,
+      "killAfterMs": 785,
+      "ackedCreates": 85,
+      "ackedWrites": 84,
+      "ackedBytes": 714289,
+      "appendAckedChunks": 16,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.012492083,
+      "ok": true
+    },
+    {
+      "iteration": 8,
+      "seed": 50,
+      "killAfterMs": 1213,
+      "ackedCreates": 136,
+      "ackedWrites": 136,
+      "ackedBytes": 1199613,
+      "appendAckedChunks": 27,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.017517958,
+      "ok": true
+    },
+    {
+      "iteration": 9,
+      "seed": 51,
+      "killAfterMs": 1516,
+      "ackedCreates": 142,
+      "ackedWrites": 141,
+      "ackedBytes": 1195227,
+      "appendAckedChunks": 28,
+      "stormCompletedBeforeKill": false,
+      "verifySec": 0.01878425,
+      "ok": true
+    }
+  ],
+  "started": "2026-07-03T20:25:40.166139-07:00",
+  "finished": "2026-07-03T20:25:52.771799-07:00"
+}

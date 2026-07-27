@@ -1,0 +1,371 @@
+// pfslocal v1 — the local frontend protocol between portablefsd (Go daemon) and
+// filesystem frontends (the macOS FSKit extension today; anything else tomorrow).
+//
+// Transport: a SOCK_STREAM Unix domain socket. Every frame is a 4-byte
+// little-endian unsigned length N (N <= 16 MiB) followed by N bytes encoding one
+// Envelope. Client→daemon envelopes carry request bodies with a nonzero,
+// client-chosen, strictly-increasing request_id. Daemon→client envelopes either
+// echo a request_id (exactly one reply per request) or carry request_id 0 for
+// server-initiated Events. Requests may be pipelined; replies may arrive out of
+// order. Read/Write data rides inside frames (no side channel) — the daemon is
+// loopback, so the copy is cheap relative to correctness.
+//
+// Versioning: Hello/HelloReply negotiate {major, minor}. Same major = wire
+// compatible; unknown fields are ignored (proto3). Breaking changes bump major
+// and the daemon serves both during a deprecation window.
+//
+// Identity model: items are addressed by (item_id, item_generation) — the
+// authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
+// treats them as opaque. attach_ref is an opaque string minted by the daemon's
+// control API (EnsureAttach); it carries no secrets and is safe to appear in a
+// mount URL / logs.
+
+syntax = "proto3";
+
+package pfslocal.v1;
+
+option go_package = "github.com/steerlabs/portablefs/vcs/internal/pfslocal/pfslocalpb";
+option swift_prefix = "Pfs";
+
+// ---------- envelope ----------
+
+message Envelope {
+  uint64 request_id = 1;
+  oneof body {
+    // client → daemon
+    Hello hello = 10;
+    ResolveRequest resolve = 11;
+    LookupRequest lookup = 12;
+    EnumerateRequest enumerate = 13;
+    GetAttrRequest get_attr = 14;
+    SetAttrRequest set_attr = 15;
+    OpenRequest open = 16;
+    CloseRequest close = 17;
+    ReadRequest read = 18;
+    WriteRequest write = 19;
+    CreateRequest create = 20;
+    MkdirRequest mkdir = 21;
+    RemoveRequest remove = 22;
+    RenameRequest rename = 23;
+    SymlinkRequest symlink = 24;
+    ReadlinkRequest readlink = 25;
+    XattrGetRequest xattr_get = 26;
+    XattrSetRequest xattr_set = 27;
+    XattrListRequest xattr_list = 28;
+    XattrRemoveRequest xattr_remove = 29;
+    StatfsRequest statfs = 30;
+    FsyncRequest fsync = 31;
+    ReclaimRequest reclaim = 32;
+    SubscribeEventsRequest subscribe_events = 33;
+    HardLinkRequest hard_link = 34;
+
+    // daemon → client (replies)
+    HelloReply hello_reply = 60;
+    ResolveReply resolve_reply = 61;
+    LookupReply lookup_reply = 62;
+    EnumerateReply enumerate_reply = 63;
+    GetAttrReply get_attr_reply = 64;
+    SetAttrReply set_attr_reply = 65;
+    OpenReply open_reply = 66;
+    CloseReply close_reply = 67;
+    ReadReply read_reply = 68;
+    WriteReply write_reply = 69;
+    CreateReply create_reply = 70;
+    MkdirReply mkdir_reply = 71;
+    RemoveReply remove_reply = 72;
+    RenameReply rename_reply = 73;
+    SymlinkReply symlink_reply = 74;
+    ReadlinkReply readlink_reply = 75;
+    XattrGetReply xattr_get_reply = 76;
+    XattrSetReply xattr_set_reply = 77;
+    XattrListReply xattr_list_reply = 78;
+    XattrRemoveReply xattr_remove_reply = 79;
+    StatfsReply statfs_reply = 80;
+    FsyncReply fsync_reply = 81;
+    ReclaimReply reclaim_reply = 82;
+    SubscribeEventsReply subscribe_events_reply = 83;
+    HardLinkReply hard_link_reply = 84;
+
+    // daemon → client (either)
+    ErrorReply error = 90;   // reply position: op failed with errno
+    Event event = 91;        // request_id 0: server-initiated
+  }
+}
+
+// ---------- session ----------
+
+message Hello {
+  uint32 protocol_major = 1; // 1
+  uint32 protocol_minor = 2; // 0
+  string client_name = 3;    // e.g. "fskit-appex"
+  string client_version = 4;
+}
+
+message HelloReply {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string daemon_version = 3;
+}
+
+// Resolve binds this connection to one attach. All subsequent item ops on the
+// connection are scoped to it. One attach per connection; the extension opens
+// one connection per mounted volume (plus one for events if it prefers).
+message ResolveRequest {
+  string attach_ref = 1;
+}
+
+message ResolveReply {
+  Item root = 1;
+  Attr root_attr = 2;
+  string volume_id = 3;
+  string branch = 4;
+  string volume_name = 5;      // display name for the mounted volume
+  Capabilities capabilities = 6;
+}
+
+message Capabilities {
+  bool symlinks = 1;
+  bool hard_links = 2;
+  bool xattrs = 3;
+  bool case_sensitive = 4;
+  uint32 max_name_bytes = 5;    // e.g. 255
+  uint64 max_file_size = 6;     // 0 = unlimited/unknown
+  uint32 preferred_io_bytes = 7; // daemon's preferred read/write chunk, e.g. 1 MiB
+}
+
+// ---------- core types ----------
+
+message Item {
+  uint64 item_id = 1;         // authority ino
+  uint64 item_generation = 2; // guards against ino reuse
+}
+
+enum ItemKind {
+  ITEM_KIND_UNSPECIFIED = 0;
+  ITEM_KIND_FILE = 1;
+  ITEM_KIND_DIRECTORY = 2;
+  ITEM_KIND_SYMLINK = 3;
+}
+
+message Attr {
+  Item item = 1;
+  ItemKind kind = 2;
+  uint32 mode = 3;      // permission bits only (kind is separate)
+  uint32 nlink = 4;
+  uint32 uid = 5;
+  uint32 gid = 6;
+  uint64 size = 7;
+  int64 mtime_ms = 8;
+  int64 ctime_ms = 9;
+  int64 atime_ms = 10;
+  int64 birthtime_ms = 11;
+  uint64 content_version = 12; // coherence version; bumps on content change
+}
+
+// errno values use the darwin numbering (the daemon translates); message is for logs only.
+message ErrorReply {
+  int32 errno = 1;
+  string message = 2;
+}
+
+// ---------- metadata ops ----------
+
+message LookupRequest {
+  Item dir = 1;
+  bytes name = 2; // exact bytes, no normalization; daemon/authority own semantics
+}
+message LookupReply {
+  Attr attr = 1;
+}
+
+message EnumerateRequest {
+  Item dir = 1;
+  uint64 cookie = 2;      // 0 = start; else opaque continuation from prior reply
+  uint32 max_entries = 3; // daemon may return fewer
+  bool want_attrs = 4;    // readdir-plus
+}
+message DirEntry {
+  bytes name = 1;
+  Attr attr = 2; // always has item+kind; full attrs when want_attrs
+  uint64 cookie = 3; // resume enumeration AFTER this entry; 0 only for the final entry/end
+}
+message EnumerateReply {
+  repeated DirEntry entries = 1;
+  uint64 next_cookie = 2; // resume after the last returned entry (== last entry's cookie, 0 at end)
+  uint64 dir_version = 3; // directory coherence version at enumeration time
+}
+
+message GetAttrRequest { Item item = 1; }
+message GetAttrReply { Attr attr = 1; }
+
+message SetAttrRequest {
+  Item item = 1;
+  optional uint32 mode = 2;
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+  optional uint64 size = 5; // truncate
+  optional int64 mtime_ms = 6;
+  optional int64 atime_ms = 7;
+}
+message SetAttrReply { Attr attr = 1; }
+
+// ---------- open/close + io ----------
+
+enum OpenMode {
+  OPEN_MODE_UNSPECIFIED = 0;
+  OPEN_MODE_READ = 1;
+  OPEN_MODE_WRITE = 2;
+  OPEN_MODE_READ_WRITE = 3;
+}
+
+message OpenRequest {
+  Item item = 1;
+  OpenMode mode = 2;
+}
+message OpenReply {
+  uint64 handle = 1; // daemon-scoped; keeps open-after-unlink alive via orphan leases
+}
+
+message CloseRequest { uint64 handle = 1; }
+message CloseReply {}
+
+message ReadRequest {
+  uint64 handle = 1;
+  uint64 offset = 2;
+  uint32 length = 3; // <= 8 MiB per request; frontend loops
+}
+message ReadReply {
+  bytes data = 1; // short read only at EOF
+}
+
+message WriteRequest {
+  uint64 handle = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+message WriteReply {
+  uint32 written = 1;
+  Attr attr = 2; // post-write size/mtime so the frontend can answer without a round-trip
+}
+
+message FsyncRequest { uint64 handle = 1; }
+message FsyncReply {}
+
+// ---------- namespace mutations ----------
+// All mutation replies return fresh Attrs so the frontend never guesses.
+
+message CreateRequest {
+  Item dir = 1;
+  bytes name = 2;
+  uint32 mode = 3;
+  bool exclusive = 4; // O_EXCL
+}
+message CreateReply {
+  Attr attr = 1;
+  uint64 handle = 2; // opened read-write
+}
+
+message MkdirRequest {
+  Item dir = 1;
+  bytes name = 2;
+  uint32 mode = 3;
+}
+message MkdirReply { Attr attr = 1; }
+
+message RemoveRequest {
+  Item dir = 1;
+  bytes name = 2;
+  bool directory = 3; // rmdir vs unlink
+}
+message RemoveReply {}
+
+message RenameRequest {
+  Item from_dir = 1;
+  bytes from_name = 2;
+  Item to_dir = 3;
+  bytes to_name = 4;
+  bool no_replace = 5;
+}
+message RenameReply {}
+
+message SymlinkRequest {
+  Item dir = 1;
+  bytes name = 2;
+  bytes target = 3;
+}
+message SymlinkReply { Attr attr = 1; }
+
+message ReadlinkRequest { Item item = 1; }
+message ReadlinkReply { bytes target = 1; }
+
+message HardLinkRequest {
+  Item item = 1;
+  Item dir = 2;
+  bytes name = 3;
+}
+message HardLinkReply {
+  bytes name = 1; // canonical created name
+  Attr attr = 2;  // fresh source item attrs, including updated nlink
+}
+
+// ---------- xattrs ----------
+
+message XattrGetRequest { Item item = 1; string name = 2; }
+message XattrGetReply { bytes value = 1; }
+message XattrSetRequest { Item item = 1; string name = 2; bytes value = 3; bool create_only = 4; bool replace_only = 5; }
+message XattrSetReply {}
+message XattrListRequest { Item item = 1; }
+message XattrListReply { repeated string names = 1; }
+message XattrRemoveRequest { Item item = 1; string name = 2; }
+message XattrRemoveReply {}
+
+// ---------- statfs / reclaim ----------
+
+message StatfsRequest {}
+message StatfsReply {
+  uint64 block_size = 1;
+  uint64 total_blocks = 2;   // synthetic but nonzero (Finder/apps need free space > 0 to allow writes)
+  uint64 free_blocks = 3;
+  uint64 total_files = 4;
+  uint64 free_files = 5;
+}
+
+// Frontend no longer references the item (FSKit reclaimItem / FUSE forget).
+message ReclaimRequest { Item item = 1; }
+message ReclaimReply {}
+
+// ---------- events ----------
+
+message SubscribeEventsRequest {}
+message SubscribeEventsReply {}
+
+// Emitted only after SubscribeEventsRequest on this connection.
+message Event {
+  oneof kind {
+    Invalidation invalidation = 1;
+    AttachState attach_state = 2;
+  }
+}
+
+// Mirrors the authority's push-invalidation stream, item-addressed. On macOS 26
+// the extension treats these as advisory (no kernel cache control); future
+// adapters can use them for kernel-cache coordination where the SDK supports it.
+message Invalidation {
+  Item item = 1;
+  bool content_changed = 2;   // file data changed remotely
+  bool attrs_changed = 3;
+  bool namespace_changed = 4; // entries under this dir changed (create/remove/rename)
+  uint64 content_version = 5;
+}
+
+message AttachState {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_ATTACHED = 1;   // healthy
+    STATE_WARMING = 2;    // prefetch running
+    STATE_DEGRADED = 3;   // authority unreachable; ops may stall/fail
+    STATE_DETACHING = 4;  // unmount in progress; fail new ops with ENXIO
+  }
+  State state = 1;
+  string detail = 2;
+}
