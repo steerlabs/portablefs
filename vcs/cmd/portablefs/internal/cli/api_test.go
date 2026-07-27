@@ -201,6 +201,57 @@ func TestLsListsVolumes(t *testing.T) {
 	}
 }
 
+// TestLsRendersLiveBranchWithoutHead pins the hosted control-plane shape:
+// GET /v1/volumes intentionally omits branches[].headCommitId (the list is
+// control-plane metadata, no per-volume engine hop), so ls renders "(live)"
+// instead of a dangling "name @ ". A branch with a head keeps the exact
+// @ form, and --json passes the server's shape through untouched.
+func TestLsRendersLiveBranchWithoutHead(t *testing.T) {
+	f := newFakeServer(t)
+	f.on("GET", "/v1/volumes", func(map[string]any) (int, string) {
+		return 200, `{"volumes":[
+			{"volumeId":"vol_live","tenantId":"t1","createdAtMs":1700000000000,"branches":[{"name":"main"}]},
+			{"volumeId":"vol_base","tenantId":"t1","createdAtMs":1700000001000,"branches":[{"name":"main","headCommitId":"cmt_9"}]}]}`
+	})
+	e, stdout, _ := testEnv(t)
+	if rc := e.run(f.commonArgs("ls")); rc != 0 {
+		t.Fatalf("rc = %d", rc)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "  main (live)\n") {
+		t.Fatalf("headless branch must render (live): %q", out)
+	}
+	if !strings.Contains(out, "  main @ cmt_9\n") {
+		t.Fatalf("branch with a head must keep the @ form: %q", out)
+	}
+	if strings.Contains(out, "@ \n") {
+		t.Fatalf("no dangling @: %q", out)
+	}
+
+	stdout.Reset()
+	if rc := e.run(f.commonArgs("ls", "--json")); rc != 0 {
+		t.Fatalf("ls --json rc = %d", rc)
+	}
+	var parsed struct {
+		Volumes []struct {
+			VolumeID string `json:"volumeId"`
+			Branches []struct {
+				Name         string `json:"name"`
+				HeadCommitID string `json:"headCommitId"`
+			} `json:"branches"`
+		} `json:"volumes"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
+		t.Fatalf("ls --json must emit valid JSON: %v (%q)", err, stdout.String())
+	}
+	if len(parsed.Volumes) != 2 || parsed.Volumes[0].Branches[0].HeadCommitID != "" || parsed.Volumes[1].Branches[0].HeadCommitID != "cmt_9" {
+		t.Fatalf("--json must pass the server's fields through unchanged: %+v", parsed)
+	}
+	if strings.Contains(stdout.String(), "(live)") {
+		t.Fatalf("the (live) rendering must not leak into --json: %q", stdout.String())
+	}
+}
+
 func TestLs404ExplainsUpgrade(t *testing.T) {
 	f := newFakeServer(t) // no route: default 404
 	e, _, stderr := testEnv(t)
