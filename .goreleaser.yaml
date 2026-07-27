@@ -60,6 +60,11 @@ homebrew_casks:
     repository:
       owner: steerlabs
       name: homebrew-tap
+    # Cask publishing pushes to the tap repo, which the release workflow's
+    # repo-scoped GITHUB_TOKEN cannot do. Keep the cask generated in dist/
+    # but skip the upload until the public launch wires a tap-scoped token
+    # (then flip this to "auto").
+    skip_upload: true
     homepage: https://github.com/steerlabs/portablefs
     description: "Live, durable, branchable network filesystem for AI agent workspaces"
     # The CLI discovers portablefsd as a sibling binary, so the cask links both.
