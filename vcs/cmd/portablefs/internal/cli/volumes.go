@@ -96,7 +96,14 @@ func cmdLs(e *cmdEnv, args []string) int {
 	for _, v := range volumes {
 		fmt.Fprintf(e.stdout, "%s  created %s\n", v.VolumeID, formatMs(v.CreatedAtMs))
 		for _, b := range v.Branches {
-			fmt.Fprintf(e.stdout, "  %s @ %s\n", b.Name, b.HeadCommitID)
+			// Hosted control planes omit branches[].headCommitId from the
+			// volume list (no per-volume engine hop; `portablefs status` has
+			// the committed head): render live volumes without a dangling @.
+			if b.HeadCommitID == "" {
+				fmt.Fprintf(e.stdout, "  %s (live)\n", b.Name)
+			} else {
+				fmt.Fprintf(e.stdout, "  %s @ %s\n", b.Name, b.HeadCommitID)
+			}
 		}
 	}
 	return 0
