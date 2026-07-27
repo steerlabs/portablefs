@@ -114,6 +114,13 @@ services:
       # ship a default: a public value would let anyone forge mount tokens.
       # scripts/quickstart.sh generates a fresh 32-byte secret per install.
       PORTABLEFS_ACCESS_TOKEN_ROOT_SECRET: ${QUICKSTART_ACCESS_TOKEN_ROOT_SECRET:?run ./scripts/quickstart.sh, which generates secrets into .env.quickstart}
+      # The quickstart router is plaintext by design (dev/LAN/tailnet posture,
+      # authenticated by per-mount access-lease tokens, never production-safe).
+      # Production authority MODE otherwise requires router TLS, so the
+      # documented plaintext override is mandatory here — without it the manager
+      # refuses to start. Real deployments set TLS cert/key instead (see
+      # docs/self-hosting.md).
+      PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION: "1"
       PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR: "0.0.0.0:2050"
       # The address mount clients dial (the published router port). In
       # tailnet/LAN mode QUICKSTART_ADVERTISE_HOST is the address other
