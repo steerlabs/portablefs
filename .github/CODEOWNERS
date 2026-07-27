@@ -1,0 +1,21 @@
+# Code owners for PortableFS. GitHub requests review from the owner(s) of any
+# changed path. Replace the placeholder team below with the real maintainer
+# team/handle for the repository (e.g. @steerlabs/portablefs-maintainers) and
+# enable "Require review from Code Owners" in branch protection.
+
+* @steerlabs/portablefs-maintainers
+
+# Data plane and durability core (highest-risk changes)
+/vcs/                       @steerlabs/portablefs-maintainers
+/packages/metadata-db/      @steerlabs/portablefs-maintainers
+
+# Supply chain: workflows, release, and the pin policy gate them all
+/.github/workflows/         @steerlabs/portablefs-maintainers
+/.goreleaser.yaml           @steerlabs/portablefs-maintainers
+/scripts/check-workflow-pins.mjs @steerlabs/portablefs-maintainers
+
+# Security and legal
+/SECURITY.md                @steerlabs/portablefs-maintainers
+/LICENSE                    @steerlabs/portablefs-maintainers
+/NOTICE                     @steerlabs/portablefs-maintainers
+/THIRD_PARTY_NOTICES.md     @steerlabs/portablefs-maintainers

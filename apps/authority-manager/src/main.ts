@@ -1,0 +1,251 @@
+import {
+  type AuthorityRegistry,
+  createAuthorityManagerServer,
+  createEnvAuthorityRegistry,
+  readAuthorityManagerMode,
+  validateEnvAuthorityRegistryConfig,
+} from "./server.js";
+import {
+  createAuthorityDataPlaneRouterServer,
+  LeaseTunnelRegistry,
+  validateAuthorityDataPlaneRouterConfig,
+} from "./data-plane-router.js";
+import {
+  createProductionAuthorityRegistry,
+  type ProductionAuthorityRegistry,
+} from "./production-registry.js";
+import {
+  PostgresManagerControlStore,
+  type ManagerControlStore,
+} from "./manager-control-store.js";
+import { ChildMetricsCollector } from "./child-metrics.js";
+import { ManagerMetrics } from "./manager-metrics.js";
+import { createManagerMetricsEndpoint } from "./metrics-endpoint.js";
+import { loadAuthorityManagerReleaseIdentity } from "./release-identity.js";
+import type { AccessLeaseHandler } from "./server.js";
+
+const port = Number(process.env.PORT || process.env.AUTHORITY_MANAGER_PORT || 8788);
+const authToken = process.env.PORTABLEFS_AUTHORITY_MANAGER_TOKEN?.trim();
+const allowUnauthenticated =
+  process.env.PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED === "1";
+const authorityMode = readAuthorityManagerMode(process.env);
+const requireAuthorityHealth =
+  authorityMode === "env" &&
+  (process.env.NODE_ENV === "production" ||
+    process.env.PORTABLEFS_AUTHORITY_MANAGER_REQUIRE_HEALTH === "1");
+
+// Unauthenticated session minting hands out data-plane mount credentials, so
+// it is honored ONLY in an explicit local-development environment. Keying it
+// off "not production" would leave it open when NODE_ENV is unset (the default
+// in many production containers) or "staging" — fail closed on anything that
+// is not explicitly development.
+if (allowUnauthenticated && process.env.NODE_ENV !== "development") {
+  throw new Error(
+    "PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED is honored only when NODE_ENV=development. Set PORTABLEFS_AUTHORITY_MANAGER_TOKEN for any non-development deployment."
+  );
+}
+
+if (!authToken && !allowUnauthenticated) {
+  throw new Error(
+    "PORTABLEFS_AUTHORITY_MANAGER_TOKEN is required because authority sessions expose data-plane credentials. Set PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED=1 only for local development."
+  );
+}
+
+let registry: AuthorityRegistry;
+let dataPlaneRouter:
+  | ReturnType<typeof createAuthorityDataPlaneRouterServer>
+  | undefined;
+let accessLeases: AccessLeaseHandler | undefined;
+let productionRegistry: ProductionAuthorityRegistry | undefined;
+let managerControlStore: ManagerControlStore | undefined;
+// Manager metrics registry: fixed-name scalars only (strongest cardinality
+// bound); GET /metrics renders it plus the bounded, allowlisted child
+// aggregation, behind the same bearer auth as every other control route.
+const managerMetrics = new ManagerMetrics();
+let childMetricsCollector: ChildMetricsCollector | undefined;
+let leaseTunnelRegistry: LeaseTunnelRegistry | undefined;
+if (authorityMode === "production") {
+  // PRODUCTION (journal-native): singleton fenced manager + one disposable
+  // child per active branch, remote journal/control truth. No persistent
+  // work directory, no local WAL, no standby pair, no file ledger.
+  validateRouterConfig();
+  managerControlStore = loadManagerControlStore();
+  productionRegistry = await createProductionAuthorityRegistry(process.env, {
+    controlStore: managerControlStore,
+  });
+  const leases = productionRegistry.leases;
+  accessLeases = leases;
+  // Lease lifecycle fences live tunnels: end closes them, rotation closes
+  // older-generation ones.
+  const tunnelRegistry = new LeaseTunnelRegistry();
+  leaseTunnelRegistry = tunnelRegistry;
+  leases.onLeaseEnded((event) => tunnelRegistry.closeLease(event.accessLeaseId));
+  leases.onLeaseRotated((accessLeaseId, tokenGeneration) =>
+    tunnelRegistry.closeSupersededGenerations(accessLeaseId, tokenGeneration)
+  );
+  dataPlaneRouter = createAuthorityDataPlaneRouterServer(leases, {
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH
+      ? { tlsCertPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH
+      ? { tlsKeyPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM
+      ? { tlsCertPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM
+      ? { tlsKeyPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM }
+      : {}),
+    tunnelRegistry,
+  });
+  listenTcp(dataPlaneRouter, process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR!);
+  registry = productionRegistry;
+
+  // Child metrics aggregation: the manager is the ONLY scraper of the
+  // children's loopback /metrics; the collector enforces loopback targets,
+  // per-child + overall deadlines, byte caps, single-flight and TTL cache.
+  const boundRegistry = productionRegistry;
+  childMetricsCollector = new ChildMetricsCollector({
+    targets: () => boundRegistry.metricsTargets(),
+    metrics: managerMetrics,
+  });
+} else {
+  validateEnvAuthorityRegistryConfig(process.env, {
+    requireHealth: requireAuthorityHealth,
+  });
+  registry = createEnvAuthorityRegistry(process.env);
+}
+
+const releaseIdentity = loadAuthorityManagerReleaseIdentity(process.env);
+console.log(
+  releaseIdentity
+    ? `PortableFS authority manager release identity: ${releaseIdentity.releaseId} (${releaseIdentity.sourceRevision}).`
+    : "PortableFS authority manager release identity is not configured (PORTABLEFS_RELEASE_ID + PORTABLEFS_SOURCE_REVISION); /v1/release-identity answers 404."
+);
+
+const server = createAuthorityManagerServer({
+  ...(authToken ? { authToken } : {}),
+  ...(allowUnauthenticated ? { allowUnauthenticated: true } : {}),
+  registry,
+  ...(accessLeases ? { accessLeases } : {}),
+  ...(releaseIdentity ? { releaseIdentity } : {}),
+  metricsEndpoint: createManagerMetricsEndpoint({
+    metrics: managerMetrics,
+    ...(productionRegistry ? { registry: productionRegistry } : {}),
+    ...(childMetricsCollector ? { childMetrics: childMetricsCollector } : {}),
+    ...(leaseTunnelRegistry ? { tunnels: leaseTunnelRegistry } : {}),
+  }),
+  readiness: async () => {
+    if (authorityMode === "env") {
+      return true;
+    }
+    // Production readiness: the live epoch claim (inside the DB-derived
+    // local monotonic deadline), the router, the lease service, AND a
+    // bounded control-store reachability probe. Fail closed on any of them.
+    if (!dataPlaneRouter?.listening || !(accessLeases?.healthy() ?? true)) {
+      return false;
+    }
+    if (!productionRegistry?.ready()) {
+      return false;
+    }
+    const probe = await managerControlStore?.healthProbe?.().catch(() => null);
+    return probe?.ok === true;
+  },
+});
+
+server.listen(port, () => {
+  console.log(`PortableFS authority manager listening on :${port} (${authorityMode})`);
+});
+
+let shuttingDown = false;
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    void shutdown(signal);
+  });
+}
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`PortableFS authority manager shutting down after ${signal}.`);
+  const forceExit = setTimeout(() => {
+    console.error("PortableFS authority manager shutdown timed out.");
+    process.exit(1);
+  }, 30_000);
+  forceExit.unref?.();
+  await Promise.allSettled([
+    closeServer(server),
+    dataPlaneRouter ? closeServer(dataPlaneRouter) : Promise.resolve(),
+    registry.shutdown ? registry.shutdown() : Promise.resolve(),
+  ]);
+  await managerControlStore?.close().catch(() => undefined);
+  clearTimeout(forceExit);
+  process.exit(0);
+}
+
+// loadManagerControlStore builds the Postgres pfm control-store adapter from
+// the REQUIRED PORTABLEFS_MANAGER_CONTROL_DATABASE_URL. There is no dynamic
+// module injection and no file fallback: production without the control
+// database is an honest startup failure.
+function loadManagerControlStore(): ManagerControlStore {
+  const connectionString = process.env.PORTABLEFS_MANAGER_CONTROL_DATABASE_URL?.trim();
+  if (connectionString) {
+    return new PostgresManagerControlStore(connectionString);
+  }
+  throw new Error(
+    "AUTHORITY_CONTROL_STORE_REQUIRED: PORTABLEFS_AUTHORITY_MODE=production requires PORTABLEFS_MANAGER_CONTROL_DATABASE_URL (the pfm manager-control database, portablefs_manager role). There is no file fallback; readiness fails closed until it is set."
+  );
+}
+
+function validateRouterConfig(): void {
+  validateAuthorityDataPlaneRouterConfig({
+    authorityMode,
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR
+      ? { listenAddr: process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_URL
+      ? { publicUrl: process.env.PORTABLEFS_AUTHORITY_ROUTER_URL }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH
+      ? { tlsCertPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH
+      ? { tlsKeyPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM
+      ? { tlsCertPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM
+      ? { tlsKeyPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM }
+      : {}),
+    allowPlaintextProduction:
+      process.env.PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION === "1",
+  });
+}
+
+function listenTcp(
+  server: { listen(port: number, host: string, callback: () => void): unknown },
+  addr: string
+): void {
+  const { host, port: listenPort } = parseListenAddr(addr);
+  server.listen(listenPort, host, () => {
+    console.log(`PortableFS authority data-plane router listening on ${host}:${listenPort}`);
+  });
+}
+
+function closeServer(serverToClose: { close(callback: (error?: Error) => void): unknown }): Promise<void> {
+  return new Promise((resolve) => {
+    serverToClose.close(() => resolve());
+  });
+}
+
+function parseListenAddr(addr: string): { host: string; port: number } {
+  const [host, portText] = addr.trim().split(":");
+  const listenPort = portText ? Number(portText) : NaN;
+  if (!host || !Number.isInteger(listenPort) || listenPort <= 0 || listenPort > 65535) {
+    throw new Error(`PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR must be host:port, got ${addr}.`);
+  }
+  return { host, port: listenPort };
+}

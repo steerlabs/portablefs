@@ -1,0 +1,466 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 70;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2A0000000000000000000001 /* PortableFSAppMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000101 /* PortableFSAppMain.swift */; };
+		2A0000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000102 /* AppModel.swift */; };
+		2A0000000000000000000003 /* DaemonSupervisor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000103 /* DaemonSupervisor.swift */; };
+		2A0000000000000000000004 /* MountCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000104 /* MountCommand.swift */; };
+		2A0000000000000000000005 /* MenuContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000105 /* MenuContent.swift */; };
+		2A0000000000000000000006 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000106 /* SignInView.swift */; };
+		2A0000000000000000000007 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000107 /* SettingsView.swift */; };
+		2A0000000000000000000011 /* ExtensionMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000201 /* ExtensionMain.swift */; };
+		2A0000000000000000000021 /* PortableFSExt.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 200000000000000000000302 /* PortableFSExt.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		2A0000000000000000000022 /* PortableFSAppCore in Frameworks */ = {isa = PBXBuildFile; productRef = 200000000000000000000901 /* PortableFSAppCore */; };
+		2A0000000000000000000023 /* PortableFSKit in Frameworks */ = {isa = PBXBuildFile; productRef = 200000000000000000000902 /* PortableFSKit */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		200000000000000000000401 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 200000000000000000000701 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 200000000000000000000502;
+			remoteInfo = PortableFSExt;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		200000000000000000000601 /* Embed ExtensionKit Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(EXTENSIONS_FOLDER_PATH)";
+			dstSubfolderSpec = 16;
+			files = (
+				2A0000000000000000000021 /* PortableFSExt.appex in Embed ExtensionKit Extensions */,
+			);
+			name = "Embed ExtensionKit Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		200000000000000000000101 /* PortableFSAppMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortableFSAppMain.swift; sourceTree = "<group>"; };
+		200000000000000000000102 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		200000000000000000000103 /* DaemonSupervisor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonSupervisor.swift; sourceTree = "<group>"; };
+		200000000000000000000104 /* MountCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MountCommand.swift; sourceTree = "<group>"; };
+		200000000000000000000105 /* MenuContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuContent.swift; sourceTree = "<group>"; };
+		200000000000000000000106 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
+		200000000000000000000107 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		200000000000000000000108 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		200000000000000000000201 /* ExtensionMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionMain.swift; sourceTree = "<group>"; };
+		200000000000000000000202 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		200000000000000000000203 /* PortableFSExt.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PortableFSExt.entitlements; sourceTree = "<group>"; };
+		200000000000000000000301 /* PortableFSApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PortableFSApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		200000000000000000000302 /* PortableFSExt.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = PortableFSExt.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		200000000000000000000801 /* Development.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Development.xcconfig; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		200000000000000000000602 /* App Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2A0000000000000000000022 /* PortableFSAppCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		200000000000000000000603 /* Extension Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2A0000000000000000000023 /* PortableFSKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		200000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000110 /* App */,
+				200000000000000000000210 /* PortableFSExt */,
+				200000000000000000000810 /* Config */,
+				200000000000000000000310 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		200000000000000000000110 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000101 /* PortableFSAppMain.swift */,
+				200000000000000000000102 /* AppModel.swift */,
+				200000000000000000000103 /* DaemonSupervisor.swift */,
+				200000000000000000000104 /* MountCommand.swift */,
+				200000000000000000000105 /* MenuContent.swift */,
+				200000000000000000000106 /* SignInView.swift */,
+				200000000000000000000107 /* SettingsView.swift */,
+				200000000000000000000108 /* Info.plist */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		200000000000000000000210 /* PortableFSExt */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000201 /* ExtensionMain.swift */,
+				200000000000000000000202 /* Info.plist */,
+				200000000000000000000203 /* PortableFSExt.entitlements */,
+			);
+			path = PortableFSExt;
+			sourceTree = "<group>";
+		};
+		200000000000000000000310 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000301 /* PortableFSApp.app */,
+				200000000000000000000302 /* PortableFSExt.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		200000000000000000000810 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000801 /* Development.xcconfig */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		200000000000000000000501 /* PortableFSApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 200000000000000000000731 /* Build configuration list for PBXNativeTarget "PortableFSApp" */;
+			buildPhases = (
+				200000000000000000000604 /* App Sources */,
+				200000000000000000000602 /* App Frameworks */,
+				200000000000000000000606 /* App Resources */,
+				200000000000000000000601 /* Embed ExtensionKit Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				200000000000000000000402 /* PBXTargetDependency */,
+			);
+			name = PortableFSApp;
+			packageProductDependencies = (
+				200000000000000000000901 /* PortableFSAppCore */,
+			);
+			productName = PortableFSApp;
+			productReference = 200000000000000000000301 /* PortableFSApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		200000000000000000000502 /* PortableFSExt */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 200000000000000000000732 /* Build configuration list for PBXNativeTarget "PortableFSExt" */;
+			buildPhases = (
+				200000000000000000000605 /* Extension Sources */,
+				200000000000000000000603 /* Extension Frameworks */,
+				200000000000000000000607 /* Extension Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PortableFSExt;
+			packageProductDependencies = (
+				200000000000000000000902 /* PortableFSKit */,
+			);
+			productName = PortableFSExt;
+			productReference = 200000000000000000000302 /* PortableFSExt.appex */;
+			productType = "com.apple.product-type.extensionkit-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		200000000000000000000701 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2660;
+				LastUpgradeCheck = 2660;
+				TargetAttributes = {
+					200000000000000000000501 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					200000000000000000000502 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+				};
+			};
+			buildConfigurationList = 200000000000000000000730 /* Build configuration list for PBXProject "PortableFSApp" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 200000000000000000000001;
+			packageReferences = (
+				200000000000000000000900 /* XCLocalSwiftPackageReference "../PortableFSKit" */,
+			);
+			productRefGroup = 200000000000000000000310 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				200000000000000000000501 /* PortableFSApp */,
+				200000000000000000000502 /* PortableFSExt */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		200000000000000000000606 /* App Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		200000000000000000000607 /* Extension Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		200000000000000000000604 /* App Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2A0000000000000000000001 /* PortableFSAppMain.swift in Sources */,
+				2A0000000000000000000002 /* AppModel.swift in Sources */,
+				2A0000000000000000000003 /* DaemonSupervisor.swift in Sources */,
+				2A0000000000000000000004 /* MountCommand.swift in Sources */,
+				2A0000000000000000000005 /* MenuContent.swift in Sources */,
+				2A0000000000000000000006 /* SignInView.swift in Sources */,
+				2A0000000000000000000007 /* SettingsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		200000000000000000000605 /* Extension Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2A0000000000000000000011 /* ExtensionMain.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		200000000000000000000402 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 200000000000000000000502 /* PortableFSExt */;
+			targetProxy = 200000000000000000000401 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		200000000000000000000741 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		200000000000000000000742 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		200000000000000000000751 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		200000000000000000000752 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		200000000000000000000761 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = PortableFSExt/PortableFSExt.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PortableFSExt/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp.PortableFSExt;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		200000000000000000000762 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = PortableFSExt/PortableFSExt.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PortableFSExt/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp.PortableFSExt;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		200000000000000000000730 /* Build configuration list for PBXProject "PortableFSApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				200000000000000000000741 /* Debug */,
+				200000000000000000000742 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		200000000000000000000731 /* Build configuration list for PBXNativeTarget "PortableFSApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				200000000000000000000751 /* Debug */,
+				200000000000000000000752 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		200000000000000000000732 /* Build configuration list for PBXNativeTarget "PortableFSExt" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				200000000000000000000761 /* Debug */,
+				200000000000000000000762 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		200000000000000000000900 /* XCLocalSwiftPackageReference "../PortableFSKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../PortableFSKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		200000000000000000000901 /* PortableFSAppCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 200000000000000000000900 /* XCLocalSwiftPackageReference "../PortableFSKit" */;
+			productName = PortableFSAppCore;
+		};
+		200000000000000000000902 /* PortableFSKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 200000000000000000000900 /* XCLocalSwiftPackageReference "../PortableFSKit" */;
+			productName = PortableFSKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 200000000000000000000701 /* Project object */;
+}

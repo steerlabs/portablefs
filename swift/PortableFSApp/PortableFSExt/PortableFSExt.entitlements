@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.fskit.fsmodule</key>
+	<true/>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- The daemon socket lives in this app-group container (see
+	     PFSAppGroupIdentifier in Info.plist). This is the only place a
+	     sandboxed extension may connect(2) to a unix socket: the app sandbox
+	     allows network-outbound solely on app-group paths, so a socket under
+	     /tmp is unreachable no matter what file exceptions are granted. The
+	     group id is team-prefixed and product-specific, so it never collides
+	     with another PortableFS embedder on the same machine. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(TeamIdentifierPrefix)pfsoss</string>
+	</array>
+</dict>
+</plist>

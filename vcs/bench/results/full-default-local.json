@@ -1,0 +1,182 @@
+{
+  "label": "default",
+  "transport": "local",
+  "profile": {
+    "name": "full",
+    "w1Files": 10000,
+    "w1Dirs": 500,
+    "w2Files": 5000,
+    "w2Dirs": 100,
+    "w2ProbeMiss": 2000,
+    "w2ProbeIter": 3,
+    "w3Appends": 1000,
+    "w3ChunkB": 256,
+    "w5MiB": 256
+  },
+  "n": 3,
+  "config": {
+    "writeBack": false,
+    "negativeCache": false,
+    "noReaddirPlus": false,
+    "flushMs": 250,
+    "flushMaxRecords": 0,
+    "flushMaxBytes": 0,
+    "sessionTTLMs": 0,
+    "pool": 16
+  },
+  "machine": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "numCPU": 18,
+    "goVersion": "go1.26.2",
+    "cpu": "Apple M5 Max",
+    "memBytes": 137438953472,
+    "hostname": "redacted"
+  },
+  "startedAt": "2026-07-03T20:28:33.555413-07:00",
+  "phases": [
+    {
+      "workload": "W1",
+      "phase": "walk_cold",
+      "runsSec": [
+        0.032988625,
+        0.033297166,
+        0.033531166
+      ],
+      "p50Sec": 0.033297166,
+      "ops": 10500,
+      "opsPerSec": 315342.15254235145,
+      "note": "fresh client caches per run"
+    },
+    {
+      "workload": "W1",
+      "phase": "walk_warm",
+      "runsSec": [
+        0.032408792,
+        0.032805208,
+        0.032948333
+      ],
+      "p50Sec": 0.032805208,
+      "ops": 10500,
+      "opsPerSec": 320071.1301693316,
+      "note": "immediately after a cold walk"
+    },
+    {
+      "workload": "W1",
+      "phase": "git_status",
+      "runsSec": [
+        0.023213333,
+        0.023680666,
+        0.02375925
+      ],
+      "p50Sec": 0.023680666,
+      "ops": 10000,
+      "opsPerSec": 422285.4205198452,
+      "note": "git status --porcelain"
+    },
+    {
+      "workload": "W2",
+      "phase": "storm_visible",
+      "runsSec": [
+        0.264749917,
+        0.2792165,
+        0.286514166
+      ],
+      "p50Sec": 0.2792165,
+      "ops": 5000,
+      "opsPerSec": 17907.251183221622,
+      "note": "create+write returned"
+    },
+    {
+      "workload": "W2",
+      "phase": "storm_durable",
+      "runsSec": [
+        0.104943292,
+        0.111055084,
+        0.330397625
+      ],
+      "p50Sec": 0.111055084,
+      "ops": 5000,
+      "opsPerSec": 45022.70242756289,
+      "note": "durability barrier after storm"
+    },
+    {
+      "workload": "W2",
+      "phase": "probe_miss",
+      "runsSec": [
+        0.008132917,
+        0.008223792,
+        0.012310125
+      ],
+      "p50Sec": 0.008223792,
+      "ops": 6000,
+      "opsPerSec": 729590.4371122227,
+      "note": "lstat storm on missing names in existing dirs"
+    },
+    {
+      "workload": "W3",
+      "phase": "append",
+      "runsSec": [
+        0.004769375,
+        0.004910542,
+        0.005175375
+      ],
+      "p50Sec": 0.004910542,
+      "ops": 1000,
+      "opsPerSec": 203643.50819115283,
+      "note": "sequential appends to one log"
+    },
+    {
+      "workload": "W4",
+      "phase": "grep_cold",
+      "runsSec": [
+        0.129942916,
+        0.131203083,
+        0.156184583
+      ],
+      "p50Sec": 0.131203083,
+      "ops": 10000,
+      "opsPerSec": 76217.72119485942,
+      "note": "fresh client caches per run"
+    },
+    {
+      "workload": "W4",
+      "phase": "grep_warm",
+      "runsSec": [
+        0.126248917,
+        0.128079667,
+        0.12980375
+      ],
+      "p50Sec": 0.128079667,
+      "ops": 10000,
+      "opsPerSec": 78076.40536729377,
+      "note": "immediately after a cold scan"
+    },
+    {
+      "workload": "W5",
+      "phase": "write_seq",
+      "runsSec": [
+        0.106412792,
+        0.120096167,
+        0.120587667
+      ],
+      "p50Sec": 0.120096167,
+      "ops": 256,
+      "opsPerSec": 2131.625066768367,
+      "note": "1MiB chunks + durability barrier"
+    },
+    {
+      "workload": "W5",
+      "phase": "read_seq_cold",
+      "runsSec": [
+        0.011163083,
+        0.011181583,
+        0.011517583
+      ],
+      "p50Sec": 0.011181583,
+      "ops": 256,
+      "opsPerSec": 22894.790478235504,
+      "note": "fresh client caches; 1MiB chunks"
+    }
+  ]
+}
