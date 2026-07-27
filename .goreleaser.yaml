@@ -71,7 +71,6 @@ homebrew_casks:
     binaries:
       - portablefs
       - portablefsd
-    skip_upload: auto
 
 changelog:
   # git history, not the GitHub compare API: the API path infers the repo from
