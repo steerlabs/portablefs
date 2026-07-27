@@ -269,7 +269,7 @@ func (r *doctorRun) checkVersion() doctorResult {
 	if cli.less(minRequired) {
 		return doctorFail(
 			fmt.Sprintf("this CLI is %s but the server requires at least %s", r.e.version, r.minCLIVersion),
-			"upgrade with: "+upgradeCommand(r.settings.apiURL))
+			"upgrade with: "+upgradeCommand())
 	}
 	return doctorPass(fmt.Sprintf("CLI %s meets the server minimum %s", r.e.version, r.minCLIVersion))
 }

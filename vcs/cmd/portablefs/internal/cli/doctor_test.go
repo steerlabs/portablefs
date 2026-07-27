@@ -209,7 +209,7 @@ func TestDoctorVersionSkewFails(t *testing.T) {
 	}
 	requireContains(t, stdout.String(),
 		"FAIL  version: this CLI is v1.0.0 but the server requires at least 9.9.9",
-		"fix: upgrade with: curl -fsSL https://api.example.com/install | sh",
+		"fix: upgrade with: curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh",
 	)
 }
 

@@ -3,6 +3,3 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/steerlabs/portablefs/blob/main/SECURITY.md
     about: Do not open a public issue for security problems. Report privately per SECURITY.md.
-  - name: Question or discussion
-    url: https://github.com/steerlabs/portablefs/discussions
-    about: For usage questions and open-ended discussion, use Discussions.

@@ -49,10 +49,12 @@ func (a semver) less(b semver) bool {
 	return a.patch < b.patch
 }
 
-// upgradeCommand is the copy-paste fix for a too-old binary: every deployment
-// (the hosted control plane included) serves its installer at /install.
-func upgradeCommand(origin string) string {
-	return "curl -fsSL " + origin + "/install | sh"
+// upgradeCommand is the copy-paste fix for a too-old binary: the canonical
+// installer script. It is origin-independent on purpose — self-hosted servers
+// do not serve an /install route, so pointing at the deployment origin would
+// 404 exactly when a version-skewed client is stuck and needs the upgrade.
+func upgradeCommand() string {
+	return "curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh"
 }
 
 // versionSkewError is the version handshake's terminal refusal: the server
@@ -66,7 +68,7 @@ type versionSkewError struct {
 
 func (e *versionSkewError) Error() string {
 	return fmt.Sprintf("this CLI is %s but the server at %s requires at least %s; upgrade with: %s",
-		e.cliVersion, e.origin, e.minVersion, upgradeCommand(e.origin))
+		e.cliVersion, e.origin, e.minVersion, upgradeCommand())
 }
 
 // httpError is a non-2xx response, carrying the server's error code/message
@@ -121,10 +123,6 @@ func friendlyErrorText(code string) string {
 		return "the server hit an internal error while preparing this mount (commonly the volume's authority failing to start); try again, and if it persists check the server logs (self-hosted quickstart stacks: `docker compose logs authority-manager`)"
 	case "VOLUME_COMMIT_PFT2_NO_MANIFEST":
 		return "this operation asked for a commit's legacy manifest, but the volume's history is content-addressed and carries none; read it through the live routes (mount/status/snapshots) — hitting this from a current CLI means the server needs an upgrade"
-	case "VOLUME_EXEC_DISABLED":
-		return "command execution is disabled on this older deployment; do not enable host execution — upgrade PortableFS, then mount the volume and run the command locally"
-	case "VOLUME_EXEC_RETIRED":
-		return "server-side command execution was retired from the PortableFS Volume API for isolation; mount the volume (`portablefs mount <volumeId> <path>`) and run the command locally"
 	}
 	return ""
 }
@@ -223,7 +221,7 @@ func (c *jsonClient) checkMinCLIVersion(h http.Header) error {
 			if c.warnW != nil {
 				fmt.Fprintf(c.warnW,
 					"portablefs: warning: the server at %s requires CLI %s or newer; this %q build skips the check — if commands misbehave, upgrade with: %s\n",
-					c.baseURL, minRaw, c.cliVersion, upgradeCommand(c.baseURL))
+					c.baseURL, minRaw, c.cliVersion, upgradeCommand())
 			}
 		})
 		return nil

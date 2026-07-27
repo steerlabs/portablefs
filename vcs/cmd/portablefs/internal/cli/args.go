@@ -42,14 +42,3 @@ func (f *stringListFlag) Set(v string) error {
 	*f = append(*f, v)
 	return nil
 }
-
-// splitDoubleDash splits args at the first standalone "--". Everything after it
-// is an opaque command tail that must not be flag-parsed (portablefs exec).
-func splitDoubleDash(args []string) (before, after []string, found bool) {
-	for i, a := range args {
-		if a == "--" {
-			return args[:i], args[i+1:], true
-		}
-	}
-	return args, nil, false
-}

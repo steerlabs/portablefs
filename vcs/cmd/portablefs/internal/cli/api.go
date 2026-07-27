@@ -364,40 +364,6 @@ func (c *apiClient) forkSnapshot(ctx context.Context, snapshotID, tenantID, newV
 	return &out, nil
 }
 
-type execTiming struct {
-	TotalMs   float64 `json:"totalMs"`
-	SetupMs   float64 `json:"setupMs"`
-	ExecuteMs float64 `json:"executeMs"`
-	CommitMs  float64 `json:"commitMs"`
-}
-
-type execResult struct {
-	Stdout       string     `json:"stdout"`
-	Stderr       string     `json:"stderr"`
-	ExitCode     int        `json:"exitCode"`
-	Signal       string     `json:"signal"`
-	Timing       execTiming `json:"timing"`
-	HeadCommitID string     `json:"headCommitId"`
-	Committed    bool       `json:"committed"`
-}
-
-func (c *apiClient) exec(ctx context.Context, volumeID, branch, command string, write bool, timeout time.Duration) (*execResult, error) {
-	body := map[string]any{
-		"branch":    branch,
-		"command":   command,
-		"write":     write,
-		"timeoutMs": timeout.Milliseconds(),
-	}
-	var out execResult
-	path := fmt.Sprintf("/v1/volumes/%s/exec", url.PathEscape(volumeID))
-	// The server materializes, runs, and commits within the request; allow the
-	// remote timeout plus generous setup/commit headroom.
-	if err := c.do(ctx, "POST", path, body, &out, timeout+60*time.Second); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
 type grepMatch struct {
 	File string `json:"file"`
 	Line int    `json:"line"`

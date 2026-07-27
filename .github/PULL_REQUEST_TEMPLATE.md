@@ -22,7 +22,7 @@ Thanks for contributing to PortableFS. Keep the description focused on WHY.
 
 ## Checklist
 
-- [ ] Commits are signed off (`git commit -s`) — the DCO check requires it (see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md#sign-your-work-dco)).
-- [ ] Changes to surfaces in [COMPATIBILITY.md](../blob/main/COMPATIBILITY.md) are called out above and reviewed.
+- [ ] Commits are signed off (`git commit -s`) — the DCO check requires it (see [CONTRIBUTING.md](https://github.com/steerlabs/portablefs/blob/main/CONTRIBUTING.md#sign-your-work-dco)).
+- [ ] Changes to surfaces in [COMPATIBILITY.md](https://github.com/steerlabs/portablefs/blob/main/COMPATIBILITY.md) are called out above and reviewed.
 - [ ] No secrets, tokens, or personal paths added; no new `..`/symlink path handling that bypasses the volume root.
 - [ ] Docs updated if behavior or guarantees changed.

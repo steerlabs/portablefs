@@ -130,7 +130,7 @@ func commands() []command {
 		{"logout", "remove saved credentials for a profile", cmdLogout},
 		{"create", "create a volume (with branch main)", cmdCreate},
 		{"adopt", "import an existing local directory into a new volume", cmdAdopt},
-		{"activate", "enter an adopted branch into journal service (adopt does this automatically)", cmdActivate},
+		{"activate", "resume an interrupted adopt (adopt runs this automatically)", cmdActivate},
 		{"ls", "list volumes", cmdLs},
 		{"rm", "retire (delete) a volume; live mounts detach as their leases expire", cmdRm},
 		{"status", "show a branch head summary and activity counts", cmdStatus},
@@ -140,7 +140,6 @@ func commands() []command {
 		{"branch", "create a branch within a volume", cmdBranch},
 		{"branches", "list branches of a volume", cmdBranches},
 		{"fork", "fork a volume into a new volume (give every agent its own fork)", cmdFork},
-		{"exec", "retired; mount the volume and run commands locally", cmdExec},
 		{"grep", "search a branch's file bytes server-side", cmdGrep},
 		{"mount", "mount a live volume on this machine", cmdMount},
 		{"umount", "unmount a mounted volume and stop its daemon", cmdUmount},
@@ -180,6 +179,10 @@ func (e *cmdEnv) run(args []string) int {
 		return 0
 	case "-version", "--version":
 		name, args = "version", args[:1]
+	case "unmount":
+		// `umount` is the POSIX spelling; accept `unmount` (what many macOS
+		// users type, cf. `diskutil unmount`) as an alias.
+		name = "umount"
 	}
 	cmd, ok := findCommand(name)
 	if !ok {

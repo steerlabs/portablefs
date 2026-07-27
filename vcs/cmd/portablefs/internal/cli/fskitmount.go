@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -428,7 +427,3 @@ func mountFSKitPath(fsType, attachRef, mountPath string) error {
 	}
 	return nil
 }
-
-// errFskitUnsupported is returned on non-darwin builds (the strategy switch
-// never selects fskit there; this is defense in depth).
-var errFskitUnsupported = errors.New("the fskit strategy requires macOS")
