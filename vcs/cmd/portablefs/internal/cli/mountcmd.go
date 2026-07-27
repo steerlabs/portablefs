@@ -745,6 +745,31 @@ func platformUnmount(strategy, mountPath string) error {
 	return lastErr
 }
 
+// isMountpoint reports whether path currently has a filesystem mounted on it:
+// its device id differs from its parent directory's (the same check
+// mountpoint(1) performs, via syscall.Stat_t on darwin and linux — no tool
+// output to parse). A path that does not exist or cannot be stat'ed counts as
+// not mounted; umount reconciliation treats both the same way.
+func isMountpoint(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	parentFi, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	parentSt, ok := parentFi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return st.Dev != parentSt.Dev
+}
+
 func cmdUmount(e *cmdEnv, args []string) int {
 	fs := newFlagSet("umount")
 	var o commonOpts
@@ -771,7 +796,12 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	if st == nil {
 		fmt.Fprintf(e.stderr, "portablefs umount: warning: no mount state recorded for %s; attempting a plain unmount\n", mountPath)
 		if err := platformUnmount("", mountPath); err != nil {
-			return e.fail("umount", err)
+			if isMountpoint(mountPath) {
+				return e.fail("umount", err)
+			}
+			// Unmount is idempotent: a path with nothing mounted on it is
+			// already in the state the user asked for.
+			fmt.Fprintf(e.stderr, "portablefs umount: warning: nothing was mounted at %s\n", mountPath)
 		}
 		if o.jsonOut {
 			return e.printJSON(map[string]any{"mountPath": mountPath, "unmounted": true, "tracked": false})
@@ -781,12 +811,20 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 
 	if err := platformUnmount(st.Strategy, mountPath); err != nil {
-		if pidAlive(st.PID) {
+		switch {
+		case isMountpoint(mountPath) && pidAlive(st.PID):
 			return e.fail("umount", fmt.Errorf("%w\nif the volume is busy, close processes using %s and retry", err, mountPath))
+		case pidAlive(st.PID):
+			// The platform mount was torn down externally (forced diskutil
+			// unmount, extension crash) but the daemon lingers: reconcile —
+			// stop it and drop the record — instead of reporting "busy" for
+			// a path that has nothing mounted on it.
+			fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d still running); stopping it and removing stale mount state\n", mountPath, st.PID)
+		default:
+			// Daemon already gone and nothing to unmount: a stale record. Clean it
+			// up instead of failing, so `mounts` stops flagging it.
+			fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
 		}
-		// Daemon already gone and nothing to unmount: a stale record. Clean it
-		// up instead of failing, so `mounts` stops flagging it.
-		fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
 	}
 	if pidAlive(st.PID) {
 		stopMountDaemon(st.PID)
