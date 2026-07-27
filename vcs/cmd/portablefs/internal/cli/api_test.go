@@ -748,59 +748,6 @@ func Test401AppendsLoginGuidance(t *testing.T) {
 	}
 }
 
-// TestLiveAuthorityRefusalTranslatesEverywhere: when a server refuses a live
-// branch with the typed live-authority code (current servers run exec against
-// an exact cut of the live state, but older ones refuse), the CLI answers in
-// plain language, never the raw internal envelope.
-func TestLiveAuthorityRefusalTranslatesEverywhere(t *testing.T) {
-	f := newFakeServer(t)
-	f.on("POST", "/v1/volumes/vol_live/exec", func(map[string]any) (int, string) {
-		return 409, `{"error":{"code":"LIVE_AUTHORITY_ROUTE_REQUIRED","message":"This branch is served by a live journal authority; use the live filesystem routes instead of manifest access."}}`
-	})
-	e, _, stderr := testEnv(t)
-	args := append(f.commonArgs("exec", "vol_live"), "--", "ls")
-	if rc := e.run(args); rc == 0 {
-		t.Fatal("exec against a live branch must fail")
-	}
-	msg := stderr.String()
-	if !strings.Contains(msg, "live authority") || !strings.Contains(msg, "mount") {
-		t.Fatalf("live refusal must explain itself in plain language: %q", msg)
-	}
-	for _, jargon := range []string{"LIVE_AUTHORITY_ROUTE_REQUIRED", "manifest access", "journal authority"} {
-		if strings.Contains(msg, jargon) {
-			t.Fatalf("raw envelope text must not leak: %q", msg)
-		}
-	}
-}
-
-func TestExecPropagatesExitCodeAndStreams(t *testing.T) {
-	f := newFakeServer(t)
-	f.on("POST", "/v1/volumes/vol_1/exec", func(body map[string]any) (int, string) {
-		if body["command"] != "npm test -- -v" || body["write"] != true || body["branch"] != "dev" {
-			return 400, `{"error":{"code":"BAD","message":"wrong exec body"}}`
-		}
-		if ms, ok := body["timeoutMs"].(float64); !ok || ms != 120000 {
-			return 400, `{"error":{"code":"BAD","message":"wrong timeoutMs"}}`
-		}
-		return 200, `{"stdout":"tests passed\n","stderr":"warning: slow\n","exitCode":3,"signal":null,"timing":{"totalMs":10,"setupMs":1,"executeMs":8,"commitMs":1},"headCommitId":"cmt_2","committed":true}`
-	})
-	e, stdout, stderr := testEnv(t)
-	args := append(f.commonArgs("exec", "vol_1", "--branch", "dev", "--write", "--timeout", "2m"), "--", "npm", "test", "--", "-v")
-	rc := e.run(args)
-	if rc != 3 {
-		t.Fatalf("exec must exit with the remote code: rc = %d, want 3", rc)
-	}
-	if stdout.String() != "tests passed\n" {
-		t.Fatalf("stdout = %q", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "warning: slow") {
-		t.Fatalf("stderr must carry remote stderr: %q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "committed changes as cmt_2") {
-		t.Fatalf("stderr must mention the commit: %q", stderr.String())
-	}
-}
-
 func TestGrepPrintsMatchesAndExitCodes(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/volumes/vol_1/grep", func(body map[string]any) (int, string) {

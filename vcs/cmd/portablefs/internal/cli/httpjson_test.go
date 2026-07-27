@@ -24,8 +24,6 @@ func TestFriendlyErrorTextTranslatesTypedCodes(t *testing.T) {
 		{"ACCESS_LEASE_UNAUTHORIZED", []string{"portablefs login", "remount"}},
 		{"ACCESS_LEASE_INTERNAL", []string{"internal error", "try again", "docker compose logs authority-manager"}},
 		{"VOLUME_COMMIT_PFT2_NO_MANIFEST", []string{"content-addressed", "upgrade"}},
-		{"VOLUME_EXEC_DISABLED", []string{"disabled", "do not enable", "locally"}},
-		{"VOLUME_EXEC_RETIRED", []string{"retired", "mount", "locally"}},
 	}
 	for _, tc := range cases {
 		got := friendlyErrorText(tc.code)
@@ -153,7 +151,7 @@ func TestVersionHandshakeFailsFastBelowMinimum(t *testing.T) {
 	for _, want := range []string{
 		"this CLI is v1.4.0",
 		"requires at least 2.0.0",
-		"upgrade with: curl -fsSL " + srv.URL + "/install | sh",
+		"upgrade with: curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("skew failure missing %q: %q", want, msg)
@@ -192,7 +190,7 @@ func TestVersionHandshakeDevBuildWarnsOnceAndProceeds(t *testing.T) {
 	if got := strings.Count(msg, "portablefs: warning:"); got != 1 {
 		t.Fatalf("dev skew must warn exactly once, got %d: %q", got, msg)
 	}
-	if !strings.Contains(msg, "requires CLI 2.0.0 or newer") || !strings.Contains(msg, "curl -fsSL "+srv.URL+"/install | sh") {
+	if !strings.Contains(msg, "requires CLI 2.0.0 or newer") || !strings.Contains(msg, "curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh") {
 		t.Fatalf("dev warning must name the minimum and the upgrade command: %q", msg)
 	}
 }

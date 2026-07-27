@@ -36,17 +36,6 @@ builds:
     ldflags:
       - -s -w
 
-  - id: fsio
-    dir: vcs
-    main: ./cmd/fsio
-    binary: fsio
-    env:
-      - CGO_ENABLED=0
-    goos: [linux, darwin]
-    goarch: [amd64, arm64]
-    ldflags:
-      - -s -w
-
   - id: portablefsd
     dir: vcs
     main: ./cmd/portablefsd

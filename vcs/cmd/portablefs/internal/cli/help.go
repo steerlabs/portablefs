@@ -25,6 +25,7 @@ QUICKSTART
 VOLUMES
   create <name>                create a volume (omit <name> for a generated id)
   adopt <dir>                  import an existing local directory into a new volume
+  activate <volumeId>          resume an interrupted adopt (adopt runs this for you)
   ls                           list volumes with their branches
   rm <volumeId>                retire (delete) a volume — mounts detach as leases expire
   status <volumeId>            branch head, tree hash, active leases/delegations
@@ -40,9 +41,6 @@ DATA MANAGEMENT
 
 SEARCH (no mount needed)
   grep <volumeId> <pattern>    search a branch's file bytes server-side
-
-RETIRED
-  exec <volumeId> -- <cmd...>  retained only to return mount guidance
 
 MOUNTS (this machine)
   mount <volumeId> <path>      attach the live volume (FSKit on macOS, FUSE on Linux)
@@ -119,12 +117,14 @@ EXAMPLES
 		"activate": `USAGE
   portablefs activate <volumeId> [--branch main] [--timeout 15m] [--json]
 
-Enter a base-authored (adopted) branch into managed journal service: the
-server converts the committed manifest head into the immutable journal base
-and flips the branch mode, after which the volume can be mounted. Adopt runs
-this automatically as its final step — the explicit command exists for
-volumes adopted before activation shipped and for resuming an interrupted
-activation. Idempotent: an already-active branch answers immediately.
+Finish entering an adopted volume into service after an interrupted
+` + "`portablefs adopt`" + `. Idempotent and safe to re-run: an already-active
+branch answers immediately. You rarely run this directly — adopt runs it
+automatically as its final step, and prints this command if it is interrupted.
+
+Under the hood it converts the committed head into the immutable journal base
+and flips the branch into managed journal service, after which the volume can
+be mounted.
 
 EXAMPLES
   portablefs activate my-repo
@@ -176,7 +176,7 @@ head commits.
   portablefs rm <volumeId> [--yes] [--json]
 
 Retire (delete) a volume — this cannot be undone. The volume immediately
-disappears from listings and from every API surface (attach, exec/grep,
+disappears from listings and from every API surface (attach, grep,
 branches, snapshots, and forks of its snapshots all answer the same not-found
 an unknown volume gets), and its slot is freed for a new volume. Existing
 live mounts are not force-detached: they lose access shortly afterwards as
@@ -265,18 +265,6 @@ then hands you the equivalent same-volume command
 EXAMPLES
   portablefs fork my-workspace --name agent-run-7
   portablefs fork my-workspace --snapshot before-refactor
-`,
-		"exec": `RETIRED
-  portablefs exec <volumeId> [--branch main] [--write] [--timeout 60s]
-                  [--json] -- <command...>
-
-Server-side command execution has been retired from the Volume API so the
-storage/control plane never runs tenant commands in its host trust domain.
-Mount the volume and run the command locally:
-
-EXAMPLES
-  portablefs mount my-workspace ./workspace
-  (cd ./workspace && npm test)
 `,
 		"grep": `USAGE
   portablefs grep <volumeId> <pattern> [--dir path] [--branch main]

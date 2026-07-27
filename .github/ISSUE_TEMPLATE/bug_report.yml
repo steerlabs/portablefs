@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Thanks for filing a bug. For suspected security vulnerabilities, do NOT
-        open a public issue — follow [SECURITY.md](../blob/main/SECURITY.md).
+        open a public issue — follow [SECURITY.md](https://github.com/steerlabs/portablefs/blob/main/SECURITY.md).
   - type: textarea
     id: what-happened
     attributes:

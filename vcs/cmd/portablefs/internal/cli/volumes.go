@@ -186,7 +186,7 @@ func (e *cmdEnv) printManifestStatus(o *commonOpts, br *branchInfo, head *headRe
 	}
 	fmt.Fprintf(e.stdout, "volume       %s\n", head.Volume.ID)
 	fmt.Fprintf(e.stdout, "branch       %s\n", head.Branch.Name)
-	fmt.Fprintf(e.stdout, "mode         authoring (commits move the manifest head)\n")
+	fmt.Fprintf(e.stdout, "mode         authoring (import in progress — finish with: portablefs activate %s)\n", head.Volume.ID)
 	fmt.Fprintf(e.stdout, "head         %s\n", head.Head.ID)
 	fmt.Fprintf(e.stdout, "tree         %s\n", head.Head.TreeHash)
 	fmt.Fprintf(e.stdout, "leases       %d active\n", head.ActiveLeases)
