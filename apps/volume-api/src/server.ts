@@ -1597,7 +1597,11 @@ async function routeRequest(
       });
       return;
     }
-    const uploaded = await deps.blobStore.put(body, { digest, checkExisting: false });
+    const uploaded = await deps.blobStore.put(body, {
+      digest,
+      checkExisting: false,
+      signal: deps.requestSignal,
+    });
     await deps.metadata.recordBlobs([
       Object.assign(
         {
@@ -1973,6 +1977,7 @@ async function uploadBlobBatchEntries(
       const result = await deps.blobStore.put(entry.bytes, {
         digest: entry.digest,
         checkExisting: false,
+        signal: deps.requestSignal,
       });
       return { result };
     } catch (error) {

@@ -271,6 +271,15 @@ manager-minted runtime read credentials (below).
 
 The TLS requirement is unconditional (never keyed to `NODE_ENV`); an unset or
 nonstandard Node environment can never weaken a production authority router.
+Router resource admission is bounded without imposing an idle lifetime on
+healthy mounts: `PORTABLEFS_AUTHORITY_ROUTER_MAX_PENDING_CONNECTIONS` defaults
+to 256 handshakes/backend dials, `PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS`
+defaults to 4096 live tunnels across the process, and
+`PORTABLEFS_AUTHORITY_ROUTER_MAX_TUNNELS_PER_LEASE` defaults to 64 live or
+in-flight tunnels for one access lease. The per-lease limit must not exceed the
+global limit. Tune these upward only with matching file-descriptor and memory
+budgets; connections over a bound are refused while existing tunnels continue
+unchanged.
 
 Optional: `PORTABLEFS_MANAGED_VCS_JOURNAL_POOLER_MODE=transaction` when the
 journal DSN reaches a transaction-mode pooler (PgBouncer/pgcat) — the manager

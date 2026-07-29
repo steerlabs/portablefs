@@ -5,6 +5,12 @@
   "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@10.29.3",
+  "pnpm": {
+    "overrides": {
+      "esbuild": "0.28.1",
+      "postcss": "8.5.18"
+    }
+  },
   "scripts": {
     "build": "pnpm -r --sort build",
     "test": "pnpm build && pnpm -r --sort test && go -C vcs test ./...",

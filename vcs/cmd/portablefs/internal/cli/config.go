@@ -40,10 +40,23 @@ func defaultConfigPath() (string, error) {
 // loadConfig reads the config file. A missing file is an empty config, not an
 // error, so first-run commands work before any login.
 func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		return &Config{CurrentProfile: "default", Profiles: map[string]Profile{}}, nil
 	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect config %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("refuse unsafe config %s: expected a regular non-symlink file", path)
+	}
+	if err := verifyConfigFilePermissions(path, info); err != nil {
+		return nil, err
+	}
+	if err := verifyConfigDirectory(filepath.Dir(path), false); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
@@ -64,21 +77,62 @@ func loadConfig(path string) (*Config, error) {
 // tokens). The parent directory is created on demand; an existing file's mode
 // is reset to 0600 in case it was created loose by another tool.
 func saveConfig(path string, cfg *Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
+	dir := filepath.Dir(path)
+	if err := verifyConfigDirectory(dir, true); err != nil {
+		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".portablefs-config-*.tmp")
+	if err != nil {
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	tmpName := tmp.Name()
+	keepTemp := true
+	defer func() {
+		if keepTemp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := secureTemporaryConfigFile(path, tmp); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
-	return os.Chmod(path, 0o600)
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync config %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close config %s: %w", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("write config %s: %w", path, err)
+	}
+	keepTemp = false
+	return syncConfigDirectory(dir)
+}
+
+func verifyConfigDirectory(dir string, create bool) error {
+	info, err := os.Lstat(dir)
+	if os.IsNotExist(err) && create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create config directory: %w", err)
+		}
+		info, err = os.Lstat(dir)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect config directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("refuse unsafe config directory %s: expected a non-symlink directory", dir)
+	}
+	return verifyConfigDirectoryPermissions(dir, info, create)
 }
 
 // settings is the fully resolved connection configuration for one command run.
