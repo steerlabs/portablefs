@@ -123,6 +123,13 @@ environment knobs not documented in [docs/](./docs/) (operator budgets
 replace toggles over time), test helpers and `packages/testkit`, scripts,
 benchmark harnesses, and documentation wording.
 
+The per-user `portablefsd` HTTP control API is also a private paired-release
+surface. The CLI and menu app require an exact `/v1/identity` match for the
+daemon version, executable digest, and control protocol before issuing any
+operational request. This is intentionally stricter than the additive
+`pfslocal` mount-wire policy: an older live daemon is left untouched and the
+operation fails closed until it is cleanly drained.
+
 ## Changing A Frozen Surface
 
 Frozen does not mean immortal; changes are deliberate and staged:

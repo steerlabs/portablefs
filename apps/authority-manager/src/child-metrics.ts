@@ -45,13 +45,51 @@ export interface ChildMetricSpec {
 // REQUIRES adding it here with an explicit aggregator — nothing passes by
 // default. The names are the hosted manager's exact allowlist (ecosystem
 // compatibility: the same exposition passes both managers) extended with the
-// OSS child's additions: vcs_fsproto_op_other and the dirty-RSS gauges.
+// OSS child's additions: the fixed per-op counters and the dirty-RSS gauges.
 export const childMetricAllowlist: Readonly<Record<string, ChildMetricSpec>> = {
   // Readiness boolean: aggregate as ALL (minimum).
   vcs_ready: { aggregator: "gauge_min" },
 
   // Monotonic counters: sums are meaningful.
   vcs_fsproto_ops: { aggregator: "counter" },
+  vcs_fsproto_op_getattr: { aggregator: "counter" },
+  vcs_fsproto_op_readdir: { aggregator: "counter" },
+  vcs_fsproto_op_read: { aggregator: "counter" },
+  vcs_fsproto_op_write: { aggregator: "counter" },
+  vcs_fsproto_op_create: { aggregator: "counter" },
+  vcs_fsproto_op_mkdir: { aggregator: "counter" },
+  vcs_fsproto_op_remove: { aggregator: "counter" },
+  vcs_fsproto_op_rename: { aggregator: "counter" },
+  vcs_fsproto_op_symlink: { aggregator: "counter" },
+  vcs_fsproto_op_readlink: { aggregator: "counter" },
+  vcs_fsproto_op_truncate: { aggregator: "counter" },
+  vcs_fsproto_op_fsync: { aggregator: "counter" },
+  vcs_fsproto_op_subscribe: { aggregator: "counter" },
+  vcs_fsproto_op_setattr: { aggregator: "counter" },
+  vcs_fsproto_op_checkout: { aggregator: "counter" },
+  vcs_fsproto_op_checkin: { aggregator: "counter" },
+  vcs_fsproto_op_flush_batch: { aggregator: "counter" },
+  vcs_fsproto_op_lock: { aggregator: "counter" },
+  vcs_fsproto_op_orphan: { aggregator: "counter" },
+  vcs_fsproto_op_reap: { aggregator: "counter" },
+  vcs_fsproto_op_renew_orphan_leases: { aggregator: "counter" },
+  vcs_fsproto_op_mark_open: { aggregator: "counter" },
+  vcs_fsproto_op_renew_open_inodes: { aggregator: "counter" },
+  vcs_fsproto_op_unmark_open_inodes: { aggregator: "counter" },
+  vcs_fsproto_op_getxattr: { aggregator: "counter" },
+  vcs_fsproto_op_setxattr: { aggregator: "counter" },
+  vcs_fsproto_op_listxattr: { aggregator: "counter" },
+  vcs_fsproto_op_removexattr: { aggregator: "counter" },
+  vcs_fsproto_op_link: { aggregator: "counter" },
+  vcs_fsproto_op_delegation_acquire: { aggregator: "counter" },
+  vcs_fsproto_op_writeback_state: { aggregator: "counter" },
+  vcs_fsproto_op_writeback_rebind: { aggregator: "counter" },
+  vcs_fsproto_op_writeback_discard: { aggregator: "counter" },
+  vcs_fsproto_op_protocol_version: { aggregator: "counter" },
+  vcs_fsproto_op_session_open: { aggregator: "counter" },
+  vcs_fsproto_op_session_resume: { aggregator: "counter" },
+  vcs_fsproto_op_session_attach: { aggregator: "counter" },
+  vcs_fsproto_op_session_expire: { aggregator: "counter" },
   vcs_fsproto_op_other: { aggregator: "counter" },
   vcs_mutations: { aggregator: "counter" },
   vcs_wal_replay_skips: { aggregator: "counter" },

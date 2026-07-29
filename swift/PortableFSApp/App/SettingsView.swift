@@ -53,17 +53,10 @@ struct SettingsView: View {
                     .font(.caption)
                 LabeledContent("Log", value: model.daemon.logPath)
                     .font(.caption)
-                HStack {
-                    Button("Restart Daemon") {
-                        Task {
-                            await model.daemon.restart()
-                        }
-                    }
-                    Button("Reveal Log in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting(
-                            [URL(fileURLWithPath: model.daemon.logPath)]
-                        )
-                    }
+                Button("Reveal Log in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: model.daemon.logPath)]
+                    )
                 }
             }
         }

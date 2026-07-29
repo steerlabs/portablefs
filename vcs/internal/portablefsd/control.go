@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
 func (s *Server) ServeControl(ctx context.Context) error {
@@ -30,8 +32,23 @@ func (s *Server) ServeControl(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/v1/attaches", s.handleAttaches)
-	mux.HandleFunc("/v1/attaches/", s.handleAttach)
+	mux.HandleFunc("/v1/identity", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, http.StatusOK, daemonctl.Identity{
+			SchemaVersion:    daemonctl.IdentitySchemaVersion,
+			ControlProtocol:  daemonctl.ControlProtocolVersion,
+			DaemonVersion:    s.cfg.Version,
+			ExecutableSHA256: s.cfg.ExecutableSHA256,
+			PFSLocalMajor:    pfslocal.ProtocolMajor,
+			PFSLocalMinor:    pfslocal.ProtocolMinor,
+		})
+	})
+	mux.Handle("/v1/attaches", requireControlProtocol(http.HandlerFunc(s.handleAttaches)))
+	mux.Handle("/v1/attaches/", requireControlProtocol(http.HandlerFunc(s.handleAttach)))
+	mux.Handle("/v1/lifecycle/stop-if-idle", requireControlProtocol(http.HandlerFunc(s.handleStopIfIdle)))
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -46,6 +63,34 @@ func (s *Server) ServeControl(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) handleStopIfIdle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	idle, attachCount, err := s.registry.quiesceIfIdle()
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !idle {
+		writeHTTPError(w, http.StatusConflict, fmt.Sprintf("daemon has %d attach(es); cleanly unmount all volumes before stopping it", attachCount))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+	go s.stopOnce.Do(func() { close(s.stopCh) })
+}
+
+func requireControlProtocol(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(daemonctl.ControlProtocolHeader) != strconv.Itoa(daemonctl.ControlProtocolVersion) {
+			writeHTTPError(w, http.StatusUpgradeRequired, "incompatible or missing PortableFS daemon control protocol")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {

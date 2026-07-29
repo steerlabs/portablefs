@@ -16,10 +16,11 @@ import (
 func TestFsyncErrorsOnFencedSession(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
-	v := dialCore(t, addr, Options{
+	v := dialCoreNoCleanup(t, addr, Options{
 		Owner:  "M",
 		WALDir: t.TempDir(),
 	})
+	t.Cleanup(func() { _, _ = v.CloseJournalDurable() })
 
 	// A subtree path so the engine delegates and acknowledges locally (a
 	// top-level file runs write-through and would just ESTALE immediately).

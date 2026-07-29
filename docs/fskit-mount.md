@@ -58,13 +58,17 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
 ```
 
 1. **Ensure the daemon.** The CLI probes the `portablefsd` control socket
-   (`GET /healthz`). A healthy daemon is adopted — the daemon is per-user and
+   (`GET /healthz`) and requires an exact `/v1/identity` match for the
+   CLI/daemon release, exact daemon executable SHA-256, private control
+   protocol, and `pfslocal` major protocol. A
+   healthy compatible daemon is adopted — the daemon is per-user and
    multi-attach, so one instance serves every mount, whether the CLI or the
-   menu-bar app started it. Otherwise the CLI spawns one, detached into its
-   own session so it outlives the mount process and serves later mounts. The
-   daemon binary is discovered next to the `portablefs` executable first (the
-   release-archive layout), then on `PATH`; `PORTABLEFS_FSKIT_DAEMON` points
-   at an explicit binary.
+   menu-bar app started it. An incompatible live daemon fails closed with
+   clean-stop guidance; the CLI never replaces it automatically. Otherwise
+   the CLI spawns one, detached into its own session so it outlives the mount
+   process and serves later mounts. The daemon binary is discovered next to
+   the `portablefs` executable first (the release-archive layout), then on
+   `PATH`; `PORTABLEFS_FSKIT_DAEMON` points at an explicit binary.
 2. **Register the attach.** `POST /v1/attaches` on the control socket carries
    everything the daemon needs to own the authority connection itself: the
    resolved authority URL, the data-plane token, the TLS CA bundle as PEM
@@ -85,8 +89,9 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
    what file-access exceptions it holds. The daemon the CLI ensures must
    therefore serve exactly that container socket (see the overrides below).
 
-The command then behaves like every `portablefs mount`: it returns once the
-path is live and daemonizes (state under `~/.local/state/portablefs/mounts/`),
+The command then behaves like every `portablefs mount`: it returns only after
+the kernel reports the path mounted and a real root enumeration succeeds, then
+daemonizes (state under `~/.local/state/portablefs/mounts/`),
 the mount process keeps the access lease renewed and pushes rotated
 credentials into the daemon (`POST /v1/attaches/{ref}/credential`), and
 `portablefs umount` unmounts through `/sbin/umount` (falling back to
@@ -115,14 +120,19 @@ the `pfs` fs type.
 
 The release archive ships `portablefsd` alongside the `portablefs` binary;
 keeping them siblings (or `portablefsd` on `PATH`) is all the daemon setup
-there is.
+there is. The installer validates both downloaded versions before changing
+the destination and refuses while any same-user `portablefsd` is running. It
+never restarts or replaces a live daemon; cleanly unmount and stop the idle
+daemon before upgrading. Use the matching installed CLI's
+`portablefs daemon stop` after all mounts are gone; the daemon atomically
+refuses the stop if any attach still exists.
 
 ## Daemon Lifecycle
 
 - **Per-user, multi-attach.** One `portablefsd` serves every attach for the
-  user. The CLI adopts any healthy daemon on the control socket and never
-  duplicates it; the menu-bar app does the same when they share sockets, so
-  CLI and app mounts ride one daemon.
+  user. The CLI adopts a healthy daemon only when its exact control identity
+  is compatible and never duplicates or automatically replaces it. CLI and
+  app mounts can ride the same compatible daemon when they share sockets.
 - **Spawn.** When nothing healthy answers, the CLI starts
   `portablefsd -frontend-socket ... -control-socket ...` with a state dir at
   `~/.local/state/portablefs/portablefsd`, detached, and waits up to 15
@@ -238,12 +248,10 @@ extension name) forces a fresh instance on the next mount.
 
 ### A foreign daemon owns the sockets
 
-The CLI adopts whatever answers `/healthz` on the control socket. If that
-daemon is not the one you expect — a stale dev build from another checkout —
-the symptoms are attaches served by a build you did not intend or mounts
-that die when that daemon stops. (The sockets live in the per-user app-group
-container under `$HOME`, so unlike a `/tmp` path they can never be another
-user's.)
+The CLI requires both liveness and an exact control identity on the control
+socket. A stale dev build or older release is refused before an attach is
+created. (The sockets live in the per-user app-group container under `$HOME`,
+so unlike a `/tmp` path they can never be another user's.)
 
 The fix depends on which extension you run:
 

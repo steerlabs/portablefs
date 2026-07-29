@@ -170,6 +170,7 @@ public struct UnixSocketHTTPClient: Sendable {
         var request = "\(method) \(path) HTTP/1.1\r\n"
         request += "Host: portablefsd\r\n"
         request += "Connection: close\r\n"
+        request += "X-PortableFS-Control-Protocol: 1\r\n"
         if let body {
             request += "Content-Type: \(contentType)\r\n"
             request += "Content-Length: \(body.count)\r\n"

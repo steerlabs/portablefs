@@ -36,10 +36,6 @@ This file tracks what production packaging still needs.
 - [ ] Bundle a `portablefsd` universal binary into `Contents/Resources/` as
       part of the build (script phase building from the Go repo), so step 4 of
       the binary search order always hits.
-- [ ] Credential re-issue on daemon restart: revived attaches come back
-      `degraded` ("credentials required after daemon restart"); the app should
-      detect that state and re-run the mount-session + `POST
-      /v1/attaches/<ref>/credential` flow automatically.
 
 ## App polish
 

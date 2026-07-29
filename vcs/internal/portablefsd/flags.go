@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 )
 
 // AppGroup is the macOS app-group container shared with the FSKit extension
@@ -17,6 +19,7 @@ const AppGroup = "B47U2LLKHW.pfsoss"
 func ParseFlags(version string) (Config, bool) {
 	var cfg Config
 	cfg.Version = version
+	cfg.ExecutableSHA256, _ = daemonctl.CurrentExecutableSHA256()
 	home, _ := os.UserHomeDir()
 	defaultState := filepath.Join(home, "Library", "Application Support", "PortableFS", "portablefsd")
 	if home == "" {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -632,7 +633,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err != nil {
 			return failReady(err)
 		}
-		ctl, err := ensurePortablefsd(fskitCfg, filepath.Dir(stateDir))
+		ctl, err := ensurePortablefsd(fskitCfg, filepath.Dir(stateDir), e.version)
 		if err != nil {
 			return failReady(err)
 		}
@@ -649,17 +650,27 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return failReady(err)
 		}
 		attachRef := attachReply.AttachRef
-		detach := func() {
-			if err := ctl.deleteAttach(attachRef); err != nil {
+		detach := func() error {
+			return ctl.deleteAttach(attachRef)
+		}
+		detachBestEffort := func() {
+			if err := detach(); err != nil {
 				fmt.Fprintf(e.stderr, "portablefs mount: detach %s: %v\n", attachRef, err)
 			}
 		}
-		if err := fskitPreflight(fskitCfg.frontendSock, attachRef); err != nil {
-			detach()
+		if err := fskitPreflight(fskitCfg.frontendSock, attachRef, e.version); err != nil {
+			detachBestEffort()
 			return failReady(err)
 		}
 		if err := mountFSKitPath(fskitCfg.fsType, attachRef, mountPath); err != nil {
-			detach()
+			detachBestEffort()
+			return failReady(err)
+		}
+		if err := waitForFSKitRoot(mountPath, fskitCfg.fsType, "pfs://"+attachRef, 15*time.Second); err != nil {
+			if unmountErr := platformUnmount("fskit", mountPath); unmountErr != nil {
+				return failReady(fmt.Errorf("%w; cleanup unmount failed, so attach %s was deliberately left live: %v", err, attachRef, unmountErr))
+			}
+			detachBestEffort()
 			return failReady(err)
 		}
 		// Rotated/renewed lease credentials must reach the daemon: it owns
@@ -678,8 +689,10 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			state.AccessLease = &lease
 		}
 		if err := writeMountState(stateDir, state); err != nil {
-			_ = platformUnmount("fskit", mountPath)
-			detach()
+			if unmountErr := platformUnmount("fskit", mountPath); unmountErr != nil {
+				return failReady(fmt.Errorf("%w; cleanup unmount failed, so attach %s was deliberately left live: %v", err, attachRef, unmountErr))
+			}
+			detachBestEffort()
 			return failReady(err)
 		}
 		report(ready)
@@ -689,13 +702,29 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		}
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		if err := platformUnmount("fskit", mountPath); err != nil {
-			fmt.Fprintf(e.stderr, "portablefs mount: unmount on shutdown: %v\n", err)
+		defer signal.Stop(sig)
+		for {
+			<-sig
+			if isMountpoint(mountPath) {
+				if _, err := ctl.syncAttach(attachRef); err != nil {
+					fmt.Fprintf(e.stderr, "portablefs mount: shutdown drain refused; mount remains live: %v\n", err)
+					continue
+				}
+				if err := platformUnmount("fskit", mountPath); err != nil && isMountpoint(mountPath) {
+					fmt.Fprintf(e.stderr, "portablefs mount: unmount on shutdown failed; mount remains live: %v\n", err)
+					continue
+				}
+			}
+			// A normal detach repeats the durability barrier inside the
+			// daemon and unregisters the attach only on success. If the
+			// kernel mount was removed externally and that barrier cannot
+			// finish, retain the attach, lease, and state for a retry.
+			if err := detach(); err != nil {
+				fmt.Fprintf(e.stderr, "portablefs mount: detach on shutdown refused; attach remains live: %v\n", err)
+				continue
+			}
+			break
 		}
-		// Detach AFTER the kernel unmount so the daemon flushes everything
-		// the extension handed it before the attach drops.
-		detach()
 		stopKeeper()
 		if keeper != nil {
 			keeper.release()
@@ -705,6 +734,48 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 
 	default:
 		return failReady(fmt.Errorf("unknown strategy %q", strategy))
+	}
+}
+
+// waitForFSKitRoot waits for a kernel-visible mount whose root can answer a
+// real filesystem operation. mount(8) may return before the FSKit resource
+// has completed loading; reporting readiness in that gap makes the first
+// user operation fail even though the mount becomes usable moments later.
+func waitForFSKitRoot(mountPath, expectedFSType, expectedSource string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if !isMountpoint(mountPath) {
+			lastErr = fmt.Errorf("path is not a mount point yet")
+		} else if err := verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource); err != nil {
+			lastErr = err
+		} else {
+			root, err := os.Open(mountPath)
+			if err == nil {
+				_, statErr := root.Stat()
+				_, readErr := root.Readdirnames(1)
+				closeErr := root.Close()
+				if statErr != nil {
+					lastErr = statErr
+				} else if readErr == nil || readErr == io.EOF {
+					if closeErr == nil {
+						return nil
+					}
+					lastErr = closeErr
+				} else {
+					lastErr = readErr
+				}
+			} else {
+				lastErr = err
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf(
+				"FSKit mounted %s but its root did not become usable within %s: %w",
+				mountPath, timeout, lastErr,
+			)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -865,7 +936,10 @@ func cmdUmount(e *cmdEnv, args []string) int {
 func (e *cmdEnv) drainBeforeUnmount(st *mountState) error {
 	switch {
 	case st.Strategy == "fskit" && st.AttachRef != "":
-		ctl := newFsdControl(fskitConfigFromEnv(e.getenv).controlSock)
+		ctl, err := connectCompatiblePortablefsd(fskitConfigFromEnv(e.getenv), e.version)
+		if err != nil {
+			return fmt.Errorf("pre-unmount daemon identity: %w", err)
+		}
 		if _, err := ctl.syncAttach(st.AttachRef); err != nil {
 			return fmt.Errorf("pre-unmount drain failed: %w", err)
 		}
@@ -901,7 +975,11 @@ func (e *cmdEnv) forceDetachForUnmount(st *mountState) []string {
 	if st.Strategy != "fskit" || st.AttachRef == "" {
 		return nil
 	}
-	ctl := newFsdControl(fskitConfigFromEnv(e.getenv).controlSock)
+	ctl, identityErr := connectCompatiblePortablefsd(fskitConfigFromEnv(e.getenv), e.version)
+	if identityErr != nil {
+		fmt.Fprintf(e.stderr, "portablefs umount: warning: exact daemon identity check failed (%v); the explicit force path will not send control requests to that daemon\n", identityErr)
+		return nil
+	}
 	jobID, err := ctl.forceDetach(st.AttachRef)
 	if err != nil {
 		fmt.Fprintf(e.stderr, "portablefs umount: warning: force-detach through the daemon failed (%v); proceeding with the platform unmount — parked streams remain visible in the on-disk recovery registry\n", err)
@@ -1005,7 +1083,16 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// the daemon's last error in the printed line).
 		AttachState string `json:"attachState,omitempty"`
 	}
-	daemonView := fskitAttachStatuses(e.getenv)
+	var daemonView map[string]cliAttachStatus
+	for i := range states {
+		if states[i].Strategy == "fskit" && states[i].AttachRef != "" {
+			daemonView, err = fskitAttachStatuses(e.getenv, e.version)
+			if err != nil {
+				return e.fail("mounts", err)
+			}
+			break
+		}
+	}
 	rows := make([]mountRow, 0, len(states))
 	for i := range states {
 		row := mountRow{mountState: states[i], Alive: pidAlive(states[i].PID), Health: mountHealth(&states[i])}
@@ -1062,16 +1149,25 @@ func cmdMounts(e *cmdEnv, args []string) int {
 // fskitAttachStatuses reads the daemon's attach table, keyed by attach ref.
 // Best-effort with a short budget: `portablefs mounts` must answer instantly
 // whether or not a daemon is running.
-func fskitAttachStatuses(getenv func(string) string) map[string]cliAttachStatus {
-	ctl := newFsdControl(fskitConfigFromEnv(getenv).controlSock)
+func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[string]cliAttachStatus, error) {
+	cfg := fskitConfigFromEnv(getenv)
+	liveness := newFsdControl(cfg.controlSock)
+	liveness.httpClient.Timeout = 3 * time.Second
+	if !liveness.healthy() {
+		return nil, nil
+	}
+	ctl, err := connectCompatiblePortablefsd(cfg, cliVersion)
+	if err != nil {
+		return nil, fmt.Errorf("portablefsd identity: %w", err)
+	}
 	ctl.httpClient.Timeout = 3 * time.Second
 	attaches, err := ctl.listAttaches()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	out := make(map[string]cliAttachStatus, len(attaches))
 	for _, a := range attaches {
 		out[a.AttachRef] = a
 	}
-	return out
+	return out, nil
 }

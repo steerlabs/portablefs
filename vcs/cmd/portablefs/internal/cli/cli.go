@@ -142,8 +142,9 @@ func commands() []command {
 		{"fork", "fork a volume into a new volume (give every agent its own fork)", cmdFork},
 		{"grep", "search a branch's file bytes server-side", cmdGrep},
 		{"mount", "mount a live volume on this machine", cmdMount},
-		{"umount", "unmount a mounted volume and stop its daemon", cmdUmount},
+		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
+		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},
 		{"doctor", "check this machine's PortableFS setup and report problems", cmdDoctor},
 		{"version", "print the CLI version", cmdVersion},
 	}

@@ -313,7 +313,12 @@ func (fs *FS) ManagedPinChange(env *wal.Envelope, ino uint64, unpin bool, reqHas
 		_, parked := fs.orphans[ino]
 		held := fs.managed.reserved.HasPin(ref, ino)
 		switch {
-		case ino == 0 || (!live && !parked):
+		case ino == 0 || (!unpin && fs.pendingReaps[ino] != 0) || (!live && !parked):
+			// A staged reap is already ordered before this pin. The applied
+			// tree may still expose the orphan while that lower-LSN row waits
+			// its turn, but reopening it now would return a handle whose inode
+			// is guaranteed to disappear. Treat the reserved tree horizon as
+			// authoritative and fail the open with durable ENOENT.
 			gone = true
 			return []pfc2.Record{{Kind: pfc2.KindExactOutcome, ExactOutcome: &pfc2.ExactOutcome{
 				Key: key, Outcome: pfc2.Outcome{Status: errnoOf(os.ErrNotExist)},
@@ -378,7 +383,7 @@ func (fs *FS) ManagedEnsureOpenPin(ref pfc2.SessionRef, ino uint64) error {
 	build := func() ([]pfc2.Record, error) {
 		_, live := fs.byIno[ino]
 		_, parked := fs.orphans[ino]
-		if !live && !parked {
+		if fs.pendingReaps[ino] != 0 || (!live && !parked) {
 			return nil, ErrPinTargetGone // veto: nothing journals
 		}
 		if fs.managed.reserved.HasPin(ref, ino) {

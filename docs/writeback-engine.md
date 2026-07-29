@@ -47,7 +47,8 @@ vcs/internal/writeback/
   the authority's reported `Through`, never past it; a Status-0 flush reply
   whose watermark stops short of the batch end is a protocol violation that
   parks the stream typed — records above `Through` are never dropped.
-- `fsync`/`close`/`synchronize`/normal unmount are REAL barriers:
+- `fsync`/`synchronize`/normal unmount are REAL barriers. `close(2)` has
+  standard filesystem semantics and does not imply `fsync`:
   1. **Authority durability:** the barrier succeeds only when every covered
      mutation is durably committed AND applied at the authority. An
      unreachable, slow, or fenced authority FAILS the barrier (EIO-class);

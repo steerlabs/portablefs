@@ -14,10 +14,10 @@ This directory contains the macOS FSKit frontend for PortableFS.
 
 - **Sign in** mirrors `portablefs login`: device flow (`POST /v1/auth/device/code`, browser approval, token polling) or a pasted pre-issued token. Credentials are stored in the same config file as the CLI (`~/.config/portablefs/config.json`, `currentProfile` + `profiles` with `apiUrl`/`apiToken`/`managerUrl`/`managerToken`, written atomically with mode 0600), so the app and CLI share sessions and profiles.
 - **Volumes** come from `GET {apiUrl}/v1/volumes`. Each volume shows a mounted indicator plus Mount / Unmount / Open in Finder actions.
-- **Mount flow** per volume: mint a mount session against the authority manager (`POST {managerUrl}/v1/volumes/{id}/mount-sessions`, with fallbacks for older managers) -> `POST /v1/attaches` on the portablefsd control socket (authority URL + token + volume/branch) -> `/sbin/mount -t pfs pfs://<attachRef> <base>/<volume>` (default base `~/PortableFS`, configurable in Settings). Unmount runs `/sbin/umount` (fallback `diskutil unmount`) and then `DELETE /v1/attaches/<ref>` to detach and flush.
-- **Daemon management**: the app spawns `portablefsd` as a child process with `-frontend-socket` and `-control-socket` inside the app-group container (`~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/`) and `-state-dir ~/Library/Application Support/PortableFS/portablefsd`, restarts it with backoff if it crashes, and stops it on quit (SIGTERM, then SIGKILL). If a daemon is already answering on the control socket (for example one started by hand), the app adopts it instead of spawning a second one. Daemon health is shown in the menu; the daemon log is at `~/Library/Logs/PortableFS/portablefsd.log`.
+- **Mount flow** per volume: mint an access session against the configured authority manager -> `POST /v1/attaches` on the portablefsd control socket (authority URL + token + volume/branch) -> `/sbin/mount -t pfs pfs://<attachRef> <base>/<volume>` (default base `~/PortableFS`, configurable in Settings). A normal unmount synchronizes the attach before removing the kernel mount, then deletes the attach.
+- **Daemon management**: the app locates an exact `portablefsd` binary, adopts only that exact running build or spawns it as a child with sockets inside the app-group container and state under `~/Library/Application Support/PortableFS/portablefsd`. A crash is surfaced as a terminal failure and is never restarted automatically. Quit leaves the per-user daemon running after every mount is cleanly detached; stop an idle daemon explicitly with the matching CLI's `portablefs daemon stop`.
 - **Errors** surface as menu items with a Copy Details action; nothing fails silently.
-- **Quit** unmounts all PortableFS mounts, detaches the released attaches, and stops the daemon.
+- **Quit** synchronizes, unmounts, and detaches every PortableFS mount. It refuses to quit if any durability step fails.
 
 ### Build
 
@@ -69,7 +69,7 @@ Only one PortableFS file system extension should be enabled at a time: `Portable
 3. Approve the file system extension (one-time, see above).
 4. Menu bar -> Sign In: enter the server URL and either complete device sign-in in the browser or paste a token.
 5. Menu bar -> volume -> Mount. The volume appears at `~/PortableFS/<volume>`; Open in Finder from the menu.
-6. Unmount from the menu, or Quit to unmount everything and stop the daemon.
+6. Unmount from the menu, or Quit to cleanly unmount everything. Stop the idle daemon explicitly with `portablefs daemon stop` when needed.
 
 ### Known limitations (v1 dogfood)
 
@@ -100,7 +100,7 @@ swift build
 swift test
 ```
 
-The suite covers the pfslocal transport/adapter (mock daemon) and the `PortableFSAppCore` app logic: CLI-compatible config round-trips, control-plane API decoding (volumes, device flow, access leases), the portablefsd control client against an in-process UDS HTTP server, the mount state machine, and daemon restart backoff.
+The suite covers the pfslocal transport/adapter (mock daemon) and the `PortableFSAppCore` app logic: CLI-compatible config round-trips, control-plane API decoding (volumes, device flow, access leases), the portablefsd control client against an in-process UDS HTTP server, and the mount state machine.
 
 ```sh
 xcodebuild -project swift/PortableFSKitDev/PortableFSKitDev.xcodeproj -scheme PortableFSKitDev build CODE_SIGNING_ALLOWED=NO

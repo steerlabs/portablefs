@@ -2,9 +2,10 @@ import Foundation
 import Observation
 import PortableFSAppCore
 
-/// Spawns and supervises `portablefsd` as a child process: locates the
-/// binary, restarts it with backoff when it crashes, terminates it on quit,
-/// and reports health for the menu.
+/// Spawns and supervises `portablefsd` as a child process: locates the exact
+/// binary, validates its control identity, and reports health for the menu.
+/// A crash is a visible terminal failure for this app run; it is never
+/// restarted automatically.
 ///
 /// If a daemon is already answering on the control socket at startup (for
 /// example one started by hand), the supervisor
@@ -18,7 +19,6 @@ final class DaemonSupervisor {
         case starting
         case running(pid: Int32)
         case runningExternal
-        case waitingToRestart(delaySeconds: Int)
         case failed(message: String)
     }
 
@@ -38,10 +38,9 @@ final class DaemonSupervisor {
     }
 
     private var process: Process?
-    private var backoff = RestartBackoff()
     private var startedAt: Date?
-    private var stopping = false
-    private var restartTask: Task<Void, Never>?
+    private var expectedIdentity: DaemonBinaryIdentity?
+    private var suppressedExitPIDs: Set<Int32> = []
 
     var statusLabel: String {
         switch status {
@@ -53,8 +52,6 @@ final class DaemonSupervisor {
             return healthy ? "Running (pid \(pid))" : "Running (pid \(pid), not answering)"
         case .runningExternal:
             return healthy ? "Running (external)" : "External daemon stopped answering"
-        case let .waitingToRestart(delaySeconds):
-            return "Crashed; restarting in \(delaySeconds)s"
         case .failed:
             return "Failed"
         }
@@ -64,15 +61,12 @@ final class DaemonSupervisor {
         switch status {
         case let .failed(message):
             return message
-        case .waitingToRestart:
-            return lastExitDescription ?? ""
         default:
             return ""
         }
     }
 
     func start() async {
-        stopping = false
         if case .running = status {
             return
         }
@@ -80,14 +74,6 @@ final class DaemonSupervisor {
             return
         }
 
-        // Adopt an already-running daemon rather than fight over the sockets.
-        if await control.healthz() {
-            status = .runningExternal
-            healthy = true
-            return
-        }
-
-        status = .starting
         let locator = DaemonBinaryLocator(
             userOverride: binaryOverride.isEmpty ? nil : binaryOverride,
             infoPlistPath: Bundle.main.object(forInfoDictionaryKey: "PFSPortableFSDBinaryPath") as? String,
@@ -103,6 +89,41 @@ final class DaemonSupervisor {
             return
         }
         binaryPath = binary
+        let targetIdentity: DaemonBinaryIdentity
+        do {
+            targetIdentity = try DaemonBinaryIdentity(path: binary)
+            expectedIdentity = targetIdentity
+        } catch {
+            status = .failed(message: "Could not inspect \(binary): \(error.localizedDescription)")
+            healthy = false
+            return
+        }
+
+        // Adopt only the exact installed daemon build. Liveness alone is not
+        // compatibility: an older in-memory process can keep answering after
+        // its on-disk binary has been replaced.
+        if await control.healthz() {
+            do {
+                let running = try await control.identity()
+                guard targetIdentity.matches(running) else {
+                    status = .failed(
+                        message: "A different portablefsd build owns the control socket. " +
+                            "Cleanly unmount it with its matching release; PortableFS will not replace it automatically."
+                    )
+                    healthy = false
+                    return
+                }
+                status = .runningExternal
+                healthy = true
+                return
+            } catch {
+                status = .failed(message: "The running portablefsd has no compatible control identity: \(error)")
+                healthy = false
+                return
+            }
+        }
+
+        status = .starting
 
         do {
             try FileManager.default.createDirectory(
@@ -136,7 +157,7 @@ final class DaemonSupervisor {
                 ? "signal \(finished.terminationStatus)"
                 : "exit code \(finished.terminationStatus)"
             Task { @MainActor [weak self] in
-                self?.handleExit(reason: reason)
+                self?.handleExit(pid: finished.processIdentifier, reason: reason)
             }
         }
         do {
@@ -153,38 +174,74 @@ final class DaemonSupervisor {
         // Give the sockets a moment to come up, then report health.
         for _ in 0..<20 {
             if await control.healthz() {
-                healthy = true
+                if let running = try? await control.identity(), targetIdentity.matches(running) {
+                    healthy = true
+                    return
+                }
+                await rejectSpawned(
+                    child,
+                    message: "The daemon that answered after startup does not match \(binary)."
+                )
                 return
             }
             try? await Task.sleep(for: .milliseconds(250))
         }
-        healthy = await control.healthz()
+        await rejectSpawned(
+            child,
+            message: "portablefsd did not present its exact control identity within 5 seconds."
+        )
     }
 
-    private func handleExit(reason: String) {
-        process = nil
+    private func rejectSpawned(_ child: Process, message: String) async {
+        suppressedExitPIDs.insert(child.processIdentifier)
+        if child.isRunning {
+            child.terminate()
+            let deadline = Date().addingTimeInterval(35)
+            while child.isRunning && Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        if child.isRunning {
+            status = .failed(
+                message: message + " The child did not stop within its drain budget and was left running."
+            )
+        } else {
+            if process?.processIdentifier == child.processIdentifier {
+                process = nil
+            }
+            status = .failed(message: message)
+        }
         healthy = false
-        if stopping {
-            status = .stopped
+    }
+
+    private func handleExit(pid: Int32, reason: String) {
+        if suppressedExitPIDs.remove(pid) != nil {
+            if process?.processIdentifier == pid {
+                process = nil
+            }
             return
         }
+        process = nil
+        healthy = false
         let uptime = startedAt.map { Date().timeIntervalSince($0) } ?? 0
-        lastExitDescription = "portablefsd exited (\(reason)) after \(Int(uptime))s; log: \(logPath)"
-        let delay = backoff.delayAfterExit(uptime: uptime)
-        status = .waitingToRestart(delaySeconds: Int(delay.rounded()))
-        restartTask?.cancel()
-        restartTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard let self, !Task.isCancelled else {
-                return
-            }
-            await self.start()
-        }
+        let detail = "portablefsd exited (\(reason)) after \(Int(uptime))s; log: \(logPath)"
+        lastExitDescription = detail
+        status = .failed(
+            message: detail + "\nPortableFS did not restart it automatically. " +
+                "Inspect the log, cleanly unmount any surviving volume, then relaunch the app."
+        )
     }
 
     @discardableResult
     func checkHealth() async -> Bool {
-        healthy = await control.healthz()
+        if await control.healthz(),
+           let expectedIdentity,
+           let running = try? await control.identity(),
+           expectedIdentity.matches(running) {
+            healthy = true
+        } else {
+            healthy = false
+        }
         if healthy {
             // A daemon someone else started (or one that outlived a previous
             // app run) counts as running for the menu and mount flow.
@@ -196,40 +253,6 @@ final class DaemonSupervisor {
             }
         }
         return healthy
-    }
-
-    func restart() async {
-        await stop()
-        backoff.reset()
-        await start()
-    }
-
-    /// SIGTERM (portablefsd flushes and detaches on it), escalate to SIGKILL
-    /// after 5 seconds, mirroring the Go CLI's stopMountDaemon.
-    func stop() async {
-        stopping = true
-        restartTask?.cancel()
-        restartTask = nil
-        guard let child = process, child.isRunning else {
-            if case .runningExternal = status {
-                // We did not spawn it; leave it alone.
-            } else {
-                status = .stopped
-            }
-            healthy = await control.healthz()
-            return
-        }
-        child.terminate()
-        let deadline = Date().addingTimeInterval(5)
-        while child.isRunning && Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        if child.isRunning {
-            kill(child.processIdentifier, SIGKILL)
-        }
-        process = nil
-        status = .stopped
-        healthy = false
     }
 
     var logPath: String {

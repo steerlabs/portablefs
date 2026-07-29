@@ -70,7 +70,7 @@ pre-delegation state.
 The exact cross-machine guarantee is barrier-shaped at the protocol/frontend
 invalidation boundary:
 
-- **A completed `fsync`/`close`/`synchronize` is durable and applied at the
+- **A completed `fsync`/`synchronize` is durable and applied at the
   authority.** It also waits for every live protocol subscriber to
   acknowledge its covering invalidations. Linux FUSE acknowledges only after
   its kernel invalidation hook returns, so subsequent FUSE reads are exact.
@@ -83,7 +83,7 @@ invalidation boundary:
 
 macOS 26 FSKit is an explicit framework boundary: the current FSKit API does
 not provide PortableFS a kernel-cache invalidation primitive, and its
-invalidation events are therefore advisory. `fsync`, close, synchronize, and
+invalidation events are therefore advisory. `fsync`, synchronize, and
 clean unmount still have the exact authority-durability contract above, but a
 read FSKit satisfies wholly from its kernel cache is outside the
 cross-machine visibility acknowledgment. Applications that require an exact

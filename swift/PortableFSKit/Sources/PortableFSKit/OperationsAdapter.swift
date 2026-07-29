@@ -251,7 +251,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         guard let resolved = await core.resolvedVolume else {
             throw PfsLocalClientError.unexpectedReply("volume has not been resolved")
         }
-        let statReply = (try? await core.statfs()) ?? PfsStatfsReply()
+        let statReply = try await core.statfs()
         return PortableFSVolume(core: core, attachRef: attachRef, resolved: resolved, statReply: statReply)
     }
 
@@ -312,7 +312,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         await core.shutdown()
     }
 
-    public func mount(options: FSTaskOptions) async throws {}
+    public func mount(options: FSTaskOptions) async throws {
+        do {
+            _ = try await core.rootItem()
+        } catch {
+            throw PfsErrorMapper.fsKitError(for: error)
+        }
+    }
 
     public func unmount() async {
         await core.shutdown()

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -146,6 +147,7 @@ func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
 	if reader != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set(daemonctl.ControlProtocolHeader, fmt.Sprint(daemonctl.ControlProtocolVersion))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -161,6 +163,49 @@ func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
 func (c *fsdControl) healthy() bool {
 	status, _, err := c.do(http.MethodGet, "/healthz", nil)
 	return err == nil && status >= 200 && status < 300
+}
+
+func (c *fsdControl) identity() (daemonctl.Identity, error) {
+	status, body, err := c.do(http.MethodGet, "/v1/identity", nil)
+	if err != nil {
+		return daemonctl.Identity{}, err
+	}
+	if status < 200 || status >= 300 {
+		return daemonctl.Identity{}, controlError(status, body)
+	}
+	var identity daemonctl.Identity
+	if err := json.Unmarshal(body, &identity); err != nil {
+		return daemonctl.Identity{}, fmt.Errorf("unreadable portablefsd identity: %w", err)
+	}
+	return identity, nil
+}
+
+func (c *fsdControl) requireCompatibleIdentity(cliVersion, executableSHA256 string) error {
+	identity, err := c.identity()
+	if err != nil {
+		return fmt.Errorf(
+			"the running portablefsd on %s has no compatible control identity: %w; cleanly unmount PortableFS volumes, stop that daemon, and retry (PortableFS will not replace a live daemon automatically)",
+			c.socketPath, err,
+		)
+	}
+	if identity.SchemaVersion != daemonctl.IdentitySchemaVersion ||
+		identity.ControlProtocol != daemonctl.ControlProtocolVersion ||
+		identity.PFSLocalMajor != pfslocal.ProtocolMajor ||
+		identity.DaemonVersion != cliVersion ||
+		identity.ExecutableSHA256 != executableSHA256 {
+		return fmt.Errorf(
+			"the running portablefsd on %s is incompatible (daemon %q, CLI %q, executable %q, expected %q, control protocol %d, pfslocal %d.%d); cleanly unmount PortableFS volumes, stop that daemon, and retry (PortableFS will not replace a live daemon automatically)",
+			c.socketPath,
+			identity.DaemonVersion,
+			cliVersion,
+			identity.ExecutableSHA256,
+			executableSHA256,
+			identity.ControlProtocol,
+			identity.PFSLocalMajor,
+			identity.PFSLocalMinor,
+		)
+	}
+	return nil
 }
 
 // controlError extracts the daemon's error envelope for bounded messages.
@@ -239,6 +284,17 @@ func (c *fsdControl) ensureAttach(req fskitEnsureAttachRequest) (string, error) 
 
 func (c *fsdControl) deleteAttach(ref string) error {
 	status, body, err := c.do(http.MethodDelete, "/v1/attaches/"+url.PathEscape(ref), nil)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return controlError(status, body)
+	}
+	return nil
+}
+
+func (c *fsdControl) stopIfIdle() error {
+	status, body, err := c.do(http.MethodPost, "/v1/lifecycle/stop-if-idle", map[string]any{})
 	if err != nil {
 		return err
 	}
@@ -369,18 +425,33 @@ func findPortablefsd(explicit string) (string, error) {
 // one detached. The daemon is per-user and multi-attach: one instance serves
 // every mount, so an already-running daemon (this CLI's or the app's, when
 // they share sockets) is adopted, never duplicated.
-func ensurePortablefsd(cfg fskitConfig, stateRoot string) (*fsdControl, error) {
-	ctl := newFsdControl(cfg.controlSock)
-	if ctl.healthy() {
-		return ctl, nil
-	}
+func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdControl, error) {
 	daemon, err := findPortablefsd(cfg.daemonPath)
 	if err != nil {
 		return nil, err
 	}
+	daemonSHA256, err := inspectPortablefsdBinary(daemon, cliVersion)
+	if err != nil {
+		return nil, err
+	}
+	ctl := newFsdControl(cfg.controlSock)
+	if ctl.healthy() {
+		if err := ctl.requireCompatibleIdentity(cliVersion, daemonSHA256); err != nil {
+			return nil, err
+		}
+		return ctl, nil
+	}
 	for _, sock := range []string{cfg.frontendSock, cfg.controlSock} {
 		if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
 			return nil, fmt.Errorf("create socket directory: %w", err)
+		}
+		if _, err := os.Lstat(sock); err == nil {
+			return nil, fmt.Errorf(
+				"portablefsd is not healthy but socket %s still exists; refusing to replace a possibly live daemon socket (cleanly unmount and stop the owning daemon, then remove only its stale socket if the process is gone)",
+				sock,
+			)
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("inspect portablefsd socket %s: %w", sock, err)
 		}
 	}
 	daemonStateDir := filepath.Join(stateRoot, "portablefsd")
@@ -407,17 +478,82 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot string) (*fsdControl, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start portablefsd: %w", err)
 	}
-	_ = cmd.Process.Release()
+	stopSpawned := func() error {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return nil
+		case <-time.After(35 * time.Second):
+			return fmt.Errorf("spawned portablefsd did not stop within its 30-second drain budget and was left running")
+		}
+	}
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctl.healthy() {
+			if err := ctl.requireCompatibleIdentity(cliVersion, daemonSHA256); err != nil {
+				if stopErr := stopSpawned(); stopErr != nil {
+					return nil, fmt.Errorf("%w; cleanup: %v", err, stopErr)
+				}
+				return nil, err
+			}
+			_ = cmd.Process.Release()
 			return ctl, nil
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
+	if err := stopSpawned(); err != nil {
+		return nil, fmt.Errorf("portablefsd did not become healthy on %s within 15s (log: %s); cleanup: %w",
+			cfg.controlSock, filepath.Join(stateRoot, "portablefsd.log"), err)
+	}
 	return nil, fmt.Errorf("portablefsd did not become healthy on %s within 15s (log: %s)",
 		cfg.controlSock, filepath.Join(stateRoot, "portablefsd.log"))
+}
+
+func inspectPortablefsdBinary(path, cliVersion string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("inspect portablefsd binary %s: %w (output: %s)", path, err, strings.TrimSpace(string(out)))
+	}
+	daemonVersion := strings.TrimSpace(string(out))
+	if daemonVersion != cliVersion {
+		return "", fmt.Errorf("portablefsd binary %s is version %q but this CLI is %q; install the matching binary pair", path, daemonVersion, cliVersion)
+	}
+	sum, err := daemonctl.FileSHA256(path)
+	if err != nil {
+		return "", fmt.Errorf("hash portablefsd binary %s: %w", path, err)
+	}
+	return sum, nil
+}
+
+// connectCompatiblePortablefsd proves that an already-running daemon is the
+// exact installed peer for this CLI before any operational control request.
+// This gate is used outside mount adoption too: unmount, mounts, and doctor
+// must not drive an older daemon merely because it ignores an unknown header.
+func connectCompatiblePortablefsd(cfg fskitConfig, cliVersion string) (*fsdControl, error) {
+	daemon, err := findPortablefsd(cfg.daemonPath)
+	if err != nil {
+		return nil, err
+	}
+	daemonSHA256, err := inspectPortablefsdBinary(daemon, cliVersion)
+	if err != nil {
+		return nil, err
+	}
+	ctl := newFsdControl(cfg.controlSock)
+	if !ctl.healthy() {
+		return nil, fmt.Errorf("portablefsd is not healthy on %s", cfg.controlSock)
+	}
+	if err := ctl.requireCompatibleIdentity(cliVersion, daemonSHA256); err != nil {
+		return nil, err
+	}
+	return ctl, nil
 }
 
 // readTLSCAPEM loads the data-plane CA bundle for the daemon's attach
@@ -440,7 +576,7 @@ func readTLSCAPEM() (string, error) {
 // catches the one foreseeable misconfiguration — the CLI attached to daemon
 // A while the installed extension's Info.plist points at daemon B — as a
 // typed error before the kernel mount, instead of an opaque I/O error after.
-func fskitPreflight(frontendSock, attachRef string) error {
+func fskitPreflight(frontendSock, attachRef, expectedDaemonVersion string) error {
 	conn, err := net.DialTimeout("unix", frontendSock, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("portablefsd frontend socket %s is not answering: %w", frontendSock, err)
@@ -465,8 +601,20 @@ func fskitPreflight(frontendSock, attachRef string) error {
 			return env.Body, nil
 		}
 	}
-	if _, err := call(1, &pfslocal.Hello{ProtocolMajor: pfslocal.ProtocolMajor, ProtocolMinor: pfslocal.ProtocolMinor, ClientName: "portablefs-cli", ClientVersion: "preflight"}); err != nil {
+	helloBody, err := call(1, &pfslocal.Hello{ProtocolMajor: pfslocal.ProtocolMajor, ProtocolMinor: pfslocal.ProtocolMinor, ClientName: "portablefs-cli", ClientVersion: "preflight"})
+	if err != nil {
 		return fmt.Errorf("portablefsd frontend handshake on %s: %w", frontendSock, err)
+	}
+	hello, ok := helloBody.(*pfslocal.HelloReply)
+	if !ok || hello.ProtocolMajor != pfslocal.ProtocolMajor || hello.DaemonVersion != expectedDaemonVersion {
+		gotMajor := uint32(0)
+		gotVersion := ""
+		if ok {
+			gotMajor = hello.ProtocolMajor
+			gotVersion = hello.DaemonVersion
+		}
+		return fmt.Errorf("portablefsd frontend handshake on %s returned incompatible %T (protocol %d, daemon %q; want major %d, daemon %q)",
+			frontendSock, helloBody, gotMajor, gotVersion, pfslocal.ProtocolMajor, expectedDaemonVersion)
 	}
 	if _, err := call(2, &pfslocal.ResolveRequest{AttachRef: attachRef}); err != nil {
 		return fmt.Errorf("attach %s is not resolvable on frontend %s (is the registered FSKit extension pointed at a different daemon? set %s/%s to your extension's socket pair): %w",

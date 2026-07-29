@@ -410,6 +410,7 @@ final class AppModel {
         applyMountEvent(volumeID, .mountRequested)
         let branch = volume.defaultBranch
         let mountPath = PortableFSAppPaths.mountPoint(baseDirectory: mountBaseDirectory, volumeID: volumeID)
+        var ensuredAttachRef: String?
         do {
             // 1. Create an access lease against the authority manager.
             let manager = settings.managerEndpoint()
@@ -425,13 +426,24 @@ final class AppModel {
                 authToken: session.token,
                 mountPath: mountPath
             ))
+            ensuredAttachRef = attach.attachRef
             applyMountEvent(volumeID, .attachEnsured(attachRef: attach.attachRef))
 
             // 3. FSKit mount of the pfslocal-backed filesystem.
             try FileManager.default.createDirectory(atPath: mountPath, withIntermediateDirectories: true)
             try await MountCommand.mount(attachRef: attach.attachRef, mountPath: mountPath)
+            try await MountCommand.waitUntilReady(
+                attachRef: attach.attachRef,
+                mountPath: mountPath
+            )
             applyMountEvent(volumeID, .mountCompleted(mountPath: mountPath))
         } catch {
+            // A failed readiness proof never leaves a kernel mount or daemon
+            // attach behind. There are no acknowledged user mutations yet.
+            try? await MountCommand.unmount(mountPath: mountPath)
+            if let ensuredAttachRef {
+                try? await daemon.control.deleteAttach(ref: ensuredAttachRef)
+            }
             let detail = describeMountFailure(error)
             applyMountEvent(volumeID, .failed(message: shortMessage(detail)))
             reportError(title: "Mount \(volumeID) failed", detail: detail)
@@ -446,6 +458,9 @@ final class AppModel {
         }
         applyMountEvent(volumeID, .unmountRequested)
         do {
+            // Normal unmount is a durability operation: drain and prove the
+            // authority barrier while the kernel mount is still usable.
+            try await daemon.control.sync(ref: attachRef)
             try await MountCommand.unmount(mountPath: mountPath)
             applyMountEvent(volumeID, .unmountCompleted)
         } catch {
@@ -508,23 +523,35 @@ final class AppModel {
 
     // MARK: Quit
 
-    /// Unmounts every live PortableFS kernel mount, detaches the attaches
-    /// that were actually released, stops the daemon, and exits.
+    /// Cleanly drains and unmounts every PortableFS mount, then exits. The
+    /// daemon intentionally outlives the app and may be stopped explicitly
+    /// with the matching CLI once it is idle.
     func quitApp() {
         localPollTask?.cancel()
         volumePollTask?.cancel()
         deviceFlowTask?.cancel()
         Task {
             for mount in MountTable.portableFSMounts() {
-                try? await MountCommand.unmount(mountPath: mount.mountPoint)
-            }
-            if daemon.healthy, let attaches = try? await daemon.control.listAttaches() {
-                let stillMounted = Set(MountTable.portableFSMounts().compactMap(\.attachRef))
-                for attach in attaches where !stillMounted.contains(attach.attachRef) {
-                    try? await daemon.control.deleteAttach(ref: attach.attachRef)
+                guard let attachRef = mount.attachRef else {
+                    reportError(
+                        title: "Quit refused",
+                        detail: "Could not identify the PortableFS attach mounted at \(mount.mountPoint)."
+                    )
+                    return
+                }
+                do {
+                    try await daemon.control.sync(ref: attachRef)
+                    try await MountCommand.unmount(mountPath: mount.mountPoint)
+                    try await daemon.control.deleteAttach(ref: attachRef)
+                } catch {
+                    reportError(
+                        title: "Quit refused",
+                        detail: "Could not cleanly unmount \(mount.mountPoint): \(error)"
+                    )
+                    await refreshLocalState()
+                    return
                 }
             }
-            await daemon.stop()
             NSApplication.shared.terminate(nil)
         }
     }

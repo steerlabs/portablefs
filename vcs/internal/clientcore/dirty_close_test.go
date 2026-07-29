@@ -7,12 +7,13 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
 
-func TestLastDirtyCloseSurfacesBarrierFailure(t *testing.T) {
+func TestLastCloseDoesNotImplyAuthorityBarrier(t *testing.T) {
 	addr := serveCore(t)
-	v := dialCore(t, addr, Options{
+	v := dialCoreNoCleanup(t, addr, Options{
 		Owner:  "dirty-close",
 		WALDir: t.TempDir(),
 	})
+	t.Cleanup(func() { _, _ = v.CloseJournalDurable() })
 	ctx := context.Background()
 	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
 		t.Fatalf("mkdir: %d", st)
@@ -33,23 +34,24 @@ func TestLastDirtyCloseSurfacesBarrierFailure(t *testing.T) {
 	if _, st := v.Write(ctx, "d/f", n, 0, []byte("park me")); st != fsproto.OK {
 		t.Fatalf("delegated write: %d", st)
 	}
-	if st := v.CloseHandle("d/f", n); st != fsproto.EIO {
-		t.Fatalf("last dirty close = %d, want EIO", st)
+	if st := v.CloseHandle("d/f", n); st != fsproto.OK {
+		t.Fatalf("close = %d, want OK under standard filesystem semantics", st)
 	}
 	if n.IsOpen() {
-		t.Fatal("a failed close barrier must still close the file descriptor")
+		t.Fatal("close did not retire the file descriptor")
 	}
 	if records, _ := v.WriteBackPending(); records == 0 {
-		t.Fatal("failed close dropped the unshipped acknowledged tail")
+		t.Fatal("close dropped the locally accepted unshipped tail")
 	}
 }
 
-func TestSuccessfulFsyncClearsLastCloseBarrier(t *testing.T) {
+func TestFsyncThenCloseDoesNotRunSecondBarrier(t *testing.T) {
 	addr := serveCore(t)
-	v := dialCore(t, addr, Options{
+	v := dialCoreNoCleanup(t, addr, Options{
 		Owner:  "clean-close",
 		WALDir: t.TempDir(),
 	})
+	t.Cleanup(func() { _, _ = v.CloseJournalDurable() })
 	ctx := context.Background()
 	a, st := v.Create(ctx, "f", 0o644)
 	if st != fsproto.OK {
@@ -63,10 +65,10 @@ func TestSuccessfulFsyncClearsLastCloseBarrier(t *testing.T) {
 		t.Fatalf("fsync: %d", st)
 	}
 
-	// If close incorrectly ran a second barrier for a clean handle, this
-	// definite fence would make it fail.
+	// close(2) is not a durability barrier. This definite fence after a
+	// successful fsync must not make close fail or issue another barrier.
 	v.Client().ExpireSession()
 	if st := v.CloseHandle("f", n); st != fsproto.OK {
-		t.Fatalf("clean last close ran an unnecessary barrier: %d", st)
+		t.Fatalf("close ran an unnecessary barrier: %d", st)
 	}
 }

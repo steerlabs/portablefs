@@ -85,7 +85,6 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 	}
 	if st == fsproto.OK {
 		v.recent.record(path)
-		n.markDirty()
 	}
 	return st
 }
@@ -106,7 +105,6 @@ func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, nam
 	}
 	if st == fsproto.OK {
 		v.recent.record(path)
-		n.markDirty()
 	}
 	return st
 }
