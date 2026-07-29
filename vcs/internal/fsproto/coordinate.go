@@ -59,15 +59,23 @@ type CoordinationStore interface {
 	ManagedUnpinBatch(env *wal.Envelope, inos []uint64, reqHash []byte) error
 	ManagedRecordCoordinationOutcome(env *wal.Envelope, reqHash []byte, status int32) error
 	ManagedSyncBarrierRow(env *wal.Envelope, reqHash []byte) error
-	ManagedFlushThrough(ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string) (uint64, bool, error)
-	ManagedFlushApply(env *wal.Envelope, envHash []byte, ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string, rows []workfs.ManagedFlushRow, owner string) (uint64, error)
+
+	// Write-back streams and delegations.
+	ManagedDelegationDecide(env *wal.Envelope, path, writebackID string) (workfs.CoordinationDecision, error)
+	ManagedDelegationsOverlapping(path string) []pfc2.CheckoutView
+	ManagedWritebackState(writebackID string) (pfc2.StreamStateView, bool, error)
+	ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope, through uint64, digest [32]byte) ([]workfs.WritebackConflict, error)
+	ManagedWritebackDiscard(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope) error
+	ManagedFlushApply(ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string, prevDigest, endDigest [32]byte, rows []workfs.ManagedFlushRow, owner string) (uint64, error)
+
 	SyncBarrier() error
 	WaitCoordinationClear(deadline time.Time, check func() bool) bool
 }
 
-// coordStore returns the managed coordination surface (nil off-managed).
+// coordStore returns the managed coordination surface (nil on a server
+// without a session store — reads-only test servers).
 func (s *Server) coordStore() CoordinationStore {
-	if s.exact == nil || !s.exact.managed {
+	if s.exact == nil {
 		return nil
 	}
 	cs, _ := s.exact.store.(CoordinationStore)
@@ -111,25 +119,6 @@ func barrierRequestHash(env *wal.Envelope) []byte {
 	return coordinationHash("PFC2-BARRIER", env.Generation, uint64(env.Slot), env.SlotSeq)
 }
 
-// flushRequestHash fingerprints one managed flush RPC: the write-back
-// identity plus the dense record range it covers.
-func flushRequestHash(writebackID, checkoutPath, checkoutEpoch string, firstSeq, count uint64) []byte {
-	h := sha256.New()
-	h.Write([]byte("PFC2-FLUSH"))
-	h.Write([]byte{0})
-	for _, s := range []string{writebackID, checkoutPath, checkoutEpoch} {
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], uint64(len(s)))
-		h.Write(b[:])
-		h.Write([]byte(s))
-	}
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], firstSeq)
-	h.Write(b[:])
-	binary.BigEndian.PutUint64(b[:], count)
-	h.Write(b[:])
-	return h.Sum(nil)
-}
 
 // wireLockRange converts the inclusive wire [start,end] into the PFC2
 // (start, length; 0 = through EOF) shape. The kernel expresses through-EOF as
@@ -241,6 +230,12 @@ func (s *Server) exactCoordinate(cs *connSession, req *Request) *Response {
 		return s.coordinatePin(store, req)
 	case OpUnmarkOpenInodes:
 		return s.coordinateUnpinBatch(store, req)
+	case OpDelegationAcquire:
+		return s.coordinateDelegationAcquire(cs, store, req)
+	case OpWritebackRebind:
+		return s.coordinateWritebackRebind(store, req)
+	case OpWritebackDiscard:
+		return s.coordinateWritebackDiscard(store, req)
 	default:
 		return &Response{Status: EINVAL}
 	}
@@ -459,7 +454,7 @@ func (s *Server) coordinatePin(store CoordinationStore, req *Request) *Response 
 const maxUnmarkBatchInos = 4096
 
 // coordinateUnpinBatch is the managed OpUnmarkOpenInodes path
-// (FeatOpenRegistration): the deferred last-close unmarks release as ONE
+// (baseline open registration): the deferred last-close unmarks release as ONE
 // journal row — the identity's durable outcome plus one unpin transition per
 // held pin — under ONE exact identity. Per-ino semantics match the legacy
 // batch exactly (release what is held, idempotently skip the rest; a close
@@ -482,7 +477,7 @@ func (s *Server) coordinateUnpinBatch(store CoordinationStore, req *Request) *Re
 }
 
 // registerCreateOpenManaged fuses Stage-2 open registration into a managed
-// OpCreate reply (Request.RegisterOpen, FeatOpenRegistration on the managed
+// OpCreate reply (Request.RegisterOpen on the managed
 // generation). The create itself is the exact journaled mutation whose
 // durable outcome names the inode the path bound to at the create's ordered
 // position; this step then ensures the session's durable open pin on that
@@ -541,7 +536,12 @@ func (s *Server) registerCreateOpenManaged(cs *connSession, req *Request, resp *
 
 // coordinateBarrier is the managed OpFsync path with an exact identity: one
 // journaled control-only no-op row whose ordered apply proves every earlier
-// row is durable, applied, and published (the volume sync barrier).
+// row is durable, applied, and published (the volume sync barrier) — then a
+// wait for every live subscriber to acknowledge the covering invalidation
+// position, making the completed barrier immediately visible to every
+// connected peer's subsequent reads. The subscriber wait runs on duplicate
+// replays too: an unresolved barrier retried by the client still owes the
+// cross-machine guarantee.
 func (s *Server) coordinateBarrier(cs *connSession, req *Request) *Response {
 	store := s.coordStore()
 	if store == nil {
@@ -555,21 +555,32 @@ func (s *Server) coordinateBarrier(cs *connSession, req *Request) *Response {
 		return nil // projected-expired lease: fail closed, consume nothing
 	}
 	reqHash := barrierRequestHash(env)
-	return s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
+	resp := s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
 		if err := store.ManagedSyncBarrierRow(full, reqHash); err != nil {
 			return workfs.CoordinationDecision{}, err
 		}
 		return workfs.CoordinationDecision{}, nil
 	})
+	if resp == nil || resp.Status != OK {
+		return resp
+	}
+	if st := s.awaitSubscriberAcks(s.notifierPosition()); st != OK {
+		// The barrier's rows are durable and applied, but a LIVE subscriber
+		// did not acknowledge the invalidations within the bound: the
+		// barrier fails typed rather than claiming cross-machine
+		// visibility it cannot prove. (The identity is consumed; the
+		// caller's retry uses a fresh identity and re-waits.)
+		return &Response{Status: st, Gen: s.gen()}
+	}
+	return resp
 }
 
-// flushBatchManaged applies a write-back flush as ordered PFJ3 rows (one
-// record per row with its FlushAdvance in the same row) after validating the
-// attached session, the checkout grant, and the per-record subtree bounds.
-// The session and source-suppression owner derive from the AUTHENTICATED
-// connection; Request.Owner is display-only. With an exact envelope the final
-// definite AppliedThrough is stored durably under the flush identity, so a
-// lost-reply retry replays the identical answer.
+// flushBatchManaged applies one dense same-scope run of a mount write-back
+// stream as ordered PFJ3 rows (one record per row with its FlushAdvance in
+// the same row) after validating the attached session, the delegation grant,
+// and the per-record subtree bounds. The stream's durable watermark + digest
+// ARE the exactness: a lost-reply retry resends identical bytes and the
+// authority drops the covered prefix, so no per-RPC slot identity is needed.
 func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	store := s.coordStore()
 	if store == nil {
@@ -581,10 +592,14 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	if !s.admissible(cs.id) {
 		return nil // projected-expired lease: fail closed, consume nothing
 	}
-	if req.CheckoutPath == "" || req.CheckoutEpoch == "" {
+	if req.CheckoutPath == "" || req.CheckoutEpoch == "" || req.SessionID == "" {
+		return &Response{Status: EINVAL}
+	}
+	if len(req.Records) > MaxBatchRecords {
 		return &Response{Status: EINVAL}
 	}
 	ref := pfc2.SessionRef{SessionID: cs.id, Generation: cs.gen}
+	cleanCheckout := cleanWirePath(req.CheckoutPath)
 	rows := make([]workfs.ManagedFlushRow, 0, len(req.Records))
 	for i := range req.Records {
 		r := req.Records[i]
@@ -593,50 +608,40 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 			// legacy control record here is a protocol violation.
 			return &Response{Status: EINVAL}
 		}
+		if r.Op == wal.OpSetxattr || r.Op == wal.OpRemovexattr {
+			// Xattr mutations are write-through only (the engine never
+			// delegates them); a flush batch may not smuggle them past the
+			// write-through admission gates.
+			return &Response{Status: EINVAL}
+		}
 		if isReserved(r.Path) || isReserved(r.NewPath) {
 			return &Response{Status: EINVAL}
 		}
-		if !pathWithin(r.Path, req.CheckoutPath) || (r.NewPath != "" && !pathWithin(r.NewPath, req.CheckoutPath)) {
+		// Containment must be tested on the canonical path the authority will
+		// actually apply (cleanPath resolves ".." at apply time), not the raw
+		// wire path: a byte-prefix test on "work/../victim" passes for a "work"
+		// grant yet writes to "victim". isReserved above already canonicalizes.
+		if !pathWithin(cleanWirePath(r.Path), cleanCheckout) || (r.NewPath != "" && !pathWithin(cleanWirePath(r.NewPath), cleanCheckout)) {
 			return &Response{Status: EPERM} // records (rename pair included) must stay inside the granted subtree
 		}
-		localSeq := r.Seq
+		seq := r.Seq
 		r.Seq = 0
-		rows = append(rows, workfs.ManagedFlushRow{LocalSeq: localSeq, Record: r})
+		rows = append(rows, workfs.ManagedFlushRow{Seq: seq, Record: r})
 	}
-	var env *wal.Envelope
-	var envHash []byte
-	if req.Env != nil {
-		if req.Env.SessionID != cs.id || req.Env.Generation != cs.gen || req.Env.SlotSeq == 0 {
-			return &Response{Status: ESTALE}
-		}
-		var first, count uint64
-		if len(rows) > 0 {
-			first, count = rows[0].LocalSeq, uint64(len(rows))
-		}
-		envHash = flushRequestHash(req.SessionID, req.CheckoutPath, req.CheckoutEpoch, first, count)
-		env = &wal.Envelope{
-			SessionID: req.Env.SessionID, Generation: req.Env.Generation,
-			Slot: req.Env.Slot, SlotSeq: req.Env.SlotSeq, ReqHash: envHash,
-		}
-		lk := s.exact.slotLock(env.SessionID, env.Slot)
-		lk.Lock()
-		defer lk.Unlock()
-		switch res, outcome := s.exact.store.CheckSlot(env); res {
-		case workfs.SlotDuplicate:
-			// The definite AppliedThrough was stored under the identity.
-			return &Response{AppliedThrough: uint64(outcome.Offset), Gen: s.gen(), Duplicate: true}
-		case workfs.SlotRetired:
-			return &Response{Status: EIO, Gen: s.gen()}
-		case workfs.SlotConflict, workfs.SlotGap:
-			return s.fenceCorrupt(env.SessionID, env.Generation)
-		case workfs.SlotUnknownSession:
-			return &Response{Status: ESTALE}
-		}
+	var prev, end [32]byte
+	if len(req.WBPrevDigest) == 32 {
+		copy(prev[:], req.WBPrevDigest)
 	}
-	through, err := store.ManagedFlushApply(env, envHash, ref, req.SessionID, req.CheckoutPath, req.CheckoutEpoch, rows, cs.owner)
+	if len(req.WBEndDigest) == 32 {
+		copy(end[:], req.WBEndDigest)
+	}
+	through, err := store.ManagedFlushApply(ref, req.SessionID, req.CheckoutPath, req.CheckoutEpoch, prev, end, rows, cs.owner)
 	if err != nil {
 		if errors.Is(err, workfs.ErrSessionStale) {
 			return &Response{Status: ESTALE, AppliedThrough: through}
+		}
+		if errors.Is(err, workfs.ErrWritebackCorrupt) {
+			return &Response{Status: EINVAL, AppliedThrough: through, Gen: s.gen()}
 		}
 		if errors.Is(err, workfs.ErrSessionExpiryPending) {
 			return &Response{Status: EAGAIN, AppliedThrough: through, Gen: s.gen()}
@@ -647,6 +652,197 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 		return &Response{Status: toErrno(err), AppliedThrough: through}
 	}
 	return &Response{AppliedThrough: through, Gen: s.gen()}
+}
+
+// coordinateDelegationAcquire is the adaptive grant decision: the volatile
+// policy (recall cooldown, scope shape, snapshot bound) runs first; an
+// eligible uncontended scope commits the durable grant and returns the
+// authoritative children snapshot, everything else answers a durable EBUSY
+// and the client runs write-through. The path is canonicalized ONCE here and
+// only the canonical value flows downstream (policy, durable decision,
+// snapshot), so alias spellings share one identity.
+func (s *Server) coordinateDelegationAcquire(cs *connSession, store CoordinationStore, req *Request) *Response {
+	_ = cs
+	env := req.Env
+	if req.SessionID == "" {
+		return s.coordReject(env, staticRejectHash(EINVAL), EINVAL)
+	}
+	scope := cleanWirePath(req.Path)
+	if verdict := s.delegations.policyVerdict(scope); verdict != OK {
+		return s.coordReject(env, staticRejectHash(verdict), verdict)
+	}
+	// Scope-shape policy: only an EXISTING DIRECTORY whose child set fits
+	// the grant bound is delegable. Everything else is a durable decline —
+	// the operation runs write-through. (Volatile pre-checks; the durable
+	// overlap decision happens inside the journaled decide.)
+	fi, err := s.fs.Lstat(scope)
+	if err != nil || !fi.IsDir() {
+		return s.coordReject(env, staticRejectHash(EBUSY), EBUSY)
+	}
+	if fis, err := s.fs.ReadDir(scope); err != nil || len(fis) > grantChildrenBound {
+		return s.coordReject(env, staticRejectHash(EBUSY), EBUSY)
+	}
+	reqHash, err := workfs.DelegationRequestHash(env, scope, req.SessionID)
+	if err != nil {
+		return &Response{Status: ESTALE}
+	}
+	resp := s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
+		return store.ManagedDelegationDecide(full, scope, req.SessionID)
+	})
+	if resp == nil {
+		return nil
+	}
+	if resp.Status == OK && resp.Duplicate && resp.CheckoutEpoch == "" && resp.Offset > 0 {
+		// Duplicate replay of a lost grant reply: the epoch was stored in
+		// the durable slot outcome. The snapshot is not replayed; the client
+		// re-seeds with one readdir under the held grant.
+		if epoch, err := pfc2.EpochFromInt64(resp.Offset); err == nil {
+			resp.CheckoutEpoch = string(epoch)
+		}
+		return resp
+	}
+	if resp.Status != OK || resp.CheckoutEpoch == "" {
+		return resp
+	}
+	// Fresh grant: the grant is durable, and same-session write-through
+	// mutations no longer bypass the peer gate, so the snapshot taken now is
+	// the authoritative delegated view — nothing (peer or same-session) can
+	// mutate the scope between the grant and this snapshot.
+	s.fillGrantSnapshot(scope, resp)
+	return resp
+}
+
+// grantChildrenBound declines a delegation whose initial snapshot would
+// exceed this many children (the operation runs write-through instead).
+const grantChildrenBound = 8192
+
+// fillGrantSnapshot attaches the scope's self attr and its authoritative
+// children snapshot to a fresh grant reply. The reply bound is REAL: a
+// directory that grew past the grant bound between the policy pre-check and
+// this snapshot ships no children (never an unbounded reply); the client
+// then seeds with one readdir under the held grant.
+func (s *Server) fillGrantSnapshot(path string, resp *Response) {
+	fi, err := s.fs.Lstat(path)
+	if err != nil || !fi.IsDir() {
+		return
+	}
+	a := attrOf(fi)
+	resp.Attr = &a
+	fis, err := s.fs.ReadDir(path)
+	if err != nil || len(fis) > grantChildrenBound {
+		return
+	}
+	ents := make([]Dirent, 0, len(fis))
+	for _, cfi := range fis {
+		if isReserved(pathJoin(path, cfi.Name())) {
+			continue
+		}
+		ents = append(ents, Dirent{Name: cfi.Name(), Attr: attrOf(cfi)})
+	}
+	resp.Entries = ents
+}
+
+// writebackStateRead answers OpWritebackState from the durable reducer.
+func (s *Server) writebackStateRead(req *Request) *Response {
+	store := s.coordStore()
+	if store == nil {
+		return &Response{Status: EPERM}
+	}
+	view, ok, err := store.ManagedWritebackState(req.SessionID)
+	if err != nil {
+		return &Response{Status: toErrno(err)}
+	}
+	resp := &Response{Gen: s.gen(), WBExists: ok}
+	if ok {
+		resp.AppliedThrough = view.Through
+		resp.WBDigest = append([]byte(nil), view.Digest[:]...)
+	}
+	return resp
+}
+
+// rebindRequestHash fingerprints one stream-rebind identity.
+func rebindRequestHash(writebackID string, scopes []WBScope, through uint64, digest []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte("PFC2-WB-REBIND"))
+	h.Write([]byte{0})
+	str := func(v string) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(len(v)))
+		h.Write(b[:])
+		h.Write([]byte(v))
+	}
+	str(writebackID)
+	for _, sc := range scopes {
+		str(sc.Path)
+		str(sc.Epoch)
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], through)
+	h.Write(b[:])
+	h.Write(digest)
+	return h.Sum(nil)
+}
+
+// coordinateWritebackRebind claims a parked stream's recovery scopes for the
+// caller's session. Typed conflicts return in the reply; nothing partial
+// commits and nothing is guessed.
+func (s *Server) coordinateWritebackRebind(store CoordinationStore, req *Request) *Response {
+	env := req.Env
+	if req.SessionID == "" {
+		return s.coordReject(env, staticRejectHash(EINVAL), EINVAL)
+	}
+	scopes := make([]workfs.WritebackScope, 0, len(req.WBScopes))
+	for _, sc := range req.WBScopes {
+		scopes = append(scopes, workfs.WritebackScope{Path: sc.Path, Epoch: sc.Epoch})
+	}
+	var digest [32]byte
+	copy(digest[:], req.WBPrevDigest)
+	reqHash := rebindRequestHash(req.SessionID, req.WBScopes, req.WBThrough, req.WBPrevDigest)
+	var conflicts []workfs.WritebackConflict
+	resp := s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
+		var err error
+		conflicts, err = store.ManagedWritebackRebind(full, reqHash, req.SessionID, scopes, req.WBThrough, digest)
+		if err != nil {
+			return workfs.CoordinationDecision{}, err
+		}
+		if len(conflicts) > 0 {
+			return workfs.CoordinationDecision{Status: EIO}, nil
+		}
+		return workfs.CoordinationDecision{}, nil
+	})
+	if resp != nil {
+		for _, c := range conflicts {
+			resp.WBConflicts = append(resp.WBConflicts, WBConflict{Path: c.Path, Epoch: c.Epoch, Kind: c.Kind})
+		}
+	}
+	return resp
+}
+
+// coordinateWritebackDiscard releases a parked stream's recovery scopes as
+// an audited data-loss decision.
+func (s *Server) coordinateWritebackDiscard(store CoordinationStore, req *Request) *Response {
+	env := req.Env
+	if req.SessionID == "" {
+		return s.coordReject(env, staticRejectHash(EINVAL), EINVAL)
+	}
+	scopes := make([]workfs.WritebackScope, 0, len(req.WBScopes))
+	for _, sc := range req.WBScopes {
+		scopes = append(scopes, workfs.WritebackScope{Path: sc.Path, Epoch: sc.Epoch})
+	}
+	reqHash := rebindRequestHash("discard\x00"+req.SessionID, req.WBScopes, 0, nil)
+	return s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
+		if err := store.ManagedWritebackDiscard(full, reqHash, req.SessionID, scopes); err != nil {
+			return workfs.CoordinationDecision{}, err
+		}
+		return workfs.CoordinationDecision{}, nil
+	})
+}
+
+func pathJoin(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
 }
 
 // pathWithin reports whether p equals root or lies beneath it (both already

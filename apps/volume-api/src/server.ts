@@ -21,6 +21,7 @@ import {
   type SnapshotCutRecord,
 } from "@portablefs/metadata-db";
 import { browseVolumeTree, CommitBrowseIndexCache, serveVolumeFile } from "./browse.js";
+import { runIntegrityCheck } from "./integrity.js";
 import {
   activateJournalRequestSchema,
   attachVolumeRequestSchema,
@@ -435,9 +436,6 @@ function routePolicyFor(
     if (action === "attach" || action === "attach-receipted") {
       return policies.attach;
     }
-    if (action === "exec") {
-      return policies.exec;
-    }
     if (action === "grep") {
       return policies.grep;
     }
@@ -695,6 +693,26 @@ async function routeRequest(
       options.graceMs = raw.graceMs;
     }
     const report = await runGc(deps.metadata, deps.blobStore, options);
+    sendJson(res, 200, report);
+    return;
+  }
+
+  if (method === "GET" && parts.length === 3 && parts[1] === "admin" && parts[2] === "integrity") {
+    // Read-only referenced-blob existence walk (the retired volume-worker's
+    // integrity job). Admin-gated by guardTenantAccess above.
+    if (!deps.metadata.listCommits) {
+      sendJson(res, 501, {
+        error: {
+          code: "INTEGRITY_UNSUPPORTED",
+          message: "This repository does not support commit listing.",
+        },
+      });
+      return;
+    }
+    const report = await runIntegrityCheck({
+      metadata: deps.metadata,
+      blobStore: deps.blobStore,
+    });
     sendJson(res, 200, report);
     return;
   }
@@ -1364,6 +1382,42 @@ async function routeRequest(
       )
     );
     sendJson(res, 200, { snapshots });
+    return;
+  }
+
+  if (method === "DELETE" && parts.length === 5 && parts[1] === "volumes" && parts[3] === "snapshots") {
+    // Named-snapshot release (migration 028): clears the label of this
+    // volume's named READY cuts (releasing their snapshot consumers), so
+    // they age out of the retention window and the ordinary GC sweep
+    // collects their objects. The name segment arrives percent-decoded
+    // (decodePathParts). Non-enumerating by construction: a repository
+    // without the history surface, a name that cannot exist, and an
+    // unknown name (PF007) all answer exactly the ownership guard's 404 —
+    // deletion reveals nothing the guard does not.
+    const history = (deps.metadata as { history?: PostgresHistoryRepository }).history;
+    const name = parts[4] ?? "";
+    if (!history || name.length === 0 || name.length > 256) {
+      sendJson(res, 404, notOwned().body);
+      return;
+    }
+    try {
+      // Tracked like every other durable effect: a drain waits for a
+      // dispatched release instead of stranding a half-cleared label.
+      const released = await deps.runtime.trackEffect(
+        history.releaseSnapshotCut({
+          tenantId: tenantIdForScopedRoute(auth),
+          volumeId: parts[2] ?? "",
+          name,
+        })
+      );
+      sendJson(res, 200, { released });
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "PF007") {
+        sendJson(res, 404, notOwned().body);
+        return;
+      }
+      throw error;
+    }
     return;
   }
 
@@ -2201,8 +2255,14 @@ function setupShareMs(timeoutMs: number): number {
   return Math.min(Math.max(Math.floor(timeoutMs / 2), 250), 20_000);
 }
 
-// Read-only grep against a journal-served branch: same source resolution as
-// snapshots, then a bounded scan directly over the PFT2 tree (no workspace).
+// Read-only grep against a journal-served branch: resolves an immutable cut
+// source, then a bounded scan directly over the PFT2 tree (no workspace).
+//
+// BOUNDED STALENESS: a live branch serves its newest READY cut whenever one
+// exists (a fresh cut is minted only when the branch has none), so the
+// answer is an exact immutable state at most as old as the last ready cut —
+// with chained/rolling cuts that staleness is seconds. Snapshot-then-grep is
+// the path for callers that need the exact current journal position.
 async function grepOnCutBranch(
   deps: RequestContext,
   tenantId: string,

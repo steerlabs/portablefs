@@ -1,6 +1,6 @@
-import { createHash, createHmac } from "node:crypto";
 import { open } from "node:fs/promises";
 import path from "node:path";
+import { signS3RequestHeaders } from "@portablefs/storage-s3";
 
 // ---------------------------------------------------------------------------
 // Exact-key readers for HistoryCut objects.
@@ -176,10 +176,10 @@ export interface S3ExactKeyReaderConfig {
 }
 
 /**
- * S3-compatible exact-key reader. Requests are SigV4-signed (mirroring the
- * @portablefs/storage-s3 signer byte for byte); the recorded key is presented
- * verbatim (it is already the store's fully prefixed exact key) and the body
- * is bounded by the recorded size before buffering completes.
+ * S3-compatible exact-key reader. Requests are SigV4-signed with the shared
+ * @portablefs/storage-s3 signer; the recorded key is presented verbatim (it
+ * is already the store's fully prefixed exact key) and the body is bounded
+ * by the recorded size before buffering completes.
  */
 export class S3ExactKeyReader implements ExactKeyReader {
   private readonly config: S3ExactKeyReaderConfig;
@@ -212,7 +212,7 @@ export class S3ExactKeyReader implements ExactKeyReader {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
     try {
-      const headers = signS3Request({
+      const headers = signS3RequestHeaders({
         method: "GET",
         url,
         region: this.config.region,
@@ -469,63 +469,6 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
-}
-
-// ── SigV4 (mirrors @portablefs/storage-s3; kept here because the storage
-// package exposes no exact-key surface and its signer is private) ───────────
-
-interface SignS3RequestInput {
-  method: string;
-  url: URL;
-  region: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-  now: Date;
-}
-
-function signS3Request(input: SignS3RequestInput): Record<string, string> {
-  const amzDate = input.now.toISOString().replace(/[:-]|\.\d{3}/g, "");
-  const shortDate = amzDate.slice(0, 8);
-  const payloadHash = createHash("sha256").update(Buffer.alloc(0)).digest("hex");
-  const headers: Record<string, string> = {
-    host: input.url.host,
-    "x-amz-content-sha256": payloadHash,
-    "x-amz-date": amzDate,
-  };
-  const canonicalHeaders = Object.entries(headers)
-    .map(([key, value]) => [key.toLowerCase(), value.trim().replace(/\s+/g, " ")] as const)
-    // AWS SigV4 requires canonical headers sorted by byte order of the
-    // lowercased name; collation-based ordering is locale-sensitive.
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
-  const signedHeaderNames = canonicalHeaders.map(([key]) => key).join(";");
-  const canonicalRequest = [
-    input.method,
-    input.url.pathname || "/",
-    input.url.searchParams.toString(),
-    canonicalHeaders.map(([key, value]) => `${key}:${value}\n`).join(""),
-    signedHeaderNames,
-    payloadHash,
-  ].join("\n");
-  const credentialScope = `${shortDate}/${input.region}/s3/aws4_request`;
-  const stringToSign = [
-    "AWS4-HMAC-SHA256",
-    amzDate,
-    credentialScope,
-    createHash("sha256").update(Buffer.from(canonicalRequest)).digest("hex"),
-  ].join("\n");
-  const dateKey = hmac(Buffer.from(`AWS4${input.secretAccessKey}`), shortDate);
-  const dateRegionKey = hmac(dateKey, input.region);
-  const dateRegionServiceKey = hmac(dateRegionKey, "s3");
-  const signingKey = hmac(dateRegionServiceKey, "aws4_request");
-  const signature = createHmac("sha256", signingKey).update(stringToSign).digest("hex");
-  return {
-    ...headers,
-    authorization: `AWS4-HMAC-SHA256 Credential=${input.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaderNames}, Signature=${signature}`,
-  };
-}
-
-function hmac(key: Buffer, value: string): Buffer {
-  return createHmac("sha256", key).update(value).digest();
 }
 
 function joinUrlPath(...parts: string[]): string {

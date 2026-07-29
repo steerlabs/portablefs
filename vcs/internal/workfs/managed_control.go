@@ -96,7 +96,7 @@ func (fs *FS) managedEstablishSession(sessionID string, generation uint64, owner
 	if err != nil {
 		return err
 	}
-	rec, err := pfc2.NewSessionOpenRecord(ref, owner, sum, slots, issued.Fact, SessionLeaseTTL)
+	rec, err := pfc2.NewSessionOpenRecord(ref, owner, sum, slots, issued.Fact, SessionLeaseTTL())
 	if err != nil {
 		return err
 	}
@@ -111,7 +111,7 @@ func (fs *FS) managedEstablishSession(sessionID string, generation uint64, owner
 	// The database minted the lease; anchor its projection on the local
 	// monotonic clock (deadline = now + TTL, the record's own
 	// expires − minted delta).
-	fs.anchorProjectedLease(sessionID, generation, SessionLeaseTTL.Milliseconds())
+	fs.anchorProjectedLease(sessionID, generation, SessionLeaseTTL().Milliseconds())
 	return nil
 }
 
@@ -164,7 +164,7 @@ func (fs *FS) managedResumeSession(sessionID string, generation uint64, token st
 	if err != nil {
 		return SessionInfo{}, err
 	}
-	rec, err := pfc2.NewSessionRenewRecord(ref, sum, issued.Fact, SessionLeaseTTL)
+	rec, err := pfc2.NewSessionRenewRecord(ref, sum, issued.Fact, SessionLeaseTTL())
 	if err != nil {
 		return SessionInfo{}, err
 	}
@@ -177,7 +177,7 @@ func (fs *FS) managedResumeSession(sessionID string, generation uint64, token st
 	} else {
 		// The database renewed the lease; re-anchor the monotonic projection
 		// with the record's own expires − minted delta.
-		fs.anchorProjectedLease(sessionID, generation, SessionLeaseTTL.Milliseconds())
+		fs.anchorProjectedLease(sessionID, generation, SessionLeaseTTL().Milliseconds())
 	}
 	info, ok := fs.managedSessionInfo(sessionID)
 	if !ok || info.Expired || info.Generation != generation {

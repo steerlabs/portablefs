@@ -102,10 +102,6 @@ type DurableLog interface {
 	CheckpointCutState() (CheckpointCut, bool)
 	CompactRecoveredCheckpoint(operationID string) error
 
-	// Control-only maintenance rotation.
-	RotateControlOnlyThrough(watermark, sidecarSeq uint64) error
-	RecoverControlRotation() error
-
 	// Codec identity for this epoch.
 	RecordCodec() string
 	ControlCodec() string

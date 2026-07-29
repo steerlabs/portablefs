@@ -95,8 +95,22 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			a.marshalJSONStatus(w)
 		case http.MethodDelete:
-			if _, err := s.registry.delete(r.Context(), ref); err != nil {
+			// A normal DELETE runs the full drain barrier and FAILS (attach
+			// intact, still serving) when the tail cannot reach the
+			// authority. Only ?force=1 detaches with an unshipped tail; the
+			// tail parks as a durable recovery job whose ID is returned.
+			force := r.URL.Query().Get("force") == "1"
+			_, jobID, err := s.registry.delete(r.Context(), ref, force)
+			if err != nil && !force {
+				writeHTTPError(w, http.StatusConflict, err.Error())
+				return
+			}
+			if err != nil {
 				writeHTTPError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if force {
+				writeJSON(w, http.StatusOK, map[string]any{"forced": true, "recoveryJob": jobID})
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -142,6 +156,30 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	case "sync":
+		// The unmount-class drain barrier, exposed so `portablefs umount`
+		// drains BEFORE the kernel unmount. Success means authority-durable,
+		// applied, and peer-acknowledged; failure is an HTTP error carrying
+		// the unshipped backlog — the CLI then refuses the normal unmount.
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		vol, eno := a.volOrErr()
+		if eno != 0 {
+			writeHTTPError(w, httpStatusForErr(eno), errMessage("sync", eno))
+			return
+		}
+		if err := vol.SyncVolume(); err != nil {
+			recs, bytes := vol.WriteBackPending()
+			writeHTTPError(w, http.StatusBadGateway, fmt.Sprintf("drain failed with %d records (%d bytes) unshipped: %v", recs, bytes, err))
+			return
+		}
+		recs, bytes := vol.WriteBackPending()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"pendingRecords": recs,
+			"pendingBytes":   bytes,
+		})
 	case "local-dirs":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)

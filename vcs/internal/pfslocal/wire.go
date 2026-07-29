@@ -50,8 +50,8 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.RequestID = v
-		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 90, 91:
+		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 90, 91:
 			if wt != wireBytes {
 				return nil, ErrMalformed
 			}
@@ -127,6 +127,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 33, nil, nil
 	case *HardLinkRequest:
 		return 34, marshalHardLinkRequest(m), nil
+	case *SyncVolumeRequest:
+		return 35, nil, nil
 	case *HelloReply:
 		return 60, marshalHelloReply(m), nil
 	case *ResolveReply:
@@ -177,6 +179,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 83, nil, nil
 	case *HardLinkReply:
 		return 84, marshalHardLinkReply(m), nil
+	case *SyncVolumeReply:
+		return 85, marshalSyncVolumeReply(m), nil
 	case *ErrorReply:
 		return 90, marshalErrorReply(m), nil
 	case *Event:
@@ -238,6 +242,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return &SubscribeEventsRequest{}, nil
 	case 34:
 		return unmarshalHardLinkRequest(b)
+	case 35:
+		return &SyncVolumeRequest{}, nil
 	case 60:
 		return unmarshalHelloReply(b)
 	case 61:
@@ -288,6 +294,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return &SubscribeEventsReply{}, nil
 	case 84:
 		return unmarshalHardLinkReply(b)
+	case 85:
+		return unmarshalSyncVolumeReply(b)
 	case 90:
 		return unmarshalErrorReply(b)
 	case 91:
@@ -1387,6 +1395,23 @@ func unmarshalXattrRemoveRequest(b []byte) (*XattrRemoveRequest, error) {
 			var v []byte
 			v, err = scalarBytes(wt, raw)
 			m.Name = string(v)
+		}
+		return err
+	})
+}
+
+func marshalSyncVolumeReply(m *SyncVolumeReply) []byte {
+	var b []byte
+	b = appendBool(b, 1, m.Degraded)
+	return b
+}
+
+func unmarshalSyncVolumeReply(b []byte) (*SyncVolumeReply, error) {
+	m := &SyncVolumeReply{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		var err error
+		if num == 1 {
+			m.Degraded, err = scalarBool(wt, raw)
 		}
 		return err
 	})

@@ -28,17 +28,13 @@ type LockAuthority interface {
 	Lock(path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error)
 }
 
-// lockRouter picks the coordination surface the authority generation accepts:
-// a journal-native (managed) authority refuses the legacy envelope-less
-// setlk/unlock with EPERM and requires the journaled exact-identity lock op,
-// while a legacy self-host server knows only the in-memory op. Getlk is a
-// pure read answered identically by both generations. handleIno 0 keeps
-// managed locks path-keyed at decision time — the exact semantics of the
-// legacy lock table, so lock behavior is uniform across generations.
+// lockRouter routes lock mutations through the journaled exact-identity lock
+// op; getlk is a pure read. handleIno 0 keeps locks path-keyed at decision
+// time.
 type lockRouter struct{ cli *fsproto.Client }
 
 func (r lockRouter) Lock(path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
-	if mode != fsproto.LkGetlk && r.cli.ServerManaged() {
+	if mode != fsproto.LkGetlk {
 		return r.cli.LockManaged(path, 0, mode, lkID, start, end, write, unlock)
 	}
 	return r.cli.Lock(path, mode, lkID, start, end, write, unlock)

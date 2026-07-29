@@ -1,0 +1,234 @@
+package fsproto
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/wal"
+)
+
+func encodeRequestForTest(t *testing.T, req *Request) []byte {
+	t.Helper()
+	var wire bytes.Buffer
+	if err := newRequestEncoder(&wire).Encode(req); err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	return wire.Bytes()
+}
+
+func decodeRequestForTest(wire []byte) (Request, error) {
+	var req Request
+	err := newRequestDecoder(bytes.NewReader(wire)).Decode(&req)
+	return req, err
+}
+
+func TestRequestCodecRoundTripAllFields(t *testing.T) {
+	reqHash := bytes.Repeat([]byte{0xa5}, 32)
+	want := Request{
+		Op: OpFlushBatch,
+
+		Path:         "scope/file",
+		NewPath:      "scope/new",
+		OrphanTarget: true,
+		Offset:       -17,
+		Size:         -23,
+		Mode:         0o6754,
+		Target:       "target",
+		Data:         []byte("payload"),
+		Append:       true,
+		MtimeMs:      -29,
+		SetMode:      true,
+		SetTime:      true,
+		UID:          31,
+		GID:          37,
+		SetUID:       true,
+		SetGID:       true,
+		Owner:        "owner",
+
+		SessionID: "writeback",
+		Epoch:     41,
+		Records: []wal.Record{{
+			Seq: 43, Op: wal.OpWrite, Path: "scope/file", Offset: 47, Data: []byte("record"),
+		}},
+
+		LkID:     53,
+		LkStart:  59,
+		LkEnd:    61,
+		LkWrite:  true,
+		LkUnlock: true,
+		LkMode:   LkSetlkw,
+
+		OrphanIno:    67,
+		HandleIno:    71,
+		OrphanInos:   []uint64{73, 79},
+		OpenIno:      83,
+		OpenState:    true,
+		OpenInos:     []uint64{89, 97},
+		RegisterOpen: true,
+
+		SessionGen:   101,
+		SessionToken: "token",
+		SessionSlots: 103,
+		Env: &wal.Envelope{
+			SessionID: "mount-session", Generation: 107, Slot: 109, SlotSeq: 113, ReqHash: reqHash,
+		},
+
+		CheckoutPath:  "scope",
+		CheckoutEpoch: "epoch",
+		Excl:          true,
+		XattrName:     "user.key",
+		XattrFlags:    wal.XattrCreate,
+
+		WBPrevDigest: []byte("previous"),
+		WBEndDigest:  []byte("end"),
+		WBScopes:     []WBScope{{Path: "scope", Epoch: "epoch"}},
+		WBThrough:    127,
+		AckPos:       131,
+	}
+	got, err := decodeRequestForTest(encodeRequestForTest(t, &want))
+	if err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request round trip mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestRequestCodecAllowsMaxWriteAndRejectsAggregateOverflow(t *testing.T) {
+	data := make([]byte, MaxWriteBytes)
+	if err := newRequestEncoder(io.Discard).Encode(&Request{
+		Op: OpWrite, Path: "file", Data: data,
+	}); err != nil {
+		t.Fatalf("exact MaxWriteBytes request was rejected: %v", err)
+	}
+
+	// Reuse one bounded string across all metadata fields: no individual
+	// field is excessive, but together with the legitimate 64 MiB write the
+	// aggregate frame exceeds its independent ceiling.
+	text := strings.Repeat("x", maxRequestTextBytes)
+	var dst bytes.Buffer
+	err := newRequestEncoder(&dst).Encode(&Request{
+		Op: OpWrite, Data: data,
+		Path: text, NewPath: text, Target: text, Owner: text,
+		SessionID: text, SessionToken: text, CheckoutPath: text,
+		CheckoutEpoch: text, XattrName: text,
+	})
+	if !errors.Is(err, errRequestTooLarge) {
+		t.Fatalf("aggregate overflow error = %v, want errRequestTooLarge", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("aggregate-overflow encoder wrote %d bytes before rejecting", dst.Len())
+	}
+}
+
+func requestDynamicOffset(t *testing.T, wire []byte) int {
+	t.Helper()
+	// Skip the outer frame header and every fixed-width body field through
+	// AckPos. This mirrors the frozen PFRQ1 field order.
+	const fixedBodyBytes = 4 + 1 + 1 + 4 +
+		8 + 8 + 4 + 8 + 4 + 4 + 8 +
+		8 + 8 + 8 + 1 +
+		8 + 8 + 8 +
+		8 + 4 + 1 + 8 + 8
+	off := 4 + fixedBodyBytes
+	if off > len(wire) {
+		t.Fatalf("short encoded request: %d bytes", len(wire))
+	}
+	return off
+}
+
+func skipLengthPrefixed(t *testing.T, wire []byte, off int) int {
+	t.Helper()
+	if off+4 > len(wire) {
+		t.Fatalf("missing length at offset %d", off)
+	}
+	n := int(binary.BigEndian.Uint32(wire[off : off+4]))
+	off += 4
+	if n > len(wire)-off {
+		t.Fatalf("field length %d exceeds %d remaining test bytes", n, len(wire)-off)
+	}
+	return off + n
+}
+
+func TestRequestDecoderRejectsHostileAnnouncedLengthBeforeAllocation(t *testing.T) {
+	wire := encodeRequestForTest(t, &Request{Op: OpGetattr})
+	off := requestDynamicOffset(t, wire)
+	// Nine text fields precede Data.
+	for range 9 {
+		off = skipLengthPrefixed(t, wire, off)
+	}
+	binary.BigEndian.PutUint32(wire[off:off+4], ^uint32(0))
+
+	if _, err := decodeRequestForTest(wire); !errors.Is(err, errMalformedRequest) {
+		t.Fatalf("hostile inner length error = %v, want errMalformedRequest", err)
+	}
+}
+
+func TestRequestDecoderRejectsOversizeFrameBeforeReadingBody(t *testing.T) {
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], maxRequestBytes+1)
+	if _, err := decodeRequestForTest(header[:]); !errors.Is(err, errRequestTooLarge) {
+		t.Fatalf("oversize frame error = %v, want errRequestTooLarge", err)
+	}
+}
+
+func TestRequestDecoderRejectsExcessiveCollectionBeforeAllocation(t *testing.T) {
+	base := encodeRequestForTest(t, &Request{Op: OpGetattr})
+	off := requestDynamicOffset(t, base)
+	// Nine text fields and three byte fields precede OrphanInos.
+	for range 12 {
+		off = skipLengthPrefixed(t, base, off)
+	}
+	// The empty request has four consecutive zero counts at this point:
+	// OrphanInos, OpenInos, Records, and WBScopes.
+	for i, name := range []string{"orphan inos", "open inos", "records", "write-back scopes"} {
+		t.Run(name, func(t *testing.T) {
+			wire := append([]byte(nil), base...)
+			binary.BigEndian.PutUint32(wire[off+4*i:off+4*i+4], maxRequestCollectionItems+1)
+			if _, err := decodeRequestForTest(wire); !errors.Is(err, errMalformedRequest) {
+				t.Fatalf("excessive collection error = %v, want errMalformedRequest", err)
+			}
+		})
+	}
+}
+
+func TestSubscribeAckAfterStreamTeardownIsSafe(t *testing.T) {
+	_, addr, stop := serveStoppable(t)
+	cli, err := Dial(addr, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	stream, ack, err := cli.Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pos uint64
+	select {
+	case bootstrap := <-stream:
+		pos = bootstrap.Pos
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe bootstrap did not arrive")
+	}
+	stop()
+	select {
+	case _, open := <-stream:
+		if open {
+			for range stream {
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe stream did not tear down")
+	}
+
+	// The invalidation consumer may finish applying a batch just after the
+	// reader observes teardown. That late ack is a no-op, not a nil-conn
+	// panic or race with reset.
+	ack(pos)
+}

@@ -16,10 +16,10 @@ Everything below exists to preserve that contract.
    Users and agents should think in paths, files, directories, renames, locks, and `fsync`.
    Checkpoints, commits, snapshots, and object storage are infrastructure underneath.
 
-2. **The custom mount protocol is the production data plane.**
+2. **The custom mount protocol is the only data plane.**
    Linux FUSE, macOS FSKit, and container bind mounts terminate in the same custom
-   protocol today; the Kubernetes CSI surface is a planned addition that will terminate
-   there too (not yet packaged here). NFS is compatibility only.
+   protocol (fsproto v6) today; the Kubernetes CSI surface is a planned addition that
+   will terminate there too (not yet packaged here).
 
 3. **One active volume has one logical authority.**
    A single ordered authority decides the current filesystem state for a mounted active
@@ -45,11 +45,11 @@ Everything below exists to preserve that contract.
    last writer wins where the application chooses that pattern, or clear write errors.
 
 7. **Fail closed in production.**
-   `VCS_PRODUCTION=1` requires the remote journal and refuses every local-durability
-   shape by name: local WAL files, persistent cache directories, NFS serving, operator
-   listener addresses, and unauthenticated data or lifecycle planes (per-instance
-   `VCS_AUTH_TOKEN` + `VCS_ADMIN_TOKEN`, even on loopback). The child refuses to serve
-   until the journal database's durability evidence satisfies the structured HA policy.
+   `VCS_PRODUCTION=1` requires the remote journal and refuses every removed
+   local-durability shape by name: operator listener addresses and unauthenticated data
+   or lifecycle planes (per-instance `VCS_AUTH_TOKEN` + `VCS_ADMIN_TOKEN`, even on
+   loopback). The child refuses to serve until the journal database's durability
+   evidence satisfies the structured HA policy.
 
 ## Target Shape
 
@@ -136,8 +136,10 @@ unreleased so database-time expiry fences it.
 only acceptable behind an authenticated private network or tunnel such as WireGuard.
 It is never the public internet default.
 
-Local development runs a single writable VCS with a file WAL and none of those guards;
-that shape is explicitly not production.
+Local development runs the same managed shape through quickstart (manager +
+PostgreSQL in Docker); the file WAL survives only as the mount's write-back
+stream log and the bench/test entry-log backend, never as an authority's
+production truth.
 
 ## Mounting Contract
 
@@ -167,6 +169,21 @@ Underneath, that means:
 
 The agent should never need the old attach/sync/flush local-folder workflow.
 
+### Write Path
+
+Write mode is not a mount property. Every mount runs one adaptive write-back
+engine per (volume, branch) ([writeback-engine.md](./writeback-engine.md)):
+the authority delegates an uncontended subtree on first write, mutations
+under a held scope are acknowledged locally (durable in a segmented mount
+WAL) and flushed as dense batches whose watermark and stream digest commit
+atomically with the tree state, and peer operations that overlap a
+delegation wait for recall — a reader is never answered from stale
+pre-delegation state. Contended scopes execute write-through and re-delegate
+once contention clears. `fsync`/`synchronize`/clean unmount always mean
+durable at the authority; a crashed mount's acknowledged tail parks durably
+and replays on the next attach, surfaced in `portablefs mounts` until it
+drains.
+
 ### Machine-Local Dirs (Grafts)
 
 Several machines mount one volume concurrently (a laptop and a cloud sandbox),
@@ -193,14 +210,14 @@ Three implementations serve the contract:
   `POST /v1/attaches/{ref}/local-dirs`) serves those paths from
   `<stateDir>/local/<storageID>/` instead of the authority. The control `fs/*`
   API serves the identical grafted namespace as the FSKit frontend.
-- The FUSE clients (`portablefs mount` and `cmd/mount`) implement the same
+- The Linux FUSE frontend (`portablefs mount`) implements the same
   semantics natively in `vcs/internal/localdirs`, so grafts work on Linux
   without the privileges bind mounts require. Grafted operations go straight
   to local disk on file-descriptor-backed handles: no fsproto round trips, no
   write-back flush batching, no invalidation subscriptions, and local inode
   numbers are minted in a marked range so they can never collide with volume
   inodes in the kernel dcache. Backing lives at `<stateBase>/local/<storageID>/`
-  (the CLI state dir; `PORTABLEFS_LOCAL_DIRS_STATE` for raw `cmd/mount`).
+  (the CLI state dir).
 - Privileged sandboxes may still bind-mount local disk over the FUSE mount;
   grafts make that unnecessary where privileges are absent.
 
@@ -213,9 +230,8 @@ flags at mount time so a repository declares its per-machine dirs once for
 every machine. Linux FUSE and macOS FSKit resolve the same union and reject a
 graft of `.portablefs` or `.portablefs/local-dirs`, which would hide the
 configuration source ([fskit-mount.md](./fskit-mount.md)).
-Raw `cmd/mount` reads `PORTABLEFS_LOCAL_DIRS` (comma-separated).
-Grafts are orthogonal to `--fast`: write-back batches volume writes while graft
-writes never enter the flush path at all.
+Grafts are orthogonal to the write-back engine: delegated write-back batches
+volume writes while graft writes never enter the flush path at all.
 
 Graft backing is a security boundary, not a trusted path prefix. The daemon and
 FUSE clients open the backing directory once and perform every lookup, open,
@@ -244,8 +260,8 @@ disk — one invariant, expressed at the same layer on every platform.
 For live writes (the journal contract, [journal.md](./journal.md)):
 
 - the authority orders the mutation;
-- the canonical record bytes commit to the durable log before acknowledgement —
-  the fenced remote journal in production, the local file WAL in development;
+- the canonical record bytes commit to the fenced remote journal before
+  acknowledgement;
 - reads from connected clients observe authority-ordered state;
 - history (cuts, snapshots, forks — [history.md](./history.md)) is asynchronous
   and can never change the meaning of an acknowledged write.
@@ -263,7 +279,6 @@ For history materialization:
 - Do not put S3/Railway Buckets directly in the syscall write acknowledgement path.
 - Do not make active-active multi-master the default for one live volume.
 - Do not make users think about checkpoints for ordinary agent runs.
-- Do not make NFS the production path for agent coherence.
 - Do not silently merge two agents' writes to the same file.
 
 ## Verification Contract
@@ -283,8 +298,8 @@ The local Postgres integration gate is:
 pnpm verify:postgres
 ```
 
-The real Railway Bucket gate remains credential-gated:
+The real S3 bucket gate remains credential-gated:
 
 ```bash
-pnpm test:railway-bucket
+pnpm test:s3-bucket
 ```

@@ -189,16 +189,6 @@ export const routePolicies = {
     responseReserveBytes: 48 * MiB,
     maxResponseBytes: 16 * MiB,
   },
-  // Retired exec endpoint: a single small retirement envelope, with a
-  // one-at-a-time admission cap so floods cannot amplify auth work.
-  exec: {
-    name: "exec",
-    maxBodyBytes: 64 * KiB,
-    concurrency: 1,
-    parseAmplification: 2,
-    responseReserveBytes: 1 * MiB,
-    maxResponseBytes: 1 * MiB,
-  },
 } as const satisfies Record<string, RoutePolicy>;
 
 export type RoutePolicyName = keyof typeof routePolicies;

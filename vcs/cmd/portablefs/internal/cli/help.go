@@ -279,7 +279,7 @@ EXAMPLES
   portablefs grep my-workspace "TODO" --dir src
 `,
 		"mount": `USAGE
-  portablefs mount <volumeId> <mountPath> [--branch main] [--fast]
+  portablefs mount <volumeId> <mountPath> [--branch main]
                    [--local-dir rel]... [--no-local-dirs]
                    [--strategy auto|fskit|fuse] [--addr host:port]
                    [--mount-token t] [--foreground] [--json]
@@ -289,15 +289,14 @@ authority through the manager, mounts, and daemonizes — the command returns
 and the mount persists (state under ~/.local/state/portablefs/mounts).
 --foreground stays attached; Ctrl-C unmounts.
 
---fast is single-writer speed mode: writes batch locally and flush every
-250ms instead of round-tripping per operation, and missing-path lookups
-cache with version-gated invalidation. Build/install-heavy agent workloads
-run ~25x faster (see docs/performance.md). fsync remains a real durability
-barrier — git commits and SQLite transactions are durable at the authority
-when fsync returns; other writes have a bounded ~250ms window, like a local
-page cache. Other machines see a --fast mount's writes after the next flush
-(≤250ms + network) rather than instantly. Default (no --fast) is full
-write-through: every acked write is already durable.
+Write mode is not a mount property: the authority delegates write-back per
+scope adaptively, so build/install-heavy workloads acknowledge locally at
+local-disk speed while contended paths stay write-through. fsync(2) is
+always a REAL authority-durability barrier. Linux FUSE also acknowledges
+peer invalidations after its kernel cache hook; macOS 26 FSKit has no such
+hook, so reads served wholly from FSKit's kernel cache are outside the exact
+peer-visibility claim. Un-fsynced writes have a bounded flush window. (The
+retired --fast flag is an error: every mount is adaptive.)
 
 --local-dir <rel> (repeatable) serves a workspace-relative directory —
 node_modules, .venv, target — from machine-local disk instead of the volume:
@@ -306,8 +305,7 @@ between machines. The set persists per volume+branch+mountPath, so a plain
 remount reuses it; explicit flags win and update it; --no-local-dirs clears
 it. On Linux (FUSE) a .portablefs/local-dirs file in the volume (one path
 per line, # comments) is unioned in at mount time so a repo declares its
-per-machine dirs once for every machine. Composes with --fast. See
-docs/agents.md.
+per-machine dirs once for every machine. See docs/agents.md.
 
 There is ONE transport per platform, with no fallbacks: macOS mounts through
 the PortableFS FSKit extension (install PortableFS.app and enable its File
@@ -326,18 +324,27 @@ PORTABLEFS_FSKIT_DAEMON.
 
 EXAMPLES
   portablefs mount my-workspace ~/work
-  portablefs mount my-workspace ~/work --fast     # agent build/test loops
-  portablefs mount my-workspace ~/work --local-dir node_modules --fast
+  portablefs mount my-workspace ~/work --local-dir node_modules
   portablefs mount my-workspace /tmp/w --branch experiment --foreground
   portablefs mount my-workspace /mnt/w --addr 127.0.0.1:2050 --mount-token tok
 `,
 		"umount": `USAGE
-  portablefs umount <mountPath> [--json]
+  portablefs umount <mountPath> [--force] [--json]
 
-Unmount a portablefs mount and stop its daemon. Uses the platform unmount
-tooling (umount/diskutil on macOS, fusermount3 on Linux), then terminates the
-recorded daemon pid and removes the mount state. A path with no recorded state
-gets a best-effort plain unmount with a warning.
+Unmount a portablefs mount and stop its daemon. A NORMAL unmount first runs
+the full drain barrier — every acknowledged write reaches the authority and
+every live protocol subscriber acknowledges its invalidations — and FAILS
+(mount stays attached, nonzero exit) if the drain cannot complete, so an
+unmount can never silently strand acknowledged data.
+
+--force detaches without draining: the unshipped tail parks as a durable
+recovery job (its ID is printed) and drains automatically on the next attach
+of the same volume+branch. Use it when the authority is unreachable and you
+need the mount gone NOW.
+
+Uses the platform unmount tooling (umount/diskutil on macOS, fusermount3 on
+Linux), then terminates the recorded daemon pid and removes the mount state.
+A path with no recorded state gets a best-effort plain unmount with a warning.
 `,
 		"mounts": `USAGE
   portablefs mounts [--json]

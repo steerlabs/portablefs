@@ -71,8 +71,6 @@ import {
   type RetireVolumeResult,
   type SnapshotCutInput,
   type SnapshotCutRecord,
-  type JournalContentScan,
-  type JournalContentScanInput,
   type SnapshotInput,
   type SnapshotSource,
   type VolumeBranchMode,
@@ -85,7 +83,6 @@ import {
   type VolumeStatusInput,
 } from "./types.js";
 import { attachRequestFingerprint } from "./attach.js";
-import { pfr1ControlOnly } from "./pfr1-op.js";
 import {
   PostgresHistoryRepository,
   type ConversionStatus,
@@ -195,6 +192,40 @@ const migrationIds = [
   // indexes/FKs use (tenant_id, volume_id), so equal ids in two tenants are
   // isolated without scans or ambiguous joins.
   "023_tenant_scoped_volume_identity",
+  // 024 adds pfh.object_locate_batch (worker-only): the bounded batched
+  // location read behind convergent cut retries — a retried attempt skips
+  // objects a previous attempt already uploaded and receipted instead of
+  // re-uploading its entire object set.
+  "024_history_locate_batch",
+  // 025 installs the history storage policy: batched copy receipts
+  // (pfh.object_copy_receipt_batch) and W-of-N readiness with
+  // W = min(2, N) (pfh.write_quorum) in the receipt live-flip and the
+  // publication proof, whose freshness window now applies only to objects
+  // the cut produced (upload-intent rows).
+  "025_history_write_quorum",
+  // 026 makes managed-journal capture chain on the branch's newest ready
+  // cut of the same generation (the fold covers only the tail since it),
+  // teaches adoption to verify/replace the GENERATION's live base (a
+  // chained cut's source base is a ready-cut boundary), and roots the
+  // closures of any cut serving as a live fold's source base.
+  "026_history_chained_cuts",
+  // 027 adds pfh.cut_objects_add_from_base (worker-only): the O(delta)
+  // publication — the worker registers only the objects a chained fold
+  // produced and the database copies the adopted base cut's closure rows
+  // server-side, returning the final totals.
+  "027_history_delta_publish",
+  // 028 bounds history storage: pfh.object_is_root becomes the retention
+  // policy (pinned + named + newest-8 ready cuts per live-volume branch;
+  // the unbounded child-commit clause is removed), pfh.retention_release
+  // (worker) releases superseded adoption consumers, and
+  // pfh.snapshot_cut_release (caller) deletes named snapshots by clearing
+  // their labels so the existing GC sweep collects them.
+  "028_history_retention",
+  // 029 converges user and recovery cuts at the same exact boundary onto
+  // ONE materialization (kind-agnostic dedup; a labeled request adopts
+  // its label onto an unlabeled live row) and lets adoption consume any
+  // ready pfj3 managed cut — every ready cut carries a verified anchor.
+  "029_history_cut_kind_dedup",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";
@@ -2201,12 +2232,21 @@ export class PostgresMetadataRepository implements MetadataRepository {
     if (!row) {
       return null;
     }
+    if (row.record_codec !== "pfj3" || row.control_codec !== "pfc2") {
+      // Unreachable behind the startup gate (countPreJournalV3Generations);
+      // fail closed rather than serve a retired-codec binding.
+      throw new MetadataConflictError(
+        "JOURNAL_CODEC_RETIRED",
+        "This branch's journal generation uses the retired pfr1/pfc1 codec pair.",
+        500
+      );
+    }
     return {
       generationId: String(row.id),
       branchId: String(row.branch_id),
       epoch: String(row.epoch),
-      recordCodec: row.record_codec === "pfj3" ? "pfj3" : "pfr1",
-      controlCodec: row.control_codec === "pfc2" ? "pfc2" : "pfc1",
+      recordCodec: "pfj3",
+      controlCodec: "pfc2",
       baseCommitId: String(row.base_commit_id),
       baseSeq: String(row.base_seq),
       baseDigest: String(row.base_digest),
@@ -2216,28 +2256,16 @@ export class PostgresMetadataRepository implements MetadataRepository {
     };
   }
 
-  async journalContentRowsSince(input: JournalContentScanInput): Promise<JournalContentScan> {
-    const limit = Math.max(1, Math.min(input.scanLimit, 4096));
-    // Only a bounded prefix travels: the op sits within the first ~26 bytes
-    // of the canonical PFR1 encoding, and payloads can be megabytes.
+  // Startup data gate for the retired pfr1/pfc1 journal codec era: counts
+  // generation rows predating the pfj3/pfc2 pair (migration 012). One cheap
+  // query — the generations table holds a handful of rows per active branch.
+  async countPreJournalV3Generations(): Promise<number> {
     const result = await this.pool.query(
-      `SELECT substring(payload from 1 for 32) AS prefix
-       FROM pfj.journal_records
-       WHERE generation_id = $1 AND seq >= $2 AND seq < $3
-       ORDER BY seq
-       LIMIT $4`,
-      [input.generationId, input.fromSeq, input.toSeqExclusive, limit + 1]
+      `SELECT count(*)::int AS legacy
+       FROM pfj.journal_generations
+       WHERE record_codec <> 'pfj3' OR control_codec <> 'pfc2'`
     );
-    const rows = result.rows as Array<{ prefix: Buffer }>;
-    const truncated = rows.length > limit;
-    const scanned = Math.min(rows.length, limit);
-    let contentRows = 0;
-    for (let i = 0; i < scanned; i += 1) {
-      if (!pfr1ControlOnly(new Uint8Array(rows[i]!.prefix))) {
-        contentRows += 1;
-      }
-    }
-    return { scanned, contentRows, truncated };
+    return Number((result.rows[0] as { legacy?: number } | undefined)?.legacy ?? 0);
   }
 
   async snapshotCut(input: SnapshotCutInput): Promise<SnapshotCutRecord> {
@@ -2330,13 +2358,15 @@ export class PostgresMetadataRepository implements MetadataRepository {
       createdAt: snapshot.createdAt,
       state: "ready" as const,
     }));
-    // User cuts of this volume (owner-membership read; user kind only — the
-    // recovery arm and conversion machinery never surface as snapshots).
+    // Snapshot-surfaced cuts of this volume (owner-membership read): user
+    // requests plus any labeled cut — kind-agnostic dedup (migration 029)
+    // can land a named snapshot on a recovery-kind row at the same
+    // boundary. Unlabeled recovery/conversion machinery stays invisible.
     const cuts = await this.pool.query(
       `SELECT c.* FROM pfh.history_cuts c
        LEFT JOIN branches b ON b.id = c.branch_id
        WHERE c.tenant_id = $1 AND c.volume_id = $2
-         AND c.kind = 'user'
+         AND (c.kind = 'user' OR c.user_label IS NOT NULL)
          AND ($3::text IS NULL OR b.name = $3)
        ORDER BY c.created_db_ms ASC, c.id ASC`,
       [input.tenantId, input.volumeId, input.branchName ?? null]
@@ -2585,8 +2615,11 @@ export class PostgresMetadataRepository implements MetadataRepository {
     if (snapshot) {
       return { kind: "snapshot", snapshot };
     }
+    // Kind-agnostic dedup (029) can answer a snapshot request with a
+    // recovery-kind row at the same boundary; any cut id resolves —
+    // consumability is decided by state, not by the requesting label.
     const result = await this.pool.query(
-      `SELECT * FROM pfh.history_cuts WHERE id = $1 AND kind = 'user'`,
+      `SELECT * FROM pfh.history_cuts WHERE id = $1`,
       [snapshotOrCutId]
     );
     const row = result.rows[0] as Record<string, unknown> | undefined;

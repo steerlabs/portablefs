@@ -106,7 +106,6 @@ function unusedRegistry(): AuthorityRegistry {
   };
   return {
     ensureAuthority: (ref: AuthorityRef) => fail(),
-    createSession: (ref: AuthorityRef) => fail(),
     isHealthy: async () => {
       throw new Error("Unexpected registry call.");
     },

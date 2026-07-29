@@ -52,10 +52,11 @@ type doctorRun struct {
 	e    *cmdEnv
 	opts commonOpts
 
-	httpDo        func(*http.Request) (*http.Response, error)
-	runCmd        func(name string, args ...string) (string, error)
-	goos          string
-	daemonHealthy func(controlSock string) bool
+	httpDo         func(*http.Request) (*http.Response, error)
+	runCmd         func(name string, args ...string) (string, error)
+	goos           string
+	daemonHealthy  func(controlSock string) bool
+	daemonAttaches func(controlSock string) ([]cliAttachStatus, error)
 
 	// resolved once before the checks run
 	settings    settings
@@ -80,6 +81,11 @@ func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
 		},
 		goos:          runtime.GOOS,
 		daemonHealthy: func(controlSock string) bool { return newFsdControl(controlSock).healthy() },
+		daemonAttaches: func(controlSock string) ([]cliAttachStatus, error) {
+			ctl := newFsdControl(controlSock)
+			ctl.httpClient.Timeout = 5 * time.Second
+			return ctl.listAttaches()
+		},
 	}
 }
 
@@ -100,6 +106,7 @@ func doctorChecks() []struct {
 		{"version", (*doctorRun).checkVersion},
 		{"fskit extension", (*doctorRun).checkFskitExtension},
 		{"portablefsd", (*doctorRun).checkDaemon},
+		{"write-back", (*doctorRun).checkWriteBack},
 		{"mounts", (*doctorRun).checkMounts},
 	}
 }
@@ -393,6 +400,65 @@ func (r *doctorRun) checkDaemon() doctorResult {
 			fmt.Sprintf("run `portablefs umount %s` and mount again (a fresh daemon starts automatically)", path))
 	}
 	return doctorPass("not running (it starts on demand at mount time)")
+}
+
+// checkWriteBack surfaces the daemon's durability debt: degraded attaches and
+// parked write-back WALs the background recovery job is still retrying. This
+// is the operator-visible face of "no acknowledged write is ever silently
+// abandoned".
+func (r *doctorRun) checkWriteBack() doctorResult {
+	if r.goos != "darwin" {
+		return doctorSkip("write-back recovery status is read from portablefsd (macOS-only)")
+	}
+	cfg := fskitConfigFromEnv(r.e.getenv)
+	if !r.daemonHealthy(cfg.controlSock) {
+		return doctorSkip("portablefsd is not running (no attaches to inspect)")
+	}
+	attaches, err := r.daemonAttaches(cfg.controlSock)
+	if err != nil {
+		return doctorFail(fmt.Sprintf("cannot read attach status: %v", err), "restart portablefsd (unmount and mount again)")
+	}
+	if len(attaches) == 0 {
+		return doctorPass("no attaches")
+	}
+	var lines []string
+	problems := 0
+	for _, a := range attaches {
+		line := fmt.Sprintf("%s  %s@%s  %s", a.MountPath, a.VolumeID, a.Branch, a.State)
+		if a.State == "degraded" && a.LastError != "" {
+			line += "  (" + a.LastError + ")"
+		}
+		if a.State == "degraded" {
+			problems++
+		}
+		if wb := a.WriteBack; wb != nil {
+			for _, p := range wb.ParkedWALs {
+				problems++
+				detail := fmt.Sprintf("parked WAL: %d record(s), %s old", p.Records, (time.Duration(p.AgeMs) * time.Millisecond).Round(time.Second))
+				if p.Root != "" {
+					detail += ", subtree " + p.Root
+				}
+				if p.LastError != "" {
+					detail += ", last error: " + p.LastError
+				}
+				line += "\n        " + detail
+			}
+			if wb.PendingRecords > 0 && len(wb.ParkedWALs) == 0 {
+				line += fmt.Sprintf("  (%d record(s) flushing)", wb.PendingRecords)
+			}
+		}
+		lines = append(lines, line)
+	}
+	if problems > 0 {
+		res := doctorFail(
+			fmt.Sprintf("%d attach(es) with degraded state or parked write-back records", problems),
+			"the daemon retries recovery automatically; if it persists, check authority reachability and credentials (`portablefs login`)")
+		res.Lines = lines
+		return res
+	}
+	res := doctorPass(fmt.Sprintf("%d attach(es), no parked write-back records", len(attaches)))
+	res.Lines = lines
+	return res
 }
 
 // liveFskitMount reports one recorded fskit mount whose daemon pid is alive.

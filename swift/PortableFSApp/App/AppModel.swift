@@ -411,10 +411,10 @@ final class AppModel {
         let branch = volume.defaultBranch
         let mountPath = PortableFSAppPaths.mountPoint(baseDirectory: mountBaseDirectory, volumeID: volumeID)
         do {
-            // 1. Mint a mount session against the authority manager.
+            // 1. Create an access lease against the authority manager.
             let manager = settings.managerEndpoint()
             let managerClient = ControlPlaneClient(baseURL: manager.url, token: manager.token)
-            let session = try await managerClient.mountSession(volumeID: volumeID, branch: branch)
+            let session = try await managerClient.accessSession(volumeID: volumeID, branch: branch)
             applyMountEvent(volumeID, .sessionMinted)
 
             // 2. Attach through the portablefsd control socket.

@@ -2,18 +2,11 @@ package clientcore
 
 import (
 	"context"
-	"net"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/go-git/go-billy/v5"
-
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
-	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
 // TestVolumeXattrRoundtrip: the frontend-neutral volume surface —
@@ -24,9 +17,6 @@ func TestVolumeXattrRoundtrip(t *testing.T) {
 	v := dialCore(t, addr, Options{})
 	ctx := context.Background()
 
-	if !v.SupportsXattrs() {
-		t.Fatal("authority did not advertise xattr support")
-	}
 	a, st := v.Create(ctx, "x.txt", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("create: %d", st)
@@ -85,53 +75,6 @@ func TestVolumeConditionalXattrIsOneAuthorityOperation(t *testing.T) {
 	}
 }
 
-// billyOnlyFS hides workfs's optional interfaces so the server behaves like
-// a pre-xattr authority.
-type billyOnlyFS struct{ billy.Filesystem }
-
-// TestVolumeXattrUnsupportedAuthority: against an authority without
-// FeatXattrs every volume xattr op answers EOPNOTSUPP locally — kernels then
-// keep their fallback behavior (AppleDouble on macOS).
-func TestVolumeXattrUnsupportedAuthority(t *testing.T) {
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, testBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	srv := fsproto.NewServer(billyOnlyFS{fs}, fs, delegation.New())
-	go func() { _ = srv.Serve(ctx, ln) }()
-
-	v := dialCore(t, ln.Addr().String(), Options{})
-	if v.SupportsXattrs() {
-		t.Fatal("pre-xattr authority advertised support")
-	}
-	before := opCount(v)
-	if _, st := v.Getxattr(context.Background(), "f", nil, "user.a"); st != fsproto.EOPNOTSUPP {
-		t.Fatalf("getxattr = %d, want EOPNOTSUPP", st)
-	}
-	if st := v.Setxattr(context.Background(), "f", nil, "user.a", []byte("v")); st != fsproto.EOPNOTSUPP {
-		t.Fatalf("setxattr = %d, want EOPNOTSUPP", st)
-	}
-	if _, st := v.Listxattr(context.Background(), "f", nil); st != fsproto.EOPNOTSUPP {
-		t.Fatalf("listxattr = %d, want EOPNOTSUPP", st)
-	}
-	if st := v.Removexattr(context.Background(), "f", nil, "user.a"); st != fsproto.EOPNOTSUPP {
-		t.Fatalf("removexattr = %d, want EOPNOTSUPP", st)
-	}
-	if got := opCount(v); got != before {
-		t.Fatalf("capability-gated ops still made %d wire round-trips", got-before)
-	}
-}
-
 // TestVolumeXattrWriteBackFlushFirst: on a write-back mount xattr mutations
 // are write-through — the covering session is flushed first, so a locally
 // buffered create exists at the authority before its xattr lands, and reads
@@ -139,13 +82,10 @@ func TestVolumeXattrUnsupportedAuthority(t *testing.T) {
 func TestVolumeXattrWriteBackFlushFirst(t *testing.T) {
 	addr := serveCore(t)
 	v := dialCore(t, addr, Options{
-		Owner:     "wb-mount",
-		WriteBack: true,
-		WALDir:    t.TempDir(),
+		Owner:  "wb-mount",
+		WALDir: t.TempDir(),
 		// A long interval so nothing flushes behind the test's back: the
 		// xattr mutation itself must force the flush.
-		FlushInterval: time.Hour,
-		IdleInterval:  time.Hour,
 	})
 	ctx := context.Background()
 

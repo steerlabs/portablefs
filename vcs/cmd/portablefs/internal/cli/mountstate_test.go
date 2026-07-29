@@ -5,7 +5,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestPerfOptionsFromEnv(t *testing.T) {
@@ -13,39 +12,34 @@ func TestPerfOptionsFromEnv(t *testing.T) {
 		return func(key string) string { return values[key] }
 	}
 
-	// Default: correctness-first, everything off.
-	p := perfOptionsFromEnv(false, env(nil))
-	if p.writeBack || p.negativeCache || p.flushInterval != 0 || p.fsyncPolicy != "" {
-		t.Fatalf("default must be write-through with no caching: %+v", p)
+	// Default: the v6 baseline — write-back is adaptive (no mount mode), the
+	// negative cache is capability-auto (neither force flag set).
+	p := perfOptionsFromEnv(env(nil))
+	if p.negativeCache || p.negativeCacheOff {
+		t.Fatalf("default must be capability-auto: %+v", p)
 	}
 
-	// --fast: write-back + negative cache + authority fsync barrier.
-	p = perfOptionsFromEnv(true, env(nil))
-	if !p.writeBack || !p.negativeCache {
-		t.Fatalf("--fast must enable write-back and negative cache: %+v", p)
+	// The one remaining knob: force the negative cache on or off.
+	p = perfOptionsFromEnv(env(map[string]string{"PORTABLEFS_NEGATIVE_CACHE": "1"}))
+	if !p.negativeCache || p.negativeCacheOff {
+		t.Fatalf("PORTABLEFS_NEGATIVE_CACHE=1 must force on: %+v", p)
 	}
-	if p.flushInterval != 250*time.Millisecond {
-		t.Fatalf("--fast default flush interval = %v, want 250ms", p.flushInterval)
-	}
-	if p.fsyncPolicy != "authority" {
-		t.Fatalf("--fast fsync policy = %q, want authority (fsync = durability barrier)", p.fsyncPolicy)
+	p = perfOptionsFromEnv(env(map[string]string{"PORTABLEFS_NEGATIVE_CACHE": "0"}))
+	if p.negativeCache || !p.negativeCacheOff {
+		t.Fatalf("PORTABLEFS_NEGATIVE_CACHE=0 must force off: %+v", p)
 	}
 
-	// The documented env knobs work without --fast and refine it with.
-	p = perfOptionsFromEnv(false, env(map[string]string{
-		"PORTABLEFS_WRITEBACK": "1",
-		"PORTABLEFS_FLUSH_MS":  "100",
-	}))
-	if !p.writeBack || p.negativeCache || p.flushInterval != 100*time.Millisecond || p.fsyncPolicy != "" {
-		t.Fatalf("env knobs mis-mapped: %+v", p)
-	}
-	p = perfOptionsFromEnv(true, env(map[string]string{
-		"PORTABLEFS_FSYNC_POLICY":      "local",
+	// The retired write-back knobs are inert: the authority decides
+	// delegation adaptively, batching is fixed, fsync is always the
+	// authority barrier.
+	p = perfOptionsFromEnv(env(map[string]string{
+		"PORTABLEFS_WRITEBACK":         "1",
+		"PORTABLEFS_FLUSH_MS":          "100",
 		"PORTABLEFS_FLUSH_MAX_RECORDS": "64",
 		"PORTABLEFS_FLUSH_MAX_BYTES":   "1048576",
 	}))
-	if p.fsyncPolicy != "local" || p.flushMaxRecords != 64 || p.flushMaxBytes != 1048576 {
-		t.Fatalf("env overrides must beat --fast defaults: %+v", p)
+	if p.negativeCache || p.negativeCacheOff {
+		t.Fatalf("retired env knobs must be inert: %+v", p)
 	}
 }
 

@@ -79,7 +79,27 @@ func pinRec(id string, gen, ino uint64, unpin bool) *Record {
 func flushRec(id string, gen uint64, wb, path string, epoch Epoch, through uint64) *Record {
 	return &Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{
 		Session: ref(id, gen), WritebackID: wb, CheckoutPath: path,
-		CheckoutEpoch: epoch, Through: through,
+		CheckoutEpoch: epoch, Through: through, Digest: hash32(byte(through) | 1),
+	}}
+}
+
+// delegationRec builds a delegation grant: a CheckoutGrant bound to a mount
+// write-back stream.
+func delegationRec(k ExactKey, path string, epoch Epoch, wb string) Record {
+	c := &CheckoutChange{Key: k, Op: CheckoutGrant, Path: path, Epoch: epoch, WritebackID: wb}
+	c.Key.RequestHash = c.RequestHash()
+	return Record{Kind: KindCheckoutChange, CheckoutChange: c}
+}
+
+func rebindRec(path string, epoch Epoch, wb string, newHolder SessionRef) *Record {
+	return &Record{Kind: KindCheckoutChange, CheckoutChange: &CheckoutChange{
+		Op: CheckoutRebind, Path: path, Epoch: epoch, WritebackID: wb, NewHolder: newHolder,
+	}}
+}
+
+func discardRec(path string, epoch Epoch, wb string) *Record {
+	return &Record{Kind: KindCheckoutChange, CheckoutChange: &CheckoutChange{
+		Op: CheckoutDiscard, Path: path, Epoch: epoch, WritebackID: wb,
 	}}
 }
 
@@ -297,10 +317,9 @@ func TestTerminalReleasesEverything(t *testing.T) {
 	mustApply(t, st, openAt("m2", 1, t0))
 	var seq1, seq2 seqCounter
 
-	// m1: a lock, a checkout, a flush watermark, two pins.
+	// m1: a lock, a plain checkout, two pins.
 	mustApply(t, st, ptr(lockRec(key("m1", 1, 0, seq1.take(0), 0), 10, 1, LockSetWrite, 0, 64)))
 	mustApply(t, st, ptr(checkoutRec(key("m1", 1, 1, seq1.take(1), 0), CheckoutGrant, "proj/a", "1", [32]byte{})))
-	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 5))
 	mustApply(t, st, pinRec("m1", 1, 100, false))
 	mustApply(t, st, pinRec("m1", 1, 101, false))
 	// m2 shares a pin on 101 and holds its own (non-overlapping) lock.
@@ -315,10 +334,7 @@ func TestTerminalReleasesEverything(t *testing.T) {
 		t.Fatalf("locks after terminal %+v", locks)
 	}
 	if _, ok := st.CheckoutAt("proj/a"); ok {
-		t.Fatal("checkout survived terminal")
-	}
-	if _, ok := st.FlushThrough(ref("m1", 1), "wb", "proj/a", "1"); ok {
-		t.Fatal("flush ledger survived terminal")
+		t.Fatal("plain checkout survived terminal")
 	}
 	if st.HasPin(ref("m1", 1), 101) || !st.HasPin(ref("m2", 1), 101) {
 		t.Fatal("pin state wrong after terminal")
@@ -502,13 +518,9 @@ func TestCheckoutSemantics(t *testing.T) {
 	// Release must name the exact epoch and holder.
 	wantErr(t, st, ptr(checkoutRec(key("m2", 1, 0, s2.next[0], 0), CheckoutRelease, "proj/a", "1", [32]byte{})), ErrFence)
 	wantErr(t, st, ptr(checkoutRec(key("m1", 1, 0, s1.next[0], 0), CheckoutRelease, "proj/a", "9", [32]byte{})), ErrFence)
-	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 10))
 	mustApply(t, st, ptr(checkoutRec(key("m1", 1, 0, s1.take(0), 0), CheckoutRelease, "proj/a", "1", [32]byte{})))
 	if _, ok := st.CheckoutAt("proj/a"); ok {
 		t.Fatal("checkout survived release")
-	}
-	if _, ok := st.FlushThrough(ref("m1", 1), "wb", "proj/a", "1"); ok {
-		t.Fatal("release did not invalidate the flush ledger")
 	}
 }
 
@@ -520,7 +532,6 @@ func TestCheckoutForceTransfer(t *testing.T) {
 	var sa, sc, sx seqCounter
 
 	mustApply(t, st, ptr(checkoutRec(key("holderA", 1, 0, sa.take(0), 0), CheckoutGrant, "proj/x", "1", [32]byte{})))
-	mustApply(t, st, flushRec("holderA", 1, "wb", "proj/x", "1", 3))
 
 	// The recall captured holder A's grant.
 	recall := st.RecallDigestAt("proj/x/deep")
@@ -557,28 +568,121 @@ func TestFlushAdvanceSemantics(t *testing.T) {
 	mustApply(t, st, openAt("m1", 1, t0))
 	mustApply(t, st, openAt("m2", 1, t0))
 	var s1 seqCounter
-	mustApply(t, st, ptr(checkoutRec(key("m1", 1, 0, s1.take(0), 0), CheckoutGrant, "proj/a", "1", [32]byte{})))
+	mustApply(t, st, ptr(delegationRec(key("m1", 1, 0, s1.take(0), 0), "proj/a", "1", "wb")))
 
 	// Flush against a path with no matching grant/epoch/holder: stale.
 	wantErr(t, st, flushRec("m1", 1, "wb", "proj/a", "9", 5), ErrFence)
 	wantErr(t, st, flushRec("m2", 1, "wb", "proj/a", "1", 5), ErrFence)
 	wantErr(t, st, flushRec("m1", 1, "wb", "proj/b", "1", 5), ErrFence)
+	// The stream binding must match the grant's.
+	wantErr(t, st, flushRec("m1", 1, "wb2", "proj/a", "1", 5), ErrIntegrity)
 
 	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 5))
-	// Strictly monotonic per identity.
+	// Strictly monotonic per stream.
 	wantErr(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 5), ErrIntegrity)
 	wantErr(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 4), ErrIntegrity)
 	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 6))
-	// Independent write-back domains.
-	mustApply(t, st, flushRec("m1", 1, "wb2", "proj/a", "1", 1))
+	view, ok := st.StreamState("wb")
+	if !ok || view.Through != 6 || view.Owner != ref("m1", 1) {
+		t.Fatalf("stream state %+v %v", view, ok)
+	}
 
 	// Release, re-grant under a NEW epoch to the same session: the old
-	// epoch's delayed flush is stale forever.
+	// epoch's delayed flush is stale forever, and the STREAM watermark
+	// survives the scope release (the mount stream is one dense sequence
+	// across grants).
 	mustApply(t, st, ptr(checkoutRec(key("m1", 1, 0, s1.take(0), 0), CheckoutRelease, "proj/a", "1", [32]byte{})))
-	mustApply(t, st, ptr(checkoutRec(key("m1", 1, 0, s1.take(0), 0), CheckoutGrant, "proj/a", "2", [32]byte{})))
+	if view, ok := st.StreamState("wb"); !ok || view.Through != 6 {
+		t.Fatalf("stream watermark did not survive the scope release: %+v %v", view, ok)
+	}
+	mustApply(t, st, ptr(delegationRec(key("m1", 1, 0, s1.take(0), 0), "proj/a", "2", "wb")))
 	wantErr(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 7), ErrFence)
-	// The new epoch's ledger starts fresh.
-	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "2", 1))
+	// The stream continues past its durable watermark under the new grant.
+	wantErr(t, st, flushRec("m1", 1, "wb", "proj/a", "2", 6), ErrIntegrity)
+	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "2", 7))
+}
+
+func TestDelegationRecoveryLifecycle(t *testing.T) {
+	st := NewState()
+	mustApply(t, st, openAt("m1", 1, t0))
+	var s1 seqCounter
+	mustApply(t, st, ptr(delegationRec(key("m1", 1, 0, s1.take(0), 0), "proj/a", "1", "wb")))
+	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 5))
+
+	// The holder dies (lease expiry): the delegation flips to
+	// recovery-required — never a silent release — and the stream's
+	// watermark + digest survive for the recovering mount.
+	mustApply(t, st, expireAt("m1", 1, t0+ttl, t0+ttl+250))
+	got, ok := st.CheckoutAt("proj/a")
+	if !ok || !got.Recovery || got.WritebackID != "wb" {
+		t.Fatalf("delegation after holder death: %+v %v", got, ok)
+	}
+	view, ok := st.StreamState("wb")
+	if !ok || view.Through != 5 {
+		t.Fatalf("stream state after holder death: %+v %v", view, ok)
+	}
+
+	// Recovery scopes never release or flush; only rebind or discard.
+	// (Rejected records consume no slot sequence, so the successful release
+	// far below still carries sequence 1.)
+	mustApply(t, st, openAt("m2", 1, t0+ttl+500))
+	wantErr(t, st, ptr(checkoutRec(key("m2", 1, 0, 1, 0), CheckoutRelease, "proj/a", "1", [32]byte{})), ErrFence)
+	wantErr(t, st, flushRec("m2", 1, "wb", "proj/a", "1", 6), ErrFence)
+	// A fresh overlapping grant is refused while recovery is pending.
+	wantErr(t, st, ptr(delegationRec(key("m2", 1, 0, 1, 0), "proj/a", st.NextCheckoutEpoch(), "wb2")), ErrIntegrity)
+
+	// Rebind requires exact stream identity.
+	wantErr(t, st, rebindRec("proj/a", "9", "wb", ref("m2", 1)), ErrFence)
+	wantErr(t, st, rebindRec("proj/a", "1", "other", ref("m2", 1)), ErrFence)
+	wantErr(t, st, rebindRec("proj/a", "1", "wb", ref("ghost", 1)), ErrFence)
+	mustApply(t, st, rebindRec("proj/a", "1", "wb", ref("m2", 1)))
+	got, _ = st.CheckoutAt("proj/a")
+	if got.Recovery || got.Holder != ref("m2", 1) || got.Epoch != "1" {
+		t.Fatalf("rebound delegation %+v", got)
+	}
+	if view, _ := st.StreamState("wb"); view.Owner != ref("m2", 1) {
+		t.Fatalf("stream owner after rebind %+v", view)
+	}
+	// The stream drains under the SAME epoch, continuing the watermark.
+	mustApply(t, st, flushRec("m2", 1, "wb", "proj/a", "1", 8))
+	// Rebinding a live grant is corruption.
+	wantErr(t, st, rebindRec("proj/a", "1", "wb", ref("m2", 1)), ErrIntegrity)
+	// Clean release after the drain; the last scope's terminal close drops
+	// the stream ledger.
+	mustApply(t, st, ptr(checkoutRec(key("m2", 1, 0, 1, 0), CheckoutRelease, "proj/a", "1", [32]byte{})))
+	mustApply(t, st, closeRec("m2", 1))
+	if _, ok := st.StreamState("wb"); ok {
+		t.Fatal("released stream ledger survived its session close")
+	}
+}
+
+func TestDelegationDiscardIsAuditedDataLoss(t *testing.T) {
+	st := NewState()
+	mustApply(t, st, openAt("m1", 1, t0))
+	var s1 seqCounter
+	mustApply(t, st, ptr(delegationRec(key("m1", 1, 0, s1.take(0), 0), "proj/a", "1", "wb")))
+	mustApply(t, st, flushRec("m1", 1, "wb", "proj/a", "1", 3))
+	// Discarding a LIVE grant is corruption (it releases normally).
+	wantErr(t, st, discardRec("proj/a", "1", "wb"), ErrIntegrity)
+	mustApply(t, st, expireAt("m1", 1, t0+ttl, t0+ttl+250))
+	wantErr(t, st, discardRec("proj/a", "9", "wb"), ErrFence)
+	mustApply(t, st, discardRec("proj/a", "1", "wb"))
+	if _, ok := st.CheckoutAt("proj/a"); ok {
+		t.Fatal("discarded scope survived")
+	}
+	if _, ok := st.StreamState("wb"); ok {
+		t.Fatal("discarded stream ledger survived")
+	}
+}
+
+func TestForceTransferNeverRevokesDelegations(t *testing.T) {
+	st := NewState()
+	mustApply(t, st, openAt("m1", 1, t0))
+	mustApply(t, st, openAt("contender", 1, t0))
+	var s1, sx seqCounter
+	mustApply(t, st, ptr(delegationRec(key("m1", 1, 0, s1.take(0), 0), "proj/x", "1", "wb")))
+	recall := st.RecallDigestAt("proj/x")
+	wantErr(t, st, ptr(checkoutRec(key("contender", 1, 0, sx.take(0), 0), CheckoutForceTransfer, "proj/x", st.NextCheckoutEpoch(), recall)), ErrIntegrity)
 }
 
 func TestOpenPinSemantics(t *testing.T) {
@@ -654,7 +758,7 @@ func TestTxnComposesPFR1FlushBatch(t *testing.T) {
 	st := NewState()
 	mustApply(t, st, openAt("m1", 1, t0))
 	var s1 seqCounter
-	mustApply(t, st, ptr(checkoutRec(key("m1", 1, 0, s1.take(0), 0), CheckoutGrant, "proj/a", "1", [32]byte{})))
+	mustApply(t, st, ptr(delegationRec(key("m1", 1, 0, s1.take(0), 0), "proj/a", "1", "wb")))
 	before := stateDigest(t, st)
 
 	tx := st.Begin()
@@ -682,8 +786,8 @@ func TestTxnComposesPFR1FlushBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	tx.Commit()
-	if through, ok := st.FlushThrough(ref("m1", 1), "wb", "proj/a", "1"); !ok || through != 2 {
-		t.Fatalf("flush through %d %v", through, ok)
+	if view, ok := st.StreamState("wb"); !ok || view.Through != 2 {
+		t.Fatalf("flush through %+v %v", view, ok)
 	}
 	if got := st.CheckExact(key("m1", 1, 3, 2, 0x62)); got.Disposition != ExactReplay || got.Outcome.Count != 64 {
 		t.Fatalf("replayed PFR1 outcome %+v", got)

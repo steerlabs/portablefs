@@ -40,7 +40,7 @@ jobs:
         run: |
           go -C vcs build -o "$RUNNER_TEMP/pfsbench" ./bench/cmd/pfsbench
           go -C vcs build -o "$RUNNER_TEMP/pfstorture" ./bench/cmd/pfstorture
-          go -C vcs build -o "$RUNNER_TEMP/pfsmount" ./cmd/mount
+          go -C vcs build -o "$RUNNER_TEMP/pfsmount" ./bench/cmd/benchmount
 
       - name: Quick profile (local baseline + core transport)
         working-directory: vcs

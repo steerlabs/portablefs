@@ -56,15 +56,30 @@ type SetattrRequest struct {
 // open-after-unlink routing and open-inode leases; frontends keep their own tree
 // shape and pass the current path into Volume ops.
 type NodeState struct {
-	mu        sync.Mutex
-	ino       uint64
-	authIno   bool
-	nopen     int
-	orphanIno uint64
+	mu      sync.Mutex
+	ino     uint64
+	authIno bool
+	// authorityIno is the authority identity proven for this instantiated
+	// node. It equals ino for authority-born nodes. A locally-born node gains
+	// it when delegation release resolves and pins the flushed create. Keep
+	// it separate from ino: frontends may already have published ino as
+	// their stable local item identity.
+	authorityIno uint64
+	nopen        int
+	orphanIno    uint64
+	// dirty means at least one mutation through this inode has not yet
+	// completed an authority visibility barrier. The final close consumes
+	// this bit only after the barrier succeeds, so close(2) cannot silently
+	// strand the last writer's acknowledged tail in the local WAL.
+	dirty bool
 }
 
 func NewNodeState(ino uint64, authIno bool) *NodeState {
-	return &NodeState{ino: ino, authIno: authIno}
+	n := &NodeState{ino: ino, authIno: authIno}
+	if authIno {
+		n.authorityIno = ino
+	}
+	return n
 }
 
 func (n *NodeState) StableIno() uint64 {
@@ -76,6 +91,35 @@ func (n *NodeState) StableIno() uint64 {
 
 func (n *NodeState) AuthIno() bool {
 	return n != nil && n.authIno
+}
+
+// recordAuthorityIno binds a locally-born node to the authority inode proven
+// by the delegation-release pin. The binding is immutable for this
+// instantiated node; a path recreation receives a fresh NodeState.
+func (n *NodeState) recordAuthorityIno(ino uint64) bool {
+	if n == nil || ino == 0 {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.authorityIno != 0 && n.authorityIno != ino {
+		return false
+	}
+	n.authorityIno = ino
+	return true
+}
+
+// MatchesAuthorityIno reports whether an authority notification targets this
+// exact instantiated node. Path equality alone is insufficient because an
+// orphan notification can arrive after that path has been removed and
+// recreated with a fresh local identity.
+func (n *NodeState) MatchesAuthorityIno(ino uint64) bool {
+	if n == nil || ino == 0 {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.authorityIno == ino
 }
 
 func (n *NodeState) Orphan() uint64 {
@@ -94,6 +138,33 @@ func (n *NodeState) IsOpen() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.nopen > 0
+}
+
+func (n *NodeState) markDirty() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.dirty = true
+	n.mu.Unlock()
+}
+
+func (n *NodeState) clearDirty() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.dirty = false
+	n.mu.Unlock()
+}
+
+func (n *NodeState) lastCloseIsDirty() bool {
+	if n == nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.nopen == 1 && n.dirty
 }
 
 func (n *NodeState) markOrphanLocked(ino uint64, openOrphans *InodeSet) bool {
@@ -135,13 +206,6 @@ func InoOf(path string) uint64 {
 		return v
 	}
 	return 2
-}
-
-func sessAttr(kind string, mode uint32, size, mtimeMs int64, uid, gid uint32) *fsproto.Attr {
-	if mtimeMs == 0 {
-		mtimeMs = time.Now().UnixMilli()
-	}
-	return &fsproto.Attr{Kind: kind, Mode: mode, Size: size, MtimeMs: mtimeMs, CtimeMs: mtimeMs, AtimeMs: mtimeMs, Uid: uid, Gid: gid}
 }
 
 type writeMark struct {

@@ -1,21 +1,21 @@
 package fsproto
 
-// Exact mount sessions (protocol version 3), server side.
+// Exact mount sessions, server side.
 //
-// Every write-through mutation from a session-negotiated client carries an
-// exact-once identity — (session, generation, slot, slot sequence) plus a
-// deterministic canonical request hash — inside the SAME WAL record as the
-// mutation. The authority checks the slot table, executes at most once, and
-// durably records the essential outcome, so a lost-response retry returns the
-// byte-identical status/count/version/ino/orphan-ino instead of re-executing.
-// Identity reuse with a different request (changed hash) and slot-sequence
-// gaps FENCE the session: they prove client-state corruption, after which no
-// further mutation from that generation may be trusted.
+// Every write-through mutation carries an exact-once identity — (session,
+// generation, slot, slot sequence) plus a deterministic canonical request
+// hash — inside the SAME journal row as the mutation. The authority checks
+// the slot table, executes at most once, and durably records the essential
+// outcome, so a lost-response retry returns the byte-identical
+// status/count/version/ino/orphan-ino instead of re-executing. Identity reuse
+// with a different request (changed hash) and slot-sequence gaps FENCE the
+// session: they prove client-state corruption, after which no further
+// mutation from that generation may be trusted.
 //
-// The durable session/slot machinery lives in workfs (replicated control WAL
-// records); this file is the protocol-side admission, execution, and reclaim
-// logic on top of it. Envelope-less (v1) mutations remain admitted by default
-// for compatibility; VCS_REQUIRE_EXACT_SESSIONS=1 refuses them (fail-closed).
+// The durable session/slot machinery lives in workfs (journaled PFC2
+// coordination rows); this file is the protocol-side admission and execution
+// logic on top of it. Envelope-less mutations are always refused: sessions
+// are mandatory in the v6 baseline.
 
 import (
 	"crypto/sha256"
@@ -35,9 +35,9 @@ import (
 )
 
 // SessionStore is the authority FS's durable mount-session + exact-once slot
-// surface (workfs.FS). A server whose filesystem implements it serves session
-// ops and exact envelopes; envelope-less v1 mutations stay admitted unless
-// VCS_REQUIRE_EXACT_SESSIONS=1 (or SetRequireExactSessions) fails them closed.
+// surface (workfs.FS). A v6 server requires one, and it must be MANAGED:
+// coordination state journals through the fenced entry log and recovers by
+// exact cold replay — no reclaim grace, no wall-time pruning.
 type SessionStore interface {
 	EstablishSessionWithToken(sessionID string, generation uint64, owner string, slots uint32, token string) error
 	ResumeSession(sessionID string, generation uint64, token string) (workfs.SessionInfo, error)
@@ -50,21 +50,15 @@ type SessionStore interface {
 	// SessionAdmissible fails a session closed between its PROJECTED local
 	// monotonic lease deadline and the durable database resolution (renewal
 	// or terminal). The protocol maps it to an UNKNOWN that consumes
-	// nothing. The WAL-backed store always admits (its leases are its own
-	// replicated control records).
+	// nothing.
 	SessionAdmissible(sessionID string) error
 	ExpiredSessions(now time.Time) []workfs.SessionInfo
-	ReclaimableSessions(now time.Time) []workfs.SessionInfo
-	PruneExpiredSessions(now time.Time)
 	CheckSlot(env *wal.Envelope) (workfs.SlotCheckResult, workfs.SlotOutcome)
 	RecordStaticOutcome(env *wal.Envelope, status int32) error
 	MutateEnv(r wal.Record, owner string) (workfs.MutationResult, error)
-	// FlushWatermark reads a write-back session's replicated flush watermark
-	// (control state, not a hidden tree file). ok=false = none recorded yet.
-	FlushWatermark(sessionID string) (epoch, through uint64, ok bool)
-	// Managed reports whether this store journals through a fenced remote
-	// journal generation: journaled coordination, ProtoVersionJournaledSessions
-	// negotiation, and NO reclaim grace or wall-time outcome pruning anywhere.
+	// Managed reports whether this store journals through a fenced journal
+	// generation. Construction asserts it: a v6 server never serves a
+	// non-managed session store.
 	Managed() bool
 }
 
@@ -94,55 +88,24 @@ type exactState struct {
 	// MutateEnv. Sharded by hash; cross-slot sharing only adds serialization.
 	slotShards [256]sync.Mutex
 
-	// Reclaim grace: after a restart/promotion with durable live sessions,
-	// the authority withholds NEW conflicting coordination state (locks,
-	// checkouts, mutations, open-state registration, flushes) from sessions
-	// that are not token-proven prior owners, until every prior session has
-	// re-asserted (OpReclaimDone), expired, or the bounded window elapsed.
-	mu           sync.Mutex
-	graceUntil   time.Time
-	reclaimers   map[string]uint64 // sessionID -> generation eligible to reclaim
-	reclaimDone  map[string]bool
-	requireExact bool
-	// managed marks a journaled session store: journaled coordination,
-	// ProtoVersionJournaledSessions negotiation, and NO reclaim grace or
-	// wall-time outcome pruning anywhere.
-	managed     bool
 	sweeperOnce sync.Once
 	sweeperStop chan struct{}
 	sweeperDone chan struct{} // closed when the sweeper goroutine has exited
 }
 
-func newExactState(store SessionStore, requireExact bool) *exactState {
-	e := &exactState{
-		store:        store,
-		managed:      store.Managed(),
-		reclaimers:   map[string]uint64{},
-		reclaimDone:  map[string]bool{},
-		requireExact: requireExact,
-		sweeperStop:  make(chan struct{}),
-		sweeperDone:  make(chan struct{}),
-	}
-	if e.managed {
+func newExactState(store SessionStore) *exactState {
+	if !store.Managed() {
 		// Managed (journaled) recovery is exact: the replayed journal already
 		// says which session owns every lock, checkout, pin, and outcome.
-		// There is NO reclaim grace, no re-assert phase, and no global
-		// withholding of coordination state.
-		return e
+		// The legacy in-memory coordination shadow (reclaim grace, wall-time
+		// pruning) no longer exists, so a non-managed store cannot be served.
+		panic("fsproto: a v6 server requires a MANAGED (journaled) session store")
 	}
-	// Durable prior-ownership evidence: sessions whose replicated lease is
-	// still live right now, observed BEFORE the server admits any request.
-	// Their coordination state (advisory locks, delegations) was volatile and
-	// died with the old process, so until each has resumed and re-asserted —
-	// or its lease/grace has elapsed — no other session may acquire anything
-	// that could conflict.
-	for _, info := range store.ReclaimableSessions(time.Now()) {
-		e.reclaimers[info.SessionID] = info.Generation
+	return &exactState{
+		store:       store,
+		sweeperStop: make(chan struct{}),
+		sweeperDone: make(chan struct{}),
 	}
-	if len(e.reclaimers) > 0 {
-		e.graceUntil = time.Now().Add(workfs.SessionReclaimGrace)
-	}
-	return e
 }
 
 func (e *exactState) slotLock(sessionID string, slot uint32) *sync.Mutex {
@@ -152,74 +115,6 @@ func (e *exactState) slotLock(sessionID string, slot uint32) *sync.Mutex {
 	binary.BigEndian.PutUint32(b[:], slot)
 	_, _ = h.Write(b[:])
 	return &e.slotShards[h.Sum32()%uint32(len(e.slotShards))]
-}
-
-// inGrace reports whether the reclaim-grace window is still active.
-func (e *exactState) inGrace(now time.Time) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.inGraceLocked(now)
-}
-
-func (e *exactState) inGraceLocked(now time.Time) bool {
-	if e.graceUntil.IsZero() || now.After(e.graceUntil) {
-		return false
-	}
-	// Early lift: every prior session has re-asserted, expired, or been fenced.
-	for id, gen := range e.reclaimers {
-		if e.reclaimDone[id] {
-			continue
-		}
-		info, ok := e.store.CurrentSession(id)
-		if !ok || info.Expired || info.Generation != gen {
-			continue // fenced/superseded/expired: nothing left to reclaim
-		}
-		if info.ExpiresMs <= now.UnixMilli() {
-			continue // lease elapsed: the sweeper will fence it
-		}
-		return true // at least one live prior session has not finished reclaiming
-	}
-	e.graceUntil = time.Time{}
-	return false
-}
-
-// isReclaimer reports whether the attached session is a token-proven prior
-// owner allowed to re-assert coordination state during grace.
-func (e *exactState) isReclaimer(cs *connSession) bool {
-	if !cs.attached() {
-		return false
-	}
-	e.mu.Lock()
-	gen, ok := e.reclaimers[cs.id]
-	e.mu.Unlock()
-	return ok && gen == cs.gen
-}
-
-func (e *exactState) markReclaimDone(cs *connSession) {
-	if !cs.attached() {
-		return
-	}
-	e.mu.Lock()
-	if gen, ok := e.reclaimers[cs.id]; ok && gen == cs.gen {
-		e.reclaimDone[cs.id] = true
-	}
-	e.mu.Unlock()
-}
-
-// reclaimRemainingMs is the grace budget advertised to a resuming reclaimer.
-func (e *exactState) reclaimRemainingMs(now time.Time) int64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.inGraceLocked(now) {
-		return 0
-	}
-	return e.graceUntil.Sub(now).Milliseconds()
-}
-
-func (e *exactState) exactRequired() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.requireExact
 }
 
 // ---- request -> canonical WAL record ----
@@ -420,58 +315,22 @@ func validSessionFields(id, token, owner string) bool {
 		len(owner) <= MaxOwnerBytes
 }
 
-// probeResponse answers OpProtocolVersion: the server's protocol version plus
-// the feature bits and lease the exact-session machinery advertises. A server
-// without a session store reports the version with zero features; the client
-// then keeps plain v1/v2 behavior. A managed (journaled) authority advertises
-// ProtoVersionJournaledSessions with FeatJournaledCoordination and WITHOUT
-// FeatReclaimGrace: its recovery is exact, so there is no re-assert window.
-func (s *Server) probeResponse() *Response {
+// probeResponse answers OpProtocolVersion. The v6 baseline is one version
+// with every capability mandatory: the response carries the version and the
+// session lease; Features stays on the wire for genuinely optional FUTURE
+// semantics and is zero today. clientVersion is the version the probing
+// client declared (Request.Size): anything but exactly ProtocolVersion is
+// refused EINVAL — with our version still in the response, so a newer client
+// reports the mismatch clearly, and an older one fails closed.
+func (s *Server) probeResponse(clientVersion int64) *Response {
 	resp := &Response{ProtoVersion: ProtocolVersion, Gen: s.gen()}
-	// Capability bits that describe the backing fs rather than the session
-	// machinery. Advertised explicitly so clients gate behavior on the
-	// handshake, never on sniffing response fields.
-	if _, ok := s.fs.(ParentVersioned); ok {
-		// Every lookup miss is stamped with the parent directory version and
-		// every name mutation bumps it — the precondition for a client to
-		// default the negative dentry cache on.
-		resp.Features |= FeatParentVersion
-	}
-	if _, ok := s.fs.(XattrStore); ok {
-		// Native journaled extended attributes, on BOTH generations (the
-		// legacy WAL store and the managed journal store implement the same
-		// read surface; mutations ride each generation's own write path).
-		resp.Features |= FeatXattrs
-	}
-	if s.supportsAtomicXattrFlags() {
-		resp.Features |= FeatAtomicXattrFlags
-	}
-	if _, ok := s.fs.(HardLinkStore); ok {
-		resp.Features |= FeatHardLinks
-	}
-	if _, ok := s.fs.(AtomicAppendStore); ok {
-		resp.Features |= FeatAtomicAppend
-	}
-	if _, ok := s.orphans(); ok {
-		// Fused create+register and batched unmarks, on BOTH generations.
-		// The legacy generation records holds in its in-memory,
-		// lease-renewed open-state table; a managed generation journals the
-		// same surface as durable open-pin coordination rows (the fused
-		// create ensures its pin row before the reply, and one batched
-		// unmark releases N pins in one exact journal row).
-		resp.Features |= FeatOpenRegistration
-	}
-	if s.exact == nil {
+	if clientVersion != int64(ProtocolVersion) {
+		resp.Status = EINVAL
 		return resp
 	}
-	resp.Features |= FeatExactSessions
-	if s.exact.managed {
-		resp.ProtoVersion = ProtoVersionJournaledSessions
-		resp.Features |= FeatJournaledCoordination
-	} else {
-		resp.Features |= FeatReclaimGrace
+	if s.exact != nil {
+		resp.LeaseMs = workfs.SessionLeaseTTL().Milliseconds()
 	}
-	resp.LeaseMs = workfs.SessionLeaseTTL.Milliseconds()
 	return resp
 }
 
@@ -503,15 +362,14 @@ func (s *Server) sessionOpen(cs *connSession, req *Request) *Response {
 	}
 	cs.id, cs.gen, cs.owner = req.SessionID, req.SessionGen, req.Owner
 	return &Response{
-		Gen: s.gen(), LeaseMs: workfs.SessionLeaseTTL.Milliseconds(),
+		Gen: s.gen(), LeaseMs: workfs.SessionLeaseTTL().Milliseconds(),
 		SessionSlots: req.SessionSlots, ProtoVersion: ProtocolVersion,
 	}
 }
 
 // sessionResume authenticates + durably renews an existing session and binds
 // it to this connection. It is both the reconnect path and the periodic lease
-// renewal. A resumed prior session during reclaim grace learns its remaining
-// reclaim budget via ReclaimMs.
+// renewal.
 func (s *Server) sessionResume(cs *connSession, req *Request) *Response {
 	if s.exact == nil {
 		return &Response{Status: EPERM}
@@ -533,7 +391,6 @@ func (s *Server) sessionResume(cs *connSession, req *Request) *Response {
 	return &Response{
 		Gen: s.gen(), LeaseMs: time.Until(time.UnixMilli(info.ExpiresMs)).Milliseconds(),
 		SessionSlots: info.Slots, ProtoVersion: ProtocolVersion,
-		ReclaimMs: s.exact.reclaimRemainingMs(time.Now()),
 	}
 }
 
@@ -579,56 +436,39 @@ func (s *Server) sessionExpire(cs *connSession, req *Request) *Response {
 	return &Response{Gen: s.gen()}
 }
 
-// releaseSessionOwner drops a dead session's volatile coordination state:
-// advisory locks and delegations. Open-inode/orphan leases expire on their own
-// workfs TTLs once renewals stop.
+// releaseSessionOwner traces a dead session's teardown. Its coordination
+// state (locks, checkouts, pins) is journaled and released by the store's own
+// durable expiry decision; open-inode/orphan pins release the same way.
 func (s *Server) releaseSessionOwner(owner string) {
 	if owner == "" {
 		return
 	}
 	trace(evRelease, 0, tag(owner), 0, 0, 0)
-	if s.deleg != nil {
-		s.deleg.ReleaseOwner(owner)
-	}
-	if s.locks != nil {
-		lockf("RELEASE-OWNER mount=%q (session lease expired/fenced)", owner)
-		s.locks.ReleaseOwner(owner)
-	}
 }
 
-// leaseSweeper durably fences elapsed session leases and releases their
-// coordination state. Fencing rides the WAL (a crash cannot resurrect the
-// session), so releasing locks/delegations afterwards is safe. The TTL is
-// sampled ONCE: tests shorten workfs.SessionLeaseTTL before the server
-// starts, and re-reading the package variable on every tick would race with
-// the test's deferred restore.
+// leaseSweeper schedules the store's re-check of elapsed session leases: the
+// store durably fences them (a crash cannot resurrect a session) and releases
+// their journaled coordination state. Managed stores never time-prune
+// outcomes or tombstones — capacity is explicit and exactness is never
+// forgotten. The TTL is sampled once at start (the accessor is atomic, so a
+// test shortening it around a live server is safe either way).
 func (s *Server) leaseSweeper(stop <-chan struct{}) {
 	defer close(s.exact.sweeperDone)
-	ttl := workfs.SessionLeaseTTL / 4
+	ttl := workfs.SessionLeaseTTL() / 4
 	if ttl < 100*time.Millisecond {
 		ttl = 100 * time.Millisecond
 	}
 	if ttl > 5*time.Second {
 		ttl = 5 * time.Second
 	}
-	lastPrune := time.Now()
 	for {
 		select {
 		case <-stop:
 			return
 		case <-time.After(ttl):
 		}
-		now := time.Now()
-		for _, info := range s.exact.store.ExpiredSessions(now) {
+		for _, info := range s.exact.store.ExpiredSessions(time.Now()) {
 			s.releaseSessionOwner(info.Owner)
-		}
-		// Managed (journaled) stores never time-prune outcomes or tombstones:
-		// capacity is explicit and exactness is never forgotten. (Expiry
-		// itself above is the store's own durable decision; this local timer
-		// only schedules the store's re-check.)
-		if !s.exact.managed && now.Sub(lastPrune) > time.Minute {
-			s.exact.store.PruneExpiredSessions(now)
-			lastPrune = now
 		}
 	}
 }
@@ -706,27 +546,17 @@ func (s *Server) exactMutate(cs *connSession, req *Request) *Response {
 	if isReserved(req.Path) || isReserved(req.NewPath) {
 		return s.rejectLocked(record.Env, ENOENT) // reserved metadata is invisible
 	}
-	if s.exact.managed && record.Op == wal.OpReap {
-		// Public reap is removed from the managed (journaled) protocol: only
-		// the authority reaps, after durable state proves no pins. The
-		// rejection is a durable exact outcome so the slot sequence still
-		// advances.
+	if record.Op == wal.OpReap {
+		// Public reap is removed from the protocol: only the authority
+		// reaps, after durable state proves no pins. The rejection is a
+		// durable exact outcome so the slot sequence still advances.
 		return s.rejectLocked(record.Env, EPERM)
 	}
 	if req.Op == OpSetxattr && req.XattrFlags != 0 && !s.supportsAtomicXattrFlags() {
-		// Definite fail-closed rolling-upgrade outcome. Consume the exact
-		// identity so an identical retry cannot later change meaning.
+		// Definite fail-closed outcome for a store without the conditional
+		// evaluator. Consume the exact identity so an identical retry cannot
+		// later change meaning.
 		return s.rejectLocked(record.Env, EOPNOTSUPP)
-	}
-	if s.reclaimBlocked(cs, req) {
-		return s.rejectLocked(record.Env, EAGAIN) // reclaim grace: held off
-	}
-	if gate := s.enforceCheckout(req); gate != nil {
-		resp := s.rejectLocked(record.Env, gate.Status)
-		if resp != nil && resp.Owner == "" {
-			resp.Owner = gate.Owner // debuggability: who holds the checkout (live reply only)
-		}
-		return resp
 	}
 
 	result, err := s.exact.store.MutateEnv(record, cs.owner)
@@ -893,45 +723,4 @@ func (s *Server) fillExactAttr(req *Request, record wal.Record, resp *Response) 
 func isStaticReject(err error) bool {
 	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENAMETOOLONG) ||
 		errors.Is(err, syscall.ERANGE) || errors.Is(err, syscall.E2BIG)
-}
-
-// exactRequired reports whether an envelope-less mutation must be refused
-// (fail-closed posture, VCS_REQUIRE_EXACT_SESSIONS=1). The default admits
-// envelope-less v1 mutations for compatibility — EXCEPT on a managed
-// (journaled) generation, which NEVER admits envelope-less legacy writes:
-// the development opt-in cannot bypass journaled coordination.
-func (s *Server) exactRequired(req *Request) bool {
-	if s.exact == nil {
-		return false
-	}
-	if !s.exact.managed && !s.exact.exactRequired() {
-		return false
-	}
-	return req.Env == nil
-}
-
-// reclaimBlocked reports whether req must be held off (EAGAIN) because the
-// reclaim-grace window is active and this connection's session is not a
-// token-proven prior owner. It covers every op that could CREATE or MUTATE
-// coordination/tree state that a not-yet-reasserted prior session may still
-// own; reads flow freely.
-func (s *Server) reclaimBlocked(cs *connSession, req *Request) bool {
-	if s.exact == nil {
-		return false
-	}
-	switch req.Op {
-	case OpLock:
-		if req.LkMode == LkGetlk || req.LkUnlock {
-			return false // queries and releases never conflict
-		}
-	case OpCheckout, OpFlushBatch, OpMarkOpen, OpReap:
-	default:
-		if !mutatingOp(req.Op) {
-			return false
-		}
-	}
-	if !s.exact.inGrace(time.Now()) {
-		return false
-	}
-	return !s.exact.isReclaimer(cs)
 }

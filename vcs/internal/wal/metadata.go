@@ -28,12 +28,9 @@ type metadata struct {
 	// journal cache; empty (and omitted, so 007-era files round-trip
 	// unchanged) for standalone/two-member WALs, which anchor recovery on
 	// checkpoint receipts instead.
-	BaseCommitID   string         `json:"baseCommitId,omitempty"`
-	HA             bool           `json:"ha"`
-	HasCheckpoint  bool           `json:"hasCheckpoint,omitempty"`
-	Checkpoint     CheckpointCut  `json:"checkpoint,omitempty"`
-	HasMaintenance bool           `json:"hasMaintenance,omitempty"`
-	Maintenance    MaintenanceCut `json:"maintenance,omitempty"`
+	BaseCommitID  string        `json:"baseCommitId,omitempty"`
+	HasCheckpoint bool          `json:"hasCheckpoint,omitempty"`
+	Checkpoint    CheckpointCut `json:"checkpoint,omitempty"`
 }
 
 type metadataTransition struct {
@@ -56,6 +53,36 @@ func randomEpoch() (uint64, error) {
 		e = 1
 	}
 	return e, nil
+}
+
+// BaseCommitID is the immutable backend manifest the compacted prefix (and so
+// the retained suffix) extends. Always empty for a locally-born file WAL; the
+// remote journal's implementation reports the claimed generation's anchor.
+// ensureEpochLocked mints and persists the log's LSN-namespace epoch on first
+// write. A legacy pre-metadata file cannot prove its epoch and fails closed.
+func (w *WAL) ensureEpochLocked() error {
+	if w.legacy {
+		return ErrLegacyLog
+	}
+	if w.epoch != 0 {
+		return nil
+	}
+	e, err := randomEpoch()
+	if err != nil {
+		return err
+	}
+	w.epoch = e
+	if err := w.persistMetadataLocked(); err != nil {
+		w.epoch = 0
+		return err
+	}
+	return nil
+}
+
+func (w *WAL) BaseCommitID() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.baseCommitID
 }
 
 func recordDigest(prev [32]byte, r Record) ([32]byte, error) {
@@ -153,10 +180,40 @@ func removeDurable(path string) error {
 func (w *WAL) persistMetadataLocked() error {
 	return persistJSON(w.metaPath(), metadata{
 		Version: metadataVersion, Epoch: w.epoch, BaseSeq: w.compactedThrough,
-		BaseDigest: w.baseDigest, BaseCommitID: w.baseCommitID, HA: w.haRequired,
+		BaseDigest: w.baseDigest, BaseCommitID: w.baseCommitID,
 		HasCheckpoint: w.hasCheckpoint, Checkpoint: w.checkpoint,
-		HasMaintenance: w.hasMaintenance, Maintenance: w.maintenance,
 	})
+}
+
+// recordsLocked reads the full retained record suffix. Caller holds w.mu.
+func (w *WAL) recordsLocked() ([]Record, error) {
+	records, _, err := readRecords(w.path, w.enc)
+	return records, err
+}
+
+// digestAtLocked answers the chain digest at seq within the retained range.
+func (w *WAL) digestAtLocked(seq uint64) ([32]byte, error) {
+	if seq < w.compactedThrough || seq > w.nextSeq {
+		return [32]byte{}, fmt.Errorf("wal: digest boundary %d outside retained range [%d,%d]", seq, w.compactedThrough, w.nextSeq)
+	}
+	if seq == w.compactedThrough {
+		return w.baseDigest, nil
+	}
+	records, err := w.recordsLocked()
+	if err != nil {
+		return [32]byte{}, err
+	}
+	d := w.baseDigest
+	for _, r := range records {
+		if r.Seq >= seq {
+			break
+		}
+		d, err = recordDigest(d, r)
+		if err != nil {
+			return [32]byte{}, err
+		}
+	}
+	return d, nil
 }
 
 func (w *WAL) beginTransitionLocked(target metadata, next uint64, tip [32]byte) error {
@@ -240,11 +297,8 @@ func (w *WAL) initialize(newFile bool) error {
 	w.compactedThrough = meta.BaseSeq
 	w.baseDigest = meta.BaseDigest
 	w.baseCommitID = meta.BaseCommitID
-	w.haRequired = meta.HA
 	w.hasCheckpoint = meta.HasCheckpoint
 	w.checkpoint = meta.Checkpoint
-	w.hasMaintenance = meta.HasMaintenance
-	w.maintenance = meta.Maintenance
 	next, seqErr := validateSequence(meta.BaseSeq, records)
 	if seqErr != nil && scanErr == nil {
 		scanErr = seqErr

@@ -7,7 +7,6 @@ import (
 	"syscall"
 	"unicode/utf8"
 
-	"github.com/steerlabs/portablefs/vcs/internal/ctlrec"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
@@ -34,11 +33,9 @@ const (
 	intentUser intentTrust = iota
 	// intentExactUser is intentUser plus one validated protocol-v2 envelope.
 	intentExactUser
-	// intentWritebackBatch is the trusted server-side write-back assembly: user
-	// records plus, optionally, its one terminal flush-watermark control record.
+	// intentWritebackBatch is the trusted server-side write-back assembly of
+	// user records (coordination rides PFC2 rows, never in-batch controls).
 	intentWritebackBatch
-	// intentControl is an authority-generated control-only mutation.
-	intentControl
 )
 
 type recordFields uint32
@@ -86,14 +83,6 @@ func (fs *FS) normalizeAndValidateIntent(records []wal.Record, trust intentTrust
 	}
 
 	switch trust {
-	case intentControl:
-		if r.Op != wal.OpControl || len(r.Mutations) != 0 {
-			return nil, invalidMutation("trusted control path requires one control record")
-		}
-		if _, err := canonicalizeControlRecord(r); err != nil {
-			return nil, err
-		}
-		return records, nil
 	case intentWritebackBatch:
 		if r.Op != wal.OpBatch {
 			return nil, invalidMutation("write-back path requires one batch frame")
@@ -101,15 +90,8 @@ func (fs *FS) normalizeAndValidateIntent(records []wal.Record, trust intentTrust
 		if err := validateBatchWrapper(*r); err != nil {
 			return nil, err
 		}
-		if err := validateWritebackControls(r.Mutations); err != nil {
-			return nil, err
-		}
 		for i := range r.Mutations {
-			leaf := &r.Mutations[i]
-			if leaf.Op == wal.OpControl {
-				continue
-			}
-			if err := normalizeAndValidateUserRecord(leaf, true, false); err != nil {
+			if err := normalizeAndValidateUserRecord(&r.Mutations[i], true, false); err != nil {
 				return nil, fmt.Errorf("batch mutation %d: %w", i, err)
 			}
 		}
@@ -130,21 +112,6 @@ func (fs *FS) normalizeAndValidateIntent(records []wal.Record, trust intentTrust
 	}
 }
 
-// canonicalizeControlRecord validates one control record's non-payload shape
-// and decodes its payload under the WAL store's single gob control codec
-// (this port has one control encoding; a per-log codec declaration arrives
-// with the journal's ControlCodec and is enforced there).
-func canonicalizeControlRecord(r *wal.Record) (ctlPayload, error) {
-	if err := validateControlShape(*r); err != nil {
-		return ctlPayload{}, err
-	}
-	payload, err := decodeCtlPayload(r.Data)
-	if err != nil {
-		return ctlPayload{}, invalidMutation("malformed control payload: %v", err)
-	}
-	return payload, nil
-}
-
 // preflightIntentShape runs before copying caller-owned payloads. In addition
 // to rejecting nesting without recursive descent, it bounds the aggregate data
 // allocation to the WAL's framing ceiling.
@@ -157,8 +124,8 @@ func preflightIntentShape(r wal.Record, trust intentTrust) error {
 		if len(r.Data) > maxIntentPayloadBytes {
 			return invalidMutation("mutation payload exceeds %d bytes", maxIntentPayloadBytes)
 		}
-		if r.Op == wal.OpControl && len(r.Data) > ctlrec.MaxEncodedControlBytes {
-			return invalidMutation("control payload exceeds %d bytes", ctlrec.MaxEncodedControlBytes)
+		if r.Op == wal.OpControl {
+			return invalidMutation("control records are retired (coordination rides PFC2 rows)")
 		}
 		return nil
 	}
@@ -181,8 +148,8 @@ func preflightIntentShape(r wal.Record, trust intentTrust) error {
 			return invalidMutation("batch payload exceeds %d bytes", maxIntentPayloadBytes)
 		}
 		total += len(leaf.Data)
-		if leaf.Op == wal.OpControl && len(leaf.Data) > ctlrec.MaxEncodedControlBytes {
-			return invalidMutation("batch control payload exceeds %d bytes", ctlrec.MaxEncodedControlBytes)
+		if leaf.Op == wal.OpControl {
+			return invalidMutation("control records are retired (coordination rides PFC2 rows)")
 		}
 	}
 	return nil
@@ -236,64 +203,6 @@ func validateBatchWrapper(r wal.Record) error {
 		if r.Mutations[i].TsMs != 0 {
 			return invalidMutation("batch mutation %d supplied an authority timestamp", i)
 		}
-	}
-	return nil
-}
-
-// validateWritebackControls ensures a client-provided flush record cannot
-// smuggle arbitrary replicated control state. The server appends exactly one
-// flush-watermark record after all client mutations. The only compatibility
-// exception is the one-time removal of that watermark's legacy hidden file.
-func validateWritebackControls(records []wal.Record) error {
-	controlIndex := -1
-	var payload ctlPayload
-	for i := range records {
-		if records[i].Op != wal.OpControl {
-			continue
-		}
-		if controlIndex >= 0 {
-			return invalidMutation("write-back batch contains multiple control records")
-		}
-		controlIndex = i
-		decoded, err := canonicalizeControlRecord(&records[i])
-		if err != nil {
-			return fmt.Errorf("batch control: %w", err)
-		}
-		payload = decoded
-		if payload.Kind != ctlKindWatermark || payload.Watermark == nil {
-			return invalidMutation("write-back batch may contain only its flush watermark control")
-		}
-	}
-	if controlIndex < 0 {
-		return nil // direct/internal atomic user batch (used outside write-back)
-	}
-	if controlIndex == len(records)-1 {
-		return nil
-	}
-	if controlIndex != len(records)-2 || records[len(records)-1].Op != wal.OpRemove {
-		return invalidMutation("flush watermark control must terminate the batch")
-	}
-	wantLegacy := ".portablefs-" + payload.Watermark.SessionID
-	if cleanPath(records[len(records)-1].Path) != wantLegacy {
-		return invalidMutation("post-watermark mutation is not its legacy receipt removal")
-	}
-	return nil
-}
-
-func validateControlShape(r wal.Record) error {
-	if r.Op != wal.OpControl {
-		return invalidMutation("not a control record")
-	}
-	if r.Path != "" || r.NewPath != "" || r.Offset != 0 || r.Size != 0 || r.Mode != 0 ||
-		r.Target != "" || r.MtimeMs != 0 || r.AtimeMs != 0 || r.ChtimesSetAtime ||
-		r.UID != 0 || r.GID != 0 || r.Ino != 0 || len(r.Inos) != 0 || r.OrphanTarget ||
-		r.ChownSetUID || r.ChownSetGID || r.Append || r.ReapIfLeaseExpiresByMs != 0 ||
-		r.Env != nil || len(r.Mutations) != 0 || r.Excl || r.RenameNoReplace ||
-		r.XattrName != "" || r.XattrFlags != 0 {
-		return invalidMutation("control record carries user-mutation fields")
-	}
-	if len(r.Data) == 0 {
-		return invalidMutation("empty control payload")
 	}
 	return nil
 }

@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,12 +60,16 @@ type mountOpts struct {
 	strategy    string
 	addr        string
 	mountToken  string
-	fast        bool
 	foreground  bool
 	readyFD     int
 	localDirs   stringListFlag
 	noLocalDirs bool
 }
+
+// errFastRetired is the typed refusal for the retired --fast flag: write
+// mode is no longer a mount property — the authority delegates adaptively on
+// every mount, and fsync is always durable at the authority.
+var errFastRetired = fmt.Errorf("--fast is retired: every mount is adaptive (the authority delegates write-back per scope automatically); remove the flag")
 
 func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	addCommonFlags(fs, &o.common)
@@ -72,64 +77,45 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.strategy, "strategy", "auto", "mount strategy: auto (fskit on macOS, fuse on Linux), fskit, or fuse")
 	fs.StringVar(&o.addr, "addr", "", "mount a VCS authority address directly, skipping the manager")
 	fs.StringVar(&o.mountToken, "mount-token", "", "data-plane token for --addr (or "+mountTokenEnv+")")
-	fs.BoolVar(&o.fast, "fast", false, "single-writer speed mode: write-back + negative caching (fsync = durable at the authority)")
+	fs.BoolFunc("fast", "retired: every mount is adaptive; passing this flag is an error", func(string) error {
+		return errFastRetired
+	})
 	fs.Var(&o.localDirs, "local-dir", "serve this workspace-relative directory from machine-local disk instead of the volume (repeatable; e.g. --local-dir node_modules)")
 	fs.BoolVar(&o.noLocalDirs, "no-local-dirs", false, "disable machine-local dirs entirely for this mount (clears persisted --local-dir state and ignores the volume's .portablefs/local-dirs)")
 	fs.BoolVar(&o.foreground, "foreground", false, "stay attached instead of daemonizing")
 	fs.IntVar(&o.readyFD, "ready-fd", 0, "internal: fd to write the readiness report to")
 }
 
-// perfOptions carries the FUSE mount performance knobs. The zero value is the
-// correctness-first default: write-through, no negative cache — coherence via
-// authority push invalidation only. --fast (or the documented PORTABLEFS_*
-// environment knobs, same names cmd/mount reads) turns on write-back
-// batching and version-gated negative caching. Under --fast, fsync defaults
-// to the "authority" policy so applications that fsync (git, SQLite) get a
-// real durability barrier; un-fsynced writes have a bounded (~flush interval)
+// perfOptions carries the FUSE mount cache options plus the write-back
+// engine's durable state location. There is no write-mode knob: the
+// authority delegates adaptively per scope, and fsync always means durable
+// at the authority. Un-fsynced writes have a bounded (~flush batching)
 // window, the same contract as a local page cache.
 type perfOptions struct {
-	writeBack bool
 	// negativeCache forces the negative dentry cache on; negativeCacheOff
-	// forces it off. Neither (the default) is capability-auto: clientcore
-	// enables it iff the authority advertises ParentVersion stamping in the
-	// protocol handshake.
+	// forces it off. Neither (the default) keeps the v6 baseline: on.
 	negativeCache    bool
 	negativeCacheOff bool
-	flushInterval    time.Duration
-	fsyncPolicy      string
-	flushMaxRecords  int
-	flushMaxBytes    int64
+	// writebackDir is the engine's durable state directory, keyed by
+	// (volume, branch) so parked streams recover across mount paths.
+	writebackDir string
+	volumeID     string
+	branch       string
 }
 
-func perfOptionsFromEnv(fast bool, getenv func(string) string) perfOptions {
-	p := perfOptions{
-		writeBack:        fast || getenv("PORTABLEFS_WRITEBACK") == "1",
-		negativeCache:    fast || getenv("PORTABLEFS_NEGATIVE_CACHE") == "1",
-		negativeCacheOff: !fast && getenv("PORTABLEFS_NEGATIVE_CACHE") == "0",
+func perfOptionsFromEnv(getenv func(string) string) perfOptions {
+	return perfOptions{
+		negativeCache:    getenv("PORTABLEFS_NEGATIVE_CACHE") == "1",
+		negativeCacheOff: getenv("PORTABLEFS_NEGATIVE_CACHE") == "0",
 	}
-	if v := getenv("PORTABLEFS_FLUSH_MS"); v != "" {
-		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
-			p.flushInterval = time.Duration(ms) * time.Millisecond
-		}
-	}
-	if p.writeBack && p.flushInterval == 0 {
-		p.flushInterval = 250 * time.Millisecond
-	}
-	p.fsyncPolicy = getenv("PORTABLEFS_FSYNC_POLICY")
-	if p.fsyncPolicy == "" && fast {
-		p.fsyncPolicy = "authority"
-	}
-	if v := getenv("PORTABLEFS_FLUSH_MAX_RECORDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			p.flushMaxRecords = n
-		}
-	}
-	if v := getenv("PORTABLEFS_FLUSH_MAX_BYTES"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			p.flushMaxBytes = n
-		}
-	}
-	return p
+}
+
+// storageDirID names the per-(volume, branch) write-back state directory:
+// stable across mount paths so a parked stream recovers wherever the volume
+// mounts next.
+func storageDirID(volumeID, branch string) string {
+	sum := sha256.Sum256([]byte(volumeID + "\x00" + branch))
+	return hex.EncodeToString(sum[:8])
 }
 
 // mountReady is the readiness handshake between the daemonized child and the
@@ -249,9 +235,6 @@ func (e *cmdEnv) daemonizeMount(o *mountOpts, volumeID, mountPath, stateDir stri
 	if o.addr != "" {
 		childArgs = append(childArgs, "--addr", o.addr)
 	}
-	if o.fast {
-		childArgs = append(childArgs, "--fast")
-	}
 	for _, dir := range o.localDirs {
 		childArgs = append(childArgs, "--local-dir", dir)
 	}
@@ -332,13 +315,13 @@ func (o *mountOpts) resolveMountToken(getenv func(string) string) string {
 }
 
 // sessionTokenSource serves the current data-plane credential to reconnect
-// handshakes, re-resolving the mount session when the token nears expiry or
+// handshakes, re-resolving access when the token nears expiry or
 // when the router explicitly rejects it (refreshNow).
 type sessionTokenSource struct {
 	mu          sync.Mutex // guards token/expiresAtMs/refresh — never held across a refresh call
 	token       string
 	expiresAtMs int64
-	refresh     func() (*mountSession, error)
+	refresh     func() (*accessSession, error)
 
 	// refreshMu serializes re-resolutions so the timed near-expiry path and
 	// the reactive rejection path never race two manager round-trips. It is
@@ -371,12 +354,12 @@ func (t *sessionTokenSource) get() string {
 	if token != "" {
 		return token
 	}
-	// Direct --addr mounts without a token keep cmd/mount's contract: the
-	// VCS_AUTH_TOKEN environment variable authenticates the data plane.
+	// Direct --addr mounts without a token: the VCS_AUTH_TOKEN environment
+	// variable authenticates the data plane.
 	return os.Getenv("VCS_AUTH_TOKEN")
 }
 
-// refreshNow re-resolves the mount session immediately and installs the fresh
+// refreshNow re-resolves access immediately and installs the fresh
 // credential, reporting whether it did. This is the reactive recovery path:
 // the fsproto client calls it (already coalesced across its pool) the moment
 // a dial's token frame is explicitly rejected, so a manager restart is healed
@@ -502,7 +485,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// the tenant namespace, so resolve the volume's tenant id up front and
 		// send it as teamId on every manager request.
 		teamID := e.resolveVolumeTeamID(s, volumeID, o.branch)
-		session, err := manager.mountSession(context.Background(), volumeID, o.branch, teamID)
+		session, err := manager.resolveAccess(context.Background(), volumeID, o.branch, teamID)
 		if err != nil {
 			return failReady(err)
 		}
@@ -518,29 +501,27 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			func(format string, args ...any) { log.Printf("portablefs mount: "+format, args...) },
 			func(status string, atMs int64) { setMountStatus(stateDir, mountPath, status, atMs) },
 		)
-		if session.Lease != nil {
-			// Canonical transport: the mount holds an access lease, renewed at
-			// half-TTL in the background and released on unmount. The persisted
-			// slice lets `portablefs mounts`/debugging correlate mount → lease.
-			keeper = newLeaseKeeper(manager, volumeID, o.branch, teamID, tokens, *session.Lease, func(lease leaseState) {
-				if st, err := readMountState(stateDir, mountPath); err == nil && st != nil {
-					st.AccessLease = &lease
-					_ = writeMountState(stateDir, *st)
-				}
-				if fn, _ := leaseHook.Load().(func(leaseState)); fn != nil {
-					fn(lease)
-				}
-			})
-			keeper.credWatch = credWatch
-		}
-		tokens.refresh = func() (*mountSession, error) {
+		// The mount holds an access lease, renewed at half-TTL in the
+		// background and released on unmount. The persisted slice lets
+		// `portablefs mounts`/debugging correlate mount → lease.
+		keeper = newLeaseKeeper(manager, volumeID, o.branch, teamID, tokens, *session.Lease, func(lease leaseState) {
+			if st, err := readMountState(stateDir, mountPath); err == nil && st != nil {
+				st.AccessLease = &lease
+				_ = writeMountState(stateDir, *st)
+			}
+			if fn, _ := leaseHook.Load().(func(leaseState)); fn != nil {
+				fn(lease)
+			}
+		})
+		keeper.credWatch = credWatch
+		tokens.refresh = func() (*accessSession, error) {
 			// Bounded: this runs on the reconnect path (a rejected dial is
 			// blocked on it), so a hung manager must fail the attempt quickly
 			// and let the backoff schedule own the waiting.
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			ms, err := manager.mountSession(ctx, volumeID, o.branch, teamID)
-			if err == nil && ms.Lease != nil && keeper != nil {
+			ms, err := manager.resolveAccess(ctx, volumeID, o.branch, teamID)
+			if err == nil && keeper != nil {
 				keeper.adopt(*ms.Lease)
 			}
 			// The reactive path sees revocation first when the router starts
@@ -602,7 +583,11 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				}
 			},
 		}
-		m, err := mountFUSE(authorityURL, tokens, mountPath, perfOptionsFromEnv(o.fast, e.getenv), localCfg)
+		perf := perfOptionsFromEnv(e.getenv)
+		perf.volumeID = volumeID
+		perf.branch = o.branch
+		perf.writebackDir = filepath.Join(stateDir, "writeback", storageDirID(volumeID, o.branch))
+		m, err := mountFUSE(authorityURL, tokens, mountPath, perf, localCfg)
 		if err != nil {
 			return failReady(err)
 		}
@@ -613,7 +598,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			state.AccessLease = &lease
 		}
 		if err := writeMountState(stateDir, state); err != nil {
-			m.Unmount()
+			_ = m.Unmount()
 			m.Wait()
 			return failReady(err)
 		}
@@ -625,8 +610,14 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		go func() {
-			<-sig
-			m.Unmount()
+			for range sig {
+				// A failed drain keeps the mount up; the next signal (or a
+				// recovered authority) retries. Forced detach goes through
+				// `portablefs umount --force`, never a silent fallback here.
+				if m.Unmount() == nil {
+					return
+				}
+			}
 		}()
 		m.Wait() // returns when the kernel mount is gone (signal or external umount)
 		stopKeeper()
@@ -653,7 +644,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			AuthToken:    tokens.get(),
 			TLSCAPEM:     caPEM,
 			MountPath:    mountPath,
-			Options:      fskitOptionsFromPerf(perfOptionsFromEnv(o.fast, e.getenv), flagLocalDirs, volumeFileEnabled),
+			Options:      fskitOptionsFromPerf(perfOptionsFromEnv(e.getenv), flagLocalDirs, volumeFileEnabled),
 		})
 		if err != nil {
 			return failReady(err)
@@ -773,7 +764,9 @@ func isMountpoint(path string) bool {
 func cmdUmount(e *cmdEnv, args []string) int {
 	fs := newFlagSet("umount")
 	var o commonOpts
+	var force bool
 	addCommonFlags(fs, &o)
+	fs.BoolVar(&force, "force", false, "detach even with an unshipped write-back tail: it parks as a durable recovery job (its ID is printed) and drains automatically on the next attach")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		return e.handleParseError("umount", err)
@@ -810,44 +803,171 @@ func cmdUmount(e *cmdEnv, args []string) int {
 		return 0
 	}
 
-	if err := platformUnmount(st.Strategy, mountPath); err != nil {
-		switch {
-		case isMountpoint(mountPath) && pidAlive(st.PID):
-			return e.fail("umount", fmt.Errorf("%w\nif the volume is busy, close processes using %s and retry", err, mountPath))
-		case pidAlive(st.PID):
-			// The platform mount was torn down externally (forced diskutil
-			// unmount, extension crash) but the daemon lingers: reconcile —
-			// stop it and drop the record — instead of reporting "busy" for
-			// a path that has nothing mounted on it.
-			fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d still running); stopping it and removing stale mount state\n", mountPath, st.PID)
-		default:
-			// Daemon already gone and nothing to unmount: a stale record. Clean it
-			// up instead of failing, so `mounts` stops flagging it.
-			fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
+	var forcedJobs []string
+	switch {
+	case !pidAlive(st.PID):
+		// The daemon is already gone: this is stale-record reconciliation,
+		// not a drain decision. Any parked WAL recovers on the next attach.
+	case force:
+		// The EXPLICIT force path: the daemon parks the unshipped tail as a
+		// durable recovery job OUTSIDE the attach and reports its ID.
+		forcedJobs = e.forceDetachForUnmount(st)
+	default:
+		// A NORMAL unmount requires the full drain barrier. Failure aborts
+		// with the mount fully alive — never a silently parked tail behind a
+		// healthy-looking unmount.
+		if err := e.drainBeforeUnmount(st); err != nil {
+			return e.fail("umount", fmt.Errorf("%v\nnothing was unmounted: the write-back tail could not reach the authority. Retry when it is reachable, or run `portablefs umount --force %s` to detach now — the tail then parks as a durable recovery job and drains on the next attach", err, mountPath))
 		}
+	}
+
+	switch {
+	case isMountpoint(mountPath):
+		if err := platformUnmount(st.Strategy, mountPath); err != nil && isMountpoint(mountPath) && pidAlive(st.PID) {
+			return e.fail("umount", fmt.Errorf("%w\nif the volume is busy, close processes using %s and retry", err, mountPath))
+		}
+	case pidAlive(st.PID):
+		// The platform mount was torn down externally (forced diskutil
+		// unmount, extension crash) but the daemon lingers: reconcile —
+		// stop it and drop the record — instead of reporting "busy" for
+		// a path that has nothing mounted on it.
+		fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d still running); stopping it and removing stale mount state\n", mountPath, st.PID)
+	default:
+		// Daemon already gone and nothing to unmount: a stale record. Clean it
+		// up instead of failing, so `mounts` stops flagging it.
+		fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
 	}
 	if pidAlive(st.PID) {
 		stopMountDaemon(st.PID)
+	}
+	if force {
+		// FUSE parks its job inside the daemon during teardown; report every
+		// parked stream from the on-disk registry (visible OUTSIDE any
+		// attach) so forced unmounts always print their recovery handles.
+		forcedJobs = append(forcedJobs, parkedRecoveryJobs(stateDir, st)...)
+		forcedJobs = dedupeStrings(forcedJobs)
+		for _, id := range forcedJobs {
+			fmt.Fprintf(e.stdout, "parked write-back recovery job %s (drains automatically on the next attach of %s@%s)\n", id, st.VolumeID, st.Branch)
+		}
 	}
 	if err := removeMountState(stateDir, mountPath); err != nil {
 		fmt.Fprintf(e.stderr, "portablefs umount: warning: remove mount state: %v\n", err)
 	}
 	if o.jsonOut {
-		return e.printJSON(map[string]any{"mountPath": mountPath, "volumeId": st.VolumeID, "unmounted": true, "tracked": true})
+		return e.printJSON(map[string]any{"mountPath": mountPath, "volumeId": st.VolumeID, "unmounted": true, "tracked": true, "forced": force, "recoveryJobs": forcedJobs})
 	}
 	fmt.Fprintf(e.stdout, "unmounted %s (volume %s)\n", mountPath, st.VolumeID)
 	return 0
 }
 
+// drainBeforeUnmount runs the REQUIRED normal-unmount drain barrier while
+// the mount is still fully alive. An error means the unmount must not
+// proceed.
+func (e *cmdEnv) drainBeforeUnmount(st *mountState) error {
+	switch {
+	case st.Strategy == "fskit" && st.AttachRef != "":
+		ctl := newFsdControl(fskitConfigFromEnv(e.getenv).controlSock)
+		if _, err := ctl.syncAttach(st.AttachRef); err != nil {
+			return fmt.Errorf("pre-unmount drain failed: %w", err)
+		}
+		return nil
+	case st.Strategy == "fuse":
+		// The FUSE daemon owns its drain: SIGTERM asks it to drain and
+		// detach; a failed drain leaves the mount up, which we detect.
+		proc, err := os.FindProcess(st.PID)
+		if err != nil {
+			return nil
+		}
+		_ = proc.Signal(syscall.SIGTERM)
+		deadline := time.Now().Add(daemonStopTimeout)
+		for time.Now().Before(deadline) {
+			if !isMountpoint(st.MountPath) {
+				return nil
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if isMountpoint(st.MountPath) {
+			return fmt.Errorf("the mount daemon could not drain within %v (the mount stays up)", daemonStopTimeout)
+		}
+		return nil
+	}
+	return nil
+}
+
+// forceDetachForUnmount runs the explicit force path against a live daemon
+// (fskit control) and returns any reported recovery job IDs. Best-effort: a
+// wedged daemon still gets torn down by the caller, and the on-disk job
+// registry reports the parked streams.
+func (e *cmdEnv) forceDetachForUnmount(st *mountState) []string {
+	if st.Strategy != "fskit" || st.AttachRef == "" {
+		return nil
+	}
+	ctl := newFsdControl(fskitConfigFromEnv(e.getenv).controlSock)
+	jobID, err := ctl.forceDetach(st.AttachRef)
+	if err != nil {
+		fmt.Fprintf(e.stderr, "portablefs umount: warning: force-detach through the daemon failed (%v); proceeding with the platform unmount — parked streams remain visible in the on-disk recovery registry\n", err)
+		return nil
+	}
+	if jobID == "" {
+		return nil
+	}
+	return []string{jobID}
+}
+
+// parkedRecoveryJobs reads the on-disk recovery registry for this mount's
+// (volume, branch) write-back store: job.json lives OUTSIDE any attach, so a
+// forced unmount can always name the recovery handles it parked.
+func parkedRecoveryJobs(stateDir string, st *mountState) []string {
+	roots := []string{
+		// FUSE mounts key the store under the CLI state dir.
+		filepath.Join(stateDir, "writeback", storageDirID(st.VolumeID, st.Branch)),
+	}
+	// FSKit mounts key it under the daemon's state dir (a sibling of the
+	// mount state dir).
+	roots = append(roots, filepath.Join(filepath.Dir(stateDir), "portablefsd", "wal", storageDirID(st.VolumeID, st.Branch)))
+	var ids []string
+	for _, root := range roots {
+		matches, _ := filepath.Glob(filepath.Join(root, "stream-*", "job.json"))
+		for _, m := range matches {
+			var job struct {
+				JobID string `json:"jobId"`
+			}
+			if b, err := os.ReadFile(m); err == nil && json.Unmarshal(b, &job) == nil && job.JobID != "" {
+				ids = append(ids, job.JobID)
+			}
+		}
+	}
+	return ids
+}
+
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := in[:0]
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// daemonStopTimeout is how long stopMountDaemon waits after SIGTERM before
+// escalating to SIGKILL. It MUST exceed the daemon's detach drain budget
+// (portablefsd detachDrainBudget, 30s) plus the control round-trip — a
+// shorter timeout SIGKILLs the daemon mid-drain, exactly the data-parking
+// race this constant exists to prevent.
+const daemonStopTimeout = 60 * time.Second
+
 // stopMountDaemon terminates the daemonized mount process: SIGTERM first so it
-// can flush and clean up, SIGKILL if it lingers.
+// can drain and clean up, SIGKILL only after the drain budget has fully lapsed.
 func stopMountDaemon(pid int) {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return
 	}
 	_ = proc.Signal(syscall.SIGTERM)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(daemonStopTimeout)
 	for time.Now().Before(deadline) {
 		if !pidAlive(pid) {
 			return
@@ -878,10 +998,23 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// Health folds pid-liveness and the persisted credential status:
 		// live | stale | credential-expired.
 		Health string `json:"health"`
+		// WriteBack carries the daemon's durability-debt view for fskit
+		// mounts: live un-flushed backlog plus parked WALs awaiting the
+		// background recovery job.
+		WriteBack *cliWriteBackStatus `json:"writeBack,omitempty"`
+		// AttachState is the daemon-reported attach state (degraded carries
+		// the daemon's last error in the printed line).
+		AttachState string `json:"attachState,omitempty"`
 	}
+	daemonView := fskitAttachStatuses(e.getenv)
 	rows := make([]mountRow, 0, len(states))
 	for i := range states {
-		rows = append(rows, mountRow{states[i], pidAlive(states[i].PID), mountHealth(&states[i])})
+		row := mountRow{mountState: states[i], Alive: pidAlive(states[i].PID), Health: mountHealth(&states[i])}
+		if a, ok := daemonView[states[i].AttachRef]; ok {
+			row.WriteBack = a.WriteBack
+			row.AttachState = a.State
+		}
+		rows = append(rows, row)
 	}
 	if o.jsonOut {
 		return e.printJSON(map[string]any{"mounts": rows})
@@ -903,12 +1036,43 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			status = "credential-expired" + since + " (credentials revoked or expired; run `portablefs login` and remount)"
 		default:
 			status = "live"
+			if row.AttachState == "degraded" {
+				status = "degraded"
+			}
 		}
 		extras := ""
 		if len(row.LocalDirs) > 0 {
 			extras = "  local-dirs:" + strings.Join(row.LocalDirs, ",")
 		}
+		if wb := row.WriteBack; wb != nil {
+			parkedRecords := 0
+			for _, p := range wb.ParkedWALs {
+				parkedRecords += p.Records
+			}
+			if parkedRecords > 0 {
+				extras += fmt.Sprintf("  write-back:%d records pending recovery", parkedRecords)
+			} else if wb.PendingRecords > 0 {
+				extras += fmt.Sprintf("  write-back:%d records flushing", wb.PendingRecords)
+			}
+		}
 		fmt.Fprintf(e.stdout, "%s  %s@%s  %s  pid %d%s  %s\n", row.MountPath, row.VolumeID, row.Branch, row.Strategy, row.PID, extras, status)
 	}
 	return 0
+}
+
+// fskitAttachStatuses reads the daemon's attach table, keyed by attach ref.
+// Best-effort with a short budget: `portablefs mounts` must answer instantly
+// whether or not a daemon is running.
+func fskitAttachStatuses(getenv func(string) string) map[string]cliAttachStatus {
+	ctl := newFsdControl(fskitConfigFromEnv(getenv).controlSock)
+	ctl.httpClient.Timeout = 3 * time.Second
+	attaches, err := ctl.listAttaches()
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]cliAttachStatus, len(attaches))
+	for _, a := range attaches {
+		out[a.AttachRef] = a
+	}
+	return out
 }

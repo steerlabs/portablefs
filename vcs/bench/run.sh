@@ -21,7 +21,7 @@ MOUNT_BIN="$(dirname "$BIN")/pfsmount"
 
 echo "== building harness"
 go build -o "$BIN" ./bench/cmd/pfsbench
-go build -o "$MOUNT_BIN" ./cmd/mount
+go build -o "$MOUNT_BIN" ./bench/cmd/benchmount
 mkdir -p "$RESULTS"
 
 run() { # label transport extra-flags...

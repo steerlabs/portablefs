@@ -180,48 +180,6 @@ func (l *Log) CompactRecoveredCheckpoint(operationID string) error {
 	return l.CompactThrough(cut.Watermark)
 }
 
-// RotateControlOnlyThrough performs the control-only maintenance rotation:
-// the caller has proven (from decoded durable records) that the prefix below
-// watermark carries no user mutation and that the record at sidecarSeq is a
-// complete exact snapshot sidecar. The database re-verifies the sidecar's
-// stored hash and refuses to cross a prepared checkpoint cut. Rotation is one
-// atomic transaction, so there is no prepared maintenance state to recover.
-func (l *Log) RotateControlOnlyThrough(watermark, sidecarSeq uint64) error {
-	watermarkSQL, err := checkedSQLBigint("control rotation watermark", watermark)
-	if err != nil {
-		return err
-	}
-	sidecarSQL, err := checkedSQLBigint("control rotation sidecar sequence", sidecarSeq)
-	if err != nil {
-		return err
-	}
-	if sidecarSeq == ^uint64(0) {
-		return fmt.Errorf("%w: control rotation sidecar has no exclusive end", ErrBounds)
-	}
-	if _, err := checkedSQLBigint("control rotation exclusive end", sidecarSeq+1); err != nil {
-		return err
-	}
-	if err := l.ensureDurableThrough(sidecarSeq + 1); err != nil {
-		return err
-	}
-	sidecarHash, err := l.recordHashAt(sidecarSeq)
-	if err != nil {
-		return err
-	}
-	raw, err := l.callWriter(
-		`SELECT pfj.journal_rotate_control($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		watermarkSQL, sidecarSQL, sidecarHash,
-	)
-	if err != nil {
-		return err
-	}
-	return l.applyGeneration(raw)
-}
-
-// RecoverControlRotation is a no-op: remote rotation is atomic in one
-// database transaction, so a prepared-but-unfinished maintenance state
-// cannot exist.
-func (l *Log) RecoverControlRotation() error { return nil }
 
 // recordHashAt reads the stored record hash of one durable LSN.
 func (l *Log) recordHashAt(seq uint64) (string, error) {

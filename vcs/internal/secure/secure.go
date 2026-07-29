@@ -2,8 +2,7 @@
 // replication channel, so file data and journals are encrypted in transit when a
 // client (FUSE mount) or standby is on a different machine / across the internet.
 // TLS is opt-in via env; unset means plaintext (e.g. a trusted LAN or behind
-// WireGuard). The in-kernel NFS path can't do TLS and is secured at the network
-// layer instead.
+// WireGuard).
 package secure
 
 import (

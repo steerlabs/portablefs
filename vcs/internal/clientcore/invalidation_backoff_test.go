@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
+	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
 
 // flakySub refuses Subscribe a configured number of times before handing out
@@ -15,17 +16,17 @@ import (
 type flakySub struct {
 	mu       sync.Mutex
 	failures int
-	ch       chan []coherence.Invalidation
+	ch       chan coherence.Batch
 }
 
-func (f *flakySub) Subscribe() (<-chan []coherence.Invalidation, error) {
+func (f *flakySub) Subscribe() (<-chan coherence.Batch, fsproto.AckFunc, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failures > 0 {
 		f.failures--
-		return nil, errors.New("router refusing connections")
+		return nil, nil, errors.New("router refusing connections")
 	}
-	return f.ch, nil
+	return f.ch, nil, nil
 }
 
 func (f *flakySub) setFailures(n int) {
@@ -55,7 +56,7 @@ func TestWatchInvalidationsResubscribeBackoff(t *testing.T) {
 		return d
 	}
 
-	sub := &flakySub{failures: 10, ch: make(chan []coherence.Invalidation)}
+	sub := &flakySub{failures: 10, ch: make(chan coherence.Batch)}
 	delays := make(chan time.Duration, 64)
 	opts := InvalidationOptions{
 		// The seam records the schedule and skips the real sleep, so the test

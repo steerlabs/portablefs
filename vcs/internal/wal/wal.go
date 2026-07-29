@@ -54,21 +54,13 @@ var errPoisoned = errors.New("wal: log poisoned by an unrecoverable durability f
 // ErrPoisoned lets callers classify a poisoned-log rejection (errors.Is).
 var ErrPoisoned = errPoisoned
 
-// ErrReplicaRequired is returned by a WAL that has participated in a fixed
-// two-member HA set after promotion/restart but has not yet reconciled a healthy
-// replacement standby. Such a node may replay/read its durable prefix, but must
-// fail closed for writes rather than silently downgrade acknowledged durability
-// to a single copy.
-var ErrReplicaRequired = errors.New("wal: synchronous replica required before writes can resume")
+// ErrEpochMismatch classifies a checkpoint cut minted under a different LSN
+// namespace than this log's current epoch.
+var ErrEpochMismatch = errors.New("wal: epoch mismatch")
 
-// ErrReplicationGap and ErrReplicationConflict classify standby rejection of a
-// non-contiguous LSN or a duplicate LSN carrying different content.
-var (
-	ErrReplicationGap      = errors.New("wal: replication LSN gap")
-	ErrReplicationConflict = errors.New("wal: conflicting duplicate LSN")
-	ErrEpochMismatch       = errors.New("wal: replication epoch mismatch")
-	ErrLegacyReplica       = errors.New("wal: legacy replica cannot prove an exact prefix")
-)
+// ErrLegacyLog reports a non-empty pre-metadata file: it cannot prove an
+// epoch, so it replays read-only and refuses writes.
+var ErrLegacyLog = errors.New("wal: legacy pre-metadata log cannot prove an epoch")
 
 // Op identifies a mutation kind.
 type Op uint8
@@ -126,6 +118,13 @@ const (
 	// outcome (Linux removexattr semantics), never a silent no-op. Appended
 	// after OpSetxattr.
 	OpRemovexattr
+	// OpJournalEntry frames one canonical PFJ3 journal entry (tree arm plus
+	// ordered PFC2 controls) in Data. It exists ONLY for the file-backed
+	// PFJ3 entry log (pfj3.FileEntryLog — the bench/torture/test authority
+	// backend); the production journal is PostgreSQL and never touches this
+	// op. A WAL carrying it is an entry log, never replayed record-shaped.
+	// Appended after OpRemovexattr.
+	OpJournalEntry
 )
 
 // Frozen apply-level xattr bounds, shared by every generation (admission,
@@ -247,19 +246,6 @@ type Record struct {
 	XattrFlags uint8
 }
 
-// Replica receives a copy of every durable WAL mutation. When set, a record is
-// not acknowledged until the replica has it too (replicate-before-ack), so an
-// acknowledged write survives the loss of a single node. The wal package stays
-// networking-free; the replication package provides a network Replica. Compaction
-// is expressed as an LSN watermark so the replica drops exactly the committed
-// prefix regardless of its own record positions.
-type Replica interface {
-	Append(Record) error
-	AppendBatch([]Record) error // replicate a group-commit batch in one round-trip
-	Reset() error
-	Compact(throughSeq uint64) error
-}
-
 // WAL is an append-only log whose append path writes complete framed records to
 // the fd before returning; fsync/replication can be batched separately. It tracks
 // a monotonic next-LSN so a checkpoint can compact away just the prefix it
@@ -269,8 +255,6 @@ type WAL struct {
 	f            *os.File
 	path         string
 	enc          *secure.AtRest // nil = plaintext (records framed verbatim)
-	replica      Replica
-	replicaExact bool          // true only after AttachReplica proved and reconciled the prefix
 	nextSeq      uint64        // LSN to assign to the next appended record
 	offset       int64         // current size of the log file (append position)
 	count        int           // live record count (for observability/tests)
@@ -297,12 +281,9 @@ type WAL struct {
 	baseCommitID     string              // immutable backend manifest the compacted prefix extends (durable journal caches only)
 	tipDigest        [32]byte            // digest at nextSeq (baseDigest chained through live records)
 	recordHashes     map[uint64][32]byte // retained LSN -> canonical record hash (duplicate validation)
-	legacy           bool                // non-empty pre-metadata log; exact HA attach must fail closed
-	haRequired       bool                // persisted once this WAL joins a fixed two-member HA set
+	legacy           bool                // non-empty pre-metadata log; cannot prove an epoch
 	hasCheckpoint    bool
 	checkpoint       CheckpointCut
-	hasMaintenance   bool
-	maintenance      MaintenanceCut
 
 	// epoch numbers this log's LSN NAMESPACE: it advances whenever Reset or
 	// Renumber restarts numbering, so previously-issued LSNs become ambiguous
@@ -380,16 +361,6 @@ func (w *WAL) RecordsBelow(seq uint64) ([]Record, error) {
 		}
 	}
 	return out, nil
-}
-
-// SetReplica attaches a legacy/test replica without prefix proof. Production
-// callers must use AttachReplica, which proves and repairs only exact prefixes
-// and never resets either member.
-func (w *WAL) SetReplica(r Replica) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.replica = r
-	w.replicaExact = false
 }
 
 // Open creates or opens an unencrypted log at path.
@@ -500,9 +471,6 @@ func (w *WAL) AppendBuffered(r Record) (uint64, error) {
 	if w.initErr != nil {
 		return 0, w.initErr
 	}
-	if w.haRequired && w.replica == nil {
-		return 0, ErrReplicaRequired
-	}
 	if err := w.ensureEpochLocked(); err != nil {
 		return 0, err
 	}
@@ -550,9 +518,6 @@ func (w *WAL) AppendBatchBuffered(records []Record) (firstSeq, endSeq uint64, er
 	}
 	if w.initErr != nil {
 		return 0, 0, w.initErr
-	}
-	if w.haRequired && w.replica == nil {
-		return 0, 0, ErrReplicaRequired
 	}
 	if err := w.ensureEpochLocked(); err != nil {
 		return 0, 0, err
@@ -636,28 +601,12 @@ func (w *WAL) flushLocked() error {
 		w.mu.Unlock()
 		return errPoisoned
 	}
-	batch := w.unflushed
 	w.unflushed = nil
 	target := w.nextSeq // exclusive upper bound of what this flush makes durable
 	f := w.f
-	replica := w.replica // snapshot under w.mu — SetReplica may swap it concurrently
-	replicaExact := w.replicaExact
-	epoch := w.epoch
-	haRequired := w.haRequired
 	w.mu.Unlock()
 
 	err := f.Sync()
-	if err == nil && len(batch) > 0 {
-		if replica == nil {
-			if haRequired {
-				err = ErrReplicaRequired
-			}
-		} else if exact, ok := replica.(ExactReplica); ok && replicaExact {
-			err = exact.AppendBatchExact(epoch, batch)
-		} else {
-			err = replica.AppendBatch(batch)
-		}
-	}
 	if err != nil {
 		w.mu.Lock()
 		w.poisonLocked()
@@ -670,38 +619,6 @@ func (w *WAL) flushLocked() error {
 	return nil
 }
 
-// AppendReplicated stores a record received from a primary, preserving its LSN
-// (not assigning a new one) so the standby is byte-faithful. It is idempotent: a
-// record whose LSN was already stored is ignored, so a primary that re-streams its
-// log on reconnect/restart does not duplicate records.
-func (w *WAL) AppendReplicated(r Record) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.poisoned {
-		return errPoisoned
-	}
-	if w.initErr != nil {
-		return w.initErr
-	}
-	return w.appendReplicatedBatchLocked([]Record{r})
-}
-
-// AppendReplicatedBatch stores a group-commit batch from the primary, preserving each
-// record's LSN, and fsyncs ONCE for the whole batch (the standby mirror of group
-// commit). It is idempotent (records whose LSN was already stored are skipped) and
-// all-or-nothing: a mid-batch write failure truncates the partial batch and leaves the
-// log exactly as it was, so the primary's flush sees the rejection and halts.
-func (w *WAL) AppendReplicatedBatch(records []Record) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.poisoned {
-		return errPoisoned
-	}
-	if w.initErr != nil {
-		return w.initErr
-	}
-	return w.appendReplicatedBatchLocked(records)
-}
 
 // rollbackToLocked truncates the log back to off, undoing a partially/locally
 // written record after a write/sync/replicate failure (caller holds w.mu), and
@@ -921,9 +838,6 @@ func (w *WAL) Renumber(records []Record) ([]Record, error) {
 	if w.poisoned {
 		return nil, errPoisoned
 	}
-	if w.replica != nil {
-		return nil, errors.New("wal: renumber requires the replica to be detached and reconciled afterward")
-	}
 	if w.hasCheckpoint && !checkpointTerminal(w.checkpoint.Status) {
 		return nil, errors.New("wal: renumber refused with an unresolved checkpoint cut")
 	}
@@ -941,7 +855,7 @@ func (w *WAL) Renumber(records []Record) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	target := metadata{Version: metadataVersion, Epoch: epoch, BaseSeq: 0, BaseDigest: zero, HA: w.haRequired}
+	target := metadata{Version: metadataVersion, Epoch: epoch, BaseSeq: 0, BaseDigest: zero}
 	if err := w.beginTransitionLocked(target, uint64(len(out)), tip); err != nil {
 		return nil, err
 	}
@@ -973,16 +887,10 @@ func (w *WAL) Renumber(records []Record) ([]Record, error) {
 }
 
 // Reset is a destructive standalone/test operation that creates a fresh epoch.
-// It is forbidden once a WAL has joined HA; attach/recovery always reconciles
-// exact prefixes and never resets a member.
 func (w *WAL) Reset() error {
 	w.commitMu.Lock() // exclude the group-commit flush from the rewrite (w.f swap)
 	defer w.commitMu.Unlock()
 	w.mu.Lock()
-	if w.haRequired {
-		w.mu.Unlock()
-		return errors.New("wal: destructive reset is forbidden for an HA generation; reconcile or create a new volume generation")
-	}
 	if w.hasCheckpoint && !checkpointTerminal(w.checkpoint.Status) {
 		w.mu.Unlock()
 		return errors.New("wal: reset refused with an unresolved checkpoint cut")
@@ -1021,9 +929,6 @@ func (w *WAL) Reset() error {
 	w.unflushed = nil
 	w.mu.Unlock()
 	w.durableSeq = 0 // commitMu-protected
-	if w.replica != nil {
-		return w.replica.Reset()
-	}
 	return nil
 }
 
@@ -1032,14 +937,10 @@ func (w *WAL) Reset() error {
 // during the checkpoint survive. It replicates the same LSN watermark so a standby
 // drops exactly the same prefix, regardless of its own record positions.
 func (w *WAL) CompactThrough(throughSeq uint64) error {
-	return w.compactThrough(throughSeq, true)
-}
-
-func (w *WAL) compactThrough(throughSeq uint64, replicate bool) error {
 	w.commitMu.Lock() // exclude the group-commit flush from the rewrite (w.f swap)
 	defer w.commitMu.Unlock()
-	// Make the pending batch durable + replicated first, so compaction operates on a
-	// stable file (no unflushed tail) and the standby applies batch-then-compact in order.
+	// Make the pending batch durable first, so compaction operates on a
+	// stable file (no unflushed tail).
 	if err := w.flushLocked(); err != nil {
 		return err
 	}
@@ -1059,36 +960,7 @@ func (w *WAL) compactThrough(throughSeq uint64, replicate bool) error {
 	if err != nil {
 		return err
 	}
-	// Production HA compacts the standby first. Once a backend commit has landed,
-	// a crash at any later boundary therefore promotes either (a) an already
-	// compacted standby or (b) a standby carrying the replicated landed-cut fact,
-	// which startup reconciliation compacts before replay.
-	exactReplicated := false
-	if replicate && w.replica != nil && w.replicaExact {
-		exact, ok := w.replica.(ExactReplica)
-		if !ok {
-			return ErrLegacyReplica
-		}
-		if err := exact.CompactExact(w.epoch, effective, boundaryDigest); err != nil {
-			return err
-		}
-		exactReplicated = true
-	}
-	if err := w.compactLocalLocked(effective, boundaryDigest); err != nil {
-		if exactReplicated {
-			w.poisonLocked()
-		}
-		return err
-	}
-	if replicate && w.replica != nil && !exactReplicated {
-		var rerr error
-		rerr = w.replica.Compact(effective)
-		if rerr != nil {
-			w.poisonLocked()
-			return rerr
-		}
-	}
-	return nil
+	return w.compactLocalLocked(effective, boundaryDigest)
 }
 
 // compactLocalLocked installs one already-validated local compacted prefix.
@@ -1104,12 +976,10 @@ func (w *WAL) compactLocalLocked(effective uint64, boundaryDigest [32]byte) erro
 			kept = append(kept, r)
 		}
 	}
-	keepMaintenance := w.hasMaintenance && effective <= w.maintenance.SidecarSeq
 	target := metadata{
 		Version: metadataVersion, Epoch: w.epoch, BaseSeq: effective, BaseDigest: boundaryDigest,
-		BaseCommitID: w.baseCommitID, HA: w.haRequired,
+		BaseCommitID: w.baseCommitID,
 		HasCheckpoint: w.hasCheckpoint, Checkpoint: w.checkpoint,
-		HasMaintenance: keepMaintenance, Maintenance: w.maintenance,
 	}
 	if err := w.beginTransitionLocked(target, w.nextSeq, w.tipDigest); err != nil {
 		return err
@@ -1125,9 +995,6 @@ func (w *WAL) compactLocalLocked(effective uint64, boundaryDigest [32]byte) erro
 	w.count = len(kept)
 	w.compactedThrough = effective
 	w.baseDigest = boundaryDigest
-	if !keepMaintenance {
-		w.hasMaintenance, w.maintenance = false, MaintenanceCut{}
-	}
 	for seq := range w.recordHashes {
 		if seq < effective {
 			delete(w.recordHashes, seq)

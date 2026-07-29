@@ -136,7 +136,7 @@ func TestManagedExpiryIsDatabaseTimeDecided(t *testing.T) {
 	}
 	// Advance DATABASE time past the deadline: the fresh decision fact now
 	// proves expiry and the conditional terminal row lands durably.
-	log.advanceDb(SessionLeaseTTL.Milliseconds() + 1_000)
+	log.advanceDb(SessionLeaseTTL().Milliseconds() + 1_000)
 	expired := fs.ExpiredSessions(time.Now())
 	if len(expired) != 1 || !expired[0].Expired || expired[0].SessionID != "pfs-e" {
 		t.Fatalf("database-time expiry: %+v", expired)
@@ -150,23 +150,24 @@ func TestManagedExpiryIsDatabaseTimeDecided(t *testing.T) {
 	}
 }
 
-func TestManagedNoGraceNoPruningNoAmbientRenewal(t *testing.T) {
-	fs, _ := newManagedFS(t)
+func TestManagedExpirySweepIsConditional(t *testing.T) {
+	// Reclaim grace, wall-time pruning, and ambient renewal are structurally
+	// gone (the APIs no longer exist). What remains observable: a host clock
+	// far in the future NOMINATES a session for expiry, but the database
+	// admission fact decides — a live lease is only fenced once database time
+	// reaches the durable deadline, never by the caller's clock alone.
+	fs, log := newManagedFS(t)
 	if err := fs.EstablishSessionWithToken("pfs-g", 1, "o", 8, "tok"); err != nil {
 		t.Fatal(err)
 	}
-	if got := fs.ReclaimableSessions(time.Now()); got != nil {
-		t.Fatalf("managed mode has no reclaim phase: %+v", got)
-	}
-	if fs.IsReclaimableSession("pfs-g", 1, "o", time.Now()) {
-		t.Fatal("managed session reported reclaimable")
-	}
 	before := managedDigest(t, fs)
-	fs.PruneExpiredSessions(time.Now().Add(24 * time.Hour))
-	fs.RenewSessionLease("pfs-g")
-	if got := managedDigest(t, fs); got != before {
-		t.Fatal("wall-time pruning/ambient renewal mutated managed control state")
+	if got := fs.ExpiredSessions(time.Now().Add(24 * time.Hour)); len(got) != 0 {
+		t.Fatalf("host clock alone expired a live database lease: %+v", got)
 	}
+	if got := managedDigest(t, fs); got != before {
+		t.Fatal("a refused expiry sweep mutated managed control state")
+	}
+	_ = log
 }
 
 func TestManagedCheckSlotDispositions(t *testing.T) {
@@ -313,6 +314,8 @@ func TestManagedCoordinationSurvivesColdReplay(t *testing.T) {
 	}
 	control, _ := fs.ManagedControl()
 	grant := checkoutGrant(ref, 1, 1, "proj/data", control.NextCheckoutEpoch())
+	grant.CheckoutChange.WritebackID = "wb-1"
+	grant.CheckoutChange.Key.RequestHash = grant.CheckoutChange.RequestHash()
 	if _, err := fs.CommitEntry(nil, []pfc2.Record{grant}, ""); err != nil {
 		t.Fatalf("checkout: %v", err)
 	}
@@ -320,11 +323,11 @@ func TestManagedCoordinationSurvivesColdReplay(t *testing.T) {
 	if !held || view.Holder != ref {
 		t.Fatalf("checkout not held: %+v %v", view, held)
 	}
-	// A flush watermark under the held grant, in one row (the write-back
+	// A stream watermark under the held grant, in one row (the write-back
 	// flush pattern: user records + FlushAdvance in one PFJ3 entry).
 	flush := pfc2.Record{Kind: pfc2.KindFlushAdvance, FlushAdvance: &pfc2.FlushAdvance{
 		Session: ref, WritebackID: "wb-1", CheckoutPath: "proj/data",
-		CheckoutEpoch: view.Epoch, Through: 42,
+		CheckoutEpoch: view.Epoch, Through: 42, Digest: [32]byte{0x42},
 	}}
 	if _, err := fs.CommitEntry(nil, []pfc2.Record{flush}, ""); err != nil {
 		t.Fatalf("flush: %v", err)
@@ -350,8 +353,8 @@ func TestManagedCoordinationSurvivesColdReplay(t *testing.T) {
 	if v, held := control2.CheckoutAt("proj/data"); !held || v.Holder != ref || v.Epoch != view.Epoch {
 		t.Fatalf("checkout did not survive failover: %+v %v", v, held)
 	}
-	if through, ok := control2.FlushThrough(ref, "wb-1", "proj/data", view.Epoch); !ok || through != 42 {
-		t.Fatalf("flush watermark did not survive failover: %d %v", through, ok)
+	if sv, ok := control2.StreamState("wb-1"); !ok || sv.Through != 42 {
+		t.Fatalf("stream watermark did not survive failover: %+v %v", sv, ok)
 	}
 	// The high-water dominates the pinned/locked inode 5 even though it is
 	// not in the (empty) base tree: a fresh create can never reuse it.

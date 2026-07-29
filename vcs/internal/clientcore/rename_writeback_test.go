@@ -3,39 +3,34 @@ package clientcore
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
 
-// TestWriteBackRenameAcrossSessionRoots pins the cross-root rename fix: a
-// rename whose two names are governed by DIFFERENT write-back sessions used to
-// fail EXDEV, breaking rename(2) callers that never fall back to copy+delete —
-// and with file-grain roots on managed authorities that includes the everyday
-// tmp -> final atomic-write pattern at the volume root. Both sides now flush
-// and the authority executes the rename atomically write-through; each session
-// forgets its half so reads immediately see the moved name.
+// TestWriteBackRenameAcrossSessionRoots pins the cross-scope rename
+// contract: a rename whose two names are covered by DIFFERENT delegations
+// (or one delegated and one shared name) drains the acknowledged stream and
+// executes atomically write-through at the authority; the engine forgets
+// both halves so reads immediately see the moved name. rename(2) callers
+// never see EXDEV.
 func TestWriteBackRenameAcrossSessionRoots(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 
-	// Seed the directories write-through: a top-level mkdir on the write-back
-	// volume would acquire the volume-root ("") session, which covers every
-	// path and would collapse the two roots this test needs into one.
-	seed := dialCore(t, addr, Options{})
-	if _, st := seed.Mkdir(ctx, "work", 0o755); st != fsproto.OK {
-		t.Fatalf("seed mkdir work: %d", st)
-	}
-	if _, st := seed.Mkdir(ctx, "cache", 0o755); st != fsproto.OK {
-		t.Fatalf("seed mkdir cache: %d", st)
-	}
-
 	v := dialCore(t, addr, Options{
-		Owner:         "wb-xroot",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour, // only the rename path itself may flush
+		Owner:  "wb-xroot",
+		WALDir: t.TempDir(),
 	})
+	// The mount creates the top-level directories itself (top-level mkdir is
+	// write-through and never delegates); writes into them then delegate
+	// each directory to THIS session, so there is no cross-session
+	// contention to deny the grants.
+	if _, st := v.Mkdir(ctx, "work", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir work: %d", st)
+	}
+	if _, st := v.Mkdir(ctx, "cache", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir cache: %d", st)
+	}
 	writeDirty := func(path, payload string) {
 		t.Helper()
 		a, st := v.Create(ctx, path, 0o644)
@@ -49,14 +44,13 @@ func TestWriteBackRenameAcrossSessionRoots(t *testing.T) {
 	}
 	writeDirty("work/a.txt", "payload-A")
 	writeDirty("cache/b.txt", "stale-B")
-	so, sn := v.sessions.For("work/a.txt"), v.sessions.For("cache/b.txt")
-	if so == nil || sn == nil || so == sn {
-		t.Fatalf("test premise: want two distinct sessions, got %p and %p", so, sn)
+	if !v.wb.Covers("work/a.txt") || !v.wb.Covers("cache/b.txt") {
+		t.Fatal("test premise: both scopes delegated")
 	}
 
-	// Dirty a replaces dirty b across roots: OK now (this returned EXDEV before).
+	// Dirty a replaces dirty b across scopes: drained + write-through.
 	if st := v.Rename(ctx, "work/a.txt", "cache/b.txt", nil, nil); st != fsproto.OK {
-		t.Fatalf("cross-root rename: status %d, want OK", st)
+		t.Fatalf("cross-scope rename: status %d, want OK", st)
 	}
 	if data, st := v.Read(ctx, "cache/b.txt", nil, 0, 64); st != fsproto.OK || string(data) != "payload-A" {
 		t.Fatalf("read after rename: %q st=%d", data, st)

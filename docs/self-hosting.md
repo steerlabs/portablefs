@@ -12,15 +12,14 @@ Three stateful pieces plus one disposable manager:
 | --- | --- | --- |
 | Postgres | Metadata AND the live journal: volumes, branches, commits, tenants, plus the fenced `pfj`/`pfm`/`pfh` schemas ([journal.md](./journal.md)) | your own (Postgres 16+, synchronous replication for production durability) |
 | Blob store | Content-addressed durable bytes | S3-compatible bucket, or a filesystem directory for a single node |
-| volume-api | Control and history API (`/v1`) | `Dockerfile.volume-api` |
+| volume-api | Control and history API (`/v1`), including the admin GC/integrity endpoints | `Dockerfile.volume-api` |
 | authority-manager | Resolves `teamId + volumeId + branch` to a live VCS authority; production mode spawns one journal child per active branch behind one TCP/TLS router | `Dockerfile.authority-manager` (bundles the Go `vcs` binary) |
-| volume-worker | GC, compaction, integrity checks (one-shot jobs) | `Dockerfile.volume-worker` |
 | history-worker | Resident Go worker that materializes journal cuts into immutable history and services recovery-cut adoption; required in production (see below) | `Dockerfile.history-worker` |
 
 Build the images from source with the Dockerfiles at the repo root (the
 quickstart compose file does exactly this). The release workflow additionally
 publishes prebuilt images to
-`ghcr.io/steerlabs/portablefs-{volume-api,volume-worker,authority-manager,history-worker}`
+`ghcr.io/steerlabs/portablefs-{volume-api,authority-manager,history-worker}`
 once it has run for a given version.
 
 ## Volume API
@@ -28,21 +27,38 @@ once it has run for a given version.
 ```bash
 VOLUME_DATABASE_URL=postgres://...          # required; migrations apply on startup
 VOLUME_API_TOKEN=<admin-token>              # admin credential: tenant provisioning + GC only
-# S3-compatible blob storage (the default backend; VOLUME_BLOB_STORE=s3 is the
-# canonical name, railway-bucket a legacy alias):
-VOLUME_RAILWAY_BUCKET_ENDPOINT=https://...
-VOLUME_RAILWAY_BUCKET_NAME=portablefs-blobs
-VOLUME_RAILWAY_BUCKET_REGION=...
-VOLUME_RAILWAY_BUCKET_ACCESS_KEY_ID=...
-VOLUME_RAILWAY_BUCKET_SECRET_ACCESS_KEY=...
-VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/prod
+# S3-compatible blob storage (the default backend, VOLUME_BLOB_STORE=s3):
+AWS_ENDPOINT_URL=https://...
+AWS_S3_BUCKET_NAME=portablefs-blobs
+AWS_DEFAULT_REGION=auto
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+VOLUME_S3_PREFIX=portablefs/prod            # optional; default "portablefs"
+# VOLUME_S3_SSE=AES256                      # optional server-side encryption header
 # or, single-node filesystem blobs on a durable volume:
 # VOLUME_BLOB_STORE=filesystem
 # VOLUME_FILESYSTEM_BLOB_ROOT=/data/blobs
 ```
 
-The storage package also reads standard `AWS_*` names; see
-[railway-buckets.md](./railway-buckets.md). The API listens on `PORT` (default 8787)
+The retired Railway-era spellings are accepted as compat aliases for one
+release, so existing deployments keep working without config changes:
+
+| Retired name | Canonical name |
+| --- | --- |
+| `VOLUME_BLOB_STORE=railway-bucket` | `VOLUME_BLOB_STORE=s3` |
+| `VOLUME_RAILWAY_BUCKET_ENDPOINT` | `AWS_ENDPOINT_URL` |
+| `VOLUME_RAILWAY_BUCKET_NAME` | `AWS_S3_BUCKET_NAME` |
+| `VOLUME_RAILWAY_BUCKET_REGION` | `AWS_DEFAULT_REGION` |
+| `VOLUME_RAILWAY_BUCKET_URL_STYLE` | `AWS_S3_URL_STYLE` |
+| `VOLUME_RAILWAY_BUCKET_ACCESS_KEY_ID` | `AWS_ACCESS_KEY_ID` |
+| `VOLUME_RAILWAY_BUCKET_SECRET_ACCESS_KEY` | `AWS_SECRET_ACCESS_KEY` |
+| `VOLUME_RAILWAY_BUCKET_PREFIX` | `VOLUME_S3_PREFIX` |
+| `VOLUME_RAILWAY_BUCKET_SSE` | `VOLUME_S3_SSE` |
+
+The endpoint/credential family aliases all-or-nothing, keyed on
+`VOLUME_RAILWAY_BUCKET_ENDPOINT` being set (a deployment carrying both
+spellings resolves exactly as before); prefix and SSE alias independently.
+The API listens on `PORT` (default 8787)
 and answers `GET /healthz` (dependency-free liveness; the quickstart compose probes
 it) plus `GET /readyz` (control readiness: serving phase + a bounded metadata probe
 proving connectivity and a current migration lineage — blob stores are never
@@ -245,44 +261,43 @@ mount log, `portablefs mounts` reports the mount `credential-expired` instead
 of `live`, and recovery (a new key) clears both. The lease-TTL grace between
 revocation and enforcement is unchanged.
 
-## Standalone VCS (Without The Manager)
-
-A single writable VCS with a local file WAL remains the explicit self-host
-single-node shape (run WITHOUT `VCS_PRODUCTION`):
-
-```bash
-VCS_WRITABLE=1
-VCS_WAL=/var/lib/portablefs/vol_123.wal
-VCS_FS_ADDR=<custom-protocol-listen-addr>       # optional FUSE data plane
-VCS_TLS_CERT=... VCS_TLS_KEY=...                # for a network-reachable listener
-VCS_AUTH_TOKEN=<data-plane-token>               # or mTLS via VCS_TLS_CLIENT_CA
-VOLUME_API_URL=... VOLUME_API_TOKEN=... VCS_VOLUME_ID=vol_...
-```
-
-Durability equals that one disk plus the periodic checkpoints to the blob store.
-Optional hardening: `VCS_ENCRYPTION_KEY` seals the WAL and disk cache with
-AES-256-GCM. See [../vcs/README.md](../vcs/README.md) for cache tuning and metrics
-(`VCS_METRICS_ADDR` serves `/healthz`, `/readyz`, `/metrics`).
+## Memory Tuning
 
 Memory tuning: `VCS_CACHE_RAM_MB` (default 256) sizes the read cache, and
 `VCS_DIRTY_RSS_MAX_MB` (default 2048; must be a positive integer) bounds the
 resident memory of uncommitted dirty file blocks — dirty blocks materialise at
 4 MiB granularity, so unbounded they are the process's dominant RAM cost.
 Writes past the bound refuse with `ENOSPC` until a truncate/remove releases
-memory or a checkpoint folds the blocks out; reads, deletes, and metadata
-operations always keep working. Both knobs also pass to managed children
-through the manager's `PORTABLEFS_MANAGED_VCS_EXTRA_ENV_JSON` allowlist — the
-managed child never checkpoints in-process, so its dirty blocks live for the
-whole generation and the bound is what keeps one tenant's write pattern from
-exhausting the shared host's memory.
+memory or a history cut folds the blocks out; reads, deletes, and metadata
+operations always keep working. Both knobs pass to managed children through
+the manager's `PORTABLEFS_MANAGED_VCS_EXTRA_ENV_JSON` allowlist — the managed
+child never checkpoints in-process, so its dirty blocks live for the whole
+generation and the bound is what keeps one tenant's write pattern from
+exhausting the shared host's memory. The manager + PostgreSQL journal is the
+ONLY authority shape: there is no standalone file-WAL VCS.
 
-## Volume Worker
+## Maintenance Jobs (GC And Integrity)
 
-Run `volume-worker` jobs on a schedule with the same database and bucket
-credentials as the API: `integrity` (default command), `gc --dry-run`, then `gc`.
-GC is global mark-and-sweep over content-addressed blobs with a grace window that
-protects the upload-before-commit gap; run `--dry-run` and review counts before the
-first real sweep.
+The retired volume-worker image's jobs are volume-api admin endpoints,
+authenticated with the admin token (`VOLUME_API_TOKEN`):
+
+- `POST /v1/admin/gc` with `{ "dryRun": true }` previews, `{}` sweeps, and an
+  optional `graceMs` overrides the one-hour default grace window. GC is global
+  mark-and-sweep over content-addressed blobs; the grace window protects the
+  upload-before-commit gap. Review the dry-run counts before the first real
+  sweep.
+- `GET /v1/admin/integrity` is a read-only walk verifying every blob and chunk
+  referenced by a committed manifest exists in the blob store.
+
+Schedule them with any cron that can curl, for example:
+
+```bash
+# nightly GC preview + sweep, weekly integrity
+0 4 * * *  curl -fsS -X POST -H "authorization: Bearer $VOLUME_API_TOKEN" \
+  -H "content-type: application/json" -d '{}' https://volume-api.internal/v1/admin/gc
+0 5 * * 0  curl -fsS -H "authorization: Bearer $VOLUME_API_TOKEN" \
+  https://volume-api.internal/v1/admin/integrity
+```
 
 ## Backup And Restore
 
@@ -310,7 +325,7 @@ committed head.
 - **Migrations are append-only.** The volume-api applies pending migrations on
   startup; released migration files are never edited. Upgrade the API first (old
   workers and VCS binaries keep working against the additively-migrated schema),
-  then the worker, then the manager.
+  then the history worker, then the manager.
 - **Manager restarts are epoch handoffs.** A restarted production manager claims
   a fresh epoch and demand-starts fresh children that cold-replay from the
   journal; mounts reacquire leases and reconnect. Still, upgrade it during a

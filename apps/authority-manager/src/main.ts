@@ -1,9 +1,6 @@
 import {
-  type AuthorityRegistry,
+  assertProductionAuthorityManagerMode,
   createAuthorityManagerServer,
-  createEnvAuthorityRegistry,
-  readAuthorityManagerMode,
-  validateEnvAuthorityRegistryConfig,
 } from "./server.js";
 import {
   createAuthorityDataPlaneRouterServer,
@@ -28,11 +25,7 @@ const port = Number(process.env.PORT || process.env.AUTHORITY_MANAGER_PORT || 87
 const authToken = process.env.PORTABLEFS_AUTHORITY_MANAGER_TOKEN?.trim();
 const allowUnauthenticated =
   process.env.PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED === "1";
-const authorityMode = readAuthorityManagerMode(process.env);
-const requireAuthorityHealth =
-  authorityMode === "env" &&
-  (process.env.NODE_ENV === "production" ||
-    process.env.PORTABLEFS_AUTHORITY_MANAGER_REQUIRE_HEALTH === "1");
+assertProductionAuthorityManagerMode(process.env);
 
 // Unauthenticated session minting hands out data-plane mount credentials, so
 // it is honored ONLY in an explicit local-development environment. Keying it
@@ -51,70 +44,55 @@ if (!authToken && !allowUnauthenticated) {
   );
 }
 
-let registry: AuthorityRegistry;
-let dataPlaneRouter:
-  | ReturnType<typeof createAuthorityDataPlaneRouterServer>
-  | undefined;
-let accessLeases: AccessLeaseHandler | undefined;
-let productionRegistry: ProductionAuthorityRegistry | undefined;
-let managerControlStore: ManagerControlStore | undefined;
 // Manager metrics registry: fixed-name scalars only (strongest cardinality
 // bound); GET /metrics renders it plus the bounded, allowlisted child
 // aggregation, behind the same bearer auth as every other control route.
 const managerMetrics = new ManagerMetrics();
-let childMetricsCollector: ChildMetricsCollector | undefined;
-let leaseTunnelRegistry: LeaseTunnelRegistry | undefined;
-if (authorityMode === "production") {
-  // PRODUCTION (journal-native): singleton fenced manager + one disposable
-  // child per active branch, remote journal/control truth. No persistent
-  // work directory, no local WAL, no standby pair, no file ledger.
-  validateRouterConfig();
-  managerControlStore = loadManagerControlStore();
-  productionRegistry = await createProductionAuthorityRegistry(process.env, {
-    controlStore: managerControlStore,
-  });
-  const leases = productionRegistry.leases;
-  accessLeases = leases;
-  // Lease lifecycle fences live tunnels: end closes them, rotation closes
-  // older-generation ones.
-  const tunnelRegistry = new LeaseTunnelRegistry();
-  leaseTunnelRegistry = tunnelRegistry;
-  leases.onLeaseEnded((event) => tunnelRegistry.closeLease(event.accessLeaseId));
-  leases.onLeaseRotated((accessLeaseId, tokenGeneration) =>
-    tunnelRegistry.closeSupersededGenerations(accessLeaseId, tokenGeneration)
-  );
-  dataPlaneRouter = createAuthorityDataPlaneRouterServer(leases, {
-    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH
-      ? { tlsCertPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH }
-      : {}),
-    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH
-      ? { tlsKeyPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH }
-      : {}),
-    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM
-      ? { tlsCertPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM }
-      : {}),
-    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM
-      ? { tlsKeyPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM }
-      : {}),
-    tunnelRegistry,
-  });
-  listenTcp(dataPlaneRouter, process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR!);
-  registry = productionRegistry;
 
-  // Child metrics aggregation: the manager is the ONLY scraper of the
-  // children's loopback /metrics; the collector enforces loopback targets,
-  // per-child + overall deadlines, byte caps, single-flight and TTL cache.
-  const boundRegistry = productionRegistry;
-  childMetricsCollector = new ChildMetricsCollector({
-    targets: () => boundRegistry.metricsTargets(),
-    metrics: managerMetrics,
-  });
-} else {
-  validateEnvAuthorityRegistryConfig(process.env, {
-    requireHealth: requireAuthorityHealth,
-  });
-  registry = createEnvAuthorityRegistry(process.env);
-}
+// PRODUCTION (journal-native): singleton fenced manager + one disposable
+// child per active branch, remote journal/control truth. No persistent
+// work directory, no local WAL, no standby pair, no file ledger.
+validateRouterConfig();
+const managerControlStore: ManagerControlStore = loadManagerControlStore();
+const productionRegistry: ProductionAuthorityRegistry = await createProductionAuthorityRegistry(
+  process.env,
+  { controlStore: managerControlStore }
+);
+const accessLeases: AccessLeaseHandler = productionRegistry.leases;
+// Lease lifecycle fences live tunnels: end closes them, rotation closes
+// older-generation ones.
+const leaseTunnelRegistry = new LeaseTunnelRegistry();
+productionRegistry.leases.onLeaseEnded((event) =>
+  leaseTunnelRegistry.closeLease(event.accessLeaseId)
+);
+productionRegistry.leases.onLeaseRotated((accessLeaseId, tokenGeneration) =>
+  leaseTunnelRegistry.closeSupersededGenerations(accessLeaseId, tokenGeneration)
+);
+const dataPlaneRouter = createAuthorityDataPlaneRouterServer(productionRegistry.leases, {
+  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH
+    ? { tlsCertPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH }
+    : {}),
+  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH
+    ? { tlsKeyPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH }
+    : {}),
+  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM
+    ? { tlsCertPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM }
+    : {}),
+  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM
+    ? { tlsKeyPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM }
+    : {}),
+  tunnelRegistry: leaseTunnelRegistry,
+});
+listenTcp(dataPlaneRouter, process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR!);
+const registry = productionRegistry;
+
+// Child metrics aggregation: the manager is the ONLY scraper of the
+// children's loopback /metrics; the collector enforces loopback targets,
+// per-child + overall deadlines, byte caps, single-flight and TTL cache.
+const childMetricsCollector = new ChildMetricsCollector({
+  targets: () => productionRegistry.metricsTargets(),
+  metrics: managerMetrics,
+});
 
 const releaseIdentity = loadAuthorityManagerReleaseIdentity(process.env);
 console.log(
@@ -136,25 +114,22 @@ const server = createAuthorityManagerServer({
     ...(leaseTunnelRegistry ? { tunnels: leaseTunnelRegistry } : {}),
   }),
   readiness: async () => {
-    if (authorityMode === "env") {
-      return true;
-    }
     // Production readiness: the live epoch claim (inside the DB-derived
     // local monotonic deadline), the router, the lease service, AND a
     // bounded control-store reachability probe. Fail closed on any of them.
-    if (!dataPlaneRouter?.listening || !(accessLeases?.healthy() ?? true)) {
+    if (!dataPlaneRouter.listening || !accessLeases.healthy()) {
       return false;
     }
-    if (!productionRegistry?.ready()) {
+    if (!productionRegistry.ready()) {
       return false;
     }
-    const probe = await managerControlStore?.healthProbe?.().catch(() => null);
+    const probe = await managerControlStore.healthProbe?.().catch(() => null);
     return probe?.ok === true;
   },
 });
 
 server.listen(port, () => {
-  console.log(`PortableFS authority manager listening on :${port} (${authorityMode})`);
+  console.log(`PortableFS authority manager listening on :${port} (production)`);
 });
 
 let shuttingDown = false;
@@ -177,10 +152,10 @@ async function shutdown(signal: string): Promise<void> {
   forceExit.unref?.();
   await Promise.allSettled([
     closeServer(server),
-    dataPlaneRouter ? closeServer(dataPlaneRouter) : Promise.resolve(),
-    registry.shutdown ? registry.shutdown() : Promise.resolve(),
+    closeServer(dataPlaneRouter),
+    registry.shutdown(),
   ]);
-  await managerControlStore?.close().catch(() => undefined);
+  await managerControlStore.close().catch(() => undefined);
   clearTimeout(forceExit);
   process.exit(0);
 }
@@ -201,7 +176,6 @@ function loadManagerControlStore(): ManagerControlStore {
 
 function validateRouterConfig(): void {
   validateAuthorityDataPlaneRouterConfig({
-    authorityMode,
     ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR
       ? { listenAddr: process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR }
       : {}),

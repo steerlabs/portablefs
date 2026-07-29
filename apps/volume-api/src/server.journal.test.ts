@@ -311,6 +311,69 @@ describe("cut-based snapshots", () => {
     const body = (await response.json()) as { snapshots: SnapshotCutRecord[] };
     expect(body.snapshots.map((snapshot) => snapshot.state)).toEqual(["pending", "ready"]);
   });
+
+  test("releases a named snapshot with the verified tenant and the percent-decoded name", async () => {
+    const metadata = fakeMetadata();
+    asTenant(metadata);
+    const released: Array<{ tenantId: string; volumeId: string; name: string }> = [];
+    withHistory(metadata, {
+      releaseSnapshotCut: async (input: { tenantId: string; volumeId: string; name: string }) => {
+        released.push(input);
+        return { cutIds: ["hcut_1"], snapshotConsumersReleased: "1" };
+      },
+    });
+    const baseUrl = await startServer({ metadata });
+    const response = await fetch(
+      `${baseUrl}/v1/volumes/vol_a/snapshots/${encodeURIComponent("before rebase")}`,
+      { method: "DELETE", headers: TENANT_HEADERS }
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      released: { cutIds: ["hcut_1"], snapshotConsumersReleased: "1" },
+    });
+    expect(released).toEqual([{ tenantId: "t1", volumeId: "vol_a", name: "before rebase" }]);
+  });
+
+  test("an unknown snapshot name (PF007) answers the non-enumerating 404", async () => {
+    const metadata = fakeMetadata();
+    asTenant(metadata);
+    withHistory(metadata, {
+      releaseSnapshotCut: async () => {
+        throw Object.assign(new Error("volume vol_a has no ready snapshot named ghost"), {
+          code: "PF007",
+        });
+      },
+    });
+    const baseUrl = await startServer({ metadata });
+    const response = await fetch(`${baseUrl}/v1/volumes/vol_a/snapshots/ghost`, {
+      method: "DELETE",
+      headers: TENANT_HEADERS,
+    });
+    expect(response.status).toBe(404);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "VOLUME_NOT_FOUND"
+    );
+  });
+
+  test("another tenant's volume is invisible to snapshot release (404 before the repository)", async () => {
+    const metadata = fakeMetadata();
+    asTenant(metadata);
+    metadata.tenantOwnsVolume = async () => false;
+    withHistory(metadata, {
+      releaseSnapshotCut: async () => {
+        throw new Error("the guard must refuse before the release repository");
+      },
+    });
+    const baseUrl = await startServer({ metadata });
+    const response = await fetch(`${baseUrl}/v1/volumes/vol_foreign/snapshots/keeper`, {
+      method: "DELETE",
+      headers: TENANT_HEADERS,
+    });
+    expect(response.status).toBe(404);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "VOLUME_NOT_FOUND"
+    );
+  });
 });
 
 describe("branch and fork gating on cut states", () => {
@@ -792,6 +855,12 @@ function fakeMetadata(): MetadataRepository {
     addBlobRefs: async () => undefined,
     filterUnreferencedBlobs: fail,
   };
+}
+
+// Attaches a partial history repository the way production wiring does:
+// server routes reach it through the untyped `history` property.
+function withHistory(metadata: MetadataRepository, history: unknown): void {
+  (metadata as MetadataRepository & { history?: unknown }).history = history;
 }
 
 function asTenant(metadata: MetadataRepository, tenantId = "t1"): string {

@@ -255,21 +255,21 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 	unmounted = true
 }
 
-// TestFUSELocalDirsComposeWithFast proves grafts and --fast (write-back +
-// negative cache) compose: volume writes flush through the session path while
-// graft writes stay local.
-func TestFUSELocalDirsComposeWithFast(t *testing.T) {
+// TestFUSELocalDirsComposeWithWriteback proves grafts and the adaptive
+// write-back engine compose: volume writes drain to the authority at unmount
+// while graft writes stay local.
+func TestFUSELocalDirsComposeWithWriteback(t *testing.T) {
 	skipWithoutFUSE(t)
 	addr := newTestAuthority(t)
 	seed := seedClient(t, addr)
 
 	mnt := t.TempDir()
-	m, err := mountFUSE(addr, &sessionTokenSource{}, mnt, perfOptionsFromEnv(true, func(string) string { return "" }), localDirsMountConfig{
+	m, err := mountFUSE(addr, &sessionTokenSource{}, mnt, perfOptionsFromEnv(func(string) string { return "" }), localDirsMountConfig{
 		dirs:        []string{"node_modules"},
 		backingRoot: filepath.Join(t.TempDir(), "local", "sid"),
 	})
 	if err != nil {
-		t.Fatalf("mountFUSE --fast: %v", err)
+		t.Fatalf("mountFUSE: %v", err)
 	}
 	defer func() { m.Unmount(); m.Wait() }()
 
@@ -282,12 +282,12 @@ func TestFUSELocalDirsComposeWithFast(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mnt, "src.go"), []byte("shared"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// The unmount flush barrier drains the write-back session.
+	// The unmount drain barrier flushes any delegated write-back tail.
 	m.Unmount()
 	m.Wait()
 
 	if data, st, err := seed.Read("src.go", 0, 64); err != nil || st != fsproto.OK || string(data) != "shared" {
-		t.Fatalf("volume write must flush under --fast: %q st=%d err=%v", data, st, err)
+		t.Fatalf("volume write must drain at unmount: %q st=%d err=%v", data, st, err)
 	}
 	if _, st, err := seed.Getattr("node_modules/dep.js"); err != nil || st != fsproto.ENOENT {
 		t.Fatalf("graft write must never flush: st=%d err=%v", st, err)

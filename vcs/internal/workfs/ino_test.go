@@ -197,66 +197,6 @@ func TestReplayUsesLoggedCreateIno(t *testing.T) {
 	}
 }
 
-// A checkpoint manifest contains only live inodes, so the allocator cursor
-// must survive in the control sidecar even when the highest allocated inode
-// was deleted before the cut. Otherwise restart would silently reuse a
-// stable identity and an old handle could alias an unrelated new file.
-func TestLegacyCheckpointPreservesDeletedInodeHighWater(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		reset bool
-	}{
-		{name: "compact"},
-		{name: "reset", reset: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			walPath := filepath.Join(t.TempDir(), "wal.log")
-			w, err := wal.Open(walPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			fs, err := New(nil, &fakeBlobs{data: map[string][]byte{}}, w)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := fs.MutateAs(wal.Record{Op: wal.OpCreate, Path: "gone", Mode: 0o644, Ino: 10_000}, "M"); err != nil {
-				t.Fatal(err)
-			}
-			if err := fs.MutateAs(wal.Record{Op: wal.OpRemove, Path: "gone"}, "M"); err != nil {
-				t.Fatal(err)
-			}
-			snap := fs.Snapshot()
-			entries := snapshotBackendEntries(snap)
-			if tc.reset {
-				if err := fs.ResetWAL(); err != nil {
-					t.Fatal(err)
-				}
-			} else if err := fs.CompactWAL(snap); err != nil {
-				t.Fatal(err)
-			}
-			if err := w.Close(); err != nil {
-				t.Fatal(err)
-			}
-
-			reopened, err := wal.Open(walPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer reopened.Close()
-			restarted, err := New(entries, &fakeBlobs{data: map[string][]byte{}}, reopened)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := restarted.MutateAs(wal.Record{Op: wal.OpCreate, Path: "new", Mode: 0o644}, "M"); err != nil {
-				t.Fatal(err)
-			}
-			if got := inoAt(t, restarted, "new"); got <= 10_000 {
-				t.Fatalf("post-checkpoint ino = %d, want > 10000 (deleted identity was reused)", got)
-			}
-		})
-	}
-}
-
 // TestReplayHandleWriteToMissingInoSkips guards the STRICT (no-name-fallback) handle resolution: a
 // replayed ino-addressed write whose ino is absent from byIno — a legacy pre-identity WAL that
 // re-numbered the create, or a reaped inode — must FAIL CLOSED (skip), never fall back to the name.

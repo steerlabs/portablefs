@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"sort"
@@ -83,7 +84,7 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 		}
 	}
 	// Xattrs is a PER-ATTACH capability: true exactly when the attached
-	// authority advertised FeatXattrs on this attach's protocol handshake —
+	// authority serves xattrs natively (baseline in v5) —
 	// never hardcoded, so an attach to an older authority keeps the frontend
 	// on its fallback behavior (AppleDouble sidecars) while a native-capable
 	// attach serves xattrs first-class.
@@ -91,7 +92,7 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 		Root: root.item, RootAttr: fsAttrToLocal(root.attr, root.item),
 		VolumeID: a.volumeID, Branch: a.branch, VolumeName: a.volumeName,
 		Capabilities: pfslocal.Capabilities{
-			Symlinks: true, HardLinks: vol != nil && vol.SupportsHardLinks(), Xattrs: vol != nil && vol.SupportsXattrs(), CaseSensitive: true,
+			Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
 			MaxNameBytes: 255, PreferredIOSize: 1 << 20,
 		},
 	}, 0
@@ -543,8 +544,7 @@ func (a *attach) close(req *pfslocal.CloseRequest) (int32, error) {
 	if closePath == "" {
 		closePath = h.path
 	}
-	vol.CloseHandle(closePath, h.state)
-	return 0, nil
+	return toDarwinErr(vol.CloseHandle(closePath, h.state)), nil
 }
 
 func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal.ReadReply, int32) {
@@ -632,7 +632,7 @@ func (a *attach) fsync(_ context.Context, req *pfslocal.FsyncRequest) int32 {
 	if eno != 0 {
 		return eno
 	}
-	return toDarwinErr(vol.FsyncPath(h.path))
+	return toDarwinErr(vol.FsyncHandle(h.path, h.state))
 }
 
 func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfslocal.CreateReply, int32) {
@@ -646,7 +646,7 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 	if eno != 0 {
 		return nil, eno
 	}
-	defer a.lockNames(dir.path)()
+	defer a.lockNames(entryKey(p))()
 	if graft := a.localDirFor(p); graft != "" {
 		if p == graft {
 			// A graft rule is a directory rule: the root can only ever be a
@@ -716,7 +716,7 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 	if eno != 0 {
 		return nil, eno
 	}
-	defer a.lockNames(dir.path)()
+	defer a.lockNames(entryKey(p))()
 	if graft := a.localDirFor(p); graft != "" {
 		if p == graft {
 			// Creating the graft root itself needs the machine-local scaffold
@@ -755,8 +755,16 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 }
 
 func (a *attach) remove(ctx context.Context, req *pfslocal.RemoveRequest) int32 {
-	a.nsMu.RLock()
-	defer a.nsMu.RUnlock()
+	if req.Directory {
+		// rmdir holds nsMu EXCLUSIVELY (like rename): its emptiness check
+		// must be atomic against a racing create INSIDE the dir, which
+		// per-(dir,name) stripes cannot exclude.
+		a.nsMu.Lock()
+		defer a.nsMu.Unlock()
+	} else {
+		a.nsMu.RLock()
+		defer a.nsMu.RUnlock()
+	}
 	dir, eno := a.item(req.Dir)
 	if eno != 0 {
 		return eno
@@ -765,10 +773,8 @@ func (a *attach) remove(ctx context.Context, req *pfslocal.RemoveRequest) int32 
 	if eno != 0 {
 		return eno
 	}
-	if req.Directory {
-		defer a.lockNames(dir.path, p)()
-	} else {
-		defer a.lockNames(dir.path)()
+	if !req.Directory {
+		defer a.lockNames(entryKey(p))()
 	}
 	if graft := a.localDirFor(p); graft != "" {
 		return a.removeLocal(p, req.Directory)
@@ -858,6 +864,16 @@ func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 
 			return darwinEEXIST
 		}
 	}
+	// Snapshot the daemon-side identities under a.mu, but never hold that
+	// mutex across the authority RPC. Rename can wait for a delegation recall;
+	// the invalidation consumers need a.mu to apply and acknowledge the
+	// batches that let the holder's drain/barrier finish. Holding it here
+	// creates a closed recall -> invalidation ack -> a.mu -> rename cycle.
+	//
+	// nsMu is exclusive for the whole operation, so no local frontend
+	// namespace mutation can change these bindings between the snapshot and
+	// the commit below. Authority invalidations may inspect the registry in
+	// parallel, which is precisely why a.mu must remain available.
 	a.mu.Lock()
 	if a.detached {
 		a.mu.Unlock()
@@ -872,11 +888,12 @@ func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 
 	if dst != nil {
 		dstState = dst.state
 	}
+	a.mu.Unlock()
 	st := vol.Rename(ctx, oldp, newp, srcState, dstState)
 	if st != fsproto.OK {
-		a.mu.Unlock()
 		return toDarwinErr(st)
 	}
+	a.mu.Lock()
 	if dst != nil {
 		a.removePathLocked(newp)
 	}
@@ -902,7 +919,7 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 	if eno != 0 {
 		return nil, eno
 	}
-	unlock := a.lockNames(parentPath(src.path), dir.path)
+	unlock := a.lockNames(entryKey(src.path), entryKey(newp))
 	defer unlock()
 
 	fromGraft := a.localDirFor(src.path)
@@ -966,7 +983,7 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 	if eno != 0 {
 		return nil, eno
 	}
-	defer a.lockNames(dir.path)()
+	defer a.lockNames(entryKey(p))()
 	if graft := a.localDirFor(p); graft != "" {
 		if p == graft {
 			// A graft rule is a directory rule: the root can only ever be a
@@ -1037,6 +1054,25 @@ func (a *attach) statfs() (*pfslocal.StatfsReply, int32) {
 		BlockSize: uint64(st.Bsize), TotalBlocks: st.Blocks, FreeBlocks: st.Bfree,
 		TotalFiles: st.Files, FreeFiles: st.Ffree,
 	}, 0
+}
+
+// syncVolume serves the frontend's REAL volume barrier (FSKit synchronize):
+// authority-durable, applied, and acknowledged by every live protocol
+// subscriber at its supported frontend boundary — or an ERROR. There is no degraded local-only
+// success; the un-flushed tail stays crash-safe in the local WAL and the
+// failure surfaces on the attach state and to the kernel caller.
+func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32) {
+	vol, eno := a.volOrErr()
+	if eno != 0 {
+		return nil, eno
+	}
+	if err := vol.SyncVolume(); err != nil {
+		recs, bytes := vol.WriteBackPending()
+		log.Printf("portablefsd: %s: volume sync FAILED: %v (%d records / %d bytes stay durable in the local WAL and flush when the authority answers)", a.ref, err, recs, bytes)
+		a.setErr(err)
+		return nil, darwinEIO
+	}
+	return &pfslocal.SyncVolumeReply{}, 0
 }
 
 func (a *attach) reclaim(req *pfslocal.ReclaimRequest) int32 {
@@ -1124,7 +1160,7 @@ func max64(a, b int64) int64 {
 }
 
 // Extended attributes: forwarded natively to the authority when the attach
-// advertises FeatXattrs (see rootReply's per-attach capability). Reads hold
+// serves xattrs natively (see rootReply's per-attach capability). Reads hold
 // nsMu shared like getattr; mutations additionally take the item's parent
 // directory stripe (lockNames) like the other file-grain mutations, so the
 // daemon-local registry view stays stable across the authority round trip.
@@ -1187,7 +1223,7 @@ func (a *attach) xattrSet(ctx context.Context, req *pfslocal.XattrSetRequest) (*
 	if eno != 0 {
 		return nil, eno
 	}
-	defer a.lockNames(parentPath(rec.path))()
+	defer a.lockNames(entryKey(rec.path))()
 	var flags uint8
 	if req.CreateOnly {
 		flags |= wal.XattrCreate
@@ -1215,7 +1251,7 @@ func (a *attach) xattrRemove(ctx context.Context, req *pfslocal.XattrRemoveReque
 	if eno != 0 {
 		return nil, eno
 	}
-	defer a.lockNames(parentPath(rec.path))()
+	defer a.lockNames(entryKey(rec.path))()
 	if st := vol.Removexattr(ctx, rec.path, rec.state, req.Name); st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}

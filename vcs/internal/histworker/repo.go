@@ -33,11 +33,23 @@ type Repository interface {
 	// RecordCopyReceipt records one VERIFIED copy: written to the exact
 	// key, read back from that key, size matched, plaintext re-hashed.
 	RecordCopyReceipt(ctx context.Context, cutID string, claimEpoch int64, digest string, incarnation int64, failureDomain, storageKey string, size int64) error
+	// RecordCopyReceipts records many verified copies in ONE transaction
+	// (1..4096 per call); every element carries the exact single-receipt
+	// proof obligations.
+	RecordCopyReceipts(ctx context.Context, cutID string, claimEpoch int64, receipts []CopyReceipt) error
 	AddCutObjects(ctx context.Context, cutID string, claimEpoch int64, closure string, digests []string) error
+	// AddCutObjectsFromBase copies the adopted same-branch base cut's
+	// registered closure rows into this cut server-side and returns the
+	// final per-closure totals (the O(delta) publication path).
+	AddCutObjectsFromBase(ctx context.Context, cutID string, claimEpoch int64) (ClosureTotals, error)
 	MarkCutReady(ctx context.Context, ready ReadyFacts) error
 	// LocateObject returns the recorded exact keys of the CURRENT
 	// incarnation's present copies (nil when unknown/tombstoned).
 	LocateObject(ctx context.Context, tenantID, kind, digest string) (*ObjectLocation, error)
+	// LocateObjects batch-resolves recorded locations in one snapshot
+	// (1..512 digests per call); unknown/tombstoned digests are absent
+	// from the result map.
+	LocateObjects(ctx context.Context, tenantID, kind string, digests []string) (map[string]*ObjectLocation, error)
 	// LocateLegacyBlob returns the recorded legacy blob location (nil when
 	// the digest is unknown).
 	LocateLegacyBlob(ctx context.Context, cutID string, claimEpoch int64, digest string) (*LegacyBlobLocation, error)
@@ -57,6 +69,12 @@ type Repository interface {
 	RecordScrubReceipt(ctx context.Context, workerID string, c ScrubCopy, ok bool) error
 	ClaimRepairs(ctx context.Context, workerID string, limit int, leaseTTLMs int64) ([]RepairClaim, error)
 	RecordRepairReceipt(ctx context.Context, workerID string, claim RepairClaim, storageKey string) error
+
+	// ── retention ───────────────────────────────────────────────────────
+	// RetentionRelease releases superseded adoption consumers (bounded
+	// batch) and returns the released count; the GC sweep collects the
+	// cuts the retention window no longer roots.
+	RetentionRelease(ctx context.Context, limit int) (int64, error)
 
 	// ── GC sweep ────────────────────────────────────────────────────────
 	ClaimSweep(ctx context.Context, workerID string, minAgeMs, leaseTTLMs int64) (*SweepClaim, error)
@@ -157,6 +175,26 @@ func DecodeCutClaim(raw []byte) (CutClaim, error) {
 type ObjectIntent struct {
 	Digest string `json:"digest"`
 	Size   int64  `json:"size"`
+}
+
+// ClosureTotals reports a cut's registered closure rows after the
+// server-side base copy (counts and byte sums per closure).
+type ClosureTotals struct {
+	UserObjectCount     int64
+	UserObjectBytes     int64
+	RecoveryObjectCount int64
+	RecoveryObjectBytes int64
+}
+
+// CopyReceipt is one verified copy fact for the batched receipt call: the
+// caller wrote the exact per-incarnation key, read it back from that key,
+// size-matched, and re-hashed the plaintext before constructing this.
+type CopyReceipt struct {
+	Digest        string `json:"digest"`
+	Incarnation   int64  `json:"incarnation"`
+	FailureDomain string `json:"failureDomain"`
+	StorageKey    string `json:"storageKey"`
+	Size          int64  `json:"size"`
 }
 
 // ReadyFacts carries every argument of the atomic ready publication.

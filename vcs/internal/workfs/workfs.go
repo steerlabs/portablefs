@@ -58,7 +58,7 @@ var (
 	replaySkipsTotal = metrics.Default.Counter("vcs_wal_replay_skips")
 )
 
-// POSIX rename/dir errors. The messages match the fsproto + NFS error mappers so a
+// POSIX rename/dir errors. The messages match the fsproto error mapper so a
 // client sees the right errno (ENOTEMPTY / EISDIR / ENOTDIR / EINVAL).
 var (
 	errNotEmpty      = errors.New("directory not empty")
@@ -265,14 +265,10 @@ type FS struct {
 	xattrs map[uint64]map[string][]byte
 
 	subsMu  sync.Mutex
-	subs    map[int]chan []coherence.Invalidation // invalidation-batch subscribers (FUSE clients)
+	subs    map[int]chan coherence.Batch // invalidation-batch subscribers (FUSE clients)
 	nextSub int
+	invPos  uint64 // monotonic invalidation-stream position (last published)
 
-	// ctl is the replicated control state for exact mount sessions: the
-	// durable session table and per-slot exact-once outcomes (see control.go).
-	// Guarded by mu like the tree; every transition rides a wal.OpControl
-	// record (or the Envelope on the user record it describes).
-	ctl controlState
 	// renewLocks serialize session lifecycle transitions per session id, so
 	// concurrent establishes/renewals of one session do not append redundant
 	// (though harmless) control records.
@@ -323,37 +319,15 @@ func NewWithCache(entries []backend.Entry, blobs content.BlobReader, w *wal.WAL,
 	for _, r := range records {
 		fs.epoch++
 		if r.Op.IsControl() {
-			// Session/slot control records reconstruct exactly-once state.
-			// A conditional lease expiry that lost to a renewal replays as
-			// the same deterministic phantom it was live; anything else
-			// fails CLOSED (never guess at exactly-once state).
-			if err := fs.applyControlRecord(r); err != nil {
-				if errors.Is(err, errLeaseRenewed) {
-					replaySkipsTotal.Inc()
-					continue
-				}
-				return nil, fmt.Errorf("wal replay control record: %w", err)
-			}
-			continue
+			// Session/slot control records are the retired legacy control
+			// shadow; the raw data plane fails closed rather than guess at
+			// exactly-once state.
+			return nil, fmt.Errorf("wal replay: legacy control record at LSN %d (the raw WAL data plane carries no session store)", r.Seq)
 		}
-		resolvedOffset := r.Offset
-		if r.Op == wal.OpWrite && r.Append {
-			if target := fs.resolveForRW(r.Path, r.Ino); target != nil {
-				resolvedOffset = target.curSize()
-			}
-		}
-		orphanIno, _, applyErr := fs.applyMutationReplay(r)
 		if r.Env.Valid() {
-			// Rebuild the slot outcome exactly as live apply recorded it —
-			// including deterministic guard rejections — so a retried
-			// identity replays its original essential response after a
-			// restart or promotion. Versions are generation-scoped and replay
-			// as 0 (the reconnecting client refreshes under the new
-			// generation).
-			if recErr := fs.recordSlotOutcomeLocked(r.Env, fs.exactOutcomeLocked(r, orphanIno, 0, resolvedOffset, applyErr)); recErr != nil {
-				return nil, fmt.Errorf("wal replay exact outcome: %w", recErr)
-			}
+			return nil, fmt.Errorf("wal replay: exact envelope at LSN %d (exact sessions are managed-only)", r.Seq)
 		}
+		_, _, applyErr := fs.applyMutationReplay(r)
 		if applyErr != nil {
 			if benignReplayError(applyErr) {
 				// The mutation no longer applies cleanly. Two cases reach here and both
@@ -369,11 +343,6 @@ func NewWithCache(entries []backend.Entry, blobs content.BlobReader, w *wal.WAL,
 			return nil, fmt.Errorf("wal replay record %+v: %w", r, applyErr)
 		}
 	}
-	// Durable live sessions replayed from the WAL get the bounded local
-	// reclaim grace: their volatile coordination state died with the old
-	// process, and the serving layer withholds conflicting grants until each
-	// resumes (token-proven) or the window elapses.
-	fs.grantStartupReclaimLocked(time.Now())
 	return fs, nil
 }
 
@@ -1405,10 +1374,7 @@ func (fs *FS) applyMutationAs(r wal.Record, owner string) (uint64, bool, error) 
 	now := time.Now()
 	switch r.Op {
 	case wal.OpControl:
-		// Control records inside an atomic batch (a flush's watermark
-		// advance) apply to control state, never the user namespace: no
-		// version stamp, no invalidation. Replay routes them identically.
-		return 0, false, fs.applyControlRecord(r)
+		return 0, false, fmt.Errorf("vcs: legacy control record (the raw WAL data plane carries no session store)")
 	case wal.OpCreate:
 		changed, err := fs.applyCreate(r.Path, "file", modeFromUnix(r.Mode), "", r.Ino, r.Excl, now)
 		return 0, changed, err
@@ -2785,32 +2751,6 @@ func (fs *FS) EnsureSnapshotDurable(snap *Snapshot) error {
 	return fs.wal.CommitThrough(snap.walWatermark - 1)
 }
 
-// CompactWAL drops the WAL records the snapshot committed, keeping any appended
-// since (a write that raced the checkpoint stays recoverable). Replaces a full
-// reset so no acknowledged write is lost across a checkpoint.
-//
-// Before compacting, the current control state (sessions, exact-once slot
-// outcomes, tombstones, and inode allocator cursor/high-water) is appended as
-// one snapshot record. Control history below the cut would otherwise vanish,
-// and a restart could forget retryable outcomes or reuse an old stable inode.
-// The snapshot's LSN is at or above the cut, so it survives compaction and
-// replays before (or merges monotonically with) any surviving increments.
-//
-// The live xattr state gets the identical treatment (appendXattrSnapshot):
-// the backend manifest cannot carry xattrs, so the xattr records below the
-// cut would otherwise vanish and a restart would silently strip every live
-// xattr. Re-appended path-addressed OpSetxattr records at/above the cut
-// survive the compaction and replay idempotently.
-func (fs *FS) CompactWAL(snap *Snapshot) error {
-	if err := fs.appendControlSnapshot(); err != nil {
-		return err
-	}
-	if err := fs.appendXattrSnapshot(); err != nil {
-		return err
-	}
-	return fs.wal.CompactThrough(snap.walWatermark)
-}
-
 // PoisonedCh exposes the durable store's poison signal so the serving node can
 // fence its data plane (stop reads/writes/checkpoints, step down) when
 // durability can no longer be upheld — rather than keep serving
@@ -2821,19 +2761,4 @@ func (fs *FS) PoisonedCh() <-chan struct{} {
 		return fs.wal.PoisonedCh()
 	}
 	return fs.log.PoisonedCh()
-}
-
-// ResetWAL truncates the WAL (after a checkpoint commits all dirty state),
-// then re-seeds it with a control snapshot (including the allocator cursor)
-// and the live xattr state. A reset must not forget live sessions, retryable
-// exact outcomes, or previously allocated inode identities; the legacy
-// manifest cannot carry xattrs (see CompactWAL).
-func (fs *FS) ResetWAL() error {
-	if err := fs.wal.Reset(); err != nil {
-		return err
-	}
-	if err := fs.appendControlSnapshot(); err != nil {
-		return err
-	}
-	return fs.appendXattrSnapshot()
 }

@@ -34,10 +34,7 @@ func TestNegativeCacheSubdirTwoClientCoherence(t *testing.T) {
 	addr := serveCore(t)
 	a := dialCore(t, addr, Options{NegativeCache: true, Owner: "client-a"})
 	b := dialCore(t, addr, Options{Owner: "client-b"})
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
-	time.Sleep(100 * time.Millisecond) // let the subscribe stream attach
+	watchInvalidationsForTest(t, a) // A must receive B's invalidations
 
 	ctx := context.Background()
 	if _, st := b.Mkdir(ctx, "dir", 0o755); st != fsproto.OK {
@@ -84,9 +81,6 @@ func TestNegativeCacheSiblingCreateInvalidatesSubdirNegative(t *testing.T) {
 	addr := serveCore(t)
 	a := dialCore(t, addr, Options{NegativeCache: true, Owner: "client-a"})
 	b := dialCore(t, addr, Options{Owner: "client-b"})
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
 	time.Sleep(100 * time.Millisecond)
 
 	ctx := context.Background()

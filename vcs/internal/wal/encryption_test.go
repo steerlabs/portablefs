@@ -140,33 +140,4 @@ func TestEncryptedWALTornTailDiscarded(t *testing.T) {
 	}
 }
 
-// TestEncryptedStandbyMirrorsPlaintextRecords: replication carries plaintext records
-// (sealed in transit by TLS); each node seals its own WAL with its own key. A
 // standby with a DIFFERENT key still mirrors the primary's records faithfully.
-func TestEncryptedStandbyMirrorsPlaintextRecords(t *testing.T) {
-	dir := t.TempDir()
-	primary, err := OpenEncrypted(filepath.Join(dir, "p.wal"), encA(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	standbyKey, _ := secure.NewAtRestFromKey(testKeyB)
-	standby, err := OpenEncrypted(filepath.Join(dir, "s.wal"), standbyKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range []string{"a", "b"} {
-		if err := primary.Append(Record{Op: OpCreate, Path: p, Mode: 0o644}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := primary.AttachReplica(&localReplica{w: standby}); err != nil {
-		t.Fatalf("attach: %v", err)
-	}
-	recs, err := standby.Replay()
-	if err != nil {
-		t.Fatalf("standby replay (own key): %v", err)
-	}
-	if len(recs) != 2 || recs[0].Path != "a" || recs[1].Path != "b" {
-		t.Fatalf("standby mirror = %+v, want [a b]", recs)
-	}
-}

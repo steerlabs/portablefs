@@ -38,7 +38,7 @@ type State struct {
 	checkouts map[string]checkoutGrant // by canonical path; non-overlapping
 	pins      map[uint64]map[SessionRef]struct{}
 	pinCount  int
-	ledger    map[flushKey]uint64
+	ledger    map[string]ledgerEntry // by writebackID (one entry per mount stream)
 
 	nextEpoch Epoch
 
@@ -91,13 +91,20 @@ func (s *slotState) retiredThrough() uint64 {
 type checkoutGrant struct {
 	holder SessionRef
 	epoch  Epoch
+	// writebackID binds a delegation grant to its mount write-back stream;
+	// empty for plain coordination checkouts.
+	writebackID string
+	// recovery marks a delegation whose holder went terminal without a
+	// clean release: it blocks peers until rebound or discarded.
+	recovery bool
 }
 
-type flushKey struct {
-	session     SessionRef
-	writebackID string
-	path        string
-	epoch       Epoch
+// ledgerEntry is one mount stream's durable flush state: the watermark, the
+// chained mutation digest at it, and the session that last advanced it.
+type ledgerEntry struct {
+	through uint64
+	digest  [DigestBytes]byte
+	owner   SessionRef
 }
 
 // NewState returns the empty control state of a fresh generation: no
@@ -108,7 +115,7 @@ func NewState() *State {
 		locks:     map[uint64][]HeldLock{},
 		checkouts: map[string]checkoutGrant{},
 		pins:      map[uint64]map[SessionRef]struct{}{},
-		ledger:    map[flushKey]uint64{},
+		ledger:    map[string]ledgerEntry{},
 		nextEpoch: FirstEpoch,
 	}
 }
@@ -307,9 +314,11 @@ func (st *State) LockConflict(ino uint64, owner LockOwner, start, length uint64,
 
 // CheckoutView is one granted checkout.
 type CheckoutView struct {
-	Path   string
-	Holder SessionRef
-	Epoch  Epoch
+	Path        string
+	Holder      SessionRef
+	Epoch       Epoch
+	WritebackID string
+	Recovery    bool
 }
 
 // CheckoutAt returns the grant covering exactly path.
@@ -320,7 +329,11 @@ func (st *State) CheckoutAt(path string) (CheckoutView, bool) {
 	if !ok {
 		return CheckoutView{}, false
 	}
-	return CheckoutView{Path: path, Holder: g.holder, Epoch: g.epoch}, true
+	return checkoutView(path, g), true
+}
+
+func checkoutView(path string, g checkoutGrant) CheckoutView {
+	return CheckoutView{Path: path, Holder: g.holder, Epoch: g.epoch, WritebackID: g.writebackID, Recovery: g.recovery}
 }
 
 // OverlappingCheckouts returns every grant whose subtree overlaps path
@@ -335,7 +348,22 @@ func (st *State) overlappingCheckoutsLocked(path string) []CheckoutView {
 	var out []CheckoutView
 	for p, g := range st.checkouts {
 		if pathsOverlap(p, path) {
-			out = append(out, CheckoutView{Path: p, Holder: g.holder, Epoch: g.epoch})
+			out = append(out, checkoutView(p, g))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// StreamCheckouts returns every grant bound to one write-back stream,
+// sorted by path.
+func (st *State) StreamCheckouts(writebackID string) []CheckoutView {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	var out []CheckoutView
+	for p, g := range st.checkouts {
+		if g.writebackID == writebackID && writebackID != "" {
+			out = append(out, checkoutView(p, g))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
@@ -375,12 +403,23 @@ func (st *State) RecallDigestAt(path string) [DigestBytes]byte {
 	return RecallDigest(st.OverlappingCheckouts(path))
 }
 
-// FlushThrough returns one flush-ledger watermark.
-func (st *State) FlushThrough(session SessionRef, writebackID, path string, epoch Epoch) (uint64, bool) {
+// StreamStateView is one mount stream's durable flush state.
+type StreamStateView struct {
+	WritebackID string
+	Through     uint64
+	Digest      [DigestBytes]byte
+	Owner       SessionRef
+}
+
+// StreamState returns one write-back stream's durable watermark and digest.
+func (st *State) StreamState(writebackID string) (StreamStateView, bool) {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	through, ok := st.ledger[flushKey{session: session, writebackID: writebackID, path: path, epoch: epoch}]
-	return through, ok
+	e, ok := st.ledger[writebackID]
+	if !ok {
+		return StreamStateView{}, false
+	}
+	return StreamStateView{WritebackID: writebackID, Through: e.through, Digest: e.digest, Owner: e.owner}, true
 }
 
 // HasPin reports whether session holds the durable open pin on ino.

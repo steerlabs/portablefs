@@ -53,3 +53,17 @@ type Invalidation struct {
 	// never sets this stays existence-coherent (it just keeps the CWD hazard, the prior behaviour).
 	InPlace bool
 }
+
+// Batch is one atomically-published group of invalidations (the changes of a
+// single mutation or one flushed write-back run) stamped with its monotonic
+// position in the authority's invalidation stream. Subscribers process
+// batches strictly in order and acknowledge positions; an authority barrier
+// (fsync/synchronize/unmount) completes only after every live subscriber has
+// acknowledged the position covering the barrier's mutations — that is what
+// makes a completed fsync immediately visible to every connected peer's
+// subsequent reads.
+type Batch struct {
+	Pos       uint64 // monotonic stream position; 0 = untracked unless Bootstrap is true
+	Invs      []Invalidation
+	Bootstrap bool // fresh-subscribe cache reset; acknowledge even when Pos is zero
+}

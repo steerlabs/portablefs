@@ -203,7 +203,10 @@ func TestDaemonReadsVolumeLocalDirsAndNoLocalDisablesThem(t *testing.T) {
 		t.Fatalf("volume-configured graft leaked to authority: st=%d", st)
 	}
 
-	noLocal := ensureAttachWithPolicyOptions(t, hc, authority, "vol-config-dirs", "main", "/Volumes/NoConfigDirs", "writethrough", map[string]any{
+	// A distinct volume id: one (volume, branch) allows only one live attach
+	// (shared storage identity and checkout owner), and this second attach
+	// only needs the same authority-side .portablefs/local-dirs file.
+	noLocal := ensureAttachWithPolicyOptions(t, hc, authority, "vol-config-dirs-nolocal", "main", "/Volumes/NoConfigDirs", "writethrough", map[string]any{
 		"volumeLocalDirs": false,
 	})
 	status = attachStatus{}

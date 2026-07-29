@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"time"
 
@@ -47,14 +48,13 @@ type resultFile struct {
 }
 
 type benchConfig struct {
-	WriteBack       bool  `json:"writeBack"`
-	NegativeCache   bool  `json:"negativeCache"`
-	NoReaddirPlus   bool  `json:"noReaddirPlus"`
-	FlushMs         int   `json:"flushMs"`
-	FlushMaxRecords int   `json:"flushMaxRecords"`
-	FlushMaxBytes   int64 `json:"flushMaxBytes"`
-	SessionTTLMs    int   `json:"sessionTTLMs"`
-	Pool            int   `json:"pool"`
+	// WriteThrough is the debug never-delegate mode; the default is the
+	// production adaptive engine.
+	WriteThrough  bool `json:"writeThrough"`
+	NegativeCache bool `json:"negativeCache"`
+	NoReaddirPlus bool `json:"noReaddirPlus"`
+	SessionTTLMs  int  `json:"sessionTTLMs"`
+	Pool          int  `json:"pool"`
 }
 
 type machineInfo struct {
@@ -107,28 +107,38 @@ func cmdRun(args []string) {
 	out := fs.String("out", "", "JSON output path (default stdout)")
 	label := fs.String("label", "default", "config label recorded in the result (report groups by it)")
 
-	writeBack := fs.Bool("writeback", false, "enable write-back sessions (delegation + local overlay + async flush)")
+	writeThrough := fs.Bool("write-through", false, "debug: never delegate (PORTABLEFS_DEBUG_WRITE_THROUGH)")
 	negCache := fs.Bool("negcache", false, "enable the version-gated negative lookup cache")
 	noRDP := fs.Bool("no-readdirplus", false, "disable readdir-plus attr-cache fill")
-	flushMs := fs.Int("flush-ms", 250, "write-back flush interval (ms)")
-	flushMaxRecords := fs.Int("flush-max-records", 0, "records per FlushBatch RPC (0 = default 512)")
-	flushMaxBytes := fs.Int64("flush-max-bytes", 0, "payload bytes per FlushBatch RPC (0 = unbounded)")
 	sessionTTLMs := fs.Int("session-ttl-ms", 0, "attr/entry TTL while a subtree delegation is held (0 = off)")
 	pool := fs.Int("pool", 16, "fsproto connection pool size")
 
-	mountBin := fs.String("mount-bin", "", "path to the built mount binary (fuse transport)")
+	mountBin := fs.String("mount-bin", "", "path to the built benchmount binary (fuse transport)")
 	dir := fs.String("dir", "", "working directory (default: a fresh temp dir)")
 	watchdogMin := fs.Int("watchdog-min", 30, "abort with a goroutine dump after this many minutes (0 = off)")
+	cpuProfile := fs.String("cpuprofile", "", "write a CPU profile of the whole run to this path")
 	_ = fs.Parse(args)
 
 	startWatchdog(time.Duration(*watchdogMin) * time.Minute)
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal(err)
+		}
+		defer pprof.StopCPUProfile()
+	}
 	p, ok := profiles[*profileName]
 	if !ok {
 		log.Fatalf("pfsbench run: unknown profile %q", *profileName)
 	}
+	if *writeThrough {
+		_ = os.Setenv("PORTABLEFS_DEBUG_WRITE_THROUGH", "1")
+	}
 	cfg := benchConfig{
-		WriteBack: *writeBack, NegativeCache: *negCache, NoReaddirPlus: *noRDP,
-		FlushMs: *flushMs, FlushMaxRecords: *flushMaxRecords, FlushMaxBytes: *flushMaxBytes,
+		WriteThrough: *writeThrough, NegativeCache: *negCache, NoReaddirPlus: *noRDP,
 		SessionTTLMs: *sessionTTLMs, Pool: *pool,
 	}
 
@@ -227,14 +237,10 @@ func buildTransport(transport, work string, cfg benchConfig, mountBin string) (b
 
 func coreOptions(cfg benchConfig) clientcore.Options {
 	return clientcore.Options{
-		Pool:            cfg.Pool,
-		Owner:           "pfsbench",
-		WriteBack:       cfg.WriteBack,
-		FlushInterval:   time.Duration(cfg.FlushMs) * time.Millisecond,
-		FlushMaxRecords: cfg.FlushMaxRecords,
-		FlushMaxBytes:   cfg.FlushMaxBytes,
-		NegativeCache:   cfg.NegativeCache,
-		NoReaddirPlus:   cfg.NoReaddirPlus,
-		SessionTTL:      time.Duration(cfg.SessionTTLMs) * time.Millisecond,
+		Pool:          cfg.Pool,
+		Owner:         "pfsbench",
+		NegativeCache: cfg.NegativeCache,
+		NoReaddirPlus: cfg.NoReaddirPlus,
+		SessionTTL:    time.Duration(cfg.SessionTTLMs) * time.Millisecond,
 	}
 }

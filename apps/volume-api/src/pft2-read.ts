@@ -1,6 +1,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   PFT2_CELL_BYTES,
+  PFT2_MAX_TREE_DEPTH,
+  PFT2_PAGE_BYTES,
   PFT2_ROOT_INO,
   Pft2BoundExceededError,
   Pft2CorruptError,
@@ -46,6 +48,23 @@ import { VolumeApiError } from "./errors.js";
 // ---------------------------------------------------------------------------
 
 const maxPft2FileResponseBytes = 64 * 1024 * 1024;
+
+// Per-operation reader bounds sized to the serving contract. readExtents
+// visits one DataPage node per 64 KiB page in the requested window (plus the
+// inode and the extent index/leaf chain), so every window this route family
+// legally issues — file reads up to maxPft2FileResponseBytes and the grep
+// engine's scan windows — must fit ONE operation's node budget. The reader's
+// conservative default (64 nodes) refuses any read above ~4 MiB, which is a
+// legal request here, not an abusive one. The default per-op BYTE budget is
+// kept: the charged bytes are the visited metadata nodes (a DataPage node is
+// ~1 KiB of cell refs, never file content), which stay far below it even for
+// a maximal read.
+const servingReadBounds = {
+  maxNodes:
+    Math.ceil(maxPft2FileResponseBytes / PFT2_PAGE_BYTES) + // DataPage nodes for a maximal window
+    2 * PFT2_MAX_TREE_DEPTH + // extent + inode-index chains
+    32, // root, inode, leaf slack
+};
 
 export interface Pft2ReadContext {
   history: PostgresHistoryRepository;
@@ -112,7 +131,7 @@ export async function openPft2CommitTree(
   }
   const fetcher = new HistoryObjectFetcher(context);
   const rootRef: Pft2Ref = { digest: Buffer.from(rootDigest, "hex"), size: rootSize };
-  const reader = new Pft2TreeReader({ fetcher }, rootRef);
+  const reader = new Pft2TreeReader({ fetcher, bounds: servingReadBounds }, rootRef);
   return { reader, fetcher, rootDigestHex: rootDigest };
 }
 

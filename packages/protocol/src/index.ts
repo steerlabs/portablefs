@@ -469,31 +469,6 @@ export const renewLeaseResponseSchema = z.object({
 });
 export type RenewLeaseResponse = z.infer<typeof renewLeaseResponseSchema>;
 
-export const execRequestSchema = z.object({
-  branch: z.string().min(1).max(128).default("main"),
-  command: z.string().min(1).max(16_384),
-  write: z.boolean().default(false),
-  timeoutMs: z.number().int().positive().max(5 * 60 * 1000).default(60_000),
-  env: z.record(z.string(), z.string()).default({}),
-});
-export type ExecRequest = z.input<typeof execRequestSchema>;
-
-export const execResponseSchema = z.object({
-  stdout: z.string(),
-  stderr: z.string(),
-  exitCode: z.number().int(),
-  signal: z.string().nullable().optional(),
-  timing: z.object({
-    totalMs: z.number().nonnegative(),
-    setupMs: z.number().nonnegative(),
-    executeMs: z.number().nonnegative(),
-    commitMs: z.number().nonnegative(),
-  }),
-  headCommitId: idSchema,
-  committed: z.boolean(),
-});
-export type ExecResponse = z.infer<typeof execResponseSchema>;
-
 // Read-only browse: a directory listing of a committed tree. Entries are the
 // DIRECT children of the requested path — directories first, then files and
 // symlinks, each group ordered by name (UTF-16 code unit order, matching the

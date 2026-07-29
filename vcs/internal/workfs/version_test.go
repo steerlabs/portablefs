@@ -136,7 +136,8 @@ func TestPublishCarriesVersionOwnerGen(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case invs := <-sub:
+	case batch := <-sub:
+		invs := batch.Invs
 		if len(invs) != 1 {
 			t.Fatalf("create must publish exactly one invalidation, got %d: %+v", len(invs), invs)
 		}

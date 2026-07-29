@@ -76,14 +76,17 @@ func (c *rawPFSClient) start(ref string) (pfslocal.Item, error) {
 func (c *rawPFSClient) createWriteClose(dir pfslocal.Item, name, content string) error {
 	rep, err := c.mustCall(&pfslocal.CreateRequest{Dir: dir, Name: []byte(name), Mode: 0o644, Exclusive: true})
 	if err != nil {
-		return err
+		return fmt.Errorf("create %q: %w", name, err)
 	}
 	cr := rep.(*pfslocal.CreateReply)
 	if _, err := c.mustCall(&pfslocal.WriteRequest{Handle: cr.Handle, Data: []byte(content)}); err != nil {
-		return err
+		return fmt.Errorf("write %q: %w", name, err)
 	}
 	_, err = c.mustCall(&pfslocal.CloseRequest{Handle: cr.Handle})
-	return err
+	if err != nil {
+		return fmt.Errorf("close %q: %w", name, err)
+	}
+	return nil
 }
 
 // TestDaemonParallelNamespaceMutations exercises the shared-nsMu +

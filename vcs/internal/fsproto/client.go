@@ -16,7 +16,6 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
 	"github.com/steerlabs/portablefs/vcs/internal/metrics"
 	"github.com/steerlabs/portablefs/vcs/internal/secure"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
 // splitAddrs parses a comma-separated authority address list, trimming blanks.
@@ -31,12 +30,13 @@ func splitAddrs(addr string) []string {
 }
 
 // Client is a pooled connection to a Server. Each pooled connection carries its
-// own gob streams and serves one request at a time, so concurrent FUSE ops run on
-// separate connections up to the pool size. Connections lazily re-dial, so a
-// mount rides through a VCS restart or failover. Multiple authority addresses may be
-// given (comma-separated): a connection tries each in order, so when the primary
-// dies the mount follows over to a promoted standby without an external VIP. A
-// non-nil tls config encrypts every connection.
+// own framed request encoder and gob response decoder and serves one request at
+// a time, so concurrent FUSE ops run on separate connections up to the pool
+// size. Connections lazily re-dial, so a mount rides through a VCS restart or
+// failover. Multiple authority addresses may be given (comma-separated): a
+// connection tries each in order, so when the primary dies the mount follows
+// over to a promoted standby without an external VIP. A non-nil tls config
+// encrypts every connection.
 type Client struct {
 	addrs      []string
 	tls        *tls.Config
@@ -72,23 +72,13 @@ type Client struct {
 	onSelfWrite func(path string, gen, version uint64, inPlace bool)
 
 	// Exact mount-session state. exact is nil until EnsureExactSession
-	// establishes it; serverLegacy is sticky once the authority proves to be
-	// below the session protocol version (a mid-mount authority upgrade
-	// requires a remount to adopt exact sessions — documented rolling-upgrade
-	// behavior). sessionsDisabled reflects VCS_CLIENT_DISABLE_EXACT_SESSIONS=1
-	// (debugging escape hatch: pure v1 behavior).
-	exactMu          sync.RWMutex
-	serverManaged    bool       // authority negotiated journaled coordination (managed generation)
-	establishMu      sync.Mutex // serializes the one-time session establish
-	exact            *exactSession
-	serverLegacy     bool
-	serverFeatures   uint64 // probe-advertised capability bits (valid once featuresKnown)
-	featuresKnown    bool   // one successful OpProtocolVersion probe happened
-	sessionsDisabled bool
-	exactSlots       uint32
-	onReclaim        func(window time.Duration)
-	closed           chan struct{}
-	closeOnce        sync.Once
+	// establishes it (negotiating the mandatory v6 protocol first).
+	exactMu     sync.RWMutex
+	establishMu sync.Mutex // serializes the one-time session establish
+	exact       *exactSession
+	exactSlots  uint32
+	closed      chan struct{}
+	closeOnce   sync.Once
 	// resumeKick debounces the EAGAIN-triggered immediate session resume.
 	resumeKick atomic.Bool
 
@@ -172,7 +162,7 @@ type conn struct {
 	// routed through its single-flight credential re-resolve.
 	client *Client
 	nc     net.Conn
-	enc    *gob.Encoder
+	enc    *requestEncoder
 	dec    *gob.Decoder
 	// attached is the mount-session id authenticated onto THIS transport
 	// (exact sessions ride the connection; a re-dial must re-attach).
@@ -251,7 +241,7 @@ func (cn *conn) dialOnce() error {
 			_ = nc.Close()
 			return err
 		}
-		cn.nc, cn.enc, cn.dec = nc, gob.NewEncoder(nc), gob.NewDecoder(nc)
+		cn.nc, cn.enc, cn.dec = nc, newRequestEncoder(nc), gob.NewDecoder(nc)
 		return nil
 	}
 	// Timeout bounds the TCP (and TLS) connect so a blackholed authority
@@ -288,7 +278,7 @@ func (cn *conn) dialOnce() error {
 			lastErr = err
 			continue
 		}
-		cn.nc, cn.enc, cn.dec = nc, gob.NewEncoder(nc), gob.NewDecoder(nc)
+		cn.nc, cn.enc, cn.dec = nc, newRequestEncoder(nc), gob.NewDecoder(nc)
 		return nil
 	}
 	if lastErr == nil {
@@ -371,11 +361,10 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 	}
 	c := &Client{
 		addrs: addrs, tls: tlsCfg, conns: make(chan *conn, pool),
-		closed:           make(chan struct{}),
-		sessionsDisabled: os.Getenv("VCS_CLIENT_DISABLE_EXACT_SESSIONS") == "1",
-		redial:           NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
-		refreshBackoff:   NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
-		transport:        transport,
+		closed:         make(chan struct{}),
+		redial:         NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
+		refreshBackoff: NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
+		transport:      transport,
 	}
 	c.health = newConnHealth()
 	c.health.onEngage = func() { go c.runReachabilityProbe() }
@@ -395,13 +384,10 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 
 // Do sends a request on a pooled connection.
 //
-// Against a session-negotiated authority, tree mutations route through the
-// exact-once machinery (doExact): each carries a (session, generation, slot,
-// slot-sequence) identity, so a retry after a lost reply returns the STORED
-// outcome instead of re-executing. Against a legacy authority (or with
-// VCS_CLIENT_DISABLE_EXACT_SESSIONS=1) the pre-session behavior is preserved
-// unchanged: idempotent ops retry once across a re-dial, mutations surface
-// transport errors to the caller.
+// Tree mutations route through the exact-once machinery (doExact): each
+// carries a (session, generation, slot, slot-sequence) identity, so a retry
+// after a lost reply returns the STORED outcome instead of re-executing.
+// Idempotent reads retry once across a re-dial.
 func (c *Client) Do(req *Request) (*Response, error) {
 	if os.Getenv("PFS_WIRE_TRACE") != "" {
 		start := time.Now()
@@ -420,23 +406,20 @@ func (c *Client) Do(req *Request) (*Response, error) {
 		c.ops.Inc()
 		defer c.opLat.Time(time.Now()) // time.Now() captured at defer registration = op start
 	}
-	if c.sessionsEnabled() && !c.serverIsLegacy() {
-		if exactOp(req.Op) {
-			return c.doExact(req)
+	if exactOp(req.Op) {
+		return c.doExact(req)
+	}
+	if req.Op == OpFlushBatch {
+		// FlushBatch keeps its own durable ledger exactness, but it must
+		// arrive on a connection whose authenticated mount session owns the
+		// flush. Establish once; pooled conns then attach lazily in
+		// prepareConn. A fenced mount must never flush old dirty write-back
+		// bytes over its successor's state.
+		if c.SessionFenced() {
+			return &Response{Status: ESTALE}, nil
 		}
-		if req.Op == OpFlushBatch {
-			// FlushBatch keeps its own durable watermark exactness, but on a
-			// session authority it should arrive on a connection whose
-			// authenticated mount session owns the flush (required under
-			// VCS_REQUIRE_EXACT_SESSIONS=1). Establish once; pooled conns
-			// then attach lazily in prepareConn. A fenced mount must never
-			// flush old dirty write-back bytes over its successor's state.
-			if c.SessionFenced() {
-				return &Response{Status: ESTALE}, nil
-			}
-			if _, err := c.EnsureExactSession(); err != nil {
-				return nil, err
-			}
+		if _, err := c.EnsureExactSession(); err != nil {
+			return nil, err
 		}
 	}
 	cn := <-c.conns
@@ -530,21 +513,29 @@ func isIdempotent(op Op) bool {
 	}
 }
 
+// AckFunc acknowledges that the subscriber has processed every invalidation
+// batch up to pos. The authority's barriers wait on these acknowledgments,
+// so the consumer must call it only AFTER applying the batch to its caches.
+type AckFunc func(pos uint64)
+
 // Subscribe opens a dedicated connection that streams cache invalidations (a
-// batch of changed paths; nil means flush everything). The channel closes if the
-// connection drops; the caller re-subscribes and flushes.
+// batch of changed paths; nil means flush everything). The channel closes if
+// the connection drops; the caller re-subscribes and flushes. The returned
+// AckFunc reports processed stream positions back to the authority — the
+// cross-machine half of fsync (a barrier completes only after every live
+// subscriber acknowledged its position).
 //
 // The stream conn is session-attached when an exact session is live, which
 // switches the authority's cleanup model for this mount from "release
 // checkouts/locks on stream drop" (legacy liveness) to session-lease expiry —
 // a socket flap then releases nothing.
-func (c *Client) Subscribe() (<-chan []coherence.Invalidation, error) {
+func (c *Client) Subscribe() (<-chan coherence.Batch, AckFunc, error) {
 	// gateExempt: the subscribe stream is a recovery path — its 500ms reconnect
 	// loop doubles as an on-demand reachability probe, so it must dial even
 	// while fail-fast is engaged (clearing the breaker on the first success).
 	cn := &conn{addrs: c.addrs, tls: c.tls, auth: c.tokenForHandshake, client: c, health: c.health, gateExempt: true}
 	if err := cn.ensure(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if es := c.exactState(); es != nil && !es.isFenced() {
 		resp, err := cn.roundtrip(&Request{
@@ -552,7 +543,7 @@ func (c *Client) Subscribe() (<-chan []coherence.Invalidation, error) {
 		})
 		if err != nil {
 			cn.reset()
-			return nil, err
+			return nil, nil, err
 		}
 		if resp.Status != OK {
 			// A subscription stream that could not authenticate its session
@@ -562,18 +553,37 @@ func (c *Client) Subscribe() (<-chan []coherence.Invalidation, error) {
 				es.fence()
 			}
 			cn.reset()
-			return nil, statusError("subscribe session attach", resp.Status)
+			return nil, nil, statusError("subscribe session attach", resp.Status)
 		}
 		cn.attached = es.id
 	}
 	if err := cn.enc.Encode(&Request{Op: OpSubscribe, Owner: c.owner}); err != nil {
 		cn.reset()
-		return nil, err
+		return nil, nil, err
 	}
-	ch := make(chan []coherence.Invalidation, 1024)
+	// Acks are the only writes after the subscribe request; serialize them
+	// (the reader goroutine only decodes, so writes race nothing else).
+	var ackMu sync.Mutex
+	ack := func(pos uint64) {
+		ackMu.Lock()
+		defer ackMu.Unlock()
+		if cn.nc == nil || cn.enc == nil {
+			return
+		}
+		_ = cn.nc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+		// A failed ack write is resolved by the stream teardown: the server
+		// drops the subscriber from the barrier set when the conn dies.
+		_ = cn.enc.Encode(&Request{Op: OpInvalidationAck, AckPos: pos})
+		_ = cn.nc.SetWriteDeadline(time.Time{})
+	}
+	ch := make(chan coherence.Batch, 1024)
 	go func() {
 		defer close(ch)
-		defer cn.reset()
+		defer func() {
+			ackMu.Lock()
+			cn.reset()
+			ackMu.Unlock()
+		}()
 		for {
 			// Arm a read deadline: the server heartbeats every streamHeartbeat, so a
 			// gap longer than streamReadTimeout means the stream is dead/half-open.
@@ -587,55 +597,18 @@ func (c *Client) Subscribe() (<-chan []coherence.Invalidation, error) {
 			if resp.Keepalive {
 				// Liveness only — but convey the generation so the mount can detect an
 				// authority restart/promotion (a new Gen) even on an otherwise idle stream.
-				ch <- []coherence.Invalidation{{Gen: resp.Gen}}
+				ch <- coherence.Batch{
+					Pos: resp.InvPos, Bootstrap: resp.InvBootstrap,
+					Invs: []coherence.Invalidation{{Gen: resp.Gen}},
+				}
 				continue
 			}
 			if len(resp.Invs) > 0 {
-				ch <- resp.Invs
+				ch <- coherence.Batch{Pos: resp.InvPos, Invs: resp.Invs}
 			}
 		}
 	}()
-	return ch, nil
-}
-
-// Checkout acquires an exclusive write delegation on path for owner. On conflict
-// it returns granted=false and the owner currently holding it.
-func (c *Client) Checkout(path, owner string) (granted bool, heldBy string, err error) {
-	r, err := c.Do(&Request{Op: OpCheckout, Path: path, Owner: owner})
-	if err != nil {
-		return false, "", err
-	}
-	if r.Status == EBUSY {
-		return false, r.Owner, nil
-	}
-	if r.Status != OK {
-		return false, "", fmt.Errorf("checkout: status %d", r.Status)
-	}
-	return true, "", nil
-}
-
-// Checkin releases owner's delegation on path.
-func (c *Client) Checkin(path, owner string) error {
-	r, err := c.Do(&Request{Op: OpCheckin, Path: path, Owner: owner})
-	if err != nil {
-		return err
-	}
-	if r.Status != OK {
-		return fmt.Errorf("checkin: status %d", r.Status)
-	}
-	return nil
-}
-
-// FlushBatch ships a write-back session's buffered mutations (carrying the mount's local
-// WAL Seqs) to the authority for exactly-once apply. owner is the mount's checkout owner
-// id. It returns the highest local Seq now durable on the authority (the mount advances
-// its flush cursor to that), and the protocol status.
-func (c *Client) FlushBatch(sessionID string, epoch uint64, owner string, records []wal.Record) (appliedThrough uint64, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpFlushBatch, SessionID: sessionID, Epoch: epoch, Owner: owner, Records: records})
-	if err != nil {
-		return 0, EIO, err
-	}
-	return r.AppliedThrough, r.Status, nil
+	return ch, ack, nil
 }
 
 // ReadV reads up to n bytes at off and returns the path's coherence version and the
@@ -687,8 +660,7 @@ func (c *Client) WriteVHandle(path string, handleIno uint64, off int64, data []b
 }
 
 // AppendVHandle appends data atomically at authority EOF. It is one mutation
-// RPC: no getattr/size read precedes it. Callers must gate on
-// SupportsAtomicAppend.
+// RPC: no getattr/size read precedes it.
 func (c *Client) AppendVHandle(path string, handleIno uint64, data []byte, mode uint32) (count int, offset int64, version, gen uint64, status int32, err error) {
 	r, err := c.Do(&Request{
 		Op: OpWrite, Path: path, HandleIno: handleIno,
@@ -768,18 +740,10 @@ func (c *Client) MarkOpen(ino uint64) (int32, error) {
 
 // MarkOpenGen is MarkOpen returning the authority generation the registration
 // landed under, so the client can stamp (and later re-validate) the hold.
-// Against a managed authority the pin transition is a journaled coordination
-// decision and rides an exact identity (doCoordinate); the legacy liveness
-// mark stays envelope-less.
+// The pin transition is a journaled coordination decision riding an exact
+// identity (doCoordinate).
 func (c *Client) MarkOpenGen(ino uint64) (int32, uint64, error) {
-	req := &Request{Op: OpMarkOpen, OpenIno: ino, OpenState: true, Owner: c.owner}
-	var r *Response
-	var err error
-	if c.serverManagedActive() {
-		r, err = c.doCoordinate(req)
-	} else {
-		r, err = c.Do(req)
-	}
+	r, err := c.doCoordinate(&Request{Op: OpMarkOpen, OpenIno: ino, OpenState: true, Owner: c.owner})
 	if err != nil {
 		return EIO, 0, err
 	}
@@ -788,14 +752,7 @@ func (c *Client) MarkOpenGen(ino uint64) (int32, uint64, error) {
 
 // UnmarkOpen clears this mount's open hold on ino (its last local close).
 func (c *Client) UnmarkOpen(ino uint64) (int32, error) {
-	req := &Request{Op: OpMarkOpen, OpenIno: ino, OpenState: false, Owner: c.owner}
-	var r *Response
-	var err error
-	if c.serverManagedActive() {
-		r, err = c.doCoordinate(req)
-	} else {
-		r, err = c.Do(req)
-	}
+	r, err := c.doCoordinate(&Request{Op: OpMarkOpen, OpenIno: ino, OpenState: false, Owner: c.owner})
 	if err != nil {
 		return EIO, err
 	}
@@ -825,24 +782,14 @@ func (c *Client) RenewOpenInodesGen(inos []uint64) (int32, uint64, error) {
 }
 
 // UnmarkOpenBatch clears this mount's open holds on a batch of inos in one
-// round-trip (OpUnmarkOpenInodes, FeatOpenRegistration). Callers gate on
-// SupportsOpenRegistration; against an older authority use UnmarkOpen per ino.
-// Against a managed authority the batch journals as one exact row and this
-// call does not return until the identity RESOLVES (see
+// round-trip (OpUnmarkOpenInodes). The batch journals as one exact row and
+// this call does not return until the identity RESOLVES (see
 // unmarkOpenBatchManaged for why backgrounding it would be unsafe).
 func (c *Client) UnmarkOpenBatch(inos []uint64) (int32, error) {
 	if len(inos) == 0 {
 		return OK, nil
 	}
-	req := &Request{Op: OpUnmarkOpenInodes, OpenInos: append([]uint64(nil), inos...), Owner: c.owner}
-	if c.serverManagedActive() {
-		return c.unmarkOpenBatchManaged(req)
-	}
-	r, err := c.Do(req)
-	if err != nil {
-		return EIO, err
-	}
-	return r.Status, nil
+	return c.unmarkOpenBatchManaged(&Request{Op: OpUnmarkOpenInodes, OpenInos: append([]uint64(nil), inos...), Owner: c.owner})
 }
 
 // GetattrOrphan stats a parked orphan by ino (fstat on an unlinked-but-open fd).
@@ -1070,13 +1017,12 @@ func (c *Client) CreateExcl(path string, mode uint32) (*Attr, int32, error) {
 
 // CreateRegisterOpen creates path AND registers this mount's open hold on the
 // resulting inode in the same round-trip (Request.RegisterOpen,
-// FeatOpenRegistration): the kernel CREATE is create+open, so the hold must be
+// baseline): the kernel CREATE is create+open, so the hold must be
 // recorded before the create returns anyway — fusing it removes the separate
 // MarkOpen round-trip without moving the open-vs-unlink race decision point.
 // ENOENT means the just-created inode was already unlinked by a peer inside
 // the registration window: the caller fails the open, exactly like a MarkOpen
 // ENOENT. gen is the authority generation the registration is valid under.
-// Callers gate on SupportsOpenRegistration.
 func (c *Client) CreateRegisterOpen(path string, mode uint32) (*Attr, uint64, int32, error) {
 	return c.create(path, mode, true, false)
 }
@@ -1161,9 +1107,6 @@ func (c *Client) Symlink(target, link string) (*Attr, int32, error) {
 // Link adds newPath as another name for oldPath's non-directory inode. The
 // returned attributes describe the shared inode after nlink increments.
 func (c *Client) Link(oldPath, newPath string) (*Attr, int32, error) {
-	if !c.SupportsHardLinks() {
-		return nil, EOPNOTSUPP, nil
-	}
 	r, err := c.Do(&Request{Op: OpLink, Path: oldPath, NewPath: newPath})
 	if err != nil {
 		return nil, EIO, err
@@ -1206,7 +1149,7 @@ func (c *Client) SetattrHandle(path string, handleIno uint64, mode uint32, setMo
 	if setUID || setGID {
 		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, UID: uid, GID: gid, SetUID: setUID, SetGID: setGID})
 	}
-	if len(groups) != 1 && c.sessionsEnabled() && !c.serverIsLegacy() {
+	if len(groups) != 1 {
 		for _, g := range groups {
 			r, err := c.Do(g)
 			if err != nil {
@@ -1234,7 +1177,7 @@ func (c *Client) SetattrHandle(path string, handleIno uint64, mode uint32, setMo
 	return r.Status, nil
 }
 
-// ---- extended attributes (FeatXattrs; callers gate on SupportsXattrs) ----
+// ---- extended attributes ----
 
 // Getxattr reads one extended attribute. handleIno addresses an open handle's
 // stable ino when non-zero (named or parked orphan). ENODATA = not present.
@@ -1264,9 +1207,6 @@ func (c *Client) Setxattr(path string, handleIno uint64, name string, value []by
 // SetxattrFlags applies wal.XattrCreate/wal.XattrReplace atomically at the
 // authority's ordered mutation position.
 func (c *Client) SetxattrFlags(path string, handleIno uint64, name string, value []byte, flags uint8) (int32, error) {
-	if flags != 0 && !c.SupportsAtomicXattrFlags() {
-		return EOPNOTSUPP, nil
-	}
 	r, err := c.Do(&Request{
 		Op: OpSetxattr, Path: path, HandleIno: handleIno,
 		XattrName: name, XattrFlags: flags, Data: value,

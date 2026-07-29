@@ -1,28 +1,25 @@
-// Command vcs serves one volume.
+// Command vcs serves one volume branch as the MANAGED authority child: one
+// disposable fenced process per active branch, cold-replaying the
+// synchronously durable remote PostgreSQL journal (VCS_JOURNAL_DSN) — the only
+// write truth — and serving the authenticated fsproto data plane.
 //
-// Read-only (default):
-//
-//	VOLUME_API_URL=... VOLUME_API_TOKEN=... VCS_VOLUME_ID=vol_... vcs
-//
-// Writable primary, local file WAL (development / self-host single node):
-//
-//	VCS_WRITABLE=1 ... vcs
-//
-// MANAGED PRODUCTION (remote journal; no local WAL/opstate/cache files):
+// MANAGED PRODUCTION:
 //
 //	VCS_PRODUCTION=1 VCS_WRITABLE=1 VCS_JOURNAL_DSN=postgres://... \
 //	VCS_TENANT_ID=... VCS_AUTHORITY_INSTANCE_ID=... \
 //	VCS_JOURNAL_HA_POLICY_JSON="..." vcs
 //
-// VCS_PRODUCTION=1 requires the remote journal and rejects VCS_WAL and
-// VCS_CACHE_DIR: durability lives in the fenced PostgreSQL journal, and the
-// authority starts in an empty read-only working directory. The managed child
-// is spawned by the authority manager with two inherited pipes
-// (VCS_HEARTBEAT_FD, VCS_BOOTSTRAP_FD), binds its own loopback listeners, and
-// reports the exact addresses back on the bootstrap pipe.
+// The managed child is spawned by the authority manager with two inherited
+// pipes (VCS_HEARTBEAT_FD, VCS_BOOTSTRAP_FD), binds its own loopback
+// listeners, and reports the exact addresses back on the bootstrap pipe.
+// VCS_PRODUCTION=1 rejects VCS_WAL and VCS_CACHE_DIR: durability lives in the
+// fenced PostgreSQL journal, and the authority starts in an empty read-only
+// working directory.
 //
-// Env: VCS_ADDR (127.0.0.1:2049), VCS_BRANCH (main), VCS_WAL (temp file),
-// VCS_CHECKPOINT_INTERVAL seconds (5), VCS_FAILOVER_POLL seconds (2).
+// A development run against a local test database drops VCS_PRODUCTION and the
+// pipes but keeps the same remote-journal serving path (it may pin VCS_FS_ADDR
+// and VCS_METRICS_ADDR). There is no other serving mode: no local file-WAL
+// authority, no read-only branch-head serving, no NFS.
 package main
 
 import (
@@ -35,7 +32,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -44,20 +40,13 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 
-	"github.com/steerlabs/portablefs/vcs/internal/authority"
 	"github.com/steerlabs/portablefs/vcs/internal/backend"
-	"github.com/steerlabs/portablefs/vcs/internal/checkpoint"
 	"github.com/steerlabs/portablefs/vcs/internal/content"
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/hapolicy"
 	"github.com/steerlabs/portablefs/vcs/internal/lifecycle"
 	"github.com/steerlabs/portablefs/vcs/internal/metrics"
 	"github.com/steerlabs/portablefs/vcs/internal/secure"
-	"github.com/steerlabs/portablefs/vcs/internal/server"
-	"github.com/steerlabs/portablefs/vcs/internal/volfs"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
-	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
 // Readiness / liveness state for orchestration probes. Liveness (/healthz) means
@@ -239,23 +228,16 @@ func env(key, def string) string {
 }
 
 type config struct {
-	addr            string
-	addrExplicit    bool // VCS_ADDR was set explicitly (managed mode rejects it)
-	apiURL          string
-	token           string
-	volumeID        string
-	branch          string
-	production      bool
-	writable        bool
-	walPath         string
-	walPathExplicit bool
-	fsAddr          string // custom FS protocol listen addr (FUSE clients); "" disables
-	checkpointEvery time.Duration
-	failoverPoll    time.Duration
-	leaseTTLms      int64  // write-lease lifetime; a successor waits up to this after a crash
-	cacheDir        string // VCS_CACHE_DIR — enables the persistent disk cache tier
-	cacheRAMBytes   int64
-	cacheDiskBytes  int64
+	apiURL        string
+	token         string
+	volumeID      string
+	branch        string
+	production    bool
+	writable      bool
+	fsAddr        string // custom FS protocol listen addr (dev runs); production rejects it
+	failoverPoll  time.Duration
+	leaseTTLms    int64 // write-lease lifetime; a successor waits up to this after a crash
+	cacheRAMBytes int64
 	// dirtyRSSMaxMB (VCS_DIRTY_RSS_MAX_MB, default 2048) bounds the working
 	// tree's resident dirty-block bytes. Dirty blocks materialise at 4 MiB
 	// granularity and — on a managed child, which never checkpoints
@@ -268,15 +250,13 @@ type config struct {
 	// loudly instead of silently substituting the default.
 	dirtyRSSMaxMB string
 	metricsAddr   string // VCS_METRICS_ADDR — serve /stats, /metrics, /healthz; "" disables
-	prefetch      bool   // VCS_PREFETCH=1 — warm the cache with the volume's blobs on startup
 	// authorityInstanceID is the opaque manager-assigned identity of this authority
 	// instance (VCS_AUTHORITY_INSTANCE_ID). Lifecycle operations are fenced by it.
 	authorityInstanceID string
-	// journalDSN (VCS_JOURNAL_DSN) selects the managed-production remote
-	// journal: durability lives in PostgreSQL behind SECURITY DEFINER
-	// functions, reached with the restricted authority login. Setting it
-	// switches serving to the remote paths (remote.go) with NO local
-	// WAL/opstate/cache files; it is required when VCS_PRODUCTION=1.
+	// journalDSN (VCS_JOURNAL_DSN) names the remote journal: durability lives
+	// in PostgreSQL behind SECURITY DEFINER functions, reached with the
+	// restricted authority login. It is REQUIRED — the remote journal is the
+	// only durability truth this binary serves.
 	journalDSN string
 	// journalPoolerMode (VCS_JOURNAL_POOLER_MODE) is empty for a direct
 	// database connection or exactly "transaction" when the journal DSN
@@ -333,36 +313,19 @@ func (c config) managed() bool {
 }
 
 func loadConfig() config {
-	volumeID := os.Getenv("VCS_VOLUME_ID")
-	walPath, walPathExplicit := os.LookupEnv("VCS_WAL")
-	if !walPathExplicit {
-		walPath = filepath.Join(os.TempDir(), "vcs-"+volumeID+".wal")
-	}
-	addr, addrExplicit := os.LookupEnv("VCS_ADDR")
-	if !addrExplicit || addr == "" {
-		addr = "127.0.0.1:2049"
-	}
 	return config{
-		addr:            addr,
-		addrExplicit:    addrExplicit,
-		apiURL:          os.Getenv("VOLUME_API_URL"),
-		token:           os.Getenv("VOLUME_API_TOKEN"),
-		volumeID:        volumeID,
-		branch:          env("VCS_BRANCH", "main"),
-		production:      os.Getenv("VCS_PRODUCTION") == "1",
-		writable:        os.Getenv("VCS_WRITABLE") == "1",
-		walPath:         walPath,
-		walPathExplicit: walPathExplicit,
-		fsAddr:          os.Getenv("VCS_FS_ADDR"),
-		checkpointEvery: time.Duration(mustInt(env("VCS_CHECKPOINT_INTERVAL", "5"))) * time.Second,
-		failoverPoll:    time.Duration(mustInt(env("VCS_FAILOVER_POLL", "2"))) * time.Second,
-		leaseTTLms:      int64(mustInt(env("VCS_LEASE_TTL", "30"))) * 1000,
-		cacheDir:        os.Getenv("VCS_CACHE_DIR"),
-		cacheRAMBytes:   int64(envInt("VCS_CACHE_RAM_MB", 256)) << 20,
-		cacheDiskBytes:  int64(envInt("VCS_CACHE_DISK_MB", 0)) << 20,
-		dirtyRSSMaxMB:   os.Getenv("VCS_DIRTY_RSS_MAX_MB"),
-		metricsAddr:     os.Getenv("VCS_METRICS_ADDR"),
-		prefetch:        os.Getenv("VCS_PREFETCH") == "1",
+		apiURL:        os.Getenv("VOLUME_API_URL"),
+		token:         os.Getenv("VOLUME_API_TOKEN"),
+		volumeID:      os.Getenv("VCS_VOLUME_ID"),
+		branch:        env("VCS_BRANCH", "main"),
+		production:    os.Getenv("VCS_PRODUCTION") == "1",
+		writable:      os.Getenv("VCS_WRITABLE") == "1",
+		fsAddr:        os.Getenv("VCS_FS_ADDR"),
+		failoverPoll:  time.Duration(mustInt(env("VCS_FAILOVER_POLL", "2"))) * time.Second,
+		leaseTTLms:    int64(mustInt(env("VCS_LEASE_TTL", "30"))) * 1000,
+		cacheRAMBytes: int64(envInt("VCS_CACHE_RAM_MB", 256)) << 20,
+		dirtyRSSMaxMB: os.Getenv("VCS_DIRTY_RSS_MAX_MB"),
+		metricsAddr:   os.Getenv("VCS_METRICS_ADDR"),
 
 		authorityInstanceID: os.Getenv("VCS_AUTHORITY_INSTANCE_ID"),
 		journalDSN:          os.Getenv("VCS_JOURNAL_DSN"),
@@ -379,18 +342,6 @@ func loadConfig() config {
 		journalHAPolicyJSON:        os.Getenv("VCS_JOURNAL_HA_POLICY_JSON"),
 		suspendDeadlineMs:          int64(envInt("VCS_SUSPEND_DEADLINE_MS", 30_000)),
 	}
-}
-
-// removedPairedEnvs are the process-pair standby/replication settings removed
-// pre-launch. Failover is a fresh journal claim + cold replay now; a
-// deployment still setting one of these must stop loudly rather than silently
-// serve a different role than it was configured for.
-var removedPairedEnvs = []string{
-	"VCS_STANDBY",
-	"VCS_REPLICA_ADDR",
-	"VCS_REPLICA_LISTEN",
-	"VCS_STANDBY_WAL",
-	"VCS_STANDBY_PROMOTION_DELAY",
 }
 
 // defaultDirtyRSSMaxMB is the default dirty-block memory bound (2 GiB).
@@ -418,143 +369,91 @@ func validateConfig(cfg config) error {
 	if _, err := cfg.dirtyRSSMaxBytes(); err != nil {
 		return err
 	}
-	for _, name := range removedPairedEnvs {
-		if os.Getenv(name) != "" {
-			return fmt.Errorf("%s was removed: the process-pair standby mode no longer exists. Production is the managed journal child (VCS_JOURNAL_DSN); development/self-host is the single-node file WAL", name)
-		}
+	// The remote journal is the ONLY serving mode: cmd/vcs is the managed
+	// authority child. Self-hosting runs the manager + Postgres (quickstart);
+	// the bench/torture harness hosts its own in-process authority.
+	if cfg.journalDSN == "" {
+		return fmt.Errorf("VCS_JOURNAL_DSN is required: cmd/vcs serves the fenced remote PostgreSQL journal only (there is no file-WAL or read-only serving mode)")
+	}
+	if !cfg.writable {
+		return fmt.Errorf("VCS_WRITABLE=1 is required: the remote journal serves a writable fenced primary only")
 	}
 	if cfg.journalPoolerMode != "" && cfg.journalPoolerMode != "transaction" {
 		return fmt.Errorf("VCS_JOURNAL_POOLER_MODE must be empty (direct connection) or transaction")
 	}
-	if cfg.journalPoolerMode != "" && cfg.journalDSN == "" {
-		return fmt.Errorf("VCS_JOURNAL_POOLER_MODE requires VCS_JOURNAL_DSN (it declares the journal connection's pooler topology)")
+	if cfg.tenantID == "" {
+		return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_TENANT_ID (journal claims are tenant-scoped in SQL)")
 	}
-	if cfg.journalDSN != "" {
-		// Remote-journal mode (managed production, or a local run against a
-		// test database): the remote journal is the ONLY durability truth.
-		// Every local-durability setting is rejected — there is no mixing and
-		// no silent fallback.
-		if cfg.tenantID == "" {
-			return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_TENANT_ID (journal claims are tenant-scoped in SQL)")
-		}
-		// There is deliberately NO codec selection knob: the immutable pair
-		// comes from the authoritative provisioning/claim result alone
-		// (pfj.branch_provisioning), so no configuration typo can pick or
-		// downgrade a data plane.
-		if os.Getenv("VCS_JOURNAL_CODEC") != "" {
-			return fmt.Errorf("VCS_JOURNAL_CODEC is not a setting: the journal codec pair is decided by authoritative provisioning (pfj.branch_provisioning), never by configuration")
-		}
-		if cfg.walPathExplicit {
-			return fmt.Errorf("VCS_JOURNAL_DSN rejects VCS_WAL: the remote journal is the only durability authority (no local WAL)")
-		}
-		if cfg.cacheDir != "" {
-			return fmt.Errorf("VCS_JOURNAL_DSN rejects VCS_CACHE_DIR: a managed authority keeps no persistent local directories (RAM cache only)")
-		}
-		if !cfg.writable {
-			return fmt.Errorf("VCS_JOURNAL_DSN serves a writable fenced primary only: managed read-only serving does not exist (serve the branch head without VCS_JOURNAL_DSN instead)")
-		}
-		if cfg.addrExplicit {
-			return fmt.Errorf("VCS_JOURNAL_DSN rejects VCS_ADDR: the remote-journal authority serves the authenticated fsproto data plane only (NFSv3 has no authentication and is a local/self-host mode)")
-		}
-		// Every journal transaction (claim, append, read, suspend) presents the
-		// exact manager/runtime binding; the child fails fast instead of
-		// failing its first SQL call.
-		if cfg.managerEpoch == "" || cfg.managerRuntimeID == "" {
-			return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_MANAGER_EPOCH and VCS_MANAGER_RUNTIME_ID (every journal transaction is fenced by the live manager claim)")
-		}
-		if cfg.authorityRuntimeSeq == "" || cfg.authorityRuntimeID == "" {
-			return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_AUTHORITY_RUNTIME_SEQ and VCS_AUTHORITY_RUNTIME_ID (every journal transaction is fenced by the live pfm runtime row)")
-		}
-		if cfg.authorityRuntimeCapability == "" {
-			return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_AUTHORITY_RUNTIME_CAPABILITY (the manager-issued runtime capability; the database stores only its hash)")
-		}
-		if cfg.journalHAPolicyJSON != "" {
-			if _, err := hapolicy.ParsePolicy(cfg.journalHAPolicyJSON); err != nil {
-				return fmt.Errorf("VCS_JOURNAL_HA_POLICY_JSON is invalid: %w", err)
-			}
+	// There is deliberately NO codec selection knob: the immutable pair
+	// comes from the authoritative provisioning/claim result alone
+	// (pfj.branch_provisioning), so no configuration typo can pick or
+	// downgrade a data plane.
+	if os.Getenv("VCS_JOURNAL_CODEC") != "" {
+		return fmt.Errorf("VCS_JOURNAL_CODEC is not a setting: the journal codec pair is decided by authoritative provisioning (pfj.branch_provisioning), never by configuration")
+	}
+	// The remote journal is the only durability truth. Every local-durability
+	// setting is rejected — there is no mixing and no silent fallback.
+	if _, set := os.LookupEnv("VCS_WAL"); set {
+		return fmt.Errorf("VCS_WAL was removed: the remote journal is the only durability authority (no local WAL)")
+	}
+	if os.Getenv("VCS_CACHE_DIR") != "" {
+		return fmt.Errorf("VCS_CACHE_DIR was removed: the authority keeps no persistent local directories (RAM cache only)")
+	}
+	// Every journal transaction (claim, append, read, suspend) presents the
+	// exact manager/runtime binding; the child fails fast instead of
+	// failing its first SQL call.
+	if cfg.managerEpoch == "" || cfg.managerRuntimeID == "" {
+		return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_MANAGER_EPOCH and VCS_MANAGER_RUNTIME_ID (every journal transaction is fenced by the live manager claim)")
+	}
+	if cfg.authorityRuntimeSeq == "" || cfg.authorityRuntimeID == "" {
+		return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_AUTHORITY_RUNTIME_SEQ and VCS_AUTHORITY_RUNTIME_ID (every journal transaction is fenced by the live pfm runtime row)")
+	}
+	if cfg.authorityRuntimeCapability == "" {
+		return fmt.Errorf("VCS_JOURNAL_DSN requires VCS_AUTHORITY_RUNTIME_CAPABILITY (the manager-issued runtime capability; the database stores only its hash)")
+	}
+	if cfg.journalHAPolicyJSON != "" {
+		if _, err := hapolicy.ParsePolicy(cfg.journalHAPolicyJSON); err != nil {
+			return fmt.Errorf("VCS_JOURNAL_HA_POLICY_JSON is invalid: %w", err)
 		}
 	}
 	if !cfg.production {
 		return nil
 	}
-	// VCS_PRODUCTION=1 is MANAGED production: remote-pgx journal required.
-	// The file WAL remains an explicit dev/self-host/offline deployment shape
-	// (run without VCS_PRODUCTION), never a silent fallback.
-	if cfg.journalDSN == "" {
-		return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_JOURNAL_DSN: managed production runs on the remote journal only (the file WAL is a dev/self-host mode)")
+	// VCS_PRODUCTION=1 is MANAGED production under the authority manager.
+	if cfg.authorityInstanceID == "" {
+		return fmt.Errorf("VCS_PRODUCTION=1: writable primary requires VCS_AUTHORITY_INSTANCE_ID (lifecycle operations are fenced by it)")
 	}
-	if cfg.writable {
-		if cfg.authorityInstanceID == "" {
-			return fmt.Errorf("VCS_PRODUCTION=1: writable primary requires VCS_AUTHORITY_INSTANCE_ID (lifecycle operations are fenced by it)")
-		}
-		// The managed child binds its own loopback-ephemeral listeners and
-		// reports the exact addresses through the bootstrap pipe; operator
-		// addresses would reintroduce the port-allocation race and a
-		// network-reachable bind.
-		if cfg.fsAddr != "" {
-			return fmt.Errorf("VCS_PRODUCTION=1 rejects VCS_FS_ADDR: the managed child binds fsproto on 127.0.0.1:0 itself and reports the exact address on the bootstrap pipe")
-		}
-		if cfg.metricsAddr != "" {
-			return fmt.Errorf("VCS_PRODUCTION=1 rejects VCS_METRICS_ADDR: the managed child binds metrics on 127.0.0.1:0 itself and reports the exact address on the bootstrap pipe")
-		}
-		if cfg.heartbeatFD < 3 {
-			return fmt.Errorf("VCS_PRODUCTION=1: writable primary requires VCS_HEARTBEAT_FD (>= 3): the manager lease pipe is the child's self-fencing clock")
-		}
-		if cfg.bootstrapFD < 3 || cfg.bootstrapFD == cfg.heartbeatFD {
-			return fmt.Errorf("VCS_PRODUCTION=1: writable primary requires a distinct VCS_BOOTSTRAP_FD (>= 3): the child reports its exact self-bound listener addresses on it")
-		}
-		if cfg.journalHAPolicyJSON == "" {
-			return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_JOURNAL_HA_POLICY_JSON: the structured HA policy the child verifies against pfj.durability_facts() (a DSN or prose attestation alone is never a durability gate)")
-		}
-		if os.Getenv("VCS_AUTH_TOKEN") == "" {
-			return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_AUTH_TOKEN: the managed fsproto data plane is authenticated even on loopback")
-		}
-		if secure.AdminToken() == "" {
-			return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_ADMIN_TOKEN: lifecycle control is authenticated even on loopback")
-		}
-		if os.Getenv("VCS_ALLOW_LEGACY_WRITES") == "1" {
-			return fmt.Errorf("VCS_PRODUCTION=1 rejects VCS_ALLOW_LEGACY_WRITES: managed production serves authenticated exact-session fsproto only (legacy v1 write admission is a development/maintenance mode)")
-		}
-		// Zero means "use the 30s default" (config built programmatically);
-		// an explicit value needs a real bound that still fits teardown.
-		if cfg.suspendDeadlineMs != 0 && (cfg.suspendDeadlineMs < 1_000 || cfg.suspendDeadlineMs > 600_000) {
-			return fmt.Errorf("VCS_SUSPEND_DEADLINE_MS must be within [1000, 600000]: the exact journal suspension needs a real bound that still fits inside ordinary teardown")
-		}
+	// The managed child binds its own loopback-ephemeral listeners and
+	// reports the exact addresses through the bootstrap pipe; operator
+	// addresses would reintroduce the port-allocation race and a
+	// network-reachable bind.
+	if cfg.fsAddr != "" {
+		return fmt.Errorf("VCS_PRODUCTION=1 rejects VCS_FS_ADDR: the managed child binds fsproto on 127.0.0.1:0 itself and reports the exact address on the bootstrap pipe")
+	}
+	if cfg.metricsAddr != "" {
+		return fmt.Errorf("VCS_PRODUCTION=1 rejects VCS_METRICS_ADDR: the managed child binds metrics on 127.0.0.1:0 itself and reports the exact address on the bootstrap pipe")
+	}
+	if cfg.heartbeatFD < 3 {
+		return fmt.Errorf("VCS_PRODUCTION=1: writable primary requires VCS_HEARTBEAT_FD (>= 3): the manager lease pipe is the child's self-fencing clock")
+	}
+	if cfg.bootstrapFD < 3 || cfg.bootstrapFD == cfg.heartbeatFD {
+		return fmt.Errorf("VCS_PRODUCTION=1: writable primary requires a distinct VCS_BOOTSTRAP_FD (>= 3): the child reports its exact self-bound listener addresses on it")
+	}
+	if cfg.journalHAPolicyJSON == "" {
+		return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_JOURNAL_HA_POLICY_JSON: the structured HA policy the child verifies against pfj.durability_facts() (a DSN or prose attestation alone is never a durability gate)")
+	}
+	if os.Getenv("VCS_AUTH_TOKEN") == "" {
+		return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_AUTH_TOKEN: the managed fsproto data plane is authenticated even on loopback")
+	}
+	if secure.AdminToken() == "" {
+		return fmt.Errorf("VCS_PRODUCTION=1 requires VCS_ADMIN_TOKEN: lifecycle control is authenticated even on loopback")
+	}
+	// Zero means "use the 30s default" (config built programmatically);
+	// an explicit value needs a real bound that still fits teardown.
+	if cfg.suspendDeadlineMs != 0 && (cfg.suspendDeadlineMs < 1_000 || cfg.suspendDeadlineMs > 600_000) {
+		return fmt.Errorf("VCS_SUSPEND_DEADLINE_MS must be within [1000, 600000]: the exact journal suspension needs a real bound that still fits inside ordinary teardown")
 	}
 	return nil
-}
-
-// prefetchSources collects every file blob/chunk digest from a manifest, for
-// warming the cache.
-func prefetchSources(entries []backend.Entry) []content.PrefetchSource {
-	var out []content.PrefetchSource
-	for _, e := range entries {
-		if e.Kind != "file" {
-			continue
-		}
-		if len(e.Chunks) > 0 {
-			for _, c := range e.Chunks {
-				out = append(out, content.PrefetchSource{Digest: c.Digest, Size: c.Size})
-			}
-		} else if e.BlobDigest != "" {
-			out = append(out, content.PrefetchSource{Digest: e.BlobDigest, Size: e.BlobSize})
-		}
-	}
-	return out
-}
-
-// maybePrefetch warms the cache with the volume's blobs in the background (bounded
-// by total cache capacity) when VCS_PREFETCH=1, so reads are fast from first touch.
-func maybePrefetch(ctx context.Context, cfg config, blobs content.BlobReader, cache content.Cache, entries []backend.Entry) {
-	if !cfg.prefetch {
-		return
-	}
-	sources := prefetchSources(entries)
-	maxBytes := cfg.cacheRAMBytes + cfg.cacheDiskBytes
-	go func() {
-		n, b := content.Prefetch(ctx, blobs, cache, sources, 8, maxBytes)
-		log.Printf("prefetch: warmed %d blobs (%d MiB) into the cache", n, b>>20)
-	}()
 }
 
 // envInt reads a non-negative integer env var (0 allowed), falling back to def.
@@ -567,9 +466,6 @@ func envInt(key string, def int) int {
 	return def
 }
 
-// buildCache builds the read cache: in-memory, plus a persistent local disk
-// (NVMe) tier when VCS_CACHE_DIR + VCS_CACHE_DISK_MB are set — so the working set
-// can exceed RAM and survives restarts (a warm cache).
 // atRest builds the at-rest encryption cipher from VCS_ENCRYPTION_KEY (nil when
 // unset — encryption is opt-in and changes nothing when off).
 func atRest() *secure.AtRest {
@@ -580,18 +476,12 @@ func atRest() *secure.AtRest {
 	return enc
 }
 
+// buildCache builds the RAM read cache. The managed child keeps no persistent
+// local directories, so there is no disk tier.
 func buildCache(cfg config) content.Cache {
-	enc := atRest()
-	cache, err := content.NewTieredCache(cfg.cacheRAMBytes, cfg.cacheDir, cfg.cacheDiskBytes, enc)
+	cache, err := content.NewTieredCache(cfg.cacheRAMBytes, "", 0, atRest())
 	if err != nil {
-		log.Fatalf("build cache (dir=%s): %v", cfg.cacheDir, err)
-	}
-	if cfg.cacheDir != "" && cfg.cacheDiskBytes > 0 {
-		encNote := ""
-		if enc.Enabled() {
-			encNote = " (AES-256-GCM at rest)"
-		}
-		log.Printf("read cache: %d MiB RAM + %d MiB disk at %s%s", cfg.cacheRAMBytes>>20, cfg.cacheDiskBytes>>20, cfg.cacheDir, encNote)
+		log.Fatalf("build cache: %v", err)
 	}
 	return cache
 }
@@ -636,15 +526,7 @@ func main() {
 		go serveMetrics(ctx, cfg.metricsAddr)
 	}
 
-	var runErr error
-	switch {
-	case cfg.writable && cfg.journalDSN != "":
-		runErr = runRemotePrimary(ctx, client, cfg)
-	case cfg.writable:
-		runPrimary(ctx, client, cfg)
-	default:
-		runReadOnly(ctx, client, cfg)
-	}
+	runErr := runRemotePrimary(ctx, client, cfg)
 	log.Print("vcs stopped")
 	if runErr != nil {
 		// The graceful eviction drain did not complete: some ADMITTED —
@@ -659,184 +541,18 @@ func main() {
 	}
 }
 
-func runReadOnly(ctx context.Context, client *backend.Client, cfg config) {
-	setRole("read-only")
-	entries, err := client.Manifest(ctx, cfg.volumeID, cfg.branch)
-	if err != nil {
-		log.Fatalf("fetch manifest: %v", err)
-	}
-	log.Printf("loaded %d manifest entries for %s@%s (read-only)", len(entries), cfg.volumeID, cfg.branch)
-	cache := buildCache(cfg)
-	maybePrefetch(ctx, cfg, client, cache, entries)
-	serveNFS(ctx, cfg, volfs.NewWithCache(entries, client, cache))
-}
-
-func runPrimary(ctx context.Context, client *backend.Client, cfg config) {
-	setRole("primary")
-	entries, err := client.Manifest(ctx, cfg.volumeID, cfg.branch)
-	if err != nil {
-		log.Fatalf("fetch manifest: %v", err)
-	}
-	w, err := wal.OpenEncrypted(cfg.walPath, atRest())
-	if err != nil {
-		log.Fatalf("open wal %s: %v", cfg.walPath, err)
-	}
-	// Use AcquireWhenFree, not a one-shot Acquire+Fatal: a restart after our OWN crash finds the
-	// dead holder's lease still ticking down (TTL not yet expired), so we WAIT for it to free and
-	// then take over — instead of exiting, which wedged the volume for up to the full lease TTL
-	// while a supervisor crash-looped us. A genuinely LIVE other primary keeps renewing its lease,
-	// so this still blocks (never double-serves) rather than racing it; ctx cancellation aborts a
-	// clean shutdown.
-	poll := cfg.failoverPoll
-	if poll <= 0 {
-		poll = time.Second
-	}
-	auth, err := authority.AcquireWhenFree(ctx, client, cfg.volumeID, cfg.branch, holderID(), cfg.leaseTTLms, poll)
-	if err != nil {
-		if ctx.Err() != nil {
-			return // clean shutdown while waiting for a busy lease
-		}
-		log.Fatalf("acquire write authority for %s: %v", cfg.volumeID, err)
-	}
-	cache := buildCache(cfg)
-	maybePrefetch(ctx, cfg, client, cache, entries)
-	wfs, err := workfs.NewWithCache(entries, client, w, cache)
-	if err != nil {
-		log.Fatalf("build working fs: %v", err)
-	}
-	// After construction (WAL replay must always load, even past a lowered
-	// bound), before serving: only new write admissions are bounded.
-	dirtyMax, _ := cfg.dirtyRSSMaxBytes() // validated at startup
-	wfs.SetDirtyRSSMax(dirtyMax)
-	log.Printf("primary: %d entries, WAL=%s, exclusive lease (%dms) held, checkpoint every %s", len(entries), cfg.walPath, cfg.leaseTTLms, cfg.checkpointEvery)
-	servePrimary(ctx, cfg, wfs, auth)
-}
-
-// servePrimary runs the development/self-host writable serving loop: renew +
-// checkpoint loops, NFS serve, and on shutdown a final checkpoint + lease
-// release. The checkpoint loop is structural to THIS path only — a managed
-// store (remote journal) never checkpoints in-process, and the managed
-// serving path (remote.go) never reaches here.
-func servePrimary(ctx context.Context, cfg config, wfs *workfs.FS, auth *authority.Authority) {
-	// serveCtx fences the data plane: if the lease is lost (a successor claimed, or
-	// a partition outlived the TTL), renewLoop cancels it so serveNFS stops and the
-	// node steps down — a deposed primary must not keep serving stale reads.
-	serveCtx, fence := context.WithCancel(ctx)
-	defer fence()
-	go renewLoop(serveCtx, auth, cfg.renewEvery(), cfg.leaseTTL(), fence)
-	// Fence on WAL poison too: a durability failure means the in-memory tree may hold
-	// applied-but-unacked state, so the node must stop serving (reads and checkpoints
-	// included), not keep answering from poisoned state.
-	go func() {
-		select {
-		case <-wfs.PoisonedCh():
-			log.Print("WAL poisoned (durability failure): fencing data plane and stepping down")
-			fence()
-		case <-serveCtx.Done():
-		}
-	}()
-	wfs.StartOrphanSweeper(serveCtx)
-	go checkpointLoop(serveCtx, wfs, auth, cfg.checkpointEvery)
-	defer func() {
-		finalCheckpoint(wfs, auth)
-		_ = auth.Release(context.Background())
-	}()
-	serveNFS(serveCtx, cfg, wfs)
-}
-
-func serveNFS(ctx context.Context, cfg config, fsys billy.Filesystem) {
-	if cfg.fsAddr != "" {
-		go serveFSProto(ctx, cfg.fsAddr, fsys)
-	}
-	if err := requireNFSExposureOK(cfg.addr); err != nil {
-		log.Fatalf("nfs: %v", err)
-	}
-	ln, err := net.Listen("tcp", cfg.addr)
-	if err != nil {
-		log.Fatalf("listen %s: %v", cfg.addr, err)
-	}
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	log.Printf("vcs serving NFSv3 for volume %s on %s", cfg.volumeID, ln.Addr())
-	log.Printf("mount (macOS): sudo mount -o vers=3,tcp,port=%s,mountport=%s,noacl,noresvport 127.0.0.1:/ /tmp/vcsmnt", port, port)
-	log.Printf("mount (Linux): sudo mount -t nfs -o vers=3,tcp,port=%s,mountport=%s,nolock 127.0.0.1:/ /tmp/vcsmnt", port, port)
-	// The read-only and dev writable roles funnel through here once they are
-	// actually serving, so this is the one place to flip readiness on; it flips
-	// back off as the serve loop unwinds. (The managed child flips readiness in
-	// serveRemotePrimary after its startup proofs instead.)
-	setReady(true)
-	defer setReady(false)
-	if err := server.Serve(ctx, ln, fsys); err != nil {
-		log.Fatalf("serve: %v", err)
-	}
-}
-
-// requireNFSExposureOK refuses a non-loopback NFSv3 bind unless explicitly
-// acknowledged. NFSv3 here uses a null-auth handler — it does NOT authenticate (it
-// ignores VCS_AUTH_TOKEN and cannot do TLS), so a non-loopback bind exposes the entire
-// volume read/write to the network. Bind 127.0.0.1, or set VCS_NFS_EXPOSED=1 to confirm
-// you are securing the network layer (firewall/VPN/WireGuard) yourself. (FUSE/fsproto
-// clients ARE token-authenticated and gated separately by RequireSecureExposure.)
-func requireNFSExposureOK(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	if secure.IsLoopbackBind(host) || os.Getenv("VCS_NFS_EXPOSED") == "1" {
-		return nil
-	}
-	return fmt.Errorf(
-		"refusing NFSv3 on non-loopback %s: NFSv3 has NO application-level auth (it ignores VCS_AUTH_TOKEN "+
-			"and cannot do TLS). Bind 127.0.0.1, or set VCS_NFS_EXPOSED=1 to confirm you secure the network layer yourself",
-		addr)
-}
-
-// serveFSProto serves the same filesystem over the custom protocol for FUSE
-// clients (live coherence, parallel I/O), alongside NFS.
-func serveFSProto(ctx context.Context, addr string, fsys billy.Filesystem) {
-	if err := secure.RequireSecureExposure(addr); err != nil {
-		log.Fatalf("fsproto: %v", err)
-	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Printf("fsproto listen %s: %v", addr, err)
-		return
-	}
-	serveFSProtoOn(ctx, ln, fsys)
-}
-
 // serveFSProtoOn serves fsproto on an already-bound listener (the managed
 // child binds 127.0.0.1:0 itself; secure exposure was validated by the
 // caller/binder). Blocks until ctx ends.
 func serveFSProtoOn(ctx context.Context, ln net.Listener, fsys billy.Filesystem) {
 	ln = maybeTLS(ln, "fsproto")
-	log.Printf("vcs serving custom FS protocol (FUSE clients) on %s", ln.Addr())
-	log.Printf("mount it: mount-bin -addr %s -mount /mnt/vol", ln.Addr())
+	log.Printf("vcs serving custom FS protocol (FUSE/FSKit clients) on %s", ln.Addr())
 	var notifier fsproto.Notifier
-	var deleg fsproto.Delegations
 	if n, ok := fsys.(fsproto.Notifier); ok {
-		notifier = n             // writable working tree pushes cache invalidations
-		deleg = delegation.New() // ...and supports checkout/checkin coordination
+		notifier = n // writable working tree pushes cache invalidations
 	}
-	if err := fsproto.NewServer(fsys, notifier, deleg).Serve(ctx, ln); err != nil {
+	if err := fsproto.NewServer(fsys, notifier).Serve(ctx, ln); err != nil {
 		log.Printf("fsproto serve: %v", err)
-	}
-}
-
-func checkpointLoop(ctx context.Context, wfs *workfs.FS, auth *authority.Authority, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			head, err := checkpoint.Run(ctx, wfs, auth)
-			if err != nil {
-				log.Printf("checkpoint: %v", err)
-			} else if head != "" {
-				log.Printf("checkpoint -> %s", head)
-			}
-		}
 	}
 }
 
@@ -922,15 +638,6 @@ func renewLoop(ctx context.Context, auth leaseRenewer, every, ttl time.Duration,
 			}
 			log.Printf("lease renew failed (retrying; self-fence watchdog armed for %s): %v", deadline, err)
 		}
-	}
-}
-
-func finalCheckpoint(wfs *workfs.FS, auth *authority.Authority) {
-	head, err := checkpoint.Run(context.Background(), wfs, auth)
-	if err != nil {
-		log.Printf("final checkpoint: %v", err)
-	} else if head != "" {
-		log.Printf("final checkpoint -> %s", head)
 	}
 }
 

@@ -38,6 +38,13 @@ type fakeRepo struct {
 	afterCopyReceipt  func() error
 	beforeMarkReady   func() error
 	heartbeatErr      func() error
+	retentionRelease  func(limit int) (int64, error)
+
+	// call counters (RPC-shape evidence for the convergence/batching tests).
+	callsLocate       int64
+	callsLocateBatch  int64
+	callsReceipt      int64
+	callsReceiptBatch int64
 }
 
 type fakeCut struct {
@@ -400,6 +407,29 @@ func (f *fakeRepo) IntendObjects(_ context.Context, cutID string, claimEpoch int
 func (f *fakeRepo) RecordCopyReceipt(_ context.Context, cutID string, claimEpoch int64, digest string, incarnation int64, failureDomain, storageKey string, size int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.callsReceipt++
+	return f.recordCopyReceiptLocked(cutID, claimEpoch, digest, incarnation, failureDomain, storageKey, size)
+}
+
+func (f *fakeRepo) RecordCopyReceipts(_ context.Context, cutID string, claimEpoch int64, receipts []CopyReceipt) error {
+	if len(receipts) < 1 || len(receipts) > 4096 {
+		return fmt.Errorf("copy receipt batches are bounded to 1..4096 entries")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callsReceiptBatch++
+	for _, r := range receipts {
+		if err := f.recordCopyReceiptLocked(cutID, claimEpoch,
+			r.Digest, r.Incarnation, r.FailureDomain, r.StorageKey, r.Size); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recordCopyReceiptLocked mirrors pfh.object_copy_receipt: intent binding,
+// incarnation fence, and the 025 write-quorum 'live' flip.
+func (f *fakeRepo) recordCopyReceiptLocked(cutID string, claimEpoch int64, digest string, incarnation int64, failureDomain, storageKey string, size int64) error {
 	if f.beforeCopyReceipt != nil {
 		if err := f.beforeCopyReceipt(); err != nil {
 			return err
@@ -434,7 +464,7 @@ func (f *fakeRepo) RecordCopyReceipt(_ context.Context, cutID string, claimEpoch
 			present++
 		}
 	}
-	if present >= len(f.requiredDomains) && (o.state == "intended" || o.state == "reclaiming") {
+	if present >= writeQuorum(len(f.requiredDomains)) && (o.state == "intended" || o.state == "reclaiming") {
 		o.state = "live"
 		o.lastUpdateMs = f.nowMs
 	}
@@ -457,6 +487,50 @@ func (f *fakeRepo) AddCutObjects(_ context.Context, cutID string, claimEpoch int
 		cut.closures[closure][d] = true
 	}
 	return nil
+}
+
+// AddCutObjectsFromBase mirrors pfh.cut_objects_add_from_base: copy the
+// adopted same-branch base cut's closure rows and answer final totals.
+func (f *fakeRepo) AddCutObjectsFromBase(_ context.Context, cutID string, claimEpoch int64) (ClosureTotals, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cut, err := f.requireClaim(cutID, claimEpoch)
+	if err != nil {
+		return ClosureTotals{}, err
+	}
+	base := cut.facts.BaseCommit
+	if base == nil || base.CommitKind != "pft2" || base.BaseMode != "adopted" {
+		return ClosureTotals{}, fmt.Errorf("cut %s base is not an adopted pft2 commit", cutID)
+	}
+	var baseCut *fakeCut
+	for _, other := range f.cuts {
+		if other.state == "ready" && other.commitID == base.CommitID {
+			baseCut = other
+			break
+		}
+	}
+	if baseCut == nil {
+		return ClosureTotals{}, fmt.Errorf("base commit %s has no ready cut", base.CommitID)
+	}
+	for closure, digests := range baseCut.closures {
+		for digest := range digests {
+			cut.closures[closure][digest] = true
+		}
+	}
+	totals := ClosureTotals{}
+	for digest := range cut.closures["user"] {
+		totals.UserObjectCount++
+		if o, ok := f.objects[objKey(cut.tenant, "pft2", digest)]; ok {
+			totals.UserObjectBytes += o.size
+		}
+	}
+	for digest := range cut.closures["recovery"] {
+		totals.RecoveryObjectCount++
+		if o, ok := f.objects[objKey(cut.tenant, "pft2", digest)]; ok {
+			totals.RecoveryObjectBytes += o.size
+		}
+	}
+	return totals, nil
 }
 
 func (f *fakeRepo) MarkCutReady(_ context.Context, in ReadyFacts) error {
@@ -486,6 +560,11 @@ func (f *fakeRepo) MarkCutReady(_ context.Context, in ReadyFacts) error {
 	if cut.closures["user"]["sha256:"+in.RecoveryRootDigestHex] {
 		return fmt.Errorf("%w: user closure reaches the recovery root", historycut.ErrCorrupt)
 	}
+	// Mirrors the 025 pfh.cut_mark_ready readiness rule: W-of-N verified
+	// copies per closure object; the freshness window applies only to
+	// objects THIS cut produced (intent rows) — reused rows count on
+	// presence, with scrub owning their cadence.
+	quorum := writeQuorum(len(f.requiredDomains))
 	for _, closure := range []string{"user", "recovery"} {
 		for digest := range cut.closures[closure] {
 			key := objKey(cut.tenant, "pft2", digest)
@@ -493,11 +572,20 @@ func (f *fakeRepo) MarkCutReady(_ context.Context, in ReadyFacts) error {
 			if !ok || o.state != "live" {
 				return fmt.Errorf("%w: closure object %s is not live", historycut.ErrCorrupt, digest)
 			}
+			_, intended := cut.intents[digest]
+			counted := 0
 			for _, domain := range f.requiredDomains {
 				c, ok := f.copies[copyKey(key, o.incarnation, domain)]
-				if !ok || c.state != "present" || c.lastVerified < f.nowMs-f.freshnessMs {
-					return fmt.Errorf("%w: object %s misses a fresh copy in %s", historycut.ErrCorrupt, digest, domain)
+				if !ok || c.state != "present" {
+					continue
 				}
+				if intended && c.lastVerified < f.nowMs-f.freshnessMs {
+					continue
+				}
+				counted++
+			}
+			if counted < quorum {
+				return fmt.Errorf("%w: object %s holds %d of the %d-copy quorum", historycut.ErrCorrupt, digest, counted, quorum)
 			}
 		}
 	}
@@ -514,10 +602,31 @@ func (f *fakeRepo) MarkCutReady(_ context.Context, in ReadyFacts) error {
 func (f *fakeRepo) LocateObject(_ context.Context, tenant, kind, digest string) (*ObjectLocation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.callsLocate++
+	return f.locateLocked(tenant, kind, digest), nil
+}
+
+func (f *fakeRepo) LocateObjects(_ context.Context, tenant, kind string, digests []string) (map[string]*ObjectLocation, error) {
+	if len(digests) < 1 || len(digests) > 512 {
+		return nil, fmt.Errorf("object locate batches are bounded to 1..512 digests")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callsLocateBatch++
+	out := make(map[string]*ObjectLocation, len(digests))
+	for _, digest := range digests {
+		if loc := f.locateLocked(tenant, kind, digest); loc != nil {
+			out[digest] = loc
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) locateLocked(tenant, kind, digest string) *ObjectLocation {
 	key := objKey(tenant, kind, digest)
 	o, ok := f.objects[key]
 	if !ok || o.state == "tombstoned" {
-		return nil, nil
+		return nil
 	}
 	out := &ObjectLocation{
 		TenantID: tenant, Kind: kind, Digest: digest,
@@ -532,7 +641,7 @@ func (f *fakeRepo) LocateObject(_ context.Context, tenant, kind, digest string) 
 			Size: c.size, LastVerified: c.lastVerified,
 		})
 	}
-	return out, nil
+	return out
 }
 
 func (f *fakeRepo) copiesOf(key string, incarnation int64) map[string]*fakeCopy {
@@ -750,6 +859,18 @@ func (f *fakeRepo) releaseCut(cutID string) {
 	if cut, ok := f.cuts[cutID]; ok {
 		cut.consumed = false
 	}
+}
+
+// RetentionRelease answers the injected hook; the release policy itself is
+// SQL (pfh.retention_release) and covered by the Postgres harness.
+func (f *fakeRepo) RetentionRelease(_ context.Context, limit int) (int64, error) {
+	f.mu.Lock()
+	hook := f.retentionRelease
+	f.mu.Unlock()
+	if hook == nil {
+		return 0, ErrCapabilityMissing
+	}
+	return hook(limit)
 }
 
 func (f *fakeRepo) ClaimSweep(_ context.Context, workerID string, minAgeMs, leaseTTLMs int64) (*SweepClaim, error) {

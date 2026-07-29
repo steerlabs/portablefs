@@ -9,8 +9,10 @@
  * from the end of the previous run. The same ordered element sequence always
  * produces the same tree.
  *
- * Builders never touch an object store on a mutation path: they run in
- * HistoryCut/materializer context and callers decide where bytes go.
+ * TEST-ONLY module — deliberately not exported from the package barrel. The
+ * Go history worker is the sole production producer of PFT2 objects; this
+ * mirror exists to construct real PFT2 fixtures for reader tests (verified
+ * against the shared golden vectors in golden.test.ts).
  */
 import { createHash } from "node:crypto";
 import {
@@ -50,18 +52,11 @@ import {
   type Pft2InodeIndexEntry,
   type Pft2Node,
   type Pft2Ref,
+  isZeroCell,
+  type Pft2NodeSink,
+  type Pft2PackSink,
 } from "./types.js";
 import { compareBytes, sizeTagged } from "./wire.js";
-
-/** Persists one encoded metadata node (reference computed by the builder). */
-export interface Pft2NodeSink {
-  putNode(ref: Pft2Ref, encoded: Uint8Array): void;
-}
-
-/** Persists one packed immutable data object. */
-export interface Pft2PackSink {
-  putPack(ref: Pft2Ref, data: Uint8Array): void;
-}
 
 function shouldClose(currentBytes: number, elemBytes: number, count: number, maxCount: number): boolean {
   return count > 0 && (count >= maxCount || currentBytes + elemBytes > PFT2_TARGET_NODE_BYTES);
@@ -371,15 +366,6 @@ export function buildControlTree(entries: Pft2ControlEntry[], sink: Pft2NodeSink
   return { root, entryCount: BigInt(entries.length), counts };
 }
 
-/** True when every byte is zero (the cell is canonically a hole). */
-export function isZeroCell(cell: Uint8Array): boolean {
-  for (const byte of cell) {
-    if (byte !== 0) {
-      return false;
-    }
-  }
-  return true;
-}
 
 /**
  * Packs changed nonzero cells into immutable data objects under the frozen

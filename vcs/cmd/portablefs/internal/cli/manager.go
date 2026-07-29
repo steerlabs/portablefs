@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -36,17 +35,17 @@ func (e *cmdEnv) managerClient(baseURL, token string) *managerClient {
 	return &managerClient{jsonClient: e.jsonClient(baseURL, token), pendingCreateOp: map[string]string{}}
 }
 
-// mountSession is the resolved data-plane endpoint + credential for one mount.
-type mountSession struct {
+// accessSession is the resolved data-plane endpoint + credential for one
+// mount, minted by POST /v1/access-leases/create — the only resolution route.
+type accessSession struct {
 	AuthorityURL        string `json:"authorityUrl"`
 	Host                string `json:"host"`
 	Port                int    `json:"port"`
-	NFSPort             int    `json:"nfsPort"`
 	Token               string `json:"token"`
 	ExpiresAtMs         int64  `json:"expiresAtMs"`
 	AuthorityInstanceID string `json:"authorityInstanceId"`
-	// Lease is set when the session came from the canonical access-lease
-	// route; the mount renews it at half-TTL and releases it on unmount.
+	// Lease is the renewable slice: the mount renews it at half-TTL and
+	// releases it on unmount.
 	Lease *leaseState `json:"lease,omitempty"`
 }
 
@@ -125,14 +124,13 @@ func (w leaseWire) toState(token string) *leaseState {
 	return &leaseState{AccessLeaseID: w.AccessLeaseID, AccessToken: token, ExpiresAtMs: w.ExpiresAt, ControlSeq: w.ControlSeq}
 }
 
-// createAccessLease drives POST /v1/access-leases/create. handled=false means
-// the manager predates the route (404/405) and the caller must fall back to
-// the mount-session chain. teamID is sent ONLY for a split self-host
-// deployment (a distinct volume-api and authority-manager, where the client
-// resolves tenancy); a unified control plane (the hosted broker) owns tenancy
-// itself and rejects a client teamId, so the caller passes "" there. See
-// resolveVolumeTeamID.
-func (c *managerClient) createAccessLease(ctx context.Context, volumeID, branch, teamID string) (*mountSession, bool, error) {
+// resolveAccess drives POST /v1/access-leases/create — the only endpoint
+// resolution route (retired mount-session/authority-session routes answer
+// 410). teamID is sent ONLY for a split self-host deployment (a distinct
+// volume-api and authority-manager, where the client resolves tenancy); a
+// unified control plane (the hosted broker) owns tenancy itself and rejects a
+// client teamId, so the caller passes "" there. See resolveVolumeTeamID.
+func (c *managerClient) resolveAccess(ctx context.Context, volumeID, branch, teamID string) (*accessSession, error) {
 	key := volumeID + "\x00" + branch
 	c.opMu.Lock()
 	opID := c.pendingCreateOp[key]
@@ -147,7 +145,6 @@ func (c *managerClient) createAccessLease(ctx context.Context, volumeID, branch,
 			AuthorityURL        string `json:"authorityUrl"`
 			Host                string `json:"host"`
 			Port                int    `json:"port"`
-			NFSPort             int    `json:"nfsPort"`
 			AuthorityInstanceID string `json:"authorityInstanceId"`
 		} `json:"authority"`
 		Lease       leaseWire `json:"lease"`
@@ -163,41 +160,32 @@ func (c *managerClient) createAccessLease(ctx context.Context, volumeID, branch,
 		createBody["teamId"] = teamID
 	}
 	err := c.do(ctx, "POST", "/v1/access-leases/create", createBody, &out, 0)
-	if httpStatus(err) == 404 || httpStatus(err) == 405 {
-		// Older manager without the route: the operation never executed;
-		// drop the retained id and use the legacy chain.
-		c.opMu.Lock()
-		delete(c.pendingCreateOp, key)
-		c.opMu.Unlock()
-		return nil, false, err
-	}
 	if err != nil {
 		if !ambiguousFailure(err) {
 			c.opMu.Lock()
 			delete(c.pendingCreateOp, key)
 			c.opMu.Unlock()
 		}
-		return nil, true, fmt.Errorf("create access lease for %s@%s: %w", volumeID, branch, err)
+		return nil, fmt.Errorf("create access lease for %s@%s: %w", volumeID, branch, err)
 	}
 	c.opMu.Lock()
 	delete(c.pendingCreateOp, key)
 	c.opMu.Unlock()
 	if out.Authority.AuthorityURL == "" {
-		return nil, true, fmt.Errorf("manager returned an access lease without an authority endpoint")
+		return nil, fmt.Errorf("manager returned an access lease without an authority endpoint")
 	}
 	if out.AccessToken == "" || out.Lease.AccessLeaseID == "" {
-		return nil, true, fmt.Errorf("manager returned an incomplete access lease for %s@%s", volumeID, branch)
+		return nil, fmt.Errorf("manager returned an incomplete access lease for %s@%s", volumeID, branch)
 	}
-	return &mountSession{
+	return &accessSession{
 		AuthorityURL:        out.Authority.AuthorityURL,
 		Host:                out.Authority.Host,
 		Port:                out.Authority.Port,
-		NFSPort:             out.Authority.NFSPort,
 		Token:               out.AccessToken,
 		ExpiresAtMs:         out.Lease.ExpiresAt,
 		AuthorityInstanceID: out.Authority.AuthorityInstanceID,
 		Lease:               out.Lease.toState(out.AccessToken),
-	}, true, nil
+	}, nil
 }
 
 // renewAccessLease drives POST /v1/access-leases/renew with the retry-stable
@@ -241,9 +229,8 @@ func (c *managerClient) releaseAccessLease(ctx context.Context, lease leaseState
 
 // leaseKeeper renews a mounted volume's access lease in the background and
 // releases it on unmount. Renewals fire at half the remaining TTL; a renewal
-// that fails definitively (lease expired/revoked/epoch-superseded) falls back
-// to minting a fresh lease through the full mountSession ladder, so a mount
-// outlives any single lease.
+// that fails definitively (lease expired/revoked/epoch-superseded) mints a
+// fresh lease through resolveAccess, so a mount outlives any single lease.
 type leaseKeeper struct {
 	manager  *managerClient
 	volumeID string
@@ -294,7 +281,7 @@ func (k *leaseKeeper) snapshot() leaseState {
 // renewOnce performs one renewal. An ambiguous failure retains the
 // operationId so the next tick replays the SAME renewal (the manager's
 // receipts make that idempotent); a definitive failure re-creates a fresh
-// lease via the mountSession ladder.
+// lease via resolveAccess.
 func (k *leaseKeeper) renewOnce(ctx context.Context) {
 	k.mu.Lock()
 	opID := k.pendingRenew
@@ -320,11 +307,11 @@ func (k *leaseKeeper) renewOnce(ctx context.Context) {
 	}
 	// Definitive refusal (epoch superseded, unknown to the new epoch,
 	// expired/revoked/released, CAS conflict after a lost receipt): this
-	// lease can never renew again; mint a fresh one through the full ladder.
+	// lease can never renew again; mint a fresh one.
 	k.mu.Lock()
 	k.pendingRenew = ""
 	k.mu.Unlock()
-	ms, createErr := k.manager.mountSession(ctx, k.volumeID, k.branch, k.teamID)
+	ms, createErr := k.manager.resolveAccess(ctx, k.volumeID, k.branch, k.teamID)
 	if createErr != nil {
 		// Re-acquire failing with a credential rejection is TERMINAL: after
 		// a key revocation both the renew and the create path answer
@@ -335,12 +322,6 @@ func (k *leaseKeeper) renewOnce(ctx context.Context) {
 		if credentialRejected(createErr) {
 			k.credWatch.noteRejected(createErr)
 		}
-		return
-	}
-	if ms.Lease == nil {
-		// A non-lease manager rung answered: the credential is accepted,
-		// there is just no lease to adopt on this transport.
-		k.credWatch.noteHealthy()
 		return
 	}
 	k.mu.Lock()
@@ -378,103 +359,4 @@ func (k *leaseKeeper) release() {
 		// Best-effort by contract: the lease expires on its own.
 		fmt.Fprintf(os.Stderr, "portablefs: %v\n", err)
 	}
-}
-
-type authorityPayload struct {
-	AuthorityURL        string `json:"authorityUrl"`
-	Host                string `json:"host"`
-	Port                int    `json:"port"`
-	NFSPort             int    `json:"nfsPort"`
-	AuthorityInstanceID string `json:"authorityInstanceId"`
-	AuthorityAuthToken  string `json:"authorityAuthToken"`
-	AuthorityExpiresAt  int64  `json:"authorityExpiresAt"`
-}
-
-// mountSession resolves a live mount endpoint for volumeID+branch. It prefers
-// the canonical POST /v1/access-leases/create route (idempotent per
-// operationId, renewable, releasable); a manager that predates it (404/405)
-// is served by POST /v1/volumes/:id/mount-sessions, then the flat
-// /v1/mount-sessions alias, then the legacy /v1/authorities/ensure +
-// /v1/authorities/session pair — exactly the pre-lease ladder. The canonical
-// access-lease route resolves tenancy control-plane-side; only the legacy
-// self-host env-mode ladder still accepts a client teamId, so it rides along
-// there when known.
-func (c *managerClient) mountSession(ctx context.Context, volumeID, branch, teamID string) (*mountSession, error) {
-	if ms, handled, err := c.createAccessLease(ctx, volumeID, branch, teamID); handled {
-		return ms, err
-	}
-	ref := map[string]string{"volumeId": volumeID, "branch": branch}
-	if teamID != "" {
-		ref["teamId"] = teamID
-	}
-	var newStyle struct {
-		MountSession struct {
-			Endpoint struct {
-				AuthorityURL string `json:"authorityUrl"`
-				Host         string `json:"host"`
-				Port         int    `json:"port"`
-				NFSPort      int    `json:"nfsPort"`
-			} `json:"endpoint"`
-			Token               string `json:"token"`
-			ExpiresAtMs         int64  `json:"expiresAtMs"`
-			AuthorityInstanceID string `json:"authorityInstanceId"`
-		} `json:"mountSession"`
-	}
-	// Canonical volume-scoped route first (served by both the OSS manager and
-	// hosted control planes), then the flat alias, then the legacy pair.
-	err := c.do(ctx, "POST", "/v1/volumes/"+url.PathEscape(volumeID)+"/mount-sessions", ref, &newStyle, 0)
-	if httpStatus(err) == 404 || httpStatus(err) == 405 {
-		err = c.do(ctx, "POST", "/v1/mount-sessions", ref, &newStyle, 0)
-	}
-	if err == nil {
-		ms := newStyle.MountSession
-		if ms.Endpoint.AuthorityURL == "" {
-			return nil, fmt.Errorf("manager returned a mount session without an authority endpoint")
-		}
-		return &mountSession{
-			AuthorityURL:        ms.Endpoint.AuthorityURL,
-			Host:                ms.Endpoint.Host,
-			Port:                ms.Endpoint.Port,
-			NFSPort:             ms.Endpoint.NFSPort,
-			Token:               ms.Token,
-			ExpiresAtMs:         ms.ExpiresAtMs,
-			AuthorityInstanceID: ms.AuthorityInstanceID,
-		}, nil
-	}
-	if httpStatus(err) != 404 {
-		return nil, fmt.Errorf("resolve mount session for %s@%s: %w", volumeID, branch, err)
-	}
-
-	// Older manager: ensure the authority exists, then mint the session token.
-	var ensure struct {
-		Authority authorityPayload `json:"authority"`
-	}
-	if err := c.do(ctx, "POST", "/v1/authorities/ensure", ref, &ensure, 0); err != nil {
-		return nil, fmt.Errorf("ensure authority for %s@%s: %w", volumeID, branch, err)
-	}
-	var session struct {
-		Authority authorityPayload `json:"authority"`
-	}
-	if err := c.do(ctx, "POST", "/v1/authorities/session", ref, &session, 0); err != nil {
-		return nil, fmt.Errorf("mint mount session for %s@%s: %w", volumeID, branch, err)
-	}
-	a := session.Authority
-	if a.AuthorityURL == "" {
-		a.AuthorityURL = ensure.Authority.AuthorityURL
-	}
-	if a.AuthorityInstanceID == "" {
-		a.AuthorityInstanceID = ensure.Authority.AuthorityInstanceID
-	}
-	if a.AuthorityURL == "" {
-		return nil, fmt.Errorf("manager returned no authority endpoint for %s@%s", volumeID, branch)
-	}
-	return &mountSession{
-		AuthorityURL:        a.AuthorityURL,
-		Host:                a.Host,
-		Port:                a.Port,
-		NFSPort:             a.NFSPort,
-		Token:               a.AuthorityAuthToken,
-		ExpiresAtMs:         a.AuthorityExpiresAt,
-		AuthorityInstanceID: a.AuthorityInstanceID,
-	}, nil
 }

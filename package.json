@@ -15,7 +15,7 @@
     "verify": "bash scripts/verify-local.sh",
     "verify:postgres": "bash scripts/verify-postgres.sh",
     "test:postgres": "pnpm build && PORTABLEFS_TEST_POSTGRES=true pnpm --filter @portablefs/metadata-db exec vitest run src/postgres.integration.test.ts",
-    "test:railway-bucket": "pnpm build && PORTABLEFS_TEST_RAILWAY_BUCKET=true pnpm --filter @portablefs/storage-railway exec vitest run src/railway-bucket.integration.test.ts",
+    "test:s3-bucket": "pnpm build && PORTABLEFS_TEST_S3_BUCKET=true pnpm --filter @portablefs/storage-s3 exec vitest run src/s3.integration.test.ts",
     "bench:manifest-index": "pnpm build && node scripts/benchmark-manifest-index.mjs"
   },
   "devDependencies": {

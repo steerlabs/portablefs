@@ -11,7 +11,14 @@ import type {
   VolumeHeadResult,
   VolumeListEntry,
 } from "@portablefs/metadata-db";
-import type { BlobDigest, VolumeBranch, VolumeCommitSummary, Volume } from "@portablefs/protocol";
+import {
+  protocolVersion,
+  type BlobDigest,
+  type TreeEntry,
+  type VolumeBranch,
+  type VolumeCommitSummary,
+  type Volume,
+} from "@portablefs/protocol";
 import { ControlReadiness } from "./readiness.js";
 import { createVolumeApiServer, type VolumeApiServerDeps } from "./server.js";
 
@@ -357,6 +364,78 @@ describe("createVolumeApiServer", () => {
     expect(deletedObjects).toEqual(["sha256:garbage"]);
 
     const unauth = await fetch(`${baseUrl}/v1/admin/gc`, { method: "POST", body: "{}" });
+    expect(unauth.status).toBe(401);
+  });
+
+  test("admin integrity walks referenced blobs and chunks and reports the missing ones", async () => {
+    const present = new Set<string>(["sha256:present", "sha256:chunk-present"]);
+    const blobStore = {
+      async has(digest: BlobDigest) {
+        return present.has(digest);
+      },
+    } as unknown as BlobStore;
+
+    const entry = (overrides: Partial<TreeEntry> & Pick<TreeEntry, "path" | "kind">): TreeEntry => ({
+      mode: 0o644,
+      size: 1,
+      mtimeMs: 0,
+      executable: false,
+      ...overrides,
+    });
+    const zeroHash = `sha256:${"0".repeat(64)}`;
+    const metadata = throwingMetadata();
+    metadata.listCommits = async () => [
+      {
+        id: "cmt_1",
+        volumeId: "vol_1",
+        branchId: "brn_1",
+        treeHash: zeroHash,
+        mutationCount: 0,
+        byteCount: 0,
+        createdAt: 0,
+        manifest: {
+          version: protocolVersion,
+          treeHash: zeroHash,
+          entries: [
+            entry({ kind: "directory", path: "src", mode: 0o755, size: 0 }),
+            entry({
+              kind: "file",
+              path: "a",
+              blob: { digest: "sha256:present", size: 1, compression: "none", packed: false },
+            }),
+            entry({
+              kind: "file",
+              path: "b",
+              chunks: [
+                { digest: "sha256:chunk-present", size: 1, offset: 0 },
+                { digest: "sha256:chunk-missing", size: 1, offset: 1 },
+              ],
+            }),
+            entry({
+              kind: "file",
+              path: "c",
+              blob: { digest: "sha256:missing", size: 1, compression: "none", packed: false },
+            }),
+          ],
+        },
+      },
+    ];
+
+    const baseUrl = await startServer("secret-token", blobStore, metadata);
+    const response = await fetch(`${baseUrl}/v1/admin/integrity`, {
+      headers: { authorization: "Bearer secret-token" },
+    });
+    expect(response.status).toBe(200);
+    const report = (await response.json()) as {
+      commitsChecked: number;
+      blobsChecked: number;
+      missingBlobs: string[];
+    };
+    expect(report.commitsChecked).toBe(1);
+    expect(report.blobsChecked).toBe(4);
+    expect(report.missingBlobs.sort()).toEqual(["sha256:chunk-missing", "sha256:missing"]);
+
+    const unauth = await fetch(`${baseUrl}/v1/admin/integrity`);
     expect(unauth.status).toBe(401);
   });
 

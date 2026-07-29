@@ -13,10 +13,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
-	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
 func selfSignedCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
@@ -53,14 +49,7 @@ func selfSignedCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
 func TestTLSRoundTrip(t *testing.T) {
 	cert, caPool := selfSignedCert(t)
 
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +57,7 @@ func TestTLSRoundTrip(t *testing.T) {
 	tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = NewServer(fs, fs, delegation.New()).Serve(ctx, tlsLn) }()
+	go func() { _ = NewServer(fs, fs).Serve(ctx, tlsLn) }()
 	addr := ln.Addr().String()
 
 	// Encrypted client trusts the CA -> ops succeed.

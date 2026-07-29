@@ -21,10 +21,11 @@ Thirty seconds, two machines, one workspace:
 portablefs mount myagent ~/work
 cd ~/work && claude    # agent edits files, runs git, builds
 
-# server (same volume, same instant)
+# server (same live authority)
 portablefs mount myagent /srv/work
-tail -f /srv/work/agent.log   # sees the laptop's writes live — one authority, no sync delay
-# (every mount — FSKit on macOS, FUSE on Linux — gets push invalidation)
+tail -f /srv/work/agent.log   # sees flushed writes from the shared authority
+# Linux FUSE applies push invalidations through the kernel; macOS FSKit's
+# current SDK boundary is documented below.
 
 # close the laptop. The mount disappears; the workspace does not.
 # The agent on the server keeps working. Every acked write was already
@@ -90,9 +91,8 @@ portablefs mount myagent ~/work                # mount it live
 # (macOS: install PortableFS.app and enable its File System Extension once —
 #  see docs/fskit-mount.md; Linux: needs fuse3, e.g. `apt install fuse3`)
 cd ~/work                                      # run agents, git, builds — normal files
-# single-writer machine doing builds/installs? add --fast: writes batch and
-# flush every 250ms (~25x faster small-file storms; fsync stays a real
-# durability barrier — see docs/performance.md)
+# write-back delegation is adaptive; fsync remains the authority-durability
+# barrier (see docs/performance.md)
 
 portablefs grep myagent "TODO" --dir src  # bounded server-side content search
 portablefs history myagent                # every checkpoint the agent produced
@@ -127,17 +127,16 @@ Any Linux sandbox that can run a static binary can join a workspace. No kernel m
 beyond FUSE, no vendor integration:
 
 ```bash
-# on your machine: mint a mount session for the sandbox
+# on your machine: mint an access lease for the sandbox
 # (teamId is the volume's tenant id — "local" on the quickstart stack)
-curl -X POST "$PORTABLEFS_MANAGER_URL/v1/mount-sessions" \
+curl -X POST "$PORTABLEFS_MANAGER_URL/v1/access-leases/create" \
   -H "authorization: Bearer $PORTABLEFS_MANAGER_TOKEN" \
   -H "content-type: application/json" \
-  -d '{"volumeId":"myagent","branch":"main","teamId":"local"}'
-# -> { "mountSession": { "endpoint": { "authorityUrl": "host:2050", ... }, "token": "...", ... } }
+  -d '{"operationId":"'"$(uuidgen)"'","volumeId":"myagent","branch":"main","teamId":"local","consumerId":"sandbox-1"}'
+# -> { "authority": { "authorityUrl": "host:2050", ... }, "accessToken": "...", ... }
 
-# inside the sandbox: copy in the portablefs CLI (or the static portablefs-mount binary), then
-portablefs mount myagent /workspace --addr <endpoint.authorityUrl> --mount-token <token>
-# or: VCS_AUTH_TOKEN=<token> ./portablefs-mount -addr <endpoint.authorityUrl> -mount /workspace
+# inside the sandbox: copy in the static portablefs CLI, then
+portablefs mount myagent /workspace --addr <authority.authorityUrl> --mount-token <accessToken>
 ```
 
 The sandbox now shares the live workspace with every other mount. When the sandbox is
@@ -170,22 +169,20 @@ for containers; the Kubernetes CSI driver shown in the transport row is planned 
 not yet packaged in this repository.
 
 - `vcs/`: the Go data plane. One VCS authority owns the live working tree for an
-  active volume, serves mounts over a custom protocol (Linux FUSE client in
-  `vcs/cmd/mount`, the `portablefsd` daemon behind the macOS FSKit
-  extension, NFSv3 compat), and journals every mutation
-  durably before acking — to the fenced Postgres journal in production
-  ([docs/journal.md](./docs/journal.md)), to a crash-safe local file WAL in
-  development. `vcs/cmd/history-worker` materializes journaled history cuts into
+  active volume, serves mounts over the custom protocol — fsproto v6 — (the
+  `portablefs` CLI mounts via FUSE on Linux and the `portablefsd` daemon behind
+  the macOS FSKit extension), and journals every mutation durably to the fenced
+  Postgres journal before acking ([docs/journal.md](./docs/journal.md)).
+  `vcs/cmd/history-worker` materializes journaled history cuts into
   content-addressed history objects ([docs/history.md](./docs/history.md)).
 - `apps/volume-api`: the TypeScript control plane for volumes, branches, snapshots,
-  forks, commits, content-addressed blobs, history serving, leases, delegations, and
-  bounded server-side `grep`, over Postgres and S3-compatible (or filesystem) blob
-  storage.
+  forks, commits, content-addressed blobs, history serving, leases, delegations,
+  bounded server-side `grep`, and admin GC/integrity, over Postgres and
+  S3-compatible (or filesystem) blob storage.
 - `apps/authority-manager`: resolves `teamId + volumeId + branch` to a live authority
   endpoint and mount credential. Production mode spawns one disposable journal child
   per active branch behind one TCP/TLS router and serves access leases, so products
   and sandboxes see one stable address.
-- `apps/volume-worker`: garbage collection, compaction, and integrity checks.
 - `packages/`: shared TypeScript libraries — `protocol` (wire schemas), `core`
   (tree/manifest + PFT2), and `metadata-db` (Postgres repository + migrations).
 - `swift/`: the macOS menu-bar app and FSKit file-system extension (`PortableFSKit`).
@@ -202,14 +199,16 @@ The full contract lives in [docs/architecture.md](./docs/architecture.md).
   volume@branch. Every mount connects to that authority; nothing maintains its own
   local truth. A second claimant fences the first in the database — there is no
   promotion protocol and no split-brain window.
-- **Live multi-client coherence.** Mounts share one working tree. The authority pushes
-  invalidations, so hot reads are page-cache fast and cross-machine read-after-write is
-  exact — `git` and SQLite behave.
-- **Write durability.** A writable VCS commits every mutation to its durable log
-  before acking: the fenced, synchronously replicated PostgreSQL journal in
-  production ([docs/journal.md](./docs/journal.md)), a crash-safe local file WAL in
-  development. Authorities are disposable: on failure a replacement claims the
-  journal and cold-replays — no acknowledged write is lost.
+- **Live multi-client coherence.** Mounts share one authority-ordered working
+  tree. Linux FUSE applies push invalidations through its kernel cache hook.
+  macOS 26 FSKit exposes no equivalent invalidation hook, so PortableFS makes
+  no exact peer-visibility claim for reads satisfied entirely from FSKit's
+  kernel cache; authority durability and operations that reach the daemon
+  remain exact. See [docs/consistency-model.md](./docs/consistency-model.md).
+- **Write durability.** A writable VCS commits every mutation to the fenced,
+  synchronously replicated PostgreSQL journal before acking
+  ([docs/journal.md](./docs/journal.md)). Authorities are disposable: on failure a
+  replacement claims the journal and cold-replays — no acknowledged write is lost.
 - **Exact sessions.** Mount sessions are journaled with receipts, so a reconnecting
   client replays in-flight mutations exactly once — never lost, never doubled.
 - **Automatic history.** The journal is cut asynchronously into immutable
@@ -220,8 +219,8 @@ The full contract lives in [docs/architecture.md](./docs/architecture.md).
   Postgres metadata and content-addressed storage. Fork any snapshot into a new
   live volume; nothing rewrites history.
 - **Fail closed in production.** `VCS_PRODUCTION=1` requires the remote journal and
-  its policy-verified durability evidence, and refuses local WALs, implicit temp
-  files, and unauthenticated network-reachable data ports.
+  its policy-verified durability evidence, and refuses unauthenticated
+  network-reachable data ports.
 
 ## What PortableFS Is Not
 
@@ -232,8 +231,6 @@ The full contract lives in [docs/architecture.md](./docs/architecture.md).
 - **A single-writer-authority model.** One logical authority per active volume decides
   ordering. Concurrent writers use normal filesystem semantics plus delegations —
   never active-active multi-master, never silent merges of two writers' bytes.
-- **NFS is compatibility only.** The custom mount protocol is the production data
-  plane; NFSv3 exists for zero-install local workflows, not production coherence.
 
 ## Documentation
 
@@ -274,7 +271,7 @@ pnpm vcs:test
 pnpm vcs:test:race
 pnpm verify:postgres
 pnpm test:postgres
-pnpm test:railway-bucket
+pnpm test:s3-bucket
 pnpm bench:manifest-index
 ```
 

@@ -51,7 +51,7 @@ func renewControl() pfc2.Record {
 func flushControl(through uint64) pfc2.Record {
 	return pfc2.Record{Kind: pfc2.KindFlushAdvance, FlushAdvance: &pfc2.FlushAdvance{
 		Session: sessionRef(), WritebackID: "wb-1", CheckoutPath: "proj/data",
-		CheckoutEpoch: "12", Through: through,
+		CheckoutEpoch: "12", Through: through, Digest: hash32(0xcd),
 	}}
 }
 
@@ -98,7 +98,8 @@ var pfj3Goldens = []struct {
 		},
 		hex: "50464a33000000000000000c0000a5c62a1a3a0c2dff8a08a44bea8f4f22357bb3b71247a36d20052e70b033829708" +
 			"0c122250465231080c100ec2010a080110011a0178388003c2010a080210021a01784a0164" +
-			"1a305046433208063a280a0e0a0a7066732d3061316232631001120477622d311a0970726f6a2f6461746122023132288004",
+			"1a525046433208063a4a0a0e0a0a7066732d3061316232631001120477622d311a0970726f6a2f64617461220231322880043220" +
+			"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
 	},
 }
 

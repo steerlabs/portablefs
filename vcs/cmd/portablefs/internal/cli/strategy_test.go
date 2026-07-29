@@ -41,7 +41,7 @@ func TestResolveStrategyMatrix(t *testing.T) {
 		{"darwin explicit fuse", "fuse", "darwin", false, "", "fskit"},
 		{"retired webdav strategy", "webdav", "darwin", false, "", "unknown --strategy"},
 		{"unsupported os", "auto", "windows", false, "", "not supported"},
-		{"unknown strategy", "nfs", "linux", true, "", "unknown --strategy"},
+		{"unknown strategy", "webdav", "linux", true, "", "unknown --strategy"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

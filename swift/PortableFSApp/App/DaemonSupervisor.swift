@@ -7,7 +7,7 @@ import PortableFSAppCore
 /// and reports health for the menu.
 ///
 /// If a daemon is already answering on the control socket at startup (for
-/// example one started by `integration-live.sh` or by hand), the supervisor
+/// example one started by hand), the supervisor
 /// adopts it instead of spawning a second instance, and leaves it running on
 /// quit.
 @MainActor

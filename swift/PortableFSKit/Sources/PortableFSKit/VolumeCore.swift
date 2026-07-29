@@ -567,6 +567,22 @@ public actor VolumeCore {
         return reply
     }
 
+    /// The REAL volume barrier: the daemon drains outstanding write-back to
+    /// the authority, and success means authority-durable, applied, AND
+    /// acknowledged by every live protocol subscriber at its supported
+    /// frontend boundary. macOS 26 exposes no kernel-cache invalidation hook,
+    /// so FSKit kernel-cache visibility is not part of that acknowledgment.
+    /// There is
+    /// no degraded local-only success: an unreachable or slow authority
+    /// FAILS the barrier (the error surfaces to the kernel caller), while
+    /// the un-flushed tail stays crash-safe in the daemon's local WAL.
+    public func syncVolume() async throws {
+        let envelope = try await client.request(.syncVolume(PfsSyncVolumeRequest()))
+        guard case .syncVolumeReply? = envelope.body else {
+            throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+        }
+    }
+
     public func fsync(item: PortableFSItem) async throws {
         let objectID = ObjectIdentifier(item)
         _ = try identity(for: item)

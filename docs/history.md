@@ -10,11 +10,12 @@ cut into immutable, content-addressed **PFT2** objects in blob storage.
 
 ```text
 write path:    client -> authority -> fenced Postgres journal -> ack
-history path:  cut_create (short txn, pins seq+digest)
+history path:  cut_create (short txn, pins seq+digest,
+                           chained on the branch's newest ready cut)
                -> history-worker claims the cut
-               -> deterministic reduction of the exact journal prefix
-               -> verified PFT2 objects in N failure domains
-               -> atomic ready publication
+               -> deterministic reduction of the exact journal suffix
+               -> verified PFT2 objects at write-quorum coverage
+               -> atomic O(delta) ready publication
 ```
 
 Ready cuts are what branching, forking, publishing, and time travel consume.
@@ -36,6 +37,24 @@ linearizes it at:
 journal-head row lock the append path uses, so a racing append is wholly
 before or after the cut. Capture reads no authority RAM and no object
 storage.
+
+Capture chains: a managed-journal cut's frozen source base is the branch's
+newest READY cut of the same generation whenever one exists strictly below
+the captured head (the generation's adoption-pinned base otherwise). The
+fold therefore covers only the tail since the last ready cut, not the
+branch's whole backlog since the last adoption. The generation base itself
+still advances only through adoption — journal trimming stays adoption's
+job, and the captured cumulative backlog counters stay adoption-relative.
+
+Cut kinds (`user`, `recovery`, `conversion_final`) are consumption-rights
+labels, not different materializations: every ready cut carries both the
+user root and the verified recovery anchor. Capture dedup is kind-agnostic
+between `user` and `recovery` — requests for either kind at one exact
+boundary converge onto one cut row (one fold, one object set), and a
+labeled request converging onto an unlabeled live row adopts the label
+(first label wins; the journal position, not the label, is the cut's
+identity). `conversion_final` keeps its own dedup axis: it drains whole
+legacy generations through a different pipeline.
 
 ### State machine
 
@@ -82,9 +101,18 @@ The worker drives one shared deterministic reduction
    `pfc2.State`.
 4. Path-copy exactly the changed PFT2 nodes and assemble the user root plus
    the recovery anchor.
-5. Upload every produced object as it is produced, verify it, and record
-   fenced copy receipts (see object storage below).
-6. Publish readiness atomically under the live claim epoch.
+5. Upload every produced object as it is produced — every still-missing
+   required domain in parallel — verify each copy by readback, and record
+   fenced copy receipts in batched transactions (see object storage below).
+6. Publish readiness atomically under the live claim epoch. Registration
+   is O(delta) over an adopted base: the worker registers only the objects
+   this run produced and the database copies the base cut's closure rows
+   server-side (`pfh.cut_objects_add_from_base`). The copied closure is a
+   superset of the exact reachable set (objects the fold deleted stay
+   registered), so a deterministic ~1-in-16 slice of cuts — a pure function
+   of the frozen cut digest, so every retry of one cut makes the same
+   choice — publishes the exact recomputed closure instead, keeping
+   registration and GC rootedness bounded under churn.
 
 The reduction is deterministic end to end: object boundaries, node splits,
 pack boundaries, and therefore every digest depend only on the frozen cut
@@ -93,7 +121,12 @@ resume. `MaterializerVersion` names this exact reduction; changing any
 committed-byte-affecting rule changes the version string. Crash/rerun
 convergence follows from determinism: uploads are idempotent at
 per-incarnation exact keys and cursors/receipts live in PostgreSQL, so a
-rerun emits byte-identical objects.
+rerun emits byte-identical objects. Retries are convergent, not repeated:
+before uploading, an attempt batch-locates its object set
+(`pfh.object_locate_batch`) and skips every object that already holds
+fresh verified copies at the bound incarnation in the required domains, so
+an attempt that dies mid-upload leaves receipts the next attempt builds on
+instead of re-shipping the whole set.
 
 Folding applies exactly the live authority's per-leaf semantics. Every
 envelope-carrying leaf's deterministic outcome (status, ino, count, resolved
@@ -129,6 +162,8 @@ cut projection carries `baseCommit.baseMode`:
   recovery anchor (controls, orphans, checkout epochs, database-time floor,
   allocator cursor) binds exactly and is re-verified against the hashed
   RecoveryRoot: filesystem root, as-of sequence, namespace, and next-local.
+  Chained capture makes this the ordinary case: every managed-journal cut
+  with a ready predecessor folds from it.
 - `fork` — a PFT2 commit produced by a different branch's cut. Only the
   immutable user root is imported; the source anchor is never even fetched.
   The fork starts with default control state, no orphans, and its own
@@ -323,8 +358,11 @@ Every later read, scrub, repair, and delete presents a database-recorded key
 verbatim; nothing ever treats a digest-derived path as the location of
 truth. Every copy is written to its exact key, independently read back from
 that key, size-matched, and hash-verified before the fenced copy receipt is
-recorded. `ReadVerified`/`VerifyStream` are the only ways worker code turns
-a recorded key into trusted bytes.
+recorded; still-missing domains are written in parallel and receipts land
+in batched transactions — including proven copies of an object whose
+quorum attempt failed, so the next attempt converges on them.
+`ReadVerified`/`VerifyStream` are the only ways worker code turns a
+recorded key into trusted bytes.
 
 Each logical object has an incarnation; physical keys embed it, so a delayed
 delete of incarnation N can never remove a re-upload at N+1.
@@ -335,7 +373,14 @@ Every history object is replicated across operator-declared **failure
 domains** — attestations of independence (different disks, buckets,
 providers), never derived from endpoints. The installed replication policy
 (one frozen row, expected-epoch CAS install, 1..8 distinct domains) names
-the exact domain set every copy must cover before a cut can be ready.
+the exact domain set copies may land in. Readiness is a **write quorum**
+over it: a cut publishes once every closure object holds W = min(2, N)
+independently verified copies in required domains (N = 1 admits 1). Copies
+the quorum did not need are healed asynchronously by the ordinary repair
+loop, which still targets every policy domain. With the production floor
+of exactly two domains W = N = 2 — an outage in either still blocks
+readiness; the quorum only relaxes deployments with three or more
+independent domains.
 
 The deployment's replication floor is configurable:
 
@@ -409,9 +454,9 @@ migration/capability, policy admission, and per-domain store reachability),
 and `/metrics` (low-cardinality Prometheus text). There is deliberately no
 data-plane surface on the worker.
 
-## Scrub, repair, and GC
+## Scrub, repair, retention, and GC
 
-The same worker process runs three independent maintenance loops, all fenced
+The same worker process runs independent maintenance loops, all fenced
 through database claims:
 
 **Scrub** claims due copies and verifies each against its own recorded exact
@@ -428,18 +473,41 @@ supersession fences stale repairs. An object with no verified source
 anywhere stays quarantined and reported — it is never "healed" by
 fabrication.
 
+**Retention** turns the release cranks the root predicate needs.
+`pfh.retention_release` — a bounded worker loop pass — releases adoption
+consumers whose adoption is durably superseded (a strictly newer applied
+adoption exists for the same generation, or the generation is gone) and
+whose serving pin is already released; snapshot/branch/fork/publish/
+conversion consumers are owned by their own lifecycles and never
+auto-released. Named snapshots are deleted through the caller surface
+(`pfh.snapshot_cut_release`, `DELETE /v1/volumes/:volumeId/snapshots/:name`):
+the named ready cuts drop their label and snapshot consumers, age out of
+the retention window, and the ordinary sweep collects their objects.
+
 **GC** is reachability-safe and performs one fenced object sweep at a time.
-Roots are marked explicitly: live branch bases, retained ready cuts,
-snapshots, publishes, pending/materializing cuts, current control anchors,
-and live upload/materialization intents. A sweep claims one unreferenced
-incarnation under a database-time lease, deletes every database-recorded
-exact copy, proves each key absent with an independent head, and only then
-completes with the full incarnation/reclaim-generation/claim-epoch tuple. A
-late root or re-upload resurrects (or bumps the incarnation) instead of
-losing reachable history; a delayed tombstone prevents ABA. A time-based
-grace period is not the correctness mechanism for an upload-before-commit
-race. Filesystem backends additionally sweep only old, structurally named
-crash-orphaned temporary uploads; final objects are never swept by age.
+Rootedness IS the retention policy (`pfh.object_is_root`): a live
+(pending/materializing) fold's upload intents and its base cut's closures
+are roots, and a ready cut's closure stays rooted iff the cut is
+
+- **pinned** — an unreleased consumer (branch/fork/publish/conversion/
+  adoption/snapshot), an unreleased serving pin, the source base of an
+  in-flight fold, or its commit is a branch head, a public snapshot, or a
+  live generation base;
+- **named** — it carries a user snapshot label, on a live (unretired)
+  volume; or
+- **recent** — among the newest 8 ready cuts of its branch, on a live
+  volume.
+
+Everything that falls out of the root set is collected by the sweep. A
+sweep claims one unreferenced incarnation under a database-time lease,
+deletes every database-recorded exact copy, proves each key absent with an
+independent head, and only then completes with the full
+incarnation/reclaim-generation/claim-epoch tuple. A late root or re-upload
+resurrects (or bumps the incarnation) instead of losing reachable history;
+a delayed tombstone prevents ABA. A time-based grace period is not the
+correctness mechanism for an upload-before-commit race. Filesystem backends
+additionally sweep only old, structurally named crash-orphaned temporary
+uploads; final objects are never swept by age.
 
 ## Journal bounding: recovery cuts and adoption
 
@@ -448,11 +516,14 @@ quota (4 GiB / 1,048,576 records by default, plus a fixed hidden control
 reserve so fencing and rejection outcomes stay journalable at exhaustion).
 Generations are resumed, not rotated, across child restarts, so a branch's
 cumulative backlog persists for its lifetime. The ONLY admitted shrink is
-**adoption** of a ready `recovery` cut of that managed journal:
+**adoption** of a ready cut of that managed journal:
 
-1. `pfh.cut_adopt(cutId, anchorId)` requires a ready RECOVERY cut of a pfj3
-   managed journal (user-facing snapshot cuts never qualify) and verifies
-   that the anchor bounds the same cut.
+1. `pfh.cut_adopt(cutId, anchorId)` requires a ready cut of a pfj3 managed
+   journal and verifies that the anchor is THE anchor of that cut. Any
+   ready cut qualifies — every ready cut carries a verified recovery
+   anchor, and user/recovery captures at one boundary converge onto one
+   row — so a snapshot cut at the trim boundary never forces a second
+   fold.
 2. The journal-owner primitive verifies the exact old base tuple under the
    append lock order, advances the generation's base
    (commit/sequence/digest) to the cut boundary, and subtracts the captured

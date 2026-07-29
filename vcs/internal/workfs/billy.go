@@ -42,10 +42,9 @@ func (fi fileInfo) AccessTime() time.Time {
 	return fi.atime
 }
 
-// OwnerIDs exposes POSIX ownership via Sys(); a consumer (the FUSE protocol layer)
-// type-asserts this interface. Sys returns the fileInfo itself so the assertion
-// succeeds; the NFS server, which expects a *syscall.Stat_t, simply falls back to
-// root as before (no regression).
+// OwnerIDs exposes POSIX ownership via Sys(); a consumer (the protocol layer)
+// type-asserts this interface. Sys returns the fileInfo itself so the
+// assertion succeeds.
 func (fi fileInfo) OwnerIDs() (uint32, uint32) { return fi.uid, fi.gid }
 
 // LinkCount exposes the POSIX hard-link count via Sys() (same type-assert pattern as
@@ -367,7 +366,7 @@ func (fs *FS) LinkAs(oldPath, newPath, owner string) error {
 }
 
 // ---- billy.Change: chmod / chtimes / chown persist (uid/gid are carried through the
-// manifest and tree hash). Routed by both the NFS server and the custom protocol. ----
+// manifest and tree hash). Routed by the protocol layer. ----
 
 var _ billy.Change = (*FS)(nil)
 

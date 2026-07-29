@@ -1,13 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { intEnv, rejectRetiredExecEnv, requiredEnv, semverEnv } from "./config.js";
-
-describe("retired exec configuration", () => {
-  test("the old enable value fails startup while absent/off values remain compatible", () => {
-    expect(() => rejectRetiredExecEnv({})).not.toThrow();
-    expect(() => rejectRetiredExecEnv({ VOLUME_API_TENANT_EXEC: "0" })).not.toThrow();
-    expect(() => rejectRetiredExecEnv({ VOLUME_API_TENANT_EXEC: " 1 " })).toThrow(/retired/);
-  });
-});
+import { intEnv, requiredEnv, semverEnv } from "./config.js";
 
 describe("intEnv", () => {
   test("uses the fallback when absent or empty", () => {

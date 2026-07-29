@@ -320,8 +320,18 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
 
     public func synchronize(flags: FSSyncFlags) async throws {
         do {
-            let stat = try await core.statfs()
-            setCachedStatistics(PfsFSKitMapping.statfs(from: stat, capabilities: capabilities))
+            // The REAL volume barrier: the daemon drains outstanding
+            // write-back to the authority and waits for every live protocol
+            // subscriber's supported acknowledgment boundary. macOS 26 has
+            // no kernel-cache invalidation hook, so success guarantees
+            // authority durability, not eviction of a peer FSKit kernel
+            // cache. Failure (unreachable/slow/fenced authority) throws —
+            // never a silent local-only outcome. The un-flushed tail stays
+            // crash-safe in the daemon's WAL.
+            try await core.syncVolume()
+            if let stat = try? await core.statfs() {
+                setCachedStatistics(PfsFSKitMapping.statfs(from: stat, capabilities: capabilities))
+            }
         } catch {
             throw PfsErrorMapper.fsKitError(for: error)
         }

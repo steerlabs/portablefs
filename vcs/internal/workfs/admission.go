@@ -17,7 +17,7 @@ import (
 //
 //   - no mutation is in flight anywhere — not between fs.mu release and
 //     wal.CommitThrough, not inside an ApplyBatch group commit, not in an
-//     fsproto/NFS/billy handler's FS call;
+//     fsproto/billy handler's FS call;
 //   - every acknowledged mutation is applied, WAL-durable, and replicated;
 //   - the WAL has no unflushed tail, so a following checkpoint barrier never
 //     needs the replication channel again.

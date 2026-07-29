@@ -290,6 +290,32 @@ describe("GET /v1/history/base-provenance/:commitId", () => {
     expect((await response.json()) as Record<string, unknown>).toEqual({ provenance: proof });
   });
 
+  test("the retired pfr1/pfc1 codec pair is refused as an invalid proof query", async () => {
+    const fake: FakeHistory = {
+      locate: async () => null,
+      proof: async () => {
+        throw new Error("a pfr1 proof query must never reach the repository");
+      },
+      degraded: [],
+    };
+    const stores = new HistoryStoreRegistry([
+      { failureDomain: "dom-a", reader: new MapReader(new Map()) },
+    ]);
+    const baseUrl = await startHistoryServer(fakeHistoryRepository(fake), stores);
+    const legacyQuery =
+      "generationId=jgen_1&baseSeq=0&baseDigest=" +
+      "0".repeat(64) +
+      "&recordCodec=pfr1&controlCodec=pfc1";
+    const response = await fetch(
+      `${baseUrl}/v1/history/base-provenance/cmt_base?${legacyQuery}`,
+      { headers: TENANT_HEADERS }
+    );
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "HISTORY_BASE_PROOF_INVALID"
+    );
+  });
+
   test("absence is a 404, never an inferred commit family", async () => {
     const fake: FakeHistory = {
       locate: async () => null,

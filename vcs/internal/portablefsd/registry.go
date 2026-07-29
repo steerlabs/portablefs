@@ -56,12 +56,9 @@ func NewServer(cfg Config) *Server {
 }
 
 type AttachOptions struct {
-	WritePolicy     string `json:"writePolicy"`
-	FsyncPolicy     string `json:"fsyncPolicy"`
-	FlushIntervalMs int64  `json:"flushIntervalMs,omitempty"`
-	Prefetch        bool   `json:"prefetch"`
-	DiskCacheDir    string `json:"diskCacheDir"`
-	DiskCacheMB     int64  `json:"diskCacheMb"`
+	Prefetch     bool   `json:"prefetch"`
+	DiskCacheDir string `json:"diskCacheDir"`
+	DiskCacheMB  int64  `json:"diskCacheMb"`
 	// NegativeCache forces the negative dentry cache on; NoNegativeCache
 	// forces it off. Neither set = capability-auto (on iff the authority
 	// advertises ParentVersion stamping in the handshake).
@@ -84,16 +81,55 @@ type ensureAttachRequest struct {
 }
 
 type attachStatus struct {
-	AttachRef  string         `json:"attachRef"`
-	VolumeID   string         `json:"volumeId"`
-	Branch     string         `json:"branch"`
-	MountPath  string         `json:"mountPath"`
-	State      string         `json:"state"`
-	Prefetch   prefetchStatus `json:"prefetch"`
-	Cache      cacheStatus    `json:"cache"`
-	LastError  string         `json:"lastError,omitempty"`
-	VolumeName string         `json:"volumeName,omitempty"`
-	LocalDirs  []string       `json:"localDirs,omitempty"`
+	AttachRef  string           `json:"attachRef"`
+	VolumeID   string           `json:"volumeId"`
+	Branch     string           `json:"branch"`
+	MountPath  string           `json:"mountPath"`
+	State      string           `json:"state"`
+	Prefetch   prefetchStatus   `json:"prefetch"`
+	Cache      cacheStatus      `json:"cache"`
+	LastError  string           `json:"lastError,omitempty"`
+	VolumeName string           `json:"volumeName,omitempty"`
+	LocalDirs  []string         `json:"localDirs,omitempty"`
+	WriteBack  *writeBackStatus `json:"writeBack,omitempty"`
+}
+
+// writeBackStatus is the durability-debt view of an attach: the engine's
+// full health snapshot — the unshipped acknowledged backlog, the sticky
+// degraded verdict, the held delegations, and every parked stream the
+// recovery machinery or an operator must still resolve.
+type writeBackStatus struct {
+	PendingRecords  int              `json:"pendingRecords"`
+	PendingBytes    int64            `json:"pendingBytes"`
+	AppliedThrough  uint64           `json:"appliedThrough,omitempty"`
+	AdmittedThrough uint64           `json:"admittedThrough,omitempty"`
+	OldestPendingMs int64            `json:"oldestPendingMs,omitempty"`
+	Degraded        bool             `json:"degraded,omitempty"`
+	LastFailure     string           `json:"lastFailure,omitempty"`
+	Delegations     int              `json:"delegations,omitempty"`
+	WALBytes        int64            `json:"walBytes,omitempty"`
+	Jobs            []recoveryJobRef `json:"jobs,omitempty"`
+	// ParkedWALs keeps the doctor/mounts wire name for parked recovery
+	// state: one entry per parked stream.
+	ParkedWALs []parkedWAL `json:"parkedWals,omitempty"`
+}
+
+type recoveryJobRef struct {
+	JobID     string `json:"jobId"`
+	State     string `json:"state"`
+	Records   uint64 `json:"records"`
+	Bytes     uint64 `json:"bytes"`
+	LastError string `json:"lastError,omitempty"`
+}
+
+type parkedWAL struct {
+	WAL          string `json:"wal"`
+	Root         string `json:"root,omitempty"`
+	Records      int    `json:"records"`
+	PayloadBytes int64  `json:"payloadBytes"`
+	AgeMs        int64  `json:"ageMs"`
+	LastError    string `json:"lastError,omitempty"`
+	NextRetryMs  int64  `json:"nextRetryMs"`
 }
 
 type prefetchStatus struct {
@@ -145,7 +181,9 @@ func newRegistry(stateDir string) *registry {
 		journal:     newBindingJournal(stateDir),
 	}
 	go r.persistLoop()
-	for _, e := range loadPersistedAttaches(stateDir) {
+	persisted := loadPersistedAttaches(stateDir)
+	seenStorage := map[string]string{}
+	for _, e := range persisted {
 		req := ensureAttachRequest{
 			VolumeID:     e.VolumeID,
 			Branch:       e.Branch,
@@ -163,6 +201,13 @@ func newRegistry(stateDir string) *registry {
 			log.Printf("portablefsd: skipping duplicate persisted attach key volumeId=%q branch=%q mountPath=%q", req.VolumeID, req.Branch, req.MountPath)
 			continue
 		}
+		if prior := seenStorage[storageKey(req.VolumeID, req.Branch)]; prior != "" {
+			// One (volume, branch) = one WAL store = one checkout owner:
+			// reviving two attaches of the same branch would corrupt it.
+			log.Printf("portablefsd: skipping persisted attach at %q: volume %s@%s already revives at %q (one attach per branch)", req.MountPath, req.VolumeID, req.Branch, prior)
+			continue
+		}
+		seenStorage[storageKey(req.VolumeID, req.Branch)] = req.MountPath
 		a := newRevivedAttach(e.Ref, key, req, stateDir, e.IdentityEpoch, e.Items)
 		a.persist = r.persist
 		a.schedulePersist = r.schedulePersist
@@ -170,6 +215,19 @@ func newRegistry(stateDir string) *registry {
 		r.byRef[e.Ref] = a
 		r.byKey[key] = a
 	}
+	// Stamp identity onto legacy mount-path-keyed WAL dirs while the mapping
+	// is still derivable from the persisted attach entries — after that, an
+	// attach of the same (volume, branch) adopts them from ANY mount path.
+	for _, e := range persisted {
+		legacy := filepath.Join(stateDir, "wal", stableStorageID(attachKey(e.VolumeID, e.Branch, e.MountPath)))
+		if _, err := os.Stat(legacy); err == nil {
+			writeWALIdentity(legacy, walIdentity{VolumeID: e.VolumeID, Branch: e.Branch})
+		}
+	}
+	// One pass over the WAL root: drop fully-drained logs, report anything
+	// that can never recover (never delete records), leave adoptable dirs for
+	// their attach's next start.
+	sweepWALRoot(stateDir, persisted)
 	// Replay binding deltas the previous process journaled after its last
 	// full persist, then drop the entries the replay itself buffered (they
 	// are already durable in the journal being replayed).
@@ -269,6 +327,24 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		}
 		return a, false, nil
 	}
+	// Storage identity is (volume, branch): two LIVE attaches of one branch
+	// would share one WAL store and one checkout owner — refuse the second
+	// instead of corrupting the first's write-back state. A DORMANT revived
+	// attach (never activated in this daemon lifetime) is the remount-at-a-
+	// new-path flow: evict it so the new attach inherits the storage.
+	for ref, other := range r.byRef {
+		if other.key == key || other.isDetached() ||
+			other.volumeID != req.VolumeID || other.branch != req.Branch {
+			continue
+		}
+		if other.hasLiveVolume() {
+			r.mu.Unlock()
+			return nil, false, fmt.Errorf("volume %s@%s is already attached at %s; concurrent attaches of one branch are not supported", req.VolumeID, req.Branch, other.mountPath)
+		}
+		log.Printf("portablefsd: attach at %q supersedes the dormant persisted attach of %s@%s at %q", req.MountPath, req.VolumeID, req.Branch, other.mountPath)
+		delete(r.byRef, ref)
+		delete(r.byKey, other.key)
+	}
 	ref, err := randomAttachRef()
 	if err != nil {
 		r.mu.Unlock()
@@ -293,7 +369,7 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		delete(r.byRef, ref)
 		delete(r.byKey, key)
 		r.mu.Unlock()
-		_ = a.detach(ctx) // fresh attach: nothing written yet, the persist error dominates
+		_, _ = a.detach(ctx, true) // fresh attach: nothing written yet, the persist error dominates
 		return nil, false, err
 	}
 	return a, true, nil
@@ -315,36 +391,46 @@ func (r *registry) list() []*attach {
 	return out
 }
 
-func (r *registry) delete(ctx context.Context, ref string) (bool, error) {
-	r.mu.Lock()
+// delete detaches ref. A NORMAL delete runs the full drain barrier first and
+// FAILS — with the attach fully alive and registered — when the tail cannot
+// reach the authority; only an explicit force detaches with an unshipped
+// tail, parking it as a durable recovery job whose ID is returned.
+func (r *registry) delete(ctx context.Context, ref string, force bool) (found bool, jobID string, err error) {
+	r.mu.RLock()
 	a := r.byRef[ref]
-	if a != nil {
-		delete(r.byRef, ref)
-		delete(r.byKey, a.key)
-	}
-	r.mu.Unlock()
+	r.mu.RUnlock()
 	if a == nil {
-		return false, nil
+		return false, "", nil
 	}
-	if err := r.persist(); err != nil {
-		r.mu.Lock()
-		if r.byRef[ref] == nil && r.byKey[a.key] == nil {
-			r.byRef[ref] = a
-			r.byKey[a.key] = a
-		}
-		r.mu.Unlock()
-		return true, err
+	jobID, err = a.detach(ctx, force)
+	if err != nil && !force {
+		// The drain failed: the attach keeps serving; nothing unregisters.
+		return true, "", err
 	}
-	// The attach is torn down either way (kernel mount is already gone), but a failed
-	// final flush must reach the unmount caller, not vanish into a log line.
-	return true, a.detach(ctx)
+	r.mu.Lock()
+	delete(r.byRef, ref)
+	delete(r.byKey, a.key)
+	r.mu.Unlock()
+	if perr := r.persist(); perr != nil && err == nil {
+		err = perr
+	}
+	return true, jobID, err
 }
 
+// closeAll is the daemon-termination path (SIGTERM): the process is dying
+// regardless, so a failed drain degrades to the crash-equivalent FORCED
+// close — the tail parks as a durable recovery job (logged with its ID) and
+// the next attach recovers it. No caller is told a normal unmount succeeded.
 func (r *registry) closeAll(ctx context.Context) {
 	r.stopPersister()
 	for _, a := range r.list() {
-		if err := a.detach(ctx); err != nil {
-			log.Printf("detach %s: %v", a.ref, err)
+		if _, err := a.detach(ctx, false); err != nil {
+			log.Printf("portablefsd: shutdown detach %s: drain failed (%v); forcing a journal-first close", a.ref, err)
+			if jobID, ferr := a.detach(ctx, true); ferr != nil {
+				log.Printf("portablefsd: shutdown force-detach %s: %v", a.ref, ferr)
+			} else if jobID != "" {
+				log.Printf("portablefsd: shutdown parked recovery job %s for %s; it recovers on the next attach", jobID, a.ref)
+			}
 		}
 	}
 	// The identity bindings created since the last debounce tick — and the
@@ -410,14 +496,18 @@ type attach struct {
 	localRoot         string
 	localFS           *confinedfs.Root
 	localVersions     map[string]uint64
-	nextHandle        uint64
-	nextEnumID        uint64
-	nextOrigin        uint64
-	subscribers       map[*eventSubscriber]struct{}
-	conns             map[interface{ Close() error }]struct{}
-	eventReady        chan struct{}
-	eventOnce         sync.Once
-	detached          bool
+	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
+	// blocks attach readiness (see legacydrain.go); merged into status
+	// ParkedWALs for dormant/revived attaches.
+	legacyParked []parkedWAL
+	nextHandle   uint64
+	nextEnumID   uint64
+	nextOrigin   uint64
+	subscribers  map[*eventSubscriber]struct{}
+	conns        map[interface{ Close() error }]struct{}
+	eventReady   chan struct{}
+	eventOnce    sync.Once
+	detached     bool
 
 	// Test seam for deterministic frontend ordering tests; nil in production.
 	testLookupAfterVolume func(path string)
@@ -458,7 +548,7 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		log.Printf("portablefsd: ignoring invalid persisted localDirs for %s: %v", name, err)
 		localDirs = nil
 	}
-	storageID := stableStorageID(key)
+	storageID := stableStorageID(storageKey(req.VolumeID, req.Branch))
 	options := req.Options
 	options.LocalDirs = localDirs
 	return &attach{
@@ -591,6 +681,11 @@ func (a *attach) start(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "cache"), 0o700); err != nil {
 		return err
 	}
+	// Claim the (volume, branch) WAL store and pull in parked WALs from
+	// legacy mount-path-keyed dirs BEFORE the Volume dials: the engine's
+	// recovery replays its own PFW5 streams inside Dial, and the legacy
+	// sess-*.wal drain below replays the pre-v5 debris.
+	a.adoptWALStore()
 	tlsCfg, err := tlsConfigFromPEM(a.tlsCAPEM)
 	if err != nil {
 		return err
@@ -614,10 +709,8 @@ func (a *attach) start(ctx context.Context) error {
 			defer a.credMu.RUnlock()
 			return a.token
 		},
-		WriteBack:       a.options.WritePolicy == "writeback",
+		Branch:          a.branch,
 		WALDir:          filepath.Join(a.stateDir, "wal", a.storageID),
-		FsyncPolicy:     clientcore.FsyncPolicy(a.options.FsyncPolicy),
-		FlushInterval:   time.Duration(a.options.FlushIntervalMs) * time.Millisecond,
 		NegativeCache:   a.options.NegativeCache,
 		NoNegativeCache: a.options.NoNegativeCache,
 		DiskCacheDir:    diskDir,
@@ -633,12 +726,20 @@ func (a *attach) start(ctx context.Context) error {
 			log.Printf("attach %s: "+format, append([]any{a.ref}, args...)...)
 		},
 	}
-	if opts.FsyncPolicy == "" {
-		opts.FsyncPolicy = clientcore.FsyncLocal
-	}
 	vol, err := clientcore.Dial(ctx, opts)
 	if err != nil {
 		return dialErrorWithTLSHint(err, a.tlsCAPEM)
+	}
+	// Legacy sess-*.wal records have no durable scope fencing. They must be
+	// completely resolved before this Volume is published to the frontend or
+	// event readiness is signaled; otherwise new live mutations could race an
+	// ambiguous replay. A failure leaves the legacy WAL/sidecar in place and
+	// activation returns its typed cause.
+	if err := a.drainLegacyWALs(ctx, vol); err != nil {
+		if closeErr := vol.Close(); closeErr != nil {
+			return errors.Join(err, fmt.Errorf("close volume after blocked legacy drain: %w", closeErr))
+		}
+		return err
 	}
 	effectiveLocalDirs := append([]string(nil), a.options.LocalDirs...)
 	if a.options.VolumeLocalDirs {
@@ -677,7 +778,7 @@ func (a *attach) start(ctx context.Context) error {
 		_ = vol.Close()
 		return err
 	}
-	eventStream, err := eventClient.Subscribe()
+	eventStream, eventAck, err := eventClient.Subscribe()
 	if err != nil {
 		if openedLocalFS {
 			_ = localFS.Close()
@@ -728,7 +829,7 @@ func (a *attach) start(ctx context.Context) error {
 	a.mu.Unlock()
 	a.eventOnce.Do(func() { close(a.eventReady) })
 	go vol.StartInvalidations(ctx, false)
-	go a.forwardEvents(ctx, eventClient, eventStream)
+	go a.forwardEvents(ctx, eventClient, eventStream, eventAck)
 	go a.watchPrefetch(ctx)
 	return nil
 }
@@ -751,56 +852,60 @@ func (a *attach) setCredential(tok string) {
 	}
 }
 
-func (a *attach) detach(ctx context.Context) error {
+// detach tears the attach down. NORMAL (force=false): the full drain barrier
+// runs FIRST and a failure aborts the detach with the attach fully alive —
+// a normal unmount can never succeed with an unshipped acknowledged tail.
+// FORCED (force=true): the tail parks as a durable recovery job (registered
+// in the WAL store, outside the attach lifetime) and its ID is returned for
+// the caller to surface.
+func (a *attach) detach(ctx context.Context, force bool) (jobID string, err error) {
+	_ = ctx
+	// Quiesce every namespace/handle operation through the complete drain
+	// decision. A failed normal detach releases this lock with the attach and
+	// Volume still usable; a successful/forced detach publishes the terminal
+	// flag before operations can resume.
+	a.nsMu.Lock()
+	a.mu.RLock()
+	alreadyDetached := a.detached
+	vol := a.vol
+	a.mu.RUnlock()
+	if alreadyDetached {
+		a.nsMu.Unlock()
+		return "", nil
+	}
+	if vol != nil {
+		if force {
+			id, cerr := vol.CloseJournalDurable()
+			jobID = id
+			if cerr != nil {
+				err = fmt.Errorf("forced detach: journal-durable close: %w", cerr)
+			} else if id != "" {
+				log.Printf("portablefsd: detach %s: forced; recovery job %s parked durably (recovers on the next attach)", a.ref, id)
+			}
+		} else if cerr := vol.Close(); cerr != nil {
+			// Close freezes admissions around the final drain and visibility
+			// barrier. It is retryable on failure and has not cancelled the
+			// Volume or parked its WAL. Keep the attach serving.
+			recs, bytes := vol.WriteBackPending()
+			a.nsMu.Unlock()
+			return "", fmt.Errorf("detach refused: final drain/release barrier failed with %d records (%d bytes) unshipped: %w (retry when the authority answers, or force-detach to park them as a durable recovery job)", recs, bytes, cerr)
+		}
+	}
 	a.mu.Lock()
 	if a.detached {
 		a.mu.Unlock()
-		return nil
+		a.nsMu.Unlock()
+		return "", nil
 	}
 	a.detached = true
 	a.state = pfslocal.AttachStateDetaching
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDetaching, Detail: "detaching"}})
-	vol := a.vol
 	events := a.eventClient
 	localFS := a.localFS
 	a.mu.Unlock()
+	a.nsMu.Unlock()
 	if events != nil {
 		_ = events.Close()
-	}
-	var flushErr error
-	if vol != nil {
-		if fenced, unreachable := vol.SessionFenced(), vol.AuthorityUnreachable(); fenced || unreachable {
-			// Journal-first detach: the authority is unreachable or this
-			// generation is fenced, so a network flush is doomed (unreachable)
-			// or would falsely claim durability (fenced). Make the un-flushed
-			// write-back tail durable in the local session WALs and close
-			// without a final drain or checkin — it replays on the next clean
-			// start, exactly as after a crash.
-			cause := "authority unreachable (fail-fast)"
-			if fenced {
-				cause = "session fenced (writes of this generation rejected; remount required)"
-			}
-			log.Printf("portablefsd: detach %s: %s; closing journal-first (un-flushed write-back mutations stay durable in the session WAL and replay on the next clean start)", a.ref, cause)
-			if err := vol.CloseJournalDurable(); err != nil {
-				log.Printf("portablefsd: detach %s: journal-durable close: %v", a.ref, err)
-			}
-		} else {
-			flushCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			err := vol.FlushToAuthority(flushCtx)
-			cancel()
-			if err != nil {
-				// The flush failed with the authority still reachable and un-fenced:
-				// keep the un-flushed tail durable in the local WAL and close
-				// journal-first (a clean Close would re-block on the same dead
-				// network), and surface the failure to the caller.
-				flushErr = fmt.Errorf("final write-back flush failed; unflushed changes remain in the local write-back log and are recovered on the next attach: %w", err)
-				if cerr := vol.CloseJournalDurable(); cerr != nil {
-					log.Printf("portablefsd: detach %s: journal-durable close: %v", a.ref, cerr)
-				}
-			} else {
-				_ = vol.Close()
-			}
-		}
 	}
 	if localFS != nil {
 		_ = localFS.Close()
@@ -821,7 +926,7 @@ func (a *attach) detach(ctx context.Context) error {
 		}
 	}
 	a.mu.Unlock()
-	return flushErr
+	return jobID, err
 }
 
 func (a *attach) status() attachStatus {
@@ -834,22 +939,53 @@ func (a *attach) status() attachStatus {
 	diskBytes, diskCap := int64(0), int64(0)
 	a.mu.RUnlock()
 	var pf clientcore.PrefetchProgress
+	var wb *writeBackStatus
 	if vol != nil {
 		pf = vol.PrefetchProgress()
 		attrEntries = vol.AttrCache.Len()
 		if vol.DiskCache != nil {
 			diskBytes, diskCap = vol.DiskCache.Stats()
 		}
+		st := vol.WritebackStatus()
+		if st.PendingRecords > 0 || len(st.Jobs) > 0 || st.Degraded {
+			wb = &writeBackStatus{
+				PendingRecords: st.PendingRecords, PendingBytes: st.PendingBytes,
+				AppliedThrough: st.AppliedThrough, AdmittedThrough: st.AdmittedThrough,
+				OldestPendingMs: st.OldestPendingMs, Degraded: st.Degraded,
+				LastFailure: st.LastFailure, Delegations: len(st.Delegations),
+				WALBytes: st.WALBytes,
+			}
+			now := time.Now().UnixMilli()
+			for _, j := range st.Jobs {
+				wb.Jobs = append(wb.Jobs, recoveryJobRef{
+					JobID: j.JobID, State: j.State,
+					Records: j.PendingRecords, Bytes: j.PendingBytes,
+					LastError: j.LastError,
+				})
+				wb.ParkedWALs = append(wb.ParkedWALs, parkedWAL{
+					WAL: j.JobID, Records: int(j.PendingRecords), PayloadBytes: int64(j.PendingBytes),
+					AgeMs: now - j.CreatedAtMs, LastError: j.LastError,
+				})
+			}
+		}
 	}
 	a.mu.RLock()
 	localDirs := append([]string(nil), a.localDirs...)
+	legacyParked := append([]parkedWAL(nil), a.legacyParked...)
 	a.mu.RUnlock()
+	if len(legacyParked) > 0 {
+		if wb == nil {
+			wb = &writeBackStatus{}
+		}
+		wb.ParkedWALs = append(wb.ParkedWALs, legacyParked...)
+	}
 	return attachStatus{
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
 		Prefetch:  prefetchStatus{Done: pf.Done, EntriesWalked: pf.Entries},
 		Cache:     cacheStatus{AttrEntries: attrEntries, DiskBytes: diskBytes, DiskCapBytes: diskCap},
 		LocalDirs: localDirs,
+		WriteBack: wb,
 	}
 }
 
@@ -875,12 +1011,17 @@ func (a *attach) currentStateLocked() pfslocal.AttachStateState {
 func (a *attach) setErr(err error) {
 	a.mu.Lock()
 	if err != nil {
-		a.lastErr = err.Error()
-		if a.vol == nil {
-			a.credentialPending = true
+		// Idempotent while degraded: the health tick re-reports a persistent
+		// error every flush interval; republishing an identical state event
+		// 4x/second would spam subscribers without adding information.
+		if msg := err.Error(); a.lastErr != msg {
+			a.lastErr = msg
+			if a.vol == nil {
+				a.credentialPending = true
+			}
+			a.state = pfslocal.AttachStateDegraded
+			a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDegraded, Detail: a.lastErr}})
 		}
-		a.state = pfslocal.AttachStateDegraded
-		a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDegraded, Detail: a.lastErr}})
 	} else if a.lastErr != "" {
 		a.lastErr = ""
 		a.state = a.currentStateLocked()
@@ -1151,23 +1292,26 @@ func (a *attach) persistedItemsLocked() []persistedItemRecord {
 	return items
 }
 
-// lockNames serializes same-directory namespace mutations while nsMu is held
-// SHARED. File-grain mutations (create, mkdir, symlink, remove) take the
-// stripe of the directory they mutate — so two mutations of the same (dir,
-// name), whose local pre-checks and registry bookkeeping need a stable view,
-// serialize — while mutations in different directories run their authority
-// round trips in parallel (the authority linearizes them, exactly as it does
-// for two independent machines). Subtree-moving ops (rename) hold nsMu
-// EXCLUSIVELY instead, which excludes every stripe holder wholesale.
-// Directory removal passes both the parent (its own entry) and the dir itself
-// (so a racing create inside cannot slip past the emptiness check).
+// lockNames serializes mutations of the SAME (directory, name) pair while
+// nsMu is held SHARED. File-grain mutations (create, mkdir, symlink, unlink,
+// hard link, xattr set/remove) take the stripe of the exact name they mutate,
+// so two mutations of one name — whose local pre-checks and registry
+// bookkeeping need a stable view, and whose legacy O_EXCL decision is a
+// lookup-then-create pair — serialize, while mutations of DIFFERENT names run
+// their authority round trips in parallel even inside one directory (the
+// authority linearizes them, exactly as it does for two independent
+// machines). A name stripe is therefore never a directory-wide lock held
+// across the network: a create storm in one directory fans out. Subtree ops
+// (rename, rmdir) hold nsMu EXCLUSIVELY instead, which excludes every stripe
+// holder wholesale — rmdir needs that to keep its emptiness check atomic
+// against concurrent creates inside the dir.
 // Returns the unlock function; stripes are acquired in index order so
 // multi-stripe holders can never deadlock each other.
-func (a *attach) lockNames(dirs ...string) func() {
+func (a *attach) lockNames(keys ...nameKey) func() {
 	seen := map[int]struct{}{}
-	idx := make([]int, 0, len(dirs))
-	for _, d := range dirs {
-		i := int(clientcore.InoOf(d) & 63)
+	idx := make([]int, 0, len(keys))
+	for _, k := range keys {
+		i := int(clientcore.InoOf(k.dir+"\x00"+k.name) & 63)
 		if _, ok := seen[i]; !ok {
 			seen[i] = struct{}{}
 			idx = append(idx, i)
@@ -1182,6 +1326,16 @@ func (a *attach) lockNames(dirs ...string) func() {
 			a.nameLocks[idx[i]].Unlock()
 		}
 	}
+}
+
+// nameKey identifies one directory entry for stripe locking.
+type nameKey struct {
+	dir  string
+	name string
+}
+
+func entryKey(p string) nameKey {
+	return nameKey{dir: parentPath(p), name: path.Base("/" + p)}
 }
 
 func (a *attach) item(item pfslocal.Item) (*itemRecord, int32) {
@@ -1441,26 +1595,28 @@ func (a *attach) onFlushAll(p string) {
 func (a *attach) onMarkOrphan(p string, ino uint64) {
 	a.mu.Lock()
 	if rec := a.paths[p]; rec != nil {
-		// After a remote rename-over, registerWithItemLocked swaps the
-		// record's state to the inode NOW at the path; an orphan mark for the
-		// replaced inode racing that swap must not divert the fresh state.
-		if !rec.state.AuthIno() || rec.state.StableIno() == ino {
+		// Match the authority identity, never just the path. Invalidation
+		// delivery can trail remove+recreate: a locally-born replacement has
+		// AuthIno false but is still a different node and must not be routed
+		// to the retired inode. Delegation release records the proven
+		// authority inode before a peer can unlink an open local create.
+		if rec.state.MatchesAuthorityIno(ino) {
 			rec.state.MarkOrphan(ino, a.vol.OpenOrphans())
 		}
 	}
 	a.mu.Unlock()
 }
 
-func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <-chan []coherence.Invalidation) {
+func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <-chan coherence.Batch, firstAck fsproto.AckFunc) {
 	owner := a.ownerID()
-	stream := first
+	stream, ack := first, firstAck
 	for {
 		if a.isDetached() {
 			return
 		}
 		if stream == nil {
 			var err error
-			stream, err = cli.Subscribe()
+			stream, ack, err = cli.Subscribe()
 			if err != nil {
 				select {
 				case <-ctx.Done():
@@ -1472,7 +1628,7 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 			a.eventOnce.Do(func() { close(a.eventReady) })
 		}
 		for batch := range stream {
-			for _, inv := range batch {
+			for _, inv := range batch.Invs {
 				// The authority only knows the daemon's fsproto owner, not which local frontend
 				// connection originated an op. Daemon-origin mutations are therefore fanned out
 				// synchronously at the pfslocal boundary with an origin-connection skip; the later
@@ -1500,6 +1656,13 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 					// kernel vnode: refresh its size and drop its pages.
 					a.scheduleCoherenceRefresh(inv.Path)
 				}
+			}
+			// Acknowledge after daemon caches are updated and the batch is
+			// offered to the local frontend stream. This is the strongest
+			// boundary portablefsd can report; macOS 26 FSKit exposes no
+			// kernel-cache invalidation hook.
+			if ack != nil && (batch.Pos != 0 || batch.Bootstrap) {
+				ack(batch.Pos)
 			}
 		}
 		select {
@@ -1532,6 +1695,15 @@ func (a *attach) isDetached() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.detached
+}
+
+// hasLiveVolume reports whether this attach activated a Volume in this daemon
+// lifetime — the storage-claim signal the one-live-attach-per-branch guard
+// keys on (a dormant revived attach holds no WAL handles yet).
+func (a *attach) hasLiveVolume() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.vol != nil
 }
 
 func (a *attach) statusState() pfslocal.AttachStateState {
@@ -1588,8 +1760,19 @@ func stableStorageID(key string) string {
 	return fmt.Sprintf("%x", sum[:16])
 }
 
+// attachKey identifies an ATTACH (a kernel mount of a volume at a path); two
+// mounts of one branch at different paths are distinct attaches.
 func attachKey(volumeID, branch, mountPath string) string {
 	return volumeID + "\x00" + branch + "\x00" + mountPath
+}
+
+// storageKey identifies durable per-volume STATE — the write-back WAL store
+// and the checkout owner. Deliberately excludes the mount path: remounting a
+// branch at a new path must find the WALs (and the authority-side coordination
+// identity) its previous mount left behind, instead of stranding them under a
+// path-hashed directory forever.
+func storageKey(volumeID, branch string) string {
+	return volumeID + "\x00" + branch
 }
 
 func syntheticRootAttr() fsproto.Attr {

@@ -173,25 +173,6 @@ export interface VolumeStatusInput {
   branchName: string;
 }
 
-export interface JournalContentScanInput {
-  generationId: string;
-  /** First sequence number to classify (inclusive). */
-  fromSeq: string;
-  /** End of the scan range (exclusive) — normally the binding's nextSeq. */
-  toSeqExclusive: string;
-  /** Maximum rows to classify before reporting the scan truncated. */
-  scanLimit: number;
-}
-
-export interface JournalContentScan {
-  /** Rows examined (bounded by scanLimit). */
-  scanned: number;
-  /** Rows that change user-visible content (unparseable rows count here). */
-  contentRows: number;
-  /** True when the range held more than scanLimit rows. */
-  truncated: boolean;
-}
-
 export interface WaitForHeadInput extends VolumeStatusInput {
   afterCommitId: string;
   timeoutMs: number;
@@ -519,13 +500,6 @@ export interface MetadataRepository {
   // generation: the branch is in its base-authoring phase). Read-only and
   // redacted; capability material never crosses this boundary.
   journalBinding?(input: VolumeStatusInput): Promise<BranchJournalBinding | null>;
-  // Bounded content-vs-control classification of the journal rows in
-  // [fromSeq, toSeqExclusive), for exec/grep cut reuse: a READY cut whose
-  // boundary is older than the live position is still the branch's exact
-  // current content when every row since it is control-only (session
-  // establishment, pins, watermarks, barriers). Truncated scans classify as
-  // content — the conservative direction (mint, never stale-reuse).
-  journalContentRowsSince?(input: JournalContentScanInput): Promise<JournalContentScan>;
   // Cut-based snapshot capture: journal-served branches record an exact
   // pfh HistoryCut (async, worker-materialized); manifest-headed branches
   // produce a born-ready commit-pinned record (there is nothing to

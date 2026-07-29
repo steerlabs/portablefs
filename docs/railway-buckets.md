@@ -21,10 +21,11 @@ Do not commit bucket credentials. To populate your current shell without printin
 set -a
 eval "$(railway bucket credentials --bucket portablefs-blobs)"
 set +a
-export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
+export VOLUME_S3_PREFIX=portablefs/dev
 ```
 
-The storage package can read the Railway CLI variable names directly:
+The canonical configuration names are exactly the Railway CLI variable names,
+so the eval above is all the credential setup the API needs:
 
 ```text
 AWS_ENDPOINT_URL
@@ -34,18 +35,10 @@ AWS_S3_BUCKET_NAME
 AWS_DEFAULT_REGION
 ```
 
-The API and worker can read the Railway CLI variables directly. They also accept explicit
-PortableFS names when you want clearer production config:
-
-```bash
-export VOLUME_RAILWAY_BUCKET_ENDPOINT="$AWS_ENDPOINT_URL"
-export VOLUME_RAILWAY_BUCKET_NAME="$AWS_S3_BUCKET_NAME"
-export VOLUME_RAILWAY_BUCKET_REGION="$AWS_DEFAULT_REGION"
-export VOLUME_RAILWAY_BUCKET_URL_STYLE=virtual-host
-export VOLUME_RAILWAY_BUCKET_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-export VOLUME_RAILWAY_BUCKET_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
-```
+plus the optional PortableFS extras `VOLUME_S3_PREFIX` (object key prefix,
+default `portablefs`) and `VOLUME_S3_SSE`. The retired
+`VOLUME_RAILWAY_BUCKET_*` spellings remain accepted as compat aliases for one
+release; the mapping table is in [self-hosting.md](./self-hosting.md).
 
 ## Test Against Railway
 
@@ -56,13 +49,12 @@ export VOLUME_DATABASE_CONNECT_TIMEOUT_MS=10000
 set -a
 eval "$(railway bucket credentials --bucket portablefs-blobs)"
 set +a
-export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
-pnpm test:railway-bucket
+export VOLUME_S3_PREFIX=portablefs/dev
+pnpm test:s3-bucket
 ```
 
-`test:railway-bucket` uploads, downloads, dedupes, verifies, and deletes real objects through
-`packages/storage-railway`. The store itself is the generic S3 SigV4 implementation in
-`packages/storage-s3`; the Railway-named exports are compatibility aliases for it.
+`test:s3-bucket` uploads, downloads, dedupes, verifies, and deletes real objects through
+the generic S3 SigV4 implementation in `packages/storage-s3`.
 
 ## Manual API And VCS Run
 
@@ -74,7 +66,7 @@ export VOLUME_DATABASE_URL=postgres://postgres:postgres@localhost:5432/portablef
 set -a
 eval "$(railway bucket credentials --bucket portablefs-blobs)"
 set +a
-export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
+export VOLUME_S3_PREFIX=portablefs/dev
 pnpm --filter @portablefs/volume-api dev
 ```
 
@@ -82,7 +74,7 @@ In another shell, run a writable VCS authority against that API:
 
 ```bash
 go build -C vcs -o ../vcs-bin ./cmd/vcs
-go build -C vcs -o ../mount-bin ./cmd/mount
+go build -C vcs -o ../portablefs-bin ./cmd/portablefs
 
 VCS_WRITABLE=1 \
 VOLUME_API_URL=http://localhost:8787 \
@@ -97,5 +89,5 @@ Then mount the live filesystem:
 
 ```bash
 mkdir -p /mnt/vol
-./mount-bin -addr 127.0.0.1:2050 -mount /mnt/vol
+./portablefs-bin mount vol_... /mnt/vol --addr 127.0.0.1:2050 --foreground
 ```

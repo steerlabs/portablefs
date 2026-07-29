@@ -13,7 +13,7 @@ import {
 
 describe("journal digest chain", () => {
   test("one chain step is sha256(prev || be64(len) || payload)", () => {
-    const payload = Buffer.concat([journalPayloadMagics.pfr1, Buffer.from("record body")]);
+    const payload = Buffer.concat([journalPayloadMagics.pfj3, Buffer.from("record body")]);
     const previous = "ab".repeat(32);
     const length = Buffer.alloc(8);
     length.writeBigUInt64BE(BigInt(payload.byteLength));
@@ -31,8 +31,8 @@ describe("journal digest chain", () => {
   });
 
   test("chaining is order-sensitive", () => {
-    const first = Buffer.concat([journalPayloadMagics.pfr1, Buffer.from("a")]);
-    const second = Buffer.concat([journalPayloadMagics.pfr1, Buffer.from("b")]);
+    const first = Buffer.concat([journalPayloadMagics.pfj3, Buffer.from("a")]);
+    const second = Buffer.concat([journalPayloadMagics.pfj3, Buffer.from("b")]);
     const forward = journalChainDigest(journalChainDigest(zeroJournalDigest, first), second);
     const reversed = journalChainDigest(journalChainDigest(zeroJournalDigest, second), first);
     expect(forward).not.toBe(reversed);
@@ -48,22 +48,18 @@ describe("journal digest chain", () => {
 });
 
 describe("journal payload codecs", () => {
-  test("recognizes exactly the two frozen payload magics", () => {
-    expect(journalPayloadCodec(Buffer.concat([journalPayloadMagics.pfr1, Buffer.from("x")]))).toBe(
-      "pfr1"
-    );
+  test("recognizes exactly the one frozen payload magic", () => {
     expect(journalPayloadCodec(Buffer.concat([journalPayloadMagics.pfj3, Buffer.from("x")]))).toBe(
       "pfj3"
     );
+    // The retired pfr1 magic no longer sniffs as a codec.
+    expect(journalPayloadCodec(Buffer.from("PFR1record"))).toBeNull();
     expect(journalPayloadCodec(Buffer.from("PFXX????"))).toBeNull();
     expect(journalPayloadCodec(Buffer.from("PF"))).toBeNull();
   });
 
-  test("the codec pairs are immutable and exactly two", () => {
-    expect(journalCodecPairs).toEqual([
-      { recordCodec: "pfr1", controlCodec: "pfc1" },
-      { recordCodec: "pfj3", controlCodec: "pfc2" },
-    ]);
+  test("the codec pair is immutable and exactly one", () => {
+    expect(journalCodecPairs).toEqual([{ recordCodec: "pfj3", controlCodec: "pfc2" }]);
   });
 });
 

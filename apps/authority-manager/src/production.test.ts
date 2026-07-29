@@ -1734,7 +1734,7 @@ describe("production children are disposable and journal remotely (no local file
     await expect(stat(cwd)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("ensureAuthorityForLease binds the lease to the EXACT instance and runtime under the authority lock; the legacy session route mints through the same path", async () => {
+  test("ensureAuthorityForLease binds the lease to the EXACT instance and runtime under the authority lock", async () => {
     const h = await newProductionHarness();
     const { endpoint, result } = await createHarnessLease(h);
     expect(result.lease.authorityInstanceId).toBe(endpoint.authorityInstanceId);
@@ -1743,11 +1743,11 @@ describe("production children are disposable and journal remotely (no local file
     expect(route).toMatchObject({ authorityInstanceId: endpoint.authorityInstanceId });
     expect(route!.backendAddresses).toEqual([h.latestSim().fsAddr]);
 
-    // Legacy session route: a real access lease under a synthetic consumer.
-    const session = await h.registry.createSession(ref);
-    expect(session.authToken).toBeDefined();
-    expect(session.expiresAt).toBeGreaterThan(0);
-    expect(h.registry.leases.resolveSessionToken(session.authToken!)).toMatchObject({
+    // A second lease on the same ref binds under the same lock to the SAME
+    // live child — demand-start, no churn.
+    const second = await createHarnessLease(h, "op-create-2");
+    expect(second.result.lease.authorityInstanceId).toBe(endpoint.authorityInstanceId);
+    expect(h.registry.leases.resolveSessionToken(second.result.accessToken)).toMatchObject({
       authorityInstanceId: endpoint.authorityInstanceId,
     });
     expect(h.spawnEnvs).toHaveLength(1); // same child served both leases
@@ -1988,8 +1988,8 @@ function expectNoOperationContentConflicts(h: { logs: string[] }): void {
 describe("teardown orders the durable access fence BEFORE the runtime end", () => {
   test("unexpected child exit: local fence immediately, retire commits, ONLY THEN the runtime row ends", async () => {
     const h = await newProductionHarness();
-    const session = await h.registry.createSession(ref);
-    expect(session.authToken).toBeDefined();
+    const { result: session } = await createHarnessLease(h, "op-teardown-exit");
+    expect(session.accessToken).toBeDefined();
     const scope = { tenantKey: managedTenantKey(ref), volumeId: ref.volumeId, branch: ref.branch };
     expect(h.store.liveRuntime(scope)).not.toBeNull();
 
@@ -2002,14 +2002,14 @@ describe("teardown orders the durable access fence BEFORE the runtime end", () =
     // The instance's durable lease rows were retired by the fence, and the
     // session token stopped resolving the moment the local fence ran.
     expect(h.store.activeLeaseRows()).toBe(0);
-    expect(h.registry.leases.resolveSessionToken(session.authToken!)).toBeNull();
+    expect(h.registry.leases.resolveSessionToken(session.accessToken)).toBeNull();
     expect(await h.registry.inspectAuthority(ref)).toBeNull();
     expectNoOperationContentConflicts(h);
   });
 
   test("shutdown settles to ZERO live runtime rows with no operation-content conflicts and releases the claim", async () => {
     const h = await newProductionHarness();
-    await h.registry.createSession(ref);
+    await createHarnessLease(h, "op-teardown-shutdown");
     const scope = { tenantKey: managedTenantKey(ref), volumeId: ref.volumeId, branch: ref.branch };
     expect(h.store.liveRuntime(scope)).not.toBeNull();
     await h.registry.shutdown();
@@ -2028,7 +2028,7 @@ describe("teardown orders the durable access fence BEFORE the runtime end", () =
 
   test("a LOST retire response retries the SAME idempotent operation and the runtime end WAITS for the commit", async () => {
     const h = await newProductionHarness();
-    await h.registry.createSession(ref);
+    await createHarnessLease(h, "op-teardown-lost-retire");
     const events = instrumentTeardownOrder(h.store);
     h.store.failNext("accessEndBatch", 1);
 
@@ -2046,7 +2046,7 @@ describe("teardown orders the durable access fence BEFORE the runtime end", () =
 
   test("crash-shaped outage AFTER the fence: the runtime row stays LIVE with all access fenced, and the successor's begin settles it", async () => {
     const h = await newProductionHarness();
-    await h.registry.createSession(ref);
+    await createHarnessLease(h, "op-teardown-crash");
     const scope = { tenantKey: managedTenantKey(ref), volumeId: ref.volumeId, branch: ref.branch };
     const before = h.store.liveRuntime(scope);
     const events = instrumentTeardownOrder(h.store);
@@ -2690,7 +2690,6 @@ function stubRegistry(): AuthorityRegistry {
   };
   return {
     ensureAuthority: async () => endpoint,
-    createSession: async () => ({ ...endpoint, authToken: "session-token" }),
     isHealthy: async () => true,
     stopAuthority: async () => ({ stopped: false, managed: true, reason: "not_found" }),
     ensureAuthorityForLease: async (_ref, create) => ({

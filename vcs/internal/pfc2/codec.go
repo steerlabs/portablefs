@@ -160,8 +160,10 @@ func (l *LockChange) RequestHash() [RequestHashBytes]byte {
 }
 
 // RequestHash returns the canonical fingerprint of c's semantic checkout
-// request. Valid CheckoutChange records carry exactly this hash in their
-// exact key.
+// request (keyed ops only). Valid keyed CheckoutChange records carry exactly
+// this hash in their exact key. A delegation acquire folds the stream's
+// writeback id in (field 4, emitted only when present, so plain checkout
+// fingerprints are unchanged).
 func (c *CheckoutChange) RequestHash() [RequestHashBytes]byte {
 	var body []byte
 	if c.Op == CheckoutRelease {
@@ -171,6 +173,9 @@ func (c *CheckoutChange) RequestHash() [RequestHashBytes]byte {
 	} else {
 		body = pfwire.AppendUint(body, 1, checkoutClassAcquire)
 		body = pfwire.AppendString(body, 2, c.Path)
+		if c.WritebackID != "" {
+			body = pfwire.AppendString(body, 4, c.WritebackID)
+		}
 	}
 	return requestHash(KindCheckoutChange, body)
 }
@@ -261,6 +266,7 @@ func appendRecord(dst []byte, r *Record) ([]byte, error) {
 		b = pfwire.AppendString(b, 3, f.CheckoutPath)
 		b = pfwire.AppendString(b, 4, string(f.CheckoutEpoch))
 		b = pfwire.AppendUint(b, 5, f.Through)
+		b = pfwire.AppendBytes(b, 6, f.Digest[:])
 		dst = pfwire.AppendBytes(dst, 7, b)
 	case KindLockChange:
 		l := r.LockChange
@@ -276,13 +282,21 @@ func appendRecord(dst []byte, r *Record) ([]byte, error) {
 	case KindCheckoutChange:
 		c := r.CheckoutChange
 		var b []byte
-		b = pfwire.AppendBytes(b, 1, appendExactKey(nil, &c.Key))
+		if c.Op.keyed() {
+			b = pfwire.AppendBytes(b, 1, appendExactKey(nil, &c.Key))
+		}
 		b = pfwire.AppendBytes(b, 2, appendOutcome(nil, c.Outcome))
 		b = pfwire.AppendUint(b, 3, uint64(c.Op))
 		b = pfwire.AppendString(b, 4, c.Path)
 		b = pfwire.AppendString(b, 5, string(c.Epoch))
 		if c.Op == CheckoutForceTransfer {
 			b = pfwire.AppendBytes(b, 6, c.RecalledDigest[:])
+		}
+		if c.WritebackID != "" {
+			b = pfwire.AppendString(b, 7, c.WritebackID)
+		}
+		if c.Op == CheckoutRebind {
+			b = pfwire.AppendBytes(b, 8, appendSessionRef(nil, c.NewHolder))
 		}
 		dst = pfwire.AppendBytes(dst, 9, b)
 	case KindOpenPinChange:
@@ -864,6 +878,10 @@ func decodeFlushAdvance(body []byte) (*FlushAdvance, error) {
 			if f.Through, err = rd.Uint(field); err != nil {
 				return nil, err
 			}
+		case field == 6 && wt == pfwire.TypeBytes:
+			if err := fixed32(rd, field, &f.Digest); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, rd.RejectUnknown(field)
 		}
@@ -971,7 +989,7 @@ func decodeCheckoutChange(body []byte) (*CheckoutChange, error) {
 			if err != nil {
 				return nil, err
 			}
-			if v > uint64(CheckoutForceTransfer) {
+			if v > uint64(CheckoutDiscard) {
 				return nil, rd.Malformedf("unknown checkout op %d", v)
 			}
 			c.Op = CheckoutOp(v)
@@ -990,14 +1008,36 @@ func decodeCheckoutChange(body []byte) (*CheckoutChange, error) {
 				return nil, err
 			}
 			digestSeen = true
+		case field == 7 && wt == pfwire.TypeBytes:
+			if c.WritebackID, err = rd.String(field, MaxWritebackIDBytes); err != nil {
+				return nil, err
+			}
+		case field == 8 && wt == pfwire.TypeBytes:
+			msg, err := rd.Bytes(field, MaxRecordBytes)
+			if err != nil {
+				return nil, err
+			}
+			if c.NewHolder, err = decodeSessionRef("pfc2 checkout change new holder", msg); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, rd.RejectUnknown(field)
 		}
 	}
 	// Presence congruence keeps one wire form per value: force transfer must
-	// carry its digest field, other ops must omit it.
+	// carry its digest field, other ops must omit it; keyed ops must carry
+	// their exact key and rebind its explicit new holder.
 	if (c.Op == CheckoutForceTransfer) != digestSeen {
 		return nil, rd.Malformedf("recalled digest presence does not match op %d", c.Op)
+	}
+	if c.Op.keyed() != (c.Key != ExactKey{}) {
+		return nil, rd.Malformedf("exact key presence does not match op %d", c.Op)
+	}
+	if (c.Op == CheckoutRebind) != (c.NewHolder != SessionRef{}) {
+		return nil, rd.Malformedf("new holder presence does not match op %d", c.Op)
+	}
+	if c.WritebackID == "" && !c.Op.keyed() {
+		return nil, rd.Malformedf("rebind/discard require a writeback id")
 	}
 	return &c, nil
 }

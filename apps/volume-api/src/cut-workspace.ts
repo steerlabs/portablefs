@@ -7,7 +7,6 @@ import {
 } from "@portablefs/core";
 import {
   MetadataConflictError,
-  type BranchJournalBinding,
   type HistoryCutStatus,
   type MetadataRepository,
   type SnapshotCutRecord,
@@ -27,15 +26,22 @@ import {
 // Cut-based reads for grep on journal-served branches.
 //
 // A journal-served branch has no manifest head: its live truth is the fenced
-// Postgres journal. Grep therefore runs against an EXACT immutable HistoryCut
-// of the live state — the same primitive `portablefs snapshot` uses:
+// Postgres journal. Grep therefore runs against an immutable HistoryCut —
+// the same primitive `portablefs snapshot` uses:
 //
-// 1. Resolve the read source (resolveCutReadSource): reuse a READY
-//    cut that provably captures the CURRENT journal position, or mint one
-//    through metadata.snapshotCut and wait (bounded) for the resident history
-//    worker to materialize it.
+// 1. Resolve the read source (resolveCutReadSource): REUSE the branch's
+//    newest READY cut when one exists; mint one through metadata.snapshotCut
+//    and wait (bounded) for the resident history worker only when the branch
+//    has no ready cut at all.
 // 2. Scan the tree directly through the verified exact-key read path
 //    (grepPft2Commit), without materializing a host workspace.
+//
+// BOUNDED STALENESS CONTRACT: grep answers an exact immutable state of the
+// branch, at most as old as the branch's last ready cut. Staleness is the
+// time since that cut was published — with chained/rolling cuts the history
+// worker keeps that to seconds. Callers that need the exact CURRENT journal
+// position take a snapshot (which always mints at the live boundary) and
+// grep that.
 //
 // Every object byte flows through the same positive-proof discipline as
 // GET /v1/history/objects: DB-recorded exact storage keys, size- and
@@ -71,25 +77,20 @@ export interface ResolveCutSourceInput {
   signal: AbortSignal;
 }
 
-// Newest-first candidates whose recorded boundary already matches are
-// re-proven through cutStatus; the scan is bounded so a pathological record
-// list cannot turn resolution into O(cuts) database reads.
+// Newest-first ready candidates are re-proven through cutStatus; the scan is
+// bounded so a pathological record list cannot turn resolution into O(cuts)
+// database reads.
 const maxReuseCandidateChecks = 4;
 const cutReadyPollIntervalMs = 150;
-// A cut older than the live journal position is still exact when every row
-// since it is control-only. Scans beyond this many rows classify as content
-// (mint a fresh cut) — on a mounted volume the control-row trickle is a few
-// rows per minute, so a current cut sits well under the bound.
-const cutReuseContentScanLimit = 512;
 
 /**
- * Resolves the immutable source grep on a journal-served branch scans. For
- * live branches, a READY cut is REUSED when its exact
- * (generationId, cutSeqExclusive) equals the branch's current (generationId,
- * nextSeq) — every appended record is inside the cut, so its result commit
- * IS the live state; repeat reads on an idle volume mint nothing. Terminal
- * (retiring/retired) branches run against their newest ready cut, which is
- * their truth by definition.
+ * Resolves the immutable source grep on a journal-served branch scans. Live
+ * branches REUSE the branch's newest READY cut whenever one exists —
+ * regardless of its age — and mint a fresh cut (waiting bounded for the
+ * resident history worker) only when NO ready cut exists. Staleness is
+ * therefore bounded by the time since the last ready cut was published (see
+ * the module header). Terminal (retiring/retired) branches run against their
+ * newest ready cut, which is their truth by definition.
  */
 export async function resolveCutReadSource(
   input: ResolveCutSourceInput
@@ -100,7 +101,8 @@ export async function resolveCutReadSource(
 
   // The branch's current journal position. null = no nonterminal generation:
   // the branch head commit IS the live state (nothing has ever been
-  // journaled past it), and the repository would refuse a capture typed.
+  // journaled past it, and a newest ready cut could only be older than the
+  // installed head), and the repository would refuse a capture typed.
   const binding = input.metadata.journalBinding
     ? await input.metadata.journalBinding({
         tenantId: input.tenantId,
@@ -111,14 +113,11 @@ export async function resolveCutReadSource(
   if (binding === null) {
     return resolveHeadCommitSource(input);
   }
-  if (binding !== undefined) {
-    const reused = await findReusableCut(input, binding);
-    if (reused) {
-      return reused;
-    }
+  const reused = await findNewestReadyCut(input);
+  if (reused) {
+    return reused;
   }
-  // No provably-current ready cut (or no binding surface to compare against:
-  // correct first, fast second) — capture a fresh one and wait bounded.
+  // No ready cut exists yet — capture a fresh one and wait bounded.
   return mintAndAwaitCut(input);
 }
 
@@ -181,10 +180,11 @@ async function resolveHeadCommitSource(input: ResolveCutSourceInput): Promise<Cu
   throw new MetadataConflictError("VOLUME_NOT_FOUND", "Volume or branch head not found.", 404);
 }
 
-async function findReusableCut(
-  input: ResolveCutSourceInput,
-  binding: BranchJournalBinding
-): Promise<CutReadSource | null> {
+// The branch's newest READY cut, re-proven through the full cut facts: a
+// stale record projection (canceled cut, missing result commit) never
+// serves. Any ready cut is an exact immutable state of this branch — age
+// only bounds staleness, never exactness.
+async function findNewestReadyCut(input: ResolveCutSourceInput): Promise<CutReadSource | null> {
   if (!input.metadata.listSnapshotRecords) {
     return null;
   }
@@ -199,55 +199,10 @@ async function findReusableCut(
     if (record.state !== "ready" || !record.cutId || !record.resultCommitId) {
       continue;
     }
-    // The live journal position advances with CONTROL rows (session
-    // establishment, open pins, flush watermarks, barriers) even while the
-    // content is untouched, so an exact-boundary match almost never exists
-    // on a mounted volume. A cut at an OLDER boundary is still the branch's
-    // exact current content when every row since it is control-only.
-    const cutBoundarySeq = record.cutSeqExclusive;
-    if (!cutBoundarySeq) {
-      continue;
-    }
-    let boundary: -1 | 0 | 1;
-    try {
-      const cutSeq = BigInt(cutBoundarySeq);
-      const nextSeq = BigInt(binding.nextSeq);
-      boundary = cutSeq === nextSeq ? 0 : cutSeq < nextSeq ? -1 : 1;
-    } catch {
-      continue;
-    }
-    if (boundary > 0) {
-      continue; // a boundary past the live position can only be an alias
-    }
-    if (boundary < 0 && !input.metadata.journalContentRowsSince) {
-      continue; // no classification surface: correct first, fast second
-    }
     checks += 1;
-    // Re-prove against the full cut facts that the GENERATION matches too —
-    // sequence numbers from a superseded generation must never alias into
-    // the current one — and that the recorded boundary is the cut's truth.
     const status = await input.cutFacts.cutStatus(input.tenantId, record.cutId);
-    if (
-      !status ||
-      status.state !== "ready" ||
-      status.generationId !== binding.generationId ||
-      status.cutSeqExclusive !== cutBoundarySeq ||
-      !status.resultCommitId
-    ) {
+    if (!status || status.state !== "ready" || !status.resultCommitId) {
       continue;
-    }
-    if (boundary < 0) {
-      const scan = await input.metadata.journalContentRowsSince!({
-        generationId: binding.generationId,
-        fromSeq: cutBoundarySeq,
-        toSeqExclusive: binding.nextSeq,
-        scanLimit: cutReuseContentScanLimit,
-      });
-      if (scan.truncated || scan.contentRows > 0) {
-        // Content moved past this cut. Candidates iterate newest-first, so
-        // every remaining cut is staler still: stop and mint.
-        return null;
-      }
     }
     return {
       kind: "pft2",

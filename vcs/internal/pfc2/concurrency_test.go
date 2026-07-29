@@ -39,7 +39,8 @@ func TestConcurrentReadersDuringApply(t *testing.T) {
 					d.st.NextCheckoutEpoch()
 				case 3:
 					d.st.PinHolders(uint64(1 + i%6))
-					d.st.FlushThrough(ref("pfs-1", 1), "wb", "dir0/leaf0", "1")
+					d.st.StreamState("wbpfs-1")
+					d.st.StreamCheckouts("wbpfs-1")
 					d.st.DbTimeFloorMs()
 				case 4:
 					d.st.Counts()

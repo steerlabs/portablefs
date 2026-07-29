@@ -21,7 +21,7 @@ package wal
 //   - the trivial edges: empty/absent-file Replay, a no-op Reset, idempotent repeat Replay,
 //     delete-then-recreate, CompactThrough exactly-at / ±1 a boundary, Close semantics.
 //
-// In-package helpers are reused (encA, localReplica, countingReplica, assertContiguousReplay,
+// In-package helpers are reused (encA, assertContiguousReplay,
 // oversize). No production .go source or existing test is modified.
 
 import (
@@ -706,21 +706,14 @@ func TestRenumberIsIdempotentOnAlreadyContiguous(t *testing.T) {
 // TestGroupCommitBufferAllThenCommitStorm exercises the exact shape the FOCUS calls out:
 // fan out N goroutines that each AppendBuffered (no commit), wait for ALL buffers to land,
 // then release a second storm where every goroutine calls CommitThrough on its own LSN at
-// once. Group commit must coalesce these into far fewer than N flushes, every commit must
-// return nil (durable), and a reopen+Replay must show a gapless [0..N) LSN prefix with the
-// standby a faithful mirror. -race guards the shared mu/commitMu/unflushed/durableSeq.
+// once. Every commit must return nil (durable), and a reopen+Replay must show a gapless
+// [0..N) LSN prefix. -race guards the shared mu/commitMu/unflushed/durableSeq.
 func TestGroupCommitBufferAllThenCommitStorm(t *testing.T) {
 	dir := t.TempDir()
 	primary, err := Open(filepath.Join(dir, "p.wal"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	standby, err := Open(filepath.Join(dir, "s.wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rep := &countingReplica{w: standby}
-	primary.SetReplica(rep)
 
 	const N = 256
 	seqs := make([]uint64, N)
@@ -788,17 +781,9 @@ func TestGroupCommitBufferAllThenCommitStorm(t *testing.T) {
 	if d := primary.durableSeqForTest(); d != N {
 		t.Fatalf("final durableSeq = %d, want %d", d, N)
 	}
-	rep.mu.Lock()
-	batches := rep.batches
-	rep.mu.Unlock()
-	if batches >= N {
-		t.Fatalf("group commit did not coalesce: %d replication batches for %d concurrent commits", batches, N)
-	}
-	t.Logf("buffer-all + commit-storm: %d concurrent commits coalesced into %d replication batches", N, batches)
 
-	// Durable & contiguous on the primary, and faithfully mirrored on the standby.
+	// Durable & contiguous on the primary.
 	assertContiguousReplay(t, "primary", filepath.Join(dir, "p.wal"), N)
-	assertContiguousReplay(t, "standby", filepath.Join(dir, "s.wal"), N)
 }
 
 // TestConcurrentAppendBufferedAssignsUniqueContiguousLSNs isolates the AppendBuffered LSN

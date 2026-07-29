@@ -157,6 +157,8 @@ export const authorityEndpointPayloadSchema = z.object({
   authorityUrl: z.string().min(1).max(512),
   host: z.string().min(1).max(255).optional(),
   port: z.number().int().positive().max(65535).optional(),
+  // Retired with the NFSv3 data plane: kept optional for wire compatibility
+  // with older payloads; no producer emits it.
   nfsPort: z.number().int().positive().max(65535).optional(),
   authorityInstanceId: idSchema.optional(),
   authorityAuthToken: z.string().min(1).optional(),

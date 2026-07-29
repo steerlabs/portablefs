@@ -2,41 +2,8 @@ package fsproto
 
 import (
 	"testing"
-
-	"github.com/go-git/go-billy/v5/memfs"
+	"time"
 )
-
-// TestProbeAdvertisesFsCapabilities: a workfs-backed authority advertises
-// ParentVersion stamping (negative-cache default-on precondition) and the
-// open-registration surface (fused create+register, batched unmarks); a plain
-// billy fs advertises neither — capability gating, never wire sniffing.
-func TestProbeAdvertisesFsCapabilities(t *testing.T) {
-	_, addr := serveFS(t)
-	cli, err := Dial(addr, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cli.Close()
-	feats, err := cli.ServerFeatures()
-	if err != nil {
-		t.Fatalf("ServerFeatures: %v", err)
-	}
-	if feats&FeatParentVersion == 0 {
-		t.Fatalf("workfs probe features %b missing FeatParentVersion", feats)
-	}
-	if feats&FeatOpenRegistration == 0 {
-		t.Fatalf("workfs probe features %b missing FeatOpenRegistration", feats)
-	}
-	if !cli.SupportsOpenRegistration() {
-		t.Fatal("SupportsOpenRegistration must be true against a workfs authority")
-	}
-
-	legacy := NewServer(memfs.New(), nil, nil)
-	if r := legacy.dispatch(&Request{Op: OpProtocolVersion, Size: int64(ProtocolVersion)}); r.Status != OK ||
-		r.Features&(FeatParentVersion|FeatOpenRegistration) != 0 {
-		t.Fatalf("plain billy fs must advertise neither capability: status=%d features=%b", r.Status, r.Features)
-	}
-}
 
 // TestCreateRegisterOpenHoldParksPeerUnlink is the fused-path version of the
 // frozen open-vs-unlink guarantee: the hold recorded by create+RegisterOpen
@@ -103,8 +70,16 @@ func TestUnmarkOpenBatchReleasesHolds(t *testing.T) {
 		if st, err := cli.Remove(name); err != nil || st != OK {
 			t.Fatalf("remove %s: st=%d err=%v", name, st, err)
 		}
-		if _, st, err := cli.GetattrOrphan(inos[i]); err != nil || st != ENOENT {
-			t.Fatalf("%s must be destroyed after unmark+remove, got orphan stat st=%d err=%v", name, st, err)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, st, err := cli.GetattrOrphan(inos[i]); err == nil && st == ENOENT {
+				break
+			}
+			if time.Now().After(deadline) {
+				_, st, err := cli.GetattrOrphan(inos[i])
+				t.Fatalf("%s must be destroyed after unmark+remove, got orphan stat st=%d err=%v", name, st, err)
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }

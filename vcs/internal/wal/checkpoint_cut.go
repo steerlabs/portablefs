@@ -105,14 +105,8 @@ func (w *WAL) CheckpointCutState() (CheckpointCut, bool) {
 }
 
 func (w *WAL) validateCheckpointCompactionLocked(through uint64) error {
-	if w.hasMaintenance && w.maintenance.Status == MaintenancePrepared && through > w.maintenance.Watermark {
-		return fmt.Errorf("wal: checkpoint compaction %d crosses prepared maintenance cut %d; recover rotation first", through, w.maintenance.Watermark)
-	}
 	if !w.hasCheckpoint {
-		if !w.haRequired {
-			return nil
-		}
-		return errors.New("wal: HA compaction requires a replicated landed checkpoint cut")
+		return nil
 	}
 	if w.checkpoint.Status != CheckpointLanded && w.checkpoint.Status != CheckpointFinalized {
 		return errors.New("wal: compaction requires a landed checkpoint cut")
@@ -123,9 +117,9 @@ func (w *WAL) validateCheckpointCompactionLocked(through uint64) error {
 	return nil
 }
 
-// PrepareCheckpointCut is the mandatory pre-dispatch barrier. For HA WALs it
-// persists locally, then synchronously on the reconciled standby, before
-// returning permission for the caller to dispatch the backend commit.
+// PrepareCheckpointCut is the mandatory pre-dispatch barrier: the cut fact is
+// durable in the log's metadata before the caller may dispatch the backend
+// commit.
 func (w *WAL) PrepareCheckpointCut(cut CheckpointCut) (CheckpointCut, error) {
 	w.commitMu.Lock()
 	defer w.commitMu.Unlock()
@@ -141,24 +135,10 @@ func (w *WAL) PrepareCheckpointCut(cut CheckpointCut) (CheckpointCut, error) {
 	if err := w.setCheckpointCutLocked(cut); err != nil {
 		return CheckpointCut{}, err
 	}
-	if w.haRequired {
-		exact, ok := w.replica.(ExactReplica)
-		if !ok || !w.replicaExact {
-			return CheckpointCut{}, ErrReplicaRequired
-		}
-		if err := exact.SetCheckpointCutExact(cut); err != nil {
-			w.poisonLocked()
-			return CheckpointCut{}, err
-		}
-	}
 	return cut, nil
 }
 
-// ResolveCheckpointCut records definitive backend receipt evidence. Remote is
-// persisted first so loss of the primary after a landed commit cannot promote a
-// standby that lacks the cut proof. A promoted member with no replacement may
-// resolve locally during startup recovery; HA membership simultaneously refuses
-// every user write until AttachReplica installs a replacement.
+// ResolveCheckpointCut records definitive backend receipt evidence.
 func (w *WAL) ResolveCheckpointCut(operationID, commitID string, landed bool) error {
 	w.commitMu.Lock()
 	defer w.commitMu.Unlock()
@@ -173,23 +153,10 @@ func (w *WAL) ResolveCheckpointCut(operationID, commitID string, landed bool) er
 	} else {
 		next.Status, next.CommitID = CheckpointAborted, ""
 	}
-	if w.haRequired {
-		if w.replica != nil {
-			exact, ok := w.replica.(ExactReplica)
-			if !ok || !w.replicaExact {
-				return ErrReplicaRequired
-			}
-			if err := exact.SetCheckpointCutExact(next); err != nil {
-				w.poisonLocked()
-				return err
-			}
-		}
-	}
 	return w.setCheckpointCutLocked(next)
 }
 
-// FinalizeCheckpointCut marks a landed cut fully compacted on both members (or
-// locally on a promoted, write-fenced member awaiting its replacement).
+// FinalizeCheckpointCut marks a landed cut fully compacted.
 func (w *WAL) FinalizeCheckpointCut(operationID string) error {
 	w.commitMu.Lock()
 	defer w.commitMu.Unlock()
@@ -206,26 +173,12 @@ func (w *WAL) FinalizeCheckpointCut(operationID string) error {
 	}
 	next := w.checkpoint
 	next.Status = CheckpointFinalized
-	if w.haRequired {
-		if w.replica != nil {
-			exact, ok := w.replica.(ExactReplica)
-			if !ok || !w.replicaExact {
-				return ErrReplicaRequired
-			}
-			if err := exact.SetCheckpointCutExact(next); err != nil {
-				w.poisonLocked()
-				return err
-			}
-		}
-	}
 	return w.setCheckpointCutLocked(next)
 }
 
 // CompactRecoveredCheckpoint locally compacts only the watermark named by a
-// persisted replicated Landed cut. It is the startup/promotion path used before
-// a replacement replica is attached: it deliberately does not flush the
-// reopened suffix through the ordinary write barrier, but cannot be invoked
-// without exact commit proof. User writes remain HA-fenced.
+// persisted Landed cut — the startup path when the compaction itself did not
+// survive the crash. It cannot be invoked without exact commit proof.
 func (w *WAL) CompactRecoveredCheckpoint(operationID string) error {
 	w.commitMu.Lock()
 	defer w.commitMu.Unlock()

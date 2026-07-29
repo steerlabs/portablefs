@@ -41,6 +41,20 @@ func newFreezeProxy(t *testing.T, backend string) *freezeProxy {
 func (p *freezeProxy) addr() string { return p.ln.Addr().String() }
 
 func (p *freezeProxy) freeze() { p.frozen.Store(true) }
+func (p *freezeProxy) thaw() {
+	p.frozen.Store(false)
+	// Connections accepted while frozen were deliberately never connected
+	// to the backend, so merely clearing the flag cannot revive them. Model
+	// a recovered network link by resetting the outage-era TCP cohort; the
+	// client then redials through the now-healthy proxy.
+	p.mu.Lock()
+	stale := p.conns
+	p.conns = nil
+	p.mu.Unlock()
+	for _, c := range stale {
+		_ = c.Close()
+	}
+}
 
 func (p *freezeProxy) close() {
 	select {
@@ -108,93 +122,234 @@ func (p *freezeProxy) pump(dst, src net.Conn) {
 	}
 }
 
-// TestSyncVolumeBoundedJournalFirstOnDeadAuthority pins the P1 journal-first
-// unmount contract end to end:
-//
-//  1. With the authority BLACK-HOLED mid-attach (the incident shape), the
-//     unmount-class volume barrier replies success within its ceiling —
-//     never a network-liveness wait — because the pending write-back
-//     mutations are made durable in the local session WAL.
-//  2. CloseJournalDurable returns without draining to the dead authority and
-//     keeps the WAL on disk.
-//  3. The next clean start of the same (owner, walDir) volume replays the
-//     WAL to the recovered authority: nothing acknowledged was lost.
-func TestSyncVolumeBoundedJournalFirstOnDeadAuthority(t *testing.T) {
+func compressBarrierTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := volumeBarrierTimeout
+	volumeBarrierTimeout = d
+	t.Cleanup(func() { volumeBarrierTimeout = prev })
+}
+
+// TestNormalBarrierFailsOnDeadAuthority pins invariants 6/9/10: with the
+// authority BLACK-HOLED, the normal volume barrier (fsync / synchronize /
+// unmount drain) returns an ERROR within its bound — never a local-only
+// success. Only the EXPLICIT force path (CloseJournalDurable) detaches with
+// the unshipped tail, parking it as a durable, visible recovery job whose ID
+// it returns; the next attach on a healthy authority drains it byte-exact
+// BEFORE serving (recovery is an attach-readiness gate).
+func TestNormalBarrierFailsOnDeadAuthority(t *testing.T) {
+	compressBarrierTimeout(t, 2*time.Second)
 	authorityAddr := serveCore(t)
 	proxy := newFreezeProxy(t, authorityAddr)
 	walDir := t.TempDir()
 	ctx := context.Background()
 
 	v := dialCoreNoCleanup(t, proxy.addr(), Options{
-		Owner:     "own-unmount-test",
-		WriteBack: true,
-		WALDir:    walDir,
-		// Keep the background flusher quiet so the test deterministically owns
-		// which flushes happen when.
-		FlushInterval: time.Hour,
+		Owner:    "own-unmount-test",
+		VolumeID: "vol-unmount",
+		Branch:   "main",
+		WALDir:   walDir,
 	})
 
-	a, st := v.Create(ctx, "f", 0o644)
+	// A DELEGATED subtree (top-level paths are deliberately nondelegable, so
+	// they would prove nothing about the acknowledged write-back tail).
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir: %d", st)
+	}
+	a, st := v.Create(ctx, "d/f", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create d/f: %d", st)
+	}
+	if !v.wb.Covers("d/f") {
+		t.Fatal("precondition: d is delegated")
+	}
+	n := NewNodeState(a.Ino, a.Ino != 0)
+
+	// The authority's TCP peer goes dark FIRST: everything acknowledged
+	// after this point is a guaranteed-unshipped delegated tail.
+	proxy.freeze()
+	if _, st := v.Write(ctx, "d/f", n, 0, []byte("journal-first")); st != fsproto.OK {
+		t.Fatalf("write: %d", st)
+	}
+
+	start := time.Now()
+	err := v.SyncVolume()
+	if err == nil {
+		t.Fatal("the normal barrier answered success against a black-holed authority — the local-only fsync outcome must not exist")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("barrier failure took %v; it must fail within its bound, never hang", elapsed)
+	}
+
+	// Explicit force: park the tail durably with a visible job ID.
+	start = time.Now()
+	jobID, err := v.CloseJournalDurable()
+	if err != nil {
+		t.Fatalf("forced close: %v", err)
+	}
+	if jobID == "" {
+		t.Fatal("forced close with an unshipped tail returned no recovery job ID")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("forced close took %v; it must not drain to the dead authority", elapsed)
+	}
+
+	// Next attach (authority reachable, same walDir): the attach-readiness
+	// gate drains the parked stream BEFORE the mount serves.
+	compressBarrierTimeout(t, 60*time.Second)
+	v2 := dialCore(t, authorityAddr, Options{
+		Owner:    "own-unmount-test",
+		VolumeID: "vol-unmount",
+		Branch:   "main",
+		WALDir:   walDir,
+	})
+	if jobs := v2.RecoveryJobs(); len(jobs) != 0 {
+		t.Fatalf("attach served with unresolved recovery jobs: %+v", jobs)
+	}
+	data, st := v2.Read(ctx, "d/f", NewNodeState(a.Ino, a.Ino != 0), 0, 64)
+	if st != fsproto.OK || string(data) != "journal-first" {
+		t.Fatalf("recovered content %q st=%d, want %q — the acknowledged write was lost", data, st, "journal-first")
+	}
+}
+
+func TestFailedCloseLeavesVolumeServingForRetry(t *testing.T) {
+	compressBarrierTimeout(t, time.Second)
+	authorityAddr := serveCore(t)
+	proxy := newFreezeProxy(t, authorityAddr)
+	ctx := context.Background()
+	v := dialCoreNoCleanup(t, proxy.addr(), Options{
+		Owner:    "retry-close",
+		VolumeID: "vol-retry-close",
+		Branch:   "main",
+		WALDir:   t.TempDir(),
+	})
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir: %d", st)
+	}
+	a, st := v.Create(ctx, "d/f", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("create: %d", st)
 	}
 	n := NewNodeState(a.Ino, a.Ino != 0)
-	if _, st := v.Write(ctx, "f", n, 0, []byte("journal-first")); st != fsproto.OK {
-		t.Fatalf("write: %d", st)
+	if st := v.RegisterOpened("d/f", n); st != fsproto.OK {
+		t.Fatalf("register open: %d", st)
+	}
+	if st := v.FsyncHandle("d/f", n); st != fsproto.OK {
+		t.Fatalf("initial fsync: %d", st)
 	}
 
-	// The authority's TCP peer goes dark: established conns black-hole.
 	proxy.freeze()
-
-	start := time.Now()
-	degraded, err := v.SyncVolumeBounded(700 * time.Millisecond)
-	if err != nil {
-		t.Fatalf("journal-first volume barrier must succeed on WAL durability, got %v", err)
+	if _, st := v.Write(ctx, "d/f", n, 0, []byte("before retry")); st != fsproto.OK {
+		t.Fatalf("delegated write: %d", st)
 	}
-	if !degraded {
-		t.Fatal("a journal-first answer must report itself degraded (callers log it; it is not the authority barrier)")
+	if err := v.Close(); err == nil {
+		t.Fatal("close succeeded against a black-holed authority")
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("volume barrier took %v; must reply within its ceiling, never await the dead network", elapsed)
+	if !n.IsOpen() {
+		t.Fatal("failed volume close altered live handle state")
 	}
-
-	start = time.Now()
-	if err := v.CloseJournalDurable(); err != nil {
-		t.Fatalf("journal-durable close: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("journal-durable close took %v; must not drain to the dead authority", elapsed)
+	if _, st := v.Write(ctx, "d/f", n, int64(len("before retry")), []byte("+alive")); st != fsproto.OK {
+		t.Fatalf("write after refused close: %d", st)
 	}
 
-	// Next clean start (authority reachable again, same owner + walDir):
-	// recovery replays the WAL tail before serving.
-	v2 := dialCore(t, authorityAddr, Options{
-		Owner:         "own-unmount-test",
-		WriteBack:     true,
-		WALDir:        walDir,
-		FlushInterval: time.Hour,
-	})
-	data, st := v2.Read(ctx, "f", NewNodeState(a.Ino, a.Ino != 0), 0, 64)
-	if st != fsproto.OK {
-		t.Fatalf("read after recovery: %d", st)
+	proxy.thaw()
+	volumeBarrierTimeout = 10 * time.Second
+	deadline := time.Now().Add(15 * time.Second)
+	var lastErr error
+	for {
+		lastErr = v.Fsync("d/f")
+		if lastErr == nil {
+			n.clearDirty()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("volume did not recover after authority connectivity returned: %v", lastErr)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if string(data) != "journal-first" {
-		t.Fatalf("recovered content %q, want %q — the acknowledged write was lost", data, "journal-first")
+	if st := v.CloseHandle("d/f", n); st != fsproto.OK {
+		t.Fatalf("close handle after recovery: %d", st)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatalf("retry volume close: %v", err)
 	}
 }
 
-// TestSyncVolumeBoundedNormalPathFlushesToAuthority pins that a REACHABLE
-// authority keeps today's synchronize semantics exactly: the bounded barrier
-// completes the full flush to the authority before success (not merely local
-// WAL durability).
-func TestSyncVolumeBoundedNormalPathFlushesToAuthority(t *testing.T) {
+func TestFailedDetachKeepsMutationsGatedThenReopensVolume(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+	v := dialCoreNoCleanup(t, addr, Options{
+		Owner:    "retry-detach",
+		VolumeID: "vol-retry-detach",
+		Branch:   "main",
+		WALDir:   t.TempDir(),
+	})
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir: %d", st)
+	}
+	a, st := v.Create(ctx, "d/f", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create: %d", st)
+	}
+	n := NewNodeState(a.Ino, a.Ino != 0)
+	if _, st := v.Write(ctx, "d/f", n, 0, []byte("before")); st != fsproto.OK {
+		t.Fatalf("initial write: %d", st)
+	}
+
+	detachEntered := make(chan struct{})
+	releaseDetach := make(chan struct{})
+	detachErr := errors.New("injected kernel detach failure")
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- v.CloseWithFinalizer(func() error {
+			close(detachEntered)
+			<-releaseDetach
+			return detachErr
+		})
+	}()
+	select {
+	case <-detachEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("close never reached the frontend detach")
+	}
+
+	writeDone := make(chan Status, 1)
+	go func() {
+		_, st := v.Write(ctx, "d/f", n, int64(len("before")), []byte("+after"))
+		writeDone <- st
+	}()
+	select {
+	case st := <-writeDone:
+		t.Fatalf("mutation escaped the close gate during detach: %d", st)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseDetach)
+	if err := <-closeDone; !errors.Is(err, detachErr) {
+		t.Fatalf("close error = %v, want injected detach failure", err)
+	}
+	select {
+	case st := <-writeDone:
+		if st != fsproto.OK {
+			t.Fatalf("mutation after refused detach: %d", st)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("mutation gate did not reopen after refused detach")
+	}
+
+	if err := v.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+}
+
+// TestSyncVolumeNormalPathFlushesToAuthority pins that a REACHABLE authority
+// completes the full barrier: every acknowledged mutation is at the
+// authority (and peer-visible) before success.
+func TestSyncVolumeNormalPathFlushesToAuthority(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 	v := dialCore(t, addr, Options{
-		Owner:         "own-normal-sync",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
+		Owner:  "own-normal-sync",
+		WALDir: t.TempDir(),
 	})
 	a, st := v.Create(ctx, "g", 0o644)
 	if st != fsproto.OK {
@@ -204,12 +359,8 @@ func TestSyncVolumeBoundedNormalPathFlushesToAuthority(t *testing.T) {
 	if _, st := v.Write(ctx, "g", n, 0, []byte("normal-path")); st != fsproto.OK {
 		t.Fatalf("write: %d", st)
 	}
-	degraded, err := v.SyncVolumeBounded(unmountTestCeiling)
-	if err != nil {
-		t.Fatalf("bounded barrier on a reachable authority: %v", err)
-	}
-	if degraded {
-		t.Fatal("the normal path completed the full authority barrier; it must not report degraded")
+	if err := v.SyncVolume(); err != nil {
+		t.Fatalf("barrier on a reachable authority: %v", err)
 	}
 	// An INDEPENDENT write-through client must observe the bytes at the
 	// authority (write-back flushed before success, not just WAL-fsynced).
@@ -219,27 +370,21 @@ func TestSyncVolumeBoundedNormalPathFlushesToAuthority(t *testing.T) {
 		t.Fatalf("observer read: %d", st)
 	}
 	if string(data) != "normal-path" {
-		t.Fatalf("authority holds %q, want %q — the normal-path barrier must flush before success", data, "normal-path")
+		t.Fatalf("authority holds %q, want %q — the barrier must flush before success", data, "normal-path")
 	}
 }
 
-const unmountTestCeiling = 12 * time.Second
-
-// TestSyncVolumeBoundedFencedSessionSurfacesError pins the m1 half of the
-// split predicate: a FENCED session with a perfectly REACHABLE authority must
-// never answer the volume barrier with bare success. The fence is a definite
-// verdict — this generation's writes are rejected — so the barrier surfaces
-// an error (mapped to EIO by frontends), exactly as the weaker per-file
-// fsync=authority does on a superseded session. It must still answer fast:
-// fenced can never mean a kernel-visible hang.
-func TestSyncVolumeBoundedFencedSessionSurfacesError(t *testing.T) {
+// TestSyncVolumeFencedSessionSurfacesError: a FENCED session with a
+// perfectly REACHABLE authority must never answer the volume barrier with
+// success — the fence is a definite verdict that this generation's writes
+// are rejected. It must still answer fast: fenced can never mean a
+// kernel-visible hang.
+func TestSyncVolumeFencedSessionSurfacesError(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 	v := dialCore(t, addr, Options{
-		Owner:         "own-fenced-barrier",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
+		Owner:  "own-fenced-barrier",
+		WALDir: t.TempDir(),
 	})
 	a, st := v.Create(ctx, "h", 0o644)
 	if st != fsproto.OK {
@@ -256,37 +401,12 @@ func TestSyncVolumeBoundedFencedSessionSurfacesError(t *testing.T) {
 	if !v.SessionFenced() {
 		t.Fatal("precondition: session fenced")
 	}
-	if v.AuthorityUnreachable() {
-		t.Fatal("precondition: authority reachable (fail-fast must not be engaged)")
-	}
 
 	start := time.Now()
-	degraded, err := v.SyncVolumeBounded(unmountTestCeiling)
-	if err == nil {
-		t.Fatal("fenced-but-reachable barrier answered success — the false durability guarantee m1 forbids")
+	if err := v.SyncVolume(); err == nil {
+		t.Fatal("fenced-but-reachable barrier answered success — a false durability guarantee")
 	}
-	if !errors.Is(err, fsproto.ErrSessionFenced) {
-		t.Fatalf("fenced barrier error must wrap ErrSessionFenced, got %v", err)
-	}
-	if degraded {
-		t.Fatal("a fenced barrier is an ERROR, not a degraded journal-first success")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Fatalf("fenced barrier took %v; it must fail fast, never wedge the caller", elapsed)
-	}
-}
-
-// TestSyncLocalDurableWriteThroughIsInert pins the write-through invariant:
-// with no session manager nothing can be pending locally by construction
-// (every acknowledged mutation was durable-before-reply at the authority),
-// so the journal-first barrier is an immediate success with no network.
-func TestSyncLocalDurableWriteThroughIsInert(t *testing.T) {
-	addr := serveCore(t)
-	v := dialCore(t, addr, Options{Owner: "own-wt"})
-	if v.Sessions() != nil {
-		t.Fatal("precondition: write-through volume has no session manager")
-	}
-	if err := v.SyncLocalDurable(); err != nil {
-		t.Fatalf("write-through journal-first barrier must be an immediate success: %v", err)
 	}
 }

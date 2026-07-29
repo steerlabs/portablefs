@@ -58,6 +58,7 @@ message Envelope {
     ReclaimRequest reclaim = 32;
     SubscribeEventsRequest subscribe_events = 33;
     HardLinkRequest hard_link = 34;
+    SyncVolumeRequest sync_volume = 35;
 
     // daemon → client (replies)
     HelloReply hello_reply = 60;
@@ -85,6 +86,7 @@ message Envelope {
     ReclaimReply reclaim_reply = 82;
     SubscribeEventsReply subscribe_events_reply = 83;
     HardLinkReply hard_link_reply = 84;
+    SyncVolumeReply sync_volume_reply = 85;
 
     // daemon → client (either)
     ErrorReply error = 90;   // reply position: op failed with errno
@@ -319,7 +321,18 @@ message XattrListReply { repeated string names = 1; }
 message XattrRemoveRequest { Item item = 1; string name = 2; }
 message XattrRemoveReply {}
 
-// ---------- statfs / reclaim ----------
+// ---------- volume sync / statfs / reclaim ----------
+
+// SyncVolume is the REAL volume barrier behind FSKit's synchronize and the
+// CLI's pre-unmount drain. Success means the acknowledged tail is durable and
+// applied at the authority and every live protocol subscriber reached its
+// supported invalidation boundary. There is no local-only success: an
+// unreachable, slow, or fenced authority fails the request. `degraded` is
+// retired wire ballast and is always false.
+message SyncVolumeRequest {}
+message SyncVolumeReply {
+  bool degraded = 1;
+}
 
 message StatfsRequest {}
 message StatfsReply {

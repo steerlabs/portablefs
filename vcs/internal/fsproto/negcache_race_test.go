@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
@@ -33,20 +31,15 @@ func (f *lstatHookFS) Lstat(name string) (os.FileInfo, error) {
 // negative forever (nothing ever advances the parent again). Sampling BEFORE stamps the pre-create
 // version, so the create's invalidation strictly advances the client past the negative and evicts it.
 func TestGetattrMissSamplesParentVersionBeforeLstat(t *testing.T) {
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	inner, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	inner := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	hooked := &lstatHookFS{FS: inner}
-	deleg := delegation.New()
-	s := NewServer(hooked, inner, deleg)
-
-	if r := s.dispatch(&Request{Op: OpMkdir, Path: "d", Mode: 0o755}); r.Status != OK {
-		t.Fatalf("seed mkdir: status %d", r.Status)
+	s := NewServer(hooked, inner)
+	// Mutations ride a second server over the SAME fs (the hooked server is
+	// reads-only: the wrapper hides the session store).
+	mut := NewServer(inner, inner)
+	mcs := openExactSession(t, mut, "sess-NC", 1, "M", "tokNC", 8)
+	if r := exactDo(mut, mcs, &Request{Op: OpMkdir, Path: "d", Mode: 0o755}, 0, 1); r.Status != OK {
+		t.Fatalf("seed mkdir: %+v", r)
 	}
 
 	// Parent version of "d" BEFORE any racing create.
@@ -62,8 +55,8 @@ func TestGetattrMissSamplesParentVersionBeforeLstat(t *testing.T) {
 	hooked.hook = func(name string) {
 		if name == "d/x" && !fired {
 			fired = true
-			if r := s.dispatch(&Request{Op: OpCreate, Path: "d/y", Mode: 0o644}); r.Status != OK {
-				t.Errorf("in-window create: status %d", r.Status)
+			if r := exactDo(mut, mcs, &Request{Op: OpCreate, Path: "d/y", Mode: 0o644}, 0, 2); r.Status != OK {
+				t.Errorf("in-window create: %+v", r)
 			}
 		}
 	}

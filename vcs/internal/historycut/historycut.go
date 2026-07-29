@@ -356,6 +356,11 @@ type Result struct {
 	RecoveryObjectCount uint64
 	RecoveryObjectBytes uint64
 	RecoveryClosure     []string
+	// DeltaClosures reports that the closures above cover ONLY the objects
+	// this run produced (Materializer.DeltaClosures over an adopted base):
+	// the publisher must register the reused remainder from the base cut's
+	// closure rows and take its totals from that registration.
+	DeltaClosures bool
 }
 
 // fixed reduction constants (changing any of these changes committed object
@@ -422,6 +427,41 @@ type Materializer struct {
 	// select the pft2 defaults). Production leaves it zero; tests lower
 	// MaxStagedCellBytes to force many checkpoint commits on small folds.
 	Limits pft2.EditorLimits
+	// DeltaClosures requests O(delta) closure reporting for ADOPTED-base
+	// folds: Result closures then cover only the objects THIS run produced
+	// (the reachable subset), and the caller registers the reused rows
+	// server-side from the base cut's registered closure — instead of the
+	// reducer re-walking (and re-fetching) the entire tree. Ignored for
+	// fork/conversion/empty bases, whose closures have no registered
+	// same-branch base to copy from. Committed object bytes are identical
+	// either way.
+	DeltaClosures bool
+
+	// produced records every object written during the current Run when
+	// the delta-closure path is active.
+	produced *producedRecorder
+}
+
+// producedRecorder marks every object the reduction writes; the closure
+// delta is the reachable subset of exactly these.
+type producedRecorder struct {
+	Store
+	refs map[pft2.Ref]bool
+}
+
+func (r *producedRecorder) Seed(ref pft2.Ref, data []byte) error {
+	r.refs[ref] = true
+	return r.Store.Seed(ref, data)
+}
+
+func (r *producedRecorder) PutNode(ref pft2.Ref, encoded []byte) error {
+	r.refs[ref] = true
+	return r.Store.PutNode(ref, encoded)
+}
+
+func (r *producedRecorder) PutPack(ref pft2.Ref, data []byte) error {
+	r.refs[ref] = true
+	return r.Store.PutPack(ref, data)
 }
 
 // Run materializes the cut. On ErrNeedBlobs the supervisor stages Spool
@@ -493,6 +533,12 @@ func (m *Materializer) runManaged(ctx context.Context) (*Result, error) {
 				}
 				if err := m.bindAdoptedRecovery(bc, baseRecovery, ref, baseSeq, namespace); err != nil {
 					return nil, err
+				}
+				if m.DeltaClosures {
+					// Every write from here on is delta: the base cut's
+					// registered closure covers the reused remainder.
+					m.produced = &producedRecorder{Store: m.Spool, refs: map[pft2.Ref]bool{}}
+					m.Spool = m.produced
 				}
 			case "fork":
 				// A fork is a fresh generation origin by construction; a
@@ -1269,8 +1315,16 @@ func (m *Materializer) assemble(
 		return nil, err
 	}
 
+	// Delta mode restricts both walks to objects this run produced: their
+	// parent spine up to the root is produced too (path copying re-encodes
+	// every ancestor of a changed node), so the restricted reachability is
+	// exactly "produced and reachable" with no fetch beyond the delta.
+	var include func(pft2.Ref) bool
+	if m.produced != nil {
+		include = func(ref pft2.Ref) bool { return m.produced.refs[ref] }
+	}
 	userSet := map[pft2.Ref]uint64{}
-	if err := m.closureInto(ctx, res.Root, userSet, nil); err != nil {
+	if err := m.closureInto(ctx, res.Root, userSet, nil, include); err != nil {
 		return nil, err
 	}
 	// The user filesystem tree must never reach an internal recovery object.
@@ -1283,7 +1337,7 @@ func (m *Materializer) assemble(
 		}
 	}
 	recoverySet := map[pft2.Ref]uint64{}
-	if err := m.closureInto(ctx, recoveryRef, recoverySet, userSet); err != nil {
+	if err := m.closureInto(ctx, recoveryRef, recoverySet, userSet, include); err != nil {
 		return nil, err
 	}
 	userClosure, userBytes := sortedClosure(userSet)
@@ -1302,6 +1356,7 @@ func (m *Materializer) assemble(
 		RecoveryObjectCount: uint64(len(recoveryClosure)),
 		RecoveryObjectBytes: recoveryBytes,
 		RecoveryClosure:     recoveryClosure,
+		DeltaClosures:       m.produced != nil,
 	}, nil
 }
 
@@ -1354,9 +1409,12 @@ func buildXattrLeaves(rows []fstransition.XattrRow, sink Store) ([]pft2.Ref, err
 
 // closureInto walks the exact object graph from root (every edge re-verified
 // by decode) into out, skipping members of exclude (already accounted to the
-// other closure).
+// other closure). A non-nil include restricts the walk to admitted refs
+// without descending past a refused one (delta closures: reused subtrees
+// are covered by the base cut's registered rows).
 func (m *Materializer) closureInto(
 	ctx context.Context, root pft2.Ref, out map[pft2.Ref]uint64, exclude map[pft2.Ref]uint64,
+	include func(pft2.Ref) bool,
 ) error {
 	var visit func(ref pft2.Ref) error
 	visit = func(ref pft2.Ref) error {
@@ -1367,6 +1425,9 @@ func (m *Materializer) closureInto(
 			if _, ok := exclude[ref]; ok {
 				return nil
 			}
+		}
+		if include != nil && !include(ref) {
+			return nil
 		}
 		raw, err := m.Spool.Fetch(ctx, ref)
 		if err != nil {

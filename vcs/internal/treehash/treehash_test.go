@@ -72,9 +72,9 @@ func TestGoldenOwnershipMatchesTS(t *testing.T) {
 //	    { path: "emoji-🚀-café/x.txt", kind: "file", mode: M, size: 2, mtimeMs: 0, executable: false, uid: M, gid: M, blob: { digest: "sha256:"+"b".repeat(64), size: 2, compression: "none", packed: false } },
 //	  ]));'
 //
-// It was additionally cross-checked byte-identically against the Go bridge
-// (cmd/treehashcheck) on both the per-entry comparable keys (DEBUG=1) and the
-// final root hash. (A local generator also lives at
+// It was additionally cross-checked byte-identically against a Go bridge on
+// both the per-entry comparable keys and the final root hash when the port
+// was written. (A local generator also lives at
 // .volume-cache/treehash-boundary-probe.mjs, mirroring treehash-crosscheck.mjs.)
 func TestGoldenBoundaryMatchesTS(t *testing.T) {
 	const maxU32 = 0xffffffff // 4294967295
@@ -97,8 +97,8 @@ func TestGoldenBoundaryMatchesTS(t *testing.T) {
 // TestBoundaryComparableKeysAreStable pins the exact per-entry comparable keys of
 // the boundary manifest. These strings are the pre-image fed (with the path and a
 // NUL separator) into the shard SHA-256, so they ARE the Go↔TS contract: the same
-// strings are emitted by the TS comparableEntry/stableJson path (confirmed via the
-// treehashcheck DEBUG=1 bridge). Pinning them makes any drift in integer or string
+// strings are emitted by the TS comparableEntry/stableJson path (confirmed via a
+// debug bridge when the port was written). Pinning them makes any drift in integer or string
 // encoding fail here with a readable diff rather than only as an opaque hash change.
 func TestBoundaryComparableKeysAreStable(t *testing.T) {
 	const maxU32 = 0xffffffff

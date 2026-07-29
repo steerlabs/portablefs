@@ -12,18 +12,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/metrics"
-	"github.com/steerlabs/portablefs/vcs/internal/session"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
-)
-
-// FsyncPolicy controls write-back fsync durability.
-type FsyncPolicy string
-
-const (
-	// FsyncLocal keeps today's write-back behavior: fsync commits the local session WAL only.
-	FsyncLocal FsyncPolicy = "local"
-	// FsyncAuthority additionally flushes the covering write-back session to the authority.
-	FsyncAuthority FsyncPolicy = "authority"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 // Options configures a frontend-neutral clientcore volume attachment.
@@ -44,20 +33,14 @@ type Options struct {
 	// for a timed credential refresh.
 	OnTokenRejected func() bool
 
-	WriteBack     bool
-	WALDir        string
-	IdleInterval  time.Duration
-	FlushInterval time.Duration
-	FsyncPolicy   FsyncPolicy
-
-	// FlushMaxRecords / FlushMaxBytes bound one write-back FlushBatch RPC (records and
-	// payload bytes). Zero keeps the session defaults (512 records, unbounded bytes).
-	// Pure batching knobs: they change round-trip count, never apply semantics.
-	FlushMaxRecords int
-	FlushMaxBytes   int64
+	// WALDir is the write-back engine's durable state directory (the mount
+	// stream WAL + recovery jobs live under it). Empty uses a fresh
+	// temporary directory: crash recovery then belongs to the caller that
+	// owns a persistent path (portablefsd keys it by (volume, branch)).
+	WALDir string
 
 	// Negative dentry cache mode. Neither flag set (the default) is
-	// capability-auto: ON iff the authority advertises FeatParentVersion in
+	// default ON: parent versions are baseline in
 	// the protocol handshake (every miss then carries a parent-directory
 	// version stamp the cached negative is ordered against, and every name
 	// mutation bumps it — the invalidation-driven coherence proof).
@@ -74,6 +57,7 @@ type Options struct {
 	DiskCacheDir   string
 	DiskCacheBytes int64
 	VolumeID       string
+	Branch         string
 
 	PrefetchTree       bool
 	PrefetchMaxEntries int
@@ -85,9 +69,9 @@ type Options struct {
 	OnInvalidate  func(path string, inPlace bool)
 	OnFlushAll    func(path string)
 	OnMarkOrphan  func(path string, ino uint64)
-	// OnWriteBackError is called per subtree root after each write-back flush with the flush
-	// error (nil clears). Lets the daemon flip a mount to degraded when flushes persistently
-	// fail, so acked-but-unflushable write-back is loud instead of silently lost.
+	// OnWriteBackError reports the engine's sticky health verdict (nil
+	// clears). Lets the daemon flip a mount to degraded when flushes stall,
+	// so acked-but-unflushable write-back is loud instead of silently lost.
 	OnWriteBackError func(root string, err error)
 	Debugf           func(string, ...any)
 
@@ -96,11 +80,22 @@ type Options struct {
 	ExactSlots uint32
 }
 
+// volumeBarrierTimeout bounds one fsync/synchronize/unmount drain attempt:
+// past it the barrier FAILS (the tail stays durable in the local WAL) — it
+// never silently degrades to a local-only success. A var so failure-shape
+// tests compress it; production never changes it.
+var volumeBarrierTimeout = 60 * time.Second
+
 // PrefetchProgress is a snapshot of the asynchronous metadata prefetcher.
 type PrefetchProgress struct {
 	Entries int64
 	Done    bool
 	Err     string
+}
+
+type releasePin struct {
+	ino  uint64
+	path string
 }
 
 // Volume is the shared PortableFS client brain: protocol client, versioned metadata cache,
@@ -110,13 +105,22 @@ type Volume struct {
 	client *fsproto.Client
 	owner  string
 
+	// lifecycleMu is the frontend mutation gate. Every externally initiated
+	// filesystem mutation holds it for the whole operation; close takes it
+	// exclusively across the final drain, authority barrier, and optional
+	// frontend detach. That closes the gap where a mutation could otherwise
+	// fall through to the authority after write-back froze but before the
+	// final volume barrier. A failed close leaves closed=false and releases
+	// the gate so the still-mounted frontend can keep serving and retry.
+	lifecycleMu sync.RWMutex
+	closed      bool
+
 	AttrCache    *AttrCache
 	VersionCache *VersionCache
 	Metrics      *metrics.Registry
 	DiskCache    *DiskBlockCache
 
-	sessions    *session.Manager
-	fsyncPolicy FsyncPolicy
+	wb          *writeback.Engine
 	dirMu       sync.Mutex
 	dirCache    map[string]dirCacheEntry
 	recent      *recentWrites
@@ -131,9 +135,14 @@ type Volume struct {
 	openReg   *openRegistry
 
 	// lockReg tracks the live advisory-lock handles so a post-failover
-	// reclaim window can re-assert every held lock (see ReassertCoordination).
 	lockRegMu sync.Mutex
 	lockReg   map[*LockHandle]struct{}
+
+	// releasePins records the extra authority ref acquired when a delegated
+	// open handle becomes shared. Ownership is NodeState-stable so a rename
+	// cannot strand the pin under its old path.
+	releasePinMu sync.Mutex
+	releasePins  map[openOwner]releasePin
 
 	negativeCache bool
 	noReaddirPlus bool
@@ -158,6 +167,21 @@ type Volume struct {
 
 	prefetchMu sync.Mutex
 	prefetch   PrefetchProgress
+}
+
+var errVolumeClosed = errors.New("clientcore: volume is closed")
+
+func (v *Volume) beginMutation() bool {
+	v.lifecycleMu.RLock()
+	if v.closed {
+		v.lifecycleMu.RUnlock()
+		return false
+	}
+	return true
+}
+
+func (v *Volume) endMutation() {
+	v.lifecycleMu.RUnlock()
 }
 
 // markKernelFlushed reports whether gen is being kernel-flushed for the FIRST time, recording it so
@@ -221,7 +245,6 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		AttrCache:     NewAttrCache(),
 		VersionCache:  NewVersionCache(),
 		Metrics:       reg,
-		fsyncPolicy:   opts.FsyncPolicy,
 		dirCache:      map[string]dirCacheEntry{},
 		recent:        newRecentWrites(),
 		opens:         NewOpenTracker(),
@@ -229,6 +252,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		openFiles:     NewInodeSet(),
 		hardlinks:     newHardlinkAliases(),
 		lockReg:       map[*LockHandle]struct{}{},
+		releasePins:   map[openOwner]releasePin{},
 		noReaddirPlus: opts.NoReaddirPlus,
 		attrTTL:       opts.AttrTTL,
 		sessionTTL:    opts.SessionTTL,
@@ -255,87 +279,84 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		}
 		v.DiskCache = dc
 	}
-	if v.fsyncPolicy == "" {
-		v.fsyncPolicy = FsyncLocal
-	}
-	// Exact mount session: establish at mount when the authority offers it
-	// (negotiated; a legacy authority leaves the client on plain v1 behavior
-	// — the graceful downgrade). The reclaim hook re-asserts coordination
-	// state after a failover grants a reclaim window. A fenced identity at
-	// establish (ErrSessionFenced) is surfaced by the first mutation instead
-	// of failing the mount: reads are still valid.
+	// Exact mount session: establish at mount. The handshake requires the
+	// v5 protocol exactly — an older authority fails the mount with a clear
+	// version-mismatch error. A fenced identity at establish
+	// (ErrSessionFenced) is surfaced by the first mutation instead of
+	// failing the mount: reads are still valid.
 	if opts.ExactSlots != 0 {
 		cli.SetExactSlots(opts.ExactSlots)
 	}
-	cli.SetOnReclaim(v.ReassertCoordination)
 	if _, err := cli.EnsureExactSession(); err != nil && !errors.Is(err, fsproto.ErrSessionFenced) {
 		_ = cli.Close()
 		cancel()
 		return nil, err
 	}
-	// Capability-gated defaults, decided from the handshake the session
-	// establish just performed (or a one-shot probe when sessions are
-	// disabled). Never sniffed from response fields mid-flight.
-	v.negativeCache = opts.NegativeCache
-	if !v.negativeCache && !opts.NoNegativeCache {
-		v.negativeCache = cli.HasFeature(fsproto.FeatParentVersion)
-	}
+	// Version-gated negative caching is part of the v6 baseline (the
+	// authority stamps every lookup miss with the parent directory version);
+	// the explicit off switch remains as the only override.
+	v.negativeCache = !opts.NoNegativeCache
 	v.openReg = newOpenRegistry(cli, v.VersionCache.CurrentGen, v.openFiles,
-		cli.SupportsOpenRegistration(), opts.OpenRetentionEntries, opts.Debugf)
-	if opts.WriteBack {
-		walDir := opts.WALDir
-		if walDir == "" {
-			d, derr := os.MkdirTemp("", "portablefs-sess-")
-			if derr != nil {
-				_ = cli.Close()
-				cancel()
-				return nil, derr
-			}
-			walDir = d
-		} else if err := os.MkdirAll(walDir, 0o700); err != nil {
+		opts.OpenRetentionEntries, opts.Debugf)
+	// The write-back engine is part of every v5 mount: the authority decides
+	// adaptively per scope whether to delegate; there is no mount-level
+	// write mode. PORTABLEFS_DEBUG_WRITE_THROUGH=1 is the only override
+	// (debug: never delegate; the engine still recovers parked streams).
+	walDir := opts.WALDir
+	if walDir == "" {
+		d, derr := os.MkdirTemp("", "portablefs-wb-")
+		if derr != nil {
 			_ = cli.Close()
 			cancel()
-			return nil, err
+			return nil, derr
 		}
-		auth := selfInvalidatingAuthority{
-			Authority: wbAuthority{cli: cli},
-			onRecords: func(records []wal.Record) {
-				for _, r := range records {
-					v.noteSelfMutationRecord(r)
+		walDir = d
+	} else if err := os.MkdirAll(walDir, 0o700); err != nil {
+		_ = cli.Close()
+		cancel()
+		return nil, err
+	}
+	budget := opts.DiskCacheBytes / 2
+	wb, werr := writeback.Open(cctx, writeback.Config{
+		StateDir:          walDir,
+		VolumeID:          v.volumeID,
+		Branch:            opts.Branch,
+		Remote:            wbRemote{cli: cli},
+		BudgetBytes:       budget,
+		DisableDelegation: os.Getenv("PORTABLEFS_DEBUG_WRITE_THROUGH") == "1",
+		Busy:              v.opens.BusyUnder,
+		EnsureOpenPins:    v.ensureOpenPins,
+		Logf:              opts.Debugf,
+		Events: writeback.Events{
+			OnGrant: func(scope string) {
+				// Shared attr/negative/directory/kernel entries under the
+				// scope must not shadow the authoritative delegated view.
+				v.AttrCache.EvictPrefix(scope)
+				v.evictDirCachePrefix(scope)
+				if v.onFlushAll != nil {
+					go v.onFlushAll(scope)
 				}
 			},
-		}
-		v.sessions = session.NewManager(auth, opts.Owner, walDir, opts.IdleInterval)
-		v.sessions.AttachMetrics(reg)
-		v.sessions.SetBusyCheck(v.opens.BusyUnder)
-		v.sessions.SetFileGrainRootCheckouts(cli.ServerManaged())
-		if opts.OnWriteBackError != nil {
-			v.sessions.SetOnFlushHealth(opts.OnWriteBackError)
-		}
-		if opts.FlushMaxRecords > 0 || opts.FlushMaxBytes > 0 {
-			v.sessions.SetFlushLimits(session.FlushLimits{MaxRecords: opts.FlushMaxRecords, MaxBytes: opts.FlushMaxBytes})
-		}
-		v.sessions.SetOnRelease(func(rp string) {
-			v.AttrCache.EvictPrefix(rp)
-			v.evictDirCachePrefix(rp) // a listing cached while rp was held must not outlive the release
-			if v.onFlushAll != nil {
-				v.onFlushAll(rp)
-			}
-		})
-		v.sessions.SetOnAcquire(func(rp string) {
-			v.AttrCache.EvictPrefix(rp)
-			v.evictDirCachePrefix(rp)
-			if v.onFlushAll != nil {
-				go v.onFlushAll(rp)
-			}
-		})
-		v.sessions.RecoverAll()
-		flush := opts.FlushInterval
-		if flush <= 0 {
-			flush = 250 * time.Millisecond
-		}
-		v.sessions.Start(flush)
+			OnRelease: func(scope string) {
+				v.AttrCache.EvictPrefix(scope)
+				v.evictDirCachePrefix(scope)
+				if v.onFlushAll != nil {
+					v.onFlushAll(scope)
+				}
+			},
+			OnHealth: func(err error) {
+				if opts.OnWriteBackError != nil {
+					opts.OnWriteBackError("", err)
+				}
+			},
+		},
+	})
+	if werr != nil {
+		_ = cli.Close()
+		cancel()
+		return nil, werr
 	}
+	v.wb = wb
 	if opts.PrefetchTree {
 		maxEntries := opts.PrefetchMaxEntries
 		if maxEntries <= 0 {
@@ -354,63 +375,144 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	return v, nil
 }
 
-// wbAuthority adapts *fsproto.Client to session.Authority, routing checkout,
-// checkin, and flush through the managed journaled-coordination surface when
-// the authority negotiated it (ServerManaged), and through the legacy
-// envelope-less methods otherwise. This is the seam that lets write-back work
-// against a journal-native production authority (which rejects the legacy
-// coordination ops with EPERM — the "checkout: status 1" failure); a legacy
-// self-host authority keeps the exact prior behavior via the zero grant.
-type wbAuthority struct{ cli *fsproto.Client }
+// wbRemote adapts *fsproto.Client to writeback.Remote: delegation
+// acquisition, stream flushes, and recovery all ride the journaled
+// coordination surface under exact identities. ctxCall makes each method
+// context-aware: cancellation returns promptly to the engine while the
+// underlying exact machinery keeps resolving the identity (a canceled wait
+// is a lost reply, which the exact protocol already handles — it is never
+// reinterpreted as a definite outcome).
+type wbRemote struct{ cli *fsproto.Client }
 
-func (a wbAuthority) Checkout(path, owner string) (bool, string, session.CheckoutGrant, error) {
-	if a.cli.ServerManaged() {
-		granted, heldBy, epoch, err := a.cli.CheckoutManaged(path)
-		if err != nil || !granted {
-			return granted, heldBy, session.CheckoutGrant{}, err
+func ctxCall[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	type res struct {
+		v   T
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		v, err := fn()
+		ch <- res{v, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+func (r wbRemote) DelegationAcquire(ctx context.Context, scope, writebackID string) (writeback.AcquireReply, error) {
+	return ctxCall(ctx, func() (writeback.AcquireReply, error) {
+		g, err := r.cli.DelegationAcquire(scope, writebackID)
+		if err != nil {
+			return writeback.AcquireReply{}, err
 		}
-		return true, "", session.CheckoutGrant{Path: path, Epoch: epoch}, nil
-	}
-	granted, heldBy, err := a.cli.Checkout(path, owner)
-	return granted, heldBy, session.CheckoutGrant{}, err
-}
-
-func (a wbAuthority) Checkin(path, owner string, g session.CheckoutGrant) error {
-	if g.Epoch != "" {
-		return a.cli.CheckinManaged(g.Path, g.Epoch)
-	}
-	return a.cli.Checkin(path, owner)
-}
-
-func (a wbAuthority) FlushBatch(id string, epoch uint64, owner string, g session.CheckoutGrant, recs []wal.Record) (uint64, int32, error) {
-	return a.cli.FlushBatchWriteBack(id, epoch, owner, g.Path, g.Epoch, recs)
-}
-
-func (a wbAuthority) Read(p string, off, n int64) ([]byte, int32, error) {
-	return a.cli.Read(p, off, n)
-}
-func (a wbAuthority) Stat(p string) (string, uint32, int32, error) { return a.cli.Stat(p) }
-func (a wbAuthority) Readlink(p string) (string, int32, error)     { return a.cli.Readlink(p) }
-
-type selfInvalidatingAuthority struct {
-	session.Authority
-	onRecords func([]wal.Record)
-}
-
-func (a selfInvalidatingAuthority) FlushBatch(sessionID string, epoch uint64, owner string, grant session.CheckoutGrant, records []wal.Record) (uint64, int32, error) {
-	appliedThrough, status, err := a.Authority.FlushBatch(sessionID, epoch, owner, grant, records)
-	if err == nil && status == fsproto.OK && a.onRecords != nil {
-		applied := make([]wal.Record, 0, len(records))
-		for _, r := range records {
-			if r.Seq <= appliedThrough {
-				applied = append(applied, r)
+		reply := writeback.AcquireReply{Granted: g.Granted, Epoch: g.Epoch, Exists: g.Exists}
+		if g.Exists {
+			reply.Self = entryFromAttr("", g.Self)
+		}
+		if g.HasChildren {
+			reply.HasChildren = true
+			reply.Children = make([]writeback.Entry, 0, len(g.Children))
+			for _, d := range g.Children {
+				reply.Children = append(reply.Children, entryFromAttr(d.Name, d.Attr))
 			}
 		}
-		if len(applied) > 0 {
-			a.onRecords(applied)
+		return reply, nil
+	})
+}
+
+func (r wbRemote) ReleaseDelegation(ctx context.Context, scope, epoch string) error {
+	_, err := ctxCall(ctx, func() (struct{}, error) {
+		return struct{}{}, r.cli.CheckinManaged(scope, epoch)
+	})
+	return err
+}
+
+func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
+	return ctxCall(ctx, func() (writeback.FlushReply, error) {
+		through, status, err := r.cli.FlushWriteback(req.WritebackID, req.Scope, req.Epoch, req.PrevDigest, req.EndDigest, req.Records)
+		if err != nil {
+			return writeback.FlushReply{}, err
+		}
+		return writeback.FlushReply{Through: through, Status: status}, nil
+	})
+}
+
+func (r wbRemote) StreamState(ctx context.Context, writebackID string) (writeback.StreamState, error) {
+	return ctxCall(ctx, func() (writeback.StreamState, error) {
+		exists, through, digest, err := r.cli.WritebackState(writebackID)
+		if err != nil {
+			return writeback.StreamState{}, err
+		}
+		return writeback.StreamState{Exists: exists, Through: through, Digest: digest}, nil
+	})
+}
+
+func (r wbRemote) Rebind(ctx context.Context, writebackID string, scopes []writeback.RebindScope, through uint64, digest [32]byte) (writeback.RebindReply, error) {
+	return ctxCall(ctx, func() (writeback.RebindReply, error) {
+		wire := make([]fsproto.WBScope, 0, len(scopes))
+		for _, sc := range scopes {
+			wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
+		}
+		conflicts, err := r.cli.WritebackRebind(writebackID, wire, through, digest)
+		if err != nil {
+			return writeback.RebindReply{}, err
+		}
+		reply := writeback.RebindReply{}
+		for _, c := range conflicts {
+			reply.Conflicts = append(reply.Conflicts, writeback.ConflictDetail{Scope: c.Path, Epoch: c.Epoch, Kind: c.Kind})
+		}
+		return reply, nil
+	})
+}
+
+func (r wbRemote) Discard(ctx context.Context, writebackID string, scopes []writeback.RebindScope) error {
+	_, err := ctxCall(ctx, func() (struct{}, error) {
+		wire := make([]fsproto.WBScope, 0, len(scopes))
+		for _, sc := range scopes {
+			wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
+		}
+		return struct{}{}, r.cli.WritebackDiscard(writebackID, wire)
+	})
+	return err
+}
+
+// entryFromAttr converts a wire attr to the engine's entry shape.
+func entryFromAttr(name string, a fsproto.Attr) writeback.Entry {
+	return writeback.Entry{
+		Name: name, Kind: a.Kind, Mode: a.Mode, Size: a.Size,
+		MtimeMs: a.MtimeMs, CtimeMs: a.CtimeMs, AtimeMs: a.AtimeMs,
+		UID: a.Uid, GID: a.Gid, Ino: a.Ino, Nlink: a.Nlink,
+	}
+}
+
+// attrFromEntry converts an engine entry to wire attrs. Locally-born entries
+// carry no authority ino; the caller substitutes a path-derived fallback.
+func attrFromEntry(e writeback.Entry) fsproto.Attr {
+	a := fsproto.Attr{
+		Kind: e.Kind, Mode: e.Mode, Size: e.Size,
+		MtimeMs: e.MtimeMs, CtimeMs: e.CtimeMs, AtimeMs: e.AtimeMs,
+		Uid: e.UID, Gid: e.GID, Ino: e.Ino, Nlink: e.Nlink,
+	}
+	if a.MtimeMs == 0 {
+		a.MtimeMs = time.Now().UnixMilli()
+	}
+	if a.CtimeMs == 0 {
+		a.CtimeMs = a.MtimeMs
+	}
+	if a.AtimeMs == 0 {
+		a.AtimeMs = a.MtimeMs
+	}
+	if a.Nlink == 0 {
+		a.Nlink = 1
+		if a.Kind == "directory" {
+			a.Nlink = 2
 		}
 	}
-	return appliedThrough, status, err
+	return a
 }
 
 func (v *Volume) noteSelfMutation(p string, gen, version uint64, inPlace bool) {
@@ -435,20 +537,6 @@ func (v *Volume) noteSelfMutation(p string, gen, version uint64, inPlace bool) {
 	v.evictDirCache(dir)
 }
 
-func (v *Volume) noteSelfMutationRecord(r wal.Record) {
-	switch r.Op {
-	case wal.OpCreate, wal.OpMkdir, wal.OpRemove, wal.OpSymlink, wal.OpOrphan:
-		v.noteSelfMutation(r.Path, 0, 0, false)
-	case wal.OpRename:
-		v.noteSelfMutation(r.Path, 0, 0, false)
-		v.noteSelfMutation(r.NewPath, 0, 0, false)
-	case wal.OpWrite, wal.OpTruncate, wal.OpChmod, wal.OpChtimes, wal.OpChown:
-		if r.Path != "" {
-			v.noteSelfMutation(r.Path, 0, 0, true)
-		}
-	}
-}
-
 func cleanVolumePath(p string) string {
 	p = strings.Trim(p, "/")
 	if p == "." {
@@ -461,8 +549,8 @@ func cleanVolumePath(p string) string {
 // helpers during the extraction.
 func (v *Volume) Client() *fsproto.Client { return v.client }
 
-// Sessions exposes the write-back manager while cmd/mount is still being collapsed into the core.
-func (v *Volume) Sessions() *session.Manager { return v.sessions }
+// Writeback exposes the mount engine's status surface.
+func (v *Volume) Writeback() *writeback.Engine { return v.wb }
 
 // LockAuth returns the advisory-lock surface bound to this volume's authority
 // generation. Every lock acquire, release, and getlk must route through it —
@@ -493,44 +581,6 @@ func (v *Volume) lockHandles() []*LockHandle {
 		out = append(out, h)
 	}
 	return out
-}
-
-// ReassertCoordination is the post-failover reclaim hook: within the granted
-// window it re-asserts every piece of volatile coordination state this mount
-// owns — advisory locks, open-inode pins, orphan leases, and write-back
-// checkouts — then reports ReclaimDone so the authority can lift the grace
-// early. Individual re-assert failures are logged, not fatal: state that
-// cannot be re-asserted is simply lost to the normal conflict rules.
-func (v *Volume) ReassertCoordination(window time.Duration) {
-	deadline := time.Now().Add(window)
-	for _, h := range v.lockHandles() {
-		for _, l := range h.Snapshot() {
-			if !time.Now().Before(deadline) {
-				return // window elapsed: do not signal done; grace timeout owns it
-			}
-			if _, err := v.LockAuth().Lock(l.Path, fsproto.LkSetlk, l.Owner, l.Start, l.End, l.Write, false); err != nil {
-				v.debug("reclaim lock %q [%d,%d]: %v", l.Path, l.Start, l.End, err)
-			}
-		}
-	}
-	for _, ino := range v.openFiles.Snapshot() {
-		if _, err := v.client.MarkOpen(ino); err != nil {
-			v.debug("reclaim open pin ino=%d: %v", ino, err)
-		}
-	}
-	if inos := v.openOrphans.Snapshot(); len(inos) > 0 {
-		if _, err := v.client.RenewOrphanLeases(inos); err != nil {
-			v.debug("reclaim orphan leases: %v", err)
-		}
-	}
-	if v.sessions != nil {
-		for _, root := range v.sessions.Roots() {
-			if granted, heldBy, err := v.client.Checkout(root, v.owner); err != nil || !granted {
-				v.debug("reclaim checkout %q: granted=%v heldBy=%q err=%v", root, granted, heldBy, err)
-			}
-		}
-	}
-	v.client.ReclaimDone()
 }
 
 func (v *Volume) OpenTracker() *OpenTracker { return v.opens }
@@ -593,7 +643,7 @@ func (v *Volume) AttrValidFor(path string) time.Duration {
 	if v.recent.mine(path) {
 		return 0
 	}
-	if v.sessions != nil && v.sessions.For(path) != nil {
+	if v.wb != nil && v.wb.Covers(path) {
 		return v.sessionTTL
 	}
 	return 0
@@ -625,6 +675,10 @@ type volumeInvalidationHandler struct {
 
 func (h volumeInvalidationHandler) FlushAll() {
 	h.v.clearDirCache()
+	// The engine's held views survive a wholesale flush: the delegation is
+	// exclusive (peers recall before touching the scope, and the authority
+	// never force-transfers), so its completeness proof does not depend on
+	// the invalidation stream. Only shared-path caches reset.
 	// Invalidations may have been missed wholesale (resubscribe / overflow /
 	// generation change): retained open registrations whose names may have
 	// silently changed are given up — worth at most one re-mark each.
@@ -639,7 +693,8 @@ func (h volumeInvalidationHandler) InvalidatePath(path string, inPlace bool) {
 		dir, _ := splitPath(path)
 		h.v.evictDirCache(dir)
 		// A peer changed this name's binding; a retained registration under
-		// it has no trustworthy reuse value anymore.
+		// it has no trustworthy reuse value anymore. (A held engine view
+		// needs nothing: peers cannot mutate under an exclusive delegation.)
 		h.v.openReg.DropPath(path)
 	}
 	if h.v.onInvalidate != nil {
@@ -676,8 +731,16 @@ func (h volumeInvalidationHandler) MarkOrphan(path string, ino uint64) {
 }
 
 func (h volumeInvalidationHandler) ReleaseSubtree(path string) {
-	if h.v.sessions != nil {
-		h.v.sessions.ReleaseSubtree(path)
+	if h.v.wb == nil {
+		return
+	}
+	// The authority recalled the scope for a peer: drain and release. The
+	// peer's gated operation waits on the durable release, so a failure here
+	// only extends its bounded wait (and the recall re-arrives).
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := h.v.wb.Recall(ctx, path); err != nil {
+		h.v.debug("recall %q: %v", path, err)
 	}
 }
 
@@ -691,191 +754,238 @@ func (v *Volume) SetAuthToken(tok string) { v.client.SetAuthToken(tok) }
 // source-configured volume to a stale static token.
 func (v *Volume) RenewCredential(tok string) { v.SetAuthToken(tok) }
 
-// FlushToAuthority waits until every active write-back session has flushed to the authority.
+// ensureOpenPins establishes an authority-durable open pin for every open
+// handle under scope, called by the engine AFTER the drain and BEFORE the
+// durable delegation release: once the scope leaves delegated mode, a peer
+// unlink must PARK any inode this mount still holds open (open-after-unlink),
+// never destroy it. Locally-born files gained their authority identity when
+// the drain applied their creates; the pin rides the standard registration
+// machinery (retained hold, renewal, name-change release), so the orphan
+// redirect and reap flows stay exactly the shared-mode ones.
+func (v *Volume) ensureOpenPins(ctx context.Context, scope string) error {
+	return v.opens.ForEachUnder(scope, func(owner openOwner, path string, node *NodeState) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if node != nil && node.Orphan() != 0 {
+			return nil // no longer a named handle in the delegated namespace
+		}
+		a, _, _, _, st, err := v.client.GetattrV(path)
+		if err != nil {
+			return fmt.Errorf("clientcore: open pin for %q: %w", path, err)
+		}
+		if st != fsproto.OK {
+			return fmt.Errorf("clientcore: open pin for %q: getattr status %d", path, st)
+		}
+		if a.Ino == 0 {
+			return fmt.Errorf("clientcore: open pin for %q: authority returned inode 0", path)
+		}
+		if st := v.openReg.Open(path, a.Ino); st != fsproto.OK {
+			return fmt.Errorf("clientcore: open pin for %q inode %d: mark-open status %d", path, a.Ino, st)
+		}
+		if !node.recordAuthorityIno(a.Ino) {
+			// Return the ref acquired above before failing the release. A
+			// changed inode means the open handle's binding cannot be proven;
+			// releasing the delegation would make orphan routing ambiguous.
+			v.openReg.Close(path, a.Ino, false)
+			return fmt.Errorf("clientcore: open pin for %q changed authority inode to %d", path, a.Ino)
+		}
+
+		// The open HANDLE owns this refcount: the last close of the path
+		// returns it (CloseHandle), so a peer unlink in between parks the
+		// inode (the pin holds it against the reap sweep) and the live
+		// handle redirects through the orphan protocol — exactly the
+		// shared-mode open-after-unlink flow.
+		v.releasePinMu.Lock()
+		pin, dup := v.releasePins[owner]
+		if dup {
+			if pin.ino == a.Ino {
+				pin.path = path
+				v.releasePins[owner] = pin
+			}
+			// Already pinned by an earlier release cycle: return the extra ref.
+			v.releasePinMu.Unlock()
+			v.openReg.Close(path, a.Ino, false)
+			if pin.ino != a.Ino {
+				return fmt.Errorf("clientcore: open pin for %q changed inode from %d to %d", path, pin.ino, a.Ino)
+			}
+			return nil
+		}
+		v.releasePins[owner] = releasePin{ino: a.Ino, path: path}
+		v.releasePinMu.Unlock()
+		return nil
+	})
+}
+
+// FlushToAuthority waits until the engine's acknowledged stream tail has
+// flushed to the authority.
 func (v *Volume) FlushToAuthority(ctx context.Context) error {
-	if v.sessions == nil {
+	if !v.beginMutation() {
+		return errVolumeClosed
+	}
+	defer v.endMutation()
+	return v.flushToAuthority(ctx)
+}
+
+func (v *Volume) flushToAuthority(ctx context.Context) error {
+	if v.wb == nil {
 		return nil
 	}
+	return v.wb.DrainAll(ctx)
+}
+
+// Fsync is the per-file authority-durability and subscriber-visibility
+// barrier. It
+// returns success only when (1) every acknowledged mutation up to the
+// barrier is committed and applied at the authority (flush commits are
+// durable-before-reply; the mount stream is globally dense, so the drain
+// intentionally overflushes earlier unrelated mutations), and (2) every
+// live protocol subscriber has acknowledged the covering invalidations at
+// the frontend boundary it supports. Linux FUSE includes its kernel
+// invalidation hook; macOS 26 FSKit cannot because its SDK exposes no such
+// hook.
+// If the authority is unreachable, slow past the deadline, or fenced, fsync
+// returns the ERROR: there is no local-only fsync outcome, ever.
+func (v *Volume) Fsync(path string) error {
+	if !v.beginMutation() {
+		return errVolumeClosed
+	}
+	defer v.endMutation()
+	return v.fsync(path)
+}
+
+func (v *Volume) fsync(path string) error {
+	if v.wb != nil {
+		ctx, cancel := context.WithTimeout(v.ctx, volumeBarrierTimeout)
+		defer cancel()
+		if err := v.wb.Fsync(ctx, path); err != nil {
+			return err
+		}
+	}
+	// The authority barrier: earlier journal rows durable + applied +
+	// published, and every live subscriber acked the covering invalidation
+	// position at its supported frontend boundary.
+	return v.boundedBarrier(v.client.Sync)
+}
+
+// boundedBarrier runs one authority-barrier RPC under volumeBarrierTimeout:
+// past the bound the barrier FAILS typed (never a local-only success). An
+// abandoned attempt resolves on its own transport budget without claiming
+// anything.
+func (v *Volume) boundedBarrier(fn func() error) error {
 	done := make(chan error, 1)
-	go func() { done <- v.sessions.FlushAll() }()
+	go func() { done <- fn() }()
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
 	case err := <-done:
 		return err
+	case <-time.After(volumeBarrierTimeout):
+		return fmt.Errorf("clientcore: volume barrier timed out after %v (authority unreachable or slow; acknowledged data stays durable in the local WAL and flushes when the authority answers)", volumeBarrierTimeout)
 	}
 }
 
-// Fsync applies the configured write-back fsync policy for path.
-func (v *Volume) Fsync(path string) error {
-	if v.sessions == nil {
-		return nil
+// WriteBackPending reports the unshipped acknowledged backlog — the bytes a
+// degraded drain verdict parks locally.
+func (v *Volume) WriteBackPending() (records int, bytes int64) {
+	if v.wb == nil {
+		return 0, 0
 	}
-	s := v.sessions.For(path)
-	if s == nil {
-		return nil
-	}
-	if err := s.Fsync(); err != nil && !errors.Is(err, session.ErrReleased) {
-		return err
-	}
-	if v.fsyncPolicy == FsyncAuthority {
-		if err := s.Flush(); err != nil {
-			return err
-		}
-		// m1: a superseded/fenced session's Flush short-circuits to a no-op and returns nil, so its
-		// records never reached the authority. fsync=authority must NOT report that as durable — surface
-		// EIO. This is the documented force-revoke residual: a fenced holder's writes are rejected by the
-		// generation/fencing token, so claiming authority durability here would be a false guarantee.
-		if s.IsSuperseded() {
-			return fmt.Errorf("clientcore: fsync=authority on superseded session: writes not durable at authority")
-		}
-		return nil
-	}
-	return nil
+	return v.wb.Pending()
 }
 
-// SyncVolume drains this volume's outstanding write-back state (every live
-// session flushes, closed files included — the session WALs cover them), then
-// submits the authority volume barrier: the client gates new local mutations,
-// waits for every earlier and parked exact identity, appends one journaled
+// RecoveryJobs reports parked write-back streams awaiting recovery (pending
+// records from prior instances of this mount identity).
+func (v *Volume) RecoveryJobs() []writeback.RecoveryJob {
+	if v.wb == nil {
+		return nil
+	}
+	return v.wb.Status().Jobs
+}
+
+// WritebackStatus reports the engine's full health snapshot.
+func (v *Volume) WritebackStatus() writeback.Status {
+	if v.wb == nil {
+		return writeback.Status{}
+	}
+	return v.wb.Status()
+}
+
+// SyncVolume drains this volume's outstanding write-back state, then submits
+// the authority volume barrier: the client gates new local mutations, waits
+// for every earlier and parked exact identity, appends one journaled
 // control-only barrier row, and returns only when that row — and therefore
-// every row admitted before it — is durable, applied, and its invalidations
-// are published. This is the FSKit synchronize contract; fsyncing a snapshot
-// of currently open handles alone is NOT a sufficient volume barrier. No
-// HistoryCut, checkpoint, snapshot, publish, or global drain is involved.
+// every row admitted before it — is durable, applied, its invalidations are
+// published, AND every live subscriber has acknowledged them at its
+// supported frontend boundary. This is the FSKit synchronize contract; fsyncing a snapshot
+// of currently open handles alone is NOT a sufficient volume barrier. There
+// is NO degraded local-only outcome: an unreachable, slow, or fenced
+// authority fails the barrier with an error. The un-flushed tail stays
+// durable in the local WAL either way and replays on the next attach.
 func (v *Volume) SyncVolume() error {
-	if v.sessions != nil {
-		if err := v.sessions.FlushAll(); err != nil {
+	if !v.beginMutation() {
+		return errVolumeClosed
+	}
+	defer v.endMutation()
+	return v.syncVolume()
+}
+
+func (v *Volume) syncVolume() error {
+	if v.wb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), volumeBarrierTimeout)
+		defer cancel()
+		if err := v.wb.DrainAll(ctx); err != nil {
+			// The tail could not reach the authority: make it locally
+			// durable (crash-safe; replays on the next attach) and surface
+			// the barrier failure.
+			if serr := v.wb.SyncLocal(); serr != nil {
+				return fmt.Errorf("clientcore: volume barrier: drain failed (%v) and local WAL fsync failed: %w", err, serr)
+			}
 			return err
 		}
 	}
-	return v.client.SyncVolume()
+	return v.boundedBarrier(v.client.SyncVolume)
 }
 
 // AuthorityUnreachable reports confirmed transport unreachability (fail-fast
 // engaged past the grace window): a network flush is futile until the prober
-// re-proves the peer. Unmount-class paths consult it to choose the
-// journal-first barrier instead of a doomed network flush, and
-// SyncVolumeBounded uses it to skip straight to journal-first — pre-deadline —
-// on a black-holed authority.
+// re-proves the peer. Status surfaces consult it; barriers do NOT — they
+// simply fail when the authority cannot answer.
 func (v *Volume) AuthorityUnreachable() bool {
 	return v.client.FailFast()
 }
 
 // SessionFenced reports whether the mount session was fenced (stale
-// generation / lease lost). Deliberately NOT folded into AuthorityUnreachable:
-// a fence is a definite verdict from a (possibly perfectly reachable)
-// authority, so paths that would claim durability must surface it as an error
-// (m1), while unreachability merely means there is no truth to be had.
+// generation / lease lost). A fence is a definite verdict from a (possibly
+// perfectly reachable) authority: barrier paths surface it as an error.
 func (v *Volume) SessionFenced() bool {
 	return v.client.SessionFenced()
 }
 
-// SyncLocalDurable is the JOURNAL-FIRST volume barrier: it makes everything
-// this volume ever acknowledged durable WITHOUT any authority round-trip.
-//
-//   - Write-back: every pending session mutation is fsynced into its local
-//     session WAL. The WAL replays on the next clean start (the designed
-//     crash-recovery path), so nothing acknowledged can be lost.
-//   - Write-through (no session manager): nothing CAN be pending locally by
-//     construction — every acknowledged mutation was a synchronous,
-//     durable-before-reply authority round-trip. There is deliberately no
-//     network fallback here.
-//
-// What it does NOT provide: the cross-writer ordering of the full authority
-// barrier. That ordering is unobtainable from an unreachable authority by
-// definition and is the documented trade of the journal-first unmount.
-func (v *Volume) SyncLocalDurable() error {
-	if v.sessions == nil {
-		return nil
+// CloseJournalDurable closes the volume for an EXPLICITLY FORCED unmount,
+// with no authority round-trip anywhere on the path: the mount stream WAL
+// and its recovery job are made durable OUTSIDE the attach lifetime and the
+// engine closes WITHOUT releasing its delegations; the mount session lease
+// is deliberately NOT expired — like after a crash, the delegations flip to
+// recovery-required when it lapses, protecting the unshipped state until the
+// next attach rebinds and drains the stream. The returned job ID is the
+// user-visible recovery handle ("" when nothing was parked). Never called on
+// a normal unmount: a normal unmount that cannot drain FAILS.
+func (v *Volume) CloseJournalDurable() (string, error) {
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
+	if v.closed {
+		return "", nil
 	}
-	return v.sessions.FsyncAll()
-}
 
-// SyncVolumeBounded is the unmount-class volume barrier: the FULL SyncVolume
-// network barrier when the authority is reachable, bounded by deadline, with
-// the journal-first local-WAL barrier as the fallback — so the reply NEVER
-// depends on a live authority connection and the caller (ultimately the
-// kernel's dounmount) always gets an answer.
-//
-// Decision order:
-//  1. Session FENCED: the authority has definitively rejected this
-//     generation. m1: claiming durability here would be a false guarantee, so
-//     after best-effort local WAL durability the barrier surfaces an ERROR.
-//     Immediate — no network wait, never a hang.
-//  2. Authority confirmed UNREACHABLE (fail-fast): skip the network entirely;
-//     local WAL durability is success (the honest answer when there is no
-//     truth to be had). Inert in stage 1 (AuthorityUnreachable == false).
-//  3. Otherwise run today's SyncVolume within the deadline — the normal-path
-//     contract exactly as before (full flush to authority before success).
-//  4. Deadline breach: journal-first fallback — WAL durable means success,
-//     WAL fsync failure means EIO. Never hang.
-//
-// degraded reports that the journal-first fallback answered instead of the
-// full authority barrier: the data is machine-crash safe (WAL + replay on the
-// next clean start) but NOT yet visible to other machines. Operator-facing
-// callers must log it (m2 — a degraded barrier is never silent).
-func (v *Volume) SyncVolumeBounded(deadline time.Duration) (degraded bool, err error) {
-	if v.SessionFenced() {
-		return false, v.fencedBarrierError()
-	}
-	if v.AuthorityUnreachable() {
-		return true, v.SyncLocalDurable()
-	}
-	done := make(chan error, 1)
-	go func() { done <- v.SyncVolume() }()
-	timer := time.NewTimer(deadline)
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		if err == nil {
-			return false, nil
-		}
-		if v.SessionFenced() {
-			return false, v.fencedBarrierError()
-		}
-		if v.AuthorityUnreachable() {
-			return true, v.SyncLocalDurable()
-		}
-		return false, err
-	case <-timer.C:
-		// Deadline breach with the authority reachable and un-fenced: the flush
-		// is healthy but SLOW (a large write burst on a slow uplink). The
-		// journal-first fallback claims LOCAL WAL durability plus
-		// replay-on-next-clean-start, not authority durability; the degraded
-		// flag makes the claim auditable, and the abandoned SyncVolume goroutine
-		// resolves on its own bounded opTimeout budget while CloseLocalDurable
-		// serializes with its in-flight flush (session.flushMu) so a late
-		// CompactThrough can never race the log close into a double-apply.
-		return true, v.SyncLocalDurable()
-	}
-}
-
-// fencedBarrierError makes the un-flushed tail locally durable (best effort —
-// the WAL keeps protecting it across a machine crash and replays on the next
-// clean start) and returns the m1-consistent verdict: a fenced generation's
-// records are rejected by the authority, so the volume barrier must never
-// claim durability for them.
-func (v *Volume) fencedBarrierError() error {
-	if serr := v.SyncLocalDurable(); serr != nil {
-		return fmt.Errorf("clientcore: volume barrier on fenced session: local WAL fsync also failed: %w", serr)
-	}
-	return fmt.Errorf("clientcore: volume barrier: %w (writes of this generation are not durable at the authority)", fsproto.ErrSessionFenced)
-}
-
-// CloseJournalDurable closes the volume for a JOURNAL-FIRST unmount, with no
-// authority round-trip anywhere on the path: pending write-back mutations are
-// made durable in the local session WALs and the logs close WITHOUT the final
-// drain or checkin (StopLocalDurable); the mount session lease is deliberately
-// NOT expired — like after a crash, its grace protects the un-flushed state
-// until the next clean start replays the WALs and the authority's liveness
-// machinery reclaims the coordination state.
-func (v *Volume) CloseJournalDurable() error {
 	v.cancel()
 	v.wg.Wait()
+	jobID := ""
 	var first error
-	if v.sessions != nil {
-		first = v.sessions.StopLocalDurable()
+	if v.wb != nil {
+		id, err := v.wb.ForceClose("forced unmount")
+		if err != nil {
+			first = err
+		}
+		jobID = id
 	}
 	// Deliberately NO openReg.Shutdown here: journal-first means no authority
 	// round-trips anywhere on the path; open registrations are reclaimed by the
@@ -883,25 +993,57 @@ func (v *Volume) CloseJournalDurable() error {
 	if err := v.client.Close(); first == nil {
 		first = err
 	}
-	return first
+	v.closed = true
+	return jobID, first
 }
 
-// Close cancels background work, flushes/checks in write-back sessions, and closes the protocol
-// connections. A clean Close is an authority-durable detach when write-back is enabled.
+// Close drains + releases the write-back engine, then cancels background work
+// and closes the protocol connections. A failed drain leaves the Volume
+// fully alive and retryable; only CloseJournalDurable is allowed to park a
+// recovery job and tear down without authority success.
 func (v *Volume) Close() error {
+	return v.CloseWithFinalizer(nil)
+}
+
+// CloseWithFinalizer performs the normal close while keeping filesystem
+// mutations gated through finalize. A kernel frontend passes its detach
+// operation here: if either the authority barrier or detach fails, write-back
+// thaws, the Volume remains live, and the mutation gate reopens. Once
+// finalize succeeds the frontend is gone before protocol resources close.
+func (v *Volume) CloseWithFinalizer(finalize func() error) error {
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
+	if v.closed {
+		return nil
+	}
+
+	barrierAndFinalize := func() error {
+		if err := v.boundedBarrier(v.client.SyncVolume); err != nil {
+			return err
+		}
+		if finalize != nil {
+			return finalize()
+		}
+		return nil
+	}
+	if v.wb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), volumeBarrierTimeout)
+		err := v.wb.CloseWithBarrier(ctx, barrierAndFinalize)
+		cancel()
+		if err != nil {
+			return err
+		}
+	} else if err := barrierAndFinalize(); err != nil {
+		return err
+	}
 	v.cancel()
 	v.wg.Wait()
-	var first error
-	if v.sessions != nil {
-		first = v.sessions.Stop()
-	}
 	// Release retained open registrations (bounded, best-effort): a clean
 	// detach should not leave holds for the authority's lease sweeper.
 	v.openReg.Shutdown(2 * time.Second)
-	if err := v.client.Close(); first == nil {
-		first = err
-	}
-	return first
+	err := v.client.Close()
+	v.closed = true
+	return err
 }
 
 func (v *Volume) setPrefetchProgress(p PrefetchProgress) {

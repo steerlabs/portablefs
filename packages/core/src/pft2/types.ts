@@ -969,3 +969,23 @@ export function validatePft2Node(node: Pft2Node): void {
     }
   }
 }
+
+/** Persists one encoded metadata node (reference computed by the writer). */
+export interface Pft2NodeSink {
+  putNode(ref: Pft2Ref, encoded: Uint8Array): void;
+}
+
+/** Persists one packed immutable data object. */
+export interface Pft2PackSink {
+  putPack(ref: Pft2Ref, data: Uint8Array): void;
+}
+
+/** True when every byte is zero (the cell is canonically a hole). */
+export function isZeroCell(cell: Uint8Array): boolean {
+  for (const byte of cell) {
+    if (byte !== 0) {
+      return false;
+    }
+  }
+  return true;
+}

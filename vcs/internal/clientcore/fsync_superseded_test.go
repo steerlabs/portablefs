@@ -5,59 +5,63 @@ import (
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
-// TestFsyncAuthorityErrorsOnSupersededSession pins m1: with fsync=authority, a fsync on a
-// superseded/fenced session must return an error (EIO to the frontend), never success. A superseded
-// session's Flush short-circuits to a no-op returning nil, so its records never reached the authority;
-// reporting durable success would be a false guarantee (the force-revoke residual).
-func TestFsyncAuthorityErrorsOnSupersededSession(t *testing.T) {
+// TestFsyncErrorsOnFencedSession pins m1: fsync with acknowledged-but-
+// unshippable state on a fenced mount session must return an error (EIO to
+// the frontend), never success. A fenced generation's records never reach
+// the authority; fsync always means authority-durable, so reporting success
+// would be a false guarantee. The stream parks durably and recovers on the
+// next attach instead.
+func TestFsyncErrorsOnFencedSession(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 	v := dialCore(t, addr, Options{
-		Owner:       "M",
-		WriteBack:   true,
-		WALDir:      t.TempDir(),
-		FsyncPolicy: FsyncAuthority,
+		Owner:  "M",
+		WALDir: t.TempDir(),
 	})
 
-	a, st := v.Create(ctx, "f", 0o644)
+	// A subtree path so the engine delegates and acknowledges locally (a
+	// top-level file runs write-through and would just ESTALE immediately).
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir d: %d", st)
+	}
+	a, st := v.Create(ctx, "d/f", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("create: %d", st)
 	}
 	n := NewNodeState(a.Ino, a.Ino != 0)
-	if _, st := v.Write(ctx, "f", n, 0, []byte("FIRST")); st != fsproto.OK {
+	// Hold the file open so the engine's idle-release never hands the "d"
+	// delegation back before the fence (a real fsync fires on an open fd).
+	if st := v.RegisterOpened("d/f", n); st != fsproto.OK {
+		t.Fatalf("open: %d", st)
+	}
+	if _, st := v.Write(ctx, "d/f", n, 0, []byte("FIRST")); st != fsproto.OK {
 		t.Fatalf("write: %d", st)
 	}
-	if err := v.FlushToAuthority(ctx); err != nil { // establish the watermark at this session's epoch
+	if err := v.FlushToAuthority(ctx); err != nil { // establish the stream watermark
 		t.Fatalf("initial flush: %v", err)
 	}
 
-	sess := v.Sessions().For("f")
-	if sess == nil {
-		t.Fatal("no session covers f")
-	}
-	// A newer generation of the SAME SessionID bumps the authority watermark to a far-higher epoch,
-	// so this session's next flush is rejected (ESTALE) and the session marks itself superseded.
-	if _, bst, err := v.Client().FlushBatch(sess.ID(), 1<<62, "M", []wal.Record{
-		{Seq: 0, Op: wal.OpCreate, Path: "g", Mode: 0o644},
-	}); err != nil || bst != fsproto.OK {
-		t.Fatalf("watermark bump: st=%d err=%v", bst, err)
-	}
+	// The mount session is fenced (as a supersession/lease loss would):
+	// every later flush is rejected ESTALE and the stream parks terminally.
+	v.Client().ExpireSession()
 
-	// Write more, then drive the transition: this flush is rejected and sets superseded=true.
-	if _, st := v.Write(ctx, "f", n, 5, []byte("MORE")); st != fsproto.OK {
+	// The engine still holds the delegation, so this write is acknowledged
+	// locally — it can never ship under the fenced generation.
+	if _, st := v.Write(ctx, "d/f", n, 5, []byte("MORE")); st != fsproto.OK {
 		t.Fatalf("second write: %d", st)
 	}
-	_ = v.FsyncPath("f") // transition flush (rejected); may already report EIO
-	if !sess.IsSuperseded() {
-		t.Fatal("session should be superseded after a stale flush")
-	}
 
-	// The KEY assertion: a fsync on the now-superseded session (whose Flush is a silent no-op) must
-	// still return EIO, not success.
-	if st := v.FsyncPath("f"); st != fsproto.EIO {
-		t.Fatalf("fsync=authority on a superseded session must EIO, got %d", st)
+	// The KEY assertion: fsync must surface the failure (sticky), never a
+	// false durability claim.
+	if st := v.FsyncPath("d/f"); st != fsproto.EIO {
+		t.Fatalf("fsync on a fenced session must EIO, got %d", st)
+	}
+	if st := v.FsyncPath("d/f"); st != fsproto.EIO {
+		t.Fatalf("fsync must stay EIO while the tail is parked, got %d", st)
+	}
+	if recs, _ := v.WriteBackPending(); recs == 0 {
+		t.Fatal("the unshippable tail must remain visible as pending write-back debt")
 	}
 }

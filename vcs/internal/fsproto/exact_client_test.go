@@ -17,7 +17,6 @@ import (
 
 	"github.com/go-git/go-billy/v5/memfs"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
@@ -69,14 +68,7 @@ func awaitQuiesce(t *testing.T, s *Server) {
 // serveExact starts an exact-session authority and returns its harness.
 func serveExact(t *testing.T) *exactHarness {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +76,7 @@ func serveExact(t *testing.T) *exactHarness {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := &exactHarness{fs: fs, addr: ln.Addr().String()}
-	h.srv = NewServer(fs, fs, delegation.New())
+	h.srv = NewServer(fs, fs)
 	h.srv.SetDropReply(func(req *Request, resp *Response) bool {
 		if fn := h.drop.Load(); fn != nil {
 			return (*fn)(req, resp)
@@ -126,48 +118,28 @@ func TestClientEstablishesExactSessionOnFirstMutation(t *testing.T) {
 	}
 }
 
-func TestClientDowngradesAgainstLegacyAuthority(t *testing.T) {
+// TestClientRefusesSessionlessAuthorityMutations: a reads-only server (no
+// session store) answers the v6 probe but refuses session opens; the client
+// surfaces that as a mutation error instead of downgrading to any legacy
+// write path. Reads still flow.
+func TestClientRefusesSessionlessAuthorityMutations(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = NewServer(memfs.New(), nil, nil).Serve(ctx, ln) }()
+	go func() { _ = NewServer(memfs.New(), nil).Serve(ctx, ln) }()
 	cli := dialExact(t, ln.Addr().String(), "M1")
 
-	// Graceful downgrade: against an authority without exact sessions the
-	// client keeps plain v1 mutation behavior (this repository's
-	// compatibility contract), and never establishes a session.
-	if _, st, err := cli.Create("f", 0o644); err != nil || st != OK {
-		t.Fatalf("create against legacy authority: st=%d err=%v, want plain v1 success", st, err)
+	if _, st, err := cli.Create("f", 0o644); err == nil && st == OK {
+		t.Fatal("create against a sessionless authority must not succeed")
 	}
 	if cli.ExactSessionActive() {
-		t.Fatal("no session may exist against a legacy authority")
+		t.Fatal("no session may exist against a sessionless authority")
 	}
-	if !cli.serverIsLegacy() {
-		t.Fatal("client must remember the authority is legacy (sticky downgrade)")
-	}
-	if _, st, err := cli.Getattr("f"); err != nil || st != OK {
-		t.Fatalf("read against legacy authority: st=%d err=%v", st, err)
-	}
-}
-
-func TestClientDisableEnvVarForcesDowngrade(t *testing.T) {
-	t.Setenv("VCS_CLIENT_DISABLE_EXACT_SESSIONS", "1")
-	h := serveExact(t)
-	cli := dialExact(t, h.addr, "M1")
-
-	// The authority OFFERS sessions, but the escape hatch keeps the client on
-	// plain v1 behavior: mutations succeed with no session.
-	if _, st, err := cli.Create("f", 0o644); err != nil || st != OK {
-		t.Fatalf("create with sessions disabled: st=%d err=%v", st, err)
-	}
-	if cli.ExactSessionActive() {
-		t.Fatal("VCS_CLIENT_DISABLE_EXACT_SESSIONS=1 must prevent session establishment")
-	}
-	if live, err := cli.EnsureExactSession(); live || err != nil {
-		t.Fatalf("EnsureExactSession with sessions disabled: live=%v err=%v, want false/nil", live, err)
+	if _, st, err := cli.Getattr("nope"); err != nil || st != ENOENT {
+		t.Fatalf("read against sessionless authority: st=%d err=%v, want ENOENT", st, err)
 	}
 }
 
@@ -288,8 +260,8 @@ func TestClientFencedSessionNeverMintsFreshGeneration(t *testing.T) {
 		t.Fatalf("authority session = %+v, want the SAME generation, expired", info)
 	}
 	// And a fenced mount cannot flush old dirty write-back bytes either.
-	batch := []wal.Record{{Seq: 0, Op: wal.OpCreate, Path: "wb-file", Mode: 0o644}}
-	if _, st, err := cli.FlushBatch("wb", 1, "M1", batch); err != nil || st != ESTALE {
+	batch := []wal.Record{{Seq: 1, Op: wal.OpCreate, Path: "wb-file", Mode: 0o644}}
+	if _, st, err := cli.FlushWriteback("wb", "wb-file", "1", wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), batch), batch); err != nil || st != ESTALE {
 		t.Fatalf("flush after fence: st=%d err=%v, want ESTALE", st, err)
 	}
 }
@@ -300,10 +272,10 @@ func TestClientSocketFlapReleasesNothing(t *testing.T) {
 	if _, st, err := cli.Create("db", 0o644); err != nil || st != OK {
 		t.Fatalf("create: st=%d err=%v", st, err)
 	}
-	if granted, heldBy, err := cli.Checkout("proj", "M1"); err != nil || !granted {
+	if granted, heldBy, _, err := cli.CheckoutManaged("proj"); err != nil || !granted {
 		t.Fatalf("checkout: granted=%v heldBy=%q err=%v", granted, heldBy, err)
 	}
-	if lr, err := cli.Lock("db", LkSetlk, 7, 0, 10, true, false); err != nil || lr.Status != OK {
+	if lr, err := cli.LockManaged("db", 0, LkSetlk, 7, 0, 10, true, false); err != nil || lr.Status != OK {
 		t.Fatalf("lock: %+v err=%v", lr, err)
 	}
 
@@ -314,12 +286,17 @@ func TestClientSocketFlapReleasesNothing(t *testing.T) {
 		cli.conns <- cn
 	}
 
-	// Nothing was released: the checkout and the lock are still ours.
-	if holder, _ := h.srv.deleg.HeldBy("proj"); holder != "M1" {
-		t.Fatalf("checkout holder after flap = %q, want M1 (flap must release nothing)", holder)
+	// Nothing was released: the checkout is still ours (a fresh contender
+	// cannot acquire an overlapping grant).
+	other0 := dialExact(t, h.addr, "M2")
+	if granted, _, _, err := other0.CheckoutManaged("proj/sub"); err != nil || granted {
+		t.Fatalf("peer checkout after flap: granted=%v err=%v, want refused (flap must release nothing)", granted, err)
 	}
 	other := dialExact(t, h.addr, "M2")
-	if lr, err := other.Lock("db", LkGetlk, 9, 0, 10, true, false); err != nil || !lr.Conflict {
+	if _, err := other.EnsureExactSession(); err != nil {
+		t.Fatalf("peer session: %v", err)
+	}
+	if lr, err := other.LockManaged("db", 0, LkGetlk, 9, 0, 10, true, false); err != nil || !lr.Conflict {
 		t.Fatalf("peer getlk after flap: %+v err=%v, want conflict (lock still held)", lr, err)
 	}
 	// And the same mount keeps mutating over re-dialed, re-attached conns.
@@ -351,11 +328,11 @@ func TestClientSplitsMultiGroupSetattr(t *testing.T) {
 	_ = h
 }
 
-// TestOpenUnlinkOrphanSurvivesFailover: a mount holds a file open, unlinks it
-// (parking the inode as an orphan), the authority crashes, and a standby
-// promotes from the replicated WAL. The parked inode — created by a replicated
-// OpOrphan intent — must survive the failover: the mount keeps reading and
-// writing it by ino and finally reaps it exactly once.
+// TestOpenUnlinkOrphanSurvivesFailover: an unlinked-but-open (pinned) inode
+// parks under a durable journaled pin; the authority crashes and a successor
+// cold-replays the SAME file entry log. The mount resumes its session, keeps
+// reading and writing the parked inode by ino, and the unpin finally lets
+// the authority's reap sweep destroy it.
 func TestOpenUnlinkOrphanSurvivesFailover(t *testing.T) {
 	// Registered FIRST so it runs LAST (after the cancel/close cleanups):
 	// every server goroutine must have exited before this test returns.
@@ -366,15 +343,8 @@ func TestOpenUnlinkOrphanSurvivesFailover(t *testing.T) {
 		}
 	})
 
-	walPath := filepath.Join(t.TempDir(), "replicated.wal")
-	w1, err := wal.Open(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs1, err := workfs.New(nil, nopBlobs{}, w1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	walPath := filepath.Join(t.TempDir(), "authority.wal")
+	srvA, _, _, _ := reopenAuthority(t, walPath)
 	lnA, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -384,7 +354,6 @@ func TestOpenUnlinkOrphanSurvivesFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctxA, cancelA := context.WithCancel(context.Background())
-	srvA := NewServer(fs1, fs1, delegation.New())
 	quiesce = append(quiesce, srvA)
 	go func() { _ = srvA.Serve(ctxA, lnA) }()
 
@@ -401,194 +370,70 @@ func TestOpenUnlinkOrphanSurvivesFailover(t *testing.T) {
 	if n, _, _, st, err := cli.WriteV("scratch", 0, []byte("tempdata"), 0o600); err != nil || st != OK || n != 8 {
 		t.Fatalf("write: n=%d st=%d err=%v", n, st, err)
 	}
-	// Open-unlink: the name goes away, the inode parks under a lease.
-	ino, st, err := cli.Orphan("scratch")
-	if err != nil || st != OK || ino == 0 {
-		t.Fatalf("orphan: ino=%d st=%d err=%v", ino, st, err)
+	a, st, err := cli.Getattr("scratch")
+	if err != nil || st != OK || a.Ino == 0 {
+		t.Fatalf("getattr: a=%+v st=%d err=%v", a, st, err)
 	}
+	// Open-state pin, then unlink: the inode parks under the durable pin.
+	if st, err := cli.MarkOpen(a.Ino); err != nil || st != OK {
+		t.Fatalf("mark open: st=%d err=%v", st, err)
+	}
+	if st, err := cli.Remove("scratch"); err != nil || st != OK {
+		t.Fatalf("remove: st=%d err=%v", st, err)
+	}
+	ino := a.Ino
 	if _, st, _ := cli.Getattr("scratch"); st != ENOENT {
-		t.Fatalf("name after orphan: st=%d, want ENOENT", st)
+		t.Fatalf("name after unlink: st=%d, want ENOENT", st)
+	}
+	if data, st, err := cli.ReadOrphan(ino, 0, 64); err != nil || st != OK || string(data) != "tempdata" {
+		t.Fatalf("orphan read: %q st=%d err=%v", data, st, err)
 	}
 
-	// CRASH the primary; PROMOTE a standby from the same replicated WAL.
+	// CRASH the authority; a successor cold-replays the SAME entry log.
 	cancelA()
 	_ = lnA.Close()
-	if err := w1.Close(); err != nil {
-		t.Fatal(err)
-	}
-	w2, err := wal.Open(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs2, err := workfs.New(nil, nopBlobs{}, w2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	awaitQuiesce(t, srvA)
+	quiesce = quiesce[1:]
+	srvB, _, _, _ := reopenAuthority(t, walPath)
 	ctxB, cancelB := context.WithCancel(context.Background())
 	t.Cleanup(cancelB)
-	srvB := NewServer(fs2, fs2, delegation.New())
 	quiesce = append(quiesce, srvB)
 	go func() { _ = srvB.Serve(ctxB, lnB) }()
 
+	// The mount resumes its session against the successor (the renew loop's
+	// job; done explicitly here so the test does not wait out its interval).
+	es := cli.exactState()
+	if resp, err := cli.doRaw(&Request{
+		Op: OpSessionResume, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
+	}, true); err != nil || resp.Status != OK {
+		t.Fatalf("resume after failover: %+v err=%v", resp, err)
+	}
+
 	// The parked inode survived: reads and exact writes keep addressing it by
-	// ino on the promoted authority (the fd never noticed the failover).
+	// ino on the successor (the fd never noticed the failover).
 	if data, st, err := cli.ReadOrphan(ino, 0, 64); err != nil || st != OK || string(data) != "tempdata" {
-		t.Fatalf("orphan read after promotion: %q st=%d err=%v", data, st, err)
+		t.Fatalf("orphan read after failover: %q st=%d err=%v", data, st, err)
 	}
 	if n, st, err := cli.WriteOrphan(ino, 8, []byte("+more")); err != nil || st != OK || n != 5 {
-		t.Fatalf("orphan write after promotion: n=%d st=%d err=%v", n, st, err)
+		t.Fatalf("orphan write after failover: n=%d st=%d err=%v", n, st, err)
 	}
 	if data, st, err := cli.ReadOrphan(ino, 0, 64); err != nil || st != OK || string(data) != "tempdata+more" {
 		t.Fatalf("orphan reread: %q st=%d err=%v", data, st, err)
 	}
-	// Last close: reap the parked inode (an exact mutation), exactly once.
-	if st, err := cli.Reap(ino); err != nil || st != OK {
-		t.Fatalf("reap after promotion: st=%d err=%v", st, err)
+	// Last close: the unpin releases the durable pin and the authority's
+	// reap sweep destroys the parked inode.
+	if st, err := cli.UnmarkOpen(ino); err != nil || st != OK {
+		t.Fatalf("unmark after failover: st=%d err=%v", st, err)
 	}
-	if _, st, err := cli.ReadOrphan(ino, 0, 8); err != nil || st != ENOENT {
-		t.Fatalf("read after reap: st=%d err=%v, want ENOENT", st, err)
-	}
-}
-
-// TestClientReclaimReassertsAcrossPromotion is the end-to-end failover story:
-// a mount holds coordination state, the authority dies, a standby promotes
-// from the replicated WAL, the mount's lease renewal discovers the reclaim
-// window, re-asserts its state through the registered hook, and a competing
-// mount is held off until then — after which conflicts resolve normally.
-func TestClientReclaimReassertsAcrossPromotion(t *testing.T) {
-	// Registered FIRST so it runs LAST (after later cleanups shut both servers
-	// down): it waits for every server goroutine to exit BEFORE restoring the
-	// package variables — a still-running handler or sweeper reading them
-	// during the restore would be a data race.
-	var quiesce []*Server
-	oldTTL, oldGrace := workfs.SessionLeaseTTL, workfs.SessionReclaimGrace
-	t.Cleanup(func() {
-		for _, s := range quiesce {
-			awaitQuiesce(t, s)
-		}
-		workfs.SessionLeaseTTL, workfs.SessionReclaimGrace = oldTTL, oldGrace
-	})
-	workfs.SessionLeaseTTL = 1200 * time.Millisecond // renewals every ~400ms
-	workfs.SessionReclaimGrace = 8 * time.Second
-
-	walPath := filepath.Join(t.TempDir(), "replicated.wal")
-	w1, err := wal.Open(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs1, err := workfs.New(nil, nopBlobs{}, w1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lnA, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	lnB, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctxA, cancelA := context.WithCancel(context.Background())
-	srvA := NewServer(fs1, fs1, delegation.New())
-	quiesce = append(quiesce, srvA)
-	go func() { _ = srvA.Serve(ctxA, lnA) }()
-
-	// The mount knows both addresses (primary,standby) — no VIP.
-	addrs := lnA.Addr().String() + "," + lnB.Addr().String()
-	cli, err := Dial(addrs, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cli.SetOwner("MA")
-	t.Cleanup(func() { _ = cli.Close() })
-
-	if _, st, err := cli.Create("db", 0o644); err != nil || st != OK {
-		t.Fatalf("create: st=%d err=%v", st, err)
-	}
-	if granted, _, err := cli.Checkout("proj", "MA"); err != nil || !granted {
-		t.Fatalf("checkout: %v", err)
-	}
-	if lr, err := cli.Lock("db", LkSetlk, 7, 0, 10, true, false); err != nil || lr.Status != OK {
-		t.Fatalf("lock: %+v err=%v", lr, err)
-	}
-
-	// The reclaim hook re-asserts coordination state, then reports done.
-	reclaimed := make(chan time.Duration, 1)
-	cli.SetOnReclaim(func(window time.Duration) {
-		if granted, _, err := cli.Checkout("proj", "MA"); err != nil || !granted {
-			t.Errorf("reclaim checkout: granted=%v err=%v", granted, err)
-		}
-		if lr, err := cli.Lock("db", LkSetlk, 7, 0, 10, true, false); err != nil || lr.Status != OK {
-			t.Errorf("reclaim lock: %+v err=%v", lr, err)
-		}
-		cli.ReclaimDone()
-		select {
-		case reclaimed <- window:
-		default:
-		}
-	})
-
-	// CRASH the primary; PROMOTE the standby from the same replicated WAL.
-	cancelA()
-	_ = lnA.Close()
-	if err := w1.Close(); err != nil {
-		t.Fatal(err)
-	}
-	w2, err := wal.Open(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs2, err := workfs.New(nil, nopBlobs{}, w2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srvB := NewServer(fs2, fs2, delegation.New())
-	quiesce = append(quiesce, srvB)
-	ctxB, cancelB := context.WithCancel(context.Background())
-	t.Cleanup(cancelB)
-	go func() { _ = srvB.Serve(ctxB, lnB) }()
-	if !srvB.exact.inGrace(time.Now()) {
-		t.Fatal("promoted authority must start in reclaim grace")
-	}
-
-	// A competitor on the promoted authority is held off while grace runs
-	// (the gate answers EAGAIN, which the typed helper surfaces as not-granted).
-	rival := dialExact(t, lnB.Addr().String(), "MB")
-	if granted, _, _ := rival.Checkout("proj", "MB"); granted {
-		t.Fatal("rival checkout during reclaim grace was granted, want held off")
-	}
-
-	// The mount's lease renewal finds the standby, learns ReclaimMs, and the
-	// hook re-asserts + completes.
-	select {
-	case window := <-reclaimed:
-		if window <= 0 {
-			t.Fatalf("reclaim window = %v, want > 0", window)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("reclaim hook never ran after promotion")
-	}
-
-	// Grace lifted early (all priors reclaimed): the rival now sees a normal
-	// CONFLICT (held by MA), not a grace hold-off; other subtrees are free.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if granted, _, err := rival.Checkout("elsewhere", "MB"); err == nil && granted {
+		if _, st, err := cli.ReadOrphan(ino, 0, 8); err == nil && st == ENOENT {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("grace never lifted for non-conflicting acquisition")
+			_, st, err := cli.ReadOrphan(ino, 0, 8)
+			t.Fatalf("orphan survived unpin: st=%d err=%v, want ENOENT", st, err)
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if holder, _ := srvB.deleg.HeldBy("proj"); holder != "MA" {
-		t.Fatalf("proj holder after reclaim = %q, want MA", holder)
-	}
-	// The mount's exact mutations continue seamlessly on the promoted node.
-	if n, st, err := cli.Write("db", 0, []byte("hi"), 0o644); err != nil || st != OK || n != 2 {
-		t.Fatalf("write after promotion: n=%d st=%d err=%v", n, st, err)
-	}
-	if lr, err := rival.Lock("db", LkGetlk, 9, 0, 10, true, false); err != nil || !lr.Conflict {
-		t.Fatalf("rival getlk: %+v err=%v, want conflict with MA's reclaimed lock", lr, err)
+		time.Sleep(20 * time.Millisecond)
 	}
 }

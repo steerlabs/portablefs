@@ -1,23 +1,11 @@
 package fsproto
 
 import (
-	"context"
-	"net"
-	"path/filepath"
 	"testing"
-
-	"github.com/go-git/go-billy/v5"
-
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
-	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
 func hardLinkRoundtrip(t *testing.T, cli *Client) {
 	t.Helper()
-	if !cli.SupportsHardLinks() {
-		t.Fatal("authority did not advertise FeatHardLinks")
-	}
 	src, st, err := cli.Create("source", 0o644)
 	if err != nil || st != OK {
 		t.Fatalf("create: attr=%+v st=%d err=%v", src, st, err)
@@ -51,9 +39,9 @@ func hardLinkRoundtrip(t *testing.T, cli *Client) {
 	}
 }
 
-func TestHardLinkRoundtripWALAuthority(t *testing.T) {
+func TestHardLinkRoundtripFileLogAuthority(t *testing.T) {
 	cli := serve(t)
-	cli.SetOwner("hardlink-wal")
+	cli.SetOwner("hardlink-filelog")
 	if _, err := cli.EnsureExactSession(); err != nil {
 		t.Fatal(err)
 	}
@@ -72,40 +60,4 @@ func TestHardLinkRoundtripManagedAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	hardLinkRoundtrip(t, cli)
-}
-
-type noHardLinkFS struct{ billy.Filesystem }
-
-func TestHardLinkCapabilityDowngradesWithoutSendingUnknownOp(t *testing.T) {
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	srv := NewServer(noHardLinkFS{fs}, fs, delegation.New())
-	go func() { _ = srv.Serve(ctx, ln) }()
-
-	cli, err := Dial(ln.Addr().String(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cli.Close() })
-	if cli.SupportsHardLinks() {
-		t.Fatal("authority without HardLinkStore advertised FeatHardLinks")
-	}
-	if _, st, err := cli.Link("source", "alias"); err != nil || st != EOPNOTSUPP {
-		t.Fatalf("client downgrade: st=%d err=%v", st, err)
-	}
-	if got := srv.dispatch(&Request{Op: OpLink, Path: "source", NewPath: "alias"}); got.Status != EOPNOTSUPP {
-		t.Fatalf("raw unsupported link status=%d", got.Status)
-	}
 }

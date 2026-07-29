@@ -45,8 +45,8 @@ export VOLUME_DATABASE_CONNECT_TIMEOUT_MS=10000
 set -a
 eval "$(railway bucket credentials --bucket portablefs-blobs)"
 set +a
-export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
-pnpm test:railway-bucket
+export VOLUME_S3_PREFIX=portablefs/dev
+pnpm test:s3-bucket
 ```
 
 See [railway-buckets.md](./railway-buckets.md) for the full bucket setup.
@@ -73,26 +73,27 @@ curl -X POST http://localhost:8787/v1/admin/tenants \
   -d '{"tenantId":"local","token":"local-tenant-token","label":"local-dev"}'
 ```
 
-Railway Bucket remains the default blob backend when `VOLUME_BLOB_STORE` is not
-set. `VOLUME_BLOB_STORE=s3` is the canonical name for the same S3-compatible
-store (`railway-bucket` keeps working as an alias):
+S3-compatible storage is the default blob backend when `VOLUME_BLOB_STORE` is
+not set (`railway-bucket` keeps working as a compat alias for `s3`, and the
+retired `VOLUME_RAILWAY_BUCKET_*` spellings alias onto the canonical
+`AWS_*`/`VOLUME_S3_*` names; see [self-hosting.md](./self-hosting.md)):
 
 ```bash
 export VOLUME_DATABASE_URL=postgres://postgres:postgres@localhost:5432/portablefs
 set -a
 eval "$(railway bucket credentials --bucket portablefs-blobs)"
 set +a
-export VOLUME_RAILWAY_BUCKET_PREFIX=portablefs/dev
+export VOLUME_S3_PREFIX=portablefs/dev
 pnpm --filter @portablefs/volume-api dev
 ```
 
 ## Run A Writable VCS
 
-Build the server and mount client:
+Build the server and CLI:
 
 ```bash
 go build -C vcs -o ../vcs-bin ./cmd/vcs
-go build -C vcs -o ../mount-bin ./cmd/mount
+go build -C vcs -o ../portablefs-bin ./cmd/portablefs
 ```
 
 Start a writable authority:
@@ -111,14 +112,15 @@ Mount it through the custom protocol:
 
 ```bash
 mkdir -p /mnt/vol
-./mount-bin -addr 127.0.0.1:2050 -mount /mnt/vol
+./portablefs-bin mount vol_... /mnt/vol --addr 127.0.0.1:2050 --foreground
 ```
 
 Run agents and tools inside `/mnt/vol`. That mounted filesystem is the live source of truth for
 the active volume.
 
-Production mounts use the same command shape, but set `VCS_TLS_CA` and `VCS_AUTH_TOKEN` so the
-client verifies and authenticates to the VCS authority.
+Production direct mounts also pass `--mount-token` (and configure
+`PORTABLEFS_TLS_CA`/`VCS_TLS_CA`) so the client authenticates and verifies the
+authority.
 
 For NFS mounting, the managed journal child, TLS/auth, metrics, and real-backend VCS tests, see
 [../vcs/README.md](../vcs/README.md).

@@ -86,7 +86,7 @@ func TestMutationPublishesInvalidations(t *testing.T) {
 	for !(got["a.txt"] && got["b.txt"] && got["d"]) {
 		select {
 		case ps := <-ch:
-			for _, p := range ps {
+			for _, p := range ps.Invs {
 				got[p.Path] = true
 			}
 		case <-timeout:

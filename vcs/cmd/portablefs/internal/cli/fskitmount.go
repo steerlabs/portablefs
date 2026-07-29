@@ -116,7 +116,10 @@ func newFsdControl(socketPath string) *fsdControl {
 	return &fsdControl{
 		socketPath: socketPath,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			// Must exceed the daemon's detach/sync drain budget (30s): the
+			// sync and detach endpoints legitimately hold the request open
+			// for the whole bounded drain.
+			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					var d net.Dialer
@@ -178,11 +181,9 @@ func controlError(status int, body []byte) error {
 	return fmt.Errorf("portablefsd: %s (HTTP %d)", text, status)
 }
 
-// fskitAttachOptions mirrors portablefsd's AttachOptions JSON.
+// fskitAttachOptions mirrors portablefsd's AttachOptions JSON. There is no
+// write-mode field: every attach is adaptive.
 type fskitAttachOptions struct {
-	WritePolicy     string   `json:"writePolicy"`
-	FsyncPolicy     string   `json:"fsyncPolicy,omitempty"`
-	FlushIntervalMs int64    `json:"flushIntervalMs,omitempty"`
 	Prefetch        bool     `json:"prefetch"`
 	DiskCacheDir    string   `json:"diskCacheDir"`
 	DiskCacheMB     int64    `json:"diskCacheMb"`
@@ -193,19 +194,12 @@ type fskitAttachOptions struct {
 }
 
 func fskitOptionsFromPerf(perf perfOptions, localDirs []string, volumeLocalDirs bool) fskitAttachOptions {
-	opts := fskitAttachOptions{
-		WritePolicy:     "writethrough",
-		FsyncPolicy:     perf.fsyncPolicy,
+	return fskitAttachOptions{
 		NegativeCache:   perf.negativeCache,
 		NoNegativeCache: perf.negativeCacheOff,
 		LocalDirs:       localDirs,
 		VolumeLocalDirs: volumeLocalDirs,
 	}
-	if perf.writeBack {
-		opts.WritePolicy = "writeback"
-		opts.FlushIntervalMs = perf.flushInterval.Milliseconds()
-	}
-	return opts
 }
 
 type fskitEnsureAttachRequest struct {
@@ -252,6 +246,90 @@ func (c *fsdControl) deleteAttach(ref string) error {
 		return controlError(status, body)
 	}
 	return nil
+}
+
+// forceDetach detaches ref WITH an unshipped tail permitted: the daemon
+// parks the tail as a durable recovery job and reports its ID ("" when
+// nothing was pending).
+func (c *fsdControl) forceDetach(ref string) (jobID string, err error) {
+	status, body, err := c.do(http.MethodDelete, "/v1/attaches/"+url.PathEscape(ref)+"?force=1", nil)
+	if err != nil {
+		return "", err
+	}
+	if status < 200 || status >= 300 {
+		return "", controlError(status, body)
+	}
+	var reply struct {
+		RecoveryJob string `json:"recoveryJob"`
+	}
+	_ = json.Unmarshal(body, &reply)
+	return reply.RecoveryJob, nil
+}
+
+// cliAttachStatus is the slice of portablefsd's attach status the CLI reads
+// for `portablefs mounts` and `portablefs doctor`.
+type cliAttachStatus struct {
+	AttachRef string              `json:"attachRef"`
+	MountPath string              `json:"mountPath"`
+	VolumeID  string              `json:"volumeId"`
+	Branch    string              `json:"branch"`
+	State     string              `json:"state"`
+	LastError string              `json:"lastError"`
+	WriteBack *cliWriteBackStatus `json:"writeBack"`
+}
+
+type cliWriteBackStatus struct {
+	PendingRecords int            `json:"pendingRecords"`
+	PendingBytes   int64          `json:"pendingBytes"`
+	ParkedWALs     []cliParkedWAL `json:"parkedWals"`
+}
+
+type cliParkedWAL struct {
+	Root         string `json:"root"`
+	Records      int    `json:"records"`
+	PayloadBytes int64  `json:"payloadBytes"`
+	AgeMs        int64  `json:"ageMs"`
+	LastError    string `json:"lastError"`
+}
+
+func (c *fsdControl) listAttaches() ([]cliAttachStatus, error) {
+	status, body, err := c.do(http.MethodGet, "/v1/attaches", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, controlError(status, body)
+	}
+	var out struct {
+		Attaches []cliAttachStatus `json:"attaches"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("unreadable attach list from portablefsd: %w", err)
+	}
+	return out.Attaches, nil
+}
+
+// syncVerdict is the daemon's successful drain verdict (POST
+// /v1/attaches/{ref}/sync). A drain that cannot reach authority durability
+// is an HTTP error, never a degraded success.
+type syncVerdict struct {
+	PendingRecords int   `json:"pendingRecords"`
+	PendingBytes   int64 `json:"pendingBytes"`
+}
+
+func (c *fsdControl) syncAttach(ref string) (syncVerdict, error) {
+	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/sync", nil)
+	if err != nil {
+		return syncVerdict{}, err
+	}
+	if status < 200 || status >= 300 {
+		return syncVerdict{}, controlError(status, body)
+	}
+	var v syncVerdict
+	if err := json.Unmarshal(body, &v); err != nil {
+		return syncVerdict{}, fmt.Errorf("unreadable drain verdict from portablefsd: %w", err)
+	}
+	return v, nil
 }
 
 func (c *fsdControl) setCredential(ref, token string) error {

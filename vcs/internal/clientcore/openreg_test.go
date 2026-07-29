@@ -7,11 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-git/go-billy/v5/memfs"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
@@ -19,38 +16,16 @@ import (
 // that assert authority-side open/orphan state directly.
 func serveWorkfs(t *testing.T) (*workfs.FS, string) {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, testBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedTestFS(t, testBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	srv := fsproto.NewServer(fs, fs, delegation.New())
+	srv := fsproto.NewServer(fs, fs)
 	go func() { _ = srv.Serve(ctx, ln) }()
 	return fs, ln.Addr().String()
-}
-
-// serveBilly serves a plain in-memory billy fs: no version stamps, no
-// ParentVersion, no open-state — the capability-less legacy authority shape.
-func serveBilly(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	srv := fsproto.NewServer(memfs.New(), nil, nil)
-	go func() { _ = srv.Serve(ctx, ln) }()
-	return ln.Addr().String()
 }
 
 // createOpened drives the volume exactly like a kernel CREATE: create the
@@ -81,9 +56,6 @@ func TestRetainedReopenZeroRPCStillParksPeerUnlink(t *testing.T) {
 	_, addr := serveWorkfs(t)
 	a := dialCore(t, addr, Options{Owner: "client-a"})
 	b := dialCore(t, addr, Options{Owner: "client-b"})
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
 	ctx := context.Background()
 
 	n, ino := createOpened(t, a, "keep.txt")
@@ -144,8 +116,24 @@ func TestSelfRemoveOfRetainedFileDestroys(t *testing.T) {
 	if _, st := a.Lookup(ctx, "gone.txt"); st != fsproto.ENOENT {
 		t.Fatalf("lookup after remove: %d, want ENOENT", st)
 	}
-	if _, st, err := a.client.GetattrOrphan(ino); err != nil || st != fsproto.ENOENT {
-		t.Fatalf("self-removed retained file must be DESTROYED, found parked orphan: st=%d err=%v", st, err)
+	awaitOrphanGone(t, a.client, ino, "self-removed retained file must be DESTROYED")
+}
+
+// awaitOrphanGone polls until the authority's reap sweep destroys the parked
+// inode (the release/unmark lands asynchronously; reply-follows-apply only
+// covers the unmark itself, not the sweep).
+func awaitOrphanGone(t *testing.T, cli *fsproto.Client, ino uint64, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, st, err := cli.GetattrOrphan(ino)
+		if err == nil && st == fsproto.ENOENT {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: st=%d err=%v", msg, st, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -161,9 +149,7 @@ func TestPeerUnlinkOfRetainedFileReleasesViaInvalidation(t *testing.T) {
 	fs, addr := serveWorkfs(t)
 	a := dialCore(t, addr, Options{Owner: "client-a"})
 	b := dialCore(t, addr, Options{Owner: "client-b"})
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
+	watchInvalidationsForTest(t, a) // A must receive B's Orphaned invalidation
 	ctx := context.Background()
 
 	n, ino := createOpened(t, a, "peer-gone.txt")
@@ -220,6 +206,7 @@ func TestRetentionEvictionUnmarksSoRemoveDestroys(t *testing.T) {
 	if st := b.Remove(ctx, "evict-a.txt", nil); st != fsproto.OK {
 		t.Fatalf("peer remove: %d", st)
 	}
+	awaitOrphanGone(t, b.client, ino1, "evicted registration still pins the peer remove")
 	if _, st, err := b.client.GetattrOrphan(ino1); err != nil || st != fsproto.ENOENT {
 		t.Fatalf("evicted registration must not park: orphan stat st=%d err=%v", st, err)
 	}
@@ -227,17 +214,14 @@ func TestRetentionEvictionUnmarksSoRemoveDestroys(t *testing.T) {
 
 // TestNegativeCacheDefaultsOnAgainstStampingAuthority is the default-on
 // cross-client coherence proof: with NO explicit option the volume enables
-// the negative cache because the authority advertises FeatParentVersion —
+// the negative cache because parent versions are baseline —
 // repeat ENOENT probes cost zero round-trips, and a peer's create of the
 // probed name is observed promptly via the parent-version invalidation.
 func TestNegativeCacheDefaultsOnAgainstStampingAuthority(t *testing.T) {
 	addr := serveCore(t)
 	a := dialCore(t, addr, Options{Owner: "client-a"}) // no NegativeCache flag: capability-auto
 	b := dialCore(t, addr, Options{Owner: "client-b"})
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
-	time.Sleep(100 * time.Millisecond) // let the subscribe stream attach
+	watchInvalidationsForTest(t, a) // A's cached negative is evicted by B's parent-version invalidation
 
 	ctx := context.Background()
 	if !a.negativeCache {
@@ -271,30 +255,22 @@ func TestNegativeCacheDefaultsOnAgainstStampingAuthority(t *testing.T) {
 	}
 }
 
-// TestNegativeCacheAutoStaysOffWithoutCapability: against an authority that
-// does not advertise FeatParentVersion the default must remain OFF (probes
-// keep round-tripping; nothing is sniffed from response fields), and the
-// explicit opt-out keeps it off even against a capable authority.
-func TestNegativeCacheAutoStaysOffWithoutCapability(t *testing.T) {
-	legacyAddr := serveBilly(t)
-	a := dialCore(t, legacyAddr, Options{Owner: "client-a"})
-	if a.negativeCache {
-		t.Fatal("negative cache must stay OFF against an authority without FeatParentVersion")
-	}
-	ctx := context.Background()
-	for i := 0; i < 3; i++ {
-		before := opCount(a)
-		if _, st := a.Lookup(ctx, "nope.json"); st != fsproto.ENOENT {
-			t.Fatalf("probe %d: %d", i, st)
-		}
-		if got := opCount(a) - before; got == 0 {
-			t.Fatalf("probe %d served without a round-trip against a capability-less authority", i)
-		}
-	}
-
+// TestNegativeCacheExplicitOptOut: parent versions are baseline in v5, so the
+// negative cache defaults ON — but the explicit opt-out must keep it off.
+func TestNegativeCacheExplicitOptOut(t *testing.T) {
 	capableAddr := serveCore(t)
 	off := dialCore(t, capableAddr, Options{Owner: "client-off", NoNegativeCache: true})
 	if off.negativeCache {
 		t.Fatal("NoNegativeCache must force the cache off even against a capable authority")
+	}
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		before := opCount(off)
+		if _, st := off.Lookup(ctx, "nope.json"); st != fsproto.ENOENT {
+			t.Fatalf("probe %d: %d", i, st)
+		}
+		if got := opCount(off) - before; got == 0 {
+			t.Fatalf("probe %d served from a cache the option disabled", i)
+		}
 	}
 }

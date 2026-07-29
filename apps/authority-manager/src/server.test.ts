@@ -2,12 +2,10 @@ import { afterEach, describe, expect, test } from "vitest";
 import { connect, createServer, type AddressInfo, type Socket } from "node:net";
 import { accessLeaseErrorCodes } from "@portablefs/protocol";
 import {
+  assertProductionAuthorityManagerMode,
   AuthorityOperationError,
   authorityOperationErrorCodes,
   createAuthorityManagerServer,
-  createEnvAuthorityRegistry,
-  readAuthorityManagerMode,
-  validateEnvAuthorityRegistryConfig,
   type AccessLeaseHandler,
   type AuthorityRegistry,
 } from "./server.js";
@@ -51,13 +49,9 @@ afterEach(async () => {
 
 describe("createAuthorityManagerServer", () => {
   test("requires explicit unauthenticated mode for credential-bearing routes", () => {
-    const registry = createEnvAuthorityRegistry({
-      PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-    });
-
     expect(() =>
       createAuthorityManagerServer({
-        registry,
+        registry: fixedEndpointRegistry(),
       })
     ).toThrow(/authToken is required/);
   });
@@ -69,9 +63,7 @@ describe("createAuthorityManagerServer", () => {
       expect(() =>
         createAuthorityManagerServer({
           allowUnauthenticated: true,
-          registry: createEnvAuthorityRegistry({
-            PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-          }),
+          registry: fixedEndpointRegistry(),
         })
       ).toThrow(/allowUnauthenticated cannot be enabled in production/);
     } finally {
@@ -90,7 +82,7 @@ describe("createAuthorityManagerServer", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ ok: true });
 
-    const unauthorized = await fetch(`${baseUrl}/v1/authorities/session`, {
+    const unauthorized = await fetch(`${baseUrl}/v1/authorities/ensure`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
@@ -102,7 +94,6 @@ describe("createAuthorityManagerServer", () => {
   test("ready checks can fail independently from liveness", async () => {
     const baseUrl = await startCustomServer({
       ensureAuthority: async () => ({ authorityUrl: "router.example:2050" }),
-      createSession: async () => ({ authorityUrl: "router.example:2050" }),
       isHealthy: async () => true,
     }, undefined, () => false);
 
@@ -121,38 +112,32 @@ describe("createAuthorityManagerServer", () => {
         retryAfterSeconds: 15,
       });
     };
-    const baseUrl = await startCustomServer(
-      {
-        ensureAuthority: async () => refuse(authorityOperationErrorCodes.atCapacity),
-        createSession: async () => refuse(authorityOperationErrorCodes.startQueueTimeout),
-        isHealthy: async () => true,
-      },
-      "manager-token"
-    );
     const headers = {
       authorization: "Bearer manager-token",
       "content-type": "application/json",
     };
 
-    const atCapacity = await fetch(`${baseUrl}/v1/authorities/ensure`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
-    });
-    expect(atCapacity.status).toBe(503);
-    expect(atCapacity.headers.get("retry-after")).toBe("15");
-    const atCapacityBody = (await atCapacity.json()) as { error: { code: string } };
-    expect(atCapacityBody.error.code).toBe(authorityOperationErrorCodes.atCapacity);
-
-    const queueTimeout = await fetch(`${baseUrl}/v1/authorities/session`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
-    });
-    expect(queueTimeout.status).toBe(503);
-    expect(queueTimeout.headers.get("retry-after")).toBe("15");
-    const queueTimeoutBody = (await queueTimeout.json()) as { error: { code: string } };
-    expect(queueTimeoutBody.error.code).toBe(authorityOperationErrorCodes.startQueueTimeout);
+    for (const code of [
+      authorityOperationErrorCodes.atCapacity,
+      authorityOperationErrorCodes.startQueueTimeout,
+    ]) {
+      const baseUrl = await startCustomServer(
+        {
+          ensureAuthority: async () => refuse(code),
+          isHealthy: async () => true,
+        },
+        "manager-token"
+      );
+      const response = await fetch(`${baseUrl}/v1/authorities/ensure`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
+      });
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("15");
+      const body = (await response.json()) as { error: { code: string } };
+      expect(body.error.code).toBe(code);
+    }
   });
 
   test("typed per-tenant fairness refusals render 429 with Retry-After, distinct from the 503 capacity codes", async () => {
@@ -161,38 +146,32 @@ describe("createAuthorityManagerServer", () => {
         retryAfterSeconds: 15,
       });
     };
-    const baseUrl = await startCustomServer(
-      {
-        ensureAuthority: async () => refuse(authorityOperationErrorCodes.tenantAtCapacity),
-        createSession: async () => refuse(authorityOperationErrorCodes.tenantLeaseLimit),
-        isHealthy: async () => true,
-      },
-      "manager-token"
-    );
     const headers = {
       authorization: "Bearer manager-token",
       "content-type": "application/json",
     };
 
-    const tenantAtCapacity = await fetch(`${baseUrl}/v1/authorities/ensure`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ teamId: "team_1", volumeId: "vol_1", branch: "main" }),
-    });
-    expect(tenantAtCapacity.status).toBe(429);
-    expect(tenantAtCapacity.headers.get("retry-after")).toBe("15");
-    const tenantAtCapacityBody = (await tenantAtCapacity.json()) as { error: { code: string } };
-    expect(tenantAtCapacityBody.error.code).toBe(authorityOperationErrorCodes.tenantAtCapacity);
-
-    const leaseLimit = await fetch(`${baseUrl}/v1/authorities/session`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ teamId: "team_1", volumeId: "vol_1", branch: "main" }),
-    });
-    expect(leaseLimit.status).toBe(429);
-    expect(leaseLimit.headers.get("retry-after")).toBe("15");
-    const leaseLimitBody = (await leaseLimit.json()) as { error: { code: string } };
-    expect(leaseLimitBody.error.code).toBe(authorityOperationErrorCodes.tenantLeaseLimit);
+    for (const code of [
+      authorityOperationErrorCodes.tenantAtCapacity,
+      authorityOperationErrorCodes.tenantLeaseLimit,
+    ]) {
+      const baseUrl = await startCustomServer(
+        {
+          ensureAuthority: async () => refuse(code),
+          isHealthy: async () => true,
+        },
+        "manager-token"
+      );
+      const response = await fetch(`${baseUrl}/v1/authorities/ensure`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ teamId: "team_1", volumeId: "vol_1", branch: "main" }),
+      });
+      expect(response.status).toBe(429);
+      expect(response.headers.get("retry-after")).toBe("15");
+      const body = (await response.json()) as { error: { code: string } };
+      expect(body.error.code).toBe(code);
+    }
   });
 
   test("GET /metrics requires the manager bearer token and renders bounded text", async () => {
@@ -202,7 +181,6 @@ describe("createAuthorityManagerServer", () => {
     const baseUrl = await startCustomServer(
       {
         ensureAuthority: async () => ({ authorityUrl: "router.example:2050" }),
-        createSession: async () => ({ authorityUrl: "router.example:2050" }),
         isHealthy: async () => true,
       },
       "manager-token",
@@ -241,7 +219,6 @@ describe("createAuthorityManagerServer", () => {
     const failing = await startCustomServer(
       {
         ensureAuthority: async () => ({ authorityUrl: "router.example:2050" }),
-        createSession: async () => ({ authorityUrl: "router.example:2050" }),
         isHealthy: async () => true,
       },
       "manager-token",
@@ -283,13 +260,12 @@ describe("createAuthorityManagerServer", () => {
         authorityUrl: "vcs.example:2050",
         host: "vcs.example",
         port: 2050,
-        nfsPort: 2049,
       },
     });
   });
 
-  test("session returns the current data-plane token", async () => {
-    const baseUrl = await startServer("manager-token");
+  test("the retired session route answers a typed 410 without touching the registry", async () => {
+    const baseUrl = await startCustomServer(unreachableRegistry(), "manager-token");
 
     const response = await fetch(`${baseUrl}/v1/authorities/session`, {
       method: "POST",
@@ -300,86 +276,34 @@ describe("createAuthorityManagerServer", () => {
       body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
     });
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      authority: {
-        provider: "portablefs-managed",
-        authorityUrl: "vcs.example:2050",
-        host: "vcs.example",
-        port: 2050,
-        nfsPort: 2049,
-        authorityAuthToken: "vcs-token",
-      },
-    });
+    expect(response.status).toBe(410);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("AUTHORITY_SESSION_RETIRED");
+    expect(body.error.message).toContain("/v1/access-leases/create");
   });
 
-  test("mount-sessions returns endpoint and token in one call, defaulting branch to main", async () => {
-    const baseUrl = await startServer("manager-token");
+  test("the retired mount-session routes answer a typed 410 without touching the registry", async () => {
+    const baseUrl = await startCustomServer(unreachableRegistry(), "manager-token");
 
-    const response = await fetch(`${baseUrl}/v1/mount-sessions`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer manager-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ volumeId: "vol_1" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      mountSession: {
-        volumeId: "vol_1",
-        branch: "main",
-        endpoint: {
-          authorityUrl: "vcs.example:2050",
-          host: "vcs.example",
-          port: 2050,
-          nfsPort: 2049,
+    for (const path of ["/v1/mount-sessions", "/v1/volumes/vol_1/mount-sessions"]) {
+      const response = await fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer manager-token",
+          "content-type": "application/json",
         },
-        token: "vcs-token",
-        provider: "portablefs-managed",
-      },
-    });
+        body: JSON.stringify({ volumeId: "vol_1" }),
+      });
+
+      expect(response.status).toBe(410);
+      const body = (await response.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe("MOUNT_SESSION_RETIRED");
+      expect(body.error.message).toContain("/v1/access-leases/create");
+    }
   });
 
-  test("mount-sessions accepts the canonical volume-scoped route", async () => {
-    const baseUrl = await startServer("manager-token");
-
-    const response = await fetch(`${baseUrl}/v1/volumes/vol_1/mount-sessions`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer manager-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({}),
-    });
-
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { mountSession: { volumeId: string; branch: string } };
-    expect(body.mountSession.volumeId).toBe("vol_1");
-    expect(body.mountSession.branch).toBe("main");
-  });
-
-  test("mount-sessions rejects a body volumeId that contradicts the URL", async () => {
-    const baseUrl = await startServer("manager-token");
-
-    const response = await fetch(`${baseUrl}/v1/volumes/vol_1/mount-sessions`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer manager-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ volumeId: "vol_other" }),
-    });
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({
-      error: "volumeId in the body does not match the URL.",
-    });
-  });
-
-  test("mount-sessions rejects unauthenticated callers like the authority routes", async () => {
-    const baseUrl = await startServer("manager-token");
+  test("the retired routes still require the manager bearer token", async () => {
+    const baseUrl = await startCustomServer(unreachableRegistry(), "manager-token");
 
     const response = await fetch(`${baseUrl}/v1/mount-sessions`, {
       method: "POST",
@@ -391,127 +315,9 @@ describe("createAuthorityManagerServer", () => {
     expect(await response.json()).toEqual({ error: "Unauthorized." });
   });
 
-  test("mount-sessions requires volumeId", async () => {
-    const baseUrl = await startServer();
-
-    const response = await fetch(`${baseUrl}/v1/mount-sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ branch: "main" }),
-    });
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "volumeId is required." });
-  });
-
-  test("mount-sessions maps unknown volumes to the session route's 404", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry({
-        PORTABLEFS_AUTHORITY_MAP_JSON: JSON.stringify({
-          "vol_known:main": { authorityUrl: "vcs.example:2050" },
-        }),
-      })
-    );
-
-    const response = await fetch(`${baseUrl}/v1/mount-sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_missing" }),
-    });
-
-    expect(response.status).toBe(404);
-    expect(await response.json()).toEqual({
-      error: "No PortableFS authority is registered for vol_missing@main.",
-    });
-  });
-
-  test("mount-sessions omits the token when the environment endpoint has no credential", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry({
-        PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-      })
-    );
-
-    const response = await fetch(`${baseUrl}/v1/mount-sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_1", branch: "dev", teamId: "team_1" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      mountSession: {
-        volumeId: "vol_1",
-        branch: "dev",
-        endpoint: {
-          authorityUrl: "vcs.example:2050",
-          host: "vcs.example",
-          port: 2050,
-        },
-        provider: "portablefs-managed",
-      },
-    });
-  });
-
-  test("mount-sessions returns the session token and TTL-derived expiry from the registry", async () => {
-    const expiresAt = Date.now() + 300_000;
-    const baseUrl = await startCustomServer(
-      {
-        ensureAuthority: async () => ({
-          provider: "portablefs-managed",
-          authorityUrl: "router.example:2050",
-          host: "router.example",
-          port: 2050,
-          authorityInstanceId: "pfai_1",
-        }),
-        createSession: async () => ({
-          provider: "portablefs-managed",
-          authorityUrl: "router.example:2050",
-          host: "router.example",
-          port: 2050,
-          authorityInstanceId: "pfai_1",
-          authToken: "pfs_sess_scoped",
-          expiresAt,
-        }),
-        isHealthy: async () => true,
-      },
-      "manager-token"
-    );
-
-    const response = await fetch(`${baseUrl}/v1/mount-sessions`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer manager-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ teamId: "team_1", volumeId: "vol_1" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      mountSession: {
-        volumeId: "vol_1",
-        branch: "main",
-        endpoint: {
-          authorityUrl: "router.example:2050",
-          host: "router.example",
-          port: 2050,
-        },
-        token: "pfs_sess_scoped",
-        expiresAtMs: expiresAt,
-        authorityInstanceId: "pfai_1",
-        provider: "portablefs-managed",
-      },
-    });
-  });
-
   test("health delegates to the registry", async () => {
-    const registry = createEnvAuthorityRegistry({
-      PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-    });
     const baseUrl = await startCustomServer({
-      ensureAuthority: registry.ensureAuthority.bind(registry),
-      createSession: registry.createSession.bind(registry),
+      ensureAuthority: async () => ({ authorityUrl: "vcs.example:2050" }),
       isHealthy: async () => false,
     });
 
@@ -533,7 +339,6 @@ describe("createAuthorityManagerServer", () => {
         ensureCalls += 1;
         return { authorityUrl: "router.example:2050" };
       },
-      createSession: async () => ({ authorityUrl: "router.example:2050" }),
       inspectAuthority: async () => {
         inspectCalls += 1;
         return { authorityUrl: "router.example:2050", authorityInstanceId: "pfai_1" };
@@ -553,26 +358,6 @@ describe("createAuthorityManagerServer", () => {
     expect(ensureCalls).toBe(0);
   });
 
-  test("environment health accepts plain 200 health endpoints", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry(
-        {
-          PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-          PORTABLEFS_AUTHORITY_HEALTH_URL: "https://vcs.example/healthz",
-        },
-        (async () => new Response("ok\n", { status: 200 })) as typeof fetch
-      )
-    );
-    const response = await fetch(`${baseUrl}/v1/authorities/health`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ healthy: true });
-  });
-
   test("stop validates expected authority identity and returns the advisory no-op result", async () => {
     const baseUrl = await startServer();
 
@@ -588,7 +373,6 @@ describe("createAuthorityManagerServer", () => {
           authorityUrl: "vcs.example:2050",
           host: "vcs.example",
           port: 2050,
-          nfsPort: 2049,
         },
       }),
     });
@@ -601,7 +385,6 @@ describe("createAuthorityManagerServer", () => {
     const stopCalls: unknown[] = [];
     const baseUrl = await startCustomServer({
       ensureAuthority: async () => ({ authorityUrl: "router.example:2050" }),
-      createSession: async () => ({ authorityUrl: "router.example:2050" }),
       isHealthy: async () => true,
       stopAuthority: async (ref) => {
         stopCalls.push(ref);
@@ -648,172 +431,32 @@ describe("createAuthorityManagerServer", () => {
     expect(await response.json()).toEqual({ error: "expectedAuthority is required for stop." });
   });
 
-  test("environment health treats unreachable endpoints as unhealthy", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry(
-        {
-          PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-          PORTABLEFS_AUTHORITY_HEALTH_URL: "https://vcs.example/healthz",
-        },
-        (async () => {
-          throw new Error("connection reset");
-        }) as typeof fetch
-      )
-    );
-    const response = await fetch(`${baseUrl}/v1/authorities/health`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ healthy: false });
-  });
-
-  test("environment health bounds stalled endpoint checks", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry(
-        {
-          PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-          PORTABLEFS_AUTHORITY_HEALTH_URL: "https://vcs.example/healthz",
-          PORTABLEFS_AUTHORITY_HEALTH_TIMEOUT_MS: "1",
-        },
-        (async (_input, init) =>
-          new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-          })) as typeof fetch
-      )
-    );
-    const response = await fetch(`${baseUrl}/v1/authorities/health`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ healthy: false });
-  });
-
-  test("environment health bounds stalled response bodies", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry(
-        {
-          PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-          PORTABLEFS_AUTHORITY_HEALTH_URL: "https://vcs.example/healthz",
-          PORTABLEFS_AUTHORITY_HEALTH_TIMEOUT_MS: "1",
-        },
-        (async (_input, init) =>
-          ({
-            ok: true,
-            text: async () =>
-              new Promise<string>((_resolve, reject) => {
-                init?.signal?.addEventListener("abort", () => reject(new Error("body aborted")));
-              }),
-          }) as Response) as typeof fetch
-      )
-    );
-    const response = await fetch(`${baseUrl}/v1/authorities/health`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_1", branch: "main" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ healthy: false });
-  });
-
-  test("volume-specific mappings override default mappings", async () => {
-    const baseUrl = await startCustomServer(
-      createEnvAuthorityRegistry({
-        PORTABLEFS_AUTHORITY_URL: "default.example:2050",
-        PORTABLEFS_AUTHORITY_MAP_JSON: JSON.stringify({
-          "vol_2:main": {
-            authorityUrl: "specific.example:3050",
-            authToken: "specific-token",
-          },
-        }),
-      })
-    );
-
-    const response = await fetch(`${baseUrl}/v1/authorities/session`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ volumeId: "vol_2", branch: "main" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      authority: {
-        provider: "portablefs-managed",
-        authorityUrl: "specific.example:3050",
-        host: "specific.example",
-        port: 3050,
-        authorityAuthToken: "specific-token",
-      },
-    });
-  });
-
-  test("environment registry validation requires at least one endpoint", () => {
-    expect(() => validateEnvAuthorityRegistryConfig({})).toThrow(
-      /At least one PortableFS authority endpoint/
-    );
-  });
-
-  test("environment registry validation can require health URLs", () => {
+  test("mode selection refuses the retired managed and env modes by name and names production as the only mode", () => {
+    expect(() => assertProductionAuthorityManagerMode({})).not.toThrow();
     expect(() =>
-      validateEnvAuthorityRegistryConfig(
-        {
-          PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-        },
-        { requireHealth: true }
-      )
-    ).toThrow(/health URLs are required/);
-
-    expect(() =>
-      validateEnvAuthorityRegistryConfig(
-        {
-          PORTABLEFS_AUTHORITY_MAP_JSON: JSON.stringify({
-            "vol_1:main": {
-              authorityUrl: "vcs.example:2050",
-              healthUrl: "https://vcs.example/readyz",
-            },
-          }),
-        },
-        { requireHealth: true }
-      )
+      assertProductionAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "production" })
     ).not.toThrow();
+
+    expect(() =>
+      assertProductionAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "managed" })
+    ).toThrow(/managed is no longer supported[\s\S]*Production mode/);
+    expect(() =>
+      assertProductionAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "env" })
+    ).toThrow(/env is no longer supported[\s\S]*Production mode/);
+    expect(() =>
+      assertProductionAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "paired" })
+    ).toThrow(/must be production/);
   });
 
-  test("mode selection refuses the retired managed mode by name and names production as the successor", () => {
-    expect(readAuthorityManagerMode({})).toBe("env");
-    expect(readAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "env" })).toBe("env");
-    expect(readAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "production" })).toBe(
-      "production"
-    );
-
-    expect(() => readAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "managed" })).toThrow(
-      /managed is no longer supported[\s\S]*PORTABLEFS_AUTHORITY_MODE=production/
-    );
-    expect(() => readAuthorityManagerMode({ PORTABLEFS_AUTHORITY_MODE: "paired" })).toThrow(
-      /must be env or production/
-    );
-  });
-
-  test("mode inference from process-registry variables requires the production control store", () => {
-    expect(
-      readAuthorityManagerMode({
-        PORTABLEFS_MANAGED_VCS_BIN: "/usr/local/bin/vcs",
-        PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR: "0.0.0.0:2050",
-        PORTABLEFS_MANAGER_CONTROL_DATABASE_URL: "postgres://portablefs_manager@db/portablefs",
+  test("retired env-registry variables are rejected by name", () => {
+    expect(() =>
+      assertProductionAuthorityManagerMode({ PORTABLEFS_AUTHORITY_URL: "vcs.example:2050" })
+    ).toThrow(/PORTABLEFS_AUTHORITY_URL[\s\S]*retired env registry/);
+    expect(() =>
+      assertProductionAuthorityManagerMode({
+        PORTABLEFS_AUTHORITY_MAP_JSON: JSON.stringify({ "vol_1:main": {} }),
       })
-    ).toBe("production");
-
-    expect(() =>
-      readAuthorityManagerMode({ PORTABLEFS_MANAGED_VCS_BIN: "/usr/local/bin/vcs" })
-    ).toThrow(/retired[\s\S]*PORTABLEFS_AUTHORITY_MODE=production/);
-    expect(() =>
-      readAuthorityManagerMode({ PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR: "127.0.0.1:2050" })
-    ).toThrow(/retired[\s\S]*PORTABLEFS_AUTHORITY_MODE=production/);
+    ).toThrow(/PORTABLEFS_AUTHORITY_MAP_JSON[\s\S]*retired env registry/);
   });
 });
 
@@ -877,11 +520,10 @@ describe("authority data-plane router", () => {
       })
     ).toThrow(/never both/);
 
-    // Production authority mode accepts either full source and refuses
-    // plaintext regardless of NODE_ENV (often unset in bare-node and
-    // Kubernetes deployments).
+    // The router accepts either full TLS source and refuses plaintext
+    // regardless of NODE_ENV (often unset in bare-node and Kubernetes
+    // deployments) unless the explicit tunnel escape hatch is set.
     const base = {
-      authorityMode: "production" as const,
       listenAddr: "0.0.0.0:2050",
       publicUrl: "vcs.example:2050",
     };
@@ -900,13 +542,6 @@ describe("authority data-plane router", () => {
     expect(() =>
       validateAuthorityDataPlaneRouterConfig({ ...base, tlsCertPem: "C" })
     ).toThrow(/TLS_KEY_PEM/);
-    expect(() =>
-      validateAuthorityDataPlaneRouterConfig({
-        authorityMode: "env",
-        listenAddr: "127.0.0.1:2050",
-        publicUrl: "127.0.0.1:2050",
-      })
-    ).not.toThrow();
   });
 });
 
@@ -927,10 +562,8 @@ describe("access-lease routes", () => {
         authorityUrl: "router.example:2050",
         host: "router.example",
         port: 2050,
-        nfsPort: 2049,
         ...(instanceId ? { authorityInstanceId: instanceId } : {}),
       }),
-      createSession: async () => ({ authorityUrl: "router.example:2050" }),
       isHealthy: async () => true,
     };
   }
@@ -1245,15 +878,34 @@ async function startTrackingBackend(
   return { address: `${address.host}:${address.port}`, sockets };
 }
 
-async function startServer(authToken?: string): Promise<string> {
-  return startCustomServer(
-    createEnvAuthorityRegistry({
-      PORTABLEFS_AUTHORITY_URL: "vcs.example:2050",
-      PORTABLEFS_AUTHORITY_NFS_PORT: "2049",
-      PORTABLEFS_AUTHORITY_AUTH_TOKEN: "vcs-token",
+// A fixed-endpoint stub registry standing in for a fenced production
+// registry: ensure resolves routing, health is delegated, stop is absent.
+function fixedEndpointRegistry(): AuthorityRegistry {
+  return {
+    ensureAuthority: async () => ({
+      provider: "portablefs-managed",
+      authorityUrl: "vcs.example:2050",
+      host: "vcs.example",
+      port: 2050,
     }),
-    authToken
-  );
+    isHealthy: async () => true,
+  };
+}
+
+// Registries backing tombstoned routes must never be dispatched to.
+function unreachableRegistry(): AuthorityRegistry {
+  return {
+    ensureAuthority: async () => {
+      throw new Error("the registry must not be reached");
+    },
+    isHealthy: async () => {
+      throw new Error("the registry must not be reached");
+    },
+  };
+}
+
+async function startServer(authToken?: string): Promise<string> {
+  return startCustomServer(fixedEndpointRegistry(), authToken);
 }
 
 async function startCustomServer(
