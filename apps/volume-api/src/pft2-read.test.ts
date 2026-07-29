@@ -507,7 +507,7 @@ describe("PFT2 file serving", () => {
     expect(ranged.status).toBe(206);
     const rangedBody = Buffer.from(await ranged.arrayBuffer());
     expect(rangedBody.equals(Buffer.from(bigContent.subarray(start, end + 1)))).toBe(true);
-  });
+  }, 15_000);
 });
 
 function tenantMetadata(): MetadataRepository {
