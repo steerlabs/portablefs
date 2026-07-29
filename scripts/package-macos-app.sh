@@ -3,7 +3,7 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-version=${1:-${PORTABLEFS_VERSION:-0.2.1}}
+version=${1:-${PORTABLEFS_VERSION:-0.2.2}}
 version=${version#v}
 team_id=${PORTABLEFS_APPLE_TEAM_ID:-B47U2LLKHW}
 configuration=${PORTABLEFS_XCODE_CONFIGURATION:-Release}
