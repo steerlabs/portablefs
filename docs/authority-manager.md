@@ -231,20 +231,17 @@ process is gone.
 A manager restart is an epoch handoff, not a recovery. The new process claims
 a fresh epoch (waiting out the previous claim's database TTL if it was not
 released), demand-starts fresh children that cold-replay from the remote
-journal, and never adopts a predecessor's process, listener, or token. Mounts
-reacquire access leases against the new epoch; filesystem state and sessions
-survive in the journal. Child teardown is always ordered: the durable
+journal, and never adopts a predecessor's process, listener, or token. Existing
+mount leases fail closed; an operator starts a new mount session against the
+new epoch. Filesystem state survives in the journal. Child teardown is always ordered: the durable
 access-lease fence commits first, then the process terminates, then the
 runtime row ends — on supersession the runtime rows are deliberately left for
 the successor's begin to settle.
 
-Reacquisition is reactive, not timer-driven: the router's one-byte rejection
-ack tells the mount its token is dead the moment it redials, the mount
-re-resolves the mount session immediately (coalesced to one manager request
-per mount, however many pooled connections saw the rejection), and its
-reconnect attempts are paced by full-jitter exponential backoff (250ms base,
-15s cap) so a fleet recovering from the same restart does not storm the new
-epoch. See docs/failure-modes.md "Manager Restart (Session Token Rejection)".
+The router's one-byte rejection ack tells a mount its token is dead. The mount
+surfaces that terminal condition and never re-resolves or reacquires behind the
+operator's back. See docs/failure-modes.md "Manager Restart (Session Token
+Rejection)".
 
 ### Configuration
 

@@ -328,10 +328,11 @@ committed head.
   then the history worker, then the manager.
 - **Manager restarts are epoch handoffs.** A restarted production manager claims
   a fresh epoch and demand-starts fresh children that cold-replay from the
-  journal; mounts reacquire leases and reconnect. Still, upgrade it during a
-  quiet window rather than under heavy mount churn.
-- **Mount clients and authorities negotiate protocol versions** (`fsproto`), so
-  client and server release trains may skew. Consult [../COMPATIBILITY.md](../COMPATIBILITY.md)
+  journal. Existing mounts fail closed; remount explicitly against the new
+  epoch. Upgrade it during a quiet window.
+- **Mount clients and authorities negotiate exact protocol versions** (`fsproto`);
+  incompatible versions fail closed and must be upgraded together. Consult
+  [../COMPATIBILITY.md](../COMPATIBILITY.md)
   for what each release is allowed to change.
 - **Verify what is serving with `GET /v1/release-identity`.** The published
   images bake the exact release id and source revision; deployment tooling

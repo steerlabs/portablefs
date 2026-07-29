@@ -21,7 +21,7 @@ package fsproto
 // state a successor already took over.
 //
 // Sessions are mandatory: the client requires the authority to negotiate
-// exactly ProtocolVersion (v6) and refuses anything else with a clear
+// exactly ProtocolVersion (v7) and refuses anything else with a clear
 // version-mismatch error. There is no legacy downgrade.
 
 import (
@@ -78,16 +78,24 @@ type exactSession struct {
 	stop     chan struct{}
 }
 
-func newExactSession(owner string, slots uint32) *exactSession {
+func newExactSession(owner string, slots uint32) (*exactSession, error) {
 	if slots == 0 {
 		slots = DefaultExactSlots
 	}
 	if slots > MaxSessionSlots {
 		slots = MaxSessionSlots
 	}
+	id, err := randToken(12)
+	if err != nil {
+		return nil, err
+	}
+	token, err := randToken(24)
+	if err != nil {
+		return nil, err
+	}
 	es := &exactSession{
-		id:    "pfs-" + randToken(12),
-		token: "pfstok_" + randToken(24),
+		id:    "pfs-" + id,
+		token: "pfstok_" + token,
 		gen:   1,
 		owner: owner,
 		slots: slots,
@@ -98,17 +106,15 @@ func newExactSession(owner string, slots uint32) *exactSession {
 	for i := uint32(0); i < slots; i++ {
 		es.avail <- i
 	}
-	return es
+	return es, nil
 }
 
-func randToken(n int) string {
+func randToken(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		// Without entropy the process cannot mint an unforgeable credential;
-		// fall back to a time-derived value only for the ID's uniqueness.
-		return hex.EncodeToString([]byte(time.Now().String()))[:2*n]
+		return "", fmt.Errorf("fsproto: mint exact-session credential: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 func (es *exactSession) isFenced() bool {
@@ -208,7 +214,7 @@ func (c *Client) isClosed() bool {
 }
 
 // EnsureExactSession establishes the mount session, negotiating the protocol
-// version first: the authority must speak exactly ProtocolVersion (v6).
+// version first: the authority must speak exactly ProtocolVersion (v7).
 // Returns (true, nil) when the session is live and an error otherwise —
 // including ErrProtocolVersionMismatch against an older authority. There is
 // no legacy downgrade.
@@ -233,7 +239,10 @@ func (c *Client) EnsureExactSession() (bool, error) {
 	if probe.Status != OK || probe.ProtoVersion != ProtocolVersion {
 		return false, &ErrProtocolVersionMismatch{ServerVersion: probe.ProtoVersion}
 	}
-	es := newExactSession(c.owner, c.exactSlots)
+	es, err := newExactSession(c.owner, c.exactSlots)
+	if err != nil {
+		return false, err
+	}
 	es.features = probe.Features
 	// The exact (id, gen, owner, slots, token) tuple is idempotent, so a lost
 	// establish reply is safely replayed with the identical tuple.

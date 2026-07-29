@@ -42,10 +42,10 @@ Two things make this safe rather than merely convenient:
   [writeback-engine.md](./writeback-engine.md)) is immediately visible on the
   writing mount, then reaches local physical durability on the 5 ms / 4 MiB
   group-sync. A complete power loss inside that small window may lose the
-  recent un-fsynced tail, just as on a normal filesystem. `fsync`, dirty
-  last-close, synchronize, and clean unmount force the local WAL and make the
+  recent un-fsynced tail, just as on a normal filesystem. `fsync`,
+  synchronize, and clean unmount force the local WAL and make the
   accepted tail durable at the authority. Those are the handoff boundaries
-  for Git, SQLite, and cross-machine continuation.
+  for Git, SQLite, and cross-machine continuation; `close(2)` alone is not.
 - **There is no stale handover, because there is no second truth.** Both
   mounts are windows onto the same live authority. A peer that reads a
   subtree another mount holds delegated waits for the holder to drain

@@ -29,14 +29,25 @@ import (
 const bindingJournalName = "items.journal"
 
 type bindingJournalEntry struct {
-	Ref  string `json:"ref"`
-	Op   string `json:"op"` // bind | unbind | rekey
-	Path string `json:"path,omitempty"`
-	ID   uint64 `json:"id,omitempty"`
-	Gen  uint64 `json:"gen,omitempty"`
-	Auth bool   `json:"auth,omitempty"`
-	From string `json:"from,omitempty"` // rekey: old path prefix
-	To   string `json:"to,omitempty"`   // rekey: new path prefix
+	Ref             string `json:"ref"`
+	Op              string `json:"op"` // bind | unbind | rekey
+	Path            string `json:"path,omitempty"`
+	ID              uint64 `json:"id,omitempty"`
+	Gen             uint64 `json:"gen,omitempty"`
+	Auth            bool   `json:"auth,omitempty"`
+	AuthorityItemID uint64 `json:"authorityItemId,omitempty"`
+	From            string `json:"from,omitempty"` // rekey: old path prefix
+	To              string `json:"to,omitempty"`   // rekey: new path prefix
+}
+
+func (e bindingJournalEntry) authorityItemID() uint64 {
+	if e.AuthorityItemID != 0 {
+		return e.AuthorityItemID
+	}
+	if e.Auth {
+		return e.ID
+	}
+	return 0
 }
 
 type bindingJournal struct {

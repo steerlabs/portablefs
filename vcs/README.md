@@ -1,7 +1,7 @@
 # vcs — Volume Cache Service (live mount)
 
 The VCS serves a PortableFS volume as the live filesystem authority over one data
-plane: fsproto v6, the custom protocol spoken by the product FUSE/FSKit mounts.
+plane: fsproto v7, the custom protocol spoken by the product FUSE/FSKit mounts.
 Every mutation rides a journaled exact session; durability and coordination are
 the fenced PostgreSQL journal's.
 
@@ -138,7 +138,7 @@ listeners; the managed child serves loopback only.
 
 The product mount is the CLI: `portablefs mount <volume>` (FSKit on macOS, FUSE
 on Linux — see the top-level docs). It resolves the volume's endpoint through
-the manager's access-lease API and speaks fsproto v6.
+the manager's access-lease API and speaks fsproto v7.
 
 For benchmarking against a plain authority address (no control plane), the
 bench harness's raw FUSE mount is `bench/cmd/benchmount`:
@@ -158,7 +158,7 @@ go -C vcs test -race ./...    # race-clean
 VOLUME_API_URL=... VOLUME_API_TOKEN=... [VCS_E2E_VOLUME_ID=vol_... VCS_E2E_BIG_SHA=...] go -C vcs test ./...
 ```
 
-The suite drives fsproto v6 end-to-end in-process (exact sessions, journaled
+The suite drives fsproto v7 end-to-end in-process (exact sessions, journaled
 coordination, write-back flushes, failover replay), plus multi-client coherence
 and the managed parity suite. The tree hash is cross-checked against the TS
 implementation (`internal/treehash` golden + `.volume-cache/treehash-crosscheck.mjs`).

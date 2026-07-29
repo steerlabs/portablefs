@@ -415,6 +415,15 @@ func flushDigests(t *testing.T, prev [32]byte, rows []ManagedFlushRow) [32]byte 
 	return d
 }
 
+func flushRowsForScope(rows []ManagedFlushRow, path, epoch string) []ManagedFlushRow {
+	out := append([]ManagedFlushRow(nil), rows...)
+	for i := range out {
+		out[i].CheckoutPath = path
+		out[i].CheckoutEpoch = epoch
+	}
+	return out
+}
+
 func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	log := newFakeEntryLog()
 	fs, err := NewManaged(nil, nil, log)
@@ -431,9 +440,10 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 		{Seq: 3, Record: wal.Record{Op: wal.OpWrite, Path: "ws/a", Data: []byte("hello")}},
 		{Seq: 4, Record: wal.Record{Op: wal.OpMkdir, Path: "ws/dir", Mode: 0o755}},
 	}
+	rows = flushRowsForScope(rows, "ws", epoch)
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	through, err := fs.ManagedFlushApply(a, "wb-1", "ws", epoch, prev, end, rows, "M")
+	through, err := fs.ManagedFlushApply(a, "wb-1", prev, end, rows, "M")
 	if err != nil || through != 4 {
 		t.Fatalf("flush: through=%d err=%v", through, err)
 	}
@@ -442,7 +452,7 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	}
 	// A lost-reply retry of the identical batch converges without double
 	// apply: everything at or below the durable watermark drops.
-	through2, err := fs.ManagedFlushApply(a, "wb-1", "ws", epoch, prev, end, rows, "M")
+	through2, err := fs.ManagedFlushApply(a, "wb-1", prev, end, rows, "M")
 	if err != nil || through2 != 4 {
 		t.Fatalf("retry flush: through=%d err=%v", through2, err)
 	}
@@ -452,13 +462,13 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 		t.Fatalf("content after retry: %q err=%v", data[:n], err)
 	}
 	// A gapped continuation is the typed corrupt verdict, not a partial apply.
-	gap := []ManagedFlushRow{{Seq: 6, Record: wal.Record{Op: wal.OpCreate, Path: "ws/gap", Mode: 0o644}}}
-	if _, err := fs.ManagedFlushApply(a, "wb-1", "ws", epoch, end, flushDigests(t, end, gap), gap, "M"); !errors.Is(err, ErrWritebackCorrupt) {
+	gap := flushRowsForScope([]ManagedFlushRow{{Seq: 6, Record: wal.Record{Op: wal.OpCreate, Path: "ws/gap", Mode: 0o644}}}, "ws", epoch)
+	if _, err := fs.ManagedFlushApply(a, "wb-1", end, flushDigests(t, end, gap), gap, "M"); !errors.Is(err, ErrWritebackCorrupt) {
 		t.Fatalf("gapped flush: %v, want ErrWritebackCorrupt", err)
 	}
 	// A diverging digest at the same sequences fences too.
-	forged := []ManagedFlushRow{{Seq: 5, Record: wal.Record{Op: wal.OpCreate, Path: "ws/forged", Mode: 0o644}}}
-	if _, err := fs.ManagedFlushApply(a, "wb-1", "ws", epoch, end, end, forged, "M"); !errors.Is(err, ErrWritebackCorrupt) {
+	forged := flushRowsForScope([]ManagedFlushRow{{Seq: 5, Record: wal.Record{Op: wal.OpCreate, Path: "ws/forged", Mode: 0o644}}}, "ws", epoch)
+	if _, err := fs.ManagedFlushApply(a, "wb-1", end, end, forged, "M"); !errors.Is(err, ErrWritebackCorrupt) {
 		t.Fatalf("digest-diverging flush: %v, want ErrWritebackCorrupt", err)
 	}
 	// A flush naming a released epoch is fenced; the STREAM watermark
@@ -472,8 +482,8 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	if d, err := fs.ManagedCheckinDecide(renv, "ws", epoch); err != nil || d.Status != 0 {
 		t.Fatalf("release: d=%+v err=%v", d, err)
 	}
-	late := []ManagedFlushRow{{Seq: 5, Record: wal.Record{Op: wal.OpCreate, Path: "ws/late", Mode: 0o644}}}
-	if _, err := fs.ManagedFlushApply(a, "wb-1", "ws", epoch, end, flushDigests(t, end, late), late, "M"); !errors.Is(err, ErrSessionStale) {
+	late := flushRowsForScope([]ManagedFlushRow{{Seq: 5, Record: wal.Record{Op: wal.OpCreate, Path: "ws/late", Mode: 0o644}}}, "ws", epoch)
+	if _, err := fs.ManagedFlushApply(a, "wb-1", end, flushDigests(t, end, late), late, "M"); !errors.Is(err, ErrSessionStale) {
 		t.Fatalf("stale-epoch flush: %v, want stale", err)
 	}
 	if view, ok, _ := fs.ManagedWritebackState("wb-1"); !ok || view.Through != 4 {
@@ -491,6 +501,78 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	n2, err := replayed.ReadHandleAt("ws/a", 0, data, 0)
 	if (err != nil && !errors.Is(err, io.EOF)) || string(data[:n2]) != "hello" {
 		t.Fatalf("replayed content: %q err=%v", data[:n2], err)
+	}
+}
+
+func TestManagedFlushInterleavedScopesIsAtomicAndRetryable(t *testing.T) {
+	log := newFakeEntryLog()
+	fs, err := NewManaged(nil, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := openManagedSession(t, fs, "pfs-mixed-flush", 1)
+	epochA := grantDelegation(t, fs, a, 0, 1, "a", "wb-mixed")
+	epochB := grantDelegation(t, fs, a, 1, 1, "b", "wb-mixed")
+
+	rows := []ManagedFlushRow{
+		{Seq: 1, CheckoutPath: "a", CheckoutEpoch: epochA, Record: wal.Record{Op: wal.OpMkdir, Path: "a", Mode: 0o755}},
+		{Seq: 2, CheckoutPath: "b", CheckoutEpoch: epochB, Record: wal.Record{Op: wal.OpMkdir, Path: "b", Mode: 0o755}},
+		{Seq: 3, CheckoutPath: "a", CheckoutEpoch: epochA, Record: wal.Record{Op: wal.OpCreate, Path: "a/one", Mode: 0o644}},
+		{Seq: 4, CheckoutPath: "b", CheckoutEpoch: epochB, Record: wal.Record{Op: wal.OpCreate, Path: "b/two", Mode: 0o644}},
+	}
+	prev := digestZeroStream()
+	end := flushDigests(t, prev, rows)
+	through, err := fs.ManagedFlushApply(a, "wb-mixed", prev, end, rows, "M")
+	if err != nil || through != 4 {
+		t.Fatalf("mixed flush: through=%d err=%v", through, err)
+	}
+
+	// A lost success reply can only cause the exact same global batch to be
+	// retried. The durable stream watermark drops the duplicate prefix, so
+	// no mutation is applied twice.
+	retryThrough, err := fs.ManagedFlushApply(a, "wb-mixed", prev, end, rows, "M")
+	if err != nil || retryThrough != 4 {
+		t.Fatalf("mixed lost-reply retry: through=%d err=%v", retryThrough, err)
+	}
+
+	// Cold replay must reproduce both subtrees and the one global watermark.
+	replayed, err := NewManaged(nil, nil, log)
+	if err != nil {
+		t.Fatalf("cold replay: %v", err)
+	}
+	if _, err := replayed.Stat("a/one"); err != nil {
+		t.Fatalf("replayed scope a: %v", err)
+	}
+	if _, err := replayed.Stat("b/two"); err != nil {
+		t.Fatalf("replayed scope b: %v", err)
+	}
+	if view, ok, _ := replayed.ManagedWritebackState("wb-mixed"); !ok || view.Through != 4 || view.Digest != end {
+		t.Fatalf("replayed mixed stream state: view=%+v ok=%v", view, ok)
+	}
+
+	// Releasing only B makes a later A/B batch stale as a WHOLE. A's first
+	// row must not leak through before B's invalid epoch is discovered.
+	renv := coordEnv(a, 1, 2, nil)
+	rh, err := CheckoutRequestHash(renv, true, "b", epochB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renv.ReqHash = rh
+	if d, err := fs.ManagedCheckinDecide(renv, "b", epochB); err != nil || d.Status != 0 {
+		t.Fatalf("release b: d=%+v err=%v", d, err)
+	}
+	late := []ManagedFlushRow{
+		{Seq: 5, CheckoutPath: "a", CheckoutEpoch: epochA, Record: wal.Record{Op: wal.OpCreate, Path: "a/must-not-apply", Mode: 0o644}},
+		{Seq: 6, CheckoutPath: "b", CheckoutEpoch: epochB, Record: wal.Record{Op: wal.OpCreate, Path: "b/stale", Mode: 0o644}},
+	}
+	if _, err := fs.ManagedFlushApply(a, "wb-mixed", end, flushDigests(t, end, late), late, "M"); !errors.Is(err, ErrSessionStale) {
+		t.Fatalf("mixed stale batch: %v, want ErrSessionStale", err)
+	}
+	if _, err := fs.Stat("a/must-not-apply"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mixed stale batch partially applied scope a: %v", err)
+	}
+	if view, ok, _ := fs.ManagedWritebackState("wb-mixed"); !ok || view.Through != 4 || view.Digest != end {
+		t.Fatalf("stale mixed batch advanced stream: view=%+v ok=%v", view, ok)
 	}
 }
 
@@ -546,15 +628,16 @@ func TestManagedFlushGroupCrashKeepsRowAtomicity(t *testing.T) {
 		{Seq: 2, Record: wal.Record{Op: wal.OpCreate, Path: "ws/x", Mode: 0o644}},
 		{Seq: 3, Record: wal.Record{Op: wal.OpWrite, Path: "ws/x", Data: []byte("v1")}},
 	}
+	rows = flushRowsForScope(rows, "ws", epoch)
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	if _, err := fs.ManagedFlushApply(a, "wb", "ws", epoch, prev, end, rows, "M"); err == nil {
+	if _, err := fs.ManagedFlushApply(a, "wb", prev, end, rows, "M"); err == nil {
 		t.Fatal("injected append failure did not surface")
 	}
 	if _, ok, _ := fs.ManagedWritebackState("wb"); ok {
 		t.Fatal("failed group advanced the stream ledger")
 	}
-	through, err := fs.ManagedFlushApply(a, "wb", "ws", epoch, prev, end, rows, "M")
+	through, err := fs.ManagedFlushApply(a, "wb", prev, end, rows, "M")
 	if err != nil || through != 3 {
 		t.Fatalf("retry flush: through=%d err=%v", through, err)
 	}
@@ -572,9 +655,10 @@ func TestManagedWritebackRecoveryLifecycle(t *testing.T) {
 		{Seq: 1, Record: wal.Record{Op: wal.OpMkdir, Path: "ws", Mode: 0o755}},
 		{Seq: 2, Record: wal.Record{Op: wal.OpCreate, Path: "ws/a", Mode: 0o644}},
 	}
+	rows = flushRowsForScope(rows, "ws", epoch)
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	if _, err := fs.ManagedFlushApply(a, "wb", "ws", epoch, prev, end, rows, "M"); err != nil {
+	if _, err := fs.ManagedFlushApply(a, "wb", prev, end, rows, "M"); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	// The holder dies without a clean release: the scope is recovery-
@@ -597,9 +681,9 @@ func TestManagedWritebackRecoveryLifecycle(t *testing.T) {
 	if err != nil || len(conflicts) != 0 {
 		t.Fatalf("rebind: conflicts=%v err=%v", conflicts, err)
 	}
-	tail := []ManagedFlushRow{{Seq: 3, Record: wal.Record{Op: wal.OpWrite, Path: "ws/a", Data: []byte("recovered")}}}
+	tail := flushRowsForScope([]ManagedFlushRow{{Seq: 3, Record: wal.Record{Op: wal.OpWrite, Path: "ws/a", Data: []byte("recovered")}}}, "ws", epoch)
 	tailEnd := flushDigests(t, end, tail)
-	if _, err := fs.ManagedFlushApply(b, "wb", "ws", epoch, end, tailEnd, tail, "M"); err != nil {
+	if _, err := fs.ManagedFlushApply(b, "wb", end, tailEnd, tail, "M"); err != nil {
 		t.Fatalf("recovery flush: %v", err)
 	}
 	data := make([]byte, 16)

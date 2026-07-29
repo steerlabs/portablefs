@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -72,92 +71,17 @@ func TestFillAttrDefaultsAndIdentity(t *testing.T) {
 	}
 }
 
-func TestSessionTokenSourceStaticAndRefresh(t *testing.T) {
-	static := &sessionTokenSource{token: "tok_static"}
-	if got := static.get(); got != "tok_static" {
-		t.Fatalf("static token: %q", got)
-	}
-
-	refreshed := 0
+func TestSessionTokenSourceOnlyAdvancesExplicitly(t *testing.T) {
 	src := &sessionTokenSource{
 		token:       "tok_old",
-		expiresAtMs: time.Now().UnixMilli() - 1, // already expired
-		refresh: func() (*accessSession, error) {
-			refreshed++
-			return &accessSession{Token: "tok_new", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
-		},
+		expiresAtMs: time.Now().UnixMilli() - 1,
 	}
-	if got := src.get(); got != "tok_new" || refreshed != 1 {
-		t.Fatalf("expired token must refresh: %q (refreshed %d)", got, refreshed)
+	if got := src.get(); got != "tok_old" {
+		t.Fatalf("expired token must not trigger hidden resolution: %q", got)
 	}
-	if got := src.get(); got != "tok_new" || refreshed != 1 {
-		t.Fatalf("fresh token must not re-refresh: %q (refreshed %d)", got, refreshed)
-	}
-}
-
-// TestSessionTokenSourceRefreshFeedbackNoDeadlock pins a wedge fix: the real
-// refresh closure feeds the fresh lease back through keeper.adopt → setToken
-// while the refresh is still in flight. get() used to hold the token mutex
-// across the refresh call, so that echo self-deadlocked and the mount hung on
-// the next reconnect handshake. get() must complete and serve the new token.
-func TestSessionTokenSourceRefreshFeedbackNoDeadlock(t *testing.T) {
-	src := &sessionTokenSource{token: "tok_old", expiresAtMs: time.Now().UnixMilli() - 1}
-	src.refresh = func() (*accessSession, error) {
-		src.setToken("tok_adopted", time.Now().Add(time.Hour).UnixMilli())
-		return &accessSession{Token: "tok_new", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
-	}
-	done := make(chan string, 1)
-	go func() { done <- src.get() }()
-	select {
-	case got := <-done:
-		if got != "tok_new" {
-			t.Fatalf("get() after feedback refresh = %q, want tok_new", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("get() deadlocked while the refresh fed tokens back through setToken")
-	}
-}
-
-// TestSessionTokenSourceRefreshNow pins the reactive path used on router
-// token rejection: refreshNow re-resolves immediately regardless of expiry
-// and installs the fresh credential; without a refresh function (--addr
-// static-token mounts) it reports false and changes nothing.
-func TestSessionTokenSourceRefreshNow(t *testing.T) {
-	static := &sessionTokenSource{token: "tok_static"}
-	if static.refreshNow() {
-		t.Fatal("static mounts have nothing to re-resolve")
-	}
-	if got := static.get(); got != "tok_static" {
-		t.Fatalf("static token must survive a refreshNow no-op: %q", got)
-	}
-
-	refreshed := 0
-	src := &sessionTokenSource{
-		token: "tok_current",
-		// Far from expiry: rejection is PROOF the token is dead (epoch-keyed
-		// HMAC), so refreshNow must not consult the clock.
-		expiresAtMs: time.Now().Add(time.Hour).UnixMilli(),
-		refresh: func() (*accessSession, error) {
-			refreshed++
-			return &accessSession{Token: "tok_fresh", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
-		},
-	}
-	if !src.refreshNow() {
-		t.Fatal("refreshNow with a working resolver must succeed")
-	}
-	if refreshed != 1 || src.get() != "tok_fresh" {
-		t.Fatalf("refreshNow must install the re-resolved token: refreshed=%d token=%q", refreshed, src.get())
-	}
-
-	failing := &sessionTokenSource{
-		token:   "tok_kept",
-		refresh: func() (*accessSession, error) { return nil, errors.New("manager down") },
-	}
-	if failing.refreshNow() {
-		t.Fatal("a failed re-resolve must report false")
-	}
-	if got := failing.get(); got != "tok_kept" {
-		t.Fatalf("a failed re-resolve must not clobber the token: %q", got)
+	src.setToken("tok_renewed", time.Now().Add(time.Hour).UnixMilli())
+	if got := src.get(); got != "tok_renewed" {
+		t.Fatalf("explicit lease renewal token = %q", got)
 	}
 }
 
@@ -311,6 +235,12 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 	})
 	mux.HandleFunc("/v1/attaches/att_test1", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
+			if deleted != "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":"unknown attach"}`))
+				return
+			}
 			deleted = "att_test1"
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -350,6 +280,9 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 	}
 	if deleted != "att_test1" {
 		t.Fatal("delete did not address the attach ref")
+	}
+	if err := ctl.deleteAttach(ref); err != nil {
+		t.Fatalf("repeated delete of an already-absent attach must converge: %v", err)
 	}
 
 	// A typed daemon refusal surfaces its envelope, bounded.

@@ -963,7 +963,7 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	rec := a.registerLocked(newp, attr)
+	rec := a.registerHardLinkAliasLocked(newp, src, attr)
 	a.mu.Unlock()
 	a.flushBindingDelta()
 	return &pfslocal.HardLinkReply{

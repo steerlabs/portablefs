@@ -555,8 +555,10 @@ func (s *mutationSequencer) waitApplied(target uint64) error {
 
 // ManagedFlushRow is one write-back record with its global stream sequence.
 type ManagedFlushRow struct {
-	Seq    uint64
-	Record wal.Record
+	Seq           uint64
+	Record        wal.Record
+	CheckoutPath  string
+	CheckoutEpoch string
 }
 
 // ErrWritebackCorrupt is the definite verdict that a flush contradicted the
@@ -616,35 +618,49 @@ func pathWithinClean(p, root string) bool {
 	return len(p) > len(root) && p[:len(root)] == root && p[len(root)] == '/'
 }
 
-func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string, prevDigest, endDigest [32]byte, rows []ManagedFlushRow, owner string) (uint64, error) {
+func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDigest, endDigest [32]byte, rows []ManagedFlushRow, owner string) (uint64, error) {
 	if fs.managed == nil {
 		return 0, ErrNotManaged
-	}
-	canonical := cleanPath(checkoutPath)
-	epoch := pfc2.Epoch(checkoutEpoch)
-	if err := epoch.Validate(); err != nil {
-		return 0, invalidMutation("flush checkout epoch: %v", err)
 	}
 	durable := uint64(0)
 	digest := digestZeroStream()
 	if view, ok := fs.managed.applied.StreamState(writebackID); ok {
 		durable, digest = view.Through, view.Digest
 	}
-	// The grant must be live and stream-bound at admission; each row's
-	// FlushAdvance re-validates it at its own ordered position.
-	g, ok := fs.managed.reserved.CheckoutAt(canonical)
-	if !ok || g.Holder != ref || g.Epoch != epoch || g.Recovery {
-		return durable, ErrSessionStale
+	type grantKey struct {
+		path  string
+		epoch pfc2.Epoch
 	}
-	if g.WritebackID != writebackID {
-		// The bound stream ID is a recovery CAPABILITY: never disclose it to
-		// a caller presenting a different one.
-		return durable, fmt.Errorf("%w: grant %q is bound to a different write-back stream", ErrWritebackCorrupt, canonical)
+	grants := make(map[grantKey]struct{}, len(rows))
+	for i := range rows {
+		rows[i].CheckoutPath = cleanPath(rows[i].CheckoutPath)
+		epoch := pfc2.Epoch(rows[i].CheckoutEpoch)
+		if err := epoch.Validate(); err != nil {
+			return durable, invalidMutation("flush checkout epoch: %v", err)
+		}
+		key := grantKey{path: rows[i].CheckoutPath, epoch: epoch}
+		if _, checked := grants[key]; checked {
+			continue
+		}
+		// Every grant must be live and stream-bound at admission; each row's
+		// FlushAdvance re-validates it at its own ordered position.
+		g, ok := fs.managed.reserved.CheckoutAt(key.path)
+		if !ok || g.Holder != ref || g.Epoch != key.epoch || g.Recovery {
+			return durable, ErrSessionStale
+		}
+		if g.WritebackID != writebackID {
+			// The bound stream ID is a recovery CAPABILITY: never disclose it
+			// to a caller presenting a different one.
+			return durable, fmt.Errorf("%w: grant %q is bound to a different write-back stream", ErrWritebackCorrupt, key.path)
+		}
+		grants[key] = struct{}{}
 	}
 	var specs []entrySpec
 	next := durable
 	applied := false
 	for _, row := range rows {
+		canonical := row.CheckoutPath
+		epoch := pfc2.Epoch(row.CheckoutEpoch)
 		if row.Record.Op.IsControl() || row.Record.Op.IsBatch() {
 			return durable, invalidMutation("managed flush records must be plain user mutations (watermarks ride natively as FlushAdvance)")
 		}

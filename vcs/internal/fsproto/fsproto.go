@@ -52,7 +52,7 @@ const (
 	OpRenewOpenInodes   // renew leases for the open (still-named) inos this mount holds open
 
 	// ---- exact mount sessions. Sessions, journaled coordination, and the
-	// exact-once mutation envelope are MANDATORY in the v6 baseline: every
+	// exact-once mutation envelope are MANDATORY in the v7 baseline: every
 	// mutation carries Request.Env, and the session ops below are the only
 	// way to acquire one.
 	OpSessionOpen   // establish (or idempotently re-establish) a mount session identity
@@ -60,10 +60,10 @@ const (
 	OpSessionAttach // authenticate an existing session onto THIS connection (no durable renewal)
 	OpSessionExpire // voluntarily fence THIS session generation (clean unmount); its lease-owned state is released
 
-	// ---- open-registration batching (mandatory in v6).
+	// ---- open-registration batching (mandatory in v7).
 	OpUnmarkOpenInodes // clear this mount's open holds for a batch of inos (deferred/batched last-close unmarks)
 
-	// ---- extended attributes (mandatory in v6). Reads (get/list) are pure
+	// ---- extended attributes (mandatory in v7). Reads (get/list) are pure
 	// reads; set/remove are journaled mutations that ride the exact-once
 	// path exactly like OpCreate/OpWrite.
 	OpGetxattr    // read one attribute value (Path/HandleIno + XattrName)
@@ -71,11 +71,11 @@ const (
 	OpListxattr   // list attribute names (Path/HandleIno)
 	OpRemovexattr // remove one attribute (ENODATA when absent)
 
-	// ---- hard links (mandatory in v6). Path is the existing source name
+	// ---- hard links (mandatory in v7). Path is the existing source name
 	// and NewPath is the new directory entry.
 	OpLink
 
-	// ---- adaptive write-back delegations (mandatory in v6). The authority
+	// ---- adaptive write-back delegations (mandatory in v7). The authority
 	// owns the grant decision; the client engine acknowledges locally only
 	// under an active grant. SessionID carries the mount stream id
 	// (writebackID) on all four.
@@ -324,9 +324,10 @@ type Request struct {
 
 	// ---- journaled-coordination (managed) fields ----
 
-	// CheckoutPath/CheckoutEpoch name the durable checkout grant a managed
-	// flush rides (OpFlushBatch) or releases (OpCheckin). The epoch is the
-	// server-controlled monotonic grant identity OpCheckout returned.
+	// CheckoutPath/CheckoutEpoch name the durable checkout grant released by
+	// OpCheckin. OpFlushBatch carries ordered mixed-scope runs in WBScopes.
+	// The epoch is the server-controlled monotonic grant identity
+	// OpCheckout returned.
 	CheckoutPath  string
 	CheckoutEpoch string
 
@@ -352,6 +353,8 @@ type Request struct {
 	WBPrevDigest []byte
 	WBEndDigest  []byte
 	// WBScopes names the delegations an OpWritebackRebind/Discard resolves.
+	// For OpFlushBatch it is an ordered run table: Through is the last global
+	// stream sequence authorized by Path/Epoch.
 	WBScopes []WBScope
 	// WBThrough is the recovering stream's claimed durable watermark
 	// (OpWritebackRebind; verified with WBPrevDigest as the digest at it).
@@ -364,8 +367,9 @@ type Request struct {
 
 // WBScope names one delegation grant of a write-back stream.
 type WBScope struct {
-	Path  string
-	Epoch string
+	Path    string
+	Epoch   string
+	Through uint64
 }
 
 // WBConflict is one typed write-back recovery conflict.

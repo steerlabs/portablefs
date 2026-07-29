@@ -35,10 +35,21 @@ type persistedAttachEntry struct {
 }
 
 type persistedItemRecord struct {
-	Path           string `json:"path"`
-	ItemID         uint64 `json:"itemId"`
-	ItemGeneration uint64 `json:"itemGeneration"`
-	AuthorityIno   bool   `json:"authorityIno,omitempty"`
+	Path            string `json:"path"`
+	ItemID          uint64 `json:"itemId"`
+	ItemGeneration  uint64 `json:"itemGeneration"`
+	AuthorityIno    bool   `json:"authorityIno,omitempty"`
+	AuthorityItemID uint64 `json:"authorityItemId,omitempty"`
+}
+
+func (i persistedItemRecord) authorityItemID() uint64 {
+	if i.AuthorityItemID != 0 {
+		return i.AuthorityItemID
+	}
+	if i.AuthorityIno {
+		return i.ItemID
+	}
+	return 0
 }
 
 func loadPersistedAttaches(stateDir string) []persistedAttachEntry {
@@ -109,7 +120,7 @@ func validatePersistedAttach(e persistedAttachEntry) error {
 
 func sanitizePersistedItems(e persistedAttachEntry, attachIndex int, registryPath string) []persistedItemRecord {
 	out := make([]persistedItemRecord, 0, len(e.Items))
-	seenIDAuth := map[uint64]bool{}
+	seenIDAuth := map[uint64]uint64{}
 	seenPath := map[string]struct{}{}
 	for i, item := range e.Items {
 		if item.ItemID == 0 {
@@ -132,12 +143,19 @@ func sanitizePersistedItems(e persistedAttachEntry, attachIndex int, registryPat
 			log.Printf("portablefsd: skipping duplicate item path %q for attach entry %d in %s", cleanPath, attachIndex, registryPath)
 			continue
 		}
-		if auth, dup := seenIDAuth[item.ItemID]; dup && auth != item.AuthorityIno {
+		authorityItemID := item.authorityItemID()
+		if auth, dup := seenIDAuth[item.ItemID]; dup && auth != authorityItemID {
 			log.Printf("portablefsd: skipping item id %d with conflicting authority identity for attach entry %d in %s", item.ItemID, attachIndex, registryPath)
 			continue
 		}
+		item.AuthorityIno = authorityItemID != 0
+		if authorityItemID == item.ItemID {
+			item.AuthorityItemID = 0
+		} else {
+			item.AuthorityItemID = authorityItemID
+		}
 		item.Path = cleanPath
-		seenIDAuth[item.ItemID] = item.AuthorityIno
+		seenIDAuth[item.ItemID] = authorityItemID
 		seenPath[cleanPath] = struct{}{}
 		out = append(out, item)
 	}

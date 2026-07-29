@@ -148,10 +148,16 @@ final class DaemonSupervisor {
             "-control-socket", controlSocketPath,
             "-state-dir", stateDirectory
         ]
-        if let log = openLogHandle() {
-            child.standardOutput = log
-            child.standardError = log
+        let log: FileHandle
+        do {
+            log = try openLogHandle()
+        } catch {
+            status = .failed(message: "Could not open daemon log \(logPath): \(error.localizedDescription)")
+            healthy = false
+            return
         }
+        child.standardOutput = log
+        child.standardError = log
         child.terminationHandler = { [weak self] finished in
             let reason = finished.terminationReason == .uncaughtSignal
                 ? "signal \(finished.terminationStatus)"
@@ -259,16 +265,16 @@ final class DaemonSupervisor {
         (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/PortableFS/portablefsd.log")
     }
 
-    private func openLogHandle() -> FileHandle? {
+    private func openLogHandle() throws -> FileHandle {
         let directory = (logPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: logPath) {
-            FileManager.default.createFile(atPath: logPath, contents: nil)
+            guard FileManager.default.createFile(atPath: logPath, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
         }
-        guard let handle = FileHandle(forWritingAtPath: logPath) else {
-            return nil
-        }
-        _ = try? handle.seekToEnd()
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: logPath))
+        try handle.seekToEnd()
         return handle
     }
 }

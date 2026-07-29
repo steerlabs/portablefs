@@ -17,9 +17,17 @@ enum MountCommandError: Error, CustomStringConvertible {
 /// FSKit verification loop and the live 15-check battery use:
 /// `/sbin/mount -t pfs pfs://<attachRef> <mountPath>`.
 enum MountCommand {
+    static func hasLiveMount(attachRef: String, mountPath: String) -> Bool {
+        MountTable.current().contains {
+            $0.mountPoint == mountPath &&
+                $0.fsTypeName == MountTable.portableFSRuntimeTypeName &&
+                $0.mountedFrom == "pfs://\(attachRef)"
+        }
+    }
+
     static func mount(attachRef: String, mountPath: String) async throws {
         try await run([
-            "/sbin/mount", "-t", MountTable.portableFSTypeName,
+            "/sbin/mount", "-t", MountTable.portableFSRegistrationTypeName,
             "pfs://\(attachRef)", mountPath,
         ])
     }
@@ -35,8 +43,8 @@ enum MountCommand {
         var lastDetail = "mount is not in the kernel mount table"
         while clock.now < deadline {
             if let mount = MountTable.current().first(where: { $0.mountPoint == mountPath }) {
-                if mount.fsTypeName != MountTable.portableFSTypeName {
-                    lastDetail = "filesystem type is \(mount.fsTypeName), expected \(MountTable.portableFSTypeName)"
+                if mount.fsTypeName != MountTable.portableFSRuntimeTypeName {
+                    lastDetail = "filesystem type is \(mount.fsTypeName), expected \(MountTable.portableFSRuntimeTypeName)"
                 } else if mount.mountedFrom != expectedSource {
                     lastDetail = "mount source is \(mount.mountedFrom), expected \(expectedSource)"
                 } else {
@@ -57,22 +65,10 @@ enum MountCommand {
         )
     }
 
-    /// `/sbin/umount` first, `diskutil unmount` as fallback — the same
-    /// attempt order as the Go CLI's platformUnmount for darwin.
+    /// One explicit kernel-unmount path. A failure is surfaced to the caller;
+    /// the app never switches to a second command with different semantics.
     static func unmount(mountPath: String) async throws {
-        do {
-            try await run(["/sbin/umount", mountPath])
-        } catch {
-            do {
-                try await run(["/usr/sbin/diskutil", "unmount", mountPath])
-            } catch let diskutilError {
-                throw MountCommandError.failed(
-                    command: "umount + diskutil unmount \(mountPath)",
-                    exitCode: 1,
-                    output: "\(error)\n\(diskutilError)"
-                )
-            }
-        }
+        try await run(["/sbin/umount", mountPath])
     }
 
     private static func run(_ argv: [String]) async throws {

@@ -25,7 +25,7 @@ func TestProtocolVersionMismatchIsClear(t *testing.T) {
 	err := &ErrProtocolVersionMismatch{ServerVersion: 4}
 	if msg := err.Error(); msg == "" {
 		t.Fatal("mismatch error must carry a message")
-	} else if want := "protocol version 4"; !contains(msg, want) || !contains(msg, "requires exactly 6") {
+	} else if want := "protocol version 4"; !contains(msg, want) || !contains(msg, "requires exactly 7") {
 		t.Fatalf("mismatch error %q must name both versions", msg)
 	}
 	// A pre-negotiation authority (probe rejected / no version) is reported

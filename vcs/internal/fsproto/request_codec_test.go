@@ -87,7 +87,7 @@ func TestRequestCodecRoundTripAllFields(t *testing.T) {
 
 		WBPrevDigest: []byte("previous"),
 		WBEndDigest:  []byte("end"),
-		WBScopes:     []WBScope{{Path: "scope", Epoch: "epoch"}},
+		WBScopes:     []WBScope{{Path: "scope", Epoch: "epoch", Through: 125}},
 		WBThrough:    127,
 		AckPos:       131,
 	}

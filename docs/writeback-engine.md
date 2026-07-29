@@ -104,8 +104,8 @@ vcs/internal/writeback/
   covering delegation first, then execute on the shared lane
   (`Engine.ReleaseFor`). Xattrs on locally-born objects remain in the
   delegated WAL when the authority advertised `FeatureDelegatedXattrs`;
-  older v6 authorities select the shared xattr lane from the version probe,
-  before any mutation is attempted. Server-side, a same-session
+  v7 authorities without the delegated-xattr feature select the shared xattr
+  lane from the version probe, before any mutation is attempted. Server-side, a same-session
   write-through mutation does not bypass the peer gate — it recalls the
   holder's own grant — which is what makes the grant-time children snapshot
   exact against same-session races.
@@ -164,7 +164,7 @@ Hard bounds, no spill: a mutation that would grow a directory view past
 delegation, and runs write-through; `MergeReaddir` never claims completeness
 for an oversize listing. Overlay memory is bounded by construction.
 
-## Authority side (fsproto v6 + workfs + pfc2)
+## Authority side (fsproto v7 + workfs + pfc2)
 
 - `OpDelegationAcquire`: exact-identity op whose outcome is RESOLVED — a
   sent-but-unanswered request replays the identical identity until the stored
@@ -182,10 +182,12 @@ for an oversize listing. Overlay memory is bounded by construction.
   foreign active delegation publish a recall and wait bounded; still-held →
   EAGAIN. Write-through MUTATIONS also gate against the caller's OWN grant.
   Recovery-required scopes → EAGAIN until rebound or discarded.
-- Flush: `OpFlushBatch` ships dense per-scope runs of the mount stream with a
-  chained stream digest; `FlushAdvance` rows commit tree state + watermark +
-  digest atomically. Requests are decoded under an aggregate byte budget
-  (oversize frames drop before allocation).
+- Flush: `OpFlushBatch` ships one dense global mount-stream batch plus an
+  ordered table of scope/epoch runs. Every row is checked against its matching
+  live grant, then all tree changes and `FlushAdvance` watermarks commit as
+  one atomic group with one chained stream digest. Interleaved scopes therefore
+  batch efficiently without weakening ordering or grant fencing. Requests are
+  decoded under an aggregate byte budget (oversize frames drop before allocation).
 - `OpWritebackState` reads the stream watermark/digest. `OpWritebackRebind`
   atomically fences a dead holder session and rebinds its recovery scopes to
   the caller after verifying stream identity + digest. `OpWritebackDiscard`

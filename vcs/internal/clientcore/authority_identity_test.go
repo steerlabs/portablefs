@@ -7,7 +7,7 @@ func TestLocalNodeAuthorityIdentityIsExactAndImmutable(t *testing.T) {
 	if n.MatchesAuthorityIno(44) {
 		t.Fatal("unbound local node matched an authority inode")
 	}
-	if !n.recordAuthorityIno(44) {
+	if !n.RecordAuthorityIno(44) {
 		t.Fatal("first proven authority binding was rejected")
 	}
 	if !n.MatchesAuthorityIno(44) {
@@ -16,7 +16,7 @@ func TestLocalNodeAuthorityIdentityIsExactAndImmutable(t *testing.T) {
 	if n.MatchesAuthorityIno(45) {
 		t.Fatal("node matched a different authority inode")
 	}
-	if n.recordAuthorityIno(45) {
+	if n.RecordAuthorityIno(45) {
 		t.Fatal("instantiated node accepted an authority identity change")
 	}
 	if !n.MatchesAuthorityIno(44) {

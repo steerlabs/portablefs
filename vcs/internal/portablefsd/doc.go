@@ -12,7 +12,7 @@
 // authority, while objects born inside a delegation keep their complete
 // xattr map in the same local WAL lane as file data. macOS therefore avoids
 // both AppleDouble ._ sidecars and a WAN drain/release cycle for each new
-// file. An earlier v6 authority that does not advertise delegated xattrs
+// file. An v7 authority without the delegated-xattr feature that does not advertise delegated xattrs
 // still serves the same operations through the exact authority lane selected
 // during protocol negotiation.
 //

@@ -59,6 +59,9 @@ func TestDelegatedCreateStormZeroRemoteCalls(t *testing.T) {
 	if acquires0 != 1 {
 		t.Fatalf("first create acquired %d delegations, want 1", acquires0)
 	}
+	if scope, res := e.Lookup("w/pkg"); res != LookupHit || scope.Kind != "directory" {
+		t.Fatalf("delegated scope getattr = %+v/%v, want authoritative directory hit", scope, res)
+	}
 	// Hold the flusher back during the storm so batch formation is
 	// deterministic: the drain below must ship the backlog in full batches.
 	auth.mu.Lock()
@@ -95,6 +98,127 @@ func TestDelegatedCreateStormZeroRemoteCalls(t *testing.T) {
 	_, flushes, _ := auth.calls()
 	if got := flushes - flushes0; got < 1 || got > 8 {
 		t.Fatalf("drain shipped the storm in %d RPCs, want ~4 full batches", got)
+	}
+}
+
+func TestInterleavedDelegationsFlushAsOneGlobalBatch(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["a"] = true
+	auth.dirs["b"] = true
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+
+	// Prevent the age timer from dispatching a prefix while the test admits
+	// the interleaved stream. DrainAll clears this steady-state backoff and
+	// asks for an immediate global batch.
+	e.fl.mu.Lock()
+	e.fl.nextAttempt = time.Now().Add(time.Hour)
+	e.fl.mu.Unlock()
+	for i := 0; i < 8; i++ {
+		scope := "a"
+		if i%2 == 1 {
+			scope = "b"
+		}
+		path := fmt.Sprintf("%s/f%d", scope, i)
+		_, handled, err := e.Create(ctx, path, 0o644, false, false)
+		mustHandled(t, "mixed create "+path, handled, err)
+		_, handled, err = e.WriteAt(ctx, path, 0, []byte(path))
+		mustHandled(t, "mixed write "+path, handled, err)
+	}
+	if err := e.DrainAll(ctx); err != nil {
+		t.Fatalf("mixed drain: %v", err)
+	}
+	auth.mu.Lock()
+	flushes := auth.flushes
+	auth.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("16 interleaved records shipped in %d authority RPCs, want one global batch", flushes)
+	}
+	for i := 0; i < 8; i++ {
+		scope := "a"
+		if i%2 == 1 {
+			scope = "b"
+		}
+		path := fmt.Sprintf("%s/f%d", scope, i)
+		if err := auth.equalFile(path, []byte(path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCrashRecoveryReplaysInterleavedScopesAsOneBatch(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["a"] = true
+	auth.dirs["b"] = true
+	auth.mu.Unlock()
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	e1, err := Open(ctx, Config{
+		StateDir: dir, VolumeID: "vol", Branch: "main", Remote: auth,
+		BudgetBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("open first engine: %v", err)
+	}
+	e1.fl.mu.Lock()
+	e1.fl.nextAttempt = time.Now().Add(time.Hour)
+	e1.fl.mu.Unlock()
+	for i := 0; i < 8; i++ {
+		scope := "a"
+		if i%2 == 1 {
+			scope = "b"
+		}
+		path := fmt.Sprintf("%s/recovered-%d", scope, i)
+		_, handled, err := e1.Create(ctx, path, 0o644, false, false)
+		mustHandled(t, "recovery create "+path, handled, err)
+	}
+	if err := e1.SyncLocal(); err != nil {
+		t.Fatalf("sync crash tail: %v", err)
+	}
+	e1.cancelCtx()
+	e1.fl.stop()
+	if err := e1.wal.Close(); err != nil {
+		t.Fatalf("close crash WAL: %v", err)
+	}
+	if err := e1.lock.Close(); err != nil {
+		t.Fatalf("release crash lock: %v", err)
+	}
+
+	e2, err := Open(ctx, Config{
+		StateDir: dir, VolumeID: "vol", Branch: "main", Remote: auth,
+		BudgetBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("open recovery engine: %v", err)
+	}
+	defer func() { _, _ = e2.ForceClose("test teardown") }()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(e2.Status().Jobs) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("mixed recovery did not resolve: %+v", e2.Status().Jobs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	auth.mu.Lock()
+	flushes := auth.flushes
+	rebinds := auth.rebinds
+	auth.mu.Unlock()
+	if flushes != 1 || rebinds != 1 {
+		t.Fatalf("mixed recovery RPCs: flushes=%d rebinds=%d, want one of each", flushes, rebinds)
+	}
+	for i := 0; i < 8; i++ {
+		scope := "a"
+		if i%2 == 1 {
+			scope = "b"
+		}
+		path := fmt.Sprintf("%s/recovered-%d", scope, i)
+		if err := auth.equalFile(path, nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -577,6 +701,48 @@ func TestClientKillRecovery(t *testing.T) {
 	}
 	if streams, _ := filepath.Glob(filepath.Join(dir, "stream-*")); len(streams) != 0 {
 		t.Fatalf("recovered stream dirs not removed: %v", streams)
+	}
+}
+
+func TestCleanCloseRemountNeverReusesWritebackIdentity(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	e1, err := Open(ctx, Config{StateDir: dir, VolumeID: "vol", Branch: "main", Remote: auth})
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if _, handled, err := e1.Create(ctx, "d/first", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("first create: handled=%v err=%v", handled, err)
+	}
+	if err := e1.Close(ctx); err != nil {
+		t.Fatalf("first clean close: %v", err)
+	}
+	firstID, firstEpoch := e1.writebackID, e1.epoch
+	if streams, _ := filepath.Glob(filepath.Join(dir, "stream-*")); len(streams) != 0 {
+		t.Fatalf("clean close retained stream directories: %v", streams)
+	}
+
+	e2, err := Open(ctx, Config{StateDir: dir, VolumeID: "vol", Branch: "main", Remote: auth})
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	defer func() { _, _ = e2.ForceClose("test teardown") }()
+	if e2.writebackID == firstID || e2.epoch <= firstEpoch {
+		t.Fatalf("clean remount reused stream identity: first=%s/%d second=%s/%d", firstID, firstEpoch, e2.writebackID, e2.epoch)
+	}
+	if _, handled, err := e2.Create(ctx, "d/second", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("second create: handled=%v err=%v", handled, err)
+	}
+	if err := e2.DrainAll(ctx); err != nil {
+		t.Fatalf("second drain: %v", err)
+	}
+	if err := auth.equalFile("d/second", nil); err != nil {
+		t.Fatalf("second stream did not reach authority: %v", err)
 	}
 }
 

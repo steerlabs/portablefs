@@ -151,6 +151,7 @@ func (c *frontendConn) handle(ctx context.Context, env *pfslocal.Envelope) {
 }
 
 func (c *frontendConn) handleAttached(ctx context.Context, a *attach, requestID uint64, body any) {
+	started := time.Now()
 	var (
 		reply any
 		eno   int32
@@ -218,7 +219,7 @@ func (c *frontendConn) handleAttached(ctx context.Context, a *attach, requestID 
 		return
 	}
 	if pfsdTrace {
-		log.Printf("pfsd-trace %s eno=%d", traceOp(a, body), eno)
+		log.Printf("pfsd-trace %s eno=%d duration=%s", traceOp(a, body), eno, time.Since(started))
 	}
 	if eno != 0 {
 		c.errorReply(requestID, eno, errMessage(fmt.Sprintf("%T", body), eno))

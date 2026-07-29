@@ -15,7 +15,7 @@ package fsproto
 // The durable session/slot machinery lives in workfs (journaled PFC2
 // coordination rows); this file is the protocol-side admission and execution
 // logic on top of it. Envelope-less mutations are always refused: sessions
-// are mandatory in the v6 baseline.
+// are mandatory in the v7 baseline.
 
 import (
 	"crypto/sha256"
@@ -35,7 +35,7 @@ import (
 )
 
 // SessionStore is the authority FS's durable mount-session + exact-once slot
-// surface (workfs.FS). A v6 server requires one, and it must be MANAGED:
+// surface (workfs.FS). A v7 server requires one, and it must be MANAGED:
 // coordination state journals through the fenced entry log and recovers by
 // exact cold replay — no reclaim grace, no wall-time pruning.
 type SessionStore interface {
@@ -57,7 +57,7 @@ type SessionStore interface {
 	RecordStaticOutcome(env *wal.Envelope, status int32) error
 	MutateEnv(r wal.Record, owner string) (workfs.MutationResult, error)
 	// Managed reports whether this store journals through a fenced journal
-	// generation. Construction asserts it: a v6 server never serves a
+	// generation. Construction asserts it: a v7 server never serves a
 	// non-managed session store.
 	Managed() bool
 }
@@ -99,7 +99,7 @@ func newExactState(store SessionStore) *exactState {
 		// says which session owns every lock, checkout, pin, and outcome.
 		// The legacy in-memory coordination shadow (reclaim grace, wall-time
 		// pruning) no longer exists, so a non-managed store cannot be served.
-		panic("fsproto: a v6 server requires a MANAGED (journaled) session store")
+		panic("fsproto: a v7 server requires a MANAGED (journaled) session store")
 	}
 	return &exactState{
 		store:       store,

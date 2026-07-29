@@ -532,7 +532,7 @@ func TestExactWireBounds(t *testing.T) {
 	}
 }
 
-// TestEnvelopelessMutationsAlwaysRefused: the v6 baseline has no permissive
+// TestEnvelopelessMutationsAlwaysRefused: the v7 baseline has no permissive
 // posture — every envelope-less mutation and coordination op is refused,
 // while reads flow.
 func TestEnvelopelessMutationsAlwaysRefused(t *testing.T) {

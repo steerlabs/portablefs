@@ -1,4 +1,4 @@
-// Set your Apple Development team id here for signed local builds, e.g.
-// DEVELOPMENT_TEAM = AB12CD34EF
-// Unsigned CI-style builds use CODE_SIGNING_ALLOWED=NO and ignore this.
-DEVELOPMENT_TEAM =
+// PortableFS's signing team. Forks should override DEVELOPMENT_TEAM at build
+// time and register a matching application-group identifier.
+// Unsigned verification builds use CODE_SIGNING_ALLOWED=NO and ignore this.
+DEVELOPMENT_TEAM = B47U2LLKHW

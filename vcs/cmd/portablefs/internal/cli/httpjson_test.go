@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
@@ -159,39 +158,21 @@ func TestVersionHandshakeFailsFastBelowMinimum(t *testing.T) {
 	}
 }
 
-// TestVersionHandshakeDevBuildWarnsOnceAndProceeds: a non-semver build
-// ("portablefs dev") cannot be ordered against a release version, so it
-// warns exactly once per client — not once per poll — and keeps working.
-func TestVersionHandshakeDevBuildWarnsOnceAndProceeds(t *testing.T) {
-	var polls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(minCLIVersionHeader, "2.0.0")
-		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/activate-journal") {
-			if polls.Add(1) < 3 {
-				_, _ = w.Write([]byte(`{"state":"converting"}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"state":"active","branchMode":"managed_journal"}`))
-			return
-		}
-		w.WriteHeader(404)
-	}))
-	defer srv.Close()
-
+// TestVersionHandshakeDevBuildFailsClosed: a non-semver build cannot be
+// ordered against the server's minimum, so it must not bypass the exact
+// compatibility gate.
+func TestVersionHandshakeDevBuildFailsClosed(t *testing.T) {
+	srv := minVersionServer(t, "2.0.0")
 	e, _, stderr := testEnv(t)
 	e.version = "dev"
-	if rc := e.run([]string{"activate", "vol1", "--api-url", srv.URL, "--api-token", "tok"}); rc != 0 {
-		t.Fatalf("dev build must proceed, rc = %d, stderr: %s", rc, stderr.String())
-	}
-	if polls.Load() != 3 {
-		t.Fatalf("expected 3 polls, got %d", polls.Load())
+	if rc := e.run([]string{"ls", "--api-url", srv.URL, "--api-token", "tok"}); rc != 1 {
+		t.Fatalf("dev build must fail closed, rc = %d, stderr: %s", rc, stderr.String())
 	}
 	msg := stderr.String()
-	if got := strings.Count(msg, "portablefs: warning:"); got != 1 {
-		t.Fatalf("dev skew must warn exactly once, got %d: %q", got, msg)
-	}
-	if !strings.Contains(msg, "requires CLI 2.0.0 or newer") || !strings.Contains(msg, "curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh") {
-		t.Fatalf("dev warning must name the minimum and the upgrade command: %q", msg)
+	if !strings.Contains(msg, `non-release version "dev"`) ||
+		!strings.Contains(msg, "requires at least 2.0.0") ||
+		!strings.Contains(msg, upgradeCommand()) {
+		t.Fatalf("dev refusal must name the compatibility proof and release path: %q", msg)
 	}
 }
 
@@ -209,15 +190,17 @@ func TestVersionHandshakeMeetingMinimumPasses(t *testing.T) {
 	}
 }
 
-// TestVersionHandshakeUnparseableHeaderIgnored: a header the CLI cannot
-// order against ("latest") must never break the command — a server-side bug
-// must not take out every stale-looking client.
-func TestVersionHandshakeUnparseableHeaderIgnored(t *testing.T) {
+// TestVersionHandshakeUnparseableHeaderFailsClosed: an invalid server
+// minimum is not compatibility evidence.
+func TestVersionHandshakeUnparseableHeaderFailsClosed(t *testing.T) {
 	srv := minVersionServer(t, "latest")
 	e, _, stderr := testEnv(t)
 	e.version = "v0.0.1"
-	if rc := e.run([]string{"ls", "--api-url", srv.URL, "--api-token", "tok"}); rc != 0 {
-		t.Fatalf("rc = %d, stderr: %s", rc, stderr.String())
+	if rc := e.run([]string{"ls", "--api-url", srv.URL, "--api-token", "tok"}); rc != 1 {
+		t.Fatalf("rc = %d, want 1, stderr: %s", rc, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `advertised invalid minimum CLI version "latest"`) {
+		t.Fatalf("invalid minimum refusal: %q", stderr.String())
 	}
 }
 

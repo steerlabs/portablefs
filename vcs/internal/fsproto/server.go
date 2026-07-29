@@ -927,7 +927,7 @@ func (s *Server) dispatchConn(cs *connSession, req *Request) *Response {
 		return s.registerCreateOpen(cs, req, s.exactMutate(cs, req))
 	}
 	if mutatingOp(req.Op) || req.Op == OpReap {
-		// Envelope-less mutations do not exist in the v6 baseline: every
+		// Envelope-less mutations do not exist in the v7 baseline: every
 		// mutation carries an exact-once identity. An old client that
 		// ignored the probe's version refusal fails closed here.
 		return &Response{Status: EPERM}

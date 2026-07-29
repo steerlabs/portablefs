@@ -204,12 +204,9 @@ func TestRouterRejectionSurfacesTypedError(t *testing.T) {
 	}
 }
 
-// TestRouterRejectionCoalescesOneReresolveAcrossPool pins the single-flight
-// contract: a whole pool of connections hitting the same dead token after a
-// manager restart triggers exactly ONE credential re-resolve, every in-flight
-// idempotent op rides through on the fresh token with no user-visible error,
-// and recovery is immediate (no timed tick involved).
-func TestRouterRejectionCoalescesOneReresolveAcrossPool(t *testing.T) {
+// TestRouterRejectionFailsClosedAcrossPool verifies that a manager epoch
+// change cannot trigger credential re-resolution or retry behind the caller.
+func TestRouterRejectionFailsClosedAcrossPool(t *testing.T) {
 	_, backend := serveFS(t)
 	router := newFakeRouter(t, backend, "tok-epoch1")
 	src := &tokenCell{}
@@ -227,22 +224,15 @@ func TestRouterRejectionCoalescesOneReresolveAcrossPool(t *testing.T) {
 
 	// Manager restart: new epoch accepts only tok-epoch2; all tunnels die.
 	router.rotate("tok-epoch2")
-	var resolves atomic.Int64
-	cli.SetOnTokenRejected(func() bool {
-		resolves.Add(1)
-		src.set("tok-epoch2")
-		return true
-	})
 
-	start := time.Now()
 	var wg sync.WaitGroup
 	errs := make(chan error, pool)
 	for i := 0; i < pool; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, st, err := cli.Getattr("f.txt"); err != nil || st != OK {
-				errs <- fmt.Errorf("getattr through restarted router: st=%d err=%v", st, err)
+			if _, _, err := cli.Getattr("f.txt"); !errors.Is(err, ErrSessionTokenRejected) {
+				errs <- fmt.Errorf("getattr error = %v, want ErrSessionTokenRejected", err)
 			}
 		}()
 	}
@@ -251,112 +241,7 @@ func TestRouterRejectionCoalescesOneReresolveAcrossPool(t *testing.T) {
 	for e := range errs {
 		t.Fatal(e)
 	}
-	elapsed := time.Since(start)
-	if got := resolves.Load(); got != 1 {
-		t.Fatalf("re-resolves = %d, want exactly 1 for %d concurrent rejected dials", got, pool)
-	}
-	if elapsed > 5*time.Second {
-		t.Fatalf("recovery took %v, want seconds at most", elapsed)
-	}
-	t.Logf("recovered %d concurrent ops after a simulated manager restart in %v with 1 re-resolve", pool, elapsed)
-}
-
-// TestRouterRejectionRefreshFailureBacksOffThenRecovers: while the manager is
-// still down the re-resolver fails; its retries are paced (never hammered
-// inside the backoff window) and the mount keeps trying until the manager
-// returns — it must not wedge permanently, and it must not need a remount.
-func TestRouterRejectionRefreshFailureBacksOffThenRecovers(t *testing.T) {
-	_, backend := serveFS(t)
-	router := newFakeRouter(t, backend, "tok-epoch1")
-	src := &tokenCell{}
-	src.set("tok-epoch1")
-
-	cli, err := DialTLSAuth(router.addr(), 1, nil, src.get)
-	if err != nil {
-		t.Fatalf("dial through router: %v", err)
-	}
-	defer cli.Close()
-	if _, st, err := cli.Create("f.txt", 0o644); err != nil || st != OK {
-		t.Fatalf("seed create: st=%d err=%v", st, err)
-	}
-
-	router.rotate("tok-epoch2")
-	var resolves atomic.Int64
-	cli.SetOnTokenRejected(func() bool {
-		if resolves.Add(1) < 3 {
-			return false // manager still down
-		}
-		src.set("tok-epoch2")
-		return true
-	})
-
-	start := time.Now()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, st, err := cli.Getattr("f.txt"); err == nil && st == OK {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("mount wedged: no recovery after %d resolver attempts", resolves.Load())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := resolves.Load(); got != 3 {
-		t.Fatalf("resolver attempts = %d, want exactly 3 (two paced failures, then success)", got)
-	}
-	t.Logf("recovered after resolver came back, total %v", time.Since(start))
-}
-
-// TestRefreshRejectedTokenCoalescesByGeneration pins the mutex+generation
-// single flight at the unit level: a rejection whose dial predates the last
-// completed re-resolve retries without invoking the resolver again.
-func TestRefreshRejectedTokenCoalescesByGeneration(t *testing.T) {
-	c := &Client{}
-	var calls atomic.Int64
-	c.SetOnTokenRejected(func() bool { calls.Add(1); return true })
-
-	if !c.refreshRejectedToken(0) {
-		t.Fatal("first rejection must resolve")
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("resolver calls = %d, want 1", calls.Load())
-	}
-	// Same observed generation again: the completed re-resolve already
-	// installed a fresh credential — retry without resolving.
-	if !c.refreshRejectedToken(0) {
-		t.Fatal("stale-generation rejection must report fresh-credential-available")
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("stale-generation rejection re-ran the resolver: %d calls", calls.Load())
-	}
-	// The fresh token admits a dial (clears the resolver pacing window); a
-	// LATER rejection of the current generation's token is new information.
-	c.noteDialSuccess()
-	if !c.refreshRejectedToken(1) {
-		t.Fatal("current-generation rejection must resolve")
-	}
-	if calls.Load() != 2 {
-		t.Fatalf("resolver calls = %d, want 2", calls.Load())
-	}
-}
-
-// TestRefreshRejectedTokenPacesFailingResolver: a failing resolver is not
-// hammered — rejections inside the backoff window return without resolving.
-func TestRefreshRejectedTokenPacesFailingResolver(t *testing.T) {
-	c := &Client{}
-	var calls atomic.Int64
-	c.SetOnTokenRejected(func() bool { calls.Add(1); return false })
-	// Deterministic wide window so the second call lands inside it.
-	c.refreshBackoff = NewBackoff(time.Hour, time.Hour)
-	c.refreshBackoff.rand = func(n int64) int64 { return n - 1 }
-
-	if c.refreshRejectedToken(0) {
-		t.Fatal("failed resolve must report false")
-	}
-	if c.refreshRejectedToken(0) {
-		t.Fatal("inside the failure window there is no fresh credential")
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("resolver ran %d times inside the backoff window, want 1", calls.Load())
+	if got := src.get(); got != "tok-epoch1" {
+		t.Fatalf("rejection mutated credential to %q", got)
 	}
 }

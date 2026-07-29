@@ -677,8 +677,7 @@ type localDirsMountConfig struct {
 
 // mountFUSE dials the authority and mounts it at mountPath, wiring push
 // invalidation, open-lease renewal, and the default cache options. tokens
-// serves the live data-plane credential to reconnect handshakes and re-resolves
-// access when the router rejects the token (manager restart).
+// serves the one live lease's credential to reconnect handshakes.
 func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf perfOptions, localCfg localDirsMountConfig) (*fuseMount, error) {
 	tlsCfg, err := secure.ClientTLS()
 	if err != nil {
@@ -706,10 +705,8 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 		TLSConfig:        tlsCfg,
 		Owner:            "portablefs-" + randomID(),
 		CredentialSource: tokens.get,
-		// A router token rejection (manager restart, lease rotation) triggers
-		// an immediate access re-resolve instead of waiting for the
-		// keeper's timed renewal to discover the new epoch.
-		OnTokenRejected: tokens.refreshNow,
+		// A router token rejection fails closed. The lease keeper owns the
+		// sole credential-advance path and never mints a replacement lease.
 		// The write-back engine's durable state: keyed by (volume, branch)
 		// so a parked stream recovers on the next mount at ANY path.
 		WALDir:          perf.writebackDir,

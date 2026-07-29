@@ -66,7 +66,7 @@ type CoordinationStore interface {
 	ManagedWritebackState(writebackID string) (pfc2.StreamStateView, bool, error)
 	ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope, through uint64, digest [32]byte) ([]workfs.WritebackConflict, error)
 	ManagedWritebackDiscard(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope) error
-	ManagedFlushApply(ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string, prevDigest, endDigest [32]byte, rows []workfs.ManagedFlushRow, owner string) (uint64, error)
+	ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDigest, endDigest [32]byte, rows []workfs.ManagedFlushRow, owner string) (uint64, error)
 
 	SyncBarrier() error
 	WaitCoordinationClear(deadline time.Time, check func() bool) bool
@@ -574,12 +574,12 @@ func (s *Server) coordinateBarrier(cs *connSession, req *Request) *Response {
 	return resp
 }
 
-// flushBatchManaged applies one dense same-scope run of a mount write-back
-// stream as ordered PFJ3 rows (one record per row with its FlushAdvance in
-// the same row) after validating the attached session, the delegation grant,
-// and the per-record subtree bounds. The stream's durable watermark + digest
-// ARE the exactness: a lost-reply retry resends identical bytes and the
-// authority drops the covered prefix, so no per-RPC slot identity is needed.
+// flushBatchManaged applies one dense global run of a mount write-back stream
+// as ordered PFJ3 rows (one record per row with its FlushAdvance in the same
+// row) after validating the attached session, every delegation run, and the
+// per-record subtree bounds. The stream's durable watermark + digest ARE the
+// exactness: a lost-reply retry resends identical bytes and the authority
+// drops the covered prefix, so no per-RPC slot identity is needed.
 func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	store := s.coordStore()
 	if store == nil {
@@ -591,17 +591,49 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	if !s.admissible(cs.id) {
 		return nil // projected-expired lease: fail closed, consume nothing
 	}
-	if req.CheckoutPath == "" || req.CheckoutEpoch == "" || req.SessionID == "" {
+	if req.SessionID == "" || len(req.Records) == 0 || len(req.WBScopes) == 0 || len(req.WBScopes) > len(req.Records) {
 		return &Response{Status: EINVAL}
 	}
 	if len(req.Records) > MaxBatchRecords {
 		return &Response{Status: EINVAL}
 	}
+	for i, run := range req.WBScopes {
+		if run.Path == "" || run.Epoch == "" || run.Through == 0 {
+			return &Response{Status: EINVAL}
+		}
+		if i > 0 && run.Through <= req.WBScopes[i-1].Through {
+			return &Response{Status: EINVAL}
+		}
+	}
+	if req.WBScopes[len(req.WBScopes)-1].Through != req.Records[len(req.Records)-1].Seq {
+		return &Response{Status: EINVAL}
+	}
+	recordIndex := 0
+	for _, run := range req.WBScopes {
+		start := recordIndex
+		for recordIndex < len(req.Records) && req.Records[recordIndex].Seq <= run.Through {
+			recordIndex++
+		}
+		if recordIndex == start || req.Records[recordIndex-1].Seq != run.Through {
+			return &Response{Status: EINVAL}
+		}
+	}
+	if recordIndex != len(req.Records) {
+		return &Response{Status: EINVAL}
+	}
 	ref := pfc2.SessionRef{SessionID: cs.id, Generation: cs.gen}
-	cleanCheckout := cleanWirePath(req.CheckoutPath)
 	rows := make([]workfs.ManagedFlushRow, 0, len(req.Records))
+	runIndex := 0
 	for i := range req.Records {
 		r := req.Records[i]
+		for runIndex < len(req.WBScopes) && r.Seq > req.WBScopes[runIndex].Through {
+			runIndex++
+		}
+		if runIndex == len(req.WBScopes) {
+			return &Response{Status: EINVAL}
+		}
+		run := req.WBScopes[runIndex]
+		cleanCheckout := cleanWirePath(run.Path)
 		if r.Op.IsControl() {
 			// Managed flushes carry watermarks natively as FlushAdvance; a
 			// legacy control record here is a protocol violation.
@@ -619,7 +651,10 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 		}
 		seq := r.Seq
 		r.Seq = 0
-		rows = append(rows, workfs.ManagedFlushRow{Seq: seq, Record: r})
+		rows = append(rows, workfs.ManagedFlushRow{
+			Seq: seq, Record: r,
+			CheckoutPath: cleanCheckout, CheckoutEpoch: run.Epoch,
+		})
 	}
 	var prev, end [32]byte
 	if len(req.WBPrevDigest) == 32 {
@@ -628,7 +663,7 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	if len(req.WBEndDigest) == 32 {
 		copy(end[:], req.WBEndDigest)
 	}
-	through, err := store.ManagedFlushApply(ref, req.SessionID, req.CheckoutPath, req.CheckoutEpoch, prev, end, rows, cs.owner)
+	through, err := store.ManagedFlushApply(ref, req.SessionID, prev, end, rows, cs.owner)
 	if err != nil {
 		if errors.Is(err, workfs.ErrSessionStale) {
 			return &Response{Status: ESTALE, AppliedThrough: through}

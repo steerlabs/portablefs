@@ -181,9 +181,23 @@ func (a *fakeAuthority) Flush(ctx context.Context, req FlushRequest) (FlushReply
 	if a.flushStat != 0 {
 		return FlushReply{Status: a.flushStat}, nil
 	}
-	g, ok := a.grants[req.Scope]
-	if !ok || g.epoch != req.Epoch {
-		return FlushReply{Status: 116}, nil // ESTALE
+	if len(req.Records) == 0 || len(req.ScopeRuns) == 0 ||
+		req.ScopeRuns[len(req.ScopeRuns)-1].Through != req.Records[len(req.Records)-1].Seq {
+		return FlushReply{Status: 22}, nil
+	}
+	runIndex := 0
+	for _, rec := range req.Records {
+		for runIndex < len(req.ScopeRuns) && rec.Seq > req.ScopeRuns[runIndex].Through {
+			runIndex++
+		}
+		if runIndex == len(req.ScopeRuns) {
+			return FlushReply{Status: 22}, nil
+		}
+		run := req.ScopeRuns[runIndex]
+		g, ok := a.grants[run.Scope]
+		if !ok || g.epoch != run.Epoch {
+			return FlushReply{Status: 116}, nil // ESTALE
+		}
 	}
 	st := a.streams[req.WritebackID]
 	if st == nil {

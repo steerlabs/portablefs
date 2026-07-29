@@ -195,6 +195,9 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 		if err := addText("write-back scope epoch", req.WBScopes[i].Epoch); err != nil {
 			return preparedRequest{}, err
 		}
+		if err := add(8); err != nil {
+			return preparedRequest{}, err
+		}
 	}
 	prepared.bodyBytes = uint32(n)
 	return prepared, nil
@@ -352,6 +355,7 @@ func (e *requestEncoder) Encode(req *Request) error {
 	for _, scope := range req.WBScopes {
 		w.text(scope.Path)
 		w.text(scope.Epoch)
+		w.u64(scope.Through)
 	}
 	if w.err != nil {
 		return w.err
@@ -546,13 +550,14 @@ func (d *requestDecoder) Decode(dst *Request) error {
 			req.Records[i] = record
 		}
 	}
-	scopeCount := r.count("write-back scope list", maxRequestCollectionItems, 8)
+	scopeCount := r.count("write-back scope list", maxRequestCollectionItems, 16)
 	if r.err == nil && scopeCount != 0 {
 		req.WBScopes = make([]WBScope, int(scopeCount))
 		for i := range req.WBScopes {
 			req.WBScopes[i] = WBScope{
-				Path:  r.text("write-back scope path"),
-				Epoch: r.text("write-back scope epoch"),
+				Path:    r.text("write-back scope path"),
+				Epoch:   r.text("write-back scope epoch"),
+				Through: r.u64(),
 			}
 		}
 	}

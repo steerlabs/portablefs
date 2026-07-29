@@ -287,6 +287,14 @@ func (c *fsdControl) deleteAttach(ref string) error {
 	if err != nil {
 		return err
 	}
+	// DELETE is a state-convergence operation. An external forced unmount
+	// removes the attach before it signals the foreground wrapper; that
+	// wrapper must then be able to repeat the normal detach and exit
+	// cooperatively. Treat an already-absent attach as the desired result,
+	// never as a reason to wait forever for another signal.
+	if status == http.StatusNotFound {
+		return nil
+	}
 	if status < 200 || status >= 300 {
 		return controlError(status, body)
 	}

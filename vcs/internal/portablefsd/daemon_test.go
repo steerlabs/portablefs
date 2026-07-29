@@ -1955,6 +1955,88 @@ func TestDaemonStableItemIdentityAfterRestart(t *testing.T) {
 	assertExactNames(t, names, []string{"bigdir"})
 }
 
+func TestDaemonWritebackHardLinkSharesOpenItemAcrossRestart(t *testing.T) {
+	authority := serveAuthority(t)
+	bin := buildPortablefsdTestBinary(t)
+	stateDir, err := os.MkdirTemp("/tmp", "pfsd-hardlink-identity-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
+
+	opts := map[string]any{"flushIntervalMs": int64(time.Hour / time.Millisecond)}
+	p1 := startPortablefsdProcess(t, bin, stateDir, "pfsd-hardlink1")
+	ref1 := ensureAttachWithPolicyOptions(t, p1.hc, authority, "vol-hardlink", "main", "/Volumes/Hardlink", "writeback", opts)
+	c1 := dialPFS(t, p1.cfg.FrontendSocket)
+	c1.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "hardlink-before"})
+	res1 := c1.call(&pfslocal.ResolveRequest{AttachRef: ref1}).(*pfslocal.ResolveReply)
+	dir := c1.call(&pfslocal.MkdirRequest{Dir: res1.Root, Name: []byte("delegated"), Mode: 0o755}).(*pfslocal.MkdirReply)
+
+	// The create remains open while Link drains its delegation, establishes
+	// the authority identity/open pin, and publishes the alias. Both names
+	// must continue to be one pfslocal Item, not two objects with coincident
+	// link counts.
+	source := c1.call(&pfslocal.CreateRequest{Dir: dir.Attr.Item, Name: []byte("source"), Mode: 0o644, Exclusive: true}).(*pfslocal.CreateReply)
+	c1.call(&pfslocal.WriteRequest{Handle: source.Handle, Data: []byte("abcdefgh")})
+	alias := c1.call(&pfslocal.HardLinkRequest{Item: source.Attr.Item, Dir: dir.Attr.Item, Name: []byte("alias")}).(*pfslocal.HardLinkReply)
+	if alias.Attr.Item != source.Attr.Item || alias.Attr.Nlink != 2 {
+		t.Fatalf("open-source hardlink split item: source=%+v alias=%+v", source.Attr, alias.Attr)
+	}
+	aliasLookup := c1.call(&pfslocal.LookupRequest{Dir: dir.Attr.Item, Name: []byte("alias")}).(*pfslocal.LookupReply)
+	if aliasLookup.Attr.Item != source.Attr.Item || aliasLookup.Attr.Nlink != 2 {
+		t.Fatalf("alias lookup split item: source=%+v alias=%+v", source.Attr, aliasLookup.Attr)
+	}
+
+	aliasOpen := c1.call(&pfslocal.OpenRequest{Item: alias.Attr.Item, Mode: pfslocal.OpenModeReadWrite}).(*pfslocal.OpenReply)
+	c1.call(&pfslocal.WriteRequest{Handle: source.Handle, Offset: 0, Data: []byte("SOURCE!!")})
+	if got := c1.call(&pfslocal.ReadRequest{Handle: aliasOpen.Handle, Length: 16}).(*pfslocal.ReadReply); string(got.Data) != "SOURCE!!" {
+		t.Fatalf("source write not visible through alias: %q", got.Data)
+	}
+	size := uint64(4)
+	c1.call(&pfslocal.SetAttrRequest{Item: alias.Attr.Item, Size: &size})
+	if got := c1.call(&pfslocal.ReadRequest{Handle: source.Handle, Length: 16}).(*pfslocal.ReadReply); string(got.Data) != "SOUR" {
+		t.Fatalf("alias truncate not visible through open source: %q", got.Data)
+	}
+	c1.call(&pfslocal.WriteRequest{Handle: aliasOpen.Handle, Offset: 0, Data: []byte("alias-data")})
+	if got := c1.call(&pfslocal.ReadRequest{Handle: source.Handle, Length: 16}).(*pfslocal.ReadReply); string(got.Data) != "alias-data" {
+		t.Fatalf("alias write not visible through open source: %q", got.Data)
+	}
+	c1.call(&pfslocal.FsyncRequest{Handle: source.Handle})
+	c1.call(&pfslocal.CloseRequest{Handle: aliasOpen.Handle})
+	c1.call(&pfslocal.CloseRequest{Handle: source.Handle})
+
+	// A process restart restores the frontend item and its distinct authority
+	// inode from the durable binding journal. With all old handles closed,
+	// opening either name still reaches the same authority inode.
+	p1.stop()
+	c1.close()
+	p2 := startPortablefsdProcess(t, bin, stateDir, "pfsd-hardlink2")
+	ref2 := ensureAttachWithPolicyOptions(t, p2.hc, authority, "vol-hardlink", "main", "/Volumes/Hardlink", "writeback", opts)
+	if ref2 != ref1 {
+		t.Fatalf("restart ref=%q want %q", ref2, ref1)
+	}
+	c2 := dialPFS(t, p2.cfg.FrontendSocket)
+	defer c2.close()
+	c2.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "hardlink-after"})
+	res2 := c2.call(&pfslocal.ResolveRequest{AttachRef: ref2}).(*pfslocal.ResolveReply)
+	dir2 := c2.call(&pfslocal.LookupRequest{Dir: res2.Root, Name: []byte("delegated")}).(*pfslocal.LookupReply)
+	source2 := c2.call(&pfslocal.LookupRequest{Dir: dir2.Attr.Item, Name: []byte("source")}).(*pfslocal.LookupReply)
+	alias2 := c2.call(&pfslocal.LookupRequest{Dir: dir2.Attr.Item, Name: []byte("alias")}).(*pfslocal.LookupReply)
+	if source2.Attr.Item != source.Attr.Item || alias2.Attr.Item != source.Attr.Item ||
+		source2.Attr.Nlink != 2 || alias2.Attr.Nlink != 2 {
+		t.Fatalf("restart hardlink identity: before=%+v source=%+v alias=%+v", source.Attr, source2.Attr, alias2.Attr)
+	}
+	closedSource := c2.call(&pfslocal.OpenRequest{Item: source2.Attr.Item, Mode: pfslocal.OpenModeReadWrite}).(*pfslocal.OpenReply)
+	closedAlias := c2.call(&pfslocal.OpenRequest{Item: alias2.Attr.Item, Mode: pfslocal.OpenModeReadWrite}).(*pfslocal.OpenReply)
+	c2.call(&pfslocal.WriteRequest{Handle: closedAlias.Handle, Offset: 0, Data: []byte("restart")})
+	if got := c2.call(&pfslocal.ReadRequest{Handle: closedSource.Handle, Length: 16}).(*pfslocal.ReadReply); string(got.Data) != "restartata" {
+		t.Fatalf("post-restart alias write not visible through source: %q", got.Data)
+	}
+	c2.call(&pfslocal.FsyncRequest{Handle: closedAlias.Handle})
+	c2.call(&pfslocal.CloseRequest{Handle: closedAlias.Handle})
+	c2.call(&pfslocal.CloseRequest{Handle: closedSource.Handle})
+}
+
 func TestDaemonWritebackFrontendItemSurvivesImmediateCrash(t *testing.T) {
 	// The SIGKILLed daemon's mount session must expire quickly: its journaled
 	// file-grain grants block the restarted daemon's WAL recovery (bounded

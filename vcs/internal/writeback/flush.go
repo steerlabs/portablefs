@@ -52,8 +52,8 @@ type drainWaiter struct {
 	ch     chan error
 }
 
-// flusher owns network flush ordering: one goroutine, dense same-scope runs,
-// exact watermark reconciliation, sticky health.
+// flusher owns network flush ordering: one goroutine, dense global batches
+// with explicit scope runs, exact watermark reconciliation, sticky health.
 type flusher struct {
 	e *Engine
 
@@ -255,10 +255,9 @@ func (f *flusher) sendBatch() {
 		f.mu.Unlock()
 		return
 	}
-	scope := f.pending[0].scope
 	n := 0
 	var bytes int64
-	for n < len(f.pending) && n < flushMaxRecords && bytes < flushMaxBytes && f.pending[n].scope == scope {
+	for n < len(f.pending) && n < flushMaxRecords && bytes < flushMaxBytes {
 		bytes += int64(f.pending[n].length)
 		n++
 	}
@@ -269,15 +268,40 @@ func (f *flusher) sendBatch() {
 	e := f.e
 	e.mu.RLock()
 	w := e.wal
-	var epoch string
-	if d := e.delegations[scope]; d != nil {
-		epoch = d.epoch
+	epochs := make(map[string]string, len(batch))
+	for _, p := range batch {
+		d := e.delegations[p.scope]
+		if d == nil {
+			continue
+		}
+		epochs[p.scope] = d.epoch
 	}
 	e.mu.RUnlock()
-	if w == nil || epoch == "" {
+	if w == nil {
+		f.park(fmt.Errorf("%w: pending records have no live WAL", ErrConflict))
+		return
+	}
+	scopeRuns := make([]FlushScope, 0, len(batch))
+	for _, p := range batch {
+		epoch := epochs[p.scope]
+		if epoch == "" {
+			// A record without its live grant cannot exist (drain precedes
+			// every release); this is engine-state corruption.
+			f.park(fmt.Errorf("%w: pending record for %q has no live delegation", ErrConflict, p.scope))
+			return
+		}
+		if len(scopeRuns) != 0 &&
+			scopeRuns[len(scopeRuns)-1].Scope == p.scope &&
+			scopeRuns[len(scopeRuns)-1].Epoch == epoch {
+			scopeRuns[len(scopeRuns)-1].Through = p.seq
+		} else {
+			scopeRuns = append(scopeRuns, FlushScope{Scope: p.scope, Epoch: epoch, Through: p.seq})
+		}
+	}
+	if len(scopeRuns) == 0 {
 		// A record without its live grant cannot exist (drain precedes every
 		// release); this is engine-state corruption.
-		f.park(fmt.Errorf("%w: pending record for %q has no live delegation", ErrConflict, scope))
+		f.park(fmt.Errorf("%w: pending batch has no scope runs", ErrConflict))
 		return
 	}
 	records := make([]wal.Record, 0, len(batch))
@@ -297,9 +321,9 @@ func (f *flusher) sendBatch() {
 	}
 	ctx, cancel := context.WithTimeout(e.ctx, flushAttemptTimeout)
 	reply, err := e.remote.Flush(ctx, FlushRequest{
-		WritebackID: e.writebackID, Scope: scope, Epoch: epoch,
+		WritebackID: e.writebackID,
 		PrevDigest: prevDigest, EndDigest: batch[len(batch)-1].digest,
-		Records: records,
+		Records: records, ScopeRuns: scopeRuns,
 	})
 	cancel()
 	if err != nil {

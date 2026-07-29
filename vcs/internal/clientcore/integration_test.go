@@ -152,8 +152,8 @@ func TestVolumePublicOpsEndToEnd(t *testing.T) {
 func TestWriteBackAtomicAppendAddsNoHotPathRoundTrips(t *testing.T) {
 	addr := serveCore(t)
 	v := dialCore(t, addr, Options{
-		Owner:         "append-wb",
-		WALDir:        t.TempDir(),
+		Owner:  "append-wb",
+		WALDir: t.TempDir(),
 	})
 	ctx := context.Background()
 	// A subtree path so the write-back engine delegates the parent directory
@@ -640,6 +640,51 @@ sawAliasWrite:
 			t.Fatalf("surviving alias did not refresh nlink: attr=%+v st=%d", fresh, st)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// A file born under a delegation has a frontend-stable local item identity
+// before the authority assigns its inode. Linking it drains the delegation
+// and publishes that authority identity. Every later operation must use the
+// published inode and stay on the shared hard-link lane; otherwise the two
+// names can diverge in separate delegated overlays.
+func TestHardLinkPromotesDelegatedLocalIdentity(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+	v := dialCore(t, addr, Options{Owner: "hardlink-local-born"})
+
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir: %d", st)
+	}
+	created, st := v.Create(ctx, "d/source", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create: %d", st)
+	}
+	if created.Ino != 0 {
+		t.Fatalf("delegated create inode=%d, want frontend-local identity", created.Ino)
+	}
+	source := NewNodeState(0xfeed, false)
+	if _, st := v.Write(ctx, "d/source", source, 0, []byte("before")); st != fsproto.OK {
+		t.Fatalf("delegated write: %d", st)
+	}
+
+	linked, st := v.Link(ctx, "d/source", "d/alias", source)
+	if st != fsproto.OK || linked.Ino == 0 || linked.Nlink != 2 {
+		t.Fatalf("link: attr=%+v st=%d", linked, st)
+	}
+	if got := source.AuthorityIno(); got != linked.Ino {
+		t.Fatalf("promoted authority inode=%d, want %d", got, linked.Ino)
+	}
+	if got := authHandleIno(source); got != linked.Ino {
+		t.Fatalf("handle inode=%d, want %d", got, linked.Ino)
+	}
+
+	if _, st := v.Write(ctx, "d/source", source, 0, []byte("shared")); st != fsproto.OK {
+		t.Fatalf("post-link write: %d", st)
+	}
+	buf, st := v.Read(ctx, "d/alias", source, 0, len("shared"))
+	if st != fsproto.OK || string(buf) != "shared" {
+		t.Fatalf("alias read=%q st=%d", buf, st)
 	}
 }
 

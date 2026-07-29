@@ -263,9 +263,13 @@ type streamWAL struct {
 	unsyncedBytes int64
 	unsyncedSince time.Time
 	syncTimer     *time.Timer
+	syncing       bool
+	syncDone      chan struct{}
 	syncErr       error
-	onFailure     func(error)
-	closed        bool
+	// syncFile is a test seam. Nil uses (*os.File).Sync.
+	syncFile  func(*os.File) error
+	onFailure func(error)
+	closed    bool
 }
 
 func segmentPath(dir string, ordinal uint64) string {
@@ -493,24 +497,64 @@ func (w *streamWAL) writeActiveLocked(buf []byte, off int64) error {
 		w.unsyncedSince = time.Now()
 	}
 	if w.unsyncedBytes >= groupSyncBytes {
-		return w.syncLocked()
+		w.startBackgroundSyncLocked()
+		return nil
 	}
 	w.armSyncTimerLocked()
 	return nil
 }
 
 func (w *streamWAL) armSyncTimerLocked() {
-	if w.syncTimer != nil {
+	if w.syncTimer != nil || w.syncing {
 		return
 	}
 	w.syncTimer = time.AfterFunc(groupSyncDelay, func() {
 		w.mu.Lock()
-		defer w.mu.Unlock()
 		w.syncTimer = nil
 		if !w.closed && w.unsyncedBytes > 0 {
-			_ = w.syncLocked()
+			w.startBackgroundSyncLocked()
 		}
+		w.mu.Unlock()
 	})
+}
+
+// startBackgroundSyncLocked snapshots the currently-unsynced prefix and
+// syncs it without holding the append mutex. Writes accepted after the
+// snapshot accumulate in a fresh unsynced generation and are conservatively
+// covered by the next group sync, even if the kernel happened to include
+// them in the in-flight fsync. This keeps a slow local fsync from serializing
+// every FSKit create/write/xattr callback behind the WAL mutex.
+func (w *streamWAL) startBackgroundSyncLocked() {
+	if w.syncing || w.unsyncedBytes == 0 || w.active == nil || w.closed {
+		return
+	}
+	f := w.active
+	syncFile := w.syncFile
+	done := make(chan struct{})
+	w.syncing = true
+	w.syncDone = done
+	w.unsyncedBytes = 0
+	w.unsyncedSince = time.Time{}
+	go func() {
+		var err error
+		if syncFile != nil {
+			err = syncFile(f)
+		} else {
+			err = f.Sync()
+		}
+
+		w.mu.Lock()
+		if err != nil && !w.closed {
+			_ = w.failLocked(fmt.Errorf("sync active segment: %w", err))
+		}
+		w.syncing = false
+		w.syncDone = nil
+		close(done)
+		if err == nil && !w.closed && w.unsyncedBytes > 0 {
+			w.armSyncTimerLocked()
+		}
+		w.mu.Unlock()
+	}()
 }
 
 func (w *streamWAL) failLocked(err error) error {
@@ -525,10 +569,25 @@ func (w *streamWAL) failLocked(err error) error {
 }
 
 func (w *streamWAL) syncLocked() error {
+	for w.syncing {
+		done := w.syncDone
+		w.mu.Unlock()
+		<-done
+		w.mu.Lock()
+		if w.syncErr != nil {
+			return w.syncErr
+		}
+	}
 	if w.unsyncedBytes == 0 || w.active == nil {
 		return w.syncErr
 	}
-	if err := w.active.Sync(); err != nil {
+	var err error
+	if w.syncFile != nil {
+		err = w.syncFile(w.active)
+	} else {
+		err = w.active.Sync()
+	}
+	if err != nil {
 		return w.failLocked(fmt.Errorf("sync active segment: %w", err))
 	}
 	w.unsyncedBytes = 0
@@ -554,6 +613,13 @@ func (w *streamWAL) rotateIfNeededLocked() error {
 	}
 	if err := w.syncLocked(); err != nil {
 		return err
+	}
+	// syncLocked may temporarily release w.mu while an already-running
+	// background sync completes. Another appender can rotate the active
+	// segment during that wait, so decide against the current segment again.
+	seg = &w.segments[len(w.segments)-1]
+	if seg.size < segmentTargetBytes {
+		return nil
 	}
 	if err := w.openSegmentLocked(seg.ordinal+1, w.nextFrame+1, w.lastSeq+1); err != nil {
 		return w.failLocked(fmt.Errorf("rotate segment: %w", err))
@@ -725,16 +791,26 @@ func (w *streamWAL) Close() error {
 // the method never upgrades a plain write into an fsync.
 func (w *streamWAL) Abandon() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.closed {
+		w.mu.Unlock()
 		return
 	}
+	// Mark the object closed before waiting so the in-flight worker neither
+	// arms another timer nor reports a post-abandon health failure. We still
+	// wait for that worker to release the descriptor before closing it.
+	w.closed = true
 	if w.syncTimer != nil {
 		w.syncTimer.Stop()
 		w.syncTimer = nil
 	}
+	done := w.syncDone
+	w.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	w.mu.Lock()
 	w.closeFilesLocked()
-	w.closed = true
+	w.mu.Unlock()
 }
 
 func (w *streamWAL) closeFilesLocked() {

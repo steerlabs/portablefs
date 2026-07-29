@@ -9,11 +9,10 @@ Names retired at the boundary keep typed tombstones for exactly one
 release.
 
 The reset includes the mount wire. Released v0.1 clients speak `fsproto` v3;
-the first v2 authority speaks v6 and intentionally refuses that older
+the first v2 authority speaks v7 and intentionally refuses that older
 protocol rather than silently weakening exact-session semantics. Upgrade
-clients before (or atomically with) the authority. The one-release-skew
-promise below begins with the v2 release line; it does not promise
-v0.1↔v2 interoperability.
+clients and authorities together; PortableFS deliberately fails closed
+instead of carrying a second compatibility execution path.
 
 Every surface is in one of four tiers: **frozen**, **tombstoned**,
 **deprecated for removal**, or **internal**. If a surface is not listed,
@@ -45,8 +44,9 @@ these.
   (FUSE through portablefsd) and `swift/PortableFSKit` (FSKit) are the two
   supported clients. Wire-visible changes ship only behind `fsproto`
   protocol version negotiation and the versioned `pfslocal`
-  `Hello`/`HelloReply` handshake; a client and authority one release apart
-  interoperate.
+  `Hello`/`HelloReply` handshake. Compatible releases interoperate; a
+  wire-incompatible release gets a new exact protocol version and requires a
+  coordinated client/authority upgrade.
 - **PFT2**, the immutable content-addressed base format: the strict
   canonical object encoding, the digest scheme, and the node kinds. A
   committed PFT2 object keeps its exact bytes and digest forever. Postgres

@@ -25,14 +25,6 @@ type Options struct {
 	CredentialSource func() string
 	AuthToken        string
 
-	// OnTokenRejected is invoked (single-flight, client-side coalesced) when
-	// the data-plane router explicitly rejects this mount's session token on
-	// a dial — the manager restarted or the lease rotated. It must re-resolve
-	// the mount session so CredentialSource serves the fresh token, and
-	// report whether it did; dials then retry immediately instead of waiting
-	// for a timed credential refresh.
-	OnTokenRejected func() bool
-
 	// WALDir is the write-back engine's durable state directory (the mount
 	// stream WAL + recovery jobs live under it). Empty uses a fresh
 	// temporary directory: crash recovery then belongs to the caller that
@@ -236,9 +228,6 @@ func Dial(ctx context.Context, opts Options) (*Volume, error) {
 	} else if opts.AuthToken != "" {
 		cli.SetAuthToken(opts.AuthToken)
 	}
-	if opts.OnTokenRejected != nil {
-		cli.SetOnTokenRejected(opts.OnTokenRejected)
-	}
 	return Attach(ctx, cli, opts)
 }
 
@@ -293,7 +282,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		v.DiskCache = dc
 	}
 	// Exact mount session: establish at mount. The handshake requires the
-	// v6 protocol exactly — an older authority fails the mount with a clear
+	// v7 protocol exactly — an older authority fails the mount with a clear
 	// version-mismatch error. A fenced identity at establish
 	// (ErrSessionFenced) is surfaced by the first mutation instead of
 	// failing the mount: reads are still valid.
@@ -305,13 +294,13 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		cancel()
 		return nil, err
 	}
-	// Version-gated negative caching is part of the v6 baseline (the
+	// Version-gated negative caching is part of the v7 baseline (the
 	// authority stamps every lookup miss with the parent directory version);
 	// the explicit off switch remains as the only override.
 	v.negativeCache = !opts.NoNegativeCache
 	v.openReg = newOpenRegistry(cli, v.VersionCache.CurrentGen, v.openFiles,
 		opts.OpenRetentionEntries, opts.Debugf)
-	// The write-back engine is part of every v6 mount: the authority decides
+	// The write-back engine is part of every v7 mount: the authority decides
 	// adaptively per scope whether to delegate; there is no mount-level
 	// write mode. PORTABLEFS_DEBUG_WRITE_THROUGH=1 is the only override
 	// (debug: never delegate; the engine still recovers parked streams).
@@ -447,7 +436,11 @@ func (r wbRemote) ReleaseDelegation(ctx context.Context, scope, epoch string) er
 
 func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
 	return ctxCall(ctx, func() (writeback.FlushReply, error) {
-		through, status, err := r.cli.FlushWriteback(req.WritebackID, req.Scope, req.Epoch, req.PrevDigest, req.EndDigest, req.Records)
+		scopes := make([]fsproto.WBScope, 0, len(req.ScopeRuns))
+		for _, run := range req.ScopeRuns {
+			scopes = append(scopes, fsproto.WBScope{Path: run.Scope, Epoch: run.Epoch, Through: run.Through})
+		}
+		through, status, err := r.cli.FlushWriteback(req.WritebackID, scopes, req.PrevDigest, req.EndDigest, req.Records)
 		if err != nil {
 			return writeback.FlushReply{}, err
 		}
@@ -797,7 +790,7 @@ func (v *Volume) ensureOpenPins(ctx context.Context, scope string) error {
 		if st := v.openReg.Open(path, a.Ino); st != fsproto.OK {
 			return fmt.Errorf("clientcore: open pin for %q inode %d: mark-open status %d", path, a.Ino, st)
 		}
-		if !node.recordAuthorityIno(a.Ino) {
+		if !node.RecordAuthorityIno(a.Ino) {
 			// Return the ref acquired above before failing the release. A
 			// changed inode means the open handle's binding cannot be proven;
 			// releasing the delegation would make orphan routing ambiguous.

@@ -9,7 +9,7 @@ import (
 )
 
 // Remote is the authority surface the engine drives. Every method rides
-// fsproto v6 exact envelopes in production and is context-aware: the engine
+// fsproto v7 exact envelopes in production and is context-aware: the engine
 // bounds each attempt and cancels in-flight work on force-close, so a late
 // reply can never act against a closed WAL.
 type Remote interface {
@@ -63,15 +63,23 @@ type AcquireReply struct {
 	Children    []Entry
 }
 
-// FlushRequest is one dense same-scope run of the mount stream.
+// FlushScope is one contiguous run in a mixed-scope mount-stream flush.
+// Through is the last global stream sequence covered by the run.
+type FlushScope struct {
+	Scope   string
+	Epoch   string
+	Through uint64
+}
+
+// FlushRequest is one dense global run of the mount stream. ScopeRuns map
+// every record to the exact live delegation that authorizes it.
 type FlushRequest struct {
 	WritebackID string
-	Scope       string
-	Epoch       string
 	PrevDigest  [32]byte
 	EndDigest   [32]byte
 	// Records carry their global stream sequences in Seq.
-	Records []wal.Record
+	Records   []wal.Record
+	ScopeRuns []FlushScope
 }
 
 // FlushReply reports the stream's durable authority watermark.
