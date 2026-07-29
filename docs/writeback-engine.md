@@ -100,8 +100,12 @@ vcs/internal/writeback/
 - No mutation ever runs write-through INSIDE a held delegation. The one
   escape from delegated mode is drain + durable RELEASE: undecidable creates,
   unknown removes, cross-scope renames, orphan transitions, hard links, and
-  xattr mutations release the covering delegation first, then execute on the
-  shared lane (`Engine.ReleaseFor`). Server-side, a same-session
+  xattr mutations on objects without a complete local xattr view release the
+  covering delegation first, then execute on the shared lane
+  (`Engine.ReleaseFor`). Xattrs on locally-born objects remain in the
+  delegated WAL when the authority advertised `FeatureDelegatedXattrs`;
+  older v6 authorities select the shared xattr lane from the version probe,
+  before any mutation is attempted. Server-side, a same-session
   write-through mutation does not bypass the peer gate — it recalls the
   holder's own grant — which is what makes the grant-time children snapshot
   exact against same-session races.

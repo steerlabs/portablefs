@@ -117,12 +117,17 @@ type writeBackStatus struct {
 	OldestPendingMs int64            `json:"oldestPendingMs,omitempty"`
 	Degraded        bool             `json:"degraded,omitempty"`
 	LastFailure     string           `json:"lastFailure,omitempty"`
-	Delegations     int              `json:"delegations,omitempty"`
+	Delegations     []delegationView `json:"delegations"`
 	WALBytes        int64            `json:"walBytes,omitempty"`
 	Jobs            []recoveryJobRef `json:"jobs,omitempty"`
 	// ParkedWALs keeps the doctor/mounts wire name for parked recovery
 	// state: one entry per parked stream.
 	ParkedWALs []parkedWAL `json:"parkedWals,omitempty"`
+}
+
+type delegationView struct {
+	Scope    string `json:"scope"`
+	Draining bool   `json:"draining,omitempty"`
 }
 
 type recoveryJobRef struct {
@@ -391,19 +396,26 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 	return a, true, nil
 }
 
-// quiesceIfIdle atomically closes attach admission and proves that no active
-// or dormant attach exists. Once it succeeds, no later ensure can race into
-// daemon shutdown.
+// quiesceIfIdle atomically closes attach admission and proves that no live
+// Volume exists. Credential-pending entries revived from disk are durable
+// restart metadata, not active mounts: they hold no WAL handles, sessions, or
+// frontend service and therefore must not permanently block a clean daemon
+// stop or binary upgrade.
 func (r *registry) quiesceIfIdle() (bool, int, error) {
 	r.mu.Lock()
 	if r.quiescing {
 		r.mu.Unlock()
 		return true, 0, nil
 	}
-	count := len(r.byRef)
-	if count != 0 {
+	liveCount := 0
+	for _, a := range r.byRef {
+		if a.hasLiveVolume() {
+			liveCount++
+		}
+	}
+	if liveCount != 0 {
 		r.mu.Unlock()
-		return false, count, nil
+		return false, liveCount, nil
 	}
 	r.quiescing = true
 	r.mu.Unlock()
@@ -459,27 +471,24 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 	return true, jobID, err
 }
 
-// closeAll is the daemon-termination path (SIGTERM): the process is dying
-// regardless, so a failed drain degrades to the crash-equivalent FORCED
-// close — the tail parks as a durable recovery job (logged with its ID) and
-// the next attach recovers it. No caller is told a normal unmount succeeded.
-func (r *registry) closeAll(ctx context.Context) {
+// closeAll is the cooperative daemon-termination path. Every attach must pass
+// its normal authority durability barrier. A failed drain remains a visible
+// shutdown failure; this path never changes semantics by force-detaching or
+// parking a recovery job.
+func (r *registry) closeAll(ctx context.Context) error {
 	r.stopPersister()
+	var shutdownErrs []error
 	for _, a := range r.list() {
 		if _, err := a.detach(ctx, false); err != nil {
-			log.Printf("portablefsd: shutdown detach %s: drain failed (%v); forcing a journal-first close", a.ref, err)
-			if jobID, ferr := a.detach(ctx, true); ferr != nil {
-				log.Printf("portablefsd: shutdown force-detach %s: %v", a.ref, ferr)
-			} else if jobID != "" {
-				log.Printf("portablefsd: shutdown parked recovery job %s for %s; it recovers on the next attach", jobID, a.ref)
-			}
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("detach %s: %w", a.ref, err))
 		}
 	}
 	// The identity bindings created since the last debounce tick — and the
 	// restart-identity contract itself — ride on this final write.
 	if err := r.persist(); err != nil {
-		log.Printf("portablefsd: final state persist: %v", err)
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("final state persist: %w", err))
 	}
+	return errors.Join(shutdownErrs...)
 }
 
 type attach struct {
@@ -989,26 +998,31 @@ func (a *attach) status() attachStatus {
 			diskBytes, diskCap = vol.DiskCache.Stats()
 		}
 		st := vol.WritebackStatus()
-		if st.PendingRecords > 0 || len(st.Jobs) > 0 || st.Degraded {
-			wb = &writeBackStatus{
-				PendingRecords: st.PendingRecords, PendingBytes: st.PendingBytes,
-				AppliedThrough: st.AppliedThrough, AdmittedThrough: st.AdmittedThrough,
-				OldestPendingMs: st.OldestPendingMs, Degraded: st.Degraded,
-				LastFailure: st.LastFailure, Delegations: len(st.Delegations),
-				WALBytes: st.WALBytes,
-			}
-			now := time.Now().UnixMilli()
-			for _, j := range st.Jobs {
-				wb.Jobs = append(wb.Jobs, recoveryJobRef{
-					JobID: j.JobID, State: j.State,
-					Records: j.PendingRecords, Bytes: j.PendingBytes,
-					LastError: j.LastError,
-				})
-				wb.ParkedWALs = append(wb.ParkedWALs, parkedWAL{
-					WAL: j.JobID, Records: int(j.PendingRecords), PayloadBytes: int64(j.PendingBytes),
-					AgeMs: now - j.CreatedAtMs, LastError: j.LastError,
-				})
-			}
+		// A healthy zero-debt engine is still operationally meaningful:
+		// expose it instead of making clients guess whether write-back is
+		// absent or merely idle. Scope names make contention and overly broad
+		// grants diagnosable without exposing delegation epochs.
+		wb = &writeBackStatus{
+			PendingRecords: st.PendingRecords, PendingBytes: st.PendingBytes,
+			AppliedThrough: st.AppliedThrough, AdmittedThrough: st.AdmittedThrough,
+			OldestPendingMs: st.OldestPendingMs, Degraded: st.Degraded,
+			LastFailure: st.LastFailure, WALBytes: st.WALBytes,
+			Delegations: make([]delegationView, 0, len(st.Delegations)),
+		}
+		for _, d := range st.Delegations {
+			wb.Delegations = append(wb.Delegations, delegationView{Scope: d.Scope, Draining: d.Draining})
+		}
+		now := time.Now().UnixMilli()
+		for _, j := range st.Jobs {
+			wb.Jobs = append(wb.Jobs, recoveryJobRef{
+				JobID: j.JobID, State: j.State,
+				Records: j.PendingRecords, Bytes: j.PendingBytes,
+				LastError: j.LastError,
+			})
+			wb.ParkedWALs = append(wb.ParkedWALs, parkedWAL{
+				WAL: j.JobID, Records: int(j.PendingRecords), PayloadBytes: int64(j.PendingBytes),
+				AgeMs: now - j.CreatedAtMs, LastError: j.LastError,
+			})
 		}
 	}
 	a.mu.RLock()

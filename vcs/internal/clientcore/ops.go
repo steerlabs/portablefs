@@ -22,6 +22,8 @@ func statusErr(err error) Status {
 		return fsproto.EEXIST
 	case errors.Is(err, syscall.ENOTEMPTY):
 		return fsproto.ENOTEMPTY
+	case errors.Is(err, writeback.ErrNoXattr):
+		return fsproto.ENODATA
 	case errors.Is(err, writeback.ErrNoSpace):
 		return fsproto.ENOSPC
 	default:

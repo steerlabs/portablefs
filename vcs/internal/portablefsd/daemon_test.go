@@ -71,11 +71,21 @@ func startDaemon(t *testing.T, authority string) (Config, *http.Client, string, 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := NewServer(cfg)
+	runDone := make(chan error, 1)
 	go func() {
-		if err := s.Run(ctx); err != nil {
-			t.Errorf("daemon Run: %v", err)
-		}
+		runDone <- s.Run(ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Errorf("daemon Run: %v", err)
+			}
+		case <-time.After(35 * time.Second):
+			t.Error("daemon did not complete its bounded cooperative shutdown")
+		}
+	})
 	waitUnix(t, cfg.ControlSocket)
 	waitUnix(t, cfg.FrontendSocket)
 	for _, p := range []string{cfg.ControlSocket, cfg.FrontendSocket} {
@@ -781,6 +791,38 @@ func TestStopIfIdleExitsDaemonWithNoAttaches(t *testing.T) {
 	t.Fatalf("idle daemon did not remove %s after accepting stop", cfg.ControlSocket)
 }
 
+func TestStopIfIdleAllowsOnlyDormantRestartMetadata(t *testing.T) {
+	stateDir := t.TempDir()
+	r := newRegistry(stateDir)
+	req := ensureAttachRequest{
+		VolumeID:     "vol-dormant",
+		Branch:       "main",
+		AuthorityURL: "127.0.0.1:1",
+		MountPath:    "/Volumes/Dormant",
+	}
+	key := attachKey(req.VolumeID, req.Branch, req.MountPath)
+	a := newRevivedAttach("att_dormant", key, req, stateDir, 1, nil)
+	a.persist = r.persist
+	a.schedulePersist = r.schedulePersist
+	a.journal = r.journal
+	r.byRef[a.ref] = a
+	r.byKey[a.key] = a
+
+	idle, count, err := r.quiesceIfIdle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !idle || count != 0 {
+		t.Fatalf("quiesceIfIdle() = (%v, %d), want (true, 0) for metadata-only revived attach", idle, count)
+	}
+	if len(r.byRef) != 1 {
+		t.Fatal("idle proof must preserve dormant restart metadata on disk")
+	}
+	if err := r.closeAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDaemonFrontendLookupSeesControlWriteAfterNegative(t *testing.T) {
 	authority := serveAuthority(t)
 	cfg, hc, ref, cancel := startDaemon(t, authority)
@@ -1077,11 +1119,21 @@ func TestDaemonRenameWaitsForInFlightLookupBeforeReply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := NewServer(cfg)
+	runDone := make(chan error, 1)
 	go func() {
-		if err := srv.Run(ctx); err != nil {
-			t.Errorf("daemon Run: %v", err)
-		}
+		runDone <- srv.Run(ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Errorf("daemon Run: %v", err)
+			}
+		case <-time.After(35 * time.Second):
+			t.Error("daemon did not complete its bounded cooperative shutdown")
+		}
+	})
 	waitUnix(t, cfg.ControlSocket)
 	waitUnix(t, cfg.FrontendSocket)
 	hc := httpUDSClient(cfg.ControlSocket)
@@ -1520,11 +1572,21 @@ func TestDaemonEnumerateConcurrentSameDirSnapshotsAreIsolated(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := NewServer(cfg)
+	runDone := make(chan error, 1)
 	go func() {
-		if err := srv.Run(ctx); err != nil {
-			t.Errorf("daemon Run: %v", err)
-		}
+		runDone <- srv.Run(ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Errorf("daemon Run: %v", err)
+			}
+		case <-time.After(35 * time.Second):
+			t.Error("daemon did not complete its bounded cooperative shutdown")
+		}
+	})
 	waitUnix(t, cfg.ControlSocket)
 	waitUnix(t, cfg.FrontendSocket)
 	hc := httpUDSClient(cfg.ControlSocket)

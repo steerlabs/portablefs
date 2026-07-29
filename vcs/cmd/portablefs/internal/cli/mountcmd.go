@@ -908,7 +908,9 @@ func cmdUmount(e *cmdEnv, args []string) int {
 		fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
 	}
 	if pidAlive(st.PID) {
-		stopMountDaemon(st.PID)
+		if err := stopMountDaemon(st.PID); err != nil {
+			return e.fail("umount", err)
+		}
 	}
 	if force {
 		// FUSE parks its job inside the daemon during teardown; report every
@@ -1029,29 +1031,34 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-// daemonStopTimeout is how long stopMountDaemon waits after SIGTERM before
-// escalating to SIGKILL. It MUST exceed the daemon's detach drain budget
-// (portablefsd detachDrainBudget, 30s) plus the control round-trip — a
-// shorter timeout SIGKILLs the daemon mid-drain, exactly the data-parking
-// race this constant exists to prevent.
+// daemonStopTimeout bounds the cooperative foreground-process shutdown after
+// the authority drain and platform unmount have both succeeded.
 const daemonStopTimeout = 60 * time.Second
 
-// stopMountDaemon terminates the daemonized mount process: SIGTERM first so it
-// can drain and clean up, SIGKILL only after the drain budget has fully lapsed.
-func stopMountDaemon(pid int) {
+// stopMountDaemon only requests cooperative termination. It never escalates
+// to SIGKILL: a process that does not acknowledge SIGTERM remains visible to
+// the operator and keeps its mount-state record instead of being silently
+// converted into a crash-recovery path.
+func stopMountDaemon(pid int) error {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return
+		return err
 	}
-	_ = proc.Signal(syscall.SIGTERM)
+	if err := proc.Signal(syscall.SIGTERM); err != nil && pidAlive(pid) {
+		return fmt.Errorf("request foreground mount process %d shutdown: %w", pid, err)
+	}
 	deadline := time.Now().Add(daemonStopTimeout)
 	for time.Now().Before(deadline) {
 		if !pidAlive(pid) {
-			return
+			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	_ = proc.Signal(syscall.SIGKILL)
+	return fmt.Errorf(
+		"foreground mount process %d did not exit within %v after SIGTERM; it was left running and its mount-state record was preserved (no forced termination was attempted)",
+		pid,
+		daemonStopTimeout,
+	)
 }
 
 func cmdMounts(e *cmdEnv, args []string) int {
@@ -1070,8 +1077,18 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		return e.fail("mounts", err)
 	}
 	type mountRow struct {
-		mountState
-		Alive bool `json:"alive"`
+		MountPath         string   `json:"mountPath"`
+		VolumeID          string   `json:"volumeId"`
+		Branch            string   `json:"branch"`
+		PID               int      `json:"pid"`
+		Strategy          string   `json:"strategy"`
+		AuthorityURL      string   `json:"authorityUrl,omitempty"`
+		AttachRef         string   `json:"attachRef,omitempty"`
+		StartedAtMs       int64    `json:"startedAtMs"`
+		LocalDirs         []string `json:"localDirs,omitempty"`
+		Alive             bool     `json:"alive"`
+		Status            string   `json:"status,omitempty"`
+		StatusChangedAtMs int64    `json:"statusChangedAtMs,omitempty"`
 		// Health folds pid-liveness and the persisted credential status:
 		// live | stale | credential-expired.
 		Health string `json:"health"`
@@ -1095,7 +1112,25 @@ func cmdMounts(e *cmdEnv, args []string) int {
 	}
 	rows := make([]mountRow, 0, len(states))
 	for i := range states {
-		row := mountRow{mountState: states[i], Alive: pidAlive(states[i].PID), Health: mountHealth(&states[i])}
+		st := &states[i]
+		// mountState contains the live access credential because the daemon
+		// needs it for renewal. Never embed that persistence object in a
+		// presentation type: JSON output is routinely captured in agent logs.
+		row := mountRow{
+			MountPath:         st.MountPath,
+			VolumeID:          st.VolumeID,
+			Branch:            st.Branch,
+			PID:               st.PID,
+			Strategy:          st.Strategy,
+			AuthorityURL:      st.AuthorityURL,
+			AttachRef:         st.AttachRef,
+			StartedAtMs:       st.StartedAtMs,
+			LocalDirs:         st.LocalDirs,
+			Alive:             pidAlive(st.PID),
+			Status:            st.Status,
+			Health:            mountHealth(st),
+			StatusChangedAtMs: st.StatusChangedAtMs,
+		}
 		if a, ok := daemonView[states[i].AttachRef]; ok {
 			row.WriteBack = a.WriteBack
 			row.AttachState = a.State

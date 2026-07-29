@@ -2,12 +2,124 @@ package clientcore
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+// TestSiblingWritersPushDelegationsDown proves the launch workload that the
+// one-writer/one-reader lifecycle test does not cover: two live mounts create
+// and fill sibling directory trees concurrently. A mount must not retain the
+// common ancestor grant after it starts mutating a deeper directory; doing so
+// serializes unrelated peers behind recalls and can turn a high-throughput
+// sibling workload into a bounded-wait failure.
+func TestSiblingWritersPushDelegationsDown(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+	a := dialCore(t, addr, Options{
+		Owner: "sibling-a", VolumeID: "vol-siblings", Branch: "main",
+		WALDir: t.TempDir(),
+	})
+	b := dialCore(t, addr, Options{
+		Owner: "sibling-b", VolumeID: "vol-siblings", Branch: "main",
+		WALDir: t.TempDir(),
+	})
+	watchInvalidationsForTest(t, a)
+	watchInvalidationsForTest(t, b)
+
+	if _, st := a.Mkdir(ctx, "run", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir run: %d", st)
+	}
+	if _, st := a.Mkdir(ctx, "run/a", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir run/a: %d", st)
+	}
+	if _, st := a.Mkdir(ctx, "run/a/sequential", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir run/a/sequential: %d", st)
+	}
+	if _, st := a.Create(ctx, "run/a/sequential/seed", 0o644); st != fsproto.OK {
+		t.Fatalf("create a seed: %d", st)
+	}
+	assertDelegationScopes(t, a, "run/a/sequential")
+
+	// B's first directory is a sibling of A's narrow scope. It may be
+	// created synchronously if the broad "run" checkout is ineligible, but
+	// its deeper work must settle on its own non-overlapping scope.
+	if _, st := b.Mkdir(ctx, "run/b", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir run/b: %d", st)
+	}
+	if _, st := b.Mkdir(ctx, "run/b/sequential", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir run/b/sequential: %d", st)
+	}
+	if _, st := b.Create(ctx, "run/b/sequential/seed", 0o644); st != fsproto.OK {
+		t.Fatalf("create b seed: %d", st)
+	}
+	assertDelegationScopes(t, b, "run/b/sequential")
+
+	const files = 500
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, writer := range []struct {
+		name string
+		vol  *Volume
+	}{
+		{name: "a", vol: a},
+		{name: "b", vol: b},
+	} {
+		writer := writer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < files; i++ {
+				p := fmt.Sprintf("run/%s/sequential/file-%06d", writer.name, i)
+				if _, st := writer.vol.Create(ctx, p, 0o644); st != fsproto.OK {
+					errs <- fmt.Errorf("%s create %d: status %d", writer.name, i, st)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if err := a.FlushToAuthority(ctx); err != nil {
+		t.Fatalf("flush a: %v", err)
+	}
+	if err := b.FlushToAuthority(ctx); err != nil {
+		t.Fatalf("flush b: %v", err)
+	}
+
+	observer := dialCore(t, addr, Options{Owner: "sibling-observer"})
+	for _, role := range []string{"a", "b"} {
+		for i := 0; i < files; i++ {
+			p := fmt.Sprintf("run/%s/sequential/file-%06d", role, i)
+			if _, st := observer.Lookup(ctx, p); st != fsproto.OK {
+				t.Fatalf("observer lookup %s: status %d", p, st)
+			}
+		}
+	}
+}
+
+func assertDelegationScopes(t *testing.T, v *Volume, want ...string) {
+	t.Helper()
+	got := v.WritebackStatus().Delegations
+	if len(got) != len(want) {
+		t.Fatalf("delegations = %+v, want scopes %v", got, want)
+	}
+	for i := range want {
+		if got[i].Scope != want[i] || got[i].Draining {
+			t.Fatalf("delegations = %+v, want active scopes %v", got, want)
+		}
+	}
+}
 
 // TestAdaptiveDelegationLifecycle pins the full adaptive loop against the
 // REAL authority policy: grant on first uncontended write, zero-RPC local

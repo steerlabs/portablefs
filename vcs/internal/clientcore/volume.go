@@ -293,7 +293,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		v.DiskCache = dc
 	}
 	// Exact mount session: establish at mount. The handshake requires the
-	// v5 protocol exactly — an older authority fails the mount with a clear
+	// v6 protocol exactly — an older authority fails the mount with a clear
 	// version-mismatch error. A fenced identity at establish
 	// (ErrSessionFenced) is surfaced by the first mutation instead of
 	// failing the mount: reads are still valid.
@@ -311,7 +311,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	v.negativeCache = !opts.NoNegativeCache
 	v.openReg = newOpenRegistry(cli, v.VersionCache.CurrentGen, v.openFiles,
 		opts.OpenRetentionEntries, opts.Debugf)
-	// The write-back engine is part of every v5 mount: the authority decides
+	// The write-back engine is part of every v6 mount: the authority decides
 	// adaptively per scope whether to delegate; there is no mount-level
 	// write mode. PORTABLEFS_DEBUG_WRITE_THROUGH=1 is the only override
 	// (debug: never delegate; the engine still recovers parked streams).
@@ -331,15 +331,16 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	}
 	budget := opts.DiskCacheBytes / 2
 	wb, werr := writeback.Open(cctx, writeback.Config{
-		StateDir:          walDir,
-		VolumeID:          v.volumeID,
-		Branch:            opts.Branch,
-		Remote:            wbRemote{cli: cli},
-		BudgetBytes:       budget,
-		DisableDelegation: os.Getenv("PORTABLEFS_DEBUG_WRITE_THROUGH") == "1",
-		Busy:              v.opens.BusyUnder,
-		EnsureOpenPins:    v.ensureOpenPins,
-		Logf:              opts.Debugf,
+		StateDir:               walDir,
+		VolumeID:               v.volumeID,
+		Branch:                 opts.Branch,
+		Remote:                 wbRemote{cli: cli},
+		BudgetBytes:            budget,
+		DisableDelegation:      os.Getenv("PORTABLEFS_DEBUG_WRITE_THROUGH") == "1",
+		DisableDelegatedXattrs: cli.Features()&fsproto.FeatureDelegatedXattrs == 0,
+		Busy:                   v.opens.BusyUnder,
+		EnsureOpenPins:         v.ensureOpenPins,
+		Logf:                   opts.Debugf,
 		Events: writeback.Events{
 			OnGrant: func(scope string) {
 				// Shared attr/negative/directory/kernel entries under the

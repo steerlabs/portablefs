@@ -65,6 +65,9 @@ type exactSession struct {
 	gen   uint64
 	owner string
 	slots uint32
+	// features is the immutable bitmap returned by the protocol probe that
+	// preceded this session's establishment.
+	features uint64
 
 	mu       sync.Mutex
 	fenced   bool
@@ -231,6 +234,7 @@ func (c *Client) EnsureExactSession() (bool, error) {
 		return false, &ErrProtocolVersionMismatch{ServerVersion: probe.ProtoVersion}
 	}
 	es := newExactSession(c.owner, c.exactSlots)
+	es.features = probe.Features
 	// The exact (id, gen, owner, slots, token) tuple is idempotent, so a lost
 	// establish reply is safely replayed with the identical tuple.
 	var resp *Response
@@ -278,6 +282,17 @@ func (c *Client) EnsureExactSession() (bool, error) {
 	c.exactMu.Unlock()
 	go c.renewLoop(es)
 	return true, nil
+}
+
+// Features returns the optional capability bitmap negotiated before the
+// current exact session was established. Zero means either no live session
+// or an authority that advertises no optional features.
+func (c *Client) Features() uint64 {
+	es := c.exactState()
+	if es == nil {
+		return 0
+	}
+	return es.features
 }
 
 // renewLoop periodically resumes (durably renews) the session lease. On a

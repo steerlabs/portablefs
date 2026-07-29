@@ -112,8 +112,8 @@ func TestProbeNegotiation(t *testing.T) {
 	if r.Status != OK || r.ProtoVersion != ProtocolVersion {
 		t.Fatalf("probe: version=%d status=%d, want %d/OK", r.ProtoVersion, r.Status, ProtocolVersion)
 	}
-	if r.Features != 0 {
-		t.Fatalf("v6 advertises no optional features today: %b", r.Features)
+	if r.Features != FeatureDelegatedXattrs {
+		t.Fatalf("managed authority features = %b, want delegated xattrs", r.Features)
 	}
 	if r.LeaseMs <= 0 {
 		t.Fatalf("probe LeaseMs = %d, want > 0", r.LeaseMs)

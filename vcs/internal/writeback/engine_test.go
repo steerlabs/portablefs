@@ -401,7 +401,7 @@ func TestRecallDrainsAndReleases(t *testing.T) {
 }
 
 // TestReleaseForLeavesDelegatedMode pins the P1 write-through contract: a
-// caller about to run a write-through operation (hard link, orphan, xattr)
+// caller about to run a write-through operation (hard link or orphan)
 // releases the covering delegation FIRST — the acked tail drains, the grant
 // releases durably, and no delegation covers the paths afterward.
 func TestReleaseForLeavesDelegatedMode(t *testing.T) {

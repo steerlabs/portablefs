@@ -315,13 +315,12 @@ func validSessionFields(id, token, owner string) bool {
 		len(owner) <= MaxOwnerBytes
 }
 
-// probeResponse answers OpProtocolVersion. The v6 baseline is one version
-// with every capability mandatory: the response carries the version and the
-// session lease; Features stays on the wire for genuinely optional FUTURE
-// semantics and is zero today. clientVersion is the version the probing
-// client declared (Request.Size): anything but exactly ProtocolVersion is
-// refused EINVAL — with our version still in the response, so a newer client
-// reports the mismatch clearly, and an older one fails closed.
+// probeResponse answers OpProtocolVersion. The response carries the version,
+// optional feature bitmap, and session lease. clientVersion is the version
+// the probing client declared (Request.Size): anything but exactly
+// ProtocolVersion is refused EINVAL — with our version still in the response,
+// so a newer client reports the mismatch clearly, and an older one fails
+// closed.
 func (s *Server) probeResponse(clientVersion int64) *Response {
 	resp := &Response{ProtoVersion: ProtocolVersion, Gen: s.gen()}
 	if clientVersion != int64(ProtocolVersion) {
@@ -330,6 +329,9 @@ func (s *Server) probeResponse(clientVersion int64) *Response {
 	}
 	if s.exact != nil {
 		resp.LeaseMs = workfs.SessionLeaseTTL().Milliseconds()
+		if s.coordStore() != nil && s.supportsAtomicXattrFlags() {
+			resp.Features |= FeatureDelegatedXattrs
+		}
 	}
 	return resp
 }

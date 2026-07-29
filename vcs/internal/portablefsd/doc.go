@@ -8,11 +8,13 @@
 //
 // pfslocal exposes xattr and hard-link operations. Extended attributes are
 // served NATIVELY by the attached authority (xattrs are baseline; the
-// ResolveReply capability is per-attach): reads forward to the authority's
-// live xattr state, mutations journal write-through, and macOS stops minting
-// AppleDouble ._ sidecars. Against an older authority the ops return Darwin
-// ENOTSUP and macOS keeps its AppleDouble fallback. Hard links remain
-// ENOTSUP (no native authority support yet).
+// ResolveReply capability is per-attach): existing objects read from the
+// authority, while objects born inside a delegation keep their complete
+// xattr map in the same local WAL lane as file data. macOS therefore avoids
+// both AppleDouble ._ sidecars and a WAN drain/release cycle for each new
+// file. An earlier v6 authority that does not advertise delegated xattrs
+// still serves the same operations through the exact authority lane selected
+// during protocol negotiation.
 //
 // The pfslocal Item identity returned to filesystem frontends is stable across
 // daemon restarts for a revived attach. portablefsd uses the authority inode as

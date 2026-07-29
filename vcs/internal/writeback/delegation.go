@@ -327,6 +327,11 @@ func (e *Engine) dropScopeStateLocked(scope string) {
 			delete(e.files, p)
 		}
 	}
+	for p := range e.xattrs {
+		if pathUnder(p, scope) {
+			delete(e.xattrs, p)
+		}
+	}
 	// The scope root's entry lives in its parent's view; that view is not
 	// under the scope, so evict just the entry (its attrs may be stale once
 	// shared mode resumes).

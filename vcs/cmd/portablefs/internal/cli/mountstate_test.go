@@ -132,6 +132,46 @@ func TestMountsCommandListsState(t *testing.T) {
 	}
 }
 
+func TestMountsJSONNeverExposesPersistedAccessToken(t *testing.T) {
+	e, stdout, _ := testEnv(t)
+	stateHome := t.TempDir()
+	e.getenv = func(k string) string {
+		if k == "XDG_STATE_HOME" {
+			return stateHome
+		}
+		return ""
+	}
+	dir, err := e.mountStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "pfal_secret_that_must_not_reach_stdout"
+	if err := writeMountState(dir, mountState{
+		MountPath: "/tmp/w", VolumeID: "vol_1", Branch: "main",
+		PID: os.Getpid(), Strategy: "fuse",
+		AccessLease: &leaseState{
+			AccessLeaseID: "pfal_1",
+			AccessToken:   secret,
+			ExpiresAtMs:   1700000600000,
+			ControlSeq:    "7",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rc := e.run([]string{"mounts", "--json"}); rc != 0 {
+		t.Fatalf("mounts --json rc = %d", rc)
+	}
+	out := stdout.String()
+	if strings.Contains(out, secret) || strings.Contains(out, "accessToken") {
+		t.Fatalf("mounts --json exposed persisted credential: %q", out)
+	}
+	for _, want := range []string{`"mountPath": "/tmp/w"`, `"volumeId": "vol_1"`, `"health": "live"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("mounts --json missing %s: %q", want, out)
+		}
+	}
+}
+
 func TestSameOriginGatesTenancyOwnership(t *testing.T) {
 	cases := []struct {
 		name       string
