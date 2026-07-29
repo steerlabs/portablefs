@@ -38,8 +38,36 @@ Railway-specific wiring.
    gate already did the work) and serves `/readyz`.
 5. **history-worker** — needs the policy epoch from step 3's
    `pfh.history_policies` install and the stores JSON below.
-6. **authority-manager** — last: its children need the volume API, the
-   journal roles, and the installed HA policy to pass their own readiness.
+6. **authority-manager** — last, using the explicit stop-before-start
+   singleton handoff below: its children need the volume API, the journal
+   roles, and the installed HA policy to pass their own readiness.
+
+### Authority-manager singleton handoff
+
+Do not submit an ordinary health-gated rolling deploy for the
+`authority-manager`. Railway keeps the previous deployment active until the
+candidate passes `/readyz`, but a candidate manager correctly refuses readiness
+while the previous manager holds the live `pfm` claim. Neither side should
+weaken that fence.
+
+For this one service, perform an explicit stop-before-start handoff with exact
+project, environment, and service IDs:
+
+1. Confirm the currently active deployment and that the service is pinned to
+   one replica.
+2. Run `railway down --yes` with all three exact selectors. Wait for the command
+   to finish and verify the previous deployment is `REMOVED`. Its SIGTERM path
+   drains children and releases the manager claim; the configured 60-second
+   drain budget bounds that shutdown.
+3. Run `railway up --ci` from the clean, verified release checkout with the same
+   exact selectors.
+4. Require a successful Railway deployment, `GET /readyz`, and authenticated
+   `GET /v1/release-identity` readback before publishing the matching client
+   release or declaring the rollout complete.
+
+The bounded manager unavailability during this handoff is intentional. It is a
+fail-closed singleton transition, not a fallback. Never bypass the claim,
+disable readiness, run two replicas, or silently route around the manager.
 
 ## Environment matrix
 
