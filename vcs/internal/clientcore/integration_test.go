@@ -3,12 +3,13 @@ package clientcore
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/content"
+	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 	"net"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
@@ -28,21 +29,14 @@ func serveCore(t *testing.T) string {
 
 func serveCoreServer(t *testing.T) (string, *fsproto.Server) {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, testBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedTestFS(t, testBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	srv := fsproto.NewServer(fs, fs, delegation.New())
+	srv := fsproto.NewServer(fs, fs)
 	go func() { _ = srv.Serve(ctx, ln) }()
 	return ln.Addr().String(), srv
 }
@@ -57,6 +51,18 @@ func dialCore(t *testing.T, addr string, opts Options) *Volume {
 	}
 	t.Cleanup(func() { _ = v.Close() })
 	return v
+}
+
+// watchInvalidationsForTest starts the mount's invalidation stream and waits
+// for the subscription to establish. Delegation recalls ride this stream, so
+// any test that needs a holder to hand its scope to a contender (or that
+// observes peer invalidations) starts it explicitly.
+func watchInvalidationsForTest(t *testing.T, v *Volume) {
+	t.Helper()
+	ictx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go v.StartInvalidations(ictx, false)
+	time.Sleep(50 * time.Millisecond)
 }
 
 func dialCoreNoCleanup(t *testing.T, addr string, opts Options) *Volume {
@@ -147,13 +153,15 @@ func TestWriteBackAtomicAppendAddsNoHotPathRoundTrips(t *testing.T) {
 	addr := serveCore(t)
 	v := dialCore(t, addr, Options{
 		Owner:         "append-wb",
-		WriteBack:     true,
 		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
-		IdleInterval:  time.Hour,
 	})
 	ctx := context.Background()
-	attr, st := v.Create(ctx, "append.log", 0o644)
+	// A subtree path so the write-back engine delegates the parent directory
+	// (a top-level file's parent is the un-delegable volume root).
+	if _, st := v.Mkdir(ctx, "logs", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir logs: %d", st)
+	}
+	attr, st := v.Create(ctx, "logs/append.log", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("create: %d", st)
 	}
@@ -162,7 +170,7 @@ func TestWriteBackAtomicAppendAddsNoHotPathRoundTrips(t *testing.T) {
 	const records = 100
 	for i := 0; i < records; i++ {
 		payload := []byte{byte(i), byte(i >> 8), 0xA5, 0x5A}
-		if n, st := v.WriteAppend(ctx, "append.log", state, 0, payload); st != fsproto.OK || n != len(payload) {
+		if n, st := v.WriteAppend(ctx, "logs/append.log", state, 0, payload); st != fsproto.OK || n != len(payload) {
 			t.Fatalf("append %d: n=%d st=%d", i, n, st)
 		}
 	}
@@ -173,7 +181,7 @@ func TestWriteBackAtomicAppendAddsNoHotPathRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer := dialCore(t, addr, Options{Owner: "append-reader"})
-	data, st := peer.Read(ctx, "append.log", nil, 0, records*4)
+	data, st := peer.Read(ctx, "logs/append.log", nil, 0, records*4)
 	if st != fsproto.OK || len(data) != records*4 {
 		t.Fatalf("peer read: len=%d st=%d", len(data), st)
 	}
@@ -191,8 +199,7 @@ func TestNegativeCacheJunkProbeAndParentVersionBump(t *testing.T) {
 	b := dialCore(t, addr, Options{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.StartInvalidations(ctx, false)
-	time.Sleep(100 * time.Millisecond)
+	watchInvalidationsForTest(t, a)
 
 	start := opCount(a)
 	for i := 0; i < 5; i++ {
@@ -224,7 +231,6 @@ func TestSameVolumeCreateEvictsCachedNegativeWithoutEcho(t *testing.T) {
 	v := dialCore(t, addr, Options{NegativeCache: true, Owner: "same-volume-negative"})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go v.StartInvalidations(ctx, false)
 	time.Sleep(100 * time.Millisecond)
 
 	if _, st := v.Lookup(ctx, "ext.txt"); st != fsproto.ENOENT {
@@ -240,7 +246,7 @@ func TestSameVolumeCreateEvictsCachedNegativeWithoutEcho(t *testing.T) {
 
 func TestPrefetchTreeLeavesWarmMetadataCache(t *testing.T) {
 	addr := serveCore(t)
-	seed := dialCore(t, addr, Options{})
+	seed := dialCoreNoCleanup(t, addr, Options{})
 	ctx := context.Background()
 	if _, st := seed.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
 		t.Fatalf("mkdir seed: %d", st)
@@ -249,6 +255,13 @@ func TestPrefetchTreeLeavesWarmMetadataCache(t *testing.T) {
 		if _, st := seed.Create(ctx, p, 0o644); st != fsproto.OK {
 			t.Fatalf("create %s: %d", p, st)
 		}
+	}
+	// Close the seeder BEFORE prefetching: its creates under d/ ran under a
+	// delegation, and close drains + releases, so the tree the prefetcher
+	// walks is settled (no mid-walk recall bumping versions and forcing a
+	// revalidation).
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed close: %v", err)
 	}
 	v := dialCore(t, addr, Options{PrefetchTree: true, PrefetchMaxEntries: 10, PrefetchMaxDepth: 4})
 	deadline := time.Now().Add(3 * time.Second)
@@ -313,10 +326,7 @@ func TestDiskCacheDoesNotServeStaleAfterRemoteContentChange(t *testing.T) {
 	cacheDir := t.TempDir()
 	a := dialCore(t, addr, Options{DiskCacheDir: cacheDir, DiskCacheBytes: int64(DiskBlockSize * 2), VolumeID: "vol"})
 	b := dialCore(t, addr, Options{})
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
-	time.Sleep(100 * time.Millisecond)
+	watchInvalidationsForTest(t, a)
 
 	attr, st := a.Lookup(ctx, "big")
 	if st != fsproto.OK {
@@ -350,6 +360,7 @@ func TestCreateAfterNegativeEvictsAfterDelayedInvalidation(t *testing.T) {
 	addr := serveCore(t)
 	a := dialCore(t, addr, Options{NegativeCache: true})
 	b := dialCore(t, addr, Options{})
+	watchInvalidationsForTest(t, a)
 	ctx := context.Background()
 	if _, st := a.Lookup(ctx, "race"); st != fsproto.ENOENT {
 		t.Fatalf("initial negative: %d", st)
@@ -358,9 +369,6 @@ func TestCreateAfterNegativeEvictsAfterDelayedInvalidation(t *testing.T) {
 	// Delay A's stream deliberately: before A observes the parent-version bump,
 	// it may still return the old miss. Once the delayed stream is released, the
 	// parent version must evict that negative and the next lookup must see the file.
-	ictx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ictx, false)
 	if _, st := b.Create(ctx, "race", 0o644); st != fsproto.OK {
 		t.Fatalf("remote create: %d", st)
 	}
@@ -375,14 +383,9 @@ func TestWriteBackWALReplayAfterSimulatedCrash(t *testing.T) {
 	walDir := t.TempDir()
 	ctx := context.Background()
 	v := dialCoreNoCleanup(t, addr, Options{
-		Owner:         "replay-owner",
-		WriteBack:     true,
-		WALDir:        walDir,
-		FlushInterval: time.Hour,
+		Owner:  "replay-owner",
+		WALDir: walDir,
 	})
-	liveCtx, liveCancel := context.WithCancel(context.Background())
-	go v.StartInvalidations(liveCtx, false)
-	time.Sleep(100 * time.Millisecond)
 	a, st := v.Create(ctx, "wb", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("create: %d", st)
@@ -391,19 +394,25 @@ func TestWriteBackWALReplayAfterSimulatedCrash(t *testing.T) {
 	if _, st := v.Write(ctx, "wb", n, 0, []byte("from-wal")); st != fsproto.OK {
 		t.Fatalf("write: %d", st)
 	}
+	// Crash: no drain, no release, no CLOSE frame — the acknowledged tail
+	// survives only in the mount stream WAL.
+	v.Writeback().Abandon()
 	_ = v.client.Close()
-	time.Sleep(200 * time.Millisecond)
-	liveCancel()
 	v.cancel()
 
+	// The next attach of the same (volume, branch) store recovers: it
+	// rebinds the parked stream (fencing the dead session) and drains the
+	// tail before anything is lost.
 	replay := dialCore(t, addr, Options{
-		Owner:         "replay-owner",
-		WriteBack:     true,
-		WALDir:        walDir,
-		FlushInterval: time.Hour,
+		Owner:  "replay-owner2",
+		WALDir: walDir,
 	})
-	if err := replay.FlushToAuthority(ctx); err != nil {
-		t.Fatalf("replay flush: %v", err)
+	deadline := time.Now().Add(15 * time.Second)
+	for len(replay.RecoveryJobs()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("recovery did not resolve: %+v", replay.RecoveryJobs())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	reader := dialCore(t, addr, Options{})
 	attr, st := reader.Lookup(ctx, "wb")
@@ -417,7 +426,10 @@ func TestWriteBackWALReplayAfterSimulatedCrash(t *testing.T) {
 	}
 }
 
-func TestFsyncPolicyAuthorityBlocksOnFlushAndLocalDoesNot(t *testing.T) {
+// TestFsyncBlocksOnAuthorityFlush pins the ONLY fsync meaning: local WAL
+// durable AND the covering session drained to the authority — fsync returns
+// only after the flush lands (no policy, no local-only mode).
+func TestFsyncBlocksOnAuthorityFlush(t *testing.T) {
 	addr, srv := serveCoreServer(t)
 	blockFlush := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -430,22 +442,22 @@ func TestFsyncPolicyAuthorityBlocksOnFlushAndLocalDoesNot(t *testing.T) {
 	})
 	ctx := context.Background()
 	auth := dialCore(t, addr, Options{
-		Owner:         "fsync-authority",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
-		FsyncPolicy:   FsyncAuthority,
+		Owner:  "fsync-authority",
+		WALDir: t.TempDir(),
 	})
-	a, st := auth.Create(ctx, "auth", 0o644)
+	if _, st := auth.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir d: %d", st)
+	}
+	a, st := auth.Create(ctx, "d/auth", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("auth create: %d", st)
 	}
 	an := NewNodeState(a.Ino, a.Ino != 0)
-	if _, st := auth.Write(ctx, "auth", an, 0, []byte("durable")); st != fsproto.OK {
+	if _, st := auth.Write(ctx, "d/auth", an, 0, []byte("durable")); st != fsproto.OK {
 		t.Fatalf("auth write: %d", st)
 	}
 	done := make(chan Status, 1)
-	go func() { done <- auth.FsyncPath("auth") }()
+	go func() { done <- auth.FsyncPath("d/auth") }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -466,61 +478,13 @@ func TestFsyncPolicyAuthorityBlocksOnFlushAndLocalDoesNot(t *testing.T) {
 		t.Fatal("authority fsync did not complete after flush release")
 	}
 	reader := dialCore(t, addr, Options{})
-	attr, st := reader.Lookup(ctx, "auth")
+	attr, st := reader.Lookup(ctx, "d/auth")
 	if st != fsproto.OK {
 		t.Fatalf("reader lookup auth: %d", st)
 	}
-	data, st := reader.Read(ctx, "auth", NewNodeState(attr.Ino, attr.Ino != 0), 0, 16)
+	data, st := reader.Read(ctx, "d/auth", NewNodeState(attr.Ino, attr.Ino != 0), 0, 16)
 	if st != fsproto.OK || string(data) != "durable" {
 		t.Fatalf("reader after authority fsync: %q st=%d", data, st)
-	}
-}
-
-func TestFsyncPolicyLocalReturnsBeforeAuthorityFlush(t *testing.T) {
-	addr, srv := serveCoreServer(t)
-	blockFlush := make(chan struct{})
-	entered := make(chan struct{}, 1)
-	srv.SetBeforeFlushBatch(func() {
-		select {
-		case entered <- struct{}{}:
-		default:
-		}
-		<-blockFlush
-	})
-	ctx := context.Background()
-	local := dialCore(t, addr, Options{
-		Owner:         "fsync-local",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
-		FsyncPolicy:   FsyncLocal,
-	})
-	a, st := local.Create(ctx, "local", 0o644)
-	if st != fsproto.OK {
-		t.Fatalf("local create: %d", st)
-	}
-	n := NewNodeState(a.Ino, a.Ino != 0)
-	if _, st := local.Write(ctx, "local", n, 0, []byte("local-only")); st != fsproto.OK {
-		t.Fatalf("local write: %d", st)
-	}
-	done := make(chan Status, 1)
-	go func() { done <- local.FsyncPath("local") }()
-	select {
-	case st := <-done:
-		if st != fsproto.OK {
-			t.Fatalf("local fsync status: %d", st)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("local fsync blocked on authority flush")
-	}
-	select {
-	case <-entered:
-		t.Fatal("local fsync unexpectedly entered FlushBatch")
-	default:
-	}
-	close(blockFlush)
-	if err := local.FlushToAuthority(ctx); err != nil {
-		t.Fatalf("final flush: %v", err)
 	}
 }
 
@@ -528,61 +492,66 @@ func TestDelegationRecallForcesFlushBeforeContenderProceeds(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 	a := dialCore(t, addr, Options{
-		Owner:         "recall-a",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: 50 * time.Millisecond,
+		Owner:  "recall-a",
+		WALDir: t.TempDir(),
 	})
-	actx, cancelA := context.WithCancel(context.Background())
-	defer cancelA()
-	go a.StartInvalidations(actx, false)
-	time.Sleep(100 * time.Millisecond)
-	attr, st := a.Create(ctx, "shared", 0o644)
+	// A must receive the authority's recall over its invalidation stream.
+	watchInvalidationsForTest(t, a)
+	// A subtree path so A actually holds a delegation on "d" to be recalled.
+	if _, st := a.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("A mkdir d: %d", st)
+	}
+	attr, st := a.Create(ctx, "d/shared", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("A create: %d", st)
 	}
 	an := NewNodeState(attr.Ino, attr.Ino != 0)
-	if _, st := a.Write(ctx, "shared", an, 0, []byte("from-a")); st != fsproto.OK {
+	if _, st := a.Write(ctx, "d/shared", an, 0, []byte("from-a")); st != fsproto.OK {
 		t.Fatalf("A write: %d", st)
+	}
+	if !a.wb.Covers("d/shared") {
+		t.Fatal("precondition: A holds the d delegation")
 	}
 
 	b := dialCore(t, addr, Options{
-		Owner:         "recall-b",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
+		Owner:  "recall-b",
+		WALDir: t.TempDir(),
 	})
 	bn := NewNodeState(attr.Ino, attr.Ino != 0)
 	bctx, bcancel := context.WithTimeout(ctx, 6*time.Second)
 	defer bcancel()
-	if _, st := b.Write(bctx, "shared", bn, 0, []byte("from-b")); st != fsproto.OK {
+	// B's write overlaps A's delegation: the authority recalls A, A drains
+	// its acknowledged create+write, and only then does B's write-through
+	// apply. B's success itself proves the ordering — a gated write against
+	// an undrained create would have found no file (WriteAtExistingAs).
+	if _, st := b.Write(bctx, "d/shared", bn, 0, []byte("from-b")); st != fsproto.OK {
 		t.Fatalf("B write after recall: %d", st)
 	}
+	if a.wb.Covers("d/shared") {
+		t.Fatal("A still covers the recalled scope")
+	}
 	reader := dialCore(t, addr, Options{})
-	ra, st := reader.Lookup(ctx, "shared")
+	ra, st := reader.Lookup(ctx, "d/shared")
 	if st != fsproto.OK {
 		t.Fatalf("reader lookup: %d", st)
 	}
-	data, st := reader.Read(ctx, "shared", NewNodeState(ra.Ino, ra.Ino != 0), 0, 16)
-	if st != fsproto.OK || string(data) != "from-a" {
-		t.Fatalf("authority did not contain recalled A data before B flush: %q st=%d", data, st)
+	data, st := reader.Read(ctx, "d/shared", NewNodeState(ra.Ino, ra.Ino != 0), 0, 16)
+	if st != fsproto.OK || string(data) != "from-b" {
+		t.Fatalf("authority must hold B's write ordered after A's drained state: %q st=%d", data, st)
 	}
 }
 
 func TestTwoClientInvalidationOrdering(t *testing.T) {
 	addr := serveCore(t)
 	events := make(chan bool, 4)
-	a := dialCore(t, addr, Options{
+	observer := dialCore(t, addr, Options{
 		OnInvalidate: func(path string, inPlace bool) {
 			if path == "ordered" {
 				events <- inPlace
 			}
 		},
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go a.StartInvalidations(ctx, false)
-	time.Sleep(100 * time.Millisecond)
+	watchInvalidationsForTest(t, observer)
 
 	b := dialCore(t, addr, Options{})
 	attr, st := b.Create(context.Background(), "ordered", 0o644)
@@ -632,10 +601,7 @@ func TestHardLinkInvalidationFansOutByInode(t *testing.T) {
 			}
 		},
 	})
-	watchCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go reader.StartInvalidations(watchCtx, false)
-	time.Sleep(100 * time.Millisecond)
+	watchInvalidationsForTest(t, reader)
 	if a, st := reader.Lookup(ctx, "source"); st != fsproto.OK || a.Nlink != 2 {
 		t.Fatalf("reader source=%+v st=%d", a, st)
 	}
@@ -675,4 +641,24 @@ sawAliasWrite:
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// newManagedTestFS opens the file-backed PFJ3 entry log at walPath and builds
+// the MANAGED workfs over it — the only generation a v5 server serves.
+func newManagedTestFS(t testing.TB, blobs content.BlobReader, walPath string) *workfs.FS {
+	t.Helper()
+	w, err := wal.Open(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	flog, err := pfj3.NewFileEntryLog(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs, err := workfs.NewManaged(nil, blobs, flog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs
 }

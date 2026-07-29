@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { BlobRangeNotSatisfiableError, sha256Buffer } from "@portablefs/core";
-import { S3BlobStore, s3ConfigFromAnyEnv } from "./index.js";
+import { S3BlobStore, s3ConfigFromEnv, signS3RequestHeaders } from "./index.js";
 
 async function collect(stream: AsyncIterable<Buffer>): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -348,9 +348,9 @@ describe("S3BlobStore", () => {
     expect(Buffer.concat(received).byteLength).toBeLessThan(bytes.byteLength);
   });
 
-  test("accepts Railway CLI credential environment shape", () => {
+  test("reads the canonical AWS_* environment shape", () => {
     expect(
-      s3ConfigFromAnyEnv({
+      s3ConfigFromEnv({
         AWS_ENDPOINT_URL: "https://t3.storageapi.dev",
         AWS_S3_BUCKET_NAME: "bucket-test",
         AWS_DEFAULT_REGION: "auto",
@@ -366,9 +366,9 @@ describe("S3BlobStore", () => {
     });
   });
 
-  test("prefers VOLUME_RAILWAY_BUCKET_* variables over AWS_* fallbacks", () => {
+  test("maps the retired VOLUME_RAILWAY_BUCKET_* spellings onto the canonical names, whole-family", () => {
     expect(
-      s3ConfigFromAnyEnv({
+      s3ConfigFromEnv({
         VOLUME_RAILWAY_BUCKET_ENDPOINT: "https://buckets.example.test",
         VOLUME_RAILWAY_BUCKET_NAME: "explicit-bucket",
         VOLUME_RAILWAY_BUCKET_ACCESS_KEY_ID: "explicit-access",
@@ -384,5 +384,62 @@ describe("S3BlobStore", () => {
       accessKeyId: "explicit-access",
       prefix: "portablefs",
     });
+  });
+
+  test("aliases the retired prefix/SSE spellings independently of the credential family", () => {
+    expect(
+      s3ConfigFromEnv({
+        AWS_ENDPOINT_URL: "https://t3.storageapi.dev",
+        AWS_S3_BUCKET_NAME: "bucket-test",
+        AWS_ACCESS_KEY_ID: "access",
+        AWS_SECRET_ACCESS_KEY: "secret",
+        VOLUME_RAILWAY_BUCKET_PREFIX: "legacy-prefix",
+        VOLUME_RAILWAY_BUCKET_SSE: "AES256",
+      })
+    ).toMatchObject({
+      prefix: "legacy-prefix",
+      serverSideEncryption: "AES256",
+    });
+  });
+
+  test("signs a fixed request deterministically (the one shared SigV4 signer)", () => {
+    const headers = signS3RequestHeaders({
+      method: "GET",
+      url: new URL("https://bkt.t3.storageapi.dev/history/t/local/pft2/sha256/ab/cd/i1"),
+      region: "auto",
+      accessKeyId: "AKIDEXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      now: new Date("2026-01-02T03:04:05.000Z"),
+    });
+    expect(headers["x-amz-date"]).toBe("20260102T030405Z");
+    expect(headers["x-amz-content-sha256"]).toBe(
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    expect(headers.authorization).toBe(
+      "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260102/auto/s3/aws4_request, " +
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, " +
+        "Signature=a32fcfd0b969c426664d10dabcd86fd6f4b5eac7bd7286fb8cff665e890ad913"
+    );
+  });
+
+  test("canonicalizes query parameters per SigV4 (sorted, %20 spaces, extras escaped)", () => {
+    const base = {
+      method: "GET" as const,
+      region: "auto",
+      accessKeyId: "AKIDEXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      now: new Date("2026-01-02T03:04:05.000Z"),
+    };
+    // Same logical query, two insertion orders and one '+'-space spelling:
+    // canonical signing must produce the identical signature for all three.
+    const a = signS3RequestHeaders({
+      ...base,
+      url: new URL("https://bkt.example.com/k?prefix=a b&list-type=2&marker=x*(1)"),
+    });
+    const b = signS3RequestHeaders({
+      ...base,
+      url: new URL("https://bkt.example.com/k?marker=x*(1)&prefix=a+b&list-type=2"),
+    });
+    expect(a.authorization).toBe(b.authorization);
   });
 });

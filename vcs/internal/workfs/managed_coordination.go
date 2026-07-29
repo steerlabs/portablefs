@@ -20,6 +20,8 @@ package workfs
 // Reserved-but-unapplied state never acknowledges anything.
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -348,7 +350,7 @@ var errPinAlreadyHeld = errors.New("vcs: open pin already held (idempotent ensur
 
 // ManagedEnsureOpenPin journals ONE open-pin acquisition for ref on ino
 // unless the session's pin is already staged — the FUSED create+register
-// ensure step (FeatOpenRegistration on the managed generation). Unlike
+// ensure step (baseline open registration on the managed generation). Unlike
 // ManagedPinChange it consumes NO exact identity: the fused create's
 // identity was consumed by the create's own journaled row, and this ensure
 // step re-runs on EVERY reply attempt for that identity — fresh execution
@@ -546,41 +548,70 @@ func (s *mutationSequencer) waitApplied(target uint64) error {
 
 // ─── managed write-back flush ────────────────────────────────────────────────
 
-// ManagedFlushRow is one write-back record with its local (mount) sequence.
+// ManagedFlushRow is one write-back record with its global stream sequence.
 type ManagedFlushRow struct {
-	LocalSeq uint64
-	Record   wal.Record
+	Seq    uint64
+	Record wal.Record
 }
 
-// ManagedFlushThrough reads the durable flush watermark for one write-back
-// identity (session, writebackID, checkoutPath, checkoutEpoch).
-func (fs *FS) ManagedFlushThrough(ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string) (uint64, bool, error) {
+// ErrWritebackCorrupt is the definite verdict that a flush contradicted the
+// stream's durable identity (a sequence gap or digest divergence): the stream
+// must never advance past it, and the client parks into a typed recovery job.
+var ErrWritebackCorrupt = errors.New("vcs: write-back stream contradicts its durable watermark/digest")
+
+// ManagedWritebackState reads one mount stream's durable watermark + digest.
+func (fs *FS) ManagedWritebackState(writebackID string) (pfc2.StreamStateView, bool, error) {
 	if fs.managed == nil {
-		return 0, false, ErrNotManaged
+		return pfc2.StreamStateView{}, false, ErrNotManaged
 	}
-	through, ok := fs.managed.applied.FlushThrough(ref, writebackID, cleanPath(checkoutPath), pfc2.Epoch(checkoutEpoch))
-	return through, ok, nil
+	view, ok := fs.managed.applied.StreamState(writebackID)
+	return view, ok, nil
 }
 
-// ManagedFlushApply applies a write-back flush as ordered PFJ3 rows: each
-// user record is ONE row whose controls carry the matching FlushAdvance —
-// tree state never applies without its watermark and the watermark never
-// advances without its tree state (same journal row, same fenced
-// transaction). The ledger maps a local writeback sequence to
-// Through = LocalSeq + 1, DENSE: every applied record advances the watermark
-// by exactly one, local sequence 0 (a fresh session WAL's first record) is
-// representable, a retry drops exactly the durably covered prefix, and the
-// remainder must continue at previous+1 (anything else is a corrupt or
-// reordered flush and rejects before any reservation). The whole bounded
-// batch stages as one ordered row list behind ONE CommitThrough barrier. An
-// oversized write splits into bounded chunks with the advance riding ONLY
-// the final chunk (earlier chunks are idempotently re-covered by a retry).
-// When env carries the flush RPC's exact identity, one final control-only
-// row stores the definite AppliedThrough (Outcome.Offset) so a lost-reply
-// retry replays the identical answer without touching the ledger. Returns
-// the durable through watermark (== AppliedThrough semantics: local
-// sequences strictly below it are durable).
-func (fs *FS) ManagedFlushApply(env *wal.Envelope, envHash []byte, ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string, rows []ManagedFlushRow, owner string) (uint64, error) {
+// writebackStreamDigest chains the mutation-stream digest exactly like the
+// client WAL: the canonical PFR1 bytes of the record with its stream
+// sequence zeroed.
+func writebackStreamDigest(prev [32]byte, seq uint64, rec wal.Record) ([32]byte, error) {
+	rec.Seq = 0
+	rec.Env = nil
+	payload, err := wal.EncodePFR1(&rec)
+	if err != nil {
+		return prev, err
+	}
+	inner := sha256.Sum256(payload)
+	h := sha256.New()
+	h.Write([]byte("PortableFS/PFW5/stream/v1\x00"))
+	h.Write(prev[:])
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], seq)
+	h.Write(b[:])
+	h.Write(inner[:])
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out, nil
+}
+
+// ManagedFlushApply applies one dense run of a mount write-back stream as
+// ordered PFJ3 rows: each user record is ONE row whose controls carry the
+// matching FlushAdvance — tree state never applies without its watermark and
+// the watermark never advances without its tree state (same journal row,
+// same fenced transaction). The stream is one dense global sequence: rows at
+// or below the durable watermark are dropped (retry catch-up), the remainder
+// must continue at watermark+1 with no gaps, and the chained stream digest
+// must extend the durable digest to endDigest exactly — a contradiction is
+// the typed ErrWritebackCorrupt, never a partial apply. The whole bounded
+// batch stages as one ordered row list behind ONE CommitThrough barrier.
+// Returns the stream's durable through watermark.
+// pathWithinClean reports whether p equals root or lies beneath it; both must
+// already be cleanPath output (canonical, no leading/trailing slash).
+func pathWithinClean(p, root string) bool {
+	if root == "" || p == root {
+		return true
+	}
+	return len(p) > len(root) && p[:len(root)] == root && p[len(root)] == '/'
+}
+
+func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, writebackID, checkoutPath, checkoutEpoch string, prevDigest, endDigest [32]byte, rows []ManagedFlushRow, owner string) (uint64, error) {
 	if fs.managed == nil {
 		return 0, ErrNotManaged
 	}
@@ -589,42 +620,51 @@ func (fs *FS) ManagedFlushApply(env *wal.Envelope, envHash []byte, ref pfc2.Sess
 	if err := epoch.Validate(); err != nil {
 		return 0, invalidMutation("flush checkout epoch: %v", err)
 	}
-	durable, _, err := fs.ManagedFlushThrough(ref, writebackID, canonical, checkoutEpoch)
-	if err != nil {
-		return 0, err
+	durable := uint64(0)
+	digest := digestZeroStream()
+	if view, ok := fs.managed.applied.StreamState(writebackID); ok {
+		durable, digest = view.Through, view.Digest
 	}
-	// The grant must be live at admission; each row's FlushAdvance
-	// re-validates it at its own ordered position (a mid-flush transfer
-	// fences the remainder).
-	if g, ok := fs.managed.reserved.CheckoutAt(canonical); !ok || g.Holder != ref || g.Epoch != epoch {
+	// The grant must be live and stream-bound at admission; each row's
+	// FlushAdvance re-validates it at its own ordered position.
+	g, ok := fs.managed.reserved.CheckoutAt(canonical)
+	if !ok || g.Holder != ref || g.Epoch != epoch || g.Recovery {
 		return durable, ErrSessionStale
+	}
+	if g.WritebackID != writebackID {
+		// The bound stream ID is a recovery CAPABILITY: never disclose it to
+		// a caller presenting a different one.
+		return durable, fmt.Errorf("%w: grant %q is bound to a different write-back stream", ErrWritebackCorrupt, canonical)
 	}
 	var specs []entrySpec
 	next := durable
-	established := durable > 0 // false only for the first-ever flush of this writeback id
+	applied := false
 	for _, row := range rows {
 		if row.Record.Op.IsControl() || row.Record.Op.IsBatch() {
 			return durable, invalidMutation("managed flush records must be plain user mutations (watermarks ride natively as FlushAdvance)")
 		}
-		through := row.LocalSeq + 1
-		if through == 0 {
-			return durable, invalidMutation("flush local sequence overflows the ledger domain")
+		// Defense in depth against a mis-canonicalized gate: the applied path
+		// (cleanPath, ".."-resolved) must stay inside the delegated subtree.
+		if !pathWithinClean(cleanPath(row.Record.Path), canonical) ||
+			(row.Record.NewPath != "" && !pathWithinClean(cleanPath(row.Record.NewPath), canonical)) {
+			return durable, invalidMutation("flush record %q escapes delegated subtree %q", row.Record.Path, canonical)
 		}
-		if through <= durable {
+		if row.Seq <= durable {
 			continue // already durably covered (retry catch-up)
 		}
-		if !established {
-			// First-ever flush of this writeback id: its first record's
-			// local sequence establishes the base; everything after must be
-			// strictly contiguous (+1). Retries re-establish the identical
-			// base deterministically.
-			established = true
-			next = through
-		} else if through != next+1 {
-			return durable, invalidMutation("flush is not dense: local sequence %d does not continue the covered prefix (next expected %d)", row.LocalSeq, next)
-		} else {
-			next = through
+		if row.Seq != next+1 {
+			return durable, fmt.Errorf("%w: sequence %d does not continue the durable watermark %d", ErrWritebackCorrupt, row.Seq, next)
 		}
+		if !applied && prevDigest != ([32]byte{}) && next == durable && row.Seq == durable+1 && prevDigest != digest {
+			return durable, fmt.Errorf("%w: presented digest does not extend the durable stream digest", ErrWritebackCorrupt)
+		}
+		var derr error
+		digest, derr = writebackStreamDigest(digest, row.Seq, row.Record)
+		if derr != nil {
+			return durable, derr
+		}
+		next = row.Seq
+		applied = true
 		chunks, err := fs.splitFlushRecord(row.Record)
 		if err != nil {
 			return durable, err
@@ -632,65 +672,32 @@ func (fs *FS) ManagedFlushApply(env *wal.Envelope, envHash []byte, ref pfc2.Sess
 		for ci, chunk := range chunks {
 			spec := entrySpec{tree: new(wal.Record)}
 			*spec.tree = chunk
-			spec.tree.Seq = 0 // the journal assigns the LSN; LocalSeq rides the advance
+			spec.tree.Seq = 0 // the journal assigns the LSN; the stream seq rides the advance
 			if ci == len(chunks)-1 {
 				spec.controls = []pfc2.Record{{Kind: pfc2.KindFlushAdvance, FlushAdvance: &pfc2.FlushAdvance{
 					Session: ref, WritebackID: writebackID,
 					CheckoutPath: canonical, CheckoutEpoch: epoch,
-					Through: through,
+					Through: row.Seq, Digest: digest,
 				}}}
-				spec.through = through
+				spec.through = row.Seq
 			}
 			specs = append(specs, spec)
 		}
 	}
-	finalThrough := next // ledger units (Seq+1); dense
-	// The client-visible AppliedThrough is the highest local Seq durably
-	// covered (Through−1): "records with Seq ≤ AppliedThrough are durable".
-	appliedSeq := int64(-1)
-	if finalThrough > 0 {
-		appliedSeq = int64(finalThrough) - 1
+	if !applied {
+		return durable, nil
 	}
-	if env.Valid() {
-		// The flush RPC's own exact identity: one final control-only row in
-		// the SAME ordered group stores the definite AppliedThrough, so a
-		// lost-reply retry replays the identical outcome.
-		key, kerr := managedExactKey(env)
-		if kerr != nil {
-			return uint64(max64(appliedSeq, 0)), kerr
-		}
-		if err := envHashExact(env, envHash); err != nil {
-			return uint64(max64(appliedSeq, 0)), err
-		}
-		specs = append(specs, entrySpec{controls: []pfc2.Record{{
-			Kind: pfc2.KindExactOutcome, ExactOutcome: &pfc2.ExactOutcome{
-				Key: key, Outcome: pfc2.Outcome{Offset: appliedSeq},
-			},
-		}}})
+	if digest != endDigest {
+		return durable, fmt.Errorf("%w: batch digest does not match the presented end digest", ErrWritebackCorrupt)
 	}
-	if len(specs) == 0 {
-		return uint64(max64(appliedSeq, int64(durableSeq(durable)))), nil
+	if through, err := fs.commitEntriesGroup(specs, owner); err != nil {
+		return max(durable, through), classifyCoordinationCommit(err)
 	}
-	if _, err := fs.commitEntriesGroup(specs, owner); err != nil {
-		return uint64(durableSeq(durable)), classifyCoordinationCommit(err)
-	}
-	return uint64(max64(appliedSeq, 0)), nil
+	return next, nil
 }
 
-// durableSeq converts a ledger Through watermark (Seq+1) to the highest
-// durable local Seq (0 when nothing is covered).
-func durableSeq(through uint64) int64 {
-	if through == 0 {
-		return 0
-	}
-	return int64(through) - 1
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
+func digestZeroStream() [32]byte {
+	return sha256.Sum256([]byte("PortableFS/PFW5/empty/v1\x00"))
 }
 
 // splitFlushRecord splits one oversized plain write into bounded chunks

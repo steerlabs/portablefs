@@ -11,10 +11,10 @@ import (
 )
 
 type fakeSub struct {
-	ch chan []coherence.Invalidation
+	ch chan coherence.Batch
 }
 
-func (f *fakeSub) Subscribe() (<-chan []coherence.Invalidation, error) { return f.ch, nil }
+func (f *fakeSub) Subscribe() (<-chan coherence.Batch, fsproto.AckFunc, error) { return f.ch, nil, nil }
 
 type fakeHandler struct {
 	mu       sync.Mutex
@@ -55,7 +55,7 @@ func (h *fakeHandler) ReleaseSubtree(p string) {
 func TestNameChangeInvalidationBumpsParentVersion(t *testing.T) {
 	attrs := NewAttrCache()
 	versions := NewVersionCache()
-	sub := &fakeSub{ch: make(chan []coherence.Invalidation, 4)}
+	sub := &fakeSub{ch: make(chan coherence.Batch, 4)}
 	h := &fakeHandler{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -78,7 +78,7 @@ func TestNameChangeInvalidationBumpsParentVersion(t *testing.T) {
 	versions.FillOK(7, "dir", 1)
 
 	// A NAME change under "dir" (in-place false) must advance dir's recorded version to the event's.
-	sub.ch <- []coherence.Invalidation{{Path: "dir/new", Version: 4, Gen: 7, InPlace: false}}
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{Path: "dir/new", Version: 4, Gen: 7, InPlace: false}}}
 	deadline = time.Now().Add(time.Second)
 	for {
 		if _, v := versions.GenAndVersion("dir"); v >= 4 {
@@ -93,7 +93,7 @@ func TestNameChangeInvalidationBumpsParentVersion(t *testing.T) {
 
 	// A subsequent IN-PLACE change to a child must NOT advance the parent version.
 	before := func() uint64 { _, v := versions.GenAndVersion("dir"); return v }()
-	sub.ch <- []coherence.Invalidation{{Path: "dir/new", Version: 5, Gen: 7, InPlace: true}}
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{Path: "dir/new", Version: 5, Gen: 7, InPlace: true}}}
 	time.Sleep(50 * time.Millisecond)
 	if _, v := versions.GenAndVersion("dir"); v != before {
 		t.Fatalf("in-place change must not bump parent version: got %d want %d", v, before)
@@ -103,7 +103,7 @@ func TestNameChangeInvalidationBumpsParentVersion(t *testing.T) {
 func TestWatchInvalidationsAppliesVersionedEvents(t *testing.T) {
 	attrs := NewAttrCache()
 	versions := NewVersionCache()
-	sub := &fakeSub{ch: make(chan []coherence.Invalidation, 4)}
+	sub := &fakeSub{ch: make(chan coherence.Batch, 4)}
 	h := &fakeHandler{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -128,7 +128,7 @@ func TestWatchInvalidationsAppliesVersionedEvents(t *testing.T) {
 	versions.FillOK(5, "dir/file", 1)
 	versions.FillOK(5, "dir", 1)
 
-	sub.ch <- []coherence.Invalidation{{Path: "dir/file", Version: 2, Gen: 5, Orphaned: true, OrphanIno: 99}}
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{Path: "dir/file", Version: 2, Gen: 5, Orphaned: true, OrphanIno: 99}}}
 	deadline = time.Now().Add(time.Second)
 	for {
 		if _, ok := attrs.Get(5, 2, "dir/file"); !ok {
@@ -143,7 +143,7 @@ func TestWatchInvalidationsAppliesVersionedEvents(t *testing.T) {
 		t.Fatal("negative should miss after parent version was recorded from name-change invalidation")
 	}
 
-	sub.ch <- []coherence.Invalidation{{Recall: true, Path: "dir"}}
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{Recall: true, Path: "dir"}}}
 	deadline = time.Now().Add(time.Second)
 	for {
 		h.mu.Lock()

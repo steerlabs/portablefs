@@ -50,13 +50,11 @@ clears stored credentials.
 long-lived agent sessions. A mount is a normal directory; every tool works
 unchanged, and hot reads run at local page-cache speed.
 
-Add `--fast` to a FUSE mount when this machine is the only writer and the work
-is build/install-heavy (npm ci, cargo build, test suites): writes batch and
-flush every 250ms instead of round-tripping per operation (~25x faster on
-small-file storms). fsync stays a real durability barrier — git commits and
-SQLite transactions are durable at the authority when fsync returns — and
-other machines see the writes after the next flush (≤250ms) instead of
-instantly. Skip `--fast` when two machines edit the same files live.
+Write mode is adaptive and has no mount flag: the authority delegates
+uncontended scopes for local-WAL acknowledgments and keeps contended paths
+write-through. `fsync`, close, synchronize, and normal unmount remain real
+authority-durability barriers. Use `--local-dir` for machine-specific build
+trees such as `node_modules`, `.venv`, or `target`.
 
 **Exec/grep** when you need one-shot answers and cannot or should not mount: no
 FUSE in this environment, a quick inspection of another workspace, or comparing

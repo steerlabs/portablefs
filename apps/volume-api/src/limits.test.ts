@@ -19,9 +19,11 @@ describe("AdmissionController", () => {
 
   test("rejects above a route's own concurrency cap while other routes stay admittable", () => {
     const admission = new AdmissionController({ maxActiveRequests: 100 });
-    admission.admit(routePolicies.exec, 0); // exec concurrency is 1
-    expect(() => admission.admit(routePolicies.exec, 0)).toThrowError(/concurrency limit/);
-    // A different route is not starved by the exec cap.
+    for (let i = 0; i < routePolicies.grep.concurrency!; i += 1) {
+      admission.admit(routePolicies.grep, 0);
+    }
+    expect(() => admission.admit(routePolicies.grep, 0)).toThrowError(/concurrency limit/);
+    // A different route is not starved by the grep cap.
     const permit = admission.admit(routePolicies.control, 0);
     permit.release();
   });

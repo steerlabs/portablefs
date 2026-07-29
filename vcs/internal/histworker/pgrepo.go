@@ -168,9 +168,49 @@ func (r *pgRepository) RecordCopyReceipt(ctx context.Context, cutID string, clai
 	return mapPgError(err)
 }
 
+func (r *pgRepository) RecordCopyReceipts(ctx context.Context, cutID string, claimEpoch int64, receipts []CopyReceipt) error {
+	payload, err := marshalJSON(receipts)
+	if err != nil {
+		return err
+	}
+	_, err = r.pool.Exec(ctx, sqlObjectCopyReceiptBatch, cutID, claimEpoch, payload)
+	return mapPgError(err)
+}
+
 func (r *pgRepository) AddCutObjects(ctx context.Context, cutID string, claimEpoch int64, closure string, digests []string) error {
 	_, err := r.pool.Exec(ctx, sqlCutObjectsAdd, cutID, claimEpoch, closure, digests)
 	return mapPgError(err)
+}
+
+func (r *pgRepository) AddCutObjectsFromBase(ctx context.Context, cutID string, claimEpoch int64) (ClosureTotals, error) {
+	var raw []byte
+	if err := r.pool.QueryRow(ctx, sqlCutObjectsAddFromBase, cutID, claimEpoch).Scan(&raw); err != nil {
+		return ClosureTotals{}, mapPgError(err)
+	}
+	var out struct {
+		UserObjectCount     string `json:"userObjectCount"`
+		UserObjectBytes     string `json:"userObjectBytes"`
+		RecoveryObjectCount string `json:"recoveryObjectCount"`
+		RecoveryObjectBytes string `json:"recoveryObjectBytes"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return ClosureTotals{}, fmt.Errorf("histworker: closure totals decode: %w", err)
+	}
+	var totals ClosureTotals
+	var err error
+	if totals.UserObjectCount, err = parseInt64(out.UserObjectCount, "user closure count"); err != nil {
+		return ClosureTotals{}, err
+	}
+	if totals.UserObjectBytes, err = parseInt64(out.UserObjectBytes, "user closure bytes"); err != nil {
+		return ClosureTotals{}, err
+	}
+	if totals.RecoveryObjectCount, err = parseInt64(out.RecoveryObjectCount, "recovery closure count"); err != nil {
+		return ClosureTotals{}, err
+	}
+	if totals.RecoveryObjectBytes, err = parseInt64(out.RecoveryObjectBytes, "recovery closure bytes"); err != nil {
+		return ClosureTotals{}, err
+	}
+	return totals, nil
 }
 
 func (r *pgRepository) MarkCutReady(ctx context.Context, ready ReadyFacts) error {
@@ -214,6 +254,29 @@ func (r *pgRepository) LocateObject(ctx context.Context, tenantID, kind, digest 
 		return nil, mapPgError(err)
 	}
 	return DecodeObjectLocation(raw)
+}
+
+func (r *pgRepository) LocateObjects(ctx context.Context, tenantID, kind string, digests []string) (map[string]*ObjectLocation, error) {
+	rows, err := r.pool.Query(ctx, sqlObjectLocateBatch, tenantID, kind, digests)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+	out := make(map[string]*ObjectLocation, len(digests))
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		loc, err := DecodeObjectLocation(raw)
+		if err != nil {
+			return nil, err
+		}
+		if loc != nil {
+			out[loc.Digest] = loc
+		}
+	}
+	return out, mapPgError(rows.Err())
 }
 
 func (r *pgRepository) LocateLegacyBlob(ctx context.Context, cutID string, claimEpoch int64, digest string) (*LegacyBlobLocation, error) {
@@ -387,6 +450,20 @@ func (r *pgRepository) RecordRepairReceipt(ctx context.Context, workerID string,
 		workerID, claim.TenantID, claim.Kind, claim.Digest, claim.Incarnation,
 		claim.MissingDomain, claim.ClaimEpoch, storageKey, claim.Size)
 	return mapPgError(err)
+}
+
+func (r *pgRepository) RetentionRelease(ctx context.Context, limit int) (int64, error) {
+	var raw []byte
+	if err := r.pool.QueryRow(ctx, sqlRetentionRelease, limit).Scan(&raw); err != nil {
+		return 0, mapPgError(err)
+	}
+	var out struct {
+		AdoptionConsumersReleased string `json:"adoptionConsumersReleased"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return 0, fmt.Errorf("histworker: retention release decode: %w", err)
+	}
+	return parseInt64(out.AdoptionConsumersReleased, "retention released count")
 }
 
 func (r *pgRepository) ClaimSweep(ctx context.Context, workerID string, minAgeMs, leaseTTLMs int64) (*SweepClaim, error) {

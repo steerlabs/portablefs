@@ -8,5 +8,4 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "building PortableFS binaries for ${GOOS}/${GOARCH}"
 GOOS="$GOOS" GOARCH="$GOARCH" go build -C "$ROOT/vcs" -o "$ROOT/vcs-bin" ./cmd/vcs
-GOOS="$GOOS" GOARCH="$GOARCH" go build -C "$ROOT/vcs" -o "$ROOT/mount-bin" ./cmd/mount
 GOOS="$GOOS" GOARCH="$GOARCH" go build -C "$ROOT/vcs" -o "$ROOT/portablefsd-bin" ./cmd/portablefsd

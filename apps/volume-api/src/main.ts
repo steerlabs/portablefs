@@ -1,5 +1,5 @@
 import { createVolumeApiServer, type HttpServerDefenses } from "./server.js";
-import { intEnv as intEnvOf, rejectRetiredExecEnv, semverEnv } from "./config.js";
+import { intEnv as intEnvOf, semverEnv } from "./config.js";
 import {
   HistoryMaintenanceLoop,
   historyMaintenanceSettingsFromEnv,
@@ -15,7 +15,7 @@ import {
   FilesystemBlobStore,
   filesystemBlobStoreConfigFromEnv,
 } from "@portablefs/storage-filesystem";
-import { S3BlobStore, s3ConfigFromAnyEnv } from "@portablefs/storage-s3";
+import { S3BlobStore, s3ConfigFromEnv } from "@portablefs/storage-s3";
 
 const databaseUrl = requiredEnv("VOLUME_DATABASE_URL");
 const port = Number(process.env.PORT || process.env.VOLUME_API_PORT || 8787);
@@ -37,6 +37,19 @@ const metadata = new PostgresMetadataRepository({
 console.log("PortableFS API applying metadata migrations.");
 await metadata.applyMigrations();
 console.log("PortableFS API metadata migrations are ready.");
+
+// Data gate for the retired pfr1/pfc1 journal codec era: serving and
+// binding reads accept only pfj3/pfc2 (migration 012+), so a deployment
+// still carrying a pre-012 generation row must stop HERE with a clear
+// message instead of failing per-request. One cheap query at startup.
+const legacyGenerations = await metadata.countPreJournalV3Generations();
+if (legacyGenerations > 0) {
+  throw new Error(
+    `${legacyGenerations} journal generation(s) still use the retired pfr1/pfc1 codec pair. ` +
+      "This volume-api serves only pfj3/pfc2 (migration 012+): retire or migrate those branches " +
+      "onto new-generation journals before upgrading."
+  );
+}
 
 const blobStore = createBlobStore(process.env);
 
@@ -128,8 +141,6 @@ const readiness = new ControlReadiness({
   controlProbe: (options) => metadata.probeControlPlane(options),
 });
 
-rejectRetiredExecEnv(process.env);
-
 const server = createVolumeApiServer({
   metadata,
   blobStore,
@@ -190,15 +201,17 @@ function httpDefensesFromEnv(): HttpServerDefenses {
 }
 
 function createBlobStore(env: NodeJS.ProcessEnv): BlobStore {
-  // "railway-bucket" is the legacy alias for "s3" and stays the default when unset.
-  const kind = env.VOLUME_BLOB_STORE?.trim() || "railway-bucket";
+  // Compat aliasing (one release): "railway-bucket" is the retired spelling
+  // of "s3". The retired VOLUME_RAILWAY_BUCKET_* variables alias onto the
+  // canonical AWS_*/VOLUME_S3_* names inside s3ConfigFromEnv.
+  const kind = env.VOLUME_BLOB_STORE?.trim() || "s3";
   if (kind === "s3" || kind === "railway-bucket") {
-    return new S3BlobStore(s3ConfigFromAnyEnv(env));
+    return new S3BlobStore(s3ConfigFromEnv(env));
   }
   if (kind === "filesystem") {
     return new FilesystemBlobStore(filesystemBlobStoreConfigFromEnv(env));
   }
-  throw new Error("VOLUME_BLOB_STORE must be s3, railway-bucket, or filesystem.");
+  throw new Error("VOLUME_BLOB_STORE must be s3 or filesystem.");
 }
 
 function databaseSslConfig():

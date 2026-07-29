@@ -7,7 +7,6 @@ This directory contains the macOS FSKit frontend for PortableFS.
 - `PortableFSKit`: Swift package with the pfslocal client, `VolumeCore`, macOS 26 FSKit Operations adapter, generated protobuf bindings, mock daemon tests, and `PortableFSAppCore` (config file handling, control-plane API client, portablefsd control-socket client, mount state machine — the testable core of the menu-bar app).
 - `PortableFSApp`: the PortableFS menu-bar app (`PortableFSApp.app` + embedded `PortableFSExt.appex`). Signs in to a PortableFS control plane, lists volumes, manages a child `portablefsd`, and mounts volumes via FSKit. This is the dogfood target.
 - `PortableFSKitDev`: minimal Xcode host app plus `PortableFSDev.appex` for manual FSKit registration and mount testing. Kept for the package's test/verification loop.
-- `Scripts/integration-live.sh`: gated live harness against the real Go daemon.
 
 ## PortableFS.app (menu-bar app)
 
@@ -16,7 +15,7 @@ This directory contains the macOS FSKit frontend for PortableFS.
 - **Sign in** mirrors `portablefs login`: device flow (`POST /v1/auth/device/code`, browser approval, token polling) or a pasted pre-issued token. Credentials are stored in the same config file as the CLI (`~/.config/portablefs/config.json`, `currentProfile` + `profiles` with `apiUrl`/`apiToken`/`managerUrl`/`managerToken`, written atomically with mode 0600), so the app and CLI share sessions and profiles.
 - **Volumes** come from `GET {apiUrl}/v1/volumes`. Each volume shows a mounted indicator plus Mount / Unmount / Open in Finder actions.
 - **Mount flow** per volume: mint a mount session against the authority manager (`POST {managerUrl}/v1/volumes/{id}/mount-sessions`, with fallbacks for older managers) -> `POST /v1/attaches` on the portablefsd control socket (authority URL + token + volume/branch) -> `/sbin/mount -t pfs pfs://<attachRef> <base>/<volume>` (default base `~/PortableFS`, configurable in Settings). Unmount runs `/sbin/umount` (fallback `diskutil unmount`) and then `DELETE /v1/attaches/<ref>` to detach and flush.
-- **Daemon management**: the app spawns `portablefsd` as a child process with `-frontend-socket` and `-control-socket` inside the app-group container (`~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/`) and `-state-dir ~/Library/Application Support/PortableFS/portablefsd`, restarts it with backoff if it crashes, and stops it on quit (SIGTERM, then SIGKILL). If a daemon is already answering on the control socket (for example one started by `integration-live.sh`), the app adopts it instead of spawning a second one. Daemon health is shown in the menu; the daemon log is at `~/Library/Logs/PortableFS/portablefsd.log`.
+- **Daemon management**: the app spawns `portablefsd` as a child process with `-frontend-socket` and `-control-socket` inside the app-group container (`~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/`) and `-state-dir ~/Library/Application Support/PortableFS/portablefsd`, restarts it with backoff if it crashes, and stops it on quit (SIGTERM, then SIGKILL). If a daemon is already answering on the control socket (for example one started by hand), the app adopts it instead of spawning a second one. Daemon health is shown in the menu; the daemon log is at `~/Library/Logs/PortableFS/portablefsd.log`.
 - **Errors** surface as menu items with a Copy Details action; nothing fails silently.
 - **Quit** unmounts all PortableFS mounts, detaches the released attaches, and stops the daemon.
 
@@ -101,30 +100,13 @@ swift build
 swift test
 ```
 
-The suite covers the pfslocal transport/adapter (mock daemon) and the `PortableFSAppCore` app logic: CLI-compatible config round-trips, control-plane API decoding (volumes, device flow, mount sessions), the portablefsd control client against an in-process UDS HTTP server, the mount state machine, and daemon restart backoff.
+The suite covers the pfslocal transport/adapter (mock daemon) and the `PortableFSAppCore` app logic: CLI-compatible config round-trips, control-plane API decoding (volumes, device flow, access leases), the portablefsd control client against an in-process UDS HTTP server, the mount state machine, and daemon restart backoff.
 
 ```sh
 xcodebuild -project swift/PortableFSKitDev/PortableFSKitDev.xcodeproj -scheme PortableFSKitDev build CODE_SIGNING_ALLOWED=NO
 ```
 
 For signed local extension testing of the dev harness, set `DEVELOPMENT_TEAM` in `swift/PortableFSKitDev/Config/Development.xcconfig`.
-
-## Live Go Daemon Integration
-
-The gated live harness builds the sibling Go `cmd/vcs` and `cmd/portablefsd`
-binaries into a temp directory, starts a loopback scratch authority, attaches
-through the daemon control socket, then runs the Swift `VolumeCore` matrix over
-the real pfslocal frontend socket.
-
-```sh
-swift/Scripts/integration-live.sh
-```
-
-By default the script builds from this repository root (resolved relative to
-the script location, i.e. the checkout containing `vcs/`). Override with
-`PFS_GO_REPO=/path/to/portablefs`; set `GO_BIN=/path/to/go` if Go is not on
-`PATH`. Plain `swift test` remains mock-only; the live Swift test executes only
-when the script sets `PFS_LIVE=1`.
 
 ## Manual FSKit Verification
 

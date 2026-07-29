@@ -10,8 +10,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
@@ -24,14 +24,20 @@ func (nopBlobs) Blob(context.Context, string) ([]byte, error) {
 	return nil, errors.New("pfsbench: scratch volume has no backed blobs")
 }
 
-// startAuthority opens (or replays) the WAL at walPath, builds the workfs and
-// serves fsproto on addr. Returns the bound address and a stop func.
+// startAuthority opens (or replays) the file-backed PFJ3 entry log at walPath,
+// builds the MANAGED workfs over it — the same journaled coordination plane a
+// production child serves, minus PostgreSQL — and serves fsproto on addr.
+// Returns the bound address and a stop func.
 func startAuthority(ctx context.Context, addr, walPath string) (string, func(), error) {
 	w, err := wal.Open(walPath)
 	if err != nil {
 		return "", nil, err
 	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
+	flog, err := pfj3.NewFileEntryLog(w)
+	if err != nil {
+		return "", nil, err
+	}
+	fs, err := workfs.NewManaged(nil, nopBlobs{}, flog)
 	if err != nil {
 		return "", nil, err
 	}
@@ -40,7 +46,7 @@ func startAuthority(ctx context.Context, addr, walPath string) (string, func(), 
 		return "", nil, err
 	}
 	sctx, cancel := context.WithCancel(ctx)
-	srv := fsproto.NewServer(fs, fs, delegation.New())
+	srv := fsproto.NewServer(fs, fs)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

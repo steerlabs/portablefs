@@ -1,6 +1,8 @@
 package fsproto
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -8,20 +10,49 @@ import (
 
 // serveManagedAuthority starts a managed (journal-native) authority over a real
 // TCP listener and returns its address. Mirrors newManagedServer but served on
-// a socket so a real *Client (which negotiates ServerManaged) can dial it.
+// a socket so a real *Client (which requires the v6 baseline) can dial it.
 func serveManagedAuthority(t *testing.T) string {
 	t.Helper()
 	addr, _ := serveManagedAuthorityFS(t)
 	return addr
 }
 
-// TestWriteBackManagedCoordination proves the --fast fix at its root. Against a
-// managed authority the LEGACY envelope-less checkout is refused with EPERM
-// (the "checkout: status 1" that made --fast create-EIO and silently drop
-// acked appends). The write-back path now routes through the managed
-// coordination surface — CheckoutManaged returns a durable grant epoch,
-// FlushBatchWriteBack applies the buffered create+write under that grant, the
-// acked bytes are durable on the authority, and CheckinManaged releases it.
+// wbTestDigest chains the mutation-stream digest the way the engine and the
+// authority both compute it: over the canonical PFR1 bytes with the stream
+// sequence zeroed.
+func wbTestDigest(t *testing.T, prev [32]byte, records []wal.Record) [32]byte {
+	t.Helper()
+	d := prev
+	for _, rec := range records {
+		seq := rec.Seq
+		rec.Seq = 0
+		rec.Env = nil
+		payload, err := wal.EncodePFR1(&rec)
+		if err != nil {
+			t.Fatalf("pfr1: %v", err)
+		}
+		inner := sha256.Sum256(payload)
+		h := sha256.New()
+		h.Write([]byte("PortableFS/PFW5/stream/v1\x00"))
+		h.Write(d[:])
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], seq)
+		h.Write(b[:])
+		h.Write(inner[:])
+		copy(d[:], h.Sum(nil))
+	}
+	return d
+}
+
+func wbZeroDigest() [32]byte {
+	return sha256.Sum256([]byte("PortableFS/PFW5/empty/v1\x00"))
+}
+
+// TestWriteBackManagedCoordination exercises the adaptive write-back wire
+// surface end to end: DelegationAcquire grants the scope with a durable
+// epoch, FlushWriteback applies the acknowledged create+write under the
+// stream's digest discipline, the acked bytes are durable on the authority,
+// and CheckinManaged releases the scope after the drain.
 func TestWriteBackManagedCoordination(t *testing.T) {
 	addr := serveManagedAuthority(t)
 	cli, err := Dial(addr, 2)
@@ -33,39 +64,50 @@ func TestWriteBackManagedCoordination(t *testing.T) {
 	if _, err := cli.EnsureExactSession(); err != nil {
 		t.Fatalf("establish exact session: %v", err)
 	}
-	if !cli.ServerManaged() {
-		t.Fatal("expected a managed authority (ServerManaged=true)")
+
+	// Only an existing directory is delegable (a file delegates its parent;
+	// an absent scope declines to write-through).
+	if _, st, err := cli.Mkdir("w", 0o755); err != nil || st != OK {
+		t.Fatalf("mkdir: st=%d err=%v", st, err)
+	}
+	if grant, err := cli.DelegationAcquire("absent-dir", "wb-stream-1"); err != nil || grant.Granted {
+		t.Fatalf("absent scope must decline: %+v err=%v", grant, err)
+	}
+	grant, err := cli.DelegationAcquire("w", "wb-stream-1")
+	if err != nil || !grant.Granted || grant.Epoch == "" {
+		t.Fatalf("delegation acquire: %+v err=%v", grant, err)
 	}
 
-	// The bug: the legacy envelope-less checkout write-back used before this fix
-	// is categorically refused by a managed authority.
-	if _, _, lerr := cli.Checkout("f.txt", "M"); lerr == nil {
-		t.Fatal("legacy checkout unexpectedly succeeded against a managed authority (bug repro expected EPERM)")
+	// The stream flush applies the acknowledged records under the digest
+	// chain; a lost-reply retry of identical bytes converges.
+	records := []wal.Record{
+		{Seq: 1, Op: wal.OpCreate, Path: "w/f.txt", Mode: 0o644},
+		{Seq: 2, Op: wal.OpWrite, Path: "w/f.txt", Offset: 0, Data: []byte("hello-writeback")},
 	}
-
-	// The fix: managed checkout grants a durable epoch (file-grain, since managed
-	// refuses the volume-root "" checkout).
-	granted, _, epoch, err := cli.CheckoutManaged("f.txt")
-	if err != nil || !granted || epoch == "" {
-		t.Fatalf("managed checkout: granted=%v epoch=%q err=%v", granted, epoch, err)
-	}
-
-	// Write-back flush of a create+write batch routes through the managed surface.
-	through, st, err := cli.FlushBatchWriteBack("wb-1", 1, "M", "f.txt", epoch, []wal.Record{
-		{Seq: 1, Op: wal.OpCreate, Path: "f.txt", Mode: 0o644},
-		{Seq: 2, Op: wal.OpWrite, Path: "f.txt", Offset: 0, Data: []byte("hello-writeback")},
-	})
-	if err != nil || st != OK || through < 2 {
+	prev := wbZeroDigest()
+	end := wbTestDigest(t, prev, records)
+	through, st, err := cli.FlushWriteback("wb-stream-1", "w", grant.Epoch, prev, end, records)
+	if err != nil || st != OK || through != 2 {
 		t.Fatalf("managed write-back flush: through=%d st=%d err=%v", through, st, err)
 	}
+	through2, st2, err := cli.FlushWriteback("wb-stream-1", "w", grant.Epoch, prev, end, records)
+	if err != nil || st2 != OK || through2 != 2 {
+		t.Fatalf("retry flush: through=%d st=%d err=%v", through2, st2, err)
+	}
 
-	// The acked write is durable on the authority (this is what --fast silently lost before).
-	data, _, _, rst, err := cli.ReadV("f.txt", 0, 128)
+	// The durable stream state is queryable for recovery.
+	exists, wbThrough, wbDigest, err := cli.WritebackState("wb-stream-1")
+	if err != nil || !exists || wbThrough != 2 || wbDigest != end {
+		t.Fatalf("writeback state: exists=%v through=%d err=%v", exists, wbThrough, err)
+	}
+
+	// The acked write is durable on the authority.
+	data, _, _, rst, err := cli.ReadV("w/f.txt", 0, 128)
 	if err != nil || rst != OK || string(data) != "hello-writeback" {
 		t.Fatalf("readback after managed flush: st=%d data=%q err=%v", rst, string(data), err)
 	}
 
-	if err := cli.CheckinManaged("f.txt", epoch); err != nil {
+	if err := cli.CheckinManaged("w", grant.Epoch); err != nil {
 		t.Fatalf("managed checkin: %v", err)
 	}
 }

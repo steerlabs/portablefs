@@ -6,7 +6,6 @@ import { releaseIdentitySchema, type ReleaseIdentity } from "@portablefs/protoco
 // routes for 404s.
 export const authorityManagerCapabilities = [
   "authorities",
-  "mount-sessions",
   "access-leases",
   "data-plane-router",
   "managed-vcs",

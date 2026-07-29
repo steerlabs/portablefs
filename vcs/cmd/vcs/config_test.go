@@ -30,7 +30,6 @@ func baseProductionConfig() config {
 		heartbeatFD:                3,
 		bootstrapFD:                4,
 		journalHAPolicyJSON:        testHAPolicyJSON,
-		walPath:                    "/tmp/implicit.wal", // implicit default, not explicit
 	}
 }
 
@@ -43,40 +42,25 @@ func setManagedProductionEnv(t *testing.T) {
 	t.Setenv("VCS_ADMIN_TOKEN", "admin-token")
 }
 
-func TestValidateConfigDevAllowsSingleNodeWritable(t *testing.T) {
+// TestValidateConfigRequiresRemoteJournal: cmd/vcs is the managed authority
+// child. A config without the remote journal — the old file-WAL dev primary
+// or read-only branch-head shapes — refuses startup by name; there is no
+// silent local-durability fallback.
+func TestValidateConfigRequiresRemoteJournal(t *testing.T) {
 	cfg := config{
 		apiURL:   "http://localhost:8787",
 		volumeID: "vol_dev",
 		writable: true,
 	}
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("dev single-node writable should be allowed: %v", err)
-	}
-}
-
-// TestValidateConfigRefusesRemovedPairedEnvs: the process-pair standby mode
-// was removed pre-launch. A deployment still exporting one of its settings
-// must stop loudly — never silently serve a different role than the operator
-// configured.
-func TestValidateConfigRefusesRemovedPairedEnvs(t *testing.T) {
-	for _, name := range removedPairedEnvs {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv(name, "1")
-			cfg := config{apiURL: "http://localhost:8787", volumeID: "vol_dev", writable: true}
-			err := validateConfig(cfg)
-			if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "removed") {
-				t.Fatalf("removed env %s must refuse startup by name, got %v", name, err)
-			}
-		})
-	}
-}
-
-func TestValidateConfigProductionRequiresRemoteJournal(t *testing.T) {
-	setManagedProductionEnv(t)
-	cfg := baseProductionConfig()
-	cfg.journalDSN = ""
-	cfg.tenantID = ""
 	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "VCS_JOURNAL_DSN") {
+		t.Fatalf("writable without a remote journal should fail, got %v", err)
+	}
+
+	setManagedProductionEnv(t)
+	prod := baseProductionConfig()
+	prod.journalDSN = ""
+	prod.tenantID = ""
+	if err := validateConfig(prod); err == nil || !strings.Contains(err.Error(), "VCS_JOURNAL_DSN") {
 		t.Fatalf("managed production without the remote journal should fail, got %v", err)
 	}
 	if err := validateConfig(baseProductionConfig()); err != nil {
@@ -95,18 +79,26 @@ func TestValidateConfigRemoteJournalRequiresTenant(t *testing.T) {
 
 func TestValidateConfigRemoteJournalRejectsLocalDurability(t *testing.T) {
 	setManagedProductionEnv(t)
-	cfg := baseProductionConfig()
-	cfg.walPathExplicit = true
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "VCS_WAL") {
+	t.Setenv("VCS_WAL", "/tmp/local.wal")
+	if err := validateConfig(baseProductionConfig()); err == nil || !strings.Contains(err.Error(), "VCS_WAL") {
 		t.Fatalf("remote journal with a local WAL should fail, got %v", err)
 	}
+	t.Setenv("VCS_WAL", "")
+	if err := validateConfig(baseProductionConfig()); err == nil || !strings.Contains(err.Error(), "VCS_WAL") {
+		t.Fatalf("an explicitly empty VCS_WAL is still a local-durability setting and should fail, got %v", err)
+	}
+}
 
-	cfg = baseProductionConfig()
-	cfg.cacheDir = "/var/cache/portablefs"
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "VCS_CACHE_DIR") {
+func TestValidateConfigRemoteJournalRejectsLocalCacheDir(t *testing.T) {
+	setManagedProductionEnv(t)
+	t.Setenv("VCS_CACHE_DIR", "/var/cache/portablefs")
+	if err := validateConfig(baseProductionConfig()); err == nil || !strings.Contains(err.Error(), "VCS_CACHE_DIR") {
 		t.Fatalf("remote journal with a persistent local cache dir should fail, got %v", err)
 	}
+}
 
+func TestValidateConfigRemoteJournalRejectsCodecKnob(t *testing.T) {
+	setManagedProductionEnv(t)
 	// There is deliberately no codec knob: the pair is a provisioning
 	// decision (pfj.branch_provisioning), never configuration.
 	t.Setenv("VCS_JOURNAL_CODEC", "pfj3")
@@ -115,20 +107,11 @@ func TestValidateConfigRemoteJournalRejectsLocalDurability(t *testing.T) {
 	}
 }
 
-func TestValidateConfigRemoteJournalRejectsNFSAndReadOnly(t *testing.T) {
+func TestValidateConfigRemoteJournalRejectsReadOnly(t *testing.T) {
 	setManagedProductionEnv(t)
-	// The remote-journal authority serves authenticated fsproto ONLY: an
-	// explicit NFS address is a config error, not a silently ignored setting.
+	// Read-only serving does not exist: a journal DSN without a writable
+	// primary is an error, never a silent branch-head fallback.
 	cfg := baseProductionConfig()
-	cfg.addrExplicit = true
-	cfg.addr = "127.0.0.1:2049"
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "VCS_ADDR") {
-		t.Fatalf("remote journal with an NFS listener should fail, got %v", err)
-	}
-
-	// Managed read-only serving does not exist: a journal DSN without a
-	// writable primary is an error, never a silent branch-head fallback.
-	cfg = baseProductionConfig()
 	cfg.production = false
 	cfg.writable = false
 	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "writable fenced primary only") {
@@ -177,7 +160,7 @@ func TestValidateConfigRemoteJournalDevModeAllowed(t *testing.T) {
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("dev remote-journal run should be allowed: %v", err)
 	}
-	cfg.walPathExplicit = true
+	t.Setenv("VCS_WAL", "/tmp/dev.wal")
 	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "VCS_WAL") {
 		t.Fatalf("dev remote-journal run with a local WAL should fail, got %v", err)
 	}
@@ -254,14 +237,6 @@ func TestValidateConfigProductionRequiresStructuredHAPolicy(t *testing.T) {
 	}
 }
 
-func TestValidateConfigProductionRejectsLegacyWrites(t *testing.T) {
-	setManagedProductionEnv(t)
-	t.Setenv("VCS_ALLOW_LEGACY_WRITES", "1")
-	if err := validateConfig(baseProductionConfig()); err == nil || !strings.Contains(err.Error(), "VCS_ALLOW_LEGACY_WRITES") {
-		t.Fatalf("production with legacy (non-exact) writes enabled should fail, got %v", err)
-	}
-}
-
 func TestValidateConfigProductionRequiresAuthenticationEvenOnLoopback(t *testing.T) {
 	t.Setenv("VCS_AUTH_TOKEN", "")
 	t.Setenv("VCS_ADMIN_TOKEN", "admin-token")
@@ -280,7 +255,8 @@ func TestValidateConfigProductionRequiresAuthenticationEvenOnLoopback(t *testing
 // honors an explicit override, and refuses zero/negative/garbage at startup —
 // a silent fallback would either disable the OOM guard or wedge every write.
 func TestDirtyRSSMaxConfig(t *testing.T) {
-	cfg := config{apiURL: "http://localhost:8787", volumeID: "vol_dev", writable: true}
+	setManagedProductionEnv(t)
+	cfg := baseProductionConfig()
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("unset VCS_DIRTY_RSS_MAX_MB must apply the default: %v", err)
 	}

@@ -10,15 +10,6 @@ export function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
-/** Refuses the retired in-process command runner instead of silently ignoring it. */
-export function rejectRetiredExecEnv(env: NodeJS.ProcessEnv): void {
-  if (env.VOLUME_API_TENANT_EXEC?.trim() === "1") {
-    throw new Error(
-      "VOLUME_API_TENANT_EXEC=1 is retired: the Volume API never runs tenant commands in its host trust domain. Mount the volume and execute locally, or deploy a separately isolated runner."
-    );
-  }
-}
-
 // Semantic version: MAJOR.MINOR.PATCH with optional pre-release/build
 // metadata (semver.org shape, dotted alphanumeric-and-hyphen identifiers).
 const semverPattern =

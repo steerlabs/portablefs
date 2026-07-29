@@ -2,9 +2,6 @@ import { afterEach, describe, expect, test } from "vitest";
 import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import {
-  buildDirectoryTree,
-  buildFileExtents,
-  buildInodeIndexTree,
   encodePft2Node,
   Pft2FileKind,
   Pft2MemoryStore,
@@ -14,6 +11,14 @@ import {
   type Pft2Inode,
   type Pft2Ref,
 } from "@portablefs/core";
+// The deterministic builder is test-only fixture support, deliberately
+// outside the shipped @portablefs/core barrel (the Go worker is the sole
+// production PFT2 producer).
+import {
+  buildDirectoryTree,
+  buildFileExtents,
+  buildInodeIndexTree,
+} from "@portablefs/core/dist/pft2/builder.js";
 import type { BlobStore } from "@portablefs/core";
 import type {
   HistoryObjectLocation,
@@ -199,9 +204,11 @@ function buildTestFilesystem(store: Pft2MemoryStore): Pft2Ref {
   return rootRef;
 }
 
-async function startGoldenServer(): Promise<GoldenWorld> {
+async function startGoldenServer(
+  build: (store: Pft2MemoryStore) => Pft2Ref = buildTestFilesystem
+): Promise<GoldenWorld> {
   const store = new Pft2MemoryStore();
-  const rootRef = buildTestFilesystem(store);
+  const rootRef = build(store);
   const rootHex = Buffer.from(rootRef.digest).toString("hex");
 
   // Every golden object becomes one registered live copy at an exact key.
@@ -407,6 +414,99 @@ describe("PFT2 file serving", () => {
     expect(link.status).toBe(200);
     expect(link.headers.get("x-portablefs-kind")).toBe("symlink");
     expect(await link.text()).toBe("a/hello.bin");
+  });
+
+  // Regression: one readExtents operation visits one DataPage node per 64 KiB
+  // page of the requested window, so a file (or range) spanning more pages
+  // than the reader's per-op node budget used to fail typed 413
+  // (VOLUME_RESPONSE_TOO_LARGE) even though the request was far below the
+  // route's documented 64 MiB bound. The serving reader now sizes its bounds
+  // from that contract; a whole-file read of 8 MiB (128 pages, 2x the old
+  // 64-node default) must serve byte-exact.
+  test("serves multi-megabyte files whose page count exceeds the old per-op node budget", async () => {
+    const bigContent = new Uint8Array(8 * 1024 * 1024);
+    for (let i = 0; i < bigContent.length; i += 1) {
+      bigContent[i] = (i * 31 + 7) % 253;
+    }
+    const buildBigWorld = (store: Pft2MemoryStore): Pft2Ref => {
+      const putInode = (inode: Pft2Inode): Pft2Ref => {
+        const encoded = encodePft2Node({ kind: Pft2NodeKind.Inode, inode });
+        const ref = pft2RefOf(encoded);
+        store.putNode(ref, encoded);
+        return ref;
+      };
+      const extents = buildFileExtents(bigContent, store, store);
+      if (!extents) {
+        throw new Error("big.bin must have present pages");
+      }
+      const bigRef = putInode(
+        inodeOf({
+          ino: 2n,
+          kind: Pft2FileKind.Regular,
+          mode: 0o644,
+          size: BigInt(bigContent.length),
+          extentRoot: extents,
+        })
+      );
+      const rootDir = buildDirectoryTree(
+        [{ name: "big.bin", ino: 2n, kind: Pft2FileKind.Regular }],
+        store
+      );
+      const rootInodeRef = putInode(
+        inodeOf({
+          ino: 1n,
+          kind: Pft2FileKind.Directory,
+          mode: 0o755,
+          ...(rootDir.root ? { directoryRoot: rootDir.root } : {}),
+        })
+      );
+      const inodeIndex = buildInodeIndexTree(
+        [
+          { ino: 1n, inode: rootInodeRef },
+          { ino: 2n, inode: bigRef },
+        ],
+        store
+      );
+      if (!inodeIndex.root) {
+        throw new Error("inode index must exist");
+      }
+      const rootEncoded = encodePft2Node({
+        kind: Pft2NodeKind.Root,
+        root: {
+          rootInode: rootInodeRef,
+          inodeIndex: inodeIndex.root,
+          maxInoSeen: 2n,
+          inodeCount: inodeIndex.entryCount,
+          direntCount: rootDir.entryCount,
+          logicalBytes: BigInt(bigContent.length),
+          features: 0n,
+        },
+      });
+      const rootRef = pft2RefOf(rootEncoded);
+      store.putNode(rootRef, rootEncoded);
+      return rootRef;
+    };
+
+    const { baseUrl } = await startGoldenServer(buildBigWorld);
+    const whole = await fetch(
+      `${baseUrl}/v1/volumes/vol_a/file?commit=${COMMIT_ID}&path=big.bin`,
+      { headers: TENANT_HEADERS }
+    );
+    expect(whole.status).toBe(200);
+    const wholeBody = Buffer.from(await whole.arrayBuffer());
+    expect(wholeBody.byteLength).toBe(bigContent.length);
+    expect(wholeBody.equals(Buffer.from(bigContent))).toBe(true);
+
+    // A range spanning ~96 pages (the old failure started past ~64 pages).
+    const start = 1 * 1024 * 1024;
+    const end = start + 6 * 1024 * 1024 - 1;
+    const ranged = await fetch(
+      `${baseUrl}/v1/volumes/vol_a/file?commit=${COMMIT_ID}&path=big.bin`,
+      { headers: { ...TENANT_HEADERS, range: `bytes=${start}-${end}` } }
+    );
+    expect(ranged.status).toBe(206);
+    const rangedBody = Buffer.from(await ranged.arrayBuffer());
+    expect(rangedBody.equals(Buffer.from(bigContent.subarray(start, end + 1)))).toBe(true);
   });
 });
 

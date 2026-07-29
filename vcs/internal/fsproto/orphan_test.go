@@ -11,7 +11,7 @@ import (
 
 // waitForOrphanInvalidation drains sub until it sees an Orphaned invalidation for path and returns
 // its OrphanIno, or fails the test on timeout. It tolerates interleaved plain invalidations.
-func waitForOrphanInvalidation(t *testing.T, sub <-chan []coherence.Invalidation, path string) uint64 {
+func waitForOrphanInvalidation(t *testing.T, sub <-chan coherence.Batch, path string) uint64 {
 	t.Helper()
 	var seen []coherence.Invalidation
 	timeout := time.After(2 * time.Second)
@@ -21,7 +21,7 @@ func waitForOrphanInvalidation(t *testing.T, sub <-chan []coherence.Invalidation
 			if !ok {
 				t.Fatalf("subscribe stream closed waiting for orphan invalidation for %q; saw %+v", path, seen)
 			}
-			for _, inv := range batch {
+			for _, inv := range batch.Invs {
 				if inv.Path != path {
 					continue
 				}
@@ -41,7 +41,7 @@ func waitForOrphanInvalidation(t *testing.T, sub <-chan []coherence.Invalidation
 
 // drainSubscribeHeartbeat consumes the first (possibly empty) heartbeat batch so the subscription is
 // known-live before the test triggers the event it wants to observe.
-func drainSubscribeHeartbeat(t *testing.T, sub <-chan []coherence.Invalidation) {
+func drainSubscribeHeartbeat(t *testing.T, sub <-chan coherence.Batch) {
 	t.Helper()
 	select {
 	case _, ok := <-sub:
@@ -85,7 +85,7 @@ func TestCrossMountOrphanInvalidationRedirectsPeerOpen(t *testing.T) {
 		t.Fatalf("peer pre-open read = %q st=%d err=%v", data, st, err)
 	}
 
-	sub, err := cliB.Subscribe()
+	sub, _, err := cliB.Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestCrossMountRenameOverInvalidationRedirectsPeerTarget(t *testing.T) {
 		t.Fatalf("peer pre-open target read = %q st=%d err=%v", data, st, err)
 	}
 
-	sub, err := cliB.Subscribe()
+	sub, _, err := cliB.Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,13 +182,7 @@ func TestOrphanRoundTrip(t *testing.T) {
 		t.Fatalf("write: st=%d err=%v", st, err)
 	}
 
-	ino, st, err := cli.Orphan("f")
-	if err != nil || st != OK {
-		t.Fatalf("orphan: st=%d err=%v", st, err)
-	}
-	if ino == 0 {
-		t.Fatal("orphan returned ino 0")
-	}
+	ino := pinThenOrphan(t, cli, "f")
 	// The name is gone from the tree.
 	if _, st, _ := cli.Getattr("f"); st != ENOENT {
 		t.Fatalf("orphaned name should stat ENOENT, got st=%d", st)
@@ -214,13 +208,8 @@ func TestOrphanRoundTrip(t *testing.T) {
 	if string(data) != "WOR" {
 		t.Fatalf("read after truncateorphan = %q, want WOR", data)
 	}
-	// Last close reaps it; the ino stops resolving.
-	if st, err := cli.Reap(ino); err != nil || st != OK {
-		t.Fatalf("reap: st=%d err=%v", st, err)
-	}
-	if _, st, _ := cli.ReadOrphan(ino, 0, 1); st != ENOENT {
-		t.Fatalf("read after reap should be ENOENT, got st=%d", st)
-	}
+	// Last close: the unpin lets the authority's reap sweep destroy it.
+	unpinAndAwaitReap(t, cli, ino)
 }
 
 // The canonical POSIX semantic over the wire: orphan a file, then recreate the same name. The orphan
@@ -233,10 +222,7 @@ func TestOrphanThenRecreateNameDistinct(t *testing.T) {
 	if _, st, err := cli.Write("f", 0, []byte("AAAAA"), 0o644); err != nil || st != OK {
 		t.Fatalf("write: st=%d err=%v", st, err)
 	}
-	ino, st, err := cli.Orphan("f")
-	if err != nil || st != OK {
-		t.Fatalf("orphan: st=%d err=%v", st, err)
-	}
+	ino := pinThenOrphan(t, cli, "f")
 	if _, st, err := cli.Create("f", 0o644); err != nil || st != OK {
 		t.Fatalf("recreate: st=%d err=%v", st, err)
 	}
@@ -264,10 +250,7 @@ func TestHandleWriteAfterUnlinkRecreateTargetsOldOrphan(t *testing.T) {
 		t.Fatalf("getattr old: attr=%+v st=%d err=%v", a, st, err)
 	}
 	i1 := a.Ino
-	orphIno, st, err := cli.Orphan("f")
-	if err != nil || st != OK {
-		t.Fatalf("orphan: ino=%d st=%d err=%v", orphIno, st, err)
-	}
+	orphIno := pinThenOrphan(t, cli, "f")
 	if orphIno != i1 {
 		t.Fatalf("orphan ino = %d, want original ino %d", orphIno, i1)
 	}
@@ -313,88 +296,6 @@ func startOrphanSweeper(t *testing.T, fs *workfs.FS) {
 	fs.StartOrphanSweeper(ctx)
 }
 
-func TestOrphanReconnectBlipKeptByRenewal(t *testing.T) {
-	withProtocolOrphanLeaseTiming(t, 400*time.Millisecond, 10*time.Millisecond)
-	fs, addr := serveFS(t)
-	startOrphanSweeper(t, fs)
-
-	cli, err := Dial(addr, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cli.Close()
-
-	if _, st, _ := cli.Create("f", 0o644); st != OK {
-		t.Fatalf("create st=%d", st)
-	}
-	if _, st, _ := cli.Write("f", 0, []byte("keep"), 0o644); st != OK {
-		t.Fatalf("write st=%d", st)
-	}
-	ino, st, err := cli.Orphan("f")
-	if err != nil || st != OK {
-		t.Fatalf("orphan st=%d err=%v", st, err)
-	}
-
-	time.Sleep(120 * time.Millisecond)
-	if st, err := cli.RenewOrphanLeases([]uint64{ino}); err != nil || st != OK {
-		t.Fatalf("renew st=%d err=%v", st, err)
-	}
-	time.Sleep(320 * time.Millisecond)
-
-	data, st, err := cli.ReadOrphan(ino, 0, 4)
-	if err != nil || st != OK || string(data) != "keep" {
-		t.Fatalf("orphan after blip = %q st=%d err=%v, want keep", data, st, err)
-	}
-}
-
-func TestSameOwnerRestartOldOrphanReaped(t *testing.T) {
-	withProtocolOrphanLeaseTiming(t, 80*time.Millisecond, 5*time.Millisecond)
-	fs, addr := serveFS(t)
-	startOrphanSweeper(t, fs)
-
-	cli1, err := Dial(addr, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cli1.SetOwner("stable-owner")
-	if _, st, _ := cli1.Create("old", 0o644); st != OK {
-		t.Fatalf("create st=%d", st)
-	}
-	ino, st, err := cli1.Orphan("old")
-	if err != nil || st != OK {
-		t.Fatalf("orphan st=%d err=%v", st, err)
-	}
-	_ = cli1.Close()
-
-	cli2, err := Dial(addr, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cli2.Close()
-	cli2.SetOwner("stable-owner")
-	sub, err := cli2.Subscribe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-sub:
-	case <-time.After(time.Second):
-		t.Fatal("no subscribe heartbeat")
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, st, _ := cli2.ReadOrphan(ino, 0, 1); st == ENOENT {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("same-owner restarted mount kept an old unknown orphan alive")
-}
-
-// TestRemoveOfPeerOpenFileParksInsteadOfRemoving is the core of Stage 2 (authority open-state): mount
-// A removes a file ONLY mount B holds open. Because B registered the inode as open (MarkOpen), the
-// authority PARKS it as an orphan instead of removing — B keeps reading it by ino until it closes.
 func TestRemoveOfPeerOpenFileParksInsteadOfRemoving(t *testing.T) {
 	fs, addr := serveFS(t)
 	startOrphanSweeper(t, fs)

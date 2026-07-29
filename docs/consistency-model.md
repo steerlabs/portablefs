@@ -17,7 +17,7 @@ One active volume has one logical VCS authority at a time. That authority owns t
 holds a fenced lease against the API, and serves every live mount for that volume.
 
 Multiple machines can mount the same volume, but they are not independent sources of truth. They
-all talk to the same VCS authority through FUSE/custom protocol or NFS. This is the architectural
+all talk to the same VCS authority through the custom mount protocol. This is the architectural
 reason live read-after-write can work without merging separate local folders.
 
 If the authority loses its claim, its readiness flips false and it must stop serving the data
@@ -28,23 +28,42 @@ the authority between machines.
 
 ## Write Rule
 
-A writable filesystem operation mutates the VCS working tree and is appended to the durable log
-before it is acknowledged. With `VCS_PRODUCTION=1` that log is the fenced, synchronously
-replicated Postgres journal; in development it is the crash-safe local file WAL.
+A writable filesystem operation mutates the VCS working tree and is appended to the fenced,
+synchronously replicated Postgres journal before it is acknowledged.
 
 This makes acknowledged writes live-durable even before they are checkpointed. If the
-process restarts, the VCS rebuilds the working tree from the last committed manifest plus WAL
-replay.
+process restarts, a replacement authority rebuilds the working tree from the immutable base
+plus journal replay.
 
 ## Mount Visibility
 
-Mount clients connected to the same VCS authority share one live working tree. Reads go through
-the authority and its cache hierarchy, not through separate per-machine folder snapshots.
+Mount clients connected to the same VCS authority share one live working tree — never separate
+per-machine folder snapshots. Reads resolve against the authority's current state through
+version-gated caches, kept coherent by the push-invalidation stream. Under an adaptive
+write-back delegation, the holder acknowledges mutations locally; a peer operation overlapping
+the delegated scope waits for its recall and drain, so a peer is never answered from stale
+pre-delegation state.
 
-The custom FUSE protocol includes push invalidation so client kernel caches evict changed files.
-The NFS path is useful for zero-install access, but the custom FUSE path is the higher-fidelity
-agent filesystem path because it supports explicit invalidation, reconnect behavior, and richer
-coordination.
+The exact cross-machine guarantee is barrier-shaped at the protocol/frontend
+invalidation boundary:
+
+- **A completed `fsync`/`close`/`synchronize` is durable and applied at the
+  authority.** It also waits for every live protocol subscriber to
+  acknowledge its covering invalidations. Linux FUSE acknowledges only after
+  its kernel invalidation hook returns, so subsequent FUSE reads are exact.
+  `portablefsd` acknowledges after its user-space caches are invalidated and
+  the event is delivered to the local frontend stream.
+- **Plain un-fsynced writes propagate to peers within bounded asynchronous invalidation** (the
+  flush batching window plus one invalidation push), like a local page cache.
+
+macOS 26 FSKit is an explicit framework boundary: the current FSKit API does
+not provide PortableFS a kernel-cache invalidation primitive, and its
+invalidation events are therefore advisory. `fsync`, close, synchronize, and
+clean unmount still have the exact authority-durability contract above, but a
+read FSKit satisfies wholly from its kernel cache is outside the
+cross-machine visibility acknowledgment. Applications that require an exact
+handoff on macOS must reopen/re-resolve the file or coordinate at the
+application layer until the SDK exposes a cache invalidation hook.
 
 ## Checkpoint Visibility
 
@@ -70,8 +89,8 @@ runtime code should not bypass VCS for live filesystem writes.
 
 ## Exact-Once Mount Sessions
 
-Every mount instance negotiates an exact-once session with the authority (protocol version 3,
-`OpProtocolVersion` + `FeatExactSessions`). The client mints a random session identity and an
+Every mount instance negotiates an exact-once session with the authority (protocol version 6;
+exact sessions are baseline, not a capability). The client mints a random session identity and an
 opaque token once per mount, establishes the session durably, and stamps every write-through
 mutation with an identity: `(session, generation, slot, slot sequence)`. The authority computes a
 canonical request fingerprint server-side, embeds the identity in the same durable record as the
@@ -97,27 +116,21 @@ The invariants:
   generation; every further mutation from it fails ESTALE, and the mount surfaces a hard error.
   Remount recovers; a fenced mount never mints a fresh generation by itself.
 - **Sessions own liveness.** Coordination state (advisory locks, delegations, open pins) is
-  released on durable lease expiry or voluntary session expire — never on a socket flap. After an
-  authority restart or replacement, token-proven prior sessions get a bounded reclaim window to
-  re-assert their coordination state before conflicting acquisitions are admitted.
+  released on durable lease expiry or voluntary session expire — never on a socket flap. There
+  is no reclaim grace and no wall-time pruning: a cold replay of the journal already contains
+  authoritative coordination, so a replacement authority admits or refuses exactly what the
+  journal says.
 
-Write-back flush batches compose with sessions: flush exactness is a replicated per-session
-watermark (a control record advanced in the same atomic batch as the mutations it covers), and
-under the fail-closed posture a flush must arrive on a connection whose authenticated mount
-session is still current.
+Write-back flush batches compose with sessions: flush exactness is the journaled per-session
+flush ledger (advanced in the same fenced journal rows as the mutations it covers), and a flush
+must arrive on a connection whose authenticated mount session is still current.
 
-The durable journaled session store — `Managed()` stores negotiating protocol version 4 with
-`FeatJournaledCoordination`, no reclaim grace, and no wall-time outcome pruning — wires up with
-the journal integration.
-
-Open registration (`FeatOpenRegistration`) — the fused create+open (the kernel CREATE is
-create+open, so the open hold rides the create RPC), batched last-close unmarks, and client-side
-registration retention — applies to **both** server generations. The legacy generation records
-holds in its in-memory, lease-renewed open table; the managed generation records the same surface
-as durable journaled open-pin rows: the fused create ensures its pin row before the reply leaves
-the server (a lost-reply replay of the create re-ensures the same pin, never a second one), and
-one batched unmark journals all of its releases as one exact row, replayed — not re-applied — on
-an identical resend.
+Open registration is baseline: the fused create+open (the kernel CREATE is create+open, so the
+open hold rides the create RPC), batched last-close unmarks, and client-side registration
+retention. Open pins are durable journaled rows: the fused create ensures its pin row before the
+reply leaves the server (a lost-reply replay of the create re-ensures the same pin, never a
+second one), and one batched unmark journals all of its releases as one exact row, replayed —
+not re-applied — on an identical resend.
 
 ## Commit Rule
 
@@ -154,7 +167,7 @@ Every shared-path lookup carries entry-timeout 0, so the kernel revalidates each
 the authority and a peer's create/remove/rename is reflected immediately, with no per-name TTL. Only a
 path a mount **exclusively holds** (a write-back checkout) caches positive existence, since nothing
 else can change it. NON-existence (a repeat ENOENT probe) is served from the version-gated negative
-dentry cache when the authority stamps misses with the parent directory version (`FeatParentVersion`,
+dentry cache when the authority stamps misses with the parent directory version (`ParentVersion`,
 default-on then): the cached negative is ordered against that version, which every name mutation in
 the directory advances — invalidation-driven, still never a TTL. The `keepcache` /
 `PORTABLEFS_TTL_MS` knobs extend only **attribute/content** caching; they never introduce a positive
@@ -226,13 +239,12 @@ into a fork.
 
 ## POSIX Boundary
 
-The core path is now a real mount rather than a folder scanner. The custom FUSE protocol is the
-primary target for coherent agent filesystems. NFSv3 remains useful where zero-install mounting is
-more important than the richest coherence semantics.
+The core path is now a real mount rather than a folder scanner. The custom mount protocol is
+the one target for coherent agent filesystems.
 
 ### Concurrent appends
 
-Authorities advertising `FeatAtomicAppend` resolve EOF at the write's serialized WAL/journal
+Authorities resolve append EOF at the write's serialized journal
 position. Linux FUSE retains `O_APPEND` on the open-file description and sends one append
 mutation—no getattr/size preflight—so concurrent append records across machines occupy distinct,
 non-overlapping ranges. Exact-session retries replay both the original count and selected offset;
@@ -272,5 +284,5 @@ before compaction/reset therefore cannot make its stable identity reusable after
 
 ## Known limitations
 
-NFSv4, broader cross-client POSIX lock coverage, and stronger sub-flush demand-coherence are
+Broader cross-client POSIX lock coverage and stronger sub-flush demand-coherence are
 follow-on work.

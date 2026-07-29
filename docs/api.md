@@ -503,6 +503,18 @@ Lists snapshot records — commit-pinned records plus this volume's cut-backed
 records — oldest-first, each with its additive `state` (and `cutId`/
 `resultCommitId` for cut-backed records).
 
+`DELETE /v1/volumes/:volumeId/snapshots/:name`
+
+Releases the named snapshot (the name segment is percent-decoded): this
+volume's READY cut-backed records with that name drop their label and their
+snapshot consumers, so they age out of the retention window (pinned + named
++ newest-K ready cuts per branch) and the ordinary GC sweep collects their
+objects. Answers `200 { released: { cutIds, snapshotConsumersReleased } }`.
+A cut that is also adoption-pinned or a live generation base stays rooted
+through those pins exactly as long as they hold. An unknown name answers the
+same non-enumerating `404 VOLUME_NOT_FOUND` as a foreign volume; commit-
+pinned (manifest) records are not releasable through this route.
+
 `POST /v1/volumes/:volumeId/branches`
 
 Creates a same-volume branch from a snapshot record.
@@ -573,8 +585,13 @@ with short-lived mount credentials.
 `POST /v1/volumes/:volumeId/grep`
 
 Searches file bytes server-side without mounting a workspace, against the
-committed head on an authoring branch or a per-call HistoryCut of the live
-state on a live branch.
+committed head on an authoring branch or an immutable HistoryCut on a live
+branch. Live branches serve the branch's newest READY cut whenever one
+exists; a fresh cut is minted (bounded wait, `409 HISTORY_CUT_NOT_READY` on
+timeout) only when the branch has no ready cut at all. The answer is
+therefore an exact immutable state at most as old as the last ready cut —
+seconds under the history worker's rolling cut cadence. Callers that need
+the exact current journal position take a snapshot and grep that.
 
 ```json
 {

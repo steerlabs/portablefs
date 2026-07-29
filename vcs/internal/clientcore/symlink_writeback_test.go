@@ -3,7 +3,6 @@ package clientcore
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
@@ -17,10 +16,8 @@ func TestWriteBackReadlinkBeforeFlush(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 	v := dialCore(t, addr, Options{
-		Owner:         "wb-symlink",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour, // never auto-flush: the overlay must serve everything
+		Owner:  "wb-symlink",
+		WALDir: t.TempDir(),
 	})
 
 	a, st := v.Symlink(ctx, "target.txt", "l")

@@ -136,6 +136,28 @@ describe("VolumeClient", () => {
     expect(requests).toEqual([{ path: "/v1/blobs/batch-binary", search: "?response=ack" }]);
   });
 
+  test("deletes a named snapshot with a percent-encoded path segment", async () => {
+    const requests: Array<{ method: string; path: string }> = [];
+    const client = new VolumeClient({
+      baseUrl: "http://volume.test",
+      fetchImpl: async (input, init) => {
+        requests.push({ method: String(init?.method), path: new URL(String(input)).pathname });
+        return new Response(
+          JSON.stringify({ released: { cutIds: ["hcut_1"], snapshotConsumersReleased: "1" } }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      },
+    });
+
+    await expect(client.deleteSnapshot("vol_a", "before rebase")).resolves.toEqual({
+      cutIds: ["hcut_1"],
+      snapshotConsumersReleased: "1",
+    });
+    expect(requests).toEqual([
+      { method: "DELETE", path: "/v1/volumes/vol_a/snapshots/before%20rebase" },
+    ]);
+  });
+
   test("accepts full blob batch responses from mixed-version servers when ack is requested", async () => {
     const bytes = Buffer.from("mixed-version ack\n");
     const digest = sha256Buffer(bytes);

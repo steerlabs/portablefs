@@ -10,7 +10,7 @@ func TestAttachRegistryPersistsItemIdentities(t *testing.T) {
 		Branch:        "main",
 		MountPath:     "/Volumes/Identity",
 		AuthorityURL:  "127.0.0.1:1",
-		Options:       AttachOptions{WritePolicy: "writethrough", FsyncPolicy: "local", DiskCacheMB: 1},
+		Options:       AttachOptions{DiskCacheMB: 1},
 		IdentityEpoch: 7,
 		Items: []persistedItemRecord{
 			{Path: "", ItemID: 1, ItemGeneration: 7, AuthorityIno: true},

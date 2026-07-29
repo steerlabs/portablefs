@@ -34,7 +34,8 @@ func TestApplyBatchAtomicVisibility(t *testing.T) {
 
 	// Exactly ONE publish covering the whole batch (atomic visibility).
 	select {
-	case paths := <-sub:
+	case batchInvs := <-sub:
+		paths := batchInvs.Invs
 		if len(paths) != 3 {
 			t.Fatalf("batch published %d paths %v, want 3 (a, a, b)", len(paths), paths)
 		}

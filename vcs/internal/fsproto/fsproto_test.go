@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
+	"github.com/steerlabs/portablefs/vcs/internal/backend"
+	"github.com/steerlabs/portablefs/vcs/internal/content"
+	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
@@ -21,25 +23,39 @@ func (nopBlobs) Blob(context.Context, string) ([]byte, error) {
 	return nil, errors.New("no backed blobs in this test")
 }
 
+// newManagedWorkFS opens (or replays) the file-backed PFJ3 entry log at
+// walPath and builds the MANAGED workfs over it — the only generation a v6
+// server serves. It is the package's standard authority harness.
+func newManagedWorkFS(t testing.TB, entries []backend.Entry, blobs content.BlobReader, walPath string) *workfs.FS {
+	t.Helper()
+	w, err := wal.Open(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	flog, err := pfj3.NewFileEntryLog(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs, err := workfs.NewManaged(entries, blobs, flog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs
+}
+
 // serve starts an fsproto server over a fresh workfs and returns a connected
 // client.
 func serve(t *testing.T) *Client {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = NewServer(fs, fs, delegation.New()).Serve(ctx, ln) }()
+	go func() { _ = NewServer(fs, fs).Serve(ctx, ln) }()
 
 	cli, err := Dial(ln.Addr().String(), 4)
 	if err != nil {
@@ -53,21 +69,14 @@ func serve(t *testing.T) *Client {
 // tests that drive invalidations or restart the server.
 func serveFS(t *testing.T) (*workfs.FS, string) {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = NewServer(fs, fs, delegation.New()).Serve(ctx, ln) }()
+	go func() { _ = NewServer(fs, fs).Serve(ctx, ln) }()
 	return fs, ln.Addr().String()
 }
 
@@ -80,7 +89,7 @@ func TestSubscribeStreamsInvalidations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cli.Close()
-	sub, err := cli.Subscribe()
+	sub, _, err := cli.Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +106,7 @@ func TestSubscribeStreamsInvalidations(t *testing.T) {
 	for !got["x.txt"] {
 		select {
 		case ps := <-sub:
-			for _, p := range ps {
+			for _, p := range ps.Invs {
 				got[p.Path] = true
 			}
 		case <-timeout:
@@ -142,20 +151,13 @@ func TestClientReconnectsForReads(t *testing.T) {
 // func (cancels Serve + closes the listener) so a test can simulate a node crash.
 func serveStoppable(t *testing.T) (*workfs.FS, string, func()) {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { _ = NewServer(fs, fs, delegation.New()).Serve(ctx, ln) }()
+	go func() { _ = NewServer(fs, fs).Serve(ctx, ln) }()
 	stop := func() { cancel(); _ = ln.Close() }
 	t.Cleanup(stop)
 	return fs, ln.Addr().String(), stop
@@ -166,18 +168,22 @@ func serveStoppable(t *testing.T) (*workfs.FS, string, func()) {
 // over to the standby with no reconfiguration. This is what lets 5+ mounts ride
 // through a failover without an external VIP.
 func TestClientFollowsFailoverToSecondAddr(t *testing.T) {
-	fsA, addrA, stopA := serveStoppable(t)
-	fsB, addrB, _ := serveStoppable(t)
-	// Both authorities hold the file (B is a promoted standby mirror of A).
-	for _, fs := range []*workfs.FS{fsA, fsB} {
-		f, err := fs.Create("shared.txt")
+	_, addrA, stopA := serveStoppable(t)
+	_, addrB, _ := serveStoppable(t)
+	// Both authorities hold the file (seeded through their own sessions).
+	for _, addr := range []string{addrA, addrB} {
+		seed, err := Dial(addr, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.Write([]byte("hello")); err != nil {
-			t.Fatal(err)
+		seed.SetOwner("seeder")
+		if _, st, err := seed.Create("shared.txt", 0o644); err != nil || st != OK {
+			t.Fatalf("seed create: st=%d err=%v", st, err)
 		}
-		_ = f.Close()
+		if _, st, err := seed.Write("shared.txt", 0, []byte("hello"), 0o644); err != nil || st != OK {
+			t.Fatalf("seed write: st=%d err=%v", st, err)
+		}
+		_ = seed.Close()
 	}
 	cli, err := Dial(addrA+","+addrB, 2)
 	if err != nil {
@@ -185,9 +191,13 @@ func TestClientFollowsFailoverToSecondAddr(t *testing.T) {
 	}
 	defer cli.Close()
 
-	// Served by A initially.
+	// Served by A initially — including a mutation, which establishes the
+	// mount's exact session ON A.
 	if a, st, err := cli.Getattr("shared.txt"); err != nil || st != OK || a == nil {
 		t.Fatalf("pre-failover getattr: a=%v st=%d err=%v", a, st, err)
+	}
+	if n, st, err := cli.Write("shared.txt", 0, []byte("HELLO"), 0o644); err != nil || st != OK || n != 5 {
+		t.Fatalf("pre-failover write: n=%d st=%d err=%v", n, st, err)
 	}
 	// Crash the primary, then drop the now-dead pooled connections so the next op
 	// re-dials and must fall through addrA (dead) to addrB.
@@ -197,12 +207,22 @@ func TestClientFollowsFailoverToSecondAddr(t *testing.T) {
 		cn.reset()
 		cli.conns <- cn
 	}
+	// The first op discovers the fence: the standby never issued this
+	// mount's session, so the attach answers a definite ESTALE and the
+	// client fences itself (one surfaced failure, never a silent
+	// wrong-authority mutation).
+	if _, _, err := cli.Getattr("shared.txt"); err == nil && !cli.SessionFenced() {
+		t.Fatal("failover must fence the session issued by the dead authority")
+	}
+	// Reads then follow over to the standby...
 	if a, st, err := cli.Getattr("shared.txt"); err != nil || st != OK || a == nil {
 		t.Fatalf("client did not follow over to the standby: a=%v st=%d err=%v", a, st, err)
 	}
-	// And writes are served by the standby too.
-	if n, st, err := cli.Write("shared.txt", 0, []byte("world"), 0o644); err != nil || st != OK || n != 5 {
-		t.Fatalf("post-failover write on standby: n=%d st=%d err=%v", n, st, err)
+	// ...while mutations stay fenced: they must NOT land under an identity
+	// the standby never issued. Remounting (a fresh session against the new
+	// authority) is the recovery.
+	if _, st, err := cli.Write("shared.txt", 0, []byte("world"), 0o644); err != nil || st != ESTALE {
+		t.Fatalf("post-failover write must fence: st=%d err=%v, want ESTALE", st, err)
 	}
 }
 
@@ -320,35 +340,6 @@ func TestProtocolChown(t *testing.T) {
 	}
 }
 
-// TestProtocolCheckout checks RECALL-based checkout/checkin coordination over the protocol: a
-// contender does not get EBUSY — its OpCheckout recalls the holder and blocks until the holder
-// relinquishes, then grants. Here A (a separate connection) checks in shortly after B starts
-// waiting, simulating A responding to the recall; B then acquires the overlapping subtree.
-func TestProtocolCheckout(t *testing.T) {
-	_, addr := serveFS(t)
-	ca, err := Dial(addr, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ca.Close()
-	cb, err := Dial(addr, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cb.Close()
-
-	if ok, _, err := ca.Checkout("work", "agent-A"); err != nil || !ok {
-		t.Fatalf("A checkout: ok=%v err=%v", ok, err)
-	}
-	go func() {
-		time.Sleep(150 * time.Millisecond) // A relinquishes in response to the recall
-		_ = ca.Checkin("work", "agent-A")
-	}()
-	if ok, _, err := cb.Checkout("work/sub", "agent-B"); err != nil || !ok {
-		t.Fatalf("B checkout should acquire after A relinquishes (recall handoff): ok=%v err=%v", ok, err)
-	}
-}
-
 // TestConcurrentClientsStress hammers one server with many clients doing mixed
 // ops at once, verifying every read-after-write is correct (run under -race to
 // catch data races in the server + working tree under load).
@@ -408,5 +399,48 @@ func TestProtocolErrors(t *testing.T) {
 	}
 	if st, _ := c.Remove("ghost"); st != ENOENT {
 		t.Fatalf("remove missing st=%d, want ENOENT", st)
+	}
+}
+
+// pinThenOrphan pins path's inode (the open-state registration a real mount
+// holds) and then orphans the name, returning the parked ino. Without the
+// pin a managed authority's reap sweep destroys an unpinned orphan
+// immediately.
+func pinThenOrphan(t *testing.T, cli *Client, path string) uint64 {
+	t.Helper()
+	a, st, err := cli.Getattr(path)
+	if err != nil || st != OK || a == nil || a.Ino == 0 {
+		t.Fatalf("getattr %s: a=%+v st=%d err=%v", path, a, st, err)
+	}
+	if st, err := cli.MarkOpen(a.Ino); err != nil || st != OK {
+		t.Fatalf("mark open %s: st=%d err=%v", path, st, err)
+	}
+	ino, st, err := cli.Orphan(path)
+	if err != nil || st != OK || ino == 0 {
+		t.Fatalf("orphan %s: ino=%d st=%d err=%v", path, ino, st, err)
+	}
+	if ino != a.Ino {
+		t.Fatalf("orphan ino %d != pinned ino %d", ino, a.Ino)
+	}
+	return ino
+}
+
+// unpinAndAwaitReap releases the pin and waits for the authority's reap
+// sweep to destroy the parked inode.
+func unpinAndAwaitReap(t *testing.T, cli *Client, ino uint64) {
+	t.Helper()
+	if st, err := cli.UnmarkOpen(ino); err != nil || st != OK {
+		t.Fatalf("unmark %d: st=%d err=%v", ino, st, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, st, err := cli.ReadOrphan(ino, 0, 1); err == nil && st == ENOENT {
+			return
+		}
+		if time.Now().After(deadline) {
+			_, st, err := cli.ReadOrphan(ino, 0, 1)
+			t.Fatalf("orphan %d survived unpin: st=%d err=%v", ino, st, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

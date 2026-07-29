@@ -38,7 +38,7 @@ import (
 //     ReleaseNameChange first, which flushes synchronously.
 //
 // All three behaviors are gated on the authority advertising
-// FeatOpenRegistration; against an older authority every open marks and every
+// baseline open registration; without it every open would mark and every
 // last close unmarks, bit-for-bit the previous behavior.
 
 // retentionLeaseSlack bounds how stale the last authority confirmation (a
@@ -96,10 +96,9 @@ type openRegistry struct {
 	openSet *InodeSet     // renewal view: every ino with a live or retained registration
 	debugf  func(string, ...any)
 
-	// fused reports FeatOpenRegistration; without it retention and deferred
-	// unmarks stay off and the registry reproduces the previous per-open
-	// mark / per-last-close unmark behavior exactly.
-	fused        bool
+	// retentionCap bounds retained (closed but still registered) entries;
+	// fused-create open registration and batched unmarks are part of the v5
+	// baseline.
 	retentionCap int
 
 	mu          sync.Mutex
@@ -110,17 +109,14 @@ type openRegistry struct {
 	flushing    bool
 }
 
-func newOpenRegistry(reg OpenRegistrar, curGen func() uint64, openSet *InodeSet, fused bool, retentionCap int, debugf func(string, ...any)) *openRegistry {
+func newOpenRegistry(reg OpenRegistrar, curGen func() uint64, openSet *InodeSet, retentionCap int, debugf func(string, ...any)) *openRegistry {
 	if retentionCap == 0 {
 		retentionCap = defaultOpenRetentionEntries
 	}
-	if !fused {
-		retentionCap = -1 // no retention against authorities without the capability
-	}
 	return &openRegistry{
 		reg: reg, curGen: curGen, openSet: openSet, debugf: debugf,
-		fused: fused, retentionCap: retentionCap,
-		entries: map[uint64]*openRegEntry{}, byPath: map[string]uint64{}, lru: list.New(),
+		retentionCap: retentionCap,
+		entries:      map[uint64]*openRegEntry{}, byPath: map[string]uint64{}, lru: list.New(),
 	}
 }
 
@@ -131,10 +127,6 @@ func (r *openRegistry) debug(format string, a ...any) {
 }
 
 func (r *openRegistry) retentionOn() bool { return r.retentionCap > 0 }
-
-// FusedCreate reports whether creates should carry the fused open
-// registration (the authority advertised FeatOpenRegistration).
-func (r *openRegistry) FusedCreate() bool { return r.fused }
 
 // retentionValidLocked reports whether a retained registration may be reused
 // with zero round-trips: confirmed under the CURRENT authority generation (a
@@ -198,10 +190,11 @@ func (r *openRegistry) kickFlushLocked() {
 	go r.flushUnmarks()
 }
 
-// Open registers one open of ino, returning ENOENT iff the inode is gone (the
-// open lost the race to an unlink — the caller must fail the open). Exactly
-// one MarkOpen round-trips per inode registration; joiners and refcounted
-// re-opens ride it for free.
+// Open registers one open of ino. It returns success only when the authority
+// has confirmed the hold under the current generation and lease window;
+// transport errors and definite refusals fail the open instead of exposing an
+// unpinned handle. Exactly one MarkOpen round-trips per inode transition, and
+// joiners re-examine that confirmed result.
 func (r *openRegistry) Open(path string, ino uint64) Status {
 	if ino == 0 {
 		return fsproto.OK
@@ -231,7 +224,7 @@ func (r *openRegistry) Open(path string, ino uint64) Status {
 			r.unqueueLocked(e)
 			e.noRetain = false
 		}
-		if e.refs > 0 {
+		if e.refs > 0 && r.retentionValidLocked(e) {
 			e.refs++
 			e.path = path
 			r.mu.Unlock()
@@ -254,6 +247,9 @@ func (r *openRegistry) Open(path string, ino uint64) Status {
 		ch := make(chan struct{})
 		e.pending = ch
 		r.detachRetainedLocked(e)
+		requestPath := path
+		previousPath := e.path
+		e.path = path
 		r.mu.Unlock()
 		st, gen, err := r.reg.MarkOpenGen(ino)
 		r.mu.Lock()
@@ -261,44 +257,37 @@ func (r *openRegistry) Open(path string, ino uint64) Status {
 		close(ch)
 		switch {
 		case err != nil:
-			// Transport failure: proceed unregistered — the periodic renewal
-			// recovers the hold, and a remove racing that window is the
-			// documented residual (identical to the pre-registry behavior).
 			r.debug("MarkOpen %d: %v", ino, err)
-			e.refs++
-			e.registered = false
-			e.path = path
-			r.openSet.Add(ino)
+			r.restoreAfterFailedOpenLocked(e, requestPath, previousPath)
 			r.mu.Unlock()
-			return fsproto.OK
-		case st == fsproto.ENOENT:
-			if e.refs == 0 && !e.queued {
-				// The inode is gone; nothing to renew or ever unmark.
-				r.openSet.Remove(ino)
-				delete(r.entries, ino)
-			}
-			r.mu.Unlock()
-			return fsproto.ENOENT
+			return fsproto.EIO
 		case st == fsproto.OK:
 			e.refs++
 			e.registered = true
 			e.gen = gen
 			e.confirmedAt = time.Now()
-			e.path = path
 			r.openSet.Add(ino)
 			r.mu.Unlock()
 			return fsproto.OK
 		default:
-			// A definite non-ENOENT refusal (e.g. EPERM from a store without
-			// open-state): proceed unregistered, as before.
-			e.refs++
-			e.registered = false
-			e.path = path
-			r.openSet.Add(ino)
+			r.restoreAfterFailedOpenLocked(e, requestPath, previousPath)
 			r.mu.Unlock()
-			return fsproto.OK
+			return st
 		}
 	}
+}
+
+func (r *openRegistry) restoreAfterFailedOpenLocked(e *openRegEntry, requestPath, previousPath string) {
+	if e.path == requestPath {
+		// A concurrent successful rename may already have changed e.path.
+		// Preserve that re-key; otherwise restore the live entry's old name.
+		e.path = previousPath
+	}
+	if e.refs != 0 {
+		return
+	}
+	r.openSet.Remove(e.ino)
+	delete(r.entries, e.ino)
 }
 
 // SeedRegistered records a hold the authority just confirmed as a side effect
@@ -440,22 +429,25 @@ func (r *openRegistry) ReleaseNameChange(path string, ino uint64) {
 	}
 }
 
-// NotePathMoved re-keys a retained entry after a successful rename by this
-// mount, so a later remove of the NEW name still finds and releases the hold.
+// NotePathMoved re-keys every live or retained entry after a successful
+// rename by this mount. Directory renames include descendants, and boundary
+// matching prevents a rename of "a" from touching "ab".
 func (r *openRegistry) NotePathMoved(oldPath, newPath string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	ino, ok := r.byPath[oldPath]
-	if !ok {
-		return
+	for _, e := range r.entries {
+		moved, ok := rekeyPathPrefix(e.path, oldPath, newPath)
+		if !ok {
+			continue
+		}
+		if e.lru != nil && e.path != "" && r.byPath[e.path] == e.ino {
+			delete(r.byPath, e.path)
+		}
+		e.path = moved
+		if e.lru != nil && moved != "" {
+			r.byPath[moved] = e.ino
+		}
 	}
-	e := r.entries[ino]
-	delete(r.byPath, oldPath)
-	if e == nil {
-		return
-	}
-	e.path = newPath
-	r.byPath[newPath] = ino
 }
 
 // DropIno invalidates any retained registration for ino (a peer orphaned or
@@ -522,16 +514,7 @@ func (r *openRegistry) sendUnmarks(inos []uint64) {
 	if len(inos) == 0 {
 		return
 	}
-	var err error
-	if r.fused {
-		_, err = r.reg.UnmarkOpenBatch(inos)
-	} else {
-		for _, ino := range inos {
-			if _, e := r.reg.UnmarkOpen(ino); e != nil {
-				err = e
-			}
-		}
-	}
+	_, err := r.reg.UnmarkOpenBatch(inos)
 	if err != nil {
 		// Best-effort like the previous per-close UnmarkOpen: a hold that
 		// never got cleared is pruned by the authority's open-lease expiry.
@@ -580,9 +563,8 @@ func (r *openRegistry) flushUnmarks() {
 }
 
 // ConfirmRenewal records a successful RenewOpenInodes round for inos under
-// gen. Renewal re-creates absent holds server-side, so it re-validates even
-// entries whose original mark failed or predates an authority restart — this
-// is what heals retention across failover without any per-open probing.
+// gen. Renewal re-creates absent holds server-side, so it re-validates entries
+// that predate an authority restart without any per-open probing.
 func (r *openRegistry) ConfirmRenewal(inos []uint64, gen uint64) {
 	now := time.Now()
 	r.mu.Lock()

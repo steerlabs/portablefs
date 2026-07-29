@@ -153,7 +153,7 @@ func (d *driver) candidate() *Record {
 		}
 		r := lockRec(k, ino, owner.KernelLockOwner, op, start, length)
 		return &r
-	case 13, 14: // checkout grant
+	case 13, 14: // checkout grant (plain or delegation)
 		info, ok := d.pickLive()
 		if !ok {
 			return nil
@@ -166,9 +166,22 @@ func (d *driver) candidate() *Record {
 		if len(d.st.OverlappingCheckouts(path)) != 0 {
 			return nil // EBUSY at admission
 		}
+		if d.rng.Intn(2) == 0 {
+			r := delegationRec(k, path, d.st.NextCheckoutEpoch(), "wb"+info.Ref.SessionID)
+			return &r
+		}
 		r := checkoutRec(k, CheckoutGrant, path, d.st.NextCheckoutEpoch(), [32]byte{})
 		return &r
-	case 15: // checkout release or force transfer
+	case 15: // checkout release, force transfer, rebind, or discard
+		path := fmt.Sprintf("dir%d/leaf%d", d.rng.Intn(3), d.rng.Intn(4))
+		if g, held := d.st.CheckoutAt(path); held && g.Recovery {
+			// A recovery scope resolves by rebind (to a live session) or by
+			// the audited discard; both ride keyless records.
+			if info, ok := d.pickLive(); ok && d.rng.Intn(2) == 0 {
+				return rebindRec(path, g.Epoch, g.WritebackID, info.Ref)
+			}
+			return discardRec(path, g.Epoch, g.WritebackID)
+		}
 		info, ok := d.pickLive()
 		if !ok {
 			return nil
@@ -177,7 +190,6 @@ func (d *driver) candidate() *Record {
 		if !ok {
 			return nil
 		}
-		path := fmt.Sprintf("dir%d/leaf%d", d.rng.Intn(3), d.rng.Intn(4))
 		if g, held := d.st.CheckoutAt(path); held && g.Holder == info.Ref && d.rng.Intn(2) == 0 {
 			r := checkoutRec(k, CheckoutRelease, path, g.Epoch, [32]byte{})
 			return &r
@@ -185,6 +197,11 @@ func (d *driver) candidate() *Record {
 		conflicts := d.st.OverlappingCheckouts(path)
 		if len(conflicts) == 0 {
 			return nil
+		}
+		for _, c := range conflicts {
+			if c.WritebackID != "" {
+				return nil // delegations are never force-transferred
+			}
 		}
 		r := checkoutRec(k, CheckoutForceTransfer, path, d.st.NextCheckoutEpoch(), RecallDigest(conflicts))
 		return &r
@@ -195,7 +212,7 @@ func (d *driver) candidate() *Record {
 		}
 		ino := uint64(1 + d.rng.Intn(6))
 		return pinRec(info.Ref.SessionID, info.Ref.Generation, ino, d.st.HasPin(info.Ref, ino))
-	default: // flush advance under a held checkout
+	default: // flush advance under a held delegation
 		info, ok := d.pickLive()
 		if !ok {
 			return nil
@@ -203,7 +220,7 @@ func (d *driver) candidate() *Record {
 		var grant CheckoutView
 		found := false
 		for _, path := range []string{"dir0/leaf0", "dir0/leaf1", "dir1/leaf0", "dir1/leaf1", "dir2/leaf2"} {
-			if g, held := d.st.CheckoutAt(path); held && g.Holder == info.Ref {
+			if g, held := d.st.CheckoutAt(path); held && g.Holder == info.Ref && g.WritebackID != "" && !g.Recovery {
 				grant, found = g, true
 				break
 			}
@@ -211,8 +228,11 @@ func (d *driver) candidate() *Record {
 		if !found {
 			return nil
 		}
-		through, _ := d.st.FlushThrough(info.Ref, "wb", grant.Path, grant.Epoch)
-		return flushRec(info.Ref.SessionID, info.Ref.Generation, "wb", grant.Path, grant.Epoch, through+1+uint64(d.rng.Intn(8)))
+		through := uint64(0)
+		if view, ok := d.st.StreamState(grant.WritebackID); ok {
+			through = view.Through
+		}
+		return flushRec(info.Ref.SessionID, info.Ref.Generation, grant.WritebackID, grant.Path, grant.Epoch, through+1+uint64(d.rng.Intn(8)))
 	}
 }
 

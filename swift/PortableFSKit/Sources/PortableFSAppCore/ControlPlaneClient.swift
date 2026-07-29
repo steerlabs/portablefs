@@ -172,32 +172,32 @@ public enum CredentialVerification: Equatable, Sendable {
 }
 
 /// Resolved data-plane endpoint + credential for one mount, as minted by the
-/// authority manager.
-public struct MountSessionInfo: Equatable, Sendable {
+/// authority manager's access-lease route.
+public struct AccessSessionInfo: Equatable, Sendable {
     public var authorityUrl: String
     public var host: String
     public var port: Int
-    public var nfsPort: Int
     public var token: String
     public var expiresAtMs: Int64
     public var authorityInstanceId: String
+    public var accessLeaseId: String
 
     public init(
         authorityUrl: String,
         host: String = "",
         port: Int = 0,
-        nfsPort: Int = 0,
         token: String = "",
         expiresAtMs: Int64 = 0,
-        authorityInstanceId: String = ""
+        authorityInstanceId: String = "",
+        accessLeaseId: String = ""
     ) {
         self.authorityUrl = authorityUrl
         self.host = host
         self.port = port
-        self.nfsPort = nfsPort
         self.token = token
         self.expiresAtMs = expiresAtMs
         self.authorityInstanceId = authorityInstanceId
+        self.accessLeaseId = accessLeaseId
     }
 }
 
@@ -309,102 +309,55 @@ public struct ControlPlaneClient: Sendable {
         }
     }
 
-    // MARK: Mount sessions (authority manager surface)
+    // MARK: Access sessions (authority manager surface)
 
-    /// Resolves a live mount endpoint for volumeID+branch, mirroring the Go
-    /// CLI: the canonical volume-scoped route first, the flat alias on
-    /// 404/405, then the legacy ensure+session pair when the unified route is
-    /// entirely absent.
-    public func mountSession(volumeID: String, branch: String) async throws -> MountSessionInfo {
-        struct Endpoint: Decodable {
+    /// Resolves a live mount endpoint + credential for volumeID+branch by
+    /// creating an access lease — the manager's only resolution route (the
+    /// retired mount-session/authority-session routes answer 410).
+    public func accessSession(volumeID: String, branch: String) async throws -> AccessSessionInfo {
+        struct Authority: Decodable {
             var authorityUrl: String?
             var host: String?
             var port: Int?
-            var nfsPort: Int?
-        }
-        struct NewStyleSession: Decodable {
-            var endpoint: Endpoint?
-            var token: String?
-            var expiresAtMs: Int64?
             var authorityInstanceId: String?
         }
-        struct NewStyleEnvelope: Decodable {
-            var mountSession: NewStyleSession?
+        struct Lease: Decodable {
+            var accessLeaseId: String?
+            var expiresAt: Int64?
+        }
+        struct Envelope: Decodable {
+            var authority: Authority?
+            var lease: Lease?
+            var accessToken: String?
         }
 
-        let ref = try JSONEncoder().encode(["volumeId": volumeID, "branch": branch])
-        let escapedVolume = volumeID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? volumeID
-
-        var (status, body) = try await sendRaw(
-            method: "POST",
-            path: "/v1/volumes/\(escapedVolume)/mount-sessions",
-            body: ref
-        )
-        if status == 404 || status == 405 {
-            (status, body) = try await sendRaw(method: "POST", path: "/v1/mount-sessions", body: ref)
-        }
-        if (200..<300).contains(status) {
-            let envelope = try decodeJSON(NewStyleEnvelope.self, from: body, context: "mount session response")
-            guard let session = envelope.mountSession,
-                  let authorityUrl = session.endpoint?.authorityUrl,
-                  !authorityUrl.isEmpty else {
-                throw ControlPlaneError(status: status, message: "manager returned a mount session without an authority endpoint")
-            }
-            return MountSessionInfo(
-                authorityUrl: authorityUrl,
-                host: session.endpoint?.host ?? "",
-                port: session.endpoint?.port ?? 0,
-                nfsPort: session.endpoint?.nfsPort ?? 0,
-                token: session.token ?? "",
-                expiresAtMs: session.expiresAtMs ?? 0,
-                authorityInstanceId: session.authorityInstanceId ?? ""
-            )
-        }
-        if status != 404 {
+        let host = ProcessInfo.processInfo.hostName
+        let request = try JSONEncoder().encode([
+            "operationId": UUID().uuidString.lowercased(),
+            "volumeId": volumeID,
+            "branch": branch,
+            "consumerId": "app:" + (host.isEmpty ? "unknown-host" : host),
+        ])
+        let (status, body) = try await sendRaw(method: "POST", path: "/v1/access-leases/create", body: request)
+        guard (200..<300).contains(status) else {
             throw ControlPlaneError.parse(status: status, body: body)
         }
-
-        // Older manager: ensure the authority exists, then mint the session token.
-        struct AuthorityPayload: Decodable {
-            var authorityUrl: String?
-            var host: String?
-            var port: Int?
-            var nfsPort: Int?
-            var authorityInstanceId: String?
-            var authorityAuthToken: String?
-            var authorityExpiresAt: Int64?
+        let envelope = try decodeJSON(Envelope.self, from: body, context: "access lease response")
+        guard let authorityUrl = envelope.authority?.authorityUrl, !authorityUrl.isEmpty else {
+            throw ControlPlaneError(status: status, message: "manager returned an access lease without an authority endpoint")
         }
-        struct AuthorityEnvelope: Decodable {
-            var authority: AuthorityPayload?
+        guard let token = envelope.accessToken, !token.isEmpty,
+              let leaseId = envelope.lease?.accessLeaseId, !leaseId.isEmpty else {
+            throw ControlPlaneError(status: status, message: "manager returned an incomplete access lease for \(volumeID)@\(branch)")
         }
-        let (ensureStatus, ensureBody) = try await sendRaw(method: "POST", path: "/v1/authorities/ensure", body: ref)
-        guard (200..<300).contains(ensureStatus) else {
-            throw ControlPlaneError.parse(status: ensureStatus, body: ensureBody)
-        }
-        let ensure = try decodeJSON(AuthorityEnvelope.self, from: ensureBody, context: "authority ensure response")
-        let (sessionStatus, sessionBody) = try await sendRaw(method: "POST", path: "/v1/authorities/session", body: ref)
-        guard (200..<300).contains(sessionStatus) else {
-            throw ControlPlaneError.parse(status: sessionStatus, body: sessionBody)
-        }
-        let session = try decodeJSON(AuthorityEnvelope.self, from: sessionBody, context: "authority session response")
-        var authority = session.authority ?? AuthorityPayload()
-        if (authority.authorityUrl ?? "").isEmpty {
-            authority.authorityUrl = ensure.authority?.authorityUrl
-        }
-        if (authority.authorityInstanceId ?? "").isEmpty {
-            authority.authorityInstanceId = ensure.authority?.authorityInstanceId
-        }
-        guard let authorityUrl = authority.authorityUrl, !authorityUrl.isEmpty else {
-            throw ControlPlaneError(status: sessionStatus, message: "manager returned no authority endpoint for \(volumeID)@\(branch)")
-        }
-        return MountSessionInfo(
+        return AccessSessionInfo(
             authorityUrl: authorityUrl,
-            host: authority.host ?? "",
-            port: authority.port ?? 0,
-            nfsPort: authority.nfsPort ?? 0,
-            token: authority.authorityAuthToken ?? "",
-            expiresAtMs: authority.authorityExpiresAt ?? 0,
-            authorityInstanceId: authority.authorityInstanceId ?? ""
+            host: envelope.authority?.host ?? "",
+            port: envelope.authority?.port ?? 0,
+            token: token,
+            expiresAtMs: envelope.lease?.expiresAt ?? 0,
+            authorityInstanceId: envelope.authority?.authorityInstanceId ?? "",
+            accessLeaseId: leaseId
         )
     }
 

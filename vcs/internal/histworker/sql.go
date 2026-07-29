@@ -15,14 +15,17 @@ const (
 	sqlCutReadPage = `SELECT seq, payload, record_hash, chain_digest
 	 FROM pfh.cut_read_page($1, $2, $3, $4, $5)`
 
-	sqlObjectIntend      = `SELECT pfh.object_intend($1, $2, $3::jsonb)`
-	sqlObjectCopyReceipt = `SELECT pfh.object_copy_receipt($1, $2, $3, $4, $5, $6, $7)`
+	sqlObjectIntend           = `SELECT pfh.object_intend($1, $2, $3::jsonb)`
+	sqlObjectCopyReceipt      = `SELECT pfh.object_copy_receipt($1, $2, $3, $4, $5, $6, $7)`
+	sqlObjectCopyReceiptBatch = `SELECT pfh.object_copy_receipt_batch($1, $2, $3::jsonb)`
+	sqlCutObjectsAddFromBase  = `SELECT pfh.cut_objects_add_from_base($1, $2)`
 	sqlCutObjectsAdd     = `SELECT pfh.cut_objects_add($1, $2, $3, $4)`
 	sqlCutMarkReady      = `SELECT pfh.cut_mark_ready(
 	   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
 
-	sqlObjectLocate     = `SELECT pfh.object_locate($1, $2, $3)`
-	sqlLegacyBlobLocate = `SELECT pfh.legacy_blob_locate($1, $2, $3)`
+	sqlObjectLocate      = `SELECT pfh.object_locate($1, $2, $3)`
+	sqlObjectLocateBatch = `SELECT pfh.object_locate_batch($1, $2, $3)`
+	sqlLegacyBlobLocate  = `SELECT pfh.legacy_blob_locate($1, $2, $3)`
 
 	sqlLegacyChainPrepare   = `SELECT pfh.legacy_chain_prepare($1, $2)`
 	sqlLegacyChainApplyPage = `SELECT pfh.legacy_chain_apply_page($1, $2, $3)`
@@ -43,6 +46,8 @@ const (
 
 	sqlRepairClaim   = `SELECT * FROM pfh.repair_claim($1, $2, $3)`
 	sqlRepairReceipt = `SELECT pfh.repair_receipt($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+
+	sqlRetentionRelease = `SELECT pfh.retention_release($1)`
 
 	sqlSweepClaim    = `SELECT pfh.sweep_claim($1, $2, $3)`
 	sqlSweepComplete = `SELECT pfh.sweep_complete($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`

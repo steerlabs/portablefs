@@ -148,6 +148,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	loop("gc", func(c context.Context) (bool, error) {
 		return w.gcPass(c)
 	}, w.cfg.PollInterval)
+	loop("retention", func(c context.Context) (bool, error) {
+		return w.retentionPass(c)
+	}, w.cfg.PollInterval)
 	loop("rehome", func(c context.Context) (bool, error) {
 		return w.rehomePass(c)
 	}, w.cfg.PollInterval)

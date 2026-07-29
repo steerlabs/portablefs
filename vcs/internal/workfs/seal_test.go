@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
@@ -80,91 +80,46 @@ func TestSealClosesWriteAdmission(t *testing.T) {
 	}
 }
 
-// Terminal sealing closes client write admission, but authority-owned control
-// records must still be able to finish cleanup and preserve exact-once state.
-// Checkpointing and session cleanup are not ordinary user writes and may run
-// after the terminal barrier has drained admitted requests.
-func TestInternalControlRecordsBypassTerminalSeal(t *testing.T) {
-	fs, _ := newFS(t, nil, &fakeBlobs{data: map[string][]byte{}})
-	if _, err := fs.EstablishSession("session-1", 1, "mount-1", 8); err != nil {
-		t.Fatalf("establish session: %v", err)
-	}
-	if err := fs.Seal(context.Background()); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-
-	if _, err := fs.EstablishSession("session-2", 1, "mount-2", 8); !errors.Is(err, ErrSealed) {
-		t.Fatalf("new client session after seal: err=%v, want ErrSealed", err)
-	}
-	if err := fs.ExpireSession("session-1", 1); err != nil {
-		t.Fatalf("internal session expiry after seal: %v", err)
-	}
-	if err := fs.AppendControlSnapshot(); err != nil {
-		t.Fatalf("control snapshot after seal: %v", err)
-	}
-}
-
-// latchReplica is a wal.Replica whose AppendBatch parks inside the durability
-// path until released — a deterministic latch that holds an ADMITTED mutation
-// in flight between fs.mu release and its CommitThrough acknowledgement, which
+// latchLog wraps the managed entry log so CommitThrough parks inside the
+// durability path until released — a deterministic latch that holds an
+// ADMITTED mutation in flight between staging and its acknowledgement, which
 // is exactly the window the admission drain must cover.
-type latchReplica struct {
-	mu       sync.Mutex
-	arrived  chan struct{} // closed when the first AppendBatch parks
+type latchLog struct {
+	pfj3.EntryLog
+	arrived  chan struct{} // closed when the first CommitThrough parks
 	release  chan struct{} // closed by the test to let it finish
 	arriveMu sync.Once
-	batches  int
 }
 
-func newLatchReplica() *latchReplica {
-	return &latchReplica{arrived: make(chan struct{}), release: make(chan struct{})}
+func newLatchLog(inner pfj3.EntryLog) *latchLog {
+	return &latchLog{EntryLog: inner, arrived: make(chan struct{}), release: make(chan struct{})}
 }
 
-func (r *latchReplica) Append(wal.Record) error { return nil }
-func (r *latchReplica) AppendBatch([]wal.Record) error {
-	r.arriveMu.Do(func() { close(r.arrived) })
-	<-r.release
-	r.mu.Lock()
-	r.batches++
-	r.mu.Unlock()
-	return nil
+func (l *latchLog) CommitThrough(seq uint64) error {
+	l.arriveMu.Do(func() { close(l.arrived) })
+	<-l.release
+	return l.EntryLog.CommitThrough(seq)
 }
-func (r *latchReplica) Reset() error         { return nil }
-func (r *latchReplica) Compact(uint64) error { return nil }
-func (r *latchReplica) batchCount() int      { r.mu.Lock(); defer r.mu.Unlock(); return r.batches }
 
 // TestSealDrainsInFlightMutationThroughDurability is the deterministic latch
 // test for the admission drain: a mutation ADMITTED before Seal is parked
-// inside its durability path (WAL replication) with fs.mu already released —
-// the exact window the old fs.mu-only seal missed. Seal must NOT return while
-// that mutation is still in flight; once it completes (durable + acknowledged),
-// Seal returns and a snapshot covers the write.
+// inside its durability path (the journal commit) — the exact window an
+// fs.mu-only seal would miss. Seal must NOT return while that mutation is
+// still in flight; once it completes (durable + acknowledged), Seal returns.
 func TestSealDrainsInFlightMutationThroughDurability(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "wal.log")
-	w, err := wal.Open(p)
+	latch := newLatchLog(newFakeEntryLog())
+	fs, err := NewManaged(nil, &fakeBlobs{data: map[string][]byte{}}, latch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs, err := New(nil, &fakeBlobs{data: map[string][]byte{}}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replica := newLatchReplica()
-	w.SetReplica(replica)
 
 	ackErr := make(chan error, 1)
 	go func() {
-		ackErr <- fs.ApplyBatch([]wal.Record{
-			{Op: wal.OpCreate, Path: "inflight.txt", Mode: 0o644},
-			{Op: wal.OpWrite, Path: "inflight.txt", Offset: 0, Data: []byte("admitted before seal")},
-		}, "owner")
+		_, err := fs.CommitEntry(&wal.Record{Op: wal.OpCreate, Path: "inflight.txt", Mode: 0o644}, nil, "owner")
+		ackErr <- err
 	}()
-	<-replica.arrived // the mutation is parked mid-durability, fs.mu released
+	<-latch.arrived // the mutation is parked mid-durability
 
-	// The WAL-backed store applies before its durability barrier (fs.mu is
-	// held only for the in-memory apply); the drain contract below is what
-	// Seal guarantees: the ADMITTED mutation must finish its durability
-	// boundary before Seal returns, so a sealed snapshot always covers it.
 	sealDone := make(chan error, 1)
 	go func() { sealDone <- fs.Seal(context.Background()) }()
 
@@ -180,38 +135,20 @@ func TestSealDrainsInFlightMutationThroughDurability(t *testing.T) {
 		t.Fatal("admission must be closed the moment Seal begins, before the drain completes")
 	}
 	// New mutations are already refused while the drain waits.
-	if _, err := fs.Create("late.txt"); !errors.Is(err, ErrSealed) {
+	if _, err := fs.CommitEntry(&wal.Record{Op: wal.OpCreate, Path: "late.txt", Mode: 0o644}, nil, "owner"); !errors.Is(err, ErrSealed) {
 		t.Fatalf("mutation during drain: err=%v, want ErrSealed", err)
 	}
 
-	close(replica.release) // let the admitted mutation reach its ack boundary
+	close(latch.release) // let the admitted mutation reach its ack boundary
 	if err := <-sealDone; err != nil {
 		t.Fatalf("Seal after drain: %v", err)
 	}
 	if err := <-ackErr; err != nil {
 		t.Fatalf("the pre-seal mutation must be acknowledged successfully: %v", err)
 	}
-	if replica.batchCount() == 0 {
-		t.Fatal("the admitted mutation never replicated")
-	}
-
-	// The post-drain snapshot covers the acknowledged write, and the WAL has no
-	// unflushed tail: EnsureSnapshotDurable succeeds without the replica.
-	snap := fs.Snapshot()
-	if !snap.HasUncommittedRecords() {
-		t.Fatal("post-drain snapshot must cover the acknowledged records")
-	}
-	if err := fs.EnsureSnapshotDurable(snap); err != nil {
-		t.Fatalf("post-drain snapshot durability: %v", err)
-	}
-	found := false
-	for _, e := range snap.Entries {
-		if e.Path == "inflight.txt" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("acknowledged pre-seal write missing from the post-drain snapshot")
+	// The acknowledged pre-seal write is present in the sealed state.
+	if _, err := fs.Lstat("inflight.txt"); err != nil {
+		t.Fatalf("acknowledged pre-seal create missing after the drain: %v", err)
 	}
 }
 
@@ -219,23 +156,18 @@ func TestSealDrainsInFlightMutationThroughDurability(t *testing.T) {
 // time, Seal reports the failure but admission STAYS closed — never reopened —
 // and a later drain attempt can still complete.
 func TestSealDrainTimeoutFailsClosed(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "wal.log")
-	w, err := wal.Open(p)
+	latch := newLatchLog(newFakeEntryLog())
+	fs, err := NewManaged(nil, &fakeBlobs{data: map[string][]byte{}}, latch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs, err := New(nil, &fakeBlobs{data: map[string][]byte{}}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replica := newLatchReplica()
-	w.SetReplica(replica)
 
 	ackErr := make(chan error, 1)
 	go func() {
-		ackErr <- fs.ApplyBatch([]wal.Record{{Op: wal.OpCreate, Path: "stuck.txt", Mode: 0o644}}, "")
+		_, err := fs.CommitEntry(&wal.Record{Op: wal.OpCreate, Path: "stuck.txt", Mode: 0o644}, nil, "owner")
+		ackErr <- err
 	}()
-	<-replica.arrived
+	<-latch.arrived
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -245,11 +177,11 @@ func TestSealDrainTimeoutFailsClosed(t *testing.T) {
 	if !fs.Sealed() {
 		t.Fatal("a timed-out Seal must leave admission closed (fail closed)")
 	}
-	if _, err := fs.Create("late.txt"); !errors.Is(err, ErrSealed) {
+	if _, err := fs.CommitEntry(&wal.Record{Op: wal.OpCreate, Path: "late.txt", Mode: 0o644}, nil, "owner"); !errors.Is(err, ErrSealed) {
 		t.Fatalf("mutation after failed seal: err=%v, want ErrSealed", err)
 	}
 
-	close(replica.release)
+	close(latch.release)
 	if err := <-ackErr; err != nil {
 		t.Fatalf("the admitted mutation still completes: %v", err)
 	}

@@ -261,7 +261,6 @@ export function createAuthorityDataPlaneRouterServer(
 }
 
 export function validateAuthorityDataPlaneRouterConfig(args: {
-  authorityMode: "env" | "production";
   listenAddr?: string;
   publicUrl?: string;
   tlsCertPath?: string;
@@ -296,7 +295,7 @@ export function validateAuthorityDataPlaneRouterConfig(args: {
     );
   }
   const hasTls = certPath || certPem;
-  if (args.authorityMode === "production" && !hasTls && !args.allowPlaintextProduction) {
+  if (!hasTls && !args.allowPlaintextProduction) {
     throw new Error(
       "Router TLS (PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH/KEY_PATH or PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM/KEY_PEM) is required in production; set PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1 only behind an authenticated private tunnel."
     );

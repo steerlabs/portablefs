@@ -1,0 +1,206 @@
+package writeback
+
+import (
+	"sort"
+	"strings"
+)
+
+// Entry is one locally-known name: an authoritative child of a seeded
+// directory, or a locally created/mutated object. Attribute fields mirror the
+// wire attr shape so clientcore can serve getattr/readdir from it directly.
+type Entry struct {
+	Name    string
+	Kind    string // "file" | "directory" | "symlink"
+	Mode    uint32
+	Size    int64
+	MtimeMs int64
+	CtimeMs int64
+	AtimeMs int64
+	UID     uint32
+	GID     uint32
+	Ino     uint64
+	Nlink   uint32
+	Target  string // symlink target
+}
+
+// dirView is one directory's locally-known children under a delegation.
+// complete means the set is authoritative (grant snapshot, one seeded
+// readdir, or born local): absence is then a proven ENOENT and creates need
+// no probe. A partial view knows only locally created names and tombstones.
+type dirView struct {
+	children   map[string]*Entry
+	tombstones map[string]bool // hidden authority names (partial views only)
+	complete   bool
+}
+
+func newDirView(complete bool) *dirView {
+	return &dirView{children: map[string]*Entry{}, tombstones: map[string]bool{}, complete: complete}
+}
+
+// extent is one current dirty range [start,end) of a file. zero extents fill
+// holes (write-beyond-EOF, truncate-extend); WAL extents reference payload
+// bytes in a stream segment.
+type extent struct {
+	start, end uint64
+	seq        uint64
+	zero       bool
+	ordinal    uint64
+	off        int64 // payload byte offset within the segment file
+}
+
+// baseMove is one locally-acknowledged rename not yet applied at the
+// authority: until the watermark covers seq, the view's clean ranges still
+// live at the OLD authority path.
+type baseMove struct {
+	seq  uint64
+	path string
+}
+
+// fileView is one file's dirty state: current extents over the authority
+// base, plus its attr entry (shared with the parent dirView's children map).
+// basePath is the authority path currently serving the view's clean ranges;
+// pending local renames advance it only as the watermark covers them —
+// folding a write must never redirect base reads to a name the authority has
+// not bound yet (the fold-vs-rename race serves the PREVIOUS file's bytes).
+type fileView struct {
+	entry    *Entry
+	basePath string
+	moves    []baseMove
+	extents  []extent
+}
+
+// notePathMove records a local rename of this view to newPath at seq.
+func (fv *fileView) notePathMove(seq uint64, newPath string) {
+	fv.moves = append(fv.moves, baseMove{seq: seq, path: newPath})
+}
+
+// baseAt reports the authority path serving clean ranges right now.
+func (fv *fileView) baseAt() string {
+	return fv.basePath
+}
+
+// insertExtent splices e into the sorted non-overlapping set, splitting
+// partial overlaps and adjusting WAL payload offsets for retained fragments.
+func (fv *fileView) insertExtent(e extent) {
+	if e.start >= e.end {
+		return
+	}
+	out := fv.extents[:0:0]
+	for _, cur := range fv.extents {
+		if cur.end <= e.start || cur.start >= e.end {
+			out = append(out, cur)
+			continue
+		}
+		if cur.start < e.start {
+			left := cur
+			left.end = e.start
+			out = append(out, left)
+		}
+		if cur.end > e.end {
+			right := cur
+			if !right.zero {
+				right.off += int64(e.end - right.start)
+			}
+			right.start = e.end
+			out = append(out, right)
+		}
+	}
+	out = append(out, e)
+	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
+	fv.extents = out
+}
+
+// truncateExtents applies a truncate to size: extents beyond it are dropped
+// or clipped; extending inserts a zero extent so old base bytes can never
+// leak back after a shrink-then-extend.
+func (fv *fileView) truncateExtents(oldSize, newSize uint64, seq uint64) {
+	if newSize < oldSize {
+		out := fv.extents[:0]
+		for _, cur := range fv.extents {
+			if cur.start >= newSize {
+				continue
+			}
+			if cur.end > newSize {
+				cur.end = newSize
+			}
+			out = append(out, cur)
+		}
+		fv.extents = out
+		return
+	}
+	if newSize > oldSize {
+		fv.insertExtent(extent{start: oldSize, end: newSize, seq: seq, zero: true})
+	}
+}
+
+// overlapping returns the current extents intersecting [start,end), in order.
+func (fv *fileView) overlapping(start, end uint64) []extent {
+	var out []extent
+	for _, cur := range fv.extents {
+		if cur.end <= start {
+			continue
+		}
+		if cur.start >= end {
+			break
+		}
+		out = append(out, cur)
+	}
+	return out
+}
+
+// segmentsPinned reports the WAL segment ordinals live extents reference.
+func (fv *fileView) segmentsPinned(pin map[uint64]bool) {
+	for _, e := range fv.extents {
+		if !e.zero {
+			pin[e.ordinal] = true
+		}
+	}
+}
+
+// foldApplied drops extents fully covered by the authority watermark: the
+// flushed bytes are now the authority's current content, so reads fall
+// through to the (version-refreshed) base path. Pending base moves (local
+// renames) advance basePath as the watermark covers their sequences —
+// strictly in order, so a chain of renames tracks exactly where the
+// authority currently binds the content. Reports whether any extents remain.
+func (fv *fileView) foldApplied(through uint64) bool {
+	for len(fv.moves) > 0 && fv.moves[0].seq <= through {
+		fv.basePath = fv.moves[0].path
+		fv.moves = fv.moves[1:]
+	}
+	out := fv.extents[:0]
+	for _, cur := range fv.extents {
+		if cur.seq <= through && !cur.zero {
+			continue
+		}
+		if cur.seq <= through && cur.zero {
+			// A folded zero extent's range is now authoritative (the flushed
+			// truncate/hole is applied), so it can drop with the rest.
+			continue
+		}
+		out = append(out, cur)
+	}
+	fv.extents = out
+	return len(fv.extents) > 0
+}
+
+func parentDir(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[:i]
+	}
+	return ""
+}
+
+func baseName(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+func pathUnder(p, root string) bool {
+	if root == "" {
+		return true
+	}
+	return p == root || strings.HasPrefix(p, root+"/")
+}

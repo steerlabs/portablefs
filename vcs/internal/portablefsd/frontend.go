@@ -199,6 +199,8 @@ func (c *frontendConn) handleAttached(ctx context.Context, a *attach, requestID 
 		reply, eno = a.xattrRemove(ctx, req)
 	case *pfslocal.StatfsRequest:
 		reply, eno = a.statfs()
+	case *pfslocal.SyncVolumeRequest:
+		reply, eno = a.syncVolume(ctx)
 	case *pfslocal.FsyncRequest:
 		eno = a.fsync(ctx, req)
 		reply = &pfslocal.FsyncReply{}

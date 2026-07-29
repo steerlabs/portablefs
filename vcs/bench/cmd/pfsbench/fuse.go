@@ -34,8 +34,9 @@ func fuseAvailable() (bool, string) {
 	}
 }
 
-// buildFuseTransport starts an in-process authority and mounts it via the mount
-// binary as a subprocess, returning a localFS pointed at the mountpoint.
+// buildFuseTransport starts an in-process authority and mounts it via the
+// benchmount binary as a subprocess, returning a localFS pointed at the
+// mountpoint.
 func buildFuseTransport(work string, cfg benchConfig, mountBin string) (benchFS, func(), error) {
 	if ok, reason := fuseAvailable(); !ok {
 		if os.Getenv("PFSBENCH_MOUNT_ONLY") == "skip" {
@@ -45,7 +46,7 @@ func buildFuseTransport(work string, cfg benchConfig, mountBin string) (benchFS,
 		return nil, nil, fmt.Errorf("fuse transport unavailable: %s (set PFSBENCH_MOUNT_ONLY=skip to skip)", reason)
 	}
 	if mountBin == "" {
-		return nil, nil, fmt.Errorf("fuse transport needs -mount-bin (go build -o mount-bin ./cmd/mount)")
+		return nil, nil, fmt.Errorf("fuse transport needs -mount-bin (go build -o benchmount ./bench/cmd/benchmount)")
 	}
 	addr, stopAuth, err := startAuthority(context.Background(), "127.0.0.1:0", filepath.Join(work, "authority.wal"))
 	if err != nil {
@@ -85,30 +86,28 @@ type fuseFS struct {
 	proc       *exec.Cmd
 }
 
-func (f *fuseFS) env() []string {
-	env := append(os.Environ(),
-		"PORTABLEFS_FLUSH_MS="+strconv.Itoa(f.cfg.FlushMs),
-		"PORTABLEFS_SESSION_TTL_MS="+strconv.Itoa(f.cfg.SessionTTLMs),
-		// fsync on the mount forces the covering write-back session to the
-		// authority, so localFS.SyncDurable is a real durability barrier.
-		"PORTABLEFS_FSYNC_POLICY=authority",
-	)
-	if f.cfg.WriteBack {
-		env = append(env, "PORTABLEFS_WRITEBACK=1")
+// args builds the benchmount flag list for this config. benchmount is
+// bench-only and reads no product environment variables; every swept knob is
+// an explicit flag. (fsync on the mount forces the covering write-back
+// session to the authority, so localFS.SyncDurable is a real durability
+// barrier.)
+func (f *fuseFS) args() []string {
+	args := []string{
+		"-addr", f.addr,
+		"-mount", f.mountpoint,
+		"-pool", strconv.Itoa(f.cfg.Pool),
+		"-session-ttl-ms", strconv.Itoa(f.cfg.SessionTTLMs),
+	}
+	if f.cfg.WriteThrough {
+		args = append(args, "-write-through")
 	}
 	if f.cfg.NegativeCache {
-		env = append(env, "PORTABLEFS_NEGATIVE_CACHE=1")
+		args = append(args, "-negcache")
 	}
 	if f.cfg.NoReaddirPlus {
-		env = append(env, "PORTABLEFS_NO_READDIRPLUS=1")
+		args = append(args, "-no-readdirplus")
 	}
-	if f.cfg.FlushMaxRecords > 0 {
-		env = append(env, "PORTABLEFS_FLUSH_MAX_RECORDS="+strconv.Itoa(f.cfg.FlushMaxRecords))
-	}
-	if f.cfg.FlushMaxBytes > 0 {
-		env = append(env, "PORTABLEFS_FLUSH_MAX_BYTES="+strconv.FormatInt(f.cfg.FlushMaxBytes, 10))
-	}
-	return env
+	return args
 }
 
 // mount starts the mount subprocess and waits until the volume is visible at
@@ -125,8 +124,7 @@ func (f *fuseFS) mount() error {
 		return fmt.Errorf("create ready marker: st=%d err=%v", st, err)
 	}
 
-	cmd := exec.Command(f.mountBin, "-addr", f.addr, "-mount", f.mountpoint, "-pool", strconv.Itoa(f.cfg.Pool))
-	cmd.Env = f.env()
+	cmd := exec.Command(f.mountBin, f.args()...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

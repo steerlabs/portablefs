@@ -29,8 +29,6 @@ const MAX_BODY_BYTES = 1024 * 1024;
 // The inspect request is exactly one bounded id plus one bounded token. Keep a
 // small byte ceiling at the transport boundary before JSON/schema parsing.
 const MAX_ACCESS_LEASE_INSPECT_BODY_BYTES = 8 * 1024;
-const DEFAULT_PROVIDER = "portablefs-managed";
-const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
 
 export interface AuthorityRef {
   teamId?: string;
@@ -44,7 +42,6 @@ export interface AuthorityIdentity {
   authorityUrl?: string;
   host?: string;
   port?: number;
-  nfsPort?: number;
   authorityInstanceId?: string;
   processRef?: string;
 }
@@ -54,12 +51,7 @@ export interface AuthorityEndpoint {
   authorityUrl: string;
   host?: string;
   port?: number;
-  nfsPort?: number;
   authorityInstanceId?: string;
-  authToken?: string;
-  expiresAt?: number;
-  healthUrl?: string;
-  healthToken?: string;
 }
 
 export interface AuthorityStopResult {
@@ -124,7 +116,6 @@ export const authorityOperationErrorCodes = {
 
 export interface AuthorityRegistry {
   ensureAuthority(ref: AuthorityRef): Promise<AuthorityEndpoint>;
-  createSession(ref: AuthorityRef): Promise<AuthorityEndpoint>;
   inspectAuthority?(ref: AuthorityRef): Promise<AuthorityEndpoint | null>;
   isHealthy(ref: AuthorityRef, endpoint: AuthorityEndpoint): Promise<boolean>;
   stopAuthority?(ref: AuthorityRef): Promise<AuthorityStopResult>;
@@ -300,6 +291,31 @@ export function createAuthorityManagerServer(deps: AuthorityManagerServerDeps): 
       }
 
       const url = new URL(req.url ?? "/", "http://authority-manager.local");
+
+      // Retired session-minting family: the stable routes remain as explicit
+      // retirement contracts for one release, refusing before body parsing or
+      // registry dispatch. POST /v1/access-leases/create is the successor.
+      if (url.pathname === "/v1/mount-sessions" || isVolumeMountSessionsPath(url.pathname)) {
+        sendJson(res, 410, {
+          error: {
+            code: "MOUNT_SESSION_RETIRED",
+            message:
+              "Mount sessions have been retired from the authority manager. Create an access lease with POST /v1/access-leases/create instead.",
+          },
+        });
+        return;
+      }
+      if (url.pathname === "/v1/authorities/session") {
+        sendJson(res, 410, {
+          error: {
+            code: "AUTHORITY_SESSION_RETIRED",
+            message:
+              "The authority session route has been retired. Create an access lease with POST /v1/access-leases/create instead.",
+          },
+        });
+        return;
+      }
+
       const body = await readJsonBody(
         req,
         url.pathname === "/v1/access-leases/inspect"
@@ -312,30 +328,12 @@ export function createAuthorityManagerServer(deps: AuthorityManagerServerDeps): 
         return;
       }
 
-      // One-call convenience route: the same registry paths as
-      // /v1/authorities/ensure followed by /v1/authorities/session. The
-      // volume-scoped form is canonical (hosted control planes mirror it);
-      // the flat form with volumeId in the body is kept as an alias.
-      const mountSessionVolumeId = parseMountSessionPath(url.pathname);
-      if (mountSessionVolumeId !== null || url.pathname === "/v1/mount-sessions") {
-        const ref = readMountSessionRef(body, mountSessionVolumeId ?? undefined);
-        await deps.registry.ensureAuthority(ref);
-        const endpoint = await deps.registry.createSession(ref);
-        sendJson(res, 200, { mountSession: toMountSessionPayload(ref, endpoint) });
-        return;
-      }
-
       const ref = readAuthorityRef(body);
 
       switch (url.pathname) {
         case "/v1/authorities/ensure": {
           const endpoint = await deps.registry.ensureAuthority(ref);
-          sendJson(res, 200, { authority: toAuthorityPayload(endpoint, false) });
-          return;
-        }
-        case "/v1/authorities/session": {
-          const endpoint = await deps.registry.createSession(ref);
-          sendJson(res, 200, { authority: toAuthorityPayload(endpoint, true) });
+          sendJson(res, 200, { authority: toAuthorityPayload(endpoint) });
           return;
         }
         case "/v1/authorities/health": {
@@ -563,7 +561,6 @@ function toLeaseAuthorityPayload(
     ...(endpoint.provider ? { provider: endpoint.provider } : {}),
     ...(endpoint.host ? { host: endpoint.host } : {}),
     ...(endpoint.port !== undefined ? { port: endpoint.port } : {}),
-    ...(endpoint.nfsPort !== undefined ? { nfsPort: endpoint.nfsPort } : {}),
     ...(endpoint.authorityInstanceId ? { authorityInstanceId: endpoint.authorityInstanceId } : {}),
     authorityAuthToken: accessToken,
     authorityExpiresAt: expiresAt,
@@ -586,280 +583,63 @@ function sendAccessLeaseError(res: ServerResponse, error: unknown): void {
     });
     return;
   }
+  // Never reflect raw internal error text to the caller (matches sendError's
+  // discipline): log server-side, return a fixed message.
+  console.error("authority-manager access-lease internal error:", error);
   sendJson(res, 500, {
-    error: {
-      code: accessLeaseErrorCodes.internal,
-      message: error instanceof Error ? error.message : "Internal error.",
-    },
+    error: { code: accessLeaseErrorCodes.internal, message: "Internal error." },
   });
 }
 
 // ---------------------------------------------------------------------------
 // Mode selection.
 //
-// Two modes exist: "env" (fixed endpoints) and "production" (journal-native,
-// remote control store). The retired WAL-paired "managed" mode fails startup
-// by name, and the ambient variables that used to infer it
-// (PORTABLEFS_MANAGED_VCS_BIN, PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR) infer
-// production only when the production control store is also configured.
+// Production (journal-native, remote control store) is the only mode. The
+// retired WAL-paired "managed" mode and the retired fixed-endpoint "env"
+// mode fail startup by name.
 // ---------------------------------------------------------------------------
-
-export type AuthorityManagerMode = "env" | "production";
 
 export interface AuthorityManagerModeEnv {
   PORTABLEFS_AUTHORITY_MODE?: string;
-  PORTABLEFS_MANAGED_VCS_BIN?: string;
-  PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR?: string;
-  PORTABLEFS_MANAGER_CONTROL_DATABASE_URL?: string;
+  PORTABLEFS_AUTHORITY_MAP_JSON?: string;
+  PORTABLEFS_AUTHORITY_URL?: string;
 }
 
-const MANAGED_MODE_RETIRED_MESSAGE =
-  "The WAL-paired managed registry was retired; production mode (PORTABLEFS_AUTHORITY_MODE=production, journal-native) is its successor. Set PORTABLEFS_AUTHORITY_MODE=production with PORTABLEFS_MANAGER_CONTROL_DATABASE_URL, PORTABLEFS_MANAGED_VCS_JOURNAL_DSN, and PORTABLEFS_MANAGED_VCS_JOURNAL_HA_POLICY_JSON (see docs/authority-manager.md), or PORTABLEFS_AUTHORITY_MODE=env for fixed endpoints.";
+const PRODUCTION_MODE_MESSAGE =
+  "Production mode (journal-native) is the only authority manager mode. Configure PORTABLEFS_MANAGER_CONTROL_DATABASE_URL, PORTABLEFS_MANAGED_VCS_JOURNAL_DSN, and PORTABLEFS_MANAGED_VCS_JOURNAL_HA_POLICY_JSON (see docs/authority-manager.md).";
 
-export function readAuthorityManagerMode(env: AuthorityManagerModeEnv): AuthorityManagerMode {
+export function assertProductionAuthorityManagerMode(env: AuthorityManagerModeEnv): void {
   const explicit = normalizeOptionalString(env.PORTABLEFS_AUTHORITY_MODE);
-  if (!explicit) {
-    const wantsProcessRegistry =
-      normalizeOptionalString(env.PORTABLEFS_MANAGED_VCS_BIN) ??
-      normalizeOptionalString(env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR);
-    if (!wantsProcessRegistry) {
-      return "env";
-    }
-    if (normalizeOptionalString(env.PORTABLEFS_MANAGER_CONTROL_DATABASE_URL)) {
-      return "production";
-    }
-    throw new Error(
-      `PORTABLEFS_MANAGED_VCS_BIN/PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR are set without the production control store. ${MANAGED_MODE_RETIRED_MESSAGE}`
-    );
-  }
-  if (explicit === "env" || explicit === "production") {
-    return explicit;
-  }
   if (explicit === "managed") {
     throw new Error(
-      `PORTABLEFS_AUTHORITY_MODE=managed is no longer supported. ${MANAGED_MODE_RETIRED_MESSAGE}`
+      `PORTABLEFS_AUTHORITY_MODE=managed is no longer supported (the WAL-paired managed registry was retired). ${PRODUCTION_MODE_MESSAGE}`
     );
   }
-  throw new Error("PORTABLEFS_AUTHORITY_MODE must be env or production.");
-}
-
-export interface EnvAuthorityRegistryConfig {
-  PORTABLEFS_AUTHORITY_PROVIDER_NAME?: string;
-  PORTABLEFS_AUTHORITY_URL?: string;
-  PORTABLEFS_AUTHORITY_NFS_PORT?: string;
-  PORTABLEFS_AUTHORITY_AUTH_TOKEN?: string;
-  PORTABLEFS_AUTHORITY_EXPIRES_AT?: string;
-  PORTABLEFS_AUTHORITY_HEALTH_URL?: string;
-  PORTABLEFS_AUTHORITY_HEALTH_TOKEN?: string;
-  PORTABLEFS_AUTHORITY_HEALTH_TIMEOUT_MS?: string;
-  PORTABLEFS_AUTHORITY_MAP_JSON?: string;
-  VCS_AUTH_TOKEN?: string;
-}
-
-export interface ValidateEnvAuthorityRegistryConfigOptions {
-  requireHealth?: boolean;
-}
-
-export function validateEnvAuthorityRegistryConfig(
-  env: EnvAuthorityRegistryConfig,
-  options: ValidateEnvAuthorityRegistryConfigOptions = {}
-): void {
-  const provider = normalizeOptionalString(env.PORTABLEFS_AUTHORITY_PROVIDER_NAME) ?? DEFAULT_PROVIDER;
-  const entries = readAuthorityEntries(env, provider);
-  if (entries.size === 0) {
-    throw new Error("At least one PortableFS authority endpoint must be configured.");
-  }
-  if (options.requireHealth) {
-    const missingHealth = [...entries]
-      .filter(([, endpoint]) => !endpoint.healthUrl)
-      .map(([key]) => key);
-    if (missingHealth.length > 0) {
-      throw new Error(
-        `PortableFS authority health URLs are required in production; missing healthUrl for ${missingHealth.join(", ")}.`
-      );
-    }
-  }
-}
-
-export function createEnvAuthorityRegistry(
-  env: EnvAuthorityRegistryConfig,
-  fetchImpl?: typeof fetch
-): AuthorityRegistry {
-  const registry = new EnvAuthorityRegistry(env, fetchImpl);
-  return registry;
-}
-
-class EnvAuthorityRegistry implements AuthorityRegistry {
-  private readonly provider: string;
-  private readonly entries: Map<string, AuthorityEndpoint>;
-  private readonly fetchImpl: typeof fetch;
-  private readonly healthTimeoutMs: number;
-
-  constructor(env: EnvAuthorityRegistryConfig, fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis)) {
-    this.provider = normalizeOptionalString(env.PORTABLEFS_AUTHORITY_PROVIDER_NAME) ?? DEFAULT_PROVIDER;
-    this.entries = readAuthorityEntries(env, this.provider);
-    this.fetchImpl = fetchImpl;
-    this.healthTimeoutMs =
-      readPositiveNumberFromString(env.PORTABLEFS_AUTHORITY_HEALTH_TIMEOUT_MS) ?? DEFAULT_HEALTH_TIMEOUT_MS;
-  }
-
-  async ensureAuthority(ref: AuthorityRef): Promise<AuthorityEndpoint> {
-    return this.resolve(ref);
-  }
-
-  async createSession(ref: AuthorityRef): Promise<AuthorityEndpoint> {
-    return this.resolve(ref);
-  }
-
-  async inspectAuthority(ref: AuthorityRef): Promise<AuthorityEndpoint | null> {
-    return this.resolve(ref);
-  }
-
-  async isHealthy(ref: AuthorityRef, endpoint: AuthorityEndpoint): Promise<boolean> {
-    const resolved = endpoint.authorityUrl ? endpoint : this.resolve(ref);
-    if (!resolved.healthUrl) {
-      return true;
-    }
-    const response = await fetchHealthWithTimeout(
-      this.fetchImpl,
-      resolved.healthUrl,
-      {
-        headers: resolved.healthToken ? { authorization: `Bearer ${resolved.healthToken}` } : {},
-      },
-      this.healthTimeoutMs
-    ).catch(() => null);
-    if (!response) {
-      return false;
-    }
-    if (!response.ok) {
-      return false;
-    }
-    const text = response.text;
-    if (!text.trim()) {
-      return true;
-    }
-    const json = tryParseJsonObject(text);
-    if (!json) {
-      return true;
-    }
-    const ready = readBoolean(json, "ready");
-    const ok = readBoolean(json, "ok");
-    return ready ?? ok ?? true;
-  }
-
-  private resolve(ref: AuthorityRef): AuthorityEndpoint {
-    const endpoint =
-      (ref.teamId ? this.entries.get(`${ref.teamId}:${ref.volumeId}:${ref.branch}`) : undefined) ??
-      this.entries.get(`${ref.volumeId}:${ref.branch}`) ??
-      this.entries.get(ref.volumeId) ??
-      this.entries.get("default") ??
-      this.entries.get("*");
-    if (!endpoint) {
-      throw new HttpError(
-        404,
-        `No PortableFS authority is registered for ${ref.volumeId}@${ref.branch}.`
-      );
-    }
-    return endpoint;
-  }
-}
-
-function readAuthorityEntries(env: EnvAuthorityRegistryConfig, provider: string): Map<string, AuthorityEndpoint> {
-  const entries = new Map<string, AuthorityEndpoint>();
-  const mapJson = normalizeOptionalString(env.PORTABLEFS_AUTHORITY_MAP_JSON);
-  if (mapJson) {
-    const parsed = parseJsonObject(mapJson);
-    for (const [key, value] of Object.entries(parsed)) {
-      if (!isRecord(value)) {
-        throw new Error(`PortableFS authority map entry ${key} must be an object.`);
-      }
-      entries.set(key, normalizeEndpoint(value, provider));
-    }
-  }
-
-  const defaultAuthorityUrl = normalizeOptionalString(env.PORTABLEFS_AUTHORITY_URL);
-  if (defaultAuthorityUrl) {
-    entries.set(
-      "default",
-      normalizeEndpoint(
-        {
-          authorityUrl: defaultAuthorityUrl,
-          nfsPort: readNumberFromString(env.PORTABLEFS_AUTHORITY_NFS_PORT),
-          authToken:
-            normalizeOptionalString(env.PORTABLEFS_AUTHORITY_AUTH_TOKEN) ??
-            normalizeOptionalString(env.VCS_AUTH_TOKEN),
-          expiresAt: readNumberFromString(env.PORTABLEFS_AUTHORITY_EXPIRES_AT),
-          healthUrl: normalizeOptionalString(env.PORTABLEFS_AUTHORITY_HEALTH_URL),
-          healthToken: normalizeOptionalString(env.PORTABLEFS_AUTHORITY_HEALTH_TOKEN),
-        },
-        provider
-      )
+  if (explicit === "env") {
+    throw new Error(
+      `PORTABLEFS_AUTHORITY_MODE=env is no longer supported (the fixed-endpoint env registry was retired). ${PRODUCTION_MODE_MESSAGE}`
     );
   }
-
-  return entries;
+  if (explicit && explicit !== "production") {
+    throw new Error(`PORTABLEFS_AUTHORITY_MODE must be production. ${PRODUCTION_MODE_MESSAGE}`);
+  }
+  const retiredEnvRegistryVars = (["PORTABLEFS_AUTHORITY_MAP_JSON", "PORTABLEFS_AUTHORITY_URL"] as const).filter(
+    (name) => normalizeOptionalString(env[name])
+  );
+  if (retiredEnvRegistryVars.length > 0) {
+    throw new Error(
+      `${retiredEnvRegistryVars.join(", ")} belong to the retired env registry and are no longer read. ${PRODUCTION_MODE_MESSAGE}`
+    );
+  }
 }
 
-function normalizeEndpoint(value: Record<string, unknown>, defaultProvider: string): AuthorityEndpoint {
-  const authorityUrl = readString(value, "authorityUrl");
-  if (!authorityUrl) {
-    throw new Error("PortableFS authority endpoint is missing authorityUrl.");
-  }
-  const address = parseAuthorityAddress(authorityUrl);
-  const host = readString(value, "host") ?? address.host;
-  const port = readNumber(value, "port") ?? address.port;
-  if (!host || !port) {
-    throw new Error(`PortableFS authority endpoint has an invalid authorityUrl: ${authorityUrl}`);
-  }
-  const endpoint: AuthorityEndpoint = {
-    provider: readString(value, "provider") ?? defaultProvider,
-    authorityUrl,
-    host,
-    port,
-  };
-  const nfsPort = readNumber(value, "nfsPort");
-  const authToken =
-    readString(value, "authToken") ??
-    readString(value, "authorityAuthToken") ??
-    readString(value, "mountToken");
-  const expiresAt = readNumber(value, "expiresAt") ?? readNumber(value, "authorityExpiresAt");
-  const healthUrl = readString(value, "healthUrl");
-  const healthToken = readString(value, "healthToken");
-  if (nfsPort !== undefined) endpoint.nfsPort = nfsPort;
-  if (authToken) endpoint.authToken = authToken;
-  if (expiresAt !== undefined) endpoint.expiresAt = expiresAt;
-  if (healthUrl) endpoint.healthUrl = healthUrl;
-  if (healthToken) endpoint.healthToken = healthToken;
-  return endpoint;
-}
-
-function toAuthorityPayload(endpoint: AuthorityEndpoint, includeAuthToken: boolean): Record<string, unknown> {
+function toAuthorityPayload(endpoint: AuthorityEndpoint): Record<string, unknown> {
   return omitUndefined({
     provider: endpoint.provider,
     authorityUrl: endpoint.authorityUrl,
     host: endpoint.host,
     port: endpoint.port,
-    nfsPort: endpoint.nfsPort,
     authorityInstanceId: endpoint.authorityInstanceId,
-    authorityAuthToken: includeAuthToken ? endpoint.authToken : undefined,
-    authorityExpiresAt: includeAuthToken ? endpoint.expiresAt : undefined,
-  });
-}
-
-function toMountSessionPayload(ref: AuthorityRef, endpoint: AuthorityEndpoint): Record<string, unknown> {
-  return omitUndefined({
-    volumeId: ref.volumeId,
-    branch: ref.branch,
-    endpoint: omitUndefined({
-      authorityUrl: endpoint.authorityUrl,
-      host: endpoint.host,
-      port: endpoint.port,
-      nfsPort: endpoint.nfsPort,
-    }),
-    token: endpoint.authToken,
-    expiresAtMs: endpoint.expiresAt,
-    authorityInstanceId: endpoint.authorityInstanceId,
-    provider: endpoint.provider,
   });
 }
 
@@ -880,35 +660,13 @@ function readAuthorityRef(body: Record<string, unknown>): AuthorityRef {
   return ref;
 }
 
-// parseMountSessionPath extracts the volume id from the canonical
-// /v1/volumes/:volumeId/mount-sessions form; null = not that route.
-function parseMountSessionPath(pathname: string): string | null {
+// The canonical /v1/volumes/:volumeId/mount-sessions form of the retired
+// mount-session route.
+function isVolumeMountSessionsPath(pathname: string): boolean {
   const parts = pathname.split("/").filter(Boolean);
-  if (parts.length === 4 && parts[0] === "v1" && parts[1] === "volumes" && parts[3] === "mount-sessions") {
-    return decodeURIComponent(parts[2] ?? "");
-  }
-  return null;
-}
-
-function readMountSessionRef(
-  body: Record<string, unknown>,
-  pathVolumeId?: string
-): AuthorityRef {
-  const bodyVolumeId = readString(body, "volumeId");
-  if (pathVolumeId && bodyVolumeId && bodyVolumeId !== pathVolumeId) {
-    throw new HttpError(400, "volumeId in the body does not match the URL.");
-  }
-  const volumeId = pathVolumeId || bodyVolumeId;
-  if (!volumeId) {
-    throw new HttpError(400, "volumeId is required.");
-  }
-  const ref: AuthorityRef = {
-    volumeId,
-    branch: readString(body, "branch") ?? "main",
-  };
-  const teamId = readString(body, "teamId");
-  if (teamId) ref.teamId = teamId;
-  return ref;
+  return (
+    parts.length === 4 && parts[0] === "v1" && parts[1] === "volumes" && parts[3] === "mount-sessions"
+  );
 }
 
 function readAuthorityIdentity(body: Record<string, unknown>, key: string): AuthorityIdentity | undefined {
@@ -921,7 +679,6 @@ function readAuthorityIdentity(body: Record<string, unknown>, key: string): Auth
     authorityUrl: readString(candidate, "authorityUrl"),
     host: readString(candidate, "host"),
     port: readNumber(candidate, "port"),
-    nfsPort: readNumber(candidate, "nfsPort"),
     authorityInstanceId:
       readString(candidate, "authorityInstanceId") ?? readString(candidate, "processRef"),
     processRef: readString(candidate, "processRef"),
@@ -994,28 +751,6 @@ function timingSafeStringEqual(left: string, right: string): boolean {
   return timingSafeEqual(leftBytes, rightBytes);
 }
 
-async function fetchHealthWithTimeout(
-  fetchImpl: typeof fetch,
-  input: string,
-  init: RequestInit,
-  timeoutMs: number
-): Promise<{ ok: boolean; text: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetchImpl(input, {
-      ...init,
-      signal: init.signal ?? controller.signal,
-    });
-    if (!response.ok) {
-      return { ok: false, text: "" };
-    }
-    return { ok: true, text: await response.text() };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 function sendJson(
   res: ServerResponse,
   status: number,
@@ -1045,9 +780,7 @@ function sendError(res: ServerResponse, error: unknown): void {
     sendJson(res, error.status, { error: error.message });
     return;
   }
-  // Legacy session routes mint their credential through the lease service
-  // (and, in production mode, the fenced registry); structured failures keep
-  // their status and machine-readable code.
+  // Registry lifecycle failures keep their status and machine-readable code.
   if (error instanceof AccessLeaseError || error instanceof AuthorityOperationError) {
     sendJson(
       res,
@@ -1073,36 +806,12 @@ class HttpError extends Error {
   }
 }
 
-function parseAuthorityAddress(authorityUrl: string): { host?: string; port?: number } {
-  const firstAddress = authorityUrl.split(",")[0]?.trim() ?? "";
-  const stripped = firstAddress.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, "");
-  const [host, portText] = stripped.split(":");
-  const port = portText && /^[0-9]+$/u.test(portText) ? Number(portText) : undefined;
-  const result: { host?: string; port?: number } = {};
-  if (host) {
-    result.host = host;
-  }
-  if (port && port > 0 && port <= 65535) {
-    result.port = port;
-  }
-  return result;
-}
-
 function parseJsonObject(text: string): Record<string, unknown> {
   const parsed: unknown = JSON.parse(text);
   if (!isRecord(parsed)) {
     throw new HttpError(400, "Request body must be a JSON object.");
   }
   return parsed;
-}
-
-function tryParseJsonObject(text: string): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return isRecord(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
 }
 
 function readString(value: Record<string, unknown>, key: string): string | undefined {
@@ -1113,25 +822,6 @@ function readString(value: Record<string, unknown>, key: string): string | undef
 function readNumber(value: Record<string, unknown>, key: string): number | undefined {
   const candidate = value[key];
   return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
-}
-
-function readNumberFromString(value: string | undefined): number | undefined {
-  const normalized = normalizeOptionalString(value);
-  if (!normalized) {
-    return undefined;
-  }
-  const numberValue = Number(normalized);
-  return Number.isFinite(numberValue) ? numberValue : undefined;
-}
-
-function readPositiveNumberFromString(value: string | undefined): number | undefined {
-  const numberValue = readNumberFromString(value);
-  return numberValue !== undefined && numberValue > 0 ? numberValue : undefined;
-}
-
-function readBoolean(value: Record<string, unknown>, key: string): boolean | undefined {
-  const candidate = value[key];
-  return typeof candidate === "boolean" ? candidate : undefined;
 }
 
 function normalizeOptionalString(value: string | undefined): string | undefined {

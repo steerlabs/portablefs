@@ -624,7 +624,8 @@ func TestApplyBatchPublishesExactlyOncePerBatch(t *testing.T) {
 	}
 	// Exactly one publish, carrying only the affected paths of records that ACTUALLY changed the tree.
 	select {
-	case paths := <-sub:
+	case batchInvs := <-sub:
+		paths := batchInvs.Invs
 		// a, a, d, b = 4 paths; the guard-rejected rename (no-op) contributes none.
 		if len(paths) != 4 {
 			t.Fatalf("published %d paths %v, want 4 (no-op records must not publish)", len(paths), paths)

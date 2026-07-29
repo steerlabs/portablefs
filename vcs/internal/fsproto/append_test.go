@@ -29,9 +29,6 @@ func TestAtomicAppendAcrossClients(t *testing.T) {
 		if _, err := cli.EnsureExactSession(); err != nil {
 			t.Fatal(err)
 		}
-		if !cli.SupportsAtomicAppend() {
-			t.Fatal("workfs authority did not advertise atomic append")
-		}
 		clients[i] = cli
 	}
 	if _, st, err := clients[0].Create("log", 0o644); err != nil || st != OK {

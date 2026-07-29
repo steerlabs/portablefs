@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -24,11 +23,10 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
-// This file is the CLI's in-process FUSE frontend. It forwards kernel ops
-// through clientcore.Volume exactly the way cmd/mount does — the coherence,
-// open-after-unlink, and cache logic all live in clientcore — and keeps only
-// the go-fuse node adapter here (cmd/mount's adapter is package main and
-// cannot be imported; cmd/mount itself is frozen).
+// This file is the product FUSE frontend: it forwards kernel ops through
+// clientcore.Volume — the coherence, open-after-unlink, and cache logic all
+// live in clientcore — and keeps only the go-fuse node adapter here. (The
+// bench harness carries its own trimmed copy in bench/cmd/benchmount.)
 
 func randomID() string {
 	var b [8]byte
@@ -514,7 +512,7 @@ func (n *fuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 }
 
 func (n *fuseNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
-	return errno(n.v.FsyncPath(n.curPath()))
+	return errno(n.v.FsyncHandle(n.curPath(), n.state))
 }
 
 // Flush runs on every close(2), including intermediate closes of shared
@@ -524,11 +522,9 @@ func (n *fuseNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno { 
 func (n *fuseNode) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	if h, ok := fh.(*fuseHandle); ok {
 		clientcore.ReleaseHandleLocks(n.v.LockAuth(), &h.lock)
-		n.v.CloseHandle(h.openPath, n.state)
-		return 0
+		return errno(n.v.CloseHandle(h.openPath, n.state))
 	}
-	n.v.CloseHandle(n.curPath(), n.state)
-	return 0
+	return errno(n.v.CloseHandle(n.curPath(), n.state))
 }
 
 func (n *fuseNode) lockHandle(fh fs.FileHandle) *clientcore.LockHandle {
@@ -679,10 +675,10 @@ type localDirsMountConfig struct {
 	onChange func([]string)
 }
 
-// mountFUSE dials the authority and mounts it at mountPath, wiring the same
-// invalidation, open-lease renewal, and cache options cmd/mount uses. tokens
+// mountFUSE dials the authority and mounts it at mountPath, wiring push
+// invalidation, open-lease renewal, and the default cache options. tokens
 // serves the live data-plane credential to reconnect handshakes and re-resolves
-// the mount session when the router rejects the token (manager restart).
+// access when the router rejects the token (manager restart).
 func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf perfOptions, localCfg localDirsMountConfig) (*fuseMount, error) {
 	tlsCfg, err := secure.ClientTLS()
 	if err != nil {
@@ -704,15 +700,6 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 	// contributes) and before any invalidation goroutine starts; the closures
 	// below only run from those goroutines.
 	var grafts *localdirs.Grafts
-	walDir := ""
-	if perf.writeBack {
-		// A scratch WAL dir buffers write-back mutations between flushes; it
-		// holds no durable state once the session drains on unmount.
-		walDir, err = os.MkdirTemp("", "portablefs-sess-")
-		if err != nil {
-			return nil, fmt.Errorf("write-back scratch dir: %w", err)
-		}
-	}
 	vol, err := clientcore.Dial(context.Background(), clientcore.Options{
 		Addr:             addr,
 		Pool:             16,
@@ -720,15 +707,14 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 		Owner:            "portablefs-" + randomID(),
 		CredentialSource: tokens.get,
 		// A router token rejection (manager restart, lease rotation) triggers
-		// an immediate mount-session re-resolve instead of waiting for the
+		// an immediate access re-resolve instead of waiting for the
 		// keeper's timed renewal to discover the new epoch.
 		OnTokenRejected: tokens.refreshNow,
-		WriteBack:       perf.writeBack,
-		WALDir:          walDir,
-		FlushInterval:   perf.flushInterval,
-		FsyncPolicy:     clientcore.FsyncPolicy(perf.fsyncPolicy),
-		FlushMaxRecords: perf.flushMaxRecords,
-		FlushMaxBytes:   perf.flushMaxBytes,
+		// The write-back engine's durable state: keyed by (volume, branch)
+		// so a parked stream recovers on the next mount at ANY path.
+		WALDir:          perf.writebackDir,
+		VolumeID:        perf.volumeID,
+		Branch:          perf.branch,
 		NegativeCache:   perf.negativeCache,
 		NoNegativeCache: perf.negativeCacheOff,
 		OnFlushAll: func(path string) {
@@ -797,7 +783,7 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 		log.Printf("machine-local dirs: %s (backing %s)", strings.Join(effectiveDirs, ", "), localCfg.backingRoot)
 	}
 
-	// Kernel caching mirrors cmd/mount's default mode: file data is cached and
+	// Kernel caching default: file data is cached and
 	// kept across opens, attrs and existence revalidate every time (ttl 0);
 	// coherence comes from the authority's push invalidations, never timers.
 	ttl := time.Duration(0)
@@ -840,15 +826,24 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 	return m, nil
 }
 
-// Unmount flushes and detaches; safe to call once from a signal handler.
-func (m *fuseMount) Unmount() {
-	m.stop()
-	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := m.vol.FlushToAuthority(flushCtx); err != nil {
-		log.Printf("unmount flush barrier FAILED: %v; un-flushed write-back mutations remain in the session WAL and are recovered on the next clean start — do NOT delete the WAL directory", err)
+// Unmount runs the full drain barrier and detaches only on success: a
+// normal unmount can never succeed with an unshipped acknowledged tail. On
+// failure the kernel mount STAYS UP and the error is returned — the caller
+// retries, or uses the explicit force path (which parks the tail as a
+// durable recovery job).
+func (m *fuseMount) Unmount() error {
+	err := m.vol.CloseWithFinalizer(func() error {
+		if err := m.server.Unmount(); err != nil {
+			return err
+		}
+		m.stop()
+		return nil
+	})
+	if err != nil {
+		log.Printf("unmount REFUSED: final drain or kernel detach failed: %v — the mount stays attached; retry when the authority answers, or `portablefs umount --force` parks the tail as a durable recovery job", err)
+		return err
 	}
-	_ = m.server.Unmount()
+	return nil
 }
 
 // Wait blocks until the kernel mount is gone, then releases client resources.

@@ -6,10 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/metrics"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
-	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
 // TestOpNamesCoverEverySequentialOp guards the per-op counter map against new
@@ -51,21 +48,14 @@ func TestCountOpAttributesKnownAndUnknownOps(t *testing.T) {
 // in their per-op counters (the benchmark harness reads these to attribute a
 // workload's round-trips).
 func TestServeCountsPerOp(t *testing.T) {
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = NewServer(fs, fs, delegation.New()).Serve(ctx, ln) }()
+	go func() { _ = NewServer(fs, fs).Serve(ctx, ln) }()
 	cli, err := Dial(ln.Addr().String(), 1)
 	if err != nil {
 		t.Fatal(err)

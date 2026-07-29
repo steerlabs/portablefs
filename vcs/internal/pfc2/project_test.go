@@ -80,13 +80,22 @@ func goldenEntries() []goldenEntry {
 			key:   "06000000000000002a7066732d306131623263000000000000000001",
 		},
 		{
+			name: "checkout-delegation-recovery",
+			entry: Entry{Kind: EntryCheckout, Checkout: &CheckoutEntryValue{
+				Path: "proj/held", Holder: ref("pfs-0a1b2c", 1), Epoch: "13",
+				WritebackID: "wb-1", Recovery: true,
+			}},
+			value: "080532270a0970726f6a2f68656c64120e0a0a7066732d30613162326310011a023133220477622d312801",
+			key:   "0570726f6a2f68656c6400",
+		},
+		{
 			name: "flush",
 			entry: Entry{Kind: EntryFlush, Flush: &FlushEntryValue{
-				Session: ref("pfs-0a1b2c", 1), WritebackID: "wb-1", CheckoutPath: "proj/data",
-				CheckoutEpoch: "12", Through: 512,
+				Owner: ref("pfs-0a1b2c", 1), WritebackID: "wb-1", Through: 512,
+				Digest: hash32(0x99),
 			}},
-			value: "080742280a0e0a0a7066732d3061316232631001120477622d311a0970726f6a2f6461746122023132288004",
-			key:   "077066732d30613162326300000000000000000177622d310070726f6a2f64617461003132",
+			value: "0807423b0a0e0a0a7066732d3061316232631001120477622d3128800432209999999999999999999999999999999999999999999999999999999999999999",
+			key:   "0777622d3100",
 		},
 	}
 }
@@ -107,7 +116,7 @@ func goldenProjectionState(t *testing.T) *State {
 	mustApply(t, st, floorRec("pfs-a", 1, 3, 1))
 	mustApply(t, st, ptr(lockRec(key("pfs-a", 1, 1, sa.take(1), 0), 42, 7, LockSetWrite, 4096, 0)))
 	mustApply(t, st, ptr(lockRec(key("pfs-a", 1, 1, sa.take(1), 0), 42, 7, LockSetRead, 0, 100)))
-	mustApply(t, st, ptr(checkoutRec(key("pfs-a", 1, 2, sa.take(2), 0), CheckoutGrant, "proj/data", "1", [32]byte{})))
+	mustApply(t, st, ptr(delegationRec(key("pfs-a", 1, 2, sa.take(2), 0), "proj/data", "1", "wb-1")))
 	mustApply(t, st, flushRec("pfs-a", 1, "wb-1", "proj/data", "1", 512))
 	mustApply(t, st, pinRec("pfs-a", 1, 42, false))
 	mustApply(t, st, pinRec("pfs-b", 1, 42, false))
@@ -118,7 +127,7 @@ func goldenProjectionState(t *testing.T) *State {
 // goldenProjectionDigest freezes the projection digest of the state above.
 // A checkout grant's durable slot outcome now carries the granted epoch
 // (Outcome.Offset), so the frozen digest reflects that.
-const goldenProjectionDigest = "9c092d372eca4efe41a9ff1a028bc19d4b457bc1e86255bc603653d807dbde22"
+const goldenProjectionDigest = "aa23d50995c0c159c2c83681194ed803176e473f78e40a54ac7311b45cdf6434"
 
 func TestEntryGoldens(t *testing.T) {
 	for _, g := range goldenEntries() {
@@ -338,10 +347,10 @@ func TestRebuildRejectsCorruption(t *testing.T) {
 			}
 		}
 	})
-	mutate("flush-without-grant", ErrIntegrity, func(p *Projection) {
+	mutate("flush-owner-unknown", ErrIntegrity, func(p *Projection) {
 		for i := range p.Entries {
 			if p.Entries[i].Kind == EntryFlush {
-				p.Entries[i].Flush.CheckoutEpoch = "9"
+				p.Entries[i].Flush.Owner = ref("ghost", 1)
 				return
 			}
 		}
@@ -450,7 +459,13 @@ func TestEntryValidateRejects(t *testing.T) {
 		}}},
 		{"tombstone-bad-reason", Entry{Kind: EntryTombstone, Tombstone: &TombstoneEntryValue{Session: ref("s", 1), Reason: 0}}},
 		{"flush-zero-through", Entry{Kind: EntryFlush, Flush: &FlushEntryValue{
-			Session: ref("s", 1), WritebackID: "w", CheckoutPath: "p", CheckoutEpoch: "1",
+			Owner: ref("s", 1), WritebackID: "w", Digest: hash32(1),
+		}}},
+		{"flush-zero-digest", Entry{Kind: EntryFlush, Flush: &FlushEntryValue{
+			Owner: ref("s", 1), WritebackID: "w", Through: 5,
+		}}},
+		{"checkout-recovery-without-stream", Entry{Kind: EntryCheckout, Checkout: &CheckoutEntryValue{
+			Path: "p", Holder: ref("s", 1), Epoch: "1", Recovery: true,
 		}}},
 		{"pin-zero-ino", Entry{Kind: EntryPin, Pin: &PinEntryValue{Session: ref("s", 1)}}},
 	}

@@ -125,8 +125,9 @@ func goldenRecords() []goldenRecord {
 			rec: Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{
 				Session: ref("pfs-0a1b2c", 1), WritebackID: "wb-1",
 				CheckoutPath: "proj/data", CheckoutEpoch: "12", Through: 512,
+				Digest: hash32(0x99),
 			}},
-			hex: "5046433208063a280a0e0a0a7066732d3061316232631001120477622d311a0970726f6a2f6461746122023132288004",
+			hex: "5046433208063a4a0a0e0a0a7066732d3061316232631001120477622d311a0970726f6a2f646174612202313228800432209999999999999999999999999999999999999999999999999999999999999999",
 		},
 		{
 			name: "lock-set-write-eof",
@@ -152,6 +153,26 @@ func goldenRecords() []goldenRecord {
 			name: "checkout-force-transfer",
 			rec:  checkoutRec(key("pfs-9f8e7d", 3, 0, 1, 0), CheckoutForceTransfer, "proj/data", "13", hash32(0x5a)),
 			hex:  "5046433208084a690a340a0e0a0a7066732d396638653764100318012220768b4311ee00f7036365fa7292cf93b6a13e185e11b2298c2aba77dbb9c856c71803220970726f6a2f646174612a02313332205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+		},
+		{
+			name: "delegation-grant",
+			rec:  delegationRec(key("pfs-0a1b2c", 1, 1, 4, 0), "proj/data", "14", "wb-1"),
+			hex:  "5046433208084a4f0a360a0e0a0a7066732d3061316232631001100118042220db84e2effb7714ae1472e18ff38d23c08c81643afa928a8f810e0d01e1f5187c1801220970726f6a2f646174612a0231343a0477622d31",
+		},
+		{
+			name: "checkout-rebind",
+			rec: Record{Kind: KindCheckoutChange, CheckoutChange: &CheckoutChange{
+				Op: CheckoutRebind, Path: "proj/data", Epoch: "14",
+				WritebackID: "wb-1", NewHolder: ref("pfs-9f8e7d", 3),
+			}},
+			hex: "5046433208084a271804220970726f6a2f646174612a0231343a0477622d31420e0a0a7066732d3966386537641003",
+		},
+		{
+			name: "checkout-discard",
+			rec: Record{Kind: KindCheckoutChange, CheckoutChange: &CheckoutChange{
+				Op: CheckoutDiscard, Path: "proj/data", Epoch: "14", WritebackID: "wb-1",
+			}},
+			hex: "5046433208084a171805220970726f6a2f646174612a0231343a0477622d31",
 		},
 		{
 			name: "open-pin",
@@ -470,9 +491,10 @@ func TestValidateRejects(t *testing.T) {
 		{"outcome-zero-slot-seq", Record{Kind: KindExactOutcome, ExactOutcome: &ExactOutcome{Key: ExactKey{Session: ref("s", 1), RequestHash: hash32(1)}}}},
 		{"outcome-slot-out-of-bound", Record{Kind: KindExactOutcome, ExactOutcome: &ExactOutcome{Key: ExactKey{Session: ref("s", 1), Slot: MaxSlots, SlotSeq: 1, RequestHash: hash32(1)}}}},
 		{"floor-zero-through", Record{Kind: KindOutcomeFloor, OutcomeFloor: &OutcomeFloor{Session: ref("s", 1), Slot: 0}}},
-		{"flush-empty-writeback", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), CheckoutPath: "p", CheckoutEpoch: "1", Through: 1}}},
-		{"flush-bad-epoch", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), WritebackID: "w", CheckoutPath: "p", CheckoutEpoch: "01", Through: 1}}},
-		{"flush-zero-through", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), WritebackID: "w", CheckoutPath: "p", CheckoutEpoch: "1"}}},
+		{"flush-empty-writeback", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), CheckoutPath: "p", CheckoutEpoch: "1", Through: 1, Digest: hash32(1)}}},
+		{"flush-bad-epoch", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), WritebackID: "w", CheckoutPath: "p", CheckoutEpoch: "01", Through: 1, Digest: hash32(1)}}},
+		{"flush-zero-through", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), WritebackID: "w", CheckoutPath: "p", CheckoutEpoch: "1", Digest: hash32(1)}}},
+		{"flush-zero-digest", Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{Session: ref("s", 1), WritebackID: "w", CheckoutPath: "p", CheckoutEpoch: "1", Through: 1}}},
 		{"lock-zero-ino", func() Record {
 			r := lockRec(key("s", 1, 0, 1, 0), 1, 1, LockSetRead, 0, 1)
 			r.LockChange.Ino = 0
@@ -515,6 +537,33 @@ func TestValidateRejects(t *testing.T) {
 		{"checkout-fingerprint-mismatch", func() Record {
 			r := checkoutRec(key("s", 1, 0, 1, 0), CheckoutGrant, "a", "1", [32]byte{})
 			r.CheckoutChange.Key.RequestHash = hash32(0x11)
+			return r
+		}()},
+		{"release-with-writeback-id", func() Record {
+			r := checkoutRec(key("s", 1, 0, 1, 0), CheckoutRelease, "a", "1", [32]byte{})
+			r.CheckoutChange.WritebackID = "w"
+			return r
+		}()},
+		{"rebind-with-key", func() Record {
+			r := *rebindRec("a", "1", "w", ref("s", 2))
+			r.CheckoutChange.Key = key("s", 1, 0, 1, 0x11)
+			return r
+		}()},
+		{"rebind-without-new-holder", func() Record {
+			r := *rebindRec("a", "1", "w", ref("s", 2))
+			r.CheckoutChange.NewHolder = SessionRef{}
+			return r
+		}()},
+		{"rebind-without-writeback-id", *rebindRec("a", "1", "", ref("s", 2))},
+		{"discard-with-new-holder", func() Record {
+			r := *discardRec("a", "1", "w")
+			r.CheckoutChange.NewHolder = ref("s", 2)
+			return r
+		}()},
+		{"discard-without-writeback-id", *discardRec("a", "1", "")},
+		{"grant-with-new-holder", func() Record {
+			r := checkoutRec(key("s", 1, 0, 1, 0), CheckoutGrant, "a", "1", [32]byte{})
+			r.CheckoutChange.NewHolder = ref("s", 2)
 			return r
 		}()},
 		{"pin-zero-ino", Record{Kind: KindOpenPinChange, OpenPinChange: &OpenPinChange{Session: ref("s", 1)}}},
@@ -710,6 +759,7 @@ func randRecord(rng *rand.Rand) Record {
 		return Record{Kind: KindFlushAdvance, FlushAdvance: &FlushAdvance{
 			Session: randRef(rng), WritebackID: randID(rng, 16),
 			CheckoutPath: randPath(rng), CheckoutEpoch: randEpoch(rng), Through: rng.Uint64()>>1 + 1,
+			Digest: randHash(rng),
 		}}
 	case KindLockChange:
 		op := LockOp(1 + rng.Intn(3))
@@ -720,7 +770,17 @@ func randRecord(rng *rand.Rand) Record {
 		}
 		return lockRec(randKey(rng), rng.Uint64()>>1+1, rng.Uint64(), op, start, length)
 	case KindCheckoutChange:
-		op := CheckoutOp(1 + rng.Intn(3))
+		op := CheckoutOp(1 + rng.Intn(5))
+		switch op {
+		case CheckoutRebind:
+			return *rebindRec(randPath(rng), randEpoch(rng), randID(rng, 16), randRef(rng))
+		case CheckoutDiscard:
+			return *discardRec(randPath(rng), randEpoch(rng), randID(rng, 16))
+		case CheckoutGrant:
+			if rng.Intn(2) == 0 {
+				return delegationRec(randKey(rng), randPath(rng), randEpoch(rng), randID(rng, 16))
+			}
+		}
 		var digest [32]byte
 		if op == CheckoutForceTransfer {
 			digest = randHash(rng)

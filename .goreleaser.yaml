@@ -25,17 +25,6 @@ builds:
     ldflags:
       - -s -w
 
-  - id: portablefs-mount
-    dir: vcs
-    main: ./cmd/mount
-    binary: portablefs-mount
-    env:
-      - CGO_ENABLED=0
-    goos: [linux, darwin]
-    goarch: [amd64, arm64]
-    ldflags:
-      - -s -w
-
   - id: portablefsd
     dir: vcs
     main: ./cmd/portablefsd

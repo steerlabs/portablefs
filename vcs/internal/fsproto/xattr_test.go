@@ -1,17 +1,11 @@
 package fsproto
 
 import (
-	"context"
-	"net"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/go-git/go-billy/v5"
-
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
-	"github.com/steerlabs/portablefs/vcs/internal/metrics"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
@@ -21,9 +15,6 @@ import (
 // wire bounds (ERANGE name, E2BIG value).
 func xattrClientRoundtrip(t *testing.T, cli *Client) {
 	t.Helper()
-	if !cli.SupportsXattrs() {
-		t.Fatal("authority did not advertise FeatXattrs")
-	}
 	if _, st, err := cli.Create("x.txt", 0o644); err != nil || st != OK {
 		t.Fatalf("create: st=%d err=%v", st, err)
 	}
@@ -128,9 +119,9 @@ func TestXattrCreateOnlyAtomicAcrossClients(t *testing.T) {
 	}
 }
 
-// TestXattrRoundtripLegacyAuthority: the WAL-backed generation serves and
-// journals xattrs through the exact-session mutation path.
-func TestXattrRoundtripLegacyAuthority(t *testing.T) {
+// TestXattrRoundtripFileLogAuthority: the file-entry-log-backed managed
+// generation serves and journals xattrs through the exact-session mutation path.
+func TestXattrRoundtripFileLogAuthority(t *testing.T) {
 	cli := serve(t)
 	if _, err := cli.EnsureExactSession(); err != nil {
 		t.Fatalf("exact session: %v", err)
@@ -152,141 +143,60 @@ func TestXattrRoundtripManagedAuthority(t *testing.T) {
 	if _, err := cli.EnsureExactSession(); err != nil {
 		t.Fatalf("exact session: %v", err)
 	}
-	if !cli.ServerManaged() {
-		t.Fatal("authority did not negotiate managed coordination")
-	}
 	xattrClientRoundtrip(t, cli)
 }
 
-// billyOnly hides every optional workfs interface (XattrStore included), so
-// the server behaves exactly like a pre-xattr authority: no FeatXattrs on
-// the probe, EOPNOTSUPP on a direct wire op.
-type billyOnly struct{ billy.Filesystem }
+// noCondXattrFS models a store that serves xattrs but does NOT implement the
+// conditional-flag evaluator: a conditional set against it must fail closed
+// with a durable EOPNOTSUPP instead of silently dropping the precondition.
+type noCondXattrFS struct{ *workfs.FS }
 
-// legacyXattrFS models the rolling-upgrade peer that implements the original
-// FeatXattrs read surface but predates conditional xattr flags.
-type legacyXattrFS struct {
-	billy.Filesystem
-	delegate *workfs.FS
-}
+func (noCondXattrFS) SupportsAtomicXattrFlags() bool { return false }
 
-func (f legacyXattrFS) GetxattrHandle(path string, ino uint64, name string) ([]byte, error) {
-	return f.delegate.GetxattrHandle(path, ino, name)
-}
-
-func (f legacyXattrFS) ListxattrHandle(path string, ino uint64) ([]string, error) {
-	return f.delegate.ListxattrHandle(path, ino)
-}
-
-// TestXattrCapabilityNegotiation: an authority without the xattr surface
-// never advertises FeatXattrs; the client's SupportsXattrs gate reports
-// false and a raw wire op answers EOPNOTSUPP.
-func TestXattrCapabilityNegotiation(t *testing.T) {
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
+func TestConditionalXattrWithoutEvaluatorFailsClosed(t *testing.T) {
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
+	srv := NewServer(noCondXattrFS{FS: fs}, fs)
+	cs := openExactSession(t, srv, "sess-XF", 1, "MX", "tokXF", 8)
+	if r := exactDo(srv, cs, &Request{Op: OpCreate, Path: "f", Mode: 0o644}, 0, 1); r.Status != OK {
+		t.Fatalf("create: %+v", r)
 	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
+	r := exactDo(srv, cs, &Request{Op: OpSetxattr, Path: "f", XattrName: "user.k", Data: []byte("v"), XattrFlags: wal.XattrCreate}, 0, 2)
+	if r == nil || r.Status != EOPNOTSUPP {
+		t.Fatalf("conditional set without the evaluator: %+v, want EOPNOTSUPP", r)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// The identity was consumed durably: the identical resend replays.
+	if r := exactDo(srv, cs, &Request{Op: OpSetxattr, Path: "f", XattrName: "user.k", Data: []byte("v"), XattrFlags: wal.XattrCreate}, 0, 2); r == nil || r.Status != EOPNOTSUPP || !r.Duplicate {
+		t.Fatalf("replay: %+v, want duplicate EOPNOTSUPP", r)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	srv := NewServer(billyOnly{fs}, fs, delegation.New())
-	go func() { _ = srv.Serve(ctx, ln) }()
-
-	cli, err := Dial(ln.Addr().String(), 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cli.Close() })
-	if cli.SupportsXattrs() {
-		t.Fatal("pre-xattr authority advertised FeatXattrs")
-	}
-	// A raw wire op (bypassing the client gate) answers EOPNOTSUPP — the
-	// server-side fence behind the un-advertised capability.
-	if r := srv.dispatch(&Request{Op: OpGetxattr, Path: "f", XattrName: "user.a"}); r.Status != EOPNOTSUPP {
-		t.Fatalf("getxattr against pre-xattr fs: status %d, want EOPNOTSUPP", r.Status)
-	}
-	if r := srv.dispatch(&Request{Op: OpListxattr, Path: "f"}); r.Status != EOPNOTSUPP {
-		t.Fatalf("listxattr against pre-xattr fs: status %d, want EOPNOTSUPP", r.Status)
-	}
-
-	// A full workfs-backed server advertises the bit (both generations are
-	// proven by the roundtrip tests above).
-	feats, err := serve(t).ServerFeatures()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if feats&FeatXattrs == 0 || feats&FeatAtomicXattrFlags == 0 {
-		t.Fatalf("workfs authority features %b miss xattrs or atomic xattr flags", feats)
+	// The unconditional set still lands.
+	if r := exactDo(srv, cs, &Request{Op: OpSetxattr, Path: "f", XattrName: "user.k", Data: []byte("v")}, 0, 3); r == nil || r.Status != OK {
+		t.Fatalf("unconditional set: %+v", r)
 	}
 }
 
-func TestConditionalXattrRollingUpgradeFailsClosed(t *testing.T) {
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	srv := NewServer(legacyXattrFS{Filesystem: fs, delegate: fs}, fs, delegation.New())
-	go func() { _ = srv.Serve(ctx, ln) }()
-
-	cli, err := Dial(ln.Addr().String(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cli.Close() })
-	if !cli.SupportsXattrs() {
-		t.Fatal("legacy xattr authority did not advertise basic xattrs")
-	}
-	if cli.SupportsAtomicXattrFlags() {
-		t.Fatal("legacy xattr authority advertised conditional flags")
-	}
-	cli.ops = &metrics.Counter{}
-	before := cli.ops.Value()
-	if st, err := cli.SetxattrFlags("f", 0, "user.once", []byte("v"), wal.XattrCreate); err != nil || st != EOPNOTSUPP {
-		t.Fatalf("conditional set against legacy authority: st=%d err=%v", st, err)
-	}
-	if got := cli.ops.Value(); got != before {
-		t.Fatalf("conditional xattr made %d wire operations after capability denial", got-before)
-	}
-	if r := srv.dispatch(&Request{
-		Op: OpSetxattr, Path: "f", XattrName: "user.once",
-		XattrFlags: wal.XattrCreate, Data: []byte("v"),
-	}); r.Status != EOPNOTSUPP {
-		t.Fatalf("raw conditional xattr status %d, want EOPNOTSUPP", r.Status)
-	}
-}
-
-// TestXattrFlushBatchRejectsSmuggledRecords: xattr mutations are
-// write-through only; a write-back flush carrying one is refused before any
-// apply (both admission layers enforce it — this covers the server's).
 func TestXattrFlushBatchRejectsSmuggledRecords(t *testing.T) {
-	fs, addr := serveFS(t)
-	_ = fs
+	_, addr := serveFS(t)
 	cli, err := Dial(addr, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cli.Close() })
-	_, st, err := cli.FlushBatch("sess-x", 1, "M", []wal.Record{
-		{Seq: 0, Op: wal.OpCreate, Path: "f", Mode: 0o644},
-		{Seq: 1, Op: wal.OpSetxattr, Path: "f", XattrName: "user.a", Data: []byte("v")},
-	})
+	cli.SetOwner("M")
+	if _, err := cli.EnsureExactSession(); err != nil {
+		t.Fatalf("exact session: %v", err)
+	}
+	if _, st, err := cli.Mkdir("wb", 0o755); err != nil || st != OK {
+		t.Fatalf("mkdir: st=%d err=%v", st, err)
+	}
+	grant, err := cli.DelegationAcquire("wb", "sess-x")
+	if err != nil || !grant.Granted {
+		t.Fatalf("delegation acquire: %+v err=%v", grant, err)
+	}
+	records := []wal.Record{
+		{Seq: 1, Op: wal.OpCreate, Path: "wb/f", Mode: 0o644},
+		{Seq: 2, Op: wal.OpSetxattr, Path: "wb/f", XattrName: "user.a", Data: []byte("v")},
+	}
+	_, st, err := cli.FlushWriteback("sess-x", "wb", grant.Epoch, wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), records), records)
 	if err != nil || st != EINVAL {
 		t.Fatalf("smuggled xattr flush: st=%d err=%v, want EINVAL", st, err)
 	}

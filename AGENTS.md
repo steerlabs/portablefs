@@ -55,8 +55,7 @@ never edit a released file under `packages/metadata-db/migrations`.
 - `vcs/`: Go data plane (authority server, Linux FUSE mount client, the macOS
   `portablefsd` daemon behind the FSKit extension, NFS compat, WAL,
   replication, checkpoints). Internals live under `vcs/internal/`.
-- `apps/volume-api`, `apps/authority-manager`, `apps/volume-worker`: TypeScript
-  control plane.
+- `apps/volume-api`, `apps/authority-manager`: TypeScript control plane.
 - `packages/*`: shared TS libraries (protocol schemas, core tree/chunk/hash logic,
   metadata DB, blob stores, testkit).
 - `docs/`: contracts and guides; `docs/architecture.md` is the root contract.

@@ -55,6 +55,10 @@ type cutStore struct {
 
 	uploadConcurrency int
 	maxPendingBytes   int64
+	// freshFloor is the receipt-freshness cutoff (claim DB time minus the
+	// freshen age): a copy verified at or after it needs no re-upload and
+	// no re-verification — the same rule proveOne applies at publish.
+	freshFloor int64
 
 	mu           sync.Mutex
 	pending      map[pft2.Ref][]byte
@@ -76,6 +80,11 @@ type cutStore struct {
 	ObjectsUploaded atomic.Int64
 	BytesUploaded   atomic.Int64
 	ObjectsFetched  atomic.Int64
+	// ObjectsSkipped counts objects a previous attempt already uploaded and
+	// receipted (fresh, at the bound incarnation, in every required
+	// domain): the convergent-retry path skips their uploads entirely, so
+	// a retried cut only pays for what is actually missing.
+	ObjectsSkipped atomic.Int64
 	// StoreRetries counts the transient store failures (503 SlowDown, 429,
 	// reset connections) the required domains absorbed with backoff while
 	// this run's uploads were in flight. It is the operator's signal that a
@@ -108,6 +117,7 @@ func newCutStore(ctx context.Context, repo Repository, stores *DomainStores, cla
 		domains:           claim.ReplicationPolicy.RequiredFailureDomains,
 		uploadConcurrency: cfg.UploadConcurrency,
 		maxPendingBytes:   cfg.MaxPendingUploadBytes,
+		freshFloor:        claim.DbTimeMs - cfg.FreshenAge.Milliseconds(),
 		pending:           map[pft2.Ref][]byte{},
 		cache:             map[pft2.Ref]*list.Element{},
 		cacheList:         list.New(),
@@ -200,10 +210,19 @@ func (s *cutStore) Flush() error {
 		s.mu.Unlock()
 
 		intents := make([]ObjectIntent, len(batch))
+		digests := make([]string, len(batch))
 		for i, ref := range batch {
-			intents[i] = ObjectIntent{Digest: digestOfRef(ref), Size: int64(ref.Size)}
+			digests[i] = digestOfRef(ref)
+			intents[i] = ObjectIntent{Digest: digests[i], Size: int64(ref.Size)}
 		}
 		bindings, err := s.repo.IntendObjects(s.ctx, s.claim.Facts.CutID, s.claim.ClaimEpoch, intents)
+		if err != nil {
+			return err
+		}
+		// Convergent retries: a previous attempt's verified receipts at the
+		// SAME bound incarnation are exactly as good as ours — locate the
+		// whole batch once and upload only to domains without a fresh copy.
+		located, err := s.repo.LocateObjects(s.ctx, s.claim.TenantID, "pft2", digests)
 		if err != nil {
 			return err
 		}
@@ -211,22 +230,32 @@ func (s *cutStore) Flush() error {
 		type job struct {
 			ref         pft2.Ref
 			incarnation int64
+			missing     []string // required domains without a fresh receipt
 		}
 		jobs := make([]job, 0, len(batch))
 		for _, ref := range batch {
-			incarnation, ok := bindings[digestOfRef(ref)]
+			digest := digestOfRef(ref)
+			incarnation, ok := bindings[digest]
 			if !ok {
-				return fmt.Errorf("histworker: intent response is missing %s", digestOfRef(ref))
+				return fmt.Errorf("histworker: intent response is missing %s", digest)
 			}
-			jobs = append(jobs, job{ref: ref, incarnation: incarnation})
+			jobs = append(jobs, job{
+				ref:         ref,
+				incarnation: incarnation,
+				missing:     s.missingDomains(located[digest], incarnation),
+			})
 		}
 
 		// Per-job error slots keep the reported failure deterministic: the
 		// first failed job in intent order wins, regardless of goroutine
-		// scheduling.
+		// scheduling. Receipts collect per job and land in batched
+		// transactions after the wave — including proven copies of jobs
+		// whose quorum failed, so the next attempt converges on them.
+		quorum := writeQuorum(len(s.domains))
 		retriesBefore := s.storeRetryTotal()
 		sem := make(chan struct{}, s.uploadConcurrency)
 		uploadErrs := make([]error, len(jobs))
+		jobReceipts := make([][]CopyReceipt, len(jobs))
 		var wg sync.WaitGroup
 		for i, j := range jobs {
 			wg.Add(1)
@@ -240,12 +269,23 @@ func (s *cutStore) Flush() error {
 				if data == nil {
 					return // uploaded by an earlier overlapping flush
 				}
-				uploadErrs[i] = s.uploadOne(j.ref, j.incarnation, data)
+				if len(s.domains)-len(j.missing) >= quorum {
+					s.ObjectsSkipped.Add(1)
+					return // quorum already receipted by a previous attempt
+				}
+				jobReceipts[i], uploadErrs[i] = s.uploadObject(j.ref, j.incarnation, data, j.missing, quorum)
 			}(i, j)
 		}
 		wg.Wait()
 		if absorbed := s.storeRetryTotal() - retriesBefore; absorbed > 0 {
 			s.StoreRetries.Add(absorbed)
+		}
+		var receipts []CopyReceipt
+		for _, proven := range jobReceipts {
+			receipts = append(receipts, proven...)
+		}
+		if err := s.recordReceipts(receipts); err != nil {
+			return err
 		}
 		for _, err := range uploadErrs {
 			if err != nil {
@@ -294,37 +334,113 @@ func (s *cutStore) storeRetryTotal() int64 {
 	return total
 }
 
-// uploadOne writes one object to every required domain and records fenced
-// receipts after read-after-write proof. Same-incarnation bytes only: the
-// exact key embeds the intent-bound incarnation.
-func (s *cutStore) uploadOne(ref pft2.Ref, incarnation int64, data []byte) error {
+// missingDomains reports the required failure domains without a fresh
+// verified receipt at the bound incarnation — the domains an upload must
+// still cover. A location at a different incarnation grants nothing (its
+// keys embed the superseded incarnation).
+func (s *cutStore) missingDomains(loc *ObjectLocation, incarnation int64) []string {
+	fresh := map[string]bool{}
+	if loc != nil && loc.Incarnation == incarnation {
+		for _, c := range loc.Copies {
+			if c.LastVerified >= s.freshFloor {
+				fresh[c.FailureDomain] = true
+			}
+		}
+	}
+	missing := make([]string, 0, len(s.domains))
+	for _, domain := range s.domains {
+		if !fresh[domain] {
+			missing = append(missing, domain)
+		}
+	}
+	return missing
+}
+
+// writeQuorum is the readiness quorum over the policy's N required
+// domains: two independently verified copies whenever the policy names at
+// least two, one for explicit single-domain deployments. A constant of
+// the design (mirrored by pfh.write_quorum), never a knob.
+func writeQuorum(n int) int {
+	if n < 2 {
+		return n
+	}
+	return 2
+}
+
+// uploadObject writes one object to every still-missing required domain IN
+// PARALLEL, each write independently read-after-write verified from its
+// exact per-incarnation key. It returns the proven copies as receipt facts
+// for the batched receipt transaction; the object succeeds once fresh plus
+// newly proven copies reach the write quorum — domains a passing quorum
+// left unwritten heal through the ordinary repair loop.
+func (s *cutStore) uploadObject(ref pft2.Ref, incarnation int64, data []byte, missing []string, quorum int) ([]CopyReceipt, error) {
 	id := histstore.ObjectID{
 		Tenant: s.claim.TenantID, Kind: "pft2",
 		DigestHex: ref.Hex(), Incarnation: incarnation,
 	}
-	for _, domain := range s.domains {
-		store, ok := s.stores.Get(domain)
-		if !ok {
-			return fmt.Errorf("%w: required failure domain %q has no store", ErrPolicyMismatch, domain)
+	proven := make([]*CopyReceipt, len(missing))
+	domainErrs := make([]error, len(missing))
+	var wg sync.WaitGroup
+	for i, domain := range missing {
+		wg.Add(1)
+		go func(i int, domain string) {
+			defer wg.Done()
+			store, ok := s.stores.Get(domain)
+			if !ok {
+				domainErrs[i] = fmt.Errorf("%w: required failure domain %q has no store", ErrPolicyMismatch, domain)
+				return
+			}
+			key, err := store.ExactKey(id)
+			if err != nil {
+				domainErrs[i] = err
+				return
+			}
+			if err := store.Put(s.ctx, key, int64(ref.Size), ref.Hex(), bytes.NewReader(data)); err != nil {
+				domainErrs[i] = fmt.Errorf("histworker: upload %s to %s: %w", digestOfRef(ref), domain, err)
+				return
+			}
+			// Independent read-after-write proof from the same exact key.
+			if err := readbackVerified(s.ctx, store, key, int64(ref.Size), ref.Hex()); err != nil {
+				domainErrs[i] = fmt.Errorf("histworker: readback %s from %s: %w", digestOfRef(ref), domain, err)
+				return
+			}
+			proven[i] = &CopyReceipt{
+				Digest: digestOfRef(ref), Incarnation: incarnation,
+				FailureDomain: domain, StorageKey: key, Size: int64(ref.Size),
+			}
+		}(i, domain)
+	}
+	wg.Wait()
+	receipts := make([]CopyReceipt, 0, len(missing))
+	for _, r := range proven {
+		if r != nil {
+			receipts = append(receipts, *r)
 		}
-		key, err := store.ExactKey(id)
-		if err != nil {
-			return err
+	}
+	fresh := len(s.domains) - len(missing)
+	if fresh+len(receipts) < quorum {
+		for _, err := range domainErrs {
+			if err != nil {
+				return receipts, err
+			}
 		}
-		if err := store.Put(s.ctx, key, int64(ref.Size), ref.Hex(), bytes.NewReader(data)); err != nil {
-			return fmt.Errorf("histworker: upload %s to %s: %w", digestOfRef(ref), domain, err)
-		}
-		// Independent read-after-write proof from the same exact key.
-		if err := readbackVerified(s.ctx, store, key, int64(ref.Size), ref.Hex()); err != nil {
-			return fmt.Errorf("histworker: readback %s from %s: %w", digestOfRef(ref), domain, err)
-		}
-		if err := s.repo.RecordCopyReceipt(s.ctx, s.claim.Facts.CutID, s.claim.ClaimEpoch,
-			digestOfRef(ref), incarnation, domain, key, int64(ref.Size)); err != nil {
-			return err
-		}
+		return receipts, fmt.Errorf("histworker: %s proved %d of the %d-copy write quorum",
+			digestOfRef(ref), fresh+len(receipts), quorum)
 	}
 	s.ObjectsUploaded.Add(1)
 	s.BytesUploaded.Add(int64(len(data)))
+	return receipts, nil
+}
+
+// recordReceipts lands proven copies in bounded batched transactions.
+func (s *cutStore) recordReceipts(receipts []CopyReceipt) error {
+	for start := 0; start < len(receipts); start += 4096 {
+		end := min(start+4096, len(receipts))
+		if err := s.repo.RecordCopyReceipts(s.ctx, s.claim.Facts.CutID,
+			s.claim.ClaimEpoch, receipts[start:end]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -57,8 +57,6 @@ jobs:
         include:
           - image: portablefs-volume-api
             dockerfile: Dockerfile.volume-api
-          - image: portablefs-volume-worker
-            dockerfile: Dockerfile.volume-worker
           - image: portablefs-authority-manager
             dockerfile: Dockerfile.authority-manager
           - image: portablefs-history-worker

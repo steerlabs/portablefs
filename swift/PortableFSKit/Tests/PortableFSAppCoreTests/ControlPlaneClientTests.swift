@@ -175,61 +175,45 @@ private struct FailingTransport: HTTPDataTransport {
     }
 }
 
-private let newStyleSessionJSON = """
-{"mountSession":{
-  "endpoint":{"authorityUrl":"tcp://10.0.0.5:7443","host":"10.0.0.5","port":7443,"nfsPort":0},
-  "token":"mount-token","expiresAtMs":1751505000000,"authorityInstanceId":"auth-1"}}
+private let accessLeaseJSON = """
+{"authority":{"authorityUrl":"tcp://10.0.0.5:7443","host":"10.0.0.5","port":7443,"authorityInstanceId":"auth-1"},
+ "lease":{"accessLeaseId":"pfal_1","controlSeq":"7","expiresAt":1751505000000,"state":"active"},
+ "accessToken":"lease-token","serverTimeMs":1751504000000}
 """
 
-@Test func mountSessionUsesCanonicalRoute() async throws {
-    let transport = StubTransport([.init(status: 200, body: Data(newStyleSessionJSON.utf8))])
+@Test func accessSessionUsesAccessLeaseRoute() async throws {
+    let transport = StubTransport([.init(status: 200, body: Data(accessLeaseJSON.utf8))])
     let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
-    let session = try await client.mountSession(volumeID: "vol-a", branch: "main")
+    let session = try await client.accessSession(volumeID: "vol-a", branch: "main")
     #expect(session.authorityUrl == "tcp://10.0.0.5:7443")
-    #expect(session.token == "mount-token")
+    #expect(session.token == "lease-token")
     #expect(session.expiresAtMs == 1751505000000)
-    #expect(transport.recordedPaths == ["/v1/volumes/vol-a/mount-sessions"])
+    #expect(session.accessLeaseId == "pfal_1")
+    #expect(transport.recordedPaths == ["/v1/access-leases/create"])
 }
 
-@Test func mountSessionFallsBackToFlatAlias() async throws {
-    let transport = StubTransport([
-        .init(status: 405, body: Data()),
-        .init(status: 200, body: Data(newStyleSessionJSON.utf8))
-    ])
-    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
-    let session = try await client.mountSession(volumeID: "vol-a", branch: "main")
-    #expect(session.authorityUrl == "tcp://10.0.0.5:7443")
-    #expect(transport.recordedPaths == ["/v1/volumes/vol-a/mount-sessions", "/v1/mount-sessions"])
-}
-
-@Test func mountSessionFallsBackToLegacyEnsureSessionPair() async throws {
-    let ensure = #"{"authority":{"authorityUrl":"tcp://10.0.0.9:7443","authorityInstanceId":"auth-9"}}"#
-    let session = #"{"authority":{"authorityAuthToken":"legacy-token","authorityExpiresAt":123}}"#
-    let transport = StubTransport([
-        .init(status: 404, body: Data()),
-        .init(status: 404, body: Data()),
-        .init(status: 200, body: Data(ensure.utf8)),
-        .init(status: 200, body: Data(session.utf8))
-    ])
-    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
-    let resolved = try await client.mountSession(volumeID: "vol-a", branch: "main")
-    #expect(resolved.authorityUrl == "tcp://10.0.0.9:7443")
-    #expect(resolved.token == "legacy-token")
-    #expect(resolved.expiresAtMs == 123)
-    #expect(resolved.authorityInstanceId == "auth-9")
-    #expect(transport.recordedPaths == [
-        "/v1/volumes/vol-a/mount-sessions",
-        "/v1/mount-sessions",
-        "/v1/authorities/ensure",
-        "/v1/authorities/session"
-    ])
-}
-
-@Test func mountSessionRejectsMissingEndpoint() async {
-    let transport = StubTransport(status: 200, json: #"{"mountSession":{"token":"t"}}"#)
+@Test func accessSessionNeverFallsBack() async {
+    // The retired mount-session/authority-session routes answer 410; a
+    // manager without the access-lease route is a hard error, never a probe
+    // of retired paths.
+    let transport = StubTransport([.init(status: 404, body: Data(#"{"error":"unknown route"}"#.utf8))])
     let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
     do {
-        _ = try await client.mountSession(volumeID: "vol-a", branch: "main")
+        _ = try await client.accessSession(volumeID: "vol-a", branch: "main")
+        Issue.record("expected error")
+    } catch let error as ControlPlaneError {
+        #expect(error.status == 404)
+    } catch {
+        Issue.record("unexpected error type: \(error)")
+    }
+    #expect(transport.recordedPaths == ["/v1/access-leases/create"])
+}
+
+@Test func accessSessionRejectsMissingEndpoint() async {
+    let transport = StubTransport(status: 200, json: #"{"lease":{"accessLeaseId":"pfal_1"},"accessToken":"t"}"#)
+    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
+    do {
+        _ = try await client.accessSession(volumeID: "vol-a", branch: "main")
         Issue.record("expected error")
     } catch let error as ControlPlaneError {
         #expect(error.message.contains("without an authority endpoint"))
@@ -238,11 +222,24 @@ private let newStyleSessionJSON = """
     }
 }
 
-@Test func mountSessionSurfacesNonFallbackErrors() async {
+@Test func accessSessionRejectsIncompleteLease() async {
+    let transport = StubTransport(status: 200, json: #"{"authority":{"authorityUrl":"tcp://10.0.0.5:7443"},"lease":{},"accessToken":""}"#)
+    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
+    do {
+        _ = try await client.accessSession(volumeID: "vol-a", branch: "main")
+        Issue.record("expected error")
+    } catch let error as ControlPlaneError {
+        #expect(error.message.contains("incomplete access lease"))
+    } catch {
+        Issue.record("unexpected error type: \(error)")
+    }
+}
+
+@Test func accessSessionSurfacesErrors() async {
     let transport = StubTransport([.init(status: 502, body: Data(#"{"error":"no capacity"}"#.utf8))])
     let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
     do {
-        _ = try await client.mountSession(volumeID: "vol-a", branch: "main")
+        _ = try await client.accessSession(volumeID: "vol-a", branch: "main")
         Issue.record("expected error")
     } catch let error as ControlPlaneError {
         #expect(error.status == 502)

@@ -7,7 +7,6 @@ package workfs
 // so only the store-neutral behaviors live here.
 
 import (
-	"crypto/sha256"
 	"errors"
 	"os"
 	"testing"
@@ -70,36 +69,6 @@ func TestLiveOrphanSourcesPinsBaseObjectsUntilReap(t *testing.T) {
 	sources = fs.LiveOrphanSources()
 	if len(sources) != 1 || sources[0].BlobDigest != "sha256:whole" {
 		t.Fatalf("sources after chunked reap=%+v, want only whole", sources)
-	}
-}
-
-func TestV2ReplayReconstructsSemanticErrorWithoutLegacySkip(t *testing.T) {
-	fs, walPath := newFS(t, nil, &fakeBlobs{data: map[string][]byte{}})
-	if _, err := fs.EstablishSession("v2", 1, "mount", 4); err != nil {
-		t.Fatal(err)
-	}
-	reqHash := sha256.Sum256([]byte("remove-missing"))
-	env := &wal.Envelope{SessionID: "v2", Generation: 1, Slot: 0, SlotSeq: 1, ReqHash: reqHash[:]}
-	res, err := fs.MutateEnv(wal.Record{Op: wal.OpRemove, Path: "missing", Env: env}, "mount")
-	if err != nil || res.Status != 2 {
-		t.Fatalf("live outcome=(%+v,%v), want recorded ENOENT", res, err)
-	}
-	if check, outcome := fs.CheckSlot(env); check != SlotDuplicate || outcome.Status != 2 {
-		t.Fatalf("live slot=(%v,%+v), want duplicate ENOENT", check, outcome)
-	}
-	if err := fileWAL(t, fs).Close(); err != nil {
-		t.Fatal(err)
-	}
-	w, err := wal.Open(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replayed, err := New(nil, &fakeBlobs{data: map[string][]byte{}}, w)
-	if err != nil {
-		t.Fatalf("v2 deterministic rejection must replay: %v", err)
-	}
-	if check, outcome := replayed.CheckSlot(env); check != SlotDuplicate || outcome.Status != 2 {
-		t.Fatalf("replayed slot=(%v,%+v), want duplicate ENOENT", check, outcome)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/content"
+	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 	"io"
 	"net"
 	"net/http"
@@ -16,11 +18,11 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -41,21 +43,14 @@ func serveAuthority(t *testing.T) string {
 
 func serveAuthorityServer(t *testing.T) (string, *fsproto.Server) {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, daemonTestBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := newManagedTestFS(t, daemonTestBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	srv := fsproto.NewServer(fs, fs, delegation.New())
+	srv := fsproto.NewServer(fs, fs)
 	go func() { _ = srv.Serve(ctx, ln) }()
 	return ln.Addr().String(), srv
 }
@@ -98,7 +93,10 @@ func startDaemon(t *testing.T, authority string) (Config, *http.Client, string, 
 
 func waitUnix(t *testing.T, p string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous: a freshly BUILT daemon binary's first exec can queue behind
+	// macOS binary assessment for several seconds when the machine is under
+	// concurrent build/test load.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("unix", p, 50*time.Millisecond)
 		if err == nil {
@@ -183,7 +181,7 @@ func ensureAttachOnceWithPolicy(t *testing.T, hc *http.Client, authority, volume
 		AttachRef  string `json:"attachRef"`
 		VolumeName string `json:"volumeName"`
 	}
-	options := map[string]any{"writePolicy": writePolicy, "fsyncPolicy": "local", "negativeCache": true, "diskCacheMb": 1}
+	options := map[string]any{"writePolicy": writePolicy, "negativeCache": true, "diskCacheMb": 1}
 	for k, v := range extraOptions {
 		options[k] = v
 	}
@@ -510,7 +508,7 @@ func TestDaemonControlAndFrontendEndToEnd(t *testing.T) {
 	res := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
 	root := res.Root
 	// Xattrs is a per-attach capability: this authority (workfs) advertises
-	// FeatXattrs, so the resolve reply must reflect native xattr support.
+	// native xattrs, so the resolve reply must reflect that support.
 	if res.RootAttr.Kind != pfslocal.ItemKindDirectory || !res.Capabilities.Symlinks || !res.Capabilities.HardLinks || !res.Capabilities.Xattrs {
 		t.Fatalf("resolve = %+v", res)
 	}
@@ -1002,7 +1000,11 @@ func TestDaemonRenameWaitsForInFlightLookupBeforeReply(t *testing.T) {
 	defer setup.close()
 	setup.call(&pfslocal.Hello{ProtocolMajor: 1})
 	res := setup.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
-	root := res.Root
+	// The rename must ride one write-back session's overlay (buffered, then
+	// flushed): use a subdirectory so both names share the parent-dir session
+	// (top-level names hold file-grain roots and rename write-through).
+	cfgDir := setup.call(&pfslocal.MkdirRequest{Dir: res.Root, Name: []byte("cfg"), Mode: 0o755}).(*pfslocal.MkdirReply)
+	root := cfgDir.Attr.Item
 	lock := setup.call(&pfslocal.CreateRequest{Dir: root, Name: []byte("config.lock"), Mode: 0o644, Exclusive: true}).(*pfslocal.CreateReply)
 	setup.call(&pfslocal.WriteRequest{Handle: lock.Handle, Data: []byte("[core]\n")})
 	setup.call(&pfslocal.CloseRequest{Handle: lock.Handle})
@@ -1011,7 +1013,7 @@ func TestDaemonRenameWaitsForInFlightLookupBeforeReply(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	a.testLookupAfterVolume = func(p string) {
-		if p != "config.lock" {
+		if p != "cfg/config.lock" {
 			return
 		}
 		once.Do(func() {
@@ -1092,7 +1094,11 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 	defer setup.close()
 	setup.call(&pfslocal.Hello{ProtocolMajor: 1})
 	res := setup.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
-	root := res.Root
+	// The rename must ride one write-back session's overlay (buffered, then
+	// flushed): use a subdirectory so both names share the parent-dir session
+	// (top-level names hold file-grain roots and rename write-through).
+	cfgDir := setup.call(&pfslocal.MkdirRequest{Dir: res.Root, Name: []byte("cfg"), Mode: 0o755}).(*pfslocal.MkdirReply)
+	root := cfgDir.Attr.Item
 	lock := setup.call(&pfslocal.CreateRequest{Dir: root, Name: []byte("config.lock"), Mode: 0o644, Exclusive: true}).(*pfslocal.CreateReply)
 	setup.call(&pfslocal.WriteRequest{Handle: lock.Handle, Data: []byte("[core]\n")})
 
@@ -1264,7 +1270,10 @@ func TestDaemonWritebackEnumerateReflectsOverlayBeforeFlush(t *testing.T) {
 	cfg, hc, _, cancel := startDaemon(t, authority)
 	defer cancel()
 	defer close(blockFlush)
-	ref := ensureAttachWithPolicy(t, hc, authority, "vol-wb-enum", "main", "/Volumes/WBEnum", "writeback")
+	// Keep the background flusher quiet: every file-grain session would
+	// otherwise park a flush RPC on the blocked hook and starve the pool.
+	opts := map[string]any{"flushIntervalMs": int64(time.Hour / time.Millisecond)}
+	ref := ensureAttachWithPolicyOptions(t, hc, authority, "vol-wb-enum", "main", "/Volumes/WBEnum", "writeback", opts)
 	c := dialPFS(t, cfg.FrontendSocket)
 	defer c.close()
 	c.call(&pfslocal.Hello{ProtocolMajor: 1})
@@ -1547,15 +1556,41 @@ func writeControlFile(t *testing.T, hc *http.Client, ref, p, data string) {
 	}, http.StatusNoContent, nil)
 }
 
+var (
+	testBinOnce sync.Once
+	testBinPath string
+	testBinErr  error
+)
+
+// buildPortablefsdTestBinary builds the daemon ONCE per test process. A fresh
+// binary's first exec goes through macOS binary assessment, which serializes
+// on syspolicyd and can take tens of seconds when the machine is under
+// concurrent build/test load; building (and warming) one binary keeps that
+// cost out of every subprocess test's socket-readiness window.
 func buildPortablefsdTestBinary(t *testing.T) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "portablefsd-test")
-	build := exec.Command("go", "build", "-o", bin, "./cmd/portablefsd")
-	build.Dir = filepath.Join("..", "..")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build portablefsd: %v\n%s", err, out)
+	testBinOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "portablefsd-testbin-")
+		if err != nil {
+			testBinErr = err
+			return
+		}
+		bin := filepath.Join(dir, "portablefsd-test")
+		build := exec.Command("go", "build", "-o", bin, "./cmd/portablefsd")
+		build.Dir = filepath.Join("..", "..")
+		if out, err := build.CombinedOutput(); err != nil {
+			testBinErr = fmt.Errorf("%v\n%s", err, out)
+			return
+		}
+		// Pre-pay the first-exec assessment here rather than under a test's
+		// startup deadline; the bogus flag makes the daemon exit immediately.
+		_ = exec.Command(bin, "--portablefsd-test-warmup").Run()
+		testBinPath = bin
+	})
+	if testBinErr != nil {
+		t.Fatalf("build portablefsd: %v", testBinErr)
 	}
-	return bin
+	return testBinPath
 }
 
 type portablefsdProcess struct {
@@ -1585,11 +1620,12 @@ func startPortablefsdProcess(t *testing.T, bin, stateDir, name string) *portable
 	}
 	p := &portablefsdProcess{cmd: cmd, cfg: cfg, hc: httpUDSClient(cfg.ControlSocket), stderr: &stderr}
 	t.Cleanup(func() {
+		if t.Failed() {
+			alive := cmd.Process != nil && cmd.Process.Signal(syscall.Signal(0)) == nil
+			t.Logf("%s: pid=%d alive=%v stderr(%d bytes):\n%s", name, cmd.Process.Pid, alive, stderr.Len(), stderr.String())
+		}
 		p.stop()
 		_ = os.RemoveAll(runDir)
-		if stderr.Len() > 0 && t.Failed() {
-			t.Logf("%s stderr:\n%s", name, stderr.String())
-		}
 	})
 	waitUnix(t, cfg.ControlSocket)
 	waitUnix(t, cfg.FrontendSocket)
@@ -1762,6 +1798,12 @@ func TestDaemonStableItemIdentityAfterRestart(t *testing.T) {
 }
 
 func TestDaemonWritebackFrontendItemSurvivesImmediateCrash(t *testing.T) {
+	// The SIGKILLed daemon's mount session must expire quickly: its journaled
+	// file-grain grants block the restarted daemon's WAL recovery (bounded
+	// retry) until the lease resolves.
+	prevTTL := workfs.SessionLeaseTTL()
+	workfs.SetSessionLeaseTTL(time.Second)
+	t.Cleanup(func() { workfs.SetSessionLeaseTTL(prevTTL) })
 	authority := serveAuthority(t)
 	bin := buildPortablefsdTestBinary(t)
 	stateDir, err := os.MkdirTemp("/tmp", "pfsd-item-crash-")
@@ -1795,7 +1837,19 @@ func TestDaemonWritebackFrontendItemSurvivesImmediateCrash(t *testing.T) {
 	c2.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "item-crash-after"})
 	res2 := c2.call(&pfslocal.ResolveRequest{AttachRef: ref2}).(*pfslocal.ResolveReply)
 
-	oldAttr := c2.call(&pfslocal.GetAttrRequest{Item: fileItem}).(*pfslocal.GetAttrReply)
+	var oldAttr *pfslocal.GetAttrReply
+	itemDeadline := time.Now().Add(20 * time.Second)
+	for {
+		body, er := c2.callMaybe(&pfslocal.GetAttrRequest{Item: fileItem})
+		if er == nil {
+			oldAttr = body.(*pfslocal.GetAttrReply)
+			break
+		}
+		if time.Now().After(itemDeadline) {
+			t.Fatalf("old item never recovered: errno=%d", er.Errno)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if oldAttr.Attr.Kind != pfslocal.ItemKindFile || oldAttr.Attr.Item != fileItem {
 		t.Fatalf("old item getattr=%+v want file item %+v", oldAttr.Attr, fileItem)
 	}
@@ -1811,6 +1865,12 @@ func TestDaemonWritebackFrontendItemSurvivesImmediateCrash(t *testing.T) {
 }
 
 func TestDaemonWritebackWALReplayAfterCrash(t *testing.T) {
+	// The SIGKILLed daemon's mount session must expire quickly: its journaled
+	// file-grain grants block the restarted daemon's WAL recovery (bounded
+	// retry) until the lease resolves.
+	prevTTL := workfs.SessionLeaseTTL()
+	workfs.SetSessionLeaseTTL(time.Second)
+	t.Cleanup(func() { workfs.SetSessionLeaseTTL(prevTTL) })
 	authority := serveAuthority(t)
 
 	bin := buildPortablefsdTestBinary(t)
@@ -1849,7 +1909,19 @@ func TestDaemonWritebackWALReplayAfterCrash(t *testing.T) {
 	defer c2.close()
 	c2.call(&pfslocal.Hello{ProtocolMajor: 1})
 	res2 := c2.call(&pfslocal.ResolveRequest{AttachRef: ref2}).(*pfslocal.ResolveReply)
-	lr := c2.call(&pfslocal.LookupRequest{Dir: res2.Root, Name: []byte("crash.txt")}).(*pfslocal.LookupReply)
+	var lr *pfslocal.LookupReply
+	lookupDeadline := time.Now().Add(20 * time.Second)
+	for {
+		body, er := c2.callMaybe(&pfslocal.LookupRequest{Dir: res2.Root, Name: []byte("crash.txt")})
+		if er == nil {
+			lr = body.(*pfslocal.LookupReply)
+			break
+		}
+		if time.Now().After(lookupDeadline) {
+			t.Fatalf("crash.txt never recovered: errno=%d", er.Errno)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if lr.Attr.Kind != pfslocal.ItemKindFile {
 		t.Fatalf("post-restart lookup attr = %+v, want file", lr.Attr)
 	}
@@ -1861,6 +1933,12 @@ func TestDaemonWritebackWALReplayAfterCrash(t *testing.T) {
 }
 
 func TestDaemonWritebackWALReplayAfterCrashWithPriorSessionHistory(t *testing.T) {
+	// The SIGKILLed daemon's mount session must expire quickly: its journaled
+	// file-grain grants block the restarted daemon's WAL recovery (bounded
+	// retry) until the lease resolves.
+	prevTTL := workfs.SessionLeaseTTL()
+	workfs.SetSessionLeaseTTL(time.Second)
+	t.Cleanup(func() { workfs.SetSessionLeaseTTL(prevTTL) })
 	authority := serveAuthority(t)
 
 	bin := buildPortablefsdTestBinary(t)
@@ -1907,7 +1985,19 @@ func TestDaemonWritebackWALReplayAfterCrashWithPriorSessionHistory(t *testing.T)
 	defer c2.close()
 	c2.call(&pfslocal.Hello{ProtocolMajor: 1})
 	res2 := c2.call(&pfslocal.ResolveRequest{AttachRef: ref2}).(*pfslocal.ResolveReply)
-	lr := c2.call(&pfslocal.LookupRequest{Dir: res2.Root, Name: []byte("durability.txt")}).(*pfslocal.LookupReply)
+	var lr *pfslocal.LookupReply
+	lookupDeadline := time.Now().Add(20 * time.Second)
+	for {
+		body, er := c2.callMaybe(&pfslocal.LookupRequest{Dir: res2.Root, Name: []byte("durability.txt")})
+		if er == nil {
+			lr = body.(*pfslocal.LookupReply)
+			break
+		}
+		if time.Now().After(lookupDeadline) {
+			t.Fatalf("durability.txt never recovered: errno=%d", er.Errno)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	op := c2.call(&pfslocal.OpenRequest{Item: lr.Attr.Item, Mode: pfslocal.OpenModeRead}).(*pfslocal.OpenReply)
 	got := c2.call(&pfslocal.ReadRequest{Handle: op.Handle, Length: 64}).(*pfslocal.ReadReply)
 	if string(got.Data) != "survives" {
@@ -2043,4 +2133,24 @@ func stringsJoin(v []string) string {
 		out += "," + s
 	}
 	return out
+}
+
+// newManagedTestFS opens the file-backed PFJ3 entry log at walPath and builds
+// the MANAGED workfs over it — the only generation a v5 server serves.
+func newManagedTestFS(t testing.TB, blobs content.BlobReader, walPath string) *workfs.FS {
+	t.Helper()
+	w, err := wal.Open(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	flog, err := pfj3.NewFileEntryLog(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs, err := workfs.NewManaged(nil, blobs, flog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs
 }

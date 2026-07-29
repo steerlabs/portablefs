@@ -17,7 +17,6 @@ Railway-specific wiring.
 | volume-api | this repo, `Dockerfile.volume-api` | `/railway/volume-api.railway.json` | control and history API (`/v1`), port 8787 |
 | authority-manager | this repo, `Dockerfile.authority-manager` | `/railway/authority-manager.railway.json` | fenced singleton; spawns journal children behind the TCP router (2050) |
 | history-worker | this repo, `Dockerfile.history-worker` | `/railway/history-worker.railway.json` | resident pfh worker: cuts, scrub, repair, GC |
-| volume-worker | this repo, `Dockerfile.volume-worker` | `/railway/volume-worker.railway.json` | one-shot integrity/GC job; dashboard cron, never overlapping |
 | Postgres | Railway Postgres (16+) | — | metadata + journal (`pfj`/`pfm`/`pfh`) |
 | bucket(s) | Railway Buckets | — | volume-api blobs + history stores |
 
@@ -62,8 +61,8 @@ secret (tokens, passwords, PEMs). Names below are code-verified.
 | `VOLUME_DATABASE_URL` | **direct** Postgres URL (startup migrations take the session advisory lock; wait-head long-polling runs `LISTEN portablefs_head` — both are session identities a transaction pooler destroys) |
 | `VOLUME_DATABASE_SSL` | `require` / `no-verify` |
 | `VOLUME_API_TOKEN` | admin credential (tenant provisioning + GC only) |
-| `VOLUME_BLOB_STORE` | `s3` (canonical; `railway-bucket` is the legacy alias and the default when unset) |
-| `VOLUME_RAILWAY_BUCKET_ENDPOINT` / `_NAME` / `_REGION` / `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_PREFIX` | from the Railway bucket — reference the bucket service's `AWS_*` variables (the storage package also reads the `AWS_*` names directly; see [railway-buckets.md](./railway-buckets.md)) |
+| `VOLUME_BLOB_STORE` | `s3` (the default when unset; `railway-bucket` remains a compat alias for one release) |
+| `AWS_ENDPOINT_URL` / `AWS_S3_BUCKET_NAME` / `AWS_DEFAULT_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | reference the Railway bucket service's variables of the same names directly; `VOLUME_S3_PREFIX` is the optional key prefix. The retired `VOLUME_RAILWAY_BUCKET_*` spellings remain accepted as aliases (see [self-hosting.md](./self-hosting.md)) |
 | `PORTABLEFS_RELEASE_ID` / `PORTABLEFS_SOURCE_REVISION` | from `RAILWAY_GIT_COMMIT_SHA` (see [release identity](#release-identity)) |
 
 `PORT` is Railway-injected; the API listens on it (image default 8787) and
@@ -108,12 +107,14 @@ expose ONLY the router (2050) through the TCP proxy.
 | `PORT` | `8790` |
 | `PFH_WORKER_LISTEN_ADDR` | `0.0.0.0:${{PORT}}` — **required coupling.** Railway probes `/readyz` on its injected `PORT`, but the worker reads only `PFH_WORKER_LISTEN_ADDR` and ignores `PORT`; the image `EXPOSE`s 8790 but bakes no listen-addr default, and an unset value disables the listener entirely. Details: [railway/README.md](../railway/README.md). |
 
-### volume-worker
+### Maintenance jobs (GC and integrity)
 
-Same `VOLUME_DATABASE_URL` (direct) and bucket variables as volume-api.
-One-shot job (`integrity` by default; override the start command for
-`gc --dry-run`, then `gc`). Schedule via dashboard cron;
-`restartPolicyType NEVER`; never let two instances overlap.
+Blob GC and the integrity walk are volume-api admin endpoints
+(`POST /v1/admin/gc`, `GET /v1/admin/integrity`), authenticated with the
+admin token — there is no separate worker service. Schedule them with any
+cron that can curl over the private network; see
+[self-hosting.md](./self-hosting.md#maintenance-jobs-gc-and-integrity) for
+example schedules. Never let two GC sweeps overlap.
 
 ## The DSN routing law
 
@@ -129,7 +130,7 @@ Everything else stays **direct**, each for a session-scoped reason:
 | Variable | Why direct |
 | --- | --- |
 | `PORTABLEFS_MIGRATION_DATABASE_URL` (gate) | session advisory lock (`pg_advisory_lock`, classid `0x70667321` / objid `0x6d696772`); a pooler can unlock on the wrong server session and strand it fleet-wide |
-| `VOLUME_DATABASE_URL` (api + worker) | startup migrations take the same session lock; `LISTEN portablefs_head` long-polling pins a connection |
+| `VOLUME_DATABASE_URL` (api) | startup migrations take the same session lock; `LISTEN portablefs_head` long-polling pins a connection |
 | `PORTABLEFS_MANAGER_CONTROL_DATABASE_URL` | pfm control pool with session-configured timeouts |
 | `PORTABLEFS_MANAGED_VCS_JOURNAL_DSN` in direct mode | children pin session timeout GUCs at startup |
 | `PFH_WORKER_DATABASE_URL` | already bounded at 8 connections; pooling adds failure surface without relief |
@@ -158,10 +159,10 @@ should not be proxied publicly at all.
 
 ## Buckets
 
-- **volume-api blobs** — one Railway bucket; wire its credentials into the
-  `VOLUME_RAILWAY_BUCKET_*` variables (or let the service read the
-  bucket's `AWS_*` reference variables directly). Content-addressed, safe
-  to share with the history legacy store.
+- **volume-api blobs** — one Railway bucket; let the service read the
+  bucket's `AWS_*` reference variables directly (the retired
+  `VOLUME_RAILWAY_BUCKET_*` spellings remain accepted as aliases).
+  Content-addressed, safe to share with the history legacy store.
 - **history stores** — `PFH_WORKER_STORES_JSON` needs one store per
   failure domain and production enforces >= 2 distinct domains: use two
   buckets in different regions, or one Railway bucket plus one external

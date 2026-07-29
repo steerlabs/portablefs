@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/steerlabs/portablefs/vcs/internal/backend"
 	"github.com/steerlabs/portablefs/vcs/internal/content"
 	"github.com/steerlabs/portablefs/vcs/internal/fstransition"
 	"github.com/steerlabs/portablefs/vcs/internal/pft2"
@@ -184,66 +183,6 @@ func TestXattrLegacyReplayPreservesState(t *testing.T) {
 	}
 	if names, err := fs2.ListxattrHandle("f", 0); err != nil || strings.Join(names, ",") != "user.keep" {
 		t.Fatalf("replayed listxattr = %v, %v", names, err)
-	}
-}
-
-// TestXattrLegacyCompactionSurvival is the legacy half of the
-// compaction-survival requirement: the checkpoint manifest cannot carry
-// xattrs, so CompactWAL re-appends the live xattr state above the cut and a
-// rebuild from (manifest, compacted WAL) preserves it — never silent loss.
-func TestXattrLegacyCompactionSurvival(t *testing.T) {
-	walPath := filepath.Join(t.TempDir(), "wal.log")
-	w := openXattrWAL(t, walPath)
-	fs, err := New(nil, xattrTestBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.MutateAs(wal.Record{Op: wal.OpMkdir, Path: "d", Mode: 0o755}, "M"); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.MutateAs(wal.Record{Op: wal.OpCreate, Path: "d/f", Mode: 0o644}, "M"); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.MutateAs(wal.Record{Op: wal.OpSetxattr, Path: "d/f", XattrName: "user.q", Data: []byte("qq")}, "M"); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.MutateAs(wal.Record{Op: wal.OpSetxattr, Path: "", XattrName: "user.rootmark", Data: []byte("r")}, "M"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Checkpoint: snapshot, then compact the WAL below the snapshot
-	// watermark (exactly what the checkpointer does after the backend
-	// commit lands). The manifest is simulated from the snapshot entries —
-	// it has NO xattr field, which is the whole point.
-	snap := fs.Snapshot()
-	if err := fs.CompactWAL(snap); err != nil {
-		t.Fatalf("compact: %v", err)
-	}
-	if w.CompactedThrough() != snap.WALWatermark() {
-		t.Fatalf("compaction did not reach the snapshot watermark")
-	}
-	var entries []backend.Entry
-	for _, e := range snap.Entries {
-		entries = append(entries, backend.Entry{
-			Path: e.Path, Kind: e.Kind, Mode: e.Mode, Ino: e.Ino,
-			MtimeMs: e.MtimeMs, CtimeMs: e.CtimeMs, AtimeMs: e.AtimeMs,
-		})
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	w2 := openXattrWAL(t, walPath)
-	defer w2.Close()
-	fs2, err := New(entries, xattrTestBlobs{}, w2)
-	if err != nil {
-		t.Fatalf("rebuild after compaction: %v", err)
-	}
-	if v, err := fs2.GetxattrHandle("d/f", 0, "user.q"); err != nil || string(v) != "qq" {
-		t.Fatalf("xattr lost at checkpoint compaction: %q, %v", v, err)
-	}
-	if v, err := fs2.GetxattrHandle("", 0, "user.rootmark"); err != nil || string(v) != "r" {
-		t.Fatalf("root xattr lost at checkpoint compaction: %q, %v", v, err)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -12,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/content"
+	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
+
 	"github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
@@ -25,21 +29,14 @@ import (
 // involved anywhere in this file.
 func newTestAuthority(t *testing.T) string {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	wfs, err := workfs.New(nil, noBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
+	wfs := newManagedTestFS(t, noBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); _ = ln.Close() })
-	go func() { _ = fsproto.NewServer(wfs, wfs, delegation.New()).Serve(ctx, ln) }()
+	go func() { _ = fsproto.NewServer(wfs, wfs).Serve(ctx, ln) }()
 	return ln.Addr().String()
 }
 
@@ -83,9 +80,9 @@ func TestSessionTokenSourceStaticAndRefresh(t *testing.T) {
 	src := &sessionTokenSource{
 		token:       "tok_old",
 		expiresAtMs: time.Now().UnixMilli() - 1, // already expired
-		refresh: func() (*mountSession, error) {
+		refresh: func() (*accessSession, error) {
 			refreshed++
-			return &mountSession{Token: "tok_new", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
+			return &accessSession{Token: "tok_new", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
 		},
 	}
 	if got := src.get(); got != "tok_new" || refreshed != 1 {
@@ -103,9 +100,9 @@ func TestSessionTokenSourceStaticAndRefresh(t *testing.T) {
 // the next reconnect handshake. get() must complete and serve the new token.
 func TestSessionTokenSourceRefreshFeedbackNoDeadlock(t *testing.T) {
 	src := &sessionTokenSource{token: "tok_old", expiresAtMs: time.Now().UnixMilli() - 1}
-	src.refresh = func() (*mountSession, error) {
+	src.refresh = func() (*accessSession, error) {
 		src.setToken("tok_adopted", time.Now().Add(time.Hour).UnixMilli())
-		return &mountSession{Token: "tok_new", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
+		return &accessSession{Token: "tok_new", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
 	}
 	done := make(chan string, 1)
 	go func() { done <- src.get() }()
@@ -138,9 +135,9 @@ func TestSessionTokenSourceRefreshNow(t *testing.T) {
 		// Far from expiry: rejection is PROOF the token is dead (epoch-keyed
 		// HMAC), so refreshNow must not consult the clock.
 		expiresAtMs: time.Now().Add(time.Hour).UnixMilli(),
-		refresh: func() (*mountSession, error) {
+		refresh: func() (*accessSession, error) {
 			refreshed++
-			return &mountSession{Token: "tok_fresh", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
+			return &accessSession{Token: "tok_fresh", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}, nil
 		},
 	}
 	if !src.refreshNow() {
@@ -152,7 +149,7 @@ func TestSessionTokenSourceRefreshNow(t *testing.T) {
 
 	failing := &sessionTokenSource{
 		token:   "tok_kept",
-		refresh: func() (*mountSession, error) { return nil, errors.New("manager down") },
+		refresh: func() (*accessSession, error) { return nil, errors.New("manager down") },
 	}
 	if failing.refreshNow() {
 		t.Fatal("a failed re-resolve must report false")
@@ -273,7 +270,7 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 		AuthorityURL: "127.0.0.1:9",
 		AuthToken:    "tok-initial",
 		MountPath:    "/tmp/m",
-		Options:      fskitOptionsFromPerf(perfOptionsFromEnv(false, func(string) string { return "" }), []string{"node_modules"}, true),
+		Options:      fskitOptionsFromPerf(perfOptionsFromEnv(func(string) string { return "" }), []string{"node_modules"}, true),
 	})
 	if err != nil {
 		t.Fatalf("ensureAttach: %v", err)
@@ -281,7 +278,7 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 	if ref != "att_test1" {
 		t.Fatalf("attachRef = %q", ref)
 	}
-	if gotAttach.Options.WritePolicy != "writethrough" || len(gotAttach.Options.LocalDirs) != 1 {
+	if len(gotAttach.Options.LocalDirs) != 1 || !gotAttach.Options.VolumeLocalDirs {
 		t.Fatalf("attach options did not travel: %+v", gotAttach.Options)
 	}
 	if err := ctl.setCredential(ref, "tok-rotated"); err != nil {
@@ -304,23 +301,36 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFastModeAttachOptions pins the --fast translation: write-back policy
-// with the bounded flush interval, exactly what the FUSE path's perfOptions
-// mean, expressed as portablefsd attach options.
-func TestFastModeAttachOptions(t *testing.T) {
-	perf := perfOptionsFromEnv(true, func(string) string { return "" })
-	opts := fskitOptionsFromPerf(perf, nil, true)
-	if opts.WritePolicy != "writeback" {
-		t.Fatalf("fast write policy = %q", opts.WritePolicy)
+// TestFastFlagRetired pins the --fast retirement: the flag is gone from the
+// mount surface, and passing it fails with a pointer at the adaptive model
+// instead of being silently ignored.
+func TestFastFlagRetired(t *testing.T) {
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var o mountOpts
+	addMountFlags(fs, &o)
+	err := fs.Parse([]string{"--fast", "vol@main"})
+	if err == nil || !strings.Contains(err.Error(), "adaptive") {
+		t.Fatalf("--fast must fail with a pointer at the adaptive model, got: %v", err)
 	}
-	if opts.FlushIntervalMs != 250 {
-		t.Fatalf("fast flush interval = %dms, want 250", opts.FlushIntervalMs)
+}
+
+// newManagedTestFS opens the file-backed PFJ3 entry log at walPath and builds
+// the MANAGED workfs over it — the only generation a v5 server serves.
+func newManagedTestFS(t testing.TB, blobs content.BlobReader, walPath string) *workfs.FS {
+	t.Helper()
+	w, err := wal.Open(walPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if opts.FsyncPolicy != "authority" {
-		t.Fatalf("fast fsync policy = %q, want authority (fsync stays a real durability barrier)", opts.FsyncPolicy)
+	t.Cleanup(func() { _ = w.Close() })
+	flog, err := pfj3.NewFileEntryLog(w)
+	if err != nil {
+		t.Fatal(err)
 	}
-	slow := fskitOptionsFromPerf(perfOptionsFromEnv(false, func(string) string { return "" }), nil, true)
-	if slow.WritePolicy != "writethrough" || slow.FlushIntervalMs != 0 {
-		t.Fatalf("default must be write-through: %+v", slow)
+	fs, err := workfs.NewManaged(nil, blobs, flog)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return fs
 }

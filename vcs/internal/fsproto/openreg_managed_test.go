@@ -1,6 +1,6 @@
 package fsproto
 
-// Managed-generation open registration (FeatOpenRegistration on the
+// Managed-generation open registration (baseline on the
 // journal-native server): the fused create+register, the batched last-close
 // unmarks, duplicate-replay pin idempotence, the ENOENT degradation, and
 // cold-failover replay of pins and their releases. Dispatch-level tests
@@ -32,7 +32,7 @@ func serveManagedAuthorityFS(t *testing.T) (string, *workfs.FS) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	srv := NewServer(fs, fs, nil)
+	srv := NewServer(fs, fs)
 	go func() { _ = srv.Serve(ctx, ln) }()
 	return ln.Addr().String(), fs
 }
@@ -61,22 +61,6 @@ func waitReaped(t *testing.T, fs *workfs.FS, ino uint64) {
 			t.Fatalf("orphan %d survived the reap sweep", ino)
 		}
 		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-// TestManagedProbeAdvertisesOpenRegistration: the managed generation now
-// earns FeatOpenRegistration (fused create+register, batched unmarks) next to
-// its journaled-coordination bits.
-func TestManagedProbeAdvertisesOpenRegistration(t *testing.T) {
-	s, _ := newManagedServer(t, newProtoEntryLog())
-	probe := s.dispatch(&Request{Op: OpProtocolVersion, Size: int64(ProtocolVersion)})
-	if probe.ProtoVersion != ProtoVersionJournaledSessions {
-		t.Fatalf("managed probe version = %d, want %d", probe.ProtoVersion, ProtoVersionJournaledSessions)
-	}
-	for _, feat := range []uint64{FeatOpenRegistration, FeatJournaledCoordination, FeatExactSessions} {
-		if probe.Features&feat == 0 {
-			t.Fatalf("managed probe features %b missing bit %b", probe.Features, feat)
-		}
 	}
 }
 
@@ -383,12 +367,6 @@ func TestClientOpenRegistrationAgainstManagedAuthority(t *testing.T) {
 	cli.SetOwner("MA")
 	if _, err := cli.EnsureExactSession(); err != nil {
 		t.Fatalf("establish exact session: %v", err)
-	}
-	if !cli.ServerManaged() {
-		t.Fatal("expected a managed authority (ServerManaged=true)")
-	}
-	if !cli.SupportsOpenRegistration() {
-		t.Fatal("SupportsOpenRegistration must be true against a managed authority")
 	}
 
 	peer, err := Dial(addr, 2)

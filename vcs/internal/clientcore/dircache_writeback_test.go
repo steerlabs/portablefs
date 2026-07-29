@@ -4,7 +4,6 @@ import (
 	"context"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
@@ -61,10 +60,8 @@ func TestWriteBackReaddirReflectsOwnMutations(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
 	v := dialCore(t, addr, Options{
-		Owner:         "wb-ls",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour, // flush only on our explicit FlushToAuthority
+		Owner:  "wb-ls",
+		WALDir: t.TempDir(),
 	})
 
 	if _, st := v.Mkdir(ctx, "D", 0o755); st != fsproto.OK {
@@ -126,10 +123,8 @@ func TestWriteBackReaddirMergesOverlayBeforeFlush(t *testing.T) {
 	}
 
 	v := dialCore(t, addr, Options{
-		Owner:         "wb-merge-ls",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
+		Owner:  "wb-merge-ls",
+		WALDir: t.TempDir(),
 	})
 	assertNames(t, lsNameList(t, v, "D"), "drop", "keep")
 
@@ -167,24 +162,26 @@ func TestWriteBackReaddirMergesOverlayBeforeFlush(t *testing.T) {
 func TestWriteBackReaddirTombstonedDirectoryReturnsENOENT(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
-	seed := dialCore(t, addr, Options{})
-	if _, st := seed.Mkdir(ctx, "D", 0o755); st != fsproto.OK {
-		t.Fatalf("seed mkdir D: %d", st)
-	}
-	if _, st := seed.Create(ctx, "D/stale-child", 0o644); st != fsproto.OK {
-		t.Fatalf("seed child: %d", st)
-	}
-
 	v := dialCore(t, addr, Options{
-		Owner:         "wb-tombstone-ls",
-		WriteBack:     true,
-		WALDir:        t.TempDir(),
-		FlushInterval: time.Hour,
+		Owner:  "wb-tombstone-ls",
+		WALDir: t.TempDir(),
 	})
-	if st := v.Remove(ctx, "D", nil); st != fsproto.OK {
-		t.Fatalf("remove D: %d", st)
+	// A top-level directory the mount creates itself, with an empty subdir
+	// under a held delegation, so the removal tombstones locally.
+	if _, st := v.Mkdir(ctx, "P", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir P: %d", st)
 	}
-	if ents, st := v.Readdir(ctx, "D"); st != fsproto.ENOENT {
-		t.Fatalf("readdir tombstoned D = ents=%v st=%d, want ENOENT", ents, st)
+	if _, st := v.Mkdir(ctx, "P/D", 0o755); st != fsproto.OK { // delegates P, D born empty
+		t.Fatalf("mkdir P/D: %d", st)
+	}
+	if !v.wb.Covers("P/D") {
+		t.Fatal("P/D must be covered by the P delegation")
+	}
+	if st := v.Remove(ctx, "P/D", nil); st != fsproto.OK {
+		t.Fatalf("remove P/D: %d", st)
+	}
+	// The tombstoned directory reads back ENOENT locally (zero RPCs).
+	if ents, st := v.Readdir(ctx, "P/D"); st != fsproto.ENOENT {
+		t.Fatalf("readdir tombstoned P/D = ents=%v st=%d, want ENOENT", ents, st)
 	}
 }

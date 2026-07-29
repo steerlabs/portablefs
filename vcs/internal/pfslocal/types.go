@@ -242,6 +242,17 @@ type XattrRemoveRequest struct {
 }
 type XattrRemoveReply struct{}
 
+// SyncVolumeRequest asks the daemon for the REAL volume barrier: success
+// means every acknowledged mutation is durable and applied at the authority
+// AND acknowledged by every live protocol subscriber at its supported
+// frontend boundary. There is
+// no degraded local-only success — an unreachable/slow/fenced authority
+// fails the op (EIO), with the un-flushed tail crash-safe in the local WAL.
+// Degraded is retired wire ballast (always false) kept for frame
+// compatibility.
+type SyncVolumeRequest struct{}
+type SyncVolumeReply struct{ Degraded bool }
+
 type StatfsRequest struct{}
 type StatfsReply struct {
 	BlockSize   uint64

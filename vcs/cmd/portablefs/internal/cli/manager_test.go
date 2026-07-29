@@ -6,123 +6,50 @@ import (
 	"testing"
 )
 
-func TestMountSessionCanonicalVolumeScopedRoute(t *testing.T) {
-	f := newFakeServer(t) // /v1/access-leases/create unset => 404 => legacy ladder
-	f.on("POST", "/v1/volumes/vol_1/mount-sessions", func(body map[string]any) (int, string) {
-		if body["volumeId"] != "vol_1" || body["branch"] != "main" {
-			return 400, `{"error":"volumeId and branch are required."}`
-		}
-		return 200, `{"mountSession":{"endpoint":{"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050,"nfsPort":2049},"token":"sess_tok","expiresAtMs":1700000000000,"authorityInstanceId":"pfai_1"}}`
-	})
+// TestResolveAccessNeverFallsBack pins the v2 contract: the access-lease
+// route is the ONLY endpoint resolution transport. A manager without it
+// (404) is a hard, actionable error — the client must not probe the retired
+// mount-session/authority-session routes.
+func TestResolveAccessNeverFallsBack(t *testing.T) {
+	f := newFakeServer(t) // /v1/access-leases/create unset => 404
 	m := newManagerClient(f.srv.URL, "mgr_tok")
-	got, err := m.mountSession(context.Background(), "vol_1", "main", "")
-	if err != nil {
-		t.Fatalf("mountSession: %v", err)
-	}
-	if got.AuthorityURL != "vcs.example.com:2050" || got.Token != "sess_tok" || got.Port != 2050 || got.NFSPort != 2049 {
-		t.Fatalf("session = %+v", got)
-	}
-	if got.ExpiresAtMs != 1700000000000 || got.AuthorityInstanceID != "pfai_1" {
-		t.Fatalf("session metadata = %+v", got)
-	}
-	if got.Lease != nil {
-		t.Fatalf("a non-lease route must not fabricate a lease: %+v", got.Lease)
+	_, err := m.resolveAccess(context.Background(), "vol_1", "main", "")
+	if err == nil || !strings.Contains(err.Error(), "vol_1@main") {
+		t.Fatalf("a manager without the access-lease route must fail by name: %v", err)
 	}
 	var paths []string
 	for _, r := range f.recorded() {
 		paths = append(paths, r.Path)
 	}
-	want := "/v1/access-leases/create,/v1/volumes/vol_1/mount-sessions"
-	if strings.Join(paths, ",") != want {
-		t.Fatalf("the volume-scoped route must not fall further when it succeeds: %v", paths)
+	if strings.Join(paths, ",") != "/v1/access-leases/create" {
+		t.Fatalf("resolution must touch ONLY the access-lease route: %v", paths)
 	}
 }
 
-// TestMountSessionFlatAliasRoute pins the middle rung of the ladder: a manager
-// that serves only the flat /v1/mount-sessions alias (404 on the volume-scoped
-// form) still resolves in two requests without touching the legacy pair.
-func TestMountSessionFlatAliasRoute(t *testing.T) {
+func TestResolveAccessErrorsAreActionable(t *testing.T) {
 	f := newFakeServer(t)
-	f.on("POST", "/v1/mount-sessions", func(body map[string]any) (int, string) {
-		if body["volumeId"] != "vol_1" || body["branch"] != "main" {
-			return 400, `{"error":"volumeId and branch are required."}`
-		}
-		return 200, `{"mountSession":{"endpoint":{"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050},"token":"sess_tok"}}`
-	})
-	m := newManagerClient(f.srv.URL, "mgr_tok")
-	got, err := m.mountSession(context.Background(), "vol_1", "main", "")
-	if err != nil {
-		t.Fatalf("mountSession: %v", err)
-	}
-	if got.AuthorityURL != "vcs.example.com:2050" || got.Token != "sess_tok" {
-		t.Fatalf("session = %+v", got)
-	}
-	var paths []string
-	for _, r := range f.recorded() {
-		paths = append(paths, r.Path)
-	}
-	want := "/v1/access-leases/create,/v1/volumes/vol_1/mount-sessions,/v1/mount-sessions"
-	if strings.Join(paths, ",") != want {
-		t.Fatalf("call sequence = %v", paths)
-	}
-}
-
-// TestMountSessionFallsBackToEnsureSession pins the compatibility path: a
-// manager without /v1/mount-sessions (404) is driven through
-// /v1/authorities/ensure + /v1/authorities/session and yields the same info.
-func TestMountSessionFallsBackToEnsureSession(t *testing.T) {
-	f := newFakeServer(t) // /v1/mount-sessions unset => 404
-	f.on("POST", "/v1/authorities/ensure", func(body map[string]any) (int, string) {
-		if body["volumeId"] != "vol_1" || body["branch"] != "dev" {
-			return 400, `{"error":"volumeId and branch are required."}`
-		}
-		return 200, `{"authority":{"provider":"portablefs-managed","authorityUrl":"router.example.com:2050","host":"router.example.com","port":2050,"authorityInstanceId":"pfai_7"}}`
-	})
-	f.on("POST", "/v1/authorities/session", func(map[string]any) (int, string) {
-		return 200, `{"authority":{"provider":"portablefs-managed","authorityUrl":"router.example.com:2050","host":"router.example.com","port":2050,"authorityInstanceId":"pfai_7","authorityAuthToken":"data_tok","authorityExpiresAt":1700000000000}}`
-	})
-	m := newManagerClient(f.srv.URL, "mgr_tok")
-	got, err := m.mountSession(context.Background(), "vol_1", "dev", "")
-	if err != nil {
-		t.Fatalf("mountSession fallback: %v", err)
-	}
-	if got.AuthorityURL != "router.example.com:2050" || got.Token != "data_tok" || got.AuthorityInstanceID != "pfai_7" {
-		t.Fatalf("fallback session = %+v", got)
-	}
-	var paths []string
-	for _, r := range f.recorded() {
-		paths = append(paths, r.Path)
-	}
-	want := "/v1/access-leases/create,/v1/volumes/vol_1/mount-sessions,/v1/mount-sessions,/v1/authorities/ensure,/v1/authorities/session"
-	if strings.Join(paths, ",") != want {
-		t.Fatalf("call sequence = %v", paths)
-	}
-}
-
-func TestMountSessionErrorsAreActionable(t *testing.T) {
-	f := newFakeServer(t)
-	f.on("POST", "/v1/mount-sessions", func(map[string]any) (int, string) {
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
 		return 401, `{"error":"Unauthorized."}`
 	})
 	m := newManagerClient(f.srv.URL, "wrong")
-	_, err := m.mountSession(context.Background(), "vol_1", "main", "")
+	_, err := m.resolveAccess(context.Background(), "vol_1", "main", "")
 	if err == nil || !strings.Contains(err.Error(), "vol_1@main") {
 		t.Fatalf("error must identify the volume@branch: %v", err)
 	}
 }
 
 const leaseCreateOK = `{
-  "authority": {"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050,"nfsPort":2049,"authorityInstanceId":"pfai_9"},
+  "authority": {"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050,"authorityInstanceId":"pfai_9"},
   "lease": {"accessLeaseId":"pfal_1","controlSeq":"7","expiresAt":1700000600000,"state":"active"},
   "accessToken": "lease_tok_1",
   "serverTimeMs": 1700000000000
 }`
 
-// TestMountSessionPrefersAccessLeases pins the canonical transport: a manager
+// TestResolveAccessLeaseRoute pins the canonical transport: a manager
 // serving POST /v1/access-leases/create resolves in ONE request, the access
 // token is the data-plane credential, and the lease slice (id, token, expiry,
 // controlSeq) is carried for the renewal loop.
-func TestMountSessionPrefersAccessLeases(t *testing.T) {
+func TestResolveAccessLeaseRoute(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/access-leases/create", func(body map[string]any) (int, string) {
 		if body["volumeId"] != "vol_1" || body["branch"] != "main" {
@@ -139,11 +66,11 @@ func TestMountSessionPrefersAccessLeases(t *testing.T) {
 		return 200, leaseCreateOK
 	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
-	got, err := m.mountSession(context.Background(), "vol_1", "main", "")
+	got, err := m.resolveAccess(context.Background(), "vol_1", "main", "")
 	if err != nil {
-		t.Fatalf("mountSession: %v", err)
+		t.Fatalf("resolveAccess: %v", err)
 	}
-	if got.AuthorityURL != "vcs.example.com:2050" || got.Token != "lease_tok_1" || got.NFSPort != 2049 || got.AuthorityInstanceID != "pfai_9" {
+	if got.AuthorityURL != "vcs.example.com:2050" || got.Token != "lease_tok_1" || got.AuthorityInstanceID != "pfai_9" {
 		t.Fatalf("session = %+v", got)
 	}
 	if got.ExpiresAtMs != 1700000600000 {
@@ -157,11 +84,11 @@ func TestMountSessionPrefersAccessLeases(t *testing.T) {
 	}
 }
 
-// TestMountSessionForwardsTeamID pins the tenant namespace: when the CLI
-// knows the volume's tenant id it rides as teamId on the lease route AND on
-// the mount-session fallback rungs (journal-native production managers
-// require it; environment managers ignore it).
-func TestMountSessionForwardsTeamID(t *testing.T) {
+// TestResolveAccessForwardsTeamID pins the tenant namespace: when the CLI
+// knows the volume's tenant id it rides as teamId on the lease route
+// (journal-native production managers require it; environment managers
+// ignore it).
+func TestResolveAccessForwardsTeamID(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/access-leases/create", func(body map[string]any) (int, string) {
 		if body["teamId"] != "team_9" {
@@ -170,25 +97,12 @@ func TestMountSessionForwardsTeamID(t *testing.T) {
 		return 200, leaseCreateOK
 	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
-	got, err := m.mountSession(context.Background(), "vol_1", "main", "team_9")
+	got, err := m.resolveAccess(context.Background(), "vol_1", "main", "team_9")
 	if err != nil {
-		t.Fatalf("mountSession with teamId: %v", err)
+		t.Fatalf("resolveAccess with teamId: %v", err)
 	}
 	if got.Lease == nil || got.Lease.AccessLeaseID != "pfal_1" {
 		t.Fatalf("lease slice = %+v", got.Lease)
-	}
-
-	// The fallback rungs carry the same teamId.
-	f2 := newFakeServer(t) // lease route unset => 404 => mount-session ladder
-	f2.on("POST", "/v1/volumes/vol_1/mount-sessions", func(body map[string]any) (int, string) {
-		if body["teamId"] != "team_9" {
-			return 400, `{"error":"teamId missing on the mount-session rung"}`
-		}
-		return 200, `{"mountSession":{"endpoint":{"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050},"token":"sess_tok"}}`
-	})
-	m2 := newManagerClient(f2.srv.URL, "mgr_tok")
-	if _, err := m2.mountSession(context.Background(), "vol_1", "main", "team_9"); err != nil {
-		t.Fatalf("mount-session rung with teamId: %v", err)
 	}
 
 	// Without a resolved tenant the requests stay teamId-free (byte-identical
@@ -201,8 +115,8 @@ func TestMountSessionForwardsTeamID(t *testing.T) {
 		return 200, leaseCreateOK
 	})
 	m3 := newManagerClient(f3.srv.URL, "mgr_tok")
-	if _, err := m3.mountSession(context.Background(), "vol_1", "main", ""); err != nil {
-		t.Fatalf("mountSession without teamId: %v", err)
+	if _, err := m3.resolveAccess(context.Background(), "vol_1", "main", ""); err != nil {
+		t.Fatalf("resolveAccess without teamId: %v", err)
 	}
 }
 
@@ -225,10 +139,10 @@ func TestAccessLeaseCreateRetriesSameOperationID(t *testing.T) {
 	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
 
-	if _, err := m.mountSession(context.Background(), "vol_1", "main", ""); err == nil {
+	if _, err := m.resolveAccess(context.Background(), "vol_1", "main", ""); err == nil {
 		t.Fatal("first attempt must surface the 503")
 	}
-	got, err := m.mountSession(context.Background(), "vol_1", "main", "")
+	got, err := m.resolveAccess(context.Background(), "vol_1", "main", "")
 	if err != nil || got.Lease == nil {
 		t.Fatalf("retry: %v %+v", err, got)
 	}
@@ -238,7 +152,7 @@ func TestAccessLeaseCreateRetriesSameOperationID(t *testing.T) {
 
 	// After success the logical attempt is complete: a new mount attempt
 	// must mint a fresh operationId.
-	if _, err := m.mountSession(context.Background(), "vol_1", "main", ""); err != nil {
+	if _, err := m.resolveAccess(context.Background(), "vol_1", "main", ""); err != nil {
 		t.Fatalf("third attempt: %v", err)
 	}
 	if len(opIDs) != 3 || opIDs[2] == opIDs[1] {
@@ -321,7 +235,7 @@ func TestAccessLeaseRenewAndRelease(t *testing.T) {
 // ACCESS_LEASE_EPOCH_SUPERSEDED ships as a 503, which the ambiguity rule
 // alone would classify as "retry the same renew" — but the typed code means
 // this lease can NEVER renew again (its epoch is gone), so the keeper must
-// re-acquire a fresh lease through the mountSession ladder instead of
+// re-acquire a fresh lease through resolveAccess instead of
 // renewing a dead one forever.
 func TestLeaseKeeperReacquiresOnEpochSuperseded(t *testing.T) {
 	f := newFakeServer(t)
@@ -417,7 +331,7 @@ func TestLeaseKeeperPlain503StaysAmbiguous(t *testing.T) {
 
 // TestAccessLeaseRenewFailureMintsFreshLease pins recovery: a definitive
 // renew refusal (the lease expired server-side) falls back to creating a
-// fresh lease through the mountSession ladder, and the mount keeps running.
+// fresh lease through resolveAccess, and the mount keeps running.
 func TestAccessLeaseRenewFailureMintsFreshLease(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {

@@ -411,6 +411,11 @@ func (tx *Txn) terminalize(s *sessionState, reason TerminalReason) []uint64 {
 		tx.setLocks(ino, kept)
 	}
 
+	// Delegation grants (bound to a write-back stream) are NEVER silently
+	// released on holder death: they may cover unshipped acknowledged state,
+	// so they flip to recovery-required and block peers until the stream
+	// rebinds and drains, or an operator discards them. Plain coordination
+	// checkouts release as before.
 	var paths []string
 	for p, g := range st.checkouts {
 		if g.holder == ref {
@@ -419,18 +424,37 @@ func (tx *Txn) terminalize(s *sessionState, reason TerminalReason) []uint64 {
 	}
 	sort.Strings(paths)
 	for _, p := range paths {
-		tx.deleteCheckout(p)
-	}
-
-	var fkeys []flushKey
-	for k := range st.ledger {
-		if k.session == ref {
-			fkeys = append(fkeys, k)
+		g := st.checkouts[p]
+		if g.writebackID != "" {
+			g.recovery = true
+			tx.setCheckout(p, g)
+		} else {
+			tx.deleteCheckout(p)
 		}
 	}
-	sortFlushKeys(fkeys)
-	for _, k := range fkeys {
-		tx.deleteLedger(k)
+
+	// Stream ledgers owned by the dead session survive exactly while a
+	// recovery scope still references them (the recovering stream needs the
+	// watermark + digest); a fully-released stream's entry drops with its
+	// session.
+	var wbids []string
+	for id, e := range st.ledger {
+		if e.owner == ref {
+			wbids = append(wbids, id)
+		}
+	}
+	sort.Strings(wbids)
+	for _, id := range wbids {
+		referenced := false
+		for _, g := range st.checkouts {
+			if g.writebackID == id {
+				referenced = true
+				break
+			}
+		}
+		if !referenced {
+			tx.deleteLedger(id)
+		}
 	}
 
 	var pinInos []uint64
@@ -546,10 +570,16 @@ func (st *State) applyFlushAdvance(tx *Txn, f *FlushAdvance, dry bool) (ApplyRes
 		return res, fencedf("flush advance names checkout %q epoch %s that is not the live grant (released or transferred flushes are stale)",
 			f.CheckoutPath, f.CheckoutEpoch)
 	}
-	key := flushKey{session: f.Session, writebackID: f.WritebackID, path: f.CheckoutPath, epoch: f.CheckoutEpoch}
-	cur, exists := st.ledger[key]
-	if exists && f.Through <= cur {
-		return res, integrityf("flush advance to %d does not advance the durable watermark %d", f.Through, cur)
+	if g.recovery {
+		return res, fencedf("flush advance names recovery-required scope %q; the stream must rebind first", f.CheckoutPath)
+	}
+	if g.writebackID != f.WritebackID {
+		// Never echo the grant's true stream ID (a recovery capability).
+		return res, integrityf("flush advance stream %q does not match the grant's stream", f.WritebackID)
+	}
+	cur, exists := st.ledger[f.WritebackID]
+	if exists && f.Through <= cur.through {
+		return res, integrityf("flush advance to %d does not advance the durable watermark %d", f.Through, cur.through)
 	}
 	if !exists && len(st.ledger) >= MaxFlushEntries {
 		return res, capacityf("flush ledger exhausted (%d)", MaxFlushEntries)
@@ -557,7 +587,7 @@ func (st *State) applyFlushAdvance(tx *Txn, f *FlushAdvance, dry bool) (ApplyRes
 	if dry {
 		return res, nil
 	}
-	tx.setLedger(key, f.Through)
+	tx.setLedger(f.WritebackID, ledgerEntry{through: f.Through, digest: f.Digest, owner: f.Session})
 	return res, nil
 }
 
@@ -604,12 +634,15 @@ func (st *State) applyLockChange(tx *Txn, l *LockChange, dry bool) (ApplyResult,
 
 func (st *State) applyCheckoutChange(tx *Txn, c *CheckoutChange, dry bool) (ApplyResult, error) {
 	res := ApplyResult{Kind: KindCheckoutChange}
-	s := st.liveSessionLocked(c.Key.Session)
-	if s == nil {
-		return res, fencedf("checkout change targets non-live generation %v", c.Key.Session)
-	}
-	if err := st.checkOutcomeSlot(s, c.Key); err != nil {
-		return res, err
+	var s *sessionState
+	if c.Op.keyed() {
+		s = st.liveSessionLocked(c.Key.Session)
+		if s == nil {
+			return res, fencedf("checkout change targets non-live generation %v", c.Key.Session)
+		}
+		if err := st.checkOutcomeSlot(s, c.Key); err != nil {
+			return res, err
+		}
 	}
 	switch c.Op {
 	case CheckoutGrant:
@@ -634,7 +667,7 @@ func (st *State) applyCheckoutChange(tx *Txn, c *CheckoutChange, dry bool) (Appl
 		// a guess from the current view. Deterministic on replay — the epoch
 		// is the record's own field.
 		tx.commitOutcomeSlot(s, c.Key, grantOutcome(c.Epoch))
-		tx.setCheckout(c.Path, checkoutGrant{holder: c.Key.Session, epoch: c.Epoch})
+		tx.setCheckout(c.Path, checkoutGrant{holder: c.Key.Session, epoch: c.Epoch, writebackID: c.WritebackID})
 		tx.setNextEpoch(nextEpoch)
 		res.GrantedEpoch = c.Epoch
 	case CheckoutRelease:
@@ -642,16 +675,26 @@ func (st *State) applyCheckoutChange(tx *Txn, c *CheckoutChange, dry bool) (Appl
 		if !ok || g.holder != c.Key.Session || g.epoch != c.Epoch {
 			return res, fencedf("release names checkout %q epoch %s that is not the caller's live grant", c.Path, c.Epoch)
 		}
+		if g.recovery {
+			return res, fencedf("release names recovery-required scope %q; only rebind or discard resolve it", c.Path)
+		}
 		if dry {
 			return res, nil
 		}
 		tx.commitOutcomeSlot(s, c.Key, c.Outcome)
 		tx.deleteCheckout(c.Path)
-		tx.dropCheckoutLedger(c.Path, c.Epoch)
 	case CheckoutForceTransfer:
 		conflicts := st.overlappingCheckoutsLocked(c.Path)
 		if len(conflicts) == 0 {
 			return res, integrityf("force transfer of %q found no conflicting grants (an ordinary grant must be used)", c.Path)
+		}
+		for _, conflict := range conflicts {
+			if conflict.WritebackID != "" {
+				// A delegation may cover unshipped acknowledged state; force
+				// transfer would silently discard it (recovery/discard are
+				// the only paths past a dead holder).
+				return res, integrityf("force transfer of %q would revoke delegation %q; delegations are never force-transferred", c.Path, conflict.Path)
+			}
 		}
 		if RecallDigest(conflicts) != c.RecalledDigest {
 			return res, integrityf("force transfer of %q carries a stale recalled-conflict digest: the conflict set changed after the recall", c.Path)
@@ -669,11 +712,54 @@ func (st *State) applyCheckoutChange(tx *Txn, c *CheckoutChange, dry bool) (Appl
 		tx.commitOutcomeSlot(s, c.Key, grantOutcome(c.Epoch))
 		for _, conflict := range conflicts {
 			tx.deleteCheckout(conflict.Path)
-			tx.dropCheckoutLedger(conflict.Path, conflict.Epoch)
 		}
 		tx.setCheckout(c.Path, checkoutGrant{holder: c.Key.Session, epoch: c.Epoch})
 		tx.setNextEpoch(nextEpoch)
 		res.GrantedEpoch = c.Epoch
+	case CheckoutRebind:
+		g, ok := st.checkouts[c.Path]
+		if !ok || g.epoch != c.Epoch || g.writebackID != c.WritebackID {
+			return res, fencedf("rebind names checkout %q epoch %s stream %q that is not durable state", c.Path, c.Epoch, c.WritebackID)
+		}
+		if !g.recovery {
+			return res, integrityf("rebind of %q requires the recovery-required state (the holder is still bound)", c.Path)
+		}
+		holder := st.liveSessionLocked(c.NewHolder)
+		if holder == nil {
+			return res, fencedf("rebind targets non-live generation %v", c.NewHolder)
+		}
+		if dry {
+			return res, nil
+		}
+		g.holder = c.NewHolder
+		g.recovery = false
+		tx.setCheckout(c.Path, g)
+		if e, ok := st.ledger[c.WritebackID]; ok {
+			e.owner = c.NewHolder
+			tx.setLedger(c.WritebackID, e)
+		}
+	case CheckoutDiscard:
+		g, ok := st.checkouts[c.Path]
+		if !ok || g.epoch != c.Epoch || g.writebackID != c.WritebackID {
+			return res, fencedf("discard names checkout %q epoch %s stream %q that is not durable state", c.Path, c.Epoch, c.WritebackID)
+		}
+		if !g.recovery {
+			return res, integrityf("discard of %q requires the recovery-required state (a live grant releases normally)", c.Path)
+		}
+		if dry {
+			return res, nil
+		}
+		tx.deleteCheckout(c.Path)
+		remaining := false
+		for _, other := range st.checkouts {
+			if other.writebackID == c.WritebackID {
+				remaining = true
+				break
+			}
+		}
+		if !remaining {
+			tx.deleteLedger(c.WritebackID)
+		}
 	}
 	return res, nil
 }
@@ -796,44 +882,27 @@ func (tx *Txn) deleteCheckout(path string) {
 	delete(st.checkouts, path)
 }
 
-func (tx *Txn) setLedger(key flushKey, through uint64) {
+func (tx *Txn) setLedger(writebackID string, e ledgerEntry) {
 	st := tx.st
-	prev, had := st.ledger[key]
+	prev, had := st.ledger[writebackID]
 	tx.push(func() {
 		if had {
-			st.ledger[key] = prev
+			st.ledger[writebackID] = prev
 		} else {
-			delete(st.ledger, key)
+			delete(st.ledger, writebackID)
 		}
 	})
-	st.ledger[key] = through
+	st.ledger[writebackID] = e
 }
 
-func (tx *Txn) deleteLedger(key flushKey) {
+func (tx *Txn) deleteLedger(writebackID string) {
 	st := tx.st
-	prev, had := st.ledger[key]
+	prev, had := st.ledger[writebackID]
 	if !had {
 		return
 	}
-	tx.push(func() { st.ledger[key] = prev })
-	delete(st.ledger, key)
-}
-
-// dropCheckoutLedger invalidates every flush watermark under one released or
-// transferred grant: its epoch never recurs, so the entries can never match a
-// future flush and retaining them would only leak capacity.
-func (tx *Txn) dropCheckoutLedger(path string, epoch Epoch) {
-	st := tx.st
-	var keys []flushKey
-	for k := range st.ledger {
-		if k.path == path && k.epoch == epoch {
-			keys = append(keys, k)
-		}
-	}
-	sortFlushKeys(keys)
-	for _, k := range keys {
-		tx.deleteLedger(k)
-	}
+	tx.push(func() { st.ledger[writebackID] = prev })
+	delete(st.ledger, writebackID)
 }
 
 func (tx *Txn) addPin(ref SessionRef, ino uint64) {
@@ -886,23 +955,4 @@ func (tx *Txn) setDbTimeFloor(mintedDbMs int64) {
 	old := tx.st.dbTimeFloorMs
 	tx.push(func() { tx.st.dbTimeFloorMs = old })
 	tx.st.dbTimeFloorMs = mintedDbMs
-}
-
-func sortFlushKeys(keys []flushKey) {
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := keys[i], keys[j]
-		if a.session.SessionID != b.session.SessionID {
-			return a.session.SessionID < b.session.SessionID
-		}
-		if a.session.Generation != b.session.Generation {
-			return a.session.Generation < b.session.Generation
-		}
-		if a.writebackID != b.writebackID {
-			return a.writebackID < b.writebackID
-		}
-		if a.path != b.path {
-			return a.path < b.path
-		}
-		return a.epoch.Compare(b.epoch) < 0
-	})
 }

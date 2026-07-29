@@ -337,6 +337,14 @@ public struct PfsEnvelope: Sendable {
     set {body = .hardLink(newValue)}
   }
 
+  public var syncVolume: PfsSyncVolumeRequest {
+    get {
+      if case .syncVolume(let v)? = body {return v}
+      return PfsSyncVolumeRequest()
+    }
+    set {body = .syncVolume(newValue)}
+  }
+
   /// daemon → client (replies)
   public var helloReply: PfsHelloReply {
     get {
@@ -538,6 +546,14 @@ public struct PfsEnvelope: Sendable {
     set {body = .hardLinkReply(newValue)}
   }
 
+  public var syncVolumeReply: PfsSyncVolumeReply {
+    get {
+      if case .syncVolumeReply(let v)? = body {return v}
+      return PfsSyncVolumeReply()
+    }
+    set {body = .syncVolumeReply(newValue)}
+  }
+
   /// daemon → client (either)
   public var error: PfsErrorReply {
     get {
@@ -585,6 +601,7 @@ public struct PfsEnvelope: Sendable {
     case reclaim(PfsReclaimRequest)
     case subscribeEvents(PfsSubscribeEventsRequest)
     case hardLink(PfsHardLinkRequest)
+    case syncVolume(PfsSyncVolumeRequest)
     /// daemon → client (replies)
     case helloReply(PfsHelloReply)
     case resolveReply(PfsResolveReply)
@@ -611,6 +628,7 @@ public struct PfsEnvelope: Sendable {
     case reclaimReply(PfsReclaimReply)
     case subscribeEventsReply(PfsSubscribeEventsReply)
     case hardLinkReply(PfsHardLinkReply)
+    case syncVolumeReply(PfsSyncVolumeReply)
     /// daemon → client (either)
     case error(PfsErrorReply)
     /// request_id 0: server-initiated
@@ -1704,6 +1722,34 @@ public struct PfsXattrRemoveReply: Sendable {
   public init() {}
 }
 
+/// SyncVolume is the REAL volume barrier behind FSKit's synchronize and the
+/// CLI's pre-unmount drain. Success means the acknowledged tail is durable and
+/// applied at the authority and every live protocol subscriber reached its
+/// supported invalidation boundary. There is no local-only success: an
+/// unreachable, slow, or fenced authority fails the request. `degraded` is
+/// retired wire ballast and is always false.
+public struct PfsSyncVolumeRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct PfsSyncVolumeReply: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var degraded: Bool = false
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public struct PfsStatfsRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -1975,6 +2021,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     32: .same(proto: "reclaim"),
     33: .standard(proto: "subscribe_events"),
     34: .standard(proto: "hard_link"),
+    35: .standard(proto: "sync_volume"),
     60: .standard(proto: "hello_reply"),
     61: .standard(proto: "resolve_reply"),
     62: .standard(proto: "lookup_reply"),
@@ -2000,6 +2047,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     82: .standard(proto: "reclaim_reply"),
     83: .standard(proto: "subscribe_events_reply"),
     84: .standard(proto: "hard_link_reply"),
+    85: .standard(proto: "sync_volume_reply"),
     90: .same(proto: "error"),
     91: .same(proto: "event"),
   ]
@@ -2336,6 +2384,19 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
           self.body = .hardLink(v)
         }
       }()
+      case 35: try {
+        var v: PfsSyncVolumeRequest?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .syncVolume(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .syncVolume(v)
+        }
+      }()
       case 60: try {
         var v: PfsHelloReply?
         var hadOneofValue = false
@@ -2661,6 +2722,19 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
           self.body = .hardLinkReply(v)
         }
       }()
+      case 85: try {
+        var v: PfsSyncVolumeReply?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .syncVolumeReply(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .syncVolumeReply(v)
+        }
+      }()
       case 90: try {
         var v: PfsErrorReply?
         var hadOneofValue = false
@@ -2801,6 +2875,10 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
       guard case .hardLink(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 34)
     }()
+    case .syncVolume?: try {
+      guard case .syncVolume(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 35)
+    }()
     case .helloReply?: try {
       guard case .helloReply(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 60)
@@ -2900,6 +2978,10 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     case .hardLinkReply?: try {
       guard case .hardLinkReply(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 84)
+    }()
+    case .syncVolumeReply?: try {
+      guard case .syncVolumeReply(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 85)
     }()
     case .error?: try {
       guard case .error(let v)? = self.body else { preconditionFailure() }
@@ -4997,6 +5079,57 @@ extension PfsXattrRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 
   public static func ==(lhs: PfsXattrRemoveReply, rhs: PfsXattrRemoveReply) -> Bool {
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension PfsSyncVolumeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".SyncVolumeRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    // Load everything into unknown fields
+    while try decoder.nextFieldNumber() != nil {}
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: PfsSyncVolumeRequest, rhs: PfsSyncVolumeRequest) -> Bool {
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension PfsSyncVolumeReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".SyncVolumeReply"
+  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+    1: .same(proto: "degraded"),
+  ]
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBoolField(value: &self.degraded) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.degraded != false {
+      try visitor.visitSingularBoolField(value: self.degraded, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: PfsSyncVolumeReply, rhs: PfsSyncVolumeReply) -> Bool {
+    if lhs.degraded != rhs.degraded {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

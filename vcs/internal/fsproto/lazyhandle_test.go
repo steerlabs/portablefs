@@ -8,6 +8,7 @@ package fsproto
 
 import (
 	"testing"
+	"time"
 )
 
 func TestGetattrOrphanReportsZeroNlink(t *testing.T) {
@@ -49,16 +50,27 @@ func TestGetattrOrphanReportsZeroNlink(t *testing.T) {
 		t.Fatalf("parked handle getattr = %+v, want nlink 0", handle)
 	}
 
-	// Reap: the handle becomes verified absence — exactly ENOENT, and the
-	// exact reap identity replays its stored outcome.
-	if r := exactDo(s, cs, &Request{Op: OpReap, OrphanIno: ino}, 0, 3); r.Status != OK {
-		t.Fatalf("reap: %+v", r)
+	// Public reap is removed from the protocol: the rejection is a durable
+	// exact outcome (EPERM) and its identical resend replays. Only the
+	// authority reaps, once durable state proves no pins — this UNPINNED
+	// park is destroyed by the sweep, and the handle becomes verified
+	// absence (exactly ENOENT).
+	if r := exactDo(s, cs, &Request{Op: OpReap, OrphanIno: ino}, 0, 3); r.Status != EPERM {
+		t.Fatalf("reap: %+v, want durable EPERM", r)
 	}
-	if r := exactDo(s, cs, &Request{Op: OpReap, OrphanIno: ino}, 0, 3); r.Status != OK || !r.Duplicate {
-		t.Fatalf("reap replay: %+v, want stored duplicate", r)
+	if r := exactDo(s, cs, &Request{Op: OpReap, OrphanIno: ino}, 0, 3); r.Status != EPERM || !r.Duplicate {
+		t.Fatalf("reap replay: %+v, want stored duplicate EPERM", r)
 	}
-	if r := s.dispatch(&Request{Op: OpGetattr, OrphanIno: ino}); r.Status != ENOENT {
-		t.Fatalf("reaped orphan getattr status = %d, want ENOENT", r.Status)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if r := s.dispatch(&Request{Op: OpGetattr, OrphanIno: ino}); r.Status == ENOENT {
+			break
+		}
+		if time.Now().After(deadline) {
+			r := s.dispatch(&Request{Op: OpGetattr, OrphanIno: ino})
+			t.Fatalf("unpinned orphan getattr status = %d, want ENOENT after the reap sweep", r.Status)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -1,6 +1,6 @@
 # Railway config-as-code
 
-Per-service Railway configuration for the four deployable PortableFS
+Per-service Railway configuration for the three deployable PortableFS
 services plus the one-shot migration gate. All share this single repository
 root, so Railway's one-file-per-service pattern is used: each service in
 the Railway dashboard is pointed at its own config file here (service
@@ -21,7 +21,6 @@ deploy order is [docs/railway-deployment.md](../docs/railway-deployment.md).
 | `volume-api.railway.json` | volume-api | `Dockerfile.volume-api` | `GET /readyz` (port 8787) | `ON_FAILURE`, 10 retries |
 | `authority-manager.railway.json` | authority-manager | `Dockerfile.authority-manager` | `GET /readyz` (control port 8788) | `ON_FAILURE`, 10 retries |
 | `history-worker.railway.json` | history-worker | `Dockerfile.history-worker` | `GET /readyz` (port 8790) | `ON_FAILURE`, 10 retries |
-| `volume-worker.railway.json` | volume-worker | `Dockerfile.volume-worker` | none — one-shot job, no listener | `NEVER` |
 | `migration-gate.railway.json` | migration gate (pre-deploy job) | `Dockerfile.volume-api` | none — one-shot job, no listener | `NEVER` |
 
 Why these values:
@@ -57,13 +56,11 @@ Why these values:
     `PFH_WORKER_LISTEN_ADDR=0.0.0.0:8790`. Setting `PORT=8790` alone
     leaves nothing listening and the deployment never becomes healthy.
 - **`restartPolicyType`** — `ON_FAILURE` for the three long-running
-  services; `NEVER` for volume-worker, which is a one-shot integrity job
-  (`CMD node dist/main.js integrity`) whose clean exit must not be
-  restarted into a loop. Schedule it via the dashboard (cron) or run it
-  manually; never let two instances overlap. `NEVER` likewise for the
-  migration gate below: a failed migration must surface as a failed
-  one-shot deploy, never a crash loop retrying against a wedged advisory
-  lock.
+  services; `NEVER` for the migration gate below: a failed migration must
+  surface as a failed one-shot deploy, never a crash loop retrying against
+  a wedged advisory lock. (Blob GC and the integrity walk are volume-api
+  admin endpoints, cron-driven — see
+  [docs/railway-deployment.md](../docs/railway-deployment.md).)
 - **`drainingSeconds`** — Railway's default drain is **0 seconds**: the old
   deploy gets SIGKILL immediately after SIGTERM, which would cut off
   in-flight requests and graceful teardown. 30s for volume-api and the

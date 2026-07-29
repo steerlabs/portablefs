@@ -689,6 +689,8 @@ private actor MockFileSystem {
                 response.totalFiles = 1_000_000
                 response.freeFiles = 900_000
                 reply.body = .statfsReply(response)
+            case .syncVolume:
+                reply.body = .syncVolumeReply(PfsSyncVolumeReply())
             case .fsync:
                 reply.body = .fsyncReply(PfsFsyncReply())
             case let .reclaim(request):
@@ -702,7 +704,7 @@ private actor MockFileSystem {
                  .createReply, .mkdirReply, .removeReply, .renameReply, .symlinkReply,
                  .readlinkReply, .xattrGetReply, .xattrSetReply, .xattrListReply,
                  .xattrRemoveReply, .statfsReply, .fsyncReply, .reclaimReply,
-                 .subscribeEventsReply, .hardLinkReply, .error, .event:
+                 .subscribeEventsReply, .hardLinkReply, .syncVolumeReply, .error, .event:
                 throw MockPOSIXError(errno: EINVAL, message: "daemon received reply body")
             }
         } catch let error as MockPOSIXError {

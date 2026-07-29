@@ -18,18 +18,21 @@ import (
 // invalidations together — never torn across the batch boundary.
 
 // Subscribe returns a channel of coherence-invalidation batches plus an unsubscribe func.
-// A batch consisting of a single FlushAll invalidation (sent when a subscriber's buffer
-// overflows) tells the client to drop ALL cached versions and re-read, so a slow client
-// degrades to a full refresh rather than going stale.
-func (fs *FS) Subscribe() (<-chan []coherence.Invalidation, func()) {
+// Every batch carries its monotonic stream position (the authority barrier
+// waits on subscriber acknowledgments of these positions). A batch consisting
+// of a single FlushAll invalidation (sent when a subscriber's buffer
+// overflows) tells the client to drop ALL cached versions and re-read, so a
+// slow client degrades to a full refresh rather than going stale — it carries
+// the position of the batch that overflowed, superseding everything drained.
+func (fs *FS) Subscribe() (<-chan coherence.Batch, func()) {
 	fs.subsMu.Lock()
 	defer fs.subsMu.Unlock()
 	if fs.subs == nil {
-		fs.subs = map[int]chan []coherence.Invalidation{}
+		fs.subs = map[int]chan coherence.Batch{}
 	}
 	id := fs.nextSub
 	fs.nextSub++
-	ch := make(chan []coherence.Invalidation, 1024)
+	ch := make(chan coherence.Batch, 1024)
 	fs.subs[id] = ch
 	return ch, func() {
 		fs.subsMu.Lock()
@@ -41,6 +44,15 @@ func (fs *FS) Subscribe() (<-chan []coherence.Invalidation, func()) {
 	}
 }
 
+// InvalidationPosition reports the highest published invalidation-stream
+// position: the position an authority barrier must see acknowledged by every
+// live subscriber before it may complete.
+func (fs *FS) InvalidationPosition() uint64 {
+	fs.subsMu.Lock()
+	defer fs.subsMu.Unlock()
+	return fs.invPos
+}
+
 // publish delivers one batch to every subscriber without blocking (it holds only subsMu,
 // never fs.mu, and never blocks on a full channel).
 func (fs *FS) publish(invs []coherence.Invalidation) {
@@ -48,15 +60,17 @@ func (fs *FS) publish(invs []coherence.Invalidation) {
 		return
 	}
 	fs.subsMu.Lock()
+	fs.invPos++
+	batch := coherence.Batch{Pos: fs.invPos, Invs: invs}
 	for _, ch := range fs.subs {
 		select {
-		case ch <- invs:
+		case ch <- batch:
 		default:
 			// Buffer full: the subscriber is behind. Drain the now-superseded batches and
 			// collapse to a single FlushAll (a full re-read). Draining first GUARANTEES the
 			// FlushAll lands — a plain non-blocking send into a still-full buffer can be
 			// dropped, leaving the client silently and permanently stale.
-			drainAndFlush(ch, fs.generation)
+			drainAndFlush(ch, fs.generation, fs.invPos)
 		}
 	}
 	fs.subsMu.Unlock()
@@ -70,15 +84,15 @@ func (fs *FS) PublishRecall(p string) {
 }
 
 // drainAndFlush empties ch (whose batches are about to be superseded) and enqueues a single
-// FlushAll batch. publish is the only producer and holds subsMu, so after the drain the
-// buffer has room and the FlushAll is delivered.
-func drainAndFlush(ch chan []coherence.Invalidation, gen uint64) {
+// FlushAll batch carrying the superseding position. publish is the only producer and holds
+// subsMu, so after the drain the buffer has room and the FlushAll is delivered.
+func drainAndFlush(ch chan coherence.Batch, gen, pos uint64) {
 	for {
 		select {
 		case <-ch:
 		default:
 			select {
-			case ch <- []coherence.Invalidation{{FlushAll: true, Gen: gen}}:
+			case ch <- coherence.Batch{Pos: pos, Invs: []coherence.Invalidation{{FlushAll: true, Gen: gen}}}:
 			default:
 			}
 			return

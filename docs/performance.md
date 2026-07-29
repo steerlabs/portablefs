@@ -17,22 +17,26 @@ over TCP. That shape fixes what is cheap and what is expensive:
   ~137x local while the version-coherent warm walk (W1) is at local parity: the
   walk is served from client caches with zero round-trips, the storm pays one
   durable round-trip per mutation.
-- Delegation plus write-back makes a single writer near-local. While a mount
-  holds an exclusive subtree delegation (a write-back session), mutations apply
-  to a local overlay at local-disk latency and flush to the authority
-  asynchronously in batches. The same W2 storm drops from ~137x to ~5x local;
-  appends drop from ~750x to ~10x. No coherence is given up: the authority
-  blocks other writers for the duration of the delegation, and the session
-  drains before handoff. `O_APPEND` is retained as intent in that local flush
-  log and resolved at authority EOF when the batch applies; it does not force
-  one write-through RPC per append, so W3 keeps its four-RPC shape.
-- Durable acknowledgement costs a flush round-trip. Write-through pays it
-  inline on every mutation (the authority fsyncs its WAL before acking, so
-  "visible" and "durable" coincide and the durability barrier is free).
-  Write-back defers it: visibility is local-fast and the explicit barrier
-  (fsync with `PORTABLEFS_FSYNC_POLICY=authority`, or session drain) pays the
-  deferred flush. Nothing makes durability free; the knobs only move when it is
-  paid.
+- Adaptive delegation makes a single writer near-local, automatically. Write
+  mode is not a mount property ([writeback-engine.md](./writeback-engine.md)):
+  the authority delegates an uncontended subtree on the first write, after
+  which mutations under it are acknowledged into a local overlay + segmented
+  mount WAL at local-disk latency and one flusher ships them in dense batches.
+  The same W2 storm drops from ~200x to ~0.7x local wall time with ZERO
+  synchronous round-trips (delegated creates need no probe: the grant's
+  children snapshot proves absence locally). No coherence is given up: a peer
+  operation overlapping the delegation waits for recall at the authority and
+  reads the exact acknowledged bytes, never pre-delegation state; contended
+  scopes run write-through and re-delegate once contention clears. `O_APPEND`
+  under a delegation resolves at the locally-authoritative EOF (the grant is
+  exclusive).
+- Durable acknowledgement costs a flush round-trip. Contended (write-through)
+  mutations pay it inline (the authority fsyncs its journal before acking, so
+  "visible" and "durable" coincide). Delegated mutations defer it: visibility
+  is local-fast and the explicit barrier (`fsync`, `synchronize`, unmount —
+  all of which mean durable at the authority in v5, never a local-only
+  outcome) pays the deferred flush. Nothing makes durability free; the engine
+  only moves when it is paid.
 - Multi-writer paths pay for coherence. Reads and opens of shared (undelegated)
   paths revalidate by version against the authority. Open/close tracking for
   cross-mount open-after-unlink semantics (`mark_open` in the op mix) is now
@@ -43,7 +47,7 @@ over TCP. That shape fixes what is cheap and what is expensive:
   last-close unmarks are deferred into batches. Version-gated caching removes
   repeat round-trips (warm walks, repeat ENOENT probes) without a time-based
   staleness window; the negative cache now defaults ON whenever the authority
-  advertises `FeatParentVersion` (the stamp that makes it invalidation-coherent).
+  stamps `ParentVersion` (baseline in v5; the stamp that makes it invalidation-coherent).
 - Conditional xattr updates are one write-through authority mutation.
   `XATTR_CREATE`/`XATTR_REPLACE` do not issue a preceding getxattr, so atomicity
   removes the old TOCTOU race without adding a hot-path round-trip.
@@ -90,14 +94,47 @@ PortableFS, not for it.
 
 ## Results
 
-Two datasets. The committed baseline: full profile, n=3, 2026-07-03 (JSON in
-`vcs/bench/results/*.json`). The op-mix round below: full profile, n=2 (W2
-write-through re-measured at n=3 after an environment outlier), 2026-07-19 —
-after the mark_open reduction and the negative-cache default flip, measured
-with the same harness on the same machine class. Machine: Apple M5 Max
-(darwin/arm64, 18 CPU, 128 GiB RAM), go1.26.2, macOS 26.5. FUSE runs were
-skipped on this host (the harness's kernel-mount transport is Linux FUSE);
-core-transport numbers are the client+protocol cost without kernel dispatch.
+### The adaptive engine (current, 2026-07-28)
+
+Full profile, n=3, core transport, committed as
+`vcs/bench/results/full-adaptive-core.json`. Machine: Apple M5 Max
+(darwin/arm64, 18 CPU, 128 GiB RAM), go1.26.5, macOS 26.5. This is the
+default configuration — no write-mode flag exists.
+
+| workload | phase | p50 | RPCs | top server ops |
+|---|---|---|---|---|
+| W1 | walk_cold | 27.1ms | 500 | readdir:500 |
+| W1 | walk_warm | 1.6ms | 0 | - |
+| W2 | storm_visible | 197.7ms | 0 | flush_batch:10 |
+| W2 | storm_durable | 595.4ms | 0 | flush_batch:70 |
+| W2 | probe_miss | 1.3ms | 0 | - |
+| W3 | append | 81.2ms | 0 | flush_batch:8 |
+| W4 | grep_cold | 40.3s | 20,000 | getattr:10000 mark_open:10000 read:10000 |
+| W4 | grep_warm | 39.8s | 10,000 | mark_open:10000 read:10000 |
+| W5 | write_seq | 940.8ms | 0 | flush_batch:33 |
+| W5 | read_seq_cold | 149.9ms | 257 | read:256 getattr:1 |
+
+Reading it against the local baseline below: the delegated write path now has
+ZERO synchronous RPCs — storm_visible at 197.7ms is ~0.7x LOCAL (the overlay
+acknowledges faster than APFS creates files), probe_miss is answered from the
+delegated children set, and the whole storm ships as ~10 flush batches. The
+same run in debug write-through
+(`vcs/bench/results/full-write-through-core.json`): storm_visible 56.9s
+(15,101 RPCs), append 3.78s — the adaptive engine is ~288x on the storm and
+~47x on appends. Write-through itself is unchanged by the engine integration
+within noise (quick-profile storm 11.69s before / 11.73s after). One honest
+regression, orthogonal to the write path: W4 grep pays a durable
+exact-mutation commit per `mark_open` (~4ms/open — the v5 baseline records
+every mutation identity durably; 39.8s in BOTH modes, engine-independent),
+which predates the engine integration and is the next op-mix target; it does
+not affect delegated writes, reads under a delegation, or any gated phase.
+
+### Historical (pre-adaptive labels, 2026-07-03/19)
+
+The tables below predate the adaptive engine: `writeback` was an opt-in mount
+mode (`-writeback`, retired) and `default` meant write-through. They remain
+the reference for the mark_open reduction narrative and the local baseline.
+Machine: same class, go1.26.2.
 
 ### Op-mix deltas (the 2026-07-19 round's deliverable)
 
@@ -109,7 +146,7 @@ are p50.
 | phase | RPCs before | RPCs after | op-mix change | wall before -> after |
 |---|---|---|---|---|
 | W2 storm_visible (write-through) | 25,101 (mark_open:10,000 create:5,000 getattr:5,000 write:5,000) | 15,101 (create:5,000 getattr:5,000 write:5,000 — mark_open GONE) | −40% RPCs: registration rides the create; unmark retained/batched | 40.0s -> 39.3s (fsync-bound: the removed ops were the cheap ones) |
-| W2 probe_miss (default config) | 6,000 (getattr:6,000, 15x local forever) | 2,000 fill round, 0 steady-state (p50 at n=3: 0 RPCs, 0.9ms) | negative cache now default-on via FeatParentVersion | 127ms -> 53ms (n=2 p50 = fill run; cached runs ~1ms) |
+| W2 probe_miss (default config) | 6,000 (getattr:6,000, 15x local forever) | 2,000 fill round, 0 steady-state (p50 at n=3: 0 RPCs, 0.9ms) | negative cache now default-on (ParentVersion is baseline) | 127ms -> 53ms (n=2 p50 = fill run; cached runs ~1ms) |
 | W4 grep_cold | 40,000 (mark_open:20,000 getattr:10,000 read:10,000) | 30,000 (mark_open:10,000 getattr:10,000 read:10,000) | unmarks gone (retained) | 1.13s -> 0.82s |
 | W4 grep_warm | 30,000 (mark_open:20,000 read:10,000) | 10,000 (read:10,000 — mark_open GONE) | −67% RPCs: retained registrations reused, zero per-open round-trips | 841ms -> 400ms |
 | W3 append | 1,004 | 1,002 | fused create+register | ~par |
@@ -244,7 +281,7 @@ Reading the tables:
 - probe_miss with the negative cache: the p50 run costs zero RPCs (its first,
   fill round is visible in the run list as ~59-103 ms). Without it every
   repeat probe re-round-trips (15x local forever) — which is why the cache is
-  now DEFAULT-ON whenever the authority advertises `FeatParentVersion` (the
+  now DEFAULT-ON (`ParentVersion` is baseline in fsproto v5; the
   2026-07-19 default-label probe_miss shows the flip: 6,000 RPCs -> 0
   steady-state).
 - W4 grep was read-bound and knob-insensitive at 3 RPCs per file (open-time
@@ -318,62 +355,72 @@ opt-in). Design, driven by the measured distribution:
 
 ## Knob reference
 
-Knobs added by the performance stream (defaults preserve prior behavior
-exactly; every one is opt-in unless marked capability-auto):
+The write path has NO knobs: `--fast`, `PORTABLEFS_WRITEBACK`,
+`PORTABLEFS_FLUSH_MS`, `PORTABLEFS_FLUSH_MAX_RECORDS`,
+`PORTABLEFS_FLUSH_MAX_BYTES`, and the fsync policies are retired. The
+authority decides delegation adaptively per scope; batching (128 records /
+8 MiB / 10 ms), the local group-sync cadence (5 ms / 4 MiB), the WAL budget,
+and the retry/backoff schedule are internal constants of the engine
+([writeback-engine.md](./writeback-engine.md)). The one debug override is
+`PORTABLEFS_DEBUG_WRITE_THROUGH=1` (never delegate; the engine still
+recovers parked streams) — a diagnosis tool, not a mode.
 
-| knob | where | default | effect | coherence implication | when to enable |
-|---|---|---|---|---|---|
-| `FlushLimits{MaxRecords, MaxBytes}` via `Manager.SetFlushLimits` / `Session.SetFlushLimits` | `internal/session` (Go API) | zero value = 512 records, unbounded bytes | bounds one write-back `FlushBatch` RPC by record count and payload bytes; a single over-limit record still ships alone (bounded progress, never a stall); applied to the live drain, exclusive drain, and crash-recovery drain | none — pure batching; apply order and exactly-once semantics unchanged | always safe; tune when huge batches must respect an RPC size budget or when smaller batches reduce flush tail latency |
-| `Options.FlushMaxRecords` / `Options.FlushMaxBytes` | `internal/clientcore` (Go API) | 0 / 0 = session defaults | plumbs `FlushLimits` to every session the volume creates | none | same as above |
-| `PORTABLEFS_FLUSH_MAX_RECORDS` | mount env | unset = 512 | mount-level override of records per flush batch (>0 to set) | none | same as above |
-| `PORTABLEFS_FLUSH_MAX_BYTES` | mount env | unset = unbounded | mount-level override of payload bytes per flush batch (>0 to set) | none | same as above |
-| `PORTABLEFS_SESSION_TTL_MS` | mount env | 0 = off | kernel attr/entry time box for paths under a subtree this mount exclusively holds (a write-back delegation); `AttrValidFor` returns the TTL iff a session covers the path and 0 the moment the delegation releases, so shared paths always revalidate per-lookup | while held, the authority blocks peer mutations, so the kernel cache cannot go stale from a peer; residual hazard: an entry granted a TTL moments before a release can outlive the release by up to the TTL if a push invalidation is collapsed or missed (the historical handoff data-loss shape — the reason the default is 0) | single-writer, lookup-heavy workloads where the extra kernel-cache hit rate matters and a short post-handoff staleness window (keep it small, e.g. 100-500 ms) is acceptable; leave 0 for anything doing rapid subtree handoffs (e.g. SQLite journals passed between mounts) |
-| `vcs_fsproto_op_<name>` counters | fsproto server metrics | always on | per-op server counters (25 named ops + `other`, `unmark_open_inodes` included) behind the report's "top server ops" column | none (observability) | n/a |
-
-Companion knobs that predate this stream (the bench labels exercise them;
-listed for context):
+Remaining knobs:
 
 | knob | where | default | effect |
 |---|---|---|---|
-| `PORTABLEFS_WRITEBACK` | mount env | off | delegation-backed write-back sessions: mutations apply to a local overlay + local WAL, flush asynchronously; the authority enforces exclusivity per subtree |
-| `PORTABLEFS_FLUSH_MS` | mount env | 250 | write-back flush interval |
-| `PORTABLEFS_NEGATIVE_CACHE` | mount env | capability-auto | version-gated ENOENT caching: a miss is stored against the parent directory version the authority stamps on the miss response (`ParentVersion`); any create/remove in that directory advances the version and invalidates the negative. Two-client coherence, including the subdirectory, sibling-create, and default-on shapes, is proven in `clientcore` tests (`TestNegativeCacheSubdirTwoClientCoherence`, `TestNegativeCacheSiblingCreateInvalidatesSubdirNegative`, `TestNegativeCacheDefaultsOnAgainstStampingAuthority`). The default is ON iff the authority advertises `FeatParentVersion` in the protocol handshake (an explicit capability bit, never sniffed from response fields) — a pre-`ParentVersion` authority does not advertise it, so the default stays off there. `"1"` forces on (still safe against an old authority: an unstamped miss is never cached, so it degrades to no caching, never to staleness); `"0"` forces off |
-| `PORTABLEFS_OPEN_RETENTION_ENTRIES` | mount env | 65536 | bounds retained open registrations (closed-but-still-registered inodes reused by later opens with zero round-trips; see the mark_open reduction section). `0` disables retention — every last close unmarks, the previous behavior. Only effective against authorities advertising `FeatOpenRegistration` |
-| `PORTABLEFS_FSYNC_POLICY` | mount env | `local` | `authority` makes fsync flush the covering write-back session to the authority (the durability barrier the bench measures) |
+| `PORTABLEFS_NEGATIVE_CACHE` | mount env | on | version-gated ENOENT caching: a miss is stored against the parent directory version the authority stamps on the miss response (`ParentVersion`, baseline in fsproto v5); any create/remove in that directory advances the version and invalidates the negative. Two-client coherence, including the subdirectory, sibling-create, and default-on shapes, is proven in `clientcore` tests (`TestNegativeCacheSubdirTwoClientCoherence`, `TestNegativeCacheSiblingCreateInvalidatesSubdirNegative`, `TestNegativeCacheDefaultsOnAgainstStampingAuthority`). `"0"` forces off |
+| `PORTABLEFS_OPEN_RETENTION_ENTRIES` | mount env | 65536 | bounds retained open registrations (closed-but-still-registered inodes reused by later opens with zero round-trips; see the mark_open reduction section). `0` disables retention — every last close unmarks, the previous behavior |
 | `PORTABLEFS_NO_READDIRPLUS` | mount env | off (readdir-plus on) | kill switch for the readdir-time attr-cache fill; changes RPC count only, never observed attrs |
+| `vcs_fsproto_op_<name>` counters | fsproto server metrics | always on | per-op server counters behind the report's "top server ops" column |
 
-`pfsbench run` exposes the same set as flags for A/B runs: `-writeback`,
-`-negcache`, `-no-readdirplus`, `-flush-ms`, `-flush-max-records`,
-`-flush-max-bytes`, `-session-ttl-ms`, `-pool`.
+`pfsbench run` flags for A/B runs: `-write-through` (debug), `-negcache`,
+`-no-readdirplus`, `-session-ttl-ms`, `-pool`, `-cpuprofile`.
 
 ## Crash durability (pfstorture)
 
-`vcs/bench/cmd/pfstorture` is the kill -9 torture loop: per iteration it starts
-a real authority OS process (`pfsbench serve`, the same workfs + WAL + fsproto
-stack the vcs authority wires into its data plane) on a fresh disk-backed WAL,
-drives a W2-shaped small-file storm plus an append log over write-through
-fsproto, SIGKILLs the authority at a random point (100 ms-3 s, so across
-iterations some kills land mid-storm and some just after the final ack),
-records exactly which operations were acknowledged, restarts the authority on
-the same WAL, and verifies through the same pooled client (which must
-reconnect transparently) that:
+`vcs/bench/cmd/pfstorture` is the kill -9 torture loop, with two campaigns:
+
+- `-mode authority-kill` (default): per iteration it starts a real authority
+  OS process (`pfsbench serve`) on a fresh disk-backed WAL, drives a
+  W2-shaped small-file storm plus an append log over write-through fsproto,
+  SIGKILLs the authority at a random point, records exactly which operations
+  were acknowledged, restarts the authority on the same WAL, and verifies
+  through the same pooled client (which must reconnect transparently).
+- `-mode client-kill`: the authority stays healthy while the write-back
+  MOUNT CLIENT (`pfsbench wbstorm` — a real `clientcore` volume running the
+  adaptive engine with a durable store) is SIGKILLed mid-storm. Kills are
+  timer-triggered on even iterations (covering the setup phase and the
+  point immediately after the last ack, where the flusher still holds an
+  unshipped tail) and ack-count-triggered on odd iterations (squarely
+  mid-ack-phase). A fresh client on the same store (`pfsbench wbrecover`)
+  must automatically discover the parked stream, rebind it, and drain it.
+
+Both campaigns verify, against the (restarted or always-live) authority:
 
 - every acked create resolves and is reachable through its parent directory
   listings (tree consistency, duplicate-entry check included);
 - every acked full-file write reads back with the exact content hash;
 - a file whose create acked but whose write was in flight is empty or
-  complete, never torn;
+  complete, never torn — and nothing is duplicated;
 - the append log's acked prefix hashes exactly, with at most one in-flight
   chunk beyond it.
 
 Any violation exits non-zero with the iteration's seed, so a durability bug is
-a one-command repro (`-seed <failing> -k 1`).
+a one-command repro (`-seed <failing> -k 1 -mode <mode>`).
 
-Result on this machine (committed as `vcs/bench/results/torture-k10.json`):
-10/10 iterations passed. Kill points ranged 166 ms-2,882 ms; per iteration
-15-180 acked creates, 14-179 acked writes (114 KB-1.6 MB), 2-35 acked append
-chunks — every acked byte present and hash-correct after restart. No
-durability violation found.
+Results on this machine (committed as
+`vcs/bench/results/torture-authority-kill-k5.json` and
+`torture-client-kill-k5.json`, 2026-07-28): 5/5 iterations passed in each
+mode (client-kill additionally re-run at two more seed bases, 15/15 total).
+Client-kill iterations acknowledged 15-245 creates/writes before the kill —
+one iteration was killed between a create's ack and its write's ack, and one
+mid-setup kill exercised the grant-orphaned-before-DELEGATION-frame window
+(recovery must sweep the authority-journaled grant of a provably empty
+stream; `TestRecoverySweepsGrantOrphanedBeforeDelegationFrame` pins it).
+Every acknowledged byte was present and hash-correct on the authority after
+automatic recovery, with no duplication. The historical write-through-era
+`torture-k10.json` (10/10) is retained.
 
 ## Running locally
 
@@ -386,14 +433,15 @@ cd vcs
 # CI-sized:
 PROFILE=quick N=2 ./bench/run.sh
 
-# One config directly:
+# One config directly (the default IS the adaptive engine):
 go build -o /tmp/pfsbench ./bench/cmd/pfsbench
-/tmp/pfsbench run -transport core -profile quick -n 2 -writeback -negcache -out /tmp/r.json
+/tmp/pfsbench run -transport core -profile quick -n 2 -out /tmp/r.json
 /tmp/pfsbench report -dir /tmp
 
-# Torture loop (kill -9 crash durability), ~15 s for K=10:
+# Torture loops (kill -9 crash durability), ~15 s for K=10:
 go build -o /tmp/pfstorture ./bench/cmd/pfstorture
 /tmp/pfstorture -serve-bin /tmp/pfsbench -k 10 -seed 42
+/tmp/pfstorture -serve-bin /tmp/pfsbench -mode client-kill -k 10 -seed 42
 ```
 
 ## CI

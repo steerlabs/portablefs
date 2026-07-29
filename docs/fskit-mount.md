@@ -4,9 +4,11 @@
 The CLI drives the same `portablefsd` + FSKit extension pair the PortableFS
 menu-bar app uses. There is deliberately no fallback transport: a Mac that
 cannot serve an FSKit mount fails with install guidance instead of degrading
-to a weaker consistency model, so a mounted path always means the full
-contract — push invalidation, authority-ordered read-after-write, real POSIX
-modes and symlinks.
+to the retired fallback transport. A mounted path gets authority-ordered
+operations, real POSIX modes and symlinks, and the durability contract below.
+On macOS 26, FSKit does not expose a kernel-cache invalidation primitive;
+cross-machine cache visibility is therefore a documented framework boundary,
+not an exact guarantee.
 
 `--strategy auto` (the default) resolves to `fskit` on macOS and `fuse` on
 Linux; an explicit `--strategy fskit` requires darwin, and an explicit
@@ -160,17 +162,23 @@ Forks that build under their own Apple team id change the group id in
 `AppPaths.swift`, the extension Info.plist/entitlements, and the CLI's
 `fskitAppGroup` constant together.
 
-## Performance Knobs
+## Write Path
 
-`--fast` maps onto the daemon's attach options exactly as it maps onto the
-Linux FUSE mount: write-back (mutations batch locally and flush every 250 ms)
-with the fsync-to-authority policy, so `fsync` remains a real durability
-barrier — git commits and SQLite transactions are durable at the authority
-when fsync returns — while other writes have a bounded ~250 ms window. The
-default (no `--fast`) is full write-through: every acknowledged write is
-already durable. The documented `PORTABLEFS_WRITEBACK` / `PORTABLEFS_FLUSH_MS`
-/ `PORTABLEFS_NEGATIVE_CACHE` / `PORTABLEFS_FSYNC_POLICY` environment knobs
-([performance.md](./performance.md)) travel to the daemon the same way.
+There is no write-mode knob (`--fast` is retired and fails with a pointer at
+this model). Every FSKit mount runs the adaptive write-back engine
+([writeback-engine.md](./writeback-engine.md)): the authority delegates a
+subtree on the first uncontended write, after which mutations under it are
+acknowledged locally (durable in the mount's stream WAL) and one flusher
+ships them in batches; contended scopes run write-through and re-delegate
+once contention clears. `fsync`, FSKit `synchronize`, and clean unmount are
+always authority-durability barriers — git commits and SQLite transactions
+are durable at the authority when they return — while other writes have a
+bounded (~flush batching) window, the same contract as a local page cache. A
+SIGKILLed daemon's acknowledged tail parks durably and replays on the next
+attach; `portablefs mounts` and attach status surface the parked jobs. The
+only remaining environment knob is `PORTABLEFS_NEGATIVE_CACHE`
+([performance.md](./performance.md)); it travels to the daemon as an attach
+option.
 
 ## Machine-Local Dirs
 
@@ -263,11 +271,10 @@ and concurrent appends from two machines to one shared file collapsed into
 whole-file last-writer-wins uploads — precisely the shapes agent workspaces
 hit (tailing a log another machine appends to, two mounts sharing state
 files). A mount that sometimes has those semantics is worse than a mount
-error that says how to get the real ones. One transport per platform keeps
-namespace and ordinary read/write coherence uniform: every mounted path gets
-push invalidation and authority-ordered mutation application, or the mount
-fails with instructions. One framework boundary remains explicit: current
-FSKit write callbacks do not expose `O_APPEND` intent, so cross-machine atomic
-append cannot be inferred without misclassifying legitimate positional
-writes. See
+error that says how to get the real one. One transport per platform keeps
+authority ordering uniform without pretending the macOS 26 SDK can evict
+kernel pages: daemon-side invalidations are advisory until FSKit exposes that
+hook. A second framework boundary remains explicit: current FSKit write
+callbacks do not expose `O_APPEND` intent, so cross-machine atomic append
+cannot be inferred without misclassifying legitimate positional writes. See
 [`consistency-model.md`](./consistency-model.md#concurrent-appends).

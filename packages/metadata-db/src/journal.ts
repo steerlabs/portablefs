@@ -52,8 +52,7 @@ export function journalRecordHash(payload: Buffer): string {
 // separately at 1 MiB by the Go admission layer; the values here are the
 // storage-facing bounds.
 export const journalLimits = {
-  // One record payload — a whole logical intent (one PFR1 record including a
-  // whole OpBatch, or one whole PFJ3 entry).
+  // One record payload — a whole logical intent (one whole PFJ3 entry).
   maxRecordPayloadBytes: 8 * 1024 * 1024,
   // One append group (one journal commit transaction).
   maxGroupRecords: 128,
@@ -63,23 +62,23 @@ export const journalLimits = {
   maxPageBytes: 16 * 1024 * 1024,
 } as const;
 
-// The immutable journal codec pairs (migration 012). A generation declares
-// exactly one pair at creation and can never switch in place: moving a
-// writable branch onto PFJ3/PFC2 is an exceptional retire + new-generation
-// migration. PFJ3 rows are whole journal entries: optionally one canonical
-// PFR1 tree intent plus 0..128 ordered canonical PFC2 controls, hashed,
-// chained, receipted, and replayed as their exact complete bytes.
+// The immutable journal codec pair (migration 012). A generation declares
+// exactly one pair at creation and can never switch in place. pfj3/pfc2 is
+// the ONLY supported pair: the pre-012 pfr1/pfc1 era is retired, and a
+// deployment still carrying such a generation row is refused at volume-api
+// startup (countPreJournalV3Generations) rather than served. PFJ3 rows are
+// whole journal entries: optionally one canonical tree intent plus 0..128
+// ordered canonical PFC2 controls, hashed, chained, receipted, and replayed
+// as their exact complete bytes.
 export const journalCodecPairs = [
-  { recordCodec: "pfr1", controlCodec: "pfc1" },
   { recordCodec: "pfj3", controlCodec: "pfc2" },
 ] as const;
 
 export type JournalRecordCodec = (typeof journalCodecPairs)[number]["recordCodec"];
 export type JournalControlCodec = (typeof journalCodecPairs)[number]["controlCodec"];
 
-// Frozen 4-byte payload magics (part of the canonical hashed bytes).
+// Frozen 4-byte payload magic (part of the canonical hashed bytes).
 export const journalPayloadMagics = {
-  pfr1: Buffer.from("PFR1", "ascii"),
   pfj3: Buffer.from("PFJ3", "ascii"),
 } as const;
 
@@ -91,13 +90,8 @@ export const pfj3Limits = {
 } as const;
 
 export function journalPayloadCodec(payload: Buffer): JournalRecordCodec | null {
-  if (payload.byteLength >= 4) {
-    if (payload.subarray(0, 4).equals(journalPayloadMagics.pfr1)) {
-      return "pfr1";
-    }
-    if (payload.subarray(0, 4).equals(journalPayloadMagics.pfj3)) {
-      return "pfj3";
-    }
+  if (payload.byteLength >= 4 && payload.subarray(0, 4).equals(journalPayloadMagics.pfj3)) {
+    return "pfj3";
   }
   return null;
 }

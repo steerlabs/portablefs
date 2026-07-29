@@ -292,8 +292,11 @@ export interface ServingBaseProofCommon {
   generationId: string;
   baseSeq: string;
   baseDigest: string;
-  recordCodec: "pfr1" | "pfj3";
-  controlCodec: "pfc1" | "pfc2";
+  // pfj3/pfc2 is the only served codec pair: the retired pfr1/pfc1 era is
+  // refused at volume-api startup (countPreJournalV3Generations), so no
+  // provable generation tuple can carry it.
+  recordCodec: "pfj3";
+  controlCodec: "pfc2";
 }
 
 export interface ManifestServingBaseProof extends ServingBaseProofCommon {
@@ -338,8 +341,8 @@ export interface ServingBaseProofInput {
   generationId: string;
   baseSeq: string;
   baseDigest: string;
-  recordCodec: "pfr1" | "pfj3";
-  controlCodec: "pfc1" | "pfc2";
+  recordCodec: "pfj3";
+  controlCodec: "pfc2";
 }
 
 export function sha256HexOf(canonicalJson: string): string {
@@ -453,6 +456,28 @@ export class PostgresHistoryRepository {
       ]
     );
     return firstRowJson<HistoryCutStatus>(rows, "out")!;
+  }
+
+  /**
+   * Named-snapshot deletion (migration 028): clears the label (and
+   * releases any snapshot consumers) of the named READY cuts of one
+   * volume, so they age out of the retention window (named + newest-K +
+   * pinned) and the ordinary GC sweep collects their objects. Refuses
+   * typed (PF007) when the volume has no ready snapshot of that name.
+   */
+  async releaseSnapshotCut(input: {
+    tenantId: string;
+    volumeId: string;
+    name: string;
+  }): Promise<{ cutIds: string[]; snapshotConsumersReleased: string }> {
+    const { rows } = await this.pool.query(
+      `SELECT pfh.snapshot_cut_release($1,$2,$3) AS out`,
+      [input.tenantId, input.volumeId, input.name]
+    );
+    return firstRowJson<{ cutIds: string[]; snapshotConsumersReleased: string }>(
+      rows,
+      "out"
+    )!;
   }
 
   async cutStatus(tenantId: string, cutId: string): Promise<HistoryCutStatus | null> {

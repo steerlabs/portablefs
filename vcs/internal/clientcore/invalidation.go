@@ -11,8 +11,10 @@ import (
 )
 
 // InvalidationSubscriber is the fsproto subscription surface used by the shared invalidation loop.
+// The AckFunc reports processed batch positions back to the authority (may be
+// nil for sources without barrier-ack semantics).
 type InvalidationSubscriber interface {
-	Subscribe() (<-chan []coherence.Invalidation, error)
+	Subscribe() (<-chan coherence.Batch, fsproto.AckFunc, error)
 }
 
 // InvalidationHandler is implemented by frontends to translate shared cache-coherence events into
@@ -77,7 +79,7 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 			return
 		default:
 		}
-		stream, err := sub.Subscribe()
+		stream, ack, err := sub.Subscribe()
 		if err != nil {
 			opts.resubscribeWait(ctx, retry.Next())
 			continue
@@ -88,7 +90,7 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 		attrs.Clear()
 		versions.Reset()
 		for batch := range stream {
-			for _, inv := range batch {
+			for _, inv := range batch.Invs {
 				if inv.Gen != 0 && !versions.SeenGen(inv.Gen) {
 					versions.RefreshAll(inv.Gen)
 					h.FlushAll()
@@ -130,6 +132,12 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 						related.InvalidateRelatedInodes(inv.RelatedInos, inv.Path)
 					}
 				}
+			}
+			// Acknowledge AFTER the batch is fully applied to every cache:
+			// the authority's barriers treat this position as "this peer's
+			// subsequent reads cannot serve pre-batch state".
+			if ack != nil && (batch.Pos != 0 || batch.Bootstrap) {
+				ack(batch.Pos)
 			}
 		}
 		h.FlushAll()

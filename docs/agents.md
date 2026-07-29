@@ -24,8 +24,10 @@ portablefs create refactor-auth
 portablefs mount refactor-auth ~/work
 cd ~/work && git clone git@github.com:acme/api . && claude
 
-# laptop lid closes mid-run. Nothing is lost: every acked write is already
-# durable in the journal, and history cuts capture progress continuously.
+# laptop lid closes mid-run. Nothing is lost: every acked write is durable
+# (at the authority, or in the mount's crash-safe write-back log with the
+# flusher shipping it within milliseconds), and history cuts capture
+# progress continuously.
 
 # day 1, later, a server: pick up mid-run
 portablefs mount refactor-auth /srv/work
@@ -34,15 +36,26 @@ cd /srv/work    # same files, same git state, same half-finished edit
 
 Two things make this safe rather than merely convenient:
 
-- **Durability is at ack time, not at sync time.** There is no "did it upload?"
-  window. If a write returned, it is in the WAL (replicated before ack in
-  production) and will reach committed history.
-- **There is no handover, because there is no second truth.** Both mounts are
-  windows onto the same live authority; the server was already seeing the laptop's
-  writes as they happened. The fenced write lease lives with that one authority,
-  not with any mount, so machines can come and go freely — the lease only matters
-  for preventing a second authority or a direct API writer from splitting the
-  brain.
+- **Durability is at ack time, not at sync time.** There is no "did it
+  upload?" window. A contended write is durable at the authority when it
+  returns. A write under a delegation (the adaptive write-back engine —
+  [writeback-engine.md](./writeback-engine.md)) is durable in the mount's
+  local stream WAL when it returns and ships to the authority within
+  milliseconds; if the machine dies first, the acknowledged tail parks
+  durably and replays automatically on the next attach from that machine —
+  never silently dropped. `fsync` and clean unmount always mean durable at
+  the authority, so `git commit` and SQLite transactions are
+  machine-independent the moment they return.
+- **There is no stale handover, because there is no second truth.** Both
+  mounts are windows onto the same live authority. A peer that reads a
+  subtree another mount holds delegated waits for the holder to drain
+  (milliseconds when the holder is alive) and then sees the exact
+  acknowledged bytes — never a stale snapshot. If the holder vanished with
+  an unshipped tail, peers get a retryable error rather than silently old
+  data until the tail recovers (or an operator explicitly discards it as
+  data loss). The practical habit: end an agent run with `fsync`/unmount
+  (or any barrier) before abandoning the machine, and the whole workspace
+  is authority-durable.
 
 For scheduled or resumable agents, make the mount the first step of the job and the
 unmount the last; the workspace carries all state between runs, including
@@ -184,11 +197,11 @@ volume free of per-machine state from the start.
 ## Sandbox Integration
 
 Any Linux sandbox that can run a static binary can mount a workspace — see
-"Quickstart B" in the [README](../README.md). The sequence is: mint a mount session
-(endpoint + scoped token) from the authority manager, copy the `portablefs-mount`
-static binary (or the `portablefs` CLI) into the sandbox, mount, run the agent.
-Sandboxes never hold long-lived credentials: session tokens are scoped to one
-authority instance and expire.
+"Quickstart B" in the [README](../README.md). The sequence is: mint an access
+lease (endpoint + scoped token) from the authority manager, copy the static
+`portablefs` CLI into the sandbox, mount, run the agent. Sandboxes never hold
+long-lived credentials: access tokens are scoped to one authority instance
+and expire.
 
 Sandboxes that cannot mount at all need a different isolated runner with a
 supported mount boundary; PortableFS deliberately does not fall back to running

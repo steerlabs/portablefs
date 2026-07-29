@@ -17,7 +17,7 @@ go test -race ./internal/confinedfs ./internal/localdirs -count=1
 go test -race ./internal/portablefsd \
   -run '^(TestRefreshKernelFile|TestRefreshSample)' -count=3
 go test ./internal/portablefsd -count=1
-go test ./cmd/portablefs/internal/cli ./cmd/mount -count=1
+go test ./cmd/portablefs/internal/cli -count=1
 ```
 
 On macOS, the targeted `portablefsd` suite also attacks the live-vnode

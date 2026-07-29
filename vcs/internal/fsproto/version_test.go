@@ -1,15 +1,25 @@
 package fsproto
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // TestReadStampsVersionAndGen: a read-family response carries the path's coherence
 // Version and the authority Gen, so a client can do generation-aware, monotonic fills.
 func TestReadStampsVersionAndGen(t *testing.T) {
-	s, deleg := newEnforceServer(t)
-	deleg.Checkout("d", "M")
-	s.dispatch(&Request{Op: OpMkdir, Path: "d", Mode: 0o755, Owner: "M"})
-	s.dispatch(&Request{Op: OpCreate, Path: "d/a", Mode: 0o644, Owner: "M"})
-	s.dispatch(&Request{Op: OpWrite, Path: "d/a", Data: []byte("hello"), Owner: "M"})
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
+	s := NewServer(fs, fs)
+	cs := openExactSession(t, s, "sess-VG", 1, "M", "tokVG", 8)
+	if r := exactDo(s, cs, &Request{Op: OpMkdir, Path: "d", Mode: 0o755}, 0, 1); r.Status != OK {
+		t.Fatalf("mkdir: %+v", r)
+	}
+	if r := exactDo(s, cs, &Request{Op: OpCreate, Path: "d/a", Mode: 0o644}, 0, 2); r.Status != OK {
+		t.Fatalf("create: %+v", r)
+	}
+	if r := exactDo(s, cs, &Request{Op: OpWrite, Path: "d/a", Data: []byte("hello")}, 0, 3); r.Status != OK {
+		t.Fatalf("write: %+v", r)
+	}
 
 	g := s.dispatch(&Request{Op: OpGetattr, Path: "d/a"})
 	if g.Status != OK || g.Version == 0 || g.Gen == 0 {
@@ -22,16 +32,21 @@ func TestReadStampsVersionAndGen(t *testing.T) {
 }
 
 func TestGetattrMissCarriesParentVersion(t *testing.T) {
-	s, deleg := newEnforceServer(t)
-	deleg.Checkout("d", "M")
-	s.dispatch(&Request{Op: OpMkdir, Path: "d", Mode: 0o755, Owner: "M"})
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
+	s := NewServer(fs, fs)
+	cs := openExactSession(t, s, "sess-PV", 1, "M", "tokPV", 8)
+	if r := exactDo(s, cs, &Request{Op: OpMkdir, Path: "d", Mode: 0o755}, 0, 1); r.Status != OK {
+		t.Fatalf("mkdir: %+v", r)
+	}
 
 	miss := s.dispatch(&Request{Op: OpGetattr, Path: "d/.DS_Store"})
 	if miss.Status != ENOENT || miss.Gen == 0 || miss.ParentVersion == 0 {
 		t.Fatalf("miss must carry gen and parent version: %+v", miss)
 	}
 	before := miss.ParentVersion
-	s.dispatch(&Request{Op: OpCreate, Path: "d/file", Mode: 0o644, Owner: "M"})
+	if r := exactDo(s, cs, &Request{Op: OpCreate, Path: "d/file", Mode: 0o644}, 0, 2); r.Status != OK {
+		t.Fatalf("create: %+v", r)
+	}
 	miss = s.dispatch(&Request{Op: OpGetattr, Path: "d/.DS_Store"})
 	if miss.Status != ENOENT || miss.ParentVersion <= before {
 		t.Fatalf("parent version should advance after child create: before=%d after=%+v", before, miss)

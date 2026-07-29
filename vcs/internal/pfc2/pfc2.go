@@ -234,11 +234,25 @@ const (
 	// CheckoutForceTransfer atomically removes every overlapping grant and
 	// installs the new one. It carries the digest of the conflict set that was
 	// originally recalled, so a timeout against holder A can never revoke a
-	// fresh holder C.
+	// fresh holder C. Delegation grants (WritebackID set) are never force
+	// transferred: their holder may have unshipped acknowledged state.
 	CheckoutForceTransfer CheckoutOp = 3
+	// CheckoutRebind binds a recovery-required delegation grant to a fresh
+	// session generation after the authority verified the claiming stream's
+	// identity, watermark, and digest. It carries no exact key (the identity
+	// rides a sibling ExactOutcome record in the same atomic batch); the new
+	// holder is named explicitly.
+	CheckoutRebind CheckoutOp = 4
+	// CheckoutDiscard releases a recovery-required delegation grant as an
+	// audited data-loss decision (`portablefs recover discard`). No exact
+	// key, same batching discipline as CheckoutRebind.
+	CheckoutDiscard CheckoutOp = 5
 )
 
-func (op CheckoutOp) valid() bool { return op >= CheckoutGrant && op <= CheckoutForceTransfer }
+func (op CheckoutOp) valid() bool { return op >= CheckoutGrant && op <= CheckoutDiscard }
+
+// keyed reports whether the op consumes its own exact identity.
+func (op CheckoutOp) keyed() bool { return op <= CheckoutForceTransfer }
 
 // SessionRef names one exact session generation.
 type SessionRef struct {
@@ -390,18 +404,24 @@ type OutcomeFloor struct {
 	Through uint64
 }
 
-// FlushAdvance (kind 6) advances one write-back flush ledger watermark:
-// (session, writebackID, checkoutPath, checkoutEpoch) -> throughSequence,
-// strictly monotonic per identity. It rides the SAME atomic outer batch as
-// the flushed user PFR1 records. The named checkout epoch must be the live
-// grant held by the same session: a delayed flush after release/transfer is
-// ESTALE even if the path later becomes free.
+// FlushAdvance (kind 6) advances one mount write-back stream's durable
+// watermark: writebackID -> (throughSequence, streamDigest), strictly
+// monotonic per stream and surviving session-generation rebinds. It rides
+// the SAME atomic outer batch as the flushed user PFR1 records. The named
+// checkout (path, epoch) is the live delegation grant covering the flushed
+// record — held by the same session and bound to the same stream — so a
+// delayed flush after release/transfer is ESTALE even if the path later
+// becomes free.
 type FlushAdvance struct {
 	Session       SessionRef
 	WritebackID   string
 	CheckoutPath  string
 	CheckoutEpoch Epoch
 	Through       uint64
+	// Digest is the chained mutation-stream digest at Through. The client
+	// maintains the identical chain over its WAL; recovery rebinds only on
+	// an exact match.
+	Digest [DigestBytes]byte
 }
 
 // LockChange (kind 7) applies one granted POSIX byte-range transition keyed
@@ -419,10 +439,12 @@ type LockChange struct {
 	Length          uint64
 }
 
-// CheckoutChange (kind 8) grants, releases, or force-transfers one
-// canonical-path checkout. Grants receive the server-controlled next decimal
-// epoch; release must name its grant's exact epoch. It carries its exact
-// request key and outcome; rejections are ExactOutcome records.
+// CheckoutChange (kind 8) grants, releases, force-transfers, rebinds, or
+// discards one canonical-path checkout. Grants receive the server-controlled
+// next decimal epoch; release must name its grant's exact epoch. Grant,
+// release, and force transfer carry their exact request key and outcome
+// (rejections are ExactOutcome records); rebind and discard carry no key —
+// their identity rides a sibling ExactOutcome in the same atomic batch.
 type CheckoutChange struct {
 	Key     ExactKey
 	Outcome Outcome // must be the zero (success) outcome
@@ -432,6 +454,14 @@ type CheckoutChange struct {
 	// RecalledDigest is present exactly for CheckoutForceTransfer: the digest
 	// of the overlapping conflict set originally recalled (RecallDigest).
 	RecalledDigest [DigestBytes]byte
+	// WritebackID binds a delegation grant to its mount write-back stream.
+	// A grant carrying one survives holder death as a recovery-required
+	// scope instead of releasing (it may cover unshipped acknowledged
+	// state); rebind and discard must name it exactly.
+	WritebackID string
+	// NewHolder is the session a CheckoutRebind binds the scope to (the op
+	// carries no exact key, so the holder is explicit).
+	NewHolder SessionRef
 }
 
 // OpenPinChange (kind 9) acquires or releases the one durable open pin per
@@ -713,6 +743,9 @@ func (r *Record) Validate() error {
 		if f.Through == 0 {
 			return malformedf("flush advance: through must be nonzero")
 		}
+		if f.Digest == ([DigestBytes]byte{}) {
+			return malformedf("flush advance: all-zero stream digest is never a canonical chain value")
+		}
 	case KindLockChange:
 		l := r.LockChange
 		if l == nil {
@@ -741,20 +774,45 @@ func (r *Record) Validate() error {
 		if c == nil {
 			return malformedf("kind %v without its union arm", r.Kind)
 		}
-		if err := validateExactKey("checkout change", &c.Key); err != nil {
-			return err
+		if !c.Op.valid() {
+			return malformedf("checkout change: unknown op %d", c.Op)
+		}
+		if c.Op.keyed() {
+			if err := validateExactKey("checkout change", &c.Key); err != nil {
+				return err
+			}
+			if c.NewHolder != (SessionRef{}) {
+				return malformedf("checkout change: explicit new holder is only valid for rebind")
+			}
+		} else {
+			if c.Key != (ExactKey{}) {
+				return malformedf("checkout change: rebind/discard carry no exact key (the identity rides a sibling ExactOutcome)")
+			}
+			if !restrictedName(c.WritebackID, MaxWritebackIDBytes) {
+				return malformedf("checkout change: rebind/discard require the stream's writeback id")
+			}
+			if c.Op == CheckoutRebind {
+				if err := validateSessionRef("checkout rebind new holder", c.NewHolder); err != nil {
+					return err
+				}
+			} else if c.NewHolder != (SessionRef{}) {
+				return malformedf("checkout change: discard names no new holder")
+			}
 		}
 		if !c.Outcome.IsZero() {
 			return malformedf("checkout change: outcome must be the zero success outcome (rejections are ExactOutcome records)")
-		}
-		if !c.Op.valid() {
-			return malformedf("checkout change: unknown op %d", c.Op)
 		}
 		if err := ValidateCanonicalPath(c.Path); err != nil {
 			return fmt.Errorf("checkout change: %w", err)
 		}
 		if err := c.Epoch.Validate(); err != nil {
 			return fmt.Errorf("checkout change: %w", err)
+		}
+		if c.WritebackID != "" && !restrictedName(c.WritebackID, MaxWritebackIDBytes) {
+			return malformedf("checkout change: malformed writeback id")
+		}
+		if c.WritebackID != "" && (c.Op == CheckoutRelease || c.Op == CheckoutForceTransfer) {
+			return malformedf("checkout change: release/transfer never carry a writeback id (the grant's binding is durable state)")
 		}
 		// The recalled digest exists exactly for force transfer: presence is
 		// op-kind-based (the wire field is emitted iff transferring). When
@@ -768,8 +826,10 @@ func (r *Record) Validate() error {
 		} else if c.RecalledDigest != ([DigestBytes]byte{}) {
 			return malformedf("checkout change: recalled digest is only valid for force transfer")
 		}
-		if want := c.RequestHash(); c.Key.RequestHash != want {
-			return malformedf("checkout change: request hash does not fingerprint the checkout request")
+		if c.Op.keyed() {
+			if want := c.RequestHash(); c.Key.RequestHash != want {
+				return malformedf("checkout change: request hash does not fingerprint the checkout request")
+			}
 		}
 	case KindOpenPinChange:
 		p := r.OpenPinChange

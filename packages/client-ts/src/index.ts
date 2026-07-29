@@ -10,7 +10,6 @@ import {
   createVolumeResponseSchema,
   delegationsResponseSchema,
   detachResponseSchema,
-  execResponseSchema,
   forkResponseSchema,
   grepResponseSchema,
   listBranchesResponseSchema,
@@ -41,8 +40,6 @@ import {
   type CreateVolumeResponse,
   type DelegationsResponse,
   type DetachResponse,
-  type ExecRequest,
-  type ExecResponse,
   type ForkRequest,
   type ForkResponse,
   type GrepRequest,
@@ -66,6 +63,17 @@ export interface VolumeClientOptions {
   baseUrl: string;
   token?: string;
   fetchImpl?: typeof fetch;
+}
+
+/**
+ * The named-snapshot release facts (`DELETE .../snapshots/:name`): the READY
+ * cut ids whose label was cleared and how many snapshot consumers were
+ * released with them. No protocol schema exists for this journal-era route;
+ * the shape is validated structurally like `getManifest`.
+ */
+export interface DeleteSnapshotResponse {
+  cutIds: string[];
+  snapshotConsumersReleased: string;
 }
 
 export class VolumeClientError extends Error {
@@ -382,6 +390,17 @@ export class VolumeClient {
     );
   }
 
+  async deleteSnapshot(volumeId: string, name: string): Promise<DeleteSnapshotResponse> {
+    const response = (await this.requestJson(
+      "DELETE",
+      `/v1/volumes/${encodeURIComponent(volumeId)}/snapshots/${encodeURIComponent(name)}`
+    )) as { released?: DeleteSnapshotResponse };
+    if (!response?.released || !Array.isArray(response.released.cutIds)) {
+      throw new VolumeClientError(502, "VOLUME_PROTOCOL_ERROR", "Snapshot release response was empty.");
+    }
+    return response.released;
+  }
+
   async createBranch(
     volumeId: string,
     input: CreateBranchRequest
@@ -409,16 +428,6 @@ export class VolumeClient {
       await this.requestJson(
         "GET",
         `/v1/volumes/${encodeURIComponent(volumeId)}/delegations?branch=${encodeURIComponent(branch)}&includeReleased=${includeReleased ? "true" : "false"}`
-      )
-    );
-  }
-
-  async exec(volumeId: string, input: ExecRequest): Promise<ExecResponse> {
-    return execResponseSchema.parse(
-      await this.requestJson(
-        "POST",
-        `/v1/volumes/${encodeURIComponent(volumeId)}/exec`,
-        input
       )
     );
   }

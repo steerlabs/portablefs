@@ -1,18 +1,17 @@
 // Package fsproto is the custom filesystem protocol between a FUSE client (on the
 // agent's machine) and the VCS (the authority/cache node). The VCS serves its
 // billy.Filesystem over this protocol; the FUSE client translates kernel ops into
-// requests. Unlike the in-kernel NFSv3 client, a FUSE client controls its own
-// caching, so a thin client gets live, read-after-write coherence across machines
-// (every read reaches the single authority) rather than NFSv3 close-to-open.
+// requests. The FUSE client controls its own caching, so a thin client gets
+// live, read-after-write coherence across machines (every read reaches the
+// single authority) rather than close-to-open approximations.
 //
-// Wire format: a gob stream per direction on a persistent TCP connection — the
-// client encodes Requests and decodes Responses; the server does the reverse.
-// gob sends each type descriptor once per stream, so steady-state framing is just
-// the field bytes.
+// Wire format: requests use allocation-safe, aggregate-size-framed PFRQ1 on
+// the client→server half of a persistent TCP connection. Responses remain a
+// gob stream on the independent server→client half. Subscribe acknowledgments
+// are requests and therefore use PFRQ1 too.
 package fsproto
 
 import (
-	"context"
 	"errors"
 	"os"
 	"strings"
@@ -52,96 +51,45 @@ const (
 	OpMarkOpen          // register/deregister that this mount holds Ino open (Stage 2 authority open-state)
 	OpRenewOpenInodes   // renew leases for the open (still-named) inos this mount holds open
 
-	// ---- protocol version 3 (exact mount sessions). Values are APPENDED so
-	// every earlier op keeps its wire value; an old server answers any of
-	// these with EINVAL via its dispatch default, and a new client never
-	// sends them to a server whose negotiated version is below
-	// ProtoVersionExactSessions (see protoversion.go).
+	// ---- exact mount sessions. Sessions, journaled coordination, and the
+	// exact-once mutation envelope are MANDATORY in the v6 baseline: every
+	// mutation carries Request.Env, and the session ops below are the only
+	// way to acquire one.
 	OpSessionOpen   // establish (or idempotently re-establish) a mount session identity
 	OpSessionResume // authenticate + durably renew an existing session (reconnect / periodic lease renewal)
 	OpSessionAttach // authenticate an existing session onto THIS connection (no durable renewal)
 	OpSessionExpire // voluntarily fence THIS session generation (clean unmount); its lease-owned state is released
-	OpReclaimDone   // the resumed session finished re-asserting its coordination state (ends its reclaim-grace share early)
 
-	// ---- open-registration batching (FeatOpenRegistration). Appended so every
-	// earlier op keeps its wire value; a client only sends it to an authority
-	// that advertises the feature bit, so an old server never sees it.
+	// ---- open-registration batching (mandatory in v6).
 	OpUnmarkOpenInodes // clear this mount's open holds for a batch of inos (deferred/batched last-close unmarks)
 
-	// ---- extended attributes (FeatXattrs). Appended so every earlier op
-	// keeps its wire value; a client only sends them to an authority that
-	// advertises the feature bit (an old server's dispatch default would
-	// answer EINVAL, and the client maps a missing bit to EOPNOTSUPP without
-	// a round-trip). Reads (get/list) are pure reads; set/remove are
-	// journaled mutations that ride the exact-once path on session
-	// authorities exactly like OpCreate/OpWrite.
+	// ---- extended attributes (mandatory in v6). Reads (get/list) are pure
+	// reads; set/remove are journaled mutations that ride the exact-once
+	// path exactly like OpCreate/OpWrite.
 	OpGetxattr    // read one attribute value (Path/HandleIno + XattrName)
 	OpSetxattr    // set one attribute (XattrName + Data; optional XattrFlags)
 	OpListxattr   // list attribute names (Path/HandleIno)
 	OpRemovexattr // remove one attribute (ENODATA when absent)
 
-	// ---- hard links (FeatHardLinks). Appended so every earlier op keeps
-	// its wire value. Path is the existing source name and NewPath is the
-	// new directory entry. Clients send it only after capability
-	// negotiation; older authorities therefore never see the unknown op.
+	// ---- hard links (mandatory in v6). Path is the existing source name
+	// and NewPath is the new directory entry.
 	OpLink
-)
 
-// Feature bits advertised in the OpProtocolVersion probe response. Zero from
-// any server that predates them (gob omits the absent field).
-const (
-	// FeatExactSessions: the authority durably supports session establish/
-	// resume/attach and exact-once mutation envelopes.
-	FeatExactSessions uint64 = 1 << 0
-	// FeatReclaimGrace: after restart/promotion the authority runs an
-	// authenticated reclaim-grace window for durable prior sessions. Never
-	// advertised by a managed (journaled) authority: its recovery is exact,
-	// so there is no re-assert phase to grant.
-	FeatReclaimGrace uint64 = 1 << 1
-	// FeatJournaledCoordination: the authority's session store journals
-	// through a fenced remote journal generation. Coordination state (exact
-	// sessions, outcomes, locks, checkouts) recovers from cold replay with
-	// no reclaim grace and no wall-time outcome pruning, and the probe
-	// advertises ProtoVersionJournaledSessions.
-	FeatJournaledCoordination uint64 = 1 << 2
-	// FeatParentVersion: the authority stamps every lookup miss with the
-	// parent directory's coherence version (Response.ParentVersion) and bumps
-	// that version on every name mutation in the directory, so a client may
-	// default the version-gated negative dentry cache ON. Advertised iff the
-	// backing fs implements ParentVersioned — an explicit capability, not a
-	// wire sniff, so a client never has to interpret ParentVersion==0
-	// ambiguously ("old authority" vs "no version available right now").
-	FeatParentVersion uint64 = 1 << 3
-	// FeatOpenRegistration: the authority supports the reduced-op open
-	// registration surface — Request.RegisterOpen on OpCreate (create and
-	// register the creating owner's open hold in one round-trip) and
-	// OpUnmarkOpenInodes (batched last-close unmarks). Advertised by BOTH
-	// generations: legacy holds ride the in-memory lease-renewed open table;
-	// managed holds are durable journaled open-pin coordination rows (the
-	// fused create ensures its pin row before the reply, and the batched
-	// unmark journals N releases as one exact row).
-	FeatOpenRegistration uint64 = 1 << 4
-	// FeatXattrs: the authority serves native extended attributes
-	// (OpGetxattr/OpSetxattr/OpListxattr/OpRemovexattr) as journaled LIVE
-	// volume state. Advertised by BOTH server generations whenever the
-	// backing fs implements the xattr surface (workfs does on legacy AND
-	// managed); a client never sends xattr ops without it and reports
-	// EOPNOTSUPP locally instead, so kernels fall back to today's behavior
-	// (e.g. AppleDouble sidecars) against old authorities.
-	FeatXattrs uint64 = 1 << 5
-	// FeatHardLinks: the authority can atomically add a second name for an
-	// existing non-directory inode and maintains stable inode identity and
-	// nlink through unlink, rename-over, replay, and HistoryCut materialization.
-	FeatHardLinks uint64 = 1 << 6
-	// FeatAtomicAppend: Request.Append is honored by the authority and EOF is
-	// selected at the write record's ordered apply position. Clients never
-	// send the flag to an older authority that would silently ignore it.
-	FeatAtomicAppend uint64 = 1 << 7
-	// FeatAtomicXattrFlags: Request.XattrFlags is honored at the xattr
-	// record's ordered apply position. It is separate from FeatXattrs so a
-	// new client never sends conditional flags to an older xattr authority
-	// whose gob decoder would silently ignore the additive field.
-	FeatAtomicXattrFlags uint64 = 1 << 8
+	// ---- adaptive write-back delegations (mandatory in v6). The authority
+	// owns the grant decision; the client engine acknowledges locally only
+	// under an active grant. SessionID carries the mount stream id
+	// (writebackID) on all four.
+	OpDelegationAcquire // ask the adaptive policy to delegate Path to this mount's stream
+	OpWritebackState    // read a stream's durable watermark + digest (pure read)
+	OpWritebackRebind   // claim a parked stream's recovery scopes under this session
+	OpWritebackDiscard  // release a parked stream's recovery scopes (audited data loss)
+
+	// OpInvalidationAck rides the SUBSCRIBE connection client→server: the
+	// subscriber has processed every invalidation batch up to AckPos. The
+	// authority's fsync/synchronize/unmount barriers wait for every live
+	// subscriber's acknowledged position to cover the barrier's mutations —
+	// cross-machine read-after-fsync is exact, not eventual.
+	OpInvalidationAck
 )
 
 // Lock modes carried in Request.LkMode (OpLock).
@@ -152,37 +100,17 @@ const (
 )
 
 // Notifier is the source of cache invalidations (the writable working tree). A
-// read-only filesystem has none, so it may be nil.
+// read-only filesystem has none, so it may be nil. Batches carry monotonic
+// stream positions; InvalidationPosition reports the highest published one
+// (the target an authority barrier waits for subscribers to acknowledge).
 type Notifier interface {
-	Subscribe() (<-chan []coherence.Invalidation, func())
+	Subscribe() (<-chan coherence.Batch, func())
+	InvalidationPosition() uint64
 }
 
-// Delegations coordinates exclusive write access to subtrees (checkout/checkin).
-// May be nil (read-only / no coordination).
-type Delegations interface {
-	Checkout(path, owner string) (granted bool, heldBy string)
-	Checkin(path, owner string) bool
-	// HeldBy reports the owner of the checkout covering path (the path itself or any
-	// ancestor), and the path it is held at. Empty owner = not checked out.
-	HeldBy(path string) (owner, at string)
-	// ReleaseOwner drops every checkout held by owner (crash cleanup when a mount's
-	// liveness stream drops), so a dead mount's exclusive holds don't block others.
-	ReleaseOwner(owner string)
-	// AwaitFree blocks until no delegation overlaps path (so a contender can acquire), or ctx is
-	// cancelled (returns false). Used after recalling a holder, to wait out its flush + checkin.
-	AwaitFree(ctx context.Context, path string) bool
-	// ForceCheckout revokes overlapping delegations held by others and grants path to owner —
-	// the escalation when a recalled holder does not relinquish within the bound. The revoked
-	// owners are fenced (see IsFenced) until they re-establish a checkout.
-	ForceCheckout(path, owner string) (revoked []string)
-	// IsFenced reports whether owner was force-revoked from a subtree covering path and has not
-	// re-acquired it — so its in-flight write-back flush must be rejected (ESTALE) rather than
-	// applied over the subtree after the new holder hands it back.
-	IsFenced(owner, path string) bool
-}
-
-// Recaller broadcasts a handoff recall for a contended subtree to subscribers (the writable
-// authority FS). May be nil (no recall — contention then falls back to EBUSY).
+// Recaller broadcasts a handoff recall HINT for a contended subtree to
+// subscribers (the writable authority FS). May be nil (no hint — contention
+// then waits out the holder's checkin or lease).
 type Recaller interface {
 	PublishRecall(path string)
 }
@@ -246,7 +174,7 @@ const connKeepAlive = 15 * time.Second
 
 // serverIdleTimeout bounds how long a post-handshake connection may sit between
 // requests. A peer that connects, authenticates, then sends nothing (or
-// dribbles a slow-loris request) cannot pin a goroutine and gob buffers
+// dribbles a slow-loris request) cannot pin a goroutine and request buffers
 // indefinitely. Far larger than opTimeout so a quiet-but-healthy mount is never
 // killed mid-op; on timeout the client simply redials on its next request
 // (sessions are lease-owned and survive a socket close).
@@ -375,13 +303,10 @@ type Request struct {
 	// CREATE is create+open, so the separate MarkOpen RPC is pure overhead).
 	// The hold is recorded before the reply, so the same open-vs-unlink
 	// guarantee holds: once the create returns, a peer unlink parks. Only
-	// sent to authorities advertising FeatOpenRegistration (gob-additive:
-	// an old server would decode and silently ignore it, which would leave
-	// the open unregistered — hence the capability gate, never a sniff).
+	// baseline open registration (capability-gated, never sniffed).
 	RegisterOpen bool
 
-	// ---- protocol version 3 fields (gob omits zero values, so v1/v2 peers
-	// are unaffected; an old server decodes and silently drops them) ----
+	// ---- protocol version 3 fields ----
 
 	// Mount-session identity (OpSessionOpen/Resume/Attach/Expire, and
 	// OpSubscribe so the stream binds to the session's lease instead of the
@@ -397,7 +322,7 @@ type Request struct {
 	// embeds it in the SAME WAL record as the mutation.
 	Env *wal.Envelope
 
-	// ---- journaled-coordination (managed) fields (gob-additive) ----
+	// ---- journaled-coordination (managed) fields ----
 
 	// CheckoutPath/CheckoutEpoch name the durable checkout grant a managed
 	// flush rides (OpFlushBatch) or releases (OpCheckin). The epoch is the
@@ -413,12 +338,41 @@ type Request struct {
 
 	// XattrName names the extended attribute of an OpGetxattr/OpSetxattr/
 	// OpRemovexattr request (raw case-sensitive bytes, 1..wal.MaxXattrNameBytes,
-	// NUL-free UTF-8). The set VALUE rides Data. Gob-additive: an old server
-	// never sees these ops (FeatXattrs gate), so the field never dangles.
+	// NUL-free UTF-8). The set VALUE rides Data.
 	XattrName string
 	// XattrFlags carries wal.XattrCreate or wal.XattrReplace for
 	// OpSetxattr. The precondition is decided atomically at ordered apply.
 	XattrFlags uint8
+
+	// ---- write-back stream fields ----
+
+	// WBPrevDigest/WBEndDigest chain an OpFlushBatch run onto the stream's
+	// durable digest: the batch applies only if it extends the durable
+	// watermark exactly (a contradiction fences the stream as corrupt).
+	WBPrevDigest []byte
+	WBEndDigest  []byte
+	// WBScopes names the delegations an OpWritebackRebind/Discard resolves.
+	WBScopes []WBScope
+	// WBThrough is the recovering stream's claimed durable watermark
+	// (OpWritebackRebind; verified with WBPrevDigest as the digest at it).
+	WBThrough uint64
+
+	// AckPos is an OpInvalidationAck's cumulative acknowledged
+	// invalidation-stream position (client→server on the subscribe conn).
+	AckPos uint64
+}
+
+// WBScope names one delegation grant of a write-back stream.
+type WBScope struct {
+	Path  string
+	Epoch string
+}
+
+// WBConflict is one typed write-back recovery conflict.
+type WBConflict struct {
+	Path  string
+	Epoch string
+	Kind  string // SCOPE_MISSING, HOLDER_CHANGED, DIGEST_MISMATCH
 }
 
 // Response is the server's reply. Status != OK means the op failed (Status is an
@@ -496,6 +450,25 @@ type Response struct {
 	// XattrNames is an OpListxattr reply's sorted attribute-name list
 	// (gob-additive; the value of an OpGetxattr rides Data).
 	XattrNames []string
+
+	// ---- write-back stream fields ----
+
+	// WBExists/WBDigest report a stream's durable state (OpWritebackState;
+	// the watermark rides AppliedThrough).
+	WBExists bool
+	WBDigest []byte
+	// WBConflicts carries the typed recovery conflicts of a rejected
+	// OpWritebackRebind — never silently merged or discarded.
+	WBConflicts []WBConflict
+
+	// InvPos stamps a subscribe-stream batch with its monotonic
+	// invalidation-stream position; the client acknowledges processed
+	// positions with OpInvalidationAck.
+	InvPos uint64
+	// InvBootstrap marks the first subscribe-stream message. The client
+	// must flush every cache and acknowledge InvPos before the authority
+	// counts this subscriber as coherent at any barrier position.
+	InvBootstrap bool
 }
 
 // toErrno maps a Go filesystem error to a wire errno.

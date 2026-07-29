@@ -16,8 +16,9 @@
 //	             (loopback fsproto; no kernel, no FUSE requirement). Each
 //	             logical filesystem op mirrors what the FUSE frontend issues.
 //	      fuse:  against a real kernel mount (Linux-only: requires /dev/fuse
-//	             plus -mount-bin). PFSBENCH_MOUNT_ONLY=skip skips instead of
-//	             failing when FUSE is unavailable.
+//	             plus -mount-bin pointing at the built bench/cmd/benchmount).
+//	             PFSBENCH_MOUNT_ONLY=skip skips instead of failing when FUSE
+//	             is unavailable.
 //
 //	pfsbench report -dir <results-dir>
 //	    Print a markdown table across all JSON results in a directory.
@@ -50,12 +51,16 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "report":
 		cmdReport(os.Args[2:])
+	case "wbstorm":
+		cmdWBStorm(os.Args[2:])
+	case "wbrecover":
+		cmdWBRecover(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: pfsbench <serve|run|report> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: pfsbench <serve|run|report|wbstorm|wbrecover> [flags]")
 	os.Exit(2)
 }

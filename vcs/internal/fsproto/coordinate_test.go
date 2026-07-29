@@ -172,12 +172,12 @@ func newManagedServer(t *testing.T, log *protoEntryLog) (*Server, *workfs.FS) {
 	if err != nil {
 		t.Fatalf("new managed workfs: %v", err)
 	}
-	return NewServer(fs, fs, nil), fs
+	return NewServer(fs, fs), fs
 }
 
 // openJournaledSession establishes a session on a managed authority. The
 // negotiation is the version probe (OpProtocolVersion); a managed authority
-// advertises ProtoVersionJournaledSessions + FeatJournaledCoordination.
+// speaks the v6 baseline (journaled coordination is mandatory).
 func openJournaledSession(t *testing.T, s *Server, id string, gen uint64, owner, token string, slots uint32) *connSession {
 	t.Helper()
 	cs := &connSession{}
@@ -195,11 +195,11 @@ func TestManagedProbeAndLegacyWriteRefusal(t *testing.T) {
 	s, _ := newManagedServer(t, newProtoEntryLog())
 
 	probe := s.dispatch(&Request{Op: OpProtocolVersion, Size: int64(ProtocolVersion)})
-	if probe.ProtoVersion != ProtoVersionJournaledSessions || probe.Features&FeatJournaledCoordination == 0 {
-		t.Fatalf("managed probe: version=%d features=%b", probe.ProtoVersion, probe.Features)
+	if probe.Status != OK || probe.ProtoVersion != ProtocolVersion {
+		t.Fatalf("managed probe: status=%d version=%d", probe.Status, probe.ProtoVersion)
 	}
-	if probe.Features&FeatReclaimGrace != 0 {
-		t.Fatal("managed probe advertises reclaim grace")
+	if probe.Features != 0 {
+		t.Fatalf("v6 advertises no optional features today, got %b", probe.Features)
 	}
 
 	// A managed generation NEVER admits envelope-less legacy writes and every
@@ -343,42 +343,71 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	s, _ := newManagedServer(t, log)
 	a := openJournaledSession(t, s, "pfs-co", 1, "MA", "tokA", 8)
 
-	co := exactDo(s, a, &Request{Op: OpCheckout, Path: "ws", Owner: "MA"}, 0, 1)
-	if co == nil || co.Status != OK || co.CheckoutEpoch != "1" {
-		t.Fatalf("checkout: %+v", co)
+	// Only an existing directory is delegable: mkdir write-through first.
+	if r := exactDo(s, a, &Request{Op: OpMkdir, Path: "ws", Mode: 0o755}, 0, 1); r == nil || r.Status != OK {
+		t.Fatalf("mkdir ws: %+v", r)
 	}
-	// Lost grant reply: identical identity replays; the epoch is recovered.
-	co2 := exactDo(s, a, &Request{Op: OpCheckout, Path: "ws", Owner: "MA"}, 0, 1)
+	co := exactDo(s, a, &Request{Op: OpDelegationAcquire, Path: "ws", SessionID: "wb-1", Owner: "MA"}, 0, 2)
+	if co == nil || co.Status != OK || co.CheckoutEpoch != "1" {
+		t.Fatalf("delegation acquire: %+v", co)
+	}
+	// Lost grant reply: identical identity replays; the epoch is recovered
+	// (the snapshot is not — the client re-seeds under the held grant).
+	co2 := exactDo(s, a, &Request{Op: OpDelegationAcquire, Path: "ws", SessionID: "wb-1", Owner: "MA"}, 0, 2)
 	if co2 == nil || co2.Status != OK || !co2.Duplicate || co2.CheckoutEpoch != "1" {
-		t.Fatalf("checkout replay: %+v", co2)
+		t.Fatalf("delegation replay: %+v", co2)
 	}
 
+	records := []wal.Record{
+		{Seq: 1, Op: wal.OpCreate, Path: "ws/f", Mode: 0o644},
+		{Seq: 2, Op: wal.OpWrite, Path: "ws/f", Data: []byte("data")},
+	}
+	prev := wbZeroDigest()
+	end := wbTestDigest(t, prev, records)
 	flush := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
 		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
-		Records: []wal.Record{
-			{Seq: 1, Op: wal.OpMkdir, Path: "ws", Mode: 0o755},
-			{Seq: 2, Op: wal.OpCreate, Path: "ws/f", Mode: 0o644},
-			{Seq: 3, Op: wal.OpWrite, Path: "ws/f", Data: []byte("data")},
-		},
+		WBPrevDigest: prev[:], WBEndDigest: end[:],
+		Records: records,
 	}
 	fr := s.dispatchConn(a, flush)
-	if fr == nil || fr.Status != OK || fr.AppliedThrough != 3 {
+	if fr == nil || fr.Status != OK || fr.AppliedThrough != 2 {
 		t.Fatalf("flush: %+v", fr)
 	}
 	// Retry of the identical flush converges on the durable watermark.
 	fr2 := s.dispatchConn(a, flush)
-	if fr2 == nil || fr2.Status != OK || fr2.AppliedThrough != 3 {
+	if fr2 == nil || fr2.Status != OK || fr2.AppliedThrough != 2 {
 		t.Fatalf("flush retry: %+v", fr2)
 	}
 	// Records outside the granted subtree are refused.
+	badRecords := []wal.Record{{Seq: 3, Op: wal.OpCreate, Path: "outside", Mode: 0o644}}
+	badEnd := wbTestDigest(t, end, badRecords)
 	bad := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
 		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
-		Records: []wal.Record{{Seq: 4, Op: wal.OpCreate, Path: "outside", Mode: 0o644}},
+		WBPrevDigest: end[:], WBEndDigest: badEnd[:],
+		Records: badRecords,
 	}
 	if r := s.dispatchConn(a, bad); r == nil || r.Status != EPERM {
 		t.Fatalf("out-of-subtree flush: %+v", r)
+	}
+	// A ".."-traversal record whose raw wire path is byte-prefixed by the
+	// grant ("ws/..") but canonicalizes outside it must be refused — the gate
+	// tests the applied (cleaned) path, not the wire bytes.
+	escRecords := []wal.Record{{Seq: 3, Op: wal.OpCreate, Path: "ws/../outside/f", Mode: 0o644}}
+	escEnd := wbTestDigest(t, end, escRecords)
+	esc := &Request{
+		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
+		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
+		WBPrevDigest: end[:], WBEndDigest: escEnd[:],
+		Records: escRecords,
+	}
+	if r := s.dispatchConn(a, esc); r == nil || r.Status != EPERM {
+		t.Fatalf("traversal-escape flush: %+v", r)
+	}
+	// The refused escape touched nothing: the durable watermark is still 2.
+	if r := s.dispatchConn(a, flush); r == nil || r.Status != OK || r.AppliedThrough != 2 {
+		t.Fatalf("watermark after refused escape: %+v", r)
 	}
 	// Checkin with the wrong epoch is a durable ENOENT; the right epoch releases.
 	if r := exactDo(s, a, &Request{Op: OpCheckin, Path: "ws", CheckoutEpoch: "9", Owner: "MA"}, 1, 1); r == nil || r.Status != ENOENT {
@@ -388,10 +417,13 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 		t.Fatalf("checkin: %+v", r)
 	}
 	// A flush after release is fenced (ESTALE) — stale holders never write.
+	lateRecords := []wal.Record{{Seq: 3, Op: wal.OpCreate, Path: "ws/late", Mode: 0o644}}
+	lateEnd := wbTestDigest(t, end, lateRecords)
 	late := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
 		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
-		Records: []wal.Record{{Seq: 5, Op: wal.OpCreate, Path: "ws/late", Mode: 0o644}},
+		WBPrevDigest: end[:], WBEndDigest: lateEnd[:],
+		Records: lateRecords,
 	}
 	if r := s.dispatchConn(a, late); r == nil || r.Status != ESTALE {
 		t.Fatalf("stale flush: %+v", r)

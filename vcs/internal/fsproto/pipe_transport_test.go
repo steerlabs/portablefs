@@ -16,8 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/internal/delegation"
-	"github.com/steerlabs/portablefs/vcs/internal/wal"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
@@ -69,15 +67,8 @@ func (l *pipeListener) dial() (net.Conn, error) {
 // the server, its workfs, and a dialer for clients.
 func startPipeAuthority(t *testing.T) (*Server, *workfs.FS, func() (net.Conn, error)) {
 	t.Helper()
-	w, err := wal.Open(filepath.Join(t.TempDir(), "pipe.wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := workfs.New(nil, nopBlobs{}, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := NewServer(fs, fs, delegation.New())
+	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "pipe.wal"))
+	s := NewServer(fs, fs)
 	ln := newPipeListener()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -271,7 +262,7 @@ func TestPipeTwoClientsRacingCreatesAndLocks(t *testing.T) {
 	for _, c := range []*Client{c1, c2} {
 		c := c
 		go func() {
-			res, err := c.Lock("race.file", LkSetlk, 1, 0, 100, true, false)
+			res, err := c.LockManaged("race.file", 0, LkSetlk, 1, 0, 100, true, false)
 			lockResults <- result{st: res.Status, err: err}
 		}()
 	}

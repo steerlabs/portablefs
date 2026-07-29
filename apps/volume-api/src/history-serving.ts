@@ -96,14 +96,16 @@ export async function routeHistoryServingRequest(
       const baseDigest = query.baseDigest!;
       const recordCodec = query.recordCodec!;
       const controlCodec = query.controlCodec!;
+      // pfj3/pfc2 is the only served codec pair: the retired pfr1/pfc1
+      // generation era is refused at volume-api startup (no generation row
+      // may predate migration 012), so a pfr1 proof presented here can only
+      // be malformed input.
       if (
         !boundedId.test(generationId) ||
         !isCanonicalSignedInt64(baseSeq, true) ||
         !hexDigest.test(baseDigest) ||
-        !(
-          (recordCodec === "pfr1" && controlCodec === "pfc1") ||
-          (recordCodec === "pfj3" && controlCodec === "pfc2")
-        )
+        recordCodec !== "pfj3" ||
+        controlCodec !== "pfc2"
       ) {
         throw new MetadataConflictError(
           "HISTORY_BASE_PROOF_INVALID",
@@ -236,8 +238,8 @@ function assertServingProof(
     generationId: string;
     baseSeq: string;
     baseDigest: string;
-    recordCodec: "pfr1" | "pfj3";
-    controlCodec: "pfc1" | "pfc2";
+    recordCodec: "pfj3";
+    controlCodec: "pfc2";
   }
 ): void {
   const forkMode = value.kind === "pft2" && value.baseMode === "fork";

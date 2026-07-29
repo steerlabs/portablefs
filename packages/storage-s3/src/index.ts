@@ -208,7 +208,7 @@ export class S3BlobStore implements BlobStore {
     options?: { allowNotFound?: boolean; signal?: AbortSignal }
   ): Promise<Response> {
     const url = objectUrl(this.config, key);
-    const signInput: SignRequestInput = {
+    const signInput: SignS3RequestInput = {
       method,
       url,
       region: this.config.region,
@@ -222,7 +222,7 @@ export class S3BlobStore implements BlobStore {
     if (headers) {
       signInput.headers = headers;
     }
-    const requestHeaders = signedHeaders(signInput);
+    const requestHeaders = signS3RequestHeaders(signInput);
     const response = await this.fetchImpl(url, {
       method,
       headers: requestHeaders,
@@ -311,58 +311,59 @@ function prepareStorageBody(buffer: Buffer): { body: Buffer; compression: BlobRe
   return { body: compressed, compression: "gzip" };
 }
 
+/**
+ * Reads the canonical S3 configuration: the `AWS_*` credential family
+ * (endpoint, bucket, region, url style, key pair) plus the PortableFS extras
+ * `VOLUME_S3_PREFIX` (default "portablefs") and `VOLUME_S3_SSE`. The retired
+ * Railway-era spellings are accepted through the compat alias mapping below.
+ */
 export function s3ConfigFromEnv(
   env: NodeJS.ProcessEnv
 ): S3BlobStoreConfig {
-  const urlStyle = optionalEnv(env, "VOLUME_RAILWAY_BUCKET_URL_STYLE") ?? "virtual-host";
+  const resolved = applyRailwayCompatAliases(env);
+  const urlStyle = optionalEnv(resolved, "AWS_S3_URL_STYLE") ?? "virtual-host";
   if (urlStyle !== "virtual-host" && urlStyle !== "path") {
-    throw new Error("VOLUME_RAILWAY_BUCKET_URL_STYLE must be virtual-host or path.");
+    throw new Error("AWS_S3_URL_STYLE must be virtual-host or path.");
   }
+  const sse = optionalEnv(resolved, "VOLUME_S3_SSE");
   return {
-    endpoint: requiredEnv(env, "VOLUME_RAILWAY_BUCKET_ENDPOINT"),
-    bucket: requiredEnv(env, "VOLUME_RAILWAY_BUCKET_NAME"),
-    region: optionalEnv(env, "VOLUME_RAILWAY_BUCKET_REGION") ?? "auto",
+    endpoint: requiredEnv(resolved, "AWS_ENDPOINT_URL"),
+    bucket: requiredEnv(resolved, "AWS_S3_BUCKET_NAME"),
+    region: optionalEnv(resolved, "AWS_DEFAULT_REGION") ?? "auto",
     urlStyle,
-    accessKeyId: requiredEnv(env, "VOLUME_RAILWAY_BUCKET_ACCESS_KEY_ID"),
-    secretAccessKey: requiredEnv(env, "VOLUME_RAILWAY_BUCKET_SECRET_ACCESS_KEY"),
-    prefix: optionalEnv(env, "VOLUME_RAILWAY_BUCKET_PREFIX") ?? "portablefs",
-    ...sseConfig(env),
+    accessKeyId: requiredEnv(resolved, "AWS_ACCESS_KEY_ID"),
+    secretAccessKey: requiredEnv(resolved, "AWS_SECRET_ACCESS_KEY"),
+    prefix: optionalEnv(resolved, "VOLUME_S3_PREFIX") ?? "portablefs",
+    ...(sse ? { serverSideEncryption: sse } : {}),
   };
 }
 
-// sseConfig reads the optional server-side-encryption algorithm (VOLUME_RAILWAY_BUCKET_SSE),
-// e.g. "AES256". Unset = no SSE header (unchanged behaviour).
-function sseConfig(env: NodeJS.ProcessEnv): { serverSideEncryption?: string } {
-  const sse = optionalEnv(env, "VOLUME_RAILWAY_BUCKET_SSE");
-  return sse ? { serverSideEncryption: sse } : {};
-}
-
-export function s3ConfigFromAnyEnv(
-  env: NodeJS.ProcessEnv
-): S3BlobStoreConfig {
+// Compat aliasing (one release): the retired VOLUME_RAILWAY_BUCKET_* spellings
+// map onto the canonical AWS_*/VOLUME_S3_* names. The endpoint/credential
+// family is all-or-nothing, keyed on VOLUME_RAILWAY_BUCKET_ENDPOINT (matching
+// the retired spelling-selection behavior, so a deployment carrying both
+// spellings keeps resolving exactly as before); prefix and SSE alias
+// independently because both spellings read the Railway names for them.
+function applyRailwayCompatAliases(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const aliased: NodeJS.ProcessEnv = { ...env };
   if (optionalEnv(env, "VOLUME_RAILWAY_BUCKET_ENDPOINT")) {
-    return s3ConfigFromEnv(env);
+    aliased.AWS_ENDPOINT_URL = env.VOLUME_RAILWAY_BUCKET_ENDPOINT;
+    aliased.AWS_S3_BUCKET_NAME = env.VOLUME_RAILWAY_BUCKET_NAME;
+    aliased.AWS_DEFAULT_REGION = env.VOLUME_RAILWAY_BUCKET_REGION;
+    aliased.AWS_S3_URL_STYLE = env.VOLUME_RAILWAY_BUCKET_URL_STYLE;
+    aliased.AWS_ACCESS_KEY_ID = env.VOLUME_RAILWAY_BUCKET_ACCESS_KEY_ID;
+    aliased.AWS_SECRET_ACCESS_KEY = env.VOLUME_RAILWAY_BUCKET_SECRET_ACCESS_KEY;
   }
-  return s3ConfigFromAwsEnv(env);
+  if (!optionalEnv(env, "VOLUME_S3_PREFIX")) {
+    aliased.VOLUME_S3_PREFIX = env.VOLUME_RAILWAY_BUCKET_PREFIX;
+  }
+  if (!optionalEnv(env, "VOLUME_S3_SSE")) {
+    aliased.VOLUME_S3_SSE = env.VOLUME_RAILWAY_BUCKET_SSE;
+  }
+  return aliased;
 }
 
-export function s3ConfigFromAwsEnv(
-  env: NodeJS.ProcessEnv
-): S3BlobStoreConfig {
-  const urlStyle = optionalEnv(env, "AWS_S3_URL_STYLE") ?? "virtual-host";
-  return {
-    endpoint: requiredEnv(env, "AWS_ENDPOINT_URL"),
-    bucket: requiredEnv(env, "AWS_S3_BUCKET_NAME"),
-    region: optionalEnv(env, "AWS_DEFAULT_REGION") ?? "auto",
-    urlStyle: urlStyle === "path" ? "path" : "virtual-host",
-    accessKeyId: requiredEnv(env, "AWS_ACCESS_KEY_ID"),
-    secretAccessKey: requiredEnv(env, "AWS_SECRET_ACCESS_KEY"),
-    prefix: optionalEnv(env, "VOLUME_RAILWAY_BUCKET_PREFIX") ?? "portablefs",
-    ...sseConfig(env),
-  };
-}
-
-interface SignRequestInput {
+export interface SignS3RequestInput {
   method: string;
   url: URL;
   region: string;
@@ -373,7 +374,32 @@ interface SignRequestInput {
   now: Date;
 }
 
-function signedHeaders(input: SignRequestInput): Record<string, string> {
+// SigV4 canonical query string: RFC 3986 percent-encoding (space as %20, the
+// encodeURIComponent extras !'()* escaped), pairs sorted by encoded name then
+// encoded value. URLSearchParams.toString() is NOT canonical (unsorted, '+'
+// for space) and would produce SignatureDoesNotMatch on any signed URL that
+// carries query parameters.
+function canonicalQueryString(params: URLSearchParams): string {
+  const encode = (value: string) =>
+    encodeURIComponent(value).replace(
+      /[!'()*]/g,
+      (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+  return [...params]
+    .map(([name, value]) => [encode(name), encode(value)] as const)
+    .sort(([ln, lv], [rn, rv]) => (ln < rn ? -1 : ln > rn ? 1 : lv < rv ? -1 : lv > rv ? 1 : 0))
+    .map(([name, value]) => `${name}=${value}`)
+    .join("&");
+}
+
+/**
+ * AWS SigV4 request signing for S3-compatible stores: returns the request
+ * headers (host, x-amz-content-sha256, x-amz-date, any extras, authorization)
+ * for the given method/url/credentials. This is the ONE signer in the
+ * TypeScript services; exact-key history readers import it rather than
+ * carrying a private copy.
+ */
+export function signS3RequestHeaders(input: SignS3RequestInput): Record<string, string> {
   const amzDate = timestamp(input.now);
   const shortDate = amzDate.slice(0, 8);
   const payloadHash = hexSha256(input.body ?? Buffer.alloc(0));
@@ -393,7 +419,7 @@ function signedHeaders(input: SignRequestInput): Record<string, string> {
   const canonicalRequest = [
     input.method,
     input.url.pathname || "/",
-    input.url.searchParams.toString(),
+    canonicalQueryString(input.url.searchParams),
     canonicalHeaders.map(([key, value]) => `${key}:${value}\n`).join(""),
     signedHeaderNames,
     payloadHash,

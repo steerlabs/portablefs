@@ -7,52 +7,49 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
 
-// TestRerouteOrphanedWriteUsesParkedInoOverProbe pins P3: when a write is rejected with ErrOrphaned
-// and the node already carries a parked orphanIno (set by the concurrent unlink), the reroute must use
-// that ino DIRECTLY, not fall back to the RedirectToOrphan stable-ino probe. For an uncommitted
-// write-back file the stable ino is a path-hash the authority can't resolve as an orphan, so
-// probing first would EIO where the parked ino succeeds.
-func TestRerouteOrphanedWriteUsesParkedInoOverProbe(t *testing.T) {
+// TestWriteToParkedInodeGoesDirectToOrphan pins that a write on a node whose
+// orphanIno is set (the file was unlinked while this handle held it open)
+// lands on the parked inode by ino — never a path-addressed write that would
+// ENOENT against the vanished name.
+func TestWriteToParkedInodeGoesDirectToOrphan(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
-	seed := dialCore(t, addr, Options{})
+	v := dialCore(t, addr, Options{Owner: "orphan-writer"})
 
-	a, st := seed.Create(ctx, "orph", 0o644)
-	if st != fsproto.OK {
-		t.Fatalf("create: %d", st)
+	a, st := v.Create(ctx, "orph", 0o644)
+	if st != fsproto.OK || a.Ino == 0 {
+		t.Fatalf("create: ino=%d st=%d", a.Ino, st)
 	}
-	realIno := a.Ino
-	if realIno == 0 {
-		t.Fatal("authority did not assign a real inode")
+	// Hold the file open (create+open already registered the pin) so the
+	// authority parks — not reaps — the inode on unlink.
+	n := NewNodeState(a.Ino, true)
+	if st := v.RegisterOpened("orph", n); st != fsproto.OK {
+		t.Fatalf("open: %d", st)
 	}
-	n0 := NewNodeState(realIno, true)
-	if _, st := seed.Write(ctx, "orph", n0, 0, []byte("AAAA")); st != fsproto.OK {
-		t.Fatalf("seed write: %d", st)
-	}
-
-	// Park the inode at the authority (delete-on-last-close), yielding the orphan ino to address.
-	parkedIno, ost, oerr := seed.client.Orphan("orph")
-	if oerr != nil || ost != fsproto.OK || parkedIno == 0 {
-		t.Fatalf("orphan: ino=%d st=%d err=%v", parkedIno, ost, oerr)
+	if _, st := v.Write(ctx, "orph", n, 0, []byte("AAAA")); st != fsproto.OK {
+		t.Fatalf("write: %d", st)
 	}
 
-	// A node with a PATH-HASH stable ino (uncommitted write-back file, authIno=false) that the
-	// RedirectToOrphan probe cannot resolve, but whose parked orphanIno is the real parked inode.
-	nWrite := NewNodeState(InoOf("orph"), false)
-	seed.incOpen("orph", nWrite) // nopen=1 so markOrphan takes and IsOpen() is true
-	if !nWrite.MarkOrphan(parkedIno, seed.openOrphans) {
-		t.Fatal("MarkOrphan should set the parked ino")
+	// Unlink while open: the inode parks and the node redirects to it.
+	if st := v.Remove(ctx, "orph", n); st != fsproto.OK {
+		t.Fatalf("remove while open: %d", st)
 	}
-	if seed.RedirectToOrphan(nWrite) != 0 {
-		t.Fatal("precondition: RedirectToOrphan must MISS on the path-hash stable ino")
+	parkedIno := n.Orphan()
+	if parkedIno == 0 {
+		t.Fatal("unlink-while-open did not park the inode on the node")
 	}
 
-	cnt, st := seed.rerouteOrphanedWrite(nWrite, 0, []byte("BBBB"))
+	// A write now goes straight to the parked inode.
+	cnt, st := v.Write(ctx, "orph", n, 0, []byte("BBBB"))
 	if st != fsproto.OK || cnt != 4 {
-		t.Fatalf("reroute must use the parked ino directly: cnt=%d st=%d", cnt, st)
+		t.Fatalf("write to parked inode: cnt=%d st=%d", cnt, st)
 	}
-	data, rst, rerr := seed.client.ReadOrphan(parkedIno, 0, 4)
+	data, rst, rerr := v.client.ReadOrphan(parkedIno, 0, 4)
 	if rerr != nil || rst != fsproto.OK || string(data) != "BBBB" {
-		t.Fatalf("parked inode should hold the rerouted write: %q st=%d err=%v", data, rst, rerr)
+		t.Fatalf("parked inode should hold the write: %q st=%d err=%v", data, rst, rerr)
+	}
+	// The vanished name no longer resolves.
+	if _, st := v.Lookup(ctx, "orph"); st != fsproto.ENOENT {
+		t.Fatalf("orphaned name lookup = %d, want ENOENT", st)
 	}
 }

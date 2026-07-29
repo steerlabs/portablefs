@@ -1,6 +1,7 @@
 package workfs
 
 import (
+	"errors"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -31,13 +32,6 @@ type mutationTransaction struct {
 	openInodes   map[uint64]openEntryUndo
 	byIno        map[uint64]inodeEntryUndo
 	pendingReaps map[uint64]uint32EntryUndo
-
-	ctlSessionsNil   bool
-	ctlWatermarksNil bool
-	ctlSlotStates    int
-	ctlSessions      map[string]sessionEntryUndo
-	ctlWatermarks    map[string]watermarkEntryUndo
-	ctlSlots         map[slotUndoKey]slotEntryUndo
 }
 
 // int64AndUint64 keeps the two apply clocks together without introducing a
@@ -74,27 +68,6 @@ type uint32EntryUndo struct {
 	ok    bool
 }
 
-type sessionEntryUndo struct {
-	value *ctlSession
-	ok    bool
-}
-
-type watermarkEntryUndo struct {
-	value ctlWatermark
-	ok    bool
-}
-
-type slotUndoKey struct {
-	session string
-	slot    uint32
-}
-
-type slotEntryUndo struct {
-	value       *slotOutcome
-	ok          bool
-	outcomesNil bool
-}
-
 func newMutationTransaction(fs *FS) *mutationTransaction {
 	return &mutationTransaction{
 		fs:     fs,
@@ -103,11 +76,7 @@ func newMutationTransaction(fs *FS) *mutationTransaction {
 		inodes:     make(map[*inode]inode),
 		orphans:    make(map[uint64]inodeEntryUndo), orphanLeases: make(map[uint64]timeEntryUndo),
 		openInodes: make(map[uint64]openEntryUndo), byIno: make(map[uint64]inodeEntryUndo),
-		pendingReaps:   make(map[uint64]uint32EntryUndo),
-		ctlSessionsNil: fs.ctl.sessions == nil, ctlWatermarksNil: fs.ctl.watermarks == nil,
-		ctlSlotStates: fs.ctl.slotStates,
-		ctlSessions:   make(map[string]sessionEntryUndo), ctlWatermarks: make(map[string]watermarkEntryUndo),
-		ctlSlots: make(map[slotUndoKey]slotEntryUndo),
+		pendingReaps: make(map[uint64]uint32EntryUndo),
 	}
 }
 
@@ -210,95 +179,13 @@ func (tx *mutationTransaction) capturePendingReap(ino uint64) {
 	tx.pendingReaps[ino] = uint32EntryUndo{value: v, ok: present}
 }
 
-func cloneSlotOutcome(o *slotOutcome) *slotOutcome {
-	if o == nil {
-		return nil
-	}
-	cloned := *o
-	cloned.reqHash = append([]byte(nil), o.reqHash...)
-	return &cloned
-}
-
-func cloneCtlSession(s *ctlSession) *ctlSession {
-	if s == nil {
-		return nil
-	}
-	cloned := *s
-	cloned.tokenHash = append([]byte(nil), s.tokenHash...)
-	cloned.outcomes = make(map[uint32]*slotOutcome, len(s.outcomes))
-	for slot, outcome := range s.outcomes {
-		cloned.outcomes[slot] = cloneSlotOutcome(outcome)
-	}
-	return &cloned
-}
-
-func (tx *mutationTransaction) captureSession(id string) {
-	if _, ok := tx.ctlSessions[id]; ok {
-		return
-	}
-	v, present := tx.fs.ctl.sessions[id]
-	tx.ctlSessions[id] = sessionEntryUndo{value: cloneCtlSession(v), ok: present}
-}
-
-func (tx *mutationTransaction) captureWatermark(id string) {
-	if _, ok := tx.ctlWatermarks[id]; ok {
-		return
-	}
-	v, present := tx.fs.ctl.watermarks[id]
-	tx.ctlWatermarks[id] = watermarkEntryUndo{value: v, ok: present}
-}
-
-func (tx *mutationTransaction) captureSlot(env *wal.Envelope) {
-	if !env.Valid() {
-		return
-	}
-	key := slotUndoKey{session: env.SessionID, slot: env.Slot}
-	if _, ok := tx.ctlSlots[key]; ok {
-		return
-	}
-	s := tx.fs.ctl.sessions[env.SessionID]
-	if s == nil {
-		tx.ctlSlots[key] = slotEntryUndo{}
-		return
-	}
-	v, present := s.outcomes[env.Slot]
-	tx.ctlSlots[key] = slotEntryUndo{value: cloneSlotOutcome(v), ok: present, outcomesNil: s.outcomes == nil}
-}
-
-func (tx *mutationTransaction) captureControl(r wal.Record) error {
-	p, err := decodeCtlPayload(r.Data)
-	if err != nil {
-		return err
-	}
-	switch p.Kind {
-	case ctlKindSession:
-		tx.captureSession(p.Session.SessionID)
-	case ctlKindExpire:
-		tx.captureSession(p.Expire.SessionID)
-	case ctlKindRenew:
-		tx.captureSession(p.Renew.SessionID)
-	case ctlKindWatermark:
-		tx.captureWatermark(p.Watermark.SessionID)
-	case ctlKindOutcome:
-		tx.captureSession(p.Outcome.SessionID)
-	case ctlKindSnapshot:
-		for i := range p.Snapshot.Sessions {
-			tx.captureSession(p.Snapshot.Sessions[i].SessionID)
-		}
-		for i := range p.Snapshot.Watermarks {
-			tx.captureWatermark(p.Snapshot.Watermarks[i].SessionID)
-		}
-	}
-	return nil
-}
-
 // captureMutation records precisely the state that r may change at its current
 // ordered apply position. Caller holds fs.mu.
 func (tx *mutationTransaction) captureMutation(r wal.Record) error {
 	fs := tx.fs
 	switch r.Op {
 	case wal.OpControl:
-		return tx.captureControl(r)
+		return errors.New("vcs: legacy control record (the raw WAL data plane carries no session store)")
 	case wal.OpCreate, wal.OpSymlink:
 		parent, _ := fs.resolveParent(r.Path)
 		tx.captureInode(parent)
@@ -368,7 +255,6 @@ func (tx *mutationTransaction) captureMutation(r wal.Record) error {
 		tx.captureByIno(r.Ino)
 		tx.capturePendingReap(r.Ino)
 	}
-	tx.captureSlot(r.Env)
 	return nil
 }
 
@@ -438,42 +324,6 @@ func (tx *mutationTransaction) rollback() {
 			delete(fs.pendingReaps, ino)
 		}
 	}
-	for id, undo := range tx.ctlSessions {
-		if undo.ok {
-			fs.ctl.sessions[id] = undo.value
-		} else {
-			delete(fs.ctl.sessions, id)
-		}
-	}
-	for id, undo := range tx.ctlWatermarks {
-		if undo.ok {
-			fs.ctl.watermarks[id] = undo.value
-		} else {
-			delete(fs.ctl.watermarks, id)
-		}
-	}
-	for key, undo := range tx.ctlSlots {
-		s := fs.ctl.sessions[key.session]
-		if s == nil {
-			continue
-		}
-		if undo.outcomesNil {
-			s.outcomes = nil
-			continue
-		}
-		if undo.ok {
-			s.outcomes[key.slot] = undo.value
-		} else {
-			delete(s.outcomes, key.slot)
-		}
-	}
-	if tx.ctlSessionsNil {
-		fs.ctl.sessions = nil
-	}
-	if tx.ctlWatermarksNil {
-		fs.ctl.watermarks = nil
-	}
-	fs.ctl.slotStates = tx.ctlSlotStates
 	fs.epoch = tx.clocks.i
 	fs.version = tx.clocks.u
 	fs.alloc = tx.alloc

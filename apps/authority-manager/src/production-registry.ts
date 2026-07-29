@@ -816,31 +816,6 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     return this.endpointFor(authority);
   }
 
-  async createSession(ref: AuthorityRef): Promise<AuthorityEndpoint> {
-    // The legacy session route is an access lease under a synthetic consumer.
-    const { endpoint, result } = await this.ensureAuthorityForLease(ref, (binding) =>
-      this.leases.create({
-        operationId: `legacy-session-${randomUUID()}`,
-        ...(ref.teamId ? { teamId: ref.teamId } : {}),
-        volumeId: ref.volumeId,
-        branch: ref.branch,
-        consumerId: "legacy-session",
-        authorityInstanceId: binding.authorityInstanceId,
-        ...(binding.authorityRuntimeGeneration !== undefined
-          ? { authorityRuntimeGeneration: binding.authorityRuntimeGeneration }
-          : {}),
-        ...(binding.authorityRuntimeId !== undefined
-          ? { authorityRuntimeId: binding.authorityRuntimeId }
-          : {}),
-      })
-    );
-    return {
-      ...endpoint,
-      authToken: result.accessToken,
-      expiresAt: result.lease.expiresAt,
-    };
-  }
-
   async inspectAuthority(ref: AuthorityRef): Promise<AuthorityEndpoint | null> {
     const authority = this.authorities.get(authorityKey(ref));
     return authority ? this.endpointFor(authority) : null;

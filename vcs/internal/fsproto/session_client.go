@@ -20,10 +20,9 @@ package fsproto
 // deliberate — an automatic new generation would let a zombie mount overwrite
 // state a successor already took over.
 //
-// Sessions are negotiated: against a server below ProtoVersionExactSessions
-// (or one without FeatExactSessions), the client keeps plain v1 behavior —
-// the graceful downgrade this repository's compatibility contract requires.
-// VCS_CLIENT_DISABLE_EXACT_SESSIONS=1 forces the same downgrade for debugging.
+// Sessions are mandatory: the client requires the authority to negotiate
+// exactly ProtocolVersion (v6) and refuses anything else with a clear
+// version-mismatch error. There is no legacy downgrade.
 
 import (
 	"crypto/rand"
@@ -177,84 +176,6 @@ func (c *Client) exactState() *exactSession {
 	return c.exact
 }
 
-// sessionsEnabled reports whether this client may use exact sessions at all
-// (compile-time capable and not disabled via VCS_CLIENT_DISABLE_EXACT_SESSIONS=1).
-func (c *Client) sessionsEnabled() bool { return !c.sessionsDisabled }
-
-// recordProbe caches the authority's advertised capability bits from one
-// successful OpProtocolVersion round-trip. A legacy server (which rejects the
-// probe op) is recorded as having no features, so capability checks are
-// definite after the first probe rather than repeatedly re-asking.
-func (c *Client) recordProbe(probe *Response) {
-	feats := probe.Features
-	if interpretVersionResponse(probe) == legacyProtocolVersion {
-		feats = 0
-	}
-	c.exactMu.Lock()
-	c.serverFeatures = feats
-	c.featuresKnown = true
-	c.exactMu.Unlock()
-}
-
-// ServerFeatures returns the authority's advertised capability bits, probing
-// once if no probe has happened yet (e.g. when exact sessions are disabled).
-func (c *Client) ServerFeatures() (uint64, error) {
-	c.exactMu.RLock()
-	known, feats := c.featuresKnown, c.serverFeatures
-	c.exactMu.RUnlock()
-	if known {
-		return feats, nil
-	}
-	c.establishMu.Lock()
-	defer c.establishMu.Unlock()
-	c.exactMu.RLock()
-	known, feats = c.featuresKnown, c.serverFeatures
-	c.exactMu.RUnlock()
-	if known {
-		return feats, nil
-	}
-	probe, err := c.doRaw(&Request{Op: OpProtocolVersion, Size: int64(ProtocolVersion)}, true)
-	if err != nil {
-		return 0, err
-	}
-	c.recordProbe(probe)
-	c.exactMu.RLock()
-	feats = c.serverFeatures
-	c.exactMu.RUnlock()
-	return feats, nil
-}
-
-// HasFeature reports whether the authority advertised the capability bit.
-// False when the probe never succeeded — capability-gated behavior then stays
-// off, the conservative direction for every gated feature.
-func (c *Client) HasFeature(bit uint64) bool {
-	feats, err := c.ServerFeatures()
-	return err == nil && feats&bit != 0
-}
-
-// SupportsOpenRegistration reports whether the authority accepts the fused
-// create+register request and the batched unmark op.
-func (c *Client) SupportsOpenRegistration() bool { return c.HasFeature(FeatOpenRegistration) }
-
-// SupportsXattrs reports whether the authority serves native extended
-// attributes (FeatXattrs). Callers gate every xattr op on it and answer
-// EOPNOTSUPP locally against an older authority — never a wire attempt.
-func (c *Client) SupportsXattrs() bool { return c.HasFeature(FeatXattrs) }
-
-// SupportsHardLinks reports whether the authority advertised the atomic hard
-// link surface. Callers must gate OpLink on this bit so older authorities
-// continue to receive only operations they understand.
-func (c *Client) SupportsHardLinks() bool { return c.HasFeature(FeatHardLinks) }
-
-// SupportsAtomicAppend reports whether the authority resolves append EOF in
-// sequencer order. Without it Request.Append must never be sent because an
-// older gob decoder would ignore the additive field.
-func (c *Client) SupportsAtomicAppend() bool { return c.HasFeature(FeatAtomicAppend) }
-
-// SupportsAtomicXattrFlags reports whether conditional xattr flags are
-// evaluated by the authority in the same ordered mutation as the update.
-func (c *Client) SupportsAtomicXattrFlags() bool { return c.HasFeature(FeatAtomicXattrFlags) }
-
 // SetExactSlots bounds this mount's concurrent in-flight exact mutations.
 // Call before the first mutation (0 = DefaultExactSlots).
 func (c *Client) SetExactSlots(n uint32) { c.exactSlots = n }
@@ -274,12 +195,6 @@ func (c *Client) SessionFenced() bool {
 	return es != nil && es.isFenced()
 }
 
-func (c *Client) serverIsLegacy() bool {
-	c.exactMu.RLock()
-	defer c.exactMu.RUnlock()
-	return c.serverLegacy
-}
-
 func (c *Client) isClosed() bool {
 	select {
 	case <-c.closed:
@@ -289,54 +204,31 @@ func (c *Client) isClosed() bool {
 	}
 }
 
-// EnsureExactSession establishes the mount session if the authority supports
-// exact sessions. Returns (true, nil) when the session is live, (false, nil)
-// against a legacy authority (mutations then keep plain v1 semantics — the
-// graceful downgrade), and an error only for transport failures.
+// EnsureExactSession establishes the mount session, negotiating the protocol
+// version first: the authority must speak exactly ProtocolVersion (v6).
+// Returns (true, nil) when the session is live and an error otherwise —
+// including ErrProtocolVersionMismatch against an older authority. There is
+// no legacy downgrade.
 //
 // It never holds exactMu across network I/O (pool users take exactMu.RLock
 // while holding a pooled conn; holding the write lock while waiting for a
 // conn would invert that order and deadlock). establishMu serializes the
 // one-time establish instead.
 func (c *Client) EnsureExactSession() (bool, error) {
-	if !c.sessionsEnabled() {
-		return false, nil
-	}
 	if es := c.exactState(); es != nil {
 		return !es.isFenced(), nil
-	}
-	if c.serverIsLegacy() {
-		return false, nil
 	}
 	c.establishMu.Lock()
 	defer c.establishMu.Unlock()
 	if es := c.exactState(); es != nil {
 		return !es.isFenced(), nil
 	}
-	if c.serverIsLegacy() {
-		return false, nil
-	}
-	// Probe the authority first: sessions require the negotiated protocol
-	// version AND the feature bit. Anything less is a legacy server — the
-	// client stays on v1 semantics (sticky until remount; a mid-mount
-	// authority upgrade is adopted on the next mount).
 	probe, err := c.doRaw(&Request{Op: OpProtocolVersion, Size: int64(ProtocolVersion)}, true)
 	if err != nil {
 		return false, err
 	}
-	c.recordProbe(probe)
-	if interpretVersionResponse(probe) < ProtoVersionExactSessions || probe.Features&FeatExactSessions == 0 {
-		c.exactMu.Lock()
-		c.serverLegacy = true
-		c.exactMu.Unlock()
-		return false, nil
-	}
-	if interpretVersionResponse(probe) >= ProtoVersionJournaledSessions && probe.Features&FeatJournaledCoordination != 0 {
-		// Managed (journaled) authority: locks, checkouts, and open pins ride
-		// the exact coordination surface (coordinate_client.go).
-		c.exactMu.Lock()
-		c.serverManaged = true
-		c.exactMu.Unlock()
+	if probe.Status != OK || probe.ProtoVersion != ProtocolVersion {
+		return false, &ErrProtocolVersionMismatch{ServerVersion: probe.ProtoVersion}
 	}
 	es := newExactSession(c.owner, c.exactSlots)
 	// The exact (id, gen, owner, slots, token) tuple is idempotent, so a lost
@@ -413,40 +305,11 @@ func (c *Client) renewLoop(es *exactSession) {
 		if err != nil {
 			continue // transport trouble: keep trying; the lease has slack
 		}
-		switch resp.Status {
-		case OK:
-			if resp.ReclaimMs > 0 {
-				// A freshly promoted/restarted authority granted a reclaim
-				// window: re-assert coordination state (locks, checkouts)
-				// through the registered hook, or — when the frontend tracks
-				// nothing to re-assert — release our share of the grace
-				// immediately so other mounts are not held off for nothing.
-				if hook := c.reclaimHook(); hook != nil {
-					go hook(time.Duration(resp.ReclaimMs) * time.Millisecond)
-				} else {
-					go c.ReclaimDone()
-				}
-			}
-		case ESTALE:
+		if resp.Status == ESTALE {
 			es.fence()
 			return
 		}
 	}
-}
-
-// SetOnReclaim registers the frontend hook invoked when the authority grants a
-// post-failover reclaim window (re-assert locks and checkouts, then call
-// ReclaimDone). Without a hook the client reports ReclaimDone immediately.
-func (c *Client) SetOnReclaim(fn func(window time.Duration)) {
-	c.exactMu.Lock()
-	c.onReclaim = fn
-	c.exactMu.Unlock()
-}
-
-func (c *Client) reclaimHook() func(window time.Duration) {
-	c.exactMu.RLock()
-	defer c.exactMu.RUnlock()
-	return c.onReclaim
 }
 
 // doRaw runs one session-management request (probe/open/resume) on a pooled
@@ -507,16 +370,6 @@ func (c *Client) prepareConn(cn *conn) error {
 	}
 	cn.attached = es.id
 	return nil
-}
-
-// ReclaimDone tells the authority this session finished re-asserting its
-// coordination state, allowing the reclaim grace to lift early.
-func (c *Client) ReclaimDone() {
-	es := c.exactState()
-	if es == nil || es.isFenced() {
-		return
-	}
-	_, _ = c.doAttached(&Request{Op: OpReclaimDone, SessionID: es.id}, true)
 }
 
 // ExpireSession voluntarily fences this session (clean unmount): the authority
@@ -594,12 +447,7 @@ func (c *Client) doExactOnce(req *Request) (*Response, error) {
 			return nil, err
 		}
 		if !live {
-			if c.SessionFenced() {
-				return &Response{Status: ESTALE}, nil
-			}
-			// Legacy authority (or sessions disabled): plain v1 mutation,
-			// exactly the pre-session behavior of this client.
-			return c.doLegacy(req)
+			return &Response{Status: ESTALE}, nil
 		}
 		es = c.exactState()
 	}
@@ -643,23 +491,6 @@ func (c *Client) doExactOnce(req *Request) (*Response, error) {
 	// UNKNOWN: park the identity; the replayer resends it until definite.
 	c.parkExact(es, slot, seq, req)
 	return nil, ErrMutationUnknown
-}
-
-// doLegacy performs a single envelope-less v1 mutation with this client's
-// pre-session semantics (transparent single retry for the idempotent subset).
-func (c *Client) doLegacy(req *Request) (*Response, error) {
-	cn := <-c.conns
-	defer func() { c.conns <- cn }()
-	resp, err := cn.roundtrip(req)
-	if err == nil {
-		return resp, nil
-	}
-	if isIdempotent(req.Op) {
-		if resp2, err2 := cn.roundtrip(req); err2 == nil {
-			return resp2, nil
-		}
-	}
-	return nil, err
 }
 
 // finishExact commits a definite outcome and maintains session health state.

@@ -1,8 +1,16 @@
-// Command pfstorture is the crash-durability torture loop: it repeatedly
-// SIGKILLs a real authority OS process mid-write-storm and proves that every
-// acknowledged write survives restart, byte for byte.
+// Command pfstorture is the crash-durability torture loop. It has two
+// campaigns:
 //
-//	pfstorture -serve-bin /path/to/pfsbench [-k 10] [-seed 42] [-out report.json]
+//   - authority-kill (default): repeatedly SIGKILL a real authority OS
+//     process mid-write-storm and prove every acknowledged write survives
+//     restart, byte for byte.
+//   - client-kill: keep the authority healthy and SIGKILL the write-back
+//     MOUNT CLIENT (a real clientcore volume with the adaptive engine and a
+//     durable store) mid-storm; a fresh client on the same store must
+//     automatically recover the parked stream, after which every
+//     acknowledged step must be present on the authority byte-exactly.
+//
+//	pfstorture -serve-bin /path/to/pfsbench [-mode authority-kill|client-kill] [-k 10] [-seed 42] [-out report.json]
 //
 // Per iteration: start `pfsbench serve` (the same workfs + WAL + fsproto stack
 // the vcs authority wires into its data plane — the full vcs binary needs a
@@ -48,6 +56,7 @@ type iterationReport struct {
 	Iteration    int     `json:"iteration"`
 	Seed         int64   `json:"seed"`
 	KillAfterMs  int64   `json:"killAfterMs"`
+	KillOnAcks   int     `json:"killOnAcks,omitempty"`
 	AckedCreates int     `json:"ackedCreates"`
 	AckedWrites  int     `json:"ackedWrites"`
 	AckedBytes   int64   `json:"ackedBytes"`
@@ -60,6 +69,7 @@ type iterationReport struct {
 
 type report struct {
 	K        int               `json:"k"`
+	Mode     string            `json:"mode"`
 	Passed   int               `json:"passed"`
 	Runs     []iterationReport `json:"runs"`
 	Started  time.Time         `json:"started"`
@@ -69,17 +79,33 @@ type report struct {
 func main() {
 	log.SetFlags(0)
 	serveBin := flag.String("serve-bin", "", "path to the pfsbench binary (its serve mode is the authority under torture)")
+	daemonBin := flag.String("daemon-bin", "", "path to the portablefsd binary (required for -mode daemon-kill)")
 	k := flag.Int("k", 10, "iterations (kill -9 + restart cycles)")
 	seed := flag.Int64("seed", 42, "base RNG seed (iteration i uses seed+i)")
+	mode := flag.String("mode", "authority-kill", "authority-kill (SIGKILL the authority mid-storm), client-kill (SIGKILL the write-back mount client mid-storm, restart, require recovery), or daemon-kill (SIGKILL a real portablefsd behind the pfslocal boundary mid-storm, restart, require the attach-readiness recovery gate to drain)")
 	out := flag.String("out", "", "JSON report path (default: none)")
 	flag.Parse()
 	if *serveBin == "" {
 		log.Fatal("pfstorture: -serve-bin is required (go build -o pfsbench ./bench/cmd/pfsbench)")
 	}
+	if *mode != "authority-kill" && *mode != "client-kill" && *mode != "daemon-kill" {
+		log.Fatalf("pfstorture: unknown -mode %q", *mode)
+	}
+	if *mode == "daemon-kill" && *daemonBin == "" {
+		log.Fatal("pfstorture: -daemon-bin is required for -mode daemon-kill (go build -o portablefsd ./cmd/portablefsd)")
+	}
 
-	rep := report{K: *k, Started: time.Now()}
+	rep := report{K: *k, Mode: *mode, Started: time.Now()}
 	for i := 0; i < *k; i++ {
-		ir := runIteration(i, *seed+int64(i), *serveBin)
+		var ir iterationReport
+		switch *mode {
+		case "client-kill":
+			ir = runClientKillIteration(i, *seed+int64(i), *serveBin)
+		case "daemon-kill":
+			ir = runDaemonKillIteration(i, *seed+int64(i), *serveBin, *daemonBin)
+		default:
+			ir = runIteration(i, *seed+int64(i), *serveBin)
+		}
 		rep.Runs = append(rep.Runs, ir)
 		if ir.OK {
 			rep.Passed++

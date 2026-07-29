@@ -41,9 +41,10 @@ import {
   type Pft2Node,
   type Pft2Ref,
   type Pft2Root,
+  isZeroCell,
+  type Pft2NodeSink,
+  type Pft2PackSink,
 } from "./types.js";
-import { isZeroCell } from "./builder.js";
-import type { Pft2NodeSink, Pft2PackSink } from "./builder.js";
 import { compareBytes, utf8Encode } from "./wire.js";
 
 // ─── per-edge child verification (mirror of vcs/internal/pft2/verify.go) ────

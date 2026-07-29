@@ -134,11 +134,10 @@ apt-get update && apt-get install -y curl ca-certificates fuse3 tmux
 curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh
 
 mkdir -p /work
-# --fast: this container is the only writer, so let writes batch locally and
-# flush every 250ms — build/install-heavy agent work runs ~25x faster, and
-# fsync (git commit, SQLite) remains a real durability barrier. Drop --fast
-# if you will edit the same files live from another machine at the same time.
-portablefs mount myrepo /work --fast
+# Delegation is adaptive: uncontended writes batch locally, contended paths
+# stay write-through, and fsync (git commit, SQLite) remains the explicit
+# authority-durability barrier.
+portablefs mount myrepo /work
 
 # install your agent CLI of choice (claude, codex, ...), then run it in tmux
 # so it survives your SSH/attach session ending:

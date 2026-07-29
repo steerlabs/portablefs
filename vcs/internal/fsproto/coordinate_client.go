@@ -18,32 +18,15 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
-// ErrLegacyAuthority reports a managed coordination call against an authority
-// that never negotiated exact sessions (legacy v1 server).
-var ErrLegacyAuthority = errors.New("fsproto: authority does not speak the exact session protocol")
-
-// serverManagedActive reports whether the authority negotiated the managed
-// journaled-coordination protocol for this client.
-func (c *Client) serverManagedActive() bool {
-	c.exactMu.RLock()
-	defer c.exactMu.RUnlock()
-	return c.serverManaged
-}
-
-// ServerManaged reports whether the authority negotiated managed journaled
-// coordination. Frontends use it to route locks, checkouts, and open pins
-// through the exact coordination surface.
-func (c *Client) ServerManaged() bool { return c.serverManagedActive() }
-
-// doCoordinate executes one coordination mutation under an exact identity
-// against a managed authority. It mirrors doExactOnce's transport contract;
-// EAGAIN/EBUSY are returned to the caller (definite, identity consumed —
-// retries use a fresh identity at the caller's cadence).
+// doCoordinate executes one coordination mutation under an exact identity.
+// It mirrors doExactOnce's transport contract; EAGAIN/EBUSY are returned to
+// the caller (definite, identity consumed — retries use a fresh identity at
+// the caller's cadence).
 func (c *Client) doCoordinate(req *Request) (*Response, error) {
 	if live, err := c.EnsureExactSession(); err != nil {
 		return nil, err
 	} else if !live {
-		return nil, ErrLegacyAuthority
+		return &Response{Status: ESTALE}, nil
 	}
 	es := c.exactState()
 	if es == nil || es.isFenced() {
@@ -75,6 +58,66 @@ func (c *Client) doCoordinate(req *Request) (*Response, error) {
 	}
 	c.parkExact(es, slot, seq, req)
 	return nil, ErrMutationUnknown
+}
+
+// doCoordinateResolved is doCoordinate for decisions whose outcome the
+// caller must KNOW before proceeding (delegation acquire and release): a
+// sent-but-unanswered request replays the IDENTICAL exact identity until a
+// definite reply arrives, the session fences, or the client closes. It never
+// hands the identity to the background replayer and returns
+// ErrMutationUnknown — an unknown acquire outcome would leave the authority
+// possibly holding a grant the engine does not know exists, and reinterpreting
+// it as a denial (write-through) would fork the mutation lanes.
+func (c *Client) doCoordinateResolved(req *Request) (*Response, error) {
+	if live, err := c.EnsureExactSession(); err != nil {
+		return nil, err
+	} else if !live {
+		return &Response{Status: ESTALE}, nil
+	}
+	es := c.exactState()
+	if es == nil || es.isFenced() {
+		return &Response{Status: ESTALE}, nil
+	}
+	slot, seq, err := es.acquire(opTimeout)
+	if err != nil {
+		return nil, err
+	}
+	req.Env = es.envelope(slot, seq)
+	if req.Owner == "" {
+		req.Owner = c.owner
+	}
+	sent := false
+	backoff := parkRetryMin
+	for {
+		resp, wasSent, rerr := c.roundtripExact(req)
+		if rerr == nil {
+			c.finishExact(es, slot, seq, resp)
+			return resp, nil
+		}
+		sent = sent || wasSent
+		if !sent {
+			// Nothing ever hit a connection: the identity is provably
+			// unused, so the authority holds nothing — a definite outcome.
+			es.abort(slot)
+			if es.isFenced() {
+				return &Response{Status: ESTALE}, nil
+			}
+			return nil, rerr
+		}
+		select {
+		case <-es.stop:
+			// Fenced with the identity unresolved: the slot retires with
+			// the session; any grant it committed is bound to the fenced
+			// generation and resolves through terminalization + recovery.
+			return &Response{Status: ESTALE}, nil
+		case <-c.closed:
+			return nil, rerr
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > parkRetryMax {
+			backoff = parkRetryMax
+		}
+	}
 }
 
 // LockManaged performs a managed (journaled, inode-keyed) lock operation.
@@ -122,9 +165,12 @@ func (c *Client) CheckoutManaged(path string) (granted bool, heldBy, epoch strin
 }
 
 // CheckinManaged releases the caller's managed checkout grant (path, epoch).
-// ENOENT (not the caller's live grant) is reported as an error.
+// ENOENT (not the caller's live grant) is reported as an error. The outcome
+// is RESOLVED: a lost release reply replays the identical identity until the
+// stored outcome answers — the caller never guesses whether the grant is
+// still held.
 func (c *Client) CheckinManaged(path, epoch string) error {
-	resp, err := c.doCoordinate(&Request{Op: OpCheckin, Path: path, CheckoutEpoch: epoch, Owner: c.owner})
+	resp, err := c.doCoordinateResolved(&Request{Op: OpCheckin, Path: path, CheckoutEpoch: epoch, Owner: c.owner})
 	if err != nil {
 		return err
 	}
@@ -134,30 +180,121 @@ func (c *Client) CheckinManaged(path, epoch string) error {
 	return nil
 }
 
-// FlushBatchWriteBack ships one write-back session batch. Against a managed
-// (journal-native) authority it rides the mount's exact session under a flush
-// identity (doCoordinate), carrying the durable checkout grant (grantPath,
-// grantEpoch) the authority pins its per-grant flush watermark to — so a lost
-// reply replays the IDENTICAL identity and the server returns the stored
-// AppliedThrough (Duplicate) instead of re-applying. Against a legacy authority
-// it degrades to the envelope-less v1 watermark FlushBatch, unchanged.
-func (c *Client) FlushBatchWriteBack(writebackID string, epoch uint64, owner, grantPath, grantEpoch string, records []wal.Record) (uint64, int32, error) {
-	if !c.serverManagedActive() {
-		return c.FlushBatch(writebackID, epoch, owner, records)
-	}
-	resp, err := c.doCoordinate(&Request{
+// FlushWriteback ships one dense same-scope run of the mount write-back
+// stream. Exactness rides the stream's durable watermark + digest (a lost
+// reply resends identical bytes and the authority drops the covered prefix),
+// so no slot identity is consumed.
+func (c *Client) FlushWriteback(writebackID, grantPath, grantEpoch string, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
+	resp, err := c.doAttached(&Request{
 		Op:            OpFlushBatch,
 		SessionID:     writebackID,
-		Epoch:         epoch,
-		Owner:         owner,
+		Owner:         c.owner,
 		CheckoutPath:  grantPath,
 		CheckoutEpoch: grantEpoch,
+		WBPrevDigest:  prevDigest[:],
+		WBEndDigest:   endDigest[:],
 		Records:       records,
-	})
+	}, false)
 	if err != nil {
 		return 0, EIO, err
 	}
 	return resp.AppliedThrough, resp.Status, nil
+}
+
+// DelegationGrant is the authority's adaptive decision for one scope.
+type DelegationGrant struct {
+	Granted bool
+	Epoch   string
+	// Exists/Self describe the scope path when it exists; HasChildren
+	// carries an existing directory's authoritative snapshot. A duplicate
+	// replay of a lost grant reply has neither — the caller re-seeds with
+	// one readdir under the held grant.
+	Exists      bool
+	Self        Attr
+	HasChildren bool
+	Children    []Dirent
+}
+
+// DelegationAcquire asks the adaptive policy to delegate scope to this
+// mount's stream. granted=false is a DEFINITE denial (run write-through and
+// back off); the outcome is resolved — a lost grant reply replays the
+// identical identity until the stored outcome answers, so the authority can
+// never hold a grant the caller does not know exists.
+func (c *Client) DelegationAcquire(scope, writebackID string) (DelegationGrant, error) {
+	resp, err := c.doCoordinateResolved(&Request{Op: OpDelegationAcquire, Path: scope, SessionID: writebackID, Owner: c.owner})
+	if err != nil {
+		return DelegationGrant{}, err
+	}
+	switch resp.Status {
+	case OK:
+		g := DelegationGrant{Granted: true, Epoch: resp.CheckoutEpoch}
+		if resp.Attr != nil {
+			g.Exists = true
+			g.Self = *resp.Attr
+			if resp.Attr.Kind == "directory" {
+				g.HasChildren = true
+				g.Children = resp.Entries
+			}
+		}
+		return g, nil
+	case EBUSY, EAGAIN:
+		return DelegationGrant{}, nil
+	default:
+		return DelegationGrant{}, statusError("delegation acquire", resp.Status)
+	}
+}
+
+// WritebackState reads a stream's durable watermark + digest.
+func (c *Client) WritebackState(writebackID string) (exists bool, through uint64, digest [32]byte, err error) {
+	resp, err := c.doAttached(&Request{Op: OpWritebackState, SessionID: writebackID}, true)
+	if err != nil {
+		return false, 0, digest, err
+	}
+	if resp.Status != OK {
+		return false, 0, digest, statusError("writeback state", resp.Status)
+	}
+	copy(digest[:], resp.WBDigest)
+	return resp.WBExists, resp.AppliedThrough, digest, nil
+}
+
+// WritebackRebind claims a parked stream's recovery scopes under this
+// session after the authority verified the stream identity and digest.
+// Typed conflicts are returned without error; nothing partial commits.
+func (c *Client) WritebackRebind(writebackID string, scopes []WBScope, through uint64, digest [32]byte) ([]WBConflict, error) {
+	resp, err := c.doCoordinate(&Request{
+		Op: OpWritebackRebind, SessionID: writebackID, Owner: c.owner,
+		WBScopes: scopes, WBThrough: through, WBPrevDigest: digest[:],
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status == OK {
+		return nil, nil
+	}
+	if len(resp.WBConflicts) > 0 || resp.Status == EIO {
+		if len(resp.WBConflicts) == 0 {
+			// A duplicate replay of a conflicted rebind: the details are
+			// re-derivable, the verdict is not OK.
+			resp.WBConflicts = []WBConflict{{Kind: "SCOPE_MISSING"}}
+		}
+		return resp.WBConflicts, nil
+	}
+	return nil, statusError("writeback rebind", resp.Status)
+}
+
+// WritebackDiscard releases a parked stream's recovery scopes as an audited
+// data-loss decision.
+func (c *Client) WritebackDiscard(writebackID string, scopes []WBScope) error {
+	resp, err := c.doCoordinate(&Request{
+		Op: OpWritebackDiscard, SessionID: writebackID, Owner: c.owner, WBScopes: scopes,
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Status != OK {
+		return statusError("writeback discard", resp.Status)
+	}
+	return nil
 }
 
 // MarkOpenManaged journals the durable open pin transition for ino.
@@ -182,7 +319,7 @@ func (c *Client) unmarkOpenBatchManaged(req *Request) (int32, error) {
 	if live, err := c.EnsureExactSession(); err != nil {
 		return EIO, err
 	} else if !live {
-		return EIO, ErrLegacyAuthority
+		return ESTALE, nil
 	}
 	es := c.exactState()
 	if es == nil || es.isFenced() {
@@ -265,13 +402,9 @@ func (c *Client) Sync() error {
 // waits for every earlier and parked exact identity to resolve by holding the
 // whole slot budget, (2) submits one journaled control-only barrier row under
 // an exact identity, whose ordered apply proves every earlier journal row is
-// durable, applied, and published, then (3) releases the gate. Against a
-// legacy authority it degrades to the envelope-less barrier. Callers flush
+// durable, applied, and published, then (3) releases the gate. Callers flush
 // their write-back sessions FIRST (the flush consumes slots itself).
 func (c *Client) SyncVolume() error {
-	if !c.serverManagedActive() {
-		return c.Sync()
-	}
 	es := c.exactState()
 	if es == nil {
 		live, err := c.EnsureExactSession()
@@ -279,7 +412,7 @@ func (c *Client) SyncVolume() error {
 			return err
 		}
 		if !live {
-			return c.Sync()
+			return ErrSessionFenced
 		}
 		es = c.exactState()
 	}

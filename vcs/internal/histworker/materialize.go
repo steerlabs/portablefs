@@ -103,6 +103,7 @@ func (w *Worker) materializeClaim(rootCtx, ctx context.Context, claim CutClaim) 
 			"phase":           store.Phase(),
 			"uploadedObjects": store.ObjectsUploaded.Load(),
 			"uploadedBytes":   store.BytesUploaded.Load(),
+			"skippedObjects":  store.ObjectsSkipped.Load(),
 			"fetchedObjects":  store.ObjectsFetched.Load(),
 			"elapsedMs":       time.Since(started).Milliseconds(),
 		}
@@ -117,6 +118,7 @@ func (w *Worker) materializeClaim(rootCtx, ctx context.Context, claim CutClaim) 
 			"recoveryObjects": result.RecoveryObjectCount,
 			"uploadedObjects": store.ObjectsUploaded.Load(),
 			"uploadedBytes":   store.BytesUploaded.Load(),
+			"skippedObjects":  store.ObjectsSkipped.Load(),
 			"elapsedMs":       time.Since(started).Milliseconds(),
 		})
 	case rootCtx.Err() != nil:
@@ -162,6 +164,7 @@ func (w *Worker) heartbeatWithRetries(matCtx context.Context, log *Logger, claim
 			"phase":           store.Phase(),
 			"uploadedObjects": store.ObjectsUploaded.Load(),
 			"uploadedBytes":   store.BytesUploaded.Load(),
+			"skippedObjects":  store.ObjectsSkipped.Load(),
 			"fetchedObjects":  store.ObjectsFetched.Load(),
 			"storeRetries":    store.StoreRetries.Load(),
 		}
@@ -255,6 +258,14 @@ func (w *Worker) runReduction(ctx context.Context, claim CutClaim, store *cutSto
 		Legacy:  sources,
 		Blobs:   blobs,
 		Spool:   store,
+		// Adopted-base folds publish O(delta): the reducer reports only the
+		// objects this run produced and the base cut's registered closure
+		// rows are copied server-side at publication. Copied rows are a
+		// SUPERSET of the reachable set (deletions accumulate along the
+		// chain), so a deterministic slice of cuts refreshes the exact
+		// closure to keep registration — and therefore GC rootedness —
+		// bounded.
+		DeltaClosures: !exactClosureRefresh(claim.Facts.CutDigest),
 	}
 	result, err := m.Run(ctx)
 	if err != nil {
@@ -304,9 +315,11 @@ func (w *Worker) driveLegacySteps(ctx context.Context, claim CutClaim) error {
 	return nil
 }
 
-// publishReady registers both closures, proves fresh verified copies in
-// every required domain for every closure object (uploading or
-// re-verifying as needed), and marks the cut ready atomically.
+// publishReady registers the closures (only this run's delta when the
+// reduction folded over an adopted base — the base cut's rows are copied
+// server-side), proves quorum coverage for every registered object
+// (produced objects were receipted at upload), and marks the cut ready
+// atomically.
 func (w *Worker) publishReady(ctx context.Context, claim CutClaim, store *cutStore, result *historycut.Result) error {
 	if err := w.proveClosure(ctx, claim, store, result.UserClosure); err != nil {
 		return err
@@ -319,6 +332,19 @@ func (w *Worker) publishReady(ctx context.Context, claim CutClaim, store *cutSto
 	}
 	if err := w.addClosure(ctx, claim, "recovery", result.RecoveryClosure); err != nil {
 		return err
+	}
+	totals := ClosureTotals{
+		UserObjectCount:     int64(result.UserObjectCount),
+		UserObjectBytes:     int64(result.UserObjectBytes),
+		RecoveryObjectCount: int64(result.RecoveryObjectCount),
+		RecoveryObjectBytes: int64(result.RecoveryObjectBytes),
+	}
+	if result.DeltaClosures {
+		copied, err := w.repo.AddCutObjectsFromBase(ctx, claim.Facts.CutID, claim.ClaimEpoch)
+		if err != nil {
+			return err
+		}
+		totals = copied
 	}
 
 	namespace, err := strconv.ParseInt(claim.Facts.InodeNamespace, 10, 64)
@@ -340,10 +366,10 @@ func (w *Worker) publishReady(ctx context.Context, claim CutClaim, store *cutSto
 		MaxInoSeen:     int64(result.MaxInoSeen),
 		RootMaxInoSeen: int64(result.RootMaxInoSeen),
 
-		UserObjectCount:     int64(result.UserObjectCount),
-		UserObjectBytes:     int64(result.UserObjectBytes),
-		RecoveryObjectCount: int64(result.RecoveryObjectCount),
-		RecoveryObjectBytes: int64(result.RecoveryObjectBytes),
+		UserObjectCount:     totals.UserObjectCount,
+		UserObjectBytes:     totals.UserObjectBytes,
+		RecoveryObjectCount: totals.RecoveryObjectCount,
+		RecoveryObjectBytes: totals.RecoveryObjectBytes,
 	}
 	if result.ControlRoot != nil {
 		ready.ControlRootDigestHex = result.ControlRoot.Hex()
@@ -426,6 +452,8 @@ func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, 
 	// hold — presenting one anyway fences the whole cut attempt into an
 	// endless retry loop the moment a reused base copy ages past the
 	// freshen floor.
+	quorum := writeQuorum(len(claim.ReplicationPolicy.RequiredFailureDomains))
+	fresh := 0
 	var stale []string   // present, bytes re-verified at the recorded key, freshness receipt due
 	var missing []string // absent, corrupt, or unreachable: heal through re-upload
 	for _, domain := range claim.ReplicationPolicy.RequiredFailureDomains {
@@ -435,6 +463,7 @@ func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, 
 			continue
 		}
 		if copyRec.LastVerified >= freshFloor {
+			fresh++
 			continue
 		}
 		domainStore, ok := w.stores.Get(domain)
@@ -450,7 +479,10 @@ func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, 
 		}
 		stale = append(stale, domain)
 	}
-	if len(stale) == 0 && len(missing) == 0 {
+	if fresh >= quorum {
+		// Enough already-fresh verified copies: no intent, no receipts — the
+		// publication counts the object on presence and repair heals any
+		// domain the quorum leaves uncovered.
 		return nil
 	}
 
@@ -475,6 +507,7 @@ func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, 
 	// proof object_copy_receipt admits. Valid only while the recorded key is
 	// the bound incarnation's exact key — an intent that bumped the
 	// incarnation (sweep race) moves the copy to the re-upload arm instead.
+	proven := fresh
 	for _, domain := range stale {
 		domainStore, ok := w.stores.Get(domain)
 		if !ok {
@@ -492,22 +525,22 @@ func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, 
 			digest, incarnation, domain, key, loc.Size); err != nil {
 			return err
 		}
+		proven++
 	}
 	if len(missing) == 0 {
 		return nil
 	}
 
-	// Re-upload path: verified bytes from cache or any healthy domain.
-	ref, err := refFromDigest(hexDigest, loc.Size)
-	if err != nil {
-		return err
-	}
-	data, ok := store.CachedBytes(ref)
-	if !ok {
-		data, err = store.fetchRecorded(ctx, ref)
-		if err != nil {
-			return fmt.Errorf("histworker: closure object %s has no healthy source for repair: %w", digest, err)
+	// Re-upload path: verified bytes from cache or any healthy domain. A
+	// domain outage here fails the object only below the write quorum;
+	// domains a passing quorum leaves unwritten heal through repair.
+	var domainErrs []error
+	data, fetchErr := proveSourceBytes(ctx, store, hexDigest, loc.Size)
+	if fetchErr != nil {
+		if proven >= quorum {
+			return nil
 		}
+		return fmt.Errorf("histworker: closure object %s has no healthy source for repair: %w", digest, fetchErr)
 	}
 	for _, domain := range missing {
 		domainStore, ok := w.stores.Get(domain)
@@ -519,17 +552,39 @@ func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, 
 			return err
 		}
 		if err := domainStore.Put(ctx, key, loc.Size, hexDigest, bytes.NewReader(data)); err != nil {
-			return err
+			domainErrs = append(domainErrs, err)
+			continue
 		}
 		if err := readbackVerified(ctx, domainStore, key, loc.Size, hexDigest); err != nil {
-			return err
+			domainErrs = append(domainErrs, err)
+			continue
 		}
 		if err := w.repo.RecordCopyReceipt(ctx, claim.Facts.CutID, claim.ClaimEpoch,
 			digest, incarnation, domain, key, loc.Size); err != nil {
 			return err
 		}
+		proven++
 	}
-	return nil
+	if proven >= quorum {
+		return nil
+	}
+	if len(domainErrs) > 0 {
+		return domainErrs[0]
+	}
+	return fmt.Errorf("histworker: %s proved %d of the %d-copy write quorum", digest, proven, quorum)
+}
+
+// proveSourceBytes resolves verified object bytes for closure repair from
+// the run's local copies first, then any healthy recorded domain.
+func proveSourceBytes(ctx context.Context, store *cutStore, hexDigest string, size int64) ([]byte, error) {
+	ref, err := refFromDigest(hexDigest, size)
+	if err != nil {
+		return nil, err
+	}
+	if data, ok := store.CachedBytes(ref); ok {
+		return data, nil
+	}
+	return store.fetchRecorded(ctx, ref)
 }
 
 func refFromDigest(hexDigest string, size int64) (pft2.Ref, error) {
@@ -541,6 +596,22 @@ func refFromDigest(hexDigest string, size int64) (pft2.Ref, error) {
 	copy(ref.Digest[:], raw)
 	ref.Size = uint64(size)
 	return ref, nil
+}
+
+// exactClosureRefresh selects the deterministic ~1-in-16 slice of cuts
+// that publish an EXACT closure instead of the delta+base-copy form: the
+// copied rows are supersets (objects deleted since the base stay
+// registered), and without a periodic exact refresh the superset would
+// grow with churn forever. The choice is a pure function of the frozen
+// cut digest, so every retry of the same cut makes the same choice, and
+// an absent digest (legacy sources, which never fold over adopted bases)
+// conservatively selects exact.
+func exactClosureRefresh(cutDigestHex string) bool {
+	raw, err := hex.DecodeString(cutDigestHex)
+	if err != nil || len(raw) == 0 {
+		return true
+	}
+	return raw[0]>>4 == 0
 }
 
 // errDoc is the bounded structured error the database stores on a cut.

@@ -1,13 +1,10 @@
 export {
+  assertProductionAuthorityManagerMode,
   AuthorityOperationError,
   authorityOperationErrorCodes,
   createAuthorityManagerServer,
-  createEnvAuthorityRegistry,
-  readAuthorityManagerMode,
-  validateEnvAuthorityRegistryConfig,
   type AccessLeaseCreation,
   type AccessLeaseHandler,
-  type AuthorityManagerMode,
   type AuthorityManagerModeEnv,
   type AuthorityEndpoint,
   type AuthorityLeaseBinding,
@@ -15,8 +12,6 @@ export {
   type AuthorityRef,
   type AuthorityRegistry,
   type AuthorityStopResult,
-  type EnvAuthorityRegistryConfig,
-  type ValidateEnvAuthorityRegistryConfigOptions,
 } from "./server.js";
 export {
   createAuthorityDataPlaneRouterServer,

@@ -7,7 +7,7 @@
 // the credential endpoint for future fsproto reconnect handshakes.
 //
 // pfslocal exposes xattr and hard-link operations. Extended attributes are
-// served NATIVELY when the attached authority advertises FeatXattrs (the
+// served NATIVELY by the attached authority (xattrs are baseline; the
 // ResolveReply capability is per-attach): reads forward to the authority's
 // live xattr state, mutations journal write-through, and macOS stops minting
 // AppleDouble ._ sidecars. Against an older authority the ops return Darwin

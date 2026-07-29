@@ -91,11 +91,14 @@ type LockEntryValue struct {
 	Write  bool
 }
 
-// CheckoutEntryValue is one checkout grant.
+// CheckoutEntryValue is one checkout grant. Delegation grants carry their
+// write-back stream binding and, after holder death, the recovery flag.
 type CheckoutEntryValue struct {
-	Path   string
-	Holder SessionRef
-	Epoch  Epoch
+	Path        string
+	Holder      SessionRef
+	Epoch       Epoch
+	WritebackID string
+	Recovery    bool
 }
 
 // PinEntryValue is one durable open pin.
@@ -104,13 +107,12 @@ type PinEntryValue struct {
 	Ino     uint64
 }
 
-// FlushEntryValue is one flush-ledger watermark.
+// FlushEntryValue is one mount stream's durable flush state.
 type FlushEntryValue struct {
-	Session       SessionRef
-	WritebackID   string
-	CheckoutPath  string
-	CheckoutEpoch Epoch
-	Through       uint64
+	Owner       SessionRef
+	WritebackID string
+	Through     uint64
+	Digest      [DigestBytes]byte
 }
 
 // Entry is one typed control-map entry (exactly one arm, matching Kind).
@@ -172,11 +174,7 @@ func (e *Entry) Key() []byte {
 		be64(e.Pin.Session.Generation)
 	case EntryFlush:
 		b = append(b, 0x07)
-		str(e.Flush.Session.SessionID)
-		be64(e.Flush.Session.Generation)
 		str(e.Flush.WritebackID)
-		str(e.Flush.CheckoutPath)
-		b = append(b, e.Flush.CheckoutEpoch...)
 	}
 	return b
 }
@@ -298,6 +296,12 @@ func (e *Entry) Validate() error {
 		if err := c.Epoch.Validate(); err != nil {
 			return fmt.Errorf("checkout entry: %w", err)
 		}
+		if c.WritebackID != "" && !restrictedName(c.WritebackID, MaxWritebackIDBytes) {
+			return malformedf("checkout entry: malformed writeback id")
+		}
+		if c.Recovery && c.WritebackID == "" {
+			return malformedf("checkout entry: recovery state requires a stream binding")
+		}
 	case EntryPin:
 		p := e.Pin
 		if p == nil {
@@ -314,20 +318,17 @@ func (e *Entry) Validate() error {
 		if f == nil {
 			return malformedf("entry kind %d without its union arm", e.Kind)
 		}
-		if err := validateSessionRef("flush entry", f.Session); err != nil {
+		if err := validateSessionRef("flush entry", f.Owner); err != nil {
 			return err
 		}
 		if !restrictedName(f.WritebackID, MaxWritebackIDBytes) {
 			return malformedf("flush entry: malformed writeback id")
 		}
-		if err := ValidateCanonicalPath(f.CheckoutPath); err != nil {
-			return fmt.Errorf("flush entry: %w", err)
-		}
-		if err := f.CheckoutEpoch.Validate(); err != nil {
-			return fmt.Errorf("flush entry: %w", err)
-		}
 		if f.Through == 0 {
 			return malformedf("flush entry: through must be nonzero")
+		}
+		if f.Digest == ([DigestBytes]byte{}) {
+			return malformedf("flush entry: all-zero stream digest is never a canonical chain value")
 		}
 	default:
 		return malformedf("unknown entry kind %d", e.Kind)
@@ -347,9 +348,9 @@ func (e *Entry) Validate() error {
 //	Slot:       1 session  2 slot  3 next_seq  4 retired_through  5 latest_seq
 //	            6 latest_hash[32]  7 latest_outcome
 //	Lock:       1 ino  2 session  3 lock_owner  4 start  5 length  6 write(b)
-//	Checkout:   1 path  2 session  3 epoch
+//	Checkout:   1 path  2 session  3 epoch  4 writeback_id  5 recovery(b)
 //	Pin:        1 session  2 ino
-//	Flush:      1 session  2 writeback_id  3 path  4 epoch  5 through
+//	Flush:      1 owner_session  2 writeback_id  5 through  6 digest[32]
 
 // EncodeEntry encodes e into its unique canonical byte string.
 func EncodeEntry(e *Entry) ([]byte, error) {
@@ -401,6 +402,10 @@ func EncodeEntry(e *Entry) ([]byte, error) {
 		arm = pfwire.AppendString(arm, 1, c.Path)
 		arm = pfwire.AppendBytes(arm, 2, appendSessionRef(nil, c.Holder))
 		arm = pfwire.AppendString(arm, 3, string(c.Epoch))
+		if c.WritebackID != "" {
+			arm = pfwire.AppendString(arm, 4, c.WritebackID)
+		}
+		arm = pfwire.AppendBool(arm, 5, c.Recovery)
 		field = 6
 	case EntryPin:
 		p := e.Pin
@@ -409,11 +414,10 @@ func EncodeEntry(e *Entry) ([]byte, error) {
 		field = 7
 	case EntryFlush:
 		f := e.Flush
-		arm = pfwire.AppendBytes(arm, 1, appendSessionRef(nil, f.Session))
+		arm = pfwire.AppendBytes(arm, 1, appendSessionRef(nil, f.Owner))
 		arm = pfwire.AppendString(arm, 2, f.WritebackID)
-		arm = pfwire.AppendString(arm, 3, f.CheckoutPath)
-		arm = pfwire.AppendString(arm, 4, string(f.CheckoutEpoch))
 		arm = pfwire.AppendUint(arm, 5, f.Through)
+		arm = pfwire.AppendBytes(arm, 6, f.Digest[:])
 		field = 8
 	}
 	body = pfwire.AppendUint(body, 1, uint64(e.Kind))
@@ -793,6 +797,14 @@ func decodeCheckoutEntryValue(body []byte) (*CheckoutEntryValue, error) {
 				return nil, err
 			}
 			c.Epoch = Epoch(s)
+		case field == 4 && wt == pfwire.TypeBytes:
+			if c.WritebackID, err = rd.String(field, MaxWritebackIDBytes); err != nil {
+				return nil, err
+			}
+		case field == 5 && wt == pfwire.TypeVarint:
+			if c.Recovery, err = rd.Bool(field); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, rd.RejectUnknown(field)
 		}
@@ -854,25 +866,19 @@ func decodeFlushEntryValue(body []byte) (*FlushEntryValue, error) {
 			if err != nil {
 				return nil, err
 			}
-			if f.Session, err = decodeSessionRef("pfc2 flush entry session", msg); err != nil {
+			if f.Owner, err = decodeSessionRef("pfc2 flush entry owner", msg); err != nil {
 				return nil, err
 			}
 		case field == 2 && wt == pfwire.TypeBytes:
 			if f.WritebackID, err = rd.String(field, MaxWritebackIDBytes); err != nil {
 				return nil, err
 			}
-		case field == 3 && wt == pfwire.TypeBytes:
-			if f.CheckoutPath, err = rd.String(field, MaxPathBytes); err != nil {
-				return nil, err
-			}
-		case field == 4 && wt == pfwire.TypeBytes:
-			s, err := rd.String(field, len(EpochBound))
-			if err != nil {
-				return nil, err
-			}
-			f.CheckoutEpoch = Epoch(s)
 		case field == 5 && wt == pfwire.TypeVarint:
 			if f.Through, err = rd.Uint(field); err != nil {
+				return nil, err
+			}
+		case field == 6 && wt == pfwire.TypeBytes:
+			if err := fixed32(rd, field, &f.Digest); err != nil {
 				return nil, err
 			}
 		default:
@@ -960,6 +966,7 @@ func (st *State) Project() *Projection {
 	for path, g := range st.checkouts {
 		p.Entries = append(p.Entries, Entry{Kind: EntryCheckout, Checkout: &CheckoutEntryValue{
 			Path: path, Holder: g.holder, Epoch: g.epoch,
+			WritebackID: g.writebackID, Recovery: g.recovery,
 		}})
 		p.Counts.Checkouts++
 	}
@@ -969,10 +976,9 @@ func (st *State) Project() *Projection {
 			p.Counts.Pins++
 		}
 	}
-	for k, through := range st.ledger {
+	for id, e := range st.ledger {
 		p.Entries = append(p.Entries, Entry{Kind: EntryFlush, Flush: &FlushEntryValue{
-			Session: k.session, WritebackID: k.writebackID, CheckoutPath: k.path,
-			CheckoutEpoch: k.epoch, Through: through,
+			Owner: e.owner, WritebackID: id, Through: e.through, Digest: e.digest,
 		}})
 		p.Counts.Flushes++
 	}
@@ -1150,13 +1156,18 @@ func Rebuild(p *Projection) (*State, error) {
 			counts.Locks++
 		case EntryCheckout:
 			v := e.Checkout
-			if _, err := rebuildLiveSession(st, v.Holder, "checkout entry"); err != nil {
-				return nil, fmt.Errorf("projection entry %d: %w", i, err)
+			if !v.Recovery {
+				// A recovery grant's holder is a dead generation (that is
+				// what recovery MEANS); only live grants get the liveness
+				// referential check.
+				if _, err := rebuildLiveSession(st, v.Holder, "checkout entry"); err != nil {
+					return nil, fmt.Errorf("projection entry %d: %w", i, err)
+				}
 			}
 			if v.Epoch.Compare(st.nextEpoch) >= 0 {
 				return nil, integrityf("projection entry %d: checkout epoch %s is not below the next epoch %s", i, v.Epoch, st.nextEpoch)
 			}
-			st.checkouts[v.Path] = checkoutGrant{holder: v.Holder, epoch: v.Epoch}
+			st.checkouts[v.Path] = checkoutGrant{holder: v.Holder, epoch: v.Epoch, writebackID: v.WritebackID, recovery: v.Recovery}
 			counts.Checkouts++
 		case EntryPin:
 			v := e.Pin
@@ -1173,15 +1184,22 @@ func Rebuild(p *Projection) (*State, error) {
 			counts.Pins++
 		case EntryFlush:
 			v := e.Flush
-			if _, err := rebuildLiveSession(st, v.Session, "flush entry"); err != nil {
-				return nil, fmt.Errorf("projection entry %d: %w", i, err)
+			// Checkout entries sort before flush entries, so the stream's
+			// scopes are already rebuilt: a stream survives either under a
+			// live owner or via recovery scopes referencing it.
+			recovery := false
+			for _, g := range st.checkouts {
+				if g.writebackID == v.WritebackID && g.recovery {
+					recovery = true
+					break
+				}
 			}
-			g, ok := st.checkouts[v.CheckoutPath]
-			if !ok || g.holder != v.Session || g.epoch != v.CheckoutEpoch {
-				return nil, integrityf("projection entry %d: flush ledger item names checkout %q epoch %s that is not the holder's live grant",
-					i, v.CheckoutPath, v.CheckoutEpoch)
+			if !recovery {
+				if _, err := rebuildLiveSession(st, v.Owner, "flush entry"); err != nil {
+					return nil, fmt.Errorf("projection entry %d: %w", i, err)
+				}
 			}
-			st.ledger[flushKey{session: v.Session, writebackID: v.WritebackID, path: v.CheckoutPath, epoch: v.CheckoutEpoch}] = v.Through
+			st.ledger[v.WritebackID] = ledgerEntry{through: v.Through, digest: v.Digest, owner: v.Owner}
 			counts.Flushes++
 		}
 	}

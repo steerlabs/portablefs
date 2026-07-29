@@ -12,10 +12,10 @@
 // timeout defaults are attested from their authoritative source
 // (pg_db_role_setting database defaults — see below); any other outcome is
 // a nonzero exit with a one-line error. It changes NO runtime behavior:
-// volume-api and volume-worker keep running applyMigrations() at startup,
-// so their startup migrations remain the safety net — this gate only moves
-// the same work earlier in the deploy so a bad migration fails the deploy
-// instead of the service fleet.
+// volume-api keeps running applyMigrations() at startup, so its startup
+// migrations remain the safety net — this gate only moves the same work
+// earlier in the deploy so a bad migration fails the deploy instead of the
+// service fleet.
 //
 // 016 attestation model:
 //   PRIMARY: pg_db_role_setting rows with setrole = 0 for the target

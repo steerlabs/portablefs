@@ -9,11 +9,11 @@ routable VCS authority endpoint and mount credential.
 product worker / CLI
         |
         | POST /v1/authorities/ensure
-        | POST /v1/authorities/session
+        | POST /v1/access-leases/create
         v
 PortableFS authority manager
         |
-        | production (journal) registry / router, or env registry
+        | production (journal) registry / router
         v
 one VCS authority instance for volume@branch
         |
@@ -22,12 +22,12 @@ one VCS authority instance for volume@branch
 agent sandbox mount
 ```
 
-The manager has two modes: **production** (`PORTABLEFS_AUTHORITY_MODE=production`,
-the journal-native registry — spawns one disposable journal child per active
-branch behind one TCP/TLS data-plane router) and **env** (a fixed-endpoint
-lookup table for smoke tests and deliberately static deployments). The retired
-WAL-paired `managed` mode fails startup by name and points at production as its
-successor.
+The manager has one mode: **production** (the journal-native registry — spawns
+one disposable journal child per active branch behind one TCP/TLS data-plane
+router). The retired WAL-paired `managed` mode and the retired fixed-endpoint
+`env` mode fail startup by name and point at production as the successor, as
+do the retired env-registry variables (`PORTABLEFS_AUTHORITY_URL`,
+`PORTABLEFS_AUTHORITY_MAP_JSON`).
 
 ## Contract
 
@@ -37,11 +37,7 @@ authenticated `GET /v1/release-identity` and `GET /metrics`
 ([Metrics](#metrics)).
 The packaged server fails closed when the token is absent unless
 `PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED=1` is explicitly set for local
-development; `NODE_ENV=production` rejects that unauthenticated bypass. The
-environment-backed mode also fails at startup when no authority endpoint is configured.
-In `NODE_ENV=production`, or when `PORTABLEFS_AUTHORITY_MANAGER_REQUIRE_HEALTH=1`,
-every configured environment endpoint must include a health URL so callers do not
-treat an unknown/dead VCS as healthy.
+development; `NODE_ENV=production` rejects that unauthenticated bypass.
 
 Request body:
 
@@ -56,37 +52,13 @@ Request body:
 Routes:
 
 - `POST /v1/authorities/ensure` returns the current routable authority address.
-- `POST /v1/authorities/session` returns the address plus the current mount credential.
 - `POST /v1/authorities/health` returns `{ "healthy": true }` when the authority is ready.
 - `POST /v1/authorities/stop` is a fenced lifecycle hook. The request must include
-  `expectedAuthority` with the `authorityInstanceId` returned by `ensure`/`session`.
+  `expectedAuthority` with the `authorityInstanceId` returned by `ensure`.
   Production mode stops only when that opaque instance id still matches the live
-  authority. Environment-backed mode has no owned process to stop and returns
-  `{ "stopped": false, "managed": false }`.
-- `POST /v1/volumes/:volumeId/mount-sessions` is the one-call convenience route:
-  `ensure` followed by `session` in a single request. See below.
-- `POST /v1/access-leases/*` is the canonical lease API for production mode. See
+  authority.
+- `POST /v1/access-leases/*` is the canonical lease API. See
   [Access Leases](#access-leases).
-
-## Mount Sessions
-
-`POST /v1/volumes/:volumeId/mount-sessions` (canonical)
-`POST /v1/mount-sessions` (alias with `volumeId` in the body)
-
-Resolves a volume to a mountable endpoint and mints the mount credential in one
-call, so simple clients do not need the two-step `ensure` + `session` dance. It runs
-the same registry paths as those routes, with the same authentication and the same
-error mapping (unknown volumes in environment mode return 404, child spawn
-failures surface as 500). A body `volumeId` that contradicts the URL is a 400.
-
-Request body (`branch` defaults to `main`):
-
-```json
-{
-  "branch": "main",
-  "teamId": "the-volume's-metadata-tenant-id"
-}
-```
 
 `teamId` is the volume's metadata tenant id. Production mode requires it on
 every authority/lease request — every authority, runtime row, and lease is
@@ -96,34 +68,8 @@ supplies a volume-api credential: the registry mints each spawned authority
 its own short-lived runtime read credential in the database (migration 015),
 scoped to the volume's owning tenant.
 
-Response:
-
-```json
-{
-  "mountSession": {
-    "volumeId": "vol_123",
-    "branch": "main",
-    "endpoint": {
-      "authorityUrl": "vcs.example.com:2050",
-      "host": "vcs.example.com",
-      "port": 2050,
-      "nfsPort": 2049
-    },
-    "token": "pfs_sess_...",
-    "expiresAtMs": 1767000000000,
-    "authorityInstanceId": "pfai_...",
-    "provider": "portablefs-managed"
-  }
-}
-```
-
-`nfsPort` appears only when the endpoint advertises one. `expiresAtMs` is present in
-production mode (the minted credential is an access lease with a real expiry) and
-omitted when the credential does not expire, as with a static environment-mode
-token. `token` is omitted when the environment endpoint has no configured
-credential.
-
-Response shape:
+`ensure` response shape (the mount credential is only ever minted through
+`/v1/access-leases/create`):
 
 ```json
 {
@@ -132,12 +78,20 @@ Response shape:
     "authorityUrl": "vcs.example.com:2050",
     "host": "vcs.example.com",
     "port": 2050,
-    "nfsPort": 2049,
-    "authorityInstanceId": "pfai_...",
-    "authorityAuthToken": "only returned by /session"
+    "authorityInstanceId": "pfai_..."
   }
 }
 ```
+
+## Retired session routes
+
+The legacy session-minting family — `POST /v1/mount-sessions`,
+`POST /v1/volumes/:volumeId/mount-sessions`, and `POST /v1/authorities/session`
+— is retired. For one release the routes remain as explicit tombstones: they
+answer `410 { "error": { "code": "MOUNT_SESSION_RETIRED" | "AUTHORITY_SESSION_RETIRED" } }`
+before any body parsing or registry dispatch. `POST /v1/access-leases/create`
+is the successor; it ensures the authority and mints the mount credential in
+one call.
 
 ## The Data-Plane Router
 
@@ -175,9 +129,8 @@ The repository ships deployable Dockerfiles for the hosted PortableFS
 services:
 
 - `Dockerfile.volume-api` runs `@portablefs/volume-api`, applies metadata
-  migrations on startup, and serves the lease/commit/blob/history API.
-- `Dockerfile.volume-worker` runs `@portablefs/volume-worker` one-shot jobs
-  (`integrity` by default; override the command for `gc`/`gc --dry-run`).
+  migrations on startup, and serves the lease/commit/blob/history API plus
+  the admin GC/integrity endpoints.
 - `Dockerfile.authority-manager` runs this manager plus the bundled Go `vcs`
   binary. No durable service volume is needed: production mode keeps no
   manager-local state.
@@ -186,8 +139,8 @@ services:
 
 ## Production Mode (Journal)
 
-Production mode (`PORTABLEFS_AUTHORITY_MODE=production`) is the journal-native
-registry for stateless manager deployments. Children journal to a fenced
+Production mode is the journal-native registry for stateless manager
+deployments. Children journal to a fenced
 remote Postgres journal instead of local WAL files, and manager, runtime, and
 lease control state lives in the `pfm` manager-control database
 (`PORTABLEFS_MANAGER_CONTROL_DATABASE_URL`). There is no persistent work
@@ -198,12 +151,10 @@ manager host is disposable, and the local-topology variables (`VCS_WAL`,
 startup.
 
 Mode selection is fail-closed. `PORTABLEFS_AUTHORITY_MODE=managed` (the
-retired WAL-paired local registry) refuses startup and names production as
-its successor. Without an explicit mode, the process-registry variables
-(`PORTABLEFS_MANAGED_VCS_BIN`, `PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR`)
-select production only when `PORTABLEFS_MANAGER_CONTROL_DATABASE_URL` is also
-configured; otherwise startup fails with the same message rather than
-guessing. Plain `env` deployments are unaffected.
+retired WAL-paired local registry) and `PORTABLEFS_AUTHORITY_MODE=env` (the
+retired fixed-endpoint registry) refuse startup and name production as the
+successor. `PORTABLEFS_AUTHORITY_MODE=production` remains accepted; an unset
+mode is production.
 
 ### Singleton manager and the epoch model
 
@@ -298,7 +249,6 @@ epoch. See docs/failure-modes.md "Manager Restart (Session Token Rejection)".
 ### Configuration
 
 ```bash
-PORTABLEFS_AUTHORITY_MODE=production
 PORTABLEFS_AUTHORITY_MANAGER_TOKEN=<manager-api-token>
 PORTABLEFS_MANAGER_CONTROL_DATABASE_URL=postgres://portablefs_manager@db.internal/pfm
 PORTABLEFS_MANAGED_VCS_BIN=/usr/local/bin/vcs
@@ -322,9 +272,8 @@ NO static child volume-api credential: setting `PORTABLEFS_VOLUME_API_TOKEN`
 (or `VOLUME_API_TOKEN`) is a startup error — children authenticate with
 manager-minted runtime read credentials (below).
 
-The TLS requirement is keyed to `PORTABLEFS_AUTHORITY_MODE=production`,
-not `NODE_ENV`; an unset or nonstandard Node environment can never weaken a
-production authority router.
+The TLS requirement is unconditional (never keyed to `NODE_ENV`); an unset or
+nonstandard Node environment can never weaken a production authority router.
 
 Optional: `PORTABLEFS_MANAGED_VCS_JOURNAL_POOLER_MODE=transaction` when the
 journal DSN reaches a transaction-mode pooler (PgBouncer/pgcat) — the manager
@@ -474,15 +423,14 @@ explicitly not the internal filesystem session: losing a lease token never
 loses filesystem state — the caller creates a fresh lease and reconnects. The
 wire contract (route names, shapes, `ACCESS_LEASE_*` error codes) is shared
 with hosted PortableFS stacks, so a consumer built against one works against
-the other. Environment mode does not manage leases and answers these routes
-with `ACCESS_LEASE_UNSUPPORTED`.
+the other.
 
 All six routes are `POST`, authenticated by the manager bearer token, and
 report failures as `{ "error": { "code": "ACCESS_LEASE_...", "message": "..." } }`:
 
 | Route | Purpose |
 | --- | --- |
-| `/v1/access-leases/create` | Ensure the authority and mint a lease. Returns `{ authority, lease, accessToken, serverTimeMs }`; `authority` carries `authorityUrl`, `host`, `port`, `nfsPort`, `authorityInstanceId`, and `provider`, with the access token as the mount credential. |
+| `/v1/access-leases/create` | Ensure the authority and mint a lease. Returns `{ authority, lease, accessToken, serverTimeMs }`; `authority` carries `authorityUrl`, `host`, `port`, `authorityInstanceId`, and `provider`, with the access token as the mount credential. |
 | `/v1/access-leases/inspect` | Authenticate the exact current token and return the lease. Read-only; changes nothing. |
 | `/v1/access-leases/renew` | Extend the lease under a `expectedControlSeq` CAS; `rotateToken: true` also rotates the token. |
 | `/v1/access-leases/release` | Consumer-initiated end. Returns `{ lease, receipt, serverTimeMs }`. |
@@ -534,53 +482,9 @@ durable facts. A control-store outage answers lease routes with 503
 `ACCESS_LEASE_STORE_UNAVAILABLE` (nothing changed; the identical retry
 succeeds) rather than guessing lease state.
 
-The legacy mount-session routes (`/v1/mount-sessions`,
-`/v1/volumes/:id/mount-sessions`, `/v1/authorities/session`) keep their exact
-response shapes but mint their credential through the lease service under the
-synthetic consumer id `legacy-session`, so revocation, expiry, and authority
-teardown fence legacy tokens uniformly.
-
-## Environment Registry
-
-Environment mode is a generic fixed-endpoint registry. It is useful for local
-development, smoke tests, or deliberately fixed hosted volumes. It does not create
-per-volume VCS processes and is not sufficient for dynamic one-volume-per-workspace
-production unless the configured map already contains every live volume.
-
-Single default endpoint:
-
-```bash
-PORTABLEFS_AUTHORITY_MANAGER_TOKEN=<manager-api-token>
-PORTABLEFS_AUTHORITY_URL=vcs.example.com:2050
-PORTABLEFS_AUTHORITY_AUTH_TOKEN=<vcs-data-plane-token>
-PORTABLEFS_AUTHORITY_NFS_PORT=2049
-PORTABLEFS_AUTHORITY_HEALTH_URL=https://vcs-metrics.example.com/readyz
-```
-
-Multiple mappings:
-
-```bash
-PORTABLEFS_AUTHORITY_MAP_JSON='{
-  "team_1:vol_123:main": {
-    "authorityUrl": "vcs-123.example.com:2050",
-    "authToken": "data-plane-token",
-    "healthUrl": "https://vcs-123-metrics.example.com/readyz"
-  },
-  "vol_shared:main": {
-    "authorityUrl": "vcs-shared.example.com:2050",
-    "authToken": "data-plane-token",
-    "healthUrl": "https://vcs-shared-metrics.example.com/readyz"
-  }
-}'
-```
-
-Resolution order is:
-
-1. `teamId:volumeId:branch`
-2. `volumeId:branch`
-3. `volumeId`
-4. `default`
-5. `*`
+The legacy session-minting routes (`/v1/mount-sessions`,
+`/v1/volumes/:id/mount-sessions`, `/v1/authorities/session`) are retired and
+answer 410 tombstones ([Retired session routes](#retired-session-routes)).
 
 ## Security Notes
 
