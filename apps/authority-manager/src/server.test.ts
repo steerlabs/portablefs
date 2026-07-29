@@ -10,6 +10,7 @@ import {
   type AuthorityRegistry,
 } from "./server.js";
 import {
+  authorityDataPlaneRouterLimitsFromEnv,
   createAuthorityDataPlaneRouterServer,
   InMemoryAuthorityDataPlaneRouteTable,
   LeaseTunnelRegistry,
@@ -461,6 +462,82 @@ describe("createAuthorityManagerServer", () => {
 });
 
 describe("authority data-plane router", () => {
+  test("parses bounded router limits and rejects invalid or contradictory values", () => {
+    expect(authorityDataPlaneRouterLimitsFromEnv({})).toEqual({
+      maxPendingConnections: 256,
+      maxOpenTunnels: 4096,
+      maxTunnelsPerLease: 64,
+      maxConnections: 4352,
+    });
+    expect(
+      authorityDataPlaneRouterLimitsFromEnv({
+        PORTABLEFS_AUTHORITY_ROUTER_MAX_PENDING_CONNECTIONS: "12",
+        PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS: "100",
+        PORTABLEFS_AUTHORITY_ROUTER_MAX_TUNNELS_PER_LEASE: "20",
+      })
+    ).toEqual({
+      maxPendingConnections: 12,
+      maxOpenTunnels: 100,
+      maxTunnelsPerLease: 20,
+      maxConnections: 112,
+    });
+    expect(() =>
+      authorityDataPlaneRouterLimitsFromEnv({
+        PORTABLEFS_AUTHORITY_ROUTER_MAX_PENDING_CONNECTIONS: "0",
+      })
+    ).toThrow(/positive safe integer/);
+    expect(() =>
+      authorityDataPlaneRouterLimitsFromEnv({
+        PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS: "10",
+        PORTABLEFS_AUTHORITY_ROUTER_MAX_TUNNELS_PER_LEASE: "11",
+      })
+    ).toThrow(/must not exceed/);
+  });
+
+  test("reservations enforce per-lease and global tunnel limits and release capacity", () => {
+    const registry = new LeaseTunnelRegistry({
+      maxOpenTunnels: 2,
+      maxTunnelsPerLease: 1,
+    });
+    const first = registry.reserve("lease-1", "1");
+    expect(first).not.toBeNull();
+    expect(registry.reserve("lease-1", "1")).toBeNull();
+    const second = registry.reserve("lease-2", "1");
+    expect(second).not.toBeNull();
+    expect(registry.reserve("lease-3", "1")).toBeNull();
+    expect(registry.pendingTunnelCount()).toBe(2);
+
+    registry.releaseReservation(first!);
+    expect(registry.pendingTunnelCount()).toBe(1);
+    expect(registry.reserve("lease-3", "1")).not.toBeNull();
+  });
+
+  test("refuses handshakes above the pending-connection cap", async () => {
+    const routeTable = new InMemoryAuthorityDataPlaneRouteTable();
+    const router = createAuthorityDataPlaneRouterServer(routeTable, {
+      maxPendingConnections: 1,
+      maxConnections: 2,
+      handshakeTimeoutMs: 5_000,
+    });
+    tcpServers.push(router);
+    const routerAddress = await listenTcp(router);
+
+    const parked = await connectClient(routerAddress);
+    const excess = await connectClient(routerAddress);
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("excess pending connection was not closed")),
+        1_000
+      );
+      excess.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    expect(excess.destroyed).toBe(true);
+    parked.destroy();
+  });
+
   test("routes a scoped session token to the backend using the internal backend token", async () => {
     const backend = await startTokenBackend("backend-token");
     const routeTable = new InMemoryAuthorityDataPlaneRouteTable();
@@ -480,6 +557,63 @@ describe("authority data-plane router", () => {
     client.write("ping");
     const echo = await readExactly(client, 4);
     expect(echo.toString("utf8")).toBe("ping");
+    client.destroy();
+  });
+
+  test("closes a backend that rejects router auth before falling back", async () => {
+    let closeRejectedBackend!: () => void;
+    const rejectedBackendClosed = new Promise<void>((resolve) => {
+      closeRejectedBackend = resolve;
+    });
+    let rejectedBackendWasClosed = false;
+    const rejectedBackend = createServer((socket) => {
+      const cleanupTimer = setTimeout(() => socket.destroy(), 1_000);
+      cleanupTimer.unref?.();
+      socket.once("close", () => {
+        clearTimeout(cleanupTimer);
+        rejectedBackendWasClosed = true;
+        closeRejectedBackend();
+      });
+      void readTokenFrame(socket)
+        .then(() => {
+          socket.write(Buffer.from([1]));
+        })
+        .catch(() => socket.destroy());
+    });
+    tcpServers.push(rejectedBackend);
+    const rejectedAddress = await listenTcp(rejectedBackend);
+
+    const fallbackBackend = createServer((socket) => {
+      void (async () => {
+        await readTokenFrame(socket);
+        await rejectedBackendClosed;
+        socket.write(Buffer.from([0]));
+        socket.pipe(socket);
+      })().catch(() => socket.destroy());
+    });
+    tcpServers.push(fallbackBackend);
+    const fallbackAddress = await listenTcp(fallbackBackend);
+
+    const routeTable = new InMemoryAuthorityDataPlaneRouteTable();
+    const session = routeTable.createSession({
+      authorityInstanceId: "pfai_1",
+      backendAddresses: [
+        `${rejectedAddress.host}:${rejectedAddress.port}`,
+        `${fallbackAddress.host}:${fallbackAddress.port}`,
+      ],
+      backendAuthToken: "backend-token",
+    });
+    const router = createAuthorityDataPlaneRouterServer(routeTable, {
+      handshakeTimeoutMs: 250,
+    });
+    tcpServers.push(router);
+    const routerAddress = await listenTcp(router);
+
+    const client = await connectClient(routerAddress);
+    await writeTokenFrame(client, session.token);
+    const ack = await readExactly(client, 1);
+    expect(ack[0]).toBe(0);
+    expect(rejectedBackendWasClosed).toBe(true);
     client.destroy();
   });
 
@@ -677,7 +811,10 @@ describe("access-lease data-plane tunnels", () => {
   // The same wiring main.ts performs in production mode: the lease service
   // IS the router's route table, and lease end/rotation events close
   // registered tunnels through the LeaseTunnelRegistry.
-  async function startLeaseRouter(): Promise<LeaseRouterHarness> {
+  async function startLeaseRouter(limits?: {
+    maxOpenTunnels: number;
+    maxTunnelsPerLease: number;
+  }): Promise<LeaseRouterHarness> {
     const backend = await startTrackingBackend("backend-token");
     const store = new InMemoryManagerControlStore();
     const claim = await store.claimManager({
@@ -709,12 +846,17 @@ describe("access-lease data-plane tunnels", () => {
         ? { backendAddresses: [backend.address], backendAuthToken: "backend-token" }
         : null
     );
-    const tunnelRegistry = new LeaseTunnelRegistry();
+    const tunnelRegistry = new LeaseTunnelRegistry(limits);
     service.onLeaseEnded((event) => tunnelRegistry.closeLease(event.accessLeaseId));
     service.onLeaseRotated((accessLeaseId, tokenGeneration) =>
       tunnelRegistry.closeSupersededGenerations(accessLeaseId, tokenGeneration)
     );
-    const router = createAuthorityDataPlaneRouterServer(service, { tunnelRegistry });
+    const router = createAuthorityDataPlaneRouterServer(service, {
+      tunnelRegistry,
+      ...(limits
+        ? { maxConnections: limits.maxOpenTunnels + 16, maxPendingConnections: 16 }
+        : {}),
+    });
     tcpServers.push(router);
     const routerAddress = await listenTcp(router);
     return {
@@ -778,6 +920,29 @@ describe("access-lease data-plane tunnels", () => {
     const echo = await readExactly(client, 4);
     expect(echo.toString("utf8")).toBe("ping");
     client.destroy();
+  });
+
+  test("refuses only excess per-lease tunnels and restores capacity after close", async () => {
+    const harness = await startLeaseRouter({
+      maxOpenTunnels: 4,
+      maxTunnelsPerLease: 2,
+    });
+    const { lease, accessToken } = await createLease(harness.service);
+    const first = await openTunnel(harness.routerAddress, accessToken);
+    const second = await openTunnel(harness.routerAddress, accessToken);
+    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    expect(harness.tunnelRegistry.openTunnelCount(lease.accessLeaseId)).toBe(2);
+
+    second.write("still-live");
+    expect((await readExactly(second, 10)).toString("utf8")).toBe("still-live");
+    const firstClosed = waitForClose(first);
+    first.destroy();
+    await firstClosed;
+
+    const replacement = await openTunnel(harness.routerAddress, accessToken);
+    expect(harness.tunnelRegistry.openTunnelCount(lease.accessLeaseId)).toBe(2);
+    replacement.destroy();
+    second.destroy();
   });
 
   test("rotation closes superseded-generation tunnels in both directions", async () => {

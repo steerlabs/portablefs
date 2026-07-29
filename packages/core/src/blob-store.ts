@@ -8,6 +8,8 @@ export interface BlobStorePutResult {
 export interface BlobStorePutOptions {
   digest?: BlobDigest;
   checkExisting?: boolean;
+  /** Cancels storage work when the originating upload is abandoned. */
+  signal?: AbortSignal;
 }
 
 /**
