@@ -88,7 +88,11 @@ func (c *apiClient) createVolume(ctx context.Context, name, tenantID string) (*v
 		body["tenantId"] = tenantID
 	}
 	var out volumeMutationResponse
-	if err := c.doIdempotent(ctx, "POST", "/v1/volumes", body, &out, 0, mintIdempotencyKey()); err != nil {
+	idempotencyKey, err := mintIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doIdempotent(ctx, "POST", "/v1/volumes", body, &out, 0, idempotencyKey); err != nil {
 		if httpCode(err) == "VOLUME_VALIDATION_FAILED" && tenantID == "" {
 			return nil, fmt.Errorf("create volume: %w (this volume-api build requires a tenantId in the request; pass --tenant <id>)", err)
 		}
@@ -179,7 +183,11 @@ type retireVolumeReceipt struct {
 func (c *apiClient) retireVolume(ctx context.Context, volumeID string) (*retireVolumeReceipt, error) {
 	var out retireVolumeReceipt
 	path := fmt.Sprintf("/v1/volumes/%s", url.PathEscape(volumeID))
-	if err := c.doIdempotent(ctx, "DELETE", path, nil, &out, 0, mintIdempotencyKey()); err != nil {
+	idempotencyKey, err := mintIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doIdempotent(ctx, "DELETE", path, nil, &out, 0, idempotencyKey); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -286,7 +294,11 @@ func (c *apiClient) snapshot(ctx context.Context, volumeID, branch, name string)
 		Snapshot snapshotInfo `json:"snapshot"`
 	}
 	path := fmt.Sprintf("/v1/volumes/%s/snapshots", url.PathEscape(volumeID))
-	if err := c.doIdempotent(ctx, "POST", path, body, &out, 0, mintIdempotencyKey()); err != nil {
+	idempotencyKey, err := mintIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doIdempotent(ctx, "POST", path, body, &out, 0, idempotencyKey); err != nil {
 		return nil, err
 	}
 	return &out.Snapshot, nil
@@ -328,7 +340,11 @@ func (c *apiClient) createBranch(ctx context.Context, volumeID, branchName, from
 	}
 	var out createBranchResponse
 	path := fmt.Sprintf("/v1/volumes/%s/branches", url.PathEscape(volumeID))
-	if err := c.doIdempotent(ctx, "POST", path, body, &out, 0, mintIdempotencyKey()); err != nil {
+	idempotencyKey, err := mintIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doIdempotent(ctx, "POST", path, body, &out, 0, idempotencyKey); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -358,7 +374,11 @@ func (c *apiClient) forkSnapshot(ctx context.Context, snapshotID, tenantID, newV
 	}
 	var out volumeMutationResponse
 	path := fmt.Sprintf("/v1/snapshots/%s/fork", url.PathEscape(snapshotID))
-	if err := c.doIdempotent(ctx, "POST", path, body, &out, 0, mintIdempotencyKey()); err != nil {
+	idempotencyKey, err := mintIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doIdempotent(ctx, "POST", path, body, &out, 0, idempotencyKey); err != nil {
 		return nil, err
 	}
 	return &out, nil

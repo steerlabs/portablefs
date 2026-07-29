@@ -55,24 +55,13 @@ type Client struct {
 	// gets hammered in proportion to op traffic.
 	redial *Backoff
 
-	// Credential re-resolve coordination for explicit token rejections
-	// (see reconnect.go). refreshGen counts completed re-resolves; a dial
-	// captures it before fetching its token so a rejection can tell "my
-	// token predates the last re-resolve" (just retry) from "the installed
-	// token itself was rejected" (re-resolve). refreshMu single-flights the
-	// resolver; refreshWait/refreshBackoff pace a failing resolver.
-	refreshGen      atomic.Uint64
-	refreshMu       sync.Mutex
-	refreshWait     time.Time
-	refreshBackoff  *Backoff
-	onTokenRejected func() bool
 	// onSelfWrite, if set, is called after every successful write-through MUTATION with the path,
 	// the version the authority assigned, and whether the mutation was in-place. This lets the
 	// mount update/evict its own caches for owner-suppressed invalidation echoes. nil => no-op.
 	onSelfWrite func(path string, gen, version uint64, inPlace bool)
 
 	// Exact mount-session state. exact is nil until EnsureExactSession
-	// establishes it (negotiating the mandatory v6 protocol first).
+	// establishes it (negotiating the mandatory v7 protocol first).
 	exactMu     sync.RWMutex
 	establishMu sync.Mutex // serializes the one-time session establish
 	exact       *exactSession
@@ -158,8 +147,7 @@ type conn struct {
 	// in-process transports such as net.Pipe). The auth handshake still runs.
 	transport func() (net.Conn, error)
 	// client is the owning pool's client, when there is one: dial success
-	// resets its shared redial backoff, and an explicit token rejection is
-	// routed through its single-flight credential re-resolve.
+	// resets its shared redial backoff.
 	client *Client
 	nc     net.Conn
 	enc    *requestEncoder
@@ -177,10 +165,8 @@ type conn struct {
 }
 
 // ensure lazily (re)dials. An ordinary dial failure surfaces to the caller
-// (whose retry policy owns the pacing); an explicit token rejection instead
-// triggers ONE coalesced credential re-resolve and, when a fresh token was
-// installed, ONE more dial pass — so a mount whose manager restarted recovers
-// inside the op that first noticed, without a timer tick in the loop.
+// (whose retry policy owns the pacing). An explicit token rejection is a
+// terminal credential result and is returned without another resolution path.
 func (cn *conn) ensure() error {
 	if cn.nc != nil {
 		return nil
@@ -188,37 +174,21 @@ func (cn *conn) ensure() error {
 	if err := cn.health.gate(cn.gateExempt); err != nil {
 		return err
 	}
-	for pass := 0; ; pass++ {
-		var gen uint64
-		if cn.client != nil {
-			// Captured BEFORE dialOnce fetches the token: a re-resolve that
-			// completes in between advances the generation, which
-			// refreshRejectedToken reads as "fresh credential already
-			// installed, just retry".
-			gen = cn.client.refreshGen.Load()
+	err := cn.dialOnce()
+	if err == nil {
+		cn.health.recordSuccess()
+		if cn.client != nil && cn.client.redial != nil {
+			cn.client.redial.Reset()
 		}
-		err := cn.dialOnce()
-		if err == nil {
-			cn.health.recordSuccess()
-			if cn.client != nil {
-				cn.client.noteDialSuccess()
-			}
-			return nil
-		}
-		// A definite token rejection is an ANSWER from a reachable peer, not
-		// unreachability (see failfast.go): it must not feed the failure
-		// streak, or an expired-but-renewable credential would masquerade as
-		// a dead authority and trip fail-fast on a working mount.
-		if !errors.Is(err, ErrSessionTokenRejected) {
-			cn.health.recordFailure()
-		}
-		if !errors.Is(err, ErrSessionTokenRejected) || cn.client == nil || pass >= 1 {
-			return err
-		}
-		if !cn.client.refreshRejectedToken(gen) {
-			return err
-		}
+		return nil
 	}
+	// A definite token rejection is an ANSWER from a reachable peer, not
+	// unreachability (see failfast.go), so it does not trip the transport
+	// breaker. It still returns immediately and fails closed.
+	if !errors.Is(err, ErrSessionTokenRejected) {
+		cn.health.recordFailure()
+	}
+	return err
 }
 
 // dialOnce makes one dial pass: the in-process transport, or each authority
@@ -361,10 +331,9 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 	}
 	c := &Client{
 		addrs: addrs, tls: tlsCfg, conns: make(chan *conn, pool),
-		closed:         make(chan struct{}),
-		redial:         NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
-		refreshBackoff: NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
-		transport:      transport,
+		closed:    make(chan struct{}),
+		redial:    NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
+		transport: transport,
 	}
 	c.health = newConnHealth()
 	c.health.onEngage = func() { go c.runReachabilityProbe() }
@@ -449,11 +418,8 @@ func (c *Client) Do(req *Request) (*Response, error) {
 				return nil, err
 			}
 			if errors.Is(err, ErrSessionTokenRejected) {
-				// ensure() already coalesced one credential re-resolve and
-				// retried the dial; a rejection that still escapes cannot be
-				// fixed by redialing with the same credential — fail the op
-				// now, and let the next op (or the invalidation resubscribe
-				// loop) drive the paced re-resolve.
+				// A rejection cannot be fixed by redialing with the same
+				// credential. Fail closed without another resolution path.
 				return nil, err
 			}
 			if cn.nc != nil {

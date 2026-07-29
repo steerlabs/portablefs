@@ -376,25 +376,25 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		return errors.New("rebind conflict")
 	}
 
-	// Drain the dense tail as same-scope runs, chaining the digest forward.
+	// Drain the dense tail as mixed-scope batches, chaining the digest
+	// forward. Every run names the exact rebound grant authorizing it.
 	prev := localDigest
 	i := 0
 	for i < len(tail) {
-		scope := coveringScope(live, decodePathOf(tail[i]))
-		if scope == "" {
-			js.update(func(j *RecoveryJob) {
-				j.State = JobCorrupt
-				j.LastError = fmt.Sprintf("record %d has no covering delegation", tail[i].seq)
-			})
-			return errors.New("record without covering delegation")
-		}
 		var records []wal.Record
+		var scopeRuns []FlushScope
 		var bytes int
 		end := prev
 		j := i
 		for ; j < len(tail) && len(records) < flushMaxRecords && bytes < flushMaxBytes; j++ {
-			if coveringScope(live, decodePathOf(tail[j])) != scope {
-				break
+			scope := coveringScope(live, decodePathOf(tail[j]))
+			if scope == "" {
+				missingSeq := tail[j].seq
+				js.update(func(job *RecoveryJob) {
+					job.State = JobCorrupt
+					job.LastError = fmt.Sprintf("record %d has no covering delegation", missingSeq)
+				})
+				return errors.New("record without covering delegation")
 			}
 			rec, err := wal.DecodePFR1(tail[j].payload)
 			if err != nil {
@@ -408,10 +408,17 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			end = digestNext(end, tail[j].seq, tail[j].payload)
 			records = append(records, rec)
 			bytes += len(tail[j].payload)
+			if len(scopeRuns) != 0 && scopeRuns[len(scopeRuns)-1].Scope == scope {
+				scopeRuns[len(scopeRuns)-1].Through = tail[j].seq
+			} else {
+				scopeRuns = append(scopeRuns, FlushScope{
+					Scope: scope, Epoch: live[scope], Through: tail[j].seq,
+				})
+			}
 		}
 		reply, err := e.remote.Flush(ctx, FlushRequest{
-			WritebackID: wbID, Scope: scope, Epoch: live[scope],
-			PrevDigest: prev, EndDigest: end, Records: records,
+			WritebackID: wbID, PrevDigest: prev, EndDigest: end,
+			Records: records, ScopeRuns: scopeRuns,
 		})
 		if err != nil {
 			return fmt.Errorf("%w: recovery flush: %v", errRetryable, err)

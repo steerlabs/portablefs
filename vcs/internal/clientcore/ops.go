@@ -111,7 +111,7 @@ func (v *Volume) RememberHardlinkAlias(path string, ino uint64) {
 }
 
 func (v *Volume) isHardlink(n *NodeState) bool {
-	return n != nil && v.hardlinks.contains(n.StableIno())
+	return n != nil && v.hardlinks.contains(n.AuthorityIno())
 }
 
 // engineAttr converts an engine entry to the served attr. A locally-born
@@ -355,7 +355,7 @@ func (v *Volume) incOpen(path string, n *NodeState) Status {
 	n.mu.Lock()
 	n.nopen++
 	n.mu.Unlock()
-	if ino := n.StableIno(); ino != 0 && n.AuthIno() {
+	if ino := n.AuthorityIno(); ino != 0 {
 		if st := v.openReg.Open(path, ino); st != fsproto.OK {
 			n.mu.Lock()
 			n.nopen--
@@ -443,7 +443,7 @@ func (v *Volume) closeOne(path string, n *NodeState) bool {
 		v.openOrphans.Remove(orphanIno)
 	}
 	if hadOpen {
-		if fino := n.StableIno(); fino != 0 && n.AuthIno() {
+		if fino := n.AuthorityIno(); fino != 0 {
 			// Every successful Open owns one registry ref. An orphaned
 			// inode's final transition is discarded; a live zero-ref entry
 			// is retained for RPC-free re-opens.
@@ -627,7 +627,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	v.VersionCache.FillOK(gen, path, version)
 	v.AttrCache.Evict(path)
 	if v.isHardlink(n) {
-		v.invalidateRelatedInodes([]uint64{n.StableIno()}, path)
+		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path)
 	}
 	return cnt, fsproto.OK
 }
@@ -705,7 +705,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	v.VersionCache.FillOK(gen, path, version)
 	v.AttrCache.Evict(path)
 	if v.isHardlink(n) {
-		v.invalidateRelatedInodes([]uint64{n.StableIno()}, path)
+		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path)
 	}
 	return cnt, fsproto.OK
 }
@@ -883,7 +883,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 				dir, _ := splitPath(path)
 				v.AttrCache.Evict(dir)
 				v.evictDirCache(dir)
-				v.invalidateRelatedInodes([]uint64{child.StableIno()}, path)
+				v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path)
 				v.hardlinks.removePath(path)
 			}
 			return st
@@ -900,7 +900,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 		v.AttrCache.Evict(dir)
 		v.evictDirCache(dir)
 		if child != nil {
-			v.invalidateRelatedInodes([]uint64{child.StableIno()}, path)
+			v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path)
 		}
 		v.hardlinks.removePath(path)
 	}
@@ -1129,7 +1129,10 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 		return fsproto.Attr{}, st
 	}
 	if a.Ino == 0 && src != nil && src.AuthIno() {
-		a.Ino = src.StableIno()
+		a.Ino = src.AuthorityIno()
+	}
+	if src != nil && !src.RecordAuthorityIno(a.Ino) {
+		return fsproto.Attr{}, fsproto.EIO
 	}
 	v.observeHardlink(oldp, *a)
 	v.observeHardlink(newp, *a)
@@ -1279,16 +1282,16 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	}
 	v.observeHardlink(path, *a)
 	if v.isHardlink(n) {
-		v.invalidateRelatedInodes([]uint64{n.StableIno()}, path)
+		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path)
 	}
 	return *a, fsproto.OK
 }
 
 func authHandleIno(n *NodeState) uint64 {
-	if n == nil || !n.AuthIno() {
+	if n == nil {
 		return 0
 	}
-	return n.StableIno()
+	return n.AuthorityIno()
 }
 
 func (v *Volume) FsyncPath(path string) Status {

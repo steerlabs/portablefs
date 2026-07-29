@@ -10,7 +10,7 @@ PortableFS separates write acceptance from two linked durability layers:
 - **Authority durability:** a write-through mutation is committed to the
   authority journal before its reply. A delegated mutation reaches this layer
   asynchronously, or synchronously when `fsync`, synchronize, explicit
-  flush, dirty last-close, or clean unmount drains it.
+  flush, or clean unmount drains it. `close(2)` is not a durability barrier.
 - **Checkpoint durability:** the Volume API has accepted a commit whose referenced blobs exist
   in the blob store and whose metadata transaction advanced the branch head.
 
@@ -114,7 +114,7 @@ runtime code should not bypass VCS for live filesystem writes.
 
 ## Exact-Once Mount Sessions
 
-Every mount instance negotiates an exact-once session with the authority (protocol version 6;
+Every mount instance negotiates an exact-once session with the authority (protocol version 7;
 exact sessions are baseline, not a capability). The client mints a random session identity and an
 opaque token once per mount, establishes the session durably, and stamps every write-through
 mutation with an identity: `(session, generation, slot, slot sequence)`. The authority computes a
@@ -208,10 +208,10 @@ non-empty/missing path) publishes no invalidation at all.
 
 ## Extended Attributes (xattrs)
 
-Extended attributes are native **LIVE volume state** in the fsproto v6 baseline. They exist
+Extended attributes are native **LIVE volume state** in the fsproto v7 baseline. They exist
 so macOS FSKit mounts stop generating AppleDouble `._` sidecar files: the FSKit extension
 forwards xattr operations over pfslocal and portablefsd answers them natively. Authorities
-that do not speak the v6 baseline are rejected at mount-time protocol negotiation; a mount
+that do not speak the v7 baseline are rejected at mount-time protocol negotiation; a mount
 never silently drops xattr operations or changes their semantics.
 
 Semantics (Linux `setxattr`/`removexattr` as the reference):
@@ -241,9 +241,9 @@ read-through, and their mutations conservatively use the authority lane unless t
 can prove the complete xattr map. That proof boundary preserves conditional flags and the
 128 KiB per-inode limit before any local acknowledgement. Remote xattr mutations publish an
 in-place (attr-level) invalidation, keeping version-gated attribute caches honest. Delegated
-xattr batches are an optional v6 optimization advertised by `FeatureDelegatedXattrs`; a
-client connected to an earlier v6 authority selects the shared xattr lane from the initial
-probe, never after a failed operation.
+xattr batches are an optional v7 optimization advertised by `FeatureDelegatedXattrs`; a
+client connected to a v7 authority without that feature selects the shared xattr lane from
+the initial probe, never after a failed operation.
 
 Durability across compaction — the load-bearing part:
 

@@ -865,13 +865,13 @@ func (a *attach) start(ctx context.Context) error {
 	aliasCounts := map[uint64]int{}
 	for _, rec := range a.paths {
 		if rec != nil && rec.path != "" && rec.state != nil && rec.state.AuthIno() {
-			aliasCounts[rec.state.StableIno()]++
+			aliasCounts[rec.state.AuthorityIno()]++
 		}
 	}
 	for _, rec := range a.paths {
 		if rec != nil && rec.path != "" && rec.state != nil && rec.state.AuthIno() &&
-			aliasCounts[rec.state.StableIno()] > 1 {
-			vol.RememberHardlinkAlias(rec.path, rec.state.StableIno())
+			aliasCounts[rec.state.AuthorityIno()] > 1 {
+			vol.RememberHardlinkAlias(rec.path, rec.state.AuthorityIno())
 		}
 	}
 	if a.options.Prefetch {
@@ -1154,6 +1154,30 @@ func (a *attach) registerCreatedLocked(p string, attr fsproto.Attr) *itemRecord 
 	return a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false)
 }
 
+// registerHardLinkAliasLocked binds a new hard-link name to the exact
+// frontend item and NodeState already published for its source. A source
+// created under write-back may have a daemon-local FSKit item ID even after
+// delegation release gives it a different authority inode; publishing the
+// authority inode as a second FSKit item would split one POSIX inode into two
+// independent frontend objects.
+func (a *attach) registerHardLinkAliasLocked(p string, source *itemRecord, attr fsproto.Attr) *itemRecord {
+	if a.paths[p] != nil {
+		a.removePathLocked(p)
+	}
+	if current := a.paths[source.path]; current != nil {
+		source = current
+	}
+	source.attr = attr
+	a.pendBindingLocked(source)
+	rec := &itemRecord{item: source.item, path: p, state: source.state, attr: attr}
+	a.paths[p] = rec
+	if a.items[rec.item.ItemID] == nil {
+		a.items[rec.item.ItemID] = source
+	}
+	a.pendBindingLocked(rec)
+	return rec
+}
+
 func (a *attach) registerWithItemLocked(p string, attr fsproto.Attr, ino uint64, authIno bool, reuseByItemID bool) *itemRecord {
 	gen := a.identityEpoch
 	if gen == 0 {
@@ -1168,12 +1192,16 @@ func (a *attach) registerWithItemLocked(p string, attr fsproto.Attr, ino uint64,
 		// kernel-held FSItems. Fresh creates use registerCreatedLocked so recycled paths cannot inherit
 		// an item that was renamed away.
 		if rec.state == nil {
-			rec.state = clientcore.NewNodeState(ino, authIno)
+			var authorityItemID uint64
+			if authIno {
+				authorityItemID = ino
+			}
+			rec.state = clientcore.NewNodeStateWithAuthority(rec.item.ItemID, authorityItemID)
 			if authIno {
 				a.pendBindingLocked(rec)
 			}
 		} else if authIno && rec.state.AuthIno() && rec.state.Orphan() == 0 &&
-			rec.state.StableIno() != ino {
+			rec.state.AuthorityIno() != ino {
 			// The authority inode BEHIND this path changed: a remote writer
 			// rename-over-ed or recreated the name (git's atomic ref update).
 			// The kernel's Item stays stable — same path identity — but open
@@ -1182,9 +1210,11 @@ func (a *attach) registerWithItemLocked(p string, attr fsproto.Attr, ino uint64,
 			// unlinked). POSIX open resolves the NAME at open time: swap in a
 			// fresh NodeState for the current inode. Handles already open
 			// captured the old state at open time and unwind through it.
-			rec.state = clientcore.NewNodeState(ino, true)
-		} else if authIno && rec.item.ItemID == ino && !rec.state.AuthIno() {
-			rec.state = clientcore.NewNodeState(ino, true)
+			rec.state = clientcore.NewNodeStateWithAuthority(rec.item.ItemID, ino)
+		} else if authIno && !rec.state.AuthIno() {
+			if !rec.state.RecordAuthorityIno(ino) {
+				rec.state = clientcore.NewNodeStateWithAuthority(rec.item.ItemID, ino)
+			}
 			a.pendBindingLocked(rec) // the persisted Auth bit flipped
 		}
 		return rec
@@ -1214,10 +1244,18 @@ func (a *attach) registerWithItemLocked(p string, attr fsproto.Attr, ino uint64,
 // pendBindingLocked buffers a binding delta for the caller's later
 // flushBindingDelta. Caller holds a.mu.
 func (a *attach) pendBindingLocked(rec *itemRecord) {
+	var authorityItemID uint64
+	if rec.state != nil {
+		authorityItemID = rec.state.AuthorityIno()
+	}
+	persistedAuthorityItemID := authorityItemID
+	if persistedAuthorityItemID == rec.item.ItemID {
+		persistedAuthorityItemID = 0
+	}
 	a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{
 		Ref: a.ref, Op: "bind", Path: rec.path,
 		ID: rec.item.ItemID, Gen: rec.item.ItemGeneration,
-		Auth: rec.state != nil && rec.state.AuthIno(),
+		Auth: authorityItemID != 0, AuthorityItemID: persistedAuthorityItemID,
 	})
 }
 
@@ -1261,7 +1299,7 @@ func (a *attach) applyJournalEntry(e bindingJournalEntry) {
 		rec := &itemRecord{
 			item:  pfslocal.Item{ItemID: e.ID, ItemGeneration: e.Gen},
 			path:  e.Path,
-			state: clientcore.NewNodeState(e.ID, e.Auth),
+			state: clientcore.NewNodeStateWithAuthority(e.ID, e.authorityItemID()),
 			attr:  attr,
 		}
 		if canonical := a.items[e.ID]; canonical != nil {
@@ -1311,7 +1349,7 @@ func (a *attach) restoreItemsLocked(items []persistedItemRecord) {
 		rec := &itemRecord{
 			item:  pfslocal.Item{ItemID: item.ItemID, ItemGeneration: item.ItemGeneration},
 			path:  item.Path,
-			state: clientcore.NewNodeState(item.ItemID, item.AuthorityIno),
+			state: clientcore.NewNodeStateWithAuthority(item.ItemID, item.authorityItemID()),
 			attr:  attr,
 		}
 		if canonical := a.items[item.ItemID]; canonical != nil {
@@ -1332,11 +1370,20 @@ func (a *attach) persistedItemsLocked() []persistedItemRecord {
 		if rec == nil || rec.item.ItemID == 0 {
 			continue
 		}
+		var authorityItemID uint64
+		if rec.state != nil {
+			authorityItemID = rec.state.AuthorityIno()
+		}
+		persistedAuthorityItemID := authorityItemID
+		if persistedAuthorityItemID == rec.item.ItemID {
+			persistedAuthorityItemID = 0 // legacy compact form: authorityIno=true means itemId
+		}
 		items = append(items, persistedItemRecord{
-			Path:           rec.path,
-			ItemID:         rec.item.ItemID,
-			ItemGeneration: rec.item.ItemGeneration,
-			AuthorityIno:   rec.state != nil && rec.state.AuthIno(),
+			Path:            rec.path,
+			ItemID:          rec.item.ItemID,
+			ItemGeneration:  rec.item.ItemGeneration,
+			AuthorityIno:    authorityItemID != 0,
+			AuthorityItemID: persistedAuthorityItemID,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool {

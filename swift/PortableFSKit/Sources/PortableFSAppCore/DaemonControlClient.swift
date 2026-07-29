@@ -3,26 +3,17 @@ import Foundation
 /// Attach tuning knobs, JSON-compatible with portablefsd's `AttachOptions`
 /// (`vcs/internal/portablefsd/registry.go`).
 public struct DaemonAttachOptions: Codable, Equatable, Sendable {
-    public var writePolicy: String
-    public var fsyncPolicy: String
-    public var flushIntervalMs: Int64?
     public var prefetch: Bool
     public var diskCacheDir: String
     public var diskCacheMb: Int64
     public var negativeCache: Bool
 
     public init(
-        writePolicy: String = "writethrough",
-        fsyncPolicy: String = "local",
-        flushIntervalMs: Int64? = nil,
         prefetch: Bool = false,
         diskCacheDir: String = "",
         diskCacheMb: Int64 = 0,
         negativeCache: Bool = true
     ) {
-        self.writePolicy = writePolicy
-        self.fsyncPolicy = fsyncPolicy
-        self.flushIntervalMs = flushIntervalMs
         self.prefetch = prefetch
         self.diskCacheDir = diskCacheDir
         self.diskCacheMb = diskCacheMb
@@ -214,7 +205,14 @@ public struct DaemonControlClient: Sendable {
         }
         let response = try await http.send(method: "GET", path: "/v1/attaches")
         try Self.check(response)
-        return try Self.decode(Reply.self, from: response.body).attaches ?? []
+        let reply = try Self.decode(Reply.self, from: response.body)
+        guard let attaches = reply.attaches else {
+            throw DaemonControlError(status: response.status, message: "GET /v1/attaches returned no attaches array")
+        }
+        guard attaches.allSatisfy({ !$0.attachRef.isEmpty && !$0.volumeId.isEmpty }) else {
+            throw DaemonControlError(status: response.status, message: "GET /v1/attaches returned an incomplete attach identity")
+        }
+        return attaches
     }
 
     public func attachStatus(ref: String) async throws -> DaemonAttachStatus {
@@ -226,6 +224,11 @@ public struct DaemonControlClient: Sendable {
     /// Detach: flushes dirty state to the authority and drops the attach.
     public func deleteAttach(ref: String) async throws {
         let response = try await http.send(method: "DELETE", path: "/v1/attaches/\(Self.escape(ref))")
+        // DELETE converges state. If a prior request succeeded but its reply
+        // was lost, the exact retry sees 404 and is already complete.
+        if response.status == 404 {
+            return
+        }
         try Self.check(response)
     }
 

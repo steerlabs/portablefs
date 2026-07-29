@@ -277,11 +277,15 @@ func (r *doctorRun) checkVersion() doctorResult {
 	}
 	minRequired, ok := parseSemver(r.minCLIVersion)
 	if !ok {
-		return doctorSkip(fmt.Sprintf("server sent an unparseable minimum CLI version %q", r.minCLIVersion))
+		return doctorFail(
+			fmt.Sprintf("server sent invalid minimum CLI version %q", r.minCLIVersion),
+			"fix the server's "+minCLIVersionHeader+" response header before using this client")
 	}
 	cli, ok := parseSemver(r.e.version)
 	if !ok {
-		return doctorPass(fmt.Sprintf("%q build skips the version check (server minimum %s)", r.e.version, r.minCLIVersion))
+		return doctorFail(
+			fmt.Sprintf("%q is not a stamped release version, so compatibility with server minimum %s cannot be verified", r.e.version, r.minCLIVersion),
+			"install a stamped release with: "+upgradeCommand())
 	}
 	if cli.less(minRequired) {
 		return doctorFail(

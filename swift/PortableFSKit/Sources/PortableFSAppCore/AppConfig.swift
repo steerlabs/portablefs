@@ -130,14 +130,18 @@ public enum PortableFSConfigFile {
         guard created else {
             throw PortableFSConfigError.unwritable(path: path, detail: "create temporary file \(temporaryPath)")
         }
+        // Tighten the temporary file before publication. Once rename
+        // succeeds there must be no later permission step that can fail
+        // after the new config has already become visible.
+        guard chmod(temporaryPath, 0o600) == 0 else {
+            let detail = String(cString: strerror(errno))
+            unlink(temporaryPath)
+            throw PortableFSConfigError.unwritable(path: path, detail: "chmod temporary file: \(detail)")
+        }
         guard rename(temporaryPath, path) == 0 else {
             let detail = String(cString: strerror(errno))
             unlink(temporaryPath)
             throw PortableFSConfigError.unwritable(path: path, detail: "rename: \(detail)")
-        }
-        // Existing files created loose by another tool are tightened, matching Go.
-        guard chmod(path, 0o600) == 0 else {
-            throw PortableFSConfigError.unwritable(path: path, detail: "chmod: \(String(cString: strerror(errno)))")
         }
     }
 }

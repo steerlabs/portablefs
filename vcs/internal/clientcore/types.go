@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
@@ -56,24 +57,34 @@ type SetattrRequest struct {
 // open-after-unlink routing and open-inode leases; frontends keep their own tree
 // shape and pass the current path into Volume ops.
 type NodeState struct {
-	mu      sync.Mutex
-	ino     uint64
-	authIno bool
+	mu  sync.Mutex
+	ino uint64
 	// authorityIno is the authority identity proven for this instantiated
 	// node. It equals ino for authority-born nodes. A locally-born node gains
 	// it when delegation release resolves and pins the flushed create. Keep
 	// it separate from ino: frontends may already have published ino as
 	// their stable local item identity.
-	authorityIno uint64
+	authorityIno atomic.Uint64
 	nopen        int
 	orphanIno    uint64
 }
 
 func NewNodeState(ino uint64, authIno bool) *NodeState {
-	n := &NodeState{ino: ino, authIno: authIno}
+	n := &NodeState{ino: ino}
 	if authIno {
-		n.authorityIno = ino
+		n.authorityIno.Store(ino)
 	}
+	return n
+}
+
+// NewNodeStateWithAuthority restores a frontend-stable item identity whose
+// authority identity is different. This is the normal state of a locally-born
+// item after its delegated create has drained: FSKit must keep presenting the
+// original item ID, while handle-addressed authority operations must use the
+// now-proven authority inode.
+func NewNodeStateWithAuthority(ino, authorityIno uint64) *NodeState {
+	n := &NodeState{ino: ino}
+	n.authorityIno.Store(authorityIno)
 	return n
 }
 
@@ -85,23 +96,34 @@ func (n *NodeState) StableIno() uint64 {
 }
 
 func (n *NodeState) AuthIno() bool {
-	return n != nil && n.authIno
+	return n != nil && n.AuthorityIno() != 0
 }
 
-// recordAuthorityIno binds a locally-born node to the authority inode proven
+// AuthorityIno returns the proven authority identity, which may differ from
+// StableIno after a locally-born item is published to the authority.
+func (n *NodeState) AuthorityIno() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.authorityIno.Load()
+}
+
+// RecordAuthorityIno binds a locally-born node to the authority inode proven
 // by the delegation-release pin. The binding is immutable for this
 // instantiated node; a path recreation receives a fresh NodeState.
-func (n *NodeState) recordAuthorityIno(ino uint64) bool {
+func (n *NodeState) RecordAuthorityIno(ino uint64) bool {
 	if n == nil || ino == 0 {
 		return false
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.authorityIno != 0 && n.authorityIno != ino {
-		return false
+	for {
+		current := n.authorityIno.Load()
+		if current != 0 {
+			return current == ino
+		}
+		if n.authorityIno.CompareAndSwap(0, ino) {
+			return true
+		}
 	}
-	n.authorityIno = ino
-	return true
 }
 
 // MatchesAuthorityIno reports whether an authority notification targets this
@@ -112,9 +134,7 @@ func (n *NodeState) MatchesAuthorityIno(ino uint64) bool {
 	if n == nil || ino == 0 {
 		return false
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.authorityIno == ino
+	return n.authorityIno.Load() == ino
 }
 
 func (n *NodeState) Orphan() uint64 {

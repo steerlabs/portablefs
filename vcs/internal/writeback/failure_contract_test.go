@@ -6,8 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
 func TestWALInitializationFailureFailsClosedWithoutAuthorityFallback(t *testing.T) {
@@ -238,5 +241,223 @@ func TestBackgroundGroupSyncFailureIsStickyAndReported(t *testing.T) {
 	}
 	if err := w.Sync(); err == nil {
 		t.Fatal("background group-sync failure did not remain sticky")
+	}
+}
+
+func TestBackgroundGroupSyncDoesNotSerializeAppends(t *testing.T) {
+	oldDelay := groupSyncDelay
+	groupSyncDelay = time.Millisecond
+	defer func() { groupSyncDelay = oldDelay }()
+
+	var mountID [16]byte
+	copy(mountID[:], "async-sync-test-")
+	w, err := createStreamWAL(t.TempDir(), mountID, "vol", "main", 1)
+	if err != nil {
+		t.Fatalf("create WAL: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	syncStarted := make(chan struct{})
+	releaseSync := make(chan struct{})
+	var calls atomic.Int32
+	w.mu.Lock()
+	w.syncFile = func(f *os.File) error {
+		if calls.Add(1) == 1 {
+			close(syncStarted)
+			<-releaseSync
+		}
+		return f.Sync()
+	}
+	w.mu.Unlock()
+
+	if _, err := w.appendMutations([][]byte{canonicalPayload(mkRec("d/first", []byte("one")))}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	select {
+	case <-syncStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background group-sync did not start")
+	}
+
+	appended := make(chan error, 1)
+	go func() {
+		_, err := w.appendMutations([][]byte{canonicalPayload(mkRec("d/second", []byte("two")))})
+		appended <- err
+	}()
+	select {
+	case err := <-appended:
+		if err != nil {
+			t.Fatalf("append during group-sync: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("background fsync serialized a later WAL append")
+	}
+
+	close(releaseSync)
+	if err := w.Sync(); err != nil {
+		t.Fatalf("explicit sync after background generation: %v", err)
+	}
+	w.mu.Lock()
+	unsynced := w.unsyncedBytes
+	syncing := w.syncing
+	w.mu.Unlock()
+	if unsynced != 0 || syncing {
+		t.Fatalf("explicit sync left WAL debt: unsynced=%d syncing=%v", unsynced, syncing)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("explicit sync did not cover the post-snapshot append: sync calls=%d", calls.Load())
+	}
+}
+
+func TestGroupSyncByteThresholdDoesNotExposePartialAppendState(t *testing.T) {
+	oldDelay := groupSyncDelay
+	groupSyncDelay = time.Hour
+	defer func() { groupSyncDelay = oldDelay }()
+
+	var mountID [16]byte
+	copy(mountID[:], "threshold-test--")
+	dir := t.TempDir()
+	w, err := createStreamWAL(dir, mountID, "vol", "main", 1)
+	if err != nil {
+		t.Fatalf("create WAL: %v", err)
+	}
+
+	syncStarted := make(chan struct{})
+	releaseSync := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseSync:
+		default:
+			close(releaseSync)
+		}
+		w.Abandon()
+	}()
+	var calls atomic.Int32
+	w.mu.Lock()
+	w.syncFile = func(f *os.File) error {
+		if calls.Add(1) == 1 {
+			close(syncStarted)
+			<-releaseSync
+		}
+		return f.Sync()
+	}
+	w.mu.Unlock()
+
+	// Four one-megabyte records cross the byte threshold. The append that
+	// crosses it must commit its sequence/segment metadata before returning,
+	// even though the resulting background sync remains blocked.
+	for i, path := range []string{"d/large-0", "d/large-1", "d/large-2", "d/large-3"} {
+		rec := mkRec(path, make([]byte, 1<<20))
+		if _, err := w.appendMutations([][]byte{canonicalPayload(rec)}); err != nil {
+			t.Fatalf("threshold append %d: %v", i, err)
+		}
+	}
+	select {
+	case <-syncStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("byte-threshold background sync did not start")
+	}
+
+	appended := make(chan error, 1)
+	go func() {
+		_, err := w.appendMutations([][]byte{canonicalPayload(mkRec("d/after-threshold", []byte("tail")))})
+		appended <- err
+	}()
+	select {
+	case err := <-appended:
+		if err != nil {
+			t.Fatalf("append behind threshold sync: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("byte-threshold sync serialized a later append")
+	}
+
+	close(releaseSync)
+	if err := w.Sync(); err != nil {
+		t.Fatalf("sync complete stream: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+	scan, err := scanStream(dir)
+	if err != nil {
+		t.Fatalf("scan WAL: %v", err)
+	}
+	var gotPaths []string
+	for _, fr := range scan.frames {
+		if fr.typ != frameMutation {
+			continue
+		}
+		rec, err := wal.DecodePFR1(fr.payload)
+		if err != nil {
+			t.Fatalf("decode sequence %d: %v", fr.seq, err)
+		}
+		if fr.seq != uint64(len(gotPaths)+1) {
+			t.Fatalf("non-dense recovered sequence %d after %d records", fr.seq, len(gotPaths))
+		}
+		gotPaths = append(gotPaths, rec.Path)
+	}
+	if len(gotPaths) != 5 || gotPaths[4] != "d/after-threshold" {
+		t.Fatalf("recovered append order = %v", gotPaths)
+	}
+}
+
+func TestAbandonWaitsForBackgroundSyncDescriptorOwnership(t *testing.T) {
+	oldDelay := groupSyncDelay
+	groupSyncDelay = time.Millisecond
+	defer func() { groupSyncDelay = oldDelay }()
+
+	var mountID [16]byte
+	copy(mountID[:], "abandon-sync---")
+	w, err := createStreamWAL(t.TempDir(), mountID, "vol", "main", 1)
+	if err != nil {
+		t.Fatalf("create WAL: %v", err)
+	}
+	syncStarted := make(chan struct{})
+	releaseSync := make(chan struct{})
+	injected := errors.New("abandoned in-flight sync")
+	failures := make(chan error, 1)
+	w.mu.Lock()
+	w.onFailure = func(err error) { failures <- err }
+	w.syncFile = func(*os.File) error {
+		close(syncStarted)
+		<-releaseSync
+		return injected
+	}
+	w.mu.Unlock()
+	if _, err := w.appendMutations([][]byte{canonicalPayload(mkRec("d/file", []byte("accepted")))}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case <-syncStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background sync did not start")
+	}
+
+	abandoned := make(chan struct{})
+	go func() {
+		w.Abandon()
+		close(abandoned)
+	}()
+	select {
+	case <-abandoned:
+		t.Fatal("Abandon closed a descriptor still owned by background sync")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseSync)
+	select {
+	case <-abandoned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Abandon did not finish after background sync released the descriptor")
+	}
+	select {
+	case err := <-failures:
+		t.Fatalf("post-abandon sync failure escaped as a live mount failure: %v", err)
+	default:
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.closed || w.active != nil || len(w.files) != 0 {
+		t.Fatalf("abandoned WAL retained descriptors: closed=%v active=%v files=%d", w.closed, w.active != nil, len(w.files))
 	}
 }

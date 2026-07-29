@@ -39,6 +39,7 @@ struct MenuContent: View {
         Button("Quit PortableFS") {
             model.quitApp()
         }
+        .disabled(model.isQuitting)
     }
 
     private func openSignInWindow() {

@@ -44,6 +44,8 @@ import Testing
 }
 
 @Test func mountTableParsesAttachRefs() {
+    #expect(MountTable.portableFSRegistrationTypeName == "pfs")
+    #expect(MountTable.portableFSRuntimeTypeName == "portablefs")
     #expect(MountTable.attachRef(fromMountedFrom: "pfs://att_abc123") == "att_abc123")
     #expect(MountTable.attachRef(fromMountedFrom: "pfs://att_abc123/") == "att_abc123")
     #expect(MountTable.attachRef(fromMountedFrom: "pfs://") == nil)
@@ -54,7 +56,7 @@ import Testing
 @Test func mountTableSnapshotIncludesRootFilesystem() {
     let mounts = MountTable.current()
     #expect(mounts.contains { $0.mountPoint == "/" })
-    #expect(MountTable.portableFSMounts().allSatisfy { $0.fsTypeName == "pfs" })
+    #expect(MountTable.portableFSMounts().allSatisfy { $0.fsTypeName == "portablefs" })
 }
 
 @Test func mountPointBuilderSanitizesVolumeIDs() {

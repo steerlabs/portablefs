@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -69,6 +68,29 @@ type versionSkewError struct {
 func (e *versionSkewError) Error() string {
 	return fmt.Sprintf("this CLI is %s but the server at %s requires at least %s; upgrade with: %s",
 		e.cliVersion, e.origin, e.minVersion, upgradeCommand())
+}
+
+// versionVerificationError is the fail-closed outcome when either side of
+// the minimum-version handshake is not an orderable release version. The
+// client must not guess that an unknown build is compatible with an exact
+// wire protocol.
+type versionVerificationError struct {
+	cliVersion string
+	minVersion string
+	origin     string
+}
+
+func (e *versionVerificationError) Error() string {
+	if _, ok := parseSemver(e.minVersion); !ok {
+		return fmt.Sprintf(
+			"the server at %s advertised invalid minimum CLI version %q; refusing because protocol compatibility cannot be verified",
+			e.origin, e.minVersion,
+		)
+	}
+	return fmt.Sprintf(
+		"this CLI build reports non-release version %q while the server at %s requires at least %s; install a stamped release with: %s",
+		e.cliVersion, e.origin, e.minVersion, upgradeCommand(),
+	)
 }
 
 // httpError is a non-2xx response, carrying the server's error code/message
@@ -174,13 +196,11 @@ type jsonClient struct {
 	token   string
 	http    *http.Client
 
-	// cliVersion/warnW arm the per-response version handshake (see
+	// cliVersion arms the per-response version handshake (see
 	// checkMinCLIVersion). Command code constructs clients through the
 	// cmdEnv helpers (cmdEnv.apiClient/managerClient/jsonClient), which bind
-	// them; a bare newJSONClient carries no handshake.
-	cliVersion  string
-	warnW       io.Writer
-	devWarnOnce sync.Once
+	// it; a bare newJSONClient carries no handshake.
+	cliVersion string
 }
 
 func newJSONClient(baseURL, token string) *jsonClient {
@@ -196,16 +216,13 @@ func newJSONClient(baseURL, token string) *jsonClient {
 func (e *cmdEnv) jsonClient(baseURL, token string) *jsonClient {
 	c := newJSONClient(baseURL, token)
 	c.cliVersion = e.version
-	c.warnW = e.stderr
 	return c
 }
 
 // checkMinCLIVersion enforces the server's version handshake on ONE response
-// (nothing is cached; every response is evaluated on its own). A response
-// without the header, or with one that does not parse, passes. A binary
-// version that is valid semver below the minimum is a terminal refusal; a
-// non-semver build ("dev", locally built) warns once per client and
-// proceeds, because it cannot be ordered against a release version.
+// (nothing is cached; every response is evaluated on its own). An absent
+// header passes. Invalid server values and non-release client versions fail
+// closed because exact-protocol compatibility cannot be proven.
 func (c *jsonClient) checkMinCLIVersion(h http.Header) error {
 	minRaw := strings.TrimSpace(h.Get(minCLIVersionHeader))
 	if minRaw == "" {
@@ -213,18 +230,11 @@ func (c *jsonClient) checkMinCLIVersion(h http.Header) error {
 	}
 	minRequired, ok := parseSemver(minRaw)
 	if !ok {
-		return nil
+		return &versionVerificationError{cliVersion: c.cliVersion, minVersion: minRaw, origin: c.baseURL}
 	}
 	cli, ok := parseSemver(c.cliVersion)
 	if !ok {
-		c.devWarnOnce.Do(func() {
-			if c.warnW != nil {
-				fmt.Fprintf(c.warnW,
-					"portablefs: warning: the server at %s requires CLI %s or newer; this %q build skips the check — if commands misbehave, upgrade with: %s\n",
-					c.baseURL, minRaw, c.cliVersion, upgradeCommand())
-			}
-		})
-		return nil
+		return &versionVerificationError{cliVersion: c.cliVersion, minVersion: minRaw, origin: c.baseURL}
 	}
 	if cli.less(minRequired) {
 		return &versionSkewError{cliVersion: c.cliVersion, minVersion: minRaw, origin: c.baseURL}
@@ -299,8 +309,12 @@ func (c *jsonClient) doIdempotent(ctx context.Context, method, path string, body
 // mintIdempotencyKey mints the caller-retained key for one logical resource
 // mutation (volume create, snapshot, branch, fork). Reuses the CLI's v4-UUID
 // minting; hosted ledgers key replay on it, self-host ignores it.
-func mintIdempotencyKey() string {
-	return "cli-" + newOperationID()
+func mintIdempotencyKey() (string, error) {
+	id, err := newOperationID()
+	if err != nil {
+		return "", err
+	}
+	return "cli-" + id, nil
 }
 
 // doRaw is do without status interpretation: it returns the HTTP status and

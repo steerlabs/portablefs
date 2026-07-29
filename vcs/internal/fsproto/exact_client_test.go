@@ -119,7 +119,7 @@ func TestClientEstablishesExactSessionOnFirstMutation(t *testing.T) {
 }
 
 // TestClientRefusesSessionlessAuthorityMutations: a reads-only server (no
-// session store) answers the v6 probe but refuses session opens; the client
+// session store) answers the v7 probe but refuses session opens; the client
 // surfaces that as a mutation error instead of downgrading to any legacy
 // write path. Reads still flow.
 func TestClientRefusesSessionlessAuthorityMutations(t *testing.T) {
@@ -261,7 +261,7 @@ func TestClientFencedSessionNeverMintsFreshGeneration(t *testing.T) {
 	}
 	// And a fenced mount cannot flush old dirty write-back bytes either.
 	batch := []wal.Record{{Seq: 1, Op: wal.OpCreate, Path: "wb-file", Mode: 0o644}}
-	if _, st, err := cli.FlushWriteback("wb", "wb-file", "1", wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), batch), batch); err != nil || st != ESTALE {
+	if _, st, err := cli.FlushWriteback("wb", []WBScope{{Path: "wb-file", Epoch: "1", Through: batch[len(batch)-1].Seq}}, wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), batch), batch); err != nil || st != ESTALE {
 		t.Fatalf("flush after fence: st=%d err=%v, want ESTALE", st, err)
 	}
 }

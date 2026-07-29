@@ -41,27 +41,16 @@ closes.
 
 The mount client treats that ack (or a clean close right after the token frame, before any ack)
 as a typed credential failure, distinct from an ordinary dead socket: redialing with the same
-token can never succeed. The first rejected redial immediately re-resolves the mount session
-against the manager — the same ladder the lease keeper uses at renewal time — installs the fresh
-token, and retries the dial. The re-resolve is single-flight: a whole connection pool observing
-the rejection concurrently coalesces into one manager round trip. In-flight idempotent ops ride
-through on the fresh token without surfacing EIO, so recovery is bounded by one manager round
-trip (seconds), not by the lease keeper's half-TTL renewal tick.
-
-While the manager is still down, every reconnect path — per-op redial, the invalidation-stream
-resubscribe, and the credential re-resolve itself — is paced by a shared full-jitter exponential
-backoff (sleep drawn uniformly from `[0, min(15s, 250ms * 2^attempt))`, reset on success). The
-first retry stays within the 250ms base so a single blip recovers fast; a sustained outage decays
-a fleet of mounts to a trickle of attempts instead of a lockstep reconnect storm against the
-recovering router. The mount never wedges: it keeps retrying on this schedule until the manager
-returns.
+token can never succeed. It surfaces the failure and does not re-resolve, create a replacement
+lease, or retry through another route. The operator cleanly unmounts, authenticates if needed,
+and mounts again as a new explicit session.
 
 The lease keeper is reactive to the same event on its HTTP path: a renew refused with a typed
 terminal code — `ACCESS_LEASE_EPOCH_SUPERSEDED` (which ships as a 503, deliberately overriding
 the "5xx is ambiguous, retry the same operation" rule), `ACCESS_LEASE_NOT_FOUND`,
 `ACCESS_LEASE_EXPIRED`, `ACCESS_LEASE_REVOKED`, `ACCESS_LEASE_RELEASED`, or
-`ACCESS_LEASE_UNAUTHORIZED` — re-acquires a fresh lease through the full mount-session ladder
-instead of renewing the dead lease forever.
+`ACCESS_LEASE_UNAUTHORIZED` — stops that lease and surfaces a terminal mount status. It never
+creates a replacement lease.
 
 ## Authority Loses Its Fencing
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestResolveAccessNeverFallsBack pins the v2 contract: the access-lease
@@ -186,7 +187,7 @@ func TestAccessLeaseRenewAndRelease(t *testing.T) {
 	m := newManagerClient(f.srv.URL, "mgr_tok")
 	tokens := &sessionTokenSource{}
 	var persisted []leaseState
-	k := newLeaseKeeper(m, "vol_1", "main", "", tokens, leaseState{
+	k := newLeaseKeeper(m, tokens, leaseState{
 		AccessLeaseID: "pfal_1", AccessToken: "lease_tok_1", ExpiresAtMs: 1700000600000, ControlSeq: "7",
 	}, func(l leaseState) { persisted = append(persisted, l) })
 
@@ -225,73 +226,101 @@ func TestAccessLeaseRenewAndRelease(t *testing.T) {
 		t.Fatalf("second renew must CAS on the last controlSeq: %+v", renewBodies[1])
 	}
 
-	k.release()
+	releaseCtx, cancelRelease := context.WithCancel(context.Background())
+	defer cancelRelease()
+	if err := k.release(releaseCtx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
 	if released != 1 {
 		t.Fatalf("release calls = %d", released)
 	}
 }
 
-// TestLeaseKeeperReacquiresOnEpochSuperseded pins the manager-restart path:
+// TestAccessLeaseReleaseRetriesSameOperationID pins clean-unmount cleanup:
+// an ambiguous response replays the exact release operation. It never mints
+// a second logical release or creates a replacement lease.
+func TestAccessLeaseReleaseRetriesSameOperationID(t *testing.T) {
+	f := newFakeServer(t)
+	var releaseOps []string
+	f.on("POST", "/v1/access-leases/release", func(body map[string]any) (int, string) {
+		op, _ := body["operationId"].(string)
+		releaseOps = append(releaseOps, op)
+		if len(releaseOps) == 1 {
+			return 503, `{"error":{"code":"ACCESS_LEASE_STORE_UNAVAILABLE","message":"receipt outcome unknown"}}`
+		}
+		return 200, `{"lease":{"accessLeaseId":"pfal_1","controlSeq":"9","expiresAt":1700001200000,"state":"released"}}`
+	})
+	m := newManagerClient(f.srv.URL, "mgr_tok")
+	k := newLeaseKeeper(m, nil, leaseState{
+		AccessLeaseID: "pfal_1", AccessToken: "lease_tok_1", ExpiresAtMs: 1700000600000, ControlSeq: "8",
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := k.release(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if len(releaseOps) != 2 || releaseOps[0] == "" || releaseOps[0] != releaseOps[1] {
+		t.Fatalf("ambiguous release must replay the SAME operationId: %v", releaseOps)
+	}
+}
+
+// TestLeaseKeeperFailsClosedOnEpochSuperseded pins the manager-restart path:
 // ACCESS_LEASE_EPOCH_SUPERSEDED ships as a 503, which the ambiguity rule
 // alone would classify as "retry the same renew" — but the typed code means
-// this lease can NEVER renew again (its epoch is gone), so the keeper must
-// re-acquire a fresh lease through resolveAccess instead of
-// renewing a dead one forever.
-func TestLeaseKeeperReacquiresOnEpochSuperseded(t *testing.T) {
+// this lease can NEVER renew again (its epoch is gone), so the keeper stops
+// without creating a replacement.
+func TestLeaseKeeperFailsClosedOnEpochSuperseded(t *testing.T) {
 	f := newFakeServer(t)
 	renews := 0
 	f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {
 		renews++
 		return 503, `{"error":{"code":"ACCESS_LEASE_EPOCH_SUPERSEDED","message":"Manager epoch 4 has been superseded; reacquire against the new manager."}}`
 	})
-	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
-		return 200, `{
-		  "authority": {"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050},
-		  "lease": {"accessLeaseId":"pfal_epoch5","controlSeq":"1","expiresAt":1700009999000,"state":"active"},
-		  "accessToken": "lease_tok_epoch5",
-		  "serverTimeMs": 1700000000000
-		}`
-	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
 	tokens := &sessionTokenSource{}
-	k := newLeaseKeeper(m, "vol_1", "main", "", tokens, leaseState{
+	k := newLeaseKeeper(m, tokens, leaseState{
 		AccessLeaseID: "pfal_epoch4", AccessToken: "tok_epoch4", ExpiresAtMs: 1700000600000, ControlSeq: "7",
 	}, nil)
 
 	k.renewOnce(context.Background())
 	cur := k.snapshot()
-	if cur.AccessLeaseID != "pfal_epoch5" || cur.AccessToken != "lease_tok_epoch5" {
-		t.Fatalf("keeper must re-acquire on a typed epoch refusal, got %+v", cur)
+	if cur.AccessLeaseID != "pfal_epoch4" || cur.AccessToken != "tok_epoch4" {
+		t.Fatalf("terminal refusal must preserve the original lease, got %+v", cur)
 	}
 	if renews != 1 {
 		t.Fatalf("renew calls = %d — the dead lease must not be blindly re-renewed", renews)
 	}
-	if tokens.get() != "lease_tok_epoch5" {
-		t.Fatalf("re-acquired token must reach the token source: %q", tokens.get())
+	if tokens.get() != "" {
+		t.Fatalf("terminal refusal must not install a replacement token: %q", tokens.get())
 	}
 	if k.pendingRenew != "" {
 		t.Fatal("a definitive refusal must clear the retained renew operationId")
 	}
+	if !k.terminal {
+		t.Fatal("a definitive refusal must stop the keeper")
+	}
+	k.renewOnce(context.Background())
+	if renews != 1 {
+		t.Fatalf("terminal keeper retried after stop: %d renewals", renews)
+	}
 }
 
-// TestLeaseKeeperUnknownLeaseReacquires: after a restart the new epoch has
+// TestLeaseKeeperUnknownLeaseIsTerminal: after a restart the new epoch has
 // never projected the old lease, so renew answers 404 ACCESS_LEASE_NOT_FOUND
-// — also a re-acquire, never a blind renew retry.
-func TestLeaseKeeperUnknownLeaseReacquires(t *testing.T) {
+// — terminal, never a create or blind renew retry.
+func TestLeaseKeeperUnknownLeaseIsTerminal(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {
 		return 404, `{"error":{"code":"ACCESS_LEASE_NOT_FOUND","message":"Unknown access lease pfal_old (production lease state is scoped to the current manager epoch)."}}`
 	})
-	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
-		return 200, leaseCreateOK
-	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
-	k := newLeaseKeeper(m, "vol_1", "main", "", nil, leaseState{
+	k := newLeaseKeeper(m, nil, leaseState{
 		AccessLeaseID: "pfal_old", AccessToken: "tok_old", ExpiresAtMs: 1, ControlSeq: "3",
 	}, nil)
 	k.renewOnce(context.Background())
-	if cur := k.snapshot(); cur.AccessLeaseID != "pfal_1" {
-		t.Fatalf("unknown-lease refusal must re-acquire: %+v", cur)
+	if cur := k.snapshot(); cur.AccessLeaseID != "pfal_old" || !k.terminal {
+		t.Fatalf("unknown-lease refusal must stop original lease: %+v terminal=%v", cur, k.terminal)
 	}
 }
 
@@ -312,7 +341,7 @@ func TestLeaseKeeperPlain503StaysAmbiguous(t *testing.T) {
 		return 200, leaseCreateOK
 	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
-	k := newLeaseKeeper(m, "vol_1", "main", "", nil, leaseState{
+	k := newLeaseKeeper(m, nil, leaseState{
 		AccessLeaseID: "pfal_keep", AccessToken: "tok_keep", ExpiresAtMs: 1700000600000, ControlSeq: "7",
 	}, nil)
 
@@ -329,34 +358,25 @@ func TestLeaseKeeperPlain503StaysAmbiguous(t *testing.T) {
 	}
 }
 
-// TestAccessLeaseRenewFailureMintsFreshLease pins recovery: a definitive
-// renew refusal (the lease expired server-side) falls back to creating a
-// fresh lease through resolveAccess, and the mount keeps running.
-func TestAccessLeaseRenewFailureMintsFreshLease(t *testing.T) {
+// TestAccessLeaseRenewFailureStopsOriginalLease pins fail-closed behavior: a
+// definitive expiry never creates or adopts a replacement lease.
+func TestAccessLeaseRenewFailureStopsOriginalLease(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {
 		return 410, `{"error":{"code":"ACCESS_LEASE_EXPIRED","message":"lease expired"}}`
 	})
-	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
-		return 200, `{
-		  "authority": {"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050},
-		  "lease": {"accessLeaseId":"pfal_2","controlSeq":"1","expiresAt":1700009999000,"state":"active"},
-		  "accessToken": "lease_tok_2",
-		  "serverTimeMs": 1700000000000
-		}`
-	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
 	tokens := &sessionTokenSource{}
-	k := newLeaseKeeper(m, "vol_1", "main", "", tokens, leaseState{
+	k := newLeaseKeeper(m, tokens, leaseState{
 		AccessLeaseID: "pfal_1", AccessToken: "dead_tok", ExpiresAtMs: 1, ControlSeq: "7",
 	}, nil)
 
 	k.renewOnce(context.Background())
 	cur := k.snapshot()
-	if cur.AccessLeaseID != "pfal_2" || cur.AccessToken != "lease_tok_2" {
-		t.Fatalf("keeper must adopt the replacement lease: %+v", cur)
+	if cur.AccessLeaseID != "pfal_1" || cur.AccessToken != "dead_tok" || !k.terminal {
+		t.Fatalf("keeper must stop the original lease: %+v terminal=%v", cur, k.terminal)
 	}
-	if tokens.get() != "lease_tok_2" {
-		t.Fatalf("replacement token must reach the token source: %q", tokens.get())
+	if tokens.get() != "" {
+		t.Fatalf("replacement token must never be installed: %q", tokens.get())
 	}
 }

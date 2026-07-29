@@ -175,6 +175,14 @@ func (e *Engine) installGrant(scope string, reply AcquireReply) error {
 	e.delegations[scope] = d
 	e.held.Store(int64(len(e.delegations)))
 	delete(e.denials, scope)
+	if reply.Exists {
+		// The scope root itself is authoritative under the grant too. FSKit
+		// asks for parent attributes during nearly every create; omitting
+		// Self forced those getattr callbacks onto the network even while we
+		// exclusively owned the directory, adding one authority RTT to every
+		// small-file create.
+		e.installEntryLocked(scope, reply.Self)
+	}
 	if reply.HasChildren {
 		dv := newDirView(true)
 		for i := range reply.Children {

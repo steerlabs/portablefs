@@ -21,10 +21,12 @@ public struct MountedFilesystem: Equatable, Sendable {
 }
 
 public enum MountTable {
-    // The product-namespaced FSKit mount type (matches FSShortName in the
-    // extension Info.plist). Distinct from any other PortableFS embedder's
-    // type (another embedder may register its own type) so both can coexist on one host.
-    public static let portableFSTypeName = "pfs"
+    // macOS exposes two distinct names for the same FSKit module. mount(8)
+    // selects the extension by its registered FSShortName ("pfs"), while
+    // getfsstat(2) reports FSKit's canonical runtime type ("portablefs").
+    // Conflating them makes a successful mount look absent to the app.
+    public static let portableFSRegistrationTypeName = "pfs"
+    public static let portableFSRuntimeTypeName = "portablefs"
 
     /// Extracts the attach ref from a `pfs://<ref>` device spec, tolerating
     /// trailing slashes appended by mount tooling.
@@ -67,7 +69,7 @@ public enum MountTable {
     }
 
     public static func portableFSMounts() -> [MountedFilesystem] {
-        current().filter { $0.fsTypeName == portableFSTypeName }
+        current().filter { $0.fsTypeName == portableFSRuntimeTypeName }
     }
 
     private static func string<T>(fromFixedSizeCString tuple: T) -> String {

@@ -266,13 +266,9 @@ private func shortSocketPath(_ name: String) -> String {
     try await client.setCredential(ref: "att_test123", authToken: "fresh")
     try await client.deleteAttach(ref: "att_test123")
 
-    do {
-        try await client.deleteAttach(ref: "att_missing")
-        Issue.record("expected 404 error")
-    } catch let error as DaemonControlError {
-        #expect(error.status == 404)
-        #expect(error.message == "unknown attach endpoint")
-    }
+    // DELETE is idempotent: a lost successful reply followed by 404 has
+    // already converged to the requested state.
+    try await client.deleteAttach(ref: "att_missing")
 
     // The attach request body must carry the exact Go JSON keys.
     let attachRequest = server.requests.first { $0.method == "POST" && $0.path == "/v1/attaches" }
@@ -281,8 +277,8 @@ private func shortSocketPath(_ name: String) -> String {
     #expect(bodyObject?["authorityUrl"] as? String == "127.0.0.1:9999")
     #expect(bodyObject?["mountPath"] as? String == "/Users/u/PortableFS/vol-a")
     let options = bodyObject?["options"] as? [String: Any]
-    #expect(options?["writePolicy"] as? String == "writethrough")
-    #expect(options?["fsyncPolicy"] as? String == "local")
+    #expect(options?["writePolicy"] == nil)
+    #expect(options?["fsyncPolicy"] == nil)
     #expect(options?["negativeCache"] as? Bool == true)
 }
 
@@ -297,6 +293,24 @@ private func shortSocketPath(_ name: String) -> String {
         } else {
             Issue.record("expected connect error, got \(error)")
         }
+    } catch {
+        Issue.record("unexpected error type: \(error)")
+    }
+}
+
+@Test func daemonControlClientRejectsMissingAttachCollection() async throws {
+    let socketPath = shortSocketPath("missing-list")
+    let server = try MockControlServer(socketPath: socketPath) { _ in
+        .init(status: 200, json: "{}")
+    }
+    defer { server.stop() }
+
+    let client = DaemonControlClient(socketPath: socketPath, timeout: 5)
+    do {
+        _ = try await client.listAttaches()
+        Issue.record("expected missing attaches array to fail")
+    } catch let error as DaemonControlError {
+        #expect(error.message.contains("no attaches array"))
     } catch {
         Issue.record("unexpected error type: \(error)")
     }

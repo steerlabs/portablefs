@@ -171,6 +171,14 @@ public enum CredentialVerification: Equatable, Sendable {
     case unreachable(message: String)
 }
 
+public enum AccessLeaseFailureDisposition: Equatable, Sendable {
+    /// The manager may have committed the operation. Retry only with the
+    /// exact same operation ID and request body.
+    case retrySameOperation
+    /// The response is definitive or says the lease can never advance.
+    case terminal
+}
+
 /// Resolved data-plane endpoint + credential for one mount, as minted by the
 /// authority manager's access-lease route.
 public struct AccessSessionInfo: Equatable, Sendable {
@@ -181,6 +189,7 @@ public struct AccessSessionInfo: Equatable, Sendable {
     public var expiresAtMs: Int64
     public var authorityInstanceId: String
     public var accessLeaseId: String
+    public var controlSeq: String
 
     public init(
         authorityUrl: String,
@@ -189,7 +198,8 @@ public struct AccessSessionInfo: Equatable, Sendable {
         token: String = "",
         expiresAtMs: Int64 = 0,
         authorityInstanceId: String = "",
-        accessLeaseId: String = ""
+        accessLeaseId: String = "",
+        controlSeq: String = ""
     ) {
         self.authorityUrl = authorityUrl
         self.host = host
@@ -198,6 +208,7 @@ public struct AccessSessionInfo: Equatable, Sendable {
         self.expiresAtMs = expiresAtMs
         self.authorityInstanceId = authorityInstanceId
         self.accessLeaseId = accessLeaseId
+        self.controlSeq = controlSeq
     }
 }
 
@@ -240,7 +251,13 @@ public struct ControlPlaneClient: Sendable {
             path += "?limit=\(limit)"
         }
         let envelope: Envelope = try await sendJSON(method: "GET", path: path, body: nil)
-        return envelope.volumes ?? []
+        guard let volumes = envelope.volumes else {
+            throw ControlPlaneError(status: 0, message: "list-volumes response omitted the volumes array")
+        }
+        guard volumes.allSatisfy({ !$0.volumeId.isEmpty }) else {
+            throw ControlPlaneError(status: 0, message: "list-volumes response contained a volume without volumeId")
+        }
+        return volumes
     }
 
     /// Mirrors the CLI's `verifyCredential`: the server authenticates before
@@ -315,6 +332,20 @@ public struct ControlPlaneClient: Sendable {
     /// creating an access lease — the manager's only resolution route (the
     /// retired mount-session/authority-session routes answer 410).
     public func accessSession(volumeID: String, branch: String) async throws -> AccessSessionInfo {
+        try await accessSession(
+            volumeID: volumeID,
+            branch: branch,
+            operationID: UUID().uuidString.lowercased()
+        )
+    }
+
+    /// Operation-ID-explicit create used by long-lived clients. An ambiguous
+    /// response must be retried with the same value.
+    public func accessSession(
+        volumeID: String,
+        branch: String,
+        operationID: String
+    ) async throws -> AccessSessionInfo {
         struct Authority: Decodable {
             var authorityUrl: String?
             var host: String?
@@ -323,6 +354,7 @@ public struct ControlPlaneClient: Sendable {
         }
         struct Lease: Decodable {
             var accessLeaseId: String?
+            var controlSeq: String?
             var expiresAt: Int64?
         }
         struct Envelope: Decodable {
@@ -331,12 +363,18 @@ public struct ControlPlaneClient: Sendable {
             var accessToken: String?
         }
 
-        let host = ProcessInfo.processInfo.hostName
+        let host = ProcessInfo.processInfo.hostName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else {
+            throw ControlPlaneError(
+                status: 0,
+                message: "cannot create an access lease because macOS returned an empty machine hostname"
+            )
+        }
         let request = try JSONEncoder().encode([
-            "operationId": UUID().uuidString.lowercased(),
+            "operationId": operationID,
             "volumeId": volumeID,
             "branch": branch,
-            "consumerId": "app:" + (host.isEmpty ? "unknown-host" : host),
+            "consumerId": "app:" + host,
         ])
         let (status, body) = try await sendRaw(method: "POST", path: "/v1/access-leases/create", body: request)
         guard (200..<300).contains(status) else {
@@ -347,7 +385,9 @@ public struct ControlPlaneClient: Sendable {
             throw ControlPlaneError(status: status, message: "manager returned an access lease without an authority endpoint")
         }
         guard let token = envelope.accessToken, !token.isEmpty,
-              let leaseId = envelope.lease?.accessLeaseId, !leaseId.isEmpty else {
+              let leaseId = envelope.lease?.accessLeaseId, !leaseId.isEmpty,
+              let controlSeq = envelope.lease?.controlSeq, !controlSeq.isEmpty,
+              let expiresAt = envelope.lease?.expiresAt, expiresAt > 0 else {
             throw ControlPlaneError(status: status, message: "manager returned an incomplete access lease for \(volumeID)@\(branch)")
         }
         return AccessSessionInfo(
@@ -355,10 +395,106 @@ public struct ControlPlaneClient: Sendable {
             host: envelope.authority?.host ?? "",
             port: envelope.authority?.port ?? 0,
             token: token,
-            expiresAtMs: envelope.lease?.expiresAt ?? 0,
+            expiresAtMs: expiresAt,
             authorityInstanceId: envelope.authority?.authorityInstanceId ?? "",
-            accessLeaseId: leaseId
+            accessLeaseId: leaseId,
+            controlSeq: controlSeq
         )
+    }
+
+    /// Renews exactly one existing lease. The caller owns `operationID` and
+    /// must reuse it when a response is ambiguous; this method never creates
+    /// a replacement lease or probes another route.
+    public func renewAccessSession(
+        _ session: AccessSessionInfo,
+        operationID: String,
+        rotateToken: Bool = false
+    ) async throws -> AccessSessionInfo {
+        struct Request: Encodable {
+            var operationId: String
+            var accessLeaseId: String
+            var accessToken: String
+            var expectedControlSeq: String
+            var rotateToken: Bool
+        }
+        struct Lease: Decodable {
+            var accessLeaseId: String?
+            var controlSeq: String?
+            var expiresAt: Int64?
+        }
+        struct Envelope: Decodable {
+            var lease: Lease?
+            var accessToken: String?
+        }
+
+        let request = try JSONEncoder().encode(Request(
+            operationId: operationID,
+            accessLeaseId: session.accessLeaseId,
+            accessToken: session.token,
+            expectedControlSeq: session.controlSeq,
+            rotateToken: rotateToken
+        ))
+        let (status, body) = try await sendRaw(method: "POST", path: "/v1/access-leases/renew", body: request)
+        guard (200..<300).contains(status) else {
+            throw ControlPlaneError.parse(status: status, body: body)
+        }
+        let envelope = try decodeJSON(Envelope.self, from: body, context: "access lease renewal response")
+        guard let leaseId = envelope.lease?.accessLeaseId, leaseId == session.accessLeaseId,
+              let controlSeq = envelope.lease?.controlSeq, !controlSeq.isEmpty,
+              let expiresAt = envelope.lease?.expiresAt, expiresAt > 0 else {
+            throw ControlPlaneError(status: status, message: "manager returned an incomplete access lease renewal")
+        }
+        var renewed = session
+        renewed.controlSeq = controlSeq
+        renewed.expiresAtMs = expiresAt
+        if let token = envelope.accessToken, !token.isEmpty {
+            renewed.token = token
+        } else if rotateToken {
+            throw ControlPlaneError(status: status, message: "manager renewed without the requested rotated access token")
+        }
+        return renewed
+    }
+
+    /// Classifies access-lease failures without inventing a recovery path.
+    /// Terminal typed lease codes win even when carried by a 5xx status.
+    public static func accessLeaseFailureDisposition(_ error: Error) -> AccessLeaseFailureDisposition {
+        guard let controlError = error as? ControlPlaneError else {
+            return .retrySameOperation
+        }
+        let terminalCodes: Set<String> = [
+            "ACCESS_LEASE_EPOCH_SUPERSEDED",
+            "ACCESS_LEASE_NOT_FOUND",
+            "ACCESS_LEASE_EXPIRED",
+            "ACCESS_LEASE_REVOKED",
+            "ACCESS_LEASE_RELEASED",
+            "ACCESS_LEASE_UNAUTHORIZED",
+        ]
+        if terminalCodes.contains(controlError.code) {
+            return .terminal
+        }
+        if controlError.status == 0 || controlError.status == 408 ||
+            controlError.status == 429 || controlError.status >= 500 {
+            return .retrySameOperation
+        }
+        return .terminal
+    }
+
+    /// Releases exactly one existing lease. No alternate cleanup route is
+    /// attempted; callers surface an ambiguous result and let expiry remain
+    /// the manager's terminal backstop.
+    public func releaseAccessSession(
+        _ session: AccessSessionInfo,
+        operationID: String
+    ) async throws {
+        let request = try JSONEncoder().encode([
+            "operationId": operationID,
+            "accessLeaseId": session.accessLeaseId,
+            "accessToken": session.token,
+        ])
+        let (status, body) = try await sendRaw(method: "POST", path: "/v1/access-leases/release", body: request)
+        guard (200..<300).contains(status) else {
+            throw ControlPlaneError.parse(status: status, body: body)
+        }
     }
 
     // MARK: Plumbing

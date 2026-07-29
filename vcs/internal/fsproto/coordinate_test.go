@@ -177,7 +177,7 @@ func newManagedServer(t *testing.T, log *protoEntryLog) (*Server, *workfs.FS) {
 
 // openJournaledSession establishes a session on a managed authority. The
 // negotiation is the version probe (OpProtocolVersion); a managed authority
-// speaks the v6 baseline (journaled coordination is mandatory).
+// speaks the v7 baseline (journaled coordination is mandatory).
 func openJournaledSession(t *testing.T, s *Server, id string, gen uint64, owner, token string, slots uint32) *connSession {
 	t.Helper()
 	cs := &connSession{}
@@ -366,9 +366,8 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	end := wbTestDigest(t, prev, records)
 	flush := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
-		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
 		WBPrevDigest: prev[:], WBEndDigest: end[:],
-		Records: records,
+		Records: records, WBScopes: []WBScope{{Path: "ws", Epoch: co.CheckoutEpoch, Through: 2}},
 	}
 	fr := s.dispatchConn(a, flush)
 	if fr == nil || fr.Status != OK || fr.AppliedThrough != 2 {
@@ -384,9 +383,8 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	badEnd := wbTestDigest(t, end, badRecords)
 	bad := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
-		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
 		WBPrevDigest: end[:], WBEndDigest: badEnd[:],
-		Records: badRecords,
+		Records: badRecords, WBScopes: []WBScope{{Path: "ws", Epoch: co.CheckoutEpoch, Through: 3}},
 	}
 	if r := s.dispatchConn(a, bad); r == nil || r.Status != EPERM {
 		t.Fatalf("out-of-subtree flush: %+v", r)
@@ -398,9 +396,8 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	escEnd := wbTestDigest(t, end, escRecords)
 	esc := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
-		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
 		WBPrevDigest: end[:], WBEndDigest: escEnd[:],
-		Records: escRecords,
+		Records: escRecords, WBScopes: []WBScope{{Path: "ws", Epoch: co.CheckoutEpoch, Through: 3}},
 	}
 	if r := s.dispatchConn(a, esc); r == nil || r.Status != EPERM {
 		t.Fatalf("traversal-escape flush: %+v", r)
@@ -421,9 +418,8 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	lateEnd := wbTestDigest(t, end, lateRecords)
 	late := &Request{
 		Op: OpFlushBatch, SessionID: "wb-1", Owner: "MA",
-		CheckoutPath: "ws", CheckoutEpoch: co.CheckoutEpoch,
 		WBPrevDigest: end[:], WBEndDigest: lateEnd[:],
-		Records: lateRecords,
+		Records: lateRecords, WBScopes: []WBScope{{Path: "ws", Epoch: co.CheckoutEpoch, Through: 3}},
 	}
 	if r := s.dispatchConn(a, late); r == nil || r.Status != ESTALE {
 		t.Fatalf("stale flush: %+v", r)

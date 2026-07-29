@@ -14,7 +14,7 @@ package fsproto
 // deadline timeouts included) whose streak has persisted for at least
 // failFastGrace. A DEFINITE auth rejection (ErrSessionTokenRejected) never
 // counts: the peer answered, so it is reachable — only its credential check
-// failed, and that is the credential re-resolve's problem, not reachability's.
+// failed, and that terminal result is not reachability state.
 // The grace window means a transient blip (an authority restart, a brief
 // LB flap) never engages fail-fast: ops keep retrying normally for the
 // first ~10s of any outage.

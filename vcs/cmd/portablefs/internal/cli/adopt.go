@@ -880,7 +880,11 @@ func buildAdoptManifest(entries []*adoptEntry) ([]adoptManifestEntry, []treehash
 func (c *apiClient) adoptCreateVolume(ctx context.Context, name, branch string) (*volumeMutationResponse, error) {
 	body := map[string]string{"volumeId": name, "branchName": branch}
 	var out volumeMutationResponse
-	if err := c.doIdempotent(ctx, "POST", "/v1/volumes", body, &out, 0, mintIdempotencyKey()); err != nil {
+	idempotencyKey, err := mintIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doIdempotent(ctx, "POST", "/v1/volumes", body, &out, 0, idempotencyKey); err != nil {
 		return nil, err
 	}
 	return &out, nil

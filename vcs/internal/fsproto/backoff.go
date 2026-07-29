@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// Reconnect backoff parameters shared by every client-side reconnect path
-// (per-op redial, invalidation resubscribe, credential re-resolve). One set of
+// Reconnect backoff parameters shared by client-side transport reconnect paths
+// (per-op redial and invalidation resubscribe). One set of
 // numbers so a fleet of mounts recovering from the same event decays at the
 // same rate; the small base keeps single-blip recovery snappy while the cap
 // turns a sustained outage into a trickle of attempts instead of a storm.

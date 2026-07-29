@@ -355,9 +355,10 @@ recovery job (its ID is printed) and is verified and replayed on the next attach
 of the same volume+branch. Use it when the authority is unreachable and you
 need the mount gone NOW.
 
-Uses the platform unmount tooling (umount/diskutil on macOS, fusermount3 on
+Uses one platform unmount command (/sbin/umount on macOS, fusermount3 on
 Linux), then terminates the recorded daemon pid and removes the mount state.
-A path with no recorded state gets a best-effort plain unmount with a warning.
+Missing state or missing drain proof fails closed; PortableFS never substitutes
+an unverified plain unmount.
 `,
 		"mounts": `USAGE
   portablefs mounts [--json]

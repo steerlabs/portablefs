@@ -213,14 +213,30 @@ func TestDoctorVersionSkewFails(t *testing.T) {
 	)
 }
 
-func TestDoctorVersionDevBypassPasses(t *testing.T) {
+func TestDoctorVersionDevBuildFailsClosed(t *testing.T) {
 	e, stdout, r, _ := doctorBaseline(t)
 	e.version = "dev"
 	r.httpDo = doctorTransport(401, 200, "9.9.9")
-	if rc := r.execute(); rc != 0 {
-		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
+	if rc := r.execute(); rc != 1 {
+		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
 	}
-	requireContains(t, stdout.String(), `PASS  version: "dev" build skips the version check (server minimum 9.9.9)`)
+	requireContains(t, stdout.String(),
+		`FAIL  version: "dev" is not a stamped release version, so compatibility with server minimum 9.9.9 cannot be verified`,
+		"fix: install a stamped release with: "+upgradeCommand(),
+	)
+}
+
+func TestDoctorInvalidServerMinimumFailsClosed(t *testing.T) {
+	e, stdout, r, _ := doctorBaseline(t)
+	e.version = "v9.9.9"
+	r.httpDo = doctorTransport(401, 200, "latest")
+	if rc := r.execute(); rc != 1 {
+		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
+	}
+	requireContains(t, stdout.String(),
+		`FAIL  version: server sent invalid minimum CLI version "latest"`,
+		"fix: fix the server's "+minCLIVersionHeader+" response header",
+	)
 }
 
 func TestDoctorVersionMeetsMinimum(t *testing.T) {

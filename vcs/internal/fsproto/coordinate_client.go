@@ -180,20 +180,20 @@ func (c *Client) CheckinManaged(path, epoch string) error {
 	return nil
 }
 
-// FlushWriteback ships one dense same-scope run of the mount write-back
-// stream. Exactness rides the stream's durable watermark + digest (a lost
-// reply resends identical bytes and the authority drops the covered prefix),
-// so no slot identity is consumed.
-func (c *Client) FlushWriteback(writebackID, grantPath, grantEpoch string, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
+// FlushWriteback ships one dense global run of the mount write-back stream.
+// scopes maps every record to the exact live grant authorizing it. Exactness
+// rides the stream's durable watermark + digest (a lost reply resends
+// identical bytes and the authority drops the covered prefix), so no slot
+// identity is consumed.
+func (c *Client) FlushWriteback(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
 	resp, err := c.doAttached(&Request{
-		Op:            OpFlushBatch,
-		SessionID:     writebackID,
-		Owner:         c.owner,
-		CheckoutPath:  grantPath,
-		CheckoutEpoch: grantEpoch,
-		WBPrevDigest:  prevDigest[:],
-		WBEndDigest:   endDigest[:],
-		Records:       records,
+		Op:           OpFlushBatch,
+		SessionID:    writebackID,
+		Owner:        c.owner,
+		WBPrevDigest: prevDigest[:],
+		WBEndDigest:  endDigest[:],
+		Records:      records,
+		WBScopes:     scopes,
 	}, false)
 	if err != nil {
 		return 0, EIO, err

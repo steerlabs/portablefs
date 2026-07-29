@@ -12,9 +12,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -244,7 +246,12 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	e.fl = newFlusher(e)
 	e.recovery = newRecoveryRunner(e)
 	maxEpoch := e.recovery.discover()
-	e.epoch = maxEpoch + 1
+	e.epoch, err = reserveWALEpoch(cfg.StateDir, maxEpoch)
+	if err != nil {
+		e.cancelCtx()
+		_ = lock.Close()
+		return nil, err
+	}
 	e.writebackID = streamID(mountID, e.epoch)
 	// Attach-readiness gate: every prior parked stream must drain — or park
 	// in an explicit terminal conflict/corrupt state — BEFORE the mount
@@ -328,6 +335,37 @@ func ensureMountID(dir string) ([16]byte, error) {
 		return id, err
 	}
 	return id, nil
+}
+
+// reserveWALEpoch durably advances the stream-identity high-water mark.
+// Stream directories are deliberately removed after a clean close, so
+// discovering their maximum is not enough: without this independent
+// reservation, the next clean mount would reuse epoch 1 and collide with the
+// authority's durable write-back ledger. Gaps after a crash are harmless;
+// reuse is not.
+func reserveWALEpoch(dir string, discovered uint64) (uint64, error) {
+	path := filepath.Join(dir, "wal-epoch")
+	last := discovered
+	b, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		persisted, parseErr := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+		if parseErr != nil || persisted == 0 {
+			return 0, fmt.Errorf("%w: malformed WAL epoch high-water mark %s", ErrCorrupt, path)
+		}
+		last = max(last, persisted)
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return 0, fmt.Errorf("writeback: read WAL epoch high-water mark: %w", err)
+	}
+	if last == math.MaxUint64 {
+		return 0, errors.New("writeback: WAL epoch space exhausted")
+	}
+	next := last + 1
+	if err := writeFileAtomicDurable(path, []byte(strconv.FormatUint(next, 10)+"\n"), 0o600); err != nil {
+		return 0, fmt.Errorf("writeback: reserve WAL epoch %d: %w", next, err)
+	}
+	return next, nil
 }
 
 // ensureStreamLocked lazily creates the live stream WAL and its recovery-job

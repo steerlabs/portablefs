@@ -96,6 +96,24 @@ private struct FailingTransport: HTTPDataTransport {
     }
 }
 
+@Test func listVolumesRejectsMissingCollectionOrIdentity() async {
+    for json in [#"{}"#, #"{"volumes":[{"branches":[]}]}"#] {
+        let client = ControlPlaneClient(
+            baseURL: "https://api",
+            token: "tok",
+            transport: StubTransport(status: 200, json: json)
+        )
+        do {
+            _ = try await client.listVolumes()
+            Issue.record("expected incomplete list-volumes response to fail")
+        } catch let error as ControlPlaneError {
+            #expect(error.message.contains("list-volumes response"))
+        } catch {
+            Issue.record("unexpected error type: \(error)")
+        }
+    }
+}
+
 @Test func verifyCredentialMirrorsGoSemantics() async {
     // 401/403 = rejected.
     let rejected = ControlPlaneClient(
@@ -189,7 +207,110 @@ private let accessLeaseJSON = """
     #expect(session.token == "lease-token")
     #expect(session.expiresAtMs == 1751505000000)
     #expect(session.accessLeaseId == "pfal_1")
+    #expect(session.controlSeq == "7")
     #expect(transport.recordedPaths == ["/v1/access-leases/create"])
+}
+
+@Test func accessSessionRenewsAndRotatesOnlyTheSameLease() async throws {
+    let renewedJSON = """
+    {"lease":{"accessLeaseId":"pfal_1","controlSeq":"8","expiresAt":1751506000000,"state":"active"},
+     "accessToken":"rotated-token","serverTimeMs":1751505000000}
+    """
+    let transport = StubTransport(status: 200, json: renewedJSON)
+    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
+    let initial = AccessSessionInfo(
+        authorityUrl: "tcp://10.0.0.5:7443",
+        token: "lease-token",
+        expiresAtMs: 1751505000000,
+        authorityInstanceId: "auth-1",
+        accessLeaseId: "pfal_1",
+        controlSeq: "7"
+    )
+    let renewed = try await client.renewAccessSession(
+        initial,
+        operationID: "op-renew-1",
+        rotateToken: true
+    )
+    #expect(renewed.authorityUrl == initial.authorityUrl)
+    #expect(renewed.accessLeaseId == initial.accessLeaseId)
+    #expect(renewed.controlSeq == "8")
+    #expect(renewed.expiresAtMs == 1751506000000)
+    #expect(renewed.token == "rotated-token")
+    #expect(transport.recordedPaths == ["/v1/access-leases/renew"])
+
+    let body = try #require(transport.requests.first?.httpBody)
+    let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(payload["operationId"] as? String == "op-renew-1")
+    #expect(payload["accessLeaseId"] as? String == "pfal_1")
+    #expect(payload["expectedControlSeq"] as? String == "7")
+    #expect(payload["rotateToken"] as? Bool == true)
+}
+
+@Test func accessLeaseFailureClassificationNeverReacquires() {
+    #expect(
+        ControlPlaneClient.accessLeaseFailureDisposition(
+            ControlPlaneError(status: 0, message: "connection lost")
+        ) == .retrySameOperation
+    )
+    #expect(
+        ControlPlaneClient.accessLeaseFailureDisposition(
+            ControlPlaneError(status: 503, code: "ACCESS_LEASE_EPOCH_SUPERSEDED", message: "old epoch")
+        ) == .terminal
+    )
+    #expect(
+        ControlPlaneClient.accessLeaseFailureDisposition(
+            ControlPlaneError(status: 409, code: "ACCESS_LEASE_CONTROL_CONFLICT", message: "conflict")
+        ) == .terminal
+    )
+}
+
+@Test func accessSessionRenewRejectsIncompleteRotationWithoutFallback() async {
+    let transport = StubTransport(
+        status: 200,
+        json: #"{"lease":{"accessLeaseId":"pfal_1","controlSeq":"8","expiresAt":1751506000000,"state":"active"}}"#
+    )
+    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
+    let initial = AccessSessionInfo(
+        authorityUrl: "tcp://authority",
+        token: "lease-token",
+        expiresAtMs: 1751505000000,
+        accessLeaseId: "pfal_1",
+        controlSeq: "7"
+    )
+    do {
+        _ = try await client.renewAccessSession(
+            initial,
+            operationID: "op-renew-1",
+            rotateToken: true
+        )
+        Issue.record("expected error")
+    } catch let error as ControlPlaneError {
+        #expect(error.message.contains("without the requested rotated access token"))
+    } catch {
+        Issue.record("unexpected error type: \(error)")
+    }
+    #expect(transport.recordedPaths == ["/v1/access-leases/renew"])
+}
+
+@Test func accessSessionReleaseUsesExactLeaseRouteAndOperation() async throws {
+    let transport = StubTransport(
+        status: 200,
+        json: #"{"lease":{"accessLeaseId":"pfal_1"},"receipt":{"operationId":"op-release-1"},"serverTimeMs":1}"#
+    )
+    let client = ControlPlaneClient(baseURL: "https://mgr", token: "mtok", transport: transport)
+    let session = AccessSessionInfo(
+        authorityUrl: "tcp://authority",
+        token: "lease-token",
+        accessLeaseId: "pfal_1",
+        controlSeq: "7"
+    )
+    try await client.releaseAccessSession(session, operationID: "op-release-1")
+    #expect(transport.recordedPaths == ["/v1/access-leases/release"])
+    let body = try #require(transport.requests.first?.httpBody)
+    let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(payload["operationId"] as? String == "op-release-1")
+    #expect(payload["accessLeaseId"] as? String == "pfal_1")
+    #expect(payload["accessToken"] as? String == "lease-token")
 }
 
 @Test func accessSessionNeverFallsBack() async {

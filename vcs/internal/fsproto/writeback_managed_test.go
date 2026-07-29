@@ -10,7 +10,7 @@ import (
 
 // serveManagedAuthority starts a managed (journal-native) authority over a real
 // TCP listener and returns its address. Mirrors newManagedServer but served on
-// a socket so a real *Client (which requires the v6 baseline) can dial it.
+// a socket so a real *Client (which requires the v7 baseline) can dial it.
 func serveManagedAuthority(t *testing.T) string {
 	t.Helper()
 	addr, _ := serveManagedAuthorityFS(t)
@@ -86,11 +86,12 @@ func TestWriteBackManagedCoordination(t *testing.T) {
 	}
 	prev := wbZeroDigest()
 	end := wbTestDigest(t, prev, records)
-	through, st, err := cli.FlushWriteback("wb-stream-1", "w", grant.Epoch, prev, end, records)
+	scopes := []WBScope{{Path: "w", Epoch: grant.Epoch, Through: records[len(records)-1].Seq}}
+	through, st, err := cli.FlushWriteback("wb-stream-1", scopes, prev, end, records)
 	if err != nil || st != OK || through != 2 {
 		t.Fatalf("managed write-back flush: through=%d st=%d err=%v", through, st, err)
 	}
-	through2, st2, err := cli.FlushWriteback("wb-stream-1", "w", grant.Epoch, prev, end, records)
+	through2, st2, err := cli.FlushWriteback("wb-stream-1", scopes, prev, end, records)
 	if err != nil || st2 != OK || through2 != 2 {
 		t.Fatalf("retry flush: through=%d st=%d err=%v", through2, st2, err)
 	}
