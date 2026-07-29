@@ -76,9 +76,13 @@ Why these values:
   epoch claim, flapping children on every claim exchange. This is pinned
   in config-as-code — unlike the other capacity knobs, which stay
   dashboard-managed — because scaling the manager horizontally is never a
-  valid operator action; a redeploy is an epoch handover in which the new
-  instance claims and the old one self-fences. Do not "fix" a slow manager
-  by raising this.
+  valid operator action. Railway's health-gated rolling activation is also
+  deliberately NOT the handoff mechanism: Railway waits for the successor's
+  `/readyz` before signaling the predecessor, while the successor correctly
+  refuses readiness until the predecessor releases its live database claim.
+  Deploy this service with the stop-before-start procedure in
+  `docs/railway-deployment.md`. Do not weaken readiness, force a live takeover,
+  or "fix" a slow manager by raising the replica count.
 - **`migration-gate.railway.json` reuses `Dockerfile.volume-api`** — the
   volume-api runtime image already contains the built
   `packages/metadata-db/dist`, its installed `pg` dependency, and the

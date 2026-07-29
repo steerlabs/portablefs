@@ -28,9 +28,9 @@ tail -f /srv/work/agent.log   # sees flushed writes from the shared authority
 # Linux FUSE applies push invalidations through the kernel; macOS FSKit's
 # current SDK boundary is documented below.
 
-# close the laptop. The mount disappears; the workspace does not.
-# The agent on the server keeps working. Every acked write was already
-# durably journaled and flows into immutable history automatically.
+# synchronize or cleanly unmount, then close the laptop. The mount disappears;
+# the workspace does not. The agent on the server keeps working, and everything
+# through that filesystem durability barrier flows into immutable history.
 
 # fork the workspace to try three approaches in parallel
 portablefs fork myagent --name attempt-1
@@ -52,19 +52,13 @@ This is the difference from everything that looks similar:
 
 ## Install The CLI
 
-> **Prebuilt releases are coming soon.** The commands below (and the Homebrew
-> tap) go live with the first tagged release. Until then, build from source —
-> see [Development](#development) — or watch the
-> [releases page](https://github.com/steerlabs/portablefs/releases).
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh
-# or
-brew install steerlabs/tap/portablefs
 ```
 
 The installer verifies release checksums before installing (Linux and macOS,
-amd64 and arm64). Binaries also ship on the GitHub releases page.
+amd64 and arm64). Binaries also ship on the
+[GitHub releases page](https://github.com/steerlabs/portablefs/releases).
 
 ## Quickstart A: Local Stack In 2 Minutes
 
