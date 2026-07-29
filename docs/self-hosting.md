@@ -35,10 +35,17 @@ AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 VOLUME_S3_PREFIX=portablefs/prod            # optional; default "portablefs"
 # VOLUME_S3_SSE=AES256                      # optional server-side encryption header
+# VOLUME_S3_REQUEST_TIMEOUT_MS=300000        # optional; 1s..10m
 # or, single-node filesystem blobs on a durable volume:
 # VOLUME_BLOB_STORE=filesystem
 # VOLUME_FILESYSTEM_BLOB_ROOT=/data/blobs
 ```
+
+`AWS_ENDPOINT_URL` must use HTTPS. Loopback-only development stores may opt
+into HTTP with `VOLUME_S3_ALLOW_INSECURE_ENDPOINT=1`; the flag never permits a
+plaintext non-loopback endpoint. The request timeout covers uploads and
+buffered/control responses, while streaming reads use it only for response
+headers and remain caller-abortable afterward.
 
 The retired Railway-era spellings are accepted as compat aliases for one
 release, so existing deployments keep working without config changes:

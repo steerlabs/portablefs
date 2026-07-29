@@ -488,6 +488,9 @@ describe("createVolumeApiServer", () => {
       [emptyDigest, firstDigest].sort()
     );
     expect(blobStore.putOptions.every((options) => options?.checkExisting === false)).toBe(true);
+    expect(blobStore.putOptions.every((options) => options?.signal instanceof AbortSignal)).toBe(
+      true
+    );
   });
 
   test("uploads small blobs through compact binary batch and records metadata", async () => {
@@ -518,6 +521,9 @@ describe("createVolumeApiServer", () => {
       [firstDigest, secondDigest].sort()
     );
     expect(blobStore.putOptions.every((options) => options?.checkExisting === false)).toBe(true);
+    expect(blobStore.putOptions.every((options) => options?.signal instanceof AbortSignal)).toBe(
+      true
+    );
   });
 
   test("can acknowledge binary blob batches without returning every blob ref", async () => {
@@ -571,6 +577,7 @@ describe("createVolumeApiServer", () => {
 
     expect(response.status).toBe(201);
     expect(blobStore.putOptions[0]?.checkExisting).toBe(false);
+    expect(blobStore.putOptions[0]?.signal).toBeInstanceOf(AbortSignal);
     await expect(blobStore.get(digest)).resolves.toEqual(bytes);
   });
 
