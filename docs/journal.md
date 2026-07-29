@@ -1,11 +1,12 @@
 # The Journal
 
 The journal is PortableFS's durability layer: a fenced, ordered mutation log
-in PostgreSQL. Every acknowledged write to a live volume commits to the
-journal before the client hears "done". Authority processes are disposable
-caches over that truth — kill one at any moment and a replacement replays the
-journal and continues exactly where things left off. Nothing about
-persistence depends on checkpoints, snapshots, drains, or shutdown.
+in PostgreSQL. Every authority-lane write commits before its reply, and every
+successful mount `fsync` drains delegated writes through the same boundary.
+Authority processes are disposable caches over that truth — kill one at any
+moment and a replacement replays the journal and continues exactly where
+authority-durable history left off. Persistence at this layer does not depend
+on checkpoints, snapshots, or authority shutdown.
 
 ## Durability contract
 

@@ -71,7 +71,7 @@ type Options struct {
 	OnMarkOrphan  func(path string, ino uint64)
 	// OnWriteBackError reports the engine's sticky health verdict (nil
 	// clears). Lets the daemon flip a mount to degraded when flushes stall,
-	// so acked-but-unflushable write-back is loud instead of silently lost.
+	// so accepted-but-unflushable write-back is loud instead of hidden.
 	OnWriteBackError func(root string, err error)
 	Debugf           func(string, ...any)
 
@@ -80,10 +80,10 @@ type Options struct {
 	ExactSlots uint32
 }
 
-// volumeBarrierTimeout bounds one fsync/synchronize/unmount drain attempt:
-// past it the barrier FAILS (the tail stays durable in the local WAL) — it
-// never silently degrades to a local-only success. A var so failure-shape
-// tests compress it; production never changes it.
+// volumeBarrierTimeout bounds one fsync/synchronize/unmount drain attempt.
+// Past it the barrier fails and never degrades to a local-only success. The
+// local sync stage must also have succeeded before any durability claim.
+// A var so failure-shape tests compress it; production never changes it.
 var volumeBarrierTimeout = 60 * time.Second
 
 // PrefetchProgress is a snapshot of the asynchronous metadata prefetcher.
@@ -171,13 +171,26 @@ type Volume struct {
 
 var errVolumeClosed = errors.New("clientcore: volume is closed")
 
-func (v *Volume) beginMutation() bool {
+func (v *Volume) beginLifecycleOperation() error {
 	v.lifecycleMu.RLock()
 	if v.closed {
 		v.lifecycleMu.RUnlock()
-		return false
+		return errVolumeClosed
 	}
-	return true
+	return nil
+}
+
+func (v *Volume) beginMutation() error {
+	if err := v.beginLifecycleOperation(); err != nil {
+		return err
+	}
+	if v.wb != nil {
+		if err := v.wb.MutationError(); err != nil {
+			v.lifecycleMu.RUnlock()
+			return err
+		}
+	}
+	return nil
 }
 
 func (v *Volume) endMutation() {
@@ -820,8 +833,8 @@ func (v *Volume) ensureOpenPins(ctx context.Context, scope string) error {
 // FlushToAuthority waits until the engine's acknowledged stream tail has
 // flushed to the authority.
 func (v *Volume) FlushToAuthority(ctx context.Context) error {
-	if !v.beginMutation() {
-		return errVolumeClosed
+	if err := v.beginLifecycleOperation(); err != nil {
+		return err
 	}
 	defer v.endMutation()
 	return v.flushToAuthority(ctx)
@@ -836,7 +849,7 @@ func (v *Volume) flushToAuthority(ctx context.Context) error {
 
 // Fsync is the per-file authority-durability and subscriber-visibility
 // barrier. It
-// returns success only when (1) every acknowledged mutation up to the
+// returns success only when (1) every accepted mutation up to the
 // barrier is committed and applied at the authority (flush commits are
 // durable-before-reply; the mount stream is globally dense, so the drain
 // intentionally overflushes earlier unrelated mutations), and (2) every
@@ -847,8 +860,8 @@ func (v *Volume) flushToAuthority(ctx context.Context) error {
 // If the authority is unreachable, slow past the deadline, or fenced, fsync
 // returns the ERROR: there is no local-only fsync outcome, ever.
 func (v *Volume) Fsync(path string) error {
-	if !v.beginMutation() {
-		return errVolumeClosed
+	if err := v.beginLifecycleOperation(); err != nil {
+		return err
 	}
 	defer v.endMutation()
 	return v.fsync(path)
@@ -879,7 +892,7 @@ func (v *Volume) boundedBarrier(fn func() error) error {
 	case err := <-done:
 		return err
 	case <-time.After(volumeBarrierTimeout):
-		return fmt.Errorf("clientcore: volume barrier timed out after %v (authority unreachable or slow; acknowledged data stays durable in the local WAL and flushes when the authority answers)", volumeBarrierTimeout)
+		return fmt.Errorf("clientcore: volume barrier timed out after %v (authority unreachable or slow; no durability or visibility success is claimed)", volumeBarrierTimeout)
 	}
 }
 
@@ -918,11 +931,11 @@ func (v *Volume) WritebackStatus() writeback.Status {
 // supported frontend boundary. This is the FSKit synchronize contract; fsyncing a snapshot
 // of currently open handles alone is NOT a sufficient volume barrier. There
 // is NO degraded local-only outcome: an unreachable, slow, or fenced
-// authority fails the barrier with an error. The un-flushed tail stays
-// durable in the local WAL either way and replays on the next attach.
+// authority fails the barrier with an error. The drain forces the local WAL
+// first; if that local sync also fails, the mount remains failed closed.
 func (v *Volume) SyncVolume() error {
-	if !v.beginMutation() {
-		return errVolumeClosed
+	if err := v.beginLifecycleOperation(); err != nil {
+		return err
 	}
 	defer v.endMutation()
 	return v.syncVolume()
@@ -934,8 +947,8 @@ func (v *Volume) syncVolume() error {
 		defer cancel()
 		if err := v.wb.DrainAll(ctx); err != nil {
 			// The tail could not reach the authority: make it locally
-			// durable (crash-safe; replays on the next attach) and surface
-			// the barrier failure.
+			// durable when possible and surface the barrier failure. Exact
+			// replay on a later attach never converts this into success.
 			if serr := v.wb.SyncLocal(); serr != nil {
 				return fmt.Errorf("clientcore: volume barrier: drain failed (%v) and local WAL fsync failed: %w", err, serr)
 			}

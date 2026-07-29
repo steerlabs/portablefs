@@ -8,9 +8,10 @@ why they work.
 
 The model in one paragraph: a volume is a workspace that lives in the network. One
 authority owns its live state, so every mount — laptop, server, sandbox — sees the
-same ordered filesystem, coherently. Acked writes commit durably to the journal,
-flow into immutable commits automatically, and every commit is forkable. Machines
-are disposable; the workspace is not.
+same ordered filesystem, coherently. Accepted writes flow into the authority
+journal and immutable commits automatically; `fsync` and clean unmount are the
+explicit cross-machine durability boundaries. Every commit is forkable. Machines
+are disposable after that barrier; the workspace is not.
 
 ## Continuity: The Workspace Outlives The Session
 
@@ -24,10 +25,9 @@ portablefs create refactor-auth
 portablefs mount refactor-auth ~/work
 cd ~/work && git clone git@github.com:acme/api . && claude
 
-# laptop lid closes mid-run. Nothing is lost: every acked write is durable
-# (at the authority, or in the mount's crash-safe write-back log with the
-# flusher shipping it within milliseconds), and history cuts capture
-# progress continuously.
+# Before handing work to another machine, fsync or cleanly unmount. That
+# makes the accepted local tail durable at the authority; history cuts then
+# capture it continuously.
 
 # day 1, later, a server: pick up mid-run
 portablefs mount refactor-auth /srv/work
@@ -36,26 +36,26 @@ cd /srv/work    # same files, same git state, same half-finished edit
 
 Two things make this safe rather than merely convenient:
 
-- **Durability is at ack time, not at sync time.** There is no "did it
-  upload?" window. A contended write is durable at the authority when it
-  returns. A write under a delegation (the adaptive write-back engine —
-  [writeback-engine.md](./writeback-engine.md)) is durable in the mount's
-  local stream WAL when it returns and ships to the authority within
-  milliseconds; if the machine dies first, the acknowledged tail parks
-  durably and replays automatically on the next attach from that machine —
-  never silently dropped. `fsync` and clean unmount always mean durable at
-  the authority, so `git commit` and SQLite transactions are
-  machine-independent the moment they return.
+- **Write acceptance and durability are separate.** A contended,
+  write-through operation is durable at the authority when it returns. A
+  write under a delegation (the adaptive write-back engine —
+  [writeback-engine.md](./writeback-engine.md)) is immediately visible on the
+  writing mount, then reaches local physical durability on the 5 ms / 4 MiB
+  group-sync. A complete power loss inside that small window may lose the
+  recent un-fsynced tail, just as on a normal filesystem. `fsync`, dirty
+  last-close, synchronize, and clean unmount force the local WAL and make the
+  accepted tail durable at the authority. Those are the handoff boundaries
+  for Git, SQLite, and cross-machine continuation.
 - **There is no stale handover, because there is no second truth.** Both
   mounts are windows onto the same live authority. A peer that reads a
   subtree another mount holds delegated waits for the holder to drain
   (milliseconds when the holder is alive) and then sees the exact
-  acknowledged bytes — never a stale snapshot. If the holder vanished with
-  an unshipped tail, peers get a retryable error rather than silently old
-  data until the tail recovers (or an operator explicitly discards it as
-  data loss). The practical habit: end an agent run with `fsync`/unmount
-  (or any barrier) before abandoning the machine, and the whole workspace
-  is authority-durable.
+  accepted bytes — never a stale snapshot. If the holder vanished with a
+  locally durable, unshipped tail, peers get a retryable error rather than
+  silently old data until exact replay completes (or an operator explicitly
+  discards it as data loss). The practical habit: end an agent run with
+  `fsync`/unmount (or any barrier) before abandoning the machine, and the
+  whole workspace is authority-durable.
 
 For scheduled or resumable agents, make the mount the first step of the job and the
 unmount the last; the workspace carries all state between runs, including

@@ -1058,9 +1058,9 @@ func (a *attach) statfs() (*pfslocal.StatfsReply, int32) {
 
 // syncVolume serves the frontend's REAL volume barrier (FSKit synchronize):
 // authority-durable, applied, and acknowledged by every live protocol
-// subscriber at its supported frontend boundary — or an ERROR. There is no degraded local-only
-// success; the un-flushed tail stays crash-safe in the local WAL and the
-// failure surfaces on the attach state and to the kernel caller.
+// subscriber at its supported frontend boundary — or an ERROR. There is no
+// degraded local-only success. Local WAL sync failure seals mutation
+// admission; any barrier failure surfaces on attach state and to the kernel.
 func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32) {
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -1068,7 +1068,7 @@ func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32
 	}
 	if err := vol.SyncVolume(); err != nil {
 		recs, bytes := vol.WriteBackPending()
-		log.Printf("portablefsd: %s: volume sync FAILED: %v (%d records / %d bytes stay durable in the local WAL and flush when the authority answers)", a.ref, err, recs, bytes)
+		log.Printf("portablefsd: %s: volume sync FAILED: %v (%d records / %d bytes remain pending; no barrier success claimed)", a.ref, err, recs, bytes)
 		a.setErr(err)
 		return nil, darwinEIO
 	}

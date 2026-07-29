@@ -515,7 +515,7 @@ func TestDirViewBoundNeverClaimsOversizeListing(t *testing.T) {
 
 // TestClientKillRecovery simulates a client kill -9: the engine is abandoned
 // without any close, a fresh engine on the same store recovers the stream,
-// and every acknowledged mutation reaches the authority byte-exactly.
+// and every accepted mutation reaches the authority byte-exactly.
 func TestClientKillRecovery(t *testing.T) {
 	auth := newFakeAuthority()
 	auth.mu.Lock()
@@ -739,10 +739,10 @@ func TestRecoverySweepsGrantOrphanedBeforeDelegationFrame(t *testing.T) {
 	}
 }
 
-// TestStickyDegradedAndSelfHeal: an unreachable authority flips sticky
-// degraded via the no-progress watchdog; recovery of connectivity drains and
-// clears the verdict.
-func TestStickyDegradedAndSelfHeal(t *testing.T) {
+// TestStickyDegradedClearsOnlyAfterExactDrain: an unreachable authority flips
+// sticky degraded via the no-progress watchdog; an exact full drain after
+// connectivity returns clears the transient verdict.
+func TestStickyDegradedClearsOnlyAfterExactDrain(t *testing.T) {
 	auth := newFakeAuthority()
 	auth.mu.Lock()
 	auth.dirs["d"] = true

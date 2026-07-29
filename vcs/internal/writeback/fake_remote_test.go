@@ -26,6 +26,9 @@ type fakeAuthority struct {
 	modes    map[string]uint32
 
 	denyAll bool
+	// acquireErr simulates a definite pre-grant transport failure. It is
+	// distinct from a policy denial and must never select another lane.
+	acquireErr error
 	// omitChildren makes grants ship no snapshot (the duplicate-replay
 	// shape); the client then seeds via readdir under the held grant.
 	omitChildren bool
@@ -75,6 +78,9 @@ func (a *fakeAuthority) DelegationAcquire(_ context.Context, scope, writebackID 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.acquires++
+	if a.acquireErr != nil {
+		return AcquireReply{}, a.acquireErr
+	}
 	if a.denyAll {
 		return AcquireReply{}, nil
 	}

@@ -88,9 +88,8 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 
 // perfOptions carries the FUSE mount cache options plus the write-back
 // engine's durable state location. There is no write-mode knob: the
-// authority delegates adaptively per scope, and fsync always means durable
-// at the authority. Un-fsynced writes have a bounded (~flush batching)
-// window, the same contract as a local page cache.
+// authority delegates adaptively per scope. Plain writes may return before
+// the local group-sync; fsync forces local sync and authority durability.
 type perfOptions struct {
 	// negativeCache forces the negative dentry cache on; negativeCacheOff
 	// forces it off. Neither (the default) keeps the v6 baseline: on.
@@ -766,7 +765,7 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	var o commonOpts
 	var force bool
 	addCommonFlags(fs, &o)
-	fs.BoolVar(&force, "force", false, "detach even with an unshipped write-back tail: it parks as a durable recovery job (its ID is printed) and drains automatically on the next attach")
+	fs.BoolVar(&force, "force", false, "detach even with an unshipped write-back tail: it parks as a durable recovery job (its ID is printed) for verified exact replay on the next attach")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		return e.handleParseError("umount", err)
@@ -817,7 +816,7 @@ func cmdUmount(e *cmdEnv, args []string) int {
 		// with the mount fully alive — never a silently parked tail behind a
 		// healthy-looking unmount.
 		if err := e.drainBeforeUnmount(st); err != nil {
-			return e.fail("umount", fmt.Errorf("%v\nnothing was unmounted: the write-back tail could not reach the authority. Retry when it is reachable, or run `portablefs umount --force %s` to detach now — the tail then parks as a durable recovery job and drains on the next attach", err, mountPath))
+			return e.fail("umount", fmt.Errorf("%v\nnothing was unmounted: the write-back tail could not reach the authority. Retry when it is reachable, or run `portablefs umount --force %s` to detach now — the tail then parks as a durable recovery job for verified exact replay on the next attach", err, mountPath))
 		}
 	}
 
@@ -847,7 +846,7 @@ func cmdUmount(e *cmdEnv, args []string) int {
 		forcedJobs = append(forcedJobs, parkedRecoveryJobs(stateDir, st)...)
 		forcedJobs = dedupeStrings(forcedJobs)
 		for _, id := range forcedJobs {
-			fmt.Fprintf(e.stdout, "parked write-back recovery job %s (drains automatically on the next attach of %s@%s)\n", id, st.VolumeID, st.Branch)
+			fmt.Fprintf(e.stdout, "parked write-back recovery job %s (verified and replayed exactly on the next attach of %s@%s)\n", id, st.VolumeID, st.Branch)
 		}
 	}
 	if err := removeMountState(stateDir, mountPath); err != nil {

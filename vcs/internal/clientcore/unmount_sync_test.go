@@ -342,7 +342,7 @@ func TestFailedDetachKeepsMutationsGatedThenReopensVolume(t *testing.T) {
 }
 
 // TestSyncVolumeNormalPathFlushesToAuthority pins that a REACHABLE authority
-// completes the full barrier: every acknowledged mutation is at the
+// completes the full barrier: every accepted mutation is at the
 // authority (and peer-visible) before success.
 func TestSyncVolumeNormalPathFlushesToAuthority(t *testing.T) {
 	addr := serveCore(t)

@@ -1,12 +1,14 @@
 # History
 
-History in PortableFS is asynchronous. The fenced Postgres journal is the one
-durability layer: an acknowledged mutation is durable the moment the journal
-transaction commits, and nothing on the write path ever waits for a cut, a
-checkpoint, or object storage. History is built behind the write path from
-the journal itself: a **HistoryCut** pins one exact journal position in a
-short database transaction, and an external worker later reconstructs that
-cut into immutable, content-addressed **PFT2** objects in blob storage.
+History in PortableFS is asynchronous. The fenced Postgres journal is the
+authority durability layer: a mutation is authority-durable when that
+journal transaction commits, and nothing on the write path ever waits for a
+cut, checkpoint, or object storage. A delegated mount may accept `write(2)`
+before this point; `fsync` drains through it. History is built behind the
+authority write path from the journal itself: a **HistoryCut** pins one exact
+journal position in a short database transaction, and an external worker
+later reconstructs that cut into immutable, content-addressed **PFT2**
+objects in blob storage.
 
 ```text
 write path:    client -> authority -> fenced Postgres journal -> ack

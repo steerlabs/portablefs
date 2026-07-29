@@ -20,8 +20,10 @@ over TCP. That shape fixes what is cheap and what is expensive:
 - Adaptive delegation makes a single writer near-local, automatically. Write
   mode is not a mount property ([writeback-engine.md](./writeback-engine.md)):
   the authority delegates an uncontended subtree on the first write, after
-  which mutations under it are acknowledged into a local overlay + segmented
-  mount WAL at local-disk latency and one flusher ships them in dense batches.
+  which mutations under it are accepted into a local overlay + segmented
+  mount WAL file descriptor at local-disk latency and one flusher ships them
+  in dense batches. The 5 ms / 4 MiB group-sync preserves throughput by not
+  forcing physical sync on every `write(2)`.
   The same W2 storm drops from ~200x to ~0.7x local wall time with ZERO
   synchronous round-trips (delegated creates need no probe: the grant's
   children snapshot proves absence locally). No coherence is given up: a peer
@@ -37,6 +39,11 @@ over TCP. That shape fixes what is cheap and what is expensive:
   all of which mean durable at the authority in v5, never a local-only
   outcome) pays the deferred flush. Nothing makes durability free; the engine
   only moves when it is paid.
+- The write-return and power-loss-durability measurements are intentionally
+  separate. `storm_visible` measures accepted local writes; `storm_durable`
+  includes the explicit local sync, authority drain/apply, and visibility
+  barrier. Treating the first as durable would erase the exact performance
+  trade-off the engine is designed to expose.
 - Multi-writer paths pay for coherence. Reads and opens of shared (undelegated)
   paths revalidate by version against the authority. Open/close tracking for
   cross-mount open-after-unlink semantics (`mark_open` in the op mix) is now
@@ -389,12 +396,17 @@ Remaining knobs:
   through the same pooled client (which must reconnect transparently).
 - `-mode client-kill`: the authority stays healthy while the write-back
   MOUNT CLIENT (`pfsbench wbstorm` — a real `clientcore` volume running the
-  adaptive engine with a durable store) is SIGKILLed mid-storm. Kills are
+  adaptive engine with a persistent local store) is SIGKILLed mid-storm. Kills are
   timer-triggered on even iterations (covering the setup phase and the
   point immediately after the last ack, where the flusher still holds an
   unshipped tail) and ack-count-triggered on odd iterations (squarely
   mid-ack-phase). A fresh client on the same store (`pfsbench wbrecover`)
-  must automatically discover the parked stream, rebind it, and drain it.
+  must discover the parked stream at its attach-readiness gate, verify it,
+  rebind it, and drain it exactly.
+
+The client-kill campaign is a process-loss test, not a sudden-power-loss
+test: the OS page cache survives SIGKILL. The write-versus-fsync contract is
+pinned separately by `TestWriteAndFsyncHaveDistinctLocalDurabilityBoundaries`.
 
 Both campaigns verify, against the (restarted or always-live) authority:
 
@@ -418,8 +430,8 @@ one iteration was killed between a create's ack and its write's ack, and one
 mid-setup kill exercised the grant-orphaned-before-DELEGATION-frame window
 (recovery must sweep the authority-journaled grant of a provably empty
 stream; `TestRecoverySweepsGrantOrphanedBeforeDelegationFrame` pins it).
-Every acknowledged byte was present and hash-correct on the authority after
-automatic recovery, with no duplication. The historical write-through-era
+Every accepted byte was present and hash-correct on the authority after
+exact attach-time replay, with no duplication. The historical write-through-era
 `torture-k10.json` (10/10) is retained.
 
 ## Running locally

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,10 +27,7 @@ const (
 	// writes split into contiguous records before admission.
 	maxMutationPayload = (1 << 20) + (64 << 10)
 
-	// groupSyncDelay / groupSyncBytes are the local group-sync thresholds:
-	// fdatasync when the oldest unsynced frame is this old or this many new
-	// bytes are pending.
-	groupSyncDelay = 5 * time.Millisecond
+	// groupSyncBytes is the local group-sync byte threshold.
 	groupSyncBytes = 4 << 20
 )
 
@@ -37,6 +35,10 @@ var (
 	segmentMagic = [4]byte{'P', 'F', 'W', '5'}
 	frameMagic   = [4]byte{'P', 'F', 'R', '5'}
 	crcTable     = crc32.MakeTable(crc32.Castagnoli)
+
+	// groupSyncDelay is the time threshold. A variable lets package tests
+	// pin the write-versus-fsync boundary; production never changes it.
+	groupSyncDelay = 5 * time.Millisecond
 )
 
 // segmentTargetBytes is the rotation threshold (a variable so rotation tests
@@ -262,6 +264,7 @@ type streamWAL struct {
 	unsyncedSince time.Time
 	syncTimer     *time.Timer
 	syncErr       error
+	onFailure     func(error)
 	closed        bool
 }
 
@@ -286,6 +289,7 @@ func createStreamWAL(dir string, mountID [16]byte, volumeID, branch string, epoc
 		return nil, err
 	}
 	if err := fsyncDir(dir); err != nil {
+		_ = w.Close()
 		return nil, err
 	}
 	return w, nil
@@ -475,11 +479,14 @@ func (w *streamWAL) reemitLiveDelegationsLocked() error {
 // engine acknowledged.
 func (w *streamWAL) writeActiveLocked(buf []byte, off int64) error {
 	n, err := w.active.WriteAt(buf, off)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		if n > 0 {
 			_ = w.active.Truncate(off)
 		}
-		return err
+		return w.failLocked(fmt.Errorf("write active segment: %w", err))
 	}
 	w.unsyncedBytes += int64(len(buf))
 	if w.unsyncedSince.IsZero() {
@@ -501,11 +508,20 @@ func (w *streamWAL) armSyncTimerLocked() {
 		defer w.mu.Unlock()
 		w.syncTimer = nil
 		if !w.closed && w.unsyncedBytes > 0 {
-			if err := w.syncLocked(); err != nil && w.syncErr == nil {
-				w.syncErr = err
-			}
+			_ = w.syncLocked()
 		}
 	})
+}
+
+func (w *streamWAL) failLocked(err error) error {
+	if w.syncErr != nil {
+		return w.syncErr
+	}
+	w.syncErr = err
+	if w.onFailure != nil {
+		w.onFailure(err)
+	}
+	return err
 }
 
 func (w *streamWAL) syncLocked() error {
@@ -513,8 +529,7 @@ func (w *streamWAL) syncLocked() error {
 		return w.syncErr
 	}
 	if err := w.active.Sync(); err != nil {
-		w.syncErr = err
-		return err
+		return w.failLocked(fmt.Errorf("sync active segment: %w", err))
 	}
 	w.unsyncedBytes = 0
 	w.unsyncedSince = time.Time{}
@@ -541,11 +556,10 @@ func (w *streamWAL) rotateIfNeededLocked() error {
 		return err
 	}
 	if err := w.openSegmentLocked(seg.ordinal+1, w.nextFrame+1, w.lastSeq+1); err != nil {
-		return err
+		return w.failLocked(fmt.Errorf("rotate segment: %w", err))
 	}
 	if err := w.reemitLiveDelegationsLocked(); err != nil {
-		w.syncErr = fmt.Errorf("writeback: re-emit live delegations after rotation: %w", err)
-		return w.syncErr
+		return w.failLocked(fmt.Errorf("writeback: re-emit live delegations after rotation: %w", err))
 	}
 	// Rotation is rare and recovery-critical. Make the copied grant set
 	// durable before any caller can append/ack a mutation in this segment.
@@ -553,8 +567,7 @@ func (w *streamWAL) rotateIfNeededLocked() error {
 		return err
 	}
 	if err := fsyncDir(w.dir); err != nil {
-		w.syncErr = fmt.Errorf("writeback: sync WAL directory after rotation: %w", err)
-		return w.syncErr
+		return w.failLocked(fmt.Errorf("writeback: sync WAL directory after rotation: %w", err))
 	}
 	return nil
 }
@@ -662,7 +675,10 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 		}
 	}
 	w.segments = append([]segmentInfo(nil), kept...)
-	return fsyncDir(w.dir)
+	if err := fsyncDir(w.dir); err != nil {
+		return w.failLocked(fmt.Errorf("sync WAL directory after reclaim: %w", err))
+	}
+	return nil
 }
 
 // DiskBytes reports the stream's on-disk footprint.
@@ -699,13 +715,34 @@ func (w *streamWAL) Close() error {
 		w.syncTimer.Stop()
 		w.syncTimer = nil
 	}
+	w.closeFilesLocked()
+	w.closed = true
+	return err
+}
+
+// Abandon closes descriptors without issuing a sync, matching a process
+// termination boundary. The kernel may still write dirty pages later, but
+// the method never upgrades a plain write into an fsync.
+func (w *streamWAL) Abandon() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	if w.syncTimer != nil {
+		w.syncTimer.Stop()
+		w.syncTimer = nil
+	}
+	w.closeFilesLocked()
+	w.closed = true
+}
+
+func (w *streamWAL) closeFilesLocked() {
 	for _, f := range w.files {
 		_ = f.Close()
 	}
 	w.files = map[uint64]*os.File{}
 	w.active = nil
-	w.closed = true
-	return err
 }
 
 // RemoveAll closes and deletes the whole stream directory (clean close).

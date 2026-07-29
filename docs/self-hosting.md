@@ -101,7 +101,7 @@ blob cache (blobs up to 8 MiB) reserves its actual byte length.
 
 ### Journal-bounding maintenance (keep it on)
 
-Managed branches journal every acknowledged write into a PFJ3 generation that is
+Managed branches journal every authority-applied write into a PFJ3 generation that is
 admission-bounded (4 GiB / 1,048,576 records per generation by default) and
 resumed — never rotated — across child restarts. The ONLY way that backlog shrinks
 is history-cut adoption: a ready recovery cut of the journal is adopted, which
@@ -307,7 +307,7 @@ Production state lives in exactly two places:
   manager control plane (`pfm`), and the history plane (`pfh`). Back it up with
   WAL archiving or scheduled dumps and run it with the synchronous replication
   your HA policy attests. Restoring Postgres restores both committed history and
-  every acknowledged-but-uncut live write.
+  every authority-durable but uncut live write.
 - **The bucket.** Content-addressed blobs for committed history. These backups
   are consistent with Postgres by construction: commits reference
   content-addressed blobs, and the API validates referenced blobs before

@@ -1,9 +1,16 @@
 # Consistency Model
 
-PortableFS has two linked sources of durability:
+PortableFS separates write acceptance from two linked durability layers:
 
-- **Live durability:** the active VCS authority has acknowledged the filesystem mutation after
-  writing it to the WAL. In production mode, the mutation is replicated before acknowledgement.
+- **Local write acceptance:** under an active delegation, `write(2)` returns
+  after the mutation is appended to the mount WAL file descriptor and
+  published in the local overlay. The group-sync runs at 5 ms / 4 MiB; until
+  it or an explicit barrier completes, an immediate whole-machine power loss
+  may lose that recent accepted tail.
+- **Authority durability:** a write-through mutation is committed to the
+  authority journal before its reply. A delegated mutation reaches this layer
+  asynchronously, or synchronously when `fsync`, synchronize, explicit
+  flush, dirty last-close, or clean unmount drains it.
 - **Checkpoint durability:** the Volume API has accepted a commit whose referenced blobs exist
   in the blob store and whose metadata transaction advanced the branch head.
 
@@ -26,14 +33,30 @@ the committed state plus the journaled tail, and becomes the new authority
 ([journal.md](./journal.md)). The product contract is one filesystem; the implementation can move
 the authority between machines.
 
-## Write Rule
+## Write And Fsync Rule
 
-A writable filesystem operation mutates the VCS working tree and is appended to the fenced,
-synchronously replicated Postgres journal before it is acknowledged.
+A writable operation takes one lane chosen before execution:
 
-This makes acknowledged writes live-durable even before they are checkpointed. If the
-process restarts, a replacement authority rebuilds the working tree from the immutable base
-plus journal replay.
+- The shared authority lane appends to the fenced, synchronously replicated
+  Postgres journal before replying.
+- The delegated lane appends to the mount's segmented local WAL and publishes
+  its overlay before replying. It does not wait for physical local sync on
+  every `write(2)`.
+
+`fsync(2)` first forces the local WAL, then drains the captured dense stream
+tail until it is durably committed and applied at the authority, then waits
+for the subscriber visibility barrier. Any stage that cannot complete returns
+an error. Clean unmount and explicit synchronize use the same durability
+boundary.
+
+If local WAL establishment or persistence fails, the engine latches a
+terminal mount error and every later mutation fails until remount. It never
+substitutes a write-through operation. A remote delegation-acquire error also
+fails the operation; only an explicit authority policy denial selects the
+shared lane.
+
+After authority durability, a replacement authority rebuilds the working
+tree from the immutable base plus journal replay.
 
 ## Mount Visibility
 
@@ -53,8 +76,10 @@ invalidation boundary:
   its kernel invalidation hook returns, so subsequent FUSE reads are exact.
   `portablefsd` acknowledges after its user-space caches are invalidated and
   the event is delivered to the local frontend stream.
-- **Plain un-fsynced writes propagate to peers within bounded asynchronous invalidation** (the
-  flush batching window plus one invalidation push), like a local page cache.
+- **Plain un-fsynced writes normally propagate to peers within bounded
+  asynchronous invalidation** (the flush batching window plus one
+  invalidation push), like a local page cache. This is a visibility schedule,
+  not a power-loss durability promise.
 
 macOS 26 FSKit is an explicit framework boundary: the current FSKit API does
 not provide PortableFS a kernel-cache invalidation primitive, and its
@@ -75,7 +100,7 @@ branch head. They never see partially uploaded blobs or an uncommitted manifest.
 
 Snapshots and forks consume exact immutable states. On a base-authoring branch a snapshot pins
 the committed head. On a live (journal-served) branch a snapshot records a HistoryCut at the
-current journal position — every acknowledged write up to the cut is captured — and materializes
+current journal position — every authority-durable write up to the cut is captured — and materializes
 asynchronously; forks and branches consume the cut once it is ready.
 
 ## Writer Coordination

@@ -25,9 +25,11 @@ Breaking changes are prohibited. Deployments and clients may pin against
 these.
 
 - **Journal-born volumes.** Every volume is journal-native: the fenced
-  Postgres journal (PFJ3 records, PFC2 controls) is the one durability
-  layer, an acknowledged mutation survives any process loss, and committed
-  history keeps its content-addressed identity forever.
+  Postgres journal (PFJ3 records, PFC2 controls) is the authority durability
+  layer. Authority-lane replies and successful mount `fsync` barriers are
+  journal-durable; delegated `write(2)` uses standard filesystem semantics
+  and may return before local physical sync. Committed history keeps its
+  content-addressed identity forever.
 - **The Volume API `/v1` surface** as documented in
   [docs/api.md](./docs/api.md): request/response shapes, error codes, and
   the token semantics (admin provisioning token, per-tenant bearer tokens,
