@@ -1723,8 +1723,8 @@ public struct PfsXattrRemoveReply: Sendable {
 }
 
 /// SyncVolume is the REAL volume barrier behind FSKit's synchronize and the
-/// CLI's pre-unmount drain. Success means the acknowledged tail is durable and
-/// applied at the authority and every live protocol subscriber reached its
+/// CLI's pre-unmount drain. Success means the accepted tail is locally synced,
+/// durable and applied at the authority, and every live protocol subscriber reached its
 /// supported invalidation boundary. There is no local-only success: an
 /// unreachable, slow, or fenced authority fails the request. `degraded` is
 /// retired wire ballast and is always false.

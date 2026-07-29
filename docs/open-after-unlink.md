@@ -116,7 +116,7 @@ remove parks instead of destroying), plus the reduced-op paths'
 
 The mount registers open-state only for a node that holds a **real authority inode** (`authIno`); an
 uncommitted write-back file (path-hash, exclusively held, not peer-visible) skips registration, since
-there is nothing at the authority to race. On a normal handoff this self-heals: a graceful release is
+there is nothing at the authority to race. On a normal handoff this converges through the explicit protocol: a graceful release is
 deferred while the file is open and entry-timeout is 0, so the next path lookup re-resolves the node
 to its now-committed real inode and registration resumes.
 

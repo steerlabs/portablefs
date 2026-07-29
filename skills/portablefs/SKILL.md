@@ -23,8 +23,10 @@ accepts `--json` for machine-readable output; parse that instead of scraping tex
   no sync, no merge, no conflict copies.
 - **Mount**: a real POSIX filesystem view of a branch on this machine. **Exec/grep**:
   run a command or search server-side against an exact snapshot of the branch, no mount.
-- Acknowledged writes are durable and checkpointed into history automatically (every
-  few seconds). There is no save, commit, or push step for you to run.
+- Writes are accepted immediately and checkpointed into history
+  automatically. On a mount, `fsync`, synchronize, dirty last-close, and
+  clean unmount are the explicit authority-durability boundaries; there is no
+  PortableFS-specific save, commit, or push step.
 
 ## Setup And Login
 
@@ -52,17 +54,21 @@ unchanged, and hot reads run at local page-cache speed.
 
 Write mode is adaptive and has no mount flag: the authority delegates
 uncontended scopes for local-WAL acknowledgments and keeps contended paths
-write-through. `fsync`, close, synchronize, and normal unmount remain real
-authority-durability barriers. Use `--local-dir` for machine-specific build
-trees such as `node_modules`, `.venv`, or `target`.
+write-through. Delegated `write(2)` is immediately visible locally and
+normally group-syncs within 5 ms, but it does not wait for physical sync.
+`fsync`, dirty last-close, synchronize, and normal unmount are real
+authority-durability barriers. A WAL error fails all later mutations until
+remount and never silently switches them to write-through. Use `--local-dir`
+for machine-specific build trees such as `node_modules`, `.venv`, or
+`target`.
 
 **Exec/grep** when you need one-shot answers and cannot or should not mount: no
 FUSE in this environment, a quick inspection of another workspace, or comparing
 forks. `exec` materializes an exact snapshot of the branch server-side, runs your
 command near the data, and returns output; `grep` searches the same snapshot. On a
-live branch the snapshot is captured at the moment of the call — every acknowledged
-write is included — at the cost of a few seconds of setup per call; tight loops
-should mount instead.
+live branch the snapshot is captured at the moment of the call — every
+authority-visible write is included — at the cost of a few seconds of setup per
+call; tight loops should mount instead.
 
 ## Golden Paths
 
@@ -100,8 +106,9 @@ cd ~/work
 # ... work normally: git clone, edit, build, run tests ...
 ```
 
-Writes are durable when acked and checkpoint automatically. When done on this
-machine: `portablefs umount ~/work`. Unmounting loses nothing.
+Writes checkpoint automatically. When done on this machine:
+`portablefs umount ~/work`. Clean unmount forces the local WAL, drains it to
+authority durability, and refuses to detach on failure.
 
 ### Inspect state and history
 
@@ -183,10 +190,11 @@ portablefs mount myagent ~/work
 cd ~/work    # identical state: same files, same git repo, same everything
 ```
 
-A laptop closing, a sandbox being destroyed, or a session ending does not lose
-state: every acknowledged write was already durable. There is no lock to steal
-either — all mounts of a branch attach to the same live authority, so the new
-machine reads and writes immediately, alongside any mounts that still exist.
+Before a laptop closes or a sandbox is destroyed, run the application's
+normal `fsync` boundary or cleanly unmount. That guarantees the accepted tail
+is durable at the authority. All mounts of a branch attach to the same live
+authority; a new machine can then continue from that ordered state without
+copying or merging folders.
 
 ## Troubleshooting
 

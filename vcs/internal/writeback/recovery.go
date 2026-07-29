@@ -77,8 +77,9 @@ func (js *jobState) update(fn func(*RecoveryJob)) {
 }
 
 // updateDebounced folds progress counters in and persists at most once per
-// second: the WAL is the durability record; job.json is advisory surfacing.
-func (js *jobState) updateDebounced(fn func(*RecoveryJob)) {
+// second. The WAL remains the mutation record, while registry persistence
+// errors are returned rather than hidden.
+func (js *jobState) updateDebounced(fn func(*RecoveryJob)) error {
 	js.mu.Lock()
 	fn(&js.job)
 	js.job.UpdatedAtMs = time.Now().UnixMilli()
@@ -89,12 +90,13 @@ func (js *jobState) updateDebounced(fn func(*RecoveryJob)) {
 	}
 	js.mu.Unlock()
 	if due {
-		_ = js.persist()
+		return js.persist()
 	}
+	return nil
 }
 
-// persist writes job.json by atomic temporary-file replacement followed by a
-// parent-directory fsync.
+// persist writes job.json through the package's file-sync, atomic-replace,
+// directory-sync primitive.
 func (js *jobState) persist() error {
 	js.mu.Lock()
 	body, err := json.MarshalIndent(js.job, "", "  ")
@@ -103,19 +105,7 @@ func (js *jobState) persist() error {
 		return err
 	}
 	body = append(body, '\n')
-	tmp := js.path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return err
-	}
-	f, err := os.Open(tmp)
-	if err == nil {
-		_ = f.Sync()
-		_ = f.Close()
-	}
-	if err := os.Rename(tmp, js.path); err != nil {
-		return err
-	}
-	return fsyncDir(filepath.Dir(js.path))
+	return writeFileAtomicDurable(js.path, body, 0o600)
 }
 
 func loadJob(streamDir string) (RecoveryJob, bool) {
@@ -218,13 +208,17 @@ func (r *recoveryRunner) attempt(ctx context.Context, dir string) error {
 				j.State = JobReplaying
 			}
 		})
-		_ = js.persist()
+		if persistErr := js.persist(); persistErr != nil {
+			return fmt.Errorf("writeback: persist retryable recovery state for %s: %w", filepath.Base(dir), persistErr)
+		}
 		return fmt.Errorf("writeback: parked stream %s not drained: %w", filepath.Base(dir), err)
 	default:
 		// Terminal (conflict/corrupt/foreign): stays registered for
 		// surfacing; the mount serves — the scopes stay fenced server-side
 		// and typed locally, nothing is silently merged.
-		_ = js.persist()
+		if persistErr := js.persist(); persistErr != nil {
+			return fmt.Errorf("writeback: persist terminal recovery state for %s: %w", filepath.Base(dir), persistErr)
+		}
 		return nil
 	}
 }
@@ -308,7 +302,9 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		j.JobID = jobID
 		j.AdmittedThrough = scan.lastSeq
 	})
-	_ = js.persist()
+	if err := js.persist(); err != nil {
+		return fmt.Errorf("%w: persist recovery registry: %v", errRetryable, err)
+	}
 
 	ss, err := e.remote.StreamState(ctx, wbID)
 	if err != nil {
@@ -439,10 +435,12 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		}
 		prev = end
 		i = j
-		js.updateDebounced(func(jb *RecoveryJob) {
+		if err := js.updateDebounced(func(jb *RecoveryJob) {
 			jb.AppliedThrough = reply.Through
 			jb.PendingRecords = uint64(len(tail) - i)
-		})
+		}); err != nil {
+			return fmt.Errorf("%w: persist recovery progress: %v", errRetryable, err)
+		}
 	}
 	for _, sc := range scopes {
 		if err := e.remote.ReleaseDelegation(ctx, sc.Scope, sc.Epoch); err != nil {

@@ -2,8 +2,15 @@ package writeback
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
+
+type acquireFlight struct {
+	done chan struct{}
+	err  error
+}
 
 // acquire asks the authority to delegate scope (singleflight per scope).
 // The resolution runs DETACHED on the engine's lifetime context: whatever
@@ -13,17 +20,20 @@ import (
 // on their own contexts.
 func (e *Engine) acquire(ctx context.Context, scope string) (bool, error) {
 	e.acquireMu.Lock()
-	ch, inflight := e.acquiring[scope]
+	flight, inflight := e.acquiring[scope]
 	if !inflight {
-		ch = make(chan struct{})
-		e.acquiring[scope] = ch
-		go e.resolveAcquire(scope, ch)
+		flight = &acquireFlight{done: make(chan struct{})}
+		e.acquiring[scope] = flight
+		go e.resolveAcquire(scope, flight)
 	}
 	e.acquireMu.Unlock()
 	select {
-	case <-ch:
+	case <-flight.done:
 	case <-ctx.Done():
 		return false, ctx.Err()
+	}
+	if flight.err != nil {
+		return false, flight.err
 	}
 	e.mu.RLock()
 	_, held := e.delegations[scope]
@@ -38,36 +48,39 @@ func (e *Engine) acquire(ctx context.Context, scope string) (bool, error) {
 // is bound to a generation whose fate the recovery machinery owns (swept or
 // rebound on the next attach); it is never reinterpreted as a denial that
 // forks the mutation lanes mid-session.
-func (e *Engine) resolveAcquire(scope string, ch chan struct{}) {
+func (e *Engine) resolveAcquire(scope string, flight *acquireFlight) {
 	defer func() {
 		e.acquireMu.Lock()
 		delete(e.acquiring, scope)
 		e.acquireMu.Unlock()
-		close(ch)
+		close(flight.done)
 	}()
 	// The stream (and its recovery-job registry) must be durable before the
 	// grant can admit anything. A dead (parked) stream never installs a new
 	// grant: its WAL can never advance.
 	e.mu.Lock()
-	if e.closed || e.frozen || e.streamDead != nil {
+	if e.closed || e.frozen {
+		flight.err = errors.New("writeback: engine stopped during delegation acquisition")
+		e.mu.Unlock()
+		return
+	}
+	if err := e.MutationError(); err != nil {
+		flight.err = err
 		e.mu.Unlock()
 		return
 	}
 	if err := e.ensureStreamLocked(); err != nil {
-		// Local store failure: no grant exists anywhere, write-through is
-		// safe. Back off so the mutation path does not hot-loop on a broken
-		// store.
+		flight.err = err
 		e.mu.Unlock()
 		e.logf("writeback: acquire %q: stream unavailable: %v", scope, err)
-		e.noteDenial(scope, 0)
 		return
 	}
 	e.mu.Unlock()
 
 	reply, err := e.remote.DelegationAcquire(e.ctx, scope, e.writebackID)
 	if err != nil {
-		e.logf("writeback: acquire %q unresolved (%v); backing off", scope, err)
-		e.noteDenial(scope, 0)
+		flight.err = fmt.Errorf("writeback: acquire %q: %w", scope, err)
+		e.logf("writeback: acquire %q failed: %v", scope, err)
 		return
 	}
 	if !reply.Granted {
@@ -77,8 +90,11 @@ func (e *Engine) resolveAcquire(scope string, ch chan struct{}) {
 	if err := e.installGrant(scope, reply); err != nil {
 		// The WAL rejected the grant record: abort the grant so the
 		// authority does not hold a scope we cannot use.
-		_ = e.remote.ReleaseDelegation(e.ctx, scope, reply.Epoch)
-		e.noteDenial(scope, 0)
+		if releaseErr := e.remote.ReleaseDelegation(e.ctx, scope, reply.Epoch); releaseErr != nil {
+			flight.err = fmt.Errorf("writeback: install grant %q failed (%w); releasing unusable grant also failed: %v", scope, err, releaseErr)
+			return
+		}
+		flight.err = err
 		return
 	}
 	if e.cfg.Events.OnGrant != nil {
@@ -150,7 +166,7 @@ func (e *Engine) installGrant(scope string, reply AcquireReply) error {
 		return err
 	}
 	if err := e.wal.appendControl(frameDelegation, delegationFrame{Scope: scope, Epoch: reply.Epoch}); err != nil {
-		return err
+		return e.failLocalWAL("record delegation", err)
 	}
 	d := &delegation{
 		scope: scope, epoch: reply.Epoch,
@@ -219,7 +235,7 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation) error {
 	e.mu.RUnlock()
 	if w != nil {
 		if err := w.Sync(); err != nil {
-			return e.failRelease(d, err)
+			return e.failRelease(d, e.failLocalWAL("pre-release sync", err))
 		}
 		if err := e.fl.drainThrough(ctx, w.LastSeq()); err != nil {
 			return e.failRelease(d, err)
@@ -242,15 +258,20 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation) error {
 		e.held.Store(int64(len(e.delegations)))
 	}
 	e.dropScopeStateLocked(d.scope)
+	var localErr error
 	if w != nil {
-		_ = w.appendControl(frameRelease, delegationFrame{Scope: d.scope, Epoch: d.epoch})
+		if err := w.appendControl(frameRelease, delegationFrame{Scope: d.scope, Epoch: d.epoch}); err != nil {
+			localErr = e.failLocalWAL("record delegation release", err)
+		} else if err := w.Sync(); err != nil {
+			localErr = e.failLocalWAL("sync delegation release", err)
+		}
 	}
 	closeReleaseSignal(d.done)
 	e.mu.Unlock()
 	if e.cfg.Events.OnRelease != nil {
 		e.cfg.Events.OnRelease(d.scope)
 	}
-	return nil
+	return localErr
 }
 
 // ReleaseFor drains and RELEASES every delegation covering any of paths: the
@@ -260,6 +281,9 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation) error {
 // leaves delegated mode first, so the write-through orders after the
 // drained, durably released state.
 func (e *Engine) ReleaseFor(ctx context.Context, paths ...string) error {
+	if err := e.MutationError(); err != nil {
+		return err
+	}
 	if e.held.Load() == 0 {
 		return nil
 	}

@@ -175,10 +175,13 @@ the native route avoids Docker in the agent's path. Pick one.
 ## The Airport Flow
 
 You are at the airport. On the laptop, you mount the workspace, steer the agent
-for twenty minutes, and close the lid at boarding. The laptop's mount disappears;
-the workspace does not — it lives on the Mini, where the agent in tmux keeps
-reading and writing the same volume. Every acknowledged write was already durable
-in the journal, and history cuts capture progress continuously.
+for twenty minutes, run the agent's normal save/`fsync` boundary (or cleanly
+unmount), and close the lid at boarding. The laptop's mount may disappear; the
+authority-durable workspace does not — it lives on the Mini, where the agent
+in tmux keeps reading and writing the same volume. Recent plain writes are
+usually group-synced and flushed within milliseconds, but the explicit
+barrier is what makes the handoff a guarantee. History cuts capture
+authority-durable progress continuously.
 
 After landing, you do not even need to re-mount to see what happened:
 

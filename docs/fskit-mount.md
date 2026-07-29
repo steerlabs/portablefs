@@ -137,9 +137,10 @@ there is.
   API. Authority credentials are stored per attach and refreshed through the
   credential endpoint.
 - **Outlives mounts.** Unmounting deletes the attach but leaves the daemon
-  running for the next mount. The daemon holds no durable volume state —
-  every acknowledged write is durable at the authority — so stopping an idle
-  daemon is always safe.
+  running for the next mount. Active delegated attaches may own local WAL
+  state, so they must `fsync`, synchronize, or detach cleanly before the
+  daemon is stopped. A truly idle daemon with no attaches owns no live tail
+  and is safe to stop.
 
 ## Environment Overrides
 
@@ -168,15 +169,16 @@ There is no write-mode knob (`--fast` is retired and fails with a pointer at
 this model). Every FSKit mount runs the adaptive write-back engine
 ([writeback-engine.md](./writeback-engine.md)): the authority delegates a
 subtree on the first uncontended write, after which mutations under it are
-acknowledged locally (durable in the mount's stream WAL) and one flusher
-ships them in batches; contended scopes run write-through and re-delegate
-once contention clears. `fsync`, FSKit `synchronize`, and clean unmount are
-always authority-durability barriers — git commits and SQLite transactions
-are durable at the authority when they return — while other writes have a
-bounded (~flush batching) window, the same contract as a local page cache. A
-SIGKILLed daemon's acknowledged tail parks durably and replays on the next
-attach; `portablefs mounts` and attach status surface the parked jobs. The
-only remaining environment knob is `PORTABLEFS_NEGATIVE_CACHE`
+accepted into the mount's stream WAL file descriptor and local overlay while
+one flusher ships them in batches. The local WAL group-sync runs at 5 ms /
+4 MiB; plain writes do not wait for it. Contended scopes run write-through
+and re-delegate once contention clears. `fsync`, FSKit `synchronize`, and
+clean unmount force local sync and then authority durability — Git commits
+and SQLite transactions are durable at the authority when those barriers
+return. A verified local tail replays exactly on the next attach;
+`portablefs mounts` and attach status surface parked jobs. WAL failure seals
+all later mutations until remount and never changes them to write-through.
+The only remaining environment knob is `PORTABLEFS_NEGATIVE_CACHE`
 ([performance.md](./performance.md)); it travels to the daemon as an attach
 option.
 

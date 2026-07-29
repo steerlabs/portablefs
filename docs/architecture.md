@@ -27,15 +27,17 @@ Everything below exists to preserve that contract.
    and Git behavior understandable.
 
 4. **One logical authority must not mean one fragile process.**
-   Production writes must be stored in a replicated durable log before acknowledgement.
-   The VCS satisfies this contract with the remote journal: every acknowledged write
-   commits to a fenced, synchronously replicated PostgreSQL journal
-   ([journal.md](./journal.md)) before the client hears "done". The authority process is
-   a disposable cache over that truth — a replacement claims the journal and cold-replays.
+   Authority-lane writes and completed filesystem durability barriers must be stored in a
+   replicated durable log before acknowledgement. The VCS satisfies this contract with the
+   remote journal: authority-lane mutations commit to a fenced, synchronously replicated
+   PostgreSQL journal ([journal.md](./journal.md)) before reply. Delegated `write(2)` calls
+   are accepted into the mount WAL first; `fsync` drains them into the replicated journal.
+   The authority process is a disposable cache over that truth — a replacement claims the
+   journal and cold-replays.
 
 5. **Object storage is not the synchronous write path.**
    Railway Buckets/S3 hold checkpointed content, cold data, snapshots, forks, and long-term
-   durable history. Normal file writes acknowledge from the live durable layer, then
+   durable history. Normal file writes are accepted into the live filesystem layer, then
    checkpoint in the background.
 
 6. **Shared writing uses filesystem semantics, not magical merge.**
@@ -174,15 +176,19 @@ The agent should never need the old attach/sync/flush local-folder workflow.
 Write mode is not a mount property. Every mount runs one adaptive write-back
 engine per (volume, branch) ([writeback-engine.md](./writeback-engine.md)):
 the authority delegates an uncontended subtree on first write, mutations
-under a held scope are acknowledged locally (durable in a segmented mount
-WAL) and flushed as dense batches whose watermark and stream digest commit
-atomically with the tree state, and peer operations that overlap a
-delegation wait for recall — a reader is never answered from stale
-pre-delegation state. Contended scopes execute write-through and re-delegate
-once contention clears. `fsync`/`synchronize`/clean unmount always mean
-durable at the authority; a crashed mount's acknowledged tail parks durably
-and replays on the next attach, surfaced in `portablefs mounts` until it
-drains.
+under a held scope are accepted into a segmented mount WAL and local overlay,
+then flushed as dense batches whose watermark and stream digest commit
+atomically with the tree state. Plain `write(2)` may return before the local
+group-sync; `fsync` forces it. Peer operations that overlap a delegation wait
+for recall — a reader is never answered from stale pre-delegation state.
+Contended scopes execute write-through and re-delegate once contention
+clears. `fsync`/`synchronize`/clean unmount always mean durable at the
+authority. A verified fsynced or group-synced tail can be replayed exactly on
+the next attach; ambiguous or corrupt state blocks instead of being repaired.
+
+Any local WAL persistence failure seals the mount mutation gate until remount.
+It never causes a silent switch to write-through, and a terminal
+fence/conflict does not leave unrelated scopes mutating through another lane.
 
 ### Machine-Local Dirs (Grafts)
 

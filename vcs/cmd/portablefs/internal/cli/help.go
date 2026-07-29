@@ -292,10 +292,13 @@ and the mount persists (state under ~/.local/state/portablefs/mounts).
 Write mode is not a mount property: the authority delegates write-back per
 scope adaptively, so build/install-heavy workloads acknowledge locally at
 local-disk speed while contended paths stay write-through. fsync(2) is
-always a REAL authority-durability barrier. Linux FUSE also acknowledges
+always a REAL local-sync plus authority-durability barrier. Plain write(2)
+does not wait for physical local sync; the WAL group-sync normally runs
+within 5 ms. Linux FUSE also acknowledges
 peer invalidations after its kernel cache hook; macOS 26 FSKit has no such
 hook, so reads served wholly from FSKit's kernel cache are outside the exact
-peer-visibility claim. Un-fsynced writes have a bounded flush window. (The
+peer-visibility claim. A WAL error fails later mutations until remount; it
+never switches them to write-through. (The
 retired --fast flag is an error: every mount is adaptive.)
 
 --local-dir <rel> (repeatable) serves a workspace-relative directory —
@@ -332,13 +335,12 @@ EXAMPLES
   portablefs umount <mountPath> [--force] [--json]
 
 Unmount a portablefs mount and stop its daemon. A NORMAL unmount first runs
-the full drain barrier — every acknowledged write reaches the authority and
+the full drain barrier — every accepted write is locally synced, reaches the authority, and
 every live protocol subscriber acknowledges its invalidations — and FAILS
-(mount stays attached, nonzero exit) if the drain cannot complete, so an
-unmount can never silently strand acknowledged data.
+(mount stays attached, nonzero exit) if the drain cannot complete.
 
 --force detaches without draining: the unshipped tail parks as a durable
-recovery job (its ID is printed) and drains automatically on the next attach
+recovery job (its ID is printed) and is verified and replayed on the next attach
 of the same volume+branch. Use it when the authority is unreachable and you
 need the mount gone NOW.
 

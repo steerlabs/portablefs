@@ -574,8 +574,8 @@ public actor VolumeCore {
     /// so FSKit kernel-cache visibility is not part of that acknowledgment.
     /// There is
     /// no degraded local-only success: an unreachable or slow authority
-    /// FAILS the barrier (the error surfaces to the kernel caller), while
-    /// the un-flushed tail stays crash-safe in the daemon's local WAL.
+    /// or a local WAL sync failure FAILS the barrier and surfaces to the
+    /// kernel caller.
     public func syncVolume() async throws {
         let envelope = try await client.request(.syncVolume(PfsSyncVolumeRequest()))
         guard case .syncVolumeReply? = envelope.body else {

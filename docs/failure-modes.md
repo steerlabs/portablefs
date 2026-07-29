@@ -7,11 +7,30 @@ loads the last committed manifest, replays the local WAL, and resumes from the l
 state it had acknowledged.
 
 In production, the authority process is a disposable cache over the remote journal: every
-acknowledged write already committed to the fenced PostgreSQL journal before the client heard
-"done". The manager demand-starts a replacement child anywhere; it claims the journal
+authority-acknowledged write already committed to the fenced PostgreSQL journal before the
+client heard "done". The manager demand-starts a replacement child anywhere; it claims the journal
 generation (fencing any stale writer in the same transaction), cold-replays the immutable base
-plus the retained journal suffix, and serves — no acknowledged write is lost, and there is no
+plus the retained journal suffix, and serves — no authority-durable write is lost, and there is no
 promotion protocol and no warm standby to keep consistent.
+
+## Mount Process Or Machine Dies
+
+A delegated `write(2)` is accepted after its frames reach the local WAL file
+descriptor and overlay; it does not wait for physical local sync. The 5 ms /
+4 MiB group-sync normally closes that window quickly. A process crash leaves
+the kernel page cache available to write the tail, but a complete machine
+power loss may lose writes that had not crossed group-sync or `fsync`.
+
+`fsync`, synchronize, dirty last-close, explicit flush, and clean unmount
+force the local WAL before draining to authority durability. A verified local
+tail replays exactly on the next attach. Recovery never guesses: malformed
+WAL, identity mismatch, or authority conflict remains a typed blocked job for
+an operator.
+
+Any WAL initialization, append, rotation, checkpoint, group-sync, or explicit
+sync error latches a terminal mount verdict. Every later mutation fails until
+remount; no operation silently becomes write-through and no unrelated scope
+continues around the failed stream.
 
 ## Manager Restart (Session Token Rejection)
 
@@ -75,20 +94,24 @@ content is present and verified.
 ## Postgres Failure
 
 In production the journal database IS the durability layer: while it is unavailable or cannot
-prove its durability evidence, new writes fail loudly (nothing is acknowledged that is not
-journal-durable) and already-acknowledged writes stay safe in the journal. Metadata operations
+prove its durability evidence, authority-lane writes and durability barriers fail loudly.
+Already authority-durable writes stay safe in the journal; a delegated mount may continue to
+accept into its bounded local WAL until its own health or capacity gate refuses more. Metadata operations
 — lease renewal, branch-head reads, snapshots, forks, history — fail while their database is
 unavailable; an authority that cannot renew self-fences before its lease expires. In
-development, acknowledged writes remain WAL-durable locally but cannot become
+development, authority-acknowledged writes remain WAL-durable locally but cannot become
 checkpoint-durable until metadata commits resume.
 
 ## Local Disk Full
 
-A managed production child keeps no persistent local files — local disk pressure affects only
-its RAM-bounded caches and temp dir, never durability. In development, if the VCS cannot write
-its WAL, cache, or working-tree state, it fails the affected filesystem operation and should
-report unhealthy/not-ready depending on severity. Previously committed branch history remains
-intact.
+A managed production authority child keeps no persistent local files — its
+disk pressure affects only RAM-bounded caches and temp space. Mounts do keep
+their delegated stream WAL locally. If that store cannot initialize, append,
+rotate, checkpoint, or sync, the mount seals its full mutation gate and
+reports a sticky unhealthy verdict; it does not redirect writes to the
+authority. In development, an authority-local WAL failure likewise fails the
+operation and should report unhealthy/not-ready. Previously committed branch
+history remains intact.
 
 ## Cache Corruption
 
@@ -107,8 +130,9 @@ caller that was blocked on the mutation sees a definite error after the foregrou
 (`mutation outcome unknown; identity parked for replay`), but the identity keeps replaying in the
 background and lands at most once.
 
-Operator guidance: parked identities are self-healing across authority restarts and failover
-(they resolve against whichever authority holds the durable log). A mount logging repeated
+Operator guidance: parked identities resolve by exact replay across authority
+restarts and failover (against whichever authority holds the durable log);
+this is completion of the original identity, not inferred repair. A mount logging repeated
 replay attempts indicates the authority is unreachable or cannot record durably (a poisoned
 log) — resolve the authority; do not restart the mount to "clear" it, since a remount abandons
 the mount's session and its parked identities resolve as fenced.
@@ -156,8 +180,8 @@ checkpoint metadata transaction commits. They do not see partial checkpoint blob
 ## Snapshot During Active Session
 
 On a base-authoring branch, snapshots pin the committed branch head. On a journal-served (live)
-branch, a snapshot records a HistoryCut at the current journal position — every acknowledged
-write up to the cut is captured — and materializes asynchronously; the record lists as pending
+branch, a snapshot records a HistoryCut at the current journal position — every
+authority-visible write up to the cut is captured — and materializes asynchronously; the record lists as pending
 until ready, and a cut that fails to materialize is definitively `failed` (create a fresh one).
 
 ## Retired Server-Side Exec

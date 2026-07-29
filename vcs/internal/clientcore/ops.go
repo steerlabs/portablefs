@@ -313,7 +313,7 @@ func (v *Volume) evictDirCachePrefix(rp string) {
 }
 
 func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeIntent bool) Status {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -327,7 +327,7 @@ func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeInten
 }
 
 func (v *Volume) RegisterOpened(path string, n *NodeState) Status {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -389,7 +389,7 @@ func (v *Volume) rollbackTrackedOpen(path string, n *NodeState) {
 }
 
 func (v *Volume) CloseHandle(path string, n *NodeState) Status {
-	if !v.beginMutation() {
+	if err := v.beginLifecycleOperation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -569,7 +569,7 @@ func (v *Volume) readBase(path string, n *NodeState, off int64, length int) ([]b
 }
 
 func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64, data []byte) (int, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return 0, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -661,7 +661,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 // locally at the exact EOF; otherwise the authority resolves EOF in
 // sequencer order.
 func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, legacyOff int64, data []byte) (int, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return 0, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -761,7 +761,7 @@ func (v *Volume) CreateExcl(ctx context.Context, path string, mode uint32) (fspr
 }
 
 func (v *Volume) createCommon(ctx context.Context, path string, mode uint32, excl bool) (fsproto.Attr, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -826,7 +826,7 @@ func (v *Volume) createWriteThrough(path string, mode uint32, excl bool) (fsprot
 }
 
 func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.Attr, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -861,7 +861,7 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 }
 
 func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Status {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -972,7 +972,7 @@ func unlockTwo(a, b *NodeState) {
 }
 
 func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeState) Status {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1106,7 +1106,7 @@ func (v *Volume) evictNamespacePaths(oldp, newp string) {
 }
 
 func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1145,7 +1145,7 @@ func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr
 // then orders after the released state and never mutates inside a held
 // scope.
 func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (fsproto.Attr, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1200,7 +1200,7 @@ func (v *Volume) Readlink(ctx context.Context, path string) (string, Status) {
 }
 
 func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
-	if !v.beginMutation() {
+	if err := v.beginMutation(); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1344,7 +1344,7 @@ func (v *Volume) FsyncPath(path string) Status {
 }
 
 func (v *Volume) FsyncHandle(path string, n *NodeState) Status {
-	if !v.beginMutation() {
+	if err := v.beginLifecycleOperation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()

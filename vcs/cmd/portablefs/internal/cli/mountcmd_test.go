@@ -92,7 +92,7 @@ func TestUmountReconcilesOrphanedMountWithLiveDaemon(t *testing.T) {
 	}
 }
 
-// TestUmountDeadDaemonNotMountedCleansState pins the pre-existing self-heal:
+// TestUmountDeadDaemonNotMountedCleansState pins stale-state cleanup:
 // a stale record whose daemon is gone and whose path is not mounted cleans up
 // and exits 0 (here through the --json path).
 func TestUmountDeadDaemonNotMountedCleansState(t *testing.T) {

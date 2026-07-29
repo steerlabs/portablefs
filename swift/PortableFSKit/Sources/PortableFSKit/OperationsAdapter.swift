@@ -326,8 +326,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             // no kernel-cache invalidation hook, so success guarantees
             // authority durability, not eviction of a peer FSKit kernel
             // cache. Failure (unreachable/slow/fenced authority) throws —
-            // never a silent local-only outcome. The un-flushed tail stays
-            // crash-safe in the daemon's WAL.
+            // never a silent local-only outcome. Local WAL sync failure
+            // throws as well and seals later mutation admission.
             try await core.syncVolume()
             if let stat = try? await core.statfs() {
                 setCachedStatistics(PfsFSKitMapping.statfs(from: stat, capabilities: capabilities))

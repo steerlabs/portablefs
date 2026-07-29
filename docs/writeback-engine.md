@@ -35,7 +35,11 @@ vcs/internal/writeback/
 
 - A local mutation is acknowledged only while an authority-issued delegation
   covering it is active, and only after all its WAL frames are written to the
-  segment fd and the overlay delta is published.
+  segment fd and the overlay delta is published. This is the normal filesystem
+  `write(2)` boundary: the mutation is immediately visible to the writing
+  mount, but may still be in the kernel's dirty-page cache. It becomes
+  power-loss durable when the 5 ms / 4 MiB group-sync runs or an explicit
+  `fsync`-class barrier forces `File.Sync`.
 - One dense mutation sequence and one WAL per mount stream. A stream is
   `(mountID, walEpoch)`; its `writebackID` (`wb<mountID>x<epoch>`) keys the
   authority's durable watermark + digest, which survive session-generation
@@ -47,8 +51,9 @@ vcs/internal/writeback/
   1. **Authority durability:** the barrier succeeds only when every covered
      mutation is durably committed AND applied at the authority. An
      unreachable, slow, or fenced authority FAILS the barrier (EIO-class);
-     there is no local-only fsync outcome, ever. The un-flushed tail stays
-     crash-safe in the local WAL and drains when the authority answers.
+     there is no local-only fsync outcome, ever. Before attempting the
+     authority drain, the barrier synchronizes the local WAL; a failed local
+     sync is itself an EIO-class barrier failure.
   2. **Frontend visibility acknowledgment:** every published invalidation batch carries
      a monotonic stream position; subscribers process batches strictly in
      order and acknowledge positions on the subscribe connection. The barrier
@@ -80,6 +85,17 @@ vcs/internal/writeback/
   labeled data loss).
 - Recovery conflicts (scope discarded, authority moved on) surface as typed
   job states; nothing is silently merged or discarded.
+- WAL creation, recovery-registry persistence, append, rotation, checkpoint,
+  group-sync, and explicit-sync failures latch one terminal mount verdict.
+  Every later mutation fails EIO-class until remount, including mutations
+  that would normally use the authority lane. A failure is never
+  reinterpreted as delegation denial and never changes the operation's lane.
+  The verdict is exposed through attach health and write-back status.
+- Only a definite authority policy response (`Granted=false`) selects the
+  shared authority lane after an acquire attempt. Acquire transport errors
+  fail that operation visibly and are not cached as denials. A later
+  application operation may make a fresh exact attempt; there is no
+  background mode switch or in-process clearing of a terminal engine verdict.
 - No mutation ever runs write-through INSIDE a held delegation. The one
   escape from delegated mode is drain + durable RELEASE: undecidable creates,
   unknown removes, cross-scope renames, orphan transitions, hard links, and
@@ -111,7 +127,9 @@ fully-present final frame — is corruption and fails closed into a `corrupt`
 recovery job. Segment chains validate ordinal, epoch, mount, volume/branch
 identity, and frame/sequence continuity. Malformed control payloads
 (DELEGATION/RELEASE/APPLIED/CLOSE JSON) are corruption, never silently
-ignored.
+ignored. The persistent mount identity and recovery registry use one
+file-sync → atomic-rename → directory-sync primitive. An existing malformed
+mount identity fails attach and is never regenerated.
 
 Rotation at 64 MiB. Reclamation is ONE operation (`CheckpointAndReclaim`):
 append the APPLIED checkpoint (watermark + digest captured atomically), sync
@@ -120,8 +138,9 @@ neither extent-pinned nor read-pinned. A checkpoint failure reclaims nothing
 and latches the WAL's sync error so later acknowledgments fail loudly.
 Composed reads pin their extent snapshot's segments for the duration of the
 pread, so reclamation can never delete a segment mid-read (no retry
-compensation). A group-sync goroutine fdatasyncs on 5 ms / 4 MiB thresholds;
-fsync-class barriers force it.
+compensation). A group-sync goroutine calls `File.Sync` on 5 ms / 4 MiB thresholds;
+fsync-class barriers force it. Successful `write(2)` does not wait for that
+physical sync; successful `fsync(2)` does.
 
 ## Overlay
 
@@ -187,12 +206,14 @@ under full-jitter backoff (50 ms → 5 s cap), no attempt limit. Progress =
 authority watermark advance; 30 s without progress flips sticky DEGRADED
 (definite fence/conflict flips immediately), cleared only by a full drain of
 pre-failure admissions. A definite fence/conflict/corruption verdict parks
-the stream terminally: mutations under its held scopes fail typed, untouched
-scopes keep working write-through, and recovery happens on the NEXT attach —
-before it serves — continuing the watermark exactly where it stopped.
+the stream terminally and seals the mount's complete mutation gate. No scope
+keeps mutating through another lane. The next attach verifies and replays the
+exact journal before it serves, continuing the watermark exactly where it
+stopped; corruption or identity conflict remains blocked for an operator
+rather than being repaired, merged, reset, or discarded.
 Force-close cancels the engine's lifetime context and waits for ACTUAL
 goroutine termination before closing the WAL, so a late flush can never act
 on a ForceClosed store. Applied extents fold out of the overlay as the
 watermark advances, so steady-state heap tracks the unshipped tail. Status
-reports admitted/synced/applied sequences, pending backlog, oldest age, last
-failure, delegation states, recovery jobs.
+reports admitted/applied sequences, pending backlog, oldest age, the sticky
+terminal failure, delegation states, and recovery jobs.

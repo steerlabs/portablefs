@@ -5,9 +5,10 @@ Your agent's workspace is a place in the network, not a folder on one machine.
 PortableFS is a live, durable, branchable network filesystem for AI agent workspaces.
 Mount the same volume from a laptop, a server, and a sandbox at the same time: one
 ordered authority serves every mount, pushes cache invalidations, and gives real
-read-after-write coherence — `git` and SQLite work. Every acknowledged write is
-committed to a fenced PostgreSQL journal before ack and flows into immutable,
-forkable history on object storage. Close your laptop; the agent working on a server keeps going. Fork a workspace
+read-after-write coherence — `git` and SQLite work. Adaptive delegated writes
+return at local-WAL speed; `fsync`, synchronize, and clean unmount force them
+into the fenced PostgreSQL journal and immutable, forkable history. Close your
+laptop after that normal filesystem barrier; the agent working on a server keeps going. Fork a workspace
 to fan out parallel agent attempts; time-travel through everything an agent did. It is
 open source, self-hostable, and built for teams running coding agents (Claude Code,
 Codex) that need continuity, forking, and history for agent workspaces.

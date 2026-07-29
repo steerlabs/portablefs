@@ -59,6 +59,11 @@ var (
 // not relieve: the mutation is refused before any WAL append.
 var ErrNoSpace = errors.New("writeback: stream WAL budget exhausted")
 
+// ErrFailedClosed marks a terminal engine verdict. Once latched, the mount
+// refuses every later mutation until it is remounted; it never changes the
+// operation to the authority lane because local state became unavailable.
+var ErrFailedClosed = errors.New("writeback: engine failed closed; remount required")
+
 // Events are the engine-to-frontend hooks.
 type Events struct {
 	// OnGrant fires after a delegation installs: the caller evicts shared
@@ -122,6 +127,10 @@ type delegation struct {
 	relMu sync.Mutex
 }
 
+type engineFailure struct {
+	err error
+}
+
 // Engine is the mount write-back engine.
 type Engine struct {
 	cfg         Config
@@ -142,13 +151,9 @@ type Engine struct {
 	closed     bool
 	frozen     bool // no further delegated admissions (unmount/force-close)
 	streamOpen bool
-	// streamDead is the flusher's terminal verdict (fence/conflict/corrupt):
-	// the live stream can never advance again. Mutations under its held
-	// scopes fail with this error — acknowledging onto a dead stream would
-	// violate the active-delegation invariant, and executing them
-	// write-through would reorder them ahead of the parked acknowledged
-	// history. Uncovered scopes keep working write-through; the parked
-	// stream recovers on the next attach.
+	// streamDead is the flusher's terminal verdict (fence/conflict/corrupt).
+	// It also latches failure, sealing the whole mount mutation gate until
+	// remount so no operation changes lanes around parked history.
 	streamDead  error
 	delegations map[string]*delegation
 	dirs        map[string]*dirView
@@ -162,11 +167,19 @@ type Engine struct {
 	held atomic.Int64
 
 	acquireMu sync.Mutex
-	acquiring map[string]chan struct{}
+	acquiring map[string]*acquireFlight
+
+	// failure is the mount-lifetime terminal verdict. Atomic reads keep the
+	// mutation fast path lock-free while the first failure wins permanently.
+	failure atomic.Pointer[engineFailure]
 
 	wal *streamWAL
 	fl  *flusher
 	job *jobState
+
+	// createWAL is fixed to createStreamWAL in production and replaceable by
+	// package tests for deterministic initialization-failure coverage.
+	createWAL func(string, [16]byte, string, string, uint64) (*streamWAL, error)
 
 	recovery *recoveryRunner
 	idleStop chan struct{}
@@ -214,7 +227,8 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		dirs:        map[string]*dirView{},
 		files:       map[string]*fileView{},
 		denials:     map[string]time.Time{},
-		acquiring:   map[string]chan struct{}{},
+		acquiring:   map[string]*acquireFlight{},
+		createWAL:   createStreamWAL,
 	}
 	e.ctx, e.cancelCtx = context.WithCancel(context.Background())
 	e.fl = newFlusher(e)
@@ -285,40 +299,46 @@ func lockStoreDir(dir string) (*os.File, error) {
 func ensureMountID(dir string) ([16]byte, error) {
 	var id [16]byte
 	path := filepath.Join(dir, "mount-id")
-	if b, err := os.ReadFile(path); err == nil {
-		if raw, derr := hex.DecodeString(strings.TrimSpace(string(b))); derr == nil && len(raw) == 16 {
-			copy(id[:], raw)
-			return id, nil
+	b, err := os.ReadFile(path)
+	if err == nil {
+		raw, derr := hex.DecodeString(strings.TrimSpace(string(b)))
+		if derr != nil || len(raw) != len(id) {
+			return id, fmt.Errorf("%w: malformed mount identity %s", ErrCorrupt, path)
 		}
+		copy(id[:], raw)
+		return id, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return id, fmt.Errorf("writeback: read mount identity: %w", err)
 	}
 	if _, err := rand.Read(id[:]); err != nil {
 		return id, err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(id[:])+"\n"), 0o600); err != nil {
+	if err := writeFileAtomicDurable(path, []byte(hex.EncodeToString(id[:])+"\n"), 0o600); err != nil {
 		return id, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return id, err
-	}
-	return id, fsyncDir(dir)
+	return id, nil
 }
 
 // ensureStreamLocked lazily creates the live stream WAL and its recovery-job
 // registry — both must be durable before the first delegated acknowledgment.
 func (e *Engine) ensureStreamLocked() error {
+	if err := e.MutationError(); err != nil {
+		return err
+	}
 	if e.streamOpen {
 		return nil
 	}
 	jobID, err := newPublicJobID()
 	if err != nil {
-		return fmt.Errorf("writeback: generate recovery job id: %w", err)
+		return e.failClosed(fmt.Errorf("initialize recovery identity: %w", err))
 	}
 	dir := filepath.Join(e.cfg.StateDir, streamDirName(e.epoch))
-	w, err := createStreamWAL(dir, e.mountID, e.cfg.VolumeID, e.cfg.Branch, e.epoch)
+	w, err := e.createWAL(dir, e.mountID, e.cfg.VolumeID, e.cfg.Branch, e.epoch)
 	if err != nil {
-		return err
+		return e.failLocalWAL("create stream", err)
 	}
+	w.onFailure = func(err error) { e.failLocalWAL("persist stream", err) }
 	job := newJobState(dir, RecoveryJob{
 		Version: 1, JobID: jobID, VolumeID: e.cfg.VolumeID, Branch: e.cfg.Branch,
 		MountID: hex.EncodeToString(e.mountID[:]), WALEpoch: e.epoch, WritebackID: e.writebackID,
@@ -326,12 +346,45 @@ func (e *Engine) ensureStreamLocked() error {
 	})
 	if err := job.persist(); err != nil {
 		_ = w.Close()
-		return err
+		return e.failLocalWAL("persist recovery registry", err)
 	}
 	e.wal = w
 	e.job = job
 	e.streamOpen = true
 	return nil
+}
+
+// MutationError reports the mount-lifetime terminal verdict. Callers use it
+// at their common mutation gate so authority-native operations cannot keep
+// changing state after the local engine has failed.
+func (e *Engine) MutationError() error {
+	if failure := e.failure.Load(); failure != nil {
+		return failure.err
+	}
+	return nil
+}
+
+// failClosed latches the first terminal verdict. The failure is deliberately
+// never cleared in-process: remount is the only recovery boundary.
+func (e *Engine) failClosed(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	failure := &engineFailure{err: fmt.Errorf("%w: %w", ErrFailedClosed, cause)}
+	if !e.failure.CompareAndSwap(nil, failure) {
+		return e.failure.Load().err
+	}
+	if cb := e.cfg.Events.OnHealth; cb != nil {
+		go cb(failure.err)
+	}
+	return failure.err
+}
+
+func (e *Engine) failLocalWAL(operation string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return e.failClosed(fmt.Errorf("local WAL %s: %w", operation, cause))
 }
 
 // ─── scope resolution ────────────────────────────────────────────────────────
@@ -383,9 +436,13 @@ type admission struct {
 }
 
 // admit resolves the delegation admitting a mutation on path, adaptively
-// acquiring one when the scope is eligible and uncontended. ok=false means
-// the caller executes write-through (any pending overlap has been drained).
+// acquiring one when the scope is eligible and uncontended. ok=false with a
+// nil error is a normal authority-lane decision made before the operation;
+// failures always return an error and never change lanes.
 func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error) {
+	if err := e.MutationError(); err != nil {
+		return admission{}, false, err
+	}
 	if e.cfg.DisableDelegation {
 		return admission{}, false, nil
 	}
@@ -393,18 +450,11 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 		e.mu.Lock()
 		if e.closed || e.frozen {
 			e.mu.Unlock()
-			return admission{}, false, nil
+			return admission{}, false, errors.New("writeback: engine is not accepting mutations")
 		}
-		if dead := e.streamDead; dead != nil {
-			d := e.coveringLocked(path)
+		if err := e.MutationError(); err != nil {
 			e.mu.Unlock()
-			if d != nil {
-				// The scope's acknowledged history is parked on the dead
-				// stream: neither a new local ack nor a write-through may
-				// order around it. Fail typed; recovery resolves it.
-				return admission{}, false, dead
-			}
-			return admission{}, false, nil // untouched scope: write-through
+			return admission{}, false, err
 		}
 		d := e.coveringLocked(path)
 		if d != nil && !d.draining {
@@ -471,6 +521,9 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 	}
 	if e.wal.DiskBytes() >= e.cfg.BudgetBytes {
 		e.relieveBudgetLocked()
+		if err := e.MutationError(); err != nil {
+			return nil, err
+		}
 		if e.wal.DiskBytes() >= e.cfg.BudgetBytes {
 			return nil, ErrNoSpace
 		}
@@ -485,7 +538,7 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 	}
 	results, err := e.wal.appendMutations(payloads)
 	if err != nil {
-		return nil, err
+		return nil, e.failLocalWAL("append mutation", err)
 	}
 	for i := range results {
 		records[i].Seq = results[i].seq
@@ -509,6 +562,7 @@ func (e *Engine) relieveBudgetLocked() {
 	}
 	if e.wal != nil {
 		if err := e.wal.CheckpointAndReclaim(through, digest, func(ord uint64) bool { return pins[ord] }); err != nil {
+			e.failLocalWAL("checkpoint", err)
 			e.logf("writeback: budget-relief checkpoint at %d failed: %v", through, err)
 		}
 	}
@@ -680,8 +734,8 @@ func (e *Engine) dirBoundExceededLocked(dv *dirView) bool {
 
 // Create acknowledges an O_CREAT locally when the engine can decide
 // adopt-vs-create (a complete parent view, a locally-known entry, or the
-// caller's proven-absent hint). handled=false falls back to the authority's
-// idempotent create — with no delegation left covering the path.
+// caller's proven-absent hint). handled=false with no error selects the
+// authority's idempotent create after releasing every covering delegation.
 func (e *Engine) Create(ctx context.Context, path string, mode uint32, excl, knownAbsent bool) (Result, bool, error) {
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
@@ -1191,7 +1245,7 @@ func (e *Engine) Readlink(path string) (target string, kind string, ok bool) {
 
 // ─── barriers and lifecycle ──────────────────────────────────────────────────
 
-// Fsync makes every acknowledged mutation authority-durable: local WAL sync
+// Fsync makes every accepted mutation authority-durable: local WAL sync
 // plus a flush drain through the current stream tail (flush commits are
 // durable-before-reply at the authority).
 func (e *Engine) Fsync(ctx context.Context, path string) error {
@@ -1201,19 +1255,23 @@ func (e *Engine) Fsync(ctx context.Context, path string) error {
 
 // DrainAll flushes the captured stream tail to the authority.
 func (e *Engine) DrainAll(ctx context.Context) error {
+	failure := e.MutationError()
 	e.mu.RLock()
 	w := e.wal
 	e.mu.RUnlock()
 	if w == nil {
-		return nil
+		return failure
 	}
 	if err := w.Sync(); err != nil {
-		return err
+		return e.failLocalWAL("sync", err)
+	}
+	if failure != nil {
+		return failure
 	}
 	return e.fl.drainThrough(ctx, w.LastSeq())
 }
 
-// SyncLocal makes every acknowledged mutation locally durable (journal-first
+// SyncLocal makes every accepted mutation locally durable (journal-first
 // barriers); no network.
 func (e *Engine) SyncLocal() error {
 	e.mu.RLock()
@@ -1222,7 +1280,10 @@ func (e *Engine) SyncLocal() error {
 	if w == nil {
 		return nil
 	}
-	return w.Sync()
+	if err := w.Sync(); err != nil {
+		return e.failLocalWAL("sync", err)
+	}
+	return nil
 }
 
 // Pending reports the unshipped acknowledged backlog.
@@ -1254,7 +1315,7 @@ func (e *Engine) CloseWithBarrier(ctx context.Context, barrier func() error) err
 	if w != nil {
 		if err := w.Sync(); err != nil {
 			e.thawAfterFailedClose()
-			return err
+			return e.failLocalWAL("clean-unmount sync", err)
 		}
 		if err := e.fl.drainThrough(ctx, w.LastSeq()); err != nil {
 			e.thawAfterFailedClose()
@@ -1323,7 +1384,7 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 		return "", nil
 	}
 	if err := w.Sync(); err != nil {
-		return "", err
+		return "", e.failLocalWAL("forced-unmount sync", err)
 	}
 	jobID := ""
 	if job != nil {
@@ -1337,19 +1398,21 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 			j.LastError = reason
 		})
 		if err := job.persist(); err != nil {
-			return "", err
+			return "", e.failLocalWAL("persist forced recovery job", err)
 		}
 		jobID = job.snapshot().JobID
 	}
 	if err := w.appendControl(frameForcedClose, closeFrame{
 		Through: e.fl.appliedThrough(), JobID: jobID, Reason: reason,
 	}); err != nil {
-		return jobID, err
+		return jobID, e.failLocalWAL("record forced close", err)
 	}
 	if err := w.Sync(); err != nil {
-		return jobID, err
+		return jobID, e.failLocalWAL("sync forced close", err)
 	}
-	_ = w.Close()
+	if err := w.Close(); err != nil {
+		return jobID, e.failLocalWAL("close forced WAL", err)
+	}
 	e.mu.Lock()
 	e.closed = true
 	e.mu.Unlock()
@@ -1371,7 +1434,7 @@ func (e *Engine) Abandon() {
 	e.cancelCtx()
 	e.fl.stop()
 	if w != nil {
-		_ = w.Close()
+		w.Abandon()
 	}
 	_ = e.lock.Close()
 }
@@ -1401,6 +1464,10 @@ type DelegationStatus struct {
 
 func (e *Engine) Status() Status {
 	st := e.fl.status()
+	if err := e.MutationError(); err != nil {
+		st.Degraded = true
+		st.LastFailure = err.Error()
+	}
 	st.WALBudget = e.cfg.BudgetBytes
 	e.mu.RLock()
 	if e.wal != nil {

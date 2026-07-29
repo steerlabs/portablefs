@@ -403,9 +403,10 @@ func (f *flusher) noteFailure(msg string) {
 }
 
 // park permanently stops flushing (definite fence, conflict, corruption):
-// the stream's tail stays durable locally and recovers on the next attach.
-// The engine stops admitting under the dead stream's scopes — a local ack
-// without a live stream would violate the active-delegation invariant.
+// the stream's written tail stays available for an explicit local sync and
+// exact attach-time recovery. The engine seals all mutation admission — a
+// local ack without a live stream would violate the active-delegation
+// invariant, and another lane must not order around it.
 func (f *flusher) park(err error) {
 	f.mu.Lock()
 	f.terminal = err
@@ -414,7 +415,6 @@ func (f *flusher) park(err error) {
 	f.degraded = true
 	waiters := f.waiters
 	f.waiters = nil
-	f.notifyHealthLocked(err)
 	f.mu.Unlock()
 	for _, wtr := range waiters {
 		wtr.ch <- err
@@ -425,16 +425,19 @@ func (f *flusher) park(err error) {
 			j.State = JobParked
 			j.LastError = err.Error()
 		})
-		_ = f.e.job.persist()
+		if persistErr := f.e.job.persist(); persistErr != nil {
+			f.e.logf("writeback: persist parked recovery job: %v", persistErr)
+		}
 	}
 }
 
 func (e *Engine) markStreamDead(err error) {
+	dead := e.failClosed(err)
 	e.mu.Lock()
 	if e.streamDead == nil {
-		e.streamDead = err
+		e.streamDead = dead
 	}
-	dead := e.streamDead
+	dead = e.streamDead
 	for _, d := range e.delegations {
 		if !d.draining {
 			continue
@@ -466,6 +469,9 @@ func (f *flusher) notifyHealthLocked(err error) {
 	cb := f.e.cfg.Events.OnHealth
 	if cb == nil {
 		return
+	}
+	if err == nil {
+		err = f.e.MutationError()
 	}
 	go cb(err)
 }
@@ -513,6 +519,7 @@ func (e *Engine) noteApplied(through uint64, digest [32]byte) {
 			// reclaimed. The WAL latches the sync failure — subsequent
 			// appends fail loudly rather than acknowledging onto a log that
 			// cannot checkpoint.
+			e.failLocalWAL("checkpoint", err)
 			e.logf("writeback: APPLIED checkpoint at %d failed (nothing reclaimed): %v", through, err)
 		}
 	}
@@ -520,10 +527,12 @@ func (e *Engine) noteApplied(through uint64, digest [32]byte) {
 	e.mu.Unlock()
 	if job != nil {
 		recs, bytes := e.fl.pendingStats()
-		job.updateDebounced(func(j *RecoveryJob) {
+		if err := job.updateDebounced(func(j *RecoveryJob) {
 			j.AppliedThrough = through
 			j.PendingRecords = uint64(recs)
 			j.PendingBytes = uint64(bytes)
-		})
+		}); err != nil {
+			e.failLocalWAL("persist recovery progress", err)
+		}
 	}
 }
