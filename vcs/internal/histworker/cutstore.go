@@ -495,7 +495,14 @@ func (s *cutStore) Fetch(ctx context.Context, ref pft2.Ref) ([]byte, error) {
 }
 
 // fetchRecorded resolves one object through pfh.object_locate and verifies
-// bytes from the first healthy recorded copy.
+// bytes from the first healthy recorded copy in this worker's configured
+// locality order. The database orders copies by verification freshness for
+// serving diagnostics, not network proximity; following that order made a
+// west-coast worker read most objects cross-country whenever IAD happened
+// to carry the newest receipt. Replication policy still requires every
+// named domain for writes. Read locality is deterministic store declaration
+// order and an unhealthy preferred copy fails this attempt: there is no
+// failure-induced route to another domain.
 func (s *cutStore) fetchRecorded(ctx context.Context, ref pft2.Ref) ([]byte, error) {
 	digest := digestOfRef(ref)
 	loc, err := s.repo.LocateObject(ctx, s.claim.TenantID, "pft2", digest)
@@ -509,23 +516,38 @@ func (s *cutStore) fetchRecorded(ctx context.Context, ref pft2.Ref) ([]byte, err
 		return nil, fmt.Errorf("%w: object %s recorded size %d, reference says %d",
 			historycut.ErrCorrupt, digest, loc.Size, ref.Size)
 	}
-	var lastErr error
-	for _, copyRec := range loc.Copies {
-		store, ok := s.stores.Get(copyRec.FailureDomain)
+	copyRec, store, ok := s.preferredReadableCopy(loc.Copies)
+	if !ok {
+		return nil, fmt.Errorf("histworker: object %s: no recorded copy is reachable from configured domains", digest)
+	}
+	data, err := histstore.ReadVerified(ctx, store, copyRec.StorageKey, int64(ref.Size), ref.Hex())
+	if err != nil {
+		return nil, fmt.Errorf("histworker: object %s from preferred domain %s: %w",
+			digest, copyRec.FailureDomain, err)
+	}
+	return data, nil
+}
+
+// preferredReadableCopy binds one read to the first configured domain with a
+// recorded copy. A read error is attempt-fatal; choosing a different copy
+// after failure would be an implicit availability fallback and would make
+// latency and failure behavior depend on the error.
+func (s *cutStore) preferredReadableCopy(copies []CopyRecord) (CopyRecord, histstore.Store, bool) {
+	byDomain := make(map[string]CopyRecord, len(copies))
+	for _, copyRec := range copies {
+		byDomain[copyRec.FailureDomain] = copyRec
+	}
+	for _, domain := range s.stores.Domains() {
+		copyRec, ok := byDomain[domain]
 		if !ok {
 			continue
 		}
-		data, err := histstore.ReadVerified(ctx, store, copyRec.StorageKey, int64(ref.Size), ref.Hex())
-		if err != nil {
-			lastErr = err
-			continue
+		store, configured := s.stores.Get(domain)
+		if configured {
+			return copyRec, store, true
 		}
-		return data, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no copy is reachable from configured domains")
-	}
-	return nil, fmt.Errorf("histworker: object %s: %w", digest, lastErr)
+	return CopyRecord{}, nil, false
 }
 
 // UploadedIncarnation reports the bound incarnation of an object this run

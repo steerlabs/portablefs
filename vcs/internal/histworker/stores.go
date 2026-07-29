@@ -79,7 +79,10 @@ func (d *DomainStores) Get(domain string) (histstore.Store, bool) {
 	return s, ok
 }
 
-// Domains lists configured domains in declaration order.
+// Domains lists configured domains in declaration order. Declaration order
+// is also the deterministic read-locality order: operators place the store
+// nearest this worker first, while the replication policy independently
+// defines the domains that must hold durable copies.
 func (d *DomainStores) Domains() []string {
 	return append([]string(nil), d.ordered...)
 }

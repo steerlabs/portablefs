@@ -190,6 +190,13 @@ func (s staticStore) Get(context.Context, string) (io.ReadCloser, int64, error) 
 func (s staticStore) Head(context.Context, string) (int64, error) { return 0, histstore.ErrNotFound }
 func (s staticStore) Delete(context.Context, string) error        { return nil }
 
+func TestDefaultsUseFullBoundedUploadConcurrency(t *testing.T) {
+	cfg := Config{}.withDefaults()
+	if cfg.UploadConcurrency != 32 {
+		t.Fatalf("upload concurrency = %d, want the validated maximum 32", cfg.UploadConcurrency)
+	}
+}
+
 func TestStoreConfigRejectsAliasesAndUnknownFields(t *testing.T) {
 	base := Config{
 		DSN: "postgres://worker:secret@localhost/pfs", WorkerID: "worker",
