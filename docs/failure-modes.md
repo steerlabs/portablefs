@@ -21,7 +21,7 @@ descriptor and overlay; it does not wait for physical local sync. The 5 ms /
 the kernel page cache available to write the tail, but a complete machine
 power loss may lose writes that had not crossed group-sync or `fsync`.
 
-`fsync`, synchronize, dirty last-close, explicit flush, and clean unmount
+`fsync`, synchronize, explicit flush, and clean unmount
 force the local WAL before draining to authority durability. A verified local
 tail replays exactly on the next attach. Recovery never guesses: malformed
 WAL, identity mismatch, or authority conflict remains a typed blocked job for

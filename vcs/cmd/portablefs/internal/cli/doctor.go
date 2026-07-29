@@ -79,10 +79,20 @@ func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
 			out, err := exec.Command(name, args...).CombinedOutput()
 			return string(out), err
 		},
-		goos:          runtime.GOOS,
-		daemonHealthy: func(controlSock string) bool { return newFsdControl(controlSock).healthy() },
+		goos: runtime.GOOS,
+		daemonHealthy: func(controlSock string) bool {
+			cfg := fskitConfigFromEnv(e.getenv)
+			cfg.controlSock = controlSock
+			_, err := connectCompatiblePortablefsd(cfg, e.version)
+			return err == nil
+		},
 		daemonAttaches: func(controlSock string) ([]cliAttachStatus, error) {
-			ctl := newFsdControl(controlSock)
+			cfg := fskitConfigFromEnv(e.getenv)
+			cfg.controlSock = controlSock
+			ctl, err := connectCompatiblePortablefsd(cfg, e.version)
+			if err != nil {
+				return nil, err
+			}
 			ctl.httpClient.Timeout = 5 * time.Second
 			return ctl.listAttaches()
 		},

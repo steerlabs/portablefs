@@ -19,6 +19,10 @@ const goldenPath = path.join(
   here,
   "../../../vcs/internal/metrics/testdata/golden_exposition.txt"
 );
+const fsprotoServerPath = path.join(
+  here,
+  "../../../vcs/internal/fsproto/server.go"
+);
 
 describe("golden Go exporter contract", () => {
   test("the exact Go exporter output parses cleanly and aggregates with correct semantics", () => {
@@ -336,7 +340,46 @@ describe("allowlist hygiene", () => {
     }
   });
 
-  test("every metric name the OSS Go child can emit is allowlisted (dirty-RSS gauges included)", () => {
+  test("every fixed fsproto per-op counter is explicitly allowlisted", () => {
+    const server = readFileSync(fsprotoServerPath, "utf8");
+    const opNamesBlock = server.match(
+      /var opNames = map\[Op\]string\{(?<body>[\s\S]*?)\n\}/
+    )?.groups?.body;
+    expect(opNamesBlock).toBeDefined();
+    const opNames = [
+      ...(opNamesBlock ?? "").matchAll(/Op[A-Za-z0-9]+:\s+"(?<name>[a-z0-9_]+)"/g),
+    ].map((match) => match.groups?.name);
+    expect(opNames.length).toBeGreaterThan(0);
+    for (const name of opNames) {
+      expect(name).toBeDefined();
+      expect(childMetricAllowlist[`vcs_fsproto_op_${name}`], name).toEqual({
+        aggregator: "counter",
+      });
+    }
+    const producerMetrics = opNames.map((name) => `vcs_fsproto_op_${name}`).sort();
+    const allowlistedFixedMetrics = Object.keys(childMetricAllowlist)
+      .filter(
+        (name) =>
+          name.startsWith("vcs_fsproto_op_") &&
+          name !== "vcs_fsproto_op_other" &&
+          name !== "vcs_fsproto_op_latency"
+      )
+      .sort();
+    expect(allowlistedFixedMetrics).toEqual(producerMetrics);
+
+    const parsed = parseChildExposition(
+      producerMetrics.map((name, index) => `${name} ${index + 1}`).join("\n") + "\n"
+    );
+    expect(parsed.ok).toBe(true);
+    const aggregate = aggregateChildMetrics([parsed, parsed]);
+    expect(aggregate.childrenAggregated).toBe(2);
+    expect(aggregate.childrenMalformed).toBe(0);
+    expect(aggregate.lines).toContain(
+      `pfm_child_${producerMetrics.at(-1)} ${producerMetrics.length * 2}`
+    );
+  });
+
+  test("every non-per-op metric name the OSS Go child can emit is allowlisted", () => {
     for (const name of [
       "vcs_fsproto_op_other",
       "vcs_dirty_block_bytes",

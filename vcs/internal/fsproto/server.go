@@ -277,6 +277,8 @@ func (s *Server) handle(conn net.Conn) {
 			return // peer closed, idle-timed-out, oversize, or stream error
 		}
 		if req.Op == OpSubscribe {
+			fsprotoOps.Inc()
+			countOp(req.Op)
 			// Owner is coordination identity, not a client-selected stream
 			// decoration. When supplied, it must match the session already
 			// authenticated onto this connection. Unattached read-only/test

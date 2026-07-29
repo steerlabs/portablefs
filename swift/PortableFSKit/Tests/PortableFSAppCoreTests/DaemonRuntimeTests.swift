@@ -1,30 +1,5 @@
-import Foundation
 import Testing
 @testable import PortableFSAppCore
-
-@Test func backoffEscalatesAndCaps() {
-    var backoff = RestartBackoff()
-    var delays: [TimeInterval] = []
-    for _ in 0..<15 {
-        delays.append(backoff.delayAfterExit(uptime: 1))
-    }
-    #expect(Array(delays.prefix(4)) == [0.5, 1.0, 2.0, 4.0])
-    #expect(delays.last == 30.0)
-}
-
-@Test func backoffResetsAfterHealthyRun() {
-    var backoff = RestartBackoff()
-    _ = backoff.delayAfterExit(uptime: 1)
-    _ = backoff.delayAfterExit(uptime: 1)
-    #expect(backoff.consecutiveFailures == 2)
-    // A run that stayed up past the threshold starts the ladder over.
-    let afterHealthy = backoff.delayAfterExit(uptime: 120)
-    #expect(afterHealthy == 0.5)
-    #expect(backoff.consecutiveFailures == 1)
-
-    backoff.reset()
-    #expect(backoff.consecutiveFailures == 0)
-}
 
 @Test func binaryLocatorHonorsPrecedence() {
     let executables: Set<String> = [

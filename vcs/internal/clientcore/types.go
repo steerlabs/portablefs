@@ -67,11 +67,6 @@ type NodeState struct {
 	authorityIno uint64
 	nopen        int
 	orphanIno    uint64
-	// dirty means at least one mutation through this inode has not yet
-	// completed an authority visibility barrier. The final close consumes
-	// this bit only after the barrier succeeds, so close(2) cannot silently
-	// strand the last writer's acknowledged tail in the local WAL.
-	dirty bool
 }
 
 func NewNodeState(ino uint64, authIno bool) *NodeState {
@@ -138,33 +133,6 @@ func (n *NodeState) IsOpen() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.nopen > 0
-}
-
-func (n *NodeState) markDirty() {
-	if n == nil {
-		return
-	}
-	n.mu.Lock()
-	n.dirty = true
-	n.mu.Unlock()
-}
-
-func (n *NodeState) clearDirty() {
-	if n == nil {
-		return
-	}
-	n.mu.Lock()
-	n.dirty = false
-	n.mu.Unlock()
-}
-
-func (n *NodeState) lastCloseIsDirty() bool {
-	if n == nil {
-		return false
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.nopen == 1 && n.dirty
 }
 
 func (n *NodeState) markOrphanLocked(ino uint64, openOrphans *InodeSet) bool {

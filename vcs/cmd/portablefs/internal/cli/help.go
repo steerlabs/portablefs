@@ -44,8 +44,9 @@ SEARCH (no mount needed)
 
 MOUNTS (this machine)
   mount <volumeId> <path>      attach the live volume (FSKit on macOS, FUSE on Linux)
-  umount <path>                detach and stop the mount daemon
+  umount <path>                sync and detach one mounted volume
   mounts                       list active mounts
+  daemon stop                  atomically stop portablefsd only when no attach exists
 
 SESSION
   login [URL]                  authenticate and save credentials (device flow or --token)
@@ -102,6 +103,14 @@ EXAMPLES
   portablefs logout [--profile name] [--json]
 
 Remove the saved credentials for a profile (default: the current profile).
+`,
+		"daemon": `USAGE
+  portablefs daemon stop
+
+Atomically stop the per-user portablefsd only when it has no active or dormant
+attach. The daemon first closes attach admission and persists its final idle
+state; if any attach exists, the command fails without signaling or changing
+the daemon. The installer never invokes this automatically.
 `,
 		"create": `USAGE
   portablefs create [name] [--tenant id] [--json]

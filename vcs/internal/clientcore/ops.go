@@ -337,10 +337,6 @@ func (v *Volume) RegisterOpened(path string, n *NodeState) Status {
 		v.rollbackTrackedOpen(path, n)
 		return st
 	}
-	// RegisterOpened is the create+open completion path. The create is a
-	// mutation owned by this fresh handle, so its last close must provide the
-	// same barrier as an explicit fsync unless one happens first.
-	n.markDirty()
 	return fsproto.OK
 }
 
@@ -397,14 +393,6 @@ func (v *Volume) CloseHandle(path string, n *NodeState) Status {
 	if currentPath, found := v.opens.CurrentPath(path, n); found {
 		path = currentPath
 	}
-	closeStatus := Status(fsproto.OK)
-	if n.lastCloseIsDirty() {
-		if err := v.fsync(path); err != nil {
-			closeStatus = fsproto.EIO
-		} else {
-			n.clearDirty()
-		}
-	}
 	owner := openOwnerFor(path, n)
 	remaining, currentPath, found := v.opens.Dec(path, n)
 	if found {
@@ -428,7 +416,7 @@ func (v *Volume) CloseHandle(path string, n *NodeState) Status {
 			v.openReg.Close(pin.path, pin.ino, orphaned)
 		}
 	}
-	return closeStatus
+	return fsproto.OK
 }
 
 func (v *Volume) closeOne(path string, n *NodeState) bool {
@@ -579,9 +567,6 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		if err != nil {
 			return 0, fsproto.EIO
 		}
-		if st == fsproto.OK {
-			n.markDirty()
-		}
 		return cnt, st
 	}
 	if v.wb != nil && !v.isHardlink(n) {
@@ -591,9 +576,6 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			cnt, st, werr := v.client.WriteOrphan(oi, off, data)
 			if werr != nil {
 				return 0, fsproto.EIO
-			}
-			if st == fsproto.OK {
-				n.markDirty()
 			}
 			return cnt, st
 		}
@@ -606,7 +588,6 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			}
 			v.recent.record(path)
 			v.noteSelfMutation(path, 0, 0, true)
-			n.markDirty()
 			return res.Count, fsproto.OK
 		}
 		if werr != nil {
@@ -619,9 +600,6 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		cnt, st, err := v.client.WriteOrphan(oi, off, data)
 		if err != nil {
 			return 0, fsproto.EIO
-		}
-		if st == fsproto.OK {
-			n.markDirty()
 		}
 		return cnt, st
 	}
@@ -637,9 +615,6 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			if oerr != nil {
 				return 0, fsproto.EIO
 			}
-			if ost == fsproto.OK {
-				n.markDirty()
-			}
 			return c2, ost
 		}
 	}
@@ -652,7 +627,6 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	if v.isHardlink(n) {
 		v.invalidateRelatedInodes([]uint64{n.StableIno()}, path)
 	}
-	n.markDirty()
 	return cnt, fsproto.OK
 }
 
@@ -671,9 +645,6 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		if err != nil {
 			return 0, fsproto.EIO
 		}
-		if st == fsproto.OK {
-			n.markDirty()
-		}
 		return cnt, st
 	}
 	if v.wb != nil && !v.isHardlink(n) {
@@ -683,9 +654,6 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			cnt, _, st, werr := v.client.AppendOrphan(oi, data)
 			if werr != nil {
 				return 0, fsproto.EIO
-			}
-			if st == fsproto.OK {
-				n.markDirty()
 			}
 			return cnt, st
 		}
@@ -698,7 +666,6 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			}
 			v.recent.record(path)
 			v.noteSelfMutation(path, 0, 0, true)
-			n.markDirty()
 			return res.Count, fsproto.OK
 		}
 		if werr != nil {
@@ -711,9 +678,6 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		cnt, _, st, err := v.client.AppendOrphan(oi, data)
 		if err != nil {
 			return 0, fsproto.EIO
-		}
-		if st == fsproto.OK {
-			n.markDirty()
 		}
 		return cnt, st
 	}
@@ -729,9 +693,6 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			if oerr != nil {
 				return 0, fsproto.EIO
 			}
-			if ost == fsproto.OK {
-				n.markDirty()
-			}
 			return c2, ost
 		}
 	}
@@ -744,7 +705,6 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	if v.isHardlink(n) {
 		v.invalidateRelatedInodes([]uint64{n.StableIno()}, path)
 	}
-	n.markDirty()
 	return cnt, fsproto.OK
 }
 
@@ -1212,7 +1172,6 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			} else if st != fsproto.OK {
 				return fsproto.Attr{}, st
 			}
-			n.markDirty()
 		}
 		return fsproto.Attr{}, fsproto.OK
 	}
@@ -1226,7 +1185,6 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 				} else if st != fsproto.OK {
 					return fsproto.Attr{}, st
 				}
-				n.markDirty()
 			}
 			return fsproto.Attr{}, fsproto.OK
 		}
@@ -1263,7 +1221,6 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		if handledAll && mutated {
 			v.recent.record(path)
 			v.noteSelfMutation(path, 0, 0, true)
-			n.markDirty()
 			return engineAttr(path, last.Entry), fsproto.OK
 		}
 		if handledAll && !mutated {
@@ -1282,7 +1239,6 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			} else if st != fsproto.OK {
 				return fsproto.Attr{}, st
 			}
-			n.markDirty()
 		}
 		return fsproto.Attr{}, fsproto.OK
 	}
@@ -1310,9 +1266,6 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			return fsproto.Attr{}, st
 		}
 		v.recent.record(path)
-	}
-	if req.SetSize || req.SetMode || req.SetMTime || req.SetUID || req.SetGID {
-		n.dirty = true // n.mu is still held
 	}
 	a, st, err := v.client.GetattrHandle(path, handleIno)
 	n.mu.Unlock()
@@ -1352,7 +1305,6 @@ func (v *Volume) FsyncHandle(path string, n *NodeState) Status {
 	if err := v.fsync(path); err != nil {
 		return fsproto.EIO
 	}
-	n.clearDirty()
 	return fsproto.OK
 }
 

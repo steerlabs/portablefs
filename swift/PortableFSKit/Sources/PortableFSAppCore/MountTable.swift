@@ -14,7 +14,7 @@ public struct MountedFilesystem: Equatable, Sendable {
     }
 
     /// For PortableFS mounts, `mountedFrom` is the `pfs://<attachRef>`
-    /// resource passed to `mount -t portablefs`.
+    /// resource passed to `mount -t pfs`.
     public var attachRef: String? {
         MountTable.attachRef(fromMountedFrom: mountedFrom)
     }

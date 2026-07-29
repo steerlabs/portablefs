@@ -118,6 +118,18 @@ tar -xzf "$tmp/$archive" -C "$tmp" "$BINARY" "$DAEMON" 2>/dev/null ||
 [ -f "$tmp/$DAEMON" ] || die "$archive does not contain a $DAEMON binary"
 chmod 0755 "$tmp/$BINARY" "$tmp/$DAEMON"
 
+# Validate the downloaded pair before looking at or changing the destination.
+# Both binaries are stamped from the same release; a mixed archive is never
+# activated.
+cli_version=$("$tmp/$BINARY" version 2>/dev/null) ||
+  die "$archive contains a CLI that failed its version smoke test"
+daemon_version=$("$tmp/$DAEMON" -version 2>/dev/null) ||
+  die "$archive contains a daemon that failed its version smoke test"
+[ "$cli_version" = "portablefs $version" ] ||
+  die "$archive CLI identifies as '$cli_version', expected 'portablefs $version'"
+[ "$daemon_version" = "$version" ] ||
+  die "$archive daemon identifies as '$daemon_version', expected '$version'"
+
 # --- install --------------------------------------------------------------------
 if [ -n "${PORTABLEFS_INSTALL_DIR:-}" ]; then
   dest="$PORTABLEFS_INSTALL_DIR"
@@ -130,6 +142,17 @@ else
 fi
 [ -w "$dest" ] || die "$dest is not writable; set PORTABLEFS_INSTALL_DIR to a writable directory"
 
+# A running daemon keeps its old executable in memory and may own live WALs
+# and open handles. Refuse before changing either file; installation never
+# restarts, replaces, or signals a daemon. The matching old CLI remains
+# available so the user can unmount normally.
+if command -v pgrep >/dev/null 2>&1 &&
+  pgrep -u "$(id -u)" -x "$DAEMON" >/dev/null 2>&1; then
+  die "a portablefsd process is running; nothing was installed
+cleanly unmount every PortableFS volume, stop the idle daemon, then rerun the installer
+run the matching existing CLI's \`portablefs daemon stop\`; the installer never replaces or restarts a live daemon"
+fi
+
 # Stage each binary inside the destination directory so its final rename is
 # atomic: an interrupted install never leaves a partial binary at $dest.
 install_binary() {
@@ -140,12 +163,17 @@ install_binary() {
   mv -f "$_staged" "$dest/$_name" || die "install $_name into $dest failed"
   staged=""
 }
-install_binary "$BINARY"
+# Activate the daemon first. If power is lost between the two atomic renames,
+# an old CLI will fail closed against the new daemon's control-protocol gate;
+# rerunning the installer completes the pair.
 install_binary "$DAEMON"
+install_binary "$BINARY"
 
 # --- smoke test + next steps -----------------------------------------------------
 "$dest/$BINARY" version >/dev/null 2>&1 ||
   die "$dest/$BINARY was installed but failed its smoke test (\`$BINARY version\`)"
+"$dest/$DAEMON" -version >/dev/null 2>&1 ||
+  die "$dest/$DAEMON was installed but failed its smoke test (\`$DAEMON -version\`)"
 
 printf '%s\n' ""
 printf '%s installed to %s\n' "$("$dest/$BINARY" version)" "$dest/$BINARY"

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Finds the `portablefsd` executable the app should spawn.
 ///
@@ -56,5 +57,37 @@ public struct DaemonBinaryLocator: Sendable {
 
     public func locate() -> String? {
         candidates.first(where: isExecutableFile)
+    }
+}
+
+public struct DaemonBinaryIdentity: Equatable, Sendable {
+    public var version: String
+    public var executableSha256: String
+
+    public init(path: String) throws {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
+        executableSha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["-version"]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let bytes = output.fileHandleForReading.readDataToEndOfFile()
+        version = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard process.terminationStatus == 0, !version.isEmpty else {
+            throw CocoaError(.executableNotLoadable)
+        }
+    }
+
+    public func matches(_ running: DaemonIdentity) -> Bool {
+        running.schemaVersion == 1 &&
+            running.controlProtocol == 1 &&
+            running.daemonVersion == version &&
+            running.executableSha256 == executableSha256 &&
+            running.pfslocalMajor == 1
     }
 }

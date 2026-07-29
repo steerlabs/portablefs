@@ -945,9 +945,11 @@ func (fs *FS) applyCommittedEntry(entry pfj3.JournalEntry, owner string, applied
 			if leaf.orphanIno != 0 && leaf.changed {
 				// A detached inode is a reap candidate the moment no durable
 				// open pin holds it (never a wall-clock lease). Candidacy is
-				// decided AFTER the atomic commit below (the reducer txn owns
-				// its lock here); the sweep re-validates pin-freedom
-				// atomically at its own staged position.
+				// decided AFTER the atomic commit below. Do not mark it as a
+				// pending reap here: pendingReaps is exclusively the
+				// reservation fence for an OpReap row that has already won.
+				// The sweep re-validates pin-freedom atomically at its own
+				// staged position.
 				parkedInos = append(parkedInos, leaf.orphanIno)
 			}
 			out.tree = append(out.tree, entryLeafOutcome{err: leaf.err, res: leaf.res})
@@ -973,13 +975,11 @@ func (fs *FS) applyCommittedEntry(entry pfj3.JournalEntry, owner string, applied
 	schedule := false
 	for _, ino := range parkedInos {
 		if fs.orphans[ino] != nil && len(fs.managed.applied.PinHolders(ino)) == 0 {
-			fs.pendingReaps[ino]++
 			schedule = true
 		}
 	}
 	for _, ino := range unpinnedInos {
 		if fs.orphans[ino] != nil {
-			fs.pendingReaps[ino]++
 			schedule = true
 		}
 	}

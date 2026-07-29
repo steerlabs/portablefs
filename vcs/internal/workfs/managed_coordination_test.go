@@ -340,6 +340,66 @@ func TestManagedPinDecisionsAndReap(t *testing.T) {
 	}
 }
 
+// TestManagedPinRefusesReservedReap freezes the reservation-order contract
+// behind open(): once an OpReap row has won for an orphan, the applied tree
+// may still contain that inode briefly, but a later pin must see it as
+// logically gone. Otherwise open can acknowledge a handle that the lower-LSN
+// reap is guaranteed to destroy before the first read.
+func TestManagedPinRefusesReservedReap(t *testing.T) {
+	log := newFakeEntryLog()
+	fs, err := NewManaged(nil, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := openManagedSession(t, fs, "pfs-reap-owner", 1)
+	b := openManagedSession(t, fs, "pfs-reap-racer", 1)
+	ino := managedCreateFile(t, fs, a, 0, 1, "retired")
+
+	hash := func(seed byte) []byte {
+		h := make([]byte, 32)
+		h[0] = seed
+		return h
+	}
+	pin := hash(1)
+	if err := fs.ManagedPinChange(coordEnv(a, 1, 1, pin), ino, false, pin); err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	orphan := hash(2)
+	if _, err := fs.MutateEnv(wal.Record{
+		Op: wal.OpOrphan, Path: "retired", Env: coordEnv(a, 0, 2, orphan),
+	}, ""); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+
+	// Keep the automatic sweep parked so this test can model the exact
+	// reservation/apply interval deterministically.
+	fs.managed.sweepScheduled.Store(true)
+	t.Cleanup(func() { fs.managed.sweepScheduled.Store(false) })
+	unpin := hash(3)
+	if err := fs.ManagedPinChange(coordEnv(a, 1, 2, unpin), ino, true, unpin); err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	fs.mu.Lock()
+	if fs.orphans[ino] == nil {
+		fs.mu.Unlock()
+		t.Fatal("orphan disappeared before reserved-reap model")
+	}
+	fs.pendingReaps[ino] = 1 // an OpReap row is reserved below the racing pin
+	fs.mu.Unlock()
+
+	race := hash(4)
+	err = fs.ManagedPinChange(coordEnv(b, 0, 1, race), ino, false, race)
+	if !errors.Is(err, ErrPinTargetGone) {
+		t.Fatalf("pin behind reserved reap: %v, want ErrPinTargetGone", err)
+	}
+	if res, out := fs.CheckSlot(coordEnv(b, 0, 1, race)); res != SlotDuplicate || out.Status != 2 {
+		t.Fatalf("reserved-reap ENOENT replay: res=%v status=%d", res, out.Status)
+	}
+	if err := fs.ManagedEnsureOpenPin(b, ino); !errors.Is(err, ErrPinTargetGone) {
+		t.Fatalf("fused ensure behind reserved reap: %v, want ErrPinTargetGone", err)
+	}
+}
+
 // flushDigests chains the stream digest over rows starting from prev,
 // returning the end digest (the client-side computation).
 func flushDigests(t *testing.T, prev [32]byte, rows []ManagedFlushRow) [32]byte {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/content"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -171,12 +173,28 @@ func shortSocketDir(t *testing.T) string {
 	return dir
 }
 
+func fakePortablefsdBinary(t *testing.T, dir, version string) (string, string) {
+	t.Helper()
+	path := filepath.Join(dir, "portablefsd")
+	script := "#!/bin/sh\nprintf '%s\\n' '" + version + "'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := daemonctl.FileSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path, sum
+}
+
 // TestEnsurePortablefsdAdoptsHealthyDaemon proves the fskit path adopts an
 // already-listening control socket instead of spawning a second daemon: a
-// fake control server answering /healthz is "the daemon", and ensure returns
-// a client bound to it without ever exec-ing a binary.
+// fake control server answering the liveness and exact identity endpoints is
+// "the daemon", and ensure returns a client bound to it without ever
+// exec-ing a binary.
 func TestEnsurePortablefsdAdoptsHealthyDaemon(t *testing.T) {
 	dir := shortSocketDir(t)
+	daemonPath, daemonSHA256 := fakePortablefsdBinary(t, dir, "test-version")
 	controlSock := filepath.Join(dir, "control.sock")
 	ln, err := net.Listen("unix", controlSock)
 	if err != nil {
@@ -188,6 +206,10 @@ func TestEnsurePortablefsdAdoptsHealthyDaemon(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		if r.URL.Path == "/v1/identity" {
+			_, _ = fmt.Fprintf(w, `{"schemaVersion":1,"controlProtocol":1,"daemonVersion":"test-version","executableSha256":%q,"pfslocalMajor":1,"pfslocalMinor":0}`, daemonSHA256)
+			return
+		}
 		http.NotFound(w, r)
 	})}
 	go func() { _ = server.Serve(ln) }()
@@ -197,15 +219,51 @@ func TestEnsurePortablefsdAdoptsHealthyDaemon(t *testing.T) {
 		fsType:       "portablefs",
 		frontendSock: filepath.Join(dir, "pfs.sock"),
 		controlSock:  controlSock,
-		// No daemon binary anywhere: adoption must succeed without one.
-		daemonPath: filepath.Join(dir, "missing-portablefsd"),
+		daemonPath:   daemonPath,
 	}
-	ctl, err := ensurePortablefsd(cfg, dir)
+	ctl, err := ensurePortablefsd(cfg, dir, "test-version")
 	if err != nil {
 		t.Fatalf("adopting a healthy daemon must not require the binary: %v", err)
 	}
 	if !ctl.healthy() {
 		t.Fatal("adopted control client is not healthy")
+	}
+}
+
+func TestEnsurePortablefsdFailsClosedOnIncompatibleHealthyDaemon(t *testing.T) {
+	dir := shortSocketDir(t)
+	daemonPath, _ := fakePortablefsdBinary(t, dir, "new-version")
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusOK)
+		case "/v1/identity":
+			_, _ = w.Write([]byte(`{"schemaVersion":1,"controlProtocol":1,"daemonVersion":"old-version","executableSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pfslocalMajor":1,"pfslocalMinor":0}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() { _ = server.Serve(ln) }()
+	defer server.Close()
+
+	cfg := fskitConfig{
+		frontendSock: filepath.Join(dir, "pfs.sock"),
+		controlSock:  controlSock,
+		daemonPath:   daemonPath,
+	}
+	_, err = ensurePortablefsd(cfg, dir, "new-version")
+	if err == nil {
+		t.Fatal("incompatible healthy daemon must fail closed")
+	}
+	if !strings.Contains(err.Error(), `daemon "old-version", CLI "new-version"`) ||
+		!strings.Contains(err.Error(), "will not replace a live daemon automatically") {
+		t.Fatalf("incompatible daemon error = %v", err)
 	}
 }
 

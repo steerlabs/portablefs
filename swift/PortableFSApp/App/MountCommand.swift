@@ -1,4 +1,5 @@
 import Foundation
+import PortableFSAppCore
 
 enum MountCommandError: Error, CustomStringConvertible {
     case failed(command: String, exitCode: Int32, output: String)
@@ -14,10 +15,46 @@ enum MountCommandError: Error, CustomStringConvertible {
 
 /// Kernel mount plumbing. The mount invocation is exactly the one the manual
 /// FSKit verification loop and the live 15-check battery use:
-/// `/sbin/mount -t portablefs pfs://<attachRef> <mountPath>`.
+/// `/sbin/mount -t pfs pfs://<attachRef> <mountPath>`.
 enum MountCommand {
     static func mount(attachRef: String, mountPath: String) async throws {
-        try await run(["/sbin/mount", "-t", "portablefs", "pfs://\(attachRef)", mountPath])
+        try await run([
+            "/sbin/mount", "-t", MountTable.portableFSTypeName,
+            "pfs://\(attachRef)", mountPath,
+        ])
+    }
+
+    static func waitUntilReady(
+        attachRef: String,
+        mountPath: String,
+        timeout: Duration = .seconds(15)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        let expectedSource = "pfs://\(attachRef)"
+        var lastDetail = "mount is not in the kernel mount table"
+        while clock.now < deadline {
+            if let mount = MountTable.current().first(where: { $0.mountPoint == mountPath }) {
+                if mount.fsTypeName != MountTable.portableFSTypeName {
+                    lastDetail = "filesystem type is \(mount.fsTypeName), expected \(MountTable.portableFSTypeName)"
+                } else if mount.mountedFrom != expectedSource {
+                    lastDetail = "mount source is \(mount.mountedFrom), expected \(expectedSource)"
+                } else {
+                    do {
+                        _ = try FileManager.default.contentsOfDirectory(atPath: mountPath)
+                        return
+                    } catch {
+                        lastDetail = "root enumeration failed: \(error)"
+                    }
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        throw MountCommandError.failed(
+            command: "verify FSKit mount \(mountPath)",
+            exitCode: 1,
+            output: "mount did not become usable within \(timeout): \(lastDetail)"
+        )
     }
 
     /// `/sbin/umount` first, `diskutil unmount` as fallback — the same

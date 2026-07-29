@@ -258,7 +258,6 @@ func TestFailedCloseLeavesVolumeServingForRetry(t *testing.T) {
 	for {
 		lastErr = v.Fsync("d/f")
 		if lastErr == nil {
-			n.clearDirty()
 			break
 		}
 		if time.Now().After(deadline) {
@@ -382,10 +381,11 @@ func TestSyncVolumeNormalPathFlushesToAuthority(t *testing.T) {
 func TestSyncVolumeFencedSessionSurfacesError(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
-	v := dialCore(t, addr, Options{
+	v := dialCoreNoCleanup(t, addr, Options{
 		Owner:  "own-fenced-barrier",
 		WALDir: t.TempDir(),
 	})
+	t.Cleanup(func() { _, _ = v.CloseJournalDurable() })
 	a, st := v.Create(ctx, "h", 0o644)
 	if st != fsproto.OK {
 		t.Fatalf("create: %d", st)

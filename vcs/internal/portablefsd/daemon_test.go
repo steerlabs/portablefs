@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -108,7 +109,24 @@ func waitUnix(t *testing.T, p string) {
 	t.Fatalf("socket %s did not become ready", p)
 }
 
+type protocolTransport struct {
+	base *http.Transport
+}
+
+func (t protocolTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set(daemonctl.ControlProtocolHeader, fmt.Sprint(daemonctl.ControlProtocolVersion))
+	return t.base.RoundTrip(req)
+}
+
 func httpUDSClient(sock string) *http.Client {
+	base := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", sock)
+	}}
+	return &http.Client{Transport: protocolTransport{base: base}}
+}
+
+func rawHTTPUDSClient(sock string) *http.Client {
 	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", sock)
@@ -501,6 +519,42 @@ func TestDaemonControlAndFrontendEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("healthz status=%d", resp.StatusCode)
 	}
+	req, _ = http.NewRequest(http.MethodGet, "http://portablefsd/v1/identity", nil)
+	resp, err = hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var identity struct {
+		SchemaVersion    int    `json:"schemaVersion"`
+		ControlProtocol  int    `json:"controlProtocol"`
+		DaemonVersion    string `json:"daemonVersion"`
+		ExecutableSHA256 string `json:"executableSha256"`
+		PFSLocalMajor    uint32 `json:"pfslocalMajor"`
+		PFSLocalMinor    uint32 `json:"pfslocalMinor"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&identity); err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK ||
+		identity.SchemaVersion != 1 ||
+		identity.ControlProtocol != 1 ||
+		identity.DaemonVersion != "portablefsd-test" ||
+		len(identity.ExecutableSHA256) != 64 ||
+		identity.PFSLocalMajor != pfslocal.ProtocolMajor ||
+		identity.PFSLocalMinor != pfslocal.ProtocolMinor {
+		t.Fatalf("identity status=%d body=%+v", resp.StatusCode, identity)
+	}
+	req, _ = http.NewRequest(http.MethodGet, "http://portablefsd/v1/attaches", nil)
+	resp, err = rawHTTPUDSClient(cfg.ControlSocket).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("headerless control request status=%d, want 426", resp.StatusCode)
+	}
 
 	c := dialPFS(t, cfg.FrontendSocket)
 	defer c.close()
@@ -683,6 +737,48 @@ func TestDaemonControlAndFrontendEndToEnd(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestStopIfIdleAtomicallyRefusesBusyDaemon(t *testing.T) {
+	authority := serveAuthority(t)
+	cfg, hc, _, cancel := startDaemon(t, authority)
+	defer cancel()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://portablefsd/v1/lifecycle/stop-if-idle", nil)
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("busy stop status=%d, want 409", resp.StatusCode)
+	}
+	if _, err := os.Stat(cfg.ControlSocket); err != nil {
+		t.Fatalf("busy stop changed the live daemon: %v", err)
+	}
+}
+
+func TestStopIfIdleExitsDaemonWithNoAttaches(t *testing.T) {
+	cfg, hc, cancel := startDaemonNoAttach(t, "")
+	defer cancel()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://portablefsd/v1/lifecycle/stop-if-idle", nil)
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("idle stop status=%d, want 204", resp.StatusCode)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Lstat(cfg.ControlSocket); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("idle daemon did not remove %s after accepting stop", cfg.ControlSocket)
 }
 
 func TestDaemonFrontendLookupSeesControlWriteAfterNegative(t *testing.T) {

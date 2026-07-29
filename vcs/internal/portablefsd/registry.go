@@ -23,6 +23,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
 	"github.com/steerlabs/portablefs/vcs/internal/confinedfs"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -34,15 +35,18 @@ const (
 )
 
 type Config struct {
-	FrontendSocket string
-	ControlSocket  string
-	StateDir       string
-	Version        string
+	FrontendSocket   string
+	ControlSocket    string
+	StateDir         string
+	Version          string
+	ExecutableSHA256 string
 }
 
 type Server struct {
 	cfg      Config
 	registry *registry
+	stopCh   chan struct{}
+	stopOnce sync.Once
 
 	frontendLnMu sync.Mutex
 	controlLnMu  sync.Mutex
@@ -52,7 +56,14 @@ func NewServer(cfg Config) *Server {
 	if cfg.Version == "" {
 		cfg.Version = "dev"
 	}
-	return &Server{cfg: cfg, registry: newRegistry(cfg.StateDir)}
+	if cfg.ExecutableSHA256 == "" {
+		cfg.ExecutableSHA256, _ = daemonctl.CurrentExecutableSHA256()
+	}
+	return &Server{
+		cfg:      cfg,
+		registry: newRegistry(cfg.StateDir),
+		stopCh:   make(chan struct{}),
+	}
 }
 
 type AttachOptions struct {
@@ -149,6 +160,7 @@ type registry struct {
 	stateDir  string
 	byRef     map[string]*attach
 	byKey     map[string]*attach
+	quiescing bool
 
 	// Debounced background persistence for the per-file identity bindings.
 	// Namespace mutations must never block on (or fail with) state-file I/O:
@@ -305,6 +317,10 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 	req.Options.LocalDirs = requestedLocalDirs
 	key := attachKey(req.VolumeID, req.Branch, req.MountPath)
 	r.mu.Lock()
+	if r.quiescing {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("portablefsd is quiescing for an idle stop; new attaches are refused")
+	}
 	if a := r.byKey[key]; a != nil {
 		r.mu.Unlock()
 		// A revived attach has not opened its Volume yet, so resolve the
@@ -373,6 +389,32 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		return nil, false, err
 	}
 	return a, true, nil
+}
+
+// quiesceIfIdle atomically closes attach admission and proves that no active
+// or dormant attach exists. Once it succeeds, no later ensure can race into
+// daemon shutdown.
+func (r *registry) quiesceIfIdle() (bool, int, error) {
+	r.mu.Lock()
+	if r.quiescing {
+		r.mu.Unlock()
+		return true, 0, nil
+	}
+	count := len(r.byRef)
+	if count != 0 {
+		r.mu.Unlock()
+		return false, count, nil
+	}
+	r.quiescing = true
+	r.mu.Unlock()
+
+	if err := r.persist(); err != nil {
+		r.mu.Lock()
+		r.quiescing = false
+		r.mu.Unlock()
+		return false, 0, fmt.Errorf("persist final idle state: %w", err)
+	}
+	return true, 0, nil
 }
 
 func (r *registry) get(ref string) *attach {

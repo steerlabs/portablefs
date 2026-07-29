@@ -156,6 +156,15 @@ public struct DaemonControlError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+public struct DaemonIdentity: Decodable, Equatable, Sendable {
+    public var schemaVersion: Int
+    public var controlProtocol: Int
+    public var daemonVersion: String
+    public var executableSha256: String
+    public var pfslocalMajor: UInt32
+    public var pfslocalMinor: UInt32
+}
+
 /// Client for the portablefsd control socket (HTTP over UDS; see
 /// `vcs/internal/portablefsd/control.go`).
 public struct DaemonControlClient: Sendable {
@@ -176,6 +185,12 @@ public struct DaemonControlClient: Sendable {
         } catch {
             return false
         }
+    }
+
+    public func identity() async throws -> DaemonIdentity {
+        let response = try await http.send(method: "GET", path: "/v1/identity")
+        try Self.check(response)
+        return try Self.decode(DaemonIdentity.self, from: response.body)
     }
 
     public func ensureAttach(_ request: DaemonEnsureAttachRequest) async throws -> (attachRef: String, volumeName: String) {
@@ -222,6 +237,12 @@ public struct DaemonControlClient: Sendable {
 
     public func flush(ref: String) async throws {
         let response = try await http.send(method: "POST", path: "/v1/attaches/\(Self.escape(ref))/flush", body: Data("{}".utf8))
+        try Self.check(response)
+    }
+
+    /// Full authority durability barrier used before a normal kernel unmount.
+    public func sync(ref: String) async throws {
+        let response = try await http.send(method: "POST", path: "/v1/attaches/\(Self.escape(ref))/sync", body: Data("{}".utf8))
         try Self.check(response)
     }
 

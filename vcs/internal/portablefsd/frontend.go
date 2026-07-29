@@ -294,7 +294,11 @@ func listenUnixSocket(p string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return nil, err
 	}
-	_ = os.Remove(p)
+	if _, err := os.Lstat(p); err == nil {
+		return nil, fmt.Errorf("refusing to replace existing Unix socket %s; another or previously crashed portablefsd may own it", p)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect Unix socket %s: %w", p, err)
+	}
 	ln, err := net.Listen("unix", p)
 	if err != nil {
 		return nil, err
