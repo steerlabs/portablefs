@@ -52,9 +52,12 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	s.registry.closeAll(shutCtx)
+	shutErr := s.registry.closeAll(shutCtx)
 	shutCancel()
 	wg.Wait()
+	if shutErr != nil {
+		return fmt.Errorf("cooperative shutdown refused: %w", shutErr)
+	}
 	return nil
 }
 

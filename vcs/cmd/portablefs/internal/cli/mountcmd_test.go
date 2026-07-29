@@ -81,7 +81,7 @@ func TestUmountReconcilesOrphanedMountWithLiveDaemon(t *testing.T) {
 	}
 	select {
 	case <-daemonDone:
-	case <-time.After(6 * time.Second): // stopMountDaemon escalates to SIGKILL at 5s
+	case <-time.After(6 * time.Second):
 		t.Fatal("fake daemon still alive after umount; stopMountDaemon must stop it")
 	}
 	if st, err := readMountState(stateDir, mountPath); err != nil || st != nil {

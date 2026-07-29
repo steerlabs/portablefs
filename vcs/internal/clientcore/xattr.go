@@ -2,7 +2,9 @@ package clientcore
 
 import (
 	"context"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -13,19 +15,14 @@ import (
 //
 // Coherence/durability model (documented in docs/consistency-model.md):
 //
-//   - Reads (get/list) are pure read-through: every call reaches the
-//     authority (nothing caches xattr bytes client-side), so a mount
-//     observes its own mutations read-after-write and remote mutations as
-//     soon as the authority applied them. Remote xattr changes additionally
-//     publish an in-place (attr-level) invalidation, which keeps
-//     version-gated attr caches honest.
+//   - Existing authority objects stay read-through. Objects created under a
+//     delegation have a complete empty xattr view from birth, so their
+//     get/list/set/remove operations can stay in the same WAL-backed local
+//     lane as create/write.
 //
-//   - Mutations are WRITE-THROUGH even on write-back mounts: sessions never
-//     buffer xattr intents at this stage (simpler and honest — a buffered
-//     xattr would otherwise need base-image and flush-path carriage). On a
-//     write-back-covered path the covering session is flushed FIRST, so a
-//     locally buffered create exists at the authority before its xattr
-//     lands; the extra flush round-trip is the documented cost.
+//   - Existing objects without a complete xattr view conservatively use the
+//     authority lane. This is required to prove conditional flags and the
+//     per-inode total-byte limit before acknowledging a local set.
 
 // xattrHandleIno picks the handle addressing for xattr ops: a parked orphan
 // is addressed by its stable ino (the name is gone); named paths stay
@@ -34,33 +31,38 @@ func xattrHandleIno(n *NodeState) uint64 { return n.Orphan() }
 
 // Getxattr reads one extended attribute. ENODATA = attribute not present.
 func (v *Volume) Getxattr(ctx context.Context, path string, n *NodeState, name string) ([]byte, Status) {
+	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
+		if value, result := v.wb.Getxattr(path, name); result != writeback.LookupUndecided {
+			if result == writeback.LookupNegative {
+				return nil, fsproto.ENODATA
+			}
+			return value, fsproto.OK
+		}
+	}
 	value, st, err := v.client.Getxattr(path, xattrHandleIno(n), name)
 	if err != nil {
 		return nil, fsproto.EIO
-	}
-	if st == fsproto.ENOENT {
-		if st2, ok := v.xattrLocalOnly(path); ok {
-			return nil, st2 // exists locally, unflushed, has no xattrs: honest ENODATA
-		}
 	}
 	return value, st
 }
 
 // Listxattr lists extended-attribute names (sorted; empty = none).
 func (v *Volume) Listxattr(ctx context.Context, path string, n *NodeState) ([]string, Status) {
+	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
+		if names, ok := v.wb.Listxattr(path); ok {
+			return names, fsproto.OK
+		}
+	}
 	names, st, err := v.client.Listxattr(path, xattrHandleIno(n))
 	if err != nil {
 		return nil, fsproto.EIO
 	}
-	if st == fsproto.ENOENT {
-		if _, ok := v.xattrLocalOnly(path); ok {
-			return nil, fsproto.OK // exists locally, unflushed: truthfully no xattrs yet
-		}
-	}
 	return names, st
 }
 
-// Setxattr creates-or-overwrites one extended attribute, write-through.
+// Setxattr creates-or-overwrites one extended attribute. A locally-born
+// object's complete xattr map stays in its delegated WAL; all other objects
+// use the exact authority lane.
 func (v *Volume) Setxattr(ctx context.Context, path string, n *NodeState, name string, value []byte) Status {
 	return v.SetxattrFlags(ctx, path, n, name, value, 0)
 }
@@ -73,8 +75,22 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 	}
 	defer v.endMutation()
 
-	if flags&^wal.XattrFlagMask != 0 || flags == wal.XattrFlagMask {
-		return fsproto.EINVAL
+	if st := validateXattr(name, value, flags, true); st != fsproto.OK {
+		return st
+	}
+	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
+		handled, err := v.wb.Setxattr(ctx, path, name, value, flags)
+		if handled {
+			if err != nil {
+				return statusErr(err)
+			}
+			v.recent.record(path)
+			v.noteSelfMutation(path, 0, 0, true)
+			return fsproto.OK
+		}
+		if err != nil {
+			return statusErr(err)
+		}
 	}
 	if st := v.flushCoveringSession(path); st != fsproto.OK {
 		return st
@@ -89,13 +105,30 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 	return st
 }
 
-// Removexattr removes one extended attribute, write-through. ENODATA when absent.
+// Removexattr removes one extended attribute. ENODATA when absent.
 func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, name string) Status {
 	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
 
+	if st := validateXattr(name, nil, 0, false); st != fsproto.OK {
+		return st
+	}
+	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
+		handled, err := v.wb.Removexattr(ctx, path, name)
+		if handled {
+			if err != nil {
+				return statusErr(err)
+			}
+			v.recent.record(path)
+			v.noteSelfMutation(path, 0, 0, true)
+			return fsproto.OK
+		}
+		if err != nil {
+			return statusErr(err)
+		}
+	}
 	if st := v.flushCoveringSession(path); st != fsproto.OK {
 		return st
 	}
@@ -109,9 +142,25 @@ func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, nam
 	return st
 }
 
-// flushCoveringSession drains and RELEASES any delegation covering path:
-// xattr mutations are write-through only, and a write-through mutation never
-// runs inside a held delegation. A no-op without a covering delegation.
+func validateXattr(name string, value []byte, flags uint8, set bool) Status {
+	if name == "" || strings.IndexByte(name, 0) >= 0 || !utf8.ValidString(name) {
+		return fsproto.EINVAL
+	}
+	if len(name) > wal.MaxXattrNameBytes {
+		return fsproto.ERANGE
+	}
+	if set && len(value) > wal.MaxXattrValueBytes {
+		return fsproto.E2BIG
+	}
+	if flags&^wal.XattrFlagMask != 0 || flags == wal.XattrFlagMask || (!set && flags != 0) {
+		return fsproto.EINVAL
+	}
+	return fsproto.OK
+}
+
+// flushCoveringSession drains and releases any delegation before an
+// operation that must use the authority lane (existing-object xattrs,
+// hardlink aliases, and parked orphans).
 func (v *Volume) flushCoveringSession(path string) Status {
 	if v.wb == nil {
 		return fsproto.OK
@@ -122,19 +171,4 @@ func (v *Volume) flushCoveringSession(path string) Status {
 		return statusErr(err)
 	}
 	return fsproto.OK
-}
-
-// xattrLocalOnly reports whether path exists ONLY in the engine's
-// acknowledged state (its create has not flushed). In that window the file
-// truthfully has no xattrs — every xattr mutation flushes first — so reads
-// answer "no attributes" instead of a confusing ENOENT for a file the kernel
-// just created.
-func (v *Volume) xattrLocalOnly(path string) (Status, bool) {
-	if v.wb == nil {
-		return 0, false
-	}
-	if ent, res := v.wb.Lookup(path); res == writeback.LookupHit && ent.Kind != "" {
-		return fsproto.ENODATA, true
-	}
-	return 0, false
 }

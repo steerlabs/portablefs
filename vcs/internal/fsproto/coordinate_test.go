@@ -198,8 +198,8 @@ func TestManagedProbeAndLegacyWriteRefusal(t *testing.T) {
 	if probe.Status != OK || probe.ProtoVersion != ProtocolVersion {
 		t.Fatalf("managed probe: status=%d version=%d", probe.Status, probe.ProtoVersion)
 	}
-	if probe.Features != 0 {
-		t.Fatalf("v6 advertises no optional features today, got %b", probe.Features)
+	if probe.Features != FeatureDelegatedXattrs {
+		t.Fatalf("managed features = %b, want delegated xattrs", probe.Features)
 	}
 
 	// A managed generation NEVER admits envelope-less legacy writes and every

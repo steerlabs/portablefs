@@ -8,9 +8,8 @@ import "fmt"
 // allocation-safe, size-framed PFRQ1 codec; responses remain gob. Exact mount
 // sessions, journaled coordination, parent-version stamping, fused open
 // registration, xattrs, hard links, and atomic append are all MANDATORY parts
-// of the baseline — none of them is capability-negotiated. The probe's
-// Features field remains on the wire for genuinely optional FUTURE semantics
-// and is zero today.
+// of the baseline. Optional optimizations that preserve those baseline
+// semantics are selected by the probe's Features bitmap.
 //
 // Both sides fail closed against an older peer:
 //
@@ -37,6 +36,13 @@ import "fmt"
 // ProtocolVersion and gate the new behavior on the negotiated value; additive
 // response gob fields do not require a bump (gob decoders ignore unknown fields).
 const ProtocolVersion uint32 = 6
+
+// Optional protocol features. A client selects these lanes only from the
+// version probe; an older authority's zero bitmap is a definite pre-mutation
+// decision, never a failed-operation downgrade.
+const (
+	FeatureDelegatedXattrs uint64 = 1 << iota
+)
 
 // OpProtocolVersion is the version probe. Its value is deliberately far above the
 // sequential op block so ops added there (including on parallel branches) can never

@@ -208,12 +208,11 @@ non-empty/missing path) publishes no invalidation at all.
 
 ## Extended Attributes (xattrs)
 
-Extended attributes are native **LIVE volume state**, capability-gated on `FeatXattrs`
-(advertised by both server generations). They exist so macOS FSKit mounts stop generating
-AppleDouble `._` sidecar files: the FSKit extension already forwards xattr operations over
-pfslocal, and portablefsd answers natively whenever the attached authority advertises the
-feature. Against an older authority every xattr op reports ENOTSUP locally (no wire attempt)
-and kernels keep today's fallback behavior.
+Extended attributes are native **LIVE volume state** in the fsproto v6 baseline. They exist
+so macOS FSKit mounts stop generating AppleDouble `._` sidecar files: the FSKit extension
+forwards xattr operations over pfslocal and portablefsd answers them natively. Authorities
+that do not speak the v6 baseline are rejected at mount-time protocol negotiation; a mount
+never silently drops xattr operations or changes their semantics.
 
 Semantics (Linux `setxattr`/`removexattr` as the reference):
 
@@ -223,24 +222,28 @@ Semantics (Linux `setxattr`/`removexattr` as the reference):
   record's ordered apply position).
 - Set is create-or-overwrite (last writer wins). `removexattr`/`getxattr` of a missing name
   is `ENODATA` (Darwin frontends translate to `ENOATTR`), never a silent no-op.
-  `XATTR_CREATE`/`XATTR_REPLACE` (and FSKit's mustCreate/mustReplace policies) are enforced by
-  the authority at the mutation's ordered WAL/journal position. The existence test and update
-  are one durable operation across every mount; no client-side preflight read or TOCTOU window
-  exists. Conditional policies require the separately negotiated `FeatAtomicXattrFlags`;
-  clients fail closed with `EOPNOTSUPP` against an older basic-xattr authority rather than let
-  that authority ignore the additive flag.
+  `XATTR_CREATE`/`XATTR_REPLACE` (and FSKit's mustCreate/mustReplace policies) are one atomic
+  mutation with no preflight read or TOCTOU window. The authority evaluates them for shared
+  objects. A delegation holder evaluates them from the complete xattr map of a locally-born
+  object before appending the same conditional record to its WAL; exclusive scope ownership
+  prevents a peer from racing that decision.
 - Xattrs are keyed by stable inode: rename and open-after-unlink parking keep them; true inode
   destruction (remove of a not-open file, reap of an orphan) drops them.
 - Xattr mutations never touch file timestamps (the same discipline as chmod).
 
-Coherence: xattr **reads are pure read-through** — every getxattr/listxattr reaches the
-authority, nothing caches xattr bytes client-side — so a mount observes its own writes
-read-after-write and remote writes as soon as the authority applies them. A remote xattr
-mutation additionally publishes an in-place (attr-level) invalidation, keeping version-gated
-attribute caches honest. Xattr **mutations are write-through even on write-back mounts**:
-sessions never buffer xattr intents at this stage. On a write-back-covered path the covering
-session is flushed first (so a locally buffered create exists at the authority before its
-xattr lands); the extra flush round-trip is the documented cost of the simpler, honest model.
+Coherence follows the same delegated boundary as file data. An object created under a
+delegation starts with a complete empty xattr map, so get/list/set/remove stay in that
+scope's local WAL and preserve immediate read-after-write; fsync/flush/unmount carries the
+file and its xattrs through the same authority barrier. This is important on macOS, which
+normally attaches an Apple xattr to each newly-created file. Existing authority objects do
+not receive an unbounded xattr snapshot with the delegation: their reads remain
+read-through, and their mutations conservatively use the authority lane unless the client
+can prove the complete xattr map. That proof boundary preserves conditional flags and the
+128 KiB per-inode limit before any local acknowledgement. Remote xattr mutations publish an
+in-place (attr-level) invalidation, keeping version-gated attribute caches honest. Delegated
+xattr batches are an optional v6 optimization advertised by `FeatureDelegatedXattrs`; a
+client connected to an earlier v6 authority selects the shared xattr lane from the initial
+probe, never after a failed operation.
 
 Durability across compaction — the load-bearing part:
 

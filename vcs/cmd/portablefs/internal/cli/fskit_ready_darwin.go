@@ -13,8 +13,19 @@ func verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource string) 
 		return err
 	}
 	fsType := darwinStatfsString(stat.Fstypename[:])
-	if fsType != expectedFSType {
-		return fmt.Errorf("filesystem type is %q, want %q", fsType, expectedFSType)
+	// FSKit's registration short name (the value passed to mount -t, "pfs"
+	// by default) selects the extension. Once mounted, macOS 26 exposes the
+	// framework's canonical runtime type "portablefs" through statfs rather
+	// than echoing that registration name. The source below remains the
+	// attach-specific identity check.
+	const fskitRuntimeType = "portablefs"
+	if fsType != fskitRuntimeType {
+		return fmt.Errorf(
+			"filesystem type is %q, want FSKit runtime type %q (registered as %q)",
+			fsType,
+			fskitRuntimeType,
+			expectedFSType,
+		)
 	}
 	source := darwinStatfsString(stat.Mntfromname[:])
 	if source != expectedSource {

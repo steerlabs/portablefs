@@ -37,6 +37,28 @@ func newDirView(complete bool) *dirView {
 	return &dirView{children: map[string]*Entry{}, tombstones: map[string]bool{}, complete: complete}
 }
 
+// xattrView is the complete extended-attribute map of an object created
+// inside a delegation. Existing authority objects deliberately do not get a
+// partial view: without every value's size the client cannot prove the
+// per-inode total-byte limit before acknowledging a set locally.
+type xattrView struct {
+	values map[string][]byte
+}
+
+func newXattrView() *xattrView {
+	return &xattrView{values: map[string][]byte{}}
+}
+
+func (x *xattrView) totalAfterSet(name string, value []byte) int {
+	total := len(name) + len(value)
+	for existingName, existingValue := range x.values {
+		if existingName != name {
+			total += len(existingName) + len(existingValue)
+		}
+	}
+	return total
+}
+
 // extent is one current dirty range [start,end) of a file. zero extents fill
 // holes (write-beyond-EOF, truncate-extend); WAL extents reference payload
 // bytes in a stream segment.

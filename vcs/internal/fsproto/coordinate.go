@@ -119,7 +119,6 @@ func barrierRequestHash(env *wal.Envelope) []byte {
 	return coordinationHash("PFC2-BARRIER", env.Generation, uint64(env.Slot), env.SlotSeq)
 }
 
-
 // wireLockRange converts the inclusive wire [start,end] into the PFC2
 // (start, length; 0 = through EOF) shape. The kernel expresses through-EOF as
 // OFFSET_MAX (and some shims as ^0); both map to length 0.
@@ -606,12 +605,6 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 		if r.Op.IsControl() {
 			// Managed flushes carry watermarks natively as FlushAdvance; a
 			// legacy control record here is a protocol violation.
-			return &Response{Status: EINVAL}
-		}
-		if r.Op == wal.OpSetxattr || r.Op == wal.OpRemovexattr {
-			// Xattr mutations are write-through only (the engine never
-			// delegates them); a flush batch may not smuggle them past the
-			// write-through admission gates.
 			return &Response{Status: EINVAL}
 		}
 		if isReserved(r.Path) || isReserved(r.NewPath) {

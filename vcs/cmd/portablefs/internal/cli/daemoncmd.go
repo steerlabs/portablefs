@@ -6,7 +6,14 @@ import (
 )
 
 func cmdDaemon(e *cmdEnv, args []string) int {
-	if len(args) != 1 || args[0] != "stop" {
+	fs := newFlagSet("daemon")
+	var o commonOpts
+	addCommonFlags(fs, &o)
+	positionals, err := parseArgs(fs, args)
+	if err != nil {
+		return e.handleParseError("daemon", err)
+	}
+	if len(positionals) != 1 || positionals[0] != "stop" {
 		return e.usageError("daemon", fmt.Errorf("expected `stop`"))
 	}
 	cfg := fskitConfigFromEnv(e.getenv)
@@ -20,6 +27,9 @@ func cmdDaemon(e *cmdEnv, args []string) int {
 	deadline := time.Now().Add(35 * time.Second)
 	for time.Now().Before(deadline) {
 		if !ctl.healthy() {
+			if o.jsonOut {
+				return e.printJSON(map[string]any{"stopped": true})
+			}
 			fmt.Fprintln(e.stdout, "portablefsd stopped")
 			return 0
 		}

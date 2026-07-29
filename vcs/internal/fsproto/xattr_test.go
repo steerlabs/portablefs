@@ -156,6 +156,10 @@ func (noCondXattrFS) SupportsAtomicXattrFlags() bool { return false }
 func TestConditionalXattrWithoutEvaluatorFailsClosed(t *testing.T) {
 	fs := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
 	srv := NewServer(noCondXattrFS{FS: fs}, fs)
+	probe := srv.probeResponse(int64(ProtocolVersion))
+	if probe.Status != OK || probe.Features&FeatureDelegatedXattrs != 0 {
+		t.Fatalf("authority without atomic xattr evaluator advertised delegated xattrs: %+v", probe)
+	}
 	cs := openExactSession(t, srv, "sess-XF", 1, "MX", "tokXF", 8)
 	if r := exactDo(srv, cs, &Request{Op: OpCreate, Path: "f", Mode: 0o644}, 0, 1); r.Status != OK {
 		t.Fatalf("create: %+v", r)
@@ -174,7 +178,7 @@ func TestConditionalXattrWithoutEvaluatorFailsClosed(t *testing.T) {
 	}
 }
 
-func TestXattrFlushBatchRejectsSmuggledRecords(t *testing.T) {
+func TestXattrFlushBatchAppliesDelegatedRecords(t *testing.T) {
 	_, addr := serveFS(t)
 	cli, err := Dial(addr, 1)
 	if err != nil {
@@ -197,7 +201,11 @@ func TestXattrFlushBatchRejectsSmuggledRecords(t *testing.T) {
 		{Seq: 2, Op: wal.OpSetxattr, Path: "wb/f", XattrName: "user.a", Data: []byte("v")},
 	}
 	_, st, err := cli.FlushWriteback("sess-x", "wb", grant.Epoch, wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), records), records)
-	if err != nil || st != EINVAL {
-		t.Fatalf("smuggled xattr flush: st=%d err=%v, want EINVAL", st, err)
+	if err != nil || st != OK {
+		t.Fatalf("delegated xattr flush: st=%d err=%v", st, err)
+	}
+	value, st, err := cli.Getxattr("wb/f", 0, "user.a")
+	if err != nil || st != OK || string(value) != "v" {
+		t.Fatalf("get flushed xattr: value=%q st=%d err=%v", value, st, err)
 	}
 }

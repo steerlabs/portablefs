@@ -59,6 +59,9 @@ var (
 // not relieve: the mutation is refused before any WAL append.
 var ErrNoSpace = errors.New("writeback: stream WAL budget exhausted")
 
+// ErrNoXattr is the engine's deterministic ENODATA outcome.
+var ErrNoXattr = errors.New("writeback: extended attribute does not exist")
+
 // ErrFailedClosed marks a terminal engine verdict. Once latched, the mount
 // refuses every later mutation until it is remounted; it never changes the
 // operation to the authority lane because local state became unavailable.
@@ -105,6 +108,11 @@ type Config struct {
 	// (PORTABLEFS_DEBUG_WRITE_THROUGH=1). The engine still recovers parked
 	// streams.
 	DisableDelegation bool
+
+	// DisableDelegatedXattrs keeps xattr mutations on the authority lane
+	// when the negotiated authority does not advertise that optional flush
+	// record class. The decision is fixed before the first mutation.
+	DisableDelegatedXattrs bool
 
 	Logf func(string, ...any)
 }
@@ -158,6 +166,7 @@ type Engine struct {
 	delegations map[string]*delegation
 	dirs        map[string]*dirView
 	files       map[string]*fileView
+	xattrs      map[string]*xattrView
 	denials     map[string]time.Time
 
 	// held mirrors len(delegations) so the shared-path read surfaces
@@ -226,6 +235,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		delegations: map[string]*delegation{},
 		dirs:        map[string]*dirView{},
 		files:       map[string]*fileView{},
+		xattrs:      map[string]*xattrView{},
 		denials:     map[string]time.Time{},
 		acquiring:   map[string]*acquireFlight{},
 		createWAL:   createStreamWAL,
@@ -436,9 +446,15 @@ type admission struct {
 }
 
 // admit resolves the delegation admitting a mutation on path, adaptively
-// acquiring one when the scope is eligible and uncontended. ok=false with a
-// nil error is a normal authority-lane decision made before the operation;
-// failures always return an error and never change lanes.
+// acquiring one when the scope is eligible and uncontended. A grant is kept
+// at the mutation's exact parent directory: when a broader ancestor grant
+// covers the path, it is drained and released before the narrower grant is
+// acquired. This "push down" is what lets peer mounts write sibling
+// directories concurrently instead of one mount retaining a broad parent
+// checkout for the lifetime of its deeper workload.
+//
+// ok=false with a nil error is a normal authority-lane decision made before
+// the operation; failures always return an error and never change lanes.
 func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error) {
 	if err := e.MutationError(); err != nil {
 		return admission{}, false, err
@@ -446,6 +462,7 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 	if e.cfg.DisableDelegation {
 		return admission{}, false, nil
 	}
+	scope := governingScope(path)
 	for {
 		e.mu.Lock()
 		if e.closed || e.frozen {
@@ -458,8 +475,21 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 		}
 		d := e.coveringLocked(path)
 		if d != nil && !d.draining {
-			d.lastActive = time.Now()
-			return admission{d: d}, true, nil // e.mu stays held; caller releases
+			if d.scope == scope {
+				d.lastActive = time.Now()
+				return admission{d: d}, true, nil // e.mu stays held; caller releases
+			}
+			// The active grant is a strict ancestor of the mutation's exact
+			// parent. Drain it before continuing so a long-running deep
+			// workload never monopolizes a common ancestor shared with peer
+			// writers. The next loop acquires the now-authoritative child
+			// directory directly.
+			e.prepareReleaseLocked(d)
+			e.mu.Unlock()
+			if err := e.finishRelease(ctx, d); err != nil {
+				return admission{}, false, err
+			}
+			continue
 		}
 		if d != nil {
 			if err := d.drainErr; err != nil {
@@ -481,7 +511,6 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 			// admission, a typed failure, or write-through.
 			continue
 		}
-		scope := governingScope(path)
 		if scope == "" {
 			e.mu.Unlock()
 			return admission{}, false, nil // top-level: no delegable scope
@@ -762,6 +791,7 @@ func (e *Engine) Create(ctx context.Context, path string, mode uint32, excl, kno
 	}
 	ent := e.installEntryLocked(path, entryNow("file", mode))
 	e.files[path] = &fileView{entry: ent, basePath: path}
+	e.xattrs[path] = newXattrView()
 	return Result{Entry: *ent}, true, nil
 }
 
@@ -785,6 +815,7 @@ func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) (Result, b
 		}
 		ent := e.installEntryLocked(path, entryNow("directory", mode))
 		e.dirs[path] = newDirView(true)
+		e.xattrs[path] = newXattrView()
 		return Result{Entry: *ent}, true, nil
 	}
 	return Result{}, false, e.fallThroughLocked(ctx, path)
@@ -813,6 +844,7 @@ func (e *Engine) Symlink(ctx context.Context, path, target string) (Result, bool
 	ent.Target = target
 	ent.Size = int64(len(target))
 	stored := e.installEntryLocked(path, ent)
+	e.xattrs[path] = newXattrView()
 	return Result{Entry: *stored}, true, nil
 }
 
@@ -861,6 +893,7 @@ func (e *Engine) removeLocalLocked(path string) {
 	}
 	delete(e.files, path)
 	delete(e.dirs, path)
+	delete(e.xattrs, path)
 	prefix := path + "/"
 	for p := range e.files {
 		if strings.HasPrefix(p, prefix) {
@@ -870,6 +903,11 @@ func (e *Engine) removeLocalLocked(path string) {
 	for p := range e.dirs {
 		if strings.HasPrefix(p, prefix) {
 			delete(e.dirs, p)
+		}
+	}
+	for p := range e.xattrs {
+		if strings.HasPrefix(p, prefix) {
+			delete(e.xattrs, p)
 		}
 	}
 }
@@ -904,12 +942,12 @@ func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, e
 	}
 	renameSeq := renRes[0].seq
 	moved := *srcEnt
-	e.removeLocalLocked(newp)
+	srcXattrs := e.xattrs[oldp]
 	// Re-key the moved object and every overlay object under it.
 	srcFile := e.files[oldp]
 	srcDir := e.dirs[oldp]
 	type mv struct{ from, to string }
-	var files, dirsMv []mv
+	var files, dirsMv, xattrsMv []mv
 	prefix := oldp + "/"
 	for p := range e.files {
 		if strings.HasPrefix(p, prefix) {
@@ -921,6 +959,12 @@ func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, e
 			dirsMv = append(dirsMv, mv{p, newp + "/" + p[len(prefix):]})
 		}
 	}
+	for p := range e.xattrs {
+		if strings.HasPrefix(p, prefix) {
+			xattrsMv = append(xattrsMv, mv{p, newp + "/" + p[len(prefix):]})
+		}
+	}
+	e.removeLocalLocked(newp)
 	for _, m := range files {
 		mv := e.files[m.from]
 		// The moved view's clean ranges stay at the OLD authority path until
@@ -933,6 +977,10 @@ func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, e
 		e.dirs[m.to] = e.dirs[m.from]
 		delete(e.dirs, m.from)
 	}
+	for _, m := range xattrsMv {
+		e.xattrs[m.to] = e.xattrs[m.from]
+		delete(e.xattrs, m.from)
+	}
 	// Detach the old name (tombstone in partial parents).
 	if dv := e.dirs[parentDir(oldp)]; dv != nil {
 		delete(dv.children, baseName(oldp))
@@ -942,6 +990,7 @@ func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, e
 	}
 	delete(e.files, oldp)
 	delete(e.dirs, oldp)
+	delete(e.xattrs, oldp)
 	stored := e.installEntryLocked(newp, moved)
 	if srcFile != nil {
 		srcFile.entry = stored
@@ -950,6 +999,9 @@ func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, e
 	}
 	if srcDir != nil {
 		e.dirs[newp] = srcDir
+	}
+	if srcXattrs != nil {
+		e.xattrs[newp] = srcXattrs
 	}
 	return Result{Entry: *stored}, true, nil
 }
@@ -1133,6 +1185,118 @@ func (e *Engine) Setattr(ctx context.Context, path string, req SetattrRequest) (
 	}
 	ent.CtimeMs = nowMs()
 	return Result{Entry: *ent}, true, nil
+}
+
+// Getxattr answers from a complete delegated xattr view. Such a view exists
+// only for an object born locally under the grant; existing authority
+// objects stay read-through because the grant snapshot does not carry their
+// xattr values.
+func (e *Engine) Getxattr(path, name string) ([]byte, LookupResult) {
+	if e.held.Load() == 0 {
+		return nil, LookupUndecided
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	d := e.coveringLocked(path)
+	if d == nil || d.draining {
+		return nil, LookupUndecided
+	}
+	xv := e.xattrs[path]
+	if xv == nil {
+		return nil, LookupUndecided
+	}
+	value, ok := xv.values[name]
+	if !ok {
+		return nil, LookupNegative
+	}
+	return append([]byte(nil), value...), LookupHit
+}
+
+// Listxattr returns the complete sorted name set for a locally-born object.
+func (e *Engine) Listxattr(path string) ([]string, bool) {
+	if e.held.Load() == 0 {
+		return nil, false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	d := e.coveringLocked(path)
+	xv := e.xattrs[path]
+	if d == nil || d.draining || xv == nil {
+		return nil, false
+	}
+	names := make([]string, 0, len(xv.values))
+	for name := range xv.values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, true
+}
+
+// Setxattr acknowledges an xattr mutation locally only when the engine owns
+// the object's complete xattr map. That proves conditional flags and the
+// frozen per-inode total-byte bound before acknowledgment; existing objects
+// conservatively release the grant and use the authority lane.
+func (e *Engine) Setxattr(ctx context.Context, path, name string, value []byte, flags uint8) (bool, error) {
+	if e.cfg.DisableDelegatedXattrs {
+		return false, e.ReleaseFor(ctx, path)
+	}
+	adm, ok, err := e.admit(ctx, path)
+	if !ok {
+		return false, err
+	}
+	defer e.release(adm)
+	if _, present := e.entryLocked(path); !present {
+		return false, e.fallThroughLocked(ctx, path)
+	}
+	xv := e.xattrs[path]
+	if xv == nil {
+		return false, e.fallThroughLocked(ctx, path)
+	}
+	_, exists := xv.values[name]
+	if flags&wal.XattrCreate != 0 && exists {
+		return true, os.ErrExist
+	}
+	if flags&wal.XattrReplace != 0 && !exists {
+		return true, ErrNoXattr
+	}
+	if xv.totalAfterSet(name, value) > wal.MaxXattrTotalBytes {
+		return true, ErrNoSpace
+	}
+	rec := wal.Record{Op: wal.OpSetxattr, Path: path, XattrName: name, XattrFlags: flags, Data: value}
+	if _, err := e.appendRecordsLocked(adm.d, []wal.Record{rec}); err != nil {
+		return true, err
+	}
+	xv.values[name] = append([]byte(nil), value...)
+	return true, nil
+}
+
+// Removexattr acknowledges a removal locally under the same complete-view
+// rule as Setxattr, preserving ENODATA exactly.
+func (e *Engine) Removexattr(ctx context.Context, path, name string) (bool, error) {
+	if e.cfg.DisableDelegatedXattrs {
+		return false, e.ReleaseFor(ctx, path)
+	}
+	adm, ok, err := e.admit(ctx, path)
+	if !ok {
+		return false, err
+	}
+	defer e.release(adm)
+	if _, present := e.entryLocked(path); !present {
+		return false, e.fallThroughLocked(ctx, path)
+	}
+	xv := e.xattrs[path]
+	if xv == nil {
+		return false, e.fallThroughLocked(ctx, path)
+	}
+	if _, exists := xv.values[name]; !exists {
+		return true, ErrNoXattr
+	}
+	rec := wal.Record{Op: wal.OpRemovexattr, Path: path, XattrName: name}
+	if _, err := e.appendRecordsLocked(adm.d, []wal.Record{rec}); err != nil {
+		return true, err
+	}
+	delete(xv.values, name)
+	return true, nil
 }
 
 // ─── reads ───────────────────────────────────────────────────────────────────

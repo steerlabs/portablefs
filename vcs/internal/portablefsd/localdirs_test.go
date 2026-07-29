@@ -66,11 +66,21 @@ func startDaemonNoAttach(t *testing.T, _ string) (Config, *http.Client, context.
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := NewServer(cfg)
+	runDone := make(chan error, 1)
 	go func() {
-		if err := s.Run(ctx); err != nil {
-			t.Errorf("daemon Run: %v", err)
-		}
+		runDone <- s.Run(ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Errorf("daemon Run: %v", err)
+			}
+		case <-time.After(35 * time.Second):
+			t.Error("daemon did not complete its bounded cooperative shutdown")
+		}
+	})
 	waitUnix(t, cfg.ControlSocket)
 	waitUnix(t, cfg.FrontendSocket)
 	return cfg, httpUDSClient(cfg.ControlSocket), cancel

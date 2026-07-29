@@ -105,12 +105,14 @@ EXAMPLES
 Remove the saved credentials for a profile (default: the current profile).
 `,
 		"daemon": `USAGE
-  portablefs daemon stop
+  portablefs daemon stop [--json]
 
-Atomically stop the per-user portablefsd only when it has no active or dormant
-attach. The daemon first closes attach admission and persists its final idle
-state; if any attach exists, the command fails without signaling or changing
-the daemon. The installer never invokes this automatically.
+Atomically stop the per-user portablefsd only when it has no live attach.
+Credential-pending restart metadata does not block a clean stop because it
+holds no live session, WAL handle, or frontend service. The daemon first
+closes attach admission and persists its final idle state; if any live attach
+exists, the command fails without signaling or changing the daemon. The
+installer never invokes this automatically.
 `,
 		"create": `USAGE
   portablefs create [name] [--tenant id] [--json]

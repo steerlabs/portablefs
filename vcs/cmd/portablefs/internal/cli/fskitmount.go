@@ -335,9 +335,15 @@ type cliAttachStatus struct {
 }
 
 type cliWriteBackStatus struct {
-	PendingRecords int            `json:"pendingRecords"`
-	PendingBytes   int64          `json:"pendingBytes"`
-	ParkedWALs     []cliParkedWAL `json:"parkedWals"`
+	PendingRecords int                 `json:"pendingRecords"`
+	PendingBytes   int64               `json:"pendingBytes"`
+	Delegations    []cliDelegationView `json:"delegations"`
+	ParkedWALs     []cliParkedWAL      `json:"parkedWals"`
+}
+
+type cliDelegationView struct {
+	Scope    string `json:"scope"`
+	Draining bool   `json:"draining"`
 }
 
 type cliParkedWAL struct {

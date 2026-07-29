@@ -330,12 +330,6 @@ func normalizeAndValidateUserRecord(r *wal.Record, inBatch, allowEnvelope bool) 
 			return invalidMutation("reap requires a stable inode and no path")
 		}
 	case wal.OpSetxattr, wal.OpRemovexattr:
-		// Xattr mutations are write-through only: they never ride a
-		// write-back flush batch, so admission fails a smuggled one closed
-		// (env-less xattr rows then cannot appear in a durable batch at all).
-		if inBatch {
-			return invalidMutation("xattr mutations are write-through only (not batchable)")
-		}
 		allowed = fieldPath | fieldIno | fieldEnvelope | fieldXattrName
 		if r.Op == wal.OpSetxattr {
 			allowed |= fieldData | fieldXattrFlags
