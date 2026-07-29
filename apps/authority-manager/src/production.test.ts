@@ -30,6 +30,8 @@ import {
   MANAGED_CHILD_PROTOCOL_VERSION,
   canonicalHaPolicyHash,
   createProductionAuthorityRegistry,
+  escapeLogControls,
+  formatChildLogChunk,
   readProductionAuthorityRegistryConfig,
   type ProductionAuthorityRegistry,
 } from "./production-registry.js";
@@ -48,6 +50,21 @@ const ref = { teamId: "team_1", volumeId: "vol_1", branch: "main" };
 
 const registries: ProductionAuthorityRegistry[] = [];
 const servers: Array<ReturnType<typeof createAuthorityManagerServer>> = [];
+
+test("operator logs escape tenant controls and prefix every child-output line", () => {
+  expect(escapeLogControls("vol\nname\u001b[31m")).toBe(
+    "vol\\u000aname\\u001b[31m"
+  );
+  expect(
+    formatChildLogChunk(
+      "[portablefs-vcs production safe]",
+      Buffer.from("first\nforged\u001b[2J\n")
+    )
+  ).toBe(
+    "[portablefs-vcs production safe] first\n" +
+      "[portablefs-vcs production safe] forged\\u001b[2J\n"
+  );
+});
 
 afterEach(async () => {
   await Promise.allSettled(registries.splice(0).map((registry) => registry.shutdown()));
