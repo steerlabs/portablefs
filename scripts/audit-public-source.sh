@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fail closed when a public source tree, ref name, or Git object contains a
-# protected product marker. The default marker is assembled so this scanner
-# does not match its own source.
-default_forbidden_regex='open''steer'
-forbidden_regex="$default_forbidden_regex"
-if [ -n "${PORTABLEFS_PUBLIC_FORBIDDEN_REGEX:-}" ]; then
-  forbidden_regex="$forbidden_regex|(${PORTABLEFS_PUBLIC_FORBIDDEN_REGEX})"
-fi
+# Scan a public source tree, ref names, and optionally all Git objects for
+# caller-supplied forbidden markers. Organization-specific markers belong in
+# the release environment, not in this public repository.
+forbidden_regex="${PORTABLEFS_PUBLIC_FORBIDDEN_REGEX:-}"
 revision=""
 scan_all_objects=false
 
 usage() {
   echo "Usage: $0 [--revision REV] [--all-objects] [--forbid ERE]" >&2
+  echo "Set PORTABLEFS_PUBLIC_FORBIDDEN_REGEX or pass --forbid at least once." >&2
+}
+
+append_forbidden_regex() {
+  local candidate="$1"
+  if [ -z "$candidate" ]; then
+    echo "public-source audit: forbidden-marker regular expression must not be empty" >&2
+    exit 2
+  fi
+  if [ -n "$forbidden_regex" ]; then
+    forbidden_regex="$forbidden_regex|($candidate)"
+  else
+    forbidden_regex="($candidate)"
+  fi
 }
 
 while [ "$#" -gt 0 ]; do
@@ -29,7 +39,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --forbid)
       [ "$#" -ge 2 ] || { usage; exit 2; }
-      forbidden_regex="$forbidden_regex|($2)"
+      append_forbidden_regex "$2"
       shift 2
       ;;
     -h|--help)
@@ -42,6 +52,12 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -z "$forbidden_regex" ]; then
+  echo "public-source audit: no forbidden-marker patterns configured" >&2
+  usage
+  exit 2
+fi
 
 set +e
 printf '' | LC_ALL=C grep -Eq "$forbidden_regex"
