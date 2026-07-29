@@ -37,7 +37,7 @@ The local release packager builds the app, embeds a universal daemon, verifies
 the complete signature, and emits a checksummed zip without GitHub CI:
 
 ```sh
-scripts/package-macos-app.sh 0.2.2
+scripts/package-macos-app.sh 0.2.3
 ```
 
 Set `PORTABLEFS_DEVELOPER_ID_EXPORT=1` for Developer ID export. If a

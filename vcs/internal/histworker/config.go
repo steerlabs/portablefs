@@ -149,7 +149,7 @@ func (c Config) withDefaults() Config {
 	def(&c.MaterializeConcurrency, 1)
 	def(&c.MaxCutAttempts, 12)
 	def(&c.MinFailureDomains, 2)
-	def(&c.UploadConcurrency, 8)
+	def(&c.UploadConcurrency, 32)
 	def(&c.ScrubBatch, 64)
 	def(&c.ScrubConcurrency, 8)
 	def(&c.RepairBatch, 16)
