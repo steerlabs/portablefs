@@ -259,13 +259,20 @@ func (c *Client) probeAuthority() bool {
 		tls:         c.tls,
 		auth:        c.tokenForHandshake,
 		transport:   c.transport,
+		client:      c,
 		health:      c.health,
 		gateExempt:  true,
 		dialTimeout: failFastProbeDialTimeout,
 	}
+	if !c.registerDedicated(cn) {
+		return false
+	}
+	defer func() {
+		cn.reset()
+		c.unregisterDedicated(cn)
+	}()
 	if err := cn.ensure(); err != nil {
 		return false
 	}
-	cn.reset()
 	return true
 }

@@ -3,8 +3,10 @@ package writeback
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -187,5 +189,148 @@ func TestWALRotationDoesNotReemitReleasedGrant(t *testing.T) {
 		if fr.typ == frameDelegation {
 			t.Fatalf("released delegation frame survived into segment %d", fr.ordinal)
 		}
+	}
+}
+
+func TestRecordDrainedReleasePersistsAppliedCertificateBeforeRelease(t *testing.T) {
+	oldTarget := segmentTargetBytes
+	segmentTargetBytes = 1 << 30
+	t.Cleanup(func() { segmentTargetBytes = oldTarget })
+
+	streamDir := filepath.Join(t.TempDir(), streamDirName(1))
+	var mountID [16]byte
+	copy(mountID[:], "release-cert----")
+	w, err := createStreamWAL(streamDir, mountID, "vol", "main", 1)
+	if err != nil {
+		t.Fatalf("create WAL: %v", err)
+	}
+	grant := delegationFrame{Scope: "d", Epoch: "epoch-1"}
+	if err := w.appendControl(frameDelegation, grant); err != nil {
+		t.Fatalf("append delegation: %v", err)
+	}
+	payload := canonicalPayload(wal.Record{
+		Op: wal.OpCreate, Path: "d/f", Mode: 0o644,
+	})
+	appended, err := w.appendMutations([][]byte{payload})
+	if err != nil {
+		t.Fatalf("append mutation: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("sync mutation: %v", err)
+	}
+	var certificateSyncs atomic.Int32
+	w.syncFile = func(f *os.File) error {
+		certificateSyncs.Add(1)
+		return f.Sync()
+	}
+	if err := w.recordDrainedRelease(grant.Scope, grant.Epoch, appended[0].seq, appended[0].digest); err != nil {
+		t.Fatalf("record drained release: %v", err)
+	}
+	if got := certificateSyncs.Load(); got != 1 {
+		t.Fatalf("drained release used %d syncs, want exactly 1", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("hard-crash close: %v", err)
+	}
+
+	scan, err := scanStream(streamDir)
+	if err != nil {
+		t.Fatalf("scan stream: %v", err)
+	}
+	live, mutations, marks, _, err := decodeStreamFrames(scan.frames)
+	if err != nil {
+		t.Fatalf("decode stream: %v", err)
+	}
+	if len(live) != 0 {
+		t.Fatalf("locally-final release remained live: %+v", live)
+	}
+	if len(mutations) != 1 {
+		t.Fatalf("mutations = %d, want 1", len(mutations))
+	}
+	through, digest, err := highestAppliedCertificate(marks, scan.lastSeq)
+	if err != nil {
+		t.Fatalf("select applied certificate: %v", err)
+	}
+	if through != appended[0].seq || digest != appended[0].digest {
+		t.Fatalf("certificate = (%d,%x), want (%d,%x)", through, digest, appended[0].seq, appended[0].digest)
+	}
+	if len(scan.frames) != 4 ||
+		scan.frames[0].typ != frameDelegation ||
+		scan.frames[1].typ != frameMutation ||
+		scan.frames[2].typ != frameApplied ||
+		scan.frames[3].typ != frameRelease {
+		t.Fatalf("frame order = %+v, want DELEGATION, MUTATION, APPLIED, RELEASE", scan.frames)
+	}
+}
+
+func TestAppliedCertificatesSelectHighestIndependentOfFrameOrder(t *testing.T) {
+	oldTarget := segmentTargetBytes
+	segmentTargetBytes = 1 << 30
+	t.Cleanup(func() { segmentTargetBytes = oldTarget })
+
+	streamDir := filepath.Join(t.TempDir(), streamDirName(1))
+	var mountID [16]byte
+	copy(mountID[:], "applied-order---")
+	w, err := createStreamWAL(streamDir, mountID, "vol", "main", 1)
+	if err != nil {
+		t.Fatalf("create WAL: %v", err)
+	}
+	first := canonicalPayload(wal.Record{Op: wal.OpCreate, Path: "d/a", Mode: 0o644})
+	second := canonicalPayload(wal.Record{Op: wal.OpCreate, Path: "d/b", Mode: 0o644})
+	appended, err := w.appendMutations([][]byte{first, second})
+	if err != nil {
+		t.Fatalf("append mutations: %v", err)
+	}
+	// A newer authority checkpoint can win the WAL mutex before a release
+	// worker appends the older applied snapshot it captured previously.
+	if err := w.appendControl(frameApplied, appliedFrame{
+		Through: appended[1].seq,
+		Digest:  fmt.Sprintf("%x", appended[1].digest),
+	}); err != nil {
+		t.Fatalf("append newer applied mark: %v", err)
+	}
+	if err := w.appendControl(frameApplied, appliedFrame{
+		Through: appended[0].seq,
+		Digest:  fmt.Sprintf("%x", appended[0].digest),
+	}); err != nil {
+		t.Fatalf("append older applied mark: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("sync out-of-order marks: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+
+	scan, err := scanStream(streamDir)
+	if err != nil {
+		t.Fatalf("scan stream: %v", err)
+	}
+	_, _, marks, _, err := decodeStreamFrames(scan.frames)
+	if err != nil {
+		t.Fatalf("decode stream: %v", err)
+	}
+	through, digest, err := highestAppliedCertificate(marks, scan.lastSeq)
+	if err != nil {
+		t.Fatalf("select highest applied certificate: %v", err)
+	}
+	if through != appended[1].seq || digest != appended[1].digest {
+		t.Fatalf("highest certificate=(%d,%x), want (%d,%x)", through, digest, appended[1].seq, appended[1].digest)
+	}
+	analyzed, err := analyzeAbandonedStream(streamDir, 1, scan, RecoveryJob{})
+	if err != nil {
+		t.Fatalf("force-park analysis rejected valid out-of-order marks: %v", err)
+	}
+	if analyzed.appliedThrough != appended[1].seq {
+		t.Fatalf("force-park applied watermark=%d, want %d", analyzed.appliedThrough, appended[1].seq)
+	}
+
+	conflict := append([]appliedFrame(nil), marks...)
+	conflict = append(conflict, appliedFrame{
+		Through: appended[0].seq,
+		Digest:  fmt.Sprintf("%x", [32]byte{}),
+	})
+	if _, _, err := highestAppliedCertificate(conflict, scan.lastSeq); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("conflicting same-watermark digest error=%v, want ErrCorrupt", err)
 	}
 }

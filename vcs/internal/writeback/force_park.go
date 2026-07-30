@@ -600,17 +600,16 @@ func analyzeAbandonedStream(
 		}
 	}
 	applied := job.AppliedThrough
-	var lastMark uint64
+	markThrough, _, err := highestAppliedCertificate(marks, scan.lastSeq)
+	if err != nil {
+		return stream, err
+	}
 	for _, mark := range marks {
-		if mark.Through < lastMark || mark.Through > scan.lastSeq {
-			return stream, fmt.Errorf("%w: APPLIED watermark is not monotonic within the WAL", ErrCorrupt)
-		}
 		if _, err := digestAt(scan, marks, mark.Through); err != nil {
 			return stream, err
 		}
-		lastMark = mark.Through
-		applied = max(applied, mark.Through)
 	}
+	applied = max(applied, markThrough)
 	if scan.firstSeq > 0 && applied < scan.firstSeq-1 {
 		return stream, fmt.Errorf("%w: applied watermark predates the reclaimed WAL prefix", ErrCorrupt)
 	}
@@ -624,21 +623,38 @@ func analyzeAbandonedStream(
 		if err := json.Unmarshal(fr.payload, &close); err != nil || close.Through > scan.lastSeq {
 			return stream, fmt.Errorf("%w: malformed terminal close frame %d", ErrCorrupt, fr.frameNo)
 		}
-		if i != len(scan.frames)-1 {
-			return stream, fmt.Errorf("%w: stream contains frames after terminal close", ErrCorrupt)
-		}
 		if fr.typ == frameClose {
+			if i != len(scan.frames)-1 {
+				return stream, fmt.Errorf("%w: stream contains frames after clean close", ErrCorrupt)
+			}
 			if close.Through != scan.lastSeq {
 				return stream, fmt.Errorf("%w: clean-close frame does not cover the exact WAL tail", ErrCorrupt)
 			}
 			stream.clean = true
 			return stream, nil
 		}
-		if close.JobID != job.JobID || !validPublicJobID(close.JobID) || job.State != JobForced ||
-			close.Through != job.AppliedThrough || job.AdmittedThrough != scan.lastSeq {
+		if close.JobID != job.JobID || !validPublicJobID(close.JobID) ||
+			close.Through > job.AppliedThrough || job.AdmittedThrough != scan.lastSeq {
 			return stream, fmt.Errorf("%w: forced-close frame and job registry disagree", ErrCorrupt)
 		}
-		stream.alreadyForced = true
+		if i != len(scan.frames)-1 {
+			// Recovery may append only its APPLIED+RELEASE finalization
+			// controls after the original forced-close marker. No later
+			// mutation or delegation installation is a valid writer shape.
+			for _, later := range scan.frames[i+1:] {
+				if later.typ != frameApplied && later.typ != frameRelease && later.typ != frameForcedClose {
+					return stream, fmt.Errorf("%w: invalid frame after historical forced close", ErrCorrupt)
+				}
+			}
+			continue
+		}
+		// A matching final marker means force-park is already durable.
+		// A replaying job can retain an older final marker after advancing
+		// recovery progress; forceParkStream appends a fresh marker for the
+		// new applied watermark.
+		if job.State == JobForced && close.Through == job.AppliedThrough {
+			stream.alreadyForced = true
+		}
 	}
 	return stream, nil
 }

@@ -8,7 +8,8 @@ package fsproto
 // recovers from cold replay with no reclaim grace. Reads (GETLK, watermark
 // queries) answer from the applied (durable) reducer.
 //
-// Exactness model: the request's canonical fingerprint is computed
+// Exactness model: mutations which consume a session slot use the request's
+// canonical fingerprint, computed
 // SERVER-side from the decision record the server would commit; the identity
 // is checked against the durable slot table under the (session, slot) shard
 // lock; a duplicate replays the stored outcome; a changed fingerprint fences
@@ -19,7 +20,11 @@ package fsproto
 // identity has exactly one durable applied outcome. Blocking waits (SETLKW,
 // contended checkout) are VOLATILE, cancelable, and happen BEFORE the
 // identity is consumed: nothing is journaled while waiting, and no
-// per-slice rejection rows are written.
+// per-slice rejection rows are written. Delegation prepare is the deliberate
+// exception: it consumes no slot and releases no ownership. It is an
+// idempotent pre-step scoped to the caller's still-live grant, so a lost reply
+// can re-resolve the same paths while that grant and the client handoff
+// barrier keep their bindings stable; the subsequent checkin remains exact.
 
 import (
 	"crypto/sha256"
@@ -49,6 +54,7 @@ const setlkwWaitBudget = 45 * time.Second
 type CoordinationStore interface {
 	ManagedLockConflict(ino uint64, owner pfc2.LockOwner, start, length uint64, write bool) (pfc2.HeldLock, bool, error)
 	ManagedLockDecide(env *wal.Envelope, ino, kernelLockOwner uint64, op pfc2.LockOp, start, length uint64) (workfs.CoordinationDecision, error)
+	ManagedLockDecideGated(env *wal.Envelope, path string, ino, kernelLockOwner uint64, op pfc2.LockOp, start, length uint64) (workfs.CoordinationDecision, error)
 	ManagedCheckoutDecide(env *wal.Envelope, path string) (workfs.CoordinationDecision, error)
 	ManagedCheckinDecide(env *wal.Envelope, path, epoch string) (workfs.CoordinationDecision, error)
 	ManagedCheckoutAt(path string) (pfc2.CheckoutView, bool, error)
@@ -62,14 +68,45 @@ type CoordinationStore interface {
 
 	// Write-back streams and delegations.
 	ManagedDelegationDecide(env *wal.Envelope, path, writebackID string) (workfs.CoordinationDecision, error)
+	ManagedPrepareDelegationPins(ref pfc2.SessionRef, scope, epoch string, paths []string) ([]uint64, error)
 	ManagedDelegationsOverlapping(path string) []pfc2.CheckoutView
 	ManagedWritebackState(writebackID string) (pfc2.StreamStateView, bool, error)
+	ManagedWritebackConflicts(writebackID string, scopes []workfs.WritebackScope, through uint64, digest [32]byte) ([]workfs.WritebackConflict, error)
 	ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope, through uint64, digest [32]byte) ([]workfs.WritebackConflict, error)
 	ManagedWritebackDiscard(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope) error
 	ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDigest, endDigest [32]byte, rows []workfs.ManagedFlushRow, owner string) (uint64, error)
 
 	SyncBarrier() error
 	WaitCoordinationClear(deadline time.Time, check func() bool) bool
+}
+
+func (s *Server) prepareDelegationRelease(cs *connSession, req *Request) *Response {
+	store := s.coordStore()
+	if store == nil {
+		return &Response{Status: EPERM}
+	}
+	if !cs.attached() || req.Env != nil || req.CheckoutEpoch == "" ||
+		len(req.OpenPaths) == 0 || len(req.OpenPaths) > MaxPrepareOpenPaths {
+		return &Response{Status: EINVAL, Gen: s.gen()}
+	}
+	if !s.admissible(cs.id) {
+		return nil
+	}
+	ref := pfc2.SessionRef{SessionID: cs.id, Generation: cs.gen}
+	inos, err := store.ManagedPrepareDelegationPins(ref, req.Path, req.CheckoutEpoch, req.OpenPaths)
+	switch {
+	case err == nil:
+		return &Response{Status: OK, Gen: s.gen(), OpenInos: inos}
+	case errors.Is(err, workfs.ErrDelegationPrepareNotHeld),
+		errors.Is(err, workfs.ErrPinTargetGone):
+		return &Response{Status: ENOENT, Gen: s.gen()}
+	case errors.Is(err, workfs.ErrControlCapacity):
+		return &Response{Status: EBUSY, Gen: s.gen()}
+	case errors.Is(err, workfs.ErrDurabilityUnknown), errors.Is(err, wal.ErrPoisoned):
+		return nil
+	default:
+		return &Response{Status: toErrno(err), Gen: s.gen()}
+	}
 }
 
 // coordStore returns the managed coordination surface (nil on a server
@@ -293,25 +330,56 @@ func (s *Server) fenceCorrupt(sessionID string, generation uint64) *Response {
 	return &Response{Status: ESTALE}
 }
 
-// coordinateDecide runs ONE identity-classified decision attempt under the
-// shard lock. decide performs the single-reservation observe+journal step.
-func (s *Server) coordinateDecide(env *wal.Envelope, reqHash []byte, decide func(full *wal.Envelope) (workfs.CoordinationDecision, error)) *Response {
-	full := &wal.Envelope{
+func coordinateEnvelope(env *wal.Envelope, reqHash []byte) *wal.Envelope {
+	return &wal.Envelope{
 		SessionID: env.SessionID, Generation: env.Generation,
 		Slot: env.Slot, SlotSeq: env.SlotSeq, ReqHash: reqHash,
 	}
+}
+
+// classifyCoordinateSlotLocked classifies one fully canonical coordination
+// identity. The caller holds its per-slot lock. fresh is true only when no
+// durable outcome occupies this identity and the caller may proceed to the
+// single observe+journal decision.
+func (s *Server) classifyCoordinateSlotLocked(full *wal.Envelope) (resp *Response, fresh bool) {
+	switch res, outcome := s.exact.store.CheckSlot(full); res {
+	case workfs.SlotNew:
+		return nil, true
+	case workfs.SlotDuplicate:
+		return duplicateResponse(outcome, s.gen()), false
+	case workfs.SlotRetired:
+		return &Response{Status: EIO, Gen: s.gen()}, false
+	case workfs.SlotConflict, workfs.SlotGap:
+		return s.fenceCorrupt(full.SessionID, full.Generation), false
+	case workfs.SlotUnknownSession:
+		return &Response{Status: ESTALE}, false
+	default:
+		return s.fenceCorrupt(full.SessionID, full.Generation), false
+	}
+}
+
+// classifyCoordinateSlot performs a read-only exact-slot classification. It
+// exists for operations with a volatile pre-decision wait: duplicates and
+// proven corruption return before that wait, while a fresh identity releases
+// the shard lock, waits without consuming anything, then re-enters
+// coordinateDecide for the authoritative locked recheck and decision.
+func (s *Server) classifyCoordinateSlot(env *wal.Envelope, reqHash []byte) (resp *Response, fresh bool) {
+	full := coordinateEnvelope(env, reqHash)
 	lk := s.exact.slotLock(env.SessionID, env.Slot)
 	lk.Lock()
 	defer lk.Unlock()
-	switch res, outcome := s.exact.store.CheckSlot(full); res {
-	case workfs.SlotDuplicate:
-		return duplicateResponse(outcome, s.gen())
-	case workfs.SlotRetired:
-		return &Response{Status: EIO, Gen: s.gen()}
-	case workfs.SlotConflict, workfs.SlotGap:
-		return s.fenceCorrupt(env.SessionID, env.Generation)
-	case workfs.SlotUnknownSession:
-		return &Response{Status: ESTALE}
+	return s.classifyCoordinateSlotLocked(full)
+}
+
+// coordinateDecide runs ONE identity-classified decision attempt under the
+// shard lock. decide performs the single-reservation observe+journal step.
+func (s *Server) coordinateDecide(env *wal.Envelope, reqHash []byte, decide func(full *wal.Envelope) (workfs.CoordinationDecision, error)) *Response {
+	full := coordinateEnvelope(env, reqHash)
+	lk := s.exact.slotLock(env.SessionID, env.Slot)
+	lk.Lock()
+	defer lk.Unlock()
+	if resp, fresh := s.classifyCoordinateSlotLocked(full); !fresh {
+		return resp
 	}
 	decision, err := decide(full)
 	switch {
@@ -352,6 +420,15 @@ func (s *Server) coordinateLock(cs *connSession, store CoordinationStore, req *R
 		return &Response{Status: ESTALE}
 	}
 	if req.LkMode == LkSetlkw && op != pfc2.LockUnlock {
+		// Exact replays are answered before any volatile work. A first
+		// classification under the slot lock is read-only: a fresh identity
+		// releases the lock and waits without consuming anything; the final
+		// coordinateDecide call reacquires the lock and rechecks before making
+		// the one durable decision. This second check is required because
+		// another connection may resolve the identity while this one waits.
+		if resp, fresh := s.classifyCoordinateSlot(env, reqHash); !fresh {
+			return resp
+		}
 		// VOLATILE, cancelable wait BEFORE the identity is consumed: nothing
 		// is journaled while waiting (no rejection slices), and a conflicting
 		// live holder is never force-revoked. On budget expiry the single
@@ -366,7 +443,20 @@ func (s *Server) coordinateLock(cs *connSession, store CoordinationStore, req *R
 		})
 	}
 	return s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
-		return store.ManagedLockDecide(full, ino, req.LkID, op, start, length)
+		if op != pfc2.LockUnlock {
+			// Lock acquisitions are peer accesses to delegated state. Gate only
+			// after exactCoordinate authenticated the attached envelope and
+			// coordinateDecide classified this identity as SlotNew. This avoids
+			// recall publication by forged/stale envelopes and lets duplicate
+			// replays return without re-running a volatile wait.
+			if st := s.delegationGate(cs, true, req.Path); st != OK {
+				if err := store.ManagedRecordCoordinationOutcome(full, reqHash, st); err != nil {
+					return workfs.CoordinationDecision{}, err
+				}
+				return workfs.CoordinationDecision{Status: st}, nil
+			}
+		}
+		return store.ManagedLockDecideGated(full, req.Path, ino, req.LkID, op, start, length)
 	})
 }
 
@@ -839,6 +929,15 @@ func (s *Server) coordinateWritebackRebind(store CoordinationStore, req *Request
 		return workfs.CoordinationDecision{}, nil
 	})
 	if resp != nil {
+		if resp.Duplicate && resp.Status == EIO && len(conflicts) == 0 {
+			var err error
+			conflicts, err = store.ManagedWritebackConflicts(
+				req.SessionID, scopes, req.WBThrough, digest,
+			)
+			if err != nil {
+				return nil
+			}
+		}
 		for _, c := range conflicts {
 			resp.WBConflicts = append(resp.WBConflicts, WBConflict{Path: c.Path, Epoch: c.Epoch, Kind: c.Kind})
 		}

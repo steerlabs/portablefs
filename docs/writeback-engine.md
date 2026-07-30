@@ -105,15 +105,41 @@ vcs/internal/writeback/
   covering delegation first, then execute on the shared lane
   (`Engine.ReleaseFor`). Xattrs on locally-born objects remain in the
   delegated WAL when the authority advertised `FeatureDelegatedXattrs`;
-  v7 authorities without the delegated-xattr feature select the shared xattr
+  v8 authorities without the delegated-xattr feature select the shared xattr
   lane from the version probe, before any mutation is attempted. Server-side, a same-session
   write-through mutation does not bypass the peer gate — it recalls the
   holder's own grant — which is what makes the grant-time children snapshot
   exact against same-session races.
-- Open handles under a releasing scope gain authority-durable open pins
-  BEFORE the durable release (post-drain), so a peer unlink after the release
-  parks the inode (open-after-unlink) instead of destroying it; the pin is
-  owned by the handle and retires on its last close.
+- Open handles use a two-phase release handoff. The mount first installs a
+  subtree-scoped barrier: existing closes remain live, while new opens and
+  namespace rebindings in that subtree wait. It then sends batches of at most
+  127 canonical open paths to `OpDelegationPrepareRelease`. While the exact
+  `(scope, checkout epoch)` grant is still held, the authority resolves the
+  batch under one reservation and durably adds any missing session open pins
+  in one PFJ3 row. The aligned inode vector is adopted locally with the exact
+  live-handle refcounts.
+- Delegation prepare consumes no exact-session slot and never releases
+  ownership. It is idempotent under the still-live grant: a lost reply can
+  re-resolve the same barrier-frozen path bindings, and an already-held pin is
+  a no-op. After every prepared identity is installed, the replay-exact
+  client writes an `APPLIED` watermark/digest certificate immediately followed
+  by `RELEASE` in one WAL append and one sync, then sends `Checkin`. That
+  ordering is the crash contract, not an optimistic acknowledgement: the scope
+  is already fully drained and barred, so recovery may safely sweep a grant
+  when Checkin was never committed. If Checkin committed, its reply was lost,
+  and session terminalization already removed the authority stream ledger, the
+  local certificate still proves the exact drained prefix and recovery needs
+  no rebind. The barrier remains installed through the authority decision, then
+  wakes queued opens into shared mode. Failures leave the in-process grant held
+  and draining; idle cleanup never reopens delegated admission after this
+  locally-final boundary.
+
+  Attach-time recovery uses the same boundary after replaying a parked tail:
+  one APPLIED certificate followed by RELEASE for every rebound scope is
+  appended and synced before the first Checkin. A crash between mixed-scope
+  Checkins therefore resumes from an empty local live-scope projection and
+  sweeps only the authority grants that remain; it never rebinds a scope whose
+  Checkin already committed.
 
 ## Client WAL
 
@@ -165,7 +191,7 @@ Hard bounds, no spill: a mutation that would grow a directory view past
 delegation, and runs write-through; `MergeReaddir` never claims completeness
 for an oversize listing. Overlay memory is bounded by construction.
 
-## Authority side (fsproto v7 + workfs + pfc2)
+## Authority side (fsproto v8 + workfs + pfc2)
 
 - `OpDelegationAcquire`: exact-identity op whose outcome is RESOLVED — a
   sent-but-unanswered request replays the identical identity until the stored

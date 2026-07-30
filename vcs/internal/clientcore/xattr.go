@@ -11,7 +11,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
-// Extended attributes (baseline in fsproto v7).
+// Extended attributes (baseline in fsproto v8).
 //
 // Coherence/durability model (documented in docs/consistency-model.md):
 //

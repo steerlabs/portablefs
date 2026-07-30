@@ -41,44 +41,46 @@ var (
 // benchmark harness (vcs/bench) uses these to attribute where a workload's
 // round-trips go; keep names stable once published.
 var opNames = map[Op]string{
-	OpGetattr:           "getattr",
-	OpReaddir:           "readdir",
-	OpRead:              "read",
-	OpWrite:             "write",
-	OpCreate:            "create",
-	OpMkdir:             "mkdir",
-	OpRemove:            "remove",
-	OpRename:            "rename",
-	OpSymlink:           "symlink",
-	OpReadlink:          "readlink",
-	OpTruncate:          "truncate",
-	OpFsync:             "fsync",
-	OpSubscribe:         "subscribe",
-	OpSetattr:           "setattr",
-	OpCheckout:          "checkout",
-	OpCheckin:           "checkin",
-	OpFlushBatch:        "flush_batch",
-	OpLock:              "lock",
-	OpOrphan:            "orphan",
-	OpReap:              "reap",
-	OpRenewOrphanLeases: "renew_orphan_leases",
-	OpMarkOpen:          "mark_open",
-	OpRenewOpenInodes:   "renew_open_inodes",
-	OpUnmarkOpenInodes:  "unmark_open_inodes",
-	OpGetxattr:          "getxattr",
-	OpSetxattr:          "setxattr",
-	OpListxattr:         "listxattr",
-	OpRemovexattr:       "removexattr",
-	OpLink:              "link",
-	OpDelegationAcquire: "delegation_acquire",
-	OpWritebackState:    "writeback_state",
-	OpWritebackRebind:   "writeback_rebind",
-	OpWritebackDiscard:  "writeback_discard",
-	OpProtocolVersion:   "protocol_version",
-	OpSessionOpen:       "session_open",
-	OpSessionResume:     "session_resume",
-	OpSessionAttach:     "session_attach",
-	OpSessionExpire:     "session_expire",
+	OpGetattr:                  "getattr",
+	OpReaddir:                  "readdir",
+	OpRead:                     "read",
+	OpWrite:                    "write",
+	OpCreate:                   "create",
+	OpMkdir:                    "mkdir",
+	OpRemove:                   "remove",
+	OpRename:                   "rename",
+	OpSymlink:                  "symlink",
+	OpReadlink:                 "readlink",
+	OpTruncate:                 "truncate",
+	OpFsync:                    "fsync",
+	OpSubscribe:                "subscribe",
+	OpSetattr:                  "setattr",
+	OpCheckout:                 "checkout",
+	OpCheckin:                  "checkin",
+	OpFlushBatch:               "flush_batch",
+	OpLock:                     "lock",
+	OpOrphan:                   "orphan",
+	OpReap:                     "reap",
+	OpRenewOrphanLeases:        "renew_orphan_leases",
+	OpMarkOpen:                 "mark_open",
+	OpRenewOpenInodes:          "renew_open_inodes",
+	OpUnmarkOpenInodes:         "unmark_open_inodes",
+	OpGetxattr:                 "getxattr",
+	OpSetxattr:                 "setxattr",
+	OpListxattr:                "listxattr",
+	OpRemovexattr:              "removexattr",
+	OpLink:                     "link",
+	OpDelegationAcquire:        "delegation_acquire",
+	OpWritebackState:           "writeback_state",
+	OpWritebackRebind:          "writeback_rebind",
+	OpWritebackDiscard:         "writeback_discard",
+	OpInvalidationAck:          "invalidation_ack",
+	OpDelegationPrepareRelease: "delegation_prepare_release",
+	OpProtocolVersion:          "protocol_version",
+	OpSessionOpen:              "session_open",
+	OpSessionResume:            "session_resume",
+	OpSessionAttach:            "session_attach",
+	OpSessionExpire:            "session_expire",
 }
 
 // opCounters gives every op its own counter (vcs_fsproto_op_<name>) so a metrics
@@ -119,6 +121,9 @@ type Server struct {
 	// beforeFlushBatch is a test seam used to stall OpFlushBatch for fsync/barrier tests.
 	// Nil in production.
 	beforeFlushBatch func()
+	// beforeDelegationPrepare is a test seam used to stall the open-path pin
+	// phase while proving frontend closes remain live. Nil in production.
+	beforeDelegationPrepare func()
 	// dropReply is a test seam simulating a LOST RESPONSE: the request is
 	// fully applied, but when dropReply returns true the connection is
 	// dropped instead of replying — exactly the failure the exact-once replay
@@ -166,6 +171,8 @@ func (ss *subscriberState) observedLocked() uint64 {
 
 // SetBeforeFlushBatch installs a test hook that runs immediately before an OpFlushBatch is applied.
 func (s *Server) SetBeforeFlushBatch(fn func()) { s.beforeFlushBatch = fn }
+
+func (s *Server) SetBeforeDelegationPrepare(fn func()) { s.beforeDelegationPrepare = fn }
 
 // SetDropReply installs a test hook that, when it returns true for an applied
 // request, drops the connection WITHOUT sending the response (a lost reply).
@@ -827,21 +834,19 @@ func (s *Server) dispatchConn(cs *connSession, req *Request) *Response {
 			if req.Env == nil {
 				return &Response{Status: EPERM} // journaled exact identity required
 			}
-			if !req.LkUnlock {
-				// A lock acquisition on a delegated object waits for recall
-				// like any peer access (releases always pass — they only
-				// shrink held state). The holder's own locks pass: locks are
-				// durable coordination state, not tree mutations.
-				if st := s.delegationGate(cs, true, req.Path); st != OK {
-					return &Response{Status: st}
-				}
-			}
 			return s.exactCoordinate(cs, req)
 		case OpDelegationAcquire, OpWritebackRebind, OpWritebackDiscard:
 			if req.Env == nil {
 				return &Response{Status: EPERM}
 			}
 			return s.exactCoordinate(cs, req)
+		case OpDelegationPrepareRelease:
+			// Idempotent two-phase handoff: pins are durable while the exact
+			// delegation remains held; only the later Checkin releases it.
+			if s.beforeDelegationPrepare != nil {
+				s.beforeDelegationPrepare()
+			}
+			return s.prepareDelegationRelease(cs, req)
 		case OpWritebackState:
 			return s.writebackStateRead(req)
 		case OpCheckout, OpCheckin, OpMarkOpen:
@@ -913,21 +918,10 @@ func (s *Server) dispatchConn(cs *connSession, req *Request) *Response {
 		if !mutatingOp(req.Op) && req.Op != OpReap {
 			return &Response{Status: EINVAL} // envelope on a non-mutating op
 		}
-		if mutatingOp(req.Op) && (req.Path != "" || req.NewPath != "") {
-			// A write-through mutation overlapping ANY delegation — foreign
-			// OR the caller's own — waits for recall BEFORE any identity is
-			// consumed: it must order after the holder's acknowledged
-			// (drained, released) state. No same-session bypass here: that
-			// is what makes the grant snapshot exact and keeps every
-			// mutation inside a held scope on exactly one lane.
-			if st := s.delegationGate(cs, false, req.Path, req.NewPath); st != OK {
-				return &Response{Status: st}
-			}
-		}
 		return s.registerCreateOpen(cs, req, s.exactMutate(cs, req))
 	}
 	if mutatingOp(req.Op) || req.Op == OpReap {
-		// Envelope-less mutations do not exist in the v7 baseline: every
+		// Envelope-less mutations do not exist in the v8 baseline: every
 		// mutation carries an exact-once identity. An old client that
 		// ignored the probe's version refusal fails closed here.
 		return &Response{Status: EPERM}

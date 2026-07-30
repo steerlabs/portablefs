@@ -9,9 +9,10 @@ import (
 )
 
 // Remote is the authority surface the engine drives. Every method rides
-// fsproto v7 exact envelopes in production and is context-aware: the engine
-// bounds each attempt and cancels in-flight work on force-close, so a late
-// reply can never act against a closed WAL.
+// fsproto v8 coordination in production and accepts the engine lifetime
+// context. Exact release resolves a sent identity to a durable outcome;
+// forced teardown locally aborts the protocol client, then joins the engine's
+// release workers before closing the WAL.
 type Remote interface {
 	// DelegationAcquire asks the authority to delegate scope to this mount's
 	// stream. The authority applies the adaptive policy and either grants
@@ -34,6 +35,13 @@ type Remote interface {
 	// in the same transaction.
 	Flush(ctx context.Context, req FlushRequest) (FlushReply, error)
 
+	// FlushResolved is the recovery-only flush surface. Once a request may
+	// have reached the authority, it must keep resolving the identical
+	// idempotent batch until its outcome is known or the recovery session is
+	// terminalized. Unlike the live flusher, recovery may not leave an
+	// authority mutation running after Open releases the store lock.
+	FlushResolved(ctx context.Context, req FlushRequest) (FlushReply, error)
+
 	// StreamState reads the stream's durable watermark and digest.
 	StreamState(ctx context.Context, writebackID string) (StreamState, error)
 
@@ -43,7 +51,8 @@ type Remote interface {
 	Rebind(ctx context.Context, writebackID string, scopes []RebindScope, through uint64, digest [32]byte) (RebindReply, error)
 
 	// Discard releases the stream's recovery scopes as an audited data-loss
-	// decision.
+	// decision. It has the same resolved-until-terminal contract as Rebind and
+	// FlushResolved.
 	Discard(ctx context.Context, writebackID string, scopes []RebindScope) error
 }
 

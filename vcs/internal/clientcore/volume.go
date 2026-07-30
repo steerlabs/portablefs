@@ -85,11 +85,6 @@ type PrefetchProgress struct {
 	Err     string
 }
 
-type releasePin struct {
-	ino  uint64
-	path string
-}
-
 // Volume is the shared PortableFS client brain: protocol client, versioned metadata cache,
 // optional write-back sessions, credential renewal, prefetch, and flush barriers. It deliberately
 // has no go-fuse types; kernel frontends translate their native op shapes into these methods.
@@ -135,16 +130,18 @@ type Volume struct {
 	// write-through lane while ordinary files retain full write-back speed.
 	hardlinks *hardlinkAliases
 	openReg   *openRegistry
+	// openStateMu publishes tracker paths and registry paths as one local
+	// namespace transition. It is never held across authority I/O; closes
+	// remain responsive during delegation preparation.
+	openStateMu sync.Mutex
+	// prepareDelegationRelease is the authority two-phase handoff surface.
+	// It is a field so failure-shape tests can inject a definite prepare
+	// failure without weakening the production protocol.
+	prepareDelegationRelease func(scope, epoch string, paths []string) ([]uint64, uint64, error)
 
 	// lockReg tracks the live advisory-lock handles so a post-failover
 	lockRegMu sync.Mutex
 	lockReg   map[*LockHandle]struct{}
-
-	// releasePins records the extra authority ref acquired when a delegated
-	// open handle becomes shared. Ownership is NodeState-stable so a rename
-	// cannot strand the pin under its old path.
-	releasePinMu sync.Mutex
-	releasePins  map[openOwner]releasePin
 
 	negativeCache bool
 	noReaddirPlus bool
@@ -269,7 +266,6 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		openFiles:     NewInodeSet(),
 		hardlinks:     newHardlinkAliases(),
 		lockReg:       map[*LockHandle]struct{}{},
-		releasePins:   map[openOwner]releasePin{},
 		noReaddirPlus: opts.NoReaddirPlus,
 		attrTTL:       opts.AttrTTL,
 		sessionTTL:    opts.SessionTTL,
@@ -297,7 +293,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		v.DiskCache = dc
 	}
 	// Exact mount session: establish at mount. The handshake requires the
-	// v7 protocol exactly — an older authority fails the mount with a clear
+	// v8 protocol exactly — an older authority fails the mount with a clear
 	// version-mismatch error. A fenced identity at establish
 	// (ErrSessionFenced) is surfaced by the first mutation instead of
 	// failing the mount: reads are still valid.
@@ -309,13 +305,14 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		cancel()
 		return nil, err
 	}
-	// Version-gated negative caching is part of the v7 baseline (the
+	// Version-gated negative caching is part of the v8 baseline (the
 	// authority stamps every lookup miss with the parent directory version);
 	// the explicit off switch remains as the only override.
 	v.negativeCache = !opts.NoNegativeCache
 	v.openReg = newOpenRegistry(cli, v.VersionCache.CurrentGen, v.openFiles,
 		opts.OpenRetentionEntries, opts.Debugf)
-	// The write-back engine is part of every v7 mount: the authority decides
+	v.prepareDelegationRelease = cli.PrepareDelegationRelease
+	// The write-back engine is part of every v8 mount: the authority decides
 	// adaptively per scope whether to delegate; there is no mount-level
 	// write mode. PORTABLEFS_DEBUG_WRITE_THROUGH=1 is the only override
 	// (debug: never delegate; the engine still recovers parked streams).
@@ -334,7 +331,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		return nil, err
 	}
 	budget := opts.DiskCacheBytes / 2
-	wb, werr := writeback.Open(cctx, writeback.Config{
+	wb, werr := openWritebackForAttach(cctx, cli, writeback.Config{
 		StateDir:               walDir,
 		VolumeID:               v.volumeID,
 		Branch:                 opts.Branch,
@@ -343,7 +340,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		DisableDelegation:      os.Getenv("PORTABLEFS_DEBUG_WRITE_THROUGH") == "1",
 		DisableDelegatedXattrs: cli.Features()&fsproto.FeatureDelegatedXattrs == 0,
 		Busy:                   v.opens.BusyUnder,
-		EnsureOpenPins:         v.ensureOpenPins,
+		ProtectOpenPins:        v.protectOpenPins,
 		Logf:                   opts.Debugf,
 		Events: writeback.Events{
 			OnGrant: func(scope string) {
@@ -393,13 +390,49 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	return v, nil
 }
 
+// openWritebackForAttach binds ONLY the attach-readiness window to terminal
+// protocol teardown. Recovery ownership moves are resolved synchronously while
+// writeback.Open holds the store flock; if the attach context ends, Abort
+// interrupts and joins those calls before Open can return and release the
+// lock. Once Open succeeds the watcher is joined and disappears, so ordinary
+// Volume lifetime cancellation retains its existing shutdown semantics.
+func openWritebackForAttach(ctx context.Context, cli *fsproto.Client, cfg writeback.Config) (*writeback.Engine, error) {
+	openDone := make(chan struct{})
+	abortDone := make(chan bool, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = cli.Abort()
+			abortDone <- true
+		case <-openDone:
+			abortDone <- false
+		}
+	}()
+
+	wb, openErr := writeback.Open(ctx, cfg)
+	close(openDone)
+	aborted := <-abortDone // join the watcher (and Abort, when selected)
+	if aborted || ctx.Err() != nil {
+		// If Open won the race with cancellation, make the same terminal
+		// transition here. Abort is idempotent and joins protocol operations.
+		abortErr := cli.Abort()
+		var closeErr error
+		if wb != nil {
+			_, closeErr = wb.ForceClose("attach canceled after recovery")
+		}
+		return nil, errors.Join(ctx.Err(), openErr, abortErr, closeErr)
+	}
+	return wb, openErr
+}
+
 // wbRemote adapts *fsproto.Client to writeback.Remote: delegation
 // acquisition, stream flushes, and recovery all ride the journaled
-// coordination surface under exact identities. ctxCall makes each method
-// context-aware: cancellation returns promptly to the engine while the
-// underlying exact machinery keeps resolving the identity (a canceled wait
-// is a lost reply, which the exact protocol already handles — it is never
-// reinterpreted as a definite outcome).
+// coordination surface under exact identities. Read-like operations use
+// ctxCall so their callers can stop waiting while the exact machinery
+// resolves a lost reply in the background. Ownership transitions are
+// different: ReleaseDelegation and Rebind do not return after they have
+// started until their exact outcome is known. That keeps the engine's
+// handoff barrier and recovery store lock installed for the whole transition.
 type wbRemote struct{ cli *fsproto.Client }
 
 func ctxCall[T any](ctx context.Context, fn func() (T, error)) (T, error) {
@@ -443,10 +476,17 @@ func (r wbRemote) DelegationAcquire(ctx context.Context, scope, writebackID stri
 }
 
 func (r wbRemote) ReleaseDelegation(ctx context.Context, scope, epoch string) error {
-	_, err := ctxCall(ctx, func() (struct{}, error) {
-		return struct{}{}, r.cli.CheckinManaged(scope, epoch)
-	})
-	return err
+	// Once release begins, the handoff barrier must remain installed until
+	// the exact Checkin reaches a definite durable outcome. Returning on
+	// ctx cancellation while Checkin continues in a background goroutine
+	// would let the engine drop the barrier before ownership actually
+	// changes. CheckinManaged is itself bounded per transport attempt and
+	// replay-resolves the same exact identity until success, refusal, fence,
+	// or client teardown.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.cli.CheckinManaged(scope, epoch)
 }
 
 func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
@@ -463,6 +503,21 @@ func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeb
 	})
 }
 
+func (r wbRemote) FlushResolved(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
+	if err := ctx.Err(); err != nil {
+		return writeback.FlushReply{}, err
+	}
+	scopes := make([]fsproto.WBScope, 0, len(req.ScopeRuns))
+	for _, run := range req.ScopeRuns {
+		scopes = append(scopes, fsproto.WBScope{Path: run.Scope, Epoch: run.Epoch, Through: run.Through})
+	}
+	through, status, err := r.cli.FlushWritebackResolved(req.WritebackID, scopes, req.PrevDigest, req.EndDigest, req.Records)
+	if err != nil {
+		return writeback.FlushReply{}, err
+	}
+	return writeback.FlushReply{Through: through, Status: status}, nil
+}
+
 func (r wbRemote) StreamState(ctx context.Context, writebackID string) (writeback.StreamState, error) {
 	return ctxCall(ctx, func() (writeback.StreamState, error) {
 		exists, through, digest, err := r.cli.WritebackState(writebackID)
@@ -474,32 +529,40 @@ func (r wbRemote) StreamState(ctx context.Context, writebackID string) (writebac
 }
 
 func (r wbRemote) Rebind(ctx context.Context, writebackID string, scopes []writeback.RebindScope, through uint64, digest [32]byte) (writeback.RebindReply, error) {
-	return ctxCall(ctx, func() (writeback.RebindReply, error) {
-		wire := make([]fsproto.WBScope, 0, len(scopes))
-		for _, sc := range scopes {
-			wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
-		}
-		conflicts, err := r.cli.WritebackRebind(writebackID, wire, through, digest)
-		if err != nil {
-			return writeback.RebindReply{}, err
-		}
-		reply := writeback.RebindReply{}
-		for _, c := range conflicts {
-			reply.Conflicts = append(reply.Conflicts, writeback.ConflictDetail{Scope: c.Path, Epoch: c.Epoch, Kind: c.Kind})
-		}
-		return reply, nil
-	})
+	// Rebind is an exact ownership move. Once sent, returning on ctx
+	// cancellation would release the recovery store lock while the move was
+	// still resolving, allowing another attach to overlap the same stream.
+	// The fsproto client bounds individual transports and resolves retries
+	// under one exact identity; Client.Abort is the terminal interruption.
+	if err := ctx.Err(); err != nil {
+		return writeback.RebindReply{}, err
+	}
+	wire := make([]fsproto.WBScope, 0, len(scopes))
+	for _, sc := range scopes {
+		wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
+	}
+	conflicts, err := r.cli.WritebackRebind(writebackID, wire, through, digest)
+	if err != nil {
+		return writeback.RebindReply{}, err
+	}
+	reply := writeback.RebindReply{}
+	for _, c := range conflicts {
+		reply.Conflicts = append(reply.Conflicts, writeback.ConflictDetail{Scope: c.Path, Epoch: c.Epoch, Kind: c.Kind})
+	}
+	return reply, nil
 }
 
 func (r wbRemote) Discard(ctx context.Context, writebackID string, scopes []writeback.RebindScope) error {
-	_, err := ctxCall(ctx, func() (struct{}, error) {
-		wire := make([]fsproto.WBScope, 0, len(scopes))
-		for _, sc := range scopes {
-			wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
-		}
-		return struct{}{}, r.cli.WritebackDiscard(writebackID, wire)
-	})
-	return err
+	// Recovery may remove the local stream immediately after this returns, so
+	// a possibly-sent discard must resolve while Open still owns the flock.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	wire := make([]fsproto.WBScope, 0, len(scopes))
+	for _, sc := range scopes {
+		wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
+	}
+	return r.cli.WritebackDiscard(writebackID, wire)
 }
 
 // entryFromAttr converts a wire attr to the engine's entry shape.
@@ -776,67 +839,117 @@ func (v *Volume) SetAuthToken(tok string) { v.client.SetAuthToken(tok) }
 // source-configured volume to a stale static token.
 func (v *Volume) RenewCredential(tok string) { v.SetAuthToken(tok) }
 
-// ensureOpenPins establishes an authority-durable open pin for every open
-// handle under scope, called by the engine AFTER the drain and BEFORE the
-// durable delegation release: once the scope leaves delegated mode, a peer
-// unlink must PARK any inode this mount still holds open (open-after-unlink),
-// never destroy it. Locally-born files gained their authority identity when
-// the drain applied their creates; the pin rides the standard registration
-// machinery (retained hold, renewal, name-change release), so the orphan
-// redirect and reap flows stay exactly the shared-mode ones.
-func (v *Volume) ensureOpenPins(ctx context.Context, scope string) error {
-	return v.opens.ForEachUnder(scope, func(owner openOwner, path string, node *NodeState) error {
+// protectOpenPins establishes an authority-durable open pin for every open
+// handle under scope and returns the subtree handoff barrier the engine must
+// retain THROUGH its durable delegation release. The tracker mutex is never
+// held across authority I/O: closes stay responsive, while new opens and
+// path rebindings in this subtree wait for the ownership transition.
+func (v *Volume) protectOpenPins(ctx context.Context, scope, epoch string) (func(bool), error) {
+	guard, err := v.opens.BeginRelease(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (func(bool), error) {
+		guard.End(false)
+		return nil, err
+	}
+	var pending []trackedOpenSnapshot
+	for _, snapshot := range guard.Snapshots() {
 		if err := ctx.Err(); err != nil {
-			return err
+			return fail(err)
 		}
+		node := snapshot.node
 		if node != nil && node.Orphan() != 0 {
-			return nil // no longer a named handle in the delegated namespace
+			continue // no longer a named handle in the delegated namespace
 		}
-		a, _, _, _, st, err := v.client.GetattrV(path)
-		if err != nil {
-			return fmt.Errorf("clientcore: open pin for %q: %w", path, err)
+		if !guard.NeedsPreparedPin(snapshot) {
+			continue // every live handle is already represented by a pin
 		}
-		if st != fsproto.OK {
-			return fmt.Errorf("clientcore: open pin for %q: getattr status %d", path, st)
-		}
-		if a.Ino == 0 {
-			return fmt.Errorf("clientcore: open pin for %q: authority returned inode 0", path)
-		}
-		if st := v.openReg.Open(path, a.Ino); st != fsproto.OK {
-			return fmt.Errorf("clientcore: open pin for %q inode %d: mark-open status %d", path, a.Ino, st)
-		}
-		if !node.RecordAuthorityIno(a.Ino) {
-			// Return the ref acquired above before failing the release. A
-			// changed inode means the open handle's binding cannot be proven;
-			// releasing the delegation would make orphan routing ambiguous.
-			v.openReg.Close(path, a.Ino, false)
-			return fmt.Errorf("clientcore: open pin for %q changed authority inode to %d", path, a.Ino)
-		}
+		pending = append(pending, snapshot)
+	}
 
-		// The open HANDLE owns this refcount: the last close of the path
-		// returns it (CloseHandle), so a peer unlink in between parks the
-		// inode (the pin holds it against the reap sweep) and the live
-		// handle redirects through the orphan protocol — exactly the
-		// shared-mode open-after-unlink flow.
-		v.releasePinMu.Lock()
-		pin, dup := v.releasePins[owner]
-		if dup {
-			if pin.ino == a.Ino {
-				pin.path = path
-				v.releasePins[owner] = pin
+	type prepareReply struct {
+		inos []uint64
+		gen  uint64
+	}
+	activeInos := map[uint64]bool{}
+	var preparedInos []uint64
+	preparedGen := map[uint64]uint64{}
+	cleanupPrepared := func() {
+		for _, ino := range preparedInos {
+			if !activeInos[ino] {
+				v.openReg.RetirePreparedPin(ino, preparedGen[ino])
 			}
-			// Already pinned by an earlier release cycle: return the extra ref.
-			v.releasePinMu.Unlock()
-			v.openReg.Close(path, a.Ino, false)
-			if pin.ino != a.Ino {
-				return fmt.Errorf("clientcore: open pin for %q changed inode from %d to %d", path, pin.ino, a.Ino)
-			}
-			return nil
 		}
-		v.releasePins[owner] = releasePin{ino: a.Ino, path: path}
-		v.releasePinMu.Unlock()
-		return nil
-	})
+	}
+	cleanupDone := false
+	defer func() {
+		if !cleanupDone {
+			cleanupPrepared()
+		}
+	}()
+	for start := 0; start < len(pending); start += fsproto.MaxPrepareOpenPaths {
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		end := start + fsproto.MaxPrepareOpenPaths
+		if end > len(pending) {
+			end = len(pending)
+		}
+		chunk := pending[start:end]
+		paths := make([]string, len(chunk))
+		for i := range chunk {
+			paths[i] = chunk[i].path
+		}
+		// Do not abandon an in-flight prepare at context cancellation. A
+		// prepared pin has durable side effects but no exact slot outcome;
+		// keeping this barrier until the bounded RPC finishes prevents local
+		// namespace rebindings from racing a late server decision.
+		inos, gen, err := v.prepareDelegationRelease(scope, epoch, paths)
+		reply := prepareReply{inos: inos, gen: gen}
+		if err != nil {
+			return fail(fmt.Errorf("clientcore: prepare delegation release %q: %w", scope, err))
+		}
+		if reply.gen == 0 || len(reply.inos) != len(chunk) {
+			return fail(fmt.Errorf("clientcore: invalid prepare delegation release reply for %q", scope))
+		}
+		preparedInos = append(preparedInos, reply.inos...)
+		for i, ino := range reply.inos {
+			preparedGen[ino] = reply.gen
+			active, err := guard.AdoptPreparedPin(
+				chunk[i],
+				ino,
+				reply.gen,
+				v.openReg.AdoptPreparedRefs,
+			)
+			if err != nil {
+				return fail(err)
+			}
+			if active {
+				activeInos[ino] = true
+				continue
+			}
+			// The handle may have closed while the prepare RPC was in
+			// flight. The prepare still proved the exact authority identity
+			// of this frozen namespace binding. Publish that identity before
+			// retiring its pin so the name mutation waiting behind this
+			// handoff can synchronously order the final unmark before its
+			// park-vs-destroy decision.
+			if chunk[i].node != nil && !chunk[i].node.RecordAuthorityIno(ino) {
+				return fail(fmt.Errorf(
+					"clientcore: prepared closed open for %q could not bind inode %d",
+					chunk[i].path,
+					ino,
+				))
+			}
+		}
+	}
+	cleanupPrepared()
+	cleanupDone = true
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	return guard.End, nil
 }
 
 // FlushToAuthority waits until the engine's acknowledged stream tail has
@@ -1002,20 +1115,23 @@ func (v *Volume) CloseJournalDurable() (string, error) {
 	}
 
 	v.cancel()
+	// Forced teardown is crash-equivalent: close local transports without
+	// SessionExpire so the authority lease retains recovery ownership. This
+	// also resolves any checked-out protocol call before the engine joins
+	// its release workers and closes the WAL.
+	closeErr := v.client.Abort()
 	v.wg.Wait()
 	jobID := ""
-	var closeErr error
 	if v.wb != nil {
 		id, err := v.wb.ForceClose("forced unmount")
 		jobID = id
-		closeErr = err
+		if closeErr == nil {
+			closeErr = err
+		}
 	}
 	// Deliberately NO openReg.Shutdown here: journal-first means no authority
 	// round-trips anywhere on the path; open registrations are reclaimed by the
 	// authority's lease sweeper, exactly as after a crash.
-	if err := v.client.Close(); closeErr == nil {
-		closeErr = err
-	}
 	v.forceCloseDone = true
 	v.forceCloseJobID = jobID
 	v.forceCloseErr = closeErr

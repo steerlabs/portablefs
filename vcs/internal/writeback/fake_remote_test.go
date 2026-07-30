@@ -329,6 +329,10 @@ func moveKeyStr(m map[string]string, from, to string) {
 	}
 }
 
+func (a *fakeAuthority) FlushResolved(ctx context.Context, req FlushRequest) (FlushReply, error) {
+	return a.Flush(ctx, req)
+}
+
 func (a *fakeAuthority) StreamState(_ context.Context, writebackID string) (StreamState, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

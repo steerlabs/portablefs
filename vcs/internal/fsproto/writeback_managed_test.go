@@ -10,7 +10,7 @@ import (
 
 // serveManagedAuthority starts a managed (journal-native) authority over a real
 // TCP listener and returns its address. Mirrors newManagedServer but served on
-// a socket so a real *Client (which requires the v7 baseline) can dial it.
+// a socket so a real *Client (which requires the v8 baseline) can dial it.
 func serveManagedAuthority(t *testing.T) string {
 	t.Helper()
 	addr, _ := serveManagedAuthorityFS(t)

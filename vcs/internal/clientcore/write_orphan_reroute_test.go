@@ -23,7 +23,7 @@ func TestWriteToParkedInodeGoesDirectToOrphan(t *testing.T) {
 	// Hold the file open (create+open already registered the pin) so the
 	// authority parks — not reaps — the inode on unlink.
 	n := NewNodeState(a.Ino, true)
-	if st := v.RegisterOpened("orph", n); st != fsproto.OK {
+	if st := v.RegisterOpened(context.Background(), "orph", n); st != fsproto.OK {
 		t.Fatalf("open: %d", st)
 	}
 	if _, st := v.Write(ctx, "orph", n, 0, []byte("AAAA")); st != fsproto.OK {

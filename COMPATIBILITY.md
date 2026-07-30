@@ -9,7 +9,7 @@ Names retired at the boundary keep typed tombstones for exactly one
 release.
 
 The reset includes the mount wire. Released v0.1 clients speak `fsproto` v3;
-the first v2 authority speaks v7 and intentionally refuses that older
+the current v2 authority speaks v8 and intentionally refuses older
 protocol rather than silently weakening exact-session semantics. Upgrade
 clients and authorities together; PortableFS deliberately fails closed
 instead of carrying a second compatibility execution path.

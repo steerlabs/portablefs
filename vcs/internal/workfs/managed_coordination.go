@@ -81,6 +81,18 @@ func decideRejection(key pfc2.ExactKey, status int32) []pfc2.Record {
 // control-only EAGAIN rejection row for the identity. Unlocks always grant.
 // The returned decision is the durable applied outcome.
 func (fs *FS) ManagedLockDecide(env *wal.Envelope, ino, kernelLockOwner uint64, op pfc2.LockOp, start, length uint64) (CoordinationDecision, error) {
+	return fs.managedLockDecide(env, "", false, ino, kernelLockOwner, op, start, length)
+}
+
+// ManagedLockDecideGated is ManagedLockDecide with the delegation overlap
+// decision folded into the same fs.mu reservation. The protocol's volatile
+// recall wait remains an optimization; this final check closes the race with
+// a grant that reserved after that wait but before the lock row.
+func (fs *FS) ManagedLockDecideGated(env *wal.Envelope, path string, ino, kernelLockOwner uint64, op pfc2.LockOp, start, length uint64) (CoordinationDecision, error) {
+	return fs.managedLockDecide(env, path, true, ino, kernelLockOwner, op, start, length)
+}
+
+func (fs *FS) managedLockDecide(env *wal.Envelope, path string, gated bool, ino, kernelLockOwner uint64, op pfc2.LockOp, start, length uint64) (CoordinationDecision, error) {
 	if fs.managed == nil {
 		return CoordinationDecision{}, ErrNotManaged
 	}
@@ -100,6 +112,10 @@ func (fs *FS) ManagedLockDecide(env *wal.Envelope, ino, kernelLockOwner uint64, 
 	decision := CoordinationDecision{}
 	build := func() ([]pfc2.Record, error) {
 		if op != pfc2.LockUnlock {
+			if gated && fs.reservedDelegationBlocks(&ref, path) {
+				decision.Status = errnos.EAGAIN
+				return decideRejection(rec.Key, errnos.EAGAIN), nil
+			}
 			owner := pfc2.LockOwner{Session: ref, KernelLockOwner: kernelLockOwner}
 			if _, conflict := fs.managed.reserved.LockConflict(ino, owner, start, length, op == pfc2.LockSetWrite); conflict {
 				decision.Status = errnos.EAGAIN

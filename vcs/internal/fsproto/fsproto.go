@@ -5,10 +5,10 @@
 // live, read-after-write coherence across machines (every read reaches the
 // single authority) rather than close-to-open approximations.
 //
-// Wire format: requests use allocation-safe, aggregate-size-framed PFRQ1 on
+// Wire format: requests use allocation-safe, aggregate-size-framed PFRQ2 on
 // the client→server half of a persistent TCP connection. Responses remain a
 // gob stream on the independent server→client half. Subscribe acknowledgments
-// are requests and therefore use PFRQ1 too.
+// are requests and therefore use PFRQ2 too.
 package fsproto
 
 import (
@@ -25,6 +25,11 @@ import (
 
 // Op identifies a filesystem operation.
 type Op uint8
+
+// MaxPrepareOpenPaths keeps one durable prepare row within PFJ3's 128-control
+// ceiling (at most one OpenPinChange per path; already-held/duplicate inodes
+// consume fewer controls).
+const MaxPrepareOpenPaths = 127
 
 const (
 	OpGetattr Op = iota + 1
@@ -52,7 +57,7 @@ const (
 	OpRenewOpenInodes   // renew leases for the open (still-named) inos this mount holds open
 
 	// ---- exact mount sessions. Sessions, journaled coordination, and the
-	// exact-once mutation envelope are MANDATORY in the v7 baseline: every
+	// exact-once mutation envelope are MANDATORY in the v8 baseline: every
 	// mutation carries Request.Env, and the session ops below are the only
 	// way to acquire one.
 	OpSessionOpen   // establish (or idempotently re-establish) a mount session identity
@@ -60,10 +65,10 @@ const (
 	OpSessionAttach // authenticate an existing session onto THIS connection (no durable renewal)
 	OpSessionExpire // voluntarily fence THIS session generation (clean unmount); its lease-owned state is released
 
-	// ---- open-registration batching (mandatory in v7).
+	// ---- open-registration batching (mandatory in v8).
 	OpUnmarkOpenInodes // clear this mount's open holds for a batch of inos (deferred/batched last-close unmarks)
 
-	// ---- extended attributes (mandatory in v7). Reads (get/list) are pure
+	// ---- extended attributes (mandatory in v8). Reads (get/list) are pure
 	// reads; set/remove are journaled mutations that ride the exact-once
 	// path exactly like OpCreate/OpWrite.
 	OpGetxattr    // read one attribute value (Path/HandleIno + XattrName)
@@ -71,11 +76,11 @@ const (
 	OpListxattr   // list attribute names (Path/HandleIno)
 	OpRemovexattr // remove one attribute (ENODATA when absent)
 
-	// ---- hard links (mandatory in v7). Path is the existing source name
+	// ---- hard links (mandatory in v8). Path is the existing source name
 	// and NewPath is the new directory entry.
 	OpLink
 
-	// ---- adaptive write-back delegations (mandatory in v7). The authority
+	// ---- adaptive write-back delegations (mandatory in v8). The authority
 	// owns the grant decision; the client engine acknowledges locally only
 	// under an active grant. SessionID carries the mount stream id
 	// (writebackID) on all four.
@@ -90,6 +95,12 @@ const (
 	// subscriber's acknowledged position to cover the barrier's mutations —
 	// cross-machine read-after-fsync is exact, not eventual.
 	OpInvalidationAck
+
+	// OpDelegationPrepareRelease durably pins the currently open paths named
+	// by OpenPaths while the caller still owns (Path, CheckoutEpoch). It
+	// returns an aligned OpenInos vector; the caller installs those exact
+	// identities locally before issuing the existing replay-exact Checkin.
+	OpDelegationPrepareRelease
 )
 
 // Lock modes carried in Request.LkMode (OpLock).
@@ -298,6 +309,9 @@ type Request struct {
 	// OpRenewOpenInodes: batch of OPEN (still-named) inos this mount holds open, to renew their leases.
 	// OpUnmarkOpenInodes: batch of inos whose deferred last-close unmark is being flushed.
 	OpenInos []uint64
+	// OpDelegationPrepareRelease: ordered paths to resolve and pin while the
+	// exact delegation named by Path/CheckoutEpoch is still held.
+	OpenPaths []string
 	// RegisterOpen on OpCreate asks the authority to register the creating
 	// owner's open hold on the new inode in the same round-trip (the kernel
 	// CREATE is create+open, so the separate MarkOpen RPC is pure overhead).
@@ -414,6 +428,9 @@ type Response struct {
 	// OpOrphan: the stable ino the authority parked the unlinked inode under. The client addresses
 	// subsequent reads/writes/truncates/reap of the open-but-unlinked file by this ino (Request.OrphanIno).
 	OrphanIno uint64
+	// OpDelegationPrepareRelease: authority inode for each request OpenPaths
+	// element in the same order.
+	OpenInos []uint64
 
 	// OpProtocolVersion: the server's protocol version (see protoversion.go). Zero from
 	// any server that predates negotiation; gob decoders that predate the field drop it.
