@@ -1,6 +1,7 @@
 package fsproto
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -132,6 +133,86 @@ func TestAbortCancelsInflightLegacyTransportDial(t *testing.T) {
 				t.Fatal("initial transport did not close")
 			}
 		})
+	}
+}
+
+func TestFlushContextCancelsDisconnectedRedialBeforeAnySend(t *testing.T) {
+	var calls atomic.Int32
+	var releaseOnce sync.Once
+	dialEntered := make(chan struct{})
+	releaseDial := make(chan struct{})
+	initialDone := make(chan struct{})
+	lateTraffic := make(chan bool, 1)
+	release := func() {
+		releaseOnce.Do(func() { close(releaseDial) })
+	}
+	t.Cleanup(release)
+
+	dial := func() (net.Conn, error) {
+		client, server := net.Pipe()
+		if calls.Add(1) == 1 {
+			go func() {
+				defer close(initialDone)
+				defer server.Close()
+				if err := acceptTestClientHandshake(server); err != nil {
+					return
+				}
+				_, _ = io.Copy(io.Discard, server)
+			}()
+			return client, nil
+		}
+		close(dialEntered)
+		go func() {
+			defer server.Close()
+			var first [1]byte
+			n, _ := server.Read(first[:])
+			lateTraffic <- n != 0
+		}()
+		<-releaseDial
+		return client, nil
+	}
+
+	cli, err := DialWithTransport(1, dial)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Abort() })
+	cli.pool[0].reset()
+	select {
+	case <-initialDone:
+	case <-time.After(time.Second):
+		t.Fatal("initial transport did not close")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cli.FlushWritebackContext(ctx, "wb", nil, [32]byte{}, [32]byte{}, nil)
+		done <- err
+	}()
+	select {
+	case <-dialEntered:
+	case <-time.After(time.Second):
+		t.Fatal("flush did not enter disconnected redial")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("flush error = %v, want context deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flush context cancellation waited for delayed dial")
+	}
+
+	release()
+	select {
+	case sent := <-lateTraffic:
+		if sent {
+			t.Fatal("canceled flush authenticated or sent on late transport")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late transport was not retired")
 	}
 }
 

@@ -33,17 +33,99 @@ private final class PfsEventSink: @unchecked Sendable {
 private final class PfsConnection: @unchecked Sendable {
     let id = UUID()
     let socket: PfsAsyncSocket
+    let writer: PfsOrderedEnvelopeWriter
     var resolvedAttachRef: String?
     var eventsSubscribed = false
+    var nextOperationID: UInt64 = 1
 
     init(socket: PfsAsyncSocket) {
         self.socket = socket
+        self.writer = PfsOrderedEnvelopeWriter { envelope in
+            try await socket.write(envelope)
+        }
+    }
+}
+
+/// Chains socket writes in the same order they were enqueued. Request IDs are
+/// allocated by `PfsLocalClient`'s actor, and every request plus one-way
+/// publication acknowledgement enters this queue synchronously while on that
+/// actor. Detached task scheduling therefore cannot reorder stream frames.
+final class PfsOrderedEnvelopeWriter: @unchecked Sendable {
+    private let write: @Sendable (PfsEnvelope) async throws -> Void
+    private var tail: Task<Void, Error>?
+
+    init(write: @escaping @Sendable (PfsEnvelope) async throws -> Void) {
+        self.write = write
+    }
+
+    func enqueue(_ envelope: PfsEnvelope) -> Task<Void, Error> {
+        let predecessor = tail
+        let write = self.write
+        let task = Task.detached {
+            if let predecessor {
+                try await predecessor.value
+            }
+            try await write(envelope)
+        }
+        tail = task
+        return task
     }
 }
 
 private struct PfsPendingRequest: Sendable {
     var continuation: CheckedContinuation<PfsEnvelope, Error>
     var timeoutTask: Task<Void, Never>?
+    var publicationCollector: PfsPublicationCollector?
+}
+
+private struct PfsPublicationTicket: Sendable {
+    var connectionID: UUID
+    var operationID: UInt64
+}
+
+private final class PfsPublicationCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connectionIDs: Set<UUID> = []
+    private var boundConnectionID: UUID?
+    private var operationID: UInt64?
+
+    func bind(to connectionID: UUID, allocating candidate: UInt64) -> (id: UInt64, isNew: Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let boundConnectionID {
+            guard boundConnectionID == connectionID, let operationID else {
+                return nil
+            }
+            return (operationID, false)
+        }
+        boundConnectionID = connectionID
+        operationID = candidate
+        return (candidate, true)
+    }
+
+    func append(connectionID: UUID) {
+        lock.lock()
+        connectionIDs.insert(connectionID)
+        lock.unlock()
+    }
+
+    func snapshot() -> [PfsPublicationTicket] {
+        lock.lock()
+        let result: [PfsPublicationTicket]
+        if let operationID {
+            result = connectionIDs.map {
+                PfsPublicationTicket(connectionID: $0, operationID: operationID)
+            }
+        } else {
+            result = []
+        }
+        lock.unlock()
+        return result
+    }
+}
+
+private enum PfsPublicationContext {
+    @TaskLocal static var collector: PfsPublicationCollector?
 }
 
 /// Async pfslocal client for length-prefixed protobuf over a Unix domain socket.
@@ -122,7 +204,69 @@ public actor PfsLocalClient {
             throw PfsLocalClientError.daemon(errno: ENXIO, message: "attach is detaching")
         }
         try await ensureConnected()
-        return try await sendRequestOnCurrentConnection(body)
+        if PfsPublicationContext.collector != nil {
+            return try await sendRequestOnCurrentConnection(body)
+        }
+        let collector = PfsPublicationCollector()
+        return try await PfsPublicationContext.$collector.withValue(collector) {
+            do {
+                let envelope = try await self.sendRequestOnCurrentConnection(body)
+                await self.completePublications(collector.snapshot())
+                return envelope
+            } catch {
+                // Cacheable negative replies are publications too. `receive`
+                // records their request ID before resuming the throwing
+                // continuation, so the daemon gate is released only here.
+                await self.completePublications(collector.snapshot())
+                throw error
+            }
+        }
+    }
+
+    /// Extends every request issued by operation through the point where the
+    /// FSKit adapter has copied/installed the returned values. The daemon
+    /// holds overlapping delegation handoffs until these one-way
+    /// acknowledgements arrive.
+    public nonisolated func withPublicationBoundary<T>(
+        _ operation: () async throws -> T
+    ) async throws -> T {
+        if PfsPublicationContext.collector != nil {
+            return try await operation()
+        }
+        let collector = PfsPublicationCollector()
+        return try await PfsPublicationContext.$collector.withValue(collector) {
+            do {
+                let value = try await operation()
+                await self.completePublications(collector.snapshot())
+                return value
+            } catch {
+                await self.completePublications(collector.snapshot())
+                throw error
+            }
+        }
+    }
+
+    /// Collects the request IDs issued by `operation` without acknowledging
+    /// them. Callback-based FSKit witnesses invoke the returned completion
+    /// only after their reply handler returns, providing a real framework
+    /// publication boundary rather than an approximation before an async
+    /// method return.
+    public nonisolated func withDeferredPublication<T>(
+        _ operation: () async throws -> T
+    ) async -> (Result<T, Error>, @Sendable () async -> Void) {
+        let collector = PfsPublicationCollector()
+        let result: Result<T, Error> = await PfsPublicationContext.$collector.withValue(collector) {
+            do {
+                return .success(try await operation())
+            } catch {
+                return .failure(error)
+            }
+        }
+        let tickets = collector.snapshot()
+        let complete: @Sendable () async -> Void = {
+            await self.completePublications(tickets)
+        }
+        return (result, complete)
     }
 
     /// Resolves this connection to an attach reference and remembers it for reconnects.
@@ -168,11 +312,11 @@ public actor PfsLocalClient {
         if isShutdown {
             throw PfsLocalClientError.shutdown
         }
-        if connection != nil {
-            return
-        }
         if let task = connectingTask {
             try await task.value
+            return
+        }
+        if connection != nil {
             return
         }
 
@@ -266,6 +410,9 @@ public actor PfsLocalClient {
             return
         }
         request.timeoutTask?.cancel()
+        if envelope.publicationAckRequired {
+            request.publicationCollector?.append(connectionID: connectionID)
+        }
 
         if case let .error(error)? = envelope.body {
             request.continuation.resume(throwing: PfsLocalClientError.daemon(errno: error.errno, message: error.message))
@@ -303,7 +450,7 @@ public actor PfsLocalClient {
     private func helloOnCurrentConnection() async throws {
         var hello = PfsHello()
         hello.protocolMajor = 1
-        hello.protocolMinor = 0
+        hello.protocolMinor = 2
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -311,7 +458,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 2 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
     }
@@ -340,12 +487,33 @@ public actor PfsLocalClient {
         guard let connection else {
             throw PfsLocalClientError.connectionClosed
         }
+        var operationID: UInt64 = 0
+        if let collector = PfsPublicationContext.collector {
+            guard let binding = collector.bind(
+                to: connection.id,
+                allocating: connection.nextOperationID
+            ) else {
+                // A framework reply cannot combine cacheable results from two
+                // ownership epochs. The callback fails as one unit; the old
+                // connection close has already retired its daemon-side gate.
+                throw PfsLocalClientError.connectionClosed
+            }
+            operationID = binding.id
+            if binding.isNew {
+                guard connection.nextOperationID != UInt64.max else {
+                    connection.socket.close()
+                    throw PfsLocalClientError.connectionClosed
+                }
+                connection.nextOperationID += 1
+            }
+        }
 
         let requestID = nextRequestID
         nextRequestID += 1
 
         var envelope = PfsEnvelope()
         envelope.requestID = requestID
+        envelope.operationID = operationID
         envelope.body = body
 
         return try await withTaskCancellationHandler {
@@ -356,15 +524,20 @@ public actor PfsLocalClient {
                         await self.timeoutRequest(requestID)
                     } catch {}
                 }
-                pending[requestID] = PfsPendingRequest(continuation: continuation, timeoutTask: timeoutTask)
+                pending[requestID] = PfsPendingRequest(
+                    continuation: continuation,
+                    timeoutTask: timeoutTask,
+                    publicationCollector: PfsPublicationContext.collector
+                )
                 if Task.isCancelled {
                     cancelRequest(requestID)
                     return
                 }
                 let outboundEnvelope = envelope
-                Task.detached { [socket = connection.socket, connectionID = connection.id, outboundEnvelope] in
+                let writeTask = connection.writer.enqueue(outboundEnvelope)
+                Task.detached { [connectionID = connection.id, writeTask] in
                     do {
-                        try await socket.write(outboundEnvelope)
+                        try await writeTask.value
                     } catch {
                         await self.writeFailed(requestID, connectionID: connectionID, error: error)
                     }
@@ -377,19 +550,54 @@ public actor PfsLocalClient {
         }
     }
 
+    private func completePublications(_ tickets: [PfsPublicationTicket]) async {
+        for ticket in tickets {
+            guard let connection, connection.id == ticket.connectionID else {
+                // Closing the old connection synchronously retires all of its
+                // daemon-side publication tickets. Never replay a stale
+                // request ID onto a replacement connection.
+                continue
+            }
+            var ack = PfsPublicationAck()
+            ack.operationID = ticket.operationID
+            var envelope = PfsEnvelope()
+            envelope.requestID = 0
+            envelope.body = .publicationAck(ack)
+            let writeTask = connection.writer.enqueue(envelope)
+            do {
+                try await writeTask.value
+            } catch {
+                closeCurrentConnection(connection.id, error: error)
+                return
+            }
+        }
+    }
+
     private func timeoutRequest(_ requestID: UInt64) {
         guard let request = pending.removeValue(forKey: requestID) else {
             return
         }
+        let connectionID = connection?.id
         request.continuation.resume(throwing: PfsLocalClientError.timeout)
+        if let connectionID {
+            // The daemon may still publish a late reply for this request. A
+            // connection reset is the exact cancellation boundary: it
+            // retires every server-side publication ticket instead of
+            // leaving an unacknowledgeable operation in the handoff gate.
+            closeCurrentConnection(connectionID, error: PfsLocalClientError.timeout)
+        }
     }
 
     private func cancelRequest(_ requestID: UInt64) {
         guard let request = pending.removeValue(forKey: requestID) else {
             return
         }
+        let connectionID = connection?.id
         request.timeoutTask?.cancel()
         request.continuation.resume(throwing: PfsLocalClientError.cancelled)
+        if let connectionID {
+            closeCurrentConnection(connectionID, error: PfsLocalClientError.cancelled)
+        }
     }
 
     private func writeFailed(_ requestID: UInt64, connectionID: UUID, error: Error) {

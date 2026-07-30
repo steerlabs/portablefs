@@ -33,7 +33,10 @@ func (c *rawPFSClient) close() { _ = c.conn.Close() }
 func (c *rawPFSClient) call(body any) (any, *pfslocal.ErrorReply, error) {
 	c.next++
 	id := c.next
-	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{RequestID: id, Body: body}); err != nil {
+	operationID := id
+	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+		RequestID: id, OperationID: operationID, Body: body,
+	}); err != nil {
 		return nil, nil, err
 	}
 	for {
@@ -43,6 +46,13 @@ func (c *rawPFSClient) call(body any) (any, *pfslocal.ErrorReply, error) {
 		}
 		if env.RequestID != id {
 			continue // events and other-request replies
+		}
+		if env.PublicationAckRequired {
+			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+				Body: &pfslocal.PublicationAck{OperationID: operationID},
+			}); err != nil {
+				return nil, nil, err
+			}
 		}
 		if er, ok := env.Body.(*pfslocal.ErrorReply); ok {
 			return nil, er, nil
@@ -63,7 +73,11 @@ func (c *rawPFSClient) mustCall(body any) (any, error) {
 }
 
 func (c *rawPFSClient) start(ref string) (pfslocal.Item, error) {
-	if _, err := c.mustCall(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "stripes-test"}); err != nil {
+	if _, err := c.mustCall(&pfslocal.Hello{
+		ProtocolMajor: 1,
+		ProtocolMinor: pfslocal.ProtocolMinor,
+		ClientName:    "stripes-test",
+	}); err != nil {
 		return pfslocal.Item{}, err
 	}
 	rep, err := c.mustCall(&pfslocal.ResolveRequest{AttachRef: ref})

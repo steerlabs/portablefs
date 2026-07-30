@@ -31,6 +31,7 @@ package portablefsd
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -110,6 +111,41 @@ func (a *attach) localDirFor(p string) string {
 	return a.localDirForLocked(p)
 }
 
+func localDirForRules(p string, dirs []string) string {
+	for _, dir := range dirs {
+		if p == dir || strings.HasPrefix(p, dir+"/") {
+			return dir
+		}
+	}
+	return ""
+}
+
+// transitionGraftProvenanceLocked reincarnates every active pathname whose
+// routing owner changes under a new effective graft rule set. Item provenance
+// is immutable: mutating rec.graft in place would let an FSKit Item already
+// published for authority storage silently become a machine-local inode (or
+// vice versa). The retired Item remains detached until Reclaim; the next
+// lookup publishes a fresh identity with the new owner.
+func (a *attach) transitionGraftProvenanceLocked(effective []string) []string {
+	var paths []string
+	for p, rec := range a.paths {
+		if rec == nil || p == "" {
+			continue
+		}
+		wantGraft := localDirForRules(p, effective) != ""
+		if rec.graft != wantGraft {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		if rec := a.paths[p]; rec != nil {
+			a.detachReincarnatedPathLocked(p, rec)
+		}
+	}
+	return paths
+}
+
 // graftRootsUnderLocked lists graft roots whose parent directory is dir.
 func (a *attach) graftRootsUnderLocked(dir string) []string {
 	var out []string
@@ -140,8 +176,8 @@ func (a *attach) ensureLocalScaffold(p string) error {
 // and invalidates affected kernel state so the new namespace is visible
 // immediately.
 func (a *attach) addLocalDirs(dirs []string) ([]string, error) {
-	a.nsMu.Lock()
-	defer a.nsMu.Unlock()
+	unlockNamespace := a.lockExternalNamespaceWrite()
+	defer unlockNamespace()
 	requested, err := normalizeLocalDirs(dirs)
 	if err != nil {
 		return nil, err
@@ -182,29 +218,55 @@ func (a *attach) addLocalDirs(dirs []string) ([]string, error) {
 			added = append(added, dir)
 		}
 	}
-	a.localDirs = merged
-	a.options.LocalDirs, err = normalizeLocalDirs(append(append([]string(nil), a.options.LocalDirs...), requested...))
+	previousOptions := append([]string(nil), a.options.LocalDirs...)
+	nextOptions, err := normalizeLocalDirs(append(append([]string(nil), previousOptions...), requested...))
 	if err != nil {
 		a.mu.Unlock()
 		return nil, err
 	}
+	// Commit the durable routing rule before changing live ownership. If this
+	// snapshot fails, no published Item is detached and the old routing view
+	// remains coherent. A crash after the snapshot but before the transition
+	// is also safe: activation applies the effective rule set and performs
+	// this same reincarnation before the frontend can serve.
+	a.options.LocalDirs = nextOptions
 	a.mu.Unlock()
-
 	if err := a.persistState(); err != nil {
+		a.mu.Lock()
+		a.options.LocalDirs = previousOptions
+		a.mu.Unlock()
 		return nil, err
 	}
+
+	a.mu.Lock()
+	changedItems := a.transitionGraftProvenanceLocked(merged)
+	a.localDirs = merged
+	// A new rule changes the parent's merged listing (it can shadow an
+	// authority entry) with no authority-side change, so the parent's overlay
+	// version must move for the enumeration verifier to change.
+	for _, dir := range added {
+		a.bumpLocalVersionLocked(parentPath(dir))
+	}
+	a.mu.Unlock()
+
+	journalErr := a.flushBindingDeltaError()
+	// Publish invalidations even if the binding journal failed. That failure
+	// freezes the attach, but already-live vnodes must still be told that
+	// their immutable provenance was retired.
 	a.mu.Lock()
 	for _, dir := range added {
-		// A new rule changes the parent's merged listing (it can shadow an
-		// authority entry) with no authority-side change, so the parent's
-		// overlay version must move for the enumeration verifier to change.
-		a.bumpLocalVersionLocked(parentPath(dir))
 		// The graft shadows whatever the volume had at this path; force the
 		// kernel to re-resolve the name and drop stale attrs/pages.
 		a.publishNamespaceInvalidationLocked(dir, 0, 0)
 		a.publishContentInvalidationLocked(dir, 0, 0)
 	}
+	for _, p := range changedItems {
+		a.publishNamespaceInvalidationLocked(p, 0, 0)
+	}
 	a.mu.Unlock()
+	if journalErr != nil {
+		return nil, fmt.Errorf("persist local-dir identity transition: %w", journalErr)
+	}
 	return merged, nil
 }
 
@@ -384,15 +446,19 @@ func (a *attach) registerLocalLocked(p string, attr fsproto.Attr) *itemRecord {
 		rec.attr = attr
 		return rec
 	}
-	return a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false)
+	return a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false, true)
 }
 
 func (a *attach) registerLocalAliasLocked(p string, source *itemRecord, attr fsproto.Attr) *itemRecord {
 	if a.paths[p] != nil {
 		a.removePathLocked(p)
 	}
-	rec := &itemRecord{item: source.item, path: p, state: source.state, attr: attr}
+	rec := &itemRecord{
+		item: source.item, path: p, state: source.state, attr: attr, graft: true,
+	}
 	a.paths[p] = rec
+	a.addItemAliasLocked(rec)
+	a.frontendPathEpoch.Add(1)
 	if a.items[rec.item.ItemID] == nil {
 		a.items[rec.item.ItemID] = rec
 	}
@@ -437,8 +503,7 @@ func (a *attach) removeLocal(p string, directory bool) int32 {
 	a.removePathLocked(p)
 	a.bumpLocalVersionLocked(parentPath(p))
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	return 0
+	return a.flushBindingDelta()
 }
 
 // renameLocal renames within a single graft with plain POSIX semantics (a
@@ -469,8 +534,7 @@ func (a *attach) renameLocal(oldp, newp string, noReplace bool) int32 {
 		a.bumpLocalVersionLocked(parentPath(newp))
 	}
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	return 0
+	return a.flushBindingDelta()
 }
 
 // setattrLocal applies POSIX metadata changes directly to grafted backing
@@ -522,7 +586,9 @@ func (a *attach) setattrLocal(rec *itemRecord, req *pfslocal.SetAttrRequest) (*p
 		return nil, eno
 	}
 	updated := a.registerLocal(rec.path, attr)
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, updated.item)}, 0
 }
 
@@ -556,33 +622,33 @@ func (a *attach) readLocalFile(p string, offset int64, length int) ([]byte, int3
 // mirroring the frontend create+write identity bookkeeping. Creating the
 // graft root's scaffold and parents on demand lets management writes land
 // before anything mkdir'ed the root through the mount.
-func (a *attach) writeLocalFile(p string, graft string, data []byte) int32 {
+func (a *attach) writeLocalFile(p string, graft string, data []byte) (uint64, int32) {
 	if p == graft {
 		// A graft rule is a directory rule; the root itself is never a file.
-		return darwinEISDIR
+		return 0, darwinEISDIR
 	}
 	if err := a.ensureLocalScaffold(graft); err != nil {
-		return localErrno(err)
+		return 0, localErrno(err)
 	}
 	rootExisted := true
 	if _, err := a.localFS.Lstat(graft); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return localErrno(err)
+			return 0, localErrno(err)
 		}
 		rootExisted = false
 	}
 	if err := a.localFS.MkdirAll(parentPath(p), 0o755); err != nil {
-		return localErrno(err)
+		return 0, localErrno(err)
 	}
 	if err := a.localFS.WriteFile(p, data, 0o644); err != nil {
-		return localErrno(err)
+		return 0, localErrno(err)
 	}
 	attr, eno := a.statLocal(p)
 	if eno != 0 {
-		return eno
+		return 0, eno
 	}
 	a.mu.Lock()
-	a.registerLocalLocked(p, attr)
+	refreshItemID := a.registerLocalLocked(p, attr).item.ItemID
 	a.bumpLocalVersionLocked(parentPath(p))
 	if !rootExisted {
 		// The write materialized the graft root implicitly: the root's parent
@@ -593,8 +659,10 @@ func (a *attach) writeLocalFile(p string, graft string, data []byte) int32 {
 	a.publishNamespaceInvalidationLocked(p, 0, 0)
 	a.publishContentInvalidationLocked(p, 0, 0)
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	return 0
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return 0, eno
+	}
+	return refreshItemID, 0
 }
 
 func localOpenFlags(mode pfslocal.OpenMode) int {

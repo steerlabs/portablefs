@@ -115,10 +115,18 @@ func (e *Engine) noteDenial(scope string, backoff time.Duration) {
 // delegation is active or its previous attempt failed. Caller holds e.mu.
 // A release already in progress keeps its signal so racing releasers share
 // one definite outcome.
-func (e *Engine) prepareReleaseLocked(d *delegation) *releaseAttempt {
+func (e *Engine) prepareReleaseLocked(ctx context.Context, d *delegation) *releaseAttempt {
 	d.draining = true
 	d.drainErr = nil
-	d.attempt = newReleaseAttempt()
+	// Release durability is owned by the engine context, not by the request
+	// that happened to trigger it. Preserve only the triggering context's
+	// values so frontend handoff hooks can identify their own in-flight
+	// operation without allowing request cancellation to interrupt Checkin.
+	eventCtx := e.ctx
+	if ctx != nil {
+		eventCtx = valueOverlayContext{Context: e.ctx, values: ctx}
+	}
+	d.attempt = newReleaseAttempt(eventCtx)
 	attempt := d.attempt
 	if e.forcing || e.closed {
 		err := ErrFenced
@@ -140,9 +148,9 @@ type releaseClaim struct {
 	owner   bool
 }
 
-func (e *Engine) claimReleaseLocked(d *delegation) releaseClaim {
+func (e *Engine) claimReleaseLocked(ctx context.Context, d *delegation) releaseClaim {
 	if !d.draining || d.drainErr != nil || d.attempt == nil {
-		return releaseClaim{d: d, attempt: e.prepareReleaseLocked(d), owner: true}
+		return releaseClaim{d: d, attempt: e.prepareReleaseLocked(ctx, d), owner: true}
 	}
 	return releaseClaim{d: d, attempt: d.attempt}
 }
@@ -159,7 +167,25 @@ func waitReleaseAttempt(ctx context.Context, attempt *releaseAttempt) error {
 	}
 }
 
+func (e *Engine) waitReleaseForCaller(ctx context.Context, attempt *releaseAttempt) error {
+	var resume func()
+	if e.cfg.Events.OnReleaseWait != nil {
+		resume = e.cfg.Events.OnReleaseWait(ctx)
+	}
+	if resume != nil {
+		defer resume()
+	}
+	return waitReleaseAttempt(ctx, attempt)
+}
+
 func (e *Engine) runReleaseClaims(ctx context.Context, claims []releaseClaim) error {
+	var resume func()
+	if len(claims) != 0 && e.cfg.Events.OnReleaseWait != nil {
+		resume = e.cfg.Events.OnReleaseWait(ctx)
+	}
+	if resume != nil {
+		defer resume()
+	}
 	var first error
 	for _, claim := range claims {
 		if err := waitReleaseAttempt(ctx, claim.attempt); err != nil && first == nil {
@@ -183,6 +209,9 @@ func (e *Engine) failRelease(d *delegation, attempt *releaseAttempt, err error) 
 		if d.attempt == attempt {
 			d.draining = true
 			d.drainErr = err
+			d.readMu.Lock()
+			d.readClosing = false
+			d.readMu.Unlock()
 		}
 	}
 	e.mu.Unlock()
@@ -249,7 +278,7 @@ func (e *Engine) Recall(ctx context.Context, path string) error {
 	var claims []releaseClaim
 	for _, d := range e.delegations {
 		if pathUnder(path, d.scope) || pathUnder(d.scope, path) {
-			claim := e.claimReleaseLocked(d)
+			claim := e.claimReleaseLocked(ctx, d)
 			claims = append(claims, claim)
 			if claim.owner {
 				// Contention recalled this scope: do not immediately re-acquire.
@@ -295,23 +324,8 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 			return e.failRelease(d, attempt, err)
 		}
 	}
-	var endOpenProtection func(bool)
-	if e.cfg.ProtectOpenPins != nil {
-		// Open handles under the scope must hold authority-durable open
-		// pins BEFORE the release, and the subtree barrier must remain live
-		// through the durable checkin. A peer unlink after the release then
-		// parks the inode (open-after-unlink), never destroys it.
-		var err error
-		endOpenProtection, err = e.cfg.ProtectOpenPins(ctx, d.scope, d.epoch)
-		if err != nil {
-			return e.failRelease(d, attempt, err)
-		}
-	}
 	select {
 	case <-attempt.done:
-		if endOpenProtection != nil {
-			endOpenProtection(false)
-		}
 		return attempt.err
 	default:
 	}
@@ -321,33 +335,86 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 		d.draining
 	e.mu.RUnlock()
 	if !current {
-		if endOpenProtection != nil {
-			endOpenProtection(false)
-		}
 		return attempt.complete(fmt.Errorf("%w: release attempt lost ownership before local finalization", ErrConflict))
 	}
-	// Record the authority-confirmed applied prefix and locally-final release
-	// in one WAL sync BEFORE sending Checkin. The subtree is still barred and
-	// every live open below it is authority-pinned, so no later mutation can
-	// depend on this grant. If Checkin commits but its reply is lost and the
-	// authority retires the stream ledger, recovery still has the exact
-	// durable prefix certificate needed to retire this stream without
-	// inventing a tail or trying to rebind the released scope.
-	if w != nil {
-		through, digest := e.fl.appliedState()
-		if through < target {
+	handoffStarted := false
+	if e.cfg.Events.OnHandoffStart != nil {
+		if err := e.cfg.Events.OnHandoffStart(attempt.eventCtx, d.scope); err != nil {
+			return e.failRelease(d, attempt, fmt.Errorf("writeback: frontend handoff start %q: %w", d.scope, err))
+		}
+		handoffStarted = true
+	}
+	if handoffStarted {
+		defer e.cfg.Events.OnHandoffEnd(d.scope)
+	}
+	if err := e.closeReadAdmission(ctx, d, attempt); err != nil {
+		return e.failRelease(d, attempt, err)
+	}
+	if e.cfg.Events.OnHandoff != nil {
+		// Read admission is closed and every overlay reader has exited, while
+		// the authority grant still excludes peers. Drop every user-space
+		// cache that could otherwise bypass the exact read-view handoff.
+		if err := e.cfg.Events.OnHandoff(d.scope); err != nil {
+			return e.failRelease(d, attempt, fmt.Errorf("writeback: frontend handoff %q: %w", d.scope, err))
+		}
+	}
+	var endOpenProtection func(bool)
+	if e.cfg.ProtectOpenPins != nil {
+		// Establish the open barrier only after the frontend cache handoff.
+		// Some frontends implement that handoff with a daemon-owned open
+		// through the mount; installing this barrier earlier would make that
+		// exact refresh wait on the release it is preparing. Mutation and read
+		// admission are already closed here, so the snapshot still captures
+		// every earlier open, and the barrier remains live through Checkin.
+		// A peer unlink after the release then parks the inode
+		// (open-after-unlink), never destroys it.
+		var err error
+		endOpenProtection, err = e.cfg.ProtectOpenPins(ctx, d.scope, d.epoch)
+		if err != nil {
+			return e.failRelease(d, attempt, err)
+		}
+	}
+	var endPublishedProtection func(bool)
+	if e.cfg.Events.OnHandoffPrepared != nil {
+		var err error
+		endPublishedProtection, err = e.cfg.Events.OnHandoffPrepared(
+			attempt.eventCtx, d.scope, d.epoch,
+		)
+		if err != nil {
 			if endOpenProtection != nil {
 				endOpenProtection(false)
 			}
+			return e.failRelease(
+				d, attempt,
+				fmt.Errorf("writeback: prepared frontend handoff %q: %w", d.scope, err),
+			)
+		}
+	}
+	endProtections := func(released bool) {
+		if endPublishedProtection != nil {
+			endPublishedProtection(released)
+		}
+		if endOpenProtection != nil {
+			endOpenProtection(released)
+		}
+	}
+	// All fallible local handoff preparation is complete. Record the
+	// authority-confirmed applied prefix and locally-final release in one WAL
+	// sync immediately before Checkin. Once this record is durable, the
+	// release is intentionally irreversible: if Checkin commits but its reply
+	// is lost and the authority retires the stream ledger, recovery has the
+	// exact prefix certificate needed to retire the stream.
+	if w != nil {
+		through, digest := e.fl.appliedState()
+		if through < target {
+			endProtections(false)
 			return e.failRelease(d, attempt, fmt.Errorf(
 				"%w: release drain stopped at %d before target %d",
 				ErrConflict, through, target,
 			))
 		}
 		if err := w.recordDrainedRelease(d.scope, d.epoch, through, digest); err != nil {
-			if endOpenProtection != nil {
-				endOpenProtection(false)
-			}
+			endProtections(false)
 			return e.failRelease(d, attempt, e.failLocalWAL("record drained delegation release", err))
 		}
 		e.mu.Lock()
@@ -359,18 +426,14 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 		}
 		e.mu.Unlock()
 		if !current {
-			if endOpenProtection != nil {
-				endOpenProtection(false)
-			}
+			endProtections(false)
 			return attempt.complete(e.failClosed(fmt.Errorf(
 				"writeback: release attempt lost ownership after durable local finalization",
 			)))
 		}
 	}
 	if err := e.remote.ReleaseDelegation(ctx, d.scope, d.epoch); err != nil {
-		if endOpenProtection != nil {
-			endOpenProtection(false)
-		}
+		endProtections(false)
 		return e.failRelease(d, attempt, err)
 	}
 	e.mu.Lock()
@@ -380,9 +443,7 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 	}
 	e.dropScopeStateLocked(d.scope)
 	e.mu.Unlock()
-	if endOpenProtection != nil {
-		endOpenProtection(true)
-	}
+	endProtections(true)
 	if e.cfg.Events.OnRelease != nil {
 		e.cfg.Events.OnRelease(d.scope)
 	}
@@ -414,7 +475,7 @@ func (e *Engine) ReleaseFor(ctx context.Context, paths ...string) error {
 			continue
 		}
 		seen[d] = true
-		claims = append(claims, e.claimReleaseLocked(d))
+		claims = append(claims, e.claimReleaseLocked(ctx, d))
 	}
 	e.mu.Unlock()
 	return e.runReleaseClaims(ctx, claims)
@@ -455,7 +516,7 @@ func (e *Engine) releaseAll(ctx context.Context) error {
 	e.mu.Lock()
 	var claims []releaseClaim
 	for _, d := range e.delegations {
-		claims = append(claims, e.claimReleaseLocked(d))
+		claims = append(claims, e.claimReleaseLocked(ctx, d))
 	}
 	e.mu.Unlock()
 	return e.runReleaseClaims(ctx, claims)
@@ -483,7 +544,7 @@ func (e *Engine) releaseIdleWithWait(wait time.Duration) {
 		if e.cfg.Busy != nil && e.cfg.Busy(d.scope) {
 			continue
 		}
-		claims = append(claims, e.claimReleaseLocked(d))
+		claims = append(claims, e.claimReleaseLocked(e.ctx, d))
 	}
 	e.mu.Unlock()
 	for _, claim := range claims {

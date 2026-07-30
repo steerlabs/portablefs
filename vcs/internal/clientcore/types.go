@@ -22,10 +22,16 @@ type DirEntry struct {
 }
 
 type dirCacheEntry struct {
-	gen     uint64
-	version uint64
-	entries []DirEntry
+	gen      uint64
+	version  uint64
+	fenceSeq uint64
+	entries  []DirEntry
 }
+
+// maxDirCacheEntries keeps complete directory snapshots a bounded
+// optimization. Eviction is arbitrary because version/fence validation owns
+// correctness and a miss simply refetches the listing.
+const maxDirCacheEntries = 50_000
 
 // Statfs describes the fixed virtual capacity advertised by PortableFS mounts.
 type Statfs struct {

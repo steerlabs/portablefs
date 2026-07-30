@@ -78,21 +78,42 @@ func TestConcurrentReadersAndWriters(t *testing.T) {
 	}
 }
 
-// slowBlobs adds latency to each backend Blob fetch, modelling a slow/remote object
-// store, so a test can prove concurrent writers fetch base blocks in PARALLEL (warmed
-// outside fs.mu) rather than serializing on a backend round-trip held under the lock.
-type slowBlobs struct {
-	data    map[string][]byte
-	delay   time.Duration
+// gatedBlobs holds every backend Blob fetch at a shared barrier. Reaching the
+// barrier with all writers proves directly that base reads run in parallel
+// outside fs.mu; a fetch performed under that lock would prevent the remaining
+// writers from ever entering Blob.
+type gatedBlobs struct {
+	data       map[string][]byte
+	want       int
+	allStarted chan struct{}
+	release    chan struct{}
+
 	mu      sync.Mutex
 	fetches int
 }
 
-func (b *slowBlobs) Blob(_ context.Context, d string) ([]byte, error) {
-	time.Sleep(b.delay)
+func newGatedBlobs(want int) *gatedBlobs {
+	return &gatedBlobs{
+		data:       map[string][]byte{},
+		want:       want,
+		allStarted: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (b *gatedBlobs) Blob(ctx context.Context, d string) ([]byte, error) {
 	b.mu.Lock()
 	b.fetches++
+	if b.fetches == b.want {
+		close(b.allStarted)
+	}
 	b.mu.Unlock()
+
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	v, ok := b.data[d]
 	if !ok {
 		return nil, fmt.Errorf("no blob %s", d)
@@ -102,11 +123,12 @@ func (b *slowBlobs) Blob(_ context.Context, d string) ([]byte, error) {
 
 // TestConcurrentPartialWritesDoNotSerializeOnBackendFetch: N writers each do a
 // read-modify-write (partial overwrite) of a DISTINCT backed file whose base must be
-// fetched from a slow backend. With the base fetch warmed outside fs.mu, the fetches
-// run in parallel and the whole batch finishes in roughly one fetch latency — not N.
+// fetched from a gated backend. With the base fetch warmed outside fs.mu, every fetch
+// reaches the barrier concurrently. If the fetch ran under fs.mu, only one writer
+// could reach the barrier and the test would fail before releasing it.
 func TestConcurrentPartialWritesDoNotSerializeOnBackendFetch(t *testing.T) {
 	const N = 20
-	blobs := &slowBlobs{data: map[string][]byte{}, delay: 50 * time.Millisecond}
+	blobs := newGatedBlobs(N)
 	var entries []backend.Entry
 	for i := 0; i < N; i++ {
 		base := []byte(fmt.Sprintf("base-bytes-for-file-%02d-padding-padding-padding", i))
@@ -126,7 +148,6 @@ func TestConcurrentPartialWritesDoNotSerializeOnBackendFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
 		wg.Add(1)
@@ -138,15 +159,20 @@ func TestConcurrentPartialWritesDoNotSerializeOnBackendFetch(t *testing.T) {
 			}
 		}(i)
 	}
-	wg.Wait()
-	elapsed := time.Since(start)
 
-	// Per-write serialized-under-lock fetching would be N*50ms = 1s. Warmed-in-parallel
-	// should be a small multiple of one fetch latency.
-	if elapsed > time.Duration(N/4)*blobs.delay {
-		t.Fatalf("partial writes serialized on the backend fetch: %v for %d writes (want ~1 fetch latency)", elapsed, N)
+	select {
+	case <-blobs.allStarted:
+		close(blobs.release)
+	case <-time.After(5 * time.Second):
+		close(blobs.release)
+		wg.Wait()
+		blobs.mu.Lock()
+		started := blobs.fetches
+		blobs.mu.Unlock()
+		t.Fatalf("backend fetches did not overlap: %d of %d reached the barrier", started, N)
 	}
-	t.Logf("lock-off-fetch: %d concurrent read-modify-writes (50ms backend each) in %v", N, elapsed)
+	wg.Wait()
+	t.Logf("lock-off-fetch: all %d concurrent read-modify-writes reached the backend barrier", N)
 
 	// Correctness: each file reflects the overwrite over its preserved base.
 	for i := 0; i < N; i++ {

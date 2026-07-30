@@ -31,8 +31,17 @@ func xattrHandleIno(n *NodeState) uint64 { return n.Orphan() }
 
 // Getxattr reads one extended attribute. ENODATA = attribute not present.
 func (v *Volume) Getxattr(ctx context.Context, path string, n *NodeState, name string) ([]byte, Status) {
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	defer permit.Close()
+	return v.getxattr(&permit, path, n, name)
+}
+
+func (v *Volume) getxattr(permit *readView, path string, n *NodeState, name string) ([]byte, Status) {
 	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
-		if value, result := v.wb.Getxattr(path, name); result != writeback.LookupUndecided {
+		if value, result := permit.Getxattr(path, name); result != writeback.LookupUndecided {
 			if result == writeback.LookupNegative {
 				return nil, fsproto.ENODATA
 			}
@@ -48,8 +57,17 @@ func (v *Volume) Getxattr(ctx context.Context, path string, n *NodeState, name s
 
 // Listxattr lists extended-attribute names (sorted; empty = none).
 func (v *Volume) Listxattr(ctx context.Context, path string, n *NodeState) ([]string, Status) {
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	defer permit.Close()
+	return v.listxattr(&permit, path, n)
+}
+
+func (v *Volume) listxattr(permit *readView, path string, n *NodeState) ([]string, Status) {
 	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
-		if names, ok := v.wb.Listxattr(path); ok {
+		if names, ok := permit.Listxattr(path); ok {
 			return names, fsproto.OK
 		}
 	}
@@ -70,6 +88,7 @@ func (v *Volume) Setxattr(ctx context.Context, path string, n *NodeState, name s
 // SetxattrFlags evaluates XattrCreate/XattrReplace in the same ordered
 // authority mutation as the set. It performs no client-side existence read.
 func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, name string, value []byte, flags uint8) Status {
+	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
@@ -92,7 +111,11 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 			return statusErr(err)
 		}
 	}
-	if st := v.flushCoveringSession(path); st != fsproto.OK {
+	releasePaths := []string{path}
+	if v.isHardlink(n) {
+		releasePaths = append(releasePaths, v.hardlinks.pathsForInos([]uint64{authHandleIno(n)})...)
+	}
+	if st := v.flushCoveringSession(ctx, releasePaths...); st != fsproto.OK {
 		return st
 	}
 	st, err := v.client.SetxattrFlags(path, xattrHandleIno(n), name, value, flags)
@@ -107,6 +130,7 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 
 // Removexattr removes one extended attribute. ENODATA when absent.
 func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, name string) Status {
+	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
@@ -129,7 +153,11 @@ func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, nam
 			return statusErr(err)
 		}
 	}
-	if st := v.flushCoveringSession(path); st != fsproto.OK {
+	releasePaths := []string{path}
+	if v.isHardlink(n) {
+		releasePaths = append(releasePaths, v.hardlinks.pathsForInos([]uint64{authHandleIno(n)})...)
+	}
+	if st := v.flushCoveringSession(ctx, releasePaths...); st != fsproto.OK {
 		return st
 	}
 	st, err := v.client.Removexattr(path, xattrHandleIno(n), name)
@@ -161,13 +189,13 @@ func validateXattr(name string, value []byte, flags uint8, set bool) Status {
 // flushCoveringSession drains and releases any delegation before an
 // operation that must use the authority lane (existing-object xattrs,
 // hardlink aliases, and parked orphans).
-func (v *Volume) flushCoveringSession(path string) Status {
+func (v *Volume) flushCoveringSession(ctx context.Context, paths ...string) Status {
 	if v.wb == nil {
 		return fsproto.OK
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	if err := v.wb.ReleaseFor(ctx, path); err != nil {
+	if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
 		return statusErr(err)
 	}
 	return fsproto.OK

@@ -3,6 +3,14 @@ import FSKit
 import os
 @preconcurrency import Darwin
 
+private final class PfsUncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
 struct PfsSyntheticDirectoryEntry: Sendable, Equatable {
     var name: Data
     var nextCookie: UInt64
@@ -328,10 +336,11 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         do {
             // The REAL volume barrier: the daemon drains outstanding
             // write-back to the authority and waits for every live protocol
-            // subscriber's supported acknowledgment boundary. macOS 26 has
-            // no kernel-cache invalidation hook, so success guarantees
-            // authority durability, not eviction of a peer FSKit kernel
-            // cache. Failure (unreachable/slow/fenced authority) throws —
+            // subscriber's supported acknowledgment boundary. On macOS 26,
+            // the daemon refreshes known regular-file data and size before
+            // acknowledging content changes; cached namespace bindings and
+            // other attributes remain outside FSKit's public cache-control
+            // surface. Failure (unreachable/slow/fenced authority) throws —
             // never a silent local-only outcome. Local WAL sync failure
             // throws as well and seals later mutation admission.
             try await core.syncVolume()
@@ -343,59 +352,111 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         }
     }
 
+    private func publishAfterReply<Value>(
+        _ operation: @escaping () async throws -> Value,
+        reply: @escaping (Result<Value, Error>) -> Void
+    ) {
+        let operation = PfsUncheckedSendableBox(operation)
+        let reply = PfsUncheckedSendableBox(reply)
+        Task {
+            let (result, complete) = await core.client.withDeferredPublication {
+                try await operation.value()
+            }
+            // FSKit's callback is the framework publication boundary. Invoke
+            // it first; only after it returns may the daemon let Checkin and a
+            // competing peer mutation proceed.
+            reply.value(result)
+            await complete()
+        }
+    }
+
+    @nonobjc
     public func attributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem) async throws -> FSItem.Attributes {
-        do {
-            let attr = try await core.getattr(item: try portableItem(item))
-            return PfsFSKitMapping.attributes(from: attr)
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let attr = try await core.getattr(item: try portableItem(item))
+                return PfsFSKitMapping.attributes(from: attr)
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    public func getAttributes(
+        _ desiredAttributes: FSItem.GetAttributesRequest,
+        of item: FSItem,
+        replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.attributes(desiredAttributes, of: item)
+        }, reply: { result in
+            switch result {
+            case let .success(attributes):
+                reply(attributes, nil)
+            case let .failure(error):
+                reply(nil, error)
+            }
+        })
+    }
+
+    @nonobjc
     public func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem) async throws -> FSItem.Attributes {
-        do {
-            let request = PfsFSKitMapping.setAttributes(from: newAttributes)
-            let attr = try await core.setattr(item: try portableItem(item), attributes: request)
-            return PfsFSKitMapping.attributes(from: attr)
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let request = PfsFSKitMapping.setAttributes(from: newAttributes)
+                let attr = try await core.setattr(item: try portableItem(item), attributes: request)
+                return PfsFSKitMapping.attributes(from: attr)
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func lookupItem(named name: FSFileName, inDirectory directory: FSItem) async throws -> (FSItem, FSFileName) {
-        do {
-            let result = try await core.lookup(in: try portableItem(directory), name: name.data)
-            return (result.item, PfsFSKitMapping.fileName(from: result.canonicalName))
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let result = try await core.lookup(in: try portableItem(directory), name: name.data)
+                return (result.item, PfsFSKitMapping.fileName(from: result.canonicalName))
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func reclaimItem(_ item: FSItem) async throws {
-        do {
-            try await core.reclaim(item: try portableItem(item))
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                try await core.reclaim(item: try portableItem(item))
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func readSymbolicLink(_ item: FSItem) async throws -> FSFileName {
-        do {
-            let target = try await core.readlink(item: try portableItem(item))
-            return PfsFSKitMapping.fileName(from: target)
-        } catch {
-            logger.error("readlink failed: \(String(describing: error), privacy: .private)")
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let target = try await core.readlink(item: try portableItem(item))
+                return PfsFSKitMapping.fileName(from: target)
+            } catch {
+                logger.error("readlink failed: \(String(describing: error), privacy: .private)")
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func createItem(
         named name: FSFileName,
         type: FSItem.ItemType,
         inDirectory directory: FSItem,
         attributes newAttributes: FSItem.SetAttributesRequest
     ) async throws -> (FSItem, FSFileName) {
-        do {
+        try await core.client.withPublicationBoundary {
+          do {
             let mode = newAttributes.isValid(.mode) ? newAttributes.mode : 0o644
             let result: PfsCreateResult
             switch type {
@@ -407,18 +468,21 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 throw PfsLocalClientError.daemon(errno: ENOTSUP, message: "unsupported create item type")
             }
             return (result.item, PfsFSKitMapping.fileName(from: result.canonicalName))
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func createSymbolicLink(
         named name: FSFileName,
         inDirectory directory: FSItem,
         attributes newAttributes: FSItem.SetAttributesRequest,
         linkContents contents: FSFileName
     ) async throws -> (FSItem, FSFileName) {
-        do {
+        try await core.client.withPublicationBoundary {
+          do {
             let targetBytes = PfsFSKitMapping.bytes(from: contents)
             let result = try await core.symlink(
                 in: try portableItem(directory),
@@ -426,23 +490,29 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 target: targetBytes
             )
             return (result.item, PfsFSKitMapping.fileName(from: result.canonicalName))
-        } catch {
-            logger.error("symlink create failed: \(String(describing: error), privacy: .private)")
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              logger.error("symlink create failed: \(String(describing: error), privacy: .private)")
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func createLink(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem) async throws -> FSFileName {
-        do {
-            let canonicalName = try await core.hardLink(item: try portableItem(item), in: try portableItem(directory), name: name.data)
-            return PfsFSKitMapping.fileName(from: canonicalName)
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let canonicalName = try await core.hardLink(item: try portableItem(item), in: try portableItem(directory), name: name.data)
+                return PfsFSKitMapping.fileName(from: canonicalName)
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func removeItem(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem) async throws {
-        do {
+        try await core.client.withPublicationBoundary {
+          do {
             let portable = try portableItem(item)
             let attr = try await core.getattr(item: portable)
             try await core.remove(
@@ -451,11 +521,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 from: try portableItem(directory),
                 isDirectory: attr.kind == .directory
             )
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func renameItem(
         _ item: FSItem,
         inDirectory sourceDirectory: FSItem,
@@ -464,7 +536,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         inDirectory destinationDirectory: FSItem,
         overItem: FSItem?
     ) async throws -> FSFileName {
-        do {
+        try await core.client.withPublicationBoundary {
+          do {
             let sourceItem = try portableItem(item)
             try await core.rename(
                 item: sourceItem,
@@ -478,11 +551,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 try await core.recordRenameReplacement(replacedItem: replacedItem)
             }
             return destinationName
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func enumerateDirectory(
         _ directory: FSItem,
         startingAt cookie: FSDirectoryCookie,
@@ -490,7 +565,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         attributes: FSItem.GetAttributesRequest?,
         packer: FSDirectoryEntryPacker
     ) async throws -> FSDirectoryVerifier {
-        do {
+        return try await core.client.withPublicationBoundary {
+          do {
             let portableDirectory = try portableItem(directory)
             let attributesRequested = attributes != nil
             logger.debug("enumerate dir=\(portableDirectory.identity.itemID) cookie=\(cookie.rawValue) verifier=\(verifier.rawValue) attrs=\(attributesRequested)")
@@ -556,35 +632,44 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 )
             }
             return FSDirectoryVerifier(currentVerifier)
-        } catch let error as PfsLocalClientError where error.posixErrno == ESTALE {
+          } catch let error as PfsLocalClientError where error.posixErrno == ESTALE {
             // The daemon signals an unknown/expired/pre-restart enumeration cookie with
             // ESTALE (its documented fail-safe). Surface FSKit's invalid-directory-cookie
             // error so the kernel restarts the enumeration from scratch instead of
             // bubbling a raw POSIX ESTALE to readdir callers.
             throw PfsErrorMapper.invalidDirectoryCookieError()
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func openItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
-        do {
-            try await core.open(item: try portableItem(item), mode: PfsFSKitMapping.openMode(from: modes))
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                try await core.open(item: try portableItem(item), mode: PfsFSKitMapping.openMode(from: modes))
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func closeItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
-        do {
-            try await core.close(item: try portableItem(item), retainingModes: PfsFSKitMapping.openMode(from: modes))
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                try await core.close(item: try portableItem(item), retainingModes: PfsFSKitMapping.openMode(from: modes))
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> Int {
-        do {
+        try await core.client.withPublicationBoundary {
+          do {
             let pit = try portableItem(item)
             let data = try await core.read(item: pit, offset: UInt64(offset), length: UInt32(clamping: length))
             let copied = min(data.count, buffer.length)
@@ -596,30 +681,39 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 }
             }
             return copied
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> Int {
-        do {
-            let result = try await core.write(item: try portableItem(item), offset: UInt64(offset), data: contents)
-            return Int(result.written)
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let result = try await core.write(item: try portableItem(item), offset: UInt64(offset), data: contents)
+                return Int(result.written)
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func xattr(named name: FSFileName, of item: FSItem) async throws -> Data {
-        do {
-            return try await core.xattrGet(item: try portableItem(item), name: try PfsFSKitMapping.xattrName(from: name))
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                return try await core.xattrGet(item: try portableItem(item), name: try PfsFSKitMapping.xattrName(from: name))
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
     }
 
+    @nonobjc
     public func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy) async throws {
-        do {
+        try await core.client.withPublicationBoundary {
+          do {
             let portable = try portableItem(item)
             let xattrName = try PfsFSKitMapping.xattrName(from: name)
             switch policy {
@@ -634,18 +728,315 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             @unknown default:
                 throw PfsLocalClientError.daemon(errno: EINVAL, message: "unknown xattr policy")
             }
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+          } catch {
+              throw PfsErrorMapper.fsKitError(for: error)
+          }
         }
     }
 
+    @nonobjc
     public func xattrs(of item: FSItem) async throws -> [FSFileName] {
-        do {
-            let names = try await core.xattrList(item: try portableItem(item))
-            return names.map { FSFileName(string: $0) }
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        try await core.client.withPublicationBoundary {
+            do {
+                let names = try await core.xattrList(item: try portableItem(item))
+                return names.map { FSFileName(string: $0) }
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
         }
+    }
+
+    public func setAttributes(
+        _ newAttributes: FSItem.SetAttributesRequest,
+        on item: FSItem,
+        replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.setAttributes(newAttributes, on: item)
+        }, reply: { result in
+            switch result {
+            case let .success(attributes): reply(attributes, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
+    }
+
+    public func lookupItem(
+        named name: FSFileName,
+        inDirectory directory: FSItem,
+        replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.lookupItem(named: name, inDirectory: directory)
+        }, reply: { result in
+            switch result {
+            case let .success((item, canonicalName)): reply(item, canonicalName, nil)
+            case let .failure(error): reply(nil, nil, error)
+            }
+        })
+    }
+
+    public func reclaimItem(
+        _ item: FSItem,
+        replyHandler reply: @escaping (Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.reclaimItem(item)
+        }, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
+    }
+
+    public func readSymbolicLink(
+        _ item: FSItem,
+        replyHandler reply: @escaping (FSFileName?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.readSymbolicLink(item)
+        }, reply: { result in
+            switch result {
+            case let .success(contents): reply(contents, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
+    }
+
+    public func createItem(
+        named name: FSFileName,
+        type: FSItem.ItemType,
+        inDirectory directory: FSItem,
+        attributes newAttributes: FSItem.SetAttributesRequest,
+        replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.createItem(
+                named: name,
+                type: type,
+                inDirectory: directory,
+                attributes: newAttributes
+            )
+        }, reply: { result in
+            switch result {
+            case let .success((item, canonicalName)): reply(item, canonicalName, nil)
+            case let .failure(error): reply(nil, nil, error)
+            }
+        })
+    }
+
+    public func createSymbolicLink(
+        named name: FSFileName,
+        inDirectory directory: FSItem,
+        attributes newAttributes: FSItem.SetAttributesRequest,
+        linkContents contents: FSFileName,
+        replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.createSymbolicLink(
+                named: name,
+                inDirectory: directory,
+                attributes: newAttributes,
+                linkContents: contents
+            )
+        }, reply: { result in
+            switch result {
+            case let .success((item, canonicalName)): reply(item, canonicalName, nil)
+            case let .failure(error): reply(nil, nil, error)
+            }
+        })
+    }
+
+    public func createLink(
+        to item: FSItem,
+        named name: FSFileName,
+        inDirectory directory: FSItem,
+        replyHandler reply: @escaping (FSFileName?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.createLink(to: item, named: name, inDirectory: directory)
+        }, reply: { result in
+            switch result {
+            case let .success(canonicalName): reply(canonicalName, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
+    }
+
+    public func removeItem(
+        _ item: FSItem,
+        named name: FSFileName,
+        fromDirectory directory: FSItem,
+        replyHandler reply: @escaping (Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.removeItem(item, named: name, fromDirectory: directory)
+        }, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
+    }
+
+    public func renameItem(
+        _ item: FSItem,
+        inDirectory sourceDirectory: FSItem,
+        named sourceName: FSFileName,
+        to destinationName: FSFileName,
+        inDirectory destinationDirectory: FSItem,
+        overItem: FSItem?,
+        replyHandler reply: @escaping (FSFileName?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.renameItem(
+                item,
+                inDirectory: sourceDirectory,
+                named: sourceName,
+                to: destinationName,
+                inDirectory: destinationDirectory,
+                overItem: overItem
+            )
+        }, reply: { result in
+            switch result {
+            case let .success(canonicalName): reply(canonicalName, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
+    }
+
+    public func enumerateDirectory(
+        _ directory: FSItem,
+        startingAt cookie: FSDirectoryCookie,
+        verifier: FSDirectoryVerifier,
+        attributes: FSItem.GetAttributesRequest?,
+        packer: FSDirectoryEntryPacker,
+        replyHandler reply: @escaping (FSDirectoryVerifier, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.enumerateDirectory(
+                directory,
+                startingAt: cookie,
+                verifier: verifier,
+                attributes: attributes,
+                packer: packer
+            )
+        }, reply: { result in
+            switch result {
+            case let .success(currentVerifier): reply(currentVerifier, nil)
+            case let .failure(error): reply(.initial, error)
+            }
+        })
+    }
+
+    public func openItem(
+        _ item: FSItem,
+        modes: FSVolume.OpenModes,
+        replyHandler reply: @escaping (Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.openItem(item, modes: modes)
+        }, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
+    }
+
+    public func closeItem(
+        _ item: FSItem,
+        modes: FSVolume.OpenModes,
+        replyHandler reply: @escaping (Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.closeItem(item, modes: modes)
+        }, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
+    }
+
+    public func read(
+        from item: FSItem,
+        at offset: off_t,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer,
+        replyHandler reply: @escaping (Int, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.read(from: item, at: offset, length: length, into: buffer)
+        }, reply: { result in
+            switch result {
+            case let .success(count): reply(count, nil)
+            case let .failure(error): reply(0, error)
+            }
+        })
+    }
+
+    public func write(
+        contents: Data,
+        to item: FSItem,
+        at offset: off_t,
+        replyHandler reply: @escaping (Int, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.write(contents: contents, to: item, at: offset)
+        }, reply: { result in
+            switch result {
+            case let .success(count): reply(count, nil)
+            case let .failure(error): reply(0, error)
+            }
+        })
+    }
+
+    public func getXattr(
+        named name: FSFileName,
+        of item: FSItem,
+        replyHandler reply: @escaping (Data?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.xattr(named: name, of: item)
+        }, reply: { result in
+            switch result {
+            case let .success(value): reply(value, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
+    }
+
+    public func setXattr(
+        named name: FSFileName,
+        to value: Data?,
+        on item: FSItem,
+        policy: FSVolume.SetXattrPolicy,
+        replyHandler reply: @escaping (Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.setXattr(named: name, to: value, on: item, policy: policy)
+        }, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
+    }
+
+    public func listXattrs(
+        of item: FSItem,
+        replyHandler reply: @escaping ([FSFileName]?, Error?) -> Void
+    ) {
+        publishAfterReply({
+            try await self.xattrs(of: item)
+        }, reply: { result in
+            switch result {
+            case let .success(names): reply(names, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
     }
 
     public func shutdown() async {

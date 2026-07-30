@@ -266,11 +266,25 @@ func dialPFS(t *testing.T, sock string) *pfsTestClient {
 
 func (c *pfsTestClient) close() { _ = c.conn.Close() }
 
+func currentTestProtocol(body any) any {
+	hello, ok := body.(*pfslocal.Hello)
+	if !ok || hello.ProtocolMinor != 0 {
+		return body
+	}
+	copy := *hello
+	copy.ProtocolMinor = pfslocal.ProtocolMinor
+	return &copy
+}
+
 func (c *pfsTestClient) call(body any) any {
 	c.t.Helper()
+	body = currentTestProtocol(body)
 	c.next++
 	id := c.next
-	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{RequestID: id, Body: body}); err != nil {
+	operationID := id
+	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+		RequestID: id, OperationID: operationID, Body: body,
+	}); err != nil {
 		c.t.Fatal(err)
 	}
 	for {
@@ -287,15 +301,26 @@ func (c *pfsTestClient) call(body any) any {
 		if er, ok := env.Body.(*pfslocal.ErrorReply); ok {
 			c.t.Fatalf("unexpected error reply: %+v", er)
 		}
+		if env.PublicationAckRequired {
+			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+				Body: &pfslocal.PublicationAck{OperationID: operationID},
+			}); err != nil {
+				c.t.Fatal(err)
+			}
+		}
 		return env.Body
 	}
 }
 
 func (c *pfsTestClient) callMaybe(body any) (any, *pfslocal.ErrorReply) {
 	c.t.Helper()
+	body = currentTestProtocol(body)
 	c.next++
 	id := c.next
-	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{RequestID: id, Body: body}); err != nil {
+	operationID := id
+	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+		RequestID: id, OperationID: operationID, Body: body,
+	}); err != nil {
 		c.t.Fatal(err)
 	}
 	for {
@@ -310,7 +335,21 @@ func (c *pfsTestClient) callMaybe(body any) (any, *pfslocal.ErrorReply) {
 			c.t.Fatalf("reply id=%d want %d", env.RequestID, id)
 		}
 		if er, ok := env.Body.(*pfslocal.ErrorReply); ok {
+			if env.PublicationAckRequired {
+				if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+					Body: &pfslocal.PublicationAck{OperationID: operationID},
+				}); err != nil {
+					c.t.Fatal(err)
+				}
+			}
 			return nil, er
+		}
+		if env.PublicationAckRequired {
+			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+				Body: &pfslocal.PublicationAck{OperationID: operationID},
+			}); err != nil {
+				c.t.Fatal(err)
+			}
 		}
 		return env.Body, nil
 	}
@@ -318,9 +357,13 @@ func (c *pfsTestClient) callMaybe(body any) (any, *pfslocal.ErrorReply) {
 
 func (c *pfsTestClient) callErr(body any) *pfslocal.ErrorReply {
 	c.t.Helper()
+	body = currentTestProtocol(body)
 	c.next++
 	id := c.next
-	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{RequestID: id, Body: body}); err != nil {
+	operationID := id
+	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+		RequestID: id, OperationID: operationID, Body: body,
+	}); err != nil {
 		c.t.Fatal(err)
 	}
 	for {
@@ -338,7 +381,41 @@ func (c *pfsTestClient) callErr(body any) *pfslocal.ErrorReply {
 		if !ok {
 			c.t.Fatalf("reply = %T, want ErrorReply", env.Body)
 		}
+		if env.PublicationAckRequired {
+			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+				Body: &pfslocal.PublicationAck{OperationID: operationID},
+			}); err != nil {
+				c.t.Fatal(err)
+			}
+		}
 		return er
+	}
+}
+
+func readPFSReply(t *testing.T, conn net.Conn, requestID uint64) *pfslocal.Envelope {
+	t.Helper()
+	for {
+		env, err := pfslocal.ReadFrame(conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.RequestID == 0 {
+			continue
+		}
+		if env.RequestID != requestID {
+			t.Fatalf("reply id=%d want %d", env.RequestID, requestID)
+		}
+		return env
+	}
+}
+
+func expectPFSConnectionClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if env, err := pfslocal.ReadFrame(conn); err == nil {
+		t.Fatalf("connection remained open; unexpected envelope %#v", env)
 	}
 }
 
@@ -773,6 +850,200 @@ func TestDaemonControlAndFrontendEndToEnd(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestFrontendSignalsOnlyPublicationRepliesAndKeepsConnectionOpen(t *testing.T) {
+	authority := serveAuthority(t)
+	cfg, _, ref, cancel := startDaemon(t, authority)
+	defer cancel()
+
+	c := dialPFS(t, cfg.FrontendSocket)
+	defer c.close()
+	c.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "ack-contract-test"})
+	resolve := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
+	created := c.call(&pfslocal.CreateRequest{
+		Dir:       resolve.Root,
+		Name:      []byte("ack-contract"),
+		Mode:      0o644,
+		Exclusive: true,
+	}).(*pfslocal.CreateReply)
+	c.call(&pfslocal.CloseRequest{Handle: created.Handle})
+
+	request := func(body any) *pfslocal.Envelope {
+		t.Helper()
+		c.next++
+		operationID := c.next
+		if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+			RequestID:   c.next,
+			OperationID: operationID,
+			Body:        body,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return readPFSReply(t, c.conn, c.next)
+	}
+
+	open := request(&pfslocal.OpenRequest{Item: created.Attr.Item, Mode: pfslocal.OpenModeRead})
+	if open.PublicationAckRequired {
+		t.Fatal("open reply unexpectedly requires publication acknowledgement")
+	}
+	handle := open.Body.(*pfslocal.OpenReply).Handle
+
+	statfs := request(&pfslocal.StatfsRequest{})
+	if statfs.PublicationAckRequired {
+		t.Fatal("statfs reply unexpectedly requires publication acknowledgement")
+	}
+
+	getattr := request(&pfslocal.GetAttrRequest{Item: created.Attr.Item})
+	if !getattr.PublicationAckRequired {
+		t.Fatal("getattr reply did not require publication acknowledgement")
+	}
+	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
+		Body: &pfslocal.PublicationAck{
+			OperationID: getattr.RequestID,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second non-publishing round trip proves that omitting acknowledgements
+	// for Open and Statfs leaves the same production server connection usable.
+	after := request(&pfslocal.StatfsRequest{})
+	if _, ok := after.Body.(*pfslocal.StatfsReply); !ok {
+		t.Fatalf("post-publication statfs reply = %T", after.Body)
+	}
+	c.call(&pfslocal.CloseRequest{Handle: handle})
+}
+
+func TestFrontendRejectsMalformedRequestAndPublicationSequences(t *testing.T) {
+	cfg, _, ref, cancel := startDaemon(t, serveAuthority(t))
+	defer cancel()
+
+	t.Run("unknown publication acknowledgement", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			Body: &pfslocal.PublicationAck{OperationID: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("acknowledgement carries request id", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID: 1,
+			Body:      &pfslocal.PublicationAck{OperationID: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("non-increasing request id", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		hello := &pfslocal.Envelope{
+			RequestID: 2,
+			Body: &pfslocal.Hello{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: pfslocal.ProtocolMinor,
+				ClientName:    "sequence-test",
+			},
+		}
+		if err := pfslocal.WriteFrame(conn, hello); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, hello.RequestID)
+		if err := pfslocal.WriteFrame(conn, hello); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("resolve before hello", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID: 1,
+			Body:      &pfslocal.ResolveRequest{AttachRef: "anything"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("attached request before resolve", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID: 1,
+			Body: &pfslocal.Hello{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: pfslocal.ProtocolMinor,
+				ClientName:    "state-test",
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, 1)
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID: 2,
+			Body:      &pfslocal.StatfsRequest{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("second resolve", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID: 1,
+			Body: &pfslocal.Hello{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: pfslocal.ProtocolMinor,
+				ClientName:    "state-test",
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, 1)
+		resolve := &pfslocal.Envelope{
+			RequestID: 2,
+			Body:      &pfslocal.ResolveRequest{AttachRef: ref},
+		}
+		if err := pfslocal.WriteFrame(conn, resolve); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, 2)
+		resolve.RequestID = 3
+		if err := pfslocal.WriteFrame(conn, resolve); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
 }
 
 func TestStopIfIdleAtomicallyRefusesBusyDaemon(t *testing.T) {
@@ -2065,6 +2336,118 @@ func TestDaemonWritebackHardLinkSharesOpenItemAcrossRestart(t *testing.T) {
 	c2.call(&pfslocal.FsyncRequest{Handle: closedAlias.Handle})
 	c2.call(&pfslocal.CloseRequest{Handle: closedAlias.Handle})
 	c2.call(&pfslocal.CloseRequest{Handle: closedSource.Handle})
+}
+
+func TestDaemonPeerHardLinkDiscoveryReusesDelegatedCreateIdentity(t *testing.T) {
+	authority := serveAuthority(t)
+	cfg, hc, _ := startDaemonNoAttach(t, authority)
+	opts := map[string]any{"flushIntervalMs": int64(time.Hour / time.Millisecond)}
+	ref := ensureAttachWithPolicyOptions(
+		t, hc, authority, "vol-peer-hardlink", "main",
+		"/Volumes/PeerHardlink", "writeback", opts,
+	)
+
+	local := dialPFS(t, cfg.FrontendSocket)
+	defer local.close()
+	local.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "peer-hardlink-local"})
+	root := local.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply).Root
+	dir := local.call(&pfslocal.MkdirRequest{
+		Dir: root, Name: []byte("delegated"), Mode: 0o755,
+	}).(*pfslocal.MkdirReply)
+	source := local.call(&pfslocal.CreateRequest{
+		Dir: dir.Attr.Item, Name: []byte("source"), Mode: 0o644, Exclusive: true,
+	}).(*pfslocal.CreateReply)
+	if source.Attr.Item.ItemID&localItemIDMarker == 0 {
+		t.Fatalf("delegated create item=%+v, want daemon-local identity", source.Attr.Item)
+	}
+	local.call(&pfslocal.WriteRequest{Handle: source.Handle, Data: []byte("before")})
+
+	// Synchronize makes the data authority-durable while the adaptive
+	// delegation remains held. The peer link below recalls that delegation;
+	// its release pin assigns an authority inode to source's still-open
+	// NodeState while the frontend gate is closed. portablefsd must index
+	// that inode before the peer can publish a new name for it.
+	local.call(&pfslocal.SyncVolumeRequest{})
+
+	peer, err := clientcore.Dial(context.Background(), clientcore.Options{
+		Addr: authority, Pool: 2, Owner: "peer-hardlink-writer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	peerSource, st := peer.Lookup(context.Background(), "delegated/source")
+	if st != fsproto.OK || peerSource.Ino == 0 {
+		t.Fatalf("peer source lookup: attr=%+v st=%d", peerSource, st)
+	}
+	peerState := clientcore.NewNodeState(peerSource.Ino, true)
+	for _, alias := range []string{"lookup-alias", "enum-alias"} {
+		if linked, st := peer.Link(
+			context.Background(),
+			"delegated/source",
+			"delegated/"+alias,
+			peerState,
+		); st != fsproto.OK || linked.Ino != peerSource.Ino {
+			t.Fatalf("peer link %s: attr=%+v st=%d", alias, linked, st)
+		}
+	}
+	local.call(&pfslocal.CloseRequest{Handle: source.Handle})
+
+	lookupAlias := local.call(&pfslocal.LookupRequest{
+		Dir: dir.Attr.Item, Name: []byte("lookup-alias"),
+	}).(*pfslocal.LookupReply)
+	if lookupAlias.Attr.Item != source.Attr.Item {
+		t.Fatalf("peer alias lookup split frontend identity: source=%+v alias=%+v",
+			source.Attr.Item, lookupAlias.Attr.Item)
+	}
+
+	page := local.call(&pfslocal.EnumerateRequest{
+		Dir: dir.Attr.Item, MaxEntries: 32, WantAttrs: true,
+	}).(*pfslocal.EnumerateReply)
+	var enumAlias *pfslocal.DirEntry
+	for i := range page.Entries {
+		if string(page.Entries[i].Name) == "enum-alias" {
+			enumAlias = &page.Entries[i]
+			break
+		}
+	}
+	if enumAlias == nil {
+		t.Fatalf("peer enum alias absent from listing: %+v", page.Entries)
+	}
+	if enumAlias.Attr.Item != source.Attr.Item {
+		t.Fatalf("peer alias readdir split frontend identity: source=%+v alias=%+v",
+			source.Attr.Item, enumAlias.Attr.Item)
+	}
+
+	// Removing the original name must move the canonical path to an alias
+	// without changing Item ID, generation, or NodeState. An already-open
+	// handle and a newly-opened survivor then share writes.
+	beforeUnlink := local.call(&pfslocal.OpenRequest{
+		Item: source.Attr.Item, Mode: pfslocal.OpenModeReadWrite,
+	}).(*pfslocal.OpenReply)
+	local.call(&pfslocal.RemoveRequest{
+		Dir: dir.Attr.Item, Name: []byte("source"),
+	})
+	survivor := local.call(&pfslocal.LookupRequest{
+		Dir: dir.Attr.Item, Name: []byte("enum-alias"),
+	}).(*pfslocal.LookupReply)
+	if survivor.Attr.Item != source.Attr.Item {
+		t.Fatalf("surviving alias changed frontend identity: source=%+v survivor=%+v",
+			source.Attr.Item, survivor.Attr.Item)
+	}
+	afterUnlink := local.call(&pfslocal.OpenRequest{
+		Item: survivor.Attr.Item, Mode: pfslocal.OpenModeReadWrite,
+	}).(*pfslocal.OpenReply)
+	local.call(&pfslocal.WriteRequest{
+		Handle: afterUnlink.Handle, Offset: 0, Data: []byte("shared"),
+	})
+	if got := local.call(&pfslocal.ReadRequest{
+		Handle: beforeUnlink.Handle, Length: 16,
+	}).(*pfslocal.ReadReply); string(got.Data) != "shared" {
+		t.Fatalf("surviving alias write not visible through pre-unlink open: %q", got.Data)
+	}
+	local.call(&pfslocal.CloseRequest{Handle: afterUnlink.Handle})
+	local.call(&pfslocal.CloseRequest{Handle: beforeUnlink.Handle})
 }
 
 func TestDaemonWritebackFrontendItemSurvivesImmediateCrash(t *testing.T) {
