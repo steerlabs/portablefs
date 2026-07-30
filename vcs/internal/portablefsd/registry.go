@@ -1760,6 +1760,74 @@ func (a *attach) registerLocked(p string, attr fsproto.Attr) *itemRecord {
 	return a.registerWithItemLocked(p, attr, ino, authIno, true, false)
 }
 
+// registerHandleAttrLocked updates the immutable Item identity owned by an
+// open handle without assuming that its remembered open path still names that
+// inode. POSIX keeps an overwritten or unlinked target alive through its open
+// descriptor, while the pathname may already name a replacement (or nothing).
+// Re-registering the handle's stale path from a post-write getattr would
+// transiently replace or resurrect that directory entry in the frontend
+// registry.
+//
+// A still-bound handle takes the normal registration path, including
+// delegated-local identity promotion. A detached handle updates only its
+// retained Item and any genuine hard-link aliases. The stale open path remains
+// an authority addressing hint for handle I/O; it is never namespace evidence.
+// Caller holds a.mu.
+func (a *attach) registerHandleAttrLocked(h *handleRecord, attr fsproto.Attr) *itemRecord {
+	if h == nil || h.itemID == 0 || h.state == nil {
+		return nil
+	}
+	if current := a.paths[h.path]; current != nil && current.item.ItemID == h.itemID {
+		return a.registerLocked(h.path, attr)
+	}
+
+	rec := a.items[h.itemID]
+	if rec == nil || rec.state == nil {
+		return nil
+	}
+	recAuthorityIno := rec.state.AuthorityIno()
+	handleAuthorityIno := h.state.AuthorityIno()
+	if rec.state != h.state &&
+		(recAuthorityIno == 0 || handleAuthorityIno == 0 ||
+			recAuthorityIno != handleAuthorityIno) {
+		return nil
+	}
+	if attr.Ino != 0 && recAuthorityIno != 0 && attr.Ino != recAuthorityIno {
+		return nil
+	}
+
+	promoted := false
+	if attr.Ino != 0 && recAuthorityIno == 0 {
+		if !rec.state.RecordAuthorityIno(attr.Ino) {
+			return nil
+		}
+		promoted = true
+	}
+	rec.attr = attr
+	for aliasPath := range a.itemAliases[h.itemID] {
+		alias := a.paths[aliasPath]
+		if alias == nil || alias.item != rec.item || alias.state != rec.state {
+			continue
+		}
+		alias.attr = attr
+	}
+	a.indexAuthorityIdentityLocked(rec)
+	if promoted {
+		if len(a.itemAliases[h.itemID]) == 0 {
+			entry := a.bindingEntryLocked("detach", rec)
+			entry.Path = h.openPath
+			a.pendingBindings = append(a.pendingBindings, entry)
+		} else {
+			for aliasPath := range a.itemAliases[h.itemID] {
+				if alias := a.paths[aliasPath]; alias != nil {
+					a.pendBindingLocked(alias)
+				}
+			}
+		}
+	}
+	return rec
+}
+
 func (a *attach) registerCreatedLocked(p string, attr fsproto.Attr) *itemRecord {
 	if attr.Ino != 0 {
 		return a.registerLocked(p, attr)

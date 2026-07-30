@@ -653,7 +653,7 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	rec := a.registerLocked(h.path, attr)
+	rec := a.registerHandleAttrLocked(h, attr)
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO

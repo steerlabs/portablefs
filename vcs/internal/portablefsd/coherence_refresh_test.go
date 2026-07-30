@@ -467,6 +467,38 @@ func TestFrontendItemOperationCoversEveryHardlinkAlias(t *testing.T) {
 	}
 }
 
+func TestDetachedHandlePublicationScopeNeverUsesStalePath(t *testing.T) {
+	state := clientcore.NewNodeState(7, true)
+	item := pfslocal.Item{ItemID: 7, ItemGeneration: 1}
+	a := &attach{
+		items:       map[uint64]*itemRecord{},
+		paths:       map[string]*itemRecord{},
+		itemAliases: map[uint64]map[string]struct{}{},
+		handles:     map[uint64]*handleRecord{},
+	}
+	detached := &itemRecord{item: item, path: "target", state: state}
+	replacement := &itemRecord{
+		item:  pfslocal.Item{ItemID: 9, ItemGeneration: 1},
+		path:  "target",
+		state: clientcore.NewNodeState(9, true),
+	}
+	a.items[item.ItemID] = detached
+	a.items[replacement.item.ItemID] = replacement
+	a.paths["target"] = replacement
+	a.addItemAliasLocked(replacement)
+	a.handles[3] = &handleRecord{
+		id: 3, itemID: item.ItemID, path: "target", openPath: "target", state: state, write: true,
+	}
+
+	paths, _, publishes := a.frontendOperationPaths(&pfslocal.WriteRequest{Handle: 3})
+	if !publishes {
+		t.Fatal("detached write was not publication-tracked")
+	}
+	if len(paths) != 1 || paths[0] != "" {
+		t.Fatalf("detached write publication paths=%v want mount-wide unknown scope", paths)
+	}
+}
+
 func TestFrontendHandoffCancellationReopensAdmission(t *testing.T) {
 	a := &attach{}
 	_, op := a.beginFrontendPaths(context.Background(), []string{"d/f"})
