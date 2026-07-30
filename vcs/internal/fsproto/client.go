@@ -195,6 +195,13 @@ func (cn *conn) ensure() error {
 // bounded and health-accounted; a successful attempt is the probe that
 // clears the shared reachability state.
 func (cn *conn) ensureWithGate(resolved bool) error {
+	return cn.ensureWithGateContext(context.Background(), resolved)
+}
+
+func (cn *conn) ensureWithGateContext(ctx context.Context, resolved bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cn.connected() {
 		return nil
 	}
@@ -204,7 +211,7 @@ func (cn *conn) ensureWithGate(resolved bool) error {
 	if err := cn.health.gate(cn.gateExempt || resolved); err != nil {
 		return err
 	}
-	err := cn.dialOnce()
+	err := cn.dialOnceContext(ctx)
 	if err == nil {
 		cn.health.recordSuccess()
 		if cn.client != nil && cn.client.redial != nil {
@@ -215,7 +222,7 @@ func (cn *conn) ensureWithGate(resolved bool) error {
 	// A definite token rejection is an ANSWER from a reachable peer, not
 	// unreachability (see failfast.go), so it does not trip the transport
 	// breaker. It still returns immediately and fails closed.
-	if !errors.Is(err, ErrSessionTokenRejected) && !errors.Is(err, net.ErrClosed) {
+	if !errors.Is(err, ErrSessionTokenRejected) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		cn.health.recordFailure()
 	}
 	return err
@@ -228,28 +235,62 @@ func (cn *conn) ensureWithGate(resolved bool) error {
 // immediately: every address shares the same credential, so offering a dead
 // token to the rest of the list only adds to the reconnect storm.
 func (cn *conn) dialOnce() error {
+	return cn.dialOnceContext(context.Background())
+}
+
+func (cn *conn) dialOnceContext(ctx context.Context) error {
 	token := secure.AuthToken()
 	if cn.auth != nil {
 		token = cn.auth()
 	}
-	dialCtx := context.Background()
+	dialCtx, cancelDial := context.WithCancel(ctx)
+	defer cancelDial()
+	stopLifecycle := func() bool { return true }
 	if cn.client != nil && cn.client.lifecycleCtx != nil {
-		dialCtx = cn.client.lifecycleCtx
+		stopLifecycle = context.AfterFunc(cn.client.lifecycleCtx, cancelDial)
 	}
+	defer stopLifecycle()
 	if cn.transport != nil {
 		nc, err := cn.transport(dialCtx)
 		if err != nil {
 			if dialCtx.Err() != nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				return net.ErrClosed
 			}
 			return err
 		}
+		if err := dialCtx.Err(); err != nil {
+			_ = nc.Close()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
+			return net.ErrClosed
+		}
 		if err := cn.adoptTransport(nc); err != nil {
 			return err
 		}
+		if err := dialCtx.Err(); err != nil {
+			cn.reset()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
+			return net.ErrClosed
+		}
 		if err := clientHandshake(nc, token); err != nil {
 			cn.reset()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
 			return err
+		}
+		if err := dialCtx.Err(); err != nil {
+			cn.reset()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
+			return net.ErrClosed
 		}
 		if err := cn.finishTransport(nc); err != nil {
 			cn.reset()
@@ -268,6 +309,9 @@ func (cn *conn) dialOnce() error {
 	var lastErr error
 	for _, addr := range cn.addrs {
 		if err := dialCtx.Err(); err != nil {
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
 			return net.ErrClosed
 		}
 		var (
@@ -282,6 +326,9 @@ func (cn *conn) dialOnce() error {
 		}
 		if err != nil {
 			if dialCtx.Err() != nil {
+				if callerErr := ctx.Err(); callerErr != nil {
+					return callerErr
+				}
 				return net.ErrClosed
 			}
 			lastErr = err
@@ -290,16 +337,33 @@ func (cn *conn) dialOnce() error {
 		if err := cn.adoptTransport(nc); err != nil {
 			return err
 		}
+		if err := dialCtx.Err(); err != nil {
+			cn.reset()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
+			return net.ErrClosed
+		}
 		// Authenticate to the server before using the connection (no-op when
 		// unset). The typed classification is the point: rejection means the
 		// CREDENTIAL is dead, not the network.
 		if err := clientHandshake(nc, token); err != nil {
 			cn.reset()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
 			if errors.Is(err, ErrSessionTokenRejected) {
 				return fmt.Errorf("fsproto: dial %s: %w", addr, err)
 			}
 			lastErr = err
 			continue
+		}
+		if err := dialCtx.Err(); err != nil {
+			cn.reset()
+			if callerErr := ctx.Err(); callerErr != nil {
+				return callerErr
+			}
+			return net.ErrClosed
 		}
 		if err := cn.finishTransport(nc); err != nil {
 			cn.reset()
@@ -401,8 +465,15 @@ func (cn *conn) roundtripSent(req *Request) (*Response, bool, error) {
 }
 
 func (cn *conn) roundtripSentWithGate(req *Request, resolved bool) (*Response, bool, error) {
+	return cn.roundtripSentWithGateContext(context.Background(), req, resolved)
+}
+
+func (cn *conn) roundtripSentWithGateContext(ctx context.Context, req *Request, resolved bool) (*Response, bool, error) {
 	prepared, err := prepareRequest(req)
 	if err != nil {
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
 	// Gate before dialing/sending: while fail-fast is engaged, a non-exempt op
@@ -411,7 +482,10 @@ func (cn *conn) roundtripSentWithGate(req *Request, resolved bool) (*Response, b
 	if err := cn.health.gate(cn.gateExempt || resolved); err != nil {
 		return nil, false, err
 	}
-	if err := cn.ensureWithGate(resolved); err != nil {
+	if err := cn.ensureWithGateContext(ctx, resolved); err != nil {
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
 	if cn.client != nil && cn.client.isClosed() {
@@ -425,15 +499,23 @@ func (cn *conn) roundtripSentWithGate(req *Request, resolved bool) (*Response, b
 	// Bound the round-trip so a partitioned VCS surfaces as EIO (idempotent ops then
 	// retry) instead of hanging the FUSE op until the OS TCP timeout. The conn is
 	// reset on any error, so the deadline never leaks onto a reused connection.
-	_ = nc.SetDeadline(time.Now().Add(opTimeout))
+	deadline := time.Now().Add(opTimeout)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	_ = nc.SetDeadline(deadline)
 	if err := enc.encodePrepared(req, prepared); err != nil {
-		cn.health.recordFailure()
+		if ctx.Err() == nil {
+			cn.health.recordFailure()
+		}
 		cn.reset()
 		return nil, true, err
 	}
 	var resp Response
 	if err := dec.Decode(&resp); err != nil {
-		cn.health.recordFailure()
+		if ctx.Err() == nil {
+			cn.health.recordFailure()
+		}
 		cn.reset()
 		return nil, true, err
 	}
@@ -840,6 +922,21 @@ func (c *Client) ReadVHandle(path string, handleIno uint64, off, n int64) (data 
 // safe negative-cache metadata.
 func (c *Client) GetattrV(path string) (a Attr, version, gen, parentVersion uint64, status int32, err error) {
 	r, err := c.Do(&Request{Op: OpGetattr, Path: path})
+	if err != nil {
+		return Attr{}, 0, 0, 0, EIO, err
+	}
+	if r.Attr != nil {
+		a = *r.Attr
+	}
+	return a, r.Version, r.Gen, r.ParentVersion, r.Status, nil
+}
+
+// GetattrVContext is the cancellable exact-sampling form. It uses the
+// session-attached context roundtrip so cancellation interrupts and joins the
+// checked-out transport; callers never leave a stale authority sample running
+// after an exact coherence barrier has timed out.
+func (c *Client) GetattrVContext(ctx context.Context, path string) (a Attr, version, gen, parentVersion uint64, status int32, err error) {
+	r, _, err := c.roundtripAttachedContext(ctx, &Request{Op: OpGetattr, Path: path})
 	if err != nil {
 		return Attr{}, 0, 0, 0, EIO, err
 	}

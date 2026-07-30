@@ -4,11 +4,18 @@
 // Transport: a SOCK_STREAM Unix domain socket. Every frame is a 4-byte
 // little-endian unsigned length N (N <= 16 MiB) followed by N bytes encoding one
 // Envelope. Client→daemon envelopes carry request bodies with a nonzero,
-// client-chosen, strictly-increasing request_id. Daemon→client envelopes either
+// client-chosen, strictly-increasing request_id. PublicationAck is the sole
+// one-way client message and uses request_id 0; it confirms that an earlier
+// operation reply — including a cacheable negative/error such as ENOENT — has
+// been fully published to the kernel, not merely read from the socket.
+// Daemon→client envelopes either
 // echo a request_id (exactly one reply per request) or carry request_id 0 for
 // server-initiated Events. Requests may be pipelined; replies may arrive out of
 // order. Read/Write data rides inside frames (no side channel) — the daemon is
 // loopback, so the copy is cheap relative to correctness.
+// A connection sends exactly one successful Hello followed by exactly one
+// successful Resolve; all filesystem requests and PublicationAck messages
+// follow that binding. A second Hello or Resolve is a protocol violation.
 //
 // Versioning: Hello/HelloReply negotiate {major, minor}. Same major = wire
 // compatible; unknown fields are ignored (proto3). Breaking changes bump major
@@ -31,6 +38,15 @@ option swift_prefix = "Pfs";
 
 message Envelope {
   uint64 request_id = 1;
+  // Set only on daemon replies whose result/error can be published into the
+  // frontend's kernel cache. The client must send exactly one PublicationAck
+  // for such a reply after the framework reply callback returns. Replies
+  // without this bit must not be acknowledged.
+  bool publication_ack_required = 2;
+  // Strictly increasing within one connection. Every request issued while
+  // producing one FSKit framework reply carries the same nonzero ID, making a
+  // multi-RPC callback one admission and publication unit across handoffs.
+  uint64 operation_id = 3;
   oneof body {
     // client → daemon
     Hello hello = 10;
@@ -59,6 +75,7 @@ message Envelope {
     SubscribeEventsRequest subscribe_events = 33;
     HardLinkRequest hard_link = 34;
     SyncVolumeRequest sync_volume = 35;
+    PublicationAck publication_ack = 36;
 
     // daemon → client (replies)
     HelloReply hello_reply = 60;
@@ -98,9 +115,20 @@ message Envelope {
 
 message Hello {
   uint32 protocol_major = 1; // 1
-  uint32 protocol_minor = 2; // 0
+  uint32 protocol_minor = 2; // 1
   string client_name = 3;    // e.g. "fskit-appex"
   string client_version = 4;
+}
+
+// One-way completion for a cache/namespace-producing operation reply,
+// including a cacheable error or negative result. The envelope request_id is
+// 0; published_request_id names the original request whose result the frontend
+// has finished installing into FSKit.
+message PublicationAck {
+  // Deprecated request-scoped identifier from protocol minor 1. Protocol
+  // minor 2 clients leave it zero and acknowledge operation_id instead.
+  uint64 published_request_id = 1;
+  uint64 operation_id = 2;
 }
 
 message HelloReply {
@@ -360,9 +388,11 @@ message Event {
   }
 }
 
-// Mirrors the authority's push-invalidation stream, item-addressed. On macOS 26
-// the extension treats these as advisory (no kernel cache control); future
-// adapters can use them for kernel-cache coordination where the SDK supports it.
+// Mirrors the authority's push-invalidation stream, item-addressed. On macOS
+// 26 the daemon performs an exact data-and-size refresh for known regular-file
+// items before acknowledging content invalidations. Cached namespace bindings
+// and other attributes remain advisory until the SDK exposes general cache
+// control.
 message Invalidation {
   Item item = 1;
   bool content_changed = 2;   // file data changed remotely

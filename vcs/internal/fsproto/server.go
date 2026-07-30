@@ -118,6 +118,10 @@ type Server struct {
 	// workfs-style (managed) SessionStore. Every mutation requires an exact
 	// envelope; a server without a session store serves reads only.
 	exact *exactState
+	// hookMu guards the mutable test seams below. Production leaves every
+	// hook nil, but tests deliberately replace them while requests are live
+	// to model transport failures and handoff races.
+	hookMu sync.RWMutex
 	// beforeFlushBatch is a test seam used to stall OpFlushBatch for fsync/barrier tests.
 	// Nil in production.
 	beforeFlushBatch func()
@@ -170,13 +174,43 @@ func (ss *subscriberState) observedLocked() uint64 {
 }
 
 // SetBeforeFlushBatch installs a test hook that runs immediately before an OpFlushBatch is applied.
-func (s *Server) SetBeforeFlushBatch(fn func()) { s.beforeFlushBatch = fn }
+func (s *Server) SetBeforeFlushBatch(fn func()) {
+	s.hookMu.Lock()
+	s.beforeFlushBatch = fn
+	s.hookMu.Unlock()
+}
 
-func (s *Server) SetBeforeDelegationPrepare(fn func()) { s.beforeDelegationPrepare = fn }
+func (s *Server) SetBeforeDelegationPrepare(fn func()) {
+	s.hookMu.Lock()
+	s.beforeDelegationPrepare = fn
+	s.hookMu.Unlock()
+}
 
 // SetDropReply installs a test hook that, when it returns true for an applied
 // request, drops the connection WITHOUT sending the response (a lost reply).
-func (s *Server) SetDropReply(fn func(req *Request, resp *Response) bool) { s.dropReply = fn }
+func (s *Server) SetDropReply(fn func(req *Request, resp *Response) bool) {
+	s.hookMu.Lock()
+	s.dropReply = fn
+	s.hookMu.Unlock()
+}
+
+func (s *Server) currentDropReply() func(req *Request, resp *Response) bool {
+	s.hookMu.RLock()
+	defer s.hookMu.RUnlock()
+	return s.dropReply
+}
+
+func (s *Server) currentBeforeFlushBatch() func() {
+	s.hookMu.RLock()
+	defer s.hookMu.RUnlock()
+	return s.beforeFlushBatch
+}
+
+func (s *Server) currentBeforeDelegationPrepare() func() {
+	s.hookMu.RLock()
+	defer s.hookMu.RUnlock()
+	return s.beforeDelegationPrepare
+}
 
 func (s *Server) sessionLock(id string) *sync.Mutex {
 	h := fnv.New32a()
@@ -311,7 +345,7 @@ func (s *Server) handle(conn net.Conn) {
 			// the identical exact identity against a surviving authority.
 			return
 		}
-		if s.dropReply != nil && s.dropReply(&req, resp) {
+		if dropReply := s.currentDropReply(); dropReply != nil && dropReply(&req, resp) {
 			return // test seam: response lost in flight (see SetDropReply)
 		}
 		// A peer that stopped reading must not block the server in Encode on a
@@ -843,8 +877,8 @@ func (s *Server) dispatchConn(cs *connSession, req *Request) *Response {
 		case OpDelegationPrepareRelease:
 			// Idempotent two-phase handoff: pins are durable while the exact
 			// delegation remains held; only the later Checkin releases it.
-			if s.beforeDelegationPrepare != nil {
-				s.beforeDelegationPrepare()
+			if before := s.currentBeforeDelegationPrepare(); before != nil {
+				before()
 			}
 			return s.prepareDelegationRelease(cs, req)
 		case OpWritebackState:
@@ -855,8 +889,8 @@ func (s *Server) dispatchConn(cs *connSession, req *Request) *Response {
 			}
 			return s.exactCoordinate(cs, req)
 		case OpFlushBatch:
-			if s.beforeFlushBatch != nil {
-				s.beforeFlushBatch()
+			if before := s.currentBeforeFlushBatch(); before != nil {
+				before()
 			}
 			// Serialize per write-back session: the ledger's strict
 			// monotonicity would otherwise reject an interleaved retry.

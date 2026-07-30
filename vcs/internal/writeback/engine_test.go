@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +34,90 @@ func testEngine(t *testing.T, auth *fakeAuthority) *Engine {
 	return e
 }
 
+type firstFlushFailsRemote struct {
+	*fakeAuthority
+	mu           sync.Mutex
+	requests     []FlushRequest
+	firstEntered chan struct{}
+	releaseFirst chan struct{}
+	secondSeen   chan struct{}
+}
+
+func (r *firstFlushFailsRemote) Flush(ctx context.Context, req FlushRequest) (FlushReply, error) {
+	r.mu.Lock()
+	r.requests = append(r.requests, req)
+	call := len(r.requests)
+	r.mu.Unlock()
+	if call == 1 {
+		close(r.firstEntered)
+		select {
+		case <-r.releaseFirst:
+			return FlushReply{}, errors.New("injected ambiguous flush failure")
+		case <-ctx.Done():
+			return FlushReply{}, ctx.Err()
+		}
+	}
+	if call == 2 {
+		close(r.secondSeen)
+	}
+	return r.fakeAuthority.Flush(ctx, req)
+}
+
+func (r *firstFlushFailsRemote) firstTwo() (FlushRequest, FlushRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.requests[0], r.requests[1]
+}
+
+func TestFlushRetryPinsExactBatchWhileNewWritesArrive(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	remote := &firstFlushFailsRemote{
+		fakeAuthority: auth,
+		firstEntered:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondSeen:    make(chan struct{}),
+	}
+	e, err := Open(context.Background(), Config{
+		StateDir: t.TempDir(), VolumeID: "vol", Branch: "main", Remote: remote,
+		BudgetBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	select {
+	case <-remote.firstEntered:
+	case <-ctx.Done():
+		t.Fatal("first flush did not start")
+	}
+	if _, handled, err := e.WriteAt(ctx, "d/f", 0, []byte("new tail")); err != nil || !handled {
+		t.Fatalf("write during ambiguous flush: handled=%v err=%v", handled, err)
+	}
+	close(remote.releaseFirst)
+	select {
+	case <-remote.secondSeen:
+	case <-ctx.Done():
+		t.Fatal("flush retry did not start")
+	}
+
+	first, second := remote.firstTwo()
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("ambiguous retry changed batch:\nfirst=%+v\nsecond=%+v", first, second)
+	}
+	if err := e.Fsync(ctx, "d/f"); err != nil {
+		t.Fatalf("drain after exact retry: %v", err)
+	}
+}
+
 func mustHandled(t *testing.T, what string, handled bool, err error) {
 	t.Helper()
 	if err != nil {
@@ -37,6 +125,48 @@ func mustHandled(t *testing.T, what string, handled bool, err error) {
 	}
 	if !handled {
 		t.Fatalf("%s: not handled locally", what)
+	}
+}
+
+func TestAdmissionRevalidatesAfterGrantInstallation(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+
+	aliasUnsafe := false
+	e, err := Open(context.Background(), Config{
+		StateDir:    t.TempDir(),
+		VolumeID:    "vol",
+		Branch:      "main",
+		Remote:      auth,
+		BudgetBytes: 1 << 30,
+		Events: Events{
+			// Clientcore observes the grant snapshot before the acquire
+			// resolver completes. Model that transition at OnGrant: the same
+			// syscall must revalidate, release, and choose authority I/O.
+			OnGrant: func(string) {
+				aliasUnsafe = true
+			},
+			AllowDelegatedMutation: func(context.Context, string) bool {
+				return !aliasUnsafe
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	if _, handled, err := e.Create(context.Background(), "d/file", 0o644, false, false); err != nil || handled {
+		t.Fatalf("post-grant admission: handled=%v err=%v, want authority lane", handled, err)
+	}
+	if e.Covers("d/file") {
+		t.Fatal("rejected grant remained installed")
+	}
+	acquires, _, releases := auth.calls()
+	if acquires != 1 || releases != 1 {
+		t.Fatalf("grant lifecycle: acquires=%d releases=%d, want 1/1", acquires, releases)
 	}
 }
 
@@ -188,9 +318,45 @@ func TestCrashRecoveryReplaysInterleavedScopesAsOneBatch(t *testing.T) {
 		t.Fatalf("release crash lock: %v", err)
 	}
 
+	injectedPrepareErr := errors.New("injected recovered identity persistence failure")
+	if failed, openErr := Open(ctx, Config{
+		StateDir: dir, VolumeID: "vol", Branch: "main", Remote: auth,
+		BudgetBytes: 1 << 30,
+		Events: Events{
+			OnHandoffPrepared: func(
+				context.Context, string, string,
+			) (func(bool), error) {
+				return nil, injectedPrepareErr
+			},
+		},
+	}); openErr == nil {
+		_, _ = failed.ForceClose("unexpected successful recovery")
+		t.Fatal("recovery served after identity persistence failure")
+	} else if !strings.Contains(openErr.Error(), injectedPrepareErr.Error()) {
+		t.Fatalf("recovery prepare failure=%v want %v", openErr, injectedPrepareErr)
+	}
+
+	var preparedScopes []string
+	var completedScopes []string
 	e2, err := Open(ctx, Config{
 		StateDir: dir, VolumeID: "vol", Branch: "main", Remote: auth,
 		BudgetBytes: 1 << 30,
+		Events: Events{
+			OnHandoffPrepared: func(
+				_ context.Context, scope, epoch string,
+			) (func(bool), error) {
+				if epoch == "" {
+					t.Fatalf("recovery prepared empty epoch for %q", scope)
+				}
+				preparedScopes = append(preparedScopes, scope)
+				return func(released bool) {
+					if !released {
+						t.Fatalf("successful recovery retired %q as unreleased", scope)
+					}
+					completedScopes = append(completedScopes, scope)
+				}, nil
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("open recovery engine: %v", err)
@@ -207,8 +373,15 @@ func TestCrashRecoveryReplaysInterleavedScopesAsOneBatch(t *testing.T) {
 	flushes := auth.flushes
 	rebinds := auth.rebinds
 	auth.mu.Unlock()
-	if flushes != 1 || rebinds != 1 {
-		t.Fatalf("mixed recovery RPCs: flushes=%d rebinds=%d, want one of each", flushes, rebinds)
+	if flushes != 1 || rebinds != 2 {
+		t.Fatalf("mixed recovery RPCs: flushes=%d rebinds=%d, want one flush and two rebind attempts", flushes, rebinds)
+	}
+	sort.Strings(preparedScopes)
+	sort.Strings(completedScopes)
+	if !reflect.DeepEqual(preparedScopes, []string{"a", "b"}) ||
+		!reflect.DeepEqual(completedScopes, []string{"a", "b"}) {
+		t.Fatalf("recovery prepared/completed scopes=%v/%v want [a b]/[a b]",
+			preparedScopes, completedScopes)
 	}
 	for i := 0; i < 8; i++ {
 		scope := "a"
@@ -524,6 +697,294 @@ func TestRecallDrainsAndReleases(t *testing.T) {
 	}
 }
 
+// TestRecallKeepsAcknowledgedOverlayReadableDuringDrain pins the handoff
+// window found by the two-mount production stress test. Once a mutation is
+// acknowledged, reads must keep using the holder's authoritative overlay
+// while recall flushes its WAL. Falling through to the authority in this
+// interval can expose the pre-create/pre-write state.
+func TestRecallKeepsAcknowledgedOverlayReadableDuringDrain(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.flushGate = make(chan struct{})
+	auth.flushEntered = make(chan struct{}, 1)
+	flushGate := auth.flushGate
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+
+	// Prevent the steady-state flusher from applying the overlay before the
+	// recall establishes the deterministic drain window.
+	e.fl.mu.Lock()
+	e.fl.nextAttempt = time.Now().Add(time.Hour)
+	e.fl.mu.Unlock()
+
+	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.WriteAt(ctx, "d/f", 0, []byte("acked")); err != nil || !handled {
+		t.Fatalf("write: handled=%v err=%v", handled, err)
+	}
+	if handled, err := e.Setxattr(ctx, "d/f", "user.test", []byte("value"), 0); err != nil || !handled {
+		t.Fatalf("setxattr: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.Symlink(ctx, "d/link", "f"); err != nil || !handled {
+		t.Fatalf("symlink: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.Create(ctx, "d/removed", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create removed: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.Remove(ctx, "d/removed"); err != nil || !handled {
+		t.Fatalf("remove: handled=%v err=%v", handled, err)
+	}
+
+	recallOut := make(chan error, 1)
+	go func() { recallOut <- e.Recall(ctx, "d") }()
+	select {
+	case <-auth.flushEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recall did not enter the blocked authority flush")
+	}
+	permit, err := e.BeginRead(ctx, "d/f")
+	if err != nil {
+		t.Fatalf("begin draining read: %v", err)
+	}
+	permitOpen := true
+	defer func() {
+		if permitOpen {
+			permit.Close()
+		}
+	}()
+	if !e.Covers("d/f") {
+		t.Fatal("draining delegation stopped covering acknowledged state before Checkin")
+	}
+	type writeResult struct {
+		handled bool
+		err     error
+	}
+	writeOut := make(chan writeResult, 1)
+	go func() {
+		_, handled, err := e.WriteAt(ctx, "d/f", 0, []byte("later"))
+		writeOut <- writeResult{handled: handled, err: err}
+	}()
+	select {
+	case result := <-writeOut:
+		t.Fatalf("mutation crossed draining handoff: handled=%v err=%v", result.handled, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if ent, result := e.Lookup("d/f"); result != LookupHit || ent.Size != 5 {
+		t.Fatalf("lookup during drain = %+v/%v, want acknowledged file", ent, result)
+	}
+	if _, result := e.Lookup("d/removed"); result != LookupNegative {
+		t.Fatalf("removed lookup during drain = %v, want acknowledged tombstone", result)
+	}
+	entries, ok := e.Readdir("d")
+	if !ok {
+		t.Fatal("readdir became undecidable during drain")
+	}
+	foundFile, foundLink := false, false
+	for _, ent := range entries {
+		foundFile = foundFile || ent.Name == "f"
+		foundLink = foundLink || ent.Name == "link"
+	}
+	if !foundFile || !foundLink {
+		t.Fatalf("readdir during drain omitted acknowledged entries: %+v", entries)
+	}
+	dst := make([]byte, 5)
+	n, handled, err := e.ReadAt("d/f", dst, 0, func(string, int64, []byte) (int, error) {
+		return 0, errors.New("authority base must not serve a born-local file during drain")
+	})
+	if err != nil || !handled || n != 5 || string(dst) != "acked" {
+		t.Fatalf("read during drain = %q n=%d handled=%v err=%v", dst, n, handled, err)
+	}
+	if target, kind, ok := e.Readlink("d/link"); !ok || kind != "symlink" || target != "f" {
+		t.Fatalf("readlink during drain = target=%q kind=%q ok=%v", target, kind, ok)
+	}
+	if value, result := e.Getxattr("d/f", "user.test"); result != LookupHit || string(value) != "value" {
+		t.Fatalf("getxattr during drain = %q/%v", value, result)
+	}
+	if names, ok := e.Listxattr("d/f"); !ok || len(names) != 1 || names[0] != "user.test" {
+		t.Fatalf("listxattr during drain = %v/%v", names, ok)
+	}
+
+	close(flushGate)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		e.mu.RLock()
+		d := e.delegations["d"]
+		e.mu.RUnlock()
+		readClosing := false
+		if d != nil {
+			d.readMu.Lock()
+			readClosing = d.readClosing
+			d.readMu.Unlock()
+		}
+		if readClosing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recall did not close read admission after draining")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	nextRead := make(chan ReadPermit, 1)
+	go func() {
+		p, beginErr := e.BeginRead(ctx, "d/f")
+		if beginErr != nil {
+			nextRead <- nil
+			return
+		}
+		nextRead <- p
+	}()
+	select {
+	case <-recallOut:
+		t.Fatal("Checkin passed an in-flight overlay read")
+	case <-nextRead:
+		t.Fatal("new read crossed the closed handoff barrier")
+	case <-time.After(50 * time.Millisecond):
+	}
+	permit.Close()
+	permitOpen = false
+	if err := <-recallOut; err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+	select {
+	case p := <-nextRead:
+		if p == nil {
+			t.Fatal("post-handoff reader failed")
+		}
+		p.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-handoff reader did not re-resolve after overlay drop")
+	}
+	if result := <-writeOut; result.handled || result.err != nil {
+		t.Fatalf("post-handoff mutation = handled=%v err=%v, want shared lane", result.handled, result.err)
+	}
+	if err := auth.equalFile("d/f", []byte("acked")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecallRefusesCheckinWhenFrontendHandoffFails(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	handoffErr := errors.New("frontend cache barrier failed")
+	e.cfg.Events.OnHandoff = func(scope string) error {
+		if scope != "d" {
+			t.Fatalf("handoff scope = %q, want d", scope)
+		}
+		return handoffErr
+	}
+	ctx := context.Background()
+	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.WriteAt(ctx, "d/f", 0, []byte("acked")); err != nil || !handled {
+		t.Fatalf("write: handled=%v err=%v", handled, err)
+	}
+	if err := e.Recall(ctx, "d"); !errors.Is(err, handoffErr) {
+		t.Fatalf("recall error = %v, want frontend barrier failure", err)
+	}
+	if got := auth.grantCount(); got != 1 {
+		t.Fatalf("failed frontend barrier released authority grant: grants=%d", got)
+	}
+	permit, err := e.BeginRead(ctx, "d/f")
+	if err != nil {
+		t.Fatalf("begin read after failed handoff: %v", err)
+	}
+	defer permit.Close()
+	if ent, result := permit.Lookup("d/f"); result != LookupHit || ent.Size != 5 {
+		t.Fatalf("retained overlay after failed handoff = %+v/%v", ent, result)
+	}
+}
+
+func TestRecallRefusesCheckinWhenPreparedIdentityPersistenceFails(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	prepared := false
+	e.cfg.ProtectOpenPins = func(context.Context, string, string) (func(bool), error) {
+		prepared = true
+		return func(bool) {}, nil
+	}
+	persistErr := errors.New("identity journal disk full")
+	e.cfg.Events.OnHandoffPrepared = func(
+		_ context.Context, scope string, _ string,
+	) (func(bool), error) {
+		if scope != "d" {
+			t.Fatalf("prepared handoff scope=%q want d", scope)
+		}
+		if !prepared {
+			t.Fatal("identity persistence ran before release-pin identity assignment")
+		}
+		return nil, persistErr
+	}
+	ctx := context.Background()
+	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.WriteAt(ctx, "d/f", 0, []byte("acked")); err != nil || !handled {
+		t.Fatalf("write: handled=%v err=%v", handled, err)
+	}
+	if err := e.Recall(ctx, "d"); !errors.Is(err, persistErr) {
+		t.Fatalf("recall error=%v want identity persistence error", err)
+	}
+	if got := auth.grantCount(); got != 1 {
+		t.Fatalf("failed identity persist released authority grant: grants=%d", got)
+	}
+}
+
+func TestReadPermitInterfaceCopiesShareOneClose(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	permit, err := e.BeginRead(ctx, "d/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyOfPermit := permit
+	permit.Close()
+	copyOfPermit.Close()
+
+	e.mu.RLock()
+	d := e.delegations["d"]
+	e.mu.RUnlock()
+	d.readMu.Lock()
+	readers := d.readers
+	d.readMu.Unlock()
+	if readers != 0 {
+		t.Fatalf("reader count after copied closes = %d, want 0", readers)
+	}
+}
+
+func TestSharedReadPermitFastPathDoesNotAllocate(t *testing.T) {
+	auth := newFakeAuthority()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+	allocs := testing.AllocsPerRun(1000, func() {
+		permit, err := e.BeginRead(ctx, "shared/file")
+		if err != nil {
+			panic(err)
+		}
+		permit.Close()
+	})
+	if allocs != 0 {
+		t.Fatalf("shared BeginRead allocations = %v, want 0", allocs)
+	}
+}
+
 // TestReleaseForLeavesDelegatedMode pins the P1 write-through contract: a
 // caller about to run a write-through operation (hard link or orphan)
 // releases the covering delegation FIRST — the acked tail drains, the grant
@@ -554,6 +1015,106 @@ func TestReleaseForLeavesDelegatedMode(t *testing.T) {
 	// that follows orders after it.
 	if err := auth.equalFile("d/f", []byte("acked")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestRenameAuthorityLaneReleasesDestinationOnlyDelegation pins the
+// multi-path admission contract. A top-level source is deliberately
+// nondelegable, but the destination can still sit inside a retained grant.
+// Rename must release that destination grant before returning handled=false;
+// otherwise the authority rename recalls its own caller and deadlocks behind
+// the frontend operation waiting for Rename to return.
+func TestRenameAuthorityLaneReleasesDestinationOnlyDelegation(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["delegated"] = true
+	auth.files["source"] = []byte("authority source")
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+
+	if _, handled, err := e.Create(ctx, "delegated/acked", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create delegated tail: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := e.WriteAt(ctx, "delegated/acked", 0, []byte("drain me")); err != nil || !handled {
+		t.Fatalf("write delegated tail: handled=%v err=%v", handled, err)
+	}
+
+	if _, handled, err := e.Rename(ctx, "source", "delegated/destination", nil); err != nil || handled {
+		t.Fatalf("cross-lane rename: handled=%v err=%v, want clean authority lane", handled, err)
+	}
+	if e.Covers("delegated/destination") {
+		t.Fatal("destination delegation survived authority-lane rename admission")
+	}
+	if got := auth.grantCount(); got != 0 {
+		t.Fatalf("authority still holds %d destination grants, want 0", got)
+	}
+	if _, _, releases := auth.calls(); releases != 1 {
+		t.Fatalf("rename released %d grants, want exactly 1", releases)
+	}
+	if err := auth.equalFile("delegated/acked", []byte("drain me")); err != nil {
+		t.Fatalf("destination tail was not authoritative before rename fallthrough: %v", err)
+	}
+}
+
+// A policy denial on the source scope is another normal authority-lane
+// decision. It has the same multi-path release obligation as a nondelegable
+// top-level source.
+func TestRenameDeniedSourceReleasesDestinationOnlyDelegation(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["source-dir"] = true
+	auth.dirs["delegated"] = true
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+
+	if _, handled, err := e.Create(ctx, "delegated/held", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create destination delegation: handled=%v err=%v", handled, err)
+	}
+	auth.mu.Lock()
+	auth.denyAll = true
+	auth.mu.Unlock()
+
+	if _, handled, err := e.Rename(ctx, "source-dir/source", "delegated/destination", nil); err != nil || handled {
+		t.Fatalf("denied-source rename: handled=%v err=%v, want clean authority lane", handled, err)
+	}
+	if e.Covers("delegated/destination") {
+		t.Fatal("destination delegation survived denied source admission")
+	}
+	if got := auth.grantCount(); got != 0 {
+		t.Fatalf("authority still holds %d destination grants, want 0", got)
+	}
+}
+
+// An indeterminate source-admission failure is not permission to switch to
+// the authority lane. Preserve all grants and return the error; a caller must
+// never execute rename after an acquisition whose outcome is unknown.
+func TestRenameSourceAdmissionErrorPreservesDestinationDelegation(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["source-dir"] = true
+	auth.dirs["delegated"] = true
+	auth.mu.Unlock()
+	e := testEngine(t, auth)
+	ctx := context.Background()
+
+	if _, handled, err := e.Create(ctx, "delegated/held", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create destination delegation: handled=%v err=%v", handled, err)
+	}
+	acquireErr := errors.New("source acquire outcome unknown")
+	auth.mu.Lock()
+	auth.acquireErr = acquireErr
+	auth.mu.Unlock()
+
+	if _, handled, err := e.Rename(ctx, "source-dir/source", "delegated/destination", nil); !errors.Is(err, acquireErr) || handled {
+		t.Fatalf("uncertain-source rename: handled=%v err=%v, want admission failure", handled, err)
+	}
+	if !e.Covers("delegated/destination") {
+		t.Fatal("admission error incorrectly released the destination delegation")
+	}
+	if _, _, releases := auth.calls(); releases != 0 {
+		t.Fatalf("admission error released %d grants, want 0", releases)
 	}
 }
 

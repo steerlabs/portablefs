@@ -74,21 +74,25 @@ invalidation boundary:
   authority.** It also waits for every live protocol subscriber to
   acknowledge its covering invalidations. Linux FUSE acknowledges only after
   its kernel invalidation hook returns, so subsequent FUSE reads are exact.
-  `portablefsd` acknowledges after its user-space caches are invalidated and
-  the event is delivered to the local frontend stream.
+  On macOS 26, `portablefsd` acknowledges regular-file content invalidations
+  only after it has updated the live vnode's authoritative size and invalidated
+  its mapped pages; `FlushAll` does this for every retained regular-file
+  FSItem.
 - **Plain un-fsynced writes normally propagate to peers within bounded
   asynchronous invalidation** (the flush batching window plus one
   invalidation push), like a local page cache. This is a visibility schedule,
   not a power-loss durability promise.
 
-macOS 26 FSKit is an explicit framework boundary: the current FSKit API does
-not provide PortableFS a kernel-cache invalidation primitive, and its
-invalidation events are therefore advisory. `fsync`, synchronize, and
-clean unmount still have the exact authority-durability contract above, but a
-read FSKit satisfies wholly from its kernel cache is outside the
-cross-machine visibility acknowledgment. Applications that require an exact
-handoff on macOS must reopen/re-resolve the file or coordinate at the
-application layer until the SDK exposes a cache invalidation hook.
+macOS 26 FSKit is an explicit framework boundary. PortableFS performs an exact
+regular-file data-and-size refresh through every known live FSItem before
+acknowledging content invalidation, but the current FSKit API does not provide
+a public primitive for remotely revoking cached namespace bindings or general
+attributes. Mode, ownership, timestamps, link count, directory attributes,
+and an already cached remote name replacement are therefore outside the
+cross-machine visibility acknowledgment. A later lookup re-resolves the
+authority and reincarnates a replaced name safely. Applications requiring an
+exact handoff for those unsupported categories must reopen/re-resolve or
+coordinate at the application layer until the SDK exposes cache control.
 
 ## Checkpoint Visibility
 
@@ -161,11 +165,17 @@ A delegation handoff freezes only new opens and namespace rebindings in the
 released subtree; closes and unrelated subtrees remain live. Before Checkin,
 the authority resolves every barrier-stable open path under the still-held
 grant and durably installs any missing session pins. The client adopts the
-aligned inode identities with the exact live-handle counts, records its
-drained watermark plus local release in one WAL sync, and keeps the barrier
-through the replay-exact Checkin. Thus a peer unlink after handoff either sees
-an open pin and parks the inode or sees no live handle—never an unprotected
-open created in the release gap.
+aligned inode identities with the exact live-handle counts. The frontend also
+resolves and journals every active authority-routed Item published in that
+scope whose delegated create has not yet learned its authority inode, even if
+its handle already closed. Only then does it record its drained watermark plus
+local release in one WAL sync and keep the barrier through replay-exact
+Checkin. Recovery repeats the same identity boundary before writing a recovered
+release certificate. Thus peers cannot discover an authority inode before the
+originating frontend has durably attached that inode to the Item it already
+published, and a peer unlink after handoff either sees an open pin and parks
+the inode or sees no live handle—never an unprotected open created in the
+release gap.
 
 ## Commit Rule
 

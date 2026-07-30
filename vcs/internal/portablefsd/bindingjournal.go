@@ -1,8 +1,9 @@
 package portablefsd
 
 // The binding journal makes item-identity durability O(changes) instead of
-// O(table). Every binding change — a minted item, an unbind, a subtree rekey —
-// appends one JSON line before the operation replies, and the debounced
+// O(table). Every operation's binding transaction — minted items, detaches,
+// reclaims, and subtree rekeys together — appends one JSON line before the
+// operation replies, and the debounced
 // full-state persist doubles as compaction that truncates it. The previous
 // design rewrote and fsynced the ENTIRE state file (every attach's whole item
 // table) synchronously inside every lookup/enumerate/create/write that touched
@@ -19,7 +20,8 @@ package portablefsd
 import (
 	"bytes"
 	"encoding/json"
-	"log"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,14 +32,20 @@ const bindingJournalName = "items.journal"
 
 type bindingJournalEntry struct {
 	Ref             string `json:"ref"`
-	Op              string `json:"op"` // bind | unbind | rekey
+	Op              string `json:"op"` // bind | unbind | detach | reclaim | rekey
 	Path            string `json:"path,omitempty"`
 	ID              uint64 `json:"id,omitempty"`
 	Gen             uint64 `json:"gen,omitempty"`
 	Auth            bool   `json:"auth,omitempty"`
 	AuthorityItemID uint64 `json:"authorityItemId,omitempty"`
+	Kind            string `json:"kind,omitempty"`
+	Graft           bool   `json:"graft,omitempty"`
 	From            string `json:"from,omitempty"` // rekey: old path prefix
 	To              string `json:"to,omitempty"`   // rekey: new path prefix
+}
+
+type bindingJournalBatch struct {
+	Entries []bindingJournalEntry `json:"entries"`
 }
 
 func (e bindingJournalEntry) authorityItemID() uint64 {
@@ -55,45 +63,62 @@ type bindingJournal struct {
 	path string
 	dir  string
 	f    *os.File
+	// testWrite injects short writes and terminal errors. Protected by mu.
+	testWrite func([]byte) (int, error)
 }
 
 func newBindingJournal(stateDir string) *bindingJournal {
 	return &bindingJournal{path: filepath.Join(stateDir, bindingJournalName), dir: stateDir}
 }
 
-// append writes entries as JSON lines in one write call. Failures are logged,
-// never surfaced: journal I/O must not gate volume I/O, and the debounced
-// full-state persist covers the same changes shortly after.
-func (j *bindingJournal) append(entries []bindingJournalEntry) {
+// append writes complete JSON lines before an Item identity may be published
+// to FSKit. The mount and its cached Items can survive a daemon restart, so a
+// failed or short process-durable append is a correctness failure—not a
+// best-effort diagnostic.
+func (j *bindingJournal) append(entries []bindingJournalEntry) error {
 	if len(entries) == 0 {
-		return
+		return nil
+	}
+	b, err := json.Marshal(bindingJournalBatch{Entries: entries})
+	if err != nil {
+		return fmt.Errorf("encode binding journal transaction: %w", err)
 	}
 	var buf bytes.Buffer
-	for _, e := range entries {
-		b, err := json.Marshal(e)
-		if err != nil {
-			continue
-		}
-		buf.Write(b)
-		buf.WriteByte('\n')
-	}
+	buf.Write(b)
+	buf.WriteByte('\n')
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.f == nil {
+	if j.f == nil && j.testWrite == nil {
 		if err := os.MkdirAll(j.dir, 0o700); err != nil {
-			log.Printf("portablefsd: binding journal dir: %v", err)
-			return
+			return fmt.Errorf("binding journal dir: %w", err)
 		}
 		f, err := os.OpenFile(j.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
-			log.Printf("portablefsd: open binding journal: %v", err)
-			return
+			return fmt.Errorf("open binding journal: %w", err)
 		}
 		j.f = f
 	}
-	if _, err := j.f.Write(buf.Bytes()); err != nil {
-		log.Printf("portablefsd: append binding journal: %v", err)
+	data := buf.Bytes()
+	for len(data) > 0 {
+		var n int
+		var err error
+		if j.testWrite != nil {
+			n, err = j.testWrite(data)
+		} else {
+			n, err = j.f.Write(data)
+		}
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("append binding journal: invalid write count %d", n)
+		}
+		data = data[n:]
+		if err != nil {
+			return fmt.Errorf("append binding journal: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("append binding journal: %w", io.ErrShortWrite)
+		}
 	}
+	return nil
 }
 
 // truncateLocked drops the journal after a successful full-state persist has
@@ -116,10 +141,24 @@ func loadBindingJournal(stateDir string) []bindingJournalEntry {
 		return nil
 	}
 	var out []bindingJournalEntry
-	for _, line := range bytes.Split(data, []byte("\n")) {
+	lines := bytes.Split(data, []byte("\n"))
+	if len(data) != 0 && data[len(data)-1] != '\n' {
+		// append emits one complete operation transaction per newline. A
+		// trailing unterminated JSON value is a torn transaction even if the
+		// JSON bytes themselves happen to be syntactically complete.
+		lines = lines[:len(lines)-1]
+	}
+	for _, line := range lines {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
+		var batch bindingJournalBatch
+		if err := json.Unmarshal(line, &batch); err == nil && batch.Entries != nil {
+			out = append(out, batch.Entries...)
+			continue
+		}
+		// Legacy journals stored one entry per line. Keep accepting their
+		// complete lines during the format transition.
 		var e bindingJournalEntry
 		if err := json.Unmarshal(line, &e); err != nil {
 			continue

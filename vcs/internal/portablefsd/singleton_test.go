@@ -265,3 +265,80 @@ func TestListenUnixSocketNeverUnlinksExistingOwner(t *testing.T) {
 		t.Fatalf("original owner accept: %v", err)
 	}
 }
+
+func TestListenUnixSocketPublishesOnlyPrivateMode(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pfsd-socket-mode-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "frontend.sock")
+	for attempt := 0; attempt < 100; attempt++ {
+		type result struct {
+			ln  net.Listener
+			err error
+		}
+		ready := make(chan result, 1)
+		go func() {
+			ln, err := listenUnixSocket(path)
+			ready <- result{ln: ln, err: err}
+		}()
+
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			info, err := os.Lstat(path)
+			if err == nil {
+				if got := info.Mode().Perm(); got != 0o600 {
+					t.Fatalf("published socket mode=%o, want 0600", got)
+				}
+				break
+			}
+			if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("socket was not published")
+			}
+		}
+		out := <-ready
+		if out.err != nil {
+			t.Fatal(out.err)
+		}
+		if err := out.ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("closed listener left published socket: %v", err)
+		}
+	}
+}
+
+func TestPublishedUnixListenerNeverRemovesReplacement(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pfsd-socket-replace-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "frontend.sock")
+	ln, err := listenUnixSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	const replacement = "replacement-owner"
+	if err := os.WriteFile(path, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ln.Close(); err == nil || !strings.Contains(err.Error(), "refusing to remove replaced Unix socket") {
+		t.Fatalf("close replacement verdict=%v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != replacement {
+		t.Fatalf("replacement contents=%q", got)
+	}
+}

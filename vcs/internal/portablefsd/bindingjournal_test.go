@@ -67,9 +67,10 @@ func TestBindingJournalReplayAcrossRestart(t *testing.T) {
 	if a.paths["dir/old.txt"] != nil || a.paths["dir/new.txt"] != nil {
 		t.Fatal("old paths still bound after rekey replay")
 	}
-	// The unbind dropped both indexes.
-	if a.paths["gone.txt"] != nil || a.items[50] != nil {
-		t.Fatal("unbound item survived replay")
+	// FSKit can reconnect across daemon restart, so unbind removes the name
+	// but retains the published Item until an explicit Reclaim tombstone.
+	if a.paths["gone.txt"] != nil || a.items[50] == nil {
+		t.Fatal("unbound item lifetime was not retained across replay")
 	}
 	// Garbage rejected: stale generation, escaping path, torn line.
 	if a.paths["stale.txt"] != nil || a.items[8] != nil {
@@ -77,5 +78,45 @@ func TestBindingJournalReplayAcrossRestart(t *testing.T) {
 	}
 	if a.root == nil || a.root.item.ItemID != 1 {
 		t.Fatalf("root binding lost: %+v", a.root)
+	}
+}
+
+func TestBindingJournalTransactionRejectsPartialMultiEntryAppend(t *testing.T) {
+	stateDir := privateTestDir(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(stateDir, bindingJournalName)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := newBindingJournal(stateDir)
+	journal.f = f
+	first := true
+	journal.testWrite = func(data []byte) (int, error) {
+		if first {
+			first = false
+			// Write the entire JSON transaction but not its commit newline.
+			// A subsequent disk-full error must not make an entry prefix
+			// replayable after restart.
+			n := len(data) - 1
+			return f.Write(data[:n])
+		}
+		return 0, os.ErrPermission
+	}
+	err = journal.append([]bindingJournalEntry{
+		{Ref: "att_tx", Op: "detach", Path: "old", ID: 10, Gen: 1, Auth: true},
+		{Ref: "att_tx", Op: "bind", Path: "old", ID: 11, Gen: 1, Auth: true},
+	})
+	if err == nil {
+		t.Fatal("partial transaction append unexpectedly succeeded")
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	journal.f = nil
+	if replayed := loadBindingJournal(stateDir); len(replayed) != 0 {
+		t.Fatalf("torn multi-entry transaction replayed a prefix: %+v", replayed)
 	}
 }

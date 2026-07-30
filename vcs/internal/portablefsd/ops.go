@@ -117,7 +117,9 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 			return nil, eno
 		}
 		rec := a.registerLocal(p, attr)
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 		return &pfslocal.LookupReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -134,7 +136,9 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 	a.mu.Lock()
 	rec := a.registerLocked(p, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.LookupReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 }
 
@@ -162,7 +166,9 @@ func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) 
 			return nil, eno
 		}
 		if rep != nil && len(rep.Entries) > 0 {
-			a.flushBindingDelta()
+			if eno := a.flushBindingDelta(); eno != 0 {
+				return nil, eno
+			}
 		}
 		return rep, 0
 	}
@@ -172,7 +178,9 @@ func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) 
 		return nil, eno
 	}
 	if rep != nil && len(rep.Entries) > 0 {
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 	}
 	return rep, 0
 }
@@ -408,7 +416,9 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 			return nil, eno
 		}
 		rec = a.registerLocal(rec.path, attr)
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 		return &pfslocal.GetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -422,7 +432,9 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 	a.mu.Lock()
 	rec = a.registerLocked(rec.path, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.GetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 }
 
@@ -441,18 +453,19 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		return nil, eno
 	}
 	// A size-only setattr the daemon itself issued to refresh the kernel's
-	// stale vnode state (see scheduleCoherenceRefresh) must not reach the
+	// stale vnode state (see exactKernelRefresh) must not reach the
 	// authority: consume the note and answer with current attributes.
 	if a.consumeExpectedTruncate(rec.path, req) {
-		attr, st := vol.Getattr(ctx, rec.path, rec.state)
-		if st != fsproto.OK {
-			return nil, toDarwinErr(st)
+		a.mu.RLock()
+		current := a.items[rec.item.ItemID]
+		if current == nil || current.item.ItemGeneration != rec.item.ItemGeneration {
+			a.mu.RUnlock()
+			return nil, darwinESTALE
 		}
-		a.mu.Lock()
-		rec = a.registerLocked(rec.path, attr)
-		a.mu.Unlock()
-		a.flushBindingDelta()
-		return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+		attr := current.attr
+		item := current.item
+		a.mu.RUnlock()
+		return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, item)}, 0
 	}
 	cr := clientcore.SetattrRequest{}
 	if req.Mode != nil {
@@ -483,7 +496,9 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	a.mu.Lock()
 	rec = a.registerLocked(rec.path, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 }
 
@@ -509,7 +524,7 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 			return nil, localErrno(err)
 		}
 		a.mu.Lock()
-		h := a.newLocalHandleLocked(rec.path, file, write)
+		h := a.newLocalHandleLocked(rec.path, rec.item.ItemID, file, write)
 		a.mu.Unlock()
 		return &pfslocal.OpenReply{Handle: h}, 0
 	}
@@ -522,7 +537,7 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	h := a.newHandleLocked(rec.path, rec.state, write)
+	h := a.newHandleLocked(rec.path, rec.item.ItemID, rec.state, write)
 	a.mu.Unlock()
 	return &pfslocal.OpenReply{Handle: h}, 0
 }
@@ -600,7 +615,9 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 		}
 		attr := localAttr(fi)
 		rec := a.registerLocal(h.path, attr)
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 		return &pfslocal.WriteReply{Written: uint32(len(req.Data)), Attr: fsAttrToLocal(attr, rec.item)}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -618,7 +635,9 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	a.mu.Lock()
 	rec := a.registerLocked(h.path, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.WriteReply{Written: uint32(n), Attr: fsAttrToLocal(attr, rec.item)}, 0
 }
 
@@ -677,9 +696,12 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 		a.mu.Lock()
 		rec := a.registerLocalLocked(p, attr)
 		a.bumpLocalVersionLocked(parentPath(p))
-		h := a.newLocalHandleLocked(p, file, true)
+		h := a.newLocalHandleLocked(p, rec.item.ItemID, file, true)
 		a.mu.Unlock()
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			_ = file.Close()
+			return nil, eno
+		}
 		return &pfslocal.CreateReply{Attr: fsAttrToLocal(attr, rec.item), Handle: h}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -702,12 +724,14 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 	a.mu.Lock()
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	if st := vol.RegisterOpened(ctx, p, rec.state); st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	h := a.newHandleLocked(p, rec.state, true)
+	h := a.newHandleLocked(p, rec.item.ItemID, rec.state, true)
 	a.mu.Unlock()
 	return &pfslocal.CreateReply{Attr: fsAttrToLocal(attr, rec.item), Handle: h}, 0
 }
@@ -743,7 +767,9 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 		rec := a.registerLocalLocked(p, attr)
 		a.bumpLocalVersionLocked(parentPath(p))
 		a.mu.Unlock()
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 		return &pfslocal.MkdirReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -757,7 +783,9 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 	a.mu.Lock()
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.MkdirReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 }
 
@@ -824,8 +852,7 @@ func (a *attach) remove(ctx context.Context, req *pfslocal.RemoveRequest) int32 
 	a.mu.Lock()
 	a.removePathLocked(p)
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	return 0
+	return a.flushBindingDelta()
 }
 
 func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 {
@@ -895,10 +922,22 @@ func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 
 	if dst != nil {
 		dstState = dst.state
 	}
+	sameIdentity := src != nil && dst != nil &&
+		(src.item == dst.item || src.state == dst.state ||
+			(src.state != nil && dst.state != nil &&
+				src.state.AuthorityIno() != 0 &&
+				src.state.AuthorityIno() == dst.state.AuthorityIno()))
 	a.mu.Unlock()
 	st := vol.Rename(ctx, oldp, newp, srcState, dstState)
 	if st != fsproto.OK {
 		return toDarwinErr(st)
+	}
+	if sameIdentity {
+		// POSIX rename(old,new) is a no-op when both names already refer to
+		// the same inode. The authority left both links intact; mirror that
+		// exact result instead of deleting the destination and rekeying the
+		// source in the frontend registry.
+		return 0
 	}
 	a.mu.Lock()
 	if dst != nil {
@@ -906,8 +945,7 @@ func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 
 	}
 	a.renamePathLocked(oldp, newp)
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	return 0
+	return a.flushBindingDelta()
 }
 
 func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*pfslocal.HardLinkReply, int32) {
@@ -954,7 +992,9 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 		rec := a.registerLocalAliasLocked(newp, src, attr)
 		a.bumpLocalVersionLocked(dir.path)
 		a.mu.Unlock()
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 		return &pfslocal.HardLinkReply{
 			Name: append([]byte(nil), req.Name...),
 			Attr: fsAttrToLocal(attr, rec.item),
@@ -972,7 +1012,9 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 	a.mu.Lock()
 	rec := a.registerHardLinkAliasLocked(newp, src, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.HardLinkReply{
 		Name: append([]byte(nil), req.Name...),
 		Attr: fsAttrToLocal(attr, rec.item),
@@ -1008,7 +1050,9 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 		rec := a.registerLocalLocked(p, attr)
 		a.bumpLocalVersionLocked(parentPath(p))
 		a.mu.Unlock()
-		a.flushBindingDelta()
+		if eno := a.flushBindingDelta(); eno != 0 {
+			return nil, eno
+		}
 		return &pfslocal.SymlinkReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -1022,7 +1066,9 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 	a.mu.Lock()
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
-	a.flushBindingDelta()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return nil, eno
+	}
 	return &pfslocal.SymlinkReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
 }
 
@@ -1093,16 +1139,18 @@ func (a *attach) reclaim(req *pfslocal.ReclaimRequest) int32 {
 		return darwinENXIO
 	}
 	a.mu.Lock()
-	if rec := a.items[req.Item.ItemID]; rec != nil && rec.item.ItemGeneration == req.Item.ItemGeneration && rec.path != "" {
-		for p, alias := range a.paths {
-			if alias.item == rec.item {
-				a.removePathLocked(p)
-			}
-		}
+	if a.reclaimItemLocked(req.Item) {
+		// Reclaim is the durable Item lifetime tombstone. Without it, a
+		// daemon crash after removing the in-memory detached identity but
+		// before full-state compaction could replay its prior detach entry
+		// and resurrect an Item generation FSKit has explicitly retired.
+		a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{
+			Ref: a.ref, Op: "reclaim",
+			ID: req.Item.ItemID, Gen: req.Item.ItemGeneration,
+		})
 	}
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	return 0
+	return a.flushBindingDelta()
 }
 
 func (a *attach) synthesizeFrontendMutation(body any, origin uint64) {

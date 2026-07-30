@@ -519,6 +519,35 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		})
 		return err
 	}
+	// Resolve and durably publish every frontend identity before recording
+	// any local RELEASE. If the process crashes after a RELEASE certificate,
+	// the next recovery deliberately treats that scope as locally final and
+	// may sweep its remaining authority grant without rebinding it; therefore
+	// the identity boundary must already be complete at that point.
+	preparedEnds := make([]func(bool), len(scopes))
+	cleanupPreparedFrom := func(start int) {
+		for i := start; i < len(preparedEnds); i++ {
+			if preparedEnds[i] != nil {
+				preparedEnds[i](false)
+				preparedEnds[i] = nil
+			}
+		}
+	}
+	for i, sc := range scopes {
+		if e.cfg.Events.OnHandoffPrepared != nil {
+			var err error
+			preparedEnds[i], err = e.cfg.Events.OnHandoffPrepared(
+				ctx, sc.Scope, sc.Epoch,
+			)
+			if err != nil {
+				cleanupPreparedFrom(0)
+				return fmt.Errorf(
+					"%w: prepare recovered frontend identities %q: %v",
+					errRetryable, sc.Scope, err,
+				)
+			}
+		}
+	}
 	// Make every rebound scope locally final in ONE durable append before
 	// sending the first Checkin. A crash or failure after any subset of the
 	// sequential authority releases then recovers from an empty local live
@@ -526,11 +555,17 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	// recovery grants remain instead of trying to rebind already-released
 	// scopes.
 	if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, prev, scopes); err != nil {
+		cleanupPreparedFrom(0)
 		return fmt.Errorf("%w: persist recovery release certificate: %v", errRetryable, err)
 	}
-	for _, sc := range scopes {
+	for i, sc := range scopes {
 		if err := e.remote.ReleaseDelegation(ctx, sc.Scope, sc.Epoch); err != nil {
+			cleanupPreparedFrom(i)
 			return fmt.Errorf("%w: release %q: %v", errRetryable, sc.Scope, err)
+		}
+		if preparedEnds[i] != nil {
+			preparedEnds[i](true)
+			preparedEnds[i] = nil
 		}
 	}
 	// Sweep any grant still bound to this stream but absent from the local

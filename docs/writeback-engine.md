@@ -55,20 +55,36 @@ vcs/internal/writeback/
      there is no local-only fsync outcome, ever. Before attempting the
      authority drain, the barrier synchronizes the local WAL; a failed local
      sync is itself an EIO-class barrier failure.
-  2. **Frontend visibility acknowledgment:** every published invalidation batch carries
-     a monotonic stream position; subscribers process batches strictly in
-     order and acknowledge positions on the subscribe connection. The barrier
-     completes only after every LIVE subscriber has acknowledged the position
-     covering the barrier's mutations. Linux FUSE acknowledges after its
-     kernel invalidation hook, so cross-machine read-after-fsync is exact for
-     FUSE peers. `portablefsd` acknowledges after invalidating its user-space
-     caches and delivering the event to its frontend stream. macOS 26 FSKit
-     exposes no kernel-cache invalidation hook, so reads served wholly from
-     that kernel cache are explicitly outside this visibility claim; the
-     authority-durability barrier remains exact. A live-but-slow subscriber
-     fails the barrier typed within a bound; a dropped subscriber leaves the
-     set. The wait costs one RTT to the slowest live subscriber, only on
-     barriers.
+  2. **Frontend visibility acknowledgment:** every published invalidation
+     batch carries a monotonic stream position; subscribers process batches
+     strictly in order and acknowledge positions on the subscribe connection.
+     The barrier completes only after every LIVE subscriber has acknowledged
+     the position covering the barrier's mutations. Linux FUSE acknowledges
+     after its kernel invalidation hook. On macOS 26, `portablefsd` first
+     fences its user-space caches, resolves every known affected FSItem
+     (including aliases discovered only through `RelatedInos`), synchronously
+     pushes the authoritative size through the live regular-file vnode, and
+     invalidates its cached pages with `msync(MS_INVALIDATE)`. `FlushAll`
+     covers every retained regular-file FSItem. Only after that exact
+     regular-file data-and-size pass succeeds does the
+     daemon acknowledge the authority position. A pass that cannot establish
+     a stable post-write sample within its bounded optimistic transaction
+     fail-freezes the attach: frontend and control admissions return EIO, the
+     position remains unacknowledged, health remains degraded for the attach
+     lifetime, and an explicit unmount/restart is required. It never retries
+     in a background repair worker or reports an unproven barrier.
+
+     macOS 26 still has no stable public API for remotely revoking cached
+     namespace bindings or general attributes. Known hardlink aliases and
+     open identities get the exact regular-file data-and-size pass, and a
+     later lookup reincarnates a remotely replaced name as a new FSItem
+     without corrupting the surviving inode. Already kernel-cached remote
+     namespace replacements and mode/ownership/time/link-count/directory
+     attributes remain the documented FSKit 26 framework boundary. The macOS
+     27 `DataCacheHandler`/cache-state API is a separate
+     final-SDK release gate, not a beta-symbol fallback in this binary. A
+     live-but-slow subscriber fails an authority barrier typed within a bound;
+     a dropped subscriber leaves the set.
 - Normal unmount cannot succeed with an unshipped acknowledged tail: the
   drain barrier runs while the mount is fully alive and a failure refuses the
   unmount (`portablefs umount` exits nonzero; the FSKit/FUSE detach keeps
@@ -85,6 +101,36 @@ vcs/internal/writeback/
   leaves its scopes durably `recovery-required`; peers get retryable EAGAIN
   until the stream rebinds and drains, or an operator discards it (audited,
   labeled data loss).
+- Holder reads use an operation-scoped read permit. Recall immediately fences
+  new mutations, but the retained overlay remains the holder's authoritative
+  read view while its captured WAL tail drains. After the tail is
+  authority-visible, release closes read admission, waits for every in-flight
+  permit, synchronously fences frontend/user-space caches, and only then sends
+  Checkin and drops the overlay. A definite Checkin or frontend-barrier
+  failure reopens the retained overlay before readers wake; it never exposes a
+  pre-flush authority view.
+- Frontend reply admission is part of that same boundary. One FSKit callback
+  receives a strictly increasing logical operation ID on its connection; every
+  RPC issued by that callback carries the same ID. The first cache-producing
+  RPC creates the publication unit, later publishing or nonpublishing RPCs
+  join it, and the extension sends exactly one one-way `PublicationAck` only
+  after the framework reply handler returns. Successful replies and cacheable
+  errors such as lookup `ENOENT` are treated identically. A participating RPC
+  that must wait for `ReleaseFor` or for a mirrored namespace lock temporarily
+  suspends from the pre-handoff set, then re-enters admission before executing
+  in the post-handoff view. Concurrent participants keep the unit active until
+  every running sibling has either finished or suspended. This prevents the
+  release from waiting on its own caller (or another caller joined to the same
+  release) without allowing a pre-handoff reply to escape afterward.
+  Disconnect retires executing and reply-pending units; request IDs and newly
+  allocated operation IDs are nonzero and strictly increasing, and
+  unknown/duplicate acknowledgements close the connection.
+- Delegation grant and handoff each install a prefix cache fence. Authority
+  reads carry an operation-start token, so a reply that began before the
+  ownership boundary may finish its already-linearized syscall but cannot
+  repopulate metadata, directory, or disk caches afterward. Per-path version
+  floors remain retained across the fence, preventing delayed equal/older
+  invalidations from making pre-boundary cache keys reachable again.
 - Recovery conflicts (scope discarded, authority moved on) surface as typed
   job states; nothing is silently merged or discarded.
 - WAL creation, recovery-registry persistence, append, rotation, checkpoint,
@@ -110,20 +156,31 @@ vcs/internal/writeback/
   write-through mutation does not bypass the peer gate — it recalls the
   holder's own grant — which is what makes the grant-time children snapshot
   exact against same-session races.
-- Open handles use a two-phase release handoff. The mount first installs a
-  subtree-scoped barrier: existing closes remain live, while new opens and
-  namespace rebindings in that subtree wait. It then sends batches of at most
-  127 canonical open paths to `OpDelegationPrepareRelease`. While the exact
+- Published frontend identities and open handles use a two-phase release
+  handoff. After the captured WAL tail is authority-visible, the mount first
+  closes frontend reply admission, closes overlay read admission and waits for
+  existing read permits, then fences all user-space/frontend caches. Only
+  after those fallible publication steps succeed does it install the
+  subtree-scoped open barrier: existing closes remain live, while new opens
+  and namespace rebindings in that subtree wait. It sends batches of at most
+  127 canonical open paths to
+  `OpDelegationPrepareRelease`. While the exact
   `(scope, checkout epoch)` grant is still held, the authority resolves the
   batch under one reservation and durably adds any missing session open pins
   in one PFJ3 row. The aligned inode vector is adopted locally with the exact
-  live-handle refcounts.
+  live-handle refcounts. The daemon then prepares every remaining active
+  authority-routed Item published under that scope, including delegated
+  creates whose handles have already closed, journals each assigned
+  Item-to-authority identity, and holds those temporary pins through Checkin.
 - Delegation prepare consumes no exact-session slot and never releases
   ownership. It is idempotent under the still-live grant: a lost reply can
   re-resolve the same barrier-frozen path bindings, and an already-held pin is
-  a no-op. After every prepared identity is installed, the replay-exact
+  a no-op. Recovery performs the same published-identity preparation before
+  it can certify a recovered scope as locally released. After every prepared
+  identity is installed, the replay-exact
   client writes an `APPLIED` watermark/digest certificate immediately followed
-  by `RELEASE` in one WAL append and one sync, then sends `Checkin`. That
+  by `RELEASE` in one WAL append and one sync only after frontend/read/cache
+  handoff and open-pin preparation have succeeded, then sends `Checkin`. That
   ordering is the crash contract, not an optimistic acknowledgement: the scope
   is already fully drained and barred, so recovery may safely sweep a grant
   when Checkin was never committed. If Checkin committed, its reply was lost,

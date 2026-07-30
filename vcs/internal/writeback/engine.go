@@ -74,6 +74,40 @@ type Events struct {
 	// OnGrant fires after a delegation installs: the caller evicts shared
 	// attr/negative/directory/kernel state under the scope.
 	OnGrant func(scope string)
+
+	// AllowDelegatedMutation is re-evaluated on every admission loop,
+	// including immediately after a newly acquired grant is installed. A
+	// false result drains any covering grant and selects the authority lane.
+	// Clientcore uses this to reject path-keyed write-back when the grant
+	// snapshot reveals that the target inode is hard-linked.
+	AllowDelegatedMutation func(ctx context.Context, path string) bool
+	// OnHandoff runs synchronously after the captured WAL tail is
+	// authority-visible and all overlay readers have exited, but before
+	// Checkin releases the grant. The client evicts every user-space cache
+	// capable of bypassing read admission while peers are still excluded.
+	OnHandoff func(scope string) error
+	// OnHandoffStart closes frontend reply admission before overlay read
+	// admission closes; OnHandoffEnd reopens it after Checkin has a definite
+	// outcome. This brackets response publication around OnHandoff.
+	OnHandoffStart func(ctx context.Context, scope string) error
+	OnHandoffEnd   func(scope string)
+	// OnHandoffPrepared runs after authority identities for protected opens
+	// have been assigned, while read/frontend admission and the delegation
+	// grant are still held, and before the durable Checkin. It may prepare
+	// and persist identities for published-but-closed nodes. The returned
+	// end hook retires any temporary authority pins after Checkin resolves.
+	OnHandoffPrepared func(
+		ctx context.Context,
+		scope string,
+		epoch string,
+	) (end func(released bool), err error)
+	// OnReleaseWait temporarily removes the calling frontend operation from
+	// pre-handoff publication admission while it waits for a release that
+	// must complete before the operation itself can run. The returned resume
+	// function re-enters admission before the caller publishes any outcome.
+	// This prevents concurrent write-through callers joined to one release
+	// from waiting cyclically on their own unpublished replies.
+	OnReleaseWait func(ctx context.Context) (resume func())
 	// OnRelease fires after a delegation fully releases (drained): the
 	// caller drops overlay-derived cache entries and invalidates the kernel
 	// scope before shared-mode requests resume.
@@ -136,18 +170,46 @@ type delegation struct {
 	// escaping into write-through while the authority still owns the grant.
 	attempt  *releaseAttempt
 	drainErr error
+	// readClosing is the read-side half of the handoff barrier. Readers that
+	// entered before it was set pin the overlay through their whole
+	// operation; later readers wait for attempt and re-resolve after the
+	// grant either releases or definitely remains held.
+	readMu      sync.Mutex
+	readClosing bool
+	readers     int
+	readersZero chan struct{}
 }
 
 // releaseAttempt is one immutable single-flight outcome. Followers retain
 // this exact object so a later retry cannot replace the result they joined.
 type releaseAttempt struct {
-	done chan struct{}
-	once sync.Once
-	err  error
+	done     chan struct{}
+	once     sync.Once
+	err      error
+	eventCtx context.Context
 }
 
-func newReleaseAttempt() *releaseAttempt {
-	return &releaseAttempt{done: make(chan struct{})}
+// valueOverlayContext takes cancellation, deadlines, and all engine-owned
+// lifetime semantics from Context while exposing request-scoped values to
+// handoff hooks. A caller cancellation must never interrupt an already-owned
+// durable release, but frontend hooks still need the initiating operation's
+// identity to avoid waiting on themselves.
+type valueOverlayContext struct {
+	context.Context
+	values context.Context
+}
+
+func (c valueOverlayContext) Value(key any) any {
+	if c.values != nil {
+		if value := c.values.Value(key); value != nil {
+			return value
+		}
+	}
+	return c.Context.Value(key)
+}
+
+func newReleaseAttempt(eventCtx context.Context) *releaseAttempt {
+	return &releaseAttempt{done: make(chan struct{}), eventCtx: eventCtx}
 }
 
 func (a *releaseAttempt) complete(err error) error {
@@ -255,6 +317,9 @@ func (e *Engine) logf(format string, args ...any) {
 func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	if cfg.StateDir == "" || cfg.VolumeID == "" || cfg.Remote == nil {
 		return nil, errors.New("writeback: StateDir, VolumeID, and Remote are required")
+	}
+	if (cfg.Events.OnHandoffStart == nil) != (cfg.Events.OnHandoffEnd == nil) {
+		return nil, errors.New("writeback: OnHandoffStart and OnHandoffEnd must be configured together")
 	}
 	if cfg.BudgetBytes <= 0 {
 		cfg.BudgetBytes = defaultBudgetBytes
@@ -517,7 +582,10 @@ func (e *Engine) coveringLocked(p string) *delegation {
 	}
 }
 
-// Covers reports whether an active delegation covers path.
+// Covers reports whether a retained delegation covers path. A draining grant
+// still owns the subtree until its durable Checkin completes: reads must keep
+// using its overlay, and write-through-only mutations must join its release
+// rather than race the in-flight handoff.
 func (e *Engine) Covers(path string) bool {
 	if e.held.Load() == 0 {
 		return false
@@ -525,7 +593,7 @@ func (e *Engine) Covers(path string) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	d := e.coveringLocked(path)
-	return d != nil && !d.draining
+	return d != nil
 }
 
 // ─── mutation admission ──────────────────────────────────────────────────────
@@ -559,6 +627,12 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 	}
 	scope := governingScope(path)
 	for {
+		if allow := e.cfg.Events.AllowDelegatedMutation; allow != nil && !allow(ctx, path) {
+			if err := e.ReleaseFor(ctx, path); err != nil {
+				return admission{}, false, err
+			}
+			return admission{}, false, nil
+		}
 		e.mu.Lock()
 		if e.closed || e.frozen {
 			e.mu.Unlock()
@@ -579,9 +653,9 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 			// workload never monopolizes a common ancestor shared with peer
 			// writers. The next loop acquires the now-authoritative child
 			// directory directly.
-			attempt := e.prepareReleaseLocked(d)
+			attempt := e.prepareReleaseLocked(ctx, d)
 			e.mu.Unlock()
-			if err := waitReleaseAttempt(ctx, attempt); err != nil {
+			if err := e.waitReleaseForCaller(ctx, attempt); err != nil {
 				return admission{}, false, err
 			}
 			continue
@@ -593,7 +667,7 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 			}
 			attempt := d.attempt
 			e.mu.Unlock()
-			if err := waitReleaseAttempt(ctx, attempt); err != nil {
+			if err := e.waitReleaseForCaller(ctx, attempt); err != nil {
 				return admission{}, false, err
 			}
 			// A release signal means only that the attempt reached a
@@ -615,6 +689,28 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 			return admission{}, false, err
 		}
 	}
+}
+
+// admitAcross resolves local admission from primary for a mutation touching
+// every path in touched. If primary selects the authority lane, all touched
+// paths must leave delegated mode before the caller can issue that mutation:
+// a destination-only delegation is just as exclusive as one covering the
+// source. Errors never change lanes, so an indeterminate admission failure
+// preserves the retained grants and fails the operation.
+//
+// A successful admission returns with e.mu held. The caller may then prove
+// that every other operand is covered by the same delegation; if not, it
+// uses fallThroughLocked to release all operands atomically with respect to
+// local admission.
+func (e *Engine) admitAcross(ctx context.Context, primary string, touched ...string) (admission, bool, error) {
+	adm, ok, err := e.admit(ctx, primary)
+	if ok || err != nil {
+		return adm, ok, err
+	}
+	if err := e.ReleaseFor(ctx, touched...); err != nil {
+		return admission{}, false, err
+	}
+	return admission{}, false, nil
 }
 
 // release pairs with a successful admit.
@@ -740,8 +836,11 @@ const (
 	LookupNegative
 )
 
-// Lookup answers a name resolution from the overlay.
-func (e *Engine) Lookup(path string) (Entry, LookupResult) {
+// lookup answers a name resolution from the overlay. A draining delegation
+// remains read-authoritative until Checkin completes and dropScopeStateLocked
+// removes it under e.mu. Hiding its overlay earlier would expose the
+// authority's pre-flush state after a mutation had already been acknowledged.
+func (e *Engine) lookup(path string) (Entry, LookupResult) {
 	if e.held.Load() == 0 {
 		return Entry{}, LookupUndecided
 	}
@@ -751,7 +850,7 @@ func (e *Engine) Lookup(path string) (Entry, LookupResult) {
 		return Entry{}, LookupUndecided
 	}
 	d := e.coveringLocked(path)
-	if d == nil || d.draining {
+	if d == nil {
 		return Entry{}, LookupUndecided
 	}
 	if ent, ok := e.entryLocked(path); ok {
@@ -770,15 +869,16 @@ func (e *Engine) Lookup(path string) (Entry, LookupResult) {
 	return Entry{}, LookupUndecided
 }
 
-// Readdir serves dir's complete listing when the engine holds one.
-func (e *Engine) Readdir(dir string) ([]Entry, bool) {
+// readdir serves dir's complete listing while the engine still holds the
+// delegation, including its drain interval (see Lookup).
+func (e *Engine) readdir(dir string) ([]Entry, bool) {
 	if e.held.Load() == 0 {
 		return nil, false
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	d := e.coveringLocked(dir)
-	if d == nil || d.draining {
+	if d == nil {
 		return nil, false
 	}
 	dv := e.dirs[dir]
@@ -797,17 +897,17 @@ func (dv *dirView) listingLocked() []Entry {
 	return out
 }
 
-// MergeReaddir folds an authority listing through the overlay and seeds
+// mergeReaddir folds an authority listing through the overlay and seeds
 // dir's complete children set under an active delegation, so later lookups,
 // negative answers, and creates are local for the life of the grant. A dir
 // without an active covering delegation has no overlay (every local ack is
 // strictly inside a held scope, and release drops the scope's views), so the
 // authority listing passes through unchanged.
-func (e *Engine) MergeReaddir(dir string, authority []Entry) []Entry {
+func (e *Engine) mergeReaddir(dir string, authority []Entry) []Entry {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	d := e.coveringLocked(dir)
-	if d == nil || d.draining {
+	if d == nil {
 		return authority
 	}
 	dv := e.dirViewLocked(dir, true)
@@ -1006,7 +1106,7 @@ func (e *Engine) removeLocalLocked(path string) {
 // SAME delegation and the source is locally known. Everything else releases
 // the covering delegations and runs write-through.
 func (e *Engine) Rename(ctx context.Context, oldp, newp string, onCommit func()) (Result, bool, error) {
-	adm, ok, err := e.admit(ctx, oldp)
+	adm, ok, err := e.admitAcross(ctx, oldp, oldp, newp)
 	if !ok {
 		return Result{}, false, err
 	}
@@ -1284,18 +1384,18 @@ func (e *Engine) Setattr(ctx context.Context, path string, req SetattrRequest) (
 	return Result{Entry: *ent}, true, nil
 }
 
-// Getxattr answers from a complete delegated xattr view. Such a view exists
+// getxattr answers from a complete delegated xattr view. Such a view exists
 // only for an object born locally under the grant; existing authority
 // objects stay read-through because the grant snapshot does not carry their
 // xattr values.
-func (e *Engine) Getxattr(path, name string) ([]byte, LookupResult) {
+func (e *Engine) getxattr(path, name string) ([]byte, LookupResult) {
 	if e.held.Load() == 0 {
 		return nil, LookupUndecided
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	d := e.coveringLocked(path)
-	if d == nil || d.draining {
+	if d == nil {
 		return nil, LookupUndecided
 	}
 	xv := e.xattrs[path]
@@ -1309,8 +1409,8 @@ func (e *Engine) Getxattr(path, name string) ([]byte, LookupResult) {
 	return append([]byte(nil), value...), LookupHit
 }
 
-// Listxattr returns the complete sorted name set for a locally-born object.
-func (e *Engine) Listxattr(path string) ([]string, bool) {
+// listxattr returns the complete sorted name set for a locally-born object.
+func (e *Engine) listxattr(path string) ([]string, bool) {
 	if e.held.Load() == 0 {
 		return nil, false
 	}
@@ -1318,7 +1418,7 @@ func (e *Engine) Listxattr(path string) ([]string, bool) {
 	defer e.mu.RUnlock()
 	d := e.coveringLocked(path)
 	xv := e.xattrs[path]
-	if d == nil || d.draining || xv == nil {
+	if d == nil || xv == nil {
 		return nil, false
 	}
 	names := make([]string, 0, len(xv.values))
@@ -1404,11 +1504,11 @@ func (e *Engine) Removexattr(ctx context.Context, path, name string) (bool, erro
 // locally-acknowledged rename until the rename applies.
 type BaseReader func(basePath string, off int64, dst []byte) (int, error)
 
-// ReadAt composes a read from dirty extents over the base. handled=false
+// readAt composes a read from dirty extents over the base. handled=false
 // means the file has no dirty state and the caller serves it normally.
 // The extent snapshot pins its WAL segments, so a concurrent
 // checkpoint+reclaim can never delete one mid-pread (no retry compensation).
-func (e *Engine) ReadAt(path string, dst []byte, off int64, base BaseReader) (int, bool, error) {
+func (e *Engine) readAt(path string, dst []byte, off int64, base BaseReader) (int, bool, error) {
 	e.mu.RLock()
 	fv := e.files[path]
 	if fv == nil {
@@ -1482,15 +1582,15 @@ func (e *Engine) ReadAt(path string, dst []byte, off int64, base BaseReader) (in
 	return n, true, nil
 }
 
-// Readlink serves a locally-known symlink target.
-func (e *Engine) Readlink(path string) (target string, kind string, ok bool) {
+// readlink serves a locally-known symlink target.
+func (e *Engine) readlink(path string) (target string, kind string, ok bool) {
 	if e.held.Load() == 0 {
 		return "", "", false
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	d := e.coveringLocked(path)
-	if d == nil || d.draining {
+	if d == nil {
 		return "", "", false
 	}
 	ent, present := e.entryLocked(path)

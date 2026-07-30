@@ -3,6 +3,8 @@
 package portablefsd
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 
@@ -27,26 +29,38 @@ const darwinResolveBeneath = 0x00001000
 // component, fails instead of escaping the mount and truncating a host file.
 // The same descriptor is used for truncate and mmap so there is no second
 // pathname race between the two operations.
-func refreshKernelFile(mountPath, relativePath string, expectedItemID uint64, size int64) bool {
+func refreshKernelFile(mountPath, relativePath string, expectedItemID uint64, size int64) (kernelRefreshOutcome, error) {
 	fd, err := openKernelRefreshFile(mountPath, relativePath)
 	if err != nil {
-		return false // gone or renamed away: nothing to refresh
+		if errors.Is(err, unix.ENOENT) ||
+			errors.Is(err, unix.ENOTDIR) ||
+			errors.Is(err, unix.ELOOP) {
+			return kernelRefreshObsolete, err
+		}
+		return kernelRefreshRetry, err
 	}
 	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil ||
-		uint64(stat.Ino) != expectedItemID ||
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return kernelRefreshRetry, err
+	}
+	if uint64(stat.Ino) != expectedItemID ||
 		stat.Mode&unix.S_IFMT != unix.S_IFREG {
 		// The namespace changed between scheduling and opening. In
 		// particular, do not let a regular-file rename swap redirect the
 		// refresh to a different FSItem merely because it is not a symlink.
-		return false
+		return kernelRefreshObsolete, fmt.Errorf(
+			"resolved inode/type changed: inode=%d mode=%#o",
+			stat.Ino, stat.Mode&unix.S_IFMT,
+		)
 	}
-	if err := unix.Ftruncate(fd, size); err != nil {
-		return false
+	if stat.Size != size {
+		if err := unix.Ftruncate(fd, size); err != nil {
+			return kernelRefreshRetry, err
+		}
 	}
 	if size <= 0 {
-		return true
+		return kernelRefreshApplied, nil
 	}
 	const window = 256 << 20
 	for off := int64(0); off < size; off += window {
@@ -56,17 +70,17 @@ func refreshKernelFile(mountPath, relativePath string, expectedItemID uint64, si
 		}
 		data, err := unix.Mmap(fd, off, int(length), unix.PROT_READ, unix.MAP_SHARED)
 		if err != nil {
-			return true
+			return kernelRefreshRetry, err
 		}
 		if err := unix.Msync(data, unix.MS_INVALIDATE); err != nil {
 			// Loud: a silently broken purge reintroduces stale reads.
 			log.Printf("portablefsd: msync(MS_INVALIDATE) %s: %v", relativePath, err)
 			_ = unix.Munmap(data)
-			return true
+			return kernelRefreshRetry, err
 		}
 		_ = unix.Munmap(data)
 	}
-	return true
+	return kernelRefreshApplied, nil
 }
 
 func openKernelRefreshFile(mountPath, relativePath string) (int, error) {

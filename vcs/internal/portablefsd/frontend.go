@@ -2,6 +2,7 @@ package portablefsd
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -38,8 +40,16 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 			}
 			return err
 		}
+		if s.frontendConnections.Add(1) > maxFrontendConnections {
+			s.frontendConnections.Add(-1)
+			_ = c.Close()
+			continue
+		}
 		fc := &frontendConn{srv: s, conn: c}
-		go fc.serve(ctx)
+		go func() {
+			defer s.frontendConnections.Add(-1)
+			fc.serve(ctx)
+		}()
 	}
 }
 
@@ -47,6 +57,7 @@ type frontendConn struct {
 	srv    *Server
 	conn   net.Conn
 	origin uint64
+	cancel context.CancelFunc
 
 	writeMu sync.Mutex
 
@@ -55,10 +66,43 @@ type frontendConn struct {
 
 	eventsMu sync.Mutex
 	events   *eventSubscriber
+
+	publicationMu     sync.Mutex
+	operations        map[uint64]*frontendOperationEntry
+	lastOperationID   uint64
+	publicationClosed bool
+	closeOnce         sync.Once
+	inFlight          atomic.Int32
+	handlerWG         sync.WaitGroup
 }
 
+type frontendOperationEntry struct {
+	ready          chan struct{}
+	op             *frontendOperation
+	err            error
+	activeRequests int
+	ackPending     bool
+}
+
+const maxFrontendOperationsPerConnection = 4096
+const maxFrontendRequestsInFlight = 1024
+const maxFrontendConnections = 256
+
+type frontendProtocolState uint8
+
+const (
+	frontendAwaitingHello frontendProtocolState = iota
+	frontendAwaitingResolve
+	frontendAttached
+)
+
 func (c *frontendConn) serve(ctx context.Context) {
+	connCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
 	defer c.close()
+	defer cancel()
+	var lastRequestID uint64
+	state := frontendAwaitingHello
 	for {
 		env, err := pfslocal.ReadFrame(c.conn)
 		if err != nil {
@@ -67,23 +111,122 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			return
 		}
-		go c.handle(ctx, env)
+		if _, ack := env.Body.(*pfslocal.PublicationAck); ack {
+			if state != frontendAttached || env.RequestID != 0 {
+				return
+			}
+			req := env.Body.(*pfslocal.PublicationAck)
+			if req.PublishedRequestID != 0 ||
+				req.OperationID == 0 ||
+				!c.acknowledgePublication(req.OperationID) {
+				return
+			}
+			continue
+		} else {
+			if env.RequestID == 0 || env.RequestID <= lastRequestID {
+				return
+			}
+			lastRequestID = env.RequestID
+		}
+		switch req := env.Body.(type) {
+		case *pfslocal.Hello:
+			if state != frontendAwaitingHello {
+				return
+			}
+			if req.ProtocolMajor != pfslocal.ProtocolMajor ||
+				req.ProtocolMinor < pfslocal.ProtocolMinor {
+				c.errorReply(env.RequestID, darwinEINVAL, "unsupported protocol version")
+				return
+			}
+			c.reply(env.RequestID, &pfslocal.HelloReply{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: pfslocal.ProtocolMinor,
+				DaemonVersion: c.srv.cfg.Version,
+			})
+			state = frontendAwaitingResolve
+		case *pfslocal.ResolveRequest:
+			if state != frontendAwaitingResolve {
+				return
+			}
+			a := c.srv.registry.get(req.AttachRef)
+			if a == nil {
+				c.errorReply(env.RequestID, darwinENOENT, "unknown attach_ref")
+				continue
+			}
+			rep, eno := a.rootReply(connCtx)
+			if eno != 0 {
+				c.errorReply(env.RequestID, eno, errMessage("resolve", eno))
+				continue
+			}
+			if !c.setAttach(a) {
+				return
+			}
+			state = frontendAttached
+			c.reply(env.RequestID, &rep)
+		default:
+			if state != frontendAttached {
+				return
+			}
+			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
+				c.inFlight.Add(-1)
+				return
+			}
+			c.handlerWG.Add(1)
+			go func(
+				a *attach,
+				requestID uint64,
+				operationID uint64,
+				body any,
+			) {
+				defer c.handlerWG.Done()
+				defer c.inFlight.Add(-1)
+				c.handleAttached(
+					connCtx,
+					a,
+					requestID,
+					operationID,
+					body,
+				)
+			}(c.currentAttach(), env.RequestID, env.OperationID, req)
+		}
 	}
 }
 
 func (c *frontendConn) close() {
-	if a := c.currentAttach(); a != nil {
-		a.removeConn(c.conn)
-	}
-	c.eventsMu.Lock()
-	if c.events != nil {
-		if a := c.currentAttach(); a != nil {
-			a.unsubscribe(c.events)
+	c.closeOnce.Do(func() {
+		if c.cancel != nil {
+			c.cancel()
 		}
-		c.events = nil
-	}
-	c.eventsMu.Unlock()
-	_ = c.conn.Close()
+		// Closing the transport unblocks any handler currently writing a
+		// reply. Admission and release waits observe the canceled connCtx.
+		_ = c.conn.Close()
+		// A handler may still be completing a local syscall or mutation after
+		// cancellation. Keep its logical operation in the handoff gate until
+		// the handler has fully exited.
+		c.handlerWG.Wait()
+		c.publicationMu.Lock()
+		c.publicationClosed = true
+		pending := c.operations
+		c.operations = nil
+		c.publicationMu.Unlock()
+		for _, entry := range pending {
+			<-entry.ready
+			if entry.op != nil {
+				entry.op.attach.finishFrontendOperation(entry.op)
+			}
+		}
+		if a := c.currentAttach(); a != nil {
+			a.removeConn(c.conn)
+		}
+		c.eventsMu.Lock()
+		if c.events != nil {
+			if a := c.currentAttach(); a != nil {
+				a.unsubscribe(c.events)
+			}
+			c.events = nil
+		}
+		c.eventsMu.Unlock()
+	})
 }
 
 func (c *frontendConn) currentAttach() *attach {
@@ -92,14 +235,19 @@ func (c *frontendConn) currentAttach() *attach {
 	return c.attach
 }
 
-func (c *frontendConn) setAttach(a *attach) {
+func (c *frontendConn) setAttach(a *attach) bool {
 	c.attachMu.Lock()
+	if c.attach != nil {
+		c.attachMu.Unlock()
+		return false
+	}
 	c.attach = a
 	if c.origin == 0 {
 		c.origin = a.newOrigin()
 	}
 	c.attachMu.Unlock()
 	a.addConn(c.conn)
+	return true
 }
 
 func (c *frontendConn) write(env *pfslocal.Envelope) error {
@@ -109,7 +257,15 @@ func (c *frontendConn) write(env *pfslocal.Envelope) error {
 }
 
 func (c *frontendConn) reply(req uint64, body any) {
-	if err := c.write(&pfslocal.Envelope{RequestID: req, Body: body}); err != nil {
+	c.replyWithPublication(req, body, false)
+}
+
+func (c *frontendConn) replyWithPublication(req uint64, body any, ackRequired bool) {
+	if err := c.write(&pfslocal.Envelope{
+		RequestID:              req,
+		PublicationAckRequired: ackRequired,
+		Body:                   body,
+	}); err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
 	}
@@ -119,38 +275,193 @@ func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
 	c.reply(req, &pfslocal.ErrorReply{Errno: eno, Message: msg})
 }
 
-func (c *frontendConn) handle(ctx context.Context, env *pfslocal.Envelope) {
-	switch req := env.Body.(type) {
-	case *pfslocal.Hello:
-		if req.ProtocolMajor != pfslocal.ProtocolMajor {
-			c.errorReply(env.RequestID, darwinEINVAL, "unsupported protocol major")
-			return
-		}
-		c.reply(env.RequestID, &pfslocal.HelloReply{ProtocolMajor: pfslocal.ProtocolMajor, ProtocolMinor: pfslocal.ProtocolMinor, DaemonVersion: c.srv.cfg.Version})
-	case *pfslocal.ResolveRequest:
-		a := c.srv.registry.get(req.AttachRef)
-		if a == nil {
-			c.errorReply(env.RequestID, darwinENOENT, "unknown attach_ref")
-			return
-		}
-		rep, eno := a.rootReply(ctx)
-		if eno != 0 {
-			c.errorReply(env.RequestID, eno, errMessage("resolve", eno))
-			return
-		}
-		c.setAttach(a)
-		c.reply(env.RequestID, &rep)
-	default:
-		a := c.currentAttach()
-		if a == nil {
-			c.errorReply(env.RequestID, darwinEINVAL, "connection is not resolved")
-			return
-		}
-		c.handleAttached(ctx, a, env.RequestID, req)
+func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
+	c.publicationMu.Lock()
+	entry := c.operations[operationID]
+	if entry == nil || entry.op == nil || entry.ackPending {
+		c.publicationMu.Unlock()
+		return false
+	}
+	entry.ackPending = true
+	finish := entry.activeRequests == 0
+	if finish {
+		delete(c.operations, operationID)
+	}
+	c.publicationMu.Unlock()
+	if finish {
+		entry.op.attach.finishFrontendOperation(entry.op)
+	}
+	return true
+}
+
+func (c *frontendConn) finishLogicalRequest(operationID uint64) {
+	c.publicationMu.Lock()
+	entry := c.operations[operationID]
+	if entry == nil || entry.activeRequests <= 0 {
+		c.publicationMu.Unlock()
+		return
+	}
+	entry.activeRequests--
+	finish := entry.ackPending && entry.activeRequests == 0
+	if finish {
+		delete(c.operations, operationID)
+	}
+	c.publicationMu.Unlock()
+	if finish {
+		entry.op.attach.finishFrontendOperation(entry.op)
 	}
 }
 
-func (c *frontendConn) handleAttached(ctx context.Context, a *attach, requestID uint64, body any) {
+func (c *frontendConn) hasLogicalOperation(operationID uint64) bool {
+	c.publicationMu.Lock()
+	_, exists := c.operations[operationID]
+	c.publicationMu.Unlock()
+	return exists
+}
+
+func (c *frontendConn) beginLogicalOperation(
+	ctx context.Context,
+	a *attach,
+	operationID uint64,
+	body any,
+) (context.Context, *frontendOperationParticipant, bool, bool, error) {
+	paths, pathEpoch, publishes := a.frontendOperationPaths(body)
+
+	c.publicationMu.Lock()
+	if c.publicationClosed {
+		c.publicationMu.Unlock()
+		return ctx, nil, false, false, net.ErrClosed
+	}
+	if entry := c.operations[operationID]; entry != nil {
+		if entry.ackPending {
+			c.publicationMu.Unlock()
+			return ctx, nil, false, false, fmt.Errorf("frontend operation already acknowledged")
+		}
+		entry.activeRequests++
+		c.publicationMu.Unlock()
+		select {
+		case <-entry.ready:
+		case <-ctx.Done():
+			c.finishLogicalRequest(operationID)
+			return ctx, nil, false, false, ctx.Err()
+		}
+		if entry.err != nil {
+			c.finishLogicalRequest(operationID)
+			return ctx, nil, false, false, entry.err
+		}
+		participant, err := a.extendFrontendOperation(ctx, entry.op, paths, pathEpoch)
+		if err != nil {
+			c.finishLogicalRequest(operationID)
+			return ctx, nil, false, false, err
+		}
+		return context.WithValue(ctx, frontendOperationContextKey{}, participant),
+			participant, true, publishes, nil
+	}
+	if !publishes {
+		c.publicationMu.Unlock()
+		return ctx, nil, false, false, nil
+	}
+	if operationID == 0 {
+		c.publicationMu.Unlock()
+		return ctx, nil, false, false, fmt.Errorf("invalid frontend operation id")
+	}
+	if c.operations == nil {
+		c.operations = map[uint64]*frontendOperationEntry{}
+	}
+	if operationID <= c.lastOperationID {
+		c.publicationMu.Unlock()
+		return ctx, nil, false, false, fmt.Errorf("frontend operation id is not increasing")
+	}
+	if len(c.operations) >= maxFrontendOperationsPerConnection {
+		c.publicationMu.Unlock()
+		return ctx, nil, false, false, fmt.Errorf("too many unacknowledged frontend operations")
+	}
+	entry := &frontendOperationEntry{ready: make(chan struct{}), activeRequests: 1}
+	c.operations[operationID] = entry
+	c.lastOperationID = operationID
+	c.publicationMu.Unlock()
+
+	op, err := a.beginFrontendPathsAtEpochContext(ctx, paths, pathEpoch)
+	c.publicationMu.Lock()
+	if c.publicationClosed && err == nil {
+		err = net.ErrClosed
+	}
+	entry.op = op
+	entry.err = err
+	close(entry.ready)
+	if err != nil {
+		delete(c.operations, operationID)
+	}
+	c.publicationMu.Unlock()
+	if err != nil {
+		if op != nil {
+			a.finishFrontendOperation(op)
+		}
+		return ctx, nil, false, false, err
+	}
+	participant := &frontendOperationParticipant{op: op}
+	return context.WithValue(ctx, frontendOperationContextKey{}, participant),
+		participant, true, true, nil
+}
+
+func (c *frontendConn) handleAttached(
+	ctx context.Context,
+	a *attach,
+	requestID uint64,
+	operationID uint64,
+	body any,
+) {
+	// A request that extends an already-published logical callback must enter
+	// the frontend gate before it waits for the mirrored namespace locks. If a
+	// recall owns one of those locks, suspending this participant lets that
+	// recall finish; resumption then waits for the post-handoff view. A new
+	// logical operation takes the mirrors first so it can never become active
+	// while blocked behind an older concrete namespace lock.
+	continuation := c.hasLogicalOperation(operationID)
+	var (
+		unlockRequest func()
+		participant   *frontendOperationParticipant
+		participates  bool
+		publishes     bool
+		err           error
+	)
+	if continuation {
+		ctx, participant, participates, publishes, err = c.beginLogicalOperation(ctx, a, operationID, body)
+		if err == nil {
+			resume := a.suspendFrontendOperation(ctx)
+			unlockRequest = a.lockFrontendRequest(body)
+			if resume != nil {
+				resume()
+			}
+		}
+	} else {
+		unlockRequest = a.lockFrontendRequest(body)
+		ctx, participant, participates, publishes, err = c.beginLogicalOperation(ctx, a, operationID, body)
+	}
+	if err != nil {
+		if unlockRequest != nil {
+			unlockRequest()
+		}
+		_ = c.conn.Close()
+		return
+	}
+	if unlockRequest != nil {
+		defer unlockRequest()
+	}
+	if participates {
+		defer c.finishLogicalRequest(operationID)
+		defer a.finishFrontendParticipant(participant)
+	}
+	if err := a.frontendAdmissionError(); err != nil {
+		if publishes {
+			c.replyWithPublication(requestID, &pfslocal.ErrorReply{
+				Errno: darwinEIO, Message: err.Error(),
+			}, true)
+		} else {
+			c.errorReply(requestID, darwinEIO, err.Error())
+		}
+		return
+	}
 	started := time.Now()
 	var (
 		reply any
@@ -222,11 +533,22 @@ func (c *frontendConn) handleAttached(ctx context.Context, a *attach, requestID 
 		log.Printf("pfsd-trace %s eno=%d duration=%s", traceOp(a, body), eno, time.Since(started))
 	}
 	if eno != 0 {
-		c.errorReply(requestID, eno, errMessage(fmt.Sprintf("%T", body), eno))
+		if publishes {
+			c.replyWithPublication(
+				requestID,
+				&pfslocal.ErrorReply{
+					Errno:   eno,
+					Message: errMessage(fmt.Sprintf("%T", body), eno),
+				},
+				true,
+			)
+		} else {
+			c.errorReply(requestID, eno, errMessage(fmt.Sprintf("%T", body), eno))
+		}
 		return
 	}
 	a.synthesizeFrontendMutation(body, c.origin)
-	c.reply(requestID, reply)
+	c.replyWithPublication(requestID, reply, publishes)
 }
 
 // pfsdTrace (PFSD_TRACE=1) logs every frontend op with its resolved paths and
@@ -292,21 +614,119 @@ func (c *frontendConn) subscribeEvents(a *attach) error {
 }
 
 func listenUnixSocket(p string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
+	}
+	dirInfo, err := os.Lstat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode().Perm() != 0o700 {
+		return nil, fmt.Errorf("Unix socket parent %s must be a private 0700 directory", dir)
 	}
 	if _, err := os.Lstat(p); err == nil {
 		return nil, fmt.Errorf("refusing to replace existing Unix socket %s; another or previously crashed portablefsd may own it", p)
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("inspect Unix socket %s: %w", p, err)
 	}
-	ln, err := net.Listen("unix", p)
+	// bind(2) publishes a Unix socket pathname before Go returns from
+	// net.Listen, so chmod-after-bind has an observable permissive-mode
+	// window. Bind under a short private staging name in the already-0700
+	// parent, set the final mode, then publish the already-secured socket inode
+	// with link(2). The short name preserves macOS's small sockaddr_un path
+	// limit even when the configured final path is close to that limit. Link
+	// is atomic and refuses an existing destination, preserving the
+	// singleton's never-replace-owner contract without a process-global umask.
+	stagePath, err := unusedUnixStagePath(dir)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(p, 0o600); err != nil {
-		_ = ln.Close()
+	cleanupStage := func() { _ = os.Remove(stagePath) }
+	ln, err := net.Listen("unix", stagePath)
+	if err != nil {
+		cleanupStage()
 		return nil, err
 	}
-	return ln, nil
+	unixLn, ok := ln.(*net.UnixListener)
+	if !ok {
+		_ = ln.Close()
+		cleanupStage()
+		return nil, fmt.Errorf("listen Unix socket %s returned %T", stagePath, ln)
+	}
+	// The final pathname, not the private staging name, owns cleanup.
+	unixLn.SetUnlinkOnClose(false)
+	if err := os.Chmod(stagePath, 0o600); err != nil {
+		_ = ln.Close()
+		cleanupStage()
+		return nil, err
+	}
+	identity, err := os.Lstat(stagePath)
+	if err != nil {
+		_ = ln.Close()
+		cleanupStage()
+		return nil, err
+	}
+	if err := os.Link(stagePath, p); err != nil {
+		_ = ln.Close()
+		cleanupStage()
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("refusing to replace existing Unix socket %s; another or previously crashed portablefsd may own it", p)
+		}
+		return nil, fmt.Errorf("publish Unix socket %s: %w", p, err)
+	}
+	published := &publishedUnixListener{Listener: ln, path: p, identity: identity}
+	if err := os.Remove(stagePath); err != nil {
+		_ = published.Close()
+		cleanupStage()
+		return nil, fmt.Errorf("retire staged Unix socket name: %w", err)
+	}
+	return published, nil
+}
+
+func unusedUnixStagePath(dir string) (string, error) {
+	var suffix [2]byte
+	for attempt := 0; attempt < 64; attempt++ {
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", fmt.Errorf("generate Unix socket staging name: %w", err)
+		}
+		p := filepath.Join(dir, fmt.Sprintf(".p%02x%02x", suffix[0], suffix[1]))
+		if _, err := os.Lstat(p); os.IsNotExist(err) {
+			return p, nil
+		} else if err != nil {
+			return "", fmt.Errorf("inspect Unix socket staging name: %w", err)
+		}
+	}
+	return "", fmt.Errorf("allocate unique Unix socket staging name in %s", dir)
+}
+
+// publishedUnixListener removes only the exact socket inode it published.
+// A same-user process replacing the path during shutdown is never deleted.
+type publishedUnixListener struct {
+	net.Listener
+	path     string
+	identity os.FileInfo
+	once     sync.Once
+	err      error
+}
+
+func (l *publishedUnixListener) Close() error {
+	l.once.Do(func() {
+		closeErr := l.Listener.Close()
+		current, statErr := os.Lstat(l.path)
+		switch {
+		case os.IsNotExist(statErr):
+			statErr = nil
+		case statErr != nil:
+		case !os.SameFile(current, l.identity):
+			statErr = fmt.Errorf("refusing to remove replaced Unix socket %s", l.path)
+		default:
+			statErr = os.Remove(l.path)
+			if os.IsNotExist(statErr) {
+				statErr = nil
+			}
+		}
+		l.err = errors.Join(closeErr, statErr)
+	})
+	return l.err
 }

@@ -12,6 +12,7 @@ package fsproto
 // connection drops (UNKNOWN) and the identity parks for replay.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -222,7 +223,14 @@ func (c *Client) PrepareDelegationRelease(path, epoch string, paths []string) ([
 // identical bytes and the authority drops the covered prefix), so no slot
 // identity is consumed.
 func (c *Client) FlushWriteback(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
-	return c.flushWriteback(writebackID, scopes, prevDigest, endDigest, records, false)
+	return c.flushWriteback(context.Background(), writebackID, scopes, prevDigest, endDigest, records, false)
+}
+
+// FlushWritebackContext is the normal flusher path. When ctx expires it
+// interrupts and joins the checked-out transport before returning, so the
+// single flusher remains the single authority writer even across timeouts.
+func (c *Client) FlushWritebackContext(ctx context.Context, writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
+	return c.flushWriteback(ctx, writebackID, scopes, prevDigest, endDigest, records, false)
 }
 
 // FlushWritebackResolved is the recovery-only form of FlushWriteback. Once
@@ -231,10 +239,10 @@ func (c *Client) FlushWriteback(writebackID string, scopes []WBScope, prevDigest
 // teardown. Recovery callers retain their exclusive local store lock for this
 // entire call, so a possibly-sent flush never becomes a detached writer.
 func (c *Client) FlushWritebackResolved(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
-	return c.flushWriteback(writebackID, scopes, prevDigest, endDigest, records, true)
+	return c.flushWriteback(context.Background(), writebackID, scopes, prevDigest, endDigest, records, true)
 }
 
-func (c *Client) flushWriteback(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record, resolved bool) (uint64, int32, error) {
+func (c *Client) flushWriteback(ctx context.Context, writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record, resolved bool) (uint64, int32, error) {
 	req := &Request{
 		Op:           OpFlushBatch,
 		SessionID:    writebackID,
@@ -251,7 +259,7 @@ func (c *Client) flushWriteback(writebackID string, scopes []WBScope, prevDigest
 	if resolved {
 		resp, err = c.doAttachedResolved(req)
 	} else {
-		resp, err = c.doAttached(req, false)
+		resp, _, err = c.roundtripAttachedContext(ctx, req)
 	}
 	if err != nil {
 		return 0, EIO, err
