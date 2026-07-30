@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"syscall"
 	"time"
@@ -149,7 +150,8 @@ func retriableTransportError(err error) bool {
 	switch {
 	case errors.Is(err, syscall.ECONNRESET),
 		errors.Is(err, syscall.ECONNABORTED),
-		errors.Is(err, syscall.EPIPE):
+		errors.Is(err, syscall.EPIPE),
+		errors.Is(err, net.ErrClosed):
 		return true
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		// net/http surfaces a server that closed the connection before

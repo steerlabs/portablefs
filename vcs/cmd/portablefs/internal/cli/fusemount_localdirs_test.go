@@ -15,11 +15,12 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 )
 
-// skipWithoutFUSE gates the real-kernel-mount tests on a usable unprivileged
-// FUSE environment (Linux with /dev/fuse and a fusermount helper — e.g. any
-// stock ubuntu CI runner). The graft SEMANTICS are pinned unconditionally by
-// vcs/internal/localdirs's unit tests; this file proves the kernel-facing
-// wiring end to end where a kernel is available.
+// skipWithoutFUSE gates the real-kernel-mount tests on the prerequisites that
+// can be checked without attempting a mount. Some containerized Linux hosts
+// expose /dev/fuse and a helper but still deny the mount syscall; that final
+// capability is handled by skipIfFUSEMountForbidden below. The graft semantics
+// are pinned unconditionally by vcs/internal/localdirs's unit tests; this file
+// proves the kernel-facing wiring end to end where a kernel mount is permitted.
 func skipWithoutFUSE(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -32,6 +33,19 @@ func skipWithoutFUSE(t *testing.T) {
 		if _, err := exec.LookPath("fusermount"); err != nil {
 			t.Skip("fusermount3/fusermount not in PATH")
 		}
+	}
+}
+
+// skipIfFUSEMountForbidden distinguishes a host capability restriction from a
+// PortableFS mount failure. EPERM while go-fuse is performing the kernel mount
+// means the test host does not permit FUSE (for example, an unprivileged CI
+// container). Every other error remains a hard test failure.
+func skipIfFUSEMountForbidden(t *testing.T, err error) {
+	t.Helper()
+	if err != nil &&
+		strings.HasPrefix(err.Error(), "mount ") &&
+		(errors.Is(err, syscall.EPERM) || strings.Contains(strings.ToLower(err.Error()), "operation not permitted")) {
+		t.Skipf("host does not permit a real FUSE mount: %v", err)
 	}
 }
 
@@ -102,6 +116,7 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 		backingRoot: backing,
 	})
 	if err != nil {
+		skipIfFUSEMountForbidden(t, err)
 		t.Fatalf("mountFUSE: %v", err)
 	}
 	installTestDirectDetach(t, m, mnt, "mnt_AAAAAAAAAAAAAAAAAAAAAA")
@@ -278,6 +293,7 @@ func TestFUSELocalDirsComposeWithWriteback(t *testing.T) {
 		backingRoot: filepath.Join(t.TempDir(), "local", "sid"),
 	})
 	if err != nil {
+		skipIfFUSEMountForbidden(t, err)
 		t.Fatalf("mountFUSE: %v", err)
 	}
 	installTestDirectDetach(t, m, mnt, "mnt_BBBBBBBBBBBBBBBBBBBBBB")
