@@ -146,7 +146,7 @@ private final class EmptyDataStringFileName: FSFileName {
 }
 
 @available(macOS 26.0, *)
-private struct AdapterHarness {
+private struct AdapterHarness: @unchecked Sendable {
     var daemon: PfsLocalMockDaemon
     var core: VolumeCore
     var volume: PortableFSVolume
@@ -379,6 +379,44 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     #expect(gateState.returned)
     stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 2)
     #expect(stats.publicationAcks >= baseline + 2)
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterDrainsPublicationAcksUnderConcurrentLoad() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    try await Task.sleep(for: .milliseconds(20))
+
+    let baseline = await harness.daemon.stats().publicationAcks
+    let workerCount = 1_200
+    let operationsPerWorker = 2
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for _ in 0..<workerCount {
+            group.addTask {
+                for _ in 0..<operationsPerWorker {
+                    try await withCheckedThrowingContinuation {
+                        (continuation: CheckedContinuation<Void, Error>) in
+                        harness.volume.getAttributes(
+                            FSItem.GetAttributesRequest(),
+                            of: harness.root
+                        ) { _, error in
+                            if let error {
+                                continuation.resume(throwing: error)
+                            } else {
+                                continuation.resume()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try await group.waitForAll()
+    }
+
+    let expected = baseline + workerCount * operationsPerWorker
+    let stats = try await waitForPublicationAcks(harness.daemon, atLeast: expected)
+    #expect(stats.publicationAcks == expected)
 }
 
 @available(macOS 26.0, *)

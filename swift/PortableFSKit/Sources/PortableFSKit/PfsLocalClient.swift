@@ -46,29 +46,184 @@ private final class PfsConnection: @unchecked Sendable {
     }
 }
 
-/// Chains socket writes in the same order they were enqueued. Request IDs are
-/// allocated by `PfsLocalClient`'s actor, and every request plus one-way
-/// publication acknowledgement enters this queue synchronously while on that
-/// actor. Detached task scheduling therefore cannot reorder stream frames.
+final class PfsEnvelopeWriteReceipt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Void, Error>?
+    private var continuations: [CheckedContinuation<Void, Error>] = []
+
+    func wait() async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(with: result)
+                return
+            }
+            continuations.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func resolve(_ result: Result<Void, Error>) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let continuations = continuations
+        self.continuations.removeAll(keepingCapacity: false)
+        lock.unlock()
+        for continuation in continuations {
+            continuation.resume(with: result)
+        }
+    }
+}
+
+private struct PfsQueuedEnvelopeWrite: @unchecked Sendable {
+    var envelope: PfsEnvelope
+    var receipt: PfsEnvelopeWriteReceipt
+}
+
+enum PfsEnvelopeWriteLane {
+    case request
+    case publication
+}
+
+private struct PfsEnvelopeWriteQueue {
+    private var storage: [PfsQueuedEnvelopeWrite?] = []
+    private var head = 0
+
+    mutating func append(_ write: PfsQueuedEnvelopeWrite) {
+        storage.append(write)
+    }
+
+    mutating func popFirst() -> PfsQueuedEnvelopeWrite? {
+        guard head < storage.count, let write = storage[head] else {
+            return nil
+        }
+        // Release each frame and receipt as soon as it leaves the queue. The
+        // backing allocation may remain at its peak capacity, but live
+        // payload memory is bounded by the actual backlog.
+        storage[head] = nil
+        head += 1
+        if head == storage.count {
+            storage.removeAll(keepingCapacity: true)
+            head = 0
+        } else if head >= 1024, head * 2 >= storage.count {
+            storage.removeFirst(head)
+            head = 0
+        }
+        return write
+    }
+
+    mutating func removeAll() -> [PfsQueuedEnvelopeWrite] {
+        let pending = storage[head...].compactMap { $0 }
+        storage.removeAll(keepingCapacity: false)
+        head = 0
+        return pending
+    }
+}
+
+/// One lock-linearized writer owns every frame for a connection. Ordinary
+/// requests retain strict FIFO order. Publication acknowledgements use a
+/// control lane so a callback can release its daemon handoff before a large
+/// request burst reaches the daemon's admission bound. The control lane is
+/// checked only between complete frame writes, so bytes never interleave.
+///
+/// A single drain task performs writes and consumed slots release their payload
+/// immediately, avoiding both concurrent stream writes and an unbounded
+/// dependency/retention chain under sustained load.
 final class PfsOrderedEnvelopeWriter: @unchecked Sendable {
     private let write: @Sendable (PfsEnvelope) async throws -> Void
-    private var tail: Task<Void, Error>?
+    private let lock = NSLock()
+    private var requestQueue = PfsEnvelopeWriteQueue()
+    private var publicationQueue = PfsEnvelopeWriteQueue()
+    private var draining = false
+    private var terminalError: Error?
 
     init(write: @escaping @Sendable (PfsEnvelope) async throws -> Void) {
         self.write = write
     }
 
-    func enqueue(_ envelope: PfsEnvelope) -> Task<Void, Error> {
-        let predecessor = tail
-        let write = self.write
-        let task = Task.detached {
-            if let predecessor {
-                try await predecessor.value
+    func enqueue(
+        _ envelope: PfsEnvelope,
+        lane: PfsEnvelopeWriteLane = .request
+    ) -> PfsEnvelopeWriteReceipt {
+        let receipt = PfsEnvelopeWriteReceipt()
+        var startDrain = false
+
+        lock.lock()
+        if let terminalError {
+            lock.unlock()
+            receipt.resolve(.failure(terminalError))
+        } else {
+            let queued = PfsQueuedEnvelopeWrite(
+                envelope: envelope,
+                receipt: receipt
+            )
+            switch lane {
+            case .request:
+                requestQueue.append(queued)
+            case .publication:
+                publicationQueue.append(queued)
             }
-            try await write(envelope)
+            if !draining {
+                draining = true
+                startDrain = true
+            }
+            lock.unlock()
         }
-        tail = task
-        return task
+
+        if startDrain {
+            Task.detached {
+                await self.drain()
+            }
+        }
+        return receipt
+    }
+
+    private func drain() async {
+        while true {
+            guard let queued = dequeue() else {
+                return
+            }
+
+            do {
+                try await write(queued.envelope)
+                queued.receipt.resolve(.success(()))
+            } catch {
+                let pending = terminate(with: error)
+                queued.receipt.resolve(.failure(error))
+                for write in pending {
+                    write.receipt.resolve(.failure(error))
+                }
+                return
+            }
+        }
+    }
+
+    private func dequeue() -> PfsQueuedEnvelopeWrite? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let publication = publicationQueue.popFirst() {
+            return publication
+        }
+        if let request = requestQueue.popFirst() {
+            return request
+        }
+        draining = false
+        return nil
+    }
+
+    private func terminate(with error: Error) -> [PfsQueuedEnvelopeWrite] {
+        lock.lock()
+        defer { lock.unlock() }
+        terminalError = error
+        let pending = publicationQueue.removeAll() + requestQueue.removeAll()
+        draining = false
+        return pending
     }
 }
 
@@ -79,7 +234,7 @@ private struct PfsPendingRequest: Sendable {
 }
 
 private struct PfsPublicationTicket: Sendable {
-    var connectionID: UUID
+    var connection: PfsConnection
     var operationID: UInt64
 }
 
@@ -91,7 +246,7 @@ private enum PfsExistingPublicationBinding {
 
 private final class PfsPublicationCollector: @unchecked Sendable {
     private let lock = NSLock()
-    private var connectionIDs: Set<UUID> = []
+    private var connections: [UUID: PfsConnection] = [:]
     private var boundConnectionID: UUID?
     private var operationID: UInt64?
 
@@ -121,9 +276,9 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         return .current(operationID)
     }
 
-    func append(connectionID: UUID) {
+    func append(connection: PfsConnection) {
         lock.lock()
-        connectionIDs.insert(connectionID)
+        connections[connection.id] = connection
         lock.unlock()
     }
 
@@ -131,8 +286,8 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         lock.lock()
         let result: [PfsPublicationTicket]
         if let operationID {
-            result = connectionIDs.map {
-                PfsPublicationTicket(connectionID: $0, operationID: operationID)
+            result = connections.values.map {
+                PfsPublicationTicket(connection: $0, operationID: operationID)
             }
         } else {
             result = []
@@ -447,7 +602,9 @@ public actor PfsLocalClient {
         }
         request.timeoutTask?.cancel()
         if envelope.publicationAckRequired {
-            request.publicationCollector?.append(connectionID: connectionID)
+            if let connection {
+                request.publicationCollector?.append(connection: connection)
+            }
         }
 
         if case let .error(error)? = envelope.body {
@@ -589,10 +746,10 @@ public actor PfsLocalClient {
                     return
                 }
                 let outboundEnvelope = envelope
-                let writeTask = connection.writer.enqueue(outboundEnvelope)
-                Task.detached { [connectionID = connection.id, writeTask] in
+                let writeReceipt = connection.writer.enqueue(outboundEnvelope)
+                Task.detached { [connectionID = connection.id, writeReceipt] in
                     do {
-                        try await writeTask.value
+                        try await writeReceipt.wait()
                     } catch {
                         await self.writeFailed(requestID, connectionID: connectionID, error: error)
                     }
@@ -605,27 +762,35 @@ public actor PfsLocalClient {
         }
     }
 
-    private func completePublications(_ tickets: [PfsPublicationTicket]) async {
+    private nonisolated func completePublications(_ tickets: [PfsPublicationTicket]) async {
         for ticket in tickets {
-            guard let connection, connection.id == ticket.connectionID else {
-                // Closing the old connection synchronously retires all of its
-                // daemon-side publication tickets. Never replay a stale
-                // request ID onto a replacement connection.
-                continue
-            }
             var ack = PfsPublicationAck()
             ack.operationID = ticket.operationID
             var envelope = PfsEnvelope()
             envelope.requestID = 0
             envelope.body = .publicationAck(ack)
-            let writeTask = connection.writer.enqueue(envelope)
+            let writeReceipt = ticket.connection.writer.enqueue(
+                envelope,
+                lane: .publication
+            )
             do {
-                try await writeTask.value
+                try await writeReceipt.wait()
             } catch {
-                closeCurrentConnection(connection.id, error: error)
+                // A ticket is permanently bound to the connection that
+                // exposed its reply. Never replay it on a replacement
+                // connection; closing that exact epoch makes the daemon fail
+                // coherence closed if the result was already exposed.
+                await closePublicationConnection(
+                    ticket.connection.id,
+                    error: error
+                )
                 return
             }
         }
+    }
+
+    private func closePublicationConnection(_ connectionID: UUID, error: Error) {
+        closeCurrentConnection(connectionID, error: error)
     }
 
     private func timeoutRequest(_ requestID: UInt64) {
