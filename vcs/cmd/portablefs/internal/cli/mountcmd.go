@@ -1802,6 +1802,7 @@ func cmdUmount(e *cmdEnv, args []string) int {
 			if err != nil {
 				return e.fail("umount", err)
 			}
+			fskitUnmountCompleted = true
 		case "fuse":
 			ownerWasLive := mountProcessMatches(st)
 			forcedJobs, err = e.forceParkFUSEMount(stateDir, st)
@@ -1846,8 +1847,15 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("umount", fmt.Errorf("kernel mount identity changed after drain; refusing unmount: %w", err))
 	}
-	switch {
-	case mounted && !fuseForceCompleted && !fskitUnmountCompleted:
+	needsPlatformUnmount, reconcileStale, completionErr := decidePostUnmount(
+		mounted,
+		fuseForceCompleted,
+		fskitUnmountCompleted,
+	)
+	if completionErr != nil {
+		return e.fail("umount", completionErr)
+	}
+	if needsPlatformUnmount {
 		if unmountErr := platformUnmountRecorded(st); unmountErr != nil {
 			stillMounted, identityErr := recordedKernelMountPresent(st)
 			if identityErr != nil {
@@ -1857,18 +1865,18 @@ func cmdUmount(e *cmdEnv, args []string) int {
 				return e.fail("umount", fmt.Errorf("%w\nif the volume is busy, close processes using %s and retry", unmountErr, mountPath))
 			}
 		}
-	case mounted:
-		return e.fail("umount", fmt.Errorf("forced FUSE owner acknowledged parking but the exact kernel mount remains; state and intent were preserved"))
-	case mountProcessMatches(st):
-		// The platform mount was torn down externally (forced diskutil
-		// unmount, extension crash) but the daemon lingers: reconcile —
-		// stop it and drop the record — instead of reporting "busy" for
-		// a path that has nothing mounted on it.
-		fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d still running); stopping it and removing stale mount state\n", mountPath, st.PID)
-	default:
-		// Daemon already gone and nothing to unmount: a stale record. Clean it
-		// up instead of failing, so `mounts` stops flagging it.
-		fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
+	} else if reconcileStale {
+		if mountProcessMatches(st) {
+			// The platform mount was torn down externally (forced diskutil
+			// unmount, extension crash) but the daemon lingers: reconcile —
+			// stop it and drop the record — instead of reporting "busy" for
+			// a path that has nothing mounted on it.
+			fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d still running); stopping it and removing stale mount state\n", mountPath, st.PID)
+		} else {
+			// Daemon already gone and nothing to unmount: a stale record. Clean it
+			// up instead of failing, so `mounts` stops flagging it.
+			fmt.Fprintf(e.stderr, "portablefs umount: warning: %s was not mounted (daemon pid %d already gone); removing stale mount state\n", mountPath, st.PID)
+		}
 	}
 	if mountProcessMatches(st) {
 		if err := stopMountDaemon(st); err != nil {
@@ -1905,6 +1913,26 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 	fmt.Fprintf(e.stdout, "unmounted %s (volume %s)\n", mountPath, st.VolumeID)
 	return 0
+}
+
+// decidePostUnmount classifies the exact kernel state after a drain/detach
+// acknowledgement. A successful daemon-owned FSKit transaction already
+// performed the kernel detach, so absence is normal and presence is an
+// FSKit-specific invariant violation. Only an unacknowledged absence is
+// stale-state reconciliation.
+func decidePostUnmount(mounted, fuseForceCompleted, fskitUnmountCompleted bool) (needsPlatformUnmount, reconcileStale bool, err error) {
+	switch {
+	case mounted && fskitUnmountCompleted:
+		return false, false, fmt.Errorf("daemon-owned FSKit unmount acknowledged completion but the exact kernel mount remains; state and intent were preserved")
+	case mounted && fuseForceCompleted:
+		return false, false, fmt.Errorf("forced FUSE owner acknowledged parking but the exact kernel mount remains; state and intent were preserved")
+	case mounted:
+		return true, false, nil
+	case fskitUnmountCompleted || fuseForceCompleted:
+		return false, false, nil
+	default:
+		return false, true, nil
+	}
 }
 
 func preparedFUSERetryDecision(phase string, ownerLive, explicitForce, parkAcknowledged bool) (bool, error) {

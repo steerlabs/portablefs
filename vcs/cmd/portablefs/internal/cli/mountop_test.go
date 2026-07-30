@@ -166,6 +166,81 @@ func TestPreparedFUSELiveRetryDecision(t *testing.T) {
 	}
 }
 
+func TestDecidePostUnmount(t *testing.T) {
+	tests := []struct {
+		name                    string
+		mounted                 bool
+		fuseForceCompleted      bool
+		fskitUnmountCompleted   bool
+		wantPlatformUnmount     bool
+		wantStaleReconciliation bool
+		wantError               string
+		rejectError             string
+	}{
+		{
+			name:                "ordinary live mount needs platform detach",
+			mounted:             true,
+			wantPlatformUnmount: true,
+		},
+		{
+			name:                    "unacknowledged absent mount is stale",
+			wantStaleReconciliation: true,
+		},
+		{
+			name:                  "acknowledged FSKit absence is normal completion",
+			fskitUnmountCompleted: true,
+		},
+		{
+			name:               "acknowledged forced FUSE absence is normal completion",
+			fuseForceCompleted: true,
+		},
+		{
+			name:                  "acknowledged FSKit mount remaining is FSKit failure",
+			mounted:               true,
+			fskitUnmountCompleted: true,
+			wantError:             "FSKit unmount acknowledged completion",
+			rejectError:           "FUSE",
+		},
+		{
+			name:               "acknowledged forced FUSE mount remaining is FUSE failure",
+			mounted:            true,
+			fuseForceCompleted: true,
+			wantError:          "forced FUSE owner acknowledged parking",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			platformUnmount, reconcileStale, err := decidePostUnmount(
+				tc.mounted,
+				tc.fuseForceCompleted,
+				tc.fskitUnmountCompleted,
+			)
+			if platformUnmount != tc.wantPlatformUnmount ||
+				reconcileStale != tc.wantStaleReconciliation {
+				t.Fatalf(
+					"decision=(platform=%v stale=%v), want (platform=%v stale=%v)",
+					platformUnmount,
+					reconcileStale,
+					tc.wantPlatformUnmount,
+					tc.wantStaleReconciliation,
+				)
+			}
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error=%v, want substring %q", err, tc.wantError)
+			}
+			if tc.rejectError != "" && strings.Contains(err.Error(), tc.rejectError) {
+				t.Fatalf("error=%q contains rejected substring %q", err, tc.rejectError)
+			}
+		})
+	}
+}
+
 func TestOwnerlessForceRequestRequiresExactOfflineStoreProof(t *testing.T) {
 	e, _, _ := testEnv(t)
 	stateDir := filepath.Join(t.TempDir(), "mounts")

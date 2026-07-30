@@ -28,6 +28,11 @@ type persistedAttachRegistry struct {
 	Attaches []persistedAttachEntry `json:"attaches"`
 }
 
+type loadedAttachRegistry struct {
+	attaches            []persistedAttachEntry
+	preserveLegacyEmpty bool
+}
+
 type persistedAttachEntry struct {
 	Ref                 string                `json:"ref"`
 	VolumeID            string                `json:"volumeId"`
@@ -97,26 +102,53 @@ func (i persistedItemRecord) authorityItemID() uint64 {
 }
 
 func loadPersistedAttaches(stateDir string) ([]persistedAttachEntry, error) {
+	loaded, err := loadAttachRegistry(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	return loaded.attaches, nil
+}
+
+func loadAttachRegistry(stateDir string) (loadedAttachRegistry, error) {
 	p := attachRegistryPath(stateDir)
 	data, err := privatepath.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return loadedAttachRegistry{}, nil
 		}
-		return nil, fmt.Errorf("read attach registry %s: %w", p, err)
+		return loadedAttachRegistry{}, fmt.Errorf("read attach registry %s: %w", p, err)
+	}
+	if err := rejectDuplicateRegistryFields(data); err != nil {
+		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: %w", p, err)
 	}
 	var raw persistedAttachRegistry
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("parse attach registry %s: %w", p, err)
+		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: %w", p, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err == nil || err != io.EOF {
-		return nil, fmt.Errorf("parse attach registry %s: trailing JSON", p)
+		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: trailing JSON", p)
 	}
-	if raw.Version != attachRegistryVersion {
-		return nil, fmt.Errorf("attach registry %s has unsupported version %d", p, raw.Version)
+	switch raw.Version {
+	case 1:
+		if raw.Attaches == nil || len(raw.Attaches) != 0 {
+			return loadedAttachRegistry{}, fmt.Errorf(
+				"attach registry %s has unsupported nonempty legacy version 1 inventory",
+				p,
+			)
+		}
+		// An explicitly empty v1 inventory carries no attach state requiring
+		// migration. Accept it read-only: this is compatibility, not recovery
+		// or self-healing, and must not rewrite the file behind the caller.
+		return loadedAttachRegistry{
+			attaches:            raw.Attaches,
+			preserveLegacyEmpty: true,
+		}, nil
+	case attachRegistryVersion:
+	default:
+		return loadedAttachRegistry{}, fmt.Errorf("attach registry %s has unsupported version %d", p, raw.Version)
 	}
 	seenRef := map[string]struct{}{}
 	seenKey := map[string]struct{}{}
@@ -124,25 +156,97 @@ func loadPersistedAttaches(stateDir string) ([]persistedAttachEntry, error) {
 	for i := range raw.Attaches {
 		e := &raw.Attaches[i]
 		if err := validatePersistedAttach(e); err != nil {
-			return nil, fmt.Errorf("invalid attach registry entry %d in %s: %w", i, p, err)
+			return loadedAttachRegistry{}, fmt.Errorf("invalid attach registry entry %d in %s: %w", i, p, err)
 		}
 		if _, duplicate := seenRef[e.Ref]; duplicate {
-			return nil, fmt.Errorf("duplicate attach ref %s in %s", e.Ref, p)
+			return loadedAttachRegistry{}, fmt.Errorf("duplicate attach ref %s in %s", e.Ref, p)
 		}
 		key := attachKey(e.VolumeID, e.Branch, e.MountPath)
 		if _, duplicate := seenKey[key]; duplicate {
-			return nil, fmt.Errorf("duplicate attach key for %s in %s", e.MountPath, p)
+			return loadedAttachRegistry{}, fmt.Errorf("duplicate attach key for %s in %s", e.MountPath, p)
 		}
 		storage := storageKey(e.VolumeID, e.Branch)
 		if _, duplicate := seenStorage[storage]; duplicate {
-			return nil, fmt.Errorf("multiple persisted attaches own %s@%s in %s", e.VolumeID, e.Branch, p)
+			return loadedAttachRegistry{}, fmt.Errorf("multiple persisted attaches own %s@%s in %s", e.VolumeID, e.Branch, p)
 		}
 		if err := validatePersistedItems(*e); err != nil {
-			return nil, fmt.Errorf("attach registry entry %d in %s: %w", i, p, err)
+			return loadedAttachRegistry{}, fmt.Errorf("attach registry entry %d in %s: %w", i, p, err)
 		}
 		seenRef[e.Ref], seenKey[key], seenStorage[storage] = struct{}{}, struct{}{}, struct{}{}
 	}
-	return raw.Attaches, nil
+	return loadedAttachRegistry{attaches: raw.Attaches}, nil
+}
+
+// rejectDuplicateRegistryFields makes every durable field unambiguous before
+// the typed strict decode. In particular, a document cannot hide a nonempty
+// legacy inventory behind a later empty one or use last-value-wins semantics
+// inside an attach, its options, or its item table.
+func rejectDuplicateRegistryFields(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("top-level value must be an object")
+	}
+	return rejectDuplicateObjectFields(decoder, "$")
+}
+
+func rejectDuplicateObjectFields(decoder *json.Decoder, objectPath string) error {
+	seen := map[string]struct{}{}
+	for decoder.More() {
+		nameToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := nameToken.(string)
+		if !ok {
+			return fmt.Errorf("object member name is not a string")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("duplicate field %q in %s", name, objectPath)
+		}
+		seen[name] = struct{}{}
+		if err := rejectDuplicateValueFields(decoder, objectPath+"."+name); err != nil {
+			return err
+		}
+	}
+	closeToken, err := decoder.Token()
+	if err != nil || closeToken != json.Delim('}') {
+		return fmt.Errorf("invalid object close: %v", err)
+	}
+	return nil
+}
+
+func rejectDuplicateValueFields(decoder *json.Decoder, valuePath string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, isContainer := token.(json.Delim)
+	if !isContainer {
+		return nil
+	}
+	switch delim {
+	case '{':
+		return rejectDuplicateObjectFields(decoder, valuePath)
+	case '[':
+		index := 0
+		for decoder.More() {
+			if err := rejectDuplicateValueFields(decoder, fmt.Sprintf("%s[%d]", valuePath, index)); err != nil {
+				return err
+			}
+			index++
+		}
+		closeToken, err := decoder.Token()
+		if err != nil || closeToken != json.Delim(']') {
+			return fmt.Errorf("invalid array close in %s: %v", valuePath, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unexpected container delimiter %q in %s", delim, valuePath)
+	}
 }
 
 func validatePersistedAttach(e *persistedAttachEntry) error {
@@ -276,9 +380,13 @@ func (r *registry) persist() error {
 		defer r.journal.mu.Unlock()
 	}
 	entries := r.persistedEntries()
+	if r.preserveLegacyEmpty && len(entries) == 0 {
+		return nil
+	}
 	if err := writePersistedAttaches(r.stateDir, entries); err != nil {
 		return err
 	}
+	r.preserveLegacyEmpty = false
 	if r.journal != nil {
 		r.journal.truncateLocked()
 	}
