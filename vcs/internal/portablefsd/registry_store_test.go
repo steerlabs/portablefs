@@ -590,14 +590,23 @@ func TestBindingJournalFailureFailsCurrentPublicationClosed(t *testing.T) {
 func TestAttachRegistryCorruptionFailsClosed(t *testing.T) {
 	validEntry := `{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}`
 	for name, body := range map[string]string{
-		"malformed":         `{`,
-		"unsupported":       `{"version":999,"attaches":[]}`,
-		"unknown field":     `{"version":2,"attaches":[],"future":true}`,
-		"invalid ref":       `{"version":2,"attaches":[{"ref":"att_bad","volumeId":"vol","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
-		"invalid local dir": `{"version":2,"attaches":[{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{"localDirs":["../escape"]},"identityEpoch":1}]}`,
-		"noncanonical path": `{"version":2,"attaches":[{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","branch":"main","mountPath":"/Volumes/../Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
-		"duplicate branch":  `{"version":2,"attaches":[` + validEntry + `,{"ref":"att_BBBBBBBBBBBBBBBBBBBBBB","volumeId":"vol","branch":"main","mountPath":"/Volumes/Other","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
-		"trailing json":     `{"version":2,"attaches":[]}{}`,
+		"malformed":                 `{`,
+		"unsupported zero":          `{"version":0,"attaches":[]}`,
+		"unsupported future":        `{"version":3,"attaches":[]}`,
+		"legacy omitted":            `{"version":1}`,
+		"legacy null":               `{"version":1,"attaches":null}`,
+		"legacy duplicate version":  `{"version":2,"version":1,"attaches":[]}`,
+		"legacy duplicate attaches": `{"version":1,"attaches":[{}],"attaches":[]}`,
+		"legacy unknown field":      `{"version":1,"attaches":[],"future":true}`,
+		"legacy trailing json":      `{"version":1,"attaches":[]}{}`,
+		"unknown field":             `{"version":2,"attaches":[],"future":true}`,
+		"duplicate attach field":    `{"version":2,"attaches":[{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","volumeId":"other","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
+		"duplicate options field":   `{"version":2,"attaches":[{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{"diskCacheMb":1,"diskCacheMb":2},"identityEpoch":1}]}`,
+		"invalid ref":               `{"version":2,"attaches":[{"ref":"att_bad","volumeId":"vol","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
+		"invalid local dir":         `{"version":2,"attaches":[{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","branch":"main","mountPath":"/Volumes/Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{"localDirs":["../escape"]},"identityEpoch":1}]}`,
+		"noncanonical path":         `{"version":2,"attaches":[{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol","branch":"main","mountPath":"/Volumes/../Test","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
+		"duplicate branch":          `{"version":2,"attaches":[` + validEntry + `,{"ref":"att_BBBBBBBBBBBBBBBBBBBBBB","volumeId":"vol","branch":"main","mountPath":"/Volumes/Other","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}]}`,
+		"trailing json":             `{"version":2,"attaches":[]}{}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			stateDir := filepath.Join(privateTestDir(t), "state")
@@ -622,6 +631,88 @@ func TestAttachRegistryCorruptionFailsClosed(t *testing.T) {
 			t.Fatal("unsafe registry file was accepted")
 		}
 	})
+}
+
+func TestNonemptyLegacyAttachRegistryFailsClosed(t *testing.T) {
+	stateDir := filepath.Join(privateTestDir(t), "state")
+	body := []byte(`{
+	  "version": 1,
+	  "attaches": [{
+	    "ref": "att_legacy",
+	    "volumeId": "vol-legacy",
+	    "branch": "main",
+	    "mountPath": "/Volumes/Legacy",
+	    "authorityUrl": "127.0.0.1:1",
+	    "options": {}
+	  }]
+	}`)
+	if err := privatepath.WriteFileAtomic(attachRegistryPath(stateDir), body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPersistedAttaches(stateDir); err == nil ||
+		!strings.Contains(err.Error(), "unsupported nonempty legacy version 1 inventory") {
+		t.Fatalf("nonempty legacy registry error = %v, want explicit fail-closed refusal", err)
+	}
+}
+
+func TestEmptyLegacyAttachRegistryIsReadOnlyCompatible(t *testing.T) {
+	stateDir := filepath.Join(privateTestDir(t), "state")
+	body := []byte("{\n  \"version\": 1,\n  \"attaches\": []\n}\n")
+	path := attachRegistryPath(stateDir)
+	if err := privatepath.WriteFileAtomic(path, body); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registry := newRegistry(stateDir)
+	if registry.loadErr != nil {
+		t.Fatalf("empty legacy registry load error = %v", registry.loadErr)
+	}
+	if got := registry.list(); len(got) != 0 {
+		t.Fatalf("loaded %d legacy attaches, want 0", len(got))
+	}
+	if err := registry.closeAll(context.Background()); err != nil {
+		t.Fatalf("close empty legacy registry: %v", err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("empty legacy registry was silently replaced")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("empty legacy registry was rewritten:\n%s", got)
+	}
+}
+
+func TestCurrentAttachRegistryVersionStillLoadsAndPersists(t *testing.T) {
+	stateDir := privateTestDir(t)
+	if err := writePersistedAttaches(stateDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadPersistedAttaches(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("loaded %d current attaches, want 0", len(loaded))
+	}
+	data, err := os.ReadFile(attachRegistryPath(stateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"version": 2`) {
+		t.Fatalf("current writer did not persist version 2:\n%s", data)
+	}
 }
 
 func TestDeletePersistFailureRetainsRetryableDetachedRecord(t *testing.T) {

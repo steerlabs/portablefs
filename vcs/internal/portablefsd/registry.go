@@ -174,6 +174,12 @@ type registry struct {
 	quiescing  bool
 	loadErr    error
 
+	// Guarded by persistMu. An empty v1 registry is semantically compatible
+	// with v2, but accepting it must remain a read-only compatibility rule.
+	// The first real attach mutation writes v2 through the normal persistence
+	// boundary; idle persistence never performs a hidden migration.
+	preserveLegacyEmpty bool
+
 	// Debounced background persistence for the per-file identity bindings.
 	// Namespace mutations must never block on (or fail with) state-file I/O:
 	// the synchronous persist-per-op this replaces rewrote and fsynced the
@@ -222,11 +228,13 @@ func newRegistry(stateDir string) *registry {
 		}
 		go r.persistLoop()
 	}()
-	persisted, loadErr := loadPersistedAttaches(stateDir)
+	loaded, loadErr := loadAttachRegistry(stateDir)
 	if loadErr != nil {
 		r.loadErr = loadErr
 		return r
 	}
+	persisted := loaded.attaches
+	r.preserveLegacyEmpty = loaded.preserveLegacyEmpty
 	seenStorage := map[string]string{}
 	for _, e := range persisted {
 		req := ensureAttachRequest{
