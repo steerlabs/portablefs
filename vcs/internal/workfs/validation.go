@@ -190,7 +190,7 @@ func validateBatchWrapper(r wal.Record) error {
 		return invalidMutation("batch has %d mutations; maximum is %d", len(r.Mutations), maxIntentMutations)
 	}
 	if r.Path != "" || r.NewPath != "" || r.Offset != 0 || r.Size != 0 || r.Mode != 0 ||
-		r.Target != "" || len(r.Data) != 0 || r.MtimeMs != 0 || r.AtimeMs != 0 || r.ChtimesSetAtime ||
+		r.Target != "" || len(r.Data) != 0 || r.MtimeMs != 0 || r.AtimeMs != 0 || r.ChtimesSetAtime || r.ChtimesKeepMtime ||
 		r.UID != 0 || r.GID != 0 || r.Ino != 0 || len(r.Inos) != 0 || r.OrphanTarget ||
 		r.ChownSetUID || r.ChownSetGID || r.Append || r.ReapIfLeaseExpiresByMs != 0 || r.Env != nil ||
 		r.Excl || r.RenameNoReplace || r.XattrName != "" || r.XattrFlags != 0 {
@@ -319,6 +319,9 @@ func normalizeAndValidateUserRecord(r *wal.Record, inBatch, allowEnvelope bool) 
 		if !r.ChtimesSetAtime && r.AtimeMs != 0 {
 			return invalidMutation("atime supplied without ChtimesSetAtime")
 		}
+		if r.ChtimesKeepMtime && !r.ChtimesSetAtime {
+			return invalidMutation("ChtimesKeepMtime requires an atime update")
+		}
 	case wal.OpChown:
 		allowed = fieldPath | fieldOwner | fieldIno | fieldEnvelope
 		if err := requirePath(r.Path, r.Ino); err != nil {
@@ -427,7 +430,7 @@ func validateAllowedFields(r wal.Record, allowed recordFields) error {
 	if allowed&fieldData == 0 && len(r.Data) != 0 {
 		return bad("Data")
 	}
-	if allowed&fieldTimes == 0 && (r.MtimeMs != 0 || r.AtimeMs != 0 || r.ChtimesSetAtime) {
+	if allowed&fieldTimes == 0 && (r.MtimeMs != 0 || r.AtimeMs != 0 || r.ChtimesSetAtime || r.ChtimesKeepMtime) {
 		return bad("time fields")
 	}
 	if allowed&fieldOwner == 0 && (r.UID != 0 || r.GID != 0 || r.ChownSetUID || r.ChownSetGID) {

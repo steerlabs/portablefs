@@ -224,7 +224,7 @@ func buildMutationRecord(req *Request) (wal.Record, int32) {
 		if req.SetMode {
 			groups++
 		}
-		if req.SetTime {
+		if req.SetTime || req.SetATime {
 			groups++
 		}
 		if req.SetUID || req.SetGID {
@@ -236,8 +236,12 @@ func buildMutationRecord(req *Request) (wal.Record, int32) {
 		switch {
 		case req.SetMode:
 			return wal.Record{Op: wal.OpChmod, Path: req.Path, Ino: req.HandleIno, Mode: modebits.CleanUnix(req.Mode)}, OK
-		case req.SetTime:
-			return wal.Record{Op: wal.OpChtimes, Path: req.Path, Ino: req.HandleIno, MtimeMs: req.MtimeMs}, OK
+		case req.SetTime || req.SetATime:
+			return wal.Record{
+				Op: wal.OpChtimes, Path: req.Path, Ino: req.HandleIno,
+				MtimeMs: req.MtimeMs, ChtimesKeepMtime: !req.SetTime,
+				AtimeMs: req.AtimeMs, ChtimesSetAtime: req.SetATime,
+			}, OK
 		default:
 			// Chown intent flags: only the flagged field changes; the other
 			// resolves at ordered apply (deterministic on replay). A
@@ -296,6 +300,13 @@ func canonicalRecordHash(r wal.Record) []byte {
 	if r.Op == wal.OpSetxattr || r.Op == wal.OpRemovexattr {
 		str(r.XattrName)
 		u64(uint64(r.XattrFlags))
+	}
+	// Preserve every pre-atime exact hash byte-for-byte across the rolling
+	// upgrade. Only the newly expressible atime-only semantic appends a
+	// domain-separated suffix; false is the entire legacy encoding.
+	if r.ChtimesKeepMtime {
+		str("pfr1:chtimes-keep-mtime")
+		u64(1)
 	}
 	var digest [sha256.Size]byte
 	return h.Sum(digest[:0])

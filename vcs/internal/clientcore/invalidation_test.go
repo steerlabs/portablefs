@@ -22,6 +22,7 @@ type fakeHandler struct {
 	invalids []coherence.Invalidation
 	orphans  []uint64
 	recalls  []string
+	related  []coherence.Invalidation
 }
 
 func (h *fakeHandler) FlushAll() {
@@ -46,6 +47,68 @@ func (h *fakeHandler) ReleaseSubtree(p string) {
 	h.mu.Lock()
 	h.recalls = append(h.recalls, p)
 	h.mu.Unlock()
+}
+
+func (h *fakeHandler) InvalidateRelatedInodes(
+	inos []uint64,
+	eventPath string,
+	gen, version uint64,
+	namespaceChange bool,
+) {
+	h.mu.Lock()
+	h.related = append(h.related, coherence.Invalidation{
+		Path: eventPath, Gen: gen, Version: version,
+		InPlace: !namespaceChange, RelatedInos: append([]uint64(nil), inos...),
+	})
+	h.mu.Unlock()
+}
+
+func TestPathlessInodeInvalidationReachesRelatedAliases(t *testing.T) {
+	attrs := NewAttrCache()
+	versions := NewVersionCache()
+	sub := &fakeSub{ch: make(chan coherence.Batch, 4)}
+	h := &fakeHandler{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchInvalidations(ctx, sub, versions, attrs, h, InvalidationOptions{})
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.mu.Lock()
+		started := h.flushes != 0
+		h.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("subscription did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	versions.RefreshAll(7)
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{
+		Gen: 7, Version: 11, InPlace: true, RelatedInos: []uint64{42},
+	}}}
+
+	deadline = time.Now().Add(time.Second)
+	for {
+		h.mu.Lock()
+		if len(h.related) != 0 {
+			got := h.related[0]
+			h.mu.Unlock()
+			if got.Path != "" || got.Gen != 7 || got.Version != 11 ||
+				!got.InPlace || len(got.RelatedInos) != 1 ||
+				got.RelatedInos[0] != 42 {
+				t.Fatalf("pathless related invalidation=%+v", got)
+			}
+			break
+		}
+		h.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("pathless inode event was dropped before related alias fan-out")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // TestNameChangeInvalidationBumpsParentVersion pins the P4 improvement: a name-change (not in-place)

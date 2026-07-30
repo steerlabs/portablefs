@@ -125,6 +125,7 @@ public actor VolumeCore {
     private var deletedItemsByObject: [ObjectIdentifier: DeletedItemState] = [:]
     private var currentGenerationByItemID: [UInt64: UInt64] = [:]
     private var openHandles: [ObjectIdentifier: OpenState] = [:]
+    private var lifecycleGates: [ObjectIdentifier: LifecycleGateState] = [:]
 
     private struct OpenState: Sendable {
         var identity: PfsItemIdentity
@@ -132,11 +133,32 @@ public actor VolumeCore {
         var mode: PfsOpenMode
         var isImplicit: Bool
         var attrSnapshot: PfsAttr?
+        // Handles superseded by a successful mode upgrade remain owned here
+        // until the daemon confirms each close. This prevents a failed close
+        // from turning a live daemon descriptor into unreachable state.
+        var pendingCloseHandles: [UInt64]
     }
 
     private struct DeletedItemState: Sendable {
         var identity: PfsItemIdentity
         var attrSnapshot: PfsAttr?
+    }
+
+    private enum LifecycleGateMode {
+        case shared
+        case exclusive
+    }
+
+    private struct LifecycleWaiter {
+        var id: UUID
+        var mode: LifecycleGateMode
+        var continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private struct LifecycleGateState {
+        var sharedOwners = 0
+        var exclusiveOwner = false
+        var waiters: [LifecycleWaiter] = []
     }
 
     public init(client: PfsLocalClient) {
@@ -219,25 +241,28 @@ public actor VolumeCore {
 
     public func getattr(item: PortableFSItem) async throws -> PfsAttr {
         let objectID = ObjectIdentifier(item)
+        return try await withDescriptorGate(for: objectID) {
+            try await getattrLocked(item: item, objectID: objectID)
+        }
+    }
+
+    private func getattrLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier
+    ) async throws -> PfsAttr {
         if let deleted = deletedItemsByObject[objectID] {
-            if openHandles[objectID] != nil {
-                if let snapshot = openHandles[objectID]?.attrSnapshot ?? deleted.attrSnapshot {
-                    return snapshot
-                }
-                do {
-                    var attr = try await fetchAttr(identity: deleted.identity)
-                    attr.nlink = 0
-                    rememberAttrSnapshot(attr, for: objectID)
-                    return attr
-                } catch let error as PfsLocalClientError where error.posixErrno == ENOENT || error.posixErrno == ESTALE {
-                    throw PfsLocalClientError.daemon(errno: ENOENT, message: "item was unlinked")
-                }
+            guard openHandles[objectID] != nil else {
+                throw PfsLocalClientError.daemon(errno: ENOENT, message: "item was unlinked")
             }
-            throw PfsLocalClientError.daemon(errno: ENOENT, message: "item was unlinked")
+            // A retained descriptor is the native FSKit object lifetime.
+            // Never answer fstat from the deletion snapshot: writes and
+            // metadata changes after unlink would make it stale.
+            _ = deleted
         }
 
         var request = PfsGetAttrRequest()
         request.item = try identity(for: item).proto
+        request.handle = openHandles[objectID]?.handle ?? 0
         let envelope: PfsEnvelope
         do {
             envelope = try await client.request(.getAttr(request))
@@ -259,8 +284,24 @@ public actor VolumeCore {
     }
 
     public func setattr(item: PortableFSItem, attributes: PfsSetAttributes) async throws -> PfsAttr {
+        let objectID = ObjectIdentifier(item)
+        return try await withDescriptorGate(for: objectID) {
+            try await setattrLocked(
+                item: item,
+                objectID: objectID,
+                attributes: attributes
+            )
+        }
+    }
+
+    private func setattrLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        attributes: PfsSetAttributes
+    ) async throws -> PfsAttr {
         var request = PfsSetAttrRequest()
         request.item = try identity(for: item).proto
+        request.handle = openHandles[objectID]?.handle ?? 0
         if let mode = attributes.mode { request.mode = mode }
         if let uid = attributes.uid { request.uid = uid }
         if let gid = attributes.gid { request.gid = gid }
@@ -273,12 +314,22 @@ public actor VolumeCore {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
         _ = self.item(for: reply.attr.item)
-        rememberAttrSnapshot(reply.attr, for: ObjectIdentifier(item))
+        rememberAttrSnapshot(reply.attr, for: objectID)
         return reply.attr
     }
 
     public func open(item: PortableFSItem, mode: PfsOpenMode) async throws {
         let objectID = ObjectIdentifier(item)
+        try await withLifecycleGate(for: objectID) {
+            try await openLocked(item: item, objectID: objectID, mode: mode)
+        }
+    }
+
+    private func openLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        mode: PfsOpenMode
+    ) async throws {
         if deletedItemsByObject[objectID] != nil && openHandles[objectID] == nil {
             throw PfsLocalClientError.daemon(errno: ENOENT, message: "item was unlinked")
         }
@@ -289,7 +340,7 @@ public actor VolumeCore {
         } else {
             attrSnapshot = try? await fetchAttr(identity: identity)
         }
-        try await reconcileOpenHandle(
+        try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
             requestedMode: mode,
@@ -300,6 +351,20 @@ public actor VolumeCore {
 
     public func close(item: PortableFSItem, retainingModes: PfsOpenMode? = nil) async throws {
         let objectID = ObjectIdentifier(item)
+        try await withLifecycleGate(for: objectID) {
+            try await closeLocked(
+                item: item,
+                objectID: objectID,
+                retainingModes: retainingModes
+            )
+        }
+    }
+
+    private func closeLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        retainingModes: PfsOpenMode?
+    ) async throws {
         let identity = try identity(for: item)
         guard let state = openHandles[objectID] else {
             return
@@ -307,48 +372,60 @@ public actor VolumeCore {
 
         let retainedMode = retainingModes ?? .unspecified
         if retainedMode == .unspecified {
-            openHandles.removeValue(forKey: objectID)
-            try await closeDaemonHandle(state.handle)
+            try await closeAllDaemonHandles(objectID: objectID)
             return
         }
 
-        if state.mode == retainedMode {
+        // FSKit reports the modes that remain live, not a request to replace
+        // the backing descriptor. A broader descriptor already covers that
+        // retained access and, critically, may be the only remaining
+        // capability for an unlinked or rename-replaced object.
+        if Self.mode(state.mode, covers: retainedMode) {
+            try await closePendingDaemonHandles(objectID: objectID)
             return
         }
 
         let newHandle = try await openDaemonHandle(identity: identity, mode: retainedMode)
-        openHandles[objectID] = OpenState(
+        var replacement = OpenState(
             identity: identity,
             handle: newHandle,
             mode: retainedMode,
             isImplicit: state.isImplicit,
-            attrSnapshot: state.attrSnapshot
+            attrSnapshot: state.attrSnapshot,
+            pendingCloseHandles: state.pendingCloseHandles
         )
-        try await closeDaemonHandle(state.handle)
+        replacement.pendingCloseHandles.append(state.handle)
+        openHandles[objectID] = replacement
+        try await closePendingDaemonHandles(objectID: objectID)
     }
 
     public func read(item: PortableFSItem, offset: UInt64, length: UInt32) async throws -> Data {
-        let handle = try await handle(for: item, mode: .read)
-        if length == 0 {
-            return try await readChunk(handle: handle, offset: offset, length: 0)
-        }
-
-        var output = Data()
-        output.reserveCapacity(Int(length))
-        var remaining = Int(length)
-        var currentOffset = offset
-        let chunkSize = ioChunkSize()
-        while remaining > 0 {
-            let chunkLength = min(remaining, chunkSize)
-            let data = try await readChunk(handle: handle, offset: currentOffset, length: UInt32(chunkLength))
-            output.append(data)
-            if data.count < chunkLength {
-                break
+        try await withDescriptorHandle(item: item, mode: .read) { handle in
+            if length == 0 {
+                return try await readChunk(handle: handle, offset: offset, length: 0)
             }
-            remaining -= chunkLength
-            currentOffset += UInt64(chunkLength)
+
+            var output = Data()
+            output.reserveCapacity(Int(length))
+            var remaining = Int(length)
+            var currentOffset = offset
+            let chunkSize = ioChunkSize()
+            while remaining > 0 {
+                let chunkLength = min(remaining, chunkSize)
+                let data = try await readChunk(
+                    handle: handle,
+                    offset: currentOffset,
+                    length: UInt32(chunkLength)
+                )
+                output.append(data)
+                if data.count < chunkLength {
+                    break
+                }
+                remaining -= chunkLength
+                currentOffset += UInt64(chunkLength)
+            }
+            return output
         }
-        return output
     }
 
     private func readChunk(handle: UInt64, offset: UInt64, length: UInt32) async throws -> Data {
@@ -366,34 +443,41 @@ public actor VolumeCore {
     @discardableResult
     public func write(item: PortableFSItem, offset: UInt64, data: Data) async throws -> (written: UInt32, attr: PfsAttr) {
         let objectID = ObjectIdentifier(item)
-        let handle = try await handle(for: item, mode: .readWrite)
-        if data.isEmpty {
-            let result = try await writeChunk(handle: handle, offset: offset, data: data)
-            rememberAttrSnapshot(result.attr, for: objectID)
-            return result
-        }
+        return try await withDescriptorHandle(item: item, mode: .readWrite) { handle in
+            if data.isEmpty {
+                let result = try await writeChunk(handle: handle, offset: offset, data: data)
+                rememberAttrSnapshot(result.attr, for: objectID)
+                return result
+            }
 
-        var totalWritten = 0
-        var currentOffset = offset
-        var latestAttr: PfsAttr?
-        let chunkSize = ioChunkSize()
-        while totalWritten < data.count {
-            let end = min(data.count, totalWritten + chunkSize)
-            let chunk = data.subdata(in: totalWritten..<end)
-            let result = try await writeChunk(handle: handle, offset: currentOffset, data: chunk)
-            latestAttr = result.attr
-            rememberAttrSnapshot(result.attr, for: objectID)
-            let written = Int(result.written)
-            if written <= 0 {
-                throw PfsLocalClientError.daemon(errno: EIO, message: "daemon write made no progress")
+            var totalWritten = 0
+            var currentOffset = offset
+            var latestAttr: PfsAttr?
+            let chunkSize = ioChunkSize()
+            while totalWritten < data.count {
+                let end = min(data.count, totalWritten + chunkSize)
+                let chunk = data.subdata(in: totalWritten..<end)
+                let result = try await writeChunk(handle: handle, offset: currentOffset, data: chunk)
+                latestAttr = result.attr
+                rememberAttrSnapshot(result.attr, for: objectID)
+                let written = Int(result.written)
+                if written <= 0 {
+                    throw PfsLocalClientError.daemon(
+                        errno: EIO,
+                        message: "daemon write made no progress"
+                    )
+                }
+                totalWritten += written
+                currentOffset += UInt64(written)
+                if written < chunk.count {
+                    break
+                }
             }
-            totalWritten += written
-            currentOffset += UInt64(written)
-            if written < chunk.count {
-                break
-            }
+            return (
+                UInt32(clamping: totalWritten),
+                latestAttr ?? openHandles[objectID]?.attrSnapshot ?? PfsAttr()
+            )
         }
-        return (UInt32(clamping: totalWritten), latestAttr ?? openHandles[objectID]?.attrSnapshot ?? PfsAttr())
     }
 
     private func writeChunk(handle: UInt64, offset: UInt64, data: Data) async throws -> (written: UInt32, attr: PfsAttr) {
@@ -425,7 +509,8 @@ public actor VolumeCore {
                 handle: reply.handle,
                 mode: .readWrite,
                 isImplicit: false,
-                attrSnapshot: reply.attr
+                attrSnapshot: reply.attr,
+                pendingCloseHandles: []
             )
         }
         return PfsCreateResult(item: newItem, attr: reply.attr, canonicalName: name)
@@ -519,9 +604,21 @@ public actor VolumeCore {
     }
 
     public func xattrGet(item: PortableFSItem, name: String) async throws -> Data {
+        let objectID = ObjectIdentifier(item)
+        return try await withDescriptorGate(for: objectID) {
+            try await xattrGetLocked(item: item, objectID: objectID, name: name)
+        }
+    }
+
+    private func xattrGetLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        name: String
+    ) async throws -> Data {
         var request = PfsXattrGetRequest()
         request.item = try identity(for: item).proto
         request.name = name
+        request.handle = openHandles[objectID]?.handle ?? 0
         let envelope = try await client.request(.xattrGet(request))
         guard case let .xattrGetReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -530,12 +627,34 @@ public actor VolumeCore {
     }
 
     public func xattrSet(item: PortableFSItem, name: String, value: Data, createOnly: Bool, replaceOnly: Bool) async throws {
+        let objectID = ObjectIdentifier(item)
+        try await withDescriptorGate(for: objectID) {
+            try await xattrSetLocked(
+                item: item,
+                objectID: objectID,
+                name: name,
+                value: value,
+                createOnly: createOnly,
+                replaceOnly: replaceOnly
+            )
+        }
+    }
+
+    private func xattrSetLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        name: String,
+        value: Data,
+        createOnly: Bool,
+        replaceOnly: Bool
+    ) async throws {
         var request = PfsXattrSetRequest()
         request.item = try identity(for: item).proto
         request.name = name
         request.value = value
         request.createOnly = createOnly
         request.replaceOnly = replaceOnly
+        request.handle = openHandles[objectID]?.handle ?? 0
         let envelope = try await client.request(.xattrSet(request))
         guard case .xattrSetReply? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -543,8 +662,19 @@ public actor VolumeCore {
     }
 
     public func xattrList(item: PortableFSItem) async throws -> [String] {
+        let objectID = ObjectIdentifier(item)
+        return try await withDescriptorGate(for: objectID) {
+            try await xattrListLocked(item: item, objectID: objectID)
+        }
+    }
+
+    private func xattrListLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier
+    ) async throws -> [String] {
         var request = PfsXattrListRequest()
         request.item = try identity(for: item).proto
+        request.handle = openHandles[objectID]?.handle ?? 0
         let envelope = try await client.request(.xattrList(request))
         guard case let .xattrListReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -553,9 +683,21 @@ public actor VolumeCore {
     }
 
     public func xattrRemove(item: PortableFSItem, name: String) async throws {
+        let objectID = ObjectIdentifier(item)
+        try await withDescriptorGate(for: objectID) {
+            try await xattrRemoveLocked(item: item, objectID: objectID, name: name)
+        }
+    }
+
+    private func xattrRemoveLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        name: String
+    ) async throws {
         var request = PfsXattrRemoveRequest()
         request.item = try identity(for: item).proto
         request.name = name
+        request.handle = openHandles[objectID]?.handle ?? 0
         let envelope = try await client.request(.xattrRemove(request))
         guard case .xattrRemoveReply? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -589,6 +731,15 @@ public actor VolumeCore {
 
     public func fsync(item: PortableFSItem) async throws {
         let objectID = ObjectIdentifier(item)
+        try await withDescriptorGate(for: objectID) {
+            try await fsyncLocked(item: item, objectID: objectID)
+        }
+    }
+
+    private func fsyncLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier
+    ) async throws {
         _ = try identity(for: item)
         guard let state = openHandles[objectID] else {
             return
@@ -603,25 +754,33 @@ public actor VolumeCore {
 
     public func reclaim(item: PortableFSItem) async throws {
         let objectID = ObjectIdentifier(item)
+        try await withLifecycleGate(for: objectID) {
+            try await reclaimLocked(item: item, objectID: objectID)
+        }
+    }
+
+    private func reclaimLocked(
+        item: PortableFSItem,
+        objectID: ObjectIdentifier
+    ) async throws {
         let identity = try identity(for: item)
 
-        identitiesByObject.removeValue(forKey: objectID)
-        itemsByObject.removeValue(forKey: objectID)
-        deletedItemsByObject.removeValue(forKey: objectID)
-        item.markReclaimed()
-
-        if let canonical = itemsByIdentity[identity], canonical === item {
-            itemsByIdentity.removeValue(forKey: identity)
-        }
-
-        if let state = openHandles.removeValue(forKey: objectID) {
-            try await closeDaemonHandle(state.handle)
+        if openHandles[objectID] != nil {
+            try await closeAllDaemonHandles(objectID: objectID)
         }
         var request = PfsReclaimRequest()
         request.item = identity.proto
         let envelope = try await client.request(.reclaim(request))
         guard case .reclaimReply? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+        }
+
+        identitiesByObject.removeValue(forKey: objectID)
+        itemsByObject.removeValue(forKey: objectID)
+        deletedItemsByObject.removeValue(forKey: objectID)
+        item.markReclaimed()
+        if let canonical = itemsByIdentity[identity], canonical === item {
+            itemsByIdentity.removeValue(forKey: identity)
         }
         pruneGenerationIfUnused(itemID: identity.itemID)
     }
@@ -645,7 +804,9 @@ public actor VolumeCore {
             itemCount: itemsByIdentity.count,
             objectIdentityCount: identitiesByObject.count + deletedItemsByObject.count,
             generationCount: currentGenerationByItemID.count,
-            openHandleCount: openHandles.count
+            openHandleCount: openHandles.values.reduce(into: 0) { count, state in
+                count += 1 + state.pendingCloseHandles.count
+            }
         )
     }
 
@@ -661,8 +822,45 @@ public actor VolumeCore {
         }
     }
 
-    private func handle(for item: PortableFSItem, mode: PfsOpenMode) async throws -> UInt64 {
+    /// Runs a complete descriptor operation under shared gate ownership. If
+    /// the operation first needs to open or upgrade a descriptor, it performs
+    /// that transition exclusively and atomically downgrades to shared
+    /// ownership before exposing the handle.
+    private func withDescriptorHandle<T>(
+        item: PortableFSItem,
+        mode: PfsOpenMode,
+        operation: (UInt64) async throws -> T
+    ) async throws -> T {
         let objectID = ObjectIdentifier(item)
+        try await acquireLifecycleGate(for: objectID, mode: .shared)
+        if let state = openHandles[objectID], Self.mode(state.mode, covers: mode) {
+            defer { releaseLifecycleGate(for: objectID, mode: .shared) }
+            return try await operation(state.handle)
+        }
+        releaseLifecycleGate(for: objectID, mode: .shared)
+
+        try await acquireLifecycleGate(for: objectID, mode: .exclusive)
+        let handle: UInt64
+        do {
+            handle = try await handleLocked(
+                for: item,
+                objectID: objectID,
+                mode: mode
+            )
+            downgradeLifecycleGateToShared(for: objectID)
+        } catch {
+            releaseLifecycleGate(for: objectID, mode: .exclusive)
+            throw error
+        }
+        defer { releaseLifecycleGate(for: objectID, mode: .shared) }
+        return try await operation(handle)
+    }
+
+    private func handleLocked(
+        for item: PortableFSItem,
+        objectID: ObjectIdentifier,
+        mode: PfsOpenMode
+    ) async throws -> UInt64 {
         if deletedItemsByObject[objectID] != nil && openHandles[objectID] == nil {
             throw PfsLocalClientError.daemon(errno: ENOENT, message: "item was unlinked")
         }
@@ -676,7 +874,7 @@ public actor VolumeCore {
         } else {
             attrSnapshot = try? await fetchAttr(identity: identity)
         }
-        try await reconcileOpenHandle(
+        try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
             requestedMode: mode,
@@ -689,7 +887,10 @@ public actor VolumeCore {
         return state.handle
     }
 
-    private func reconcileOpenHandle(
+    /// Reconciles one object's descriptor state while its lifecycle gate is
+    /// held. No open/close/reclaim transition for this object can interleave
+    /// across the daemon awaits below.
+    private func reconcileOpenHandleLocked(
         objectID: ObjectIdentifier,
         identity: PfsItemIdentity,
         requestedMode: PfsOpenMode,
@@ -714,14 +915,17 @@ public actor VolumeCore {
 
             let targetMode = Self.union(state.mode, requestedMode)
             let newHandle = try await openDaemonHandle(identity: identity, mode: targetMode)
-            openHandles[objectID] = OpenState(
+            var replacement = OpenState(
                 identity: identity,
                 handle: newHandle,
                 mode: targetMode,
                 isImplicit: implicit && state.isImplicit,
-                attrSnapshot: state.attrSnapshot ?? attrSnapshot
+                attrSnapshot: state.attrSnapshot ?? attrSnapshot,
+                pendingCloseHandles: state.pendingCloseHandles
             )
-            try await closeDaemonHandle(state.handle)
+            replacement.pendingCloseHandles.append(state.handle)
+            openHandles[objectID] = replacement
+            try await closePendingDaemonHandles(objectID: objectID)
             return
         }
 
@@ -731,7 +935,8 @@ public actor VolumeCore {
             handle: handle,
             mode: requestedMode,
             isImplicit: implicit,
-            attrSnapshot: attrSnapshot
+            attrSnapshot: attrSnapshot,
+            pendingCloseHandles: []
         )
     }
 
@@ -746,12 +951,240 @@ public actor VolumeCore {
         return reply.handle
     }
 
-    private func closeDaemonHandle(_ handle: UInt64) async throws {
+    private struct DaemonCloseConfirmation {
+        var terminalErrno: Int32?
+    }
+
+    /// A generic daemon error means the handle was not retired and must remain
+    /// tracked. A CloseReply is a distinct, explicit retirement confirmation;
+    /// its terminal errno is surfaced only after actor state forgets the now
+    /// unusable descriptor.
+    private func closeDaemonHandle(_ handle: UInt64) async throws -> DaemonCloseConfirmation {
         var request = PfsCloseRequest()
         request.handle = handle
         let envelope = try await client.request(.close(request))
-        guard case .closeReply? = envelope.body else {
+        guard case let .closeReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+        }
+        guard reply.retired else {
+            throw PfsLocalClientError.unexpectedReply(
+                "close reply did not confirm retirement for handle \(handle)"
+            )
+        }
+        return DaemonCloseConfirmation(
+            terminalErrno: reply.closeErrno == 0 ? nil : reply.closeErrno
+        )
+    }
+
+    /// Closes superseded descriptors in creation order. A handle leaves actor
+    /// state only after the daemon confirms that exact close.
+    private func closePendingDaemonHandles(objectID: ObjectIdentifier) async throws {
+        while let handle = openHandles[objectID]?.pendingCloseHandles.first {
+            let confirmation = try await closeDaemonHandle(handle)
+            if var current = openHandles[objectID],
+               let index = current.pendingCloseHandles.firstIndex(of: handle) {
+                current.pendingCloseHandles.remove(at: index)
+                openHandles[objectID] = current
+            }
+            if let errno = confirmation.terminalErrno {
+                throw PfsLocalClientError.daemon(
+                    errno: errno,
+                    message: "close retired handle \(handle) with a terminal error"
+                )
+            }
+        }
+    }
+
+    /// Drains superseded descriptors before the primary descriptor so a
+    /// failure always leaves every still-live handle represented in state.
+    private func closeAllDaemonHandles(objectID: ObjectIdentifier) async throws {
+        try await closePendingDaemonHandles(objectID: objectID)
+        guard let state = openHandles[objectID] else {
+            return
+        }
+        let confirmation = try await closeDaemonHandle(state.handle)
+        if let current = openHandles[objectID],
+           current.handle == state.handle,
+           current.pendingCloseHandles.isEmpty {
+            openHandles.removeValue(forKey: objectID)
+        }
+        if let errno = confirmation.terminalErrno {
+            throw PfsLocalClientError.daemon(
+                errno: errno,
+                message: "close retired handle \(state.handle) with a terminal error"
+            )
+        }
+    }
+
+    /// Takes the exclusive side of one object's lifecycle gate. Descriptor
+    /// operations take shared ownership, so they remain concurrent with each
+    /// other while open/close/reclaim transitions wait for every in-flight RPC.
+    private func withLifecycleGate<T>(
+        for objectID: ObjectIdentifier,
+        operation: () async throws -> T
+    ) async throws -> T {
+        try await acquireLifecycleGate(for: objectID, mode: .exclusive)
+        defer { releaseLifecycleGate(for: objectID, mode: .exclusive) }
+        return try await operation()
+    }
+
+    private func withDescriptorGate<T>(
+        for objectID: ObjectIdentifier,
+        operation: () async throws -> T
+    ) async throws -> T {
+        try await acquireLifecycleGate(for: objectID, mode: .shared)
+        defer { releaseLifecycleGate(for: objectID, mode: .shared) }
+        return try await operation()
+    }
+
+    private func acquireLifecycleGate(
+        for objectID: ObjectIdentifier,
+        mode: LifecycleGateMode
+    ) async throws {
+        try Task.checkCancellation()
+        var state = lifecycleGates[objectID] ?? LifecycleGateState()
+        let canAcquire: Bool
+        switch mode {
+        case .shared:
+            // Do not bypass an already queued lifecycle transition.
+            canAcquire = !state.exclusiveOwner && state.waiters.isEmpty
+        case .exclusive:
+            canAcquire = !state.exclusiveOwner
+                && state.sharedOwners == 0
+                && state.waiters.isEmpty
+        }
+        if canAcquire {
+            switch mode {
+            case .shared:
+                state.sharedOwners += 1
+            case .exclusive:
+                state.exclusiveOwner = true
+            }
+            lifecycleGates[objectID] = state
+            return
+        }
+
+        let waiterID = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                var current = lifecycleGates[objectID] ?? LifecycleGateState()
+                current.waiters.append(
+                    LifecycleWaiter(
+                        id: waiterID,
+                        mode: mode,
+                        continuation: continuation
+                    )
+                )
+                lifecycleGates[objectID] = current
+            }
+        } onCancel: {
+            Task {
+                await self.cancelLifecycleWaiter(
+                    objectID: objectID,
+                    waiterID: waiterID
+                )
+            }
+        }
+        guard acquired else {
+            throw CancellationError()
+        }
+        if Task.isCancelled {
+            // Ownership has already transferred from the prior operation.
+            // Pass it to the next waiter before honoring cancellation.
+            releaseLifecycleGate(for: objectID, mode: mode)
+            throw CancellationError()
+        }
+    }
+
+    private func cancelLifecycleWaiter(
+        objectID: ObjectIdentifier,
+        waiterID: UUID
+    ) {
+        guard var state = lifecycleGates[objectID],
+              let index = state.waiters.firstIndex(where: { $0.id == waiterID }) else {
+            return
+        }
+        let waiter = state.waiters.remove(at: index)
+        lifecycleGates[objectID] = state
+        wakeLifecycleWaiters(for: objectID)
+        waiter.continuation.resume(returning: false)
+    }
+
+    private func releaseLifecycleGate(
+        for objectID: ObjectIdentifier,
+        mode: LifecycleGateMode
+    ) {
+        guard var state = lifecycleGates[objectID] else {
+            return
+        }
+        switch mode {
+        case .shared:
+            precondition(state.sharedOwners > 0)
+            state.sharedOwners -= 1
+        case .exclusive:
+            precondition(state.exclusiveOwner)
+            state.exclusiveOwner = false
+        }
+        lifecycleGates[objectID] = state
+        wakeLifecycleWaiters(for: objectID)
+    }
+
+    private func downgradeLifecycleGateToShared(for objectID: ObjectIdentifier) {
+        guard var state = lifecycleGates[objectID] else {
+            preconditionFailure("missing lifecycle gate during downgrade")
+        }
+        precondition(state.exclusiveOwner)
+        precondition(state.sharedOwners == 0)
+        state.exclusiveOwner = false
+        state.sharedOwners = 1
+        var ready: [LifecycleWaiter] = []
+        while let next = state.waiters.first {
+            guard case .shared = next.mode else {
+                break
+            }
+            ready.append(state.waiters.removeFirst())
+        }
+        state.sharedOwners += ready.count
+        lifecycleGates[objectID] = state
+        for waiter in ready {
+            waiter.continuation.resume(returning: true)
+        }
+    }
+
+    private func wakeLifecycleWaiters(for objectID: ObjectIdentifier) {
+        guard var state = lifecycleGates[objectID],
+              !state.exclusiveOwner,
+              state.sharedOwners == 0 else {
+            return
+        }
+        guard let first = state.waiters.first else {
+            lifecycleGates.removeValue(forKey: objectID)
+            return
+        }
+
+        switch first.mode {
+        case .exclusive:
+            let waiter = state.waiters.removeFirst()
+            state.exclusiveOwner = true
+            lifecycleGates[objectID] = state
+            waiter.continuation.resume(returning: true)
+        case .shared:
+            var ready: [LifecycleWaiter] = []
+            while let next = state.waiters.first {
+                guard case .shared = next.mode else {
+                    break
+                }
+                ready.append(state.waiters.removeFirst())
+            }
+            state.sharedOwners += ready.count
+            lifecycleGates[objectID] = state
+            for waiter in ready {
+                waiter.continuation.resume(returning: true)
+            }
         }
     }
 

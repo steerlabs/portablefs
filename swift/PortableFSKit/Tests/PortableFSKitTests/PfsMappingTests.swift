@@ -30,6 +30,10 @@ import Testing
     #expect(attributes.fileID == .rootDirectory)
     #expect(attributes.type == .directory)
 
+    root.nlink = 0
+    let detachedAttributes = try PfsFSKitMapping.attributes(from: root)
+    #expect(detachedAttributes.linkCount == 0)
+
     do {
         _ = try PfsFSKitMapping.itemIdentifier(from: UInt64.max)
         Issue.record("expected an unrepresentable item identifier to fail")

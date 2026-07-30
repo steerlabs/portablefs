@@ -180,23 +180,24 @@ func (e *Envelope) Valid() bool { return e != nil && e.SessionID != "" }
 // Record is a single logged mutation. Seq is its log sequence number (LSN),
 // assigned by the primary on append and preserved across replication and replay.
 type Record struct {
-	Seq             uint64 // log sequence number (monotonic, assigned on append)
-	Op              Op
-	Path            string
-	NewPath         string   // OpRename target
-	Offset          int64    // OpWrite
-	Size            int64    // OpTruncate
-	Mode            uint32   // OpCreate, OpMkdir, OpChmod
-	Target          string   // OpSymlink
-	Data            []byte   // OpWrite payload; control payload for OpControl* records
-	MtimeMs         int64    // OpChtimes
-	AtimeMs         int64    // OpChtimes (exact atime; see ChtimesSetAtime)
-	ChtimesSetAtime bool     // distinguishes an intentional Unix-epoch atime from legacy omission
-	UID             uint32   // OpChown
-	GID             uint32   // OpChown
-	Ino             uint64   // OpReap and handle-addressed OpWrite/OpTruncate/OpChmod/OpChtimes/OpChown: target stable ino. Zero for path-addressed ops — gob omits it, so existing logs are byte-compatible.
-	Inos            []uint64 // OpMkdir: one reserved stable inode per normalized path component (legacy nil records allocate during replay)
-	OrphanTarget    bool     // compatibility-only: deterministic apply always parks a replaced NewPath; old true records replay identically
+	Seq              uint64 // log sequence number (monotonic, assigned on append)
+	Op               Op
+	Path             string
+	NewPath          string   // OpRename target
+	Offset           int64    // OpWrite
+	Size             int64    // OpTruncate
+	Mode             uint32   // OpCreate, OpMkdir, OpChmod
+	Target           string   // OpSymlink
+	Data             []byte   // OpWrite payload; control payload for OpControl* records
+	MtimeMs          int64    // OpChtimes
+	AtimeMs          int64    // OpChtimes (exact atime; see ChtimesSetAtime)
+	ChtimesSetAtime  bool     // distinguishes an intentional Unix-epoch atime from legacy omission
+	ChtimesKeepMtime bool     // atime-only update; false preserves legacy "always set mtime"
+	UID              uint32   // OpChown
+	GID              uint32   // OpChown
+	Ino              uint64   // OpReap and handle-addressed OpWrite/OpTruncate/OpChmod/OpChtimes/OpChown: target stable ino. Zero for path-addressed ops — gob omits it, so existing logs are byte-compatible.
+	Inos             []uint64 // OpMkdir: one reserved stable inode per normalized path component (legacy nil records allocate during replay)
+	OrphanTarget     bool     // compatibility-only: deterministic apply always parks a replaced NewPath; old true records replay identically
 
 	// TsMs is the server-selected mutation timestamp (ms), stamped at append so
 	// replay and the standby reproduce identical mtimes/ctimes instead of each
@@ -251,18 +252,18 @@ type Record struct {
 // a monotonic next-LSN so a checkpoint can compact away just the prefix it
 // committed, preserving writes that arrived during the checkpoint.
 type WAL struct {
-	mu           sync.Mutex
-	f            *os.File
-	path         string
-	enc          *secure.AtRest // nil = plaintext (records framed verbatim)
-	nextSeq      uint64        // LSN to assign to the next appended record
-	offset       int64         // current size of the log file (append position)
-	count        int           // live record count (for observability/tests)
-	poisoned     bool          // set when a durability invariant can no longer be upheld
-	poisonOnce   sync.Once     // closes poisonedCh exactly once
-	poisonedCh   chan struct{} // closed on poison, so the node can fence the data plane
-	unflushed    []Record      // records written to the fd but not yet fsync'd+replicated
-	initErr      error         // deferred disk validation error surfaced by Replay/mutations
+	mu         sync.Mutex
+	f          *os.File
+	path       string
+	enc        *secure.AtRest // nil = plaintext (records framed verbatim)
+	nextSeq    uint64         // LSN to assign to the next appended record
+	offset     int64          // current size of the log file (append position)
+	count      int            // live record count (for observability/tests)
+	poisoned   bool           // set when a durability invariant can no longer be upheld
+	poisonOnce sync.Once      // closes poisonedCh exactly once
+	poisonedCh chan struct{}  // closed on poison, so the node can fence the data plane
+	unflushed  []Record       // records written to the fd but not yet fsync'd+replicated
+	initErr    error          // deferred disk validation error surfaced by Replay/mutations
 
 	// Group commit: a write becomes durable (fsync'd + replicated) via CommitThrough.
 	// commitMu serializes flushes so only one fsync+replication runs at a time and the
@@ -618,7 +619,6 @@ func (w *WAL) flushLocked() error {
 	}
 	return nil
 }
-
 
 // rollbackToLocked truncates the log back to off, undoing a partially/locally
 // written record after a write/sync/replicate failure (caller holds w.mu), and
@@ -978,7 +978,7 @@ func (w *WAL) compactLocalLocked(effective uint64, boundaryDigest [32]byte) erro
 	}
 	target := metadata{
 		Version: metadataVersion, Epoch: w.epoch, BaseSeq: effective, BaseDigest: boundaryDigest,
-		BaseCommitID: w.baseCommitID,
+		BaseCommitID:  w.baseCommitID,
 		HasCheckpoint: w.hasCheckpoint, Checkpoint: w.checkpoint,
 	}
 	if err := w.beginTransitionLocked(target, w.nextSeq, w.tipDigest); err != nil {

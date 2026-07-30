@@ -29,6 +29,10 @@ const (
 )
 
 func fsAttrToLocal(a fsproto.Attr, item pfslocal.Item) pfslocal.Attr {
+	return fsAttrToLocalNlink(a, item, false)
+}
+
+func fsAttrToLocalNlink(a fsproto.Attr, item pfslocal.Item, preserveZero bool) pfslocal.Attr {
 	kind := pfslocal.ItemKindFile
 	switch a.Kind {
 	case "directory":
@@ -37,7 +41,7 @@ func fsAttrToLocal(a fsproto.Attr, item pfslocal.Item) pfslocal.Attr {
 		kind = pfslocal.ItemKindSymlink
 	}
 	nlink := a.Nlink
-	if nlink == 0 {
+	if nlink == 0 && !preserveZero {
 		nlink = 1
 	}
 	return pfslocal.Attr{
@@ -420,31 +424,62 @@ func (a *attach) dropEnumerationLocked(id uint64) {
 func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pfslocal.GetAttrReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	rec, eno := a.item(req.Item)
+	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
-	if graft := a.localDirFor(rec.path); graft != "" {
-		attr, eno := a.statLocal(rec.path)
-		if eno != 0 {
-			return nil, eno
+	rec := target.rec
+	if rec.graft {
+		var attr fsproto.Attr
+		if target.handle != nil {
+			if target.handle.file == nil {
+				return nil, darwinEIO
+			}
+			fi, err := target.handle.file.Stat()
+			if err != nil {
+				return nil, localErrno(err)
+			}
+			attr = localAttr(fi)
+			a.mu.Lock()
+			rec = a.registerHandleAttrLocked(target.handle, attr)
+			a.mu.Unlock()
+		} else {
+			attr, eno = a.statLocal(rec.path)
+			if eno != 0 {
+				return nil, eno
+			}
+			rec = a.registerLocal(rec.path, attr)
 		}
-		rec = a.registerLocal(rec.path, attr)
+		if rec == nil {
+			return nil, darwinEIO
+		}
 		if eno := a.flushBindingDelta(); eno != 0 {
 			return nil, eno
 		}
-		return &pfslocal.GetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+		return &pfslocal.GetAttrReply{
+			Attr: fsAttrToLocalNlink(attr, rec.item, target.detached),
+		}, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
 	}
-	attr, st := vol.Getattr(ctx, rec.path, rec.state)
+	var attr fsproto.Attr
+	var st clientcore.Status
+	if target.handle != nil {
+		attr, st = vol.GetattrOpenHandle(ctx, target.scope, rec.state)
+	} else {
+		attr, st = vol.Getattr(ctx, rec.path, rec.state)
+	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	rec = a.registerLocked(rec.path, attr)
+	if target.handle != nil {
+		rec = a.registerHandleAttrLocked(target.handle, attr)
+	} else {
+		rec = a.registerLocked(rec.path, attr)
+	}
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
@@ -452,18 +487,32 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.GetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+	return &pfslocal.GetAttrReply{
+		Attr: fsAttrToLocalNlink(attr, rec.item, target.detached),
+	}, 0
 }
 
 func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pfslocal.SetAttrReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	rec, eno := a.item(req.Item)
+	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
-	if graft := a.localDirFor(rec.path); graft != "" {
-		return a.setattrLocal(rec, req)
+	rec := target.rec
+	if req.Size != nil && target.detached && target.handle != nil && !target.handle.write {
+		return nil, darwinEBADF
+	}
+	if rec.graft {
+		exactHandle := target.handle
+		if !target.detached && req.Size != nil &&
+			exactHandle != nil && !exactHandle.write {
+			// A linked item setattr is pathname-authorized by FSKit. A
+			// coincidental read descriptor must not turn truncate into EBADF;
+			// open a purpose-scoped writable local file for this bound name.
+			exactHandle = nil
+		}
+		return a.setattrLocal(rec, exactHandle, target.detached, req)
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -500,18 +549,35 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	if req.MtimeMs != nil {
 		cr.MtimeMs, cr.SetMTime = *req.MtimeMs, true
 	}
-	attr, st := vol.Setattr(ctx, rec.path, rec.state, cr)
+	if req.AtimeMs != nil {
+		cr.AtimeMs, cr.SetATime = *req.AtimeMs, true
+	}
+	var attr fsproto.Attr
+	var st clientcore.Status
+	if target.handle != nil {
+		attr, st = vol.SetattrOpenHandle(ctx, target.scope, rec.state, cr)
+	} else {
+		attr, st = vol.Setattr(ctx, rec.path, rec.state, cr)
+	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
 	if attr.Kind == "" {
-		attr, st = vol.Getattr(ctx, rec.path, rec.state)
+		if target.handle != nil {
+			attr, st = vol.GetattrOpenHandle(ctx, target.scope, rec.state)
+		} else {
+			attr, st = vol.Getattr(ctx, rec.path, rec.state)
+		}
 		if st != fsproto.OK {
 			return nil, toDarwinErr(st)
 		}
 	}
 	a.mu.Lock()
-	rec = a.registerLocked(rec.path, attr)
+	if target.handle != nil {
+		rec = a.registerHandleAttrLocked(target.handle, attr)
+	} else {
+		rec = a.registerLocked(rec.path, attr)
+	}
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
@@ -519,7 +585,9 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+	return &pfslocal.SetAttrReply{
+		Attr: fsAttrToLocalNlink(attr, rec.item, target.detached),
+	}, 0
 }
 
 func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal.OpenReply, int32) {
@@ -529,7 +597,7 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 	if eno != 0 {
 		return nil, eno
 	}
-	if a.localDirFor(rec.path) != "" {
+	if rec.graft {
 		write := req.Mode == pfslocal.OpenModeWrite || req.Mode == pfslocal.OpenModeReadWrite
 		flags := localOpenFlags(req.Mode)
 		file, err := a.localFS.OpenFile(rec.path, flags, 0)
@@ -562,40 +630,56 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 	return &pfslocal.OpenReply{Handle: h}, 0
 }
 
-func (a *attach) close(req *pfslocal.CloseRequest) (int32, error) {
-	a.nsMu.RLock()
-	defer a.nsMu.RUnlock()
+func (a *attach) close(req *pfslocal.CloseRequest) (*pfslocal.CloseReply, int32) {
+	// Close owns the namespace lifecycle lock exclusively so a read/write or
+	// reclaim cannot race between descriptor validation and confirmed close.
+	a.nsMu.Lock()
+	defer a.nsMu.Unlock()
 	if err := a.controlAdmissionError(); err != nil {
-		return darwinENXIO, nil
+		return nil, darwinENXIO
 	}
-	h := a.closeHandle(req.Handle)
-	if h == nil {
-		return darwinEINVAL, nil
+	h, eno := a.handle(req.Handle)
+	if eno != 0 {
+		if eno == darwinEINVAL {
+			if reply, retired := a.replayRetiredClose(req.Handle); retired {
+				return reply, 0
+			}
+		}
+		return nil, eno
 	}
 	if h.file != nil {
-		if err := h.file.Close(); err != nil {
-			return localErrno(err), nil
+		err := h.file.Close()
+		a.closeHandle(req.Handle)
+		reply := &pfslocal.CloseReply{Retired: true}
+		if err != nil {
+			reply.CloseErrno = localErrno(err)
+			a.recordRetiredCloseError(req.Handle, reply.CloseErrno)
 		}
-		return 0, nil
+		return reply, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
-		return eno, nil
+		return nil, eno
 	}
 	closePath := h.openPath
 	if closePath == "" {
 		closePath = h.path
 	}
-	return toDarwinErr(vol.CloseHandle(closePath, h.state)), nil
+	if st := vol.CloseHandle(closePath, h.state); st != fsproto.OK {
+		return nil, toDarwinErr(st)
+	}
+	a.closeHandle(req.Handle)
+	return &pfslocal.CloseReply{Retired: true}, 0
 }
 
 func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal.ReadReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	h, eno := a.handle(req.Handle)
+	h, scope, eno := a.handleTarget(req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
+	detached := scope == ""
 	if req.Length > 8<<20 {
 		return nil, darwinEINVAL
 	}
@@ -611,7 +695,13 @@ func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal
 	if eno != 0 {
 		return nil, eno
 	}
-	data, st := vol.Read(ctx, h.path, h.state, int64(req.Offset), int(req.Length))
+	var data []byte
+	var st clientcore.Status
+	if detached {
+		data, st = vol.ReadExactHandle(ctx, h.state, int64(req.Offset), int(req.Length))
+	} else {
+		data, st = vol.ReadOpenHandle(ctx, scope, h.state, int64(req.Offset), int(req.Length))
+	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
@@ -621,9 +711,13 @@ func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal
 func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfslocal.WriteReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	h, eno := a.handle(req.Handle)
+	h, scope, eno := a.handleTarget(req.Handle)
 	if eno != 0 {
 		return nil, eno
+	}
+	detached := scope == ""
+	if !h.write {
+		return nil, darwinEBADF
 	}
 	if h.file != nil {
 		if _, err := h.file.WriteAt(req.Data, int64(req.Offset)); err != nil {
@@ -634,21 +728,36 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 			return nil, localErrno(err)
 		}
 		attr := localAttr(fi)
-		rec := a.registerLocal(h.path, attr)
+		a.mu.Lock()
+		rec := a.registerHandleAttrLocked(h, attr)
+		a.mu.Unlock()
+		if rec == nil {
+			return nil, darwinEIO
+		}
 		if eno := a.flushBindingDelta(); eno != 0 {
 			return nil, eno
 		}
-		return &pfslocal.WriteReply{Written: uint32(len(req.Data)), Attr: fsAttrToLocal(attr, rec.item)}, 0
+		return &pfslocal.WriteReply{
+			Written: uint32(len(req.Data)),
+			Attr:    fsAttrToLocalNlink(attr, rec.item, detached),
+		}, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
 	}
-	n, st := vol.Write(ctx, h.path, h.state, int64(req.Offset), req.Data)
+	var n int
+	var st clientcore.Status
+	if detached {
+		n, st = vol.WriteExactHandle(ctx, h.state, int64(req.Offset), req.Data)
+	} else {
+		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), req.Data)
+	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
-	attr, st := vol.Getattr(ctx, h.path, h.state)
+	var attr fsproto.Attr
+	attr, st = vol.GetattrOpenHandle(ctx, scope, h.state)
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
@@ -661,13 +770,16 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.WriteReply{Written: uint32(n), Attr: fsAttrToLocal(attr, rec.item)}, 0
+	return &pfslocal.WriteReply{
+		Written: uint32(n),
+		Attr:    fsAttrToLocalNlink(attr, rec.item, detached),
+	}, 0
 }
 
 func (a *attach) fsync(_ context.Context, req *pfslocal.FsyncRequest) int32 {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	h, eno := a.handle(req.Handle)
+	h, scope, eno := a.handleTarget(req.Handle)
 	if eno != 0 {
 		return eno
 	}
@@ -681,7 +793,7 @@ func (a *attach) fsync(_ context.Context, req *pfslocal.FsyncRequest) int32 {
 	if eno != 0 {
 		return eno
 	}
-	return toDarwinErr(vol.FsyncHandle(h.path, h.state))
+	return toDarwinErr(vol.FsyncHandle(scope, h.state))
 }
 
 func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfslocal.CreateReply, int32) {
@@ -1111,7 +1223,7 @@ func (a *attach) readlink(ctx context.Context, req *pfslocal.ReadlinkRequest) (*
 	if eno != 0 {
 		return nil, eno
 	}
-	if a.localDirFor(rec.path) != "" {
+	if rec.graft {
 		target, err := a.localFS.Readlink(rec.path)
 		if err != nil {
 			return nil, localErrno(err)
@@ -1165,12 +1277,25 @@ func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32
 }
 
 func (a *attach) reclaim(req *pfslocal.ReclaimRequest) int32 {
-	a.nsMu.RLock()
-	defer a.nsMu.RUnlock()
+	a.nsMu.Lock()
+	defer a.nsMu.Unlock()
 	if err := a.controlAdmissionError(); err != nil {
 		return darwinENXIO
 	}
 	a.mu.Lock()
+	rec := a.items[req.Item.ItemID]
+	if rec == nil || rec.item.ItemGeneration != req.Item.ItemGeneration {
+		// Reclaim is idempotent for an already-retired generation. A reused
+		// ItemID's newer generation and its handles are unrelated.
+		a.mu.Unlock()
+		return 0
+	}
+	for _, h := range a.handles {
+		if h != nil && h.itemID == req.Item.ItemID {
+			a.mu.Unlock()
+			return darwinEBUSY
+		}
+	}
 	if a.reclaimItemLocked(req.Item) {
 		// Reclaim is the durable Item lifetime tombstone. Without it, a
 		// daemon crash after removing the in-memory detached identity but
@@ -1222,20 +1347,16 @@ func (a *attach) synthesizeFrontendMutation(body any, origin uint64) {
 		}
 	case *pfslocal.WriteRequest:
 		if h := a.handles[req.Handle]; h != nil {
-			a.publishContentInvalidationLocked(h.path, 0, origin)
+			if rec := a.items[h.itemID]; rec != nil {
+				a.publishItemContentInvalidationLocked(rec.item, origin)
+			}
 		}
 	case *pfslocal.SetAttrRequest:
-		if rec := a.items[req.Item.ItemID]; rec != nil && rec.item.ItemGeneration == req.Item.ItemGeneration {
-			a.publishContentInvalidationLocked(rec.path, 0, origin)
-		}
+		a.publishItemContentInvalidationLocked(req.Item, origin)
 	case *pfslocal.XattrSetRequest:
-		if rec := a.items[req.Item.ItemID]; rec != nil && rec.item.ItemGeneration == req.Item.ItemGeneration {
-			a.publishContentInvalidationLocked(rec.path, 0, origin)
-		}
+		a.publishItemContentInvalidationLocked(req.Item, origin)
 	case *pfslocal.XattrRemoveRequest:
-		if rec := a.items[req.Item.ItemID]; rec != nil && rec.item.ItemGeneration == req.Item.ItemGeneration {
-			a.publishContentInvalidationLocked(rec.path, 0, origin)
-		}
+		a.publishItemContentInvalidationLocked(req.Item, origin)
 	}
 }
 
@@ -1266,18 +1387,25 @@ func max64(a, b int64) int64 {
 func (a *attach) xattrGet(ctx context.Context, req *pfslocal.XattrGetRequest) (*pfslocal.XattrGetReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	rec, eno := a.item(req.Item)
+	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
-	if a.localDirFor(rec.path) != "" {
+	rec := target.rec
+	if rec.graft {
 		return nil, darwinENOTSUP
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
 	}
-	value, st := vol.Getxattr(ctx, rec.path, rec.state, req.Name)
+	var value []byte
+	var st clientcore.Status
+	if target.handle != nil {
+		value, st = vol.GetxattrOpenHandle(ctx, target.scope, rec.state, req.Name)
+	} else {
+		value, st = vol.Getxattr(ctx, rec.path, rec.state, req.Name)
+	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
@@ -1287,18 +1415,25 @@ func (a *attach) xattrGet(ctx context.Context, req *pfslocal.XattrGetRequest) (*
 func (a *attach) xattrList(ctx context.Context, req *pfslocal.XattrListRequest) (*pfslocal.XattrListReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	rec, eno := a.item(req.Item)
+	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
-	if a.localDirFor(rec.path) != "" {
+	rec := target.rec
+	if rec.graft {
 		return nil, darwinENOTSUP
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
 	}
-	names, st := vol.Listxattr(ctx, rec.path, rec.state)
+	var names []string
+	var st clientcore.Status
+	if target.handle != nil {
+		names, st = vol.ListxattrOpenHandle(ctx, target.scope, rec.state)
+	} else {
+		names, st = vol.Listxattr(ctx, rec.path, rec.state)
+	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
@@ -1308,11 +1443,12 @@ func (a *attach) xattrList(ctx context.Context, req *pfslocal.XattrListRequest) 
 func (a *attach) xattrSet(ctx context.Context, req *pfslocal.XattrSetRequest) (*pfslocal.XattrSetReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	rec, eno := a.item(req.Item)
+	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
-	if a.localDirFor(rec.path) != "" {
+	rec := target.rec
+	if rec.graft {
 		return nil, darwinENOTSUP
 	}
 	vol, eno := a.volOrErr()
@@ -1327,7 +1463,13 @@ func (a *attach) xattrSet(ctx context.Context, req *pfslocal.XattrSetRequest) (*
 	if req.ReplaceOnly {
 		flags |= wal.XattrReplace
 	}
-	if st := vol.SetxattrFlags(ctx, rec.path, rec.state, req.Name, req.Value, flags); st != fsproto.OK {
+	var st clientcore.Status
+	if target.handle != nil {
+		st = vol.SetxattrOpenHandle(ctx, target.scope, rec.state, req.Name, req.Value, flags)
+	} else {
+		st = vol.SetxattrFlags(ctx, rec.path, rec.state, req.Name, req.Value, flags)
+	}
+	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
 	return &pfslocal.XattrSetReply{}, 0
@@ -1336,11 +1478,12 @@ func (a *attach) xattrSet(ctx context.Context, req *pfslocal.XattrSetRequest) (*
 func (a *attach) xattrRemove(ctx context.Context, req *pfslocal.XattrRemoveRequest) (*pfslocal.XattrRemoveReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
-	rec, eno := a.item(req.Item)
+	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
 	}
-	if a.localDirFor(rec.path) != "" {
+	rec := target.rec
+	if rec.graft {
 		return nil, darwinENOTSUP
 	}
 	vol, eno := a.volOrErr()
@@ -1348,7 +1491,13 @@ func (a *attach) xattrRemove(ctx context.Context, req *pfslocal.XattrRemoveReque
 		return nil, eno
 	}
 	defer a.lockNames(entryKey(rec.path))()
-	if st := vol.Removexattr(ctx, rec.path, rec.state, req.Name); st != fsproto.OK {
+	var st clientcore.Status
+	if target.handle != nil {
+		st = vol.RemovexattrOpenHandle(ctx, target.scope, rec.state, req.Name)
+	} else {
+		st = vol.Removexattr(ctx, rec.path, rec.state, req.Name)
+	}
+	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
 	return &pfslocal.XattrRemoveReply{}, 0

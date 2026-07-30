@@ -8,6 +8,7 @@ const (
 	darwinEIO          int32 = 5
 	darwinENXIO        int32 = 6
 	darwinE2BIG        int32 = 7
+	darwinEBADF        int32 = 9
 	darwinEACCES       int32 = 13
 	darwinEAGAIN       int32 = 35
 	darwinEBUSY        int32 = 16

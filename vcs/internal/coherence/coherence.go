@@ -11,6 +11,10 @@ package coherence
 //     A client applies it (evicting its cached copy of Path) iff Version is newer than
 //     the version it has cached for Path; it recognises its own write-back writes by
 //     Owner and does not evict them.
+//   - An inode-scoped invalidation (FlushAll=false, empty Path, non-empty RelatedInos)
+//     says an exact live inode changed while the mutating client had no trustworthy
+//     pathname. Clients fan it out to every locally known alias; it is not a
+//     mount-wide flush.
 //   - A FlushAll invalidation (empty Path) tells the client to drop ALL cached versions
 //     and re-read on demand — sent when a subscriber's buffer overflows.
 //   - A Recall event (Recall=true, Path = the contended subtree) asks whichever client
@@ -33,7 +37,9 @@ type Invalidation struct {
 	// RelatedInos names every existing inode whose aliases may have changed
 	// attributes or content as part of this mutation. Hard-link-aware clients
 	// use it to fan one path event out to any other aliases they have cached.
-	// It is additive on the gob wire; older clients safely ignore it.
+	// With an empty Path and FlushAll=false it is the complete target of an
+	// inode-scoped event. It is additive on the gob wire; older clients safely
+	// ignore it.
 	RelatedInos []uint64
 
 	// An orphan invalidation is a normal path invalidation PLUS Orphaned=true and OrphanIno: the

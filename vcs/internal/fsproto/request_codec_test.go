@@ -43,8 +43,10 @@ func TestRequestCodecRoundTripAllFields(t *testing.T) {
 		Data:         []byte("payload"),
 		Append:       true,
 		MtimeMs:      -29,
+		AtimeMs:      -30,
 		SetMode:      true,
 		SetTime:      true,
+		SetATime:     true,
 		UID:          31,
 		GID:          37,
 		SetUID:       true,
@@ -98,6 +100,65 @@ func TestRequestCodecRoundTripAllFields(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("request round trip mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func requestV3ToLegacyV2(t *testing.T, wire []byte) []byte {
+	t.Helper()
+	const (
+		versionOffset = 4 + 4
+		atimeOffset   = 4 + 4 + 1 + 1 + 4 + 8 + 8 + 4 + 8
+	)
+	if len(wire) < atimeOffset+8 {
+		t.Fatalf("short v3 request: %d bytes", len(wire))
+	}
+	bodyBytes := binary.BigEndian.Uint32(wire[:4])
+	if bodyBytes < 8 {
+		t.Fatalf("invalid v3 body size: %d", bodyBytes)
+	}
+	legacy := make([]byte, 0, len(wire)-8)
+	legacy = append(legacy, wire[:atimeOffset]...)
+	legacy = append(legacy, wire[atimeOffset+8:]...)
+	legacy[versionOffset] = requestWireLegacyVersion
+	binary.BigEndian.PutUint32(legacy[:4], bodyBytes-8)
+	return legacy
+}
+
+func TestRequestDecoderAcceptsLegacyV2(t *testing.T) {
+	want := Request{
+		Op:           OpSetattr,
+		Path:         "scope/file",
+		Size:         41,
+		Mode:         0o640,
+		MtimeMs:      1700000000123,
+		SetMode:      true,
+		SetTime:      true,
+		UID:          43,
+		GID:          47,
+		SetUID:       true,
+		SetGID:       true,
+		HandleIno:    53,
+		SessionID:    "session",
+		SessionToken: "token",
+	}
+	wire := requestV3ToLegacyV2(t, encodeRequestForTest(t, &want))
+	got, err := decodeRequestForTest(wire)
+	if err != nil {
+		t.Fatalf("decode legacy v2 request: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy request mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestRequestDecoderRejectsV3AtimeFlagOnLegacyV2(t *testing.T) {
+	req := Request{
+		Op: OpSetattr, Path: "scope/file",
+		AtimeMs: 1700000000123, SetATime: true,
+	}
+	wire := requestV3ToLegacyV2(t, encodeRequestForTest(t, &req))
+	if _, err := decodeRequestForTest(wire); !errors.Is(err, errMalformedRequest) {
+		t.Fatalf("legacy v2 atime flag error=%v want errMalformedRequest", err)
 	}
 }
 
@@ -164,7 +225,7 @@ func requestDynamicOffset(t *testing.T, wire []byte) int {
 	// Skip the outer frame header and every fixed-width body field through
 	// AckPos. This mirrors the PFRQ2 field order.
 	const fixedBodyBytes = 4 + 1 + 1 + 4 +
-		8 + 8 + 4 + 8 + 4 + 4 + 8 +
+		8 + 8 + 4 + 8 + 8 + 4 + 4 + 8 +
 		8 + 8 + 8 + 1 +
 		8 + 8 + 8 +
 		8 + 4 + 1 + 8 + 8

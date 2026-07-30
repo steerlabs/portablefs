@@ -711,7 +711,7 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     let v1 = adapterBytes("v1")
     let v2 = adapterBytes("v2")
     let target = try await createAdapterFile(volume: harness.volume, in: harness.root, name: "config", contents: v1)
-    try await harness.volume.openItem(target, modes: [.read])
+    try await harness.volume.openItem(target, modes: [.read, .write])
     let lock = try await createAdapterFile(volume: harness.volume, in: harness.root, name: "config.lock", contents: v2)
 
     _ = try await harness.volume.renameItem(
@@ -723,15 +723,49 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
         overItem: target
     )
 
-    #expect(try await readViaCore(harness.core, item: target, length: v1.count) == v1)
+    let portableTarget = try #require(target as? PortableFSItem)
+    let exactAttr = try await harness.core.setattr(
+        item: portableTarget,
+        attributes: PfsSetAttributes(
+            mode: 0o600,
+            size: 1,
+            mtimeMilliseconds: 123_456,
+            atimeMilliseconds: 234_567
+        )
+    )
+    #expect(exactAttr.mode == 0o600)
+    #expect(exactAttr.size == 1)
+    #expect(exactAttr.mtimeMs == 123_456)
+    #expect(exactAttr.atimeMs == 234_567)
+    try await harness.core.xattrSet(
+        item: portableTarget,
+        name: "user.detached",
+        value: adapterBytes("old"),
+        createOnly: false,
+        replaceOnly: false
+    )
+    #expect(
+        try await harness.core.xattrGet(item: portableTarget, name: "user.detached")
+            == adapterBytes("old")
+    )
+    #expect(try await harness.core.xattrList(item: portableTarget) == ["user.detached"])
+    #expect(try await readViaCore(harness.core, item: target, length: v1.count) == adapterBytes("v"))
     let oldAttr = try await harness.volume.attributes(FSItem.GetAttributesRequest(), of: target)
-    #expect(oldAttr.size == UInt64(v1.count))
+    #expect(oldAttr.size == 1)
 
     let (newTarget, _) = try await harness.volume.lookupItem(named: FSFileName(string: "config"), inDirectory: harness.root)
     try await harness.volume.openItem(newTarget, modes: [.read])
     #expect(try await readViaCore(harness.core, item: newTarget, length: v2.count) == v2)
+    let portableNewTarget = try #require(newTarget as? PortableFSItem)
+    do {
+        _ = try await harness.core.xattrGet(item: portableNewTarget, name: "user.detached")
+        Issue.record("replacement unexpectedly inherited detached xattr")
+    } catch {
+        #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOATTR))
+    }
     try await harness.volume.closeItem(newTarget, modes: [])
 
+    try await harness.core.xattrRemove(item: portableTarget, name: "user.detached")
     try await harness.volume.closeItem(target, modes: [])
     do {
         _ = try await harness.volume.attributes(FSItem.GetAttributesRequest(), of: target)

@@ -115,6 +115,14 @@ var pfr1Goldens = []struct {
 		rec:  Record{Seq: 21, Op: OpRemovexattr, Path: "f", XattrName: "user.test"},
 		hex:  "50465231081510111a0166da0109757365722e74657374",
 	},
+	{
+		name: "chtimes-atime-only",
+		rec: Record{
+			Seq: 24, Op: OpChtimes, Path: "f", AtimeMs: -2,
+			ChtimesSetAtime: true, ChtimesKeepMtime: true,
+		},
+		hex: "50465231081810091a016658036001e80101",
+	},
 }
 
 func TestPFR1Goldens(t *testing.T) {
@@ -184,6 +192,7 @@ func randomPFR1Record(rng *rand.Rand, allowBatch bool) Record {
 		r.AtimeMs = rng.Int63() - rng.Int63()
 		r.TsMs = rng.Int63()
 		r.ChtimesSetAtime = rng.Intn(2) == 0
+		r.ChtimesKeepMtime = rng.Intn(2) == 0
 		r.UID = rng.Uint32()
 		r.GID = rng.Uint32()
 		r.ChownSetUID = rng.Intn(2) == 0
@@ -471,6 +480,35 @@ func TestPFR1ZigzagExtremes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(dec, rec) {
 		t.Fatalf("extremes mismatch: %+v vs %+v", dec, rec)
+	}
+}
+
+func TestPFR1SizeEstimateBoundsEveryRecordField(t *testing.T) {
+	rec := Record{
+		Seq: math.MaxUint64, Op: OpSetxattr,
+		Path: "path", NewPath: "new-path",
+		Offset: math.MinInt64, Size: math.MaxInt64, Mode: math.MaxUint32,
+		Target: "target", Data: []byte("value"),
+		MtimeMs: math.MinInt64, AtimeMs: math.MaxInt64,
+		ChtimesSetAtime: true, ChtimesKeepMtime: true,
+		UID: math.MaxUint32, GID: math.MaxUint32, Ino: math.MaxUint64,
+		Inos:         []uint64{math.MaxUint64, math.MaxUint64},
+		OrphanTarget: true, TsMs: math.MinInt64,
+		ChownSetUID: true, ChownSetGID: true, Append: true,
+		ReapIfLeaseExpiresByMs: math.MaxInt64,
+		Env: &Envelope{
+			SessionID: "estimate", Generation: math.MaxUint64,
+			Slot: math.MaxUint32, SlotSeq: math.MaxUint64,
+			ReqHash: bytes.Repeat([]byte{0xff}, PFR1ReqHashBytes),
+		},
+		XattrName: "user.estimate", XattrFlags: XattrCreate,
+	}
+	encoded, err := EncodePFR1(&rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate := PFR1SizeEstimate(rec); estimate < len(encoded) {
+		t.Fatalf("PFR1SizeEstimate=%d, encoded=%d", estimate, len(encoded))
 	}
 }
 

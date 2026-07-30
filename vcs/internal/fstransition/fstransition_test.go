@@ -308,6 +308,10 @@ func TestEngineAppendResolvesEOFAndChownIntent(t *testing.T) {
 		wal.Record{Op: wal.OpChmod, Path: "log", Mode: 0o600},
 		wal.Record{Op: wal.OpChtimes, Path: "log", MtimeMs: 1234, AtimeMs: 77, ChtimesSetAtime: true},
 		wal.Record{Op: wal.OpTruncate, Path: "log", Size: 6, TsMs: 4321},
+		wal.Record{
+			Op: wal.OpChtimes, Path: "log", AtimeMs: 99,
+			ChtimesSetAtime: true, ChtimesKeepMtime: true,
+		},
 	)
 	_, reader := h.commit()
 	got, ok := h.lookup(reader, "log")
@@ -323,7 +327,7 @@ func TestEngineAppendResolvesEOFAndChownIntent(t *testing.T) {
 	if got.Size != 6 {
 		t.Fatalf("size = %d", got.Size)
 	}
-	if got.MtimeMs != 4321 || got.AtimeMs != 77 {
+	if got.MtimeMs != 4321 || got.AtimeMs != 99 {
 		t.Fatalf("times = mtime %d atime %d", got.MtimeMs, got.AtimeMs)
 	}
 	if got.Nlink != 1 {
