@@ -40,7 +40,7 @@ func newLatencyProxy(t *testing.T, backend string, delay time.Duration) *latency
 				continue
 			}
 			go func() { _, _ = io.Copy(server, client); _ = server.Close() }() // client→server: direct
-			go func() { // server→client: delayed
+			go func() {                                                        // server→client: delayed
 				defer client.Close()
 				buf := make([]byte, 32<<10)
 				for {

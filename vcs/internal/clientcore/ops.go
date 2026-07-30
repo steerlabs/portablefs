@@ -37,10 +37,10 @@ func (v *Volume) debug(format string, a ...any) {
 	}
 }
 
-func (v *Volume) CachedGetattr(path string) (fsproto.Attr, Status) {
-	if gen, curVer := v.VersionCache.GenAndVersion(path); gen != 0 {
+func (v *Volume) cachedGetattr(view *readView, path string) (fsproto.Attr, Status) {
+	if gen, curVer, pathValid := v.VersionCache.CacheState(path); gen != 0 && pathValid {
 		dir, _ := splitPath(path)
-		_, parentCurVer := v.VersionCache.GenAndVersion(dir)
+		_, parentCurVer, parentValid := v.VersionCache.CacheState(dir)
 		// Positive entries are served only when their path version is at least
 		// the current version. Negative entries are served only when their
 		// parent-directory version is at least the current parent version. The
@@ -52,34 +52,41 @@ func (v *Volume) CachedGetattr(path string) (fsproto.Attr, Status) {
 		// the miss is concurrent with the create and returning ENOENT is a valid
 		// ordering for that syscall; once the bumped version is observed the
 		// negative can never shadow the created name.
-		if e, ok := v.AttrCache.GetLookup(gen, curVer, parentCurVer, path); ok {
-			if !e.Exists {
-				return fsproto.Attr{}, fsproto.ENOENT
+		if parentValid {
+			if e, ok := v.AttrCache.GetLookup(gen, curVer, parentCurVer, path); ok {
+				if !e.Exists {
+					return fsproto.Attr{}, fsproto.ENOENT
+				}
+				v.observeHardlink(path, e.Attr)
+				return e.Attr, fsproto.OK
 			}
-			v.observeHardlink(path, e.Attr)
-			return e.Attr, fsproto.OK
 		}
 	}
+	observation := v.hardlinks.beginObservation()
+	defer observation.Close()
 	a, rver, rgen, parentVersion, st, err := v.client.GetattrV(path)
 	if err != nil {
 		v.debug("CachedGetattr GetattrV %q: %v", path, err)
 		return fsproto.Attr{}, fsproto.EIO
 	}
-	if rgen != 0 && !v.VersionCache.SeenGen(rgen) {
-		v.VersionCache.RefreshAll(rgen)
+	token, cacheOK := v.VersionCache.AcceptGeneration(view.cacheToken, rgen)
+	if cacheOK {
+		view.cacheToken = token
 	}
-	if rgen != 0 && st == fsproto.OK && v.VersionCache.FillOK(rgen, path, rver) {
-		v.AttrCache.PutAttr(rgen, rver, path, a)
+	if cacheOK && st == fsproto.OK {
+		v.VersionCache.PublishOKToken(token, rgen, path, rver, func() {
+			v.AttrCache.PutAttr(rgen, rver, path, a)
+		})
 	}
-	if v.negativeCache && rgen != 0 && st == fsproto.ENOENT && parentVersion != 0 {
+	if v.negativeCache && cacheOK && st == fsproto.ENOENT && parentVersion != 0 {
 		dir, _ := splitPath(path)
 		pver := parentVersion - 1
-		if v.VersionCache.FillOK(rgen, dir, pver) {
+		v.VersionCache.PublishOKToken(token, rgen, dir, pver, func() {
 			v.AttrCache.PutNegative(rgen, pver, path)
-		}
+		})
 	}
 	if st == fsproto.OK {
-		v.observeHardlink(path, a)
+		observation.Observe(path, a)
 	}
 	return a, st
 }
@@ -92,12 +99,15 @@ func (v *Volume) observeHardlink(path string, a fsproto.Attr) {
 // proves path does not exist — the same ordering proof CachedGetattr serves
 // ENOENT from. The create path uses it to skip the adopt-or-create probe.
 func (v *Volume) provenAbsent(path string) bool {
-	gen, curVer := v.VersionCache.GenAndVersion(path)
-	if gen == 0 {
+	gen, curVer, pathValid := v.VersionCache.CacheState(path)
+	if gen == 0 || !pathValid {
 		return false
 	}
 	dir, _ := splitPath(path)
-	_, parentCurVer := v.VersionCache.GenAndVersion(dir)
+	_, parentCurVer, parentValid := v.VersionCache.CacheState(dir)
+	if !parentValid {
+		return false
+	}
 	e, ok := v.AttrCache.GetLookup(gen, curVer, parentCurVer, path)
 	return ok && !e.Exists
 }
@@ -124,35 +134,53 @@ func engineAttr(path string, e writeback.Entry) fsproto.Attr {
 }
 
 func (v *Volume) Lookup(ctx context.Context, path string) (fsproto.Attr, Status) {
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	defer permit.Close()
+	return v.lookup(ctx, &permit, path)
+}
+
+func (v *Volume) lookup(ctx context.Context, permit *readView, path string) (fsproto.Attr, Status) {
 	if v.wb != nil {
-		if ent, res := v.wb.Lookup(path); res == writeback.LookupHit {
+		if ent, res := permit.Lookup(path); res == writeback.LookupHit {
 			a := engineAttr(path, ent)
-			if a.Nlink > 1 {
-				v.observeHardlink(path, a)
-			}
+			v.observeHardlink(path, a)
 			return a, fsproto.OK
 		} else if res == writeback.LookupNegative {
 			return fsproto.Attr{}, fsproto.ENOENT
 		}
-		if dir, _ := splitPath(path); v.wb.Covers(dir) {
+		if dir, _ := splitPath(path); permit.Covers(dir) {
 			// The engine covers the parent but cannot decide the name yet.
 			// Seed the complete listing (ONE readdir instead of one getattr
 			// per name) so this and every later lookup under the directory —
 			// including proven ENOENT for names about to be created — is
 			// answered locally for the life of the delegation.
-			if _, st := v.Readdir(ctx, dir); st == fsproto.OK {
-				if ent, res := v.wb.Lookup(path); res == writeback.LookupHit {
-					return engineAttr(path, ent), fsproto.OK
+			if _, st := v.readdir(ctx, permit, dir); st == fsproto.OK {
+				if ent, res := permit.Lookup(path); res == writeback.LookupHit {
+					a := engineAttr(path, ent)
+					v.observeHardlink(path, a)
+					return a, fsproto.OK
 				} else if res == writeback.LookupNegative {
 					return fsproto.Attr{}, fsproto.ENOENT
 				}
 			}
 		}
 	}
-	return v.CachedGetattr(path)
+	return v.cachedGetattr(permit, path)
 }
 
 func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsproto.Attr, Status) {
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	defer permit.Close()
+	return v.getattr(ctx, &permit, path, n)
+}
+
+func (v *Volume) getattr(ctx context.Context, permit *readView, path string, n *NodeState) (fsproto.Attr, Status) {
 	if oi := n.Orphan(); oi != 0 {
 		a, st, err := v.client.GetattrOrphan(oi)
 		if err != nil {
@@ -164,13 +192,15 @@ func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsprot
 		return *a, fsproto.OK
 	}
 	if v.wb != nil {
-		if ent, res := v.wb.Lookup(path); res == writeback.LookupHit {
-			return engineAttr(path, ent), fsproto.OK
+		if ent, res := permit.Lookup(path); res == writeback.LookupHit {
+			a := engineAttr(path, ent)
+			v.observeHardlink(path, a)
+			return a, fsproto.OK
 		} else if res == writeback.LookupNegative {
 			return fsproto.Attr{}, fsproto.ENOENT
 		}
 	}
-	a, st := v.CachedGetattr(path)
+	a, st := v.cachedGetattr(permit, path)
 	if st == fsproto.ENOENT {
 		if oi := v.RedirectToOrphan(n); oi != 0 {
 			if oa, ost, oerr := v.client.GetattrOrphan(oi); oerr == nil && ost == fsproto.OK {
@@ -182,29 +212,46 @@ func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsprot
 }
 
 func (v *Volume) Readdir(ctx context.Context, dir string) ([]DirEntry, Status) {
-	covered := v.wb != nil && v.wb.Covers(dir)
+	permit, err := v.beginRead(ctx, dir)
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	defer permit.Close()
+	return v.readdir(ctx, &permit, dir)
+}
+
+func (v *Volume) readdir(ctx context.Context, permit *readView, dir string) ([]DirEntry, Status) {
+	covered := v.wb != nil && permit.Covers(dir)
 	if covered {
 		// A held dir with a complete children set serves locally: the
 		// delegation excludes peer mutations, and the engine's own
 		// mutations are folded into the set. Zero RPCs.
-		if ents, ok := v.wb.Readdir(dir); ok {
-			return engineEntriesToDir(dir, ents), fsproto.OK
+		if ents, ok := permit.Readdir(dir); ok {
+			out := engineEntriesToDir(dir, ents)
+			v.observeDirectoryHardlinks(dir, out)
+			return out, fsproto.OK
 		}
-		if ent, res := v.wb.Lookup(dir); res == writeback.LookupHit && ent.Kind != "directory" {
+		if ent, res := permit.Lookup(dir); res == writeback.LookupHit && ent.Kind != "directory" {
 			return nil, fsproto.ENOTDIR
 		} else if res == writeback.LookupNegative {
 			return nil, fsproto.ENOENT
 		}
 	}
-	if gen, curVer := v.VersionCache.GenAndVersion(dir); gen != 0 && !covered {
+	if gen, curVer, valid := v.VersionCache.CacheState(dir); gen != 0 && valid && !covered {
+		fenceSeq := v.VersionCache.FenceClock()
 		v.dirMu.Lock()
-		if e, ok := v.dirCache[dir]; ok && e.gen == gen && e.version >= curVer {
+		if e, ok := v.dirCache[dir]; ok &&
+			e.gen == gen &&
+			e.version >= curVer &&
+			e.fenceSeq == fenceSeq {
 			out := append([]DirEntry(nil), e.entries...)
 			v.dirMu.Unlock()
 			return out, fsproto.OK
 		}
 		v.dirMu.Unlock()
 	}
+	observation := v.hardlinks.beginObservation()
+	defer observation.Close()
 	ents, gen, dirVersion, st, err := v.client.ReaddirV(dir)
 	if err != nil {
 		return nil, fsproto.EIO
@@ -212,10 +259,11 @@ func (v *Volume) Readdir(ctx context.Context, dir string) ([]DirEntry, Status) {
 	if st != fsproto.OK {
 		return nil, st
 	}
-	if gen != 0 && !v.VersionCache.SeenGen(gen) {
-		v.VersionCache.RefreshAll(gen)
+	token, cacheOK := v.VersionCache.AcceptGeneration(permit.cacheToken, gen)
+	if cacheOK {
+		permit.cacheToken = token
 	}
-	fillCache := !v.noReaddirPlus && gen != 0 && !covered
+	fillCache := !v.noReaddirPlus && cacheOK && !covered
 	out := make([]DirEntry, 0, len(ents))
 	for _, e := range ents {
 		cp := e.Name
@@ -227,20 +275,22 @@ func (v *Volume) Readdir(ctx context.Context, dir string) ([]DirEntry, Status) {
 			ino = InoOf(cp)
 		}
 		out = append(out, DirEntry{Name: e.Name, Attr: e.Attr, Ino: ino})
-		v.observeHardlink(cp, e.Attr)
+		observation.Observe(cp, e.Attr)
 		if fillCache && e.Version != 0 {
 			ver := e.Version - 1
-			if v.VersionCache.FillOK(gen, cp, ver) {
+			v.VersionCache.PublishOKToken(token, gen, cp, ver, func() {
 				v.AttrCache.PutAttr(gen, ver, cp, e.Attr)
-			}
+			})
 		}
 	}
 	if covered {
 		// Seed the engine's complete children set from this authority
 		// readdir and answer from the merged (overlay-over-base) view; later
 		// lookups and listings under dir are then local.
-		merged := v.wb.MergeReaddir(dir, dirEntriesToEngine(out))
-		return engineEntriesToDir(dir, merged), fsproto.OK
+		merged := permit.MergeReaddir(dir, dirEntriesToEngine(out))
+		out = engineEntriesToDir(dir, merged)
+		v.observeDirectoryHardlinks(dir, out)
+		return out, fsproto.OK
 	}
 	// A non-delegated directory has no unflushed local children (every
 	// create directly under it was write-through), so the authority listing
@@ -248,10 +298,24 @@ func (v *Volume) Readdir(ctx context.Context, dir string) ([]DirEntry, Status) {
 	// that fill the attr cache. Store it only when not delegated: a held
 	// dir's version never advances for our own writes, so a cache entry
 	// would go stale invisibly.
-	if gen != 0 && v.VersionCache.FillOK(gen, dir, dirVersion) {
-		v.dirMu.Lock()
-		v.dirCache[dir] = dirCacheEntry{gen: gen, version: dirVersion, entries: append([]DirEntry(nil), out...)}
-		v.dirMu.Unlock()
+	if cacheOK {
+		cached := append([]DirEntry(nil), out...)
+		v.VersionCache.PublishDirectoryOKToken(token, gen, dirVersion, dir, func() {
+			v.dirMu.Lock()
+			v.dirCache[dir] = dirCacheEntry{
+				gen: gen, version: dirVersion, fenceSeq: token.fenceSeq, entries: cached,
+			}
+			if len(v.dirCache) > maxDirCacheEntries {
+				for cachedDir := range v.dirCache {
+					if cachedDir == dir {
+						continue
+					}
+					delete(v.dirCache, cachedDir)
+					break
+				}
+			}
+			v.dirMu.Unlock()
+		})
 	}
 	return out, fsproto.OK
 }
@@ -284,6 +348,16 @@ func engineEntriesToDir(dir string, ents []writeback.Entry) []DirEntry {
 	return out
 }
 
+func (v *Volume) observeDirectoryHardlinks(dir string, entries []DirEntry) {
+	for _, entry := range entries {
+		path := entry.Name
+		if dir != "" {
+			path = dir + "/" + entry.Name
+		}
+		v.observeHardlink(path, entry.Attr)
+	}
+}
+
 func (v *Volume) clearDirCache() {
 	v.dirMu.Lock()
 	v.dirCache = map[string]dirCacheEntry{}
@@ -306,6 +380,8 @@ func (v *Volume) evictDirCachePrefix(rp string) {
 		v.dirCache = map[string]dirCacheEntry{}
 		return
 	}
+	parent, _ := splitPath(rp)
+	delete(v.dirCache, parent)
 	pfx := rp + "/"
 	for k := range v.dirCache {
 		if k == rp || len(k) > len(pfx) && k[:len(pfx)] == pfx {
@@ -528,6 +604,15 @@ func (v *Volume) RedirectToOrphan(n *NodeState) uint64 {
 }
 
 func (v *Volume) Read(ctx context.Context, path string, n *NodeState, off int64, length int) ([]byte, Status) {
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	defer permit.Close()
+	return v.read(&permit, path, n, off, length)
+}
+
+func (v *Volume) read(permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
 	if oi := n.Orphan(); oi != 0 {
 		data, st, err := v.client.ReadOrphan(oi, off, int64(length))
 		if err != nil {
@@ -537,12 +622,12 @@ func (v *Volume) Read(ctx context.Context, path string, n *NodeState, off int64,
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		dst := make([]byte, length)
-		nRead, handled, err := v.wb.ReadAt(path, dst, off, func(basePath string, boff int64, bdst []byte) (int, error) {
+		nRead, handled, err := permit.ReadAt(path, dst, off, func(basePath string, boff int64, bdst []byte) (int, error) {
 			// basePath is where the authority CURRENTLY serves this view's
 			// clean ranges (it trails a local rename until the rename
 			// applies — reading the new name early would serve the previous
 			// file's bytes).
-			data, st := v.readBase(basePath, n, boff, len(bdst))
+			data, st := v.readBase(permit, basePath, n, boff, len(bdst))
 			if st != fsproto.OK {
 				// A base miss composes as zeros; the dirty extents and the
 				// engine-tracked size still bound the result.
@@ -558,7 +643,7 @@ func (v *Volume) Read(ctx context.Context, path string, n *NodeState, off int64,
 			return dst[:nRead], fsproto.OK
 		}
 	}
-	return v.readBase(path, n, off, length)
+	return v.readBase(permit, path, n, off, length)
 }
 
 // readBase is the shared/clean read path: version-gated disk cache first,
@@ -568,9 +653,9 @@ func (v *Volume) Read(ctx context.Context, path string, n *NodeState, off int64,
 // serve the PREVIOUS flushed content after the overlay folds. Covered reads
 // go to the authority (whose applied state is exactly what we acknowledged);
 // the cache resumes when the delegation releases and versions flow again.
-func (v *Volume) readBase(path string, n *NodeState, off int64, length int) ([]byte, Status) {
+func (v *Volume) readBase(permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
 	handleIno := authHandleIno(n)
-	covered := v.wb != nil && v.wb.Covers(path)
+	covered := v.wb != nil && permit.Covers(path)
 	if v.DiskCache != nil && handleIno != 0 && !covered {
 		if gen, knownVersion := v.VersionCache.GenAndVersion(path); gen != 0 && knownVersion != 0 {
 			if data, ok := v.DiskCache.GetRange(v.volumeID, gen, handleIno, off, length, knownVersion); ok {
@@ -598,8 +683,9 @@ func (v *Volume) readBase(path string, n *NodeState, off int64, length int) ([]b
 			return d, fsproto.OK
 		}
 	}
-	if gen != 0 && !v.VersionCache.SeenGen(gen) {
-		v.VersionCache.RefreshAll(gen)
+	token, cacheOK := v.VersionCache.AcceptGeneration(permit.cacheToken, gen)
+	if cacheOK {
+		permit.cacheToken = token
 	}
 	// P1: fire the kernel FOPEN_KEEP_CACHE flush backup exactly once per new generation, tracked
 	// SEPARATELY from the version-cache re-anchor above. A getattr/readdir may have re-anchored the
@@ -608,16 +694,18 @@ func (v *Volume) readBase(path string, n *NodeState, off int64, length int) ([]b
 	if v.onFlushAll != nil && v.markKernelFlushed(gen) {
 		go v.onFlushAll("")
 	}
-	if !v.VersionCache.FillOK(gen, path, version) && v.onInvalidate != nil {
+	fillOK := cacheOK && v.VersionCache.FillOKToken(token, gen, path, version)
+	if !fillOK && v.onInvalidate != nil {
 		go v.onInvalidate(path, true)
 	}
-	if v.DiskCache != nil && handleIno != 0 && !covered {
+	if fillOK && v.DiskCache != nil && handleIno != 0 && !covered {
 		v.DiskCache.PutRange(v.volumeID, gen, handleIno, off, version, data, length)
 	}
 	return data, fsproto.OK
 }
 
 func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64, data []byte) (int, Status) {
+	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(); err != nil {
 		return 0, fsproto.EIO
 	}
@@ -629,6 +717,11 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			return 0, fsproto.EIO
 		}
 		return cnt, st
+	}
+	if v.wb != nil && v.isHardlink(n) {
+		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
+			return 0, statusErr(err)
+		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
@@ -691,7 +784,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	v.VersionCache.FillOK(gen, path, version)
 	v.AttrCache.Evict(path)
 	if v.isHardlink(n) {
-		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path)
+		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, gen, version, false)
 	}
 	return cnt, fsproto.OK
 }
@@ -701,6 +794,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 // locally at the exact EOF; otherwise the authority resolves EOF in
 // sequencer order.
 func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, legacyOff int64, data []byte) (int, Status) {
+	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(); err != nil {
 		return 0, fsproto.EIO
 	}
@@ -712,6 +806,11 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			return 0, fsproto.EIO
 		}
 		return cnt, st
+	}
+	if v.wb != nil && v.isHardlink(n) {
+		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
+			return 0, statusErr(err)
+		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
@@ -771,7 +870,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	v.VersionCache.FillOK(gen, path, version)
 	v.AttrCache.Evict(path)
 	if v.isHardlink(n) {
-		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path)
+		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, gen, version, false)
 	}
 	return cnt, fsproto.OK
 }
@@ -889,6 +988,7 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 }
 
 func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Status {
+	ctx = withHardlinkAdmissionIdentities(ctx, child)
 	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
@@ -901,6 +1001,11 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 	// park the inode until lease GC. Live handles are untouched; the open
 	// paths below own those.
 	v.openReg.ReleaseNameChange(path, authHandleIno(child))
+	if v.wb != nil && v.isHardlink(child) {
+		if err := v.releaseHardlinkScopes(ctx, []*NodeState{child}, path); err != nil {
+			return statusErr(err)
+		}
+	}
 	if v.wb != nil && !v.isHardlink(child) {
 		// Unlink-while-open needs the write-through orphan protocol, which
 		// never runs INSIDE a held delegation: the covering scope drains and
@@ -949,7 +1054,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 				dir, _ := splitPath(path)
 				v.AttrCache.Evict(dir)
 				v.evictDirCache(dir)
-				v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path)
+				v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path, 0, 0, false)
 				v.hardlinks.removePath(path)
 			}
 			return st
@@ -973,7 +1078,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 				dir, _ := splitPath(path)
 				v.AttrCache.Evict(dir)
 				v.evictDirCache(dir)
-				v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path)
+				v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path, 0, 0, false)
 				v.hardlinks.removePath(path)
 			}
 			return st
@@ -990,7 +1095,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 		v.AttrCache.Evict(dir)
 		v.evictDirCache(dir)
 		if child != nil {
-			v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path)
+			v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path, 0, 0, false)
 		}
 		v.hardlinks.removePath(path)
 	}
@@ -1024,18 +1129,29 @@ func unlockTwo(a, b *NodeState) {
 }
 
 func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeState) Status {
+	ctx = withHardlinkAdmissionIdentities(ctx, src, dst)
 	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
 
+	sameAuthorityInode := sameAuthorityIdentity(src, dst)
 	// Rename-over reads OUR open holds on the replaced destination the same
 	// way remove does: release any zero-ref retained registration on newp
 	// first, so replacing a recently-closed file destroys it (as it always
 	// did) instead of spuriously parking it against our stale hold. An OPEN
-	// destination takes the explicit orphan-target arm below, untouched.
-	v.openReg.ReleaseNameChange(newp, authHandleIno(dst))
-	if v.wb != nil && !v.isHardlink(src) && !v.isHardlink(dst) {
+	// destination takes the explicit orphan-target arm below, untouched. Two
+	// names already bound to the same authority inode are a POSIX no-op: do
+	// not retire either name's registration.
+	if !sameAuthorityInode {
+		v.openReg.ReleaseNameChange(newp, authHandleIno(dst))
+	}
+	if v.wb != nil && (sameAuthorityInode || v.isHardlink(src) || v.isHardlink(dst)) {
+		if err := v.releaseHardlinkScopes(ctx, []*NodeState{src, dst}, oldp, newp); err != nil {
+			return statusErr(err)
+		}
+	}
+	if v.wb != nil && !sameAuthorityInode && !v.isHardlink(src) && !v.isHardlink(dst) {
 		// Rename-over an open destination needs the orphan protocol, which
 		// runs write-through — never inside a held delegation. Release the
 		// covering scopes first, then take the shared lane below.
@@ -1067,12 +1183,27 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 			}
 		}
 	}
-	return v.renameWriteThrough(oldp, newp, src, dst)
+	return v.renameWriteThrough(oldp, newp, src, dst, sameAuthorityInode)
 }
 
 // renameWriteThrough performs the authority-side rename with the
 // open-destination orphan protocol and full cache/registry bookkeeping.
-func (v *Volume) renameWriteThrough(oldp, newp string, src, dst *NodeState) Status {
+func (v *Volume) renameWriteThrough(
+	oldp, newp string,
+	src, dst *NodeState,
+	sameAuthorityInode bool,
+) Status {
+	if sameAuthorityInode {
+		// POSIX rename(old,new) is a semantic no-op when both names already
+		// identify the same inode. Still ask the authority to validate the
+		// current namespace, but never detach/rekey either frontend name,
+		// open owner, retained registration, or alias observation.
+		st, _, err := v.client.RenameWithOrphanTarget(oldp, newp, false)
+		if err != nil {
+			return fsproto.EIO
+		}
+		return st
+	}
 	if dst != nil {
 		lockTwo(src, dst)
 		if dst.nopen > 0 && dst.orphanIno == 0 {
@@ -1137,7 +1268,7 @@ func (v *Volume) noteOpenRename(oldPath, newPath string, src, dst *NodeState) {
 }
 
 func (v *Volume) evictRename(oldp, newp string) {
-	v.invalidateRelatedInodes(v.hardlinks.inosForPaths(oldp, newp), "")
+	v.invalidateRelatedInodes(v.hardlinks.inosForPaths(oldp, newp), "", 0, 0, false)
 	v.hardlinks.rekey(oldp, newp)
 	v.evictNamespacePaths(oldp, newp)
 }
@@ -1199,7 +1330,7 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 	defer v.endMutation()
 
 	if v.wb != nil {
-		if err := v.wb.ReleaseFor(ctx, oldp, newp); err != nil {
+		if err := v.releaseHardlinkScopes(ctx, []*NodeState{src}, oldp, newp); err != nil {
 			return fsproto.Attr{}, statusErr(err)
 		}
 	}
@@ -1228,11 +1359,20 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 }
 
 func (v *Volume) Readlink(ctx context.Context, path string) (string, Status) {
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return "", fsproto.EIO
+	}
+	defer permit.Close()
+	return v.readlink(&permit, path)
+}
+
+func (v *Volume) readlink(permit *readView, path string) (string, Status) {
 	// An engine-covered path answers from the overlay: a just-created symlink
 	// may not have flushed to the authority yet, so resolving there would
 	// race the flusher.
 	if v.wb != nil {
-		if target, kind, ok := v.wb.Readlink(path); ok {
+		if target, kind, ok := permit.Readlink(path); ok {
 			switch kind {
 			case "symlink":
 				return target, fsproto.OK
@@ -1251,6 +1391,7 @@ func (v *Volume) Readlink(ctx context.Context, path string) (string, Status) {
 }
 
 func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
+	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1265,6 +1406,11 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			}
 		}
 		return fsproto.Attr{}, fsproto.OK
+	}
+	if v.wb != nil && v.isHardlink(n) {
+		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
+			return fsproto.Attr{}, statusErr(err)
+		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
@@ -1315,9 +1461,18 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			return engineAttr(path, last.Entry), fsproto.OK
 		}
 		if handledAll && !mutated {
-			// Nothing requested: report the current view.
-			if ent, res := v.wb.Lookup(path); res == writeback.LookupHit {
-				return engineAttr(path, ent), fsproto.OK
+			// Nothing requested: report the current view, but still join the
+			// read handoff barrier. This path is reachable from a size-refresh
+			// setattr whose fields were consumed by the daemon.
+			permit, err := v.beginRead(ctx, path)
+			if err != nil {
+				return fsproto.Attr{}, fsproto.EIO
+			}
+			defer permit.Close()
+			if ent, res := permit.Lookup(path); res == writeback.LookupHit {
+				a := engineAttr(path, ent)
+				v.observeHardlink(path, a)
+				return a, fsproto.OK
 			}
 		}
 	}
@@ -1368,7 +1523,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	}
 	v.observeHardlink(path, *a)
 	if v.isHardlink(n) {
-		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path)
+		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, 0, 0, false)
 	}
 	return *a, fsproto.OK
 }
@@ -1378,6 +1533,14 @@ func authHandleIno(n *NodeState) uint64 {
 		return 0
 	}
 	return n.AuthorityIno()
+}
+
+func sameAuthorityIdentity(a, b *NodeState) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	aIno := a.AuthorityIno()
+	return aIno != 0 && aIno == b.AuthorityIno()
 }
 
 func (v *Volume) FsyncPath(path string) Status {

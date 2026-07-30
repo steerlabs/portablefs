@@ -8,6 +8,69 @@ private func transportBytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+private actor PfsTestAsyncGate {
+    private var open = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if open {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        open = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+}
+
+private actor PfsWrittenRequestIDs {
+    private var ids: [UInt64] = []
+
+    func append(_ id: UInt64) {
+        ids.append(id)
+    }
+
+    func snapshot() -> [UInt64] {
+        ids
+    }
+}
+
+@Test func outboundWriterPreservesRequestIDOrderAcrossDetachedScheduling() async throws {
+    let firstWriteGate = PfsTestAsyncGate()
+    let written = PfsWrittenRequestIDs()
+    let writer = PfsOrderedEnvelopeWriter { envelope in
+        if envelope.requestID == 1 {
+            await firstWriteGate.wait()
+        }
+        await written.append(envelope.requestID)
+    }
+
+    var firstEnvelope = PfsEnvelope()
+    firstEnvelope.requestID = 1
+    firstEnvelope.body = .statfs(PfsStatfsRequest())
+    var secondEnvelope = PfsEnvelope()
+    secondEnvelope.requestID = 2
+    secondEnvelope.body = .statfs(PfsStatfsRequest())
+
+    let first = writer.enqueue(firstEnvelope)
+    let second = writer.enqueue(secondEnvelope)
+    try await Task.sleep(for: .milliseconds(20))
+    #expect(await written.snapshot().isEmpty)
+
+    await firstWriteGate.release()
+    try await first.value
+    try await second.value
+    #expect(await written.snapshot() == [1, 2])
+}
+
 @Test func realReadPathRejectsEOFInMiddleOfFrame() async throws {
     let server = try PfsRawServer { fd in
         _ = try? PfsRawServer.recvSome(fd: fd)
@@ -139,6 +202,53 @@ private func transportBytes(_ string: String) -> Data {
         return
     }
     #expect(invalidation.contentVersion == 9)
+}
+
+@Test func deferredPublicationOperationCannotSpanReplacementConnections() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(
+            maxReconnectAttempts: 10,
+            reconnectBaseDelayNanoseconds: 5_000_000
+        )
+    )
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    let (result, complete) = await client.withDeferredPublication {
+        _ = try await client.request(.getAttr(getattr))
+        daemon.dropConnections()
+
+        // Let the reader retire connection A before issuing the second
+        // ack-producing request on connection B.
+        try await Task.sleep(nanoseconds: 20_000_000)
+        _ = try await client.request(.getAttr(getattr))
+    }
+    do {
+        try result.get()
+        Issue.record("expected a multi-request publication operation to fail across reconnect")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .connectionClosed)
+    }
+    await complete()
+
+    var stats = await daemon.stats()
+    #expect(stats.publicationAcks == 0)
+
+    // A fresh logical operation uses connection B normally. The stale ticket
+    // from A is never replayed onto it.
+    _ = try await client.request(.getAttr(getattr))
+    let deadline = ContinuousClock.now + .seconds(1)
+    while stats.publicationAcks < 1, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+        stats = await daemon.stats()
+    }
+    #expect(stats.publicationAcks == 1)
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
 private func nextEvent(from stream: AsyncStream<PfsEvent>) async throws -> PfsEvent {

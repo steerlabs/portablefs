@@ -89,3 +89,22 @@ func TestStreamMultipleFrames(t *testing.T) {
 		t.Fatalf("stream order ids = %d, %d", first.RequestID, second.RequestID)
 	}
 }
+
+func TestPublicationAckRequirementRoundTrip(t *testing.T) {
+	env := &Envelope{
+		RequestID:              42,
+		PublicationAckRequired: true,
+		Body:                   &GetAttrReply{},
+	}
+	frame, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RequestID != 42 || !decoded.PublicationAckRequired {
+		t.Fatalf("decoded envelope = %#v", decoded)
+	}
+}

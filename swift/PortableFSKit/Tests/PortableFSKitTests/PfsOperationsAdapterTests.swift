@@ -171,6 +171,79 @@ private func makeRecordingPacker(capacity: Int) -> (RecordingDirectoryEntryPacke
 }
 
 @available(macOS 26.0, *)
+private func waitForPublicationAcks(
+    _ daemon: PfsLocalMockDaemon,
+    atLeast expected: Int
+) async throws -> PfsLocalMockDaemon.Stats {
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+        let stats = await daemon.stats()
+        if stats.publicationAcks >= expected {
+            return stats
+        }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    return await daemon.stats()
+}
+
+@available(macOS 26.0, *)
+private final class PublicationReplyGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = false
+    private var released = false
+    private var returned = false
+    private var capturedError: Error?
+
+    func block(error: Error?) {
+        lock.lock()
+        capturedError = error
+        entered = true
+        lock.unlock()
+        while true {
+            lock.lock()
+            let canReturn = released
+            lock.unlock()
+            if canReturn {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        lock.lock()
+        returned = true
+        lock.unlock()
+    }
+
+    func release() {
+        lock.lock()
+        released = true
+        lock.unlock()
+    }
+
+    func snapshot() -> (entered: Bool, returned: Bool, error: Error?) {
+        lock.lock()
+        let result = (entered, returned, capturedError)
+        lock.unlock()
+        return result
+    }
+}
+
+@available(macOS 26.0, *)
+private func waitForReplyGate(
+    _ gate: PublicationReplyGate,
+    returned: Bool = false
+) async throws -> (entered: Bool, returned: Bool, error: Error?) {
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+        let state = gate.snapshot()
+        if state.entered, !returned || state.returned {
+            return state
+        }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    return gate.snapshot()
+}
+
+@available(macOS 26.0, *)
 private struct DirectoryCollection: Sendable {
     var entries: [RecordedDirectoryEntry]
     var refusedPages: Int
@@ -264,6 +337,48 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
         throw PfsLocalClientError.daemon(errno: ESTALE, message: "test item is not PortableFSItem")
     }
     return try await core.read(item: portable, offset: 0, length: UInt32(length))
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterAcknowledgesSuccessfulAndNegativePublications() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    try await Task.sleep(for: .milliseconds(20))
+    let initialStats = await harness.daemon.stats()
+    let baseline = initialStats.publicationAcks
+    let baselineGetattrs = initialStats.getAttrRequests
+
+    let attributesGate = PublicationReplyGate()
+    harness.volume.getAttributes(FSItem.GetAttributesRequest(), of: harness.root) { _, error in
+        attributesGate.block(error: error)
+    }
+    var gateState = try await waitForReplyGate(attributesGate)
+    #expect(gateState.entered)
+    #expect(gateState.error == nil)
+    #expect(await harness.daemon.stats().publicationAcks == baseline)
+    attributesGate.release()
+    gateState = try await waitForReplyGate(attributesGate, returned: true)
+    #expect(gateState.returned)
+    var stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks >= baseline + 1)
+    #expect(stats.getAttrRequests == baselineGetattrs + 1)
+
+    let lookupGate = PublicationReplyGate()
+    harness.volume.lookupItem(
+        named: FSFileName(string: "missing"),
+        inDirectory: harness.root
+    ) { _, _, error in
+        lookupGate.block(error: error)
+    }
+    gateState = try await waitForReplyGate(lookupGate)
+    #expect(gateState.entered)
+    #expect(PfsErrorMapper.fsKitError(for: gateState.error!).code == Int(ENOENT))
+    #expect(await harness.daemon.stats().publicationAcks == baseline + 1)
+    lookupGate.release()
+    gateState = try await waitForReplyGate(lookupGate, returned: true)
+    #expect(gateState.returned)
+    stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 2)
+    #expect(stats.publicationAcks >= baseline + 2)
 }
 
 @available(macOS 26.0, *)
@@ -624,4 +739,89 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     } catch {
         #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOENT))
     }
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterRenameOverTargetRetainsSurvivingHardLinkIdentity() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+
+    let oldBytes = adapterBytes("old-target")
+    let newBytes = adapterBytes("new-target")
+    let target = try await createAdapterFile(
+        volume: harness.volume, in: harness.root, name: "config", contents: oldBytes
+    )
+    _ = try await harness.volume.createLink(
+        to: target,
+        named: FSFileName(string: "survivor"),
+        inDirectory: harness.root
+    )
+    let lock = try await createAdapterFile(
+        volume: harness.volume, in: harness.root, name: "config.lock", contents: newBytes
+    )
+
+    _ = try await harness.volume.renameItem(
+        lock,
+        inDirectory: harness.root,
+        named: FSFileName(string: "config.lock"),
+        to: FSFileName(string: "config"),
+        inDirectory: harness.root,
+        overItem: target
+    )
+
+    let (survivor, _) = try await harness.volume.lookupItem(
+        named: FSFileName(string: "survivor"), inDirectory: harness.root
+    )
+    let portableTarget = try #require(target as? PortableFSItem)
+    let portableSurvivor = try #require(survivor as? PortableFSItem)
+    #expect(portableSurvivor === portableTarget)
+    let survivorAttr = try await harness.core.getattr(item: portableSurvivor)
+    #expect(survivorAttr.nlink == 1)
+    try await harness.volume.openItem(survivor, modes: [.read])
+    #expect(try await readViaCore(harness.core, item: survivor, length: oldBytes.count) == oldBytes)
+    try await harness.volume.closeItem(survivor, modes: [])
+
+    let (replacement, _) = try await harness.volume.lookupItem(
+        named: FSFileName(string: "config"), inDirectory: harness.root
+    )
+    #expect(replacement !== target)
+    try await harness.volume.openItem(replacement, modes: [.read])
+    #expect(try await readViaCore(harness.core, item: replacement, length: newBytes.count) == newBytes)
+    try await harness.volume.closeItem(replacement, modes: [])
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterRenameBetweenSameInodeLinksIsNoOp() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+
+    let item = try await createAdapterFile(
+        volume: harness.volume, in: harness.root, name: "a", contents: adapterBytes("same-inode")
+    )
+    _ = try await harness.volume.createLink(
+        to: item, named: FSFileName(string: "b"), inDirectory: harness.root
+    )
+    let (alias, _) = try await harness.volume.lookupItem(
+        named: FSFileName(string: "b"), inDirectory: harness.root
+    )
+
+    _ = try await harness.volume.renameItem(
+        item,
+        inDirectory: harness.root,
+        named: FSFileName(string: "a"),
+        to: FSFileName(string: "b"),
+        inDirectory: harness.root,
+        overItem: alias
+    )
+
+    let (a, _) = try await harness.volume.lookupItem(
+        named: FSFileName(string: "a"), inDirectory: harness.root
+    )
+    let (b, _) = try await harness.volume.lookupItem(
+        named: FSFileName(string: "b"), inDirectory: harness.root
+    )
+    #expect(a === item)
+    #expect(b === item)
+    let attr = try await harness.core.getattr(item: try #require(item as? PortableFSItem))
+    #expect(attr.nlink == 2)
 }

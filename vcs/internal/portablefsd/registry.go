@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
@@ -48,8 +49,9 @@ type Server struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 
-	frontendLnMu sync.Mutex
-	controlLnMu  sync.Mutex
+	frontendLnMu        sync.Mutex
+	controlLnMu         sync.Mutex
+	frontendConnections atomic.Int32
 }
 
 func NewServer(cfg Config) *Server {
@@ -177,10 +179,10 @@ type registry struct {
 	// the synchronous persist-per-op this replaces rewrote and fsynced the
 	// FULL state file — every attach's whole item table — inside each create/
 	// remove/rename, an O(items) cost that grew quadratically over a workload
-	// like git clone. Losing a binding from the final debounce window in a
-	// daemon crash costs one ESTALE re-lookup after restart (open handles
-	// never survive a crash anyway); membership changes and clean shutdown
-	// still persist synchronously.
+	// like git clone. A synchronous O(changes) journal transaction now gates
+	// Item publication, including detached lifetimes and Reclaim tombstones;
+	// this debounced snapshot is only compaction. Membership changes and clean
+	// shutdown still persist synchronously.
 	persistReq  chan struct{}
 	persistStop chan struct{}
 	persistDone chan struct{}
@@ -607,6 +609,7 @@ func (r *registry) unmountFSKitWith(
 				return true, jobID, err
 			}
 		}
+		a.frontendSerial.Lock()
 		a.nsMu.Lock()
 		if _, err := a.finishDetachWithNSLocked("", nil); err != nil {
 			return true, jobID, err
@@ -698,12 +701,14 @@ func (r *registry) forceUnmountFSKit(
 	forceAlreadyAuthorized bool,
 	ops fskitKernelOps,
 ) (string, error) {
+	a.frontendSerial.Lock()
 	a.nsMu.Lock()
 	a.mu.RLock()
 	if a.detached {
 		jobID := a.detachJobID
 		a.mu.RUnlock()
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return jobID, nil
 	}
 	vol := a.vol
@@ -720,6 +725,7 @@ func (r *registry) forceUnmountFSKit(
 			a.detachForce = false
 			a.mu.Unlock()
 			a.nsMu.Unlock()
+			a.frontendSerial.Unlock()
 			return "", fmt.Errorf("persist forced FSKit detach authorization: %w", err)
 		}
 	}
@@ -730,10 +736,12 @@ func (r *registry) forceUnmountFSKit(
 			storeIdentity, ok := readWALIdentity(storeDir)
 			if !ok || storeIdentity.VolumeID != a.volumeID || storeIdentity.Branch != a.branch {
 				a.nsMu.Unlock()
+				a.frontendSerial.Unlock()
 				return jobID, fmt.Errorf("forced FSKit detach store identity does not match exact attach %s@%s", a.volumeID, a.branch)
 			}
 			if legacy := a.legacyWALs(); len(legacy) != 0 {
 				a.nsMu.Unlock()
+				a.frontendSerial.Unlock()
 				return jobID, fmt.Errorf("forced FSKit detach refuses %d unresolved legacy WAL(s); exact offline parking is available only for the PFW5 store", len(legacy))
 			}
 			proof, err := writeback.ForceParkAbandonedStore(
@@ -745,6 +753,7 @@ func (r *registry) forceUnmountFSKit(
 			)
 			if err != nil {
 				a.nsMu.Unlock()
+				a.frontendSerial.Unlock()
 				return jobID, fmt.Errorf("durably park abandoned FSKit store: %w", err)
 			}
 			if len(proof.JobIDs) != 0 {
@@ -762,9 +771,11 @@ func (r *registry) forceUnmountFSKit(
 				a.mu.Unlock()
 				if err := r.persist(); err != nil {
 					a.nsMu.Unlock()
+					a.frontendSerial.Unlock()
 					return jobID, fmt.Errorf("persist forced FSKit recovery handle: %w", err)
 				}
 				a.nsMu.Unlock()
+				a.frontendSerial.Unlock()
 				return jobID, fmt.Errorf("durably park forced FSKit tail: %w", closeErr)
 			}
 			prepared = true
@@ -775,6 +786,7 @@ func (r *registry) forceUnmountFSKit(
 		a.mu.Unlock()
 		if err := r.persist(); err != nil {
 			a.nsMu.Unlock()
+			a.frontendSerial.Unlock()
 			return jobID, fmt.Errorf("persist forced FSKit detach proof: %w", err)
 		}
 	}
@@ -787,6 +799,7 @@ func (r *registry) forceUnmountFSKit(
 		// Force authorization and the parked-tail proof remain durable.
 		// Operations are quarantined until an exact retry succeeds.
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return jobID, err
 	}
 	return a.finishDetachWithNSLocked(jobID, nil)
@@ -840,39 +853,71 @@ type attach struct {
 	// buffers them under a.mu until flushBindingDelta drains to the journal.
 	journal         *bindingJournal
 	pendingBindings []bindingJournalEntry
-	// coherence state for remote content changes (see coherence_refresh.go):
-	// purging tracks the paths with a refresh worker in flight and
-	// refreshAgain the ones that took another invalidation meanwhile (the
-	// worker must run one more pass so the final pass observes the settled
-	// state); expectedTruncates marks the kernel-size refresh truncates the
-	// daemon itself issues through the mount so the setattr handler can
-	// consume them without touching the authority.
-	purging           map[string]bool
-	refreshAgain      map[string]bool
+	// expectedTruncates marks the kernel-size refresh truncates the daemon
+	// itself issues through the mount so the setattr handler can consume them
+	// without touching the authority.
 	expectedTruncates map[string]expectedTruncate
+	// Exact refreshes for one item are one sample→truncate/page-invalidate→
+	// verify transaction. Context-selectable channel stripes bound memory,
+	// prevent concurrent passes from overwriting each other's truncate
+	// marker, and let attach shutdown cancel a waiter even while another
+	// colliding item is inside a slow kernel msync.
+	kernelRefreshGateMu sync.Mutex
+	kernelRefreshGates  [64]chan struct{}
+
+	// frontendGate extends a handoff through FSKit's explicit publication
+	// acknowledgement. Admission is scope-aware: disjoint subtrees continue
+	// concurrently, while overlapping replies complete before Checkin.
+	frontendGateMu   sync.Mutex
+	frontendGateCond *sync.Cond
+	frontendActive   map[*frontendOperation]struct{}
+	frontendHandoffs map[string]int
+	// frontendPathEpoch changes whenever an FSItem/handle path binding can
+	// change. Publication operations snapshot it with their resolved aliases;
+	// a mismatch at handoff is conservatively mount-wide, closing the narrow
+	// race where a namespace mutation moves an in-flight operation.
+	frontendPathEpoch atomic.Uint64
 
 	credMu sync.RWMutex
 	token  string
 
 	startMu sync.Mutex
 
-	mu                sync.RWMutex
-	nsMu              sync.RWMutex
-	nameLocks         [64]sync.Mutex
+	mu        sync.RWMutex
+	nsMu      sync.RWMutex
+	nameLocks [64]sync.Mutex
+	// frontendSerial and frontendNameLocks mirror the namespace lock classes
+	// at the protocol boundary. A request acquires them before entering the
+	// publication gate, so an admitted operation can never sit behind a
+	// rename/name lock held by the operation whose delegation handoff is
+	// waiting for that admission to publish.
+	frontendSerial    sync.RWMutex
+	frontendNameLocks [64]sync.Mutex
 	vol               *clientcore.Volume
 	eventClient       *fsproto.Client
 	state             pfslocal.AttachStateState
 	lastErr           string
-	credentialPending bool
-	root              *itemRecord
-	items             map[uint64]*itemRecord
-	paths             map[string]*itemRecord
-	handles           map[uint64]*handleRecord
-	enumRecords       map[uint64]*enumerationRecord
-	localDirs         []string
-	localRoot         string
-	localFS           *confinedfs.Root
-	localVersions     map[string]uint64
+	// Terminal for this attach lifetime: once a correctness-bound kernel
+	// refresh fails, authority visibility was not proven. Operations fail
+	// closed until an explicit unmount/restart.
+	coherenceFailFrozen bool
+	credentialPending   bool
+	root                *itemRecord
+	items               map[uint64]*itemRecord
+	paths               map[string]*itemRecord
+	itemAliases         map[uint64]map[string]struct{}
+	// authorityItems is the second half of frontend identity. items maps the
+	// stable ItemID already published to FSKit; authorityItems maps the inode
+	// later assigned by the authority back to that same Item and NodeState.
+	// The identities differ for a create born under a delegation.
+	authorityItems         map[uint64]frontendItemIdentity
+	awaitingAuthorityItems map[uint64]struct{}
+	handles                map[uint64]*handleRecord
+	enumRecords            map[uint64]*enumerationRecord
+	localDirs              []string
+	localRoot              string
+	localFS                *confinedfs.Root
+	localVersions          map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -897,6 +942,9 @@ type attach struct {
 
 	// Test seam for deterministic frontend ordering tests; nil in production.
 	testLookupAfterVolume func(path string)
+	// Test seam for the secure kernel refresh syscall; nil in production.
+	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64) (kernelRefreshOutcome, error)
+	testExactKernelRefresh func(context.Context, uint64) error
 }
 
 type itemRecord struct {
@@ -904,10 +952,20 @@ type itemRecord struct {
 	path  string
 	state *clientcore.NodeState
 	attr  fsproto.Attr
+	// graft is immutable Item provenance. Path inference is insufficient:
+	// an authority ancestor rename remaps a graft root while a detached
+	// Item's remembered path intentionally remains stale until Reclaim.
+	graft bool
+}
+
+type frontendItemIdentity struct {
+	item  pfslocal.Item
+	state *clientcore.NodeState
 }
 
 type handleRecord struct {
 	id       uint64
+	itemID   uint64
 	path     string
 	openPath string
 	state    *clientcore.NodeState
@@ -933,34 +991,37 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 	options := req.Options
 	options.LocalDirs = localDirs
 	return &attach{
-		ref:                 ref,
-		key:                 key,
-		volumeID:            req.VolumeID,
-		branch:              req.Branch,
-		authorityURL:        strings.TrimSpace(req.AuthorityURL),
-		authorityAddr:       normalizeAuthority(req.AuthorityURL),
-		dataPlaneTransport:  req.DataPlaneTransport,
-		dataPlaneServerName: req.DataPlaneServerName,
-		tlsCAPEM:            req.TLSCAPEM,
-		tlsCASHA256:         req.TLSCASHA256,
-		mountPath:           req.MountPath,
-		volumeName:          name,
-		storageID:           storageID,
-		options:             options,
-		stateDir:            stateDir,
-		identityEpoch:       1,
-		token:               req.AuthToken,
-		state:               pfslocal.AttachStateAttached,
-		items:               map[uint64]*itemRecord{},
-		paths:               map[string]*itemRecord{},
-		handles:             map[uint64]*handleRecord{},
-		enumRecords:         map[uint64]*enumerationRecord{},
-		subscribers:         map[*eventSubscriber]struct{}{},
-		conns:               map[interface{ Close() error }]struct{}{},
-		eventReady:          make(chan struct{}),
-		localDirs:           localDirs,
-		localRoot:           filepath.Join(stateDir, "local", storageID),
-		localVersions:       map[string]uint64{},
+		ref:                    ref,
+		key:                    key,
+		volumeID:               req.VolumeID,
+		branch:                 req.Branch,
+		authorityURL:           strings.TrimSpace(req.AuthorityURL),
+		authorityAddr:          normalizeAuthority(req.AuthorityURL),
+		dataPlaneTransport:     req.DataPlaneTransport,
+		dataPlaneServerName:    req.DataPlaneServerName,
+		tlsCAPEM:               req.TLSCAPEM,
+		tlsCASHA256:            req.TLSCASHA256,
+		mountPath:              req.MountPath,
+		volumeName:             name,
+		storageID:              storageID,
+		options:                options,
+		stateDir:               stateDir,
+		identityEpoch:          1,
+		token:                  req.AuthToken,
+		state:                  pfslocal.AttachStateAttached,
+		items:                  map[uint64]*itemRecord{},
+		paths:                  map[string]*itemRecord{},
+		itemAliases:            map[uint64]map[string]struct{}{},
+		authorityItems:         map[uint64]frontendItemIdentity{},
+		awaitingAuthorityItems: map[uint64]struct{}{},
+		handles:                map[uint64]*handleRecord{},
+		enumRecords:            map[uint64]*enumerationRecord{},
+		subscribers:            map[*eventSubscriber]struct{}{},
+		conns:                  map[interface{ Close() error }]struct{}{},
+		eventReady:             make(chan struct{}),
+		localDirs:              localDirs,
+		localRoot:              filepath.Join(stateDir, "local", storageID),
+		localVersions:          map[string]uint64{},
 	}
 }
 
@@ -1014,6 +1075,10 @@ func (a *attach) persistedEntry() persistedAttachEntry {
 	items := a.persistedItemsLocked()
 	options := a.options
 	options.LocalDirs = append([]string(nil), a.options.LocalDirs...)
+	identityEpoch := a.identityEpoch
+	detachPrepared := a.detachPrepared
+	detachForce := a.detachForce
+	detachJobID := a.detachJobID
 	a.mu.RUnlock()
 	return persistedAttachEntry{
 		Ref:                 a.ref,
@@ -1026,10 +1091,10 @@ func (a *attach) persistedEntry() persistedAttachEntry {
 		TLSCAPEM:            a.tlsCAPEM,
 		TLSCASHA256:         a.tlsCASHA256,
 		Options:             options,
-		IdentityEpoch:       a.identityEpoch,
-		DetachPrepared:      a.detachPrepared,
-		DetachForce:         a.detachForce,
-		DetachJobID:         a.detachJobID,
+		IdentityEpoch:       identityEpoch,
+		DetachPrepared:      detachPrepared,
+		DetachForce:         detachForce,
+		DetachJobID:         detachJobID,
 		Items:               items,
 	}
 }
@@ -1039,8 +1104,8 @@ func (a *attach) activate(ctx context.Context, tok string) error {
 }
 
 func (a *attach) activateWithOptions(ctx context.Context, tok string, options *AttachOptions) error {
-	a.nsMu.Lock()
-	defer a.nsMu.Unlock()
+	unlockNamespace := a.lockExternalNamespaceWrite()
+	defer unlockNamespace()
 	a.startMu.Lock()
 	defer a.startMu.Unlock()
 	a.mu.RLock()
@@ -1060,6 +1125,8 @@ func (a *attach) activateWithOptions(ctx context.Context, tok string, options *A
 	}
 	if options != nil {
 		a.mu.Lock()
+		previousVolumeLocalDirs := a.options.VolumeLocalDirs
+		previousLocalDirs := append([]string(nil), a.options.LocalDirs...)
 		a.options.VolumeLocalDirs = options.VolumeLocalDirs
 		// A revived attach has no live routing table, so the re-ensure
 		// request is authoritative for explicit grafts. In particular,
@@ -1067,6 +1134,17 @@ func (a *attach) activateWithOptions(ctx context.Context, tok string, options *A
 		// must clear persisted grafts rather than add nothing to them.
 		a.options.LocalDirs = append([]string(nil), options.LocalDirs...)
 		a.mu.Unlock()
+		// Persist the effective routing request before start can reincarnate
+		// any published Items. A crash after this snapshot is reconciled by
+		// start's provenance transition; a snapshot failure leaves both the
+		// old live identities and old durable routing rules untouched.
+		if err := a.persistState(); err != nil {
+			a.mu.Lock()
+			a.options.VolumeLocalDirs = previousVolumeLocalDirs
+			a.options.LocalDirs = previousLocalDirs
+			a.mu.Unlock()
+			return fmt.Errorf("persist revived local-dir routing: %w", err)
+		}
 	}
 	if err := a.start(ctx); err != nil {
 		a.setErr(err)
@@ -1093,6 +1171,8 @@ func (a *attach) controlAdmissionError() error {
 		return fmt.Errorf("attach is detached")
 	case a.detachPrepared || a.detachForce:
 		return fmt.Errorf("attach is quarantined by a durable prepared detach")
+	case a.coherenceFailFrozen:
+		return fmt.Errorf("%s", a.lastErr)
 	default:
 		return nil
 	}
@@ -1138,15 +1218,19 @@ func (a *attach) start(ctx context.Context) error {
 			defer a.credMu.RUnlock()
 			return a.token
 		},
-		Branch:          a.branch,
-		WALDir:          filepath.Join(a.stateDir, "wal", a.storageID),
-		NegativeCache:   a.options.NegativeCache,
-		NoNegativeCache: a.options.NoNegativeCache,
-		DiskCacheDir:    diskDir,
-		DiskCacheBytes:  diskCap << 20,
-		PrefetchTree:    a.options.Prefetch,
-		OnFlushAll:      a.onFlushAll,
-		OnMarkOrphan:    a.onMarkOrphan,
+		Branch:            a.branch,
+		WALDir:            filepath.Join(a.stateDir, "wal", a.storageID),
+		NegativeCache:     a.options.NegativeCache,
+		NoNegativeCache:   a.options.NoNegativeCache,
+		DiskCacheDir:      diskDir,
+		DiskCacheBytes:    diskCap << 20,
+		PrefetchTree:      a.options.Prefetch,
+		OnFlushAll:        a.onFlushAll,
+		OnHandoffStart:    a.startFrontendHandoff,
+		OnHandoffEnd:      a.endFrontendHandoff,
+		OnHandoffPrepared: a.persistAssignedAuthorityIdentities,
+		OnReleaseWait:     a.suspendFrontendOperation,
+		OnMarkOrphan:      a.onMarkOrphan,
 		// A persistently failing write-back flush flips the attach to degraded (visible in
 		// `portablefs mounts` + pushed to the extension) instead of only logging, so acked
 		// write-back that cannot reach the authority is loud, never silently dropped.
@@ -1235,10 +1319,11 @@ func (a *attach) start(ctx context.Context) error {
 		_ = vol.Close()
 		return fmt.Errorf("attach is detached")
 	}
-	a.vol = vol
-	a.eventClient = eventClient
+	changedRoutingItems := a.transitionGraftProvenanceLocked(effectiveLocalDirs)
 	a.localDirs = effectiveLocalDirs
 	a.localFS = localFS
+	a.vol = vol
+	a.eventClient = eventClient
 	a.root = a.registerLocked("", rootAttr)
 	aliasCounts := map[uint64]int{}
 	for _, rec := range a.paths {
@@ -1255,7 +1340,25 @@ func (a *attach) start(ctx context.Context) error {
 	if a.options.Prefetch {
 		a.state = pfslocal.AttachStateWarming
 	}
+	for _, p := range changedRoutingItems {
+		a.publishNamespaceInvalidationLocked(p, 0, 0)
+	}
 	a.mu.Unlock()
+	if err := a.flushBindingDeltaError(); err != nil {
+		a.mu.Lock()
+		a.vol = nil
+		a.eventClient = nil
+		if openedLocalFS {
+			a.localFS = nil
+		}
+		a.mu.Unlock()
+		if openedLocalFS {
+			_ = localFS.Close()
+		}
+		_ = eventClient.Close()
+		_ = vol.Close()
+		return fmt.Errorf("persist effective local-dir identity transition: %w", err)
+	}
 	a.eventOnce.Do(func() { close(a.eventReady) })
 	go vol.StartInvalidations(ctx, false)
 	go a.forwardEvents(ctx, eventClient, eventStream, eventAck)
@@ -1293,6 +1396,7 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	// decision. A failed normal detach releases this lock with the attach and
 	// Volume still usable; a successful/forced detach publishes the terminal
 	// flag before operations can resume.
+	a.frontendSerial.Lock()
 	a.nsMu.Lock()
 	a.mu.RLock()
 	alreadyDetached := a.detached
@@ -1302,10 +1406,12 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	a.mu.RUnlock()
 	if alreadyDetached {
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return existingJobID, nil
 	}
 	if prepared {
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return existingJobID, fmt.Errorf("attach has a durable prepared FSKit detach; reconcile it through the exact unmount endpoint")
 	}
 	if vol != nil {
@@ -1323,6 +1429,7 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 			// Volume or parked its WAL. Keep the attach serving.
 			recs, bytes := vol.WriteBackPending()
 			a.nsMu.Unlock()
+			a.frontendSerial.Unlock()
 			return "", fmt.Errorf("detach refused: final drain/release barrier failed with %d records (%d bytes) unshipped: %w (retry when the authority answers, or force-detach to park them as a durable recovery job)", recs, bytes, cerr)
 		}
 	}
@@ -1334,6 +1441,7 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 // freeze is still held. CloseWithFinalizer keeps the volume usable when the
 // callback fails, so a failed platform unmount thaws back to the live mount.
 func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
+	a.frontendSerial.Lock()
 	a.nsMu.Lock()
 	a.mu.RLock()
 	alreadyDetached := a.detached
@@ -1342,28 +1450,32 @@ func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
 	a.mu.RUnlock()
 	if alreadyDetached {
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return existingJobID, nil
 	}
 	if vol != nil {
 		if err := vol.CloseWithFinalizer(finalizer); err != nil {
 			a.nsMu.Unlock()
+			a.frontendSerial.Unlock()
 			return "", fmt.Errorf("prepared FSKit detach refused: %w", err)
 		}
 	} else if err := finalizer(); err != nil {
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return "", err
 	}
 	return a.finishDetachWithNSLocked("", nil)
 }
 
 // finishDetachWithNSLocked publishes the terminal attach state and releases
-// the admission freeze. The caller owns nsMu exclusively.
+// the admission freeze. The caller owns frontendSerial and nsMu exclusively.
 func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string, error) {
 	a.mu.Lock()
 	if a.detached {
 		existingJobID := a.detachJobID
 		a.mu.Unlock()
 		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
 		return existingJobID, priorErr
 	}
 	a.detached = true
@@ -1376,6 +1488,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	localFS := a.localFS
 	a.mu.Unlock()
 	a.nsMu.Unlock()
+	a.frontendSerial.Unlock()
 	if events != nil {
 		_ = events.Close()
 	}
@@ -1499,12 +1612,43 @@ func (a *attach) setErr(err error) {
 			a.state = pfslocal.AttachStateDegraded
 			a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDegraded, Detail: a.lastErr}})
 		}
-	} else if a.lastErr != "" {
+	} else if a.lastErr != "" && !a.coherenceFailFrozen {
 		a.lastErr = ""
 		a.state = a.currentStateLocked()
 		a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: a.state}})
 	}
 	a.mu.Unlock()
+}
+
+func (a *attach) failCoherence(err error) {
+	if err == nil {
+		return
+	}
+	// Linearize the terminal fence after every already-admitted frontend
+	// handler and before every later one. Callers reach this point only after
+	// releasing concrete/proxy namespace locks.
+	a.frontendSerial.Lock()
+	defer a.frontendSerial.Unlock()
+	a.mu.Lock()
+	if !a.coherenceFailFrozen {
+		a.coherenceFailFrozen = true
+		a.lastErr = "kernel coherence barrier failed closed: " + err.Error()
+		a.state = pfslocal.AttachStateDegraded
+		a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{
+			State:  pfslocal.AttachStateDegraded,
+			Detail: a.lastErr,
+		}})
+	}
+	a.mu.Unlock()
+}
+
+func (a *attach) frontendAdmissionError() error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.coherenceFailFrozen {
+		return fmt.Errorf("%s", a.lastErr)
+	}
+	return nil
 }
 
 func (a *attach) volOrErr() (*clientcore.Volume, int32) {
@@ -1513,7 +1657,7 @@ func (a *attach) volOrErr() (*clientcore.Volume, int32) {
 	if a.detached || a.detachPrepared || a.detachForce {
 		return nil, darwinENXIO
 	}
-	if a.credentialPending || a.vol == nil {
+	if a.coherenceFailFrozen || a.credentialPending || a.vol == nil {
 		return nil, darwinEIO
 	}
 	return a.vol, 0
@@ -1534,9 +1678,9 @@ func (a *attach) persistStateBestEffort(context string) {
 
 // schedulePersistState requests an asynchronous, debounced write of the daemon
 // state file (attach configs + item identity bindings). Namespace mutations
-// call this instead of persisting synchronously: state-file I/O must never
-// gate or fail volume I/O, and a binding lost from the debounce window in a
-// crash costs exactly one ESTALE re-lookup after restart.
+// call this after their synchronous, fallible journal transaction. The state
+// snapshot is compaction; process-crash identity correctness comes from the
+// journal and therefore never depends on the debounce window.
 func (a *attach) schedulePersistState() {
 	if a.schedulePersist != nil {
 		a.schedulePersist()
@@ -1562,7 +1706,7 @@ func (a *attach) registerLocked(p string, attr fsproto.Attr) *itemRecord {
 	if ino == 0 {
 		ino = clientcore.InoOf(p)
 	}
-	return a.registerWithItemLocked(p, attr, ino, authIno, true)
+	return a.registerWithItemLocked(p, attr, ino, authIno, true, false)
 }
 
 func (a *attach) registerCreatedLocked(p string, attr fsproto.Attr) *itemRecord {
@@ -1572,7 +1716,9 @@ func (a *attach) registerCreatedLocked(p string, attr fsproto.Attr) *itemRecord 
 	if a.paths[p] != nil {
 		return a.registerLocked(p, attr)
 	}
-	return a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false)
+	rec := a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false, false)
+	a.awaitingAuthorityItems[rec.item.ItemID] = struct{}{}
+	return rec
 }
 
 // registerHardLinkAliasLocked binds a new hard-link name to the exact
@@ -1589,9 +1735,12 @@ func (a *attach) registerHardLinkAliasLocked(p string, source *itemRecord, attr 
 		source = current
 	}
 	source.attr = attr
+	a.indexAuthorityIdentityLocked(source)
 	a.pendBindingLocked(source)
-	rec := &itemRecord{item: source.item, path: p, state: source.state, attr: attr}
+	rec := &itemRecord{item: source.item, path: p, state: source.state, attr: attr, graft: source.graft}
 	a.paths[p] = rec
+	a.addItemAliasLocked(rec)
+	a.frontendPathEpoch.Add(1)
 	if a.items[rec.item.ItemID] == nil {
 		a.items[rec.item.ItemID] = source
 	}
@@ -1599,13 +1748,33 @@ func (a *attach) registerHardLinkAliasLocked(p string, source *itemRecord, attr 
 	return rec
 }
 
-func (a *attach) registerWithItemLocked(p string, attr fsproto.Attr, ino uint64, authIno bool, reuseByItemID bool) *itemRecord {
+func (a *attach) registerWithItemLocked(
+	p string,
+	attr fsproto.Attr,
+	ino uint64,
+	authIno bool,
+	reuseByItemID bool,
+	graft bool,
+) *itemRecord {
 	gen := a.identityEpoch
 	if gen == 0 {
 		gen = 1
 		a.identityEpoch = gen
 	}
 	if rec := a.paths[p]; rec != nil {
+		if authIno && rec.state != nil && rec.state.AuthIno() &&
+			rec.state.Orphan() == 0 && rec.state.AuthorityIno() != ino {
+			// A pathname is not an inode identity. A peer can atomically
+			// replace this directory entry while another hard-link name (or
+			// an open handle) still refers to the old inode. Reusing the old
+			// Item or mutating its NodeState would collapse two live POSIX
+			// inodes into one frontend object. Detach only this name, retain
+			// the old Item/NodeState for its aliases and kernel references,
+			// then register the replacement as a fresh identity.
+			a.detachReincarnatedPathLocked(p, rec)
+			return a.registerWithItemLocked(p, attr, ino, authIno, reuseByItemID, graft)
+		}
+
 		rec.attr = attr
 		// Preserve the pfslocal Item already handed to the kernel for this same path. A write-back
 		// create starts life with a local item, then may gain an authority inode when it flushes or
@@ -1621,50 +1790,181 @@ func (a *attach) registerWithItemLocked(p string, attr fsproto.Attr, ino uint64,
 			if authIno {
 				a.pendBindingLocked(rec)
 			}
-		} else if authIno && rec.state.AuthIno() && rec.state.Orphan() == 0 &&
-			rec.state.AuthorityIno() != ino {
-			// The authority inode BEHIND this path changed: a remote writer
-			// rename-over-ed or recreated the name (git's atomic ref update).
-			// The kernel's Item stays stable — same path identity — but open
-			// registration pins inodes, and pinning the remembered inode now
-			// answers ENOENT forever (the authority correctly reports it
-			// unlinked). POSIX open resolves the NAME at open time: swap in a
-			// fresh NodeState for the current inode. Handles already open
-			// captured the old state at open time and unwind through it.
-			rec.state = clientcore.NewNodeStateWithAuthority(rec.item.ItemID, ino)
 		} else if authIno && !rec.state.AuthIno() {
 			if !rec.state.RecordAuthorityIno(ino) {
 				rec.state = clientcore.NewNodeStateWithAuthority(rec.item.ItemID, ino)
 			}
 			a.pendBindingLocked(rec) // the persisted Auth bit flipped
 		}
+		if authIno {
+			a.indexAuthorityIdentityLocked(rec)
+		}
 		return rec
 	}
 	item := pfslocal.Item{ItemID: ino, ItemGeneration: gen}
+	var identity frontendItemIdentity
 	var canonical *itemRecord
-	if reuseByItemID {
-		canonical = a.items[ino]
+	if authIno {
+		identity = a.authorityItems[ino]
 	}
-	rec := &itemRecord{item: item, state: clientcore.NewNodeState(ino, authIno)}
-	if canonical == nil {
-		a.items[ino] = rec
+	if identity.state == nil && reuseByItemID {
+		canonical = a.items[ino]
+		if canonical != nil {
+			identity = frontendItemIdentity{item: canonical.item, state: canonical.state}
+		}
+	}
+	rec := &itemRecord{item: item, state: clientcore.NewNodeState(ino, authIno), graft: graft}
+	if identity.state == nil {
+		a.items[item.ItemID] = rec
 	} else {
-		// Multiple paths with the same stable inode are hard-link aliases.
-		// Keep one canonical item lookup while each name retains its own
-		// path record; every alias shares the same open/orphan NodeState.
-		rec.state = canonical.state
+		// Multiple authority names for one inode are hard-link aliases. This
+		// also covers the important asymmetric case where the first name was
+		// published with a daemon-local ItemID before the authority allocated
+		// its inode. Reuse both halves of the already-published identity.
+		rec.item = identity.item
+		rec.state = identity.state
 	}
 	rec.path = p
 	rec.attr = attr
-	rec.item = item
 	a.paths[p] = rec
+	a.addItemAliasLocked(rec)
+	a.frontendPathEpoch.Add(1)
+	if canonical := a.items[rec.item.ItemID]; canonical == nil ||
+		a.paths[canonical.path] != canonical {
+		// A remotely replaced last-known name leaves its old Item detached
+		// until Reclaim. Discovery of an authority hard-link alias makes that
+		// live name canonical again without changing the published identity.
+		a.items[rec.item.ItemID] = rec
+	}
+	if authIno {
+		a.indexAuthorityIdentityLocked(rec)
+	}
 	a.pendBindingLocked(rec)
 	return rec
+}
+
+// detachReincarnatedPathLocked removes one pathname from its old identity
+// without reclaiming that identity. The authority may still expose the inode
+// through another hard-link alias, and FSKit may still hold the published Item
+// or an open handle. If the detached record was canonical, prefer a surviving
+// alias as the canonical path; with no alias, retain the detached record until
+// the kernel's explicit Reclaim releases the old Item.
+func (a *attach) detachReincarnatedPathLocked(p string, rec *itemRecord) {
+	if rec == nil || a.paths[p] != rec {
+		return
+	}
+	delete(a.paths, p)
+	a.dropItemAliasLocked(rec.item.ItemID, p)
+	// Keep authorityItems while the detached frontend Item remains live.
+	// Locally unknown hard-link names may still resolve to this inode; their
+	// later discovery must recover the exact Item/NodeState already published
+	// for the replaced name. Reclaim is the lifetime boundary that drops the
+	// retained identity when no kernel reference can discover more aliases.
+
+	if a.items[rec.item.ItemID] == rec {
+		var canonical *itemRecord
+		for aliasPath := range a.itemAliases[rec.item.ItemID] {
+			candidate := a.paths[aliasPath]
+			if candidate == nil || candidate.item != rec.item || candidate.state != rec.state {
+				continue
+			}
+			if canonical == nil || candidate.path < canonical.path {
+				canonical = candidate
+			}
+		}
+		if canonical != nil {
+			a.items[rec.item.ItemID] = canonical
+		}
+		// No alias intentionally leaves rec canonical. The Item remains
+		// addressable through its old NodeState until Reclaim.
+	}
+	if len(a.itemAliases[rec.item.ItemID]) == 0 {
+		delete(a.awaitingAuthorityItems, rec.item.ItemID)
+		entry := a.bindingEntryLocked("detach", rec)
+		entry.Path = p
+		a.pendingBindings = append(a.pendingBindings, entry)
+	} else {
+		a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{
+			Ref: a.ref, Op: "unbind", Path: p,
+		})
+	}
+}
+
+// indexAuthorityIdentityLocked publishes the authority side of a frontend
+// identity after a delegated create is assigned its real inode. The frontend
+// Item and NodeState are immutable as a pair: later lookup/readdir discovery
+// of any hard-link alias must reuse both.
+func (a *attach) indexAuthorityIdentityLocked(rec *itemRecord) {
+	if rec == nil || rec.state == nil {
+		return
+	}
+	authorityIno := rec.state.AuthorityIno()
+	if authorityIno == 0 {
+		return
+	}
+	identity := frontendItemIdentity{item: rec.item, state: rec.state}
+	if current, ok := a.authorityItems[authorityIno]; ok &&
+		(current.item != identity.item || current.state != identity.state) {
+		// Identity is immutable once published. The handoff gate installs a
+		// local create's mapping before peers may expose another name, so a
+		// second mapping is never allowed to replace the canonical pair.
+		return
+	}
+	a.authorityItems[authorityIno] = identity
+	delete(a.awaitingAuthorityItems, rec.item.ItemID)
+}
+
+func (a *attach) dropAuthorityIdentityIfUnusedLocked(item pfslocal.Item, state *clientcore.NodeState) {
+	if state == nil {
+		return
+	}
+	authorityIno := state.AuthorityIno()
+	identity, ok := a.authorityItems[authorityIno]
+	if !ok || identity.item != item || identity.state != state {
+		return
+	}
+	for alias := range a.itemAliases[item.ItemID] {
+		if rec := a.paths[alias]; rec != nil && rec.state == state {
+			return
+		}
+	}
+	delete(a.authorityItems, authorityIno)
+}
+
+// publishAssignedAuthorityIdentitiesLocked advances the small set of
+// delegation-born items whose NodeState was populated by the release pin
+// protocol. It runs in the fallible prepared-handoff hook while the frontend
+// gate and authority delegation are still held, so the mapping is journaled
+// before Checkin can expose the inode to peers.
+func (a *attach) publishAssignedAuthorityIdentitiesLocked() {
+	for itemID := range a.awaitingAuthorityItems {
+		rec := a.items[itemID]
+		if rec == nil {
+			delete(a.awaitingAuthorityItems, itemID)
+			continue
+		}
+		if rec.state == nil || rec.state.AuthorityIno() == 0 {
+			continue
+		}
+		a.indexAuthorityIdentityLocked(rec)
+		for alias := range a.itemAliases[itemID] {
+			if pathRec := a.paths[alias]; pathRec != nil {
+				a.pendBindingLocked(pathRec)
+			}
+		}
+	}
 }
 
 // pendBindingLocked buffers a binding delta for the caller's later
 // flushBindingDelta. Caller holds a.mu.
 func (a *attach) pendBindingLocked(rec *itemRecord) {
+	a.pendingBindings = append(a.pendingBindings, a.bindingEntryLocked("bind", rec))
+}
+
+func (a *attach) bindingEntryLocked(op string, rec *itemRecord) bindingJournalEntry {
+	if rec == nil {
+		return bindingJournalEntry{Ref: a.ref, Op: op}
+	}
 	var authorityItemID uint64
 	if rec.state != nil {
 		authorityItemID = rec.state.AuthorityIno()
@@ -1673,11 +1973,13 @@ func (a *attach) pendBindingLocked(rec *itemRecord) {
 	if persistedAuthorityItemID == rec.item.ItemID {
 		persistedAuthorityItemID = 0
 	}
-	a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{
-		Ref: a.ref, Op: "bind", Path: rec.path,
+	return bindingJournalEntry{
+		Ref: a.ref, Op: op, Path: rec.path,
 		ID: rec.item.ItemID, Gen: rec.item.ItemGeneration,
 		Auth: authorityItemID != 0, AuthorityItemID: persistedAuthorityItemID,
-	})
+		Kind:  rec.attr.Kind,
+		Graft: rec.graft,
+	}
 }
 
 // flushBindingDelta journals the binding changes buffered by the registration
@@ -1685,18 +1987,178 @@ func (a *attach) pendBindingLocked(rec *itemRecord) {
 // Every operation that can change bindings calls this after releasing a.mu
 // and BEFORE replying, so an item ID never reaches the kernel without its
 // binding being at least process-crash durable.
-func (a *attach) flushBindingDelta() {
+func (a *attach) flushBindingDelta() int32 {
+	if err := a.flushBindingDeltaError(); err != nil {
+		return darwinEIO
+	}
+	return 0
+}
+
+func (a *attach) flushBindingDeltaError() error {
 	a.mu.Lock()
 	pending := a.pendingBindings
 	a.pendingBindings = nil
 	a.mu.Unlock()
 	if len(pending) == 0 {
-		return
+		return nil
 	}
 	if a.journal != nil {
-		a.journal.append(pending)
+		if err := a.journal.append(pending); err != nil {
+			a.failBindingPersistence(err)
+			return err
+		}
 	}
 	a.schedulePersistState()
+	return nil
+}
+
+func (a *attach) persistAssignedAuthorityIdentities(
+	ctx context.Context,
+	scope string,
+	epoch string,
+	cli *fsproto.Client,
+) (func(bool), error) {
+	type pendingIdentity struct {
+		item  pfslocal.Item
+		path  string
+		state *clientcore.NodeState
+	}
+	a.mu.Lock()
+	if a.coherenceFailFrozen {
+		err := errors.New(a.lastErr)
+		a.mu.Unlock()
+		return nil, err
+	}
+	// protectOpenPins runs immediately before this hook and may already have
+	// assigned live-open identities. Queue those durable mappings first, then
+	// prepare every remaining published, active, authority-routed Item in the
+	// released scope—even when its create handle was closed long ago.
+	a.publishAssignedAuthorityIdentitiesLocked()
+	var pending []pendingIdentity
+	for itemID := range a.awaitingAuthorityItems {
+		rec := a.items[itemID]
+		if rec == nil || rec.graft || rec.path == "" ||
+			!pathWithinScope(rec.path, scope) ||
+			a.paths[rec.path] != rec ||
+			rec.state == nil || rec.state.AuthorityIno() != 0 {
+			continue
+		}
+		pending = append(pending, pendingIdentity{
+			item: rec.item, path: rec.path, state: rec.state,
+		})
+	}
+	a.mu.Unlock()
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].path == pending[j].path {
+			return pending[i].item.ItemID < pending[j].item.ItemID
+		}
+		return pending[i].path < pending[j].path
+	})
+
+	var preparedInos []uint64
+	resolved := make([]uint64, len(pending))
+	cleanupPrepared := func() {
+		if len(preparedInos) == 0 {
+			return
+		}
+		unique := make([]uint64, 0, len(preparedInos))
+		seen := make(map[uint64]struct{}, len(preparedInos))
+		for _, ino := range preparedInos {
+			if ino == 0 {
+				continue
+			}
+			if _, ok := seen[ino]; ok {
+				continue
+			}
+			seen[ino] = struct{}{}
+			unique = append(unique, ino)
+		}
+		for start := 0; start < len(unique); start += fsproto.MaxPrepareOpenPaths {
+			end := start + fsproto.MaxPrepareOpenPaths
+			if end > len(unique) {
+				end = len(unique)
+			}
+			if st, err := cli.UnmarkOpenBatch(unique[start:end]); err != nil || st != fsproto.OK {
+				if err == nil {
+					err = fmt.Errorf("authority status %d", st)
+				}
+				a.setErr(fmt.Errorf(
+					"retire prepared published identities for %q: %w",
+					scope, err,
+				))
+				return
+			}
+		}
+	}
+	for start := 0; start < len(pending); start += fsproto.MaxPrepareOpenPaths {
+		if err := ctx.Err(); err != nil {
+			cleanupPrepared()
+			return nil, err
+		}
+		end := start + fsproto.MaxPrepareOpenPaths
+		if end > len(pending) {
+			end = len(pending)
+		}
+		paths := make([]string, end-start)
+		for i := start; i < end; i++ {
+			paths[i-start] = pending[i].path
+		}
+		inos, _, err := cli.PrepareDelegationRelease(scope, epoch, paths)
+		if err != nil {
+			cleanupPrepared()
+			return nil, err
+		}
+		copy(resolved[start:end], inos)
+		preparedInos = append(preparedInos, inos...)
+	}
+
+	a.mu.Lock()
+	for i, target := range pending {
+		rec := a.items[target.item.ItemID]
+		if rec == nil || rec.item != target.item || rec.state != target.state ||
+			rec.path != target.path || a.paths[target.path] != rec || rec.graft {
+			a.mu.Unlock()
+			cleanupPrepared()
+			return nil, fmt.Errorf(
+				"published identity %d at %q changed during prepared handoff",
+				target.item.ItemID, target.path,
+			)
+		}
+		if !target.state.RecordAuthorityIno(resolved[i]) {
+			a.mu.Unlock()
+			cleanupPrepared()
+			return nil, fmt.Errorf(
+				"published identity %d at %q rejected authority inode %d",
+				target.item.ItemID, target.path, resolved[i],
+			)
+		}
+	}
+	a.publishAssignedAuthorityIdentitiesLocked()
+	a.mu.Unlock()
+	if err := a.flushBindingDeltaError(); err != nil {
+		cleanupPrepared()
+		return nil, err
+	}
+	if len(preparedInos) == 0 {
+		return nil, nil
+	}
+	return func(bool) { cleanupPrepared() }, nil
+}
+
+func (a *attach) failBindingPersistence(err error) {
+	if err == nil {
+		return
+	}
+	a.mu.Lock()
+	if !a.coherenceFailFrozen {
+		a.coherenceFailFrozen = true
+		a.lastErr = "item identity journal failed closed: " + err.Error()
+		a.state = pfslocal.AttachStateDegraded
+		a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{
+			State: pfslocal.AttachStateDegraded, Detail: a.lastErr,
+		}})
+	}
+	a.mu.Unlock()
 }
 
 // applyJournalEntry replays one binding delta at daemon startup, mirroring
@@ -1710,9 +2172,13 @@ func (a *attach) applyJournalEntry(e bindingJournalEntry) {
 			return
 		}
 		if prev := a.paths[e.Path]; prev != nil {
+			// FSKit can remain mounted and reconnect across a portablefsd
+			// restart. Preserve the replaced binding until its exact Item
+			// generation is reclaimed; the new bind must not collapse a
+			// still-live pre-restart vnode into the replacement identity.
 			a.dropPathLocked(e.Path)
 		}
-		attr := fsproto.Attr{Ino: e.ID}
+		attr := fsproto.Attr{Ino: e.ID, Kind: e.Kind}
 		if e.Path == "" {
 			attr = syntheticRootAttr()
 			attr.Ino = e.ID
@@ -1722,18 +2188,57 @@ func (a *attach) applyJournalEntry(e bindingJournalEntry) {
 			path:  e.Path,
 			state: clientcore.NewNodeStateWithAuthority(e.ID, e.authorityItemID()),
 			attr:  attr,
+			graft: e.Graft,
 		}
 		if canonical := a.items[e.ID]; canonical != nil {
 			rec.state = canonical.state
+			if a.paths[canonical.path] != canonical {
+				a.items[e.ID] = rec
+			}
 		} else {
 			a.items[e.ID] = rec
 		}
 		a.paths[e.Path] = rec
+		a.addItemAliasLocked(rec)
+		a.indexAuthorityIdentityLocked(rec)
+		if !rec.graft && rec.path != "" && rec.state.AuthorityIno() == 0 {
+			a.awaitingAuthorityItems[rec.item.ItemID] = struct{}{}
+		}
+		a.frontendPathEpoch.Add(1)
 		if e.Path == "" {
 			a.root = rec
 		}
 	case "unbind":
-		a.removePathLocked(e.Path)
+		a.dropPathLocked(e.Path)
+	case "detach":
+		if e.ID == 0 || e.Gen == 0 || e.Gen != a.identityEpoch ||
+			!validJournalPath(e.Path) || e.Path == "" {
+			return
+		}
+		if prev := a.paths[e.Path]; prev != nil &&
+			prev.item.ItemID == e.ID && prev.item.ItemGeneration == e.Gen {
+			if e.Kind != "" {
+				prev.attr.Kind = e.Kind
+			}
+			a.dropPathLocked(e.Path)
+		}
+		if current := a.items[e.ID]; current == nil ||
+			current.item.ItemGeneration != e.Gen {
+			rec := &itemRecord{
+				item:  pfslocal.Item{ItemID: e.ID, ItemGeneration: e.Gen},
+				path:  e.Path,
+				state: clientcore.NewNodeStateWithAuthority(e.ID, e.authorityItemID()),
+				attr:  fsproto.Attr{Ino: e.ID, Kind: e.Kind},
+				graft: e.Graft,
+			}
+			a.items[e.ID] = rec
+			a.indexAuthorityIdentityLocked(rec)
+		}
+	case "reclaim":
+		if e.ID == 0 || e.Gen == 0 || e.Gen != a.identityEpoch {
+			return
+		}
+		a.reclaimItemLocked(pfslocal.Item{ItemID: e.ID, ItemGeneration: e.Gen})
 	case "rekey":
 		if !validJournalPath(e.From) || !validJournalPath(e.To) {
 			return
@@ -1762,7 +2267,7 @@ func (a *attach) restoreItemsLocked(items []persistedItemRecord) {
 		if item.ItemID == 0 || item.ItemGeneration == 0 {
 			continue
 		}
-		attr := fsproto.Attr{Ino: item.ItemID}
+		attr := fsproto.Attr{Ino: item.ItemID, Kind: item.Kind}
 		if item.Path == "" {
 			attr = syntheticRootAttr()
 			attr.Ino = item.ItemID
@@ -1772,13 +2277,26 @@ func (a *attach) restoreItemsLocked(items []persistedItemRecord) {
 			path:  item.Path,
 			state: clientcore.NewNodeStateWithAuthority(item.ItemID, item.authorityItemID()),
 			attr:  attr,
+			graft: item.Graft,
 		}
 		if canonical := a.items[item.ItemID]; canonical != nil {
 			rec.state = canonical.state
 		} else {
 			a.items[item.ItemID] = rec
 		}
-		a.paths[item.Path] = rec
+		if !item.Detached {
+			a.paths[item.Path] = rec
+			a.addItemAliasLocked(rec)
+			if canonical := a.items[item.ItemID]; canonical == nil ||
+				a.paths[canonical.path] != canonical {
+				a.items[item.ItemID] = rec
+			}
+			if !rec.graft && rec.path != "" && rec.state.AuthorityIno() == 0 {
+				a.awaitingAuthorityItems[rec.item.ItemID] = struct{}{}
+			}
+		}
+		a.indexAuthorityIdentityLocked(rec)
+		a.frontendPathEpoch.Add(1)
 		if item.Path == "" {
 			a.root = rec
 		}
@@ -1786,10 +2304,10 @@ func (a *attach) restoreItemsLocked(items []persistedItemRecord) {
 }
 
 func (a *attach) persistedItemsLocked() []persistedItemRecord {
-	items := make([]persistedItemRecord, 0, len(a.paths))
-	for _, rec := range a.paths {
+	items := make([]persistedItemRecord, 0, len(a.paths)+len(a.items))
+	appendRecord := func(rec *itemRecord, detached bool) {
 		if rec == nil || rec.item.ItemID == 0 {
-			continue
+			return
 		}
 		var authorityItemID uint64
 		if rec.state != nil {
@@ -1805,10 +2323,24 @@ func (a *attach) persistedItemsLocked() []persistedItemRecord {
 			ItemGeneration:  rec.item.ItemGeneration,
 			AuthorityIno:    authorityItemID != 0,
 			AuthorityItemID: persistedAuthorityItemID,
+			Kind:            rec.attr.Kind,
+			Graft:           rec.graft,
+			Detached:        detached,
 		})
+	}
+	for _, rec := range a.paths {
+		appendRecord(rec, false)
+	}
+	for itemID, rec := range a.items {
+		if rec != nil && rec.path != "" && len(a.itemAliases[itemID]) == 0 {
+			appendRecord(rec, true)
+		}
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Path == items[j].Path {
+			if items[i].Detached != items[j].Detached {
+				return !items[i].Detached
+			}
 			return items[i].ItemID < items[j].ItemID
 		}
 		return items[i].Path < items[j].Path
@@ -1852,6 +2384,91 @@ func (a *attach) lockNames(keys ...nameKey) func() {
 	}
 }
 
+// lockFrontendRequest establishes the same serialization order before a
+// request enters frontendActive that the concrete operation will establish
+// with nsMu/nameLocks afterward. The locks are separate mirrors: recursive
+// acquisition of sync.RWMutex is unsafe when a writer is pending.
+func (a *attach) lockFrontendRequest(body any) func() {
+	exclusive := false
+	mutatesName := false
+	switch req := body.(type) {
+	case *pfslocal.RenameRequest:
+		exclusive = true
+	case *pfslocal.RemoveRequest:
+		exclusive = req.Directory
+		mutatesName = !req.Directory
+	case *pfslocal.SetAttrRequest,
+		*pfslocal.WriteRequest,
+		*pfslocal.CreateRequest,
+		*pfslocal.MkdirRequest,
+		*pfslocal.SymlinkRequest,
+		*pfslocal.HardLinkRequest,
+		*pfslocal.XattrSetRequest,
+		*pfslocal.XattrRemoveRequest:
+		mutatesName = true
+	}
+	if exclusive {
+		a.frontendSerial.Lock()
+		return a.frontendSerial.Unlock
+	}
+	a.frontendSerial.RLock()
+	if !mutatesName {
+		return a.frontendSerial.RUnlock
+	}
+	paths, _, _ := a.frontendOperationPaths(body)
+	unlockNames := a.lockFrontendRequestNames(paths)
+	return func() {
+		unlockNames()
+		a.frontendSerial.RUnlock()
+	}
+}
+
+func (a *attach) lockFrontendRequestNames(paths []string) func() {
+	seen := map[int]struct{}{}
+	idx := make([]int, 0, len(paths))
+	for _, p := range paths {
+		k := entryKey(p)
+		i := int(clientcore.InoOf(k.dir+"\x00"+k.name) & 63)
+		if _, ok := seen[i]; ok {
+			continue
+		}
+		seen[i] = struct{}{}
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	for _, i := range idx {
+		a.frontendNameLocks[i].Lock()
+	}
+	return func() {
+		for i := len(idx) - 1; i >= 0; i-- {
+			a.frontendNameLocks[idx[i]].Unlock()
+		}
+	}
+}
+
+// Non-frontend operations acquire the mirror before the concrete namespace
+// lock. A frontend callback waiting on nsMu is already represented in the
+// handoff publication gate, so reversing this order would let a control or
+// lifecycle operation hold nsMu while its delegation release waits for that
+// same callback.
+func (a *attach) lockExternalNamespaceRead() func() {
+	a.frontendSerial.RLock()
+	a.nsMu.RLock()
+	return func() {
+		a.nsMu.RUnlock()
+		a.frontendSerial.RUnlock()
+	}
+}
+
+func (a *attach) lockExternalNamespaceWrite() func() {
+	a.frontendSerial.Lock()
+	a.nsMu.Lock()
+	return func() {
+		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
+	}
+}
+
 // nameKey identifies one directory entry for stripe locking.
 type nameKey struct {
 	dir  string
@@ -1872,6 +2489,13 @@ func (a *attach) item(item pfslocal.Item) (*itemRecord, int32) {
 	if rec == nil || rec.item.ItemGeneration != item.ItemGeneration {
 		return nil, darwinENOENT
 	}
+	if current := a.paths[rec.path]; current != rec {
+		// The Item is retained solely for Reclaim, open-handle state, and
+		// late hard-link discovery. Its remembered pathname has been removed
+		// or now names a replacement inode; ordinary Item operations must
+		// never route through that stale name.
+		return nil, darwinENOENT
+	}
 	cp := *rec
 	return &cp, 0
 }
@@ -1888,34 +2512,142 @@ func (a *attach) itemByPath(p string) *itemRecord {
 }
 
 func (a *attach) removePathLocked(p string) {
+	rec := a.paths[p]
+	if rec == nil {
+		return
+	}
+	entry := bindingJournalEntry{Ref: a.ref, Op: "unbind", Path: p}
 	if a.dropPathLocked(p) {
-		a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{Ref: a.ref, Op: "unbind", Path: p})
+		if current := a.items[rec.item.ItemID]; current != nil &&
+			current.item.ItemGeneration == rec.item.ItemGeneration &&
+			len(a.itemAliases[rec.item.ItemID]) == 0 {
+			// The last known name is gone, but the frontend Item lifetime is
+			// not. Journal the detached identity explicitly so a daemon
+			// restart cannot split an unseen peer hard link from the FSKit
+			// vnode that already represents it.
+			entry = a.bindingEntryLocked("detach", rec)
+			entry.Path = p
+		}
+		a.pendingBindings = append(a.pendingBindings, entry)
 	}
 }
 
 func (a *attach) dropPathLocked(p string) bool {
 	if rec := a.paths[p]; rec != nil {
+		// Removing a pathname does not prove that a regular-file inode is no
+		// longer live. A peer may already have created a hard-link alias that
+		// this frontend has never observed, and FSKit may still hold the
+		// published Item or an open handle. Keep that Item↔authority identity
+		// detached until explicit Reclaim; a later alias lookup can then reuse
+		// it instead of publishing a second frontend object.
+		retainIdentity := rec.attr.Kind != "directory"
 		delete(a.paths, p)
+		a.dropItemAliasLocked(rec.item.ItemID, p)
+		a.frontendPathEpoch.Add(1)
 		if a.items[rec.item.ItemID] == rec {
-			delete(a.items, rec.item.ItemID)
-			for _, alias := range a.paths {
-				if alias.item == rec.item {
-					a.items[rec.item.ItemID] = alias
-					break
+			var canonical *itemRecord
+			for aliasPath := range a.itemAliases[rec.item.ItemID] {
+				alias := a.paths[aliasPath]
+				if alias == nil || alias.item != rec.item || alias.state != rec.state {
+					continue
+				}
+				if canonical == nil || alias.path < canonical.path {
+					canonical = alias
 				}
 			}
+			if canonical != nil {
+				a.items[rec.item.ItemID] = canonical
+			} else if !retainIdentity {
+				delete(a.items, rec.item.ItemID)
+			}
+		}
+		if !retainIdentity {
+			a.dropAuthorityIdentityIfUnusedLocked(rec.item, rec.state)
+		}
+		if len(a.itemAliases[rec.item.ItemID]) == 0 {
+			delete(a.awaitingAuthorityItems, rec.item.ItemID)
 		}
 		return true
 	}
 	return false
 }
 
+// forgetPathLocked permanently drops a path identity. It is intentionally not
+// used by journal replay: FSKit may remain mounted across a daemon restart, so
+// only an explicit Reclaim may retire a detached frontend Item generation.
+func (a *attach) forgetPathLocked(p string) bool {
+	rec := a.paths[p]
+	if rec == nil {
+		return false
+	}
+	delete(a.paths, p)
+	a.dropItemAliasLocked(rec.item.ItemID, p)
+	a.frontendPathEpoch.Add(1)
+	if a.items[rec.item.ItemID] == rec {
+		delete(a.items, rec.item.ItemID)
+		var canonical *itemRecord
+		for aliasPath := range a.itemAliases[rec.item.ItemID] {
+			alias := a.paths[aliasPath]
+			if alias == nil || alias.item != rec.item || alias.state != rec.state {
+				continue
+			}
+			if canonical == nil || alias.path < canonical.path {
+				canonical = alias
+			}
+		}
+		if canonical != nil {
+			a.items[rec.item.ItemID] = canonical
+		}
+	}
+	a.dropAuthorityIdentityIfUnusedLocked(rec.item, rec.state)
+	if len(a.itemAliases[rec.item.ItemID]) == 0 {
+		delete(a.awaitingAuthorityItems, rec.item.ItemID)
+	}
+	return true
+}
+
+// reclaimItemLocked is the sole lifetime boundary for a published non-root
+// frontend Item. It removes every alias and the retained authority index for
+// exactly one Item generation without touching a replacement that happens to
+// reuse one of its old names. Caller holds a.mu.
+func (a *attach) reclaimItemLocked(item pfslocal.Item) bool {
+	rec := a.items[item.ItemID]
+	if rec == nil || rec.item.ItemGeneration != item.ItemGeneration || rec.path == "" {
+		return false
+	}
+	changed := false
+	for p, alias := range a.paths {
+		if alias.item != item {
+			continue
+		}
+		delete(a.paths, p)
+		a.dropItemAliasLocked(item.ItemID, p)
+		changed = true
+	}
+	if changed {
+		a.frontendPathEpoch.Add(1)
+	}
+	current := a.items[item.ItemID]
+	if current == nil || current.item.ItemGeneration != item.ItemGeneration {
+		return changed
+	}
+	a.dropAuthorityIdentityIfUnusedLocked(current.item, current.state)
+	delete(a.items, item.ItemID)
+	delete(a.awaitingAuthorityItems, item.ItemID)
+	delete(a.itemAliases, item.ItemID)
+	return true
+}
+
 func (a *attach) renamePathLocked(oldp, newp string) {
+	changed := false
 	for p, rec := range a.paths {
 		if np, ok := renamedPath(p, oldp, newp); ok {
 			delete(a.paths, p)
+			a.dropItemAliasLocked(rec.item.ItemID, p)
 			rec.path = np
 			a.paths[rec.path] = rec
+			a.addItemAliasLocked(rec)
+			changed = true
 		}
 	}
 	for id, h := range a.handles {
@@ -1923,7 +2655,11 @@ func (a *attach) renamePathLocked(oldp, newp string) {
 			cp := *h
 			cp.path = np
 			a.handles[id] = &cp
+			changed = true
 		}
+	}
+	if changed {
+		a.frontendPathEpoch.Add(1)
 	}
 	// A volume rename that moves an ancestor of a graft root carries the graft
 	// (and its machine-local backing) to the new location, mirroring how a
@@ -1933,6 +2669,29 @@ func (a *attach) renamePathLocked(oldp, newp string) {
 	a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{Ref: a.ref, Op: "rekey", From: oldp, To: newp})
 }
 
+func (a *attach) addItemAliasLocked(rec *itemRecord) {
+	if rec == nil || rec.item.ItemID == 0 {
+		return
+	}
+	if a.itemAliases == nil {
+		a.itemAliases = map[uint64]map[string]struct{}{}
+	}
+	paths := a.itemAliases[rec.item.ItemID]
+	if paths == nil {
+		paths = map[string]struct{}{}
+		a.itemAliases[rec.item.ItemID] = paths
+	}
+	paths[rec.path] = struct{}{}
+}
+
+func (a *attach) dropItemAliasLocked(itemID uint64, path string) {
+	paths := a.itemAliases[itemID]
+	delete(paths, path)
+	if len(paths) == 0 {
+		delete(a.itemAliases, itemID)
+	}
+}
+
 func renamedPath(p, oldp, newp string) (string, bool) {
 	if p != oldp && !strings.HasPrefix(p, oldp+"/") {
 		return "", false
@@ -1940,23 +2699,27 @@ func renamedPath(p, oldp, newp string) (string, bool) {
 	return newp + strings.TrimPrefix(p, oldp), true
 }
 
-func (a *attach) newHandleLocked(path string, state *clientcore.NodeState, write bool) uint64 {
+func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.NodeState, write bool) uint64 {
 	a.nextHandle++
 	if a.nextHandle == 0 {
 		a.nextHandle++
 	}
 	id := a.nextHandle
-	a.handles[id] = &handleRecord{id: id, path: path, openPath: path, state: state, write: write}
+	a.handles[id] = &handleRecord{
+		id: id, itemID: itemID, path: path, openPath: path, state: state, write: write,
+	}
 	return id
 }
 
-func (a *attach) newLocalHandleLocked(path string, file *os.File, write bool) uint64 {
+func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File, write bool) uint64 {
 	a.nextHandle++
 	if a.nextHandle == 0 {
 		a.nextHandle++
 	}
 	id := a.nextHandle
-	a.handles[id] = &handleRecord{id: id, path: path, openPath: path, write: write, file: file}
+	a.handles[id] = &handleRecord{
+		id: id, itemID: itemID, path: path, openPath: path, write: write, file: file,
+	}
 	return id
 }
 
@@ -2118,6 +2881,7 @@ func (a *attach) onFlushAll(p string) {
 
 func (a *attach) onMarkOrphan(p string, ino uint64) {
 	a.mu.Lock()
+	states := make(map[*clientcore.NodeState]struct{})
 	if rec := a.paths[p]; rec != nil {
 		// Match the authority identity, never just the path. Invalidation
 		// delivery can trail remove+recreate: a locally-born replacement has
@@ -2125,8 +2889,25 @@ func (a *attach) onMarkOrphan(p string, ino uint64) {
 		// to the retired inode. Delegation release records the proven
 		// authority inode before a peer can unlink an open local create.
 		if rec.state.MatchesAuthorityIno(ino) {
-			rec.state.MarkOrphan(ino, a.vol.OpenOrphans())
+			states[rec.state] = struct{}{}
 		}
+	}
+	// A replacement lookup may already have reincarnated p while an old
+	// handle still owns the removed inode's NodeState. Route every matching
+	// live authority handle to orphan I/O; path lookup alone would miss that
+	// exact open-after-rename window and redirect the handle to the new inode.
+	for _, handle := range a.handles {
+		if handle.file == nil && handle.state != nil &&
+			handle.state.MatchesAuthorityIno(ino) {
+			states[handle.state] = struct{}{}
+		}
+	}
+	var orphans *clientcore.InodeSet
+	if a.vol != nil {
+		orphans = a.vol.OpenOrphans()
+	}
+	for state := range states {
+		state.MarkOrphan(ino, orphans)
 	}
 	a.mu.Unlock()
 }
@@ -2152,6 +2933,13 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 			a.eventOnce.Do(func() { close(a.eventReady) })
 		}
 		for batch := range stream {
+			// true means a RelatedInos claim requires an exact refresh of
+			// that authority inode. A false entry is an ordinary path-local
+			// refresh for which namespace replacement may make the old sample
+			// obsolete without a content claim.
+			refreshItems := make(map[uint64]bool)
+			invalidatedItems := make(map[uint64]struct{})
+			refreshAll := false
 			for _, inv := range batch.Invs {
 				// The authority only knows the daemon's fsproto owner, not which local frontend
 				// connection originated an op. Daemon-origin mutations are therefore fanned out
@@ -2162,6 +2950,7 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 				}
 				if inv.FlushAll {
 					a.publish(pfslocal.Event{Kind: &pfslocal.AttachState{State: a.statusState(), Detail: "cache flush"}})
+					refreshAll = true
 					continue
 				}
 				if inv.Path == "" {
@@ -2173,18 +2962,103 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 				shadowed := a.localDirForLocked(inv.Path) != ""
 				if !shadowed {
 					a.publishAuthorityInvalidationLocked(inv.Path, inv.InPlace, inv.Version)
+					if inv.InPlace {
+						if rec := a.paths[inv.Path]; rec != nil {
+							requireIdentity := regularFileIdentityRequired(rec.attr.Kind)
+							if current, exists := refreshItems[rec.item.ItemID]; !exists ||
+								(requireIdentity && !current) {
+								// A path-local regular-file write still
+								// carries an exact identity claim. A
+								// rename-over can otherwise replace this
+								// name before sampling and let the old live
+								// vnode falsely settle on the new inode.
+								refreshItems[rec.item.ItemID] = requireIdentity
+							}
+						}
+					}
+				}
+				for _, authorityIno := range inv.RelatedInos {
+					identity, known := a.authorityItems[authorityIno]
+					if !known || identity.item.ItemID == 0 {
+						continue
+					}
+					itemID := identity.item.ItemID
+					if a.itemOwnedByGraftLocked(itemID) {
+						// Authority invalidations never own machine-local
+						// graft state, including a detached graft Item whose
+						// remembered path remains under the graft root.
+						continue
+					}
+					var chosen *itemRecord
+					for alias := range a.itemAliases[itemID] {
+						// A namespace event says this particular name may now
+						// bind another inode. Refresh a surviving alias of the
+						// related inode, never the replaced name itself.
+						if !inv.InPlace && alias == inv.Path {
+							continue
+						}
+						candidate := a.paths[alias]
+						if candidate == nil || candidate.state == nil ||
+							!candidate.state.MatchesAuthorityIno(authorityIno) ||
+							a.localDirForLocked(alias) != "" {
+							continue
+						}
+						if chosen == nil || candidate.path < chosen.path {
+							chosen = candidate
+						}
+					}
+					if chosen == nil {
+						// The inode is retained and therefore may back a live
+						// vnode, but no current pathname proves where to
+						// refresh it. Keep the barrier closed unless a lookup
+						// discovers and promotes the unseen alias while the
+						// bounded exact refresh is waiting.
+						refreshItems[itemID] = true
+						continue
+					}
+					// Keep future exact samples on a still-valid alias when
+					// the previous canonical name was replaced.
+					a.items[itemID] = chosen
+					if _, already := invalidatedItems[itemID]; !already {
+						a.publishContentInvalidationLocked(chosen.path, inv.Version, 0)
+						invalidatedItems[itemID] = struct{}{}
+					}
+					refreshItems[itemID] = true
 				}
 				a.mu.Unlock()
-				if !shadowed && inv.InPlace {
-					// A remote writer changed bytes behind a possibly-live
-					// kernel vnode: refresh its size and drop its pages.
-					a.scheduleCoherenceRefresh(inv.Path)
+			}
+			if refreshAll {
+				a.mu.RLock()
+				for itemID, rec := range a.items {
+					if rec != nil && !a.itemOwnedByGraftLocked(itemID) {
+						requireIdentity := regularFileIdentityRequired(rec.attr.Kind)
+						if current, exists := refreshItems[itemID]; !exists ||
+							(requireIdentity && !current) {
+							// FlushAll may be the overflow representation of
+							// lost RelatedInos/name history. Every retained
+							// regular-file Item (plus legacy records whose
+							// kind is not persisted) therefore carries an
+							// exact identity claim; a detached stale name
+							// cannot settle the barrier. Nonregular samples
+							// are independently proved safe by the sampler.
+							refreshItems[itemID] = requireIdentity
+						}
+					}
+				}
+				a.mu.RUnlock()
+			}
+			// The authority's durability/coherence barriers wait for this
+			// acknowledgement. Do not advance it until every possibly-live
+			// macOS vnode has adopted the new size and discarded stale pages.
+			// Any refresh failure fail-freezes the attach and keeps the
+			// barrier closed rather than reporting unproven visibility.
+			for itemID, requireAuthorityIdentity := range refreshItems {
+				err := a.exactKernelRefreshMode(ctx, itemID, requireAuthorityIdentity)
+				if err != nil {
+					a.failCoherence(err)
+					return
 				}
 			}
-			// Acknowledge after daemon caches are updated and the batch is
-			// offered to the local frontend stream. This is the strongest
-			// boundary portablefsd can report; macOS 26 FSKit exposes no
-			// kernel-cache invalidation hook.
 			if ack != nil && (batch.Pos != 0 || batch.Bootstrap) {
 				ack(batch.Pos)
 			}
@@ -2196,6 +3070,22 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 		}
 		stream = nil
 	}
+}
+
+func regularFileIdentityRequired(kind string) bool {
+	// Pre-kind-persistence records restore with an empty Kind. Conservatively
+	// treat them as regular files; exact sampling can prove a directory or
+	// symlink safe without touching the regular-file page cache.
+	return kind == "" || kind == "file"
+}
+
+// itemOwnedByGraftLocked reports whether this frontend identity belongs to a
+// machine-local graft. Graft mutations and control operations own their exact
+// kernel refreshes; authority FlushAll/RelatedInos batches must not refresh or
+// fail-freeze on either live or detached graft Items.
+func (a *attach) itemOwnedByGraftLocked(itemID uint64) bool {
+	rec := a.items[itemID]
+	return rec != nil && rec.graft
 }
 
 func (a *attach) waitEventsReady(ctx context.Context) bool {

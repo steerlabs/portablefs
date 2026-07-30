@@ -52,6 +52,12 @@ type persistedItemRecord struct {
 	ItemGeneration  uint64 `json:"itemGeneration"`
 	AuthorityIno    bool   `json:"authorityIno,omitempty"`
 	AuthorityItemID uint64 `json:"authorityItemId,omitempty"`
+	Kind            string `json:"kind,omitempty"`
+	Graft           bool   `json:"graft,omitempty"`
+	// Detached records preserve an FSKit Item↔authority identity after its
+	// last locally known name is removed. FSKit stays mounted across a daemon
+	// restart, so only explicit Reclaim—not process lifetime—retires it.
+	Detached bool `json:"detached,omitempty"`
 }
 
 type PersistedAttachIdentity struct {
@@ -199,6 +205,7 @@ func validatePersistedAttach(e *persistedAttachEntry) error {
 func validatePersistedItems(e persistedAttachEntry) error {
 	seenIDAuth := map[uint64]uint64{}
 	seenPath := map[string]struct{}{}
+	seenDetachedID := map[uint64]struct{}{}
 	for i, item := range e.Items {
 		if item.ItemID == 0 {
 			return fmt.Errorf("item %d has no itemId", i)
@@ -216,8 +223,24 @@ func validatePersistedItems(e persistedAttachEntry) error {
 		if cleanPath != item.Path {
 			return fmt.Errorf("item %d path %q is not canonical", i, item.Path)
 		}
-		if _, dup := seenPath[cleanPath]; dup {
-			return fmt.Errorf("item %d duplicates path %q", i, cleanPath)
+		if item.Detached {
+			if item.Path == "" {
+				return fmt.Errorf("item %d detaches the root item", i)
+			}
+			if _, dup := seenDetachedID[item.ItemID]; dup {
+				return fmt.Errorf("item %d duplicates detached item id %d", i, item.ItemID)
+			}
+			seenDetachedID[item.ItemID] = struct{}{}
+		} else {
+			if _, dup := seenPath[cleanPath]; dup {
+				return fmt.Errorf("item %d duplicates path %q", i, cleanPath)
+			}
+			seenPath[cleanPath] = struct{}{}
+		}
+		switch item.Kind {
+		case "", "file", "directory", "symlink":
+		default:
+			return fmt.Errorf("item %d has invalid kind %q", i, item.Kind)
 		}
 		authorityItemID := item.authorityItemID()
 		if auth, dup := seenIDAuth[item.ItemID]; dup && auth != authorityItemID {
@@ -232,7 +255,6 @@ func validatePersistedItems(e persistedAttachEntry) error {
 			return fmt.Errorf("item %d authority identity fields are not canonical", i)
 		}
 		seenIDAuth[item.ItemID] = authorityItemID
-		seenPath[cleanPath] = struct{}{}
 	}
 	return nil
 }

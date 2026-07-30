@@ -8,8 +8,10 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var closeRequests: Int
         public var activeHandles: Int
         public var enumerateRequests: Int
+        public var getAttrRequests: Int
         public var maxReadLength: UInt32
         public var maxWriteLength: Int
+        public var publicationAcks: Int
     }
 
     public struct Configuration: Sendable {
@@ -394,8 +396,10 @@ private actor MockFileSystem {
     private var openRequests = 0
     private var closeRequests = 0
     private var enumerateRequests = 0
+    private var getAttrRequests = 0
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
+    private var publicationAcks = 0
 
     init(configuration: PfsLocalMockDaemon.Configuration) {
         self.configuration = configuration
@@ -413,8 +417,10 @@ private actor MockFileSystem {
             closeRequests: closeRequests,
             activeHandles: handles.count,
             enumerateRequests: enumerateRequests,
+            getAttrRequests: getAttrRequests,
             maxReadLength: maxReadLength,
-            maxWriteLength: maxWriteLength
+            maxWriteLength: maxWriteLength,
+            publicationAcks: publicationAcks
         )
     }
 
@@ -422,8 +428,10 @@ private actor MockFileSystem {
         openRequests = 0
         closeRequests = 0
         enumerateRequests = 0
+        getAttrRequests = 0
         maxReadLength = 0
         maxWriteLength = 0
+        publicationAcks = 0
     }
 
     func handle(_ envelope: PfsEnvelope, session: MockSession) async -> PfsEnvelope {
@@ -432,6 +440,15 @@ private actor MockFileSystem {
         do {
             guard let body = envelope.body else {
                 throw MockPOSIXError(errno: EINVAL, message: "missing body")
+            }
+            switch body {
+            case .lookup(_), .enumerate(_), .getAttr(_), .setAttr(_),
+                 .read(_), .write(_), .create(_), .mkdir(_), .remove(_),
+                 .rename(_), .symlink(_), .readlink(_), .hardLink(_),
+                 .xattrGet(_), .xattrSet(_), .xattrList(_), .xattrRemove(_):
+                reply.publicationAckRequired = true
+            default:
+                reply.publicationAckRequired = false
             }
             switch body {
             case let .hello(request):
@@ -509,6 +526,7 @@ private actor MockFileSystem {
                 response.dirVersion = directory.contentVersion
                 reply.body = .enumerateReply(response)
             case let .getAttr(request):
+                getAttrRequests += 1
                 var response = PfsGetAttrReply()
                 response.attr = attr(for: try node(for: request.item))
                 reply.body = .getAttrReply(response)
@@ -603,6 +621,12 @@ private actor MockFileSystem {
                 let replacedID = toDirectory.children[request.toName]
                 if request.noReplace && replacedID != nil && replacedID != childID {
                     throw MockPOSIXError(errno: EEXIST, message: "exists")
+                }
+                if replacedID == childID {
+                    // POSIX specifies a no-op when both names are hard links
+                    // to the same inode: neither directory entry is removed.
+                    reply.body = .renameReply(PfsRenameReply())
+                    break
                 }
                 fromDirectory.children.removeValue(forKey: request.fromName)
                 if let replacedID, replacedID != childID, let replaced = nodes[replacedID] {
@@ -699,6 +723,11 @@ private actor MockFileSystem {
             case .subscribeEvents:
                 session.setSubscribed()
                 reply.body = .subscribeEventsReply(PfsSubscribeEventsReply())
+            case .publicationAck:
+                // One-way publication completion; requestID zero keeps the
+                // empty mock envelope outside the request multiplexer.
+                publicationAcks += 1
+                break
             case .helloReply, .resolveReply, .lookupReply, .enumerateReply, .getAttrReply,
                  .setAttrReply, .openReply, .closeReply, .readReply, .writeReply,
                  .createReply, .mkdirReply, .removeReply, .renameReply, .symlinkReply,

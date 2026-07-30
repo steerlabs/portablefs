@@ -34,12 +34,9 @@ func (c *AttrCache) capLocked() {
 	if len(c.m) <= MaxAttrEntries {
 		return
 	}
-	low := MaxAttrEntries - MaxAttrEntries/4
 	for k := range c.m {
 		delete(c.m, k)
-		if len(c.m) <= low {
-			break
-		}
+		break
 	}
 }
 

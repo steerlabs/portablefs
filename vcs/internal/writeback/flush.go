@@ -63,9 +63,15 @@ type flusher struct {
 	perScope      map[string]int
 	applied       uint64
 	appliedDigest [32]byte
-	oldestAt      time.Time
-	urgent        bool
-	waiters       []*drainWaiter
+	// attemptEnd pins the exact batch prefix across ambiguous transport
+	// failures. New admissions may extend pending while an attempt is in
+	// flight, but retries MUST resend byte-for-byte the same digest range
+	// until its authority outcome is definite. Otherwise a late smaller
+	// request and a newer superset can reach the authority out of order.
+	attemptEnd uint64
+	oldestAt   time.Time
+	urgent     bool
+	waiters    []*drainWaiter
 
 	backoff     time.Duration
 	nextAttempt time.Time
@@ -271,10 +277,23 @@ func (f *flusher) sendBatch() {
 		return
 	}
 	n := 0
-	var bytes int64
-	for n < len(f.pending) && n < flushMaxRecords && bytes < flushMaxBytes {
-		bytes += int64(f.pending[n].length)
-		n++
+	if f.attemptEnd != 0 {
+		for n < len(f.pending) && f.pending[n].seq <= f.attemptEnd {
+			n++
+		}
+		if n == 0 || f.pending[n-1].seq != f.attemptEnd {
+			err := fmt.Errorf("%w: pinned flush batch ending at %d is absent from pending stream", ErrConflict, f.attemptEnd)
+			f.mu.Unlock()
+			f.park(err)
+			return
+		}
+	} else {
+		var bytes int64
+		for n < len(f.pending) && n < flushMaxRecords && bytes < flushMaxBytes {
+			bytes += int64(f.pending[n].length)
+			n++
+		}
+		f.attemptEnd = f.pending[n-1].seq
 	}
 	batch := append([]pendingRec(nil), f.pending[:n]...)
 	prevDigest := f.appliedDigest
@@ -369,6 +388,9 @@ func (f *flusher) sendBatch() {
 // records the durable APPLIED checkpoint.
 func (f *flusher) advance(through uint64) {
 	f.mu.Lock()
+	if f.attemptEnd != 0 && through >= f.attemptEnd {
+		f.attemptEnd = 0
+	}
 	if through > f.applied {
 		f.applied = through
 		f.lastProgress = time.Now()

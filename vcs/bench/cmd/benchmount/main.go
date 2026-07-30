@@ -32,6 +32,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/fusefrontend"
 	"github.com/steerlabs/portablefs/vcs/internal/modebits"
 )
 
@@ -93,6 +94,10 @@ type benchNode struct {
 	v     *clientcore.Volume
 	path  string // creation-time path; curPath follows renames via the live tree
 	state *clientcore.NodeState
+	// Held through ReadResult.Done so the handoff cache purge cannot be
+	// followed by an older content reply. Admission is subtree-scoped;
+	// metadata replies are zero-TTL.
+	replyGate *fusefrontend.ReplyGate
 }
 
 // benchHandle records the open-time path (release must decrement the same key
@@ -136,7 +141,7 @@ func (n *benchNode) newChild(ctx context.Context, name string, a *fsproto.Attr) 
 	if ino == 0 {
 		ino = clientcore.InoOf(cp)
 	}
-	child := &benchNode{v: n.v, path: cp, state: clientcore.NewNodeState(ino, a.Ino != 0)}
+	child := &benchNode{v: n.v, path: cp, state: clientcore.NewNodeState(ino, a.Ino != 0), replyGate: n.replyGate}
 	return n.NewInode(ctx, child, fs.StableAttr{Mode: typeBits(a.Kind), Ino: ino})
 }
 
@@ -182,12 +187,12 @@ func (n *benchNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	cp := n.child(name)
 	a, st := n.v.Lookup(ctx, cp)
 	if st != fsproto.OK {
-		out.SetEntryTimeout(n.v.AttrValidFor(cp))
+		out.SetEntryTimeout(0)
 		return nil, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -198,7 +203,7 @@ func (n *benchNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Att
 		return errno(st)
 	}
 	fillAttr(p, &a, &out.Attr)
-	out.SetTimeout(n.v.AttrValidFor(p))
+	out.SetTimeout(0)
 	return 0
 }
 
@@ -228,11 +233,17 @@ func (n *benchNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 }
 
 func (n *benchNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	data, st := n.v.Read(ctx, n.curPath(), n.state, off, len(dest))
+	p := n.curPath()
+	admission, err := n.replyGate.BeginRead(ctx, p)
+	if err != nil {
+		return nil, syscall.EINTR
+	}
+	data, st := n.v.Read(ctx, p, n.state, off, len(dest))
 	if st != fsproto.OK {
+		admission.Abort()
 		return nil, errno(st)
 	}
-	return fuse.ReadResultData(data), 0
+	return admission.Wrap(fuse.ReadResultData(data)), 0
 }
 
 func (n *benchNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
@@ -262,8 +273,8 @@ func (n *benchNode) Create(ctx context.Context, name string, flags, mode uint32,
 		return nil, nil, 0, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	ch := n.newChild(ctx, name, &a)
 	if cn, ok := ch.Operations().(*benchNode); ok {
 		// Count the just-opened handle so a peer unlink parks the inode
@@ -285,8 +296,8 @@ func (n *benchNode) Mkdir(ctx context.Context, name string, mode uint32, out *fu
 		return nil, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -314,8 +325,8 @@ func (n *benchNode) Symlink(ctx context.Context, target, name string, out *fuse.
 		return nil, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -331,8 +342,8 @@ func (n *benchNode) Link(ctx context.Context, target fs.InodeEmbedder, name stri
 		return nil, errno(st)
 	}
 	fillAttr(newp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(newp))
-	out.SetAttrTimeout(n.v.AttrValidFor(newp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -374,7 +385,7 @@ func (n *benchNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetA
 	if a.Kind != "" {
 		fillAttr(p, &a, &out.Attr)
 	}
-	out.SetTimeout(n.v.AttrValidFor(p))
+	out.SetTimeout(0)
 	return 0
 }
 
@@ -501,10 +512,19 @@ func invalidatePath(root *fs.Inode, path string, inPlace bool) {
 // Content-only: entry timeouts are 0, so existence coherence comes from
 // lookup revalidation, and dentry drops would break in-use CWDs.
 func flushAll(n *fs.Inode) {
-	for _, child := range n.Children() {
-		_ = child.NotifyContent(0, 0)
-		flushAll(child)
+	_ = flushAllExact(n)
+}
+
+func flushAllExact(n *fs.Inode) error {
+	if errno := n.NotifyContent(0, 0); errno != 0 {
+		return errno
 	}
+	for _, child := range n.Children() {
+		if err := flushAllExact(child); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -533,6 +553,7 @@ func main() {
 		mu   sync.Mutex
 		node *benchNode
 	}
+	var frontendReplies fusefrontend.ReplyGate
 	rootInode := func() *fs.Inode {
 		rootHolder.mu.Lock()
 		defer rootHolder.mu.Unlock()
@@ -541,27 +562,44 @@ func main() {
 		}
 		return rootHolder.node.EmbeddedInode()
 	}
+	flushFrontend := func(path string) {
+		root := rootInode()
+		if root == nil {
+			return
+		}
+		if path == "" {
+			flushAll(root)
+			return
+		}
+		if in := walkInode(root, path); in != nil {
+			flushAll(in)
+		}
+	}
+	flushFrontendExact := func(path string) error {
+		root := rootInode()
+		if root == nil {
+			return nil
+		}
+		if path == "" {
+			return flushAllExact(root)
+		}
+		if in := walkInode(root, path); in != nil {
+			return flushAllExact(in)
+		}
+		return nil
+	}
 	vol, err := clientcore.Dial(context.Background(), clientcore.Options{
-		Addr:          *addr,
-		Pool:          *pool,
-		Owner:         "benchmount-" + randomID(),
-		WALDir:        walDir,
-		NegativeCache: *negCache,
-		NoReaddirPlus: *noRDP,
-		SessionTTL:    time.Duration(*sessionTTLMs) * time.Millisecond,
-		OnFlushAll: func(path string) {
-			root := rootInode()
-			if root == nil {
-				return
-			}
-			if path == "" {
-				flushAll(root)
-				return
-			}
-			if in := walkInode(root, path); in != nil {
-				flushAll(in)
-			}
-		},
+		Addr:           *addr,
+		Pool:           *pool,
+		Owner:          "benchmount-" + randomID(),
+		WALDir:         walDir,
+		NegativeCache:  *negCache,
+		NoReaddirPlus:  *noRDP,
+		SessionTTL:     time.Duration(*sessionTTLMs) * time.Millisecond,
+		OnFlushAll:     flushFrontend,
+		OnHandoffStart: frontendReplies.BeginHandoff,
+		OnHandoffEnd:   frontendReplies.EndHandoff,
+		OnHandoffFlush: flushFrontendExact,
 		OnInvalidate: func(path string, inPlace bool) {
 			if root := rootInode(); root != nil {
 				invalidatePath(root, path, inPlace)
@@ -601,7 +639,7 @@ func main() {
 			EnableLocks:   true,
 		},
 	}
-	root := &benchNode{v: vol, state: clientcore.NewNodeState(1, true)}
+	root := &benchNode{v: vol, state: clientcore.NewNodeState(1, true), replyGate: &frontendReplies}
 	rootHolder.mu.Lock()
 	rootHolder.node = root
 	rootHolder.mu.Unlock()

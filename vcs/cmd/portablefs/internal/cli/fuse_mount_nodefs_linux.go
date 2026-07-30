@@ -22,14 +22,31 @@ import (
 
 type startFUSEHelperFunc func(string, []string, *os.ProcAttr) (*os.Process, error)
 
-func mountNodeFS(dir string, root fs.InodeEmbedder, options *fs.Options, mechanism, helperPath string) (*fuse.Server, error) {
+func mountNodeFS(
+	dir string,
+	root fs.InodeEmbedder,
+	options *fs.Options,
+	mechanism, helperPath string,
+	beforeServe func(),
+) (*fuse.Server, error) {
+	rawFS := fs.NewNodeFS(root, options)
 	if mechanism == "direct" {
-		return fs.Mount(dir, root, options)
+		server, err := fuse.NewServer(rawFS, dir, &options.MountOptions)
+		if err != nil {
+			return nil, err
+		}
+		if beforeServe != nil {
+			beforeServe()
+		}
+		go server.Serve()
+		if err := server.WaitMount(); err != nil {
+			return nil, err
+		}
+		return server, nil
 	}
 	if mechanism != "helper" {
 		return nil, fmt.Errorf("unsupported Linux FUSE mount mechanism %q", mechanism)
 	}
-	rawFS := fs.NewNodeFS(root, options)
 	fd, err := callExactFUSEHelper(helperPath, dir, &options.MountOptions)
 	if err != nil {
 		return nil, err
@@ -39,6 +56,9 @@ func mountNodeFS(dir string, root fs.InodeEmbedder, options *fs.Options, mechani
 	if err != nil {
 		_ = syscall.Close(fd)
 		return nil, err
+	}
+	if beforeServe != nil {
+		beforeServe()
 	}
 	go server.Serve()
 	if err := server.WaitMount(); err != nil {

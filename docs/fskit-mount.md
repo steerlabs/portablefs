@@ -6,9 +6,10 @@ menu-bar app uses. There is deliberately no fallback transport: a Mac that
 cannot serve an FSKit mount fails with install guidance instead of degrading
 to the retired fallback transport. A mounted path gets authority-ordered
 operations, real POSIX modes and symlinks, and the durability contract below.
-On macOS 26, FSKit does not expose a kernel-cache invalidation primitive;
-cross-machine cache visibility is therefore a documented framework boundary,
-not an exact guarantee.
+On macOS 26, PortableFS provides an exact pre-acknowledgment refresh for known
+regular-file data and size. FSKit does not expose a general kernel-cache
+invalidation primitive, so cached namespace bindings and other attributes
+remain a documented framework boundary.
 
 `--strategy auto` (the default) resolves to `fskit` on macOS and `fuse` on
 Linux; an explicit `--strategy fskit` requires darwin, and an explicit
@@ -222,6 +223,15 @@ status and the CLI readiness record report the effective union. Declaring
 `.portablefs` itself (or the declaration file) as a graft is rejected so the
 configuration cannot shadow its own source.
 
+Graft ownership is immutable for the lifetime of an FSKit Item. When the
+effective rule set changes—during revived activation or a live additive
+update—the daemon durably retires every affected active Item and invalidates
+its namespace before a lookup can publish a fresh Item with the new
+authority-versus-local provenance. The durable routing option is committed
+before the live transition, so a failed config persist leaves the old routing
+and identities intact; startup applies any committed transition before the
+frontend serves.
+
 Every graft operation is relative to an open backing-directory capability.
 Safe relative symlinks within a graft work; `readlink` returns the exact stored
 target, while server-side traversal of an absolute link or a relative link that
@@ -298,9 +308,10 @@ whole-file last-writer-wins uploads — precisely the shapes agent workspaces
 hit (tailing a log another machine appends to, two mounts sharing state
 files). A mount that sometimes has those semantics is worse than a mount
 error that says how to get the real one. One transport per platform keeps
-authority ordering uniform without pretending the macOS 26 SDK can evict
-kernel pages: daemon-side invalidations are advisory until FSKit exposes that
-hook. A second framework boundary remains explicit: current FSKit write
+authority ordering uniform. PortableFS explicitly refreshes known
+regular-file data and size, while cached namespace bindings and other
+attributes remain advisory until FSKit exposes general cache control. A
+second framework boundary remains explicit: current FSKit write
 callbacks do not expose `O_APPEND` intent, so cross-machine atomic append
 cannot be inferred without misclassifying legitimate positional writes. See
 [`consistency-model.md`](./consistency-model.md#concurrent-appends).

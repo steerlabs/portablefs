@@ -23,6 +23,11 @@ package portablefsd
 //     faults through the extension to the daemon.
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
@@ -47,82 +52,233 @@ const (
 	truncateNoteTTL = 5 * time.Second
 	// staleSampleRetries bounds how long a refresh waits for the authority
 	// sample to catch up with state the daemon has already seen (see
-	// refreshSample). 40 × refreshCoalesce ≈ 1s, comfortably past a flush.
+	// refreshLocalSample). 40 × refreshCoalesce ≈ 1s, comfortably past a flush.
 	staleSampleRetries = 40
 )
 
-// scheduleCoherenceRefresh coalesces kernel refreshes for a remotely-changed
-// path. The refresh drives syscalls THROUGH the mount, so it runs off the
-// event loop holding no daemon locks (the kernel's upcalls are served by
-// other goroutines). An invalidation arriving while a worker is in flight
-// marks the path dirty and the worker runs ANOTHER full pass: a burst like
-// shell truncate-then-write must never end on a mid-flight size, or the
-// kernel wedges at it until the next remote edit.
-func (a *attach) scheduleCoherenceRefresh(p string) {
-	a.mu.Lock()
-	rec := a.paths[p]
-	if a.detached || rec == nil || rec.attr.Kind == "directory" {
-		// The kernel never resolved this path (nothing cached), or it is a
-		// directory (no content pages, and listings already revalidate).
-		a.mu.Unlock()
-		return
-	}
-	if a.purging == nil {
-		a.purging = map[string]bool{}
-		a.refreshAgain = map[string]bool{}
-	}
-	if a.purging[p] {
-		a.refreshAgain[p] = true
-		a.mu.Unlock()
-		return
-	}
-	a.purging[p] = true
-	mount := a.mountPath
-	a.mu.Unlock()
-	go func() {
-		for {
-			time.Sleep(refreshCoalesce)
-			settled := a.refreshKernelState(mount, p)
-			a.mu.Lock()
-			if a.refreshAgain[p] || !settled {
-				delete(a.refreshAgain, p)
-				a.mu.Unlock()
-				continue // settled state moved during this pass: run again
-			}
-			delete(a.purging, p)
-			a.mu.Unlock()
-			return
-		}
-	}()
-}
+type refreshSampleOutcome uint8
 
-// refreshKernelState pushes the authoritative size into the kernel vnode via
-// a marked no-op truncate, then drops the vnode's cached pages. The size is
-// read RAW from the authority — the daemon-side attr cache races its own
-// invalidation-driven eviction on a separate connection, and a stale size
-// here would wedge the kernel exactly like the bug this fixes.
-// refreshKernelState reports whether the pass left the kernel on the settled
-// authoritative state; false means the worker must run another pass. The
+const (
+	refreshSampleRetry refreshSampleOutcome = iota
+	// refreshSampleTerminal means the sampled name is absent. An ordinary
+	// namespace-local refresh may settle that transition, but an
+	// identity-required refresh must keep the barrier closed: another name
+	// may still expose the exact regular-file inode whose vnode needs its
+	// pages refreshed.
+	refreshSampleTerminal
+	// refreshSampleNonRegular means the sampled name resolved successfully
+	// to the expected identity, but that identity is not a regular file.
+	// Directories and symlinks have no regular-file page cache to truncate or
+	// invalidate, so this is a proved, successful exact-refresh outcome.
+	refreshSampleNonRegular
+	// refreshSampleObsolete means the sampled name resolves to a different
+	// authority inode than the frontend Item being refreshed. Its size must
+	// never be applied to that Item's cached vnode.
+	refreshSampleObsolete
+	refreshSampleReady
+)
+
+type kernelRefreshOutcome uint8
+
+const (
+	kernelRefreshApplied kernelRefreshOutcome = iota
+	// kernelRefreshObsolete means the scheduled name no longer resolves to
+	// the expected regular-file identity. Namespace coherence owns that
+	// transition; retrying the retired binding would be incorrect.
+	kernelRefreshObsolete
+	// kernelRefreshRetry means the expected binding may still be live but a
+	// syscall did not complete. Ordinary convergence retries it, while an
+	// exact delegation handoff fails closed before Checkin.
+	kernelRefreshRetry
+)
+
+// refreshKernelItemStateComposed pushes the current composed size into the
+// kernel vnode via a marked no-op truncate, then drops the vnode's cached
+// pages. It reports whether the pass left the kernel on the settled state;
+// false means the bounded exact transaction must run another pass. The
 // refresh truncate races application writes traveling through the same
 // kernel: a local write can land between the sample and the truncate — its
 // own echo is invalidation-suppressed, so without the post-apply verify the
 // clamp would wedge the kernel on the superseded sample forever. Verifying
-// that the authority version did not move past the applied sample makes the
-// worker converge on the final state instead (each pass re-samples newer
-// state, and versions are monotonic).
-func (a *attach) refreshKernelState(mount, p string) bool {
+// both the composed size and shared-lane authority version makes the caller
+// converge on the final state instead.
+func (a *attach) refreshKernelItemStateComposed(mount string, itemID uint64) bool {
+	return a.refreshKernelItemStateComposedModeContext(
+		context.Background(), mount, itemID, true,
+	)
+}
+
+func (a *attach) refreshKernelItemStateComposedMode(
+	mount string,
+	itemID uint64,
+	requireAuthorityIdentity bool,
+) bool {
+	return a.refreshKernelItemStateComposedModeContext(
+		context.Background(), mount, itemID, requireAuthorityIdentity,
+	)
+}
+
+func (a *attach) refreshKernelItemStateComposedModeContext(
+	ctx context.Context,
+	mount string,
+	itemID uint64,
+	requireAuthorityIdentity bool,
+) bool {
 	vol, eno := a.volOrErr()
 	if eno != 0 {
-		return true
+		return false
 	}
-	rec := a.itemByPath(p)
+	a.mu.RLock()
+	rec := a.items[itemID]
+	if rec != nil {
+		p := rec.path
+		rec = &itemRecord{
+			item: rec.item, path: p, state: rec.state, attr: rec.attr, graft: rec.graft,
+		}
+	}
+	a.mu.RUnlock()
 	if rec == nil {
 		return true
 	}
-	size, version, ok := refreshSample(vol, p)
-	if !ok {
-		return true // unfetchable (gone, or a directory): nothing to converge
+	p := rec.path
+	var authorityIno uint64
+	if rec.state != nil {
+		authorityIno = rec.state.AuthorityIno()
 	}
+	sample := func() (int64, uint64, uint64, refreshSampleOutcome) {
+		if a.localDirFor(p) != "" {
+			return a.refreshGraftSample(rec)
+		}
+		return refreshLocalSampleAuthorityContext(ctx, vol, p, authorityIno)
+	}
+	size, version, generation, outcome := sample()
+	switch outcome {
+	case refreshSampleTerminal:
+		if requireAuthorityIdentity {
+			return false
+		}
+		if a.frontendItemMoved(rec.item, p) {
+			return false
+		}
+		return true // gone or non-file: namespace handling owns convergence
+	case refreshSampleNonRegular:
+		return true
+	case refreshSampleObsolete:
+		// Namespace replacement owns an ordinary stale-name transition, but
+		// a RelatedInos refresh is an explicit claim that this exact inode is
+		// live somewhere. It cannot settle until a matching alias is known.
+		return a.obsoleteRefreshSettled(rec.item, p, requireAuthorityIdentity)
+	case refreshSampleRetry:
+		return false
+	}
+	applyOutcome, _ := a.applyKernelRefresh(mount, p, rec, size)
+	if applyOutcome != kernelRefreshApplied {
+		if applyOutcome == kernelRefreshRetry {
+			return false
+		}
+		if a.frontendItemMoved(rec.item, p) {
+			return false
+		}
+		return true
+	}
+	afterSize, afterVersion, afterGeneration, afterOutcome := sample()
+	switch afterOutcome {
+	case refreshSampleTerminal:
+		if requireAuthorityIdentity {
+			return false
+		}
+		if a.frontendItemMoved(rec.item, p) {
+			return false
+		}
+		return true
+	case refreshSampleNonRegular:
+		return true
+	case refreshSampleObsolete:
+		return a.obsoleteRefreshSettled(rec.item, p, requireAuthorityIdentity)
+	case refreshSampleRetry:
+		// Never declare a raced marked truncate settled when its verification
+		// sample failed transiently. Own-write echoes may be suppressed, so
+		// this worker is the only convergence trigger.
+		return false
+	}
+	if afterSize != size {
+		return false
+	}
+	return refreshSamplesSettled(version, generation, afterVersion, afterGeneration)
+}
+
+func (a *attach) obsoleteRefreshSettled(
+	item pfslocal.Item,
+	sampledPath string,
+	requireAuthorityIdentity bool,
+) bool {
+	return !requireAuthorityIdentity && !a.frontendItemMoved(item, sampledPath)
+}
+
+// refreshGraftSample resolves an exact local-dir Item through the confined
+// backing root. Grafts shadow the authority by definition, so sampling the
+// remote Volume would either false-freeze on ENOENT or, worse, apply the size
+// of a different shadowed inode to this vnode.
+func (a *attach) refreshGraftSample(rec *itemRecord) (int64, uint64, uint64, refreshSampleOutcome) {
+	if rec == nil {
+		return 0, 0, 0, refreshSampleTerminal
+	}
+	a.mu.RLock()
+	current := a.items[rec.item.ItemID]
+	bound := a.paths[rec.path]
+	live := current != nil &&
+		current.item.ItemGeneration == rec.item.ItemGeneration &&
+		bound != nil && bound.item == rec.item
+	a.mu.RUnlock()
+	if !live {
+		return 0, 0, 0, refreshSampleTerminal
+	}
+	attr, eno := a.statLocal(rec.path)
+	if eno != 0 {
+		if eno == darwinENOENT || eno == darwinENOTDIR {
+			return 0, 0, 0, refreshSampleTerminal
+		}
+		return 0, 0, 0, refreshSampleRetry
+	}
+	if attr.Kind != "file" {
+		return 0, 0, 0, refreshSampleNonRegular
+	}
+	a.mu.RLock()
+	current = a.items[rec.item.ItemID]
+	bound = a.paths[rec.path]
+	live = current != nil &&
+		current.item.ItemGeneration == rec.item.ItemGeneration &&
+		bound != nil && bound.item == rec.item
+	a.mu.RUnlock()
+	if !live {
+		return 0, 0, 0, refreshSampleRetry
+	}
+	return attr.Size, 0, 0, refreshSampleReady
+}
+
+func (a *attach) frontendItemMoved(item pfslocal.Item, sampledPath string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	current := a.items[item.ItemID]
+	return current != nil &&
+		current.item.ItemGeneration == item.ItemGeneration &&
+		current.path != sampledPath
+}
+
+func refreshSamplesSettled(version, generation, afterVersion, afterGeneration uint64) bool {
+	if generation == 0 || afterGeneration == 0 {
+		return generation == 0 && afterGeneration == 0
+	}
+	if generation != afterGeneration {
+		return false
+	}
+	if version == 0 || afterVersion == 0 {
+		return version == 0 && afterVersion == 0
+	}
+	return afterVersion <= version
+}
+
+func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64) (kernelRefreshOutcome, error) {
 	a.mu.Lock()
 	if a.expectedTruncates == nil {
 		a.expectedTruncates = map[string]expectedTruncate{}
@@ -131,60 +287,744 @@ func (a *attach) refreshKernelState(mount, p string) bool {
 		itemID: rec.item.ItemID, size: size,
 		deadline: time.Now().Add(truncateNoteTTL),
 	}
+	if current := a.items[rec.item.ItemID]; current != nil &&
+		current.item.ItemGeneration == rec.item.ItemGeneration {
+		current.attr.Size = size
+	}
 	a.expectedTruncates[p] = note
 	a.mu.Unlock()
-	if !refreshKernelFile(mount, p, rec.item.ItemID, size) {
-		// No setattr upcall occurred to consume the note. Remove only the
-		// exact note installed by this pass so a future pass can never lose
-		// its independently-installed marker.
-		a.mu.Lock()
-		if current, exists := a.expectedTruncates[p]; exists && current == note {
-			delete(a.expectedTruncates, p)
-		}
-		a.mu.Unlock()
+	refresh := refreshKernelFile
+	if a.testRefreshKernelFile != nil {
+		refresh = a.testRefreshKernelFile
+	}
+	outcome, err := refresh(mount, p, rec.item.ItemID, size)
+	// ftruncate is synchronous with its FSKit setattr callback. If that
+	// callback did not consume this exact note (for example, the vnode size
+	// already matched and only page invalidation was needed), retire it now;
+	// a later application truncate must never match a stale daemon marker.
+	a.mu.Lock()
+	if current, exists := a.expectedTruncates[p]; exists && current == note {
+		delete(a.expectedTruncates, p)
+	}
+	a.mu.Unlock()
+	if outcome != kernelRefreshApplied {
 		// A failed safe-open means the name disappeared, changed identity,
 		// became a symlink, or is inaccessible. Do not spin on that stale
 		// binding: namespace changes publish their own invalidations and the
 		// next path resolution or content invalidation schedules the current
 		// FSItem. Retrying this obsolete item would be both wasteful and
 		// incorrect for a permanent rename-over.
-		return true
+		return outcome, err
 	}
-	if version == 0 {
-		return true // versionless authority: nothing to verify against
-	}
-	_, after, _, _, st, err := vol.Client().GetattrV(p)
-	return err != nil || st != fsproto.OK || after <= version
+	return kernelRefreshApplied, nil
 }
 
-// refreshSample reads the authoritative size for p, raw. The sample must be
-// at least as new as anything the daemon has already seen for the path (the
-// VersionCache floor: self-writes via noteSelfMutation, remote edits via
-// invalidation Apply). With two machines writing the same file in the same
-// instant, a raw getattr can land BETWEEN the interleaved remote truncate
-// and a local, already-acknowledged write whose own echo is suppressed —
-// clamping the kernel to that mid-race size would wedge it on a state the
-// daemon itself has superseded, with no further event to correct it. A stale
-// sample is re-fetched; if the authority still hasn't caught up, the refresh
-// bails and leaves the kernel untouched (the next invalidation or local
-// write re-runs it) rather than install a size known to be wrong.
-func refreshSample(vol *clientcore.Volume, p string) (size int64, version uint64, ok bool) {
+type frontendOperation struct {
+	attach       *attach
+	paths        []string
+	pathEpoch    uint64
+	gateActive   bool
+	participants int
+	suspended    int
+	completed    bool
+}
+
+type frontendOperationContextKey struct{}
+
+type frontendOperationParticipant struct {
+	op        *frontendOperation
+	suspended bool
+	finished  bool
+}
+
+func (a *attach) initFrontendGateLocked() {
+	if a.frontendGateCond == nil {
+		a.frontendGateCond = sync.NewCond(&a.frontendGateMu)
+	}
+	if a.frontendActive == nil {
+		a.frontendActive = map[*frontendOperation]struct{}{}
+	}
+	if a.frontendHandoffs == nil {
+		a.frontendHandoffs = map[string]int{}
+	}
+}
+
+func scopesOverlap(a, b string) bool {
+	return pathWithinScope(a, b) || pathWithinScope(b, a)
+}
+
+func operationOverlapsScope(paths []string, scope string) bool {
+	for _, path := range paths {
+		if scopesOverlap(path, scope) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *attach) beginFrontendOperation(ctx context.Context, body any) (context.Context, *frontendOperation) {
+	paths, pathEpoch, publishes := a.frontendOperationPaths(body)
+	if !publishes {
+		return ctx, nil
+	}
+	return a.beginFrontendPathsAtEpoch(ctx, paths, pathEpoch)
+}
+
+func (a *attach) beginFrontendPaths(ctx context.Context, paths []string) (context.Context, *frontendOperation) {
+	return a.beginFrontendPathsAtEpoch(ctx, paths, a.frontendPathEpoch.Load())
+}
+
+func (a *attach) beginFrontendPathsAtEpoch(
+	ctx context.Context,
+	paths []string,
+	pathEpoch uint64,
+) (context.Context, *frontendOperation) {
+	op, err := a.beginFrontendPathsAtEpochContext(ctx, paths, pathEpoch)
+	if err != nil {
+		return ctx, nil
+	}
+	participant := &frontendOperationParticipant{op: op}
+	return context.WithValue(ctx, frontendOperationContextKey{}, participant), op
+}
+
+func (a *attach) beginFrontendPathsAtEpochContext(
+	ctx context.Context,
+	paths []string,
+	pathEpoch uint64,
+) (*frontendOperation, error) {
+	op := &frontendOperation{attach: a, paths: paths, pathEpoch: pathEpoch}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	stopWake := context.AfterFunc(ctx, func() {
+		a.frontendGateMu.Lock()
+		a.frontendGateCond.Broadcast()
+		a.frontendGateMu.Unlock()
+	})
+	defer stopWake()
+	for {
+		if err := ctx.Err(); err != nil {
+			a.frontendGateMu.Unlock()
+			return nil, err
+		}
+		blocked := false
+		for scope := range a.frontendHandoffs {
+			if op.pathEpoch != a.frontendPathEpoch.Load() ||
+				operationOverlapsScope(paths, scope) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			break
+		}
+		a.frontendGateCond.Wait()
+	}
+	a.frontendActive[op] = struct{}{}
+	op.gateActive = true
+	op.participants = 1
+	a.frontendGateMu.Unlock()
+	return op, nil
+}
+
+// extendFrontendOperation admits another request belonging to an already
+// active logical FSKit callback. A handoff that is already waiting on this
+// operation must allow its later pages/RPCs through, otherwise the callback
+// can never reach its one publication acknowledgement. A handoff that was
+// disjoint from the operation's original scope still blocks a newly-overlapping
+// extension until ownership is stable.
+func (a *attach) extendFrontendOperation(
+	ctx context.Context,
+	op *frontendOperation,
+	paths []string,
+	pathEpoch uint64,
+) (*frontendOperationParticipant, error) {
+	if op == nil || op.attach != a {
+		return nil, fmt.Errorf("portablefsd: invalid logical frontend operation")
+	}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	stopWake := context.AfterFunc(ctx, func() {
+		a.frontendGateMu.Lock()
+		a.frontendGateCond.Broadcast()
+		a.frontendGateMu.Unlock()
+	})
+	defer stopWake()
+	for {
+		if err := ctx.Err(); err != nil {
+			a.frontendGateMu.Unlock()
+			return nil, err
+		}
+		if op.completed {
+			a.frontendGateMu.Unlock()
+			return nil, net.ErrClosed
+		}
+		blocked := false
+		for scope := range a.frontendHandoffs {
+			currentEpoch := a.frontendPathEpoch.Load()
+			newOverlaps := pathEpoch != currentEpoch ||
+				operationOverlapsScope(paths, scope)
+			alreadyOwned := op.gateActive &&
+				(op.pathEpoch != currentEpoch ||
+					operationOverlapsScope(op.paths, scope))
+			if newOverlaps && !alreadyOwned {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			break
+		}
+		a.frontendGateCond.Wait()
+	}
+	seen := make(map[string]struct{}, len(op.paths)+len(paths))
+	for _, path := range op.paths {
+		seen[path] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		op.paths = append(op.paths, path)
+	}
+	if op.pathEpoch != pathEpoch {
+		// Zero cannot equal a real namespace epoch, so any later handoff
+		// conservatively treats this logical operation as mount-wide.
+		op.pathEpoch = 0
+	}
+	op.participants++
+	a.frontendGateMu.Unlock()
+	return &frontendOperationParticipant{op: op}, nil
+}
+
+func (a *attach) finishFrontendOperation(op *frontendOperation) {
+	if op == nil {
+		return
+	}
+	a.frontendGateMu.Lock()
+	if !op.completed {
+		op.completed = true
+		if op.gateActive {
+			delete(a.frontendActive, op)
+			op.gateActive = false
+		}
+		if a.frontendGateCond != nil {
+			a.frontendGateCond.Broadcast()
+		}
+	}
+	a.frontendGateMu.Unlock()
+}
+
+func (a *attach) finishFrontendParticipant(participant *frontendOperationParticipant) {
+	if participant == nil || participant.op == nil || participant.op.attach != a {
+		return
+	}
+	a.frontendGateMu.Lock()
+	if participant.finished {
+		a.frontendGateMu.Unlock()
+		return
+	}
+	participant.finished = true
+	op := participant.op
+	if participant.suspended {
+		participant.suspended = false
+		if op.suspended > 0 {
+			op.suspended--
+		}
+	}
+	if op.participants > 0 {
+		op.participants--
+	}
+	if !op.completed && op.gateActive &&
+		op.participants > 0 && op.suspended == op.participants {
+		delete(a.frontendActive, op)
+		op.gateActive = false
+	}
+	a.frontendGateCond.Broadcast()
+	a.frontendGateMu.Unlock()
+}
+
+// suspendFrontendOperation moves a request that is about to wait for a
+// delegation release out of the pre-handoff publication set. The operation
+// itself runs only after that release, so its eventual reply belongs to the
+// post-handoff view. Re-entry blocks until the release hook has reopened the
+// overlapping scopes, preventing both self-deadlock and joined-waiter cycles.
+func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
+	participant, ok := ctx.Value(frontendOperationContextKey{}).(*frontendOperationParticipant)
+	if !ok || participant.op == nil || participant.op.attach != a {
+		return nil
+	}
+	op := participant.op
+	a.frontendGateMu.Lock()
+	if !op.completed && !participant.finished && !participant.suspended {
+		participant.suspended = true
+		op.suspended++
+	}
+	if !op.completed && op.gateActive &&
+		op.participants > 0 && op.suspended == op.participants {
+		delete(a.frontendActive, op)
+		op.gateActive = false
+		a.frontendGateCond.Broadcast()
+	}
+	a.frontendGateMu.Unlock()
+	return func() {
+		a.frontendGateMu.Lock()
+		defer a.frontendGateMu.Unlock()
+		stopWake := context.AfterFunc(ctx, func() {
+			a.frontendGateMu.Lock()
+			a.frontendGateCond.Broadcast()
+			a.frontendGateMu.Unlock()
+		})
+		defer stopWake()
+		if participant.finished || !participant.suspended {
+			return
+		}
+		for !op.completed {
+			if ctx.Err() != nil {
+				participant.suspended = false
+				if op.suspended > 0 {
+					op.suspended--
+				}
+				a.frontendGateCond.Broadcast()
+				return
+			}
+			blocked := false
+			for scope := range a.frontendHandoffs {
+				if op.pathEpoch != a.frontendPathEpoch.Load() ||
+					operationOverlapsScope(op.paths, scope) {
+					blocked = true
+					break
+				}
+			}
+			if !blocked {
+				participant.suspended = false
+				if op.suspended > 0 {
+					op.suspended--
+				}
+				if !op.gateActive {
+					a.frontendActive[op] = struct{}{}
+					op.gateActive = true
+				}
+				a.frontendGateCond.Broadcast()
+				return
+			}
+			a.frontendGateCond.Wait()
+		}
+	}
+}
+
+func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
+	var own *frontendOperation
+	if participant, ok := ctx.Value(frontendOperationContextKey{}).(*frontendOperationParticipant); ok &&
+		participant.op != nil && participant.op.attach == a {
+		own = participant.op
+	}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	stopWake := context.AfterFunc(ctx, func() {
+		a.frontendGateMu.Lock()
+		a.frontendGateCond.Broadcast()
+		a.frontendGateMu.Unlock()
+	})
+	defer stopWake()
+	for {
+		if err := ctx.Err(); err != nil {
+			a.frontendGateMu.Unlock()
+			return err
+		}
+		overlap := false
+		for activeScope := range a.frontendHandoffs {
+			if scopesOverlap(activeScope, scope) {
+				overlap = true
+				break
+			}
+		}
+		if !overlap {
+			break
+		}
+		a.frontendGateCond.Wait()
+	}
+	a.frontendHandoffs[scope]++
+	for {
+		if err := ctx.Err(); err != nil {
+			if a.frontendHandoffs[scope] <= 1 {
+				delete(a.frontendHandoffs, scope)
+			} else {
+				a.frontendHandoffs[scope]--
+			}
+			a.frontendGateCond.Broadcast()
+			a.frontendGateMu.Unlock()
+			return err
+		}
+		blocked := false
+		for op := range a.frontendActive {
+			if op != own &&
+				(op.pathEpoch != a.frontendPathEpoch.Load() ||
+					operationOverlapsScope(op.paths, scope)) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			break
+		}
+		a.frontendGateCond.Wait()
+	}
+	a.frontendGateMu.Unlock()
+	return nil
+}
+
+func (a *attach) endFrontendHandoff(scope string) {
+	a.frontendGateMu.Lock()
+	if a.frontendHandoffs[scope] <= 1 {
+		delete(a.frontendHandoffs, scope)
+	} else {
+		a.frontendHandoffs[scope]--
+	}
+	a.frontendGateCond.Broadcast()
+	a.frontendGateMu.Unlock()
+}
+
+func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	pathEpoch := a.frontendPathEpoch.Load()
+	itemPath := func(item pfslocal.Item) (string, bool) {
+		rec := a.items[item.ItemID]
+		if rec == nil || rec.item.ItemGeneration != item.ItemGeneration {
+			return "", false
+		}
+		return rec.path, true
+	}
+	itemPaths := func(item pfslocal.Item) ([]string, bool) {
+		rec := a.items[item.ItemID]
+		if rec == nil || rec.item.ItemGeneration != item.ItemGeneration {
+			return nil, false
+		}
+		aliases := a.itemAliases[item.ItemID]
+		paths := make([]string, 0, len(aliases))
+		for path := range aliases {
+			paths = append(paths, path)
+		}
+		return paths, len(paths) != 0
+	}
+	handlePaths := func(handle uint64) ([]string, bool) {
+		rec := a.handles[handle]
+		if rec == nil {
+			return nil, false
+		}
+		if rec.itemID == 0 {
+			return []string{rec.path}, true
+		}
+		aliases := a.itemAliases[rec.itemID]
+		paths := make([]string, 0, len(aliases))
+		for path := range aliases {
+			paths = append(paths, path)
+		}
+		if len(paths) == 0 {
+			paths = append(paths, rec.path)
+		}
+		return paths, true
+	}
+	child := func(dir pfslocal.Item, name []byte) (string, string, bool) {
+		parent, ok := itemPath(dir)
+		if !ok {
+			return "", "", false
+		}
+		path, eno := cleanChild(parent, name)
+		return parent, path, eno == 0
+	}
+	known := func(paths ...string) ([]string, uint64, bool) {
+		return paths, pathEpoch, true
+	}
+	knownSlice := func(paths []string) ([]string, uint64, bool) {
+		return paths, pathEpoch, true
+	}
+	unknown := func() ([]string, uint64, bool) { return []string{""}, pathEpoch, true }
+	withKnownAliases := func(paths []string, candidates ...string) []string {
+		seen := make(map[string]struct{}, len(paths))
+		for _, path := range paths {
+			seen[path] = struct{}{}
+		}
+		for _, candidate := range candidates {
+			rec := a.paths[candidate]
+			if rec == nil {
+				continue
+			}
+			for alias := range a.itemAliases[rec.item.ItemID] {
+				if _, ok := seen[alias]; ok {
+					continue
+				}
+				seen[alias] = struct{}{}
+				paths = append(paths, alias)
+			}
+		}
+		return paths
+	}
+
+	switch req := body.(type) {
+	case *pfslocal.LookupRequest:
+		_, _, ok := child(req.Dir, req.Name)
+		if !ok {
+			return unknown()
+		}
+		// Lookup may discover that a previously unseen name is a hard-link
+		// alias of an FSItem already live elsewhere. Until the authority reply
+		// identifies that inode, its publication scope is unknowable.
+		return unknown()
+	case *pfslocal.EnumerateRequest:
+		if _, ok := itemPath(req.Dir); !ok {
+			return unknown()
+		}
+		// Readdir-plus can publish attributes for unseen aliases. Treat the
+		// operation as mount-wide only during the rare handoff interval.
+		return unknown()
+	case *pfslocal.GetAttrRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.SetAttrRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.ReadRequest:
+		paths, ok := handlePaths(req.Handle)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.WriteRequest:
+		paths, ok := handlePaths(req.Handle)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.CreateRequest:
+		parent, path, ok := child(req.Dir, req.Name)
+		if !ok {
+			return unknown()
+		}
+		return known(parent, path)
+	case *pfslocal.MkdirRequest:
+		parent, path, ok := child(req.Dir, req.Name)
+		if !ok {
+			return unknown()
+		}
+		return known(parent, path)
+	case *pfslocal.RemoveRequest:
+		parent, path, ok := child(req.Dir, req.Name)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(withKnownAliases([]string{parent, path}, path))
+	case *pfslocal.RenameRequest:
+		fromParent, from, fromOK := child(req.FromDir, req.FromName)
+		toParent, to, toOK := child(req.ToDir, req.ToName)
+		if !fromOK || !toOK {
+			return unknown()
+		}
+		return knownSlice(withKnownAliases(
+			[]string{fromParent, from, toParent, to},
+			from,
+			to,
+		))
+	case *pfslocal.SymlinkRequest:
+		parent, path, ok := child(req.Dir, req.Name)
+		if !ok {
+			return unknown()
+		}
+		return known(parent, path)
+	case *pfslocal.ReadlinkRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.HardLinkRequest:
+		sources, sourceOK := itemPaths(req.Item)
+		parent, path, targetOK := child(req.Dir, req.Name)
+		if !sourceOK || !targetOK {
+			return unknown()
+		}
+		return known(append(sources, parent, path)...)
+	case *pfslocal.XattrGetRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.XattrSetRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.XattrListRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	case *pfslocal.XattrRemoveRequest:
+		paths, ok := itemPaths(req.Item)
+		if !ok {
+			return unknown()
+		}
+		return knownSlice(paths)
+	default:
+		// Open/close/fsync/sync/statfs/reclaim/event operations do not
+		// publish namespace, metadata, xattr, or content cache state.
+		return nil, pathEpoch, false
+	}
+}
+
+func pathWithinScope(p, scope string) bool {
+	return scope == "" || p == scope || strings.HasPrefix(p, scope+"/")
+}
+
+func (a *attach) refreshKernelItemExact(ctx context.Context, itemID uint64) error {
+	return a.refreshKernelItemExactMode(ctx, itemID, true)
+}
+
+func (a *attach) refreshKernelItemExactMode(
+	ctx context.Context,
+	itemID uint64,
+	requireAuthorityIdentity bool,
+) error {
+	// A concurrent application write can advance the composed view between
+	// sample, marked truncate, and verification. Re-run that optimistic
+	// transaction a bounded number of times; this is ordering against a live
+	// writer, not recovery or a fallback. Failure to establish one stable
+	// point fail-freezes the attach at the caller.
+	for attempt := 0; attempt <= staleSampleRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("portablefsd: exact kernel refresh item %d: %w", itemID, err)
+		}
+		if a.refreshKernelItemStateComposedModeContext(
+			ctx, a.mountPath, itemID, requireAuthorityIdentity,
+		) {
+			return nil
+		}
+		if attempt != staleSampleRetries {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("portablefsd: exact kernel refresh item %d: %w", itemID, ctx.Err())
+			case <-time.After(refreshCoalesce):
+			}
+		}
+	}
+	return fmt.Errorf(
+		"portablefsd: exact kernel refresh item %d did not converge after %d ordered attempts",
+		itemID, staleSampleRetries+1,
+	)
+}
+
+func (a *attach) exactKernelRefresh(ctx context.Context, itemID uint64) error {
+	return a.exactKernelRefreshMode(ctx, itemID, true)
+}
+
+func (a *attach) exactKernelRefreshMode(
+	ctx context.Context,
+	itemID uint64,
+	requireAuthorityIdentity bool,
+) error {
+	release, err := a.acquireKernelRefreshGate(ctx, itemID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if a.testExactKernelRefresh != nil {
+		return a.testExactKernelRefresh(ctx, itemID)
+	}
+	return a.refreshKernelItemExactMode(ctx, itemID, requireAuthorityIdentity)
+}
+
+func (a *attach) acquireKernelRefreshGate(
+	ctx context.Context,
+	itemID uint64,
+) (func(), error) {
+	stripe := itemID & 63
+	a.kernelRefreshGateMu.Lock()
+	gate := a.kernelRefreshGates[stripe]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		gate <- struct{}{}
+		a.kernelRefreshGates[stripe] = gate
+	}
+	a.kernelRefreshGateMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf(
+			"portablefsd: exact kernel refresh item %d gate: %w", itemID, ctx.Err(),
+		)
+	case <-gate:
+		return func() { gate <- struct{}{} }, nil
+	}
+}
+
+// refreshLocalSample reads the exact composed size for p. It keeps the
+// version-floor guard on the shared lane and returns immediately for
+// a delegated overlay sample (version zero), whose read permit already fenced
+// the release handoff.
+func refreshLocalSample(vol *clientcore.Volume, p string) (size int64, version uint64, generation uint64, outcome refreshSampleOutcome) {
+	return refreshLocalSampleAuthority(vol, p, 0)
+}
+
+func refreshLocalSampleAuthority(
+	vol *clientcore.Volume,
+	p string,
+	expectedAuthorityIno uint64,
+) (size int64, version uint64, generation uint64, outcome refreshSampleOutcome) {
+	return refreshLocalSampleAuthorityContext(
+		context.Background(), vol, p, expectedAuthorityIno,
+	)
+}
+
+func refreshLocalSampleAuthorityContext(
+	ctx context.Context,
+	vol *clientcore.Volume,
+	p string,
+	expectedAuthorityIno uint64,
+) (size int64, version uint64, generation uint64, outcome refreshSampleOutcome) {
 	for attempt := 0; ; attempt++ {
-		attr, ver, gen, _, st, err := vol.Client().GetattrV(p)
+		if ctx.Err() != nil {
+			return 0, 0, 0, refreshSampleRetry
+		}
+		attr, ver, gen, st := vol.CoherenceSample(ctx, p)
+		if st != fsproto.OK {
+			if st == fsproto.ENOENT || st == fsproto.ENOTDIR {
+				return 0, 0, 0, refreshSampleTerminal
+			}
+			return 0, 0, 0, refreshSampleRetry
+		}
 		// Only regular files have kernel content pages and a size that may
 		// safely be refreshed. In particular, never drive truncate through a
-		// symlink: its target is authority-controlled and may name a host path.
-		if err != nil || st != fsproto.OK || attr.Kind != "file" {
-			return 0, 0, false
+		// symlink: its target may name a host path.
+		if expectedAuthorityIno != 0 && attr.Ino != expectedAuthorityIno {
+			return 0, 0, 0, refreshSampleObsolete
+		}
+		if attr.Kind != "file" {
+			return 0, 0, 0, refreshSampleNonRegular
 		}
 		knownGen, knownVer := vol.VersionCache.GenAndVersion(p)
-		if ver == 0 || gen != knownGen || ver >= knownVer {
-			return attr.Size, ver, true
+		if ver == 0 && gen == 0 {
+			return attr.Size, 0, 0, refreshSampleReady
+		}
+		if gen != 0 && gen == knownGen && ver >= knownVer {
+			return attr.Size, ver, gen, refreshSampleReady
 		}
 		if attempt >= staleSampleRetries {
-			return 0, 0, false
+			return 0, 0, 0, refreshSampleRetry
 		}
-		time.Sleep(refreshCoalesce)
+		select {
+		case <-ctx.Done():
+			return 0, 0, 0, refreshSampleRetry
+		case <-time.After(refreshCoalesce):
+		}
 	}
 }
 

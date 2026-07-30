@@ -51,7 +51,10 @@ func (r *firstReleaseGateRemote) ReleaseDelegation(ctx context.Context, scope, e
 	}
 	select {
 	case <-r.releaseGate:
-		return r.releaseErr
+		if r.releaseErr != nil {
+			return r.releaseErr
+		}
+		return r.fakeAuthority.ReleaseDelegation(ctx, scope, epoch)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -930,6 +933,21 @@ func TestFailedIdleReleaseNeverThawsDelegatedAdmission(t *testing.T) {
 	if !stillDraining || !errors.Is(drainErr, releaseErr) {
 		t.Fatalf("idle failure thawed scope: draining=%v err=%v", stillDraining, drainErr)
 	}
+	// Checkin failed before the authority released the grant. The immutable
+	// release attempt is complete, so readers must immediately re-enter the
+	// retained overlay even though mutations remain fenced until an explicit
+	// release retry succeeds.
+	readCtx, cancelRead := context.WithTimeout(context.Background(), time.Second)
+	defer cancelRead()
+	permit, err := e.BeginRead(readCtx, "d/file")
+	if err != nil {
+		t.Fatalf("begin read after failed Checkin: %v", err)
+	}
+	if _, result := e.Lookup("d/file"); result != LookupHit {
+		permit.Close()
+		t.Fatalf("lookup after failed Checkin = %v, want retained overlay hit", result)
+	}
+	permit.Close()
 	if _, handled, err := e.WriteAt(context.Background(), "d/file", 0, []byte("must-not-admit")); !errors.Is(err, releaseErr) || handled {
 		t.Fatalf("write after locally-final release = handled=%v err=%v, want draining failure", handled, err)
 	}
@@ -1153,6 +1171,93 @@ func TestDuplicateRecallsJoinOneContextAwareAttempt(t *testing.T) {
 	_, _, releases := auth.calls()
 	if releases != 1 {
 		t.Fatalf("duplicate recalls sent %d authority releases, want 1", releases)
+	}
+}
+
+func TestStrictAncestorAdmissionSuspendsFrontendWhileJoiningRelease(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.dirs["d/sub"] = true
+	auth.mu.Unlock()
+	remote := &firstReleaseGateRemote{
+		fakeAuthority:  auth,
+		releaseEntered: make(chan struct{}, 1),
+		releaseGate:    make(chan struct{}),
+	}
+	suspended := make(chan struct{}, 1)
+	resumed := make(chan struct{}, 1)
+	e, err := Open(context.Background(), Config{
+		StateDir:    t.TempDir(),
+		VolumeID:    "vol",
+		Branch:      "main",
+		Remote:      remote,
+		BudgetBytes: 1 << 30,
+		Events: Events{
+			OnReleaseWait: func(context.Context) func() {
+				suspended <- struct{}{}
+				return func() { resumed <- struct{}{} }
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	if _, handled, err := e.Create(
+		context.Background(),
+		"d/seed",
+		0o644,
+		false,
+		false,
+	); err != nil || !handled {
+		t.Fatalf("seed create: handled=%v err=%v", handled, err)
+	}
+	if err := e.DrainAll(context.Background()); err != nil {
+		t.Fatalf("seed drain: %v", err)
+	}
+
+	createOut := make(chan writeOutcome, 1)
+	go func() {
+		_, handled, err := e.Create(
+			context.Background(),
+			"d/sub/child",
+			0o644,
+			false,
+			false,
+		)
+		createOut <- writeOutcome{handled: handled, err: err}
+	}()
+	select {
+	case <-remote.releaseEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("strict-ancestor admission did not start its release")
+	}
+	select {
+	case <-suspended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("strict-ancestor release wait did not suspend the frontend operation")
+	}
+	select {
+	case <-resumed:
+		t.Fatal("frontend operation resumed before the release completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(remote.releaseGate)
+	select {
+	case <-resumed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("frontend operation did not resume after the release completed")
+	}
+	select {
+	case outcome := <-createOut:
+		if outcome.err != nil || !outcome.handled {
+			t.Fatalf("post-release child create: handled=%v err=%v", outcome.handled, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-release child create did not complete")
 	}
 }
 

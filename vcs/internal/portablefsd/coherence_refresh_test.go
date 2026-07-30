@@ -1,9 +1,17 @@
 package portablefsd
 
 import (
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
+	"github.com/steerlabs/portablefs/vcs/internal/coherence"
+	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -74,4 +82,1160 @@ func TestConsumeExpectedTruncate(t *testing.T) {
 	if !a.consumeExpectedTruncate("new-name", request(7, 22)) {
 		t.Fatal("renamed FSItem refresh note not consumed")
 	}
+}
+
+func TestAppliedRefreshCannotLeaveConsumableTruncateMarker(t *testing.T) {
+	a := &attach{
+		items: map[uint64]*itemRecord{},
+	}
+	rec := &itemRecord{
+		item: pfslocal.Item{ItemID: 4, ItemGeneration: 1},
+		path: "same-size",
+		attr: fsproto.Attr{Kind: "file", Size: 8},
+	}
+	a.items[rec.item.ItemID] = rec
+	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+		// Models a vnode whose size already matches: no setattr callback
+		// consumes the marker, but page invalidation succeeds.
+		return kernelRefreshApplied, nil
+	}
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 8); outcome != kernelRefreshApplied || err != nil {
+		t.Fatalf("apply = (%v, %v)", outcome, err)
+	}
+	if a.consumeExpectedTruncate(rec.path, &pfslocal.SetAttrRequest{
+		Item: rec.item,
+		Size: func() *uint64 { value := uint64(8); return &value }(),
+	}) {
+		t.Fatal("later application truncate consumed a retired refresh marker")
+	}
+}
+
+func TestExactRefreshSerializesOneItemTransaction(t *testing.T) {
+	a := &attach{}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	a.testExactKernelRefresh = func(context.Context, uint64) error {
+		if calls.Add(1) == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		return nil
+	}
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- a.exactKernelRefresh(context.Background(), 42) }()
+	<-firstEntered
+	go func() { secondDone <- a.exactKernelRefresh(context.Background(), 42) }()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second item refresh overlapped the first: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQueuedRemoteRefreshSamplesNewDelegatedViewAtExecution(t *testing.T) {
+	authority, server := serveAuthorityServer(t)
+	ctx := context.Background()
+	vol, err := clientcore.Dial(ctx, clientcore.Options{
+		Addr:     authority,
+		Pool:     4,
+		Owner:    "queued-refresh-holder",
+		WALDir:   privateTestDir(t),
+		VolumeID: "queued-refresh-volume",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = vol.Close() })
+	if _, st := vol.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir d: %d", st)
+	}
+
+	blockFlush := make(chan struct{})
+	var unblock sync.Once
+	t.Cleanup(func() { unblock.Do(func() { close(blockFlush) }) })
+	entered := make(chan struct{}, 1)
+	server.SetBeforeFlushBatch(func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-blockFlush
+	})
+	attr, st := vol.Create(ctx, "d/f", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create d/f: %d", st)
+	}
+	node := clientcore.NewNodeState(attr.Ino, attr.Ino != 0)
+	payload := []byte("new-delegated-size")
+	if _, st := vol.Write(ctx, "d/f", node, 0, payload); st != fsproto.OK {
+		t.Fatalf("write d/f: %d", st)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("flush did not enter authority gate")
+	}
+
+	var appliedSize int64 = -1
+	a := &attach{
+		vol: vol,
+		paths: map[string]*itemRecord{
+			"d/f": {
+				item:  pfslocal.Item{ItemID: 7, ItemGeneration: 1},
+				path:  "d/f",
+				state: node,
+				attr:  fsproto.Attr{Kind: "file"},
+			},
+		},
+	}
+	a.items = map[uint64]*itemRecord{7: a.paths["d/f"]}
+	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+		if path != "d/f" || itemID != 7 {
+			t.Fatalf("refresh target = %q item=%d", path, itemID)
+		}
+		appliedSize = size
+		return kernelRefreshApplied, nil
+	}
+	// Model a remote invalidation that was queued before the grant/write but
+	// reaches its worker afterward. The pass must choose the composed view at
+	// execution, not the stale raw authority lane implied by its origin.
+	if settled := a.refreshKernelItemStateComposed("/unused-test-mount", 7); !settled {
+		t.Fatal("composed refresh did not settle")
+	}
+	if appliedSize != int64(len(payload)) {
+		t.Fatalf("queued remote refresh applied size %d, want %d", appliedSize, len(payload))
+	}
+	unblock.Do(func() { close(blockFlush) })
+}
+
+func TestRefreshSamplesFenceAuthorityGenerationChanges(t *testing.T) {
+	if refreshSamplesSettled(9, 101, 1, 202) {
+		t.Fatal("versions from different generation nonces were ordered")
+	}
+	if refreshSamplesSettled(9, 101, 0, 0) {
+		t.Fatal("authority-to-overlay ownership boundary was marked settled")
+	}
+	if refreshSamplesSettled(0, 0, 9, 101) {
+		t.Fatal("overlay-to-authority ownership boundary was marked settled")
+	}
+	if !refreshSamplesSettled(0, 0, 0, 0) {
+		t.Fatal("stable delegated overlay samples did not settle")
+	}
+	if !refreshSamplesSettled(9, 101, 8, 101) {
+		t.Fatal("same-generation non-advancing sample did not settle")
+	}
+	if refreshSamplesSettled(8, 101, 9, 101) {
+		t.Fatal("same-generation advancing sample was marked settled")
+	}
+}
+
+func TestFrontendHandoffBracketsReadReplyPublication(t *testing.T) {
+	a := &attach{}
+	_, read := a.beginFrontendPaths(context.Background(), []string{"d/f"})
+	started := make(chan struct{})
+	go func() {
+		if err := a.startFrontendHandoff(context.Background(), "d"); err != nil {
+			t.Errorf("start handoff: %v", err)
+		}
+		close(started)
+	}()
+	select {
+	case <-started:
+		t.Fatal("handoff crossed an in-flight read reply")
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.finishFrontendOperation(read)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not start after read reply completed")
+	}
+
+	nextRead := make(chan *frontendOperation, 1)
+	go func() {
+		_, op := a.beginFrontendPaths(context.Background(), []string{"d/next"})
+		nextRead <- op
+	}()
+	select {
+	case <-nextRead:
+		t.Fatal("new read reply entered during handoff")
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.endFrontendHandoff("d")
+	select {
+	case op := <-nextRead:
+		a.finishFrontendOperation(op)
+	case <-time.After(time.Second):
+		t.Fatal("new read reply did not resume after handoff")
+	}
+}
+
+func TestFrontendHandoffDoesNotBlockDisjointScope(t *testing.T) {
+	a := &attach{}
+	if err := a.startFrontendHandoff(context.Background(), "left"); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan *frontendOperation, 1)
+	go func() {
+		_, op := a.beginFrontendPaths(context.Background(), []string{"right/file"})
+		entered <- op
+	}()
+	select {
+	case op := <-entered:
+		a.finishFrontendOperation(op)
+	case <-time.After(time.Second):
+		t.Fatal("disjoint frontend operation was blocked by handoff")
+	}
+	a.endFrontendHandoff("left")
+}
+
+func TestFrontendReleaseWaitSuspendsEveryJoinedCaller(t *testing.T) {
+	a := &attach{}
+	ctxA, opA := a.beginFrontendPaths(context.Background(), []string{"d/a"})
+	ctxB, opB := a.beginFrontendPaths(context.Background(), []string{"d/b"})
+	resumeA := a.suspendFrontendOperation(ctxA)
+	resumeB := a.suspendFrontendOperation(ctxB)
+
+	if err := a.startFrontendHandoff(context.Background(), "d"); err != nil {
+		t.Fatal(err)
+	}
+	resumed := make(chan struct{}, 2)
+	go func() {
+		resumeA()
+		resumed <- struct{}{}
+	}()
+	go func() {
+		resumeB()
+		resumed <- struct{}{}
+	}()
+	select {
+	case <-resumed:
+		t.Fatal("release waiter re-entered before handoff ended")
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.endFrontendHandoff("d")
+	for range 2 {
+		select {
+		case <-resumed:
+		case <-time.After(time.Second):
+			t.Fatal("release waiter did not re-enter after handoff")
+		}
+	}
+	a.finishFrontendOperation(opA)
+	a.finishFrontendOperation(opB)
+}
+
+func TestFrontendPathEpochMakesRenameRaceConservative(t *testing.T) {
+	a := &attach{}
+	_, op := a.beginFrontendPaths(context.Background(), []string{"right/file"})
+	// Model a namespace rekey after the operation resolved its scope.
+	a.frontendPathEpoch.Add(1)
+	started := make(chan error, 1)
+	go func() {
+		started <- a.startFrontendHandoff(context.Background(), "left")
+	}()
+	select {
+	case err := <-started:
+		t.Fatalf("handoff crossed stale path snapshot: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.finishFrontendOperation(op)
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not resume after stale-snapshot operation completed")
+	}
+	a.endFrontendHandoff("left")
+}
+
+func TestFrontendItemOperationCoversEveryHardlinkAlias(t *testing.T) {
+	state := clientcore.NewNodeState(7, true)
+	item := pfslocal.Item{ItemID: 7, ItemGeneration: 1}
+	a := &attach{
+		items:       map[uint64]*itemRecord{},
+		paths:       map[string]*itemRecord{},
+		itemAliases: map[uint64]map[string]struct{}{},
+	}
+	first := &itemRecord{item: item, path: "left/a", state: state}
+	second := &itemRecord{item: item, path: "right/b", state: state}
+	a.items[item.ItemID] = first
+	a.paths[first.path] = first
+	a.paths[second.path] = second
+	a.addItemAliasLocked(first)
+	a.addItemAliasLocked(second)
+
+	paths, _, publishes := a.frontendOperationPaths(&pfslocal.GetAttrRequest{Item: item})
+	if !publishes {
+		t.Fatal("getattr was not publication-tracked")
+	}
+	got := map[string]bool{}
+	for _, path := range paths {
+		got[path] = true
+	}
+	if !got[first.path] || !got[second.path] || len(got) != 2 {
+		t.Fatalf("hardlink publication paths = %v", paths)
+	}
+}
+
+func TestFrontendHandoffCancellationReopensAdmission(t *testing.T) {
+	a := &attach{}
+	_, op := a.beginFrontendPaths(context.Background(), []string{"d/f"})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := a.startFrontendHandoff(ctx, "d"); err == nil {
+		t.Fatal("canceled handoff unexpectedly succeeded")
+	}
+	a.finishFrontendOperation(op)
+
+	entered := make(chan *frontendOperation, 1)
+	go func() {
+		_, next := a.beginFrontendPaths(context.Background(), []string{"d/next"})
+		entered <- next
+	}()
+	select {
+	case next := <-entered:
+		a.finishFrontendOperation(next)
+	case <-time.After(time.Second):
+		t.Fatal("canceled handoff left admission closed")
+	}
+}
+
+func TestClosedFrontendConnectionCannotLeakLatePublication(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	a := &attach{}
+	_, inFlight := a.beginFrontendPaths(context.Background(), []string{"d/in-flight"})
+	ready := make(chan struct{})
+	close(ready)
+	conn := &frontendConn{
+		conn: serverSide,
+		operations: map[uint64]*frontendOperationEntry{
+			1: {ready: ready, op: inFlight},
+		},
+		lastOperationID: 1,
+	}
+	conn.close()
+	if _, _, _, _, err := conn.beginLogicalOperation(
+		context.Background(),
+		a,
+		2,
+		&pfslocal.GetAttrRequest{},
+	); err == nil {
+		t.Fatal("closed connection admitted a late logical operation")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.startFrontendHandoff(ctx, "d"); err != nil {
+		t.Fatalf("late publication survived closed connection: %v", err)
+	}
+	a.endFrontendHandoff("d")
+}
+
+func TestLogicalOperationCanIssueNextRPCWhileHandoffWaitsForItsPublication(t *testing.T) {
+	a := &attach{}
+	conn := &frontendConn{}
+	const operationID uint64 = 1
+
+	ctx1, participant1, participates, publishes, err := conn.beginLogicalOperation(
+		context.Background(),
+		a,
+		operationID,
+		&pfslocal.GetAttrRequest{},
+	)
+	if err != nil || !participates || !publishes || participant1 == nil {
+		t.Fatalf("first request admission: participates=%v publishes=%v participant=%v err=%v", participates, publishes, participant1, err)
+	}
+	_ = ctx1
+	a.finishFrontendParticipant(participant1)
+	conn.finishLogicalRequest(operationID)
+
+	handoffDone := make(chan error, 1)
+	go func() {
+		handoffDone <- a.startFrontendHandoff(context.Background(), "")
+	}()
+	select {
+	case err := <-handoffDone:
+		t.Fatalf("handoff crossed unacknowledged first reply: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	_, participant2, participates, publishes, err := conn.beginLogicalOperation(
+		context.Background(),
+		a,
+		operationID,
+		&pfslocal.EnumerateRequest{},
+	)
+	if err != nil || !participates || !publishes || participant2 == nil {
+		t.Fatalf("second request admission: participates=%v publishes=%v participant=%v err=%v", participates, publishes, participant2, err)
+	}
+	select {
+	case err := <-handoffDone:
+		t.Fatalf("handoff crossed the logical operation's second request: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	a.finishFrontendParticipant(participant2)
+	conn.finishLogicalRequest(operationID)
+	if !conn.acknowledgePublication(operationID) {
+		t.Fatal("logical operation acknowledgement was rejected")
+	}
+	select {
+	case err := <-handoffDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not complete after the logical operation acknowledgement")
+	}
+	a.endFrontendHandoff("")
+}
+
+func TestEarlyLogicalOperationAckWaitsForEveryPipelinedRequest(t *testing.T) {
+	a := &attach{}
+	conn := &frontendConn{}
+	const operationID uint64 = 1
+
+	_, first, _, _, err := conn.beginLogicalOperation(
+		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, _, _, err := conn.beginLogicalOperation(
+		context.Background(), a, operationID, &pfslocal.EnumerateRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !conn.acknowledgePublication(operationID) {
+		t.Fatal("early acknowledgement was not recorded")
+	}
+
+	handoffDone := make(chan error, 1)
+	go func() { handoffDone <- a.startFrontendHandoff(context.Background(), "") }()
+	a.finishFrontendParticipant(first)
+	conn.finishLogicalRequest(operationID)
+	select {
+	case err := <-handoffDone:
+		t.Fatalf("handoff crossed the still-executing second request: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.finishFrontendParticipant(second)
+	conn.finishLogicalRequest(operationID)
+	select {
+	case err := <-handoffDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not complete after every pipelined request finished")
+	}
+	a.endFrontendHandoff("")
+
+	if _, _, _, _, err := conn.beginLogicalOperation(
+		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	); err == nil {
+		t.Fatal("acknowledged operation id was reusable")
+	}
+}
+
+func TestAuthorityAckWaitsForExactKernelRefresh(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	item := pfslocal.Item{ItemID: 17, ItemGeneration: 1}
+	rec := &itemRecord{
+		item: item,
+		path: "visible",
+		// Restored bindings intentionally begin with only authority identity;
+		// an empty cached Kind must not let a live vnode escape the barrier.
+		attr: fsproto.Attr{Ino: 91},
+	}
+	a := &attach{
+		paths: map[string]*itemRecord{"visible": rec},
+		items: map[uint64]*itemRecord{item.ItemID: rec},
+	}
+	refreshStarted := make(chan struct{})
+	allowRefresh := make(chan struct{})
+	a.testExactKernelRefresh = func(context.Context, uint64) error {
+		close(refreshStarted)
+		<-allowRefresh
+		return nil
+	}
+	stream := make(chan coherence.Batch, 1)
+	acked := make(chan uint64, 1)
+	done := make(chan struct{})
+	go func() {
+		a.forwardEvents(ctx, nil, stream, func(pos uint64) { acked <- pos })
+		close(done)
+	}()
+	stream <- coherence.Batch{
+		Pos: 7,
+		Invs: []coherence.Invalidation{{
+			Path: "visible", Version: 2, InPlace: true,
+		}},
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("exact kernel refresh did not start")
+	}
+	select {
+	case pos := <-acked:
+		t.Fatalf("authority position %d acknowledged before kernel refresh", pos)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowRefresh)
+	select {
+	case pos := <-acked:
+		if pos != 7 {
+			t.Fatalf("ack position = %d, want 7", pos)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authority position was not acknowledged after exact refresh")
+	}
+	cancel()
+	close(stream)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event forwarder did not stop")
+	}
+}
+
+func TestRelatedAuthorityInodeRefreshesKnownAliasBeforeAck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	item := pfslocal.Item{ItemID: 31, ItemGeneration: 1}
+	state := clientcore.NewNodeState(77, true)
+	rec := &itemRecord{
+		item: item, path: "known-alias", state: state,
+		attr: fsproto.Attr{Kind: "file", Ino: 77},
+	}
+	a := &attach{
+		paths:          map[string]*itemRecord{"known-alias": rec},
+		items:          map[uint64]*itemRecord{item.ItemID: rec},
+		itemAliases:    map[uint64]map[string]struct{}{item.ItemID: {"known-alias": {}}},
+		authorityItems: map[uint64]frontendItemIdentity{77: {item: item, state: state}},
+	}
+	refreshed := make(chan uint64, 1)
+	a.testExactKernelRefresh = func(_ context.Context, itemID uint64) error {
+		refreshed <- itemID
+		return nil
+	}
+	stream := make(chan coherence.Batch, 1)
+	acked := make(chan uint64, 1)
+	done := make(chan struct{})
+	go func() {
+		a.forwardEvents(ctx, nil, stream, func(pos uint64) { acked <- pos })
+		close(done)
+	}()
+	// The peer mutated through a name this mount has never looked up. The
+	// related authority inode is the only bridge to the live local alias.
+	stream <- coherence.Batch{
+		Pos: 11,
+		Invs: []coherence.Invalidation{{
+			Path: "unseen-link", Version: 4, RelatedInos: []uint64{77},
+		}},
+	}
+	select {
+	case itemID := <-refreshed:
+		if itemID != item.ItemID {
+			t.Fatalf("refreshed item = %d, want %d", itemID, item.ItemID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("related known alias was not refreshed")
+	}
+	select {
+	case pos := <-acked:
+		if pos != 11 {
+			t.Fatalf("ack position = %d, want 11", pos)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("related-alias batch was not acknowledged after refresh")
+	}
+	cancel()
+	close(stream)
+	<-done
+}
+
+func TestObsoleteDirectRefreshRetriesMovedCanonicalAlias(t *testing.T) {
+	item := pfslocal.Item{ItemID: 63, ItemGeneration: 1}
+	state := clientcore.NewNodeState(700, true)
+	moved := &itemRecord{
+		item: item, path: "b", state: state,
+		attr: fsproto.Attr{Ino: 700, Kind: "file"},
+	}
+	a := &attach{items: map[uint64]*itemRecord{item.ItemID: moved}}
+	if a.obsoleteRefreshSettled(item, "a", false) {
+		t.Fatal("obsolete sample at old a settled after exact Item moved to b")
+	}
+	if !a.obsoleteRefreshSettled(item, "b", false) {
+		t.Fatal("ordinary obsolete sample at unchanged canonical name did not settle")
+	}
+	if a.obsoleteRefreshSettled(item, "b", true) {
+		t.Fatal("identity-required obsolete sample settled")
+	}
+}
+
+func TestExactKernelRefreshGateHonorsCanceledWaiter(t *testing.T) {
+	a := &attach{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.testExactKernelRefresh = func(_ context.Context, itemID uint64) error {
+		if itemID != 1 {
+			t.Fatalf("unexpected refresh entered gate for item %d", itemID)
+		}
+		close(entered)
+		<-release
+		return nil
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- a.exactKernelRefreshMode(context.Background(), 1, true)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first colliding refresh did not enter")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err := a.exactKernelRefreshMode(ctx, 65, true) // same 64-way stripe as item 1
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled colliding refresh error=%v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("canceled gate waiter returned after %v", elapsed)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+}
+
+func TestRestartRestoredRegularAndSymlinkFlushAll(t *testing.T) {
+	authority := serveAuthority(t)
+	vol, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vol.Close()
+	cli := vol.Client()
+	fileAttr, st, err := cli.Create("regular", 0o644)
+	if err != nil || st != fsproto.OK {
+		t.Fatalf("create regular st=%d err=%v", st, err)
+	}
+	if _, st, err := cli.Write("regular", 0, []byte("data"), 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("write regular st=%d err=%v", st, err)
+	}
+	fileAttr, st, err = cli.Getattr("regular")
+	if err != nil || st != fsproto.OK {
+		t.Fatalf("getattr regular st=%d err=%v", st, err)
+	}
+	linkAttr, st, err := cli.Symlink("regular", "link")
+	if err != nil || st != fsproto.OK {
+		t.Fatalf("symlink st=%d err=%v", st, err)
+	}
+
+	a := newAttach("att_restart_types", "key", ensureAttachRequest{
+		VolumeID: "vol-restart-types", Branch: "main",
+		MountPath: "/Volumes/RestartTypes",
+	}, privateTestDir(t))
+	a.vol = vol
+	a.restoreItemsLocked([]persistedItemRecord{
+		{
+			Path: "regular", ItemID: fileAttr.Ino, ItemGeneration: 1,
+			AuthorityIno: true, Kind: "file",
+		},
+		{
+			Path: "link", ItemID: linkAttr.Ino, ItemGeneration: 1,
+			AuthorityIno: true, Kind: "symlink",
+		},
+	})
+	var regularApplies atomic.Int32
+	a.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+		if p != "regular" || itemID != fileAttr.Ino || size != 4 {
+			t.Fatalf("kernel apply path=%q item=%d size=%d", p, itemID, size)
+		}
+		regularApplies.Add(1)
+		return kernelRefreshApplied, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := make(chan coherence.Batch, 2)
+	acked := make(chan uint64, 2)
+	done := make(chan struct{})
+	go func() {
+		a.forwardEvents(ctx, nil, stream, func(pos uint64) { acked <- pos })
+		close(done)
+	}()
+	stream <- coherence.Batch{Pos: 31, Invs: []coherence.Invalidation{{FlushAll: true}}}
+	select {
+	case pos := <-acked:
+		if pos != 31 {
+			t.Fatalf("FlushAll ack=%d want 31", pos)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("restored regular+symlink FlushAll did not settle")
+	}
+	if got := regularApplies.Load(); got != 1 {
+		t.Fatalf("regular kernel applies=%d want 1 (symlink must not apply)", got)
+	}
+
+	stream <- coherence.Batch{Pos: 32, Invs: []coherence.Invalidation{{
+		Path: "link", RelatedInos: []uint64{linkAttr.Ino},
+	}}}
+	select {
+	case pos := <-acked:
+		if pos != 32 {
+			t.Fatalf("symlink RelatedInos ack=%d want 32", pos)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("exact symlink RelatedInos did not settle as nonregular")
+	}
+	if got := regularApplies.Load(); got != 1 {
+		t.Fatalf("symlink RelatedInos touched regular-file apply path: %d", got)
+	}
+	cancel()
+	close(stream)
+	<-done
+}
+
+func TestRelatedRetainedInodeCannotAckThroughReplacementPath(t *testing.T) {
+	authority := serveAuthority(t)
+	vol, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vol.Close()
+	cli := vol.Client()
+	oldAttr, st, err := cli.Create("a", 0o644)
+	if err != nil || st != fsproto.OK {
+		t.Fatalf("create old a st=%d err=%v", st, err)
+	}
+	if _, st, err := cli.Write("a", 0, []byte("old"), 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("write old a st=%d err=%v", st, err)
+	}
+	if linked, st, err := cli.Link("a", "b"); err != nil || st != fsproto.OK ||
+		linked.Ino != oldAttr.Ino {
+		t.Fatalf("link unseen b attr=%+v st=%d err=%v", linked, st, err)
+	}
+	if _, st, err := cli.Create("replacement", 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("create replacement st=%d err=%v", st, err)
+	}
+	if _, st, err := cli.Write("replacement", 0, []byte("replacement-is-larger"), 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("write replacement st=%d err=%v", st, err)
+	}
+	if st, _, err := cli.RenameWithOrphanTarget("replacement", "a", false); err != nil || st != fsproto.OK {
+		t.Fatalf("replace a st=%d err=%v", st, err)
+	}
+	newAttr, st, err := cli.Getattr("a")
+	if err != nil || st != fsproto.OK || newAttr.Ino == oldAttr.Ino {
+		t.Fatalf("replacement getattr attr=%+v st=%d err=%v", newAttr, st, err)
+	}
+
+	oldItem := pfslocal.Item{ItemID: 81, ItemGeneration: 1}
+	oldState := clientcore.NewNodeState(oldAttr.Ino, true)
+	oldDetached := &itemRecord{
+		item: oldItem, path: "a", state: oldState,
+		attr: fsproto.Attr{Ino: oldAttr.Ino, Kind: "file", Size: 3},
+	}
+	newItem := pfslocal.Item{ItemID: 82, ItemGeneration: 1}
+	newRec := &itemRecord{
+		item: newItem, path: "a", state: clientcore.NewNodeState(newAttr.Ino, true),
+		attr: *newAttr,
+	}
+	blocked := &attach{
+		vol:               vol,
+		mountPath:         "/unused",
+		items:             map[uint64]*itemRecord{oldItem.ItemID: oldDetached, newItem.ItemID: newRec},
+		paths:             map[string]*itemRecord{"a": newRec},
+		itemAliases:       map[uint64]map[string]struct{}{newItem.ItemID: {"a": {}}},
+		authorityItems:    map[uint64]frontendItemIdentity{oldAttr.Ino: {item: oldItem, state: oldState}},
+		expectedTruncates: map[string]expectedTruncate{},
+	}
+	blocked.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+		t.Fatal("replacement pathname was applied to retained old vnode")
+		return kernelRefreshRetry, errors.New("unreachable")
+	}
+	stream := make(chan coherence.Batch, 1)
+	acked := make(chan uint64, 1)
+	done := make(chan struct{})
+	go func() {
+		blocked.forwardEvents(context.Background(), nil, stream, func(pos uint64) { acked <- pos })
+		close(done)
+	}()
+	stream <- coherence.Batch{Pos: 21, Invs: []coherence.Invalidation{{
+		Path: "b", InPlace: true, Version: 9, RelatedInos: []uint64{oldAttr.Ino},
+	}}}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unresolved retained-inode refresh did not fail closed")
+	}
+	select {
+	case pos := <-acked:
+		t.Fatalf("unresolved retained inode falsely acknowledged position %d", pos)
+	default:
+	}
+	if err := blocked.frontendAdmissionError(); err == nil {
+		t.Fatal("unresolved retained inode did not fail-freeze admission")
+	}
+
+	flushBlocked := &attach{
+		vol:               vol,
+		mountPath:         "/unused",
+		items:             map[uint64]*itemRecord{oldItem.ItemID: oldDetached, newItem.ItemID: newRec},
+		paths:             map[string]*itemRecord{"a": newRec},
+		itemAliases:       map[uint64]map[string]struct{}{newItem.ItemID: {"a": {}}},
+		authorityItems:    map[uint64]frontendItemIdentity{oldAttr.Ino: {item: oldItem, state: oldState}},
+		expectedTruncates: map[string]expectedTruncate{},
+	}
+	var oldFlushApplied atomic.Bool
+	flushBlocked.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+		if itemID == oldItem.ItemID {
+			oldFlushApplied.Store(true)
+		}
+		if itemID != newItem.ItemID || p != "a" || size != newAttr.Size {
+			return kernelRefreshRetry, errors.New("unexpected FlushAll apply target")
+		}
+		// FlushAll legitimately refreshes the live replacement too. The
+		// retained old Item must still fail closed independently, regardless
+		// of nondeterministic map iteration order.
+		return kernelRefreshApplied, nil
+	}
+	flushStream := make(chan coherence.Batch, 1)
+	flushAcked := make(chan uint64, 1)
+	flushDone := make(chan struct{})
+	go func() {
+		flushBlocked.forwardEvents(context.Background(), nil, flushStream, func(pos uint64) { flushAcked <- pos })
+		close(flushDone)
+	}()
+	flushStream <- coherence.Batch{Pos: 23, Invs: []coherence.Invalidation{{FlushAll: true}}}
+	select {
+	case <-flushDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("FlushAll with unresolved retained inode did not fail closed")
+	}
+	select {
+	case pos := <-flushAcked:
+		t.Fatalf("unresolved FlushAll falsely acknowledged position %d", pos)
+	default:
+	}
+	if err := flushBlocked.frontendAdmissionError(); err == nil {
+		t.Fatal("unresolved FlushAll did not fail-freeze admission")
+	}
+	if oldFlushApplied.Load() {
+		t.Fatal("FlushAll applied replacement pathname to retained old vnode")
+	}
+
+	// Once lookup has made b the canonical alias, the exact same authority
+	// claim samples the matching inode, applies that vnode, and may ACK.
+	oldAlias := &itemRecord{
+		item: oldItem, path: "b", state: oldState,
+		attr: fsproto.Attr{Ino: oldAttr.Ino, Kind: "file", Size: 3},
+	}
+	resolved := &attach{
+		vol:            vol,
+		mountPath:      "/unused",
+		items:          map[uint64]*itemRecord{oldItem.ItemID: oldAlias},
+		paths:          map[string]*itemRecord{"b": oldAlias},
+		itemAliases:    map[uint64]map[string]struct{}{oldItem.ItemID: {"b": {}}},
+		authorityItems: map[uint64]frontendItemIdentity{oldAttr.Ino: {item: oldItem, state: oldState}},
+	}
+	applied := make(chan struct{}, 1)
+	resolved.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+		if path != "b" || itemID != oldItem.ItemID || size != 3 {
+			t.Fatalf("resolved exact refresh path=%q item=%d size=%d", path, itemID, size)
+		}
+		applied <- struct{}{}
+		return kernelRefreshApplied, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	resolvedStream := make(chan coherence.Batch, 1)
+	resolvedAck := make(chan uint64, 1)
+	resolvedDone := make(chan struct{})
+	go func() {
+		resolved.forwardEvents(ctx, nil, resolvedStream, func(pos uint64) { resolvedAck <- pos })
+		close(resolvedDone)
+	}()
+	resolvedStream <- coherence.Batch{Pos: 22, Invs: []coherence.Invalidation{{
+		Path: "b", InPlace: true, Version: 10, RelatedInos: []uint64{oldAttr.Ino},
+	}}}
+	select {
+	case <-applied:
+	case <-time.After(time.Second):
+		t.Fatal("known surviving alias was not exactly refreshed")
+	}
+	select {
+	case pos := <-resolvedAck:
+		if pos != 22 {
+			t.Fatalf("resolved ack=%d want 22", pos)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resolved surviving alias was not acknowledged")
+	}
+	resolvedStream <- coherence.Batch{Pos: 24, Invs: []coherence.Invalidation{{FlushAll: true}}}
+	select {
+	case <-applied:
+	case <-time.After(time.Second):
+		t.Fatal("resolved surviving alias was not refreshed for FlushAll")
+	}
+	select {
+	case pos := <-resolvedAck:
+		if pos != 24 {
+			t.Fatalf("resolved FlushAll ack=%d want 24", pos)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resolved surviving alias FlushAll was not acknowledged")
+	}
+	cancel()
+	close(resolvedStream)
+	<-resolvedDone
+}
+
+func TestAuthorityRefreshFailureFailFreezesWithoutAcknowledging(t *testing.T) {
+	item := pfslocal.Item{ItemID: 23, ItemGeneration: 1}
+	rec := &itemRecord{item: item, path: "stale", attr: fsproto.Attr{Ino: 101}}
+	a := &attach{
+		paths: map[string]*itemRecord{"stale": rec},
+		items: map[uint64]*itemRecord{item.ItemID: rec},
+	}
+	refreshErr := errors.New("kernel rejected exact invalidation")
+	a.testExactKernelRefresh = func(context.Context, uint64) error {
+		return refreshErr
+	}
+	stream := make(chan coherence.Batch, 1)
+	acked := make(chan uint64, 1)
+	done := make(chan struct{})
+	go func() {
+		a.forwardEvents(context.Background(), nil, stream, func(pos uint64) { acked <- pos })
+		close(done)
+	}()
+	stream <- coherence.Batch{
+		Pos: 9,
+		Invs: []coherence.Invalidation{{
+			Path: "stale", Version: 3, InPlace: true,
+		}},
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event forwarder did not stop on exact refresh failure")
+	}
+	select {
+	case pos := <-acked:
+		t.Fatalf("failed kernel refresh acknowledged authority position %d", pos)
+	default:
+	}
+	if err := a.frontendAdmissionError(); err == nil {
+		t.Fatal("frontend remained admitted after unproven kernel coherence")
+	}
+	if err := a.controlAdmissionError(); err == nil {
+		t.Fatal("control API remained admitted after unproven kernel coherence")
+	}
+	if got := a.statusState(); got != pfslocal.AttachStateDegraded {
+		t.Fatalf("attach state = %v, want degraded", got)
+	}
+	// Health success must never self-heal a correctness fail-freeze.
+	a.setErr(nil)
+	if err := a.frontendAdmissionError(); err == nil {
+		t.Fatal("health tick cleared terminal coherence fail-freeze")
+	}
+}
+
+func TestFirstPublishingReplyAfterFailFreezeCanRetire(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+	a := &attach{}
+	a.failCoherence(errors.New("unproven vnode state"))
+	conn := &frontendConn{conn: serverSide}
+	done := make(chan struct{})
+	go func() {
+		conn.handleAttached(
+			context.Background(),
+			a,
+			1,
+			1,
+			&pfslocal.GetAttrRequest{},
+		)
+		close(done)
+	}()
+	reply, err := pfslocal.ReadFrame(clientSide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.PublicationAckRequired {
+		t.Fatal("fail-frozen publishing error did not request publication acknowledgement")
+	}
+	if _, ok := reply.Body.(*pfslocal.ErrorReply); !ok {
+		t.Fatalf("reply = %T, want ErrorReply", reply.Body)
+	}
+	<-done
+	if !conn.acknowledgePublication(1) {
+		t.Fatal("fail-frozen publication acknowledgement was rejected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.startFrontendHandoff(ctx, ""); err != nil {
+		t.Fatalf("fail-frozen operation leaked after acknowledgement: %v", err)
+	}
+	a.endFrontendHandoff("")
+}
+
+func TestLogicalOperationContinuationSuspendsBeforeProxyWait(t *testing.T) {
+	a := &attach{}
+	conn := &frontendConn{}
+	const operationID uint64 = 1
+	_, first, _, _, err := conn.beginLogicalOperation(
+		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.finishFrontendParticipant(first)
+	conn.finishLogicalRequest(operationID)
+
+	// Model a control/lifecycle writer that has acquired the proxy and is
+	// waiting for this logical callback to publish before taking nsMu.
+	a.frontendSerial.Lock()
+	handoffDone := make(chan error, 1)
+	go func() { handoffDone <- a.startFrontendHandoff(context.Background(), "") }()
+	select {
+	case err := <-handoffDone:
+		t.Fatalf("handoff crossed the unacknowledged callback: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	continuationReady := make(chan *frontendOperationParticipant, 1)
+	continuationDone := make(chan struct{})
+	go func() {
+		ctx, participant, participates, publishes, beginErr := conn.beginLogicalOperation(
+			context.Background(), a, operationID, &pfslocal.OpenRequest{},
+		)
+		if beginErr != nil || !participates || publishes {
+			continuationReady <- nil
+			close(continuationDone)
+			return
+		}
+		resume := a.suspendFrontendOperation(ctx)
+		continuationReady <- participant
+		unlock := a.lockFrontendRequest(&pfslocal.OpenRequest{})
+		if resume != nil {
+			resume()
+		}
+		unlock()
+		a.finishFrontendParticipant(participant)
+		conn.finishLogicalRequest(operationID)
+		close(continuationDone)
+	}()
+	participant := <-continuationReady
+	if participant == nil {
+		t.Fatal("logical continuation admission failed")
+	}
+	select {
+	case err := <-handoffDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("suspended continuation did not release the handoff cycle")
+	}
+	a.endFrontendHandoff("")
+	a.frontendSerial.Unlock()
+	select {
+	case <-continuationDone:
+	case <-time.After(time.Second):
+		t.Fatal("logical continuation did not resume after proxy release")
+	}
+	if !conn.acknowledgePublication(operationID) {
+		t.Fatal("logical callback acknowledgement failed")
+	}
+}
+
+func TestLastRunningSiblingFinishingDeactivatesFullySuspendedOperation(t *testing.T) {
+	a := &attach{}
+	conn := &frontendConn{}
+	const operationID uint64 = 1
+	ctxA, participantA, _, _, err := conn.beginLogicalOperation(
+		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, participantB, _, _, err := conn.beginLogicalOperation(
+		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeA := a.suspendFrontendOperation(ctxA)
+	if resumeA == nil {
+		t.Fatal("request A did not suspend")
+	}
+	handoffDone := make(chan error, 1)
+	go func() { handoffDone <- a.startFrontendHandoff(context.Background(), "") }()
+	select {
+	case err := <-handoffDone:
+		t.Fatalf("handoff crossed running request B: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.finishFrontendParticipant(participantB)
+	conn.finishLogicalRequest(operationID)
+	select {
+	case err := <-handoffDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff remained blocked after only live participant was suspended")
+	}
+	a.endFrontendHandoff("")
+	resumeA()
+	a.finishFrontendParticipant(participantA)
+	conn.finishLogicalRequest(operationID)
+	if !conn.acknowledgePublication(operationID) {
+		t.Fatal("operation acknowledgement failed")
+	}
+}
+
+func TestExternalNamespaceWriterTakesProxyBeforeConcreteLock(t *testing.T) {
+	a := &attach{}
+	a.frontendSerial.RLock()
+	acquired := make(chan func(), 1)
+	go func() { acquired <- a.lockExternalNamespaceWrite() }()
+	select {
+	case <-acquired:
+		t.Fatal("external writer crossed an active frontend proxy")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if !a.nsMu.TryLock() {
+		t.Fatal("external writer took nsMu before its frontend proxy")
+	}
+	a.nsMu.Unlock()
+	a.frontendSerial.RUnlock()
+	var unlock func()
+	select {
+	case unlock = <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("external writer did not acquire after proxy release")
+	}
+	unlock()
 }
