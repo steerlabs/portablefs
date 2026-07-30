@@ -47,9 +47,19 @@ These are security surfaces; flaws in them are in scope:
   (AES-256-GCM), and bucket server-side encryption configuration.
 - **Read-path integrity**: content-address verification of blobs and chunks on every
   read.
+- **Local mount state**: per-account mount state, write-back journals, and daemon
+  control sockets reject foreign ownership, unsafe permissions, and unexpected
+  symlink or hard-link shapes before an offline transaction mutates them.
+
+The operating-system account is the local security boundary. PortableFS assumes
+processes running as the same effective user are mutually trusted: such processes
+can ordinarily inspect or signal one another and can modify that user's private
+state. Run mutually untrusted workloads under distinct OS accounts or stronger OS
+isolation.
 
 Out of scope: deployments that deliberately disable the production guards
 (`VCS_ALLOW_PLAINTEXT_PRODUCTION=1`,
+`PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=plaintext`,
 `PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1`,
 `PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED=1`) outside an authenticated
 private network, missing rate limiting or denial-of-service resilience on

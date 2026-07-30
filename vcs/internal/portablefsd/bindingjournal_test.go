@@ -12,15 +12,16 @@ import (
 // outlives the process), while corrupt lines, stale generations, and escaping
 // paths are discarded with the state file remaining authoritative.
 func TestBindingJournalReplayAcrossRestart(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := privateTestDir(t)
 	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{{
-		Ref:           "att_j",
-		VolumeID:      "vol-j",
-		Branch:        "main",
-		MountPath:     "/Volumes/J",
-		AuthorityURL:  "127.0.0.1:1",
-		Options:       AttachOptions{DiskCacheMB: 1},
-		IdentityEpoch: 7,
+		Ref:                "att_CCCCCCCCCCCCCCCCCCCCCC",
+		VolumeID:           "vol-j",
+		Branch:             "main",
+		MountPath:          "/Volumes/J",
+		AuthorityURL:       "127.0.0.1:1",
+		DataPlaneTransport: "plaintext",
+		Options:            AttachOptions{DiskCacheMB: 1},
+		IdentityEpoch:      7,
 		Items: []persistedItemRecord{
 			{Path: "", ItemID: 1, ItemGeneration: 7, AuthorityIno: true},
 			{Path: "dir/old.txt", ItemID: 99, ItemGeneration: 7, AuthorityIno: true},
@@ -33,20 +34,20 @@ func TestBindingJournalReplayAcrossRestart(t *testing.T) {
 	// rekey, an unbind, then garbage that must not poison the replay — a
 	// stale-generation bind, an escaping path, an unknown ref, and the torn
 	// trailing line of a machine crash.
-	journal := `{"ref":"att_j","op":"bind","path":"dir/new.txt","id":123,"gen":7,"auth":true}
-{"ref":"att_j","op":"rekey","from":"dir","to":"dir2"}
-{"ref":"att_j","op":"unbind","path":"gone.txt"}
-{"ref":"att_j","op":"bind","path":"stale.txt","id":7,"gen":6}
-{"ref":"att_j","op":"bind","path":"../escape","id":8,"gen":7}
+	journal := `{"ref":"att_CCCCCCCCCCCCCCCCCCCCCC","op":"bind","path":"dir/new.txt","id":123,"gen":7,"auth":true}
+{"ref":"att_CCCCCCCCCCCCCCCCCCCCCC","op":"rekey","from":"dir","to":"dir2"}
+{"ref":"att_CCCCCCCCCCCCCCCCCCCCCC","op":"unbind","path":"gone.txt"}
+{"ref":"att_CCCCCCCCCCCCCCCCCCCCCC","op":"bind","path":"stale.txt","id":7,"gen":6}
+{"ref":"att_CCCCCCCCCCCCCCCCCCCCCC","op":"bind","path":"../escape","id":8,"gen":7}
 {"ref":"att_other","op":"bind","path":"x","id":9,"gen":7}
-{"ref":"att_j","op":"bind","pa`
+{"ref":"att_CCCCCCCCCCCCCCCCCCCCCC","op":"bind","pa`
 	if err := os.WriteFile(filepath.Join(stateDir, bindingJournalName), []byte(journal), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	r := newRegistry(stateDir)
 	t.Cleanup(r.stopPersister)
-	a := r.byRef["att_j"]
+	a := r.byRef["att_CCCCCCCCCCCCCCCCCCCCCC"]
 	if a == nil {
 		t.Fatal("attach not revived")
 	}

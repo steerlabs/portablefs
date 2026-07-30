@@ -1,51 +1,12 @@
 import Foundation
 
-/// Default filesystem locations shared by the menu-bar app, the FSKit
-/// extension Info.plist, and the docs.
-///
-/// The daemon sockets live in the `B47U2LLKHW.pfsoss` app-group container.
-/// This is not a style choice: the macOS app sandbox only allows
-/// `network-outbound` (which `connect(2)` on a unix socket requires) on
-/// app-group container paths, so a socket anywhere else — /tmp included —
-/// is unreachable from the sandboxed FSKit extension no matter what file
-/// exceptions it holds. The group id is team-prefixed and product-specific,
-/// so it never collides with another PortableFS embedder (each uses its own
-/// group container) on the same machine. Forks building
-/// under a different team id change `appGroupIdentifier` here and in the
-/// extension Info.plist/entitlements, or set PORTABLEFS_FSKIT_SOCKET.
+/// Presentation-only filesystem paths used by the menu-bar app.
 public enum PortableFSAppPaths {
-    public static let appGroupIdentifier = "B47U2LLKHW.pfsoss"
-
-    public static var devSocketDirectory: String {
-        groupContainerPath().appending("/portablefsd")
+    public static func defaultMountBaseDirectory() throws -> String {
+        defaultMountBaseDirectory(homeDirectory: try PortableFSAccountHome.resolve())
     }
 
-    public static var devFrontendSocketPath: String {
-        devSocketDirectory.appending("/pfs.sock")
-    }
-
-    public static var devControlSocketPath: String {
-        devSocketDirectory.appending("/control.sock")
-    }
-
-    /// The group container root. `containerURL` both resolves and creates
-    /// the container for entitled processes; for the unsandboxed daemon it
-    /// resolves to the same well-known path.
-    public static func groupContainerPath(homeDirectory: String = NSHomeDirectory()) -> String {
-        if let container = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroupIdentifier
-        ) {
-            return container.path
-        }
-        return (homeDirectory as NSString)
-            .appendingPathComponent("Library/Group Containers/\(appGroupIdentifier)")
-    }
-
-    public static func defaultStateDirectory(homeDirectory: String = NSHomeDirectory()) -> String {
-        (homeDirectory as NSString).appendingPathComponent("Library/Application Support/PortableFS/portablefsd")
-    }
-
-    public static func defaultMountBaseDirectory(homeDirectory: String = NSHomeDirectory()) -> String {
+    public static func defaultMountBaseDirectory(homeDirectory: String) -> String {
         (homeDirectory as NSString).appendingPathComponent("PortableFS")
     }
 

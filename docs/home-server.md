@@ -10,6 +10,10 @@ This guide uses the quickstart stack in tailnet mode. It is a single-node,
 plaintext-TCP deployment with bearer tokens — right for a private tailnet or home
 LAN, wrong for the public internet. For a hardened multi-node deployment with TLS
 and replicated authorities, see [self-hosting.md](./self-hosting.md).
+The quickstart declares this intentionally with
+`PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=plaintext` plus the production
+plaintext authorization flag; clients learn that exact mode from each access
+lease. No client infers plaintext from a missing CA.
 
 ## Prerequisites
 
@@ -18,18 +22,23 @@ and replicated authorities, see [self-hosting.md](./self-hosting.md).
 - On both machines: [Tailscale](https://tailscale.com/), logged in to the same
   tailnet. (A trusted home LAN also works; use the Mini's LAN IP wherever this
   guide says Tailscale address.)
-- The PortableFS CLI wherever you will type `portablefs` commands. **Prebuilt
-  releases (and the Homebrew tap) are coming soon**; until the first tagged
-  release, build the CLI from source (see the repository README's Development
-  section). Once releases are published:
+- The PortableFS CLI wherever you will type `portablefs` commands. Until the
+  first tagged release, build from source (see the repository README's
+  Development section). Once releases are published:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh
 ```
 
-The installer verifies the release checksum, installs to `/usr/local/bin` (or
-`~/.local/bin` if that is not writable), and prints next steps. Homebrew users
-can `brew install steerlabs/tap/portablefs` instead.
+On Linux, the installer puts the verified CLI/daemon pair in an immutable,
+content-addressed per-user release directory and atomically switches one CLI
+activation link at `~/.local/bin/portablefs`. Before extraction, it verifies
+GitHub build provenance against this repository's exact release workflow and
+tag using the signed per-architecture bundle shipped with the release, plus the
+release SHA-256 digest. This does not require a local GitHub login. On macOS, it
+verifies the notarized `PortableFS.app`, installs it at
+`~/Applications/PortableFS.app`, and links its embedded CLI at
+`~/.local/bin/portablefs`.
 
 ## Server Setup (On The Mini)
 
@@ -106,9 +115,13 @@ cross-machine atomic append is not guaranteed; see
 [consistency-model.md](./consistency-model.md#concurrent-appends)), one
 transport, no fallback. One-time setup per Mac: install PortableFS.app and
 enable its File System Extension in System Settings → General → Login Items &
-Extensions (see [fskit-mount.md](./fskit-mount.md)). On Linux, `mount` uses
-FUSE and needs the fuse3 package. A host that cannot serve its platform's
-transport fails with guidance instead of degrading to weaker semantics.
+Extensions (see [fskit-mount.md](./fskit-mount.md)). On Linux, one host-facts
+observation selects exactly one FUSE mechanism before mounting: direct
+`mount(2)` for a process with positive `CAP_SYS_ADMIN` evidence, otherwise an
+exact trusted `fuse3` helper. That selection is persisted and revalidated; an
+attempted mount never falls through to the other mechanism. A host that cannot
+serve its platform's transport fails with guidance instead of degrading to
+weaker semantics.
 
 ## Running Agents On The Mini
 

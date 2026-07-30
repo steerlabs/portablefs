@@ -26,6 +26,31 @@ type cmdEnv struct {
 	configPath string              // empty = default (~/.config/portablefs/config.json)
 	sleepFn    func(time.Duration) // nil = time.Sleep (tests poll instantly)
 	openURLFn  func(string) error  // nil = platform browser open (tests record instead)
+	// Test-only override. Production lifecycle locking deliberately ignores
+	// XDG_STATE_HOME so environment variants cannot split the lock inode.
+	lifecycleStateDir string
+	// Test-only canonical operational state override.
+	stateDir string
+	// Test-only presentation seam. Production always performs the exact
+	// process + kernel mount identity checks in mountHealth.
+	mountHealthFn func(*mountState) string
+	// Test-only account-inventory seam. Production always reads the live
+	// kernel mount table before changing credentials or profiles.
+	kernelInventoryFn func() ([]string, error)
+}
+
+func (e *cmdEnv) classifyMount(st *mountState) string {
+	if e.mountHealthFn != nil {
+		return e.mountHealthFn(st)
+	}
+	return mountHealth(st)
+}
+
+func (e *cmdEnv) kernelMountInventory() ([]string, error) {
+	if e.kernelInventoryFn != nil {
+		return e.kernelInventoryFn()
+	}
+	return portableFSKernelInventory()
 }
 
 func (e *cmdEnv) stdinReader() io.Reader {
@@ -145,7 +170,12 @@ func commands() []command {
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
 		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},
+		{"lifecycle", "hold the internal mount/update lifecycle guard", cmdLifecycle},
+		{"install-macos-app", "install the signed macOS app bundle", cmdInstallMacOSApp},
+		{"mount-check", "inspect this host's mount transport without changing it", cmdMountCheck},
+		{"internal-root-probe", "internal bounded mount-root usability probe", cmdInternalRootProbe},
 		{"doctor", "check this machine's PortableFS setup and report problems", cmdDoctor},
+		{"install-linux-release", "atomically activate a verified Linux release", cmdInstallLinuxRelease},
 		{"version", "print the CLI version", cmdVersion},
 	}
 }

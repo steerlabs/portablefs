@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "vitest";
+import { createHash } from "node:crypto";
 import { connect, createServer, type AddressInfo, type Socket } from "node:net";
+import { rootCertificates } from "node:tls";
 import { accessLeaseErrorCodes } from "@portablefs/protocol";
 import {
   assertProductionAuthorityManagerMode,
@@ -14,7 +16,10 @@ import {
   createAuthorityDataPlaneRouterServer,
   InMemoryAuthorityDataPlaneRouteTable,
   LeaseTunnelRegistry,
+  preflightAuthorityDataPlaneRouterTLS,
+  resolveDataPlaneTransportContract,
   resolveRouterTlsMaterial,
+  validateRouterTLSIdentity,
   validateAuthorityDataPlaneRouterConfig,
 } from "./data-plane-router.js";
 import { mintRootSecret } from "./access-tokens.js";
@@ -25,6 +30,16 @@ import {
   type ManagerIdentity,
 } from "./manager-control-store.js";
 import { ProductionAccessLeaseService } from "./production-access-leases.js";
+import {
+  testTLSCNOnlyLeaf,
+  testTLSIntermediateCA,
+  testTLSLeaf,
+  testTLSLeafKey,
+  testTLSOtherRootCA,
+  testTLSPartialWildcardLeaf,
+  testTLSRootCA,
+  testTLSWrongKey,
+} from "./test-tls-fixtures.js";
 
 const servers: Array<ReturnType<typeof createAuthorityManagerServer>> = [];
 const tcpServers: Array<ReturnType<typeof createServer>> = [];
@@ -661,21 +676,259 @@ describe("authority data-plane router", () => {
       listenAddr: "0.0.0.0:2050",
       publicUrl: "vcs.example:2050",
     };
-    expect(() =>
-      validateAuthorityDataPlaneRouterConfig({ ...base, tlsCertPem: "C", tlsKeyPem: "K" })
-    ).not.toThrow();
-    expect(() =>
-      validateAuthorityDataPlaneRouterConfig({ ...base, tlsCertPath: "/c", tlsKeyPath: "/k" })
-    ).not.toThrow();
+    expect(
+      validateAuthorityDataPlaneRouterConfig({
+        ...base,
+        tlsCertPem: "C",
+        tlsKeyPem: "K",
+        transportMode: "tls-system-pki",
+        tlsServerName: "router.example",
+      })
+    ).toEqual({ mode: "tls-system-pki", serverName: "router.example" });
     expect(() => validateAuthorityDataPlaneRouterConfig(base)).toThrow(
-      /Router TLS/
+      /TRANSPORT_MODE/
     );
-    expect(() =>
-      validateAuthorityDataPlaneRouterConfig({ ...base, allowPlaintextProduction: true })
-    ).not.toThrow();
+    expect(
+      validateAuthorityDataPlaneRouterConfig({
+        ...base,
+        transportMode: "plaintext",
+        allowPlaintextProduction: true,
+      })
+    ).toEqual({ mode: "plaintext" });
     expect(() =>
       validateAuthorityDataPlaneRouterConfig({ ...base, tlsCertPem: "C" })
     ).toThrow(/TLS_KEY_PEM/);
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "plaintext",
+        allowPlaintextProduction: false,
+      })
+    ).toThrow(/ALLOW_PLAINTEXT/);
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-system-pki",
+      })
+    ).toThrow(/TLS_SERVER_NAME/);
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-system-pki",
+        tlsServerName: "router.example:2050",
+      })
+    ).toThrow(/valid DNS name or IP address/);
+    expect(
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-system-pki",
+        tlsServerName: "2001:db8::1",
+      })
+    ).toEqual({ mode: "tls-system-pki", serverName: "2001:db8::1" });
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-system-pki",
+        tlsServerName: "fe80::1%en0",
+      })
+    ).toThrow(/valid DNS name or IP address/);
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-private-ca",
+        tlsServerName: "router.example",
+        tlsCaPem: "not a certificate",
+      })
+    ).toThrow(/no certificates/);
+    const privateCA = rootCertificates[0]!;
+    expect(
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-private-ca",
+        tlsServerName: "router.example",
+        tlsCaPem: privateCA,
+      })
+    ).toEqual({
+      mode: "tls-private-ca",
+      serverName: "router.example",
+      caPem: privateCA,
+      caSha256: createHash("sha256").update(privateCA).digest("hex"),
+    });
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-private-ca",
+        tlsServerName: "router.example",
+        tlsCaPem: testTLSLeaf,
+      })
+    ).toThrow(/not a CA certificate/);
+    expect(() =>
+      resolveDataPlaneTransportContract({
+        transportMode: "tls-private-ca",
+        tlsServerName: "router.example",
+        tlsCaPem: testTLSRootCA + testTLSRootCA,
+      })
+    ).toThrow(/repeats certificate/);
+    expect(() =>
+      validateAuthorityDataPlaneRouterConfig({
+        ...base,
+        transportMode: "plaintext",
+        allowPlaintextProduction: true,
+        tlsCertPem: "C",
+        tlsKeyPem: "K",
+      })
+    ).toThrow(/must not configure router TLS/);
+    expect(() =>
+      validateAuthorityDataPlaneRouterConfig({
+        ...base,
+        transportMode: "tls-system-pki",
+        tlsServerName: "router.example",
+      })
+    ).toThrow(/requires router TLS certificate/);
+  });
+
+  test("startup preflight proves a complete private-CA chain and exact DNS/IP identity", async () => {
+    const tls = {
+      cert: Buffer.from(testTLSLeaf + testTLSIntermediateCA),
+      key: Buffer.from(testTLSLeafKey),
+    };
+    const dnsTransport = resolveDataPlaneTransportContract({
+      transportMode: "tls-private-ca",
+      tlsServerName: "router.example",
+      tlsCaPem: testTLSRootCA,
+    });
+    const ipTransport = resolveDataPlaneTransportContract({
+      transportMode: "tls-private-ca",
+      tlsServerName: "2001:db8::1",
+      tlsCaPem: testTLSRootCA,
+    });
+    await expect(preflightAuthorityDataPlaneRouterTLS(tls, dnsTransport)).resolves.toBeUndefined();
+    await expect(preflightAuthorityDataPlaneRouterTLS(tls, ipTransport)).resolves.toBeUndefined();
+  });
+
+  test("startup preflight rejects key, name, chain, trust, and PEM ambiguity", async () => {
+    const privateTransport = resolveDataPlaneTransportContract({
+      transportMode: "tls-private-ca",
+      tlsServerName: "router.example",
+      tlsCaPem: testTLSRootCA,
+    });
+    const chain = Buffer.from(testTLSLeaf + testTLSIntermediateCA);
+
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        { cert: chain, key: Buffer.from(testTLSWrongKey) },
+        privateTransport
+      )
+    ).rejects.toThrow(/does not match/);
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        { cert: chain, key: Buffer.from(testTLSLeafKey + testTLSWrongKey) },
+        privateTransport
+      )
+    ).rejects.toThrow(/exactly one/);
+
+    const wrongName = resolveDataPlaneTransportContract({
+      transportMode: "tls-private-ca",
+      tlsServerName: "wrong.example",
+      tlsCaPem: testTLSRootCA,
+    });
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        { cert: chain, key: Buffer.from(testTLSLeafKey) },
+        wrongName
+      )
+    ).rejects.toThrow(/does not match advertised serverName/);
+
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        {
+          cert: Buffer.from(testTLSIntermediateCA + testTLSLeaf),
+          key: Buffer.from(testTLSLeafKey),
+        },
+        privateTransport
+      )
+    ).rejects.toThrow(/non-CA serving leaf/);
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        { cert: Buffer.from(testTLSLeaf), key: Buffer.from(testTLSLeafKey) },
+        privateTransport
+      )
+    ).rejects.toThrow(/private-CA trust preflight failed/);
+
+    const wrongTrust = resolveDataPlaneTransportContract({
+      transportMode: "tls-private-ca",
+      tlsServerName: "router.example",
+      tlsCaPem: testTLSOtherRootCA,
+    });
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        { cert: chain, key: Buffer.from(testTLSLeafKey) },
+        wrongTrust
+      )
+    ).rejects.toThrow(/private-CA trust preflight failed/);
+
+    await expect(
+      preflightAuthorityDataPlaneRouterTLS(
+        {
+          cert: Buffer.from(testTLSLeaf + testTLSIntermediateCA + testTLSIntermediateCA),
+          key: Buffer.from(testTLSLeafKey),
+        },
+        privateTransport
+      )
+    ).rejects.toThrow(/repeats certificate/);
+  });
+
+  test("system-PKI startup also refuses a chain absent from the manager's default roots", async () => {
+    const tls = {
+      cert: Buffer.from(testTLSLeaf + testTLSIntermediateCA),
+      key: Buffer.from(testTLSLeafKey),
+    };
+    const transport = {
+      mode: "tls-system-pki" as const,
+      serverName: "router.example",
+    };
+    // The fixture identity is otherwise valid, but its private root is absent
+    // from Node's default roots. Publishing it as system-PKI would make every
+    // default client fail, so startup refuses before the real listener.
+    expect(() => validateRouterTLSIdentity(tls, transport)).not.toThrow();
+    await expect(preflightAuthorityDataPlaneRouterTLS(tls, transport)).rejects.toThrow(
+      /system-PKI trust preflight failed/
+    );
+  });
+
+  test("hostname proof is SAN-only and disables Node-only partial wildcard behavior", () => {
+    const tls = {
+      cert: Buffer.from(testTLSLeaf + testTLSIntermediateCA),
+      key: Buffer.from(testTLSLeafKey),
+    };
+    expect(() =>
+      validateRouterTLSIdentity(tls, {
+        mode: "tls-system-pki",
+        serverName: "router.example",
+      })
+    ).not.toThrow();
+    expect(() =>
+      validateRouterTLSIdentity(tls, {
+        mode: "tls-system-pki",
+        serverName: "prefix.router.example",
+      })
+    ).toThrow(/does not match/);
+    expect(() =>
+      validateRouterTLSIdentity(
+        {
+          cert: Buffer.from(testTLSCNOnlyLeaf + testTLSIntermediateCA),
+          key: Buffer.from(testTLSLeafKey),
+        },
+        {
+          mode: "tls-system-pki",
+          serverName: "cn-only.example",
+        }
+      )
+    ).toThrow(/does not match/);
+    expect(() =>
+      validateRouterTLSIdentity(
+        {
+          cert: Buffer.from(testTLSPartialWildcardLeaf + testTLSIntermediateCA),
+          key: Buffer.from(testTLSLeafKey),
+        },
+        {
+          mode: "tls-system-pki",
+          serverName: "prefix123.example.com",
+        }
+      )
+    ).toThrow(/does not match/);
   });
 });
 
@@ -899,8 +1152,8 @@ describe("access-lease data-plane tunnels", () => {
     const client = await connectClient(routerAddress);
     await writeTokenFrame(client, token);
     const ack = await readExactly(client, 1);
-    expect(ack[0]).toBe(1);
     client.destroy();
+    expect(ack[0]).toBe(1);
   }
 
   function waitForClose(socket: Socket): Promise<void> {
@@ -1012,12 +1265,20 @@ describe("access-lease data-plane tunnels", () => {
 
   test("the expiry sweep closes live tunnels without any caller action", async () => {
     const harness = await startLeaseRouter();
-    const { accessToken } = await createLease(harness.service, 1_000);
+    const { lease, accessToken } = await createLease(harness.service, 1_000);
     const client = await openTunnel(harness.routerAddress, accessToken);
 
-    // The single unref'd expiry timer ends the lease projection, which
-    // closes the registered tunnel with no request touching the lease.
+    // The single unref'd expiry timer reaches the conservative authorization
+    // deadline and closes the registered tunnel with no request touching the
+    // lease. A database recheck may prove that the row still has runway and
+    // briefly reauthorize it; that never revives the already-closed tunnel.
     await waitForClose(client);
+
+    // Once the database expiry returned by create is in the past, the next
+    // handshake must remain rejected. Waiting for that exact durable boundary
+    // avoids confusing the intentional pre-expiry guard with final expiry.
+    const untilDurableExpiryMs = Math.max(0, lease.expiresAt - Date.now());
+    await new Promise((resolve) => setTimeout(resolve, untilDurableExpiryMs + 50));
     await expectHandshakeRejected(harness.routerAddress, accessToken);
   });
 });

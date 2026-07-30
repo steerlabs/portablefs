@@ -15,6 +15,7 @@ public enum VolumeMountState: Equatable, Sendable {
     case attaching
     case mounting(attachRef: String)
     case mounted(attachRef: String, mountPath: String)
+    case cleanupRequired(mountPath: String, operationPhase: String)
     case unmounting(attachRef: String, mountPath: String)
     case detaching(attachRef: String)
     case failed(message: String)
@@ -23,7 +24,7 @@ public enum VolumeMountState: Equatable, Sendable {
         switch self {
         case .mintingSession, .attaching, .mounting, .unmounting, .detaching:
             return true
-        case .unmounted, .mounted, .failed:
+        case .unmounted, .mounted, .cleanupRequired, .failed:
             return false
         }
     }
@@ -37,7 +38,7 @@ public enum VolumeMountState: Equatable, Sendable {
 
     public var mountPath: String? {
         switch self {
-        case let .mounted(_, path), let .unmounting(_, path):
+        case let .mounted(_, path), let .cleanupRequired(path, _), let .unmounting(_, path):
             return path
         default:
             return nil
@@ -66,6 +67,8 @@ public enum VolumeMountState: Equatable, Sendable {
             return "Mounting…"
         case .mounted:
             return "Mounted"
+        case let .cleanupRequired(_, phase):
+            return phase.isEmpty ? "Cleanup required" : "Cleanup required (\(phase))"
         case .unmounting:
             return "Unmounting…"
         case .detaching:
@@ -122,7 +125,8 @@ public struct MountStateMachine: Equatable, Sendable {
              let (.failed, .observedMounted(ref, path)),
              let (.mounted, .observedMounted(ref, path)):
             state = .mounted(attachRef: ref, mountPath: path)
-        case (.mounted, .observedUnmounted), (.failed, .observedUnmounted):
+        case (.mounted, .observedUnmounted), (.cleanupRequired, .observedUnmounted),
+             (.failed, .observedUnmounted):
             state = .unmounted
         default:
             return false

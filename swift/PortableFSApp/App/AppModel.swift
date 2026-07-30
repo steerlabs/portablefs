@@ -22,36 +22,18 @@ enum DeviceFlowPhase: Equatable {
     case failed(message: String)
 }
 
-/// In-memory ownership of one mounted access lease. Credentials are
-/// deliberately not persisted; a clean quit releases every lease, while an
-/// app crash is a visible terminal supervision failure rather than an
-/// invitation to reconstruct hidden state.
-@MainActor
-private final class MountedAccessLease {
-    let client: ControlPlaneClient
-    let attachRef: String
-    var session: AccessSessionInfo
-    var pendingRenewalOperationID: String?
-    var pendingReleaseOperationID: String?
-    var renewalDelayWasReported = false
-    var task: Task<Void, Never>?
-
-    init(client: ControlPlaneClient, attachRef: String, session: AccessSessionInfo) {
-        self.client = client
-        self.attachRef = attachRef
-        self.session = session
-    }
-}
-
-/// Central app state: config/profile identity, the volume list, per-volume
-/// mount state machines, the supervised daemon, and surfaced errors.
+/// Menu-bar presentation state. The Go CLI is the sole owner of mount,
+/// daemon, access-lease, readiness, and lifecycle-lock state. The Swift app
+/// invokes that exact bundled CLI and presents its structured output.
 @MainActor
 @Observable
 final class AppModel {
     // MARK: Config / identity
 
     private(set) var config = PortableFSConfig()
-    let configPath = PortableFSConfigFile.defaultPath()
+    let configPath: String
+    private let accountHome: String
+    private let startupPathError: String?
     private(set) var configError: String?
 
     var settings: ResolvedControlPlaneSettings {
@@ -59,7 +41,7 @@ final class AppModel {
     }
 
     var isSignedIn: Bool {
-        settings.hasAPICredentials
+        configError == nil && settings.hasAPICredentials
     }
 
     var signedInDescription: String {
@@ -70,69 +52,129 @@ final class AppModel {
         return "\(config.currentProfile) @ \(host)"
     }
 
+    var accountEnvironmentOverrideNames: [String] {
+        ["PORTABLEFS_API_URL", "PORTABLEFS_API_TOKEN"].filter {
+            !(ProcessInfo.processInfo.environment[$0] ?? "").isEmpty
+        }
+    }
+
+    var hasAccountEnvironmentOverrides: Bool {
+        !accountEnvironmentOverrideNames.isEmpty
+    }
+
     // MARK: Volumes and mounts
 
     private(set) var volumes: [ListedVolume] = []
     private(set) var volumesError: String?
     private(set) var isRefreshingVolumes = false
     private(set) var mountStates: [String: MountStateMachine] = [:]
+    private(set) var localMounts: [PortableFSCLIMountRow] = []
+    private(set) var isLocalMountInventoryKnown = false
 
-    // MARK: Daemon
-
-    let daemon = DaemonSupervisor()
-
-    // MARK: Errors
+    // MARK: Errors / sign-in
 
     private(set) var alerts: [AppAlert] = []
     private(set) var isQuitting = false
-
-    // MARK: Sign-in
-
     private(set) var deviceFlow: DeviceFlowPhase = .idle
-    private var deviceFlowTask: Task<Void, Never>?
+    private(set) var isAccountMutationInProgress = false
 
-    // MARK: Settings-backed knobs
+    // MARK: Settings
 
     var mountBaseDirectory: String {
-        didSet { UserDefaults.standard.set(mountBaseDirectory, forKey: Self.mountBaseDirectoryKey) }
-    }
-
-    var daemonBinaryOverride: String {
         didSet {
-            UserDefaults.standard.set(daemonBinaryOverride, forKey: Self.daemonBinaryOverrideKey)
-            daemon.binaryOverride = daemonBinaryOverride
+            if mountBaseDirectoryValidationError == nil {
+                UserDefaults.standard.set(mountBaseDirectory, forKey: Self.mountBaseDirectoryKey)
+            }
         }
     }
 
-    private static let mountBaseDirectoryKey = "mountBaseDirectory"
-    private static let daemonBinaryOverrideKey = "daemonBinaryPath"
+    var mountBaseDirectoryValidationError: String? {
+        Self.validateMountBaseDirectory(mountBaseDirectory)
+    }
 
+    private static let mountBaseDirectoryKey = "mountBaseDirectory"
+
+    private let cli = PortableFSCLI()
+    private var lifecycleHold: PortableFSCLILease?
+    private var deviceFlowTask: Task<Void, Never>?
     private var localPollTask: Task<Void, Never>?
     private var volumePollTask: Task<Void, Never>?
-    private var mountedLeases: [String: MountedAccessLease] = [:]
-    private var pendingLeaseCreateOperations: [String: String] = [:]
+    private var interactiveSessionActivated = false
+    private var isRefreshingLocalState = false
     private var localStateError: String?
+    private var interactiveSessionRequested = false
+
+    private(set) var isLifecycleReady = false
 
     var menuBarSymbolName: String {
-        if mountStates.values.contains(where: { $0.state.isMounted }) {
+        if localMounts.contains(where: { $0.health == "live" }) ||
+            mountStates.values.contains(where: { $0.state.isMounted }) {
             return "externaldrive.fill.badge.checkmark"
         }
         return "externaldrive"
     }
 
-    init() {
-        let defaults = UserDefaults.standard
-        mountBaseDirectory = defaults.string(forKey: Self.mountBaseDirectoryKey)
-            ?? PortableFSAppPaths.defaultMountBaseDirectory()
-        daemonBinaryOverride = defaults.string(forKey: Self.daemonBinaryOverrideKey) ?? ""
-        daemon.binaryOverride = daemonBinaryOverride
-        start()
+    var unlistedLocalMounts: [PortableFSCLIMountRow] {
+        let listed = volumes.reduce(into: [String: ListedVolume]()) {
+            $0[$1.volumeId] = $1
+        }
+        return localMounts.filter { row in
+            if row.health == "stale" {
+                return true
+            }
+            guard let volume = listed[row.volumeId] else {
+                return true
+            }
+            let expectedPath = PortableFSAppPaths.mountPoint(
+                baseDirectory: mountBaseDirectory,
+                volumeID: volume.volumeId
+            )
+            return row.mountPath != expectedPath || row.branch != volume.defaultBranch
+        }
     }
 
-    private func start() {
-        reloadConfig()
+    init() {
+        let defaults = UserDefaults.standard
+        do {
+            let accountHome = try PortableFSAccountHome.resolve()
+            self.accountHome = accountHome
+            configPath = PortableFSConfigFile.defaultPath(homeDirectory: accountHome)
+            startupPathError = nil
+            mountBaseDirectory = defaults.string(forKey: Self.mountBaseDirectoryKey)
+                ?? PortableFSAppPaths.defaultMountBaseDirectory(homeDirectory: accountHome)
+        } catch {
+            accountHome = ""
+            configPath = ""
+            startupPathError = String(describing: error)
+            mountBaseDirectory = ""
+        }
+        if startupPathError == nil {
+            reloadConfig()
+        } else {
+            configError = startupPathError
+        }
         Task {
-            await daemon.start()
+            await acquireAppLifecycle()
+        }
+    }
+
+    /// Polling begins only after the user opens the menu. Launch executes only
+    /// the required lifecycle-holder command; it does not start a daemon,
+    /// inspect mounts, or contact a server.
+    func activateInteractiveSession() {
+        interactiveSessionRequested = true
+        guard isLifecycleReady else {
+            return
+        }
+        startInteractivePolling()
+    }
+
+    private func startInteractivePolling() {
+        guard !interactiveSessionActivated else {
+            return
+        }
+        interactiveSessionActivated = true
+        Task {
             await refreshVolumes()
             await refreshLocalState()
         }
@@ -152,16 +194,69 @@ final class AppModel {
         }
     }
 
+    private func acquireAppLifecycle() async {
+        if let startupPathError {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "PortableFS Could Not Resolve This Account"
+            alert.informativeText = startupPathError
+            alert.runModal()
+            NSApplication.shared.terminate(nil)
+            return
+        }
+        do {
+            let hold = try await cli.holdLifecycle()
+            lifecycleHold = hold
+            isLifecycleReady = true
+            Task {
+                if let failure = await hold.waitForUnexpectedExit() {
+                    handleUnexpectedLifecycleExit(failure)
+                }
+            }
+            if interactiveSessionRequested {
+                startInteractivePolling()
+            }
+            if FirstRunAssistant.shared.shouldPresentAtLaunch {
+                FirstRunAssistant.shared.present()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "PortableFS Could Not Start"
+            alert.informativeText = "PortableFS is being installed or updated, or its lifecycle lock could not be acquired.\n\n\(error.localizedDescription)"
+            alert.runModal()
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    private func handleUnexpectedLifecycleExit(_ error: PortableFSCLIError) {
+        guard !isQuitting else {
+            return
+        }
+        isLifecycleReady = false
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "PortableFS Lifecycle Guard Stopped"
+        alert.informativeText = "The process protecting this app from concurrent replacement exited unexpectedly. PortableFS will close rather than continue without that guarantee.\n\n\(error.localizedDescription)"
+        alert.runModal()
+        NSApplication.shared.terminate(nil)
+    }
+
     // MARK: Config
 
     func reloadConfig() {
         do {
-            config = try PortableFSConfigFile.load(path: configPath)
+            config = try PortableFSConfigFile.load(
+                path: configPath,
+                canonicalHomeDirectory: accountHome
+            )
             configError = nil
         } catch {
             let message = String(describing: error)
-            // Periodic refreshes reload the shared config; report a broken
-            // file once, not on every poll tick.
+            config = PortableFSConfig()
+            volumes = []
+            volumesError = nil
+            mountStates = [:]
             if configError != message {
                 configError = message
                 reportError(title: "Could not read config", detail: message)
@@ -170,62 +265,127 @@ final class AppModel {
     }
 
     func switchProfile(_ name: String) {
-        guard config.profiles[name] != nil || name == config.currentProfile else {
+        guard isLifecycleReady else {
             return
         }
-        guard mountedLeases.isEmpty, MountTable.portableFSMounts().isEmpty else {
-            reportError(
-                title: "Profile switch refused",
-                detail: "Cleanly unmount every PortableFS volume before switching profiles."
-            )
+        guard !hasAccountEnvironmentOverrides else {
+            reportEnvironmentAccountOverride(action: "Profile switch")
             return
         }
-        guard updateConfig({ $0.currentProfile = name }) == nil else {
-            return
-        }
-        volumes = []
         Task {
-            await refreshVolumes()
+            await performSwitchProfile(name)
         }
     }
 
-    func signOut() {
-        guard mountedLeases.isEmpty, MountTable.portableFSMounts().isEmpty else {
-            reportError(
-                title: "Sign out refused",
-                detail: "Cleanly unmount every PortableFS volume before signing out."
-            )
+    private func performSwitchProfile(_ name: String) async {
+        guard await updateConfigUnderAccountGuard(
+            action: "Profile switch",
+            mutate: {
+                guard $0.profiles[name] != nil || name == $0.currentProfile else {
+                    throw PortableFSAccountMutationError.profileNotFound(name)
+                }
+                $0.currentProfile = name
+            }
+        ) == nil else {
             return
         }
-        let currentProfile = config.currentProfile
-        guard updateConfig({ $0.profiles.removeValue(forKey: currentProfile) }) == nil else {
+        volumes = []
+        await refreshVolumes()
+        await refreshLocalState()
+    }
+
+    func signOut() {
+        guard isLifecycleReady else {
+            return
+        }
+        guard !hasAccountEnvironmentOverrides else {
+            reportEnvironmentAccountOverride(action: "Sign out")
+            return
+        }
+        Task {
+            await performSignOut()
+        }
+    }
+
+    private func performSignOut() async {
+        guard await updateConfigUnderAccountGuard(
+            action: "Sign out",
+            mutate: {
+                $0.profiles.removeValue(forKey: $0.currentProfile)
+            }
+        ) == nil else {
             return
         }
         volumes = []
         volumesError = nil
     }
 
-    /// Commits one config mutation atomically. The in-memory identity changes
-    /// only after the shared CLI/app config file was durably replaced.
-    private func updateConfig(_ mutate: (inout PortableFSConfig) -> Void) -> Error? {
-        var next = config
-        mutate(&next)
+    /// Account mutations acquire the same exclusive session guard that every
+    /// Go mount holds shared for its entire lifetime. The holder also performs
+    /// the authoritative mount-record and daemon-attach checks before its
+    /// readiness frame, closing the check/use race that polling cannot close.
+    private func updateConfigUnderAccountGuard(
+        action: String,
+        mutate: (inout PortableFSConfig) throws -> Void
+    ) async -> Error? {
+        guard !isAccountMutationInProgress else {
+            return PortableFSAccountMutationError.alreadyInProgress
+        }
+        isAccountMutationInProgress = true
+        defer {
+            isAccountMutationInProgress = false
+        }
+
+        let accountHold: PortableFSCLILease
         do {
-            try PortableFSConfigFile.save(next, path: configPath)
-            config = next
+            accountHold = try await cli.holdAccountExclusive()
+            localMounts = []
+            isLocalMountInventoryKnown = true
+        } catch {
+            isLocalMountInventoryKnown = false
+            reportError(
+                title: "\(action) refused",
+                detail: "PortableFS could not acquire an exclusive account session with an empty mount and attach inventory, so it did not change account state.\n\n\(error)"
+            )
+            return error
+        }
+        defer {
+            accountHold.release()
+        }
+
+        do {
+            // Reload only after the exclusive holder is ready so an external
+            // CLI mutation that completed while we waited cannot be lost.
+            var next = try PortableFSConfigFile.load(
+                path: configPath,
+                canonicalHomeDirectory: accountHome
+            )
+            try mutate(&next)
+            try PortableFSConfigFile.save(
+                next,
+                path: configPath,
+                canonicalHomeDirectory: accountHome
+            )
+            config = try PortableFSConfigFile.load(
+                path: configPath,
+                canonicalHomeDirectory: accountHome
+            )
             configError = nil
             return nil
         } catch {
-            configError = String(describing: error)
-            reportError(title: "Could not save config", detail: String(describing: error))
+            let detail = String(describing: error)
+            config = PortableFSConfig()
+            volumes = []
+            volumesError = nil
+            mountStates = [:]
+            configError = detail
+            reportError(title: "Could not save config", detail: detail)
             return error
         }
     }
 
     // MARK: Sign-in
 
-    /// Manual token sign-in, mirroring `portablefs login <url> --token <t>`.
-    /// Returns nil on success, otherwise a user-facing failure message.
     func signIn(
         serverURL: String,
         token: String,
@@ -233,6 +393,14 @@ final class AppModel {
         managerToken: String,
         profile: String
     ) async -> String? {
+        guard isLifecycleReady else {
+            return "PortableFS has not acquired its application lifecycle guard."
+        }
+        guard !hasAccountEnvironmentOverrides else {
+            return environmentAccountOverrideMessage(
+                action: "Sign in"
+            )
+        }
         let normalized = ControlPlaneClient.normalizeServerURL(serverURL)
         guard !normalized.isEmpty else {
             return "Server URL is required."
@@ -241,15 +409,17 @@ final class AppModel {
             return "API token is required (or use device sign-in)."
         }
         let profileName = profile.isEmpty ? "default" : profile
-        let verification = await ControlPlaneClient(baseURL: normalized, token: token).verifyCredential()
+        let client = ControlPlaneClient(baseURL: normalized, token: token)
+        let verification = await client.verifyCredential()
         switch verification {
         case .accepted:
-            if let error = saveProfile(
+            let resolvedManagerURL = ControlPlaneClient.normalizeServerURL(managerURL)
+            if let error = await saveProfile(
                 name: profileName,
                 profile: PortableFSProfile(
                     apiUrl: normalized,
                     apiToken: token,
-                    managerUrl: ControlPlaneClient.normalizeServerURL(managerURL),
+                    managerUrl: resolvedManagerURL,
                     managerToken: managerToken
                 )
             ) {
@@ -264,8 +434,16 @@ final class AppModel {
         }
     }
 
-    /// OAuth-style device flow, mirroring `portablefs login <url>`.
     func startDeviceSignIn(serverURL: String, managerURL: String, managerToken: String, profile: String) {
+        guard isLifecycleReady else {
+            return
+        }
+        guard !hasAccountEnvironmentOverrides else {
+            deviceFlow = .failed(
+                message: environmentAccountOverrideMessage(action: "Sign in")
+            )
+            return
+        }
         let normalized = ControlPlaneClient.normalizeServerURL(serverURL)
         guard !normalized.isEmpty else {
             deviceFlow = .failed(message: "Server URL is required.")
@@ -287,10 +465,11 @@ final class AppModel {
     func cancelDeviceSignIn() {
         deviceFlowTask?.cancel()
         deviceFlowTask = nil
-        if case .waitingForApproval = deviceFlow {
+        switch deviceFlow {
+        case .starting, .waitingForApproval:
             deviceFlow = .idle
-        } else if deviceFlow == .starting {
-            deviceFlow = .idle
+        default:
+            break
         }
     }
 
@@ -299,7 +478,12 @@ final class AppModel {
         deviceFlow = .idle
     }
 
-    private func runDeviceSignIn(serverURL: String, managerURL: String, managerToken: String, profile: String) async {
+    private func runDeviceSignIn(
+        serverURL: String,
+        managerURL: String,
+        managerToken: String,
+        profile: String
+    ) async {
         let client = ControlPlaneClient(baseURL: serverURL, token: "")
         let code: DeviceCodeResponse
         do {
@@ -308,7 +492,10 @@ final class AppModel {
             deviceFlow = .failed(message: String(describing: error))
             return
         }
-        deviceFlow = .waitingForApproval(userCode: code.userCode, verificationURL: code.verificationUri)
+        deviceFlow = .waitingForApproval(
+            userCode: code.userCode,
+            verificationURL: code.verificationUri
+        )
         if let url = URL(string: code.verificationUri) {
             NSWorkspace.shared.open(url)
         }
@@ -316,7 +503,9 @@ final class AppModel {
         let deadline = Date().addingTimeInterval(code.expiry)
         while !Task.isCancelled {
             if Date() > deadline {
-                deviceFlow = .failed(message: "Device sign-in expired before the code was entered. Start over.")
+                deviceFlow = .failed(
+                    message: "Device sign-in expired before the code was entered. Start over."
+                )
                 return
             }
             do {
@@ -326,7 +515,7 @@ final class AppModel {
                     if resolvedManagerURL.isEmpty && !serverManagerURL.isEmpty {
                         resolvedManagerURL = ControlPlaneClient.normalizeServerURL(serverManagerURL)
                     }
-                    if let error = saveProfile(
+                    if let error = await saveProfile(
                         name: profile,
                         profile: PortableFSProfile(
                             apiUrl: serverURL,
@@ -335,7 +524,9 @@ final class AppModel {
                             managerToken: managerToken
                         )
                     ) {
-                        deviceFlow = .failed(message: "Sign-in succeeded but the profile could not be saved: \(error)")
+                        deviceFlow = .failed(
+                            message: "Sign-in succeeded but the profile could not be saved: \(error)"
+                        )
                         return
                     }
                     deviceFlow = .succeeded(profile: profile)
@@ -344,7 +535,9 @@ final class AppModel {
                 case .pending:
                     break
                 case let .denied(message):
-                    deviceFlow = .failed(message: "Device sign-in was denied or expired: \(message)")
+                    deviceFlow = .failed(
+                        message: "Device sign-in was denied or expired: \(message)"
+                    )
                     return
                 }
             } catch {
@@ -355,23 +548,38 @@ final class AppModel {
         }
     }
 
-    private func saveProfile(name: String, profile: PortableFSProfile) -> Error? {
-        updateConfig {
+    private func saveProfile(name: String, profile: PortableFSProfile) async -> Error? {
+        await updateConfigUnderAccountGuard(action: "Sign in") {
             $0.profiles[name] = profile
             $0.currentProfile = name
         }
     }
 
-    // MARK: Volumes
+    private func environmentAccountOverrideMessage(action: String) -> String {
+        "\(action) is unavailable because \(accountEnvironmentOverrideNames.joined(separator: ", ")) overrides the saved account. Relaunch PortableFS without those environment variables before changing profiles or credentials."
+    }
+
+    private func reportEnvironmentAccountOverride(action: String) {
+        reportError(
+            title: "\(action) refused",
+            detail: environmentAccountOverrideMessage(action: action)
+        )
+    }
+
+    // MARK: Volumes and local mount state
 
     func refreshAll() async {
+        guard isLifecycleReady else {
+            return
+        }
         await refreshVolumes()
         await refreshLocalState()
     }
 
     func refreshVolumes() async {
-        // The config file is shared with the CLI; pick up `portablefs login`
-        // runs that happened while the app was open.
+        guard isLifecycleReady else {
+            return
+        }
         reloadConfig()
         guard isSignedIn else {
             volumes = []
@@ -382,10 +590,34 @@ final class AppModel {
             return
         }
         isRefreshingVolumes = true
-        defer { isRefreshingVolumes = false }
+        defer {
+            isRefreshingVolumes = false
+        }
         let client = ControlPlaneClient(baseURL: settings.apiURL, token: settings.apiToken)
         do {
-            volumes = try await client.listVolumes()
+            let fetched = try await client.listVolumes()
+            guard fetched.allSatisfy({ Self.isValidVolumeID($0.volumeId) }) else {
+                let invalid = fetched.first(where: { !Self.isValidVolumeID($0.volumeId) })?.volumeId
+                    ?? "<unknown>"
+                throw PortableFSVolumeIdentityError.invalid(invalid)
+            }
+            guard Set(fetched.map(\.volumeId)).count == fetched.count else {
+                throw PortableFSVolumeIdentityError.duplicateVolume
+            }
+            for volume in fetched {
+                guard volume.branches.allSatisfy({ Self.isValidBranchName($0.name) }) else {
+                    throw PortableFSVolumeIdentityError.invalidBranch(volume.volumeId)
+                }
+                guard Set(volume.branches.map(\.name)).count == volume.branches.count else {
+                    throw PortableFSVolumeIdentityError.duplicateBranch(volume.volumeId)
+                }
+                let defaultBranch = volume.defaultBranch
+                guard Self.isValidBranchName(defaultBranch),
+                      volume.branches.filter({ $0.name == defaultBranch }).count == 1 else {
+                    throw PortableFSVolumeIdentityError.missingDefaultBranch(volume.volumeId)
+                }
+            }
+            volumes = fetched
             volumesError = nil
         } catch {
             volumesError = String(describing: error)
@@ -396,403 +628,215 @@ final class AppModel {
         mountStates[volume.volumeId]?.state ?? .unmounted
     }
 
-    /// Reconciles per-volume state with reality: the kernel mount table plus
-    /// the daemon's attach list.
+    func canMount(_ volume: ListedVolume) -> Bool {
+        !isAccountMutationInProgress &&
+            mountBaseDirectoryValidationError == nil &&
+            isLocalMountInventoryKnown &&
+            !localMounts.contains(where: { $0.volumeId == volume.volumeId }) &&
+            mountStates[volume.volumeId]?.state.isBusy != true
+    }
+
     func refreshLocalState() async {
-        await daemon.checkHealth()
-        let kernelMounts = MountTable.portableFSMounts()
-        var attaches: [DaemonAttachStatus] = []
-        if daemon.healthy {
-            do {
-                attaches = try await daemon.control.listAttaches()
-                localStateError = nil
-            } catch {
-                let detail = String(describing: error)
-                if localStateError != detail {
-                    localStateError = detail
-                    reportError(
-                        title: "Could not reconcile local mounts",
-                        detail: "PortableFS preserved the current mount state because the daemon attach list could not be read: \(detail)"
+        guard isLifecycleReady else {
+            return
+        }
+        guard !isRefreshingLocalState else {
+            return
+        }
+        isRefreshingLocalState = true
+        defer {
+            isRefreshingLocalState = false
+        }
+        do {
+            let rows = try await cli.mounts()
+            localMounts = rows
+            isLocalMountInventoryKnown = true
+            let rowsByVolume = Dictionary(grouping: rows, by: \.volumeId)
+            for volume in volumes {
+                if mountStates[volume.volumeId]?.state.isBusy == true {
+                    continue
+                }
+                let expectedPath = PortableFSAppPaths.mountPoint(
+                    baseDirectory: mountBaseDirectory,
+                    volumeID: volume.volumeId
+                )
+                guard let row = rowsByVolume[volume.volumeId]?.first(where: {
+                    $0.mountPath == expectedPath && $0.branch == volume.defaultBranch
+                }) else {
+                    mountStates[volume.volumeId] = MountStateMachine(state: .unmounted)
+                    continue
+                }
+                if row.requiresCleanup {
+                    mountStates[volume.volumeId] = MountStateMachine(
+                        state: .cleanupRequired(
+                            mountPath: row.mountPath,
+                            operationPhase: row.operationPhase
+                        )
+                    )
+                } else if row.health == "stale" {
+                    mountStates[volume.volumeId] = MountStateMachine(
+                        state: .failed(
+                            message: "Stale mount record at \(row.mountPath); run portablefs umount \(row.mountPath)."
+                        )
+                    )
+                } else {
+                    mountStates[volume.volumeId] = MountStateMachine(
+                        state: .mounted(
+                            attachRef: row.attachRef ?? "cli-owned",
+                            mountPath: row.mountPath
+                        )
                     )
                 }
-                return
             }
-        }
-        var mountsByRef: [String: MountedFilesystem] = [:]
-        for mount in kernelMounts {
-            if let ref = mount.attachRef {
-                mountsByRef[ref] = mount
+            localStateError = nil
+        } catch {
+            isLocalMountInventoryKnown = false
+            let detail = String(describing: error)
+            if localStateError != detail {
+                localStateError = detail
+                reportError(title: "Could not read local mounts", detail: detail)
             }
-        }
-        for volume in volumes {
-            var machine = mountStates[volume.volumeId] ?? MountStateMachine()
-            if machine.state.isBusy {
-                continue
-            }
-            let volumeAttaches = attaches.filter { $0.volumeId == volume.volumeId }
-            if let live = volumeAttaches.compactMap({ attach in mountsByRef[attach.attachRef].map { (attach, $0) } }).first {
-                machine.apply(.observedMounted(attachRef: live.0.attachRef, mountPath: live.1.mountPoint))
-            } else if daemon.healthy {
-                machine.apply(.observedUnmounted)
-            }
-            mountStates[volume.volumeId] = machine
         }
     }
 
     // MARK: Mount / unmount
 
     func mount(_ volume: ListedVolume) {
+        guard isLifecycleReady else {
+            return
+        }
         Task {
             await performMount(volume)
         }
     }
 
     func unmount(_ volume: ListedVolume) {
+        guard isLifecycleReady else {
+            return
+        }
         Task {
             await performUnmount(volume)
         }
     }
 
-    private func applyMountEvent(_ volumeID: String, _ event: VolumeMountEvent) {
-        var machine = mountStates[volumeID] ?? MountStateMachine()
-        machine.apply(event)
-        mountStates[volumeID] = machine
+    func unmountLocalMount(_ row: PortableFSCLIMountRow) {
+        guard isLifecycleReady else {
+            return
+        }
+        Task {
+            do {
+                try await cli.unmount(mountPath: row.mountPath)
+            } catch {
+                reportError(
+                    title: "Unmount \(row.volumeId) failed",
+                    detail: String(describing: error)
+                )
+            }
+            await refreshLocalState()
+        }
     }
 
     private func performMount(_ volume: ListedVolume) async {
         let volumeID = volume.volumeId
-        guard !(mountStates[volumeID]?.state.isBusy ?? false) else {
+        if let mountBaseDirectoryValidationError {
+            reportError(
+                title: "Mount refused",
+                detail: mountBaseDirectoryValidationError
+            )
             return
         }
-        guard mountedLeases[volumeID] == nil else {
+        guard !isAccountMutationInProgress else {
             reportError(
-                title: "Mount \(volumeID) refused",
-                detail: "This volume still owns an access lease from an incomplete detach or release. Quit PortableFS to retry that exact cleanup operation before mounting again."
+                title: "Mount refused",
+                detail: "Finish the active account change before mounting."
             )
+            return
+        }
+        guard mountStates[volumeID]?.state.isBusy != true else {
             return
         }
         guard isSignedIn else {
             reportError(title: "Not signed in", detail: "Sign in before mounting volumes.")
             return
         }
-        guard daemon.healthy else {
+        guard isLocalMountInventoryKnown else {
             reportError(
-                title: "Daemon is not running",
-                detail: "portablefsd is not answering on \(daemon.controlSocketPath). \(daemon.statusDetail)"
+                title: "Mount refused",
+                detail: "PortableFS could not verify the complete local mount inventory. Refresh and resolve that error before mounting."
             )
             return
         }
-        applyMountEvent(volumeID, .mountRequested)
-        let branch = volume.defaultBranch
-        let createKey = volumeID + "\u{0}" + branch
-        let mountPath = PortableFSAppPaths.mountPoint(baseDirectory: mountBaseDirectory, volumeID: volumeID)
-        var ensuredAttachRef: String?
-        var managerClient: ControlPlaneClient?
-        var accessSession: AccessSessionInfo?
+        guard !localMounts.contains(where: { $0.volumeId == volumeID }) else {
+            reportError(
+                title: "Mount refused",
+                detail: "\(volumeID) already has a local mount record. Unmount it before mounting the volume at another location."
+            )
+            return
+        }
+        guard Self.isValidVolumeID(volumeID) else {
+            reportError(
+                title: "Mount refused",
+                detail: "The server returned an invalid volume identifier. Expected 1–220 ASCII letters, digits, underscores, or hyphens."
+            )
+            return
+        }
+
+        mountStates[volumeID] = MountStateMachine(state: .mintingSession)
+        let mountPath = PortableFSAppPaths.mountPoint(
+            baseDirectory: mountBaseDirectory,
+            volumeID: volumeID
+        )
         do {
-            // 1. Create an access lease against the authority manager.
-            let manager = settings.managerEndpoint()
-            let client = ControlPlaneClient(baseURL: manager.url, token: manager.token)
-            managerClient = client
-            let operationID = pendingLeaseCreateOperations[createKey]
-                ?? UUID().uuidString.lowercased()
-            pendingLeaseCreateOperations[createKey] = operationID
-            let session = try await client.accessSession(
+            let mounted = try await cli.mount(
                 volumeID: volumeID,
-                branch: branch,
-                operationID: operationID
-            )
-            pendingLeaseCreateOperations.removeValue(forKey: createKey)
-            accessSession = session
-            applyMountEvent(volumeID, .sessionMinted)
-
-            // 2. Attach through the portablefsd control socket.
-            let attach = try await daemon.control.ensureAttach(DaemonEnsureAttachRequest(
-                volumeId: volumeID,
-                branch: branch,
-                authorityUrl: session.authorityUrl,
-                authToken: session.token,
-                mountPath: mountPath
-            ))
-            ensuredAttachRef = attach.attachRef
-            applyMountEvent(volumeID, .attachEnsured(attachRef: attach.attachRef))
-            startLeaseMaintenance(
-                volumeID: volumeID,
-                client: client,
-                attachRef: attach.attachRef,
-                session: session
-            )
-
-            // 3. FSKit mount of the pfslocal-backed filesystem.
-            try FileManager.default.createDirectory(atPath: mountPath, withIntermediateDirectories: true)
-            try await MountCommand.mount(attachRef: attach.attachRef, mountPath: mountPath)
-            try await MountCommand.waitUntilReady(
-                attachRef: attach.attachRef,
+                branch: volume.defaultBranch,
                 mountPath: mountPath
             )
-            applyMountEvent(volumeID, .mountCompleted(mountPath: mountPath))
+            mountStates[volumeID] = MountStateMachine(
+                state: .mounted(
+                    attachRef: mounted.attachRef ?? "cli-owned",
+                    mountPath: mounted.mountPath
+                )
+            )
         } catch {
-            if ControlPlaneClient.accessLeaseFailureDisposition(error) == .terminal {
-                pendingLeaseCreateOperations.removeValue(forKey: createKey)
-            }
-            // Cleanup is ordered and fail-closed. Never delete the daemon
-            // attach while its kernel mount still exists: that would strand
-            // a mounted FSKit volume with no backend.
-            var cleanupDetails: [String] = []
-            var mayDetach = true
-            if let ensuredAttachRef,
-               MountCommand.hasLiveMount(attachRef: ensuredAttachRef, mountPath: mountPath) {
-                do {
-                    try await MountCommand.unmount(mountPath: mountPath)
-                } catch {
-                    if MountCommand.hasLiveMount(attachRef: ensuredAttachRef, mountPath: mountPath) {
-                        mayDetach = false
-                        cleanupDetails.append(
-                            "Cleanup unmount failed; the kernel mount and daemon attach were deliberately left live: \(error)"
-                        )
-                    } else {
-                        cleanupDetails.append("Cleanup unmount reported an error after the mount disappeared: \(error)")
-                    }
-                }
-            }
-            if mayDetach, let ensuredAttachRef {
-                do {
-                    try await daemon.control.deleteAttach(ref: ensuredAttachRef)
-                } catch {
-                    mayDetach = false
-                    cleanupDetails.append("Cleanup detach failed; the attach remains registered: \(error)")
-                }
-            }
-            if mayDetach {
-                if mountedLeases[volumeID] != nil {
-                    if let releaseError = await stopLeaseMaintenance(volumeID: volumeID, release: true) {
-                        cleanupDetails.append("Cleanup lease release failed: \(releaseError)")
-                    }
-                } else if let managerClient, let accessSession {
-                    let operationID = UUID().uuidString.lowercased()
-                    if let releaseError = await releaseAccessSessionExactly(
-                        client: managerClient,
-                        session: accessSession,
-                        operationID: operationID
-                    ) {
-                        cleanupDetails.append("Cleanup lease release failed: \(releaseError)")
-                    }
-                }
-            }
-            var detail = describeMountFailure(error)
-            if !cleanupDetails.isEmpty {
-                detail += "\n\n" + cleanupDetails.joined(separator: "\n")
-            }
-            applyMountEvent(volumeID, .failed(message: shortMessage(detail)))
-            reportError(title: "Mount \(volumeID) failed", detail: detail)
+            let detail = String(describing: error)
+            mountStates[volumeID] = MountStateMachine(
+                state: .failed(message: shortMessage(detail))
+            )
+            reportError(title: "Mount \(volumeID) failed", detail: describeMountFailure(detail))
         }
         await refreshLocalState()
     }
 
     private func performUnmount(_ volume: ListedVolume) async {
         let volumeID = volume.volumeId
-        guard case let .mounted(attachRef, mountPath) = mountState(for: volume) else {
+        let state = mountState(for: volume)
+        let attachRef: String
+        let mountPath: String
+        switch state {
+        case let .mounted(ref, path):
+            attachRef = ref
+            mountPath = path
+        case let .cleanupRequired(path, _):
+            attachRef = "cleanup-required"
+            mountPath = path
+        default:
             return
         }
-        applyMountEvent(volumeID, .unmountRequested)
+        mountStates[volumeID] = MountStateMachine(
+            state: .unmounting(attachRef: attachRef, mountPath: mountPath)
+        )
         do {
-            // Normal unmount is a durability operation: drain and prove the
-            // authority barrier while the kernel mount is still usable.
-            try await daemon.control.sync(ref: attachRef)
-            try await MountCommand.unmount(mountPath: mountPath)
-            applyMountEvent(volumeID, .unmountCompleted)
+            try await cli.unmount(mountPath: mountPath)
+            mountStates[volumeID] = MountStateMachine(state: .unmounted)
         } catch {
             let detail = String(describing: error)
-            applyMountEvent(volumeID, .failed(message: shortMessage(detail)))
-            reportError(title: "Unmount \(volumeID) failed", detail: detail)
-            await refreshLocalState()
-            return
-        }
-        do {
-            try await daemon.control.deleteAttach(ref: attachRef)
-            applyMountEvent(volumeID, .detachCompleted)
-        } catch {
-            let detail = String(describing: error)
-            applyMountEvent(volumeID, .failed(message: shortMessage(detail)))
-            reportError(title: "Detach \(volumeID) failed", detail: "The volume was unmounted but the daemon attach could not be removed: \(detail)")
-            await refreshLocalState()
-            return
-        }
-        if let releaseError = await stopLeaseMaintenance(volumeID: volumeID, release: true) {
-            reportError(
-                title: "Lease release \(volumeID) failed",
-                detail: "The volume is safely unmounted and detached, but its access lease could not be explicitly released: \(releaseError)"
+            mountStates[volumeID] = MountStateMachine(
+                state: .failed(message: shortMessage(detail))
             )
+            reportError(title: "Unmount \(volumeID) failed", detail: detail)
         }
         await refreshLocalState()
-    }
-
-    // MARK: Access lease lifecycle
-
-    private func startLeaseMaintenance(
-        volumeID: String,
-        client: ControlPlaneClient,
-        attachRef: String,
-        session: AccessSessionInfo
-    ) {
-        mountedLeases[volumeID]?.task?.cancel()
-        let runtime = MountedAccessLease(client: client, attachRef: attachRef, session: session)
-        mountedLeases[volumeID] = runtime
-        runtime.task = Task { [weak self, weak runtime] in
-            guard let self, let runtime else {
-                return
-            }
-            await self.runLeaseMaintenance(volumeID: volumeID, runtime: runtime)
-        }
-    }
-
-    /// Advances only the lease that was minted for this mount. Ambiguous
-    /// responses retry the same operation ID; every definitive refusal is a
-    /// surfaced terminal failure. There is intentionally no create/reacquire
-    /// path here.
-    private func runLeaseMaintenance(volumeID: String, runtime: MountedAccessLease) async {
-        while !Task.isCancelled, mountedLeases[volumeID] === runtime {
-            let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
-            let remainingMs = runtime.session.expiresAtMs - nowMs
-            guard remainingMs > 0 else {
-                reportLeaseTerminalFailure(
-                    volumeID: volumeID,
-                    detail: "The access lease expired before its renewal completed. PortableFS did not create a replacement lease."
-                )
-                return
-            }
-
-            let waitMs: Int64
-            if runtime.pendingRenewalOperationID == nil {
-                waitMs = max(5_000, remainingMs / 2)
-            } else {
-                waitMs = min(5_000, max(1_000, remainingMs / 4))
-            }
-            do {
-                try await Task.sleep(for: .milliseconds(waitMs))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled, mountedLeases[volumeID] === runtime else {
-                return
-            }
-
-            let operationID = runtime.pendingRenewalOperationID
-                ?? UUID().uuidString.lowercased()
-            runtime.pendingRenewalOperationID = operationID
-            do {
-                let renewed = try await runtime.client.renewAccessSession(
-                    runtime.session,
-                    operationID: operationID
-                )
-                if renewed.token != runtime.session.token {
-                    // The app does not request rotation, but installing an
-                    // explicitly returned token keeps this strict if the
-                    // server ever rotates by policy.
-                    try await daemon.control.setCredential(
-                        ref: runtime.attachRef,
-                        authToken: renewed.token
-                    )
-                }
-                runtime.session = renewed
-                runtime.pendingRenewalOperationID = nil
-                runtime.renewalDelayWasReported = false
-            } catch {
-                switch ControlPlaneClient.accessLeaseFailureDisposition(error) {
-                case .retrySameOperation:
-                    if !runtime.renewalDelayWasReported {
-                        runtime.renewalDelayWasReported = true
-                        reportError(
-                            title: "Lease renewal delayed for \(volumeID)",
-                            detail: "PortableFS will retry the exact same renewal operation; it will not create a replacement lease.\n\n\(error)"
-                        )
-                    }
-                case .terminal:
-                    reportLeaseTerminalFailure(
-                        volumeID: volumeID,
-                        detail: "The manager definitively refused the existing access lease. PortableFS did not create a replacement lease.\n\n\(error)"
-                    )
-                    return
-                }
-            }
-        }
-    }
-
-    private func reportLeaseTerminalFailure(volumeID: String, detail: String) {
-        reportError(title: "Access lease failed for \(volumeID)", detail: detail)
-    }
-
-    /// Retries only the same release operation after an ambiguous response.
-    /// The bounded retry improves clean-unmount behavior without creating a
-    /// new operation, lease, or route. A terminal response or exhausted
-    /// deadline is returned to the caller unchanged and surfaced.
-    private func releaseAccessSessionExactly(
-        client: ControlPlaneClient,
-        session: AccessSessionInfo,
-        operationID: String
-    ) async -> Error? {
-        let deadline = Date().addingTimeInterval(10)
-        var delayMs: Int64 = 100
-        while true {
-            do {
-                try await client.releaseAccessSession(
-                    session,
-                    operationID: operationID
-                )
-                return nil
-            } catch {
-                guard ControlPlaneClient.accessLeaseFailureDisposition(error) == .retrySameOperation,
-                      Date() < deadline else {
-                    return error
-                }
-                let remainingMs = max(
-                    1,
-                    Int64(deadline.timeIntervalSinceNow * 1_000)
-                )
-                do {
-                    try await Task.sleep(
-                        for: .milliseconds(min(delayMs, remainingMs))
-                    )
-                } catch {
-                    return error
-                }
-                delayMs = min(delayMs * 2, 1_000)
-            }
-        }
-    }
-
-    /// Stops renewal and optionally releases the latest confirmed lease.
-    /// Returns the exact release failure so callers cannot silently hide it.
-    private func stopLeaseMaintenance(volumeID: String, release: Bool) async -> Error? {
-        guard let runtime = mountedLeases[volumeID] else {
-            return nil
-        }
-        runtime.task?.cancel()
-        runtime.task = nil
-        guard release else {
-            mountedLeases.removeValue(forKey: volumeID)
-            return nil
-        }
-        let operationID = runtime.pendingReleaseOperationID
-            ?? UUID().uuidString.lowercased()
-        runtime.pendingReleaseOperationID = operationID
-        if let error = await releaseAccessSessionExactly(
-            client: runtime.client,
-            session: runtime.session,
-            operationID: operationID
-        ) {
-            return error
-        } else {
-            mountedLeases.removeValue(forKey: volumeID)
-            return nil
-        }
-    }
-
-    private func stopLeaseMaintenance(attachRef: String, release: Bool) async -> Error? {
-        guard let volumeID = mountedLeases.first(where: { $0.value.attachRef == attachRef })?.key else {
-            return nil
-        }
-        return await stopLeaseMaintenance(volumeID: volumeID, release: release)
     }
 
     func openInFinder(_ volume: ListedVolume) {
@@ -802,14 +846,10 @@ final class AppModel {
         NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
     }
 
-    private func describeMountFailure(_ error: Error) -> String {
-        let text = String(describing: error)
-        if error is MountCommandError {
-            return text + "\n\nIf this is the first run, enable the PortableFS file system extension: " +
-                "System Settings -> General -> Login Items & Extensions -> File System Extensions, " +
-                "then retry the mount. Also confirm portablefsd is healthy (menu: Daemon status)."
-        }
-        return text
+    private func describeMountFailure(_ detail: String) -> String {
+        detail + "\n\nIf this is the first mount, open File System Extension Setup from " +
+            "the PortableFS menu and confirm the extension is enabled. Only a successful " +
+            "mount verifies enablement."
     }
 
     private func shortMessage(_ detail: String) -> String {
@@ -817,7 +857,49 @@ final class AppModel {
         return firstLine.count > 120 ? String(firstLine.prefix(117)) + "…" : firstLine
     }
 
-    // MARK: Errors
+    private static func isValidVolumeID(_ value: String) -> Bool {
+        let bytes = value.utf8
+        guard !bytes.isEmpty, bytes.count <= 220 else {
+            return false
+        }
+        return bytes.allSatisfy { byte in
+            (byte >= 48 && byte <= 57) ||
+                (byte >= 65 && byte <= 90) ||
+                (byte >= 97 && byte <= 122) ||
+                byte == 95 ||
+                byte == 45
+        }
+    }
+
+    private static func isValidBranchName(_ value: String) -> Bool {
+        !value.isEmpty && value.count <= 128 && !value.unicodeScalars.contains {
+            $0.value == 0 || CharacterSet.controlCharacters.contains($0)
+        }
+    }
+
+    private static func validateMountBaseDirectory(_ value: String) -> String? {
+        guard !value.isEmpty else {
+            return "Choose a mount base directory."
+        }
+        guard value.hasPrefix("/") else {
+            return "The mount base directory must be an absolute path."
+        }
+        guard !value.unicodeScalars.contains(where: {
+            $0.value == 0 || CharacterSet.controlCharacters.contains($0)
+        }) else {
+            return "The mount base directory contains control characters."
+        }
+        let clean = URL(fileURLWithPath: value, isDirectory: true).standardizedFileURL.path
+        guard clean == value else {
+            return "Use a clean absolute mount path without ~, '.', '..', or a trailing slash."
+        }
+        guard value != "/" else {
+            return "The filesystem root cannot be used as the mount base directory."
+        }
+        return nil
+    }
+
+    // MARK: Errors / quit
 
     func reportError(title: String, detail: String) {
         alerts.insert(AppAlert(title: title, detail: detail), at: 0)
@@ -835,70 +917,55 @@ final class AppModel {
         alerts = []
     }
 
-    // MARK: Quit
-
-    /// Cleanly drains and unmounts every PortableFS mount, then exits. The
-    /// daemon intentionally outlives the app and may be stopped explicitly
-    /// with the matching CLI once it is idle.
+    /// The CLI owns persistent mounts, so quitting the presentation process
+    /// does not mutate or reconstruct their lifecycle.
     func quitApp() {
         guard !isQuitting else {
             return
         }
         isQuitting = true
-        Task {
-            for mount in MountTable.portableFSMounts() {
-                guard let attachRef = mount.attachRef else {
-                    reportError(
-                        title: "Quit refused",
-                        detail: "Could not identify the PortableFS attach mounted at \(mount.mountPoint)."
-                    )
-                    isQuitting = false
-                    return
-                }
-                do {
-                    try await daemon.control.sync(ref: attachRef)
-                    try await MountCommand.unmount(mountPath: mount.mountPoint)
-                    try await daemon.control.deleteAttach(ref: attachRef)
-                    if let releaseError = await stopLeaseMaintenance(attachRef: attachRef, release: true) {
-                        throw releaseError
-                    }
-                } catch {
-                    reportError(
-                        title: "Quit refused",
-                        detail: "Could not cleanly unmount \(mount.mountPoint): \(error)"
-                    )
-                    await refreshLocalState()
-                    isQuitting = false
-                    return
-                }
-            }
-            // A failed detach may leave an unmounted daemon attach plus its
-            // lease. Clean those explicitly; release retries preserve the
-            // original operation ID held by stopLeaseMaintenance.
-            for (volumeID, runtime) in Array(mountedLeases) {
-                do {
-                    try await daemon.control.deleteAttach(ref: runtime.attachRef)
-                } catch {
-                    reportError(
-                        title: "Quit refused",
-                        detail: "Could not detach the remaining \(volumeID) attach \(runtime.attachRef): \(error)"
-                    )
-                    isQuitting = false
-                    return
-                }
-                if let releaseError = await stopLeaseMaintenance(volumeID: volumeID, release: true) {
-                    reportError(
-                        title: "Quit refused",
-                        detail: "Could not release the remaining \(volumeID) access lease: \(releaseError)"
-                    )
-                    isQuitting = false
-                    return
-                }
-            }
-            localPollTask?.cancel()
-            volumePollTask?.cancel()
-            deviceFlowTask?.cancel()
-            NSApplication.shared.terminate(nil)
+        localPollTask?.cancel()
+        volumePollTask?.cancel()
+        deviceFlowTask?.cancel()
+        lifecycleHold?.release()
+        lifecycleHold = nil
+        NSApplication.shared.terminate(nil)
+    }
+}
+
+private enum PortableFSVolumeIdentityError: LocalizedError {
+    case invalid(String)
+    case duplicateVolume
+    case invalidBranch(String)
+    case duplicateBranch(String)
+    case missingDefaultBranch(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalid(value):
+            return "The server returned invalid volume identifier \(value). Expected [A-Za-z0-9_-]{1,220}; no volumes were displayed."
+        case .duplicateVolume:
+            return "The server returned duplicate volume identifiers; no volumes were displayed."
+        case let .invalidBranch(volumeID):
+            return "The server returned an invalid branch identity for \(volumeID); no volumes were displayed."
+        case let .duplicateBranch(volumeID):
+            return "The server returned duplicate branch identities for \(volumeID); no volumes were displayed."
+        case let .missingDefaultBranch(volumeID):
+            return "The server returned no unique valid default branch for \(volumeID); no volumes were displayed."
+        }
+    }
+}
+
+private enum PortableFSAccountMutationError: LocalizedError {
+    case profileNotFound(String)
+    case alreadyInProgress
+
+    var errorDescription: String? {
+        switch self {
+        case let .profileNotFound(name):
+            return "Saved profile \(name) no longer exists; account state was not changed."
+        case .alreadyInProgress:
+            return "Another account change is already in progress."
         }
     }
 }

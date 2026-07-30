@@ -118,8 +118,9 @@ services:
       # authenticated by per-mount access-lease tokens, never production-safe).
       # Production authority MODE otherwise requires router TLS, so the
       # documented plaintext override is mandatory here — without it the manager
-      # refuses to start. Real deployments set TLS cert/key instead (see
-      # docs/self-hosting.md).
+      # refuses to start. Real deployments select a TLS mode, exact server
+      # name, and certificate material instead (see docs/self-hosting.md).
+      PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE: "plaintext"
       PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION: "1"
       PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR: "0.0.0.0:2050"
       # The address mount clients dial (the published router port). In

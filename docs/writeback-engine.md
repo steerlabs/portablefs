@@ -72,9 +72,10 @@ vcs/internal/writeback/
 - Normal unmount cannot succeed with an unshipped acknowledged tail: the
   drain barrier runs while the mount is fully alive and a failure refuses the
   unmount (`portablefs umount` exits nonzero; the FSKit/FUSE detach keeps
-  serving). Only the explicit force path (`portablefs umount --force`, the
-  daemon's `?force=1` detach) parks the tail as a durable recovery job —
-  registered OUTSIDE the attach in the WAL store — and PRINTS the job ID.
+  serving). Only the explicit force path (`portablefs umount --force`, which
+  drives the daemon-owned `POST /v1/attaches/{ref}/unmount?force=1`
+  transaction on FSKit) parks the tail as a durable recovery job — registered
+  OUTSIDE the attach in the WAL store — and PRINTS the job ID.
 - Recovery is an ATTACH-READINESS GATE: `writeback.Open` drains every prior
   parked stream (or parks it in an explicit terminal conflict/corrupt state)
   BEFORE the mount serves. A transient failure fails the attach; there is no

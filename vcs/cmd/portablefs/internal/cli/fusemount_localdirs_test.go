@@ -15,11 +15,12 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 )
 
-// skipWithoutFUSE gates the real-kernel-mount tests on a usable unprivileged
-// FUSE environment (Linux with /dev/fuse and a fusermount helper — e.g. any
-// stock ubuntu CI runner). The graft SEMANTICS are pinned unconditionally by
-// vcs/internal/localdirs's unit tests; this file proves the kernel-facing
-// wiring end to end where a kernel is available.
+// skipWithoutFUSE gates the real-kernel-mount tests on the prerequisites that
+// can be checked without attempting a mount. Some containerized Linux hosts
+// expose /dev/fuse and a helper but still deny the mount syscall; that final
+// capability is handled by skipIfFUSEMountForbidden below. The graft semantics
+// are pinned unconditionally by vcs/internal/localdirs's unit tests; this file
+// proves the kernel-facing wiring end to end where a kernel mount is permitted.
 func skipWithoutFUSE(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -32,6 +33,19 @@ func skipWithoutFUSE(t *testing.T) {
 		if _, err := exec.LookPath("fusermount"); err != nil {
 			t.Skip("fusermount3/fusermount not in PATH")
 		}
+	}
+}
+
+// skipIfFUSEMountForbidden distinguishes a host capability restriction from a
+// PortableFS mount failure. EPERM while go-fuse is performing the kernel mount
+// means the test host does not permit FUSE (for example, an unprivileged CI
+// container). Every other error remains a hard test failure.
+func skipIfFUSEMountForbidden(t *testing.T, err error) {
+	t.Helper()
+	if err != nil &&
+		strings.HasPrefix(err.Error(), "mount ") &&
+		(errors.Is(err, syscall.EPERM) || strings.Contains(strings.ToLower(err.Error()), "operation not permitted")) {
+		t.Skipf("host does not permit a real FUSE mount: %v", err)
 	}
 }
 
@@ -97,18 +111,24 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 
 	mnt := t.TempDir()
 	backing := filepath.Join(t.TempDir(), "local", "sid")
-	m, err := mountFUSE(addr, &sessionTokenSource{}, mnt, perfOptions{}, localDirsMountConfig{
+	m, err := mountFUSE(addr, &sessionTokenSource{}, dataPlaneTransport{Mode: dataPlaneTransportPlaintext}, mnt, "mnt_AAAAAAAAAAAAAAAAAAAAAA", "direct", "", perfOptions{}, localDirsMountConfig{
 		dirs:        []string{"agent-app/node_modules"},
 		backingRoot: backing,
 	})
 	if err != nil {
+		skipIfFUSEMountForbidden(t, err)
 		t.Fatalf("mountFUSE: %v", err)
 	}
+	installTestDirectDetach(t, m, mnt, "mnt_AAAAAAAAAAAAAAAAAAAAAA")
 	unmounted := false
 	t.Cleanup(func() {
 		if !unmounted {
-			m.Unmount()
-			m.Wait()
+			if err := m.Unmount(); err != nil {
+				t.Errorf("cleanup unmount: %v", err)
+			}
+			if err := m.Wait(); err != nil {
+				t.Errorf("cleanup wait: %v", err)
+			}
 		}
 	})
 	if strings.Join(m.localDirs, ",") != "agent-app/node_modules,target" {
@@ -250,8 +270,12 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 		}
 	}
 
-	m.Unmount()
-	m.Wait()
+	if err := m.Unmount(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Wait(); err != nil {
+		t.Fatal(err)
+	}
 	unmounted = true
 }
 
@@ -264,14 +288,26 @@ func TestFUSELocalDirsComposeWithWriteback(t *testing.T) {
 	seed := seedClient(t, addr)
 
 	mnt := t.TempDir()
-	m, err := mountFUSE(addr, &sessionTokenSource{}, mnt, perfOptionsFromEnv(func(string) string { return "" }), localDirsMountConfig{
+	m, err := mountFUSE(addr, &sessionTokenSource{}, dataPlaneTransport{Mode: dataPlaneTransportPlaintext}, mnt, "mnt_BBBBBBBBBBBBBBBBBBBBBB", "direct", "", perfOptionsFromEnv(func(string) string { return "" }), localDirsMountConfig{
 		dirs:        []string{"node_modules"},
 		backingRoot: filepath.Join(t.TempDir(), "local", "sid"),
 	})
 	if err != nil {
+		skipIfFUSEMountForbidden(t, err)
 		t.Fatalf("mountFUSE: %v", err)
 	}
-	defer func() { m.Unmount(); m.Wait() }()
+	installTestDirectDetach(t, m, mnt, "mnt_BBBBBBBBBBBBBBBBBBBBBB")
+	unmounted := false
+	defer func() {
+		if !unmounted {
+			if err := m.Unmount(); err != nil {
+				t.Errorf("cleanup unmount: %v", err)
+			}
+			if err := m.Wait(); err != nil {
+				t.Errorf("cleanup wait: %v", err)
+			}
+		}
+	}()
 
 	if err := os.Mkdir(filepath.Join(mnt, "node_modules"), 0o755); err != nil {
 		t.Fatal(err)
@@ -283,8 +319,13 @@ func TestFUSELocalDirsComposeWithWriteback(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The unmount drain barrier flushes any delegated write-back tail.
-	m.Unmount()
-	m.Wait()
+	if err := m.Unmount(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	unmounted = true
 
 	if data, st, err := seed.Read("src.go", 0, 64); err != nil || st != fsproto.OK || string(data) != "shared" {
 		t.Fatalf("volume write must drain at unmount: %q st=%d err=%v", data, st, err)
@@ -292,4 +333,23 @@ func TestFUSELocalDirsComposeWithWriteback(t *testing.T) {
 	if _, st, err := seed.Getattr("node_modules/dep.js"); err != nil || st != fsproto.ENOENT {
 		t.Fatalf("graft write must never flush: st=%d err=%v", st, err)
 	}
+}
+
+func installTestDirectDetach(t *testing.T, m *fuseMount, mountPath, mountInstanceID string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Fatal("direct FUSE detach test helper is Linux-only")
+	}
+	kernelMountID, err := captureFUSEKernelMountID(mountPath, mountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mountState{
+		MountPath:       mountPath,
+		Strategy:        "fuse",
+		MountInstanceID: mountInstanceID,
+		KernelMountID:   kernelMountID,
+		MountMechanism:  "direct",
+	}
+	m.detachExact = func() error { return platformUnmountRecorded(&state) }
 }

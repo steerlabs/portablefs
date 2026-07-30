@@ -5,7 +5,7 @@ This directory contains the macOS FSKit frontend for PortableFS.
 ## Layout
 
 - `PortableFSKit`: Swift package with the pfslocal client, `VolumeCore`, macOS 26 FSKit Operations adapter, generated protobuf bindings, mock daemon tests, and `PortableFSAppCore` (config file handling, control-plane API client, portablefsd control-socket client, mount state machine — the testable core of the menu-bar app).
-- `PortableFSApp`: the PortableFS menu-bar app (`PortableFSApp.app` + embedded `PortableFSExt.appex`). Signs in to a PortableFS control plane, lists volumes, manages a child `portablefsd`, and mounts volumes via FSKit. This is the dogfood target.
+- `PortableFSApp`: the PortableFS menu-bar app (`PortableFS.app` + embedded CLI, daemon, and `PortableFSExt.appex`). It is a presentation layer over the bundled CLI, which is the sole mount-lifecycle owner.
 - `PortableFSKitDev`: minimal Xcode host app plus `PortableFSDev.appex` for manual FSKit registration and mount testing. Kept for the package's test/verification loop.
 
 ## PortableFS.app (menu-bar app)
@@ -14,10 +14,15 @@ This directory contains the macOS FSKit frontend for PortableFS.
 
 - **Sign in** mirrors `portablefs login`: device flow (`POST /v1/auth/device/code`, browser approval, token polling) or a pasted pre-issued token. Credentials are stored in the same config file as the CLI (`~/.config/portablefs/config.json`, `currentProfile` + `profiles` with `apiUrl`/`apiToken`/`managerUrl`/`managerToken`, written atomically with mode 0600), so the app and CLI share sessions and profiles.
 - **Volumes** come from `GET {apiUrl}/v1/volumes`. Each volume shows a mounted indicator plus Mount / Unmount / Open in Finder actions.
-- **Mount flow** per volume: mint an access session against the configured authority manager -> `POST /v1/attaches` on the portablefsd control socket (authority URL + token + volume/branch) -> `/sbin/mount -t pfs pfs://<attachRef> <base>/<volume>` (default base `~/PortableFS`, configurable in Settings). A normal unmount synchronizes the attach before removing the kernel mount, then deletes the attach.
-- **Daemon management**: release builds bundle the exact universal `portablefsd` binary in the app. The app adopts only that exact running build or spawns it as a child with sockets inside the app-group container and state under `~/Library/Application Support/PortableFS/portablefsd`. A crash is surfaced as a terminal failure and is never restarted automatically. Quit leaves the per-user daemon running after every mount is cleanly detached; stop an idle daemon explicitly with the matching CLI's `portablefs daemon stop`.
+- **Mount flow** invokes `Contents/Helpers/portablefs mount|umount|mounts --json`. The Go CLI alone owns daemon state, access leases, lifecycle locks, readiness, errors, and the canonical `~/.local/state/portablefs` root. The app never reconstructs that state.
+- **App lifecycle** holds the CLI's shared lifecycle lease while the UI is open, preventing a concurrent bundle replacement. If the holder cannot start or exits unexpectedly, the app closes visibly instead of running without the guard.
+- **Account changes** acquire the CLI's account-exclusive lease, require its
+  exact empty mount/attach readiness frame, reload the config while protected,
+  atomically save and reload it, then release. Mount lifetimes hold the paired
+  shared lease, so sign-in, sign-out, and profile switching cannot race a
+  mount session.
 - **Errors** surface as menu items with a Copy Details action; nothing fails silently.
-- **Quit** synchronizes, unmounts, and detaches every PortableFS mount. It refuses to quit if any durability step fails.
+- **Quit** exits only the presentation process. CLI-owned mounts continue until explicitly unmounted.
 
 ### Build
 
@@ -33,44 +38,34 @@ DEVELOPMENT_TEAM = <your Apple Development team id>
 
 then build without `CODE_SIGNING_ALLOWED=NO` (or run from Xcode). FSKit extensions must be signed to be registered by macOS; unsigned builds validate compilation and packaging but cannot exercise extension registration.
 
-The local release packager builds the app, embeds a universal daemon, verifies
-the complete signature, and emits a checksummed zip without GitHub CI:
+The local packager embeds universal `portablefs` and `portablefsd` helpers,
+verifies the complete code hierarchy, and emits a clearly marked development
+zip:
 
 ```sh
 scripts/package-macos-app.sh 0.2.3
 ```
 
-Set `PORTABLEFS_DEVELOPER_ID_EXPORT=1` for Developer ID export. If a
-`notarytool` keychain profile is available, set `PORTABLEFS_NOTARY_PROFILE`;
-the script submits, waits, staples, and Gatekeeper-assesses the final app.
+Distribution builds set `PORTABLEFS_RELEASE=1`, a monotonic
+`PORTABLEFS_BUILD_NUMBER`, `PORTABLEFS_DEVELOPER_ID_EXPORT=1`, and a
+`PORTABLEFS_NOTARY_PROFILE`. Release mode refuses unsigned, unexported, or
+unnotarized output; it submits, staples, validates, and Gatekeeper-assesses the
+final app before using the release filename.
 
-### Daemon binary resolution
+### Embedded runtime
 
-The app build embeds a matching `portablefsd`. For development overrides it
-still resolves in this order:
-
-1. explicit path set in PortableFS Settings (Daemon section)
-2. `PFSPortableFSDBinaryPath` in the app Info.plist
-3. `PORTABLEFSD_BIN` environment variable
-4. `portablefsd` bundled in the app's `Contents/Resources/`
-5. `~/bin/portablefsd`
-6. `/usr/local/bin/portablefsd`
-7. `/opt/homebrew/bin/portablefsd`
-
-An override build can still use:
-
-```sh
-cd <go repo>/vcs
-go build -o ~/bin/portablefsd ./cmd/portablefsd
-```
+The app always invokes `Contents/Helpers/portablefs`; that CLI locates its
+matching `portablefsd` sibling. There is no app-specific runtime override or
+second daemon discovery path.
 
 ### One-time FSKit extension approval
 
 macOS requires an interactive approval before a file system extension can serve mounts. After the first launch of PortableFS.app:
 
 1. Open System Settings -> General -> Login Items & Extensions -> File System Extensions.
-2. Enable the PortableFS extension (from PortableFSApp.app).
-3. If the toggle does not appear, launch the app once more so LaunchServices registers the appex, then reopen System Settings.
+2. Enable the PortableFS extension (from PortableFS.app).
+3. Continue to a real mount. The assistant never claims the toggle is enabled;
+   only a successful mount verifies it.
 
 Only one PortableFS file system extension should be enabled at a time: `PortableFSExt.appex` (the app) and `PortableFSDev.appex` (the dev harness) both claim the `pfs` FSKit short name, so disable one before enabling the other. This `pfs` type is deliberately distinct from any other PortableFS embedder on the machine (other PortableFS embedders register their own filesystem types), so the two never collide. Do not automate this toggle; it is a user-controlled macOS setting.
 
@@ -80,7 +75,9 @@ Only one PortableFS file system extension should be enabled at a time: `Portable
 2. Approve the file system extension (one-time, see above).
 3. Menu bar -> Sign In: enter the server URL and either complete device sign-in in the browser or paste a token.
 4. Menu bar -> volume -> Mount. The volume appears at `~/PortableFS/<volume>`; Open in Finder from the menu.
-5. Unmount from the menu, or Quit to cleanly unmount everything. Stop the idle daemon explicitly with `portablefs daemon stop` when needed.
+5. Unmount from the menu when you want to detach a volume. Quit closes only
+   the presentation app; CLI-owned mounts keep running. Stop the idle daemon
+   explicitly with `portablefs daemon stop` when needed.
 
 ### Known limitations (v1 dogfood)
 
@@ -89,8 +86,13 @@ Only one PortableFS file system extension should be enabled at a time: `Portable
   profiles and a local `notarytool` credential; the packager fails visibly if
   either is unavailable.
 - The FSKit extension approval is manual (macOS requirement).
-- Daemon sockets live in the `B47U2LLKHW.pfsoss` app-group container (`PFSAppGroupIdentifier`). This is a sandbox requirement, not a preference: a sandboxed FSKit extension may only `connect(2)` to unix sockets on app-group paths. Forks building under another team id change the group id in `AppPaths.swift`, both extension Info.plists/entitlements, and the CLI.
-- The menu mounts each volume's `main` branch (or the first branch when there is no `main`).
+- Daemon sockets live in the signing-team-specific app-group container stamped
+  into the extension, CLI, and daemon at build time. This is a sandbox
+  requirement, not a preference: a sandboxed FSKit extension may only
+  `connect(2)` to unix sockets on app-group paths.
+- The menu mounts the server-declared `defaultBranch`. A volume response with
+  an invalid, missing, or ambiguous default branch is rejected rather than
+  guessed.
 
 ## PortableFSKit package
 

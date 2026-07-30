@@ -303,7 +303,7 @@ func (e *cmdEnv) localMountsOf(volumeID, branch string) []localMountRow {
 		if st.VolumeID != volumeID || st.Branch != branch {
 			continue
 		}
-		rows = append(rows, localMountRow{MountPath: st.MountPath, PID: st.PID, Health: mountHealth(&st)})
+		rows = append(rows, localMountRow{MountPath: st.MountPath, PID: st.PID, Health: e.classifyMount(&st)})
 	}
 	return rows
 }

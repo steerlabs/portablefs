@@ -334,8 +334,12 @@ export async function readPft2Range(
 ): Promise<Buffer> {
   const out = Buffer.alloc(Number(length));
   const extents = await tree.reader.readExtents(file, offset, length);
+  // Canonical PFT2 packs contain many cells. Keep one verified fetch promise
+  // per exact pack for this read so a large sequential range does not
+  // repeatedly locate, download, and hash the same immutable object.
+  const packs = new Map<string, Promise<Uint8Array>>();
   for (const extent of extents) {
-    const bytes = await readExtentBytes(tree, extent);
+    const bytes = await readExtentBytes(tree, extent, packs);
     // Clamp the extent's cell window onto the requested range.
     const extentStart = extent.fileOffset;
     const copyStart = extentStart > offset ? extentStart : offset;
@@ -353,7 +357,11 @@ export async function readPft2Range(
   return out;
 }
 
-async function readExtentBytes(tree: Pft2CommitTree, extent: Pft2Extent): Promise<Uint8Array> {
+async function readExtentBytes(
+  tree: Pft2CommitTree,
+  extent: Pft2Extent,
+  packs: Map<string, Promise<Uint8Array>>
+): Promise<Uint8Array> {
   if (!extent.cell) {
     // The TS reader only emits cell-backed extents for PFT2-native files;
     // legacy adapter extents never appear under a history commit.
@@ -363,7 +371,14 @@ async function readExtentBytes(tree: Pft2CommitTree, extent: Pft2Extent): Promis
       500
     );
   }
-  const packBytes = await tree.fetcher.fetch(extent.cell.object);
+  const object = extent.cell.object;
+  const key = `${Buffer.from(object.digest).toString("hex")}:${object.size}`;
+  let fetch = packs.get(key);
+  if (!fetch) {
+    fetch = tree.fetcher.fetch(object);
+    packs.set(key, fetch);
+  }
+  const packBytes = await fetch;
   const logicalValid = extent.length > BigInt(PFT2_CELL_BYTES) ? BigInt(PFT2_CELL_BYTES) : extent.length;
   return verifyCellBytes(extent.cell, packBytes, logicalValid);
 }

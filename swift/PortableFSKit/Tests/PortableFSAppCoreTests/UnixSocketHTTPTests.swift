@@ -230,7 +230,7 @@ private func shortSocketPath(_ name: String) -> String {
             """, chunked: true)
         case ("GET", "/v1/attaches/att_test123"):
             return .init(status: 200, json: #"{"attachRef":"att_test123","volumeId":"vol-a","branch":"main","mountPath":"/m","state":"degraded","lastError":"credentials required after daemon restart","prefetch":{"done":false,"entriesWalked":0},"cache":{"attrEntries":0,"diskBytes":0,"diskCapBytes":0}}"#)
-        case ("DELETE", "/v1/attaches/att_test123"):
+        case ("POST", "/v1/attaches/att_test123/unmount"):
             return .init(status: 204, json: "")
         case ("POST", "/v1/attaches/att_test123/credential"):
             return .init(status: 204, json: "")
@@ -248,6 +248,7 @@ private func shortSocketPath(_ name: String) -> String {
         branch: "main",
         authorityUrl: "127.0.0.1:9999",
         authToken: "tok",
+        dataPlaneTransport: "plaintext",
         mountPath: "/Users/u/PortableFS/vol-a"
     ))
     #expect(ensured.attachRef == "att_test123")
@@ -264,11 +265,11 @@ private func shortSocketPath(_ name: String) -> String {
     #expect(status.lastError == "credentials required after daemon restart")
 
     try await client.setCredential(ref: "att_test123", authToken: "fresh")
-    try await client.deleteAttach(ref: "att_test123")
+    try await client.unmountAttach(ref: "att_test123")
 
-    // DELETE is idempotent: a lost successful reply followed by 404 has
-    // already converged to the requested state.
-    try await client.deleteAttach(ref: "att_missing")
+    // Exact unmount is idempotent: a lost successful reply followed by 404
+    // has already converged to the requested state.
+    try await client.unmountAttach(ref: "att_missing")
 
     // The attach request body must carry the exact Go JSON keys.
     let attachRequest = server.requests.first { $0.method == "POST" && $0.path == "/v1/attaches" }

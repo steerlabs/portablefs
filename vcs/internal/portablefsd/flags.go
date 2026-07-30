@@ -6,33 +6,29 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 )
 
-// AppGroup is the macOS app-group container shared with the FSKit extension
-// (PFSAppGroupIdentifier in the extension Info.plist). The sandboxed
-// extension may only connect(2) to unix sockets inside app-group container
-// paths, so on darwin the daemon's sockets default to that container — a
-// daemon serving sockets anywhere else is unreachable from the extension.
-const AppGroup = "B47U2LLKHW.pfsoss"
-
-func ParseFlags(version string) (Config, bool) {
+func ParseFlags(version string) (Config, bool, bool) {
 	var cfg Config
 	cfg.Version = version
 	cfg.ExecutableSHA256, _ = daemonctl.CurrentExecutableSHA256()
-	home, _ := os.UserHomeDir()
-	defaultState := filepath.Join(home, "Library", "Application Support", "PortableFS", "portablefsd")
+	home, _ := accountpath.Home()
+	defaultState := filepath.Join(home, ".local", "state", "portablefs", "portablefsd")
 	if home == "" {
 		defaultState = filepath.Join(os.TempDir(), "portablefsd")
 	}
 	defaultSocketDir := defaultState
 	if runtime.GOOS == "darwin" && home != "" {
-		defaultSocketDir = filepath.Join(home, "Library", "Group Containers", AppGroup, "portablefsd")
+		defaultSocketDir = filepath.Join(home, "Library", "Group Containers", fskitidentity.AppGroup, "portablefsd")
 	}
 	flag.StringVar(&cfg.FrontendSocket, "frontend-socket", filepath.Join(defaultSocketDir, "pfs.sock"), "pfslocal frontend Unix socket")
 	flag.StringVar(&cfg.ControlSocket, "control-socket", filepath.Join(defaultSocketDir, "control.sock"), "portablefsd control Unix socket")
 	flag.StringVar(&cfg.StateDir, "state-dir", defaultState, "portablefsd per-user state directory")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	showIdentity := flag.Bool("identity-json", false, "print the stamped FSKit identity as JSON and exit")
 	flag.Parse()
-	return cfg, *showVersion
+	return cfg, *showVersion, *showIdentity
 }

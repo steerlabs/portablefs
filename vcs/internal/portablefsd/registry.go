@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,7 +24,9 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 const (
@@ -60,9 +60,8 @@ func NewServer(cfg Config) *Server {
 		cfg.ExecutableSHA256, _ = daemonctl.CurrentExecutableSHA256()
 	}
 	return &Server{
-		cfg:      cfg,
-		registry: newRegistry(cfg.StateDir),
-		stopCh:   make(chan struct{}),
+		cfg:    cfg,
+		stopCh: make(chan struct{}),
 	}
 }
 
@@ -82,13 +81,17 @@ type AttachOptions struct {
 }
 
 type ensureAttachRequest struct {
-	VolumeID     string        `json:"volumeId"`
-	Branch       string        `json:"branch"`
-	AuthorityURL string        `json:"authorityUrl"`
-	AuthToken    string        `json:"authToken"`
-	TLSCAPEM     string        `json:"tlsCaPem"`
-	MountPath    string        `json:"mountPath"`
-	Options      AttachOptions `json:"options"`
+	AttachRef           string        `json:"attachRef,omitempty"`
+	VolumeID            string        `json:"volumeId"`
+	Branch              string        `json:"branch"`
+	AuthorityURL        string        `json:"authorityUrl"`
+	AuthToken           string        `json:"authToken"`
+	DataPlaneTransport  string        `json:"dataPlaneTransport"`
+	DataPlaneServerName string        `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM            string        `json:"tlsCaPem"`
+	TLSCASHA256         string        `json:"tlsCaSha256,omitempty"`
+	MountPath           string        `json:"mountPath"`
+	Options             AttachOptions `json:"options"`
 }
 
 type attachStatus struct {
@@ -160,12 +163,14 @@ type cacheStatus struct {
 }
 
 type registry struct {
-	mu        sync.RWMutex
-	persistMu sync.Mutex
-	stateDir  string
-	byRef     map[string]*attach
-	byKey     map[string]*attach
-	quiescing bool
+	mu         sync.RWMutex
+	mutationMu sync.Mutex
+	persistMu  sync.Mutex
+	stateDir   string
+	byRef      map[string]*attach
+	byKey      map[string]*attach
+	quiescing  bool
+	loadErr    error
 
 	// Debounced background persistence for the per-file identity bindings.
 	// Namespace mutations must never block on (or fail with) state-file I/O:
@@ -197,35 +202,66 @@ func newRegistry(stateDir string) *registry {
 		persistDone: make(chan struct{}),
 		journal:     newBindingJournal(stateDir),
 	}
-	go r.persistLoop()
-	persisted := loadPersistedAttaches(stateDir)
+	// Loading can open local backing roots and inspect/migrate durable WAL
+	// metadata. Production constructs registries only after owning both
+	// daemon singleton locks. Start the background worker only after the
+	// complete strict load succeeds; an invalid inventory therefore leaves
+	// no orphan persister behind.
+	defer func() {
+		if r.loadErr != nil {
+			for _, a := range r.byRef {
+				if a.localFS != nil {
+					_ = a.localFS.Close()
+					a.localFS = nil
+				}
+			}
+			close(r.persistDone)
+			return
+		}
+		go r.persistLoop()
+	}()
+	persisted, loadErr := loadPersistedAttaches(stateDir)
+	if loadErr != nil {
+		r.loadErr = loadErr
+		return r
+	}
 	seenStorage := map[string]string{}
 	for _, e := range persisted {
 		req := ensureAttachRequest{
-			VolumeID:     e.VolumeID,
-			Branch:       e.Branch,
-			AuthorityURL: e.AuthorityURL,
-			TLSCAPEM:     e.TLSCAPEM,
-			MountPath:    e.MountPath,
-			Options:      e.Options,
+			VolumeID:            e.VolumeID,
+			Branch:              e.Branch,
+			AuthorityURL:        e.AuthorityURL,
+			DataPlaneTransport:  e.DataPlaneTransport,
+			DataPlaneServerName: e.DataPlaneServerName,
+			TLSCAPEM:            e.TLSCAPEM,
+			TLSCASHA256:         e.TLSCASHA256,
+			MountPath:           e.MountPath,
+			Options:             e.Options,
 		}
 		key := attachKey(req.VolumeID, req.Branch, req.MountPath)
 		if r.byRef[e.Ref] != nil {
-			log.Printf("portablefsd: skipping duplicate persisted attach ref %q", e.Ref)
-			continue
+			r.loadErr = fmt.Errorf("duplicate persisted attach ref %q", e.Ref)
+			return r
 		}
 		if r.byKey[key] != nil {
-			log.Printf("portablefsd: skipping duplicate persisted attach key volumeId=%q branch=%q mountPath=%q", req.VolumeID, req.Branch, req.MountPath)
-			continue
+			r.loadErr = fmt.Errorf("duplicate persisted attach key volumeId=%q branch=%q mountPath=%q", req.VolumeID, req.Branch, req.MountPath)
+			return r
 		}
 		if prior := seenStorage[storageKey(req.VolumeID, req.Branch)]; prior != "" {
 			// One (volume, branch) = one WAL store = one checkout owner:
 			// reviving two attaches of the same branch would corrupt it.
-			log.Printf("portablefsd: skipping persisted attach at %q: volume %s@%s already revives at %q (one attach per branch)", req.MountPath, req.VolumeID, req.Branch, prior)
-			continue
+			r.loadErr = fmt.Errorf("persisted attach at %q conflicts with %s@%s owner at %q", req.MountPath, req.VolumeID, req.Branch, prior)
+			return r
 		}
 		seenStorage[storageKey(req.VolumeID, req.Branch)] = req.MountPath
-		a := newRevivedAttach(e.Ref, key, req, stateDir, e.IdentityEpoch, e.Items)
+		a, err := newRevivedAttach(
+			e.Ref, key, req, stateDir, e.IdentityEpoch,
+			e.DetachPrepared, e.DetachForce, e.DetachJobID, e.Items,
+		)
+		if err != nil {
+			r.loadErr = fmt.Errorf("revive persisted attach %s: %w", e.Ref, err)
+			return r
+		}
 		a.persist = r.persist
 		a.schedulePersist = r.schedulePersist
 		a.journal = r.journal
@@ -312,14 +348,27 @@ func (r *registry) stopPersister() {
 }
 
 func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach, bool, error) {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
 	if req.VolumeID == "" || req.Branch == "" || req.AuthorityURL == "" || req.MountPath == "" {
 		return nil, false, fmt.Errorf("volumeId, branch, authorityUrl, and mountPath are required")
+	}
+	if req.AttachRef != "" && !mountid.ValidAttachRef(req.AttachRef) {
+		return nil, false, fmt.Errorf("attachRef has invalid stable identity format")
 	}
 	requestedLocalDirs, err := normalizeLocalDirs(req.Options.LocalDirs)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Options.LocalDirs = requestedLocalDirs
+	if err := (dataPlaneTransport{
+		mode:       req.DataPlaneTransport,
+		serverName: req.DataPlaneServerName,
+		caPEM:      req.TLSCAPEM,
+		caSHA256:   req.TLSCASHA256,
+	}).validate(); err != nil {
+		return nil, false, fmt.Errorf("invalid data-plane transport: %w", err)
+	}
 	key := attachKey(req.VolumeID, req.Branch, req.MountPath)
 	r.mu.Lock()
 	if r.quiescing {
@@ -327,6 +376,18 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		return nil, false, fmt.Errorf("portablefsd is quiescing for an idle stop; new attaches are refused")
 	}
 	if a := r.byKey[key]; a != nil {
+		if req.AttachRef != "" && req.AttachRef != a.ref {
+			r.mu.Unlock()
+			return nil, false, fmt.Errorf("mount identity already maps to attach %s, not requested %s", a.ref, req.AttachRef)
+		}
+		if strings.TrimSpace(req.AuthorityURL) != a.authorityURL ||
+			req.DataPlaneTransport != a.dataPlaneTransport ||
+			req.DataPlaneServerName != a.dataPlaneServerName ||
+			req.TLSCAPEM != a.tlsCAPEM ||
+			req.TLSCASHA256 != a.tlsCASHA256 {
+			r.mu.Unlock()
+			return nil, false, fmt.Errorf("attach %s is already bound to a different authority transport; detach it before changing endpoint trust", a.ref)
+		}
 		r.mu.Unlock()
 		// A revived attach has not opened its Volume yet, so resolve the
 		// current mount's --no-local/volume-config choice before start reads
@@ -348,28 +409,33 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		}
 		return a, false, nil
 	}
-	// Storage identity is (volume, branch): two LIVE attaches of one branch
-	// would share one WAL store and one checkout owner — refuse the second
-	// instead of corrupting the first's write-back state. A DORMANT revived
-	// attach (never activated in this daemon lifetime) is the remount-at-a-
-	// new-path flow: evict it so the new attach inherits the storage.
-	for ref, other := range r.byRef {
+	// Storage identity is (volume, branch): any second attach would share one
+	// WAL store and checkout owner. Persisted dormant entries are durable
+	// ownership records, not stale hints; only an explicit exact detach may
+	// remove one.
+	for _, other := range r.byRef {
 		if other.key == key || other.isDetached() ||
 			other.volumeID != req.VolumeID || other.branch != req.Branch {
 			continue
 		}
-		if other.hasLiveVolume() {
-			r.mu.Unlock()
-			return nil, false, fmt.Errorf("volume %s@%s is already attached at %s; concurrent attaches of one branch are not supported", req.VolumeID, req.Branch, other.mountPath)
-		}
-		log.Printf("portablefsd: attach at %q supersedes the dormant persisted attach of %s@%s at %q", req.MountPath, req.VolumeID, req.Branch, other.mountPath)
-		delete(r.byRef, ref)
-		delete(r.byKey, other.key)
-	}
-	ref, err := randomAttachRef()
-	if err != nil {
 		r.mu.Unlock()
-		return nil, false, err
+		return nil, false, fmt.Errorf(
+			"volume %s@%s already has durable attach %s at %s; detach that exact attach before mounting it elsewhere",
+			req.VolumeID, req.Branch, other.ref, other.mountPath,
+		)
+	}
+	ref := req.AttachRef
+	if ref == "" {
+		var err error
+		ref, err = randomAttachRef()
+		if err != nil {
+			r.mu.Unlock()
+			return nil, false, err
+		}
+	}
+	if existing := r.byRef[ref]; existing != nil {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("attachRef %s already belongs to a different mount identity", ref)
 	}
 	a := newAttach(ref, key, req, r.stateDir)
 	a.persist = r.persist
@@ -390,8 +456,8 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		delete(r.byRef, ref)
 		delete(r.byKey, key)
 		r.mu.Unlock()
-		_, _ = a.detach(ctx, true) // fresh attach: nothing written yet, the persist error dominates
-		return nil, false, err
+		_, detachErr := a.detach(ctx, true)
+		return nil, false, errors.Join(err, detachErr)
 	}
 	return a, true, nil
 }
@@ -435,6 +501,21 @@ func (r *registry) get(ref string) *attach {
 	return r.byRef[ref]
 }
 
+// activate serializes credential-driven revival with every attach membership
+// mutation. Resolving the ref and publishing a live Volume therefore cannot
+// race an exact detach that is removing the same registry entry.
+func (r *registry) activate(ctx context.Context, ref, token string) (bool, error) {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	r.mu.RLock()
+	a := r.byRef[ref]
+	r.mu.RUnlock()
+	if a == nil {
+		return false, nil
+	}
+	return true, a.activate(ctx, token)
+}
+
 func (r *registry) list() []*attach {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -450,6 +531,8 @@ func (r *registry) list() []*attach {
 // reach the authority; only an explicit force detaches with an unshipped
 // tail, parking it as a durable recovery job whose ID is returned.
 func (r *registry) delete(ctx context.Context, ref string, force bool) (found bool, jobID string, err error) {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
 	r.mu.RLock()
 	a := r.byRef[ref]
 	r.mu.RUnlock()
@@ -457,18 +540,256 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 		return false, "", nil
 	}
 	jobID, err = a.detach(ctx, force)
-	if err != nil && !force {
-		// The drain failed: the attach keeps serving; nothing unregisters.
-		return true, "", err
+	if err != nil {
+		// No detach mode may unregister an attach whose required durability
+		// transition failed. In particular, force is permission to park a
+		// tail, not permission to discard a failed parking transaction.
+		return true, jobID, err
 	}
 	r.mu.Lock()
 	delete(r.byRef, ref)
 	delete(r.byKey, a.key)
 	r.mu.Unlock()
-	if perr := r.persist(); perr != nil && err == nil {
-		err = perr
+	if perr := r.persist(); perr != nil {
+		// The durable entry still exists. Retain the exact detached record so
+		// a retry can converge the same deletion instead of returning a false
+		// 404 and reviving it on restart.
+		r.mu.Lock()
+		r.byRef[ref] = a
+		r.byKey[a.key] = a
+		r.mu.Unlock()
+		err = errors.Join(err, perr)
 	}
 	return true, jobID, err
+}
+
+func (r *registry) unmountFSKit(ref string, force bool) (bool, string, error) {
+	return r.unmountFSKitWith(ref, force, hostFSKitKernelOps())
+}
+
+type fskitKernelOps struct {
+	present      func(mountPath, attachRef string) (bool, error)
+	unmountExact func(mountPath, attachRef string) error
+}
+
+// unmountFSKitWith owns the complete admission-freeze → durability barrier →
+// exact kernel detach → registry removal transaction in one daemon request.
+func (r *registry) unmountFSKitWith(
+	ref string,
+	force bool,
+	ops fskitKernelOps,
+) (bool, string, error) {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	r.mu.RLock()
+	a := r.byRef[ref]
+	r.mu.RUnlock()
+	if a == nil {
+		return false, "", nil
+	}
+	a.mu.RLock()
+	prepared := a.detachPrepared
+	forceAuthorized := a.detachForce
+	jobID := a.detachJobID
+	failFrozen := a.detachFailFrozen
+	a.mu.RUnlock()
+	if failFrozen {
+		return true, jobID, fmt.Errorf("attach admissions are fail-frozen because the prepared-detach abort could not be persisted; restart portablefsd to reconcile the durable marker")
+	}
+	switch {
+	case prepared:
+		present, err := ops.present(a.mountPath, ref)
+		if err != nil {
+			return true, jobID, fmt.Errorf("classify prepared FSKit detach: %w", err)
+		}
+		if present {
+			if err := ops.unmountExact(a.mountPath, ref); err != nil {
+				return true, jobID, err
+			}
+		}
+		a.nsMu.Lock()
+		if _, err := a.finishDetachWithNSLocked("", nil); err != nil {
+			return true, jobID, err
+		}
+	case forceAuthorized || force:
+		var err error
+		jobID, err = r.forceUnmountFSKit(a, forceAuthorized, ops)
+		if err != nil {
+			return true, jobID, err
+		}
+	default:
+		a.mu.RLock()
+		volumeActive := a.vol != nil && !a.credentialPending
+		a.mu.RUnlock()
+		if !volumeActive {
+			return true, "", fmt.Errorf("normal FSKit detach requires an active credentialed volume to prove the final authority barrier")
+		}
+		_, err := a.detachWithFinalizer(func() error {
+			a.mu.Lock()
+			a.detachPrepared = true
+			a.mu.Unlock()
+			if err := r.persist(); err != nil {
+				a.mu.Lock()
+				a.detachPrepared = false
+				a.mu.Unlock()
+				return fmt.Errorf("persist prepared FSKit detach: %w", err)
+			}
+			present, err := ops.present(a.mountPath, ref)
+			if err == nil && present {
+				err = ops.unmountExact(a.mountPath, ref)
+			}
+			if err != nil {
+				a.mu.Lock()
+				a.detachPrepared = false
+				a.mu.Unlock()
+				if persistErr := r.persist(); persistErr != nil {
+					// The durable registry may still say prepared. Restore the
+					// in-memory fail-frozen quarantine before releasing nsMu;
+					// every admission rechecks it, while shutdown remains able
+					// to acquire the namespace lock and report the failure.
+					a.mu.Lock()
+					a.detachPrepared = true
+					a.detachFailFrozen = true
+					a.mu.Unlock()
+					return &preparedDetachAbortDurabilityError{
+						cause: errors.Join(err, fmt.Errorf("durably abort prepared FSKit detach: %w", persistErr)),
+					}
+				}
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return true, "", err
+		}
+	}
+	r.mu.Lock()
+	delete(r.byRef, ref)
+	delete(r.byKey, a.key)
+	r.mu.Unlock()
+	if err := r.persist(); err != nil {
+		// Keep the exact detached object retryable until durable removal.
+		r.mu.Lock()
+		r.byRef[ref] = a
+		r.byKey[a.key] = a
+		r.mu.Unlock()
+		return true, jobID, err
+	}
+	return true, jobID, nil
+}
+
+// preparedDetachAbortDurabilityError means the exact unmount failed and the
+// prepared marker could not be synchronously cleared. The attach remains
+// explicitly quarantined; every admission rejects its prepared/fail-frozen
+// state while the namespace mutex stays releasable for clean shutdown.
+type preparedDetachAbortDurabilityError struct {
+	cause error
+}
+
+func (e *preparedDetachAbortDurabilityError) Error() string { return e.cause.Error() }
+func (e *preparedDetachAbortDurabilityError) Unwrap() error { return e.cause }
+
+// forceUnmountFSKit durably records the user's force authorization before the
+// irreversible journal close, then records the resulting recovery handle
+// (including the explicit empty-handle/zero-tail case) before exact detach.
+// The caller owns registry.mutationMu.
+func (r *registry) forceUnmountFSKit(
+	a *attach,
+	forceAlreadyAuthorized bool,
+	ops fskitKernelOps,
+) (string, error) {
+	a.nsMu.Lock()
+	a.mu.RLock()
+	if a.detached {
+		jobID := a.detachJobID
+		a.mu.RUnlock()
+		a.nsMu.Unlock()
+		return jobID, nil
+	}
+	vol := a.vol
+	jobID := a.detachJobID
+	prepared := a.detachPrepared
+	a.mu.RUnlock()
+
+	if !forceAlreadyAuthorized {
+		a.mu.Lock()
+		a.detachForce = true
+		a.mu.Unlock()
+		if err := r.persist(); err != nil {
+			a.mu.Lock()
+			a.detachForce = false
+			a.mu.Unlock()
+			a.nsMu.Unlock()
+			return "", fmt.Errorf("persist forced FSKit detach authorization: %w", err)
+		}
+	}
+
+	if !prepared {
+		if vol == nil {
+			storeDir := filepath.Join(a.stateDir, "wal", a.storageID)
+			storeIdentity, ok := readWALIdentity(storeDir)
+			if !ok || storeIdentity.VolumeID != a.volumeID || storeIdentity.Branch != a.branch {
+				a.nsMu.Unlock()
+				return jobID, fmt.Errorf("forced FSKit detach store identity does not match exact attach %s@%s", a.volumeID, a.branch)
+			}
+			if legacy := a.legacyWALs(); len(legacy) != 0 {
+				a.nsMu.Unlock()
+				return jobID, fmt.Errorf("forced FSKit detach refuses %d unresolved legacy WAL(s); exact offline parking is available only for the PFW5 store", len(legacy))
+			}
+			proof, err := writeback.ForceParkAbandonedStore(
+				storeDir,
+				a.volumeID,
+				a.branch,
+				a.ref,
+				"explicit forced FSKit unmount after portablefsd owner restart",
+			)
+			if err != nil {
+				a.nsMu.Unlock()
+				return jobID, fmt.Errorf("durably park abandoned FSKit store: %w", err)
+			}
+			if len(proof.JobIDs) != 0 {
+				jobID = proof.JobIDs[len(proof.JobIDs)-1]
+			}
+			prepared = true
+		} else {
+			parkedJobID, closeErr := vol.CloseJournalDurable()
+			if parkedJobID != "" {
+				jobID = parkedJobID
+			}
+			if closeErr != nil {
+				a.mu.Lock()
+				a.detachJobID = jobID
+				a.mu.Unlock()
+				if err := r.persist(); err != nil {
+					a.nsMu.Unlock()
+					return jobID, fmt.Errorf("persist forced FSKit recovery handle: %w", err)
+				}
+				a.nsMu.Unlock()
+				return jobID, fmt.Errorf("durably park forced FSKit tail: %w", closeErr)
+			}
+			prepared = true
+		}
+		a.mu.Lock()
+		a.detachPrepared = prepared
+		a.detachJobID = jobID
+		a.mu.Unlock()
+		if err := r.persist(); err != nil {
+			a.nsMu.Unlock()
+			return jobID, fmt.Errorf("persist forced FSKit detach proof: %w", err)
+		}
+	}
+
+	present, err := ops.present(a.mountPath, a.ref)
+	if err == nil && present {
+		err = ops.unmountExact(a.mountPath, a.ref)
+	}
+	if err != nil {
+		// Force authorization and the parked-tail proof remain durable.
+		// Operations are quarantined until an exact retry succeeds.
+		a.nsMu.Unlock()
+		return jobID, err
+	}
+	return a.finishDetachWithNSLocked(jobID, nil)
 }
 
 // closeAll is the cooperative daemon-termination path. Every attach must pass
@@ -476,6 +797,8 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 // shutdown failure; this path never changes semantics by force-detaching or
 // parking a recovery job.
 func (r *registry) closeAll(ctx context.Context) error {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
 	r.stopPersister()
 	var shutdownErrs []error
 	for _, a := range r.list() {
@@ -492,20 +815,23 @@ func (r *registry) closeAll(ctx context.Context) error {
 }
 
 type attach struct {
-	ref           string
-	key           string
-	volumeID      string
-	branch        string
-	authorityURL  string
-	authorityAddr string
-	tlsCAPEM      string
-	mountPath     string
-	volumeName    string
-	storageID     string
-	options       AttachOptions
-	stateDir      string
-	identityEpoch uint64
-	persist       func() error
+	ref                 string
+	key                 string
+	volumeID            string
+	branch              string
+	authorityURL        string
+	authorityAddr       string
+	dataPlaneTransport  string
+	dataPlaneServerName string
+	tlsCAPEM            string
+	tlsCASHA256         string
+	mountPath           string
+	volumeName          string
+	storageID           string
+	options             AttachOptions
+	stateDir            string
+	identityEpoch       uint64
+	persist             func() error
 	// schedulePersist requests a debounced background persist. Per-file
 	// namespace mutations use it instead of persist: they must never block
 	// on, or fail with, state-file I/O.
@@ -550,15 +876,24 @@ type attach struct {
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
-	legacyParked []parkedWAL
-	nextHandle   uint64
-	nextEnumID   uint64
-	nextOrigin   uint64
-	subscribers  map[*eventSubscriber]struct{}
-	conns        map[interface{ Close() error }]struct{}
-	eventReady   chan struct{}
-	eventOnce    sync.Once
-	detached     bool
+	legacyParked   []parkedWAL
+	nextHandle     uint64
+	nextEnumID     uint64
+	nextOrigin     uint64
+	subscribers    map[*eventSubscriber]struct{}
+	conns          map[interface{ Close() error }]struct{}
+	eventReady     chan struct{}
+	eventOnce      sync.Once
+	detached       bool
+	detachPrepared bool
+	detachForce    bool
+	// detachFailFrozen is process-local. The durable prepared marker and this
+	// explicit flag reject every admission, while nsMu remains releasable so
+	// daemon shutdown/restart can perform the required recovery.
+	detachFailFrozen bool
+	// Retained across a registry-persist failure so retrying the exact forced
+	// delete returns the same durable recovery handle.
+	detachJobID string
 
 	// Test seam for deterministic frontend ordering tests; nil in production.
 	testLookupAfterVolume func(path string)
@@ -591,43 +926,41 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 	if req.Branch != "" {
 		name += "@" + req.Branch
 	}
-	localDirs, err := normalizeLocalDirs(req.Options.LocalDirs)
-	if err != nil {
-		// ensure() validates options before construction; a persisted entry
-		// that fails validation degrades to no grafts rather than refusing to
-		// serve the volume.
-		log.Printf("portablefsd: ignoring invalid persisted localDirs for %s: %v", name, err)
-		localDirs = nil
-	}
+	// Both admission and strict persisted-inventory loading validate and
+	// canonicalize this list before construction.
+	localDirs := append([]string(nil), req.Options.LocalDirs...)
 	storageID := stableStorageID(storageKey(req.VolumeID, req.Branch))
 	options := req.Options
 	options.LocalDirs = localDirs
 	return &attach{
-		ref:           ref,
-		key:           key,
-		volumeID:      req.VolumeID,
-		branch:        req.Branch,
-		authorityURL:  strings.TrimSpace(req.AuthorityURL),
-		authorityAddr: normalizeAuthority(req.AuthorityURL),
-		tlsCAPEM:      req.TLSCAPEM,
-		mountPath:     req.MountPath,
-		volumeName:    name,
-		storageID:     storageID,
-		options:       options,
-		stateDir:      stateDir,
-		identityEpoch: 1,
-		token:         req.AuthToken,
-		state:         pfslocal.AttachStateAttached,
-		items:         map[uint64]*itemRecord{},
-		paths:         map[string]*itemRecord{},
-		handles:       map[uint64]*handleRecord{},
-		enumRecords:   map[uint64]*enumerationRecord{},
-		subscribers:   map[*eventSubscriber]struct{}{},
-		conns:         map[interface{ Close() error }]struct{}{},
-		eventReady:    make(chan struct{}),
-		localDirs:     localDirs,
-		localRoot:     filepath.Join(stateDir, "local", storageID),
-		localVersions: map[string]uint64{},
+		ref:                 ref,
+		key:                 key,
+		volumeID:            req.VolumeID,
+		branch:              req.Branch,
+		authorityURL:        strings.TrimSpace(req.AuthorityURL),
+		authorityAddr:       normalizeAuthority(req.AuthorityURL),
+		dataPlaneTransport:  req.DataPlaneTransport,
+		dataPlaneServerName: req.DataPlaneServerName,
+		tlsCAPEM:            req.TLSCAPEM,
+		tlsCASHA256:         req.TLSCASHA256,
+		mountPath:           req.MountPath,
+		volumeName:          name,
+		storageID:           storageID,
+		options:             options,
+		stateDir:            stateDir,
+		identityEpoch:       1,
+		token:               req.AuthToken,
+		state:               pfslocal.AttachStateAttached,
+		items:               map[uint64]*itemRecord{},
+		paths:               map[string]*itemRecord{},
+		handles:             map[uint64]*handleRecord{},
+		enumRecords:         map[uint64]*enumerationRecord{},
+		subscribers:         map[*eventSubscriber]struct{}{},
+		conns:               map[interface{ Close() error }]struct{}{},
+		eventReady:          make(chan struct{}),
+		localDirs:           localDirs,
+		localRoot:           filepath.Join(stateDir, "local", storageID),
+		localVersions:       map[string]uint64{},
 	}
 }
 
@@ -639,15 +972,26 @@ type enumerationRecord struct {
 	lastUsed   time.Time
 }
 
-func newRevivedAttach(ref, key string, req ensureAttachRequest, stateDir string, identityEpoch uint64, items []persistedItemRecord) *attach {
+func newRevivedAttach(
+	ref, key string,
+	req ensureAttachRequest,
+	stateDir string,
+	identityEpoch uint64,
+	detachPrepared bool,
+	detachForce bool,
+	detachJobID string,
+	items []persistedItemRecord,
+) (*attach, error) {
 	a := newAttach(ref, key, req, stateDir)
+	a.detachPrepared = detachPrepared
+	a.detachForce = detachForce
+	a.detachJobID = detachJobID
 	if len(a.localDirs) > 0 {
 		root, err := confinedfs.Open(a.localRoot, 0o700)
 		if err != nil {
-			log.Printf("portablefsd: local-dir backing unavailable for revived attach %s: %v", ref, err)
-		} else {
-			a.localFS = root
+			return nil, fmt.Errorf("open persisted local-dir backing: %w", err)
 		}
+		a.localFS = root
 	}
 	if identityEpoch != 0 {
 		a.identityEpoch = identityEpoch
@@ -662,7 +1006,7 @@ func newRevivedAttach(ref, key string, req ensureAttachRequest, stateDir string,
 		a.root = a.registerLocked("", syntheticRootAttr())
 	}
 	a.mu.Unlock()
-	return a
+	return a, nil
 }
 
 func (a *attach) persistedEntry() persistedAttachEntry {
@@ -672,15 +1016,21 @@ func (a *attach) persistedEntry() persistedAttachEntry {
 	options.LocalDirs = append([]string(nil), a.options.LocalDirs...)
 	a.mu.RUnlock()
 	return persistedAttachEntry{
-		Ref:           a.ref,
-		VolumeID:      a.volumeID,
-		Branch:        a.branch,
-		MountPath:     a.mountPath,
-		AuthorityURL:  a.authorityURL,
-		TLSCAPEM:      a.tlsCAPEM,
-		Options:       options,
-		IdentityEpoch: a.identityEpoch,
-		Items:         items,
+		Ref:                 a.ref,
+		VolumeID:            a.volumeID,
+		Branch:              a.branch,
+		MountPath:           a.mountPath,
+		AuthorityURL:        a.authorityURL,
+		DataPlaneTransport:  a.dataPlaneTransport,
+		DataPlaneServerName: a.dataPlaneServerName,
+		TLSCAPEM:            a.tlsCAPEM,
+		TLSCASHA256:         a.tlsCASHA256,
+		Options:             options,
+		IdentityEpoch:       a.identityEpoch,
+		DetachPrepared:      a.detachPrepared,
+		DetachForce:         a.detachForce,
+		DetachJobID:         a.detachJobID,
+		Items:               items,
 	}
 }
 
@@ -689,16 +1039,22 @@ func (a *attach) activate(ctx context.Context, tok string) error {
 }
 
 func (a *attach) activateWithOptions(ctx context.Context, tok string, options *AttachOptions) error {
+	a.nsMu.Lock()
+	defer a.nsMu.Unlock()
 	a.startMu.Lock()
 	defer a.startMu.Unlock()
-	a.setCredential(tok)
 	a.mu.RLock()
 	if a.detached {
 		a.mu.RUnlock()
 		return fmt.Errorf("attach is detached")
 	}
+	if a.detachPrepared || a.detachForce {
+		a.mu.RUnlock()
+		return fmt.Errorf("attach is quarantined by a durable prepared detach")
+	}
 	active := a.vol != nil && !a.credentialPending
 	a.mu.RUnlock()
+	a.setCredential(tok)
 	if active {
 		return nil
 	}
@@ -725,6 +1081,23 @@ func (a *attach) activateWithOptions(ctx context.Context, tok string, options *A
 	return nil
 }
 
+// controlAdmissionError is called only while nsMu is held. A persisted
+// prepared attach is deliberately inert after restart until the daemon has
+// reconciled the exact kernel identity; local graft operations must not be
+// able to bypass that quarantine.
+func (a *attach) controlAdmissionError() error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	switch {
+	case a.detached:
+		return fmt.Errorf("attach is detached")
+	case a.detachPrepared || a.detachForce:
+		return fmt.Errorf("attach is quarantined by a durable prepared detach")
+	default:
+		return nil
+	}
+}
+
 func (a *attach) start(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "wal"), 0o700); err != nil {
 		return err
@@ -737,7 +1110,12 @@ func (a *attach) start(ctx context.Context) error {
 	// recovery replays its own PFW5 streams inside Dial, and the legacy
 	// sess-*.wal drain below replays the pre-v5 debris.
 	a.adoptWALStore()
-	tlsCfg, err := tlsConfigFromPEM(a.tlsCAPEM)
+	tlsCfg, err := (dataPlaneTransport{
+		mode:       a.dataPlaneTransport,
+		serverName: a.dataPlaneServerName,
+		caPEM:      a.tlsCAPEM,
+		caSHA256:   a.tlsCASHA256,
+	}).tlsConfig()
 	if err != nil {
 		return err
 	}
@@ -779,7 +1157,7 @@ func (a *attach) start(ctx context.Context) error {
 	}
 	vol, err := clientcore.Dial(ctx, opts)
 	if err != nil {
-		return dialErrorWithTLSHint(err, a.tlsCAPEM)
+		return err
 	}
 	// Legacy sess-*.wal records have no durable scope fencing. They must be
 	// completely resolved before this Volume is published to the frontend or
@@ -918,11 +1296,17 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	a.nsMu.Lock()
 	a.mu.RLock()
 	alreadyDetached := a.detached
+	existingJobID := a.detachJobID
 	vol := a.vol
+	prepared := a.detachPrepared || a.detachForce
 	a.mu.RUnlock()
 	if alreadyDetached {
 		a.nsMu.Unlock()
-		return "", nil
+		return existingJobID, nil
+	}
+	if prepared {
+		a.nsMu.Unlock()
+		return existingJobID, fmt.Errorf("attach has a durable prepared FSKit detach; reconcile it through the exact unmount endpoint")
 	}
 	if vol != nil {
 		if force {
@@ -942,13 +1326,50 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 			return "", fmt.Errorf("detach refused: final drain/release barrier failed with %d records (%d bytes) unshipped: %w (retry when the authority answers, or force-detach to park them as a durable recovery job)", recs, bytes, cerr)
 		}
 	}
+	return a.finishDetachWithNSLocked(jobID, err)
+}
+
+// detachWithFinalizer freezes every frontend admission, closes the volume's
+// durability boundary, and runs one exact kernel detach callback while the
+// freeze is still held. CloseWithFinalizer keeps the volume usable when the
+// callback fails, so a failed platform unmount thaws back to the live mount.
+func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
+	a.nsMu.Lock()
+	a.mu.RLock()
+	alreadyDetached := a.detached
+	existingJobID := a.detachJobID
+	vol := a.vol
+	a.mu.RUnlock()
+	if alreadyDetached {
+		a.nsMu.Unlock()
+		return existingJobID, nil
+	}
+	if vol != nil {
+		if err := vol.CloseWithFinalizer(finalizer); err != nil {
+			a.nsMu.Unlock()
+			return "", fmt.Errorf("prepared FSKit detach refused: %w", err)
+		}
+	} else if err := finalizer(); err != nil {
+		a.nsMu.Unlock()
+		return "", err
+	}
+	return a.finishDetachWithNSLocked("", nil)
+}
+
+// finishDetachWithNSLocked publishes the terminal attach state and releases
+// the admission freeze. The caller owns nsMu exclusively.
+func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string, error) {
 	a.mu.Lock()
 	if a.detached {
+		existingJobID := a.detachJobID
 		a.mu.Unlock()
 		a.nsMu.Unlock()
-		return "", nil
+		return existingJobID, priorErr
 	}
 	a.detached = true
+	if jobID != "" {
+		a.detachJobID = jobID
+	}
 	a.state = pfslocal.AttachStateDetaching
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDetaching, Detail: "detaching"}})
 	events := a.eventClient
@@ -977,7 +1398,7 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 		}
 	}
 	a.mu.Unlock()
-	return jobID, err
+	return jobID, priorErr
 }
 
 func (a *attach) status() attachStatus {
@@ -1089,7 +1510,7 @@ func (a *attach) setErr(err error) {
 func (a *attach) volOrErr() (*clientcore.Volume, int32) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.detached {
+	if a.detached || a.detachPrepared || a.detachForce {
 		return nil, darwinENXIO
 	}
 	if a.credentialPending || a.vol == nil {
@@ -1279,7 +1700,7 @@ func (a *attach) flushBindingDelta() {
 }
 
 // applyJournalEntry replays one binding delta at daemon startup, mirroring
-// restoreItemsLocked's construction and sanitizePersistedItems's guards.
+// restoreItemsLocked's construction and strict persisted-item validation.
 func (a *attach) applyJournalEntry(e bindingJournalEntry) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1444,7 +1865,7 @@ func entryKey(p string) nameKey {
 func (a *attach) item(item pfslocal.Item) (*itemRecord, int32) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.detached {
+	if a.detached || a.detachPrepared || a.detachForce {
 		return nil, darwinENXIO
 	}
 	rec := a.items[item.ItemID]
@@ -1542,7 +1963,7 @@ func (a *attach) newLocalHandleLocked(path string, file *os.File, write bool) ui
 func (a *attach) handle(id uint64) (*handleRecord, int32) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.detached {
+	if a.detached || a.detachPrepared || a.detachForce {
 		return nil, darwinENXIO
 	}
 	h := a.handles[id]
@@ -1844,18 +2265,7 @@ func (a *attach) marshalJSONStatus(w http.ResponseWriter) {
 }
 
 func randomAttachRef() (string, error) {
-	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	var b strings.Builder
-	b.WriteString("att_")
-	max := big.NewInt(int64(len(alphabet)))
-	for i := 0; i < 22; i++ {
-		n, err := rand.Int(rand.Reader, max)
-		if err != nil {
-			return "", err
-		}
-		b.WriteByte(alphabet[n.Int64()])
-	}
-	return b.String(), nil
+	return mountid.NewAttachRef()
 }
 
 func stableStorageID(key string) string {
@@ -1887,30 +2297,6 @@ func normalizeAuthority(s string) string {
 	s = strings.TrimPrefix(s, "tcp://")
 	s = strings.TrimPrefix(s, "fsproto://")
 	return s
-}
-
-// dialErrorWithTLSHint annotates a rejected plaintext dial. A plaintext
-// client against a TLS router writes its token frame into what the server
-// expects to be a ClientHello; the router tears the connection down, which
-// the handshake classifier reads as an explicit token rejection. When the
-// attach carried no CA the mismatch is by far the likelier story, so say so
-// instead of letting the caller chase phantom credential bugs.
-func dialErrorWithTLSHint(err error, tlsCAPEM string) error {
-	if err == nil || tlsCAPEM != "" || !errors.Is(err, fsproto.ErrSessionTokenRejected) {
-		return err
-	}
-	return fmt.Errorf("%w (this attach dialed in PLAINTEXT — if the authority router serves TLS, the client must trust its CA: log in again to refresh the stored CA, or set PORTABLEFS_TLS_CA)", err)
-}
-
-func tlsConfigFromPEM(pemText string) (*tls.Config, error) {
-	if strings.TrimSpace(pemText) == "" {
-		return nil, nil
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM([]byte(pemText)) {
-		return nil, fmt.Errorf("invalid tlsCaPem")
-	}
-	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}, nil
 }
 
 func stateString(st pfslocal.AttachStateState) string {

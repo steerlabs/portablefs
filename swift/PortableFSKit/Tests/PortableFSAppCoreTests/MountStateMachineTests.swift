@@ -127,4 +127,12 @@ private func run(_ machine: inout MountStateMachine, _ events: [VolumeMountEvent
     #expect(VolumeMountState.unmounted.menuStatusLabel == "Not mounted")
     #expect(VolumeMountState.mounted(attachRef: "a", mountPath: "/m").menuStatusLabel == "Mounted")
     #expect(VolumeMountState.failed(message: "socket down").menuStatusLabel.contains("socket down"))
+    let cleanup = VolumeMountState.cleanupRequired(
+        mountPath: "/m",
+        operationPhase: "mount-published"
+    )
+    #expect(cleanup.menuStatusLabel == "Cleanup required (mount-published)")
+    #expect(cleanup.mountPath == "/m")
+    #expect(!cleanup.isMounted)
+    #expect(!cleanup.isBusy)
 }

@@ -66,46 +66,57 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
    menu-bar app started it. An incompatible live daemon fails closed with
    clean-stop guidance; the CLI never replaces it automatically. Otherwise
    the CLI spawns one, detached into its own session so it outlives the mount
-   process and serves later mounts. The daemon binary is discovered next to
-   the `portablefs` executable first (the release-archive layout), then on
-   `PATH`; `PORTABLEFS_FSKIT_DAEMON` points at an explicit binary.
+   process and serves later mounts. The daemon must be the exact
+   `portablefsd` sibling of the canonical real `portablefs` executable. The
+   CLI pins and hashes that file and requires the running daemon to report
+   the same executable identity; it never searches `PATH` or accepts an
+   executable override.
 2. **Register the attach.** `POST /v1/attaches` on the control socket carries
    everything the daemon needs to own the authority connection itself: the
-   resolved authority URL, the data-plane token, the TLS CA bundle as PEM
-   (the daemon dials the authority, so the trust material travels with the
-   request — `portablefs login` captures the deployment's published router CA
-   from `GET /router-ca.pem` into the profile automatically, and
-   `PORTABLEFS_TLS_CA`/`VCS_TLS_CA` override it), and the tuning options
+   resolved authority URL, the data-plane token, and the lease-bound transport
+   contract returned by the manager: exactly one of `tls-private-ca` (strict,
+   bounded CA PEM + SHA-256 + exact server name), `tls-system-pki` (system
+   roots + exact server name), or explicit `plaintext`. The daemon persists
+   that exact mode, name, and CA fingerprint and validates them again on
+   restart. Login never probes a CA endpoint, cached profile trust is not
+   reused, and an empty CA never means plaintext. The request also carries the tuning options
    (write policy, fsync policy, flush interval, machine-local dirs). The
    daemon answers with an attach reference.
 3. **Mount.** The CLI hands the kernel that reference:
    `/sbin/mount -t pfs pfs://<attachRef> <mountPath>`. The enabled FSKit
    extension serves the mount by dialing the daemon's frontend socket inside
-   the PortableFS app-group container (`~/Library/Group Containers/
-   B47U2LLKHW.pfsoss/portablefsd/pfs.sock`). The app group is load-bearing,
-   not a convention: the macOS app sandbox permits `connect(2)` on a unix
-   socket only inside app-group container paths, so a socket anywhere else —
-   `/tmp` included — is unreachable from the sandboxed extension no matter
-   what file-access exceptions it holds. The daemon the CLI ensures must
-   therefore serve exactly that container socket (see the overrides below).
+   the canonical account home's PortableFS app-group container
+   (`Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock`,
+   relative to that home). The app group is load-bearing, not a convention:
+   the macOS app sandbox permits `connect(2)` on a unix socket only inside
+   app-group container paths, so a socket anywhere else — `/tmp` included —
+   is unreachable from the sandboxed extension no matter what file-access
+   exceptions it holds. The daemon the CLI ensures must therefore serve
+   exactly that container socket (see the overrides below).
 
 The command then behaves like every `portablefs mount`: it returns only after
 the kernel reports the path mounted and a real root enumeration succeeds, then
 daemonizes (state under `~/.local/state/portablefs/mounts/`),
 the mount process keeps the access lease renewed and pushes rotated
 credentials into the daemon (`POST /v1/attaches/{ref}/credential`), and
-`portablefs umount` unmounts through `/sbin/umount` (falling back to
-`diskutil unmount`) and only then deletes the attach, so the daemon flushes
-everything the extension handed it before the attach drops.
+`portablefs umount` invokes one daemon-owned
+`POST /v1/attaches/{ref}/unmount` transaction. That request freezes every
+frontend and control admission, completes the final authority barrier,
+durably records the prepared detach, proves the exact `pfs://<attachRef>`
+kernel mount, unmounts it in-process, and only then durably removes the
+attach. A failure preserves the attach and its exact recovery evidence; no
+second delete or path-based unmount can mutate one side of the boundary
+without the other.
 
 ## Install And Enable (Once Per Mac)
 
 The strategy requires the PortableFS FSKit extension to be registered and
 enabled:
 
-1. Install PortableFS.app (built from `swift/PortableFSApp`) into
-   `/Applications` and launch it once so macOS registers its File System
-   Extension.
+1. Run the PortableFS installer. It places the notarized app at the canonical
+   per-user path `~/Applications/PortableFS.app`, links its embedded CLI into
+   `~/.local/bin`, and launches that exact app so macOS registers its File
+   System Extension.
 2. Open System Settings → General → Login Items & Extensions, scroll to the
    Extensions section, and open the **File System Extensions** category
    (click its ⓘ). Enable the PortableFS extension there. Use the category
@@ -114,18 +125,18 @@ enabled:
    user-controlled macOS setting and cannot be automated.
 
 FSKit extensions are user-space: no kernel extension, no reboot, no sudo.
-Enable only one PortableFS file system extension at a time — the app's
-`PortableFSExt.appex` and the dev harness's `PortableFSDev.appex` both claim
-the `pfs` fs type.
+Exactly one installed PortableFS provider may claim the `pfs` fs type. The
+release installer refuses publication when it finds another provider, such as
+the dev harness's `PortableFSDev.appex`; remove that provider explicitly
+before installing the release app.
 
-The release archive ships `portablefsd` alongside the `portablefs` binary;
-keeping them siblings (or `portablefsd` on `PATH`) is all the daemon setup
-there is. The installer validates both downloaded versions before changing
-the destination and refuses while any same-user `portablefsd` is running. It
-never restarts or replaces a live daemon; cleanly unmount and stop the idle
-daemon before upgrading. Use the matching installed CLI's
-`portablefs daemon stop` after all mounts are gone; the daemon atomically
-refuses the stop if any attach still exists.
+The release archive is one `PortableFS.app`. Its CLI and daemon live under
+`Contents/Helpers/`, and its FSKit extension lives under
+`Contents/Extensions/`. The installer verifies that code hierarchy, takes the
+exclusive per-user mount lifecycle lock, rechecks exact kernel mounts, mount
+records, running PortableFS processes, and canonical sockets, and atomically
+replaces the whole bundle plus CLI symlink. It never updates a live app,
+daemon, or mount. Cleanly unmount volumes and quit the app before upgrading.
 
 ## Daemon Lifecycle
 
@@ -139,16 +150,16 @@ refuses the stop if any attach still exists.
   seconds for `/healthz` before failing with the log path.
 - **Log.** A CLI-spawned daemon appends to
   `~/.local/state/portablefs/portablefsd.log`. Per-mount daemon logs are
-  separate, under `~/.local/state/portablefs/mounts/`. (The menu-bar app
-  manages its own child daemon and logs it under `~/Library/Logs/PortableFS/`.)
+  separate, under `~/.local/state/portablefs/mounts/`. The menu-bar app invokes
+  the same embedded CLI and does not own another daemon or state root.
 - **Sockets are the authentication boundary.** The daemon creates the socket
   directory 0700 and the sockets 0600; same-user filesystem access is the
   control plane's entire auth model — there is no bearer token on the control
   API. Authority credentials are stored per attach and refreshed through the
   credential endpoint.
-- **Outlives mounts.** Unmounting deletes the attach but leaves the daemon
-  running for the next mount. Active delegated attaches may own local WAL
-  state, so they must `fsync`, synchronize, or detach cleanly before the
+- **Outlives mounts.** Exact unmount durably removes the attach but leaves the
+  daemon running for the next mount. Active delegated attaches may own local
+  WAL state, so they must `fsync`, synchronize, or detach cleanly before the
   daemon is stopped. A truly idle daemon with no attaches owns no live tail
   and is safe to stop.
 
@@ -162,16 +173,20 @@ extensions registered under another fs type or socket path:
 | `PORTABLEFS_FSKIT_TYPE` | `pfs` | fs type passed to `/sbin/mount -t`; must match the FSKit short name the enabled extension claims |
 | `PORTABLEFS_FSKIT_SOCKET` | `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock` | the daemon frontend socket the extension dials (resolved from `PFSAppGroupIdentifier` in the extension's Info.plist) |
 | `PORTABLEFS_FSKIT_CONTROL_SOCKET` | `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/control.sock` | the daemon control socket the CLI drives; setting a custom frontend socket implies a `control.sock` next to it unless this is set explicitly |
-| `PORTABLEFS_FSKIT_DAEMON` | discovery | explicit `portablefsd` binary (otherwise: sibling of the `portablefs` binary, then `PATH`) |
+
+`PORTABLEFS_FSKIT_DAEMON` is rejected. A fork or development build packages
+its matching CLI and daemon as one sibling pair rather than selecting code
+from the environment.
 
 Changing the frontend socket only works with an extension whose Info.plist
 resolves the new path, and any custom location must still be inside an
 app-group container the extension is entitled to — the sandbox denies unix
 socket connects everywhere else. The stock PortableFS.app extension expects
 the default, so with it these overrides are read-only facts, not knobs.
-Forks that build under their own Apple team id change the group id in
-`AppPaths.swift`, the extension Info.plist/entitlements, and the CLI's
-`fskitAppGroup` constant together.
+The packaging build stamps one `PORTABLEFS_APP_GROUP` value derived from the
+signing team into the extension Info.plist, its signed entitlement, the CLI,
+and the daemon. Forks set their signing team once; there are no independent
+source constants to keep synchronized.
 
 ## Write Path
 
@@ -232,7 +247,8 @@ and enable it, then retry
 Do exactly that. If the toggle is missing from System Settings, launch
 PortableFS.app once more so LaunchServices registers the appex, then reopen
 System Settings. If two PortableFS extensions are listed (app and dev
-harness), enable only one.
+harness), remove the non-release provider and reinstall; a valid release
+setup has exactly one installed `pfs` provider.
 
 ### Enabled, but "Loading resource: … Input/output error"
 
@@ -250,8 +266,8 @@ extension name) forces a fresh instance on the next mount.
 
 The CLI requires both liveness and an exact control identity on the control
 socket. A stale dev build or older release is refused before an attach is
-created. (The sockets live in the per-user app-group container under `$HOME`,
-so unlike a `/tmp` path they can never be another user's.)
+created. The sockets live in the canonical account home's per-user app-group
+container, so unlike a `/tmp` path they cannot belong to another account.
 
 The fix depends on which extension you run:
 
@@ -262,7 +278,7 @@ The fix depends on which extension you run:
 - Dev extension with its own Info.plist socket: point the CLI at your own
   coordinates — `PORTABLEFS_FSKIT_SOCKET` (frontend),
   `PORTABLEFS_FSKIT_CONTROL_SOCKET`, `PORTABLEFS_FSKIT_TYPE` (the dev fs
-  type), and `PORTABLEFS_FSKIT_DAEMON` for the matching daemon build.
+  type) — and package the matching `portablefs`/`portablefsd` sibling pair.
 
 ### The daemon does not become healthy
 
