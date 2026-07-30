@@ -80,8 +80,11 @@ type Options struct {
 		epoch string,
 		client *fsproto.Client,
 	) (end func(released bool), err error)
-	OnReleaseWait func(ctx context.Context) (resume func())
-	OnMarkOrphan  func(path string, ino uint64)
+	// OnOperationWait temporarily removes a publishing frontend operation from
+	// reply admission before it blocks on delegation release or exact-operation
+	// serialization. The returned function re-enters admission after the wait.
+	OnOperationWait func(ctx context.Context) (resume func())
+	OnMarkOrphan    func(path string, ino uint64)
 	// OnWriteBackError reports the engine's sticky health verdict (nil
 	// clears). Lets the daemon flip a mount to degraded when flushes stall,
 	// so accepted-but-unflushable write-back is loud instead of hidden.
@@ -126,8 +129,13 @@ type Volume struct {
 	// inode-addressed operation after that operation has released the
 	// relevant delegation(s). Ordinary mutations hold it shared; a
 	// pathless exact operation holds it exclusively through release and the
-	// authority round trip.
+	// authority round trip. A publishing frontend operation must suspend
+	// publication before it waits for this lock: delegation handoff waits
+	// for active publishers and must never wait on a publisher blocked here.
 	exactMu sync.RWMutex
+	// onOperationWait brackets a contended exactMu acquisition outside the
+	// frontend publication set. It is nil for non-frontend embedders.
+	onOperationWait func(context.Context) func()
 	// A forced close is one terminal transaction. Retain its exact outcome
 	// so retries cannot reinterpret a prior failure (or a successfully
 	// parked non-empty tail) as an empty-tail success.
@@ -219,7 +227,35 @@ func (v *Volume) endSharedOperation() {
 	v.lifecycleMu.RUnlock()
 }
 
-func (v *Volume) beginMutation() error {
+func (v *Volume) lockExactShared(ctx context.Context) {
+	if v.exactMu.TryRLock() {
+		return
+	}
+	var resume func()
+	if v.onOperationWait != nil {
+		resume = v.onOperationWait(ctx)
+	}
+	v.exactMu.RLock()
+	if resume != nil {
+		resume()
+	}
+}
+
+func (v *Volume) lockExact(ctx context.Context) {
+	if v.exactMu.TryLock() {
+		return
+	}
+	var resume func()
+	if v.onOperationWait != nil {
+		resume = v.onOperationWait(ctx)
+	}
+	v.exactMu.Lock()
+	if resume != nil {
+		resume()
+	}
+}
+
+func (v *Volume) beginMutation(ctx context.Context) error {
 	if err := v.beginLifecycleOperation(); err != nil {
 		return err
 	}
@@ -234,7 +270,7 @@ func (v *Volume) beginMutation() error {
 			return err
 		}
 	}
-	v.exactMu.RLock()
+	v.lockExactShared(ctx)
 	return nil
 }
 
@@ -258,7 +294,7 @@ func (v *Volume) beginExactOperation(ctx context.Context) (func(), error) {
 			return nil, err
 		}
 	}
-	v.exactMu.Lock()
+	v.lockExact(ctx)
 	var endWriteback func()
 	if v.wb != nil {
 		var err error
@@ -331,28 +367,29 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	cli.SetMetrics(reg)
 	cctx, cancel := context.WithCancel(ctx)
 	v := &Volume{
-		client:        cli,
-		owner:         opts.Owner,
-		AttrCache:     NewAttrCache(),
-		VersionCache:  NewVersionCache(),
-		Metrics:       reg,
-		dirCache:      map[string]dirCacheEntry{},
-		recent:        newRecentWrites(),
-		opens:         NewOpenTracker(),
-		openOrphans:   NewInodeSet(),
-		openFiles:     NewInodeSet(),
-		hardlinks:     newHardlinkAliases(),
-		lockReg:       map[*LockHandle]struct{}{},
-		noReaddirPlus: opts.NoReaddirPlus,
-		attrTTL:       opts.AttrTTL,
-		sessionTTL:    opts.SessionTTL,
-		volumeID:      opts.VolumeID,
-		onInvalidate:  opts.OnInvalidate,
-		onFlushAll:    opts.OnFlushAll,
-		onMarkOrphan:  opts.OnMarkOrphan,
-		debugf:        opts.Debugf,
-		ctx:           cctx,
-		cancel:        cancel,
+		client:          cli,
+		owner:           opts.Owner,
+		AttrCache:       NewAttrCache(),
+		VersionCache:    NewVersionCache(),
+		Metrics:         reg,
+		dirCache:        map[string]dirCacheEntry{},
+		recent:          newRecentWrites(),
+		opens:           NewOpenTracker(),
+		openOrphans:     NewInodeSet(),
+		openFiles:       NewInodeSet(),
+		hardlinks:       newHardlinkAliases(),
+		lockReg:         map[*LockHandle]struct{}{},
+		noReaddirPlus:   opts.NoReaddirPlus,
+		attrTTL:         opts.AttrTTL,
+		sessionTTL:      opts.SessionTTL,
+		volumeID:        opts.VolumeID,
+		onInvalidate:    opts.OnInvalidate,
+		onFlushAll:      opts.OnFlushAll,
+		onMarkOrphan:    opts.OnMarkOrphan,
+		onOperationWait: opts.OnOperationWait,
+		debugf:          opts.Debugf,
+		ctx:             cctx,
+		cancel:          cancel,
 	}
 	if v.volumeID == "" {
 		v.volumeID = opts.Addr
@@ -435,7 +472,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 				}
 				return opts.OnHandoffPrepared(ctx, scope, epoch, cli)
 			},
-			OnReleaseWait:             opts.OnReleaseWait,
+			OnReleaseWait:             opts.OnOperationWait,
 			AllowDelegatedMutation:    v.allowDelegatedMutation,
 			ValidateDelegatedMutation: v.validateDelegatedMutation,
 			OnGrant: func(scope string) {
