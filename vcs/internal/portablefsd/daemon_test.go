@@ -771,6 +771,19 @@ func TestDaemonControlAndFrontendEndToEnd(t *testing.T) {
 	if string(afterUnlink.Data) != "still-open" {
 		t.Fatalf("open-after-unlink read=%q", afterUnlink.Data)
 	}
+	c.call(&pfslocal.WriteRequest{
+		Handle: tmp.Handle, Offset: uint64(len("still-open")), Data: []byte("-updated"),
+	})
+	c.call(&pfslocal.FsyncRequest{Handle: tmp.Handle})
+	if er := c.callErr(&pfslocal.LookupRequest{Dir: root, Name: []byte("tmp")}); er.Errno != darwinENOENT {
+		t.Fatalf("write through unlinked handle resurrected path: errno=%d", er.Errno)
+	}
+	afterUnlinkedWrite := c.call(&pfslocal.ReadRequest{
+		Handle: tmp.Handle, Length: 32,
+	}).(*pfslocal.ReadReply)
+	if string(afterUnlinkedWrite.Data) != "still-open-updated" {
+		t.Fatalf("open-after-unlink write/read=%q", afterUnlinkedWrite.Data)
+	}
 	c.call(&pfslocal.CloseRequest{Handle: tmp.Handle})
 
 	events := dialPFS(t, cfg.FrontendSocket)
@@ -1308,6 +1321,65 @@ func TestDaemonWritebackRenameOverServesNewContentImmediately(t *testing.T) {
 		c.call(&pfslocal.CloseRequest{Handle: lock.Handle})
 	}
 	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
+}
+
+func TestWriteThroughRenameOverTargetHandlePreservesReplacementBinding(t *testing.T) {
+	authority := serveAuthority(t)
+	cfg, hc, _, cancel := startDaemon(t, authority)
+	defer cancel()
+	ref := ensureAttach(t, hc, authority, "vol-rename-over-open-target", "main", "/Volumes/RenameOverOpenTarget")
+
+	c := dialPFS(t, cfg.FrontendSocket)
+	defer c.close()
+	c.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "rename-over-open-target"})
+	root := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply).Root
+
+	target := c.call(&pfslocal.CreateRequest{
+		Dir: root, Name: []byte("target"), Mode: 0o644, Exclusive: true,
+	}).(*pfslocal.CreateReply)
+	c.call(&pfslocal.WriteRequest{Handle: target.Handle, Data: []byte("old-target")})
+
+	replacement := c.call(&pfslocal.CreateRequest{
+		Dir: root, Name: []byte("replacement"), Mode: 0o644, Exclusive: true,
+	}).(*pfslocal.CreateReply)
+	c.call(&pfslocal.WriteRequest{Handle: replacement.Handle, Data: []byte("new-target")})
+	c.call(&pfslocal.CloseRequest{Handle: replacement.Handle})
+	c.call(&pfslocal.RenameRequest{
+		FromDir: root, FromName: []byte("replacement"),
+		ToDir: root, ToName: []byte("target"),
+	})
+
+	// The old target is detached but its descriptor remains a valid inode
+	// reference. Mutating it must never rebind its stale "target" pathname.
+	c.call(&pfslocal.WriteRequest{
+		Handle: target.Handle, Offset: 0, Data: []byte("old-updated"),
+	})
+	c.call(&pfslocal.FsyncRequest{Handle: target.Handle})
+	gotDetached := c.call(&pfslocal.ReadRequest{
+		Handle: target.Handle, Length: 32,
+	}).(*pfslocal.ReadReply)
+	if string(gotDetached.Data) != "old-updated" {
+		t.Fatalf("detached target bytes=%q want old-updated", gotDetached.Data)
+	}
+
+	lookup := c.call(&pfslocal.LookupRequest{
+		Dir: root, Name: []byte("target"),
+	}).(*pfslocal.LookupReply)
+	if lookup.Attr.Item != replacement.Attr.Item || lookup.Attr.Item == target.Attr.Item {
+		t.Fatalf("replacement binding changed after detached write: old=%+v replacement=%+v got=%+v",
+			target.Attr.Item, replacement.Attr.Item, lookup.Attr.Item)
+	}
+	opened := c.call(&pfslocal.OpenRequest{
+		Item: lookup.Attr.Item, Mode: pfslocal.OpenModeRead,
+	}).(*pfslocal.OpenReply)
+	gotReplacement := c.call(&pfslocal.ReadRequest{
+		Handle: opened.Handle, Length: 32,
+	}).(*pfslocal.ReadReply)
+	if string(gotReplacement.Data) != "new-target" {
+		t.Fatalf("replacement bytes after detached write=%q want new-target", gotReplacement.Data)
+	}
+	c.call(&pfslocal.CloseRequest{Handle: opened.Handle})
+	c.call(&pfslocal.CloseRequest{Handle: target.Handle})
 }
 
 func TestDaemonWritebackDoubleLockRenameDoesNotRecycleMovedItem(t *testing.T) {

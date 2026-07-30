@@ -788,7 +788,12 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 			paths = append(paths, path)
 		}
 		if len(paths) == 0 {
-			paths = append(paths, rec.path)
+			// The retained path on an unlinked or overwritten open handle is
+			// only an authority addressing hint. It may now name another
+			// inode, so treating it as publication scope would let a detached
+			// write cross a handoff for a real replacement. Unknown is the
+			// exact conservative scope until a genuine alias is discovered.
+			paths = append(paths, "")
 		}
 		return paths, true
 	}
