@@ -424,6 +424,8 @@ func (a *attach) dropEnumerationLocked(id uint64) {
 func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pfslocal.GetAttrReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -495,6 +497,8 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pfslocal.SetAttrReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -631,10 +635,13 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 }
 
 func (a *attach) close(req *pfslocal.CloseRequest) (*pfslocal.CloseReply, int32) {
-	// Close owns the namespace lifecycle lock exclusively so a read/write or
-	// reclaim cannot race between descriptor validation and confirmed close.
-	a.nsMu.Lock()
-	defer a.nsMu.Unlock()
+	// Descriptor operations serialize on this handle. The shared namespace
+	// lock keeps item reclamation exclusive without globally blocking
+	// unrelated handles behind one close.
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, true)
+	defer unlockIfPresent(unlockHandle)
 	if err := a.controlAdmissionError(); err != nil {
 		return nil, darwinENXIO
 	}
@@ -675,6 +682,8 @@ func (a *attach) close(req *pfslocal.CloseRequest) (*pfslocal.CloseReply, int32)
 func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal.ReadReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	h, scope, eno := a.handleTarget(req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -711,6 +720,8 @@ func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal
 func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfslocal.WriteReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	h, scope, eno := a.handleTarget(req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -779,6 +790,8 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 func (a *attach) fsync(_ context.Context, req *pfslocal.FsyncRequest) int32 {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	h, scope, eno := a.handleTarget(req.Handle)
 	if eno != 0 {
 		return eno
@@ -1387,6 +1400,8 @@ func max64(a, b int64) int64 {
 func (a *attach) xattrGet(ctx context.Context, req *pfslocal.XattrGetRequest) (*pfslocal.XattrGetReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -1415,6 +1430,8 @@ func (a *attach) xattrGet(ctx context.Context, req *pfslocal.XattrGetRequest) (*
 func (a *attach) xattrList(ctx context.Context, req *pfslocal.XattrListRequest) (*pfslocal.XattrListReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -1443,6 +1460,8 @@ func (a *attach) xattrList(ctx context.Context, req *pfslocal.XattrListRequest) 
 func (a *attach) xattrSet(ctx context.Context, req *pfslocal.XattrSetRequest) (*pfslocal.XattrSetReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
@@ -1478,6 +1497,8 @@ func (a *attach) xattrSet(ctx context.Context, req *pfslocal.XattrSetRequest) (*
 func (a *attach) xattrRemove(ctx context.Context, req *pfslocal.XattrRemoveRequest) (*pfslocal.XattrRemoveReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
+	unlockHandle := a.lockHandleOperation(req.Handle, false)
+	defer unlockIfPresent(unlockHandle)
 	target, eno := a.objectTarget(req.Item, req.Handle)
 	if eno != 0 {
 		return nil, eno
