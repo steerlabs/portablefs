@@ -43,6 +43,43 @@ private actor PfsWrittenRequestIDs {
     }
 }
 
+private actor PfsWriteOverlapProbe {
+    private var active = 0
+    private var maximum = 0
+
+    func begin() {
+        active += 1
+        maximum = max(maximum, active)
+    }
+
+    func end() {
+        active -= 1
+    }
+
+    func maximumConcurrency() -> Int {
+        maximum
+    }
+}
+
+private enum PfsWriterTestError: Error {
+    case failed
+}
+
+private final class PfsWeakWriteReceiptBox {
+    weak var receipt: PfsEnvelopeWriteReceipt?
+
+    init(_ receipt: PfsEnvelopeWriteReceipt) {
+        self.receipt = receipt
+    }
+}
+
+private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
+    var envelope = PfsEnvelope()
+    envelope.requestID = requestID
+    envelope.body = .statfs(PfsStatfsRequest())
+    return envelope
+}
+
 @Test func outboundWriterPreservesRequestIDOrderAcrossDetachedScheduling() async throws {
     let firstWriteGate = PfsTestAsyncGate()
     let written = PfsWrittenRequestIDs()
@@ -66,9 +103,126 @@ private actor PfsWrittenRequestIDs {
     #expect(await written.snapshot().isEmpty)
 
     await firstWriteGate.release()
-    try await first.value
-    try await second.value
+    try await first.wait()
+    try await second.wait()
     #expect(await written.snapshot() == [1, 2])
+}
+
+@Test func outboundWriterPrioritizesPublicationAfterCurrentFrame() async throws {
+    let firstWriteStarted = PfsTestAsyncGate()
+    let firstWriteGate = PfsTestAsyncGate()
+    let written = PfsWrittenRequestIDs()
+    let writer = PfsOrderedEnvelopeWriter { envelope in
+        if envelope.requestID == 1 {
+            await firstWriteStarted.release()
+            await firstWriteGate.wait()
+        }
+        await written.append(envelope.requestID)
+    }
+
+    let first = writer.enqueue(writerTestEnvelope(1))
+    await firstWriteStarted.wait()
+    let second = writer.enqueue(writerTestEnvelope(2))
+    let third = writer.enqueue(writerTestEnvelope(3))
+    let publication = writer.enqueue(
+        writerTestEnvelope(99),
+        lane: .publication
+    )
+
+    await firstWriteGate.release()
+    try await first.wait()
+    try await publication.wait()
+    try await second.wait()
+    try await third.wait()
+    #expect(await written.snapshot() == [1, 99, 2, 3])
+}
+
+@Test func outboundWriterReleasesConsumedEntriesWhileBusy() async throws {
+    let midpointReached = PfsTestAsyncGate()
+    let midpointGate = PfsTestAsyncGate()
+    let writer = PfsOrderedEnvelopeWriter { envelope in
+        if envelope.requestID == 2_500 {
+            await midpointReached.release()
+            await midpointGate.wait()
+        }
+    }
+    var consumedReceipts: [PfsWeakWriteReceiptBox] = []
+    var finalReceipt: PfsEnvelopeWriteReceipt?
+
+    for requestID in UInt64(1)...5_000 {
+        let receipt = writer.enqueue(writerTestEnvelope(requestID))
+        if requestID < 2_500 {
+            consumedReceipts.append(PfsWeakWriteReceiptBox(receipt))
+        }
+        if requestID == 5_000 {
+            finalReceipt = receipt
+        }
+    }
+
+    await midpointReached.wait()
+    #expect(consumedReceipts.allSatisfy { $0.receipt == nil })
+    await midpointGate.release()
+    try await finalReceipt?.wait()
+}
+
+@Test func outboundWriterSerializesConcurrentEnqueues() async throws {
+    let written = PfsWrittenRequestIDs()
+    let overlap = PfsWriteOverlapProbe()
+    let writer = PfsOrderedEnvelopeWriter { envelope in
+        await overlap.begin()
+        try await Task.sleep(for: .microseconds(100))
+        await written.append(envelope.requestID)
+        await overlap.end()
+    }
+    let workerCount: UInt64 = 8
+    let writesPerWorker: UInt64 = 300
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for worker in 0..<workerCount {
+            group.addTask {
+                for index in 0..<writesPerWorker {
+                    var envelope = PfsEnvelope()
+                    envelope.requestID = worker * writesPerWorker + index + 1
+                    envelope.body = .statfs(PfsStatfsRequest())
+                    try await writer.enqueue(envelope).wait()
+                }
+            }
+        }
+        try await group.waitForAll()
+    }
+
+    let ids = await written.snapshot()
+    #expect(ids.count == Int(workerCount * writesPerWorker))
+    #expect(Set(ids).count == ids.count)
+    #expect(await overlap.maximumConcurrency() == 1)
+}
+
+@Test func outboundWriterFailsQueuedAndLaterWritesAfterTerminalError() async throws {
+    let firstWriteGate = PfsTestAsyncGate()
+    let writer = PfsOrderedEnvelopeWriter { envelope in
+        if envelope.requestID == 1 {
+            await firstWriteGate.wait()
+        }
+        throw PfsWriterTestError.failed
+    }
+    let receipts = [
+        writer.enqueue(writerTestEnvelope(1)),
+        writer.enqueue(writerTestEnvelope(2)),
+        writer.enqueue(writerTestEnvelope(3)),
+    ]
+
+    await firstWriteGate.release()
+    for receipt in receipts {
+        do {
+            try await receipt.wait()
+            Issue.record("expected queued write to fail")
+        } catch is PfsWriterTestError {}
+    }
+
+    do {
+        try await writer.enqueue(writerTestEnvelope(4)).wait()
+        Issue.record("expected later write to fail with the terminal error")
+    } catch is PfsWriterTestError {}
 }
 
 @Test func realReadPathRejectsEOFInMiddleOfFrame() async throws {

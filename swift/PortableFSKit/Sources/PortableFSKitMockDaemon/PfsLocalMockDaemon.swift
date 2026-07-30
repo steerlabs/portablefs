@@ -53,6 +53,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .utility)
     private let clientQueue = DispatchQueue(label: "dev.portablefs.mock.client", qos: .utility, attributes: .concurrent)
     private let acceptGroup = DispatchGroup()
+    private let lifecycleLock = NSLock()
     private var acceptWorkItem: DispatchWorkItem?
     private var stopped = false
 
@@ -75,10 +76,14 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     }
 
     public func stop() {
+        lifecycleLock.lock()
         guard !stopped else {
+            lifecycleLock.unlock()
             return
         }
         stopped = true
+        lifecycleLock.unlock()
+
         acceptWorkItem?.cancel()
         if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
             PfsUnixSocket.close(wakeFD)
@@ -191,10 +196,10 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         defer {
             acceptGroup.leave()
         }
-        while !stopped && acceptWorkItem?.isCancelled != true {
+        while !isStopped && acceptWorkItem?.isCancelled != true {
             do {
                 let clientFD = try PfsUnixSocket.accept(serverFD)
-                if stopped || acceptWorkItem?.isCancelled == true {
+                if isStopped || acceptWorkItem?.isCancelled == true {
                     PfsUnixSocket.close(clientFD)
                     return
                 }
@@ -204,7 +209,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
                     self?.clientLoop(session: session)
                 }
             } catch {
-                if !stopped {
+                if !isStopped {
                     continue
                 }
                 return
@@ -218,7 +223,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             session.close()
         }
         var reader = PfsMockFrameReader(fd: session.fd)
-        while !stopped {
+        while !isStopped {
             do {
                 let envelope = try reader.readFrame()
                 Task.detached { [fileSystem, session] in
@@ -229,6 +234,13 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
                 return
             }
         }
+    }
+
+    private var isStopped: Bool {
+        lifecycleLock.lock()
+        let value = stopped
+        lifecycleLock.unlock()
+        return value
     }
 
     private func addSession(_ session: MockSession) {
@@ -253,7 +265,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
 private final class MockSession: @unchecked Sendable {
     let fd: Int32
-    private let writeLock = NSLock()
+    private let ioLock = NSLock()
     private let stateLock = NSLock()
     private var subscribed = false
     private var closed = false
@@ -277,8 +289,8 @@ private final class MockSession: @unchecked Sendable {
     }
 
     func send(_ envelope: PfsEnvelope) throws {
-        writeLock.lock()
-        defer { writeLock.unlock() }
+        ioLock.lock()
+        defer { ioLock.unlock() }
         guard !closed else {
             throw PfsLocalClientError.connectionClosed
         }
@@ -286,10 +298,10 @@ private final class MockSession: @unchecked Sendable {
     }
 
     func close() {
-        stateLock.lock()
+        ioLock.lock()
+        defer { ioLock.unlock() }
         let shouldClose = !closed
         closed = true
-        stateLock.unlock()
         if shouldClose {
             PfsUnixSocket.close(fd)
         }
