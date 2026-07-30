@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 // TestResolveLocalDirsPrecedence pins the documented precedence: explicit
@@ -109,11 +111,25 @@ func TestLocalDirsRecordSurvivesBesideBacking(t *testing.T) {
 	if err := writePersistedLocalDirs(mountsDir, "vol_1", "main", "/mnt/w", []string{"node_modules"}); err != nil {
 		t.Fatal(err)
 	}
-	got := readPersistedLocalDirs(mountsDir, "vol_1", "main", "/mnt/w")
+	got, err := readPersistedLocalDirs(mountsDir, "vol_1", "main", "/mnt/w")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Join(got, ",") != "node_modules" {
 		t.Fatalf("persisted local dirs = %v", got)
 	}
-	if readPersistedLocalDirs(mountsDir, "vol_2", "main", "/mnt/w") != nil {
+	if got, err := readPersistedLocalDirs(mountsDir, "vol_2", "main", "/mnt/w"); err != nil || got != nil {
 		t.Fatal("records must be keyed per mount identity")
+	}
+}
+
+func TestPersistedLocalDirsCorruptionFailsMountResolution(t *testing.T) {
+	mountsDir := filepath.Join(t.TempDir(), "state", "portablefs", "mounts")
+	path := localDirsRecordPath(mountsDir, "vol_1", "main", "/mnt/w")
+	if err := privatepath.WriteFileAtomic(path, []byte("{broken\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPersistedLocalDirs(mountsDir, "vol_1", "main", "/mnt/w"); err == nil {
+		t.Fatal("corrupt persisted local-dirs record was treated as empty")
 	}
 }

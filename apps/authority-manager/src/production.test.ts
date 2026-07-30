@@ -1464,6 +1464,40 @@ async function createHarnessLease(h: ProdHarness, operationId = "op-create-1") {
 }
 
 describe("production registry configuration fails closed", () => {
+  test("public router addresses are strict and canonical across schemes and IPv6", () => {
+    expect(
+      readProductionAuthorityRegistryConfig({
+        ...PROD_ENV,
+        PORTABLEFS_AUTHORITY_ROUTER_URL: "tcp://router.example:2050",
+      })
+    ).toMatchObject({
+      routerUrl: "router.example:2050",
+      routerAddress: { host: "router.example", port: 2050 },
+    });
+    expect(
+      readProductionAuthorityRegistryConfig({
+        ...PROD_ENV,
+        PORTABLEFS_AUTHORITY_ROUTER_URL: "fsproto://[2001:db8::1]:2050",
+      })
+    ).toMatchObject({
+      routerUrl: "[2001:db8::1]:2050",
+      routerAddress: { host: "2001:db8::1", port: 2050 },
+    });
+    for (const malformed of [
+      "2001:db8::1:2050",
+      "https://router.example:2050",
+      "01.2.3.4:2050",
+      "router.example:2050/path",
+    ]) {
+      expect(() =>
+        readProductionAuthorityRegistryConfig({
+          ...PROD_ENV,
+          PORTABLEFS_AUTHORITY_ROUTER_URL: malformed,
+        })
+      ).toThrow(/strict host:port/);
+    }
+  });
+
   test("the remote journal contract is REQUIRED and local-topology variables are rejected by name", () => {
     const { PORTABLEFS_MANAGED_VCS_JOURNAL_DSN: _dsn, ...withoutDsn } = PROD_ENV;
     expect(() => readProductionAuthorityRegistryConfig(withoutDsn)).toThrow(
@@ -2734,6 +2768,7 @@ async function startProductionServer(): Promise<{
     registry: stubRegistry(),
     authToken: "manager-token",
     accessLeases: service,
+    dataPlaneTransport: { mode: "tls-system-pki", serverName: "router.example" },
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -2792,6 +2827,7 @@ describe("canonical access-lease routes over the production service", () => {
       authorityUrl: "router.example:2050",
       authorityInstanceId: "pfai_route_1",
       authorityAuthToken: accessToken,
+      dataPlaneTransport: { mode: "tls-system-pki", serverName: "router.example" },
     });
 
     // The lost-response replay over HTTP is byte-identical.

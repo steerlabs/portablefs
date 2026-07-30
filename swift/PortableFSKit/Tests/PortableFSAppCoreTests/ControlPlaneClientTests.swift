@@ -1,4 +1,6 @@
 import Foundation
+import CryptoKit
+import Security
 import Testing
 @testable import PortableFSAppCore
 
@@ -44,6 +46,17 @@ private final class StubTransport: HTTPDataTransport, @unchecked Sendable {
         defer { lock.unlock() }
         return requests.map { $0.url?.path(percentEncoded: false) ?? "" }
     }
+}
+
+private func systemCertificatePEM() throws -> String {
+    var anchors: CFArray?
+    let status = SecTrustCopyAnchorCertificates(&anchors)
+    #expect(status == errSecSuccess)
+    let certificate = try #require((anchors as? [SecCertificate])?.first)
+    let der = SecCertificateCopyData(certificate) as Data
+    return "-----BEGIN CERTIFICATE-----\n" +
+        der.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed]) +
+        "-----END CERTIFICATE-----\n"
 }
 
 private struct FailingTransport: HTTPDataTransport {
@@ -194,10 +207,94 @@ private struct FailingTransport: HTTPDataTransport {
 }
 
 private let accessLeaseJSON = """
-{"authority":{"authorityUrl":"tcp://10.0.0.5:7443","host":"10.0.0.5","port":7443,"authorityInstanceId":"auth-1"},
+{"authority":{"authorityUrl":"tcp://10.0.0.5:7443","host":"10.0.0.5","port":7443,"authorityInstanceId":"auth-1",
+ "dataPlaneTransport":{"mode":"tls-system-pki","serverName":"router.example"}},
  "lease":{"accessLeaseId":"pfal_1","controlSeq":"7","expiresAt":1751505000000,"state":"active"},
  "accessToken":"lease-token","serverTimeMs":1751504000000}
 """
+
+private func accessLeaseResponse(transport: [String: Any]?) throws -> Data {
+    var authority: [String: Any] = ["authorityUrl": "router.example:2050"]
+    if let transport {
+        authority["dataPlaneTransport"] = transport
+    }
+    return try JSONSerialization.data(withJSONObject: [
+        "authority": authority,
+        "lease": [
+            "accessLeaseId": "pfal_1",
+            "controlSeq": "1",
+            "expiresAt": 1_751_505_000_000,
+            "state": "active",
+        ],
+        "accessToken": "lease-token",
+    ])
+}
+
+@Test func accessSessionAcceptsPrivateCAAndExplicitPlaintext() async throws {
+    let pem = try systemCertificatePEM()
+    let digest = SHA256.hash(data: Data(pem.utf8)).map { String(format: "%02x", $0) }.joined()
+    let privateClient = ControlPlaneClient(
+        baseURL: "https://mgr",
+        token: "mtok",
+        transport: StubTransport([.init(status: 200, body: try accessLeaseResponse(transport: [
+            "mode": "tls-private-ca",
+            "serverName": "router.example",
+            "caPem": pem,
+            "caSha256": digest,
+        ]))])
+    )
+    #expect(
+        try await privateClient.accessSession(volumeID: "vol-a", branch: "main").dataPlaneTransport ==
+            .tlsPrivateCA(serverName: "router.example", caPEM: pem, caSHA256: digest)
+    )
+
+    let plaintextClient = ControlPlaneClient(
+        baseURL: "https://mgr",
+        token: "mtok",
+        transport: StubTransport([.init(
+            status: 200,
+            body: try accessLeaseResponse(transport: ["mode": "plaintext"])
+        )])
+    )
+    #expect(
+        try await plaintextClient.accessSession(volumeID: "vol-a", branch: "main").dataPlaneTransport ==
+            .plaintext
+    )
+}
+
+@Test func accessSessionRejectsMissingConflictingAndFingerprintMismatchedTransport() async throws {
+    let pem = try systemCertificatePEM()
+    let cases: [([String: Any]?, String)] = [
+        (nil, "upgrade the authority manager"),
+        (["mode": "plaintext", "serverName": "router.example"], "conflicting"),
+        (["mode": "tls-system-pki"], "incomplete"),
+        ([
+            "mode": "tls-private-ca",
+            "serverName": "router.example",
+            "caPem": pem,
+            "caSha256": String(repeating: "0", count: 64),
+        ], "fingerprint mismatch"),
+        (["mode": "future"], "unsupported"),
+    ]
+    for (wire, expected) in cases {
+        let client = ControlPlaneClient(
+            baseURL: "https://mgr",
+            token: "mtok",
+            transport: StubTransport([.init(
+                status: 200,
+                body: try accessLeaseResponse(transport: wire)
+            )])
+        )
+        do {
+            _ = try await client.accessSession(volumeID: "vol-a", branch: "main")
+            Issue.record("accepted invalid transport \(String(describing: wire))")
+        } catch let error as ControlPlaneError {
+            #expect(error.message.contains(expected))
+        } catch {
+            Issue.record("unexpected error type: \(error)")
+        }
+    }
+}
 
 @Test func accessSessionUsesAccessLeaseRoute() async throws {
     let transport = StubTransport([.init(status: 200, body: Data(accessLeaseJSON.utf8))])
@@ -208,6 +305,7 @@ private let accessLeaseJSON = """
     #expect(session.expiresAtMs == 1751505000000)
     #expect(session.accessLeaseId == "pfal_1")
     #expect(session.controlSeq == "7")
+    #expect(session.dataPlaneTransport == .tlsSystemPKI(serverName: "router.example"))
     #expect(transport.recordedPaths == ["/v1/access-leases/create"])
 }
 
@@ -224,7 +322,8 @@ private let accessLeaseJSON = """
         expiresAtMs: 1751505000000,
         authorityInstanceId: "auth-1",
         accessLeaseId: "pfal_1",
-        controlSeq: "7"
+        controlSeq: "7",
+        dataPlaneTransport: .plaintext
     )
     let renewed = try await client.renewAccessSession(
         initial,
@@ -275,7 +374,8 @@ private let accessLeaseJSON = """
         token: "lease-token",
         expiresAtMs: 1751505000000,
         accessLeaseId: "pfal_1",
-        controlSeq: "7"
+        controlSeq: "7",
+        dataPlaneTransport: .plaintext
     )
     do {
         _ = try await client.renewAccessSession(
@@ -302,7 +402,8 @@ private let accessLeaseJSON = """
         authorityUrl: "tcp://authority",
         token: "lease-token",
         accessLeaseId: "pfal_1",
-        controlSeq: "7"
+        controlSeq: "7",
+        dataPlaneTransport: .plaintext
     )
     try await client.releaseAccessSession(session, operationID: "op-release-1")
     #expect(transport.recordedPaths == ["/v1/access-leases/release"])

@@ -112,15 +112,17 @@ Mount it through the custom protocol:
 
 ```bash
 mkdir -p /mnt/vol
-./portablefs-bin mount vol_... /mnt/vol --addr 127.0.0.1:2050 --foreground
+./portablefs-bin mount vol_... /mnt/vol --addr 127.0.0.1:2050 \
+  --data-plane-transport plaintext --foreground
 ```
 
 Run agents and tools inside `/mnt/vol`. That mounted filesystem is the live source of truth for
 the active volume.
 
-Production direct mounts also pass `--mount-token` (and configure
-`PORTABLEFS_TLS_CA`/`VCS_TLS_CA`) so the client authenticates and verifies the
-authority.
+Production direct mounts also pass `--mount-token` and an explicit transport:
+`tls-system-pki` plus `--data-plane-server-name`, or `tls-private-ca` plus the
+exact server name and `--data-plane-ca <ca.pem>`. There is no TLS environment
+fallback and an empty CA never selects plaintext.
 
 For NFS mounting, the managed journal child, TLS/auth, metrics, and real-backend VCS tests, see
 [../vcs/README.md](../vcs/README.md).

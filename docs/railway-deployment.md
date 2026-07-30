@@ -111,7 +111,10 @@ the `/readyz` health check probes it — no coupling needed here.
 | `PORTABLEFS_ACCESS_TOKEN_ROOT_SECRET` | >= 32 bytes, hex or base64url (sealed) |
 | `PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR` | `0.0.0.0:2050` |
 | `PORTABLEFS_AUTHORITY_ROUTER_URL` | `${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}` — the public address mount clients dial |
+| `PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE` | `tls-private-ca` |
+| `PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME` | `${{RAILWAY_TCP_PROXY_DOMAIN}}` — exact SAN/verification name, without a port |
 | `PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM` / `PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM` | router TLS as inline PEMs in sealed variables (the `*_PATH` file variants exist but Railway has no secret-file mount; PEM-in-env avoids a volume) |
+| `PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM` | strict private CA certificate bundle that anchors the router certificate; its SHA-256 is lease-bound automatically |
 | `PORTABLEFS_VOLUME_API_URL` | `http://volume-api.railway.internal:8787` (private network) |
 
 Do NOT set `PORTABLEFS_VOLUME_API_TOKEN` / `VOLUME_API_TOKEN` here — a
@@ -176,9 +179,20 @@ PEM variables above. Practical consequence: Railway's edge certificates
 do not apply, so issue the router certificate from your own private CA
 with the TCP proxy domain (`RAILWAY_TCP_PROXY_DOMAIN`) in the SAN, seal
 the PEMs into `PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM`/`_KEY_PEM`, and
-distribute the CA certificate to mount clients. Plaintext is only
-possible with `PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1`
+seal the CA into `PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM`. The manager sends
+the exact CA, fingerprint, and server name only inside the access lease; clients
+never probe or reuse a profile cache. Startup proves the leaf/key/SAN,
+intermediate chain, validity, TLS-server purpose, and an actual local TLS 1.3
+handshake against that exact private CA before the public listener is
+published. Plaintext is only possible with
+`PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=plaintext` plus
+`PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1`
 behind an authenticated private tunnel — never across the public proxy.
+
+Router addresses are strict `host:port`; bracket IPv6 as `[address]:port`.
+Paths, userinfo, queries, unbracketed IPv6, ambiguous numeric IPv4, and
+noncanonical ports fail startup. The recommended Railway value is already the
+canonical scheme-free `${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}`.
 
 Everything else stays on the private network: volume-api is reachable at
 `volume-api.railway.internal:8787` and needs no public domain unless CLIs

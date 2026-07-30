@@ -3,12 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -83,8 +80,7 @@ func cmdLogin(e *cmdEnv, args []string) int {
 		}
 		serverURL = positionals[0]
 	}
-
-	cfg, cfgPath, err := e.loadConfig()
+	cfg, _, err := e.loadConfig()
 	if err != nil {
 		return e.fail("login", err)
 	}
@@ -124,63 +120,28 @@ func cmdLogin(e *cmdEnv, args []string) int {
 		}
 	}
 
-	// Capture the deployment's data-plane router CA so mounts trust its TLS
-	// endpoint with zero local setup. Best-effort: deployments without a
-	// published CA (plaintext dev routers, or trust distributed out of band
-	// via PORTABLEFS_TLS_CA) simply store nothing.
-	prof.DataPlaneCAPEM = fetchRouterCA(serverURL, prof.ManagerUrl)
-
-	cfg.Profiles[profileName] = prof
-	cfg.CurrentProfile = profileName
-	if err := saveConfig(cfgPath, cfg); err != nil {
-		return e.fail("login", err)
-	}
-
 	if err := verifyCredential(e, serverURL, prof.APIToken); err != nil {
 		var skew *versionSkewError
 		if errors.As(err, &skew) {
-			// A too-old binary is not a credential problem; the saved
-			// credentials are fine once the CLI is upgraded.
 			return e.fail("login", skew)
 		}
-		return e.fail("login", fmt.Errorf("%w\ncredentials were saved to %s but were rejected; re-run `portablefs login %s --token <valid token>`", err, cfgPath, serverURL))
+		return e.fail("login", fmt.Errorf("%w\ncredentials were not saved; re-run `portablefs login %s --token <valid token>`", err, serverURL))
 	}
+
+	cfgPath, err := e.mutateConfigExclusive(func(latest *Config, _ string) error {
+		latest.Profiles[profileName] = prof
+		latest.CurrentProfile = profileName
+		return nil
+	})
+	if err != nil {
+		return e.fail("login", err)
+	}
+
 	if *jsonOut {
 		return e.printJSON(map[string]any{"apiUrl": serverURL, "profile": profileName, "verified": true})
 	}
 	fmt.Fprintf(e.stdout, "logged in to %s (profile %q, config %s)\n", serverURL, profileName, cfgPath)
 	return 0
-}
-
-// fetchRouterCA retrieves the data-plane router CA bundle a deployment
-// publishes at GET /router-ca.pem (the hosted control plane serves it from
-// the API origin; a split self-host may serve it from the manager origin).
-// The response must parse as PEM certificate material; anything else — 404,
-// HTML error pages, an empty body — yields "" and mounts fall back to env
-// trust (PORTABLEFS_TLS_CA) or plaintext for local routers.
-func fetchRouterCA(origins ...string) string {
-	client := &http.Client{Timeout: 10 * time.Second}
-	seen := map[string]bool{}
-	for _, origin := range origins {
-		if origin == "" || seen[origin] {
-			continue
-		}
-		seen[origin] = true
-		resp, err := client.Get(origin + "/router-ca.pem")
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
-		_ = resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusOK {
-			continue
-		}
-		if block, _ := pem.Decode(body); block == nil || block.Type != "CERTIFICATE" {
-			continue
-		}
-		return string(body)
-	}
-	return ""
 }
 
 // verifyCredential checks the token against GET /v1/volumes. The server
@@ -305,19 +266,18 @@ func cmdLogout(e *cmdEnv, args []string) int {
 	if _, err := parseArgs(fs, args); err != nil {
 		return e.handleParseError("logout", err)
 	}
-	cfg, cfgPath, err := e.loadConfig()
-	if err != nil {
-		return e.fail("logout", err)
-	}
 	name := *profileFlag
-	if name == "" {
-		name = cfg.CurrentProfile
-	}
-	if _, ok := cfg.Profiles[name]; !ok {
-		return e.fail("logout", fmt.Errorf("profile %q has no saved credentials in %s", name, cfgPath))
-	}
-	delete(cfg.Profiles, name)
-	if err := saveConfig(cfgPath, cfg); err != nil {
+	cfgPath, err := e.mutateConfigExclusive(func(cfg *Config, path string) error {
+		if name == "" {
+			name = cfg.CurrentProfile
+		}
+		if _, ok := cfg.Profiles[name]; !ok {
+			return fmt.Errorf("profile %q has no saved credentials in %s", name, path)
+		}
+		delete(cfg.Profiles, name)
+		return nil
+	})
+	if err != nil {
 		return e.fail("logout", err)
 	}
 	if *jsonOut {

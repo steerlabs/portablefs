@@ -106,6 +106,16 @@ type Volume struct {
 	// the gate so the still-mounted frontend can keep serving and retry.
 	lifecycleMu sync.RWMutex
 	closed      bool
+	// A forced close is one terminal transaction. Retain its exact outcome
+	// so retries cannot reinterpret a prior failure (or a successfully
+	// parked non-empty tail) as an empty-tail success.
+	forceCloseDone  bool
+	forceCloseJobID string
+	forceCloseErr   error
+	// mutationFailClosed seals every mutation lane when an external durable
+	// prepared marker cannot be rolled back. It is independent of wb because
+	// authority-native lanes and a no-engine construction must also fail.
+	mutationFailClosed error
 
 	AttrCache    *AttrCache
 	VersionCache *VersionCache
@@ -174,6 +184,11 @@ func (v *Volume) beginLifecycleOperation() error {
 
 func (v *Volume) beginMutation() error {
 	if err := v.beginLifecycleOperation(); err != nil {
+		return err
+	}
+	if v.mutationFailClosed != nil {
+		err := v.mutationFailClosed
+		v.lifecycleMu.RUnlock()
 		return err
 	}
 	if v.wb != nil {
@@ -979,6 +994,9 @@ func (v *Volume) SessionFenced() bool {
 func (v *Volume) CloseJournalDurable() (string, error) {
 	v.lifecycleMu.Lock()
 	defer v.lifecycleMu.Unlock()
+	if v.forceCloseDone {
+		return v.forceCloseJobID, v.forceCloseErr
+	}
 	if v.closed {
 		return "", nil
 	}
@@ -986,22 +1004,23 @@ func (v *Volume) CloseJournalDurable() (string, error) {
 	v.cancel()
 	v.wg.Wait()
 	jobID := ""
-	var first error
+	var closeErr error
 	if v.wb != nil {
 		id, err := v.wb.ForceClose("forced unmount")
-		if err != nil {
-			first = err
-		}
 		jobID = id
+		closeErr = err
 	}
 	// Deliberately NO openReg.Shutdown here: journal-first means no authority
 	// round-trips anywhere on the path; open registrations are reclaimed by the
 	// authority's lease sweeper, exactly as after a crash.
-	if err := v.client.Close(); first == nil {
-		first = err
+	if err := v.client.Close(); closeErr == nil {
+		closeErr = err
 	}
+	v.forceCloseDone = true
+	v.forceCloseJobID = jobID
+	v.forceCloseErr = closeErr
 	v.closed = true
-	return jobID, first
+	return v.forceCloseJobID, v.forceCloseErr
 }
 
 // Close drains + releases the write-back engine, then cancels background work
@@ -1038,9 +1057,11 @@ func (v *Volume) CloseWithFinalizer(finalize func() error) error {
 		err := v.wb.CloseWithBarrier(ctx, barrierAndFinalize)
 		cancel()
 		if err != nil {
+			v.latchFailFrozenFinalizer(err)
 			return err
 		}
 	} else if err := barrierAndFinalize(); err != nil {
+		v.latchFailFrozenFinalizer(err)
 		return err
 	}
 	v.cancel()
@@ -1051,6 +1072,16 @@ func (v *Volume) CloseWithFinalizer(finalize func() error) error {
 	err := v.client.Close()
 	v.closed = true
 	return err
+}
+
+// latchFailFrozenFinalizer preserves the external durability contract even
+// when no writeback engine exists. Normal retryable detach failures do not
+// implement this policy and therefore leave mutation service live.
+func (v *Volume) latchFailFrozenFinalizer(err error) {
+	var keepFrozen writeback.KeepWritebackFrozenError
+	if errors.As(err, &keepFrozen) && keepFrozen.KeepWritebackFrozen() && v.mutationFailClosed == nil {
+		v.mutationFailClosed = fmt.Errorf("clientcore: mutations sealed after prepared-detach rollback failure: %w", err)
+	}
 }
 
 func (v *Volume) setPrefetchProgress(p PrefetchProgress) {

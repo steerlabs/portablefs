@@ -8,38 +8,81 @@ struct MenuContent: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        Text(model.signedInDescription)
-        Text("Daemon: \(model.daemon.statusLabel)")
-        Divider()
+        Group {
+            if !model.isLifecycleReady {
+                Text("Starting PortableFS…")
+                Divider()
+                Button("Quit PortableFS") {
+                    model.quitApp()
+                }
+            } else {
+                Text(model.signedInDescription)
+                Divider()
 
-        volumesSection
-        Divider()
+                volumesSection
+                if !model.unlistedLocalMounts.isEmpty {
+                    Divider()
+                    Text("Local Mounts")
+                    ForEach(model.unlistedLocalMounts) { mount in
+                        Menu {
+                            Text("\(mount.volumeId)@\(mount.branch)")
+                            Text(mount.mountPath)
+                            if mount.requiresCleanup {
+                                Text(
+                                    mount.operationPhase.isEmpty
+                                        ? "Cleanup required"
+                                        : "Cleanup required (\(mount.operationPhase))"
+                                )
+                            } else {
+                                Text("Health: \(mount.health)")
+                            }
+                            Divider()
+                            Button(mount.requiresCleanup ? "Unmount / Reconcile" : "Unmount") {
+                                model.unmountLocalMount(mount)
+                            }
+                        } label: {
+                            Label(mount.volumeId, systemImage: "externaldrive.badge.questionmark")
+                        }
+                    }
+                }
+                Divider()
 
-        alertsSection
+                alertsSection
 
-        Button("Refresh") {
-            Task {
-                await model.refreshAll()
+                Button("Refresh") {
+                    Task {
+                        await model.refreshAll()
+                    }
+                }
+                Group {
+                    if model.isSignedIn {
+                        Button("Sign In / Switch Account…") {
+                            openSignInWindow()
+                        }
+                    } else {
+                        Button("Sign In…") {
+                            openSignInWindow()
+                        }
+                    }
+                }
+                .disabled(model.hasAccountEnvironmentOverrides)
+                Button("Settings…") {
+                    NSApplication.shared.activate()
+                    openSettings()
+                }
+                Button("File System Extension Setup…") {
+                    FirstRunAssistant.shared.present()
+                }
+                Divider()
+                Button("Quit PortableFS") {
+                    model.quitApp()
+                }
+                .disabled(model.isQuitting)
             }
         }
-        if model.isSignedIn {
-            Button("Sign In / Switch Account…") {
-                openSignInWindow()
-            }
-        } else {
-            Button("Sign In…") {
-                openSignInWindow()
-            }
+        .onAppear {
+            model.activateInteractiveSession()
         }
-        Button("Settings…") {
-            NSApplication.shared.activate()
-            openSettings()
-        }
-        Divider()
-        Button("Quit PortableFS") {
-            model.quitApp()
-        }
-        .disabled(model.isQuitting)
     }
 
     private func openSignInWindow() {
@@ -109,10 +152,15 @@ private struct VolumeMenu: View {
                 Button("Unmount") {
                     model.unmount(volume)
                 }
+            case .cleanupRequired:
+                Button("Unmount / Reconcile") {
+                    model.unmount(volume)
+                }
             case .unmounted, .failed:
                 Button("Mount \(volume.volumeId)@\(volume.defaultBranch)") {
                     model.mount(volume)
                 }
+                .disabled(!model.canMount(volume))
                 if case let .failed(message) = state {
                     Button("Copy Error") {
                         NSPasteboard.general.clearContents()
@@ -132,6 +180,8 @@ private struct VolumeMenu: View {
         case .mounted:
             return "circle.fill"
         case .failed:
+            return "exclamationmark.triangle"
+        case .cleanupRequired:
             return "exclamationmark.triangle"
         case .unmounted:
             return "circle"

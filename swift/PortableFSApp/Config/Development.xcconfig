@@ -2,3 +2,4 @@
 // time and register a matching application-group identifier.
 // Unsigned verification builds use CODE_SIGNING_ALLOWED=NO and ignore this.
 DEVELOPMENT_TEAM = B47U2LLKHW
+PORTABLEFS_APP_GROUP = $(TeamIdentifierPrefix)pfsoss

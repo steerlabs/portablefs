@@ -140,31 +140,36 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			a.marshalJSONStatus(w)
 		case http.MethodDelete:
-			// A normal DELETE runs the full drain barrier and FAILS (attach
-			// intact, still serving) when the tail cannot reach the
-			// authority. Only ?force=1 detaches with an unshipped tail; the
-			// tail parks as a durable recovery job whose ID is returned.
-			force := r.URL.Query().Get("force") == "1"
-			_, jobID, err := s.registry.delete(r.Context(), ref, force)
-			if err != nil && !force {
-				writeHTTPError(w, http.StatusConflict, err.Error())
-				return
-			}
-			if err != nil {
-				writeHTTPError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if force {
-				writeJSON(w, http.StatusOK, map[string]any{"forced": true, "recoveryJob": jobID})
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
+			writeHTTPError(w, http.StatusMethodNotAllowed, "DELETE cannot prove exact FSKit kernel teardown; use POST /v1/attaches/{ref}/unmount")
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 		return
 	}
 	switch strings.Join(parts[1:], "/") {
+	case "unmount":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		force := r.URL.Query().Get("force") == "1"
+		found, jobID, err := s.registry.unmountFSKit(ref, force)
+		if err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if !found {
+			writeHTTPError(w, http.StatusNotFound, "unknown attach")
+			return
+		}
+		if force || jobID != "" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"forced":      force,
+				"recoveryJob": jobID,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "credential":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -177,8 +182,13 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := a.activate(r.Context(), req.AuthToken); err != nil {
+		found, err := s.registry.activate(r.Context(), ref, req.AuthToken)
+		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if !found {
+			writeHTTPError(w, http.StatusNotFound, "unknown attach")
 			return
 		}
 		if eno := a.persistStateOrEIO("credential activation"); eno != 0 {
@@ -269,6 +279,12 @@ func (s *Server) controlFSList(w http.ResponseWriter, r *http.Request, a *attach
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
+	if err := a.controlAdmissionError(); err != nil {
+		writeHTTPError(w, http.StatusConflict, err.Error())
+		return
+	}
 	p := cleanControlPath(req.Path)
 	// freshDirListing is the same namespace the FSKit frontend serves: grafted
 	// directories list machine-local backing, graft parents merge graft roots
@@ -304,6 +320,12 @@ func (s *Server) controlFSRead(w http.ResponseWriter, r *http.Request, a *attach
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
+	if err := a.controlAdmissionError(); err != nil {
+		writeHTTPError(w, http.StatusConflict, err.Error())
 		return
 	}
 	p := cleanControlPath(req.Path)
@@ -358,6 +380,15 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 	data, err := base64.StdEncoding.DecodeString(req.DataBase64)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Hold the exclusive namespace gate for the complete logical operation.
+	// This also covers grafted local files, whose mutation path deliberately
+	// bypasses the remote Volume lifecycle.
+	a.nsMu.Lock()
+	defer a.nsMu.Unlock()
+	if err := a.controlAdmissionError(); err != nil {
+		writeHTTPError(w, http.StatusConflict, err.Error())
 		return
 	}
 	p := cleanControlPath(req.Path)
@@ -431,6 +462,12 @@ func (s *Server) controlFSStat(w http.ResponseWriter, r *http.Request, a *attach
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
+	if err := a.controlAdmissionError(); err != nil {
+		writeHTTPError(w, http.StatusConflict, err.Error())
 		return
 	}
 	p := cleanControlPath(req.Path)

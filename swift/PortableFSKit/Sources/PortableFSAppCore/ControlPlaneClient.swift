@@ -1,8 +1,27 @@
 import Foundation
+import CryptoKit
+import Darwin
+import Security
 
 /// Transport seam so tests can exercise the client against canned responses.
 public protocol HTTPDataTransport: Sendable {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+public extension HTTPDataTransport {
+    func send(
+        _ request: URLRequest,
+        maximumResponseBytes: Int
+    ) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await send(request)
+        guard data.prefix(maximumResponseBytes + 1).count <= maximumResponseBytes else {
+            throw ControlPlaneError(
+                status: 0,
+                message: "response exceeded \(maximumResponseBytes) bytes"
+            )
+        }
+        return (data, response)
+    }
 }
 
 public struct URLSessionTransport: HTTPDataTransport {
@@ -20,6 +39,31 @@ public struct URLSessionTransport: HTTPDataTransport {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw ControlPlaneError(status: 0, code: "", message: "non-HTTP response from \(request.url?.absoluteString ?? "?")")
+        }
+        return (data, http)
+    }
+
+    public func send(
+        _ request: URLRequest,
+        maximumResponseBytes: Int
+    ) async throws -> (Data, HTTPURLResponse) {
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw ControlPlaneError(
+                status: 0,
+                message: "non-HTTP response from \(request.url?.absoluteString ?? "?")"
+            )
+        }
+        var data = Data()
+        data.reserveCapacity(min(maximumResponseBytes, 16 * 1024))
+        for try await byte in bytes {
+            data.append(byte)
+            guard data.count <= maximumResponseBytes else {
+                throw ControlPlaneError(
+                    status: 0,
+                    message: "response exceeded \(maximumResponseBytes) bytes"
+                )
+            }
         }
         return (data, http)
     }
@@ -179,6 +223,19 @@ public enum AccessLeaseFailureDisposition: Equatable, Sendable {
     case terminal
 }
 
+public enum DataPlaneTransport: Equatable, Sendable {
+    case tlsPrivateCA(serverName: String, caPEM: String, caSHA256: String)
+    case tlsSystemPKI(serverName: String)
+    case plaintext
+}
+
+private struct DataPlaneTransportWire: Decodable {
+    var mode: String?
+    var serverName: String?
+    var caPem: String?
+    var caSha256: String?
+}
+
 /// Resolved data-plane endpoint + credential for one mount, as minted by the
 /// authority manager's access-lease route.
 public struct AccessSessionInfo: Equatable, Sendable {
@@ -190,6 +247,7 @@ public struct AccessSessionInfo: Equatable, Sendable {
     public var authorityInstanceId: String
     public var accessLeaseId: String
     public var controlSeq: String
+    public var dataPlaneTransport: DataPlaneTransport
 
     public init(
         authorityUrl: String,
@@ -199,7 +257,8 @@ public struct AccessSessionInfo: Equatable, Sendable {
         expiresAtMs: Int64 = 0,
         authorityInstanceId: String = "",
         accessLeaseId: String = "",
-        controlSeq: String = ""
+        controlSeq: String = "",
+        dataPlaneTransport: DataPlaneTransport
     ) {
         self.authorityUrl = authorityUrl
         self.host = host
@@ -209,6 +268,7 @@ public struct AccessSessionInfo: Equatable, Sendable {
         self.authorityInstanceId = authorityInstanceId
         self.accessLeaseId = accessLeaseId
         self.controlSeq = controlSeq
+        self.dataPlaneTransport = dataPlaneTransport
     }
 }
 
@@ -274,6 +334,131 @@ public struct ControlPlaneClient: Sendable {
             }
         } catch {
             return .unreachable(message: friendlyTransportMessage(error))
+        }
+    }
+
+    private static func isStrictCertificatePEM(_ pem: String) -> Bool {
+        let begin = "-----BEGIN CERTIFICATE-----"
+        let end = "-----END CERTIFICATE-----"
+        var remaining = pem[...]
+        var certificateCount = 0
+
+        func droppingWhitespace(_ value: Substring) -> Substring {
+            value.drop(while: { $0.isWhitespace })
+        }
+
+        while true {
+            remaining = droppingWhitespace(remaining)
+            if remaining.isEmpty {
+                return certificateCount > 0
+            }
+            guard remaining.hasPrefix(begin) else {
+                return false
+            }
+            remaining.removeFirst(begin.count)
+            guard let endRange = remaining.range(of: end) else {
+                return false
+            }
+            let encodedRegion = remaining[..<endRange.lowerBound]
+            let encoded = encodedRegion.filter { !$0.isWhitespace }
+            guard !encoded.isEmpty,
+                  encoded.allSatisfy({
+                      $0.isASCII &&
+                          ($0.isLetter || $0.isNumber || $0 == "+" || $0 == "/" || $0 == "=")
+                  }),
+                  let der = Data(base64Encoded: String(encoded)),
+                  SecCertificateCreateWithData(nil, der as CFData) != nil else {
+                return false
+            }
+            certificateCount += 1
+            remaining = remaining[endRange.upperBound...]
+        }
+    }
+
+    private static func isValidDataPlaneServerName(_ name: String) -> Bool {
+        guard !name.isEmpty,
+              name.count <= 253,
+              name == name.trimmingCharacters(in: .whitespacesAndNewlines),
+              name.rangeOfCharacter(from: .controlCharacters) == nil,
+              !name.contains("/"),
+              !name.contains("\\"),
+              !name.hasPrefix("["),
+              !name.hasSuffix("]") else {
+            return false
+        }
+        if name.contains(":") {
+            var address = in6_addr()
+            return name.withCString { inet_pton(AF_INET6, $0, &address) == 1 }
+        }
+        return name.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
+            guard !label.isEmpty,
+                  label.count <= 63,
+                  label.first != "-",
+                  label.last != "-" else {
+                return false
+            }
+            return label.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+        }
+    }
+
+    private static func validateDataPlaneTransport(
+        _ wire: DataPlaneTransportWire?,
+        status: Int
+    ) throws -> DataPlaneTransport {
+        guard let wire, let mode = wire.mode, !mode.isEmpty else {
+            throw ControlPlaneError(
+                status: status,
+                message: "manager omitted authority.dataPlaneTransport; upgrade the authority manager before mounting with this PortableFS client"
+            )
+        }
+        switch mode {
+        case "plaintext":
+            guard wire.serverName == nil, wire.caPem == nil, wire.caSha256 == nil else {
+                throw ControlPlaneError(status: status, message: "manager returned plaintext transport with conflicting TLS fields")
+            }
+            return .plaintext
+        case "tls-system-pki":
+            guard let serverName = wire.serverName,
+                  isValidDataPlaneServerName(serverName),
+                  wire.caPem == nil,
+                  wire.caSha256 == nil else {
+                throw ControlPlaneError(status: status, message: "manager returned incomplete or conflicting tls-system-pki transport")
+            }
+            return .tlsSystemPKI(serverName: serverName)
+        case "tls-private-ca":
+            guard let serverName = wire.serverName,
+                  isValidDataPlaneServerName(serverName),
+                  let caPEM = wire.caPem,
+                  !caPEM.isEmpty,
+                  Data(caPEM.utf8).count <= 256 * 1024,
+                  isStrictCertificatePEM(caPEM),
+                  let declaredDigest = wire.caSha256,
+                  declaredDigest.count == 64,
+                  declaredDigest == declaredDigest.lowercased(),
+                  declaredDigest.allSatisfy({
+                      $0.isASCII && (($0 >= "0" && $0 <= "9") || ($0 >= "a" && $0 <= "f"))
+                  }) else {
+                throw ControlPlaneError(status: status, message: "manager returned incomplete or invalid tls-private-ca transport")
+            }
+            let actualDigest = SHA256.hash(data: Data(caPEM.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            guard actualDigest == declaredDigest else {
+                throw ControlPlaneError(
+                    status: status,
+                    message: "manager returned tls-private-ca with a CA fingerprint mismatch"
+                )
+            }
+            return .tlsPrivateCA(
+                serverName: serverName,
+                caPEM: caPEM,
+                caSHA256: declaredDigest
+            )
+        default:
+            throw ControlPlaneError(
+                status: status,
+                message: "manager returned unsupported data-plane transport mode \(mode); upgrade PortableFS so client and manager agree"
+            )
         }
     }
 
@@ -351,6 +536,7 @@ public struct ControlPlaneClient: Sendable {
             var host: String?
             var port: Int?
             var authorityInstanceId: String?
+            var dataPlaneTransport: DataPlaneTransportWire?
         }
         struct Lease: Decodable {
             var accessLeaseId: String?
@@ -376,7 +562,12 @@ public struct ControlPlaneClient: Sendable {
             "branch": branch,
             "consumerId": "app:" + host,
         ])
-        let (status, body) = try await sendRaw(method: "POST", path: "/v1/access-leases/create", body: request)
+        let (status, body) = try await sendRaw(
+            method: "POST",
+            path: "/v1/access-leases/create",
+            body: request,
+            maximumResponseBytes: 512 * 1024
+        )
         guard (200..<300).contains(status) else {
             throw ControlPlaneError.parse(status: status, body: body)
         }
@@ -390,6 +581,10 @@ public struct ControlPlaneClient: Sendable {
               let expiresAt = envelope.lease?.expiresAt, expiresAt > 0 else {
             throw ControlPlaneError(status: status, message: "manager returned an incomplete access lease for \(volumeID)@\(branch)")
         }
+        let dataPlaneTransport = try Self.validateDataPlaneTransport(
+            envelope.authority?.dataPlaneTransport,
+            status: status
+        )
         return AccessSessionInfo(
             authorityUrl: authorityUrl,
             host: envelope.authority?.host ?? "",
@@ -398,7 +593,8 @@ public struct ControlPlaneClient: Sendable {
             expiresAtMs: expiresAt,
             authorityInstanceId: envelope.authority?.authorityInstanceId ?? "",
             accessLeaseId: leaseId,
-            controlSeq: controlSeq
+            controlSeq: controlSeq,
+            dataPlaneTransport: dataPlaneTransport
         )
     }
 
@@ -515,7 +711,12 @@ public struct ControlPlaneClient: Sendable {
         return try decodeJSON(T.self, from: data, context: "\(method) \(path) response")
     }
 
-    private func sendRaw(method: String, path: String, body: Data?) async throws -> (Int, Data) {
+    private func sendRaw(
+        method: String,
+        path: String,
+        body: Data?,
+        maximumResponseBytes: Int? = nil
+    ) async throws -> (Int, Data) {
         guard let url = URL(string: baseURL + path) else {
             throw ControlPlaneError(status: 0, message: "invalid URL \(baseURL + path)")
         }
@@ -529,7 +730,11 @@ public struct ControlPlaneClient: Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         do {
-            let (data, response) = try await transport.send(request)
+            let (data, response) = if let maximumResponseBytes {
+                try await transport.send(request, maximumResponseBytes: maximumResponseBytes)
+            } else {
+                try await transport.send(request)
+            }
             return (response.statusCode, data)
         } catch let error as ControlPlaneError {
             throw error

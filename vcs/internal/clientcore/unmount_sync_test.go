@@ -26,6 +26,16 @@ type freezeProxy struct {
 	done    chan struct{}
 }
 
+type keepWritebackFrozenTestError struct {
+	cause error
+}
+
+func (e *keepWritebackFrozenTestError) Error() string { return e.cause.Error() }
+func (e *keepWritebackFrozenTestError) Unwrap() error { return e.cause }
+func (e *keepWritebackFrozenTestError) KeepWritebackFrozen() bool {
+	return true
+}
+
 func newFreezeProxy(t *testing.T, backend string) *freezeProxy {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -208,6 +218,73 @@ func TestNormalBarrierFailsOnDeadAuthority(t *testing.T) {
 	data, st := v2.Read(ctx, "d/f", NewNodeState(a.Ino, a.Ino != 0), 0, 64)
 	if st != fsproto.OK || string(data) != "journal-first" {
 		t.Fatalf("recovered content %q st=%d, want %q — the acknowledged write was lost", data, st, "journal-first")
+	}
+}
+
+func TestForcedCloseRetryReturnsExactTerminalOutcome(t *testing.T) {
+	terminalErr := errors.New("injected forced-close terminal failure")
+	v := &Volume{
+		closed:          true,
+		forceCloseDone:  true,
+		forceCloseJobID: "pfrj_exact_outcome",
+		forceCloseErr:   terminalErr,
+	}
+	for i := 0; i < 2; i++ {
+		jobID, err := v.CloseJournalDurable()
+		if jobID != "pfrj_exact_outcome" || !errors.Is(err, terminalErr) {
+			t.Fatalf("retry %d outcome=(%q,%v)", i, jobID, err)
+		}
+	}
+}
+
+func TestFinalizerFailFrozenErrorSealsEveryMutationLane(t *testing.T) {
+	authorityAddr := serveCore(t)
+	v := dialCoreNoCleanup(t, authorityAddr, Options{
+		Owner:    "fail-frozen-finalizer",
+		VolumeID: "vol-fail-frozen-finalizer",
+		Branch:   "main",
+		WALDir:   t.TempDir(),
+	})
+	t.Cleanup(func() { _, _ = v.CloseJournalDurable() })
+	sentinel := errors.New("prepared marker rollback could not be persisted")
+	err := v.CloseWithFinalizer(func() error {
+		return &keepWritebackFrozenTestError{cause: sentinel}
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("close error=%v", err)
+	}
+	if v.wb == nil || v.wb.MutationError() == nil {
+		t.Fatal("fail-frozen finalizer error did not latch the writeback mutation seal")
+	}
+	if _, st := v.Mkdir(context.Background(), "must-not-land", 0o755); st == fsproto.OK {
+		t.Fatal("authority-native mutation succeeded after fail-frozen finalizer")
+	}
+}
+
+func TestFinalizerFailFrozenErrorSealsMutationsWithoutWritebackBranch(t *testing.T) {
+	authorityAddr := serveCore(t)
+	v := dialCoreNoCleanup(t, authorityAddr, Options{
+		Owner:    "fail-frozen-finalizer-no-wb",
+		VolumeID: "vol-fail-frozen-finalizer-no-wb",
+		Branch:   "main",
+		WALDir:   t.TempDir(),
+	})
+	writebackEngine := v.wb
+	v.wb = nil // exercise CloseWithFinalizer's direct barrier branch
+	sentinel := errors.New("prepared marker rollback could not be persisted")
+	err := v.CloseWithFinalizer(func() error {
+		return &keepWritebackFrozenTestError{cause: sentinel}
+	})
+	v.wb = writebackEngine
+	t.Cleanup(func() { _, _ = v.CloseJournalDurable() })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("close error=%v", err)
+	}
+	if v.mutationFailClosed == nil {
+		t.Fatal("direct finalizer branch did not latch the Volume mutation seal")
+	}
+	if _, st := v.Mkdir(context.Background(), "must-not-land", 0o755); st == fsproto.OK {
+		t.Fatal("mutation succeeded after direct-branch fail-frozen finalizer")
 	}
 }
 

@@ -33,7 +33,8 @@ private func temporaryDirectory() throws -> String {
           "apiUrl": "https://staging.portablefs.com",
           "apiToken": "tok-staging",
           "managerUrl": "https://manager.staging.portablefs.com",
-          "managerToken": "mgr-staging"
+          "managerToken": "mgr-staging",
+          "dataPlaneCaPem": "-----BEGIN CERTIFICATE-----\\nY2VydA==\\n-----END CERTIFICATE-----\\n"
         }
       }
     }
@@ -44,6 +45,7 @@ private func temporaryDirectory() throws -> String {
     #expect(config.profiles.count == 2)
     #expect(config.profiles["staging"]?.managerUrl == "https://manager.staging.portablefs.com")
     #expect(config.profiles["default"]?.managerToken == "")
+    #expect(!String(decoding: try JSONEncoder().encode(config), as: UTF8.self).contains("dataPlaneCaPem"))
 }
 
 @Test func configDefaultsMissingFieldsLikeGo() throws {
@@ -100,23 +102,64 @@ private func temporaryDirectory() throws -> String {
     #expect(decoded == config)
 }
 
-@Test func configSaveTightensLoosePermissions() throws {
+@Test func configSaveRefusesLooseExistingFileRatherThanRepairingIt() throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(atPath: directory) }
     let path = directory + "/config.json"
     FileManager.default.createFile(atPath: path, contents: Data("{}".utf8), attributes: [.posixPermissions: 0o644])
 
-    try PortableFSConfigFile.save(PortableFSConfig(), path: path)
+    #expect(throws: PortableFSConfigError.self) {
+        try PortableFSConfigFile.save(PortableFSConfig(), path: path)
+    }
     let attributes = try FileManager.default.attributesOfItem(atPath: path)
     let permissions = (attributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
-    #expect(permissions == 0o600)
+    #expect(permissions == 0o644)
 }
 
-@Test func configDefaultPathHonorsXDGConfigHome() {
-    let xdg = PortableFSConfigFile.defaultPath(environment: ["XDG_CONFIG_HOME": "/xdg"], homeDirectory: "/home/u")
-    #expect(xdg == "/xdg/portablefs/config.json")
-    let plain = PortableFSConfigFile.defaultPath(environment: [:], homeDirectory: "/home/u")
+@Test func configDefaultPathUsesFixedAccountHomeLocation() {
+    let plain = PortableFSConfigFile.defaultPath(homeDirectory: "/home/u")
     #expect(plain == "/home/u/.config/portablefs/config.json")
+}
+
+@Test func canonicalConfigRefusesSymlinkedConfigAncestor() throws {
+    let home = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let outside = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(atPath: outside) }
+    try FileManager.default.createSymbolicLink(
+        atPath: home + "/.config",
+        withDestinationPath: outside
+    )
+    let path = PortableFSConfigFile.defaultPath(homeDirectory: home)
+    #expect(throws: PortableFSConfigError.self) {
+        try PortableFSConfigFile.save(
+            PortableFSConfig(),
+            path: path,
+            canonicalHomeDirectory: home
+        )
+    }
+    #expect(!FileManager.default.fileExists(atPath: outside + "/portablefs/config.json"))
+}
+
+@Test func canonicalConfigCreatesAndValidatesEachOwnedComponent() throws {
+    let home = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let path = PortableFSConfigFile.defaultPath(homeDirectory: home)
+    try PortableFSConfigFile.save(
+        PortableFSConfig(),
+        path: path,
+        canonicalHomeDirectory: home
+    )
+    _ = try PortableFSConfigFile.load(
+        path: path,
+        canonicalHomeDirectory: home
+    )
+    for component in [home + "/.config", home + "/.config/portablefs"] {
+        var info = stat()
+        #expect(lstat(component, &info) == 0)
+        #expect(info.st_mode & S_IFMT == S_IFDIR)
+        #expect(info.st_uid == geteuid())
+    }
 }
 
 @Test func resolvedSettingsPrecedenceAndManagerFallback() {

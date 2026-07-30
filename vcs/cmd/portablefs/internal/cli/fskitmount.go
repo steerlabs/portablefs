@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,8 +18,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
 // ---------------------------------------------------------------------------
@@ -49,25 +55,22 @@ const (
 	// any other product that embeds PortableFS (another embedder
 	// may register its own FSName extension with its own app group): a unique
 	// mount type and a private app-group socket directory guarantee the two
-	// never collide when installed on the same machine. Overridable via
-	// PORTABLEFS_FSKIT_* for bespoke deployments.
+	// never collide when installed on the same machine. Extension coordinates
+	// are overridable via PORTABLEFS_FSKIT_* for bespoke deployments; the
+	// executable peer is not.
 	defaultFskitType = "pfs"
-
-	// Must match PFSAppGroupIdentifier in the extension Info.plist and the
-	// com.apple.security.application-groups entitlement.
-	fskitAppGroup = "B47U2LLKHW.pfsoss"
 )
 
 // defaultFskitSocketDir is the daemon socket directory inside the app-group
 // container. The unsandboxed daemon and CLI address it by its well-known
 // path; the sandboxed extension resolves the identical path via
 // containerURL(forSecurityApplicationGroupIdentifier:).
-func defaultFskitSocketDir() string {
-	home, err := os.UserHomeDir()
+func defaultFskitSocketDir() (string, error) {
+	home, err := accountpath.Home()
 	if err != nil {
-		home = "~"
+		return "", fmt.Errorf("resolve canonical account home for FSKit sockets: %w", err)
 	}
-	return filepath.Join(home, "Library", "Group Containers", fskitAppGroup, "portablefsd")
+	return filepath.Join(home, "Library", "Group Containers", fskitidentity.AppGroup, "portablefsd"), nil
 }
 
 // fskitConfig resolves the extension coordinates for this host. Defaults
@@ -75,20 +78,34 @@ func defaultFskitSocketDir() string {
 // Info.plist); the env overrides exist for dev extensions registered under
 // another fs type / socket location.
 type fskitConfig struct {
-	fsType       string
-	frontendSock string
-	controlSock  string
-	daemonPath   string // explicit portablefsd binary, "" = discover
+	fsType            string
+	frontendSock      string
+	controlSock       string
+	daemonPathForTest string // tests inject a peer without adding a production override
+	legacyStateDir    string // empty only in isolated tests
 }
 
-func fskitConfigFromEnv(getenv func(string) string) fskitConfig {
-	socketDir := defaultFskitSocketDir()
+func fskitConfigFromEnv(getenv func(string) string) (fskitConfig, error) {
+	socketDir, err := defaultFskitSocketDir()
+	if err != nil {
+		return fskitConfig{}, err
+	}
 	cfg := fskitConfig{
 		fsType:       defaultFskitType,
 		frontendSock: filepath.Join(socketDir, "pfs.sock"),
 		controlSock:  filepath.Join(socketDir, "control.sock"),
-		daemonPath:   getenv(fskitDaemonEnv),
 	}
+	if daemonOverride := getenv(fskitDaemonEnv); daemonOverride != "" {
+		return fskitConfig{}, fmt.Errorf(
+			"%s is unsupported: portablefsd must be the exact sibling embedded with this portablefs executable",
+			fskitDaemonEnv,
+		)
+	}
+	home, err := accountpath.Home()
+	if err != nil {
+		return fskitConfig{}, fmt.Errorf("resolve canonical account home for legacy FSKit inventory: %w", err)
+	}
+	cfg.legacyStateDir = filepath.Join(home, "Library", "Application Support", "PortableFS", "portablefsd")
 	if v := getenv(fskitTypeEnv); v != "" {
 		cfg.fsType = v
 	}
@@ -103,7 +120,7 @@ func fskitConfigFromEnv(getenv func(string) string) fskitConfig {
 	if v := getenv(fskitControlEnv); v != "" {
 		cfg.controlSock = v
 	}
-	return cfg
+	return cfg, nil
 }
 
 // fsdControl is a minimal client for portablefsd's control socket (HTTP over
@@ -248,13 +265,17 @@ func fskitOptionsFromPerf(perf perfOptions, localDirs []string, volumeLocalDirs 
 }
 
 type fskitEnsureAttachRequest struct {
-	VolumeID     string             `json:"volumeId"`
-	Branch       string             `json:"branch"`
-	AuthorityURL string             `json:"authorityUrl"`
-	AuthToken    string             `json:"authToken"`
-	TLSCAPEM     string             `json:"tlsCaPem,omitempty"`
-	MountPath    string             `json:"mountPath"`
-	Options      fskitAttachOptions `json:"options"`
+	AttachRef           string             `json:"attachRef"`
+	VolumeID            string             `json:"volumeId"`
+	Branch              string             `json:"branch"`
+	AuthorityURL        string             `json:"authorityUrl"`
+	AuthToken           string             `json:"authToken"`
+	DataPlaneTransport  string             `json:"dataPlaneTransport"`
+	DataPlaneServerName string             `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM            string             `json:"tlsCaPem,omitempty"`
+	TLSCASHA256         string             `json:"tlsCaSha256,omitempty"`
+	MountPath           string             `json:"mountPath"`
+	Options             fskitAttachOptions `json:"options"`
 }
 
 type fskitEnsureAttachReply struct {
@@ -282,25 +303,6 @@ func (c *fsdControl) ensureAttach(req fskitEnsureAttachRequest) (string, error) 
 	return reply.AttachRef, err
 }
 
-func (c *fsdControl) deleteAttach(ref string) error {
-	status, body, err := c.do(http.MethodDelete, "/v1/attaches/"+url.PathEscape(ref), nil)
-	if err != nil {
-		return err
-	}
-	// DELETE is a state-convergence operation. An external forced unmount
-	// removes the attach before it signals the foreground wrapper; that
-	// wrapper must then be able to repeat the normal detach and exit
-	// cooperatively. Treat an already-absent attach as the desired result,
-	// never as a reason to wait forever for another signal.
-	if status == http.StatusNotFound {
-		return nil
-	}
-	if status < 200 || status >= 300 {
-		return controlError(status, body)
-	}
-	return nil
-}
-
 func (c *fsdControl) stopIfIdle() error {
 	status, body, err := c.do(http.MethodPost, "/v1/lifecycle/stop-if-idle", map[string]any{})
 	if err != nil {
@@ -312,11 +314,12 @@ func (c *fsdControl) stopIfIdle() error {
 	return nil
 }
 
-// forceDetach detaches ref WITH an unshipped tail permitted: the daemon
-// parks the tail as a durable recovery job and reports its ID ("" when
-// nothing was pending).
+// forceDetach runs the daemon-owned forced FSKit transaction: durable force
+// authorization, journal parking, prepared proof, exact kernel detach, and
+// durable registry removal. The response names the parked recovery stream
+// ("" is an explicit zero-tail proof).
 func (c *fsdControl) forceDetach(ref string) (jobID string, err error) {
-	status, body, err := c.do(http.MethodDelete, "/v1/attaches/"+url.PathEscape(ref)+"?force=1", nil)
+	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/unmount?force=1", nil)
 	if err != nil {
 		return "", err
 	}
@@ -402,6 +405,23 @@ func (c *fsdControl) syncAttach(ref string) (syncVerdict, error) {
 	return v, nil
 }
 
+// unmountAttach is the normal FSKit teardown transaction. portablefsd owns
+// the admission gate, final durability barrier, exact kernel identity check,
+// in-process kernel unmount, and durable attach removal in one request.
+func (c *fsdControl) unmountAttach(ref string) error {
+	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/unmount", nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound {
+		return nil
+	}
+	if status < 200 || status >= 300 {
+		return controlError(status, body)
+	}
+	return nil
+}
+
 func (c *fsdControl) setCredential(ref, token string) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/credential",
 		map[string]string{"authToken": token})
@@ -414,25 +434,145 @@ func (c *fsdControl) setCredential(ref, token string) error {
 	return nil
 }
 
-// findPortablefsd locates the daemon binary: explicit override, then a
-// sibling of this executable (the release layout), then PATH.
-func findPortablefsd(explicit string) (string, error) {
-	if explicit != "" {
-		if _, err := os.Stat(explicit); err != nil {
-			return "", fmt.Errorf("%s=%s: %w", fskitDaemonEnv, explicit, err)
-		}
-		return explicit, nil
+type portablefsdPeer struct {
+	path   string
+	name   string
+	parent *os.File
+	file   *os.File
+	sha256 string
+}
+
+func (p *portablefsdPeer) close() {
+	if p == nil {
+		return
 	}
-	if exe, err := os.Executable(); err == nil {
-		sibling := filepath.Join(filepath.Dir(exe), "portablefsd")
-		if _, err := os.Stat(sibling); err == nil {
-			return sibling, nil
-		}
+	if p.file != nil {
+		_ = p.file.Close()
 	}
-	if found, err := exec.LookPath("portablefsd"); err == nil {
-		return found, nil
+	if p.parent != nil {
+		_ = p.parent.Close()
 	}
-	return "", fmt.Errorf("portablefsd not found: install it next to the portablefs binary or on PATH (or set %s)", fskitDaemonEnv)
+}
+
+func (p *portablefsdPeer) validate() error {
+	var opened, named unix.Stat_t
+	if err := unix.Fstat(int(p.file.Fd()), &opened); err != nil {
+		return fmt.Errorf("inspect pinned portablefsd peer %s: %w", p.path, err)
+	}
+	if err := unix.Fstatat(int(p.parent.Fd()), p.name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("recheck exact portablefsd peer %s: %w", p.path, err)
+	}
+	if opened.Dev != named.Dev || opened.Ino != named.Ino {
+		return fmt.Errorf("exact portablefsd peer %s changed while pinned", p.path)
+	}
+	if opened.Mode&unix.S_IFMT != unix.S_IFREG ||
+		opened.Uid != uint32(os.Geteuid()) ||
+		opened.Nlink != 1 ||
+		opened.Mode&0o111 == 0 ||
+		opened.Mode&0o022 != 0 {
+		return fmt.Errorf(
+			"portablefsd peer %s must be one uid-owned, non-writable executable regular file",
+			p.path,
+		)
+	}
+	return nil
+}
+
+func openPortablefsdPeer(path string) (*portablefsdPeer, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("portablefsd peer path must be absolute and clean: %q", path)
+	}
+	parentPath, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("resolve portablefsd peer directory %s: %w", filepath.Dir(path), err)
+	}
+	path = filepath.Join(parentPath, filepath.Base(path))
+	parent, err := privatepath.OpenExistingOwnedDir(parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("pin portablefsd peer directory %s: %w", parentPath, err)
+	}
+	name := filepath.Base(path)
+	fd, err := unix.Openat(
+		int(parent.Fd()),
+		name,
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		_ = parent.Close()
+		return nil, fmt.Errorf("open exact portablefsd peer %s without following symlinks: %w", path, err)
+	}
+	peer := &portablefsdPeer{
+		path:   path,
+		name:   name,
+		parent: parent,
+		file:   os.NewFile(uintptr(fd), path),
+	}
+	if peer.file == nil {
+		_ = unix.Close(fd)
+		peer.close()
+		return nil, fmt.Errorf("open exact portablefsd peer %s: invalid file descriptor", path)
+	}
+	if err := peer.validate(); err != nil {
+		peer.close()
+		return nil, err
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, peer.file); err != nil {
+		peer.close()
+		return nil, fmt.Errorf("hash exact portablefsd peer %s: %w", path, err)
+	}
+	peer.sha256 = hex.EncodeToString(hash.Sum(nil))
+	if err := peer.validate(); err != nil {
+		peer.close()
+		return nil, err
+	}
+	return peer, nil
+}
+
+// exactPortablefsdPath resolves only the daemon packaged beside this exact CLI.
+// There is no PATH search or environment-selected executable in production.
+func exactPortablefsdPath(executable string) (string, error) {
+	if executable == "" {
+		return "", fmt.Errorf("portablefs executable path is empty")
+	}
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		return "", fmt.Errorf("resolve portablefs executable %s: %w", executable, err)
+	}
+	if !filepath.IsAbs(resolved) {
+		return "", fmt.Errorf("resolved portablefs executable is not absolute: %q", resolved)
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect portablefs executable %s: %w", resolved, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("portablefs executable %s is not a real executable file", resolved)
+	}
+	return filepath.Join(filepath.Dir(resolved), "portablefsd"), nil
+}
+
+func findPortablefsd(testPath string) (string, error) {
+	if testPath != "" {
+		return testPath, nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve portablefs executable: %w", err)
+	}
+	path, err := exactPortablefsdPath(executable)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Lstat(path); err != nil {
+		return "", fmt.Errorf(
+			"exact embedded portablefsd peer is unavailable at %s: %w; reinstall the complete PortableFS release",
+			path,
+			err,
+		)
+	}
+	return path, nil
 }
 
 // ensurePortablefsd adopts a healthy daemon on the control socket or spawns
@@ -440,24 +580,30 @@ func findPortablefsd(explicit string) (string, error) {
 // every mount, so an already-running daemon (this CLI's or the app's, when
 // they share sockets) is adopted, never duplicated.
 func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdControl, error) {
-	daemon, err := findPortablefsd(cfg.daemonPath)
+	if cfg.legacyStateDir != "" {
+		if err := checkPortablefsdStateRoots(filepath.Join(stateRoot, "portablefsd"), cfg.legacyStateDir); err != nil {
+			return nil, err
+		}
+	}
+	daemonPath, err := findPortablefsd(cfg.daemonPathForTest)
 	if err != nil {
 		return nil, err
 	}
-	daemonSHA256, err := inspectPortablefsdBinary(daemon, cliVersion)
+	daemon, err := openPortablefsdPeer(daemonPath)
 	if err != nil {
 		return nil, err
 	}
+	defer daemon.close()
 	ctl := newFsdControl(cfg.controlSock)
 	if ctl.healthy() {
-		if err := ctl.requireCompatibleIdentity(cliVersion, daemonSHA256); err != nil {
+		if err := ctl.requireCompatibleIdentity(cliVersion, daemon.sha256); err != nil {
 			return nil, err
 		}
 		return ctl, nil
 	}
 	for _, sock := range []string{cfg.frontendSock, cfg.controlSock} {
-		if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-			return nil, fmt.Errorf("create socket directory: %w", err)
+		if err := privatepath.EnsureDir(filepath.Dir(sock)); err != nil {
+			return nil, fmt.Errorf("validate socket directory: %w", err)
 		}
 		if _, err := os.Lstat(sock); err == nil {
 			return nil, fmt.Errorf(
@@ -469,17 +615,19 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 		}
 	}
 	daemonStateDir := filepath.Join(stateRoot, "portablefsd")
-	if err := os.MkdirAll(daemonStateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create portablefsd state dir: %w", err)
+	if err := privatepath.EnsureDir(daemonStateDir); err != nil {
+		return nil, fmt.Errorf("validate portablefsd state dir: %w", err)
 	}
-	logFile, err := os.OpenFile(filepath.Join(stateRoot, "portablefsd.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logFile, err := privatepath.OpenFileAppend(filepath.Join(stateRoot, "portablefsd.log"))
 	if err != nil {
 		return nil, err
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(daemon,
+	if err := daemon.validate(); err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(daemon.path,
 		"-frontend-socket", cfg.frontendSock,
 		"-control-socket", cfg.controlSock,
 		"-state-dir", daemonStateDir,
@@ -489,6 +637,10 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 	// Its own session: the daemon outlives this mount process and serves
 	// later mounts too.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Revalidate at the final userspace boundary immediately before exec.
+	if err := daemon.validate(); err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start portablefsd: %w", err)
 	}
@@ -506,11 +658,17 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 			return fmt.Errorf("spawned portablefsd did not stop within its 30-second drain budget and was left running")
 		}
 	}
+	if err := daemon.validate(); err != nil {
+		if stopErr := stopSpawned(); stopErr != nil {
+			return nil, fmt.Errorf("%w; cleanup: %v", err, stopErr)
+		}
+		return nil, err
+	}
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctl.healthy() {
-			if err := ctl.requireCompatibleIdentity(cliVersion, daemonSHA256); err != nil {
+			if err := ctl.requireCompatibleIdentity(cliVersion, daemon.sha256); err != nil {
 				if stopErr := stopSpawned(); stopErr != nil {
 					return nil, fmt.Errorf("%w; cleanup: %v", err, stopErr)
 				}
@@ -529,22 +687,47 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 		cfg.controlSock, filepath.Join(stateRoot, "portablefsd.log"))
 }
 
-func inspectPortablefsdBinary(path, cliVersion string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
+func rejectLegacyPortablefsdStateAt(legacy string) error {
+	return checkPortablefsdStateRoots("", legacy)
+}
+
+func checkPortablefsdStateRoots(canonical, legacy string) error {
+	canonicalNonempty, err := nonemptyStateDirectory(canonical)
 	if err != nil {
-		return "", fmt.Errorf("inspect portablefsd binary %s: %w (output: %s)", path, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("inspect canonical portablefsd state %s: %w", canonical, err)
 	}
-	daemonVersion := strings.TrimSpace(string(out))
-	if daemonVersion != cliVersion {
-		return "", fmt.Errorf("portablefsd binary %s is version %q but this CLI is %q; install the matching binary pair", path, daemonVersion, cliVersion)
-	}
-	sum, err := daemonctl.FileSHA256(path)
+	legacyNonempty, err := nonemptyStateDirectory(legacy)
 	if err != nil {
-		return "", fmt.Errorf("hash portablefsd binary %s: %w", path, err)
+		return fmt.Errorf("inspect legacy portablefsd state %s: %w", legacy, err)
 	}
-	return sum, nil
+	if !legacyNonempty {
+		return nil
+	}
+	if canonicalNonempty {
+		return fmt.Errorf("portablefsd state conflict: both canonical %s and legacy %s contain state; PortableFS will never guess or merge them", canonical, legacy)
+	}
+	return fmt.Errorf("legacy portablefsd state exists at %s; run the PortableFS installer state migration before mounting (the runtime will not copy, merge, or delete it)", legacy)
+}
+
+func nonemptyStateDirectory(path string) (bool, error) {
+	if path == "" {
+		return false, nil
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return false, fmt.Errorf("state path %s exists with an unexpected type", path)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) != 0, nil
 }
 
 // connectCompatiblePortablefsd proves that an already-running daemon is the
@@ -552,37 +735,23 @@ func inspectPortablefsdBinary(path, cliVersion string) (string, error) {
 // This gate is used outside mount adoption too: unmount, mounts, and doctor
 // must not drive an older daemon merely because it ignores an unknown header.
 func connectCompatiblePortablefsd(cfg fskitConfig, cliVersion string) (*fsdControl, error) {
-	daemon, err := findPortablefsd(cfg.daemonPath)
+	daemonPath, err := findPortablefsd(cfg.daemonPathForTest)
 	if err != nil {
 		return nil, err
 	}
-	daemonSHA256, err := inspectPortablefsdBinary(daemon, cliVersion)
+	daemon, err := openPortablefsdPeer(daemonPath)
 	if err != nil {
 		return nil, err
 	}
+	defer daemon.close()
 	ctl := newFsdControl(cfg.controlSock)
 	if !ctl.healthy() {
 		return nil, fmt.Errorf("portablefsd is not healthy on %s", cfg.controlSock)
 	}
-	if err := ctl.requireCompatibleIdentity(cliVersion, daemonSHA256); err != nil {
+	if err := ctl.requireCompatibleIdentity(cliVersion, daemon.sha256); err != nil {
 		return nil, err
 	}
 	return ctl, nil
-}
-
-// readTLSCAPEM loads the data-plane CA bundle for the daemon's attach
-// request. The daemon dials the authority itself, so the trust material the
-// CLI resolved (PORTABLEFS_TLS_CA / VCS_TLS_CA) must travel to it as PEM.
-func readTLSCAPEM() (string, error) {
-	path := os.Getenv("VCS_TLS_CA")
-	if path == "" {
-		return "", nil
-	}
-	pem, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read TLS CA %s: %w", path, err)
-	}
-	return string(pem), nil
 }
 
 // fskitPreflight proves the attach is resolvable over the SAME frontend
@@ -637,23 +806,39 @@ func fskitPreflight(frontendSock, attachRef, expectedDaemonVersion string) error
 	return nil
 }
 
-// fskitMountHint rewrites the opaque kernel error for a missing/disabled
-// FSKit extension into install guidance.
+type fskitMountFailure string
+
+const (
+	fskitFailureUnknown       fskitMountFailure = ""
+	fskitFailureResourceLoad  fskitMountFailure = "resource-load"
+	fskitFailureModuleMissing fskitMountFailure = "module-unavailable"
+)
+
+// classifyFSKitMountFailure recognizes only evidence that distinguishes a
+// reached extension from the legacy mount-helper fallback. Generic errno text
+// is intentionally left unknown: the same errno can be produced by unrelated
+// mount point, policy, resource, and extension failures.
+func classifyFSKitMountFailure(fsType, message string) fskitMountFailure {
+	if strings.Contains(message, "Loading resource") {
+		return fskitFailureResourceLoad
+	}
+	helper := "mount_" + fsType
+	if strings.Contains(message, helper) &&
+		(strings.Contains(message, "No such file or directory") ||
+			strings.Contains(message, "not found")) {
+		return fskitFailureModuleMissing
+	}
+	return fskitFailureUnknown
+}
+
+// fskitMountHint adds conservative context to otherwise opaque mount output.
 func fskitMountHint(fsType string, err error) error {
 	message := err.Error()
-	// "mount_<type>: No such file or directory" means the kernel found no
-	// enabled FSKit module for the type and fell through to the legacy
-	// /Library/Filesystems probe: the extension is missing or not enabled.
-	// "Loading resource: ... Input/output error" means the module IS enabled
-	// but its loadResource failed — with no daemon socket reachable inside
-	// the app-group container being the overwhelmingly common cause.
-	switch {
-	case strings.Contains(message, "mount_"+fsType) ||
-		strings.Contains(message, "unknown") || strings.Contains(message, "not recognized") ||
-		strings.Contains(message, "45") || strings.Contains(message, "Operation not supported"):
-		return fmt.Errorf("%w\nthe %q FSKit extension is not enabled: install PortableFS.app, then in System Settings → General → Login Items & Extensions open the FILE SYSTEM EXTENSIONS category (the per-app list's toggle is unreliable on macOS 26) and enable it, then retry", err, fsType)
-	case strings.Contains(message, "Loading resource"):
-		return fmt.Errorf("%w\nthe %q FSKit extension could not reach portablefsd's socket in the app-group container; if this CLI was configured with PORTABLEFS_FSKIT_SOCKET, that path must match the extension's PFSAppGroupIdentifier container", err, fsType)
+	switch classifyFSKitMountFailure(fsType, message) {
+	case fskitFailureResourceLoad:
+		return fmt.Errorf("%w\nthe %q FSKit extension was reached but failed while loading its resource; verify portablefsd is reachable at the extension's exact app-group socket and inspect the underlying mount error", err, fsType)
+	case fskitFailureModuleMissing:
+		return fmt.Errorf("%w\nmacOS did not resolve an FSKit module for %q and fell through to the missing legacy %s helper; PortableFS.app may be absent or its extension may need to be enabled in System Settings → General → Login Items & Extensions → FILE SYSTEM EXTENSIONS", err, fsType, "mount_"+fsType)
 	}
 	return err
 }

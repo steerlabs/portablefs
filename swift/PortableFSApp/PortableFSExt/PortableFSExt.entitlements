@@ -15,7 +15,7 @@
 	     with another PortableFS embedder on the same machine. -->
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>$(TeamIdentifierPrefix)pfsoss</string>
+		<string>$(PORTABLEFS_APP_GROUP)</string>
 	</array>
 </dict>
 </plist>

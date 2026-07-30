@@ -19,6 +19,11 @@ pnpm vcs:test:race
 echo "== manifest index benchmark =="
 pnpm bench:manifest-index
 
+echo "== release trust policy =="
+sh -n scripts/install.sh
+node scripts/check-workflow-pins.mjs
+node scripts/check-install-release-trust.mjs
+
 echo "== stale architecture scan =="
 # Guards against resurrecting the removed local-folder-sync architecture. The old
 # bare "daemon/" and "cli/" path patterns are gone: legitimate current components
