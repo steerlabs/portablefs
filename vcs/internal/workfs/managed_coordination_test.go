@@ -987,8 +987,15 @@ func TestManagedHardLinkNlinkAndLastLinkParking(t *testing.T) {
 	if string(data[:n]) != "shared" {
 		t.Fatalf("surviving content %q, want shared", data[:n])
 	}
-	// The last-link unlink parks the inode (open-after-unlink).
-	exact(0, 3, 0x0A, wal.Record{Op: wal.OpOrphan, Path: "h"})
+	// Model the open handle that makes the last-link unlink observable as a
+	// parked inode. Without the durable pin, the asynchronous reap sweep may
+	// legitimately collect the orphan before this test inspects it.
+	pinHash := make([]byte, 32)
+	pinHash[0] = 0x0A
+	if err := fs.ManagedPinChange(coordEnv(a, 6, 1, pinHash), ino, false, pinHash); err != nil {
+		t.Fatalf("pin before last-link unlink: %v", err)
+	}
+	exact(0, 3, 0x0B, wal.Record{Op: wal.OpOrphan, Path: "h"})
 	if _, ok := fs.OrphanInfo(ino); !ok {
 		t.Fatal("last-link unlink did not park the inode")
 	}
