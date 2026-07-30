@@ -411,6 +411,16 @@ type StreamStateView struct {
 	Owner       SessionRef
 }
 
+// WritebackRebindView is one coherent read-only snapshot of the stream ledger
+// and the exact checkout entries named by a recovery rebind. Scope vectors are
+// aligned with the caller's ordered path vector.
+type WritebackRebindView struct {
+	Stream       StreamStateView
+	StreamExists bool
+	Scopes       []CheckoutView
+	ScopeExists  []bool
+}
+
 // StreamState returns one write-back stream's durable watermark and digest.
 func (st *State) StreamState(writebackID string) (StreamStateView, bool) {
 	st.mu.RLock()
@@ -420,6 +430,36 @@ func (st *State) StreamState(writebackID string) (StreamStateView, bool) {
 		return StreamStateView{}, false
 	}
 	return StreamStateView{WritebackID: writebackID, Through: e.through, Digest: e.digest, Owner: e.owner}, true
+}
+
+// WritebackRebindSnapshot reads every fact used by rebind conflict
+// evaluation under one reducer read lock. This prevents a duplicate audit
+// from combining a stream watermark from one applied position with checkout
+// holders from another.
+func (st *State) WritebackRebindSnapshot(writebackID string, paths []string) WritebackRebindView {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+
+	view := WritebackRebindView{
+		Scopes:      make([]CheckoutView, len(paths)),
+		ScopeExists: make([]bool, len(paths)),
+	}
+	if e, ok := st.ledger[writebackID]; ok {
+		view.Stream = StreamStateView{
+			WritebackID: writebackID,
+			Through:     e.through,
+			Digest:      e.digest,
+			Owner:       e.owner,
+		}
+		view.StreamExists = true
+	}
+	for i, path := range paths {
+		if grant, ok := st.checkouts[path]; ok {
+			view.Scopes[i] = checkoutView(path, grant)
+			view.ScopeExists[i] = true
+		}
+	}
+	return view
 }
 
 // HasPin reports whether session holds the durable open pin on ino.

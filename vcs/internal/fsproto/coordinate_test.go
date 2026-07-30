@@ -175,9 +175,33 @@ func newManagedServer(t *testing.T, log *protoEntryLog) (*Server, *workfs.FS) {
 	return NewServer(fs, fs), fs
 }
 
+// observedCoordinationWaitFS makes volatile wait entry observable without
+// sleeping. Tests pre-record an exact outcome, so a correct duplicate replay
+// never calls this method; a regression is deterministic instead of costing
+// the production 45-second SETLKW wait budget.
+type observedCoordinationWaitFS struct {
+	*workfs.FS
+	waitCalls int
+}
+
+func (fs *observedCoordinationWaitFS) WaitCoordinationClear(time.Time, func() bool) bool {
+	fs.waitCalls++
+	return false
+}
+
+func newObservedCoordinationWaitServer(t *testing.T) (*Server, *observedCoordinationWaitFS) {
+	t.Helper()
+	fs, err := workfs.NewManaged(nil, nopBlobs{}, newProtoEntryLog())
+	if err != nil {
+		t.Fatalf("new managed workfs: %v", err)
+	}
+	observed := &observedCoordinationWaitFS{FS: fs}
+	return NewServer(observed, observed), observed
+}
+
 // openJournaledSession establishes a session on a managed authority. The
 // negotiation is the version probe (OpProtocolVersion); a managed authority
-// speaks the v7 baseline (journaled coordination is mandatory).
+// speaks the v8 baseline (journaled coordination is mandatory).
 func openJournaledSession(t *testing.T, s *Server, id string, gen uint64, owner, token string, slots uint32) *connSession {
 	t.Helper()
 	cs := &connSession{}
@@ -338,6 +362,109 @@ func TestManagedSetlkwBlocksVolatilelyThenGrants(t *testing.T) {
 	}
 }
 
+// TestManagedSetlkwDuplicateSkipsVolatileWait models a response lost after
+// the lock decision was durably recorded. Replaying the identical SETLKW
+// identity must classify the slot and return its stored outcome before
+// consulting current lock contention. Both outcomes are important: a stored
+// EAGAIN remains prompt while its original holder is live, and a stored grant
+// remains prompt even if later durable operations replaced it with a foreign
+// conflicting hold.
+func TestManagedSetlkwDuplicateSkipsVolatileWait(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantStatus int32
+		prepare    func(t *testing.T, s *Server, fs *observedCoordinationWaitFS, holder, contender *connSession, ino uint64)
+		after      func(t *testing.T, s *Server, holder, contender *connSession)
+	}{
+		{
+			name:       "recorded EAGAIN under extant holder",
+			wantStatus: EAGAIN,
+			prepare: func(t *testing.T, s *Server, _ *observedCoordinationWaitFS, holder, _ *connSession, _ uint64) {
+				t.Helper()
+				if r := exactDo(s, holder, &Request{
+					Op: OpLock, Path: "w", LkMode: LkSetlk,
+					LkID: 1, LkStart: 0, LkEnd: kernelOffsetEOF, LkWrite: true,
+				}, 1, 1); r == nil || r.Status != OK {
+					t.Fatalf("holder lock: %+v", r)
+				}
+			},
+		},
+		{
+			name:       "recorded OK before later extant holder",
+			wantStatus: OK,
+			after: func(t *testing.T, s *Server, holder, contender *connSession) {
+				t.Helper()
+				if r := exactDo(s, contender, &Request{
+					Op: OpLock, Path: "w", LkMode: LkSetlk,
+					LkID: 2, LkStart: 0, LkEnd: kernelOffsetEOF, LkUnlock: true,
+				}, 1, 1); r == nil || r.Status != OK {
+					t.Fatalf("contender unlock after recorded grant: %+v", r)
+				}
+				if r := exactDo(s, holder, &Request{
+					Op: OpLock, Path: "w", LkMode: LkSetlk,
+					LkID: 1, LkStart: 0, LkEnd: kernelOffsetEOF, LkWrite: true,
+				}, 1, 1); r == nil || r.Status != OK {
+					t.Fatalf("later holder lock: %+v", r)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, fs := newObservedCoordinationWaitServer(t)
+			holder := openJournaledSession(t, s, "pfs-dup-holder", 1, "MH", "tokH", 8)
+			contender := openJournaledSession(t, s, "pfs-dup-contender", 1, "MC", "tokC", 8)
+			if r := exactDo(s, holder, &Request{Op: OpCreate, Path: "w", Mode: 0o644}, 0, 1); r == nil || r.Status != OK {
+				t.Fatalf("create: %+v", r)
+			}
+
+			ino := s.resolveLockIno(&Request{Path: "w"})
+			if ino == 0 {
+				t.Fatal("resolve lock inode returned zero")
+			}
+			if tt.prepare != nil {
+				tt.prepare(t, s, fs, holder, contender, ino)
+			}
+
+			env := &wal.Envelope{
+				SessionID: contender.id, Generation: contender.gen,
+				Slot: 0, SlotSeq: 1,
+			}
+			reqHash, err := workfs.LockChangeRequestHash(
+				env, ino, 2, pfc2.LockSetWrite, 0, 0,
+			)
+			if err != nil {
+				t.Fatalf("lock request hash: %v", err)
+			}
+			// Execute the one durable decision and deliberately discard its
+			// response to model a transport loss after commit.
+			recorded := s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
+				return fs.ManagedLockDecide(full, ino, 2, pfc2.LockSetWrite, 0, 0)
+			})
+			if recorded == nil || recorded.Status != tt.wantStatus || recorded.Duplicate {
+				t.Fatalf("recorded outcome: %+v, want fresh status %d", recorded, tt.wantStatus)
+			}
+			if tt.after != nil {
+				tt.after(t, s, holder, contender)
+			}
+
+			fs.waitCalls = 0
+			replay := s.dispatchConn(contender, &Request{
+				Op: OpLock, Path: "w", LkMode: LkSetlkw,
+				LkID: 2, LkStart: 0, LkEnd: kernelOffsetEOF, LkWrite: true,
+				Env: env,
+			})
+			if replay == nil || replay.Status != tt.wantStatus || !replay.Duplicate {
+				t.Fatalf("lost-reply replay: %+v, want duplicate status %d", replay, tt.wantStatus)
+			}
+			if fs.waitCalls != 0 {
+				t.Fatalf("duplicate replay entered volatile SETLKW wait %d time(s)", fs.waitCalls)
+			}
+		})
+	}
+}
+
 func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	log := newProtoEntryLog()
 	s, _ := newManagedServer(t, log)
@@ -423,6 +550,65 @@ func TestManagedCheckoutFlushProtocol(t *testing.T) {
 	}
 	if r := s.dispatchConn(a, late); r == nil || r.Status != ESTALE {
 		t.Fatalf("stale flush: %+v", r)
+	}
+}
+
+func TestManagedRebindConflictAuditSurvivesColdReplay(t *testing.T) {
+	log := newProtoEntryLog()
+	s, _ := newManagedServer(t, log)
+	holder := openJournaledSession(t, s, "pfs-wb-holder", 1, "holder", "tok-holder", 8)
+	if r := exactDo(s, holder, &Request{Op: OpMkdir, Path: "ws", Mode: 0o755}, 0, 1); r == nil || r.Status != OK {
+		t.Fatalf("mkdir: %+v", r)
+	}
+	grant := exactDo(s, holder, &Request{
+		Op: OpDelegationAcquire, Path: "ws", SessionID: "wb-cold-audit",
+	}, 0, 2)
+	if grant == nil || grant.Status != OK {
+		t.Fatalf("delegation acquire: %+v", grant)
+	}
+	records := []wal.Record{{Seq: 1, Op: wal.OpCreate, Path: "ws/file", Mode: 0o644}}
+	zero := wbZeroDigest()
+	end := wbTestDigest(t, zero, records)
+	if r := s.dispatchConn(holder, &Request{
+		Op:           OpFlushBatch,
+		SessionID:    "wb-cold-audit",
+		WBPrevDigest: zero[:],
+		WBEndDigest:  end[:],
+		Records:      records,
+		WBScopes:     []WBScope{{Path: "ws", Epoch: grant.CheckoutEpoch, Through: 1}},
+	}); r == nil || r.Status != OK {
+		t.Fatalf("flush: %+v", r)
+	}
+
+	recovery := openJournaledSession(t, s, "pfs-wb-recovery", 1, "recovery", "tok-recovery", 8)
+	req := &Request{
+		Op:           OpWritebackRebind,
+		SessionID:    "wb-cold-audit",
+		WBScopes:     []WBScope{{Path: "ws", Epoch: grant.CheckoutEpoch}},
+		WBThrough:    0,
+		WBPrevDigest: zero[:],
+	}
+	first := exactDo(s, recovery, req, 0, 1)
+	if first == nil || first.Status != EIO || len(first.WBConflicts) == 0 ||
+		first.WBConflicts[0].Kind != "DIGEST_MISMATCH" {
+		t.Fatalf("fresh rejected Rebind: %+v", first)
+	}
+
+	// A replacement authority has only the frozen exact EIO outcome. Its
+	// duplicate path must reconstruct typed proof from the applied replay
+	// state, not invent SCOPE_MISSING.
+	s2, _ := newManagedServer(t, log)
+	recovery2 := &connSession{}
+	if r := s2.dispatchConn(recovery2, &Request{
+		Op: OpSessionResume, SessionID: "pfs-wb-recovery", SessionGen: 1,
+		SessionToken: "tok-recovery",
+	}); r == nil || r.Status != OK {
+		t.Fatalf("resume after cold replay: %+v", r)
+	}
+	replay := exactDo(s2, recovery2, req, 0, 1)
+	if replay == nil || replay.Status != EIO || !replay.Duplicate ||
+		len(replay.WBConflicts) == 0 || replay.WBConflicts[0].Kind != "DIGEST_MISMATCH" {
+		t.Fatalf("cold duplicate Rebind: %+v", replay)
 	}
 }
 

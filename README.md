@@ -184,7 +184,7 @@ for containers; the Kubernetes CSI driver shown in the transport row is planned 
 not yet packaged in this repository.
 
 - `vcs/`: the Go data plane. One VCS authority owns the live working tree for an
-  active volume, serves mounts over the custom protocol — fsproto v7 — (the
+  active volume, serves mounts over the custom protocol — fsproto v8 — (the
   `portablefs` CLI mounts via FUSE on Linux and the `portablefsd` daemon behind
   the macOS FSKit extension), and journals every mutation durably to the fenced
   Postgres journal before acking ([docs/journal.md](./docs/journal.md)).

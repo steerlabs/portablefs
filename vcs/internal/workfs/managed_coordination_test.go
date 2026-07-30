@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -609,6 +610,90 @@ func grantDelegation(t *testing.T, fs *FS, ref pfc2.SessionRef, slot uint32, seq
 	return d.Epoch
 }
 
+func TestManagedPrepareDelegationPinsIsAtomicAndIdempotent(t *testing.T) {
+	log := newFakeEntryLog()
+	fs, err := NewManaged(nil, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := openManagedSession(t, fs, "pfs-prepare", 1)
+	mutate := func(slot uint32, seq uint64, record wal.Record) uint64 {
+		t.Helper()
+		hash := make([]byte, 32)
+		hash[0], hash[1], hash[2] = byte(slot), byte(seq), byte(record.Op)
+		record.Env = coordEnv(ref, slot, seq, hash)
+		res, err := fs.MutateEnv(record, "")
+		if err != nil {
+			t.Fatalf("mutate %s: %v", record.Path, err)
+		}
+		return res.Ino
+	}
+	mutate(0, 1, wal.Record{Op: wal.OpMkdir, Path: "ws", Mode: 0o755})
+	inoA := mutate(0, 2, wal.Record{Op: wal.OpCreate, Path: "ws/a", Mode: 0o644})
+	inoB := mutate(0, 3, wal.Record{Op: wal.OpCreate, Path: "ws/b", Mode: 0o644})
+	epoch := grantDelegation(t, fs, ref, 1, 1, "ws", "wb-prepare")
+
+	before := len(log.rows)
+	inos, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, []string{"ws/a", "ws/a"})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if len(inos) != 2 || inos[0] != inoA || inos[1] != inoA {
+		t.Fatalf("aligned prepare inodes = %v, want [%d %d]", inos, inoA, inoA)
+	}
+	if !fs.managed.applied.HasPin(ref, inoA) {
+		t.Fatal("prepare did not durably pin resolved inode")
+	}
+	if _, held, err := fs.ManagedCheckoutAt("ws"); err != nil || !held {
+		t.Fatalf("prepare released the delegation: held=%v err=%v", held, err)
+	}
+	if got := len(log.rows); got != before+1 {
+		t.Fatalf("fresh prepare rows = %d, want %d", got, before+1)
+	}
+
+	again, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, []string{"ws/a", "ws/a"})
+	if err != nil {
+		t.Fatalf("idempotent prepare: %v", err)
+	}
+	if len(again) != 2 || again[0] != inoA || again[1] != inoA {
+		t.Fatalf("idempotent aligned inodes = %v", again)
+	}
+	if got := len(log.rows); got != before+1 {
+		t.Fatalf("idempotent prepare appended a row: got %d want %d", got, before+1)
+	}
+
+	if _, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, []string{"ws/b", "ws/missing"}); !errors.Is(err, ErrPinTargetGone) {
+		t.Fatalf("partial-miss prepare error = %v, want ErrPinTargetGone", err)
+	}
+	if fs.managed.applied.HasPin(ref, inoB) {
+		t.Fatal("partial-miss prepare pinned an earlier path")
+	}
+	if got := len(log.rows); got != before+1 {
+		t.Fatalf("partial-miss prepare appended a row: got %d want %d", got, before+1)
+	}
+
+	maxBatch := make([]string, maxDelegationPreparePaths)
+	for i := range maxBatch {
+		maxBatch[i] = "ws/a"
+	}
+	if got, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, maxBatch); err != nil || len(got) != len(maxBatch) {
+		t.Fatalf("max-size prepare: len=%d err=%v", len(got), err)
+	}
+	if _, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, append(maxBatch, "ws/a")); err == nil {
+		t.Fatal("prepare accepted more than the PFJ3 row bound")
+	}
+	if _, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, []string{"ws/../ws/a"}); err == nil {
+		t.Fatal("prepare normalized a non-canonical path")
+	}
+	if _, err := fs.ManagedPrepareDelegationPins(ref, "ws", epoch, []string{"ws/" + strings.Repeat("x", pfc2.MaxNameBytes+1)}); err == nil {
+		t.Fatal("prepare accepted an overlong path component")
+	}
+	other := openManagedSession(t, fs, "pfs-prepare-other", 1)
+	if _, err := fs.ManagedPrepareDelegationPins(other, "ws", epoch, []string{"ws/a"}); !errors.Is(err, ErrDelegationPrepareNotHeld) {
+		t.Fatalf("wrong-session prepare error = %v, want ErrDelegationPrepareNotHeld", err)
+	}
+}
+
 func TestManagedFlushGroupCrashKeepsRowAtomicity(t *testing.T) {
 	log := newFakeEntryLog()
 	fs, err := NewManaged(nil, nil, log)
@@ -699,6 +784,12 @@ func TestManagedWritebackRecoveryLifecycle(t *testing.T) {
 	conflicts, err = fs.ManagedWritebackRebind(cenv, ch, "wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, 1, prev)
 	if err != nil || len(conflicts) == 0 {
 		t.Fatalf("conflicting rebind: conflicts=%v err=%v", conflicts, err)
+	}
+	audited, err := fs.ManagedWritebackConflicts(
+		"wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, 1, prev,
+	)
+	if err != nil || len(audited) == 0 || audited[0].Kind != "DIGEST_MISMATCH" {
+		t.Fatalf("applied-state conflict audit: conflicts=%v err=%v", audited, err)
 	}
 }
 

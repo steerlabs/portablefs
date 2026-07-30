@@ -15,7 +15,7 @@ package fsproto
 // The durable session/slot machinery lives in workfs (journaled PFC2
 // coordination rows); this file is the protocol-side admission and execution
 // logic on top of it. Envelope-less mutations are always refused: sessions
-// are mandatory in the v7 baseline.
+// are mandatory in the v8 baseline.
 
 import (
 	"crypto/sha256"
@@ -35,7 +35,7 @@ import (
 )
 
 // SessionStore is the authority FS's durable mount-session + exact-once slot
-// surface (workfs.FS). A v7 server requires one, and it must be MANAGED:
+// surface (workfs.FS). A v8 server requires one, and it must be MANAGED:
 // coordination state journals through the fenced entry log and recovers by
 // exact cold replay — no reclaim grace, no wall-time pruning.
 type SessionStore interface {
@@ -56,8 +56,9 @@ type SessionStore interface {
 	CheckSlot(env *wal.Envelope) (workfs.SlotCheckResult, workfs.SlotOutcome)
 	RecordStaticOutcome(env *wal.Envelope, status int32) error
 	MutateEnv(r wal.Record, owner string) (workfs.MutationResult, error)
+	MutateEnvGated(r wal.Record, owner string, paths ...string) (workfs.MutationResult, error)
 	// Managed reports whether this store journals through a fenced journal
-	// generation. Construction asserts it: a v7 server never serves a
+	// generation. Construction asserts it: a v8 server never serves a
 	// non-managed session store.
 	Managed() bool
 }
@@ -99,7 +100,7 @@ func newExactState(store SessionStore) *exactState {
 		// says which session owns every lock, checkout, pin, and outcome.
 		// The legacy in-memory coordination shadow (reclaim grace, wall-time
 		// pruning) no longer exists, so a non-managed store cannot be served.
-		panic("fsproto: a v7 server requires a MANAGED (journaled) session store")
+		panic("fsproto: a v8 server requires a MANAGED (journaled) session store")
 	}
 	return &exactState{
 		store:       store,
@@ -560,8 +561,23 @@ func (s *Server) exactMutate(cs *connSession, req *Request) *Response {
 		// later change meaning.
 		return s.rejectLocked(record.Env, EOPNOTSUPP)
 	}
+	if req.Path != "" || req.NewPath != "" {
+		// A write-through mutation overlapping ANY delegation — foreign OR
+		// the caller's own — waits for recall only after the connection's
+		// envelope has authenticated and duplicate/slot-gap classification has
+		// proved this is a fresh identity. A bounded gate rejection is recorded
+		// under the canonical mutation hash before replying, exactly like every
+		// other definite outcome; replay therefore returns the stored EAGAIN
+		// and the next slot sequence remains contiguous. MutateEnvGated repeats
+		// the overlap decision against the RESERVED projection in the same
+		// journal reservation as the tree-or-EAGAIN row; this volatile wait is
+		// recall delivery and latency optimization, not the correctness gate.
+		if st := s.delegationGate(cs, false, req.Path, req.NewPath); st != OK {
+			return s.rejectLocked(record.Env, st)
+		}
+	}
 
-	result, err := s.exact.store.MutateEnv(record, cs.owner)
+	result, err := s.exact.store.MutateEnvGated(record, cs.owner, req.Path, req.NewPath)
 	if err == nil {
 		// A definite outcome (applied, or a deterministic apply rejection
 		// like ENOENT/EEXIST), durably recorded under this identity. Reply

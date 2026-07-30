@@ -90,6 +90,8 @@ export const childMetricAllowlist: Readonly<Record<string, ChildMetricSpec>> = {
   vcs_fsproto_op_session_resume: { aggregator: "counter" },
   vcs_fsproto_op_session_attach: { aggregator: "counter" },
   vcs_fsproto_op_session_expire: { aggregator: "counter" },
+  vcs_fsproto_op_invalidation_ack: { aggregator: "counter" },
+  vcs_fsproto_op_delegation_prepare_release: { aggregator: "counter" },
   vcs_fsproto_op_other: { aggregator: "counter" },
   vcs_mutations: { aggregator: "counter" },
   vcs_wal_replay_skips: { aggregator: "counter" },

@@ -54,7 +54,7 @@ over TCP. That shape fixes what is cheap and what is expensive:
   last-close unmarks are deferred into batches. Version-gated caching removes
   repeat round-trips (warm walks, repeat ENOENT probes) without a time-based
   staleness window; the negative cache now defaults ON whenever the authority
-  stamps `ParentVersion` (baseline in v7; the stamp that makes it invalidation-coherent).
+  stamps `ParentVersion` (baseline in v8; the stamp that makes it invalidation-coherent).
 - Xattrs on files born inside a delegation share the file's local WAL lane,
   avoiding the per-file drain/release cycle macOS provenance attributes would
   otherwise impose. Existing objects without a complete xattr view use one

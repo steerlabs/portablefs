@@ -77,9 +77,13 @@ func validFrameType(t frameType) bool {
 	}
 }
 
-// delegationFrame records a grant installation (or, as a frameRelease, its
-// clean post-drain release). Control frames are stream-local: they never
-// cross a process boundary, so JSON under the frame CRC is sufficient.
+// delegationFrame records a grant installation (or, as a frameRelease, the
+// durable local decision that a fully drained grant no longer authorizes new
+// mutations). frameRelease is synced before the authority Checkin: recovery
+// can therefore sweep a still-held grant or accept an already-committed
+// Checkin without guessing from a lost reply. Control frames are stream-local:
+// they never cross a process boundary, so JSON under the frame CRC is
+// sufficient.
 type delegationFrame struct {
 	Scope string `json:"scope"`
 	Epoch string `json:"epoch"`
@@ -402,6 +406,62 @@ func (w *streamWAL) appendControl(typ frameType, v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.appendControlLocked(typ, payload)
+}
+
+// recordDrainedRelease writes the authority-confirmed applied prefix and the
+// locally-final grant release as one WAL transaction: both frames are
+// appended while holding the WAL mutex and become durable in the same sync.
+// Recovery can therefore use the APPLIED certificate when Checkin committed
+// but its reply was lost and the authority has already retired the stream
+// ledger. No mutation may be admitted under scope after this operation.
+func (w *streamWAL) recordDrainedRelease(scope, epoch string, through uint64, digest [32]byte) error {
+	if scope == "" || epoch == "" {
+		return errors.New("writeback: invalid drained release")
+	}
+	appliedPayload, err := json.Marshal(appliedFrame{
+		Through: through,
+		Digest:  fmt.Sprintf("%x", digest),
+	})
+	if err != nil {
+		return err
+	}
+	releasePayload, err := json.Marshal(delegationFrame{Scope: scope, Epoch: epoch})
+	if err != nil {
+		return err
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return errors.New("writeback: wal closed")
+	}
+	if w.syncErr != nil {
+		return w.syncErr
+	}
+	if through > w.lastSeq {
+		return fmt.Errorf("writeback: drained release watermark %d is past WAL tail %d", through, w.lastSeq)
+	}
+	if through == w.lastSeq && digest != w.digest {
+		return errors.New("writeback: drained release digest does not match WAL tail")
+	}
+	// Rotate at most once before constructing the pair. Writing both encoded
+	// frames in one WriteAt means a partial write truncates both, and neither
+	// frame can independently trigger a rotation or sync.
+	if err := w.rotateIfNeededLocked(); err != nil {
+		return err
+	}
+	seg := &w.segments[len(w.segments)-1]
+	firstFrame := w.nextFrame + 1
+	buf := encodeFrame(nil, frameApplied, firstFrame, 0, appliedPayload)
+	buf = encodeFrame(buf, frameRelease, firstFrame+1, 0, releasePayload)
+	if err := w.writeActiveLocked(buf, seg.size); err != nil {
+		return err
+	}
+	seg.size += int64(len(buf))
+	seg.lastFrame = firstFrame + 1
+	w.nextFrame = firstFrame + 1
+	w.applyDelegationControlLocked(frameRelease, releasePayload)
+	return w.syncLocked()
 }
 
 func (w *streamWAL) appendControlLocked(typ frameType, payload []byte) error {

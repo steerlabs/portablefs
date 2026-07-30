@@ -2,6 +2,7 @@ package clientcore
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 	"time"
 
@@ -85,6 +86,13 @@ type openRegEntry struct {
 	pending chan struct{} // non-nil while a mark or unmark RPC covering this ino is in flight
 	queued  bool          // sitting in unmarkQueue awaiting a batched unmark
 	lru     *list.Element // non-nil while retained (refs==0, registered, not queued)
+
+	// retirePrepared records a delegation-prepare pin that must be unmarked
+	// after the transition currently owning pending completes. A prepare and an
+	// in-flight unmark can arrive in either authority order; one ordered second
+	// unmark is therefore required when no live ref remains.
+	retirePrepared    bool
+	retirePreparedGen uint64
 }
 
 // openRegistry serializes every per-inode registration transition (mark,
@@ -258,7 +266,11 @@ func (r *openRegistry) Open(path string, ino uint64) Status {
 		switch {
 		case err != nil:
 			r.debug("MarkOpen %d: %v", ino, err)
-			r.restoreAfterFailedOpenLocked(e, requestPath, previousPath)
+			if e.retirePrepared {
+				r.queueDeferredPreparedRetirementLocked(e)
+			} else {
+				r.restoreAfterFailedOpenLocked(e, requestPath, previousPath)
+			}
 			r.mu.Unlock()
 			return fsproto.EIO
 		case st == fsproto.OK:
@@ -266,15 +278,104 @@ func (r *openRegistry) Open(path string, ino uint64) Status {
 			e.registered = true
 			e.gen = gen
 			e.confirmedAt = time.Now()
+			e.retirePrepared = false
+			e.retirePreparedGen = 0
 			r.openSet.Add(ino)
 			r.mu.Unlock()
 			return fsproto.OK
 		default:
-			r.restoreAfterFailedOpenLocked(e, requestPath, previousPath)
+			if e.retirePrepared {
+				r.queueDeferredPreparedRetirementLocked(e)
+			} else {
+				r.restoreAfterFailedOpenLocked(e, requestPath, previousPath)
+			}
 			r.mu.Unlock()
 			return st
 		}
 	}
+}
+
+// AdoptPreparedRefs installs refs for handles whose inode was pinned by the
+// authority's delegation-prepare transaction. No RPC is issued here: the
+// prepare reply is the durable confirmation, and the tracker serializes this
+// local adoption against closes.
+func (r *openRegistry) AdoptPreparedRefs(path string, ino uint64, refs int, gen uint64) error {
+	if ino == 0 || refs <= 0 || gen == 0 {
+		return fmt.Errorf("clientcore: invalid prepared pin adoption ino=%d refs=%d gen=%d", ino, refs, gen)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.entries[ino]
+	if e == nil {
+		e = &openRegEntry{ino: ino}
+		r.entries[ino] = e
+	}
+	if e.pending != nil {
+		return fmt.Errorf("clientcore: prepared pin for inode %d conflicts with an in-flight registry transition", ino)
+	}
+	if e.queued {
+		r.unqueueLocked(e)
+	}
+	r.detachRetainedLocked(e)
+	e.refs += refs
+	e.path = path
+	e.registered = true
+	e.gen = gen
+	e.confirmedAt = time.Now()
+	e.noRetain = false
+	r.openSet.Add(ino)
+	return nil
+}
+
+// RetirePreparedPin releases a prepare-time authority pin whose snapshot
+// owner closed before the reply arrived. A pin already represented by other
+// live registry refs is retained; otherwise it enters the ordinary exact
+// batched-unmark lane.
+func (r *openRegistry) RetirePreparedPin(ino uint64, gen uint64) {
+	if ino == 0 {
+		return
+	}
+	r.mu.Lock()
+	e := r.entries[ino]
+	if e == nil {
+		e = &openRegEntry{ino: ino}
+		r.entries[ino] = e
+	}
+	if e.refs > 0 {
+		r.mu.Unlock()
+		return
+	}
+	if e.pending != nil {
+		e.retirePrepared = true
+		e.retirePreparedGen = gen
+		e.noRetain = true
+		r.mu.Unlock()
+		return
+	}
+	if e.queued {
+		r.mu.Unlock()
+		return
+	}
+	e.retirePreparedGen = gen
+	r.queueDeferredPreparedRetirementLocked(e)
+	r.mu.Unlock()
+}
+
+// queueDeferredPreparedRetirementLocked turns a known prepare-time authority
+// pin into one ordered unmark. It is called only after any prior transition on
+// this inode has completed, so the unmark is guaranteed to order after the
+// prepare regardless of which RPC originally reached the authority first.
+func (r *openRegistry) queueDeferredPreparedRetirementLocked(e *openRegEntry) {
+	gen := e.retirePreparedGen
+	e.retirePrepared = false
+	e.retirePreparedGen = 0
+	e.registered = true
+	e.gen = gen
+	e.confirmedAt = time.Now()
+	e.noRetain = true
+	r.openSet.Add(e.ino)
+	r.queueUnmarkLocked(e)
+	r.kickFlushLocked()
 }
 
 func (r *openRegistry) restoreAfterFailedOpenLocked(e *openRegEntry, requestPath, previousPath string) {
@@ -532,8 +633,13 @@ func (r *openRegistry) finishUnmarksLocked(inos []uint64, ch chan struct{}) {
 		e.queued = false
 		e.registered = false
 		e.gen = 0
-		if e.refs == 0 {
+		if e.refs == 0 && e.retirePrepared {
+			r.queueDeferredPreparedRetirementLocked(e)
+		} else if e.refs == 0 {
 			delete(r.entries, ino)
+		} else {
+			e.retirePrepared = false
+			e.retirePreparedGen = 0
 		}
 	}
 	close(ch)

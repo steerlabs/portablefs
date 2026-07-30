@@ -21,14 +21,16 @@ package fsproto
 // state a successor already took over.
 //
 // Sessions are mandatory: the client requires the authority to negotiate
-// exactly ProtocolVersion (v7) and refuses anything else with a clear
-// version-mismatch error. There is no legacy downgrade.
+// exactly ProtocolVersion (v8) and refuses anything else. PFRQ2 peers return
+// a typed version mismatch; older request-wire peers fail closed at framing.
+// There is no legacy downgrade.
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -213,8 +215,24 @@ func (c *Client) isClosed() bool {
 	}
 }
 
+func (c *Client) takeConn() (*conn, error) {
+	if c.isClosed() {
+		return nil, net.ErrClosed
+	}
+	select {
+	case <-c.closed:
+		return nil, net.ErrClosed
+	case cn := <-c.conns:
+		if c.isClosed() {
+			c.conns <- cn
+			return nil, net.ErrClosed
+		}
+		return cn, nil
+	}
+}
+
 // EnsureExactSession establishes the mount session, negotiating the protocol
-// version first: the authority must speak exactly ProtocolVersion (v7).
+// version first: the authority must speak exactly ProtocolVersion (v8).
 // Returns (true, nil) when the session is live and an error otherwise —
 // including ErrProtocolVersionMismatch against an older authority. There is
 // no legacy downgrade.
@@ -341,7 +359,10 @@ func (c *Client) renewLoop(es *exactSession) {
 // construction, so retry re-sends the identical request once after a
 // transport error.
 func (c *Client) doRaw(req *Request, retry bool) (*Response, error) {
-	cn := <-c.conns
+	cn, err := c.takeConn()
+	if err != nil {
+		return nil, err
+	}
 	defer func() { c.conns <- cn }()
 	resp, err := cn.roundtrip(req)
 	if err != nil && retry {
@@ -355,34 +376,99 @@ func (c *Client) doRaw(req *Request, retry bool) (*Response, error) {
 // ReclaimDone/SessionExpire prove identity by the ATTACHED connection, so a
 // bare roundtrip on a fresh conn would be silently ignored server-side.
 func (c *Client) doAttached(req *Request, retry bool) (*Response, error) {
-	cn := <-c.conns
-	defer func() { c.conns <- cn }()
-	if err := c.prepareConn(cn); err != nil {
-		return nil, err
-	}
-	resp, err := cn.roundtrip(req)
-	if err != nil && retry {
-		if err = c.prepareConn(cn); err == nil {
-			resp, err = cn.roundtrip(req)
-		}
+	resp, sent, err := c.roundtripAttached(req)
+	if err != nil && retry && sent {
+		resp, _, err = c.roundtripAttached(req)
 	}
 	return resp, err
+}
+
+// roundtripAttached performs one session-attached request attempt. sent is
+// false only when the request itself provably never reached a transport
+// (taking/dialing/attaching failed first). Once cn.roundtrip is entered an
+// error is conservatively ambiguous: request bytes may have reached the
+// authority even if encoding or reading the reply failed.
+func (c *Client) roundtripAttached(req *Request) (resp *Response, sent bool, err error) {
+	return c.roundtripAttachedWithGate(req, false)
+}
+
+func (c *Client) roundtripAttachedWithGate(req *Request, resolved bool) (resp *Response, sent bool, err error) {
+	cn, err := c.takeConn()
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { c.conns <- cn }()
+	if err := c.prepareConnWithGate(cn, resolved); err != nil {
+		return nil, false, err
+	}
+	return cn.roundtripSentWithGate(req, resolved)
+}
+
+// doAttachedResolved runs an idempotent, session-scoped operation whose
+// successful execution has durable side effects but no exact slot recording
+// its response. A pre-send failure is definite and returns immediately. Once
+// any attempt may have reached the authority, the identical request is replayed
+// until its reply is known, the session is fenced, or the client closes.
+//
+// This is intentionally the envelope-less counterpart of
+// doCoordinateResolved. Callers must retain any local serialization barrier
+// that makes the operation idempotent for this method's whole lifetime.
+func (c *Client) doAttachedResolved(req *Request) (*Response, error) {
+	es := c.exactState()
+	if es == nil || es.isFenced() {
+		return &Response{Status: ESTALE}, nil
+	}
+	sent := false
+	backoff := parkRetryMin
+	var lastErr error
+	for {
+		resp, wasSent, err := c.roundtripAttachedWithGate(req, true)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		sent = sent || wasSent
+		if !sent {
+			// The operation never crossed the attached transport, so it has no
+			// durable side effect to discover.
+			if es.isFenced() {
+				return &Response{Status: ESTALE}, nil
+			}
+			return nil, err
+		}
+		select {
+		case <-es.stop:
+			// Terminalization releases the generation's pins, making the
+			// unresolved prepare harmless and its session outcome definite.
+			return &Response{Status: ESTALE}, nil
+		case <-c.closed:
+			return nil, lastErr
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > parkRetryMax {
+			backoff = parkRetryMax
+		}
+	}
 }
 
 // prepareConn dials (if needed) and attaches the client's exact session onto
 // the transport, so subsequent mutations on it pass the server's envelope==
 // connection-session check. A definite ESTALE on attach fences the session.
 func (c *Client) prepareConn(cn *conn) error {
-	if err := cn.ensure(); err != nil {
+	return c.prepareConnWithGate(cn, false)
+}
+
+func (c *Client) prepareConnWithGate(cn *conn, resolved bool) error {
+	if err := cn.ensureWithGate(resolved); err != nil {
 		return err
 	}
 	es := c.exactState()
 	if es == nil || es.isFenced() || cn.attached == es.id {
 		return nil
 	}
-	resp, err := cn.roundtrip(&Request{
+	resp, _, err := cn.roundtripSentWithGate(&Request{
 		Op: OpSessionAttach, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
-	})
+	}, resolved)
 	if err != nil {
 		return err
 	}
@@ -564,16 +650,23 @@ func (c *Client) parkExact(es *exactSession, slot uint32, seq uint64, req *Reque
 // connection. wasSent reports whether any request bytes may have reached the
 // authority (false only when dialing or the pre-send attach itself failed).
 func (c *Client) roundtripExact(req *Request) (resp *Response, wasSent bool, err error) {
-	cn := <-c.conns
-	defer func() { c.conns <- cn }()
-	if err := c.prepareConn(cn); err != nil {
+	return c.roundtripExactWithGate(req, false)
+}
+
+func (c *Client) roundtripExactResolved(req *Request) (resp *Response, wasSent bool, err error) {
+	return c.roundtripExactWithGate(req, true)
+}
+
+func (c *Client) roundtripExactWithGate(req *Request, resolved bool) (resp *Response, wasSent bool, err error) {
+	cn, err := c.takeConn()
+	if err != nil {
 		return nil, false, err
 	}
-	resp, err = cn.roundtrip(req)
-	if err != nil {
-		return nil, true, err
+	defer func() { c.conns <- cn }()
+	if err := c.prepareConnWithGate(cn, resolved); err != nil {
+		return nil, false, err
 	}
-	return resp, true, nil
+	return cn.roundtripSentWithGate(req, resolved)
 }
 
 // exactOp reports whether op is a write-through tree mutation that must carry

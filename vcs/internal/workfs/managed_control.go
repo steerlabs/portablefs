@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pfc2"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
@@ -366,6 +367,45 @@ func (fs *FS) managedMutateEnv(r wal.Record, owner string) (MutationResult, erro
 	}
 	if len(out.tree) != 1 {
 		return MutationResult{}, fmt.Errorf("workfs: managed mutation produced %d leaf outcomes", len(out.tree))
+	}
+	return out.tree[0].res, out.tree[0].err
+}
+
+// managedMutateEnvGated makes delegation admission part of the tree row's
+// reservation decision. The protocol may wait/publish recalls optimistically,
+// but this final check observes the reservation-order reducer under fs.mu:
+//
+//   - if the mutation reserves first, a later grant is ordered after its
+//     apply and therefore snapshots it;
+//   - if the grant reserves first, this identity journals a control-only
+//     EAGAIN and no tree mutation can land beneath that grant.
+//
+// The rejection uses the mutation envelope's canonical request hash, so a
+// lost reply replays the same exact outcome.
+func (fs *FS) managedMutateEnvGated(r wal.Record, owner string, paths ...string) (MutationResult, error) {
+	key, err := managedExactKey(r.Env)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	rejected := false
+	pre := func() ([]pfc2.Record, bool, error) {
+		if !fs.reservedDelegationBlocks(nil, paths...) {
+			return nil, false, nil
+		}
+		rejected = true
+		return decideRejection(key, errnos.EAGAIN), true, nil
+	}
+	out, err := fs.commitEntryDynamicTreePre(&r, func() ([]pfc2.Record, error) {
+		return nil, nil
+	}, owner, pre)
+	if err != nil {
+		return MutationResult{}, mapManagedControlError(err)
+	}
+	if rejected {
+		return MutationResult{Status: errnos.EAGAIN}, nil
+	}
+	if len(out.tree) != 1 {
+		return MutationResult{}, fmt.Errorf("workfs: managed gated mutation produced %d leaf outcomes", len(out.tree))
 	}
 	return out.tree[0].res, out.tree[0].err
 }

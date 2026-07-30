@@ -114,7 +114,7 @@ runtime code should not bypass VCS for live filesystem writes.
 
 ## Exact-Once Mount Sessions
 
-Every mount instance negotiates an exact-once session with the authority (protocol version 7;
+Every mount instance negotiates an exact-once session with the authority (protocol version 8;
 exact sessions are baseline, not a capability). The client mints a random session identity and an
 opaque token once per mount, establishes the session durably, and stamps every write-through
 mutation with an identity: `(session, generation, slot, slot sequence)`. The authority computes a
@@ -156,6 +156,16 @@ retention. Open pins are durable journaled rows: the fused create ensures its pi
 reply leaves the server (a lost-reply replay of the create re-ensures the same pin, never a
 second one), and one batched unmark journals all of its releases as one exact row, replayed —
 not re-applied — on an identical resend.
+
+A delegation handoff freezes only new opens and namespace rebindings in the
+released subtree; closes and unrelated subtrees remain live. Before Checkin,
+the authority resolves every barrier-stable open path under the still-held
+grant and durably installs any missing session pins. The client adopts the
+aligned inode identities with the exact live-handle counts, records its
+drained watermark plus local release in one WAL sync, and keeps the barrier
+through the replay-exact Checkin. Thus a peer unlink after handoff either sees
+an open pin and parks the inode or sees no live handle—never an unprotected
+open created in the release gap.
 
 ## Commit Rule
 
@@ -208,10 +218,10 @@ non-empty/missing path) publishes no invalidation at all.
 
 ## Extended Attributes (xattrs)
 
-Extended attributes are native **LIVE volume state** in the fsproto v7 baseline. They exist
+Extended attributes are native **LIVE volume state** in the fsproto v8 baseline. They exist
 so macOS FSKit mounts stop generating AppleDouble `._` sidecar files: the FSKit extension
 forwards xattr operations over pfslocal and portablefsd answers them natively. Authorities
-that do not speak the v7 baseline are rejected at mount-time protocol negotiation; a mount
+that do not speak the v8 baseline are rejected at mount-time protocol negotiation; a mount
 never silently drops xattr operations or changes their semantics.
 
 Semantics (Linux `setxattr`/`removexattr` as the reference):
@@ -241,8 +251,8 @@ read-through, and their mutations conservatively use the authority lane unless t
 can prove the complete xattr map. That proof boundary preserves conditional flags and the
 128 KiB per-inode limit before any local acknowledgement. Remote xattr mutations publish an
 in-place (attr-level) invalidation, keeping version-gated attribute caches honest. Delegated
-xattr batches are an optional v7 optimization advertised by `FeatureDelegatedXattrs`; a
-client connected to a v7 authority without that feature selects the shared xattr lane from
+xattr batches are an optional v8 optimization advertised by `FeatureDelegatedXattrs`; a
+client connected to a v8 authority without that feature selects the shared xattr lane from
 the initial probe, never after a failed operation.
 
 Durability across compaction — the load-bearing part:

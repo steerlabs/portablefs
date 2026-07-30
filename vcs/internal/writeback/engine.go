@@ -96,12 +96,12 @@ type Config struct {
 	// Busy reports open handles under a path (defers voluntary release).
 	Busy func(scope string) bool
 
-	// EnsureOpenPins establishes authority-durable open pins for every open
-	// handle under scope BEFORE the delegation releases, preserving
-	// open-after-unlink across the release boundary (a peer unlink then
-	// parks the inode instead of destroying it). nil skips (tests without
-	// open tracking).
-	EnsureOpenPins func(ctx context.Context, scope string) error
+	// ProtectOpenPins establishes authority-durable open pins for every open
+	// handle under scope and returns a release barrier. The engine retains
+	// that barrier through the authority's durable delegation release, so a
+	// new locally-born open or path rebind cannot enter the handoff gap.
+	// nil skips (tests without open tracking).
+	ProtectOpenPins func(ctx context.Context, scope, epoch string) (end func(released bool), err error)
 
 	// BudgetBytes bounds the stream WAL on disk (0 = 512 MiB).
 	BudgetBytes int64
@@ -126,15 +126,37 @@ type delegation struct {
 	grantedAt  time.Time
 	lastActive time.Time
 	draining   bool
-	// done is closed whenever the current drain+release attempt reaches a
+	// localFinal is set only after the WAL has durably recorded the
+	// authority-applied prefix followed by RELEASE. Once true, delegated
+	// admission is irreversible even if Checkin has not returned.
+	localFinal bool
+	// attempt closes whenever the current drain+release operation reaches a
 	// definite outcome. A failed attempt leaves drainErr set and the
 	// delegation held: admissions wake, re-evaluate, and fail instead of
 	// escaping into write-through while the authority still owns the grant.
-	done     chan struct{}
+	attempt  *releaseAttempt
 	drainErr error
-	// relMu serializes the drain+release so exactly one caller executes it
-	// (recall, idle release, and release-before-write-through can race).
-	relMu sync.Mutex
+}
+
+// releaseAttempt is one immutable single-flight outcome. Followers retain
+// this exact object so a later retry cannot replace the result they joined.
+type releaseAttempt struct {
+	done chan struct{}
+	once sync.Once
+	err  error
+}
+
+func newReleaseAttempt() *releaseAttempt {
+	return &releaseAttempt{done: make(chan struct{})}
+}
+
+func (a *releaseAttempt) complete(err error) error {
+	a.once.Do(func() {
+		a.err = err
+		close(a.done)
+	})
+	<-a.done
+	return a.err
 }
 
 type engineFailure struct {
@@ -195,14 +217,31 @@ type Engine struct {
 	recovery *recoveryRunner
 	idleStop chan struct{}
 	idleOnce sync.Once
+	idleWG   sync.WaitGroup
+
+	// Every delegation release is an engine-owned resolver. Callers only
+	// wait on its immutable attempt outcome with their own contexts. The
+	// lifecycle joins these workers before closing or abandoning the WAL,
+	// so no late resolver can write through a closed stream.
+	releaseWG sync.WaitGroup
+	forcing   bool
 }
 
-func (e *Engine) stopIdle() {
+// signalIdleStop prevents the idle loop from starting more voluntary release
+// work. Joining is deliberately separate: a release already in progress may
+// be waiting on the engine context or flusher, both of which forced teardown
+// must cancel before it waits for the loop.
+func (e *Engine) signalIdleStop() {
 	e.idleOnce.Do(func() {
 		if e.idleStop != nil {
 			close(e.idleStop)
 		}
 	})
+}
+
+func (e *Engine) stopIdle() {
+	e.signalIdleStop()
+	e.idleWG.Wait()
 }
 
 func (e *Engine) logf(format string, args ...any) {
@@ -271,7 +310,11 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 	e.fl.start()
 	e.idleStop = make(chan struct{})
-	go e.idleLoop()
+	e.idleWG.Add(1)
+	go func() {
+		defer e.idleWG.Done()
+		e.idleLoop()
+	}()
 	return e, nil
 }
 
@@ -536,9 +579,9 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 			// workload never monopolizes a common ancestor shared with peer
 			// writers. The next loop acquires the now-authoritative child
 			// directory directly.
-			e.prepareReleaseLocked(d)
+			attempt := e.prepareReleaseLocked(d)
 			e.mu.Unlock()
-			if err := e.finishRelease(ctx, d); err != nil {
+			if err := waitReleaseAttempt(ctx, attempt); err != nil {
 				return admission{}, false, err
 			}
 			continue
@@ -548,15 +591,10 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 				e.mu.Unlock()
 				return admission{}, false, err
 			}
-			done := d.done
+			attempt := d.attempt
 			e.mu.Unlock()
-			if done == nil {
-				return admission{}, false, fmt.Errorf("%w: delegation %q is draining without a release attempt", ErrConflict, d.scope)
-			}
-			select {
-			case <-done:
-			case <-ctx.Done():
-				return admission{}, false, ctx.Err()
+			if err := waitReleaseAttempt(ctx, attempt); err != nil {
+				return admission{}, false, err
 			}
 			// A release signal means only that the attempt reached a
 			// definite outcome. Re-evaluate ownership before choosing local
@@ -967,7 +1005,7 @@ func (e *Engine) removeLocalLocked(path string) {
 // Rename acknowledges a rename locally when both ends are covered by the
 // SAME delegation and the source is locally known. Everything else releases
 // the covering delegations and runs write-through.
-func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, error) {
+func (e *Engine) Rename(ctx context.Context, oldp, newp string, onCommit func()) (Result, bool, error) {
 	adm, ok, err := e.admit(ctx, oldp)
 	if !ok {
 		return Result{}, false, err
@@ -1054,6 +1092,13 @@ func (e *Engine) Rename(ctx context.Context, oldp, newp string) (Result, bool, e
 	}
 	if srcXattrs != nil {
 		e.xattrs[newp] = srcXattrs
+	}
+	// Publish frontend open-handle namespace bookkeeping before releasing
+	// e.mu. A concurrent recall must not drain/apply this WAL rename and
+	// snapshot the old handle path in the gap between engine return and the
+	// caller's tracker update.
+	if onCommit != nil {
+		onCommit()
 	}
 	return Result{Entry: *stored}, true, nil
 }
@@ -1590,12 +1635,15 @@ func (e *Engine) thawAfterFailedClose() {
 func (e *Engine) ForceClose(reason string) (string, error) {
 	e.mu.Lock()
 	e.frozen = true
+	e.forcing = true
 	w := e.wal
 	job := e.job
 	e.mu.Unlock()
-	e.stopIdle()
+	e.signalIdleStop()
 	e.cancelCtx()
 	e.fl.stop()
+	e.idleWG.Wait()
+	e.releaseWG.Wait()
 	if w == nil {
 		e.mu.Lock()
 		e.closed = true
@@ -1648,11 +1696,14 @@ func (e *Engine) Abandon() {
 	e.mu.Lock()
 	e.frozen = true
 	e.closed = true
+	e.forcing = true
 	w := e.wal
 	e.mu.Unlock()
-	e.stopIdle()
+	e.signalIdleStop()
 	e.cancelCtx()
 	e.fl.stop()
+	e.idleWG.Wait()
+	e.releaseWG.Wait()
 	if w != nil {
 		w.Abandon()
 	}

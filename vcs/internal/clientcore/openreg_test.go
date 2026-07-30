@@ -2,15 +2,146 @@ package clientcore
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
-
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
+
+type blockingUnmarkRegistrar struct {
+	calls        chan []uint64
+	releaseFirst chan struct{}
+	first        sync.Once
+}
+
+type failingPendingMarkRegistrar struct {
+	markEntered chan struct{}
+	releaseMark chan struct{}
+	unmarks     chan []uint64
+}
+
+func (r *failingPendingMarkRegistrar) MarkOpenGen(uint64) (int32, uint64, error) {
+	close(r.markEntered)
+	<-r.releaseMark
+	return fsproto.EIO, 0, errors.New("injected mark failure")
+}
+
+func (r *failingPendingMarkRegistrar) UnmarkOpen(uint64) (int32, error) {
+	return fsproto.OK, nil
+}
+
+func (r *failingPendingMarkRegistrar) UnmarkOpenBatch(inos []uint64) (int32, error) {
+	r.unmarks <- append([]uint64(nil), inos...)
+	return fsproto.OK, nil
+}
+
+func (r *blockingUnmarkRegistrar) MarkOpenGen(uint64) (int32, uint64, error) {
+	return fsproto.OK, 1, nil
+}
+
+func (r *blockingUnmarkRegistrar) UnmarkOpen(uint64) (int32, error) {
+	return fsproto.OK, nil
+}
+
+func (r *blockingUnmarkRegistrar) UnmarkOpenBatch(inos []uint64) (int32, error) {
+	isFirst := false
+	r.first.Do(func() { isFirst = true })
+	call := append([]uint64(nil), inos...)
+	r.calls <- call
+	if isFirst {
+		<-r.releaseFirst
+	}
+	return fsproto.OK, nil
+}
+
+func TestRetirePreparedPinOrdersAfterPendingUnmark(t *testing.T) {
+	reg := &blockingUnmarkRegistrar{
+		calls:        make(chan []uint64, 4),
+		releaseFirst: make(chan struct{}),
+	}
+	openSet := NewInodeSet()
+	r := newOpenRegistry(reg, func() uint64 { return 7 }, openSet, 1, nil)
+	if err := r.AdoptPreparedRefs("d/file", 42, 1, 7); err != nil {
+		t.Fatalf("seed registered pin: %v", err)
+	}
+	r.Close("d/file", 42, true)
+
+	select {
+	case first := <-reg.calls:
+		if len(first) != 1 || first[0] != 42 {
+			t.Fatalf("first unmark batch = %v", first)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first unmark did not enter registrar")
+	}
+
+	// Model a delegation prepare that committed while the first unmark was in
+	// flight. Cleanup must issue a second, ordered unmark; merely observing the
+	// pending transition cannot represent this newer authority pin.
+	r.RetirePreparedPin(42, 7)
+	close(reg.releaseFirst)
+
+	select {
+	case second := <-reg.calls:
+		if len(second) != 1 || second[0] != 42 {
+			t.Fatalf("second unmark batch = %v", second)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prepared-pin retirement was lost behind pending unmark")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		r.mu.Lock()
+		_, present := r.entries[42]
+		r.mu.Unlock()
+		if !present {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("registry entry survived ordered prepared-pin retirement")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRetirePreparedPinSurvivesPendingMarkFailure(t *testing.T) {
+	reg := &failingPendingMarkRegistrar{
+		markEntered: make(chan struct{}),
+		releaseMark: make(chan struct{}),
+		unmarks:     make(chan []uint64, 1),
+	}
+	r := newOpenRegistry(reg, func() uint64 { return 7 }, NewInodeSet(), 1, nil)
+	openOut := make(chan Status, 1)
+	go func() { openOut <- r.Open("d/file", 42) }()
+	select {
+	case <-reg.markEntered:
+	case <-time.After(time.Second):
+		t.Fatal("mark did not enter registrar")
+	}
+
+	// The authority prepare succeeded while MarkOpen was unresolved. Even
+	// though the mark then fails, its local finisher must retain the prepare
+	// cleanup obligation and issue an ordered unmark.
+	r.RetirePreparedPin(42, 7)
+	close(reg.releaseMark)
+	if st := <-openOut; st != fsproto.EIO {
+		t.Fatalf("failed mark status = %d, want EIO", st)
+	}
+	select {
+	case batch := <-reg.unmarks:
+		if len(batch) != 1 || batch[0] != 42 {
+			t.Fatalf("prepared cleanup batch = %v", batch)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prepared cleanup was lost after pending mark failure")
+	}
+}
 
 // serveWorkfs is serveCore returning the backing workfs.FS too, for tests
 // that assert authority-side open/orphan state directly.
@@ -41,7 +172,7 @@ func createOpened(t *testing.T, v *Volume, path string) (*NodeState, uint64) {
 		t.Fatalf("create %s: authority assigned no inode", path)
 	}
 	n := NewNodeState(a.Ino, true)
-	if st := v.RegisterOpened(path, n); st != fsproto.OK {
+	if st := v.RegisterOpened(context.Background(), path, n); st != fsproto.OK {
 		t.Fatalf("register-open %s: %d", path, st)
 	}
 	return n, a.Ino

@@ -10,7 +10,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
-// PFRQ1 is the allocation-safe client-to-authority request wire format.
+// PFRQ2 is the allocation-safe client-to-authority request wire format.
 //
 // Each request is a uint32 big-endian body length followed by this fixed
 // schema. The outer length is rejected before reading or allocating the body;
@@ -20,7 +20,7 @@ import (
 var requestWireMagic = [4]byte{'P', 'F', 'R', 'Q'}
 
 const (
-	requestWireVersion = 1
+	requestWireVersion = 2
 
 	// The largest legitimate request is one MaxWriteBytes write plus bounded
 	// metadata. Keep the existing 64 MiB write allowance while bounding the
@@ -165,6 +165,26 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 	if err := addUint64s("open inode list", req.OpenInos); err != nil {
 		return preparedRequest{}, err
 	}
+	if len(req.OpenPaths) > MaxPrepareOpenPaths {
+		return preparedRequest{}, fmt.Errorf(
+			"%w: open path list has %d items (max %d)",
+			errMalformedRequest, len(req.OpenPaths), MaxPrepareOpenPaths,
+		)
+	}
+	if err := add(4); err != nil {
+		return preparedRequest{}, err
+	}
+	for _, openPath := range req.OpenPaths {
+		if len(openPath) > MaxPathBytes {
+			return preparedRequest{}, fmt.Errorf(
+				"%w: open path is %d bytes (max %d)",
+				errMalformedRequest, len(openPath), MaxPathBytes,
+			)
+		}
+		if err := add(4 + uint64(len(openPath))); err != nil {
+			return preparedRequest{}, err
+		}
+	}
 	if len(req.Records) > MaxBatchRecords {
 		return preparedRequest{}, fmt.Errorf("%w: record list has %d items (max %d)", errMalformedRequest, len(req.Records), MaxBatchRecords)
 	}
@@ -288,6 +308,13 @@ func (e *requestEncoder) Encode(req *Request) error {
 	if err != nil {
 		return err
 	}
+	return e.encodePrepared(req, prepared)
+}
+
+// encodePrepared writes a request that has already passed prepareRequest.
+// Keeping preflight separate from transport writes lets exact clients prove
+// that a local shape/bounds rejection consumed no wire identity.
+func (e *requestEncoder) encodePrepared(req *Request, prepared preparedRequest) error {
 	w := requestWireWriter{w: e.w}
 	w.u32(prepared.bodyBytes)
 	if w.err == nil {
@@ -346,6 +373,10 @@ func (e *requestEncoder) Encode(req *Request) error {
 	w.u32(uint32(len(req.OpenInos)))
 	for _, ino := range req.OpenInos {
 		w.u64(ino)
+	}
+	w.u32(uint32(len(req.OpenPaths)))
+	for _, openPath := range req.OpenPaths {
+		w.text(openPath)
 	}
 	w.u32(uint32(len(prepared.records)))
 	for _, payload := range prepared.records {
@@ -421,6 +452,10 @@ func (r *requestWireReader) bytes(name string, max uint32) []byte {
 
 func (r *requestWireReader) text(name string) string {
 	return string(r.bytes(name, maxRequestTextBytes))
+}
+
+func (r *requestWireReader) textMax(name string, max uint32) string {
+	return string(r.bytes(name, max))
 }
 
 func (r *requestWireReader) count(name string, max uint32, minItemBytes int64) uint32 {
@@ -532,6 +567,13 @@ func (d *requestDecoder) Decode(dst *Request) error {
 		req.OpenInos = make([]uint64, int(openCount))
 		for i := range req.OpenInos {
 			req.OpenInos[i] = r.u64()
+		}
+	}
+	openPathCount := r.count("open path list", MaxPrepareOpenPaths, 4)
+	if r.err == nil && openPathCount != 0 {
+		req.OpenPaths = make([]string, int(openPathCount))
+		for i := range req.OpenPaths {
+			req.OpenPaths[i] = r.textMax("open path", MaxPathBytes)
 		}
 	}
 	recordCount := r.count("record list", MaxBatchRecords, 4)

@@ -13,6 +13,7 @@ package fsproto
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -89,7 +90,7 @@ func (c *Client) doCoordinateResolved(req *Request) (*Response, error) {
 	sent := false
 	backoff := parkRetryMin
 	for {
-		resp, wasSent, rerr := c.roundtripExact(req)
+		resp, wasSent, rerr := c.roundtripExactResolved(req)
 		if rerr == nil {
 			c.finishExact(es, slot, seq, resp)
 			return resp, nil
@@ -180,13 +181,61 @@ func (c *Client) CheckinManaged(path, epoch string) error {
 	return nil
 }
 
+// PrepareDelegationRelease durably pins an ordered batch of open paths while
+// the exact delegation remains held. The returned inode vector is aligned
+// with paths. Once sent, a lost reply is replayed until its exact mapping is
+// known or the session terminates: neither peers nor this mount can change the
+// bindings while the grant and the caller's handoff barrier remain held.
+func (c *Client) PrepareDelegationRelease(path, epoch string, paths []string) ([]uint64, uint64, error) {
+	if path == "" || epoch == "" || len(paths) == 0 || len(paths) > MaxPrepareOpenPaths {
+		return nil, 0, fmt.Errorf("fsproto: invalid delegation prepare shape")
+	}
+	if live, err := c.EnsureExactSession(); err != nil {
+		return nil, 0, err
+	} else if !live {
+		return nil, 0, ErrSessionFenced
+	}
+	resp, err := c.doAttachedResolved(&Request{
+		Op:            OpDelegationPrepareRelease,
+		Path:          path,
+		CheckoutEpoch: epoch,
+		OpenPaths:     append([]string(nil), paths...),
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if resp.Status != OK {
+		return nil, resp.Gen, statusError("delegation prepare release", resp.Status)
+	}
+	if len(resp.OpenInos) != len(paths) {
+		return nil, resp.Gen, fmt.Errorf(
+			"fsproto: delegation prepare returned %d inodes for %d paths",
+			len(resp.OpenInos), len(paths),
+		)
+	}
+	return append([]uint64(nil), resp.OpenInos...), resp.Gen, nil
+}
+
 // FlushWriteback ships one dense global run of the mount write-back stream.
 // scopes maps every record to the exact live grant authorizing it. Exactness
 // rides the stream's durable watermark + digest (a lost reply resends
 // identical bytes and the authority drops the covered prefix), so no slot
 // identity is consumed.
 func (c *Client) FlushWriteback(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
-	resp, err := c.doAttached(&Request{
+	return c.flushWriteback(writebackID, scopes, prevDigest, endDigest, records, false)
+}
+
+// FlushWritebackResolved is the recovery-only form of FlushWriteback. Once
+// any attempt may have reached the authority, it replays the identical
+// digest-addressed batch until a definite reply, session fence, or client
+// teardown. Recovery callers retain their exclusive local store lock for this
+// entire call, so a possibly-sent flush never becomes a detached writer.
+func (c *Client) FlushWritebackResolved(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
+	return c.flushWriteback(writebackID, scopes, prevDigest, endDigest, records, true)
+}
+
+func (c *Client) flushWriteback(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record, resolved bool) (uint64, int32, error) {
+	req := &Request{
 		Op:           OpFlushBatch,
 		SessionID:    writebackID,
 		Owner:        c.owner,
@@ -194,9 +243,21 @@ func (c *Client) FlushWriteback(writebackID string, scopes []WBScope, prevDigest
 		WBEndDigest:  endDigest[:],
 		Records:      records,
 		WBScopes:     scopes,
-	}, false)
+	}
+	var (
+		resp *Response
+		err  error
+	)
+	if resolved {
+		resp, err = c.doAttachedResolved(req)
+	} else {
+		resp, err = c.doAttached(req, false)
+	}
 	if err != nil {
 		return 0, EIO, err
+	}
+	if resolved && resp.Status == ESTALE {
+		return 0, EIO, ErrSessionFenced
 	}
 	return resp.AppliedThrough, resp.Status, nil
 }
@@ -261,7 +322,7 @@ func (c *Client) WritebackState(writebackID string) (exists bool, through uint64
 // session after the authority verified the stream identity and digest.
 // Typed conflicts are returned without error; nothing partial commits.
 func (c *Client) WritebackRebind(writebackID string, scopes []WBScope, through uint64, digest [32]byte) ([]WBConflict, error) {
-	resp, err := c.doCoordinate(&Request{
+	resp, err := c.doCoordinateResolved(&Request{
 		Op: OpWritebackRebind, SessionID: writebackID, Owner: c.owner,
 		WBScopes: scopes, WBThrough: through, WBPrevDigest: digest[:],
 	})
@@ -271,21 +332,21 @@ func (c *Client) WritebackRebind(writebackID string, scopes []WBScope, through u
 	if resp.Status == OK {
 		return nil, nil
 	}
-	if len(resp.WBConflicts) > 0 || resp.Status == EIO {
-		if len(resp.WBConflicts) == 0 {
-			// A duplicate replay of a conflicted rebind: the details are
-			// re-derivable, the verdict is not OK.
-			resp.WBConflicts = []WBConflict{{Kind: "SCOPE_MISSING"}}
-		}
+	if len(resp.WBConflicts) > 0 {
 		return resp.WBConflicts, nil
+	}
+	if resp.Status == EIO {
+		return nil, fmt.Errorf("fsproto: writeback rebind rejection omitted its durable typed conflicts")
 	}
 	return nil, statusError("writeback rebind", resp.Status)
 }
 
 // WritebackDiscard releases a parked stream's recovery scopes as an audited
-// data-loss decision.
+// data-loss decision. Its exact outcome is resolved before return: recovery
+// keeps the store lock held until the discard commits, is definitely refused,
+// or the client session is terminalized.
 func (c *Client) WritebackDiscard(writebackID string, scopes []WBScope) error {
-	resp, err := c.doCoordinate(&Request{
+	resp, err := c.doCoordinateResolved(&Request{
 		Op: OpWritebackDiscard, SessionID: writebackID, Owner: c.owner, WBScopes: scopes,
 	})
 	if err != nil {
@@ -336,7 +397,7 @@ func (c *Client) unmarkOpenBatchManaged(req *Request) (int32, error) {
 	sent := false
 	backoff := parkRetryMin
 	for {
-		resp, wasSent, rerr := c.roundtripExact(req)
+		resp, wasSent, rerr := c.roundtripExactResolved(req)
 		if rerr == nil {
 			c.finishExact(es, slot, seq, resp)
 			return resp.Status, nil
