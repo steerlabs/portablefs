@@ -9,12 +9,16 @@ import (
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 )
 
 func TestPinnedFUSEHelperExecutionIgnoresHostilePATH(t *testing.T) {
 	trusted := "/bin/true"
 	if _, err := os.Stat(trusted); err != nil {
 		t.Skipf("trusted system executable unavailable: %v", err)
+	}
+	if err := mounthost.ValidateFUSEHelper(trusted); err != nil {
+		t.Skipf("host has no root-managed executable ancestry for the pinning test: %v", err)
 	}
 	hostileDir := t.TempDir()
 	marker := filepath.Join(hostileDir, "executed")
