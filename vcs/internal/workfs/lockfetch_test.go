@@ -79,9 +79,10 @@ func TestConcurrentReadersAndWriters(t *testing.T) {
 }
 
 // gatedBlobs holds every backend Blob fetch at a shared barrier. Reaching the
-// barrier with all writers proves directly that base reads run in parallel
-// outside fs.mu; a fetch performed under that lock would prevent the remaining
-// writers from ever entering Blob.
+// barrier with all writers proves directly that distinct writes do not
+// serialize their base reads under fs.mu's exclusive lock; a fetch performed
+// while holding that lock would prevent the remaining writers from entering
+// Blob.
 type gatedBlobs struct {
 	data       map[string][]byte
 	want       int
@@ -123,9 +124,10 @@ func (b *gatedBlobs) Blob(ctx context.Context, d string) ([]byte, error) {
 
 // TestConcurrentPartialWritesDoNotSerializeOnBackendFetch: N writers each do a
 // read-modify-write (partial overwrite) of a DISTINCT backed file whose base must be
-// fetched from a gated backend. With the base fetch warmed outside fs.mu, every fetch
-// reaches the barrier concurrently. If the fetch ran under fs.mu, only one writer
-// could reach the barrier and the test would fail before releasing it.
+// fetched from a gated backend. With the base fetch warmed before the exclusive
+// apply section, every fetch reaches the barrier concurrently. If the fetch ran
+// under fs.mu's exclusive lock, only one writer could reach the barrier and the
+// test would fail before releasing it.
 func TestConcurrentPartialWritesDoNotSerializeOnBackendFetch(t *testing.T) {
 	const N = 20
 	blobs := newGatedBlobs(N)
@@ -172,6 +174,12 @@ func TestConcurrentPartialWritesDoNotSerializeOnBackendFetch(t *testing.T) {
 		t.Fatalf("backend fetches did not overlap: %d of %d reached the barrier", started, N)
 	}
 	wg.Wait()
+	blobs.mu.Lock()
+	fetches := blobs.fetches
+	blobs.mu.Unlock()
+	if fetches != N {
+		t.Fatalf("backend fetches = %d, want exactly %d warm fetches and no locked refetch", fetches, N)
+	}
 	t.Logf("lock-off-fetch: all %d concurrent read-modify-writes reached the backend barrier", N)
 
 	// Correctness: each file reflects the overwrite over its preserved base.
