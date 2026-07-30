@@ -1553,43 +1553,135 @@ func TestExternalNamespaceWriterTakesProxyBeforeConcreteLock(t *testing.T) {
 	unlock()
 }
 
-func TestFrontendLifecycleWritersTakeExclusiveNamespaceProxy(t *testing.T) {
-	tests := []struct {
-		name string
-		body any
-	}{
-		{name: "close", body: &pfslocal.CloseRequest{}},
-		{name: "reclaim", body: &pfslocal.ReclaimRequest{}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			a := &attach{}
-			a.frontendSerial.RLock()
-			readerHeld := true
-			defer func() {
-				if readerHeld {
-					a.frontendSerial.RUnlock()
-				}
-			}()
-
-			acquired := make(chan func(), 1)
-			go func() { acquired <- a.lockFrontendRequest(test.body) }()
-			select {
-			case unlock := <-acquired:
-				unlock()
-				t.Fatal("namespace lifecycle writer acquired a shared frontend proxy")
-			case <-time.After(20 * time.Millisecond):
-			}
-
+func TestFrontendReclaimTakesExclusiveNamespaceProxy(t *testing.T) {
+	a := &attach{}
+	a.frontendSerial.RLock()
+	readerHeld := true
+	defer func() {
+		if readerHeld {
 			a.frontendSerial.RUnlock()
-			readerHeld = false
-			var unlock func()
-			select {
-			case unlock = <-acquired:
-			case <-time.After(time.Second):
-				t.Fatal("namespace lifecycle writer did not acquire after readers exited")
-			}
-			unlock()
-		})
+		}
+	}()
+
+	acquired := make(chan func(), 1)
+	go func() { acquired <- a.lockFrontendRequest(&pfslocal.ReclaimRequest{}) }()
+	select {
+	case unlock := <-acquired:
+		unlock()
+		t.Fatal("reclaim acquired a shared frontend proxy")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	a.frontendSerial.RUnlock()
+	readerHeld = false
+	var unlock func()
+	select {
+	case unlock = <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("reclaim did not acquire after readers exited")
+	}
+	unlock()
+}
+
+func TestCloseCrossesUnrelatedSharedNamespaceLocks(t *testing.T) {
+	a := &attach{
+		handles:            map[uint64]*handleRecord{},
+		retiredCloseErrnos: map[uint64]int32{},
+	}
+	a.frontendSerial.RLock()
+	a.nsMu.RLock()
+	locksHeld := true
+	defer func() {
+		if locksHeld {
+			a.nsMu.RUnlock()
+			a.frontendSerial.RUnlock()
+		}
+	}()
+
+	done := make(chan int32, 1)
+	go func() {
+		unlock := a.lockFrontendRequest(&pfslocal.CloseRequest{Handle: 42})
+		_, eno := a.close(&pfslocal.CloseRequest{Handle: 42})
+		unlock()
+		done <- eno
+	}()
+	select {
+	case eno := <-done:
+		if eno != darwinEINVAL {
+			t.Fatalf("close errno=%d want EINVAL", eno)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close blocked behind unrelated shared namespace locks")
+	}
+
+	a.nsMu.RUnlock()
+	a.frontendSerial.RUnlock()
+	locksHeld = false
+}
+
+func TestHandleOperationsSerializeOnlyMatchingDescriptor(t *testing.T) {
+	a := &attach{
+		handles: map[uint64]*handleRecord{
+			1: {id: 1},
+			2: {id: 2},
+		},
+	}
+
+	firstFrontend := a.lockFrontendRequest(&pfslocal.ReadRequest{Handle: 1})
+	secondFrontend := a.lockFrontendRequest(&pfslocal.ReadRequest{Handle: 1})
+	secondFrontend()
+	sameFrontend := make(chan func(), 1)
+	otherFrontend := make(chan func(), 1)
+	go func() {
+		sameFrontend <- a.lockFrontendRequest(&pfslocal.CloseRequest{Handle: 1})
+	}()
+	go func() {
+		otherFrontend <- a.lockFrontendRequest(&pfslocal.CloseRequest{Handle: 2})
+	}()
+	select {
+	case unlock := <-sameFrontend:
+		unlock()
+		t.Fatal("same-handle frontend request crossed descriptor gate")
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case unlock := <-otherFrontend:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("unrelated frontend handle was globally serialized")
+	}
+	firstFrontend()
+	select {
+	case unlock := <-sameFrontend:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("same-handle frontend request did not resume")
+	}
+
+	firstConcrete := a.lockHandleOperation(1, false)
+	secondConcrete := a.lockHandleOperation(1, false)
+	secondConcrete()
+	sameConcrete := make(chan func(), 1)
+	otherConcrete := make(chan func(), 1)
+	go func() { sameConcrete <- a.lockHandleOperation(1, true) }()
+	go func() { otherConcrete <- a.lockHandleOperation(2, true) }()
+	select {
+	case unlock := <-sameConcrete:
+		unlock()
+		t.Fatal("same-handle concrete operation crossed descriptor gate")
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case unlock := <-otherConcrete:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("unrelated concrete handle was globally serialized")
+	}
+	firstConcrete()
+	select {
+	case unlock := <-sameConcrete:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("same-handle concrete operation did not resume")
 	}
 }
