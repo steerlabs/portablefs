@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,7 +45,7 @@ func serveAuthority(t *testing.T) string {
 
 func serveAuthorityServer(t *testing.T) (string, *fsproto.Server) {
 	t.Helper()
-	fs := newManagedTestFS(t, daemonTestBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
+	fs := newManagedTestFS(t, daemonTestBlobs{}, filepath.Join(privateTestDir(t), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +59,7 @@ func serveAuthorityServer(t *testing.T) (string, *fsproto.Server) {
 
 func startDaemon(t *testing.T, authority string) (Config, *http.Client, string, context.CancelFunc) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "pfsd-")
+	dir, err := os.MkdirTemp("", "pfsd-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +201,30 @@ func ensureAttachWithPolicyOptions(t *testing.T, hc *http.Client, authority, vol
 	return out.AttachRef
 }
 
+func TestControlAttachHonorsRequestedStableIdentityIdempotently(t *testing.T) {
+	authority := serveAuthority(t)
+	_, hc, _, _ := startDaemon(t, authority)
+	const attachRef = "att_RRRRRRRRRRRRRRRRRRRRRR"
+	request := map[string]any{
+		"attachRef":          attachRef,
+		"volumeId":           "vol-requested-ref",
+		"branch":             "main",
+		"authorityUrl":       authority,
+		"dataPlaneTransport": "plaintext",
+		"mountPath":          "/Volumes/RequestedRef",
+		"options":            map[string]any{"diskCacheMb": 1},
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		var out struct {
+			AttachRef string `json:"attachRef"`
+		}
+		controlJSON(t, hc, http.MethodPost, "/v1/attaches", request, http.StatusOK, &out)
+		if out.AttachRef != attachRef {
+			t.Fatalf("attempt %d attachRef = %q, want requested %q", attempt+1, out.AttachRef, attachRef)
+		}
+	}
+}
+
 func ensureAttachOnceWithPolicy(t *testing.T, hc *http.Client, authority, volumeID, branch, mountPath, writePolicy, authToken string, extraOptions map[string]any) struct {
 	AttachRef  string `json:"attachRef"`
 	VolumeName string `json:"volumeName"`
@@ -215,7 +240,8 @@ func ensureAttachOnceWithPolicy(t *testing.T, hc *http.Client, authority, volume
 	}
 	controlJSON(t, hc, http.MethodPost, "/v1/attaches", map[string]any{
 		"volumeId": volumeID, "branch": branch, "authorityUrl": authority, "authToken": authToken, "mountPath": mountPath,
-		"options": options,
+		"dataPlaneTransport": "plaintext",
+		"options":            options,
 	}, http.StatusOK, &out)
 	if out.AttachRef == "" || out.VolumeName == "" {
 		t.Fatalf("bad attach response: %+v", out)
@@ -738,7 +764,7 @@ func TestDaemonControlAndFrontendEndToEnd(t *testing.T) {
 	}
 	c.call(&pfslocal.CloseRequest{Handle: openedHard.Handle})
 
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 	_ = c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{RequestID: 999, Body: &pfslocal.StatfsRequest{}}); err == nil {
 		if env, rerr := pfslocal.ReadFrame(c.conn); rerr == nil {
@@ -792,16 +818,20 @@ func TestStopIfIdleExitsDaemonWithNoAttaches(t *testing.T) {
 }
 
 func TestStopIfIdleAllowsOnlyDormantRestartMetadata(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := privateTestDir(t)
 	r := newRegistry(stateDir)
 	req := ensureAttachRequest{
-		VolumeID:     "vol-dormant",
-		Branch:       "main",
-		AuthorityURL: "127.0.0.1:1",
-		MountPath:    "/Volumes/Dormant",
+		VolumeID:           "vol-dormant",
+		Branch:             "main",
+		AuthorityURL:       "127.0.0.1:1",
+		DataPlaneTransport: "plaintext",
+		MountPath:          "/Volumes/Dormant",
 	}
 	key := attachKey(req.VolumeID, req.Branch, req.MountPath)
-	a := newRevivedAttach("att_dormant", key, req, stateDir, 1, nil)
+	a, err := newRevivedAttach("att_DDDDDDDDDDDDDDDDDDDDDD", key, req, stateDir, 1, false, false, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	a.persist = r.persist
 	a.schedulePersist = r.schedulePersist
 	a.journal = r.journal
@@ -903,7 +933,7 @@ func TestDaemonWritebackRenameOverServesNewContentImmediately(t *testing.T) {
 		}
 		c.call(&pfslocal.CloseRequest{Handle: lock.Handle})
 	}
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 }
 
 func TestDaemonWritebackDoubleLockRenameDoesNotRecycleMovedItem(t *testing.T) {
@@ -968,7 +998,7 @@ func TestDaemonWritebackDoubleLockRenameDoesNotRecycleMovedItem(t *testing.T) {
 			t.Fatalf("iter %d lock after second rename errno=%d want ENOENT", i, er.Errno)
 		}
 	}
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 }
 
 func TestDaemonRemoveTypeMismatchDoesNotDeleteDotGit(t *testing.T) {
@@ -1028,7 +1058,7 @@ func TestDaemonRemoveTypeMismatchDoesNotDeleteDotGit(t *testing.T) {
 	if !names[".git"] || !names["._.git"] {
 		t.Fatalf("root listing after failed removes = %+v, want .git and ._.git", fsList.Entries)
 	}
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 }
 
 func TestDaemonWritebackGitStashLikeChurnKeepsDotGit(t *testing.T) {
@@ -1100,12 +1130,12 @@ func TestDaemonWritebackGitStashLikeChurnKeepsDotGit(t *testing.T) {
 	if stat.Attr.Kind != "directory" {
 		t.Fatalf("control stat .git after churn = %+v, want directory", stat.Attr)
 	}
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 }
 
 func TestDaemonRenameWaitsForInFlightLookupBeforeReply(t *testing.T) {
 	authority := serveAuthority(t)
-	dir, err := os.MkdirTemp("/tmp", "pfsd-rename-order-")
+	dir, err := os.MkdirTemp("", "pfsd-rename-order-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1222,7 +1252,7 @@ func TestDaemonRenameWaitsForInFlightLookupBeforeReply(t *testing.T) {
 	if lr.Attr.Item != lock.Attr.Item {
 		t.Fatalf("post-rename config item=%+v want %+v", lr.Attr.Item, lock.Attr.Item)
 	}
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 }
 
 func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
@@ -1339,7 +1369,7 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 		t.Fatalf("no active flush observed after rename: before=%d after=%d", beforeFlushes, flushes.Load())
 	}
 	setup.call(&pfslocal.CloseRequest{Handle: lock.Handle})
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 }
 
 func TestDaemonPublishesInvalidationsForControlAndRemoteMutations(t *testing.T) {
@@ -1558,7 +1588,7 @@ func TestDaemonEnumerateConcurrentSameDirSnapshotsAreIsolated(t *testing.T) {
 	authority := serveAuthority(t)
 	want := seedAuthorityAppleDoubleFiles(t, authority, 1200)
 
-	dir, err := os.MkdirTemp("/tmp", "pfsd-enum-concurrent-")
+	dir, err := os.MkdirTemp("", "pfsd-enum-concurrent-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1648,7 +1678,7 @@ func TestDaemonEnumerateStaleCookieAfterRestartFailsSafe(t *testing.T) {
 	authority := serveAuthority(t)
 	want := seedAuthorityFiles(t, authority, 4)
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-enum-restart-")
+	stateDir, err := os.MkdirTemp("", "pfsd-enum-restart-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1761,7 +1791,7 @@ type portablefsdProcess struct {
 
 func startPortablefsdProcess(t *testing.T, bin, stateDir, name string) *portablefsdProcess {
 	t.Helper()
-	runDir, err := os.MkdirTemp("/tmp", name+"-")
+	runDir, err := os.MkdirTemp("", name+"-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1801,7 +1831,7 @@ func (p *portablefsdProcess) stop() {
 func TestDaemonRevivesAttachRefAfterRestart(t *testing.T) {
 	authority := serveAuthority(t)
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-wal-")
+	stateDir, err := os.MkdirTemp("", "pfsd-wal-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1881,7 +1911,7 @@ func TestDaemonRevivesAttachRefAfterRestart(t *testing.T) {
 func TestDaemonStableItemIdentityAfterRestart(t *testing.T) {
 	authority := serveAuthority(t)
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-identity-")
+	stateDir, err := os.MkdirTemp("", "pfsd-identity-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1958,7 +1988,7 @@ func TestDaemonStableItemIdentityAfterRestart(t *testing.T) {
 func TestDaemonWritebackHardLinkSharesOpenItemAcrossRestart(t *testing.T) {
 	authority := serveAuthority(t)
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-hardlink-identity-")
+	stateDir, err := os.MkdirTemp("", "pfsd-hardlink-identity-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2046,7 +2076,7 @@ func TestDaemonWritebackFrontendItemSurvivesImmediateCrash(t *testing.T) {
 	t.Cleanup(func() { workfs.SetSessionLeaseTTL(prevTTL) })
 	authority := serveAuthority(t)
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-item-crash-")
+	stateDir, err := os.MkdirTemp("", "pfsd-item-crash-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2114,7 +2144,7 @@ func TestDaemonWritebackWALReplayAfterCrash(t *testing.T) {
 	authority := serveAuthority(t)
 
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-wal-")
+	stateDir, err := os.MkdirTemp("", "pfsd-wal-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2182,7 +2212,7 @@ func TestDaemonWritebackWALReplayAfterCrashWithPriorSessionHistory(t *testing.T)
 	authority := serveAuthority(t)
 
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-wal-history-")
+	stateDir, err := os.MkdirTemp("", "pfsd-wal-history-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2248,7 +2278,7 @@ func TestDaemonWritebackWALReplayAfterCrashWithPriorSessionHistory(t *testing.T)
 func TestDaemonDeletePurgesAttachPersistence(t *testing.T) {
 	authority := serveAuthority(t)
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-delete-")
+	stateDir, err := os.MkdirTemp("", "pfsd-delete-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2266,7 +2296,7 @@ func TestDaemonDeletePurgesAttachPersistence(t *testing.T) {
 	if bytes.Contains(data, []byte("authToken")) || bytes.Contains(data, []byte("renewed")) {
 		t.Fatalf("registry persisted credentials: %s", data)
 	}
-	controlJSON(t, p1.hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, p1.hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 	data, err = os.ReadFile(attachRegistryPath(stateDir))
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
@@ -2285,58 +2315,36 @@ func TestDaemonDeletePurgesAttachPersistence(t *testing.T) {
 	}
 }
 
-func TestDaemonCorruptAttachRegistryTolerated(t *testing.T) {
-	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-corrupt-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(attachRegistryPath(stateDir), []byte(`{"version":1,"attaches":[`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	p1 := startPortablefsdProcess(t, bin, stateDir, "pfsd-corrupt1")
-	var empty struct {
-		Attaches []attachStatus `json:"attaches"`
-	}
-	controlJSON(t, p1.hc, http.MethodGet, "/v1/attaches", nil, http.StatusOK, &empty)
-	if len(empty.Attaches) != 0 {
-		t.Fatalf("invalid registry loaded attaches: %+v", empty)
-	}
-	p1.stop()
-
-	const goodRef = "att_goodpersistedref"
-	const badRef = "att_badpersistedref"
-	validWithBadEntries := []byte(`{
-  "version": 1,
-  "attaches": [
-    "not-an-object",
-    {"ref":"` + badRef + `","volumeId":"vol-bad","branch":"main","mountPath":"/Volumes/Bad"},
-    {"ref":"` + goodRef + `","volumeId":"vol-good","branch":"main","mountPath":"/Volumes/Good","authorityUrl":"127.0.0.1:1","options":{"writePolicy":"writethrough","fsyncPolicy":"local","diskCacheMb":1}}
-  ]
-}`)
-	if err := os.WriteFile(attachRegistryPath(stateDir), validWithBadEntries, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	p2 := startPortablefsdProcess(t, bin, stateDir, "pfsd-corrupt2")
-	var out struct {
-		Attaches []attachStatus `json:"attaches"`
-	}
-	controlJSON(t, p2.hc, http.MethodGet, "/v1/attaches", nil, http.StatusOK, &out)
-	if len(out.Attaches) != 1 || out.Attaches[0].AttachRef != goodRef || out.Attaches[0].State != "degraded" {
-		t.Fatalf("loaded attaches = %+v", out)
-	}
-	c := dialPFS(t, p2.cfg.FrontendSocket)
-	defer c.close()
-	c.call(&pfslocal.Hello{ProtocolMajor: 1})
-	if res := c.call(&pfslocal.ResolveRequest{AttachRef: goodRef}).(*pfslocal.ResolveReply); res.Root.ItemID == 0 {
-		t.Fatalf("good resolve = %+v", res)
-	}
-	if er := c.callErr(&pfslocal.ResolveRequest{AttachRef: badRef}); er.Errno != darwinENOENT {
-		t.Fatalf("bad entry resolve errno=%d want ENOENT", er.Errno)
+func TestDaemonCorruptAttachRegistryFailsClosed(t *testing.T) {
+	for name, body := range map[string]string{
+		"malformed": `{"version":2,"attaches":[`,
+		"mixed valid and invalid": `{"version":2,"attaches":[
+			{"ref":"att_AAAAAAAAAAAAAAAAAAAAAA","volumeId":"vol-good","branch":"main","mountPath":"/Volumes/Good","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1},
+			{"ref":"att_bad","volumeId":"vol-bad","branch":"main","mountPath":"/Volumes/Bad","authorityUrl":"127.0.0.1:1","dataPlaneTransport":"plaintext","options":{},"identityEpoch":1}
+		]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			stateDir := privateTestDir(t)
+			if err := os.WriteFile(attachRegistryPath(stateDir), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			socketDir := privateTestDir(t)
+			server := NewServer(Config{
+				FrontendSocket: filepath.Join(socketDir, "frontend.sock"),
+				ControlSocket:  filepath.Join(socketDir, "control.sock"),
+				StateDir:       stateDir,
+			})
+			err := server.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "strict persisted attach inventory") {
+				t.Fatalf("Run error = %v, want strict persisted attach inventory refusal", err)
+			}
+			if server.registry == nil {
+				t.Fatal("strict inventory was not initialized after singleton ownership")
+			}
+			if _, statErr := os.Lstat(filepath.Join(socketDir, "control.sock")); !os.IsNotExist(statErr) {
+				t.Fatalf("daemon published control socket despite corrupt registry: %v", statErr)
+			}
+		})
 	}
 }
 

@@ -18,6 +18,7 @@ struct PortableFSAppMain: App {
         }
         .windowResizability(.contentSize)
         .defaultPosition(.center)
+        .defaultLaunchBehavior(.suppressed)
 
         Settings {
             SettingsView(model: model)

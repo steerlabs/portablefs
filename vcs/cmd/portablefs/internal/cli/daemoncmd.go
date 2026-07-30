@@ -16,7 +16,10 @@ func cmdDaemon(e *cmdEnv, args []string) int {
 	if len(positionals) != 1 || positionals[0] != "stop" {
 		return e.usageError("daemon", fmt.Errorf("expected `stop`"))
 	}
-	cfg := fskitConfigFromEnv(e.getenv)
+	cfg, err := fskitConfigFromEnv(e.getenv)
+	if err != nil {
+		return e.fail("daemon stop", err)
+	}
 	ctl, err := connectCompatiblePortablefsd(cfg, e.version)
 	if err != nil {
 		return e.fail("daemon stop", err)

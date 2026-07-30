@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
+	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 // Profile is one saved credential set in the config file.
@@ -13,11 +17,6 @@ type Profile struct {
 	APIToken     string `json:"apiToken"`
 	ManagerUrl   string `json:"managerUrl"`
 	ManagerToken string `json:"managerToken"`
-	// DataPlaneCAPEM is the CA bundle that signs the deployment's data-plane
-	// router certificate, captured from GET <apiUrl>/router-ca.pem at login.
-	// Mounts dial the router with this trust anchor so TLS works without any
-	// local file or env setup; PORTABLEFS_TLS_CA / VCS_TLS_CA override it.
-	DataPlaneCAPEM string `json:"dataPlaneCaPem,omitempty"`
 }
 
 // Config is the on-disk shape of ~/.config/portablefs/config.json.
@@ -27,12 +26,9 @@ type Config struct {
 }
 
 func defaultConfigPath() (string, error) {
-	if base := os.Getenv("XDG_CONFIG_HOME"); base != "" {
-		return filepath.Join(base, "portablefs", "config.json"), nil
-	}
-	home, err := os.UserHomeDir()
+	home, err := accountpath.Home()
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory for config file: %w", err)
+		return "", fmt.Errorf("resolve account home for config file: %w", err)
 	}
 	return filepath.Join(home, ".config", "portablefs", "config.json"), nil
 }
@@ -40,23 +36,10 @@ func defaultConfigPath() (string, error) {
 // loadConfig reads the config file. A missing file is an empty config, not an
 // error, so first-run commands work before any login.
 func loadConfig(path string) (*Config, error) {
-	info, err := os.Lstat(path)
+	data, err := privatepath.ReadFile(path)
 	if os.IsNotExist(err) {
 		return &Config{CurrentProfile: "default", Profiles: map[string]Profile{}}, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("inspect config %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("refuse unsafe config %s: expected a regular non-symlink file", path)
-	}
-	if err := verifyConfigFilePermissions(path, info); err != nil {
-		return nil, err
-	}
-	if err := verifyConfigDirectory(filepath.Dir(path), false); err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
@@ -74,65 +57,47 @@ func loadConfig(path string) (*Config, error) {
 }
 
 // saveConfig writes the config file with 0600 permissions (it holds bearer
-// tokens). The parent directory is created on demand; an existing file's mode
-// is reset to 0600 in case it was created loose by another tool.
+// tokens). The parent directory is created on demand. Existing files with
+// unsafe type, ownership, link count, or mode are refused, never repaired.
 func saveConfig(path string, cfg *Config) error {
-	dir := filepath.Dir(path)
-	if err := verifyConfigDirectory(dir, true); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".portablefs-config-*.tmp")
-	if err != nil {
+	if err := privatepath.WriteFileAtomic(path, append(data, '\n')); err != nil {
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
-	tmpName := tmp.Name()
-	keepTemp := true
-	defer func() {
-		if keepTemp {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if err := secureTemporaryConfigFile(path, tmp); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write config %s: %w", path, err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync config %s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close config %s: %w", path, err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("write config %s: %w", path, err)
-	}
-	keepTemp = false
-	return syncConfigDirectory(dir)
+	return nil
 }
 
-func verifyConfigDirectory(dir string, create bool) error {
-	info, err := os.Lstat(dir)
-	if os.IsNotExist(err) && create {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("create config directory: %w", err)
-		}
-		info, err = os.Lstat(dir)
-	}
+// mutateConfigExclusive is the sole saved-profile mutation boundary. Network
+// authentication happens before entry; while held it excludes mount startup,
+// rejects any strict residual mount/attach inventory, reloads the latest
+// config, applies one mutation, and atomically publishes it.
+func (e *cmdEnv) mutateConfigExclusive(update func(*Config, string) error) (string, error) {
+	stateDir, err := e.mountLifecycleStateDir()
 	if err != nil {
-		return fmt.Errorf("inspect config directory: %w", err)
+		return "", err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("refuse unsafe config directory %s: expected a non-symlink directory", dir)
+	guard, err := accountsession.AcquireExclusive(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("acquire account session guard: %w; unmount PortableFS volumes before changing credentials or profiles", err)
 	}
-	return verifyConfigDirectoryPermissions(dir, info, create)
+	defer guard.Close()
+	if _, _, err := e.strictAccountInventory(); err != nil {
+		return "", err
+	}
+	cfg, path, err := e.loadConfig()
+	if err != nil {
+		return "", err
+	}
+	if err := update(cfg, path); err != nil {
+		return "", err
+	}
+	if err := saveConfig(path, cfg); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // settings is the fully resolved connection configuration for one command run.
@@ -141,9 +106,6 @@ type settings struct {
 	apiToken     string
 	managerURL   string
 	managerToken string
-	// dataPlaneCAPEM comes only from the profile (no flag/env: those already
-	// exist as PORTABLEFS_TLS_CA/VCS_TLS_CA file paths and take precedence).
-	dataPlaneCAPEM string
 }
 
 // resolveSettings applies the documented precedence: flags > environment >
@@ -163,11 +125,10 @@ func resolveSettings(cfg *Config, profileName string, getenv func(string) string
 		return fileVal
 	}
 	return settings{
-		apiURL:         pick(flags.apiURL, "PORTABLEFS_API_URL", prof.APIUrl),
-		apiToken:       pick(flags.apiToken, "PORTABLEFS_API_TOKEN", prof.APIToken),
-		managerURL:     pick(flags.managerURL, "PORTABLEFS_MANAGER_URL", prof.ManagerUrl),
-		managerToken:   pick(flags.managerToken, "PORTABLEFS_MANAGER_TOKEN", prof.ManagerToken),
-		dataPlaneCAPEM: prof.DataPlaneCAPEM,
+		apiURL:       pick(flags.apiURL, "PORTABLEFS_API_URL", prof.APIUrl),
+		apiToken:     pick(flags.apiToken, "PORTABLEFS_API_TOKEN", prof.APIToken),
+		managerURL:   pick(flags.managerURL, "PORTABLEFS_MANAGER_URL", prof.ManagerUrl),
+		managerToken: pick(flags.managerToken, "PORTABLEFS_MANAGER_TOKEN", prof.ManagerToken),
 	}
 }
 

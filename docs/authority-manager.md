@@ -60,6 +60,19 @@ Routes:
 - `POST /v1/access-leases/*` is the canonical lease API. See
   [Access Leases](#access-leases).
 
+Every successful access-lease create response binds the credential to one
+explicit `authority.dataPlaneTransport`:
+
+```json
+{ "mode": "tls-system-pki", "serverName": "portablefs-vcs.example.com" }
+```
+
+or `tls-private-ca` with `serverName`, a bounded strict `caPem`, and its
+lowercase `caSha256`, or `{ "mode": "plaintext" }`. Empty or missing CA
+material never implies plaintext. Current mount clients reject a manager that
+omits this additive field and ask the operator to upgrade it; older clients
+may ignore the new field.
+
 `teamId` is the volume's metadata tenant id. Production mode requires it on
 every authority/lease request — every authority, runtime row, and lease is
 keyed by the tenant namespace in SQL. The `portablefs` CLI resolves it from
@@ -102,7 +115,7 @@ VCS processes:
 ```text
 Daytona / remote mount
         |
-        | TLS TCP to one public router address
+        | lease-declared TLS (or explicit private-network plaintext)
         v
 authority-manager data-plane router
         |
@@ -120,7 +133,7 @@ session token as the first VCS auth frame, dials the selected loopback VCS using
 separate internal backend token, then pipes the filesystem protocol. Loopback VCS
 ports and backend tokens never leak to product workers or sandboxes.
 
-The public data-plane router terminates TLS; the VCS children listen only on
+In either TLS mode the public data-plane router terminates TLS; the VCS children listen only on
 `127.0.0.1`, so they do not need public TLS. The router's route table IS the
 access-lease service: a token resolves exactly while its lease is active on
 the admitted generation, and lease end or rotation closes live tunnels.
@@ -254,6 +267,8 @@ PORTABLEFS_MANAGED_VCS_JOURNAL_HA_POLICY_JSON='{"v":1,"expectedSystemIdentifier"
 PORTABLEFS_ACCESS_TOKEN_ROOT_SECRET=<64 hex chars>
 PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR=0.0.0.0:2050
 PORTABLEFS_AUTHORITY_ROUTER_URL=portablefs-vcs.example.com:2050
+PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=tls-system-pki
+PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME=portablefs-vcs.example.com
 PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH=/etc/portablefs/router.crt
 PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH=/etc/portablefs/router.key
 PORTABLEFS_VOLUME_API_URL=https://volume-api.example.com
@@ -262,15 +277,46 @@ PORTABLEFS_VOLUME_API_URL=https://volume-api.example.com
 Required: the control database URL (there is no file fallback — without it
 startup fails with `AUTHORITY_CONTROL_STORE_REQUIRED`), the VCS binary, the
 journal DSN, the versioned structured HA policy JSON, the access-token root
-secret, the router URL/listen address (with router TLS unless
-`PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1` is set behind an
-authenticated private tunnel), and the volume-api URL. There is deliberately
+secret, the router URL/listen address, one explicit transport mode, and the
+volume-api URL. `tls-system-pki` requires the router cert/key and exact
+`PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME`. `tls-private-ca` additionally
+requires exactly one of `PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH` or
+`PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM`; the manager validates the complete
+PEM and publishes its SHA-256 in every lease. `plaintext` requires both
+`PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=plaintext` and
+`PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1`, and refuses any
+TLS fields. There is deliberately
 NO static child volume-api credential: setting `PORTABLEFS_VOLUME_API_TOKEN`
 (or `VOLUME_API_TOKEN`) is a startup error — children authenticate with
 manager-minted runtime read credentials (below).
 
-The TLS requirement is unconditional (never keyed to `NODE_ENV`); an unset or
-nonstandard Node environment can never weaken a production authority router.
+The mode requirement is unconditional (never keyed to `NODE_ENV`); missing
+TLS fields cannot silently turn a production router into plaintext. The
+router always enforces TLS 1.3 for both TLS modes. Before publishing the
+production listener, startup parses one bounded certificate chain and exactly
+one unencrypted private key, proves leaf/key agreement, SAN-only hostname or
+IP coverage using the same wildcard rules as Go clients, current validity,
+TLS-server EKU, and an ordered signature-valid intermediate chain.
+`tls-private-ca` then completes a local TLS 1.3 client/server handshake against
+the exact advertised CA bundle, exercising OpenSSL's trust-path, constraint,
+and TLS-purpose validation. A mismatch is a startup error, never deferred to
+the first mount.
+
+`tls-system-pki` performs the same local TLS 1.3 handshake using the manager
+runtime's current default roots, so a private/self-signed or otherwise
+untrusted chain cannot be published as system PKI. This proves the manager's
+root snapshot, not that every later Go and Swift platform has refreshed to an
+identical root set. Cross-platform root-store parity and public proxy
+reachability remain deployment facts, so production readiness should still
+include a real lease-create-and-dial probe.
+
+All router addresses use one strict grammar. DNS and IPv4 are `host:port`;
+IPv6 is `[address]:port` (including the brackets). Ports are canonical decimal
+1-65535, and userinfo, paths, query strings, ambiguous numeric IPv4, and
+unbracketed IPv6 are rejected. Optional `tcp://` or `fsproto://` public-router
+input is normalized once to the canonical scheme-free dial address emitted in
+leases; clients never perform per-platform scheme fallback.
+
 Router resource admission is bounded without imposing an idle lifetime on
 healthy mounts: `PORTABLEFS_AUTHORITY_ROUTER_MAX_PENDING_CONNECTIONS` defaults
 to 256 handshakes/backend dials, `PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS`
@@ -436,7 +482,7 @@ report failures as `{ "error": { "code": "ACCESS_LEASE_...", "message": "..." } 
 
 | Route | Purpose |
 | --- | --- |
-| `/v1/access-leases/create` | Ensure the authority and mint a lease. Returns `{ authority, lease, accessToken, serverTimeMs }`; `authority` carries `authorityUrl`, `host`, `port`, `authorityInstanceId`, and `provider`, with the access token as the mount credential. |
+| `/v1/access-leases/create` | Ensure the authority and mint a lease. Returns `{ authority, lease, accessToken, serverTimeMs }`; `authority` carries `authorityUrl`, `host`, `port`, `authorityInstanceId`, `provider`, and the exact `dataPlaneTransport`, with the access token as the mount credential. |
 | `/v1/access-leases/inspect` | Authenticate the exact current token and return the lease. Read-only; changes nothing. |
 | `/v1/access-leases/renew` | Extend the lease under a `expectedControlSeq` CAS; `rotateToken: true` also rotates the token. |
 | `/v1/access-leases/release` | Consumer-initiated end. Returns `{ lease, receipt, serverTimeMs }`. |

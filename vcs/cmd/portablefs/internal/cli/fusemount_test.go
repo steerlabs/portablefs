@@ -89,7 +89,7 @@ func TestSessionTokenSourceOnlyAdvancesExplicitly(t *testing.T) {
 // Unix socket paths at 104 bytes; t.TempDir() under /var/folders exceeds it).
 func shortSocketDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "pfs")
+	dir, err := os.MkdirTemp("", "pfs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,10 +140,10 @@ func TestEnsurePortablefsdAdoptsHealthyDaemon(t *testing.T) {
 	defer server.Close()
 
 	cfg := fskitConfig{
-		fsType:       "portablefs",
-		frontendSock: filepath.Join(dir, "pfs.sock"),
-		controlSock:  controlSock,
-		daemonPath:   daemonPath,
+		fsType:            "portablefs",
+		frontendSock:      filepath.Join(dir, "pfs.sock"),
+		controlSock:       controlSock,
+		daemonPathForTest: daemonPath,
 	}
 	ctl, err := ensurePortablefsd(cfg, dir, "test-version")
 	if err != nil {
@@ -177,9 +177,9 @@ func TestEnsurePortablefsdFailsClosedOnIncompatibleHealthyDaemon(t *testing.T) {
 	defer server.Close()
 
 	cfg := fskitConfig{
-		frontendSock: filepath.Join(dir, "pfs.sock"),
-		controlSock:  controlSock,
-		daemonPath:   daemonPath,
+		frontendSock:      filepath.Join(dir, "pfs.sock"),
+		controlSock:       controlSock,
+		daemonPathForTest: daemonPath,
 	}
 	_, err = ensurePortablefsd(cfg, dir, "new-version")
 	if err == nil {
@@ -193,7 +193,7 @@ func TestEnsurePortablefsdFailsClosedOnIncompatibleHealthyDaemon(t *testing.T) {
 
 // TestFsdControlAttachRoundTrip drives the exact control-protocol bytes the
 // fskit mount path sends: ensureAttach posts the attach request and reads the
-// attachRef, setCredential and deleteAttach address the ref path, and daemon
+// attachRef, setCredential and unmountAttach address the ref path, and daemon
 // error envelopes surface as bounded messages.
 func TestFsdControlAttachRoundTrip(t *testing.T) {
 	dir := shortSocketDir(t)
@@ -206,7 +206,7 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 
 	var gotAttach fskitEnsureAttachRequest
 	var credentialToken string
-	var deleted string
+	var unmounted string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/attaches", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -233,15 +233,15 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 		credentialToken = body.AuthToken
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("/v1/attaches/att_test1", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			if deleted != "" {
+	mux.HandleFunc("/v1/attaches/att_test1/unmount", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if unmounted != "" {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusNotFound)
 				_, _ = w.Write([]byte(`{"error":"unknown attach"}`))
 				return
 			}
-			deleted = "att_test1"
+			unmounted = "att_test1"
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -275,14 +275,14 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 	if credentialToken != "tok-rotated" {
 		t.Fatalf("rotated credential did not reach the daemon: %q", credentialToken)
 	}
-	if err := ctl.deleteAttach(ref); err != nil {
-		t.Fatalf("deleteAttach: %v", err)
+	if err := ctl.unmountAttach(ref); err != nil {
+		t.Fatalf("unmountAttach: %v", err)
 	}
-	if deleted != "att_test1" {
-		t.Fatal("delete did not address the attach ref")
+	if unmounted != "att_test1" {
+		t.Fatal("unmount did not address the attach ref")
 	}
-	if err := ctl.deleteAttach(ref); err != nil {
-		t.Fatalf("repeated delete of an already-absent attach must converge: %v", err)
+	if err := ctl.unmountAttach(ref); err != nil {
+		t.Fatalf("repeated exact unmount of an already-absent attach must converge: %v", err)
 	}
 
 	// A typed daemon refusal surfaces its envelope, bounded.

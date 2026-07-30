@@ -89,5 +89,6 @@ Then mount the live filesystem:
 
 ```bash
 mkdir -p /mnt/vol
-./portablefs-bin mount vol_... /mnt/vol --addr 127.0.0.1:2050 --foreground
+./portablefs-bin mount vol_... /mnt/vol --addr 127.0.0.1:2050 \
+  --data-plane-transport plaintext --foreground
 ```

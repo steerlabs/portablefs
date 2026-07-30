@@ -28,6 +28,11 @@ import {
 import { ProductionAccessLeaseService } from "./production-access-leases.js";
 import { parseAccessTokenRootSecret } from "./access-tokens.js";
 import type { AuthorityDataPlaneRoute } from "./data-plane-router.js";
+import {
+  formatAuthorityAddress,
+  parseAuthorityAddress,
+  type AuthorityAddress,
+} from "./authority-address.js";
 
 // ---------------------------------------------------------------------------
 // ProductionAuthorityRegistry: the journal-native production registry.
@@ -247,6 +252,7 @@ export interface ProductionAuthorityRegistryEnvConfig {
 export interface ProductionAuthorityRegistryConfig {
   vcsBin: string;
   routerUrl: string;
+  routerAddress: AuthorityAddress;
   provider: string;
   volumeApiUrl: string;
   journalDsn: string;
@@ -277,12 +283,17 @@ export function readProductionAuthorityRegistryConfig(
   if (!vcsBin) {
     throw new Error("PORTABLEFS_MANAGED_VCS_BIN is required for the production authority registry.");
   }
-  const routerUrl = normalizeOptionalString(env.PORTABLEFS_AUTHORITY_ROUTER_URL);
-  if (!routerUrl) {
+  const configuredRouterUrl = env.PORTABLEFS_AUTHORITY_ROUTER_URL;
+  if (!configuredRouterUrl || configuredRouterUrl.trim() === "") {
     throw new Error(
       "PORTABLEFS_AUTHORITY_ROUTER_URL is required for the production authority registry."
     );
   }
+  const routerAddress = parseAuthorityAddress(configuredRouterUrl, {
+    label: "PORTABLEFS_AUTHORITY_ROUTER_URL",
+    allowedSchemes: ["tcp", "fsproto"],
+  });
+  const routerUrl = formatAuthorityAddress(routerAddress);
   const volumeApiUrl =
     normalizeOptionalString(env.PORTABLEFS_VOLUME_API_URL) ??
     normalizeOptionalString(env.VOLUME_API_URL);
@@ -351,6 +362,7 @@ export function readProductionAuthorityRegistryConfig(
   return {
     vcsBin,
     routerUrl,
+    routerAddress,
     provider: normalizeOptionalString(env.PORTABLEFS_AUTHORITY_PROVIDER_NAME) ?? "portablefs-managed",
     volumeApiUrl,
     journalDsn,
@@ -1955,12 +1967,11 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   }
 
   private endpointFor(authority: ProductionChild): AuthorityEndpoint {
-    const address = parsePublicRouterAddress(this.config.routerUrl);
     return {
       provider: this.config.provider,
       authorityUrl: this.config.routerUrl,
-      ...(address.host ? { host: address.host } : {}),
-      ...(address.port !== undefined ? { port: address.port } : {}),
+      host: this.config.routerAddress.host,
+      port: this.config.routerAddress.port,
       authorityInstanceId: authority.instanceId,
     };
   }
@@ -2278,16 +2289,6 @@ function requireLoopbackAddress(value: unknown, field: string): string {
     throw new Error(`The child's bootstrap frame reports an invalid ${field} port.`);
   }
   return value;
-}
-
-function parsePublicRouterAddress(routerUrl: string): { host?: string; port?: number } {
-  const stripped = routerUrl.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, "");
-  const [host, portText] = stripped.split(":");
-  const port = portText && /^[0-9]+$/u.test(portText) ? Number(portText) : undefined;
-  return {
-    ...(host ? { host } : {}),
-    ...(port && port > 0 && port <= 65535 ? { port } : {}),
-  };
 }
 
 function normalizeOptionalString(value: string | undefined): string | undefined {

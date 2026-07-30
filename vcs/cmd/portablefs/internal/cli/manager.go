@@ -39,12 +39,13 @@ func (e *cmdEnv) managerClient(baseURL, token string) *managerClient {
 // accessSession is the resolved data-plane endpoint + credential for one
 // mount, minted by POST /v1/access-leases/create — the only resolution route.
 type accessSession struct {
-	AuthorityURL        string `json:"authorityUrl"`
-	Host                string `json:"host"`
-	Port                int    `json:"port"`
-	Token               string `json:"token"`
-	ExpiresAtMs         int64  `json:"expiresAtMs"`
-	AuthorityInstanceID string `json:"authorityInstanceId"`
+	AuthorityURL        string             `json:"authorityUrl"`
+	Host                string             `json:"host"`
+	Port                int                `json:"port"`
+	Token               string             `json:"token"`
+	ExpiresAtMs         int64              `json:"expiresAtMs"`
+	AuthorityInstanceID string             `json:"authorityInstanceId"`
+	DataPlaneTransport  dataPlaneTransport `json:"dataPlaneTransport"`
 	// Lease is the renewable slice: the mount renews it at half-TTL and
 	// releases it on unmount.
 	Lease *leaseState `json:"lease,omitempty"`
@@ -152,12 +153,35 @@ func (c *managerClient) resolveAccess(ctx context.Context, volumeID, branch, tea
 	}
 	c.opMu.Unlock()
 
+	session, err := c.resolveAccessExact(ctx, opID, volumeID, branch, teamID, consumerID)
+	if err != nil {
+		if !ambiguousFailure(err) {
+			c.opMu.Lock()
+			delete(c.pendingCreateOp, key)
+			c.opMu.Unlock()
+		}
+		return nil, err
+	}
+	c.opMu.Lock()
+	delete(c.pendingCreateOp, key)
+	c.opMu.Unlock()
+	return session, nil
+}
+
+// resolveAccessExact executes one caller-owned durable create transaction.
+// The operation and consumer identities are supplied explicitly so a mount
+// intent can be persisted before the POST and replayed after a crash.
+func (c *managerClient) resolveAccessExact(ctx context.Context, opID, volumeID, branch, teamID, consumerID string) (*accessSession, error) {
+	if opID == "" || consumerID == "" {
+		return nil, fmt.Errorf("create access lease for %s@%s: missing durable operation or consumer identity", volumeID, branch)
+	}
 	var out struct {
 		Authority struct {
-			AuthorityURL        string `json:"authorityUrl"`
-			Host                string `json:"host"`
-			Port                int    `json:"port"`
-			AuthorityInstanceID string `json:"authorityInstanceId"`
+			AuthorityURL        string             `json:"authorityUrl"`
+			Host                string             `json:"host"`
+			Port                int                `json:"port"`
+			AuthorityInstanceID string             `json:"authorityInstanceId"`
+			DataPlaneTransport  dataPlaneTransport `json:"dataPlaneTransport"`
 		} `json:"authority"`
 		Lease       leaseWire `json:"lease"`
 		AccessToken string    `json:"accessToken"`
@@ -171,23 +195,18 @@ func (c *managerClient) resolveAccess(ctx context.Context, volumeID, branch, tea
 	if teamID != "" {
 		createBody["teamId"] = teamID
 	}
-	err = c.do(ctx, "POST", "/v1/access-leases/create", createBody, &out, 0)
+	err := c.do(ctx, "POST", "/v1/access-leases/create", createBody, &out, 0)
 	if err != nil {
-		if !ambiguousFailure(err) {
-			c.opMu.Lock()
-			delete(c.pendingCreateOp, key)
-			c.opMu.Unlock()
-		}
 		return nil, fmt.Errorf("create access lease for %s@%s: %w", volumeID, branch, err)
 	}
-	c.opMu.Lock()
-	delete(c.pendingCreateOp, key)
-	c.opMu.Unlock()
 	if out.Authority.AuthorityURL == "" {
 		return nil, fmt.Errorf("manager returned an access lease without an authority endpoint")
 	}
 	if out.AccessToken == "" || out.Lease.AccessLeaseID == "" {
 		return nil, fmt.Errorf("manager returned an incomplete access lease for %s@%s", volumeID, branch)
+	}
+	if err := out.Authority.DataPlaneTransport.validate(); err != nil {
+		return nil, fmt.Errorf("manager returned an invalid data-plane transport for %s@%s: %w", volumeID, branch, err)
 	}
 	return &accessSession{
 		AuthorityURL:        out.Authority.AuthorityURL,
@@ -196,6 +215,7 @@ func (c *managerClient) resolveAccess(ctx context.Context, volumeID, branch, tea
 		Token:               out.AccessToken,
 		ExpiresAtMs:         out.Lease.ExpiresAt,
 		AuthorityInstanceID: out.Authority.AuthorityInstanceID,
+		DataPlaneTransport:  out.Authority.DataPlaneTransport,
 		Lease:               out.Lease.toState(out.AccessToken),
 	}, nil
 }
@@ -359,11 +379,21 @@ func (k *leaseKeeper) release(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return k.releaseWithOperation(ctx, opID)
+}
+
+func (k *leaseKeeper) releaseWithOperation(ctx context.Context, opID string) error {
+	if opID == "" {
+		return fmt.Errorf("release access lease: missing durable operation id")
+	}
 	lease := k.snapshot()
 	delay := 100 * time.Millisecond
 	for {
-		err = k.manager.releaseAccessLease(ctx, opID, lease)
+		err := k.manager.releaseAccessLease(ctx, opID, lease)
 		if err == nil {
+			return nil
+		}
+		if leaseReleaseSatisfied(err) {
 			return nil
 		}
 		if !ambiguousFailure(err) || leaseTerminal(err) {
@@ -382,5 +412,22 @@ func (k *leaseKeeper) release(ctx context.Context) error {
 				delay = time.Second
 			}
 		}
+	}
+}
+
+func leaseReleaseSatisfied(err error) bool {
+	var he *httpError
+	if !errors.As(err, &he) {
+		return false
+	}
+	switch he.Code {
+	case "ACCESS_LEASE_NOT_FOUND",
+		"ACCESS_LEASE_EXPIRED",
+		"ACCESS_LEASE_REVOKED",
+		"ACCESS_LEASE_RELEASED",
+		"ACCESS_LEASE_EPOCH_SUPERSEDED":
+		return true
+	default:
+		return false
 	}
 }

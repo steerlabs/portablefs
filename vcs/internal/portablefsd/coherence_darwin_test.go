@@ -13,7 +13,7 @@ import (
 )
 
 func TestRefreshKernelFileRejectsSymlinkEscapesAndRenameSwap(t *testing.T) {
-	host := t.TempDir()
+	host := privateTestDir(t)
 	mount := filepath.Join(host, "mount")
 	outside := filepath.Join(host, "outside")
 	if err := os.MkdirAll(mount, 0o700); err != nil {
@@ -98,7 +98,7 @@ func TestRefreshKernelFileRejectsSymlinkEscapesAndRenameSwap(t *testing.T) {
 }
 
 func TestRefreshKernelFileTruncatesExpectedRegularFile(t *testing.T) {
-	mount := t.TempDir()
+	mount := privateTestDir(t)
 	name := filepath.Join(mount, "regular")
 	if err := os.WriteFile(name, []byte("contents"), 0o600); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestRefreshKernelFileTruncatesExpectedRegularFile(t *testing.T) {
 }
 
 func TestRefreshKernelFileResistsConcurrentSymlinkSwap(t *testing.T) {
-	host := t.TempDir()
+	host := privateTestDir(t)
 	mount := filepath.Join(host, "mount")
 	outside := filepath.Join(host, "outside")
 	if err := os.MkdirAll(mount, 0o700); err != nil {
@@ -177,7 +177,7 @@ func TestRefreshKernelFileResistsConcurrentSymlinkSwap(t *testing.T) {
 }
 
 func TestRefreshKernelFileResistsConcurrentRegularFileSwap(t *testing.T) {
-	host := t.TempDir()
+	host := privateTestDir(t)
 	mount := filepath.Join(host, "mount")
 	outsideDir := filepath.Join(host, "outside")
 	if err := os.MkdirAll(mount, 0o700); err != nil {

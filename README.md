@@ -56,8 +56,21 @@ This is the difference from everything that looks similar:
 curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh
 ```
 
-The installer verifies release checksums before installing (Linux and macOS,
-amd64 and arm64). Binaries also ship on the
+On Linux, the installer stores each verified CLI/daemon pair in an immutable,
+content-addressed directory under `~/.local/lib/portablefs/releases` and
+atomically switches the single `~/.local/bin/portablefs` activation link. It
+requires both the published SHA-256 digest and a GitHub artifact attestation
+that binds the archive to this repository's release workflow and exact version
+tag. The signed attestation bundle ships beside each architecture's archive, so
+verification does not depend on locally configured GitHub credentials. It
+never replaces a live mount or daemon and never defaults to a system-wide
+directory.
+On macOS, it also verifies the Developer ID signature and Gatekeeper
+assessment, installs the notarized app at
+`~/Applications/PortableFS.app`, and links its embedded CLI at
+`~/.local/bin/portablefs`. The app, CLI, daemon, and FSKit extension are one
+versioned macOS product; there is no second standalone macOS binary
+distribution. Artifacts also ship on the
 [GitHub releases page](https://github.com/steerlabs/portablefs/releases).
 
 ## Quickstart A: Local Stack In 2 Minutes
@@ -128,11 +141,18 @@ curl -X POST "$PORTABLEFS_MANAGER_URL/v1/access-leases/create" \
   -H "authorization: Bearer $PORTABLEFS_MANAGER_TOKEN" \
   -H "content-type: application/json" \
   -d '{"operationId":"'"$(uuidgen)"'","volumeId":"myagent","branch":"main","teamId":"local","consumerId":"sandbox-1"}'
-# -> { "authority": { "authorityUrl": "host:2050", ... }, "accessToken": "...", ... }
+# -> { "authority": { "authorityUrl": "host:2050",
+#      "dataPlaneTransport": { "mode": "plaintext" }, ... }, "accessToken": "...", ... }
 
 # inside the sandbox: copy in the static portablefs CLI, then
-portablefs mount myagent /workspace --addr <authority.authorityUrl> --mount-token <accessToken>
+portablefs mount myagent /workspace --addr <authority.authorityUrl> \
+  --mount-token <accessToken> --data-plane-transport plaintext
 ```
+
+Direct mounts must spell out the returned transport. For
+`tls-system-pki`, also pass `--data-plane-server-name`; for
+`tls-private-ca`, pass that exact name plus `--data-plane-ca <ca.pem>`.
+Manager-resolved mounts carry these fields automatically inside the lease.
 
 The sandbox now shares the live workspace with every other mount. When the sandbox is
 destroyed, the workspace — and its full history — remains.

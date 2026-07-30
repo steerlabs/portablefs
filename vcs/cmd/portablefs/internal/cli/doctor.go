@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 )
 
 // fskitExtensionBundleIDs are the FSKit file-system extensions that can
@@ -32,7 +32,7 @@ const fskitSettingsHint = "System Settings → General → Login Items & Extensi
 // FAIL; Lines carry per-item context (profiles, mounts).
 type doctorResult struct {
 	Name   string   `json:"name"`
-	Status string   `json:"status"` // PASS | FAIL | SKIP
+	Status string   `json:"status"` // PASS | FAIL | UNKNOWN | SKIP
 	Detail string   `json:"detail"`
 	Remedy string   `json:"remedy,omitempty"`
 	Lines  []string `json:"lines,omitempty"`
@@ -40,6 +40,9 @@ type doctorResult struct {
 
 func doctorPass(detail string) doctorResult { return doctorResult{Status: "PASS", Detail: detail} }
 func doctorSkip(detail string) doctorResult { return doctorResult{Status: "SKIP", Detail: detail} }
+func doctorUnknown(detail string) doctorResult {
+	return doctorResult{Status: "UNKNOWN", Detail: detail}
+}
 func doctorFail(detail, remedy string) doctorResult {
 	return doctorResult{Status: "FAIL", Detail: detail, Remedy: remedy}
 }
@@ -57,6 +60,8 @@ type doctorRun struct {
 	goos           string
 	daemonHealthy  func(controlSock string) bool
 	daemonAttaches func(controlSock string) ([]cliAttachStatus, error)
+	hostCheck      func(mounthost.Transport) mounthost.Facts
+	verifiedMount  func(mounthost.Transport) (string, bool, error)
 
 	// resolved once before the checks run
 	settings    settings
@@ -79,15 +84,23 @@ func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
 			out, err := exec.Command(name, args...).CombinedOutput()
 			return string(out), err
 		},
-		goos: runtime.GOOS,
+		goos:          runtime.GOOS,
+		hostCheck:     mounthost.Check,
+		verifiedMount: e.verifiedMount,
 		daemonHealthy: func(controlSock string) bool {
-			cfg := fskitConfigFromEnv(e.getenv)
+			cfg, err := fskitConfigFromEnv(e.getenv)
+			if err != nil {
+				return false
+			}
 			cfg.controlSock = controlSock
-			_, err := connectCompatiblePortablefsd(cfg, e.version)
+			_, err = connectCompatiblePortablefsd(cfg, e.version)
 			return err == nil
 		},
 		daemonAttaches: func(controlSock string) ([]cliAttachStatus, error) {
-			cfg := fskitConfigFromEnv(e.getenv)
+			cfg, err := fskitConfigFromEnv(e.getenv)
+			if err != nil {
+				return nil, err
+			}
 			cfg.controlSock = controlSock
 			ctl, err := connectCompatiblePortablefsd(cfg, e.version)
 			if err != nil {
@@ -114,7 +127,8 @@ func doctorChecks() []struct {
 		{"server", (*doctorRun).checkServer},
 		{"token", (*doctorRun).checkToken},
 		{"version", (*doctorRun).checkVersion},
-		{"fskit extension", (*doctorRun).checkFskitExtension},
+		{"mount transport", (*doctorRun).checkMountTransport},
+		{"fskit inventory", (*doctorRun).checkFskitExtension},
 		{"portablefsd", (*doctorRun).checkDaemon},
 		{"write-back", (*doctorRun).checkWriteBack},
 		{"mounts", (*doctorRun).checkMounts},
@@ -140,16 +154,19 @@ func (r *doctorRun) execute() int {
 	checks := doctorChecks()
 	results := make([]doctorResult, 0, len(checks))
 	failed := 0
+	unknown := 0
 	for _, c := range checks {
 		res := c.run(r)
 		res.Name = c.name
 		results = append(results, res)
 		if res.Status == "FAIL" {
 			failed++
+		} else if res.Status == "UNKNOWN" {
+			unknown++
 		}
 	}
 	if r.opts.jsonOut {
-		if rc := r.e.printJSON(map[string]any{"checks": results, "failed": failed}); rc != 0 {
+		if rc := r.e.printJSON(map[string]any{"checks": results, "failed": failed, "unknown": unknown}); rc != 0 {
 			return rc
 		}
 		if failed > 0 {
@@ -170,6 +187,10 @@ func (r *doctorRun) execute() int {
 		fmt.Fprintf(r.e.stdout, "\n%d problem(s) found\n", failed)
 		return 1
 	}
+	if unknown > 0 {
+		fmt.Fprintf(r.e.stdout, "\nno definite problems found; %d check(s) remain unverified\n", unknown)
+		return 0
+	}
 	fmt.Fprintf(r.e.stdout, "\nno problems found\n")
 	return 0
 }
@@ -179,7 +200,7 @@ func (r *doctorRun) execute() int {
 func (r *doctorRun) checkConfig() doctorResult {
 	path, err := r.e.resolveConfigPath()
 	if err != nil {
-		return doctorFail(err.Error(), "set XDG_CONFIG_HOME or HOME so the config directory resolves")
+		return doctorFail(err.Error(), "ensure the current OS account has a real, uid-owned home directory")
 	}
 	cfg, err := loadConfig(path)
 	if err != nil {
@@ -295,11 +316,29 @@ func (r *doctorRun) checkVersion() doctorResult {
 	return doctorPass(fmt.Sprintf("CLI %s meets the server minimum %s", r.e.version, r.minCLIVersion))
 }
 
-// pluginkitState parses one `pluginkit -m -i <id>` match line. The election
-// annotation occupies column one: "+" approved (enabled), "-" denied
-// (disabled), "?" unknown, and a leading space is the default election —
-// for an FSKit module that means registered but never approved, since user
-// approval stamps "+". No output at all means not registered.
+func (r *doctorRun) checkMountTransport() doctorResult {
+	facts, err := observeMountHost(r.goos, "auto", r.hostCheck, r.verifiedMount)
+	if err != nil {
+		return doctorFail(err.Error(), "use macOS with FSKit or Linux with FUSE")
+	}
+	switch facts.State {
+	case mounthost.Verified:
+		return doctorPass(facts.Summary)
+	case mounthost.Blocked:
+		return doctorFail(facts.Summary, mountHostGuidance(facts.Issue))
+	default:
+		result := doctorUnknown(facts.Summary)
+		for _, evidence := range facts.Details {
+			result.Lines = append(result.Lines, evidence.Key+": "+evidence.Value)
+		}
+		return result
+	}
+}
+
+// pluginkitState parses one `pluginkit -m -i <id>` inventory line. The
+// election annotation occupies column one. PlugInKit election is deliberately
+// not interpreted as FSKit enablement: enabled, disabled, and default
+// elections have all contradicted actual mountability.
 func pluginkitState(out string) (state byte, registered bool) {
 	for _, line := range strings.Split(out, "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -319,6 +358,14 @@ func (r *doctorRun) checkFskitExtension() doctorResult {
 	if r.goos != "darwin" {
 		return doctorSkip("FSKit is macOS-only (Linux mounts use FUSE)")
 	}
+	path, live, err := r.verifiedMount(mounthost.FSKit)
+	if err != nil {
+		return doctorFail("cannot inventory recorded FSKit mounts: "+err.Error(), "repair or explicitly reconcile the private mount-state inventory")
+	}
+	if live {
+		return doctorSkip(fmt.Sprintf("live FSKit mount at %s is authoritative; PlugInKit inventory was not used", path))
+	}
+	result := doctorUnknown("PlugInKit election is inventory only and does not establish FSKit mountability")
 	for _, id := range fskitExtensionBundleIDs {
 		// pluginkit exits non-zero when nothing matches; the empty output
 		// already says that, so the error itself is not load-bearing.
@@ -327,88 +374,40 @@ func (r *doctorRun) checkFskitExtension() doctorResult {
 		if !registered {
 			continue
 		}
-		switch state {
-		case '+':
-			if logPath, stale := r.staleFskitMountLog(); stale {
-				return doctorFail(
-					fmt.Sprintf("extension %s is enabled, but the last mount attempt failed as if it were not (post-update registration staleness; see %s)", id, logPath),
-					fmt.Sprintf("toggle the extension off and on in %s, then retry the mount", fskitSettingsHint))
-			}
-			return doctorPass(fmt.Sprintf("extension %s is registered and enabled", id))
-		case '-':
-			return doctorFail(
-				fmt.Sprintf("extension %s is registered but disabled", id),
-				fmt.Sprintf("enable it in %s", fskitSettingsHint))
-		default:
-			return doctorFail(
-				fmt.Sprintf("extension %s is registered but has never been enabled", id),
-				fmt.Sprintf("enable it in %s", fskitSettingsHint))
+		election := map[byte]string{
+			'+': "plus",
+			'-': "minus",
+			'!': "superseded",
+			'?': "unknown",
+			' ': "default",
+		}[state]
+		if election == "" {
+			election = fmt.Sprintf("byte-%d", state)
 		}
+		result.Lines = append(result.Lines, fmt.Sprintf("%s  election=%s", id, election))
 	}
-	return doctorFail("no PortableFS FSKit extension is registered",
-		fmt.Sprintf("install PortableFS.app into /Applications and launch it once, then enable its extension in %s", fskitSettingsHint))
-}
-
-// staleFskitMountLog scans the recorded mount logs (truncated per attempt,
-// so each reflects the LAST attempt for its path) for the kernel's
-// extension-not-enabled refusal. Seeing it while pluginkit reports the
-// extension enabled is the known post-update staleness: macOS thinks the
-// extension is enabled but the kernel no longer resolves it, and toggling
-// it off/on re-registers it.
-func (r *doctorRun) staleFskitMountLog() (string, bool) {
-	stateDir, err := r.e.mountStateDir()
-	if err != nil {
-		return "", false
+	if len(result.Lines) == 0 {
+		result.Detail = "no matching PlugInKit registration was listed; PlugInKit inventory does not establish FSKit mountability"
 	}
-	entries, err := os.ReadDir(stateDir)
-	if err != nil {
-		return "", false
-	}
-	for _, ent := range entries {
-		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".log") {
-			continue
-		}
-		path := filepath.Join(stateDir, ent.Name())
-		if strings.Contains(readFileTail(path, 16<<10), "FSKit extension is not enabled") {
-			return path, true
-		}
-	}
-	return "", false
-}
-
-// readFileTail returns up to the last max bytes of a file ("" on any error;
-// this is best-effort evidence gathering).
-func readFileTail(path string, max int64) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return ""
-	}
-	if size := info.Size(); size > max {
-		if _, err := f.Seek(size-max, io.SeekStart); err != nil {
-			return ""
-		}
-	}
-	data, err := io.ReadAll(io.LimitReader(f, max))
-	if err != nil {
-		return ""
-	}
-	return string(data)
+	return result
 }
 
 func (r *doctorRun) checkDaemon() doctorResult {
 	if r.goos != "darwin" {
 		return doctorSkip("portablefsd serves FSKit mounts (macOS-only)")
 	}
-	cfg := fskitConfigFromEnv(r.e.getenv)
+	cfg, err := fskitConfigFromEnv(r.e.getenv)
+	if err != nil {
+		return doctorFail(err.Error(), "repair canonical account home resolution before using FSKit")
+	}
 	if r.daemonHealthy(cfg.controlSock) {
 		return doctorPass(fmt.Sprintf("answering on %s", cfg.controlSock))
 	}
-	if path, ok := r.liveFskitMount(); ok {
+	path, live, err := r.verifiedMount(mounthost.FSKit)
+	if err != nil {
+		return doctorFail("cannot inventory recorded FSKit mounts: "+err.Error(), "repair or explicitly reconcile the private mount-state inventory")
+	}
+	if live {
 		return doctorFail(
 			fmt.Sprintf("not answering on %s while fskit mounts are recorded live (e.g. %s)", cfg.controlSock, path),
 			fmt.Sprintf("run `portablefs umount %s` and mount again (a fresh daemon starts automatically)", path))
@@ -424,7 +423,10 @@ func (r *doctorRun) checkWriteBack() doctorResult {
 	if r.goos != "darwin" {
 		return doctorSkip("write-back recovery status is read from portablefsd (macOS-only)")
 	}
-	cfg := fskitConfigFromEnv(r.e.getenv)
+	cfg, err := fskitConfigFromEnv(r.e.getenv)
+	if err != nil {
+		return doctorFail(err.Error(), "repair canonical account home resolution before using FSKit")
+	}
 	if !r.daemonHealthy(cfg.controlSock) {
 		return doctorSkip("portablefsd is not running (no attaches to inspect)")
 	}
@@ -475,28 +477,10 @@ func (r *doctorRun) checkWriteBack() doctorResult {
 	return res
 }
 
-// liveFskitMount reports one recorded fskit mount whose daemon pid is alive.
-func (r *doctorRun) liveFskitMount() (string, bool) {
-	stateDir, err := r.e.mountStateDir()
-	if err != nil {
-		return "", false
-	}
-	states, err := listMountStates(stateDir)
-	if err != nil {
-		return "", false
-	}
-	for _, st := range states {
-		if st.Strategy == "fskit" && pidAlive(st.PID) {
-			return st.MountPath, true
-		}
-	}
-	return "", false
-}
-
 func (r *doctorRun) checkMounts() doctorResult {
 	stateDir, err := r.e.mountStateDir()
 	if err != nil {
-		return doctorFail(err.Error(), "set XDG_STATE_HOME or HOME so the mount state directory resolves")
+		return doctorFail(err.Error(), "ensure the current OS account has a real, uid-owned home directory")
 	}
 	states, err := listMountStates(stateDir)
 	if err != nil {
@@ -508,7 +492,7 @@ func (r *doctorRun) checkMounts() doctorResult {
 	var lines []string
 	var stale, expired []string
 	for _, st := range states {
-		health := mountHealth(&st)
+		health := r.e.classifyMount(&st)
 		lines = append(lines, fmt.Sprintf("%s  %s@%s  %s  %s", st.MountPath, st.VolumeID, st.Branch, st.Strategy, health))
 		switch health {
 		case "stale":

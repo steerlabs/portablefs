@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -200,18 +201,23 @@ func (c *apiClient) retireVolume(ctx context.Context, volumeID string) (*retireV
 // per-volume and answers for base-authoring branches). Best-effort: an
 // unresolvable tenant returns "" and callers omit the field — servers that
 // require it produce their own typed error.
-func (c *apiClient) resolveVolumeTenant(ctx context.Context, volumeID, branch string) string {
-	if listed, err := c.listVolumes(ctx, 1000); err == nil {
+func (c *apiClient) resolveVolumeTenant(ctx context.Context, volumeID, branch string) (string, error) {
+	listed, listErr := c.listVolumes(ctx, 1000)
+	if listErr == nil {
 		for _, volume := range listed {
 			if volume.VolumeID == volumeID {
-				return volume.TenantID
+				if volume.TenantID == "" {
+					return "", fmt.Errorf("volume %s has no tenant identity", volumeID)
+				}
+				return volume.TenantID, nil
 			}
 		}
 	}
-	if head, err := c.head(ctx, volumeID, branch); err == nil && head != nil {
-		return head.Volume.TenantID
+	head, headErr := c.head(ctx, volumeID, branch)
+	if headErr == nil && head != nil && head.Volume.TenantID != "" {
+		return head.Volume.TenantID, nil
 	}
-	return ""
+	return "", fmt.Errorf("resolve tenant for %s@%s: %w", volumeID, branch, errors.Join(listErr, headErr))
 }
 
 type headResponse struct {

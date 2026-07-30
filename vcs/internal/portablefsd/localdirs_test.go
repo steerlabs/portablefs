@@ -53,7 +53,7 @@ func TestNormalizeLocalDirs(t *testing.T) {
 
 func startDaemonNoAttach(t *testing.T, _ string) (Config, *http.Client, context.CancelFunc) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "pfsd-")
+	dir, err := os.MkdirTemp("", "pfsd-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +564,7 @@ func TestDaemonLocalDirsAddedLiveViaControl(t *testing.T) {
 // remains idempotent-and-additive for localDirs across restarts.
 func TestDaemonLocalDirsSurviveDaemonRestart(t *testing.T) {
 	authority := serveAuthority(t)
-	dir, err := os.MkdirTemp("/tmp", "pfsd-")
+	dir, err := os.MkdirTemp("", "pfsd-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +578,8 @@ func TestDaemonLocalDirsSurviveDaemonRestart(t *testing.T) {
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	s1 := NewServer(cfg)
-	go func() { _ = s1.Run(ctx1) }()
+	run1Done := make(chan error, 1)
+	go func() { run1Done <- s1.Run(ctx1) }()
 	waitUnix(t, cfg.ControlSocket)
 	waitUnix(t, cfg.FrontendSocket)
 	hc := httpUDSClient(cfg.ControlSocket)
@@ -592,12 +593,18 @@ func TestDaemonLocalDirsSurviveDaemonRestart(t *testing.T) {
 	c1.close()
 
 	cancel1()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(cfg.FrontendSocket); err != nil {
-			break
+	// A disappeared socket is not the daemon's restart boundary: Run still
+	// owns the state singleton while it drains attaches and commits the final
+	// registry. Starting the successor in that interval races the nonblocking
+	// singleton lock and can leave no daemon behind. Wait for the exact
+	// cooperative completion that production supervisors wait for.
+	select {
+	case err := <-run1Done:
+		if err != nil {
+			t.Fatalf("first daemon shutdown: %v", err)
 		}
-		time.Sleep(20 * time.Millisecond)
+	case <-time.After(35 * time.Second):
+		t.Fatal("first daemon did not complete its bounded cooperative shutdown")
 	}
 
 	ctx2, cancel2 := context.WithCancel(context.Background())

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 )
+
+func TestLegacyProfileCADoesNotSurviveConfigDecodeEncode(t *testing.T) {
+	data := []byte(`{"currentProfile":"default","profiles":{"default":{"apiUrl":"https://api.example","apiToken":"tok","managerUrl":"https://manager.example","managerToken":"mgr","dataPlaneCaPem":"stale-trust"}}}`)
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "dataPlaneCaPem") || strings.Contains(string(encoded), "stale-trust") {
+		t.Fatalf("legacy cached trust survived config round trip: %s", encoded)
+	}
+}
 
 // testEnv returns a cmdEnv wired to buffers, an isolated config file, an empty
 // environment, and an instant device-flow sleeper.
@@ -18,20 +36,40 @@ func testEnv(t *testing.T) (*cmdEnv, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	e := &cmdEnv{
-		stdout:     stdout,
-		stderr:     stderr,
-		getenv:     func(string) string { return "" },
-		version:    "test",
-		configPath: filepath.Join(t.TempDir(), "config.json"),
-		sleepFn:    func(time.Duration) {},
+		stdout:            stdout,
+		stderr:            stderr,
+		getenv:            func(string) string { return "" },
+		version:           "test",
+		configPath:        filepath.Join(t.TempDir(), "private-config", "config.json"),
+		lifecycleStateDir: filepath.Join(t.TempDir(), "state", "portablefs"),
+		stateDir:          filepath.Join(t.TempDir(), "operational-state", "portablefs"),
+		sleepFn:           func(time.Duration) {},
 		// Tests must never launch a real browser; individual tests override
 		// this to record the URL they would have opened.
-		openURLFn: func(string) error { return errNoTestBrowser },
+		openURLFn:         func(string) error { return errNoTestBrowser },
+		kernelInventoryFn: func() ([]string, error) { return nil, nil },
 	}
 	return e, stdout, stderr
 }
 
 var errNoTestBrowser = fmt.Errorf("no browser in tests")
+
+func TestDefaultConfigPathIgnoresMutableHomeEnvironment(t *testing.T) {
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "fake-home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "fake-xdg"))
+	home, err := accountpath.Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := defaultConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config", "portablefs", "config.json")
+	if got != want {
+		t.Fatalf("default config = %q, want %q", got, want)
+	}
+}
 
 func TestConfigSaveLoadRoundtripAndPerms(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.json")
@@ -61,7 +99,11 @@ func TestConfigSaveLoadRoundtripAndPerms(t *testing.T) {
 }
 
 func TestLoadConfigMissingFileIsEmpty(t *testing.T) {
-	cfg, err := loadConfig(filepath.Join(t.TempDir(), "nope.json"))
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(filepath.Join(dir, "nope.json"))
 	if err != nil {
 		t.Fatalf("missing config must not error: %v", err)
 	}
@@ -72,6 +114,9 @@ func TestLoadConfigMissingFileIsEmpty(t *testing.T) {
 
 func TestLoadConfigRejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	target := filepath.Join(dir, "target.json")
 	if err := os.WriteFile(target, []byte(`{"currentProfile":"default","profiles":{}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -80,12 +125,12 @@ func TestLoadConfigRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, err := loadConfig(link); err == nil || !strings.Contains(err.Error(), "non-symlink") {
+	if _, err := loadConfig(link); err == nil {
 		t.Fatalf("loadConfig symlink error = %v", err)
 	}
 }
 
-func TestSaveConfigReplacesSymlinkWithoutFollowingIt(t *testing.T) {
+func TestSaveConfigRefusesSymlinkWithoutFollowingIt(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "config")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -99,8 +144,8 @@ func TestSaveConfigReplacesSymlinkWithoutFollowingIt(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 	cfg := &Config{CurrentProfile: "default", Profiles: map[string]Profile{}}
-	if err := saveConfig(path, cfg); err != nil {
-		t.Fatalf("saveConfig: %v", err)
+	if err := saveConfig(path, cfg); err == nil {
+		t.Fatal("saveConfig accepted a symlink config path")
 	}
 	if body, err := os.ReadFile(victim); err != nil || string(body) != "do not overwrite" {
 		t.Fatalf("symlink target changed: body=%q err=%v", body, err)
@@ -109,8 +154,8 @@ func TestSaveConfigReplacesSymlinkWithoutFollowingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("saved config mode = %v, want regular", info.Mode())
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("refused config symlink was replaced: mode=%v", info.Mode())
 	}
 }
 

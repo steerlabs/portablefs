@@ -27,7 +27,10 @@ public struct DaemonEnsureAttachRequest: Codable, Equatable, Sendable {
     public var branch: String
     public var authorityUrl: String
     public var authToken: String
+    public var dataPlaneTransport: String
+    public var dataPlaneServerName: String
     public var tlsCaPem: String
+    public var tlsCaSha256: String
     public var mountPath: String
     public var options: DaemonAttachOptions
 
@@ -36,7 +39,10 @@ public struct DaemonEnsureAttachRequest: Codable, Equatable, Sendable {
         branch: String,
         authorityUrl: String,
         authToken: String,
+        dataPlaneTransport: String,
+        dataPlaneServerName: String = "",
         tlsCaPem: String = "",
+        tlsCaSha256: String = "",
         mountPath: String,
         options: DaemonAttachOptions = DaemonAttachOptions()
     ) {
@@ -44,7 +50,10 @@ public struct DaemonEnsureAttachRequest: Codable, Equatable, Sendable {
         self.branch = branch
         self.authorityUrl = authorityUrl
         self.authToken = authToken
+        self.dataPlaneTransport = dataPlaneTransport
+        self.dataPlaneServerName = dataPlaneServerName
         self.tlsCaPem = tlsCaPem
+        self.tlsCaSha256 = tlsCaSha256
         self.mountPath = mountPath
         self.options = options
     }
@@ -221,11 +230,16 @@ public struct DaemonControlClient: Sendable {
         return try Self.decode(DaemonAttachStatus.self, from: response.body)
     }
 
-    /// Detach: flushes dirty state to the authority and drops the attach.
-    public func deleteAttach(ref: String) async throws {
-        let response = try await http.send(method: "DELETE", path: "/v1/attaches/\(Self.escape(ref))")
-        // DELETE converges state. If a prior request succeeded but its reply
-        // was lost, the exact retry sees 404 and is already complete.
+    /// Atomically drains the attach, proves and removes its exact FSKit
+    /// kernel mount, then durably removes the daemon attach.
+    public func unmountAttach(ref: String) async throws {
+        let response = try await http.send(
+            method: "POST",
+            path: "/v1/attaches/\(Self.escape(ref))/unmount",
+            body: Data("{}".utf8)
+        )
+        // Exact unmount converges state. If a prior request committed but its
+        // reply was lost, the retry sees 404 and is already complete.
         if response.status == 404 {
             return
         }

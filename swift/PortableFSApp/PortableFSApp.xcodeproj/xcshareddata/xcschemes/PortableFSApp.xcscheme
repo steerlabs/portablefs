@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "200000000000000000000501"
-               BuildableName = "PortableFSApp.app"
+               BuildableName = "PortableFS.app"
                BlueprintName = "PortableFSApp"
                ReferencedContainer = "container:PortableFSApp.xcodeproj">
             </BuildableReference>
@@ -38,7 +38,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "200000000000000000000501"
-            BuildableName = "PortableFSApp.app"
+            BuildableName = "PortableFS.app"
             BlueprintName = "PortableFSApp"
             ReferencedContainer = "container:PortableFSApp.xcodeproj">
          </BuildableReference>
@@ -55,7 +55,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "200000000000000000000501"
-            BuildableName = "PortableFSApp.app"
+            BuildableName = "PortableFS.app"
             BlueprintName = "PortableFSApp"
             ReferencedContainer = "container:PortableFSApp.xcodeproj">
          </BuildableReference>

@@ -20,6 +20,7 @@ import {
   type AccessLeaseRevokeOwnerResponse,
   type AccessLeaseRevokeResponse,
   type AuthorityEndpointPayload,
+  type DataPlaneTransport,
   releaseIdentityErrorCode,
   type ReleaseIdentity,
 } from "@portablefs/protocol";
@@ -204,6 +205,10 @@ export interface AuthorityManagerServerDeps {
   // Canonical access-lease service (production mode). When absent, the
   // /v1/access-leases/* routes answer ACCESS_LEASE_UNSUPPORTED.
   accessLeases?: AccessLeaseHandler;
+  // Exact data-plane transport projected into every newly-created access
+  // lease. Production startup always supplies this; it remains optional here
+  // so older embedders retain additive source/wire compatibility.
+  dataPlaneTransport?: DataPlaneTransport;
   // Exact deployment identity served at GET /v1/release-identity (loaded once
   // at startup from release-tooling env). Absent -> the route answers 404
   // RELEASE_IDENTITY_UNAVAILABLE, the honest "unpinned dev deployment" signal.
@@ -400,7 +405,12 @@ async function handleAccessLeaseRoute(
           ...(request.ttlMs !== undefined ? { ttlMs: request.ttlMs } : {}),
         });
         const response: AccessLeaseCreateResponse = {
-          authority: toLeaseAuthorityPayload(endpoint, created.accessToken, created.lease.expiresAt),
+          authority: toLeaseAuthorityPayload(
+            endpoint,
+            created.accessToken,
+            created.lease.expiresAt,
+            deps.dataPlaneTransport
+          ),
           lease: created.lease,
           accessToken: created.accessToken,
           serverTimeMs: Date.now(),
@@ -554,7 +564,8 @@ function parseAccessLeaseBody<T>(schema: ZodType<T>, body: Record<string, unknow
 function toLeaseAuthorityPayload(
   endpoint: AuthorityEndpoint,
   accessToken: string,
-  expiresAt: number
+  expiresAt: number,
+  dataPlaneTransport?: DataPlaneTransport
 ): AuthorityEndpointPayload {
   return {
     authorityUrl: endpoint.authorityUrl,
@@ -564,6 +575,7 @@ function toLeaseAuthorityPayload(
     ...(endpoint.authorityInstanceId ? { authorityInstanceId: endpoint.authorityInstanceId } : {}),
     authorityAuthToken: accessToken,
     authorityExpiresAt: expiresAt,
+    ...(dataPlaneTransport ? { dataPlaneTransport } : {}),
   };
 }
 

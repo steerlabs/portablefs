@@ -55,6 +55,6 @@
 		<false/>
 	</dict>
 	<key>PFSAppGroupIdentifier</key>
-	<string>B47U2LLKHW.pfsoss</string>
+	<string>$(PORTABLEFS_APP_GROUP)</string>
 </dict>
 </plist>

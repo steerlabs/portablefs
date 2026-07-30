@@ -2,6 +2,11 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +32,238 @@ func TestResolveAccessNeverFallsBack(t *testing.T) {
 	}
 }
 
+func TestIntentLeaseTransactionReplaysExactCreateThenRelease(t *testing.T) {
+	f := newFakeServer(t)
+	const (
+		createOp  = "11111111-2222-4333-8444-555555555555"
+		releaseOp = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+		consumer  = "cli:durable-host"
+	)
+	var createBodies, releaseBodies []map[string]any
+	f.on("POST", "/v1/access-leases/create", func(body map[string]any) (int, string) {
+		createBodies = append(createBodies, body)
+		return 200, leaseCreateOK
+	})
+	f.on("POST", "/v1/access-leases/release", func(body map[string]any) (int, string) {
+		releaseBodies = append(releaseBodies, body)
+		return 200, `{"lease":{"accessLeaseId":"pfal_1","controlSeq":"8","expiresAt":1700000600000,"state":"released"}}`
+	})
+	e, _, _ := testEnv(t)
+	e.getenv = func(name string) string {
+		switch name {
+		case "PORTABLEFS_API_URL", "PORTABLEFS_MANAGER_URL":
+			return f.srv.URL
+		case "PORTABLEFS_MANAGER_TOKEN":
+			return "mgr_tok"
+		default:
+			return ""
+		}
+	}
+	intent := &mountIntent{
+		SchemaVersion:           2,
+		Phase:                   "starting",
+		MountPath:               filepath.Join(t.TempDir(), "mount"),
+		VolumeID:                "vol_1",
+		Branch:                  "main",
+		Strategy:                "fuse",
+		ManagerURL:              f.srv.URL,
+		LeaseCreateOperationID:  createOp,
+		LeaseReleaseOperationID: releaseOp,
+		LeaseConsumerID:         consumer,
+		OperationOwnerPID:       os.Getpid(),
+		UpdatedAtMs:             time.Now().UnixMilli(),
+	}
+	identity, err := processStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent.OperationOwnerStartIdentity = identity
+	if err := e.releaseIntentAccessLease(intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(createBodies) != 1 || createBodies[0]["operationId"] != createOp ||
+		createBodies[0]["consumerId"] != consumer {
+		t.Fatalf("exact replay create body = %+v", createBodies)
+	}
+	if len(releaseBodies) != 1 || releaseBodies[0]["operationId"] != releaseOp ||
+		releaseBodies[0]["accessLeaseId"] != "pfal_1" {
+		t.Fatalf("exact replay release body = %+v", releaseBodies)
+	}
+}
+
+func TestInjectedPreMountFailureReleasesExactLease(t *testing.T) {
+	f := newFakeServer(t)
+	const releaseOp = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	var operations []string
+	f.on("POST", "/v1/access-leases/release", func(body map[string]any) (int, string) {
+		operations = append(operations, body["operationId"].(string))
+		return 200, `{"lease":{"accessLeaseId":"pfal_1","controlSeq":"8","expiresAt":1700000600000,"state":"released"}}`
+	})
+	keeper := newLeaseKeeper(newManagerClient(f.srv.URL, "mgr_tok"), nil, leaseState{
+		AccessLeaseID: "pfal_1",
+		AccessToken:   "lease_tok_1",
+		ExpiresAtMs:   1700000600000,
+		ControlSeq:    "7",
+	}, nil)
+	if err := releaseStartupAccessLease(keeper, releaseOp); err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 || operations[0] != releaseOp {
+		t.Fatalf("pre-mount cleanup operations = %v", operations)
+	}
+}
+
+func TestReleasedLeaseFactUsesLatestStateTokenAndNeedsNoManagerReplay(t *testing.T) {
+	e, _, _ := testEnv(t)
+	stateDir := filepath.Join(t.TempDir(), "mounts")
+	mountPath := filepath.Join(t.TempDir(), "mount")
+	operation, err := acquireMountOperation(stateDir, mountPath, "vol_1", "main", "fuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.close(false)
+	operation.mountInstanceID = "mnt_AAAAAAAAAAAAAAAAAAAAAA"
+	operation.mountMechanism = "direct"
+	operation.managerURL = "https://manager.example"
+	operation.leaseReleaseOp = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	st := validFuseMountState(t, mountPath)
+	st.MountInstanceID = operation.mountInstanceID
+	st.ManagerURL = operation.managerURL
+	st.AccessLeaseReleaseOperationID = operation.leaseReleaseOp
+	st.AccessLease = &leaseState{
+		AccessLeaseID: "pfal_1",
+		AccessToken:   "rotated_latest_token",
+		ExpiresAtMs:   1700000600000,
+		ControlSeq:    "9",
+	}
+	if err := writeMountState(stateDir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishReleasedLeaseIntent(operation, stateDir, mountPath); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := readMountIntent(operation.intentPath, mountPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.Phase != "lease-released" || intent.AccessLease == nil ||
+		intent.AccessLease.AccessToken != "rotated_latest_token" {
+		t.Fatalf("released fact = %+v", intent)
+	}
+	if _, err := e.reconcileMountIntent(intent, false); err != nil {
+		t.Fatalf("released fact must finalize without manager replay: %v", err)
+	}
+}
+
+func TestUmountFinalizesCoexistingReleasedIntentAndState(t *testing.T) {
+	e, _, stderr := testEnv(t)
+	stateDir, err := e.mountStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountPath := t.TempDir()
+	operation, err := acquireMountOperation(stateDir, mountPath, "vol_1", "main", "fuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation.mountInstanceID = "mnt_AAAAAAAAAAAAAAAAAAAAAA"
+	operation.mountMechanism = "direct"
+	operation.managerURL = "https://manager.example"
+	operation.leaseReleaseOp = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	lease := &leaseState{
+		AccessLeaseID: "pfal_1",
+		AccessToken:   "rotated_latest_token",
+		ExpiresAtMs:   1700000600000,
+		ControlSeq:    "9",
+	}
+	st := validFuseMountState(t, mountPath)
+	st.MountInstanceID = operation.mountInstanceID
+	st.ManagerURL = operation.managerURL
+	st.AccessLeaseReleaseOperationID = operation.leaseReleaseOp
+	st.AccessLease = lease
+	if err := writeMountState(stateDir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishReleasedLeaseIntent(operation, stateDir, mountPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := operation.close(false); err != nil {
+		t.Fatal(err)
+	}
+	if rc := e.run([]string{"umount", mountPath}); rc != 0 {
+		t.Fatalf("rc = %d, stderr = %q", rc, stderr.String())
+	}
+	if state, err := readMountState(stateDir, mountPath); err != nil || state != nil {
+		t.Fatalf("state after finalization = %+v, %v", state, err)
+	}
+	_, intentPath := mountOperationPaths(stateDir, mountPath)
+	if _, err := os.Stat(intentPath); !os.IsNotExist(err) {
+		t.Fatalf("intent remains after finalization: %v", err)
+	}
+}
+
+func TestPreparedCleanupIdentityAllowsSameLeaseRotation(t *testing.T) {
+	mountPath := t.TempDir()
+	state := validFuseMountState(t, mountPath)
+	state.ManagerURL = "https://manager.example"
+	state.AccessLeaseReleaseOperationID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	state.AccessLease = &leaseState{
+		AccessLeaseID: "pfal_same_lease",
+		AccessToken:   "token-before",
+		ExpiresAtMs:   1700000600000,
+		ControlSeq:    "8",
+	}
+	op := &mountOperation{mountPath: mountPath}
+	hydrateMountOperationFromState(op, &state)
+	identity, err := processStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := &mountIntent{
+		SchemaVersion:               2,
+		Phase:                       "drain-prepared",
+		MountPath:                   op.mountPath,
+		VolumeID:                    op.volumeID,
+		Branch:                      op.branch,
+		Strategy:                    op.strategy,
+		FSType:                      op.fsType,
+		AttachRef:                   op.attachRef,
+		MountInstanceID:             op.mountInstanceID,
+		KernelMountID:               op.kernelMountID,
+		MountTargetDevice:           op.mountTarget.device,
+		MountTargetInode:            op.mountTarget.inode,
+		ManagerURL:                  op.managerURL,
+		LeaseReleaseOperationID:     op.leaseReleaseOp,
+		AccessLease:                 op.accessLease,
+		MountMechanism:              op.mountMechanism,
+		FUSEHelperPath:              op.fuseHelperPath,
+		StartedAtMs:                 op.startedAtMs,
+		AuthorityURL:                op.authorityURL,
+		DataPlaneTransport:          op.transportMode,
+		DataPlaneServerName:         op.transportServer,
+		DataPlaneCAPath:             op.dataPlaneCAPath,
+		DataPlaneCASHA256:           op.dataPlaneCAHash,
+		MountOwnerPID:               state.PID,
+		MountOwnerStartIdentity:     state.ProcessStartIdentity,
+		OperationOwnerPID:           os.Getpid(),
+		OperationOwnerStartIdentity: identity,
+		UpdatedAtMs:                 1,
+	}
+	state.AccessLease = &leaseState{
+		AccessLeaseID: "pfal_same_lease",
+		AccessToken:   "token-after",
+		ExpiresAtMs:   1700000900000,
+		ControlSeq:    "9",
+	}
+	if err := verifyCleanupIntentMatchesState(intent, &state); err != nil {
+		t.Fatalf("same lease rotation wedged prepared recovery: %v", err)
+	}
+	intent.Phase = "resources-cleaned"
+	if err := verifyCleanupIntentMatchesState(intent, &state); err == nil {
+		t.Fatal("terminal cleanup accepted a stale mutable lease frame")
+	}
+}
+
 func TestResolveAccessErrorsAreActionable(t *testing.T) {
 	f := newFakeServer(t)
 	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
@@ -40,11 +277,67 @@ func TestResolveAccessErrorsAreActionable(t *testing.T) {
 }
 
 const leaseCreateOK = `{
-  "authority": {"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050,"authorityInstanceId":"pfai_9"},
+  "authority": {"authorityUrl":"vcs.example.com:2050","host":"vcs.example.com","port":2050,"authorityInstanceId":"pfai_9","dataPlaneTransport":{"mode":"plaintext"}},
   "lease": {"accessLeaseId":"pfal_1","controlSeq":"7","expiresAt":1700000600000,"state":"active"},
   "accessToken": "lease_tok_1",
   "serverTimeMs": 1700000000000
 }`
+
+func TestResolveAccessRequiresExplicitTransport(t *testing.T) {
+	f := newFakeServer(t)
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+		return 200, `{
+		  "authority":{"authorityUrl":"router.example:2050"},
+		  "lease":{"accessLeaseId":"pfal_1","controlSeq":"1","expiresAt":1700000600000,"state":"active"},
+		  "accessToken":"lease_tok"
+		}`
+	})
+	_, err := newManagerClient(f.srv.URL, "mgr_tok").resolveAccess(context.Background(), "vol_1", "main", "")
+	if err == nil || !strings.Contains(err.Error(), "upgrade the authority manager") {
+		t.Fatalf("missing transport must fail with upgrade guidance: %v", err)
+	}
+}
+
+func TestResolveAccessCarriesPrivateCATransport(t *testing.T) {
+	ca := testCertificatePEM(t, 77)
+	sum := sha256.Sum256([]byte(ca))
+	digest := hex.EncodeToString(sum[:])
+	response, err := json.Marshal(map[string]any{
+		"authority": map[string]any{
+			"authorityUrl": "router.example:2050",
+			"dataPlaneTransport": map[string]any{
+				"mode":       "tls-private-ca",
+				"serverName": "router.example",
+				"caPem":      ca,
+				"caSha256":   digest,
+			},
+		},
+		"lease": map[string]any{
+			"accessLeaseId": "pfal_1",
+			"controlSeq":    "1",
+			"expiresAt":     int64(1700000600000),
+			"state":         "active",
+		},
+		"accessToken": "lease_tok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeServer(t)
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+		return 200, string(response)
+	})
+	session, err := newManagerClient(f.srv.URL, "mgr_tok").resolveAccess(context.Background(), "vol_1", "main", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.DataPlaneTransport.Mode != dataPlaneTransportTLSPrivateCA ||
+		session.DataPlaneTransport.ServerName != "router.example" ||
+		session.DataPlaneTransport.CASHA256 != digest ||
+		session.DataPlaneTransport.CAPEM != ca {
+		t.Fatalf("private CA transport = %+v", session.DataPlaneTransport)
+	}
+}
 
 // TestResolveAccessLeaseRoute pins the canonical transport: a manager
 // serving POST /v1/access-leases/create resolves in ONE request, the access
@@ -262,6 +555,25 @@ func TestAccessLeaseReleaseRetriesSameOperationID(t *testing.T) {
 	}
 	if len(releaseOps) != 2 || releaseOps[0] == "" || releaseOps[0] != releaseOps[1] {
 		t.Fatalf("ambiguous release must replay the SAME operationId: %v", releaseOps)
+	}
+}
+
+func TestAccessLeaseReleasePersistedOperationConvergesTerminalState(t *testing.T) {
+	f := newFakeServer(t)
+	var operationIDs []string
+	f.on("POST", "/v1/access-leases/release", func(body map[string]any) (int, string) {
+		operationIDs = append(operationIDs, body["operationId"].(string))
+		return 409, `{"error":{"code":"ACCESS_LEASE_RELEASED","message":"already released"}}`
+	})
+	k := newLeaseKeeper(newManagerClient(f.srv.URL, "mgr_tok"), nil, leaseState{
+		AccessLeaseID: "pfal_done", AccessToken: "tok_done", ExpiresAtMs: 1, ControlSeq: "9",
+	}, nil)
+	const persistedOperationID = "11111111-2222-4333-8444-555555555555"
+	if err := k.releaseWithOperation(context.Background(), persistedOperationID); err != nil {
+		t.Fatalf("terminal released state must converge cleanup: %v", err)
+	}
+	if len(operationIDs) != 1 || operationIDs[0] != persistedOperationID {
+		t.Fatalf("release operations = %v", operationIDs)
 	}
 }
 

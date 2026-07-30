@@ -2,13 +2,13 @@
 # End-to-end golden-path gate against a disposable quickstart stack.
 #
 # Boots an ISOLATED compose project (own project name, ports, env file, CLI
-# config), then walks the full user journey and asserts every step:
+# account root), then walks the full user journey and asserts every step:
 # login, create, adopt, mount, cross-mount coherence, history, named
 # snapshot, fork, MOUNT THE FORK, fork isolation, branch, mount the branch,
 # grep against the live branch, exec retirement, unmount,
 # teardown. Exits non-zero on the first failed assertion; always tears the
-# stack down. Nothing here touches a developer's default quickstart stack
-# or ~/.config/portablefs.
+# stack down. The CLI is built with a test-only account-root hook, so nothing
+# here touches a developer's default quickstart stack or account state.
 #
 # Usage: ./scripts/e2e-quickstart.sh [--keep]   (--keep skips teardown)
 #
@@ -40,9 +40,9 @@ POSTGRES_PORT=25433
 ENV_FILE=.env.quickstart.e2e
 WORK=$(mktemp -d /tmp/pfs-e2e.XXXXXX)
 CLI="$WORK/portablefs"
-export XDG_CONFIG_HOME="$WORK/config"
-export XDG_STATE_HOME="$WORK/state"
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+mkdir -p "$WORK/account"
+PORTABLEFS_E2E_ACCOUNT_HOME=$(CDPATH= cd -- "$WORK/account" && pwd -P)
+export PORTABLEFS_E2E_ACCOUNT_HOME
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -65,8 +65,14 @@ require() { # require <description> <command...>
 }
 
 MOUNTS=()
+PEER_MOUNT=""
+PEER_ACCOUNT_ROOT=""
 cleanup() {
   set +e
+  if [ -n "$PEER_MOUNT" ] && [ -n "$PEER_ACCOUNT_ROOT" ]; then
+    PORTABLEFS_E2E_ACCOUNT_HOME="$PEER_ACCOUNT_ROOT" \
+      "$CLI" umount "$PEER_MOUNT" >/dev/null 2>&1
+  fi
   for m in "${MOUNTS[@]:-}"; do
     [ -n "$m" ] && "$CLI" umount "$m" >/dev/null 2>&1
   done
@@ -87,7 +93,7 @@ cleanup() {
 trap cleanup EXIT
 
 step "build CLI from source"
-GOTOOLCHAIN=auto go -C vcs build -o "$CLI" ./cmd/portablefs || {
+GOTOOLCHAIN=auto go -C vcs build -tags portablefs_e2e -o "$CLI" ./cmd/portablefs || {
   fail "CLI build"
   exit 1
 }
@@ -95,7 +101,7 @@ pass "CLI build"
 
 # FSKit mounts spawn portablefsd; the CLI discovers it as a sibling binary.
 if [ "$MOUNTS_ENABLED" = 1 ] && [ "$(uname -s)" = "Darwin" ]; then
-  GOTOOLCHAIN=auto go -C vcs build -o "$WORK/portablefsd" ./cmd/portablefsd || {
+  GOTOOLCHAIN=auto go -C vcs build -tags portablefs_e2e -o "$WORK/portablefsd" ./cmd/portablefsd || {
     fail "portablefsd build"
     exit 1
   }
@@ -145,6 +151,14 @@ restore_dev_env
 step "login"
 require "login" "$CLI" login --url "http://127.0.0.1:$API_PORT" --token "$TENANT_TOKEN" \
   --manager-url "http://127.0.0.1:$MANAGER_PORT" --manager-token "$MANAGER_TOKEN"
+if [ "$(uname -s)" = "Linux" ]; then
+  mkdir -p "$WORK/account-peer"
+  PEER_ACCOUNT_ROOT=$(CDPATH= cd -- "$WORK/account-peer" && pwd -P)
+  require "peer account login" env \
+    PORTABLEFS_E2E_ACCOUNT_HOME="$PEER_ACCOUNT_ROOT" \
+    "$CLI" login --url "http://127.0.0.1:$API_PORT" --token "$TENANT_TOKEN" \
+    --manager-url "http://127.0.0.1:$MANAGER_PORT" --manager-token "$MANAGER_TOKEN"
+fi
 
 step "create empty volume"
 require "create" "$CLI" create e2e-created
@@ -178,29 +192,44 @@ else
   skip "nested content readable (needs mount)"
 fi
 
-step "cross-mount coherence"
+step "local write-back ownership and cross-machine coherence"
 if [ "$MOUNTS_ENABLED" = 1 ]; then
-  M2="$WORK/m2"
-  mkdir -p "$M2"
-  if "$CLI" mount e2e-repo "$M2" >/dev/null 2>&1; then
-    MOUNTS+=("$M2")
-    pass "second mount"
+  MLOCAL="$WORK/m-local-duplicate"
+  mkdir -p "$MLOCAL"
+  if "$CLI" mount e2e-repo "$MLOCAL" >/dev/null 2>&1; then
+    fail "same-account duplicate branch mount was accepted"
+    "$CLI" umount "$MLOCAL" >/dev/null 2>&1 || true
   else
-    fail "second mount"
+    pass "same-account duplicate branch mount refused before side effects"
   fi
-  echo "coherent-$$" > "$M1/coherence.txt"
-  COHERENT=0
-  for _ in $(seq 1 20); do
-    if grep -q "coherent-$$" "$M2/coherence.txt" 2>/dev/null; then
-      COHERENT=1
-      break
+
+  if [ "$(uname -s)" = "Linux" ]; then
+    M2="$WORK/m2"
+    mkdir -p "$M2"
+    if PORTABLEFS_E2E_ACCOUNT_HOME="$PEER_ACCOUNT_ROOT" \
+      "$CLI" mount e2e-repo "$M2" >/dev/null 2>&1; then
+      PEER_MOUNT="$M2"
+      pass "peer-account mount (models a second machine-local owner)"
+    else
+      fail "peer-account mount"
     fi
-    sleep 1
-  done
-  [ "$COHERENT" = 1 ] && pass "write visible across mounts" || fail "write visible across mounts (20s)"
+    echo "coherent-$$" > "$M1/coherence.txt"
+    COHERENT=0
+    for _ in $(seq 1 20); do
+      if grep -q "coherent-$$" "$M2/coherence.txt" 2>/dev/null; then
+        COHERENT=1
+        break
+      fi
+      sleep 1
+    done
+    [ "$COHERENT" = 1 ] && pass "write visible across machine-local owners" ||
+      fail "write visible across machine-local owners (20s)"
+  else
+    skip "cross-machine coherence (requires a distinct FSKit host; one local daemon intentionally owns each branch once)"
+  fi
 else
-  skip "second mount (darwin without PFS_E2E_FSKIT=1)"
-  skip "write visible across mounts (needs mounts)"
+  skip "same-account duplicate branch mount refusal (needs mounts)"
+  skip "cross-machine coherence (needs mounts)"
 fi
 
 step "history"
@@ -289,6 +318,12 @@ fi
 
 step "unmount everything"
 if [ "$MOUNTS_ENABLED" = 1 ]; then
+  if [ -n "$PEER_MOUNT" ]; then
+    require "umount $PEER_MOUNT (peer account)" env \
+      PORTABLEFS_E2E_ACCOUNT_HOME="$PEER_ACCOUNT_ROOT" \
+      "$CLI" umount "$PEER_MOUNT"
+    PEER_MOUNT=""
+  fi
   # ${arr[@]:-} keeps bash 3.2 (macOS /bin/bash) from aborting under set -u
   # when every mount failed and the array is empty.
   for m in "${MOUNTS[@]:-}"; do

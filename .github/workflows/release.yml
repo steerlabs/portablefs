@@ -15,7 +15,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove an exact stable tag at this source revision
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tag must be stable SemVer vMAJOR.MINOR.PATCH: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Enable corepack (pnpm 10 from packageManager)
+        run: corepack enable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+      - name: Verify the exact tagged tree
+        run: pnpm verify
+      - name: Audit production JavaScript dependencies
+        run: pnpm audit --prod --audit-level high
+      - name: Audit Go dependencies
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+        working-directory: vcs
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "2.17.1"
+          args: check
+
   goreleaser:
+    needs: validate
     runs-on: ubuntu-24.04
     # Gates publishing behind the `release` GitHub environment. Required
     # reviewers / deployment branch+tag policies must be configured on that
@@ -23,15 +67,40 @@ jobs:
     environment: release
     permissions:
       contents: write # create the GitHub release + upload archives
+      id-token: write # mint the short-lived OIDC identity used by Sigstore
+      attestations: write # publish build provenance for the Linux archives
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # goreleaser needs full history for the changelog
           persist-credentials: false # release auth flows via GITHUB_TOKEN env below
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
+      - name: Refuse a pre-existing GitHub release for this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          status="$(curl -sS \
+            -o "$RUNNER_TEMP/existing-release.json" \
+            -w '%{http_code}' \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          case "$status" in
+            404) ;;
+            200)
+              echo "release $GITHUB_REF_NAME already exists; refusing to replace a draft, published release, or asset" >&2
+              exit 1
+              ;;
+            *)
+              echo "could not prove release $GITHUB_REF_NAME is absent (GitHub HTTP $status)" >&2
+              exit 1
+              ;;
+          esac
       - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           distribution: goreleaser
@@ -41,8 +110,181 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify exact Linux installer archive membership
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for arch in amd64 arm64; do
+            archive="dist/portablefs_${version}_linux_${arch}.tar.gz"
+            server_archive="dist/portablefs-server_${version}_linux_${arch}.tar.gz"
+            test -f "$archive"
+            test -f "$server_archive"
+            count="$(find dist -maxdepth 1 -type f -name "portablefs_*_linux_${arch}.tar.gz" | wc -l | tr -d ' ')"
+            test "$count" = 1
+            server_count="$(find dist -maxdepth 1 -type f -name "portablefs-server_*_linux_${arch}.tar.gz" | wc -l | tr -d ' ')"
+            test "$server_count" = 1
+            tar -tzf "$archive" | LC_ALL=C sort >"$RUNNER_TEMP/members-${arch}"
+            printf '%s\n' portablefs portablefsd >"$RUNNER_TEMP/expected-members-${arch}"
+            cmp "$RUNNER_TEMP/expected-members-${arch}" "$RUNNER_TEMP/members-${arch}"
+            tar -tvzf "$archive" >"$RUNNER_TEMP/member-types-${arch}"
+            awk '
+              $1 !~ /^-/ { exit 1 }
+              $NF != "portablefs" && $NF != "portablefsd" { exit 1 }
+              { count[$NF]++ }
+              END {
+                exit(count["portablefs"] != 1 || count["portablefsd"] != 1)
+              }
+            ' "$RUNNER_TEMP/member-types-${arch}"
+            tar -tzf "$server_archive" >"$RUNNER_TEMP/server-members-${arch}"
+            printf '%s\n' vcs >"$RUNNER_TEMP/expected-server-members-${arch}"
+            cmp "$RUNNER_TEMP/expected-server-members-${arch}" "$RUNNER_TEMP/server-members-${arch}"
+            tar -tvzf "$server_archive" >"$RUNNER_TEMP/server-member-types-${arch}"
+            awk '
+              $1 !~ /^-/ { exit 1 }
+              $NF != "vcs" { exit 1 }
+              { count++ }
+              END { exit(count != 1) }
+            ' "$RUNNER_TEMP/server-member-types-${arch}"
+          done
+      - name: Attest Linux amd64 release archive
+        id: attest-linux-amd64
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          # macOS has its independent Developer ID + notarization trust chain.
+          # This attestation is deliberately scoped to the executable Linux
+          # release archives, not checksums or unrelated dist output.
+          subject-path: "${{ github.workspace }}/dist/portablefs_*_linux_amd64.tar.gz"
+      - name: Attest Linux arm64 release archive
+        id: attest-linux-arm64
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: "${{ github.workspace }}/dist/portablefs_*_linux_arm64.tar.gz"
+      - name: Attest Linux server amd64 release archive
+        id: attest-linux-server-amd64
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: "${{ github.workspace }}/dist/portablefs-server_*_linux_amd64.tar.gz"
+      - name: Attest Linux server arm64 release archive
+        id: attest-linux-server-arm64
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: "${{ github.workspace }}/dist/portablefs-server_*_linux_arm64.tar.gz"
+      - name: Upload offline Linux attestation bundles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AMD64_BUNDLE: ${{ steps.attest-linux-amd64.outputs.bundle-path }}
+          ARM64_BUNDLE: ${{ steps.attest-linux-arm64.outputs.bundle-path }}
+          SERVER_AMD64_BUNDLE: ${{ steps.attest-linux-server-amd64.outputs.bundle-path }}
+          SERVER_ARM64_BUNDLE: ${{ steps.attest-linux-server-arm64.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          amd64_asset="dist/portablefs_${version}_linux_amd64.tar.gz.attestation.jsonl"
+          arm64_asset="dist/portablefs_${version}_linux_arm64.tar.gz.attestation.jsonl"
+          server_amd64_asset="dist/portablefs-server_${version}_linux_amd64.tar.gz.attestation.jsonl"
+          server_arm64_asset="dist/portablefs-server_${version}_linux_arm64.tar.gz.attestation.jsonl"
+          install -m 0644 "$AMD64_BUNDLE" "$amd64_asset"
+          install -m 0644 "$ARM64_BUNDLE" "$arm64_asset"
+          install -m 0644 "$SERVER_AMD64_BUNDLE" "$server_amd64_asset"
+          install -m 0644 "$SERVER_ARM64_BUNDLE" "$server_arm64_asset"
+          gh release upload "$GITHUB_REF_NAME" \
+            "$amd64_asset" \
+            "$arm64_asset" \
+            "$server_amd64_asset" \
+            "$server_arm64_asset"
+
+  macos-app:
+    needs: [validate, goreleaser]
+    runs-on: macos-26
+    environment: release
+    permissions:
+      contents: write # upload the notarized app to the draft release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+
+      - name: Test the Swift app and installer core
+        run: swift test --package-path swift/PortableFSKit
+
+      - name: Import Developer ID identity
+        env:
+          P12_BASE64: ${{ secrets.PORTABLEFS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.PORTABLEFS_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/portablefs-signing.keychain-db"
+          certificate="$RUNNER_TEMP/portablefs-developer-id.p12"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$P12_BASE64" | /usr/bin/base64 -D >"$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+          printf 'PORTABLEFS_SIGNING_KEYCHAIN=%s\n' "$keychain" >>"$GITHUB_ENV"
+          printf 'PORTABLEFS_NOTARY_KEYCHAIN=%s\n' "$keychain" >>"$GITHUB_ENV"
+
+      - name: Configure App Store Connect API key
+        env:
+          API_KEY_BASE64: ${{ secrets.PORTABLEFS_APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.PORTABLEFS_APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.PORTABLEFS_APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          api_key="$RUNNER_TEMP/AuthKey_${API_KEY_ID}.p8"
+          printf '%s' "$API_KEY_BASE64" | /usr/bin/base64 -D >"$api_key"
+          chmod 0600 "$api_key"
+          xcrun notarytool store-credentials portablefs-release \
+            --key "$api_key" \
+            --key-id "$API_KEY_ID" \
+            --issuer "$API_ISSUER_ID" \
+            --keychain "$PORTABLEFS_SIGNING_KEYCHAIN"
+          printf 'PORTABLEFS_APPLE_API_KEY_PATH=%s\n' "$api_key" >>"$GITHUB_ENV"
+          printf 'PORTABLEFS_APPLE_API_KEY_ID=%s\n' "$API_KEY_ID" >>"$GITHUB_ENV"
+          printf 'PORTABLEFS_APPLE_API_ISSUER_ID=%s\n' "$API_ISSUER_ID" >>"$GITHUB_ENV"
+
+      - name: Build, sign, notarize, staple, and verify PortableFS.app
+        env:
+          PORTABLEFS_RELEASE: "1"
+          PORTABLEFS_UNSIGNED: "0"
+          PORTABLEFS_DEVELOPER_ID_EXPORT: "1"
+          PORTABLEFS_NOTARY_PROFILE: portablefs-release
+          PORTABLEFS_BUILD_NUMBER: ${{ github.run_number }}
+        run: scripts/package-macos-app.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Upload notarized app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          artifact="dist/macos/portablefs_${version}_darwin_universal_app.zip"
+          gh release upload "$GITHUB_REF_NAME" "$artifact" "$artifact.sha256"
+
+      - name: Remove ephemeral signing keychain
+        if: always()
+        run: |
+          if [ -n "${PORTABLEFS_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$PORTABLEFS_SIGNING_KEYCHAIN" || true
+          fi
 
   docker:
+    needs: [validate, goreleaser, macos-app]
     runs-on: ubuntu-24.04
     # Gates publishing behind the `release` GitHub environment. Required
     # reviewers / deployment branch+tag policies must be configured on that
@@ -62,7 +304,7 @@ jobs:
           - image: portablefs-history-worker
             dockerfile: Dockerfile.history-worker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -81,9 +323,26 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}:${{ github.ref_name }}
-            ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}:latest
           build-args: |
             PORTABLEFS_RELEASE_ID=${{ github.ref_name }}
             PORTABLEFS_SOURCE_REVISION=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  publish:
+    needs: [validate, goreleaser, macos-app, docker]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq .isDraft)" = true
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

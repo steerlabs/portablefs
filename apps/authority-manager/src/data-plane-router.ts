@@ -1,11 +1,34 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { createServer as createNetServer, connect, type Server, type Socket } from "node:net";
-import { createServer as createTlsServer } from "node:tls";
+import {
+  createHash,
+  createPrivateKey,
+  randomBytes,
+  timingSafeEqual,
+  X509Certificate,
+} from "node:crypto";
+import { closeSync, openSync, readSync } from "node:fs";
+import {
+  createServer as createNetServer,
+  connect,
+  isIP,
+  type AddressInfo,
+  type Server,
+  type Socket,
+} from "node:net";
+import {
+  connect as connectTLS,
+  createSecureContext,
+  createServer as createTlsServer,
+  type TLSSocket,
+} from "node:tls";
+import type { DataPlaneTransport } from "@portablefs/protocol";
+import { parseAuthorityAddress } from "./authority-address.js";
 
 const MAX_TOKEN_BYTES = 4096;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_BACKEND_CONNECT_TIMEOUT_MS = 5_000;
+const MAX_ROUTER_CA_BYTES = 256 * 1024;
+const MAX_ROUTER_TLS_MATERIAL_BYTES = 256 * 1024;
+const TLS_PREFLIGHT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_PENDING_CONNECTIONS = 256;
 const DEFAULT_MAX_OPEN_TUNNELS = 4096;
 const DEFAULT_MAX_TUNNELS_PER_LEASE = 64;
@@ -352,6 +375,18 @@ export interface AuthorityDataPlaneRouterConfig {
   // deployment: paths or PEMs, never a mix.
   tlsCertPem?: string;
   tlsKeyPem?: string;
+  // Startup-resolved material. Production passes this exact object after
+  // preflight so mutable certificate paths are never read a second time.
+  tlsMaterial?: RouterTLSMaterial | null;
+  transportMode?: string;
+  tlsServerName?: string;
+  tlsCaPath?: string;
+  tlsCaPem?: string;
+  allowPlaintextProduction?: boolean;
+  // Startup-resolved immutable contract. main.ts supplies the exact object it
+  // also gives the lease server so a mutable CA path cannot be read twice
+  // into two different trust decisions.
+  dataPlaneTransport?: DataPlaneTransport;
   handshakeTimeoutMs?: number;
   backendConnectTimeoutMs?: number;
   maxPendingConnections?: number;
@@ -359,6 +394,211 @@ export interface AuthorityDataPlaneRouterConfig {
   // When set, lease-token tunnels are registered here so lease end and token
   // rotation can close them (see LeaseTunnelRegistry).
   tunnelRegistry?: LeaseTunnelRegistry;
+}
+
+export interface RouterTLSMaterial {
+  cert: Buffer;
+  key: Buffer;
+}
+
+function readExactlyOneOptionalSource(
+  pathValue: string | undefined,
+  inlineValue: string | undefined,
+  pathLabel: string,
+  pemLabel: string
+): Buffer | null {
+  const path = normalizeOptionalString(pathValue);
+  const inline = inlineValue ?? "";
+  const hasInline = inline.trim() !== "";
+  if (path && hasInline) {
+    throw new Error(`${pathLabel} and ${pemLabel} are mutually exclusive.`);
+  }
+  if (path) {
+    const descriptor = openSync(path, "r");
+    try {
+      const buffer = Buffer.allocUnsafe(MAX_ROUTER_CA_BYTES + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const count = readSync(descriptor, buffer, offset, buffer.length - offset, null);
+        if (count === 0) {
+          break;
+        }
+        offset += count;
+      }
+      return Buffer.from(buffer.subarray(0, offset));
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+  if (hasInline && Buffer.byteLength(inline, "utf8") > MAX_ROUTER_CA_BYTES) {
+    throw new Error(`PortableFS data-plane private CA exceeds ${MAX_ROUTER_CA_BYTES} bytes.`);
+  }
+  return hasInline ? Buffer.from(inline, "utf8") : null;
+}
+
+export function validateStrictCertificatePEM(data: Buffer): void {
+  parseStrictCertificatePEM(data, "PortableFS data-plane private CA", MAX_ROUTER_CA_BYTES);
+}
+
+function parseStrictCertificatePEM(
+  data: Buffer,
+  label: string,
+  maxBytes: number
+): X509Certificate[] {
+  if (data.length === 0 || data.length > maxBytes) {
+    throw new Error(
+      `${label} must contain 1-${maxBytes} bytes.`
+    );
+  }
+  const text = data.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(data)) {
+    throw new Error(`${label} must be valid UTF-8 PEM.`);
+  }
+  const expression = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/gu;
+  let cursor = 0;
+  const certificates: X509Certificate[] = [];
+  for (const match of text.matchAll(expression)) {
+    const index = match.index;
+    if (index === undefined || text.slice(cursor, index).trim() !== "") {
+      throw new Error(`${label} contains data outside CERTIFICATE PEM blocks.`);
+    }
+    const block = match[0];
+    try {
+      certificates.push(new X509Certificate(block));
+    } catch (error) {
+      throw new Error(
+        `${label} certificate ${certificates.length + 1} is invalid: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    cursor = index + block.length;
+  }
+  if (certificates.length === 0 || text.slice(cursor).trim() !== "") {
+    throw new Error(
+      certificates.length === 0
+        ? `${label} contains no certificates.`
+        : `${label} contains data outside CERTIFICATE PEM blocks.`
+    );
+  }
+  return certificates;
+}
+
+export function validateDataPlaneServerName(serverName: string): void {
+  if (
+    serverName.length === 0 ||
+    serverName.length > 253 ||
+    serverName !== serverName.trim() ||
+    /[\u0000-\u0020/\\]/u.test(serverName) ||
+    serverName.includes("%") ||
+    serverName.startsWith("[") ||
+    serverName.endsWith("]")
+  ) {
+    throw new Error("PortableFS data-plane TLS server name is not a valid DNS name or IP address.");
+  }
+  if (isIP(serverName) !== 0) {
+    return;
+  }
+  const validDNS = serverName.split(".").every(
+    (label) =>
+      label.length >= 1 &&
+      label.length <= 63 &&
+      !label.startsWith("-") &&
+      !label.endsWith("-") &&
+      /^[A-Za-z0-9-]+$/u.test(label)
+  );
+  if (!validDNS) {
+    throw new Error("PortableFS data-plane TLS server name is not a valid DNS name or IP address.");
+  }
+}
+
+// Resolves the exact lease-bound transport advertised by the production
+// manager. It uses the same router configuration that controls the listener,
+// and never infers plaintext from missing TLS material.
+export function resolveDataPlaneTransportContract(config: {
+  transportMode?: string;
+  tlsServerName?: string;
+  tlsCaPath?: string;
+  tlsCaPem?: string;
+  allowPlaintextProduction?: boolean;
+}): DataPlaneTransport {
+  const mode = normalizeOptionalString(config.transportMode);
+  const serverName = normalizeOptionalString(config.tlsServerName);
+  const ca = readExactlyOneOptionalSource(
+    config.tlsCaPath,
+    config.tlsCaPem,
+    "PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH",
+    "PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM"
+  );
+  switch (mode) {
+    case "tls-private-ca": {
+      if (!serverName) {
+        throw new Error(
+          "tls-private-ca requires PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME."
+        );
+      }
+      validateDataPlaneServerName(serverName);
+      if (!ca) {
+        throw new Error(
+          "tls-private-ca requires exactly one of PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH or PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM."
+        );
+      }
+      const anchors = parseStrictCertificatePEM(
+        ca,
+        "PortableFS data-plane private CA",
+        MAX_ROUTER_CA_BYTES
+      );
+      const anchorFingerprints = new Set<string>();
+      for (const [index, anchor] of anchors.entries()) {
+        if (!anchor.ca) {
+          throw new Error(
+            `PortableFS data-plane private CA certificate ${index + 1} is not a CA certificate.`
+          );
+        }
+        if (anchorFingerprints.has(anchor.fingerprint256)) {
+          throw new Error(
+            `PortableFS data-plane private CA repeats certificate ${index + 1}.`
+          );
+        }
+        anchorFingerprints.add(anchor.fingerprint256);
+      }
+      return {
+        mode,
+        serverName,
+        caPem: ca.toString("utf8"),
+        caSha256: createHash("sha256").update(ca).digest("hex"),
+      };
+    }
+    case "tls-system-pki":
+      if (!serverName) {
+        throw new Error(
+          "tls-system-pki requires PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME."
+        );
+      }
+      validateDataPlaneServerName(serverName);
+      if (ca) {
+        throw new Error(
+          "tls-system-pki must not configure PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH or PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM."
+        );
+      }
+      return { mode, serverName };
+    case "plaintext":
+      if (!config.allowPlaintextProduction) {
+        throw new Error(
+          "plaintext requires PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1."
+        );
+      }
+      if (serverName || ca) {
+        throw new Error("plaintext must not configure a TLS server name or private CA.");
+      }
+      return { mode };
+    case "":
+      throw new Error(
+        "PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE is required (tls-private-ca, tls-system-pki, or plaintext)."
+      );
+    default:
+      throw new Error(
+        `PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE must be tls-private-ca, tls-system-pki, or plaintext; got ${mode}.`
+      );
+  }
 }
 
 // resolveRouterTlsMaterial answers the router's TLS cert/key bytes from
@@ -369,7 +609,7 @@ export function resolveRouterTlsMaterial(config: {
   tlsKeyPath?: string;
   tlsCertPem?: string;
   tlsKeyPem?: string;
-}): { cert: Buffer; key: Buffer } | null {
+}): RouterTLSMaterial | null {
   const certPath = normalizeOptionalString(config.tlsCertPath);
   const keyPath = normalizeOptionalString(config.tlsKeyPath);
   const certPem = normalizeOptionalString(config.tlsCertPem);
@@ -385,7 +625,11 @@ export function resolveRouterTlsMaterial(config: {
         "PortableFS data-plane router TLS requires both PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM and PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM."
       );
     }
-    return { cert: Buffer.from(certPem, "utf8"), key: Buffer.from(keyPem, "utf8") };
+    const cert = Buffer.from(certPem, "utf8");
+    const key = Buffer.from(keyPem, "utf8");
+    validateTLSMaterialSize(cert, "router TLS certificate chain");
+    validateTLSMaterialSize(key, "router TLS private key");
+    return { cert, key };
   }
   if (certPath || keyPath) {
     if (!certPath || !keyPath) {
@@ -393,9 +637,239 @@ export function resolveRouterTlsMaterial(config: {
         "PortableFS data-plane router TLS requires both PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH and PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH."
       );
     }
-    return { cert: readFileSync(certPath), key: readFileSync(keyPath) };
+    return {
+      cert: readBoundedFile(certPath, "router TLS certificate chain"),
+      key: readBoundedFile(keyPath, "router TLS private key"),
+    };
   }
   return null;
+}
+
+function readBoundedFile(path: string, label: string): Buffer {
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(MAX_ROUTER_TLS_MATERIAL_BYTES + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = readSync(descriptor, buffer, offset, buffer.length - offset, null);
+      if (count === 0) {
+        break;
+      }
+      offset += count;
+    }
+    const data = Buffer.from(buffer.subarray(0, offset));
+    validateTLSMaterialSize(data, label);
+    return data;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function validateTLSMaterialSize(data: Buffer, label: string): void {
+  if (data.length === 0 || data.length > MAX_ROUTER_TLS_MATERIAL_BYTES) {
+    throw new Error(`${label} must contain 1-${MAX_ROUTER_TLS_MATERIAL_BYTES} bytes.`);
+  }
+}
+
+function parseStrictPrivateKey(data: Buffer) {
+  validateTLSMaterialSize(data, "router TLS private key");
+  const text = data.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(data)) {
+    throw new Error("router TLS private key must be valid UTF-8 PEM.");
+  }
+  const expression =
+    /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----/gu;
+  const matches = [...text.matchAll(expression)];
+  if (
+    matches.length !== 1 ||
+    matches[0]!.index === undefined ||
+    text.slice(0, matches[0]!.index).trim() !== "" ||
+    text.slice(matches[0]!.index! + matches[0]![0].length).trim() !== ""
+  ) {
+    throw new Error(
+      "router TLS private key must contain exactly one unencrypted PRIVATE KEY PEM block and no other data."
+    );
+  }
+  try {
+    return createPrivateKey(matches[0]![0]);
+  } catch (error) {
+    throw new Error(
+      `router TLS private key is invalid: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+// Performs the synchronous portion of the startup proof: exact PEM shape,
+// leaf/private-key agreement, leaf hostname, validity, server EKU, and an
+// ordered, signature-valid served intermediate chain.
+export function validateRouterTLSIdentity(
+  tls: RouterTLSMaterial,
+  transport: Exclude<DataPlaneTransport, { mode: "plaintext" }>
+): void {
+  const certificates = parseStrictCertificatePEM(
+    tls.cert,
+    "router TLS certificate chain",
+    MAX_ROUTER_TLS_MATERIAL_BYTES
+  );
+  const [leaf] = certificates;
+  if (!leaf || leaf.ca) {
+    throw new Error("router TLS certificate chain must begin with one non-CA serving leaf.");
+  }
+  const privateKey = parseStrictPrivateKey(tls.key);
+  if (!leaf.checkPrivateKey(privateKey)) {
+    throw new Error("router TLS private key does not match the serving leaf certificate.");
+  }
+  const nameMatch =
+    isIP(transport.serverName) !== 0
+      ? leaf.checkIP(transport.serverName)
+      : leaf.checkHost(transport.serverName, {
+          // Match Go x509.VerifyHostname: SAN-only, a wildcard must occupy
+          // the complete left-most label, and it matches exactly one label.
+          subject: "never",
+          wildcards: true,
+          partialWildcards: false,
+          multiLabelWildcards: false,
+          singleLabelSubdomains: false,
+        });
+  if (!nameMatch) {
+    throw new Error(
+      `router TLS serving leaf does not match advertised serverName ${transport.serverName}.`
+    );
+  }
+  const now = Date.now();
+  const seen = new Set<string>();
+  for (let index = 0; index < certificates.length; index += 1) {
+    const certificate = certificates[index]!;
+    if (seen.has(certificate.fingerprint256)) {
+      throw new Error(`router TLS certificate chain repeats certificate ${index + 1}.`);
+    }
+    seen.add(certificate.fingerprint256);
+    if (
+      certificate.validFromDate.getTime() > now ||
+      certificate.validToDate.getTime() < now
+    ) {
+      throw new Error(`router TLS certificate ${index + 1} is not currently valid.`);
+    }
+  }
+  for (let index = 0; index < certificates.length - 1; index += 1) {
+    const certificate = certificates[index]!;
+    const issuer = certificates[index + 1];
+    if (
+      issuer &&
+      (!issuer.ca || !certificate.checkIssued(issuer) || !certificate.verify(issuer.publicKey))
+    ) {
+      throw new Error(
+        `router TLS certificate chain is not an ordered signature-valid leaf-to-issuer chain at certificate ${index + 1}.`
+      );
+    }
+  }
+  const serverAuthOID = "1.3.6.1.5.5.7.3.1";
+  const anyExtendedKeyUsageOID = "2.5.29.37.0";
+  if (
+    leaf.keyUsage.length > 0 &&
+    !leaf.keyUsage.includes(serverAuthOID) &&
+    !leaf.keyUsage.includes(anyExtendedKeyUsageOID)
+  ) {
+    throw new Error("router TLS serving leaf is not valid for TLS server authentication.");
+  }
+  // OpenSSL's server context construction is the final synchronous key/cert
+  // parser and algorithm compatibility check used by the actual listener.
+  createSecureContext({ cert: tls.cert, key: tls.key, minVersion: "TLSv1.3" });
+}
+
+// Production awaits this gate before publishing the real router listener.
+// Both TLS modes perform a real local TLS 1.3 handshake through OpenSSL so
+// path constraints, EKU, signatures, validity, and trust anchors are
+// exercised. Private mode uses the exact lease CA; system mode uses Node's
+// current default roots. The latter is a strong local gate, not a claim that
+// every remote Go/Swift platform has an identical root snapshot.
+export async function preflightAuthorityDataPlaneRouterTLS(
+  tls: RouterTLSMaterial | null,
+  transport: DataPlaneTransport
+): Promise<void> {
+  if (transport.mode === "plaintext") {
+    if (tls) {
+      throw new Error("plaintext transport must not configure router TLS certificate material.");
+    }
+    return;
+  }
+  if (!tls) {
+    throw new Error(`${transport.mode} requires router TLS certificate material.`);
+  }
+  validateRouterTLSIdentity(tls, transport);
+  await preflightTLSTrust(tls, transport);
+}
+
+async function preflightTLSTrust(
+  tls: RouterTLSMaterial,
+  transport: Exclude<DataPlaneTransport, { mode: "plaintext" }>
+): Promise<void> {
+  const trustLabel =
+    transport.mode === "tls-private-ca" ? "private-CA" : "system-PKI";
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let client: TLSSocket | undefined;
+    const server = createTlsServer(
+      { cert: tls.cert, key: tls.key, minVersion: "TLSv1.3" },
+      (socket) => socket.end()
+    );
+    const timeout = setTimeout(
+      () => finish(new Error(`router TLS ${trustLabel} preflight timed out.`)),
+      TLS_PREFLIGHT_TIMEOUT_MS
+    );
+    timeout.unref?.();
+
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      client?.destroy();
+      const complete = () =>
+        error
+          ? reject(new Error(`router TLS ${trustLabel} trust preflight failed: ${error.message}`))
+          : resolve();
+      if (server.listening) {
+        server.close(() => complete());
+      } else {
+        complete();
+      }
+    };
+
+    server.once("error", (error) => finish(error));
+    server.once("tlsClientError", (error) => finish(error));
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address() as AddressInfo | null;
+      if (!address) {
+        finish(new Error("preflight listener did not publish an address"));
+        return;
+      }
+      client = connectTLS(
+        {
+          host: "127.0.0.1",
+          port: address.port,
+          ...(isIP(transport.serverName) === 0
+            ? { servername: transport.serverName }
+            : {}),
+          ...(transport.mode === "tls-private-ca"
+            ? {
+                ca: transport.caPem,
+                allowPartialTrustChain: true,
+              }
+            : {}),
+          minVersion: "TLSv1.3",
+          rejectUnauthorized: true,
+          // Exact hostname/IP matching was already proven against the leaf
+          // with X509Certificate.checkHost/checkIP above. Keep this handshake
+          // dedicated to OpenSSL's trust-path and TLS-purpose validation.
+          checkServerIdentity: () => undefined,
+        },
+        () => finish()
+      );
+      client.once("error", (error) => finish(error));
+    });
+  });
 }
 
 export function createAuthorityDataPlaneRouterServer(
@@ -422,7 +896,26 @@ export function createAuthorityDataPlaneRouterServer(
     });
   };
 
-  const tls = resolveRouterTlsMaterial(config);
+  const tls =
+    config.tlsMaterial !== undefined ? config.tlsMaterial : resolveRouterTlsMaterial(config);
+  if (normalizeOptionalString(config.transportMode) || config.dataPlaneTransport) {
+    const transport = config.dataPlaneTransport ?? resolveDataPlaneTransportContract(config);
+    if (
+      normalizeOptionalString(config.transportMode) &&
+      transport.mode !== normalizeOptionalString(config.transportMode)
+    ) {
+      throw new Error("resolved data-plane transport mode does not match router transport mode.");
+    }
+    if (transport.mode === "plaintext" && tls) {
+      throw new Error("plaintext transport must not configure router TLS certificate material.");
+    }
+    if (transport.mode !== "plaintext" && !tls) {
+      throw new Error(`${transport.mode} requires router TLS certificate material.`);
+    }
+    if (transport.mode !== "plaintext" && tls) {
+      validateRouterTLSIdentity(tls, transport);
+    }
+  }
   let server: Server;
   if (tls) {
     server = createTlsServer(
@@ -448,14 +941,27 @@ export function validateAuthorityDataPlaneRouterConfig(args: {
   tlsKeyPath?: string;
   tlsCertPem?: string;
   tlsKeyPem?: string;
+  transportMode?: string;
+  tlsServerName?: string;
+  tlsCaPath?: string;
+  tlsCaPem?: string;
   allowPlaintextProduction?: boolean;
-}): void {
-  if (!normalizeOptionalString(args.listenAddr)) {
+}): DataPlaneTransport {
+  const listenAddr = args.listenAddr;
+  if (!listenAddr || listenAddr.trim() === "") {
     throw new Error("PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR is required.");
   }
-  if (!normalizeOptionalString(args.publicUrl)) {
+  parseAuthorityAddress(listenAddr, {
+    label: "PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR",
+  });
+  const publicUrl = args.publicUrl;
+  if (!publicUrl || publicUrl.trim() === "") {
     throw new Error("PORTABLEFS_AUTHORITY_ROUTER_URL is required.");
   }
+  parseAuthorityAddress(publicUrl, {
+    label: "PORTABLEFS_AUTHORITY_ROUTER_URL",
+    allowedSchemes: ["tcp", "fsproto"],
+  });
   const certPath = Boolean(normalizeOptionalString(args.tlsCertPath));
   const keyPath = Boolean(normalizeOptionalString(args.tlsKeyPath));
   const certPem = Boolean(normalizeOptionalString(args.tlsCertPem));
@@ -476,11 +982,16 @@ export function validateAuthorityDataPlaneRouterConfig(args: {
     );
   }
   const hasTls = certPath || certPem;
-  if (!hasTls && !args.allowPlaintextProduction) {
+  const transport = resolveDataPlaneTransportContract(args);
+  if (transport.mode === "plaintext" && hasTls) {
+    throw new Error("plaintext transport must not configure router TLS certificate material.");
+  }
+  if (transport.mode !== "plaintext" && !hasTls) {
     throw new Error(
-      "Router TLS (PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH/KEY_PATH or PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM/KEY_PEM) is required in production; set PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1 only behind an authenticated private tunnel."
+      `${transport.mode} requires router TLS certificate material (PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH/KEY_PATH or PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM/KEY_PEM).`
     );
   }
+  return transport;
 }
 
 async function handleClient(
@@ -737,12 +1248,7 @@ function readExactly(socket: Socket, byteCount: number, timeoutMs: number): Prom
 }
 
 function parseHostPort(address: string): { host: string; port: number } {
-  const [host, portText] = address.trim().split(":");
-  const port = portText ? Number(portText) : NaN;
-  if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error(`Invalid PortableFS backend address: ${address}`);
-  }
-  return { host, port };
+  return parseAuthorityAddress(address, { label: "PortableFS backend address" });
 }
 
 function timingSafeStringEqual(left: string, right: string): boolean {
