@@ -4,7 +4,7 @@ package pfslocal
 
 const (
 	ProtocolMajor = 1
-	ProtocolMinor = 2
+	ProtocolMinor = 3
 	MaxFrameBytes = 16 << 20
 )
 

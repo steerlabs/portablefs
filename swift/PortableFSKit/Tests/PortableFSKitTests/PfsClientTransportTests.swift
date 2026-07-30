@@ -251,6 +251,62 @@ private actor PfsWrittenRequestIDs {
     _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
+@Test func deferredPublicationNonpublishingContinuationCannotSpanReplacementConnections() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(
+            maxReconnectAttempts: 10,
+            reconnectBaseDelayNanoseconds: 5_000_000
+        )
+    )
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    let (result, complete) = await client.withDeferredPublication {
+        _ = try await client.request(.getAttr(getattr))
+        daemon.dropConnections()
+
+        // Establish replacement connection B from a detached task, which
+        // intentionally does not inherit this callback's task-local
+        // publication collector.
+        try await Task.detached {
+            var lastError: Error = PfsLocalClientError.connectionClosed
+            for _ in 0..<20 {
+                do {
+                    _ = try await client.request(.statfs(PfsStatfsRequest()))
+                    return
+                } catch {
+                    lastError = error
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+            }
+            throw lastError
+        }.value
+
+        // A nonpublishing continuation still belongs to the publication
+        // operation bound to A and must not be issued with operation ID zero
+        // on B.
+        _ = try await client.request(.statfs(PfsStatfsRequest()))
+    }
+    do {
+        try result.get()
+        Issue.record("expected a nonpublishing continuation to fail across reconnect")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .connectionClosed)
+    }
+    await complete()
+
+    let stats = await daemon.stats()
+    #expect(stats.publicationAcks == 0)
+
+    // The replacement connection remains healthy for a new logical operation.
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
+}
+
 private func nextEvent(from stream: AsyncStream<PfsEvent>) async throws -> PfsEvent {
     try await withThrowingTaskGroup(of: PfsEvent?.self) { group in
         group.addTask {
