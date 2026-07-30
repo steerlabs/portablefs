@@ -391,7 +391,7 @@ private actor MockFileSystem {
     private let configuration: PfsLocalMockDaemon.Configuration
     private var nodes: [UInt64: Node] = [:]
     private var handles: [UInt64: UInt64] = [:]
-    private var nextNodeID: UInt64 = 3
+    private var nextNodeID: UInt64 = 2
     private var nextHandle: UInt64 = 1
     private var openRequests = 0
     private var closeRequests = 0
@@ -403,12 +403,12 @@ private actor MockFileSystem {
 
     init(configuration: PfsLocalMockDaemon.Configuration) {
         self.configuration = configuration
-        let root = Node(id: 2, kind: .directory, mode: 0o755, parent: nil)
+        let root = Node(id: 1, kind: .directory, mode: 0o755, parent: nil)
         nodes[root.id] = root
     }
 
     func rootIdentity() -> PfsItemIdentity {
-        PfsItemIdentity(itemID: 2, generation: 1)
+        PfsItemIdentity(itemID: 1, generation: 1)
     }
 
     func stats() -> PfsLocalMockDaemon.Stats {

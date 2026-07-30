@@ -278,7 +278,25 @@ func refreshSamplesSettled(version, generation, afterVersion, afterGeneration ui
 	return afterVersion <= version
 }
 
+// FSKit reserves inode values 0, 1, and 2 for invalid, parent-of-root, and
+// root. The Swift adapter exposes every durable pfslocal item ID through the
+// checked successor mapping (root 1 -> 2), so kernel-side identity proofs must
+// apply the exact same boundary translation.
+func fskitItemID(itemID uint64) (uint64, bool) {
+	if itemID == 0 || itemID == ^uint64(0) {
+		return 0, false
+	}
+	return itemID + 1, true
+}
+
 func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64) (kernelRefreshOutcome, error) {
+	expectedKernelItemID, ok := fskitItemID(rec.item.ItemID)
+	if !ok {
+		return kernelRefreshRetry, fmt.Errorf(
+			"portablefsd: item %d cannot be represented by FSKit",
+			rec.item.ItemID,
+		)
+	}
 	a.mu.Lock()
 	if a.expectedTruncates == nil {
 		a.expectedTruncates = map[string]expectedTruncate{}
@@ -297,7 +315,7 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 	if a.testRefreshKernelFile != nil {
 		refresh = a.testRefreshKernelFile
 	}
-	outcome, err := refresh(mount, p, rec.item.ItemID, size)
+	outcome, err := refresh(mount, p, expectedKernelItemID, size)
 	// ftruncate is synchronous with its FSKit setattr callback. If that
 	// callback did not consume this exact note (for example, the vnode size
 	// already matched and only page invalidation was needed), retire it now;
@@ -621,6 +639,11 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 	}
 	a.frontendGateMu.Lock()
 	a.initFrontendGateLocked()
+	if a.frontendGateErr != nil {
+		err := a.frontendGateErr
+		a.frontendGateMu.Unlock()
+		return err
+	}
 	stopWake := context.AfterFunc(ctx, func() {
 		a.frontendGateMu.Lock()
 		a.frontendGateCond.Broadcast()
@@ -628,6 +651,11 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 	})
 	defer stopWake()
 	for {
+		if a.frontendGateErr != nil {
+			err := a.frontendGateErr
+			a.frontendGateMu.Unlock()
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			a.frontendGateMu.Unlock()
 			return err
@@ -645,14 +673,23 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 		a.frontendGateCond.Wait()
 	}
 	a.frontendHandoffs[scope]++
+	removeHandoff := func() {
+		if a.frontendHandoffs[scope] <= 1 {
+			delete(a.frontendHandoffs, scope)
+		} else {
+			a.frontendHandoffs[scope]--
+		}
+		a.frontendGateCond.Broadcast()
+	}
 	for {
+		if a.frontendGateErr != nil {
+			err := a.frontendGateErr
+			removeHandoff()
+			a.frontendGateMu.Unlock()
+			return err
+		}
 		if err := ctx.Err(); err != nil {
-			if a.frontendHandoffs[scope] <= 1 {
-				delete(a.frontendHandoffs, scope)
-			} else {
-				a.frontendHandoffs[scope]--
-			}
-			a.frontendGateCond.Broadcast()
+			removeHandoff()
 			a.frontendGateMu.Unlock()
 			return err
 		}
@@ -683,6 +720,35 @@ func (a *attach) endFrontendHandoff(scope string) {
 	}
 	a.frontendGateCond.Broadcast()
 	a.frontendGateMu.Unlock()
+}
+
+// frontendRequestPublishes is the Go-side copy of the frozen pfslocal
+// publication classification. These requests may install namespace,
+// metadata, xattr, or content state in a frontend cache and therefore require
+// a logical operation ID and one post-callback acknowledgement.
+func frontendRequestPublishes(body any) bool {
+	switch body.(type) {
+	case *pfslocal.LookupRequest,
+		*pfslocal.EnumerateRequest,
+		*pfslocal.GetAttrRequest,
+		*pfslocal.SetAttrRequest,
+		*pfslocal.ReadRequest,
+		*pfslocal.WriteRequest,
+		*pfslocal.CreateRequest,
+		*pfslocal.MkdirRequest,
+		*pfslocal.RemoveRequest,
+		*pfslocal.RenameRequest,
+		*pfslocal.SymlinkRequest,
+		*pfslocal.ReadlinkRequest,
+		*pfslocal.HardLinkRequest,
+		*pfslocal.XattrGetRequest,
+		*pfslocal.XattrSetRequest,
+		*pfslocal.XattrListRequest,
+		*pfslocal.XattrRemoveRequest:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
@@ -878,6 +944,9 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 	default:
 		// Open/close/fsync/sync/statfs/reclaim/event operations do not
 		// publish namespace, metadata, xattr, or content cache state.
+		if frontendRequestPublishes(body) {
+			return unknown()
+		}
 		return nil, pathEpoch, false
 	}
 }

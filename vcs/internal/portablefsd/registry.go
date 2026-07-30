@@ -288,7 +288,10 @@ func newRegistry(stateDir string) *registry {
 	// are already durable in the journal being replayed).
 	for _, e := range loadBindingJournal(stateDir) {
 		if a := r.byRef[e.Ref]; a != nil {
-			a.applyJournalEntry(e)
+			if err := a.applyJournalEntry(e); err != nil {
+				r.loadErr = fmt.Errorf("replay item identity journal for attach %s: %w", e.Ref, err)
+				return r
+			}
 		}
 	}
 	for _, a := range r.byRef {
@@ -872,6 +875,10 @@ type attach struct {
 	frontendGateCond *sync.Cond
 	frontendActive   map[*frontendOperation]struct{}
 	frontendHandoffs map[string]int
+	// frontendGateErr is the terminal correctness verdict observed by
+	// handoffs while they hold frontendGateMu. It wakes and aborts a handoff
+	// that was already waiting when the attach failed closed.
+	frontendGateErr error
 	// frontendPathEpoch changes whenever an FSItem/handle path binding can
 	// change. Publication operations snapshot it with their resolved aliases;
 	// a mismatch at handoff is conservatively mount-wide, closing the narrow
@@ -1065,6 +1072,14 @@ func newRevivedAttach(
 	a.restoreItemsLocked(items)
 	if a.root == nil {
 		a.root = a.registerLocked("", syntheticRootAttr())
+	}
+	if a.root == nil {
+		a.mu.Unlock()
+		if a.localFS != nil {
+			_ = a.localFS.Close()
+			a.localFS = nil
+		}
+		return nil, fmt.Errorf("restore root item identity is not representable by FSKit")
 	}
 	a.mu.Unlock()
 	return a, nil
@@ -1308,6 +1323,18 @@ func (a *attach) start(ctx context.Context) error {
 		_ = eventClient.Close()
 		_ = vol.Close()
 		return fmt.Errorf("root getattr: status %d", st)
+	}
+	rootItemID := rootAttr.Ino
+	if rootItemID == 0 {
+		rootItemID = clientcore.InoOf("")
+	}
+	if _, ok := fskitItemID(rootItemID); !ok {
+		if openedLocalFS {
+			_ = localFS.Close()
+		}
+		_ = eventClient.Close()
+		_ = vol.Close()
+		return fmt.Errorf("root item identity %d is not representable by FSKit", rootItemID)
 	}
 	a.mu.Lock()
 	if a.detached {
@@ -1624,6 +1651,14 @@ func (a *attach) failCoherence(err error) {
 	if err == nil {
 		return
 	}
+	// Publish the terminal verdict to the handoff gate before waiting for the
+	// frontend proxy exclusively. A handler may hold the proxy for reading
+	// while its handoff waits on the very publication operation whose
+	// disconnect reached this path. Waking that handoff first lets it abort,
+	// remove its scope, and release the read lock; the exclusive fence below
+	// then preserves the existing admitted-handler linearization.
+	gateErr := fmt.Errorf("kernel coherence barrier failed closed: %w", err)
+	a.failFrontendGate(gateErr)
 	// Linearize the terminal fence after every already-admitted frontend
 	// handler and before every later one. Callers reach this point only after
 	// releasing concrete/proxy namespace locks.
@@ -1632,7 +1667,7 @@ func (a *attach) failCoherence(err error) {
 	a.mu.Lock()
 	if !a.coherenceFailFrozen {
 		a.coherenceFailFrozen = true
-		a.lastErr = "kernel coherence barrier failed closed: " + err.Error()
+		a.lastErr = gateErr.Error()
 		a.state = pfslocal.AttachStateDegraded
 		a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{
 			State:  pfslocal.AttachStateDegraded,
@@ -1640,6 +1675,19 @@ func (a *attach) failCoherence(err error) {
 		}})
 	}
 	a.mu.Unlock()
+}
+
+func (a *attach) failFrontendGate(err error) {
+	if err == nil {
+		return
+	}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	if a.frontendGateErr == nil {
+		a.frontendGateErr = err
+	}
+	a.frontendGateCond.Broadcast()
+	a.frontendGateMu.Unlock()
 }
 
 func (a *attach) frontendAdmissionError() error {
@@ -1706,6 +1754,9 @@ func (a *attach) registerLocked(p string, attr fsproto.Attr) *itemRecord {
 	if ino == 0 {
 		ino = clientcore.InoOf(p)
 	}
+	if _, ok := fskitItemID(ino); !ok {
+		return nil
+	}
 	return a.registerWithItemLocked(p, attr, ino, authIno, true, false)
 }
 
@@ -1717,6 +1768,9 @@ func (a *attach) registerCreatedLocked(p string, attr fsproto.Attr) *itemRecord 
 		return a.registerLocked(p, attr)
 	}
 	rec := a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false, false)
+	if rec == nil {
+		return nil
+	}
 	a.awaitingAuthorityItems[rec.item.ItemID] = struct{}{}
 	return rec
 }
@@ -1756,6 +1810,9 @@ func (a *attach) registerWithItemLocked(
 	reuseByItemID bool,
 	graft bool,
 ) *itemRecord {
+	if _, ok := fskitItemID(ino); !ok {
+		return nil
+	}
 	gen := a.identityEpoch
 	if gen == 0 {
 		gen = 1
@@ -2150,6 +2207,7 @@ func (a *attach) failBindingPersistence(err error) {
 		return
 	}
 	a.mu.Lock()
+	var gateErr error
 	if !a.coherenceFailFrozen {
 		a.coherenceFailFrozen = true
 		a.lastErr = "item identity journal failed closed: " + err.Error()
@@ -2158,18 +2216,28 @@ func (a *attach) failBindingPersistence(err error) {
 			State: pfslocal.AttachStateDegraded, Detail: a.lastErr,
 		}})
 	}
+	gateErr = errors.New(a.lastErr)
 	a.mu.Unlock()
+	a.failFrontendGate(gateErr)
 }
 
 // applyJournalEntry replays one binding delta at daemon startup, mirroring
 // restoreItemsLocked's construction and strict persisted-item validation.
-func (a *attach) applyJournalEntry(e bindingJournalEntry) {
+func (a *attach) applyJournalEntry(e bindingJournalEntry) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	switch e.Op {
 	case "bind":
-		if e.ID == 0 || e.Gen == 0 || e.Gen != a.identityEpoch || !validJournalPath(e.Path) {
-			return
+		if _, ok := fskitItemID(e.ID); !ok {
+			return fmt.Errorf("bind has unrepresentable item id %d", e.ID)
+		}
+		if authorityItemID := e.authorityItemID(); authorityItemID != 0 {
+			if _, ok := fskitItemID(authorityItemID); !ok {
+				return fmt.Errorf("bind has unrepresentable authority item id %d", authorityItemID)
+			}
+		}
+		if e.Gen == 0 || e.Gen != a.identityEpoch || !validJournalPath(e.Path) {
+			return nil
 		}
 		if prev := a.paths[e.Path]; prev != nil {
 			// FSKit can remain mounted and reconnect across a portablefsd
@@ -2211,9 +2279,17 @@ func (a *attach) applyJournalEntry(e bindingJournalEntry) {
 	case "unbind":
 		a.dropPathLocked(e.Path)
 	case "detach":
-		if e.ID == 0 || e.Gen == 0 || e.Gen != a.identityEpoch ||
+		if _, ok := fskitItemID(e.ID); !ok {
+			return fmt.Errorf("detach has unrepresentable item id %d", e.ID)
+		}
+		if authorityItemID := e.authorityItemID(); authorityItemID != 0 {
+			if _, ok := fskitItemID(authorityItemID); !ok {
+				return fmt.Errorf("detach has unrepresentable authority item id %d", authorityItemID)
+			}
+		}
+		if e.Gen == 0 || e.Gen != a.identityEpoch ||
 			!validJournalPath(e.Path) || e.Path == "" {
-			return
+			return nil
 		}
 		if prev := a.paths[e.Path]; prev != nil &&
 			prev.item.ItemID == e.ID && prev.item.ItemGeneration == e.Gen {
@@ -2235,16 +2311,20 @@ func (a *attach) applyJournalEntry(e bindingJournalEntry) {
 			a.indexAuthorityIdentityLocked(rec)
 		}
 	case "reclaim":
-		if e.ID == 0 || e.Gen == 0 || e.Gen != a.identityEpoch {
-			return
+		if _, ok := fskitItemID(e.ID); !ok {
+			return fmt.Errorf("reclaim has unrepresentable item id %d", e.ID)
+		}
+		if e.Gen == 0 || e.Gen != a.identityEpoch {
+			return nil
 		}
 		a.reclaimItemLocked(pfslocal.Item{ItemID: e.ID, ItemGeneration: e.Gen})
 	case "rekey":
 		if !validJournalPath(e.From) || !validJournalPath(e.To) {
-			return
+			return nil
 		}
 		a.renamePathLocked(e.From, e.To)
 	}
+	return nil
 }
 
 func (a *attach) newLocalItemIDLocked(p string) uint64 {
@@ -2256,7 +2336,11 @@ func (a *attach) newLocalItemIDLocked(p string) uint64 {
 		} else {
 			id = clientcore.InoOf(fmt.Sprintf("local:%s:%d:%d", p, time.Now().UnixNano(), attempt)) | localItemIDMarker
 		}
-		if id != 0 && a.items[id] == nil {
+		// UInt64.max has no FSKit representation because the platform
+		// boundary reserves one successor value for every pfslocal identity.
+		// Reject it at allocation rather than letting the checked mapping fail
+		// after this identity has been published and persisted.
+		if _, representable := fskitItemID(id); representable && a.items[id] == nil {
 			return id
 		}
 	}
@@ -2264,8 +2348,13 @@ func (a *attach) newLocalItemIDLocked(p string) uint64 {
 
 func (a *attach) restoreItemsLocked(items []persistedItemRecord) {
 	for _, item := range items {
-		if item.ItemID == 0 || item.ItemGeneration == 0 {
+		if _, ok := fskitItemID(item.ItemID); !ok || item.ItemGeneration == 0 {
 			continue
+		}
+		if authorityItemID := item.authorityItemID(); authorityItemID != 0 {
+			if _, ok := fskitItemID(authorityItemID); !ok {
+				continue
+			}
 		}
 		attr := fsproto.Attr{Ino: item.ItemID, Kind: item.Kind}
 		if item.Path == "" {

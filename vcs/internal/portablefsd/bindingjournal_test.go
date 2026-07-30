@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -78,6 +79,34 @@ func TestBindingJournalReplayAcrossRestart(t *testing.T) {
 	}
 	if a.root == nil || a.root.item.ItemID != 1 {
 		t.Fatalf("root binding lost: %+v", a.root)
+	}
+}
+
+func TestUnrepresentableJournalItemBlocksRegistryStartup(t *testing.T) {
+	stateDir := privateTestDir(t)
+	const ref = "att_YYYYYYYYYYYYYYYYYYYYYY"
+	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{{
+		Ref:                ref,
+		VolumeID:           "vol-invalid-journal",
+		Branch:             "main",
+		MountPath:          "/Volumes/InvalidJournal",
+		AuthorityURL:       "127.0.0.1:1",
+		DataPlaneTransport: "plaintext",
+		IdentityEpoch:      7,
+		Items: []persistedItemRecord{{
+			Path: "", ItemID: 1, ItemGeneration: 7, AuthorityIno: true,
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	journal := `{"ref":"` + ref + `","op":"bind","path":"invalid","id":18446744073709551615,"gen":7,"auth":true}` + "\n"
+	if err := os.WriteFile(filepath.Join(stateDir, bindingJournalName), []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := newRegistry(stateDir)
+	t.Cleanup(registry.stopPersister)
+	if registry.loadErr == nil || !strings.Contains(registry.loadErr.Error(), "unrepresentable item id") {
+		t.Fatalf("load error = %v, want unrepresentable journal refusal", registry.loadErr)
 	}
 }
 

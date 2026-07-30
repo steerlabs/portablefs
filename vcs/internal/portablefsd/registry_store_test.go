@@ -60,6 +60,70 @@ func TestAttachRegistryPersistsItemIdentities(t *testing.T) {
 	}
 }
 
+func TestPersistedUnrepresentableItemBlocksRegistryStartup(t *testing.T) {
+	stateDir := privateTestDir(t)
+	invalid := persistedAttachEntry{
+		Ref:                "att_XXXXXXXXXXXXXXXXXXXXXX",
+		VolumeID:           "vol-invalid-item",
+		Branch:             "main",
+		MountPath:          "/Volumes/InvalidItem",
+		AuthorityURL:       "127.0.0.1:1",
+		DataPlaneTransport: "plaintext",
+		IdentityEpoch:      7,
+		Items: []persistedItemRecord{{
+			Path: "", ItemID: ^uint64(0), ItemGeneration: 7, AuthorityIno: true,
+		}},
+	}
+	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{invalid}); err == nil {
+		t.Fatal("persistence accepted an unrepresentable item")
+	}
+	body := []byte(`{
+	  "version": 2,
+	  "attaches": [{
+	    "ref": "att_XXXXXXXXXXXXXXXXXXXXXX",
+	    "volumeId": "vol-invalid-item",
+	    "branch": "main",
+	    "mountPath": "/Volumes/InvalidItem",
+	    "authorityUrl": "127.0.0.1:1",
+	    "dataPlaneTransport": "plaintext",
+	    "options": {},
+	    "identityEpoch": 7,
+	    "items": [{
+	      "path": "",
+	      "itemId": 18446744073709551615,
+	      "itemGeneration": 7,
+	      "authorityIno": true
+	    }]
+	  }]
+	}`)
+	if err := privatepath.WriteFileAtomic(attachRegistryPath(stateDir), body); err != nil {
+		t.Fatal(err)
+	}
+	registry := newRegistry(stateDir)
+	t.Cleanup(registry.stopPersister)
+	if registry.loadErr == nil || !strings.Contains(registry.loadErr.Error(), "unrepresentable itemId") {
+		t.Fatalf("load error = %v, want unrepresentable item refusal", registry.loadErr)
+	}
+}
+
+func TestRuntimeRegistrationRejectsUnrepresentableAuthorityItem(t *testing.T) {
+	a := newAttach("att_runtime_item", "key", ensureAttachRequest{
+		VolumeID: "vol-runtime-item", Branch: "main", MountPath: "/Volumes/RuntimeItem",
+		AuthorityURL:       "127.0.0.1:1",
+		DataPlaneTransport: "plaintext",
+	}, privateTestDir(t))
+	valid := a.registerLocked("same", fsproto.Attr{Ino: 41, Kind: "file", Size: 3})
+	if valid == nil {
+		t.Fatal("valid item registration failed")
+	}
+	if got := a.registerLocked("same", fsproto.Attr{Ino: ^uint64(0), Kind: "file", Size: 9}); got != nil {
+		t.Fatalf("unrepresentable item registered: %+v", got)
+	}
+	if got := a.paths["same"]; got != valid || got.attr.Size != 3 {
+		t.Fatalf("rejected registration mutated existing identity: %+v", got)
+	}
+}
+
 func TestAttachRegistryPreservesPromotedAuthorityIdentity(t *testing.T) {
 	stateDir := privateTestDir(t)
 	entry := persistedAttachEntry{

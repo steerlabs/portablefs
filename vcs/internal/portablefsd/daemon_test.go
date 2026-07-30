@@ -276,12 +276,19 @@ func currentTestProtocol(body any) any {
 	return &copy
 }
 
+func testOperationID(body any, requestID uint64) uint64 {
+	if frontendRequestPublishes(body) {
+		return requestID
+	}
+	return 0
+}
+
 func (c *pfsTestClient) call(body any) any {
 	c.t.Helper()
 	body = currentTestProtocol(body)
 	c.next++
 	id := c.next
-	operationID := id
+	operationID := testOperationID(body, id)
 	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
 		RequestID: id, OperationID: operationID, Body: body,
 	}); err != nil {
@@ -317,7 +324,7 @@ func (c *pfsTestClient) callMaybe(body any) (any, *pfslocal.ErrorReply) {
 	body = currentTestProtocol(body)
 	c.next++
 	id := c.next
-	operationID := id
+	operationID := testOperationID(body, id)
 	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
 		RequestID: id, OperationID: operationID, Body: body,
 	}); err != nil {
@@ -360,7 +367,7 @@ func (c *pfsTestClient) callErr(body any) *pfslocal.ErrorReply {
 	body = currentTestProtocol(body)
 	c.next++
 	id := c.next
-	operationID := id
+	operationID := testOperationID(body, id)
 	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
 		RequestID: id, OperationID: operationID, Body: body,
 	}); err != nil {
@@ -872,7 +879,7 @@ func TestFrontendSignalsOnlyPublicationRepliesAndKeepsConnectionOpen(t *testing.
 	request := func(body any) *pfslocal.Envelope {
 		t.Helper()
 		c.next++
-		operationID := c.next
+		operationID := testOperationID(body, c.next)
 		if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
 			RequestID:   c.next,
 			OperationID: operationID,
@@ -944,6 +951,31 @@ func TestFrontendRejectsMalformedRequestAndPublicationSequences(t *testing.T) {
 			Body:      &pfslocal.PublicationAck{OperationID: 1},
 		}); err != nil {
 			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("protocol minor 2", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		hello := &pfslocal.Envelope{
+			RequestID: 1,
+			Body: &pfslocal.Hello{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: 2,
+				ClientName:    "old-operation-contract-test",
+			},
+		}
+		if err := pfslocal.WriteFrame(conn, hello); err != nil {
+			t.Fatal(err)
+		}
+		reply := readPFSReply(t, conn, hello.RequestID)
+		if protocolErr, ok := reply.Body.(*pfslocal.ErrorReply); !ok ||
+			protocolErr.Errno != darwinEINVAL {
+			t.Fatalf("minor-2 hello reply = %#v", reply.Body)
 		}
 		expectPFSConnectionClosed(t, conn)
 	})
@@ -1040,6 +1072,77 @@ func TestFrontendRejectsMalformedRequestAndPublicationSequences(t *testing.T) {
 		_ = readPFSReply(t, conn, 2)
 		resolve.RequestID = 3
 		if err := pfslocal.WriteFrame(conn, resolve); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("fresh nonpublishing operation id", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		hello := &pfslocal.Envelope{
+			RequestID: 1,
+			Body: &pfslocal.Hello{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: pfslocal.ProtocolMinor,
+				ClientName:    "operation-sequence-test",
+			},
+		}
+		if err := pfslocal.WriteFrame(conn, hello); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, hello.RequestID)
+		resolve := &pfslocal.Envelope{
+			RequestID: 2,
+			Body:      &pfslocal.ResolveRequest{AttachRef: ref},
+		}
+		if err := pfslocal.WriteFrame(conn, resolve); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, resolve.RequestID)
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID:   3,
+			OperationID: 1,
+			Body:        &pfslocal.StatfsRequest{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expectPFSConnectionClosed(t, conn)
+	})
+
+	t.Run("publishing request without operation id", func(t *testing.T) {
+		conn, err := net.Dial("unix", cfg.FrontendSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		hello := &pfslocal.Envelope{
+			RequestID: 1,
+			Body: &pfslocal.Hello{
+				ProtocolMajor: pfslocal.ProtocolMajor,
+				ProtocolMinor: pfslocal.ProtocolMinor,
+				ClientName:    "missing-operation-id-test",
+			},
+		}
+		if err := pfslocal.WriteFrame(conn, hello); err != nil {
+			t.Fatal(err)
+		}
+		_ = readPFSReply(t, conn, hello.RequestID)
+		resolve := &pfslocal.Envelope{
+			RequestID: 2,
+			Body:      &pfslocal.ResolveRequest{AttachRef: ref},
+		}
+		if err := pfslocal.WriteFrame(conn, resolve); err != nil {
+			t.Fatal(err)
+		}
+		root := readPFSReply(t, conn, resolve.RequestID).Body.(*pfslocal.ResolveReply).Root
+		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{
+			RequestID: 3,
+			Body:      &pfslocal.GetAttrRequest{Item: root},
+		}); err != nil {
 			t.Fatal(err)
 		}
 		expectPFSConnectionClosed(t, conn)

@@ -196,8 +196,19 @@ func InoOf(path string) uint64 {
 	}
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(path))
-	if v := h.Sum64(); v > 1 {
+	return usableFallbackIno(h.Sum64())
+}
+
+func usableFallbackIno(v uint64) uint64 {
+	if v > 1 && v != ^uint64(0) {
 		return v
+	}
+	// PortableFS exposes raw item IDs through FSKit's checked successor
+	// mapping. UInt64.max has no successor and therefore cannot be a durable
+	// frontend identity, even when an authority needs the legacy path-hash
+	// fallback.
+	if v == ^uint64(0) {
+		return ^uint64(0) - 1
 	}
 	return 2
 }

@@ -427,12 +427,24 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		attr, st = vol.Create(r.Context(), p, 0o644)
 		if st == fsproto.OK {
 			a.mu.Lock()
-			a.registerCreatedLocked(p, attr)
+			created := a.registerCreatedLocked(p, attr)
 			a.mu.Unlock()
+			if created == nil {
+				writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
+				return
+			}
 		}
 	}
 	if st != fsproto.OK {
 		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write", toDarwinErr(st)))
+		return
+	}
+	candidateItemID := attr.Ino
+	if candidateItemID == 0 {
+		candidateItemID = clientcore.InoOf(p)
+	}
+	if _, ok := fskitItemID(candidateItemID); !ok {
+		writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
 		return
 	}
 	n := clientcore.NewNodeState(attr.Ino, attr.Ino != 0)
@@ -456,7 +468,13 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		attr = fresh
 	}
 	a.mu.Lock()
-	refreshItemID := a.registerLocked(p, attr).item.ItemID
+	rec := a.registerLocked(p, attr)
+	if rec == nil {
+		a.mu.Unlock()
+		writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
+		return
+	}
+	refreshItemID := rec.item.ItemID
 	if !existed {
 		a.publishNamespaceInvalidationLocked(p, 0, 0)
 	}
