@@ -542,6 +542,22 @@ func (fs *FS) commitEntry(tree *wal.Record, controls []pfc2.Record, owner string
 // error, e.g. a reap whose no-pin condition no longer holds). A nil tree with
 // no controls from build is rejected exactly like the static path.
 func (fs *FS) commitEntryDynamicTree(tree *wal.Record, build func() ([]pfc2.Record, error), owner string) (entryOutcome, error) {
+	return fs.commitEntryDynamicTreePre(tree, build, owner, nil)
+}
+
+// commitEntryDynamicTreePre is commitEntryDynamicTree with one additional
+// reservation-order admission decision. pre runs under fs.mu before the tree
+// intent is prepared. Returning reject=true replaces the tree row with the
+// supplied control-only decision in this same reservation. This is the
+// atomic boundary used by delegated write-through admission: a mutation is
+// ordered either before a concurrently reserving delegation, or as an exact
+// EAGAIN after it; it can never be admitted beneath the grant.
+func (fs *FS) commitEntryDynamicTreePre(
+	tree *wal.Record,
+	build func() ([]pfc2.Record, error),
+	owner string,
+	pre func() (controls []pfc2.Record, reject bool, err error),
+) (entryOutcome, error) {
 	if fs.managed == nil {
 		return entryOutcome{}, ErrNotManaged
 	}
@@ -580,6 +596,22 @@ func (fs *FS) commitEntryDynamicTree(tree *wal.Record, build func() ([]pfc2.Reco
 	// a rejected duplicate/conflicting row must not consume identities.
 	allocBefore := fs.alloc
 	restoreAlloc := func() { fs.alloc = allocBefore }
+	var (
+		controls   []pfc2.Record
+		rejectTree bool
+	)
+	if pre != nil {
+		var preErr error
+		controls, rejectTree, preErr = pre()
+		if preErr != nil {
+			restoreAlloc()
+			fs.mu.Unlock()
+			return entryOutcome{}, preErr
+		}
+		if rejectTree {
+			records = nil
+		}
+	}
 	if records != nil {
 		if err := fs.prepareIntentLocked(records, time.Now().UnixMilli()); err != nil {
 			restoreAlloc()
@@ -589,13 +621,16 @@ func (fs *FS) commitEntryDynamicTree(tree *wal.Record, build func() ([]pfc2.Reco
 	}
 	// The row's controls are decided HERE, under fs.mu, so precondition
 	// checks (existence, pin state, next epoch) are atomic with staging.
-	controls, buildErr := build()
-	if buildErr != nil {
-		restoreAlloc()
-		fs.mu.Unlock()
-		return entryOutcome{}, buildErr
+	if !rejectTree {
+		var buildErr error
+		controls, buildErr = build()
+		if buildErr != nil {
+			restoreAlloc()
+			fs.mu.Unlock()
+			return entryOutcome{}, buildErr
+		}
 	}
-	if tree == nil && len(controls) == 0 {
+	if records == nil && len(controls) == 0 {
 		restoreAlloc()
 		fs.mu.Unlock()
 		return entryOutcome{}, invalidMutation("managed entry carries neither tree nor controls")

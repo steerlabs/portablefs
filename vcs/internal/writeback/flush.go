@@ -65,7 +65,7 @@ type flusher struct {
 	appliedDigest [32]byte
 	oldestAt      time.Time
 	urgent        bool
-	waiters       []drainWaiter
+	waiters       []*drainWaiter
 
 	backoff     time.Duration
 	nextAttempt time.Time
@@ -104,6 +104,13 @@ func (f *flusher) stop() {
 	case <-f.stopCh:
 	default:
 		close(f.stopCh)
+	}
+	f.mu.Lock()
+	waiters := f.waiters
+	f.waiters = nil
+	f.mu.Unlock()
+	for _, waiter := range waiters {
+		waiter.ch <- ErrFenced
 	}
 	f.wg.Wait()
 }
@@ -185,7 +192,7 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 	// A barrier tries NOW: the backoff schedule protects steady state, not
 	// an explicit durability request after a transient failure.
 	f.nextAttempt = time.Time{}
-	w := drainWaiter{target: target, ch: make(chan error, 1)}
+	w := &drainWaiter{target: target, ch: make(chan error, 1)}
 	f.waiters = append(f.waiters, w)
 	f.mu.Unlock()
 	f.kick()
@@ -193,6 +200,14 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 	case err := <-w.ch:
 		return err
 	case <-ctx.Done():
+		f.mu.Lock()
+		for i, waiter := range f.waiters {
+			if waiter == w {
+				f.waiters = append(f.waiters[:i], f.waiters[i+1:]...)
+				break
+			}
+		}
+		f.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -322,7 +337,7 @@ func (f *flusher) sendBatch() {
 	ctx, cancel := context.WithTimeout(e.ctx, flushAttemptTimeout)
 	reply, err := e.remote.Flush(ctx, FlushRequest{
 		WritebackID: e.writebackID,
-		PrevDigest: prevDigest, EndDigest: batch[len(batch)-1].digest,
+		PrevDigest:  prevDigest, EndDigest: batch[len(batch)-1].digest,
 		Records: records, ScopeRuns: scopeRuns,
 	})
 	cancel()
@@ -383,7 +398,7 @@ func (f *flusher) advance(through uint64) {
 	}
 	f.backoff = 0
 	f.nextAttempt = time.Time{}
-	var ready []drainWaiter
+	var ready []*drainWaiter
 	kept := f.waiters[:0]
 	for _, wtr := range f.waiters {
 		if wtr.target <= f.applied {
@@ -467,7 +482,9 @@ func (e *Engine) markStreamDead(err error) {
 			continue
 		}
 		d.drainErr = dead
-		closeReleaseSignal(d.done)
+		if d.attempt != nil {
+			d.attempt.complete(dead)
+		}
 	}
 	e.mu.Unlock()
 }

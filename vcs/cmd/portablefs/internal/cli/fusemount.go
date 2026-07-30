@@ -371,7 +371,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, 
 	if cn, ok := ch.Operations().(*fuseNode); ok {
 		// Count the just-opened handle so a peer unlink parks the inode
 		// (delete-on-last-close) instead of breaking the fresh fd.
-		if n.v.RegisterOpened(cp, cn.state) == fsproto.ENOENT {
+		if n.v.RegisterOpened(ctx, cp, cn.state) == fsproto.ENOENT {
 			return nil, nil, 0, syscall.ENOENT
 		}
 	}

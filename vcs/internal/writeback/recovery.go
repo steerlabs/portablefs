@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -306,11 +307,19 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		return fmt.Errorf("%w: persist recovery registry: %v", errRetryable, err)
 	}
 
+	certThrough, certDigest, err := highestAppliedCertificate(marks, scan.lastSeq)
+	if err != nil {
+		js.update(func(j *RecoveryJob) {
+			j.State = JobCorrupt
+			j.LastError = err.Error()
+		})
+		return err
+	}
 	ss, err := e.remote.StreamState(ctx, wbID)
 	if err != nil {
 		return fmt.Errorf("%w: stream state: %v", errRetryable, err)
 	}
-	through := uint64(0)
+	through := certThrough
 	if ss.Exists {
 		through = ss.Through
 	}
@@ -328,6 +337,13 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			j.LastError = err.Error()
 		})
 		return err
+	}
+	if !ss.Exists && localDigest != certDigest {
+		js.update(func(j *RecoveryJob) {
+			j.State = JobCorrupt
+			j.LastError = "local applied certificate does not match the retained stream"
+		})
+		return errors.New("local applied certificate mismatch")
 	}
 	if ss.Exists && localDigest != ss.Digest {
 		js.update(func(j *RecoveryJob) {
@@ -363,11 +379,49 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		})
 		return errors.New("tail without delegation")
 	}
-	reply, err := e.remote.Rebind(ctx, wbID, scopes, through, localDigest)
-	if err != nil {
-		return fmt.Errorf("%w: rebind: %v", errRetryable, err)
-	}
-	if len(reply.Conflicts) > 0 {
+	// A previous attach may have been terminalized while one resolved
+	// recovery flush was already executing at the authority. If that flush
+	// commits between our StreamState read and Rebind, the authority correctly
+	// rejects the stale digest. Re-read and accept only a strict forward
+	// watermark whose digest is provable from this WAL, then retry Rebind with
+	// a fresh exact identity. A stationary/missing/divergent state remains a
+	// real typed conflict.
+	for {
+		reply, err := e.remote.Rebind(ctx, wbID, scopes, through, localDigest)
+		if err != nil {
+			return fmt.Errorf("%w: rebind: %v", errRetryable, err)
+		}
+		if len(reply.Conflicts) == 0 {
+			break
+		}
+		digestOnly := true
+		for _, conflict := range reply.Conflicts {
+			if conflict.Kind != "DIGEST_MISMATCH" {
+				digestOnly = false
+				break
+			}
+		}
+		if digestOnly {
+			next, stateErr := e.remote.StreamState(ctx, wbID)
+			if stateErr != nil {
+				return fmt.Errorf("%w: refresh stream state after rebind race: %v", errRetryable, stateErr)
+			}
+			if next.Exists && next.Through > through && next.Through <= scan.lastSeq {
+				nextDigest, digestErr := digestAt(scan, marks, next.Through)
+				if digestErr != nil {
+					js.update(func(j *RecoveryJob) {
+						j.State = JobCorrupt
+						j.LastError = digestErr.Error()
+					})
+					return digestErr
+				}
+				if nextDigest == next.Digest {
+					through = next.Through
+					localDigest = nextDigest
+					continue
+				}
+			}
+		}
 		js.update(func(j *RecoveryJob) {
 			j.State = JobConflict
 			j.LastError = "recovery scopes moved on the authority"
@@ -378,7 +432,14 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 
 	// Drain the dense tail as mixed-scope batches, chaining the digest
 	// forward. Every run names the exact rebound grant authorizing it.
+	tail = tail[:0]
+	for _, m := range mutations {
+		if m.seq > through {
+			tail = append(tail, m)
+		}
+	}
 	prev := localDigest
+	finalThrough := through
 	i := 0
 	for i < len(tail) {
 		var records []wal.Record
@@ -416,7 +477,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 				})
 			}
 		}
-		reply, err := e.remote.Flush(ctx, FlushRequest{
+		reply, err := e.remote.FlushResolved(ctx, FlushRequest{
 			WritebackID: wbID, PrevDigest: prev, EndDigest: end,
 			Records: records, ScopeRuns: scopeRuns,
 		})
@@ -441,6 +502,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			return errors.New("recovery flush watermark short of batch end")
 		}
 		prev = end
+		finalThrough = reply.Through
 		i = j
 		if err := js.updateDebounced(func(jb *RecoveryJob) {
 			jb.AppliedThrough = reply.Through
@@ -449,14 +511,33 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			return fmt.Errorf("%w: persist recovery progress: %v", errRetryable, err)
 		}
 	}
+	if finalThrough != scan.lastSeq {
+		err := fmt.Errorf("%w: recovery drain ended at %d before WAL tail %d", ErrCorrupt, finalThrough, scan.lastSeq)
+		js.update(func(j *RecoveryJob) {
+			j.State = JobCorrupt
+			j.LastError = err.Error()
+		})
+		return err
+	}
+	// Make every rebound scope locally final in ONE durable append before
+	// sending the first Checkin. A crash or failure after any subset of the
+	// sequential authority releases then recovers from an empty local live
+	// projection and the exact applied certificate, sweeping whichever
+	// recovery grants remain instead of trying to rebind already-released
+	// scopes.
+	if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, prev, scopes); err != nil {
+		return fmt.Errorf("%w: persist recovery release certificate: %v", errRetryable, err)
+	}
 	for _, sc := range scopes {
 		if err := e.remote.ReleaseDelegation(ctx, sc.Scope, sc.Epoch); err != nil {
 			return fmt.Errorf("%w: release %q: %v", errRetryable, sc.Scope, err)
 		}
 	}
-	// Sweep any grant still bound to this stream that never reached a local
-	// DELEGATION frame (a crash between the authority's journal row and the
-	// client's append): it admitted nothing, so discarding it is lossless.
+	// Sweep any grant still bound to this stream but absent from the local
+	// live projection. This covers both an acquire that crashed before its
+	// DELEGATION frame and a fully-drained release whose local RELEASE frame
+	// was synced before Checkin. Neither shape can carry an unshipped tail,
+	// so discarding the authority remainder is lossless and idempotent.
 	if err := e.remote.Discard(ctx, wbID, nil); err != nil {
 		return fmt.Errorf("%w: discard stream remainder: %v", errRetryable, err)
 	}
@@ -513,6 +594,107 @@ func removeStreamDir(dir string) error {
 		return err
 	}
 	return fsyncDir(filepath.Dir(dir))
+}
+
+// appendRecoveryReleaseCertificate appends APPLIED followed by every RELEASE
+// to the already-scanned final segment with one physical WriteAt and one sync.
+// The store lock guarantees the scanned tail has no concurrent writer.
+func appendRecoveryReleaseCertificate(
+	dir string,
+	scan *streamScan,
+	through uint64,
+	digest [32]byte,
+	scopes []RebindScope,
+) error {
+	if scan == nil || through != scan.lastSeq || len(scopes) == 0 {
+		return errors.New("writeback: invalid recovery release certificate")
+	}
+	path, frameNo, end, err := abandonedStreamTail(&abandonedStream{dir: dir, scan: scan})
+	if err != nil {
+		return err
+	}
+	appliedPayload, err := json.Marshal(appliedFrame{
+		Through: through,
+		Digest:  fmt.Sprintf("%x", digest),
+	})
+	if err != nil {
+		return err
+	}
+	body := encodeFrame(nil, frameApplied, frameNo+1, 0, appliedPayload)
+	frameNo++
+	for _, scope := range scopes {
+		if scope.Scope == "" || scope.Epoch == "" {
+			return errors.New("writeback: invalid recovery release scope")
+		}
+		payload, err := json.Marshal(delegationFrame{Scope: scope.Scope, Epoch: scope.Epoch})
+		if err != nil {
+			return err
+		}
+		body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
+		frameNo++
+	}
+	active, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	n, writeErr := active.WriteAt(body, end)
+	if writeErr == nil && n != len(body) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
+		if n > 0 {
+			_ = active.Truncate(end)
+		}
+		_ = active.Close()
+		return fmt.Errorf("append recovery release certificate: %w", writeErr)
+	}
+	if err := active.Sync(); err != nil {
+		_ = active.Close()
+		return fmt.Errorf("sync recovery release certificate: %w", err)
+	}
+	if err := active.Close(); err != nil {
+		return fmt.Errorf("close recovery release certificate: %w", err)
+	}
+	return nil
+}
+
+// highestAppliedCertificate selects the newest durable local authority
+// acknowledgement. Concurrent release workers may append an older snapshot
+// after a newer checkpoint, so physical frame order does not imply watermark
+// order. Two different digests for the same watermark remain corruption.
+func highestAppliedCertificate(marks []appliedFrame, lastSeq uint64) (uint64, [32]byte, error) {
+	through := uint64(0)
+	digest := digestZero()
+	seen := map[uint64][32]byte{0: digest}
+	for _, mark := range marks {
+		raw, err := hex.DecodeString(mark.Digest)
+		if err != nil || len(raw) != len(digest) {
+			return 0, digestZero(), fmt.Errorf("%w: applied checkpoint digest malformed", ErrCorrupt)
+		}
+		var next [32]byte
+		copy(next[:], raw)
+		if mark.Through > lastSeq {
+			return 0, digestZero(), fmt.Errorf(
+				"%w: applied checkpoint %d is past local tail %d",
+				ErrCorrupt, mark.Through, lastSeq,
+			)
+		}
+		if prior, ok := seen[mark.Through]; ok {
+			if next != prior {
+				return 0, digestZero(), fmt.Errorf(
+					"%w: conflicting applied digests at watermark %d",
+					ErrCorrupt, mark.Through,
+				)
+			}
+			continue
+		}
+		seen[mark.Through] = next
+		if mark.Through > through {
+			through = mark.Through
+			digest = next
+		}
+	}
+	return through, digest, nil
 }
 
 // digestAt reconstructs the stream digest at seq from the retained frames

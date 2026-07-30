@@ -703,7 +703,7 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
 	a.flushBindingDelta()
-	if st := vol.RegisterOpened(p, rec.state); st != fsproto.OK {
+	if st := vol.RegisterOpened(ctx, p, rec.state); st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()

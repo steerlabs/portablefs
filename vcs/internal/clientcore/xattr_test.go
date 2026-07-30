@@ -13,7 +13,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
-// noDelegatedXattrFeatureFS models a v7 authority without delegated-xattr
+// noDelegatedXattrFeatureFS models a v8 authority without delegated-xattr
 // flushes were advertised. Embedding preserves the managed coordination
 // surface while the explicit false feature marker keeps xattrs on the exact
 // authority lane.
@@ -218,7 +218,7 @@ func TestVolumeXattrWriteBackLocalThenFsync(t *testing.T) {
 }
 
 // TestXattrFeatureNegotiationSelectsAuthorityLane proves a new client remains
-// compatible with a v7 authority that does not advertise delegated-xattr flushes. The
+// compatible with a v8 authority that does not advertise delegated-xattr flushes. The
 // version probe selects the authority lane before Setxattr: the current grant
 // is drained, no failed fast-path operation occurs, and the mutation is
 // immediately visible to a peer.

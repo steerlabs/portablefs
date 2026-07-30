@@ -14,7 +14,7 @@ func TestPerfOptionsFromEnv(t *testing.T) {
 		return func(key string) string { return values[key] }
 	}
 
-	// Default: the v7 baseline — write-back is adaptive (no mount mode), the
+	// Default: the v8 baseline — write-back is adaptive (no mount mode), the
 	// negative cache is capability-auto (neither force flag set).
 	p := perfOptionsFromEnv(env(nil))
 	if p.negativeCache || p.negativeCacheOff {

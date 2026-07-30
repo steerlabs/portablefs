@@ -1,14 +1,14 @@
 # vcs — Volume Cache Service (live mount)
 
 The VCS serves a PortableFS volume as the live filesystem authority over one data
-plane: fsproto v7, the custom protocol spoken by the product FUSE/FSKit mounts.
+plane: fsproto v8, the custom protocol spoken by the product FUSE/FSKit mounts.
 Every mutation rides a journaled exact session; durability and coordination are
 the fenced PostgreSQL journal's.
 
 Built and verified so far:
 
 - **One mount path** — the product mount (`portablefs mount`: FSKit on macOS,
-  FUSE on Linux) over `internal/fsproto` (protocol v5). The bench harness mounts
+  FUSE on Linux) over `internal/fsproto` (protocol v8). The bench harness mounts
   the same protocol via `bench/cmd/benchmount`.
 - **Local-cache reads + push invalidation (FUSE)** — the FUSE client caches file data in
   the kernel page cache (hot reads are **local-speed, ~GB/s**), while the VCS — the single
@@ -76,7 +76,7 @@ internal/lifecycle    fenced idempotent admin operations + the graceful eviction
 internal/hapolicy     the structured journal HA policy (canonical hash shared with the TS manager)
 internal/secure       TLS configs + data-plane/admin tokens (opt-in via env)
 internal/metrics      dependency-free counters/gauges/latency-histograms registry
-internal/fsproto      the v5 protocol: exact sessions, journaled coordination, push invalidations
+internal/fsproto      the v8 protocol: exact sessions, journaled coordination, push invalidations
 internal/treehash     Go port of the canonical tree hash (byte-identical to TS)
 internal/authority    held exclusive lease (single writer) + commit + failover acquire
 ```
@@ -138,7 +138,7 @@ listeners; the managed child serves loopback only.
 
 The product mount is the CLI: `portablefs mount <volume>` (FSKit on macOS, FUSE
 on Linux — see the top-level docs). It resolves the volume's endpoint through
-the manager's access-lease API and speaks fsproto v7.
+the manager's access-lease API and speaks fsproto v8.
 
 For benchmarking against a plain authority address (no control plane), the
 bench harness's raw FUSE mount is `bench/cmd/benchmount`:
@@ -158,7 +158,7 @@ go -C vcs test -race ./...    # race-clean
 VOLUME_API_URL=... VOLUME_API_TOKEN=... [VCS_E2E_VOLUME_ID=vol_... VCS_E2E_BIG_SHA=...] go -C vcs test ./...
 ```
 
-The suite drives fsproto v7 end-to-end in-process (exact sessions, journaled
+The suite drives fsproto v8 end-to-end in-process (exact sessions, journaled
 coordination, write-back flushes, failover replay), plus multi-client coherence
 and the managed parity suite. The tree hash is cross-checked against the TS
 implementation (`internal/treehash` golden + `.volume-cache/treehash-crosscheck.mjs`).

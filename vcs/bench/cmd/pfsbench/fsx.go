@@ -224,7 +224,7 @@ func (c *coreFS) Create(p string) (benchFile, error) {
 		return nil, fmt.Errorf("create %s: status %d", p, st)
 	}
 	n := clientcore.NewNodeState(nodeIno(p, a.Ino), a.Ino != 0)
-	if st := v.RegisterOpened(p, n); st != fsproto.OK {
+	if st := v.RegisterOpened(ctx, p, n); st != fsproto.OK {
 		return nil, fmt.Errorf("register-open %s: status %d", p, st)
 	}
 	return &coreFile{fs: c, path: p, n: n}, nil

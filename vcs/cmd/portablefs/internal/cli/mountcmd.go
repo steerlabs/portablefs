@@ -82,7 +82,7 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 // the local group-sync; fsync forces local sync and authority durability.
 type perfOptions struct {
 	// negativeCache forces the negative dentry cache on; negativeCacheOff
-	// forces it off. Neither (the default) keeps the v7 baseline: on.
+	// forces it off. Neither (the default) keeps the v8 baseline: on.
 	negativeCache    bool
 	negativeCacheOff bool
 	// writebackDir is the engine's durable state directory, keyed by

@@ -320,25 +320,93 @@ func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeInten
 	}
 	defer v.endMutation()
 
-	v.opens.Inc(path, n)
-	if st := v.incOpen(path, n); st != fsproto.OK {
+	released, err := v.opens.Inc(ctx, path, n)
+	if err != nil {
+		return fsproto.EIO
+	}
+	if released && (n == nil || n.AuthorityIno() == 0) {
+		if st := v.resolveOpenAfterHandoff(path, n); st != fsproto.OK {
+			v.rollbackTrackedOpen(path, n)
+			return st
+		}
+		v.opens.FinishInc(path, n, true, n != nil)
+		return fsproto.OK
+	}
+	st, registered := v.incOpen(path, n)
+	if st != fsproto.OK {
 		v.rollbackTrackedOpen(path, n)
 		return st
 	}
+	v.opens.FinishInc(path, n, true, registered)
 	return fsproto.OK
 }
 
-func (v *Volume) RegisterOpened(path string, n *NodeState) Status {
+func (v *Volume) RegisterOpened(ctx context.Context, path string, n *NodeState) Status {
 	if err := v.beginMutation(); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
 
-	v.opens.Inc(path, n)
-	if st := v.incOpen(path, n); st != fsproto.OK {
+	released, err := v.opens.Inc(ctx, path, n)
+	if err != nil {
+		return fsproto.EIO
+	}
+	if released && (n == nil || n.AuthorityIno() == 0) {
+		if st := v.resolveOpenAfterHandoff(path, n); st != fsproto.OK {
+			v.rollbackTrackedOpen(path, n)
+			return st
+		}
+		v.opens.FinishInc(path, n, true, n != nil)
+		return fsproto.OK
+	}
+	st, registered := v.incOpen(path, n)
+	if st != fsproto.OK {
 		v.rollbackTrackedOpen(path, n)
 		return st
 	}
+	v.opens.FinishInc(path, n, true, registered)
+	return fsproto.OK
+}
+
+// resolveOpenAfterHandoff closes the barrier wake-up race: this owner was
+// blocked before it could join the delegated snapshot, but the authority has
+// now accepted the release. Resolve and pin the shared-mode inode before the
+// open becomes visible to the caller.
+func (v *Volume) resolveOpenAfterHandoff(path string, n *NodeState) Status {
+	a, _, _, _, st, err := v.client.GetattrV(path)
+	if err != nil {
+		return fsproto.EIO
+	}
+	if st != fsproto.OK {
+		return st
+	}
+	if a.Ino == 0 {
+		return fsproto.EIO
+	}
+	if st := v.openReg.Open(path, a.Ino); st != fsproto.OK {
+		return st
+	}
+	if n == nil {
+		installed, ok := v.opens.InstallOrJoinAnonymousPin(path, a.Ino)
+		if !ok {
+			v.openReg.Close(path, a.Ino, true)
+			return fsproto.EIO
+		}
+		if !installed {
+			// One boolean authority pin covers every anonymous handle owned by
+			// this path. Drop the per-open ref acquired above; the tracker will
+			// retire its shared ref atomically with the final close.
+			v.openReg.Close(path, a.Ino, false)
+		}
+		return fsproto.OK
+	}
+	if !n.RecordAuthorityIno(a.Ino) {
+		v.openReg.Close(path, a.Ino, true)
+		return fsproto.EIO
+	}
+	n.mu.Lock()
+	n.nopen++
+	n.mu.Unlock()
 	return fsproto.OK
 }
 
@@ -348,9 +416,9 @@ func (v *Volume) RegisterOpened(path string, n *NodeState) Status {
 // registration, and re-opens of a registered (live or retained) inode cost
 // nothing. Any registration failure propagates to the caller: an open may
 // return only after the authority has confirmed its inode hold.
-func (v *Volume) incOpen(path string, n *NodeState) Status {
+func (v *Volume) incOpen(path string, n *NodeState) (Status, bool) {
 	if n == nil {
-		return fsproto.OK
+		return fsproto.OK, false
 	}
 	n.mu.Lock()
 	n.nopen++
@@ -360,28 +428,22 @@ func (v *Volume) incOpen(path string, n *NodeState) Status {
 			n.mu.Lock()
 			n.nopen--
 			n.mu.Unlock()
-			return st
+			return st, false
 		}
+		return fsproto.OK, true
 	}
-	return fsproto.OK
+	return fsproto.OK, false
 }
 
 func (v *Volume) rollbackTrackedOpen(path string, n *NodeState) {
-	owner := openOwnerFor(path, n)
-	remaining, _, _ := v.opens.Dec(path, n)
+	remaining, pin, pinned := v.opens.FinishInc(path, n, false, false)
 	if remaining != 0 {
 		return
 	}
 	// Delegation release may have observed the tracker reservation while
 	// incOpen was waiting on registration. If the open ultimately fails,
 	// return that release-time pin because no CloseHandle will follow.
-	v.releasePinMu.Lock()
-	pin, ok := v.releasePins[owner]
-	if ok {
-		delete(v.releasePins, owner)
-	}
-	v.releasePinMu.Unlock()
-	if ok {
+	if pinned {
 		v.openReg.Close(pin.path, pin.ino, n != nil && n.Orphan() != 0)
 	}
 }
@@ -392,36 +454,31 @@ func (v *Volume) CloseHandle(path string, n *NodeState) Status {
 	}
 	defer v.endMutation()
 
+	v.openStateMu.Lock()
 	if currentPath, found := v.opens.CurrentPath(path, n); found {
 		path = currentPath
 	}
-	owner := openOwnerFor(path, n)
-	remaining, currentPath, found := v.opens.Dec(path, n)
+	remaining, currentPath, found, closeRegistered, pin, pinned := v.opens.Dec(path, n)
 	if found {
 		// Re-read under the decrement lock in case a concurrent rename won
 		// after the pre-barrier lookup.
 		path = currentPath
 	}
-	orphaned := v.closeOne(path, n)
+	orphaned := v.closeOne(path, n, closeRegistered)
 	if remaining == 0 {
 		// Last local handle owned by this NodeState: retire any
 		// delegation-release pin
 		// through the standard registry flows (retained when the file still
 		// exists; unmarked when it was orphaned, so the reap proceeds).
-		v.releasePinMu.Lock()
-		pin, ok := v.releasePins[owner]
-		if ok {
-			delete(v.releasePins, owner)
-		}
-		v.releasePinMu.Unlock()
-		if ok {
+		if pinned {
 			v.openReg.Close(pin.path, pin.ino, orphaned)
 		}
 	}
+	v.openStateMu.Unlock()
 	return fsproto.OK
 }
 
-func (v *Volume) closeOne(path string, n *NodeState) bool {
+func (v *Volume) closeOne(path string, n *NodeState, closeRegistered bool) bool {
 	if n == nil {
 		return false
 	}
@@ -438,17 +495,19 @@ func (v *Volume) closeOne(path string, n *NodeState) bool {
 		orphanIno = n.orphanIno
 		n.orphanIno = 0
 	}
+	if hadOpen && closeRegistered {
+		if fino := n.AuthorityIno(); fino != 0 {
+			// Publish the NodeState count and registry ref transition as one
+			// per-inode critical section. ReleaseNameChange takes this same
+			// node lock before deciding destroy-vs-orphan, so it can never
+			// observe nopen==0 while the closing ref still looks live. Close
+			// is local-only here; any unmark it queues runs asynchronously.
+			v.openReg.Close(path, fino, orphaned)
+		}
+	}
 	n.mu.Unlock()
 	if orphanIno != 0 {
 		v.openOrphans.Remove(orphanIno)
-	}
-	if hadOpen {
-		if fino := n.AuthorityIno(); fino != 0 {
-			// Every successful Open owns one registry ref. An orphaned
-			// inode's final transition is discarded; a live zero-ref entry
-			// is retained for RPC-free re-opens.
-			v.openReg.Close(path, fino, orphaned)
-		}
 	}
 	return orphaned
 }
@@ -581,8 +640,13 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			}
 			return cnt, st
 		}
-		res, handled, werr := v.wb.WriteAt(ctx, path, off, data)
+		// Never retain the node lock while write-back admission may wait for a
+		// delegation release. Open-pin protection reads the same orphan state
+		// during that release; holding n.mu here would make the writer wait for
+		// the release while the release waits for the writer. If admission
+		// falls through, the shared lane rechecks orphan state below.
 		n.mu.Unlock()
+		res, handled, werr := v.wb.WriteAt(ctx, path, off, data)
 		if handled {
 			if werr != nil {
 				v.debug("Write engine %q off=%d: %v", path, off, werr)
@@ -659,8 +723,10 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			}
 			return cnt, st
 		}
-		res, handled, werr := v.wb.WriteAppend(ctx, path, data)
+		// See Write: delegation admission can wait for open-pin protection,
+		// which must be able to inspect this NodeState.
 		n.mu.Unlock()
+		res, handled, werr := v.wb.WriteAppend(ctx, path, data)
 		if handled {
 			if werr != nil {
 				v.debug("WriteAppend engine %q: %v", path, werr)
@@ -888,6 +954,30 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 			}
 			return st
 		}
+		if child.nopen == 0 {
+			// ReleaseFor deliberately leaves closes responsive while it
+			// prepares open pins. Re-decide under the target NodeState lock:
+			// either a racing close already won, in which case its prepared
+			// or retained hold must be synchronously unmarked before Remove,
+			// or a later close waits and the explicit orphan arm above owns
+			// the inode. Only this inode is serialized across the matching
+			// authority mutation.
+			v.openReg.ReleaseNameChange(path, child.AuthorityIno())
+			st, err := v.client.Remove(path)
+			child.mu.Unlock()
+			if err != nil {
+				return fsproto.EIO
+			}
+			v.recent.record(path)
+			if st == fsproto.OK {
+				dir, _ := splitPath(path)
+				v.AttrCache.Evict(dir)
+				v.evictDirCache(dir)
+				v.invalidateRelatedInodes([]uint64{child.AuthorityIno()}, path)
+				v.hardlinks.removePath(path)
+			}
+			return st
+		}
 		child.mu.Unlock()
 	}
 	st, err := v.client.Remove(path)
@@ -960,7 +1050,9 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 				return statusErr(err)
 			}
 		} else if !openDst {
-			res, handled, err := v.wb.Rename(ctx, oldp, newp)
+			res, handled, err := v.wb.Rename(ctx, oldp, newp, func() {
+				v.noteOpenRename(oldp, newp, src, dst)
+			})
 			if handled {
 				_ = res
 				if err != nil {
@@ -968,7 +1060,6 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 				}
 				v.recent.record(oldp, newp)
 				v.evictRename(oldp, newp)
-				v.noteOpenRename(oldp, newp, src, dst)
 				return fsproto.OK
 			}
 			if err != nil {
@@ -1001,6 +1092,26 @@ func (v *Volume) renameWriteThrough(oldp, newp string, src, dst *NodeState) Stat
 			v.recent.record(oldp, newp)
 			return st
 		}
+		if dst.nopen == 0 {
+			// A destination close can race the delegation prepare while
+			// remaining responsive. Serialize its final state decision and
+			// the matching authority rename on the two participating
+			// NodeStates. A close that already won is synchronously unmarked;
+			// a close that arrives later waits and the open-destination arm
+			// above provides explicit orphan semantics.
+			v.openReg.ReleaseNameChange(newp, dst.AuthorityIno())
+			st, _, err := v.client.RenameWithOrphanTarget(oldp, newp, false)
+			unlockTwo(src, dst)
+			if err != nil {
+				return fsproto.EIO
+			}
+			if st == fsproto.OK {
+				v.evictRename(oldp, newp)
+				v.noteOpenRename(oldp, newp, src, dst)
+			}
+			v.recent.record(oldp, newp)
+			return st
+		}
 		unlockTwo(src, dst)
 	}
 	st, _, err := v.client.RenameWithOrphanTarget(oldp, newp, false)
@@ -1016,38 +1127,13 @@ func (v *Volume) renameWriteThrough(oldp, newp string, src, dst *NodeState) Stat
 }
 
 func (v *Volume) noteOpenRename(oldPath, newPath string, src, dst *NodeState) {
-	if dst != nil && dst != src {
-		v.opens.Unname(dst)
+	v.openStateMu.Lock()
+	defer v.openStateMu.Unlock()
+	if dst == src {
+		dst = nil
 	}
-	v.opens.RekeyPrefix(oldPath, newPath)
-	v.rekeyReleasePins(oldPath, newPath)
+	v.opens.ApplyRename(oldPath, newPath, dst)
 	v.openReg.NotePathMoved(oldPath, newPath)
-}
-
-func (v *Volume) rekeyReleasePins(oldPath, newPath string) {
-	v.releasePinMu.Lock()
-	defer v.releasePinMu.Unlock()
-	type move struct {
-		owner openOwner
-		pin   releasePin
-	}
-	var moves []move
-	for owner, pin := range v.releasePins {
-		moved, ok := rekeyPathPrefix(pin.path, oldPath, newPath)
-		if !ok {
-			continue
-		}
-		pin.path = moved
-		moves = append(moves, move{owner: owner, pin: pin})
-	}
-	for _, move := range moves {
-		owner := move.owner
-		if owner.node == nil {
-			delete(v.releasePins, owner)
-			owner = openOwnerFor(move.pin.path, nil)
-		}
-		v.releasePins[owner] = move.pin
-	}
 }
 
 func (v *Volume) evictRename(oldp, newp string) {

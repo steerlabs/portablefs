@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -118,8 +119,206 @@ func TestClientEstablishesExactSessionOnFirstMutation(t *testing.T) {
 	}
 }
 
+func TestResolvedRecoveryMutatorsReplayLostReplies(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "recovery-resolved")
+	if _, st, err := cli.Mkdir("w", 0o755); err != nil || st != OK {
+		t.Fatalf("mkdir: status=%d err=%v", st, err)
+	}
+	grant, err := cli.DelegationAcquire("w", "wb-recovery-resolved")
+	if err != nil || !grant.Granted {
+		t.Fatalf("delegation acquire: grant=%+v err=%v", grant, err)
+	}
+
+	records := []wal.Record{
+		{Seq: 1, Op: wal.OpCreate, Path: "w/file", Mode: 0o644},
+		{Seq: 2, Op: wal.OpWrite, Path: "w/file", Data: []byte("resolved")},
+	}
+	prev := wbZeroDigest()
+	end := wbTestDigest(t, prev, records)
+	scopes := []WBScope{{Path: "w", Epoch: grant.Epoch, Through: 2}}
+	const losses = int32(3)
+	var droppedFlush, droppedDiscard atomic.Int32
+	setFailFast := func(target *Client) {
+		target.health.mu.Lock()
+		target.health.engaged = true
+		// Keep this deterministic: the resolved operation itself must be the
+		// real probe that recovers reachability, not the background prober.
+		target.health.onEngage = nil
+		target.health.mu.Unlock()
+	}
+	engageFailFast := func(target *Client) {
+		setFailFast(target)
+		if !target.FailFast() {
+			t.Fatal("failed to engage test reachability gate")
+		}
+	}
+	dropFirst := func(counter *atomic.Int32) bool {
+		for {
+			n := counter.Load()
+			if n >= losses {
+				return false
+			}
+			if counter.CompareAndSwap(n, n+1) {
+				return true
+			}
+		}
+	}
+	var activeResolver atomic.Pointer[Client]
+	h.setDrop(func(req *Request, _ *Response) bool {
+		dropped := false
+		switch req.Op {
+		case OpFlushBatch:
+			dropped = dropFirst(&droppedFlush)
+		case OpWritebackDiscard:
+			dropped = dropFirst(&droppedDiscard)
+		}
+		if dropped {
+			// Re-engage after every lost reply, including mid-resolution. The
+			// next identical retry must retain its explicit real-attempt path;
+			// an ordinary fail-fast-gated roundtrip would deadlock here.
+			if target := activeResolver.Load(); target != nil {
+				setFailFast(target)
+			}
+		}
+		return dropped
+	})
+
+	activeResolver.Store(cli)
+	engageFailFast(cli)
+	through, st, err := cli.FlushWritebackResolved(
+		"wb-recovery-resolved", scopes, prev, end, records,
+	)
+	if err != nil || st != OK || through != 2 {
+		t.Fatalf("resolved recovery flush: through=%d status=%d err=%v", through, st, err)
+	}
+	if cli.FailFast() {
+		t.Fatal("successful resolved flush did not clear fail-fast")
+	}
+	// Discard is a recovery operation: crash the holder without SessionExpire,
+	// then let a fresh recovery session fence it and discard the stream.
+	if err := cli.Abort(); err != nil {
+		t.Fatalf("abort original holder: %v", err)
+	}
+	recovery := dialExact(t, h.addr, "recovery-resolved-2")
+	if _, err := recovery.EnsureExactSession(); err != nil {
+		t.Fatalf("establish recovery session: %v", err)
+	}
+	activeResolver.Store(recovery)
+	engageFailFast(recovery)
+	if err := recovery.WritebackDiscard("wb-recovery-resolved", nil); err != nil {
+		t.Fatalf("resolved recovery discard: %v", err)
+	}
+	if recovery.FailFast() {
+		t.Fatal("successful resolved discard did not clear fail-fast")
+	}
+	if got := droppedFlush.Load(); got != losses {
+		t.Fatalf("dropped flush replies = %d, want %d", got, losses)
+	}
+	if got := droppedDiscard.Load(); got != losses {
+		t.Fatalf("dropped discard replies = %d, want %d", got, losses)
+	}
+	if grants := h.fs.ManagedDelegationsOverlapping("w"); len(grants) != 0 {
+		t.Fatalf("resolved discard left grants: %+v", grants)
+	}
+	data, _, _, status, err := recovery.ReadV("w/file", 0, 32)
+	if err != nil || status != OK || string(data) != "resolved" {
+		t.Fatalf("resolved flush content: data=%q status=%d err=%v", data, status, err)
+	}
+}
+
+// A recovery attach can read watermark N immediately before a prior,
+// possibly-sent flush commits N+1. Its first Rebind must reject with
+// DIGEST_MISMATCH. If that rejection reply is lost, exact replay has only the
+// frozen EIO outcome; the authority must re-audit the hash-identical request
+// against applied state and return the same typed proof so recovery refreshes
+// the watermark instead of manufacturing a terminal scope conflict.
+func TestWritebackRebindLostDigestReplyRetainsTypedConflict(t *testing.T) {
+	h := serveExact(t)
+	holder := dialExact(t, h.addr, "late-flush-holder")
+	if _, st, err := holder.Mkdir("w", 0o755); err != nil || st != OK {
+		t.Fatalf("mkdir: status=%d err=%v", st, err)
+	}
+	grant, err := holder.DelegationAcquire("w", "wb-late-flush")
+	if err != nil || !grant.Granted {
+		t.Fatalf("delegation acquire: grant=%+v err=%v", grant, err)
+	}
+
+	initial := []wal.Record{
+		{Seq: 1, Op: wal.OpCreate, Path: "w/file", Mode: 0o644},
+		{Seq: 2, Op: wal.OpWrite, Path: "w/file", Data: []byte("before")},
+	}
+	zero := wbZeroDigest()
+	atTwo := wbTestDigest(t, zero, initial)
+	if through, st, err := holder.FlushWriteback(
+		"wb-late-flush",
+		[]WBScope{{Path: "w", Epoch: grant.Epoch, Through: 2}},
+		zero,
+		atTwo,
+		initial,
+	); err != nil || st != OK || through != 2 {
+		t.Fatalf("initial flush: through=%d status=%d err=%v", through, st, err)
+	}
+
+	recovery := dialExact(t, h.addr, "late-flush-recovery")
+	if _, err := recovery.EnsureExactSession(); err != nil {
+		t.Fatalf("recovery session: %v", err)
+	}
+	exists, through, observed, err := recovery.WritebackState("wb-late-flush")
+	if err != nil || !exists || through != 2 || observed != atTwo {
+		t.Fatalf("first stream state: exists=%v through=%d digest=%x err=%v", exists, through, observed, err)
+	}
+
+	// The earlier holder's possibly-sent batch lands after recovery's read but
+	// before its first Rebind.
+	late := []wal.Record{
+		{Seq: 3, Op: wal.OpWrite, Path: "w/file", Offset: 6, Data: []byte("-late")},
+	}
+	atThree := wbTestDigest(t, atTwo, late)
+	if got, st, err := holder.FlushWriteback(
+		"wb-late-flush",
+		[]WBScope{{Path: "w", Epoch: grant.Epoch, Through: 3}},
+		atTwo,
+		atThree,
+		late,
+	); err != nil || st != OK || got != 3 {
+		t.Fatalf("late prior flush: through=%d status=%d err=%v", got, st, err)
+	}
+
+	var dropped atomic.Bool
+	h.setDrop(func(req *Request, resp *Response) bool {
+		return req.Op == OpWritebackRebind &&
+			resp.Status == EIO &&
+			dropped.CompareAndSwap(false, true)
+	})
+	scopes := []WBScope{{Path: "w", Epoch: grant.Epoch}}
+	conflicts, err := recovery.WritebackRebind("wb-late-flush", scopes, through, observed)
+	if err != nil {
+		t.Fatalf("lost rejected Rebind reply did not resolve: %v", err)
+	}
+	if !dropped.Load() {
+		t.Fatal("test seam did not drop the first rejected Rebind reply")
+	}
+	if len(conflicts) == 0 || conflicts[0].Kind != "DIGEST_MISMATCH" {
+		t.Fatalf("replayed typed conflicts = %+v, want DIGEST_MISMATCH", conflicts)
+	}
+	for _, conflict := range conflicts {
+		if conflict.Kind == "SCOPE_MISSING" {
+			t.Fatalf("replayed digest conflict was substituted with scope loss: %+v", conflicts)
+		}
+	}
+
+	exists, through, observed, err = recovery.WritebackState("wb-late-flush")
+	if err != nil || !exists || through != 3 || observed != atThree {
+		t.Fatalf("refreshed stream state: exists=%v through=%d digest=%x err=%v", exists, through, observed, err)
+	}
+	if conflicts, err = recovery.WritebackRebind("wb-late-flush", scopes, through, observed); err != nil || len(conflicts) != 0 {
+		t.Fatalf("reconciled Rebind: conflicts=%+v err=%v", conflicts, err)
+	}
+}
+
 // TestClientRefusesSessionlessAuthorityMutations: a reads-only server (no
-// session store) answers the v7 probe but refuses session opens; the client
+// session store) answers the v8 probe but refuses session opens; the client
 // surfaces that as a mutation error instead of downgrading to any legacy
 // write path. Reads still flow.
 func TestClientRefusesSessionlessAuthorityMutations(t *testing.T) {
@@ -222,6 +421,72 @@ func TestClientParksUnknownOutcomeAndReplaysIdentically(t *testing.T) {
 	}
 	if data, st, _ := cli.Read("f", 0, 64); st != OK || string(data) != "xy" {
 		t.Fatalf("file = %q (st=%d), want xy (each identity exactly once)", data, st)
+	}
+}
+
+func TestExactPreflightRejectDoesNotParkIdentity(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "M-preflight")
+	cli.SetExactSlots(1)
+	if _, st, err := cli.Create("seed", 0o644); err != nil || st != OK {
+		t.Fatalf("create seed: status=%d err=%v", st, err)
+	}
+
+	start := time.Now()
+	_, _, err := cli.Create(strings.Repeat("p", maxRequestTextBytes+1), 0o644)
+	if !errors.Is(err, errMalformedRequest) {
+		t.Fatalf("oversize exact request error = %v, want errMalformedRequest", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("local exact preflight took %v, want prompt rejection", elapsed)
+	}
+
+	// With one slot, a misclassified send would park the only identity and this
+	// fresh mutation would block until opTimeout. A provably-unsent rejection
+	// aborts the slot without advancing it, so reuse succeeds immediately.
+	done := make(chan error, 1)
+	go func() {
+		_, st, err := cli.Create("after-preflight", 0o644)
+		if err == nil && st != OK {
+			err = statusError("create after preflight", st)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fresh mutation after preflight reject: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = cli.Abort()
+		t.Fatal("preflight rejection parked the only exact identity")
+	}
+}
+
+func TestResolvedPreparePreflightRejectReturnsPromptly(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "M-prepare-preflight")
+	if _, err := cli.EnsureExactSession(); err != nil {
+		t.Fatalf("exact session: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cli.PrepareDelegationRelease(
+			"scope",
+			"epoch",
+			[]string{strings.Repeat("p", MaxPathBytes+1)},
+		)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errMalformedRequest) {
+			t.Fatalf("malformed resolved prepare error = %v, want errMalformedRequest", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = cli.Abort()
+		t.Fatal("malformed resolved prepare retried a provably-unsent request")
 	}
 }
 
