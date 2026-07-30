@@ -84,7 +84,7 @@ public enum PfsFSKitMapping {
         attributes.gid = attr.gid
         attributes.mode = attr.mode
         attributes.type = itemType(from: attr.kind)
-        attributes.linkCount = attr.nlink == 0 ? 1 : attr.nlink
+        attributes.linkCount = attr.nlink
         attributes.size = attr.size
         attributes.allocSize = attr.size
         attributes.fileID = try itemIdentifier(from: attr.item.itemID)

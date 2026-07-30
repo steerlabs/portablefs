@@ -7,6 +7,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var openRequests: Int
         public var closeRequests: Int
         public var activeHandles: Int
+        public var readRequests: Int
+        public var writeRequests: Int
         public var enumerateRequests: Int
         public var getAttrRequests: Int
         public var maxReadLength: UInt32
@@ -21,6 +23,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var branch: String
         public var lookupDelaysNanoseconds: [String: UInt64]
         public var lookupNoReplyNames: Set<String>
+        public var strictItemNamespace: Bool
 
         public init(
             attachRef: String = "mock",
@@ -28,7 +31,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             volumeName: String = "PortableFS Mock",
             branch: String = "main",
             lookupDelaysNanoseconds: [String: UInt64] = [:],
-            lookupNoReplyNames: Set<String> = []
+            lookupNoReplyNames: Set<String> = [],
+            strictItemNamespace: Bool = false
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -36,6 +40,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.branch = branch
             self.lookupDelaysNanoseconds = lookupDelaysNanoseconds
             self.lookupNoReplyNames = lookupNoReplyNames
+            self.strictItemNamespace = strictItemNamespace
         }
     }
 
@@ -91,6 +96,40 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         for session in sessionSnapshot() {
             session.close()
         }
+    }
+
+    /// Causes the next daemon close request to fail before releasing its
+    /// handle. Lifecycle tests use this to verify confirmed-close ownership.
+    public func failNextClose() async {
+        await fileSystem.failNextClose()
+    }
+
+    /// Causes the next close to consume its handle and report a terminal errno,
+    /// matching a local descriptor whose close syscall failed after retirement.
+    public func retireNextCloseWithError(errno: Int32 = EIO) async {
+        await fileSystem.retireNextCloseWithError(errno: errno)
+    }
+
+    /// Retires the next close handle, remembers its exact outcome for replay,
+    /// then closes that client connection before sending the reply.
+    public func loseNextRetiredCloseReply(errno: Int32 = 0) async {
+        await fileSystem.loseNextRetiredCloseReply(errno: errno)
+    }
+
+    public func delayNextOpen(nanoseconds: UInt64) async {
+        await fileSystem.delayNextOpen(nanoseconds: nanoseconds)
+    }
+
+    public func delayNextClose(nanoseconds: UInt64) async {
+        await fileSystem.delayNextClose(nanoseconds: nanoseconds)
+    }
+
+    public func delayNextRead(nanoseconds: UInt64) async {
+        await fileSystem.delayNextRead(nanoseconds: nanoseconds)
+    }
+
+    public func delayNextWrite(nanoseconds: UInt64) async {
+        await fileSystem.delayNextWrite(nanoseconds: nanoseconds)
     }
 
     public func emitInvalidation(
@@ -395,11 +434,21 @@ private actor MockFileSystem {
     private var nextHandle: UInt64 = 1
     private var openRequests = 0
     private var closeRequests = 0
+    private var readRequests = 0
+    private var writeRequests = 0
     private var enumerateRequests = 0
     private var getAttrRequests = 0
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
     private var publicationAcks = 0
+    private var pendingCloseFailures = 0
+    private var pendingRetiredCloseErrnos: [Int32] = []
+    private var pendingLostRetiredCloseErrnos: [Int32] = []
+    private var retiredCloseReplies: [UInt64: PfsCloseReply] = [:]
+    private var pendingOpenDelaysNanoseconds: [UInt64] = []
+    private var pendingCloseDelaysNanoseconds: [UInt64] = []
+    private var pendingReadDelaysNanoseconds: [UInt64] = []
+    private var pendingWriteDelaysNanoseconds: [UInt64] = []
 
     init(configuration: PfsLocalMockDaemon.Configuration) {
         self.configuration = configuration
@@ -416,6 +465,8 @@ private actor MockFileSystem {
             openRequests: openRequests,
             closeRequests: closeRequests,
             activeHandles: handles.count,
+            readRequests: readRequests,
+            writeRequests: writeRequests,
             enumerateRequests: enumerateRequests,
             getAttrRequests: getAttrRequests,
             maxReadLength: maxReadLength,
@@ -427,11 +478,41 @@ private actor MockFileSystem {
     func resetStats() {
         openRequests = 0
         closeRequests = 0
+        readRequests = 0
+        writeRequests = 0
         enumerateRequests = 0
         getAttrRequests = 0
         maxReadLength = 0
         maxWriteLength = 0
         publicationAcks = 0
+    }
+
+    func failNextClose() {
+        pendingCloseFailures += 1
+    }
+
+    func retireNextCloseWithError(errno: Int32) {
+        pendingRetiredCloseErrnos.append(errno)
+    }
+
+    func loseNextRetiredCloseReply(errno: Int32) {
+        pendingLostRetiredCloseErrnos.append(errno)
+    }
+
+    func delayNextOpen(nanoseconds: UInt64) {
+        pendingOpenDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func delayNextClose(nanoseconds: UInt64) {
+        pendingCloseDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func delayNextRead(nanoseconds: UInt64) {
+        pendingReadDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func delayNextWrite(nanoseconds: UInt64) {
+        pendingWriteDelaysNanoseconds.append(nanoseconds)
     }
 
     func handle(_ envelope: PfsEnvelope, session: MockSession) async -> PfsEnvelope {
@@ -528,10 +609,10 @@ private actor MockFileSystem {
             case let .getAttr(request):
                 getAttrRequests += 1
                 var response = PfsGetAttrReply()
-                response.attr = attr(for: try node(for: request.item))
+                response.attr = attr(for: try node(for: request.item, handle: request.handle))
                 reply.body = .getAttrReply(response)
             case let .setAttr(request):
-                let node = try node(for: request.item)
+                let node = try node(for: request.item, handle: request.handle)
                 if request.hasMode { node.mode = request.mode }
                 if request.hasUid { node.uid = request.uid }
                 if request.hasGid { node.gid = request.gid }
@@ -543,22 +624,56 @@ private actor MockFileSystem {
                 response.attr = attr(for: node)
                 reply.body = .setAttrReply(response)
             case let .open(request):
-                _ = try node(for: request.item)
+                _ = try namespaceNode(for: request.item)
                 openRequests += 1
                 let handle = nextHandle
                 nextHandle += 1
                 handles[handle] = request.item.itemID
+                if !pendingOpenDelaysNanoseconds.isEmpty {
+                    let delay = pendingOpenDelaysNanoseconds.removeFirst()
+                    try await Task.sleep(nanoseconds: delay)
+                }
                 var response = PfsOpenReply()
                 response.handle = handle
                 reply.body = .openReply(response)
             case let .close(request):
                 closeRequests += 1
-                if let nodeID = handles.removeValue(forKey: request.handle) {
-                    reapIfUnlinked(nodeID: nodeID)
+                if !pendingCloseDelaysNanoseconds.isEmpty {
+                    let delay = pendingCloseDelaysNanoseconds.removeFirst()
+                    try await Task.sleep(nanoseconds: delay)
                 }
-                reply.body = .closeReply(PfsCloseReply())
+                if pendingCloseFailures > 0 {
+                    pendingCloseFailures -= 1
+                    throw MockPOSIXError(errno: EIO, message: "injected close failure")
+                }
+                if let response = retiredCloseReplies[request.handle] {
+                    reply.body = .closeReply(response)
+                    break
+                }
+                guard let nodeID = handles.removeValue(forKey: request.handle) else {
+                    throw MockPOSIXError(errno: EINVAL, message: "unknown handle")
+                }
+                reapIfUnlinked(nodeID: nodeID)
+                var response = PfsCloseReply()
+                response.retired = true
+                let loseReply = !pendingLostRetiredCloseErrnos.isEmpty
+                if loseReply {
+                    response.closeErrno = pendingLostRetiredCloseErrnos.removeFirst()
+                } else if !pendingRetiredCloseErrnos.isEmpty {
+                    response.closeErrno = pendingRetiredCloseErrnos.removeFirst()
+                }
+                retiredCloseReplies[request.handle] = response
+                reply.body = .closeReply(response)
+                if loseReply {
+                    session.close()
+                }
             case let .read(request):
+                readRequests += 1
                 maxReadLength = max(maxReadLength, request.length)
+                if !pendingReadDelaysNanoseconds.isEmpty {
+                    let delay = pendingReadDelaysNanoseconds.removeFirst()
+                    try await Task.sleep(nanoseconds: delay)
+                }
                 let node = try node(forHandle: request.handle)
                 let offset = min(Int(request.offset), node.data.count)
                 let end = min(node.data.count, offset + Int(request.length))
@@ -566,7 +681,12 @@ private actor MockFileSystem {
                 response.data = node.data.subdata(in: offset..<end)
                 reply.body = .readReply(response)
             case let .write(request):
+                writeRequests += 1
                 maxWriteLength = max(maxWriteLength, request.data.count)
+                if !pendingWriteDelaysNanoseconds.isEmpty {
+                    let delay = pendingWriteDelaysNanoseconds.removeFirst()
+                    try await Task.sleep(nanoseconds: delay)
+                }
                 let node = try node(forHandle: request.handle)
                 write(node: node, offset: Int(request.offset), data: request.data)
                 var response = PfsWriteReply()
@@ -676,7 +796,7 @@ private actor MockFileSystem {
                 response.attr = attr(for: item)
                 reply.body = .hardLinkReply(response)
             case let .xattrGet(request):
-                let node = try node(for: request.item)
+                let node = try node(for: request.item, handle: request.handle)
                 guard let value = node.xattrs[request.name] else {
                     throw MockPOSIXError(errno: ENOATTR, message: "xattr not found")
                 }
@@ -684,7 +804,7 @@ private actor MockFileSystem {
                 response.value = value
                 reply.body = .xattrGetReply(response)
             case let .xattrSet(request):
-                let node = try node(for: request.item)
+                let node = try node(for: request.item, handle: request.handle)
                 let exists = node.xattrs[request.name] != nil
                 if request.createOnly && exists {
                     throw MockPOSIXError(errno: EEXIST, message: "xattr exists")
@@ -695,12 +815,12 @@ private actor MockFileSystem {
                 node.xattrs[request.name] = request.value
                 reply.body = .xattrSetReply(PfsXattrSetReply())
             case let .xattrList(request):
-                let node = try node(for: request.item)
+                let node = try node(for: request.item, handle: request.handle)
                 var response = PfsXattrListReply()
                 response.names = node.xattrs.keys.sorted()
                 reply.body = .xattrListReply(response)
             case let .xattrRemove(request):
-                let node = try node(for: request.item)
+                let node = try node(for: request.item, handle: request.handle)
                 guard node.xattrs.removeValue(forKey: request.name) != nil else {
                     throw MockPOSIXError(errno: ENOATTR, message: "xattr missing")
                 }
@@ -753,6 +873,25 @@ private actor MockFileSystem {
     private func node(for item: PfsItem) throws -> Node {
         guard let node = nodes[item.itemID], node.generation == item.itemGeneration else {
             throw MockPOSIXError(errno: ESTALE, message: "stale item")
+        }
+        return node
+    }
+
+    private func node(for item: PfsItem, handle: UInt64) throws -> Node {
+        guard handle != 0 else {
+            return try namespaceNode(for: item)
+        }
+        let retained = try node(forHandle: handle)
+        guard retained.id == item.itemID, retained.generation == item.itemGeneration else {
+            throw MockPOSIXError(errno: EINVAL, message: "handle does not belong to item")
+        }
+        return retained
+    }
+
+    private func namespaceNode(for item: PfsItem) throws -> Node {
+        let node = try node(for: item)
+        if configuration.strictItemNamespace && node.nlink == 0 {
+            throw MockPOSIXError(errno: ENOENT, message: "item is detached from the namespace")
         }
         return node
     }

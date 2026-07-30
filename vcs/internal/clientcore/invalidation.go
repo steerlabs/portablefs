@@ -135,6 +135,16 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 					continue
 				}
 				if inv.Path == "" {
+					if related, ok := h.(relatedInodeInvalidationHandler); ok &&
+						len(inv.RelatedInos) != 0 {
+						related.InvalidateRelatedInodes(
+							inv.RelatedInos,
+							"",
+							inv.Gen,
+							inv.Version,
+							false,
+						)
+					}
 					continue
 				}
 				// P4 (deliberate coherence improvement over the old path-only apply): a NAME change

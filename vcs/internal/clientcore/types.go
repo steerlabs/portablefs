@@ -52,6 +52,8 @@ type SetattrRequest struct {
 
 	MtimeMs  int64
 	SetMTime bool
+	AtimeMs  int64
+	SetATime bool
 
 	UID    uint32
 	SetUID bool

@@ -122,6 +122,12 @@ type Volume struct {
 	// the gate so the still-mounted frontend can keep serving and retry.
 	lifecycleMu sync.RWMutex
 	closed      bool
+	// exactMu prevents a path-keyed write-back admission from racing an
+	// inode-addressed operation after that operation has released the
+	// relevant delegation(s). Ordinary mutations hold it shared; a
+	// pathless exact operation holds it exclusively through release and the
+	// authority round trip.
+	exactMu sync.RWMutex
 	// A forced close is one terminal transaction. Retain its exact outcome
 	// so retries cannot reinterpret a prior failure (or a successfully
 	// parked non-empty tail) as an empty-tail success.
@@ -200,6 +206,19 @@ func (v *Volume) beginLifecycleOperation() error {
 	return nil
 }
 
+func (v *Volume) beginSharedOperation() error {
+	if err := v.beginLifecycleOperation(); err != nil {
+		return err
+	}
+	v.exactMu.RLock()
+	return nil
+}
+
+func (v *Volume) endSharedOperation() {
+	v.exactMu.RUnlock()
+	v.lifecycleMu.RUnlock()
+}
+
 func (v *Volume) beginMutation() error {
 	if err := v.beginLifecycleOperation(); err != nil {
 		return err
@@ -215,11 +234,48 @@ func (v *Volume) beginMutation() error {
 			return err
 		}
 	}
+	v.exactMu.RLock()
 	return nil
 }
 
 func (v *Volume) endMutation() {
+	v.exactMu.RUnlock()
 	v.lifecycleMu.RUnlock()
+}
+
+func (v *Volume) beginExactOperation(ctx context.Context) (func(), error) {
+	if err := v.beginLifecycleOperation(); err != nil {
+		return nil, err
+	}
+	if v.mutationFailClosed != nil {
+		err := v.mutationFailClosed
+		v.lifecycleMu.RUnlock()
+		return nil, err
+	}
+	if v.wb != nil {
+		if err := v.wb.MutationError(); err != nil {
+			v.lifecycleMu.RUnlock()
+			return nil, err
+		}
+	}
+	v.exactMu.Lock()
+	var endWriteback func()
+	if v.wb != nil {
+		var err error
+		endWriteback, err = v.wb.BeginExact(ctx)
+		if err != nil {
+			v.exactMu.Unlock()
+			v.lifecycleMu.RUnlock()
+			return nil, err
+		}
+	}
+	return func() {
+		if endWriteback != nil {
+			endWriteback()
+		}
+		v.exactMu.Unlock()
+		v.lifecycleMu.RUnlock()
+	}, nil
 }
 
 // markKernelFlushed reports whether gen is being kernel-flushed for the FIRST time, recording it so
@@ -379,8 +435,9 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 				}
 				return opts.OnHandoffPrepared(ctx, scope, epoch, cli)
 			},
-			OnReleaseWait:          opts.OnReleaseWait,
-			AllowDelegatedMutation: v.allowDelegatedMutation,
+			OnReleaseWait:             opts.OnReleaseWait,
+			AllowDelegatedMutation:    v.allowDelegatedMutation,
+			ValidateDelegatedMutation: v.validateDelegatedMutation,
 			OnGrant: func(scope string) {
 				// Shared attr/negative/directory/kernel entries under the
 				// scope must not shadow the authoritative delegated view.
@@ -1162,10 +1219,10 @@ func (v *Volume) protectOpenPins(ctx context.Context, scope, epoch string) (func
 // FlushToAuthority waits until the engine's acknowledged stream tail has
 // flushed to the authority.
 func (v *Volume) FlushToAuthority(ctx context.Context) error {
-	if err := v.beginLifecycleOperation(); err != nil {
+	if err := v.beginSharedOperation(); err != nil {
 		return err
 	}
-	defer v.endMutation()
+	defer v.endSharedOperation()
 	return v.flushToAuthority(ctx)
 }
 
@@ -1189,10 +1246,10 @@ func (v *Volume) flushToAuthority(ctx context.Context) error {
 // If the authority is unreachable, slow past the deadline, or fenced, fsync
 // returns the ERROR: there is no local-only fsync outcome, ever.
 func (v *Volume) Fsync(path string) error {
-	if err := v.beginLifecycleOperation(); err != nil {
+	if err := v.beginSharedOperation(); err != nil {
 		return err
 	}
-	defer v.endMutation()
+	defer v.endSharedOperation()
 	return v.fsync(path)
 }
 
@@ -1263,10 +1320,10 @@ func (v *Volume) WritebackStatus() writeback.Status {
 // authority fails the barrier with an error. The drain forces the local WAL
 // first; if that local sync also fails, the mount remains failed closed.
 func (v *Volume) SyncVolume() error {
-	if err := v.beginLifecycleOperation(); err != nil {
+	if err := v.beginSharedOperation(); err != nil {
 		return err
 	}
-	defer v.endMutation()
+	defer v.endSharedOperation()
 	return v.syncVolume()
 }
 

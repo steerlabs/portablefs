@@ -12,10 +12,14 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
+const statusExactRetry Status = -4096
+
 func statusErr(err error) Status {
 	switch {
 	case err == nil:
 		return fsproto.OK
+	case errors.Is(err, writeback.ErrDelegatedBindingMismatch):
+		return statusExactRetry
 	case errors.Is(err, os.ErrNotExist):
 		return fsproto.ENOENT
 	case errors.Is(err, os.ErrExist):
@@ -178,6 +182,80 @@ func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsprot
 	}
 	defer permit.Close()
 	return v.getattr(ctx, &permit, path, n)
+}
+
+// GetattrExactHandle stats the object retained by an open descriptor without
+// consulting path caches or write-back views. The empty path is deliberate:
+// after unlink or rename-over the former name is not namespace evidence and
+// may already identify a replacement.
+func (v *Volume) GetattrExactHandle(ctx context.Context, n *NodeState) (fsproto.Attr, Status) {
+	end, err := v.beginExactOperation(ctx)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	defer end()
+	ino := authHandleIno(n)
+	if n == nil || !n.IsOpen() || ino == 0 {
+		return fsproto.Attr{}, fsproto.ENOENT
+	}
+	var a *fsproto.Attr
+	var st int32
+	if oi := n.Orphan(); oi != 0 {
+		a, st, err = v.client.GetattrOrphan(oi)
+	} else {
+		a, st, err = v.client.GetattrHandle("", ino)
+	}
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	if st != fsproto.OK {
+		return fsproto.Attr{}, st
+	}
+	return *a, fsproto.OK
+}
+
+// GetattrOpenHandle reports an open descriptor's exact object identity while
+// using a genuine current alias only as write-back scope. Under a retained
+// delegation that alias's overlay is authoritative; on the shared lane the
+// authority inode is addressed explicitly and pathname caches are bypassed.
+func (v *Volume) GetattrOpenHandle(ctx context.Context, path string, n *NodeState) (fsproto.Attr, Status) {
+	path = cleanVolumePath(path)
+	if path == "" {
+		return v.GetattrExactHandle(ctx, n)
+	}
+	if n == nil || !n.IsOpen() {
+		return fsproto.Attr{}, fsproto.ENOENT
+	}
+	ino := authHandleIno(n)
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	defer permit.Close()
+	if v.wb != nil && permit.Covers(path) {
+		if ent, result := permit.Lookup(path); result == writeback.LookupHit {
+			if ent.Ino != 0 && ent.Ino != ino {
+				permit.Close()
+				return v.GetattrExactHandle(ctx, n)
+			}
+			a := engineAttr(path, ent)
+			v.observeHardlink(path, a)
+			return a, fsproto.OK
+		}
+		permit.Close()
+		return v.GetattrExactHandle(ctx, n)
+	}
+	if ino == 0 {
+		return fsproto.Attr{}, fsproto.ENOENT
+	}
+	a, st, err := v.client.GetattrHandle(path, ino)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	if st != fsproto.OK {
+		return fsproto.Attr{}, st
+	}
+	return *a, fsproto.OK
 }
 
 func (v *Volume) getattr(ctx context.Context, permit *readView, path string, n *NodeState) (fsproto.Attr, Status) {
@@ -525,10 +603,10 @@ func (v *Volume) rollbackTrackedOpen(path string, n *NodeState) {
 }
 
 func (v *Volume) CloseHandle(path string, n *NodeState) Status {
-	if err := v.beginLifecycleOperation(); err != nil {
+	if err := v.beginSharedOperation(); err != nil {
 		return fsproto.EIO
 	}
-	defer v.endMutation()
+	defer v.endSharedOperation()
 
 	v.openStateMu.Lock()
 	if currentPath, found := v.opens.CurrentPath(path, n); found {
@@ -610,6 +688,69 @@ func (v *Volume) Read(ctx context.Context, path string, n *NodeState, off int64,
 	}
 	defer permit.Close()
 	return v.read(&permit, path, n, off, length)
+}
+
+// ReadExactHandle is the detached-descriptor read lane. It intentionally
+// bypasses the former pathname's overlay and caches, which could now belong to
+// a replacement inode.
+func (v *Volume) ReadExactHandle(ctx context.Context, n *NodeState, off int64, length int) ([]byte, Status) {
+	end, err := v.beginExactOperation(ctx)
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	defer end()
+	ino := authHandleIno(n)
+	if n == nil || !n.IsOpen() || ino == 0 {
+		return nil, fsproto.ENOENT
+	}
+	var data []byte
+	var st int32
+	if oi := n.Orphan(); oi != 0 {
+		data, st, err = v.client.ReadOrphan(oi, off, int64(length))
+	} else {
+		data, _, _, st, err = v.client.ReadVHandle("", ino, off, int64(length))
+	}
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	return data, st
+}
+
+// ReadOpenHandle composes a genuine alias's delegated view only when that
+// view still binds the alias to the descriptor inode. A delayed peer
+// rename-over may leave the frontend registry temporarily stale; an inode
+// mismatch therefore switches to the pathless exact barrier instead of
+// reading the replacement's overlay.
+func (v *Volume) ReadOpenHandle(ctx context.Context, path string, n *NodeState, off int64, length int) ([]byte, Status) {
+	path = cleanVolumePath(path)
+	if path == "" {
+		return v.ReadExactHandle(ctx, n, off, length)
+	}
+	if n == nil || !n.IsOpen() {
+		return nil, fsproto.ENOENT
+	}
+	ino := authHandleIno(n)
+	permit, err := v.beginRead(ctx, path)
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	defer permit.Close()
+	if v.wb != nil && permit.Covers(path) {
+		ent, result := permit.Lookup(path)
+		if result != writeback.LookupHit || (ent.Ino != 0 && ent.Ino != ino) {
+			permit.Close()
+			return v.ReadExactHandle(ctx, n, off, length)
+		}
+		return v.read(&permit, path, n, off, length)
+	}
+	if ino == 0 {
+		return nil, fsproto.ENOENT
+	}
+	data, _, _, st, err := v.client.ReadVHandle(path, ino, off, int64(length))
+	if err != nil {
+		return nil, fsproto.EIO
+	}
+	return data, st
 }
 
 func (v *Volume) read(permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
@@ -787,6 +928,50 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, gen, version, false)
 	}
 	return cnt, fsproto.OK
+}
+
+// WriteExactHandle is the detached-descriptor mutation lane. A mount-wide
+// release is rare but necessary: with an unseen surviving hard link there is
+// no trustworthy pathname scope to release more narrowly.
+func (v *Volume) WriteExactHandle(ctx context.Context, n *NodeState, off int64, data []byte) (int, Status) {
+	end, err := v.beginExactOperation(ctx)
+	if err != nil {
+		return 0, fsproto.EIO
+	}
+	defer end()
+	ino := authHandleIno(n)
+	if n == nil || !n.IsOpen() || ino == 0 {
+		return 0, fsproto.ENOENT
+	}
+	if oi := n.Orphan(); oi != 0 {
+		count, st, err := v.client.WriteOrphan(oi, off, data)
+		if err != nil {
+			return 0, fsproto.EIO
+		}
+		return count, st
+	}
+	count, _, _, st, err := v.client.WriteVHandle("", ino, off, data, 0o644)
+	if err != nil {
+		return 0, fsproto.EIO
+	}
+	return count, st
+}
+
+// WriteOpenHandle validates any delegated snapshot against the descriptor
+// inode before local admission. The authority fallthrough already carries
+// the stable inode handle, so a stale alias can never redirect the write to a
+// rename-over replacement.
+func (v *Volume) WriteOpenHandle(ctx context.Context, path string, n *NodeState, off int64, data []byte) (int, Status) {
+	path = cleanVolumePath(path)
+	if path == "" {
+		return v.WriteExactHandle(ctx, n, off, data)
+	}
+	ctx = withDelegatedBindingExpectation(ctx, path, n)
+	count, st := v.Write(ctx, path, n, off, data)
+	if st == statusExactRetry {
+		return v.WriteExactHandle(ctx, n, off, data)
+	}
+	return count, st
 }
 
 // WriteAppend executes O_APPEND. Under a delegation the local size is
@@ -1398,14 +1583,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	defer v.endMutation()
 
 	if oi := n.Orphan(); oi != 0 {
-		if req.SetSize {
-			if st, err := v.client.TruncateOrphan(oi, req.Size); err != nil {
-				return fsproto.Attr{}, fsproto.EIO
-			} else if st != fsproto.OK {
-				return fsproto.Attr{}, st
-			}
-		}
-		return fsproto.Attr{}, fsproto.OK
+		return v.setattrOrphan(oi, req)
 	}
 	if v.wb != nil && v.isHardlink(n) {
 		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
@@ -1416,14 +1594,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		n.mu.Lock()
 		if oi := n.orphanIno; oi != 0 {
 			n.mu.Unlock()
-			if req.SetSize {
-				if st, err := v.client.TruncateOrphan(oi, req.Size); err != nil {
-					return fsproto.Attr{}, fsproto.EIO
-				} else if st != fsproto.OK {
-					return fsproto.Attr{}, st
-				}
-			}
-			return fsproto.Attr{}, fsproto.OK
+			return v.setattrOrphan(oi, req)
 		}
 		n.mu.Unlock()
 		var last writeback.Result
@@ -1439,10 +1610,11 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 				last, mutated = res, true
 			}
 		}
-		if handledAll && (req.SetMode || req.SetMTime || req.SetUID || req.SetGID) {
+		if handledAll && (req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID) {
 			engReq := writeback.SetattrRequest{
 				SetMode: req.SetMode, Mode: modebits.CleanUnix(req.Mode),
 				SetTime: req.SetMTime, MtimeMs: req.MtimeMs,
+				SetATime: req.SetATime, AtimeMs: req.AtimeMs,
 				SetUID: req.SetUID, UID: req.UID,
 				SetGID: req.SetGID, GID: req.GID,
 			}
@@ -1479,14 +1651,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()
-		if req.SetSize {
-			if st, err := v.client.TruncateOrphan(oi, req.Size); err != nil {
-				return fsproto.Attr{}, fsproto.EIO
-			} else if st != fsproto.OK {
-				return fsproto.Attr{}, st
-			}
-		}
-		return fsproto.Attr{}, fsproto.OK
+		return v.setattrOrphan(oi, req)
 	}
 	handleIno := authHandleIno(n)
 	if req.SetSize {
@@ -1501,8 +1666,14 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		}
 		v.recent.record(path)
 	}
-	if req.SetMode || req.SetMTime || req.SetUID || req.SetGID {
-		st, err := v.client.SetattrHandle(path, handleIno, modebits.CleanUnix(req.Mode), req.SetMode, req.MtimeMs, req.SetMTime, req.UID, req.GID, req.SetUID, req.SetGID)
+	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
+		st, err := v.client.SetattrTimesHandle(
+			path, handleIno,
+			modebits.CleanUnix(req.Mode), req.SetMode,
+			req.MtimeMs, req.SetMTime,
+			req.AtimeMs, req.SetATime,
+			req.UID, req.GID, req.SetUID, req.SetGID,
+		)
 		if err != nil {
 			n.mu.Unlock()
 			return fsproto.Attr{}, fsproto.EIO
@@ -1524,6 +1695,115 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	v.observeHardlink(path, *a)
 	if v.isHardlink(n) {
 		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, 0, 0, false)
+	}
+	return *a, fsproto.OK
+}
+
+// SetattrExactHandle applies descriptor metadata without using the former
+// pathname. It covers both a parked last-link orphan and a detached inode that
+// still has an authority-only hard-link alias unknown to this frontend.
+func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
+	end, err := v.beginExactOperation(ctx)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	defer end()
+	ino := authHandleIno(n)
+	if n == nil || !n.IsOpen() || ino == 0 {
+		return fsproto.Attr{}, fsproto.ENOENT
+	}
+	orphanIno := n.Orphan()
+	if req.SetSize {
+		var st int32
+		var err error
+		if orphanIno != 0 {
+			st, err = v.client.TruncateOrphan(orphanIno, req.Size)
+		} else {
+			st, err = v.client.TruncateHandle("", ino, req.Size)
+		}
+		if err != nil {
+			return fsproto.Attr{}, fsproto.EIO
+		}
+		if st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
+	}
+	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
+		st, err := v.client.SetattrTimesHandle(
+			"", ino,
+			modebits.CleanUnix(req.Mode), req.SetMode,
+			req.MtimeMs, req.SetMTime,
+			req.AtimeMs, req.SetATime,
+			req.UID, req.GID, req.SetUID, req.SetGID,
+		)
+		if err != nil {
+			return fsproto.Attr{}, fsproto.EIO
+		}
+		if st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
+	}
+	var a *fsproto.Attr
+	var st int32
+	if orphanIno != 0 {
+		a, st, err = v.client.GetattrOrphan(orphanIno)
+	} else {
+		a, st, err = v.client.GetattrHandle("", ino)
+	}
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	if st != fsproto.OK {
+		return fsproto.Attr{}, st
+	}
+	return *a, fsproto.OK
+}
+
+func (v *Volume) SetattrOpenHandle(ctx context.Context, path string, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
+	path = cleanVolumePath(path)
+	if path == "" {
+		return v.SetattrExactHandle(ctx, n, req)
+	}
+	ctx = withDelegatedBindingExpectation(ctx, path, n)
+	attr, st := v.Setattr(ctx, path, n, req)
+	if st == statusExactRetry {
+		return v.SetattrExactHandle(ctx, n, req)
+	}
+	return attr, st
+}
+
+func (v *Volume) setattrOrphan(ino uint64, req SetattrRequest) (fsproto.Attr, Status) {
+	if req.SetSize {
+		if st, err := v.client.TruncateOrphan(ino, req.Size); err != nil {
+			return fsproto.Attr{}, fsproto.EIO
+		} else if st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
+	}
+	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
+		// The parked inode is the identity. An empty path deliberately avoids
+		// presenting the removed or overwritten name as namespace evidence;
+		// exact-protocol handle addressing applies the metadata to ino.
+		st, err := v.client.SetattrTimesHandle(
+			"", ino,
+			modebits.CleanUnix(req.Mode), req.SetMode,
+			req.MtimeMs, req.SetMTime,
+			req.AtimeMs, req.SetATime,
+			req.UID, req.GID, req.SetUID, req.SetGID,
+		)
+		if err != nil {
+			return fsproto.Attr{}, fsproto.EIO
+		}
+		if st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
+	}
+	a, st, err := v.client.GetattrOrphan(ino)
+	if err != nil {
+		return fsproto.Attr{}, fsproto.EIO
+	}
+	if st != fsproto.OK {
+		return fsproto.Attr{}, st
 	}
 	return *a, fsproto.OK
 }
@@ -1551,10 +1831,10 @@ func (v *Volume) FsyncPath(path string) Status {
 }
 
 func (v *Volume) FsyncHandle(path string, n *NodeState) Status {
-	if err := v.beginLifecycleOperation(); err != nil {
+	if err := v.beginSharedOperation(); err != nil {
 		return fsproto.EIO
 	}
-	defer v.endMutation()
+	defer v.endSharedOperation()
 
 	if err := v.fsync(path); err != nil {
 		return fsproto.EIO

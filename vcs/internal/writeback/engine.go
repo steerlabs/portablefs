@@ -69,18 +69,34 @@ var ErrNoXattr = errors.New("writeback: extended attribute does not exist")
 // operation to the authority lane because local state became unavailable.
 var ErrFailedClosed = errors.New("writeback: engine failed closed; remount required")
 
+// ErrDelegatedBindingMismatch reports that a stable-inode caller's expected
+// object no longer matches the name in a retained delegation snapshot. The
+// caller must retry through its pathless exact lane; a pathname-scoped
+// authority fallback is not sufficient because other aliases may be covered
+// by unrelated retained delegations.
+var ErrDelegatedBindingMismatch = errors.New("writeback: delegated path binds a different inode")
+
 // Events are the engine-to-frontend hooks.
 type Events struct {
 	// OnGrant fires after a delegation installs: the caller evicts shared
 	// attr/negative/directory/kernel state under the scope.
 	OnGrant func(scope string)
 
-	// AllowDelegatedMutation is re-evaluated on every admission loop,
-	// including immediately after a newly acquired grant is installed. A
-	// false result drains any covering grant and selects the authority lane.
-	// Clientcore uses this to reject path-keyed write-back when the grant
-	// snapshot reveals that the target inode is hard-linked.
+	// AllowDelegatedMutation is re-evaluated while e.mu protects the active
+	// grant selected for admission, including immediately after a newly
+	// acquired grant is installed. A false result drains that exact grant
+	// and selects the authority lane. The callback must not call back into
+	// Engine; clientcore uses it only to consult its independent hard-link
+	// identity index.
 	AllowDelegatedMutation func(ctx context.Context, path string) bool
+	// ValidateDelegatedMutation provides a typed rejection when a
+	// stable-inode operation cannot trust the delegation snapshot's
+	// path→inode binding. entry/present are copied from the exact active
+	// snapshot while e.mu still owns admission, closing the validation-to-
+	// mutation TOCTOU. The callback must not call back into Engine. The
+	// covering grant drains before the error returns; clientcore then
+	// escalates through its mount-wide exact barrier.
+	ValidateDelegatedMutation func(ctx context.Context, path string, entry Entry, present bool) error
 	// OnHandoff runs synchronously after the captured WAL tail is
 	// authority-visible and all overlay readers have exited, but before
 	// Checkin releases the grant. The client evicts every user-space cache
@@ -241,7 +257,13 @@ type Engine struct {
 
 	lock *os.File // store-dir flock
 
-	mu         sync.RWMutex
+	mu sync.RWMutex
+	// exactMu excludes asynchronous delegation acquisition while a caller
+	// drains all retained scopes and performs a pathless stable-inode
+	// authority operation. Acquisition resolvers hold it shared for their
+	// complete remote resolution, including after their initiating request
+	// times out.
+	exactMu    sync.RWMutex
 	closed     bool
 	frozen     bool // no further delegated admissions (unmount/force-close)
 	streamOpen bool
@@ -627,12 +649,6 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 	}
 	scope := governingScope(path)
 	for {
-		if allow := e.cfg.Events.AllowDelegatedMutation; allow != nil && !allow(ctx, path) {
-			if err := e.ReleaseFor(ctx, path); err != nil {
-				return admission{}, false, err
-			}
-			return admission{}, false, nil
-		}
 		e.mu.Lock()
 		if e.closed || e.frozen {
 			e.mu.Unlock()
@@ -644,6 +660,30 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 		}
 		d := e.coveringLocked(path)
 		if d != nil && !d.draining {
+			var validationErr error
+			if validate := e.cfg.Events.ValidateDelegatedMutation; validate != nil {
+				var snapshot Entry
+				entry, present := e.entryLocked(path)
+				if present {
+					snapshot = *entry
+				}
+				validationErr = validate(ctx, path, snapshot, present)
+			}
+			allowed := true
+			if allow := e.cfg.Events.AllowDelegatedMutation; allow != nil {
+				allowed = allow(ctx, path)
+			}
+			if validationErr != nil || !allowed {
+				// Claim this exact snapshot's grant before dropping e.mu. A
+				// release+reacquire can therefore never replace the entry
+				// between validation and the local mutation decision.
+				attempt := e.prepareReleaseLocked(ctx, d)
+				e.mu.Unlock()
+				if err := e.waitReleaseForCaller(ctx, attempt); err != nil {
+					return admission{}, false, err
+				}
+				return admission{}, false, validationErr
+			}
 			if d.scope == scope {
 				d.lastActive = time.Now()
 				return admission{d: d}, true, nil // e.mu stays held; caller releases
@@ -674,6 +714,14 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 			// definite outcome. Re-evaluate ownership before choosing local
 			// admission, a typed failure, or write-through.
 			continue
+		}
+		// Avoid acquiring a grant that an independently proven hard-link
+		// identity cannot use. A concurrent in-flight grant resolver may still
+		// install after this authority-lane decision; the authority's journaled
+		// mutation gate orders the path-bearing write after that grant's recall.
+		if allow := e.cfg.Events.AllowDelegatedMutation; allow != nil && !allow(ctx, path) {
+			e.mu.Unlock()
+			return admission{}, false, nil
 		}
 		if scope == "" {
 			e.mu.Unlock()
@@ -1324,14 +1372,16 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) (Result,
 
 // SetattrRequest is the metadata mutation surface (one group per call).
 type SetattrRequest struct {
-	SetMode bool
-	Mode    uint32
-	SetTime bool
-	MtimeMs int64
-	SetUID  bool
-	UID     uint32
-	SetGID  bool
-	GID     uint32
+	SetMode  bool
+	Mode     uint32
+	SetTime  bool
+	MtimeMs  int64
+	SetATime bool
+	AtimeMs  int64
+	SetUID   bool
+	UID      uint32
+	SetGID   bool
+	GID      uint32
 }
 
 // Setattr acknowledges chmod/chtimes/chown locally for a known entry.
@@ -1349,8 +1399,12 @@ func (e *Engine) Setattr(ctx context.Context, path string, req SetattrRequest) (
 	if req.SetMode {
 		records = append(records, wal.Record{Op: wal.OpChmod, Path: path, Mode: req.Mode})
 	}
-	if req.SetTime {
-		records = append(records, wal.Record{Op: wal.OpChtimes, Path: path, MtimeMs: req.MtimeMs})
+	if req.SetTime || req.SetATime {
+		records = append(records, wal.Record{
+			Op: wal.OpChtimes, Path: path,
+			MtimeMs: req.MtimeMs, ChtimesKeepMtime: !req.SetTime,
+			AtimeMs: req.AtimeMs, ChtimesSetAtime: req.SetATime,
+		})
 	}
 	if req.SetUID || req.SetGID {
 		rec := wal.Record{Op: wal.OpChown, Path: path, ChownSetUID: req.SetUID, ChownSetGID: req.SetGID}
@@ -1373,6 +1427,9 @@ func (e *Engine) Setattr(ctx context.Context, path string, req SetattrRequest) (
 	}
 	if req.SetTime {
 		ent.MtimeMs = req.MtimeMs
+	}
+	if req.SetATime {
+		ent.AtimeMs = req.AtimeMs
 	}
 	if req.SetUID {
 		ent.UID = req.UID

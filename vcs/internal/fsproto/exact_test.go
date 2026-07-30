@@ -9,6 +9,7 @@ package fsproto
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -768,6 +769,19 @@ func TestCanonicalHashSensitivity(t *testing.T) {
 		Op: wal.OpSetxattr, Path: "a/b", XattrName: "user.x", Data: []byte("v"), XattrFlags: wal.XattrCreate,
 	})) {
 		t.Fatal("xattr conditional flags are absent from the exact request hash")
+	}
+	legacyChtimes := wal.Record{
+		Op: wal.OpChtimes, Path: "a/b", MtimeMs: 1234,
+		AtimeMs: 77, ChtimesSetAtime: true, Ino: 42,
+	}
+	if got := hex.EncodeToString(canonicalRecordHash(legacyChtimes)); got !=
+		"0a825bc3e47b3fffc3d222deb61eedeee8fde081d611c9b1814879bbcb38af5c" {
+		t.Fatalf("legacy chtimes request hash drifted across upgrade: %s", got)
+	}
+	atimeOnly := legacyChtimes
+	atimeOnly.ChtimesKeepMtime = true
+	if bytes.Equal(canonicalRecordHash(legacyChtimes), canonicalRecordHash(atimeOnly)) {
+		t.Fatal("atime-only preserve-mtime intent is absent from the exact request hash")
 	}
 }
 

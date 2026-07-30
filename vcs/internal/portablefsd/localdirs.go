@@ -539,16 +539,34 @@ func (a *attach) renameLocal(oldp, newp string, noReplace bool) int32 {
 
 // setattrLocal applies POSIX metadata changes directly to grafted backing
 // files. Ownership changes are ignored to match the volume's noowners mounts.
-func (a *attach) setattrLocal(rec *itemRecord, req *pfslocal.SetAttrRequest) (*pfslocal.SetAttrReply, int32) {
-	flags := os.O_RDONLY
-	if req.Size != nil {
-		flags = os.O_WRONLY
+func (a *attach) setattrLocal(
+	rec *itemRecord,
+	exactHandle *handleRecord,
+	detached bool,
+	req *pfslocal.SetAttrRequest,
+) (*pfslocal.SetAttrReply, int32) {
+	var file *os.File
+	closeFile := false
+	if exactHandle != nil {
+		if exactHandle.file == nil {
+			return nil, darwinEIO
+		}
+		file = exactHandle.file
+	} else {
+		flags := os.O_RDONLY
+		if req.Size != nil {
+			flags = os.O_WRONLY
+		}
+		var err error
+		file, err = a.localFS.OpenFile(rec.path, flags, 0)
+		if err != nil {
+			return nil, localErrno(err)
+		}
+		closeFile = true
 	}
-	file, err := a.localFS.OpenFile(rec.path, flags, 0)
-	if err != nil {
-		return nil, localErrno(err)
+	if closeFile {
+		defer file.Close()
 	}
-	defer file.Close()
 	if req.Mode != nil {
 		if err := file.Chmod(os.FileMode(*req.Mode) & os.ModePerm); err != nil {
 			return nil, localErrno(err)
@@ -581,15 +599,28 @@ func (a *attach) setattrLocal(rec *itemRecord, req *pfslocal.SetAttrRequest) (*p
 			return nil, localErrno(err)
 		}
 	}
-	attr, eno := a.statLocal(rec.path)
-	if eno != 0 {
-		return nil, eno
+	fi, err := file.Stat()
+	if err != nil {
+		return nil, localErrno(err)
 	}
-	updated := a.registerLocal(rec.path, attr)
+	attr := localAttr(fi)
+	var updated *itemRecord
+	if exactHandle != nil {
+		a.mu.Lock()
+		updated = a.registerHandleAttrLocked(exactHandle, attr)
+		a.mu.Unlock()
+	} else {
+		updated = a.registerLocal(rec.path, attr)
+	}
+	if updated == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, updated.item)}, 0
+	return &pfslocal.SetAttrReply{
+		Attr: fsAttrToLocalNlink(attr, updated.item, detached),
+	}, 0
 }
 
 // readLocalFile serves a bounded control-API read from grafted backing disk,

@@ -1515,12 +1515,38 @@ func (c *Client) Setattr(path string, mode uint32, setMode bool, mtimeMs int64, 
 // split into one exact mutation per group; a v1 server keeps receiving the
 // combined request unchanged.
 func (c *Client) SetattrHandle(path string, handleIno uint64, mode uint32, setMode bool, mtimeMs int64, setTime bool, uid, gid uint32, setUID, setGID bool) (int32, error) {
+	return c.SetattrTimesHandle(
+		path, handleIno, mode, setMode,
+		mtimeMs, setTime, 0, false,
+		uid, gid, setUID, setGID,
+	)
+}
+
+// SetattrTimesHandle is SetattrHandle with independent mtime and atime
+// intent. The authority preserves an omitted timestamp at its ordered apply
+// position rather than resolving it client-side.
+func (c *Client) SetattrTimesHandle(
+	path string,
+	handleIno uint64,
+	mode uint32,
+	setMode bool,
+	mtimeMs int64,
+	setTime bool,
+	atimeMs int64,
+	setATime bool,
+	uid, gid uint32,
+	setUID, setGID bool,
+) (int32, error) {
 	groups := make([]*Request, 0, 3)
 	if setMode {
 		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, Mode: mode, SetMode: true})
 	}
-	if setTime {
-		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, MtimeMs: mtimeMs, SetTime: true})
+	if setTime || setATime {
+		groups = append(groups, &Request{
+			Op: OpSetattr, Path: path, HandleIno: handleIno,
+			MtimeMs: mtimeMs, SetTime: setTime,
+			AtimeMs: atimeMs, SetATime: setATime,
+		})
 	}
 	if setUID || setGID {
 		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, UID: uid, GID: gid, SetUID: setUID, SetGID: setGID})
@@ -1542,6 +1568,7 @@ func (c *Client) SetattrHandle(path string, handleIno uint64, mode uint32, setMo
 		Op: OpSetattr, Path: path, HandleIno: handleIno,
 		Mode: mode, SetMode: setMode,
 		MtimeMs: mtimeMs, SetTime: setTime,
+		AtimeMs: atimeMs, SetATime: setATime,
 		UID: uid, GID: gid, SetUID: setUID, SetGID: setGID,
 	})
 	if err != nil {
