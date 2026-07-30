@@ -1,4 +1,5 @@
 import Foundation
+import PortableFSKit
 @preconcurrency import Darwin
 
 /// One live kernel mount, as read from `getfsstat(2)`.
@@ -21,12 +22,10 @@ public struct MountedFilesystem: Equatable, Sendable {
 }
 
 public enum MountTable {
-    // macOS exposes two distinct names for the same FSKit module. mount(8)
-    // selects the extension by its registered FSShortName ("pfs"), while
-    // getfsstat(2) reports FSKit's canonical runtime type ("portablefs").
-    // Conflating them makes a successful mount look absent to the app.
-    public static let portableFSRegistrationTypeName = "pfs"
-    public static let portableFSRuntimeTypeName = "portablefs"
+    // Apple requires FSStatFSResult.fileSystemTypeName to match the module's
+    // FSShortName. The same identity therefore selects the extension through
+    // mount(8) and identifies its live mounts through getfsstat(2).
+    public static let portableFSFileSystemTypeName = PortableFSIdentity.fileSystemTypeName
 
     /// Extracts the attach ref from a `pfs://<ref>` device spec, tolerating
     /// trailing slashes appended by mount tooling.
@@ -69,7 +68,11 @@ public enum MountTable {
     }
 
     public static func portableFSMounts() -> [MountedFilesystem] {
-        current().filter { $0.fsTypeName == portableFSRuntimeTypeName }
+        portableFSMounts(in: current())
+    }
+
+    public static func portableFSMounts(in mounts: [MountedFilesystem]) -> [MountedFilesystem] {
+        mounts.filter { $0.fsTypeName == portableFSFileSystemTypeName }
     }
 
     private static func string<T>(fromFixedSizeCString tuple: T) -> String {

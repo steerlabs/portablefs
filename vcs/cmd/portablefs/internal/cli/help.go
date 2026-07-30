@@ -350,9 +350,10 @@ plane token via --mount-token, PORTABLEFS_MOUNT_TOKEN, or VCS_AUTH_TOKEN, and
 choose exactly one --data-plane-transport. tls-system-pki also requires
 --data-plane-server-name; tls-private-ca requires that name plus
 --data-plane-ca <ca.pem>; plaintext must be selected by name. No missing CA or
-environment variable silently selects plaintext. FSKit extension coordinates (fs type,
-daemon sockets) override explicitly via PORTABLEFS_FSKIT_TYPE,
-PORTABLEFS_FSKIT_SOCKET, and PORTABLEFS_FSKIT_CONTROL_SOCKET. The daemon is
+environment variable silently selects plaintext. FSKit daemon sockets
+override explicitly via PORTABLEFS_FSKIT_SOCKET and
+PORTABLEFS_FSKIT_CONTROL_SOCKET. PORTABLEFS_FSKIT_TYPE may only assert the
+signed release type; it cannot select another provider. The daemon is
 always the exact portablefsd sibling from the same installed release;
 PORTABLEFS_FSKIT_DAEMON is rejected.
 

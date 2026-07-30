@@ -1138,10 +1138,15 @@ func rejectLiveMacOSRuntime(e *cmdEnv, stateDir string) error {
 	if err != nil {
 		return err
 	}
-	for _, mount := range mounts {
-		if mount.fsType == "portablefs" && strings.HasPrefix(mount.source, "pfs://") {
-			return fmt.Errorf("kernel FSKit mount remains at %s; cleanly unmount it before installing", mount.path)
-		}
+	liveMounts, err := portableFSKernelPaths(mounts)
+	if err != nil {
+		return fmt.Errorf("strict PortableFS kernel inventory: %w", err)
+	}
+	if len(liveMounts) != 0 {
+		return fmt.Errorf(
+			"kernel FSKit mount remains at %s; cleanly unmount it before installing",
+			liveMounts[0],
+		)
 	}
 	processes, err := unix.SysctlKinfoProcSlice("kern.proc.uid", os.Geteuid())
 	if err != nil {
@@ -1193,11 +1198,7 @@ func isPortableFSMacOSProcessName(name string) bool {
 	}
 }
 
-type darwinMount struct {
-	fsType string
-	path   string
-	source string
-}
+type darwinMount = kernelMountIdentity
 
 func darwinMountTable() ([]darwinMount, error) {
 	count, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)

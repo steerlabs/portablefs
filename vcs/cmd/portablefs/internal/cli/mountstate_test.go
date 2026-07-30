@@ -436,6 +436,7 @@ func TestMountStateValidationRejectsInvalidV2Shapes(t *testing.T) {
 		mutate func(*mountState)
 	}{
 		{"missing FSKit type", func(st *mountState) { st.FSType = "" }},
+		{"foreign FSKit type", func(st *mountState) { st.FSType = "portablefs" }},
 		{"missing FSKit attach", func(st *mountState) { st.AttachRef = "" }},
 		{"FSKit kernel id", func(st *mountState) { st.KernelMountID = "42" }},
 		{"FSKit FUSE mechanism", func(st *mountState) { st.MountMechanism = "direct" }},

@@ -240,8 +240,12 @@ func validateMountIntent(path string, intent *mountIntent) error {
 		if intent.StartedAtMs <= 0 || intent.AuthorityURL == "" || intent.DataPlaneTransport == "" {
 			return fmt.Errorf("mount operation intent %s has incomplete eventual mount-state identity", path)
 		}
-		if intent.Strategy == "fskit" && intent.FSType == "" {
-			return fmt.Errorf("mount operation intent %s has incomplete FSKit type identity", path)
+		if intent.Strategy == "fskit" && !validFSKitType(intent.FSType) {
+			return fmt.Errorf(
+				"mount operation intent %s has invalid FSKit type identity %q",
+				path,
+				intent.FSType,
+			)
 		}
 	}
 	return nil

@@ -13,7 +13,7 @@ func kernelMountBoundaries() ([]kernelMountBoundary, error) {
 			path:       mount.path,
 			fsType:     mount.fsType,
 			source:     mount.source,
-			portableFS: mount.fsType == "portablefs",
+			portableFS: isPortableFSKernelType(mount.fsType),
 		})
 	}
 	return out, nil
