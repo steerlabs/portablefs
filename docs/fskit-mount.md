@@ -166,12 +166,12 @@ daemon, or mount. Cleanly unmount volumes and quit the app before upgrading.
 
 ## Environment Overrides
 
-Defaults match PortableFS.app's extension. The overrides exist for dev
-extensions registered under another fs type or socket path:
+Defaults match PortableFS.app's extension. The socket overrides exist for dev
+extensions that use a separate app-group container:
 
 | variable | default | meaning |
 |---|---|---|
-| `PORTABLEFS_FSKIT_TYPE` | `pfs` | fs type passed to `/sbin/mount -t`; must match the FSKit short name the enabled extension claims |
+| `PORTABLEFS_FSKIT_TYPE` | `pfs` | optional assertion of the release's signed filesystem type; a different value is rejected |
 | `PORTABLEFS_FSKIT_SOCKET` | `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock` | the daemon frontend socket the extension dials (resolved from `PFSAppGroupIdentifier` in the extension's Info.plist) |
 | `PORTABLEFS_FSKIT_CONTROL_SOCKET` | `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/control.sock` | the daemon control socket the CLI drives; setting a custom frontend socket implies a `control.sock` next to it unless this is set explicitly |
 
@@ -286,9 +286,10 @@ The fix depends on which extension you run:
   attaches, then terminate the `portablefsd` process) and remount; the CLI
   spawns a fresh daemon on the now-free sockets.
 - Dev extension with its own Info.plist socket: point the CLI at your own
-  coordinates — `PORTABLEFS_FSKIT_SOCKET` (frontend),
-  `PORTABLEFS_FSKIT_CONTROL_SOCKET`, `PORTABLEFS_FSKIT_TYPE` (the dev fs
-  type) — and package the matching `portablefs`/`portablefsd` sibling pair.
+  sockets — `PORTABLEFS_FSKIT_SOCKET` (frontend) and
+  `PORTABLEFS_FSKIT_CONTROL_SOCKET` — and package the matching
+  `portablefs`/`portablefsd` sibling pair. The signed filesystem type remains
+  `pfs`.
 
 ### The daemon does not become healthy
 
