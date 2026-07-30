@@ -65,11 +65,12 @@ func umountTestEnv(t *testing.T) (e *cmdEnv, stdout, stderr *bytes.Buffer, state
 	t.Helper()
 	e, stdout, stderr = testEnv(t)
 	stateHome := t.TempDir()
+	baseGetenv := e.getenv
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
 			return stateHome
 		}
-		return ""
+		return baseGetenv(k)
 	}
 	stateDir, err := e.mountStateDir()
 	if err != nil {

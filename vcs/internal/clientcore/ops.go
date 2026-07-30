@@ -469,7 +469,7 @@ func (v *Volume) evictDirCachePrefix(rp string) {
 }
 
 func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeIntent bool) Status {
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -496,7 +496,7 @@ func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeInten
 }
 
 func (v *Volume) RegisterOpened(ctx context.Context, path string, n *NodeState) Status {
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -847,7 +847,7 @@ func (v *Volume) readBase(permit *readView, path string, n *NodeState, off int64
 
 func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64, data []byte) (int, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return 0, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -980,7 +980,7 @@ func (v *Volume) WriteOpenHandle(ctx context.Context, path string, n *NodeState,
 // sequencer order.
 func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, legacyOff int64, data []byte) (int, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return 0, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1073,7 +1073,7 @@ func (v *Volume) CreateExcl(ctx context.Context, path string, mode uint32) (fspr
 }
 
 func (v *Volume) createCommon(ctx context.Context, path string, mode uint32, excl bool) (fsproto.Attr, Status) {
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1138,7 +1138,7 @@ func (v *Volume) createWriteThrough(path string, mode uint32, excl bool) (fsprot
 }
 
 func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.Attr, Status) {
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1174,7 +1174,7 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 
 func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, child)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1315,7 +1315,7 @@ func unlockTwo(a, b *NodeState) {
 
 func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeState) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, src, dst)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1470,7 +1470,7 @@ func (v *Volume) evictNamespacePaths(oldp, newp string) {
 }
 
 func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr, Status) {
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1509,7 +1509,7 @@ func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr
 // then orders after the released state and never mutates inside a held
 // scope.
 func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (fsproto.Attr, Status) {
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
@@ -1577,7 +1577,7 @@ func (v *Volume) readlink(permit *readView, path string) (string, Status) {
 
 func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()

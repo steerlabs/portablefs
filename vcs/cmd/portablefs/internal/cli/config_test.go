@@ -30,15 +30,23 @@ func TestLegacyProfileCADoesNotSurviveConfigDecodeEncode(t *testing.T) {
 	}
 }
 
-// testEnv returns a cmdEnv wired to buffers, an isolated config file, an empty
-// environment, and an instant device-flow sleeper.
+// testEnv returns a cmdEnv wired to buffers, isolated config/state/socket
+// paths, and an instant device-flow sleeper. The isolated socket is essential:
+// tests must never discover or interrogate a real PortableFS daemon belonging
+// to the account running the suite.
 func testEnv(t *testing.T) (*cmdEnv, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	frontendSocket := filepath.Join(t.TempDir(), "portablefsd", "pfs.sock")
 	e := &cmdEnv{
-		stdout:            stdout,
-		stderr:            stderr,
-		getenv:            func(string) string { return "" },
+		stdout: stdout,
+		stderr: stderr,
+		getenv: func(key string) string {
+			if key == fskitSocketEnv {
+				return frontendSocket
+			}
+			return ""
+		},
 		version:           "test",
 		configPath:        filepath.Join(t.TempDir(), "private-config", "config.json"),
 		lifecycleStateDir: filepath.Join(t.TempDir(), "state", "portablefs"),
@@ -287,7 +295,13 @@ func TestCommandUsesEnvWhenNoConfig(t *testing.T) {
 
 	e, stdout, _ := testEnv(t)
 	env := map[string]string{"PORTABLEFS_API_URL": srv.URL, "PORTABLEFS_API_TOKEN": "env-tok"}
-	e.getenv = func(k string) string { return env[k] }
+	baseGetenv := e.getenv
+	e.getenv = func(k string) string {
+		if value := env[k]; value != "" {
+			return value
+		}
+		return baseGetenv(k)
+	}
 	if rc := e.run([]string{"status", "vol_1"}); rc != 0 {
 		t.Fatalf("rc = %d, stderr", rc)
 	}

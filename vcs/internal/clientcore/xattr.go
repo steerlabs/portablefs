@@ -272,7 +272,7 @@ func (v *Volume) Setxattr(ctx context.Context, path string, n *NodeState, name s
 // authority mutation as the set. It performs no client-side existence read.
 func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, name string, value []byte, flags uint8) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
@@ -314,7 +314,7 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 // Removexattr removes one extended attribute. ENODATA when absent.
 func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, name string) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
-	if err := v.beginMutation(); err != nil {
+	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.EIO
 	}
 	defer v.endMutation()
