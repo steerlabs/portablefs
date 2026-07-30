@@ -34,7 +34,7 @@ func TestFsyncErrorsOnFencedSession(t *testing.T) {
 	n := NewNodeState(a.Ino, a.Ino != 0)
 	// Hold the file open so the engine's idle-release never hands the "d"
 	// delegation back before the fence (a real fsync fires on an open fd).
-	if st := v.RegisterOpened("d/f", n); st != fsproto.OK {
+	if st := v.RegisterOpened(context.Background(), "d/f", n); st != fsproto.OK {
 		t.Fatalf("open: %d", st)
 	}
 	if _, st := v.Write(ctx, "d/f", n, 0, []byte("FIRST")); st != fsproto.OK {

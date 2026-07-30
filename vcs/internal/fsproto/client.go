@@ -1,6 +1,7 @@
 package fsproto
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/gob"
 	"errors"
@@ -41,6 +42,8 @@ type Client struct {
 	addrs      []string
 	tls        *tls.Config
 	conns      chan *conn
+	poolSize   int
+	pool       []*conn
 	owner      string             // this mount's checkout-owner id, sent on Subscribe for liveness-release
 	ops        *metrics.Counter   // authority round-trips (the RTT metric; write-back keeps it low)
 	opLat      *metrics.Histogram // authority round-trip latency
@@ -61,13 +64,26 @@ type Client struct {
 	onSelfWrite func(path string, gen, version uint64, inPlace bool)
 
 	// Exact mount-session state. exact is nil until EnsureExactSession
-	// establishes it (negotiating the mandatory v7 protocol first).
+	// establishes it (negotiating the mandatory v8 protocol first).
 	exactMu     sync.RWMutex
 	establishMu sync.Mutex // serializes the one-time session establish
 	exact       *exactSession
 	exactSlots  uint32
 	closed      chan struct{}
 	closeOnce   sync.Once
+	poolOnce    sync.Once
+
+	// lifecycleMu serializes the terminal close transition with transport
+	// adoption. A dial that returns after Close/Abort cannot install its
+	// socket or authenticate/send on it. It also protects the set of
+	// non-pooled transports (subscriptions and reachability probes), whose
+	// owners are joined before teardown returns.
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	dedicated       map[*conn]struct{}
+	dedicatedWG     sync.WaitGroup
+
 	// resumeKick debounces the EAGAIN-triggered immediate session resume.
 	resumeKick atomic.Bool
 
@@ -76,7 +92,7 @@ type Client struct {
 	health *connHealth
 	// transport, when set, is the in-process dialer the pool was built with;
 	// the reachability prober needs it to build a probe conn (net.Pipe etc.).
-	transport func() (net.Conn, error)
+	transport transportDialer
 }
 
 // SetOnSelfWrite registers the self-write recorder (the mount's version cache). Call once at startup.
@@ -144,14 +160,16 @@ type conn struct {
 	tls   *tls.Config
 	auth  func() string
 	// transport, when set, replaces TCP dialing entirely (deterministic
-	// in-process transports such as net.Pipe). The auth handshake still runs.
-	transport func() (net.Conn, error)
+	// in-process transports such as net.Pipe). It receives the owning
+	// client's lifecycle context, and the auth handshake still runs.
+	transport transportDialer
 	// client is the owning pool's client, when there is one: dial success
 	// resets its shared redial backoff.
-	client *Client
-	nc     net.Conn
-	enc    *requestEncoder
-	dec    *gob.Decoder
+	client  *Client
+	stateMu sync.Mutex
+	nc      net.Conn
+	enc     *requestEncoder
+	dec     *gob.Decoder
 	// attached is the mount-session id authenticated onto THIS transport
 	// (exact sessions ride the connection; a re-dial must re-attach).
 	attached string
@@ -168,10 +186,22 @@ type conn struct {
 // (whose retry policy owns the pacing). An explicit token rejection is a
 // terminal credential result and is returned without another resolution path.
 func (cn *conn) ensure() error {
-	if cn.nc != nil {
+	return cn.ensureWithGate(false)
+}
+
+// ensureWithGate lets one explicit resolution loop perform its own
+// backoff-paced real attempt while ordinary operations remain fail-fast
+// gated. The caller still owns one pooled connection and every dial is
+// bounded and health-accounted; a successful attempt is the probe that
+// clears the shared reachability state.
+func (cn *conn) ensureWithGate(resolved bool) error {
+	if cn.connected() {
 		return nil
 	}
-	if err := cn.health.gate(cn.gateExempt); err != nil {
+	if cn.client != nil && cn.client.isClosed() {
+		return net.ErrClosed
+	}
+	if err := cn.health.gate(cn.gateExempt || resolved); err != nil {
 		return err
 	}
 	err := cn.dialOnce()
@@ -185,7 +215,7 @@ func (cn *conn) ensure() error {
 	// A definite token rejection is an ANSWER from a reachable peer, not
 	// unreachability (see failfast.go), so it does not trip the transport
 	// breaker. It still returns immediately and fails closed.
-	if !errors.Is(err, ErrSessionTokenRejected) {
+	if !errors.Is(err, ErrSessionTokenRejected) && !errors.Is(err, net.ErrClosed) {
 		cn.health.recordFailure()
 	}
 	return err
@@ -202,16 +232,29 @@ func (cn *conn) dialOnce() error {
 	if cn.auth != nil {
 		token = cn.auth()
 	}
+	dialCtx := context.Background()
+	if cn.client != nil && cn.client.lifecycleCtx != nil {
+		dialCtx = cn.client.lifecycleCtx
+	}
 	if cn.transport != nil {
-		nc, err := cn.transport()
+		nc, err := cn.transport(dialCtx)
 		if err != nil {
+			if dialCtx.Err() != nil {
+				return net.ErrClosed
+			}
+			return err
+		}
+		if err := cn.adoptTransport(nc); err != nil {
 			return err
 		}
 		if err := clientHandshake(nc, token); err != nil {
-			_ = nc.Close()
+			cn.reset()
 			return err
 		}
-		cn.nc, cn.enc, cn.dec = nc, newRequestEncoder(nc), gob.NewDecoder(nc)
+		if err := cn.finishTransport(nc); err != nil {
+			cn.reset()
+			return err
+		}
 		return nil
 	}
 	// Timeout bounds the TCP (and TLS) connect so a blackholed authority
@@ -224,31 +267,44 @@ func (cn *conn) dialOnce() error {
 	dialer := &net.Dialer{KeepAlive: connKeepAlive, Timeout: to}
 	var lastErr error
 	for _, addr := range cn.addrs {
+		if err := dialCtx.Err(); err != nil {
+			return net.ErrClosed
+		}
 		var (
 			nc  net.Conn
 			err error
 		)
 		if cn.tls != nil {
-			nc, err = tls.DialWithDialer(dialer, "tcp", addr, cn.tls)
+			tlsDialer := &tls.Dialer{NetDialer: dialer, Config: cn.tls}
+			nc, err = tlsDialer.DialContext(dialCtx, "tcp", addr)
 		} else {
-			nc, err = dialer.Dial("tcp", addr)
+			nc, err = dialer.DialContext(dialCtx, "tcp", addr)
 		}
 		if err != nil {
+			if dialCtx.Err() != nil {
+				return net.ErrClosed
+			}
 			lastErr = err
 			continue
+		}
+		if err := cn.adoptTransport(nc); err != nil {
+			return err
 		}
 		// Authenticate to the server before using the connection (no-op when
 		// unset). The typed classification is the point: rejection means the
 		// CREDENTIAL is dead, not the network.
 		if err := clientHandshake(nc, token); err != nil {
-			_ = nc.Close()
+			cn.reset()
 			if errors.Is(err, ErrSessionTokenRejected) {
 				return fmt.Errorf("fsproto: dial %s: %w", addr, err)
 			}
 			lastErr = err
 			continue
 		}
-		cn.nc, cn.enc, cn.dec = nc, newRequestEncoder(nc), gob.NewDecoder(nc)
+		if err := cn.finishTransport(nc); err != nil {
+			cn.reset()
+			return err
+		}
 		return nil
 	}
 	if lastErr == nil {
@@ -258,41 +314,132 @@ func (cn *conn) dialOnce() error {
 }
 
 func (cn *conn) reset() {
-	if cn.nc != nil {
-		_ = cn.nc.Close()
-		cn.nc, cn.enc, cn.dec = nil, nil, nil
+	cn.stateMu.Lock()
+	nc := cn.nc
+	cn.nc, cn.enc, cn.dec = nil, nil, nil
+	cn.stateMu.Unlock()
+	if nc != nil {
+		_ = nc.Close()
 	}
 	cn.attached = ""
 }
 
+// adoptTransport publishes a freshly dialed socket before authentication so
+// Close/Abort can interrupt a blocked handshake. The client lifecycle gate
+// rejects and closes sockets returned by a dial after terminal closure.
+func (cn *conn) adoptTransport(nc net.Conn) error {
+	if cn.client != nil {
+		cn.client.lifecycleMu.Lock()
+		defer cn.client.lifecycleMu.Unlock()
+		if cn.client.isClosed() {
+			_ = nc.Close()
+			return net.ErrClosed
+		}
+	}
+	cn.stateMu.Lock()
+	cn.nc, cn.enc, cn.dec = nc, nil, nil
+	cn.stateMu.Unlock()
+	return nil
+}
+
+// finishTransport makes an authenticated socket request-capable. It shares
+// the close gate with adoption, so a handshake that races terminal closure
+// cannot publish encoders and proceed to an authority request.
+func (cn *conn) finishTransport(nc net.Conn) error {
+	if cn.client != nil {
+		cn.client.lifecycleMu.Lock()
+		defer cn.client.lifecycleMu.Unlock()
+		if cn.client.isClosed() {
+			return net.ErrClosed
+		}
+	}
+	cn.stateMu.Lock()
+	defer cn.stateMu.Unlock()
+	if cn.nc != nc {
+		return net.ErrClosed
+	}
+	cn.enc, cn.dec = newRequestEncoder(nc), gob.NewDecoder(nc)
+	return nil
+}
+
+func (cn *conn) connected() bool {
+	cn.stateMu.Lock()
+	defer cn.stateMu.Unlock()
+	return cn.nc != nil && cn.enc != nil && cn.dec != nil
+}
+
+func (cn *conn) transportState() (net.Conn, *requestEncoder, *gob.Decoder) {
+	cn.stateMu.Lock()
+	defer cn.stateMu.Unlock()
+	return cn.nc, cn.enc, cn.dec
+}
+
+// interrupt closes the current socket without rewriting conn state. A
+// checked-out roundtrip immediately wakes and owns reset; an idle connection
+// is reset by the pool closer after it is received.
+func (cn *conn) interrupt() {
+	cn.stateMu.Lock()
+	nc := cn.nc
+	cn.stateMu.Unlock()
+	if nc != nil {
+		_ = nc.Close()
+	}
+}
+
 func (cn *conn) roundtrip(req *Request) (*Response, error) {
+	resp, _, err := cn.roundtripSent(req)
+	return resp, err
+}
+
+// roundtripSent is roundtrip plus the ambiguity boundary needed by
+// resolved-side-effect operations. Request shape and allocation bounds are
+// checked before any transport work; a preflight rejection is therefore
+// provably unsent. Once encoding starts, an error is conservatively ambiguous
+// because it may follow a partial transport write.
+func (cn *conn) roundtripSent(req *Request) (*Response, bool, error) {
+	return cn.roundtripSentWithGate(req, false)
+}
+
+func (cn *conn) roundtripSentWithGate(req *Request, resolved bool) (*Response, bool, error) {
+	prepared, err := prepareRequest(req)
+	if err != nil {
+		return nil, false, err
+	}
 	// Gate before dialing/sending: while fail-fast is engaged, a non-exempt op
 	// fails immediately with ErrAuthorityUnreachable instead of burning a full
 	// opTimeout socket deadline against a confirmed-dead peer.
-	if err := cn.health.gate(cn.gateExempt); err != nil {
-		return nil, err
+	if err := cn.health.gate(cn.gateExempt || resolved); err != nil {
+		return nil, false, err
 	}
-	if err := cn.ensure(); err != nil {
-		return nil, err
+	if err := cn.ensureWithGate(resolved); err != nil {
+		return nil, false, err
+	}
+	if cn.client != nil && cn.client.isClosed() {
+		cn.reset()
+		return nil, false, net.ErrClosed
+	}
+	nc, enc, dec := cn.transportState()
+	if nc == nil || enc == nil || dec == nil {
+		return nil, false, errors.New("fsproto: connection transport disappeared")
 	}
 	// Bound the round-trip so a partitioned VCS surfaces as EIO (idempotent ops then
 	// retry) instead of hanging the FUSE op until the OS TCP timeout. The conn is
 	// reset on any error, so the deadline never leaks onto a reused connection.
-	_ = cn.nc.SetDeadline(time.Now().Add(opTimeout))
-	if err := cn.enc.Encode(req); err != nil {
+	_ = nc.SetDeadline(time.Now().Add(opTimeout))
+	if err := enc.encodePrepared(req, prepared); err != nil {
 		cn.health.recordFailure()
 		cn.reset()
-		return nil, err
+		return nil, true, err
 	}
 	var resp Response
-	if err := cn.dec.Decode(&resp); err != nil {
+	if err := dec.Decode(&resp); err != nil {
 		cn.health.recordFailure()
 		cn.reset()
-		return nil, err
+		return nil, true, err
 	}
-	_ = cn.nc.SetDeadline(time.Time{})
+	_ = nc.SetDeadline(time.Time{})
 	cn.health.recordSuccess()
-	return &resp, nil
+	return &resp, true, nil
 }
 
 // Dial opens a plaintext pool of connections to addr (which may be a comma-separated
@@ -318,10 +465,61 @@ func DialTLSAuth(addr string, pool int, tlsCfg *tls.Config, auth func() string) 
 // (net.Pipe) in environments where loopback listeners are unavailable; live
 // socket paths use Dial/DialTLS.
 func DialWithTransport(pool int, transport func() (net.Conn, error)) (*Client, error) {
-	return dialPool("in-process", pool, nil, nil, transport)
+	return dialPool("in-process", pool, nil, nil, adaptLegacyTransport(transport))
 }
 
-func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, transport func() (net.Conn, error)) (*Client, error) {
+// transportDialer is the one internal transport boundary. Every dial observes
+// the client's terminal lifecycle cancellation before it can hand a socket to
+// authentication or request framing.
+type transportDialer func(context.Context) (net.Conn, error)
+
+// adaptLegacyTransport preserves DialWithTransport's context-less API while
+// making client teardown independent of a callback that has not returned yet.
+// The unbuffered handoff is intentional: if cancellation wins, a callback
+// that eventually returns cannot strand its socket in an abandoned result
+// channel; the adapter closes that late socket instead.
+func adaptLegacyTransport(transport func() (net.Conn, error)) transportDialer {
+	if transport == nil {
+		return nil
+	}
+	return func(ctx context.Context) (net.Conn, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if ctx.Err() != nil {
+			return nil, net.ErrClosed
+		}
+		type result struct {
+			conn net.Conn
+			err  error
+		}
+		resultCh := make(chan result)
+		go func() {
+			conn, err := transport()
+			select {
+			case resultCh <- result{conn: conn, err: err}:
+			case <-ctx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+		select {
+		case got := <-resultCh:
+			if ctx.Err() != nil {
+				if got.conn != nil {
+					_ = got.conn.Close()
+				}
+				return nil, net.ErrClosed
+			}
+			return got.conn, got.err
+		case <-ctx.Done():
+			return nil, net.ErrClosed
+		}
+	}
+}
+
+func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, transport transportDialer) (*Client, error) {
 	if pool < 1 {
 		pool = 1
 	}
@@ -329,11 +527,15 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("fsproto: no authority address given")
 	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	c := &Client{
 		addrs: addrs, tls: tlsCfg, conns: make(chan *conn, pool),
-		closed:    make(chan struct{}),
-		redial:    NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
-		transport: transport,
+		closed:          make(chan struct{}),
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+		dedicated:       make(map[*conn]struct{}),
+		redial:          NewBackoff(DefaultReconnectBase, DefaultReconnectCap),
+		transport:       transport,
 	}
 	c.health = newConnHealth()
 	c.health.onEngage = func() { go c.runReachabilityProbe() }
@@ -347,6 +549,8 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 			return nil, err
 		}
 		c.conns <- cn
+		c.poolSize++
+		c.pool = append(c.pool, cn)
 	}
 	return c, nil
 }
@@ -391,7 +595,10 @@ func (c *Client) Do(req *Request) (*Response, error) {
 			return nil, err
 		}
 	}
-	cn := <-c.conns
+	cn, err := c.takeConn()
+	if err != nil {
+		return nil, err
+	}
 	defer func() { c.conns <- cn }()
 	var lastErr error
 	for attempt := 0; attempt < opDialAttempts; attempt++ {
@@ -422,7 +629,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 				// credential. Fail closed without another resolution path.
 				return nil, err
 			}
-			if cn.nc != nil {
+			if cn.connected() {
 				// Connected but refused at the protocol level (a session
 				// attach refusal): a redial cannot change the answer.
 				return nil, err
@@ -499,16 +706,36 @@ func (c *Client) Subscribe() (<-chan coherence.Batch, AckFunc, error) {
 	// gateExempt: the subscribe stream is a recovery path — its 500ms reconnect
 	// loop doubles as an on-demand reachability probe, so it must dial even
 	// while fail-fast is engaged (clearing the breaker on the first success).
-	cn := &conn{addrs: c.addrs, tls: c.tls, auth: c.tokenForHandshake, client: c, health: c.health, gateExempt: true}
+	cn := &conn{
+		addrs:      c.addrs,
+		tls:        c.tls,
+		auth:       c.tokenForHandshake,
+		transport:  c.transport,
+		client:     c,
+		health:     c.health,
+		gateExempt: true,
+	}
+	if !c.registerDedicated(cn) {
+		return nil, nil, net.ErrClosed
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			cn.reset()
+			c.unregisterDedicated(cn)
+		}
+	}()
 	if err := cn.ensure(); err != nil {
 		return nil, nil, err
+	}
+	if c.isClosed() {
+		return nil, nil, net.ErrClosed
 	}
 	if es := c.exactState(); es != nil && !es.isFenced() {
 		resp, err := cn.roundtrip(&Request{
 			Op: OpSessionAttach, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
 		})
 		if err != nil {
-			cn.reset()
 			return nil, nil, err
 		}
 		if resp.Status != OK {
@@ -518,13 +745,14 @@ func (c *Client) Subscribe() (<-chan coherence.Batch, AckFunc, error) {
 			if resp.Status == ESTALE {
 				es.fence()
 			}
-			cn.reset()
 			return nil, nil, statusError("subscribe session attach", resp.Status)
 		}
 		cn.attached = es.id
 	}
+	if c.isClosed() {
+		return nil, nil, net.ErrClosed
+	}
 	if err := cn.enc.Encode(&Request{Op: OpSubscribe, Owner: c.owner}); err != nil {
-		cn.reset()
 		return nil, nil, err
 	}
 	// Acks are the only writes after the subscribe request; serialize them
@@ -543,13 +771,23 @@ func (c *Client) Subscribe() (<-chan coherence.Batch, AckFunc, error) {
 		_ = cn.nc.SetWriteDeadline(time.Time{})
 	}
 	ch := make(chan coherence.Batch, 1024)
+	handedOff = true
 	go func() {
 		defer close(ch)
 		defer func() {
 			ackMu.Lock()
 			cn.reset()
 			ackMu.Unlock()
+			c.unregisterDedicated(cn)
 		}()
+		deliver := func(batch coherence.Batch) bool {
+			select {
+			case ch <- batch:
+				return true
+			case <-c.closed:
+				return false
+			}
+		}
 		for {
 			// Arm a read deadline: the server heartbeats every streamHeartbeat, so a
 			// gap longer than streamReadTimeout means the stream is dead/half-open.
@@ -563,14 +801,18 @@ func (c *Client) Subscribe() (<-chan coherence.Batch, AckFunc, error) {
 			if resp.Keepalive {
 				// Liveness only — but convey the generation so the mount can detect an
 				// authority restart/promotion (a new Gen) even on an otherwise idle stream.
-				ch <- coherence.Batch{
+				if !deliver(coherence.Batch{
 					Pos: resp.InvPos, Bootstrap: resp.InvBootstrap,
 					Invs: []coherence.Invalidation{{Gen: resp.Gen}},
+				}) {
+					return
 				}
 				continue
 			}
 			if len(resp.Invs) > 0 {
-				ch <- coherence.Batch{Pos: resp.InvPos, Invs: resp.Invs}
+				if !deliver(coherence.Batch{Pos: resp.InvPos, Invs: resp.Invs}) {
+					return
+				}
 			}
 		}
 	}()
@@ -813,16 +1055,86 @@ func (c *Client) TruncateOrphan(ino uint64, size int64) (status int32, err error
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.expireSessionOnClose()
-		close(c.closed)
+		c.closeTransportGate()
 	})
-	for {
-		select {
-		case cn := <-c.conns:
-			cn.reset()
-		default:
-			return nil
+	c.closeDedicated()
+	c.closePool()
+	return nil
+}
+
+// Abort closes this client's transports and local session machinery without
+// sending SessionExpire. It is the crash-equivalent teardown used only after
+// a forced journal-first unmount: authority lease expiry, not a clean control
+// RPC, must preserve delegation recovery ownership. Active pooled operations
+// return their connection before Abort completes, so callers may then safely
+// quiesce engine workers and close the WAL.
+func (c *Client) Abort() error {
+	c.closeOnce.Do(func() {
+		if es := c.exactState(); es != nil {
+			es.fence()
 		}
+		c.closeTransportGate()
+	})
+	c.closeDedicated()
+	c.closePool()
+	return nil
+}
+
+// registerDedicated joins a dedicated transport to the client's close
+// lifecycle. The closed check and WaitGroup Add share lifecycleMu with the
+// close transition, so no Add can race a close-side Wait.
+func (c *Client) registerDedicated(cn *conn) bool {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.isClosed() {
+		return false
 	}
+	c.dedicated[cn] = struct{}{}
+	c.dedicatedWG.Add(1)
+	return true
+}
+
+func (c *Client) unregisterDedicated(cn *conn) {
+	c.lifecycleMu.Lock()
+	if _, ok := c.dedicated[cn]; ok {
+		delete(c.dedicated, cn)
+		c.dedicatedWG.Done()
+	}
+	c.lifecycleMu.Unlock()
+}
+
+// closeTransportGate is the single terminal transport transition. It cancels
+// connect attempts, closes the public signal, and interrupts every socket
+// while transport adoption is excluded by lifecycleMu.
+func (c *Client) closeTransportGate() {
+	c.lifecycleMu.Lock()
+	if c.lifecycleCancel != nil {
+		c.lifecycleCancel()
+	}
+	close(c.closed)
+	for _, cn := range c.pool {
+		cn.interrupt()
+	}
+	for cn := range c.dedicated {
+		cn.interrupt()
+	}
+	c.lifecycleMu.Unlock()
+}
+
+func (c *Client) closeDedicated() {
+	c.dedicatedWG.Wait()
+}
+
+func (c *Client) closePool() {
+	c.poolOnce.Do(func() {
+		for _, cn := range c.pool {
+			cn.interrupt()
+		}
+		for i := 0; i < c.poolSize; i++ {
+			cn := <-c.conns
+			cn.reset()
+		}
+	})
 }
 
 // closeExpireTimeout bounds the clean-unmount session expire: a dead
@@ -838,7 +1150,7 @@ func (c *Client) expireSessionOnClose() {
 	select {
 	case cn := <-c.conns:
 		defer func() { c.conns <- cn }()
-		if cn.nc == nil {
+		if !cn.connected() {
 			return // not connected: never dial during teardown
 		}
 		if cn.attached != es.id {
@@ -861,20 +1173,21 @@ func (c *Client) expireSessionOnClose() {
 // boundedRoundtrip is roundtrip with a caller-chosen deadline and NO redial:
 // teardown paths must not hang on a dead authority.
 func (cn *conn) boundedRoundtrip(req *Request, d time.Duration) (*Response, error) {
-	if cn.nc == nil {
+	nc, enc, dec := cn.transportState()
+	if nc == nil || enc == nil || dec == nil {
 		return nil, fmt.Errorf("fsproto: connection not established")
 	}
-	_ = cn.nc.SetDeadline(time.Now().Add(d))
-	if err := cn.enc.Encode(req); err != nil {
+	_ = nc.SetDeadline(time.Now().Add(d))
+	if err := enc.Encode(req); err != nil {
 		cn.reset()
 		return nil, err
 	}
 	var resp Response
-	if err := cn.dec.Decode(&resp); err != nil {
+	if err := dec.Decode(&resp); err != nil {
 		cn.reset()
 		return nil, err
 	}
-	_ = cn.nc.SetDeadline(time.Time{})
+	_ = nc.SetDeadline(time.Time{})
 	return &resp, nil
 }
 

@@ -23,7 +23,7 @@ func TestLastCloseDoesNotImplyAuthorityBarrier(t *testing.T) {
 		t.Fatalf("create: %d", st)
 	}
 	n := NewNodeState(a.Ino, a.Ino != 0)
-	if st := v.RegisterOpened("d/f", n); st != fsproto.OK {
+	if st := v.RegisterOpened(context.Background(), "d/f", n); st != fsproto.OK {
 		t.Fatalf("register open: %d", st)
 	}
 	if st := v.FsyncHandle("d/f", n); st != fsproto.OK {
@@ -58,7 +58,7 @@ func TestFsyncThenCloseDoesNotRunSecondBarrier(t *testing.T) {
 		t.Fatalf("create: %d", st)
 	}
 	n := NewNodeState(a.Ino, a.Ino != 0)
-	if st := v.RegisterOpened("f", n); st != fsproto.OK {
+	if st := v.RegisterOpened(context.Background(), "f", n); st != fsproto.OK {
 		t.Fatalf("register open: %d", st)
 	}
 	if st := v.FsyncHandle("f", n); st != fsproto.OK {

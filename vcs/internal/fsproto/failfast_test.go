@@ -230,7 +230,7 @@ func TestFailFastAuthRejectionIsNotUnreachability(t *testing.T) {
 		}()
 		return client, nil
 	}
-	cn := &conn{transport: dial, health: h, auth: func() string { return "wrong-token" }}
+	cn := &conn{transport: adaptLegacyTransport(dial), health: h, auth: func() string { return "wrong-token" }}
 
 	// Far more rejections than the threshold, spread past the grace: the
 	// reconnect-loop shape that must NOT engage.

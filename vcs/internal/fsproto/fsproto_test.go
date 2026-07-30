@@ -24,7 +24,7 @@ func (nopBlobs) Blob(context.Context, string) ([]byte, error) {
 }
 
 // newManagedWorkFS opens (or replays) the file-backed PFJ3 entry log at
-// walPath and builds the MANAGED workfs over it — the only generation a v7
+// walPath and builds the MANAGED workfs over it — the only generation a v8
 // server serves. It is the package's standard authority harness.
 func newManagedWorkFS(t testing.TB, entries []backend.Entry, blobs content.BlobReader, walPath string) *workfs.FS {
 	t.Helper()

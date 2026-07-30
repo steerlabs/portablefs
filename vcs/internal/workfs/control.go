@@ -316,6 +316,20 @@ func (fs *FS) MutateEnv(r wal.Record, owner string) (MutationResult, error) {
 	return fs.managedMutateEnv(r, owner)
 }
 
+// MutateEnvGated is MutateEnv with atomic write-back delegation admission.
+// paths are the mutation's affected namespace paths. The final overlap check
+// and the mutation-or-EAGAIN row are selected under the same fs.mu
+// reservation used by delegation grants.
+func (fs *FS) MutateEnvGated(r wal.Record, owner string, paths ...string) (MutationResult, error) {
+	if !r.Env.Valid() {
+		return MutationResult{}, fmt.Errorf("vcs: exact gated mutation lacks an envelope")
+	}
+	if fs.managed == nil {
+		return MutationResult{}, ErrNotManaged
+	}
+	return fs.managedMutateEnvGated(r, owner, paths...)
+}
+
 // errnoOf maps an apply error to the wire errno recorded in a slot outcome.
 // It MUST agree with the protocol layer's error mapping (fsproto.toErrno) so
 // a duplicate retry replays exactly the status the live reply carried; both

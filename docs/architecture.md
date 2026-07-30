@@ -18,7 +18,7 @@ Everything below exists to preserve that contract.
 
 2. **The custom mount protocol is the only data plane.**
    Linux FUSE, macOS FSKit, and container bind mounts terminate in the same custom
-   protocol (fsproto v7) today; the Kubernetes CSI surface is a planned addition that
+   protocol (fsproto v8) today; the Kubernetes CSI surface is a planned addition that
    will terminate there too (not yet packaged here).
 
 3. **One active volume has one logical authority.**

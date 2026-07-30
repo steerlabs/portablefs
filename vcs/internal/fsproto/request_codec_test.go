@@ -70,6 +70,7 @@ func TestRequestCodecRoundTripAllFields(t *testing.T) {
 		OpenIno:      83,
 		OpenState:    true,
 		OpenInos:     []uint64{89, 97},
+		OpenPaths:    []string{"scope/file", "scope/peer"},
 		RegisterOpen: true,
 
 		SessionGen:   101,
@@ -127,10 +128,41 @@ func TestRequestCodecAllowsMaxWriteAndRejectsAggregateOverflow(t *testing.T) {
 	}
 }
 
+func TestRequestEncoderBoundsDelegationPreparePathsBeforeWriting(t *testing.T) {
+	paths := make([]string, MaxPrepareOpenPaths+1)
+	for i := range paths {
+		paths[i] = "scope/file"
+	}
+	var dst bytes.Buffer
+	err := newRequestEncoder(&dst).Encode(&Request{
+		Op: OpDelegationPrepareRelease, Path: "scope",
+		CheckoutEpoch: "epoch", OpenPaths: paths,
+	})
+	if !errors.Is(err, errMalformedRequest) {
+		t.Fatalf("oversize open-path list error = %v, want errMalformedRequest", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("oversize open-path encoder wrote %d bytes before rejecting", dst.Len())
+	}
+
+	dst.Reset()
+	err = newRequestEncoder(&dst).Encode(&Request{
+		Op: OpDelegationPrepareRelease, Path: "scope",
+		CheckoutEpoch: "epoch",
+		OpenPaths:     []string{strings.Repeat("p", MaxPathBytes+1)},
+	})
+	if !errors.Is(err, errMalformedRequest) {
+		t.Fatalf("oversize individual open path error = %v, want errMalformedRequest", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("oversize individual open path wrote %d bytes before rejecting", dst.Len())
+	}
+}
+
 func requestDynamicOffset(t *testing.T, wire []byte) int {
 	t.Helper()
 	// Skip the outer frame header and every fixed-width body field through
-	// AckPos. This mirrors the frozen PFRQ1 field order.
+	// AckPos. This mirrors the PFRQ2 field order.
 	const fixedBodyBytes = 4 + 1 + 1 + 4 +
 		8 + 8 + 4 + 8 + 4 + 4 + 8 +
 		8 + 8 + 8 + 1 +
@@ -185,12 +217,22 @@ func TestRequestDecoderRejectsExcessiveCollectionBeforeAllocation(t *testing.T) 
 	for range 12 {
 		off = skipLengthPrefixed(t, base, off)
 	}
-	// The empty request has four consecutive zero counts at this point:
-	// OrphanInos, OpenInos, Records, and WBScopes.
-	for i, name := range []string{"orphan inos", "open inos", "records", "write-back scopes"} {
-		t.Run(name, func(t *testing.T) {
+	// The empty request has five consecutive zero counts at this point:
+	// OrphanInos, OpenInos, OpenPaths, Records, and WBScopes.
+	tests := []struct {
+		name string
+		max  uint32
+	}{
+		{"orphan inos", maxRequestCollectionItems},
+		{"open inos", maxRequestCollectionItems},
+		{"open paths", MaxPrepareOpenPaths},
+		{"records", MaxBatchRecords},
+		{"write-back scopes", maxRequestCollectionItems},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			wire := append([]byte(nil), base...)
-			binary.BigEndian.PutUint32(wire[off+4*i:off+4*i+4], maxRequestCollectionItems+1)
+			binary.BigEndian.PutUint32(wire[off+4*i:off+4*i+4], tt.max+1)
 			if _, err := decodeRequestForTest(wire); !errors.Is(err, errMalformedRequest) {
 				t.Fatalf("excessive collection error = %v, want errMalformedRequest", err)
 			}

@@ -402,7 +402,7 @@ func TestRenameAndRemoveLocal(t *testing.T) {
 	if _, handled, err := e.Create(ctx, "d/b", 0o644, false, false); err != nil || !handled {
 		t.Fatalf("create b: %v %v", handled, err)
 	}
-	if _, handled, err := e.Rename(ctx, "d/a", "d/b"); err != nil || !handled {
+	if _, handled, err := e.Rename(ctx, "d/a", "d/b", nil); err != nil || !handled {
 		t.Fatalf("rename over: %v %v", handled, err)
 	}
 	if _, res := e.Lookup("d/a"); res != LookupNegative {
@@ -459,7 +459,7 @@ func TestFoldedRenameBaseReadsFollowOldName(t *testing.T) {
 	mustAck("create lock", h, err)
 	_, h, err = e.WriteAt(ctx, "d/index.lock", 0, []byte("index-001")) // seq 4
 	mustAck("write lock", h, err)
-	_, h, err = e.Rename(ctx, "d/index.lock", "d/index") // seq 5
+	_, h, err = e.Rename(ctx, "d/index.lock", "d/index", nil) // seq 5
 	mustAck("rename", h, err)
 
 	// The authority applied through seq 4 (both writes) but NOT the rename.

@@ -15,11 +15,121 @@ package workfs
 import (
 	"errors"
 	"sort"
+	"strings"
 
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pfc2"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
+
+var (
+	ErrDelegationPrepareNotHeld = errors.New("vcs: delegation prepare does not name the caller's live grant")
+	errPreparedPinsAlreadyHeld  = errors.New("vcs: prepared open pins already held")
+)
+
+const maxDelegationPreparePaths = 127 // one pin per path within PFJ3's 128-control row ceiling
+
+// ManagedPrepareDelegationPins resolves and durably pins an ordered path
+// batch while the caller's exact write-back delegation remains held. The
+// grant freezes peer namespace changes and the client handoff barrier freezes
+// its own opens/renames, so a lost reply may safely rerun this idempotent
+// decision and reconstruct the same aligned inode vector.
+func (fs *FS) ManagedPrepareDelegationPins(
+	ref pfc2.SessionRef,
+	scope string,
+	epoch string,
+	paths []string,
+) ([]uint64, error) {
+	if fs.managed == nil {
+		return nil, ErrNotManaged
+	}
+	if err := pfc2.ValidateCanonicalPath(scope); err != nil {
+		return nil, invalidMutation("delegation prepare scope: %v", err)
+	}
+	if err := pfc2.Epoch(epoch).Validate(); err != nil {
+		return nil, invalidMutation("delegation prepare epoch: %v", err)
+	}
+	if len(paths) == 0 || len(paths) > maxDelegationPreparePaths {
+		return nil, invalidMutation("invalid delegation prepare shape")
+	}
+	canonicalScope := scope
+	// Authenticate ownership before any lazy-base hydration. The final
+	// reserved-state check inside commitEntryDynamic remains authoritative
+	// against a concurrent release/fence; this applied-state check prevents
+	// a merely attached non-holder from driving path hydration work.
+	appliedGrant, held := fs.managed.applied.CheckoutAt(canonicalScope)
+	if !held || appliedGrant.Holder != ref || string(appliedGrant.Epoch) != epoch ||
+		appliedGrant.WritebackID == "" || appliedGrant.Recovery {
+		return nil, ErrDelegationPrepareNotHeld
+	}
+	canonicalPaths := make([]string, len(paths))
+	for i, candidate := range paths {
+		if err := pfc2.ValidateCanonicalPath(candidate); err != nil {
+			return nil, invalidMutation("delegation prepare open path: %v", err)
+		}
+		canonical := candidate
+		if !pathWithin(canonical, canonicalScope) {
+			return nil, invalidMutation("open path %q is outside delegation %q", candidate, canonicalScope)
+		}
+		canonicalPaths[i] = canonical
+		// Hydrate every lazy-base binding outside fs.mu. The held grant makes
+		// the later locked re-resolution stable against peer namespace work.
+		if err := fs.withReadPath(canonical, func(*inode) error { return nil }); err != nil {
+			return nil, err
+		}
+	}
+
+	inos := make([]uint64, len(canonicalPaths))
+	build := func() ([]pfc2.Record, error) {
+		grant, held := fs.managed.reserved.CheckoutAt(canonicalScope)
+		if !held || grant.Holder != ref || string(grant.Epoch) != epoch ||
+			grant.WritebackID == "" || grant.Recovery {
+			return nil, ErrDelegationPrepareNotHeld
+		}
+
+		uniqueNew := make(map[uint64]struct{}, len(canonicalPaths))
+		for i, openPath := range canonicalPaths {
+			node := fs.resolve(openPath)
+			if node == nil || node.ino == 0 || fs.pendingReaps[node.ino] != 0 {
+				return nil, ErrPinTargetGone
+			}
+			inos[i] = node.ino
+			if !fs.managed.reserved.HasPin(ref, node.ino) {
+				uniqueNew[node.ino] = struct{}{}
+			}
+		}
+		if len(uniqueNew) == 0 {
+			return nil, errPreparedPinsAlreadyHeld
+		}
+		ordered := make([]uint64, 0, len(uniqueNew))
+		for ino := range uniqueNew {
+			ordered = append(ordered, ino)
+		}
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+		records := make([]pfc2.Record, 0, len(ordered))
+		for _, ino := range ordered {
+			records = append(records, pfc2.Record{
+				Kind: pfc2.KindOpenPinChange,
+				OpenPinChange: &pfc2.OpenPinChange{
+					Session: ref,
+					Ino:     ino,
+				},
+			})
+		}
+		return records, nil
+	}
+	if _, err := fs.commitEntryDynamic(build, ""); err != nil {
+		if errors.Is(err, errPreparedPinsAlreadyHeld) {
+			return append([]uint64(nil), inos...), nil
+		}
+		return nil, classifyCoordinationCommit(err)
+	}
+	return append([]uint64(nil), inos...), nil
+}
+
+func pathWithin(candidate, scope string) bool {
+	return candidate == scope || strings.HasPrefix(candidate, scope+"/")
+}
 
 // ManagedDelegationDecide observes the staged checkout table under the ONE
 // fs.mu reservation and journals either the granted delegation (a
@@ -91,6 +201,91 @@ type WritebackConflict struct {
 	Kind  string // SCOPE_MISSING, HOLDER_CHANGED, DIGEST_MISMATCH
 }
 
+func evaluateWritebackRebind(
+	state *pfc2.State,
+	writebackID string,
+	scopes []WritebackScope,
+	through uint64,
+	digest [32]byte,
+) ([]WritebackConflict, map[pfc2.SessionRef]bool) {
+	paths := make([]string, len(scopes))
+	for i, scope := range scopes {
+		paths[i] = cleanPath(scope.Path)
+	}
+	view := state.WritebackRebindSnapshot(writebackID, paths)
+	conflicts := make([]WritebackConflict, 0, len(scopes)+1)
+	if view.StreamExists {
+		if view.Stream.Through != through || view.Stream.Digest != digest {
+			conflicts = append(conflicts, WritebackConflict{Kind: "DIGEST_MISMATCH"})
+		}
+	} else if through != 0 {
+		conflicts = append(conflicts, WritebackConflict{Kind: "DIGEST_MISMATCH"})
+	}
+	holders := make(map[pfc2.SessionRef]bool)
+	for i, scope := range scopes {
+		canonical := paths[i]
+		grant, ok := view.Scopes[i], view.ScopeExists[i]
+		switch {
+		case !ok:
+			conflicts = append(conflicts, WritebackConflict{
+				Path: canonical, Epoch: scope.Epoch, Kind: "SCOPE_MISSING",
+			})
+		case string(grant.Epoch) != scope.Epoch || grant.WritebackID != writebackID:
+			conflicts = append(conflicts, WritebackConflict{
+				Path: canonical, Epoch: scope.Epoch, Kind: "HOLDER_CHANGED",
+			})
+		default:
+			holders[grant.Holder] = true
+		}
+	}
+	return conflicts, holders
+}
+
+// ManagedWritebackConflicts revalidates a rejected rebind against one coherent
+// snapshot of the durable applied state. It is read-only: duplicate exact
+// replies use it solely to restore typed proof omitted from PFC2's deliberately
+// compact frozen Outcome. A stream watermark only advances, so a stale
+// watermark/digest rejection remains DIGEST_MISMATCH after a lost reply.
+func (fs *FS) ManagedWritebackConflicts(
+	writebackID string,
+	scopes []WritebackScope,
+	through uint64,
+	digest [32]byte,
+) ([]WritebackConflict, error) {
+	if fs.managed == nil {
+		return nil, ErrNotManaged
+	}
+	conflicts, _ := evaluateWritebackRebind(fs.managed.applied, writebackID, scopes, through, digest)
+	return conflicts, nil
+}
+
+// reservedDelegationBlocks reports whether the reservation-order projection
+// contains a write-back delegation overlapping any path. The caller MUST hold
+// fs.mu: this helper is used only inside commitEntryDynamic* decision
+// callbacks, so the observation and the row chosen from it are one atomic
+// journal reservation.
+//
+// self is non-nil for read-like acquisitions such as POSIX locks: that
+// session's own live grant may serve the operation. Exact tree mutations pass
+// nil because write-through must never run under even the caller's own grant.
+func (fs *FS) reservedDelegationBlocks(self *pfc2.SessionRef, paths ...string) bool {
+	for _, candidate := range paths {
+		if candidate == "" {
+			continue
+		}
+		for _, grant := range fs.managed.reserved.OverlappingCheckouts(cleanPath(candidate)) {
+			if grant.WritebackID == "" {
+				continue
+			}
+			if self != nil && grant.Holder == *self && !grant.Recovery {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // ManagedWritebackRebind atomically claims a parked stream for the caller's
 // session: it verifies the stream's durable watermark + digest against the
 // client's claim, fences the dead holder generation when it is still live
@@ -112,27 +307,13 @@ func (fs *FS) ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebac
 	copy(key.RequestHash[:], envHash)
 	var conflicts []WritebackConflict
 	build := func() ([]pfc2.Record, error) {
-		conflicts = conflicts[:0]
-		if view, ok := fs.managed.reserved.StreamState(writebackID); ok {
-			if view.Through != through || view.Digest != digest {
-				conflicts = append(conflicts, WritebackConflict{Kind: "DIGEST_MISMATCH"})
-			}
-		} else if through != 0 {
-			conflicts = append(conflicts, WritebackConflict{Kind: "DIGEST_MISMATCH"})
-		}
-		holders := map[pfc2.SessionRef]bool{}
-		for _, sc := range scopes {
-			canonical := cleanPath(sc.Path)
-			g, ok := fs.managed.reserved.CheckoutAt(canonical)
-			switch {
-			case !ok:
-				conflicts = append(conflicts, WritebackConflict{Path: canonical, Epoch: sc.Epoch, Kind: "SCOPE_MISSING"})
-			case string(g.Epoch) != sc.Epoch || g.WritebackID != writebackID:
-				conflicts = append(conflicts, WritebackConflict{Path: canonical, Epoch: sc.Epoch, Kind: "HOLDER_CHANGED"})
-			default:
-				if g.Holder != ref {
-					holders[g.Holder] = true
-				}
+		var holders map[pfc2.SessionRef]bool
+		conflicts, holders = evaluateWritebackRebind(
+			fs.managed.reserved, writebackID, scopes, through, digest,
+		)
+		for holder := range holders {
+			if holder == ref {
+				delete(holders, holder)
 			}
 		}
 		if len(conflicts) > 0 {
@@ -180,13 +361,13 @@ func (fs *FS) ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebac
 // ManagedWritebackDiscard releases a parked stream's recovery scopes as an
 // audited data-loss decision: one journal row carrying the identity outcome
 // plus a CheckoutDiscard per scope. An EMPTY scope list means "every grant
-// bound to writebackID": the recovering mount proved its stream is empty (a
-// valid header with zero frames — no mutation was ever acknowledged, because
-// frames append before any ack), so the grants a crash orphaned between the
-// authority's journal row and the client's DELEGATION frame are released
+// bound to writebackID": the recovering mount proved no unshipped mutation
+// depends on any remaining authority grant. That includes both an acquire
+// orphaned before its DELEGATION frame and a fully-drained grant whose local
+// RELEASE frame was synced before Checkin; either remainder is released
 // losslessly. A still-live zombie holder generation is fenced in the same
-// journal group first (only the mount owning the store flock can compute
-// this writebackID, so the claim proves the mount identity moved on).
+// journal group first (only the mount owning the store flock can compute this
+// writebackID, so the claim proves the mount identity moved on).
 func (fs *FS) ManagedWritebackDiscard(env *wal.Envelope, envHash []byte, writebackID string, scopes []WritebackScope) error {
 	if fs.managed == nil {
 		return ErrNotManaged

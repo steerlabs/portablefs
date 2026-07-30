@@ -4,8 +4,8 @@ import "fmt"
 
 // Protocol version negotiation.
 //
-// The PortableFS v2 baseline is ONE protocol version: v7. Requests use the
-// allocation-safe, size-framed PFRQ1 codec; responses remain gob. Exact mount
+// The PortableFS v2 baseline is ONE protocol version: v8. Requests use the
+// allocation-safe, size-framed PFRQ2 codec; responses remain gob. Exact mount
 // sessions, journaled coordination, parent-version stamping, fused open
 // registration, xattrs, hard links, and atomic append are all MANDATORY parts
 // of the baseline. Optional optimizations that preserve those baseline
@@ -13,30 +13,34 @@ import "fmt"
 //
 // Both sides fail closed against an older peer:
 //
-//   - A v7 client probes first (OpProtocolVersion carries its own version in
+//   - A v8 client probes first (OpProtocolVersion carries its own version in
 //     Request.Size) and refuses any authority that does not answer OK with
-//     ProtoVersion == 7 — with an error that names both versions.
-//   - A v7 server answers a probe carrying any other client version with
+//     ProtoVersion == 8. A peer that understands PFRQ2 returns both versions
+//     in the typed mismatch; a PFRQ1 peer rejects the newer frame and the
+//     client reports that framing error. There is no legacy probe lane.
+//   - A v8 server answers a probe carrying any other client version with
 //     EINVAL (its own version still in the response, so a newer client can
 //     report the mismatch), and refuses every envelope-less mutation, so an
 //     old client that ignores the probe outcome fails closed on its first
 //     write.
 //
-// PFRQ1 cannot be rolling-upgraded against a v5 gob-request peer: the first
-// request fails closed at framing. Upgrade authorities and clients together.
+// PFRQ2 cannot be rolling-upgraded against an older request-wire peer: the
+// first request fails closed at framing. Upgrade authorities and clients
+// together.
 //
-// Version history (all retired; no arm below v7 is accepted):
+// Version history (all retired; no arm below v8 is accepted):
 //
 //	1: pre-negotiation builds. 2: the probe. 3: exact mount sessions.
 //	4: journaled coordination. 5: the v2 baseline — v4 with every
 //	   formerly-optional capability mandatory and the legacy arms removed.
 //	6: allocation-safe PFRQ1 requests; responses remain gob.
 //	7: globally ordered write-back batches carry explicit scope/epoch runs.
+//	8: delegation release prepares bounded open-path pins before checkin.
 //
 // Future protocol changes that are not wire-compatible must bump
 // ProtocolVersion and gate the new behavior on the negotiated value; additive
 // response gob fields do not require a bump (gob decoders ignore unknown fields).
-const ProtocolVersion uint32 = 7
+const ProtocolVersion uint32 = 8
 
 // Optional protocol features. A client selects these lanes only from the
 // version probe; an older authority's zero bitmap is a definite pre-mutation
