@@ -153,9 +153,12 @@ public struct PfsEnvelope: @unchecked Sendable {
     set {_uniqueStorage()._publicationAckRequired = newValue}
   }
 
-  /// Strictly increasing within one connection. Every request issued while
-  /// producing one FSKit framework reply carries the same nonzero ID, making a
-  /// multi-RPC callback one admission and publication unit across handoffs.
+  /// Allocated strictly increasingly within one connection when a framework
+  /// callback first issues a cache-producing request. Earlier nonpublishing
+  /// requests carry zero; later requests from that callback carry the same
+  /// nonzero ID, making a multi-RPC callback one admission and publication unit
+  /// across handoffs. Protocol minor 3 introduced this lazy allocation rule;
+  /// a fresh nonpublishing request with a nonzero ID is a protocol violation.
   public var operationID: UInt64 {
     get {return _storage._operationID}
     set {_uniqueStorage()._operationID = newValue}
@@ -711,7 +714,7 @@ public struct PfsPublicationAck: Sendable {
   // methods supported on all messages.
 
   /// Deprecated request-scoped identifier from protocol minor 1. Protocol
-  /// minor 2 clients leave it zero and acknowledge operation_id instead.
+  /// minors 2 and later leave it zero and acknowledge operation_id instead.
   public var publishedRequestID: UInt64 = 0
 
   public var operationID: UInt64 = 0

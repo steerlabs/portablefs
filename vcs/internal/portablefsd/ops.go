@@ -65,6 +65,10 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 			root = a.root
 			if root == nil {
 				root = a.registerLocked("", syntheticRootAttr())
+				if root == nil {
+					a.mu.Unlock()
+					return pfslocal.ResolveReply{}, darwinEIO
+				}
 				changed = true
 			}
 			a.mu.Unlock()
@@ -77,6 +81,10 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 		}
 		a.mu.Lock()
 		root = a.registerLocked("", attr)
+		if root == nil {
+			a.mu.Unlock()
+			return pfslocal.ResolveReply{}, darwinEIO
+		}
 		changed = true
 		a.mu.Unlock()
 	}
@@ -136,6 +144,9 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 	a.mu.Lock()
 	rec := a.registerLocked(p, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
@@ -307,6 +318,9 @@ func (a *attach) enumeratePageLocked(enumRec *enumerationRecord, dir string, sta
 		} else {
 			rec = a.registerLocked(p, e.Attr)
 		}
+		if rec == nil {
+			return nil, darwinEIO
+		}
 		cookie := uint64(0)
 		if enumRec != nil && i < len(ents)-1 {
 			var ok bool
@@ -432,6 +446,9 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 	a.mu.Lock()
 	rec = a.registerLocked(rec.path, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
@@ -496,6 +513,9 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	a.mu.Lock()
 	rec = a.registerLocked(rec.path, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
@@ -635,6 +655,9 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	a.mu.Lock()
 	rec := a.registerLocked(h.path, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
@@ -724,6 +747,9 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 	a.mu.Lock()
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
@@ -783,6 +809,9 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 	a.mu.Lock()
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
@@ -1066,6 +1095,9 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 	a.mu.Lock()
 	rec := a.registerCreatedLocked(p, attr)
 	a.mu.Unlock()
+	if rec == nil {
+		return nil, darwinEIO
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}

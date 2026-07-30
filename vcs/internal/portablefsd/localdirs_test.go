@@ -283,7 +283,11 @@ func TestExactGraftRefreshSamplesOnlyConfinedLocalFile(t *testing.T) {
 		}
 		return kernelRefreshApplied, nil
 	}
-	wantPath, wantItem, wantSize = "cache/pure", pureID, int64(len(pureData))
+	pureFSKitID, ok := fskitItemID(pureID)
+	if !ok {
+		t.Fatal("map pure graft FSKit item ID")
+	}
+	wantPath, wantItem, wantSize = "cache/pure", pureFSKitID, int64(len(pureData))
 	if err := a.exactKernelRefresh(context.Background(), pureID); err != nil {
 		t.Fatalf("pure graft exact refresh: %v", err)
 	}
@@ -306,7 +310,11 @@ func TestExactGraftRefreshSamplesOnlyConfinedLocalFile(t *testing.T) {
 	if eno != 0 {
 		t.Fatalf("write shadowed graft errno=%d", eno)
 	}
-	wantPath, wantItem, wantSize = "cache/shadowed", shadowID, int64(len(localData))
+	shadowFSKitID, ok := fskitItemID(shadowID)
+	if !ok {
+		t.Fatal("map shadowed graft FSKit item ID")
+	}
+	wantPath, wantItem, wantSize = "cache/shadowed", shadowFSKitID, int64(len(localData))
 	if err := a.exactKernelRefresh(context.Background(), shadowID); err != nil {
 		t.Fatalf("shadowed graft exact refresh: %v", err)
 	}

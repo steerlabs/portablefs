@@ -43,9 +43,12 @@ message Envelope {
   // for such a reply after the framework reply callback returns. Replies
   // without this bit must not be acknowledged.
   bool publication_ack_required = 2;
-  // Strictly increasing within one connection. Every request issued while
-  // producing one FSKit framework reply carries the same nonzero ID, making a
-  // multi-RPC callback one admission and publication unit across handoffs.
+  // Allocated strictly increasingly within one connection when a framework
+  // callback first issues a cache-producing request. Earlier nonpublishing
+  // requests carry zero; later requests from that callback carry the same
+  // nonzero ID, making a multi-RPC callback one admission and publication unit
+  // across handoffs. Protocol minor 3 introduced this lazy allocation rule;
+  // a fresh nonpublishing request with a nonzero ID is a protocol violation.
   uint64 operation_id = 3;
   oneof body {
     // client → daemon
@@ -126,7 +129,7 @@ message Hello {
 // has finished installing into FSKit.
 message PublicationAck {
   // Deprecated request-scoped identifier from protocol minor 1. Protocol
-  // minor 2 clients leave it zero and acknowledge operation_id instead.
+  // minors 2 and later leave it zero and acknowledge operation_id instead.
   uint64 published_request_id = 1;
   uint64 operation_id = 2;
 }

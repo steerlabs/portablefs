@@ -109,22 +109,28 @@ vcs/internal/writeback/
   Checkin and drops the overlay. A definite Checkin or frontend-barrier
   failure reopens the retained overlay before readers wake; it never exposes a
   pre-flush authority view.
-- Frontend reply admission is part of that same boundary. One FSKit callback
-  receives a strictly increasing logical operation ID on its connection; every
-  RPC issued by that callback carries the same ID. The first cache-producing
-  RPC creates the publication unit, later publishing or nonpublishing RPCs
-  join it, and the extension sends exactly one one-way `PublicationAck` only
-  after the framework reply handler returns. Successful replies and cacheable
-  errors such as lookup `ENOENT` are treated identically. A participating RPC
+- Frontend reply admission is part of that same boundary. Under protocol minor
+  3, one FSKit callback lazily receives a strictly increasing logical operation
+  ID when it first issues a cache-producing RPC on its connection. Earlier
+  nonpublishing RPCs carry zero; later publishing or nonpublishing RPCs from
+  that callback carry the same ID and join the publication unit. The extension
+  sends exactly one one-way `PublicationAck` only after the framework reply
+  handler returns. Successful replies and cacheable errors such as lookup
+  `ENOENT` are treated identically. A participating RPC
   that must wait for `ReleaseFor` or for a mirrored namespace lock temporarily
   suspends from the pre-handoff set, then re-enters admission before executing
   in the post-handoff view. Concurrent participants keep the unit active until
   every running sibling has either finished or suspended. This prevents the
   release from waiting on its own caller (or another caller joined to the same
   release) without allowing a pre-handoff reply to escape afterward.
-  Disconnect retires executing and reply-pending units; request IDs and newly
-  allocated operation IDs are nonzero and strictly increasing, and
-  unknown/duplicate acknowledgements close the connection.
+  A disconnect safely retires operations whose reply was never exposed and
+  operations already acknowledged. If an acknowledgement-required result was
+  exposed to the frontend but the connection disappears before its
+  `PublicationAck`, the attach fails coherence closed: the daemon cannot prove
+  whether FSKit published that result, so admission and handoff abort instead
+  of allowing stale state to cross the ownership boundary. Request IDs and
+  newly allocated operation IDs are nonzero and strictly increasing, and
+  early, unknown, or duplicate acknowledgements close the connection.
 - Delegation grant and handoff each install a prefix cache fence. Authority
   reads carry an operation-start token, so a reply that began before the
   ownership boundary may finish its already-linearized syscall but cannot

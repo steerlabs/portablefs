@@ -81,6 +81,7 @@ type frontendOperationEntry struct {
 	op             *frontendOperation
 	err            error
 	activeRequests int
+	replyExposed   bool
 	ackPending     bool
 }
 
@@ -171,11 +172,30 @@ func (c *frontendConn) serve(ctx context.Context) {
 				c.inFlight.Add(-1)
 				return
 			}
+			publishes := frontendRequestPublishes(req)
+			if publishes && env.OperationID == 0 {
+				c.inFlight.Add(-1)
+				return
+			}
+			initializeOperation := false
+			if env.OperationID != 0 {
+				var ok bool
+				initializeOperation, ok =
+					c.reserveLogicalOperation(
+						env.OperationID,
+						publishes,
+					)
+				if !ok {
+					c.inFlight.Add(-1)
+					return
+				}
+			}
 			c.handlerWG.Add(1)
 			go func(
 				a *attach,
 				requestID uint64,
 				operationID uint64,
+				initializeOperation bool,
 				body any,
 			) {
 				defer c.handlerWG.Done()
@@ -185,9 +205,10 @@ func (c *frontendConn) serve(ctx context.Context) {
 					a,
 					requestID,
 					operationID,
+					initializeOperation,
 					body,
 				)
-			}(c.currentAttach(), env.RequestID, env.OperationID, req)
+			}(c.currentAttach(), env.RequestID, env.OperationID, initializeOperation, req)
 		}
 	}
 }
@@ -212,6 +233,11 @@ func (c *frontendConn) close() {
 		for _, entry := range pending {
 			<-entry.ready
 			if entry.op != nil {
+				if entry.replyExposed && !entry.ackPending {
+					entry.op.attach.failCoherence(errors.New(
+						"frontend disconnected before acknowledging an exposed kernel publication",
+					))
+				}
 				entry.op.attach.finishFrontendOperation(entry.op)
 			}
 		}
@@ -257,10 +283,19 @@ func (c *frontendConn) write(env *pfslocal.Envelope) error {
 }
 
 func (c *frontendConn) reply(req uint64, body any) {
-	c.replyWithPublication(req, body, false)
+	c.replyWithPublication(req, 0, body, false)
 }
 
-func (c *frontendConn) replyWithPublication(req uint64, body any, ackRequired bool) {
+func (c *frontendConn) replyWithPublication(
+	req uint64,
+	operationID uint64,
+	body any,
+	ackRequired bool,
+) {
+	if ackRequired && !c.markPublicationReplyExposed(operationID) {
+		_ = c.conn.Close()
+		return
+	}
 	if err := c.write(&pfslocal.Envelope{
 		RequestID:              req,
 		PublicationAckRequired: ackRequired,
@@ -271,6 +306,20 @@ func (c *frontendConn) replyWithPublication(req uint64, body any, ackRequired bo
 	}
 }
 
+func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
+	c.publicationMu.Lock()
+	defer c.publicationMu.Unlock()
+	entry := c.operations[operationID]
+	if c.publicationClosed ||
+		entry == nil ||
+		entry.op == nil ||
+		entry.ackPending {
+		return false
+	}
+	entry.replyExposed = true
+	return true
+}
+
 func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
 	c.reply(req, &pfslocal.ErrorReply{Errno: eno, Message: msg})
 }
@@ -278,7 +327,10 @@ func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
 func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
 	c.publicationMu.Lock()
 	entry := c.operations[operationID]
-	if entry == nil || entry.op == nil || entry.ackPending {
+	if entry == nil ||
+		entry.op == nil ||
+		!entry.replyExposed ||
+		entry.ackPending {
 		c.publicationMu.Unlock()
 		return false
 	}
@@ -312,73 +364,94 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 	}
 }
 
-func (c *frontendConn) hasLogicalOperation(operationID uint64) bool {
+// reserveLogicalOperation runs only on the connection's serial frame-reader
+// goroutine. It validates first-seen operation IDs in wire order before
+// parallel handlers can reorder their admission, and reserves the map entry
+// that every handler for that logical operation will share.
+func (c *frontendConn) reserveLogicalOperation(
+	operationID uint64,
+	publishes bool,
+) (initialize, ok bool) {
 	c.publicationMu.Lock()
-	_, exists := c.operations[operationID]
-	c.publicationMu.Unlock()
-	return exists
+	defer c.publicationMu.Unlock()
+	if c.publicationClosed || operationID == 0 {
+		return false, false
+	}
+	if entry := c.operations[operationID]; entry != nil {
+		if entry.ackPending {
+			return false, false
+		}
+		entry.activeRequests++
+		return false, true
+	}
+	if !publishes {
+		return false, false
+	}
+	if operationID <= c.lastOperationID {
+		return false, false
+	}
+	if c.operations == nil {
+		c.operations = map[uint64]*frontendOperationEntry{}
+	}
+	if len(c.operations) >= maxFrontendOperationsPerConnection {
+		return false, false
+	}
+	c.operations[operationID] = &frontendOperationEntry{
+		ready:          make(chan struct{}),
+		activeRequests: 1,
+	}
+	c.lastOperationID = operationID
+	return true, true
 }
 
 func (c *frontendConn) beginLogicalOperation(
 	ctx context.Context,
 	a *attach,
 	operationID uint64,
+	initialize bool,
 	body any,
 ) (context.Context, *frontendOperationParticipant, bool, bool, error) {
 	paths, pathEpoch, publishes := a.frontendOperationPaths(body)
+
+	if operationID == 0 {
+		if publishes {
+			return ctx, nil, false, false, fmt.Errorf("invalid frontend operation id")
+		}
+		return ctx, nil, false, false, nil
+	}
+	if initialize && !publishes {
+		return ctx, nil, false, false, fmt.Errorf(
+			"frontend operation id began with a nonpublishing request",
+		)
+	}
 
 	c.publicationMu.Lock()
 	if c.publicationClosed {
 		c.publicationMu.Unlock()
 		return ctx, nil, false, false, net.ErrClosed
 	}
-	if entry := c.operations[operationID]; entry != nil {
-		if entry.ackPending {
-			c.publicationMu.Unlock()
-			return ctx, nil, false, false, fmt.Errorf("frontend operation already acknowledged")
-		}
-		entry.activeRequests++
+	entry := c.operations[operationID]
+	if entry == nil || entry.ackPending {
+		c.publicationMu.Unlock()
+		return ctx, nil, false, false, fmt.Errorf("frontend operation was not reserved")
+	}
+	if !initialize {
 		c.publicationMu.Unlock()
 		select {
 		case <-entry.ready:
 		case <-ctx.Done():
-			c.finishLogicalRequest(operationID)
 			return ctx, nil, false, false, ctx.Err()
 		}
 		if entry.err != nil {
-			c.finishLogicalRequest(operationID)
 			return ctx, nil, false, false, entry.err
 		}
 		participant, err := a.extendFrontendOperation(ctx, entry.op, paths, pathEpoch)
 		if err != nil {
-			c.finishLogicalRequest(operationID)
 			return ctx, nil, false, false, err
 		}
 		return context.WithValue(ctx, frontendOperationContextKey{}, participant),
 			participant, true, publishes, nil
 	}
-	if !publishes {
-		c.publicationMu.Unlock()
-		return ctx, nil, false, false, nil
-	}
-	if operationID == 0 {
-		c.publicationMu.Unlock()
-		return ctx, nil, false, false, fmt.Errorf("invalid frontend operation id")
-	}
-	if c.operations == nil {
-		c.operations = map[uint64]*frontendOperationEntry{}
-	}
-	if operationID <= c.lastOperationID {
-		c.publicationMu.Unlock()
-		return ctx, nil, false, false, fmt.Errorf("frontend operation id is not increasing")
-	}
-	if len(c.operations) >= maxFrontendOperationsPerConnection {
-		c.publicationMu.Unlock()
-		return ctx, nil, false, false, fmt.Errorf("too many unacknowledged frontend operations")
-	}
-	entry := &frontendOperationEntry{ready: make(chan struct{}), activeRequests: 1}
-	c.operations[operationID] = entry
-	c.lastOperationID = operationID
 	c.publicationMu.Unlock()
 
 	op, err := a.beginFrontendPathsAtEpochContext(ctx, paths, pathEpoch)
@@ -389,9 +462,6 @@ func (c *frontendConn) beginLogicalOperation(
 	entry.op = op
 	entry.err = err
 	close(entry.ready)
-	if err != nil {
-		delete(c.operations, operationID)
-	}
 	c.publicationMu.Unlock()
 	if err != nil {
 		if op != nil {
@@ -409,6 +479,7 @@ func (c *frontendConn) handleAttached(
 	a *attach,
 	requestID uint64,
 	operationID uint64,
+	initializeOperation bool,
 	body any,
 ) {
 	// A request that extends an already-published logical callback must enter
@@ -417,7 +488,10 @@ func (c *frontendConn) handleAttached(
 	// recall finish; resumption then waits for the post-handoff view. A new
 	// logical operation takes the mirrors first so it can never become active
 	// while blocked behind an older concrete namespace lock.
-	continuation := c.hasLogicalOperation(operationID)
+	continuation := operationID != 0 && !initializeOperation
+	if operationID != 0 {
+		defer c.finishLogicalRequest(operationID)
+	}
 	var (
 		unlockRequest func()
 		participant   *frontendOperationParticipant
@@ -426,7 +500,9 @@ func (c *frontendConn) handleAttached(
 		err           error
 	)
 	if continuation {
-		ctx, participant, participates, publishes, err = c.beginLogicalOperation(ctx, a, operationID, body)
+		ctx, participant, participates, publishes, err = c.beginLogicalOperation(
+			ctx, a, operationID, false, body,
+		)
 		if err == nil {
 			resume := a.suspendFrontendOperation(ctx)
 			unlockRequest = a.lockFrontendRequest(body)
@@ -436,7 +512,9 @@ func (c *frontendConn) handleAttached(
 		}
 	} else {
 		unlockRequest = a.lockFrontendRequest(body)
-		ctx, participant, participates, publishes, err = c.beginLogicalOperation(ctx, a, operationID, body)
+		ctx, participant, participates, publishes, err = c.beginLogicalOperation(
+			ctx, a, operationID, initializeOperation, body,
+		)
 	}
 	if err != nil {
 		if unlockRequest != nil {
@@ -449,14 +527,18 @@ func (c *frontendConn) handleAttached(
 		defer unlockRequest()
 	}
 	if participates {
-		defer c.finishLogicalRequest(operationID)
 		defer a.finishFrontendParticipant(participant)
 	}
 	if err := a.frontendAdmissionError(); err != nil {
 		if publishes {
-			c.replyWithPublication(requestID, &pfslocal.ErrorReply{
-				Errno: darwinEIO, Message: err.Error(),
-			}, true)
+			c.replyWithPublication(
+				requestID,
+				operationID,
+				&pfslocal.ErrorReply{
+					Errno: darwinEIO, Message: err.Error(),
+				},
+				true,
+			)
 		} else {
 			c.errorReply(requestID, darwinEIO, err.Error())
 		}
@@ -536,6 +618,7 @@ func (c *frontendConn) handleAttached(
 		if publishes {
 			c.replyWithPublication(
 				requestID,
+				operationID,
 				&pfslocal.ErrorReply{
 					Errno:   eno,
 					Message: errMessage(fmt.Sprintf("%T", body), eno),
@@ -548,7 +631,7 @@ func (c *frontendConn) handleAttached(
 		return
 	}
 	a.synthesizeFrontendMutation(body, c.origin)
-	c.replyWithPublication(requestID, reply, publishes)
+	c.replyWithPublication(requestID, operationID, reply, publishes)
 }
 
 // pfsdTrace (PFSD_TRACE=1) logs every frontend op with its resolved paths and

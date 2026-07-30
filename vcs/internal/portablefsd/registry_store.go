@@ -207,8 +207,8 @@ func validatePersistedItems(e persistedAttachEntry) error {
 	seenPath := map[string]struct{}{}
 	seenDetachedID := map[uint64]struct{}{}
 	for i, item := range e.Items {
-		if item.ItemID == 0 {
-			return fmt.Errorf("item %d has no itemId", i)
+		if _, ok := fskitItemID(item.ItemID); !ok {
+			return fmt.Errorf("item %d has unrepresentable itemId %d", i, item.ItemID)
 		}
 		if item.ItemGeneration == 0 {
 			return fmt.Errorf("item %d has no itemGeneration", i)
@@ -243,6 +243,11 @@ func validatePersistedItems(e persistedAttachEntry) error {
 			return fmt.Errorf("item %d has invalid kind %q", i, item.Kind)
 		}
 		authorityItemID := item.authorityItemID()
+		if authorityItemID != 0 {
+			if _, ok := fskitItemID(authorityItemID); !ok {
+				return fmt.Errorf("item %d has unrepresentable authority item id %d", i, authorityItemID)
+			}
+		}
 		if auth, dup := seenIDAuth[item.ItemID]; dup && auth != authorityItemID {
 			return fmt.Errorf("item %d id %d conflicts with authority identity", i, item.ItemID)
 		}
@@ -296,6 +301,9 @@ func writePersistedAttaches(stateDir string, entries []persistedAttachEntry) err
 	for i := range entries {
 		if err := validatePersistedAttach(&entries[i]); err != nil {
 			return fmt.Errorf("refuse invalid persisted attach %d: %w", i, err)
+		}
+		if err := validatePersistedItems(entries[i]); err != nil {
+			return fmt.Errorf("refuse invalid persisted attach items %d: %w", i, err)
 		}
 		key, storage := attachKey(entries[i].VolumeID, entries[i].Branch, entries[i].MountPath), storageKey(entries[i].VolumeID, entries[i].Branch)
 		if seenRef[entries[i].Ref] || seenKey[key] || seenStorage[storage] {
