@@ -105,11 +105,12 @@ func TestMountsShowsCredentialExpired(t *testing.T) {
 		return "live"
 	}
 	stateHome := t.TempDir()
+	baseGetenv := e.getenv
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
 			return stateHome
 		}
-		return ""
+		return baseGetenv(k)
 	}
 	dir, err := e.mountStateDir()
 	if err != nil {

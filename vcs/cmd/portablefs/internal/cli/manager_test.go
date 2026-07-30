@@ -49,6 +49,7 @@ func TestIntentLeaseTransactionReplaysExactCreateThenRelease(t *testing.T) {
 		return 200, `{"lease":{"accessLeaseId":"pfal_1","controlSeq":"8","expiresAt":1700000600000,"state":"released"}}`
 	})
 	e, _, _ := testEnv(t)
+	baseGetenv := e.getenv
 	e.getenv = func(name string) string {
 		switch name {
 		case "PORTABLEFS_API_URL", "PORTABLEFS_MANAGER_URL":
@@ -56,7 +57,7 @@ func TestIntentLeaseTransactionReplaysExactCreateThenRelease(t *testing.T) {
 		case "PORTABLEFS_MANAGER_TOKEN":
 			return "mgr_tok"
 		default:
-			return ""
+			return baseGetenv(name)
 		}
 	}
 	intent := &mountIntent{
