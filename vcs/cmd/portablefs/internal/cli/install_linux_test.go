@@ -307,6 +307,9 @@ func TestLinuxReleaseInstallerRejectsReleaseTampering(t *testing.T) {
 	if err := os.Chmod(result.ReleaseDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(filepath.Join(result.ReleaseDir, "portablefsd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	writeTestInstallerBinary(t, filepath.Join(result.ReleaseDir, "portablefsd"), "source-tampered-daemon")
 	if err := os.Chmod(filepath.Join(result.ReleaseDir, "portablefsd"), 0o555); err != nil {
 		t.Fatal(err)
@@ -400,6 +403,36 @@ func testLinuxInstaller(t *testing.T, payload string) *linuxReleaseInstaller {
 
 func testLinuxInstallerAt(t *testing.T, home, stateDir, sourceDir, _ string) *linuxReleaseInstaller {
 	t.Helper()
+	// Successful installs deliberately leave the release pair and directory
+	// read-only. Restore owner-write permission only during test cleanup so
+	// testing.TempDir can remove its fixture without weakening the asserted
+	// installed state.
+	t.Cleanup(func() {
+		root := filepath.Join(home, ".local", "lib", "portablefs", "releases")
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				if os.IsNotExist(walkErr) {
+					return nil
+				}
+				return walkErr
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			switch {
+			case info.IsDir():
+				return os.Chmod(path, 0o700)
+			case info.Mode().IsRegular():
+				return os.Chmod(path, 0o600)
+			default:
+				return nil
+			}
+		})
+		if err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore installer fixture permissions: %v", err)
+		}
+	})
 	procRoot := filepath.Join(home, "proc")
 	if err := os.MkdirAll(procRoot, 0o700); err != nil {
 		t.Fatal(err)
