@@ -901,11 +901,12 @@ type attach struct {
 	mu        sync.RWMutex
 	nsMu      sync.RWMutex
 	nameLocks [64]sync.Mutex
-	// frontendSerial and frontendNameLocks mirror the namespace lock classes
-	// at the protocol boundary. A request acquires them before entering the
-	// publication gate, so an admitted operation can never sit behind a
-	// rename/name lock held by the operation whose delegation handoff is
-	// waiting for that admission to publish.
+	// frontendSerial, frontendNameLocks, and each handle's frontend operation
+	// lock mirror the concrete namespace lock classes at the protocol
+	// boundary. A request acquires them before entering the publication gate,
+	// so an admitted operation can never sit behind a lock held by the
+	// operation whose delegation handoff is waiting for that admission to
+	// publish.
 	frontendSerial    sync.RWMutex
 	frontendNameLocks [64]sync.Mutex
 	vol               *clientcore.Volume
@@ -983,6 +984,17 @@ type frontendItemIdentity struct {
 	state *clientcore.NodeState
 }
 
+// handleOperationLocks coordinate operations for one descriptor at both sides
+// of the frontend publication gate. Ordinary operations remain concurrent
+// readers; Close is the descriptor-local writer. The locks are intentionally
+// distinct: frontend is acquired before a request becomes publication-active,
+// while concrete is acquired after nsMu. Reusing one lock at both layers
+// would recursively acquire it in the same request.
+type handleOperationLocks struct {
+	frontend sync.RWMutex
+	concrete sync.RWMutex
+}
+
 type handleRecord struct {
 	id       uint64
 	itemID   uint64
@@ -990,6 +1002,10 @@ type handleRecord struct {
 	openPath string
 	state    *clientcore.NodeState
 	write    bool
+	// operationLocks is a pointer because handle records are copied when an
+	// operation resolves its target. Every copy must retain the descriptor's
+	// one serialization identity.
+	operationLocks *handleOperationLocks
 	// file backs handles for grafted local paths; nil for authority handles.
 	file *os.File
 }
@@ -2587,13 +2603,12 @@ func (a *attach) lockFrontendRequest(body any) func() {
 	mutatesName := false
 	switch req := body.(type) {
 	case *pfslocal.RenameRequest,
-		*pfslocal.CloseRequest,
 		*pfslocal.ReclaimRequest:
-		// Close and Reclaim own nsMu exclusively while they retire
-		// descriptor/item identity. Their mirror must be exclusive too:
-		// otherwise a later publishing reader can enter frontendActive,
-		// queue behind the pending nsMu writer, and cyclically block a
-		// delegation handoff waiting for that reader to publish.
+		// Reclaim owns nsMu exclusively while it retires item identity. Its
+		// mirror must be exclusive too: otherwise a later publishing reader
+		// can enter frontendActive, queue behind the pending nsMu writer, and
+		// cyclically block a delegation handoff waiting for that reader to
+		// publish.
 		exclusive = true
 	case *pfslocal.RemoveRequest:
 		exclusive = req.Directory
@@ -2613,14 +2628,127 @@ func (a *attach) lockFrontendRequest(body any) func() {
 		return a.frontendSerial.Unlock
 	}
 	a.frontendSerial.RLock()
+	unlockHandle := a.lockFrontendHandleRequest(body)
 	if !mutatesName {
-		return a.frontendSerial.RUnlock
+		if unlockHandle == nil {
+			return a.frontendSerial.RUnlock
+		}
+		return func() {
+			unlockHandle()
+			a.frontendSerial.RUnlock()
+		}
 	}
 	paths, _, _ := a.frontendOperationPaths(body)
 	unlockNames := a.lockFrontendRequestNames(paths)
 	return func() {
 		unlockNames()
+		if unlockHandle != nil {
+			unlockHandle()
+		}
 		a.frontendSerial.RUnlock()
+	}
+}
+
+func frontendRequestHandle(body any) (id uint64, exclusive bool) {
+	switch req := body.(type) {
+	case *pfslocal.GetAttrRequest:
+		return req.Handle, false
+	case *pfslocal.SetAttrRequest:
+		return req.Handle, false
+	case *pfslocal.CloseRequest:
+		return req.Handle, true
+	case *pfslocal.ReadRequest:
+		return req.Handle, false
+	case *pfslocal.WriteRequest:
+		return req.Handle, false
+	case *pfslocal.XattrGetRequest:
+		return req.Handle, false
+	case *pfslocal.XattrSetRequest:
+		return req.Handle, false
+	case *pfslocal.XattrListRequest:
+		return req.Handle, false
+	case *pfslocal.XattrRemoveRequest:
+		return req.Handle, false
+	case *pfslocal.FsyncRequest:
+		return req.Handle, false
+	default:
+		return 0, false
+	}
+}
+
+// lockFrontendHandleRequest mirrors the concrete per-handle lock before a
+// logical callback becomes publication-active. Missing handles need no lock:
+// handle IDs are never reused, and the concrete operation will return its
+// precise protocol error.
+func (a *attach) lockFrontendHandleRequest(body any) func() {
+	id, exclusive := frontendRequestHandle(body)
+	if id == 0 {
+		return nil
+	}
+	a.mu.Lock()
+	h := a.handles[id]
+	if h == nil {
+		a.mu.Unlock()
+		return nil
+	}
+	if h.operationLocks == nil {
+		h.operationLocks = &handleOperationLocks{}
+	}
+	gate := h.operationLocks
+	a.mu.Unlock()
+	if exclusive {
+		gate.frontend.Lock()
+		return gate.frontend.Unlock
+	}
+	gate.frontend.RLock()
+	return gate.frontend.RUnlock
+}
+
+// lockHandleOperation coordinates concrete operations for one live descriptor.
+// It never waits while holding a.mu. If the descriptor retires while this
+// request waits, the operation proceeds without the stale gate so its normal
+// target lookup can return the exact replay/error semantics.
+func (a *attach) lockHandleOperation(id uint64, exclusive bool) func() {
+	if id == 0 {
+		return nil
+	}
+	a.mu.Lock()
+	h := a.handles[id]
+	if h == nil {
+		a.mu.Unlock()
+		return nil
+	}
+	if h.operationLocks == nil {
+		h.operationLocks = &handleOperationLocks{}
+	}
+	gate := h.operationLocks
+	a.mu.Unlock()
+
+	if exclusive {
+		gate.concrete.Lock()
+	} else {
+		gate.concrete.RLock()
+	}
+	a.mu.RLock()
+	stillLive := a.handles[id] == h
+	a.mu.RUnlock()
+	if !stillLive {
+		if exclusive {
+			gate.concrete.Unlock()
+		} else {
+			gate.concrete.RUnlock()
+		}
+		return nil
+	}
+	if exclusive {
+		return gate.concrete.Unlock
+	}
+	return gate.concrete.RUnlock
+}
+
+func unlockIfPresent(unlock func()) {
+	if unlock != nil {
+		unlock()
 	}
 }
 
@@ -3015,6 +3143,7 @@ func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.N
 	id := a.nextHandle
 	a.handles[id] = &handleRecord{
 		id: id, itemID: itemID, path: path, openPath: path, state: state, write: write,
+		operationLocks: &handleOperationLocks{},
 	}
 	return id
 }
@@ -3027,6 +3156,7 @@ func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File,
 	id := a.nextHandle
 	a.handles[id] = &handleRecord{
 		id: id, itemID: itemID, path: path, openPath: path, write: write, file: file,
+		operationLocks: &handleOperationLocks{},
 	}
 	return id
 }
