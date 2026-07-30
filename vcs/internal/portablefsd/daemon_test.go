@@ -1904,8 +1904,8 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 		default:
 		}
 	}
-	var configSeenOK atomic.Bool
-	var lockSeenENOENT atomic.Bool
+	var anyConfigSeenOK atomic.Bool
+	var anyLockSeenENOENT atomic.Bool
 	var wg sync.WaitGroup
 	lookupLoop := func(worker int) {
 		defer wg.Done()
@@ -1913,6 +1913,8 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 		defer c.close()
 		c.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: fmt.Sprintf("rename-flush-%d", worker)})
 		c.call(&pfslocal.ResolveRequest{AttachRef: ref})
+		configSeenOK := false
+		lockSeenENOENT := false
 		for ctx.Err() == nil {
 			body, er := c.callMaybe(&pfslocal.LookupRequest{Dir: root, Name: []byte("config")})
 			if er != nil {
@@ -1920,7 +1922,7 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 					report("config lookup errno=%d want ENOENT or OK", er.Errno)
 					return
 				}
-				if configSeenOK.Load() {
+				if configSeenOK {
 					report("config flapped OK -> ENOENT")
 					return
 				}
@@ -1930,7 +1932,8 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 					report("config item=%+v want renamed item %+v", lr.Attr.Item, lock.Attr.Item)
 					return
 				}
-				configSeenOK.Store(true)
+				configSeenOK = true
+				anyConfigSeenOK.Store(true)
 			}
 
 			body, er = c.callMaybe(&pfslocal.LookupRequest{Dir: root, Name: []byte("config.lock")})
@@ -1939,10 +1942,11 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 					report("config.lock lookup errno=%d want ENOENT or OK", er.Errno)
 					return
 				}
-				lockSeenENOENT.Store(true)
+				lockSeenENOENT = true
+				anyLockSeenENOENT.Store(true)
 			} else {
 				lr := body.(*pfslocal.LookupReply)
-				if lockSeenENOENT.Load() {
+				if lockSeenENOENT {
 					report("config.lock flapped ENOENT -> OK")
 					return
 				}
@@ -1973,10 +1977,10 @@ func TestDaemonWritebackRenameLookupsMonotonicDuringActiveFlush(t *testing.T) {
 		t.Fatal(err)
 	default:
 	}
-	if !configSeenOK.Load() {
+	if !anyConfigSeenOK.Load() {
 		t.Fatal("config never transitioned to OK")
 	}
-	if !lockSeenENOENT.Load() {
+	if !anyLockSeenENOENT.Load() {
 		t.Fatal("config.lock never transitioned to ENOENT")
 	}
 	if flushes.Load() <= beforeFlushes {
