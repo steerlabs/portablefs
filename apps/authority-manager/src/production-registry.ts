@@ -114,6 +114,31 @@ const MAX_CHILD_START_ATTEMPTS = 3;
 const TEARDOWN_DURABLE_ATTEMPTS = 3;
 const TEARDOWN_RETRY_BACKOFF_MS = 100;
 
+/** Escapes terminal and line controls before untrusted fields enter one log record. */
+export function escapeLogControls(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, (character) => {
+    return `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  });
+}
+
+/** Prefixes every child-output line and strips terminal controls without hiding text. */
+export function formatChildLogChunk(prefix: string, chunk: Buffer | string): string {
+  const escaped = String(chunk).replace(
+    /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g,
+    (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+  const lines = escaped.split("\n");
+  return lines
+    .map((line, index) => {
+      const terminated = index < lines.length - 1;
+      if (!terminated && line === "") {
+        return "";
+      }
+      return `${prefix} ${line}${terminated ? "\n" : ""}`;
+    })
+    .join("");
+}
+
 // The manager pipes the child inherits (after stdin/out/err): fd 3 carries
 // bounded manager→child lease frames; fd 4 carries the child's one bounded
 // bootstrap frame (exact identities + self-bound listener addresses) back.
@@ -660,7 +685,8 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     // performance.now (never steps with NTP/operator wall-clock changes).
     // Wall time is metadata only.
     this.localNow = deps.localNow ?? (() => performance.now());
-    this.log = deps.log ?? ((message) => console.error(message));
+    const configuredLog = deps.log ?? ((message: string) => console.error(message));
+    this.log = (message) => configuredLog(escapeLogControls(message));
     this.identity = identity;
     this.claimDeadlineLocalMs = claimStartLocalMs + (claim.expiresAtDbMs - claim.dbTimeMs);
     this.leases = new ProductionAccessLeaseService(
@@ -1693,9 +1719,15 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     heartbeat?.on("close", () => {
       this.fenceHeartbeat(authority, "lease pipe closed");
     });
-    const prefix = `[portablefs-vcs production ${ref.volumeId}@${ref.branch}]`;
-    child.stdout?.on("data", (chunk) => process.stdout.write(`${prefix} ${chunk.toString()}`));
-    child.stderr?.on("data", (chunk) => process.stderr.write(`${prefix} ${chunk.toString()}`));
+    const prefix =
+      `[portablefs-vcs production ${escapeLogControls(ref.volumeId)}` +
+      `@${escapeLogControls(ref.branch)}]`;
+    child.stdout?.on("data", (chunk) =>
+      process.stdout.write(formatChildLogChunk(prefix, chunk))
+    );
+    child.stderr?.on("data", (chunk) =>
+      process.stderr.write(formatChildLogChunk(prefix, chunk))
+    );
 
     this.authorities.set(key, authority);
     // First heartbeat frame immediately: the child requires one before

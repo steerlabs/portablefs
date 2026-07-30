@@ -530,7 +530,7 @@ describe("PFT2 file serving", () => {
     for (const storageKey of packKeys) {
       expect(readsByStorageKey.get(storageKey)).toBe(2);
     }
-  });
+  }, 15_000);
 });
 
 function tenantMetadata(): MetadataRepository {

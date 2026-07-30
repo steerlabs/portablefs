@@ -14,6 +14,10 @@ import type { BlobDigest, BlobRef } from "@portablefs/protocol";
 // Content-addressed digest shape ("sha256:" + 64 lowercase hex); validated
 // before an object key is derived from it.
 const BLOB_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const DEFAULT_S3_REQUEST_TIMEOUT_MS = 300_000;
+const MIN_S3_REQUEST_TIMEOUT_MS = 1_000;
+const MAX_S3_REQUEST_TIMEOUT_MS = 10 * 60_000;
+const S3_ERROR_BODY_MAX_BYTES = 8 * 1024;
 
 export type S3UrlStyle = "virtual-host" | "path";
 
@@ -29,6 +33,10 @@ export interface S3BlobStoreConfig {
   // SSE-S3, or "aws:kms"). Encryption is at rest in the bucket; the digest is over
   // the plaintext, so content-addressed dedup is unaffected. Unset = no header.
   serverSideEncryption?: string;
+  /** Whole-operation deadline for buffered/control requests; headers-only for streams. */
+  requestTimeoutMs?: number;
+  /** Permits HTTP only for an explicitly configured loopback development endpoint. */
+  allowInsecureEndpoint?: boolean;
   fetchImpl?: typeof fetch;
   now?: () => Date;
 }
@@ -37,11 +45,14 @@ export class S3BlobStore implements BlobStore {
   private readonly config: S3BlobStoreConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
+  private readonly requestTimeoutMs: number;
 
   constructor(config: S3BlobStoreConfig) {
+    validateS3Endpoint(config.endpoint, config.allowInsecureEndpoint === true);
     this.config = config;
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.now = config.now ?? (() => new Date());
+    this.requestTimeoutMs = normalizeRequestTimeout(config.requestTimeoutMs);
   }
 
   async put(buffer: Buffer, options?: BlobStorePutOptions): Promise<BlobStorePutResult> {
@@ -50,7 +61,7 @@ export class S3BlobStore implements BlobStore {
       throw new Error(`Blob digest mismatch while uploading ${digest}.`);
     }
     const storageKey = this.keyForDigest(digest);
-    if ((options?.checkExisting ?? true) && await this.has(digest)) {
+    if ((options?.checkExisting ?? true) && await this.has(digest, options?.signal)) {
       return {
         blob: {
           digest,
@@ -63,7 +74,7 @@ export class S3BlobStore implements BlobStore {
     }
     const prepared = prepareStorageBody(buffer);
 
-    await this.request("PUT", storageKey, prepared.body, {
+    const response = await this.request("PUT", storageKey, prepared.body, {
       "content-type": "application/octet-stream",
       "x-amz-meta-digest": digest,
       "x-amz-meta-size": String(buffer.byteLength),
@@ -72,7 +83,8 @@ export class S3BlobStore implements BlobStore {
       ...(this.config.serverSideEncryption
         ? { "x-amz-server-side-encryption": this.config.serverSideEncryption }
         : {}),
-    });
+    }, options?.signal ? { signal: options.signal } : undefined);
+    await response.body?.cancel();
     return {
       blob: {
         digest,
@@ -113,7 +125,10 @@ export class S3BlobStore implements BlobStore {
     const requestOptions = options?.signal ? { signal: options.signal } : {};
 
     if (!options?.range) {
-      const response = await this.request("GET", key, undefined, undefined, requestOptions);
+      const response = await this.request("GET", key, undefined, undefined, {
+        ...requestOptions,
+        streamingBody: true,
+      });
       const compression = storedCompression(response.headers);
       const totalLength = plaintextObjectSize(digest, response.headers, compression);
       const stored = responseBodyChunks(response);
@@ -143,7 +158,7 @@ export class S3BlobStore implements BlobStore {
         key,
         undefined,
         { range: `bytes=${resolved.start}-${resolved.end}` },
-        requestOptions
+        { ...requestOptions, streamingBody: true }
       );
       const body = responseBodyChunks(response);
       // A backend that ignores Range answers 200 with the whole object; the
@@ -159,7 +174,10 @@ export class S3BlobStore implements BlobStore {
       };
     }
 
-    const response = await this.request("GET", key, undefined, undefined, requestOptions);
+    const response = await this.request("GET", key, undefined, undefined, {
+      ...requestOptions,
+      streamingBody: true,
+    });
     return {
       totalLength,
       start: resolved.start,
@@ -172,18 +190,20 @@ export class S3BlobStore implements BlobStore {
     };
   }
 
-  async has(digest: BlobDigest): Promise<boolean> {
+  async has(digest: BlobDigest, signal?: AbortSignal): Promise<boolean> {
     const response = await this.request("HEAD", this.keyForDigest(digest), undefined, undefined, {
       allowNotFound: true,
+      ...(signal ? { signal } : {}),
     });
     return response.status !== 404;
   }
 
   async delete(digest: BlobDigest): Promise<void> {
     // Idempotent: a 404 means the object is already gone, which is success for GC.
-    await this.request("DELETE", this.keyForDigest(digest), undefined, undefined, {
+    const response = await this.request("DELETE", this.keyForDigest(digest), undefined, undefined, {
       allowNotFound: true,
     });
+    await response.body?.cancel();
   }
 
   keyForDigest(digest: BlobDigest): string {
@@ -205,7 +225,7 @@ export class S3BlobStore implements BlobStore {
     key: string,
     body?: Buffer,
     headers?: Record<string, string>,
-    options?: { allowNotFound?: boolean; signal?: AbortSignal }
+    options?: { allowNotFound?: boolean; signal?: AbortSignal; streamingBody?: boolean }
   ): Promise<Response> {
     const url = objectUrl(this.config, key);
     const signInput: SignS3RequestInput = {
@@ -223,22 +243,145 @@ export class S3BlobStore implements BlobStore {
       signInput.headers = headers;
     }
     const requestHeaders = signS3RequestHeaders(signInput);
-    const response = await this.fetchImpl(url, {
-      method,
-      headers: requestHeaders,
-      ...(body ? { body: new Uint8Array(body) } : {}),
-      ...(options?.signal ? { signal: options.signal } : {}),
-    });
-    if (options?.allowNotFound && response.status === 404) {
-      return response;
+    const deadline = new AbortController();
+    const timer = setTimeout(
+      () => deadline.abort(new DOMException("S3 request timed out.", "TimeoutError")),
+      this.requestTimeoutMs
+    );
+    timer.unref?.();
+    const signal = options?.signal
+      ? AbortSignal.any([options.signal, deadline.signal])
+      : deadline.signal;
+    const cleanup = () => clearTimeout(timer);
+    try {
+      const response = await this.fetchImpl(url, {
+        method,
+        headers: requestHeaders,
+        ...(body ? { body: new Uint8Array(body) } : {}),
+        signal,
+      });
+      if (options?.allowNotFound && response.status === 404) {
+        cleanup();
+        return response;
+      }
+      if (!response.ok) {
+        const detail = await readErrorBodySnippet(response);
+        cleanup();
+        throw new Error(`S3 ${method} ${key} failed with ${response.status}: ${detail}`);
+      }
+      if (options?.streamingBody) {
+        // Streaming reads retain caller-abort propagation but have no wall
+        // clock once response headers arrive.
+        cleanup();
+        return response;
+      }
+      return responseWithDeadline(response, signal, cleanup);
+    } catch (error) {
+      cleanup();
+      throw error;
     }
-    if (!response.ok) {
-      throw new Error(
-        `S3 ${method} ${key} failed with ${response.status}: ${await response.text()}`
-      );
-    }
+  }
+}
+
+function responseWithDeadline(
+  response: Response,
+  signal: AbortSignal,
+  cleanup: () => void
+): Response {
+  if (response.body === null) {
+    cleanup();
     return response;
   }
+  const reader = response.body.getReader();
+  let settled = false;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const finish = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    signal.removeEventListener("abort", onAbort);
+    cleanup();
+  };
+  const onAbort = () => {
+    if (settled) {
+      return;
+    }
+    const reason = signal.reason ?? new DOMException("S3 request aborted.", "AbortError");
+    finish();
+    void reader.cancel(reason).catch(() => undefined);
+    streamController?.error(reason);
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+    },
+    async pull(controller) {
+      try {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          finish();
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk.value);
+      } catch (error) {
+        finish();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      finish();
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) {
+    onAbort();
+  }
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+async function readErrorBodySnippet(response: Response): Promise<string> {
+  if (response.body === null) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      const remaining = S3_ERROR_BODY_MAX_BYTES - total;
+      if (remaining <= 0) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+      const kept = chunk.value.subarray(0, remaining);
+      chunks.push(kept);
+      total += kept.byteLength;
+      if (kept.byteLength < chunk.value.byteLength || total === S3_ERROR_BODY_MAX_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function storedCompression(headers: Headers): "gzip" | "none" {
@@ -326,6 +469,11 @@ export function s3ConfigFromEnv(
     throw new Error("AWS_S3_URL_STYLE must be virtual-host or path.");
   }
   const sse = optionalEnv(resolved, "VOLUME_S3_SSE");
+  const requestTimeout = optionalEnv(resolved, "VOLUME_S3_REQUEST_TIMEOUT_MS");
+  const allowInsecure = optionalEnv(resolved, "VOLUME_S3_ALLOW_INSECURE_ENDPOINT");
+  if (allowInsecure !== undefined && allowInsecure !== "0" && allowInsecure !== "1") {
+    throw new Error("VOLUME_S3_ALLOW_INSECURE_ENDPOINT must be 0 or 1.");
+  }
   return {
     endpoint: requiredEnv(resolved, "AWS_ENDPOINT_URL"),
     bucket: requiredEnv(resolved, "AWS_S3_BUCKET_NAME"),
@@ -335,6 +483,8 @@ export function s3ConfigFromEnv(
     secretAccessKey: requiredEnv(resolved, "AWS_SECRET_ACCESS_KEY"),
     prefix: optionalEnv(resolved, "VOLUME_S3_PREFIX") ?? "portablefs",
     ...(sse ? { serverSideEncryption: sse } : {}),
+    ...(requestTimeout ? { requestTimeoutMs: parseRequestTimeout(requestTimeout) } : {}),
+    ...(allowInsecure === "1" ? { allowInsecureEndpoint: true } : {}),
   };
 }
 
@@ -496,6 +646,51 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new DOMException("The blob stream open was aborted.", "AbortError");
   }
+}
+
+function normalizeRequestTimeout(value: number | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_S3_REQUEST_TIMEOUT_MS;
+  }
+  if (
+    !Number.isSafeInteger(value) ||
+    value < MIN_S3_REQUEST_TIMEOUT_MS ||
+    value > MAX_S3_REQUEST_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `S3 request timeout must be an integer from ${MIN_S3_REQUEST_TIMEOUT_MS} to ${MAX_S3_REQUEST_TIMEOUT_MS} ms.`
+    );
+  }
+  return value;
+}
+
+function parseRequestTimeout(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error("VOLUME_S3_REQUEST_TIMEOUT_MS must be a decimal integer.");
+  }
+  return normalizeRequestTimeout(Number(value));
+}
+
+function validateS3Endpoint(endpoint: string, allowInsecure: boolean): void {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new Error("AWS_ENDPOINT_URL must be an absolute URL.");
+  }
+  if (url.protocol === "https:") {
+    return;
+  }
+  const loopback =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]";
+  if (url.protocol === "http:" && allowInsecure && loopback) {
+    return;
+  }
+  throw new Error(
+    "AWS_ENDPOINT_URL must use HTTPS; loopback HTTP requires VOLUME_S3_ALLOW_INSECURE_ENDPOINT=1."
+  );
 }
 
 function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {

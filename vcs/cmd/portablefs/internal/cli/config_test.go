@@ -112,6 +112,53 @@ func TestLoadConfigMissingFileIsEmpty(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte(`{"currentProfile":"default","profiles":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "config.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := loadConfig(link); err == nil {
+		t.Fatalf("loadConfig symlink error = %v", err)
+	}
+}
+
+func TestSaveConfigRefusesSymlinkWithoutFollowingIt(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "config")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("do not overwrite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.Symlink(victim, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	cfg := &Config{CurrentProfile: "default", Profiles: map[string]Profile{}}
+	if err := saveConfig(path, cfg); err == nil {
+		t.Fatal("saveConfig accepted a symlink config path")
+	}
+	if body, err := os.ReadFile(victim); err != nil || string(body) != "do not overwrite" {
+		t.Fatalf("symlink target changed: body=%q err=%v", body, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("refused config symlink was replaced: mode=%v", info.Mode())
+	}
+}
+
 func TestResolveSettingsPrecedenceFlagEnvFile(t *testing.T) {
 	cfg := &Config{
 		CurrentProfile: "default",

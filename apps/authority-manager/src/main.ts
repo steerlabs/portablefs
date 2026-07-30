@@ -3,6 +3,7 @@ import {
   createAuthorityManagerServer,
 } from "./server.js";
 import {
+  authorityDataPlaneRouterLimitsFromEnv,
   createAuthorityDataPlaneRouterServer,
   LeaseTunnelRegistry,
   preflightAuthorityDataPlaneRouterTLS,
@@ -67,7 +68,8 @@ const productionRegistry: ProductionAuthorityRegistry = await createProductionAu
 const accessLeases: AccessLeaseHandler = productionRegistry.leases;
 // Lease lifecycle fences live tunnels: end closes them, rotation closes
 // older-generation ones.
-const leaseTunnelRegistry = new LeaseTunnelRegistry();
+const routerLimits = authorityDataPlaneRouterLimitsFromEnv(process.env);
+const leaseTunnelRegistry = new LeaseTunnelRegistry(routerLimits);
 productionRegistry.leases.onLeaseEnded((event) =>
   leaseTunnelRegistry.closeLease(event.accessLeaseId)
 );
@@ -77,6 +79,8 @@ productionRegistry.leases.onLeaseRotated((accessLeaseId, tokenGeneration) =>
 const dataPlaneRouter = createAuthorityDataPlaneRouterServer(productionRegistry.leases, {
   tlsMaterial: routerTLSMaterial,
   dataPlaneTransport,
+  maxPendingConnections: routerLimits.maxPendingConnections,
+  maxConnections: routerLimits.maxConnections,
   tunnelRegistry: leaseTunnelRegistry,
 });
 listenTcp(dataPlaneRouter, process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR!);
