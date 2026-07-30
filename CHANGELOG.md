@@ -12,3 +12,10 @@ this file is the human-curated summary.
 ## [Unreleased]
 
 Initial open-source release preparation. No tagged release yet.
+
+### Fixed
+
+- Publish and inventory the signed macOS FSKit type `pfs` end to end, keeping
+  PortableFS lifecycle, readiness, and exact-unmount operations isolated from
+  other products that embed the filesystem engine under a different
+  `FSShortName`.

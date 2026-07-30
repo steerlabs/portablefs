@@ -53,12 +53,12 @@ const (
 
 	// The PortableFS OSS/Cloud FSKit identity is deliberately distinct from
 	// any other product that embeds PortableFS (another embedder
-	// may register its own FSName extension with its own app group): a unique
+	// may register its own FSShortName with its own app group): a unique
 	// mount type and a private app-group socket directory guarantee the two
 	// never collide when installed on the same machine. Extension coordinates
 	// are overridable via PORTABLEFS_FSKIT_* for bespoke deployments; the
 	// executable peer is not.
-	defaultFskitType = "pfs"
+	defaultFskitType = fskitidentity.FSType
 )
 
 // defaultFskitSocketDir is the daemon socket directory inside the app-group
@@ -73,10 +73,10 @@ func defaultFskitSocketDir() (string, error) {
 	return filepath.Join(home, "Library", "Group Containers", fskitidentity.AppGroup, "portablefsd"), nil
 }
 
-// fskitConfig resolves the extension coordinates for this host. Defaults
-// match PortableFS.app's extension (PFSAppGroupIdentifier in its
-// Info.plist); the env overrides exist for dev extensions registered under
-// another fs type / socket location.
+// fskitConfig resolves the extension coordinates for this host. The
+// filesystem type is a signed release identity and cannot be changed at
+// runtime. Socket overrides exist for development builds that preserve that
+// identity while using a different app-group container.
 type fskitConfig struct {
 	fsType            string
 	frontendSock      string
@@ -106,8 +106,13 @@ func fskitConfigFromEnv(getenv func(string) string) (fskitConfig, error) {
 		return fskitConfig{}, fmt.Errorf("resolve canonical account home for legacy FSKit inventory: %w", err)
 	}
 	cfg.legacyStateDir = filepath.Join(home, "Library", "Application Support", "PortableFS", "portablefsd")
-	if v := getenv(fskitTypeEnv); v != "" {
-		cfg.fsType = v
+	if v := getenv(fskitTypeEnv); v != "" && v != defaultFskitType {
+		return fskitConfig{}, fmt.Errorf(
+			"%s=%q does not match this release's signed FSKit identity %q",
+			fskitTypeEnv,
+			v,
+			defaultFskitType,
+		)
 	}
 	if v := getenv(fskitSocketEnv); v != "" {
 		cfg.frontendSock = v

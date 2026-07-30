@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
@@ -406,7 +407,7 @@ func validStateString(value string, max int) bool {
 }
 
 func validFSKitType(value string) bool {
-	return validStateString(value, 64) && !strings.ContainsAny(value, "/\\")
+	return value == fskitidentity.FSType
 }
 
 func validatePersistedDataPlaneTransport(st *mountState) error {

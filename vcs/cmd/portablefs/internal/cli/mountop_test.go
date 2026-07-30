@@ -27,7 +27,7 @@ func seedMountIntent(t *testing.T, stateDir, mountPath, phase, strategy, attachR
 		op.mountMechanism = "direct"
 	} else if strategy == "fskit" {
 		op.mountMechanism = "fskit-system"
-		op.fsType = "portablefs"
+		op.fsType = defaultFskitType
 	}
 	if err := op.writeIntent(phase, 0, ""); err != nil {
 		_ = op.close(false)
