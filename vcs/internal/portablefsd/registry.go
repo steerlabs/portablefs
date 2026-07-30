@@ -1258,7 +1258,7 @@ func (a *attach) start(ctx context.Context) error {
 		OnHandoffStart:    a.startFrontendHandoff,
 		OnHandoffEnd:      a.endFrontendHandoff,
 		OnHandoffPrepared: a.persistAssignedAuthorityIdentities,
-		OnReleaseWait:     a.suspendFrontendOperation,
+		OnOperationWait:   a.suspendFrontendOperation,
 		OnMarkOrphan:      a.onMarkOrphan,
 		// A persistently failing write-back flush flips the attach to degraded (visible in
 		// `portablefs mounts` + pushed to the extension) instead of only logging, so acked

@@ -21,11 +21,12 @@ func doctorTestEnv(t *testing.T) (*cmdEnv, *bytes.Buffer, string) {
 	e, stdout, _ := testEnv(t)
 	stateBase := t.TempDir()
 	e.stateDir = filepath.Join(stateBase, "portablefs")
+	baseGetenv := e.getenv
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
 			return stateBase
 		}
-		return ""
+		return baseGetenv(k)
 	}
 	return e, stdout, filepath.Join(e.stateDir, "mounts")
 }

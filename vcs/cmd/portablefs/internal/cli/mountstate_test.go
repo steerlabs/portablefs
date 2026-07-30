@@ -189,11 +189,12 @@ func TestPidAlive(t *testing.T) {
 func TestMountsCommandListsState(t *testing.T) {
 	e, stdout, _ := testEnv(t)
 	stateHome := t.TempDir()
+	baseGetenv := e.getenv
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
 			return stateHome
 		}
-		return ""
+		return baseGetenv(k)
 	}
 	dir, err := e.mountStateDir()
 	if err != nil {
@@ -233,11 +234,12 @@ func TestMountsJSONNeverExposesPersistedAccessToken(t *testing.T) {
 	e, stdout, _ := testEnv(t)
 	e.mountHealthFn = func(*mountState) string { return "live" }
 	stateHome := t.TempDir()
+	baseGetenv := e.getenv
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
 			return stateHome
 		}
-		return ""
+		return baseGetenv(k)
 	}
 	dir, err := e.mountStateDir()
 	if err != nil {
