@@ -1774,11 +1774,12 @@ func TestStickyDegradedClearsOnlyAfterExactDrain(t *testing.T) {
 	}
 }
 
-// TestBoundedMemoryLargeSequentialWrite streams 2 GiB through the engine and
-// asserts the heap stays bounded: dirty bytes live in the WAL, not the heap.
+// TestBoundedMemoryLargeSequentialWrite streams substantially more data than
+// the permitted heap growth through the engine and asserts the heap stays
+// bounded: dirty bytes live in the WAL, not the heap.
 func TestBoundedMemoryLargeSequentialWrite(t *testing.T) {
 	if testing.Short() {
-		t.Skip("2 GiB stream in -short mode")
+		t.Skip("large sequential stream in -short mode")
 	}
 	auth := newFakeAuthority()
 	auth.mu.Lock()
@@ -1802,7 +1803,13 @@ func TestBoundedMemoryLargeSequentialWrite(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&m0)
 	chunk := bytes.Repeat([]byte("z"), 1<<20)
-	const total = int64(2) << 30
+	const (
+		// Keep the stream eight times larger than the tolerated heap growth so
+		// the test detects proportional retention without becoming an fsync
+		// throughput benchmark.
+		total         = int64(512) << 20
+		maxHeapGrowth = int64(64) << 20
+	)
 	for off := int64(0); off < total; off += int64(len(chunk)) {
 		if _, handled, err := e.WriteAt(ctx, "d/big", off, chunk); err != nil || !handled {
 			t.Fatalf("write @%d: %v %v", off, handled, err)
@@ -1812,8 +1819,8 @@ func TestBoundedMemoryLargeSequentialWrite(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&m1)
 	grew := int64(m1.HeapInuse) - int64(m0.HeapInuse)
-	if grew > 256<<20 {
-		t.Fatalf("heap grew %d MiB while writing 2 GiB (dirty data must live in the WAL)", grew>>20)
+	if grew > maxHeapGrowth {
+		t.Fatalf("heap grew %d MiB while writing %d MiB (dirty data must live in the WAL)", grew>>20, total>>20)
 	}
 	if err := e.DrainAll(ctx); err != nil {
 		t.Fatalf("drain: %v", err)
