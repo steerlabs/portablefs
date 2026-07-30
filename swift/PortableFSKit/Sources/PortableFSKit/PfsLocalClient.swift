@@ -83,6 +83,12 @@ private struct PfsPublicationTicket: Sendable {
     var operationID: UInt64
 }
 
+private enum PfsExistingPublicationBinding {
+    case unbound
+    case current(UInt64)
+    case differentConnection
+}
+
 private final class PfsPublicationCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var connectionIDs: Set<UUID> = []
@@ -101,6 +107,18 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         boundConnectionID = connectionID
         operationID = candidate
         return (candidate, true)
+    }
+
+    func existingBinding(to connectionID: UUID) -> PfsExistingPublicationBinding {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let boundConnectionID else {
+            return .unbound
+        }
+        guard boundConnectionID == connectionID, let operationID else {
+            return .differentConnection
+        }
+        return .current(operationID)
     }
 
     func append(connectionID: UUID) {
@@ -126,6 +144,24 @@ private final class PfsPublicationCollector: @unchecked Sendable {
 
 private enum PfsPublicationContext {
     @TaskLocal static var collector: PfsPublicationCollector?
+}
+
+/// Exactly the pfslocal replies that can publish namespace, metadata, xattr,
+/// or content state into a frontend cache. Operation IDs are allocated only
+/// for these requests. Nonpublishing requests use ID zero, so an open/statfs
+/// request at the start of a callback cannot consume an ID before the first
+/// cache publication that the daemon needs to gate.
+private func pfsRequestPublishes(
+    _ body: PfsEnvelope.OneOf_Body
+) -> Bool {
+    switch body {
+    case .lookup, .enumerate, .getAttr, .setAttr, .read, .write,
+         .create, .mkdir, .remove, .rename, .symlink, .readlink,
+         .hardLink, .xattrGet, .xattrSet, .xattrList, .xattrRemove:
+        return true
+    default:
+        return false
+    }
 }
 
 /// Async pfslocal client for length-prefixed protobuf over a Unix domain socket.
@@ -450,7 +486,7 @@ public actor PfsLocalClient {
     private func helloOnCurrentConnection() async throws {
         var hello = PfsHello()
         hello.protocolMajor = 1
-        hello.protocolMinor = 2
+        hello.protocolMinor = 3
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -458,7 +494,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 2 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 3 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
     }
@@ -489,22 +525,41 @@ public actor PfsLocalClient {
         }
         var operationID: UInt64 = 0
         if let collector = PfsPublicationContext.collector {
-            guard let binding = collector.bind(
-                to: connection.id,
-                allocating: connection.nextOperationID
-            ) else {
-                // A framework reply cannot combine cacheable results from two
-                // ownership epochs. The callback fails as one unit; the old
-                // connection close has already retired its daemon-side gate.
-                throw PfsLocalClientError.connectionClosed
-            }
-            operationID = binding.id
-            if binding.isNew {
-                guard connection.nextOperationID != UInt64.max else {
-                    connection.socket.close()
+            if pfsRequestPublishes(body) {
+                guard let binding = collector.bind(
+                    to: connection.id,
+                    allocating: connection.nextOperationID
+                ) else {
+                    // A framework reply cannot combine cacheable results from two
+                    // ownership epochs. The callback fails as one unit; the old
+                    // connection close has already retired its daemon-side gate.
                     throw PfsLocalClientError.connectionClosed
                 }
-                connection.nextOperationID += 1
+                operationID = binding.id
+                if binding.isNew {
+                    guard connection.nextOperationID != UInt64.max else {
+                        connection.socket.close()
+                        throw PfsLocalClientError.connectionClosed
+                    }
+                    connection.nextOperationID += 1
+                }
+            } else {
+                switch collector.existingBinding(to: connection.id) {
+                case .unbound:
+                    // Protocol minor 3 allocates an operation ID lazily at
+                    // the first publishing request in a framework callback.
+                    break
+                case let .current(existing):
+                    // Once a callback has published cacheable state, all later
+                    // requests in that same callback share its completion gate,
+                    // even if an individual request (for example close/fsync)
+                    // does not itself publish cache state.
+                    operationID = existing
+                case .differentConnection:
+                    // A nonpublishing continuation is part of the same
+                    // framework callback and cannot cross ownership epochs.
+                    throw PfsLocalClientError.connectionClosed
+                }
             }
         }
 

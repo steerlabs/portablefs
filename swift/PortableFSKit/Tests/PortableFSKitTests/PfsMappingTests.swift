@@ -1,6 +1,53 @@
 import FSKit
 import Testing
 @testable import PortableFSKit
+@preconcurrency import Darwin
+
+@Test func itemIdentifiersRespectFSKitReservedValues() throws {
+    #expect(
+        try PfsFSKitMapping.itemIdentifier(from: 1) == .rootDirectory
+    )
+    #expect(
+        try PfsFSKitMapping.itemIdentifier(from: 2).rawValue == 3
+    )
+
+    do {
+        _ = try PfsFSKitMapping.itemIdentifier(from: 0)
+        Issue.record("expected the invalid pfslocal item identifier to fail")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EOVERFLOW)
+    }
+
+    var rootItem = PfsItem()
+    rootItem.itemID = 1
+    rootItem.itemGeneration = 1
+    var root = PfsAttr()
+    root.item = rootItem
+    root.kind = .directory
+    root.mode = 0o755
+    let attributes = try PfsFSKitMapping.attributes(from: root)
+    #expect(attributes.isValid(.fileID))
+    #expect(attributes.fileID == .rootDirectory)
+    #expect(attributes.type == .directory)
+
+    do {
+        _ = try PfsFSKitMapping.itemIdentifier(from: UInt64.max)
+        Issue.record("expected an unrepresentable item identifier to fail")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EOVERFLOW)
+    }
+}
+
+@Test func directoryVerifierNeverLeaksFSKitInitialSentinel() throws {
+    #expect(try PfsFSKitMapping.directoryVerifier(from: 0).rawValue == 1)
+    #expect(try PfsFSKitMapping.directoryVerifier(from: 41).rawValue == 42)
+    do {
+        _ = try PfsFSKitMapping.directoryVerifier(from: UInt64.max)
+        Issue.record("expected an unrepresentable verifier to fail")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EOVERFLOW)
+    }
+}
 
 @Test func statfsMappingUsesDaemonValuesAndPreferredIOSize() {
     var reply = PfsStatfsReply()

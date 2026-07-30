@@ -33,7 +33,7 @@ func (c *rawPFSClient) close() { _ = c.conn.Close() }
 func (c *rawPFSClient) call(body any) (any, *pfslocal.ErrorReply, error) {
 	c.next++
 	id := c.next
-	operationID := id
+	operationID := testOperationID(body, id)
 	if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
 		RequestID: id, OperationID: operationID, Body: body,
 	}); err != nil {

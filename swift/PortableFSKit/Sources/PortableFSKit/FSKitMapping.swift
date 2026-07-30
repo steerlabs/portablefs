@@ -20,6 +20,36 @@ public enum PfsErrorMapper {
 }
 
 public enum PfsFSKitMapping {
+    /// FSKit reserves identifiers 0, 1, and 2 for invalid, parent-of-root,
+    /// and root respectively. PortableFS uses authority inode 1 for its root,
+    /// so expose the complete pfslocal identity space through one checked
+    /// offset at the platform boundary. VolumeCore and portablefsd continue
+    /// to use the unmodified durable identity.
+    public static func itemIdentifier(from itemID: UInt64) throws -> FSItem.Identifier {
+        guard itemID > 0, itemID < UInt64.max,
+              let identifier = FSItem.Identifier(rawValue: itemID + 1) else {
+            throw PfsLocalClientError.daemon(
+                errno: EOVERFLOW,
+                message: "pfslocal item identifier cannot be represented by FSKit"
+            )
+        }
+        return identifier
+    }
+
+    /// FSKit reserves verifier zero for the initial request and requires every
+    /// successful enumeration to return a nonzero current verifier. Daemon
+    /// directory versions may legitimately be zero, so translate them through
+    /// the same checked successor scheme instead of leaking the sentinel.
+    public static func directoryVerifier(from version: UInt64) throws -> FSDirectoryVerifier {
+        guard version < UInt64.max else {
+            throw PfsLocalClientError.daemon(
+                errno: EOVERFLOW,
+                message: "directory verifier cannot be represented by FSKit"
+            )
+        }
+        return FSDirectoryVerifier(version + 1)
+    }
+
     public static func itemType(from kind: PfsItemKind) -> FSItem.ItemType {
         switch kind {
         case .file:
@@ -48,7 +78,7 @@ public enum PfsFSKitMapping {
         }
     }
 
-    public static func attributes(from attr: PfsAttr) -> FSItem.Attributes {
+    public static func attributes(from attr: PfsAttr) throws -> FSItem.Attributes {
         let attributes = FSItem.Attributes()
         attributes.uid = attr.uid
         attributes.gid = attr.gid
@@ -57,7 +87,7 @@ public enum PfsFSKitMapping {
         attributes.linkCount = attr.nlink == 0 ? 1 : attr.nlink
         attributes.size = attr.size
         attributes.allocSize = attr.size
-        attributes.fileID = FSItem.Identifier(rawValue: attr.item.itemID) ?? .invalid
+        attributes.fileID = try itemIdentifier(from: attr.item.itemID)
         attributes.modifyTime = timespec(milliseconds: attr.mtimeMs)
         attributes.changeTime = timespec(milliseconds: attr.ctimeMs)
         attributes.accessTime = timespec(milliseconds: attr.atimeMs)

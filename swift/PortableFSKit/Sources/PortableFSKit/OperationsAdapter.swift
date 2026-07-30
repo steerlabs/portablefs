@@ -375,7 +375,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         try await core.client.withPublicationBoundary {
             do {
                 let attr = try await core.getattr(item: try portableItem(item))
-                return PfsFSKitMapping.attributes(from: attr)
+                return try PfsFSKitMapping.attributes(from: attr)
             } catch {
                 throw PfsErrorMapper.fsKitError(for: error)
             }
@@ -405,7 +405,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             do {
                 let request = PfsFSKitMapping.setAttributes(from: newAttributes)
                 let attr = try await core.setattr(item: try portableItem(item), attributes: request)
-                return PfsFSKitMapping.attributes(from: attr)
+                return try PfsFSKitMapping.attributes(from: attr)
             } catch {
                 throw PfsErrorMapper.fsKitError(for: error)
             }
@@ -583,7 +583,9 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 wantAttributes: attributesRequested,
                 maxEntries: PfsEnumerationCookies.daemonPageSize
             )
-            let currentVerifier = result.verifier
+            let currentVerifier = try PfsFSKitMapping.directoryVerifier(
+                from: result.verifier
+            )
 
             for entry in try PfsEnumerationCookies.syntheticEntries(
                 for: cookie.rawValue,
@@ -592,12 +594,14 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 let packed = packer.packEntry(
                     name: PfsFSKitMapping.fileName(from: entry.name),
                     itemType: .directory,
-                    itemID: FSItem.Identifier(rawValue: portableDirectory.identity.itemID) ?? .invalid,
+                    itemID: try PfsFSKitMapping.itemIdentifier(
+                        from: portableDirectory.identity.itemID
+                    ),
                     nextCookie: FSDirectoryCookie(entry.nextCookie),
                     attributes: nil
                 )
                 if !packed {
-                    return FSDirectoryVerifier(currentVerifier)
+                    return currentVerifier
                 }
             }
 
@@ -606,17 +610,21 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                     let packed = packer.packEntry(
                         name: PfsFSKitMapping.fileName(from: entry.name),
                         itemType: PfsFSKitMapping.itemType(from: entry.attr.kind),
-                        itemID: FSItem.Identifier(rawValue: entry.attr.item.itemID) ?? .invalid,
+                        itemID: try PfsFSKitMapping.itemIdentifier(
+                            from: entry.attr.item.itemID
+                        ),
                         nextCookie: FSDirectoryCookie(
                             try PfsEnumerationCookies.fskitCookie(
                                 for: entry.nextCookie,
                                 attributesRequested: attributesRequested
                             )
                         ),
-                        attributes: attributes == nil ? nil : PfsFSKitMapping.attributes(from: entry.attr)
+                        attributes: attributes == nil
+                            ? nil
+                            : try PfsFSKitMapping.attributes(from: entry.attr)
                     )
                     if !packed {
-                        return FSDirectoryVerifier(currentVerifier)
+                        return currentVerifier
                     }
                 }
 
@@ -631,7 +639,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                     maxEntries: PfsEnumerationCookies.daemonPageSize
                 )
             }
-            return FSDirectoryVerifier(currentVerifier)
+            return currentVerifier
           } catch let error as PfsLocalClientError where error.posixErrno == ESTALE {
             // The daemon signals an unknown/expired/pre-restart enumeration cookie with
             // ESTALE (its documented fail-safe). Surface FSKit's invalid-directory-cookie

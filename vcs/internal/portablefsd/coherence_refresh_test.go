@@ -15,6 +15,50 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
+func beginTestLogicalOperation(
+	t *testing.T,
+	conn *frontendConn,
+	a *attach,
+	operationID uint64,
+	body any,
+) (context.Context, *frontendOperationParticipant, bool, bool, error) {
+	t.Helper()
+	initialize, ok := conn.reserveLogicalOperation(operationID, true)
+	if !ok {
+		return context.Background(), nil, false, false,
+			errors.New("reserve logical operation failed")
+	}
+	return conn.beginLogicalOperation(
+		context.Background(), a, operationID, initialize, body,
+	)
+}
+
+func exposeTestLogicalOperation(
+	t *testing.T,
+	conn *frontendConn,
+	operationID uint64,
+) {
+	t.Helper()
+	if !conn.markPublicationReplyExposed(operationID) {
+		t.Fatalf("expose logical operation %d failed", operationID)
+	}
+}
+
+func TestFSKitItemIDBoundary(t *testing.T) {
+	if got, ok := fskitItemID(1); !ok || got != 2 {
+		t.Fatalf("root mapping = (%d, %v), want (2, true)", got, ok)
+	}
+	if got, ok := fskitItemID(2); !ok || got != 3 {
+		t.Fatalf("child mapping = (%d, %v), want (3, true)", got, ok)
+	}
+	if got, ok := fskitItemID(0); ok || got != 0 {
+		t.Fatalf("invalid mapping = (%d, %v), want (0, false)", got, ok)
+	}
+	if got, ok := fskitItemID(^uint64(0)); ok || got != 0 {
+		t.Fatalf("overflow mapping = (%d, %v), want (0, false)", got, ok)
+	}
+}
+
 // TestConsumeExpectedTruncate pins the marked-truncate note protocol that
 // keeps the daemon's kernel-size refreshes invisible to the authority: only
 // a pure size-set matching the noted size consumes the note; mode/ownership
@@ -110,6 +154,36 @@ func TestAppliedRefreshCannotLeaveConsumableTruncateMarker(t *testing.T) {
 	}
 }
 
+func TestUnrepresentableRefreshCannotMutateTruncateOrAttributeState(t *testing.T) {
+	rec := &itemRecord{
+		item: pfslocal.Item{ItemID: ^uint64(0), ItemGeneration: 1},
+		path: "invalid",
+		attr: fsproto.Attr{Kind: "file", Size: 4},
+	}
+	originalNote := expectedTruncate{
+		itemID:   7,
+		size:     3,
+		deadline: time.Now().Add(time.Minute),
+	}
+	a := &attach{
+		items:             map[uint64]*itemRecord{rec.item.ItemID: rec},
+		expectedTruncates: map[string]expectedTruncate{"sentinel": originalNote},
+		testRefreshKernelFile: func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+			t.Fatal("kernel refresh ran for an unrepresentable item")
+			return kernelRefreshApplied, nil
+		},
+	}
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 8); outcome != kernelRefreshRetry || err == nil {
+		t.Fatalf("apply = (%v, %v), want retry with error", outcome, err)
+	}
+	if rec.attr.Size != 4 {
+		t.Fatalf("cached size mutated to %d", rec.attr.Size)
+	}
+	if len(a.expectedTruncates) != 1 || a.expectedTruncates["sentinel"] != originalNote {
+		t.Fatalf("truncate markers mutated: %+v", a.expectedTruncates)
+	}
+}
+
 func TestExactRefreshSerializesOneItemTransaction(t *testing.T) {
 	a := &attach{}
 	firstEntered := make(chan struct{})
@@ -199,7 +273,11 @@ func TestQueuedRemoteRefreshSamplesNewDelegatedViewAtExecution(t *testing.T) {
 	}
 	a.items = map[uint64]*itemRecord{7: a.paths["d/f"]}
 	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
-		if path != "d/f" || itemID != 7 {
+		expectedItemID, ok := fskitItemID(7)
+		if !ok {
+			t.Fatal("map expected FSKit item ID")
+		}
+		if path != "d/f" || itemID != expectedItemID {
 			t.Fatalf("refresh target = %q item=%d", path, itemID)
 		}
 		appliedSize = size
@@ -412,7 +490,7 @@ func TestFrontendHandoffCancellationReopensAdmission(t *testing.T) {
 	}
 }
 
-func TestClosedFrontendConnectionCannotLeakLatePublication(t *testing.T) {
+func TestClosedFrontendConnectionReleasesUnexposedOperation(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
 	defer clientSide.Close()
 	a := &attach{}
@@ -427,12 +505,7 @@ func TestClosedFrontendConnectionCannotLeakLatePublication(t *testing.T) {
 		lastOperationID: 1,
 	}
 	conn.close()
-	if _, _, _, _, err := conn.beginLogicalOperation(
-		context.Background(),
-		a,
-		2,
-		&pfslocal.GetAttrRequest{},
-	); err == nil {
+	if _, ok := conn.reserveLogicalOperation(2, true); ok {
 		t.Fatal("closed connection admitted a late logical operation")
 	}
 
@@ -444,14 +517,115 @@ func TestClosedFrontendConnectionCannotLeakLatePublication(t *testing.T) {
 	a.endFrontendHandoff("d")
 }
 
+func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	a := &attach{}
+	_, inFlight := a.beginFrontendPaths(context.Background(), []string{"d/in-flight"})
+	ready := make(chan struct{})
+	close(ready)
+	conn := &frontendConn{
+		conn: serverSide,
+		operations: map[uint64]*frontendOperationEntry{
+			1: {ready: ready, op: inFlight},
+		},
+		lastOperationID: 1,
+	}
+	exposeTestLogicalOperation(t, conn, 1)
+	handoffDone := make(chan error, 1)
+	go func() {
+		// A real attached handler holds the frontend proxy for reading while
+		// a delegation handoff runs. The disconnect verdict must wake this
+		// wait before failCoherence takes that proxy exclusively.
+		a.frontendSerial.RLock()
+		err := a.startFrontendHandoff(context.Background(), "d")
+		a.frontendSerial.RUnlock()
+		handoffDone <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		a.frontendGateMu.Lock()
+		waiting := a.frontendHandoffs["d"] != 0
+		a.frontendGateMu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("handoff did not enter the publication wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		conn.close()
+		close(closeDone)
+	}()
+
+	select {
+	case err := <-handoffDone:
+		if err == nil {
+			t.Fatal("waiting handoff crossed an unacknowledged exposed publication")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting handoff did not abort after coherence failed")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("exposed disconnect deadlocked behind the waiting handoff")
+	}
+	if err := a.frontendAdmissionError(); err == nil {
+		t.Fatal("attach remained admitted after exposed publication disconnected")
+	}
+	a.frontendGateMu.Lock()
+	waiting := len(a.frontendHandoffs)
+	a.frontendGateMu.Unlock()
+	if waiting != 0 {
+		t.Fatalf("aborted handoff left %d scope(s) installed", waiting)
+	}
+	if err := a.startFrontendHandoff(context.Background(), "d"); err == nil {
+		t.Fatal("later handoff crossed terminal frontend gate failure")
+	}
+}
+
+func TestClosedFrontendConnectionReleasesAcknowledgedOperation(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	a := &attach{}
+	_, inFlight := a.beginFrontendPaths(context.Background(), []string{"d/in-flight"})
+	ready := make(chan struct{})
+	close(ready)
+	conn := &frontendConn{
+		conn: serverSide,
+		operations: map[uint64]*frontendOperationEntry{
+			1: {ready: ready, op: inFlight},
+		},
+		lastOperationID: 1,
+	}
+	exposeTestLogicalOperation(t, conn, 1)
+	if !conn.acknowledgePublication(1) {
+		t.Fatal("acknowledgement rejected")
+	}
+	conn.close()
+
+	if err := a.frontendAdmissionError(); err != nil {
+		t.Fatalf("acknowledged disconnect failed attach: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.startFrontendHandoff(ctx, "d"); err != nil {
+		t.Fatalf("acknowledged operation survived closed connection: %v", err)
+	}
+	a.endFrontendHandoff("d")
+}
+
 func TestLogicalOperationCanIssueNextRPCWhileHandoffWaitsForItsPublication(t *testing.T) {
 	a := &attach{}
 	conn := &frontendConn{}
 	const operationID uint64 = 1
 
-	ctx1, participant1, participates, publishes, err := conn.beginLogicalOperation(
-		context.Background(),
-		a,
+	ctx1, participant1, participates, publishes, err := beginTestLogicalOperation(
+		t, conn, a,
 		operationID,
 		&pfslocal.GetAttrRequest{},
 	)
@@ -461,6 +635,7 @@ func TestLogicalOperationCanIssueNextRPCWhileHandoffWaitsForItsPublication(t *te
 	_ = ctx1
 	a.finishFrontendParticipant(participant1)
 	conn.finishLogicalRequest(operationID)
+	exposeTestLogicalOperation(t, conn, operationID)
 
 	handoffDone := make(chan error, 1)
 	go func() {
@@ -472,9 +647,8 @@ func TestLogicalOperationCanIssueNextRPCWhileHandoffWaitsForItsPublication(t *te
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	_, participant2, participates, publishes, err := conn.beginLogicalOperation(
-		context.Background(),
-		a,
+	_, participant2, participates, publishes, err := beginTestLogicalOperation(
+		t, conn, a,
 		operationID,
 		&pfslocal.EnumerateRequest{},
 	)
@@ -503,25 +677,69 @@ func TestLogicalOperationCanIssueNextRPCWhileHandoffWaitsForItsPublication(t *te
 	a.endFrontendHandoff("")
 }
 
-func TestEarlyLogicalOperationAckWaitsForEveryPipelinedRequest(t *testing.T) {
+func TestLogicalOperationIDsAreAdmittedInWireOrderNotHandlerOrder(t *testing.T) {
+	a := &attach{}
+	conn := &frontendConn{}
+	initializeOne, ok := conn.reserveLogicalOperation(1, true)
+	if !ok || !initializeOne {
+		t.Fatal("reserve operation 1")
+	}
+	initializeTwo, ok := conn.reserveLogicalOperation(2, true)
+	if !ok || !initializeTwo {
+		t.Fatal("reserve operation 2")
+	}
+
+	// Deliberately run the second handler first. Frame ingress already proved
+	// 1 then 2, so parallel goroutine scheduling must not reinterpret this as
+	// a malformed decreasing operation stream.
+	_, second, participates, publishes, err := conn.beginLogicalOperation(
+		context.Background(), a, 2, initializeTwo, &pfslocal.GetAttrRequest{},
+	)
+	if err != nil || !participates || !publishes || second == nil {
+		t.Fatalf("operation 2 admission: participant=%v err=%v", second, err)
+	}
+	_, first, participates, publishes, err := conn.beginLogicalOperation(
+		context.Background(), a, 1, initializeOne, &pfslocal.GetAttrRequest{},
+	)
+	if err != nil || !participates || !publishes || first == nil {
+		t.Fatalf("operation 1 admission: participant=%v err=%v", first, err)
+	}
+
+	a.finishFrontendParticipant(first)
+	conn.finishLogicalRequest(1)
+	a.finishFrontendParticipant(second)
+	conn.finishLogicalRequest(2)
+	exposeTestLogicalOperation(t, conn, 1)
+	exposeTestLogicalOperation(t, conn, 2)
+	if !conn.acknowledgePublication(1) ||
+		!conn.acknowledgePublication(2) {
+		t.Fatal("wire-ordered operations did not retire")
+	}
+}
+
+func TestLogicalOperationAckRequiresExposedReplyAndWaitsForEveryPipelinedRequest(t *testing.T) {
 	a := &attach{}
 	conn := &frontendConn{}
 	const operationID uint64 = 1
 
-	_, first, _, _, err := conn.beginLogicalOperation(
-		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	_, first, _, _, err := beginTestLogicalOperation(
+		t, conn, a, operationID, &pfslocal.GetAttrRequest{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, second, _, _, err := conn.beginLogicalOperation(
-		context.Background(), a, operationID, &pfslocal.EnumerateRequest{},
+	_, second, _, _, err := beginTestLogicalOperation(
+		t, conn, a, operationID, &pfslocal.EnumerateRequest{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if conn.acknowledgePublication(operationID) {
+		t.Fatal("acknowledgement before a reply was exposed was accepted")
+	}
+	exposeTestLogicalOperation(t, conn, operationID)
 	if !conn.acknowledgePublication(operationID) {
-		t.Fatal("early acknowledgement was not recorded")
+		t.Fatal("acknowledgement after reply exposure was rejected")
 	}
 
 	handoffDone := make(chan error, 1)
@@ -545,9 +763,7 @@ func TestEarlyLogicalOperationAckWaitsForEveryPipelinedRequest(t *testing.T) {
 	}
 	a.endFrontendHandoff("")
 
-	if _, _, _, _, err := conn.beginLogicalOperation(
-		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
-	); err == nil {
+	if _, ok := conn.reserveLogicalOperation(operationID, true); ok {
 		t.Fatal("acknowledged operation id was reusable")
 	}
 }
@@ -769,7 +985,11 @@ func TestRestartRestoredRegularAndSymlinkFlushAll(t *testing.T) {
 	})
 	var regularApplies atomic.Int32
 	a.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
-		if p != "regular" || itemID != fileAttr.Ino || size != 4 {
+		expectedItemID, ok := fskitItemID(fileAttr.Ino)
+		if !ok {
+			t.Fatal("map expected FSKit item ID")
+		}
+		if p != "regular" || itemID != expectedItemID || size != 4 {
 			t.Fatalf("kernel apply path=%q item=%d size=%d", p, itemID, size)
 		}
 		regularApplies.Add(1)
@@ -909,10 +1129,18 @@ func TestRelatedRetainedInodeCannotAckThroughReplacementPath(t *testing.T) {
 	}
 	var oldFlushApplied atomic.Bool
 	flushBlocked.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
-		if itemID == oldItem.ItemID {
+		oldFSKitItemID, ok := fskitItemID(oldItem.ItemID)
+		if !ok {
+			t.Fatal("map old FSKit item ID")
+		}
+		newFSKitItemID, ok := fskitItemID(newItem.ItemID)
+		if !ok {
+			t.Fatal("map new FSKit item ID")
+		}
+		if itemID == oldFSKitItemID {
 			oldFlushApplied.Store(true)
 		}
-		if itemID != newItem.ItemID || p != "a" || size != newAttr.Size {
+		if itemID != newFSKitItemID || p != "a" || size != newAttr.Size {
 			return kernelRefreshRetry, errors.New("unexpected FlushAll apply target")
 		}
 		// FlushAll legitimately refreshes the live replacement too. The
@@ -961,7 +1189,11 @@ func TestRelatedRetainedInodeCannotAckThroughReplacementPath(t *testing.T) {
 	}
 	applied := make(chan struct{}, 1)
 	resolved.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
-		if path != "b" || itemID != oldItem.ItemID || size != 3 {
+		expectedItemID, ok := fskitItemID(oldItem.ItemID)
+		if !ok {
+			t.Fatal("map expected FSKit item ID")
+		}
+		if path != "b" || itemID != expectedItemID || size != 3 {
 			t.Fatalf("resolved exact refresh path=%q item=%d size=%d", path, itemID, size)
 		}
 		applied <- struct{}{}
@@ -1060,13 +1292,17 @@ func TestAuthorityRefreshFailureFailFreezesWithoutAcknowledging(t *testing.T) {
 	}
 }
 
-func TestFirstPublishingReplyAfterFailFreezeCanRetire(t *testing.T) {
+func TestFirstPublishingReplyAfterFailFreezeCanRetireItsGate(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
 	defer serverSide.Close()
 	defer clientSide.Close()
 	a := &attach{}
 	a.failCoherence(errors.New("unproven vnode state"))
 	conn := &frontendConn{conn: serverSide}
+	initialize, ok := conn.reserveLogicalOperation(1, true)
+	if !ok || !initialize {
+		t.Fatal("reserve first logical operation")
+	}
 	done := make(chan struct{})
 	go func() {
 		conn.handleAttached(
@@ -1074,6 +1310,7 @@ func TestFirstPublishingReplyAfterFailFreezeCanRetire(t *testing.T) {
 			a,
 			1,
 			1,
+			initialize,
 			&pfslocal.GetAttrRequest{},
 		)
 		close(done)
@@ -1092,26 +1329,30 @@ func TestFirstPublishingReplyAfterFailFreezeCanRetire(t *testing.T) {
 	if !conn.acknowledgePublication(1) {
 		t.Fatal("fail-frozen publication acknowledgement was rejected")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := a.startFrontendHandoff(ctx, ""); err != nil {
-		t.Fatalf("fail-frozen operation leaked after acknowledgement: %v", err)
+	a.frontendGateMu.Lock()
+	active := len(a.frontendActive)
+	a.frontendGateMu.Unlock()
+	if active != 0 {
+		t.Fatalf("fail-frozen operation remained active after acknowledgement: %d", active)
 	}
-	a.endFrontendHandoff("")
+	if err := a.startFrontendHandoff(context.Background(), ""); err == nil {
+		t.Fatal("terminal coherence failure did not abort a later handoff")
+	}
 }
 
 func TestLogicalOperationContinuationSuspendsBeforeProxyWait(t *testing.T) {
 	a := &attach{}
 	conn := &frontendConn{}
 	const operationID uint64 = 1
-	_, first, _, _, err := conn.beginLogicalOperation(
-		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	_, first, _, _, err := beginTestLogicalOperation(
+		t, conn, a, operationID, &pfslocal.GetAttrRequest{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	a.finishFrontendParticipant(first)
 	conn.finishLogicalRequest(operationID)
+	exposeTestLogicalOperation(t, conn, operationID)
 
 	// Model a control/lifecycle writer that has acquired the proxy and is
 	// waiting for this logical callback to publish before taking nsMu.
@@ -1127,8 +1368,8 @@ func TestLogicalOperationContinuationSuspendsBeforeProxyWait(t *testing.T) {
 	continuationReady := make(chan *frontendOperationParticipant, 1)
 	continuationDone := make(chan struct{})
 	go func() {
-		ctx, participant, participates, publishes, beginErr := conn.beginLogicalOperation(
-			context.Background(), a, operationID, &pfslocal.OpenRequest{},
+		ctx, participant, participates, publishes, beginErr := beginTestLogicalOperation(
+			t, conn, a, operationID, &pfslocal.OpenRequest{},
 		)
 		if beginErr != nil || !participates || publishes {
 			continuationReady <- nil
@@ -1174,14 +1415,14 @@ func TestLastRunningSiblingFinishingDeactivatesFullySuspendedOperation(t *testin
 	a := &attach{}
 	conn := &frontendConn{}
 	const operationID uint64 = 1
-	ctxA, participantA, _, _, err := conn.beginLogicalOperation(
-		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	ctxA, participantA, _, _, err := beginTestLogicalOperation(
+		t, conn, a, operationID, &pfslocal.GetAttrRequest{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, participantB, _, _, err := conn.beginLogicalOperation(
-		context.Background(), a, operationID, &pfslocal.GetAttrRequest{},
+	_, participantB, _, _, err := beginTestLogicalOperation(
+		t, conn, a, operationID, &pfslocal.GetAttrRequest{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1211,6 +1452,7 @@ func TestLastRunningSiblingFinishingDeactivatesFullySuspendedOperation(t *testin
 	resumeA()
 	a.finishFrontendParticipant(participantA)
 	conn.finishLogicalRequest(operationID)
+	exposeTestLogicalOperation(t, conn, operationID)
 	if !conn.acknowledgePublication(operationID) {
 		t.Fatal("operation acknowledgement failed")
 	}
