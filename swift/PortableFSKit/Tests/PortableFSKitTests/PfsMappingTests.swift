@@ -65,6 +65,7 @@ import Testing
     capabilities.preferredIoBytes = 65_536
 
     let result = PfsFSKitMapping.statfs(from: reply, capabilities: capabilities)
+    #expect(result.fileSystemTypeName == "pfs")
     #expect(result.blockSize == 8192)
     #expect(result.ioSize == 65_536)
     #expect(result.totalBlocks == 10_000)

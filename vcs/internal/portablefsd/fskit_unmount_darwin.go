@@ -57,11 +57,12 @@ func exactFSKitMountPresent(mountPath, attachRef string) (bool, error) {
 	if len(atPath) != 1 {
 		return false, fmt.Errorf("%d stacked kernel mounts exist at %s", len(atPath), mountPath)
 	}
-	expectedSource := "pfs://" + attachRef
-	if atPath[0].fsType != "portablefs" || atPath[0].source != expectedSource {
+	if err := validateExactFSKitKernelMount(atPath[0].fsType, atPath[0].source, attachRef); err != nil {
 		return false, fmt.Errorf(
-			"kernel mount at %s is %s from %s, want portablefs from %s",
-			mountPath, atPath[0].fsType, atPath[0].source, expectedSource,
+			"kernel mount at %s does not match attach %s: %w",
+			mountPath,
+			attachRef,
+			err,
 		)
 	}
 	return true, nil

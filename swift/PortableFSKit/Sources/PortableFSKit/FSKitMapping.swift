@@ -150,7 +150,7 @@ public enum PfsFSKitMapping {
     }
 
     public static func statfs(from reply: PfsStatfsReply, capabilities: PfsCapabilities) -> FSStatFSResult {
-        let result = FSStatFSResult(fileSystemTypeName: "portablefs")
+        let result = FSStatFSResult(fileSystemTypeName: PortableFSIdentity.fileSystemTypeName)
         let blockSize = reply.blockSize == 0 ? 4096 : reply.blockSize
         let totalBlocks = reply.totalBlocks == 0 ? 1_000_000 : reply.totalBlocks
         let freeBlocks = reply.freeBlocks == 0 ? totalBlocks / 2 : reply.freeBlocks
