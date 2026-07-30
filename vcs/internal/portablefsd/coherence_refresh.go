@@ -851,12 +851,26 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 		// operation as mount-wide only during the rare handoff interval.
 		return unknown()
 	case *pfslocal.GetAttrRequest:
+		if req.Handle != 0 {
+			paths, ok := handlePaths(req.Handle)
+			if !ok {
+				return unknown()
+			}
+			return knownSlice(paths)
+		}
 		paths, ok := itemPaths(req.Item)
 		if !ok {
 			return unknown()
 		}
 		return knownSlice(paths)
 	case *pfslocal.SetAttrRequest:
+		if req.Handle != 0 {
+			paths, ok := handlePaths(req.Handle)
+			if !ok {
+				return unknown()
+			}
+			return knownSlice(paths)
+		}
 		paths, ok := itemPaths(req.Item)
 		if !ok {
 			return unknown()
@@ -923,24 +937,52 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 		}
 		return known(append(sources, parent, path)...)
 	case *pfslocal.XattrGetRequest:
+		if req.Handle != 0 {
+			paths, ok := handlePaths(req.Handle)
+			if !ok {
+				return unknown()
+			}
+			return knownSlice(paths)
+		}
 		paths, ok := itemPaths(req.Item)
 		if !ok {
 			return unknown()
 		}
 		return knownSlice(paths)
 	case *pfslocal.XattrSetRequest:
+		if req.Handle != 0 {
+			paths, ok := handlePaths(req.Handle)
+			if !ok {
+				return unknown()
+			}
+			return knownSlice(paths)
+		}
 		paths, ok := itemPaths(req.Item)
 		if !ok {
 			return unknown()
 		}
 		return knownSlice(paths)
 	case *pfslocal.XattrListRequest:
+		if req.Handle != 0 {
+			paths, ok := handlePaths(req.Handle)
+			if !ok {
+				return unknown()
+			}
+			return knownSlice(paths)
+		}
 		paths, ok := itemPaths(req.Item)
 		if !ok {
 			return unknown()
 		}
 		return knownSlice(paths)
 	case *pfslocal.XattrRemoveRequest:
+		if req.Handle != 0 {
+			paths, ok := handlePaths(req.Handle)
+			if !ok {
+				return unknown()
+			}
+			return knownSlice(paths)
+		}
 		paths, ok := itemPaths(req.Item)
 		if !ok {
 			return unknown()

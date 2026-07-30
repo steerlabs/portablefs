@@ -20,7 +20,8 @@ import (
 var requestWireMagic = [4]byte{'P', 'F', 'R', 'Q'}
 
 const (
-	requestWireVersion = 2
+	requestWireVersion       = 3
+	requestWireLegacyVersion = 2
 
 	// The largest legitimate request is one MaxWriteBytes write plus bounded
 	// metadata. Keep the existing 64 MiB write allowance while bounding the
@@ -50,6 +51,7 @@ const (
 	requestFlagRegisterOpen
 	requestFlagExcl
 	requestFlagEnvelope
+	requestFlagSetATime
 )
 
 const requestKnownFlags = requestFlagOrphanTarget |
@@ -63,7 +65,8 @@ const requestKnownFlags = requestFlagOrphanTarget |
 	requestFlagOpenState |
 	requestFlagRegisterOpen |
 	requestFlagExcl |
-	requestFlagEnvelope
+	requestFlagEnvelope |
+	requestFlagSetATime
 
 var (
 	errRequestTooLarge  = errors.New("fsproto: request exceeds the aggregate byte bound")
@@ -97,7 +100,7 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 	}
 	// Magic, version, op, flags, then the fixed-width scalar fields.
 	if err := add(4 + 1 + 1 + 4 +
-		8 + 8 + 4 + 8 + 4 + 4 + 8 +
+		8 + 8 + 4 + 8 + 8 + 4 + 4 + 8 +
 		8 + 8 + 8 + 1 +
 		8 + 8 + 8 +
 		8 + 4 + 1 + 8 + 8); err != nil {
@@ -237,6 +240,9 @@ func requestFlags(req *Request) uint32 {
 	if req.SetTime {
 		flags |= requestFlagSetTime
 	}
+	if req.SetATime {
+		flags |= requestFlagSetATime
+	}
 	if req.SetUID {
 		flags |= requestFlagSetUID
 	}
@@ -327,6 +333,7 @@ func (e *requestEncoder) encodePrepared(req *Request, prepared preparedRequest) 
 	w.u64(uint64(req.Size))
 	w.u32(req.Mode)
 	w.u64(uint64(req.MtimeMs))
+	w.u64(uint64(req.AtimeMs))
 	w.u32(req.UID)
 	w.u32(req.GID)
 	w.u64(req.Epoch)
@@ -493,19 +500,27 @@ func (d *requestDecoder) Decode(dst *Request) error {
 	if r.err == nil && magic != requestWireMagic {
 		r.err = fmt.Errorf("%w: bad request magic", errMalformedRequest)
 	}
-	if version := r.u8(); r.err == nil && version != requestWireVersion {
+	version := r.u8()
+	if r.err == nil && version != requestWireVersion && version != requestWireLegacyVersion {
 		r.err = fmt.Errorf("%w: unsupported request codec version %d", errMalformedRequest, version)
 	}
 	var req Request
 	req.Op = Op(r.u8())
 	flags := r.u32()
-	if r.err == nil && flags&^requestKnownFlags != 0 {
-		r.err = fmt.Errorf("%w: unknown request flags %#x", errMalformedRequest, flags&^requestKnownFlags)
+	knownFlags := uint32(requestKnownFlags)
+	if version == requestWireLegacyVersion {
+		knownFlags &^= requestFlagSetATime
+	}
+	if r.err == nil && flags&^knownFlags != 0 {
+		r.err = fmt.Errorf("%w: unknown request flags %#x", errMalformedRequest, flags&^knownFlags)
 	}
 	req.Offset = int64(r.u64())
 	req.Size = int64(r.u64())
 	req.Mode = r.u32()
 	req.MtimeMs = int64(r.u64())
+	if version >= requestWireVersion {
+		req.AtimeMs = int64(r.u64())
+	}
 	req.UID = r.u32()
 	req.GID = r.u32()
 	req.Epoch = r.u64()
@@ -526,6 +541,7 @@ func (d *requestDecoder) Decode(dst *Request) error {
 	req.Append = flags&requestFlagAppend != 0
 	req.SetMode = flags&requestFlagSetMode != 0
 	req.SetTime = flags&requestFlagSetTime != 0
+	req.SetATime = flags&requestFlagSetATime != 0
 	req.SetUID = flags&requestFlagSetUID != 0
 	req.SetGID = flags&requestFlagSetGID != 0
 	req.LkWrite = flags&requestFlagLockWrite != 0

@@ -556,6 +556,199 @@ func TestDaemonLocalDirHardLinksAndBoundaries(t *testing.T) {
 	}
 }
 
+func TestDetachedGraftXattrsRemainUnsupportedAfterAncestorRemap(t *testing.T) {
+	a := newAttach("att-graft-xattr-origin", "key", ensureAttachRequest{
+		VolumeID: "vol-graft-xattr-origin", Branch: "main",
+		MountPath: "/Volumes/GraftXattrOrigin",
+		Options:   AttachOptions{LocalDirs: []string{"workspace/cache"}},
+	}, privateTestDir(t))
+	if _, err := a.addLocalDirs([]string{"workspace/cache"}); err != nil {
+		t.Fatal(err)
+	}
+	itemID, eno := a.writeLocalFile(
+		"workspace/cache/open", "workspace/cache", []byte("retained"),
+	)
+	if eno != 0 {
+		t.Fatalf("write graft errno=%d", eno)
+	}
+	a.mu.RLock()
+	rec := a.items[itemID]
+	a.mu.RUnlock()
+	if rec == nil || !rec.graft {
+		t.Fatalf("graft record=%+v", rec)
+	}
+	opened, eno := a.open(context.Background(), &pfslocal.OpenRequest{
+		Item: rec.item, Mode: pfslocal.OpenModeReadWrite,
+	})
+	if eno != 0 {
+		t.Fatalf("open graft errno=%d", eno)
+	}
+	if eno := a.removeLocal(rec.path, false); eno != 0 {
+		t.Fatalf("detach graft errno=%d", eno)
+	}
+	a.mu.Lock()
+	a.renamePathLocked("workspace", "moved")
+	a.mu.Unlock()
+
+	if _, eno := a.xattrSet(context.Background(), &pfslocal.XattrSetRequest{
+		Item: rec.item, Handle: opened.Handle,
+		Name: "user.unsupported", Value: []byte("value"),
+	}); eno != darwinENOTSUP {
+		t.Fatalf("detached remapped graft xattr set errno=%d want ENOTSUP", eno)
+	}
+	if _, eno := a.xattrRemove(context.Background(), &pfslocal.XattrRemoveRequest{
+		Item: rec.item, Handle: opened.Handle, Name: "user.unsupported",
+	}); eno != darwinENOTSUP {
+		t.Fatalf("detached remapped graft xattr remove errno=%d want ENOTSUP", eno)
+	}
+	if reply, eno := a.close(&pfslocal.CloseRequest{Handle: opened.Handle}); eno != 0 || !reply.Retired {
+		t.Fatalf("close graft reply=%+v errno=%d", reply, eno)
+	}
+	if replay, eno := a.close(&pfslocal.CloseRequest{Handle: opened.Handle}); eno != 0 ||
+		replay == nil || !replay.Retired || replay.CloseErrno != 0 {
+		t.Fatalf("replay successful graft close reply=%+v errno=%d", replay, eno)
+	}
+}
+
+func TestLocalCloseErrorRetiresDaemonHandle(t *testing.T) {
+	a := newAttach("att-graft-close-error", "key", ensureAttachRequest{
+		VolumeID: "vol-graft-close-error", Branch: "main",
+		MountPath: "/Volumes/GraftCloseError",
+		Options:   AttachOptions{LocalDirs: []string{"workspace/cache"}},
+	}, privateTestDir(t))
+	if _, err := a.addLocalDirs([]string{"workspace/cache"}); err != nil {
+		t.Fatal(err)
+	}
+	itemID, eno := a.writeLocalFile(
+		"workspace/cache/open", "workspace/cache", []byte("retained"),
+	)
+	if eno != 0 {
+		t.Fatalf("write graft errno=%d", eno)
+	}
+	a.mu.RLock()
+	rec := a.items[itemID]
+	a.mu.RUnlock()
+	opened, eno := a.open(context.Background(), &pfslocal.OpenRequest{
+		Item: rec.item, Mode: pfslocal.OpenModeRead,
+	})
+	if eno != 0 {
+		t.Fatalf("open graft errno=%d", eno)
+	}
+
+	// Closing the underlying descriptor first deterministically makes the
+	// daemon's subsequent os.File.Close report an error. The descriptor is
+	// nevertheless unusable, so that response must confirm handle retirement.
+	handle, eno := a.handle(opened.Handle)
+	if eno != 0 {
+		t.Fatalf("resolve handle errno=%d", eno)
+	}
+	if err := handle.file.Close(); err != nil {
+		t.Fatalf("pre-close backing descriptor: %v", err)
+	}
+	reply, eno := a.close(&pfslocal.CloseRequest{Handle: opened.Handle})
+	if eno != 0 {
+		t.Fatalf("close returned pre-retirement errno=%d", eno)
+	}
+	if reply == nil || !reply.Retired || reply.CloseErrno == 0 {
+		t.Fatalf("close reply=%+v want retired terminal error", reply)
+	}
+	if _, eno := a.handle(opened.Handle); eno != darwinEINVAL {
+		t.Fatalf("retired handle lookup errno=%d want EINVAL", eno)
+	}
+	replay, eno := a.close(&pfslocal.CloseRequest{Handle: opened.Handle})
+	if eno != 0 || replay == nil || !replay.Retired ||
+		replay.CloseErrno != reply.CloseErrno {
+		t.Fatalf("replay terminal graft close reply=%+v errno=%d want close errno=%d",
+			replay, eno, reply.CloseErrno)
+	}
+}
+
+func TestDaemonLocalDirRenameOverRetainsExactOpenObject(t *testing.T) {
+	authority := serveAuthority(t)
+	cfg, hc, cancel := startDaemonNoAttach(t, authority)
+	defer cancel()
+	ref := ensureLocalDirsAttach(
+		t, hc, authority, "vol-local-rename-over",
+		"/Volumes/LocalRenameOver", []string{"node_modules"},
+	)
+
+	c := dialPFS(t, cfg.FrontendSocket)
+	defer c.close()
+	root := resolveRoot(t, c, ref)
+	nm := mkdirItem(t, c, root, "node_modules")
+	old := writeAll(t, c, nm.Item, "target", "old-data")
+	writeAll(t, c, nm.Item, "replacement", "new-data")
+
+	opened := c.call(&pfslocal.OpenRequest{
+		Item: old.Item, Mode: pfslocal.OpenModeReadWrite,
+	}).(*pfslocal.OpenReply)
+	c.call(&pfslocal.RenameRequest{
+		FromDir: nm.Item, FromName: []byte("replacement"),
+		ToDir: nm.Item, ToName: []byte("target"),
+	})
+
+	detached := c.call(&pfslocal.GetAttrRequest{
+		Item: old.Item, Handle: opened.Handle,
+	}).(*pfslocal.GetAttrReply)
+	if detached.Attr.Nlink != 0 {
+		t.Fatalf("detached graft nlink=%d want 0", detached.Attr.Nlink)
+	}
+
+	size := uint64(3)
+	mode := uint32(0o600)
+	atime := time.Now().Add(-2 * time.Hour).UnixMilli()
+	mtime := time.Now().Add(-time.Hour).UnixMilli()
+	updated := c.call(&pfslocal.SetAttrRequest{
+		Item: old.Item, Handle: opened.Handle,
+		Size: &size, Mode: &mode, AtimeMs: &atime, MtimeMs: &mtime,
+	}).(*pfslocal.SetAttrReply)
+	if updated.Attr.Size != size || updated.Attr.Mode&0o777 != mode ||
+		updated.Attr.Nlink != 0 {
+		t.Fatalf("detached graft setattr=%+v", updated.Attr)
+	}
+	if updated.Attr.AtimeMs != atime || updated.Attr.MtimeMs != mtime {
+		t.Fatalf(
+			"detached graft times atime=%d mtime=%d want %d/%d",
+			updated.Attr.AtimeMs, updated.Attr.MtimeMs, atime, mtime,
+		)
+	}
+	written := c.call(&pfslocal.WriteRequest{
+		Handle: opened.Handle, Offset: 0, Data: []byte("XYZ"),
+	}).(*pfslocal.WriteReply)
+	if written.Written != 3 || written.Attr.Nlink != 0 {
+		t.Fatalf("detached graft write=%+v", written)
+	}
+	got := c.call(&pfslocal.ReadRequest{
+		Handle: opened.Handle, Length: 16,
+	}).(*pfslocal.ReadReply)
+	if string(got.Data) != "XYZ" {
+		t.Fatalf("detached graft read=%q want XYZ", got.Data)
+	}
+	c.call(&pfslocal.FsyncRequest{Handle: opened.Handle})
+
+	replacement := lookupItem(t, c, nm.Item, "target")
+	if replacement.Item == old.Item {
+		t.Fatalf("rename-over reused detached Item: %+v", replacement.Item)
+	}
+	if got := readAll(t, c, replacement.Item); got != "new-data" {
+		t.Fatalf("replacement content=%q want new-data", got)
+	}
+	if replacement.Mode&0o777 != 0o644 {
+		t.Fatalf("replacement mode=%#o want 0644", replacement.Mode&0o777)
+	}
+
+	if er := c.callErr(&pfslocal.ReclaimRequest{Item: old.Item}); er.Errno != darwinEBUSY {
+		t.Fatalf("reclaim with live graft handle errno=%d want EBUSY", er.Errno)
+	}
+	c.call(&pfslocal.CloseRequest{Handle: opened.Handle})
+	if er := c.callErr(&pfslocal.GetAttrRequest{
+		Item: old.Item, Handle: opened.Handle,
+	}); er.Errno != darwinENOENT {
+		t.Fatalf("post-close detached graft getattr errno=%d want ENOENT", er.Errno)
+	}
+	c.call(&pfslocal.ReclaimRequest{Item: old.Item})
+}
+
 func TestDaemonReadsVolumeLocalDirsAndNoLocalDisablesThem(t *testing.T) {
 	authority := serveAuthority(t)
 	remote, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})

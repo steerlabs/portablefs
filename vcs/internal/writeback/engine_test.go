@@ -170,6 +170,106 @@ func TestAdmissionRevalidatesAfterGrantInstallation(t *testing.T) {
 	}
 }
 
+func TestDelegatedValidationAndAdmissionAreOneCriticalSection(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+
+	armed := make(chan struct{})
+	validatorEntered := make(chan struct{})
+	resumeValidator := make(chan struct{})
+	e, err := Open(context.Background(), Config{
+		StateDir:    t.TempDir(),
+		VolumeID:    "vol",
+		Branch:      "main",
+		Remote:      auth,
+		BudgetBytes: 1 << 30,
+		Events: Events{
+			ValidateDelegatedMutation: func(
+				_ context.Context,
+				path string,
+				entry Entry,
+				present bool,
+			) error {
+				select {
+				case <-armed:
+				default:
+					return nil
+				}
+				if path != "d/file" || !present || entry.Kind != "file" {
+					return fmt.Errorf("unexpected delegated snapshot: path=%q present=%v entry=%+v", path, present, entry)
+				}
+				close(validatorEntered)
+				<-resumeValidator
+				return nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, handled, err := e.Create(ctx, "d/file", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("seed delegated file: handled=%v err=%v", handled, err)
+	}
+	if err := e.Fsync(ctx, "d/file"); err != nil {
+		t.Fatalf("flush seed before admission test: %v", err)
+	}
+	close(armed)
+
+	type mutationResult struct {
+		handled bool
+		err     error
+	}
+	mutationDone := make(chan mutationResult, 1)
+	go func() {
+		_, handled, err := e.WriteAt(ctx, "d/file", 0, []byte("atomic"))
+		mutationDone <- mutationResult{handled: handled, err: err}
+	}()
+	select {
+	case <-validatorEntered:
+	case <-ctx.Done():
+		t.Fatal("validator did not enter")
+	}
+	if e.mu.TryLock() {
+		e.mu.Unlock()
+		t.Fatal("delegated validator ran outside the admission critical section")
+	}
+
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- e.ReleaseFor(ctx, "d/file") }()
+	select {
+	case err := <-releaseDone:
+		t.Fatalf("grant release passed validation/admission lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(resumeValidator)
+
+	select {
+	case result := <-mutationDone:
+		if result.err != nil || !result.handled {
+			t.Fatalf("validated mutation: handled=%v err=%v", result.handled, result.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("validated mutation did not finish")
+	}
+	select {
+	case err := <-releaseDone:
+		if err != nil {
+			t.Fatalf("release after validated mutation: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("release did not finish after validator resumed")
+	}
+	if err := auth.equalFile("d/file", []byte("atomic")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestDelegatedCreateStormZeroRemoteCalls is the zero-RPC acceptance shape:
 // after one grant on the parent, creates+writes+lookups of new names touch
 // the authority zero times until the flush.
@@ -1015,6 +1115,139 @@ func TestReleaseForLeavesDelegatedMode(t *testing.T) {
 	// that follows orders after it.
 	if err := auth.equalFile("d/f", []byte("acked")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBeginExactReleasesEveryDelegationAndHoldsAcquisitionGate(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.dirs["e"] = true
+	auth.mu.Unlock()
+	engine := testEngine(t, auth)
+	ctx := context.Background()
+	if _, handled, err := engine.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create d/f: handled=%v err=%v", handled, err)
+	}
+	if _, handled, err := engine.Create(ctx, "e/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create e/f: handled=%v err=%v", handled, err)
+	}
+	if err := engine.ReleaseFor(ctx, ""); err != nil {
+		t.Fatalf("path-scoped empty release: %v", err)
+	}
+	if !engine.Covers("d/f") || !engine.Covers("e/f") {
+		t.Fatal("ordinary empty-path ReleaseFor unexpectedly became mount-wide")
+	}
+
+	end, err := engine.BeginExact(ctx)
+	if err != nil {
+		t.Fatalf("begin exact: %v", err)
+	}
+	if engine.Covers("d/f") || engine.Covers("e/f") {
+		end()
+		t.Fatal("BeginExact left a retained delegation")
+	}
+	if got := auth.grantCount(); got != 0 {
+		end()
+		t.Fatalf("BeginExact left %d authority grants", got)
+	}
+	end()
+}
+
+type blockedAcquireRemote struct {
+	*fakeAuthority
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockedAcquireRemote) DelegationAcquire(ctx context.Context, scope, writebackID string) (AcquireReply, error) {
+	select {
+	case <-r.entered:
+	default:
+		close(r.entered)
+	}
+	select {
+	case <-r.release:
+		return r.fakeAuthority.DelegationAcquire(ctx, scope, writebackID)
+	case <-ctx.Done():
+		return AcquireReply{}, ctx.Err()
+	}
+}
+
+func TestBeginExactWaitsForDetachedAcquireResolverThenReleasesItsGrant(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	remote := &blockedAcquireRemote{
+		fakeAuthority: auth,
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	engine, err := Open(context.Background(), Config{
+		StateDir: t.TempDir(), VolumeID: "vol", Branch: "main", Remote: remote,
+		BudgetBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = engine.ForceClose("test teardown") })
+
+	mutationCtx, cancelMutation := context.WithCancel(context.Background())
+	createDone := make(chan error, 1)
+	go func() {
+		_, _, createErr := engine.Create(mutationCtx, "d/f", 0o644, false, false)
+		createDone <- createErr
+	}()
+	select {
+	case <-remote.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delegation acquire did not enter")
+	}
+	cancelMutation()
+	select {
+	case err := <-createDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("create error=%v want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled mutation did not return")
+	}
+
+	type exactResult struct {
+		end func()
+		err error
+	}
+	exactDone := make(chan exactResult, 1)
+	go func() {
+		end, exactErr := engine.BeginExact(context.Background())
+		exactDone <- exactResult{end: end, err: exactErr}
+	}()
+	select {
+	case result := <-exactDone:
+		if result.end != nil {
+			result.end()
+		}
+		t.Fatalf("BeginExact passed an unresolved acquire: %v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(remote.release)
+	var result exactResult
+	select {
+	case result = <-exactDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BeginExact did not finish after acquire resolution")
+	}
+	if result.err != nil {
+		t.Fatalf("BeginExact: %v", result.err)
+	}
+	defer result.end()
+	if engine.Covers("d/f") {
+		t.Fatal("late-installed grant survived BeginExact")
+	}
+	if got := auth.grantCount(); got != 0 {
+		t.Fatalf("late-installed authority grant count=%d want 0", got)
 	}
 }
 

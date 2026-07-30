@@ -4,7 +4,7 @@ package pfslocal
 
 const (
 	ProtocolMajor = 1
-	ProtocolMinor = 3
+	ProtocolMinor = 4
 	MaxFrameBytes = 16 << 20
 )
 
@@ -119,7 +119,10 @@ type EnumerateReply struct {
 	DirVersion uint64
 }
 
-type GetAttrRequest struct{ Item Item }
+type GetAttrRequest struct {
+	Item   Item
+	Handle uint64
+}
 type GetAttrReply struct{ Attr Attr }
 
 type SetAttrRequest struct {
@@ -130,6 +133,7 @@ type SetAttrRequest struct {
 	Size    *uint64
 	MtimeMs *int64
 	AtimeMs *int64
+	Handle  uint64
 }
 type SetAttrReply struct{ Attr Attr }
 
@@ -149,7 +153,10 @@ type OpenRequest struct {
 type OpenReply struct{ Handle uint64 }
 
 type CloseRequest struct{ Handle uint64 }
-type CloseReply struct{}
+type CloseReply struct {
+	Retired    bool
+	CloseErrno int32
+}
 
 type ReadRequest struct {
 	Handle uint64
@@ -226,8 +233,9 @@ type HardLinkReply struct {
 }
 
 type XattrGetRequest struct {
-	Item Item
-	Name string
+	Item   Item
+	Name   string
+	Handle uint64
 }
 type XattrGetReply struct{ Value []byte }
 
@@ -237,15 +245,20 @@ type XattrSetRequest struct {
 	Value       []byte
 	CreateOnly  bool
 	ReplaceOnly bool
+	Handle      uint64
 }
 type XattrSetReply struct{}
 
-type XattrListRequest struct{ Item Item }
+type XattrListRequest struct {
+	Item   Item
+	Handle uint64
+}
 type XattrListReply struct{ Names []string }
 
 type XattrRemoveRequest struct {
-	Item Item
-	Name string
+	Item   Item
+	Name   string
+	Handle uint64
 }
 type XattrRemoveReply struct{}
 

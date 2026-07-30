@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -74,7 +75,10 @@ func TestStreamMultipleFrames(t *testing.T) {
 	if err := WriteFrame(&buf, &Envelope{RequestID: 2, Body: &OpenReply{Handle: 99}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteFrame(&buf, &Envelope{RequestID: 1, Body: &CloseReply{}}); err != nil {
+	if err := WriteFrame(&buf, &Envelope{
+		RequestID: 1,
+		Body:      &CloseReply{Retired: true, CloseErrno: 5},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	first, err := ReadFrame(&buf)
@@ -87,6 +91,10 @@ func TestStreamMultipleFrames(t *testing.T) {
 	}
 	if first.RequestID != 2 || second.RequestID != 1 {
 		t.Fatalf("stream order ids = %d, %d", first.RequestID, second.RequestID)
+	}
+	closeReply, ok := second.Body.(*CloseReply)
+	if !ok || !closeReply.Retired || closeReply.CloseErrno != 5 {
+		t.Fatalf("decoded close reply = %#v", second.Body)
 	}
 }
 
@@ -106,5 +114,40 @@ func TestPublicationAckRequirementRoundTrip(t *testing.T) {
 	}
 	if decoded.RequestID != 42 || !decoded.PublicationAckRequired {
 		t.Fatalf("decoded envelope = %#v", decoded)
+	}
+}
+
+func TestExactObjectHandlesRoundTrip(t *testing.T) {
+	mode := uint32(0o600)
+	size := uint64(17)
+	mtime := int64(23)
+	atime := int64(29)
+	item := Item{ItemID: 31, ItemGeneration: 37}
+	requests := []any{
+		&GetAttrRequest{Item: item, Handle: 41},
+		&SetAttrRequest{
+			Item: item, Handle: 43, Mode: &mode, Size: &size,
+			MtimeMs: &mtime, AtimeMs: &atime,
+		},
+		&XattrGetRequest{Item: item, Name: "user.key", Handle: 47},
+		&XattrSetRequest{
+			Item: item, Name: "user.key", Value: []byte("value"),
+			CreateOnly: true, Handle: 53,
+		},
+		&XattrListRequest{Item: item, Handle: 59},
+		&XattrRemoveRequest{Item: item, Name: "user.key", Handle: 61},
+	}
+	for _, request := range requests {
+		frame, err := EncodeFrame(&Envelope{RequestID: 1, Body: request})
+		if err != nil {
+			t.Fatalf("%T encode: %v", request, err)
+		}
+		decoded, err := ReadFrame(bytes.NewReader(frame))
+		if err != nil {
+			t.Fatalf("%T decode: %v", request, err)
+		}
+		if !reflect.DeepEqual(decoded.Body, request) {
+			t.Fatalf("%T round trip:\n got  %#v\n want %#v", request, decoded.Body, request)
+		}
 	}
 }

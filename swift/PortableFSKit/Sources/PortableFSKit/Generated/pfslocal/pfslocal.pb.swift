@@ -30,6 +30,8 @@
 // Versioning: Hello/HelloReply negotiate {major, minor}. Same major = wire
 // compatible; unknown fields are ignored (proto3). Breaking changes bump major
 // and the daemon serves both during a deprecation window.
+// Protocol minor 4 makes an explicit daemon handle mandatory for retained
+// Item attribute/xattr operations after unlink or rename-over.
 //
 // Identity model: items are addressed by (item_id, item_generation) — the
 // authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
@@ -691,7 +693,7 @@ public struct PfsHello: Sendable {
   /// 1
   public var protocolMajor: UInt32 = 0
 
-  /// 1
+  /// 4
   public var protocolMinor: UInt32 = 0
 
   /// e.g. "fskit-appex"
@@ -1047,6 +1049,12 @@ public struct PfsGetAttrRequest: Sendable {
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
+  /// Exact daemon handle for fstat-style operations. Zero keeps ordinary
+  /// pathname-bound Item semantics. A nonzero handle must belong to this exact
+  /// Item generation; it is the only authority to operate after the Item's
+  /// remembered name is unlinked or replaced.
+  public var handle: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1144,6 +1152,9 @@ public struct PfsSetAttrRequest: Sendable {
   /// Clears the value of `atimeMs`. Subsequent reads from it will return its default value.
   public mutating func clearAtimeMs() {self._atimeMs = nil}
 
+  /// Exact daemon handle for ftruncate/fchmod/futimes-style operations.
+  public var handle: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1230,6 +1241,15 @@ public struct PfsCloseReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
+
+  /// True only when this request consumed the daemon handle. The frontend must
+  /// forget a retired handle even when close_errno reports a terminal syscall
+  /// error: POSIX close errors do not make the descriptor usable again.
+  public var retired: Bool = false
+
+  /// Terminal error observed while retiring the descriptor. Zero is ordinary
+  /// success. Failures that leave the daemon handle live use ErrorReply instead.
+  public var closeErrno: Int32 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1662,6 +1682,8 @@ public struct PfsXattrGetRequest: Sendable {
 
   public var name: String = String()
 
+  public var handle: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1703,6 +1725,8 @@ public struct PfsXattrSetRequest: @unchecked Sendable {
 
   public var replaceOnly: Bool = false
 
+  public var handle: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1733,6 +1757,8 @@ public struct PfsXattrListRequest: Sendable {
   public var hasItem: Bool {return self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
+
+  public var handle: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1768,6 +1794,8 @@ public struct PfsXattrRemoveRequest: Sendable {
   public mutating func clearItem() {self._item = nil}
 
   public var name: String = String()
+
+  public var handle: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -3900,6 +3928,7 @@ extension PfsGetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   public static let protoMessageName: String = _protobuf_package + ".GetAttrRequest"
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .same(proto: "item"),
+    2: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -3909,6 +3938,7 @@ extension PfsGetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._item) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -3922,11 +3952,15 @@ extension PfsGetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     try { if let v = self._item {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
     } }()
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 2)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsGetAttrRequest, rhs: PfsGetAttrRequest) -> Bool {
     if lhs._item != rhs._item {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -3978,6 +4012,7 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     5: .same(proto: "size"),
     6: .standard(proto: "mtime_ms"),
     7: .standard(proto: "atime_ms"),
+    8: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -3993,6 +4028,7 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self._size) }()
       case 6: try { try decoder.decodeSingularInt64Field(value: &self._mtimeMs) }()
       case 7: try { try decoder.decodeSingularInt64Field(value: &self._atimeMs) }()
+      case 8: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -4024,6 +4060,9 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     try { if let v = self._atimeMs {
       try visitor.visitSingularInt64Field(value: v, fieldNumber: 7)
     } }()
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4035,6 +4074,7 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     if lhs._size != rhs._size {return false}
     if lhs._mtimeMs != rhs._mtimeMs {return false}
     if lhs._atimeMs != rhs._atimeMs {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4184,18 +4224,37 @@ extension PfsCloseRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
 
 extension PfsCloseReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".CloseReply"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
+  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+    1: .same(proto: "retired"),
+    2: .standard(proto: "close_errno"),
+  ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    // Load everything into unknown fields
-    while try decoder.nextFieldNumber() != nil {}
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBoolField(value: &self.retired) }()
+      case 2: try { try decoder.decodeSingularInt32Field(value: &self.closeErrno) }()
+      default: break
+      }
+    }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.retired != false {
+      try visitor.visitSingularBoolField(value: self.retired, fieldNumber: 1)
+    }
+    if self.closeErrno != 0 {
+      try visitor.visitSingularInt32Field(value: self.closeErrno, fieldNumber: 2)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsCloseReply, rhs: PfsCloseReply) -> Bool {
+    if lhs.retired != rhs.retired {return false}
+    if lhs.closeErrno != rhs.closeErrno {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4987,6 +5046,7 @@ extension PfsXattrGetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .same(proto: "item"),
     2: .same(proto: "name"),
+    3: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4997,6 +5057,7 @@ extension PfsXattrGetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._item) }()
       case 2: try { try decoder.decodeSingularStringField(value: &self.name) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -5013,12 +5074,16 @@ extension PfsXattrGetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
     if !self.name.isEmpty {
       try visitor.visitSingularStringField(value: self.name, fieldNumber: 2)
     }
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsXattrGetRequest, rhs: PfsXattrGetRequest) -> Bool {
     if lhs._item != rhs._item {return false}
     if lhs.name != rhs.name {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -5064,6 +5129,7 @@ extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
     3: .same(proto: "value"),
     4: .standard(proto: "create_only"),
     5: .standard(proto: "replace_only"),
+    6: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -5077,6 +5143,7 @@ extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
       case 3: try { try decoder.decodeSingularBytesField(value: &self.value) }()
       case 4: try { try decoder.decodeSingularBoolField(value: &self.createOnly) }()
       case 5: try { try decoder.decodeSingularBoolField(value: &self.replaceOnly) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -5102,6 +5169,9 @@ extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
     if self.replaceOnly != false {
       try visitor.visitSingularBoolField(value: self.replaceOnly, fieldNumber: 5)
     }
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -5111,6 +5181,7 @@ extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
     if lhs.value != rhs.value {return false}
     if lhs.createOnly != rhs.createOnly {return false}
     if lhs.replaceOnly != rhs.replaceOnly {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -5139,6 +5210,7 @@ extension PfsXattrListRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   public static let protoMessageName: String = _protobuf_package + ".XattrListRequest"
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .same(proto: "item"),
+    2: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -5148,6 +5220,7 @@ extension PfsXattrListRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._item) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -5161,11 +5234,15 @@ extension PfsXattrListRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     try { if let v = self._item {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
     } }()
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 2)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsXattrListRequest, rhs: PfsXattrListRequest) -> Bool {
     if lhs._item != rhs._item {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -5208,6 +5285,7 @@ extension PfsXattrRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .same(proto: "item"),
     2: .same(proto: "name"),
+    3: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -5218,6 +5296,7 @@ extension PfsXattrRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._item) }()
       case 2: try { try decoder.decodeSingularStringField(value: &self.name) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -5234,12 +5313,16 @@ extension PfsXattrRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
     if !self.name.isEmpty {
       try visitor.visitSingularStringField(value: self.name, fieldNumber: 2)
     }
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsXattrRemoveRequest, rhs: PfsXattrRemoveRequest) -> Bool {
     if lhs._item != rhs._item {return false}
     if lhs.name != rhs.name {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

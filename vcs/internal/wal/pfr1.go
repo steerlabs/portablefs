@@ -67,6 +67,8 @@ import (
 //	                                  carry no data)
 //	 28  xattr_flags                  uint8 (OpSetxattr only: XattrCreate or
 //	                                  XattrReplace; mutually exclusive)
+//	 29  chtimes_keep_mtime           bool (OpChtimes only: update atime while
+//	                                  preserving the mtime at ordered apply)
 //
 //	Envelope:
 //	  1  session_id  string (1..MaxPFR1SessionIDBytes)
@@ -136,12 +138,12 @@ const maxPFR1Op = uint64(OpRemovexattr)
 
 // PFR1SizeEstimate returns a conservative UPPER bound on len(EncodePFR1(r)).
 // Callers use it to split logical batches into bounded intents before any
-// reservation; over-estimation only makes chunks slightly smaller. Per-field
-// framing is ≤ 2 tag bytes + ≤ 10 varint/length bytes, and PFR1 has ≤ 24
-// scalar fields, so 96 bytes generously covers all fixed field overhead plus
-// the magic.
+// reservation; over-estimation only makes chunks slightly smaller. Each of
+// the 29 record fields needs at most a two-byte tag plus a ten-byte
+// varint/length prefix, so 384 bytes covers every fixed field and the magic
+// even for a structurally valid record carrying irrelevant nonzero scalars.
 func PFR1SizeEstimate(r Record) int {
-	n := 96 + len(r.Path) + len(r.NewPath) + len(r.Target) + len(r.Data) + len(r.XattrName) + 11*len(r.Inos)
+	n := 384 + len(r.Path) + len(r.NewPath) + len(r.Target) + len(r.Data) + len(r.XattrName) + 12*len(r.Inos)
 	if r.Env != nil {
 		n += 96 + len(r.Env.SessionID) + len(r.Env.ReqHash)
 	}
@@ -345,6 +347,7 @@ func appendPFR1Record(dst []byte, r *Record) ([]byte, error) {
 	dst = pfwire.AppendBool(dst, 26, r.RenameNoReplace)
 	dst = pfwire.AppendString(dst, 27, r.XattrName)
 	dst = pfwire.AppendUint(dst, 28, uint64(r.XattrFlags))
+	dst = pfwire.AppendBool(dst, 29, r.ChtimesKeepMtime)
 	return dst, nil
 }
 
@@ -674,6 +677,13 @@ func decodePFR1Record(what string, body []byte, nested bool) (Record, error) {
 				return Record{}, rd.Malformedf("xattr_flags overflows uint8")
 			}
 			r.XattrFlags = uint8(flags)
+		case 29:
+			if wt != pfwire.TypeVarint {
+				return Record{}, rd.Malformedf("chtimes_keep_mtime wire type %d", wt)
+			}
+			if r.ChtimesKeepMtime, err = rd.Bool(field); err != nil {
+				return Record{}, err
+			}
 		default:
 			return Record{}, rd.RejectUnknown(field)
 		}

@@ -40,6 +40,14 @@ func TestInvalidationInPlaceTagging(t *testing.T) {
 		len(link[1].RelatedInos) != 1 || link[1].RelatedInos[0] != 42 {
 		t.Fatalf("link invalidations must carry related inode identity, got %+v", link)
 	}
+	if exact := fs.changesFor(
+		wal.Record{Op: wal.OpWrite, Ino: 42, Data: []byte("x")},
+		"owner", 5, 0, 42,
+	); len(exact) != 1 || exact[0].Path != "" || !exact[0].InPlace ||
+		exact[0].Version != 5 || exact[0].Owner != "owner" ||
+		len(exact[0].RelatedInos) != 1 || exact[0].RelatedInos[0] != 42 {
+		t.Fatalf("pathless exact mutation must publish inode-scoped invalidation, got %+v", exact)
+	}
 }
 
 // TestRejectedRemoveDoesNotPublish guards that a remove which REJECTS (non-empty dir, or a missing

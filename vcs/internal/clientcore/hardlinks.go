@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 // hardlinkAliases is the mount's authority-identity safety index.
@@ -92,6 +93,12 @@ func (v *Volume) releaseHardlinkScopes(
 }
 
 type hardlinkAdmissionIdentitiesKey struct{}
+type delegatedBindingExpectationKey struct{}
+
+type delegatedBindingExpectation struct {
+	path string
+	ino  uint64
+}
 
 func withHardlinkAdmissionIdentities(ctx context.Context, nodes ...*NodeState) context.Context {
 	inos := make([]uint64, 0, len(nodes))
@@ -104,6 +111,36 @@ func withHardlinkAdmissionIdentities(ctx context.Context, nodes ...*NodeState) c
 		return ctx
 	}
 	return context.WithValue(ctx, hardlinkAdmissionIdentitiesKey{}, inos)
+}
+
+func withDelegatedBindingExpectation(ctx context.Context, path string, node *NodeState) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ino := authHandleIno(node); ino != 0 {
+		expected := &delegatedBindingExpectation{
+			path: cleanVolumePath(path),
+			ino:  ino,
+		}
+		return context.WithValue(ctx, delegatedBindingExpectationKey{}, expected)
+	}
+	return ctx
+}
+
+func (v *Volume) validateDelegatedMutation(
+	ctx context.Context,
+	path string,
+	entry writeback.Entry,
+	present bool,
+) error {
+	if ctx != nil {
+		if expected, ok := ctx.Value(delegatedBindingExpectationKey{}).(*delegatedBindingExpectation); ok &&
+			expected.path == cleanVolumePath(path) &&
+			(!present || entry.Ino != expected.ino) {
+			return writeback.ErrDelegatedBindingMismatch
+		}
+	}
+	return nil
 }
 
 func (v *Volume) allowDelegatedMutation(ctx context.Context, path string) bool {

@@ -928,17 +928,22 @@ type attach struct {
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
-	legacyParked   []parkedWAL
-	nextHandle     uint64
-	nextEnumID     uint64
-	nextOrigin     uint64
-	subscribers    map[*eventSubscriber]struct{}
-	conns          map[interface{ Close() error }]struct{}
-	eventReady     chan struct{}
-	eventOnce      sync.Once
-	detached       bool
-	detachPrepared bool
-	detachForce    bool
+	legacyParked []parkedWAL
+	nextHandle   uint64
+	// retiredCloseErrnos keeps the rare terminal close(2) outcome so a
+	// CloseRequest whose reply was lost can replay the exact retirement
+	// confirmation. Successful retirements need no entry: handle IDs are
+	// monotonic for the attach, so an issued-but-absent ID proves success.
+	retiredCloseErrnos map[uint64]int32
+	nextEnumID         uint64
+	nextOrigin         uint64
+	subscribers        map[*eventSubscriber]struct{}
+	conns              map[interface{ Close() error }]struct{}
+	eventReady         chan struct{}
+	eventOnce          sync.Once
+	detached           bool
+	detachPrepared     bool
+	detachForce        bool
 	// detachFailFrozen is process-local. The durable prepared marker and this
 	// explicit flag reject every admission, while nsMu remains releasable so
 	// daemon shutdown/restart can perform the required recovery.
@@ -1022,6 +1027,7 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		authorityItems:         map[uint64]frontendItemIdentity{},
 		awaitingAuthorityItems: map[uint64]struct{}{},
 		handles:                map[uint64]*handleRecord{},
+		retiredCloseErrnos:     map[uint64]int32{},
 		enumRecords:            map[uint64]*enumerationRecord{},
 		subscribers:            map[*eventSubscriber]struct{}{},
 		conns:                  map[interface{ Close() error }]struct{}{},
@@ -1774,15 +1780,38 @@ func (a *attach) registerLocked(p string, attr fsproto.Attr) *itemRecord {
 // an authority addressing hint for handle I/O; it is never namespace evidence.
 // Caller holds a.mu.
 func (a *attach) registerHandleAttrLocked(h *handleRecord, attr fsproto.Attr) *itemRecord {
-	if h == nil || h.itemID == 0 || h.state == nil {
+	if h == nil || h.itemID == 0 {
 		return nil
 	}
 	if current := a.paths[h.path]; current != nil && current.item.ItemID == h.itemID {
+		if h.file != nil {
+			return a.registerLocalLocked(h.path, attr)
+		}
+		if h.state == nil {
+			return nil
+		}
 		return a.registerLocked(h.path, attr)
 	}
 
 	rec := a.items[h.itemID]
-	if rec == nil || rec.state == nil {
+	if rec == nil {
+		return nil
+	}
+	if h.file != nil {
+		if !rec.graft {
+			return nil
+		}
+		rec.attr = attr
+		for aliasPath := range a.itemAliases[h.itemID] {
+			alias := a.paths[aliasPath]
+			if alias == nil || alias.item != rec.item || !alias.graft {
+				continue
+			}
+			alias.attr = attr
+		}
+		return rec
+	}
+	if rec.state == nil || h.state == nil {
 		return nil
 	}
 	recAuthorityIno := rec.state.AuthorityIno()
@@ -2657,6 +2686,113 @@ func (a *attach) item(item pfslocal.Item) (*itemRecord, int32) {
 	return &cp, 0
 }
 
+type objectTarget struct {
+	rec      *itemRecord
+	handle   *handleRecord
+	scope    string
+	detached bool
+}
+
+// objectTarget resolves an item-based operation against either its genuine
+// namespace binding or one explicit live descriptor. Namespace operations
+// continue to use item(): a stale remembered path is never reachability
+// evidence. The explicit handle is both the lifetime witness and the exact
+// object capability for fstat/ftruncate/f*xattr after unlink or rename-over.
+func (a *attach) objectTarget(item pfslocal.Item, handleID uint64) (objectTarget, int32) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.detached || a.detachPrepared || a.detachForce {
+		return objectTarget{}, darwinENXIO
+	}
+	rec := a.items[item.ItemID]
+	if rec == nil || rec.item.ItemGeneration != item.ItemGeneration {
+		return objectTarget{}, darwinENOENT
+	}
+	bound := a.paths[rec.path] == rec
+	if handleID == 0 {
+		if !bound {
+			return objectTarget{}, darwinENOENT
+		}
+		recCopy := *rec
+		return objectTarget{rec: &recCopy}, 0
+	}
+
+	h := a.handles[handleID]
+	if h == nil {
+		if !bound {
+			return objectTarget{}, darwinENOENT
+		}
+		return objectTarget{}, darwinEINVAL
+	}
+	if h.itemID != item.ItemID {
+		return objectTarget{}, darwinEINVAL
+	}
+	if rec.graft {
+		if h.state != nil || h.file == nil {
+			return objectTarget{}, darwinEINVAL
+		}
+	} else if rec.state == nil || h.file != nil || h.state != rec.state {
+		return objectTarget{}, darwinEINVAL
+	}
+	recCopy := *rec
+	handleCopy := *h
+	scope := a.canonicalItemAliasLocked(rec)
+	return objectTarget{
+		rec: &recCopy, handle: &handleCopy, scope: scope, detached: scope == "",
+	}, 0
+}
+
+// canonicalItemAliasLocked returns a deterministic genuine namespace alias
+// for rec's immutable Item/object identity. A handle's remembered open path
+// is deliberately irrelevant: it may now name a replacement while another
+// hard-link alias still names the retained object. Caller holds a.mu for read.
+func (a *attach) canonicalItemAliasLocked(rec *itemRecord) string {
+	if rec == nil {
+		return ""
+	}
+	var canonical string
+	for aliasPath := range a.itemAliases[rec.item.ItemID] {
+		alias := a.paths[aliasPath]
+		if alias == nil || alias.item != rec.item || alias.graft != rec.graft ||
+			alias.state != rec.state {
+			continue
+		}
+		if canonical == "" || aliasPath < canonical {
+			canonical = aliasPath
+		}
+	}
+	return canonical
+}
+
+// handleTarget resolves an existing read/write/fsync descriptor and returns a
+// deterministic genuine alias when one exists. Authority operations use that
+// alias only as delegation scope; the stable handle inode remains the object
+// capability. With no genuine alias they use the pathless exact lane.
+func (a *attach) handleTarget(id uint64) (*handleRecord, string, int32) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.detached || a.detachPrepared || a.detachForce {
+		return nil, "", darwinENXIO
+	}
+	h := a.handles[id]
+	if h == nil {
+		return nil, "", darwinEINVAL
+	}
+	rec := a.items[h.itemID]
+	if rec == nil {
+		return nil, "", darwinENOENT
+	}
+	if rec.graft {
+		if h.state != nil || h.file == nil {
+			return nil, "", darwinEINVAL
+		}
+	} else if rec.state == nil || h.file != nil || h.state != rec.state {
+		return nil, "", darwinEINVAL
+	}
+	cp := *h
+	return &cp, a.canonicalItemAliasLocked(rec), 0
+}
+
 func (a *attach) itemByPath(p string) *itemRecord {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -2902,6 +3038,36 @@ func (a *attach) closeHandle(id uint64) *handleRecord {
 	return h
 }
 
+// replayRetiredClose returns the exact terminal outcome for an already
+// consumed handle. Handle IDs are monotonic for one live attach, so a nonzero
+// ID at or below the high-water mark that is absent from handles was issued
+// and retired. Terminal close errors are retained explicitly because retrying
+// close(2) is unsafe and a lost local-protocol reply must not erase that
+// outcome.
+func (a *attach) replayRetiredClose(id uint64) (*pfslocal.CloseReply, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if id == 0 || id > a.nextHandle || a.handles[id] != nil {
+		return nil, false
+	}
+	return &pfslocal.CloseReply{
+		Retired:    true,
+		CloseErrno: a.retiredCloseErrnos[id],
+	}, true
+}
+
+func (a *attach) recordRetiredCloseError(id uint64, errno int32) {
+	if errno == 0 {
+		return
+	}
+	a.mu.Lock()
+	if a.retiredCloseErrnos == nil {
+		a.retiredCloseErrnos = make(map[uint64]int32)
+	}
+	a.retiredCloseErrnos[id] = errno
+	a.mu.Unlock()
+}
+
 func (a *attach) subscribe(origin uint64) *eventSubscriber {
 	sub := &eventSubscriber{origin: origin, ch: make(chan pfslocal.Event, 128)}
 	a.mu.Lock()
@@ -3004,6 +3170,35 @@ func (a *attach) publishContentInvalidationLocked(p string, version uint64, skip
 		Item: rec.item, ContentChanged: true, AttrsChanged: true, ContentVersion: ver,
 	}}
 	a.publishExceptLocked(ev, skipOrigin)
+}
+
+// publishItemContentInvalidationLocked publishes against the retained Item
+// identity and only derives a version from genuine current aliases. It never
+// resolves the Item's remembered path, which may now name a replacement.
+func (a *attach) publishItemContentInvalidationLocked(item pfslocal.Item, skipOrigin uint64) {
+	rec := a.items[item.ItemID]
+	if rec == nil || rec.item.ItemGeneration != item.ItemGeneration {
+		return
+	}
+	var version uint64
+	for alias := range a.itemAliases[item.ItemID] {
+		current := a.paths[alias]
+		if current == nil || current.item != rec.item {
+			continue
+		}
+		var aliasVersion uint64
+		if a.localDirForLocked(alias) != "" {
+			aliasVersion = a.bumpLocalVersionLocked(alias)
+		} else if a.vol != nil {
+			_, aliasVersion = a.vol.VersionCache.GenAndVersion(alias)
+		}
+		if aliasVersion > version {
+			version = aliasVersion
+		}
+	}
+	a.publishExceptLocked(pfslocal.Event{Kind: &pfslocal.Invalidation{
+		Item: rec.item, ContentChanged: true, AttrsChanged: true, ContentVersion: version,
+	}}, skipOrigin)
 }
 
 func (a *attach) publishNamespaceInvalidationLocked(p string, version uint64, skipOrigin uint64) {
@@ -3110,14 +3305,14 @@ func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <
 					refreshAll = true
 					continue
 				}
-				if inv.Path == "" {
+				if inv.Path == "" && len(inv.RelatedInos) == 0 {
 					continue
 				}
 				a.mu.Lock()
 				// Volume changes under a graft are shadowed by the machine-local
 				// subtree; surfacing them would evict valid local kernel state.
-				shadowed := a.localDirForLocked(inv.Path) != ""
-				if !shadowed {
+				shadowed := inv.Path != "" && a.localDirForLocked(inv.Path) != ""
+				if inv.Path != "" && !shadowed {
 					a.publishAuthorityInvalidationLocked(inv.Path, inv.InPlace, inv.Version)
 					if inv.InPlace {
 						if rec := a.paths[inv.Path]; rec != nil {

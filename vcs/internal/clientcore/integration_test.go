@@ -1157,6 +1157,126 @@ func TestGrantSnapshotRejectsImmediateHardlinkMutation(t *testing.T) {
 	}
 }
 
+// An open descriptor's remembered pathname is only a scope hint. If a peer
+// replaces that name before this mount consumes its invalidation, a fresh
+// delegation snapshot contains the replacement inode and must not redirect
+// descriptor I/O into that replacement's overlay.
+func TestOpenHandleRejectsReplacementDelegationSnapshot(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+
+	peer, err := fsproto.Dial(addr, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	if _, st, err := peer.Mkdir("d", 0o755); err != nil || st != fsproto.OK {
+		t.Fatalf("seed mkdir: st=%d err=%v", st, err)
+	}
+	if _, st, err := peer.Mkdir("other", 0o755); err != nil || st != fsproto.OK {
+		t.Fatalf("seed other mkdir: st=%d err=%v", st, err)
+	}
+	oldAttr, st, err := peer.Create("d/target", 0o644)
+	if err != nil || st != fsproto.OK || oldAttr == nil || oldAttr.Ino == 0 {
+		t.Fatalf("seed target: attr=%+v st=%d err=%v", oldAttr, st, err)
+	}
+	if _, st, err := peer.Write("d/target", 0, []byte("old"), 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("seed target write: st=%d err=%v", st, err)
+	}
+
+	// Deliberately do not start A's invalidation watcher. Its open NodeState
+	// and caller-supplied path therefore remain stale after the peer rename.
+	a := dialCore(t, addr, Options{Owner: "replacement-snapshot-a"})
+	observed, st := a.Lookup(ctx, "d/target")
+	if st != fsproto.OK || observed.Ino != oldAttr.Ino {
+		t.Fatalf("A lookup: attr=%+v old=%+v st=%d", observed, oldAttr, st)
+	}
+	node := NewNodeState(observed.Ino, true)
+	if st := a.Open(ctx, "d/target", node, true); st != fsproto.OK {
+		t.Fatalf("A open target: %d", st)
+	}
+	defer a.CloseHandle("d/target", node)
+
+	linked, st, err := peer.Link("d/target", "other/alias")
+	if err != nil || st != fsproto.OK || linked == nil ||
+		linked.Ino != oldAttr.Ino || linked.Nlink != 2 {
+		t.Fatalf("peer old-inode alias: attr=%+v old=%+v st=%d err=%v", linked, oldAttr, st, err)
+	}
+	replacement, st, err := peer.Create("d/replacement", 0o644)
+	if err != nil || st != fsproto.OK || replacement == nil ||
+		replacement.Ino == 0 || replacement.Ino == oldAttr.Ino {
+		t.Fatalf("peer replacement create: attr=%+v old=%+v st=%d err=%v", replacement, oldAttr, st, err)
+	}
+	if _, st, err := peer.Write("d/replacement", 0, []byte("new"), 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("peer replacement write: st=%d err=%v", st, err)
+	}
+	if st, err := peer.Rename("d/replacement", "d/target"); err != nil || st != fsproto.OK {
+		t.Fatalf("peer rename-over: st=%d err=%v", st, err)
+	}
+
+	// Retain a second, unrelated delegation whose snapshot contains the
+	// surviving old-inode alias, then acknowledge an earlier dirty write
+	// through it. A stale-path mismatch must release this scope too; a
+	// pathname-only release would let EARLY flush after the descriptor write
+	// and invert their acknowledged order.
+	if _, st := a.Create(ctx, "other/probe", 0o644); st != fsproto.OK {
+		t.Fatalf("other-scope probe create: %d", st)
+	}
+	if !a.wb.Covers("other/alias") {
+		t.Fatal("test precondition: probe create did not retain other delegation")
+	}
+	if n, st := a.Write(ctx, "other/alias", node, 0, []byte("EARLY")); st != fsproto.OK || n != 5 {
+		t.Fatalf("earlier alias write: n=%d st=%d", n, st)
+	}
+	if !a.wb.Covers("other/alias") {
+		t.Fatal("test precondition: earlier alias write did not remain delegated")
+	}
+
+	// No d grant is held yet. This write acquires d, observes that d/target
+	// now binds replacement.Ino, rejects that delegated view, releases it,
+	// and escalates to the pathless exact lane. That lane must also drain the
+	// retained other/alias grant before mutating the stable old inode.
+	if n, st := a.WriteOpenHandle(ctx, "d/target", node, 0, []byte("FD-LATER")); st != fsproto.OK || n != 8 {
+		t.Fatalf("stale-handle write: n=%d st=%d", n, st)
+	}
+	if a.wb.Covers("d/target") {
+		t.Fatal("mismatched replacement snapshot remained delegated after handle write")
+	}
+	if a.wb.Covers("other/alias") {
+		t.Fatal("old-inode alias delegation survived exact handle write")
+	}
+	if got, st, err := peer.Read("d/target", 0, 16); err != nil || st != fsproto.OK || string(got) != "new" {
+		t.Fatalf("replacement after stale-handle write: data=%q st=%d err=%v", got, st, err)
+	}
+	if got, st, err := peer.Read("other/alias", 0, 16); err != nil || st != fsproto.OK || string(got) != "FD-LATER" {
+		t.Fatalf("old alias after ordered handle write: data=%q st=%d err=%v", got, st, err)
+	}
+
+	// Reacquire both scopes through unrelated local creates, then read the
+	// stale handle while both the replacement and old alias are represented
+	// by retained overlays. The read must reject the replacement overlay,
+	// release both scopes through the exact barrier, and return the old inode.
+	if _, st := a.Create(ctx, "other/read-probe", 0o644); st != fsproto.OK {
+		t.Fatalf("reacquire other probe: %d", st)
+	}
+	if _, st := a.Create(ctx, "d/read-probe", 0o644); st != fsproto.OK {
+		t.Fatalf("reacquire d probe: %d", st)
+	}
+	if !a.wb.Covers("d/target") || !a.wb.Covers("other/alias") {
+		t.Fatal("test precondition: read did not begin with both delegations retained")
+	}
+	got, st := a.ReadOpenHandle(ctx, "d/target", node, 0, 16)
+	if st != fsproto.OK || string(got) != "FD-LATER" {
+		t.Fatalf("stale-handle read: data=%q st=%d", got, st)
+	}
+	if a.wb.Covers("d/target") || a.wb.Covers("other/alias") {
+		t.Fatal("exact handle read retained a mismatched or alias delegation")
+	}
+	if got, st, err := peer.Read("d/target", 0, 16); err != nil || st != fsproto.OK || string(got) != "new" {
+		t.Fatalf("replacement after stale-handle read: data=%q st=%d err=%v", got, st, err)
+	}
+}
+
 // newManagedTestFS opens the file-backed PFJ3 entry log at walPath and builds
 // the MANAGED workfs over it — the only generation a v5 server serves.
 func newManagedTestFS(t testing.TB, blobs content.BlobReader, walPath string) *workfs.FS {

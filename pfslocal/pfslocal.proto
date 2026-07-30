@@ -20,6 +20,8 @@
 // Versioning: Hello/HelloReply negotiate {major, minor}. Same major = wire
 // compatible; unknown fields are ignored (proto3). Breaking changes bump major
 // and the daemon serves both during a deprecation window.
+// Protocol minor 4 makes an explicit daemon handle mandatory for retained
+// Item attribute/xattr operations after unlink or rename-over.
 //
 // Identity model: items are addressed by (item_id, item_generation) — the
 // authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
@@ -118,7 +120,7 @@ message Envelope {
 
 message Hello {
   uint32 protocol_major = 1; // 1
-  uint32 protocol_minor = 2; // 1
+  uint32 protocol_minor = 2; // 4
   string client_name = 3;    // e.g. "fskit-appex"
   string client_version = 4;
 }
@@ -228,7 +230,14 @@ message EnumerateReply {
   uint64 dir_version = 3; // directory coherence version at enumeration time
 }
 
-message GetAttrRequest { Item item = 1; }
+message GetAttrRequest {
+  Item item = 1;
+  // Exact daemon handle for fstat-style operations. Zero keeps ordinary
+  // pathname-bound Item semantics. A nonzero handle must belong to this exact
+  // Item generation; it is the only authority to operate after the Item's
+  // remembered name is unlinked or replaced.
+  uint64 handle = 2;
+}
 message GetAttrReply { Attr attr = 1; }
 
 message SetAttrRequest {
@@ -239,6 +248,8 @@ message SetAttrRequest {
   optional uint64 size = 5; // truncate
   optional int64 mtime_ms = 6;
   optional int64 atime_ms = 7;
+  // Exact daemon handle for ftruncate/fchmod/futimes-style operations.
+  uint64 handle = 8;
 }
 message SetAttrReply { Attr attr = 1; }
 
@@ -260,7 +271,15 @@ message OpenReply {
 }
 
 message CloseRequest { uint64 handle = 1; }
-message CloseReply {}
+message CloseReply {
+  // True only when this request consumed the daemon handle. The frontend must
+  // forget a retired handle even when close_errno reports a terminal syscall
+  // error: POSIX close errors do not make the descriptor usable again.
+  bool retired = 1;
+  // Terminal error observed while retiring the descriptor. Zero is ordinary
+  // success. Failures that leave the daemon handle live use ErrorReply instead.
+  int32 close_errno = 2;
+}
 
 message ReadRequest {
   uint64 handle = 1;
@@ -343,13 +362,13 @@ message HardLinkReply {
 
 // ---------- xattrs ----------
 
-message XattrGetRequest { Item item = 1; string name = 2; }
+message XattrGetRequest { Item item = 1; string name = 2; uint64 handle = 3; }
 message XattrGetReply { bytes value = 1; }
-message XattrSetRequest { Item item = 1; string name = 2; bytes value = 3; bool create_only = 4; bool replace_only = 5; }
+message XattrSetRequest { Item item = 1; string name = 2; bytes value = 3; bool create_only = 4; bool replace_only = 5; uint64 handle = 6; }
 message XattrSetReply {}
-message XattrListRequest { Item item = 1; }
+message XattrListRequest { Item item = 1; uint64 handle = 2; }
 message XattrListReply { repeated string names = 1; }
-message XattrRemoveRequest { Item item = 1; string name = 2; }
+message XattrRemoveRequest { Item item = 1; string name = 2; uint64 handle = 3; }
 message XattrRemoveReply {}
 
 // ---------- volume sync / statfs / reclaim ----------

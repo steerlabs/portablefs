@@ -561,8 +561,7 @@ func (c *frontendConn) handleAttached(
 	case *pfslocal.OpenRequest:
 		reply, eno = a.open(ctx, req)
 	case *pfslocal.CloseRequest:
-		eno, _ = a.close(req)
-		reply = &pfslocal.CloseReply{}
+		reply, eno = a.close(req)
 	case *pfslocal.ReadRequest:
 		reply, eno = a.read(ctx, req)
 	case *pfslocal.WriteRequest:

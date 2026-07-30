@@ -475,6 +475,7 @@ func TestDetachedHandlePublicationScopeNeverUsesStalePath(t *testing.T) {
 		paths:       map[string]*itemRecord{},
 		itemAliases: map[uint64]map[string]struct{}{},
 		handles:     map[uint64]*handleRecord{},
+		subscribers: map[*eventSubscriber]struct{}{},
 	}
 	detached := &itemRecord{item: item, path: "target", state: state}
 	replacement := &itemRecord{
@@ -490,12 +491,49 @@ func TestDetachedHandlePublicationScopeNeverUsesStalePath(t *testing.T) {
 		id: 3, itemID: item.ItemID, path: "target", openPath: "target", state: state, write: true,
 	}
 
-	paths, _, publishes := a.frontendOperationPaths(&pfslocal.WriteRequest{Handle: 3})
-	if !publishes {
-		t.Fatal("detached write was not publication-tracked")
+	requests := []struct {
+		name string
+		body any
+	}{
+		{"getattr", &pfslocal.GetAttrRequest{Item: item, Handle: 3}},
+		{"setattr", &pfslocal.SetAttrRequest{Item: item, Handle: 3}},
+		{"read", &pfslocal.ReadRequest{Handle: 3}},
+		{"write", &pfslocal.WriteRequest{Handle: 3}},
+		{"getxattr", &pfslocal.XattrGetRequest{Item: item, Handle: 3}},
+		{"setxattr", &pfslocal.XattrSetRequest{Item: item, Handle: 3}},
+		{"listxattr", &pfslocal.XattrListRequest{Item: item, Handle: 3}},
+		{"removexattr", &pfslocal.XattrRemoveRequest{Item: item, Handle: 3}},
 	}
-	if len(paths) != 1 || paths[0] != "" {
-		t.Fatalf("detached write publication paths=%v want mount-wide unknown scope", paths)
+	for _, test := range requests {
+		t.Run(test.name, func(t *testing.T) {
+			paths, _, publishes := a.frontendOperationPaths(test.body)
+			if !publishes {
+				t.Fatalf("detached %s was not publication-tracked", test.name)
+			}
+			if len(paths) != 1 || paths[0] != "" {
+				t.Fatalf(
+					"detached %s publication paths=%v want mount-wide unknown scope",
+					test.name, paths,
+				)
+			}
+		})
+	}
+
+	sub := &eventSubscriber{origin: 41, ch: make(chan pfslocal.Event, 3)}
+	a.subscribers[sub] = struct{}{}
+	mutations := []any{
+		&pfslocal.SetAttrRequest{Item: item, Handle: 3},
+		&pfslocal.XattrSetRequest{Item: item, Handle: 3},
+		&pfslocal.XattrRemoveRequest{Item: item, Handle: 3},
+	}
+	for _, mutation := range mutations {
+		a.synthesizeFrontendMutation(mutation, 17)
+		ev := <-sub.ch
+		invalidation, ok := ev.Kind.(*pfslocal.Invalidation)
+		if !ok || invalidation.Item != item || !invalidation.ContentChanged ||
+			!invalidation.AttrsChanged {
+			t.Fatalf("detached mutation invalidation=%+v want exact old Item", ev)
+		}
 	}
 }
 
@@ -890,12 +928,13 @@ func TestRelatedAuthorityInodeRefreshesKnownAliasBeforeAck(t *testing.T) {
 		a.forwardEvents(ctx, nil, stream, func(pos uint64) { acked <- pos })
 		close(done)
 	}()
-	// The peer mutated through a name this mount has never looked up. The
-	// related authority inode is the only bridge to the live local alias.
+	// The peer mutated a retained inode with no trustworthy path. The related
+	// authority inode is the only bridge to the live local alias; an empty
+	// Path is inode-scoped here, not a mount-wide flush.
 	stream <- coherence.Batch{
 		Pos: 11,
 		Invs: []coherence.Invalidation{{
-			Path: "unseen-link", Version: 4, RelatedInos: []uint64{77},
+			Version: 4, RelatedInos: []uint64{77},
 		}},
 	}
 	select {
