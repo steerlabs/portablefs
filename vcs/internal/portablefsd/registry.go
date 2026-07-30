@@ -2586,7 +2586,14 @@ func (a *attach) lockFrontendRequest(body any) func() {
 	exclusive := false
 	mutatesName := false
 	switch req := body.(type) {
-	case *pfslocal.RenameRequest:
+	case *pfslocal.RenameRequest,
+		*pfslocal.CloseRequest,
+		*pfslocal.ReclaimRequest:
+		// Close and Reclaim own nsMu exclusively while they retire
+		// descriptor/item identity. Their mirror must be exclusive too:
+		// otherwise a later publishing reader can enter frontendActive,
+		// queue behind the pending nsMu writer, and cyclically block a
+		// delegation handoff waiting for that reader to publish.
 		exclusive = true
 	case *pfslocal.RemoveRequest:
 		exclusive = req.Directory

@@ -1552,3 +1552,44 @@ func TestExternalNamespaceWriterTakesProxyBeforeConcreteLock(t *testing.T) {
 	}
 	unlock()
 }
+
+func TestFrontendLifecycleWritersTakeExclusiveNamespaceProxy(t *testing.T) {
+	tests := []struct {
+		name string
+		body any
+	}{
+		{name: "close", body: &pfslocal.CloseRequest{}},
+		{name: "reclaim", body: &pfslocal.ReclaimRequest{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := &attach{}
+			a.frontendSerial.RLock()
+			readerHeld := true
+			defer func() {
+				if readerHeld {
+					a.frontendSerial.RUnlock()
+				}
+			}()
+
+			acquired := make(chan func(), 1)
+			go func() { acquired <- a.lockFrontendRequest(test.body) }()
+			select {
+			case unlock := <-acquired:
+				unlock()
+				t.Fatal("namespace lifecycle writer acquired a shared frontend proxy")
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			a.frontendSerial.RUnlock()
+			readerHeld = false
+			var unlock func()
+			select {
+			case unlock = <-acquired:
+			case <-time.After(time.Second):
+				t.Fatal("namespace lifecycle writer did not acquire after readers exited")
+			}
+			unlock()
+		})
+	}
+}
