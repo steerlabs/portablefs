@@ -1,22 +1,398 @@
 package portablefsd
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
+	"github.com/steerlabs/portablefs/vcs/internal/coherence"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
+
+func TestControlLocalWriteRefreshesAfterReleasingNamespace(t *testing.T) {
+	a := newAttach("att-local-refresh", "key", ensureAttachRequest{
+		VolumeID:  "vol-local-refresh",
+		Branch:    "main",
+		MountPath: "/Volumes/LocalRefresh",
+		Options:   AttachOptions{LocalDirs: []string{"cache"}},
+	}, privateTestDir(t))
+	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed uint64
+	a.testExactKernelRefresh = func(_ context.Context, itemID uint64) error {
+		if !a.frontendSerial.TryLock() {
+			return errors.New("frontend namespace proxy remained locked during refresh")
+		}
+		a.frontendSerial.Unlock()
+		if !a.nsMu.TryLock() {
+			return errors.New("concrete namespace remained locked during refresh")
+		}
+		a.nsMu.Unlock()
+		refreshed = itemID
+		return nil
+	}
+	body := []byte(`{"path":"cache/file.txt","dataBase64":"` +
+		base64.StdEncoding.EncodeToString([]byte("fresh")) + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/fs/write", bytes.NewReader(body))
+	recorder := httptest.NewRecorder()
+	(&Server{}).controlFSWrite(recorder, req, a)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("control write status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if refreshed == 0 {
+		t.Fatal("grafted control write returned before exact kernel refresh")
+	}
+}
+
+func TestAddLocalDirsReincarnatesPublishedAuthorityItems(t *testing.T) {
+	stateDir := privateTestDir(t)
+	a := newAttach("att-local-transition", "key", ensureAttachRequest{
+		VolumeID:  "vol-local-transition",
+		Branch:    "main",
+		MountPath: "/Volumes/LocalTransition",
+	}, stateDir)
+	a.identityEpoch = 31
+	a.journal = newBindingJournal(stateDir)
+	a.persist = func() error { return nil }
+
+	root := a.registerLocked("", syntheticRootAttr())
+	oldDir := a.registerLocked("cache", fsproto.Attr{
+		Ino: 401, Kind: "directory", Mode: 0o755,
+	})
+	oldFile := a.registerLocked("cache/file", fsproto.Attr{
+		Ino: 402, Kind: "file", Mode: 0o644,
+	})
+	if eno := a.flushBindingDelta(); eno != 0 {
+		t.Fatalf("initial bindings errno=%d", eno)
+	}
+	sub := a.subscribe(0)
+	defer a.unsubscribe(sub)
+	<-sub.ch // initial attach state
+
+	if got, err := a.addLocalDirs([]string{"cache"}); err != nil {
+		t.Fatalf("add local dirs: %v", err)
+	} else if !reflect.DeepEqual(got, []string{"cache"}) {
+		t.Fatalf("effective local dirs=%v", got)
+	}
+	if got := a.paths["cache"]; got != nil {
+		t.Fatalf("old authority directory remained live: %+v", got)
+	}
+	if got := a.paths["cache/file"]; got != nil {
+		t.Fatalf("old authority file remained live: %+v", got)
+	}
+	if _, eno := a.item(oldDir.item); eno != darwinENOENT {
+		t.Fatalf("retired authority directory errno=%d want ENOENT", eno)
+	}
+	if _, eno := a.item(oldFile.item); eno != darwinENOENT {
+		t.Fatalf("retired authority file errno=%d want ENOENT", eno)
+	}
+
+	a.mu.Lock()
+	newDir := a.registerLocalLocked("cache", fsproto.Attr{Kind: "directory", Mode: 0o755})
+	newFile := a.registerLocalLocked("cache/file", fsproto.Attr{Kind: "file", Mode: 0o644})
+	a.mu.Unlock()
+	if !newDir.graft || !newFile.graft ||
+		newDir.item == oldDir.item || newFile.item == oldFile.item {
+		t.Fatalf("fresh graft identities dir=%+v file=%+v old=%+v/%+v",
+			newDir, newFile, oldDir, oldFile)
+	}
+
+	detached := map[uint64]bool{}
+	for _, entry := range loadBindingJournal(stateDir) {
+		if entry.Op == "detach" {
+			detached[entry.ID] = true
+		}
+	}
+	if !detached[oldDir.item.ItemID] || !detached[oldFile.item.ItemID] {
+		t.Fatalf("routing transition did not journal both retirements: %v", detached)
+	}
+	select {
+	case ev := <-sub.ch:
+		inv, ok := ev.Kind.(*pfslocal.Invalidation)
+		if !ok || !inv.NamespaceChanged || inv.Item != root.item {
+			t.Fatalf("routing transition event=%+v want root namespace invalidation", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("routing transition did not invalidate the published namespace")
+	}
+}
+
+func TestAddLocalDirsPersistFailureLeavesLiveRoutingUnchanged(t *testing.T) {
+	a := newAttach("att-local-persist-failure", "key", ensureAttachRequest{
+		VolumeID:  "vol-local-persist-failure",
+		Branch:    "main",
+		MountPath: "/Volumes/LocalPersistFailure",
+	}, privateTestDir(t))
+	a.identityEpoch = 37
+	old := a.registerLocked("cache/file", fsproto.Attr{Ino: 501, Kind: "file"})
+	if eno := a.flushBindingDelta(); eno != 0 {
+		t.Fatalf("initial binding errno=%d", eno)
+	}
+	persistErr := errors.New("injected attach snapshot failure")
+	a.persist = func() error { return persistErr }
+
+	if _, err := a.addLocalDirs([]string{"cache"}); !errors.Is(err, persistErr) {
+		t.Fatalf("add local dirs error=%v want %v", err, persistErr)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if got := a.paths["cache/file"]; got != old || got.graft {
+		t.Fatalf("failed config persist changed live provenance: %+v", got)
+	}
+	if len(a.localDirs) != 0 || len(a.options.LocalDirs) != 0 {
+		t.Fatalf("failed config persist changed routing: live=%v options=%v",
+			a.localDirs, a.options.LocalDirs)
+	}
+	if len(a.pendingBindings) != 0 {
+		t.Fatalf("failed config persist queued identity mutation: %+v", a.pendingBindings)
+	}
+}
+
+func TestRevivedGraftRuleToggleReincarnatesImmutableProvenance(t *testing.T) {
+	t.Run("disable graft", func(t *testing.T) {
+		a := newAttach("att-revive-graft-off", "key", ensureAttachRequest{
+			VolumeID: "vol-revive-graft-off", Branch: "main",
+			MountPath: "/Volumes/ReviveGraftOff",
+			Options:   AttachOptions{LocalDirs: []string{"cache"}},
+		}, privateTestDir(t))
+		a.identityEpoch = 41
+		a.restoreItemsLocked([]persistedItemRecord{{
+			Path: "cache/file", ItemID: localItemIDMarker | 71,
+			ItemGeneration: 41, Kind: "file", Graft: true,
+		}})
+		old := a.paths["cache/file"]
+		a.mu.Lock()
+		changed := a.transitionGraftProvenanceLocked(nil)
+		a.localDirs = nil
+		a.mu.Unlock()
+		if !reflect.DeepEqual(changed, []string{"cache/file"}) {
+			t.Fatalf("changed paths=%v", changed)
+		}
+		fresh := a.registerLocked("cache/file", fsproto.Attr{Ino: 601, Kind: "file"})
+		if fresh.graft || fresh.item == old.item {
+			t.Fatalf("disabled graft reused old provenance: old=%+v fresh=%+v", old, fresh)
+		}
+		if _, eno := a.item(old.item); eno != darwinENOENT {
+			t.Fatalf("retired graft Item errno=%d want ENOENT", eno)
+		}
+	})
+
+	t.Run("enable graft", func(t *testing.T) {
+		a := newAttach("att-revive-graft-on", "key", ensureAttachRequest{
+			VolumeID: "vol-revive-graft-on", Branch: "main",
+			MountPath: "/Volumes/ReviveGraftOn",
+		}, privateTestDir(t))
+		a.identityEpoch = 43
+		a.restoreItemsLocked([]persistedItemRecord{{
+			Path: "cache/file", ItemID: 602, ItemGeneration: 43,
+			AuthorityIno: true, Kind: "file",
+		}})
+		old := a.paths["cache/file"]
+		a.mu.Lock()
+		changed := a.transitionGraftProvenanceLocked([]string{"cache"})
+		a.localDirs = []string{"cache"}
+		fresh := a.registerLocalLocked("cache/file", fsproto.Attr{Kind: "file"})
+		a.mu.Unlock()
+		if !reflect.DeepEqual(changed, []string{"cache/file"}) {
+			t.Fatalf("changed paths=%v", changed)
+		}
+		if !fresh.graft || fresh.item == old.item {
+			t.Fatalf("enabled graft reused old provenance: old=%+v fresh=%+v", old, fresh)
+		}
+		if _, eno := a.item(old.item); eno != darwinENOENT {
+			t.Fatalf("retired authority Item errno=%d want ENOENT", eno)
+		}
+	})
+}
+
+func TestRevivedGraftRulePersistFailurePrecedesIdentityTransition(t *testing.T) {
+	a := newAttach("att-revive-routing-persist-failure", "key", ensureAttachRequest{
+		VolumeID: "vol-revive-routing-persist-failure", Branch: "main",
+		MountPath:    "/Volumes/ReviveRoutingPersistFailure",
+		AuthorityURL: "127.0.0.1:1",
+		Options:      AttachOptions{LocalDirs: []string{"cache"}},
+	}, privateTestDir(t))
+	a.identityEpoch = 47
+	old := a.registerWithItemLocked(
+		"cache/file", fsproto.Attr{Kind: "file"},
+		localItemIDMarker|91, false, false, true,
+	)
+	persistErr := errors.New("injected revived routing snapshot failure")
+	a.persist = func() error { return persistErr }
+
+	err := a.activateWithOptions(context.Background(), "", &AttachOptions{})
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("activate error=%v want %v", err, persistErr)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if got := a.paths["cache/file"]; got != old || !got.graft {
+		t.Fatalf("failed revived config persist reincarnated Item: %+v", got)
+	}
+	if !reflect.DeepEqual(a.options.LocalDirs, []string{"cache"}) ||
+		!reflect.DeepEqual(a.localDirs, []string{"cache"}) {
+		t.Fatalf("failed revived config persist changed routing: options=%v live=%v",
+			a.options.LocalDirs, a.localDirs)
+	}
+}
+
+func TestExactGraftRefreshSamplesOnlyConfinedLocalFile(t *testing.T) {
+	authority := serveAuthority(t)
+	vol, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vol.Close()
+	a := newAttach("att-local-exact", "key", ensureAttachRequest{
+		VolumeID: "vol-local-exact", Branch: "main",
+		MountPath: "/Volumes/LocalExact", AuthorityURL: authority,
+		Options: AttachOptions{LocalDirs: []string{"cache"}},
+	}, privateTestDir(t))
+	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
+		t.Fatal(err)
+	}
+	a.vol = vol
+
+	pureData := []byte("pure-graft")
+	pureID, eno := a.writeLocalFile("cache/pure", "cache", pureData)
+	if eno != 0 {
+		t.Fatalf("write pure graft errno=%d", eno)
+	}
+	var wantPath string
+	var wantItem uint64
+	var wantSize int64
+	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+		if path != wantPath || itemID != wantItem || size != wantSize {
+			t.Fatalf("graft refresh path=%q item=%d size=%d want path=%q item=%d size=%d",
+				path, itemID, size, wantPath, wantItem, wantSize)
+		}
+		return kernelRefreshApplied, nil
+	}
+	wantPath, wantItem, wantSize = "cache/pure", pureID, int64(len(pureData))
+	if err := a.exactKernelRefresh(context.Background(), pureID); err != nil {
+		t.Fatalf("pure graft exact refresh: %v", err)
+	}
+
+	// The same logical path exists at the authority with a deliberately
+	// different size. Graft ownership must still sample only the confined
+	// local file.
+	cli := vol.Client()
+	if _, st, err := cli.Mkdir("cache", 0o755); err != nil || st != fsproto.OK {
+		t.Fatalf("authority mkdir cache st=%d err=%v", st, err)
+	}
+	if _, st, err := cli.Create("cache/shadowed", 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("authority create shadow st=%d err=%v", st, err)
+	}
+	if _, st, err := cli.Write("cache/shadowed", 0, []byte("authority-is-much-larger"), 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("authority write shadow st=%d err=%v", st, err)
+	}
+	localData := []byte("loc")
+	shadowID, eno := a.writeLocalFile("cache/shadowed", "cache", localData)
+	if eno != 0 {
+		t.Fatalf("write shadowed graft errno=%d", eno)
+	}
+	wantPath, wantItem, wantSize = "cache/shadowed", shadowID, int64(len(localData))
+	if err := a.exactKernelRefresh(context.Background(), shadowID); err != nil {
+		t.Fatalf("shadowed graft exact refresh: %v", err)
+	}
+}
+
+func TestAuthorityFlushAllExcludesLiveAndDetachedGraftAfterAncestorRemap(t *testing.T) {
+	a := newAttach("att-graft-flush-origin", "key", ensureAttachRequest{
+		VolumeID: "vol-graft-flush-origin", Branch: "main",
+		MountPath: "/Volumes/GraftFlushOrigin",
+		Options:   AttachOptions{LocalDirs: []string{"workspace/cache"}},
+	}, privateTestDir(t))
+	if _, err := a.addLocalDirs([]string{"workspace/cache"}); err != nil {
+		t.Fatal(err)
+	}
+	liveID, eno := a.writeLocalFile(
+		"workspace/cache/live", "workspace/cache", []byte("live"),
+	)
+	if eno != 0 {
+		t.Fatalf("write live graft errno=%d", eno)
+	}
+	detachedID, eno := a.writeLocalFile(
+		"workspace/cache/detached", "workspace/cache", []byte("detached"),
+	)
+	if eno != 0 {
+		t.Fatalf("write detached graft errno=%d", eno)
+	}
+	if eno := a.removeLocal("workspace/cache/detached", false); eno != 0 {
+		t.Fatalf("remove detached graft errno=%d", eno)
+	}
+
+	a.mu.Lock()
+	a.renamePathLocked("workspace", "moved")
+	a.mu.Unlock()
+	if got := a.localDirFor("moved/cache/live"); got != "moved/cache" {
+		t.Fatalf("remapped live graft owner=%q", got)
+	}
+	a.mu.RLock()
+	live := a.items[liveID]
+	detached := a.items[detachedID]
+	a.mu.RUnlock()
+	if live == nil || !live.graft || live.path != "moved/cache/live" {
+		t.Fatalf("live graft provenance/path=%+v", live)
+	}
+	if detached == nil || !detached.graft ||
+		detached.path != "workspace/cache/detached" {
+		t.Fatalf("detached graft provenance/stale path=%+v", detached)
+	}
+	persisted := a.persistedItemsLocked()
+	var persistedDetached bool
+	for _, item := range persisted {
+		if item.ItemID == detachedID {
+			persistedDetached = item.Detached && item.Graft
+		}
+	}
+	if !persistedDetached {
+		t.Fatalf("detached graft origin was not durable: %+v", persisted)
+	}
+
+	a.testExactKernelRefresh = func(_ context.Context, itemID uint64) error {
+		t.Fatalf("authority FlushAll scheduled graft item %d", itemID)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := make(chan coherence.Batch, 1)
+	acked := make(chan uint64, 1)
+	done := make(chan struct{})
+	go func() {
+		a.forwardEvents(ctx, nil, stream, func(pos uint64) { acked <- pos })
+		close(done)
+	}()
+	stream <- coherence.Batch{Pos: 41, Invs: []coherence.Invalidation{{FlushAll: true}}}
+	select {
+	case pos := <-acked:
+		if pos != 41 {
+			t.Fatalf("FlushAll ack=%d want 41", pos)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authority FlushAll did not ignore graft-owned Items")
+	}
+	if err := a.frontendAdmissionError(); err != nil {
+		t.Fatalf("graft-only FlushAll fail-froze attach: %v", err)
+	}
+	cancel()
+	close(stream)
+	<-done
+}
 
 func TestNormalizeLocalDirs(t *testing.T) {
 	got, err := normalizeLocalDirs([]string{

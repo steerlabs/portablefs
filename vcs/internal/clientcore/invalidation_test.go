@@ -158,3 +158,92 @@ func TestWatchInvalidationsAppliesVersionedEvents(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func TestStaleInvalidationStreamCannotRollGenerationBack(t *testing.T) {
+	attrs := NewAttrCache()
+	versions := NewVersionCache()
+	sub := &fakeSub{ch: make(chan coherence.Batch, 4)}
+	h := &fakeHandler{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchInvalidations(ctx, sub, versions, attrs, h, InvalidationOptions{})
+
+	waitGen := func(want uint64) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for versions.CurrentGen() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("generation = %d, want %d", versions.CurrentGen(), want)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{Gen: 11}}}
+	waitGen(11)
+
+	readToken := versions.CaptureToken()
+	if _, ok := versions.AcceptGeneration(readToken, 22); !ok {
+		t.Fatal("new-generation read could not re-anchor cache")
+	}
+	waitGen(22)
+
+	// The original stream still carries its generation-11 token. Its delayed
+	// batch may flush conservatively, but it must not adopt 11 or publish the
+	// old version after the generation-22 read.
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{
+		Gen: 11, Path: "p", Version: 999, InPlace: true,
+	}}}
+	time.Sleep(50 * time.Millisecond)
+	if got := versions.CurrentGen(); got != 22 {
+		t.Fatalf("stale stream rolled generation back to %d", got)
+	}
+	if _, version := versions.GenAndVersion("p"); version != 0 {
+		t.Fatalf("stale stream published version %d", version)
+	}
+}
+
+func TestCurrentGenerationStreamFlushSurvivesConcurrentReadAdoption(t *testing.T) {
+	attrs := NewAttrCache()
+	versions := NewVersionCache()
+	sub := &fakeSub{ch: make(chan coherence.Batch, 4)}
+	h := &fakeHandler{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchInvalidations(ctx, sub, versions, attrs, h, InvalidationOptions{})
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.mu.Lock()
+		started := h.flushes > 0
+		h.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("subscription did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Model a read that adopts the subscribed authority's generation before
+	// the stream's first event. The stream token captured at Subscribe is now
+	// stale, but a same-generation overflow FlushAll must still drop every
+	// retained version floor.
+	versions.RefreshAll(7)
+	versions.FillOK(7, "dir/file", 99)
+	sub.ch <- coherence.Batch{Invs: []coherence.Invalidation{{Gen: 7, FlushAll: true}}}
+	deadline = time.Now().Add(time.Second)
+	for {
+		if _, version := versions.GenAndVersion("dir/file"); version == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			_, version := versions.GenAndVersion("dir/file")
+			t.Fatalf("same-generation FlushAll retained version %d", version)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := versions.CurrentGen(); got != 7 {
+		t.Fatalf("same-generation FlushAll changed generation to %d", got)
+	}
+}

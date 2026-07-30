@@ -20,6 +20,8 @@ func MarshalEnvelope(e *Envelope) ([]byte, error) {
 	}
 	var b []byte
 	b = appendU64(b, 1, e.RequestID)
+	b = appendBool(b, 2, e.PublicationAckRequired)
+	b = appendU64(b, 3, e.OperationID)
 	if e.Body == nil {
 		return b, nil
 	}
@@ -50,7 +52,27 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.RequestID = v
-		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+		case 2:
+			if wt != wireVarint {
+				return nil, ErrMalformed
+			}
+			var v uint64
+			v, b, err = consumeVarint(b)
+			if err != nil {
+				return nil, err
+			}
+			e.PublicationAckRequired = v != 0
+		case 3:
+			if wt != wireVarint {
+				return nil, ErrMalformed
+			}
+			var v uint64
+			v, b, err = consumeVarint(b)
+			if err != nil {
+				return nil, err
+			}
+			e.OperationID = v
+		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
 			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 90, 91:
 			if wt != wireBytes {
 				return nil, ErrMalformed
@@ -129,6 +151,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 34, marshalHardLinkRequest(m), nil
 	case *SyncVolumeRequest:
 		return 35, nil, nil
+	case *PublicationAck:
+		return 36, marshalPublicationAck(m), nil
 	case *HelloReply:
 		return 60, marshalHelloReply(m), nil
 	case *ResolveReply:
@@ -244,6 +268,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalHardLinkRequest(b)
 	case 35:
 		return &SyncVolumeRequest{}, nil
+	case 36:
+		return unmarshalPublicationAck(b)
 	case 60:
 		return unmarshalHelloReply(b)
 	case 61:
@@ -362,6 +388,29 @@ func unmarshalHelloReply(b []byte) (*HelloReply, error) {
 		case 3:
 			v, err := scalarBytes(wt, raw)
 			m.DaemonVersion = string(v)
+			return err
+		}
+		return nil
+	})
+}
+
+func marshalPublicationAck(m *PublicationAck) []byte {
+	var b []byte
+	b = appendU64(b, 1, m.PublishedRequestID)
+	return appendU64(b, 2, m.OperationID)
+}
+
+func unmarshalPublicationAck(b []byte) (*PublicationAck, error) {
+	m := &PublicationAck{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		switch num {
+		case 1:
+			v, err := scalarU64(wt, raw)
+			m.PublishedRequestID = v
+			return err
+		case 2:
+			v, err := scalarU64(wt, raw)
+			m.OperationID = v
 			return err
 		}
 		return nil

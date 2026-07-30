@@ -238,7 +238,18 @@ public actor VolumeCore {
 
         var request = PfsGetAttrRequest()
         request.item = try identity(for: item).proto
-        let envelope = try await client.request(.getAttr(request))
+        let envelope: PfsEnvelope
+        do {
+            envelope = try await client.request(.getAttr(request))
+        } catch let error as PfsLocalClientError
+            where error.posixErrno == ENOENT || error.posixErrno == ESTALE {
+            // The frontend identity remains canonical until Reclaim even
+            // after its last link disappears. Authorities may report that
+            // retired backing inode as either ENOENT or ESTALE; FSKit's
+            // pathname-visible result is consistently ENOENT. A surviving
+            // hard-link alias succeeds here and therefore keeps the Item.
+            throw PfsLocalClientError.daemon(errno: ENOENT, message: "item is no longer linked")
+        }
         guard case let .getAttrReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
@@ -465,20 +476,12 @@ public actor VolumeCore {
     }
 
     public func recordRenameReplacement(replacedItem: PortableFSItem) throws {
-        let replacedObjectID = ObjectIdentifier(replacedItem)
-        guard let replacedIdentity = identitiesByObject[replacedObjectID] else {
-            return
-        }
-
-        if let canonical = itemsByIdentity[replacedIdentity], canonical === replacedItem {
-            itemsByIdentity.removeValue(forKey: replacedIdentity)
-        }
-        var snapshot = openHandles[replacedObjectID]?.attrSnapshot
-        if snapshot != nil {
-            snapshot?.nlink = 0
-        }
-        deletedItemsByObject[replacedObjectID] = DeletedItemState(identity: replacedIdentity, attrSnapshot: snapshot)
-        pruneGenerationIfUnused(itemID: replacedIdentity.itemID)
+        // Rename-over removes one NAME, not necessarily the inode's last
+        // link. The daemon owns the authoritative identity and link count:
+        // a peer-only hard-link alias may still resolve to this same Item.
+        // Keep the canonical object until FSKit's explicit reclaim boundary
+        // and let getattr/lookup return the authority's actual nlink.
+        _ = try identity(for: replacedItem)
     }
 
     public func symlink(in directory: PortableFSItem, name: Data, target: Data) async throws -> PfsCreateResult {
@@ -570,9 +573,10 @@ public actor VolumeCore {
     /// The REAL volume barrier: the daemon drains outstanding write-back to
     /// the authority, and success means authority-durable, applied, AND
     /// acknowledged by every live protocol subscriber at its supported
-    /// frontend boundary. macOS 26 exposes no kernel-cache invalidation hook,
-    /// so FSKit kernel-cache visibility is not part of that acknowledgment.
-    /// There is
+    /// frontend boundary. On macOS 26, known regular-file data and size are
+    /// refreshed before content acknowledgment. Cached namespace bindings
+    /// and other attributes remain outside FSKit's public cache-control
+    /// surface. There is
     /// no degraded local-only success: an unreachable or slow authority
     /// or a local WAL sync failure FAILS the barrier and surfaces to the
     /// kernel caller.

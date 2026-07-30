@@ -28,7 +28,7 @@ type InvalidationHandler interface {
 }
 
 type relatedInodeInvalidationHandler interface {
-	InvalidateRelatedInodes(inos []uint64, eventPath string)
+	InvalidateRelatedInodes(inos []uint64, eventPath string, gen, version uint64, namespaceChange bool)
 }
 
 // InvalidationOptions holds frontend diagnostics/test seams.
@@ -89,13 +89,28 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 		opts.clearRecent()
 		attrs.Clear()
 		versions.Reset()
+		streamToken := versions.CaptureToken()
 		for batch := range stream {
 			for _, inv := range batch.Invs {
-				if inv.Gen != 0 && !versions.SeenGen(inv.Gen) {
-					versions.RefreshAll(inv.Gen)
-					h.FlushAll()
-					opts.clearRecent()
-					attrs.Clear()
+				generationOK := true
+				if inv.Gen != 0 {
+					if !versions.SeenGen(inv.Gen) {
+						var ok bool
+						streamToken, ok = versions.AcceptGeneration(streamToken, inv.Gen)
+						generationOK = ok
+						h.FlushAll()
+						opts.clearRecent()
+						attrs.Clear()
+					} else {
+						// A concurrent tokened read may adopt this valid
+						// stream's generation first. Join that same nonce so
+						// a later overflow FlushAll can retire every retained
+						// version floor; a different-generation stream still
+						// fails closed above.
+						var ok bool
+						streamToken, ok = versions.TokenForGeneration(inv.Gen)
+						generationOK = ok
+					}
 				}
 				if inv.Recall {
 					opts.debugf("RECALL received path=%q -> ReleaseSubtree", inv.Path)
@@ -103,10 +118,20 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 					continue
 				}
 				if inv.FlushAll {
-					versions.RefreshAll(inv.Gen)
+					if generationOK {
+						var ok bool
+						streamToken, ok = versions.FlushGeneration(streamToken, inv.Gen)
+						generationOK = ok
+					}
 					h.FlushAll()
 					opts.clearRecent()
 					attrs.Clear()
+					continue
+				}
+				if !generationOK {
+					// This stream lost the generation race to a newer tokened
+					// observation. Its events may conservatively flush caches
+					// and recall grants, but can never re-anchor versions.
 					continue
 				}
 				if inv.Path == "" {
@@ -120,17 +145,37 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 				// Its server pair is workfs stampVersion's parent stamping, which bumps the parent
 				// directory's version on the same mutations so the two versions advance together.
 				if !inv.InPlace {
-					versions.FillOK(inv.Gen, parentPath(inv.Path), inv.Version)
+					versions.Apply(inv.Gen, parentPath(inv.Path), inv.Version)
 				}
-				if versions.Apply(inv.Gen, inv.Path, inv.Version) {
+				appliedPath := versions.Apply(inv.Gen, inv.Path, inv.Version)
+				if appliedPath {
 					if inv.Orphaned && inv.OrphanIno != 0 && !opts.DropOrphan {
 						h.MarkOrphan(inv.Path, inv.OrphanIno)
 					}
 					h.InvalidatePath(inv.Path, inv.InPlace)
 					attrs.Evict(inv.Path)
-					if related, ok := h.(relatedInodeInvalidationHandler); ok {
-						related.InvalidateRelatedInodes(inv.RelatedInos, inv.Path)
+				}
+				if related, ok := h.(relatedInodeInvalidationHandler); ok {
+					// The primary path may already have this exact (or a
+					// newer) version because an authority read raced ahead of
+					// stream delivery. Related aliases have independent path
+					// floors and caches, so their fan-out cannot be conditional
+					// on Apply(primary) advancing. Per-alias FillOK remains
+					// monotonic, and generationOK above excludes stale streams.
+					relatedGen, relatedVersion := uint64(0), uint64(0)
+					if inv.InPlace {
+						// Only in-place events stamp the same inode changed
+						// through all aliases. Namespace events may name a
+						// surviving related inode with its own version.
+						relatedGen, relatedVersion = inv.Gen, inv.Version
 					}
+					related.InvalidateRelatedInodes(
+						inv.RelatedInos,
+						inv.Path,
+						relatedGen,
+						relatedVersion,
+						!inv.InPlace,
+					)
 				}
 			}
 			// Acknowledge AFTER the batch is fully applied to every cache:

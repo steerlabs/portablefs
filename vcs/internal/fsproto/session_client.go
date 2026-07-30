@@ -26,6 +26,7 @@ package fsproto
 // There is no legacy downgrade.
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -231,6 +232,31 @@ func (c *Client) takeConn() (*conn, error) {
 	}
 }
 
+func (c *Client) takeConnContext(ctx context.Context) (*conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.isClosed() {
+		return nil, net.ErrClosed
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closed:
+		return nil, net.ErrClosed
+	case cn := <-c.conns:
+		if err := ctx.Err(); err != nil {
+			c.conns <- cn
+			return nil, err
+		}
+		if c.isClosed() {
+			c.conns <- cn
+			return nil, net.ErrClosed
+		}
+		return cn, nil
+	}
+}
+
 // EnsureExactSession establishes the mount session, negotiating the protocol
 // version first: the authority must speak exactly ProtocolVersion (v8).
 // Returns (true, nil) when the session is live and an error otherwise —
@@ -392,6 +418,54 @@ func (c *Client) roundtripAttached(req *Request) (resp *Response, sent bool, err
 	return c.roundtripAttachedWithGate(req, false)
 }
 
+// roundtripAttachedContext is the cancellable form used by the write-back
+// flusher. Cancellation interrupts the checked-out transport and then JOINS
+// the roundtrip before returning. That join is the important ordering
+// property: a timed-out digest batch can never remain live in a detached
+// goroutine while the flusher submits a later batch for the same stream.
+// The caller may safely replay the identical digest-addressed batch after an
+// ambiguous error.
+func (c *Client) roundtripAttachedContext(ctx context.Context, req *Request) (resp *Response, sent bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	cn, err := c.takeConnContext(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { c.conns <- cn }()
+
+	stopInterrupt := make(chan struct{})
+	interruptDone := make(chan struct{})
+	go func() {
+		defer close(interruptDone)
+		select {
+		case <-ctx.Done():
+			cn.interrupt()
+		case <-stopInterrupt:
+		}
+	}()
+	defer func() {
+		close(stopInterrupt)
+		<-interruptDone
+	}()
+
+	if err := c.prepareConnContext(ctx, cn); err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	resp, sent, err = cn.roundtripSentWithGateContext(ctx, req, false)
+	if err != nil && ctx.Err() != nil {
+		return nil, sent, ctx.Err()
+	}
+	return resp, sent, err
+}
+
 func (c *Client) roundtripAttachedWithGate(req *Request, resolved bool) (resp *Response, sent bool, err error) {
 	cn, err := c.takeConn()
 	if err != nil {
@@ -456,6 +530,33 @@ func (c *Client) doAttachedResolved(req *Request) (*Response, error) {
 // connection-session check. A definite ESTALE on attach fences the session.
 func (c *Client) prepareConn(cn *conn) error {
 	return c.prepareConnWithGate(cn, false)
+}
+
+func (c *Client) prepareConnContext(ctx context.Context, cn *conn) error {
+	if err := cn.ensureWithGateContext(ctx, false); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	es := c.exactState()
+	if es == nil || es.isFenced() || cn.attached == es.id {
+		return nil
+	}
+	resp, _, err := cn.roundtripSentWithGateContext(ctx, &Request{
+		Op: OpSessionAttach, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
+	}, false)
+	if err != nil {
+		return err
+	}
+	if resp.Status != OK {
+		if resp.Status == ESTALE {
+			es.fence()
+		}
+		return statusError("session attach", resp.Status)
+	}
+	cn.attached = es.id
+	return nil
 }
 
 func (c *Client) prepareConnWithGate(cn *conn, resolved bool) error {

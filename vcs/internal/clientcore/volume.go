@@ -60,6 +60,27 @@ type Options struct {
 	SessionTTL    time.Duration
 	OnInvalidate  func(path string, inPlace bool)
 	OnFlushAll    func(path string)
+	// OnHandoffFlush is a synchronous frontend cache barrier. Set it only
+	// when returning from the callback proves the frontend applied the flush
+	// (the in-process FUSE adapter does); asynchronous event publication must
+	// stay on OnFlushAll and must not claim this exact boundary.
+	OnHandoffFlush func(path string) error
+	// OnHandoffStart/End bracket frontend reply admission across the exact
+	// flush and authority Checkin.
+	OnHandoffStart func(ctx context.Context, path string) error
+	OnHandoffEnd   func(path string)
+	// OnHandoffPrepared persists frontend identity assigned by release-pin
+	// preparation and resolves every other published local identity before
+	// authority Checkin can expose those inodes to peers. The raw attached
+	// client is supplied because recovery runs this boundary before Dial has
+	// returned the Volume.
+	OnHandoffPrepared func(
+		ctx context.Context,
+		path string,
+		epoch string,
+		client *fsproto.Client,
+	) (end func(released bool), err error)
+	OnReleaseWait func(ctx context.Context) (resume func())
 	OnMarkOrphan  func(path string, ino uint64)
 	// OnWriteBackError reports the engine's sticky health verdict (nil
 	// clears). Lets the daemon flip a mount to degraded when flushes stall,
@@ -332,10 +353,13 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	}
 	budget := opts.DiskCacheBytes / 2
 	wb, werr := openWritebackForAttach(cctx, cli, writeback.Config{
-		StateDir:               walDir,
-		VolumeID:               v.volumeID,
-		Branch:                 opts.Branch,
-		Remote:                 wbRemote{cli: cli},
+		StateDir: walDir,
+		VolumeID: v.volumeID,
+		Branch:   opts.Branch,
+		Remote: wbRemote{
+			cli:          cli,
+			observations: v.hardlinks,
+		},
 		BudgetBytes:            budget,
 		DisableDelegation:      os.Getenv("PORTABLEFS_DEBUG_WRITE_THROUGH") == "1",
 		DisableDelegatedXattrs: cli.Features()&fsproto.FeatureDelegatedXattrs == 0,
@@ -343,18 +367,41 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		ProtectOpenPins:        v.protectOpenPins,
 		Logf:                   opts.Debugf,
 		Events: writeback.Events{
+			OnHandoffStart: opts.OnHandoffStart,
+			OnHandoffEnd:   opts.OnHandoffEnd,
+			OnHandoffPrepared: func(
+				ctx context.Context,
+				scope string,
+				epoch string,
+			) (func(bool), error) {
+				if opts.OnHandoffPrepared == nil {
+					return nil, nil
+				}
+				return opts.OnHandoffPrepared(ctx, scope, epoch, cli)
+			},
+			OnReleaseWait:          opts.OnReleaseWait,
+			AllowDelegatedMutation: v.allowDelegatedMutation,
 			OnGrant: func(scope string) {
 				// Shared attr/negative/directory/kernel entries under the
 				// scope must not shadow the authoritative delegated view.
-				v.AttrCache.EvictPrefix(scope)
-				v.evictDirCachePrefix(scope)
+				v.VersionCache.FencePrefix(scope)
 				if v.onFlushAll != nil {
 					go v.onFlushAll(scope)
 				}
 			},
+			OnHandoff: func(scope string) error {
+				// Close every daemon-side pre-handoff cache view while the
+				// delegation still excludes peers. Kernel content coherence is
+				// driven separately by portablefsd's marked truncate + page
+				// invalidation protocol; a fire-and-forget frontend event is
+				// not part of this exact handoff boundary.
+				v.VersionCache.FencePrefix(scope)
+				if opts.OnHandoffFlush != nil {
+					return opts.OnHandoffFlush(scope)
+				}
+				return nil
+			},
 			OnRelease: func(scope string) {
-				v.AttrCache.EvictPrefix(scope)
-				v.evictDirCachePrefix(scope)
 				if v.onFlushAll != nil {
 					v.onFlushAll(scope)
 				}
@@ -433,7 +480,10 @@ func openWritebackForAttach(ctx context.Context, cli *fsproto.Client, cfg writeb
 // different: ReleaseDelegation and Rebind do not return after they have
 // started until their exact outcome is known. That keeps the engine's
 // handoff barrier and recovery store lock installed for the whole transition.
-type wbRemote struct{ cli *fsproto.Client }
+type wbRemote struct {
+	cli          *fsproto.Client
+	observations *hardlinkAliases
+}
 
 func ctxCall[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 	type res struct {
@@ -456,18 +506,26 @@ func ctxCall[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 
 func (r wbRemote) DelegationAcquire(ctx context.Context, scope, writebackID string) (writeback.AcquireReply, error) {
 	return ctxCall(ctx, func() (writeback.AcquireReply, error) {
+		observation := r.observations.beginObservation()
+		defer observation.Close()
 		g, err := r.cli.DelegationAcquire(scope, writebackID)
 		if err != nil {
 			return writeback.AcquireReply{}, err
 		}
 		reply := writeback.AcquireReply{Granted: g.Granted, Epoch: g.Epoch, Exists: g.Exists}
 		if g.Exists {
+			observation.Observe(scope, g.Self)
 			reply.Self = entryFromAttr("", g.Self)
 		}
 		if g.HasChildren {
 			reply.HasChildren = true
 			reply.Children = make([]writeback.Entry, 0, len(g.Children))
 			for _, d := range g.Children {
+				childPath := d.Name
+				if scope != "" {
+					childPath = scope + "/" + d.Name
+				}
+				observation.Observe(childPath, d.Attr)
 				reply.Children = append(reply.Children, entryFromAttr(d.Name, d.Attr))
 			}
 		}
@@ -490,17 +548,15 @@ func (r wbRemote) ReleaseDelegation(ctx context.Context, scope, epoch string) er
 }
 
 func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
-	return ctxCall(ctx, func() (writeback.FlushReply, error) {
-		scopes := make([]fsproto.WBScope, 0, len(req.ScopeRuns))
-		for _, run := range req.ScopeRuns {
-			scopes = append(scopes, fsproto.WBScope{Path: run.Scope, Epoch: run.Epoch, Through: run.Through})
-		}
-		through, status, err := r.cli.FlushWriteback(req.WritebackID, scopes, req.PrevDigest, req.EndDigest, req.Records)
-		if err != nil {
-			return writeback.FlushReply{}, err
-		}
-		return writeback.FlushReply{Through: through, Status: status}, nil
-	})
+	scopes := make([]fsproto.WBScope, 0, len(req.ScopeRuns))
+	for _, run := range req.ScopeRuns {
+		scopes = append(scopes, fsproto.WBScope{Path: run.Scope, Epoch: run.Epoch, Through: run.Through})
+	}
+	through, status, err := r.cli.FlushWritebackContext(ctx, req.WritebackID, scopes, req.PrevDigest, req.EndDigest, req.Records)
+	if err != nil {
+		return writeback.FlushReply{}, err
+	}
+	return writeback.FlushReply{Through: through, Status: status}, nil
 }
 
 func (r wbRemote) FlushResolved(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
@@ -603,14 +659,26 @@ func attrFromEntry(e writeback.Entry) fsproto.Attr {
 func (v *Volume) noteSelfMutation(p string, gen, version uint64, inPlace bool) {
 	p = cleanVolumePath(p)
 	if gen != 0 && !v.VersionCache.SeenGen(gen) {
-		v.VersionCache.RefreshAll(gen)
+		// Mutation responses are not generation-transition authorities: an
+		// old in-flight response can arrive after a new-generation read.
+		// Drop all reachability to unknown and let the next tokened read (or
+		// the still-current invalidation stream) establish the nonce.
+		v.VersionCache.Reset()
 		v.AttrCache.Clear()
 		v.clearDirCache()
+		if v.onFlushAll != nil {
+			go v.onFlushAll("")
+		}
 	}
 	if gen != 0 && version != 0 {
 		v.VersionCache.FillOK(gen, p, version)
 	}
 	v.AttrCache.Evict(p)
+	// Self mutations already have exact operation semantics: Link observes
+	// nlink>1 directly, while create/remove/rename cannot introduce an alias.
+	// The conservative namespace classification is reserved for peer events,
+	// whose wire shape intentionally groups link/remove/rename together.
+	v.invalidateRelatedInodes(v.hardlinks.inosForPaths(p), p, gen, version, false)
 	if inPlace {
 		return
 	}
@@ -620,6 +688,109 @@ func (v *Volume) noteSelfMutation(p string, gen, version uint64, inPlace bool) {
 	}
 	v.AttrCache.Evict(dir)
 	v.evictDirCache(dir)
+}
+
+type readView struct {
+	writeback.ReadPermit
+	cacheToken CacheToken
+}
+
+func (v *Volume) beginRead(ctx context.Context, path string) (readView, error) {
+	// Snapshot the cache epoch before read-view admission. A shared read can
+	// linearize immediately before grant acquisition; capturing afterward
+	// could mislabel its pre-grant authority reply with the post-grant fence.
+	cacheToken := v.VersionCache.CaptureToken()
+	var (
+		permit writeback.ReadPermit
+		err    error
+	)
+	if v.wb == nil {
+		permit = writeback.SharedReadPermit()
+	} else {
+		permit, err = v.wb.BeginRead(ctx, cleanVolumePath(path))
+		if err != nil {
+			return readView{}, err
+		}
+	}
+	return readView{
+		ReadPermit: permit,
+		cacheToken: cacheToken,
+	}, nil
+}
+
+// CoherenceSample returns the current file view for a daemon-driven local
+// kernel refresh. Under a retained delegation it samples the composed overlay
+// through a read permit; on the shared lane it bypasses user-space caches and
+// samples the authority with its version stamp. This prevents an acknowledged
+// local write from refreshing a live vnode back to pre-flush authority state.
+func (v *Volume) CoherenceSample(ctx context.Context, path string) (fsproto.Attr, uint64, uint64, Status) {
+	path = cleanVolumePath(path)
+	for {
+		permit, err := v.beginRead(ctx, path)
+		if err != nil {
+			return fsproto.Attr{}, 0, 0, fsproto.EIO
+		}
+		if v.wb != nil && permit.Covers(path) {
+			if ent, result := permit.Lookup(path); result == writeback.LookupHit {
+				permit.Close()
+				return engineAttr(path, ent), 0, 0, fsproto.OK
+			} else if result == writeback.LookupNegative {
+				permit.Close()
+				return fsproto.Attr{}, 0, 0, fsproto.ENOENT
+			}
+			// A retained directory view can be incomplete for a pre-existing
+			// entry. Seed it while the same permit pins the handoff, then sample
+			// the now-composed view.
+			if dir, _ := splitPath(path); permit.Covers(dir) {
+				if _, st := v.readdir(ctx, &permit, dir); st != fsproto.OK {
+					permit.Close()
+					return fsproto.Attr{}, 0, 0, st
+				}
+				if ent, result := permit.Lookup(path); result == writeback.LookupHit {
+					permit.Close()
+					return engineAttr(path, ent), 0, 0, fsproto.OK
+				} else if result == writeback.LookupNegative {
+					permit.Close()
+					return fsproto.Attr{}, 0, 0, fsproto.ENOENT
+				}
+			}
+			permit.Close()
+			return fsproto.Attr{}, 0, 0, fsproto.EIO
+		}
+		attr, version, generation, _, st, err := v.client.GetattrVContext(ctx, path)
+		if err != nil {
+			permit.Close()
+			return fsproto.Attr{}, 0, 0, fsproto.EIO
+		}
+		if generation == 0 {
+			permit.Close()
+			return attr, version, generation, st
+		}
+		token, cacheOK := v.VersionCache.AcceptGeneration(permit.cacheToken, generation)
+		tokenCurrent := cacheOK && v.VersionCache.TokenCurrent(token, generation, path)
+		if tokenCurrent && st != fsproto.OK {
+			permit.Close()
+			return attr, version, generation, st
+		}
+		if tokenCurrent {
+			// A sample older than the retained version floor is still
+			// boundary-stable; refreshLocalSample performs its bounded
+			// catch-up check. The fill is best-effort here.
+			v.VersionCache.FillOKToken(token, generation, path, version)
+			permit.Close()
+			return attr, version, generation, st
+		}
+		// The authority reply crossed a generation or ownership fence. It is
+		// safe for an already-started syscall to linearize before that fence,
+		// but it is not safe to drive a new kernel refresh from that sample.
+		// Re-enter the current read view and sample again.
+		permit.Close()
+		select {
+		case <-ctx.Done():
+			return fsproto.Attr{}, 0, 0, fsproto.EIO
+		default:
+		}
+	}
 }
 
 func cleanVolumePath(p string) string {
@@ -787,10 +958,29 @@ func (h volumeInvalidationHandler) InvalidatePath(path string, inPlace bool) {
 	}
 }
 
-func (h volumeInvalidationHandler) InvalidateRelatedInodes(inos []uint64, eventPath string) {
+func (h volumeInvalidationHandler) InvalidateRelatedInodes(
+	inos []uint64,
+	eventPath string,
+	gen, version uint64,
+	namespaceChange bool,
+) {
+	if namespaceChange {
+		// Namespace invalidations are deliberately conservative. The wire
+		// does not distinguish link from remove/rename, and only link can
+		// increase nlink; permanently classifying every related inode avoids
+		// a false-safe window without a follow-up getattr. In-place content
+		// events carry gen+version and do not change this classification.
+		h.v.hardlinks.markAliasUnsafe(inos)
+	}
 	for _, alias := range h.v.hardlinks.pathsForInos(inos) {
 		if alias == eventPath {
 			continue
+		}
+		if gen != 0 && version != 0 {
+			// Disk blocks are keyed by this per-path floor. Every name of one
+			// inode must advance together or an alias can keep serving the
+			// pre-write block after another alias changes the inode.
+			h.v.VersionCache.FillOK(gen, alias, version)
 		}
 		h.v.AttrCache.Evict(alias)
 		if h.v.onInvalidate != nil {
@@ -799,10 +989,27 @@ func (h volumeInvalidationHandler) InvalidateRelatedInodes(inos []uint64, eventP
 			h.v.onInvalidate(alias, true)
 		}
 	}
+	if namespaceChange {
+		// The event path's prior binding (and, for a directory replacement or
+		// rename, every descendant binding) is no longer trustworthy. Prune
+		// it after alias fan-out; alias-unsafe inode facts remain permanent.
+		h.v.hardlinks.removePrefix(eventPath)
+	}
 }
 
-func (v *Volume) invalidateRelatedInodes(inos []uint64, eventPath string) {
-	volumeInvalidationHandler{v: v}.InvalidateRelatedInodes(inos, eventPath)
+func (v *Volume) invalidateRelatedInodes(
+	inos []uint64,
+	eventPath string,
+	gen, version uint64,
+	namespaceChange bool,
+) {
+	volumeInvalidationHandler{v: v}.InvalidateRelatedInodes(
+		inos,
+		eventPath,
+		gen,
+		version,
+		namespaceChange,
+	)
 }
 
 func (h volumeInvalidationHandler) MarkOrphan(path string, ino uint64) {

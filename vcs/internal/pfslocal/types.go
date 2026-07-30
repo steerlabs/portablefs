@@ -4,13 +4,15 @@ package pfslocal
 
 const (
 	ProtocolMajor = 1
-	ProtocolMinor = 0
+	ProtocolMinor = 2
 	MaxFrameBytes = 16 << 20
 )
 
 type Envelope struct {
-	RequestID uint64
-	Body      any
+	RequestID              uint64
+	PublicationAckRequired bool
+	OperationID            uint64
+	Body                   any
 }
 
 type Hello struct {
@@ -24,6 +26,11 @@ type HelloReply struct {
 	ProtocolMajor uint32
 	ProtocolMinor uint32
 	DaemonVersion string
+}
+
+type PublicationAck struct {
+	PublishedRequestID uint64
+	OperationID        uint64
 }
 
 type ResolveRequest struct{ AttachRef string }

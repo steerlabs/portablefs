@@ -279,8 +279,8 @@ func (s *Server) controlFSList(w http.ResponseWriter, r *http.Request, a *attach
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a.nsMu.RLock()
-	defer a.nsMu.RUnlock()
+	unlockNamespace := a.lockExternalNamespaceRead()
+	defer unlockNamespace()
 	if err := a.controlAdmissionError(); err != nil {
 		writeHTTPError(w, http.StatusConflict, err.Error())
 		return
@@ -322,8 +322,8 @@ func (s *Server) controlFSRead(w http.ResponseWriter, r *http.Request, a *attach
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a.nsMu.RLock()
-	defer a.nsMu.RUnlock()
+	unlockNamespace := a.lockExternalNamespaceRead()
+	defer unlockNamespace()
 	if err := a.controlAdmissionError(); err != nil {
 		writeHTTPError(w, http.StatusConflict, err.Error())
 		return
@@ -385,16 +385,32 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 	// Hold the exclusive namespace gate for the complete logical operation.
 	// This also covers grafted local files, whose mutation path deliberately
 	// bypasses the remote Volume lifecycle.
-	a.nsMu.Lock()
-	defer a.nsMu.Unlock()
+	unlockNamespace := a.lockExternalNamespaceWrite()
+	namespaceLocked := true
+	defer func() {
+		if namespaceLocked {
+			unlockNamespace()
+		}
+	}()
 	if err := a.controlAdmissionError(); err != nil {
 		writeHTTPError(w, http.StatusConflict, err.Error())
 		return
 	}
 	p := cleanControlPath(req.Path)
 	if graft := a.localDirFor(p); graft != "" {
-		if eno := a.writeLocalFile(p, graft, data); eno != 0 {
+		refreshItemID, eno := a.writeLocalFile(p, graft, data)
+		if eno != 0 {
 			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
+			return
+		}
+		unlockNamespace()
+		namespaceLocked = false
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+		err := a.exactKernelRefresh(refreshCtx, refreshItemID)
+		cancelRefresh()
+		if err != nil {
+			a.failCoherence(err)
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -440,15 +456,31 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		attr = fresh
 	}
 	a.mu.Lock()
-	a.registerLocked(p, attr)
+	refreshItemID := a.registerLocked(p, attr).item.ItemID
 	if !existed {
 		a.publishNamespaceInvalidationLocked(p, 0, 0)
 	}
 	a.publishContentInvalidationLocked(p, 0, 0)
 	a.mu.Unlock()
-	a.flushBindingDelta()
-	// This write bypassed the kernel entirely; refresh any live vnode.
-	a.scheduleCoherenceRefresh(p)
+	if eno := a.flushBindingDelta(); eno != 0 {
+		writeHTTPError(
+			w, httpStatusForErr(eno), errMessage("fs/write identity journal", eno),
+		)
+		return
+	}
+	// This write bypassed the kernel entirely. Do not acknowledge it until
+	// every live vnode reflects the composed local view; otherwise FSKit can
+	// serve pre-write pages after a successful control response.
+	unlockNamespace()
+	namespaceLocked = false
+	refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	err = a.exactKernelRefresh(refreshCtx, refreshItemID)
+	cancelRefresh()
+	if err != nil {
+		a.failCoherence(err)
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -464,8 +496,8 @@ func (s *Server) controlFSStat(w http.ResponseWriter, r *http.Request, a *attach
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a.nsMu.RLock()
-	defer a.nsMu.RUnlock()
+	unlockNamespace := a.lockExternalNamespaceRead()
+	defer unlockNamespace()
 	if err := a.controlAdmissionError(); err != nil {
 		writeHTTPError(w, http.StatusConflict, err.Error())
 		return

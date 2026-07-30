@@ -7,6 +7,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,6 +148,104 @@ func TestVolumePublicOpsEndToEnd(t *testing.T) {
 	if err := v.FlushToAuthority(ctx); err != nil {
 		t.Fatalf("FlushToAuthority: %v", err)
 	}
+}
+
+func TestRenameOverSameAuthorityInodePreservesAliasesAndOpenPaths(t *testing.T) {
+	addr := serveCore(t)
+	v := dialCore(t, addr, Options{Owner: "same-inode-rename"})
+	ctx := context.Background()
+
+	source, st := v.Create(ctx, "source", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create source: %d", st)
+	}
+	sourceState := NewNodeState(source.Ino, source.Ino != 0)
+	if n, st := v.Write(ctx, "source", sourceState, 0, []byte("payload")); st != fsproto.OK || n != len("payload") {
+		t.Fatalf("write source: n=%d st=%d", n, st)
+	}
+	linked, st := v.Link(ctx, "source", "alias", sourceState)
+	if st != fsproto.OK || linked.Ino != source.Ino || linked.Nlink != 2 {
+		t.Fatalf("link alias: attr=%+v st=%d", linked, st)
+	}
+	aliasState := NewNodeState(linked.Ino, linked.Ino != 0)
+
+	if st := v.Open(ctx, "source", sourceState, true); st != fsproto.OK {
+		t.Fatalf("open source: %d", st)
+	}
+	sourceOpen := true
+	defer func() {
+		if sourceOpen {
+			v.CloseHandle("source", sourceState)
+		}
+	}()
+	if st := v.Open(ctx, "alias", aliasState, true); st != fsproto.OK {
+		t.Fatalf("open alias: %d", st)
+	}
+	aliasOpen := true
+	defer func() {
+		if aliasOpen {
+			v.CloseHandle("alias", aliasState)
+		}
+	}()
+
+	assertOpenPath := func(openedPath string, node *NodeState) {
+		t.Helper()
+		got, ok := v.opens.CurrentPath(openedPath, node)
+		if !ok || got != openedPath {
+			t.Fatalf("current open path for %q = %q, present=%v", openedPath, got, ok)
+		}
+	}
+	assertOpenPath("source", sourceState)
+	assertOpenPath("alias", aliasState)
+
+	// POSIX rename is a semantic no-op when old and new are hard-link
+	// spellings of the same inode. The authority still validates both names,
+	// but client-side rename-over bookkeeping must not remove either name.
+	if st := v.Rename(ctx, "source", "alias", sourceState, aliasState); st != fsproto.OK {
+		t.Fatalf("same-inode rename: %d", st)
+	}
+
+	sourceAfter, st := v.Lookup(ctx, "source")
+	if st != fsproto.OK || sourceAfter.Ino != source.Ino || sourceAfter.Nlink != 2 {
+		t.Fatalf("source after no-op rename: attr=%+v st=%d", sourceAfter, st)
+	}
+	aliasAfter, st := v.Lookup(ctx, "alias")
+	if st != fsproto.OK || aliasAfter.Ino != source.Ino || aliasAfter.Nlink != 2 {
+		t.Fatalf("alias after no-op rename: attr=%+v st=%d", aliasAfter, st)
+	}
+	assertOpenPath("source", sourceState)
+	assertOpenPath("alias", aliasState)
+	if sourceState.Orphan() != 0 || aliasState.Orphan() != 0 {
+		t.Fatalf(
+			"same-inode rename orphaned a live alias: source=%d alias=%d",
+			sourceState.Orphan(),
+			aliasState.Orphan(),
+		)
+	}
+
+	aliases := v.hardlinks.pathsForInos([]uint64{source.Ino})
+	gotAliases := make(map[string]bool, len(aliases))
+	for _, path := range aliases {
+		gotAliases[path] = true
+	}
+	if len(gotAliases) != 2 || !gotAliases["source"] || !gotAliases["alias"] {
+		t.Fatalf("same-inode rename changed alias observations: %v", aliases)
+	}
+	for _, path := range []string{"source", "alias"} {
+		data, st := v.Read(ctx, path, NewNodeState(source.Ino, true), 0, len("payload"))
+		if st != fsproto.OK || string(data) != "payload" {
+			t.Fatalf("read %s after no-op rename: data=%q st=%d", path, data, st)
+		}
+	}
+
+	if st := v.CloseHandle("source", sourceState); st != fsproto.OK {
+		t.Fatalf("close source: %d", st)
+	}
+	sourceOpen = false
+	if st := v.CloseHandle("alias", aliasState); st != fsproto.OK {
+		t.Fatalf("close alias: %d", st)
+	}
+	aliasOpen = false
 }
 
 func TestWriteBackAtomicAppendAddsNoHotPathRoundTrips(t *testing.T) {
@@ -488,6 +587,61 @@ func TestFsyncBlocksOnAuthorityFlush(t *testing.T) {
 	}
 }
 
+// TestCoherenceSampleUsesAcknowledgedDelegatedView pins the source-of-truth
+// contract for daemon-driven local kernel refreshes. A control write can be
+// acknowledged while its flush is blocked; sampling raw authority in that
+// window would see the old size (or ENOENT) and clamp a live vnode backward.
+func TestCoherenceSampleUsesAcknowledgedDelegatedView(t *testing.T) {
+	addr, srv := serveCoreServer(t)
+	ctx := context.Background()
+	holder := dialCore(t, addr, Options{
+		Owner:  "coherence-sample-holder",
+		WALDir: t.TempDir(),
+	})
+	if _, st := holder.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir d: %d", st)
+	}
+
+	blockFlush := make(chan struct{})
+	var unblock sync.Once
+	t.Cleanup(func() { unblock.Do(func() { close(blockFlush) }) })
+	entered := make(chan struct{}, 1)
+	srv.SetBeforeFlushBatch(func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-blockFlush
+	})
+	attr, st := holder.Create(ctx, "d/f", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create d/f: %d", st)
+	}
+	node := NewNodeState(attr.Ino, attr.Ino != 0)
+	payload := []byte("acknowledged-before-authority")
+	if _, st := holder.Write(ctx, "d/f", node, 0, payload); st != fsproto.OK {
+		t.Fatalf("write d/f: %d", st)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("background flush did not enter authority gate")
+	}
+
+	sample, version, generation, st := holder.CoherenceSample(ctx, "d/f")
+	if st != fsproto.OK || sample.Kind != "file" || sample.Size != int64(len(payload)) {
+		t.Fatalf("composed sample = %+v version=%d generation=%d st=%d", sample, version, generation, st)
+	}
+	if version != 0 || generation != 0 {
+		t.Fatalf("delegated sample exposed authority stamp version=%d generation=%d", version, generation)
+	}
+
+	if _, _, _, _, rawStatus, err := holder.Client().GetattrV("d/f"); err != nil || rawStatus != fsproto.ENOENT {
+		t.Fatalf("raw authority before unblock = status=%d err=%v, want ENOENT", rawStatus, err)
+	}
+	unblock.Do(func() { close(blockFlush) })
+}
+
 func TestDelegationRecallForcesFlushBeforeContenderProceeds(t *testing.T) {
 	addr := serveCore(t)
 	ctx := context.Background()
@@ -679,12 +833,327 @@ func TestHardLinkPromotesDelegatedLocalIdentity(t *testing.T) {
 		t.Fatalf("handle inode=%d, want %d", got, linked.Ino)
 	}
 
+	// Re-acquire the directory through an unrelated ordinary file. The
+	// hardlink write below must release this covering grant before taking
+	// the authority lane; otherwise the server self-recall can wait on the
+	// same NodeState lock held by the write.
+	other, st := v.Create(ctx, "d/other", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create other: %d", st)
+	}
+	if _, st := v.Write(ctx, "d/other", NewNodeState(other.Ino, other.Ino != 0), 0, []byte("other")); st != fsproto.OK {
+		t.Fatalf("write other: %d", st)
+	}
+	if !v.wb.Covers("d/source") {
+		t.Fatal("test precondition: unrelated write did not acquire covering grant")
+	}
 	if _, st := v.Write(ctx, "d/source", source, 0, []byte("shared")); st != fsproto.OK {
 		t.Fatalf("post-link write: %d", st)
+	}
+	if v.wb.Covers("d/source") {
+		t.Fatal("hardlink write did not release covering grant")
 	}
 	buf, st := v.Read(ctx, "d/alias", source, 0, len("shared"))
 	if st != fsproto.OK || string(buf) != "shared" {
 		t.Fatalf("alias read=%q st=%d", buf, st)
+	}
+}
+
+func TestHardlinkMutationReleasesEveryAliasDelegationScope(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+	v := dialCore(t, addr, Options{Owner: "hardlink-cross-scope-release"})
+
+	for _, dir := range []string{"a", "b"} {
+		if _, st := v.Mkdir(ctx, dir, 0o755); st != fsproto.OK {
+			t.Fatalf("mkdir %s: %d", dir, st)
+		}
+	}
+	_, st := v.Create(ctx, "a/source", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create source: %d", st)
+	}
+	source := NewNodeState(0xabc, false)
+	if _, st := v.Write(ctx, "a/source", source, 0, []byte("v1")); st != fsproto.OK {
+		t.Fatalf("write source: %d", st)
+	}
+	linked, st := v.Link(ctx, "a/source", "b/alias", source)
+	if st != fsproto.OK || linked.Ino == 0 {
+		t.Fatalf("link: attr=%+v st=%d", linked, st)
+	}
+	v.RememberHardlinkAlias("a/source", linked.Ino)
+	v.RememberHardlinkAlias("b/alias", linked.Ino)
+
+	for _, path := range []string{"a/other", "b/other"} {
+		other, createStatus := v.Create(ctx, path, 0o644)
+		if createStatus != fsproto.OK {
+			t.Fatalf("create %s: %d", path, createStatus)
+		}
+		if _, writeStatus := v.Write(
+			ctx,
+			path,
+			NewNodeState(other.Ino, other.Ino != 0),
+			0,
+			[]byte(path),
+		); writeStatus != fsproto.OK {
+			t.Fatalf("write %s: %d", path, writeStatus)
+		}
+	}
+	if !v.wb.Covers("a/source") || !v.wb.Covers("b/alias") {
+		t.Fatal("test precondition: both alias directory grants were not held")
+	}
+
+	if _, st := v.Write(ctx, "a/source", source, 0, []byte("v2")); st != fsproto.OK {
+		t.Fatalf("hardlink write: %d", st)
+	}
+	if v.wb.Covers("a/source") || v.wb.Covers("b/alias") {
+		t.Fatal("hardlink write retained a delegation covering an alias")
+	}
+	data, st := v.Read(ctx, "b/alias", source, 0, 2)
+	if st != fsproto.OK || string(data) != "v2" {
+		t.Fatalf("alias read=%q st=%d", data, st)
+	}
+}
+
+func TestDelegationSnapshotsDiscoverPreexistingHardlinkAliases(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+
+	writer := dialCoreNoCleanup(t, addr, Options{Owner: "hardlink-snapshot-seed"})
+	for _, dir := range []string{"a", "b"} {
+		if _, st := writer.Mkdir(ctx, dir, 0o755); st != fsproto.OK {
+			t.Fatalf("seed mkdir %s: %d", dir, st)
+		}
+	}
+	sourceAttr, st := writer.Create(ctx, "a/source", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("seed create source: %d", st)
+	}
+	source := NewNodeState(sourceAttr.Ino, sourceAttr.Ino != 0)
+	if _, st := writer.Write(ctx, "a/source", source, 0, []byte("v1")); st != fsproto.OK {
+		t.Fatalf("seed write source: %d", st)
+	}
+	if linked, st := writer.Link(ctx, "a/source", "b/alias", source); st != fsproto.OK || linked.Nlink != 2 {
+		t.Fatalf("seed hardlink: attr=%+v st=%d", linked, st)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close seeding mount: %v", err)
+	}
+
+	v := dialCore(t, addr, Options{Owner: "hardlink-snapshot-observer"})
+	for _, path := range []string{"a/unrelated", "b/unrelated"} {
+		attr, createStatus := v.Create(ctx, path, 0o644)
+		if createStatus != fsproto.OK {
+			t.Fatalf("create %s: %d", path, createStatus)
+		}
+		if _, writeStatus := v.Write(
+			ctx,
+			path,
+			NewNodeState(attr.Ino, attr.Ino != 0),
+			0,
+			[]byte(path),
+		); writeStatus != fsproto.OK {
+			t.Fatalf("write %s: %d", path, writeStatus)
+		}
+	}
+	if !v.wb.Covers("a/source") || !v.wb.Covers("b/alias") {
+		t.Fatal("test precondition: snapshot observer did not hold both directory grants")
+	}
+
+	observedSource, st := v.Lookup(ctx, "a/source")
+	if st != fsproto.OK || observedSource.Nlink != 2 {
+		t.Fatalf("snapshot lookup source: attr=%+v st=%d", observedSource, st)
+	}
+	observedAlias, st := v.Lookup(ctx, "b/alias")
+	if st != fsproto.OK ||
+		observedAlias.Ino != observedSource.Ino ||
+		observedAlias.Nlink != 2 {
+		t.Fatalf("snapshot lookup alias: attr=%+v source=%+v st=%d", observedAlias, observedSource, st)
+	}
+	observedNode := NewNodeState(observedSource.Ino, true)
+	if !v.isHardlink(observedNode) {
+		t.Fatal("delegated snapshot lookups did not populate the hardlink alias index")
+	}
+
+	if _, st := v.Write(ctx, "a/source", observedNode, 0, []byte("v2")); st != fsproto.OK {
+		t.Fatalf("hardlink write after snapshot discovery: %d", st)
+	}
+	if v.wb.Covers("a/source") || v.wb.Covers("b/alias") {
+		t.Fatal("hardlink write retained a delegation covering a discovered alias")
+	}
+	data, st := v.Read(ctx, "b/alias", observedNode, 0, 2)
+	if st != fsproto.OK || string(data) != "v2" {
+		t.Fatalf("alias read=%q st=%d", data, st)
+	}
+}
+
+// A node first observed with nlink==1 must not remain eligible for delegated
+// write-back after a peer adds an alias. The open NodeState does not receive a
+// fresh getattr; RelatedInos is the only identity bridge between the peer's
+// namespace mutation and this already-instantiated handle.
+func TestPeerLinkMakesOpenNlinkOneNodeAliasUnsafe(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+
+	seed := dialCoreNoCleanup(t, addr, Options{Owner: "hardlink-late-seed"})
+	for _, dir := range []string{"a", "b"} {
+		if _, st := seed.Mkdir(ctx, dir, 0o755); st != fsproto.OK {
+			t.Fatalf("seed mkdir %s: %d", dir, st)
+		}
+	}
+	seedAttr, st := seed.Create(ctx, "a/source", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("seed create source: %d", st)
+	}
+	if _, st := seed.Write(
+		ctx,
+		"a/source",
+		NewNodeState(seedAttr.Ino, seedAttr.Ino != 0),
+		0,
+		[]byte("old"),
+	); st != fsproto.OK {
+		t.Fatalf("seed write source: %d", st)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed mount: %v", err)
+	}
+
+	a := dialCore(t, addr, Options{Owner: "hardlink-late-a"})
+	watchInvalidationsForTest(t, a)
+	observed, st := a.Lookup(ctx, "a/source")
+	if st != fsproto.OK || observed.Ino == 0 || observed.Nlink != 1 {
+		t.Fatalf("A initial lookup: attr=%+v st=%d", observed, st)
+	}
+	nodeA := NewNodeState(observed.Ino, true)
+	if st := a.Open(ctx, "a/source", nodeA, true); st != fsproto.OK {
+		t.Fatalf("A open source: %d", st)
+	}
+	defer a.CloseHandle("a/source", nodeA)
+
+	// Acquire a real path-keyed delegation while the inode is still known to
+	// A only as nlink==1. The peer Link below must recall this scope.
+	if _, st := a.Write(ctx, "a/source", nodeA, 0, []byte("old")); st != fsproto.OK {
+		t.Fatalf("A delegated write: %d", st)
+	}
+	if !a.wb.Covers("a/source") {
+		t.Fatal("test precondition: A did not hold the source delegation")
+	}
+
+	b := dialCore(t, addr, Options{Owner: "hardlink-late-b"})
+	sourceB, st := b.Lookup(ctx, "a/source")
+	if st != fsproto.OK || sourceB.Ino != observed.Ino || sourceB.Nlink != 1 {
+		t.Fatalf("B source lookup: attr=%+v A=%+v st=%d", sourceB, observed, st)
+	}
+	linked, st := b.Link(ctx, "a/source", "b/alias", NewNodeState(sourceB.Ino, true))
+	if st != fsproto.OK || linked.Ino != observed.Ino || linked.Nlink != 2 {
+		t.Fatalf("B cross-scope link: attr=%+v source=%+v st=%d", linked, sourceB, st)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for !a.isHardlink(nodeA) {
+		if time.Now().After(deadline) {
+			t.Fatal("A did not classify RelatedInos as alias-unsafe")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// No getattr/lookup occurs on A between the peer Link and this write. It
+	// must release/bypass every delegated alias scope and mutate by authority
+	// inode so both names continue to denote the same bytes.
+	if _, st := a.Write(ctx, "a/source", nodeA, 0, []byte("new")); st != fsproto.OK {
+		t.Fatalf("A post-link write: %d", st)
+	}
+	if a.wb.Covers("a/source") || a.wb.Covers("b/alias") {
+		t.Fatal("A retained a delegation covering a hardlink name")
+	}
+
+	verify := dialCore(t, addr, Options{Owner: "hardlink-late-verify"})
+	for _, path := range []string{"a/source", "b/alias"} {
+		data, readStatus := verify.Read(
+			ctx,
+			path,
+			NewNodeState(linked.Ino, true),
+			0,
+			len("new"),
+		)
+		if readStatus != fsproto.OK || string(data) != "new" {
+			t.Fatalf("verify %s=%q st=%d", path, data, readStatus)
+		}
+	}
+}
+
+// Even without stream delivery, a post-link delegation snapshot is an
+// authority proof that must be consumed before the acquiring mutation is
+// admitted. Merely observing the snapshot is too late unless admission loops
+// and re-validates the target after installation.
+func TestGrantSnapshotRejectsImmediateHardlinkMutation(t *testing.T) {
+	addr := serveCore(t)
+	ctx := context.Background()
+
+	seed := dialCoreNoCleanup(t, addr, Options{Owner: "hardlink-grant-seed"})
+	if _, st := seed.Mkdir(ctx, "a", 0o755); st != fsproto.OK {
+		t.Fatalf("seed mkdir a: %d", st)
+	}
+	sourceAttr, st := seed.Create(ctx, "a/source", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("seed create source: %d", st)
+	}
+	if _, st := seed.Write(
+		ctx,
+		"a/source",
+		NewNodeState(sourceAttr.Ino, sourceAttr.Ino != 0),
+		0,
+		[]byte("old"),
+	); st != fsproto.OK {
+		t.Fatalf("seed write source: %d", st)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed mount: %v", err)
+	}
+
+	a := dialCore(t, addr, Options{Owner: "hardlink-grant-a"})
+	observed, st := a.Lookup(ctx, "a/source")
+	if st != fsproto.OK || observed.Ino == 0 || observed.Nlink != 1 {
+		t.Fatalf("A initial lookup: attr=%+v st=%d", observed, st)
+	}
+	nodeA := NewNodeState(observed.Ino, true)
+
+	b := dialCore(t, addr, Options{Owner: "hardlink-grant-b"})
+	sourceB, st := b.Lookup(ctx, "a/source")
+	if st != fsproto.OK || sourceB.Ino != observed.Ino || sourceB.Nlink != 1 {
+		t.Fatalf("B source lookup: attr=%+v A=%+v st=%d", sourceB, observed, st)
+	}
+	linked, st := b.Link(ctx, "a/source", "alias", NewNodeState(sourceB.Ino, true))
+	if st != fsproto.OK || linked.Ino != observed.Ino || linked.Nlink != 2 {
+		t.Fatalf("B link: attr=%+v source=%+v st=%d", linked, sourceB, st)
+	}
+
+	// A intentionally has no invalidation watcher and performs no fresh read.
+	// Its acquisition snapshot contains nlink==2; the observer marks the path
+	// unsafe, the admission loop releases the just-installed grant, and this
+	// same syscall falls through to the inode-addressed authority lane.
+	if _, st := a.Write(ctx, "a/source", nodeA, 0, []byte("new")); st != fsproto.OK {
+		t.Fatalf("A immediate post-link write: %d", st)
+	}
+	if !a.isHardlink(nodeA) {
+		t.Fatal("grant snapshot did not classify the target alias-unsafe")
+	}
+	if a.wb.Covers("a/source") {
+		t.Fatal("grant snapshot left the hardlink mutation delegated")
+	}
+
+	verify := dialCore(t, addr, Options{Owner: "hardlink-grant-verify"})
+	for _, path := range []string{"a/source", "alias"} {
+		data, readStatus := verify.Read(
+			ctx,
+			path,
+			NewNodeState(linked.Ino, true),
+			0,
+			len("new"),
+		)
+		if readStatus != fsproto.OK || string(data) != "new" {
+			t.Fatalf("verify %s=%q st=%d", path, data, readStatus)
+		}
 	}
 }
 

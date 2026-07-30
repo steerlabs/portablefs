@@ -18,6 +18,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/fusefrontend"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/modebits"
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
@@ -86,6 +87,11 @@ type fuseNode struct {
 	v     *clientcore.Volume
 	path  string // creation-time path; curPath follows renames via the live tree
 	state *clientcore.NodeState
+	// replyGate extends delegation content handoff through the kernel's
+	// ReadResult.Done publication hook without blocking unrelated subtrees.
+	// Metadata is deliberately zero-TTL: go-fuse exposes no corresponding
+	// post-write hook for metadata replies.
+	replyGate *fusefrontend.ReplyGate
 	// g is the mount's machine-local dirs (grafts); nil when none are
 	// configured, so the non-graft hot path pays only nil checks.
 	g *localdirs.Grafts
@@ -132,7 +138,7 @@ func (n *fuseNode) newChild(ctx context.Context, name string, a *fsproto.Attr) *
 	if ino == 0 {
 		ino = clientcore.InoOf(cp)
 	}
-	child := &fuseNode{v: n.v, path: cp, state: clientcore.NewNodeState(ino, a.Ino != 0), g: n.g}
+	child := &fuseNode{v: n.v, path: cp, state: clientcore.NewNodeState(ino, a.Ino != 0), g: n.g, replyGate: n.replyGate}
 	return n.NewInode(ctx, child, fs.StableAttr{Mode: typeBits(a.Kind), Ino: ino})
 }
 
@@ -271,12 +277,16 @@ func (n *fuseNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	}
 	a, st := n.v.Lookup(ctx, cp)
 	if st != fsproto.OK {
-		out.SetEntryTimeout(n.v.AttrValidFor(cp))
+		out.SetEntryTimeout(0)
 		return nil, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	// go-fuse publishes metadata after this node callback returns, so no
+	// callback-scoped mutex can extend through the kernel write. Zero TTL is
+	// the exact contract: a reply may satisfy its overlapping syscall, but it
+	// can never repopulate persistent metadata after a delegation handoff.
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -287,7 +297,7 @@ func (n *fuseNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 		return errno(st)
 	}
 	fillAttr(p, &a, &out.Attr)
-	out.SetTimeout(n.v.AttrValidFor(p))
+	out.SetTimeout(0)
 	return 0
 }
 
@@ -326,11 +336,17 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 }
 
 func (n *fuseNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	data, st := n.v.Read(ctx, n.curPath(), n.state, off, len(dest))
+	p := n.curPath()
+	admission, err := n.replyGate.BeginRead(ctx, p)
+	if err != nil {
+		return nil, syscall.EINTR
+	}
+	data, st := n.v.Read(ctx, p, n.state, off, len(dest))
 	if st != fsproto.OK {
+		admission.Abort()
 		return nil, errno(st)
 	}
-	return fuse.ReadResultData(data), 0
+	return admission.Wrap(fuse.ReadResultData(data)), 0
 }
 
 func (n *fuseNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
@@ -365,8 +381,8 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, 
 		return nil, nil, 0, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	ch := n.newChild(ctx, name, &a)
 	if cn, ok := ch.Operations().(*fuseNode); ok {
 		// Count the just-opened handle so a peer unlink parks the inode
@@ -393,8 +409,8 @@ func (n *fuseNode) Mkdir(ctx context.Context, name string, mode uint32, out *fus
 		return nil, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -445,8 +461,8 @@ func (n *fuseNode) Symlink(ctx context.Context, target, name string, out *fuse.E
 		return nil, errno(st)
 	}
 	fillAttr(cp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(cp))
-	out.SetAttrTimeout(n.v.AttrValidFor(cp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -465,8 +481,8 @@ func (n *fuseNode) Link(ctx context.Context, target fs.InodeEmbedder, name strin
 		return nil, errno(st)
 	}
 	fillAttr(newp, &a, &out.Attr)
-	out.SetEntryTimeout(n.v.AttrValidFor(newp))
-	out.SetAttrTimeout(n.v.AttrValidFor(newp))
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	return n.newChild(ctx, name, &a), 0
 }
 
@@ -508,7 +524,7 @@ func (n *fuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 	if a.Kind != "" {
 		fillAttr(p, &a, &out.Attr)
 	}
-	out.SetTimeout(n.v.AttrValidFor(p))
+	out.SetTimeout(0)
 	return 0
 }
 
@@ -639,13 +655,25 @@ func invalidatePath(root *fs.Inode, path string, inPlace bool) {
 // Grafted subtrees are skipped: their kernel cache is backed by machine-local
 // disk that no authority event can invalidate.
 func flushAll(n *fs.Inode) {
-	for _, child := range n.Children() {
-		if localdirs.IsLocalNode(child.Operations()) {
-			continue
-		}
-		_ = child.NotifyContent(0, 0)
-		flushAll(child)
+	_ = flushAllExact(n)
+}
+
+// flushAllExact is the delegation-handoff boundary: success means every
+// currently materialized non-grafted vnode under n accepted its content
+// invalidation before the authority grant is released.
+func flushAllExact(n *fs.Inode) error {
+	if localdirs.IsLocalNode(n.Operations()) {
+		return nil
 	}
+	if errno := n.NotifyContent(0, 0); errno != 0 {
+		return errno
+	}
+	for _, child := range n.Children() {
+		if err := flushAllExact(child); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // fuseMount is one live in-process FUSE mount.
@@ -697,6 +725,7 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 		mu   sync.Mutex
 		node *fuseNode
 	}
+	var frontendReplies fusefrontend.ReplyGate
 	rootInode := func() *fs.Inode {
 		rootHolder.mu.Lock()
 		defer rootHolder.mu.Unlock()
@@ -709,6 +738,32 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 	// contributes) and before any invalidation goroutine starts; the closures
 	// below only run from those goroutines.
 	var grafts *localdirs.Grafts
+	flushFrontend := func(path string) {
+		root := rootInode()
+		if root == nil {
+			return
+		}
+		if path == "" {
+			flushAll(root)
+			return
+		}
+		if in := walkInode(root, path); in != nil {
+			flushAll(in)
+		}
+	}
+	flushFrontendExact := func(path string) error {
+		root := rootInode()
+		if root == nil {
+			return nil
+		}
+		if path == "" {
+			return flushAllExact(root)
+		}
+		if in := walkInode(root, path); in != nil {
+			return flushAllExact(in)
+		}
+		return nil
+	}
 	vol, err := clientcore.Dial(context.Background(), clientcore.Options{
 		Addr:             addr,
 		Pool:             16,
@@ -724,19 +779,10 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 		Branch:          perf.branch,
 		NegativeCache:   perf.negativeCache,
 		NoNegativeCache: perf.negativeCacheOff,
-		OnFlushAll: func(path string) {
-			root := rootInode()
-			if root == nil {
-				return
-			}
-			if path == "" {
-				flushAll(root)
-				return
-			}
-			if in := walkInode(root, path); in != nil {
-				flushAll(in)
-			}
-		},
+		OnFlushAll:      flushFrontend,
+		OnHandoffStart:  frontendReplies.BeginHandoff,
+		OnHandoffEnd:    frontendReplies.EndHandoff,
+		OnHandoffFlush:  flushFrontendExact,
 		OnInvalidate: func(path string, inPlace bool) {
 			if grafts.Owner(path) != "" {
 				// Volume changes under a graft are shadowed by machine-local
@@ -810,10 +856,7 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 			EnableLocks:       true,
 		},
 	}
-	root := &fuseNode{v: vol, state: clientcore.NewNodeState(1, true), g: grafts}
-	rootHolder.mu.Lock()
-	rootHolder.node = root
-	rootHolder.mu.Unlock()
+	root := &fuseNode{v: vol, state: clientcore.NewNodeState(1, true), g: grafts, replyGate: &frontendReplies}
 	if mountMechanism == "helper" {
 		if err := validateSelectedFUSEHelper(fuseHelperPath, mounthost.FUSEHelper); err != nil {
 			_ = grafts.Close()
@@ -821,8 +864,21 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 			return nil, err
 		}
 	}
-	server, err := mountNodeFS(mountPath, root, opts, mountMechanism, fuseHelperPath)
+	server, err := mountNodeFS(mountPath, root, opts, mountMechanism, fuseHelperPath, func() {
+		// NewNodeFS has initialized the embedded inode and NewServer has
+		// installed the notification bridge, but Serve has not begun. Publish
+		// in this exact gap: asynchronous handoff flushes can safely traverse
+		// the tree before the first kernel reply can populate a cache.
+		rootHolder.mu.Lock()
+		rootHolder.node = root
+		rootHolder.mu.Unlock()
+	})
 	if err != nil {
+		rootHolder.mu.Lock()
+		if rootHolder.node == root {
+			rootHolder.node = nil
+		}
+		rootHolder.mu.Unlock()
 		_ = grafts.Close()
 		_ = vol.Close()
 		return nil, fmt.Errorf("mount %s: %w", mountPath, err)

@@ -9,13 +9,16 @@ package fsproto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
@@ -97,6 +100,76 @@ func pipeClient(t *testing.T, dial func() (net.Conn, error), owner string) *Clie
 	c.SetOwner(owner)
 	t.Cleanup(func() { _ = c.Close() })
 	return c
+}
+
+type blockingLstatFS struct {
+	billy.Filesystem
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingLstatFS) Lstat(path string) (os.FileInfo, error) {
+	f.once.Do(func() { close(f.entered) })
+	<-f.release
+	return f.Filesystem.Lstat(path)
+}
+
+func TestGetattrVContextInterruptsBlockedAuthoritySample(t *testing.T) {
+	base := newManagedWorkFS(t, nil, nopBlobs{}, filepath.Join(t.TempDir(), "blocked-getattr.wal"))
+	blocked := &blockingLstatFS{
+		Filesystem: base,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	server := NewServer(blocked, base)
+	listener := newPipeListener()
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		_ = server.Serve(serverCtx, listener)
+	}()
+	t.Cleanup(func() {
+		close(blocked.release)
+		stopServer()
+		_ = listener.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(5 * time.Second):
+			t.Error("blocked getattr authority did not stop")
+		}
+	})
+	client, err := DialWithTransport(1, listener.dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, _, _, err := client.GetattrVContext(ctx, "blocked")
+		result <- err
+	}()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("authority getattr did not block in Lstat")
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("GetattrVContext error=%v want context.Canceled", err)
+		}
+		if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+			t.Fatalf("GetattrVContext cancellation took %v", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GetattrVContext ignored cancellation while authority was blocked")
+	}
 }
 
 func TestPipeClientExactEndToEnd(t *testing.T) {
