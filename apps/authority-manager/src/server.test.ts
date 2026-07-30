@@ -1152,8 +1152,8 @@ describe("access-lease data-plane tunnels", () => {
     const client = await connectClient(routerAddress);
     await writeTokenFrame(client, token);
     const ack = await readExactly(client, 1);
-    expect(ack[0]).toBe(1);
     client.destroy();
+    expect(ack[0]).toBe(1);
   }
 
   function waitForClose(socket: Socket): Promise<void> {
@@ -1265,12 +1265,20 @@ describe("access-lease data-plane tunnels", () => {
 
   test("the expiry sweep closes live tunnels without any caller action", async () => {
     const harness = await startLeaseRouter();
-    const { accessToken } = await createLease(harness.service, 1_000);
+    const { lease, accessToken } = await createLease(harness.service, 1_000);
     const client = await openTunnel(harness.routerAddress, accessToken);
 
-    // The single unref'd expiry timer ends the lease projection, which
-    // closes the registered tunnel with no request touching the lease.
+    // The single unref'd expiry timer reaches the conservative authorization
+    // deadline and closes the registered tunnel with no request touching the
+    // lease. A database recheck may prove that the row still has runway and
+    // briefly reauthorize it; that never revives the already-closed tunnel.
     await waitForClose(client);
+
+    // Once the database expiry returned by create is in the past, the next
+    // handshake must remain rejected. Waiting for that exact durable boundary
+    // avoids confusing the intentional pre-expiry guard with final expiry.
+    const untilDurableExpiryMs = Math.max(0, lease.expiresAt - Date.now());
+    await new Promise((resolve) => setTimeout(resolve, untilDurableExpiryMs + 50));
     await expectHandshakeRejected(harness.routerAddress, accessToken);
   });
 });
