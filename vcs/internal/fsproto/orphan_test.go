@@ -154,6 +154,13 @@ func TestCrossMountRenameOverInvalidationRedirectsPeerTarget(t *testing.T) {
 	if data, st, err := cliB.Read("dst.txt", 0, 64); err != nil || st != OK || string(data) != "old-dst" {
 		t.Fatalf("peer pre-open target read = %q st=%d err=%v", data, st, err)
 	}
+	attr, st, err := cliB.Getattr("dst.txt")
+	if err != nil || st != OK || attr.Ino == 0 {
+		t.Fatalf("peer pre-open target getattr = %+v st=%d err=%v", attr, st, err)
+	}
+	if st, err := cliB.MarkOpen(attr.Ino); err != nil || st != OK {
+		t.Fatalf("peer target mark open: st=%d err=%v", st, err)
+	}
 
 	sub, _, err := cliB.Subscribe()
 	if err != nil {
