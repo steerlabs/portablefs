@@ -1264,7 +1264,9 @@ func (e *Engine) chtimes(ctx context.Context, r wal.Record) (bool, error) {
 	if r.ChtimesSetAtime {
 		n.AtimeMs = r.AtimeMs
 	}
-	n.MtimeMs = r.MtimeMs
+	if !r.ChtimesKeepMtime {
+		n.MtimeMs = r.MtimeMs
+	}
 	return true, e.putResolved(ctx, n, orphaned)
 }
 

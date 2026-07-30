@@ -265,15 +265,17 @@ type Request struct {
 	Data         []byte // OpWrite payload
 	// Append marks an O_APPEND write. Offset must be zero and is ignored;
 	// the authority resolves EOF atomically in sequencer order.
-	Append  bool
-	MtimeMs int64  // OpSetattr
-	SetMode bool   // OpSetattr: apply Mode
-	SetTime bool   // OpSetattr: apply MtimeMs
-	UID     uint32 // OpSetattr: owner
-	GID     uint32 // OpSetattr: group
-	SetUID  bool   // OpSetattr: apply UID (else leave unchanged)
-	SetGID  bool   // OpSetattr: apply GID (else leave unchanged)
-	Owner   string // OpCheckout/OpCheckin/mutations: delegation owner
+	Append   bool
+	MtimeMs  int64  // OpSetattr
+	AtimeMs  int64  // OpSetattr
+	SetMode  bool   // OpSetattr: apply Mode
+	SetTime  bool   // OpSetattr: apply MtimeMs
+	SetATime bool   // OpSetattr: apply AtimeMs
+	UID      uint32 // OpSetattr: owner
+	GID      uint32 // OpSetattr: group
+	SetUID   bool   // OpSetattr: apply UID (else leave unchanged)
+	SetGID   bool   // OpSetattr: apply GID (else leave unchanged)
+	Owner    string // OpCheckout/OpCheckin/mutations: delegation owner
 
 	// OpFlushBatch: a write-back session's buffered mutations. Records carry the mount's
 	// LOCAL WAL Seqs; the authority dedups on these (drops Seq < watermark) for

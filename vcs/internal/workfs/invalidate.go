@@ -108,6 +108,16 @@ func drainAndFlush(ch chan coherence.Batch, gen, pos uint64) {
 func (fs *FS) changesFor(r wal.Record, owner string, version, orphanIno uint64, relatedInos ...uint64) []coherence.Invalidation {
 	paths := affectedPaths(r)
 	out := make([]coherence.Invalidation, 0, len(paths))
+	if len(paths) == 0 && r.Ino != 0 && isInPlaceOp(r.Op) {
+		// A retained live inode may have no trustworthy name on the mutating
+		// mount while another mount knows one or more hard-link aliases. Emit
+		// an inode-scoped event instead of inventing a stale path. RelatedInos
+		// gives each subscriber the exact identity it needs for alias fan-out.
+		return []coherence.Invalidation{{
+			Version: version, Owner: owner, Gen: fs.generation,
+			InPlace: true, RelatedInos: append([]uint64(nil), relatedInos...),
+		}}
+	}
 
 	// When this mutation parked a node, find which vanished name it parked so a peer mount with that
 	// path open can redirect to ino-addressed orphan I/O (the others are plain evictions).

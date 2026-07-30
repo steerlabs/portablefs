@@ -168,7 +168,7 @@ func marshalBody(v any) (int, []byte, error) {
 	case *OpenReply:
 		return 66, marshalOpenReply(m), nil
 	case *CloseReply:
-		return 67, nil, nil
+		return 67, marshalCloseReply(m), nil
 	case *ReadReply:
 		return 68, marshalReadReply(m), nil
 	case *WriteReply:
@@ -285,7 +285,7 @@ func unmarshalBody(num int, b []byte) (any, error) {
 	case 66:
 		return unmarshalOpenReply(b)
 	case 67:
-		return &CloseReply{}, nil
+		return unmarshalCloseReply(b)
 	case 68:
 		return unmarshalReadReply(b)
 	case 69:
@@ -772,15 +772,22 @@ func unmarshalEnumerateReply(b []byte) (*EnumerateReply, error) {
 
 func marshalGetAttrRequest(m *GetAttrRequest) []byte {
 	var b []byte
-	return appendMsg(b, 1, marshalItem(&m.Item))
+	b = appendMsg(b, 1, marshalItem(&m.Item))
+	b = appendU64(b, 2, m.Handle)
+	return b
 }
 
 func unmarshalGetAttrRequest(b []byte) (*GetAttrRequest, error) {
 	m := &GetAttrRequest{}
 	return m, scan(b, func(num int, wt int, raw []byte) error {
-		if num == 1 {
+		switch num {
+		case 1:
 			item, err := parseItemField(wt, raw)
 			m.Item = item
+			return err
+		case 2:
+			var err error
+			m.Handle, err = scalarU64(wt, raw)
 			return err
 		}
 		return nil
@@ -825,6 +832,7 @@ func marshalSetAttrRequest(m *SetAttrRequest) []byte {
 	if m.AtimeMs != nil {
 		b = appendI64Present(b, 7, *m.AtimeMs)
 	}
+	b = appendU64(b, 8, m.Handle)
 	return b
 }
 
@@ -864,6 +872,8 @@ func unmarshalSetAttrRequest(b []byte) (*SetAttrRequest, error) {
 			v, err = scalarU64(wt, raw)
 			vv := int64(v)
 			m.AtimeMs = &vv
+		case 8:
+			m.Handle, err = scalarU64(wt, raw)
 		}
 		return err
 	})
@@ -938,6 +948,34 @@ func unmarshalCloseRequest(b []byte) (*CloseRequest, error) {
 			v, err := scalarU64(wt, raw)
 			m.Handle = v
 			return err
+		}
+		return nil
+	})
+}
+
+func marshalCloseReply(m *CloseReply) []byte {
+	var b []byte
+	b = appendBool(b, 1, m.Retired)
+	b = appendI32(b, 2, m.CloseErrno)
+	return b
+}
+
+func unmarshalCloseReply(b []byte) (*CloseReply, error) {
+	m := &CloseReply{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		switch num {
+		case 1:
+			v, err := scalarU64(wt, raw)
+			if err != nil {
+				return err
+			}
+			m.Retired = v != 0
+		case 2:
+			v, err := scalarU64(wt, raw)
+			if err != nil {
+				return err
+			}
+			m.CloseErrno = int32(v)
 		}
 		return nil
 	})
@@ -1321,6 +1359,7 @@ func marshalXattrGetRequest(m *XattrGetRequest) []byte {
 	var b []byte
 	b = appendMsg(b, 1, marshalItem(&m.Item))
 	b = appendString(b, 2, m.Name)
+	b = appendU64(b, 3, m.Handle)
 	return b
 }
 
@@ -1335,6 +1374,8 @@ func unmarshalXattrGetRequest(b []byte) (*XattrGetRequest, error) {
 			var v []byte
 			v, err = scalarBytes(wt, raw)
 			m.Name = string(v)
+		case 3:
+			m.Handle, err = scalarU64(wt, raw)
 		}
 		return err
 	})
@@ -1364,6 +1405,7 @@ func marshalXattrSetRequest(m *XattrSetRequest) []byte {
 	b = appendBytesField(b, 3, m.Value)
 	b = appendBool(b, 4, m.CreateOnly)
 	b = appendBool(b, 5, m.ReplaceOnly)
+	b = appendU64(b, 6, m.Handle)
 	return b
 }
 
@@ -1384,6 +1426,8 @@ func unmarshalXattrSetRequest(b []byte) (*XattrSetRequest, error) {
 			m.CreateOnly, err = scalarBool(wt, raw)
 		case 5:
 			m.ReplaceOnly, err = scalarBool(wt, raw)
+		case 6:
+			m.Handle, err = scalarU64(wt, raw)
 		}
 		return err
 	})
@@ -1391,15 +1435,22 @@ func unmarshalXattrSetRequest(b []byte) (*XattrSetRequest, error) {
 
 func marshalXattrListRequest(m *XattrListRequest) []byte {
 	var b []byte
-	return appendMsg(b, 1, marshalItem(&m.Item))
+	b = appendMsg(b, 1, marshalItem(&m.Item))
+	b = appendU64(b, 2, m.Handle)
+	return b
 }
 
 func unmarshalXattrListRequest(b []byte) (*XattrListRequest, error) {
 	m := &XattrListRequest{}
 	return m, scan(b, func(num int, wt int, raw []byte) error {
-		if num == 1 {
+		switch num {
+		case 1:
 			item, err := parseItemField(wt, raw)
 			m.Item = item
+			return err
+		case 2:
+			var err error
+			m.Handle, err = scalarU64(wt, raw)
 			return err
 		}
 		return nil
@@ -1430,6 +1481,7 @@ func marshalXattrRemoveRequest(m *XattrRemoveRequest) []byte {
 	var b []byte
 	b = appendMsg(b, 1, marshalItem(&m.Item))
 	b = appendString(b, 2, m.Name)
+	b = appendU64(b, 3, m.Handle)
 	return b
 }
 
@@ -1444,6 +1496,8 @@ func unmarshalXattrRemoveRequest(b []byte) (*XattrRemoveRequest, error) {
 			var v []byte
 			v, err = scalarBytes(wt, raw)
 			m.Name = string(v)
+		case 3:
+			m.Handle, err = scalarU64(wt, raw)
 		}
 		return err
 	})

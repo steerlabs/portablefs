@@ -1351,6 +1351,19 @@ func TestWriteThroughRenameOverTargetHandlePreservesReplacementBinding(t *testin
 
 	// The old target is detached but its descriptor remains a valid inode
 	// reference. Mutating it must never rebind its stale "target" pathname.
+	detachedAttr := c.call(&pfslocal.GetAttrRequest{
+		Item: target.Attr.Item, Handle: target.Handle,
+	}).(*pfslocal.GetAttrReply)
+	if detachedAttr.Attr.Nlink != 0 {
+		t.Fatalf("last-link detached target nlink=%d want 0", detachedAttr.Attr.Nlink)
+	}
+	truncatedSize := uint64(3)
+	truncated := c.call(&pfslocal.SetAttrRequest{
+		Item: target.Attr.Item, Handle: target.Handle, Size: &truncatedSize,
+	}).(*pfslocal.SetAttrReply)
+	if truncated.Attr.Size != truncatedSize || truncated.Attr.Nlink != 0 {
+		t.Fatalf("detached truncate attr=%+v want size=3 nlink=0", truncated.Attr)
+	}
 	c.call(&pfslocal.WriteRequest{
 		Handle: target.Handle, Offset: 0, Data: []byte("old-updated"),
 	})
@@ -1379,7 +1392,162 @@ func TestWriteThroughRenameOverTargetHandlePreservesReplacementBinding(t *testin
 		t.Fatalf("replacement bytes after detached write=%q want new-target", gotReplacement.Data)
 	}
 	c.call(&pfslocal.CloseRequest{Handle: opened.Handle})
+	if er := c.callErr(&pfslocal.ReclaimRequest{Item: target.Attr.Item}); er.Errno != darwinEBUSY {
+		t.Fatalf("reclaim of open detached item errno=%d want EBUSY", er.Errno)
+	}
 	c.call(&pfslocal.CloseRequest{Handle: target.Handle})
+	if er := c.callErr(&pfslocal.GetAttrRequest{
+		Item: target.Attr.Item, Handle: target.Handle,
+	}); er.Errno != darwinENOENT {
+		t.Fatalf("closed detached handle getattr errno=%d want ENOENT", er.Errno)
+	}
+	c.call(&pfslocal.ReclaimRequest{Item: target.Attr.Item})
+}
+
+func TestDetachedHandleWithUnseenHardlinkUsesExactInode(t *testing.T) {
+	authority := serveAuthority(t)
+	cfg, hc, _, cancel := startDaemon(t, authority)
+	defer cancel()
+	ref := ensureAttach(t, hc, authority, "vol-detached-unseen-hardlink", "main", "/Volumes/DetachedUnseenHardlink")
+
+	c := dialPFS(t, cfg.FrontendSocket)
+	defer c.close()
+	c.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "detached-unseen-hardlink"})
+	root := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply).Root
+
+	target := c.call(&pfslocal.CreateRequest{
+		Dir: root, Name: []byte("target"), Mode: 0o644, Exclusive: true,
+	}).(*pfslocal.CreateReply)
+	c.call(&pfslocal.WriteRequest{Handle: target.Handle, Data: []byte("old-target")})
+	c.call(&pfslocal.SyncVolumeRequest{})
+	readOnlyTarget := c.call(&pfslocal.OpenRequest{
+		Item: target.Attr.Item, Mode: pfslocal.OpenModeRead,
+	}).(*pfslocal.OpenReply)
+
+	peer, err := fsproto.Dial(authority, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	linked, st, err := peer.Link("target", "unseen-alias")
+	if err != nil || st != fsproto.OK || linked == nil || linked.Nlink != 2 {
+		t.Fatalf("peer unseen hardlink: attr=%+v st=%d err=%v", linked, st, err)
+	}
+
+	replacement := c.call(&pfslocal.CreateRequest{
+		Dir: root, Name: []byte("replacement"), Mode: 0o644, Exclusive: true,
+	}).(*pfslocal.CreateReply)
+	c.call(&pfslocal.WriteRequest{Handle: replacement.Handle, Data: []byte("new-target")})
+	c.call(&pfslocal.CloseRequest{Handle: replacement.Handle})
+	c.call(&pfslocal.RenameRequest{
+		FromDir: root, FromName: []byte("replacement"),
+		ToDir: root, ToName: []byte("target"),
+	})
+	readOnlySize := uint64(1)
+	if er := c.callErr(&pfslocal.SetAttrRequest{
+		Item: target.Attr.Item, Handle: readOnlyTarget.Handle, Size: &readOnlySize,
+	}); er.Errno != darwinEBADF {
+		t.Fatalf("detached truncate through read-only handle errno=%d want EBADF", er.Errno)
+	}
+	readOnlyMode := uint32(0o640)
+	readOnlyMtime := int64(111_222)
+	readOnlyAttrs := c.call(&pfslocal.SetAttrRequest{
+		Item: target.Attr.Item, Handle: readOnlyTarget.Handle,
+		Mode: &readOnlyMode, MtimeMs: &readOnlyMtime,
+	}).(*pfslocal.SetAttrReply).Attr
+	if readOnlyAttrs.Mode != readOnlyMode || readOnlyAttrs.MtimeMs != readOnlyMtime ||
+		readOnlyAttrs.Size != uint64(len("old-target")) || readOnlyAttrs.Nlink != 1 {
+		t.Fatalf("detached metadata setattr through read-only handle=%+v", readOnlyAttrs)
+	}
+
+	mode := uint32(0o600)
+	size := uint64(3)
+	mtime := int64(123_456)
+	atime := int64(234_567)
+	attrs := c.call(&pfslocal.SetAttrRequest{
+		Item: target.Attr.Item, Handle: target.Handle,
+		Mode: &mode, Size: &size, MtimeMs: &mtime, AtimeMs: &atime,
+	}).(*pfslocal.SetAttrReply).Attr
+	if attrs.Size != size || attrs.Mode != mode || attrs.Nlink != 1 ||
+		attrs.MtimeMs != mtime || attrs.AtimeMs != atime {
+		t.Fatalf("detached exact setattr=%+v", attrs)
+	}
+
+	c.call(&pfslocal.XattrSetRequest{
+		Item: target.Attr.Item, Handle: target.Handle,
+		Name: "user.detached", Value: []byte("old-inode"),
+	})
+	if got := c.call(&pfslocal.XattrGetRequest{
+		Item: target.Attr.Item, Handle: target.Handle, Name: "user.detached",
+	}).(*pfslocal.XattrGetReply); string(got.Value) != "old-inode" {
+		t.Fatalf("detached xattr=%q want old-inode", got.Value)
+	}
+	if names := c.call(&pfslocal.XattrListRequest{
+		Item: target.Attr.Item, Handle: target.Handle,
+	}).(*pfslocal.XattrListReply).Names; stringsJoin(names) != "user.detached" {
+		t.Fatalf("detached xattr names=%v", names)
+	}
+
+	c.call(&pfslocal.WriteRequest{
+		Handle: target.Handle, Offset: 3, Data: []byte("-fd"),
+	})
+	gotOld := c.call(&pfslocal.ReadRequest{
+		Handle: target.Handle, Length: 32,
+	}).(*pfslocal.ReadReply)
+	if string(gotOld.Data) != "old-fd" {
+		t.Fatalf("detached handle bytes=%q want old-fd", gotOld.Data)
+	}
+
+	aliasBytes, st, err := peer.Read("unseen-alias", 0, 32)
+	if err != nil || st != fsproto.OK || string(aliasBytes) != "old-fd" {
+		t.Fatalf("unseen alias bytes=%q st=%d err=%v", aliasBytes, st, err)
+	}
+	aliasAttr, st, err := peer.Getattr("unseen-alias")
+	if err != nil || st != fsproto.OK || aliasAttr == nil ||
+		aliasAttr.Mode != mode || aliasAttr.Nlink != 1 || aliasAttr.Size != 6 {
+		t.Fatalf("unseen alias attrs=%+v st=%d err=%v", aliasAttr, st, err)
+	}
+	aliasXattr, st, err := peer.Getxattr("unseen-alias", 0, "user.detached")
+	if err != nil || st != fsproto.OK || string(aliasXattr) != "old-inode" {
+		t.Fatalf("unseen alias xattr=%q st=%d err=%v", aliasXattr, st, err)
+	}
+
+	lookup := c.call(&pfslocal.LookupRequest{
+		Dir: root, Name: []byte("target"),
+	}).(*pfslocal.LookupReply)
+	if lookup.Attr.Item != replacement.Attr.Item || lookup.Attr.Item == target.Attr.Item {
+		t.Fatalf("replacement binding old=%+v replacement=%+v got=%+v",
+			target.Attr.Item, replacement.Attr.Item, lookup.Attr.Item)
+	}
+	replacementHandle := c.call(&pfslocal.OpenRequest{
+		Item: lookup.Attr.Item, Mode: pfslocal.OpenModeRead,
+	}).(*pfslocal.OpenReply)
+	if er := c.callErr(&pfslocal.WriteRequest{
+		Handle: replacementHandle.Handle, Data: []byte("forbidden"),
+	}); er.Errno != darwinEBADF {
+		t.Fatalf("write through read-only handle errno=%d want EBADF", er.Errno)
+	}
+	replacementBytes := c.call(&pfslocal.ReadRequest{
+		Handle: replacementHandle.Handle, Length: 32,
+	}).(*pfslocal.ReadReply)
+	c.call(&pfslocal.CloseRequest{Handle: replacementHandle.Handle})
+	if string(replacementBytes.Data) != "new-target" || lookup.Attr.Mode != 0o644 {
+		t.Fatalf("replacement changed: bytes=%q attr=%+v", replacementBytes.Data, lookup.Attr)
+	}
+	if _, st, err := peer.Getxattr("target", 0, "user.detached"); err != nil || st != fsproto.ENODATA {
+		t.Fatalf("replacement inherited detached xattr: st=%d err=%v", st, err)
+	}
+
+	c.call(&pfslocal.XattrRemoveRequest{
+		Item: target.Attr.Item, Handle: target.Handle, Name: "user.detached",
+	})
+	c.call(&pfslocal.CloseRequest{Handle: readOnlyTarget.Handle})
+	c.call(&pfslocal.CloseRequest{Handle: target.Handle})
+	if er := c.callErr(&pfslocal.GetAttrRequest{
+		Item: target.Attr.Item, Handle: target.Handle,
+	}); er.Errno != darwinENOENT {
+		t.Fatalf("post-close detached getattr errno=%d want ENOENT", er.Errno)
+	}
 }
 
 func TestDaemonWritebackDoubleLockRenameDoesNotRecycleMovedItem(t *testing.T) {

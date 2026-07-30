@@ -1448,7 +1448,9 @@ func (fs *FS) applyMutationAs(r wal.Record, owner string) (uint64, bool, error) 
 		if r.ChtimesSetAtime {
 			n.atime = time.UnixMilli(r.AtimeMs)
 		}
-		n.mtime = time.UnixMilli(r.MtimeMs)
+		if !r.ChtimesKeepMtime {
+			n.mtime = time.UnixMilli(r.MtimeMs)
+		}
 		return 0, true, nil
 	case wal.OpChown:
 		n := fs.resolveForRW(r.Path, r.Ino)
@@ -1638,7 +1640,9 @@ func (fs *FS) applyManagedMutation(r wal.Record, owner string) (uint64, bool, er
 		if r.ChtimesSetAtime {
 			n.atime = time.UnixMilli(r.AtimeMs)
 		}
-		n.mtime = time.UnixMilli(r.MtimeMs)
+		if !r.ChtimesKeepMtime {
+			n.mtime = time.UnixMilli(r.MtimeMs)
+		}
 		return 0, true, nil
 	case wal.OpChown:
 		n := fs.resolveForRW(r.Path, r.Ino)

@@ -318,6 +318,31 @@ func TestProtocolSetattr(t *testing.T) {
 	}
 }
 
+func TestProtocolSetattrAtimeOnlyPreservesMtime(t *testing.T) {
+	c := serve(t)
+	created, st, err := c.Create("times", 0o644)
+	if err != nil || st != OK || created == nil {
+		t.Fatalf("create attr=%+v st=%d err=%v", created, st, err)
+	}
+	const atime = int64(123_456_789)
+	if st, err := c.SetattrTimesHandle(
+		"times", 0,
+		0, false,
+		0, false,
+		atime, true,
+		0, 0, false, false,
+	); err != nil || st != OK {
+		t.Fatalf("atime-only setattr st=%d err=%v", st, err)
+	}
+	got, st, err := c.Getattr("times")
+	if err != nil || st != OK || got == nil {
+		t.Fatalf("getattr attr=%+v st=%d err=%v", got, st, err)
+	}
+	if got.AtimeMs != atime || got.MtimeMs != created.MtimeMs {
+		t.Fatalf("times after atime-only setattr=%+v created=%+v", got, created)
+	}
+}
+
 // TestProtocolChown checks ownership over the protocol: set uid+gid, then gid only
 // (uid preserved), and that getattr reports the owner.
 func TestProtocolChown(t *testing.T) {

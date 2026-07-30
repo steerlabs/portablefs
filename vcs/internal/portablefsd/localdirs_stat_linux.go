@@ -18,7 +18,5 @@ func applyLocalStatTimes(fi fs.FileInfo, attr *fsproto.Attr) {
 	}
 	attr.CtimeMs = time.Unix(st.Ctim.Sec, st.Ctim.Nsec).UnixMilli()
 	attr.AtimeMs = time.Unix(st.Atim.Sec, st.Atim.Nsec).UnixMilli()
-	if st.Nlink > 0 {
-		attr.Nlink = uint32(st.Nlink)
-	}
+	attr.Nlink = uint32(st.Nlink)
 }

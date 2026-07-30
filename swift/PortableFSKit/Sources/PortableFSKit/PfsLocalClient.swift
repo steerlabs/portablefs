@@ -486,7 +486,7 @@ public actor PfsLocalClient {
     private func helloOnCurrentConnection() async throws {
         var hello = PfsHello()
         hello.protocolMajor = 1
-        hello.protocolMinor = 3
+        hello.protocolMinor = 4
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -494,7 +494,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 3 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 4 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
     }

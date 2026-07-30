@@ -49,6 +49,8 @@ func (e *Engine) acquire(ctx context.Context, scope string) (bool, error) {
 // rebound on the next attach); it is never reinterpreted as a denial that
 // forks the mutation lanes mid-session.
 func (e *Engine) resolveAcquire(scope string, flight *acquireFlight) {
+	e.exactMu.RLock()
+	defer e.exactMu.RUnlock()
 	defer func() {
 		e.acquireMu.Lock()
 		delete(e.acquiring, scope)
@@ -479,6 +481,39 @@ func (e *Engine) ReleaseFor(ctx context.Context, paths ...string) error {
 	}
 	e.mu.Unlock()
 	return e.runReleaseClaims(ctx, claims)
+}
+
+// BeginExact drains and releases every delegation retained by this engine,
+// then excludes new asynchronous acquisition until the returned end function
+// is called. It is reserved for stable-inode operations whose namespace
+// aliases are all unknown: no pathname can prove which delegation may contain
+// acknowledged state for that inode.
+//
+// Acquisition resolvers hold exactMu shared for their complete lifetime. This
+// includes the deliberate detached-resolution interval after their initiating
+// request times out, so BeginExact cannot miss an in-flight grant that later
+// installs while the exact authority operation is running.
+func (e *Engine) BeginExact(ctx context.Context) (end func(), err error) {
+	e.exactMu.Lock()
+	end = e.exactMu.Unlock
+	if err := e.MutationError(); err != nil {
+		end()
+		return nil, err
+	}
+	if e.held.Load() == 0 {
+		return end, nil
+	}
+	e.mu.Lock()
+	claims := make([]releaseClaim, 0, len(e.delegations))
+	for _, d := range e.delegations {
+		claims = append(claims, e.claimReleaseLocked(ctx, d))
+	}
+	e.mu.Unlock()
+	if err := e.runReleaseClaims(ctx, claims); err != nil {
+		end()
+		return nil, err
+	}
+	return end, nil
 }
 
 // dropScopeStateLocked drops every overlay view under scope: the delegation
