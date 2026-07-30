@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -9,6 +11,40 @@ import (
 	"testing"
 	"time"
 )
+
+func TestStartedChildIdentityFailurePreservesAdvancedIntent(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "mounts")
+	mountPath := filepath.Join(t.TempDir(), "mount")
+	operation, err := acquireMountOperation(stateDir, mountPath, "volume", "main", "fuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.close(false)
+	identity, err := processStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation.mountInstanceID = "mnt_AAAAAAAAAAAAAAAAAAAAAA"
+	operation.mountMechanism = "direct"
+	if err := operation.writeIntent("mounting", os.Getpid(), identity); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command("sleep", "60")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	err = terminateUnidentifiedStartedMount(child, operation, fmt.Errorf("injected identity read failure"))
+	if err == nil || !strings.Contains(err.Error(), "explicit exact reconciliation") {
+		t.Fatalf("termination error = %v", err)
+	}
+	intent, err := readMountIntent(operation.intentPath, mountPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent == nil || intent.Phase != "mounting" || intent.MountInstanceID != operation.mountInstanceID {
+		t.Fatalf("advanced intent was removed or changed: %+v", intent)
+	}
+}
 
 func TestIsMountpoint(t *testing.T) {
 	dir := t.TempDir()
@@ -49,7 +85,10 @@ func umountTestEnv(t *testing.T) (e *cmdEnv, stdout, stderr *bytes.Buffer, state
 // and state.
 func TestUmountOrphanedMountWithoutAttachRefFailsClosed(t *testing.T) {
 	e, _, stderr, stateDir := umountTestEnv(t)
-	mountPath := t.TempDir() // ordinary directory: nothing mounted on it
+	mountPath, err := canonicalMountPath(t.TempDir()) // ordinary directory: nothing mounted on it
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// A fake mount daemon that is genuinely alive. Reap it in the background
 	// so pidAlive flips false the moment it dies, like a real daemon that
@@ -65,17 +104,25 @@ func TestUmountOrphanedMountWithoutAttachRefFailsClosed(t *testing.T) {
 		<-daemonDone
 	})
 
-	if err := writeMountState(stateDir, mountState{
+	daemonIdentity, err := processStartIdentity(daemon.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidState := mountState{
 		MountPath: mountPath, VolumeID: "vol_orphan", Branch: "main",
-		PID: daemon.Process.Pid, Strategy: "fskit",
-	}); err != nil {
+		PID: daemon.Process.Pid, ProcessStartIdentity: daemonIdentity, Strategy: "fskit",
+	}
+	writeRawMountState(t, stateDir, invalidState)
+	statePath := mountStatePath(stateDir, mountPath)
+	before, err := os.ReadFile(statePath)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	if rc := e.run([]string{"umount", mountPath}); rc == 0 {
 		t.Fatalf("umount unexpectedly succeeded, stderr: %q", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "unsupported recorded mount strategy") ||
+	if !strings.Contains(stderr.String(), "incomplete mount instance identity") ||
 		!strings.Contains(stderr.String(), "nothing was unmounted") {
 		t.Fatalf("fail-closed explanation missing: %q", stderr.String())
 	}
@@ -84,29 +131,39 @@ func TestUmountOrphanedMountWithoutAttachRefFailsClosed(t *testing.T) {
 		t.Fatal("fail-closed unmount stopped the daemon")
 	case <-time.After(100 * time.Millisecond):
 	}
-	if st, err := readMountState(stateDir, mountPath); err != nil || st == nil {
-		t.Fatalf("mount state must remain: %+v %v", st, err)
+	after, err := os.ReadFile(statePath)
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("invalid mount-state evidence changed: err=%v before=%q after=%q", err, before, after)
 	}
 }
 
 // TestUmountDeadDaemonWithoutDrainProofFailsClosed pins stale-state handling.
 func TestUmountDeadDaemonWithoutDrainProofFailsClosed(t *testing.T) {
 	e, _, stderr, stateDir := umountTestEnv(t)
-	mountPath := t.TempDir()
-	if err := writeMountState(stateDir, mountState{
+	mountPath, err := canonicalMountPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidState := mountState{
 		MountPath: mountPath, VolumeID: "vol_stale", Branch: "main",
-		PID: 4194000, Strategy: "fuse",
-	}); err != nil {
+		PID: 4194000, ProcessStartIdentity: "dead-process", Strategy: "fuse",
+	}
+	writeRawMountState(t, stateDir, invalidState)
+	statePath := mountStatePath(stateDir, mountPath)
+	before, err := os.ReadFile(statePath)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if rc := e.run([]string{"umount", mountPath, "--json"}); rc == 0 {
 		t.Fatalf("umount unexpectedly succeeded, stderr: %q", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "cannot prove a clean drain") {
+	if !strings.Contains(stderr.String(), "incomplete mount instance identity") ||
+		!strings.Contains(stderr.String(), "nothing was unmounted") {
 		t.Fatalf("fail-closed detail missing: %q", stderr.String())
 	}
-	if st, err := readMountState(stateDir, mountPath); err != nil || st == nil {
-		t.Fatalf("mount state must remain: %+v %v", st, err)
+	after, err := os.ReadFile(statePath)
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("invalid mount-state evidence changed: err=%v before=%q after=%q", err, before, after)
 	}
 }
 

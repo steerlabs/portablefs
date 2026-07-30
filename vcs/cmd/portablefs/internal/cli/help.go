@@ -47,6 +47,7 @@ MOUNTS (this machine)
   umount <path>                sync and detach one mounted volume
   mounts                       list active mounts
   daemon stop                  atomically stop portablefsd only when no attach exists
+  mount-check                  inspect mount prerequisites (no network or mutation)
 
 SESSION
   login [URL]                  authenticate and save credentials (device flow or --token)
@@ -70,7 +71,6 @@ CONFIGURATION (precedence: flags > environment > config file)
   PORTABLEFS_MANAGER_URL      authority manager URL (defaults to the API URL)
   PORTABLEFS_MANAGER_TOKEN    authority manager token (defaults to the API token)
   PORTABLEFS_MOUNT_TOKEN      data-plane token for mount --addr
-  PORTABLEFS_TLS_CA           CA bundle for data-plane TLS (alias of VCS_TLS_CA)
 
 Run ` + "`portablefs help <command>`" + ` for details and examples.
 `
@@ -113,6 +113,21 @@ holds no live session, WAL handle, or frontend service. The daemon first
 closes attach admission and persists its final idle state; if any live attach
 exists, the command fails without signaling or changing the daemon. The
 installer never invokes this automatically.
+`,
+		"lifecycle": `USAGE
+  portablefs lifecycle hold-shared --json
+  portablefs lifecycle hold-account-exclusive --json
+  portablefs lifecycle identity --json
+
+Internal app/installer coordination protocol. Acquires the fixed per-user
+mount lifecycle shared guard, writes one versioned readiness line, and holds
+the guard until stdin closes or the process receives SIGINT/SIGTERM.
+The account-exclusive form additionally performs strict mount and daemon
+attach inventory while held, then reports
+{"schemaVersion":1,"held":true,"mounts":0,"attaches":0}; the app holds it
+across atomic profile/config mutation.
+Identity prints the linker-stamped FSKit app group for packaging validation;
+portablefsd exposes the same JSON with ` + "`portablefsd -identity-json`" + `.
 `,
 		"create": `USAGE
   portablefs create [name] [--tenant id] [--json]
@@ -324,17 +339,22 @@ per-machine dirs once for every machine. See docs/agents.md.
 There is ONE transport per platform, with no fallbacks: macOS mounts through
 the PortableFS FSKit extension (install PortableFS.app and enable its File
 System Extension under System Settings once; the CLI manages the portablefsd
-daemon the extension talks to), and Linux mounts through FUSE (needs
-fusermount3/fusermount, e.g. ` + "`apt install fuse3`" + `). A host that cannot serve
+daemon the extension talks to), and Linux mounts through FUSE (direct
+mounting or one root-managed fusermount3/fusermount helper is selected from
+uncached host facts before the transaction starts). A host that cannot serve
 its platform's transport fails with guidance instead of degrading to a
 weaker consistency model.
 
 --addr mounts a VCS authority directly (skipping the manager); pass the data
-plane token via --mount-token, PORTABLEFS_MOUNT_TOKEN, or VCS_AUTH_TOKEN. TLS
-uses PORTABLEFS_TLS_CA / VCS_TLS_CA. FSKit extension coordinates (fs type,
-daemon sockets, daemon binary) override via PORTABLEFS_FSKIT_TYPE,
-PORTABLEFS_FSKIT_SOCKET, PORTABLEFS_FSKIT_CONTROL_SOCKET, and
-PORTABLEFS_FSKIT_DAEMON.
+plane token via --mount-token, PORTABLEFS_MOUNT_TOKEN, or VCS_AUTH_TOKEN, and
+choose exactly one --data-plane-transport. tls-system-pki also requires
+--data-plane-server-name; tls-private-ca requires that name plus
+--data-plane-ca <ca.pem>; plaintext must be selected by name. No missing CA or
+environment variable silently selects plaintext. FSKit extension coordinates (fs type,
+daemon sockets) override explicitly via PORTABLEFS_FSKIT_TYPE,
+PORTABLEFS_FSKIT_SOCKET, and PORTABLEFS_FSKIT_CONTROL_SOCKET. The daemon is
+always the exact portablefsd sibling from the same installed release;
+PORTABLEFS_FSKIT_DAEMON is rejected.
 
 EXAMPLES
   portablefs mount my-workspace ~/work
@@ -355,8 +375,11 @@ recovery job (its ID is printed) and is verified and replayed on the next attach
 of the same volume+branch. Use it when the authority is unreachable and you
 need the mount gone NOW.
 
-Uses one platform unmount command (/sbin/umount on macOS, fusermount3 on
-Linux), then terminates the recorded daemon pid and removes the mount state.
+On macOS, portablefsd owns one frozen drain + exact FSKit kernel unmount +
+durable attach-removal transaction. On Linux, unmount uses exactly the direct
+or pinned-helper mechanism recorded when that mount was created; it never
+switches mechanisms after a failure. The command then reconciles the exact
+recorded process, resources, access lease, and mount state.
 Missing state or missing drain proof fails closed; PortableFS never substitutes
 an unverified plain unmount.
 `,
@@ -369,6 +392,21 @@ running but the server rejected its credentials — revoked or expired keys;
 run ` + "`portablefs login`" + ` and remount). The same transition is logged once in
 the mount's log file under ~/.local/state/portablefs/mounts/.
 `,
+		"mount-check": `USAGE
+  portablefs mount-check [--strategy auto|fskit|fuse] [--json]
+
+Inspect the current host's mount transport without contacting a server,
+starting a daemon, or changing the machine. Transport selection is
+deterministic: FSKit on macOS and FUSE on Linux. The result is one of:
+
+  VERIFIED    a recorded live mount answered filesystem operations
+  BLOCKED     a definite current prerequisite is absent
+  UNVERIFIED  no definite blocker was found; only a real mount can prove it
+
+Installed helpers, capabilities, app bundles, and PlugInKit inventory are
+evidence, never proof. JSON output carries stable issue codes for installers
+and other automation. BLOCKED exits 1; VERIFIED and UNVERIFIED exit 0.
+`,
 		"doctor": `USAGE
   portablefs doctor [--profile name] [--json]
 
@@ -377,11 +415,12 @@ in order: the config file parses (listing every profile's server and the
 active one), the active server answers a cheap GET (an unauthenticated
 401/404 still proves it is there), the saved token is still accepted, this
 binary meets the server's advertised minimum CLI version, and — on macOS —
-the FSKit extension registration state (via pluginkit, including the known
-post-update staleness where the extension shows enabled but mounts fail),
-portablefsd daemon health, and this machine's recorded mounts.
+the selected mount transport, FSKit PlugInKit inventory (which does not claim
+enablement), portablefsd daemon health, and this machine's recorded mounts.
 
-Each check prints PASS, FAIL, or SKIP with a one-line fix for every FAIL.
+Each check prints PASS, FAIL, UNKNOWN, or SKIP with a one-line fix for every
+definite FAIL. UNKNOWN is an honest unverified state and does not change the
+exit code.
 Exit code 1 if any check fails, 0 otherwise. Nothing is modified.
 
 EXAMPLES

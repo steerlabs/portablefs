@@ -19,7 +19,7 @@ func TestLegacyConflictBlocksRegistryAttachReadiness(t *testing.T) {
 	ctx := context.Background()
 	authority := serveAuthority(t)
 	seed, err := clientcore.Dial(ctx, clientcore.Options{
-		Addr: authority, Pool: 2, WALDir: t.TempDir(), VolumeID: "legacy-gate-seed", Branch: "main",
+		Addr: authority, Pool: 2, WALDir: privateTestDir(t), VolumeID: "legacy-gate-seed", Branch: "main",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestLegacyConflictBlocksRegistryAttachReadiness(t *testing.T) {
 	}
 
 	const volumeID, branch = "legacy-gate", "main"
-	stateDir := t.TempDir()
+	stateDir := privateTestDir(t)
 	walPath := writeLegacyStartupRecord(t, stateDir, volumeID, branch, wal.Record{
 		Op: wal.OpMkdir, Path: "startup-conflict", Mode: 0o755, Inos: []uint64{file.Ino},
 	})
@@ -52,6 +52,7 @@ func TestLegacyConflictBlocksRegistryAttachReadiness(t *testing.T) {
 	t.Cleanup(r.stopPersister)
 	a, created, err := r.ensure(ctx, ensureAttachRequest{
 		VolumeID: volumeID, Branch: branch, AuthorityURL: authority, MountPath: "/Volumes/LegacyGate",
+		DataPlaneTransport: "plaintext",
 	})
 	if !errors.Is(err, errLegacyAdoptionConflict) {
 		t.Fatalf("ensure error = %v, want legacy adoption conflict", err)
@@ -75,7 +76,7 @@ func TestCorruptLegacyWALLeavesAttachUnstartedAndDebtVisible(t *testing.T) {
 	authority := serveAuthority(t)
 
 	const volumeID, branch = "legacy-corrupt-gate", "main"
-	stateDir := t.TempDir()
+	stateDir := privateTestDir(t)
 	store := filepath.Join(stateDir, "wal", stableStorageID(storageKey(volumeID, branch)))
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		t.Fatal(err)
@@ -89,6 +90,7 @@ func TestCorruptLegacyWALLeavesAttachUnstartedAndDebtVisible(t *testing.T) {
 
 	req := ensureAttachRequest{
 		VolumeID: volumeID, Branch: branch, AuthorityURL: authority, MountPath: "/Volumes/LegacyCorrupt",
+		DataPlaneTransport: "plaintext",
 	}
 	a := newAttach("legacy-corrupt-ref", attachKey(volumeID, branch, req.MountPath), req, stateDir)
 	err := a.activate(ctx, "")

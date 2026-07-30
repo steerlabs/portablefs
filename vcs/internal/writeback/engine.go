@@ -227,6 +227,13 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A force-park proof is bound to the exact mount transaction that was
+	// detached. Once a new engine exclusively owns the store, that proof must
+	// not survive to authorize a later transaction over the same store.
+	if err := clearForceParkProof(cfg.StateDir); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
 	mountID, err := ensureMountID(cfg.StateDir)
 	if err != nil {
 		_ = lock.Close()
@@ -410,6 +417,13 @@ func (e *Engine) MutationError() error {
 		return failure.err
 	}
 	return nil
+}
+
+// KeepWritebackFrozenError is implemented by a finalizer error when thawing
+// would violate a durable external transaction marker. CloseWithBarrier
+// seals mutation admission for the process lifetime in that case.
+type KeepWritebackFrozenError interface {
+	KeepWritebackFrozen() bool
 }
 
 // failClosed latches the first terminal verdict. The failure is deliberately
@@ -1530,6 +1544,10 @@ func (e *Engine) CloseWithBarrier(ctx context.Context, barrier func() error) err
 	}
 	if barrier != nil {
 		if err := barrier(); err != nil {
+			var keepFrozen KeepWritebackFrozenError
+			if errors.As(err, &keepFrozen) && keepFrozen.KeepWritebackFrozen() {
+				return e.failClosed(err)
+			}
 			e.thawAfterFailedClose()
 			return err
 		}

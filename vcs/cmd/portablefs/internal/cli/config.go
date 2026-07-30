@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
+	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 // Profile is one saved credential set in the config file.
@@ -13,11 +17,6 @@ type Profile struct {
 	APIToken     string `json:"apiToken"`
 	ManagerUrl   string `json:"managerUrl"`
 	ManagerToken string `json:"managerToken"`
-	// DataPlaneCAPEM is the CA bundle that signs the deployment's data-plane
-	// router certificate, captured from GET <apiUrl>/router-ca.pem at login.
-	// Mounts dial the router with this trust anchor so TLS works without any
-	// local file or env setup; PORTABLEFS_TLS_CA / VCS_TLS_CA override it.
-	DataPlaneCAPEM string `json:"dataPlaneCaPem,omitempty"`
 }
 
 // Config is the on-disk shape of ~/.config/portablefs/config.json.
@@ -27,12 +26,9 @@ type Config struct {
 }
 
 func defaultConfigPath() (string, error) {
-	if base := os.Getenv("XDG_CONFIG_HOME"); base != "" {
-		return filepath.Join(base, "portablefs", "config.json"), nil
-	}
-	home, err := os.UserHomeDir()
+	home, err := accountpath.Home()
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory for config file: %w", err)
+		return "", fmt.Errorf("resolve account home for config file: %w", err)
 	}
 	return filepath.Join(home, ".config", "portablefs", "config.json"), nil
 }
@@ -40,7 +36,7 @@ func defaultConfigPath() (string, error) {
 // loadConfig reads the config file. A missing file is an empty config, not an
 // error, so first-run commands work before any login.
 func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := privatepath.ReadFile(path)
 	if os.IsNotExist(err) {
 		return &Config{CurrentProfile: "default", Profiles: map[string]Profile{}}, nil
 	}
@@ -61,24 +57,47 @@ func loadConfig(path string) (*Config, error) {
 }
 
 // saveConfig writes the config file with 0600 permissions (it holds bearer
-// tokens). The parent directory is created on demand; an existing file's mode
-// is reset to 0600 in case it was created loose by another tool.
+// tokens). The parent directory is created on demand. Existing files with
+// unsafe type, ownership, link count, or mode are refused, never repaired.
 func saveConfig(path string, cfg *Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	if err := privatepath.WriteFileAtomic(path, append(data, '\n')); err != nil {
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("write config %s: %w", path, err)
+	return nil
+}
+
+// mutateConfigExclusive is the sole saved-profile mutation boundary. Network
+// authentication happens before entry; while held it excludes mount startup,
+// rejects any strict residual mount/attach inventory, reloads the latest
+// config, applies one mutation, and atomically publishes it.
+func (e *cmdEnv) mutateConfigExclusive(update func(*Config, string) error) (string, error) {
+	stateDir, err := e.mountLifecycleStateDir()
+	if err != nil {
+		return "", err
 	}
-	return os.Chmod(path, 0o600)
+	guard, err := accountsession.AcquireExclusive(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("acquire account session guard: %w; unmount PortableFS volumes before changing credentials or profiles", err)
+	}
+	defer guard.Close()
+	if _, _, err := e.strictAccountInventory(); err != nil {
+		return "", err
+	}
+	cfg, path, err := e.loadConfig()
+	if err != nil {
+		return "", err
+	}
+	if err := update(cfg, path); err != nil {
+		return "", err
+	}
+	if err := saveConfig(path, cfg); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // settings is the fully resolved connection configuration for one command run.
@@ -87,9 +106,6 @@ type settings struct {
 	apiToken     string
 	managerURL   string
 	managerToken string
-	// dataPlaneCAPEM comes only from the profile (no flag/env: those already
-	// exist as PORTABLEFS_TLS_CA/VCS_TLS_CA file paths and take precedence).
-	dataPlaneCAPEM string
 }
 
 // resolveSettings applies the documented precedence: flags > environment >
@@ -109,11 +125,10 @@ func resolveSettings(cfg *Config, profileName string, getenv func(string) string
 		return fileVal
 	}
 	return settings{
-		apiURL:         pick(flags.apiURL, "PORTABLEFS_API_URL", prof.APIUrl),
-		apiToken:       pick(flags.apiToken, "PORTABLEFS_API_TOKEN", prof.APIToken),
-		managerURL:     pick(flags.managerURL, "PORTABLEFS_MANAGER_URL", prof.ManagerUrl),
-		managerToken:   pick(flags.managerToken, "PORTABLEFS_MANAGER_TOKEN", prof.ManagerToken),
-		dataPlaneCAPEM: prof.DataPlaneCAPEM,
+		apiURL:       pick(flags.apiURL, "PORTABLEFS_API_URL", prof.APIUrl),
+		apiToken:     pick(flags.apiToken, "PORTABLEFS_API_TOKEN", prof.APIToken),
+		managerURL:   pick(flags.managerURL, "PORTABLEFS_MANAGER_URL", prof.ManagerUrl),
+		managerToken: pick(flags.managerToken, "PORTABLEFS_MANAGER_TOKEN", prof.ManagerToken),
 	}
 }
 

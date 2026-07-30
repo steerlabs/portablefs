@@ -224,7 +224,7 @@ func TestLegacyAdoptionConflictPreservesWALAndSidecar(t *testing.T) {
 		t.Fatal("seed file has no stable authority inode")
 	}
 
-	walPath := filepath.Join(t.TempDir(), "sess-conflict.wal")
+	walPath := filepath.Join(privateTestDir(t), "sess-conflict.wal")
 	w, err := wal.Open(walPath)
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +283,7 @@ func legacyConflictTestVolume(t *testing.T) (context.Context, *clientcore.Volume
 	vol, err := clientcore.Dial(ctx, clientcore.Options{
 		Addr:     serveAuthority(t),
 		Pool:     2,
-		WALDir:   t.TempDir(),
+		WALDir:   privateTestDir(t),
 		VolumeID: t.Name(),
 		Branch:   "legacy-conflict",
 	})
@@ -301,7 +301,7 @@ func legacyConflictTestVolume(t *testing.T) (context.Context, *clientcore.Volume
 func newLegacyDrainState(t *testing.T) *legacyDrainState {
 	t.Helper()
 	return &legacyDrainState{
-		path:           filepath.Join(t.TempDir(), "drain.json"),
+		path:           filepath.Join(privateTestDir(t), "drain.json"),
 		NextOffset:     map[string]int64{},
 		LastAppliedSeq: map[string]uint64{},
 	}

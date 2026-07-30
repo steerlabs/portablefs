@@ -164,6 +164,8 @@ PORTABLEFS_MANAGED_VCS_JOURNAL_HA_POLICY_JSON='{"v":1,"expectedSystemIdentifier"
 PORTABLEFS_ACCESS_TOKEN_ROOT_SECRET=<64 hex chars>
 PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR=0.0.0.0:2050
 PORTABLEFS_AUTHORITY_ROUTER_URL=portablefs-vcs.example.com:2050
+PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=tls-system-pki
+PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME=portablefs-vcs.example.com
 PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH=/etc/portablefs/router.crt
 PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH=/etc/portablefs/router.key
 PORTABLEFS_VOLUME_API_URL=https://volume-api.example.com
@@ -180,11 +182,31 @@ The manager fails closed: the `pfm` control database, the VCS binary, the journa
 DSN, the versioned structured HA policy (verified fact-by-fact by every child
 against `pfj.durability_facts()` — a prose attestation is never a durability
 gate), the access-token root secret, a public router URL/listen address, and
-router TLS are all required. Plaintext is only possible with
+an explicit router transport are all required. `tls-system-pki` uses the
+system roots and exact configured server name. For a private CA, select
+`tls-private-ca` and configure exactly one `PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH`
+or `_PEM`; its strict PEM and SHA-256 ride in every access lease. Plaintext is
+only possible with `PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE=plaintext` and
 `PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION=1` behind an
 authenticated private tunnel (WireGuard or equivalent) — never on the public
 internet. This gate follows `PORTABLEFS_AUTHORITY_MODE=production` directly;
 it does not depend on `NODE_ENV`.
+
+Router startup fails before publishing its listener unless the serving leaf
+matches the private key and advertised SAN/IP, the served intermediates form
+one ordered signature-valid chain, and every certificate is currently valid
+for TLS server use. Private-CA mode additionally completes a local TLS 1.3
+handshake against the exact advertised trust bundle. System-PKI mode cannot
+completes the same handshake against the manager runtime's default roots,
+rejecting private/self-signed chains, but cannot prove that all remote client
+platforms have refreshed to the identical public root set. Retain an
+end-to-end lease-and-dial readiness check across the supported platform matrix.
+
+Use `host:port` for DNS/IPv4 router addresses and `[address]:port` for IPv6.
+The manager rejects unbracketed IPv6, URL paths/userinfo/query strings,
+ambiguous numeric IPv4 forms, and noncanonical ports. Supported `tcp://` or
+`fsproto://` public inputs are normalized once to a scheme-free dial address
+before any lease is emitted.
 
 The children run with `VCS_PRODUCTION=1`, bind loopback listeners themselves, and
 report the exact addresses back on the inherited bootstrap pipe; the manager

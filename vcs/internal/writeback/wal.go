@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -853,6 +854,17 @@ type streamScan struct {
 // fully-present final frame — fails closed with ErrCorrupt: an acknowledged
 // last mutation must never be silently discarded.
 func scanStream(dir string) (*streamScan, error) {
+	return scanStreamWithTailRepair(dir, true)
+}
+
+// scanStreamReadOnly performs the same strict framing and identity validation
+// as recovery without changing a torn final append. Offline force-parking uses
+// this form to validate the entire store before it changes any stream.
+func scanStreamReadOnly(dir string) (*streamScan, error) {
+	return scanStreamWithTailRepair(dir, false)
+}
+
+func scanStreamWithTailRepair(dir string, repairTornTail bool) (*streamScan, error) {
 	names, err := filepath.Glob(filepath.Join(dir, "wb-*.pfw"))
 	if err != nil {
 		return nil, err
@@ -872,6 +884,9 @@ func scanStream(dir string) (*streamScan, error) {
 		h, err := decodeSegmentHeader(buf)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", filepath.Base(name), err)
+		}
+		if filepath.Clean(name) != segmentPath(dir, h.Ordinal) {
+			return nil, fmt.Errorf("%w: segment filename %s does not match header ordinal %d", ErrCorrupt, filepath.Base(name), h.Ordinal)
 		}
 		if prev == nil {
 			// The first retained segment establishes the dense frame and
@@ -901,22 +916,24 @@ func scanStream(dir string) (*streamScan, error) {
 			return nil, fmt.Errorf("%s: %w", filepath.Base(name), err)
 		}
 		if last && validEnd < int64(len(buf)) {
-			// Torn tail (physically short frame): truncate to the last
-			// complete frame and fsync.
-			f, err := os.OpenFile(name, os.O_RDWR, 0o600)
-			if err != nil {
-				return nil, err
-			}
-			if err := f.Truncate(validEnd); err != nil {
-				_ = f.Close()
-				return nil, err
-			}
-			if err := f.Sync(); err != nil {
-				_ = f.Close()
-				return nil, err
-			}
-			if err := f.Close(); err != nil {
-				return nil, err
+			if repairTornTail {
+				// Torn tail (physically short frame): truncate to the last
+				// complete frame and fsync.
+				f, err := os.OpenFile(name, os.O_RDWR, 0o600)
+				if err != nil {
+					return nil, err
+				}
+				if err := f.Truncate(validEnd); err != nil {
+					_ = f.Close()
+					return nil, err
+				}
+				if err := f.Sync(); err != nil {
+					_ = f.Close()
+					return nil, err
+				}
+				if err := f.Close(); err != nil {
+					return nil, err
+				}
 			}
 			scan.truncated = true
 		}
@@ -1026,11 +1043,12 @@ func fsyncDir(dir string) error {
 // streamEpochFromDir extracts the epoch from a stream directory name
 // (stream-%016x); ok=false for foreign names.
 func streamEpochFromDir(name string) (uint64, bool) {
-	if !strings.HasPrefix(name, "stream-") {
+	const prefix = "stream-"
+	if len(name) != len(prefix)+16 || !strings.HasPrefix(name, prefix) {
 		return 0, false
 	}
-	var epoch uint64
-	if _, err := fmt.Sscanf(name[len("stream-"):], "%016x", &epoch); err != nil {
+	epoch, err := strconv.ParseUint(name[len(prefix):], 16, 64)
+	if err != nil || epoch == 0 || name != streamDirName(epoch) {
 		return 0, false
 	}
 	return epoch, true

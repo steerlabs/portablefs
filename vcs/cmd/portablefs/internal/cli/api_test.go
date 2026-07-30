@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -361,6 +360,12 @@ func TestStatusFallsBackWhenHeadRefusesLive(t *testing.T) {
 // recorded local mount of the branch appears with its credential health.
 func TestStatusShowsCredentialExpiredMount(t *testing.T) {
 	e, stdout, _ := testEnv(t)
+	e.mountHealthFn = func(st *mountState) string {
+		if st.Status == mountStatusCredentialExpired {
+			return mountStatusCredentialExpired
+		}
+		return "live"
+	}
 	stateHome := t.TempDir()
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
@@ -372,10 +377,11 @@ func TestStatusShowsCredentialExpiredMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeMountState(dir, mountState{
-		MountPath: "/tmp/w1", VolumeID: "vol_live", Branch: "main", PID: os.Getpid(),
-		Strategy: "fuse", Status: mountStatusCredentialExpired, StatusChangedAtMs: 1700000000000,
-	}); err != nil {
+	st := validFuseMountState(t, "/tmp/w1")
+	st.VolumeID = "vol_live"
+	st.Status = mountStatusCredentialExpired
+	st.StatusChangedAtMs = 1700000000000
+	if err := writeMountState(dir, st); err != nil {
 		t.Fatal(err)
 	}
 	f := newFakeServer(t)

@@ -65,7 +65,7 @@ func TestSyncVolumeOpAndDetachDrainWriteBack(t *testing.T) {
 	// so d1 would run write-through for the cooldown — d2 delegates again.
 	d2 := pfs.call(&pfslocal.MkdirRequest{Dir: root, Name: []byte("d2"), Mode: 0o755}).(*pfslocal.MkdirReply)
 	writeFile(d2.Attr.Item, "detached.txt", "via-detach")
-	controlJSON(t, hc, http.MethodDelete, "/v1/attaches/"+ref, nil, http.StatusNoContent, nil)
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/unmount", nil, http.StatusNoContent, nil)
 	if got := readAuthority("d2/detached.txt"); got != "via-detach" {
 		t.Fatalf("detach did not drain: authority holds %q", got)
 	}

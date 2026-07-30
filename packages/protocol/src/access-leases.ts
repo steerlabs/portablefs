@@ -150,6 +150,104 @@ export const accessLeaseSchema = z.object({
 });
 export type AccessLease = z.infer<typeof accessLeaseSchema>;
 
+// The exact transport a lease holder MUST use for the data-plane endpoint.
+// This is deliberately discriminated instead of treating an empty CA as
+// plaintext: every successful production lease names one unambiguous mode.
+//
+// Optional at the outer endpoint boundary for additive wire compatibility
+// with managers released before this field existed. Current PortableFS mount
+// clients require it and report explicit upgrade guidance when it is absent.
+function isIPv4(value: string): boolean {
+  const parts = value.split(".");
+  return (
+    parts.length === 4 &&
+    parts.every(
+      (part) =>
+        /^(0|[1-9][0-9]{0,2})$/u.test(part) && Number(part) >= 0 && Number(part) <= 255
+    )
+  );
+}
+
+function isIPv6(value: string): boolean {
+  if (!value.includes(":") || value.includes(":::") || value.indexOf("::") !== value.lastIndexOf("::")) {
+    return false;
+  }
+  const compressed = value.includes("::");
+  const halves = compressed ? value.split("::") : [value, ""];
+  const leftText = halves[0] ?? "";
+  const rightText = halves[1] ?? "";
+  const left = leftText === "" ? [] : leftText.split(":");
+  const right = rightText === "" ? [] : rightText.split(":");
+  const all = [...left, ...right];
+  let groups = 0;
+  for (let index = 0; index < all.length; index += 1) {
+    const part = all[index]!;
+    if (part.includes(".")) {
+      if (index !== all.length - 1 || !isIPv4(part)) {
+        return false;
+      }
+      groups += 2;
+    } else {
+      if (!/^[A-Fa-f0-9]{1,4}$/u.test(part)) {
+        return false;
+      }
+      groups += 1;
+    }
+  }
+  return compressed ? groups < 8 : groups === 8;
+}
+
+function isDataPlaneServerName(value: string): boolean {
+  if (
+    value.length === 0 ||
+    value.length > 253 ||
+    value !== value.trim() ||
+    /[\u0000-\u0020/\\]/u.test(value) ||
+    value.startsWith("[") ||
+    value.endsWith("]")
+  ) {
+    return false;
+  }
+  if (isIPv4(value) || isIPv6(value)) {
+    return true;
+  }
+  return value.split(".").every(
+    (label) =>
+      label.length >= 1 &&
+      label.length <= 63 &&
+      !label.startsWith("-") &&
+      !label.endsWith("-") &&
+      /^[A-Za-z0-9-]+$/u.test(label)
+  );
+}
+
+const dataPlaneServerNameSchema = z
+  .string()
+  .min(1)
+  .max(253)
+  .refine(isDataPlaneServerName, "serverName must be a valid DNS name or unbracketed IP address");
+const dataPlaneCAPEMSchema = z.string().min(1).max(256 * 1024);
+const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/u, "caSha256 must be lowercase SHA-256 hex");
+
+export const dataPlaneTransportSchema = z.discriminatedUnion("mode", [
+  z
+    .object({
+      mode: z.literal("tls-private-ca"),
+      serverName: dataPlaneServerNameSchema,
+      caPem: dataPlaneCAPEMSchema,
+      caSha256: sha256HexSchema,
+    })
+    .strict(),
+  z
+    .object({
+      mode: z.literal("tls-system-pki"),
+      serverName: dataPlaneServerNameSchema,
+    })
+    .strict(),
+  z.object({ mode: z.literal("plaintext") }).strict(),
+]);
+export type DataPlaneTransport = z.infer<typeof dataPlaneTransportSchema>;
+
 // The endpoint payload the caller mounts against: dial this address and
 // present the accessToken as the data-plane router handshake token.
 export const authorityEndpointPayloadSchema = z.object({
@@ -163,6 +261,7 @@ export const authorityEndpointPayloadSchema = z.object({
   authorityInstanceId: idSchema.optional(),
   authorityAuthToken: z.string().min(1).optional(),
   authorityExpiresAt: z.number().int().nonnegative().optional(),
+  dataPlaneTransport: dataPlaneTransportSchema.optional(),
 });
 export type AuthorityEndpointPayload = z.infer<typeof authorityEndpointPayloadSchema>;
 

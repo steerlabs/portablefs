@@ -60,6 +60,8 @@ const COMMIT_ID = "cpft2_golden";
 interface GoldenWorld {
   baseUrl: string;
   rootHex: string;
+  objectSizesByStorageKey: Map<string, number>;
+  readsByStorageKey: Map<string, number>;
 }
 
 // The golden test tree (mirrors the shared golden filesystem shape):
@@ -241,6 +243,7 @@ async function startGoldenServer(
 
   const reader: ExactKeyReader = {
     async readExactKey(storageKey, options) {
+      readsByStorageKey.set(storageKey, (readsByStorageKey.get(storageKey) ?? 0) + 1);
       const bytes = objects.get(storageKey);
       if (!bytes) {
         throw new ExactKeyReadError("not_found", "missing");
@@ -251,6 +254,10 @@ async function startGoldenServer(
       return bytes;
     },
   };
+  const readsByStorageKey = new Map<string, number>();
+  const objectSizesByStorageKey = new Map(
+    [...objects].map(([storageKey, bytes]) => [storageKey, bytes.byteLength])
+  );
   const stores = new HistoryStoreRegistry([{ failureDomain: "dom-a", reader }]);
 
   const provenance: Pft2CommitProvenance = {
@@ -308,7 +315,12 @@ async function startGoldenServer(
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address() as AddressInfo;
-  return { baseUrl: `http://127.0.0.1:${address.port}`, rootHex };
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    rootHex,
+    objectSizesByStorageKey,
+    readsByStorageKey,
+  };
 }
 
 describe("PFT2 tree browse", () => {
@@ -487,7 +499,8 @@ describe("PFT2 file serving", () => {
       return rootRef;
     };
 
-    const { baseUrl } = await startGoldenServer(buildBigWorld);
+    const { baseUrl, objectSizesByStorageKey, readsByStorageKey } =
+      await startGoldenServer(buildBigWorld);
     const whole = await fetch(
       `${baseUrl}/v1/volumes/vol_a/file?commit=${COMMIT_ID}&path=big.bin`,
       { headers: TENANT_HEADERS }
@@ -507,6 +520,16 @@ describe("PFT2 file serving", () => {
     expect(ranged.status).toBe(206);
     const rangedBody = Buffer.from(await ranged.arrayBuffer());
     expect(rangedBody.equals(Buffer.from(bigContent.subarray(start, end + 1)))).toBe(true);
+
+    // The canonical builder emits two 4 MiB packs. Each request must locate,
+    // read, and verify each immutable pack once, not once per 4 KiB cell.
+    const packKeys = [...objectSizesByStorageKey]
+      .filter(([, size]) => size === 4 * 1024 * 1024)
+      .map(([storageKey]) => storageKey);
+    expect(packKeys).toHaveLength(2);
+    for (const storageKey of packKeys) {
+      expect(readsByStorageKey.get(storageKey)).toBe(2);
+    }
   });
 });
 

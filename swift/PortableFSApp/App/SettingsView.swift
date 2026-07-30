@@ -16,48 +16,61 @@ struct SettingsView: View {
                             Text(name).tag(name)
                         }
                     }
+                    .disabled(
+                        model.isAccountMutationInProgress ||
+                            model.hasAccountEnvironmentOverrides
+                    )
                     LabeledContent("Server", value: model.settings.apiURL.isEmpty ? "—" : model.settings.apiURL)
                     Button("Sign Out of \"\(model.config.currentProfile)\"", role: .destructive) {
                         model.signOut()
                     }
+                    .disabled(
+                        model.isAccountMutationInProgress ||
+                            model.hasAccountEnvironmentOverrides
+                    )
+                }
+                if model.hasAccountEnvironmentOverrides {
+                    Text(
+                        "\(model.accountEnvironmentOverrideNames.joined(separator: ", ")) controls the active account. Relaunch without it before changing saved profiles."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 LabeledContent("Config file", value: model.configPath)
                     .font(.caption)
             }
 
             Section("Mounts") {
-                TextField("Mount base directory", text: $model.mountBaseDirectory)
-                    .autocorrectionDisabled()
+                HStack {
+                    TextField("Mount base directory", text: $model.mountBaseDirectory)
+                        .autocorrectionDisabled()
+                    Button("Choose Folder…") {
+                        chooseMountBaseDirectory()
+                    }
+                }
+                .disabled(!model.isLocalMountInventoryKnown || !model.localMounts.isEmpty)
                 Text("Volumes mount at <base>/<volume-id>.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-
-            Section("Daemon") {
-                LabeledContent("Status", value: model.daemon.statusLabel)
-                if !model.daemon.statusDetail.isEmpty {
-                    Text(model.daemon.statusDetail)
+                if let error = model.mountBaseDirectoryValidationError {
+                    Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                }
-                if let binary = model.daemon.binaryPath {
-                    LabeledContent("Binary", value: binary)
+                } else if !model.isLocalMountInventoryKnown {
+                    Text("The mount location remains locked until PortableFS obtains a complete local mount inventory.")
                         .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if !model.localMounts.isEmpty {
+                    Text("Unmount every PortableFS volume before changing the mount location.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                TextField("portablefsd path override", text: $model.daemonBinaryOverride, prompt: Text("auto-detect"))
-                    .autocorrectionDisabled()
-                LabeledContent("Frontend socket", value: model.daemon.frontendSocketPath)
+            }
+
+            Section("Mount Runtime") {
+                Text("The signed portablefs CLI inside this app owns mounts, daemon state, access leases, and lifecycle coordination.")
                     .font(.caption)
-                LabeledContent("Control socket", value: model.daemon.controlSocketPath)
-                    .font(.caption)
-                LabeledContent("Log", value: model.daemon.logPath)
-                    .font(.caption)
-                Button("Reveal Log in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting(
-                        [URL(fileURLWithPath: model.daemon.logPath)]
-                    )
-                }
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -70,5 +83,25 @@ struct SettingsView: View {
             get: { model.config.currentProfile },
             set: { model.switchProfile($0) }
         )
+    }
+
+    private func chooseMountBaseDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose PortableFS Mount Directory"
+        panel.prompt = "Choose"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        if model.mountBaseDirectoryValidationError == nil {
+            panel.directoryURL = URL(
+                fileURLWithPath: model.mountBaseDirectory,
+                isDirectory: true
+            )
+        }
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+        model.mountBaseDirectory = url.standardizedFileURL.path
     }
 }

@@ -48,9 +48,11 @@ func fsAttrToLocal(a fsproto.Attr, item pfslocal.Item) pfslocal.Attr {
 }
 
 func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
 	changed := false
 	a.mu.RLock()
-	if a.detached {
+	if a.detached || a.detachPrepared || a.detachForce {
 		a.mu.RUnlock()
 		return pfslocal.ResolveReply{}, darwinENXIO
 	}
@@ -526,6 +528,11 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 }
 
 func (a *attach) close(req *pfslocal.CloseRequest) (int32, error) {
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
+	if err := a.controlAdmissionError(); err != nil {
+		return darwinENXIO, nil
+	}
 	h := a.closeHandle(req.Handle)
 	if h == nil {
 		return darwinEINVAL, nil
@@ -1045,6 +1052,8 @@ func (a *attach) readlink(ctx context.Context, req *pfslocal.ReadlinkRequest) (*
 }
 
 func (a *attach) statfs() (*pfslocal.StatfsReply, int32) {
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
@@ -1062,6 +1071,8 @@ func (a *attach) statfs() (*pfslocal.StatfsReply, int32) {
 // degraded local-only success. Local WAL sync failure seals mutation
 // admission; any barrier failure surfaces on attach state and to the kernel.
 func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32) {
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
@@ -1076,6 +1087,11 @@ func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32
 }
 
 func (a *attach) reclaim(req *pfslocal.ReclaimRequest) int32 {
+	a.nsMu.RLock()
+	defer a.nsMu.RUnlock()
+	if err := a.controlAdmissionError(); err != nil {
+		return darwinENXIO
+	}
 	a.mu.Lock()
 	if rec := a.items[req.Item.ItemID]; rec != nil && rec.item.ItemGeneration == req.Item.ItemGeneration && rec.path != "" {
 		for p, alias := range a.paths {

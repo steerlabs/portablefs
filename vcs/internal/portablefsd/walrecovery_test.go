@@ -37,22 +37,23 @@ func readAuthorityFile(t *testing.T, authority, name string) string {
 
 // TestWALRecoveryAcrossMountPathChange pins the re-keyed storage identity:
 // write-back parked by a SIGKILLed daemon serving /Volumes/A must be found
-// and replayed when the volume is next attached at /Volumes/B — the WAL
-// store is keyed by (volume, branch), not by where the volume was mounted.
+// and replayed when the exact durable attach is resumed. A later mount-path
+// change requires an explicit exact detach first; dormant ownership is never
+// silently superseded.
 //
 // The flusher ships within milliseconds, so the parked state is produced the
 // way it happens in production: the delegation is established while the
 // authority is up, the authority then becomes unreachable, and a delegated
 // write is acknowledged locally with a tail that cannot ship before the
 // SIGKILL.
-func TestWALRecoveryAcrossMountPathChange(t *testing.T) {
+func TestWALRecoveryThenExplicitMountPathChange(t *testing.T) {
 	prevTTL := workfs.SessionLeaseTTL()
 	workfs.SetSessionLeaseTTL(time.Second)
 	t.Cleanup(func() { workfs.SetSessionLeaseTTL(prevTTL) })
 
 	// One managed FS behind a stoppable listener: durable authority state
 	// (journal, grants, stream ledger) survives the listener bounce.
-	fs := newManagedTestFS(t, daemonTestBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
+	fs := newManagedTestFS(t, daemonTestBlobs{}, filepath.Join(privateTestDir(t), "wal.log"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +63,7 @@ func TestWALRecoveryAcrossMountPathChange(t *testing.T) {
 	go func() { _ = fsproto.NewServer(fs, fs).Serve(srvCtx, ln) }()
 
 	bin := buildPortablefsdTestBinary(t)
-	stateDir, err := os.MkdirTemp("/tmp", "pfsd-movewal-")
+	stateDir, err := os.MkdirTemp("", "pfsd-movewal-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,10 +104,14 @@ func TestWALRecoveryAcrossMountPathChange(t *testing.T) {
 		t.Fatal("data leaked to authority before recovery")
 	}
 
-	// Same volume, DIFFERENT mount path: the parked WAL must still recover.
+	// Resume the exact durable attach first. The parked WAL is keyed by
+	// (volume, branch), while attach ownership remains exact and explicit.
 	p2 := startPortablefsdProcess(t, bin, stateDir, "pfsd-move2")
 	defer p2.stop()
-	ensureAttachOnceWithPolicy(t, p2.hc, authority, "vol-move", "main", "/Volumes/NewPath", "writeback", "", nil)
+	resumed := ensureAttachOnceWithPolicy(t, p2.hc, authority, "vol-move", "main", "/Volumes/OldPath", "writeback", "", nil)
+	if resumed.AttachRef != ref1 {
+		t.Fatalf("resumed attach = %s, want durable %s", resumed.AttachRef, ref1)
+	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if got := readAuthorityFile(t, authority, "d/moved.txt"); got == "survives the move" {
@@ -117,6 +122,14 @@ func TestWALRecoveryAcrossMountPathChange(t *testing.T) {
 			t.Fatalf("recovery across mount-path change failed: authority holds %q", got)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	controlJSON(t, p2.hc, http.MethodPost, "/v1/attaches/"+ref1+"/unmount", nil, http.StatusNoContent, nil)
+	moved := ensureAttachOnceWithPolicy(t, p2.hc, authority, "vol-move", "main", "/Volumes/NewPath", "writeback", "", nil)
+	if moved.AttachRef == ref1 {
+		t.Fatal("explicit path change reused the detached attach identity")
+	}
+	if got := readAuthorityFile(t, authority, "d/moved.txt"); got != "survives the move" {
+		t.Fatalf("path-changed attach sees %q", got)
 	}
 }
 
@@ -134,7 +147,7 @@ func fnvHex(s string) string {
 // (volume, branch) store on the next attach and its records replay.
 func TestLegacyWALDirAdoption(t *testing.T) {
 	authority := serveAuthority(t)
-	dir, err := os.MkdirTemp("/tmp", "pfsd-legacy-")
+	dir, err := os.MkdirTemp("", "pfsd-legacy-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +242,7 @@ func TestLegacyWALDirAdoption(t *testing.T) {
 // unclaimed store are removed (dir included), while a store with pending
 // records for an UNKNOWN volume is preserved.
 func TestOrphanWALSweep(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "pfsd-sweep-")
+	dir, err := os.MkdirTemp("", "pfsd-sweep-")
 	if err != nil {
 		t.Fatal(err)
 	}

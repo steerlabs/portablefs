@@ -5,6 +5,8 @@ import {
 import {
   createAuthorityDataPlaneRouterServer,
   LeaseTunnelRegistry,
+  preflightAuthorityDataPlaneRouterTLS,
+  resolveRouterTlsMaterial,
   validateAuthorityDataPlaneRouterConfig,
 } from "./data-plane-router.js";
 import {
@@ -20,6 +22,7 @@ import { ManagerMetrics } from "./manager-metrics.js";
 import { createManagerMetricsEndpoint } from "./metrics-endpoint.js";
 import { loadAuthorityManagerReleaseIdentity } from "./release-identity.js";
 import type { AccessLeaseHandler } from "./server.js";
+import { parseAuthorityAddress } from "./authority-address.js";
 
 const port = Number(process.env.PORT || process.env.AUTHORITY_MANAGER_PORT || 8788);
 const authToken = process.env.PORTABLEFS_AUTHORITY_MANAGER_TOKEN?.trim();
@@ -52,7 +55,10 @@ const managerMetrics = new ManagerMetrics();
 // PRODUCTION (journal-native): singleton fenced manager + one disposable
 // child per active branch, remote journal/control truth. No persistent
 // work directory, no local WAL, no standby pair, no file ledger.
-validateRouterConfig();
+const routerConfig = loadRouterConfig();
+const routerTLSMaterial = resolveRouterTlsMaterial(routerConfig);
+const dataPlaneTransport = Object.freeze(validateAuthorityDataPlaneRouterConfig(routerConfig));
+await preflightAuthorityDataPlaneRouterTLS(routerTLSMaterial, dataPlaneTransport);
 const managerControlStore: ManagerControlStore = loadManagerControlStore();
 const productionRegistry: ProductionAuthorityRegistry = await createProductionAuthorityRegistry(
   process.env,
@@ -69,18 +75,8 @@ productionRegistry.leases.onLeaseRotated((accessLeaseId, tokenGeneration) =>
   leaseTunnelRegistry.closeSupersededGenerations(accessLeaseId, tokenGeneration)
 );
 const dataPlaneRouter = createAuthorityDataPlaneRouterServer(productionRegistry.leases, {
-  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH
-    ? { tlsCertPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PATH }
-    : {}),
-  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH
-    ? { tlsKeyPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PATH }
-    : {}),
-  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM
-    ? { tlsCertPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CERT_PEM }
-    : {}),
-  ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM
-    ? { tlsKeyPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM }
-    : {}),
+  tlsMaterial: routerTLSMaterial,
+  dataPlaneTransport,
   tunnelRegistry: leaseTunnelRegistry,
 });
 listenTcp(dataPlaneRouter, process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR!);
@@ -106,6 +102,7 @@ const server = createAuthorityManagerServer({
   ...(allowUnauthenticated ? { allowUnauthenticated: true } : {}),
   registry,
   ...(accessLeases ? { accessLeases } : {}),
+  dataPlaneTransport,
   ...(releaseIdentity ? { releaseIdentity } : {}),
   metricsEndpoint: createManagerMetricsEndpoint({
     metrics: managerMetrics,
@@ -174,8 +171,8 @@ function loadManagerControlStore(): ManagerControlStore {
   );
 }
 
-function validateRouterConfig(): void {
-  validateAuthorityDataPlaneRouterConfig({
+function loadRouterConfig() {
+  return {
     ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR
       ? { listenAddr: process.env.PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR }
       : {}),
@@ -194,18 +191,33 @@ function validateRouterConfig(): void {
     ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM
       ? { tlsKeyPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_KEY_PEM }
       : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE
+      ? { transportMode: process.env.PORTABLEFS_AUTHORITY_ROUTER_TRANSPORT_MODE }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME
+      ? { tlsServerName: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_SERVER_NAME }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH
+      ? { tlsCaPath: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PATH }
+      : {}),
+    ...(process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM
+      ? { tlsCaPem: process.env.PORTABLEFS_AUTHORITY_ROUTER_TLS_CA_PEM }
+      : {}),
     allowPlaintextProduction:
       process.env.PORTABLEFS_AUTHORITY_ROUTER_ALLOW_PLAINTEXT_PRODUCTION === "1",
-  });
+  };
 }
 
 function listenTcp(
   server: { listen(port: number, host: string, callback: () => void): unknown },
   addr: string
 ): void {
-  const { host, port: listenPort } = parseListenAddr(addr);
+  const { host, port: listenPort } = parseAuthorityAddress(addr, {
+    label: "PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR",
+  });
   server.listen(listenPort, host, () => {
-    console.log(`PortableFS authority data-plane router listening on ${host}:${listenPort}`);
+    const displayHost = host.includes(":") ? `[${host}]` : host;
+    console.log(`PortableFS authority data-plane router listening on ${displayHost}:${listenPort}`);
   });
 }
 
@@ -213,13 +225,4 @@ function closeServer(serverToClose: { close(callback: (error?: Error) => void): 
   return new Promise((resolve) => {
     serverToClose.close(() => resolve());
   });
-}
-
-function parseListenAddr(addr: string): { host: string; port: number } {
-  const [host, portText] = addr.trim().split(":");
-  const listenPort = portText ? Number(portText) : NaN;
-  if (!host || !Number.isInteger(listenPort) || listenPort <= 0 || listenPort > 65535) {
-    throw new Error(`PORTABLEFS_AUTHORITY_ROUTER_LISTEN_ADDR must be host:port, got ${addr}.`);
-  }
-  return { host, port: listenPort };
 }

@@ -21,6 +21,15 @@ struct SignInView: View {
 
     var body: some View {
         Form {
+            if model.hasAccountEnvironmentOverrides {
+                Section("Account Locked by Environment") {
+                    Text(
+                        "\(model.accountEnvironmentOverrideNames.joined(separator: ", ")) controls the active account. Relaunch PortableFS without it before saving credentials."
+                    )
+                    .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Server") {
                 TextField("Server URL", text: $serverURL, prompt: Text("https://api.portablefs.example"))
                     .textContentType(.URL)
@@ -43,7 +52,13 @@ struct SignInView: View {
                     Button("Save & Verify") {
                         saveManualToken()
                     }
-                    .disabled(isSaving || serverURL.isEmpty || apiToken.isEmpty)
+                    .disabled(
+                        isSaving ||
+                            model.isAccountMutationInProgress ||
+                            model.hasAccountEnvironmentOverrides ||
+                            serverURL.isEmpty ||
+                            apiToken.isEmpty
+                    )
                     if isSaving {
                         ProgressView()
                             .controlSize(.small)
@@ -88,7 +103,11 @@ struct SignInView: View {
                     profile: profile
                 )
             }
-            .disabled(serverURL.isEmpty)
+            .disabled(
+                serverURL.isEmpty ||
+                    model.isAccountMutationInProgress ||
+                    model.hasAccountEnvironmentOverrides
+            )
         case .starting:
             HStack {
                 ProgressView()

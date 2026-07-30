@@ -82,11 +82,24 @@ not yet packaged in this repository.
 The stable volume endpoint is resolved by the PortableFS authority manager. Product
 workers call the manager for `ensure`, `session`, `health`, and `stop`; the manager owns
 the registry that maps a volume branch to the live VCS authority. The manager also owns
-a single public TCP/TLS router. The router selects a loopback VCS backend by the mount
+a single public TCP router (TLS in either declared TLS mode). The router selects a loopback VCS backend by the mount
 session token and then forwards the custom filesystem protocol. Product workers and
 agent sandboxes see only the stable router address; they never see per-volume loopback
 ports or launch VCS processes themselves. This keeps PortableFS, rather than each
 product, responsible for authority provisioning wherever the manager runs.
+
+Each access lease binds that endpoint to exactly one transport contract:
+private-CA TLS (strict CA PEM, SHA-256, exact server name), system-PKI TLS
+(exact server name), or explicitly authorized plaintext. Mount clients do not
+probe for trust material, reuse profile CA state, infer plaintext from an
+empty CA, or fall back between modes.
+The manager canonicalizes every public endpoint through one bracketed-IPv6-safe
+host/port parser and, before publishing a TLS listener, proves the serving
+leaf/key/name/chain. Private-CA mode also performs an actual local TLS 1.3
+handshake against the lease CA; system-PKI performs it against the manager
+runtime's default roots. The latter cannot prove future remote client
+root-store refresh, so deployment readiness retains an end-to-end dial across
+the supported platform matrix.
 
 The implementation follows a shared-filesystem model: a custom filesystem protocol, a durable
 storage layer between clients and object storage, strong connected-client disk consistency,
@@ -154,7 +167,13 @@ portablefs mount vol_123 /workspace
 
 Underneath, that means:
 
-- Linux hosts mount with FUSE (fusermount3/fusermount, the fuse3 package).
+- Linux hosts mount with FUSE. One uncached host-facts observation selects
+  exactly one mount mechanism before any mount side effect: direct `mount(2)`
+  when the process has positive `CAP_SYS_ADMIN` evidence, otherwise one exact,
+  root-managed `fusermount3`/`fusermount` helper. The selected mechanism and
+  helper path are persisted and revalidated at the mount and unmount
+  boundaries. Failure is final for that operation; the client never switches
+  mechanisms after an attempted mount.
 - macOS mounts through the FSKit extension: the CLI drives the same
   `portablefsd` + PortableFS.app extension pair the menu-bar app uses
   ([fskit-mount.md](./fskit-mount.md)).
@@ -170,6 +189,54 @@ Underneath, that means:
   runs tenant commands.
 
 The agent should never need the old attach/sync/flush local-folder workflow.
+
+Transport selection is a pure platform decision (`fskit` on macOS, `fuse` on
+Linux). A separate uncached host-facts check reports only evidence available
+without mutating the machine. In particular, macOS exposes no reliable public
+query for whether a third-party FSKit extension is enabled, and Linux
+capabilities cannot predict seccomp, LSM, device-cgroup, or namespace policy.
+Those cases remain **unverified**. Only a real mount with an exact kernel
+identity and a successful root operation verifies that the transport works.
+`doctor` reports this uncertainty rather than converting inventory hints into
+enablement claims.
+
+### Local Lifecycle And Installation
+
+Operational state has one fixed per-account root:
+`~/.local/state/portablefs`, where `~` is resolved from the effective user's
+account record rather than `HOME` or XDG environment overrides. Mount records
+bind the canonical mount path to the transport, kernel filesystem/source,
+process start identity, and (for FSKit) exact attach reference. Unmount refuses
+an unrelated filesystem or recycled PID; Linux signals a recorded mount
+process through a pidfd, while FSKit teardown is driven by the exact kernel
+mount and daemon attach instead of PID signaling.
+
+An effective UID without an account-database entry is a configuration error;
+containers must provision a real account identity instead of deriving one from
+mutable environment or temporary storage. Private state and coordination paths
+are opened component-by-component without following symlinks and are pinned by
+directory descriptors across sensitive operations.
+
+Two stable, private per-user locks express the cross-process invariants:
+
+- mount and app lifetimes hold the mount-lifecycle lock shared; an installer
+  must hold it exclusive before rechecking kernel mounts, daemon state, and
+  processes and publishing a replacement;
+- mount lifetimes hold the account-session lock shared; credential or active
+  profile mutation must hold it exclusive, so account identity cannot change
+  underneath a mount.
+
+Both locks are fixed inodes under the canonical state root. Unsafe ownership,
+permissions, links, replacement, or contention is a visible refusal; runtime
+code never repairs or relocates them.
+
+Linux releases store each verified `portablefs`/`portablefsd` pair together in
+a content-addressed per-user directory and atomically switch one CLI activation
+link. macOS releases one signed and notarized `PortableFS.app` containing the
+matching CLI, daemon, and FSKit extension; the installer atomically publishes
+that bundle under `~/Applications` and links its embedded CLI. Neither
+platform replaces a live mount/runtime, publishes half of a CLI/daemon pair,
+or falls back to a system-wide installation.
 
 ### Write Path
 
@@ -189,6 +256,10 @@ the next attach; ambiguous or corrupt state blocks instead of being repaired.
 Any local WAL persistence failure seals the mount mutation gate until remount.
 It never causes a silent switch to write-through, and a terminal
 fence/conflict does not leave unrelated scopes mutating through another lane.
+One OS account may have at most one live local mount of a given
+`(volume, branch)`, so one machine never creates competing owners for the same
+write-back store. Other machines may mount that branch concurrently; authority
+delegation and recall are the cross-machine coherence boundary.
 
 ### Machine-Local Dirs (Grafts)
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -19,7 +20,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/modebits"
-	"github.com/steerlabs/portablefs/vcs/internal/secure"
+	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
 
@@ -658,6 +659,9 @@ type fuseMount struct {
 	// localDirs is the effective graft set served by this mount (flags +
 	// persisted state + the volume's .portablefs/local-dirs file).
 	localDirs []string
+	// detachExact proves and removes this server's recorded kernel mount with
+	// the one persisted mechanism. It never asks go-fuse to resolve PATH.
+	detachExact func() error
 }
 
 // localDirsMountConfig configures machine-local dirs for one FUSE mount.
@@ -678,10 +682,16 @@ type localDirsMountConfig struct {
 // mountFUSE dials the authority and mounts it at mountPath, wiring push
 // invalidation, open-lease renewal, and the default cache options. tokens
 // serves the one live lease's credential to reconnect handshakes.
-func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf perfOptions, localCfg localDirsMountConfig) (*fuseMount, error) {
-	tlsCfg, err := secure.ClientTLS()
+func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTransport, mountPath, mountInstanceID, mountMechanism, fuseHelperPath string, perf perfOptions, localCfg localDirsMountConfig) (*fuseMount, error) {
+	if mountMechanism != "direct" && mountMechanism != "helper" {
+		return nil, fmt.Errorf("invalid deterministic FUSE mount mechanism %q", mountMechanism)
+	}
+	if mountMechanism == "direct" && fuseHelperPath != "" {
+		return nil, fmt.Errorf("direct FUSE mount must not carry a helper path")
+	}
+	tlsCfg, err := transport.tlsConfig()
 	if err != nil {
-		return nil, fmt.Errorf("TLS config: %w", err)
+		return nil, fmt.Errorf("data-plane transport: %w", err)
 	}
 	var rootHolder struct {
 		mu   sync.Mutex
@@ -791,19 +801,27 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 		// chmod 000 must stick; without this go-fuse rewrites null permissions.
 		NullPermissions: true,
 		MountOptions: fuse.MountOptions{
-			FsName:        "portablefs",
-			Name:          "portablefs",
-			MaxWrite:      1 << 20,
-			MaxReadAhead:  1 << 20,
-			MaxBackground: 256,
-			EnableLocks:   true,
+			FsName:            "portablefs:" + mountInstanceID,
+			Name:              "portablefs",
+			DirectMountStrict: mountMechanism == "direct",
+			MaxWrite:          1 << 20,
+			MaxReadAhead:      1 << 20,
+			MaxBackground:     256,
+			EnableLocks:       true,
 		},
 	}
 	root := &fuseNode{v: vol, state: clientcore.NewNodeState(1, true), g: grafts}
 	rootHolder.mu.Lock()
 	rootHolder.node = root
 	rootHolder.mu.Unlock()
-	server, err := fs.Mount(mountPath, root, opts)
+	if mountMechanism == "helper" {
+		if err := validateSelectedFUSEHelper(fuseHelperPath, mounthost.FUSEHelper); err != nil {
+			_ = grafts.Close()
+			_ = vol.Close()
+			return nil, err
+		}
+	}
+	server, err := mountNodeFS(mountPath, root, opts, mountMechanism, fuseHelperPath)
 	if err != nil {
 		_ = grafts.Close()
 		_ = vol.Close()
@@ -823,6 +841,24 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 	return m, nil
 }
 
+func validateSelectedFUSEHelper(selected string, resolve func() (string, bool)) error {
+	return validateSelectedFUSEHelperWith(selected, mounthost.ValidateFUSEHelper, resolve)
+}
+
+func validateSelectedFUSEHelperWith(selected string, validate func(string) error, resolve func() (string, bool)) error {
+	if err := validate(selected); err != nil {
+		return fmt.Errorf("selected FUSE helper is not trusted at mount boundary: %w", err)
+	}
+	resolved, ok := resolve()
+	if !ok {
+		return fmt.Errorf("selected FUSE helper %s disappeared before mount", selected)
+	}
+	if resolved != selected {
+		return fmt.Errorf("FUSE helper resolution changed before mount: selected %s, now %s", selected, resolved)
+	}
+	return nil
+}
+
 // Unmount runs the full drain barrier and detaches only on success: a
 // normal unmount can never succeed with an unshipped acknowledged tail. On
 // failure the kernel mount STAYS UP and the error is returned — the caller
@@ -830,7 +866,10 @@ func mountFUSE(addr string, tokens *sessionTokenSource, mountPath string, perf p
 // durable recovery job).
 func (m *fuseMount) Unmount() error {
 	err := m.vol.CloseWithFinalizer(func() error {
-		if err := m.server.Unmount(); err != nil {
+		if m.detachExact == nil {
+			return fmt.Errorf("exact kernel detach callback is not installed")
+		}
+		if err := m.detachExact(); err != nil {
 			return err
 		}
 		m.stop()
@@ -843,11 +882,31 @@ func (m *fuseMount) Unmount() error {
 	return nil
 }
 
+// ForceUnmount is the explicit journal-first teardown. It first makes the
+// write-back recovery job durable, then durably publishes the caller's ack,
+// and only then proves and removes the exact kernel mount.
+func (m *fuseMount) ForceUnmount(publishAck func(string) error) error {
+	jobID, err := m.vol.CloseJournalDurable()
+	if err != nil {
+		return fmt.Errorf("durably park forced write-back tail: %w", err)
+	}
+	if err := publishAck(jobID); err != nil {
+		return fmt.Errorf("publish durable force-park acknowledgement: %w", err)
+	}
+	if m.detachExact == nil {
+		return fmt.Errorf("exact kernel detach callback is not installed")
+	}
+	if err := m.detachExact(); err != nil {
+		return err
+	}
+	m.stop()
+	return nil
+}
+
 // Wait blocks until the kernel mount is gone, then releases client resources.
-func (m *fuseMount) Wait() {
+func (m *fuseMount) Wait() error {
 	m.server.Wait()
 	m.stop()
 	m.renewWG.Wait()
-	_ = m.vol.Close()
-	_ = m.grafts.Close()
+	return errors.Join(m.vol.Close(), m.grafts.Close())
 }

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 )
 
 // doctorTestEnv is testEnv plus an isolated mount-state directory (doctor
@@ -18,13 +20,14 @@ func doctorTestEnv(t *testing.T) (*cmdEnv, *bytes.Buffer, string) {
 	t.Helper()
 	e, stdout, _ := testEnv(t)
 	stateBase := t.TempDir()
+	e.stateDir = filepath.Join(stateBase, "portablefs")
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
 			return stateBase
 		}
 		return ""
 	}
-	return e, stdout, filepath.Join(stateBase, "portablefs", "mounts")
+	return e, stdout, filepath.Join(e.stateDir, "mounts")
 }
 
 func writeDoctorProfile(t *testing.T, e *cmdEnv, token string) {
@@ -71,6 +74,14 @@ func fakeDoctor(t *testing.T, e *cmdEnv, o commonOpts) *doctorRun {
 		t.Fatalf("unexpected process run: %s %v", name, args)
 		return "", nil
 	}
+	r.hostCheck = func(transport mounthost.Transport) mounthost.Facts {
+		return mounthost.Facts{
+			Transport: transport,
+			State:     mounthost.Unverified,
+			Summary:   "no definite blocker found; mount not verified",
+		}
+	}
+	r.verifiedMount = func(mounthost.Transport) (string, bool, error) { return "", false, nil }
 	r.daemonHealthy = func(string) bool { return false }
 	return r
 }
@@ -121,15 +132,19 @@ func TestDoctorAllChecksPassOnLinux(t *testing.T) {
 		"PASS  server: https://api.example.com answered (HTTP 401)",
 		"PASS  token: saved token accepted (HTTP 200)",
 		"SKIP  version: server does not advertise a minimum CLI version",
-		"SKIP  fskit extension: FSKit is macOS-only",
+		"UNKNOWN  mount transport: no definite blocker found; mount not verified",
+		"SKIP  fskit inventory: FSKit is macOS-only",
 		"SKIP  portablefsd:",
 		"PASS  mounts: no mounts recorded",
-		"no problems found",
+		"no definite problems found; 1 check(s) remain unverified",
 	)
 }
 
 func TestDoctorConfigParseFailure(t *testing.T) {
 	e, stdout, _ := doctorTestEnv(t)
+	if err := os.MkdirAll(filepath.Dir(e.configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(e.configPath, []byte("{nope"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -260,52 +275,50 @@ func TestDoctorFskitExtensionStates(t *testing.T) {
 		{
 			"not registered",
 			map[string]string{},
-			1,
+			0,
 			[]string{
-				"FAIL  fskit extension: no PortableFS FSKit extension is registered",
-				"fix: install PortableFS.app into /Applications and launch it once",
-				"FILE SYSTEM EXTENSIONS",
+				"UNKNOWN  fskit inventory: no matching PlugInKit registration was listed",
+				"does not establish FSKit mountability",
 			},
 		},
 		{
 			"disabled",
 			map[string]string{releaseID: "-    " + releaseID + "(1.0.0)"},
-			1,
+			0,
 			[]string{
-				"FAIL  fskit extension: extension " + releaseID + " is registered but disabled",
-				"fix: enable it in System Settings",
-				"the per-app list's toggle is unreliable on macOS 26",
+				"UNKNOWN  fskit inventory: PlugInKit election is inventory only",
+				releaseID + "  election=minus",
 			},
 		},
 		{
 			"registered with the default election (leading spaces)",
 			map[string]string{releaseID: "     " + releaseID + "(1.0)"},
-			1,
+			0,
 			[]string{
-				"FAIL  fskit extension: extension " + releaseID + " is registered but has never been enabled",
-				"fix: enable it in System Settings",
+				"UNKNOWN  fskit inventory: PlugInKit election is inventory only",
+				releaseID + "  election=default",
 			},
 		},
 		{
 			"registered with an unknown election",
 			map[string]string{releaseID: "?    " + releaseID + "(1.0.0)"},
-			1,
+			0,
 			[]string{
-				"FAIL  fskit extension: extension " + releaseID + " is registered but has never been enabled",
-				"fix: enable it in System Settings",
+				"UNKNOWN  fskit inventory: PlugInKit election is inventory only",
+				releaseID + "  election=unknown",
 			},
 		},
 		{
 			"enabled",
 			map[string]string{releaseID: "+    " + releaseID + "(1.0.0)"},
 			0,
-			[]string{"PASS  fskit extension: extension " + releaseID + " is registered and enabled"},
+			[]string{"UNKNOWN  fskit inventory:", releaseID + "  election=plus"},
 		},
 		{
 			"dev harness fallback",
 			map[string]string{"dev.portablefs.oss.KitDev.PortableFSDev": "+    dev.portablefs.oss.KitDev.PortableFSDev(1.0.0)"},
 			0,
-			[]string{"PASS  fskit extension: extension dev.portablefs.oss.KitDev.PortableFSDev is registered and enabled"},
+			[]string{"UNKNOWN  fskit inventory:", "dev.portablefs.oss.KitDev.PortableFSDev  election=plus"},
 		},
 	}
 	for _, tc := range cases {
@@ -321,10 +334,9 @@ func TestDoctorFskitExtensionStates(t *testing.T) {
 	}
 }
 
-// TestDoctorFskitPostUpdateStaleness: pluginkit says enabled, but the last
-// mount attempt's log carries the kernel's not-enabled refusal — the known
-// post-update registration staleness whose fix is toggling the extension.
-func TestDoctorFskitPostUpdateStaleness(t *testing.T) {
+// Historical mount logs do not upgrade PlugInKit inventory into an enablement
+// verdict. Only a current mount is authoritative.
+func TestDoctorFskitHistoricalLogRemainsInventoryOnly(t *testing.T) {
 	const releaseID = "dev.portablefs.PortableFSApp.PortableFSExt"
 	_, stdout, r, stateDir := doctorBaseline(t)
 	r.goos = "darwin"
@@ -337,13 +349,13 @@ func TestDoctorFskitPostUpdateStaleness(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateDir, "deadbeef00000000.log"), []byte(logBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
+	if rc := r.execute(); rc != 0 {
+		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
 	}
 	requireContains(t, stdout.String(),
-		"FAIL  fskit extension: extension "+releaseID+" is enabled, but the last mount attempt failed as if it were not (post-update registration staleness",
-		"fix: toggle the extension off and on in System Settings",
-		"then retry the mount",
+		"UNKNOWN  fskit inventory: PlugInKit election is inventory only",
+		releaseID+"  election=plus",
+		"no definite problems found",
 	)
 }
 
@@ -353,10 +365,16 @@ func TestDoctorDaemonDownWithLiveFskitMountFails(t *testing.T) {
 	r.goos = "darwin"
 	r.runCmd = pluginkitFake(t, map[string]string{releaseID: "+    " + releaseID + "(1.0.0)"})
 	r.daemonHealthy = func(string) bool { return false }
-	if err := writeMountState(stateDir, mountState{
-		MountPath: "/Users/me/work", VolumeID: "vol1", Branch: "main",
-		PID: os.Getpid(), Strategy: "fskit",
-	}); err != nil {
+	r.verifiedMount = func(transport mounthost.Transport) (string, bool, error) {
+		if transport == mounthost.FSKit {
+			return "/Users/me/work", true, nil
+		}
+		return "", false, nil
+	}
+	r.e.mountHealthFn = func(*mountState) string { return "live" }
+	fskitState := validFSKitMountState(t, "/Users/me/work")
+	fskitState.VolumeID = "vol1"
+	if err := writeMountState(stateDir, fskitState); err != nil {
 		t.Fatal(err)
 	}
 	if rc := r.execute(); rc != 1 {
@@ -372,16 +390,23 @@ func TestDoctorDaemonDownWithLiveFskitMountFails(t *testing.T) {
 
 func TestDoctorMountHealthFailures(t *testing.T) {
 	_, stdout, r, stateDir := doctorBaseline(t)
-	if err := writeMountState(stateDir, mountState{
-		MountPath: "/tmp/stale", VolumeID: "vol1", Branch: "main",
-		PID: 3999999, Strategy: "fuse",
-	}); err != nil {
+	r.e.mountHealthFn = func(st *mountState) string {
+		if st.Status == mountStatusCredentialExpired {
+			return mountStatusCredentialExpired
+		}
+		return "stale"
+	}
+	staleState := validFuseMountState(t, "/tmp/stale")
+	staleState.VolumeID = "vol1"
+	staleState.PID = 3999999
+	if err := writeMountState(stateDir, staleState); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeMountState(stateDir, mountState{
-		MountPath: "/tmp/expired", VolumeID: "vol2", Branch: "main",
-		PID: os.Getpid(), Strategy: "fuse", Status: mountStatusCredentialExpired,
-	}); err != nil {
+	expiredState := validFuseMountState(t, "/tmp/expired")
+	expiredState.VolumeID = "vol2"
+	expiredState.Status = mountStatusCredentialExpired
+	expiredState.StatusChangedAtMs = 1700000000000
+	if err := writeMountState(stateDir, expiredState); err != nil {
 		t.Fatal(err)
 	}
 	if rc := r.execute(); rc != 1 {
@@ -402,13 +427,14 @@ func TestDoctorJSONOutput(t *testing.T) {
 		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
 	}
 	var out struct {
-		Checks []doctorResult `json:"checks"`
-		Failed int            `json:"failed"`
+		Checks  []doctorResult `json:"checks"`
+		Failed  int            `json:"failed"`
+		Unknown int            `json:"unknown"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("doctor --json must emit one JSON document: %v\n%s", err, stdout.String())
 	}
-	if len(out.Checks) != len(doctorChecks()) || out.Failed != 0 {
+	if len(out.Checks) != len(doctorChecks()) || out.Failed != 0 || out.Unknown != 1 {
 		t.Fatalf("unexpected JSON shape: %+v", out)
 	}
 }
@@ -421,7 +447,7 @@ func TestDoctorCommandRegistered(t *testing.T) {
 	if !ok {
 		t.Fatal("doctor must have detailed help")
 	}
-	for _, want := range []string{"Read-only", "PASS, FAIL, or SKIP", "Exit code 1", "pluginkit"} {
+	for _, want := range []string{"Read-only", "PASS, FAIL, UNKNOWN, or SKIP", "Exit code 1", "PlugInKit"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("doctor help missing %q", want)
 		}

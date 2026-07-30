@@ -14,8 +14,11 @@ import (
 func watchHarness(t *testing.T) (*credentialWatch, *bytes.Buffer, string, string) {
 	t.Helper()
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	mountPath := "/tmp/watch-mount"
-	if err := writeMountState(dir, mountState{MountPath: mountPath, VolumeID: "vol_1", Branch: "main", PID: os.Getpid(), Strategy: "fuse"}); err != nil {
+	if err := writeMountState(dir, validFuseMountState(t, mountPath)); err != nil {
 		t.Fatal(err)
 	}
 	logBuf := &bytes.Buffer{}
@@ -95,6 +98,12 @@ func TestLeaseKeeperExpiredIsVisible(t *testing.T) {
 // remediation, not "live"; JSON carries the same fields.
 func TestMountsShowsCredentialExpired(t *testing.T) {
 	e, stdout, _ := testEnv(t)
+	e.mountHealthFn = func(st *mountState) string {
+		if st.Status == mountStatusCredentialExpired {
+			return mountStatusCredentialExpired
+		}
+		return "live"
+	}
 	stateHome := t.TempDir()
 	e.getenv = func(k string) string {
 		if k == "XDG_STATE_HOME" {
@@ -106,10 +115,11 @@ func TestMountsShowsCredentialExpired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeMountState(dir, mountState{
-		MountPath: "/tmp/w1", VolumeID: "vol_revoked", Branch: "main", PID: os.Getpid(),
-		Strategy: "fuse", Status: mountStatusCredentialExpired, StatusChangedAtMs: 1700000000000,
-	}); err != nil {
+	st := validFuseMountState(t, "/tmp/w1")
+	st.VolumeID = "vol_revoked"
+	st.Status = mountStatusCredentialExpired
+	st.StatusChangedAtMs = 1700000000000
+	if err := writeMountState(dir, st); err != nil {
 		t.Fatal(err)
 	}
 	if rc := e.run([]string{"mounts"}); rc != 0 {

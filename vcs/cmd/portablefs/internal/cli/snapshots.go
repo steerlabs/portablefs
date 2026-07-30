@@ -329,7 +329,10 @@ func cmdFork(e *cmdEnv, args []string) int {
 	// builds require it). Resolved through mode-agnostic metadata — the
 	// manifest head route refuses journal-served branches typed, and those
 	// are exactly the branches cloud volumes have.
-	tenantID := api.resolveVolumeTenant(ctx, volumeID, *branch)
+	tenantID, err := api.resolveVolumeTenant(ctx, volumeID, *branch)
+	if err != nil {
+		return e.fail("fork", fmt.Errorf("resolve source volume tenant: %w", err))
+	}
 
 	var snap *snapshotInfo
 	if *snapshotName == "" {
