@@ -317,6 +317,16 @@ unbracketed IPv6 are rejected. Optional `tcp://` or `fsproto://` public-router
 input is normalized once to the canonical scheme-free dial address emitted in
 leases; clients never perform per-platform scheme fallback.
 
+Router resource admission is bounded without imposing an idle lifetime on
+healthy mounts: `PORTABLEFS_AUTHORITY_ROUTER_MAX_PENDING_CONNECTIONS` defaults
+to 256 handshakes/backend dials, `PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS`
+defaults to 4096 live tunnels across the process, and
+`PORTABLEFS_AUTHORITY_ROUTER_MAX_TUNNELS_PER_LEASE` defaults to 64 live or
+in-flight tunnels for one access lease. The per-lease limit must not exceed the
+global limit. Tune these upward only with matching file-descriptor and memory
+budgets; connections over a bound are refused while existing tunnels continue
+unchanged.
+
 Optional: `PORTABLEFS_MANAGED_VCS_JOURNAL_POOLER_MODE=transaction` when the
 journal DSN reaches a transaction-mode pooler (PgBouncer/pgcat) — the manager
 passes it to every child as `VCS_JOURNAL_POOLER_MODE`, whose connections then

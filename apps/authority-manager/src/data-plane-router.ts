@@ -29,6 +29,51 @@ const DEFAULT_BACKEND_CONNECT_TIMEOUT_MS = 5_000;
 const MAX_ROUTER_CA_BYTES = 256 * 1024;
 const MAX_ROUTER_TLS_MATERIAL_BYTES = 256 * 1024;
 const TLS_PREFLIGHT_TIMEOUT_MS = 5_000;
+const DEFAULT_MAX_PENDING_CONNECTIONS = 256;
+const DEFAULT_MAX_OPEN_TUNNELS = 4096;
+const DEFAULT_MAX_TUNNELS_PER_LEASE = 64;
+
+export interface AuthorityDataPlaneRouterLimits {
+  maxPendingConnections: number;
+  maxOpenTunnels: number;
+  maxTunnelsPerLease: number;
+  maxConnections: number;
+}
+
+export function authorityDataPlaneRouterLimitsFromEnv(
+  env: NodeJS.ProcessEnv
+): AuthorityDataPlaneRouterLimits {
+  const maxPendingConnections = positiveIntegerEnv(
+    env,
+    "PORTABLEFS_AUTHORITY_ROUTER_MAX_PENDING_CONNECTIONS",
+    DEFAULT_MAX_PENDING_CONNECTIONS
+  );
+  const maxOpenTunnels = positiveIntegerEnv(
+    env,
+    "PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS",
+    DEFAULT_MAX_OPEN_TUNNELS
+  );
+  const maxTunnelsPerLease = positiveIntegerEnv(
+    env,
+    "PORTABLEFS_AUTHORITY_ROUTER_MAX_TUNNELS_PER_LEASE",
+    DEFAULT_MAX_TUNNELS_PER_LEASE
+  );
+  if (maxTunnelsPerLease > maxOpenTunnels) {
+    throw new Error(
+      "PORTABLEFS_AUTHORITY_ROUTER_MAX_TUNNELS_PER_LEASE must not exceed PORTABLEFS_AUTHORITY_ROUTER_MAX_OPEN_TUNNELS."
+    );
+  }
+  const maxConnections = maxPendingConnections + maxOpenTunnels;
+  if (!Number.isSafeInteger(maxConnections)) {
+    throw new Error("PortableFS authority router connection limits exceed the safe integer range.");
+  }
+  return {
+    maxPendingConnections,
+    maxOpenTunnels,
+    maxTunnelsPerLease,
+    maxConnections,
+  };
+}
 
 export interface AuthorityDataPlaneRoute {
   authorityInstanceId: string;
@@ -79,39 +124,119 @@ interface LeaseTunnel {
   backend: Socket;
 }
 
+export interface LeaseTunnelReservation {
+  accessLeaseId: string;
+  tokenGeneration: string;
+  reservationId: symbol;
+}
+
 export class LeaseTunnelRegistry {
   private readonly tunnelsByLease = new Map<string, Set<LeaseTunnel>>();
+  private readonly reservationsByLease = new Map<string, Set<LeaseTunnelReservation>>();
+  private readonly maxOpenTunnels: number;
+  private readonly maxTunnelsPerLease: number;
+  private openTunnels = 0;
+  private pendingTunnels = 0;
 
-  register(
+  constructor(
+    limits: Pick<AuthorityDataPlaneRouterLimits, "maxOpenTunnels" | "maxTunnelsPerLease"> = {
+      maxOpenTunnels: DEFAULT_MAX_OPEN_TUNNELS,
+      maxTunnelsPerLease: DEFAULT_MAX_TUNNELS_PER_LEASE,
+    }
+  ) {
+    this.maxOpenTunnels = positiveSafeInteger(limits.maxOpenTunnels, "maxOpenTunnels");
+    this.maxTunnelsPerLease = positiveSafeInteger(
+      limits.maxTunnelsPerLease,
+      "maxTunnelsPerLease"
+    );
+    if (this.maxTunnelsPerLease > this.maxOpenTunnels) {
+      throw new Error("maxTunnelsPerLease must not exceed maxOpenTunnels.");
+    }
+  }
+
+  reserve(
     accessLeaseId: string,
-    tokenGeneration: string,
+    tokenGeneration: string
+  ): LeaseTunnelReservation | null {
+    const openForLease = this.tunnelsByLease.get(accessLeaseId)?.size ?? 0;
+    const pendingForLease = this.reservationsByLease.get(accessLeaseId)?.size ?? 0;
+    if (
+      openForLease + pendingForLease >= this.maxTunnelsPerLease ||
+      this.openTunnels + this.pendingTunnels >= this.maxOpenTunnels
+    ) {
+      return null;
+    }
+    const reservation: LeaseTunnelReservation = {
+      accessLeaseId,
+      tokenGeneration,
+      reservationId: Symbol(accessLeaseId),
+    };
+    const reservations =
+      this.reservationsByLease.get(accessLeaseId) ?? new Set<LeaseTunnelReservation>();
+    reservations.add(reservation);
+    this.reservationsByLease.set(accessLeaseId, reservations);
+    this.pendingTunnels += 1;
+    return reservation;
+  }
+
+  registerReserved(
+    reservation: LeaseTunnelReservation,
     client: Socket,
     backend: Socket
-  ): void {
-    const tunnel: LeaseTunnel = { tokenGeneration, client, backend };
-    const tunnels = this.tunnelsByLease.get(accessLeaseId) ?? new Set<LeaseTunnel>();
+  ): boolean {
+    if (client.destroyed || backend.destroyed) {
+      this.releaseReservation(reservation);
+      return false;
+    }
+    if (!this.consumeReservation(reservation)) {
+      return false;
+    }
+    const tunnel: LeaseTunnel = {
+      tokenGeneration: reservation.tokenGeneration,
+      client,
+      backend,
+    };
+    const tunnels =
+      this.tunnelsByLease.get(reservation.accessLeaseId) ?? new Set<LeaseTunnel>();
     tunnels.add(tunnel);
-    this.tunnelsByLease.set(accessLeaseId, tunnels);
+    this.tunnelsByLease.set(reservation.accessLeaseId, tunnels);
+    this.openTunnels += 1;
     const remove = () => {
-      const set = this.tunnelsByLease.get(accessLeaseId);
+      const set = this.tunnelsByLease.get(reservation.accessLeaseId);
       if (!set) {
         return;
       }
-      set.delete(tunnel);
+      if (!set.delete(tunnel)) {
+        return;
+      }
+      this.openTunnels -= 1;
       if (set.size === 0) {
-        this.tunnelsByLease.delete(accessLeaseId);
+        this.tunnelsByLease.delete(reservation.accessLeaseId);
       }
     };
-    client.once("close", remove);
-    backend.once("close", remove);
+    client.once("close", () => {
+      remove();
+      backend.destroy();
+    });
+    backend.once("close", () => {
+      remove();
+      client.destroy();
+    });
+    return true;
+  }
+
+  releaseReservation(reservation: LeaseTunnelReservation): void {
+    this.consumeReservation(reservation);
   }
 
   closeLease(accessLeaseId: string): void {
+    this.deleteReservations(accessLeaseId);
     const tunnels = this.tunnelsByLease.get(accessLeaseId);
     if (!tunnels) {
       return;
     }
     this.tunnelsByLease.delete(accessLeaseId);
+    this.openTunnels -= tunnels.size;
     for (const tunnel of tunnels) {
       tunnel.client.destroy();
       tunnel.backend.destroy();
@@ -122,6 +247,18 @@ export class LeaseTunnelRegistry {
   // admitted under a token generation other than the current one (rotation
   // fencing, both directions).
   closeSupersededGenerations(accessLeaseId: string, currentTokenGeneration: string): void {
+    const reservations = this.reservationsByLease.get(accessLeaseId);
+    if (reservations) {
+      for (const reservation of [...reservations]) {
+        if (reservation.tokenGeneration !== currentTokenGeneration) {
+          reservations.delete(reservation);
+          this.pendingTunnels -= 1;
+        }
+      }
+      if (reservations.size === 0) {
+        this.reservationsByLease.delete(accessLeaseId);
+      }
+    }
     const tunnels = this.tunnelsByLease.get(accessLeaseId);
     if (!tunnels) {
       return;
@@ -129,6 +266,7 @@ export class LeaseTunnelRegistry {
     for (const tunnel of [...tunnels]) {
       if (tunnel.tokenGeneration !== currentTokenGeneration) {
         tunnels.delete(tunnel);
+        this.openTunnels -= 1;
         tunnel.client.destroy();
         tunnel.backend.destroy();
       }
@@ -144,11 +282,32 @@ export class LeaseTunnelRegistry {
 
   /** Every live lease-scoped tunnel, for the manager's /metrics gauge. */
   totalOpenTunnels(): number {
-    let total = 0;
-    for (const tunnels of this.tunnelsByLease.values()) {
-      total += tunnels.size;
+    return this.openTunnels;
+  }
+
+  pendingTunnelCount(): number {
+    return this.pendingTunnels;
+  }
+
+  private consumeReservation(reservation: LeaseTunnelReservation): boolean {
+    const reservations = this.reservationsByLease.get(reservation.accessLeaseId);
+    if (!reservations?.delete(reservation)) {
+      return false;
     }
-    return total;
+    this.pendingTunnels -= 1;
+    if (reservations.size === 0) {
+      this.reservationsByLease.delete(reservation.accessLeaseId);
+    }
+    return true;
+  }
+
+  private deleteReservations(accessLeaseId: string): void {
+    const reservations = this.reservationsByLease.get(accessLeaseId);
+    if (!reservations) {
+      return;
+    }
+    this.reservationsByLease.delete(accessLeaseId);
+    this.pendingTunnels -= reservations.size;
   }
 }
 
@@ -230,6 +389,8 @@ export interface AuthorityDataPlaneRouterConfig {
   dataPlaneTransport?: DataPlaneTransport;
   handshakeTimeoutMs?: number;
   backendConnectTimeoutMs?: number;
+  maxPendingConnections?: number;
+  maxConnections?: number;
   // When set, lease-token tunnels are registered here so lease end and token
   // rotation can close them (see LeaseTunnelRegistry).
   tunnelRegistry?: LeaseTunnelRegistry;
@@ -715,8 +876,24 @@ export function createAuthorityDataPlaneRouterServer(
   routeTable: AuthorityDataPlaneRouteTable,
   config: AuthorityDataPlaneRouterConfig = {}
 ): Server {
+  const maxPendingConnections = positiveSafeInteger(
+    config.maxPendingConnections ?? DEFAULT_MAX_PENDING_CONNECTIONS,
+    "maxPendingConnections"
+  );
+  const maxConnections = positiveSafeInteger(
+    config.maxConnections ?? DEFAULT_MAX_PENDING_CONNECTIONS + DEFAULT_MAX_OPEN_TUNNELS,
+    "maxConnections"
+  );
+  let pendingConnections = 0;
   const handler = (socket: Socket) => {
-    void handleClient(socket, routeTable, config);
+    if (pendingConnections >= maxPendingConnections) {
+      socket.destroy();
+      return;
+    }
+    pendingConnections += 1;
+    void handleClient(socket, routeTable, config).finally(() => {
+      pendingConnections -= 1;
+    });
   };
 
   const tls =
@@ -739,18 +916,22 @@ export function createAuthorityDataPlaneRouterServer(
       validateRouterTLSIdentity(tls, transport);
     }
   }
+  let server: Server;
   if (tls) {
-    return createTlsServer(
+    server = createTlsServer(
       {
         cert: tls.cert,
         key: tls.key,
         minVersion: "TLSv1.3",
+        handshakeTimeout: config.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
       },
       handler
     );
+  } else {
+    server = createNetServer(handler);
   }
-
-  return createNetServer(handler);
+  server.maxConnections = maxConnections;
+  return server;
 }
 
 export function validateAuthorityDataPlaneRouterConfig(args: {
@@ -819,6 +1000,8 @@ async function handleClient(
   config: AuthorityDataPlaneRouterConfig
 ): Promise<void> {
   const handshakeTimeoutMs = config.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+  let backend: Socket | undefined;
+  let reservation: LeaseTunnelReservation | undefined;
   try {
     const sessionToken = await readTokenFrame(client, handshakeTimeoutMs);
     const route = routeTable.resolveSessionToken(sessionToken);
@@ -826,11 +1009,23 @@ async function handleClient(
       await rejectClient(client);
       return;
     }
-    const backend = await connectBackend(route, {
+    if (route.accessLeaseId !== undefined && config.tunnelRegistry) {
+      reservation =
+        config.tunnelRegistry.reserve(
+          route.accessLeaseId,
+          route.tokenGeneration ?? "1"
+        ) ?? undefined;
+      if (!reservation) {
+        await rejectClient(client);
+        return;
+      }
+    }
+    const connectedBackend = await connectBackend(route, {
       connectTimeoutMs: config.backendConnectTimeoutMs ?? DEFAULT_BACKEND_CONNECT_TIMEOUT_MS,
       handshakeTimeoutMs,
     });
-    if (route.accessLeaseId !== undefined && config.tunnelRegistry) {
+    backend = connectedBackend;
+    if (reservation && config.tunnelRegistry) {
       // The lease may have ended or rotated while the backend dial awaited
       // (its events fire only for already-registered tunnels). Re-resolve and
       // register synchronously before admitting, so no lease transition can
@@ -841,25 +1036,49 @@ async function handleClient(
         revalidated.accessLeaseId !== route.accessLeaseId ||
         revalidated.tokenGeneration !== route.tokenGeneration
       ) {
-        backend.destroy();
+        connectedBackend.destroy();
         await rejectClient(client);
         return;
       }
-      config.tunnelRegistry.register(
-        route.accessLeaseId,
-        route.tokenGeneration ?? "1",
-        client,
-        backend
-      );
+      if (!config.tunnelRegistry.registerReserved(reservation, client, connectedBackend)) {
+        connectedBackend.destroy();
+        await rejectClient(client);
+        return;
+      }
+      reservation = undefined;
     }
     await acceptClient(client);
-    client.pipe(backend);
-    backend.pipe(client);
-    backend.once("error", () => client.destroy());
-    client.once("error", () => backend.destroy());
+    client.pipe(connectedBackend);
+    connectedBackend.pipe(client);
+    connectedBackend.once("error", () => client.destroy());
+    client.once("error", () => connectedBackend.destroy());
   } catch {
     client.destroy();
+    backend?.destroy();
+  } finally {
+    if (reservation && config.tunnelRegistry) {
+      config.tunnelRegistry.releaseReservation(reservation);
+    }
   }
+}
+
+function positiveIntegerEnv(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number
+): number {
+  const raw = env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  return positiveSafeInteger(Number(raw), name);
+}
+
+function positiveSafeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive safe integer.`);
+  }
+  return value;
 }
 
 async function connectBackend(
@@ -868,11 +1087,13 @@ async function connectBackend(
 ): Promise<Socket> {
   let lastError: unknown;
   for (const address of route.backendAddresses) {
+    let socket: Socket | undefined;
     try {
-      const socket = await connectSocket(address, options.connectTimeoutMs);
+      socket = await connectSocket(address, options.connectTimeoutMs);
       await writeBackendTokenFrame(socket, route.backendAuthToken, options.handshakeTimeoutMs);
       return socket;
     } catch (error) {
+      socket?.destroy();
       lastError = error;
     }
   }

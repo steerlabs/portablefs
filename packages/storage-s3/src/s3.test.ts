@@ -1,6 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { BlobRangeNotSatisfiableError, sha256Buffer } from "@portablefs/core";
 import { S3BlobStore, s3ConfigFromEnv, signS3RequestHeaders } from "./index.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 async function collect(stream: AsyncIterable<Buffer>): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -169,6 +173,161 @@ describe("S3BlobStore", () => {
     await store.put(bytes, { digest: sha256Buffer(bytes), checkExisting: false });
 
     expect(requests).toEqual(["PUT"]);
+  });
+
+  test("aborts a stalled storage request at the configured deadline", async () => {
+    vi.useFakeTimers();
+    const store = new S3BlobStore({
+      endpoint: "https://t3.storageapi.dev",
+      bucket: "bucket-test",
+      region: "auto",
+      urlStyle: "virtual-host",
+      accessKeyId: "access",
+      secretAccessKey: "secret",
+      requestTimeoutMs: 1_000,
+      fetchImpl: async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener(
+            "abort",
+            () => reject(signal.reason ?? new DOMException("aborted", "AbortError")),
+            { once: true }
+          );
+        }),
+    });
+
+    const pending = store.has(
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await rejected;
+  });
+
+  test("propagates caller aborts through blob writes", async () => {
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    const store = new S3BlobStore({
+      endpoint: "https://t3.storageapi.dev",
+      bucket: "bucket-test",
+      region: "auto",
+      urlStyle: "virtual-host",
+      accessKeyId: "access",
+      secretAccessKey: "secret",
+      fetchImpl: async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          observedSignal = init?.signal ?? undefined;
+          observedSignal?.addEventListener(
+            "abort",
+            () =>
+              reject(
+                observedSignal?.reason ?? new DOMException("upload aborted", "AbortError")
+              ),
+            { once: true }
+          );
+        }),
+    });
+    const bytes = Buffer.from("abandon this upload");
+    const pending = store.put(bytes, {
+      digest: sha256Buffer(bytes),
+      checkExisting: false,
+      signal: controller.signal,
+    });
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  test("does not miss an abort between response headers and deadline wrapping", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("client disconnected", "AbortError");
+    const store = new S3BlobStore({
+      endpoint: "https://t3.storageapi.dev",
+      bucket: "bucket-test",
+      region: "auto",
+      urlStyle: "virtual-host",
+      accessKeyId: "access",
+      secretAccessKey: "secret",
+      fetchImpl: async () => {
+        controller.abort(reason);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull: () => new Promise<void>(() => undefined),
+          }),
+          { status: 200 }
+        );
+      },
+    });
+    const bytes = Buffer.from("abandon this upload");
+
+    await expect(
+      store.put(bytes, {
+        digest: sha256Buffer(bytes),
+        checkExisting: false,
+        signal: controller.signal,
+      })
+    ).rejects.toBe(reason);
+  });
+
+  test("bounds and cancels hostile S3 error bodies", async () => {
+    let canceled = false;
+    const oversized = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(64 * 1024)));
+      },
+      cancel() {
+        canceled = true;
+      },
+    });
+    const store = new S3BlobStore({
+      endpoint: "https://t3.storageapi.dev",
+      bucket: "bucket-test",
+      region: "auto",
+      urlStyle: "virtual-host",
+      accessKeyId: "access",
+      secretAccessKey: "secret",
+      fetchImpl: async () => new Response(oversized, { status: 500 }),
+    });
+
+    const error = await store
+      .has("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+      .then(
+        () => undefined,
+        (caught: unknown) => caught
+      );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message.length).toBeLessThan(9 * 1024);
+    expect(canceled).toBe(true);
+  });
+
+  test("requires HTTPS except for an explicit loopback development endpoint", () => {
+    const config = {
+      bucket: "bucket-test",
+      region: "auto",
+      urlStyle: "path" as const,
+      accessKeyId: "access",
+      secretAccessKey: "secret",
+    };
+    expect(
+      () => new S3BlobStore({ ...config, endpoint: "http://storage.example.test" })
+    ).toThrow(/must use HTTPS/);
+    expect(
+      () =>
+        new S3BlobStore({
+          ...config,
+          endpoint: "http://storage.example.test",
+          allowInsecureEndpoint: true,
+        })
+    ).toThrow(/must use HTTPS/);
+    expect(
+      () =>
+        new S3BlobStore({
+          ...config,
+          endpoint: "http://127.0.0.1:9000",
+          allowInsecureEndpoint: true,
+        })
+    ).not.toThrow();
   });
 
   test("stores compressible blobs compressed while reading original bytes", async () => {
@@ -357,12 +516,14 @@ describe("S3BlobStore", () => {
         AWS_S3_URL_STYLE: "virtual-host",
         AWS_ACCESS_KEY_ID: "access",
         AWS_SECRET_ACCESS_KEY: "secret",
+        VOLUME_S3_REQUEST_TIMEOUT_MS: "45000",
       })
     ).toMatchObject({
       endpoint: "https://t3.storageapi.dev",
       bucket: "bucket-test",
       region: "auto",
       urlStyle: "virtual-host",
+      requestTimeoutMs: 45_000,
     });
   });
 
