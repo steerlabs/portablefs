@@ -392,7 +392,7 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 			)
 		}
 	}
-	kernelPaths, err := portableFSKernelInventory()
+	kernelPaths, err := e.kernelMountInventory()
 	if err != nil {
 		return fmt.Errorf("strict PortableFS kernel inventory: %w", err)
 	}
@@ -425,7 +425,9 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(cfg.controlSock); err == nil {
+	liveness := newFsdControl(cfg.controlSock)
+	liveness.httpClient.Timeout = 3 * time.Second
+	if liveness.healthy() {
 		ctl, err := connectCompatiblePortablefsd(cfg, e.version)
 		if err != nil {
 			return fmt.Errorf("strict daemon identity inventory: %w", err)
@@ -450,8 +452,6 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 		if len(persistedByRef) != 0 {
 			return fmt.Errorf("durable daemon attach inventory contains entries absent from the live daemon")
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("inspect daemon control socket: %w", err)
 	} else {
 		for i := range intents {
 			if intents[i].AttachRef != "" {
@@ -1370,7 +1370,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return failReady(err)
 		}
 		operation.fsType = fskitCfg.fsType
-		ctl, err := ensurePortablefsd(fskitCfg, filepath.Dir(stateDir), e.version)
+		ctl, err := e.ensureFskitDaemon(fskitCfg, filepath.Dir(stateDir))
 		if err != nil {
 			return failReady(err)
 		}
@@ -1742,19 +1742,32 @@ func cmdUmount(e *cmdEnv, args []string) int {
 			if cfgErr != nil {
 				return e.fail("umount", cfgErr)
 			}
-			ctl, err := connectCompatiblePortablefsd(cfg, e.version)
+			// An unclean exit or reboot can leave the exact attach registry
+			// and write-back WAL durable while no daemon process survives.
+			// Explicit unmount reconciliation starts the exact installed peer
+			// so that peer can reload and drain that preserved transaction.
+			ctl, err := e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
 			if err != nil {
 				return e.fail("umount", fmt.Errorf("kernel mount is gone and the recorded wrapper identity is not live; exact FSKit attach %s could not be reconciled: %w", st.AttachRef, err))
 			}
-			if force {
+			attachPresent, inventoryErr := verifyRecordedFskitAttach(ctl, st)
+			if inventoryErr != nil {
+				return e.fail("umount", fmt.Errorf("verify orphaned FSKit attach %s: %w", st.AttachRef, inventoryErr))
+			}
+			if force && attachPresent {
 				if jobID, err := ctl.forceDetach(st.AttachRef); err != nil {
 					return e.fail("umount", fmt.Errorf("force-reconcile FSKit attach %s: %w", st.AttachRef, err))
 				} else if jobID != "" {
 					recoveryJobs = append(recoveryJobs, jobID)
 				}
-			} else {
-				if err := ctl.unmountAttach(st.AttachRef); err != nil {
-					return e.fail("umount", fmt.Errorf("reconcile orphaned FSKit attach %s: %w", st.AttachRef, err))
+			} else if attachPresent {
+				if err := ctl.unmountRecordedAttach(st); err != nil {
+					return e.fail("umount", fmt.Errorf(
+						"reconcile orphaned FSKit attach %s: %w; retry with `portablefs umount --force %s` to durably park any offline write-back tail",
+						st.AttachRef,
+						err,
+						mountPath,
+					))
 				}
 			}
 		} else if force && st.Strategy == "fuse" {
@@ -1834,12 +1847,23 @@ func cmdUmount(e *cmdEnv, args []string) int {
 			if err != nil {
 				return e.fail("umount", err)
 			}
-			ctl, err := connectCompatiblePortablefsd(cfg, e.version)
+			ctl, err := e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
 			if err != nil {
 				return e.fail("umount", fmt.Errorf("connect exact FSKit daemon for unmount: %w", err))
 			}
-			if err := ctl.unmountAttach(st.AttachRef); err != nil {
-				return e.fail("umount", fmt.Errorf("daemon-owned FSKit unmount refused; mount remains live: %w", err))
+			present, err := verifyRecordedFskitAttach(ctl, st)
+			if err != nil {
+				return e.fail("umount", fmt.Errorf("verify exact FSKit attach for unmount: %w", err))
+			}
+			if !present {
+				return e.fail("umount", fmt.Errorf("exact FSKit attach %s is absent; mount remains live", st.AttachRef))
+			}
+			if err := ctl.unmountRecordedAttach(st); err != nil {
+				return e.fail("umount", fmt.Errorf(
+					"daemon-owned FSKit unmount refused; mount remains live: %w; retry when the authority is reachable, or run `portablefs umount --force %s` to durably park any offline write-back tail",
+					err,
+					mountPath,
+				))
 			}
 			fskitUnmountCompleted = true
 		} else if mounted {
@@ -2346,28 +2370,17 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) ([]string
 		if cfgErr != nil {
 			return nil, cfgErr
 		}
-		if _, statErr := os.Lstat(cfg.controlSock); statErr == nil {
-			ctl, err = connectCompatiblePortablefsd(cfg, e.version)
-			if err != nil {
-				return nil, fmt.Errorf("verify daemon identity for attach %s: %w", st.AttachRef, err)
-			}
-			attaches, listErr := ctl.listAttaches()
-			if listErr != nil {
-				return nil, fmt.Errorf("inventory exact attach %s: %w", st.AttachRef, listErr)
-			}
-			for _, attach := range attaches {
-				if attach.AttachRef == st.AttachRef {
-					if attach.MountPath != st.MountPath || attach.VolumeID != st.VolumeID || attach.Branch != st.Branch {
-						return nil, fmt.Errorf("attach %s identity does not match the intent", st.AttachRef)
-					}
-					attachPresent = true
-					break
-				}
-			}
-		} else if !os.IsNotExist(statErr) {
-			return nil, fmt.Errorf("inspect daemon control socket: %w", statErr)
-		} else {
-			return nil, fmt.Errorf("daemon is unavailable, so exact attach %s absence cannot be proven", st.AttachRef)
+		stateDir, stateErr := e.mountStateDir()
+		if stateErr != nil {
+			return nil, stateErr
+		}
+		ctl, err = e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
+		if err != nil {
+			return nil, fmt.Errorf("start exact daemon to reconcile attach %s: %w", st.AttachRef, err)
+		}
+		attachPresent, err = verifyRecordedFskitAttach(ctl, st)
+		if err != nil {
+			return nil, fmt.Errorf("inventory exact attach %s: %w", st.AttachRef, err)
 		}
 	}
 
@@ -2414,7 +2427,7 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) ([]string
 				}
 				attachPresent = false
 			} else {
-				if err := ctl.unmountAttach(st.AttachRef); err != nil {
+				if err := ctl.unmountRecordedAttach(st); err != nil {
 					return nil, fmt.Errorf("daemon-owned exact FSKit unmount: %w", err)
 				}
 				attachPresent = false
@@ -2431,7 +2444,7 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) ([]string
 				recoveryJobs = append(recoveryJobs, jobID)
 			}
 		} else {
-			if err := ctl.unmountAttach(st.AttachRef); err != nil {
+			if err := ctl.unmountRecordedAttach(st); err != nil {
 				return nil, err
 			}
 		}
@@ -2500,9 +2513,28 @@ func (e *cmdEnv) drainBeforeUnmount(st *mountState) error {
 		if err != nil {
 			return err
 		}
-		ctl, err := connectCompatiblePortablefsd(cfg, e.version)
+		stateDir, err := e.mountStateDir()
+		if err != nil {
+			return err
+		}
+		ctl, err := e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
 		if err != nil {
 			return fmt.Errorf("pre-unmount daemon identity: %w", err)
+		}
+		present, err := verifyRecordedFskitAttach(ctl, st)
+		if err != nil {
+			return fmt.Errorf("pre-unmount attach identity: %w", err)
+		}
+		if !present {
+			return fmt.Errorf("pre-unmount attach %s is absent from the exact daemon", st.AttachRef)
+		}
+		if st.AccessLease != nil {
+			if !validLeaseState(st.AccessLease) {
+				return fmt.Errorf("pre-unmount access lease for attach %s is invalid", st.AttachRef)
+			}
+			if err := ctl.setCredential(st.AttachRef, st.AccessLease.AccessToken); err != nil {
+				return fmt.Errorf("pre-unmount credential activation failed: %w", err)
+			}
 		}
 		if _, err := ctl.syncAttach(st.AttachRef); err != nil {
 			return fmt.Errorf("pre-unmount drain failed: %w", err)
@@ -2546,9 +2578,20 @@ func (e *cmdEnv) forceDetachForUnmount(st *mountState) ([]string, error) {
 	if cfgErr != nil {
 		return nil, cfgErr
 	}
-	ctl, identityErr := connectCompatiblePortablefsd(cfg, e.version)
+	stateDir, stateErr := e.mountStateDir()
+	if stateErr != nil {
+		return nil, stateErr
+	}
+	ctl, identityErr := e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
 	if identityErr != nil {
 		return nil, fmt.Errorf("exact daemon identity is required for forced detach: %w", identityErr)
+	}
+	present, inventoryErr := verifyRecordedFskitAttach(ctl, st)
+	if inventoryErr != nil {
+		return nil, fmt.Errorf("verify exact daemon attach for forced detach: %w", inventoryErr)
+	}
+	if !present {
+		return nil, fmt.Errorf("exact daemon attach %s is absent; refusing to force-detach an uncorrelated kernel mount", st.AttachRef)
 	}
 	jobID, err := ctl.forceDetach(st.AttachRef)
 	if err != nil {

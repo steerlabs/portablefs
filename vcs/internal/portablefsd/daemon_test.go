@@ -2505,7 +2505,9 @@ func TestDaemonRevivesAttachRefAfterRestart(t *testing.T) {
 	if er := cCred2.callErr(&pfslocal.LookupRequest{Dir: credRes2.Root, Name: []byte("credential.txt")}); er.Errno != darwinEIO {
 		t.Fatalf("credential-pending lookup errno=%d want EIO", er.Errno)
 	}
-	controlJSON(t, p2.hc, http.MethodPost, "/v1/attaches/"+credentialRef+"/credential", map[string]string{"authToken": ""}, http.StatusNoContent, nil)
+	controlJSON(t, p2.hc, http.MethodPost, "/v1/attaches/"+credentialRef+"/credential", map[string]any{
+		"authToken": "", "onlyIfPending": true,
+	}, http.StatusNoContent, nil)
 	credLookup := cCred2.call(&pfslocal.LookupRequest{Dir: credRes2.Root, Name: []byte("credential.txt")}).(*pfslocal.LookupReply)
 	if credLookup.Attr.Kind != pfslocal.ItemKindFile {
 		t.Fatalf("post-credential endpoint lookup = %+v", credLookup)
