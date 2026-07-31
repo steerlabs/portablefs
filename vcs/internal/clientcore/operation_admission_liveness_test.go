@@ -144,3 +144,48 @@ func TestUncontendedExactLocksDoNotSuspendPublication(t *testing.T) {
 		t.Fatalf("uncontended operation wait hooks = %d, want 0", got)
 	}
 }
+
+func TestAuthorityMutationsShareLaneAndExcludeDelegationInstallation(t *testing.T) {
+	v := &Volume{}
+	endA, err := v.beginAuthorityMutation(context.Background(), nil, "d/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endB, err := v.beginAuthorityMutation(context.Background(), nil, "d/b")
+	if err != nil {
+		endA()
+		t.Fatal(err)
+	}
+
+	acquired := make(chan struct{})
+	go func() {
+		claim, claimErr := v.delegationTransitions.begin(
+			context.Background(),
+			acquireTransition,
+			[]string{"d"},
+			nil,
+		)
+		if claimErr != nil {
+			return
+		}
+		close(acquired)
+		claim.end()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("delegation installation crossed active authority mutations")
+	case <-time.After(20 * time.Millisecond):
+	}
+	endA()
+	select {
+	case <-acquired:
+		t.Fatal("delegation installation crossed the remaining authority mutation")
+	case <-time.After(20 * time.Millisecond):
+	}
+	endB()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("delegation installation did not resume after authority lane drained")
+	}
+}

@@ -9,8 +9,8 @@ import (
 )
 
 // kernelMountIdentity is the product-neutral subset of a kernel mount record
-// needed for ownership decisions. On macOS, FSKit providers may share a URL
-// scheme and implementation, so the filesystem type is the product identity.
+// needed for ownership decisions. The filesystem type and resource scheme are
+// both immutable parts of this product's FSKit identity.
 type kernelMountIdentity struct {
 	fsType string
 	path   string
@@ -30,7 +30,7 @@ func portableFSKernelPaths(mounts []kernelMountIdentity) ([]string, error) {
 		if !isPortableFSKernelType(mount.fsType) {
 			continue
 		}
-		ref, ok := strings.CutPrefix(mount.source, "pfs://")
+		ref, ok := strings.CutPrefix(mount.source, fskitidentity.ResourcePrefix)
 		if !ok || !mountid.ValidAttachRef(ref) {
 			return nil, fmt.Errorf(
 				"PortableFS kernel mount at %s has invalid attach source %q",

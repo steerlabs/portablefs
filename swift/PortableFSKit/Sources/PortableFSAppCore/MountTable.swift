@@ -14,7 +14,8 @@ public struct MountedFilesystem: Equatable, Sendable {
         self.mountedFrom = mountedFrom
     }
 
-    /// For PortableFS mounts, `mountedFrom` is the `pfs://<attachRef>`
+    /// For PortableFS mounts, `mountedFrom` is the
+    /// `<resourceScheme>://<attachRef>`
     /// resource passed to `mount -t pfs`.
     public var attachRef: String? {
         MountTable.attachRef(fromMountedFrom: mountedFrom)
@@ -27,10 +28,10 @@ public enum MountTable {
     // mount(8) and identifies its live mounts through getfsstat(2).
     public static let portableFSFileSystemTypeName = PortableFSIdentity.fileSystemTypeName
 
-    /// Extracts the attach ref from a `pfs://<ref>` device spec, tolerating
-    /// trailing slashes appended by mount tooling.
+    /// Extracts the attach ref from the exact release resource scheme,
+    /// tolerating trailing slashes appended by mount tooling.
     public static func attachRef(fromMountedFrom device: String) -> String? {
-        let prefix = "pfs://"
+        let prefix = PortableFSIdentity.resourcePrefix
         guard device.hasPrefix(prefix) else {
             return nil
         }

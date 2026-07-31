@@ -21,7 +21,7 @@ For signed local extension testing, set `DEVELOPMENT_TEAM` in `Config/Developmen
 
 ```sh
 mkdir -p /tmp/pfs
-/sbin/mount -t pfs "pfs://<ref>" /tmp/pfs
+/sbin/mount -t pfs "dev.portablefs.oss://<ref>" /tmp/pfs
 ```
 
 6. Unmount when done:

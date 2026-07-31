@@ -81,6 +81,111 @@ func opCount(v *Volume) int64 {
 	return v.Metrics.Counter("authority_ops_total").Value()
 }
 
+func TestAuthorityMutationCannotRaceSameMountDelegationInstallation(t *testing.T) {
+	addr := serveCore(t)
+	v := dialCore(t, addr, Options{})
+	watchInvalidationsForTest(t, v)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir: %d", st)
+	}
+	if _, st := v.Create(ctx, "d/seed", 0o644); st != fsproto.OK {
+		t.Fatalf("delegated seed create: %d", st)
+	}
+	if !v.wb.Covers("d/seed") {
+		t.Fatal("seed create did not install the prerequisite delegation")
+	}
+
+	endAuthority, err := v.beginAuthorityMutation(ctx, nil, "d/authority")
+	if err != nil {
+		t.Fatalf("begin authority mutation: %v", err)
+	}
+	if v.wb.Covers("d/seed") {
+		endAuthority()
+		t.Fatal("authority lane retained an overlapping delegation")
+	}
+
+	concurrentDone := make(chan Status, 1)
+	go func() {
+		_, st := v.Create(ctx, "d/concurrent", 0o644)
+		concurrentDone <- st
+	}()
+	select {
+	case st := <-concurrentDone:
+		endAuthority()
+		t.Fatalf("delegation acquisition crossed authority RPC lane: %d", st)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	_, st, callErr := v.client.Create("d/authority", 0o644)
+	endAuthority()
+	if callErr != nil || st != fsproto.OK {
+		t.Fatalf("authority create: status=%d err=%v", st, callErr)
+	}
+	select {
+	case st := <-concurrentDone:
+		if st != fsproto.OK {
+			t.Fatalf("concurrent create after authority lane: %d", st)
+		}
+	case <-ctx.Done():
+		t.Fatal("delegation acquisition did not resume after authority mutation")
+	}
+	if err := v.Fsync("d/concurrent"); err != nil {
+		t.Fatalf("flush concurrent create: %v", err)
+	}
+	if _, st, err := v.client.Getattr("d/authority"); err != nil || st != fsproto.OK {
+		t.Fatalf("authority file missing: status=%d err=%v", st, err)
+	}
+	if _, st, err := v.client.Getattr("d/concurrent"); err != nil || st != fsproto.OK {
+		t.Fatalf("concurrent file missing: status=%d err=%v", st, err)
+	}
+}
+
+func TestRenameDirectoryReleasesDescendantDelegationBeforeAuthorityRPC(t *testing.T) {
+	addr := serveCore(t)
+	v := dialCore(t, addr, Options{})
+	watchInvalidationsForTest(t, v)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tree, st := v.Mkdir(ctx, "tree", 0o755)
+	if st != fsproto.OK {
+		t.Fatalf("mkdir tree: %d", st)
+	}
+	if _, st := v.Mkdir(ctx, "tree/child", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir child: %d", st)
+	}
+	// Publish the locally-created child and release the parent grant so the
+	// next create deliberately acquires the descendant scope.
+	if err := v.wb.ReleaseFor(ctx, "tree"); err != nil {
+		t.Fatalf("publish child: %v", err)
+	}
+	if _, st := v.Create(ctx, "tree/child/file", 0o644); st != fsproto.OK {
+		t.Fatalf("create descendant file: %d", st)
+	}
+	if !v.wb.Covers("tree/child/file") {
+		t.Fatal("test precondition: descendant grant was not installed")
+	}
+
+	if st := v.Rename(
+		ctx,
+		"tree",
+		"moved",
+		NewNodeState(tree.Ino, tree.Ino != 0),
+		nil,
+	); st != fsproto.OK {
+		t.Fatalf("rename delegated ancestor: %d", st)
+	}
+	if v.wb.Covers("tree/child/file") {
+		t.Fatal("rename retained the old descendant delegation")
+	}
+	if _, st := v.Lookup(ctx, "moved/child/file"); st != fsproto.OK {
+		t.Fatalf("renamed descendant lookup: %d", st)
+	}
+}
+
 func TestVolumePublicOpsEndToEnd(t *testing.T) {
 	addr := serveCore(t)
 	v := dialCore(t, addr, Options{})

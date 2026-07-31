@@ -45,7 +45,7 @@
 		<string>pfs</string>
 		<key>FSSupportedSchemes</key>
 		<array>
-			<string>pfs</string>
+			<string>dev.portablefs.oss</string>
 		</array>
 		<key>FSSupportsBlockResources</key>
 		<false/>

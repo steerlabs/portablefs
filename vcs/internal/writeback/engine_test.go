@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,6 +168,194 @@ func TestAdmissionRevalidatesAfterGrantInstallation(t *testing.T) {
 	acquires, _, releases := auth.calls()
 	if acquires != 1 || releases != 1 {
 		t.Fatalf("grant lifecycle: acquires=%d releases=%d, want 1/1", acquires, releases)
+	}
+}
+
+func TestDelegationAcquireGateCoversRemoteGrantThroughLocalInstallation(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+
+	gateEntered := make(chan struct{})
+	allowAcquire := make(chan struct{})
+	gateEnded := make(chan struct{})
+	var grantEscapedGate atomic.Bool
+	e, err := Open(context.Background(), Config{
+		StateDir:    t.TempDir(),
+		VolumeID:    "vol",
+		Branch:      "main",
+		Remote:      auth,
+		BudgetBytes: 1 << 30,
+		DelegationAcquireGate: func(
+			context.Context,
+			string,
+		) (DelegationAcquireGuard, error) {
+			close(gateEntered)
+			<-allowAcquire
+			return DelegationAcquireGuard{
+				End: func() { close(gateEnded) },
+			}, nil
+		},
+		Events: Events{
+			OnGrant: func(string) {
+				select {
+				case <-gateEnded:
+					grantEscapedGate.Store(true)
+				default:
+				}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	type createResult struct {
+		handled bool
+		err     error
+	}
+	result := make(chan createResult, 1)
+	go func() {
+		_, handled, createErr := e.Create(
+			context.Background(), "d/file", 0o644, false, false,
+		)
+		result <- createResult{handled: handled, err: createErr}
+	}()
+	select {
+	case <-gateEntered:
+	case <-time.After(time.Second):
+		t.Fatal("delegation resolver did not enter acquire gate")
+	}
+	acquires, _, _ := auth.calls()
+	if acquires != 0 {
+		t.Fatalf("remote acquire crossed closed gate: %d", acquires)
+	}
+	close(allowAcquire)
+	select {
+	case got := <-result:
+		if got.err != nil || !got.handled {
+			t.Fatalf("create after gate: handled=%v err=%v", got.handled, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("create did not finish after acquire gate opened")
+	}
+	select {
+	case <-gateEnded:
+	case <-time.After(time.Second):
+		t.Fatal("acquire gate did not end")
+	}
+	if grantEscapedGate.Load() {
+		t.Fatal("grant became visible after acquire gate ended")
+	}
+	if !e.Covers("d/file") {
+		t.Fatal("grant was not installed before acquire gate ended")
+	}
+}
+
+func TestDelegationAcquireGuardRejectsAndReleasesBeforeInstallation(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	var granted atomic.Bool
+	e, err := Open(context.Background(), Config{
+		StateDir:    t.TempDir(),
+		VolumeID:    "vol",
+		Branch:      "main",
+		Remote:      auth,
+		BudgetBytes: 1 << 30,
+		DelegationAcquireGate: func(
+			context.Context,
+			string,
+		) (DelegationAcquireGuard, error) {
+			return DelegationAcquireGuard{
+				ReconcileReply: func(AcquireReply) bool { return false },
+			}, nil
+		},
+		Events: Events{
+			OnGrant: func(string) { granted.Store(true) },
+		},
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	if _, handled, err := e.Create(
+		context.Background(),
+		"d/file",
+		0o644,
+		false,
+		false,
+	); err != nil || handled {
+		t.Fatalf("rejected grant result: handled=%v err=%v", handled, err)
+	}
+	if granted.Load() {
+		t.Fatal("rejected grant fired OnGrant")
+	}
+	if e.Covers("d/file") {
+		t.Fatal("rejected grant became locally visible")
+	}
+	acquires, _, releases := auth.calls()
+	if acquires != 1 || releases != 1 {
+		t.Fatalf("grant lifecycle: acquires=%d releases=%d, want 1/1", acquires, releases)
+	}
+}
+
+type grantedReplyErrorRemote struct {
+	*fakeAuthority
+}
+
+func (r grantedReplyErrorRemote) DelegationAcquire(
+	ctx context.Context,
+	scope string,
+	writebackID string,
+) (AcquireReply, error) {
+	reply, err := r.fakeAuthority.DelegationAcquire(ctx, scope, writebackID)
+	if err != nil || !reply.Granted {
+		return reply, err
+	}
+	return reply, errors.New("replay snapshot seed failed")
+}
+
+func TestDelegationAcquireErrorAfterGrantDefinitelyReleasesEpoch(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.mu.Unlock()
+	remote := grantedReplyErrorRemote{fakeAuthority: auth}
+	e, err := Open(context.Background(), Config{
+		StateDir:    t.TempDir(),
+		VolumeID:    "vol",
+		Branch:      "main",
+		Remote:      remote,
+		BudgetBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.ForceClose("test teardown") })
+
+	if _, handled, err := e.Create(
+		context.Background(),
+		"d/file",
+		0o644,
+		false,
+		false,
+	); err == nil || handled {
+		t.Fatalf("post-grant error: handled=%v err=%v", handled, err)
+	}
+	if e.Covers("d/file") {
+		t.Fatal("errored grant became locally visible")
+	}
+	acquires, _, releases := auth.calls()
+	if acquires != 1 || releases != 1 {
+		t.Fatalf("grant lifecycle: acquires=%d releases=%d, want 1/1", acquires, releases)
+	}
+	if got := auth.grantCount(); got != 0 {
+		t.Fatalf("authority retained %d unknown grants", got)
 	}
 }
 
@@ -1152,6 +1341,37 @@ func TestBeginExactReleasesEveryDelegationAndHoldsAcquisitionGate(t *testing.T) 
 		t.Fatalf("BeginExact left %d authority grants", got)
 	}
 	end()
+}
+
+func TestReleaseForIncludesDescendantDelegations(t *testing.T) {
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["tree"] = true
+	auth.dirs["tree/child"] = true
+	auth.mu.Unlock()
+	engine := testEngine(t, auth)
+	ctx := context.Background()
+	if _, handled, err := engine.Create(
+		ctx,
+		"tree/child/file",
+		0o644,
+		false,
+		false,
+	); err != nil || !handled {
+		t.Fatalf("seed descendant grant: handled=%v err=%v", handled, err)
+	}
+	if !engine.Covers("tree/child/file") {
+		t.Fatal("test precondition: descendant delegation was not installed")
+	}
+	if err := engine.ReleaseFor(ctx, "tree"); err != nil {
+		t.Fatalf("release ancestor: %v", err)
+	}
+	if engine.Covers("tree/child/file") {
+		t.Fatal("ancestor release retained a descendant delegation")
+	}
+	if got := auth.grantCount(); got != 0 {
+		t.Fatalf("authority retained %d descendant grants", got)
+	}
 }
 
 type blockedAcquireRemote struct {

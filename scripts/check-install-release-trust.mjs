@@ -46,6 +46,8 @@ for (const identity of [
   "EXPECTED_TEAM_ID=B47U2LLKHW",
   "EXPECTED_BUNDLE_ID=dev.portablefs.PortableFSApp",
   "EXPECTED_APP_GROUP=B47U2LLKHW.pfsoss",
+  "EXPECTED_FS_TYPE=pfs",
+  "EXPECTED_RESOURCE_SCHEME=dev.portablefs.oss",
 ]) {
   requireText(canonicalPolicy, identity, `canonical identity ${identity}`);
 }

@@ -153,13 +153,101 @@ private struct AdapterHarness: @unchecked Sendable {
     var root: FSItem
 }
 
+// Compile-only fixture: these are the three public call shapes shipped before
+// module identity became injectable. Keeping them type-checked prevents a
+// future identity refactor from breaking existing OSS embedders.
+@available(macOS 26.0, *)
+private func legacyAdapterAPISourceCompatibility(
+    core: VolumeCore,
+    statReply: PfsStatfsReply,
+    capabilities: PfsCapabilities
+) async throws {
+    _ = PortableFSFileSystem(
+        resolverFactory: { PfsSocketPathResolver(bundle: .main) }
+    )
+    _ = try await PortableFSVolume.make(core: core, attachRef: "compat")
+    _ = PfsFSKitMapping.statfs(
+        from: statReply,
+        capabilities: capabilities
+    )
+}
+
 @available(macOS 26.0, *)
 private func makeAdapterHarness() async throws -> AdapterHarness {
     let daemon = try PfsLocalMockDaemon()
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let volume = try await PortableFSVolume.make(core: core, attachRef: "mock")
+    let volume = try await PortableFSVolume.make(
+        core: core,
+        attachRef: "mock"
+    )
     let root = try await core.rootItem()
     return AdapterHarness(daemon: daemon, core: core, volume: volume, root: root)
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterRoutesOnlyItsInjectedResourceScheme() async throws {
+    let identity = try PortableFSModuleIdentity(
+        fileSystemTypeName: PortableFSIdentity.fileSystemTypeName,
+        resourceScheme: PortableFSIdentity.resourceScheme
+    )
+    let fileSystem = PortableFSFileSystem(moduleIdentity: identity)
+
+    func probe(_ rawURL: String) async -> FSMatchResult {
+        await withCheckedContinuation { continuation in
+            fileSystem.probeResource(
+                resource: FSGenericURLResource(url: URL(string: rawURL)!)
+            ) { result, error in
+                #expect(error == nil)
+                continuation.resume(returning: result?.result ?? .notRecognized)
+            }
+        }
+    }
+
+    #expect(await probe("dev.portablefs.oss://att_AAAAAAAAAAAAAAAAAAAAAA") == .usable)
+    #expect(await probe("pfs://att_AAAAAAAAAAAAAAAAAAAAAA") == .notRecognized)
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterNamespacesStableFSKitEntityIdentifiersByModule() throws {
+    let ossIdentity = try PortableFSModuleIdentity(
+        fileSystemTypeName: "pfs",
+        resourceScheme: "dev.portablefs.oss"
+    )
+    let openSteerIdentity = try PortableFSModuleIdentity(
+        fileSystemTypeName: "portablefs",
+        resourceScheme: "pfs"
+    )
+
+    let ossVolume = PortableFSFileSystem.stableEntityUUID(
+        kind: "volume",
+        stableID: "prod-smoke",
+        moduleIdentity: ossIdentity
+    )
+    #expect(
+        ossVolume == PortableFSFileSystem.stableEntityUUID(
+            kind: "volume",
+            stableID: "prod-smoke",
+            moduleIdentity: ossIdentity
+        )
+    )
+    #expect(
+        ossVolume != PortableFSFileSystem.stableEntityUUID(
+            kind: "volume",
+            stableID: "prod-smoke",
+            moduleIdentity: openSteerIdentity
+        )
+    )
+    #expect(
+        ossVolume != PortableFSFileSystem.stableEntityUUID(
+            kind: "container",
+            stableID: "prod-smoke",
+            moduleIdentity: ossIdentity
+        )
+    )
+
+    let bytes = withUnsafeBytes(of: ossVolume.uuid) { Array($0) }
+    #expect(bytes[6] >> 4 == 8)
+    #expect(bytes[8] >> 6 == 2)
 }
 
 @available(macOS 26.0, *)

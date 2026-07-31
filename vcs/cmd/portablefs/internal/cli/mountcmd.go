@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
@@ -1443,7 +1444,12 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err := operation.writeIntent("kernel-mounted", os.Getpid(), processIdentity); err != nil {
 			return failAfterKernelMount(err)
 		}
-		if err := waitForFSKitRoot(mountPath, fskitCfg.fsType, "pfs://"+attachRef, 15*time.Second); err != nil {
+		if err := waitForFSKitRoot(
+			mountPath,
+			fskitCfg.fsType,
+			fskitidentity.ResourcePrefix+attachRef,
+			15*time.Second,
+		); err != nil {
 			return failAfterKernelMount(err)
 		}
 		// Rotated/renewed lease credentials must reach the daemon: it owns

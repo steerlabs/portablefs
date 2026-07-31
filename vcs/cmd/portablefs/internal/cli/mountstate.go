@@ -47,7 +47,8 @@ type mountState struct {
 	DataPlaneServerName  string `json:"dataPlaneServerName,omitempty"`
 	AuthorityURL         string `json:"authorityUrl,omitempty"`
 	// AttachRef is the portablefsd attach this fskit mount serves (the
-	// pfs:// device the kernel holds); umount diagnostics correlate on it.
+	// release-scoped generic URL resource the kernel holds); umount
+	// diagnostics correlate on it.
 	AttachRef   string `json:"attachRef,omitempty"`
 	StartedAtMs int64  `json:"startedAtMs"`
 	// LocalDirs are the machine-local graft roots this mount serves
