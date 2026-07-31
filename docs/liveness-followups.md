@@ -96,7 +96,7 @@ available on STREAM` immediately after the file became visible; retry
 succeeded implicitly. Not yet reproduced or root-caused; needs a repro
 with daemon tracing before any code changes.
 
-### 9. macOS FSKit platform gaps (Apple; Feedback radars to file)
+### 8. macOS FSKit platform gaps (Apple; Feedback radars to file)
 
 Kernel-verified on macOS 26:
 - Negative dentries are cached permanently: no revalidation against
