@@ -219,7 +219,7 @@ func (tx *mutationTransaction) captureMutation(r wal.Record) error {
 		n := fs.resolveForRW(r.Path, r.Ino)
 		tx.captureInode(n)
 		tx.captureTruncateBlocks(n, r.Size)
-	case wal.OpChmod, wal.OpChtimes, wal.OpChown:
+	case wal.OpChmod, wal.OpChtimes, wal.OpChown, wal.OpChflags:
 		tx.captureInode(fs.resolveForRW(r.Path, r.Ino))
 	case wal.OpRemove, wal.OpOrphan:
 		parent, base := fs.resolveParent(r.Path)

@@ -41,6 +41,8 @@ function inode(fields: Partial<Pft2Inode> & Pick<Pft2Inode, "ino" | "kind">): Pf
     mtimeMs: 0n,
     ctimeMs: 0n,
     atimeMs: 0n,
+    birthtimeMs: 0n,
+    flags: 0,
     symlinkTarget: "",
     ...fields,
   };
@@ -140,6 +142,67 @@ export function sampleNodes(): Map<string, Pft2Node> {
       {
         kind: Pft2NodeKind.Inode,
         inode: inode({ ino: 99n, kind: Pft2FileKind.Regular }),
+      },
+    ],
+    // Fields 14/15 (APPENDED). These vectors pin the exact appended bytes in
+    // BOTH languages; the pre-existing inode vectors above deliberately keep
+    // both fields at their omitted zero default, so their bytes are unchanged
+    // by the format revision (the forward-only compat contract).
+    [
+      "inode-birthtime-flags",
+      {
+        kind: Pft2NodeKind.Inode,
+        inode: inode({
+          ino: 21474836488n,
+          kind: Pft2FileKind.Regular,
+          mode: 0o600,
+          uid: 501,
+          gid: 20,
+          nlink: 2n,
+          size: 4096n,
+          mtimeMs: 1700000009999n,
+          ctimeMs: 1700000008888n,
+          atimeMs: 1700000007777n,
+          birthtimeMs: 1700000000001n,
+          flags: 0x00008000, // UF_HIDDEN
+          extentRoot: labelRef("extent-root", 555n),
+        }),
+      },
+    ],
+    // A birth time BEFORE the epoch (zigzag-negative) and the full uint32 flag
+    // space: the two encodings a Go/TS varint disagreement would show up in
+    // first.
+    [
+      "inode-birthtime-negative-flags-max",
+      {
+        kind: Pft2NodeKind.Inode,
+        inode: inode({
+          ino: 7n,
+          kind: Pft2FileKind.Directory,
+          mode: 0o755,
+          mtimeMs: 12n,
+          ctimeMs: 13n,
+          atimeMs: 14n,
+          birthtimeMs: -1700000000001n,
+          flags: 0xffffffff,
+          directoryRoot: labelRef("dir-root", 200n),
+        }),
+      },
+    ],
+    // Flags without a birth time: field 14 omitted, field 15 present — proves
+    // the two appended fields are independently optional.
+    [
+      "inode-flags-only",
+      {
+        kind: Pft2NodeKind.Inode,
+        inode: inode({
+          ino: 8n,
+          kind: Pft2FileKind.Symlink,
+          mode: 0o777,
+          size: BigInt(utf8Encode(symlinkTarget).length),
+          symlinkTarget,
+          flags: 0x00000002, // UF_IMMUTABLE
+        }),
       },
     ],
     [

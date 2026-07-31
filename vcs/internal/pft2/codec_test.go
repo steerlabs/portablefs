@@ -59,6 +59,33 @@ func sampleNodes() map[string]*Node {
 		"inode-empty-file": {Kind: KindInode, Inode: &Inode{
 			Ino: 99, Kind: FileKindRegular, Nlink: 1,
 		}},
+		// Fields 14/15 (APPENDED). These vectors pin the exact appended bytes
+		// in BOTH languages; the pre-existing inode vectors above deliberately
+		// keep both fields at their omitted zero default, so their bytes are
+		// unchanged by the format revision (the forward-only compat contract).
+		"inode-birthtime-flags": {Kind: KindInode, Inode: &Inode{
+			Ino: 21474836488, Kind: FileKindRegular, Mode: 0o600, UID: 501, GID: 20,
+			Nlink: 2, Size: 4096, MtimeMs: 1700000009999, CtimeMs: 1700000008888,
+			AtimeMs: 1700000007777, BirthtimeMs: 1700000000001,
+			Flags:      0x00008000, // UF_HIDDEN
+			ExtentRoot: refPtr(labelRef("extent-root", 555)),
+		}},
+		// A birth time BEFORE the epoch (zigzag-negative) and the full uint32
+		// flag space: the two encodings a Go/TS varint disagreement would show
+		// up in first.
+		"inode-birthtime-negative-flags-max": {Kind: KindInode, Inode: &Inode{
+			Ino: 7, Kind: FileKindDirectory, Mode: 0o755, Nlink: 1,
+			MtimeMs: 12, CtimeMs: 13, AtimeMs: 14, BirthtimeMs: -1700000000001,
+			Flags:         0xFFFFFFFF,
+			DirectoryRoot: refPtr(labelRef("dir-root", 200)),
+		}},
+		// Flags without a birth time: field 14 omitted, field 15 present —
+		// proves the two appended fields are independently optional.
+		"inode-flags-only": {Kind: KindInode, Inode: &Inode{
+			Ino: 8, Kind: FileKindSymlink, Mode: 0o777, Nlink: 1,
+			Size: uint64(len(symlinkTarget)), SymlinkTarget: symlinkTarget,
+			Flags: 0x00000002, // UF_IMMUTABLE
+		}},
 		"directory-leaf": {Kind: KindDirectoryLeaf, DirectoryLeaf: &DirectoryLeaf{
 			Entries: []DirEntry{
 				{Name: ".hidden", Ino: 12, Kind: FileKindRegular},
@@ -243,6 +270,109 @@ func TestRootXattrLeavesRoundTripAndOrderingFence(t *testing.T) {
 	body = append(body, 0x18, 0x01) // root field 3 after appended field 8
 	if _, err := decodeRoot(body); err == nil {
 		t.Fatal("decoder accepted a field after repeated root xattr leaves")
+	}
+}
+
+// TestInodeBirthtimeFlagsCompatContract pins the format revision's compat
+// contract for the APPENDED inode fields 14 (birthtime_ms) and 15 (flags):
+//
+//   - an inode written WITHOUT them (every pre-revision tree) decodes with both
+//     at zero and re-encodes byte-identically, so old trees are readable and
+//     their digests never move;
+//   - an inode carrying them round-trips exactly;
+//   - a new writer that stamps neither emits bytes an OLD reader still accepts
+//     (nothing appended at all), while an inode that DOES carry them appends
+//     only fields an old reader rejects as unknown — fail-closed, never a
+//     silent read that loses the metadata. That is the schema's standing
+//     forward-only promise, the same one xattr_leaves took.
+func TestInodeBirthtimeFlagsCompatContract(t *testing.T) {
+	legacy := &Inode{
+		Ino: 4242, Kind: FileKindRegular, Mode: 0o644, Nlink: 1, Size: 9,
+		MtimeMs: 1700000000000, CtimeMs: 1700000000000, AtimeMs: 1700000000000,
+	}
+	legacyEncoded, err := EncodeNode(&Node{Kind: KindInode, Inode: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDecoded, err := DecodeNodeKind(legacyEncoded, KindInode)
+	if err != nil {
+		t.Fatalf("decode inode without fields 14/15: %v", err)
+	}
+	if legacyDecoded.Inode.BirthtimeMs != 0 || legacyDecoded.Inode.Flags != 0 {
+		t.Fatalf("old-format inode decoded birthtime=%d flags=%#x, want zeros",
+			legacyDecoded.Inode.BirthtimeMs, legacyDecoded.Inode.Flags)
+	}
+	legacyReencoded, err := EncodeNode(legacyDecoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(legacyEncoded, legacyReencoded) {
+		t.Fatal("old-format inode did not re-encode byte-identically")
+	}
+
+	// A new writer that stamps neither field emits exactly the old bytes: the
+	// revision costs nothing on a tree that never uses it.
+	unstamped := *legacy
+	unstampedEncoded, err := EncodeNode(&Node{Kind: KindInode, Inode: &unstamped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(legacyEncoded, unstampedEncoded) {
+		t.Fatal("an unstamped inode must encode to the pre-revision bytes")
+	}
+
+	for _, tc := range []struct {
+		name        string
+		birthtimeMs int64
+		flags       uint32
+	}{
+		{"both", 1700000000001, 0x00008000},
+		{"birthtime only", 1699999999999, 0},
+		{"flags only", 0, 0xFFFFFFFF},
+		{"pre-epoch birthtime", -1700000000001, 0x00000002},
+		{"bound birthtime", MaxAbsTimeMs, 1},
+		{"negative bound birthtime", -MaxAbsTimeMs, 1},
+	} {
+		stamped := *legacy
+		stamped.BirthtimeMs = tc.birthtimeMs
+		stamped.Flags = tc.flags
+		encoded, err := EncodeNode(&Node{Kind: KindInode, Inode: &stamped})
+		if err != nil {
+			t.Fatalf("%s: encode: %v", tc.name, err)
+		}
+		decoded, err := DecodeNodeKind(encoded, KindInode)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", tc.name, err)
+		}
+		if decoded.Inode.BirthtimeMs != tc.birthtimeMs || decoded.Inode.Flags != tc.flags {
+			t.Fatalf("%s: round-trip gave birthtime=%d flags=%#x, want %d/%#x",
+				tc.name, decoded.Inode.BirthtimeMs, decoded.Inode.Flags, tc.birthtimeMs, tc.flags)
+		}
+		reencoded, err := EncodeNode(decoded)
+		if err != nil {
+			t.Fatalf("%s: re-encode: %v", tc.name, err)
+		}
+		if !bytes.Equal(encoded, reencoded) {
+			t.Fatalf("%s: re-encode differs", tc.name)
+		}
+		// The stamped inode body is the old body plus APPENDED trailing
+		// fields: an old reader consumes fields 1..13 unchanged and then hits
+		// an unknown field number, so it fails closed on the new metadata
+		// instead of silently dropping it.
+		if !bytes.HasPrefix(appendInode(nil, &stamped), appendInode(nil, legacy)) {
+			t.Fatalf("%s: fields 14/15 are not a pure append onto the old body", tc.name)
+		}
+		if _, err := decodeInode(appendInode(nil, &stamped)); err != nil {
+			t.Fatalf("%s: new reader must accept the stamped body: %v", tc.name, err)
+		}
+	}
+
+	// Out-of-range birth times fail validation on BOTH directions, exactly
+	// like the other timestamps.
+	bad := *legacy
+	bad.BirthtimeMs = MaxAbsTimeMs + 1
+	if _, err := EncodeNode(&Node{Kind: KindInode, Inode: &bad}); !errors.Is(err, ErrInvalidNode) {
+		t.Fatalf("encoding an out-of-range birth time returned %v", err)
 	}
 }
 

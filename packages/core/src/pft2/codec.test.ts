@@ -243,6 +243,8 @@ describe("pft2 codec", () => {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        birthtimeMs: 0n,
+        flags: 0,
         symlinkTarget: "abcd",
       },
     };
@@ -352,5 +354,70 @@ describe("pft2 codec", () => {
     expect(() =>
       verifyObjectBytes({ digest: labelDigest("other"), size: ref.size }, encoded)
     ).toThrow(Pft2CorruptError);
+  });
+
+  // The TS twin of Go's TestInodeBirthtimeFlagsCompatContract. Cross-language
+  // byte identity for the stamped encodings is proven by the golden vectors;
+  // this pins the compat contract itself on the TS side.
+  it("decodes pre-revision inodes with a zero birth time and zero flags", () => {
+    const legacy = {
+      ino: 4242n,
+      kind: Pft2FileKind.Regular,
+      mode: 0o644,
+      uid: 0,
+      gid: 0,
+      nlink: 1n,
+      size: 9n,
+      mtimeMs: 1700000000000n,
+      ctimeMs: 1700000000000n,
+      atimeMs: 1700000000000n,
+      birthtimeMs: 0n,
+      flags: 0,
+      symlinkTarget: "",
+    };
+    const legacyEncoded = encodePft2Node({ kind: Pft2NodeKind.Inode, inode: legacy });
+    const decoded = decodePft2NodeKind(legacyEncoded, Pft2NodeKind.Inode);
+    expect(decoded.kind).toBe(Pft2NodeKind.Inode);
+    if (decoded.kind !== Pft2NodeKind.Inode) throw new Error("unreachable");
+    // Zero is "unknown", not 1970: an old tree must not be read as if it had
+    // been created at the epoch with no flags set on purpose.
+    expect(decoded.inode.birthtimeMs).toBe(0n);
+    expect(decoded.inode.flags).toBe(0);
+    expect(Buffer.from(encodePft2Node(decoded)).toString("hex")).toBe(
+      Buffer.from(legacyEncoded).toString("hex")
+    );
+
+    for (const [birthtimeMs, flags] of [
+      [1700000000001n, 0x00008000],
+      [1699999999999n, 0],
+      [0n, 0xffffffff],
+      [-1700000000001n, 0x00000002],
+    ] as const) {
+      const stamped = { ...legacy, birthtimeMs, flags };
+      const encoded = encodePft2Node({ kind: Pft2NodeKind.Inode, inode: stamped });
+      const back = decodePft2NodeKind(encoded, Pft2NodeKind.Inode);
+      if (back.kind !== Pft2NodeKind.Inode) throw new Error("unreachable");
+      expect(back.inode.birthtimeMs).toBe(birthtimeMs);
+      expect(back.inode.flags).toBe(flags);
+      expect(Buffer.from(encodePft2Node(back)).toString("hex")).toBe(
+        Buffer.from(encoded).toString("hex")
+      );
+    }
+
+    // An unstamped inode still encodes to exactly the pre-revision bytes, so
+    // the revision costs nothing on a tree that never uses it.
+    expect(
+      Buffer.from(
+        encodePft2Node({ kind: Pft2NodeKind.Inode, inode: { ...legacy, birthtimeMs: 0n, flags: 0 } })
+      ).toString("hex")
+    ).toBe(Buffer.from(legacyEncoded).toString("hex"));
+
+    // Out-of-range birth times fail validation exactly like the other times.
+    expect(() =>
+      encodePft2Node({
+        kind: Pft2NodeKind.Inode,
+        inode: { ...legacy, birthtimeMs: (1n << 56n) },
+      })
+    ).toThrow(Pft2InvalidNodeError);
   });
 });

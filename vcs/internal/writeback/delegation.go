@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -566,7 +567,13 @@ func (e *Engine) BeginExact(ctx context.Context) (end func(), err error) {
 	if resumeLock != nil {
 		resumeLock()
 	}
-	end = e.exactMu.Unlock
+	// Single-shot: the caller's exclusion may be handed to a parked exact
+	// identity's replayer (clientcore exclusionRelease), so the end closure
+	// can be invoked from a different goroutine than the one that acquired it.
+	// Make a second invocation impossible rather than an unlock-of-unlocked
+	// panic if any owner ever double-releases.
+	var endOnce sync.Once
+	end = func() { endOnce.Do(e.exactMu.Unlock) }
 	if err := e.MutationError(); err != nil {
 		end()
 		return nil, err

@@ -803,6 +803,82 @@ func TestClientSplitsMultiGroupSetattr(t *testing.T) {
 	_ = h
 }
 
+// TestClientSplitsFlagsIntoItsOwnGroup: chflags is a FOURTH exact group. The
+// authority answers any multi-group setattr with EINVAL, so a client that
+// fused the flag word onto the chmod/chown request would fail the whole
+// syscall; one that dropped it would report a success getattr contradicts.
+// Both are visible here.
+func TestClientSplitsFlagsIntoItsOwnGroup(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "M1")
+	if _, st, err := cli.Create("f", 0o644); err != nil || st != OK {
+		t.Fatalf("create: st=%d err=%v", st, err)
+	}
+	const flags = uint32(0x8000_0002)
+	// mode + times + owner + flags in ONE kernel SETATTR: four exact identities.
+	if st, err := cli.SetattrVContext(context.Background(), "f", 0, SetattrV{
+		Mode: 0o600, SetMode: true,
+		MtimeMs: 123000, SetTime: true,
+		AtimeMs: 456000, SetATime: true,
+		UID: 1000, GID: 2000, SetUID: true, SetGID: true,
+		Flags: flags, SetFlags: true,
+	}); err != nil || st != OK {
+		t.Fatalf("four-group setattr: st=%d err=%v", st, err)
+	}
+	a, st, err := cli.Getattr("f")
+	if err != nil || st != OK || a == nil {
+		t.Fatalf("getattr: %+v st=%d err=%v", a, st, err)
+	}
+	if a.Mode != 0o600 || a.MtimeMs != 123000 || a.AtimeMs != 456000 ||
+		a.Uid != 1000 || a.Gid != 2000 || a.Flags != flags {
+		t.Fatalf("attrs = %+v, want mode 600 mtime 123000 atime 456000 uid 1000 gid 2000 flags %#x", a, flags)
+	}
+
+	// A flags-ONLY setattr is a single group and must travel as one request,
+	// not through the split loop; clearing to zero is a real durable state and
+	// proves SetFlags (not a nonzero value) is what carries the intent.
+	if st, err := cli.SetattrVContext(context.Background(), "f", 0, SetattrV{SetFlags: true}); err != nil || st != OK {
+		t.Fatalf("flags-only clear: st=%d err=%v", st, err)
+	}
+	if a, st, err := cli.Getattr("f"); err != nil || st != OK || a.Flags != 0 {
+		t.Fatalf("after clear: attr=%+v st=%d err=%v, want flags 0", a, st, err)
+	}
+	if a.Mode != 0o600 {
+		t.Fatalf("clearing flags disturbed mode: %o", a.Mode)
+	}
+
+	// No intent, no group: a setattr with nothing set is a no-op, and a stray
+	// Flags value without SetFlags must not smuggle a chflags in.
+	if st, err := cli.SetattrVContext(context.Background(), "f", 0, SetattrV{Flags: 0x4}); err != nil || st != OK {
+		t.Fatalf("flagless setattr: st=%d err=%v", st, err)
+	}
+	if a, st, err := cli.Getattr("f"); err != nil || st != OK || a.Flags != 0 {
+		t.Fatalf("stray flag word applied without SetFlags: attr=%+v st=%d err=%v", a, st, err)
+	}
+	_ = h
+}
+
+// TestSetattrFlagsRequiresTheFeatureBit pins the honest refusal the client
+// gates on: FeatureFlagPersistence is what says the authority can store a flag
+// word, and an authority that advertises it accepts the group.
+func TestSetattrFlagsRequiresTheFeatureBit(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "M1")
+	if _, st, err := cli.Create("f", 0o644); err != nil || st != OK {
+		t.Fatalf("create: st=%d err=%v", st, err)
+	}
+	if cli.Features()&FeatureFlagPersistence == 0 {
+		t.Fatal("authority does not advertise FeatureFlagPersistence")
+	}
+	if st, err := cli.SetattrVContext(context.Background(), "f", 0, SetattrV{Flags: 0x2, SetFlags: true}); err != nil || st != OK {
+		t.Fatalf("gated chflags: st=%d err=%v", st, err)
+	}
+	if a, st, err := cli.Getattr("f"); err != nil || st != OK || a.Flags != 0x2 {
+		t.Fatalf("attr=%+v st=%d err=%v, want flags 0x2", a, st, err)
+	}
+	_ = h
+}
+
 // TestOpenUnlinkOrphanSurvivesFailover: an unlinked-but-open (pinned) inode
 // parks under a durable journaled pin; the authority crashes and a successor
 // cold-replays the SAME file entry log. The mount resumes its session, keeps

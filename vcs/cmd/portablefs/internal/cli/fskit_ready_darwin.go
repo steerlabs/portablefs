@@ -4,31 +4,41 @@ package cli
 
 import (
 	"fmt"
-	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 )
 
+// Mount identification reads the KERNEL MOUNT TABLE (getfsstat), never
+// statfs/lstat of the mount path. A statfs of a mount point resolves that
+// pathname, which enters the mounted filesystem's root: once a volume is dead
+// the kernel answers EIO, and identification failed exactly when detaching was
+// the remedy. getfsstat reports the same three facts (mount point, filesystem
+// type, source) from the kernel's own table without ever entering the
+// filesystem, so a dead volume with a live daemon classifies — and detaches —
+// exactly like a live one. This mirrors portablefsd's exactFSKitMountPresent.
+
 func verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource string) error {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(mountPath, &stat); err != nil {
+	mount, err := exactKernelMountAt(mountPath)
+	if err != nil {
 		return err
 	}
-	mountedOn := darwinStatfsString(stat.Mntonname[:])
-	if mountedOn != mountPath {
+	if mount == nil {
 		return fmt.Errorf("%w at %s", errRecordedMountAbsent, mountPath)
 	}
-	fsType := darwinStatfsString(stat.Fstypename[:])
-	source := darwinStatfsString(stat.Mntfromname[:])
-	return validateFSKitKernelIdentity(fsType, source, expectedFSType, expectedSource)
+	return validateFSKitKernelIdentity(mount.fsType, mount.source, expectedFSType, expectedSource)
 }
 
 func verifyRecordedMountIdentity(st *mountState) error {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(st.MountPath, &stat); err != nil {
+	// Absence is decided FIRST, exactly as the statfs classifier did: with
+	// nothing mounted at the recorded path there is no kernel object to own,
+	// whatever the record says. Only a real mount is worth validating the
+	// record against — a record that cannot describe one is then an error,
+	// not a silent "absent".
+	mount, err := exactKernelMountAt(st.MountPath)
+	if err != nil {
 		return err
 	}
-	if darwinStatfsString(stat.Mntonname[:]) != st.MountPath {
+	if mount == nil {
 		return fmt.Errorf("%w at %s", errRecordedMountAbsent, st.MountPath)
 	}
 	if st.Strategy != "fskit" || st.AttachRef == "" {
@@ -38,20 +48,10 @@ func verifyRecordedMountIdentity(st *mountState) error {
 	if fsType == "" {
 		fsType = defaultFskitType
 	}
-	return verifyFSKitMountIdentity(
-		st.MountPath,
+	return validateFSKitKernelIdentity(
+		mount.fsType,
+		mount.source,
 		fsType,
 		fskitidentity.ResourcePrefix+st.AttachRef,
 	)
-}
-
-func darwinStatfsString(chars []int8) string {
-	buf := make([]byte, 0, len(chars))
-	for _, char := range chars {
-		if char == 0 {
-			break
-		}
-		buf = append(buf, byte(char))
-	}
-	return string(buf)
 }

@@ -692,6 +692,29 @@ func (s *Server) supportsAtomicXattrFlags() bool {
 	return ok && x.SupportsAtomicXattrFlags()
 }
 
+// InodeMetadataStore is a filesystem's AFFIRMATIVE claim that it durably
+// stores the per-inode metadata behind FeatureFlagPersistence: BSD file flags
+// (Darwin st_flags) and birth time, both fields of the same PFT2 inode record
+// revision.
+//
+// Like every other capability interface here it defaults to FALSE. A
+// capability is a promise about durability, and a store that never made the
+// promise cannot be assumed to keep it: advertising the feature by default
+// would make any store whose persistence drops the fields — the legacy
+// checkpoint manifest carries neither — accept a chflags(2) it silently loses
+// at the next restart, which is exactly the silent no-op the feature bit
+// exists to prevent. Absent the affirmative answer the server does not
+// advertise the bit and refuses the SetFlags group outright, so a client that
+// gated correctly never sends one and a client that did not fails closed.
+type InodeMetadataStore interface {
+	PersistsInodeMetadata() bool
+}
+
+func (s *Server) persistsInodeMetadata() bool {
+	m, ok := s.fs.(InodeMetadataStore)
+	return ok && m.PersistsInodeMetadata()
+}
+
 // HardLinkStore is the authority's atomic hard-link surface. The operation is
 // capability-advertised rather than inferred from generic billy interfaces:
 // older/read-only authorities make clients fail locally with EOPNOTSUPP.

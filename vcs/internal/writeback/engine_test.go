@@ -1571,11 +1571,15 @@ func TestRenameSourceAdmissionErrorPreservesDestinationDelegation(t *testing.T) 
 	}
 }
 
-// TestOverlayExtentBoundReleases pins the no-spill hard bound: a write that
-// would grow a file's extent set past maxFileExtents stops acknowledging
-// locally — it drains, releases the delegation, and falls through to
-// write-through instead of growing without bound.
-func TestOverlayExtentBoundReleases(t *testing.T) {
+// TestOverlayExtentBoundRefusesWithoutDraining pins the no-spill hard bound
+// AND its liveness contract: a write that would grow a file's extent set past
+// maxFileExtents stops acknowledging locally, and because the only thing that
+// could relieve the bound is the uplink that is already behind, the refusal is
+// a definite ENOSPC. It must not escape through a drain-and-release
+// write-through fall-through: that fall-through waits on the stalled uplink
+// inside the write syscall, which is what surfaced as ETIMEDOUT in production
+// and dragged every metadata operation down with it.
+func TestOverlayExtentBoundRefusesWithoutDraining(t *testing.T) {
 	oldExt := maxFileExtents
 	maxFileExtents = 8
 	defer func() { maxFileExtents = oldExt }()
@@ -1589,26 +1593,27 @@ func TestOverlayExtentBoundReleases(t *testing.T) {
 	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
 		t.Fatalf("create: %v %v", handled, err)
 	}
-	fellThrough := false
-	for i := 0; i < 2*maxFileExtents+2; i++ {
+	_, _, releasesBefore := auth.calls()
+	var refused error
+	for i := 0; i < 2*maxFileExtents+2 && refused == nil; i++ {
 		// Disjoint 1-byte writes with gaps: every write is its own extent.
-		// Once the bound trips, the engine tries to drain+release; the
-		// blackholed authority stalls that, so bound the attempt and accept
-		// either outcome shape — what may NOT happen is another local ack.
-		wctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		start := time.Now()
 		_, handled, err := e.WriteAt(wctx, "d/f", int64(i*3), []byte("x"))
+		elapsed := time.Since(start)
 		cancel()
+		if elapsed > 2*time.Second {
+			t.Fatalf("write %d blocked for %s on the stalled uplink", i, elapsed)
+		}
 		if !handled {
-			fellThrough = true
-			_ = err
-			break
+			t.Fatalf("write %d left the delegated lane; the fall-through drain is exactly the unbounded wait", i)
 		}
 		if err != nil {
-			t.Fatalf("handled write %d failed: %v", i, err)
+			refused = err
 		}
 	}
-	if !fellThrough {
-		t.Fatal("extent bound never forced the fall-through")
+	if !errors.Is(refused, ErrNoSpace) {
+		t.Fatalf("extent bound surfaced %v, want %v", refused, ErrNoSpace)
 	}
 	e.mu.RLock()
 	extents := len(e.files["d/f"].extents)
@@ -1616,12 +1621,33 @@ func TestOverlayExtentBoundReleases(t *testing.T) {
 	if extents > maxFileExtents {
 		t.Fatalf("overlay grew to %d extents past the %d bound", extents, maxFileExtents)
 	}
-	// Heal the authority: the parked tail drains and the release completes.
+	if _, _, releasesAfter := auth.calls(); releasesAfter != releasesBefore {
+		t.Fatalf("the bound released %d delegations; a definite ENOSPC must not hand off", releasesAfter-releasesBefore)
+	}
+	if !e.Covers("d/f") {
+		t.Fatal("the bound dropped the covering delegation")
+	}
+	// Heal the authority: the parked tail drains, folding relieves the bound,
+	// and local admission resumes. Bounded resources, not self-healing.
 	auth.mu.Lock()
 	auth.flushErr = nil
 	auth.mu.Unlock()
 	if err := e.DrainAll(ctx); err != nil {
 		t.Fatalf("drain after heal: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, handled, err := e.WriteAt(ctx, "d/f", 1<<20, []byte("y"))
+		if handled && err == nil {
+			break
+		}
+		if !errors.Is(err, ErrNoSpace) {
+			t.Fatalf("post-heal write: handled=%v err=%v", handled, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("local admission never resumed after the uplink healed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

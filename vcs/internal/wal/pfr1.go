@@ -69,6 +69,14 @@ import (
 //	                                  XattrReplace; mutually exclusive)
 //	 29  chtimes_keep_mtime           bool (OpChtimes only: update atime while
 //	                                  preserving the mtime at ordered apply)
+//	 30  flags                        uint32 (OpChflags only: the ABSOLUTE new
+//	                                  BSD file-flag word — Darwin st_flags —
+//	                                  stored unmasked, exactly as the client
+//	                                  sent it. 0 is a legal OpChflags value
+//	                                  meaning "clear every flag"; the encoding
+//	                                  omits it like any other default, and the
+//	                                  op itself is what makes the record a
+//	                                  chflags. Every other op must carry 0.)
 //
 //	Envelope:
 //	  1  session_id  string (1..MaxPFR1SessionIDBytes)
@@ -80,7 +88,11 @@ import (
 // Frozen Op enum values (wire = the Go constants; frozen here for the record):
 // Create=1 Write=2 Truncate=3 Mkdir=4 Remove=5 Rename=6 Symlink=7 Chmod=8
 // Chtimes=9 Chown=10 Orphan=11 Reap=12 Control=13 Batch=14 Link=15
-// Setxattr=16 Removexattr=17.
+// Setxattr=16 Removexattr=17 JournalEntry=18 (NOT a record op — see
+// pfr1OpValid) Chflags=19.
+// OpChflags addresses its inode by field 15 ino (else field 3 path) and
+// carries the absolute new flag word in field 30; a decoder older than the op
+// rejects it (unknown op — the sanctioned fencing for appended ops).
 // OpLink reuses fields Path (existing source name) and NewPath (new link);
 // Ino carries the source inode identity for deterministic replay.
 // OpSetxattr/OpRemovexattr address their inode by field 15 ino (else field 3
@@ -133,13 +145,22 @@ const (
 	MaxPFR1XattrValueBytes = MaxXattrValueBytes
 )
 
-// maxPFR1Op is the highest frozen Op value.
-const maxPFR1Op = uint64(OpRemovexattr)
+// maxPFR1Op is the highest frozen Op value the record encoding covers.
+const maxPFR1Op = uint64(OpChflags)
+
+// pfr1OpValid reports whether op is a record-shaped op this canonical encoding
+// covers. OpJournalEntry (18) sits inside the numeric range but is deliberately
+// EXCLUDED: it frames a whole PFJ3 entry for the file-backed entry log and is
+// never a journal record, so it must keep failing closed here exactly as it did
+// when it sat above the old ceiling.
+func pfr1OpValid(op uint64) bool {
+	return op != 0 && op <= maxPFR1Op && op != uint64(OpJournalEntry)
+}
 
 // PFR1SizeEstimate returns a conservative UPPER bound on len(EncodePFR1(r)).
 // Callers use it to split logical batches into bounded intents before any
 // reservation; over-estimation only makes chunks slightly smaller. Each of
-// the 29 record fields needs at most a two-byte tag plus a ten-byte
+// the 30 record fields needs at most a two-byte tag plus a ten-byte
 // varint/length prefix, so 384 bytes covers every fixed field and the magic
 // even for a structurally valid record carrying irrelevant nonzero scalars.
 func PFR1SizeEstimate(r Record) int {
@@ -200,7 +221,7 @@ func DecodePFR1(payload []byte) (Record, error) {
 // decoded value so both paths agree exactly). nested marks a batch leaf.
 func validatePFR1(r *Record, nested bool) error {
 	op := uint64(r.Op)
-	if op == 0 || op > maxPFR1Op {
+	if !pfr1OpValid(op) {
 		return fmt.Errorf("wal: pfr1 record has unknown op %d", op)
 	}
 	if len(r.Path) > MaxPFR1PathBytes || len(r.NewPath) > MaxPFR1PathBytes || len(r.Target) > MaxPFR1PathBytes {
@@ -229,6 +250,11 @@ func validatePFR1(r *Record, nested bool) error {
 	}
 	if r.RenameNoReplace && r.Op != OpRename {
 		return fmt.Errorf("wal: pfr1 rename_no_replace flag is only legal on rename (op %d)", r.Op)
+	}
+	// The flag word is bound to its op, not sniffed: an OpChflags may carry any
+	// uint32 (0 clears every flag), and no other op may carry one at all.
+	if r.Flags != 0 && r.Op != OpChflags {
+		return fmt.Errorf("wal: pfr1 flags field is only legal on chflags (op %d)", r.Op)
 	}
 	switch r.Op {
 	case OpSetxattr, OpRemovexattr:
@@ -348,6 +374,7 @@ func appendPFR1Record(dst []byte, r *Record) ([]byte, error) {
 	dst = pfwire.AppendString(dst, 27, r.XattrName)
 	dst = pfwire.AppendUint(dst, 28, uint64(r.XattrFlags))
 	dst = pfwire.AppendBool(dst, 29, r.ChtimesKeepMtime)
+	dst = pfwire.AppendUint(dst, 30, uint64(r.Flags))
 	return dst, nil
 }
 
@@ -453,7 +480,7 @@ func decodePFR1Record(what string, body []byte, nested bool) (Record, error) {
 			if err != nil {
 				return Record{}, err
 			}
-			if op > maxPFR1Op {
+			if !pfr1OpValid(op) {
 				return Record{}, rd.Malformedf("unknown op %d", op)
 			}
 			r.Op = Op(op)
@@ -682,6 +709,13 @@ func decodePFR1Record(what string, body []byte, nested bool) (Record, error) {
 				return Record{}, rd.Malformedf("chtimes_keep_mtime wire type %d", wt)
 			}
 			if r.ChtimesKeepMtime, err = rd.Bool(field); err != nil {
+				return Record{}, err
+			}
+		case 30:
+			if wt != pfwire.TypeVarint {
+				return Record{}, rd.Malformedf("flags wire type %d", wt)
+			}
+			if r.Flags, err = rd.Uint32(field); err != nil {
 				return Record{}, err
 			}
 		default:

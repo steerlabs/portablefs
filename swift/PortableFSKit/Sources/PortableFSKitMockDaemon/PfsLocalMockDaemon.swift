@@ -11,6 +11,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var writeRequests: Int
         public var enumerateRequests: Int
         public var getAttrRequests: Int
+        /// Setattr requests that arrived carrying `set_flags`. The frontend
+        /// gate is invisible from the outside — a refused change and a
+        /// forwarded-then-refused change both surface as ENOTSUP — so proving
+        /// forwarding needs the daemon to say it saw the frame.
+        public var flagChangeRequests: Int
         public var maxReadLength: UInt32
         public var maxWriteLength: Int
         public var publicationAcks: Int
@@ -25,6 +30,30 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var lookupNoReplyNames: Set<String>
         public var strictItemNamespace: Bool
         public var protocolMinor: UInt32?
+        /// Mirrors the real daemon's per-attach AUTHORITY knowledge: it rides
+        /// the resolve reply as `Capabilities.flagsSupported`, and a setattr
+        /// carrying `setFlags` against an AUTHORITY-BACKED node without it is
+        /// answered ENOTSUP rather than silently dropped. It says nothing
+        /// about grafted nodes — see `graftBackedNames`.
+        public var flagsSupported: Bool
+        /// Mirrors `Capabilities.flagsUnderstood`: this daemon parses
+        /// `set_flags`/`flags` at all. A real daemon sets it unconditionally;
+        /// it is configurable here only so a test can model one that does not.
+        /// This — not `flagsSupported` — is what the frontend gates on.
+        public var flagsUnderstood: Bool
+        /// Names whose backing is machine-local (a graft over the volume
+        /// namespace). chflags(2) on such a node is applied to a real host
+        /// inode, so it succeeds regardless of `flagsSupported`: no authority
+        /// feature is involved. This is what makes a volume's flag support
+        /// PER-OBJECT, and why a volume-wide frontend gate is wrong.
+        public var graftBackedNames: Set<String>
+        /// Models a daemon built BEFORE `set_flags`/`flags` existed. Both are
+        /// appended fields at the same protocol minor, so such a daemon
+        /// proto3-discards them: it never advertises `flagsSupported`, it
+        /// cannot refuse what it does not parse, and it applies the rest of
+        /// the setattr and reports success. That silent no-op is the failure
+        /// the frontend-side gate exists to prevent.
+        public var predatesFlagFields: Bool
 
         public init(
             attachRef: String = "mock",
@@ -34,7 +63,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             lookupDelaysNanoseconds: [String: UInt64] = [:],
             lookupNoReplyNames: Set<String> = [],
             strictItemNamespace: Bool = false,
-            protocolMinor: UInt32? = nil
+            protocolMinor: UInt32? = nil,
+            flagsSupported: Bool = true,
+            flagsUnderstood: Bool = true,
+            graftBackedNames: Set<String> = [],
+            predatesFlagFields: Bool = false
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -44,6 +77,10 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.lookupNoReplyNames = lookupNoReplyNames
             self.strictItemNamespace = strictItemNamespace
             self.protocolMinor = protocolMinor
+            self.flagsSupported = flagsSupported
+            self.flagsUnderstood = flagsUnderstood
+            self.graftBackedNames = graftBackedNames
+            self.predatesFlagFields = predatesFlagFields
         }
     }
 
@@ -417,6 +454,7 @@ private actor MockFileSystem {
         var atimeMs: Int64
         var birthtimeMs: Int64
         var contentVersion: UInt64
+        var flags: UInt32
 
         init(id: UInt64, kind: PfsItemKind, mode: UInt32, parent: UInt64?) {
             self.id = id
@@ -437,6 +475,7 @@ private actor MockFileSystem {
             self.atimeMs = now
             self.birthtimeMs = now
             self.contentVersion = 1
+            self.flags = 0
         }
 
         var item: PfsItem {
@@ -463,6 +502,7 @@ private actor MockFileSystem {
     private var writeRequests = 0
     private var enumerateRequests = 0
     private var getAttrRequests = 0
+    private var flagChangeRequests = 0
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
     private var publicationAcks = 0
@@ -494,6 +534,7 @@ private actor MockFileSystem {
             writeRequests: writeRequests,
             enumerateRequests: enumerateRequests,
             getAttrRequests: getAttrRequests,
+            flagChangeRequests: flagChangeRequests,
             maxReadLength: maxReadLength,
             maxWriteLength: maxWriteLength,
             publicationAcks: publicationAcks
@@ -507,6 +548,7 @@ private actor MockFileSystem {
         writeRequests = 0
         enumerateRequests = 0
         getAttrRequests = 0
+        flagChangeRequests = 0
         maxReadLength = 0
         maxWriteLength = 0
         publicationAcks = 0
@@ -582,6 +624,11 @@ private actor MockFileSystem {
                 capabilities.maxNameBytes = 255
                 capabilities.maxFileSize = UInt64.max
                 capabilities.preferredIoBytes = 1_048_576
+                // A daemon predating the flag fields advertises neither: it
+                // cannot set fields it does not know exist, and both decode
+                // false on the frontend.
+                capabilities.flagsSupported = configuration.flagsSupported && !configuration.predatesFlagFields
+                capabilities.flagsUnderstood = configuration.flagsUnderstood && !configuration.predatesFlagFields
                 response.capabilities = capabilities
                 reply.body = .resolveReply(response)
             case let .lookup(request):
@@ -634,12 +681,32 @@ private actor MockFileSystem {
                 reply.body = .getAttrReply(response)
             case let .setAttr(request):
                 let node = try node(for: request.item, handle: request.handle)
+                // A daemon predating the appended fields never observes them:
+                // proto3 discards unknown fields before any handler runs, so
+                // it can neither apply nor refuse the flags change.
+                let setFlags = request.setFlags && !configuration.predatesFlagFields
+                if setFlags {
+                    flagChangeRequests += 1
+                }
+                // The real daemon's decision is PER TARGET, taken where the
+                // backing is known. A grafted node's backing is a real host
+                // inode, so its chflags(2) lands whatever the authority can or
+                // cannot store; an authority-backed node without
+                // FeatureFlagPersistence is refused the WHOLE setattr before
+                // anything is applied. The frontend cannot make this call — it
+                // does not know what backs the object — which is exactly why
+                // its own gate asks a different question (does this daemon
+                // parse set_flags at all).
+                if setFlags && !configuration.flagsSupported && !isGraftBacked(node) {
+                    throw MockPOSIXError(errno: ENOTSUP, message: "authority does not persist BSD file flags")
+                }
                 if request.hasMode { node.mode = request.mode }
                 if request.hasUid { node.uid = request.uid }
                 if request.hasGid { node.gid = request.gid }
                 if request.hasSize { resize(node: node, size: Int(request.size)) }
                 if request.hasMtimeMs { node.mtimeMs = request.mtimeMs }
                 if request.hasAtimeMs { node.atimeMs = request.atimeMs }
+                if setFlags { node.flags = request.flags }
                 node.ctimeMs = nowMs()
                 var response = PfsSetAttrReply()
                 response.attr = attr(for: node)
@@ -971,6 +1038,7 @@ private actor MockFileSystem {
         attr.atimeMs = node.atimeMs
         attr.birthtimeMs = node.birthtimeMs
         attr.contentVersion = node.contentVersion
+        attr.flags = node.flags
         return attr
     }
 
@@ -1004,6 +1072,25 @@ private actor MockFileSystem {
 
     private func nowMs() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// A node is graft-backed when its name matches a configured graft rule.
+    /// The real daemon knows this from its routing table; the mock recovers the
+    /// name from the parent's directory map so no rename path has to keep a
+    /// second copy of it in sync.
+    private func isGraftBacked(_ node: Node) -> Bool {
+        if configuration.graftBackedNames.isEmpty {
+            return false
+        }
+        guard let parentID = node.parent, let directory = nodes[parentID] else {
+            return false
+        }
+        for (name, id) in directory.children where id == node.id {
+            if configuration.graftBackedNames.contains(displayName(name)) {
+                return true
+            }
+        }
+        return false
     }
 
     private func displayName(_ data: Data) -> String {

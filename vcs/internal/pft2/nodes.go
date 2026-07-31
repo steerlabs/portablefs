@@ -73,6 +73,22 @@ type Inode struct {
 	MtimeMs int64
 	CtimeMs int64
 	AtimeMs int64
+	// BirthtimeMs is the durable creation time (APPENDED wire field 14). It is
+	// stamped once, at inode creation, from the journaled record's op time and
+	// never moves again: no write, truncate, chmod, rename, or hard link may
+	// change it. Zero is the canonical "absent" value — every inode written by
+	// a pre-birthtime authority decodes with zero, and consumers treat zero as
+	// "unknown" rather than "1970" (the FSKit client already derives mtime in
+	// that case).
+	BirthtimeMs int64
+	// Flags carries the BSD file flags (Darwin st_flags / chflags(2)) as the
+	// full opaque uint32 the client sent (APPENDED wire field 15). The tree
+	// format deliberately defines NO bit policy: masking which flags a mount
+	// may set (UF_HIDDEN, UF_IMMUTABLE, SF_* …) is a client-side decision, and
+	// pinning a mask here would make the durable format lie about what an
+	// older/newer client meant. Zero is the canonical "no flags" value and the
+	// value every pre-flags inode decodes to.
+	Flags uint32
 	// DirectoryRoot references the directory tree root (directories only).
 	// Nil means an empty directory.
 	DirectoryRoot *Ref
@@ -444,6 +460,11 @@ func (ino *Inode) validate() error {
 	if !validTimeMs(ino.MtimeMs) || !validTimeMs(ino.CtimeMs) || !validTimeMs(ino.AtimeMs) {
 		return invalidf("inode %d: timestamp outside ±%d ms", ino.Ino, MaxAbsTimeMs)
 	}
+	if !validTimeMs(ino.BirthtimeMs) {
+		return invalidf("inode %d: birth time outside ±%d ms", ino.Ino, MaxAbsTimeMs)
+	}
+	// Flags is the full uint32 the client sent: no bit is reserved or
+	// rejected here (see the Inode.Flags contract).
 	switch ino.Kind {
 	case FileKindRegular:
 		if ino.DirectoryRoot != nil || ino.SymlinkTarget != "" {

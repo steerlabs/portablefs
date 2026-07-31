@@ -240,3 +240,150 @@ func TestAppendIntentDefaultsOffForOlderFrontends(t *testing.T) {
 		t.Fatalf("legacy positional write changed meaning: %#v", w)
 	}
 }
+
+// TestFlagIntentRoundTrip pins the chflags(2) group on the wire. The intent is
+// a separate bool because 0 is a legal flag word (clear everything): a value
+// alone could never distinguish "clear" from "no change".
+func TestFlagIntentRoundTrip(t *testing.T) {
+	item := Item{ItemID: 7, ItemGeneration: 11}
+	mode := uint32(0o600)
+	for _, tc := range []struct {
+		name string
+		req  SetAttrRequest
+	}{
+		{"set", SetAttrRequest{Item: item, SetFlags: true, Flags: 0x8000_0002}},
+		{"clear", SetAttrRequest{Item: item, SetFlags: true, Flags: 0}},
+		{"with-mode", SetAttrRequest{Item: item, Mode: &mode, SetFlags: true, Flags: 0x2}},
+		{"absent", SetAttrRequest{Item: item, Mode: &mode}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.req
+			frame, err := EncodeFrame(&Envelope{RequestID: 3, Body: &body})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := ReadFrame(bytes.NewReader(frame))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := decoded.Body.(*SetAttrRequest)
+			if got.SetFlags != tc.req.SetFlags || got.Flags != tc.req.Flags {
+				t.Fatalf("flag intent lost across the wire: setFlags=%v flags=%#x, want %v/%#x",
+					got.SetFlags, got.Flags, tc.req.SetFlags, tc.req.Flags)
+			}
+			if got.Item != item {
+				t.Fatalf("item = %+v", got.Item)
+			}
+		})
+	}
+}
+
+// TestFlagFieldsDefaultOffForOlderFrontends keeps the added fields backward
+// compatible without a protocol-minor bump: a frame minted without them decodes
+// as a setattr that changes no flags, exactly as before. Same rule the O_APPEND
+// intent fields follow.
+func TestFlagFieldsDefaultOffForOlderFrontends(t *testing.T) {
+	mode := uint32(0o644)
+	frame, err := EncodeFrame(&Envelope{
+		RequestID: 4,
+		Body:      &SetAttrRequest{Item: Item{ItemID: 9, ItemGeneration: 2}, Mode: &mode},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := decoded.Body.(*SetAttrRequest)
+	if s.SetFlags || s.Flags != 0 || s.Mode == nil || *s.Mode != 0o644 {
+		t.Fatalf("legacy setattr changed meaning: %#v", s)
+	}
+}
+
+// TestCapabilitiesFlagsSupportedRoundTrip: the resolve reply carries TWO
+// independent flag facts, and they must survive the wire independently.
+// FlagsSupported describes the attached authority's durable storage;
+// FlagsUnderstood describes whether the daemon parses set_flags at all. The
+// interesting combination is the one the graft regression turned on —
+// understood=true with supported=false — so every pairing is exercised.
+func TestCapabilitiesFlagsSupportedRoundTrip(t *testing.T) {
+	for _, want := range []Capabilities{
+		{FlagsSupported: false, FlagsUnderstood: false},
+		{FlagsSupported: false, FlagsUnderstood: true},
+		{FlagsSupported: true, FlagsUnderstood: false},
+		{FlagsSupported: true, FlagsUnderstood: true},
+	} {
+		reply := &ResolveReply{
+			Root:     Item{ItemID: 1, ItemGeneration: 1},
+			VolumeID: "vol",
+			Capabilities: Capabilities{
+				Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
+				MaxNameBytes: 255, PreferredIOSize: 1 << 20,
+				FlagsSupported:  want.FlagsSupported,
+				FlagsUnderstood: want.FlagsUnderstood,
+			},
+		}
+		frame, err := EncodeFrame(&Envelope{RequestID: 5, Body: reply})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := ReadFrame(bytes.NewReader(frame))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := decoded.Body.(*ResolveReply)
+		if got.Capabilities.FlagsSupported != want.FlagsSupported {
+			t.Fatalf("flagsSupported = %v, want %v", got.Capabilities.FlagsSupported, want.FlagsSupported)
+		}
+		if got.Capabilities.FlagsUnderstood != want.FlagsUnderstood {
+			t.Fatalf("flagsUnderstood = %v, want %v", got.Capabilities.FlagsUnderstood, want.FlagsUnderstood)
+		}
+		if got.Capabilities.PreferredIOSize != 1<<20 || !got.Capabilities.Xattrs {
+			t.Fatalf("neighbouring capability fields disturbed: %+v", got.Capabilities)
+		}
+	}
+}
+
+// TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse: flags_understood is an
+// APPENDED field, so a resolve reply produced by a daemon that predates it
+// carries no field 9 at all. It must decode false — that is precisely the
+// signal "this daemon would silently discard a forwarded set_flags", and a
+// default of true would hand the frontend a licence to forward into a
+// silent no-op.
+func TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse(t *testing.T) {
+	// The capabilities an older daemon emits: every field it knew about, and
+	// literally no field 9 on the wire — a false bool is not encoded at all,
+	// so leaving FlagsUnderstood unset reproduces those bytes exactly.
+	old := Capabilities{
+		Symlinks: true, Xattrs: true, CaseSensitive: true,
+		MaxNameBytes: 255, PreferredIOSize: 1 << 20, FlagsSupported: true,
+	}
+	encoded := marshalCapabilities(&old)
+	if err := scan(encoded, func(num int, _ int, _ []byte) error {
+		if num == 9 {
+			t.Fatalf("a false flags_understood put field 9 on the wire: % x", encoded)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reply := &ResolveReply{
+		Root: Item{ItemID: 1, ItemGeneration: 1}, VolumeID: "vol", Capabilities: old,
+	}
+	frame, err := EncodeFrame(&Envelope{RequestID: 7, Body: reply})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decoded.Body.(*ResolveReply)
+	if got.Capabilities.FlagsUnderstood {
+		t.Fatal("an absent flags_understood decoded true; a pre-flags daemon would be forwarded to")
+	}
+	if !got.Capabilities.FlagsSupported || !got.Capabilities.Xattrs {
+		t.Fatalf("the fields the old daemon DID send were lost: %+v", got.Capabilities)
+	}
+}
