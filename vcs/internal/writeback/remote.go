@@ -22,6 +22,11 @@ type Remote interface {
 	// resolves a sent-but-unanswered request (replaying the identical exact
 	// identity) instead of returning an ambiguous error, for as long as the
 	// context lives.
+	//
+	// If local reply completion (for example replay-snapshot seeding) fails
+	// after the authority's grant is already known, the implementation
+	// returns that Granted reply together with the error. Engine then
+	// definitely releases the uninstalled epoch before reporting failure.
 	DelegationAcquire(ctx context.Context, scope, writebackID string) (AcquireReply, error)
 
 	// ReleaseDelegation releases the caller's grant after a full drain.

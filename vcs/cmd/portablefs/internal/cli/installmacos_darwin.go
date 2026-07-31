@@ -3,9 +3,11 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -512,7 +514,12 @@ func validateExistingManagedMacOSApp(path, expectedAppID string) error {
 			err,
 		)
 	}
-	if err := validateStagedBundleForPublication(path, version, expectedAppID); err != nil {
+	if err := validateMacOSBundleForPublication(
+		path,
+		version,
+		expectedAppID,
+		true,
+	); err != nil {
 		return fmt.Errorf(
 			"existing app at %s is not a managed PortableFS release; remove it explicitly before installing: %w",
 			path,
@@ -1228,7 +1235,21 @@ func darwinMountTable() ([]darwinMount, error) {
 	}
 }
 
+type macOSBundleIdentityGeneration uint8
+
+const (
+	macOSBundleIdentityCurrent macOSBundleIdentityGeneration = iota + 1
+	macOSBundleIdentityImmediatePrior
+)
+
 func validateStagedBundleForPublication(app, version, expectedAppID string) error {
+	return validateMacOSBundleForPublication(app, version, expectedAppID, false)
+}
+
+func validateMacOSBundleForPublication(
+	app, version, expectedAppID string,
+	allowImmediatePrior bool,
+) error {
 	var symlink string
 	err := filepath.WalkDir(app, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1346,11 +1367,43 @@ func validateStagedBundleForPublication(app, version, expectedAppID string) erro
 	if err != nil {
 		return err
 	}
-	if extensionPoint != fskitExtensionType || extensionFSName != defaultFskitType {
+	extensionPersonalityName, err := plistValue(
+		filepath.Join(extension, "Contents", "Info.plist"),
+		"EXAppExtensionAttributes:FSPersonalities:PortableFSPersonality:FSName",
+	)
+	if err != nil {
+		return err
+	}
+	supportsGenericURLResources, err := plistValue(
+		filepath.Join(extension, "Contents", "Info.plist"),
+		"EXAppExtensionAttributes:FSSupportsGenericURLResources",
+	)
+	if err != nil {
+		return err
+	}
+	extensionSchemes, err := plistStringArray(
+		filepath.Join(extension, "Contents", "Info.plist"),
+		"EXAppExtensionAttributes.FSSupportedSchemes",
+	)
+	if err != nil {
+		return err
+	}
+	generation, profileOK := classifyMacOSBundleIdentity(
+		extensionFSName,
+		extensionPersonalityName,
+		supportsGenericURLResources,
+		extensionSchemes,
+	)
+	if extensionPoint != fskitExtensionType ||
+		!profileOK ||
+		generation == macOSBundleIdentityImmediatePrior && !allowImmediatePrior {
 		return fmt.Errorf(
-			"staged extension registration mismatch: point %q fs type %q",
+			"staged extension registration mismatch: point %q fs type %q personality %q generic URL resources %q resource schemes %q",
 			extensionPoint,
 			extensionFSName,
+			extensionPersonalityName,
+			supportsGenericURLResources,
+			extensionSchemes,
 		)
 	}
 	extensionGroup, err := plistValue(
@@ -1366,6 +1419,18 @@ func validateStagedBundleForPublication(app, version, expectedAppID string) erro
 			extensionGroup,
 			fskitidentity.AppGroup,
 		)
+	}
+	// Never execute bundle helpers until the complete nested hierarchy,
+	// signing team, hardened runtime, signed identifiers, and app-group
+	// entitlement have all been authenticated.
+	if err := validateMacOSBundleCodeIdentity(
+		app,
+		extension,
+		cli,
+		daemon,
+		expectedAppID,
+	); err != nil {
+		return err
 	}
 
 	cliVersion, err := runExactOutput(cli, "version")
@@ -1384,21 +1449,25 @@ func validateStagedBundleForPublication(app, version, expectedAppID string) erro
 		if err != nil {
 			return fmt.Errorf("read staged %s identity: %w", name, err)
 		}
-		var identity struct {
-			SchemaVersion int    `json:"schemaVersion"`
-			AppGroup      string `json:"appGroup"`
-		}
-		if err := json.Unmarshal(out, &identity); err != nil ||
-			identity.SchemaVersion != 1 ||
-			identity.AppGroup != fskitidentity.AppGroup {
+		if !validMacOSBundleIdentityJSON(out, generation) {
 			return fmt.Errorf(
-				"staged %s identity does not match app group %q",
+				"staged %s identity does not match release identity %+v",
 				name,
-				fskitidentity.AppGroup,
+				fskitidentity.Current(),
 			)
 		}
 	}
 
+	return nil
+}
+
+func validateMacOSBundleCodeIdentity(
+	app string,
+	extension string,
+	cli string,
+	daemon string,
+	expectedAppID string,
+) error {
 	teamID, _, ok := strings.Cut(fskitidentity.AppGroup, ".")
 	if !ok || teamID == "" {
 		return fmt.Errorf("invalid linker-stamped app group %q", fskitidentity.AppGroup)
@@ -1474,12 +1543,145 @@ func validateStagedBundleForPublication(app, version, expectedAppID string) erro
 	return nil
 }
 
+func classifyMacOSBundleIdentity(
+	fsName string,
+	personalityName string,
+	supportsGenericURLResources string,
+	resourceSchemes []string,
+) (macOSBundleIdentityGeneration, bool) {
+	if fsName != defaultFskitType ||
+		personalityName != defaultFskitType ||
+		supportsGenericURLResources != "true" ||
+		len(resourceSchemes) != 1 {
+		return 0, false
+	}
+	switch resourceSchemes[0] {
+	case fskitidentity.ResourceScheme:
+		return macOSBundleIdentityCurrent, true
+	case defaultFskitType:
+		return macOSBundleIdentityImmediatePrior, true
+	default:
+		return 0, false
+	}
+}
+
+func validMacOSBundleIdentityJSON(
+	data []byte,
+	generation macOSBundleIdentityGeneration,
+) bool {
+	object, ok := decodeExactJSONObject(data)
+	if !ok {
+		return false
+	}
+	switch generation {
+	case macOSBundleIdentityCurrent:
+		if len(object) != 4 {
+			return false
+		}
+		var identity fskitidentity.Identity
+		if err := json.Unmarshal(data, &identity); err != nil {
+			return false
+		}
+		for _, key := range []string{
+			"schemaVersion",
+			"fsType",
+			"resourceScheme",
+			"appGroup",
+		} {
+			if _, ok := object[key]; !ok {
+				return false
+			}
+		}
+		return identity == fskitidentity.Current()
+	case macOSBundleIdentityImmediatePrior:
+		if len(object) != 2 {
+			return false
+		}
+		var legacy struct {
+			SchemaVersion int    `json:"schemaVersion"`
+			AppGroup      string `json:"appGroup"`
+		}
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return false
+		}
+		if _, ok := object["schemaVersion"]; !ok {
+			return false
+		}
+		if _, ok := object["appGroup"]; !ok {
+			return false
+		}
+		return legacy.SchemaVersion == 1 &&
+			legacy.AppGroup == fskitidentity.AppGroup
+	default:
+		return false
+	}
+}
+
+func decodeExactJSONObject(data []byte) (map[string]json.RawMessage, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, false
+	}
+	object := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, keyOK := token.(string)
+		if err != nil || !keyOK {
+			return nil, false
+		}
+		if _, duplicate := object[key]; duplicate {
+			return nil, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		object[key] = value
+	}
+	token, err = decoder.Token()
+	if err != nil || token != json.Delim('}') {
+		return nil, false
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
+	}
+	return object, true
+}
+
 func plistValue(path, key string) (string, error) {
 	out, err := exec.Command("/usr/libexec/PlistBuddy", "-c", "Print :"+key, path).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("read %s from %s: %w (output: %s)", key, path, err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func plistStringArray(path, keyPath string) ([]string, error) {
+	out, err := exec.Command(
+		"/usr/bin/plutil",
+		"-extract",
+		keyPath,
+		"json",
+		"-o",
+		"-",
+		path,
+	).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"read %s from %s: %w (output: %s)",
+			keyPath,
+			path,
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	var values []string
+	if err := json.Unmarshal(out, &values); err != nil {
+		return nil, fmt.Errorf("decode %s from %s: %w", keyPath, path, err)
+	}
+	return values, nil
 }
 
 func runExactOutput(path string, args ...string) (string, error) {
@@ -1674,20 +1876,53 @@ func extensionClaimsPFS(extensionPath string) (bool, error) {
 		}
 		return false, fmt.Errorf("inspect FSKit extension metadata %s: %w", infoPath, err)
 	}
-	out, err := exec.Command(
+	shortNameOut, shortNameErr := exec.Command(
 		"/usr/libexec/PlistBuddy",
 		"-c", "Print :EXAppExtensionAttributes:FSShortName",
 		infoPath,
 	).CombinedOutput()
-	if err != nil {
-		// An ExtensionKit provider without FSShortName does not claim the pfs
-		// type. Other metadata/read failures remain visible.
-		if strings.Contains(string(out), "Does Not Exist") {
+	if shortNameErr != nil && !strings.Contains(string(shortNameOut), "Does Not Exist") {
+		return false, fmt.Errorf(
+			"read FSShortName from %s: %w (output: %s)",
+			infoPath,
+			shortNameErr,
+			strings.TrimSpace(string(shortNameOut)),
+		)
+	}
+	if shortNameErr == nil && strings.TrimSpace(string(shortNameOut)) == defaultFskitType {
+		return true, nil
+	}
+
+	schemesOut, schemesErr := exec.Command(
+		"/usr/bin/plutil",
+		"-extract",
+		"EXAppExtensionAttributes.FSSupportedSchemes",
+		"json",
+		"-o",
+		"-",
+		infoPath,
+	).CombinedOutput()
+	if schemesErr != nil {
+		if strings.Contains(string(schemesOut), "No value at that key path") {
 			return false, nil
 		}
-		return false, fmt.Errorf("read FSShortName from %s: %w (output: %s)", infoPath, err, strings.TrimSpace(string(out)))
+		return false, fmt.Errorf(
+			"read FSSupportedSchemes from %s: %w (output: %s)",
+			infoPath,
+			schemesErr,
+			strings.TrimSpace(string(schemesOut)),
+		)
 	}
-	return strings.TrimSpace(string(out)) == defaultFskitType, nil
+	var schemes []string
+	if err := json.Unmarshal(schemesOut, &schemes); err != nil {
+		return false, fmt.Errorf("decode FSSupportedSchemes from %s: %w", infoPath, err)
+	}
+	for _, scheme := range schemes {
+		if strings.EqualFold(scheme, fskitidentity.ResourceScheme) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func containingAppPath(path string) string {
@@ -1708,7 +1943,7 @@ func pfsProviderConflict(appPath, extensionPath string) error {
 		cleanup = fmt.Sprintf("remove its containing app, or run `pluginkit -r %s`", extensionPath)
 	}
 	return fmt.Errorf(
-		"another registered or installed provider claims the pfs FSKit type at %s; %s, then retry so macOS has exactly one deterministic provider",
+		"another registered or installed provider claims the PortableFS OSS FSKit type or resource scheme at %s; %s, then retry so macOS has exactly one deterministic provider",
 		target,
 		cleanup,
 	)

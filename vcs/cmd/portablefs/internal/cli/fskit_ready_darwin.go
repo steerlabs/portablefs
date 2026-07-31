@@ -5,6 +5,8 @@ package cli
 import (
 	"fmt"
 	"syscall"
+
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 )
 
 func verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource string) error {
@@ -36,7 +38,11 @@ func verifyRecordedMountIdentity(st *mountState) error {
 	if fsType == "" {
 		fsType = defaultFskitType
 	}
-	return verifyFSKitMountIdentity(st.MountPath, fsType, "pfs://"+st.AttachRef)
+	return verifyFSKitMountIdentity(
+		st.MountPath,
+		fsType,
+		fskitidentity.ResourcePrefix+st.AttachRef,
+	)
 }
 
 func darwinStatfsString(chars []int8) string {

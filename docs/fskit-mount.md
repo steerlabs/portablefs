@@ -84,8 +84,11 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
    (write policy, fsync policy, flush interval, machine-local dirs). The
    daemon answers with an attach reference.
 3. **Mount.** The CLI hands the kernel that reference:
-   `/sbin/mount -t pfs pfs://<attachRef> <mountPath>`. The enabled FSKit
-   extension serves the mount by dialing the daemon's frontend socket inside
+   `/sbin/mount -t pfs dev.portablefs.oss://<attachRef> <mountPath>`. The
+   filesystem type and globally scoped generic-resource scheme are separate,
+   signed identity axes: FSKit routes the URL by `FSSupportedSchemes`, while
+   statfs publishes `FSShortName`. The enabled FSKit extension serves the
+   mount by dialing the daemon's frontend socket inside
    the canonical account home's PortableFS app-group container
    (`Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock`,
    relative to that home). The app group is load-bearing, not a convention:
@@ -103,11 +106,11 @@ credentials into the daemon (`POST /v1/attaches/{ref}/credential`), and
 `portablefs umount` invokes one daemon-owned
 `POST /v1/attaches/{ref}/unmount` transaction. That request freezes every
 frontend and control admission, completes the final authority barrier,
-durably records the prepared detach, proves the exact `pfs://<attachRef>`
-kernel mount, unmounts it in-process, and only then durably removes the
-attach. A failure preserves the attach and its exact recovery evidence; no
-second delete or path-based unmount can mutate one side of the boundary
-without the other.
+durably records the prepared detach, proves the exact
+`dev.portablefs.oss://<attachRef>` kernel mount, unmounts it in-process, and
+only then durably removes the attach. A failure preserves the attach and its
+exact recovery evidence; no second delete or path-based unmount can mutate
+one side of the boundary without the other.
 
 ## Install And Enable (Once Per Mac)
 
@@ -178,6 +181,12 @@ extensions that use a separate app-group container:
 `PORTABLEFS_FSKIT_DAEMON` is rejected. A fork or development build packages
 its matching CLI and daemon as one sibling pair rather than selecting code
 from the environment.
+
+The OSS resource scheme is the immutable `dev.portablefs.oss`; it is not an
+environment override. The matching app and CLI are installed atomically and
+the installer requires the extension to advertise exactly that one scheme.
+An embedder uses its own extension metadata and matching mount client instead
+of aliasing the OSS scheme.
 
 Changing the frontend socket only works with an extension whose Info.plist
 resolves the new path, and any custom location must still be inside an
@@ -259,6 +268,11 @@ PortableFS.app once more so LaunchServices registers the appex, then reopen
 System Settings. If two PortableFS extensions are listed (app and dev
 harness), remove the non-release provider and reinstall; a valid release
 setup has exactly one installed `pfs` provider.
+
+If another enabled PortableFS-based product exists, it may remain enabled only
+when both its `FSShortName` and `FSSupportedSchemes` differ from the OSS
+identity. Sharing a generic-resource scheme is ambiguous even when filesystem
+types differ, so the installer rejects either kind of collision.
 
 ### Enabled, but "Loading resource: … Input/output error"
 

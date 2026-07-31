@@ -133,6 +133,11 @@ type Volume struct {
 	// publication before it waits for this lock: delegation handoff waits
 	// for active publishers and must never wait on a publisher blocked here.
 	exactMu sync.RWMutex
+	// delegationTransitions gives every overlapping path/inode pair one
+	// order between remote grant acquisition and path-bearing authority
+	// mutation. It is cancellable and overlap-aware, so independent
+	// directories never inherit a slow acquire's latency.
+	delegationTransitions delegationTransitionGate
 	// onOperationWait brackets a contended exactMu acquisition outside the
 	// frontend publication set. It is nil for non-frontend embedders.
 	onOperationWait func(context.Context) func()
@@ -253,6 +258,45 @@ func (v *Volume) lockExact(ctx context.Context) {
 	if resume != nil {
 		resume()
 	}
+}
+
+// beginAuthorityMutation linearizes one or more path-bearing authority
+// mutations against local delegation acquisition. Acquisition owns the
+// exclusive side until its grant is installed; authority mutations share the
+// read side, recheck every affected path, and release any grant that won
+// first. Keeping the read side through the authority RPC prevents a new local
+// grant from being recalled by this mount's own in-flight write-through.
+func (v *Volume) beginAuthorityMutation(
+	ctx context.Context,
+	nodes []*NodeState,
+	operands ...string,
+) (func(), error) {
+	paths, inos := v.hardlinkMutationTargets(nodes, operands...)
+	claim, err := v.delegationTransitions.begin(
+		ctx,
+		authorityTransition,
+		paths,
+		inos,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// Re-snapshot after admission. A grant that completed before this claim
+	// published every reply alias first; a still-running disjoint acquire
+	// must promote its reply identities against this claim and will be
+	// released rather than installed on collision.
+	paths, inos = v.hardlinkMutationTargets(nodes, operands...)
+	if err := claim.extend(ctx, paths, inos); err != nil {
+		claim.end()
+		return nil, err
+	}
+	if v.wb != nil {
+		if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
+			claim.end()
+			return nil, err
+		}
+	}
+	return claim.end, nil
 }
 
 func (v *Volume) beginMutation(ctx context.Context) error {
@@ -446,19 +490,39 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 	}
 	budget := opts.DiskCacheBytes / 2
 	wb, werr := openWritebackForAttach(cctx, cli, writeback.Config{
-		StateDir: walDir,
-		VolumeID: v.volumeID,
-		Branch:   opts.Branch,
-		Remote: wbRemote{
-			cli:          cli,
-			observations: v.hardlinks,
-		},
+		StateDir:               walDir,
+		VolumeID:               v.volumeID,
+		Branch:                 opts.Branch,
+		Remote:                 wbRemote{cli: cli},
 		BudgetBytes:            budget,
 		DisableDelegation:      os.Getenv("PORTABLEFS_DEBUG_WRITE_THROUGH") == "1",
 		DisableDelegatedXattrs: cli.Features()&fsproto.FeatureDelegatedXattrs == 0,
 		Busy:                   v.opens.BusyUnder,
 		ProtectOpenPins:        v.protectOpenPins,
-		Logf:                   opts.Debugf,
+		DelegationAcquireGate: func(
+			ctx context.Context,
+			scope string,
+		) (writeback.DelegationAcquireGuard, error) {
+			claim, err := v.delegationTransitions.begin(
+				ctx,
+				acquireTransition,
+				[]string{scope},
+				nil,
+			)
+			if err != nil {
+				return writeback.DelegationAcquireGuard{}, err
+			}
+			return writeback.DelegationAcquireGuard{
+				ReconcileReply: func(reply writeback.AcquireReply) bool {
+					paths, inos := delegationReplyTargets(scope, reply)
+					return claim.reconcileAcquire(paths, inos, func() {
+						v.hardlinks.observeAcquireReply(scope, reply)
+					})
+				},
+				End: claim.end,
+			}, nil
+		},
+		Logf: opts.Debugf,
 		Events: writeback.Events{
 			OnHandoffStart: opts.OnHandoffStart,
 			OnHandoffEnd:   opts.OnHandoffEnd,
@@ -575,8 +639,7 @@ func openWritebackForAttach(ctx context.Context, cli *fsproto.Client, cfg writeb
 // started until their exact outcome is known. That keeps the engine's
 // handoff barrier and recovery store lock installed for the whole transition.
 type wbRemote struct {
-	cli          *fsproto.Client
-	observations *hardlinkAliases
+	cli *fsproto.Client
 }
 
 func ctxCall[T any](ctx context.Context, fn func() (T, error)) (T, error) {
@@ -600,31 +663,62 @@ func ctxCall[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 
 func (r wbRemote) DelegationAcquire(ctx context.Context, scope, writebackID string) (writeback.AcquireReply, error) {
 	return ctxCall(ctx, func() (writeback.AcquireReply, error) {
-		observation := r.observations.beginObservation()
-		defer observation.Close()
 		g, err := r.cli.DelegationAcquire(scope, writebackID)
 		if err != nil {
 			return writeback.AcquireReply{}, err
 		}
-		reply := writeback.AcquireReply{Granted: g.Granted, Epoch: g.Epoch, Exists: g.Exists}
-		if g.Exists {
-			observation.Observe(scope, g.Self)
-			reply.Self = entryFromAttr("", g.Self)
-		}
-		if g.HasChildren {
+		reply := acquireReplyFromGrant(g)
+		// A replayed exact grant decision omits its original snapshot. Seed
+		// it while the authority already recognizes this session as holder,
+		// before transition promotion or local installation; no incomplete
+		// grant can become visible to the overlay. If seeding fails, return
+		// the known grant beside the error so Engine definitely releases its
+		// epoch before reporting the failed acquisition.
+		if g.Granted && !g.HasChildren {
+			entries, _, _, status, readErr := r.cli.ReaddirV(scope)
+			if readErr != nil {
+				return reply, readErr
+			}
+			if status != fsproto.OK {
+				return reply, fmt.Errorf(
+					"delegation acquire %q replay snapshot: status %d",
+					scope,
+					status,
+				)
+			}
 			reply.HasChildren = true
-			reply.Children = make([]writeback.Entry, 0, len(g.Children))
-			for _, d := range g.Children {
-				childPath := d.Name
-				if scope != "" {
-					childPath = scope + "/" + d.Name
-				}
-				observation.Observe(childPath, d.Attr)
-				reply.Children = append(reply.Children, entryFromAttr(d.Name, d.Attr))
+			reply.Children = make([]writeback.Entry, 0, len(entries))
+			for _, entry := range entries {
+				reply.Children = append(
+					reply.Children,
+					entryFromAttr(entry.Name, entry.Attr),
+				)
 			}
 		}
 		return reply, nil
 	})
+}
+
+func acquireReplyFromGrant(g fsproto.DelegationGrant) writeback.AcquireReply {
+	reply := writeback.AcquireReply{
+		Granted: g.Granted,
+		Epoch:   g.Epoch,
+		Exists:  g.Exists,
+	}
+	if g.Exists {
+		reply.Self = entryFromAttr("", g.Self)
+	}
+	if g.HasChildren {
+		reply.HasChildren = true
+		reply.Children = make([]writeback.Entry, 0, len(g.Children))
+		for _, entry := range g.Children {
+			reply.Children = append(
+				reply.Children,
+				entryFromAttr(entry.Name, entry.Attr),
+			)
+		}
+	}
+	return reply
 }
 
 func (r wbRemote) ReleaseDelegation(ctx context.Context, scope, epoch string) error {
@@ -722,6 +816,29 @@ func entryFromAttr(name string, a fsproto.Attr) writeback.Entry {
 		MtimeMs: a.MtimeMs, CtimeMs: a.CtimeMs, AtimeMs: a.AtimeMs,
 		UID: a.Uid, GID: a.Gid, Ino: a.Ino, Nlink: a.Nlink,
 	}
+}
+
+func delegationReplyTargets(
+	scope string,
+	reply writeback.AcquireReply,
+) (paths []string, inos []uint64) {
+	if reply.Exists {
+		paths = append(paths, scope)
+		if reply.Self.Ino != 0 {
+			inos = append(inos, reply.Self.Ino)
+		}
+	}
+	for _, entry := range reply.Children {
+		childPath := entry.Name
+		if scope != "" {
+			childPath = scope + "/" + entry.Name
+		}
+		paths = append(paths, childPath)
+		if entry.Ino != 0 {
+			inos = append(inos, entry.Ino)
+		}
+	}
+	return paths, inos
 }
 
 // attrFromEntry converts an engine entry to wire attrs. Locally-born entries

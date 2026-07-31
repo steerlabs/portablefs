@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -49,14 +50,26 @@ func (e *Engine) acquire(ctx context.Context, scope string) (bool, error) {
 // rebound on the next attach); it is never reinterpreted as a denial that
 // forks the mutation lanes mid-session.
 func (e *Engine) resolveAcquire(scope string, flight *acquireFlight) {
-	e.exactMu.RLock()
-	defer e.exactMu.RUnlock()
 	defer func() {
 		e.acquireMu.Lock()
 		delete(e.acquiring, scope)
 		e.acquireMu.Unlock()
 		close(flight.done)
 	}()
+	var guard DelegationAcquireGuard
+	if e.cfg.DelegationAcquireGate != nil {
+		var err error
+		guard, err = e.cfg.DelegationAcquireGate(e.ctx, scope)
+		if err != nil {
+			flight.err = fmt.Errorf("writeback: acquire %q transition: %w", scope, err)
+			return
+		}
+		if guard.End != nil {
+			defer guard.End()
+		}
+	}
+	e.exactMu.RLock()
+	defer e.exactMu.RUnlock()
 	// The stream (and its recovery-job registry) must be durable before the
 	// grant can admit anything. A dead (parked) stream never installs a new
 	// grant: its WAL can never advance.
@@ -81,11 +94,39 @@ func (e *Engine) resolveAcquire(scope string, flight *acquireFlight) {
 
 	reply, err := e.remote.DelegationAcquire(e.ctx, scope, e.writebackID)
 	if err != nil {
+		if reply.Granted {
+			if releaseErr := e.remote.ReleaseDelegation(
+				e.ctx,
+				scope,
+				reply.Epoch,
+			); releaseErr != nil {
+				flight.err = fmt.Errorf(
+					"writeback: acquire %q failed after grant (%w); releasing the uninstalled grant also failed: %v",
+					scope,
+					err,
+					releaseErr,
+				)
+				e.logf("%v", flight.err)
+				return
+			}
+		}
 		flight.err = fmt.Errorf("writeback: acquire %q: %w", scope, err)
 		e.logf("writeback: acquire %q failed: %v", scope, err)
 		return
 	}
+	install := true
+	if guard.ReconcileReply != nil {
+		install = guard.ReconcileReply(reply)
+	}
 	if !reply.Granted {
+		e.noteDenial(scope, 0)
+		return
+	}
+	if !install {
+		if releaseErr := e.remote.ReleaseDelegation(e.ctx, scope, reply.Epoch); releaseErr != nil {
+			flight.err = fmt.Errorf("writeback: reject conflicting grant %q: %w", scope, releaseErr)
+			return
+		}
 		e.noteDenial(scope, 0)
 		return
 	}
@@ -452,12 +493,13 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 	return attempt.complete(nil)
 }
 
-// ReleaseFor drains and RELEASES every delegation covering any of paths: the
-// caller is about to execute a write-through operation (hard link,
-// cross-scope rename, orphan transition, xattr, unsupported shape), and no
-// mutation ever runs write-through INSIDE a held delegation — the scope
-// leaves delegated mode first, so the write-through orders after the
-// drained, durably released state.
+// ReleaseFor drains and RELEASES every delegation overlapping any of paths:
+// equal, ancestor, or descendant. The caller is about to execute a
+// write-through namespace/metadata mutation (hard link, directory rename,
+// orphan transition, xattr, unsupported shape), and a descendant grant is
+// just as exclusive as a covering grant when its ancestor moves or changes.
+// The scope leaves delegated mode first, so write-through always orders after
+// the drained, durably released state.
 func (e *Engine) ReleaseFor(ctx context.Context, paths ...string) error {
 	if err := e.MutationError(); err != nil {
 		return err
@@ -472,15 +514,22 @@ func (e *Engine) ReleaseFor(ctx context.Context, paths ...string) error {
 		if p == "" {
 			continue
 		}
-		d := e.coveringLocked(p)
-		if d == nil || seen[d] {
-			continue
+		for scope, d := range e.delegations {
+			if seen[d] || !delegationPathsOverlap(scope, p) {
+				continue
+			}
+			seen[d] = true
+			claims = append(claims, e.claimReleaseLocked(ctx, d))
 		}
-		seen[d] = true
-		claims = append(claims, e.claimReleaseLocked(ctx, d))
 	}
 	e.mu.Unlock()
 	return e.runReleaseClaims(ctx, claims)
+}
+
+func delegationPathsOverlap(a, b string) bool {
+	return a == b ||
+		strings.HasPrefix(a, b+"/") ||
+		strings.HasPrefix(b, a+"/")
 }
 
 // BeginExact drains and releases every delegation retained by this engine,

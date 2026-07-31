@@ -221,12 +221,33 @@ func (c *frontendConn) close() {
 		// Closing the transport unblocks any handler currently writing a
 		// reply. Admission and release waits observe the canceled connCtx.
 		_ = c.conn.Close()
+		// Freeze publication bookkeeping before joining handlers. Once an
+		// exposed reply loses its connection without an acknowledgement, the
+		// kernel view is unprovable. Publish that terminal verdict to the
+		// handoff gate immediately: a handler can be waiting behind the very
+		// handoff that is waiting for this operation, so handlerWG cannot be
+		// joined safely until the gate has been woken and the handoff aborts.
+		c.publicationMu.Lock()
+		c.publicationClosed = true
+		var exposedUnacknowledged *frontendOperation
+		for _, entry := range c.operations {
+			if entry.op != nil && entry.replyExposed && !entry.ackPending {
+				exposedUnacknowledged = entry.op
+				break
+			}
+		}
+		c.publicationMu.Unlock()
+		if exposedUnacknowledged != nil {
+			exposedUnacknowledged.attach.failFrontendGate(fmt.Errorf(
+				"kernel coherence barrier failed closed: %w",
+				errors.New("frontend disconnected before acknowledging an exposed kernel publication"),
+			))
+		}
 		// A handler may still be completing a local syscall or mutation after
 		// cancellation. Keep its logical operation in the handoff gate until
 		// the handler has fully exited.
 		c.handlerWG.Wait()
 		c.publicationMu.Lock()
-		c.publicationClosed = true
 		pending := c.operations
 		c.operations = nil
 		c.publicationMu.Unlock()
@@ -427,6 +448,16 @@ func (c *frontendConn) beginLogicalOperation(
 
 	c.publicationMu.Lock()
 	if c.publicationClosed {
+		// close() retains the operation table until every handler exits. The
+		// one initializing handler owns ready's completion even when
+		// disconnect wins before that handler begins; continuations and close
+		// can then join the same definite net.ErrClosed outcome.
+		if initialize {
+			if entry := c.operations[operationID]; entry != nil {
+				entry.err = net.ErrClosed
+				close(entry.ready)
+			}
+		}
 		c.publicationMu.Unlock()
 		return ctx, nil, false, false, net.ErrClosed
 	}

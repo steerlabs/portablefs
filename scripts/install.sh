@@ -13,7 +13,8 @@
 #   PORTABLEFS_INSTALL_DIR   CLI activation-link directory on Linux or macOS
 #                            (must be an absolute path inside the canonical
 #                            account home)
-#   PORTABLEFS_EXPECTED_TEAM_ID / _BUNDLE_ID / _APP_GROUP
+#   PORTABLEFS_EXPECTED_TEAM_ID / _BUNDLE_ID / _APP_GROUP /
+#   _FS_TYPE / _RESOURCE_SCHEME
 #                            required code identities for a custom GitHub repo
 set -eu
 
@@ -56,6 +57,8 @@ if [ "$REPO" = "steerlabs/portablefs" ]; then
   EXPECTED_TEAM_ID=B47U2LLKHW
   EXPECTED_BUNDLE_ID=dev.portablefs.PortableFSApp
   EXPECTED_APP_GROUP=B47U2LLKHW.pfsoss
+  EXPECTED_FS_TYPE=pfs
+  EXPECTED_RESOURCE_SCHEME=dev.portablefs.oss
 else
   [ -n "${PORTABLEFS_EXPECTED_TEAM_ID:-}" ] ||
     { printf '%s\n' "portablefs install: error: a custom PORTABLEFS_GITHUB_REPO requires PORTABLEFS_EXPECTED_TEAM_ID" >&2; exit 1; }
@@ -63,9 +66,15 @@ else
     { printf '%s\n' "portablefs install: error: a custom PORTABLEFS_GITHUB_REPO requires PORTABLEFS_EXPECTED_BUNDLE_ID" >&2; exit 1; }
   [ -n "${PORTABLEFS_EXPECTED_APP_GROUP:-}" ] ||
     { printf '%s\n' "portablefs install: error: a custom PORTABLEFS_GITHUB_REPO requires PORTABLEFS_EXPECTED_APP_GROUP" >&2; exit 1; }
+  [ -n "${PORTABLEFS_EXPECTED_FS_TYPE:-}" ] ||
+    { printf '%s\n' "portablefs install: error: a custom PORTABLEFS_GITHUB_REPO requires PORTABLEFS_EXPECTED_FS_TYPE" >&2; exit 1; }
+  [ -n "${PORTABLEFS_EXPECTED_RESOURCE_SCHEME:-}" ] ||
+    { printf '%s\n' "portablefs install: error: a custom PORTABLEFS_GITHUB_REPO requires PORTABLEFS_EXPECTED_RESOURCE_SCHEME" >&2; exit 1; }
   EXPECTED_TEAM_ID=$PORTABLEFS_EXPECTED_TEAM_ID
   EXPECTED_BUNDLE_ID=$PORTABLEFS_EXPECTED_BUNDLE_ID
   EXPECTED_APP_GROUP=$PORTABLEFS_EXPECTED_APP_GROUP
+  EXPECTED_FS_TYPE=$PORTABLEFS_EXPECTED_FS_TYPE
+  EXPECTED_RESOURCE_SCHEME=$PORTABLEFS_EXPECTED_RESOURCE_SCHEME
 fi
 
 log() { printf '%s\n' "portablefs install: $*" >&2; }
@@ -224,6 +233,25 @@ the download is corrupt or has been tampered with; nothing was installed"
     die "could not read the FSKit extension executable identity"
   [ "$extension_executable" = "PortableFSExt" ] ||
     die "PortableFS.app has an unexpected FSKit extension executable identity"
+  extension_fs_type=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSShortName" "$source_extension/Contents/Info.plist") ||
+    die "could not read the FSKit extension filesystem type"
+  [ "$extension_fs_type" = "$EXPECTED_FS_TYPE" ] ||
+    die "PortableFS.app has an unexpected FSKit filesystem type"
+  extension_personality=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSPersonalities:PortableFSPersonality:FSName" "$source_extension/Contents/Info.plist") ||
+    die "could not read the FSKit extension personality"
+  [ "$extension_personality" = "$EXPECTED_FS_TYPE" ] ||
+    die "PortableFS.app has an unexpected FSKit personality"
+  extension_scheme=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportedSchemes:0" "$source_extension/Contents/Info.plist") ||
+    die "could not read the FSKit extension resource scheme"
+  [ "$extension_scheme" = "$EXPECTED_RESOURCE_SCHEME" ] ||
+    die "PortableFS.app has an unexpected FSKit resource scheme"
+  if /usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportedSchemes:1" "$source_extension/Contents/Info.plist" >/dev/null 2>&1; then
+    die "PortableFS.app advertises more than one FSKit resource scheme"
+  fi
+  extension_generic_urls=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportsGenericURLResources" "$source_extension/Contents/Info.plist") ||
+    die "could not read the FSKit generic URL resource capability"
+  [ "$extension_generic_urls" = "true" ] ||
+    die "PortableFS.app does not enable FSKit generic URL resources"
   extension_signing=$(codesign -dv --verbose=4 "$source_extension" 2>&1) ||
     die "could not inspect the FSKit extension signing identity"
   printf '%s\n' "$extension_signing" | grep -Fx "Identifier=$extension_bundle_id" >/dev/null ||
@@ -275,10 +303,22 @@ the download is corrupt or has been tampered with; nothing was installed"
     die "could not decode the CLI app-group identity"
   daemon_group=$(plutil -extract appGroup raw -o - "$tmp/daemon-identity.json") ||
     die "could not decode the daemon app-group identity"
+  cli_fs_type=$(plutil -extract fsType raw -o - "$tmp/cli-identity.json") ||
+    die "could not decode the CLI filesystem type"
+  daemon_fs_type=$(plutil -extract fsType raw -o - "$tmp/daemon-identity.json") ||
+    die "could not decode the daemon filesystem type"
+  cli_scheme=$(plutil -extract resourceScheme raw -o - "$tmp/cli-identity.json") ||
+    die "could not decode the CLI resource scheme"
+  daemon_scheme=$(plutil -extract resourceScheme raw -o - "$tmp/daemon-identity.json") ||
+    die "could not decode the daemon resource scheme"
   [ "$cli_group" = "$app_group" ] ||
     die "PortableFS.app CLI and FSKit extension have different app-group identities"
   [ "$daemon_group" = "$app_group" ] ||
     die "PortableFS.app daemon and FSKit extension have different app-group identities"
+  [ "$cli_fs_type" = "$extension_fs_type" ] && [ "$daemon_fs_type" = "$extension_fs_type" ] ||
+    die "PortableFS.app CLI, daemon, and FSKit extension have different filesystem types"
+  [ "$cli_scheme" = "$extension_scheme" ] && [ "$daemon_scheme" = "$extension_scheme" ] ||
+    die "PortableFS.app CLI, daemon, and FSKit extension have different resource schemes"
 
   # The signed command resolves the canonical account home through directory
   # services, validates the optional link directory, takes the exclusive

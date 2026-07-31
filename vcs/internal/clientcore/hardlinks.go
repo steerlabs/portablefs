@@ -67,12 +67,42 @@ func (v *Volume) releaseHardlinkScopes(
 	if v.wb == nil {
 		return nil
 	}
-	inos := v.hardlinks.inosForPaths(operands...)
+	return v.wb.ReleaseFor(ctx, v.hardlinkMutationPaths(nodes, operands...)...)
+}
+
+// hardlinkMutationPaths returns every known spelling whose delegation view
+// can be affected by a path-bearing inode mutation. It is also used by the
+// authority/delegation transition gate so an alias grant cannot install in
+// the release-to-RPC window.
+func (v *Volume) hardlinkMutationPaths(
+	nodes []*NodeState,
+	operands ...string,
+) []string {
+	paths, _ := v.hardlinkMutationTargets(nodes, operands...)
+	return paths
+}
+
+// hardlinkMutationTargets snapshots every known spelling and authority
+// identity affected by one mutation under a single index lock. The identity
+// set lets the transition coordinator catch a disjoint acquire reply that
+// reveals a previously unseen hardlink alias before installing its grant.
+func (v *Volume) hardlinkMutationTargets(
+	nodes []*NodeState,
+	operands ...string,
+) ([]string, []uint64) {
+	nodeInos := make([]uint64, 0, len(nodes))
 	for _, node := range nodes {
 		if ino := authHandleIno(node); ino != 0 {
-			inos = append(inos, ino)
+			nodeInos = append(nodeInos, ino)
 		}
 	}
+	return v.hardlinks.mutationTargets(nodeInos, operands...)
+}
+
+func (h *hardlinkAliases) mutationTargets(
+	nodeInos []uint64,
+	operands ...string,
+) ([]string, []uint64) {
 	seen := make(map[string]struct{}, len(operands))
 	paths := make([]string, 0, len(operands))
 	for _, path := range operands {
@@ -82,14 +112,36 @@ func (v *Volume) releaseHardlinkScopes(
 		seen[path] = struct{}{}
 		paths = append(paths, path)
 	}
-	for _, alias := range v.hardlinks.pathsForInos(inos) {
-		if _, ok := seen[alias]; ok {
-			continue
-		}
-		seen[alias] = struct{}{}
-		paths = append(paths, alias)
+	if h == nil {
+		return paths, append([]uint64(nil), nodeInos...)
 	}
-	return v.wb.ReleaseFor(ctx, paths...)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	inoSet := make(map[uint64]struct{}, len(nodeInos)+len(operands))
+	for _, ino := range nodeInos {
+		if ino != 0 {
+			inoSet[ino] = struct{}{}
+		}
+	}
+	for _, operand := range operands {
+		if ino := h.byPath[operand]; ino != 0 {
+			inoSet[ino] = struct{}{}
+		}
+	}
+	inos := make([]uint64, 0, len(inoSet))
+	for ino := range inoSet {
+		inos = append(inos, ino)
+		if observed := h.byIno[ino]; observed != nil {
+			for alias := range observed.paths {
+				if _, ok := seen[alias]; ok {
+					continue
+				}
+				seen[alias] = struct{}{}
+				paths = append(paths, alias)
+			}
+		}
+	}
+	return paths, inos
 }
 
 type hardlinkAdmissionIdentitiesKey struct{}
@@ -244,7 +296,15 @@ func (h *hardlinkAliases) observeLockedAt(
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.observeAtLocked(path, a, observationSeq, guarded)
+}
 
+func (h *hardlinkAliases) observeAtLocked(
+	path string,
+	a fsproto.Attr,
+	observationSeq uint64,
+	guarded bool,
+) {
 	// Do not tear down and recreate an existing same-inode observation: once
 	// RelatedInos or an nlink>1 attr has made an inode alias-unsafe, a delayed
 	// nlink==1 response must never clear that monotonic safety fact.
@@ -267,6 +327,32 @@ func (h *hardlinkAliases) observeLockedAt(
 	if a.Kind != "directory" &&
 		(a.Nlink > 1 || guarded && pendingSeq > observationSeq) {
 		h.unsafe[a.Ino] = struct{}{}
+	}
+}
+
+// observeAcquireReply publishes a complete delegation decision atomically.
+// The transition coordinator holds its own lock first, so an authority
+// footprint can never see half of a reply's alias/inode observations.
+func (h *hardlinkAliases) observeAcquireReply(
+	scope string,
+	reply writeback.AcquireReply,
+) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if reply.Exists {
+		h.observeAtLocked(scope, attrFromEntry(reply.Self), 0, false)
+	}
+	if reply.HasChildren {
+		for _, entry := range reply.Children {
+			childPath := entry.Name
+			if scope != "" {
+				childPath = scope + "/" + entry.Name
+			}
+			h.observeAtLocked(childPath, attrFromEntry(entry), 0, false)
+		}
 	}
 }
 

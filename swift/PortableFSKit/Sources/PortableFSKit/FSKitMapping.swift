@@ -149,8 +149,12 @@ public enum PfsFSKitMapping {
         throw PfsLocalClientError.daemon(errno: EINVAL, message: "xattr name is not valid UTF-8")
     }
 
-    public static func statfs(from reply: PfsStatfsReply, capabilities: PfsCapabilities) -> FSStatFSResult {
-        let result = FSStatFSResult(fileSystemTypeName: PortableFSIdentity.fileSystemTypeName)
+    public static func statfs(
+        from reply: PfsStatfsReply,
+        capabilities: PfsCapabilities,
+        fileSystemTypeName: String = PortableFSIdentity.fileSystemTypeName
+    ) -> FSStatFSResult {
+        let result = FSStatFSResult(fileSystemTypeName: fileSystemTypeName)
         let blockSize = reply.blockSize == 0 ? 4096 : reply.blockSize
         let totalBlocks = reply.totalBlocks == 0 ? 1_000_000 : reply.totalBlocks
         let freeBlocks = reply.freeBlocks == 0 ? totalBlocks / 2 : reply.freeBlocks
