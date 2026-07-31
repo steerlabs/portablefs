@@ -198,6 +198,250 @@ func TestLosingDaemonDoesNotInitializeOrMutateRegistry(t *testing.T) {
 	_ = conn.Close()
 }
 
+func leaveStaleUnixSocket(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("closed test listener did not leave a stale socket: %v", err)
+	}
+	return info
+}
+
+func shortDaemonSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "pfsr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func TestDaemonRestartReclaimsOnlyItsStaleCanonicalSockets(t *testing.T) {
+	root := shortDaemonSocketDir(t)
+	cfg := Config{
+		FrontendSocket: filepath.Join(root, "run", "frontend.sock"),
+		ControlSocket:  filepath.Join(root, "run", "control.sock"),
+		StateDir:       filepath.Join(root, "state"),
+		Version:        "restart-test",
+	}
+	oldFrontend := leaveStaleUnixSocket(t, cfg.FrontendSocket)
+	oldControl := leaveStaleUnixSocket(t, cfg.ControlSocket)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- NewServer(cfg).Run(ctx)
+	}()
+	waitUnix(t, cfg.FrontendSocket)
+	waitUnix(t, cfg.ControlSocket)
+
+	for path, oldInfo := range map[string]os.FileInfo{
+		cfg.FrontendSocket: oldFrontend,
+		cfg.ControlSocket:  oldControl,
+	} {
+		current, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(oldInfo, current) {
+			t.Fatalf("daemon reused stale socket inode at %s", path)
+		}
+		if current.Mode()&os.ModeSocket == 0 || current.Mode().Perm() != 0o600 {
+			t.Fatalf("replacement socket %s has unsafe mode %s", path, current.Mode())
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("restarted daemon shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restarted daemon did not stop")
+	}
+}
+
+func TestStaleSocketReclamationRefusesLiveListener(t *testing.T) {
+	dir := shortDaemonSocketDir(t)
+	path := filepath.Join(dir, "control.sock")
+	lock, err := acquireSingleton(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSingleton(lock)
+	ln, err := listenUnixSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	if err := reclaimStaleUnixSocket(lock, path); err == nil ||
+		!strings.Contains(err.Error(), "listening Unix socket") {
+		t.Fatalf("live socket reclamation verdict = %v", err)
+	}
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatalf("refused live listener was disturbed: %v", err)
+	}
+	_ = conn.Close()
+}
+
+func TestStaleSocketReclamationRestoresConcurrentReplacement(t *testing.T) {
+	dir := shortDaemonSocketDir(t)
+	path := filepath.Join(dir, "control.sock")
+	displaced := filepath.Join(dir, "displaced-stale.sock")
+	leaveStaleUnixSocket(t, path)
+	lock, err := acquireSingleton(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSingleton(lock)
+
+	var replacement net.Listener
+	err = reclaimStaleUnixSocketWith(lock, path, func() {
+		if err := os.Rename(path, displaced); err != nil {
+			t.Fatal(err)
+		}
+		replacement, err = listenUnixSocket(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("concurrent replacement verdict = %v", err)
+	}
+	defer replacement.Close()
+	if _, err := os.Lstat(displaced); err != nil {
+		t.Fatalf("original stale socket was not preserved: %v", err)
+	}
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatalf("concurrent live replacement was not restored: %v", err)
+	}
+	_ = conn.Close()
+}
+
+func TestStaleSocketReclamationRefusesUnsafeEntries(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{
+			name: "regular file",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("owner"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			setup: func(t *testing.T, path string) {
+				target := path + ".target"
+				if err := os.WriteFile(target, []byte("owner"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "permissive socket",
+			setup: func(t *testing.T, path string) {
+				leaveStaleUnixSocket(t, path)
+				if err := os.Chmod(path, 0o660); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "hard-linked socket",
+			setup: func(t *testing.T, path string) {
+				leaveStaleUnixSocket(t, path)
+				if err := os.Link(path, path+".peer"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := shortDaemonSocketDir(t)
+			path := filepath.Join(dir, "control.sock")
+			test.setup(t, path)
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lock, err := acquireSingleton(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer releaseSingleton(lock)
+
+			if err := reclaimStaleUnixSocket(lock, path); err == nil ||
+				!strings.Contains(err.Error(), "unsafe existing Unix socket") {
+				t.Fatalf("unsafe entry reclamation verdict = %v", err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil {
+				t.Fatalf("unsafe entry was removed: %v", err)
+			}
+			if !os.SameFile(before, after) {
+				t.Fatal("unsafe entry was replaced")
+			}
+		})
+	}
+}
+
+func TestDaemonRefusesNonCanonicalSocketPair(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		frontend string
+		control  string
+	}{
+		{name: "same entry", frontend: "run/control.sock", control: "run/control.sock"},
+		{name: "different directories", frontend: "frontend/pfs.sock", control: "control/control.sock"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := privateTestDir(t)
+			err := NewServer(Config{
+				FrontendSocket: filepath.Join(root, test.frontend),
+				ControlSocket:  filepath.Join(root, test.control),
+				StateDir:       filepath.Join(root, "state"),
+			}).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "distinct entries in the singleton socket directory") {
+				t.Fatalf("socket-pair verdict = %v", err)
+			}
+		})
+	}
+}
+
 func snapshotPrivateState(t *testing.T, root string) map[string]string {
 	t.Helper()
 	out := map[string]string{}
