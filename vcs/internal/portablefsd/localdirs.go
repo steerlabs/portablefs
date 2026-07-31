@@ -350,13 +350,14 @@ func localAttr(fi fs.FileInfo) fsproto.Attr {
 	}
 	mtime := fi.ModTime().UnixMilli()
 	attr := fsproto.Attr{
-		Kind:    kind,
-		Size:    fi.Size(),
-		Mode:    uint32(fi.Mode().Perm()),
-		MtimeMs: mtime,
-		CtimeMs: mtime,
-		AtimeMs: mtime,
-		Nlink:   1,
+		Kind:      kind,
+		Size:      fi.Size(),
+		AllocSize: fi.Size(),
+		Mode:      uint32(fi.Mode().Perm()),
+		MtimeMs:   mtime,
+		CtimeMs:   mtime,
+		AtimeMs:   mtime,
+		Nlink:     1,
 	}
 	// ctime/atime/nlink come from the raw stat when available; the field names
 	// differ per GOOS, so the extraction lives in localdirs_stat_*.go.
@@ -542,6 +543,7 @@ func (a *attach) renameLocal(oldp, newp string, noReplace bool) int32 {
 func (a *attach) setattrLocal(
 	rec *itemRecord,
 	exactHandle *handleRecord,
+	scope string,
 	detached bool,
 	req *pfslocal.SetAttrRequest,
 ) (*pfslocal.SetAttrReply, int32) {
@@ -619,7 +621,7 @@ func (a *attach) setattrLocal(
 		return nil, eno
 	}
 	return &pfslocal.SetAttrReply{
-		Attr: fsAttrToLocalNlink(attr, updated.item, detached),
+		Attr: a.localAttrForRecordPath(attr, updated, scope, detached),
 	}, 0
 }
 

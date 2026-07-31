@@ -31,7 +31,10 @@
 // compatible; unknown fields are ignored (proto3). Breaking changes bump major
 // and the daemon serves both during a deprecation window.
 // Protocol minor 4 makes an explicit daemon handle mandatory for retained
-// Item attribute/xattr operations after unlink or rename-over.
+// Item attribute/xattr operations after unlink or rename-over. Protocol minor
+// 5 adds frontend parent identity, BSD flags, and allocated size to Attr so
+// FSKit can satisfy its requested-attribute contract without inventing
+// metadata.
 //
 // Identity model: items are addressed by (item_id, item_generation) — the
 // authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
@@ -693,7 +696,7 @@ public struct PfsHello: Sendable {
   /// 1
   public var protocolMajor: UInt32 = 0
 
-  /// 4
+  /// 5
   public var protocolMinor: UInt32 = 0
 
   /// e.g. "fskit-appex"
@@ -893,11 +896,33 @@ public struct PfsAttr: Sendable {
   /// coherence version; bumps on content change
   public var contentVersion: UInt64 = 0
 
+  /// Actual frontend identity of one live parent binding. Absent for the root
+  /// and for retained-but-unlinked Items. Hard-linked Items may have multiple
+  /// parents; the daemon returns the parent of the concrete alias used for the
+  /// operation, or a deterministic live alias for identity-only operations.
+  public var parent: PfsItem {
+    get {return _parent ?? PfsItem()}
+    set {_parent = newValue}
+  }
+  /// Returns true if `parent` has been explicitly set.
+  public var hasParent: Bool {return self._parent != nil}
+  /// Clears the value of `parent`. Subsequent reads from it will return its default value.
+  public mutating func clearParent() {self._parent = nil}
+
+  /// Darwin st_flags. Authority-backed PortableFS Items are zero because the
+  /// authority exposes no BSD file-flags operation; local grafts carry st_flags.
+  public var flags: UInt32 = 0
+
+  /// Storage allocation reported to FSKit. Authority-backed PortableFS uses
+  /// logical quota allocation; local grafts carry the backing stat allocation.
+  public var allocSize: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _item: PfsItem? = nil
+  fileprivate var _parent: PfsItem? = nil
 }
 
 /// errno values use the darwin numbering (the daemon translates); message is for logs only.
@@ -3575,6 +3600,9 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
     10: .standard(proto: "atime_ms"),
     11: .standard(proto: "birthtime_ms"),
     12: .standard(proto: "content_version"),
+    13: .same(proto: "parent"),
+    14: .same(proto: "flags"),
+    15: .standard(proto: "alloc_size"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -3595,6 +3623,9 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
       case 10: try { try decoder.decodeSingularInt64Field(value: &self.atimeMs) }()
       case 11: try { try decoder.decodeSingularInt64Field(value: &self.birthtimeMs) }()
       case 12: try { try decoder.decodeSingularUInt64Field(value: &self.contentVersion) }()
+      case 13: try { try decoder.decodeSingularMessageField(value: &self._parent) }()
+      case 14: try { try decoder.decodeSingularUInt32Field(value: &self.flags) }()
+      case 15: try { try decoder.decodeSingularUInt64Field(value: &self.allocSize) }()
       default: break
       }
     }
@@ -3641,6 +3672,15 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
     if self.contentVersion != 0 {
       try visitor.visitSingularUInt64Field(value: self.contentVersion, fieldNumber: 12)
     }
+    try { if let v = self._parent {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
+    } }()
+    if self.flags != 0 {
+      try visitor.visitSingularUInt32Field(value: self.flags, fieldNumber: 14)
+    }
+    if self.allocSize != 0 {
+      try visitor.visitSingularUInt64Field(value: self.allocSize, fieldNumber: 15)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3657,6 +3697,9 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
     if lhs.atimeMs != rhs.atimeMs {return false}
     if lhs.birthtimeMs != rhs.birthtimeMs {return false}
     if lhs.contentVersion != rhs.contentVersion {return false}
+    if lhs._parent != rhs._parent {return false}
+    if lhs.flags != rhs.flags {return false}
+    if lhs.allocSize != rhs.allocSize {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

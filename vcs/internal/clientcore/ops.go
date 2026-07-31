@@ -41,7 +41,7 @@ func (v *Volume) debug(format string, a ...any) {
 	}
 }
 
-func (v *Volume) cachedGetattr(view *readView, path string) (fsproto.Attr, Status) {
+func (v *Volume) cachedGetattr(ctx context.Context, view *readView, path string) (fsproto.Attr, Status) {
 	if gen, curVer, pathValid := v.VersionCache.CacheState(path); gen != 0 && pathValid {
 		dir, _ := splitPath(path)
 		_, parentCurVer, parentValid := v.VersionCache.CacheState(dir)
@@ -68,7 +68,15 @@ func (v *Volume) cachedGetattr(view *readView, path string) (fsproto.Attr, Statu
 	}
 	observation := v.hardlinks.beginObservation()
 	defer observation.Close()
-	a, rver, rgen, parentVersion, st, err := v.client.GetattrV(path)
+	covered := v.wb != nil && view.Covers(path)
+	var resume func()
+	if !covered {
+		resume = v.suspendAuthorityPublication(ctx)
+	}
+	a, rver, rgen, parentVersion, st, err := v.client.GetattrVContext(ctx, path)
+	if resume != nil {
+		resume()
+	}
 	if err != nil {
 		v.debug("CachedGetattr GetattrV %q: %v", path, err)
 		return fsproto.Attr{}, fsproto.EIO
@@ -172,7 +180,7 @@ func (v *Volume) lookup(ctx context.Context, permit *readView, path string) (fsp
 			}
 		}
 	}
-	return v.cachedGetattr(permit, path)
+	return v.cachedGetattr(ctx, permit, path)
 }
 
 func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsproto.Attr, Status) {
@@ -189,7 +197,7 @@ func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsprot
 // after unlink or rename-over the former name is not namespace evidence and
 // may already identify a replacement.
 func (v *Volume) GetattrExactHandle(ctx context.Context, n *NodeState) (fsproto.Attr, Status) {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -201,9 +209,9 @@ func (v *Volume) GetattrExactHandle(ctx context.Context, n *NodeState) (fsproto.
 	var a *fsproto.Attr
 	var st int32
 	if oi := n.Orphan(); oi != 0 {
-		a, st, err = v.client.GetattrOrphan(oi)
+		a, st, err = v.client.GetattrOrphanContext(authorityCtx, oi)
 	} else {
-		a, st, err = v.client.GetattrHandle("", ino)
+		a, st, err = v.client.GetattrHandleContext(authorityCtx, "", ino)
 	}
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -248,7 +256,9 @@ func (v *Volume) GetattrOpenHandle(ctx context.Context, path string, n *NodeStat
 	if ino == 0 {
 		return fsproto.Attr{}, fsproto.ENOENT
 	}
-	a, st, err := v.client.GetattrHandle(path, ino)
+	resume := v.suspendAuthorityPublication(ctx)
+	a, st, err := v.client.GetattrHandleContext(ctx, path, ino)
+	resume()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -260,7 +270,7 @@ func (v *Volume) GetattrOpenHandle(ctx context.Context, path string, n *NodeStat
 
 func (v *Volume) getattr(ctx context.Context, permit *readView, path string, n *NodeState) (fsproto.Attr, Status) {
 	if oi := n.Orphan(); oi != 0 {
-		a, st, err := v.client.GetattrOrphan(oi)
+		a, st, err := v.client.GetattrOrphanContext(v.authorityWaitContext(ctx), oi)
 		if err != nil {
 			return fsproto.Attr{}, fsproto.EIO
 		}
@@ -278,10 +288,10 @@ func (v *Volume) getattr(ctx context.Context, permit *readView, path string, n *
 			return fsproto.Attr{}, fsproto.ENOENT
 		}
 	}
-	a, st := v.cachedGetattr(permit, path)
+	a, st := v.cachedGetattr(ctx, permit, path)
 	if st == fsproto.ENOENT {
-		if oi := v.RedirectToOrphan(n); oi != 0 {
-			if oa, ost, oerr := v.client.GetattrOrphan(oi); oerr == nil && ost == fsproto.OK {
+		if oi := v.RedirectToOrphan(ctx, n); oi != 0 {
+			if oa, ost, oerr := v.client.GetattrOrphanContext(v.authorityWaitContext(ctx), oi); oerr == nil && ost == fsproto.OK {
 				return *oa, fsproto.OK
 			}
 		}
@@ -330,7 +340,14 @@ func (v *Volume) readdir(ctx context.Context, permit *readView, dir string) ([]D
 	}
 	observation := v.hardlinks.beginObservation()
 	defer observation.Close()
-	ents, gen, dirVersion, st, err := v.client.ReaddirV(dir)
+	var resume func()
+	if !covered {
+		resume = v.suspendAuthorityPublication(ctx)
+	}
+	ents, gen, dirVersion, st, err := v.client.ReaddirVContext(ctx, dir)
+	if resume != nil {
+		resume()
+	}
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -479,7 +496,7 @@ func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeInten
 		return fsproto.EIO
 	}
 	if released && (n == nil || n.AuthorityIno() == 0) {
-		if st := v.resolveOpenAfterHandoff(path, n); st != fsproto.OK {
+		if st := v.resolveOpenAfterHandoff(ctx, path, n); st != fsproto.OK {
 			v.rollbackTrackedOpen(path, n)
 			return st
 		}
@@ -506,7 +523,7 @@ func (v *Volume) RegisterOpened(ctx context.Context, path string, n *NodeState) 
 		return fsproto.EIO
 	}
 	if released && (n == nil || n.AuthorityIno() == 0) {
-		if st := v.resolveOpenAfterHandoff(path, n); st != fsproto.OK {
+		if st := v.resolveOpenAfterHandoff(ctx, path, n); st != fsproto.OK {
 			v.rollbackTrackedOpen(path, n)
 			return st
 		}
@@ -526,8 +543,10 @@ func (v *Volume) RegisterOpened(ctx context.Context, path string, n *NodeState) 
 // blocked before it could join the delegated snapshot, but the authority has
 // now accepted the release. Resolve and pin the shared-mode inode before the
 // open becomes visible to the caller.
-func (v *Volume) resolveOpenAfterHandoff(path string, n *NodeState) Status {
-	a, _, _, _, st, err := v.client.GetattrV(path)
+func (v *Volume) resolveOpenAfterHandoff(ctx context.Context, path string, n *NodeState) Status {
+	resume := v.suspendAuthorityPublication(ctx)
+	a, _, _, _, st, err := v.client.GetattrVContext(ctx, path)
+	resume()
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -666,7 +685,7 @@ func (v *Volume) closeOne(path string, n *NodeState, closeRegistered bool) bool 
 	return orphaned
 }
 
-func (v *Volume) RedirectToOrphan(n *NodeState) uint64 {
+func (v *Volume) RedirectToOrphan(ctx context.Context, n *NodeState) uint64 {
 	if n == nil || !n.IsOpen() {
 		return 0
 	}
@@ -674,7 +693,7 @@ func (v *Volume) RedirectToOrphan(n *NodeState) uint64 {
 	if ino == 0 {
 		return 0
 	}
-	if _, st, err := v.client.GetattrOrphan(ino); err != nil || st != fsproto.OK {
+	if _, st, err := v.client.GetattrOrphanContext(v.authorityWaitContext(ctx), ino); err != nil || st != fsproto.OK {
 		return 0
 	}
 	n.MarkOrphan(ino, v.openOrphans)
@@ -687,14 +706,14 @@ func (v *Volume) Read(ctx context.Context, path string, n *NodeState, off int64,
 		return nil, fsproto.EIO
 	}
 	defer permit.Close()
-	return v.read(&permit, path, n, off, length)
+	return v.read(ctx, &permit, path, n, off, length)
 }
 
 // ReadExactHandle is the detached-descriptor read lane. It intentionally
 // bypasses the former pathname's overlay and caches, which could now belong to
 // a replacement inode.
 func (v *Volume) ReadExactHandle(ctx context.Context, n *NodeState, off int64, length int) ([]byte, Status) {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -706,9 +725,9 @@ func (v *Volume) ReadExactHandle(ctx context.Context, n *NodeState, off int64, l
 	var data []byte
 	var st int32
 	if oi := n.Orphan(); oi != 0 {
-		data, st, err = v.client.ReadOrphan(oi, off, int64(length))
+		data, st, err = v.client.ReadOrphanContext(authorityCtx, oi, off, int64(length))
 	} else {
-		data, _, _, st, err = v.client.ReadVHandle("", ino, off, int64(length))
+		data, _, _, st, err = v.client.ReadVHandleContext(authorityCtx, "", ino, off, int64(length))
 	}
 	if err != nil {
 		return nil, fsproto.EIO
@@ -741,21 +760,23 @@ func (v *Volume) ReadOpenHandle(ctx context.Context, path string, n *NodeState, 
 			permit.Close()
 			return v.ReadExactHandle(ctx, n, off, length)
 		}
-		return v.read(&permit, path, n, off, length)
+		return v.read(ctx, &permit, path, n, off, length)
 	}
 	if ino == 0 {
 		return nil, fsproto.ENOENT
 	}
-	data, _, _, st, err := v.client.ReadVHandle(path, ino, off, int64(length))
+	resume := v.suspendAuthorityPublication(ctx)
+	data, _, _, st, err := v.client.ReadVHandleContext(ctx, path, ino, off, int64(length))
+	resume()
 	if err != nil {
 		return nil, fsproto.EIO
 	}
 	return data, st
 }
 
-func (v *Volume) read(permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
+func (v *Volume) read(ctx context.Context, permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
 	if oi := n.Orphan(); oi != 0 {
-		data, st, err := v.client.ReadOrphan(oi, off, int64(length))
+		data, st, err := v.client.ReadOrphanContext(v.authorityWaitContext(ctx), oi, off, int64(length))
 		if err != nil {
 			return nil, fsproto.EIO
 		}
@@ -768,7 +789,7 @@ func (v *Volume) read(permit *readView, path string, n *NodeState, off int64, le
 			// clean ranges (it trails a local rename until the rename
 			// applies — reading the new name early would serve the previous
 			// file's bytes).
-			data, st := v.readBase(permit, basePath, n, boff, len(bdst))
+			data, st := v.readBase(ctx, permit, basePath, n, boff, len(bdst))
 			if st != fsproto.OK {
 				// A base miss composes as zeros; the dirty extents and the
 				// engine-tracked size still bound the result.
@@ -784,7 +805,7 @@ func (v *Volume) read(permit *readView, path string, n *NodeState, off int64, le
 			return dst[:nRead], fsproto.OK
 		}
 	}
-	return v.readBase(permit, path, n, off, length)
+	return v.readBase(ctx, permit, path, n, off, length)
 }
 
 // readBase is the shared/clean read path: version-gated disk cache first,
@@ -794,7 +815,7 @@ func (v *Volume) read(permit *readView, path string, n *NodeState, off int64, le
 // serve the PREVIOUS flushed content after the overlay folds. Covered reads
 // go to the authority (whose applied state is exactly what we acknowledged);
 // the cache resumes when the delegation releases and versions flow again.
-func (v *Volume) readBase(permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
+func (v *Volume) readBase(ctx context.Context, permit *readView, path string, n *NodeState, off int64, length int) ([]byte, Status) {
 	handleIno := authHandleIno(n)
 	covered := v.wb != nil && permit.Covers(path)
 	if v.DiskCache != nil && handleIno != 0 && !covered {
@@ -804,13 +825,20 @@ func (v *Volume) readBase(permit *readView, path string, n *NodeState, off int64
 			}
 		}
 	}
-	data, version, gen, st, err := v.client.ReadVHandle(path, handleIno, off, int64(length))
+	var resume func()
+	if !covered {
+		resume = v.suspendAuthorityPublication(ctx)
+	}
+	data, version, gen, st, err := v.client.ReadVHandleContext(ctx, path, handleIno, off, int64(length))
+	if resume != nil {
+		resume()
+	}
 	if err != nil {
 		return nil, fsproto.EIO
 	}
 	if st == fsproto.ENOENT {
-		if oi := v.RedirectToOrphan(n); oi != 0 {
-			d, ost, oerr := v.client.ReadOrphan(oi, off, int64(length))
+		if oi := v.RedirectToOrphan(ctx, n); oi != 0 {
+			d, ost, oerr := v.client.ReadOrphanContext(v.authorityWaitContext(ctx), oi, off, int64(length))
 			if oerr == nil && ost == fsproto.OK {
 				return d, fsproto.OK
 			}
@@ -820,7 +848,7 @@ func (v *Volume) readBase(permit *readView, path string, n *NodeState, off int64
 		return nil, st
 	}
 	if oi := n.Orphan(); oi != 0 {
-		if d, ost, oerr := v.client.ReadOrphan(oi, off, int64(length)); oerr == nil && ost == fsproto.OK {
+		if d, ost, oerr := v.client.ReadOrphanContext(v.authorityWaitContext(ctx), oi, off, int64(length)); oerr == nil && ost == fsproto.OK {
 			return d, fsproto.OK
 		}
 	}
@@ -853,7 +881,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	defer v.endMutation()
 
 	if oi := n.Orphan(); oi != 0 {
-		cnt, st, err := v.client.WriteOrphan(oi, off, data)
+		cnt, st, err := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 		if err != nil {
 			return 0, fsproto.EIO
 		}
@@ -868,7 +896,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		n.mu.Lock()
 		if oi := n.orphanIno; oi != 0 {
 			n.mu.Unlock()
-			cnt, st, werr := v.client.WriteOrphan(oi, off, data)
+			cnt, st, werr := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 			if werr != nil {
 				return 0, fsproto.EIO
 			}
@@ -894,7 +922,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			return 0, statusErr(werr)
 		}
 	}
-	endAuthority, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
@@ -904,21 +932,21 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()
-		cnt, st, err := v.client.WriteOrphan(oi, off, data)
+		cnt, st, err := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 		if err != nil {
 			return 0, fsproto.EIO
 		}
 		return cnt, st
 	}
 	handleIno := authHandleIno(n)
-	cnt, version, gen, st, err := v.client.WriteVHandle(path, handleIno, off, data, 0o644)
+	cnt, version, gen, st, err := v.client.WriteVHandleContext(authorityCtx, path, handleIno, off, data, 0o644)
 	n.mu.Unlock()
 	if err != nil {
 		return 0, fsproto.EIO
 	}
 	if st == fsproto.ENOENT {
-		if oi := v.RedirectToOrphan(n); oi != 0 {
-			c2, ost, oerr := v.client.WriteOrphan(oi, off, data)
+		if oi := v.RedirectToOrphan(authorityCtx, n); oi != 0 {
+			c2, ost, oerr := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 			if oerr != nil {
 				return 0, fsproto.EIO
 			}
@@ -941,7 +969,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 // release is rare but necessary: with an unseen surviving hard link there is
 // no trustworthy pathname scope to release more narrowly.
 func (v *Volume) WriteExactHandle(ctx context.Context, n *NodeState, off int64, data []byte) (int, Status) {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return 0, fsproto.EIO
 	}
@@ -951,13 +979,13 @@ func (v *Volume) WriteExactHandle(ctx context.Context, n *NodeState, off int64, 
 		return 0, fsproto.ENOENT
 	}
 	if oi := n.Orphan(); oi != 0 {
-		count, st, err := v.client.WriteOrphan(oi, off, data)
+		count, st, err := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 		if err != nil {
 			return 0, fsproto.EIO
 		}
 		return count, st
 	}
-	count, _, _, st, err := v.client.WriteVHandle("", ino, off, data, 0o644)
+	count, _, _, st, err := v.client.WriteVHandleContext(authorityCtx, "", ino, off, data, 0o644)
 	if err != nil {
 		return 0, fsproto.EIO
 	}
@@ -993,7 +1021,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	defer v.endMutation()
 
 	if oi := n.Orphan(); oi != 0 {
-		cnt, _, st, err := v.client.AppendOrphan(oi, data)
+		cnt, _, st, err := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
 		if err != nil {
 			return 0, fsproto.EIO
 		}
@@ -1008,7 +1036,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		n.mu.Lock()
 		if oi := n.orphanIno; oi != 0 {
 			n.mu.Unlock()
-			cnt, _, st, werr := v.client.AppendOrphan(oi, data)
+			cnt, _, st, werr := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
 			if werr != nil {
 				return 0, fsproto.EIO
 			}
@@ -1031,7 +1059,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			return 0, statusErr(werr)
 		}
 	}
-	endAuthority, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
@@ -1041,21 +1069,21 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()
-		cnt, _, st, err := v.client.AppendOrphan(oi, data)
+		cnt, _, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
 		if err != nil {
 			return 0, fsproto.EIO
 		}
 		return cnt, st
 	}
 	handleIno := authHandleIno(n)
-	cnt, _, version, gen, st, err := v.client.AppendVHandle(path, handleIno, data, 0o644)
+	cnt, _, version, gen, st, err := v.client.AppendVHandleContext(authorityCtx, path, handleIno, data, 0o644)
 	n.mu.Unlock()
 	if err != nil {
 		return 0, fsproto.EIO
 	}
 	if st == fsproto.ENOENT {
-		if oi := v.RedirectToOrphan(n); oi != 0 {
-			c2, _, ost, oerr := v.client.AppendOrphan(oi, data)
+		if oi := v.RedirectToOrphan(authorityCtx, n); oi != 0 {
+			c2, _, ost, oerr := v.client.AppendOrphanContext(authorityCtx, oi, data)
 			if oerr != nil {
 				return 0, fsproto.EIO
 			}
@@ -1139,16 +1167,16 @@ func (v *Volume) createWriteThrough(
 	var gen uint64
 	var st int32
 	var err error
-	end, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, end, releaseErr := v.beginAuthorityMutation(
 		ctx, nil, path,
 	)
 	if releaseErr != nil {
 		return fsproto.Attr{}, statusErr(releaseErr)
 	}
 	if excl {
-		a, gen, st, err = v.client.CreateExclRegisterOpen(path, mode)
+		a, gen, st, err = v.client.CreateExclRegisterOpenContext(authorityCtx, path, mode)
 	} else {
-		a, gen, st, err = v.client.CreateRegisterOpen(path, mode)
+		a, gen, st, err = v.client.CreateRegisterOpenContext(authorityCtx, path, mode)
 	}
 	end()
 	if err != nil {
@@ -1189,13 +1217,13 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 		st  int32
 		err error
 	)
-	end, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, end, releaseErr := v.beginAuthorityMutation(
 		ctx, nil, path,
 	)
 	if releaseErr != nil {
 		return fsproto.Attr{}, statusErr(releaseErr)
 	}
-	a, st, err = v.client.Mkdir(path, mode)
+	a, st, err = v.client.MkdirContext(authorityCtx, path, mode)
 	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -1260,13 +1288,13 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 		}
 	}
 	var st Status
-	end, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, end, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{child}, path,
 	)
 	if releaseErr != nil {
 		return statusErr(releaseErr)
 	}
-	st = v.removeWriteThrough(path, child)
+	st = v.removeWriteThrough(authorityCtx, path, child)
 	end()
 	return st
 }
@@ -1274,11 +1302,11 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 // removeWriteThrough performs the authority-side remove/orphan transaction.
 // Its caller has already released every overlapping local delegation and
 // keeps delegation acquisition excluded until this transaction returns.
-func (v *Volume) removeWriteThrough(path string, child *NodeState) Status {
+func (v *Volume) removeWriteThrough(ctx context.Context, path string, child *NodeState) Status {
 	if child != nil {
 		child.mu.Lock()
 		if child.nopen > 0 && child.orphanIno == 0 {
-			ino, st, err := v.client.Orphan(path)
+			ino, st, err := v.client.OrphanContext(ctx, path)
 			if err != nil {
 				child.mu.Unlock()
 				return fsproto.EIO
@@ -1307,7 +1335,7 @@ func (v *Volume) removeWriteThrough(path string, child *NodeState) Status {
 			// the inode. Only this inode is serialized across the matching
 			// authority mutation.
 			v.openReg.ReleaseNameChange(path, child.AuthorityIno())
-			st, err := v.client.Remove(path)
+			st, err := v.client.RemoveContext(ctx, path)
 			child.mu.Unlock()
 			if err != nil {
 				return fsproto.EIO
@@ -1324,7 +1352,7 @@ func (v *Volume) removeWriteThrough(path string, child *NodeState) Status {
 		}
 		child.mu.Unlock()
 	}
-	st, err := v.client.Remove(path)
+	st, err := v.client.RemoveContext(ctx, path)
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -1423,7 +1451,7 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 		}
 	}
 	var st Status
-	end, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, end, releaseErr := v.beginAuthorityMutation(
 		ctx,
 		[]*NodeState{src, dst},
 		oldp,
@@ -1432,7 +1460,7 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 	if releaseErr != nil {
 		return statusErr(releaseErr)
 	}
-	st = v.renameWriteThrough(oldp, newp, src, dst, sameAuthorityInode)
+	st = v.renameWriteThrough(authorityCtx, oldp, newp, src, dst, sameAuthorityInode)
 	end()
 	return st
 }
@@ -1440,6 +1468,7 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 // renameWriteThrough performs the authority-side rename with the
 // open-destination orphan protocol and full cache/registry bookkeeping.
 func (v *Volume) renameWriteThrough(
+	ctx context.Context,
 	oldp, newp string,
 	src, dst *NodeState,
 	sameAuthorityInode bool,
@@ -1449,7 +1478,7 @@ func (v *Volume) renameWriteThrough(
 		// identify the same inode. Still ask the authority to validate the
 		// current namespace, but never detach/rekey either frontend name,
 		// open owner, retained registration, or alias observation.
-		st, _, err := v.client.RenameWithOrphanTarget(oldp, newp, false)
+		st, _, err := v.client.RenameWithOrphanTargetContext(ctx, oldp, newp, false)
 		if err != nil {
 			return fsproto.EIO
 		}
@@ -1458,7 +1487,7 @@ func (v *Volume) renameWriteThrough(
 	if dst != nil {
 		lockTwo(src, dst)
 		if dst.nopen > 0 && dst.orphanIno == 0 {
-			st, orphanIno, err := v.client.RenameWithOrphanTarget(oldp, newp, true)
+			st, orphanIno, err := v.client.RenameWithOrphanTargetContext(ctx, oldp, newp, true)
 			if err != nil {
 				unlockTwo(src, dst)
 				return fsproto.EIO
@@ -1482,7 +1511,7 @@ func (v *Volume) renameWriteThrough(
 			// a close that arrives later waits and the open-destination arm
 			// above provides explicit orphan semantics.
 			v.openReg.ReleaseNameChange(newp, dst.AuthorityIno())
-			st, _, err := v.client.RenameWithOrphanTarget(oldp, newp, false)
+			st, _, err := v.client.RenameWithOrphanTargetContext(ctx, oldp, newp, false)
 			unlockTwo(src, dst)
 			if err != nil {
 				return fsproto.EIO
@@ -1496,7 +1525,7 @@ func (v *Volume) renameWriteThrough(
 		}
 		unlockTwo(src, dst)
 	}
-	st, _, err := v.client.RenameWithOrphanTarget(oldp, newp, false)
+	st, _, err := v.client.RenameWithOrphanTargetContext(ctx, oldp, newp, false)
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -1560,13 +1589,13 @@ func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr
 		st  int32
 		err error
 	)
-	end, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, end, releaseErr := v.beginAuthorityMutation(
 		ctx, nil, path,
 	)
 	if releaseErr != nil {
 		return fsproto.Attr{}, statusErr(releaseErr)
 	}
-	a, st, err = v.client.Symlink(target, path)
+	a, st, err = v.client.SymlinkContext(authorityCtx, target, path)
 	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -1602,7 +1631,7 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 		st  int32
 		err error
 	)
-	end, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, end, releaseErr := v.beginAuthorityMutation(
 		ctx,
 		[]*NodeState{src},
 		oldp,
@@ -1615,7 +1644,7 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 		src.mu.Lock()
 		defer src.mu.Unlock()
 	}
-	a, st, err = v.client.Link(oldp, newp)
+	a, st, err = v.client.LinkContext(authorityCtx, oldp, newp)
 	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -1642,10 +1671,10 @@ func (v *Volume) Readlink(ctx context.Context, path string) (string, Status) {
 		return "", fsproto.EIO
 	}
 	defer permit.Close()
-	return v.readlink(&permit, path)
+	return v.readlink(ctx, &permit, path)
 }
 
-func (v *Volume) readlink(permit *readView, path string) (string, Status) {
+func (v *Volume) readlink(ctx context.Context, permit *readView, path string) (string, Status) {
 	// An engine-covered path answers from the overlay: a just-created symlink
 	// may not have flushed to the authority yet, so resolving there would
 	// race the flusher.
@@ -1661,7 +1690,15 @@ func (v *Volume) readlink(permit *readView, path string) (string, Status) {
 			}
 		}
 	}
-	t, st, err := v.client.Readlink(path)
+	covered := v.wb != nil && permit.Covers(path)
+	var resume func()
+	if !covered {
+		resume = v.suspendAuthorityPublication(ctx)
+	}
+	t, st, err := v.client.ReadlinkContext(ctx, path)
+	if resume != nil {
+		resume()
+	}
 	if err != nil {
 		return "", fsproto.EIO
 	}
@@ -1676,7 +1713,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	defer v.endMutation()
 
 	if oi := n.Orphan(); oi != 0 {
-		return v.setattrOrphan(oi, req)
+		return v.setattrOrphan(ctx, oi, req)
 	}
 	if v.wb != nil && v.isHardlink(n) {
 		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
@@ -1687,7 +1724,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		n.mu.Lock()
 		if oi := n.orphanIno; oi != 0 {
 			n.mu.Unlock()
-			return v.setattrOrphan(oi, req)
+			return v.setattrOrphan(ctx, oi, req)
 		}
 		n.mu.Unlock()
 		var last writeback.Result
@@ -1741,7 +1778,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			}
 		}
 	}
-	endAuthority, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
@@ -1751,11 +1788,11 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()
-		return v.setattrOrphan(oi, req)
+		return v.setattrOrphan(authorityCtx, oi, req)
 	}
 	handleIno := authHandleIno(n)
 	if req.SetSize {
-		st, err := v.client.TruncateHandle(path, handleIno, req.Size)
+		st, err := v.client.TruncateHandleContext(authorityCtx, path, handleIno, req.Size)
 		if err != nil {
 			n.mu.Unlock()
 			return fsproto.Attr{}, fsproto.EIO
@@ -1767,7 +1804,8 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		v.recent.record(path)
 	}
 	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
-		st, err := v.client.SetattrTimesHandle(
+		st, err := v.client.SetattrTimesHandleContext(
+			authorityCtx,
 			path, handleIno,
 			modebits.CleanUnix(req.Mode), req.SetMode,
 			req.MtimeMs, req.SetMTime,
@@ -1784,7 +1822,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		}
 		v.recent.record(path)
 	}
-	a, st, err := v.client.GetattrHandle(path, handleIno)
+	a, st, err := v.client.GetattrHandleContext(authorityCtx, path, handleIno)
 	n.mu.Unlock()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -1803,7 +1841,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 // pathname. It covers both a parked last-link orphan and a detached inode that
 // still has an authority-only hard-link alias unknown to this frontend.
 func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1817,9 +1855,9 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 		var st int32
 		var err error
 		if orphanIno != 0 {
-			st, err = v.client.TruncateOrphan(orphanIno, req.Size)
+			st, err = v.client.TruncateOrphanContext(authorityCtx, orphanIno, req.Size)
 		} else {
-			st, err = v.client.TruncateHandle("", ino, req.Size)
+			st, err = v.client.TruncateHandleContext(authorityCtx, "", ino, req.Size)
 		}
 		if err != nil {
 			return fsproto.Attr{}, fsproto.EIO
@@ -1829,7 +1867,8 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 		}
 	}
 	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
-		st, err := v.client.SetattrTimesHandle(
+		st, err := v.client.SetattrTimesHandleContext(
+			authorityCtx,
 			"", ino,
 			modebits.CleanUnix(req.Mode), req.SetMode,
 			req.MtimeMs, req.SetMTime,
@@ -1846,9 +1885,9 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 	var a *fsproto.Attr
 	var st int32
 	if orphanIno != 0 {
-		a, st, err = v.client.GetattrOrphan(orphanIno)
+		a, st, err = v.client.GetattrOrphanContext(authorityCtx, orphanIno)
 	} else {
-		a, st, err = v.client.GetattrHandle("", ino)
+		a, st, err = v.client.GetattrHandleContext(authorityCtx, "", ino)
 	}
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -1872,9 +1911,10 @@ func (v *Volume) SetattrOpenHandle(ctx context.Context, path string, n *NodeStat
 	return attr, st
 }
 
-func (v *Volume) setattrOrphan(ino uint64, req SetattrRequest) (fsproto.Attr, Status) {
+func (v *Volume) setattrOrphan(ctx context.Context, ino uint64, req SetattrRequest) (fsproto.Attr, Status) {
+	authorityCtx := v.authorityWaitContext(ctx)
 	if req.SetSize {
-		if st, err := v.client.TruncateOrphan(ino, req.Size); err != nil {
+		if st, err := v.client.TruncateOrphanContext(authorityCtx, ino, req.Size); err != nil {
 			return fsproto.Attr{}, fsproto.EIO
 		} else if st != fsproto.OK {
 			return fsproto.Attr{}, st
@@ -1884,7 +1924,8 @@ func (v *Volume) setattrOrphan(ino uint64, req SetattrRequest) (fsproto.Attr, St
 		// The parked inode is the identity. An empty path deliberately avoids
 		// presenting the removed or overwritten name as namespace evidence;
 		// exact-protocol handle addressing applies the metadata to ino.
-		st, err := v.client.SetattrTimesHandle(
+		st, err := v.client.SetattrTimesHandleContext(
+			authorityCtx,
 			"", ino,
 			modebits.CleanUnix(req.Mode), req.SetMode,
 			req.MtimeMs, req.SetMTime,
@@ -1898,7 +1939,7 @@ func (v *Volume) setattrOrphan(ino uint64, req SetattrRequest) (fsproto.Attr, St
 			return fsproto.Attr{}, st
 		}
 	}
-	a, st, err := v.client.GetattrOrphan(ino)
+	a, st, err := v.client.GetattrOrphanContext(authorityCtx, ino)
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1942,13 +1983,13 @@ func (v *Volume) FsyncHandle(path string, n *NodeState) Status {
 	return fsproto.OK
 }
 
-func (v *Volume) Getlk(path string, owner, start, end uint64, write bool) (fsproto.LockResult, error) {
-	return v.LockAuth().Lock(path, fsproto.LkGetlk, owner, start, end, write, false)
+func (v *Volume) Getlk(ctx context.Context, path string, owner, start, end uint64, write bool) (fsproto.LockResult, error) {
+	return v.LockAuth().Lock(ctx, path, fsproto.LkGetlk, owner, start, end, write, false)
 }
 
 func (v *Volume) Setlk(ctx context.Context, h *LockHandle, path string, owner, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
 	v.registerLockHandle(h)
-	return SetLock(v.LockAuth(), h, path, owner, start, end, write, unlock)
+	return SetLock(ctx, v.LockAuth(), h, path, owner, start, end, write, unlock)
 }
 
 func (v *Volume) Setlkw(ctx context.Context, h *LockHandle, path string, owner, start, end uint64, write bool) (fsproto.LockResult, error) {

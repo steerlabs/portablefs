@@ -4,7 +4,7 @@ package pfslocal
 
 const (
 	ProtocolMajor = 1
-	ProtocolMinor = 4
+	ProtocolMinor = 5
 	MaxFrameBytes = 16 << 20
 )
 
@@ -87,6 +87,9 @@ type Attr struct {
 	AtimeMs        int64
 	BirthtimeMs    int64
 	ContentVersion uint64
+	Parent         *Item
+	Flags          uint32
+	AllocSize      uint64
 }
 
 type ErrorReply struct {

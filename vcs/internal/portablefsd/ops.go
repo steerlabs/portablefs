@@ -28,11 +28,16 @@ const (
 	enumerationTTL              = 5 * time.Minute
 )
 
-func fsAttrToLocal(a fsproto.Attr, item pfslocal.Item) pfslocal.Attr {
-	return fsAttrToLocalNlink(a, item, false)
+func fsAttrToLocal(a fsproto.Attr, item pfslocal.Item, parent *pfslocal.Item) pfslocal.Attr {
+	return fsAttrToLocalNlink(a, item, parent, false)
 }
 
-func fsAttrToLocalNlink(a fsproto.Attr, item pfslocal.Item, preserveZero bool) pfslocal.Attr {
+func fsAttrToLocalNlink(
+	a fsproto.Attr,
+	item pfslocal.Item,
+	parent *pfslocal.Item,
+	preserveZero bool,
+) pfslocal.Attr {
 	kind := pfslocal.ItemKindFile
 	switch a.Kind {
 	case "directory":
@@ -44,11 +49,77 @@ func fsAttrToLocalNlink(a fsproto.Attr, item pfslocal.Item, preserveZero bool) p
 	if nlink == 0 && !preserveZero {
 		nlink = 1
 	}
+	var parentCopy *pfslocal.Item
+	if parent != nil {
+		value := *parent
+		parentCopy = &value
+	}
 	return pfslocal.Attr{
 		Item: item, Kind: kind, Mode: a.Mode, Nlink: nlink, UID: a.Uid, GID: a.Gid,
 		Size: uint64(max64(a.Size, 0)), MtimeMs: a.MtimeMs, CtimeMs: a.CtimeMs, AtimeMs: a.AtimeMs,
-		ContentVersion: 0,
+		BirthtimeMs: a.BirthtimeMs, ContentVersion: 0, Parent: parentCopy, Flags: a.Flags,
+		AllocSize: uint64(max64(a.AllocSize, 0)),
 	}
+}
+
+// parentItemLocked returns the frontend identity of the concrete live parent
+// binding for p. The root and retained-but-unlinked Items intentionally have no
+// protocol parent; FSKit maps those states to parent-of-root and invalid.
+func (a *attach) parentItemLocked(p string) *pfslocal.Item {
+	if p == "" {
+		return nil
+	}
+	parent := a.paths[parentPath(p)]
+	if parent == nil {
+		return nil
+	}
+	item := parent.item
+	return &item
+}
+
+func (a *attach) localAttrForRecordLocked(
+	attr fsproto.Attr,
+	rec *itemRecord,
+	detached bool,
+) pfslocal.Attr {
+	return a.localAttrForRecordPathLocked(attr, rec, rec.path, detached)
+}
+
+func (a *attach) localAttrForRecordPathLocked(
+	attr fsproto.Attr,
+	rec *itemRecord,
+	scope string,
+	detached bool,
+) pfslocal.Attr {
+	var parent *pfslocal.Item
+	if !detached {
+		if scope == "" {
+			scope = rec.path
+		}
+		parent = a.parentItemLocked(scope)
+	}
+	return fsAttrToLocalNlink(attr, rec.item, parent, detached)
+}
+
+func (a *attach) localAttrForRecord(
+	attr fsproto.Attr,
+	rec *itemRecord,
+	detached bool,
+) pfslocal.Attr {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.localAttrForRecordLocked(attr, rec, detached)
+}
+
+func (a *attach) localAttrForRecordPath(
+	attr fsproto.Attr,
+	rec *itemRecord,
+	scope string,
+	detached bool,
+) pfslocal.Attr {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.localAttrForRecordPathLocked(attr, rec, scope, detached)
 }
 
 func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
@@ -103,7 +174,7 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 	// on its fallback behavior (AppleDouble sidecars) while a native-capable
 	// attach serves xattrs first-class.
 	return pfslocal.ResolveReply{
-		Root: root.item, RootAttr: fsAttrToLocal(root.attr, root.item),
+		Root: root.item, RootAttr: a.localAttrForRecord(root.attr, root, false),
 		VolumeID: a.volumeID, Branch: a.branch, VolumeName: a.volumeName,
 		Capabilities: pfslocal.Capabilities{
 			Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
@@ -132,7 +203,7 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 		if eno := a.flushBindingDelta(); eno != 0 {
 			return nil, eno
 		}
-		return &pfslocal.LookupReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+		return &pfslocal.LookupReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -154,7 +225,7 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.LookupReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+	return &pfslocal.LookupReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
 }
 
 func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) (*pfslocal.EnumerateReply, int32) {
@@ -333,7 +404,11 @@ func (a *attach) enumeratePageLocked(enumRec *enumerationRecord, dir string, sta
 				return nil, darwinEIO
 			}
 		}
-		out = append(out, pfslocal.DirEntry{Name: []byte(e.Name), Attr: fsAttrToLocal(e.Attr, rec.item), Cookie: cookie})
+		out = append(out, pfslocal.DirEntry{
+			Name:   []byte(e.Name),
+			Attr:   a.localAttrForRecordLocked(e.Attr, rec, false),
+			Cookie: cookie,
+		})
 	}
 	next := uint64(0)
 	if len(out) > 0 {
@@ -459,7 +534,7 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 			return nil, eno
 		}
 		return &pfslocal.GetAttrReply{
-			Attr: fsAttrToLocalNlink(attr, rec.item, target.detached),
+			Attr: a.localAttrForRecordPath(attr, rec, target.scope, target.detached),
 		}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -490,7 +565,7 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 		return nil, eno
 	}
 	return &pfslocal.GetAttrReply{
-		Attr: fsAttrToLocalNlink(attr, rec.item, target.detached),
+		Attr: a.localAttrForRecordPath(attr, rec, target.scope, target.detached),
 	}, 0
 }
 
@@ -516,7 +591,7 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 			// open a purpose-scoped writable local file for this bound name.
 			exactHandle = nil
 		}
-		return a.setattrLocal(rec, exactHandle, target.detached, req)
+		return a.setattrLocal(rec, exactHandle, target.scope, target.detached, req)
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -533,9 +608,14 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 			return nil, darwinESTALE
 		}
 		attr := current.attr
-		item := current.item
+		local := a.localAttrForRecordPathLocked(
+			attr,
+			current,
+			target.scope,
+			target.detached,
+		)
 		a.mu.RUnlock()
-		return &pfslocal.SetAttrReply{Attr: fsAttrToLocal(attr, item)}, 0
+		return &pfslocal.SetAttrReply{Attr: local}, 0
 	}
 	cr := clientcore.SetattrRequest{}
 	if req.Mode != nil {
@@ -590,7 +670,7 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		return nil, eno
 	}
 	return &pfslocal.SetAttrReply{
-		Attr: fsAttrToLocalNlink(attr, rec.item, target.detached),
+		Attr: a.localAttrForRecordPath(attr, rec, target.scope, target.detached),
 	}, 0
 }
 
@@ -750,7 +830,7 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 		}
 		return &pfslocal.WriteReply{
 			Written: uint32(len(req.Data)),
-			Attr:    fsAttrToLocalNlink(attr, rec.item, detached),
+			Attr:    a.localAttrForRecordPath(attr, rec, scope, detached),
 		}, 0
 	}
 	vol, eno := a.volOrErr()
@@ -783,7 +863,7 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	}
 	return &pfslocal.WriteReply{
 		Written: uint32(n),
-		Attr:    fsAttrToLocalNlink(attr, rec.item, detached),
+		Attr:    a.localAttrForRecordPath(attr, rec, scope, detached),
 	}, 0
 }
 
@@ -850,7 +930,10 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 			_ = file.Close()
 			return nil, eno
 		}
-		return &pfslocal.CreateReply{Attr: fsAttrToLocal(attr, rec.item), Handle: h}, 0
+		return &pfslocal.CreateReply{
+			Attr:   a.localAttrForRecord(attr, rec, false),
+			Handle: h,
+		}, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -884,7 +967,10 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 	a.mu.Lock()
 	h := a.newHandleLocked(p, rec.item.ItemID, rec.state, true)
 	a.mu.Unlock()
-	return &pfslocal.CreateReply{Attr: fsAttrToLocal(attr, rec.item), Handle: h}, 0
+	return &pfslocal.CreateReply{
+		Attr:   a.localAttrForRecord(attr, rec, false),
+		Handle: h,
+	}, 0
 }
 
 func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfslocal.MkdirReply, int32) {
@@ -921,7 +1007,7 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 		if eno := a.flushBindingDelta(); eno != 0 {
 			return nil, eno
 		}
-		return &pfslocal.MkdirReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+		return &pfslocal.MkdirReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -940,7 +1026,7 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.MkdirReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+	return &pfslocal.MkdirReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
 }
 
 func (a *attach) remove(ctx context.Context, req *pfslocal.RemoveRequest) int32 {
@@ -1151,7 +1237,7 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 		}
 		return &pfslocal.HardLinkReply{
 			Name: append([]byte(nil), req.Name...),
-			Attr: fsAttrToLocal(attr, rec.item),
+			Attr: a.localAttrForRecord(attr, rec, false),
 		}, 0
 	}
 
@@ -1171,7 +1257,7 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 	}
 	return &pfslocal.HardLinkReply{
 		Name: append([]byte(nil), req.Name...),
-		Attr: fsAttrToLocal(attr, rec.item),
+		Attr: a.localAttrForRecord(attr, rec, false),
 	}, 0
 }
 
@@ -1207,7 +1293,7 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 		if eno := a.flushBindingDelta(); eno != 0 {
 			return nil, eno
 		}
-		return &pfslocal.SymlinkReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+		return &pfslocal.SymlinkReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -1226,7 +1312,7 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
-	return &pfslocal.SymlinkReply{Attr: fsAttrToLocal(attr, rec.item)}, 0
+	return &pfslocal.SymlinkReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
 }
 
 func (a *attach) readlink(ctx context.Context, req *pfslocal.ReadlinkRequest) (*pfslocal.ReadlinkReply, int32) {

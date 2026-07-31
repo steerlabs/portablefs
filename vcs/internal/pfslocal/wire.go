@@ -566,6 +566,11 @@ func marshalAttr(m *Attr) []byte {
 	b = appendI64(b, 10, m.AtimeMs)
 	b = appendI64(b, 11, m.BirthtimeMs)
 	b = appendU64(b, 12, m.ContentVersion)
+	if m.Parent != nil {
+		b = appendMsg(b, 13, marshalItem(m.Parent))
+	}
+	b = appendU32(b, 14, m.Flags)
+	b = appendU64(b, 15, m.AllocSize)
 	return b
 }
 
@@ -619,6 +624,18 @@ func parseAttrField(wt int, raw []byte) (Attr, error) {
 			m.BirthtimeMs = int64(v)
 		case 12:
 			m.ContentVersion, err = scalarU64(wt, raw)
+		case 13:
+			var parent Item
+			parent, err = parseItemField(wt, raw)
+			if err == nil {
+				m.Parent = &parent
+			}
+		case 14:
+			var v uint64
+			v, err = scalarU64(wt, raw)
+			m.Flags = uint32(v)
+		case 15:
+			m.AllocSize, err = scalarU64(wt, raw)
 		}
 		return err
 	})

@@ -17,6 +17,9 @@ private struct RecordedDirectoryEntry: Sendable, Equatable {
     var itemID: UInt64
     var nextCookie: UInt64
     var hasAttributes: Bool
+    var attributeMask: Int
+    var parentID: UInt64?
+    var flags: UInt32?
 }
 
 @available(macOS 26.0, *)
@@ -57,13 +60,30 @@ private final class RecordingPackerState: @unchecked Sendable {
             refused = true
             return false
         }
+        let publicFields: [FSItem.Attribute] = [
+            .type, .mode, .linkCount, .uid, .gid, .flags, .size, .allocSize,
+            .fileID, .parentID, .accessTime, .modifyTime, .changeTime, .birthTime,
+            .backupTime, .addedTime, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO,
+        ]
+        let validMask = publicFields.reduce(into: FSItem.Attribute()) { mask, field in
+            if attributes?.isValid(field) == true {
+                mask.insert(field)
+            }
+        }
         storage.append(
             RecordedDirectoryEntry(
                 name: name.string ?? String(data: name.data, encoding: .utf8) ?? name.debugDescription,
                 itemType: itemType.rawValue,
                 itemID: itemID.rawValue,
                 nextCookie: nextCookie.rawValue,
-                hasAttributes: attributes != nil
+                hasAttributes: attributes != nil,
+                attributeMask: validMask.rawValue,
+                parentID: attributes?.isValid(.parentID) == true
+                    ? attributes?.parentID.rawValue
+                    : nil,
+                flags: attributes?.isValid(.flags) == true
+                    ? attributes?.flags
+                    : nil
             )
         )
         return true
@@ -580,8 +600,58 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     let target = try await harness.volume.readSymbolicLink(link)
     #expect(target.string == "a.txt")
     let (targetItem, _) = try await harness.volume.lookupItem(named: target, inDirectory: dir)
-    let attr = try await harness.volume.attributes(FSItem.GetAttributesRequest(), of: targetItem)
+    let typeRequest = FSItem.GetAttributesRequest()
+    typeRequest.wantedAttributes = [.type]
+    let attr = try await harness.volume.attributes(typeRequest, of: targetItem)
     #expect(attr.type == .file)
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterFiltersGetattrAndEnumerationToWantedAttributes() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+
+    let wanted: FSItem.Attribute = [.flags, .parentID]
+    let rootRequest = FSItem.GetAttributesRequest()
+    rootRequest.wantedAttributes = wanted
+    let rootAttributes = try await harness.volume.attributes(rootRequest, of: harness.root)
+    #expect(rootAttributes.isValid(.flags))
+    #expect(rootAttributes.flags == 0)
+    #expect(rootAttributes.isValid(.parentID))
+    #expect(rootAttributes.parentID == .parentOfRoot)
+    #expect(!rootAttributes.isValid(.uid))
+    #expect(!rootAttributes.isValid(.gid))
+
+    let child = try await createAdapterFile(
+        volume: harness.volume,
+        in: harness.root,
+        name: "wanted-mask"
+    )
+    let childRequest = FSItem.GetAttributesRequest()
+    childRequest.wantedAttributes = wanted
+    let childAttributes = try await harness.volume.attributes(childRequest, of: child)
+    #expect(childAttributes.isValid(.flags))
+    #expect(childAttributes.flags == 0)
+    #expect(childAttributes.isValid(.parentID))
+    #expect(childAttributes.parentID == .rootDirectory)
+    #expect(!childAttributes.isValid(.uid))
+    #expect(!childAttributes.isValid(.gid))
+
+    let (packer, state) = makeRecordingPacker(capacity: 10)
+    defer { RecordingPackerRegistry.shared.uninstall(packer) }
+    let enumerateRequest = FSItem.GetAttributesRequest()
+    enumerateRequest.wantedAttributes = wanted
+    _ = try await harness.volume.enumerateDirectory(
+        harness.root,
+        startingAt: .initial,
+        verifier: .initial,
+        attributes: enumerateRequest,
+        packer: packer
+    )
+    let entry = try #require(state.entries.first { $0.name == "wanted-mask" })
+    #expect(entry.attributeMask == wanted.rawValue)
+    #expect(entry.parentID == FSItem.Identifier.rootDirectory.rawValue)
+    #expect(entry.flags == 0)
 }
 
 @available(macOS 26.0, *)
@@ -777,7 +847,9 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
         overItem: target
     )
 
-    let oldAttr = try await harness.volume.attributes(FSItem.GetAttributesRequest(), of: target)
+    let sizeRequest = FSItem.GetAttributesRequest()
+    sizeRequest.wantedAttributes = [.size]
+    let oldAttr = try await harness.volume.attributes(sizeRequest, of: target)
     #expect(oldAttr.size == UInt64(v1.count))
     #expect(try await readViaCore(harness.core, item: target, length: v1.count) == v1)
 
@@ -876,7 +948,9 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     )
     #expect(try await harness.core.xattrList(item: portableTarget) == ["user.detached"])
     #expect(try await readViaCore(harness.core, item: target, length: v1.count) == adapterBytes("v"))
-    let oldAttr = try await harness.volume.attributes(FSItem.GetAttributesRequest(), of: target)
+    let sizeRequest = FSItem.GetAttributesRequest()
+    sizeRequest.wantedAttributes = [.size]
+    let oldAttr = try await harness.volume.attributes(sizeRequest, of: target)
     #expect(oldAttr.size == 1)
 
     let (newTarget, _) = try await harness.volume.lookupItem(named: FSFileName(string: "config"), inDirectory: harness.root)
