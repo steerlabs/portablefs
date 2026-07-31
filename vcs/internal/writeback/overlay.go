@@ -21,6 +21,12 @@ type Entry struct {
 	Ino     uint64
 	Nlink   uint32
 	Target  string // symlink target
+	// Flags is the inode's BSD file-flag word as the AUTHORITY last published
+	// it. The engine carries it so a delegated getattr keeps reporting the
+	// truth, but never MUTATES it: chflags has no local WAL lane (see
+	// Engine.Setattr), so a flag change is written through to the authority
+	// and re-seeded from there.
+	Flags uint32
 }
 
 // dirView is one directory's locally-known children under a delegation.

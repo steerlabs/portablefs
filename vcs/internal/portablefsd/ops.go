@@ -210,12 +210,24 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 	// never hardcoded, so an attach to an older authority keeps the frontend
 	// on its fallback behavior (AppleDouble sidecars) while a native-capable
 	// attach serves xattrs first-class.
+	//
+	// FlagsSupported is per-attach for the same reason and rides the SAME
+	// reply, which is the point: a frontend's volume capability set (FSKit's
+	// doesNotSupportImmutableFiles) is computed once, at mount, from the
+	// resolve reply — so the only way to publish per-attach flag knowledge as
+	// a mount-time static capability is to carry it here. The setattr path
+	// re-checks it per request; this field exists so the kernel is told the
+	// truth up front instead of learning it from a failed chflags.
+	// A nil vol is the synthetic-root attach (no authority yet): false is the
+	// honest answer, and it is the conservative one.
+	flagsSupported := vol.SupportsFlagPersistence()
 	return pfslocal.ResolveReply{
 		Root: root.item, RootAttr: a.localAttrForRecord(root.attr, root, false),
 		VolumeID: a.volumeID, Branch: a.branch, VolumeName: a.volumeName,
 		Capabilities: pfslocal.Capabilities{
 			Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
 			MaxNameBytes: 255, PreferredIOSize: 1 << 20,
+			FlagsSupported: flagsSupported,
 		},
 	}, 0
 }
@@ -609,7 +621,19 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		a.mu.RUnlock()
 		return &pfslocal.SetAttrReply{Attr: local}, 0
 	}
+	if req.SetFlags && !vol.SupportsFlagPersistence() {
+		// The attached authority has nowhere to store a flag word. Refuse the
+		// WHOLE setattr before anything is applied: consuming the other groups
+		// and dropping this one would report a success the next getattr
+		// contradicts. This is the same honest ENOTSUP the FSKit extension used
+		// to raise on its own — it moved down here because only the daemon
+		// knows the authority's features, and they are per-attach.
+		return nil, darwinENOTSUP
+	}
 	cr := clientcore.SetattrRequest{}
+	if req.SetFlags {
+		cr.Flags, cr.SetFlags = req.Flags, true
+	}
 	if req.Mode != nil {
 		cr.Mode, cr.SetMode = *req.Mode, true
 	}

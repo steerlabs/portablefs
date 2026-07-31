@@ -17,17 +17,19 @@ import (
 // ---- os.FileInfo (value snapshot, immutable) ----
 
 type fileInfo struct {
-	name    string
-	size    int64
-	mode    os.FileMode
-	mtime   time.Time
-	ctime   time.Time
-	atime   time.Time
-	uid     uint32
-	gid     uint32
-	nlink   uint32
-	ino     uint64
-	version uint64
+	name      string
+	size      int64
+	mode      os.FileMode
+	mtime     time.Time
+	ctime     time.Time
+	atime     time.Time
+	birthtime time.Time
+	flags     uint32
+	uid       uint32
+	gid       uint32
+	nlink     uint32
+	ino       uint64
+	version   uint64
 }
 
 func (fi fileInfo) Name() string       { return fi.name }
@@ -41,6 +43,19 @@ func (fi fileInfo) ChangeTime() time.Time {
 func (fi fileInfo) AccessTime() time.Time {
 	return fi.atime
 }
+
+// BirthTime exposes the inode's durable creation time via Sys() (the same
+// type-assert pattern as ChangeTime/AccessTime; the protocol layer's attrOf
+// already probes this exact interface for machine-local grafts). The ZERO time
+// means "unknown" — an inode from a pre-birthtime PFT2 tree — and attrOf leaves
+// the wire field at 0 for it, so the client's existing mtime-derivation
+// convention still applies instead of a bogus 1970.
+func (fi fileInfo) BirthTime() time.Time { return fi.birthtime }
+
+// Flags exposes the inode's stored BSD file flags (Darwin st_flags) via Sys(),
+// so the protocol layer serves what chflags(2) persisted rather than a zero
+// that would read as "this authority has no flags".
+func (fi fileInfo) Flags() uint32 { return fi.flags }
 
 // OwnerIDs exposes POSIX ownership via Sys(); a consumer (the protocol layer)
 // type-asserts this interface. Sys returns the fileInfo itself so the
@@ -64,7 +79,7 @@ func (fi fileInfo) Version() uint64 { return fi.version }
 
 func (fs *FS) infoOf(n *inode) fileInfo {
 	mtime, ctime, atime := inodeTimes(n)
-	return fileInfo{name: n.name, size: n.curSize(), mode: n.mode, mtime: mtime, ctime: ctime, atime: atime, uid: n.uid, gid: n.gid, nlink: fs.liveLinkCountLocked(n), ino: n.ino, version: n.version}
+	return fileInfo{name: n.name, size: n.curSize(), mode: n.mode, mtime: mtime, ctime: ctime, atime: atime, birthtime: n.birthtime, flags: n.flags, uid: n.uid, gid: n.gid, nlink: fs.liveLinkCountLocked(n), ino: n.ino, version: n.version}
 }
 
 // direntName is the entry name a path-addressed stat reports: the final
@@ -85,7 +100,7 @@ func direntName(name string) string {
 // reference count).
 func (fs *FS) infoOfNamed(n *inode, name string) fileInfo {
 	mtime, ctime, atime := inodeTimes(n)
-	return fileInfo{name: name, size: n.curSize(), mode: n.mode, mtime: mtime, ctime: ctime, atime: atime, uid: n.uid, gid: n.gid, nlink: fs.liveLinkCountLocked(n), ino: n.ino, version: n.version}
+	return fileInfo{name: name, size: n.curSize(), mode: n.mode, mtime: mtime, ctime: ctime, atime: atime, birthtime: n.birthtime, flags: n.flags, uid: n.uid, gid: n.gid, nlink: fs.liveLinkCountLocked(n), ino: n.ino, version: n.version}
 }
 
 // liveLinkCountLocked is linkCount with open-after-unlink truth: a PARKED

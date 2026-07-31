@@ -25,6 +25,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var lookupNoReplyNames: Set<String>
         public var strictItemNamespace: Bool
         public var protocolMinor: UInt32?
+        /// Mirrors the real daemon's per-attach BSD-flag knowledge: it rides
+        /// the resolve reply as `Capabilities.flagsSupported`, and a setattr
+        /// carrying `setFlags` against a daemon without it is answered
+        /// ENOTSUP rather than silently dropped.
+        public var flagsSupported: Bool
 
         public init(
             attachRef: String = "mock",
@@ -34,7 +39,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             lookupDelaysNanoseconds: [String: UInt64] = [:],
             lookupNoReplyNames: Set<String> = [],
             strictItemNamespace: Bool = false,
-            protocolMinor: UInt32? = nil
+            protocolMinor: UInt32? = nil,
+            flagsSupported: Bool = true
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -44,6 +50,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.lookupNoReplyNames = lookupNoReplyNames
             self.strictItemNamespace = strictItemNamespace
             self.protocolMinor = protocolMinor
+            self.flagsSupported = flagsSupported
         }
     }
 
@@ -417,6 +424,7 @@ private actor MockFileSystem {
         var atimeMs: Int64
         var birthtimeMs: Int64
         var contentVersion: UInt64
+        var flags: UInt32
 
         init(id: UInt64, kind: PfsItemKind, mode: UInt32, parent: UInt64?) {
             self.id = id
@@ -437,6 +445,7 @@ private actor MockFileSystem {
             self.atimeMs = now
             self.birthtimeMs = now
             self.contentVersion = 1
+            self.flags = 0
         }
 
         var item: PfsItem {
@@ -582,6 +591,7 @@ private actor MockFileSystem {
                 capabilities.maxNameBytes = 255
                 capabilities.maxFileSize = UInt64.max
                 capabilities.preferredIoBytes = 1_048_576
+                capabilities.flagsSupported = configuration.flagsSupported
                 response.capabilities = capabilities
                 reply.body = .resolveReply(response)
             case let .lookup(request):
@@ -634,12 +644,20 @@ private actor MockFileSystem {
                 reply.body = .getAttrReply(response)
             case let .setAttr(request):
                 let node = try node(for: request.item, handle: request.handle)
+                if request.setFlags && !configuration.flagsSupported {
+                    // Exactly the real daemon's contract: the ENOTSUP is
+                    // raised HERE, by the layer that knows the attached
+                    // authority's features, and it refuses the WHOLE setattr
+                    // before anything is applied.
+                    throw MockPOSIXError(errno: ENOTSUP, message: "authority does not persist BSD file flags")
+                }
                 if request.hasMode { node.mode = request.mode }
                 if request.hasUid { node.uid = request.uid }
                 if request.hasGid { node.gid = request.gid }
                 if request.hasSize { resize(node: node, size: Int(request.size)) }
                 if request.hasMtimeMs { node.mtimeMs = request.mtimeMs }
                 if request.hasAtimeMs { node.atimeMs = request.atimeMs }
+                if request.setFlags { node.flags = request.flags }
                 node.ctimeMs = nowMs()
                 var response = PfsSetAttrReply()
                 response.attr = attr(for: node)
@@ -971,6 +989,7 @@ private actor MockFileSystem {
         attr.atimeMs = node.atimeMs
         attr.birthtimeMs = node.birthtimeMs
         attr.contentVersion = node.contentVersion
+        attr.flags = node.flags
         return attr
     }
 

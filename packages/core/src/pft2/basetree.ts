@@ -1116,6 +1116,10 @@ function makeLegacyDirectory(ino: bigint, mode: number): LegacyFile {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        // Legacy manifests carry neither a birth time nor BSD flags; 0 is the
+        // canonical "absent" value the format defines for both.
+        birthtimeMs: 0n,
+        flags: 0,
         symlinkTarget: "",
       },
     },
@@ -1144,6 +1148,9 @@ function makeLegacyFile(entry: Pft2LegacyManifestEntry, ino: bigint): LegacyFile
         mtimeMs: toBigIntMs(entry.mtimeMs),
         ctimeMs: toBigIntMs(entry.ctimeMs),
         atimeMs: toBigIntMs(entry.atimeMs),
+        // Legacy manifests predate both durable fields; 0 is canonically absent.
+        birthtimeMs: 0n,
+        flags: 0,
         symlinkTarget: "",
       },
     },

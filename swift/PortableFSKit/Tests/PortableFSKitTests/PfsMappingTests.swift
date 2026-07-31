@@ -169,23 +169,45 @@ import Testing
     }
 }
 
-@Test func flagChangesAreRefusedInsteadOfSilentlyDropped() throws {
+/// A flags change is FORWARDED to the daemon, never judged in the extension
+/// and never silently dropped. Whether it can be honored is per-attach
+/// knowledge (the authority's FeatureFlagPersistence bit), so the mapping layer
+/// consumes `.flags` and lets the daemon answer — see
+/// `flagChangesAreRefusedByTheDaemonWhenTheAuthorityCannotPersistThem` for the
+/// refusal half of the contract.
+@Test func flagChangesAreForwardedInsteadOfSilentlyDropped() throws {
     let request = FSItem.SetAttributesRequest()
     request.mode = 0o600
     let modeOnly = try PfsFSKitMapping.setAttributes(from: request)
     #expect(modeOnly.mode == 0o600)
+    #expect(modeOnly.flags == nil)
 
     request.flags = UInt32(UF_IMMUTABLE)
-    do {
-        _ = try PfsFSKitMapping.setAttributes(from: request)
-        Issue.record("expected an unsupported flags change to fail")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ENOTSUP)
-    }
+    let withFlags = try PfsFSKitMapping.setAttributes(from: request)
+    #expect(withFlags.flags == UInt32(UF_IMMUTABLE))
+    #expect(withFlags.mode == 0o600)
+    // FSKit's contract: an attribute the filesystem acts on must be reported
+    // consumed, or the kernel keeps believing the change never happened.
+    #expect(request.consumedAttributes.contains(.flags))
 
-    var capabilities = PfsCapabilities()
-    capabilities.caseSensitive = true
-    #expect(PfsFSKitMapping.supportedCapabilities(from: capabilities).doesNotSupportImmutableFiles)
+    // Zero is a REQUEST (clear every flag), not "no change".
+    let clearing = FSItem.SetAttributesRequest()
+    clearing.flags = 0
+    #expect(try PfsFSKitMapping.setAttributes(from: clearing).flags == 0)
+    #expect(clearing.consumedAttributes.contains(.flags))
+}
+
+/// The volume capability is answered from the attach's own resolve reply, not
+/// hardcoded: a mount claims immutable-file support exactly where a chflags(2)
+/// will actually persist.
+@Test func immutableFileCapabilityFollowsTheAttachedAuthority() {
+    var withoutFlags = PfsCapabilities()
+    withoutFlags.caseSensitive = true
+    #expect(PfsFSKitMapping.supportedCapabilities(from: withoutFlags).doesNotSupportImmutableFiles)
+
+    var withFlags = withoutFlags
+    withFlags.flagsSupported = true
+    #expect(!PfsFSKitMapping.supportedCapabilities(from: withFlags).doesNotSupportImmutableFiles)
 }
 
 @Test func timespecConversionNormalizesPreEpochNanoseconds() {

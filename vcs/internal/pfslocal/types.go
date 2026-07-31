@@ -52,6 +52,12 @@ type Capabilities struct {
 	MaxNameBytes    uint32
 	MaxFileSize     uint64
 	PreferredIOSize uint32
+	// FlagsSupported is true exactly when this attach's authority durably
+	// stores BSD file flags (fsproto.FeatureFlagPersistence). Per-attach, never
+	// hardcoded: the frontend turns it into its mount-time volume capability
+	// (FSKit doesNotSupportImmutableFiles) so a mount claims chflags support
+	// only where a chflags will actually persist.
+	FlagsSupported bool
 }
 
 // Item is the frontend-visible filesystem object identity. portablefsd keeps
@@ -137,6 +143,15 @@ type SetAttrRequest struct {
 	MtimeMs *int64
 	AtimeMs *int64
 	Handle  uint64
+	// SetFlags/Flags is the chflags(2) group: SetFlags is the intent and Flags
+	// is the ABSOLUTE new BSD file-flag word. A bool+value pair rather than a
+	// *uint32 because 0 is a legal value (clear every flag) — the intent has to
+	// survive a zero payload. SetFlags is false in every frame an older
+	// frontend mints, which is exactly the previous "no flag change" meaning,
+	// so the fields needed no protocol-minor bump (same rule as the O_APPEND
+	// intent fields; see pfslocal.proto).
+	SetFlags bool
+	Flags    uint32
 }
 type SetAttrReply struct{ Attr Attr }
 

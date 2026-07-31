@@ -80,6 +80,15 @@ public struct PfsSetAttributes: Sendable {
     public var size: UInt64?
     public var mtimeMilliseconds: Int64?
     public var atimeMilliseconds: Int64?
+    /// chflags(2): the ABSOLUTE new BSD file-flag word, not a delta. `nil`
+    /// means "this setattr changes no flags"; `.some(0)` is a real request to
+    /// clear every flag, which is why this is an Optional rather than a
+    /// sentinel value.
+    ///
+    /// The extension always FORWARDS the intent: only the daemon knows whether
+    /// this attach's authority persists flags, so it — not the mapping layer —
+    /// is what answers ENOTSUP when it cannot.
+    public var flags: UInt32?
 
     public init(
         mode: UInt32? = nil,
@@ -87,7 +96,8 @@ public struct PfsSetAttributes: Sendable {
         gid: UInt32? = nil,
         size: UInt64? = nil,
         mtimeMilliseconds: Int64? = nil,
-        atimeMilliseconds: Int64? = nil
+        atimeMilliseconds: Int64? = nil,
+        flags: UInt32? = nil
     ) {
         self.mode = mode
         self.uid = uid
@@ -95,6 +105,7 @@ public struct PfsSetAttributes: Sendable {
         self.size = size
         self.mtimeMilliseconds = mtimeMilliseconds
         self.atimeMilliseconds = atimeMilliseconds
+        self.flags = flags
     }
 }
 
@@ -308,6 +319,12 @@ public actor VolumeCore {
         if let size = attributes.size { request.size = size }
         if let mtime = attributes.mtimeMilliseconds { request.mtimeMs = mtime }
         if let atime = attributes.atimeMilliseconds { request.atimeMs = atime }
+        if let flags = attributes.flags {
+            // setFlags is the intent; a zero word is a legal "clear
+            // everything", so the bool must be set even when flags stays 0.
+            request.setFlags = true
+            request.flags = flags
+        }
 
         let envelope = try await client.request(.setAttr(request))
         guard case let .setAttrReply(reply)? = envelope.body else {

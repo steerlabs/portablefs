@@ -140,6 +140,19 @@ func (v *Volume) isHardlink(n *NodeState) bool {
 // entry keeps Ino == 0 (no authority identity yet): frontends substitute
 // their own stable path-derived inode, and handle-addressed RPCs must NOT
 // treat it as an authority ino.
+// setattrV projects the frontend-neutral request onto the protocol splitter's
+// one-value surface. Every authority setattr arm goes through it so a newly
+// added attribute group cannot be forwarded on one arm and dropped on another.
+func setattrV(req SetattrRequest) fsproto.SetattrV {
+	return fsproto.SetattrV{
+		Mode: modebits.CleanUnix(req.Mode), SetMode: req.SetMode,
+		MtimeMs: req.MtimeMs, SetTime: req.SetMTime,
+		AtimeMs: req.AtimeMs, SetATime: req.SetATime,
+		UID: req.UID, GID: req.GID, SetUID: req.SetUID, SetGID: req.SetGID,
+		Flags: req.Flags, SetFlags: req.SetFlags,
+	}
+}
+
 func engineAttr(path string, e writeback.Entry) fsproto.Attr {
 	_ = path
 	return attrFromEntry(e)
@@ -663,10 +676,10 @@ func (v *Volume) closeOne(path string, n *NodeState, closeRegistered bool) bool 
 		n.nopen--
 	}
 	lastClose := hadOpen && n.nopen == 0
-	orphaned = n.orphanIno != 0
+	orphaned = n.orphanIno.Load() != 0
 	if lastClose && orphaned {
-		orphanIno = n.orphanIno
-		n.orphanIno = 0
+		orphanIno = n.orphanIno.Load()
+		n.orphanIno.Store(0)
 	}
 	if hadOpen && closeRegistered {
 		if fino := n.AuthorityIno(); fino != 0 {
@@ -894,7 +907,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
-		if oi := n.orphanIno; oi != 0 {
+		if oi := n.orphanIno.Load(); oi != 0 {
 			n.mu.Unlock()
 			cnt, st, werr := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 			if werr != nil {
@@ -930,7 +943,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	}
 	defer endAuthority()
 	n.mu.Lock()
-	if oi := n.orphanIno; oi != 0 {
+	if oi := n.orphanIno.Load(); oi != 0 {
 		n.mu.Unlock()
 		cnt, st, err := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 		if err != nil {
@@ -1034,7 +1047,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
-		if oi := n.orphanIno; oi != 0 {
+		if oi := n.orphanIno.Load(); oi != 0 {
 			n.mu.Unlock()
 			cnt, _, st, werr := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
 			if werr != nil {
@@ -1067,7 +1080,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	}
 	defer endAuthority()
 	n.mu.Lock()
-	if oi := n.orphanIno; oi != 0 {
+	if oi := n.orphanIno.Load(); oi != 0 {
 		n.mu.Unlock()
 		cnt, _, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
 		if err != nil {
@@ -1310,7 +1323,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 		openHandle := false
 		if child != nil {
 			child.mu.Lock()
-			openHandle = child.nopen > 0 && child.orphanIno == 0
+			openHandle = child.nopen > 0 && child.orphanIno.Load() == 0
 			child.mu.Unlock()
 		}
 		if openHandle && v.wb.Covers(path) {
@@ -1351,7 +1364,7 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 func (v *Volume) removeWriteThrough(ctx context.Context, path string, child *NodeState) Status {
 	if child != nil {
 		child.mu.Lock()
-		if child.nopen > 0 && child.orphanIno == 0 {
+		if child.nopen > 0 && child.orphanIno.Load() == 0 {
 			ino, st, err := v.client.OrphanContext(ctx, path)
 			if err != nil {
 				child.mu.Unlock()
@@ -1471,7 +1484,7 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 		openDst := false
 		if dst != nil {
 			lockTwo(src, dst)
-			openDst = dst.nopen > 0 && dst.orphanIno == 0
+			openDst = dst.nopen > 0 && dst.orphanIno.Load() == 0
 			unlockTwo(src, dst)
 		}
 		if openDst && (v.wb.Covers(oldp) || v.wb.Covers(newp)) {
@@ -1532,7 +1545,7 @@ func (v *Volume) renameWriteThrough(
 	}
 	if dst != nil {
 		lockTwo(src, dst)
-		if dst.nopen > 0 && dst.orphanIno == 0 {
+		if dst.nopen > 0 && dst.orphanIno.Load() == 0 {
 			st, orphanIno, err := v.client.RenameWithOrphanTargetContext(ctx, oldp, newp, true)
 			if err != nil {
 				unlockTwo(src, dst)
@@ -1768,7 +1781,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
-		if oi := n.orphanIno; oi != 0 {
+		if oi := n.orphanIno.Load(); oi != 0 {
 			n.mu.Unlock()
 			return v.setattrOrphan(ctx, oi, req)
 		}
@@ -1786,13 +1799,20 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 				last, mutated = res, true
 			}
 		}
-		if handledAll && (req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID) {
+		if handledAll && (req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags) {
 			engReq := writeback.SetattrRequest{
 				SetMode: req.SetMode, Mode: modebits.CleanUnix(req.Mode),
 				SetTime: req.SetMTime, MtimeMs: req.MtimeMs,
 				SetATime: req.SetATime, AtimeMs: req.AtimeMs,
 				SetUID: req.SetUID, UID: req.UID,
 				SetGID: req.SetGID, GID: req.GID,
+				// The engine cannot acknowledge a chflags locally (only the
+				// authority persists a flag word), so handing it the intent
+				// makes it RELEASE the covering delegation and report the
+				// request unhandled. The whole setattr then continues on the
+				// write-through arm below with the delegation already gone —
+				// which is why the flag word must not be dropped here.
+				SetFlags: req.SetFlags, Flags: req.Flags,
 			}
 			res, handled, err := v.wb.Setattr(ctx, path, engReq)
 			if !handled {
@@ -1832,7 +1852,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	}
 	defer endAuthority()
 	n.mu.Lock()
-	if oi := n.orphanIno; oi != 0 {
+	if oi := n.orphanIno.Load(); oi != 0 {
 		n.mu.Unlock()
 		return v.setattrOrphan(authorityCtx, oi, req)
 	}
@@ -1849,15 +1869,8 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		}
 		v.recent.record(path)
 	}
-	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
-		st, err := v.client.SetattrTimesHandleContext(
-			authorityCtx,
-			path, handleIno,
-			modebits.CleanUnix(req.Mode), req.SetMode,
-			req.MtimeMs, req.SetMTime,
-			req.AtimeMs, req.SetATime,
-			req.UID, req.GID, req.SetUID, req.SetGID,
-		)
+	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags {
+		st, err := v.client.SetattrVContext(authorityCtx, path, handleIno, setattrV(req))
 		if err != nil {
 			n.mu.Unlock()
 			return fsproto.Attr{}, fsproto.EIO
@@ -1912,15 +1925,8 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 			return fsproto.Attr{}, st
 		}
 	}
-	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
-		st, err := v.client.SetattrTimesHandleContext(
-			authorityCtx,
-			"", ino,
-			modebits.CleanUnix(req.Mode), req.SetMode,
-			req.MtimeMs, req.SetMTime,
-			req.AtimeMs, req.SetATime,
-			req.UID, req.GID, req.SetUID, req.SetGID,
-		)
+	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags {
+		st, err := v.client.SetattrVContext(authorityCtx, "", ino, setattrV(req))
 		if err != nil {
 			return fsproto.Attr{}, fsproto.EIO
 		}
@@ -1966,18 +1972,11 @@ func (v *Volume) setattrOrphan(ctx context.Context, ino uint64, req SetattrReque
 			return fsproto.Attr{}, st
 		}
 	}
-	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID {
+	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags {
 		// The parked inode is the identity. An empty path deliberately avoids
 		// presenting the removed or overwritten name as namespace evidence;
 		// exact-protocol handle addressing applies the metadata to ino.
-		st, err := v.client.SetattrTimesHandleContext(
-			authorityCtx,
-			"", ino,
-			modebits.CleanUnix(req.Mode), req.SetMode,
-			req.MtimeMs, req.SetMTime,
-			req.AtimeMs, req.SetATime,
-			req.UID, req.GID, req.SetUID, req.SetGID,
-		)
+		st, err := v.client.SetattrVContext(authorityCtx, "", ino, setattrV(req))
 		if err != nil {
 			return fsproto.Attr{}, fsproto.EIO
 		}

@@ -120,6 +120,17 @@ func (n *fuseNode) child(name string) string {
 	return p + "/" + name
 }
 
+// gateOp binds one kernel request to the mount's publication gate. Every op
+// that can reach an authority-bound wait inside clientcore installs it, so the
+// OnOperationWait hook can take that request's admitted replies out of the
+// handoff drain set for the duration of the wait. For a request holding no
+// admission — every op but Read — it is inert by construction, which is the
+// point: the record is the operation's identity, not a promise that it
+// publishes.
+func (n *fuseNode) gateOp(ctx context.Context) context.Context {
+	return n.replyGate.Operation(ctx)
+}
+
 func (n *fuseNode) childState(name string) *clientcore.NodeState {
 	ch := n.GetChild(name)
 	if ch == nil {
@@ -200,6 +211,7 @@ func setxattrFlagBits() (create, replace uint32) {
 }
 
 func (n *fuseNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	value, st := n.v.Getxattr(ctx, n.curPath(), n.state, attr)
 	if st != fsproto.OK {
 		return 0, xattrErrno(st)
@@ -212,6 +224,7 @@ func (n *fuseNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint
 }
 
 func (n *fuseNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	names, st := n.v.Listxattr(ctx, n.curPath(), n.state)
 	if st != fsproto.OK {
 		return 0, xattrErrno(st)
@@ -236,6 +249,7 @@ func (n *fuseNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.
 // existence predicate and mutation are one ordered, durable operation across
 // every mount. There is intentionally no client-side probe/TOCTOU window.
 func (n *fuseNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	createBit, replaceBit := setxattrFlagBits()
 	if flags & ^(createBit|replaceBit) != 0 {
@@ -252,6 +266,7 @@ func (n *fuseNode) Setxattr(ctx context.Context, attr string, data []byte, flags
 }
 
 func (n *fuseNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	return xattrErrno(n.v.Removexattr(ctx, n.curPath(), n.state, attr))
 }
 
@@ -269,6 +284,7 @@ func (n *fuseNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errn
 }
 
 func (n *fuseNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	cp := n.child(name)
 	if n.g.Owner(cp) != "" {
 		// The name is grafted: resolve against machine-local backing and
@@ -291,6 +307,7 @@ func (n *fuseNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 }
 
 func (n *fuseNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	a, st := n.v.Getattr(ctx, p, n.state)
 	if st != fsproto.OK {
@@ -302,6 +319,7 @@ func (n *fuseNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 }
 
 func (n *fuseNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	dir := n.curPath()
 	ents, st := n.v.Readdir(ctx, dir)
 	if st != fsproto.OK {
@@ -324,6 +342,7 @@ func (n *fuseNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 }
 
 func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	writeIntent := flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY)
 	if st := n.v.Open(ctx, p, n.state, writeIntent); st != fsproto.OK {
@@ -336,6 +355,7 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 }
 
 func (n *fuseNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	admission, err := n.replyGate.BeginRead(ctx, p)
 	if err != nil {
@@ -346,10 +366,20 @@ func (n *fuseNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 		admission.Abort()
 		return nil, errno(st)
 	}
+	if admission.Revoked() {
+		// The request was interrupted while suspended for an authority wait,
+		// so it never got back into the publication order. Answering EINTR is
+		// the same answer an interrupt before admission already produces; the
+		// one thing that must not happen is publishing a reply the gate can no
+		// longer prove is on the current side of a handoff.
+		admission.Abort()
+		return nil, syscall.EINTR
+	}
 	return admission.Wrap(fuse.ReadResultData(data)), 0
 }
 
 func (n *fuseNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	var cnt int
 	var st clientcore.Status
 	if h, ok := fh.(*fuseHandle); ok && h.append {
@@ -364,6 +394,7 @@ func (n *fuseNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off
 }
 
 func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	cp := n.child(name)
 	if n.g.Owner(cp) != "" {
 		// At a volume parent this can only be the graft root itself, which is
@@ -398,6 +429,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, 
 }
 
 func (n *fuseNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	cp := n.child(name)
 	if n.g.Owner(cp) != "" {
 		// mkdir of the graft root creates it machine-local (with scaffold);
@@ -415,6 +447,7 @@ func (n *fuseNode) Mkdir(ctx context.Context, name string, mode uint32, out *fus
 }
 
 func (n *fuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	cp := n.child(name)
 	if n.g.Owner(cp) != "" {
 		return n.g.Remove(cp, false)
@@ -423,6 +456,7 @@ func (n *fuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *fuseNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	cp := n.child(name)
 	if n.g.Owner(cp) != "" {
 		// rmdir of the graft root removes it like any directory (ENOTEMPTY
@@ -433,6 +467,7 @@ func (n *fuseNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *fuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	np, ok := newParent.(*fuseNode)
 	if !ok {
 		return syscall.EXDEV
@@ -451,6 +486,7 @@ func (n *fuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 }
 
 func (n *fuseNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	cp := n.child(name)
 	if n.g.Owner(cp) != "" {
 		// At a volume parent this can only be the graft root: EISDIR.
@@ -467,6 +503,7 @@ func (n *fuseNode) Symlink(ctx context.Context, target, name string, out *fuse.E
 }
 
 func (n *fuseNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	oldp := target.EmbeddedInode().Path(nil)
 	newp := n.child(name)
 	if n.g.Owner(oldp) != "" || n.g.Owner(newp) != "" {
@@ -487,6 +524,7 @@ func (n *fuseNode) Link(ctx context.Context, target fs.InodeEmbedder, name strin
 }
 
 func (n *fuseNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	ctx = n.gateOp(ctx)
 	t, st := n.v.Readlink(ctx, n.curPath())
 	if st != fsproto.OK {
 		return nil, errno(st)
@@ -495,6 +533,7 @@ func (n *fuseNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 }
 
 func (n *fuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	var req clientcore.SetattrRequest
 	if sz, ok := in.GetSize(); ok {
@@ -552,6 +591,7 @@ func (n *fuseNode) lockHandle(fh fs.FileHandle) *clientcore.LockHandle {
 }
 
 func (n *fuseNode) Getlk(ctx context.Context, fh fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32, out *fuse.FileLock) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	res, err := n.v.Getlk(ctx, n.curPath(), owner, lk.Start, lk.End, lk.Typ == clientcore.LockWrite)
 	if err != nil {
 		return syscall.EIO
@@ -570,6 +610,7 @@ func (n *fuseNode) Getlk(ctx context.Context, fh fs.FileHandle, owner uint64, lk
 }
 
 func (n *fuseNode) Setlk(ctx context.Context, fh fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	if lk.Typ == clientcore.LockUnlock {
 		// Unlock never fails toward the app; a lost release is reclaimed by the
@@ -588,6 +629,7 @@ func (n *fuseNode) Setlk(ctx context.Context, fh fs.FileHandle, owner uint64, lk
 }
 
 func (n *fuseNode) Setlkw(ctx context.Context, fh fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
+	ctx = n.gateOp(ctx)
 	p := n.curPath()
 	if lk.Typ == clientcore.LockUnlock {
 		_, _ = n.v.Setlk(ctx, n.lockHandle(fh), p, owner, lk.Start, lk.End, false, true)
@@ -783,6 +825,11 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 		OnHandoffStart:  frontendReplies.BeginHandoff,
 		OnHandoffEnd:    frontendReplies.EndHandoff,
 		OnHandoffFlush:  flushFrontendExact,
+		// Publication suspension. Without it the drain above can wait on a
+		// request that is itself waiting on the authority — a foreign
+		// delegation recall, this mount's own release, or a blocking
+		// advisory-lock acquire — which is the two-machine deadlock geometry.
+		OnOperationWait: frontendReplies.SuspendOperation,
 		OnInvalidate: func(path string, inPlace bool) {
 			if grafts.Owner(path) != "" {
 				// Volume changes under a graft are shadowed by machine-local

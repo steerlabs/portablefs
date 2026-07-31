@@ -820,7 +820,18 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 	knownSlice := func(paths []string) ([]string, uint64, bool) {
 		return paths, pathEpoch, true
 	}
+	// unknown is the conservative mount-wide scope for a request whose
+	// publication target cannot be resolved from the current bindings at all
+	// (a stale Item generation, an unresolvable child name, or a handle with
+	// no live alias). It is NOT the same thing as a concrete scope that
+	// happens to be the root: mountWide below names the root's real, derived
+	// scope so the two are distinguishable at every call site even though the
+	// gate algebra treats "" identically.
 	unknown := func() ([]string, uint64, bool) { return []string{""}, pathEpoch, true }
+	// mountWide is the exact scope of an operation on the volume root. The
+	// root contains every path, so a root-scoped publication genuinely
+	// overlaps every handoff; "" here is derived, not unknown.
+	mountWide := func() ([]string, uint64, bool) { return []string{""}, pathEpoch, true }
 	withKnownAliases := func(paths []string, candidates ...string) []string {
 		seen := make(map[string]struct{}, len(paths))
 		for _, path := range paths {
@@ -844,21 +855,41 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 
 	switch req := body.(type) {
 	case *pfslocal.LookupRequest:
-		_, _, ok := child(req.Dir, req.Name)
+		_, path, ok := child(req.Dir, req.Name)
 		if !ok {
 			return unknown()
 		}
-		// Lookup may discover that a previously unseen name is a hard-link
-		// alias of an FSItem already live elsewhere. Until the authority reply
-		// identifies that inode, its publication scope is unknowable.
-		return unknown()
+		// A lookup publishes exactly one name: the entry parent/name and the
+		// attributes of the FSItem it resolves to (or a negative entry for
+		// that same name). It does not republish the parent's listing, so the
+		// child pathname — plus every alias already known for whatever is
+		// bound there — is the exact publication scope. The parent itself is
+		// deliberately NOT included: adding it would make every lookup in the
+		// volume root mount-wide again for no publication that reaches it.
+		//
+		// A lookup that DISCOVERS an unseen hard-link alias of an FSItem live
+		// elsewhere installs a new binding before it replies, and every
+		// binding change bumps frontendPathEpoch; the gate then treats this
+		// still-active operation as overlapping every scope. The narrow scope
+		// is therefore exact for already-known bindings and self-correcting
+		// for newly discovered ones.
+		return knownSlice(withKnownAliases([]string{path}, path))
 	case *pfslocal.EnumerateRequest:
-		if _, ok := itemPath(req.Dir); !ok {
+		dir, ok := itemPath(req.Dir)
+		if !ok {
 			return unknown()
 		}
-		// Readdir-plus can publish attributes for unseen aliases. Treat the
-		// operation as mount-wide only during the rare handoff interval.
-		return unknown()
+		if dir == "" {
+			// Enumerating the volume root publishes the root listing, which
+			// spans the whole namespace. "" is this operation's derived,
+			// correct scope rather than an unknown one.
+			return mountWide()
+		}
+		// Every entry a readdir(-plus) page publishes is a child of dir and
+		// therefore within dir's scope. Newly discovered entries register
+		// fresh bindings, which bump frontendPathEpoch and make this
+		// still-active operation conservatively mount-wide before it replies.
+		return known(dir)
 	case *pfslocal.GetAttrRequest:
 		if req.Handle != 0 {
 			paths, ok := handlePaths(req.Handle)
@@ -1160,7 +1191,10 @@ func refreshLocalSampleAuthorityContext(
 // A size mismatch retires the note: the kernel is performing a REAL truncate
 // that must reach the authority, and the stale note must not linger.
 func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest) bool {
-	if req.Size == nil || req.Mode != nil || req.UID != nil || req.GID != nil {
+	// SetFlags disqualifies the request like any other real attribute group:
+	// the daemon's own refresh never carries one, so a request that does is a
+	// genuine chflags whose intent must not be swallowed by the no-op arm.
+	if req.Size == nil || req.Mode != nil || req.UID != nil || req.GID != nil || req.SetFlags {
 		return false
 	}
 	a.mu.Lock()

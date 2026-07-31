@@ -173,21 +173,24 @@ public enum PfsFSKitMapping {
         return attributes
     }
 
-    /// Neither the authority's durable metadata model nor the pfslocal
-    /// protocol carries BSD file flags, so a flags change has nowhere to be
-    /// stored. Report that instead of consuming the request and reporting a
-    /// success the next `getattr` contradicts; `supportedCapabilities` sets
-    /// `doesNotSupportImmutableFiles` for the same reason.
+    /// Translates a kernel SETATTR into the pfslocal request.
+    ///
+    /// BSD file flags are FORWARDED, never judged here. Whether a chflags(2)
+    /// can be honored depends on the attached authority
+    /// (fsproto FeatureFlagPersistence) or, for a machine-local graft, on the
+    /// backing filesystem — facts that live in the daemon and vary per attach.
+    /// The extension therefore consumes `.flags` and lets the daemon answer;
+    /// an authority that cannot persist flags still produces the exact same
+    /// honest ENOTSUP, now raised by the layer that actually knows. A change
+    /// is never consumed and dropped.
     public static func setAttributes(
         from request: FSItem.SetAttributesRequest
     ) throws -> PfsSetAttributes {
-        if request.isValid(.flags) {
-            throw PfsLocalClientError.daemon(
-                errno: ENOTSUP,
-                message: "PortableFS does not persist BSD file flags"
-            )
-        }
         var attributes = PfsSetAttributes()
+        if request.isValid(.flags) {
+            attributes.flags = request.flags
+            request.consumedAttributes.insert(.flags)
+        }
         if request.isValid(.mode) {
             attributes.mode = request.mode
             request.consumedAttributes.insert(.mode)
@@ -268,9 +271,15 @@ public enum PfsFSKitMapping {
         supported.supports2TBFiles = true
         supported.supportsFastStatFS = true
         supported.supportsSparseFiles = true
-        // No layer below FSKit persists BSD file flags, so claiming
-        // UF_IMMUTABLE support would make chflags(2) a silent no-op.
-        supported.doesNotSupportImmutableFiles = true
+        // A MOUNT-TIME static capability answered from PER-ATTACH knowledge:
+        // the daemon puts `flagsSupported` in the resolve reply the mount is
+        // built from, because only it knows whether this attach's authority
+        // durably stores flags. Claiming immutable-file support where nothing
+        // persists a flag word would make chflags(2) a silent no-op; denying
+        // it where the authority does persist would make the kernel refuse a
+        // change that would have worked. Both are lies, so neither is
+        // hardcoded.
+        supported.doesNotSupportImmutableFiles = !capabilities.flagsSupported
         supported.caseFormat = capabilities.caseSensitive ? .sensitive : .insensitiveCasePreserving
         return supported
     }

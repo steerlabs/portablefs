@@ -606,6 +606,7 @@ func inodesEqual(a, b *Inode) bool {
 	if a.Ino != b.Ino || a.Kind != b.Kind || a.Mode != b.Mode || a.UID != b.UID ||
 		a.GID != b.GID || a.Nlink != b.Nlink || a.Size != b.Size ||
 		a.MtimeMs != b.MtimeMs || a.CtimeMs != b.CtimeMs || a.AtimeMs != b.AtimeMs ||
+		a.BirthtimeMs != b.BirthtimeMs || a.Flags != b.Flags ||
 		a.SymlinkTarget != b.SymlinkTarget {
 		return false
 	}

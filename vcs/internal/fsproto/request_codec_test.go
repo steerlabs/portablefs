@@ -93,6 +93,9 @@ func TestRequestCodecRoundTripAllFields(t *testing.T) {
 		WBScopes:     []WBScope{{Path: "scope", Epoch: "epoch", Through: 125}},
 		WBThrough:    127,
 		AckPos:       131,
+
+		Flags:    0x8000_0002,
+		SetFlags: true,
 	}
 	got, err := decodeRequestForTest(encodeRequestForTest(t, &want))
 	if err != nil {
@@ -103,25 +106,43 @@ func TestRequestCodecRoundTripAllFields(t *testing.T) {
 	}
 }
 
-func requestV3ToLegacyV2(t *testing.T, wire []byte) []byte {
+// requestOffsets locates the two version-gated scalars inside a current-version
+// frame: the v3 atime (8 bytes) and the v4 chflags word (4 bytes, last of the
+// fixed scalar block, right after AckPos).
+const (
+	requestVersionOffset = 4 + 4
+	requestAtimeOffset   = 4 + 4 + 1 + 1 + 4 + 8 + 8 + 4 + 8
+	requestFlagsOffset   = requestAtimeOffset + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 4 + 1 + 8 + 8
+)
+
+// downgradeRequestWire rewrites a current-version frame as an older peer would
+// have written it, stripping exactly the scalars that version had not appended
+// yet. It is how the codec's backward compatibility stays provable as fields
+// are appended: each older version is decoded from bytes shaped like its own.
+func downgradeRequestWire(t *testing.T, wire []byte, version uint8) []byte {
 	t.Helper()
-	const (
-		versionOffset = 4 + 4
-		atimeOffset   = 4 + 4 + 1 + 1 + 4 + 8 + 8 + 4 + 8
-	)
-	if len(wire) < atimeOffset+8 {
-		t.Fatalf("short v3 request: %d bytes", len(wire))
+	if len(wire) < requestFlagsOffset+4 {
+		t.Fatalf("short request frame: %d bytes", len(wire))
+	}
+	out := append([]byte(nil), wire...)
+	stripped := 0
+	strip := func(offset, width int) {
+		out = append(out[:offset], out[offset+width:]...)
+		stripped += width
+	}
+	if version < requestWireChflagsVersion {
+		strip(requestFlagsOffset, 4)
+	}
+	if version < requestWireAtimeVersion {
+		strip(requestAtimeOffset, 8)
 	}
 	bodyBytes := binary.BigEndian.Uint32(wire[:4])
-	if bodyBytes < 8 {
-		t.Fatalf("invalid v3 body size: %d", bodyBytes)
+	if int(bodyBytes) < stripped {
+		t.Fatalf("invalid body size: %d", bodyBytes)
 	}
-	legacy := make([]byte, 0, len(wire)-8)
-	legacy = append(legacy, wire[:atimeOffset]...)
-	legacy = append(legacy, wire[atimeOffset+8:]...)
-	legacy[versionOffset] = requestWireLegacyVersion
-	binary.BigEndian.PutUint32(legacy[:4], bodyBytes-8)
-	return legacy
+	out[requestVersionOffset] = version
+	binary.BigEndian.PutUint32(out[:4], bodyBytes-uint32(stripped))
+	return out
 }
 
 func TestRequestDecoderAcceptsLegacyV2(t *testing.T) {
@@ -141,7 +162,7 @@ func TestRequestDecoderAcceptsLegacyV2(t *testing.T) {
 		SessionID:    "session",
 		SessionToken: "token",
 	}
-	wire := requestV3ToLegacyV2(t, encodeRequestForTest(t, &want))
+	wire := downgradeRequestWire(t, encodeRequestForTest(t, &want), requestWireLegacyVersion)
 	got, err := decodeRequestForTest(wire)
 	if err != nil {
 		t.Fatalf("decode legacy v2 request: %v", err)
@@ -156,9 +177,41 @@ func TestRequestDecoderRejectsV3AtimeFlagOnLegacyV2(t *testing.T) {
 		Op: OpSetattr, Path: "scope/file",
 		AtimeMs: 1700000000123, SetATime: true,
 	}
-	wire := requestV3ToLegacyV2(t, encodeRequestForTest(t, &req))
+	wire := downgradeRequestWire(t, encodeRequestForTest(t, &req), requestWireLegacyVersion)
 	if _, err := decodeRequestForTest(wire); !errors.Is(err, errMalformedRequest) {
 		t.Fatalf("legacy v2 atime flag error=%v want errMalformedRequest", err)
+	}
+}
+
+// A v3 peer cannot express a chflags setattr: the SetFlags bit is unknown at
+// that version, so a frame claiming it is malformed rather than silently
+// decoded as a flag-less setattr that would drop the client's intent.
+func TestRequestDecoderRejectsV4FlagsIntentOnOlderVersions(t *testing.T) {
+	req := Request{Op: OpSetattr, Path: "scope/file", Flags: 0x2, SetFlags: true}
+	wire := encodeRequestForTest(t, &req)
+	for _, version := range []uint8{requestWireLegacyVersion, requestWireAtimeVersion} {
+		older := downgradeRequestWire(t, wire, version)
+		if _, err := decodeRequestForTest(older); !errors.Is(err, errMalformedRequest) {
+			t.Fatalf("v%d chflags intent error=%v want errMalformedRequest", version, err)
+		}
+	}
+}
+
+// An older peer's frame still decodes exactly as that peer wrote it: the
+// appended scalars read as their zero values, never as bytes stolen from the
+// next field.
+func TestRequestDecoderReadsOlderVersionsWithoutAppendedScalars(t *testing.T) {
+	want := Request{
+		Op: OpSetattr, Path: "scope/file", Mode: 0o644, SetMode: true,
+		AtimeMs: 1700000000123, SetATime: true, HandleIno: 7,
+	}
+	wire := downgradeRequestWire(t, encodeRequestForTest(t, &want), requestWireAtimeVersion)
+	got, err := decodeRequestForTest(wire)
+	if err != nil {
+		t.Fatalf("decode v3 request: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("v3 request mismatch:\n got: %#v\nwant: %#v", got, want)
 	}
 }
 

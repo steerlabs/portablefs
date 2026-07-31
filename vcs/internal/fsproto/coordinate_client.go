@@ -23,8 +23,9 @@ import (
 // doCoordinate executes one coordination mutation under an exact identity.
 // It mirrors doExactOnce's transport contract; EAGAIN/EBUSY are returned to
 // the caller (definite, identity consumed — retries use a fresh identity at
-// the caller's cadence).
-func (c *Client) doCoordinate(req *Request) (*Response, error) {
+// the caller's cadence). ctx carries the park-transfer hook, so a coordination
+// identity that parks takes the caller's exclusion with it.
+func (c *Client) doCoordinate(ctx context.Context, req *Request) (*Response, error) {
 	if live, err := c.EnsureExactSession(); err != nil {
 		return nil, err
 	} else if !live {
@@ -58,7 +59,7 @@ func (c *Client) doCoordinate(req *Request) (*Response, error) {
 			return nil, rerr
 		}
 	}
-	c.parkExact(es, slot, seq, req)
+	c.parkExact(ctx, es, slot, seq, req)
 	return nil, ErrMutationUnknown
 }
 
@@ -148,7 +149,7 @@ func (c *Client) LockManagedContext(ctx context.Context, path string, handleIno 
 	}
 	resumeAuthority := beginAuthorityWait(ctx)
 	defer resumeAuthority()
-	resp, err := c.doCoordinate(&Request{
+	resp, err := c.doCoordinate(ctx, &Request{
 		Op: OpLock, Path: path, HandleIno: handleIno, Owner: c.owner,
 		LkMode: mode, LkID: lkID, LkStart: start, LkEnd: end, LkWrite: write, LkUnlock: unlock,
 	})
@@ -161,7 +162,7 @@ func (c *Client) LockManagedContext(ctx context.Context, path string, handleIno 
 // CheckoutManaged acquires a managed checkout and returns its durable grant
 // epoch. A definite EBUSY reports the holder (best effort) with granted=false.
 func (c *Client) CheckoutManaged(path string) (granted bool, heldBy, epoch string, err error) {
-	resp, err := c.doCoordinate(&Request{Op: OpCheckout, Path: path, Owner: c.owner})
+	resp, err := c.doCoordinate(context.Background(), &Request{Op: OpCheckout, Path: path, Owner: c.owner})
 	if err != nil {
 		return false, "", "", err
 	}
@@ -378,7 +379,7 @@ func (c *Client) WritebackDiscard(writebackID string, scopes []WBScope) error {
 // MarkOpenManaged journals the durable open pin transition for ino.
 // ENOENT means the inode is gone (reaped): the open must fail.
 func (c *Client) MarkOpenManaged(ino uint64, open bool) (int32, error) {
-	resp, err := c.doCoordinate(&Request{Op: OpMarkOpen, OpenIno: ino, OpenState: open, Owner: c.owner})
+	resp, err := c.doCoordinate(context.Background(), &Request{Op: OpMarkOpen, OpenIno: ino, OpenState: open, Owner: c.owner})
 	if err != nil {
 		return EIO, err
 	}
@@ -556,13 +557,16 @@ func (c *Client) SyncVolume() error {
 	}
 	// UNKNOWN: the barrier identity parks and replays; the slot must stay
 	// out of the pool until it resolves, so hand it to the replayer instead
-	// of the deferred release.
+	// of the deferred release. The barrier owns no delegation-transition claim
+	// of its own (its caller holds the volume lifecycle gate exclusively), so
+	// there is no exclusion to transfer here; the retained slot already keeps
+	// every later barrier and mutation ordered behind this identity.
 	for i, s := range held {
 		if s == slot {
 			held = append(held[:i], held[i+1:]...)
 			break
 		}
 	}
-	c.parkExact(es, slot, seq, req)
+	c.parkExact(context.Background(), es, slot, seq, req)
 	return ErrMutationUnknown
 }
