@@ -13,11 +13,13 @@ M="${PFS_MOUNT_DIR:-$HOME/.portablefs-stress-solo/mount}"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "PASS: $*"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL: $*"; }
-# watchdog: run a command, kill it (and report) if it exceeds $1 seconds
+# watchdog: run a command, kill it (and report) if it exceeds $1 seconds.
+# The watchdog subshell chdirs out of the mount so a lingering sleep never
+# holds the mount busy at unmount time.
 wd() {
   local t=$1; shift
   "$@" & local p=$!
-  ( sleep "$t"; kill -9 $p 2>/dev/null ) & local w=$!
+  ( cd / 2>/dev/null; sleep "$t"; kill -9 $p 2>/dev/null ) & local w=$!
   wait $p 2>/dev/null; local s=$?
   kill $w 2>/dev/null; wait $w 2>/dev/null
   return $s
@@ -175,6 +177,8 @@ echo "=== post-churn statfs / df ==="
 wd 20 df -k . >/dev/null && ok "statfs" || bad "statfs"
 
 cd /
+# Give any straggling watchdog subshells a moment to die before the busy check.
+sleep 3
 echo "=== unmount ==="
 wd 90 "$B" umount "$M" && ok "clean unmount" || bad "clean unmount"
 mount | grep -q "$M" && bad "mount still present after umount" || ok "mount gone"
