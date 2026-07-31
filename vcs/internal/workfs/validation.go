@@ -60,6 +60,7 @@ const (
 	fieldRenameNoReplace
 	fieldXattrName
 	fieldXattrFlags
+	fieldFlags
 )
 
 // normalizeAndValidateIntent is the authoritative live-ingress defense. It
@@ -193,7 +194,7 @@ func validateBatchWrapper(r wal.Record) error {
 		r.Target != "" || len(r.Data) != 0 || r.MtimeMs != 0 || r.AtimeMs != 0 || r.ChtimesSetAtime || r.ChtimesKeepMtime ||
 		r.UID != 0 || r.GID != 0 || r.Ino != 0 || len(r.Inos) != 0 || r.OrphanTarget ||
 		r.ChownSetUID || r.ChownSetGID || r.Append || r.ReapIfLeaseExpiresByMs != 0 || r.Env != nil ||
-		r.Excl || r.RenameNoReplace || r.XattrName != "" || r.XattrFlags != 0 {
+		r.Excl || r.RenameNoReplace || r.XattrName != "" || r.XattrFlags != 0 || r.Flags != 0 {
 		return invalidMutation("batch wrapper carries leaf-only fields")
 	}
 	for i := range r.Mutations {
@@ -207,8 +208,26 @@ func validateBatchWrapper(r wal.Record) error {
 	return nil
 }
 
+// userNamespaceOp reports whether op is a user-namespace mutation this
+// authority admits from a client. Control, batch-wrapper, and entry-framing ops
+// are deliberately absent.
+func userNamespaceOp(op wal.Op) bool {
+	switch op {
+	case wal.OpCreate, wal.OpWrite, wal.OpTruncate, wal.OpMkdir, wal.OpRemove,
+		wal.OpRename, wal.OpSymlink, wal.OpChmod, wal.OpChtimes, wal.OpChown,
+		wal.OpOrphan, wal.OpReap, wal.OpLink, wal.OpSetxattr, wal.OpRemovexattr,
+		wal.OpChflags:
+		return true
+	}
+	return false
+}
+
 func normalizeAndValidateUserRecord(r *wal.Record, inBatch, allowEnvelope bool) error {
-	if r.Op == 0 || r.Op.IsBatch() || r.Op.IsControl() || r.Op > wal.OpRemovexattr {
+	// The admitted user-namespace ops are enumerated, not range-tested: the op
+	// space is not contiguous (OpJournalEntry frames a whole PFJ3 entry for the
+	// file-backed entry log and is never a user mutation), so a range check
+	// would start admitting it the moment a later op was appended past it.
+	if !userNamespaceOp(r.Op) {
 		return invalidMutation("unknown or privileged WAL op %d", r.Op)
 	}
 	if !inBatch && r.Seq != 0 {
@@ -327,6 +346,15 @@ func normalizeAndValidateUserRecord(r *wal.Record, inBatch, allowEnvelope bool) 
 		if err := requirePath(r.Path, r.Ino); err != nil {
 			return err
 		}
+	case wal.OpChflags:
+		// Every uint32 is a legal flag word — including 0, which clears every
+		// flag. Bit POLICY (which flags a mount may set) is decided client-side;
+		// the authority persists what it was handed, so there is nothing to
+		// validate here beyond the addressing.
+		allowed = fieldPath | fieldFlags | fieldIno | fieldEnvelope
+		if err := requirePath(r.Path, r.Ino); err != nil {
+			return err
+		}
 	case wal.OpReap:
 		allowed = fieldIno | fieldReapCutoff | fieldEnvelope
 		if r.Ino == 0 || r.Path != "" {
@@ -435,6 +463,9 @@ func validateAllowedFields(r wal.Record, allowed recordFields) error {
 	}
 	if allowed&fieldOwner == 0 && (r.UID != 0 || r.GID != 0 || r.ChownSetUID || r.ChownSetGID) {
 		return bad("owner fields")
+	}
+	if allowed&fieldFlags == 0 && r.Flags != 0 {
+		return bad("Flags")
 	}
 	if allowed&fieldIno == 0 && r.Ino != 0 {
 		return bad("Ino")

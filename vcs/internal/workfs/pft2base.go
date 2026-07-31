@@ -147,7 +147,7 @@ func NewManagedFromPft2(ctx context.Context, base Pft2Base, blobs content.BlobRe
 
 	now := time.Now()
 	fs := &FS{
-		root:         &inode{ino: 1, kind: "directory", mode: os.ModeDir | 0o755, mtime: now, ctime: now, atime: now, children: map[string]*inode{}},
+		root:         &inode{ino: 1, kind: "directory", mode: os.ModeDir | 0o755, mtime: now, ctime: now, atime: now, birthtime: now, children: map[string]*inode{}},
 		blobs:        blobs,
 		cache:        cache,
 		log:          log,
@@ -363,6 +363,16 @@ func applyPft2Meta(n *inode, meta pft2.Inode) {
 	n.mtime = time.UnixMilli(meta.MtimeMs)
 	n.ctime = time.UnixMilli(meta.CtimeMs)
 	n.atime = time.UnixMilli(meta.AtimeMs)
+	// Birth time 0 is the format's "absent" value (a tree written before the
+	// field existed), NOT a real 1970 creation. Keep the zero time so the
+	// protocol layer serves 0 and the client applies its own convention;
+	// converting it to time.UnixMilli(0) would fabricate a birth time.
+	if meta.BirthtimeMs != 0 {
+		n.birthtime = time.UnixMilli(meta.BirthtimeMs)
+	} else {
+		n.birthtime = time.Time{}
+	}
+	n.flags = meta.Flags
 }
 
 func inodeFromPft2(meta pft2.Inode, lz *pft2Lazy, ref pft2.Ref) *inode {

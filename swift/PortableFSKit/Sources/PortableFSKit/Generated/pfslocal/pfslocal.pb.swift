@@ -837,6 +837,15 @@ public struct PfsCapabilities: Sendable {
   /// daemon's preferred read/write chunk, e.g. 1 MiB
   public var preferredIoBytes: UInt32 = 0
 
+  /// flags_supported is TRUE exactly when this attach's authority durably
+  /// stores BSD file flags (fsproto FeatureFlagPersistence). It is per-attach
+  /// knowledge the frontend cannot derive on its own — a getattr flag word of 0
+  /// is equally consistent with "no flags set" and "flags are not stored" — and
+  /// it rides the resolve reply because the FSKit volume capability set
+  /// (doesNotSupportImmutableFiles) is computed once per mount from exactly
+  /// that reply.
+  public var flagsSupported: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1179,6 +1188,20 @@ public struct PfsSetAttrRequest: Sendable {
 
   /// Exact daemon handle for ftruncate/fchmod/futimes-style operations.
   public var handle: UInt64 = 0
+
+  /// chflags(2). set_flags is the intent and flags is the ABSOLUTE new BSD
+  /// file-flag word, not a delta. They are a bool+uint32 pair rather than an
+  /// `optional uint32` because 0 is a legal value (clear every flag): the
+  /// intent must be carried by something that survives a zero payload.
+  /// set_flags=false (the default, and what every pre-flags frontend emits)
+  /// means "this setattr changes no flags".
+  ///
+  /// The daemon answers ENOTSUP when the attached authority does not persist
+  /// flags (fsproto FeatureFlagPersistence); Capabilities.flags_supported tells
+  /// the frontend that up front so it can publish a truthful volume capability.
+  public var setFlags: Bool = false
+
+  public var flags: UInt32 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -3489,6 +3512,7 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     5: .standard(proto: "max_name_bytes"),
     6: .standard(proto: "max_file_size"),
     7: .standard(proto: "preferred_io_bytes"),
+    8: .standard(proto: "flags_supported"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -3504,6 +3528,7 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
       case 5: try { try decoder.decodeSingularUInt32Field(value: &self.maxNameBytes) }()
       case 6: try { try decoder.decodeSingularUInt64Field(value: &self.maxFileSize) }()
       case 7: try { try decoder.decodeSingularUInt32Field(value: &self.preferredIoBytes) }()
+      case 8: try { try decoder.decodeSingularBoolField(value: &self.flagsSupported) }()
       default: break
       }
     }
@@ -3531,6 +3556,9 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     if self.preferredIoBytes != 0 {
       try visitor.visitSingularUInt32Field(value: self.preferredIoBytes, fieldNumber: 7)
     }
+    if self.flagsSupported != false {
+      try visitor.visitSingularBoolField(value: self.flagsSupported, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3542,6 +3570,7 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     if lhs.maxNameBytes != rhs.maxNameBytes {return false}
     if lhs.maxFileSize != rhs.maxFileSize {return false}
     if lhs.preferredIoBytes != rhs.preferredIoBytes {return false}
+    if lhs.flagsSupported != rhs.flagsSupported {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4056,6 +4085,8 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     6: .standard(proto: "mtime_ms"),
     7: .standard(proto: "atime_ms"),
     8: .same(proto: "handle"),
+    9: .standard(proto: "set_flags"),
+    10: .same(proto: "flags"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4072,6 +4103,8 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
       case 6: try { try decoder.decodeSingularInt64Field(value: &self._mtimeMs) }()
       case 7: try { try decoder.decodeSingularInt64Field(value: &self._atimeMs) }()
       case 8: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
+      case 9: try { try decoder.decodeSingularBoolField(value: &self.setFlags) }()
+      case 10: try { try decoder.decodeSingularUInt32Field(value: &self.flags) }()
       default: break
       }
     }
@@ -4106,6 +4139,12 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     if self.handle != 0 {
       try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 8)
     }
+    if self.setFlags != false {
+      try visitor.visitSingularBoolField(value: self.setFlags, fieldNumber: 9)
+    }
+    if self.flags != 0 {
+      try visitor.visitSingularUInt32Field(value: self.flags, fieldNumber: 10)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4118,6 +4157,8 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
     if lhs._mtimeMs != rhs._mtimeMs {return false}
     if lhs._atimeMs != rhs._atimeMs {return false}
     if lhs.handle != rhs.handle {return false}
+    if lhs.setFlags != rhs.setFlags {return false}
+    if lhs.flags != rhs.flags {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

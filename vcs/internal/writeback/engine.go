@@ -303,6 +303,11 @@ type Engine struct {
 	// with one atomic load.
 	held atomic.Int64
 
+	// walFull mirrors "stream WAL is at or over budget" so the data plane's
+	// pre-admission exhaustion check is one atomic load in the steady state.
+	// It is advisory: every definite verdict is re-derived under e.mu.
+	walFull atomic.Bool
+
 	acquireMu sync.Mutex
 	acquiring map[string]*acquireFlight
 
@@ -802,12 +807,12 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 	if err := e.ensureStreamLocked(); err != nil {
 		return nil, err
 	}
-	if e.wal.DiskBytes() >= e.cfg.BudgetBytes {
+	if e.walExhaustedLocked() {
 		e.relieveBudgetLocked()
 		if err := e.MutationError(); err != nil {
 			return nil, err
 		}
-		if e.wal.DiskBytes() >= e.cfg.BudgetBytes {
+		if e.walExhaustedLocked() {
 			return nil, ErrNoSpace
 		}
 	}
@@ -827,7 +832,14 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 		records[i].Seq = results[i].seq
 	}
 	e.fl.admit(d.scope, results)
+	e.noteBudgetLocked()
 	return results, nil
+}
+
+// walExhaustedLocked reports that the stream WAL is at or over its on-disk
+// budget. Caller holds e.mu.
+func (e *Engine) walExhaustedLocked() bool {
+	return e.wal != nil && e.wal.DiskBytes() >= e.cfg.BudgetBytes
 }
 
 // relieveBudgetLocked folds authority-applied extents and reclaims fully
@@ -849,6 +861,86 @@ func (e *Engine) relieveBudgetLocked() {
 			e.logf("writeback: budget-relief checkpoint at %d failed: %v", through, err)
 		}
 	}
+	e.noteBudgetLocked()
+}
+
+// noteBudgetLocked republishes the lock-free exhaustion mirror the data plane
+// reads before admission. Caller holds e.mu.
+func (e *Engine) noteBudgetLocked() {
+	e.walFull.Store(e.walExhaustedLocked())
+}
+
+// ─── bounded-resource admission (the data plane never waits on the uplink) ───
+//
+// Every locally-acknowledged data mutation consumes two bounded local
+// resources: stream WAL bytes on disk, and extents in the file's overlay.
+// Both are relieved by exactly one thing — the authority applying the
+// unshipped tail. When either bound binds, the ONLY way the engine could keep
+// accepting the mutation is to leave delegated mode, and leaving delegated
+// mode means draining the tail through the uplink that is already behind.
+// That drain is unbounded: production saw fsync-appending writers block inside
+// it until the frontend's operation deadline expired and surfaced ETIMEDOUT,
+// while every metadata and read operation queued behind those writers on the
+// frontend's own shared per-attach and per-mount admission gates, and the
+// kernel finally declared the whole volume dead.
+//
+// Exhaustion of a bounded store is a DEFINITE condition, so it gets a definite
+// POSIX answer. The data plane relieves once and then refuses with ENOSPC. It
+// never initiates or joins a delegation drain, so there is no wait to wake:
+// after the fix no data admission is ever blocked on the budget, and callers
+// see either a local acknowledgement or ErrNoSpace. Relief is not self-healing
+// either — the refusal lasts exactly as long as the bound binds, and the next
+// admission after the authority applies the backlog is accepted normally.
+
+// spaceVerdict is the pre-admission decision for one data mutation.
+type spaceVerdict int
+
+const (
+	// spaceProceed: bounded local resources have room; admit normally.
+	spaceProceed spaceVerdict = iota
+	// spaceAuthority: the stream is full but nothing is delegated at this
+	// path, so the mutation's lane consumes no stream budget at all. The
+	// authority lane is selected WITHOUT a drain (there is no grant to
+	// release), which keeps a full local store from failing write-through.
+	spaceAuthority
+	// spaceExhausted: the mutation would consume a bounded local resource
+	// that only the uplink can free. Definite ENOSPC.
+	spaceExhausted
+)
+
+// spaceForDataMutation is the data plane's pre-admission budget verdict. It
+// runs BEFORE admit so an exhausted stream never acquires a grant it cannot
+// use and never drains an ancestor grant it would have pushed down through.
+// The steady-state path is one atomic load.
+func (e *Engine) spaceForDataMutation(path string) (spaceVerdict, error) {
+	if !e.walFull.Load() {
+		return spaceProceed, nil
+	}
+	if err := e.MutationError(); err != nil {
+		return spaceExhausted, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed || e.frozen {
+		// Lifecycle verdicts belong to admit, which owns the single
+		// "not accepting mutations" answer. Never pre-empt it with ENOSPC.
+		return spaceProceed, nil
+	}
+	if !e.streamOpen || !e.walExhaustedLocked() {
+		e.noteBudgetLocked()
+		return spaceProceed, nil
+	}
+	e.relieveBudgetLocked()
+	if err := e.MutationError(); err != nil {
+		return spaceExhausted, err
+	}
+	if !e.walExhaustedLocked() {
+		return spaceProceed, nil
+	}
+	if e.coveringLocked(path) == nil {
+		return spaceAuthority, nil
+	}
+	return spaceExhausted, nil
 }
 
 // nowMs is stubbed in tests.
@@ -1277,6 +1369,14 @@ func (e *Engine) WriteAt(ctx context.Context, path string, off int64, data []byt
 	if off < 0 {
 		return Result{}, false, errors.New("writeback: negative write offset")
 	}
+	switch verdict, err := e.spaceForDataMutation(path); {
+	case err != nil:
+		return Result{}, true, err
+	case verdict == spaceExhausted:
+		return Result{}, true, ErrNoSpace
+	case verdict == spaceAuthority:
+		return Result{}, false, nil
+	}
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
 		return Result{}, false, err
@@ -1292,6 +1392,17 @@ func (e *Engine) WriteAt(ctx context.Context, path string, off int64, data []byt
 // WriteAppend acknowledges an O_APPEND write at the locally-authoritative
 // EOF (the exclusive delegation makes the local size exact).
 func (e *Engine) WriteAppend(ctx context.Context, path string, data []byte) (Result, bool, error) {
+	// The O_APPEND lane is the exact shape production saturated. It gets the
+	// same pre-admission verdict as a positional write: a full store answers
+	// ENOSPC, never a drain of the tail that filled it.
+	switch verdict, err := e.spaceForDataMutation(path); {
+	case err != nil:
+		return Result{}, true, err
+	case verdict == spaceExhausted:
+		return Result{}, true, ErrNoSpace
+	case verdict == spaceAuthority:
+		return Result{}, false, nil
+	}
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
 		return Result{}, false, err
@@ -1302,6 +1413,21 @@ func (e *Engine) WriteAppend(ctx context.Context, path string, data []byte) (Res
 		return Result{}, false, e.fallThroughLocked(ctx, path)
 	}
 	return e.writeLocked(ctx, adm.d, path, fv, fv.entry.Size, data)
+}
+
+// fileExtentBoundBindsLocked reports that adding want extents to fv would
+// grow its overlay past the hard bound, AFTER one relief pass. Folding is the
+// definitive relief: extents the authority has already applied are served by
+// the authority now and are not local debt. If the bound still binds, every
+// remaining extent is unshipped and only the uplink can free it — so the
+// condition is definite and the caller answers ENOSPC rather than waiting.
+// Caller holds e.mu.
+func (e *Engine) fileExtentBoundBindsLocked(fv *fileView, want int) bool {
+	if len(fv.extents)+want <= maxFileExtents {
+		return false
+	}
+	e.relieveBudgetLocked()
+	return len(fv.extents)+want > maxFileExtents
 }
 
 // fileViewLocked materializes the dirty view for a locally-known file.
@@ -1331,10 +1457,12 @@ func (e *Engine) writeLocked(ctx context.Context, d *delegation, path string, fv
 	if len(records) == 0 {
 		return Result{Entry: *fv.entry}, true, nil
 	}
-	if len(fv.extents)+len(records)+1 > maxFileExtents {
+	if e.fileExtentBoundBindsLocked(fv, len(records)+1) {
 		// Hard overlay bound (records + a possible hole extent would exceed
-		// it): drain, release, write-through — no spill.
-		return Result{}, false, e.fallThroughLocked(ctx, path)
+		// it). There is no spill, and the write-through escape would have to
+		// drain the unshipped tail first — the very uplink that let the set
+		// grow this far. Definite bounded-resource exhaustion: ENOSPC.
+		return Result{}, true, ErrNoSpace
 	}
 	results, err := e.appendRecordsLocked(d, records)
 	if err != nil {
@@ -1366,6 +1494,14 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) (Result,
 	if size < 0 {
 		return Result{}, false, errors.New("writeback: negative truncate size")
 	}
+	switch verdict, err := e.spaceForDataMutation(path); {
+	case err != nil:
+		return Result{}, true, err
+	case verdict == spaceExhausted:
+		return Result{}, true, ErrNoSpace
+	case verdict == spaceAuthority:
+		return Result{}, false, nil
+	}
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
 		return Result{}, false, err
@@ -1375,8 +1511,8 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) (Result,
 	if !ok {
 		return Result{}, false, e.fallThroughLocked(ctx, path)
 	}
-	if len(fv.extents)+1 > maxFileExtents {
-		return Result{}, false, e.fallThroughLocked(ctx, path)
+	if e.fileExtentBoundBindsLocked(fv, 1) {
+		return Result{}, true, ErrNoSpace
 	}
 	rec := wal.Record{Op: wal.OpTruncate, Path: path, Size: size}
 	results, err := e.appendRecordsLocked(adm.d, []wal.Record{rec})
@@ -1402,15 +1538,34 @@ type SetattrRequest struct {
 	UID      uint32
 	SetGID   bool
 	GID      uint32
+	// SetFlags marks a chflags(2) group. The engine never acknowledges one
+	// locally (see Setattr): it releases the covering delegation and reports
+	// unhandled so the caller writes it through to the authority, the only
+	// place a flag word is durable. Flags rides along so the field pair stays
+	// a single intent and a caller cannot express half of it.
+	SetFlags bool
+	Flags    uint32
 }
 
 // Setattr acknowledges chmod/chtimes/chown locally for a known entry.
+//
+// chflags is deliberately NOT in that list. The local WAL has an OpChflags
+// record, but the delegated overlay has no way to make the change visible and
+// exact-once through a handoff without the authority having stored it: only
+// the authority persists BSD flags (fsproto FeatureFlagPersistence). Rather
+// than acknowledge a change the next getattr under this same delegation would
+// contradict, the engine releases the covering delegation and reports the
+// request unhandled — the caller then applies it write-through. That is the
+// CORRECT lane for chflags, not a degraded fallback.
 func (e *Engine) Setattr(ctx context.Context, path string, req SetattrRequest) (Result, bool, error) {
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
 		return Result{}, false, err
 	}
 	defer e.release(adm)
+	if req.SetFlags {
+		return Result{}, false, e.fallThroughLocked(ctx, path)
+	}
 	ent, present := e.entryLocked(path)
 	if !present {
 		return Result{}, false, e.fallThroughLocked(ctx, path)

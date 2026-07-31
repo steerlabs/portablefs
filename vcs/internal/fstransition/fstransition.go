@@ -408,6 +408,8 @@ func (e *Engine) applyOne(ctx context.Context, r wal.Record) (Outcome, error) {
 		out.Changed, err = e.chtimes(ctx, r)
 	case wal.OpChown:
 		out.Changed, err = e.chown(ctx, r, ts)
+	case wal.OpChflags:
+		out.Changed, err = e.chflags(ctx, r, ts)
 	case wal.OpSetxattr:
 		out.Changed, err = e.setxattr(ctx, r)
 	case wal.OpRemovexattr:
@@ -471,7 +473,7 @@ func (e *Engine) ensureRoot(ctx context.Context, tsMs int64) (pft2.Inode, error)
 	}
 	root = pft2.Inode{
 		Ino: pft2.RootIno, Kind: pft2.FileKindDirectory, Mode: 0o755, Nlink: 1,
-		MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs,
+		MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs, BirthtimeMs: tsMs,
 	}
 	if err := e.tx.PutInode(ctx, root); err != nil {
 		return pft2.Inode{}, err
@@ -653,7 +655,7 @@ func (e *Engine) create(ctx context.Context, path string, kind pft2.FileKind, mo
 	}
 	inode := pft2.Inode{
 		Ino: newIno, Kind: kind, Mode: mode, Nlink: 1,
-		MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs,
+		MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs, BirthtimeMs: tsMs,
 	}
 	if kind == pft2.FileKindSymlink {
 		inode.SymlinkTarget = target
@@ -694,7 +696,7 @@ func (e *Engine) mkdirExact(ctx context.Context, path string, mode uint32, ino u
 	}
 	child := pft2.Inode{
 		Ino: newIno, Kind: pft2.FileKindDirectory, Mode: mode, Nlink: 1,
-		MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs,
+		MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs, BirthtimeMs: tsMs,
 	}
 	if err := e.tx.PutInode(ctx, child); err != nil {
 		return false, err
@@ -757,7 +759,7 @@ func (e *Engine) mkdirAll(ctx context.Context, path string, mode uint32, inos []
 		}
 		child := pft2.Inode{
 			Ino: newIno, Kind: pft2.FileKindDirectory, Mode: mode, Nlink: 1,
-			MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs,
+			MtimeMs: tsMs, CtimeMs: tsMs, AtimeMs: tsMs, BirthtimeMs: tsMs,
 		}
 		if err := e.tx.PutInode(ctx, child); err != nil {
 			return false, err
@@ -1250,6 +1252,22 @@ func (e *Engine) chmod(ctx context.Context, r wal.Record, tsMs int64) (bool, err
 	}
 	// Mode only — the live authority's chmod touches no timestamps.
 	n.Mode = r.Mode & 0o7777
+	return true, e.putResolved(ctx, n, orphaned)
+}
+
+// chflags sets the inode's BSD file-flag word. It mirrors chmod exactly: an
+// absolute assignment of the value the record carries, no timestamp movement,
+// and no masking — bit policy is a client-side decision, so the durable tree
+// records precisely what the journaled record asked for.
+func (e *Engine) chflags(ctx context.Context, r wal.Record, tsMs int64) (bool, error) {
+	n, orphaned, ok, err := e.resolveForRW(ctx, r.Path, r.Ino, tsMs)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, ErrNotExist
+	}
+	n.Flags = r.Flags
 	return true, e.putResolved(ctx, n, orphaned)
 }
 

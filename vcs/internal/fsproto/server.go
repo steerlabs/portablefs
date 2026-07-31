@@ -692,6 +692,25 @@ func (s *Server) supportsAtomicXattrFlags() bool {
 	return ok && x.SupportsAtomicXattrFlags()
 }
 
+// InodeMetadataStore lets a filesystem DECLINE the durable per-inode metadata
+// PortableFS otherwise assumes: BSD file flags and birth time, both fields of
+// the same PFT2 inode record revision (FeatureFlagPersistence).
+//
+// Unlike the other capability interfaces this one defaults to TRUE when it is
+// not implemented, because the record revision is part of the v2 baseline tree
+// format — every authority backed by it stores both fields. The interface
+// exists so a store that is NOT backed by it (and the tests that model an
+// authority predating the revision, whose clients must keep refusing chflags
+// honestly) can say so instead of advertising a durability it does not have.
+type InodeMetadataStore interface {
+	PersistsInodeMetadata() bool
+}
+
+func (s *Server) persistsInodeMetadata() bool {
+	m, ok := s.fs.(InodeMetadataStore)
+	return !ok || m.PersistsInodeMetadata()
+}
+
 // HardLinkStore is the authority's atomic hard-link surface. The operation is
 // capability-advertised rather than inferred from generic billy interfaces:
 // older/read-only authorities make clients fail locally with EOPNOTSUPP.

@@ -192,6 +192,8 @@ describe("Pft2TreeReader", () => {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        birthtimeMs: 0n,
+        flags: 0,
         symlinkTarget: "",
       },
     });
@@ -227,6 +229,8 @@ describe("Pft2TreeReader", () => {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        birthtimeMs: 0n,
+        flags: 0,
         symlinkTarget: "",
       },
     });
@@ -355,6 +359,8 @@ describe("Pft2TreeReader edge verification", () => {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        birthtimeMs: 0n,
+        flags: 0,
         directoryRoot: dirRoot,
         symlinkTarget: "",
       },
@@ -481,6 +487,8 @@ describe("Pft2TreeReader edge verification", () => {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        birthtimeMs: 0n,
+        flags: 0,
         extentRoot,
         symlinkTarget: "",
       },
@@ -498,6 +506,8 @@ describe("Pft2TreeReader edge verification", () => {
         mtimeMs: 0n,
         ctimeMs: 0n,
         atimeMs: 0n,
+        birthtimeMs: 0n,
+        flags: 0,
         symlinkTarget: "",
       },
     });
@@ -539,6 +549,8 @@ describe("Pft2TreeReader edge verification", () => {
           mtimeMs: 0n,
           ctimeMs: 0n,
           atimeMs: 0n,
+          birthtimeMs: 0n,
+          flags: 0,
           symlinkTarget: "",
         },
       });

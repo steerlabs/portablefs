@@ -222,8 +222,10 @@ func TestManagedProbeAndLegacyWriteRefusal(t *testing.T) {
 	if probe.Status != OK || probe.ProtoVersion != ProtocolVersion {
 		t.Fatalf("managed probe: status=%d version=%d", probe.Status, probe.ProtoVersion)
 	}
-	if probe.Features != FeatureDelegatedXattrs {
-		t.Fatalf("managed features = %b, want delegated xattrs", probe.Features)
+	// A managed authority advertises both optional lanes: atomic delegated
+	// xattrs and durable birth-time/BSD-flag persistence.
+	if want := FeatureDelegatedXattrs | FeatureFlagPersistence; probe.Features != want {
+		t.Fatalf("managed features = %b, want %b", probe.Features, want)
 	}
 
 	// A managed generation NEVER admits envelope-less legacy writes and every

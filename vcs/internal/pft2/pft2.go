@@ -70,7 +70,31 @@
 //	                   must be absent when size == 0)
 //	                13 symlink_target string (symlink only; required; 1..4096
 //	                   bytes, UTF-8, NUL-free; size must equal its byte length)
-//	  Directory size must be 0. Every timestamp satisfies |ms| <= MaxAbsTimeMs.
+//	                14 birthtime_ms sint64 (APPENDED; the durable creation time,
+//	                   stamped once at inode creation from the journaled
+//	                   record's op time and never moved again — writes,
+//	                   truncates, chmods, renames, and hard links all leave it
+//	                   alone. 0 is canonically absent: every inode written by a
+//	                   pre-birthtime authority decodes to 0, and consumers read
+//	                   0 as "unknown", never as 1970.)
+//	                15 flags uint32 (APPENDED; BSD file flags — Darwin st_flags
+//	                   / chflags(2) — stored as the full opaque uint32 the
+//	                   client sent. The format defines NO bit policy: which
+//	                   flags a mount may set is a client-side decision, so
+//	                   pinning a mask here would make the durable record lie
+//	                   about what a differently-versioned client meant. 0 is
+//	                   canonically absent and is what every pre-flags inode
+//	                   decodes to.)
+//	  Directory size must be 0. Every timestamp satisfies |ms| <= MaxAbsTimeMs,
+//	  birthtime_ms included.
+//
+//	  Compatibility of fields 14/15 is the schema's standing forward-only
+//	  contract, identical to the one xattr_leaves took: because both fields
+//	  omit their zero default, a new writer that never stamps them emits bytes
+//	  an OLD reader still accepts, while an inode that actually carries a birth
+//	  time or flags is REJECTED by an old reader (RejectUnknown) instead of
+//	  being silently read as if the metadata did not exist. New readers accept
+//	  every old inode, decoding both fields as 0.
 //
 //	DirEntry:       1 name string (1..255 bytes; UTF-8; no NUL or '/'; not "."
 //	                  or "..")   2 ino uint64   3 kind uint (1..3)

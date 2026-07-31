@@ -618,11 +618,15 @@ func (c *Client) ExpireSession() {
 // client-visible reclaim-grace status distinct from delegation contention, so
 // blanket fresh-identity EAGAIN retry would turn one bounded recall timeout
 // into a full opTimeout stall and could repeat a real lock/contention result.
-func (c *Client) doExact(req *Request) (*Response, error) {
-	return c.doExactOnce(req)
+//
+// ctx carries only the park-transfer hook (WithParkTransfer): an exact
+// identity is never abandoned on cancellation, but if it parks, the exclusion
+// the caller issued it under must travel with it.
+func (c *Client) doExact(ctx context.Context, req *Request) (*Response, error) {
+	return c.doExactOnce(ctx, req)
 }
 
-func (c *Client) doExactOnce(req *Request) (*Response, error) {
+func (c *Client) doExactOnce(ctx context.Context, req *Request) (*Response, error) {
 	es := c.exactState()
 	if es == nil {
 		live, err := c.EnsureExactSession()
@@ -671,8 +675,10 @@ func (c *Client) doExactOnce(req *Request) (*Response, error) {
 			return nil, rerr
 		}
 	}
-	// UNKNOWN: park the identity; the replayer resends it until definite.
-	c.parkExact(es, slot, seq, req)
+	// UNKNOWN: park the identity; the replayer resends it until definite. The
+	// park takes ownership of the caller's exclusion release, so the caller
+	// may return ErrMutationUnknown without handing that exclusion to anyone.
+	c.parkExact(ctx, es, slot, seq, req)
 	return nil, ErrMutationUnknown
 }
 
@@ -688,8 +694,36 @@ func (c *Client) finishExact(es *exactSession, slot uint32, seq uint64, resp *Re
 }
 
 // parkExact hands an UNKNOWN-outcome identity to the background replayer.
-func (c *Client) parkExact(es *exactSession, slot uint32, seq uint64, req *Request) {
+//
+// INVARIANT: a possibly-sent exact identity reaches a definite outcome BEFORE
+// the exclusion state it was issued under is released to anyone else. The
+// identity may execute minutes from now, so parking it also parks the
+// caller's delegation-transition claim / exact exclusion: parkExact captures
+// that release from ctx (WithParkTransfer) synchronously, before the parking
+// caller returns, and drops it on exactly one of three definite ends —
+//
+//  1. an authority reply for the identity (executed, or its stored outcome),
+//  2. a session fence (es.stop: the generation can never execute again),
+//  3. client teardown (Close/Abort, both of which fence first and then JOIN
+//     this goroutine, so no transferred claim outlives the client).
+//
+// Every exit path runs the release exactly once via defer; with no hook
+// installed the release is a no-op and behavior is unchanged.
+func (c *Client) parkExact(ctx context.Context, es *exactSession, slot uint32, seq uint64, req *Request) {
+	release := beginParkTransfer(ctx)
+	if !c.registerPark() {
+		// Torn down already: this identity can never be re-sent from this
+		// generation, so its outcome is definite by teardown. Release inline —
+		// a goroutine started here would not be joined by the close that is
+		// already past its wait.
+		release()
+		return
+	}
 	go func() {
+		defer c.parkWG.Done()
+		// Ordered after Done's registration and therefore run BEFORE it: the
+		// exclusion is handed back before teardown's join returns.
+		defer release()
 		backoff := parkRetryMin
 		for {
 			if es.isFenced() || c.isClosed() {
@@ -701,6 +735,11 @@ func (c *Client) parkExact(es *exactSession, slot uint32, seq uint64, req *Reque
 				if resp.Status == OK {
 					// The caller already returned ErrMutationUnknown; keep the
 					// client's own cache coherent for the write that DID land.
+					// This runs INSIDE the still-transferred exclusion (the
+					// deferred release follows), so the local overlay reflects
+					// the landed write before the scope can be handed to a new
+					// claim holder. The self-write recorder must therefore
+					// never re-enter that exclusion.
 					c.selfWrote(req.Path, resp, req.Op == OpWrite || req.Op == OpTruncate || req.Op == OpSetattr)
 				}
 				return

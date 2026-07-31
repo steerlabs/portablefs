@@ -47,6 +47,17 @@ const ProtocolVersion uint32 = 8
 // decision, never a failed-operation downgrade.
 const (
 	FeatureDelegatedXattrs uint64 = 1 << iota
+	// FeatureFlagPersistence advertises that this authority DURABLY stores
+	// per-inode BSD file flags (Darwin st_flags, set through OpSetattr's
+	// SetFlags group) and a per-inode birth time, both as fields of the PFT2
+	// inode record. Without the bit a client must keep refusing chflags(2)
+	// honestly and keep deriving a birth time by convention; with it, chflags
+	// persists and getattr/readdir serve the stored values.
+	//
+	// A capability BIT rather than an attr sniff: zero is a legitimate value
+	// for both fields (no flags set; an inode from a pre-revision tree), so no
+	// observed attribute can distinguish "unsupported" from "genuinely zero".
+	FeatureFlagPersistence
 )
 
 // OpProtocolVersion is the version probe. Its value is deliberately far above the

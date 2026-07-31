@@ -240,3 +240,94 @@ func TestAppendIntentDefaultsOffForOlderFrontends(t *testing.T) {
 		t.Fatalf("legacy positional write changed meaning: %#v", w)
 	}
 }
+
+// TestFlagIntentRoundTrip pins the chflags(2) group on the wire. The intent is
+// a separate bool because 0 is a legal flag word (clear everything): a value
+// alone could never distinguish "clear" from "no change".
+func TestFlagIntentRoundTrip(t *testing.T) {
+	item := Item{ItemID: 7, ItemGeneration: 11}
+	mode := uint32(0o600)
+	for _, tc := range []struct {
+		name string
+		req  SetAttrRequest
+	}{
+		{"set", SetAttrRequest{Item: item, SetFlags: true, Flags: 0x8000_0002}},
+		{"clear", SetAttrRequest{Item: item, SetFlags: true, Flags: 0}},
+		{"with-mode", SetAttrRequest{Item: item, Mode: &mode, SetFlags: true, Flags: 0x2}},
+		{"absent", SetAttrRequest{Item: item, Mode: &mode}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.req
+			frame, err := EncodeFrame(&Envelope{RequestID: 3, Body: &body})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := ReadFrame(bytes.NewReader(frame))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := decoded.Body.(*SetAttrRequest)
+			if got.SetFlags != tc.req.SetFlags || got.Flags != tc.req.Flags {
+				t.Fatalf("flag intent lost across the wire: setFlags=%v flags=%#x, want %v/%#x",
+					got.SetFlags, got.Flags, tc.req.SetFlags, tc.req.Flags)
+			}
+			if got.Item != item {
+				t.Fatalf("item = %+v", got.Item)
+			}
+		})
+	}
+}
+
+// TestFlagFieldsDefaultOffForOlderFrontends keeps the added fields backward
+// compatible without a protocol-minor bump: a frame minted without them decodes
+// as a setattr that changes no flags, exactly as before. Same rule the O_APPEND
+// intent fields follow.
+func TestFlagFieldsDefaultOffForOlderFrontends(t *testing.T) {
+	mode := uint32(0o644)
+	frame, err := EncodeFrame(&Envelope{
+		RequestID: 4,
+		Body:      &SetAttrRequest{Item: Item{ItemID: 9, ItemGeneration: 2}, Mode: &mode},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := decoded.Body.(*SetAttrRequest)
+	if s.SetFlags || s.Flags != 0 || s.Mode == nil || *s.Mode != 0o644 {
+		t.Fatalf("legacy setattr changed meaning: %#v", s)
+	}
+}
+
+// TestCapabilitiesFlagsSupportedRoundTrip: the resolve reply is what carries
+// per-attach flag knowledge to a frontend whose volume capability set is
+// computed once, at mount.
+func TestCapabilitiesFlagsSupportedRoundTrip(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		reply := &ResolveReply{
+			Root:     Item{ItemID: 1, ItemGeneration: 1},
+			VolumeID: "vol",
+			Capabilities: Capabilities{
+				Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
+				MaxNameBytes: 255, PreferredIOSize: 1 << 20, FlagsSupported: want,
+			},
+		}
+		frame, err := EncodeFrame(&Envelope{RequestID: 5, Body: reply})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := ReadFrame(bytes.NewReader(frame))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := decoded.Body.(*ResolveReply)
+		if got.Capabilities.FlagsSupported != want {
+			t.Fatalf("flagsSupported = %v, want %v", got.Capabilities.FlagsSupported, want)
+		}
+		if got.Capabilities.PreferredIOSize != 1<<20 || !got.Capabilities.Xattrs {
+			t.Fatalf("neighbouring capability fields disturbed: %+v", got.Capabilities)
+		}
+	}
+}

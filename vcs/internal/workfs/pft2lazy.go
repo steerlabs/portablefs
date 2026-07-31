@@ -874,7 +874,7 @@ func (fs *FS) collectIntentNeedsLocked(leaves []wal.Record, verdicts *baseVerdic
 		case wal.OpControl, wal.OpReap:
 			// Controls touch no tree names; reap targets the orphan table,
 			// which is eagerly restored from the recovery anchor.
-		case wal.OpWrite, wal.OpTruncate, wal.OpChmod, wal.OpChtimes, wal.OpChown:
+		case wal.OpWrite, wal.OpTruncate, wal.OpChmod, wal.OpChtimes, wal.OpChown, wal.OpChflags:
 			if r.Ino != 0 {
 				addIno(r.Ino)
 			} else {

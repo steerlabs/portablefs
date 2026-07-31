@@ -233,15 +233,23 @@ type Attr struct {
 	MtimeMs int64
 	CtimeMs int64
 	AtimeMs int64
-	// BirthtimeMs is populated by machine-local graft stat. The authority's
-	// metadata model does not persist a birth time and leaves the zero sentinel.
+	// BirthtimeMs is the file's creation time. The authority PERSISTS it in
+	// the PFT2 inode record (stamped once from the creating record's ordered
+	// op time) and serves it here; machine-local grafts fill it from their
+	// backing stat. Zero remains the "unknown" sentinel — it is what an inode
+	// from a pre-birthtime tree reports — and a client seeing zero applies its
+	// own convention rather than reading 1970.
 	BirthtimeMs int64
 	Uid         uint32 // POSIX owner
 	Gid         uint32 // POSIX group
 	Nlink       uint32 // POSIX hard-link count; 0 from an older/read-only authority ⇒ client defaults to 1
 	Ino         uint64 // stable authority-assigned inode identity; 0 ⇒ client falls back to a path hash
-	// Flags carries Darwin st_flags for machine-local grafts. The authority
-	// does not expose BSD file flags, so authority-backed attrs remain zero.
+	// Flags carries Darwin st_flags. The authority PERSISTS the full uint32 a
+	// client set with chflags(2) in the PFT2 inode record and serves it here;
+	// machine-local grafts report their backing stat. Clients feature-detect
+	// durable flag support through FeatureFlagPersistence rather than
+	// inferring it from a zero (which is also the legitimate "no flags set"
+	// value).
 	Flags uint32
 	// AllocSize is the filesystem's charged allocation. Authority-backed
 	// PortableFS charges logical bytes; local grafts report backing stat blocks.
@@ -284,6 +292,14 @@ type Request struct {
 	GID      uint32 // OpSetattr: group
 	SetUID   bool   // OpSetattr: apply UID (else leave unchanged)
 	SetGID   bool   // OpSetattr: apply GID (else leave unchanged)
+	// Flags/SetFlags carry an OpSetattr chflags(2) intent: the ABSOLUTE new
+	// BSD file-flag word (Darwin st_flags), stored by the authority as the
+	// full uint32 sent. Zero is a legal value (clear every flag), so SetFlags
+	// — not a nonzero Flags — is what makes the group present. Which bits a
+	// mount may set is decided client-side; the authority persists what it is
+	// given.
+	Flags    uint32
+	SetFlags bool
 	Owner    string // OpCheckout/OpCheckin/mutations: delegation owner
 
 	// OpFlushBatch: a write-back session's buffered mutations. Records carry the mount's
@@ -567,9 +583,18 @@ func attrOf(fi os.FileInfo) Attr {
 		}
 	}
 	if bt, ok := fi.Sys().(interface{ BirthTime() time.Time }); ok {
+		// A zero birth time is "unknown" (an inode hydrated from a tree
+		// written before the field existed), never a real 1970 creation, so it
+		// is left at the wire sentinel for the client to interpret.
 		if value := bt.BirthTime(); !value.IsZero() {
 			a.BirthtimeMs = value.UnixMilli()
 		}
+	}
+	if f, ok := fi.Sys().(interface{ Flags() uint32 }); ok {
+		// The stored word verbatim: 0 is a legitimate "no flags set" answer,
+		// which is exactly why clients gate on FeatureFlagPersistence instead
+		// of inferring support from the value.
+		a.Flags = f.Flags()
 	}
 	if allocated, ok := fi.Sys().(interface{ AllocatedSize() int64 }); ok {
 		a.AllocSize = allocated.AllocatedSize()

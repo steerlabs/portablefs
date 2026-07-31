@@ -2124,3 +2124,252 @@ func TestHandleOperationsSerializeOnlyMatchingDescriptor(t *testing.T) {
 		t.Fatal("same-handle concrete operation did not resume")
 	}
 }
+
+// newScopeTestAttach builds a bare registry with the bindings the publication
+// scope derivation reads. It deliberately avoids newAttach: these tests
+// exercise frontendOperationPaths and the frontend gate only.
+func newScopeTestAttach() *attach {
+	return &attach{
+		items:       map[uint64]*itemRecord{},
+		paths:       map[string]*itemRecord{},
+		itemAliases: map[uint64]map[string]struct{}{},
+		handles:     map[uint64]*handleRecord{},
+	}
+}
+
+func (a *attach) bindScopeTestItem(id uint64, p string) pfslocal.Item {
+	item := pfslocal.Item{ItemID: id, ItemGeneration: 1}
+	rec := &itemRecord{item: item, path: p, state: clientcore.NewNodeState(id, true)}
+	if a.items[id] == nil {
+		a.items[id] = rec
+	}
+	a.paths[p] = rec
+	a.addItemAliasLocked(rec)
+	return item
+}
+
+func scopeSet(paths []string) map[string]bool {
+	got := map[string]bool{}
+	for _, p := range paths {
+		got[p] = true
+	}
+	return got
+}
+
+// A lookup publishes one directory entry. Reporting the mount-wide unknown
+// scope made every lookup block every delegation handoff and made its own
+// suspended resume wait on every handoff — the over-serialization and the
+// deadlock trigger recorded as liveness follow-up item 3.
+func TestLookupPublicationScopeIsTheLookedUpName(t *testing.T) {
+	a := newScopeTestAttach()
+	root := a.bindScopeTestItem(1, "")
+	dir := a.bindScopeTestItem(2, "d")
+
+	paths, _, publishes := a.frontendOperationPaths(
+		&pfslocal.LookupRequest{Dir: dir, Name: []byte("f")},
+	)
+	if !publishes {
+		t.Fatal("lookup was not publication-tracked")
+	}
+	if got := scopeSet(paths); len(got) != 1 || !got["d/f"] {
+		t.Fatalf("lookup publication paths = %v, want [d/f]", paths)
+	}
+
+	// A lookup directly in the volume root still names one child, not the
+	// whole mount. The parent is deliberately excluded from the scope.
+	paths, _, _ = a.frontendOperationPaths(
+		&pfslocal.LookupRequest{Dir: root, Name: []byte("top")},
+	)
+	if got := scopeSet(paths); len(got) != 1 || !got["top"] {
+		t.Fatalf("root lookup publication paths = %v, want [top]", paths)
+	}
+
+	// An unresolvable parent (stale Item generation) remains genuinely
+	// unknown, and unknown is mount-wide.
+	stale := pfslocal.Item{ItemID: dir.ItemID, ItemGeneration: dir.ItemGeneration + 1}
+	paths, _, _ = a.frontendOperationPaths(
+		&pfslocal.LookupRequest{Dir: stale, Name: []byte("f")},
+	)
+	if got := scopeSet(paths); len(got) != 1 || !got[""] {
+		t.Fatalf("stale-parent lookup paths = %v, want mount-wide unknown", paths)
+	}
+}
+
+// Re-resolving a name that is already a known hard-link alias republishes the
+// shared FSItem's attributes, so every live alias belongs to the scope.
+func TestLookupPublicationScopeCoversKnownHardlinkAliases(t *testing.T) {
+	a := newScopeTestAttach()
+	dir := a.bindScopeTestItem(2, "left")
+	a.bindScopeTestItem(7, "left/a")
+	alias := &itemRecord{
+		item:  a.items[7].item,
+		path:  "right/b",
+		state: a.items[7].state,
+	}
+	a.paths[alias.path] = alias
+	a.addItemAliasLocked(alias)
+
+	paths, _, _ := a.frontendOperationPaths(
+		&pfslocal.LookupRequest{Dir: dir, Name: []byte("a")},
+	)
+	got := scopeSet(paths)
+	if !got["left/a"] || !got["right/b"] || len(got) != 2 {
+		t.Fatalf("hardlink lookup publication paths = %v", paths)
+	}
+}
+
+// Enumerate publishes a page of children, all of which live under the
+// directory. Only the root's listing is genuinely mount-wide.
+func TestEnumeratePublicationScopeIsTheDirectory(t *testing.T) {
+	a := newScopeTestAttach()
+	root := a.bindScopeTestItem(1, "")
+	dir := a.bindScopeTestItem(2, "d/sub")
+
+	paths, _, publishes := a.frontendOperationPaths(&pfslocal.EnumerateRequest{Dir: dir})
+	if !publishes {
+		t.Fatal("enumerate was not publication-tracked")
+	}
+	if got := scopeSet(paths); len(got) != 1 || !got["d/sub"] {
+		t.Fatalf("enumerate publication paths = %v, want [d/sub]", paths)
+	}
+
+	// Root enumeration's "" is a derived scope, not an unknown one, and it
+	// must stay mount-wide.
+	paths, _, _ = a.frontendOperationPaths(&pfslocal.EnumerateRequest{Dir: root})
+	if got := scopeSet(paths); len(got) != 1 || !got[""] {
+		t.Fatalf("root enumerate publication paths = %v, want mount-wide", paths)
+	}
+
+	stale := pfslocal.Item{ItemID: dir.ItemID, ItemGeneration: dir.ItemGeneration + 1}
+	paths, _, _ = a.frontendOperationPaths(&pfslocal.EnumerateRequest{Dir: stale})
+	if got := scopeSet(paths); len(got) != 1 || !got[""] {
+		t.Fatalf("stale enumerate publication paths = %v, want mount-wide unknown", paths)
+	}
+}
+
+// Rename and remove publish two names each (and every alias of whatever they
+// displace); the concrete lookup/enumerate scopes must not have regressed
+// those multi-name derivations.
+func TestRenameAndRemovePublicationScopesCoverEveryName(t *testing.T) {
+	a := newScopeTestAttach()
+	from := a.bindScopeTestItem(2, "from")
+	to := a.bindScopeTestItem(3, "to")
+	a.bindScopeTestItem(7, "from/a")
+	alias := &itemRecord{item: a.items[7].item, path: "other/b", state: a.items[7].state}
+	a.paths[alias.path] = alias
+	a.addItemAliasLocked(alias)
+
+	paths, _, _ := a.frontendOperationPaths(&pfslocal.RenameRequest{
+		FromDir: from, FromName: []byte("a"), ToDir: to, ToName: []byte("b"),
+	})
+	got := scopeSet(paths)
+	for _, want := range []string{"from", "from/a", "to", "to/b", "other/b"} {
+		if !got[want] {
+			t.Fatalf("rename publication paths = %v, missing %q", paths, want)
+		}
+	}
+
+	paths, _, _ = a.frontendOperationPaths(&pfslocal.RemoveRequest{
+		Dir: from, Name: []byte("a"),
+	})
+	got = scopeSet(paths)
+	for _, want := range []string{"from", "from/a", "other/b"} {
+		if !got[want] {
+			t.Fatalf("remove publication paths = %v, missing %q", paths, want)
+		}
+	}
+}
+
+// The gate consequence of the concrete scopes: a handoff for one subtree no
+// longer waits behind a lookup or enumerate in a disjoint subtree, and still
+// waits behind one that overlaps.
+func TestFrontendHandoffIgnoresDisjointLookupAndEnumerate(t *testing.T) {
+	a := newScopeTestAttach()
+	left := a.bindScopeTestItem(2, "left")
+	right := a.bindScopeTestItem(3, "right")
+
+	ctx := context.Background()
+	_, lookupOp := a.beginFrontendOperation(
+		ctx, &pfslocal.LookupRequest{Dir: right, Name: []byte("f")},
+	)
+	if lookupOp == nil {
+		t.Fatal("lookup did not enter the publication gate")
+	}
+	_, enumerateOp := a.beginFrontendOperation(ctx, &pfslocal.EnumerateRequest{Dir: right})
+	if enumerateOp == nil {
+		t.Fatal("enumerate did not enter the publication gate")
+	}
+
+	started := make(chan error, 1)
+	go func() { started <- a.startFrontendHandoff(ctx, "left") }()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatalf("disjoint handoff: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff for left waited on lookup/enumerate under right")
+	}
+
+	// The same handoff scope must still block an overlapping lookup.
+	blocked := make(chan *frontendOperation, 1)
+	go func() {
+		_, op := a.beginFrontendOperation(
+			ctx, &pfslocal.LookupRequest{Dir: left, Name: []byte("f")},
+		)
+		blocked <- op
+	}()
+	select {
+	case <-blocked:
+		t.Fatal("overlapping lookup entered during a handoff for its scope")
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.endFrontendHandoff("left")
+	select {
+	case op := <-blocked:
+		a.finishFrontendOperation(op)
+	case <-time.After(time.Second):
+		t.Fatal("overlapping lookup did not resume after the handoff")
+	}
+	a.finishFrontendOperation(lookupOp)
+	a.finishFrontendOperation(enumerateOp)
+}
+
+// A lookup's alias can die (unlink, rename) between scope derivation and gate
+// registration. Every binding change bumps frontendPathEpoch, so the stale
+// snapshot falls back to blocking every handoff rather than to a scope that no
+// longer describes what the reply will publish.
+func TestLookupScopeSnapshotGoesMountWideWhenBindingsChange(t *testing.T) {
+	a := newScopeTestAttach()
+	right := a.bindScopeTestItem(3, "right")
+
+	paths, epoch, publishes := a.frontendOperationPaths(
+		&pfslocal.LookupRequest{Dir: right, Name: []byte("f")},
+	)
+	if !publishes {
+		t.Fatal("lookup was not publication-tracked")
+	}
+	// The alias dies here, before the operation reaches the gate.
+	a.frontendPathEpoch.Add(1)
+	_, op := a.beginFrontendPathsAtEpoch(context.Background(), paths, epoch)
+	if op == nil {
+		t.Fatal("stale-snapshot lookup did not enter the gate")
+	}
+	started := make(chan error, 1)
+	go func() { started <- a.startFrontendHandoff(context.Background(), "left") }()
+	select {
+	case err := <-started:
+		t.Fatalf("handoff crossed a stale lookup scope snapshot: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	a.finishFrontendOperation(op)
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not resume once the stale-snapshot lookup finished")
+	}
+	a.endFrontendHandoff("left")
+}

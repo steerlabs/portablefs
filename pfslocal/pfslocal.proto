@@ -32,6 +32,15 @@
 // which reproduces the previous positional-write behavior exactly. A frontend
 // that can express append opts in; one that cannot is unaffected.
 //
+// chflags(2) (SetAttrRequest.set_flags/flags plus Capabilities.flags_supported)
+// follows that SAME rule and is likewise NOT gated behind a minor bump.
+// set_flags defaults to false, which is byte-for-byte the previous "this
+// setattr changes no flags" meaning, and flags_supported defaults to false,
+// which is the previous "this mount refuses chflags" meaning. An older
+// frontend is therefore unaffected, and a newer one opts in. Note the daemon
+// already rejects any frontend whose minor is below its own, so a bump could
+// only lock out frontends for no semantic gain.
+//
 // PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface append intent to
 // a filesystem extension. FSVolumeOpenModes has only Read and Write, and
 // writeContents:toFile:atOffset: hands down an off_t the KERNEL already
@@ -185,6 +194,14 @@ message Capabilities {
   uint32 max_name_bytes = 5;    // e.g. 255
   uint64 max_file_size = 6;     // 0 = unlimited/unknown
   uint32 preferred_io_bytes = 7; // daemon's preferred read/write chunk, e.g. 1 MiB
+  // flags_supported is TRUE exactly when this attach's authority durably
+  // stores BSD file flags (fsproto FeatureFlagPersistence). It is per-attach
+  // knowledge the frontend cannot derive on its own — a getattr flag word of 0
+  // is equally consistent with "no flags set" and "flags are not stored" — and
+  // it rides the resolve reply because the FSKit volume capability set
+  // (doesNotSupportImmutableFiles) is computed once per mount from exactly
+  // that reply.
+  bool flags_supported = 8;
 }
 
 // ---------- core types ----------
@@ -280,6 +297,18 @@ message SetAttrRequest {
   optional int64 atime_ms = 7;
   // Exact daemon handle for ftruncate/fchmod/futimes-style operations.
   uint64 handle = 8;
+  // chflags(2). set_flags is the intent and flags is the ABSOLUTE new BSD
+  // file-flag word, not a delta. They are a bool+uint32 pair rather than an
+  // `optional uint32` because 0 is a legal value (clear every flag): the
+  // intent must be carried by something that survives a zero payload.
+  // set_flags=false (the default, and what every pre-flags frontend emits)
+  // means "this setattr changes no flags".
+  //
+  // The daemon answers ENOTSUP when the attached authority does not persist
+  // flags (fsproto FeatureFlagPersistence); Capabilities.flags_supported tells
+  // the frontend that up front so it can publish a truthful volume capability.
+  bool set_flags = 9;
+  uint32 flags = 10;
 }
 message SetAttrReply { Attr attr = 1; }
 

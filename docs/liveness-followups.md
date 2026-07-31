@@ -1,156 +1,120 @@
 # Liveness and coherence follow-ups (post 2026-07-30 incident)
 
-Status of the remaining root-cause items identified by the post-incident
-audit of merge `5d5b8a7` and the live re-wedge reproduced during solo
-validation. Items fixed on `fix/root-liveness-metadata` are listed at the
-end for context. Each open item below needs its own dedicated change with
-tests; none is a quick patch.
+Running ledger of the root-cause items surfaced by the incident and its
+validation campaign. Updated as of the fix/root-architecture branch.
 
 ## Open
 
-### 1. Parked exact identities outlive their exclusion claim (data integrity)
+### 1. Metadata mutations can still join an unbounded delegation drain
 
-`vcs/internal/fsproto/session_client.go` `parkExact` (and the two
-equivalent park sites in `coordinate_client.go`) replay an
-unknown-outcome exact identity in a detached goroutine until definite,
-fence, or client close. The frontend caller meanwhile returns
-`ErrMutationUnknown` and releases its delegation-transition claim,
-`Volume.exactMu`, and `writeback.BeginExact` exclusion. A parked identity
-can therefore execute minutes later, after a new delegation over the same
-scope was granted to this mount or a peer. The authority's journal
-reservation re-check orders the write server-side, but the client's local
-overlay/registry state can diverge from what it believes it exclusively
-owns.
+The data plane no longer waits on the flush pipeline (see Fixed §8), but a
+namespace mutation (create/mkdir/rename/remove/setattr/setxattr) whose
+outcome the local overlay cannot decide still falls through into
+`ReleaseFor` and joins the drain of a delegation whose flush may be behind
+a slow or dead uplink. Volume is one wait per undecidable namespace op
+(versus the data plane's thousands per second), so the shared frontend
+gates now clear, but this is not a complete liveness proof for a fully
+blackholed authority. Root direction: the same
+acknowledged-locally-or-refused-definitely contract, extended to the
+namespace lane's drain dependency.
 
-Candidate root designs (pick one):
-- **Foreground-definite**: resolve the ambiguous identity synchronously
-  before the operation returns (publication stays suspended for the whole
-  bracket, so this cannot stall a handoff; force-detach fences the session
-  and unblocks the wait). Simplest semantics; reduces cancellation
-  responsiveness during transport outages.
-- **Claim transfer**: the park takes ownership of the caller's claim and
-  releases it when the identity reaches a definite outcome. Preserves
-  fast cancellation; requires plumbing a claim-transfer hook through
-  `DoContext` into all three park sites and making the clientcore `end()`
-  closures transfer-aware.
+### 2. Path-scoped delegations vs inode-shared FSItems (documented boundary)
 
-### 2. `n.mu` held across suspended waits vs the recall path (untimed cycle)
+A handoff for scope S that has already passed the frontend gate cannot be
+re-blocked when an active operation subsequently discovers a hard-link
+alias inside S. The old mount-wide operation scopes masked this without
+fixing it (attribute reads are delegated per path, not per inode).
+Closing it properly means extending an operation's scope post-reply
+before publication — which would block on the gate while holding
+frontendSerial and deadlock against namespace writers. Needs a design
+that decouples alias discovery from the publication gate; do not patch.
 
-A suspended frontend mutation holds its `NodeState.mu` (e.g. `Write` at
-`vcs/internal/clientcore/ops.go:932-943`) while its `resume()` can block
-on any overlapping handoff. The recall path takes `attach.mu` and then
-`NodeState.mu` (`onMarkOrphan`, `protectOpenPins`), and
-`persistAssignedAuthorityIdentities` needs `attach.mu`. With a mount-wide
-operation scope (item 3) the cycle closes with no timeout on any edge.
-Root direction: either the recall path must never block on `n.mu` while
-holding `a.mu`, or operations must not hold `n.mu` across suspended
-authority waits. Item 3 removes the disjoint-scope trigger but the
-same-scope discipline should be made an asserted invariant.
+### 3. Legacy WAL store checkpoint drops birthtime/flags
 
-### 3. Mount-wide `""` operation scopes over-serialize handoffs
+The dev/self-host legacy store's manifest checkpoint (`backend.Entry`)
+carries no birthtime or flags, so a checkpoint→reload round trip loses
+them there. The managed authority is unaffected (its durability is the
+PFJ3 journal + PFT2 tree). Fix when the legacy store next changes shape.
 
-`vcs/internal/portablefsd/coherence_refresh.go`: `LookupRequest` and
-`EnumerateRequest` always report `unknown()` (`[]string{""}`), and any
-handle without a live alias reports mount-wide scope. `scopesOverlap`
-treats `""` as overlapping everything, so these operations block every
-handoff while active and their `resume()` blocks on every active handoff.
-Lookup and enumerate know their concrete parent path; derive it. Detached
-handles are the only legitimately mount-wide case.
+### 4. Transient ENODATA reading a peer's just-created file
 
-### 4. FUSE frontend never arms `OnOperationWait`
+Observed once (two-Mac stress): `read peer done marker: no message
+available on STREAM` immediately after the file became visible; retry
+succeeded implicitly. Not yet reproduced or root-caused; needs a repro
+with daemon tracing before any code changes.
 
-`vcs/cmd/portablefs/internal/cli/fusemount.go` sets the ReplyGate handoff
-hooks but not `OnOperationWait`, so the entire publication-suspension
-mechanism (and with it the advisory-lock suspension) is inert on FUSE
-mounts. The ReplyGate needs a suspend/resume notion for its admissions,
-carried through the operation context, mirroring the FSKit frontend.
+### 5. macOS FSKit platform gaps (Apple; Feedback radars to file)
 
-### 5. FSKit provides no advisory-lock surface (platform limitation)
+Kernel-verified on macOS 26:
+- Negative dentries are cached permanently: no revalidation against
+  parent attributes and no invalidation API, so a pre-creation lookup
+  blinds that machine to the name until a LOCAL mutation purges the
+  directory's cache. Cross-machine "stat-poll until it appears" cannot
+  work; enumeration always consults the filesystem and is the supported
+  discovery pattern.
+- No advisory-lock operations: cross-machine fcntl exclusion is
+  impossible. The supported cross-machine mutual-exclusion primitive is
+  O_EXCL create (authority-serialized, exactly-once).
+- FSVolumeOpenModes carries no append intent and writes arrive with
+  kernel-resolved offsets, so cross-machine O_APPEND interleaving is
+  impossible on FSKit (FUSE mounts get true authority-assigned append
+  offsets). Use per-writer files or write-tmp+rename.
+- Replacing or re-registering an app that hosts an FSKit extension makes
+  pkd SIGTERM the running extension instance, killing every live mount
+  mid-write. Installers/updaters must drain mounts first.
+These belong in user-facing consistency documentation as contracts, with
+radars for the API gaps.
 
-macOS 26 FSKit (`FSVolume.h`) exposes no byte-range/advisory lock
-operations to extensions; the kernel resolves `fcntl` locks machine-
-locally. Cross-machine advisory-lock exclusion therefore cannot exist on
-FSKit mounts regardless of client code. `clientcore/locks.go` is
-reachable only from FUSE. Document this limitation user-facing; the
-`pfs-mount-stress` `locked-counter` check will truthfully fail across two
-FSKit Macs.
+## Fixed on fix/root-architecture
 
-Related: `WaitSetLock` still re-issues fresh exact identities on EAGAIN
-every `LockPollInterval`, and cannot distinguish gate-recall EAGAIN from
-genuine lock contention (FUSE-only today).
+- **parkExact claim transfer**: an exact identity that may have been sent
+  now reaches a definite outcome before the exclusion it was issued under
+  is released to anyone else. The park takes refcounted ownership of the
+  caller's release (all three park sites); fence and client teardown are
+  definite outcomes, and Close joins every replayer after fencing.
+- **Recall-path lock order**: the recall/invalidation path never blocks
+  on a NodeState mutex while holding attach.mu (onMarkOrphan collects
+  under a.mu, marks outside it; NodeState.orphanIno is atomic so guards
+  read it lock-free). Invariant documented at both a.mu sites and
+  enforced by deterministic interleaving tests.
+- **Concrete operation scopes**: lookups and enumerations report their
+  real paths instead of mount-wide `""`; binding changes bump a path
+  epoch that conservatively widens still-active operations. Root
+  enumeration and truly detached handles remain legitimately mount-wide.
+- **FUSE publication suspension**: the ReplyGate suspends a request's
+  admissions for the length of an authority-bound wait and re-admits
+  through the same predicate reads already use; a canceled resume revokes
+  the reply (EINTR) rather than publishing unaccounted bytes. The
+  advisory-lock lane now genuinely suspends.
+- **Data-plane backpressure**: a data mutation is acknowledged locally or
+  refused with a definite ENOSPC; it never initiates or joins a
+  delegation drain. Fsync of admitted data still drains (that is the
+  relief path). Write-through data on a full local store is unaffected.
+- **Dead-volume detach**: mount identification uses the kernel mount
+  table (Darwin getfsstat / Linux mountinfo), never a stat through the
+  possibly-dead filesystem, so a kernel-dead volume with a live daemon
+  detaches exactly like a live one.
+- **Authority persists birthtime and flags**: PFT2 inode fields 14/15
+  (forward-only append, byte-identical goldens for old shapes), creation
+  stamps birth from the record's ordered op time, Setattr persists the
+  full flag word via wal OpChflags, FeatureFlagPersistence advertised.
+  Zero still means "unknown" (old inodes), never 1970.
 
-### 6. Authority `AllocSize`/`Flags`/`Birthtime` deployment gap
+## Fixed on fix/root-liveness-metadata (merged as PR #28)
 
-The production authority predates the v5 attr fields, so gob decodes
-them as zero. The client now derives the logical-bytes `AllocSize`
-policy locally when absent; once the authority (`fsproto.attrOf`) is
-deployed with the fields, add a protocol feature bit so absent-vs-zero
-is explicit rather than inferred.
-
-### 7. Observation: item-getattr ESTALE bursts during name churn
-
-During rapid create/hardlink/rename/remove churn on a real macOS 26 host,
-the unified log shows steady `getStandardItemAttributesForItem` replies of
-ESTALE(70)/ENOENT(2) — the kernel refreshing attributes of items that were
-just removed or whose generation was retired by reclaim. No functional
-operation failed and churn completed, but the alternating ESTALE→ENOENT
-pattern suggests the host retries an ESTALE item-getattr once before
-accepting death. Worth confirming the intended reply for a
-removed-but-still-referenced item (an orphan with live kernel references
-should arguably still serve attributes rather than ESTALE).
-
-### 8. WAL saturation: writes time out and the kernel volume dies
-
-Reproduced on a real host by fsync-appending faster than the uplink drains
-(~2.5 GB): once `stream WAL budget exhausted`, writes first fail ENOSPC
-(fail-closed, correct), but blocked operations then start surfacing
-ETIMEDOUT(60) to FSKit, metadata operations (readdir/lstat of unrelated
-directories) queue behind the data backpressure, and the kernel eventually
-marks the volume dead — every access returns EIO while the daemon is still
-healthy and draining. Two root items:
-- Backpressure design: budget exhaustion should reject data admissions
-  fast (ENOSPC) instead of blocking them into op timeouts, and metadata
-  operations must never wait behind data-plane backpressure.
-- Recovery gap: `portablefs umount` preflights the mountpoint with lstat,
-  which returns EIO for a kernel-dead volume, so the CLI refuses to
-  unmount exactly when unmounting is the only remedy. A dead volume must
-  be detachable: `umount(2)` itself succeeds instantly (verified live —
-  no wedge, unlike the pre-fix build).
-
-### 9. Open: transient enumeration undercount under concurrent dual-process load
-
-One dual-process `pfs-mount-stress` run on a single Mac (real FSKit,
-production authority) completed its entire workload (durable state fully
-correct on remount: 240/240 files, all appends, exact lock counter), yet
-both processes' verify pass counted 49/120 entries in both `files`
-directories via ReadDir on the live mount. Removal visibility was correct
-(churn dirs enumerated empty); renamed-in entries were missing. Not yet
-reproduced by: sequential create+enumerate, mid-population enumerate,
-8-worker create with 20 Hz concurrent polling, or post-write drain
-polling (which instead hit item #8). Hypotheses: enumerate merging a
-stale cached authority listing with an already-drained overlay, or a
-paged-enumeration restart under concurrent mutation. Needs a dedicated
-repro with daemon-side enumeration tracing before any fix.
-
-## Fixed on fix/root-liveness-metadata
-
-- Daemon unmount kernel-reentrancy self-deadlock: the admission freeze
-  (`frontendSerial` + `nsMu`) no longer spans `unix.Unmount(2)` in
-  `detachWithFinalizer` / `forceUnmountFSKit`; reclaim is admitted during
-  prepared detach and idempotent after detach. Reproduced live (spindump:
-  daemon in `vflush → lifs_vnop_reclaim → lifs_wait_req_completion` with
-  the extension idle) before the fix; regression tests
-  `TestDetachFinalizerAdmitsKernelReclaim`,
-  `TestForceUnmountAdmitsKernelReclaim`,
-  `TestReclaimAdmittedDuringPreparedDetach`.
-- Publication suspension now covers the delegation-acquire flight wait
-  (`writeback.Engine.acquire`), the exact-exclusion acquisition
-  (`Engine.BeginExact`), and transition-gate admission/extend
-  (`Volume.beginAuthorityMutation`) — the mutation-side reciprocal
-  cross-client wait geometry.
-- Unlock surrenders local lock records per path only after that path's
-  authority release succeeds (`UnlockTargets`/`CommitUnlock`), and range
-  splits keep their lock type.
-- Definite delegation-gate EAGAIN on exact file mutations is retried
-  under suspension in `DoContext` instead of surfacing errno 35 to
-  applications.
+- Daemon unmount kernel-reentrancy self-deadlock (admission freeze no
+  longer spans unmount(2); reclaim is teardown-safe).
+- Mutation-side publication suspension (delegation-acquire, exact
+  exclusion, transition-gate admission).
+- Invalidation subscription anchor + attach lifetime context (peer
+  creates visible in ~1s instead of minutes/never).
+- Enumeration paging (stateless name-cursor cookies; verifier stable
+  across continuations).
+- Append intent carried end-to-end (authority-assigned offsets; FSKit
+  kernel remains unable to express it).
+- FSKit metadata contract (exact masks, canonical hard-link parents,
+  logical AllocSize, honest flags, true ".." identity, tolerant
+  unsupported attributes).
+- Unlock ownership surrendered per path only after definite authority
+  release; delegation-gate EAGAIN retried under suspension instead of
+  surfacing errno 35.

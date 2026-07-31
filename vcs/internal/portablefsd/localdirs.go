@@ -403,6 +403,11 @@ func localErrno(err error) int32 {
 			return darwinENAMETOOLONG
 		case syscall.ENOSPC:
 			return darwinENOSPC
+		case syscall.ENOTSUP:
+			// A backing filesystem that cannot honor the operation at all
+			// (chflags(2) on a graft, say). EIO would read as a transient
+			// failure; ENOTSUP is the definite answer the caller needs.
+			return darwinENOTSUP
 		}
 	}
 	return darwinEIO
@@ -576,6 +581,19 @@ func (a *attach) setattrLocal(
 	}
 	if req.Size != nil {
 		if err := file.Truncate(int64(*req.Size)); err != nil {
+			return nil, localErrno(err)
+		}
+	}
+	if req.SetFlags {
+		// Grafts need no FeatureFlagPersistence: their backing IS a real host
+		// inode, so chflags(2) on it is the durable store. Read the current
+		// word first — the safe subset is authoritative from the request, the
+		// rest of the host's flags are preserved (see applyLocalGraftFlags).
+		fi, err := file.Stat()
+		if err != nil {
+			return nil, localErrno(err)
+		}
+		if err := applyLocalGraftFlags(int(file.Fd()), fi, req.Flags); err != nil {
 			return nil, localErrno(err)
 		}
 	}

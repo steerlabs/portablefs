@@ -125,6 +125,17 @@ const (
 	// op. A WAL carrying it is an entry log, never replayed record-shaped.
 	// Appended after OpRemovexattr.
 	OpJournalEntry
+	// OpChflags sets the BSD file flags (Darwin st_flags / chflags(2)) of the
+	// inode resolved by Ino-else-Path to the ABSOLUTE value in Record.Flags.
+	// Like OpChmod it carries the whole new value rather than an intent
+	// delta, so replay is deterministic without re-reading the tree, and like
+	// OpChmod it leaves every timestamp alone. The authority stores the full
+	// uint32 it was given: which bits a mount may set is a client-side policy
+	// decision, and re-masking here would make the durable record disagree
+	// with what the client asked for. Appended after OpJournalEntry so every
+	// pre-existing op value is unchanged; an older decoder rejects the unknown
+	// op (the sanctioned fencing for appended ops).
+	OpChflags
 )
 
 // Frozen apply-level xattr bounds, shared by every generation (admission,
@@ -245,6 +256,11 @@ type Record struct {
 	// authority evaluates the precondition atomically with the mutation.
 	// Zero preserves the released create-or-overwrite behavior.
 	XattrFlags uint8
+	// Flags is the ABSOLUTE new BSD file-flag word (Darwin st_flags) of an
+	// OpChflags record — the full uint32 the client sent, unmasked. Zero on
+	// every other op, and a legal value on OpChflags itself (clearing every
+	// flag); gob omits the zero, so existing logs are byte-compatible.
+	Flags uint32
 }
 
 // WAL is an append-only log whose append path writes complete framed records to

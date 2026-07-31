@@ -59,6 +59,14 @@ type SetattrRequest struct {
 	SetUID bool
 	GID    uint32
 	SetGID bool
+
+	// Flags/SetFlags is the chflags(2) group: the ABSOLUTE new BSD file-flag
+	// word. Zero is a legal value (clear everything), so SetFlags is the only
+	// signal of intent. It is legal only against an authority that advertises
+	// fsproto.FeatureFlagPersistence — callers check SupportsFlagPersistence
+	// first and refuse honestly (ENOTSUP) rather than dropping the change.
+	Flags    uint32
+	SetFlags bool
 }
 
 // NodeState is the frontend-neutral state for one instantiated inode. It tracks
@@ -74,7 +82,12 @@ type NodeState struct {
 	// their stable local item identity.
 	authorityIno atomic.Uint64
 	nopen        int
-	orphanIno    uint64
+	// orphanIno is written only under mu (markOrphanLocked / the close-path
+	// clear) but read lock-free: the recall/invalidation path consults it
+	// while holding attach-level locks, and taking mu there would recreate
+	// the attach-lock → node-lock ordering cycle the recall path must never
+	// enter (see portablefsd onMarkOrphan).
+	orphanIno atomic.Uint64
 }
 
 func NewNodeState(ino uint64, authIno bool) *NodeState {
@@ -145,13 +158,13 @@ func (n *NodeState) MatchesAuthorityIno(ino uint64) bool {
 	return n.authorityIno.Load() == ino
 }
 
+// Orphan is deliberately lock-free so recall-path guards may call it while
+// holding attach-level locks without ordering against mu.
 func (n *NodeState) Orphan() uint64 {
 	if n == nil {
 		return 0
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.orphanIno
+	return n.orphanIno.Load()
 }
 
 func (n *NodeState) IsOpen() bool {
@@ -167,7 +180,7 @@ func (n *NodeState) markOrphanLocked(ino uint64, openOrphans *InodeSet) bool {
 	if n == nil || ino == 0 || n.nopen == 0 {
 		return false
 	}
-	n.orphanIno = ino
+	n.orphanIno.Store(ino)
 	if openOrphans != nil {
 		openOrphans.Add(ino)
 	}

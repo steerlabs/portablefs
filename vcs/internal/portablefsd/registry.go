@@ -988,6 +988,10 @@ type attach struct {
 	// Test seam for the secure kernel refresh syscall; nil in production.
 	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64) (kernelRefreshOutcome, error)
 	testExactKernelRefresh func(context.Context, uint64) error
+	// Test seam standing in for a NodeState mutex the recall path is about to
+	// contend for. It runs at exactly the point onMarkOrphan would block on
+	// n.mu, so a test can assert the recall path is not holding a.mu there.
+	testBeforeMarkOrphan func()
 }
 
 type itemRecord struct {
@@ -2284,6 +2288,14 @@ func (a *attach) flushBindingDeltaError() error {
 	return nil
 }
 
+// persistAssignedAuthorityIdentities is the delegation handoff's
+// OnHandoffPrepared hook. It is the a.mu acquisition that the recall-path
+// lock-order invariant documented on onMarkOrphan protects: a handoff cannot
+// complete until this hook has taken a.mu, so anything that holds a.mu while
+// waiting on a clientcore.NodeState mutex can wedge the handoff forever. This
+// hook itself only touches NodeState through the atomic authority-inode
+// accessors (AuthorityIno/RecordAuthorityIno), which never take n.mu, so it
+// stays on the safe side of the invariant.
 func (a *attach) persistAssignedAuthorityIdentities(
 	ctx context.Context,
 	scope string,
@@ -3511,6 +3523,27 @@ func (a *attach) onFlushAll(p string) {
 	a.publish(pfslocal.Event{Kind: &state})
 }
 
+// onMarkOrphan runs on the authority recall/invalidation path.
+//
+// LOCK-ORDER INVARIANT (recall path): code on this path must never block on a
+// clientcore.NodeState mutex while it holds a.mu. A suspended frontend
+// mutation can own its NodeState.mu across an unbounded wait for a delegation
+// handoff to finish (clientcore/ops.go takes n.mu around the authority round
+// trip, and the round trip suspends and resumes through the frontend
+// publication gate). The handoff cannot finish until its own OnHandoffPrepared
+// hook, persistAssignedAuthorityIdentities, has taken a.mu. Holding a.mu while
+// waiting for n.mu therefore closes an untimed cycle:
+//
+//	frontend mutation: n.mu held -> waits for handoff to end
+//	handoff:           waits for a.mu (persistAssignedAuthorityIdentities)
+//	recall:            a.mu held  -> waits for n.mu
+//
+// The registry maps (a.paths, a.handles, a.vol) are the only things a.mu
+// protects here, and a NodeState's own mutex has never been ordered under
+// a.mu, so collecting the targets under a.mu and marking them after releasing
+// it is exactly equivalent — MarkOrphan already re-checks the node's open
+// count under n.mu, and a reincarnated pathname always receives a fresh
+// NodeState, so the captured pointers cannot be redirected by the gap.
 func (a *attach) onMarkOrphan(p string, ino uint64) {
 	a.mu.Lock()
 	states := make(map[*clientcore.NodeState]struct{})
@@ -3538,10 +3571,16 @@ func (a *attach) onMarkOrphan(p string, ino uint64) {
 	if a.vol != nil {
 		orphans = a.vol.OpenOrphans()
 	}
+	barrier := a.testBeforeMarkOrphan
+	a.mu.Unlock()
+	// Every NodeState mutex below is taken with a.mu released; see the
+	// lock-order invariant on this function.
 	for state := range states {
+		if barrier != nil {
+			barrier()
+		}
 		state.MarkOrphan(ino, orphans)
 	}
-	a.mu.Unlock()
 }
 
 func (a *attach) forwardEvents(ctx context.Context, cli *fsproto.Client, first <-chan coherence.Batch, firstAck fsproto.AckFunc) {

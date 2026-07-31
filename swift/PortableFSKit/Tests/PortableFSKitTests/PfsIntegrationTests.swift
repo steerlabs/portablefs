@@ -260,3 +260,74 @@ private func bytes(_ string: String) -> Data {
         #expect(error.posixErrno == ESTALE)
     }
 }
+
+/// The chflags(2) write path end to end: the extension forwards the intent and
+/// the daemon — the only layer that knows the attached authority's features —
+/// persists it. A zero word is a real "clear everything", not "no change".
+@Test func flagChangesRoundTripThroughTheDaemonWhenTheAuthorityPersistsThem() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let capabilities = await core.resolvedVolume?.capabilities
+    #expect(capabilities?.flagsSupported == true)
+
+    let root = try await core.rootItem()
+    let created = try await core.createFile(in: root, name: bytes("flagged.txt"), mode: 0o644)
+    #expect(created.attr.flags == 0)
+
+    let immutable = UInt32(UF_IMMUTABLE) | UInt32(UF_HIDDEN)
+    let set = try await core.setattr(item: created.item, attributes: .init(flags: immutable))
+    #expect(set.flags == immutable)
+    #expect(try await core.getattr(item: created.item).flags == immutable)
+
+    // Clearing is a durable state of its own, and it must not disturb a
+    // neighbouring group applied in the same request.
+    let cleared = try await core.setattr(item: created.item, attributes: .init(mode: 0o600, flags: 0))
+    #expect(cleared.flags == 0)
+    #expect(cleared.mode == 0o600)
+
+    // A setattr with no flags intent leaves the stored word alone rather than
+    // resetting it to the proto default.
+    _ = try await core.setattr(item: created.item, attributes: .init(flags: immutable))
+    _ = try await core.setattr(item: created.item, attributes: .init(mtimeMilliseconds: 123_000))
+    #expect(try await core.getattr(item: created.item).flags == immutable)
+}
+
+/// Without the authority's flag-persistence bit the refusal is the DAEMON's,
+/// and it reaches the kernel as ENOTSUP — the same honest answer the extension
+/// used to invent, now raised by the layer that actually knows.
+@Test func flagChangesAreRefusedByTheDaemonWhenTheAuthorityCannotPersistThem() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(flagsSupported: false))
+    defer { daemon.stop() }
+
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let capabilities = await core.resolvedVolume?.capabilities
+    #expect(capabilities?.flagsSupported == false)
+    #expect(PfsFSKitMapping.supportedCapabilities(
+        from: capabilities ?? PfsCapabilities()
+    ).doesNotSupportImmutableFiles)
+
+    let root = try await core.rootItem()
+    let created = try await core.createFile(in: root, name: bytes("refused.txt"), mode: 0o644)
+
+    do {
+        _ = try await core.setattr(
+            item: created.item,
+            attributes: .init(mode: 0o600, flags: UInt32(UF_IMMUTABLE))
+        )
+        Issue.record("expected the daemon to refuse a flags change it cannot persist")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == ENOTSUP)
+        // And the errno the kernel receives is the DAEMON's, not a generic EIO.
+        #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOTSUP))
+    }
+
+    // The refusal applied nothing: the co-travelling mode group must not have
+    // landed either.
+    #expect(try await core.getattr(item: created.item).mode == 0o644)
+
+    // A setattr that carries no flags intent is unaffected by the missing bit.
+    let modeOnly = try await core.setattr(item: created.item, attributes: .init(mode: 0o600))
+    #expect(modeOnly.mode == 0o600)
+}

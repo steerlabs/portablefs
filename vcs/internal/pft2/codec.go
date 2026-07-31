@@ -154,6 +154,8 @@ func appendInode(dst []byte, ino *Inode) []byte {
 	dst = appendOptionalRef(dst, 11, ino.DirectoryRoot)
 	dst = appendOptionalRef(dst, 12, ino.ExtentRoot)
 	dst = pfwire.AppendString(dst, 13, ino.SymlinkTarget)
+	dst = pfwire.AppendSint(dst, 14, ino.BirthtimeMs)
+	dst = pfwire.AppendUint(dst, 15, uint64(ino.Flags))
 	return dst
 }
 
@@ -576,6 +578,14 @@ func decodeInode(body []byte) (*Inode, error) {
 			ino.ExtentRoot = &ref
 		case field == 13 && wt == pfwire.TypeBytes:
 			if ino.SymlinkTarget, err = rd.String(field, MaxSymlinkTargetBytes); err != nil {
+				return nil, err
+			}
+		case field == 14 && wt == pfwire.TypeVarint:
+			if ino.BirthtimeMs, err = rd.Sint(field); err != nil {
+				return nil, err
+			}
+		case field == 15 && wt == pfwire.TypeVarint:
+			if ino.Flags, err = rd.Uint32(field); err != nil {
 				return nil, err
 			}
 		default:
