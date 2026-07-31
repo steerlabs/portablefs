@@ -99,6 +99,39 @@ accepting death. Worth confirming the intended reply for a
 removed-but-still-referenced item (an orphan with live kernel references
 should arguably still serve attributes rather than ESTALE).
 
+### 8. WAL saturation: writes time out and the kernel volume dies
+
+Reproduced on a real host by fsync-appending faster than the uplink drains
+(~2.5 GB): once `stream WAL budget exhausted`, writes first fail ENOSPC
+(fail-closed, correct), but blocked operations then start surfacing
+ETIMEDOUT(60) to FSKit, metadata operations (readdir/lstat of unrelated
+directories) queue behind the data backpressure, and the kernel eventually
+marks the volume dead — every access returns EIO while the daemon is still
+healthy and draining. Two root items:
+- Backpressure design: budget exhaustion should reject data admissions
+  fast (ENOSPC) instead of blocking them into op timeouts, and metadata
+  operations must never wait behind data-plane backpressure.
+- Recovery gap: `portablefs umount` preflights the mountpoint with lstat,
+  which returns EIO for a kernel-dead volume, so the CLI refuses to
+  unmount exactly when unmounting is the only remedy. A dead volume must
+  be detachable: `umount(2)` itself succeeds instantly (verified live —
+  no wedge, unlike the pre-fix build).
+
+### 9. Open: transient enumeration undercount under concurrent dual-process load
+
+One dual-process `pfs-mount-stress` run on a single Mac (real FSKit,
+production authority) completed its entire workload (durable state fully
+correct on remount: 240/240 files, all appends, exact lock counter), yet
+both processes' verify pass counted 49/120 entries in both `files`
+directories via ReadDir on the live mount. Removal visibility was correct
+(churn dirs enumerated empty); renamed-in entries were missing. Not yet
+reproduced by: sequential create+enumerate, mid-population enumerate,
+8-worker create with 20 Hz concurrent polling, or post-write drain
+polling (which instead hit item #8). Hypotheses: enumerate merging a
+stale cached authority listing with an already-drained overlay, or a
+paged-enumeration restart under concurrent mutation. Needs a dedicated
+repro with daemon-side enumeration tracing before any fix.
+
 ## Fixed on fix/root-liveness-metadata
 
 - Daemon unmount kernel-reentrancy self-deadlock: the admission freeze
