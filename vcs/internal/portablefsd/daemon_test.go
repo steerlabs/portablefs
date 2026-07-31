@@ -968,7 +968,7 @@ func TestFrontendRejectsMalformedRequestAndPublicationSequences(t *testing.T) {
 		expectPFSConnectionClosed(t, conn)
 	})
 
-	t.Run("protocol minor 2", func(t *testing.T) {
+	t.Run("previous protocol minor", func(t *testing.T) {
 		conn, err := net.Dial("unix", cfg.FrontendSocket)
 		if err != nil {
 			t.Fatal(err)
@@ -978,7 +978,7 @@ func TestFrontendRejectsMalformedRequestAndPublicationSequences(t *testing.T) {
 			RequestID: 1,
 			Body: &pfslocal.Hello{
 				ProtocolMajor: pfslocal.ProtocolMajor,
-				ProtocolMinor: 2,
+				ProtocolMinor: pfslocal.ProtocolMinor - 1,
 				ClientName:    "old-operation-contract-test",
 			},
 		}
@@ -988,7 +988,7 @@ func TestFrontendRejectsMalformedRequestAndPublicationSequences(t *testing.T) {
 		reply := readPFSReply(t, conn, hello.RequestID)
 		if protocolErr, ok := reply.Body.(*pfslocal.ErrorReply); !ok ||
 			protocolErr.Errno != darwinEINVAL {
-			t.Fatalf("minor-2 hello reply = %#v", reply.Body)
+			t.Fatalf("previous-minor hello reply = %#v", reply.Body)
 		}
 		expectPFSConnectionClosed(t, conn)
 	})

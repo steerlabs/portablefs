@@ -40,7 +40,7 @@ func (v *Volume) exactXattrTarget(n *NodeState) (uint64, Status) {
 // GetxattrExactHandle reads xattrs from a retained descriptor's inode without
 // consulting the stale pathname or a replacement's write-back view.
 func (v *Volume) GetxattrExactHandle(ctx context.Context, n *NodeState, name string) ([]byte, Status) {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -49,7 +49,7 @@ func (v *Volume) GetxattrExactHandle(ctx context.Context, n *NodeState, name str
 	if st != fsproto.OK {
 		return nil, st
 	}
-	value, wireStatus, err := v.client.Getxattr("", ino, name)
+	value, wireStatus, err := v.client.GetxattrContext(authorityCtx, "", ino, name)
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -57,7 +57,7 @@ func (v *Volume) GetxattrExactHandle(ctx context.Context, n *NodeState, name str
 }
 
 func (v *Volume) ListxattrExactHandle(ctx context.Context, n *NodeState) ([]string, Status) {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -66,7 +66,7 @@ func (v *Volume) ListxattrExactHandle(ctx context.Context, n *NodeState) ([]stri
 	if st != fsproto.OK {
 		return nil, st
 	}
-	names, wireStatus, err := v.client.Listxattr("", ino)
+	names, wireStatus, err := v.client.ListxattrContext(authorityCtx, "", ino)
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -107,7 +107,9 @@ func (v *Volume) GetxattrOpenHandle(ctx context.Context, path string, n *NodeSta
 	if ino == 0 {
 		return nil, fsproto.ENOENT
 	}
-	value, wireStatus, err := v.client.Getxattr(path, ino, name)
+	resume := v.suspendAuthorityPublication(ctx)
+	value, wireStatus, err := v.client.GetxattrContext(ctx, path, ino, name)
+	resume()
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -143,7 +145,9 @@ func (v *Volume) ListxattrOpenHandle(ctx context.Context, path string, n *NodeSt
 	if ino == 0 {
 		return nil, fsproto.ENOENT
 	}
-	names, wireStatus, err := v.client.Listxattr(path, ino)
+	resume := v.suspendAuthorityPublication(ctx)
+	names, wireStatus, err := v.client.ListxattrContext(ctx, path, ino)
+	resume()
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -151,7 +155,7 @@ func (v *Volume) ListxattrOpenHandle(ctx context.Context, path string, n *NodeSt
 }
 
 func (v *Volume) SetxattrExactHandle(ctx context.Context, n *NodeState, name string, value []byte, flags uint8) Status {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -163,7 +167,7 @@ func (v *Volume) SetxattrExactHandle(ctx context.Context, n *NodeState, name str
 	if st != fsproto.OK {
 		return st
 	}
-	wireStatus, err := v.client.SetxattrFlags("", ino, name, value, flags)
+	wireStatus, err := v.client.SetxattrFlagsContext(authorityCtx, "", ino, name, value, flags)
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -184,7 +188,7 @@ func (v *Volume) SetxattrOpenHandle(ctx context.Context, path string, n *NodeSta
 }
 
 func (v *Volume) RemovexattrExactHandle(ctx context.Context, n *NodeState, name string) Status {
-	end, err := v.beginExactOperation(ctx)
+	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -196,7 +200,7 @@ func (v *Volume) RemovexattrExactHandle(ctx context.Context, n *NodeState, name 
 	if st != fsproto.OK {
 		return st
 	}
-	wireStatus, err := v.client.Removexattr("", ino, name)
+	wireStatus, err := v.client.RemovexattrContext(authorityCtx, "", ino, name)
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -218,10 +222,10 @@ func (v *Volume) Getxattr(ctx context.Context, path string, n *NodeState, name s
 		return nil, fsproto.EIO
 	}
 	defer permit.Close()
-	return v.getxattr(&permit, path, n, name)
+	return v.getxattr(ctx, &permit, path, n, name)
 }
 
-func (v *Volume) getxattr(permit *readView, path string, n *NodeState, name string) ([]byte, Status) {
+func (v *Volume) getxattr(ctx context.Context, permit *readView, path string, n *NodeState, name string) ([]byte, Status) {
 	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
 		if value, result := permit.Getxattr(path, name); result != writeback.LookupUndecided {
 			if result == writeback.LookupNegative {
@@ -230,7 +234,15 @@ func (v *Volume) getxattr(permit *readView, path string, n *NodeState, name stri
 			return value, fsproto.OK
 		}
 	}
-	value, st, err := v.client.Getxattr(path, xattrHandleIno(n), name)
+	covered := v.wb != nil && permit.Covers(path)
+	var resume func()
+	if !covered {
+		resume = v.suspendAuthorityPublication(ctx)
+	}
+	value, st, err := v.client.GetxattrContext(ctx, path, xattrHandleIno(n), name)
+	if resume != nil {
+		resume()
+	}
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -244,16 +256,24 @@ func (v *Volume) Listxattr(ctx context.Context, path string, n *NodeState) ([]st
 		return nil, fsproto.EIO
 	}
 	defer permit.Close()
-	return v.listxattr(&permit, path, n)
+	return v.listxattr(ctx, &permit, path, n)
 }
 
-func (v *Volume) listxattr(permit *readView, path string, n *NodeState) ([]string, Status) {
+func (v *Volume) listxattr(ctx context.Context, permit *readView, path string, n *NodeState) ([]string, Status) {
 	if v.wb != nil && !v.isHardlink(n) && n.Orphan() == 0 {
 		if names, ok := permit.Listxattr(path); ok {
 			return names, fsproto.OK
 		}
 	}
-	names, st, err := v.client.Listxattr(path, xattrHandleIno(n))
+	covered := v.wb != nil && permit.Covers(path)
+	var resume func()
+	if !covered {
+		resume = v.suspendAuthorityPublication(ctx)
+	}
+	names, st, err := v.client.ListxattrContext(ctx, path, xattrHandleIno(n))
+	if resume != nil {
+		resume()
+	}
 	if err != nil {
 		return nil, fsproto.EIO
 	}
@@ -293,13 +313,13 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 			return statusErr(err)
 		}
 	}
-	endAuthority, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
 		return statusErr(releaseErr)
 	}
-	st, err := v.client.SetxattrFlags(path, xattrHandleIno(n), name, value, flags)
+	st, err := v.client.SetxattrFlagsContext(authorityCtx, path, xattrHandleIno(n), name, value, flags)
 	endAuthority()
 	if err != nil {
 		return fsproto.EIO
@@ -335,13 +355,13 @@ func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, nam
 			return statusErr(err)
 		}
 	}
-	endAuthority, releaseErr := v.beginAuthorityMutation(
+	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
 		return statusErr(releaseErr)
 	}
-	st, err := v.client.Removexattr(path, xattrHandleIno(n), name)
+	st, err := v.client.RemovexattrContext(authorityCtx, path, xattrHandleIno(n), name)
 	endAuthority()
 	if err != nil {
 		return fsproto.EIO

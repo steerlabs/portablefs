@@ -24,6 +24,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var lookupDelaysNanoseconds: [String: UInt64]
         public var lookupNoReplyNames: Set<String>
         public var strictItemNamespace: Bool
+        public var protocolMinor: UInt32?
 
         public init(
             attachRef: String = "mock",
@@ -32,7 +33,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             branch: String = "main",
             lookupDelaysNanoseconds: [String: UInt64] = [:],
             lookupNoReplyNames: Set<String> = [],
-            strictItemNamespace: Bool = false
+            strictItemNamespace: Bool = false,
+            protocolMinor: UInt32? = nil
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -41,6 +43,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.lookupDelaysNanoseconds = lookupDelaysNanoseconds
             self.lookupNoReplyNames = lookupNoReplyNames
             self.strictItemNamespace = strictItemNamespace
+            self.protocolMinor = protocolMinor
         }
     }
 
@@ -547,7 +550,7 @@ private actor MockFileSystem {
             case let .hello(request):
                 var response = PfsHelloReply()
                 response.protocolMajor = request.protocolMajor
-                response.protocolMinor = request.protocolMinor
+                response.protocolMinor = configuration.protocolMinor ?? request.protocolMinor
                 response.daemonVersion = "mock"
                 reply.body = .helloReply(response)
             case let .resolve(request):
@@ -587,7 +590,7 @@ private actor MockFileSystem {
                     throw MockPOSIXError(errno: ENOENT, message: "not found")
                 }
                 var response = PfsLookupReply()
-                response.attr = attr(for: child)
+                response.attr = attr(for: child, parent: directory)
                 reply.body = .lookupReply(response)
             case let .enumerate(request):
                 enumerateRequests += 1
@@ -610,7 +613,7 @@ private actor MockFileSystem {
                         let absoluteIndex = start + offset
                         var entry = PfsDirEntry()
                         entry.name = name
-                        entry.attr = attr(for: child)
+                        entry.attr = attr(for: child, parent: directory)
                         entry.cookie = absoluteIndex + 1 >= sorted.count ? 0 : encodeCookie(position: absoluteIndex + 1)
                         response.entries.append(entry)
                     }
@@ -805,7 +808,7 @@ private actor MockFileSystem {
                 bump(directory)
                 var response = PfsHardLinkReply()
                 response.name = request.name
-                response.attr = attr(for: item)
+                response.attr = attr(for: item, parent: directory)
                 reply.body = .hardLinkReply(response)
             case let .xattrGet(request):
                 let node = try node(for: request.item, handle: request.handle)
@@ -932,15 +935,31 @@ private actor MockFileSystem {
         return node
     }
 
-    private func attr(for node: Node) -> PfsAttr {
+    private func liveParent(for node: Node) -> Node? {
+        guard node.id != rootIdentity().itemID else {
+            return nil
+        }
+        return nodes.values
+            .filter { candidate in
+                candidate.kind == .directory &&
+                    candidate.children.values.contains(node.id)
+            }
+            .min { lhs, rhs in lhs.id < rhs.id }
+    }
+
+    private func attr(for node: Node, parent explicitParent: Node? = nil) -> PfsAttr {
         var attr = PfsAttr()
         attr.item = node.item
+        if let parent = explicitParent ?? liveParent(for: node) {
+            attr.parent = parent.item
+        }
         attr.kind = node.kind
         attr.mode = node.mode
         attr.nlink = node.nlink
         attr.uid = node.uid
         attr.gid = node.gid
         attr.size = UInt64(node.kind == .symlink ? node.symlinkTarget.count : node.data.count)
+        attr.allocSize = attr.size
         attr.mtimeMs = node.mtimeMs
         attr.ctimeMs = node.ctimeMs
         attr.atimeMs = node.atimeMs

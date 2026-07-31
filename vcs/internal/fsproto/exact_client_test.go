@@ -119,6 +119,210 @@ func TestClientEstablishesExactSessionOnFirstMutation(t *testing.T) {
 	}
 }
 
+func TestDefiniteDelegationEAGAINConsumesOneExactIdentity(t *testing.T) {
+	h := serveExact(t)
+	setup := dialExact(t, h.addr, "setup")
+	if _, st, err := setup.Mkdir("ws", 0o755); err != nil || st != OK {
+		t.Fatalf("mkdir: status=%d err=%v", st, err)
+	}
+
+	holder := dialExact(t, h.addr, "holder")
+	grant, err := holder.DelegationAcquire("ws", "wb-eagain")
+	if err != nil || !grant.Granted {
+		t.Fatalf("delegation acquire: grant=%+v err=%v", grant, err)
+	}
+	holderSession := holder.exactState()
+	if holderSession == nil {
+		t.Fatal("holder exact session was not established")
+	}
+	if err := holder.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.fs.ExpireSession(holderSession.id, holderSession.gen); err != nil {
+		t.Fatalf("expire holder: %v", err)
+	}
+	if got := h.fs.ManagedDelegationsOverlapping("ws"); len(got) != 1 || !got[0].Recovery {
+		t.Fatalf("recovery delegation = %+v", got)
+	}
+
+	contender := dialExact(t, h.addr, "contender")
+	contender.SetExactSlots(1)
+	if live, err := contender.EnsureExactSession(); err != nil || !live {
+		t.Fatalf("contender exact session: live=%v err=%v", live, err)
+	}
+	before := time.Now()
+	if _, st, err := contender.Create("ws/blocked", 0o644); err != nil || st != EAGAIN {
+		t.Fatalf("gated create: status=%d err=%v", st, err)
+	}
+	if elapsed := time.Since(before); elapsed > 2*time.Second {
+		t.Fatalf("definite EAGAIN was retried for %s", elapsed)
+	}
+	es := contender.exactState()
+	es.mu.Lock()
+	seq := es.seq[0]
+	es.mu.Unlock()
+	if seq != 1 {
+		t.Fatalf("exact slot sequence = %d, want one consumed identity", seq)
+	}
+}
+
+func TestPreCanceledExactOperationSendsNothingAndConsumesNoIdentity(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "pre-canceled-exact")
+	cli.SetExactSlots(1)
+	if live, err := cli.EnsureExactSession(); err != nil || !live {
+		t.Fatalf("establish exact session: live=%v err=%v", live, err)
+	}
+
+	var applied atomic.Int64
+	h.setDrop(func(req *Request, _ *Response) bool {
+		if req.Op == OpCreate && req.Path == "never-sent" {
+			applied.Add(1)
+		}
+		return false
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := cli.DoContext(ctx, &Request{
+		Op: OpCreate, Path: "never-sent", Mode: 0o644,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled create error = %v, want context canceled", err)
+	}
+	if got := applied.Load(); got != 0 {
+		t.Fatalf("pre-canceled create reached authority %d times", got)
+	}
+	es := cli.exactState()
+	es.mu.Lock()
+	seq := es.seq[0]
+	es.mu.Unlock()
+	if seq != 0 {
+		t.Fatalf("pre-canceled create consumed sequence %d", seq)
+	}
+	if available := len(es.avail); available != 1 {
+		t.Fatalf("pre-canceled create leaked exact slot: available=%d, want 1", available)
+	}
+}
+
+func TestCanceledExactOperationWaitsForDefiniteReplyBeforeResuming(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "post-send-canceled-exact")
+	cli.SetExactSlots(1)
+	if live, err := cli.EnsureExactSession(); err != nil || !live {
+		t.Fatalf("establish exact session: live=%v err=%v", live, err)
+	}
+
+	applied := make(chan struct{})
+	releaseReply := make(chan struct{})
+	var blocked atomic.Bool
+	h.setDrop(func(req *Request, _ *Response) bool {
+		if req.Op == OpCreate && req.Path == "applied-before-cancel" &&
+			blocked.CompareAndSwap(false, true) {
+			close(applied)
+			<-releaseReply
+		}
+		return false
+	})
+
+	var waits atomic.Int64
+	var suspended atomic.Bool
+	resumed := make(chan struct{}, 1)
+	waitCtx := WithAuthorityWait(context.Background(), func() func() {
+		waits.Add(1)
+		suspended.Store(true)
+		return func() {
+			suspended.Store(false)
+			resumed <- struct{}{}
+		}
+	})
+	ctx, cancel := context.WithCancel(waitCtx)
+	defer cancel()
+	type result struct {
+		resp *Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := cli.DoContext(ctx, &Request{
+			Op: OpCreate, Path: "applied-before-cancel", Mode: 0o644,
+		})
+		done <- result{resp: resp, err: err}
+	}()
+
+	select {
+	case <-applied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("exact create did not reach the authority")
+	}
+	cancel()
+	select {
+	case got := <-done:
+		t.Fatalf("canceled exact create returned before definite reply: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-resumed:
+		t.Fatal("authority publication resumed before definite exact reply")
+	default:
+	}
+	if !suspended.Load() {
+		t.Fatal("authority publication was not suspended while exact reply was blocked")
+	}
+
+	close(releaseReply)
+	select {
+	case got := <-done:
+		if got.err != nil || got.resp == nil || got.resp.Status != OK {
+			t.Fatalf("definite exact result: response=%+v err=%v", got.resp, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("exact create did not return after definite reply")
+	}
+	select {
+	case <-resumed:
+	case <-time.After(time.Second):
+		t.Fatal("authority publication did not resume after definite reply")
+	}
+	if suspended.Load() {
+		t.Fatal("authority publication remained suspended after definite reply")
+	}
+	if got := waits.Load(); got != 1 {
+		t.Fatalf("authority wait count = %d, want 1", got)
+	}
+	es := cli.exactState()
+	es.mu.Lock()
+	seq := es.seq[0]
+	es.mu.Unlock()
+	if seq != 1 {
+		t.Fatalf("definite exact reply committed sequence %d, want 1", seq)
+	}
+}
+
+func TestAuthorityWaitResumesBeforeTypedMutationPublishesSelfWrite(t *testing.T) {
+	h := serveExact(t)
+	cli := dialExact(t, h.addr, "response-boundary")
+	if _, st, err := cli.Create("f", 0o644); err != nil || st != OK {
+		t.Fatalf("setup create: status=%d err=%v", st, err)
+	}
+	var resumed atomic.Bool
+	var waits atomic.Int64
+	cli.SetOnSelfWrite(func(string, uint64, uint64, bool) {
+		if !resumed.Load() {
+			t.Error("self-write metadata published before authority wait resumed")
+		}
+	})
+	ctx := WithAuthorityWait(context.Background(), func() func() {
+		waits.Add(1)
+		resumed.Store(false)
+		return func() { resumed.Store(true) }
+	})
+	if _, _, _, st, err := cli.WriteVHandleContext(ctx, "f", 0, 0, []byte("x"), 0o644); err != nil || st != OK {
+		t.Fatalf("write: status=%d err=%v", st, err)
+	}
+	if waits.Load() != 1 {
+		t.Fatalf("authority wait hooks = %d, want 1", waits.Load())
+	}
+}
+
 func TestResolvedRecoveryMutatorsReplayLostReplies(t *testing.T) {
 	h := serveExact(t)
 	cli := dialExact(t, h.addr, "recovery-resolved")

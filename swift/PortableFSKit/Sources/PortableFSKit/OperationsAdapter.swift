@@ -475,7 +475,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         try await core.client.withPublicationBoundary {
             do {
                 let attr = try await core.getattr(item: try portableItem(item))
-                return try PfsFSKitMapping.attributes(from: attr)
+                return try PfsFSKitMapping.attributes(
+                    from: attr,
+                    requested: desiredAttributes.wantedAttributes
+                )
             } catch {
                 throw PfsErrorMapper.fsKitError(for: error)
             }
@@ -721,7 +724,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                         ),
                         attributes: attributes == nil
                             ? nil
-                            : try PfsFSKitMapping.attributes(from: entry.attr)
+                            : try PfsFSKitMapping.attributes(
+                                from: entry.attr,
+                                requested: attributes?.wantedAttributes
+                            )
                     )
                     if !packed {
                         return currentVerifier

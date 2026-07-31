@@ -78,20 +78,86 @@ public enum PfsFSKitMapping {
         }
     }
 
-    public static func attributes(from attr: PfsAttr) throws -> FSItem.Attributes {
+    private static func includes(
+        _ attribute: FSItem.Attribute,
+        in requested: FSItem.Attribute?
+    ) -> Bool {
+        requested?.contains(attribute) ?? true
+    }
+
+    private static func parentIdentifier(from attr: PfsAttr) throws -> FSItem.Identifier {
+        if attr.item.itemID == 1 {
+            return .parentOfRoot
+        }
+        guard attr.hasParent else {
+            return .invalid
+        }
+        return try itemIdentifier(from: attr.parent.itemID)
+    }
+
+    /// Builds one atomic FSKit snapshot. Get-attribute and readdir-plus callers
+    /// pass the exact wanted mask so the reply contains neither missing
+    /// requested properties nor unrelated valid properties.
+    public static func attributes(
+        from attr: PfsAttr,
+        requested: FSItem.Attribute? = nil
+    ) throws -> FSItem.Attributes {
+        if let requested,
+           requested.contains(.addedTime) || requested.contains(.backupTime) {
+            throw PfsLocalClientError.daemon(
+                errno: ENOTSUP,
+                message: "PortableFS does not expose added-time or backup-time metadata"
+            )
+        }
         let attributes = FSItem.Attributes()
-        attributes.uid = attr.uid
-        attributes.gid = attr.gid
-        attributes.mode = attr.mode
-        attributes.type = itemType(from: attr.kind)
-        attributes.linkCount = attr.nlink
-        attributes.size = attr.size
-        attributes.allocSize = attr.size
-        attributes.fileID = try itemIdentifier(from: attr.item.itemID)
-        attributes.modifyTime = timespec(milliseconds: attr.mtimeMs)
-        attributes.changeTime = timespec(milliseconds: attr.ctimeMs)
-        attributes.accessTime = timespec(milliseconds: attr.atimeMs)
-        attributes.birthTime = timespec(milliseconds: attr.birthtimeMs)
+        if includes(.uid, in: requested) {
+            attributes.uid = attr.uid
+        }
+        if includes(.gid, in: requested) {
+            attributes.gid = attr.gid
+        }
+        if includes(.mode, in: requested) {
+            attributes.mode = attr.mode
+        }
+        if includes(.type, in: requested) {
+            attributes.type = itemType(from: attr.kind)
+        }
+        if includes(.linkCount, in: requested) {
+            attributes.linkCount = attr.nlink
+        }
+        if includes(.flags, in: requested) {
+            attributes.flags = attr.flags
+        }
+        if includes(.size, in: requested) {
+            attributes.size = attr.size
+        }
+        if includes(.allocSize, in: requested) {
+            attributes.allocSize = attr.allocSize
+        }
+        if includes(.fileID, in: requested) {
+            attributes.fileID = try itemIdentifier(from: attr.item.itemID)
+        }
+        if includes(.parentID, in: requested) {
+            attributes.parentID = try parentIdentifier(from: attr)
+        }
+        if includes(.modifyTime, in: requested) {
+            attributes.modifyTime = timespec(milliseconds: attr.mtimeMs)
+        }
+        if includes(.changeTime, in: requested) {
+            attributes.changeTime = timespec(milliseconds: attr.ctimeMs)
+        }
+        if includes(.accessTime, in: requested) {
+            attributes.accessTime = timespec(milliseconds: attr.atimeMs)
+        }
+        if includes(.birthTime, in: requested) {
+            attributes.birthTime = timespec(milliseconds: attr.birthtimeMs)
+        }
+        if includes(.supportsLimitedXAttrs, in: requested) {
+            attributes.supportsLimitedXAttrs = false
+        }
+        if includes(.inhibitKernelOffloadedIO, in: requested) {
+            attributes.inhibitKernelOffloadedIO = false
+        }
         return attributes
     }
 

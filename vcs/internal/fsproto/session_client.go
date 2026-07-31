@@ -533,7 +533,11 @@ func (c *Client) prepareConn(cn *conn) error {
 }
 
 func (c *Client) prepareConnContext(ctx context.Context, cn *conn) error {
-	if err := cn.ensureWithGateContext(ctx, false); err != nil {
+	return c.prepareConnContextWithGate(ctx, cn, false)
+}
+
+func (c *Client) prepareConnContextWithGate(ctx context.Context, cn *conn, resolved bool) error {
+	if err := cn.ensureWithGateContext(ctx, resolved); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -545,7 +549,7 @@ func (c *Client) prepareConnContext(ctx context.Context, cn *conn) error {
 	}
 	resp, _, err := cn.roundtripSentWithGateContext(ctx, &Request{
 		Op: OpSessionAttach, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
-	}, false)
+	}, resolved)
 	if err != nil {
 		return err
 	}
@@ -594,60 +598,14 @@ func (c *Client) ExpireSession() {
 	es.fence()
 }
 
-// doExact executes one mutation under an exact-once identity. Every definite
-// server reply (any status) commits the identity; transport failures replay
-// the IDENTICAL identity. After the foreground budget the identity is parked
-// with the background replayer and the caller gets ErrMutationUnknown.
-//
-// A definite EAGAIN means the authority's reclaim-grace gate held the mutation
-// off (post-failover, prior sessions still re-asserting). The identity WAS
-// consumed (the rejection is durably recorded), so the retry below uses a
-// FRESH identity — and keeps the failover invisible to the caller for as long
-// as one op is allowed to block.
+// doExact executes exactly one mutation identity. Every definite server reply
+// (including EAGAIN) commits that identity and returns immediately; transport
+// failures replay only the IDENTICAL identity. Managed exact admission has no
+// client-visible reclaim-grace status distinct from delegation contention, so
+// blanket fresh-identity EAGAIN retry would turn one bounded recall timeout
+// into a full opTimeout stall and could repeat a real lock/contention result.
 func (c *Client) doExact(req *Request) (*Response, error) {
-	deadline := time.Now().Add(opTimeout)
-	backoff := 50 * time.Millisecond
-	for {
-		resp, err := c.doExactOnce(req)
-		if err != nil || resp.Status != EAGAIN {
-			return resp, err
-		}
-		c.kickResume()
-		if c.SessionFenced() || !time.Now().Before(deadline) {
-			return resp, nil
-		}
-		select {
-		case <-c.closed:
-			return resp, nil
-		case <-time.After(backoff):
-		}
-		if backoff *= 2; backoff > time.Second {
-			backoff = time.Second
-		}
-	}
-}
-
-// kickResume performs one debounced session resume (durable renewal). Safe
-// under concurrency: the authority serializes lifecycle transitions per
-// session, and a definite ESTALE fences the client session exactly like the
-// renew loop.
-func (c *Client) kickResume() {
-	es := c.exactState()
-	if es == nil || es.isFenced() {
-		return
-	}
-	if !c.resumeKick.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		defer c.resumeKick.Store(false)
-		resp, err := c.doRaw(&Request{
-			Op: OpSessionResume, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
-		}, true)
-		if err == nil && resp.Status == ESTALE {
-			es.fence()
-		}
-	}()
+	return c.doExactOnce(req)
 }
 
 func (c *Client) doExactOnce(req *Request) (*Response, error) {

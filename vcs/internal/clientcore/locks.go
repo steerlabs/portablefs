@@ -25,19 +25,32 @@ const (
 // implements it directly, but tests and future frontends can supply a narrower
 // adapter.
 type LockAuthority interface {
-	Lock(path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error)
+	Lock(ctx context.Context, path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error)
 }
 
 // lockRouter routes lock mutations through the journaled exact-identity lock
 // op; getlk is a pure read. handleIno 0 keeps locks path-keyed at decision
 // time.
-type lockRouter struct{ cli *fsproto.Client }
+type lockRouter struct {
+	cli              *fsproto.Client
+	authorityContext func(context.Context) context.Context
+}
 
-func (r lockRouter) Lock(path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
-	if mode != fsproto.LkGetlk {
-		return r.cli.LockManaged(path, 0, mode, lkID, start, end, write, unlock)
+func (r lockRouter) Lock(ctx context.Context, path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
+	// Unlock never enters the server's delegation gate. Keep the resolved
+	// release off the frontend suspension hook: once local ownership is
+	// removed, Unlock supplies a non-cancelable context and waits for this
+	// exact release to finish.
+	if mode != fsproto.LkGetlk && unlock {
+		return r.cli.LockManagedContext(ctx, path, 0, mode, lkID, start, end, write, true)
 	}
-	return r.cli.Lock(path, mode, lkID, start, end, write, unlock)
+	if r.authorityContext != nil {
+		ctx = r.authorityContext(ctx)
+	}
+	if mode != fsproto.LkGetlk {
+		return r.cli.LockManagedContext(ctx, path, 0, mode, lkID, start, end, write, unlock)
+	}
+	return r.cli.LockContext(ctx, path, mode, lkID, start, end, write, unlock)
 }
 
 // HeldLock records one advisory lock that was acquired through a frontend's
@@ -121,19 +134,28 @@ func (h *LockHandle) Drain() []HeldLock {
 // Unlock forwards an explicit unlock to every path where the matching lock was
 // acquired. If the handle has no matching record, it falls back to the live path;
 // the release is owner-scoped at the authority, so a stray unlock is safe.
-func Unlock(auth LockAuthority, h *LockHandle, owner, start, end uint64, live string) error {
+func Unlock(ctx context.Context, auth LockAuthority, h *LockHandle, owner, start, end uint64, live string) error {
+	// Cancellation is a boundary, not an interruption point. Before this
+	// check the caller still owns every local record and nothing is sent.
+	// After it, removing a local record commits us to resolving every exact
+	// authority unlock: abandoning only part of the set would strand locks
+	// that the handle can no longer reconstruct.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	releaseCtx := context.Background()
 	if h == nil {
-		_, err := auth.Lock(live, fsproto.LkSetlk, owner, start, end, false, true)
+		_, err := auth.Lock(releaseCtx, live, fsproto.LkSetlk, owner, start, end, false, true)
 		return err
 	}
 	paths := h.UnlockPaths(owner, start, end)
 	if len(paths) == 0 {
-		_, err := auth.Lock(live, fsproto.LkSetlk, owner, start, end, false, true)
+		_, err := auth.Lock(releaseCtx, live, fsproto.LkSetlk, owner, start, end, false, true)
 		return err
 	}
 	var first error
 	for _, p := range paths {
-		if _, err := auth.Lock(p, fsproto.LkSetlk, owner, start, end, false, true); err != nil && first == nil {
+		if _, err := auth.Lock(releaseCtx, p, fsproto.LkSetlk, owner, start, end, false, true); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -143,11 +165,11 @@ func Unlock(auth LockAuthority, h *LockHandle, owner, start, end uint64, live st
 // SetLock attempts a non-blocking acquire and records successful acquisitions on
 // the handle. Unlock requests are routed through Unlock so rename-before-unlock
 // releases the authority lock at its acquire path.
-func SetLock(auth LockAuthority, h *LockHandle, path string, owner, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
+func SetLock(ctx context.Context, auth LockAuthority, h *LockHandle, path string, owner, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
 	if unlock {
-		return fsproto.LockResult{Status: fsproto.OK}, Unlock(auth, h, owner, start, end, path)
+		return fsproto.LockResult{Status: fsproto.OK}, Unlock(ctx, auth, h, owner, start, end, path)
 	}
-	res, err := auth.Lock(path, fsproto.LkSetlk, owner, start, end, write, false)
+	res, err := auth.Lock(ctx, path, fsproto.LkSetlk, owner, start, end, write, false)
 	if err != nil {
 		return res, err
 	}
@@ -162,14 +184,14 @@ func SetLock(auth LockAuthority, h *LockHandle, path string, owner, start, end u
 // a caller that already gave up never leaves an orphaned lock.
 func WaitSetLock(ctx context.Context, auth LockAuthority, h *LockHandle, path string, owner, start, end uint64, write bool) (fsproto.LockResult, error) {
 	for {
-		res, err := auth.Lock(path, fsproto.LkSetlk, owner, start, end, write, false)
+		res, err := auth.Lock(ctx, path, fsproto.LkSetlk, owner, start, end, write, false)
 		if err != nil {
 			return res, err
 		}
 		if res.Status == fsproto.OK {
 			select {
 			case <-ctx.Done():
-				_, _ = auth.Lock(path, fsproto.LkSetlk, owner, start, end, false, true)
+				_, _ = auth.Lock(context.Background(), path, fsproto.LkSetlk, owner, start, end, false, true)
 				return res, ctx.Err()
 			default:
 			}
@@ -195,6 +217,6 @@ func ReleaseHandleLocks(auth LockAuthority, h *LockHandle) {
 		return
 	}
 	for _, l := range h.Drain() {
-		_, _ = auth.Lock(l.Path, fsproto.LkSetlk, l.Owner, l.Start, l.End, false, true)
+		_, _ = auth.Lock(context.Background(), l.Path, fsproto.LkSetlk, l.Owner, l.Start, l.End, false, true)
 	}
 }

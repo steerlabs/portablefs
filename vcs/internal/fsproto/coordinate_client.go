@@ -129,8 +129,12 @@ func (c *Client) doCoordinateResolved(req *Request) (*Response, error) {
 // returns a definite EAGAIN when the bounded wait expires — the caller
 // re-issues at its own cadence with a fresh identity.
 func (c *Client) LockManaged(path string, handleIno uint64, mode uint8, lkID, start, end uint64, write, unlock bool) (LockResult, error) {
+	return c.LockManagedContext(context.Background(), path, handleIno, mode, lkID, start, end, write, unlock)
+}
+
+func (c *Client) LockManagedContext(ctx context.Context, path string, handleIno uint64, mode uint8, lkID, start, end uint64, write, unlock bool) (LockResult, error) {
 	if mode == LkGetlk {
-		r, err := c.Do(&Request{
+		r, err := c.DoContext(ctx, &Request{
 			Op: OpLock, Path: path, HandleIno: handleIno, Owner: c.owner,
 			LkMode: LkGetlk, LkID: lkID, LkStart: start, LkEnd: end, LkWrite: write,
 		})
@@ -139,6 +143,11 @@ func (c *Client) LockManaged(path string, handleIno uint64, mode uint8, lkID, st
 		}
 		return LockResult{Status: r.Status, Conflict: r.LkConflict, CStart: r.LkStart, CEnd: r.LkEnd, CWrite: r.LkWrite}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return LockResult{Status: EIO}, err
+	}
+	resumeAuthority := beginAuthorityWait(ctx)
+	defer resumeAuthority()
 	resp, err := c.doCoordinate(&Request{
 		Op: OpLock, Path: path, HandleIno: handleIno, Owner: c.owner,
 		LkMode: mode, LkID: lkID, LkStart: start, LkEnd: end, LkWrite: write, LkUnlock: unlock,
