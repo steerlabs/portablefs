@@ -169,21 +169,21 @@ import Testing
     }
 }
 
-/// A flags change is FORWARDED to the daemon, never judged in the extension
-/// and never silently dropped. Whether it can be honored is per-attach
-/// knowledge (the authority's FeatureFlagPersistence bit), so the mapping layer
-/// consumes `.flags` and lets the daemon answer — see
-/// `flagChangesAreRefusedByTheDaemonWhenTheAuthorityCannotPersistThem` for the
+/// A flags change is forwarded ONLY where the attach affirmatively supports it.
+/// The capability is per-attach knowledge that reaches the extension in the
+/// resolve reply, so the mapping layer consumes `.flags` exactly when the
+/// daemon proved it reads them — see
+/// `flagChangesAreRefusedByTheExtensionWhenTheDaemonCannotPersistThem` for the
 /// refusal half of the contract.
-@Test func flagChangesAreForwardedInsteadOfSilentlyDropped() throws {
+@Test func flagChangesAreForwardedWhenTheAttachSupportsThem() throws {
     let request = FSItem.SetAttributesRequest()
     request.mode = 0o600
-    let modeOnly = try PfsFSKitMapping.setAttributes(from: request)
+    let modeOnly = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: true)
     #expect(modeOnly.mode == 0o600)
     #expect(modeOnly.flags == nil)
 
     request.flags = UInt32(UF_IMMUTABLE)
-    let withFlags = try PfsFSKitMapping.setAttributes(from: request)
+    let withFlags = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: true)
     #expect(withFlags.flags == UInt32(UF_IMMUTABLE))
     #expect(withFlags.mode == 0o600)
     // FSKit's contract: an attribute the filesystem acts on must be reported
@@ -193,8 +193,45 @@ import Testing
     // Zero is a REQUEST (clear every flag), not "no change".
     let clearing = FSItem.SetAttributesRequest()
     clearing.flags = 0
-    #expect(try PfsFSKitMapping.setAttributes(from: clearing).flags == 0)
+    #expect(try PfsFSKitMapping.setAttributes(from: clearing, flagsSupported: true).flags == 0)
     #expect(clearing.consumedAttributes.contains(.flags))
+}
+
+/// Without an affirmative `flagsSupported` the extension refuses the change
+/// ITSELF, because the daemon might be one that cannot refuse it: `set_flags`
+/// and `flags` are appended fields, so a daemon predating them discards both,
+/// applies the rest of the setattr and answers success. The refusal must
+/// therefore happen before the request is ever built — and it must take the
+/// co-travelling groups with it, since a chflags(2) that half-applied is not a
+/// refusal.
+@Test func flagChangesAreRefusedByTheExtensionWithoutTheCapability() throws {
+    let request = FSItem.SetAttributesRequest()
+    request.mode = 0o600
+    request.flags = UInt32(UF_IMMUTABLE)
+    #expect(throws: PfsLocalClientError.self) {
+        _ = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: false)
+    }
+    do {
+        _ = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: false)
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == ENOTSUP)
+    }
+    // Nothing was consumed, so the kernel is not told a change it never got
+    // was honored.
+    #expect(!request.consumedAttributes.contains(.flags))
+    #expect(!request.consumedAttributes.contains(.mode))
+
+    // Clearing to zero is a real change and is refused the same way.
+    let clearing = FSItem.SetAttributesRequest()
+    clearing.flags = 0
+    #expect(throws: PfsLocalClientError.self) {
+        _ = try PfsFSKitMapping.setAttributes(from: clearing, flagsSupported: false)
+    }
+
+    // A setattr carrying no flags intent is untouched by the missing bit.
+    let modeOnly = FSItem.SetAttributesRequest()
+    modeOnly.mode = 0o600
+    #expect(try PfsFSKitMapping.setAttributes(from: modeOnly, flagsSupported: false).mode == 0o600)
 }
 
 /// The volume capability is answered from the attach's own resolve reply, not

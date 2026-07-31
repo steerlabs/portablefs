@@ -76,6 +76,80 @@ type extent struct {
 	off        int64 // payload byte offset within the segment file
 }
 
+// extentRange is one half-open file range [start,end). It is the only thing
+// the extent-cardinality projection needs: splicing depends on boundaries
+// alone, never on where a range's bytes live.
+type extentRange struct{ start, end uint64 }
+
+// spliceRange projects fileView.insertExtent onto ranges: the extents cur that
+// do not intersect r survive unchanged, a partial overlap leaves its
+// non-overlapping fragment(s), a fully covered extent disappears, and r itself
+// is added. Order is irrelevant to the result's cardinality, so the projection
+// does not sort.
+func spliceRange(cur []extentRange, r extentRange) []extentRange {
+	if r.start >= r.end {
+		return cur
+	}
+	out := cur[:0:0]
+	for _, c := range cur {
+		if c.end <= r.start || c.start >= r.end {
+			out = append(out, c)
+			continue
+		}
+		if c.start < r.start {
+			out = append(out, extentRange{start: c.start, end: r.start})
+		}
+		if c.end > r.end {
+			out = append(out, extentRange{start: r.end, end: c.end})
+		}
+	}
+	return append(out, r)
+}
+
+// projectedWriteExtents is the EXACT overlay cardinality that inserting ranges
+// (in order) into existing would leave behind — the same splice the write path
+// then performs, so admission and effect can never disagree.
+//
+// It is tight in both directions, which is the whole point: a write whose range
+// exactly covers existing extents REPLACES them (cardinality unchanged, or
+// lower when it covers several), so it costs nothing and must be admitted at
+// the bound; only a range that survives alongside what is already there costs a
+// slot. A range strictly inside one existing extent genuinely costs two (the
+// extent splits into a left fragment, the new range, and a right fragment)
+// because the fragments reference distinct WAL payload bytes and cannot be
+// represented as one extent — the projection charges exactly that, no more.
+func projectedWriteExtents(existing []extent, ranges []extentRange) int {
+	cur := make([]extentRange, 0, len(existing)+len(ranges))
+	for _, e := range existing {
+		cur = append(cur, extentRange{start: e.start, end: e.end})
+	}
+	for _, r := range ranges {
+		cur = spliceRange(cur, r)
+	}
+	return len(cur)
+}
+
+// projectedTruncateExtents is the EXACT overlay cardinality after truncating
+// from oldSize to newSize, mirroring fileView.truncateExtents. A shrink only
+// drops and clips extents, so it NEVER needs a free slot (truncate to zero
+// clears the set outright); only an extending truncate adds its hole extent.
+func projectedTruncateExtents(existing []extent, oldSize, newSize uint64) int {
+	switch {
+	case newSize < oldSize:
+		n := 0
+		for _, e := range existing {
+			if e.start < newSize {
+				n++
+			}
+		}
+		return n
+	case newSize > oldSize:
+		return projectedWriteExtents(existing, []extentRange{{start: oldSize, end: newSize}})
+	default:
+		return len(existing)
+	}
+}
+
 // baseMove is one locally-acknowledged rename not yet applied at the
 // authority: until the watermark covers seq, the view's clean ranges still
 // live at the OLD authority path.

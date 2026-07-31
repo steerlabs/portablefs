@@ -36,14 +36,27 @@ carries no birthtime or flags, so a checkpoint→reload round trip loses
 them there. The managed authority is unaffected (its durability is the
 PFJ3 journal + PFT2 tree). Fix when the legacy store next changes shape.
 
-### 4. Transient ENODATA reading a peer's just-created file
+### 4. Multi-group setattr is per-group exact, not request-atomic
+
+A combined setattr (size+mode+owner+times+flags) splits into up to five
+exact identities sent sequentially. Definite refusals are validated
+before anything applies (feature gates, group validation), so no
+DEFINITE failure can follow a partial commit — but a transport failure
+between groups still leaves earlier groups committed while the request
+reports an error, a window that predates the flags work (chmod+chown
+have had it since exact sessions). Root direction: an authority-side
+atomic setattr batch — one syscall outcome, per-group exact
+sub-identities in a single journal record. Design it with the format
+machinery; do not paper it with ordering.
+
+### 5. Transient ENODATA reading a peer's just-created file
 
 Observed once (two-Mac stress): `read peer done marker: no message
 available on STREAM` immediately after the file became visible; retry
 succeeded implicitly. Not yet reproduced or root-caused; needs a repro
 with daemon tracing before any code changes.
 
-### 5. macOS FSKit platform gaps (Apple; Feedback radars to file)
+### 6. macOS FSKit platform gaps (Apple; Feedback radars to file)
 
 Kernel-verified on macOS 26:
 - Negative dentries are cached permanently: no revalidation against
@@ -77,10 +90,14 @@ radars for the API gaps.
   under a.mu, marks outside it; NodeState.orphanIno is atomic so guards
   read it lock-free). Invariant documented at both a.mu sites and
   enforced by deterministic interleaving tests.
-- **Concrete operation scopes**: lookups and enumerations report their
-  real paths instead of mount-wide `""`; binding changes bump a path
-  epoch that conservatively widens still-active operations. Root
-  enumeration and truly detached handles remain legitimately mount-wide.
+- **Operation scopes**: name-mutating operations report precise
+  publication scopes covering every known hard-link alias, and binding
+  changes bump a path epoch that conservatively widens still-active
+  operations. Lookup and Enumerate deliberately REMAIN mount-wide: they
+  publish per-inode attributes through per-path delegations, and a
+  narrowed scope can race an already-passed handoff of a hard-link
+  alias (see Open §2 for the inode-identity gate that would make
+  narrowing sound).
 - **FUSE publication suspension**: the ReplyGate suspends a request's
   admissions for the length of an authority-bound wait and re-admits
   through the same predicate reads already use; a canceled resume revokes

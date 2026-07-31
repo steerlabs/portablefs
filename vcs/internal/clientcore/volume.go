@@ -328,14 +328,16 @@ func (r *exclusionRelease) end() {
 
 // acquire takes a park's reference and returns its single-use drop. It is
 // called synchronously from the parking mutation, i.e. strictly inside the
-// operation's window, so the reference can never be taken after the underlying
-// release already ran; the nil-release guard is a belt-and-braces no-op for a
-// stray late caller rather than a reachable state.
+// operation's window, so the reference can never be taken after the
+// underlying release already ran. That is an invariant, not a tolerated
+// state: acquiring a released exclusion means an exact identity escaped the
+// window its exclusion was scoped to, and silently continuing would hide
+// exactly the integrity bug this type exists to prevent.
 func (r *exclusionRelease) acquire() func() {
 	r.mu.Lock()
 	if r.release == nil {
 		r.mu.Unlock()
-		return func() {}
+		panic("clientcore: exclusion reference acquired after release")
 	}
 	r.refs++
 	r.mu.Unlock()
@@ -346,8 +348,12 @@ func (r *exclusionRelease) acquire() func() {
 func (r *exclusionRelease) drop() {
 	r.mu.Lock()
 	r.refs--
+	if r.refs < 0 {
+		r.mu.Unlock()
+		panic("clientcore: exclusion reference dropped below zero")
+	}
 	var release func()
-	if r.refs <= 0 {
+	if r.refs == 0 {
 		release, r.release = r.release, nil
 	}
 	r.mu.Unlock()

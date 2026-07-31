@@ -38,8 +38,17 @@ func TestExclusionReleaseRunsExactlyOnceAfterLastReference(t *testing.T) {
 	if guard.held() {
 		t.Fatal("exclusion still reported held after the final release")
 	}
-	// A stray late acquire cannot resurrect or re-release it.
-	guard.acquire()()
+	// Acquiring after the release ran is an invariant violation, not a
+	// tolerated state: it means an exact identity escaped its exclusion
+	// window, and the type must fail loudly rather than mask it.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("late acquire after release did not panic")
+			}
+		}()
+		guard.acquire()
+	}()
 	if got := released.Load(); got != 1 {
 		t.Fatalf("underlying release ran %d times after a late acquire, want 1", got)
 	}

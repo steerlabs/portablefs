@@ -692,23 +692,27 @@ func (s *Server) supportsAtomicXattrFlags() bool {
 	return ok && x.SupportsAtomicXattrFlags()
 }
 
-// InodeMetadataStore lets a filesystem DECLINE the durable per-inode metadata
-// PortableFS otherwise assumes: BSD file flags and birth time, both fields of
-// the same PFT2 inode record revision (FeatureFlagPersistence).
+// InodeMetadataStore is a filesystem's AFFIRMATIVE claim that it durably
+// stores the per-inode metadata behind FeatureFlagPersistence: BSD file flags
+// (Darwin st_flags) and birth time, both fields of the same PFT2 inode record
+// revision.
 //
-// Unlike the other capability interfaces this one defaults to TRUE when it is
-// not implemented, because the record revision is part of the v2 baseline tree
-// format — every authority backed by it stores both fields. The interface
-// exists so a store that is NOT backed by it (and the tests that model an
-// authority predating the revision, whose clients must keep refusing chflags
-// honestly) can say so instead of advertising a durability it does not have.
+// Like every other capability interface here it defaults to FALSE. A
+// capability is a promise about durability, and a store that never made the
+// promise cannot be assumed to keep it: advertising the feature by default
+// would make any store whose persistence drops the fields — the legacy
+// checkpoint manifest carries neither — accept a chflags(2) it silently loses
+// at the next restart, which is exactly the silent no-op the feature bit
+// exists to prevent. Absent the affirmative answer the server does not
+// advertise the bit and refuses the SetFlags group outright, so a client that
+// gated correctly never sends one and a client that did not fails closed.
 type InodeMetadataStore interface {
 	PersistsInodeMetadata() bool
 }
 
 func (s *Server) persistsInodeMetadata() bool {
 	m, ok := s.fs.(InodeMetadataStore)
-	return !ok || m.PersistsInodeMetadata()
+	return ok && m.PersistsInodeMetadata()
 }
 
 // HardLinkStore is the authority's atomic hard-link surface. The operation is

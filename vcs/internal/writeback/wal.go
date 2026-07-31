@@ -265,6 +265,15 @@ type streamWAL struct {
 	// without it).
 	readRefs map[uint64]int
 
+	// reserved is the byte cost of appends that have been ADMITTED against the
+	// budget but have not finished writing yet. Budget admission adds a cost
+	// here before it can release w.mu (rotation waits on an in-flight sync
+	// without the mutex), so a concurrent admission counts the bytes an
+	// in-flight append is already entitled to write and can never double-admit
+	// the same headroom. It settles to zero as each append completes and its
+	// bytes appear in the segment sizes.
+	reserved int64
+
 	unsyncedBytes int64
 	unsyncedSince time.Time
 	syncTimer     *time.Timer
@@ -352,6 +361,23 @@ type appendResult struct {
 // a partial append is truncated before any acknowledgment. Sequences are
 // assigned densely from lastSeq+1. Returns per-record placements.
 func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
+	return w.appendMutationsWithin(payloads, 0)
+}
+
+// appendMutationsWithin is appendMutations under a hard on-disk budget.
+//
+// Admission is a RESERVATION, not an observation: the exact number of bytes
+// this append will add to the stream's footprint — every aligned frame, plus a
+// segment rollover's header and re-emitted live delegations when the active
+// segment is at its rotation threshold — is computed and charged against the
+// budget while holding w.mu, before a single byte is written. It therefore
+// answers ErrNoSpace strictly BEFORE the mutation (nothing to undo, no
+// half-written frame, no failure to latch), and an admitted append can never
+// push the footprint past the budget: an append twice the budget's size is
+// refused whether usage is at 99% or at zero. budget <= 0 means unbounded, for
+// the control-plane and recovery paths that must be able to close out a stream
+// which is already at its bound.
+func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]appendResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -359,6 +385,24 @@ func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
 	}
 	if w.syncErr != nil {
 		return nil, w.syncErr
+	}
+	for _, p := range payloads {
+		if len(p) > maxMutationPayload {
+			return nil, fmt.Errorf("writeback: mutation payload %d exceeds frame bound", len(p))
+		}
+	}
+	if budget > 0 {
+		cost, err := w.appendCostLocked(payloads)
+		if err != nil {
+			return nil, err
+		}
+		if w.diskBytesLocked()+w.reserved+cost > budget {
+			return nil, ErrNoSpace
+		}
+		w.reserved += cost
+		// Settle the reservation on every exit: on success the bytes are in the
+		// segment sizes, on failure they were never written.
+		defer func() { w.reserved -= cost }()
 	}
 	if err := w.rotateIfNeededLocked(); err != nil {
 		return nil, err
@@ -371,9 +415,6 @@ func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
 	fno := w.nextFrame
 	digest := w.digest
 	for _, p := range payloads {
-		if len(p) > maxMutationPayload {
-			return nil, fmt.Errorf("writeback: mutation payload %d exceeds frame bound", len(p))
-		}
 		seq++
 		fno++
 		digest = digestNext(digest, seq, p)
@@ -812,11 +853,55 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 func (w *streamWAL) DiskBytes() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.diskBytesLocked()
+}
+
+func (w *streamWAL) diskBytesLocked() int64 {
 	var n int64
 	for _, seg := range w.segments {
 		n += seg.size
 	}
 	return n
+}
+
+// appendCostLocked is the EXACT number of bytes appendMutationsWithin will add
+// to the stream's footprint for payloads: every frame it writes, aligned as it
+// will be written, plus the rollover cost when the active segment has reached
+// the rotation threshold (a fresh segment header and the live-delegation set
+// re-emitted into it before the new segment may carry a mutation).
+//
+// It is never an underestimate. A concurrent appender that rotates first only
+// makes the real cost SMALLER (this append then pays no rollover), and a
+// rollover cannot appear where none was projected: the decision is read from
+// the same seg.size under the same held mutex that rotateIfNeededLocked reads.
+func (w *streamWAL) appendCostLocked(payloads [][]byte) (int64, error) {
+	var cost int64
+	if seg := &w.segments[len(w.segments)-1]; seg.size >= segmentTargetBytes {
+		cost += segmentHeaderSize
+		reemit, err := w.reemitCostLocked()
+		if err != nil {
+			return 0, err
+		}
+		cost += reemit
+	}
+	for _, p := range payloads {
+		cost += frameLen(len(p))
+	}
+	return cost, nil
+}
+
+// reemitCostLocked mirrors reemitLiveDelegationsLocked's byte cost by encoding
+// the same frames it would write.
+func (w *streamWAL) reemitCostLocked() (int64, error) {
+	var cost int64
+	for scope, epoch := range w.liveDelegations {
+		payload, err := json.Marshal(delegationFrame{Scope: scope, Epoch: epoch})
+		if err != nil {
+			return 0, err
+		}
+		cost += frameLen(len(payload))
+	}
+	return cost, nil
 }
 
 func (w *streamWAL) LastSeq() uint64 {

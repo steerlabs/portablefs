@@ -30,6 +30,13 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         /// carrying `setFlags` against a daemon without it is answered
         /// ENOTSUP rather than silently dropped.
         public var flagsSupported: Bool
+        /// Models a daemon built BEFORE `set_flags`/`flags` existed. Both are
+        /// appended fields at the same protocol minor, so such a daemon
+        /// proto3-discards them: it never advertises `flagsSupported`, it
+        /// cannot refuse what it does not parse, and it applies the rest of
+        /// the setattr and reports success. That silent no-op is the failure
+        /// the frontend-side gate exists to prevent.
+        public var predatesFlagFields: Bool
 
         public init(
             attachRef: String = "mock",
@@ -40,7 +47,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             lookupNoReplyNames: Set<String> = [],
             strictItemNamespace: Bool = false,
             protocolMinor: UInt32? = nil,
-            flagsSupported: Bool = true
+            flagsSupported: Bool = true,
+            predatesFlagFields: Bool = false
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -51,6 +59,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.strictItemNamespace = strictItemNamespace
             self.protocolMinor = protocolMinor
             self.flagsSupported = flagsSupported
+            self.predatesFlagFields = predatesFlagFields
         }
     }
 
@@ -591,7 +600,7 @@ private actor MockFileSystem {
                 capabilities.maxNameBytes = 255
                 capabilities.maxFileSize = UInt64.max
                 capabilities.preferredIoBytes = 1_048_576
-                capabilities.flagsSupported = configuration.flagsSupported
+                capabilities.flagsSupported = configuration.flagsSupported && !configuration.predatesFlagFields
                 response.capabilities = capabilities
                 reply.body = .resolveReply(response)
             case let .lookup(request):
@@ -644,11 +653,17 @@ private actor MockFileSystem {
                 reply.body = .getAttrReply(response)
             case let .setAttr(request):
                 let node = try node(for: request.item, handle: request.handle)
-                if request.setFlags && !configuration.flagsSupported {
-                    // Exactly the real daemon's contract: the ENOTSUP is
-                    // raised HERE, by the layer that knows the attached
-                    // authority's features, and it refuses the WHOLE setattr
-                    // before anything is applied.
+                // A daemon predating the appended fields never observes them:
+                // proto3 discards unknown fields before any handler runs, so
+                // it can neither apply nor refuse the flags change.
+                let setFlags = request.setFlags && !configuration.predatesFlagFields
+                if setFlags && !configuration.flagsSupported {
+                    // The real daemon's invariant check: a frontend that
+                    // forwarded a flags change against an authority without
+                    // FeatureFlagPersistence is refused the WHOLE setattr
+                    // before anything is applied. It is a backstop, not the
+                    // primary gate — the frontend's own capability check is,
+                    // because only that one also covers an old daemon.
                     throw MockPOSIXError(errno: ENOTSUP, message: "authority does not persist BSD file flags")
                 }
                 if request.hasMode { node.mode = request.mode }
@@ -657,7 +672,7 @@ private actor MockFileSystem {
                 if request.hasSize { resize(node: node, size: Int(request.size)) }
                 if request.hasMtimeMs { node.mtimeMs = request.mtimeMs }
                 if request.hasAtimeMs { node.atimeMs = request.atimeMs }
-                if request.setFlags { node.flags = request.flags }
+                if setFlags { node.flags = request.flags }
                 node.ctimeMs = nowMs()
                 var response = PfsSetAttrReply()
                 response.attr = attr(for: node)

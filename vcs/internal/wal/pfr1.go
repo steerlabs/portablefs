@@ -160,7 +160,7 @@ func pfr1OpValid(op uint64) bool {
 // PFR1SizeEstimate returns a conservative UPPER bound on len(EncodePFR1(r)).
 // Callers use it to split logical batches into bounded intents before any
 // reservation; over-estimation only makes chunks slightly smaller. Each of
-// the 29 record fields needs at most a two-byte tag plus a ten-byte
+// the 30 record fields needs at most a two-byte tag plus a ten-byte
 // varint/length prefix, so 384 bytes covers every fixed field and the magic
 // even for a structurally valid record carrying irrelevant nonzero scalars.
 func PFR1SizeEstimate(r Record) int {

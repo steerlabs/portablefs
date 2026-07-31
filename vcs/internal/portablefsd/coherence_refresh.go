@@ -820,18 +820,13 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 	knownSlice := func(paths []string) ([]string, uint64, bool) {
 		return paths, pathEpoch, true
 	}
-	// unknown is the conservative mount-wide scope for a request whose
-	// publication target cannot be resolved from the current bindings at all
-	// (a stale Item generation, an unresolvable child name, or a handle with
-	// no live alias). It is NOT the same thing as a concrete scope that
-	// happens to be the root: mountWide below names the root's real, derived
-	// scope so the two are distinguishable at every call site even though the
-	// gate algebra treats "" identically.
+	// unknown is the conservative mount-wide scope: a request whose
+	// publication target cannot be resolved from the current bindings (a
+	// stale Item generation, an unresolvable child name, a handle with no
+	// live alias) and the per-inode read publishers (Lookup, Enumerate)
+	// whose path-narrowed scopes would race already-passed handoffs of
+	// hard-link aliases.
 	unknown := func() ([]string, uint64, bool) { return []string{""}, pathEpoch, true }
-	// mountWide is the exact scope of an operation on the volume root. The
-	// root contains every path, so a root-scoped publication genuinely
-	// overlaps every handoff; "" here is derived, not unknown.
-	mountWide := func() ([]string, uint64, bool) { return []string{""}, pathEpoch, true }
 	withKnownAliases := func(paths []string, candidates ...string) []string {
 		seen := make(map[string]struct{}, len(paths))
 		for _, path := range paths {
@@ -855,41 +850,22 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 
 	switch req := body.(type) {
 	case *pfslocal.LookupRequest:
-		_, path, ok := child(req.Dir, req.Name)
-		if !ok {
-			return unknown()
-		}
-		// A lookup publishes exactly one name: the entry parent/name and the
-		// attributes of the FSItem it resolves to (or a negative entry for
-		// that same name). It does not republish the parent's listing, so the
-		// child pathname — plus every alias already known for whatever is
-		// bound there — is the exact publication scope. The parent itself is
-		// deliberately NOT included: adding it would make every lookup in the
-		// volume root mount-wide again for no publication that reaches it.
-		//
-		// A lookup that DISCOVERS an unseen hard-link alias of an FSItem live
-		// elsewhere installs a new binding before it replies, and every
-		// binding change bumps frontendPathEpoch; the gate then treats this
-		// still-active operation as overlapping every scope. The narrow scope
-		// is therefore exact for already-known bindings and self-correcting
-		// for newly discovered ones.
-		return knownSlice(withKnownAliases([]string{path}, path))
+		// Deliberately mount-wide, NOT the looked-up name. A lookup (and a
+		// readdir-plus page) publishes per-INODE attributes obtained through a
+		// per-PATH delegation, and a hard link can alias that inode under a
+		// scope whose handoff has ALREADY passed this gate — a passed handoff
+		// cannot be re-blocked, so a path-narrowed scope here can publish a
+		// pre-handoff view of an inode the new delegation holder believes is
+		// exclusively theirs. The path epoch only widens operations that
+		// install NEW bindings; it cannot protect aliases that were already
+		// known. Until an inode-identity gate exists that both handoffs and
+		// reply publication join, these two read publishers stay mount-wide.
+		return unknown()
 	case *pfslocal.EnumerateRequest:
-		dir, ok := itemPath(req.Dir)
-		if !ok {
-			return unknown()
-		}
-		if dir == "" {
-			// Enumerating the volume root publishes the root listing, which
-			// spans the whole namespace. "" is this operation's derived,
-			// correct scope rather than an unknown one.
-			return mountWide()
-		}
-		// Every entry a readdir(-plus) page publishes is a child of dir and
-		// therefore within dir's scope. Newly discovered entries register
-		// fresh bindings, which bump frontendPathEpoch and make this
-		// still-active operation conservatively mount-wide before it replies.
-		return known(dir)
+		// Mount-wide for the same inode-aliasing reason as Lookup: a
+		// readdir-plus page publishes child attributes, and any child can be
+		// hard-linked under an already-handed-off scope.
+		return unknown()
 	case *pfslocal.GetAttrRequest:
 		if req.Handle != 0 {
 			paths, ok := handlePaths(req.Handle)

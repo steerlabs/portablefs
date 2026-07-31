@@ -625,9 +625,15 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		// The attached authority has nowhere to store a flag word. Refuse the
 		// WHOLE setattr before anything is applied: consuming the other groups
 		// and dropping this one would report a success the next getattr
-		// contradicts. This is the same honest ENOTSUP the FSKit extension used
-		// to raise on its own — it moved down here because only the daemon
-		// knows the authority's features, and they are per-attach.
+		// contradicts.
+		//
+		// This is an INVARIANT check, not the primary gate. The frontend
+		// already refused this request from FlagsSupported in its own resolve
+		// reply, and it must: set_flags/flags are appended pfslocal fields, so
+		// a daemon predating them discards a forwarded flags change entirely
+		// and answers success — a refusal only the frontend is positioned to
+		// make. Reaching here means a frontend forwarded against a capability
+		// it was told was false, so fail closed rather than trust it.
 		return nil, darwinENOTSUP
 	}
 	cr := clientcore.SetattrRequest{}
