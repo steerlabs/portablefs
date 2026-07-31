@@ -52,12 +52,31 @@ type Capabilities struct {
 	MaxNameBytes    uint32
 	MaxFileSize     uint64
 	PreferredIOSize uint32
-	// FlagsSupported is true exactly when this attach's authority durably
-	// stores BSD file flags (fsproto.FeatureFlagPersistence). Per-attach, never
-	// hardcoded: the frontend turns it into its mount-time volume capability
-	// (FSKit doesNotSupportImmutableFiles) so a mount claims chflags support
-	// only where a chflags will actually persist.
+	// FlagsSupported is true exactly when this attach's AUTHORITY durably
+	// stores BSD file flags (fsproto.FeatureFlagPersistence). Per-attach,
+	// never hardcoded.
+	//
+	// It is informational to the frontend and is NOT a forwarding gate: an
+	// attach's namespace is not all authority. A machine-local graft's backing
+	// is a real host inode, so chflags(2) on it is the durable store and no
+	// authority feature is involved — gating the volume on this field would
+	// refuse graft chflags that would have worked. The daemon decides per
+	// target; the frontend gates on FlagsUnderstood.
 	FlagsSupported bool
+	// FlagsUnderstood is true exactly when the daemon serving this connection
+	// PARSES SetAttrRequest.SetFlags/Flags. It is a statement about protocol
+	// comprehension, not about any authority or any object, and every daemon
+	// that reads those fields sets it unconditionally.
+	//
+	// It exists because SetFlags/Flags are appended pfslocal fields at the
+	// same protocol minor: a daemon predating them discards both, applies the
+	// rest of the setattr and answers success — a chflags(2) that succeeds
+	// while nothing changed. Such a daemon also predates this field, so it
+	// decodes false and the frontend's gate closes on its own. The frontend
+	// forwards flags changes exactly when this is true, and answers its
+	// mount-time volume capability (FSKit doesNotSupportImmutableFiles) from
+	// it, because per-object refusal arrives as an errno on the request.
+	FlagsUnderstood bool
 }
 
 // Item is the frontend-visible filesystem object identity. portablefsd keeps

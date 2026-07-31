@@ -273,6 +273,9 @@ type streamWAL struct {
 	// the same headroom. It settles to zero as each append completes and its
 	// bytes appear in the segment sizes.
 	reserved int64
+	// admitMu serializes budgeted admissions end-to-end (taken strictly
+	// outside w.mu; see appendMutationsWithin).
+	admitMu sync.Mutex
 
 	unsyncedBytes int64
 	unsyncedSince time.Time
@@ -378,6 +381,18 @@ func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
 // the control-plane and recovery paths that must be able to close out a stream
 // which is already at its bound.
 func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]appendResult, error) {
+	if budget > 0 {
+		// Budgeted admissions serialize across the whole append, including the
+		// rotation window where rotateIfNeededLocked releases w.mu to wait on
+		// a background sync. Without this, two admissions straddling a segment
+		// boundary each charge the same rollover cost and the second can be
+		// refused headroom that actually exists. Engine mutations are already
+		// serialized above this layer, so the lock is contention-free in
+		// production; it makes the reservation invariant true of the WAL
+		// itself rather than of its current caller.
+		w.admitMu.Lock()
+		defer w.admitMu.Unlock()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {

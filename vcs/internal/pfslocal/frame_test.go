@@ -301,17 +301,27 @@ func TestFlagFieldsDefaultOffForOlderFrontends(t *testing.T) {
 	}
 }
 
-// TestCapabilitiesFlagsSupportedRoundTrip: the resolve reply is what carries
-// per-attach flag knowledge to a frontend whose volume capability set is
-// computed once, at mount.
+// TestCapabilitiesFlagsSupportedRoundTrip: the resolve reply carries TWO
+// independent flag facts, and they must survive the wire independently.
+// FlagsSupported describes the attached authority's durable storage;
+// FlagsUnderstood describes whether the daemon parses set_flags at all. The
+// interesting combination is the one the graft regression turned on —
+// understood=true with supported=false — so every pairing is exercised.
 func TestCapabilitiesFlagsSupportedRoundTrip(t *testing.T) {
-	for _, want := range []bool{true, false} {
+	for _, want := range []Capabilities{
+		{FlagsSupported: false, FlagsUnderstood: false},
+		{FlagsSupported: false, FlagsUnderstood: true},
+		{FlagsSupported: true, FlagsUnderstood: false},
+		{FlagsSupported: true, FlagsUnderstood: true},
+	} {
 		reply := &ResolveReply{
 			Root:     Item{ItemID: 1, ItemGeneration: 1},
 			VolumeID: "vol",
 			Capabilities: Capabilities{
 				Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
-				MaxNameBytes: 255, PreferredIOSize: 1 << 20, FlagsSupported: want,
+				MaxNameBytes: 255, PreferredIOSize: 1 << 20,
+				FlagsSupported:  want.FlagsSupported,
+				FlagsUnderstood: want.FlagsUnderstood,
 			},
 		}
 		frame, err := EncodeFrame(&Envelope{RequestID: 5, Body: reply})
@@ -323,11 +333,57 @@ func TestCapabilitiesFlagsSupportedRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := decoded.Body.(*ResolveReply)
-		if got.Capabilities.FlagsSupported != want {
-			t.Fatalf("flagsSupported = %v, want %v", got.Capabilities.FlagsSupported, want)
+		if got.Capabilities.FlagsSupported != want.FlagsSupported {
+			t.Fatalf("flagsSupported = %v, want %v", got.Capabilities.FlagsSupported, want.FlagsSupported)
+		}
+		if got.Capabilities.FlagsUnderstood != want.FlagsUnderstood {
+			t.Fatalf("flagsUnderstood = %v, want %v", got.Capabilities.FlagsUnderstood, want.FlagsUnderstood)
 		}
 		if got.Capabilities.PreferredIOSize != 1<<20 || !got.Capabilities.Xattrs {
 			t.Fatalf("neighbouring capability fields disturbed: %+v", got.Capabilities)
 		}
+	}
+}
+
+// TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse: flags_understood is an
+// APPENDED field, so a resolve reply produced by a daemon that predates it
+// carries no field 9 at all. It must decode false — that is precisely the
+// signal "this daemon would silently discard a forwarded set_flags", and a
+// default of true would hand the frontend a licence to forward into a
+// silent no-op.
+func TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse(t *testing.T) {
+	// The capabilities an older daemon emits: every field it knew about, and
+	// literally no field 9 on the wire — a false bool is not encoded at all,
+	// so leaving FlagsUnderstood unset reproduces those bytes exactly.
+	old := Capabilities{
+		Symlinks: true, Xattrs: true, CaseSensitive: true,
+		MaxNameBytes: 255, PreferredIOSize: 1 << 20, FlagsSupported: true,
+	}
+	encoded := marshalCapabilities(&old)
+	if err := scan(encoded, func(num int, _ int, _ []byte) error {
+		if num == 9 {
+			t.Fatalf("a false flags_understood put field 9 on the wire: % x", encoded)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reply := &ResolveReply{
+		Root: Item{ItemID: 1, ItemGeneration: 1}, VolumeID: "vol", Capabilities: old,
+	}
+	frame, err := EncodeFrame(&Envelope{RequestID: 7, Body: reply})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decoded.Body.(*ResolveReply)
+	if got.Capabilities.FlagsUnderstood {
+		t.Fatal("an absent flags_understood decoded true; a pre-flags daemon would be forwarded to")
+	}
+	if !got.Capabilities.FlagsSupported || !got.Capabilities.Xattrs {
+		t.Fatalf("the fields the old daemon DID send were lost: %+v", got.Capabilities)
 	}
 }

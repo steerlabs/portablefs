@@ -39,11 +39,11 @@ PFJ3 journal + PFT2 tree). Fix when the legacy store next changes shape.
 ### 4. Multi-group setattr is per-group exact, not request-atomic
 
 A combined setattr (size+mode+owner+times+flags) splits into up to five
-exact identities sent sequentially. Definite refusals are validated
-before anything applies (feature gates, group validation), so no
-DEFINITE failure can follow a partial commit — but a transport failure
-between groups still leaves earlier groups committed while the request
-reports an error, a window that predates the flags work (chmod+chown
+exact identities sent sequentially. Statically knowable refusals
+(capability gates, shape validation) are preflighted before anything
+applies, but a later group can still fail — definitely (another session
+raced a remove: ENOENT/ESTALE) or indeterminately (transport) — after an
+earlier group committed. The window predates the flags work (chmod+chown
 have had it since exact sessions). Root direction: an authority-side
 atomic setattr batch — one syscall outcome, per-group exact
 sub-identities in a single journal record. Design it with the format

@@ -57,6 +57,9 @@ func TestFrontendSetattrFlagsPersistAgainstFeatureAdvertisingAuthority(t *testin
 	if !res.Capabilities.FlagsSupported {
 		t.Fatal("resolve did not advertise FlagsSupported for a flag-persisting authority")
 	}
+	if !res.Capabilities.FlagsUnderstood {
+		t.Fatal("resolve did not advertise FlagsUnderstood; this daemon parses set_flags")
+	}
 	root := res.Root
 
 	cr := c.call(&pfslocal.CreateRequest{
@@ -139,6 +142,13 @@ func TestFrontendSetattrFlagsRefusedWithoutTheFeature(t *testing.T) {
 	res := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
 	if res.Capabilities.FlagsSupported {
 		t.Fatal("resolve advertised FlagsSupported for an authority that cannot persist flags")
+	}
+	// FlagsUnderstood is orthogonal: it says this daemon PARSES set_flags, and
+	// it is true even here. A frontend that conflated the two would stop
+	// forwarding flags changes for the whole volume — including to grafts,
+	// whose backing host inode needs no authority feature at all.
+	if !res.Capabilities.FlagsUnderstood {
+		t.Fatal("a missing authority feature suppressed FlagsUnderstood")
 	}
 	// The rest of the capability set is unaffected by the missing bit.
 	if !res.Capabilities.Symlinks || !res.Capabilities.HardLinks || !res.Capabilities.Xattrs {
