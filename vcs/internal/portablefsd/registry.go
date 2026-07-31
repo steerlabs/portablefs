@@ -316,6 +316,12 @@ func newRegistry(stateDir string) *registry {
 // checkout's thousands of creates) into a handful of full-state writes.
 const persistDebounce = 100 * time.Millisecond
 
+// invalidationAnchorWait bounds how long attach blocks for the authority to
+// register its invalidation subscription. It only trades a slower attach for a
+// smaller pre-anchor serving window: correctness comes from the anchor fence
+// itself, which applies whenever the subscription lands.
+var invalidationAnchorWait = 10 * time.Second
+
 // schedulePersist marks the persisted state dirty; the persister loop writes
 // it out after the debounce window. Never blocks.
 func (r *registry) schedulePersist() {
@@ -904,6 +910,16 @@ type attach struct {
 	credMu sync.RWMutex
 	token  string
 
+	// lifeCtx scopes everything that must live for the whole ATTACH, not for
+	// the control request that happened to start it. `POST .../credential`
+	// activates a restored (credential-pending) attach from an HTTP handler,
+	// and its r.Context() is cancelled the moment that handler returns — a
+	// request-scoped context handed to the Volume and to the invalidation
+	// watcher therefore killed cross-machine coherence within milliseconds of
+	// a successful activation, silently and for the life of the mount.
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
 	startMu sync.Mutex
 
 	mu        sync.RWMutex
@@ -1034,7 +1050,10 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 	storageID := stableStorageID(storageKey(req.VolumeID, req.Branch))
 	options := req.Options
 	options.LocalDirs = localDirs
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 	return &attach{
+		lifeCtx:                lifeCtx,
+		lifeCancel:             lifeCancel,
 		ref:                    ref,
 		key:                    key,
 		volumeID:               req.VolumeID,
@@ -1249,6 +1268,16 @@ func (a *attach) controlAdmissionError() error {
 	}
 }
 
+// lifetime is the attach-scoped context every long-lived goroutine and the
+// Volume itself must use. Never the control-request context: activation runs
+// inside an HTTP handler whose context dies with the response.
+func (a *attach) lifetime() context.Context {
+	if a.lifeCtx == nil {
+		return context.Background()
+	}
+	return a.lifeCtx
+}
+
 func (a *attach) start(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "wal"), 0o700); err != nil {
 		return err
@@ -1310,7 +1339,10 @@ func (a *attach) start(ctx context.Context) error {
 			log.Printf("attach %s: "+format, append([]any{a.ref}, args...)...)
 		},
 	}
-	vol, err := clientcore.Dial(ctx, opts)
+	// The Volume's internal context is derived from the one passed here and
+	// scopes write-back, credential renewal and prefetch for the whole mount,
+	// so it must be the attach lifetime, never the activating request.
+	vol, err := clientcore.Dial(a.lifetime(), opts)
 	if err != nil {
 		return err
 	}
@@ -1370,6 +1402,35 @@ func (a *attach) start(ctx context.Context) error {
 		_ = eventClient.Close()
 		_ = vol.Close()
 		return err
+	}
+	// Establish the Volume's invalidation subscription BEFORE the first read
+	// that populates its caches. The root getattr below (and every frontend
+	// read after it) is only ordered against peer mutations once the authority
+	// has registered this mount as a subscriber; anything cached earlier can
+	// only be corrected by the anchor's fence, not by an event. Starting the
+	// watcher here and waiting for the anchor keeps the mount from ever
+	// serving from a pre-subscription cache.
+	//
+	// The wait is bounded and advisory: if the authority is slow the attach
+	// proceeds, because the anchor still fences away everything cached in the
+	// meantime the moment it lands. A dead authority fails at the getattr.
+	invalidationCtx, stopInvalidations := context.WithCancel(a.lifetime())
+	activated := false
+	defer func() {
+		// Every remaining path out of start that is not a live attach must
+		// retire the watcher; otherwise a failed activation leaves it
+		// resubscribing against the closed Volume until detach.
+		if !activated {
+			stopInvalidations()
+		}
+	}()
+	go vol.StartInvalidations(invalidationCtx, false)
+	anchorCtx, cancelAnchor := context.WithTimeout(ctx, invalidationAnchorWait)
+	anchored := vol.AwaitInvalidations(anchorCtx)
+	cancelAnchor()
+	if !anchored {
+		log.Printf("attach %s: invalidation stream not anchored within %s; "+
+			"serving continues and re-fences when it lands", a.ref, invalidationAnchorWait)
 	}
 	rootAttr, st := vol.Getattr(ctx, "", clientcore.NewNodeState(1, true))
 	if st != fsproto.OK {
@@ -1443,9 +1504,9 @@ func (a *attach) start(ctx context.Context) error {
 		return fmt.Errorf("persist effective local-dir identity transition: %w", err)
 	}
 	a.eventOnce.Do(func() { close(a.eventReady) })
-	go vol.StartInvalidations(ctx, false)
-	go a.forwardEvents(ctx, eventClient, eventStream, eventAck)
-	go a.watchPrefetch(ctx)
+	go a.forwardEvents(a.lifetime(), eventClient, eventStream, eventAck)
+	go a.watchPrefetch(a.lifetime())
+	activated = true
 	return nil
 }
 
@@ -1569,9 +1630,16 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDetaching, Detail: "detaching"}})
 	events := a.eventClient
 	localFS := a.localFS
+	lifeCancel := a.lifeCancel
 	a.mu.Unlock()
 	a.nsMu.Unlock()
 	a.frontendSerial.Unlock()
+	// Detach is the attach's terminal state: retire the lifetime scope so the
+	// invalidation watcher and the event forwarder stop instead of looping on
+	// resubscribe backoff against a closed client forever.
+	if lifeCancel != nil {
+		lifeCancel()
+	}
 	if events != nil {
 		_ = events.Close()
 	}
