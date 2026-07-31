@@ -233,10 +233,19 @@ type Attr struct {
 	MtimeMs int64
 	CtimeMs int64
 	AtimeMs int64
-	Uid     uint32 // POSIX owner
-	Gid     uint32 // POSIX group
-	Nlink   uint32 // POSIX hard-link count; 0 from an older/read-only authority ⇒ client defaults to 1
-	Ino     uint64 // stable authority-assigned inode identity; 0 ⇒ client falls back to a path hash
+	// BirthtimeMs is populated by machine-local graft stat. The authority's
+	// metadata model does not persist a birth time and leaves the zero sentinel.
+	BirthtimeMs int64
+	Uid         uint32 // POSIX owner
+	Gid         uint32 // POSIX group
+	Nlink       uint32 // POSIX hard-link count; 0 from an older/read-only authority ⇒ client defaults to 1
+	Ino         uint64 // stable authority-assigned inode identity; 0 ⇒ client falls back to a path hash
+	// Flags carries Darwin st_flags for machine-local grafts. The authority
+	// does not expose BSD file flags, so authority-backed attrs remain zero.
+	Flags uint32
+	// AllocSize is the filesystem's charged allocation. Authority-backed
+	// PortableFS charges logical bytes; local grafts report backing stat blocks.
+	AllocSize int64
 }
 
 // Dirent is one entry in a directory listing.
@@ -543,7 +552,10 @@ func attrOf(fi os.FileInfo) Attr {
 		kind = "symlink"
 	}
 	mtimeMs := fi.ModTime().UnixMilli()
-	a := Attr{Kind: kind, Size: fi.Size(), Mode: modebits.ToUnix(fi.Mode()), MtimeMs: mtimeMs, CtimeMs: mtimeMs, AtimeMs: mtimeMs}
+	a := Attr{
+		Kind: kind, Size: fi.Size(), AllocSize: fi.Size(),
+		Mode: modebits.ToUnix(fi.Mode()), MtimeMs: mtimeMs, CtimeMs: mtimeMs, AtimeMs: mtimeMs,
+	}
 	if c, ok := fi.Sys().(interface{ ChangeTime() time.Time }); ok {
 		if ct := c.ChangeTime(); !ct.IsZero() {
 			a.CtimeMs = ct.UnixMilli()
@@ -553,6 +565,14 @@ func attrOf(fi os.FileInfo) Attr {
 		if av := at.AccessTime(); !av.IsZero() {
 			a.AtimeMs = av.UnixMilli()
 		}
+	}
+	if bt, ok := fi.Sys().(interface{ BirthTime() time.Time }); ok {
+		if value := bt.BirthTime(); !value.IsZero() {
+			a.BirthtimeMs = value.UnixMilli()
+		}
+	}
+	if allocated, ok := fi.Sys().(interface{ AllocatedSize() int64 }); ok {
+		a.AllocSize = allocated.AllocatedSize()
 	}
 	if o, ok := fi.Sys().(interface{ OwnerIDs() (uint32, uint32) }); ok {
 		a.Uid, a.Gid = o.OwnerIDs()

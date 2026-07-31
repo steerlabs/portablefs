@@ -8,6 +8,20 @@ private func bytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+@Test func clientRejectsDaemonWithoutAttrParentContract() async throws {
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(protocolMinor: 4)
+    )
+    defer { daemon.stop() }
+
+    do {
+        _ = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+        Issue.record("expected protocol-minor mismatch")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .protocolMismatch(major: 1, minor: 4))
+    }
+}
+
 @Test func volumeCoreRoundTripsAgainstMockDaemon() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }

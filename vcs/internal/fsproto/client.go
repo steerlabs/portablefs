@@ -11,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
@@ -83,9 +82,6 @@ type Client struct {
 	lifecycleCancel context.CancelFunc
 	dedicated       map[*conn]struct{}
 	dedicatedWG     sync.WaitGroup
-
-	// resumeKick debounces the EAGAIN-triggered immediate session resume.
-	resumeKick atomic.Bool
 
 	// health tracks authority transport reachability (the fail-fast breaker,
 	// see failfast.go); shared by every pooled, subscribe, and probe conn.
@@ -644,6 +640,44 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 // after a lost reply returns the STORED outcome instead of re-executing.
 // Idempotent reads retry once across a re-dial.
 func (c *Client) Do(req *Request) (*Response, error) {
+	return c.DoContext(context.Background(), req)
+}
+
+type authorityWaitContextKey struct{}
+
+// WithAuthorityWait arranges for every DoContext issued with ctx to bracket
+// its complete authority attempt with wait/resume. The hook is intentionally
+// per-call rather than client-global: concurrent frontend operations have
+// independent publication participants. DoContext resumes after the final
+// reply (or joined cancellation) and before typed helpers publish self-write
+// metadata from that reply.
+func WithAuthorityWait(ctx context.Context, wait func() (resume func())) context.Context {
+	if wait == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, authorityWaitContextKey{}, wait)
+}
+
+func beginAuthorityWait(ctx context.Context) func() {
+	wait, _ := ctx.Value(authorityWaitContextKey{}).(func() func())
+	if wait == nil {
+		return func() {}
+	}
+	resume := wait()
+	if resume == nil {
+		return func() {}
+	}
+	return resume
+}
+
+// DoContext is Do with caller lifetime propagation. Cancellation interrupts
+// and joins the checked-out transport before it can be returned to the pool,
+// so an abandoned frontend read cannot remain live and later install a stale
+// authority sample. Exact mutations retain their existing exact-once
+// resolution semantics; their identities cannot be abandoned after send.
+func (c *Client) DoContext(ctx context.Context, req *Request) (*Response, error) {
+	resumeAuthority := beginAuthorityWait(ctx)
+	defer resumeAuthority()
 	if os.Getenv("PFS_WIRE_TRACE") != "" {
 		start := time.Now()
 		defer func() {
@@ -662,6 +696,13 @@ func (c *Client) Do(req *Request) (*Response, error) {
 		defer c.opLat.Time(time.Now()) // time.Now() captured at defer registration = op start
 	}
 	if exactOp(req.Op) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Once an exact identity can be sent, caller cancellation cannot
+		// release the surrounding namespace/delegation exclusion while that
+		// identity may still execute. Resolve through the existing exact-once
+		// path; the authority-wait hook remains suspended until it returns.
 		return c.doExact(req)
 	}
 	if req.Op == OpFlushBatch {
@@ -677,11 +718,27 @@ func (c *Client) Do(req *Request) (*Response, error) {
 			return nil, err
 		}
 	}
-	cn, err := c.takeConn()
+	cn, err := c.takeConnContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { c.conns <- cn }()
+	if ctx.Done() != nil {
+		stopInterrupt := make(chan struct{})
+		interruptDone := make(chan struct{})
+		go func() {
+			defer close(interruptDone)
+			select {
+			case <-ctx.Done():
+				cn.interrupt()
+			case <-stopInterrupt:
+			}
+		}()
+		defer func() {
+			close(stopInterrupt)
+			<-interruptDone
+		}()
+	}
 	var lastErr error
 	for attempt := 0; attempt < opDialAttempts; attempt++ {
 		if attempt >= 2 {
@@ -691,13 +748,18 @@ func (c *Client) Do(req *Request) (*Response, error) {
 			// every further attempt so op traffic against a dead authority
 			// decays instead of hammering.
 			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			case <-c.closed:
 				return nil, lastErr
 			case <-time.After(c.redial.Next()):
 			}
 		}
-		err := c.prepareConn(cn)
+		err := c.prepareConnContext(ctx, cn)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			lastErr = err
 			if errors.Is(err, ErrAuthorityUnreachable) {
 				// Fail-fast engaged: the authority is confirmed unreachable and
@@ -718,9 +780,12 @@ func (c *Client) Do(req *Request) (*Response, error) {
 			}
 			continue
 		}
-		resp, err := cn.roundtrip(req)
+		resp, _, err := cn.roundtripSentWithGateContext(ctx, req, false)
 		if err == nil {
 			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		lastErr = err
 		if errors.Is(err, ErrAuthorityUnreachable) {
@@ -910,7 +975,12 @@ func (c *Client) ReadV(path string, off, n int64) (data []byte, version, gen uin
 
 // ReadVHandle is ReadV addressed by an open file handle's stable ino when handleIno is non-zero.
 func (c *Client) ReadVHandle(path string, handleIno uint64, off, n int64) (data []byte, version, gen uint64, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpRead, Path: path, HandleIno: handleIno, Offset: off, Size: n})
+	return c.ReadVHandleContext(context.Background(), path, handleIno, off, n)
+}
+
+// ReadVHandleContext is ReadVHandle with caller lifetime propagation.
+func (c *Client) ReadVHandleContext(ctx context.Context, path string, handleIno uint64, off, n int64) (data []byte, version, gen uint64, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpRead, Path: path, HandleIno: handleIno, Offset: off, Size: n})
 	if err != nil {
 		return nil, 0, 0, EIO, err
 	}
@@ -921,22 +991,12 @@ func (c *Client) ReadVHandle(path string, handleIno uint64, off, n int64) (data 
 // parentVersion is the parent directory version PLUS ONE; zero means the authority did not provide
 // safe negative-cache metadata.
 func (c *Client) GetattrV(path string) (a Attr, version, gen, parentVersion uint64, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpGetattr, Path: path})
-	if err != nil {
-		return Attr{}, 0, 0, 0, EIO, err
-	}
-	if r.Attr != nil {
-		a = *r.Attr
-	}
-	return a, r.Version, r.Gen, r.ParentVersion, r.Status, nil
+	return c.GetattrVContext(context.Background(), path)
 }
 
-// GetattrVContext is the cancellable exact-sampling form. It uses the
-// session-attached context roundtrip so cancellation interrupts and joins the
-// checked-out transport; callers never leave a stale authority sample running
-// after an exact coherence barrier has timed out.
+// GetattrVContext is the cancellable form used by frontend authority reads.
 func (c *Client) GetattrVContext(ctx context.Context, path string) (a Attr, version, gen, parentVersion uint64, status int32, err error) {
-	r, _, err := c.roundtripAttachedContext(ctx, &Request{Op: OpGetattr, Path: path})
+	r, err := c.DoContext(ctx, &Request{Op: OpGetattr, Path: path})
 	if err != nil {
 		return Attr{}, 0, 0, 0, EIO, err
 	}
@@ -954,7 +1014,11 @@ func (c *Client) WriteV(path string, off int64, data []byte, mode uint32) (count
 
 // WriteVHandle is WriteV addressed by an open file handle's stable ino when handleIno is non-zero.
 func (c *Client) WriteVHandle(path string, handleIno uint64, off int64, data []byte, mode uint32) (count int, version, gen uint64, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpWrite, Path: path, HandleIno: handleIno, Offset: off, Data: data, Mode: mode})
+	return c.WriteVHandleContext(context.Background(), path, handleIno, off, data, mode)
+}
+
+func (c *Client) WriteVHandleContext(ctx context.Context, path string, handleIno uint64, off int64, data []byte, mode uint32) (count int, version, gen uint64, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpWrite, Path: path, HandleIno: handleIno, Offset: off, Data: data, Mode: mode})
 	if err != nil {
 		return 0, 0, 0, EIO, err
 	}
@@ -967,7 +1031,11 @@ func (c *Client) WriteVHandle(path string, handleIno uint64, off int64, data []b
 // AppendVHandle appends data atomically at authority EOF. It is one mutation
 // RPC: no getattr/size read precedes it.
 func (c *Client) AppendVHandle(path string, handleIno uint64, data []byte, mode uint32) (count int, offset int64, version, gen uint64, status int32, err error) {
-	r, err := c.Do(&Request{
+	return c.AppendVHandleContext(context.Background(), path, handleIno, data, mode)
+}
+
+func (c *Client) AppendVHandleContext(ctx context.Context, path string, handleIno uint64, data []byte, mode uint32) (count int, offset int64, version, gen uint64, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{
 		Op: OpWrite, Path: path, HandleIno: handleIno,
 		Append: true, Data: data, Mode: mode,
 	})
@@ -993,7 +1061,11 @@ type LockResult struct {
 // Lock performs an advisory byte-range lock op (getlk/setlk/setlkw) against the single authority,
 // so flock/fcntl are coordinated across machines. lkID is the kernel's per-open lock owner.
 func (c *Client) Lock(path string, mode uint8, lkID, start, end uint64, write, unlock bool) (LockResult, error) {
-	r, err := c.Do(&Request{
+	return c.LockContext(context.Background(), path, mode, lkID, start, end, write, unlock)
+}
+
+func (c *Client) LockContext(ctx context.Context, path string, mode uint8, lkID, start, end uint64, write, unlock bool) (LockResult, error) {
+	r, err := c.DoContext(ctx, &Request{
 		Op: OpLock, Path: path, Owner: c.owner, LkMode: mode, LkID: lkID,
 		LkStart: start, LkEnd: end, LkWrite: write, LkUnlock: unlock,
 	})
@@ -1008,7 +1080,11 @@ func (c *Client) Lock(path string, mode uint8, lkID, start, end uint64, write, u
 // Orphan detaches name from the tree but PARKS its inode so an open handle keeps addressing it by the
 // returned ino after the name is gone. Issued instead of Remove when the mount still holds it open.
 func (c *Client) Orphan(name string) (ino uint64, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpOrphan, Path: name, Owner: c.owner})
+	return c.OrphanContext(context.Background(), name)
+}
+
+func (c *Client) OrphanContext(ctx context.Context, name string) (ino uint64, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpOrphan, Path: name, Owner: c.owner})
 	if err != nil {
 		return 0, EIO, err
 	}
@@ -1099,7 +1175,11 @@ func (c *Client) UnmarkOpenBatch(inos []uint64) (int32, error) {
 
 // GetattrOrphan stats a parked orphan by ino (fstat on an unlinked-but-open fd).
 func (c *Client) GetattrOrphan(ino uint64) (*Attr, int32, error) {
-	r, err := c.Do(&Request{Op: OpGetattr, OrphanIno: ino})
+	return c.GetattrOrphanContext(context.Background(), ino)
+}
+
+func (c *Client) GetattrOrphanContext(ctx context.Context, ino uint64) (*Attr, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpGetattr, OrphanIno: ino})
 	if err != nil {
 		return nil, EIO, err
 	}
@@ -1108,7 +1188,11 @@ func (c *Client) GetattrOrphan(ino uint64) (*Attr, int32, error) {
 
 // ReadOrphan reads a parked orphan by ino (open-after-unlink).
 func (c *Client) ReadOrphan(ino uint64, off, size int64) (data []byte, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpRead, OrphanIno: ino, Offset: off, Size: size})
+	return c.ReadOrphanContext(context.Background(), ino, off, size)
+}
+
+func (c *Client) ReadOrphanContext(ctx context.Context, ino uint64, off, size int64) (data []byte, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpRead, OrphanIno: ino, Offset: off, Size: size})
 	if err != nil {
 		return nil, EIO, err
 	}
@@ -1117,7 +1201,11 @@ func (c *Client) ReadOrphan(ino uint64, off, size int64) (data []byte, status in
 
 // WriteOrphan writes to a parked orphan by ino (open-after-unlink).
 func (c *Client) WriteOrphan(ino uint64, off int64, data []byte) (count int, status int32, err error) {
-	r, err := c.Do(&Request{Op: OpWrite, OrphanIno: ino, Offset: off, Data: data, Owner: c.owner})
+	return c.WriteOrphanContext(context.Background(), ino, off, data)
+}
+
+func (c *Client) WriteOrphanContext(ctx context.Context, ino uint64, off int64, data []byte) (count int, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpWrite, OrphanIno: ino, Offset: off, Data: data, Owner: c.owner})
 	if err != nil {
 		return 0, EIO, err
 	}
@@ -1126,7 +1214,11 @@ func (c *Client) WriteOrphan(ino uint64, off int64, data []byte) (count int, sta
 
 // AppendOrphan atomically appends to a parked open inode.
 func (c *Client) AppendOrphan(ino uint64, data []byte) (count int, offset int64, status int32, err error) {
-	r, err := c.Do(&Request{
+	return c.AppendOrphanContext(context.Background(), ino, data)
+}
+
+func (c *Client) AppendOrphanContext(ctx context.Context, ino uint64, data []byte) (count int, offset int64, status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{
 		Op: OpWrite, OrphanIno: ino, Append: true,
 		Data: data, Owner: c.owner,
 	})
@@ -1138,7 +1230,11 @@ func (c *Client) AppendOrphan(ino uint64, data []byte) (count int, offset int64,
 
 // TruncateOrphan truncates a parked orphan by ino (ftruncate on an unlinked-but-open fd).
 func (c *Client) TruncateOrphan(ino uint64, size int64) (status int32, err error) {
-	r, err := c.Do(&Request{Op: OpTruncate, OrphanIno: ino, Size: size, Owner: c.owner})
+	return c.TruncateOrphanContext(context.Background(), ino, size)
+}
+
+func (c *Client) TruncateOrphanContext(ctx context.Context, ino uint64, size int64) (status int32, err error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpTruncate, OrphanIno: ino, Size: size, Owner: c.owner})
 	if err != nil {
 		return EIO, err
 	}
@@ -1297,7 +1393,12 @@ func (c *Client) Getattr(path string) (*Attr, int32, error) {
 
 // GetattrHandle stats by an open file handle's stable ino when handleIno is non-zero.
 func (c *Client) GetattrHandle(path string, handleIno uint64) (*Attr, int32, error) {
-	r, err := c.Do(&Request{Op: OpGetattr, Path: path, HandleIno: handleIno})
+	return c.GetattrHandleContext(context.Background(), path, handleIno)
+}
+
+// GetattrHandleContext is GetattrHandle with caller lifetime propagation.
+func (c *Client) GetattrHandleContext(ctx context.Context, path string, handleIno uint64) (*Attr, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpGetattr, Path: path, HandleIno: handleIno})
 	if err != nil {
 		return nil, EIO, err
 	}
@@ -1326,7 +1427,12 @@ func (c *Client) Readdir(path string) ([]Dirent, uint64, int32, error) {
 // ReaddirV also returns the directory entry-list coherence version. A versioned
 // frontend can cache the listing until the parent directory version advances.
 func (c *Client) ReaddirV(path string) ([]Dirent, uint64, uint64, int32, error) {
-	r, err := c.Do(&Request{Op: OpReaddir, Path: path})
+	return c.ReaddirVContext(context.Background(), path)
+}
+
+// ReaddirVContext is ReaddirV with caller lifetime propagation.
+func (c *Client) ReaddirVContext(ctx context.Context, path string) ([]Dirent, uint64, uint64, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpReaddir, Path: path})
 	if err != nil {
 		return nil, 0, 0, EIO, err
 	}
@@ -1361,15 +1467,19 @@ func (c *Client) Write(path string, off int64, data []byte, mode uint32) (int32,
 // raced away entirely, synthesize the minimal identity — the mount refreshes
 // on its next lookup.
 func (c *Client) ensureAttr(path, kind string, r *Response) *Attr {
+	return c.ensureAttrContext(context.Background(), path, kind, r)
+}
+
+func (c *Client) ensureAttrContext(ctx context.Context, path, kind string, r *Response) *Attr {
 	if r.Attr != nil || r.Status != OK {
 		return r.Attr
 	}
-	if a, st, err := c.GetattrHandle(path, r.Ino); err == nil && st == OK && a != nil {
+	if a, st, err := c.GetattrHandleContext(ctx, path, r.Ino); err == nil && st == OK && a != nil {
 		return a
 	}
 	if r.Ino != 0 {
-		if a, st, err := c.Getattr(path); err == nil && st == OK && a != nil {
-			return a
+		if a, _, _, _, st, err := c.GetattrVContext(ctx, path); err == nil && st == OK {
+			return &a
 		}
 	}
 	return &Attr{Kind: kind, Ino: r.Ino, Nlink: 1}
@@ -1400,41 +1510,61 @@ func (c *Client) CreateExcl(path string, mode uint32) (*Attr, int32, error) {
 // the registration window: the caller fails the open, exactly like a MarkOpen
 // ENOENT. gen is the authority generation the registration is valid under.
 func (c *Client) CreateRegisterOpen(path string, mode uint32) (*Attr, uint64, int32, error) {
-	return c.create(path, mode, true, false)
+	return c.CreateRegisterOpenContext(context.Background(), path, mode)
+}
+
+func (c *Client) CreateRegisterOpenContext(ctx context.Context, path string, mode uint32) (*Attr, uint64, int32, error) {
+	return c.createContext(ctx, path, mode, true, false)
 }
 
 // CreateExclRegisterOpen fuses wire-level O_EXCL (see CreateExcl) with open
 // registration (see CreateRegisterOpen) in one round-trip.
 func (c *Client) CreateExclRegisterOpen(path string, mode uint32) (*Attr, uint64, int32, error) {
-	return c.create(path, mode, true, true)
+	return c.CreateExclRegisterOpenContext(context.Background(), path, mode)
+}
+
+func (c *Client) CreateExclRegisterOpenContext(ctx context.Context, path string, mode uint32) (*Attr, uint64, int32, error) {
+	return c.createContext(ctx, path, mode, true, true)
 }
 
 func (c *Client) create(path string, mode uint32, registerOpen, excl bool) (*Attr, uint64, int32, error) {
-	r, err := c.Do(&Request{Op: OpCreate, Path: path, Mode: mode, RegisterOpen: registerOpen, Excl: excl})
+	return c.createContext(context.Background(), path, mode, registerOpen, excl)
+}
+
+func (c *Client) createContext(ctx context.Context, path string, mode uint32, registerOpen, excl bool) (*Attr, uint64, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpCreate, Path: path, Mode: mode, RegisterOpen: registerOpen, Excl: excl})
 	if err != nil {
 		return nil, 0, EIO, err
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, false)
 	}
-	return c.ensureAttr(path, "file", r), r.Gen, r.Status, nil
+	return c.ensureAttrContext(ctx, path, "file", r), r.Gen, r.Status, nil
 }
 
 // Mkdir makes a directory and returns its attributes.
 func (c *Client) Mkdir(path string, mode uint32) (*Attr, int32, error) {
-	r, err := c.Do(&Request{Op: OpMkdir, Path: path, Mode: mode})
+	return c.MkdirContext(context.Background(), path, mode)
+}
+
+func (c *Client) MkdirContext(ctx context.Context, path string, mode uint32) (*Attr, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpMkdir, Path: path, Mode: mode})
 	if err != nil {
 		return nil, EIO, err
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, false)
 	}
-	return c.ensureAttr(path, "directory", r), r.Status, nil
+	return c.ensureAttrContext(ctx, path, "directory", r), r.Status, nil
 }
 
 // Remove deletes a file or empty directory.
 func (c *Client) Remove(path string) (int32, error) {
-	r, err := c.Do(&Request{Op: OpRemove, Path: path})
+	return c.RemoveContext(context.Background(), path)
+}
+
+func (c *Client) RemoveContext(ctx context.Context, path string) (int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpRemove, Path: path})
 	if err != nil {
 		return EIO, err
 	}
@@ -1454,7 +1584,11 @@ func (c *Client) Rename(oldPath, newPath string) (int32, error) {
 // open at this mount, the authority parks the replaced destination by ino and returns it (so the
 // mount keeps serving the open fds by ino — rename-over-an-open-file). orphanTarget=false is plain rename.
 func (c *Client) RenameWithOrphanTarget(oldPath, newPath string, orphanTarget bool) (int32, uint64, error) {
-	r, err := c.Do(&Request{Op: OpRename, Path: oldPath, NewPath: newPath, OrphanTarget: orphanTarget})
+	return c.RenameWithOrphanTargetContext(context.Background(), oldPath, newPath, orphanTarget)
+}
+
+func (c *Client) RenameWithOrphanTargetContext(ctx context.Context, oldPath, newPath string, orphanTarget bool) (int32, uint64, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpRename, Path: oldPath, NewPath: newPath, OrphanTarget: orphanTarget})
 	if err != nil {
 		return EIO, 0, err
 	}
@@ -1470,20 +1604,28 @@ func (c *Client) RenameWithOrphanTarget(oldPath, newPath string, orphanTarget bo
 
 // Symlink creates link -> target and returns the link's attributes.
 func (c *Client) Symlink(target, link string) (*Attr, int32, error) {
-	r, err := c.Do(&Request{Op: OpSymlink, Path: link, Target: target})
+	return c.SymlinkContext(context.Background(), target, link)
+}
+
+func (c *Client) SymlinkContext(ctx context.Context, target, link string) (*Attr, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpSymlink, Path: link, Target: target})
 	if err != nil {
 		return nil, EIO, err
 	}
 	if r.Status == OK {
 		c.selfWrote(link, r, false)
 	}
-	return c.ensureAttr(link, "symlink", r), r.Status, nil
+	return c.ensureAttrContext(ctx, link, "symlink", r), r.Status, nil
 }
 
 // Link adds newPath as another name for oldPath's non-directory inode. The
 // returned attributes describe the shared inode after nlink increments.
 func (c *Client) Link(oldPath, newPath string) (*Attr, int32, error) {
-	r, err := c.Do(&Request{Op: OpLink, Path: oldPath, NewPath: newPath})
+	return c.LinkContext(context.Background(), oldPath, newPath)
+}
+
+func (c *Client) LinkContext(ctx context.Context, oldPath, newPath string) (*Attr, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpLink, Path: oldPath, NewPath: newPath})
 	if err != nil {
 		return nil, EIO, err
 	}
@@ -1491,12 +1633,17 @@ func (c *Client) Link(oldPath, newPath string) (*Attr, int32, error) {
 		c.selfWrote(oldPath, r, false)
 		c.selfWrote(newPath, r, false)
 	}
-	return c.ensureAttr(newPath, "file", r), r.Status, nil
+	return c.ensureAttrContext(ctx, newPath, "file", r), r.Status, nil
 }
 
 // Readlink returns a symlink's target.
 func (c *Client) Readlink(path string) (string, int32, error) {
-	r, err := c.Do(&Request{Op: OpReadlink, Path: path})
+	return c.ReadlinkContext(context.Background(), path)
+}
+
+// ReadlinkContext is Readlink with caller lifetime propagation.
+func (c *Client) ReadlinkContext(ctx context.Context, path string) (string, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpReadlink, Path: path})
 	if err != nil {
 		return "", EIO, err
 	}
@@ -1537,6 +1684,27 @@ func (c *Client) SetattrTimesHandle(
 	uid, gid uint32,
 	setUID, setGID bool,
 ) (int32, error) {
+	return c.SetattrTimesHandleContext(
+		context.Background(),
+		path, handleIno, mode, setMode,
+		mtimeMs, setTime, atimeMs, setATime,
+		uid, gid, setUID, setGID,
+	)
+}
+
+func (c *Client) SetattrTimesHandleContext(
+	ctx context.Context,
+	path string,
+	handleIno uint64,
+	mode uint32,
+	setMode bool,
+	mtimeMs int64,
+	setTime bool,
+	atimeMs int64,
+	setATime bool,
+	uid, gid uint32,
+	setUID, setGID bool,
+) (int32, error) {
 	groups := make([]*Request, 0, 3)
 	if setMode {
 		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, Mode: mode, SetMode: true})
@@ -1553,7 +1721,7 @@ func (c *Client) SetattrTimesHandle(
 	}
 	if len(groups) != 1 {
 		for _, g := range groups {
-			r, err := c.Do(g)
+			r, err := c.DoContext(ctx, g)
 			if err != nil {
 				return EIO, err
 			}
@@ -1564,7 +1732,7 @@ func (c *Client) SetattrTimesHandle(
 		}
 		return OK, nil
 	}
-	r, err := c.Do(&Request{
+	r, err := c.DoContext(ctx, &Request{
 		Op: OpSetattr, Path: path, HandleIno: handleIno,
 		Mode: mode, SetMode: setMode,
 		MtimeMs: mtimeMs, SetTime: setTime,
@@ -1585,7 +1753,12 @@ func (c *Client) SetattrTimesHandle(
 // Getxattr reads one extended attribute. handleIno addresses an open handle's
 // stable ino when non-zero (named or parked orphan). ENODATA = not present.
 func (c *Client) Getxattr(path string, handleIno uint64, name string) ([]byte, int32, error) {
-	r, err := c.Do(&Request{Op: OpGetxattr, Path: path, HandleIno: handleIno, XattrName: name})
+	return c.GetxattrContext(context.Background(), path, handleIno, name)
+}
+
+// GetxattrContext is Getxattr with caller lifetime propagation.
+func (c *Client) GetxattrContext(ctx context.Context, path string, handleIno uint64, name string) ([]byte, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpGetxattr, Path: path, HandleIno: handleIno, XattrName: name})
 	if err != nil {
 		return nil, EIO, err
 	}
@@ -1594,7 +1767,12 @@ func (c *Client) Getxattr(path string, handleIno uint64, name string) ([]byte, i
 
 // Listxattr lists the extended-attribute names of path (sorted).
 func (c *Client) Listxattr(path string, handleIno uint64) ([]string, int32, error) {
-	r, err := c.Do(&Request{Op: OpListxattr, Path: path, HandleIno: handleIno})
+	return c.ListxattrContext(context.Background(), path, handleIno)
+}
+
+// ListxattrContext is Listxattr with caller lifetime propagation.
+func (c *Client) ListxattrContext(ctx context.Context, path string, handleIno uint64) ([]string, int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpListxattr, Path: path, HandleIno: handleIno})
 	if err != nil {
 		return nil, EIO, err
 	}
@@ -1610,7 +1788,11 @@ func (c *Client) Setxattr(path string, handleIno uint64, name string, value []by
 // SetxattrFlags applies wal.XattrCreate/wal.XattrReplace atomically at the
 // authority's ordered mutation position.
 func (c *Client) SetxattrFlags(path string, handleIno uint64, name string, value []byte, flags uint8) (int32, error) {
-	r, err := c.Do(&Request{
+	return c.SetxattrFlagsContext(context.Background(), path, handleIno, name, value, flags)
+}
+
+func (c *Client) SetxattrFlagsContext(ctx context.Context, path string, handleIno uint64, name string, value []byte, flags uint8) (int32, error) {
+	r, err := c.DoContext(ctx, &Request{
 		Op: OpSetxattr, Path: path, HandleIno: handleIno,
 		XattrName: name, XattrFlags: flags, Data: value,
 	})
@@ -1625,7 +1807,11 @@ func (c *Client) SetxattrFlags(path string, handleIno uint64, name string, value
 
 // Removexattr removes one extended attribute; a missing name is ENODATA.
 func (c *Client) Removexattr(path string, handleIno uint64, name string) (int32, error) {
-	r, err := c.Do(&Request{Op: OpRemovexattr, Path: path, HandleIno: handleIno, XattrName: name})
+	return c.RemovexattrContext(context.Background(), path, handleIno, name)
+}
+
+func (c *Client) RemovexattrContext(ctx context.Context, path string, handleIno uint64, name string) (int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpRemovexattr, Path: path, HandleIno: handleIno, XattrName: name})
 	if err != nil {
 		return EIO, err
 	}
@@ -1642,7 +1828,11 @@ func (c *Client) Truncate(path string, size int64) (int32, error) {
 
 // TruncateHandle truncates by an open file handle's stable ino when handleIno is non-zero.
 func (c *Client) TruncateHandle(path string, handleIno uint64, size int64) (int32, error) {
-	r, err := c.Do(&Request{Op: OpTruncate, Path: path, HandleIno: handleIno, Size: size})
+	return c.TruncateHandleContext(context.Background(), path, handleIno, size)
+}
+
+func (c *Client) TruncateHandleContext(ctx context.Context, path string, handleIno uint64, size int64) (int32, error) {
+	r, err := c.DoContext(ctx, &Request{Op: OpTruncate, Path: path, HandleIno: handleIno, Size: size})
 	if err != nil {
 		return EIO, err
 	}

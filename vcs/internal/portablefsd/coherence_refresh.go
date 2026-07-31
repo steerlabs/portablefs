@@ -350,9 +350,9 @@ type frontendOperation struct {
 type frontendOperationContextKey struct{}
 
 type frontendOperationParticipant struct {
-	op        *frontendOperation
-	suspended bool
-	finished  bool
+	op           *frontendOperation
+	suspendDepth int
+	finished     bool
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -544,8 +544,8 @@ func (a *attach) finishFrontendParticipant(participant *frontendOperationPartici
 	}
 	participant.finished = true
 	op := participant.op
-	if participant.suspended {
-		participant.suspended = false
+	if participant.suspendDepth > 0 {
+		participant.suspendDepth = 0
 		if op.suspended > 0 {
 			op.suspended--
 		}
@@ -574,9 +574,11 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 	}
 	op := participant.op
 	a.frontendGateMu.Lock()
-	if !op.completed && !participant.finished && !participant.suspended {
-		participant.suspended = true
-		op.suspended++
+	if !op.completed && !participant.finished {
+		if participant.suspendDepth == 0 {
+			op.suspended++
+		}
+		participant.suspendDepth++
 	}
 	if !op.completed && op.gateActive &&
 		op.participants > 0 && op.suspended == op.participants {
@@ -585,21 +587,29 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 		a.frontendGateCond.Broadcast()
 	}
 	a.frontendGateMu.Unlock()
+	resumed := false
 	return func() {
 		a.frontendGateMu.Lock()
 		defer a.frontendGateMu.Unlock()
+		if resumed {
+			return
+		}
+		resumed = true
 		stopWake := context.AfterFunc(ctx, func() {
 			a.frontendGateMu.Lock()
 			a.frontendGateCond.Broadcast()
 			a.frontendGateMu.Unlock()
 		})
 		defer stopWake()
-		if participant.finished || !participant.suspended {
+		if participant.finished || participant.suspendDepth == 0 {
+			return
+		}
+		participant.suspendDepth--
+		if participant.suspendDepth > 0 {
 			return
 		}
 		for !op.completed {
 			if ctx.Err() != nil {
-				participant.suspended = false
 				if op.suspended > 0 {
 					op.suspended--
 				}
@@ -615,7 +625,6 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 				}
 			}
 			if !blocked {
-				participant.suspended = false
 				if op.suspended > 0 {
 					op.suspended--
 				}

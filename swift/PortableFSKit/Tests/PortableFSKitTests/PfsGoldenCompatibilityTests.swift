@@ -87,3 +87,50 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     expectedEnvelope.body = .helloReply(expectedReply)
     try assertFrameRoundTrip(expectedEnvelope, golden: frame)
 }
+
+@Test func goAttrParentAndFlagsGoldenDecodesAndReencodesByteIdentically() throws {
+    let frame = try goldenFrame("attr_parent_flags.hex")
+    let envelope = try decodeSingleGoldenEnvelope(frame)
+
+    #expect(envelope.requestID == 53)
+    guard case let .getAttrReply(reply)? = envelope.body else {
+        Issue.record("expected getAttrReply body, got \(String(describing: envelope.body))")
+        return
+    }
+    #expect(reply.attr.item.itemID == 23)
+    #expect(reply.attr.item.itemGeneration == 29)
+    #expect(reply.attr.hasParent)
+    #expect(reply.attr.parent.itemID == 17)
+    #expect(reply.attr.parent.itemGeneration == 19)
+    #expect(reply.attr.flags == 0x00008000)
+    #expect(reply.attr.allocSize == 8192)
+
+    var item = PfsItem()
+    item.itemID = 23
+    item.itemGeneration = 29
+    var parent = PfsItem()
+    parent.itemID = 17
+    parent.itemGeneration = 19
+    var attr = PfsAttr()
+    attr.item = item
+    attr.kind = .file
+    attr.mode = 0o640
+    attr.nlink = 2
+    attr.uid = 501
+    attr.gid = 20
+    attr.size = 4097
+    attr.mtimeMs = 31
+    attr.ctimeMs = 37
+    attr.atimeMs = 41
+    attr.birthtimeMs = 43
+    attr.contentVersion = 47
+    attr.parent = parent
+    attr.flags = 0x00008000
+    attr.allocSize = 8192
+    var expectedReply = PfsGetAttrReply()
+    expectedReply.attr = attr
+    var expectedEnvelope = PfsEnvelope()
+    expectedEnvelope.requestID = 53
+    expectedEnvelope.body = .getAttrReply(expectedReply)
+    try assertFrameRoundTrip(expectedEnvelope, golden: frame)
+}
