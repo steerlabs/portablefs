@@ -66,14 +66,37 @@ can fail UPSTREAM_UNREACHABLE (502) while the router warms; the intent
 machinery preserves and later reconciles these correctly, but deploy
 tooling should gate on a lease-create probe, not just /readyz.
 
-### 6. Transient ENODATA reading a peer's just-created file
+### 6. Handle close drains its backlog inside the op pipeline
+
+Reproduced live on the fixed build (deliberate saturation): the ENOSPC
+admission contract held perfectly (definite refusals in ~11s, metadata
+responsive throughout the flood, engine unpoisoned) — but CLOSING the
+flooded handle with ~2 GB of admitted backlog drained synchronously in
+the frontend op pipeline. Unrelated stats queued behind it until the
+kernel timed out the volume and declared it dead; with the frontend
+gone, the drain then stalled permanently (97 MB pending, no failure
+recorded) because release completion awaits a frontend publication
+acknowledgment that a dead frontend can never send. Recovery worked
+(force-detach parked the tail as a durable job; no reboot), but three
+root fixes fall out:
+- close(2) must not synchronously drain admitted data — fsync is the
+  durability barrier; close returns after WAL admission and the engine
+  owns the drain (same contract as Open §1, handle lane);
+- drain completion must not depend on a live frontend (the publication
+  ack path must treat frontend death as a definite non-ack);
+- the CLI umount preflight must classify an unresponsive/EIO mountpoint
+  with NO kernel mount but a LIVE attach as the daemon-owned detach
+  case (today only EIO-with-matching-kernel-mount proceeds; this shape
+  refuses, and the only recovery is the daemon control API directly).
+
+### 7. Transient ENODATA reading a peer's just-created file
 
 Observed once (two-Mac stress): `read peer done marker: no message
 available on STREAM` immediately after the file became visible; retry
 succeeded implicitly. Not yet reproduced or root-caused; needs a repro
 with daemon tracing before any code changes.
 
-### 7. macOS FSKit platform gaps (Apple; Feedback radars to file)
+### 9. macOS FSKit platform gaps (Apple; Feedback radars to file)
 
 Kernel-verified on macOS 26:
 - Negative dentries are cached permanently: no revalidation against
