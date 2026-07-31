@@ -219,7 +219,7 @@ func TestRegisterReincarnatedHardLinkSplitsIdentityIndexes(t *testing.T) {
 	if alias.item != old.item || alias.state != old.state {
 		t.Fatalf("initial hard links split identity: a=%+v b=%+v", old, alias)
 	}
-	oldHandle := a.newHandleLocked("a", old.item.ItemID, old.state, false)
+	oldHandle := a.newHandleLocked("a", old.item.ItemID, old.state, false, false)
 
 	replacement := a.registerLocked("a", fsproto.Attr{Ino: 99, Kind: "file", Nlink: 1, Size: 7})
 	if replacement.item == old.item || replacement.state == old.state {

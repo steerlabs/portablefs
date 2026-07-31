@@ -152,6 +152,13 @@ const (
 type OpenRequest struct {
 	Item Item
 	Mode OpenMode
+	// Append carries O_APPEND as a STICKY property of the descriptor. Every
+	// write through the resulting handle is then resolved at the authority's
+	// EOF in sequencer order, never at a frontend-computed absolute offset —
+	// which is the only way concurrent appends from two machines cannot
+	// collide. Frontends that learn the intent per-write instead set
+	// WriteRequest.Append.
+	Append bool
 }
 type OpenReply struct{ Handle uint64 }
 
@@ -172,6 +179,11 @@ type WriteRequest struct {
 	Handle uint64
 	Offset uint64
 	Data   []byte
+	// Append requests O_APPEND semantics for THIS write: the authority (or,
+	// under an exclusive delegation, the locally authoritative view) picks the
+	// offset at EOF. Offset must be zero and is ignored. A handle opened with
+	// OpenRequest.Append/CreateRequest.Append appends regardless of this bit.
+	Append bool
 }
 type WriteReply struct {
 	Written uint32
@@ -186,6 +198,9 @@ type CreateRequest struct {
 	Name      []byte
 	Mode      uint32
 	Exclusive bool
+	// Append is O_APPEND on the O_CREAT open, sticky on the returned handle
+	// exactly as for OpenRequest.Append.
+	Append bool
 }
 type CreateReply struct {
 	Attr   Attr

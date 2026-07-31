@@ -489,14 +489,23 @@ func appendEnumeratePageMode(t *testing.T, c *pfsTestClient, root pfslocal.Item,
 	if page.NextCookie != 0 && page.NextCookie&enumerateCookieMarker == 0 {
 		t.Fatalf("next cookie %#x is not in the high-bit portablefsd namespace", page.NextCookie)
 	}
-	if page.NextCookie != 0 && page.NextCookie&enumerateCookieReservedMask != 0 {
-		t.Fatalf("next cookie %#x low bits are not reserved zero", page.NextCookie)
+	if page.NextCookie != 0 && page.NextCookie&enumerateCookieTagMask != enumerateCookieTagCursor {
+		t.Fatalf("next cookie %#x is not tagged as a name-cursor cookie", page.NextCookie)
 	}
 	return page.NextCookie
 }
 
+// assertExactNames compares a completed enumeration against the expected name
+// set. Enumeration order is the file system's own (name-cursor order), which
+// POSIX leaves unspecified and every consumer that wants alphabetical order
+// sorts for itself; what the paging contract owes callers is every name exactly
+// once.
 func assertExactNames(t *testing.T, got, want []string) {
 	t.Helper()
+	got = append([]string(nil), got...)
+	want = append([]string(nil), want...)
+	sort.Strings(got)
+	sort.Strings(want)
 	if len(got) != len(want) {
 		n := len(got)
 		if n > 10 {
@@ -525,56 +534,6 @@ func enumerateAllPFSMode(t *testing.T, c *pfsTestClient, root pfslocal.Item, max
 		cookie = appendEnumeratePageMode(t, c, root, cookie, max, wantAttrs, &names, seen)
 		if cookie == 0 {
 			return names
-		}
-	}
-}
-
-func TestEnumerationCookieEncodingOpaqueHighBitOnly(t *testing.T) {
-	cases := []struct {
-		enumID uint64
-		pos    int
-	}{
-		{1, 1},
-		{42, 256},
-		{enumerateCookieMaxID, int(enumerateCookieMaxPos)},
-	}
-	for _, tc := range cases {
-		cookie, ok := encodeEnumerationCookie(tc.enumID, tc.pos)
-		if !ok {
-			t.Fatalf("encodeEnumerationCookie(%d, %d) failed", tc.enumID, tc.pos)
-		}
-		if cookie&enumerateCookieMarker == 0 {
-			t.Fatalf("encoded cookie %#x is not high-bit-set", cookie)
-		}
-		if cookie&enumerateCookieReservedMask != 0 {
-			t.Fatalf("encoded cookie %#x has nonzero reserved bits", cookie)
-		}
-		enumID, pos, ok := decodeEnumerationCookie(cookie)
-		if !ok || enumID != tc.enumID || pos != tc.pos {
-			t.Fatalf("decodeEnumerationCookie(%#x)=(%d,%d,%v), want (%d,%d,true)", cookie, enumID, pos, ok, tc.enumID, tc.pos)
-		}
-		for _, bad := range []uint64{cookie | 1, cookie | 2, cookie | 3} {
-			if enumID, pos, ok := decodeEnumerationCookie(bad); ok {
-				t.Fatalf("decodeEnumerationCookie(%#x)=(%d,%d,true), want stale", bad, enumID, pos)
-			}
-		}
-	}
-	for _, bad := range []uint64{1, 2, 3, ^uint64(0)} {
-		if enumID, pos, ok := decodeEnumerationCookie(bad); ok {
-			t.Fatalf("decodeEnumerationCookie(%#x)=(%d,%d,true), want stale", bad, enumID, pos)
-		}
-	}
-	for _, tc := range []struct {
-		enumID uint64
-		pos    int
-	}{
-		{0, 1},
-		{1, 0},
-		{enumerateCookieMaxID + 1, 1},
-		{1, int(enumerateCookieMaxPos) + 1},
-	} {
-		if cookie, ok := encodeEnumerationCookie(tc.enumID, tc.pos); ok {
-			t.Fatalf("encodeEnumerationCookie(%d, %d)=(%#x,true), want false", tc.enumID, tc.pos, cookie)
 		}
 	}
 }
@@ -2194,15 +2153,20 @@ func TestDaemonEnumerateOffsetCookieFailsSafe(t *testing.T) {
 	res := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
 
 	page := c.call(&pfslocal.EnumerateRequest{Dir: res.Root, MaxEntries: 1, WantAttrs: false}).(*pfslocal.EnumerateReply)
-	if page.NextCookie == 0 || page.NextCookie&enumerateCookieMarker == 0 || page.NextCookie&enumerateCookieReservedMask != 0 {
-		t.Fatalf("next cookie=%#x, want high-bit reserved-zero continuation", page.NextCookie)
+	if page.NextCookie == 0 || page.NextCookie&enumerateCookieMarker == 0 || page.NextCookie&enumerateCookieTagMask != enumerateCookieTagCursor {
+		t.Fatalf("next cookie=%#x, want high-bit cursor-tagged continuation", page.NextCookie)
 	}
-	if er := c.callErr(&pfslocal.EnumerateRequest{Dir: res.Root, Cookie: page.NextCookie + 2, MaxEntries: 1, WantAttrs: false}); er.Errno != darwinESTALE {
-		t.Fatalf("offset cookie errno=%d want ESTALE", er.Errno)
+	// Anything that is not a cookie this daemon minted -- a hand-rolled offset,
+	// a pre-fix positional token (tag 0), a frontend sentinel -- must fail safe
+	// rather than be misread as a cursor and silently truncate the listing.
+	for _, bad := range []uint64{page.NextCookie + 2, page.NextCookie &^ enumerateCookieTagMask, page.NextCookie &^ enumerateCookieMarker, 3} {
+		if er := c.callErr(&pfslocal.EnumerateRequest{Dir: res.Root, Cookie: bad, MaxEntries: 1, WantAttrs: false}); er.Errno != darwinESTALE {
+			t.Fatalf("foreign cookie %#x errno=%d want ESTALE", bad, er.Errno)
+		}
 	}
 }
 
-func TestDaemonEnumerateConcurrentSameDirSnapshotsAreIsolated(t *testing.T) {
+func TestDaemonEnumerateConcurrentSameDirWalksAreIndependent(t *testing.T) {
 	authority := serveAuthority(t)
 	want := seedAuthorityAppleDoubleFiles(t, authority, 1200)
 
@@ -2239,8 +2203,7 @@ func TestDaemonEnumerateConcurrentSameDirSnapshotsAreIsolated(t *testing.T) {
 	waitUnix(t, cfg.FrontendSocket)
 	hc := httpUDSClient(cfg.ControlSocket)
 	ref := ensureAttach(t, hc, authority, "vol-enum-concurrent", "main", "/Volumes/EnumConcurrent")
-	a := srv.registry.get(ref)
-	if a == nil {
+	if a := srv.registry.get(ref); a == nil {
 		t.Fatal("attach missing after ensure")
 	}
 
@@ -2277,14 +2240,9 @@ func TestDaemonEnumerateConcurrentSameDirSnapshotsAreIsolated(t *testing.T) {
 			t.Fatalf("timed out waiting for enumeration %d first page", i)
 		}
 	}
-	a.mu.RLock()
-	live := len(a.enumRecords)
-	a.mu.RUnlock()
-	if live != workers {
-		close(release)
-		wg.Wait()
-		t.Fatalf("live enumeration records=%d want %d", live, workers)
-	}
+	// Concurrent walks share no server-side enumeration state at all: each
+	// cookie is a self-describing position in the directory's own order, so
+	// five interleaved walks cannot evict or disturb one another.
 	close(release)
 	wg.Wait()
 	for i := 0; i < workers; i++ {
@@ -2292,7 +2250,11 @@ func TestDaemonEnumerateConcurrentSameDirSnapshotsAreIsolated(t *testing.T) {
 	}
 }
 
-func TestDaemonEnumerateStaleCookieAfterRestartFailsSafe(t *testing.T) {
+// TestDaemonEnumerateCookieSurvivesDaemonRestart: a cookie names a position in
+// the directory's own name-cursor order, not a slot in some daemon's memory, so
+// a walk interrupted by a daemon restart resumes instead of blowing up in the
+// caller's readdir loop.
+func TestDaemonEnumerateCookieSurvivesDaemonRestart(t *testing.T) {
 	authority := serveAuthority(t)
 	want := seedAuthorityFiles(t, authority, 4)
 	bin := buildPortablefsdTestBinary(t)
@@ -2324,35 +2286,14 @@ func TestDaemonEnumerateStaleCookieAfterRestartFailsSafe(t *testing.T) {
 	defer c2.close()
 	c2.call(&pfslocal.Hello{ProtocolMajor: 1})
 	res2 := c2.call(&pfslocal.ResolveRequest{AttachRef: ref2}).(*pfslocal.ResolveReply)
-	if er := c2.callErr(&pfslocal.EnumerateRequest{Dir: res2.Root, Cookie: staleCookie, MaxEntries: 1, WantAttrs: true}); er.Errno != darwinESTALE {
-		t.Fatalf("stale restart cookie errno=%d want ESTALE", er.Errno)
+	resumed := []string{string(page1.Entries[0].Name)}
+	seen := map[string]bool{resumed[0]: true}
+	cookie := staleCookie
+	for cookie != 0 {
+		cookie = appendEnumeratePage(t, c2, res2.Root, cookie, 2, &resumed, seen)
 	}
+	assertExactNames(t, resumed, want)
 	assertExactNames(t, enumerateAllPFS(t, c2, res2.Root, 2), want)
-}
-
-func TestDaemonEnumerateLRUEvictionFailsSafe(t *testing.T) {
-	authority := serveAuthority(t)
-	seedAuthorityFiles(t, authority, 3)
-	cfg, _, ref, cancel := startDaemon(t, authority)
-	defer cancel()
-	c := dialPFS(t, cfg.FrontendSocket)
-	defer c.close()
-	c.call(&pfslocal.Hello{ProtocolMajor: 1})
-	res := c.call(&pfslocal.ResolveRequest{AttachRef: ref}).(*pfslocal.ResolveReply)
-
-	var firstCookie uint64
-	for i := 0; i < maxLiveEnumerations+1; i++ {
-		page := c.call(&pfslocal.EnumerateRequest{Dir: res.Root, MaxEntries: 1, WantAttrs: true}).(*pfslocal.EnumerateReply)
-		if page.NextCookie == 0 || page.NextCookie&enumerateCookieMarker == 0 {
-			t.Fatalf("enumeration %d next cookie=%#x, want high-bit continuation", i, page.NextCookie)
-		}
-		if i == 0 {
-			firstCookie = page.NextCookie
-		}
-	}
-	if er := c.callErr(&pfslocal.EnumerateRequest{Dir: res.Root, Cookie: firstCookie, MaxEntries: 1, WantAttrs: true}); er.Errno != darwinESTALE {
-		t.Fatalf("LRU-evicted cookie errno=%d want ESTALE", er.Errno)
-	}
 }
 
 func writeControlFile(t *testing.T, hc *http.Client, ref, p, data string) {

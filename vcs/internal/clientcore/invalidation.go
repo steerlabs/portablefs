@@ -37,6 +37,12 @@ type InvalidationOptions struct {
 	ClearRecent func()
 	Debugf      func(string, ...any)
 
+	// Anchored fires each time the authority confirms this mount is a
+	// registered subscriber (the stream's bootstrap message) and the caches
+	// have been fenced against everything filled before that point. Frontends
+	// use the first call as "this mount may now serve cached reads".
+	Anchored func()
+
 	// sleep overrides the resubscribe wait (tests observe the backoff
 	// schedule without real sleeps). nil = a ctx-aware timer sleep.
 	sleep func(ctx context.Context, d time.Duration)
@@ -45,6 +51,12 @@ type InvalidationOptions struct {
 func (o InvalidationOptions) clearRecent() {
 	if o.ClearRecent != nil {
 		o.ClearRecent()
+	}
+}
+
+func (o InvalidationOptions) anchored() {
+	if o.Anchored != nil {
+		o.Anchored()
 	}
 }
 
@@ -91,6 +103,31 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 		versions.Reset()
 		streamToken := versions.CaptureToken()
 		for batch := range stream {
+			if batch.Bootstrap {
+				// SUBSCRIPTION ANCHOR. The flush above happened when the
+				// subscribe REQUEST was written; the authority only added this
+				// mount to its subscriber set (and snapshotted the stream
+				// position) later, when it read that request. Every mutation
+				// committed in between was published to a set this mount was
+				// not in, and the stream has no replay — so those events are
+				// gone forever. Anything cached in that window would then be
+				// stale with no event left that could evict it, which is how a
+				// peer's create stayed invisible for minutes.
+				//
+				// Adopting the generation below cannot close that window: a
+				// frontend read racing the subscribe already adopts the same
+				// generation, after which AcceptGeneration is a no-op and the
+				// pre-registration fills survive. The bootstrap is the exact
+				// point at which the authority guarantees "from here on you get
+				// every event", so it fences unconditionally instead.
+				h.FlushAll()
+				opts.clearRecent()
+				attrs.Clear()
+				streamToken = versions.AnchorSubscription(bootstrapGen(batch))
+				opts.debugf("invalidation stream anchored gen=%d pos=%d",
+					bootstrapGen(batch), batch.Pos)
+				opts.anchored()
+			}
 			for _, inv := range batch.Invs {
 				generationOK := true
 				if inv.Gen != 0 {
@@ -200,6 +237,18 @@ func WatchInvalidations(ctx context.Context, sub InvalidationSubscriber, version
 		attrs.Clear()
 		versions.Reset()
 	}
+}
+
+// bootstrapGen reads the authority generation the stream announced in its
+// bootstrap message. A source without generations reports zero, which anchors
+// the caches to "unknown generation" exactly like a fresh Reset.
+func bootstrapGen(batch coherence.Batch) uint64 {
+	for _, inv := range batch.Invs {
+		if inv.Gen != 0 {
+			return inv.Gen
+		}
+	}
+	return 0
 }
 
 func parentPath(p string) string {

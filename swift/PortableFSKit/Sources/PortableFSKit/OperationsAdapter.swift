@@ -15,6 +15,10 @@ private final class PfsUncheckedSendableBox<Value>: @unchecked Sendable {
 struct PfsSyntheticDirectoryEntry: Sendable, Equatable {
     var name: Data
     var nextCookie: UInt64
+    /// `".."` must be packed with the parent's identifier, not the enumerated
+    /// directory's own. The name is the only thing distinguishing them, so the
+    /// planner records the distinction rather than making the packer re-parse.
+    var isParentEntry: Bool = false
 }
 
 enum PfsEnumerationCookies {
@@ -24,6 +28,9 @@ enum PfsEnumerationCookies {
     static let entriesStartCookie: UInt64 = 2
     static let daemonCookieMarker: UInt64 = 1 << 63
     static let terminalCookie = UInt64.max
+    /// `FSDirectoryVerifierInitial`, the value FSKit passes on a fresh walk.
+    @available(macOS 26.0, *)
+    static var initialVerifier: UInt64 { FSDirectoryVerifier.initial.rawValue }
 
     /// FSKit enumeration cookie state machine.
     ///
@@ -55,6 +62,10 @@ enum PfsEnumerationCookies {
         throw PfsLocalClientError.daemon(errno: ESTALE, message: "invalid directory cookie")
     }
 
+    /// FSKit's `enumerateDirectory` documentation is explicit that `"."` and
+    /// `".."` belong to attribute-free enumerations only: "Don't pack `.` and
+    /// `..` if `attributes` isn't `nil`." Readdir-plus therefore stays
+    /// synthetic-free and FSKit supplies the two entries itself.
     static func syntheticEntries(for cookie: UInt64, attributesRequested: Bool) throws -> [PfsSyntheticDirectoryEntry] {
         guard !attributesRequested else {
             return []
@@ -63,17 +74,31 @@ enum PfsEnumerationCookies {
         case dotCookie:
             return [
                 PfsSyntheticDirectoryEntry(name: Data(".".utf8), nextCookie: dotDotCookie),
-                PfsSyntheticDirectoryEntry(name: Data("..".utf8), nextCookie: entriesStartCookie)
+                PfsSyntheticDirectoryEntry(
+                    name: Data("..".utf8), nextCookie: entriesStartCookie, isParentEntry: true
+                )
             ]
         case dotDotCookie:
             return [
-                PfsSyntheticDirectoryEntry(name: Data("..".utf8), nextCookie: entriesStartCookie)
+                PfsSyntheticDirectoryEntry(
+                    name: Data("..".utf8), nextCookie: entriesStartCookie, isParentEntry: true
+                )
             ]
         case entriesStartCookie:
             return []
         default:
             return []
         }
+    }
+
+    /// A fresh walk is one FSKit starts from `FSDirectoryCookieInitial`, or one
+    /// whose verifier is still `FSDirectoryVerifierInitial` (the synthetic "."
+    /// and ".." positions are the same walk, but the kernel has not been given
+    /// a verifier to echo back yet). Everything else is a continuation whose
+    /// verifier must stay exactly as issued.
+    @available(macOS 26.0, *)
+    static func isFreshStart(cookie: UInt64, verifier: UInt64) -> Bool {
+        cookie == FSDirectoryCookie.initial.rawValue || verifier == initialVerifier
     }
 
     static func fskitCookie(for daemonCookie: UInt64, attributesRequested _: Bool) throws -> UInt64 {
@@ -506,7 +531,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     public func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem) async throws -> FSItem.Attributes {
         try await core.client.withPublicationBoundary {
             do {
-                let request = PfsFSKitMapping.setAttributes(from: newAttributes)
+                let request = try PfsFSKitMapping.setAttributes(from: newAttributes)
                 let attr = try await core.setattr(item: try portableItem(item), attributes: request)
                 return try PfsFSKitMapping.attributes(from: attr)
             } catch {
@@ -686,20 +711,48 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 wantAttributes: attributesRequested,
                 maxEntries: PfsEnumerationCookies.daemonPageSize
             )
-            let currentVerifier = try PfsFSKitMapping.directoryVerifier(
-                from: result.verifier
-            )
+            // The verifier must change only when a genuine restart is required.
+            // Daemon cookies are name-keyed resumption points, so a directory
+            // that gains or loses entries between pages is still resumable
+            // exactly where the last page stopped. Reporting the directory's
+            // current version on every page would instead tell FSKit the
+            // directory changed underneath a live walk — the invitation to
+            // abandon or restart it, which is how a several-hundred-entry
+            // listing comes back silently short under concurrent mutation.
+            // A continuation therefore echoes the verifier FSKit handed us and
+            // only a fresh walk (cookie 0, or an initial verifier) mints one.
+            let currentVerifier: FSDirectoryVerifier
+            if PfsEnumerationCookies.isFreshStart(cookie: cookie.rawValue, verifier: verifier.rawValue) {
+                currentVerifier = try PfsFSKitMapping.directoryVerifier(
+                    from: result.verifier
+                )
+            } else {
+                currentVerifier = verifier
+            }
 
-            for entry in try PfsEnumerationCookies.syntheticEntries(
+            let synthetics = try PfsEnumerationCookies.syntheticEntries(
                 for: cookie.rawValue,
                 attributesRequested: attributesRequested
-            ) {
+            )
+            let selfIdentifier = try PfsFSKitMapping.itemIdentifier(
+                from: portableDirectory.identity.itemID
+            )
+            var parentIdentifier = selfIdentifier
+            if synthetics.contains(where: { $0.isParentEntry }),
+               let directoryAttr = try? await core.getattr(item: portableDirectory) {
+                // A retained-but-unlinked directory still enumerates through
+                // its open reference but has no live parent to name; POSIX
+                // offers no better answer than itself, so a failed lookup
+                // must not fail the enumeration.
+                parentIdentifier = try PfsFSKitMapping.parentDirectoryIdentifier(
+                    from: directoryAttr
+                )
+            }
+            for entry in synthetics {
                 let packed = packer.packEntry(
                     name: PfsFSKitMapping.fileName(from: entry.name),
                     itemType: .directory,
-                    itemID: try PfsFSKitMapping.itemIdentifier(
-                        from: portableDirectory.identity.itemID
-                    ),
+                    itemID: entry.isParentEntry ? parentIdentifier : selfIdentifier,
                     nextCookie: FSDirectoryCookie(entry.nextCookie),
                     attributes: nil
                 )

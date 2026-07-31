@@ -186,3 +186,57 @@ func TestAttrParentAndFlagsRoundTrip(t *testing.T) {
 		t.Fatalf("attr round trip:\n got  %#v\n want %#v", decoded.Body, want)
 	}
 }
+
+// TestAppendIntentRoundTrip pins the O_APPEND intent on the wire. Without it
+// the daemon can only ever see a frontend-computed absolute offset, which is
+// what let two machines' appends land on the same byte range.
+func TestAppendIntentRoundTrip(t *testing.T) {
+	item := Item{ItemID: 7, ItemGeneration: 11}
+	for _, tc := range []struct {
+		name string
+		body any
+		want func(any) bool
+	}{
+		{"open", &OpenRequest{Item: item, Mode: OpenModeWrite, Append: true},
+			func(b any) bool { r := b.(*OpenRequest); return r.Append && r.Mode == OpenModeWrite && r.Item == item }},
+		{"create", &CreateRequest{Name: []byte("log"), Mode: 0o644, Exclusive: true, Append: true},
+			func(b any) bool { r := b.(*CreateRequest); return r.Append && r.Exclusive }},
+		{"write", &WriteRequest{Handle: 5, Data: []byte("rec\n"), Append: true},
+			func(b any) bool {
+				r := b.(*WriteRequest)
+				return r.Append && r.Offset == 0 && string(r.Data) == "rec\n"
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame, err := EncodeFrame(&Envelope{RequestID: 3, Body: tc.body})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := ReadFrame(bytes.NewReader(frame))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.want(decoded.Body) {
+				t.Fatalf("append intent lost across the wire: %#v", decoded.Body)
+			}
+		})
+	}
+}
+
+// TestAppendIntentDefaultsOffForOlderFrontends keeps the added fields
+// backward compatible: a frame minted without them decodes as a positional
+// write, exactly as before.
+func TestAppendIntentDefaultsOffForOlderFrontends(t *testing.T) {
+	frame, err := EncodeFrame(&Envelope{RequestID: 4, Body: &WriteRequest{Handle: 9, Offset: 64, Data: []byte("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := decoded.Body.(*WriteRequest)
+	if w.Append || w.Offset != 64 {
+		t.Fatalf("legacy positional write changed meaning: %#v", w)
+	}
+}

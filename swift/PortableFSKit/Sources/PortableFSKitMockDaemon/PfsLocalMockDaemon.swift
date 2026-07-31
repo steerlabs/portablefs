@@ -387,7 +387,17 @@ private enum PfsMockFrameIO {
 }
 
 private actor MockFileSystem {
+    // Enumeration cookie layout mirrors portablefsd exactly: [marker:1][cursor:61][tag:2],
+    // where the cursor is a pure function of the entry name. Resumption is
+    // "first entry whose cursor is strictly greater than the cookie", so a
+    // cookie stays resolvable no matter what the directory does between pages
+    // and no matter which pages the daemon already served. The mock exists to
+    // hold the adapter to that contract, so it must not be more forgiving.
     private static let daemonCookieMarker: UInt64 = 1 << 63
+    private static let cookieTagMask: UInt64 = 0x3
+    private static let cookieTagCursor: UInt64 = 0x1
+    private static let cursorMax: UInt64 = (1 << 61) - 1
+    private static let cursorSpace: UInt64 = cursorMax - (1 << 20)
 
     private final class Node {
         let id: UInt64
@@ -598,23 +608,19 @@ private actor MockFileSystem {
                 guard directory.kind == .directory else {
                     throw MockPOSIXError(errno: ENOTDIR, message: "not a directory")
                 }
-                let sorted = directory.children.keys.sorted { lhs, rhs in
-                    displayName(lhs) < displayName(rhs)
-                }
-                let start = try decodeCookie(request.cookie)
-                guard start <= sorted.count else {
-                    throw MockPOSIXError(errno: EINVAL, message: "invalid cookie")
-                }
+                let ordered = orderedChildren(of: directory)
+                let resume = try decodeCookie(request.cookie)
+                let start = ordered.firstIndex { $0.cursor > resume } ?? ordered.count
                 let maxEntries = max(1, Int(request.maxEntries))
-                let end = min(sorted.count, start + maxEntries)
+                let end = min(ordered.count, start + maxEntries)
                 var response = PfsEnumerateReply()
-                for (offset, name) in sorted[start..<end].enumerated() {
+                for index in start..<end {
+                    let name = ordered[index].name
                     if let childID = directory.children[name], let child = nodes[childID] {
-                        let absoluteIndex = start + offset
                         var entry = PfsDirEntry()
                         entry.name = name
                         entry.attr = attr(for: child, parent: directory)
-                        entry.cookie = absoluteIndex + 1 >= sorted.count ? 0 : encodeCookie(position: absoluteIndex + 1)
+                        entry.cookie = index + 1 >= ordered.count ? 0 : encodeCookie(cursor: ordered[index].cursor)
                         response.entries.append(entry)
                     }
                 }
@@ -1004,17 +1010,52 @@ private actor MockFileSystem {
         String(data: data, encoding: .utf8) ?? data.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func encodeCookie(position: Int) -> UInt64 {
-        Self.daemonCookieMarker | UInt64(position)
+    /// The directory's total enumeration order: ascending name cursor, ties
+    /// broken by name, with equal cursors perturbed upward so every entry has a
+    /// unique strictly increasing resumption key.
+    private func orderedChildren(of directory: Node) -> [(name: Data, cursor: UInt64)] {
+        var ordered = directory.children.keys.map { (name: $0, cursor: enumerationCursor($0)) }
+        ordered.sort { lhs, rhs in
+            if lhs.cursor != rhs.cursor {
+                return lhs.cursor < rhs.cursor
+            }
+            return displayName(lhs.name) < displayName(rhs.name)
+        }
+        for index in 1..<max(ordered.count, 1) where ordered[index].cursor <= ordered[index - 1].cursor {
+            ordered[index].cursor = ordered[index - 1].cursor + 1
+        }
+        return ordered
     }
 
-    private func decodeCookie(_ cookie: UInt64) throws -> Int {
+    private func enumerationCursor(_ name: Data) -> UInt64 {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in name {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return 1 + hash % Self.cursorSpace
+    }
+
+    private func encodeCookie(cursor: UInt64) -> UInt64 {
+        Self.daemonCookieMarker | (cursor << 2) | Self.cookieTagCursor
+    }
+
+    /// Returns the resume cursor for a cookie. Foreign cookies fail with
+    /// ESTALE, the daemon's documented fail-safe; cookies this daemon issued
+    /// always resolve.
+    private func decodeCookie(_ cookie: UInt64) throws -> UInt64 {
         if cookie == 0 {
             return 0
         }
-        guard (cookie & Self.daemonCookieMarker) != 0 else {
-            throw MockPOSIXError(errno: EINVAL, message: "invalid cookie")
+        guard (cookie & Self.daemonCookieMarker) != 0,
+              (cookie & Self.cookieTagMask) == Self.cookieTagCursor
+        else {
+            throw MockPOSIXError(errno: ESTALE, message: "invalid directory cookie")
         }
-        return Int(cookie & ~Self.daemonCookieMarker)
+        let cursor = (cookie & ~Self.daemonCookieMarker) >> 2
+        guard cursor != 0 else {
+            throw MockPOSIXError(errno: ESTALE, message: "invalid directory cookie")
+        }
+        return cursor
     }
 }

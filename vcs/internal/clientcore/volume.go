@@ -197,6 +197,14 @@ type Volume struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// invAnchored closes the first time the authority confirms this mount is
+	// a registered invalidation subscriber and the caches have been fenced
+	// against every fill that predates that registration. Until then a cached
+	// read can be arbitrarily stale with no event able to correct it, so a
+	// frontend attaches only after waiting on it (see AwaitInvalidations).
+	invAnchored     chan struct{}
+	invAnchoredOnce sync.Once
+
 	// kernelFlushGen tracks the last generation for which the Read path fired its FOPEN_KEEP_CACHE
 	// kernel-flush backup. It is DELIBERATELY separate from the version cache's anchored generation
 	// (P1): CachedGetattr/Readdir also RefreshAll on an unseen gen but must not flush the kernel, so a
@@ -296,12 +304,18 @@ func (v *Volume) beginAuthorityMutation(
 	operands ...string,
 ) (context.Context, func(), error) {
 	paths, inos := v.hardlinkMutationTargets(nodes, operands...)
+	// A conflicting active claim can be a remote acquire resolver mid-RPC,
+	// so admission into the transition gate is an authority-bound wait: the
+	// caller's publication must suspend while it queues, or a reciprocal
+	// cross-client acquire/mutation pair deadlocks the handoff drain.
+	resumeAdmission := v.suspendAuthorityPublication(ctx)
 	claim, err := v.delegationTransitions.begin(
 		ctx,
 		authorityTransition,
 		paths,
 		inos,
 	)
+	resumeAdmission()
 	if err != nil {
 		return ctx, nil, err
 	}
@@ -310,9 +324,12 @@ func (v *Volume) beginAuthorityMutation(
 	// must promote its reply identities against this claim and will be
 	// released rather than installed on collision.
 	paths, inos = v.hardlinkMutationTargets(nodes, operands...)
-	if err := claim.extend(ctx, paths, inos); err != nil {
+	resumeExtend := v.suspendAuthorityPublication(ctx)
+	extendErr := claim.extend(ctx, paths, inos)
+	resumeExtend()
+	if extendErr != nil {
 		claim.end()
-		return ctx, nil, err
+		return ctx, nil, extendErr
 	}
 	if v.wb != nil {
 		if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
@@ -453,6 +470,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		openFiles:       NewInodeSet(),
 		hardlinks:       newHardlinkAliases(),
 		lockReg:         map[*LockHandle]struct{}{},
+		invAnchored:     make(chan struct{}),
 		noReaddirPlus:   opts.NoReaddirPlus,
 		attrTTL:         opts.AttrTTL,
 		sessionTTL:      opts.SessionTTL,
@@ -888,6 +906,12 @@ func attrFromEntry(e writeback.Entry) fsproto.Attr {
 	if a.AtimeMs == 0 {
 		a.AtimeMs = a.MtimeMs
 	}
+	// The engine records no birth time. Reporting mtime keeps a locally-born
+	// entry consistent with the authority-backed conversion instead of
+	// surfacing the epoch-0 sentinel.
+	if a.BirthtimeMs == 0 {
+		a.BirthtimeMs = a.MtimeMs
+	}
 	if a.Nlink == 0 {
 		a.Nlink = 1
 		if a.Kind == "directory" {
@@ -1167,7 +1191,34 @@ func (v *Volume) StartInvalidations(ctx context.Context, dropOrphan bool) {
 		DropOrphan:  dropOrphan,
 		ClearRecent: v.recent.clear,
 		Debugf:      v.debugf,
+		Anchored:    v.markInvalidationsAnchored,
 	})
+}
+
+func (v *Volume) markInvalidationsAnchored() {
+	v.invAnchoredOnce.Do(func() { close(v.invAnchored) })
+}
+
+// InvalidationsAnchored closes once the authority has confirmed this mount as
+// a registered invalidation subscriber and the caches have been fenced against
+// every fill that predates that registration.
+func (v *Volume) InvalidationsAnchored() <-chan struct{} { return v.invAnchored }
+
+// AwaitInvalidations blocks until the invalidation stream is anchored, ctx is
+// done, or the volume closes. Reads served before the anchor can be stale with
+// no event able to correct them, so a frontend calls this before it starts
+// serving. It reports whether the anchor was actually reached: an attach that
+// cannot wait any longer may proceed, because the anchor still fences away
+// everything cached in the meantime the moment it arrives.
+func (v *Volume) AwaitInvalidations(ctx context.Context) bool {
+	select {
+	case <-v.invAnchored:
+		return true
+	case <-v.ctx.Done():
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 type volumeInvalidationHandler struct {

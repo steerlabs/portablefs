@@ -54,9 +54,13 @@ private func enumerationBytes(_ string: String) -> Data {
         maxEntries: PfsEnumerationCookies.daemonPageSize
     )
     #expect(firstPage.entries.count == 256)
-    #expect(firstPage.entries[0].nextCookie == (PfsEnumerationCookies.daemonCookieMarker | 1))
-    #expect(firstPage.entries[255].nextCookie == (PfsEnumerationCookies.daemonCookieMarker | 256))
-    #expect(firstPage.nextCookie == (PfsEnumerationCookies.daemonCookieMarker | 256))
+    // Per-entry cookies are opaque daemon resumption points, not positions: all
+    // that is contractual is that they live in the daemon's high-bit namespace,
+    // advance strictly with the enumeration, and that the page's next cookie is
+    // the last entry's.
+    #expect(firstPage.entries.allSatisfy { PfsEnumerationCookies.isDaemonCookie($0.nextCookie) })
+    #expect(zip(firstPage.entries, firstPage.entries.dropFirst()).allSatisfy { $0.nextCookie < $1.nextCookie })
+    #expect(firstPage.nextCookie == firstPage.entries[255].nextCookie)
 
     var names = Set(firstPage.entries.prefix(128).compactMap { String(data: $0.name, encoding: .utf8) })
     var cookie = firstPage.entries[127].nextCookie

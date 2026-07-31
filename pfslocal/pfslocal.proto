@@ -26,6 +26,22 @@
 // FSKit can satisfy its requested-attribute contract without inventing
 // metadata.
 //
+// O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
+// is deliberately NOT gated behind a minor bump: the daemon rejects any
+// frontend whose minor is below its own, and these fields default to false,
+// which reproduces the previous positional-write behavior exactly. A frontend
+// that can express append opts in; one that cannot is unaffected.
+//
+// PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface append intent to
+// a filesystem extension. FSVolumeOpenModes has only Read and Write, and
+// writeContents:toFile:atOffset: hands down an off_t the KERNEL already
+// resolved from its own cached vnode size. On that frontend an O_APPEND write
+// is indistinguishable from a positional write at the then-current EOF, so
+// two machines appending concurrently can still collide no matter what this
+// protocol offers. These fields exist so every frontend that DOES have the
+// intent (FUSE today, a future FSKit that surfaces it) gets serialized,
+// authority-assigned append offsets.
+//
 // Identity model: items are addressed by (item_id, item_generation) — the
 // authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
 // treats them as opaque. attach_ref is an opaque string minted by the daemon's
@@ -279,6 +295,11 @@ enum OpenMode {
 message OpenRequest {
   Item item = 1;
   OpenMode mode = 2;
+  // O_APPEND, sticky on the returned handle (POSIX puts the flag on the open
+  // file description, not on the write). Every write through that handle has
+  // its offset resolved at EOF by the authority in sequencer order, so two
+  // machines appending to one file can never land on the same byte range.
+  bool append = 3;
 }
 message OpenReply {
   uint64 handle = 1; // daemon-scoped; keeps open-after-unlink alive via orphan leases
@@ -308,6 +329,12 @@ message WriteRequest {
   uint64 handle = 1;
   uint64 offset = 2;
   bytes data = 3;
+  // O_APPEND for THIS write, for frontends that learn the intent per write
+  // rather than at open. Offset must be zero and is ignored: the offset is
+  // assigned at EOF under the authority's write serialization and is never
+  // computed by the frontend from a cached size. A handle opened with
+  // OpenRequest.append appends regardless of this bit.
+  bool append = 4;
 }
 message WriteReply {
   uint32 written = 1;
@@ -325,6 +352,7 @@ message CreateRequest {
   bytes name = 2;
   uint32 mode = 3;
   bool exclusive = 4; // O_EXCL
+  bool append = 5;    // O_APPEND, sticky on the returned handle (see OpenRequest.append)
 }
 message CreateReply {
   Attr attr = 1;
