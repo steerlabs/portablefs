@@ -151,3 +151,38 @@ func TestExactObjectHandlesRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestAttrParentAndFlagsRoundTrip(t *testing.T) {
+	parent := Item{ItemID: 17, ItemGeneration: 19}
+	want := &GetAttrReply{Attr: Attr{
+		Item:           Item{ItemID: 23, ItemGeneration: 29},
+		Kind:           ItemKindFile,
+		Mode:           0o640,
+		Nlink:          2,
+		UID:            501,
+		GID:            20,
+		Size:           4097,
+		MtimeMs:        31,
+		CtimeMs:        37,
+		AtimeMs:        41,
+		BirthtimeMs:    43,
+		ContentVersion: 47,
+		Parent:         &parent,
+		Flags:          0x00008000,
+		AllocSize:      8192,
+	}}
+	frame, err := EncodeFrame(&Envelope{RequestID: 53, Body: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if golden := readGolden(t, "attr_parent_flags.hex"); !bytes.Equal(frame, golden) {
+		t.Fatalf("attr frame\n got %x\nwant %x", frame, golden)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RequestID != 53 || !reflect.DeepEqual(decoded.Body, want) {
+		t.Fatalf("attr round trip:\n got  %#v\n want %#v", decoded.Body, want)
+	}
+}

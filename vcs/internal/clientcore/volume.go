@@ -260,6 +260,30 @@ func (v *Volume) lockExact(ctx context.Context) {
 	}
 }
 
+// suspendAuthorityPublication removes only the current publishing frontend
+// participant while it is exposed to an authority-side delegation wait.
+// Callers invoke it at the final cache/delegation miss boundary immediately
+// before network I/O and resume before publishing the returned sample. Reads
+// covered by a retained local delegation must never use this hook: their
+// permit is part of the pre-handoff view and the authority explicitly
+// self-bypasses its holder.
+func (v *Volume) suspendAuthorityPublication(ctx context.Context) func() {
+	if v.onOperationWait == nil {
+		return func() {}
+	}
+	resume := v.onOperationWait(ctx)
+	if resume == nil {
+		return func() {}
+	}
+	return resume
+}
+
+func (v *Volume) authorityWaitContext(ctx context.Context) context.Context {
+	return fsproto.WithAuthorityWait(ctx, func() func() {
+		return v.suspendAuthorityPublication(ctx)
+	})
+}
+
 // beginAuthorityMutation linearizes one or more path-bearing authority
 // mutations against local delegation acquisition. Acquisition owns the
 // exclusive side until its grant is installed; authority mutations share the
@@ -270,7 +294,7 @@ func (v *Volume) beginAuthorityMutation(
 	ctx context.Context,
 	nodes []*NodeState,
 	operands ...string,
-) (func(), error) {
+) (context.Context, func(), error) {
 	paths, inos := v.hardlinkMutationTargets(nodes, operands...)
 	claim, err := v.delegationTransitions.begin(
 		ctx,
@@ -279,7 +303,7 @@ func (v *Volume) beginAuthorityMutation(
 		inos,
 	)
 	if err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	// Re-snapshot after admission. A grant that completed before this claim
 	// published every reply alias first; a still-running disjoint acquire
@@ -288,15 +312,21 @@ func (v *Volume) beginAuthorityMutation(
 	paths, inos = v.hardlinkMutationTargets(nodes, operands...)
 	if err := claim.extend(ctx, paths, inos); err != nil {
 		claim.end()
-		return nil, err
+		return ctx, nil, err
 	}
 	if v.wb != nil {
 		if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
 			claim.end()
-			return nil, err
+			return ctx, nil, err
 		}
 	}
-	return claim.end, nil
+	// ReleaseFor has removed every overlapping local delegation. Each
+	// authority RPC from here can only wait on foreign authority. The
+	// returned context brackets every such RPC independently, re-entering
+	// frontend admission after its reply and before the typed protocol helper
+	// publishes self-write metadata. The transition claim remains held until
+	// the caller completes all result/cache/registry bookkeeping.
+	return v.authorityWaitContext(ctx), claim.end, nil
 }
 
 func (v *Volume) beginMutation(ctx context.Context) error {
@@ -323,19 +353,19 @@ func (v *Volume) endMutation() {
 	v.lifecycleMu.RUnlock()
 }
 
-func (v *Volume) beginExactOperation(ctx context.Context) (func(), error) {
+func (v *Volume) beginExactOperation(ctx context.Context) (context.Context, func(), error) {
 	if err := v.beginLifecycleOperation(); err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	if v.mutationFailClosed != nil {
 		err := v.mutationFailClosed
 		v.lifecycleMu.RUnlock()
-		return nil, err
+		return ctx, nil, err
 	}
 	if v.wb != nil {
 		if err := v.wb.MutationError(); err != nil {
 			v.lifecycleMu.RUnlock()
-			return nil, err
+			return ctx, nil, err
 		}
 	}
 	v.lockExact(ctx)
@@ -346,10 +376,10 @@ func (v *Volume) beginExactOperation(ctx context.Context) (func(), error) {
 		if err != nil {
 			v.exactMu.Unlock()
 			v.lifecycleMu.RUnlock()
-			return nil, err
+			return ctx, nil, err
 		}
 	}
-	return func() {
+	return v.authorityWaitContext(ctx), func() {
 		if endWriteback != nil {
 			endWriteback()
 		}
@@ -845,7 +875,7 @@ func delegationReplyTargets(
 // carry no authority ino; the caller substitutes a path-derived fallback.
 func attrFromEntry(e writeback.Entry) fsproto.Attr {
 	a := fsproto.Attr{
-		Kind: e.Kind, Mode: e.Mode, Size: e.Size,
+		Kind: e.Kind, Mode: e.Mode, Size: e.Size, AllocSize: e.Size,
 		MtimeMs: e.MtimeMs, CtimeMs: e.CtimeMs, AtimeMs: e.AtimeMs,
 		Uid: e.UID, Gid: e.GID, Ino: e.Ino, Nlink: e.Nlink,
 	}
@@ -968,7 +998,9 @@ func (v *Volume) CoherenceSample(ctx context.Context, path string) (fsproto.Attr
 			permit.Close()
 			return fsproto.Attr{}, 0, 0, fsproto.EIO
 		}
+		resume := v.suspendAuthorityPublication(ctx)
 		attr, version, generation, _, st, err := v.client.GetattrVContext(ctx, path)
+		resume()
 		if err != nil {
 			permit.Close()
 			return fsproto.Attr{}, 0, 0, fsproto.EIO
@@ -1022,7 +1054,9 @@ func (v *Volume) Writeback() *writeback.Engine { return v.wb }
 // LockAuth returns the advisory-lock surface bound to this volume's authority
 // generation. Every lock acquire, release, and getlk must route through it —
 // never the raw Client, whose legacy op a managed authority refuses with EPERM.
-func (v *Volume) LockAuth() LockAuthority { return lockRouter{v.client} }
+func (v *Volume) LockAuth() LockAuthority {
+	return lockRouter{cli: v.client, authorityContext: v.authorityWaitContext}
+}
 
 // registerLockHandle adds a handle to the reclaim registry (idempotent).
 func (v *Volume) registerLockHandle(h *LockHandle) {

@@ -365,6 +365,66 @@ func TestDetachedIdentityPersistsAcrossDaemonRestartUntilReclaim(t *testing.T) {
 	}
 }
 
+func TestFSKitAttrParentFollowsConcreteLiveBinding(t *testing.T) {
+	a := newAttach("att_attr_parent", "key", ensureAttachRequest{
+		VolumeID: "vol-attr-parent", Branch: "main",
+		MountPath: "/Volumes/AttrParent",
+	}, privateTestDir(t))
+	a.identityEpoch = 23
+
+	a.mu.Lock()
+	root := a.registerLocked("", fsproto.Attr{Ino: 1, Kind: "directory"})
+	left := a.registerLocked("left", fsproto.Attr{Ino: 2, Kind: "directory"})
+	right := a.registerLocked("right", fsproto.Attr{Ino: 3, Kind: "directory"})
+	source := a.registerLocked("left/file", fsproto.Attr{
+		Ino: 42, Kind: "file", Nlink: 2, Flags: 0x00008000,
+	})
+	alias := a.registerLocked("right/alias", fsproto.Attr{
+		Ino: 42, Kind: "file", Nlink: 2, Flags: 0x00008000,
+	})
+	if root == nil || left == nil || right == nil || source == nil || alias == nil {
+		a.mu.Unlock()
+		t.Fatal("failed to construct registry fixture")
+	}
+
+	sourceAttr := a.localAttrForRecordLocked(source.attr, source, false)
+	aliasAttr := a.localAttrForRecordLocked(alias.attr, alias, false)
+	if sourceAttr.Parent == nil || *sourceAttr.Parent != left.item {
+		a.mu.Unlock()
+		t.Fatalf("source parent=%+v want left=%+v", sourceAttr.Parent, left.item)
+	}
+	if aliasAttr.Parent == nil || *aliasAttr.Parent != right.item {
+		a.mu.Unlock()
+		t.Fatalf("hard-link alias parent=%+v want right=%+v", aliasAttr.Parent, right.item)
+	}
+	handleAttr := a.localAttrForRecordPathLocked(source.attr, source, "right/alias", false)
+	if handleAttr.Parent == nil || *handleAttr.Parent != right.item {
+		a.mu.Unlock()
+		t.Fatalf("handle scope parent=%+v want right=%+v", handleAttr.Parent, right.item)
+	}
+	if sourceAttr.Flags != 0x00008000 || aliasAttr.Flags != 0x00008000 {
+		a.mu.Unlock()
+		t.Fatalf("flags source=%#x alias=%#x", sourceAttr.Flags, aliasAttr.Flags)
+	}
+
+	a.renamePathLocked("left/file", "right/moved")
+	moved := a.paths["right/moved"]
+	movedAttr := a.localAttrForRecordLocked(moved.attr, moved, false)
+	if movedAttr.Parent == nil || *movedAttr.Parent != right.item {
+		a.mu.Unlock()
+		t.Fatalf("cross-directory rename parent=%+v want right=%+v", movedAttr.Parent, right.item)
+	}
+
+	a.removePathLocked("right/moved")
+	a.removePathLocked("right/alias")
+	detached := a.items[source.item.ItemID]
+	detachedAttr := a.localAttrForRecordLocked(detached.attr, detached, true)
+	a.mu.Unlock()
+	if detachedAttr.Parent != nil {
+		t.Fatalf("detached parent=%+v want absent", detachedAttr.Parent)
+	}
+}
+
 func TestRestoreAndJournalReplayRepopulateAwaitingAuthorityItems(t *testing.T) {
 	newTestAttach := func(ref string) *attach {
 		a := newAttach(ref, "key", ensureAttachRequest{

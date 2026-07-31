@@ -81,7 +81,7 @@ func TestContendedExactOperationSuspendsPublicationBeforeExactWait(t *testing.T)
 	result := make(chan exactResult, 1)
 	ctx := context.WithValue(context.Background(), operationWaitContextKey{}, "exact")
 	go func() {
-		end, err := v.beginExactOperation(ctx)
+		_, end, err := v.beginExactOperation(ctx)
 		result <- exactResult{end: end, err: err}
 	}()
 
@@ -134,7 +134,7 @@ func TestUncontendedExactLocksDoNotSuspendPublication(t *testing.T) {
 	}
 	v.endMutation()
 
-	end, err := v.beginExactOperation(ctx)
+	_, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		t.Fatalf("begin exact operation: %v", err)
 	}
@@ -147,11 +147,11 @@ func TestUncontendedExactLocksDoNotSuspendPublication(t *testing.T) {
 
 func TestAuthorityMutationsShareLaneAndExcludeDelegationInstallation(t *testing.T) {
 	v := &Volume{}
-	endA, err := v.beginAuthorityMutation(context.Background(), nil, "d/a")
+	_, endA, err := v.beginAuthorityMutation(context.Background(), nil, "d/a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	endB, err := v.beginAuthorityMutation(context.Background(), nil, "d/b")
+	_, endB, err := v.beginAuthorityMutation(context.Background(), nil, "d/b")
 	if err != nil {
 		endA()
 		t.Fatal(err)

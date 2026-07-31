@@ -54,6 +54,104 @@ import Testing
     }
 }
 
+@Test func requestedAttributesAreExactAndCarryAuthoritativeParentAndFlags() throws {
+    var item = PfsItem()
+    item.itemID = 9
+    item.itemGeneration = 3
+    var parent = PfsItem()
+    parent.itemID = 4
+    parent.itemGeneration = 3
+    var attr = PfsAttr()
+    attr.item = item
+    attr.parent = parent
+    attr.kind = .file
+    attr.mode = 0o640
+    attr.nlink = 2
+    attr.uid = 501
+    attr.gid = 20
+    attr.size = 4097
+    attr.allocSize = 8192
+    attr.flags = 0
+    attr.mtimeMs = 10
+    attr.ctimeMs = 20
+    attr.atimeMs = 30
+    attr.birthtimeMs = 40
+
+    let requested: FSItem.Attribute = [
+        .type, .mode, .linkCount, .flags, .size, .allocSize,
+        .fileID, .parentID, .accessTime, .modifyTime, .changeTime, .birthTime,
+    ]
+    let attributes = try PfsFSKitMapping.attributes(from: attr, requested: requested)
+
+    for field in [
+        FSItem.Attribute.type, .mode, .linkCount, .flags, .size, .allocSize,
+        .fileID, .parentID, .accessTime, .modifyTime, .changeTime, .birthTime,
+    ] {
+        #expect(attributes.isValid(field))
+    }
+    for field in [
+        FSItem.Attribute.uid, .gid, .supportsLimitedXAttrs, .inhibitKernelOffloadedIO,
+        .addedTime, .backupTime,
+    ] {
+        #expect(!attributes.isValid(field))
+    }
+    #expect(attributes.flags == 0)
+    #expect(attributes.allocSize == 8192)
+    let expectedParentID = try PfsFSKitMapping.itemIdentifier(from: parent.itemID)
+    #expect(attributes.parentID == expectedParentID)
+}
+
+@Test func parentMappingDistinguishesRootDetachedAndMalformedParents() throws {
+    var rootItem = PfsItem()
+    rootItem.itemID = 1
+    rootItem.itemGeneration = 5
+    var root = PfsAttr()
+    root.item = rootItem
+    root.kind = .directory
+    let rootAttributes = try PfsFSKitMapping.attributes(from: root, requested: [.parentID])
+    #expect(rootAttributes.isValid(.parentID))
+    #expect(rootAttributes.parentID == .parentOfRoot)
+
+    var detachedItem = PfsItem()
+    detachedItem.itemID = 7
+    detachedItem.itemGeneration = 5
+    var detached = PfsAttr()
+    detached.item = detachedItem
+    let detachedAttributes = try PfsFSKitMapping.attributes(
+        from: detached,
+        requested: [.parentID]
+    )
+    #expect(detachedAttributes.isValid(.parentID))
+    #expect(detachedAttributes.parentID == .invalid)
+
+    var invalidParent = PfsItem()
+    invalidParent.itemID = 0
+    invalidParent.itemGeneration = 5
+    detached.parent = invalidParent
+    #expect(throws: PfsLocalClientError.self) {
+        try PfsFSKitMapping.attributes(from: detached, requested: [.parentID])
+    }
+}
+
+@Test func unsupportedRequestedTimesFailExplicitly() {
+    var item = PfsItem()
+    item.itemID = 2
+    item.itemGeneration = 1
+    var attr = PfsAttr()
+    attr.item = item
+
+    for field in [FSItem.Attribute.addedTime, .backupTime] {
+        do {
+            _ = try PfsFSKitMapping.attributes(from: attr, requested: [field])
+            Issue.record("expected unsupported requested time to fail")
+        } catch let error as PfsLocalClientError {
+            #expect(error.posixErrno == ENOTSUP)
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+    }
+}
+
 @Test func statfsMappingUsesDaemonValuesAndPreferredIOSize() {
     var reply = PfsStatfsReply()
     reply.blockSize = 8192

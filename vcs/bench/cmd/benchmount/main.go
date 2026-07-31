@@ -415,7 +415,7 @@ func (n *benchNode) lockHandle(fh fs.FileHandle) *clientcore.LockHandle {
 }
 
 func (n *benchNode) Getlk(ctx context.Context, fh fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32, out *fuse.FileLock) syscall.Errno {
-	res, err := n.v.Getlk(n.curPath(), owner, lk.Start, lk.End, lk.Typ == clientcore.LockWrite)
+	res, err := n.v.Getlk(ctx, n.curPath(), owner, lk.Start, lk.End, lk.Typ == clientcore.LockWrite)
 	if err != nil {
 		return syscall.EIO
 	}

@@ -19,4 +19,6 @@ func applyLocalStatTimes(fi fs.FileInfo, attr *fsproto.Attr) {
 	attr.CtimeMs = time.Unix(st.Ctim.Sec, st.Ctim.Nsec).UnixMilli()
 	attr.AtimeMs = time.Unix(st.Atim.Sec, st.Atim.Nsec).UnixMilli()
 	attr.Nlink = uint32(st.Nlink)
+	// Linux also defines st_blocks in fixed 512-byte units.
+	attr.AllocSize = st.Blocks * 512
 }

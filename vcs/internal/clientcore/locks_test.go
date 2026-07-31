@@ -1,6 +1,8 @@
 package clientcore
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
@@ -40,10 +42,10 @@ func TestLockHandleRemoveIsOwnerScoped(t *testing.T) {
 func TestUnlockForwardsAcquirePath(t *testing.T) {
 	auth := &recordingLockAuthority{}
 	h := &LockHandle{}
-	if res, err := SetLock(auth, h, "old", 7, 0, 100, true, false); err != nil || res.Status != fsproto.OK {
+	if res, err := SetLock(context.Background(), auth, h, "old", 7, 0, 100, true, false); err != nil || res.Status != fsproto.OK {
 		t.Fatalf("SetLock: res=%+v err=%v", res, err)
 	}
-	if err := Unlock(auth, h, 7, 0, 50, "new"); err != nil {
+	if err := Unlock(context.Background(), auth, h, 7, 0, 50, "new"); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
 	if len(auth.calls) != 2 {
@@ -55,6 +57,48 @@ func TestUnlockForwardsAcquirePath(t *testing.T) {
 	left := h.Drain()
 	if len(left) != 1 || left[0].Start != 51 || left[0].End != 100 {
 		t.Fatalf("partial unlock left wrong local record: %+v", left)
+	}
+}
+
+func TestUnlockPreCanceledPreservesHandleAndSendsNothing(t *testing.T) {
+	auth := &recordingLockAuthority{}
+	h := &LockHandle{}
+	h.Add(7, 0, 100, "old", true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := Unlock(ctx, auth, h, 7, 0, 50, "new"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Unlock error = %v, want context.Canceled", err)
+	}
+	if len(auth.calls) != 0 {
+		t.Fatalf("pre-canceled unlock sent %d authority calls", len(auth.calls))
+	}
+	got := h.Snapshot()
+	if len(got) != 1 || got[0] != (HeldLock{Owner: 7, Start: 0, End: 100, Path: "old", Write: true}) {
+		t.Fatalf("pre-canceled unlock changed local ownership: %+v", got)
+	}
+}
+
+func TestUnlockCancellationAfterCommitCompletesEveryAuthorityRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	auth := &cancelAfterFirstLockAuthority{cancel: cancel}
+	h := &LockHandle{}
+	h.Add(7, 0, 100, "first", true)
+	h.Add(7, 0, 100, "second", true)
+
+	if err := Unlock(ctx, auth, h, 7, 0, 100, "live"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if len(auth.calls) != 2 {
+		t.Fatalf("cancellation after first release produced %d calls, want 2", len(auth.calls))
+	}
+	for i, call := range auth.calls {
+		if call.ctxErr != nil {
+			t.Fatalf("release %d inherited caller cancellation: %v", i, call.ctxErr)
+		}
+	}
+	if got := h.Snapshot(); len(got) != 0 {
+		t.Fatalf("completed unlock retained local records: %+v", got)
 	}
 }
 
@@ -71,9 +115,27 @@ type recordingLockAuthority struct {
 	calls []lockCall
 }
 
-func (a *recordingLockAuthority) Lock(path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
+func (a *recordingLockAuthority) Lock(_ context.Context, path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
 	a.calls = append(a.calls, lockCall{
 		path: path, mode: mode, owner: lkID, start: start, end: end, write: write, unlock: unlock,
 	})
+	return fsproto.LockResult{Status: fsproto.OK}, nil
+}
+
+type cancelAfterFirstLockAuthority struct {
+	cancel context.CancelFunc
+	calls  []unlockCancellationCall
+}
+
+type unlockCancellationCall struct {
+	path   string
+	ctxErr error
+}
+
+func (a *cancelAfterFirstLockAuthority) Lock(ctx context.Context, path string, _ uint8, _, _, _ uint64, _, _ bool) (fsproto.LockResult, error) {
+	a.calls = append(a.calls, unlockCancellationCall{path: path, ctxErr: ctx.Err()})
+	if len(a.calls) == 1 {
+		a.cancel()
+	}
 	return fsproto.LockResult{Status: fsproto.OK}, nil
 }

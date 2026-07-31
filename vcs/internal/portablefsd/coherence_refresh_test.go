@@ -3,7 +3,10 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,7 +16,22 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/workfs"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+type blockingFrontendLstatFS struct {
+	*workfs.FS
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingFrontendLstatFS) Lstat(path string) (os.FileInfo, error) {
+	f.once.Do(func() { close(f.entered) })
+	<-f.release
+	return f.FS.Lstat(path)
+}
 
 func beginTestLogicalOperation(
 	t *testing.T,
@@ -1621,6 +1639,332 @@ func TestLastRunningSiblingFinishingDeactivatesFullySuspendedOperation(t *testin
 	exposeTestLogicalOperation(t, conn, operationID)
 	if !conn.acknowledgePublication(operationID) {
 		t.Fatal("operation acknowledgement failed")
+	}
+}
+
+func TestFrontendOperationNestedSuspensionReentersOnlyAtFinalResume(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		resumeOuter bool
+	}{
+		{name: "outer first", resumeOuter: true},
+		{name: "inner first", resumeOuter: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &attach{}
+			ctx, op := a.beginFrontendPaths(context.Background(), []string{""})
+			participant := ctx.Value(frontendOperationContextKey{}).(*frontendOperationParticipant)
+			outer := a.suspendFrontendOperation(ctx)
+			inner := a.suspendFrontendOperation(ctx)
+			first, final := inner, outer
+			if tc.resumeOuter {
+				first, final = outer, inner
+			}
+			assertState := func(wantDepth, wantSuspended, wantActive int) {
+				t.Helper()
+				a.frontendGateMu.Lock()
+				defer a.frontendGateMu.Unlock()
+				active := 0
+				if op.gateActive {
+					active = 1
+				}
+				if participant.suspendDepth != wantDepth ||
+					op.suspended != wantSuspended ||
+					active != wantActive {
+					t.Fatalf(
+						"state depth=%d suspended=%d active=%d, want %d/%d/%d",
+						participant.suspendDepth, op.suspended, active,
+						wantDepth, wantSuspended, wantActive,
+					)
+				}
+			}
+			assertState(2, 1, 0)
+			first()
+			assertState(1, 1, 0)
+			first() // every resume closure is idempotent
+			assertState(1, 1, 0)
+			final()
+			assertState(0, 0, 1)
+			a.finishFrontendOperation(op)
+		})
+	}
+
+	a := &attach{}
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx, op := a.beginFrontendPaths(ctx, []string{""})
+	outer := a.suspendFrontendOperation(ctx)
+	inner := a.suspendFrontendOperation(ctx)
+	inner()
+	cancel()
+	outer()
+	a.frontendGateMu.Lock()
+	active := op.gateActive
+	suspended := op.suspended
+	a.frontendGateMu.Unlock()
+	if active || suspended != 0 {
+		t.Fatalf("canceled final resume reactivated operation: active=%v suspended=%d", active, suspended)
+	}
+	a.finishFrontendOperation(op)
+}
+
+func TestCanceledAuthorityReadInterruptsTransportWithoutFrontendLeak(t *testing.T) {
+	base := newManagedTestFS(t, daemonTestBlobs{}, filepath.Join(t.TempDir(), "wal.log"))
+	blocked := &blockingFrontendLstatFS{
+		FS:      base,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		_ = fsproto.NewServer(blocked, base).Serve(serverCtx, listener)
+	}()
+	t.Cleanup(func() {
+		close(blocked.release)
+		stopServer()
+		_ = listener.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(5 * time.Second):
+			t.Error("blocked authority did not stop")
+		}
+	})
+
+	a := &attach{}
+	volume, err := clientcore.Dial(context.Background(), clientcore.Options{
+		Addr:     listener.Addr().String(),
+		Pool:     2,
+		Owner:    "cancel-client",
+		VolumeID: "cancel-authority-read",
+		Branch:   "main",
+		WALDir:   t.TempDir(),
+		OnHandoffStart: func(ctx context.Context, scope string) error {
+			return a.startFrontendHandoff(ctx, scope)
+		},
+		OnHandoffEnd: a.endFrontendHandoff,
+		OnOperationWait: func(ctx context.Context) func() {
+			return a.suspendFrontendOperation(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = volume.Close() })
+	a.vol = volume
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	requestCtx, op := a.beginFrontendPaths(requestCtx, []string{""})
+	result := make(chan clientcore.Status, 1)
+	go func() {
+		_, st := volume.Getattr(requestCtx, "blocked", nil)
+		result <- st
+	}()
+	select {
+	case <-blocked.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("authority getattr did not reach blocked transport")
+	}
+	handoffCtx, cancelHandoff := context.WithTimeout(context.Background(), time.Second)
+	defer cancelHandoff()
+	if err := a.startFrontendHandoff(handoffCtx, ""); err != nil {
+		t.Fatalf("suspended authority read blocked handoff: %v", err)
+	}
+	cancelRequest()
+	select {
+	case st := <-result:
+		if st != fsproto.EIO {
+			t.Fatalf("canceled getattr status = %d, want EIO", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled authority read did not interrupt and join its transport")
+	}
+	a.frontendGateMu.Lock()
+	active := op.gateActive
+	suspended := op.suspended
+	a.frontendGateMu.Unlock()
+	if active || suspended != 0 {
+		t.Fatalf("canceled authority read leaked publication state: active=%v suspended=%d", active, suspended)
+	}
+	a.endFrontendHandoff("")
+	a.finishFrontendOperation(op)
+}
+
+func TestSymmetricCrossClientReadsReleaseBothFrontendHandoffs(t *testing.T) {
+	fsproto.SetAdaptivePolicyContentionWindowForTest(time.Nanosecond)
+	t.Cleanup(func() { fsproto.SetAdaptivePolicyContentionWindowForTest(30 * time.Second) })
+	writeback.SetDenialBackoffForTest(time.Nanosecond)
+	t.Cleanup(func() { writeback.SetDenialBackoffForTest(5 * time.Second) })
+
+	authority := serveAuthority(t)
+	setup, err := fsproto.Dial(authority, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup.SetOwner("setup")
+	if live, err := setup.EnsureExactSession(); err != nil || !live {
+		t.Fatalf("setup exact session: live=%v err=%v", live, err)
+	}
+	if _, st, err := setup.Mkdir("left", 0o755); err != nil || st != fsproto.OK {
+		t.Fatalf("mkdir left: status=%d err=%v", st, err)
+	}
+	if _, st, err := setup.Mkdir("right", 0o755); err != nil || st != fsproto.OK {
+		t.Fatalf("mkdir right: status=%d err=%v", st, err)
+	}
+	leftLockTarget := "left/lock-target"
+	rightLockTarget := "right/lock-target"
+	if _, st, err := setup.Create(leftLockTarget, 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("create left lock target: status=%d err=%v", st, err)
+	}
+	if _, st, err := setup.Create(rightLockTarget, 0o644); err != nil || st != fsproto.OK {
+		t.Fatalf("create right lock target: status=%d err=%v", st, err)
+	}
+	if err := setup.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	type frontend struct {
+		attach *attach
+		volume *clientcore.Volume
+		waits  atomic.Int64
+	}
+	dial := func(owner string) *frontend {
+		f := &frontend{attach: &attach{}}
+		volume, err := clientcore.Dial(context.Background(), clientcore.Options{
+			Addr:     authority,
+			Pool:     4,
+			Owner:    owner,
+			VolumeID: "cross-client-liveness",
+			Branch:   "main",
+			WALDir:   t.TempDir(),
+			OnHandoffStart: func(ctx context.Context, scope string) error {
+				return f.attach.startFrontendHandoff(ctx, scope)
+			},
+			OnHandoffEnd: f.attach.endFrontendHandoff,
+			OnOperationWait: func(ctx context.Context) func() {
+				f.waits.Add(1)
+				return f.attach.suspendFrontendOperation(ctx)
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.volume = volume
+		f.attach.vol = volume
+		t.Cleanup(func() { _ = volume.Close() })
+		invalidationCtx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go volume.StartInvalidations(invalidationCtx, false)
+		return f
+	}
+	left := dial("left-client")
+	right := dial("right-client")
+	time.Sleep(100 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	acquire := func(side, phase string, f *frontend) string {
+		t.Helper()
+		for i := 0; i < 32; i++ {
+			path := fmt.Sprintf("%s/%s-held-%02d", side, phase, i)
+			if _, st := f.volume.Getattr(ctx, path, nil); st != fsproto.ENOENT {
+				t.Fatalf("%s negative proof %d: %d", side, i, st)
+			}
+			if _, st := f.volume.Create(ctx, path, 0o644); st != fsproto.OK {
+				t.Fatalf("%s delegation seed %d: %d", side, i, st)
+			}
+			if records, _ := f.volume.WriteBackPending(); records > 0 {
+				return path
+			}
+		}
+		t.Fatalf("%s client did not acquire a delegation", side)
+		return ""
+	}
+	_ = acquire("left", "lock", left)
+	_ = acquire("right", "lock", right)
+	left.waits.Store(0)
+	right.waits.Store(0)
+
+	type lockResult struct {
+		side string
+		st   int32
+		err  error
+	}
+	lockResults := make(chan lockResult, 2)
+	lockStart := make(chan struct{})
+	leftLock := &clientcore.LockHandle{}
+	rightLock := &clientcore.LockHandle{}
+	runLock := func(side, path string, owner uint64, f *frontend, handle *clientcore.LockHandle) {
+		opCtx, op := f.attach.beginFrontendPaths(ctx, []string{""})
+		go func() {
+			defer f.attach.finishFrontendOperation(op)
+			<-lockStart
+			got, err := f.volume.Setlk(opCtx, handle, path, owner, 0, 1, true, false)
+			lockResults <- lockResult{side: side, st: got.Status, err: err}
+		}()
+	}
+	runLock("left", rightLockTarget, 11, left, leftLock)
+	runLock("right", leftLockTarget, 22, right, rightLock)
+	close(lockStart)
+	for range 2 {
+		select {
+		case got := <-lockResults:
+			if got.err != nil || got.st != fsproto.OK {
+				t.Fatalf("%s cross-client setlk: status=%d err=%v", got.side, got.st, got.err)
+			}
+		case <-ctx.Done():
+			t.Fatal("symmetric cross-client locks deadlocked with reciprocal delegation handoffs")
+		}
+	}
+	if left.waits.Load() == 0 || right.waits.Load() == 0 {
+		t.Fatalf("lock authority waits: left=%d right=%d, want both frontends suspended", left.waits.Load(), right.waits.Load())
+	}
+	if got, err := left.volume.Setlk(ctx, leftLock, rightLockTarget, 11, 0, 1, false, true); err != nil || got.Status != fsproto.OK {
+		t.Fatalf("left unlock: status=%d err=%v", got.Status, err)
+	}
+	if got, err := right.volume.Setlk(ctx, rightLock, leftLockTarget, 22, 0, 1, false, true); err != nil || got.Status != fsproto.OK {
+		t.Fatalf("right unlock: status=%d err=%v", got.Status, err)
+	}
+
+	leftPath := acquire("left", "read", left)
+	rightPath := acquire("right", "read", right)
+	left.waits.Store(0)
+	right.waits.Store(0)
+
+	type result struct {
+		side string
+		st   clientcore.Status
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	run := func(side, path string, f *frontend) {
+		opCtx, op := f.attach.beginFrontendPaths(ctx, []string{""})
+		go func() {
+			defer f.attach.finishFrontendOperation(op)
+			<-start
+			_, st := f.volume.Getattr(opCtx, path, nil)
+			results <- result{side: side, st: st}
+		}()
+	}
+	run("left", rightPath, left)
+	run("right", leftPath, right)
+	close(start)
+	for range 2 {
+		select {
+		case got := <-results:
+			if got.st != fsproto.OK {
+				t.Fatalf("%s cross-client getattr: %d", got.side, got.st)
+			}
+		case <-ctx.Done():
+			t.Fatal("symmetric cross-client authority reads deadlocked with reciprocal handoffs")
+		}
+	}
+	if left.waits.Load() == 0 || right.waits.Load() == 0 {
+		t.Fatalf("authority waits: left=%d right=%d, want both frontends suspended", left.waits.Load(), right.waits.Load())
 	}
 }
 

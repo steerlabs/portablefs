@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,7 +99,7 @@ func TestAuthorityMutationCannotRaceSameMountDelegationInstallation(t *testing.T
 		t.Fatal("seed create did not install the prerequisite delegation")
 	}
 
-	endAuthority, err := v.beginAuthorityMutation(ctx, nil, "d/authority")
+	authorityCtx, endAuthority, err := v.beginAuthorityMutation(ctx, nil, "d/authority")
 	if err != nil {
 		t.Fatalf("begin authority mutation: %v", err)
 	}
@@ -119,8 +120,14 @@ func TestAuthorityMutationCannotRaceSameMountDelegationInstallation(t *testing.T
 	case <-time.After(30 * time.Millisecond):
 	}
 
-	_, st, callErr := v.client.Create("d/authority", 0o644)
+	resp, callErr := v.client.DoContext(authorityCtx, &fsproto.Request{
+		Op: fsproto.OpCreate, Path: "d/authority", Mode: 0o644,
+	})
 	endAuthority()
+	st := int32(fsproto.EIO)
+	if resp != nil {
+		st = resp.Status
+	}
 	if callErr != nil || st != fsproto.OK {
 		t.Fatalf("authority create: status=%d err=%v", st, callErr)
 	}
@@ -140,6 +147,82 @@ func TestAuthorityMutationCannotRaceSameMountDelegationInstallation(t *testing.T
 	}
 	if _, st, err := v.client.Getattr("d/concurrent"); err != nil || st != fsproto.OK {
 		t.Fatalf("concurrent file missing: status=%d err=%v", st, err)
+	}
+}
+
+func TestCoveredDelegatedReadsNeverSuspendTheirPublication(t *testing.T) {
+	addr := serveCore(t)
+	var waits atomic.Int64
+	v := dialCore(t, addr, Options{
+		OnOperationWait: func(context.Context) func() {
+			waits.Add(1)
+			return func() {}
+		},
+	})
+	watchInvalidationsForTest(t, v)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, st := v.Mkdir(ctx, "d", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir: %d", st)
+	}
+	attr, st := v.Create(ctx, "d/local", 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create: %d", st)
+	}
+	if !v.wb.Covers("d/local") {
+		t.Fatal("test precondition: local file is not covered by a delegation")
+	}
+	waits.Store(0)
+	node := NewNodeState(attr.Ino, attr.Ino != 0)
+	if _, st := v.Getattr(ctx, "d/local", node); st != fsproto.OK {
+		t.Fatalf("covered getattr: %d", st)
+	}
+	if _, st := v.Read(ctx, "d/local", node, 0, 1); st != fsproto.OK {
+		t.Fatalf("covered read: %d", st)
+	}
+	if got := waits.Load(); got != 0 {
+		t.Fatalf("covered delegated reads suspended publication %d times", got)
+	}
+}
+
+func TestAuthorityOperationContextsSuspendEveryAuthorityRPC(t *testing.T) {
+	addr := serveCore(t)
+	var waits atomic.Int64
+	var resumes atomic.Int64
+	v := dialCore(t, addr, Options{
+		OnOperationWait: func(context.Context) func() {
+			waits.Add(1)
+			return func() { resumes.Add(1) }
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	authorityCtx, endAuthority, err := v.beginAuthorityMutation(ctx, nil, "missing")
+	if err != nil {
+		t.Fatalf("begin authority mutation: %v", err)
+	}
+	_, _, _, _, st, callErr := v.client.GetattrVContext(authorityCtx, "missing")
+	endAuthority()
+	if callErr != nil || st != fsproto.ENOENT {
+		t.Fatalf("authority-lane getattr: status=%d err=%v", st, callErr)
+	}
+	if waits.Load() != 1 || resumes.Load() != 1 {
+		t.Fatalf("authority-lane RPC wait/resume = %d/%d, want 1/1", waits.Load(), resumes.Load())
+	}
+
+	exactCtx, endExact, err := v.beginExactOperation(ctx)
+	if err != nil {
+		t.Fatalf("begin exact operation: %v", err)
+	}
+	_, _, _, _, st, callErr = v.client.GetattrVContext(exactCtx, "missing")
+	endExact()
+	if callErr != nil || st != fsproto.ENOENT {
+		t.Fatalf("exact-lane getattr: status=%d err=%v", st, callErr)
+	}
+	if waits.Load() != 2 || resumes.Load() != 2 {
+		t.Fatalf("exact-lane RPC wait/resume = %d/%d, want 2/2", waits.Load(), resumes.Load())
 	}
 }
 
@@ -236,10 +319,10 @@ func TestVolumePublicOpsEndToEnd(t *testing.T) {
 	if res, err := v.Setlk(ctx, &lh, "dir/b.txt", 77, 0, ^uint64(0), true, false); err != nil || res.Status != fsproto.OK {
 		t.Fatalf("Setlk: res=%+v err=%v", res, err)
 	}
-	if res, err := v.Getlk("dir/b.txt", 88, 0, ^uint64(0), true); err != nil || !res.Conflict {
+	if res, err := v.Getlk(ctx, "dir/b.txt", 88, 0, ^uint64(0), true); err != nil || !res.Conflict {
 		t.Fatalf("Getlk conflict: res=%+v err=%v", res, err)
 	}
-	ReleaseHandleLocks(v.Client(), &lh)
+	ReleaseHandleLocks(v.LockAuth(), &lh)
 	v.CloseHandle("a.txt", n)
 	if st := v.Remove(ctx, "sym", nil); st != fsproto.OK {
 		t.Fatalf("Remove symlink: %d", st)
