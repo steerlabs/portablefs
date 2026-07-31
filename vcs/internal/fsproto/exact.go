@@ -230,7 +230,19 @@ func buildMutationRecord(req *Request) (wal.Record, int32) {
 		if req.SetUID || req.SetGID {
 			groups++
 		}
+		// chflags is its own group for the same reason chown is: it maps to
+		// one WAL record. A client that wants chmod+chflags splits it into two
+		// identities, exactly as it already splits chmod+chown.
+		if req.SetFlags {
+			groups++
+		}
 		if groups != 1 {
+			return wal.Record{}, EINVAL
+		}
+		// The value only travels with its intent flag. Flags 0 is a legal
+		// chflags (clear everything), so a nonzero Flags without SetFlags is a
+		// client-state bug, not an implied group.
+		if !req.SetFlags && req.Flags != 0 {
 			return wal.Record{}, EINVAL
 		}
 		switch {
@@ -242,6 +254,13 @@ func buildMutationRecord(req *Request) (wal.Record, int32) {
 				MtimeMs: req.MtimeMs, ChtimesKeepMtime: !req.SetTime,
 				AtimeMs: req.AtimeMs, ChtimesSetAtime: req.SetATime,
 			}, OK
+		case req.SetFlags:
+			// The full uint32 verbatim — no server-side masking. Which BSD
+			// flags a mount may set is decided client-side (the FSKit policy
+			// layer); re-masking here would silently persist something other
+			// than what the client asked for and make the durable record
+			// disagree with the request that produced it.
+			return wal.Record{Op: wal.OpChflags, Path: req.Path, Ino: req.HandleIno, Flags: req.Flags}, OK
 		default:
 			// Chown intent flags: only the flagged field changes; the other
 			// resolves at ordered apply (deterministic on replay). A
@@ -308,6 +327,15 @@ func canonicalRecordHash(r wal.Record) []byte {
 		str("pfr1:chtimes-keep-mtime")
 		u64(1)
 	}
+	// Same discipline for the appended chflags op: only a record that IS a
+	// chflags folds in the flag word, so every pre-chflags fingerprint stays
+	// byte-identical across a rolling upgrade and a parked retry recorded by an
+	// older authority can never fence as a hash conflict. Folding it in
+	// unconditionally would change every existing record's hash.
+	if r.Op == wal.OpChflags {
+		str("pfr1:chflags")
+		u64(uint64(r.Flags))
+	}
 	var digest [sha256.Size]byte
 	return h.Sum(digest[:0])
 }
@@ -343,6 +371,14 @@ func (s *Server) probeResponse(clientVersion int64) *Response {
 		resp.LeaseMs = workfs.SessionLeaseTTL().Milliseconds()
 		if s.coordStore() != nil && s.supportsAtomicXattrFlags() {
 			resp.Features |= FeatureDelegatedXattrs
+		}
+		// Durable birth times and BSD file flags land together: both are
+		// fields of the same PFT2 inode record revision, so one bit describes
+		// the authority's whole metadata capability. Clients must gate on it
+		// rather than sniff an attr, because zero is a legitimate value for
+		// both fields.
+		if s.persistsInodeMetadata() {
+			resp.Features |= FeatureFlagPersistence
 		}
 	}
 	return resp
@@ -513,6 +549,14 @@ func (s *Server) exactMutate(cs *connSession, req *Request) *Response {
 	defer lk.Unlock()
 
 	record, errno := buildMutationRecord(req)
+	if errno == OK && req.Op == OpSetattr && req.SetFlags && !s.persistsInodeMetadata() {
+		// Fail CLOSED against a client that ignored the absent
+		// FeatureFlagPersistence bit: an authority with nowhere to store a
+		// flag word must refuse the group, not log a record whose effect it
+		// cannot serve back. Definite, so it is recorded against the slot
+		// like any other static rejection.
+		errno = EOPNOTSUPP
+	}
 	if errno != OK {
 		// Statically malformed: record the definite rejection durably so the
 		// slot's sequence progression survives retry, restart, and failover.

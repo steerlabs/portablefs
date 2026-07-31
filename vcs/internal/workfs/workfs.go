@@ -98,12 +98,25 @@ func orphanSweepInterval() time.Duration {
 }
 
 type inode struct {
-	name       string
-	kind       string // "file" | "directory" | "symlink"
-	mode       os.FileMode
-	mtime      time.Time
-	ctime      time.Time
-	atime      time.Time
+	name  string
+	kind  string // "file" | "directory" | "symlink"
+	mode  os.FileMode
+	mtime time.Time
+	ctime time.Time
+	atime time.Time
+	// birthtime is the inode's durable creation time. It is stamped ONCE, when
+	// the inode is created, from the record's ordered op time, and no later
+	// mutation moves it: writes, truncates, chmods, chtimes, renames, and hard
+	// links all leave it alone. The zero time means "unknown" — an inode
+	// hydrated from a pre-birthtime PFT2 tree — and is served on the wire as 0
+	// so the client keeps its existing mtime-derivation convention rather than
+	// reporting 1970.
+	birthtime time.Time
+	// flags carries the BSD file flags (Darwin st_flags / chflags(2)) as the
+	// full opaque uint32 the client sent. Which bits a mount is allowed to set
+	// is a client-side policy decision; the authority stores and serves what it
+	// was given.
+	flags      uint32
 	uid        uint32 // POSIX owner (0 = root)
 	gid        uint32 // POSIX group (0 = root)
 	ino        uint64 // stable authority-assigned identity: survives rename, distinct from name/path
@@ -288,7 +301,7 @@ func New(entries []backend.Entry, blobs content.BlobReader, w *wal.WAL) (*FS, er
 func NewWithCache(entries []backend.Entry, blobs content.BlobReader, w *wal.WAL, cache content.Cache) (*FS, error) {
 	now := time.Now()
 	fs := &FS{
-		root:         &inode{ino: 1, kind: "directory", mode: os.ModeDir | 0o755, mtime: now, ctime: now, atime: now, children: map[string]*inode{}},
+		root:         &inode{ino: 1, kind: "directory", mode: os.ModeDir | 0o755, mtime: now, ctime: now, atime: now, birthtime: now, children: map[string]*inode{}},
 		blobs:        blobs,
 		cache:        cache,
 		wal:          w,
@@ -1452,6 +1465,18 @@ func (fs *FS) applyMutationAs(r wal.Record, owner string) (uint64, bool, error) 
 			n.mtime = time.UnixMilli(r.MtimeMs)
 		}
 		return 0, true, nil
+	case wal.OpChflags:
+		n := fs.resolveForRW(r.Path, r.Ino)
+		if n == nil {
+			return 0, false, os.ErrNotExist
+		}
+		// Absolute assignment of the full uint32 the client sent: no bit is
+		// masked here. Which flags a mount may set is a client-side policy
+		// decision, and re-masking at apply would make the durable tree
+		// disagree with the record that produced it. Timestamps are untouched
+		// (the chmod discipline).
+		n.flags = r.Flags
+		return 0, true, nil
 	case wal.OpChown:
 		n := fs.resolveForRW(r.Path, r.Ino)
 		if n == nil {
@@ -1644,6 +1669,18 @@ func (fs *FS) applyManagedMutation(r wal.Record, owner string) (uint64, bool, er
 			n.mtime = time.UnixMilli(r.MtimeMs)
 		}
 		return 0, true, nil
+	case wal.OpChflags:
+		n := fs.resolveForRW(r.Path, r.Ino)
+		if n == nil {
+			return 0, false, os.ErrNotExist
+		}
+		// Absolute assignment of the full uint32 the client sent: no bit is
+		// masked here. Which flags a mount may set is a client-side policy
+		// decision, and re-masking at apply would make the durable tree
+		// disagree with the record that produced it. Timestamps are untouched
+		// (the chmod discipline).
+		n.flags = r.Flags
+		return 0, true, nil
 	case wal.OpChown:
 		n := fs.resolveForRW(r.Path, r.Ino)
 		if n == nil {
@@ -1705,7 +1742,11 @@ func (fs *FS) applyCreate(name, kind string, mode os.FileMode, target string, in
 	if ierr != nil {
 		return false, ierr
 	}
-	n := &inode{ino: assigned, name: base, kind: kind, mode: mode, mtime: now, ctime: now, atime: now, linkTarget: target, nlink: 1}
+	// birthtime is stamped here and only here: `now` is the record's ordered op
+	// time (recordTime — the server-selected TsMs), so a replay of the same
+	// journal reproduces the identical birth time instead of re-reading a wall
+	// clock. Nothing downstream ever writes it again.
+	n := &inode{ino: assigned, name: base, kind: kind, mode: mode, mtime: now, ctime: now, atime: now, birthtime: now, linkTarget: target, nlink: 1}
 	if kind == "file" {
 		n.born = true // a freshly created file is local + empty (no backend base)
 		n.blocks = map[int64][]byte{}
@@ -1784,7 +1825,7 @@ func (fs *FS) applyMkdirExact(name string, mode os.FileMode, ino uint64, now tim
 	}
 	child := &inode{
 		ino: assigned, name: base, kind: "directory",
-		mode: os.ModeDir | mode, mtime: now, ctime: now, atime: now,
+		mode: os.ModeDir | mode, mtime: now, ctime: now, atime: now, birthtime: now,
 		children: map[string]*inode{},
 	}
 	parent.children[base] = child
@@ -1853,7 +1894,7 @@ func (fs *FS) applyMkdirAll(name string, mode os.FileMode, inos []uint64, now ti
 		}
 		child := &inode{
 			ino: assigned, name: parts[i], kind: "directory",
-			mode: os.ModeDir | mode, mtime: now, ctime: now, atime: now,
+			mode: os.ModeDir | mode, mtime: now, ctime: now, atime: now, birthtime: now,
 			children: map[string]*inode{},
 		}
 		cur.children[parts[i]] = child

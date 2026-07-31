@@ -482,6 +482,8 @@ func marshalCapabilities(m *Capabilities) []byte {
 	b = appendU32(b, 5, m.MaxNameBytes)
 	b = appendU64(b, 6, m.MaxFileSize)
 	b = appendU32(b, 7, m.PreferredIOSize)
+	b = appendBool(b, 8, m.FlagsSupported)
+	b = appendBool(b, 9, m.FlagsUnderstood)
 	return b
 }
 
@@ -519,6 +521,14 @@ func parseCapabilitiesField(wt int, raw []byte) (Capabilities, error) {
 		case 7:
 			v, err := scalarU64(wt, raw)
 			m.PreferredIOSize = uint32(v)
+			return err
+		case 8:
+			v, err := scalarBool(wt, raw)
+			m.FlagsSupported = v
+			return err
+		case 9:
+			v, err := scalarBool(wt, raw)
+			m.FlagsUnderstood = v
 			return err
 		}
 		return nil
@@ -850,6 +860,11 @@ func marshalSetAttrRequest(m *SetAttrRequest) []byte {
 		b = appendI64Present(b, 7, *m.AtimeMs)
 	}
 	b = appendU64(b, 8, m.Handle)
+	// The intent bool is what makes the group present; the word itself is a
+	// plain uint32 whose zero encodes as absent, which is correct — a chflags
+	// that clears everything is set_flags=true with no flags field on the wire.
+	b = appendBool(b, 9, m.SetFlags)
+	b = appendU32(b, 10, m.Flags)
 	return b
 }
 
@@ -891,6 +906,12 @@ func unmarshalSetAttrRequest(b []byte) (*SetAttrRequest, error) {
 			m.AtimeMs = &vv
 		case 8:
 			m.Handle, err = scalarU64(wt, raw)
+		case 9:
+			m.SetFlags, err = scalarBool(wt, raw)
+		case 10:
+			var v uint64
+			v, err = scalarU64(wt, raw)
+			m.Flags = uint32(v)
 		}
 		return err
 	})

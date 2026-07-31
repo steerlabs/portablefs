@@ -292,6 +292,83 @@ func (v *Volume) authorityWaitContext(ctx context.Context) context.Context {
 	})
 }
 
+// exclusionRelease owns the delegation/namespace exclusion one frontend
+// operation runs under, and defers that exclusion's release until every exact
+// identity issued inside the operation's window has a definite outcome.
+//
+// THE INVARIANT: an exact identity that may have been sent must reach a
+// definite outcome before the exclusion state it was issued under is released
+// to anyone else. An identity whose transport dies after a possible send is
+// parked for background replay and can execute minutes later — after a fresh
+// delegation or transition claim over the same scope would otherwise have been
+// granted to this mount or a peer.
+//
+// The operation holds one reference (dropped by its own end()); every identity
+// parked under the operation's context takes another (fsproto.WithParkTransfer
+// → acquire), dropped when the replayer reaches a definite reply, a session
+// fence, or client teardown. The underlying release runs exactly once, when
+// the LAST reference drops, so the ordinary (no-park) path is unchanged and a
+// parked path simply postpones the handover.
+type exclusionRelease struct {
+	mu      sync.Mutex
+	refs    int
+	release func()
+	endOnce sync.Once
+}
+
+func newExclusionRelease(release func()) *exclusionRelease {
+	return &exclusionRelease{refs: 1, release: release}
+}
+
+// end drops the operation's own reference. It is idempotent: a caller that
+// both defers end() and calls it inline releases nothing twice.
+func (r *exclusionRelease) end() {
+	r.endOnce.Do(r.drop)
+}
+
+// acquire takes a park's reference and returns its single-use drop. It is
+// called synchronously from the parking mutation, i.e. strictly inside the
+// operation's window, so the reference can never be taken after the
+// underlying release already ran. That is an invariant, not a tolerated
+// state: acquiring a released exclusion means an exact identity escaped the
+// window its exclusion was scoped to, and silently continuing would hide
+// exactly the integrity bug this type exists to prevent.
+func (r *exclusionRelease) acquire() func() {
+	r.mu.Lock()
+	if r.release == nil {
+		r.mu.Unlock()
+		panic("clientcore: exclusion reference acquired after release")
+	}
+	r.refs++
+	r.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(r.drop) }
+}
+
+func (r *exclusionRelease) drop() {
+	r.mu.Lock()
+	r.refs--
+	if r.refs < 0 {
+		r.mu.Unlock()
+		panic("clientcore: exclusion reference dropped below zero")
+	}
+	var release func()
+	if r.refs == 0 {
+		release, r.release = r.release, nil
+	}
+	r.mu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+// held reports whether the exclusion is still owned by anyone (test seam).
+func (r *exclusionRelease) held() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.release != nil
+}
+
 // beginAuthorityMutation linearizes one or more path-bearing authority
 // mutations against local delegation acquisition. Acquisition owns the
 // exclusive side until its grant is installed; authority mutations share the
@@ -342,8 +419,22 @@ func (v *Volume) beginAuthorityMutation(
 	// returned context brackets every such RPC independently, re-entering
 	// frontend admission after its reply and before the typed protocol helper
 	// publishes self-write metadata. The transition claim remains held until
-	// the caller completes all result/cache/registry bookkeeping.
-	return v.authorityWaitContext(ctx), claim.end, nil
+	// the caller completes all result/cache/registry bookkeeping — AND, if any
+	// exact identity issued under it parked with an unknown outcome, until
+	// that identity is definite (exclusionRelease + WithParkTransfer). A
+	// parked mutation may still execute, so its claim must not be handed to an
+	// overlapping delegation acquisition in the meantime.
+	guard := newExclusionRelease(claim.end)
+	return v.parkTransferContext(ctx, guard), guard.end, nil
+}
+
+// parkTransferContext returns the authority-wait context with this
+// operation's exclusion registered for park transfer.
+func (v *Volume) parkTransferContext(
+	ctx context.Context,
+	guard *exclusionRelease,
+) context.Context {
+	return fsproto.WithParkTransfer(v.authorityWaitContext(ctx), guard.acquire)
 }
 
 func (v *Volume) beginMutation(ctx context.Context) error {
@@ -396,11 +487,25 @@ func (v *Volume) beginExactOperation(ctx context.Context) (context.Context, func
 			return ctx, nil, err
 		}
 	}
-	return v.authorityWaitContext(ctx), func() {
+	// The exact exclusion (v.exactMu exclusive + the engine's BeginExact
+	// acquisition barrier) is what a parked identity must keep: it is the only
+	// thing preventing a new delegation over the same inode from being
+	// acquired while a possibly-sent inode-addressed mutation can still
+	// execute. It therefore transfers to any park issued under this context.
+	//
+	// lifecycleMu deliberately does NOT transfer. It is the gate the volume
+	// close path takes exclusively to reach client.Close(), and closing the
+	// client is exactly what fences the session and thereby RESOLVES a parked
+	// identity. Transferring it would make the invariant unsatisfiable by
+	// deadlocking teardown against the park it is trying to terminate.
+	guard := newExclusionRelease(func() {
 		if endWriteback != nil {
 			endWriteback()
 		}
 		v.exactMu.Unlock()
+	})
+	return v.parkTransferContext(ctx, guard), func() {
+		guard.end()
 		v.lifecycleMu.RUnlock()
 	}, nil
 }
@@ -863,6 +968,7 @@ func entryFromAttr(name string, a fsproto.Attr) writeback.Entry {
 		Name: name, Kind: a.Kind, Mode: a.Mode, Size: a.Size,
 		MtimeMs: a.MtimeMs, CtimeMs: a.CtimeMs, AtimeMs: a.AtimeMs,
 		UID: a.Uid, GID: a.Gid, Ino: a.Ino, Nlink: a.Nlink,
+		Flags: a.Flags,
 	}
 }
 
@@ -896,6 +1002,7 @@ func attrFromEntry(e writeback.Entry) fsproto.Attr {
 		Kind: e.Kind, Mode: e.Mode, Size: e.Size, AllocSize: e.Size,
 		MtimeMs: e.MtimeMs, CtimeMs: e.CtimeMs, AtimeMs: e.AtimeMs,
 		Uid: e.UID, Gid: e.GID, Ino: e.Ino, Nlink: e.Nlink,
+		Flags: e.Flags,
 	}
 	if a.MtimeMs == 0 {
 		a.MtimeMs = time.Now().UnixMilli()
@@ -1074,6 +1181,23 @@ func (v *Volume) Client() *fsproto.Client { return v.client }
 
 // Writeback exposes the mount engine's status surface.
 func (v *Volume) Writeback() *writeback.Engine { return v.wb }
+
+// SupportsFlagPersistence reports whether the ATTACHED authority durably
+// stores BSD file flags (fsproto.FeatureFlagPersistence). It is a per-attach
+// fact answered from the immutable version probe, never from an observed
+// attribute: zero is a legitimate flag word, so no getattr can distinguish
+// "this authority cannot store flags" from "this inode has none set".
+//
+// Frontends consult it BEFORE a chflags(2) so an authority without the bit is
+// refused honestly (ENOTSUP) instead of the change being silently dropped, and
+// so the mount can publish a truthful volume capability. Precedent:
+// Features()&FeatureDelegatedXattrs above.
+func (v *Volume) SupportsFlagPersistence() bool {
+	if v == nil || v.client == nil {
+		return false
+	}
+	return v.client.Features()&fsproto.FeatureFlagPersistence != 0
+}
 
 // LockAuth returns the advisory-lock surface bound to this volume's authority
 // generation. Every lock acquire, release, and getlk must route through it —

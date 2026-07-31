@@ -238,6 +238,21 @@ export interface Pft2Inode {
   mtimeMs: bigint;
   ctimeMs: bigint;
   atimeMs: bigint;
+  /**
+   * Durable creation time (wire field 14). Stamped once, at inode creation,
+   * from the journaled record's op time and never moved again — writes,
+   * truncates, chmods, renames, and hard links all leave it alone. 0n is
+   * canonically absent: every inode written by a pre-birthtime authority
+   * decodes to 0n, and consumers must read 0n as "unknown", never as 1970.
+   */
+  birthtimeMs: bigint;
+  /**
+   * BSD file flags (Darwin st_flags / chflags(2)) as the full opaque uint32
+   * the client sent (wire field 15). The format defines no bit policy —
+   * masking which flags a mount may set is a client-side decision. 0 is
+   * canonically absent and is what every pre-flags inode decodes to.
+   */
+  flags: number;
   directoryRoot?: Pft2Ref;
   extentRoot?: Pft2Ref;
   symlinkTarget: string;
@@ -531,6 +546,14 @@ function validateInode(inode: Pft2Inode): void {
   }
   if (!validTimeMs(inode.mtimeMs) || !validTimeMs(inode.ctimeMs) || !validTimeMs(inode.atimeMs)) {
     throw invalidNode(`inode ${inode.ino}: timestamp outside ±${PFT2_MAX_ABS_TIME_MS} ms`);
+  }
+  if (!validTimeMs(inode.birthtimeMs)) {
+    throw invalidNode(`inode ${inode.ino}: birth time outside ±${PFT2_MAX_ABS_TIME_MS} ms`);
+  }
+  // flags is the full uint32 the client sent: no bit is reserved or rejected
+  // here (see the Pft2Inode.flags contract).
+  if (!Number.isInteger(inode.flags) || inode.flags < 0 || inode.flags > 0xffffffff) {
+    throw invalidNode(`inode ${inode.ino}: flags out of range`);
   }
   if (inode.size < 0n) {
     throw invalidNode(`inode ${inode.ino}: negative size`);

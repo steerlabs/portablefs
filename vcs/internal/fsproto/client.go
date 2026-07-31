@@ -82,6 +82,11 @@ type Client struct {
 	lifecycleCancel context.CancelFunc
 	dedicated       map[*conn]struct{}
 	dedicatedWG     sync.WaitGroup
+	// parkWG joins the background replayers of parked exact identities. They
+	// own the caller's exclusion release (WithParkTransfer), so teardown must
+	// not return until every one of them has reached its definite outcome and
+	// dropped that ownership — otherwise a claim would outlive the client.
+	parkWG sync.WaitGroup
 
 	// health tracks authority transport reachability (the fail-fast breaker,
 	// see failfast.go); shared by every pooled, subscribe, and probe conn.
@@ -670,6 +675,54 @@ func beginAuthorityWait(ctx context.Context) func() {
 	return resume
 }
 
+type parkTransferContextKey struct{}
+
+// WithParkTransfer makes an exact identity parked under ctx take OWNERSHIP of
+// the exclusion state its mutation was issued under.
+//
+// An exact mutation whose transport dies after a possible send has an UNKNOWN
+// outcome: the identity parks and the background replayer resends the
+// IDENTICAL identity until the authority answers definitively. The foreground
+// caller still returns ErrMutationUnknown immediately (fast cancellation is
+// preserved), but it must not hand the delegation/namespace exclusion it
+// mutated under to anyone else while that identity can still execute.
+//
+// acquire is called SYNCHRONOUSLY at park time — before the parking caller
+// returns — and yields the release the replayer runs once the identity reaches
+// a definite outcome: an authority reply (executed or the stored duplicate
+// outcome), a session fence, or client teardown. The last two are definite for
+// the parked identity as well: a fenced generation can never execute, and its
+// authority-side pins resolve through terminalization.
+//
+// The installer (clientcore) owns the reference counting that turns the
+// caller's own release into a no-op while a parked identity still holds it.
+// Callers that install no hook — FUSE/benchmount paths that call the client
+// directly — behave exactly as they did before: parking releases nothing
+// because there is nothing registered to release.
+func WithParkTransfer(ctx context.Context, acquire func() (release func())) context.Context {
+	if acquire == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, parkTransferContextKey{}, acquire)
+}
+
+// beginParkTransfer captures the caller's exclusion for one park. It always
+// returns a non-nil release; with no hook installed the release is a no-op.
+func beginParkTransfer(ctx context.Context) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	acquire, _ := ctx.Value(parkTransferContextKey{}).(func() func())
+	if acquire == nil {
+		return func() {}
+	}
+	release := acquire()
+	if release == nil {
+		return func() {}
+	}
+	return release
+}
+
 // DoContext is Do with caller lifetime propagation. Cancellation interrupts
 // and joins the checked-out transport before it can be returned to the pool,
 // so an abandoned frontend read cannot remain live and later install a stale
@@ -705,7 +758,7 @@ func (c *Client) DoContext(ctx context.Context, req *Request) (*Response, error)
 		// path; the authority-wait hook remains suspended until it returns.
 		var firstGateEAGAIN time.Time
 		for {
-			resp, err := c.doExact(req)
+			resp, err := c.doExact(ctx, req)
 			if err != nil || resp.Status != EAGAIN {
 				return resp, err
 			}
@@ -1156,7 +1209,7 @@ func (c *Client) MarkOpen(ino uint64) (int32, error) {
 // The pin transition is a journaled coordination decision riding an exact
 // identity (doCoordinate).
 func (c *Client) MarkOpenGen(ino uint64) (int32, uint64, error) {
-	r, err := c.doCoordinate(&Request{Op: OpMarkOpen, OpenIno: ino, OpenState: true, Owner: c.owner})
+	r, err := c.doCoordinate(context.Background(), &Request{Op: OpMarkOpen, OpenIno: ino, OpenState: true, Owner: c.owner})
 	if err != nil {
 		return EIO, 0, err
 	}
@@ -1165,7 +1218,7 @@ func (c *Client) MarkOpenGen(ino uint64) (int32, uint64, error) {
 
 // UnmarkOpen clears this mount's open hold on ino (its last local close).
 func (c *Client) UnmarkOpen(ino uint64) (int32, error) {
-	r, err := c.doCoordinate(&Request{Op: OpMarkOpen, OpenIno: ino, OpenState: false, Owner: c.owner})
+	r, err := c.doCoordinate(context.Background(), &Request{Op: OpMarkOpen, OpenIno: ino, OpenState: false, Owner: c.owner})
 	if err != nil {
 		return EIO, err
 	}
@@ -1282,6 +1335,11 @@ func (c *Client) Close() error {
 		c.expireSessionOnClose()
 		c.closeTransportGate()
 	})
+	// expireSessionOnClose always fences the session, and the transport gate
+	// interrupts every socket, so every parked replayer is already resolving.
+	// Joining them here is what makes teardown DEFINITE for the exclusions
+	// they own: no transferred claim survives the client that issued it.
+	c.parkWG.Wait()
 	c.closeDedicated()
 	c.closePool()
 	return nil
@@ -1300,9 +1358,26 @@ func (c *Client) Abort() error {
 		}
 		c.closeTransportGate()
 	})
+	c.parkWG.Wait()
 	c.closeDedicated()
 	c.closePool()
 	return nil
+}
+
+// registerPark joins a parked identity's replayer to the client's close
+// lifecycle. The closed check and the WaitGroup Add share lifecycleMu with the
+// terminal close transition, so no replayer can start after teardown stopped
+// waiting for them — and a park that loses that race releases its transferred
+// exclusion inline instead of stranding it behind a goroutine that would
+// immediately return.
+func (c *Client) registerPark() bool {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.isClosed() {
+		return false
+	}
+	c.parkWG.Add(1)
+	return true
 }
 
 // registerDedicated joins a dedicated transport to the client's close
@@ -1690,9 +1765,9 @@ func (c *Client) Setattr(path string, mode uint32, setMode bool, mtimeMs int64, 
 // SetattrHandle applies metadata by an open file handle's stable ino when handleIno is non-zero.
 //
 // Under exact sessions each identity maps 1:1 to a single WAL record, so a
-// kernel SETATTR carrying several attribute groups (mode + times + owner) is
-// split into one exact mutation per group; a v1 server keeps receiving the
-// combined request unchanged.
+// kernel SETATTR carrying several attribute groups (mode + times + owner +
+// flags) is split into one exact mutation per group; a single-group request
+// travels unchanged. See SetattrVContext for the splitter.
 func (c *Client) SetattrHandle(path string, handleIno uint64, mode uint32, setMode bool, mtimeMs int64, setTime bool, uid, gid uint32, setUID, setGID bool) (int32, error) {
 	return c.SetattrTimesHandle(
 		path, handleIno, mode, setMode,
@@ -1737,19 +1812,79 @@ func (c *Client) SetattrTimesHandleContext(
 	uid, gid uint32,
 	setUID, setGID bool,
 ) (int32, error) {
-	groups := make([]*Request, 0, 3)
-	if setMode {
-		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, Mode: mode, SetMode: true})
+	return c.SetattrVContext(ctx, path, handleIno, SetattrV{
+		Mode: mode, SetMode: setMode,
+		MtimeMs: mtimeMs, SetTime: setTime,
+		AtimeMs: atimeMs, SetATime: setATime,
+		UID: uid, GID: gid, SetUID: setUID, SetGID: setGID,
+	})
+}
+
+// SetattrV is the WHOLE setattr surface as one value. Every positional
+// Setattr* entry point funnels through it, so adding an attribute group (BSD
+// flags did) neither churns the existing signatures nor lets a caller forget
+// a field.
+type SetattrV struct {
+	Mode    uint32
+	SetMode bool
+
+	MtimeMs  int64
+	SetTime  bool
+	AtimeMs  int64
+	SetATime bool
+
+	UID    uint32
+	SetUID bool
+	GID    uint32
+	SetGID bool
+
+	// Flags/SetFlags is the chflags(2) group: the ABSOLUTE new BSD file-flag
+	// word, not a delta. Zero is a legal value (clear everything), so SetFlags
+	// is the only signal that a change was asked for.
+	//
+	// This group is only legal against an authority that advertises
+	// FeatureFlagPersistence — an authority without it has nowhere to store a
+	// flag word and answers EOPNOTSUPP rather than pretending. Callers gate
+	// on Features()&FeatureFlagPersistence BEFORE the mutation (clientcore's
+	// Volume.SupportsFlagPersistence) so the refusal is a definite pre-flight
+	// ENOTSUP, never a failed operation.
+	Flags    uint32
+	SetFlags bool
+}
+
+// SetattrVContext applies one kernel SETATTR, splitting it into one exact
+// mutation per attribute group.
+//
+// Under exact sessions each identity maps 1:1 to a single WAL record, so a
+// request carrying several groups (mode, times, owner, flags) cannot travel as
+// one identity: the authority answers a multi-group setattr with EINVAL. The
+// split is what makes chmod+chown+chflags in one syscall land as three
+// ordered, individually exact-once records.
+func (c *Client) SetattrVContext(
+	ctx context.Context,
+	path string,
+	handleIno uint64,
+	req SetattrV,
+) (int32, error) {
+	groups := make([]*Request, 0, 4)
+	if req.SetMode {
+		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, Mode: req.Mode, SetMode: true})
 	}
-	if setTime || setATime {
+	if req.SetTime || req.SetATime {
 		groups = append(groups, &Request{
 			Op: OpSetattr, Path: path, HandleIno: handleIno,
-			MtimeMs: mtimeMs, SetTime: setTime,
-			AtimeMs: atimeMs, SetATime: setATime,
+			MtimeMs: req.MtimeMs, SetTime: req.SetTime,
+			AtimeMs: req.AtimeMs, SetATime: req.SetATime,
 		})
 	}
-	if setUID || setGID {
-		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, UID: uid, GID: gid, SetUID: setUID, SetGID: setGID})
+	if req.SetUID || req.SetGID {
+		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, UID: req.UID, GID: req.GID, SetUID: req.SetUID, SetGID: req.SetGID})
+	}
+	// chflags is its own group for exactly the reason chown is: one group,
+	// one WAL record, one exact identity. The value travels only with its
+	// intent flag — a zero Flags without SetFlags must not imply "clear".
+	if req.SetFlags {
+		groups = append(groups, &Request{Op: OpSetattr, Path: path, HandleIno: handleIno, Flags: req.Flags, SetFlags: true})
 	}
 	if len(groups) != 1 {
 		for _, g := range groups {
@@ -1766,10 +1901,11 @@ func (c *Client) SetattrTimesHandleContext(
 	}
 	r, err := c.DoContext(ctx, &Request{
 		Op: OpSetattr, Path: path, HandleIno: handleIno,
-		Mode: mode, SetMode: setMode,
-		MtimeMs: mtimeMs, SetTime: setTime,
-		AtimeMs: atimeMs, SetATime: setATime,
-		UID: uid, GID: gid, SetUID: setUID, SetGID: setGID,
+		Mode: req.Mode, SetMode: req.SetMode,
+		MtimeMs: req.MtimeMs, SetTime: req.SetTime,
+		AtimeMs: req.AtimeMs, SetATime: req.SetATime,
+		UID: req.UID, GID: req.GID, SetUID: req.SetUID, SetGID: req.SetGID,
+		Flags: req.Flags, SetFlags: req.SetFlags,
 	})
 	if err != nil {
 		return EIO, err

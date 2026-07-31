@@ -586,6 +586,9 @@ func (e *Engine) noteApplied(through uint64, digest [32]byte) {
 			e.logf("writeback: APPLIED checkpoint at %d failed (nothing reclaimed): %v", through, err)
 		}
 	}
+	// Republish the exhaustion mirror the data plane reads: a watermark that
+	// reclaimed segments is exactly what lifts a definite ENOSPC.
+	e.noteBudgetLocked()
 	job := e.job
 	e.mu.Unlock()
 	if job != nil {

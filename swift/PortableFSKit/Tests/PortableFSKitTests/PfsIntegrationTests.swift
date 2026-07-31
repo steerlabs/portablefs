@@ -260,3 +260,151 @@ private func bytes(_ string: String) -> Data {
         #expect(error.posixErrno == ESTALE)
     }
 }
+
+/// The chflags(2) write path end to end: the extension forwards the intent and
+/// the daemon — the only layer that knows the attached authority's features —
+/// persists it. A zero word is a real "clear everything", not "no change".
+@Test func flagChangesRoundTripThroughTheDaemonWhenTheAuthorityPersistsThem() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let capabilities = await core.resolvedVolume?.capabilities
+    #expect(capabilities?.flagsSupported == true)
+    #expect(capabilities?.flagsUnderstood == true)
+
+    let root = try await core.rootItem()
+    let created = try await core.createFile(in: root, name: bytes("flagged.txt"), mode: 0o644)
+    #expect(created.attr.flags == 0)
+
+    let immutable = UInt32(UF_IMMUTABLE) | UInt32(UF_HIDDEN)
+    let set = try await core.setattr(item: created.item, attributes: .init(flags: immutable))
+    #expect(set.flags == immutable)
+    #expect(try await core.getattr(item: created.item).flags == immutable)
+
+    // Clearing is a durable state of its own, and it must not disturb a
+    // neighbouring group applied in the same request.
+    let cleared = try await core.setattr(item: created.item, attributes: .init(mode: 0o600, flags: 0))
+    #expect(cleared.flags == 0)
+    #expect(cleared.mode == 0o600)
+
+    // A setattr with no flags intent leaves the stored word alone rather than
+    // resetting it to the proto default.
+    _ = try await core.setattr(item: created.item, attributes: .init(flags: immutable))
+    _ = try await core.setattr(item: created.item, attributes: .init(mtimeMilliseconds: 123_000))
+    #expect(try await core.getattr(item: created.item).flags == immutable)
+}
+
+/// THE REGRESSION THIS PINS. `flagsSupported` describes the attached
+/// AUTHORITY's durable flag storage; it is not a verdict on the volume. A
+/// machine-local graft in the same namespace is backed by a real host inode,
+/// so chflags(2) on it persists with no authority feature involved. A frontend
+/// that gated forwarding on `flagsSupported` refused every flags change on
+/// such a mount — including the graft ones that would have worked, and
+/// including via a static capability that stopped the kernel before the
+/// extension was even asked.
+///
+/// So: `flagsUnderstood` true with `flagsSupported` false means FORWARD, and
+/// let the daemon answer per target.
+@Test func flagChangesAreForwardedWhenTheDaemonUnderstandsThemEvenWithoutAuthorityPersistence() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(
+        flagsSupported: false,
+        flagsUnderstood: true,
+        graftBackedNames: ["grafted.txt"]
+    ))
+    defer { daemon.stop() }
+
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let capabilities = await core.resolvedVolume?.capabilities
+    #expect(capabilities?.flagsSupported == false)
+    #expect(capabilities?.flagsUnderstood == true)
+    // The static capability must not declare blanket non-support: some objects
+    // on this volume take a flag word. The kernel has to let the request
+    // through so the per-object answer can be given.
+    #expect(!PfsFSKitMapping.supportedCapabilities(
+        from: capabilities ?? PfsCapabilities()
+    ).doesNotSupportImmutableFiles)
+
+    let root = try await core.rootItem()
+    let grafted = try await core.createFile(in: root, name: bytes("grafted.txt"), mode: 0o644)
+
+    // Graft-backed: the change is forwarded AND applied, with no authority
+    // feature anywhere in the story.
+    let immutable = UInt32(UF_IMMUTABLE) | UInt32(UF_HIDDEN)
+    let set = try await core.setattr(item: grafted.item, attributes: .init(flags: immutable))
+    #expect(set.flags == immutable)
+    #expect(try await core.getattr(item: grafted.item).flags == immutable)
+
+    // Authority-backed, same connection, same request shape: refused — and
+    // refused by the DAEMON, which is the only layer that knows the backing.
+    let remote = try await core.createFile(in: root, name: bytes("authority.txt"), mode: 0o644)
+    do {
+        _ = try await core.setattr(
+            item: remote.item,
+            attributes: .init(mode: 0o600, flags: immutable)
+        )
+        Issue.record("an authority without flag persistence accepted a chflags")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == ENOTSUP)
+        #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOTSUP))
+    }
+    // The refusal applied nothing, co-travelling groups included.
+    #expect(try await core.getattr(item: remote.item).mode == 0o644)
+
+    // Both requests REACHED the daemon. This is the assertion that fails when
+    // the extension gates on `flagsSupported`: it would have refused locally
+    // and the daemon would have seen no flags change at all.
+    let stats = await daemon.stats()
+    #expect(stats.flagChangeRequests == 2)
+}
+
+/// The rolling-upgrade case the daemon-side refusal cannot cover: a NEW
+/// frontend against an OLD daemon at the SAME protocol minor. `set_flags` and
+/// `flags` are appended fields, so that daemon proto3-discards them, applies
+/// the rest of the setattr and answers OK — a chflags(2) that returns success
+/// while nothing changed. It advertises neither `flagsSupported` nor
+/// `flagsUnderstood` — it cannot set fields it does not know exist — so the
+/// absent `flagsUnderstood` decodes false and the frontend's own gate refuses
+/// instead of forwarding. Forwarding here is the bug; the mock deliberately
+/// would NOT complain about it.
+@Test func flagChangesAreNotForwardedToADaemonPredatingTheFlagFields() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(predatesFlagFields: true))
+    defer { daemon.stop() }
+
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let capabilities = await core.resolvedVolume?.capabilities
+    #expect(capabilities?.flagsSupported == false)
+    #expect(capabilities?.flagsUnderstood == false)
+    // A daemon that cannot parse the request is the one case where a blanket
+    // "no immutable files" is the truth.
+    #expect(PfsFSKitMapping.supportedCapabilities(
+        from: capabilities ?? PfsCapabilities()
+    ).doesNotSupportImmutableFiles)
+
+    let root = try await core.rootItem()
+    let created = try await core.createFile(in: root, name: bytes("old-daemon.txt"), mode: 0o644)
+
+    do {
+        _ = try await core.setattr(
+            item: created.item,
+            attributes: .init(mode: 0o600, flags: UInt32(UF_IMMUTABLE))
+        )
+        Issue.record("a flags change was forwarded to a daemon that silently discards it")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == ENOTSUP)
+    }
+
+    // Proof the refusal was the frontend's: had it forwarded, this daemon
+    // would have reported success with the flag word dropped and the mode
+    // applied.
+    let after = try await core.getattr(item: created.item)
+    #expect(after.flags == 0)
+    #expect(after.mode == 0o644)
+
+    // Nothing was even sent: the refusal happened before the frame was built.
+    #expect(await daemon.stats().flagChangeRequests == 0)
+
+    // Everything an old daemon DOES understand keeps working.
+    let modeOnly = try await core.setattr(item: created.item, attributes: .init(mode: 0o600))
+    #expect(modeOnly.mode == 0o600)
+}

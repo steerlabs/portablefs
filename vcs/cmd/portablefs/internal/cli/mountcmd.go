@@ -465,19 +465,70 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 	return nil
 }
 
+// lstatMountPath and kernelMountsAt are the two ways this package learns about
+// a mount path. They are vars so CLI tests can drive the dead-volume and
+// stale-record classifications without a real wedged kernel mount.
+var (
+	lstatMountPath = os.Lstat
+	kernelMountsAt = platformKernelMountsAt
+)
+
+// exactKernelMountAt returns the single kernel mount whose mount point is
+// exactly path, or nil when nothing is mounted there. Stacked mounts are an
+// ambiguity this product refuses to act on. It never resolves a pathname
+// through a mounted filesystem, so it is the ONLY identification that still
+// answers once a volume is dead and every syscall into it returns EIO.
+func exactKernelMountAt(path string) (*kernelMountIdentity, error) {
+	mounts, err := kernelMountsAt(path)
+	if err != nil {
+		return nil, err
+	}
+	switch len(mounts) {
+	case 0:
+		return nil, nil
+	case 1:
+		mount := mounts[0]
+		return &mount, nil
+	default:
+		return nil, fmt.Errorf(
+			"kernel mount identity at %s is ambiguous: %d stacked entries share the path",
+			path, len(mounts),
+		)
+	}
+}
+
 func canonicalMountPath(input string) (string, error) {
 	absolute, err := filepath.Abs(input)
 	if err != nil {
 		return "", err
 	}
 	absolute = filepath.Clean(absolute)
-	if info, err := os.Lstat(absolute); err == nil && info.Mode()&os.ModeSymlink != 0 {
+	info, lstatErr := lstatMountPath(absolute)
+	if lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("mount path %s is a symlink; use a real directory", absolute)
+	}
+	if lstatErr != nil && !os.IsNotExist(lstatErr) {
+		// A dead volume answers EIO for every pathname that resolves THROUGH
+		// it — including its own mount point. Detaching is the remedy for
+		// exactly that state, so the CLI must not need a working filesystem to
+		// name the mount. Ask the kernel mount table instead: a mount whose
+		// mount point is this exact path proves the path is already canonical
+		// (the kernel records the fully resolved mount point), and the caller
+		// can proceed to the daemon-owned detach. With no such mount the error
+		// is about something else and stands.
+		mount, tableErr := exactKernelMountAt(absolute)
+		if tableErr == nil && mount != nil {
+			return absolute, nil
+		}
+		return "", errors.Join(
+			fmt.Errorf("inspect mount path %s: %w", absolute, lstatErr),
+			tableErr,
+		)
 	}
 	current := absolute
 	var missing []string
 	for {
-		_, err := os.Lstat(current)
+		_, err := lstatMountPath(current)
 		if err == nil {
 			break
 		}

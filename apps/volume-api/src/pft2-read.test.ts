@@ -98,6 +98,10 @@ function inodeOf(partial: {
     mtimeMs: 1700000000000n,
     ctimeMs: 1700000000000n,
     atimeMs: 0n,
+    // 0 is the format's "absent" value for both appended fields; these
+    // fixtures exercise reads, not creation-time metadata.
+    birthtimeMs: 0n,
+    flags: 0,
     symlinkTarget: partial.symlinkTarget ?? "",
     ...(partial.directoryRoot ? { directoryRoot: partial.directoryRoot } : {}),
     ...(partial.extentRoot ? { extentRoot: partial.extentRoot } : {}),

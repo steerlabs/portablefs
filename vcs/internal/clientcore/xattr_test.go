@@ -230,8 +230,13 @@ func TestXattrFeatureNegotiationSelectsAuthorityLane(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	if got := v.client.Features(); got != 0 {
-		t.Fatalf("old authority features = %#x, want 0", got)
+	// Only the delegated-xattr LANE is absent here. The probe bitmap is a set
+	// of independent capabilities, so this asserts that one bit rather than an
+	// empty bitmap — an authority may legitimately advertise other lanes (e.g.
+	// durable birth-time/BSD-flag persistence) while still serving xattrs
+	// through the authority path.
+	if got := v.client.Features(); got&fsproto.FeatureDelegatedXattrs != 0 {
+		t.Fatalf("old authority features = %#x, want the delegated-xattr bit clear", got)
 	}
 	if _, st := v.Mkdir(ctx, "compat", 0o755); st != fsproto.OK {
 		t.Fatalf("mkdir: %d", st)

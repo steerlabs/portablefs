@@ -2124,3 +2124,94 @@ func TestHandleOperationsSerializeOnlyMatchingDescriptor(t *testing.T) {
 		t.Fatal("same-handle concrete operation did not resume")
 	}
 }
+
+// newScopeTestAttach builds a bare registry with the bindings the publication
+// scope derivation reads. It deliberately avoids newAttach: these tests
+// exercise frontendOperationPaths and the frontend gate only.
+func newScopeTestAttach() *attach {
+	return &attach{
+		items:       map[uint64]*itemRecord{},
+		paths:       map[string]*itemRecord{},
+		itemAliases: map[uint64]map[string]struct{}{},
+		handles:     map[uint64]*handleRecord{},
+	}
+}
+
+func (a *attach) bindScopeTestItem(id uint64, p string) pfslocal.Item {
+	item := pfslocal.Item{ItemID: id, ItemGeneration: 1}
+	rec := &itemRecord{item: item, path: p, state: clientcore.NewNodeState(id, true)}
+	if a.items[id] == nil {
+		a.items[id] = rec
+	}
+	a.paths[p] = rec
+	a.addItemAliasLocked(rec)
+	return item
+}
+
+func scopeSet(paths []string) map[string]bool {
+	got := map[string]bool{}
+	for _, p := range paths {
+		got[p] = true
+	}
+	return got
+}
+
+
+// Rename and remove publish two names each (and every alias of whatever they
+// displace); the concrete lookup/enumerate scopes must not have regressed
+// those multi-name derivations.
+func TestRenameAndRemovePublicationScopesCoverEveryName(t *testing.T) {
+	a := newScopeTestAttach()
+	from := a.bindScopeTestItem(2, "from")
+	to := a.bindScopeTestItem(3, "to")
+	a.bindScopeTestItem(7, "from/a")
+	alias := &itemRecord{item: a.items[7].item, path: "other/b", state: a.items[7].state}
+	a.paths[alias.path] = alias
+	a.addItemAliasLocked(alias)
+
+	paths, _, _ := a.frontendOperationPaths(&pfslocal.RenameRequest{
+		FromDir: from, FromName: []byte("a"), ToDir: to, ToName: []byte("b"),
+	})
+	got := scopeSet(paths)
+	for _, want := range []string{"from", "from/a", "to", "to/b", "other/b"} {
+		if !got[want] {
+			t.Fatalf("rename publication paths = %v, missing %q", paths, want)
+		}
+	}
+
+	paths, _, _ = a.frontendOperationPaths(&pfslocal.RemoveRequest{
+		Dir: from, Name: []byte("a"),
+	})
+	got = scopeSet(paths)
+	for _, want := range []string{"from", "from/a", "other/b"} {
+		if !got[want] {
+			t.Fatalf("remove publication paths = %v, missing %q", paths, want)
+		}
+	}
+}
+
+// The gate consequence of the concrete scopes: a handoff for one subtree no
+// longer waits behind a lookup or enumerate in a disjoint subtree, and still
+// waits behind one that overlaps.
+
+// Lookup and Enumerate publish per-inode attributes through per-path
+// delegations, and a hard link can alias an inode under a scope whose
+// handoff has already passed the gate — a passed handoff cannot be
+// re-blocked, so these two read publishers stay mount-wide until an
+// inode-identity gate exists (liveness follow-up item 2).
+func TestLookupAndEnumeratePublicationScopesStayMountWide(t *testing.T) {
+	a := newScopeTestAttach()
+	root := a.bindScopeTestItem(1, "")
+	dir := a.bindScopeTestItem(2, "d")
+	a.bindScopeTestItem(3, "d/f")
+	_ = root
+	for _, body := range []any{
+		&pfslocal.LookupRequest{Dir: dir, Name: []byte("f")},
+		&pfslocal.EnumerateRequest{Dir: dir},
+	} {
+		paths, _, known := a.frontendOperationPaths(body)
+		if !known || len(paths) != 1 || paths[0] != "" {
+			t.Fatalf("%T publication paths = %v (known=%v), want mount-wide", body, paths, known)
+		}
+	}
+}

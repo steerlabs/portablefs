@@ -820,6 +820,12 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 	knownSlice := func(paths []string) ([]string, uint64, bool) {
 		return paths, pathEpoch, true
 	}
+	// unknown is the conservative mount-wide scope: a request whose
+	// publication target cannot be resolved from the current bindings (a
+	// stale Item generation, an unresolvable child name, a handle with no
+	// live alias) and the per-inode read publishers (Lookup, Enumerate)
+	// whose path-narrowed scopes would race already-passed handoffs of
+	// hard-link aliases.
 	unknown := func() ([]string, uint64, bool) { return []string{""}, pathEpoch, true }
 	withKnownAliases := func(paths []string, candidates ...string) []string {
 		seen := make(map[string]struct{}, len(paths))
@@ -844,20 +850,21 @@ func (a *attach) frontendOperationPaths(body any) ([]string, uint64, bool) {
 
 	switch req := body.(type) {
 	case *pfslocal.LookupRequest:
-		_, _, ok := child(req.Dir, req.Name)
-		if !ok {
-			return unknown()
-		}
-		// Lookup may discover that a previously unseen name is a hard-link
-		// alias of an FSItem already live elsewhere. Until the authority reply
-		// identifies that inode, its publication scope is unknowable.
+		// Deliberately mount-wide, NOT the looked-up name. A lookup (and a
+		// readdir-plus page) publishes per-INODE attributes obtained through a
+		// per-PATH delegation, and a hard link can alias that inode under a
+		// scope whose handoff has ALREADY passed this gate — a passed handoff
+		// cannot be re-blocked, so a path-narrowed scope here can publish a
+		// pre-handoff view of an inode the new delegation holder believes is
+		// exclusively theirs. The path epoch only widens operations that
+		// install NEW bindings; it cannot protect aliases that were already
+		// known. Until an inode-identity gate exists that both handoffs and
+		// reply publication join, these two read publishers stay mount-wide.
 		return unknown()
 	case *pfslocal.EnumerateRequest:
-		if _, ok := itemPath(req.Dir); !ok {
-			return unknown()
-		}
-		// Readdir-plus can publish attributes for unseen aliases. Treat the
-		// operation as mount-wide only during the rare handoff interval.
+		// Mount-wide for the same inode-aliasing reason as Lookup: a
+		// readdir-plus page publishes child attributes, and any child can be
+		// hard-linked under an already-handed-off scope.
 		return unknown()
 	case *pfslocal.GetAttrRequest:
 		if req.Handle != 0 {
@@ -1160,7 +1167,10 @@ func refreshLocalSampleAuthorityContext(
 // A size mismatch retires the note: the kernel is performing a REAL truncate
 // that must reach the authority, and the stale note must not linger.
 func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest) bool {
-	if req.Size == nil || req.Mode != nil || req.UID != nil || req.GID != nil {
+	// SetFlags disqualifies the request like any other real attribute group:
+	// the daemon's own refresh never carries one, so a request that does is a
+	// genuine chflags whose intent must not be swallowed by the no-op arm.
+	if req.Size == nil || req.Mode != nil || req.UID != nil || req.GID != nil || req.SetFlags {
 		return false
 	}
 	a.mu.Lock()

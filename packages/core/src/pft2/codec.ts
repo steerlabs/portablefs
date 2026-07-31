@@ -115,6 +115,8 @@ function encodeInode(inode: Pft2Inode): Uint8Array {
   appendOptionalRef(out, 11, inode.directoryRoot);
   appendOptionalRef(out, 12, inode.extentRoot);
   appendString(out, 13, inode.symlinkTarget);
+  appendSint(out, 14, inode.birthtimeMs);
+  appendUint(out, 15, BigInt(inode.flags));
   return out.finish();
 }
 
@@ -481,6 +483,8 @@ function decodeInode(body: Uint8Array): Pft2Inode {
     mtimeMs: 0n,
     ctimeMs: 0n,
     atimeMs: 0n,
+    birthtimeMs: 0n,
+    flags: 0,
     symlinkTarget: "",
   };
   decodeMessage("pft2 inode", body, noRepeats, (reader, field, wireType) => {
@@ -516,6 +520,10 @@ function decodeInode(body: Uint8Array): Pft2Inode {
       );
     } else if (field === 13 && wireType === WIRE_TYPE_BYTES) {
       inode.symlinkTarget = reader.string(field, PFT2_MAX_SYMLINK_TARGET_BYTES);
+    } else if (field === 14 && wireType === WIRE_TYPE_VARINT) {
+      inode.birthtimeMs = reader.sint(field);
+    } else if (field === 15 && wireType === WIRE_TYPE_VARINT) {
+      inode.flags = reader.uint32(field);
     } else {
       return false;
     }

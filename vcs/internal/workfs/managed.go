@@ -238,7 +238,7 @@ func NewManagedFromBase(base BaseImage, blobs content.BlobReader, log pfj3.Entry
 	}
 	now := time.Now()
 	fs := &FS{
-		root:         &inode{ino: 1, kind: "directory", mode: os.ModeDir | 0o755, mtime: now, ctime: now, atime: now, children: map[string]*inode{}},
+		root:         &inode{ino: 1, kind: "directory", mode: os.ModeDir | 0o755, mtime: now, ctime: now, atime: now, birthtime: now, children: map[string]*inode{}},
 		blobs:        blobs,
 		cache:        cache,
 		log:          log,

@@ -206,7 +206,7 @@ func affectedPaths(r wal.Record) []string {
 // content/attr invalidation for the path, never a namespace drop.
 func isInPlaceOp(op wal.Op) bool {
 	switch op {
-	case wal.OpWrite, wal.OpTruncate, wal.OpChmod, wal.OpChtimes, wal.OpChown,
+	case wal.OpWrite, wal.OpTruncate, wal.OpChmod, wal.OpChtimes, wal.OpChown, wal.OpChflags,
 		wal.OpSetxattr, wal.OpRemovexattr:
 		return true
 	default:

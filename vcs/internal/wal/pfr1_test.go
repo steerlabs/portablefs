@@ -123,6 +123,18 @@ var pfr1Goldens = []struct {
 		},
 		hex: "50465231081810091a016658036001e80101",
 	},
+	// APPENDED op 19 / field 30. New fixtures only — the frozen bytes above
+	// are untouched, which is the whole point of appending.
+	{
+		name: "chflags",
+		rec:  Record{Seq: 25, Op: OpChflags, Path: "f", Flags: 0x8000_8002},
+		hex:  "50465231081910131a0166f0018280828008",
+	},
+	{
+		name: "chflags-cleared",
+		rec:  Record{Seq: 26, Op: OpChflags, Ino: 9},
+		hex:  "50465231081a10137809",
+	},
 }
 
 func TestPFR1Goldens(t *testing.T) {
@@ -150,7 +162,7 @@ func TestPFR1Goldens(t *testing.T) {
 
 // randomPFR1Record builds an arbitrary VALID record (bounded).
 func randomPFR1Record(rng *rand.Rand, allowBatch bool) Record {
-	ops := []Op{OpCreate, OpWrite, OpTruncate, OpMkdir, OpRemove, OpRename, OpSymlink, OpChmod, OpChtimes, OpChown, OpOrphan, OpReap, OpControl, OpLink, OpSetxattr, OpRemovexattr}
+	ops := []Op{OpCreate, OpWrite, OpTruncate, OpMkdir, OpRemove, OpRename, OpSymlink, OpChmod, OpChtimes, OpChown, OpOrphan, OpReap, OpControl, OpLink, OpSetxattr, OpRemovexattr, OpChflags}
 	r := Record{Seq: rng.Uint64() >> 1, Op: ops[rng.Intn(len(ops))]}
 	if allowBatch && rng.Intn(6) == 0 {
 		r.Op = OpBatch
@@ -172,6 +184,11 @@ func randomPFR1Record(rng *rand.Rand, allowBatch bool) Record {
 	if r.Op == OpWrite || r.Op == OpControl {
 		r.Data = randBytes(rng, 1+rng.Intn(64))
 		r.Offset = rng.Int63() - rng.Int63()
+	}
+	if r.Op == OpChflags {
+		// Every uint32 is a legal flag word, 0 included; the op — never a
+		// nonzero value — is what makes the record a chflags.
+		r.Flags = rng.Uint32()
 	}
 	if r.Op == OpSetxattr || r.Op == OpRemovexattr {
 		r.XattrName = "user." + randToken(rng, 1+rng.Intn(24))
@@ -503,12 +520,62 @@ func TestPFR1SizeEstimateBoundsEveryRecordField(t *testing.T) {
 		},
 		XattrName: "user.estimate", XattrFlags: XattrCreate,
 	}
+	// Flags is op-bound (only an OpChflags may carry it), so the widest
+	// record's size bound is checked separately below.
 	encoded, err := EncodePFR1(&rec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if estimate := PFR1SizeEstimate(rec); estimate < len(encoded) {
 		t.Fatalf("PFR1SizeEstimate=%d, encoded=%d", estimate, len(encoded))
+	}
+
+	chflags := Record{
+		Seq: math.MaxUint64, Op: OpChflags, Path: "path", Ino: math.MaxUint64,
+		TsMs: math.MinInt64, Flags: math.MaxUint32,
+		Env: &Envelope{
+			SessionID: "estimate", Generation: math.MaxUint64,
+			Slot: math.MaxUint32, SlotSeq: math.MaxUint64,
+			ReqHash: bytes.Repeat([]byte{0xff}, PFR1ReqHashBytes),
+		},
+	}
+	flagsEncoded, err := EncodePFR1(&chflags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate := PFR1SizeEstimate(chflags); estimate < len(flagsEncoded) {
+		t.Fatalf("PFR1SizeEstimate=%d, encoded=%d (chflags)", estimate, len(flagsEncoded))
+	}
+}
+
+// TestPFR1BindsFlagsToChflags: the appended field belongs to exactly one op, so
+// no other record may smuggle a flag word through the canonical encoding, and
+// the entry-framing op stays out of the record space even though appending
+// OpChflags moved the numeric ceiling past it.
+func TestPFR1BindsFlagsToChflags(t *testing.T) {
+	stray := Record{Seq: 1, Op: OpChmod, Path: "f", Mode: 0o600, Flags: 0x2}
+	if _, err := EncodePFR1(&stray); err == nil {
+		t.Fatal("a chmod carrying a flag word encoded")
+	}
+	entry := Record{Seq: 1, Op: OpJournalEntry, Data: []byte("pfj3")}
+	if _, err := EncodePFR1(&entry); err == nil {
+		t.Fatal("the PFJ3 entry-framing op encoded as a journal record")
+	}
+	// Decoding must fence it too: a hand-built payload naming op 18 is not a
+	// record, regardless of the ceiling appended ops pushed past it.
+	valid, err := EncodePFR1(&Record{Seq: 1, Op: OpChflags, Path: "f", Flags: 0x2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := append([]byte(nil), valid...)
+	for i := 0; i+1 < len(forged); i++ {
+		if forged[i] == 0x10 && forged[i+1] == byte(OpChflags) {
+			forged[i+1] = byte(OpJournalEntry)
+			break
+		}
+	}
+	if _, err := DecodePFR1(forged); err == nil {
+		t.Fatal("a payload naming the entry-framing op decoded as a record")
 	}
 }
 
