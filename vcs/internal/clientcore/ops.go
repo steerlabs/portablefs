@@ -1102,6 +1102,52 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	return cnt, fsproto.OK
 }
 
+// AppendExactHandle is WriteExactHandle for O_APPEND: the descriptor has no
+// usable path (detached / unlinked-but-open), so the offset can only be
+// resolved by the authority against the handle's inode, in sequencer order.
+// It never computes an offset from a cached size.
+func (v *Volume) AppendExactHandle(ctx context.Context, n *NodeState, data []byte) (int, Status) {
+	authorityCtx, end, err := v.beginExactOperation(ctx)
+	if err != nil {
+		return 0, fsproto.EIO
+	}
+	defer end()
+	ino := authHandleIno(n)
+	if n == nil || !n.IsOpen() || ino == 0 {
+		return 0, fsproto.ENOENT
+	}
+	if oi := n.Orphan(); oi != 0 {
+		count, _, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
+		if err != nil {
+			return 0, fsproto.EIO
+		}
+		return count, st
+	}
+	count, _, _, _, st, err := v.client.AppendVHandleContext(authorityCtx, "", ino, data, 0o644)
+	if err != nil {
+		return 0, fsproto.EIO
+	}
+	return count, st
+}
+
+// WriteAppendOpenHandle is WriteOpenHandle for O_APPEND. It is the descriptor
+// entry point every non-FUSE frontend uses: an append NEVER carries a
+// frontend-computed absolute offset, so two machines appending to one file
+// serialize on the authority (or on the exclusive delegation that makes the
+// local EOF authoritative) instead of racing to the same byte range.
+func (v *Volume) WriteAppendOpenHandle(ctx context.Context, path string, n *NodeState, data []byte) (int, Status) {
+	path = cleanVolumePath(path)
+	if path == "" {
+		return v.AppendExactHandle(ctx, n, data)
+	}
+	ctx = withDelegatedBindingExpectation(ctx, path, n)
+	count, st := v.WriteAppend(ctx, path, n, 0, data)
+	if st == statusExactRetry {
+		return v.AppendExactHandle(ctx, n, data)
+	}
+	return count, st
+}
+
 func (v *Volume) Create(ctx context.Context, path string, mode uint32) (fsproto.Attr, Status) {
 	return v.createCommon(ctx, path, mode, false)
 }

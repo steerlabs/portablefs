@@ -703,7 +703,39 @@ func (c *Client) DoContext(ctx context.Context, req *Request) (*Response, error)
 		// release the surrounding namespace/delegation exclusion while that
 		// identity may still execute. Resolve through the existing exact-once
 		// path; the authority-wait hook remains suspended until it returns.
-		return c.doExact(req)
+		var firstGateEAGAIN time.Time
+		for {
+			resp, err := c.doExact(req)
+			if err != nil || resp.Status != EAGAIN {
+				return resp, err
+			}
+			// A definite EAGAIN from an exact file mutation is the
+			// authority's delegation gate timing out mid-recall. EAGAIN has
+			// no legitimate POSIX meaning for the operations routed through
+			// this branch, and surfacing it hands a transient coordination
+			// state to applications as an errno. Publication is suspended
+			// for this entire bracket, so waiting out the recall here cannot
+			// stall the peer's handoff; each retry consumes its own exact
+			// identity, so the exact-once ledger stays truthful. The budget
+			// bounds the wait so a scope wedged behind a recovery delegation
+			// still surfaces rather than blocking until lease expiry.
+			now := time.Now()
+			if firstGateEAGAIN.IsZero() {
+				firstGateEAGAIN = now
+			}
+			if exactGateRetryBudget <= 0 || now.Sub(firstGateEAGAIN) >= exactGateRetryBudget {
+				return resp, nil
+			}
+			select {
+			case <-ctx.Done():
+				// The last outcome was a definite non-execution, so
+				// cancellation is safe to honor.
+				return nil, ctx.Err()
+			case <-c.closed:
+				return resp, nil
+			case <-time.After(exactGateRetryDelay):
+			}
+		}
 	}
 	if req.Op == OpFlushBatch {
 		// FlushBatch keeps its own durable ledger exactness, but it must

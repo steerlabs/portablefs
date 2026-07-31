@@ -96,29 +96,55 @@ func (h *LockHandle) Remove(owner, start, end uint64) {
 // UnlockPaths applies an explicit unlock to the handle record and returns the
 // distinct acquire-time paths that must receive the forwarded unlock.
 func (h *LockHandle) UnlockPaths(owner, start, end uint64) []string {
+	paths := h.UnlockTargets(owner, start, end)
+	for _, p := range paths {
+		h.CommitUnlock(owner, start, end, p)
+	}
+	return paths
+}
+
+// UnlockTargets returns the distinct acquire-time paths that must receive a
+// forwarded unlock, without mutating the record. Local ownership is the only
+// thing that lets close/reclaim reconstruct an authority-side lock, so it is
+// surrendered per path only after that path's release definitely happened.
+func (h *LockHandle) UnlockTargets(owner, start, end uint64) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	seen := map[string]bool{}
 	var paths []string
-	var kept []HeldLock
 	for _, l := range h.held {
 		if l.Owner != owner || l.End < start || end < l.Start {
-			kept = append(kept, l)
 			continue
 		}
 		if !seen[l.Path] {
 			seen[l.Path] = true
 			paths = append(paths, l.Path)
 		}
+	}
+	return paths
+}
+
+// CommitUnlock applies the owner/range removal (mirroring the authority's
+// range split) to the records acquired at path only, once the authority
+// release for that path completed. Split remainders keep their lock type so
+// a post-failover reclaim re-asserts exactly what is still held.
+func (h *LockHandle) CommitUnlock(owner, start, end uint64, path string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var kept []HeldLock
+	for _, l := range h.held {
+		if l.Owner != owner || l.Path != path || l.End < start || end < l.Start {
+			kept = append(kept, l)
+			continue
+		}
 		if l.Start < start {
-			kept = append(kept, HeldLock{Owner: l.Owner, Start: l.Start, End: start - 1, Path: l.Path})
+			kept = append(kept, HeldLock{Owner: l.Owner, Start: l.Start, End: start - 1, Path: l.Path, Write: l.Write})
 		}
 		if l.End > end {
-			kept = append(kept, HeldLock{Owner: l.Owner, Start: end + 1, End: l.End, Path: l.Path})
+			kept = append(kept, HeldLock{Owner: l.Owner, Start: end + 1, End: l.End, Path: l.Path, Write: l.Write})
 		}
 	}
 	h.held = kept
-	return paths
 }
 
 // Drain returns and clears every held lock. Release paths call this once; a
@@ -148,16 +174,23 @@ func Unlock(ctx context.Context, auth LockAuthority, h *LockHandle, owner, start
 		_, err := auth.Lock(releaseCtx, live, fsproto.LkSetlk, owner, start, end, false, true)
 		return err
 	}
-	paths := h.UnlockPaths(owner, start, end)
+	paths := h.UnlockTargets(owner, start, end)
 	if len(paths) == 0 {
 		_, err := auth.Lock(releaseCtx, live, fsproto.LkSetlk, owner, start, end, false, true)
 		return err
 	}
 	var first error
 	for _, p := range paths {
-		if _, err := auth.Lock(releaseCtx, p, fsproto.LkSetlk, owner, start, end, false, true); err != nil && first == nil {
-			first = err
+		if _, err := auth.Lock(releaseCtx, p, fsproto.LkSetlk, owner, start, end, false, true); err != nil {
+			// Local ownership for p is retained: close/reclaim can still
+			// reconstruct and release the authority-side lock. A later
+			// duplicate release is owner-scoped and safe.
+			if first == nil {
+				first = err
+			}
+			continue
 		}
+		h.CommitUnlock(owner, start, end, p)
 	}
 	return first
 }

@@ -1217,6 +1217,17 @@ func TestStrictAncestorAdmissionSuspendsFrontendWhileJoiningRelease(t *testing.T
 	if err := e.DrainAll(context.Background()); err != nil {
 		t.Fatalf("seed drain: %v", err)
 	}
+	// The seed create's delegation acquire brackets its own authority wait;
+	// drain those events so the assertions below observe only the
+	// strict-ancestor admission.
+	for drained := false; !drained; {
+		select {
+		case <-suspended:
+		case <-resumed:
+		default:
+			drained = true
+		}
+	}
 
 	createOut := make(chan writeOutcome, 1)
 	go func() {

@@ -133,23 +133,107 @@ import Testing
     }
 }
 
-@Test func unsupportedRequestedTimesFailExplicitly() {
+@Test func unsupportedRequestedTimesAreLeftInvalidWithoutFailing() throws {
     var item = PfsItem()
     item.itemID = 2
     item.itemGeneration = 1
+    var parent = PfsItem()
+    parent.itemID = 5
+    parent.itemGeneration = 1
     var attr = PfsAttr()
     attr.item = item
+    attr.parent = parent
+    attr.kind = .file
+    attr.mode = 0o644
+    attr.size = 17
+    attr.mtimeMs = 1_700_000_000_000
 
     for field in [FSItem.Attribute.addedTime, .backupTime] {
-        do {
-            _ = try PfsFSKitMapping.attributes(from: attr, requested: [field])
-            Issue.record("expected unsupported requested time to fail")
-        } catch let error as PfsLocalClientError {
-            #expect(error.posixErrno == ENOTSUP)
-        } catch {
-            Issue.record("unexpected error \(error)")
+        let onlyUnsupported = try PfsFSKitMapping.attributes(from: attr, requested: [field])
+        #expect(!onlyUnsupported.isValid(field))
+
+        // FSKit's contract is that every requested SUPPORTED field is valid.
+        // An unsupported bit in the mask must not suppress the rest.
+        let mixed = try PfsFSKitMapping.attributes(
+            from: attr,
+            requested: [field, .type, .mode, .size, .fileID, .parentID, .modifyTime]
+        )
+        #expect(!mixed.isValid(field))
+        for supported: FSItem.Attribute in
+            [.type, .mode, .size, .fileID, .parentID, .modifyTime] {
+            #expect(mixed.isValid(supported))
         }
+        #expect(mixed.size == 17)
+        #expect(mixed.fileID == (try PfsFSKitMapping.itemIdentifier(from: 2)))
+        #expect(mixed.parentID == (try PfsFSKitMapping.itemIdentifier(from: 5)))
     }
+}
+
+@Test func flagChangesAreRefusedInsteadOfSilentlyDropped() throws {
+    let request = FSItem.SetAttributesRequest()
+    request.mode = 0o600
+    let modeOnly = try PfsFSKitMapping.setAttributes(from: request)
+    #expect(modeOnly.mode == 0o600)
+
+    request.flags = UInt32(UF_IMMUTABLE)
+    do {
+        _ = try PfsFSKitMapping.setAttributes(from: request)
+        Issue.record("expected an unsupported flags change to fail")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == ENOTSUP)
+    }
+
+    var capabilities = PfsCapabilities()
+    capabilities.caseSensitive = true
+    #expect(PfsFSKitMapping.supportedCapabilities(from: capabilities).doesNotSupportImmutableFiles)
+}
+
+@Test func timespecConversionNormalizesPreEpochNanoseconds() {
+    let negative = PfsFSKitMapping.timespec(milliseconds: -1_500)
+    #expect(negative.tv_sec == -2)
+    #expect(negative.tv_nsec == 500_000_000)
+    #expect(PfsFSKitMapping.milliseconds(from: negative) == -1_500)
+
+    let wholeSecond = PfsFSKitMapping.timespec(milliseconds: -2_000)
+    #expect(wholeSecond.tv_sec == -2)
+    #expect(wholeSecond.tv_nsec == 0)
+    #expect(PfsFSKitMapping.milliseconds(from: wholeSecond) == -2_000)
+
+    let positive = PfsFSKitMapping.timespec(milliseconds: 1_500)
+    #expect(positive.tv_sec == 1)
+    #expect(positive.tv_nsec == 500_000_000)
+
+    for milliseconds in stride(from: Int64(-5_000), through: 5_000, by: 250) {
+        let value = PfsFSKitMapping.timespec(milliseconds: milliseconds)
+        #expect(value.tv_nsec >= 0 && value.tv_nsec < 1_000_000_000)
+        #expect(PfsFSKitMapping.milliseconds(from: value) == milliseconds)
+    }
+}
+
+@Test func parentDirectoryIdentifierNamesTheTrueParentAndSelfWhenUnknown() throws {
+    var rootItem = PfsItem()
+    rootItem.itemID = 1
+    rootItem.itemGeneration = 2
+    var root = PfsAttr()
+    root.item = rootItem
+    root.kind = .directory
+    // POSIX makes the root its own parent; .parentOfRoot is a getattr-only
+    // answer and would name no packable directory entry.
+    #expect(try PfsFSKitMapping.parentDirectoryIdentifier(from: root) == .rootDirectory)
+
+    var childItem = PfsItem()
+    childItem.itemID = 12
+    childItem.itemGeneration = 1
+    var child = PfsAttr()
+    child.item = childItem
+    child.kind = .directory
+    #expect(
+        try PfsFSKitMapping.parentDirectoryIdentifier(from: child)
+            == (try PfsFSKitMapping.itemIdentifier(from: 12))
+    )
+
+    child.parent = rootItem
+    #expect(try PfsFSKitMapping.parentDirectoryIdentifier(from: child) == .rootDirectory)
 }
 
 @Test func statfsMappingUsesDaemonValuesAndPreferredIOSize() {

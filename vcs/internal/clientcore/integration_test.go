@@ -208,8 +208,11 @@ func TestAuthorityOperationContextsSuspendEveryAuthorityRPC(t *testing.T) {
 	if callErr != nil || st != fsproto.ENOENT {
 		t.Fatalf("authority-lane getattr: status=%d err=%v", st, callErr)
 	}
-	if waits.Load() != 1 || resumes.Load() != 1 {
-		t.Fatalf("authority-lane RPC wait/resume = %d/%d, want 1/1", waits.Load(), resumes.Load())
+	// Three balanced pairs: transition-gate admission, the post-admission
+	// extend, and the RPC's own authority-wait bracket. Admission counts
+	// because a conflicting active claim can be a remote acquire mid-RPC.
+	if waits.Load() != 3 || resumes.Load() != 3 {
+		t.Fatalf("authority-lane RPC wait/resume = %d/%d, want 3/3", waits.Load(), resumes.Load())
 	}
 
 	exactCtx, endExact, err := v.beginExactOperation(ctx)
@@ -221,8 +224,11 @@ func TestAuthorityOperationContextsSuspendEveryAuthorityRPC(t *testing.T) {
 	if callErr != nil || st != fsproto.ENOENT {
 		t.Fatalf("exact-lane getattr: status=%d err=%v", st, callErr)
 	}
-	if waits.Load() != 2 || resumes.Load() != 2 {
-		t.Fatalf("exact-lane RPC wait/resume = %d/%d, want 2/2", waits.Load(), resumes.Load())
+	// The exact lane adds two more balanced pairs: the write-back engine's
+	// exact-exclusion acquisition (whose lock can be held by an acquire
+	// resolver across its authority round-trip) and the RPC bracket.
+	if waits.Load() != 5 || resumes.Load() != 5 {
+		t.Fatalf("exact-lane RPC wait/resume = %d/%d, want 5/5", waits.Load(), resumes.Load())
 	}
 }
 

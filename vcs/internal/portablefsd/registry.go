@@ -316,6 +316,12 @@ func newRegistry(stateDir string) *registry {
 // checkout's thousands of creates) into a handful of full-state writes.
 const persistDebounce = 100 * time.Millisecond
 
+// invalidationAnchorWait bounds how long attach blocks for the authority to
+// register its invalidation subscription. It only trades a slower attach for a
+// smaller pre-anchor serving window: correctness comes from the anchor fence
+// itself, which applies whenever the subscription lands.
+var invalidationAnchorWait = 10 * time.Second
+
 // schedulePersist marks the persisted state dirty; the persister loop writes
 // it out after the debounce window. Never blocks.
 func (r *registry) schedulePersist() {
@@ -806,6 +812,10 @@ func (r *registry) forceUnmountFSKit(
 		}
 	}
 
+	// The exact kernel detach re-enters this daemon through vnode reclaim;
+	// never hold the admission freeze across it (see detachWithFinalizer).
+	a.nsMu.Unlock()
+	a.frontendSerial.Unlock()
 	present, err := ops.present(a.mountPath, a.ref)
 	if err == nil && present {
 		err = ops.unmountExact(a.mountPath, a.ref)
@@ -813,10 +823,10 @@ func (r *registry) forceUnmountFSKit(
 	if err != nil {
 		// Force authorization and the parked-tail proof remain durable.
 		// Operations are quarantined until an exact retry succeeds.
-		a.nsMu.Unlock()
-		a.frontendSerial.Unlock()
 		return jobID, err
 	}
+	a.frontendSerial.Lock()
+	a.nsMu.Lock()
 	return a.finishDetachWithNSLocked(jobID, nil)
 }
 
@@ -900,6 +910,16 @@ type attach struct {
 	credMu sync.RWMutex
 	token  string
 
+	// lifeCtx scopes everything that must live for the whole ATTACH, not for
+	// the control request that happened to start it. `POST .../credential`
+	// activates a restored (credential-pending) attach from an HTTP handler,
+	// and its r.Context() is cancelled the moment that handler returns — a
+	// request-scoped context handed to the Volume and to the invalidation
+	// watcher therefore killed cross-machine coherence within milliseconds of
+	// a successful activation, silently and for the life of the mount.
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
 	startMu sync.Mutex
 
 	mu        sync.RWMutex
@@ -933,7 +953,6 @@ type attach struct {
 	authorityItems         map[uint64]frontendItemIdentity
 	awaitingAuthorityItems map[uint64]struct{}
 	handles                map[uint64]*handleRecord
-	enumRecords            map[uint64]*enumerationRecord
 	localDirs              []string
 	localRoot              string
 	localFS                *confinedfs.Root
@@ -948,7 +967,6 @@ type attach struct {
 	// confirmation. Successful retirements need no entry: handle IDs are
 	// monotonic for the attach, so an issued-but-absent ID proves success.
 	retiredCloseErrnos map[uint64]int32
-	nextEnumID         uint64
 	nextOrigin         uint64
 	subscribers        map[*eventSubscriber]struct{}
 	conns              map[interface{ Close() error }]struct{}
@@ -1006,6 +1024,11 @@ type handleRecord struct {
 	openPath string
 	state    *clientcore.NodeState
 	write    bool
+	// appendOnly records O_APPEND as a sticky descriptor property (POSIX: the
+	// flag lives on the open file description, not on the write). Every write
+	// through this handle resolves its offset at EOF under the authority's
+	// serialization instead of at the frontend-supplied absolute offset.
+	appendOnly bool
 	// operationLocks is a pointer because handle records are copied when an
 	// operation resolves its target. Every copy must retain the descriptor's
 	// one serialization identity.
@@ -1030,7 +1053,10 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 	storageID := stableStorageID(storageKey(req.VolumeID, req.Branch))
 	options := req.Options
 	options.LocalDirs = localDirs
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 	return &attach{
+		lifeCtx:                lifeCtx,
+		lifeCancel:             lifeCancel,
 		ref:                    ref,
 		key:                    key,
 		volumeID:               req.VolumeID,
@@ -1056,7 +1082,6 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		awaitingAuthorityItems: map[uint64]struct{}{},
 		handles:                map[uint64]*handleRecord{},
 		retiredCloseErrnos:     map[uint64]int32{},
-		enumRecords:            map[uint64]*enumerationRecord{},
 		subscribers:            map[*eventSubscriber]struct{}{},
 		conns:                  map[interface{ Close() error }]struct{}{},
 		eventReady:             make(chan struct{}),
@@ -1064,14 +1089,6 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		localRoot:              filepath.Join(stateDir, "local", storageID),
 		localVersions:          map[string]uint64{},
 	}
-}
-
-type enumerationRecord struct {
-	id         uint64
-	dir        string
-	entries    []clientcore.DirEntry
-	dirVersion uint64
-	lastUsed   time.Time
 }
 
 func newRevivedAttach(
@@ -1245,6 +1262,16 @@ func (a *attach) controlAdmissionError() error {
 	}
 }
 
+// lifetime is the attach-scoped context every long-lived goroutine and the
+// Volume itself must use. Never the control-request context: activation runs
+// inside an HTTP handler whose context dies with the response.
+func (a *attach) lifetime() context.Context {
+	if a.lifeCtx == nil {
+		return context.Background()
+	}
+	return a.lifeCtx
+}
+
 func (a *attach) start(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "wal"), 0o700); err != nil {
 		return err
@@ -1306,7 +1333,10 @@ func (a *attach) start(ctx context.Context) error {
 			log.Printf("attach %s: "+format, append([]any{a.ref}, args...)...)
 		},
 	}
-	vol, err := clientcore.Dial(ctx, opts)
+	// The Volume's internal context is derived from the one passed here and
+	// scopes write-back, credential renewal and prefetch for the whole mount,
+	// so it must be the attach lifetime, never the activating request.
+	vol, err := clientcore.Dial(a.lifetime(), opts)
 	if err != nil {
 		return err
 	}
@@ -1366,6 +1396,35 @@ func (a *attach) start(ctx context.Context) error {
 		_ = eventClient.Close()
 		_ = vol.Close()
 		return err
+	}
+	// Establish the Volume's invalidation subscription BEFORE the first read
+	// that populates its caches. The root getattr below (and every frontend
+	// read after it) is only ordered against peer mutations once the authority
+	// has registered this mount as a subscriber; anything cached earlier can
+	// only be corrected by the anchor's fence, not by an event. Starting the
+	// watcher here and waiting for the anchor keeps the mount from ever
+	// serving from a pre-subscription cache.
+	//
+	// The wait is bounded and advisory: if the authority is slow the attach
+	// proceeds, because the anchor still fences away everything cached in the
+	// meantime the moment it lands. A dead authority fails at the getattr.
+	invalidationCtx, stopInvalidations := context.WithCancel(a.lifetime())
+	activated := false
+	defer func() {
+		// Every remaining path out of start that is not a live attach must
+		// retire the watcher; otherwise a failed activation leaves it
+		// resubscribing against the closed Volume until detach.
+		if !activated {
+			stopInvalidations()
+		}
+	}()
+	go vol.StartInvalidations(invalidationCtx, false)
+	anchorCtx, cancelAnchor := context.WithTimeout(ctx, invalidationAnchorWait)
+	anchored := vol.AwaitInvalidations(anchorCtx)
+	cancelAnchor()
+	if !anchored {
+		log.Printf("attach %s: invalidation stream not anchored within %s; "+
+			"serving continues and re-fences when it lands", a.ref, invalidationAnchorWait)
 	}
 	rootAttr, st := vol.Getattr(ctx, "", clientcore.NewNodeState(1, true))
 	if st != fsproto.OK {
@@ -1439,9 +1498,9 @@ func (a *attach) start(ctx context.Context) error {
 		return fmt.Errorf("persist effective local-dir identity transition: %w", err)
 	}
 	a.eventOnce.Do(func() { close(a.eventReady) })
-	go vol.StartInvalidations(ctx, false)
-	go a.forwardEvents(ctx, eventClient, eventStream, eventAck)
-	go a.watchPrefetch(ctx)
+	go a.forwardEvents(a.lifetime(), eventClient, eventStream, eventAck)
+	go a.watchPrefetch(a.lifetime())
+	activated = true
 	return nil
 }
 
@@ -1515,34 +1574,34 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	return a.finishDetachWithNSLocked(jobID, err)
 }
 
-// detachWithFinalizer freezes every frontend admission, closes the volume's
-// durability boundary, and runs one exact kernel detach callback while the
-// freeze is still held. CloseWithFinalizer keeps the volume usable when the
-// callback fails, so a failed platform unmount thaws back to the live mount.
+// detachWithFinalizer closes the volume's durability boundary and runs one
+// exact kernel detach callback. The admission freeze is held only around the
+// terminal state transition, never across the callback: unmount(2) re-enters
+// this daemon — the kernel reclaims every cached vnode through the FSKit
+// extension, and reclaim serializes on frontendSerial exclusively — so a
+// freeze spanning the callback deadlocks the daemon against its own kernel
+// detach. The write-back engine's close freeze is what guarantees no new
+// durability debt while the barrier and callback run. CloseWithFinalizer
+// keeps the volume usable when the callback fails, so a failed platform
+// unmount thaws back to the live mount.
 func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
-	a.frontendSerial.Lock()
-	a.nsMu.Lock()
 	a.mu.RLock()
 	alreadyDetached := a.detached
 	existingJobID := a.detachJobID
 	vol := a.vol
 	a.mu.RUnlock()
 	if alreadyDetached {
-		a.nsMu.Unlock()
-		a.frontendSerial.Unlock()
 		return existingJobID, nil
 	}
 	if vol != nil {
 		if err := vol.CloseWithFinalizer(finalizer); err != nil {
-			a.nsMu.Unlock()
-			a.frontendSerial.Unlock()
 			return "", fmt.Errorf("prepared FSKit detach refused: %w", err)
 		}
 	} else if err := finalizer(); err != nil {
-		a.nsMu.Unlock()
-		a.frontendSerial.Unlock()
 		return "", err
 	}
+	a.frontendSerial.Lock()
+	a.nsMu.Lock()
 	return a.finishDetachWithNSLocked("", nil)
 }
 
@@ -1565,9 +1624,16 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDetaching, Detail: "detaching"}})
 	events := a.eventClient
 	localFS := a.localFS
+	lifeCancel := a.lifeCancel
 	a.mu.Unlock()
 	a.nsMu.Unlock()
 	a.frontendSerial.Unlock()
+	// Detach is the attach's terminal state: retire the lifetime scope so the
+	// invalidation watcher and the event forwarder stop instead of looping on
+	// resubscribe backoff against a closed client forever.
+	if lifeCancel != nil {
+		lifeCancel()
+	}
 	if events != nil {
 		_ = events.Close()
 	}
@@ -2885,7 +2951,12 @@ func (a *attach) objectTarget(item pfslocal.Item, handleID uint64) (objectTarget
 			return objectTarget{}, darwinENOENT
 		}
 		recCopy := *rec
-		return objectTarget{rec: &recCopy}, 0
+		// The identity-only lane must name the object through the same
+		// deterministic alias the handle lane uses. rec.path is merely the
+		// first alias that happened to register, so a hard-linked file would
+		// otherwise report a different parent depending on whether a
+		// descriptor is open.
+		return objectTarget{rec: &recCopy, scope: a.canonicalItemAliasLocked(rec)}, 0
 	}
 
 	h := a.handles[handleID]
@@ -2933,6 +3004,40 @@ func (a *attach) canonicalItemAliasLocked(rec *itemRecord) string {
 		}
 	}
 	return canonical
+}
+
+// hasBoundDescendantsLocked reports whether any live namespace binding sits
+// beneath one of rec's aliases. A directory Item is the parent identity every
+// child it still binds reports, so retiring it would leave those children
+// answering FSKit with an invalid parent. Refuse exactly as an open handle
+// does and let the host retry once it has retired the subtree. Non-directories
+// never match, so no kind test is needed. Caller holds a.mu.
+func (a *attach) hasBoundDescendantsLocked(rec *itemRecord) bool {
+	// The root's alias is the empty string, which prefixes every path; it is
+	// also never reclaimed, so exclude it before the prefix test.
+	if rec == nil || rec.path == "" {
+		return false
+	}
+	var prefixes []string
+	for aliasPath := range a.itemAliases[rec.item.ItemID] {
+		if aliasPath == "" {
+			continue
+		}
+		if alias := a.paths[aliasPath]; alias != nil && alias.item == rec.item {
+			prefixes = append(prefixes, aliasPath+"/")
+		}
+	}
+	if len(prefixes) == 0 {
+		return false
+	}
+	for p := range a.paths {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(p, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // handleTarget resolves an existing read/write/fsync descriptor and returns a
@@ -3163,7 +3268,7 @@ func renamedPath(p, oldp, newp string) (string, bool) {
 	return newp + strings.TrimPrefix(p, oldp), true
 }
 
-func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.NodeState, write bool) uint64 {
+func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.NodeState, write, appendOnly bool) uint64 {
 	a.nextHandle++
 	if a.nextHandle == 0 {
 		a.nextHandle++
@@ -3171,12 +3276,13 @@ func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.N
 	id := a.nextHandle
 	a.handles[id] = &handleRecord{
 		id: id, itemID: itemID, path: path, openPath: path, state: state, write: write,
+		appendOnly:     appendOnly,
 		operationLocks: &handleOperationLocks{},
 	}
 	return id
 }
 
-func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File, write bool) uint64 {
+func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File, write, appendOnly bool) uint64 {
 	a.nextHandle++
 	if a.nextHandle == 0 {
 		a.nextHandle++
@@ -3184,6 +3290,7 @@ func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File,
 	id := a.nextHandle
 	a.handles[id] = &handleRecord{
 		id: id, itemID: itemID, path: path, openPath: path, write: write, file: file,
+		appendOnly:     appendOnly,
 		operationLocks: &handleOperationLocks{},
 	}
 	return id

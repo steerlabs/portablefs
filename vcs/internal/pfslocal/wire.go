@@ -917,6 +917,7 @@ func marshalOpenRequest(m *OpenRequest) []byte {
 	var b []byte
 	b = appendMsg(b, 1, marshalItem(&m.Item))
 	b = appendI32(b, 2, int32(m.Mode))
+	b = appendBool(b, 3, m.Append)
 	return b
 }
 
@@ -931,6 +932,8 @@ func unmarshalOpenRequest(b []byte) (*OpenRequest, error) {
 			var v uint64
 			v, err = scalarU64(wt, raw)
 			m.Mode = OpenMode(v)
+		case 3:
+			m.Append, err = scalarBool(wt, raw)
 		}
 		return err
 	})
@@ -1046,6 +1049,7 @@ func marshalWriteRequest(m *WriteRequest) []byte {
 	b = appendU64(b, 1, m.Handle)
 	b = appendU64(b, 2, m.Offset)
 	b = appendBytesField(b, 3, m.Data)
+	b = appendBool(b, 4, m.Append)
 	return b
 }
 
@@ -1060,6 +1064,8 @@ func unmarshalWriteRequest(b []byte) (*WriteRequest, error) {
 			m.Offset, err = scalarU64(wt, raw)
 		case 3:
 			m.Data, err = scalarBytes(wt, raw)
+		case 4:
+			m.Append, err = scalarBool(wt, raw)
 		}
 		return err
 	})
@@ -1111,6 +1117,7 @@ func marshalCreateRequest(m *CreateRequest) []byte {
 	b = appendBytesField(b, 2, m.Name)
 	b = appendU32(b, 3, m.Mode)
 	b = appendBool(b, 4, m.Exclusive)
+	b = appendBool(b, 5, m.Append)
 	return b
 }
 
@@ -1129,6 +1136,8 @@ func unmarshalCreateRequest(b []byte) (*CreateRequest, error) {
 			m.Mode = uint32(v)
 		case 4:
 			m.Exclusive, err = scalarBool(wt, raw)
+		case 5:
+			m.Append, err = scalarBool(wt, raw)
 		}
 		return err
 	})
