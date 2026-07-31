@@ -49,14 +49,31 @@ atomic setattr batch — one syscall outcome, per-group exact
 sub-identities in a single journal record. Design it with the format
 machinery; do not paper it with ordering.
 
-### 5. Transient ENODATA reading a peer's just-created file
+### 5. Mount intent for a nonexistent branch cannot reconcile
+
+Reproduced live: a mount attempt against a branch that does not exist
+leaves a "starting" operation intent whose release replays the exact
+access-lease create — which can only ever return branch-not-found, so
+the intent is permanently stuck (umount and umount --force both loop).
+Two root fixes: the server should answer lease-create for a missing
+branch with a clean typed 404 (today the journal child spawns, gets
+VOLUME_BRANCH_NOT_FOUND from the volume API, dies, and the manager
+reports a generic internal error after a bootstrap crash-loop); and the
+client's reconcile should treat a definite branch-absence as proof the
+lease cannot exist, releasing the intent. Related transient: lease
+creation in the first ~2 minutes after an authority singleton handoff
+can fail UPSTREAM_UNREACHABLE (502) while the router warms; the intent
+machinery preserves and later reconciles these correctly, but deploy
+tooling should gate on a lease-create probe, not just /readyz.
+
+### 6. Transient ENODATA reading a peer's just-created file
 
 Observed once (two-Mac stress): `read peer done marker: no message
 available on STREAM` immediately after the file became visible; retry
 succeeded implicitly. Not yet reproduced or root-caused; needs a repro
 with daemon tracing before any code changes.
 
-### 6. macOS FSKit platform gaps (Apple; Feedback radars to file)
+### 7. macOS FSKit platform gaps (Apple; Feedback radars to file)
 
 Kernel-verified on macOS 26:
 - Negative dentries are cached permanently: no revalidation against
