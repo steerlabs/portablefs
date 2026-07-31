@@ -67,7 +67,14 @@ macOS requires an interactive approval before a file system extension can serve 
 3. Continue to a real mount. The assistant never claims the toggle is enabled;
    only a successful mount verifies it.
 
-Only one PortableFS file system extension should be enabled at a time: `PortableFSExt.appex` (the app) and `PortableFSDev.appex` (the dev harness) both claim the `pfs` FSKit short name, so disable one before enabling the other. This `pfs` type is deliberately distinct from any other PortableFS embedder on the machine (other PortableFS embedders register their own filesystem types), so the two never collide. Do not automate this toggle; it is a user-controlled macOS setting.
+Only one OSS PortableFS file system extension should be enabled at a time:
+`PortableFSExt.appex` (the app) and `PortableFSDev.appex` (the dev harness)
+both claim the same signed identity tuple: filesystem type `pfs`, generic
+resource scheme `dev.portablefs.oss`, and the OSS app group. Disable one before
+enabling the other. Other products embedding the shared Swift adapter provide
+their own tuple through their extension metadata, so FSKit can route them
+side-by-side without an ambiguous URL scheme. Do not automate this toggle; it
+is a user-controlled macOS setting.
 
 ### End-to-end dogfood checklist
 
@@ -136,7 +143,7 @@ The live mount boundary is intentionally manual because macOS requires an intera
 
 ```sh
 mkdir -p /tmp/pfs
-/sbin/mount -t pfs "pfs://<ref>" /tmp/pfs
+/sbin/mount -t pfs "dev.portablefs.oss://<ref>" /tmp/pfs
 ```
 
 6. Smoke-test the mounted tree with normal filesystem tools (`ls`, `stat`, `cat`, create/write/rename/remove files, xattrs if available from the daemon).

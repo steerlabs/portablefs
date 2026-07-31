@@ -37,10 +37,7 @@ func cmdLifecycle(e *cmdEnv, args []string) int {
 			return e.usageError("lifecycle", fmt.Errorf("identity expects no arguments"))
 		}
 		if jsonOut {
-			return e.printJSON(struct {
-				SchemaVersion int    `json:"schemaVersion"`
-				AppGroup      string `json:"appGroup"`
-			}{SchemaVersion: 1, AppGroup: fskitidentity.AppGroup})
+			return e.printJSON(fskitidentity.Current())
 		}
 		fmt.Fprintln(e.stdout, fskitidentity.AppGroup)
 		return 0

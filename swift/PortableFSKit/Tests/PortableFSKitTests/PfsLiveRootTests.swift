@@ -38,7 +38,11 @@ import Testing
         }
         let volume = try await PortableFSVolume.make(
             core: core,
-            attachRef: attachRef
+            attachRef: attachRef,
+            moduleIdentity: PortableFSModuleIdentity(
+                fileSystemTypeName: PortableFSIdentity.fileSystemTypeName,
+                resourceScheme: PortableFSIdentity.resourceScheme
+            )
         )
         let fetchRootAttributes: @Sendable () async throws -> Void = {
             let _: Void = try await withCheckedThrowingContinuation {

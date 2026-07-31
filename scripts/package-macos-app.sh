@@ -140,12 +140,26 @@ app_build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$app/Contents/I
 extension_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$extension/Contents/Info.plist")
 extension_build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$extension/Contents/Info.plist")
 extension_group=$(/usr/libexec/PlistBuddy -c "Print :PFSAppGroupIdentifier" "$extension/Contents/Info.plist")
+extension_fs_type=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSShortName" "$extension/Contents/Info.plist")
+extension_personality=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSPersonalities:PortableFSPersonality:FSName" "$extension/Contents/Info.plist")
+extension_scheme=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportedSchemes:0" "$extension/Contents/Info.plist")
+extension_generic_urls=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportsGenericURLResources" "$extension/Contents/Info.plist")
 [ "$app_version" = "$version" ] || { echo "app version $app_version != $version" >&2; exit 1; }
 [ "$extension_version" = "$version" ] || { echo "extension version $extension_version != $version" >&2; exit 1; }
 [ "$app_build" = "$build_number" ] || { echo "app build $app_build != $build_number" >&2; exit 1; }
 [ "$extension_build" = "$build_number" ] || { echo "extension build $extension_build != $build_number" >&2; exit 1; }
 [ "$extension_group" = "$app_group" ] ||
   { echo "extension app group $extension_group != $app_group" >&2; exit 1; }
+[ -n "$extension_fs_type" ] && [ "$extension_personality" = "$extension_fs_type" ] ||
+  { echo "extension filesystem type and personality do not match" >&2; exit 1; }
+printf '%s\n' "$extension_scheme" | LC_ALL=C grep -Eq '^[a-z][a-z0-9+.-]*$' ||
+  { echo "extension resource scheme $extension_scheme is not canonical" >&2; exit 1; }
+if /usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportedSchemes:1" "$extension/Contents/Info.plist" >/dev/null 2>&1; then
+  echo "extension advertises more than one FSKit resource scheme" >&2
+  exit 1
+fi
+[ "$extension_generic_urls" = "true" ] ||
+  { echo "extension does not enable generic URL resources" >&2; exit 1; }
 
 "$cli" version | grep -Fx "portablefs $version" >/dev/null
 "$daemon" -version | grep -Fx "$version" >/dev/null
@@ -155,10 +169,18 @@ daemon_identity="$verify_tmp/daemon-identity.json"
 "$daemon" -identity-json >"$daemon_identity"
 cli_group=$(plutil -extract appGroup raw -o - "$cli_identity")
 daemon_group=$(plutil -extract appGroup raw -o - "$daemon_identity")
+cli_fs_type=$(plutil -extract fsType raw -o - "$cli_identity")
+daemon_fs_type=$(plutil -extract fsType raw -o - "$daemon_identity")
+cli_scheme=$(plutil -extract resourceScheme raw -o - "$cli_identity")
+daemon_scheme=$(plutil -extract resourceScheme raw -o - "$daemon_identity")
 [ "$cli_group" = "$app_group" ] ||
   { echo "CLI stamped app group $cli_group != $app_group" >&2; exit 1; }
 [ "$daemon_group" = "$app_group" ] ||
   { echo "daemon stamped app group $daemon_group != $app_group" >&2; exit 1; }
+[ "$cli_fs_type" = "$extension_fs_type" ] && [ "$daemon_fs_type" = "$extension_fs_type" ] ||
+  { echo "CLI/daemon filesystem type does not match extension $extension_fs_type" >&2; exit 1; }
+[ "$cli_scheme" = "$extension_scheme" ] && [ "$daemon_scheme" = "$extension_scheme" ] ||
+  { echo "CLI/daemon resource scheme does not match extension $extension_scheme" >&2; exit 1; }
 
 if [ "$unsigned" != "1" ]; then
   codesign --verify --deep --strict --verbose=2 "$app"

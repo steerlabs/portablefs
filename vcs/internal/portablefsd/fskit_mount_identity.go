@@ -7,7 +7,7 @@ import (
 )
 
 func validateExactFSKitKernelMount(fsType, source, attachRef string) error {
-	expectedSource := "pfs://" + attachRef
+	expectedSource := fskitidentity.ResourcePrefix + attachRef
 	if fsType != fskitidentity.FSType || source != expectedSource {
 		return fmt.Errorf(
 			"kernel mount is %s from %s, want %s from %s",

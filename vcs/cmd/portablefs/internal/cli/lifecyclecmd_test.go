@@ -65,7 +65,9 @@ func TestLifecycleIdentityJSON(t *testing.T) {
 	if rc := e.run([]string{"lifecycle", "identity", "--json"}); rc != 0 {
 		t.Fatalf("rc = %d", rc)
 	}
-	if got := stdout.String(); !strings.Contains(got, `"schemaVersion": 1`) ||
+	if got := stdout.String(); !strings.Contains(got, `"schemaVersion": 2`) ||
+		!strings.Contains(got, `"fsType": "pfs"`) ||
+		!strings.Contains(got, `"resourceScheme": "dev.portablefs.oss"`) ||
 		!strings.Contains(got, `"appGroup": "B47U2LLKHW.pfsoss"`) {
 		t.Fatalf("identity = %s", got)
 	}

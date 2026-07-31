@@ -128,7 +128,11 @@ vcs/internal/writeback/
   exposed to the frontend but the connection disappears before its
   `PublicationAck`, the attach fails coherence closed: the daemon cannot prove
   whether FSKit published that result, so admission and handoff abort instead
-  of allowing stale state to cross the ownership boundary. Request IDs and
+  of allowing stale state to cross the ownership boundary. The terminal
+  handoff-gate verdict is installed before connection handlers are joined;
+  the full degraded-state fence follows after they exit. This ordering wakes a
+  handler blocked behind the handoff whose publication it owns, and rejects a
+  replacement connection throughout that fence transition. Request IDs and
   newly allocated operation IDs are nonzero and strictly increasing, and
   early, unknown, or duplicate acknowledgements close the connection.
 - Delegation grant and handoff each install a prefix cache fence. Authority
@@ -158,10 +162,20 @@ vcs/internal/writeback/
   (`Engine.ReleaseFor`). Xattrs on locally-born objects remain in the
   delegated WAL when the authority advertised `FeatureDelegatedXattrs`;
   v8 authorities without the delegated-xattr feature select the shared xattr
-  lane from the version probe, before any mutation is attempted. Server-side, a same-session
-  write-through mutation does not bypass the peer gate — it recalls the
-  holder's own grant — which is what makes the grant-time children snapshot
-  exact against same-session races.
+  lane from the version probe, before any mutation is attempted. One
+  cancellable overlap coordinator closes the decision-to-RPC race without
+  mount-wide head-of-line blocking: path-bearing authority mutations claim
+  their affected subtrees and known authority inode identities through the
+  RPC, while a delegation resolver claims only its scope from remote acquire
+  through local grant installation. Reply-discovered hardlink identities are
+  promoted atomically before installation; a hidden alias collision releases
+  the new grant without exposing it. Directory mutations release equal,
+  ancestor, and descendant grants before reaching the authority. The mutation
+  therefore either precedes the new snapshot or releases it before reaching
+  the authority, while unrelated directories remain concurrent. Server-side, a
+  same-session write-through mutation still does not bypass the peer gate — it
+  recalls the holder's own grant — preserving exactness as an independent
+  protocol invariant.
 - Published frontend identities and open handles use a two-phase release
   handoff. After the captured WAL tail is authority-visible, the mount first
   closes frontend reply admission, closes overlay read admission and waits for

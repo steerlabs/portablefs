@@ -587,6 +587,72 @@ func TestClosedFrontendConnectionReleasesUnexposedOperation(t *testing.T) {
 	a.endFrontendHandoff("d")
 }
 
+func TestFrontendDisconnectCompletesReservedOperationWhoseInitializerHasNotStarted(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	a := &attach{}
+	ready := make(chan struct{})
+	conn := &frontendConn{
+		conn: serverSide,
+		operations: map[uint64]*frontendOperationEntry{
+			1: {ready: ready, activeRequests: 1},
+		},
+		lastOperationID: 1,
+	}
+	startHandler := make(chan struct{})
+	handlerResult := make(chan error, 1)
+	conn.handlerWG.Add(1)
+	go func() {
+		defer conn.handlerWG.Done()
+		<-startHandler
+		_, _, _, _, err := conn.beginLogicalOperation(
+			context.Background(),
+			a,
+			1,
+			true,
+			&pfslocal.GetAttrRequest{},
+		)
+		handlerResult <- err
+	}()
+	closeDone := make(chan struct{})
+	go func() {
+		conn.close()
+		close(closeDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn.publicationMu.Lock()
+		closed := conn.publicationClosed
+		conn.publicationMu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("disconnect did not close publication admission")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(startHandler)
+	select {
+	case err := <-handlerResult:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("initializer error = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reserved initializer did not observe disconnect")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect waited forever on the reserved operation")
+	}
+	select {
+	case <-ready:
+	default:
+		t.Fatal("reserved operation outcome was not published")
+	}
+}
+
 func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
 	defer clientSide.Close()
@@ -625,11 +691,40 @@ func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.
 		}
 		time.Sleep(time.Millisecond)
 	}
+	// Model a connection handler whose only exit is the cancellation chain
+	// that follows the terminal gate verdict. Joining handlers before
+	// publishing that verdict creates a closed cycle:
+	// close -> handlerWG -> handler -> handoff -> exposed operation -> close.
+	handlerStarted := make(chan struct{})
+	gateSeen := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	conn.handlerWG.Add(1)
+	go func() {
+		defer conn.handlerWG.Done()
+		close(handlerStarted)
+		a.frontendGateMu.Lock()
+		for a.frontendGateErr == nil {
+			a.frontendGateCond.Wait()
+		}
+		a.frontendGateMu.Unlock()
+		close(gateSeen)
+		<-releaseHandler
+	}()
+	<-handlerStarted
 	closeDone := make(chan struct{})
 	go func() {
 		conn.close()
 		close(closeDone)
 	}()
+	select {
+	case <-gateSeen:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect did not publish its terminal gate verdict before joining handlers")
+	}
+	if err := a.frontendAdmissionError(); err == nil {
+		t.Fatal("replacement frontend was admitted during disconnect fence linearization")
+	}
+	close(releaseHandler)
 
 	select {
 	case err := <-handoffDone:

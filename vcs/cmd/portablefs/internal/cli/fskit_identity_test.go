@@ -3,6 +3,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 )
 
 func TestPortableFSKernelPathsIsolatesOtherFSKitProducts(t *testing.T) {
@@ -20,7 +22,7 @@ func TestPortableFSKernelPathsIsolatesOtherFSKitProducts(t *testing.T) {
 		{
 			fsType: "pfs",
 			path:   "/Users/test/PortableFS/work",
-			source: "pfs://att_BBBBBBBBBBBBBBBBBBBBBB",
+			source: fskitidentity.ResourcePrefix + "att_BBBBBBBBBBBBBBBBBBBBBB",
 		},
 	}
 
@@ -37,7 +39,7 @@ func TestPortableFSKernelPathsRejectsMalformedOwnedMount(t *testing.T) {
 	_, err := portableFSKernelPaths([]kernelMountIdentity{{
 		fsType: "pfs",
 		path:   "/Users/test/PortableFS/broken",
-		source: "pfs://not-an-attach-ref",
+		source: fskitidentity.ResourcePrefix + "not-an-attach-ref",
 	}})
 	if err == nil || !strings.Contains(err.Error(), "invalid attach source") {
 		t.Fatalf("error = %v, want invalid owned attach source", err)
@@ -45,7 +47,7 @@ func TestPortableFSKernelPathsRejectsMalformedOwnedMount(t *testing.T) {
 }
 
 func TestValidateFSKitKernelIdentityRequiresExactProductAndSource(t *testing.T) {
-	const source = "pfs://att_AAAAAAAAAAAAAAAAAAAAAA"
+	const source = fskitidentity.ResourcePrefix + "att_AAAAAAAAAAAAAAAAAAAAAA"
 	if err := validateFSKitKernelIdentity("pfs", source, "pfs", source); err != nil {
 		t.Fatalf("exact identity: %v", err)
 	}
@@ -57,7 +59,7 @@ func TestValidateFSKitKernelIdentityRequiresExactProductAndSource(t *testing.T) 
 	}
 	if err := validateFSKitKernelIdentity(
 		"pfs",
-		"pfs://att_BBBBBBBBBBBBBBBBBBBBBB",
+		fskitidentity.ResourcePrefix+"att_BBBBBBBBBBBBBBBBBBBBBB",
 		"pfs",
 		source,
 	); err == nil {
