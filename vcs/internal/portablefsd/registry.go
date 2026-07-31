@@ -806,6 +806,10 @@ func (r *registry) forceUnmountFSKit(
 		}
 	}
 
+	// The exact kernel detach re-enters this daemon through vnode reclaim;
+	// never hold the admission freeze across it (see detachWithFinalizer).
+	a.nsMu.Unlock()
+	a.frontendSerial.Unlock()
 	present, err := ops.present(a.mountPath, a.ref)
 	if err == nil && present {
 		err = ops.unmountExact(a.mountPath, a.ref)
@@ -813,10 +817,10 @@ func (r *registry) forceUnmountFSKit(
 	if err != nil {
 		// Force authorization and the parked-tail proof remain durable.
 		// Operations are quarantined until an exact retry succeeds.
-		a.nsMu.Unlock()
-		a.frontendSerial.Unlock()
 		return jobID, err
 	}
+	a.frontendSerial.Lock()
+	a.nsMu.Lock()
 	return a.finishDetachWithNSLocked(jobID, nil)
 }
 
@@ -1515,34 +1519,34 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	return a.finishDetachWithNSLocked(jobID, err)
 }
 
-// detachWithFinalizer freezes every frontend admission, closes the volume's
-// durability boundary, and runs one exact kernel detach callback while the
-// freeze is still held. CloseWithFinalizer keeps the volume usable when the
-// callback fails, so a failed platform unmount thaws back to the live mount.
+// detachWithFinalizer closes the volume's durability boundary and runs one
+// exact kernel detach callback. The admission freeze is held only around the
+// terminal state transition, never across the callback: unmount(2) re-enters
+// this daemon — the kernel reclaims every cached vnode through the FSKit
+// extension, and reclaim serializes on frontendSerial exclusively — so a
+// freeze spanning the callback deadlocks the daemon against its own kernel
+// detach. The write-back engine's close freeze is what guarantees no new
+// durability debt while the barrier and callback run. CloseWithFinalizer
+// keeps the volume usable when the callback fails, so a failed platform
+// unmount thaws back to the live mount.
 func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
-	a.frontendSerial.Lock()
-	a.nsMu.Lock()
 	a.mu.RLock()
 	alreadyDetached := a.detached
 	existingJobID := a.detachJobID
 	vol := a.vol
 	a.mu.RUnlock()
 	if alreadyDetached {
-		a.nsMu.Unlock()
-		a.frontendSerial.Unlock()
 		return existingJobID, nil
 	}
 	if vol != nil {
 		if err := vol.CloseWithFinalizer(finalizer); err != nil {
-			a.nsMu.Unlock()
-			a.frontendSerial.Unlock()
 			return "", fmt.Errorf("prepared FSKit detach refused: %w", err)
 		}
 	} else if err := finalizer(); err != nil {
-		a.nsMu.Unlock()
-		a.frontendSerial.Unlock()
 		return "", err
 	}
+	a.frontendSerial.Lock()
+	a.nsMu.Lock()
 	return a.finishDetachWithNSLocked("", nil)
 }
 
@@ -2885,7 +2889,12 @@ func (a *attach) objectTarget(item pfslocal.Item, handleID uint64) (objectTarget
 			return objectTarget{}, darwinENOENT
 		}
 		recCopy := *rec
-		return objectTarget{rec: &recCopy}, 0
+		// The identity-only lane must name the object through the same
+		// deterministic alias the handle lane uses. rec.path is merely the
+		// first alias that happened to register, so a hard-linked file would
+		// otherwise report a different parent depending on whether a
+		// descriptor is open.
+		return objectTarget{rec: &recCopy, scope: a.canonicalItemAliasLocked(rec)}, 0
 	}
 
 	h := a.handles[handleID]
@@ -2933,6 +2942,40 @@ func (a *attach) canonicalItemAliasLocked(rec *itemRecord) string {
 		}
 	}
 	return canonical
+}
+
+// hasBoundDescendantsLocked reports whether any live namespace binding sits
+// beneath one of rec's aliases. A directory Item is the parent identity every
+// child it still binds reports, so retiring it would leave those children
+// answering FSKit with an invalid parent. Refuse exactly as an open handle
+// does and let the host retry once it has retired the subtree. Non-directories
+// never match, so no kind test is needed. Caller holds a.mu.
+func (a *attach) hasBoundDescendantsLocked(rec *itemRecord) bool {
+	// The root's alias is the empty string, which prefixes every path; it is
+	// also never reclaimed, so exclude it before the prefix test.
+	if rec == nil || rec.path == "" {
+		return false
+	}
+	var prefixes []string
+	for aliasPath := range a.itemAliases[rec.item.ItemID] {
+		if aliasPath == "" {
+			continue
+		}
+		if alias := a.paths[aliasPath]; alias != nil && alias.item == rec.item {
+			prefixes = append(prefixes, aliasPath+"/")
+		}
+	}
+	if len(prefixes) == 0 {
+		return false
+	}
+	for p := range a.paths {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(p, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // handleTarget resolves an existing read/write/fsync descriptor and returns a

@@ -95,20 +95,32 @@ public enum PfsFSKitMapping {
         return try itemIdentifier(from: attr.parent.itemID)
     }
 
+    /// The identifier the synthetic `".."` entry carries during enumeration.
+    /// Unlike `parentID`, this is a packed directory entry and must name a
+    /// real item: POSIX makes the root its own parent, and a retained item
+    /// whose last name is gone has no live parent to name, so both resolve to
+    /// the enumerated directory itself.
+    public static func parentDirectoryIdentifier(from attr: PfsAttr) throws -> FSItem.Identifier {
+        guard attr.item.itemID != 1, attr.hasParent else {
+            return try itemIdentifier(from: attr.item.itemID)
+        }
+        return try itemIdentifier(from: attr.parent.itemID)
+    }
+
     /// Builds one atomic FSKit snapshot. Get-attribute and readdir-plus callers
     /// pass the exact wanted mask so the reply contains neither missing
     /// requested properties nor unrelated valid properties.
+    ///
+    /// The mask may name properties PortableFS does not model at all — Finder
+    /// and Spotlight ask for `ATTR_CMN_ADDEDTIME` unconditionally and FSKit
+    /// offers no capability bit to suppress it. Those stay invalid rather than
+    /// failing the operation: FSKit's contract is that every requested
+    /// *supported* property is valid, and `FSItemAttributes.isValid` exists
+    /// precisely so a genuinely absent property can be reported as absent.
     public static func attributes(
         from attr: PfsAttr,
         requested: FSItem.Attribute? = nil
     ) throws -> FSItem.Attributes {
-        if let requested,
-           requested.contains(.addedTime) || requested.contains(.backupTime) {
-            throw PfsLocalClientError.daemon(
-                errno: ENOTSUP,
-                message: "PortableFS does not expose added-time or backup-time metadata"
-            )
-        }
         let attributes = FSItem.Attributes()
         if includes(.uid, in: requested) {
             attributes.uid = attr.uid
@@ -161,7 +173,20 @@ public enum PfsFSKitMapping {
         return attributes
     }
 
-    public static func setAttributes(from request: FSItem.SetAttributesRequest) -> PfsSetAttributes {
+    /// Neither the authority's durable metadata model nor the pfslocal
+    /// protocol carries BSD file flags, so a flags change has nowhere to be
+    /// stored. Report that instead of consuming the request and reporting a
+    /// success the next `getattr` contradicts; `supportedCapabilities` sets
+    /// `doesNotSupportImmutableFiles` for the same reason.
+    public static func setAttributes(
+        from request: FSItem.SetAttributesRequest
+    ) throws -> PfsSetAttributes {
+        if request.isValid(.flags) {
+            throw PfsLocalClientError.daemon(
+                errno: ENOTSUP,
+                message: "PortableFS does not persist BSD file flags"
+            )
+        }
         var attributes = PfsSetAttributes()
         if request.isValid(.mode) {
             attributes.mode = request.mode
@@ -243,14 +268,23 @@ public enum PfsFSKitMapping {
         supported.supports2TBFiles = true
         supported.supportsFastStatFS = true
         supported.supportsSparseFiles = true
+        // No layer below FSKit persists BSD file flags, so claiming
+        // UF_IMMUTABLE support would make chflags(2) a silent no-op.
+        supported.doesNotSupportImmutableFiles = true
         supported.caseFormat = capabilities.caseSensitive ? .sensitive : .insensitiveCasePreserving
         return supported
     }
 
     public static func timespec(milliseconds: Int64) -> timespec {
-        let seconds = milliseconds / 1000
-        let remainder = milliseconds % 1000
-        return Darwin.timespec(tv_sec: Int(seconds), tv_nsec: Int(remainder * 1_000_000))
+        var seconds = milliseconds / 1000
+        var nanoseconds = (milliseconds % 1000) * 1_000_000
+        if nanoseconds < 0 {
+            // Go's and C's truncating division give a negative remainder for
+            // pre-1970 times; timespec requires tv_nsec in [0, 1e9).
+            nanoseconds += 1_000_000_000
+            seconds -= 1
+        }
+        return Darwin.timespec(tv_sec: Int(seconds), tv_nsec: Int(nanoseconds))
     }
 
     public static func milliseconds(from value: timespec) -> Int64 {

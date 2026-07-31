@@ -139,3 +139,63 @@ func (a *cancelAfterFirstLockAuthority) Lock(ctx context.Context, path string, _
 	}
 	return fsproto.LockResult{Status: fsproto.OK}, nil
 }
+
+type failPathLockAuthority struct {
+	failPath string
+	calls    []lockCall
+}
+
+func (a *failPathLockAuthority) Lock(_ context.Context, path string, mode uint8, lkID, start, end uint64, write, unlock bool) (fsproto.LockResult, error) {
+	a.calls = append(a.calls, lockCall{
+		path: path, mode: mode, owner: lkID, start: start, end: end, write: write, unlock: unlock,
+	})
+	if path == a.failPath {
+		return fsproto.LockResult{}, errors.New("authority unreachable for this release")
+	}
+	return fsproto.LockResult{Status: fsproto.OK}, nil
+}
+
+// A failed authority release must not surrender the local record: it is the
+// only thing that lets close/reclaim reconstruct and retry the release.
+func TestUnlockFailedReleaseRetainsLocalOwnership(t *testing.T) {
+	auth := &failPathLockAuthority{failPath: "a"}
+	h := &LockHandle{}
+	h.Add(7, 0, 100, "a", true)
+	h.Add(7, 0, 100, "b", true)
+
+	err := Unlock(context.Background(), auth, h, 7, 0, 100, "live")
+	if err == nil {
+		t.Fatal("failed release reported success")
+	}
+	left := h.Snapshot()
+	if len(left) != 1 || left[0].Path != "a" || !left[0].Write {
+		t.Fatalf("ownership after failed release = %+v, want only path a retained", left)
+	}
+	// close/reclaim can now converge the release.
+	auth.failPath = ""
+	ReleaseHandleLocks(auth, h)
+	last := auth.calls[len(auth.calls)-1]
+	if last.path != "a" || !last.unlock {
+		t.Fatalf("reclaim did not release the retained lock: %+v", last)
+	}
+}
+
+// A partial unlock's split remainders keep their lock type so a post-failover
+// reclaim re-asserts a write lock as a write lock.
+func TestUnlockSplitPreservesWriteType(t *testing.T) {
+	auth := &recordingLockAuthority{}
+	h := &LockHandle{}
+	h.Add(7, 0, 100, "f", true)
+	if err := Unlock(context.Background(), auth, h, 7, 40, 60, "f"); err != nil {
+		t.Fatal(err)
+	}
+	left := h.Snapshot()
+	if len(left) != 2 {
+		t.Fatalf("split remainders = %+v, want 2", left)
+	}
+	for _, l := range left {
+		if !l.Write {
+			t.Fatalf("split remainder lost its write type: %+v", l)
+		}
+	}
+}

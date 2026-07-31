@@ -296,12 +296,18 @@ func (v *Volume) beginAuthorityMutation(
 	operands ...string,
 ) (context.Context, func(), error) {
 	paths, inos := v.hardlinkMutationTargets(nodes, operands...)
+	// A conflicting active claim can be a remote acquire resolver mid-RPC,
+	// so admission into the transition gate is an authority-bound wait: the
+	// caller's publication must suspend while it queues, or a reciprocal
+	// cross-client acquire/mutation pair deadlocks the handoff drain.
+	resumeAdmission := v.suspendAuthorityPublication(ctx)
 	claim, err := v.delegationTransitions.begin(
 		ctx,
 		authorityTransition,
 		paths,
 		inos,
 	)
+	resumeAdmission()
 	if err != nil {
 		return ctx, nil, err
 	}
@@ -310,9 +316,12 @@ func (v *Volume) beginAuthorityMutation(
 	// must promote its reply identities against this claim and will be
 	// released rather than installed on collision.
 	paths, inos = v.hardlinkMutationTargets(nodes, operands...)
-	if err := claim.extend(ctx, paths, inos); err != nil {
+	resumeExtend := v.suspendAuthorityPublication(ctx)
+	extendErr := claim.extend(ctx, paths, inos)
+	resumeExtend()
+	if extendErr != nil {
 		claim.end()
-		return ctx, nil, err
+		return ctx, nil, extendErr
 	}
 	if v.wb != nil {
 		if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
@@ -887,6 +896,12 @@ func attrFromEntry(e writeback.Entry) fsproto.Attr {
 	}
 	if a.AtimeMs == 0 {
 		a.AtimeMs = a.MtimeMs
+	}
+	// The engine records no birth time. Reporting mtime keeps a locally-born
+	// entry consistent with the authority-backed conversion instead of
+	// surfacing the epoch-0 sentinel.
+	if a.BirthtimeMs == 0 {
+		a.BirthtimeMs = a.MtimeMs
 	}
 	if a.Nlink == 0 {
 		a.Nlink = 1

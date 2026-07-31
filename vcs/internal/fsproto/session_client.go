@@ -52,6 +52,20 @@ const (
 	parkRetryMax = 5 * time.Second
 )
 
+// exactGateRetryDelay paces re-issuing an exact mutation after the
+// authority's delegation gate returned a definite EAGAIN mid-recall. The
+// recall it timed out on is already in flight, so the next attempt usually
+// succeeds; the delay only prevents a tight identity-consuming loop.
+const exactGateRetryDelay = 250 * time.Millisecond
+
+// exactGateRetryBudget bounds how long DoContext keeps re-issuing after
+// definite gate EAGAINs before surfacing the last one. Each server-side gate
+// attempt already waits a full recall timeout, so a budget of a few recall
+// timeouts covers every converging recall while a scope stuck behind a dead
+// holder's recovery delegation still surfaces instead of blocking until
+// lease expiry. Variable (not const) so tests can compress it.
+var exactGateRetryBudget = 90 * time.Second
+
 // ErrMutationUnknown is returned when a mutation's outcome could not be
 // determined within the foreground budget. The identity is parked and will be
 // replayed until definite; it is NEVER reused for a different request.
