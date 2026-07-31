@@ -96,15 +96,17 @@ echo "local-exit=$L remote-exit=$R"
 echo "--- local result ---";  tail -40 "$OUT/stress-local.json"
 echo "--- remote result ---"; tail -40 "$OUT/stress-remote.json"
 
-# The locked-counter check asserts cross-host fcntl exclusion, which FSKit
-# cannot provide (no lock ops in the extension API). Distinguish that known
-# limitation from every other failure.
-LOCK_ONLY=0
+# Two checks assert semantics macOS FSKit cannot provide to any filesystem:
+# cross-host fcntl exclusion (no lock operations in the extension API) and
+# cross-host O_APPEND atomicity (the kernel resolves append offsets from its
+# cached EOF before the extension sees the write; FSVolumeOpenModes carries
+# no append intent). Distinguish those platform limits from real failures.
+PLATFORM_ONLY=0
 if [ $L -ne 0 ] || [ $R -ne 0 ]; then
-  if grep -hq "locked-counter" "$OUT/stress-local.json" "$OUT/stress-remote.json" && \
-     ! grep -hqE "shared-append|byte-verify|big\.bin|churn|rename-over-open|ready barrier|done record" \
-        <(grep -ih "error\|fail" "$OUT/stress-local.json" "$OUT/stress-remote.json"); then
-    LOCK_ONLY=1
+  OTHER=$(grep -hiE "verify|error|fail|timed out" "$OUT/stress-local.json" "$OUT/stress-remote.json" \
+    | grep -vE "locked counter|shared append|verify shared appends" | head -5)
+  if [ -z "$OTHER" ]; then
+    PLATFORM_ONLY=1
   fi
 fi
 
@@ -119,8 +121,8 @@ echo "== FSKit error scan since $T0 =="
 
 if [ $L -eq 0 ] && [ $R -eq 0 ]; then
   echo "RESULT: PASS"
-elif [ $LOCK_ONLY -eq 1 ]; then
-  echo "RESULT: PASS-EXCEPT-LOCKS (expected FSKit platform limitation: no cross-machine fcntl)"
+elif [ $PLATFORM_ONLY -eq 1 ]; then
+  echo "RESULT: PASS-EXCEPT-PLATFORM (FSKit limits: no cross-machine fcntl locks, no O_APPEND intent)"
 else
   echo "RESULT: FAIL"
   exit 1

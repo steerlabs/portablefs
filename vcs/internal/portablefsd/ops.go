@@ -3,12 +3,12 @@ package portablefsd
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"os"
 	"path"
 	"sort"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
@@ -17,15 +17,31 @@ import (
 )
 
 const (
-	enumerateCookieMarker  = uint64(1) << 63
-	enumerateCookieIDBits  = 31
-	enumerateCookiePosBits = 30
-	// Cookies are [marker:1][enumID:31][position:30][reserved:2]. The daemon emits only reserved=0.
-	enumerateCookieReservedMask = uint64(0x3)
-	enumerateCookieMaxID        = (uint64(1) << enumerateCookieIDBits) - 1
-	enumerateCookieMaxPos       = (uint64(1) << enumerateCookiePosBits) - 1
-	maxLiveEnumerations         = 64
-	enumerationTTL              = 5 * time.Minute
+	enumerateCookieMarker = uint64(1) << 63
+	// Cookies are [marker:1][cursor:61][tag:2].
+	//
+	// The cursor is a pure function of the entry NAME, so a cookie is a stable
+	// resumption point in the directory's total enumeration order rather than a
+	// position in some server-side snapshot. Any daemon, before or after a
+	// restart, resolves a cookie by re-listing the directory and continuing at
+	// the first entry whose cursor is strictly greater. That is what makes
+	// paging tolerant of concurrent creates, deletes, and rename-ins: entries
+	// that survive are returned exactly once, and no cookie can ever fail to
+	// resolve mid-enumeration.
+	//
+	// tag distinguishes this format from the pre-fix positional format
+	// ([marker][enumID:31][pos:30][reserved:2], tag == 0), whose cookies died
+	// with the snapshot record they indexed. Rejecting tag != cursor keeps a
+	// cookie minted by an older daemon (or any foreign sentinel) fail-safe
+	// across an upgrade instead of being misread as a cursor.
+	enumerateCookieTagMask   = uint64(0x3)
+	enumerateCookieTagCursor = uint64(0x1)
+	enumerateCursorBits      = 61
+	enumerateCursorMax       = (uint64(1) << enumerateCursorBits) - 1
+	// Cursors are drawn from [1, enumerateCursorSpace]; the reserved headroom
+	// above it absorbs the strictly-increasing fixup applied to the (vanishing)
+	// case of two names hashing to the same cursor.
+	enumerateCursorSpace = enumerateCursorMax - (uint64(1) << 20)
 )
 
 func fsAttrToLocal(a fsproto.Attr, item pfslocal.Item, parent *pfslocal.Item) pfslocal.Attr {
@@ -250,37 +266,35 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 }
 
 func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) (*pfslocal.EnumerateReply, int32) {
-	// Enumeration cookies are daemon-opaque continuation tokens. Issued cookies always have the
-	// high bit set and low reserved bits clear; frontend adapters must pass them back unchanged.
-	// Cookie 0 starts a fresh snapshot and terminal replies use next_cookie=0. Unknown, expired,
-	// low-bit/sentinel, or otherwise malformed nonzero cookies return ESTALE so the frontend can
-	// discard its cursor and restart from 0.
+	// Enumeration cookies are daemon-opaque continuation tokens carrying a
+	// name-derived cursor in the directory's total enumeration order; frontend
+	// adapters must pass them back unchanged. Cookie 0 starts at the beginning
+	// and terminal replies use next_cookie=0. Every cookie this daemon issues
+	// resolves for as long as the directory exists — there is no per-enumeration
+	// server state to expire, evict, or lose across a restart. Only foreign
+	// cookies (missing marker, wrong format tag, out-of-range cursor) return
+	// ESTALE so the frontend restarts from 0.
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
 	dir, eno := a.item(req.Dir)
 	if eno != 0 {
 		return nil, eno
 	}
-	limit := int(req.MaxEntries)
-	if req.Cookie == 0 {
-		ents, dirVersion, eno := a.freshDirListing(ctx, dir.path)
-		if eno != 0 {
-			return nil, eno
+	resume := uint64(0)
+	if req.Cookie != 0 {
+		cursor, ok := decodeEnumerationCookie(req.Cookie)
+		if !ok {
+			return nil, darwinESTALE
 		}
-		sort.SliceStable(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
-		rep, eno := a.enumerateFreshLocked(dir.path, ents, dirVersion, limit)
-		if eno != 0 {
-			return nil, eno
-		}
-		if rep != nil && len(rep.Entries) > 0 {
-			if eno := a.flushBindingDelta(); eno != 0 {
-				return nil, eno
-			}
-		}
-		return rep, 0
+		resume = cursor
 	}
-
-	rep, eno := a.enumerateResumeLocked(dir.path, req.Cookie, limit)
+	ents, dirVersion, eno := a.freshDirListing(ctx, dir.path)
+	if eno != 0 {
+		return nil, eno
+	}
+	ordered := orderEnumeration(ents)
+	start := sort.Search(len(ordered), func(i int) bool { return ordered[i].cursor > resume })
+	rep, eno := a.enumeratePage(dir.path, ordered, start, dirVersion, int(req.MaxEntries))
 	if eno != 0 {
 		return nil, eno
 	}
@@ -354,54 +368,66 @@ func (a *attach) freshDirListing(ctx context.Context, dir string) ([]clientcore.
 	return merged, dirVersion, 0
 }
 
-func (a *attach) enumerateFreshLocked(dir string, ents []clientcore.DirEntry, dirVersion uint64, limit int) (*pfslocal.EnumerateReply, int32) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := time.Now()
-	a.pruneEnumerationsLocked(now)
-	if len(ents) <= 1 {
-		return a.enumeratePageLocked(nil, dir, 0, ents, dirVersion, limit)
-	}
-	rec, err := a.newEnumerationRecordLocked(dir, ents, dirVersion, now)
-	if err != nil {
-		return nil, darwinEIO
-	}
-	return a.enumeratePageLocked(rec, rec.dir, 0, rec.entries, rec.dirVersion, limit)
+// enumerationEntry pairs a merged directory entry with its resumption cursor.
+type enumerationEntry struct {
+	entry  clientcore.DirEntry
+	cursor uint64
 }
 
-func (a *attach) enumerateResumeLocked(dir string, cookie uint64, limit int) (*pfslocal.EnumerateReply, int32) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := time.Now()
-	a.pruneEnumerationsLocked(now)
-	if cookie&enumerateCookieMarker == 0 {
-		return nil, darwinESTALE
-	}
-	enumID, pos, ok := decodeEnumerationCookie(cookie)
-	if !ok {
-		return nil, darwinESTALE
-	}
-	rec := a.enumRecords[enumID]
-	if rec == nil || rec.dir != dir || pos < 0 || pos > len(rec.entries) {
-		// Continuation cookies are self-describing high-bit tokens issued by this daemon.
-		// Low-bit frontend sentinels, expired/LRU-evicted tokens, and tokens from a pre-restart
-		// daemon are stale. Return ESTALE so the frontend restarts from 0.
-		return nil, darwinESTALE
-	}
-	rec.lastUsed = now
-	return a.enumeratePageLocked(rec, rec.dir, pos, rec.entries, rec.dirVersion, limit)
+// enumerationCursor maps an entry name to its key in the directory's total
+// enumeration order. It is a pure function of the name: independent of the
+// listing it was computed from, of any snapshot, and of the daemon process, so
+// a cookie minted from it stays meaningful while entries around it come and go.
+func enumerationCursor(name string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	return 1 + h.Sum64()%enumerateCursorSpace
 }
 
-func (a *attach) enumeratePageLocked(enumRec *enumerationRecord, dir string, start int, ents []clientcore.DirEntry, dirVersion uint64, limit int) (*pfslocal.EnumerateReply, int32) {
-	if start > len(ents) {
-		start = len(ents)
+// orderEnumeration puts the merged listing into the daemon's enumeration order
+// -- ascending name cursor, ties broken by name -- and hands every entry a
+// strictly increasing key. Enumeration order is therefore a deterministic
+// function of the name set alone (POSIX leaves readdir order to the file
+// system; every consumer that wants alphabetical order sorts for itself).
+//
+// The strictly-increasing fixup only ever fires when two names collide in the
+// 61-bit cursor space; it keeps "resume at the first cursor greater than the
+// cookie" from skipping the colliding twin. The one residual case it cannot
+// cover is a colliding pair whose FIRST member is deleted while a cookie
+// naming it is outstanding, which drops the survivor back to its natural
+// cursor and skips it: that needs a 61-bit hash collision inside a single
+// directory and a concurrent delete on exactly that name.
+func orderEnumeration(ents []clientcore.DirEntry) []enumerationEntry {
+	ordered := make([]enumerationEntry, 0, len(ents))
+	for _, e := range ents {
+		ordered = append(ordered, enumerationEntry{entry: e, cursor: enumerationCursor(e.Name)})
 	}
-	if limit <= 0 || start+limit > len(ents) {
-		limit = len(ents) - start
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].cursor != ordered[j].cursor {
+			return ordered[i].cursor < ordered[j].cursor
+		}
+		return ordered[i].entry.Name < ordered[j].entry.Name
+	})
+	for i := 1; i < len(ordered); i++ {
+		if ordered[i].cursor <= ordered[i-1].cursor {
+			ordered[i].cursor = ordered[i-1].cursor + 1
+		}
+	}
+	return ordered
+}
+
+func (a *attach) enumeratePage(dir string, ordered []enumerationEntry, start int, dirVersion uint64, limit int) (*pfslocal.EnumerateReply, int32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if start > len(ordered) {
+		start = len(ordered)
+	}
+	if limit <= 0 || start+limit > len(ordered) {
+		limit = len(ordered) - start
 	}
 	out := make([]pfslocal.DirEntry, 0, limit)
 	for i := start; i < start+limit; i++ {
-		e := ents[i]
+		e := ordered[i].entry
 		p := e.Name
 		if dir != "" {
 			p = dir + "/" + e.Name
@@ -417,10 +443,13 @@ func (a *attach) enumeratePageLocked(enumRec *enumerationRecord, dir string, sta
 		if rec == nil {
 			return nil, darwinEIO
 		}
+		// The final entry of the listing carries cookie 0: end of directory.
+		// Every other entry carries its own cursor, which resumes strictly
+		// after it.
 		cookie := uint64(0)
-		if enumRec != nil && i < len(ents)-1 {
+		if i < len(ordered)-1 {
 			var ok bool
-			cookie, ok = encodeEnumerationCookie(enumRec.id, i+1)
+			cookie, ok = encodeEnumerationCookie(ordered[i].cursor)
 			if !ok {
 				return nil, darwinEIO
 			}
@@ -435,86 +464,28 @@ func (a *attach) enumeratePageLocked(enumRec *enumerationRecord, dir string, sta
 	if len(out) > 0 {
 		next = out[len(out)-1].Cookie
 	}
-	if next == 0 && enumRec != nil {
-		a.dropEnumerationLocked(enumRec.id)
-	}
 	return &pfslocal.EnumerateReply{Entries: out, NextCookie: next, DirVersion: dirVersion}, 0
 }
 
-func (a *attach) newEnumerationRecordLocked(dir string, ents []clientcore.DirEntry, dirVersion uint64, now time.Time) (*enumerationRecord, error) {
-	for len(a.enumRecords) >= maxLiveEnumerations {
-		a.evictOldestEnumerationLocked()
-	}
-	id := a.nextEnumerationIDLocked()
-	rec := &enumerationRecord{
-		id: id, dir: dir,
-		entries:    append([]clientcore.DirEntry(nil), ents...),
-		dirVersion: dirVersion,
-		lastUsed:   now,
-	}
-	a.enumRecords[id] = rec
-	return rec, nil
-}
-
-func (a *attach) nextEnumerationIDLocked() uint64 {
-	for {
-		a.nextEnumID++
-		if a.nextEnumID == 0 {
-			a.nextEnumID++
-		}
-		if a.nextEnumID > enumerateCookieMaxID {
-			a.nextEnumID = 1
-		}
-		if _, exists := a.enumRecords[a.nextEnumID]; !exists {
-			return a.nextEnumID
-		}
-	}
-}
-
-func encodeEnumerationCookie(enumID uint64, pos int) (uint64, bool) {
-	if enumID == 0 || enumID > enumerateCookieMaxID || pos <= 0 || uint64(pos) > enumerateCookieMaxPos {
+func encodeEnumerationCookie(cursor uint64) (uint64, bool) {
+	if cursor == 0 || cursor > enumerateCursorMax {
 		return 0, false
 	}
-	return enumerateCookieMarker | (enumID << (enumerateCookiePosBits + 2)) | (uint64(pos) << 2), true
+	return enumerateCookieMarker | (cursor << 2) | enumerateCookieTagCursor, true
 }
 
-func decodeEnumerationCookie(cookie uint64) (uint64, int, bool) {
+func decodeEnumerationCookie(cookie uint64) (uint64, bool) {
 	if cookie&enumerateCookieMarker == 0 {
-		return 0, 0, false
+		return 0, false
 	}
-	if cookie&enumerateCookieReservedMask != 0 {
-		return 0, 0, false
+	if cookie&enumerateCookieTagMask != enumerateCookieTagCursor {
+		return 0, false
 	}
-	enumID := (cookie >> (enumerateCookiePosBits + 2)) & enumerateCookieMaxID
-	pos := (cookie >> 2) & enumerateCookieMaxPos
-	if enumID == 0 || pos == 0 {
-		return 0, 0, false
+	cursor := (cookie &^ enumerateCookieMarker) >> 2
+	if cursor == 0 {
+		return 0, false
 	}
-	return enumID, int(pos), true
-}
-
-func (a *attach) pruneEnumerationsLocked(now time.Time) {
-	for id, rec := range a.enumRecords {
-		if now.Sub(rec.lastUsed) > enumerationTTL {
-			a.dropEnumerationLocked(id)
-		}
-	}
-}
-
-func (a *attach) evictOldestEnumerationLocked() {
-	var oldest *enumerationRecord
-	for _, rec := range a.enumRecords {
-		if oldest == nil || rec.lastUsed.Before(oldest.lastUsed) {
-			oldest = rec
-		}
-	}
-	if oldest != nil {
-		a.dropEnumerationLocked(oldest.id)
-	}
-}
-
-func (a *attach) dropEnumerationLocked(id uint64) {
-	delete(a.enumRecords, id)
+	return cursor, true
 }
 
 func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pfslocal.GetAttrReply, int32) {
@@ -705,6 +676,11 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 	if rec.graft {
 		write := req.Mode == pfslocal.OpenModeWrite || req.Mode == pfslocal.OpenModeReadWrite
 		flags := localOpenFlags(req.Mode)
+		if req.Append && write {
+			// A graft is a machine-local path: the host kernel enforces
+			// O_APPEND atomicity for it, so carry the flag onto the real fd.
+			flags |= os.O_APPEND
+		}
 		file, err := a.localFS.OpenFile(rec.path, flags, 0)
 		if err != nil && flags != os.O_RDONLY {
 			// Directories only support read-only descriptors; retain parity
@@ -717,7 +693,7 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 			return nil, localErrno(err)
 		}
 		a.mu.Lock()
-		h := a.newLocalHandleLocked(rec.path, rec.item.ItemID, file, write)
+		h := a.newLocalHandleLocked(rec.path, rec.item.ItemID, file, write, req.Append && write)
 		a.mu.Unlock()
 		return &pfslocal.OpenReply{Handle: h}, 0
 	}
@@ -730,7 +706,7 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	h := a.newHandleLocked(rec.path, rec.item.ItemID, rec.state, write)
+	h := a.newHandleLocked(rec.path, rec.item.ItemID, rec.state, write, req.Append && write)
 	a.mu.Unlock()
 	return &pfslocal.OpenReply{Handle: h}, 0
 }
@@ -831,8 +807,43 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	if !h.write {
 		return nil, darwinEBADF
 	}
+	// O_APPEND is a property of the open file description OR of this one
+	// request. Either way the offset is resolved at EOF by whoever owns the
+	// serialization (host kernel for a graft, authority/delegation otherwise)
+	// — never by the frontend, which can only ever hold a cached size. Two
+	// machines that each compute "EOF" from their own view write the same
+	// byte range and one record is destroyed; that is exactly the
+	// cross-machine append corruption this routing exists to prevent.
+	//
+	// PLATFORM CONSTRAINT: macOS FSKit cannot set this bit. It surfaces no
+	// append intent to an extension — FSVolumeOpenModes is Read|Write only,
+	// and writeContents:toFile:atOffset: carries an off_t the KERNEL already
+	// resolved against its own cached vnode size. Appends from that frontend
+	// therefore arrive here as ordinary positional writes and stay exposed to
+	// the collision. Frontends that DO hold the intent (FUSE today, any
+	// future FSKit that surfaces it) opt in and get serialized,
+	// authority-assigned offsets.
+	appendWrite := h.appendOnly || req.Append
 	if h.file != nil {
-		if _, err := h.file.WriteAt(req.Data, int64(req.Offset)); err != nil {
+		var err error
+		switch {
+		case h.appendOnly:
+			// The fd carries O_APPEND, so the host kernel resolves EOF and
+			// commits atomically. WriteAt is invalid on such an fd (ESPIPE on
+			// Darwin); Write is the only positionless form.
+			_, err = h.file.Write(req.Data)
+		case appendWrite:
+			// Per-request append on a descriptor that was not opened O_APPEND.
+			// A graft is machine-local, so the worst exposure is two handles
+			// on this one daemon; resolve EOF as late as possible.
+			var end int64
+			if end, err = h.file.Seek(0, io.SeekEnd); err == nil {
+				_, err = h.file.WriteAt(req.Data, end)
+			}
+		default:
+			_, err = h.file.WriteAt(req.Data, int64(req.Offset))
+		}
+		if err != nil {
 			return nil, localErrno(err)
 		}
 		fi, err := h.file.Stat()
@@ -860,9 +871,14 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	}
 	var n int
 	var st clientcore.Status
-	if detached {
+	switch {
+	case appendWrite && detached:
+		n, st = vol.AppendExactHandle(ctx, h.state, req.Data)
+	case appendWrite:
+		n, st = vol.WriteAppendOpenHandle(ctx, scope, h.state, req.Data)
+	case detached:
 		n, st = vol.WriteExactHandle(ctx, h.state, int64(req.Offset), req.Data)
-	} else {
+	default:
 		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), req.Data)
 	}
 	if st != fsproto.OK {
@@ -932,6 +948,9 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 		if req.Exclusive {
 			flags |= os.O_EXCL
 		}
+		if req.Append {
+			flags |= os.O_APPEND
+		}
 		file, err := a.localFS.OpenFile(p, flags, os.FileMode(req.Mode)&os.ModePerm)
 		if err != nil {
 			return nil, localErrno(err)
@@ -945,7 +964,7 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 		a.mu.Lock()
 		rec := a.registerLocalLocked(p, attr)
 		a.bumpLocalVersionLocked(parentPath(p))
-		h := a.newLocalHandleLocked(p, rec.item.ItemID, file, true)
+		h := a.newLocalHandleLocked(p, rec.item.ItemID, file, true, req.Append)
 		a.mu.Unlock()
 		if eno := a.flushBindingDelta(); eno != 0 {
 			_ = file.Close()
@@ -986,7 +1005,7 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
-	h := a.newHandleLocked(p, rec.item.ItemID, rec.state, true)
+	h := a.newHandleLocked(p, rec.item.ItemID, rec.state, true, req.Append)
 	a.mu.Unlock()
 	return &pfslocal.CreateReply{
 		Attr:   a.localAttrForRecord(attr, rec, false),
