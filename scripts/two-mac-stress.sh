@@ -71,8 +71,16 @@ mkdir -p "$LROOT/mount"
 LMPID=$!
 "${SSH[@]}" "mkdir -p \$HOME/$RROOT/mount && \$HOME/$RROOT/bin/portablefs mount $VOL \$HOME/$RROOT/mount --branch $BRANCH --strategy fskit" > "$OUT/mount-remote.txt" 2>&1 &
 RMPID=$!
-wait $LMPID || { cat "$OUT/mount-local.txt"; fail "local mount"; }
-wait $RMPID || { cat "$OUT/mount-remote.txt"; fail "remote mount"; }
+LOK=0; ROK=0
+wait $LMPID && LOK=1
+wait $RMPID && ROK=1
+if [ $LOK -ne 1 ] || [ $ROK -ne 1 ]; then
+  cat "$OUT/mount-local.txt" "$OUT/mount-remote.txt"
+  # Roll back whichever side mounted so a rerun starts clean.
+  [ $LOK -eq 1 ] && "$BIN" umount "$LROOT/mount"
+  [ $ROK -eq 1 ] && "${SSH[@]}" "\$HOME/$RROOT/bin/portablefs umount \$HOME/$RROOT/mount"
+  fail "mount phase (local=$LOK remote=$ROK)"
+fi
 cat "$OUT/mount-local.txt" "$OUT/mount-remote.txt"
 
 T0="$(date '+%Y-%m-%d %H:%M:%S')"

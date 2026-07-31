@@ -237,27 +237,35 @@ func writeFileSet(hostRoot, host string, count int) error {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
+			// After a failure the worker keeps DRAINING jobs: the producer
+			// sends on an unbuffered channel, so a worker that returns early
+			// (e.g. every worker erroring when the mount dies) would strand
+			// the producer in a permanent send.
+			failed := false
+			fail := func(err error) { errs <- err; failed = true }
 			for index := range jobs {
+				if failed {
+					continue
+				}
 				name := fmt.Sprintf("file-%06d.dat", index)
 				tmp := filepath.Join(tmpDir, fmt.Sprintf("%s.%d.tmp", name, worker))
 				final := filepath.Join(filesDir, name)
 				content := fileContent(host, index)
 				if err := writeExclusiveSynced(tmp, content, 0o600); err != nil {
-					errs <- fmt.Errorf("write %s: %w", tmp, err)
-					return
+					fail(fmt.Errorf("write %s: %w", tmp, err))
+					continue
 				}
 				if err := os.Rename(tmp, final); err != nil {
-					errs <- fmt.Errorf("rename %s to %s: %w", tmp, final, err)
-					return
+					fail(fmt.Errorf("rename %s to %s: %w", tmp, final, err))
+					continue
 				}
 				if err := os.Chmod(final, 0o640); err != nil {
-					errs <- fmt.Errorf("chmod %s: %w", final, err)
-					return
+					fail(fmt.Errorf("chmod %s: %w", final, err))
+					continue
 				}
 				info, err := os.Stat(final)
 				if err != nil || info.Mode().Perm() != 0o640 || info.Size() != int64(len(content)) {
-					errs <- fmt.Errorf("stat %s: info=%v err=%v", final, info, err)
-					return
+					fail(fmt.Errorf("stat %s: info=%v err=%v", final, info, err))
 				}
 			}
 		}(worker)
