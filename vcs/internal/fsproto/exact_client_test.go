@@ -120,6 +120,12 @@ func TestClientEstablishesExactSessionOnFirstMutation(t *testing.T) {
 }
 
 func TestDefiniteDelegationEAGAINConsumesOneExactIdentity(t *testing.T) {
+	// Disable the DoContext gate-retry budget: this test pins the identity
+	// ledger for a single definite EAGAIN, and its recovery delegation never
+	// converges, so retries would only add identical consumed identities.
+	prevBudget := exactGateRetryBudget
+	exactGateRetryBudget = 0
+	t.Cleanup(func() { exactGateRetryBudget = prevBudget })
 	h := serveExact(t)
 	setup := dialExact(t, h.addr, "setup")
 	if _, st, err := setup.Mkdir("ws", 0o755); err != nil || st != OK {
@@ -904,5 +910,48 @@ func TestOpenUnlinkOrphanSurvivesFailover(t *testing.T) {
 			t.Fatalf("orphan survived unpin: st=%d err=%v, want ENOENT", st, err)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A definite gate EAGAIN within the retry budget is re-issued (each attempt
+// consuming its own identity) instead of surfacing errno 35 to the caller;
+// once the budget is exhausted the last definite EAGAIN surfaces.
+func TestExactGateEAGAINRetriesWithinBudgetThenSurfaces(t *testing.T) {
+	prevBudget := exactGateRetryBudget
+	exactGateRetryBudget = exactGateRetryDelay + 50*time.Millisecond
+	t.Cleanup(func() { exactGateRetryBudget = prevBudget })
+	h := serveExact(t)
+	setup := dialExact(t, h.addr, "setup-retry")
+	if _, st, err := setup.Mkdir("ws", 0o755); err != nil || st != OK {
+		t.Fatalf("mkdir: status=%d err=%v", st, err)
+	}
+
+	holder := dialExact(t, h.addr, "holder-retry")
+	grant, err := holder.DelegationAcquire("ws", "wb-eagain-retry")
+	if err != nil || !grant.Granted {
+		t.Fatalf("delegation acquire: grant=%+v err=%v", grant, err)
+	}
+	holderSession := holder.exactState()
+	if err := holder.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.fs.ExpireSession(holderSession.id, holderSession.gen); err != nil {
+		t.Fatalf("expire holder: %v", err)
+	}
+
+	contender := dialExact(t, h.addr, "contender-retry")
+	contender.SetExactSlots(1)
+	if live, err := contender.EnsureExactSession(); err != nil || !live {
+		t.Fatalf("contender exact session: live=%v err=%v", live, err)
+	}
+	if _, st, err := contender.Create("ws/blocked", 0o644); err != nil || st != EAGAIN {
+		t.Fatalf("gated create: status=%d err=%v", st, err)
+	}
+	es := contender.exactState()
+	es.mu.Lock()
+	seq := es.seq[0]
+	es.mu.Unlock()
+	if seq < 2 {
+		t.Fatalf("exact slot sequence = %d, want at least two consumed identities (one per retry)", seq)
 	}
 }

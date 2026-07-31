@@ -28,6 +28,18 @@ func (e *Engine) acquire(ctx context.Context, scope string) (bool, error) {
 		go e.resolveAcquire(scope, flight)
 	}
 	e.acquireMu.Unlock()
+	// The resolver's outcome can depend on the authority recalling a peer's
+	// delegation. A frontend operation waiting here can no longer publish a
+	// pre-transition local view, so its publication must suspend — otherwise
+	// two clients acquiring into each other's scopes re-create the reciprocal
+	// handoff wait.
+	var resume func()
+	if e.cfg.Events.OnReleaseWait != nil {
+		resume = e.cfg.Events.OnReleaseWait(ctx)
+	}
+	if resume != nil {
+		defer resume()
+	}
 	select {
 	case <-flight.done:
 	case <-ctx.Done():
@@ -543,7 +555,17 @@ func delegationPathsOverlap(a, b string) bool {
 // request times out, so BeginExact cannot miss an in-flight grant that later
 // installs while the exact authority operation is running.
 func (e *Engine) BeginExact(ctx context.Context) (end func(), err error) {
+	// Acquisition resolvers hold exactMu shared across their complete
+	// authority round-trip, so this exclusive acquisition is itself an
+	// authority-bound wait and must suspend the caller's publication.
+	var resumeLock func()
+	if e.cfg.Events.OnReleaseWait != nil {
+		resumeLock = e.cfg.Events.OnReleaseWait(ctx)
+	}
 	e.exactMu.Lock()
+	if resumeLock != nil {
+		resumeLock()
+	}
 	end = e.exactMu.Unlock
 	if err := e.MutationError(); err != nil {
 		end()

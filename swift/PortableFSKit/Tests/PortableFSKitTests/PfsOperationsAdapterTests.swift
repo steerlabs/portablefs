@@ -1059,3 +1059,61 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     let attr = try await harness.core.getattr(item: try #require(item as? PortableFSItem))
     #expect(attr.nlink == 2)
 }
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterPacksParentDirectoryIdentityForDotDot() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let (parent, _) = try await harness.volume.createItem(
+        named: FSFileName(string: "parent"),
+        type: .directory,
+        inDirectory: harness.root,
+        attributes: FSItem.SetAttributesRequest()
+    )
+    let (child, _) = try await harness.volume.createItem(
+        named: FSFileName(string: "child"),
+        type: .directory,
+        inDirectory: parent,
+        attributes: FSItem.SetAttributesRequest()
+    )
+    _ = try await createAdapterFile(volume: harness.volume, in: child, name: "leaf.txt")
+
+    let parentID = try PfsFSKitMapping.itemIdentifier(
+        from: try #require(parent as? PortableFSItem).identity.itemID
+    ).rawValue
+    let childID = try PfsFSKitMapping.itemIdentifier(
+        from: try #require(child as? PortableFSItem).identity.itemID
+    ).rawValue
+
+    let entries = try await collectDirectoryEntries(
+        volume: harness.volume,
+        directory: child,
+        attributesRequested: false,
+        packerCapacity: 16
+    )
+    #expect(entries.map(\.name) == [".", "..", "leaf.txt"])
+    #expect(entries[0].itemID == childID)
+    #expect(entries[1].itemID == parentID)
+
+    // POSIX makes the root its own parent, so "." and ".." agree there.
+    let rootEntries = try await collectDirectoryEntries(
+        volume: harness.volume,
+        directory: harness.root,
+        attributesRequested: false,
+        packerCapacity: 16
+    )
+    let rootID = FSItem.Identifier.rootDirectory.rawValue
+    #expect(rootEntries.prefix(2).map(\.name) == [".", ".."])
+    #expect(rootEntries[0].itemID == rootID)
+    #expect(rootEntries[1].itemID == rootID)
+
+    // Readdir-plus must stay synthetic-free: FSKit's contract is "Don't pack
+    // `.` and `..` if `attributes` isn't `nil`."
+    let plusEntries = try await collectDirectoryEntries(
+        volume: harness.volume,
+        directory: child,
+        attributesRequested: true,
+        packerCapacity: 16
+    )
+    #expect(plusEntries.map(\.name) == ["leaf.txt"])
+}

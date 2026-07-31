@@ -85,6 +85,24 @@ func (a *attach) localAttrForRecordLocked(
 	return a.localAttrForRecordPathLocked(attr, rec, rec.path, detached)
 }
 
+// authorityAttrDefaults fills the POSIX fields the authority's metadata model
+// does not carry. PortableFS charges logical stored bytes, so an absent
+// allocation IS the file's size — sparse allocation is not a concept the
+// authority represents, and reporting zero makes st_blocks (and du) claim the
+// file occupies nothing. An absent birth time reports mtime, the convention
+// network filesystems use for an unknown creation time; epoch 0 would show up
+// in Finder as 1 Jan 1970. Machine-local grafts stat real backing files and
+// are never normalized here: their zeros are measurements, not omissions.
+func authorityAttrDefaults(a fsproto.Attr) fsproto.Attr {
+	if a.AllocSize == 0 && a.Size > 0 {
+		a.AllocSize = a.Size
+	}
+	if a.BirthtimeMs == 0 {
+		a.BirthtimeMs = a.MtimeMs
+	}
+	return a
+}
+
 func (a *attach) localAttrForRecordPathLocked(
 	attr fsproto.Attr,
 	rec *itemRecord,
@@ -97,6 +115,9 @@ func (a *attach) localAttrForRecordPathLocked(
 			scope = rec.path
 		}
 		parent = a.parentItemLocked(scope)
+	}
+	if !rec.graft {
+		attr = authorityAttrDefaults(attr)
 	}
 	return fsAttrToLocalNlink(attr, rec.item, parent, detached)
 }
@@ -1378,10 +1399,16 @@ func (a *attach) syncVolume(_ context.Context) (*pfslocal.SyncVolumeReply, int32
 func (a *attach) reclaim(req *pfslocal.ReclaimRequest) int32 {
 	a.nsMu.Lock()
 	defer a.nsMu.Unlock()
-	if err := a.controlAdmissionError(); err != nil {
-		return darwinENXIO
-	}
+	// Reclaim IS teardown: unmount(2) drives every cached vnode through this
+	// handler, including while a prepared detach is mid-flight. It retires
+	// identity records and creates no new durability debt, so no admission
+	// quarantine may refuse it — a refused reclaim starves the kernel detach
+	// the quarantine exists to protect.
 	a.mu.Lock()
+	if a.detached {
+		a.mu.Unlock()
+		return 0
+	}
 	rec := a.items[req.Item.ItemID]
 	if rec == nil || rec.item.ItemGeneration != req.Item.ItemGeneration {
 		// Reclaim is idempotent for an already-retired generation. A reused
@@ -1394,6 +1421,15 @@ func (a *attach) reclaim(req *pfslocal.ReclaimRequest) int32 {
 			a.mu.Unlock()
 			return darwinEBUSY
 		}
+	}
+	// The bound-descendant refusal protects steady-state parent identity
+	// (a reclaimed directory must not strand children with no reportable
+	// parent). During a detach, unmount(2)'s vflush may reclaim vnodes in
+	// any order and every binding is being retired wholesale, so refusing
+	// there would starve the kernel detach.
+	if !(a.detachPrepared || a.detachForce) && a.hasBoundDescendantsLocked(rec) {
+		a.mu.Unlock()
+		return darwinEBUSY
 	}
 	if a.reclaimItemLocked(req.Item) {
 		// Reclaim is the durable Item lifetime tombstone. Without it, a
