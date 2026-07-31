@@ -531,7 +531,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     public func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem) async throws -> FSItem.Attributes {
         try await core.client.withPublicationBoundary {
             do {
-                let request = try PfsFSKitMapping.setAttributes(from: newAttributes)
+                let request = try PfsFSKitMapping.setAttributes(
+                    from: newAttributes,
+                    flagsSupported: capabilities.flagsSupported
+                )
                 let attr = try await core.setattr(item: try portableItem(item), attributes: request)
                 return try PfsFSKitMapping.attributes(from: attr)
             } catch {

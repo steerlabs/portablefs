@@ -207,6 +207,22 @@ func (fs *FS) FenceSessionCorrupt(sessionID string, generation uint64) error {
 // store (New) is the bench/torture/test data plane and is never managed.
 func (fs *FS) Managed() bool { return fs.managed != nil }
 
+// PersistsInodeMetadata is the affirmative durability claim behind
+// fsproto.FeatureFlagPersistence: per-inode BSD file flags and birth time
+// survive a restart of THIS store.
+//
+// It reports the backing MODE, not the type, because one *FS fronts both
+// generations. The managed generation carries both facts end to end — the PFJ3
+// entry log records them (wal.OpChflags, the create record's ordered op time)
+// and the PFT2 base persists them as inode fields 14/15, so a cold start from
+// an adopted base restores them. The raw WAL-backed generation does not: its
+// committed base is a backend manifest (backend.Entry), which has no field for
+// either, so every fact the WAL replay restores is lost the moment a
+// checkpoint commits the manifest and compacts the WAL behind it. That store
+// must therefore not advertise a durability it only appears to have while the
+// log is still intact.
+func (fs *FS) PersistsInodeMetadata() bool { return fs.Managed() }
+
 // SessionAdmissible reports whether the session may consume identities right
 // now: the managed store fails closed between a session's projected lease
 // deadline and its durable database resolution (managed.go).

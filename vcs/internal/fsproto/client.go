@@ -1844,8 +1844,8 @@ type SetattrV struct {
 	//
 	// This group is only legal against an authority that advertises
 	// FeatureFlagPersistence — an authority without it has nowhere to store a
-	// flag word and answers EINVAL rather than pretending. Callers gate on
-	// Features()&FeatureFlagPersistence BEFORE the mutation (clientcore's
+	// flag word and answers EOPNOTSUPP rather than pretending. Callers gate
+	// on Features()&FeatureFlagPersistence BEFORE the mutation (clientcore's
 	// Volume.SupportsFlagPersistence) so the refusal is a definite pre-flight
 	// ENOTSUP, never a failed operation.
 	Flags    uint32

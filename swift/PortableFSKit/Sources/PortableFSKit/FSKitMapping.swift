@@ -175,19 +175,33 @@ public enum PfsFSKitMapping {
 
     /// Translates a kernel SETATTR into the pfslocal request.
     ///
-    /// BSD file flags are FORWARDED, never judged here. Whether a chflags(2)
-    /// can be honored depends on the attached authority
-    /// (fsproto FeatureFlagPersistence) or, for a machine-local graft, on the
-    /// backing filesystem — facts that live in the daemon and vary per attach.
-    /// The extension therefore consumes `.flags` and lets the daemon answer;
-    /// an authority that cannot persist flags still produces the exact same
-    /// honest ENOTSUP, now raised by the layer that actually knows. A change
-    /// is never consumed and dropped.
+    /// A BSD flags change is forwarded ONLY when this attach affirmatively
+    /// supports it — `flagsSupported` comes from the resolve reply the mount
+    /// was built from, the same fact `supportedCapabilities` answers
+    /// `doesNotSupportImmutableFiles` from. Otherwise the extension refuses it
+    /// here with ENOTSUP.
+    ///
+    /// The refusal cannot be delegated to the daemon. `set_flags`/`flags` are
+    /// APPENDED pfslocal fields at the same protocol minor, so a daemon built
+    /// before them proto3-discards both and applies the rest of the setattr
+    /// perfectly — a refusal it never had the chance to make, and a chflags(2)
+    /// that returns success while nothing changed. An old daemon never sets
+    /// `flagsSupported`, so it decodes false and this gate closes on its own;
+    /// a new daemon sets it from the authority's FeatureFlagPersistence. The
+    /// daemon's own ENOTSUP stays as the invariant check for a frontend that
+    /// forwarded anyway.
     public static func setAttributes(
-        from request: FSItem.SetAttributesRequest
+        from request: FSItem.SetAttributesRequest,
+        flagsSupported: Bool
     ) throws -> PfsSetAttributes {
         var attributes = PfsSetAttributes()
         if request.isValid(.flags) {
+            guard flagsSupported else {
+                throw PfsLocalClientError.daemon(
+                    errno: ENOTSUP,
+                    message: "this PortableFS volume does not persist BSD file flags"
+                )
+            }
             attributes.flags = request.flags
             request.consumedAttributes.insert(.flags)
         }

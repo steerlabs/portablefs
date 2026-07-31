@@ -803,18 +803,16 @@ func (e *Engine) fallThroughLocked(ctx context.Context, paths ...string) error {
 
 // appendRecords encodes and appends one syscall's records all-or-nothing and
 // registers them with the flusher. Caller holds e.mu.
+//
+// Admission is a reservation against the stream budget, taken by the WAL under
+// its own mutex from the ENCODED records: the append is either refused before
+// any byte is written, or it is guaranteed to fit. The engine never lets a
+// mutation's own size carry the stream past the budget and into a PHYSICAL
+// ENOSPC, which is not a refusal at all — it is a mid-append local WAL failure
+// that fails the whole mount closed.
 func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]appendResult, error) {
 	if err := e.ensureStreamLocked(); err != nil {
 		return nil, err
-	}
-	if e.walExhaustedLocked() {
-		e.relieveBudgetLocked()
-		if err := e.MutationError(); err != nil {
-			return nil, err
-		}
-		if e.walExhaustedLocked() {
-			return nil, ErrNoSpace
-		}
 	}
 	payloads := make([][]byte, len(records))
 	for i := range records {
@@ -824,7 +822,25 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 		}
 		payloads[i] = p
 	}
-	results, err := e.wal.appendMutations(payloads)
+	results, err := e.wal.appendMutationsWithin(payloads, e.cfg.BudgetBytes)
+	if errors.Is(err, ErrNoSpace) {
+		// One relief pass: fold what the authority has applied and reclaim the
+		// segments that frees, then re-offer the SAME reservation. Relief is
+		// the only thing that can move this bound, and it either moved it or
+		// the refusal is definite.
+		e.relieveBudgetLocked()
+		if merr := e.MutationError(); merr != nil {
+			return nil, merr
+		}
+		results, err = e.wal.appendMutationsWithin(payloads, e.cfg.BudgetBytes)
+	}
+	if errors.Is(err, ErrNoSpace) {
+		// Nothing was written, so nothing is latched: the engine stays healthy
+		// and keeps its delegations, and this exact mutation is admitted again
+		// once the uplink applies the backlog.
+		e.noteBudgetLocked()
+		return nil, ErrNoSpace
+	}
 	if err != nil {
 		return nil, e.failLocalWAL("append mutation", err)
 	}
@@ -1415,19 +1431,26 @@ func (e *Engine) WriteAppend(ctx context.Context, path string, data []byte) (Res
 	return e.writeLocked(ctx, adm.d, path, fv, fv.entry.Size, data)
 }
 
-// fileExtentBoundBindsLocked reports that adding want extents to fv would
-// grow its overlay past the hard bound, AFTER one relief pass. Folding is the
-// definitive relief: extents the authority has already applied are served by
-// the authority now and are not local debt. If the bound still binds, every
-// remaining extent is unshipped and only the uplink can free it — so the
-// condition is definite and the caller answers ENOSPC rather than waiting.
-// Caller holds e.mu.
-func (e *Engine) fileExtentBoundBindsLocked(fv *fileView, want int) bool {
-	if len(fv.extents)+want <= maxFileExtents {
+// fileExtentBoundBindsLocked reports that the mutation would leave fv's
+// overlay past the hard bound, AFTER one relief pass. project returns the
+// PROJECTED post-splice cardinality — what the overlay will actually hold once
+// the mutation is applied — so the bound is charged for growth only. An
+// overwrite that replaces existing extents and any shrinking truncate REDUCE
+// the bounded resource; refusing those with ENOSPC would deny the application
+// the very operations that free the resource it is out of. It is re-evaluated
+// after relief because folding changes the extent set the projection runs over.
+//
+// Folding is the definitive relief: extents the authority has already applied
+// are served by the authority now and are not local debt. If the bound still
+// binds, every remaining extent is unshipped and only the uplink can free it —
+// so the condition is definite and the caller answers ENOSPC rather than
+// waiting. Caller holds e.mu.
+func (e *Engine) fileExtentBoundBindsLocked(fv *fileView, project func() int) bool {
+	if project() <= maxFileExtents {
 		return false
 	}
 	e.relieveBudgetLocked()
-	return len(fv.extents)+want > maxFileExtents
+	return project() > maxFileExtents
 }
 
 // fileViewLocked materializes the dirty view for a locally-known file.
@@ -1457,9 +1480,22 @@ func (e *Engine) writeLocked(ctx context.Context, d *delegation, path string, fv
 	if len(records) == 0 {
 		return Result{Entry: *fv.entry}, true, nil
 	}
-	if e.fileExtentBoundBindsLocked(fv, len(records)+1) {
-		// Hard overlay bound (records + a possible hole extent would exceed
-		// it). There is no spill, and the write-through escape would have to
+	// The exact ranges this write will splice, in the order the splice happens:
+	// the hole extent that a write past EOF inserts first, then one range per
+	// record.
+	ranges := make([]extentRange, 0, len(records)+1)
+	if uint64(off) > uint64(fv.entry.Size) {
+		ranges = append(ranges, extentRange{start: uint64(fv.entry.Size), end: uint64(off)})
+	}
+	for i := range records {
+		ranges = append(ranges, extentRange{
+			start: uint64(records[i].Offset),
+			end:   uint64(records[i].Offset) + uint64(len(records[i].Data)),
+		})
+	}
+	if e.fileExtentBoundBindsLocked(fv, func() int { return projectedWriteExtents(fv.extents, ranges) }) {
+		// Hard overlay bound: this write genuinely GROWS the extent set past
+		// it. There is no spill, and the write-through escape would have to
 		// drain the unshipped tail first — the very uplink that let the set
 		// grow this far. Definite bounded-resource exhaustion: ENOSPC.
 		return Result{}, true, ErrNoSpace
@@ -1511,7 +1547,13 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) (Result,
 	if !ok {
 		return Result{}, false, e.fallThroughLocked(ctx, path)
 	}
-	if e.fileExtentBoundBindsLocked(fv, 1) {
+	// Only an EXTENDING truncate needs a slot (for its hole extent). A shrink
+	// drops and clips extents and a truncate to zero clears them, so refusing
+	// one at the bound would deny the application the cheapest way to free the
+	// resource it is out of.
+	if e.fileExtentBoundBindsLocked(fv, func() int {
+		return projectedTruncateExtents(fv.extents, uint64(fv.entry.Size), uint64(size))
+	}) {
 		return Result{}, true, ErrNoSpace
 	}
 	rec := wal.Record{Op: wal.OpTruncate, Path: path, Size: size}

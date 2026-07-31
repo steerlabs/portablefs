@@ -1,9 +1,10 @@
 package portablefsd
 
-// Daemon-side coverage for chflags(2). The frontend always FORWARDS a flags
-// change; the daemon is the layer that knows whether this attach's authority
-// can persist one, so it either applies it or refuses it honestly with
-// ENOTSUP. Nothing here may ever be a silent no-op.
+// Daemon-side coverage for chflags(2). The daemon publishes whether this
+// attach's authority can persist a flag word (resolve's FlagsSupported — what
+// the frontend gates its own forwarding on) and either applies a forwarded
+// change or refuses it with ENOTSUP as the invariant check against a frontend
+// that forwarded anyway. Nothing here may ever be a silent no-op.
 
 import (
 	"context"

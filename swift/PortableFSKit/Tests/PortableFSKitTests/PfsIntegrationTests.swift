@@ -294,10 +294,9 @@ private func bytes(_ string: String) -> Data {
     #expect(try await core.getattr(item: created.item).flags == immutable)
 }
 
-/// Without the authority's flag-persistence bit the refusal is the DAEMON's,
-/// and it reaches the kernel as ENOTSUP — the same honest answer the extension
-/// used to invent, now raised by the layer that actually knows.
-@Test func flagChangesAreRefusedByTheDaemonWhenTheAuthorityCannotPersistThem() async throws {
+/// Without the attach's flag-persistence bit the refusal is the FRONTEND's,
+/// raised before the request is sent, and it reaches the kernel as ENOTSUP.
+@Test func flagChangesAreRefusedByTheExtensionWhenTheDaemonCannotPersistThem() async throws {
     let daemon = try PfsLocalMockDaemon(configuration: .init(flagsSupported: false))
     defer { daemon.stop() }
 
@@ -316,10 +315,10 @@ private func bytes(_ string: String) -> Data {
             item: created.item,
             attributes: .init(mode: 0o600, flags: UInt32(UF_IMMUTABLE))
         )
-        Issue.record("expected the daemon to refuse a flags change it cannot persist")
+        Issue.record("expected the extension to refuse a flags change the attach cannot persist")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == ENOTSUP)
-        // And the errno the kernel receives is the DAEMON's, not a generic EIO.
+        // And the errno the kernel receives is the honest one, not a generic EIO.
         #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOTSUP))
     }
 
@@ -328,6 +327,47 @@ private func bytes(_ string: String) -> Data {
     #expect(try await core.getattr(item: created.item).mode == 0o644)
 
     // A setattr that carries no flags intent is unaffected by the missing bit.
+    let modeOnly = try await core.setattr(item: created.item, attributes: .init(mode: 0o600))
+    #expect(modeOnly.mode == 0o600)
+}
+
+/// The rolling-upgrade case the daemon-side refusal cannot cover: a NEW
+/// frontend against an OLD daemon at the SAME protocol minor. `set_flags` and
+/// `flags` are appended fields, so that daemon proto3-discards them, applies
+/// the rest of the setattr and answers OK — a chflags(2) that returns success
+/// while nothing changed. It never advertises `flagsSupported`, so the absent
+/// field decodes false and the frontend's own gate refuses instead of
+/// forwarding. Forwarding here is the bug; the mock deliberately would NOT
+/// complain about it.
+@Test func flagChangesAreNotForwardedToADaemonPredatingTheFlagFields() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(predatesFlagFields: true))
+    defer { daemon.stop() }
+
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let capabilities = await core.resolvedVolume?.capabilities
+    #expect(capabilities?.flagsSupported == false)
+
+    let root = try await core.rootItem()
+    let created = try await core.createFile(in: root, name: bytes("old-daemon.txt"), mode: 0o644)
+
+    do {
+        _ = try await core.setattr(
+            item: created.item,
+            attributes: .init(mode: 0o600, flags: UInt32(UF_IMMUTABLE))
+        )
+        Issue.record("a flags change was forwarded to a daemon that silently discards it")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == ENOTSUP)
+    }
+
+    // Proof the refusal was the frontend's: had it forwarded, this daemon
+    // would have reported success with the flag word dropped and the mode
+    // applied.
+    let after = try await core.getattr(item: created.item)
+    #expect(after.flags == 0)
+    #expect(after.mode == 0o644)
+
+    // Everything an old daemon DOES understand keeps working.
     let modeOnly = try await core.setattr(item: created.item, attributes: .init(mode: 0o600))
     #expect(modeOnly.mode == 0o600)
 }

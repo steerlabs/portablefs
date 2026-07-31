@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
+	"github.com/steerlabs/portablefs/vcs/internal/workfs"
 )
 
 func getattr(t *testing.T, s *Server, path string) *Attr {
@@ -173,5 +174,63 @@ func TestChflagsCanonicalHashLeavesOlderRecordsUntouched(t *testing.T) {
 	zero := wal.Record{Op: wal.OpChflags, Path: "f"}
 	if string(canonicalRecordHash(zero)) == string(canonicalRecordHash(a)) {
 		t.Fatal("clearing flags and setting them share one exact fingerprint")
+	}
+}
+
+// unprovenMetadataStore is an authority store that never PROVES it durably
+// keeps flags and birth times: it simply does not implement
+// InodeMetadataStore. The same-named blank field is what declines the
+// embedded store's promoted method — without it workfs's affirmative answer
+// would become this store's answer, and the case under test is precisely a
+// store that answers nothing. Every other surface is workfs's, so the only
+// observable difference is the unproven capability.
+type unprovenMetadataStore struct {
+	*workfs.FS
+	PersistsInodeMetadata struct{}
+}
+
+// TestUnprovenMetadataStoreNeitherAdvertisesNorAcceptsFlags: a capability is a
+// promise about durability, so silence must mean NO. A store that never
+// implemented the interface gets no FeatureFlagPersistence bit and no accepted
+// chflags — otherwise it would log a flag word its own persistence may drop
+// (the legacy checkpoint manifest carries neither field), which is the silent
+// data loss the whole capability exists to prevent.
+func TestUnprovenMetadataStoreNeitherAdvertisesNorAcceptsFlags(t *testing.T) {
+	_, fs, _, _ := newExactAuthority(t)
+	store := unprovenMetadataStore{FS: fs}
+	if _, ok := any(store).(InodeMetadataStore); ok {
+		t.Fatal("the unproven store accidentally implements InodeMetadataStore")
+	}
+	s := NewServer(store, fs)
+
+	probe := s.dispatch(&Request{Op: OpProtocolVersion, Size: int64(ProtocolVersion)})
+	if probe.Status != OK {
+		t.Fatalf("probe: status %d", probe.Status)
+	}
+	if probe.Features&FeatureFlagPersistence != 0 {
+		t.Fatal("a store that never proved inode-metadata durability advertised FeatureFlagPersistence")
+	}
+	// The bitmap is a SET of independent claims: an unproven one must not
+	// disturb a proven one.
+	if probe.Features&FeatureDelegatedXattrs == 0 {
+		t.Fatal("the delegated-xattr lane was collaterally disabled")
+	}
+
+	cs := openExactSession(t, s, "pfs-unproven", 1, "owner", "tok", 4)
+	if r := exactDo(s, cs, &Request{Op: OpCreate, Path: "f", Mode: 0o644}, 0, 1); r.Status != OK {
+		t.Fatalf("create: status %d", r.Status)
+	}
+	if r := exactDo(s, cs, &Request{Op: OpSetattr, Path: "f", Flags: 0x2, SetFlags: true}, 1, 1); r.Status != EOPNOTSUPP {
+		t.Fatalf("chflags: status %d, want EOPNOTSUPP", r.Status)
+	}
+	if got := getattr(t, s, "f").Flags; got != 0 {
+		t.Fatalf("a refused chflags stored %#x", got)
+	}
+	// Everything else about setattr is unaffected by the missing claim.
+	if r := exactDo(s, cs, &Request{Op: OpSetattr, Path: "f", Mode: 0o600, SetMode: true}, 2, 1); r.Status != OK {
+		t.Fatalf("chmod: status %d", r.Status)
+	}
+	if got := getattr(t, s, "f").Mode & 0o777; got != 0o600 {
+		t.Fatalf("chmod mode = %o, want 600", got)
 	}
 }

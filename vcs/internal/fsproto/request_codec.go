@@ -17,6 +17,10 @@ import (
 // every variable field and collection is then checked against both its
 // field-specific ceiling and the bytes remaining in the frame before make.
 // Responses deliberately remain a gob stream in the opposite direction.
+//
+// The version byte is chosen PER REQUEST (requestWireVersionFor): it states the
+// minimum a decoder must understand to read this frame, so appending a field
+// never widens the requirement of frames that do not use it.
 var requestWireMagic = [4]byte{'P', 'F', 'R', 'Q'}
 
 const (
@@ -27,6 +31,19 @@ const (
 	requestWireLegacyVersion  = 2
 	requestWireAtimeVersion   = 3
 	requestWireChflagsVersion = 4
+
+	// requestWireDefaultVersion is the version EVERY request is written at
+	// unless it needs a newer field. An appended scalar raises requestWireVersion
+	// but must NOT raise this: the version byte is a per-frame minimum
+	// requirement, not a build stamp. Writing the newest version
+	// unconditionally would put the protocol probe itself — the frame that
+	// discovers what the peer can do — out of an older authority's reach, so a
+	// new client could not even negotiate against one.
+	//
+	// v3 (atime) is the floor because it is part of the v8 protocol baseline:
+	// every authority that speaks protocol version 8 decodes it. v2 is decoded
+	// for peers that predate the baseline but is never written.
+	requestWireDefaultVersion = requestWireAtimeVersion
 
 	// The largest legitimate request is one MaxWriteBytes write plus bounded
 	// metadata. Keep the existing 64 MiB write allowance while bounding the
@@ -90,13 +107,35 @@ func newRequestEncoder(w io.Writer) *requestEncoder {
 
 type preparedRequest struct {
 	bodyBytes uint32
+	version   uint8
 	records   [][]byte
+}
+
+// requestWireVersionFor returns the MINIMAL wire version that can carry req
+// without losing a field. Encoding the minimum is what keeps a new client
+// compatible with an older authority for everything that authority already
+// understands: only a request that actually carries chflags intent needs v4,
+// and a client only forms one after the version probe advertised
+// FeatureFlagPersistence — a bit an authority can only set if it decodes v4.
+// So a v4 frame never reaches a peer that would reject it, and if a client
+// ever skipped that check the frame fails closed on the version byte instead
+// of being decoded as a flag-less setattr.
+//
+// A nonzero Flags without SetFlags is a malformed shape the authority answers
+// EINVAL; it still selects v4 so the authority judges the bytes the caller
+// actually built rather than a silently truncated version of them.
+func requestWireVersionFor(req *Request) uint8 {
+	if req.SetFlags || req.Flags != 0 {
+		return requestWireChflagsVersion
+	}
+	return requestWireDefaultVersion
 }
 
 func prepareRequest(req *Request) (preparedRequest, error) {
 	if req == nil {
 		return preparedRequest{}, fmt.Errorf("%w: nil request", errMalformedRequest)
 	}
+	version := requestWireVersionFor(req)
 	var n uint64
 	add := func(v uint64) error {
 		n += v
@@ -105,13 +144,20 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 		}
 		return nil
 	}
-	// Magic, version, op, flags, then the fixed-width scalar fields.
+	// Magic, version, op, flags, then the fixed-width scalar fields through
+	// AckPos — the shape every version from v3 on shares.
 	if err := add(4 + 1 + 1 + 4 +
 		8 + 8 + 4 + 8 + 8 + 4 + 4 + 8 +
 		8 + 8 + 8 + 1 +
 		8 + 8 + 8 +
-		8 + 4 + 1 + 8 + 8 + 4); err != nil {
+		8 + 4 + 1 + 8 + 8); err != nil {
 		return preparedRequest{}, err
+	}
+	// The chflags word is appended only by the versions that carry it.
+	if version >= requestWireChflagsVersion {
+		if err := add(4); err != nil {
+			return preparedRequest{}, err
+		}
 	}
 	addText := func(name, value string) error {
 		if len(value) > maxRequestTextBytes {
@@ -201,7 +247,7 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 	if err := add(4); err != nil {
 		return preparedRequest{}, err
 	}
-	prepared := preparedRequest{records: make([][]byte, 0, len(req.Records))}
+	prepared := preparedRequest{version: version, records: make([][]byte, 0, len(req.Records))}
 	for i := range req.Records {
 		payload, err := wal.EncodePFR1(&req.Records[i])
 		if err != nil {
@@ -336,7 +382,7 @@ func (e *requestEncoder) encodePrepared(req *Request, prepared preparedRequest) 
 	if w.err == nil {
 		_, w.err = e.w.Write(requestWireMagic[:])
 	}
-	w.u8(requestWireVersion)
+	w.u8(prepared.version)
 	w.u8(uint8(req.Op))
 	w.u32(requestFlags(req))
 	w.u64(uint64(req.Offset))
@@ -359,7 +405,9 @@ func (e *requestEncoder) encodePrepared(req *Request, prepared preparedRequest) 
 	w.u8(req.XattrFlags)
 	w.u64(req.WBThrough)
 	w.u64(req.AckPos)
-	w.u32(req.Flags)
+	if prepared.version >= requestWireChflagsVersion {
+		w.u32(req.Flags)
+	}
 
 	for _, value := range []string{
 		req.Path,
