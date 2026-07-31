@@ -180,10 +180,7 @@ func Main(version string) int {
 		return 0
 	}
 	if showIdentity {
-		_ = json.NewEncoder(os.Stdout).Encode(struct {
-			SchemaVersion int    `json:"schemaVersion"`
-			AppGroup      string `json:"appGroup"`
-		}{SchemaVersion: 1, AppGroup: fskitidentity.AppGroup})
+		_ = json.NewEncoder(os.Stdout).Encode(fskitidentity.Current())
 		return 0
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

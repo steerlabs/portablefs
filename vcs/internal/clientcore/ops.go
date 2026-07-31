@@ -894,6 +894,13 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			return 0, statusErr(werr)
 		}
 	}
+	endAuthority, releaseErr := v.beginAuthorityMutation(
+		ctx, []*NodeState{n}, path,
+	)
+	if releaseErr != nil {
+		return 0, statusErr(releaseErr)
+	}
+	defer endAuthority()
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()
@@ -1024,6 +1031,13 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			return 0, statusErr(werr)
 		}
 	}
+	endAuthority, releaseErr := v.beginAuthorityMutation(
+		ctx, []*NodeState{n}, path,
+	)
+	if releaseErr != nil {
+		return 0, statusErr(releaseErr)
+	}
+	defer endAuthority()
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()
@@ -1098,7 +1112,7 @@ func (v *Volume) createCommon(ctx context.Context, path string, mode uint32, exc
 			return fsproto.Attr{}, statusErr(err)
 		}
 	}
-	a, st := v.createWriteThrough(path, mode, excl)
+	a, st := v.createWriteThrough(ctx, path, mode, excl)
 	if st != fsproto.OK {
 		return fsproto.Attr{}, st
 	}
@@ -1115,16 +1129,28 @@ func (v *Volume) createCommon(ctx context.Context, path string, mode uint32, exc
 // is applied before the create returns — the open-vs-unlink decision point
 // is unchanged — and the follow-up RegisterOpened becomes a zero-RPC
 // registry hit on the seeded hold.
-func (v *Volume) createWriteThrough(path string, mode uint32, excl bool) (fsproto.Attr, Status) {
+func (v *Volume) createWriteThrough(
+	ctx context.Context,
+	path string,
+	mode uint32,
+	excl bool,
+) (fsproto.Attr, Status) {
 	var a *fsproto.Attr
 	var gen uint64
 	var st int32
 	var err error
+	end, releaseErr := v.beginAuthorityMutation(
+		ctx, nil, path,
+	)
+	if releaseErr != nil {
+		return fsproto.Attr{}, statusErr(releaseErr)
+	}
 	if excl {
 		a, gen, st, err = v.client.CreateExclRegisterOpen(path, mode)
 	} else {
 		a, gen, st, err = v.client.CreateRegisterOpen(path, mode)
 	}
+	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1158,7 +1184,19 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 			return fsproto.Attr{}, statusErr(err)
 		}
 	}
-	a, st, err := v.client.Mkdir(path, mode)
+	var (
+		a   *fsproto.Attr
+		st  int32
+		err error
+	)
+	end, releaseErr := v.beginAuthorityMutation(
+		ctx, nil, path,
+	)
+	if releaseErr != nil {
+		return fsproto.Attr{}, statusErr(releaseErr)
+	}
+	a, st, err = v.client.Mkdir(path, mode)
+	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1221,6 +1259,22 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 			}
 		}
 	}
+	var st Status
+	end, releaseErr := v.beginAuthorityMutation(
+		ctx, []*NodeState{child}, path,
+	)
+	if releaseErr != nil {
+		return statusErr(releaseErr)
+	}
+	st = v.removeWriteThrough(path, child)
+	end()
+	return st
+}
+
+// removeWriteThrough performs the authority-side remove/orphan transaction.
+// Its caller has already released every overlapping local delegation and
+// keeps delegation acquisition excluded until this transaction returns.
+func (v *Volume) removeWriteThrough(path string, child *NodeState) Status {
 	if child != nil {
 		child.mu.Lock()
 		if child.nopen > 0 && child.orphanIno == 0 {
@@ -1368,7 +1422,19 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 			}
 		}
 	}
-	return v.renameWriteThrough(oldp, newp, src, dst, sameAuthorityInode)
+	var st Status
+	end, releaseErr := v.beginAuthorityMutation(
+		ctx,
+		[]*NodeState{src, dst},
+		oldp,
+		newp,
+	)
+	if releaseErr != nil {
+		return statusErr(releaseErr)
+	}
+	st = v.renameWriteThrough(oldp, newp, src, dst, sameAuthorityInode)
+	end()
+	return st
 }
 
 // renameWriteThrough performs the authority-side rename with the
@@ -1489,7 +1555,19 @@ func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr
 			return fsproto.Attr{}, statusErr(err)
 		}
 	}
-	a, st, err := v.client.Symlink(target, path)
+	var (
+		a   *fsproto.Attr
+		st  int32
+		err error
+	)
+	end, releaseErr := v.beginAuthorityMutation(
+		ctx, nil, path,
+	)
+	if releaseErr != nil {
+		return fsproto.Attr{}, statusErr(releaseErr)
+	}
+	a, st, err = v.client.Symlink(target, path)
+	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1519,11 +1597,26 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 			return fsproto.Attr{}, statusErr(err)
 		}
 	}
+	var (
+		a   *fsproto.Attr
+		st  int32
+		err error
+	)
+	end, releaseErr := v.beginAuthorityMutation(
+		ctx,
+		[]*NodeState{src},
+		oldp,
+		newp,
+	)
+	if releaseErr != nil {
+		return fsproto.Attr{}, statusErr(releaseErr)
+	}
 	if src != nil {
 		src.mu.Lock()
 		defer src.mu.Unlock()
 	}
-	a, st, err := v.client.Link(oldp, newp)
+	a, st, err = v.client.Link(oldp, newp)
+	end()
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
 	}
@@ -1648,6 +1741,13 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			}
 		}
 	}
+	endAuthority, releaseErr := v.beginAuthorityMutation(
+		ctx, []*NodeState{n}, path,
+	)
+	if releaseErr != nil {
+		return fsproto.Attr{}, statusErr(releaseErr)
+	}
+	defer endAuthority()
 	n.mu.Lock()
 	if oi := n.orphanIno; oi != 0 {
 		n.mu.Unlock()

@@ -1721,6 +1721,12 @@ func (a *attach) failFrontendGate(err error) {
 }
 
 func (a *attach) frontendAdmissionError() error {
+	a.frontendGateMu.Lock()
+	gateErr := a.frontendGateErr
+	a.frontendGateMu.Unlock()
+	if gateErr != nil {
+		return gateErr
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.coherenceFailFrozen {

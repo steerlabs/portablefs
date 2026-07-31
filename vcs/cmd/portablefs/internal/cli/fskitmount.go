@@ -33,7 +33,7 @@ import (
 // app uses: ensure a per-user portablefsd (adopt a healthy one, else spawn),
 // register the attach over its control socket (authority endpoint + data-
 // plane credential + tuning), then hand the kernel the attach reference via
-// `/sbin/mount -t <fstype> pfs://<attachRef> <mountPath>`. The registered
+// `/sbin/mount -t <fstype> <scheme>://<attachRef> <mountPath>`. The registered
 // FSKit extension dials the daemon's frontend socket inside the PortableFS
 // app-group container (PFSAppGroupIdentifier in the extension Info.plist),
 // so the frontend socket this CLI serves MUST be that same path. The app
@@ -52,12 +52,12 @@ const (
 	fskitDaemonEnv  = "PORTABLEFS_FSKIT_DAEMON"
 
 	// The PortableFS OSS/Cloud FSKit identity is deliberately distinct from
-	// any other product that embeds PortableFS (another embedder
-	// may register its own FSShortName with its own app group): a unique
-	// mount type and a private app-group socket directory guarantee the two
-	// never collide when installed on the same machine. Extension coordinates
-	// are overridable via PORTABLEFS_FSKIT_* for bespoke deployments; the
-	// executable peer is not.
+	// any other product that embeds PortableFS (another embedder may register
+	// its own FSShortName, generic-resource URL scheme, and app group): a
+	// unique mount type, globally scoped URL scheme, and private app-group
+	// socket directory guarantee the products never collide when installed on
+	// the same machine. Extension coordinates are overridable via
+	// PORTABLEFS_FSKIT_* for bespoke deployments; the executable peer is not.
 	defaultFskitType = fskitidentity.FSType
 )
 
@@ -850,7 +850,13 @@ func fskitMountHint(fsType string, err error) error {
 
 // mountFSKitPath attaches the kernel to the daemon-served attach reference.
 func mountFSKitPath(fsType, attachRef, mountPath string) error {
-	out, err := exec.Command("/sbin/mount", "-t", fsType, "pfs://"+attachRef, mountPath).CombinedOutput()
+	out, err := exec.Command(
+		"/sbin/mount",
+		"-t",
+		fsType,
+		fskitidentity.ResourcePrefix+attachRef,
+		mountPath,
+	).CombinedOutput()
 	if err != nil {
 		return fskitMountHint(fsType, fmt.Errorf("mount -t %s %s: %w (output: %s)",
 			fsType, mountPath, err, strings.TrimSpace(string(out))))

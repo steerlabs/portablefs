@@ -1,4 +1,5 @@
 import FSKit
+import Foundation
 import Testing
 @testable import PortableFSKit
 @preconcurrency import Darwin
@@ -64,8 +65,12 @@ import Testing
     var capabilities = PfsCapabilities()
     capabilities.preferredIoBytes = 65_536
 
-    let result = PfsFSKitMapping.statfs(from: reply, capabilities: capabilities)
-    #expect(result.fileSystemTypeName == "pfs")
+    let result = PfsFSKitMapping.statfs(
+        from: reply,
+        capabilities: capabilities,
+        fileSystemTypeName: "portablefs"
+    )
+    #expect(result.fileSystemTypeName == "portablefs")
     #expect(result.blockSize == 8192)
     #expect(result.ioSize == 65_536)
     #expect(result.totalBlocks == 10_000)
@@ -73,6 +78,43 @@ import Testing
     #expect(result.availableBlocks == 4_000)
     #expect(result.totalFiles == 20_000)
     #expect(result.freeFiles == 3_000)
+
+    let defaultIdentityResult = PfsFSKitMapping.statfs(
+        from: reply,
+        capabilities: capabilities
+    )
+    #expect(defaultIdentityResult.fileSystemTypeName == PortableFSIdentity.fileSystemTypeName)
+}
+
+@Test func moduleIdentitySeparatesTypeAndResourceScheme() throws {
+    let identity = try PortableFSModuleIdentity(infoDictionary: [
+        "EXAppExtensionAttributes": [
+            "FSShortName": "portablefs",
+            "FSSupportedSchemes": ["pfs"],
+        ],
+    ])
+    #expect(identity.fileSystemTypeName == "portablefs")
+    #expect(identity.resourceScheme == "pfs")
+    #expect(identity.resourcePrefix == "pfs://")
+
+    let oss = try PortableFSModuleIdentity(
+        fileSystemTypeName: PortableFSIdentity.fileSystemTypeName,
+        resourceScheme: PortableFSIdentity.resourceScheme
+    )
+    #expect(oss.resourcePrefix == "dev.portablefs.oss://")
+}
+
+@Test func moduleIdentityRejectsMissingOrAmbiguousSchemes() {
+    for schemes in [[], ["pfs", "dev.portablefs.oss"], ["NOT CANONICAL"]] {
+        #expect(throws: PortableFSModuleIdentity.ValidationError.self) {
+            try PortableFSModuleIdentity(infoDictionary: [
+                "EXAppExtensionAttributes": [
+                    "FSShortName": "pfs",
+                    "FSSupportedSchemes": schemes,
+                ],
+            ])
+        }
+    }
 }
 
 @Test func supportedCapabilitiesReflectDaemonCapabilities() {

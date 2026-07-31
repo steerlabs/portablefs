@@ -3,7 +3,6 @@ package clientcore
 import (
 	"context"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
@@ -294,14 +293,14 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 			return statusErr(err)
 		}
 	}
-	releasePaths := []string{path}
-	if v.isHardlink(n) {
-		releasePaths = append(releasePaths, v.hardlinks.pathsForInos([]uint64{authHandleIno(n)})...)
-	}
-	if st := v.flushCoveringSession(ctx, releasePaths...); st != fsproto.OK {
-		return st
+	endAuthority, releaseErr := v.beginAuthorityMutation(
+		ctx, []*NodeState{n}, path,
+	)
+	if releaseErr != nil {
+		return statusErr(releaseErr)
 	}
 	st, err := v.client.SetxattrFlags(path, xattrHandleIno(n), name, value, flags)
+	endAuthority()
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -336,14 +335,14 @@ func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, nam
 			return statusErr(err)
 		}
 	}
-	releasePaths := []string{path}
-	if v.isHardlink(n) {
-		releasePaths = append(releasePaths, v.hardlinks.pathsForInos([]uint64{authHandleIno(n)})...)
-	}
-	if st := v.flushCoveringSession(ctx, releasePaths...); st != fsproto.OK {
-		return st
+	endAuthority, releaseErr := v.beginAuthorityMutation(
+		ctx, []*NodeState{n}, path,
+	)
+	if releaseErr != nil {
+		return statusErr(releaseErr)
 	}
 	st, err := v.client.Removexattr(path, xattrHandleIno(n), name)
+	endAuthority()
 	if err != nil {
 		return fsproto.EIO
 	}
@@ -365,21 +364,6 @@ func validateXattr(name string, value []byte, flags uint8, set bool) Status {
 	}
 	if flags&^wal.XattrFlagMask != 0 || flags == wal.XattrFlagMask || (!set && flags != 0) {
 		return fsproto.EINVAL
-	}
-	return fsproto.OK
-}
-
-// flushCoveringSession drains and releases any delegation before an
-// operation that must use the authority lane (existing-object xattrs,
-// hardlink aliases, and parked orphans).
-func (v *Volume) flushCoveringSession(ctx context.Context, paths ...string) Status {
-	if v.wb == nil {
-		return fsproto.OK
-	}
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
-		return statusErr(err)
 	}
 	return fsproto.OK
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"golang.org/x/sys/unix"
 )
 
@@ -66,6 +67,87 @@ func addTestBundleIdentity(t *testing.T, app, appID string) {
 		appID+"."+macOSExtensionExecutable,
 		macOSExtensionExecutable,
 	)
+}
+
+func writeTestFSKitRegistration(
+	t *testing.T,
+	extensionPath, shortName string,
+	schemes []string,
+) {
+	t.Helper()
+	infoPath := filepath.Join(extensionPath, "Contents", "Info.plist")
+	if err := os.MkdirAll(filepath.Dir(infoPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	schemeXML := ""
+	for _, scheme := range schemes {
+		schemeXML += "<string>" + scheme + "</string>"
+	}
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>EXAppExtensionAttributes</key><dict>
+<key>EXExtensionPointIdentifier</key><string>com.apple.fskit.fsmodule</string>
+<key>FSShortName</key><string>` + shortName + `</string>
+<key>FSSupportedSchemes</key><array>` + schemeXML + `</array>
+</dict>
+</dict></plist>
+`
+	if err := os.WriteFile(infoPath, []byte(plist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtensionClaimsPFSUsesTypeOrResourceScheme(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		shortName string
+		schemes   []string
+		want      bool
+	}{
+		{
+			name:      "exact OSS identity",
+			shortName: fskitidentity.FSType,
+			schemes:   []string{fskitidentity.ResourceScheme},
+			want:      true,
+		},
+		{
+			name:      "same filesystem type",
+			shortName: fskitidentity.FSType,
+			schemes:   []string{"org.example.foreign"},
+			want:      true,
+		},
+		{
+			name:      "same resource scheme case insensitive",
+			shortName: "foreign",
+			schemes:   []string{strings.ToUpper(fskitidentity.ResourceScheme)},
+			want:      true,
+		},
+		{
+			name:      "OpenSteer legacy tuple",
+			shortName: "portablefs",
+			schemes:   []string{"pfs"},
+			want:      false,
+		},
+		{
+			name:      "unrelated provider",
+			shortName: "foreign",
+			schemes:   []string{"org.example.foreign"},
+			want:      false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			extension := filepath.Join(t.TempDir(), "Provider.appex")
+			writeTestFSKitRegistration(t, extension, test.shortName, test.schemes)
+			got, err := extensionClaimsPFS(extension)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("claims = %v, want %v", got, test.want)
+			}
+		})
+	}
 }
 
 func TestCommitMacOSInstallPublishesAndUpdatesWholeBundle(t *testing.T) {
@@ -533,6 +615,96 @@ func TestValidateExistingManagedMacOSAppRejectsCounterfeitDirectory(t *testing.T
 	err := validateExistingManagedMacOSApp(app, appID)
 	if err == nil || !strings.Contains(err.Error(), "remove it explicitly") {
 		t.Fatalf("unexpected result: %v", err)
+	}
+}
+
+func TestMacOSBundleIdentityProfilesAreExact(t *testing.T) {
+	current, ok := classifyMacOSBundleIdentity(
+		"pfs",
+		"pfs",
+		"true",
+		[]string{fskitidentity.ResourceScheme},
+	)
+	if !ok || current != macOSBundleIdentityCurrent {
+		t.Fatalf("current profile = (%d, %t)", current, ok)
+	}
+	prior, ok := classifyMacOSBundleIdentity(
+		"pfs",
+		"pfs",
+		"true",
+		[]string{"pfs"},
+	)
+	if !ok || prior != macOSBundleIdentityImmediatePrior {
+		t.Fatalf("immediate-prior profile = (%d, %t)", prior, ok)
+	}
+	for _, tc := range []struct {
+		name        string
+		fsType      string
+		personality string
+		generic     string
+		schemes     []string
+	}{
+		{name: "wrong fs type", fsType: "portablefs", personality: "pfs", generic: "true", schemes: []string{"pfs"}},
+		{name: "wrong personality", fsType: "pfs", personality: "portablefs", generic: "true", schemes: []string{"pfs"}},
+		{name: "generic disabled", fsType: "pfs", personality: "pfs", generic: "false", schemes: []string{"pfs"}},
+		{name: "extra scheme", fsType: "pfs", personality: "pfs", generic: "true", schemes: []string{"pfs", fskitidentity.ResourceScheme}},
+		{name: "unknown scheme", fsType: "pfs", personality: "pfs", generic: "true", schemes: []string{"example"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := classifyMacOSBundleIdentity(
+				tc.fsType,
+				tc.personality,
+				tc.generic,
+				tc.schemes,
+			); ok {
+				t.Fatal("invalid bundle identity profile was accepted")
+			}
+		})
+	}
+}
+
+func TestMacOSBundleIdentityJSONRejectsMixedGenerations(t *testing.T) {
+	current := `{"schemaVersion":2,"fsType":"pfs","resourceScheme":"` +
+		fskitidentity.ResourceScheme +
+		`","appGroup":"` +
+		fskitidentity.AppGroup +
+		`"}`
+	prior := `{"schemaVersion":1,"appGroup":"` +
+		fskitidentity.AppGroup +
+		`"}`
+	if !validMacOSBundleIdentityJSON(
+		[]byte(current),
+		macOSBundleIdentityCurrent,
+	) {
+		t.Fatal("exact current identity was rejected")
+	}
+	if !validMacOSBundleIdentityJSON(
+		[]byte(prior),
+		macOSBundleIdentityImmediatePrior,
+	) {
+		t.Fatal("exact immediate-prior identity was rejected")
+	}
+	for _, tc := range []struct {
+		name       string
+		json       string
+		generation macOSBundleIdentityGeneration
+	}{
+		{name: "current as prior", json: current, generation: macOSBundleIdentityImmediatePrior},
+		{name: "prior as current", json: prior, generation: macOSBundleIdentityCurrent},
+		{name: "extra prior key", json: `{"schemaVersion":1,"appGroup":"` + fskitidentity.AppGroup + `","resourceScheme":"pfs"}`, generation: macOSBundleIdentityImmediatePrior},
+		{name: "duplicate prior key", json: `{"schemaVersion":1,"schemaVersion":1,"appGroup":"` + fskitidentity.AppGroup + `"}`, generation: macOSBundleIdentityImmediatePrior},
+		{name: "trailing object", json: prior + `{}`, generation: macOSBundleIdentityImmediatePrior},
+		{name: "wrong prior group", json: `{"schemaVersion":1,"appGroup":"OTHER.pfsoss"}`, generation: macOSBundleIdentityImmediatePrior},
+		{name: "wrong current scheme", json: `{"schemaVersion":2,"fsType":"pfs","resourceScheme":"pfs","appGroup":"` + fskitidentity.AppGroup + `"}`, generation: macOSBundleIdentityCurrent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if validMacOSBundleIdentityJSON(
+				[]byte(tc.json),
+				tc.generation,
+			) {
+				t.Fatal("mixed or malformed identity was accepted")
+			}
+		})
 	}
 }
 

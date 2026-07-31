@@ -1,5 +1,6 @@
 import Foundation
 import FSKit
+import CryptoKit
 import os
 @preconcurrency import Darwin
 
@@ -100,9 +101,32 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     private let logger = Logger(subsystem: "dev.portablefs.fskit", category: "PortableFSFileSystem")
     private let volumeLock = NSLock()
     private var volumes: [String: PortableFSVolume] = [:]
+    private let moduleIdentity: PortableFSModuleIdentity
     private let resolverFactory: @Sendable () -> PfsSocketPathResolver
 
-    public init(resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = { PfsSocketPathResolver(bundle: .main) }) {
+    public override convenience init() {
+        self.init(moduleIdentity: Self.mainBundleIdentity())
+    }
+
+    /// Source-compatible initializer for embedders that customize only
+    /// daemon socket discovery. Identity still comes from the running
+    /// extension's signed metadata; there is no OSS-identity assumption.
+    public convenience init(
+        resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver
+    ) {
+        self.init(
+            moduleIdentity: Self.mainBundleIdentity(),
+            resolverFactory: resolverFactory
+        )
+    }
+
+    public init(
+        moduleIdentity: PortableFSModuleIdentity,
+        resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = {
+            PfsSocketPathResolver(bundle: .main)
+        }
+    ) {
+        self.moduleIdentity = moduleIdentity
         self.resolverFactory = resolverFactory
         super.init()
     }
@@ -112,10 +136,16 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
         do {
-            let attachRef = try Self.attachRef(from: resource)
+            let attachRef = try attachRef(from: resource)
             let result = FSProbeResult.usable(
                 name: "PortableFS",
-                containerID: FSContainerIdentifier(uuid: Self.uuid(for: attachRef))
+                containerID: FSContainerIdentifier(
+                    uuid: Self.stableEntityUUID(
+                        kind: "container",
+                        stableID: attachRef,
+                        moduleIdentity: moduleIdentity
+                    )
+                )
             )
             replyHandler(result, nil)
         } catch {
@@ -131,13 +161,17 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     ) {
         let reply = PfsLoadResourceReply(replyHandler)
         do {
-            let attachRef = try Self.attachRef(from: resource)
+            let attachRef = try attachRef(from: resource)
             Task {
                 do {
                     let socketPath = try resolverFactory().resolve()
                     logger.info("loadResource resolving via socket \(socketPath, privacy: .public) for ref \(attachRef, privacy: .public)")
                     let core = try await VolumeCore.connect(socketPath: socketPath, attachRef: attachRef)
-                    let volume = try await PortableFSVolume.make(core: core, attachRef: attachRef)
+                    let volume = try await PortableFSVolume.make(
+                        core: core,
+                        attachRef: attachRef,
+                        moduleIdentity: moduleIdentity
+                    )
                     storeVolume(volume, attachRef: attachRef)
                     containerStatus = .ready
                     reply.call(volume, nil)
@@ -158,7 +192,7 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     ) {
         let reply = PfsUnloadResourceReply(reply)
         do {
-            let attachRef = try Self.attachRef(from: resource)
+            let attachRef = try attachRef(from: resource)
             if let volume = removeVolume(attachRef: attachRef) {
                 Task {
                     await volume.shutdown()
@@ -213,18 +247,29 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         }
     }
 
-    private static func attachRef(from resource: FSResource) throws -> String {
+    private static func mainBundleIdentity() -> PortableFSModuleIdentity {
+        do {
+            return try PortableFSModuleIdentity(bundle: .main)
+        } catch {
+            fatalError("invalid FSKit module identity: \(error.localizedDescription)")
+        }
+    }
+
+    private func attachRef(from resource: FSResource) throws -> String {
         guard let urlResource = resource as? FSGenericURLResource else {
             throw PfsLocalClientError.daemon(errno: ENXIO, message: "resource is not a generic URL")
         }
         let url = urlResource.url
-        guard url.scheme?.lowercased() == "pfs" else {
-            throw PfsLocalClientError.daemon(errno: ENXIO, message: "resource scheme is not pfs")
+        guard url.scheme?.lowercased() == moduleIdentity.resourceScheme else {
+            throw PfsLocalClientError.daemon(
+                errno: ENXIO,
+                message: "resource scheme is not \(moduleIdentity.resourceScheme)"
+            )
         }
         if let host = url.host, !host.isEmpty {
             return host
         }
-        let prefix = "pfs://"
+        let prefix = moduleIdentity.resourcePrefix
         let absolute = url.absoluteString
         guard absolute.hasPrefix(prefix), absolute.count > prefix.count else {
             throw PfsLocalClientError.daemon(errno: ENXIO, message: "missing attachRef")
@@ -232,12 +277,35 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         return String(absolute.dropFirst(prefix.count))
     }
 
-    fileprivate static func uuid(for string: String) -> UUID {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        for (index, byte) in string.utf8.enumerated() {
-            let slot = index % bytes.count
-            bytes[slot] = bytes[slot] &* 31 &+ byte
+    /// Derives a deterministic UUIDv8 while preserving the global FSKit
+    /// namespace boundary between products that embed this shared adapter.
+    ///
+    /// FSKit requires each container and volume identifier to uniquely
+    /// identify that entity. Backend identifiers are only unique inside one
+    /// PortableFS product, so hashing one without the signed module identity
+    /// lets two installed products alias the same LiveFS settings entry.
+    static func stableEntityUUID(
+        kind: String,
+        stableID: String,
+        moduleIdentity: PortableFSModuleIdentity
+    ) -> UUID {
+        var input = Data()
+        for component in [
+            "portablefs-fskit-entity-v1",
+            moduleIdentity.fileSystemTypeName,
+            moduleIdentity.resourceScheme,
+            kind,
+            stableID
+        ] {
+            let data = Data(component.utf8)
+            var byteCount = UInt64(data.count).bigEndian
+            withUnsafeBytes(of: &byteCount) { input.append(contentsOf: $0) }
+            input.append(data)
         }
+        var bytes = Array(SHA256.hash(data: input).prefix(16))
+        // RFC 9562 UUIDv8: application-defined payload plus the RFC variant.
+        bytes[6] = (bytes[6] & 0x0f) | 0x80
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
         return UUID(uuid: (
             bytes[0], bytes[1], bytes[2], bytes[3],
             bytes[4], bytes[5], bytes[6], bytes[7],
@@ -252,22 +320,50 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     public let core: VolumeCore
     public let capabilities: PfsCapabilities
     private let logger = Logger(subsystem: "dev.portablefs.fskit", category: "PortableFSVolume")
+    private let fileSystemTypeName: String
     private let statLock = NSLock()
     private var cachedStatistics: FSStatFSResult
 
-    public static func make(core: VolumeCore, attachRef: String) async throws -> PortableFSVolume {
+    public static func make(
+        core: VolumeCore,
+        attachRef: String,
+        moduleIdentity: PortableFSModuleIdentity = PortableFSIdentity.moduleIdentity
+    ) async throws -> PortableFSVolume {
         guard let resolved = await core.resolvedVolume else {
             throw PfsLocalClientError.unexpectedReply("volume has not been resolved")
         }
         let statReply = try await core.statfs()
-        return PortableFSVolume(core: core, attachRef: attachRef, resolved: resolved, statReply: statReply)
+        return PortableFSVolume(
+            core: core,
+            attachRef: attachRef,
+            resolved: resolved,
+            statReply: statReply,
+            moduleIdentity: moduleIdentity
+        )
     }
 
-    private init(core: VolumeCore, attachRef: String, resolved: PfsResolvedVolume, statReply: PfsStatfsReply) {
+    private init(
+        core: VolumeCore,
+        attachRef: String,
+        resolved: PfsResolvedVolume,
+        statReply: PfsStatfsReply,
+        moduleIdentity: PortableFSModuleIdentity
+    ) {
         self.core = core
         self.capabilities = resolved.capabilities
-        self.cachedStatistics = PfsFSKitMapping.statfs(from: statReply, capabilities: resolved.capabilities)
-        let volumeID = FSVolume.Identifier(uuid: PortableFSFileSystem.uuid(for: resolved.volumeID.isEmpty ? attachRef : resolved.volumeID))
+        self.fileSystemTypeName = moduleIdentity.fileSystemTypeName
+        self.cachedStatistics = PfsFSKitMapping.statfs(
+            from: statReply,
+            capabilities: resolved.capabilities,
+            fileSystemTypeName: moduleIdentity.fileSystemTypeName
+        )
+        let volumeID = FSVolume.Identifier(
+            uuid: PortableFSFileSystem.stableEntityUUID(
+                kind: "volume",
+                stableID: resolved.volumeID.isEmpty ? attachRef : resolved.volumeID,
+                moduleIdentity: moduleIdentity
+            )
+        )
         let volumeName = FSFileName(string: resolved.volumeName)
         super.init(volumeID: volumeID, volumeName: volumeName)
     }
@@ -345,7 +441,11 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             // throws as well and seals later mutation admission.
             try await core.syncVolume()
             if let stat = try? await core.statfs() {
-                setCachedStatistics(PfsFSKitMapping.statfs(from: stat, capabilities: capabilities))
+                setCachedStatistics(PfsFSKitMapping.statfs(
+                    from: stat,
+                    capabilities: capabilities,
+                    fileSystemTypeName: fileSystemTypeName
+                ))
             }
         } catch {
             throw PfsErrorMapper.fsKitError(for: error)

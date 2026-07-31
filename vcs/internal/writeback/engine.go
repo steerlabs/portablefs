@@ -153,6 +153,19 @@ type Config struct {
 	// nil skips (tests without open tracking).
 	ProtectOpenPins func(ctx context.Context, scope, epoch string) (end func(released bool), err error)
 
+	// DelegationAcquireGate registers one cancellable, scope-aware ownership
+	// transition before the remote request. ReconcileReply atomically
+	// promotes the claim with reply-discovered identities before local grant
+	// installation; install=false means the embedder found a hidden alias
+	// conflict and the engine must release the grant without exposing it.
+	// End retains transition ownership through every install/abort outcome.
+	// nil is valid for embedders that never issue authority mutations beside
+	// Engine.
+	DelegationAcquireGate func(
+		ctx context.Context,
+		scope string,
+	) (DelegationAcquireGuard, error)
+
 	// BudgetBytes bounds the stream WAL on disk (0 = 512 MiB).
 	BudgetBytes int64
 
@@ -167,6 +180,13 @@ type Config struct {
 	DisableDelegatedXattrs bool
 
 	Logf func(string, ...any)
+}
+
+// DelegationAcquireGuard spans one remote acquire decision through its local
+// installation or definite release.
+type DelegationAcquireGuard struct {
+	ReconcileReply func(reply AcquireReply) (install bool)
+	End            func()
 }
 
 // delegation is one authority-issued grant held by this engine.
