@@ -125,6 +125,31 @@ func (c *VersionCache) RefreshAll(g uint64) {
 // Reset drops to an unknown generation.
 func (c *VersionCache) Reset() { c.RefreshAll(0) }
 
+// AnchorSubscription installs the invalidation stream's establishment fence
+// and returns the token the stream continues with.
+//
+// It exists because a cache fill is only ordered against the invalidation
+// stream once the AUTHORITY has registered this subscriber. Everything filled
+// before that point has no event that can ever supersede it: the authority
+// published those invalidations to a subscriber set this mount was not yet in,
+// and the stream carries no replay. Adopting the generation is therefore NOT
+// enough — a read that raced ahead and adopted the same generation would leave
+// AcceptGeneration a no-op and the pre-registration fill permanently readable.
+//
+// So the anchor is unconditional: it drops every retained path version and
+// bumps the generation epoch, which also makes every read that STARTED before
+// the anchor fail to publish. After it, the only reachable state is state read
+// from the authority after this mount became a registered subscriber.
+func (c *VersionCache) AnchorSubscription(g uint64) CacheToken {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gen = g
+	c.genEpoch++
+	c.m = map[string]versionState{}
+	c.genClock.Store(c.genEpoch)
+	return CacheToken{genEpoch: c.genEpoch, fenceSeq: c.fenceSeq}
+}
+
 // FencePrefix makes cached versions under path unreachable until a response
 // from an operation begun after this exact ownership boundary validates them.
 // Version floors remain retained so a delayed pre-boundary invalidation

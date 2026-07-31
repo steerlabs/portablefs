@@ -87,6 +87,12 @@ func main() {
 		fatalf("wait for peer ready marker: %v", err)
 	}
 
+	// The peer's subtree is created remotely: never resolve its components by
+	// name before enumeration proves they exist (see waitFor).
+	if err := waitForPeerTree(filepath.Join(runRoot, "hosts"), *timeout, *peer, "files"); err != nil {
+		fatalf("wait for peer tree: %v", err)
+	}
+
 	var peerObserved atomic.Int64
 	scanStop := make(chan struct{})
 	scanDone := make(chan error, 1)
@@ -648,19 +654,45 @@ func syncDir(path string) error {
 	return dir.Sync()
 }
 
+// waitFor blocks until path exists, polling by ENUMERATING its parent, never
+// by stat. macOS FSKit caches a negative dentry from a pre-creation lookup
+// permanently (no revalidation, no invalidation API), so a stat-poll would
+// blind this side to the peer's file forever. Enumeration consults the
+// filesystem every time, and the first by-name lookup happens only after the
+// entry is already visible.
 func waitFor(path string, timeout time.Duration) error {
+	dir, name := filepath.Split(path)
 	deadline := time.Now().Add(timeout)
 	for {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		} else if !os.IsNotExist(err) {
+		entries, err := os.ReadDir(dir)
+		if err != nil && !os.IsNotExist(err) {
 			return err
+		}
+		for _, e := range entries {
+			if e.Name() == name {
+				return nil
+			}
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out after %s waiting for %s", timeout, path)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// waitForPeerTree enumeration-gates the descent into a directory chain the
+// PEER creates (e.g. hosts/<peer>/files). Resolving any component by name
+// before it exists would seed a permanent FSKit negative dentry, so each
+// component is awaited via parent enumeration before it is ever traversed.
+func waitForPeerTree(root string, timeout time.Duration, components ...string) error {
+	current := root
+	for _, c := range components {
+		if err := waitFor(filepath.Join(current, c), timeout); err != nil {
+			return err
+		}
+		current = filepath.Join(current, c)
+	}
+	return nil
 }
 
 func readDoneRecord(path string) (doneRecord, error) {

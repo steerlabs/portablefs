@@ -43,9 +43,24 @@ fail() { echo "FATAL: $*" >&2; exit 1; }
 [ -x "$BIN" ] || fail "missing $BIN"
 "${SSH[@]}" "test -x \$HOME/$RROOT/bin/pfs-mount-stress" || fail "remote harness missing"
 
-echo "== preflight: no stale mounts =="
-"$BIN" mounts --json | tee "$OUT/preflight-local.json" | grep -q '"alive": true' && fail "local live mount present; clean up first"
-"${SSH[@]}" "\$HOME/$RROOT/bin/portablefs mounts --json" | tee "$OUT/preflight-remote.json" | grep -q '"alive": true' && fail "remote live mount present; clean up first"
+echo "== preflight: reconcile stale records, refuse live mounts =="
+reconcile_stale() { # $1 = mounts json, prints stale mountPaths
+  python3 -c 'import json,sys; d=json.load(sys.stdin); [print(m["mountPath"]) for m in d.get("mounts",[]) if not m.get("alive")]' <<<"$1"
+}
+LJSON="$("$BIN" mounts --json | tee "$OUT/preflight-local.json")"
+grep -q '"alive": true' <<<"$LJSON" && fail "local live mount present; clean up first"
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  echo "reconciling stale local record: $p"
+  "$BIN" umount "$p" || "$BIN" umount --force "$p" || fail "reconcile stale local record $p"
+done < <(reconcile_stale "$LJSON")
+RJSON="$("${SSH[@]}" "\$HOME/$RROOT/bin/portablefs mounts --json" | tee "$OUT/preflight-remote.json")"
+grep -q '"alive": true' <<<"$RJSON" && fail "remote live mount present; clean up first"
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  echo "reconciling stale remote record: $p"
+  "${SSH[@]}" "\$HOME/$RROOT/bin/portablefs umount '$p' || \$HOME/$RROOT/bin/portablefs umount --force '$p'" || fail "reconcile stale remote record $p"
+done < <(reconcile_stale "$RJSON")
 
 echo "== branch $BRANCH =="
 "$BIN" branch "$VOL" "$BRANCH" || fail "branch create"

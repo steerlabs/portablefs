@@ -197,6 +197,14 @@ type Volume struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// invAnchored closes the first time the authority confirms this mount is
+	// a registered invalidation subscriber and the caches have been fenced
+	// against every fill that predates that registration. Until then a cached
+	// read can be arbitrarily stale with no event able to correct it, so a
+	// frontend attaches only after waiting on it (see AwaitInvalidations).
+	invAnchored     chan struct{}
+	invAnchoredOnce sync.Once
+
 	// kernelFlushGen tracks the last generation for which the Read path fired its FOPEN_KEEP_CACHE
 	// kernel-flush backup. It is DELIBERATELY separate from the version cache's anchored generation
 	// (P1): CachedGetattr/Readdir also RefreshAll on an unseen gen but must not flush the kernel, so a
@@ -462,6 +470,7 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		openFiles:       NewInodeSet(),
 		hardlinks:       newHardlinkAliases(),
 		lockReg:         map[*LockHandle]struct{}{},
+		invAnchored:     make(chan struct{}),
 		noReaddirPlus:   opts.NoReaddirPlus,
 		attrTTL:         opts.AttrTTL,
 		sessionTTL:      opts.SessionTTL,
@@ -1182,7 +1191,34 @@ func (v *Volume) StartInvalidations(ctx context.Context, dropOrphan bool) {
 		DropOrphan:  dropOrphan,
 		ClearRecent: v.recent.clear,
 		Debugf:      v.debugf,
+		Anchored:    v.markInvalidationsAnchored,
 	})
+}
+
+func (v *Volume) markInvalidationsAnchored() {
+	v.invAnchoredOnce.Do(func() { close(v.invAnchored) })
+}
+
+// InvalidationsAnchored closes once the authority has confirmed this mount as
+// a registered invalidation subscriber and the caches have been fenced against
+// every fill that predates that registration.
+func (v *Volume) InvalidationsAnchored() <-chan struct{} { return v.invAnchored }
+
+// AwaitInvalidations blocks until the invalidation stream is anchored, ctx is
+// done, or the volume closes. Reads served before the anchor can be stale with
+// no event able to correct them, so a frontend calls this before it starts
+// serving. It reports whether the anchor was actually reached: an attach that
+// cannot wait any longer may proceed, because the anchor still fences away
+// everything cached in the meantime the moment it arrives.
+func (v *Volume) AwaitInvalidations(ctx context.Context) bool {
+	select {
+	case <-v.invAnchored:
+		return true
+	case <-v.ctx.Done():
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 type volumeInvalidationHandler struct {
