@@ -87,6 +87,18 @@ policy locally when absent; once the authority (`fsproto.attrOf`) is
 deployed with the fields, add a protocol feature bit so absent-vs-zero
 is explicit rather than inferred.
 
+### 7. Observation: item-getattr ESTALE bursts during name churn
+
+During rapid create/hardlink/rename/remove churn on a real macOS 26 host,
+the unified log shows steady `getStandardItemAttributesForItem` replies of
+ESTALE(70)/ENOENT(2) — the kernel refreshing attributes of items that were
+just removed or whose generation was retired by reclaim. No functional
+operation failed and churn completed, but the alternating ESTALE→ENOENT
+pattern suggests the host retries an ESTALE item-getattr once before
+accepting death. Worth confirming the intended reply for a
+removed-but-still-referenced item (an orphan with live kernel references
+should arguably still serve attributes rather than ESTALE).
+
 ## Fixed on fix/root-liveness-metadata
 
 - Daemon unmount kernel-reentrancy self-deadlock: the admission freeze
