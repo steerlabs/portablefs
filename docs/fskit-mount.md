@@ -151,7 +151,12 @@ daemon, or mount. Cleanly unmount volumes and quit the app before upgrading.
 - **Spawn.** When nothing healthy answers, the CLI starts
   `portablefsd -frontend-socket ... -control-socket ...` with a state dir at
   `~/.local/state/portablefs/portablefsd`, detached, and waits up to 15
-  seconds for `/healthz` before failing with the log path.
+  seconds for `/healthz` before failing with the log path. A crashed daemon or
+  reboot can leave socket inodes behind; after acquiring both the state and
+  socket singleton locks, the new daemon reclaims only a private, same-UID,
+  single-link canonical socket that refuses a connection. It moves that exact
+  inode aside with an atomic no-replace rename before removal, so a concurrent
+  replacement is restored rather than unlinked.
 - **Log.** A CLI-spawned daemon appends to
   `~/.local/state/portablefs/portablefsd.log`. Per-mount daemon logs are
   separate, under `~/.local/state/portablefs/mounts/`. The menu-bar app invokes
@@ -159,8 +164,14 @@ daemon, or mount. Cleanly unmount volumes and quit the app before upgrading.
 - **Sockets are the authentication boundary.** The daemon creates the socket
   directory 0700 and the sockets 0600; same-user filesystem access is the
   control plane's entire auth model — there is no bearer token on the control
-  API. Authority credentials are stored per attach and refreshed through the
-  credential endpoint.
+  API. Authority credentials live only in daemon memory and are refreshed
+  through the credential endpoint; they are never written into the daemon's
+  durable attach registry. After a restart, an explicit normal unmount of a
+  managed mount reactivates the exact attach with the access-lease credential
+  already protected in its mount transaction before running the final
+  authority barrier. A direct-address mount has no persisted credential: if
+  its daemon is gone, normal unmount fails closed and only the explicit
+  `umount --force` transaction may durably park its offline tail.
 - **Outlives mounts.** Exact unmount durably removes the attach but leaves the
   daemon running for the next mount. Active delegated attaches may own local
   WAL state, so they must `fsync`, synchronize, or detach cleanly before the

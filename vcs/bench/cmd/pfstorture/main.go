@@ -4,13 +4,18 @@
 //   - authority-kill (default): repeatedly SIGKILL a real authority OS
 //     process mid-write-storm and prove every acknowledged write survives
 //     restart, byte for byte.
+//
 //   - client-kill: keep the authority healthy and SIGKILL the write-back
 //     MOUNT CLIENT (a real clientcore volume with the adaptive engine and a
 //     durable store) mid-storm; a fresh client on the same store must
 //     automatically recover the parked stream, after which every
 //     acknowledged step must be present on the authority byte-exactly.
 //
-//	pfstorture -serve-bin /path/to/pfsbench [-mode authority-kill|client-kill] [-k 10] [-seed 42] [-out report.json]
+//   - daemon-kill: keep the authority healthy and SIGKILL portablefsd behind
+//     the pfslocal boundary; restart it on the same sockets and state without
+//     deleting crash residue, then require exact attach-time WAL recovery.
+//
+//     pfstorture -serve-bin /path/to/pfsbench [-daemon-bin /path/to/portablefsd] [-mode authority-kill|client-kill|daemon-kill] [-k 10] [-seed 42] [-out report.json]
 //
 // Per iteration: start `pfsbench serve` (the same workfs + WAL + fsproto stack
 // the vcs authority wires into its data plane — the full vcs binary needs a

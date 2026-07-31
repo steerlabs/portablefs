@@ -517,16 +517,20 @@ func (r *registry) get(ref string) *attach {
 // activate serializes credential-driven revival with every attach membership
 // mutation. Resolving the ref and publishing a live Volume therefore cannot
 // race an exact detach that is removing the same registry entry.
-func (r *registry) activate(ctx context.Context, ref, token string) (bool, error) {
+func (r *registry) activate(ctx context.Context, ref, token string, onlyIfPending bool) (bool, bool, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
 	r.mu.RLock()
 	a := r.byRef[ref]
 	r.mu.RUnlock()
 	if a == nil {
-		return false, nil
+		return false, false, nil
 	}
-	return true, a.activate(ctx, token)
+	if onlyIfPending {
+		activated, err := a.activateIfPending(ctx, token)
+		return true, activated, err
+	}
+	return true, true, a.activate(ctx, token)
 }
 
 func (r *registry) list() []*attach {
@@ -1148,7 +1152,21 @@ func (a *attach) activate(ctx context.Context, tok string) error {
 	return a.activateWithOptions(ctx, tok, nil)
 }
 
+func (a *attach) activateIfPending(ctx context.Context, tok string) (bool, error) {
+	return a.activateWithOptionsMode(ctx, tok, nil, true)
+}
+
 func (a *attach) activateWithOptions(ctx context.Context, tok string, options *AttachOptions) error {
+	_, err := a.activateWithOptionsMode(ctx, tok, options, false)
+	return err
+}
+
+func (a *attach) activateWithOptionsMode(
+	ctx context.Context,
+	tok string,
+	options *AttachOptions,
+	onlyIfPending bool,
+) (bool, error) {
 	unlockNamespace := a.lockExternalNamespaceWrite()
 	defer unlockNamespace()
 	a.startMu.Lock()
@@ -1156,17 +1174,21 @@ func (a *attach) activateWithOptions(ctx context.Context, tok string, options *A
 	a.mu.RLock()
 	if a.detached {
 		a.mu.RUnlock()
-		return fmt.Errorf("attach is detached")
+		return false, fmt.Errorf("attach is detached")
 	}
 	if a.detachPrepared || a.detachForce {
 		a.mu.RUnlock()
-		return fmt.Errorf("attach is quarantined by a durable prepared detach")
+		return false, fmt.Errorf("attach is quarantined by a durable prepared detach")
 	}
+	credentialPending := a.credentialPending
 	active := a.vol != nil && !a.credentialPending
 	a.mu.RUnlock()
+	if onlyIfPending && !credentialPending {
+		return false, nil
+	}
 	a.setCredential(tok)
 	if active {
-		return nil
+		return true, nil
 	}
 	if options != nil {
 		a.mu.Lock()
@@ -1188,12 +1210,12 @@ func (a *attach) activateWithOptions(ctx context.Context, tok string, options *A
 			a.options.VolumeLocalDirs = previousVolumeLocalDirs
 			a.options.LocalDirs = previousLocalDirs
 			a.mu.Unlock()
-			return fmt.Errorf("persist revived local-dir routing: %w", err)
+			return false, fmt.Errorf("persist revived local-dir routing: %w", err)
 		}
 	}
 	if err := a.start(ctx); err != nil {
 		a.setErr(err)
-		return err
+		return false, err
 	}
 	a.mu.Lock()
 	a.credentialPending = false
@@ -1201,7 +1223,7 @@ func (a *attach) activateWithOptions(ctx context.Context, tok string, options *A
 	a.state = a.currentStateLocked()
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: a.state}})
 	a.mu.Unlock()
-	return nil
+	return true, nil
 }
 
 // controlAdmissionError is called only while nsMu is held. A persisted

@@ -13,6 +13,32 @@ import (
 
 const testFSKitAttachRef = "att_UUUUUUUUUUUUUUUUUUUUUU"
 
+func TestActivateIfPendingNeverRollsBackActiveCredential(t *testing.T) {
+	a := newAttach(testFSKitAttachRef, "credential-race", ensureAttachRequest{
+		AttachRef:          testFSKitAttachRef,
+		VolumeID:           "vol-credential-race",
+		Branch:             "main",
+		MountPath:          "/Volumes/CredentialRace",
+		AuthorityURL:       "127.0.0.1:1",
+		DataPlaneTransport: "plaintext",
+	}, privateTestDir(t))
+	a.setCredential("newest-token")
+
+	activated, err := a.activateIfPending(context.Background(), "stale-recorded-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated {
+		t.Fatal("active attach accepted a credential-pending-only activation")
+	}
+	a.credMu.Lock()
+	token := a.token
+	a.credMu.Unlock()
+	if token != "newest-token" {
+		t.Fatalf("active credential was rolled back to %q", token)
+	}
+}
+
 func writeFSKitDetachFixture(t *testing.T, stateDir string, prepared, force bool) {
 	t.Helper()
 	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{{

@@ -176,13 +176,14 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			AuthToken string `json:"authToken"`
+			AuthToken     string `json:"authToken"`
+			OnlyIfPending bool   `json:"onlyIfPending,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		found, err := s.registry.activate(r.Context(), ref, req.AuthToken)
+		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.OnlyIfPending)
 		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, err.Error())
 			return
@@ -191,9 +192,11 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			writeHTTPError(w, http.StatusNotFound, "unknown attach")
 			return
 		}
-		if eno := a.persistStateOrEIO("credential activation"); eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("credential", eno))
-			return
+		if activated {
+			if eno := a.persistStateOrEIO("credential activation"); eno != 0 {
+				writeHTTPError(w, httpStatusForErr(eno), errMessage("credential", eno))
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case "flush":
