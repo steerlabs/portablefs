@@ -34,6 +34,9 @@ type cmdEnv struct {
 	// Test-only presentation seam. Production always performs the exact
 	// process + kernel mount identity checks in mountHealth.
 	mountHealthFn func(*mountState) string
+	// Test-only daemon lifecycle seam. Production always adopts or starts the
+	// exact portablefsd sibling through ensurePortablefsd.
+	ensurePortablefsdFn func(fskitConfig, string, string) (*fsdControl, error)
 	// Test-only account-inventory seam. Production always reads the live
 	// kernel mount table before changing credentials or profiles.
 	kernelInventoryFn func() ([]string, error)
@@ -51,6 +54,13 @@ func (e *cmdEnv) kernelMountInventory() ([]string, error) {
 		return e.kernelInventoryFn()
 	}
 	return portableFSKernelInventory()
+}
+
+func (e *cmdEnv) ensureFskitDaemon(cfg fskitConfig, stateRoot string) (*fsdControl, error) {
+	if e.ensurePortablefsdFn != nil {
+		return e.ensurePortablefsdFn(cfg, stateRoot, e.version)
+	}
+	return ensurePortablefsd(cfg, stateRoot, e.version)
 }
 
 func (e *cmdEnv) stdinReader() io.Reader {

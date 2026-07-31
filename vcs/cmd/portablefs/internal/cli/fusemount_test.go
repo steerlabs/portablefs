@@ -111,6 +111,123 @@ func fakePortablefsdBinary(t *testing.T, dir, version string) (string, string) {
 	return path, sum
 }
 
+func leaveCLIStaleUnixSocket(t *testing.T, path string) {
+	t.Helper()
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnsurePortablefsdDelegatesStaleSocketsAndReportsEarlyExit(t *testing.T) {
+	dir := shortSocketDir(t)
+	daemonPath, _ := fakePortablefsdBinary(t, dir, "test-version")
+	frontendSock := filepath.Join(dir, "pfs.sock")
+	controlSock := filepath.Join(dir, "control.sock")
+	stateRoot := filepath.Join(dir, "state-root")
+	leaveCLIStaleUnixSocket(t, frontendSock)
+	leaveCLIStaleUnixSocket(t, controlSock)
+
+	started := time.Now()
+	_, err := ensurePortablefsd(fskitConfig{
+		fsType:            defaultFskitType,
+		frontendSock:      frontendSock,
+		controlSock:       controlSock,
+		daemonPathForTest: daemonPath,
+	}, stateRoot, "test-version")
+	if err == nil || !strings.Contains(err.Error(), "exited without becoming healthy") {
+		t.Fatalf("early daemon-exit verdict = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("early daemon exit took %v instead of returning immediately", elapsed)
+	}
+	for _, path := range []string{frontendSock, controlSock} {
+		if info, statErr := os.Lstat(path); statErr != nil || info.Mode()&os.ModeSocket == 0 {
+			t.Fatalf("CLI mutated daemon-owned stale socket %s: mode=%v err=%v", path, info, statErr)
+		}
+	}
+}
+
+func TestEnsurePortablefsdHungControlCannotMaskSpawnedChildExit(t *testing.T) {
+	dir := shortSocketDir(t)
+	daemonPath, _ := fakePortablefsdBinary(t, dir, "test-version")
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	t.Cleanup(func() {
+		close(stop)
+		_ = ln.Close()
+	})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				<-stop
+				_ = conn.Close()
+			}()
+		}
+	}()
+
+	started := time.Now()
+	_, err = ensurePortablefsd(fskitConfig{
+		fsType:            defaultFskitType,
+		frontendSock:      filepath.Join(dir, "pfs.sock"),
+		controlSock:       controlSock,
+		daemonPathForTest: daemonPath,
+	}, filepath.Join(dir, "state-root"), "test-version")
+	if err == nil || !strings.Contains(err.Error(), "exited without becoming healthy") {
+		t.Fatalf("hung-control early-exit verdict = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("hung control socket masked the child exit for %v", elapsed)
+	}
+}
+
+func TestFsdControlIdentityHonorsLifecycleDeadline(t *testing.T) {
+	dir := shortSocketDir(t)
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/identity" {
+			http.NotFound(w, r)
+			return
+		}
+		<-r.Context().Done()
+	})}
+	go func() { _ = server.Serve(ln) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	started := time.Now()
+	err = newFsdControl(controlSock).requireCompatibleIdentityWithin(
+		"test-version",
+		strings.Repeat("a", 64),
+		150*time.Millisecond,
+	)
+	if err == nil {
+		t.Fatal("hung identity endpoint unexpectedly passed")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("hung identity endpoint exceeded its lifecycle deadline: %v", elapsed)
+	}
+}
+
 // TestEnsurePortablefsdAdoptsHealthyDaemon proves the fskit path adopts an
 // already-listening control socket instead of spawning a second daemon: a
 // fake control server answering the liveness and exact identity endpoints is

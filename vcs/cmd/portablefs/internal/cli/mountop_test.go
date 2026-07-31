@@ -267,6 +267,67 @@ func TestOwnerlessForceRequestRequiresExactOfflineStoreProof(t *testing.T) {
 	}
 }
 
+func TestReconcileFSKitIntentStartsExactDaemon(t *testing.T) {
+	e, _, _, stateDir := umountTestEnv(t)
+	mountPath, err := canonicalMountPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedMountIntent(t, stateDir, mountPath, "attached", "fskit", "att_AAAAAAAAAAAAAAAAAAAAAA")
+	_, intentPath := mountOperationPaths(stateDir, mountPath)
+	intent, err := readMountIntent(intentPath, mountPath)
+	if err != nil || intent == nil {
+		t.Fatalf("read intent: intent=%+v err=%v", intent, err)
+	}
+	st := mountState{
+		MountPath: intent.MountPath,
+		VolumeID:  intent.VolumeID,
+		Branch:    intent.Branch,
+		AttachRef: intent.AttachRef,
+	}
+	ctl, calls := serveFSKitReconcileControl(t, st, true, false, 200)
+	ensures := 0
+	e.ensurePortablefsdFn = func(_ fskitConfig, stateRoot, _ string) (*fsdControl, error) {
+		ensures++
+		if stateRoot != filepath.Dir(stateDir) {
+			t.Fatalf("state root=%q want %q", stateRoot, filepath.Dir(stateDir))
+		}
+		return ctl, nil
+	}
+
+	if _, err := e.reconcileMountIntent(intent, true); err != nil {
+		t.Fatalf("reconcile FSKit intent: %v", err)
+	}
+	if ensures != 1 || calls.unmount.Load() != 1 {
+		t.Fatalf("ensure calls=%d force calls=%d, want 1 each", ensures, calls.unmount.Load())
+	}
+}
+
+func TestForceDetachForUnmountStartsExactDaemon(t *testing.T) {
+	e, _, _, stateDir := umountTestEnv(t)
+	mountPath, err := canonicalMountPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := validFSKitMountState(t, mountPath)
+	ctl, calls := serveFSKitReconcileControl(t, st, true, false, 200)
+	ensures := 0
+	e.ensurePortablefsdFn = func(_ fskitConfig, stateRoot, _ string) (*fsdControl, error) {
+		ensures++
+		if stateRoot != filepath.Dir(stateDir) {
+			t.Fatalf("state root=%q want %q", stateRoot, filepath.Dir(stateDir))
+		}
+		return ctl, nil
+	}
+
+	if _, err := e.forceDetachForUnmount(&st); err != nil {
+		t.Fatalf("force detach: %v", err)
+	}
+	if ensures != 1 || calls.unmount.Load() != 1 {
+		t.Fatalf("ensure calls=%d force calls=%d, want 1 each", ensures, calls.unmount.Load())
+	}
+}
+
 func TestNewMountRefusesPriorNonterminalIntent(t *testing.T) {
 	for _, phase := range []string{"starting", "attached", "kernel-mounted"} {
 		t.Run(phase, func(t *testing.T) {

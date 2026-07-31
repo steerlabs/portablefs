@@ -21,6 +21,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 	"golang.org/x/sys/unix"
@@ -154,6 +155,10 @@ func newFsdControl(socketPath string) *fsdControl {
 }
 
 func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
+	return c.doContext(context.Background(), method, path, body)
+}
+
+func (c *fsdControl) doContext(ctx context.Context, method, path string, body any) (int, []byte, error) {
 	var reader io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -162,7 +167,7 @@ func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
 		}
 		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequest(method, "http://portablefsd"+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, "http://portablefsd"+path, reader)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -183,12 +188,30 @@ func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
 }
 
 func (c *fsdControl) healthy() bool {
-	status, _, err := c.do(http.MethodGet, "/healthz", nil)
+	return c.healthyWithin(time.Second)
+}
+
+func (c *fsdControl) healthyWithin(timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	status, _, err := c.doContext(ctx, http.MethodGet, "/healthz", nil)
 	return err == nil && status >= 200 && status < 300
 }
 
 func (c *fsdControl) identity() (daemonctl.Identity, error) {
-	status, body, err := c.do(http.MethodGet, "/v1/identity", nil)
+	return c.identityWithin(5 * time.Second)
+}
+
+func (c *fsdControl) identityWithin(timeout time.Duration) (daemonctl.Identity, error) {
+	if timeout <= 0 {
+		return daemonctl.Identity{}, context.DeadlineExceeded
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	status, body, err := c.doContext(ctx, http.MethodGet, "/v1/identity", nil)
 	if err != nil {
 		return daemonctl.Identity{}, err
 	}
@@ -203,7 +226,15 @@ func (c *fsdControl) identity() (daemonctl.Identity, error) {
 }
 
 func (c *fsdControl) requireCompatibleIdentity(cliVersion, executableSHA256 string) error {
-	identity, err := c.identity()
+	return c.requireCompatibleIdentityWithin(cliVersion, executableSHA256, 5*time.Second)
+}
+
+func (c *fsdControl) requireCompatibleIdentityWithin(
+	cliVersion,
+	executableSHA256 string,
+	timeout time.Duration,
+) error {
+	identity, err := c.identityWithin(timeout)
 	if err != nil {
 		return fmt.Errorf(
 			"the running portablefsd on %s has no compatible control identity: %w; cleanly unmount PortableFS volumes, stop that daemon, and retry (PortableFS will not replace a live daemon automatically)",
@@ -370,6 +401,46 @@ type cliParkedWAL struct {
 	LastError    string `json:"lastError"`
 }
 
+// verifyRecordedFskitAttach correlates a persisted mount/intent with the
+// exact live daemon inventory before a lifecycle mutation. Absence is a
+// proven result; a reused attach ref with different coordinates is an error.
+func verifyRecordedFskitAttach(ctl *fsdControl, st *mountState) (bool, error) {
+	attach, err := recordedFskitAttachStatus(ctl, st)
+	return attach != nil, err
+}
+
+func recordedFskitAttachStatus(ctl *fsdControl, st *mountState) (*cliAttachStatus, error) {
+	if ctl == nil || st == nil || !mountid.ValidAttachRef(st.AttachRef) {
+		return nil, fmt.Errorf("recorded FSKit attach identity is incomplete")
+	}
+	attaches, err := ctl.listAttaches()
+	if err != nil {
+		return nil, err
+	}
+	for i := range attaches {
+		attach := &attaches[i]
+		if attach.AttachRef != st.AttachRef {
+			continue
+		}
+		if attach.MountPath != st.MountPath ||
+			attach.VolumeID != st.VolumeID ||
+			attach.Branch != st.Branch {
+			return nil, fmt.Errorf(
+				"attach %s identity mismatch: daemon has %s@%s at %s, record has %s@%s at %s",
+				st.AttachRef,
+				attach.VolumeID,
+				attach.Branch,
+				attach.MountPath,
+				st.VolumeID,
+				st.Branch,
+				st.MountPath,
+			)
+		}
+		return attach, nil
+	}
+	return nil, nil
+}
+
 func (c *fsdControl) listAttaches() ([]cliAttachStatus, error) {
 	status, body, err := c.do(http.MethodGet, "/v1/attaches", nil)
 	if err != nil {
@@ -428,8 +499,16 @@ func (c *fsdControl) unmountAttach(ref string) error {
 }
 
 func (c *fsdControl) setCredential(ref, token string) error {
+	return c.setCredentialWithMode(ref, token, false)
+}
+
+func (c *fsdControl) setCredentialIfPending(ref, token string) error {
+	return c.setCredentialWithMode(ref, token, true)
+}
+
+func (c *fsdControl) setCredentialWithMode(ref, token string, onlyIfPending bool) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/credential",
-		map[string]string{"authToken": token})
+		map[string]any{"authToken": token, "onlyIfPending": onlyIfPending})
 	if err != nil {
 		return err
 	}
@@ -437,6 +516,29 @@ func (c *fsdControl) setCredential(ref, token string) error {
 		return controlError(status, body)
 	}
 	return nil
+}
+
+// unmountRecordedAttach performs the normal, authority-durable detach for a
+// persisted FSKit mount. portablefsd deliberately does not persist authority
+// credentials, so a restarted daemon revives managed attaches inert. The
+// mount transaction does persist the current access-lease credential; push
+// that exact credential back before asking the daemon for its final authority
+// barrier. Direct-address mounts have no persisted credential and therefore
+// proceed directly: an already-active daemon can drain them, while a revived
+// daemon fails closed and requires the explicit force/park transaction.
+func (c *fsdControl) unmountRecordedAttach(st *mountState) error {
+	if st == nil || !mountid.ValidAttachRef(st.AttachRef) {
+		return fmt.Errorf("recorded FSKit attach identity is incomplete")
+	}
+	if st.AccessLease != nil {
+		if !validLeaseState(st.AccessLease) {
+			return fmt.Errorf("recorded access lease for attach %s is invalid", st.AttachRef)
+		}
+		if err := c.setCredentialIfPending(st.AttachRef, st.AccessLease.AccessToken); err != nil {
+			return fmt.Errorf("reactivate attach %s with its recorded access lease: %w", st.AttachRef, err)
+		}
+	}
+	return c.unmountAttach(st.AttachRef)
 }
 
 type portablefsdPeer struct {
@@ -600,8 +702,8 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 	}
 	defer daemon.close()
 	ctl := newFsdControl(cfg.controlSock)
-	if ctl.healthy() {
-		if err := ctl.requireCompatibleIdentity(cliVersion, daemon.sha256); err != nil {
+	if ctl.healthyWithin(time.Second) {
+		if err := ctl.requireCompatibleIdentityWithin(cliVersion, daemon.sha256, 2*time.Second); err != nil {
 			return nil, err
 		}
 		return ctl, nil
@@ -609,14 +711,6 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 	for _, sock := range []string{cfg.frontendSock, cfg.controlSock} {
 		if err := privatepath.EnsureDir(filepath.Dir(sock)); err != nil {
 			return nil, fmt.Errorf("validate socket directory: %w", err)
-		}
-		if _, err := os.Lstat(sock); err == nil {
-			return nil, fmt.Errorf(
-				"portablefsd is not healthy but socket %s still exists; refusing to replace a possibly live daemon socket (cleanly unmount and stop the owning daemon, then remove only its stale socket if the process is gone)",
-				sock,
-			)
-		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("inspect portablefsd socket %s: %w", sock, err)
 		}
 	}
 	daemonStateDir := filepath.Join(stateRoot, "portablefsd")
@@ -649,15 +743,14 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start portablefsd: %w", err)
 	}
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
 	stopSpawned := func() error {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan struct{})
-		go func() {
-			_ = cmd.Wait()
-			close(done)
-		}()
 		select {
-		case <-done:
+		case <-waitCh:
 			return nil
 		case <-time.After(35 * time.Second):
 			return fmt.Errorf("spawned portablefsd did not stop within its 30-second drain budget and was left running")
@@ -671,18 +764,98 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 	}
 
 	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if ctl.healthy() {
-			if err := ctl.requireCompatibleIdentity(cliVersion, daemon.sha256); err != nil {
+	for {
+		select {
+		case waitErr := <-waitCh:
+			if waitErr == nil {
+				return nil, fmt.Errorf(
+					"portablefsd exited without becoming healthy on %s (log: %s)",
+					cfg.controlSock,
+					filepath.Join(stateRoot, "portablefsd.log"),
+				)
+			}
+			return nil, fmt.Errorf(
+				"portablefsd exited before becoming healthy on %s: %w (log: %s)",
+				cfg.controlSock,
+				waitErr,
+				filepath.Join(stateRoot, "portablefsd.log"),
+			)
+		default:
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		probeTimeout := min(250*time.Millisecond, remaining)
+		if ctl.healthyWithin(probeTimeout) {
+			remaining = time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			identityCh := make(chan error, 1)
+			go func() {
+				identityCh <- ctl.requireCompatibleIdentityWithin(cliVersion, daemon.sha256, remaining)
+			}()
+			select {
+			case waitErr := <-waitCh:
+				if waitErr == nil {
+					return nil, fmt.Errorf(
+						"portablefsd exited without becoming healthy on %s (log: %s)",
+						cfg.controlSock,
+						filepath.Join(stateRoot, "portablefsd.log"),
+					)
+				}
+				return nil, fmt.Errorf(
+					"portablefsd exited before identity verification on %s: %w (log: %s)",
+					cfg.controlSock,
+					waitErr,
+					filepath.Join(stateRoot, "portablefsd.log"),
+				)
+			case err := <-identityCh:
+				if err == nil {
+					return ctl, nil
+				}
 				if stopErr := stopSpawned(); stopErr != nil {
 					return nil, fmt.Errorf("%w; cleanup: %v", err, stopErr)
 				}
 				return nil, err
+			case <-time.After(remaining):
+				if stopErr := stopSpawned(); stopErr != nil {
+					return nil, fmt.Errorf(
+						"portablefsd identity did not become verifiable on %s within 15s (log: %s); cleanup: %w",
+						cfg.controlSock,
+						filepath.Join(stateRoot, "portablefsd.log"),
+						stopErr,
+					)
+				}
+				return nil, fmt.Errorf(
+					"portablefsd identity did not become verifiable on %s within 15s (log: %s)",
+					cfg.controlSock,
+					filepath.Join(stateRoot, "portablefsd.log"),
+				)
 			}
-			_ = cmd.Process.Release()
-			return ctl, nil
 		}
-		time.Sleep(150 * time.Millisecond)
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case waitErr := <-waitCh:
+			if waitErr == nil {
+				return nil, fmt.Errorf(
+					"portablefsd exited without becoming healthy on %s (log: %s)",
+					cfg.controlSock,
+					filepath.Join(stateRoot, "portablefsd.log"),
+				)
+			}
+			return nil, fmt.Errorf(
+				"portablefsd exited before becoming healthy on %s: %w (log: %s)",
+				cfg.controlSock,
+				waitErr,
+				filepath.Join(stateRoot, "portablefsd.log"),
+			)
+		case <-time.After(min(150*time.Millisecond, remaining)):
+		}
 	}
 	if err := stopSpawned(); err != nil {
 		return nil, fmt.Errorf("portablefsd did not become healthy on %s within 15s (log: %s); cleanup: %w",

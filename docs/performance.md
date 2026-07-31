@@ -388,7 +388,7 @@ Remaining knobs:
 
 ## Crash durability (pfstorture)
 
-`vcs/bench/cmd/pfstorture` is the kill -9 torture loop, with two campaigns:
+`vcs/bench/cmd/pfstorture` is the kill -9 torture loop, with three campaigns:
 
 - `-mode authority-kill` (default): per iteration it starts a real authority
   OS process (`pfsbench serve`) on a fresh disk-backed WAL, drives a
@@ -405,6 +405,12 @@ Remaining knobs:
   mid-ack-phase). A fresh client on the same store (`pfsbench wbrecover`)
   must discover the parked stream at its attach-readiness gate, verify it,
   rebind it, and drain it exactly.
+- `-mode daemon-kill`: the authority stays healthy while the real
+  `portablefsd` process is SIGKILLed behind the pfslocal boundary. The daemon
+  restarts on the same state and socket paths without test-side socket
+  deletion, reclaims only strictly proven dead socket inodes under its
+  singleton locks, and must replay every acknowledged write before the
+  revived attach becomes ready.
 
 The client-kill campaign is a process-loss test, not a sudden-power-loss
 test: the OS page cache survives SIGKILL. The write-versus-fsync contract is
@@ -454,8 +460,10 @@ go build -o /tmp/pfsbench ./bench/cmd/pfsbench
 
 # Torture loops (kill -9 crash durability), ~15 s for K=10:
 go build -o /tmp/pfstorture ./bench/cmd/pfstorture
+go build -o /tmp/portablefsd ./cmd/portablefsd
 /tmp/pfstorture -serve-bin /tmp/pfsbench -k 10 -seed 42
 /tmp/pfstorture -serve-bin /tmp/pfsbench -mode client-kill -k 10 -seed 42
+/tmp/pfstorture -serve-bin /tmp/pfsbench -daemon-bin /tmp/portablefsd -mode daemon-kill -k 10 -seed 42
 ```
 
 ## CI
