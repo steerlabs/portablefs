@@ -32,13 +32,8 @@ func TestLargeWriteIsRefusedInsteadOfOvershootingTheBudget(t *testing.T) {
 	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	_, handled, err := f.e.WriteAt(wctx, "d/f", 0, big)
 	cancel()
-	if err != nil {
-		if !handled {
-			t.Fatalf("the refusal changed lanes: handled=%v err=%v", handled, err)
-		}
-		if !errors.Is(err, ErrNoSpace) {
-			t.Fatalf("oversized write surfaced %v, want %v", err, ErrNoSpace)
-		}
+	if !handled || !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("oversized write must be refused with a definite ErrNoSpace in the delegated lane: handled=%v err=%v", handled, err)
 	}
 	if used := walBytes(t, f.e); used > budget {
 		t.Fatalf("stream WAL grew to %d bytes, past its %d budget: admission observed usage "+

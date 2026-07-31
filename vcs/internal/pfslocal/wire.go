@@ -483,6 +483,7 @@ func marshalCapabilities(m *Capabilities) []byte {
 	b = appendU64(b, 6, m.MaxFileSize)
 	b = appendU32(b, 7, m.PreferredIOSize)
 	b = appendBool(b, 8, m.FlagsSupported)
+	b = appendBool(b, 9, m.FlagsUnderstood)
 	return b
 }
 
@@ -524,6 +525,10 @@ func parseCapabilitiesField(wt int, raw []byte) (Capabilities, error) {
 		case 8:
 			v, err := scalarBool(wt, raw)
 			m.FlagsSupported = v
+			return err
+		case 9:
+			v, err := scalarBool(wt, raw)
+			m.FlagsUnderstood = v
 			return err
 		}
 		return nil

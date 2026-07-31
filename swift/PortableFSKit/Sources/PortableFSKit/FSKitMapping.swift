@@ -175,31 +175,36 @@ public enum PfsFSKitMapping {
 
     /// Translates a kernel SETATTR into the pfslocal request.
     ///
-    /// A BSD flags change is forwarded ONLY when this attach affirmatively
-    /// supports it — `flagsSupported` comes from the resolve reply the mount
-    /// was built from, the same fact `supportedCapabilities` answers
-    /// `doesNotSupportImmutableFiles` from. Otherwise the extension refuses it
-    /// here with ENOTSUP.
+    /// A BSD flags change is forwarded exactly when the daemon on this
+    /// connection COMPREHENDS the request — `flagsUnderstood` from the resolve
+    /// reply — and not otherwise. That is the only question this layer is
+    /// positioned to answer.
     ///
     /// The refusal cannot be delegated to the daemon. `set_flags`/`flags` are
     /// APPENDED pfslocal fields at the same protocol minor, so a daemon built
     /// before them proto3-discards both and applies the rest of the setattr
     /// perfectly — a refusal it never had the chance to make, and a chflags(2)
-    /// that returns success while nothing changed. An old daemon never sets
-    /// `flagsSupported`, so it decodes false and this gate closes on its own;
-    /// a new daemon sets it from the authority's FeatureFlagPersistence. The
-    /// daemon's own ENOTSUP stays as the invariant check for a frontend that
-    /// forwarded anyway.
+    /// that returns success while nothing changed. Such a daemon also predates
+    /// `flagsUnderstood`, so it decodes false and this gate closes on its own.
+    ///
+    /// What this gate must NOT be is `flagsSupported`. That field describes
+    /// the attached AUTHORITY's durable flag storage, and an attach's
+    /// namespace is not all authority: a machine-local graft is backed by a
+    /// real host inode, so chflags(2) on it persists with no authority feature
+    /// involved. Refusing volume-wide on `flagsSupported` breaks graft chflags
+    /// on every attach whose authority lacks FeatureFlagPersistence. The
+    /// per-target decision is the daemon's, and it comes back as an errno on
+    /// the request that asked for it.
     public static func setAttributes(
         from request: FSItem.SetAttributesRequest,
-        flagsSupported: Bool
+        flagsUnderstood: Bool
     ) throws -> PfsSetAttributes {
         var attributes = PfsSetAttributes()
         if request.isValid(.flags) {
-            guard flagsSupported else {
+            guard flagsUnderstood else {
                 throw PfsLocalClientError.daemon(
                     errno: ENOTSUP,
-                    message: "this PortableFS volume does not persist BSD file flags"
+                    message: "this PortableFS daemon does not understand BSD file flags"
                 )
             }
             attributes.flags = request.flags
@@ -285,15 +290,22 @@ public enum PfsFSKitMapping {
         supported.supports2TBFiles = true
         supported.supportsFastStatFS = true
         supported.supportsSparseFiles = true
-        // A MOUNT-TIME static capability answered from PER-ATTACH knowledge:
-        // the daemon puts `flagsSupported` in the resolve reply the mount is
-        // built from, because only it knows whether this attach's authority
-        // durably stores flags. Claiming immutable-file support where nothing
-        // persists a flag word would make chflags(2) a silent no-op; denying
-        // it where the authority does persist would make the kernel refuse a
-        // change that would have worked. Both are lies, so neither is
-        // hardcoded.
-        supported.doesNotSupportImmutableFiles = !capabilities.flagsSupported
+        // A MOUNT-TIME static capability, and therefore a statement about the
+        // WHOLE volume — which is why it follows `flagsUnderstood` and not
+        // `flagsSupported`. Flag support on this volume is per-object: a
+        // machine-local graft persists chflags(2) on its host inode while an
+        // authority without FeatureFlagPersistence cannot, and both live in
+        // one namespace. A volume that supports flags on SOME objects must not
+        // declare blanket non-support, because the kernel would then refuse
+        // changes that would have succeeded and never let the extension speak.
+        // Objects that genuinely cannot take a flag word refuse per request,
+        // as an errno.
+        //
+        // Declaring support against a daemon that does not even parse
+        // `set_flags` would be the opposite lie — a chflags(2) reported
+        // successful while nothing changed — so the capability is not
+        // hardcoded either.
+        supported.doesNotSupportImmutableFiles = !capabilities.flagsUnderstood
         supported.caseFormat = capabilities.caseSensitive ? .sensitive : .insensitiveCasePreserving
         return supported
     }

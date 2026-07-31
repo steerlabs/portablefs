@@ -533,7 +533,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             do {
                 let request = try PfsFSKitMapping.setAttributes(
                     from: newAttributes,
-                    flagsSupported: capabilities.flagsSupported
+                    flagsUnderstood: capabilities.flagsUnderstood
                 )
                 let attr = try await core.setattr(item: try portableItem(item), attributes: request)
                 return try PfsFSKitMapping.attributes(from: attr)

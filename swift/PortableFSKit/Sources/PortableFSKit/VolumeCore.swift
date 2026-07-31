@@ -324,14 +324,20 @@ public actor VolumeCore {
             // the frame: `set_flags`/`flags` are APPENDED fields, so a daemon
             // built before them discards both and applies the rest of the
             // setattr as if the flags change had never been asked for. Only an
-            // affirmative `flagsSupported` in this attach's resolve reply
+            // affirmative `flagsUnderstood` in this attach's resolve reply
             // proves the daemon reads them; anything else — including the
             // absent field an old daemon leaves at false — is refused here
             // rather than turned into a successful no-op.
-            guard resolvedVolume?.capabilities.flagsSupported == true else {
+            //
+            // The check is COMPREHENSION, never `flagsSupported`: that field
+            // is about the authority's durable storage, and a machine-local
+            // graft in the same namespace needs no authority feature to make
+            // chflags(2) stick. Whether THIS object can take a flag word is
+            // the daemon's call, per target, answered as an errno.
+            guard resolvedVolume?.capabilities.flagsUnderstood == true else {
                 throw PfsLocalClientError.daemon(
                     errno: ENOTSUP,
-                    message: "this PortableFS volume does not persist BSD file flags"
+                    message: "this PortableFS daemon does not understand BSD file flags"
                 )
             }
             // setFlags is the intent; a zero word is a legal "clear

@@ -169,21 +169,20 @@ import Testing
     }
 }
 
-/// A flags change is forwarded ONLY where the attach affirmatively supports it.
-/// The capability is per-attach knowledge that reaches the extension in the
-/// resolve reply, so the mapping layer consumes `.flags` exactly when the
-/// daemon proved it reads them — see
-/// `flagChangesAreRefusedByTheExtensionWhenTheDaemonCannotPersistThem` for the
-/// refusal half of the contract.
-@Test func flagChangesAreForwardedWhenTheAttachSupportsThem() throws {
+/// A flags change is forwarded exactly when the daemon PARSES the fields —
+/// `flagsUnderstood` from the resolve reply — so the mapping layer consumes
+/// `.flags` whenever the change is actually going to be asked of someone who
+/// can answer. See `flagChangesAreRefusedByTheExtensionWithoutComprehension`
+/// for the refusal half of the contract.
+@Test func flagChangesAreForwardedWhenTheDaemonUnderstandsThem() throws {
     let request = FSItem.SetAttributesRequest()
     request.mode = 0o600
-    let modeOnly = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: true)
+    let modeOnly = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: true)
     #expect(modeOnly.mode == 0o600)
     #expect(modeOnly.flags == nil)
 
     request.flags = UInt32(UF_IMMUTABLE)
-    let withFlags = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: true)
+    let withFlags = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: true)
     #expect(withFlags.flags == UInt32(UF_IMMUTABLE))
     #expect(withFlags.mode == 0o600)
     // FSKit's contract: an attribute the filesystem acts on must be reported
@@ -193,26 +192,25 @@ import Testing
     // Zero is a REQUEST (clear every flag), not "no change".
     let clearing = FSItem.SetAttributesRequest()
     clearing.flags = 0
-    #expect(try PfsFSKitMapping.setAttributes(from: clearing, flagsSupported: true).flags == 0)
+    #expect(try PfsFSKitMapping.setAttributes(from: clearing, flagsUnderstood: true).flags == 0)
     #expect(clearing.consumedAttributes.contains(.flags))
 }
 
-/// Without an affirmative `flagsSupported` the extension refuses the change
-/// ITSELF, because the daemon might be one that cannot refuse it: `set_flags`
-/// and `flags` are appended fields, so a daemon predating them discards both,
-/// applies the rest of the setattr and answers success. The refusal must
-/// therefore happen before the request is ever built — and it must take the
-/// co-travelling groups with it, since a chflags(2) that half-applied is not a
-/// refusal.
-@Test func flagChangesAreRefusedByTheExtensionWithoutTheCapability() throws {
+/// Without comprehension the extension refuses the change ITSELF, because the
+/// daemon on the other end cannot refuse it: `set_flags` and `flags` are
+/// appended fields, so a daemon predating them discards both, applies the rest
+/// of the setattr and answers success. The refusal must therefore happen
+/// before the request is ever built — and it must take the co-travelling
+/// groups with it, since a chflags(2) that half-applied is not a refusal.
+@Test func flagChangesAreRefusedByTheExtensionWithoutComprehension() throws {
     let request = FSItem.SetAttributesRequest()
     request.mode = 0o600
     request.flags = UInt32(UF_IMMUTABLE)
     #expect(throws: PfsLocalClientError.self) {
-        _ = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: false)
+        _ = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: false)
     }
     do {
-        _ = try PfsFSKitMapping.setAttributes(from: request, flagsSupported: false)
+        _ = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: false)
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == ENOTSUP)
     }
@@ -225,26 +223,44 @@ import Testing
     let clearing = FSItem.SetAttributesRequest()
     clearing.flags = 0
     #expect(throws: PfsLocalClientError.self) {
-        _ = try PfsFSKitMapping.setAttributes(from: clearing, flagsSupported: false)
+        _ = try PfsFSKitMapping.setAttributes(from: clearing, flagsUnderstood: false)
     }
 
     // A setattr carrying no flags intent is untouched by the missing bit.
     let modeOnly = FSItem.SetAttributesRequest()
     modeOnly.mode = 0o600
-    #expect(try PfsFSKitMapping.setAttributes(from: modeOnly, flagsSupported: false).mode == 0o600)
+    #expect(try PfsFSKitMapping.setAttributes(from: modeOnly, flagsUnderstood: false).mode == 0o600)
 }
 
-/// The volume capability is answered from the attach's own resolve reply, not
-/// hardcoded: a mount claims immutable-file support exactly where a chflags(2)
-/// will actually persist.
-@Test func immutableFileCapabilityFollowsTheAttachedAuthority() {
-    var withoutFlags = PfsCapabilities()
-    withoutFlags.caseSensitive = true
-    #expect(PfsFSKitMapping.supportedCapabilities(from: withoutFlags).doesNotSupportImmutableFiles)
+/// The static volume capability is a statement about the WHOLE volume, so it
+/// follows comprehension, not the authority's storage. A volume whose flag
+/// support is per-object — a machine-local graft persists chflags(2) on its
+/// host inode while the authority behind the rest of the namespace cannot —
+/// must not declare blanket non-support, or the kernel refuses graft chflags
+/// before the extension is ever consulted.
+@Test func immutableFileCapabilityFollowsDaemonComprehension() {
+    var unknown = PfsCapabilities()
+    unknown.caseSensitive = true
+    #expect(PfsFSKitMapping.supportedCapabilities(from: unknown).doesNotSupportImmutableFiles)
 
-    var withFlags = withoutFlags
-    withFlags.flagsSupported = true
-    #expect(!PfsFSKitMapping.supportedCapabilities(from: withFlags).doesNotSupportImmutableFiles)
+    // The regression case: the authority persists nothing, but the daemon
+    // understands the request and some objects in this namespace DO take a
+    // flag word. Immutable files must not be declared unsupported.
+    var graftsOnly = unknown
+    graftsOnly.flagsUnderstood = true
+    graftsOnly.flagsSupported = false
+    #expect(!PfsFSKitMapping.supportedCapabilities(from: graftsOnly).doesNotSupportImmutableFiles)
+
+    var both = unknown
+    both.flagsUnderstood = true
+    both.flagsSupported = true
+    #expect(!PfsFSKitMapping.supportedCapabilities(from: both).doesNotSupportImmutableFiles)
+
+    // And an authority that persists flags cannot rescue a daemon that would
+    // discard the request: comprehension is the whole question here.
+    var understandsNothing = unknown
+    understandsNothing.flagsSupported = true
+    #expect(PfsFSKitMapping.supportedCapabilities(from: understandsNothing).doesNotSupportImmutableFiles)
 }
 
 @Test func timespecConversionNormalizesPreEpochNanoseconds() {

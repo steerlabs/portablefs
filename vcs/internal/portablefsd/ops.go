@@ -212,12 +212,12 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 	// attach serves xattrs first-class.
 	//
 	// FlagsSupported is per-attach for the same reason and rides the SAME
-	// reply, which is the point: a frontend's volume capability set (FSKit's
-	// doesNotSupportImmutableFiles) is computed once, at mount, from the
-	// resolve reply — so the only way to publish per-attach flag knowledge as
-	// a mount-time static capability is to carry it here. The setattr path
-	// re-checks it per request; this field exists so the kernel is told the
-	// truth up front instead of learning it from a failed chflags.
+	// reply, but it describes the ATTACHED AUTHORITY only: whether that
+	// authority durably stores a flag word. It is not a volume-wide verdict on
+	// chflags(2), because this attach's namespace is not all authority — a
+	// machine-local graft's backing is a real host inode and chflags on it
+	// needs no authority feature at all (see setattrLocal). The frontend is
+	// told this so it can report the truth, not so it can gate on it.
 	// A nil vol is the synthetic-root attach (no authority yet): false is the
 	// honest answer, and it is the conservative one.
 	flagsSupported := vol.SupportsFlagPersistence()
@@ -228,6 +228,17 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 			Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
 			MaxNameBytes: 255, PreferredIOSize: 1 << 20,
 			FlagsSupported: flagsSupported,
+			// FlagsUnderstood is UNCONDITIONALLY true here and must stay that
+			// way: it says only that this daemon parses
+			// SetAttrRequest.SetFlags/Flags, which this build demonstrably
+			// does a few hundred lines down. It is the frontend's forwarding
+			// gate precisely because it is the one fact no reply content can
+			// express — a daemon predating those appended fields cannot set
+			// it, so it decodes false and the frontend refuses rather than
+			// letting the change be silently discarded. Making it conditional
+			// on anything (the authority's features, the attach's grafts)
+			// would resurrect the volume-wide refusal this replaced.
+			FlagsUnderstood: true,
 		},
 	}, 0
 }
@@ -622,18 +633,24 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		return &pfslocal.SetAttrReply{Attr: local}, 0
 	}
 	if req.SetFlags && !vol.SupportsFlagPersistence() {
-		// The attached authority has nowhere to store a flag word. Refuse the
-		// WHOLE setattr before anything is applied: consuming the other groups
-		// and dropping this one would report a success the next getattr
+		// AUTHORITY-BACKED arm only: control reaches here exactly when the
+		// target is NOT a graft (the rec.graft branch above returned already,
+		// and it must stay above this — a graft's backing is a real host inode
+		// whose chflags(2) needs no authority feature, so routing it through
+		// this check would refuse a change that works).
+		//
+		// This authority has nowhere to store a flag word. Refuse the WHOLE
+		// setattr before anything is applied: consuming the other groups and
+		// dropping this one would report a success the next getattr
 		// contradicts.
 		//
-		// This is an INVARIANT check, not the primary gate. The frontend
-		// already refused this request from FlagsSupported in its own resolve
-		// reply, and it must: set_flags/flags are appended pfslocal fields, so
-		// a daemon predating them discards a forwarded flags change entirely
-		// and answers success — a refusal only the frontend is positioned to
-		// make. Reaching here means a frontend forwarded against a capability
-		// it was told was false, so fail closed rather than trust it.
+		// This is the PER-TARGET decision, and it is the daemon's alone —
+		// only this layer knows what backs the object. The frontend's own
+		// gate answers a different question (does the daemon on the wire
+		// PARSE set_flags at all — Capabilities.FlagsUnderstood), because a
+		// daemon predating those appended fields discards a forwarded flags
+		// change entirely and answers success, a refusal only the frontend is
+		// positioned to make. Neither gate substitutes for the other.
 		return nil, darwinENOTSUP
 	}
 	cr := clientcore.SetattrRequest{}
