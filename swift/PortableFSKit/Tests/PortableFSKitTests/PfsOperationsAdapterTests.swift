@@ -713,7 +713,10 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
         packer: firstPacker
     )
     let firstEntries = firstState.entries
-    #expect(firstEntries.map(\.name) == [".", "..", "a.txt", "b.txt"])
+    // Enumeration order past the synthetics is the daemon's own name-cursor
+    // order, so assert membership rather than an alphabetical listing.
+    #expect(firstEntries.prefix(2).map(\.name) == [".", ".."])
+    #expect(Set(firstEntries.dropFirst(2).map(\.name)) == ["a.txt", "b.txt"])
     let terminalCookie = try #require(firstEntries.last?.nextCookie)
     #expect(PfsEnumerationCookies.isTerminal(terminalCookie))
 
@@ -1116,4 +1119,97 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
         packerCapacity: 16
     )
     #expect(plusEntries.map(\.name) == ["leaf.txt"])
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterKeepsVerifierStableWhileDirectoryMutatesBetweenPages() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let (dir, _) = try await harness.volume.createItem(
+        named: FSFileName(string: "churn"),
+        type: .directory,
+        inDirectory: harness.root,
+        attributes: FSItem.SetAttributesRequest()
+    )
+    for index in 0..<400 {
+        _ = try await createAdapterFile(volume: harness.volume, in: dir, name: String(format: "file-%06d.dat", index))
+    }
+
+    let (firstPacker, firstState) = makeRecordingPacker(capacity: 120)
+    defer { RecordingPackerRegistry.shared.uninstall(firstPacker) }
+    let verifier = try await harness.volume.enumerateDirectory(
+        dir,
+        startingAt: .initial,
+        verifier: .initial,
+        attributes: nil,
+        packer: firstPacker
+    )
+    #expect(verifier.rawValue != FSDirectoryVerifier.initial.rawValue)
+    let resumeCookie = try #require(firstState.entries.last?.nextCookie)
+    #expect(!PfsEnumerationCookies.isTerminal(resumeCookie))
+
+    // A writer lands a file in the directory while the kernel is holding a
+    // resumption cookie. Daemon cookies resume by name, so this is not a
+    // restart: reporting a new verifier here would tell FSKit the walk it is
+    // in the middle of is no longer valid.
+    _ = try await createAdapterFile(volume: harness.volume, in: dir, name: "renamed-in.dat")
+
+    let (secondPacker, secondState) = makeRecordingPacker(capacity: 400)
+    defer { RecordingPackerRegistry.shared.uninstall(secondPacker) }
+    let resumedVerifier = try await harness.volume.enumerateDirectory(
+        dir,
+        startingAt: FSDirectoryCookie(resumeCookie),
+        verifier: verifier,
+        attributes: nil,
+        packer: secondPacker
+    )
+    #expect(resumedVerifier.rawValue == verifier.rawValue)
+    #expect(!secondState.entries.isEmpty)
+
+    // A genuine restart — cookie back to initial — is the one place a new
+    // verifier belongs.
+    let (thirdPacker, thirdState) = makeRecordingPacker(capacity: 8)
+    defer { RecordingPackerRegistry.shared.uninstall(thirdPacker) }
+    let restartVerifier = try await harness.volume.enumerateDirectory(
+        dir,
+        startingAt: .initial,
+        verifier: .initial,
+        attributes: nil,
+        packer: thirdPacker
+    )
+    #expect(restartVerifier.rawValue != verifier.rawValue)
+    #expect(!thirdState.entries.isEmpty)
+}
+
+@available(macOS 26.0, *)
+@Test func operationsAdapterEnumeratesFiveHundredEntriesWhenPackerRefusesInsideFinalDaemonPage() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let (dir, _) = try await harness.volume.createItem(
+        named: FSFileName(string: "five-hundred"),
+        type: .directory,
+        inDirectory: harness.root,
+        attributes: FSItem.SetAttributesRequest()
+    )
+    var expected: Set<String> = []
+    for index in 0..<500 {
+        let name = String(format: "file-%06d.dat", index)
+        _ = try await createAdapterFile(volume: harness.volume, in: dir, name: name)
+        expected.insert(name)
+    }
+
+    // 303 is where the live host's readdir buffer filled up: inside the second
+    // and final 256-entry daemon page the adapter had already drained.
+    for capacity in [303, 457, 256, 257] {
+        let entries = try await collectDirectoryEntries(
+            volume: harness.volume,
+            directory: dir,
+            attributesRequested: false,
+            packerCapacity: capacity
+        )
+        let names = entries.map(\.name)
+        #expect(names.count == 502, "packer capacity \(capacity) returned \(names.count) entries")
+        #expect(Set(names) == expected.union([".", ".."]), "packer capacity \(capacity) lost or repeated entries")
+        #expect(Set(names).count == names.count, "packer capacity \(capacity) repeated an entry")
+    }
 }

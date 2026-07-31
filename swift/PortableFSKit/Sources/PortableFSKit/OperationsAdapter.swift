@@ -28,6 +28,9 @@ enum PfsEnumerationCookies {
     static let entriesStartCookie: UInt64 = 2
     static let daemonCookieMarker: UInt64 = 1 << 63
     static let terminalCookie = UInt64.max
+    /// `FSDirectoryVerifierInitial`, the value FSKit passes on a fresh walk.
+    @available(macOS 26.0, *)
+    static var initialVerifier: UInt64 { FSDirectoryVerifier.initial.rawValue }
 
     /// FSKit enumeration cookie state machine.
     ///
@@ -86,6 +89,16 @@ enum PfsEnumerationCookies {
         default:
             return []
         }
+    }
+
+    /// A fresh walk is one FSKit starts from `FSDirectoryCookieInitial`, or one
+    /// whose verifier is still `FSDirectoryVerifierInitial` (the synthetic "."
+    /// and ".." positions are the same walk, but the kernel has not been given
+    /// a verifier to echo back yet). Everything else is a continuation whose
+    /// verifier must stay exactly as issued.
+    @available(macOS 26.0, *)
+    static func isFreshStart(cookie: UInt64, verifier: UInt64) -> Bool {
+        cookie == FSDirectoryCookie.initial.rawValue || verifier == initialVerifier
     }
 
     static func fskitCookie(for daemonCookie: UInt64, attributesRequested _: Bool) throws -> UInt64 {
@@ -698,9 +711,24 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 wantAttributes: attributesRequested,
                 maxEntries: PfsEnumerationCookies.daemonPageSize
             )
-            let currentVerifier = try PfsFSKitMapping.directoryVerifier(
-                from: result.verifier
-            )
+            // The verifier must change only when a genuine restart is required.
+            // Daemon cookies are name-keyed resumption points, so a directory
+            // that gains or loses entries between pages is still resumable
+            // exactly where the last page stopped. Reporting the directory's
+            // current version on every page would instead tell FSKit the
+            // directory changed underneath a live walk — the invitation to
+            // abandon or restart it, which is how a several-hundred-entry
+            // listing comes back silently short under concurrent mutation.
+            // A continuation therefore echoes the verifier FSKit handed us and
+            // only a fresh walk (cookie 0, or an initial verifier) mints one.
+            let currentVerifier: FSDirectoryVerifier
+            if PfsEnumerationCookies.isFreshStart(cookie: cookie.rawValue, verifier: verifier.rawValue) {
+                currentVerifier = try PfsFSKitMapping.directoryVerifier(
+                    from: result.verifier
+                )
+            } else {
+                currentVerifier = verifier
+            }
 
             let synthetics = try PfsEnumerationCookies.syntheticEntries(
                 for: cookie.rawValue,

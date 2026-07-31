@@ -953,7 +953,6 @@ type attach struct {
 	authorityItems         map[uint64]frontendItemIdentity
 	awaitingAuthorityItems map[uint64]struct{}
 	handles                map[uint64]*handleRecord
-	enumRecords            map[uint64]*enumerationRecord
 	localDirs              []string
 	localRoot              string
 	localFS                *confinedfs.Root
@@ -968,7 +967,6 @@ type attach struct {
 	// confirmation. Successful retirements need no entry: handle IDs are
 	// monotonic for the attach, so an issued-but-absent ID proves success.
 	retiredCloseErrnos map[uint64]int32
-	nextEnumID         uint64
 	nextOrigin         uint64
 	subscribers        map[*eventSubscriber]struct{}
 	conns              map[interface{ Close() error }]struct{}
@@ -1026,6 +1024,11 @@ type handleRecord struct {
 	openPath string
 	state    *clientcore.NodeState
 	write    bool
+	// appendOnly records O_APPEND as a sticky descriptor property (POSIX: the
+	// flag lives on the open file description, not on the write). Every write
+	// through this handle resolves its offset at EOF under the authority's
+	// serialization instead of at the frontend-supplied absolute offset.
+	appendOnly bool
 	// operationLocks is a pointer because handle records are copied when an
 	// operation resolves its target. Every copy must retain the descriptor's
 	// one serialization identity.
@@ -1079,7 +1082,6 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		awaitingAuthorityItems: map[uint64]struct{}{},
 		handles:                map[uint64]*handleRecord{},
 		retiredCloseErrnos:     map[uint64]int32{},
-		enumRecords:            map[uint64]*enumerationRecord{},
 		subscribers:            map[*eventSubscriber]struct{}{},
 		conns:                  map[interface{ Close() error }]struct{}{},
 		eventReady:             make(chan struct{}),
@@ -1087,14 +1089,6 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		localRoot:              filepath.Join(stateDir, "local", storageID),
 		localVersions:          map[string]uint64{},
 	}
-}
-
-type enumerationRecord struct {
-	id         uint64
-	dir        string
-	entries    []clientcore.DirEntry
-	dirVersion uint64
-	lastUsed   time.Time
 }
 
 func newRevivedAttach(
@@ -3274,7 +3268,7 @@ func renamedPath(p, oldp, newp string) (string, bool) {
 	return newp + strings.TrimPrefix(p, oldp), true
 }
 
-func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.NodeState, write bool) uint64 {
+func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.NodeState, write, appendOnly bool) uint64 {
 	a.nextHandle++
 	if a.nextHandle == 0 {
 		a.nextHandle++
@@ -3282,12 +3276,13 @@ func (a *attach) newHandleLocked(path string, itemID uint64, state *clientcore.N
 	id := a.nextHandle
 	a.handles[id] = &handleRecord{
 		id: id, itemID: itemID, path: path, openPath: path, state: state, write: write,
+		appendOnly:     appendOnly,
 		operationLocks: &handleOperationLocks{},
 	}
 	return id
 }
 
-func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File, write bool) uint64 {
+func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File, write, appendOnly bool) uint64 {
 	a.nextHandle++
 	if a.nextHandle == 0 {
 		a.nextHandle++
@@ -3295,6 +3290,7 @@ func (a *attach) newLocalHandleLocked(path string, itemID uint64, file *os.File,
 	id := a.nextHandle
 	a.handles[id] = &handleRecord{
 		id: id, itemID: itemID, path: path, openPath: path, write: write, file: file,
+		appendOnly:     appendOnly,
 		operationLocks: &handleOperationLocks{},
 	}
 	return id
