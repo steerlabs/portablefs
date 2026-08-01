@@ -78,7 +78,7 @@ func (a *attach) admitRequest(
 ) (context.Context, func(), int32, bool) {
 	if req, ok := body.(*pfslocal.WriteRequest); ok {
 		if barrier := a.testMutationAdmissionBarrier; barrier != nil {
-			barrier()
+			barrier(ctx)
 		}
 		return a.admitWrite(ctx, req, forceAuthority)
 	}
@@ -95,7 +95,7 @@ func (a *attach) admitMutation(
 		// Stands in for the one thing this step can do that no frontend lock may
 		// span: a metadata- or credit-lane park. Tests hold it to prove that
 		// nothing else is held while admission waits.
-		barrier()
+		barrier(ctx)
 	}
 	if a.internalRefreshPending(body) {
 		// DAEMON-ORIGINATED, not application-originated. This is the setattr

@@ -509,7 +509,7 @@ func (c *frontendConn) beginLogicalOperation(
 			// that publishes nothing — close, fsync, statfs, reclaim,
 			// syncVolume — exposes no such state, so it has no side to be on.
 			// Admitting it as an ordinary participant made it WAIT twice for
-			// no coherence benefit: extendFrontendOperation collapses the
+			// no coherence benefit: an extension collapses the
 			// logical operation to the mount-wide scope on any path-epoch
 			// change, and the resume half of suspendFrontendOperation blocks
 			// until every overlapping delegation handoff has ended — a window
@@ -535,7 +535,7 @@ func (c *frontendConn) beginLogicalOperation(
 			return context.WithValue(ctx, frontendOperationContextKey{}, participant),
 				participant, true, false, nil
 		}
-		participant, err := a.extendFrontendOperation(ctx, entry.op, paths, pathEpoch)
+		participant, err := a.reserveFrontendExtension(entry.op, paths, pathEpoch)
 		if err != nil {
 			return ctx, nil, false, false, err
 		}
@@ -544,22 +544,29 @@ func (c *frontendConn) beginLogicalOperation(
 	}
 	c.publicationMu.Unlock()
 
-	op, err := a.beginFrontendPathsAtEpochContext(ctx, paths, pathEpoch)
+	// RESERVE, never begin: the operation is created with its first
+	// participant suspended and waits for no handoff. Its continuations
+	// therefore observe entry.ready promptly, and the gate wait this call used
+	// to pay is deferred to activation, where it can be paid holding no
+	// frontend mirror (see the publication activation protocol in
+	// coherence_refresh.go).
+	op, participant := a.reserveFrontendOperation(paths, pathEpoch)
+	var err error
 	c.publicationMu.Lock()
-	if c.publicationClosed && err == nil {
+	if c.publicationClosed {
 		err = net.ErrClosed
 	}
-	entry.op = op
+	if err == nil {
+		entry.op = op
+	}
 	entry.err = err
 	close(entry.ready)
 	c.publicationMu.Unlock()
 	if err != nil {
-		if op != nil {
-			a.finishFrontendOperation(op)
-		}
+		a.finishFrontendParticipant(participant)
+		a.finishFrontendOperation(op)
 		return ctx, nil, false, false, err
 	}
-	participant := &frontendOperationParticipant{op: op}
 	return context.WithValue(ctx, frontendOperationContextKey{}, participant),
 		participant, true, true, nil
 }
@@ -576,16 +583,31 @@ func (c *frontendConn) handleAttached(
 	//
 	// One request runs in four phases, and the order is the whole point:
 	//
-	//	0. DEADLINE.    One absolute bound for the operation, installed before
-	//	                anything can wait.
+	//	0. DEADLINE     One absolute bound for the operation, installed before
+	//	   + RESERVE.   anything can wait; then this request joins its logical
+	//	                operation SUSPENDED, holding nothing and waiting for
+	//	                nothing.
 	//	1. ADMISSION.   Classification, delegation transition and metadata-lane
 	//	                pacing — every step that can BLOCK on the uplink — taken
-	//	                holding NOTHING.
+	//	                holding NOTHING, and carrying the reserved publication
+	//	                identity so a release's handoff recognises this
+	//	                request's own operation.
 	//	2. PUBLICATION  The frontend mirrors (serialization, name stripes,
-	//	   + MIRRORS.   per-handle gate) and membership in the publication set.
-	//	                Nothing acquired here waits on the far end.
+	//	   + MIRRORS.   per-handle gate), then a NONBLOCKING attempt to activate
+	//	                into the publication set. Nothing acquired here waits on
+	//	                the far end, and nothing here waits at all while a mirror
+	//	                is held.
 	//	3. MUTATE.      The handler: a nonblocking revalidate of what phase 1
 	//	                decided, then the mutation itself.
+	//
+	// RESERVE exists because a CONTINUATION used to run phase 1 before it
+	// joined its logical operation, so its admission context carried no
+	// publication identity. A delegation release taken during classification
+	// reached OnHandoffStart, which saw the continuation's OWN already-active
+	// operation as a foreign member of the publication set and waited for it —
+	// an operation that cannot finish, because this continuation is one of its
+	// in-flight requests. A bounded deadlock resolved only by the operation
+	// deadline, surfacing as an EINTR and a spurious drain error.
 	//
 	// Phase 1 used to sit INSIDE phase 2. lockFrontendRequest takes the frontend
 	// serialization lock, the name stripes and a per-handle frontend RLock; then
@@ -602,13 +624,12 @@ func (c *frontendConn) handleAttached(
 	// publication set before it re-admits, so the second pass's claim and release
 	// are also paid holding nothing.
 	//
-	// Within phase 2 the existing order is preserved exactly: a CONTINUATION
-	// enters the gate first and suspends across the mirrors (if a recall owns one
-	// of them, suspending lets that recall finish, and resumption waits for the
-	// post-handoff view); a NEW logical operation takes the mirrors first so it
-	// can never become publication-active while blocked behind an older concrete
-	// namespace lock.
-	continuation := operationID != 0 && !initializeOperation
+	// Within phase 2 there is now ONE order for every request, continuation or
+	// not: take the mirrors while suspended (blocking no handoff), then ATTEMPT
+	// activation. The two orders this replaced each waited under the mirrors —
+	// a new operation in the gate entry it took after them, a continuation in
+	// the resume half of its suspend/mirrors/resume sequence — and that wait
+	// spans a delegation release's authority round trips.
 	if operationID != 0 {
 		defer c.finishLogicalRequest(operationID)
 	}
@@ -617,8 +638,24 @@ func (c *frontendConn) handleAttached(
 	ctx, cancelOperation := clientcore.WithOperationDeadline(ctx)
 	defer cancelOperation()
 
-	// PHASE 1, first pass. Holds nothing at all.
-	opCtx, settleMutation, admitEno, classified := a.admitRequest(ctx, body, false)
+	// RESERVE. Holds nothing, waits for nothing except this logical
+	// operation's own reservation by its initializing request.
+	gateCtx, participant, participates, publishes, err := c.beginLogicalOperation(
+		ctx, a, operationID, initializeOperation, body,
+	)
+	if err != nil {
+		_ = c.conn.Close()
+		return
+	}
+	if participates {
+		defer a.finishFrontendParticipant(participant)
+	}
+
+	// PHASE 1, first pass. Holds nothing at all, and carries the reserved
+	// publication identity: the lane, the transition token and the deadline are
+	// phase 1's, the publication identity is the reservation's, and phase 3
+	// needs both.
+	opCtx, settleMutation, admitEno, classified := a.admitRequest(gateCtx, body, false)
 	settleOnce := func() {
 		if settleMutation != nil {
 			settleMutation()
@@ -628,53 +665,16 @@ func (c *frontendConn) handleAttached(
 	defer settleOnce()
 
 	// PHASE 2.
-	var (
-		unlockRequest func()
-		participant   *frontendOperationParticipant
-		participates  bool
-		publishes     bool
-		gateCtx       = ctx
-		err           error
-	)
-	if continuation {
-		gateCtx, participant, participates, publishes, err = c.beginLogicalOperation(
-			ctx, a, operationID, false, body,
-		)
-		if err == nil {
-			resume := a.suspendFrontendOperation(gateCtx)
-			unlockRequest = a.lockFrontendRequest(body)
-			if resume != nil {
-				resume()
-			}
-		}
-	} else {
-		unlockRequest = a.lockFrontendRequest(body)
-		gateCtx, participant, participates, publishes, err = c.beginLogicalOperation(
-			ctx, a, operationID, initializeOperation, body,
-		)
-	}
-	if err != nil {
+	var unlockRequest func()
+	defer func() {
 		if unlockRequest != nil {
 			unlockRequest()
 		}
+	}()
+	unlockRequest, err = a.enterFrontendMirrors(gateCtx, body, participant)
+	if err != nil {
 		_ = c.conn.Close()
 		return
-	}
-	if unlockRequest != nil {
-		defer func() {
-			if unlockRequest != nil {
-				unlockRequest()
-			}
-		}()
-	}
-	if participates {
-		defer a.finishFrontendParticipant(participant)
-		// The operation context was built before this request joined the
-		// publication set, so it does not yet carry the participant every
-		// authority-bound wait inside the handler suspends against. Fold it in
-		// now: the lane, the transition token and the deadline are phase 1's, the
-		// publication identity is phase 2's, and phase 3 needs both.
-		opCtx = context.WithValue(opCtx, frontendOperationContextKey{}, participant)
 	}
 	if err := a.frontendAdmissionError(); err != nil {
 		if publishes {
@@ -721,16 +721,18 @@ func (c *frontendConn) handleAttached(
 		// UNWIND. Drop the mirrors and leave the publication set BEFORE
 		// re-admitting: the second pass's claim and delegation release are as
 		// unbounded as the first pass's and must be paid in the same place.
+		// Re-entry is the same reserve/mirrors/attempt-activation sequence the
+		// first pass used, so the second pass's gate wait is paid holding
+		// nothing too.
 		unlockRequest()
 		unlockRequest = nil
-		resume := a.suspendFrontendOperation(gateCtx)
-		opCtx, settleMutation, admitEno, classified = a.admitRequest(ctx, body, true)
-		if participates {
-			opCtx = context.WithValue(opCtx, frontendOperationContextKey{}, participant)
-		}
-		unlockRequest = a.lockFrontendRequest(body)
-		if resume != nil {
-			resume()
+		a.suspendFrontendParticipant(participant)
+		opCtx, settleMutation, admitEno, classified = a.admitRequest(gateCtx, body, true)
+		unlockRequest, err = a.enterFrontendMirrors(gateCtx, body, participant)
+		if err != nil {
+			settleOnce()
+			_ = c.conn.Close()
+			return
 		}
 	}
 	if eno == errnoLaneChanged {

@@ -122,7 +122,7 @@ Kernel-verified on macOS 26:
 These belong in user-facing consistency documentation as contracts, with
 radars for the API gaps.
 
-## Fixed on fix/root-architecture (round 3)
+## Fixed on fix/root-architecture (rounds 3-5)
 
 - **Internal coherence refreshes are distinguished by PROVENANCE, not by a
   clock**: the daemon's own kernel-size refresh installs a marker that is PINNED
@@ -135,15 +135,35 @@ radars for the API gaps.
   sampled size. Elapsed time now cannot decide provenance at all, and a pending
   internal refresh BYPASSES mutation admission outright: it publishes state the
   authority has already applied, so it neither caused the backlog nor can help
-  drain it.
-- **One dispatcher-ordering contract for every daemon request**: deadline →
-  pre-lock admission (holding nothing) → publication membership and the frontend
-  mirrors → nonblocking revalidate + mutate. Mutation admission used to run
-  INSIDE `lockFrontendRequest`, so a metadata-lane park held the frontend
-  serialization lock, the name stripes and a per-handle frontend RLock — and a
-  `close(2)` needing that handle gate exclusively queued behind it. The unwind
-  obeys the same contract: it drops the mirrors and suspends the request out of
-  the publication set before re-admitting.
+  drain it. Provenance is the PINNED WINDOW itself and is not consumable: the
+  marker was a single-use token, so an application `ftruncate` to the same item
+  and the same size — byte-identical on the wire, possibly through a hard-link
+  alias — could reach the dispatcher first and SPEND it, leaving the daemon's own
+  upcall markerless and therefore reclassified as an application mutation. While
+  the window is open every matching size-set is answered locally, and only the
+  refresh that opened it retires it (by sequence number, on every exit path). One
+  predicate now answers for both call sites, so admission and the setattr handler
+  cannot disagree about a request.
+- **One dispatcher-ordering contract for every daemon request**: deadline and
+  publication RESERVATION → pre-lock admission (holding nothing) → the frontend
+  mirrors plus a NONBLOCKING attempt to activate into the publication set →
+  nonblocking revalidate + mutate. Mutation admission used to run INSIDE
+  `lockFrontendRequest`, so a metadata-lane park held the frontend serialization
+  lock, the name stripes and a per-handle frontend RLock — and a `close(2)`
+  needing that handle gate exclusively queued behind it. The unwind obeys the
+  same contract: it drops the mirrors and suspends the request out of the
+  publication set before re-admitting.
+- **Publication membership is RESERVED before admission and ACTIVATED without
+  waiting**: a request joins its logical operation permanently suspended, so it
+  counts as a participant but blocks no delegation handoff and waits for none.
+  A CONTINUATION used to admit before it joined, so its admission context
+  carried no publication identity and the delegation release taken during
+  classification waited, through `OnHandoffStart`, on the continuation's OWN
+  already-active operation — an operation that cannot finish while this request
+  is one of its in-flight members. Activation is then ATTEMPTED under the
+  mirrors and never waited for: if a handoff owns an operand scope, the request
+  drops the mirrors, waits suspended and retries, so no gate wait is ever paid
+  with the frontend serialization lock, a name stripe or a handle gate held.
 - **Semantic authority diversions are classified pre-lock**: link,
   unlink-while-open, rename-over-an-open-destination and setattr on a
   hard-linked inode are authority-only by SEMANTICS, not by path coverage, and
@@ -152,12 +172,20 @@ radars for the API gaps.
   classified operation whose resolved lane is delegated, and every remaining
   under-lock release goes through one lane-aware gate, so no blocking drain is
   reachable beneath `nsMu`, a name stripe or a handle lock by any route.
-- **The live control API is a frontend**: control mutations take the operation
-  deadline and their pre-lock admission before `lockExternalNamespaceWrite`, and
-  the locked region does nonblocking revalidation and the mutation only. It used
-  to hold the mount-wide EXCLUSIVE namespace gate across a transition claim and a
-  delegation release, with the raw HTTP context and no bound — which also
-  inverted the one global lock order the rest of the daemon depends on.
+- **The live control API is a frontend, and holds a frontend's locks**: control
+  mutations take the operation deadline and their pre-lock admission first, then
+  `lockExternalNamespaceMutation` — the shared serialization mirror, the frontend
+  stripe for the one name, the SHARED namespace lock and that name's concrete
+  stripe, exactly what `attach.create`/`attach.setattr` take for the identical
+  authority calls. It used to hold the mount-wide EXCLUSIVE namespace gate across
+  a transition claim and a delegation release with the raw HTTP context and no
+  bound — which inverted the one global lock order — and, even after admission
+  moved out, across the six real authority round trips of the mutation itself.
+  Pre-lock admission bounds the classification, not the round trips; because Go's
+  RWMutex is writer-preferring, that exclusive hold parked every `nsMu.RLock` in
+  the mount, on every path. Mutual exclusion between two control writes to one
+  name is now the concrete name stripe's job rather than the exclusive gate's
+  side effect.
 - **FUSE writes share one absolute deadline across every unwind pass**:
   `WithOperationDeadline` is installed once in `fuseNode.Write`, outside the
   loop. `AdmitWrite` installs it idempotently, so a loop handing it a
@@ -170,6 +198,30 @@ radars for the API gaps.
   instead of an `errRetryable` that failed every attach forever with the grants
   stranded. Mark-before-reclaim ordering is unchanged and load-bearing (`digestAt`
   cannot rebuild a digest across segments that are already gone).
+- **Segment reclaim fsyncs the directory after EACH unlink**, in barrier B of the
+  recovery close-out and in `CheckpointAndReclaim` alike. Ascending unlink order
+  was assumed to leave "a contiguous ordinal suffix at every crash point", but
+  persistence order is not syscall order: with one trailing `fsyncDir` the whole
+  batch is unordered against a crash, so a crash could persist the unlink of
+  ordinal 2 and not ordinal 1 and leave the HOLE {0,2,3}. The reader rejects an
+  ordinal gap as `ErrCorrupt`, `recoverStream` maps that to `JobCorrupt`, and
+  `attempt` treats `JobCorrupt` as TERMINAL — so the stream parked forever with
+  its delegation grants checked out, unrecoverable rather than merely shorter.
+  One barrier per unlink reduces the reachable crash states to prefixes of the
+  loop, which is exactly the retained contiguous suffix the reader accepts; the
+  reader's continuity checks were deliberately NOT relaxed. Reclaim is rare, so
+  N directory syncs cost nothing next to an unrecoverable stream. Crash tests for
+  this window must enumerate PERSISTED SUBSETS derived from the barriers the code
+  actually issues, never just "the process stopped at step N".
+- **Lease supersession is UNRESOLVED for RELEASE too**: one decision table
+  (`leaseUnresolved`) now classifies both lease transitions. 503
+  `ACCESS_LEASE_EPOCH_SUPERSEDED` is a statement about the MANAGER, not the
+  lease; release counted it as a SATISFIED release, so unmount reported success
+  while the durable lease stayed active until its own expiry. It now replays the
+  same operationId, accessLeaseId and accessToken until a definite answer, the
+  caller's deadline, or the lease's own expiry — the same three termination
+  conditions renewal has — and reports a definite failure rather than a release
+  it never observed.
 - **A release drains its OWN scope's tail, not the whole stream**:
   `finishRelease` targeted `w.LastSeq()` — the last sequence of the shared
   stream — so releasing an already-applied metadata scope waited behind every

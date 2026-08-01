@@ -89,8 +89,11 @@ const (
 // expectedTruncate.pinned) is what actually decides whether a request is the
 // daemon's own refresh; this only stops a marker that somehow outlived its
 // refresh from lingering. An application truncate to the exact same (already
-// current) size inside a pinned window is still consumed — its only observable
-// loss is an mtime bump the remote edit has already superseded.
+// current) size inside a pinned window is answered locally as a no-op — its
+// only observable loss is an mtime bump the remote edit has already superseded
+// — and, crucially, it does NOT consume the window: provenance belongs to the
+// refresh that opened it, not to whichever request matches it first (see
+// refreshWindowOpenLocked).
 //
 // A var so failure-shape tests can compress it and drive the case where a
 // request's admission outlasts the TTL; production never changes it.
@@ -403,6 +406,22 @@ type frontendOperationParticipant struct {
 	// It is accounted for (the operation is not finished while it runs) but
 	// is never a member of the active publication set.
 	nonpublishing bool
+	// pendingPaths/pendingEpoch are an EXTENSION's own operand scopes, held
+	// on the participant until the instant it activates.
+	//
+	// A reserved participant is suspended, so it contributes no scope to the
+	// publication set and no handoff can be waiting on it. Merging its scopes
+	// into op.paths at reservation time would widen an ALREADY ACTIVE
+	// operation into a scope a handoff owns — the case the extension rule in
+	// activationBlockedLocked holds back. So the merge is part of activation,
+	// taken under the gate at the moment the operation proves no handoff owns
+	// the new scopes.
+	//
+	// merged is true from the start for the participant that CREATED the
+	// operation: its paths are the operation's paths already.
+	pendingPaths []string
+	pendingEpoch uint64
+	merged       bool
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -428,14 +447,6 @@ func operationOverlapsScope(paths []string, scope string) bool {
 		}
 	}
 	return false
-}
-
-func (a *attach) beginFrontendOperation(ctx context.Context, body any) (context.Context, *frontendOperation) {
-	paths, pathEpoch, publishes := a.frontendOperationPaths(body)
-	if !publishes {
-		return ctx, nil
-	}
-	return a.beginFrontendPathsAtEpoch(ctx, paths, pathEpoch)
 }
 
 func (a *attach) beginFrontendPaths(ctx context.Context, paths []string) (context.Context, *frontendOperation) {
@@ -494,14 +505,77 @@ func (a *attach) beginFrontendPathsAtEpochContext(
 	return op, nil
 }
 
-// extendFrontendOperation admits another request belonging to an already
-// active logical FSKit callback. A handoff that is already waiting on this
-// operation must allow its later pages/RPCs through, otherwise the callback
-// can never reach its one publication acknowledgement. A handoff that was
-// disjoint from the operation's original scope still blocks a newly-overlapping
-// extension until ownership is stable.
-func (a *attach) extendFrontendOperation(
-	ctx context.Context,
+// ── THE PUBLICATION ACTIVATION PROTOCOL ─────────────────────────────────────
+//
+// Membership of the active publication set is acquired in two separable steps,
+// and the split is the whole point:
+//
+//	RESERVE   (reserveFrontendOperation / reserveFrontendExtension)
+//	          The request joins its logical operation SUSPENDED. It counts as
+//	          a participant — so the operation is not finished while it runs,
+//	          which is what keeps a recall holding a namespace mirror from
+//	          deadlocking against the operation it is waiting to publish — but
+//	          it is not a member of the active set, so it blocks no handoff and
+//	          waits for none. Reservation waits for NOTHING and holds NOTHING.
+//	          It happens BEFORE admission, so every admission callback (in
+//	          particular the delegation release that reaches OnHandoffStart)
+//	          carries this operation's identity and cannot wait on it.
+//
+//	ACTIVATE  (tryActivateFrontendParticipant / awaitFrontendActivation)
+//	          Becoming a member is ATTEMPTED, never waited for, while the
+//	          frontend mirrors are held. If a handoff owns an operand scope the
+//	          attempt fails, the caller drops the mirrors, waits SUSPENDED for
+//	          the gate to open, and retries.
+//
+// The discipline both halves enforce: no gate wait is ever paid with the
+// frontend serialization lock, a name stripe or a per-handle gate held. Phase 2
+// used to take the mirrors and then wait — for a handoff that spans a
+// delegation release's authority round trips — so a write holding the per-handle
+// frontend RLock blocked the close(2) that needs it exclusively and depends on
+// nothing remote. It is the same unwind discipline ErrLaneChanged already obeys,
+// applied to the publication gate.
+//
+// Liveness: a suspended participant is never a member of the active set, so a
+// handoff waiting on the active set always makes progress while a reservation
+// waits. Each retry can only be defeated by a NEW handoff starting in the
+// window between the wait returning and the mirrors being retaken, and the
+// operation deadline (phase 0) bounds the whole loop regardless.
+
+// reserveFrontendOperation creates a logical operation with its first
+// participant already suspended. It never waits: the created operation is not
+// a member of the active publication set until it activates.
+func (a *attach) reserveFrontendOperation(
+	paths []string,
+	pathEpoch uint64,
+) (*frontendOperation, *frontendOperationParticipant) {
+	op := &frontendOperation{attach: a, paths: paths, pathEpoch: pathEpoch}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	op.participants = 1
+	op.suspended = 1
+	a.frontendGateMu.Unlock()
+	return op, &frontendOperationParticipant{
+		op:           op,
+		suspendDepth: 1,
+		// The creating participant's paths ARE the operation's paths.
+		merged: true,
+	}
+}
+
+// reserveFrontendExtension admits another request belonging to an already live
+// logical FSKit callback, suspended and without waiting. Its operand scopes
+// stay on the participant until activation merges them (see pendingPaths).
+//
+// It never RETRACTS the operation's existing membership. A reservation is only
+// a statement about the arriving request — that IT is not yet a member — and
+// says nothing about the callback, whose earlier reply may already be exposed
+// and unacknowledged. Deactivating here (the rule finishFrontendParticipant and
+// suspendFrontendOperation apply when an ACTIVE participant leaves the set)
+// would let a delegation handoff cross that unacknowledged reply, and would
+// then leave this reservation unable to activate at all, since the handoff it
+// released now owns the scope. The active set is retracted only by a
+// participant that was in it.
+func (a *attach) reserveFrontendExtension(
 	op *frontendOperation,
 	paths []string,
 	pathEpoch uint64,
@@ -511,6 +585,143 @@ func (a *attach) extendFrontendOperation(
 	}
 	a.frontendGateMu.Lock()
 	a.initFrontendGateLocked()
+	if op.completed {
+		a.frontendGateMu.Unlock()
+		return nil, net.ErrClosed
+	}
+	op.participants++
+	op.suspended++
+	a.frontendGateMu.Unlock()
+	return &frontendOperationParticipant{
+		op:           op,
+		suspendDepth: 1,
+		pendingPaths: paths,
+		pendingEpoch: pathEpoch,
+	}, nil
+}
+
+// activationBlockedLocked reports whether a handoff currently owns a scope this
+// participant needs. It reproduces, exactly, the two predicates the blocking
+// entry points used before the split:
+//
+//   - an unmerged EXTENSION uses the extension rule — a handoff that already
+//     waits on this operation must let its later requests through
+//     (alreadyOwned), or the callback could never reach its one publication
+//     acknowledgement; a handoff disjoint from the operation's original scope
+//     still holds back a newly overlapping extension until ownership is stable;
+//   - a merged participant (the operation's creator, or a request resuming
+//     after an unwind) uses the gate-entry rule over the operation's own scopes.
+func (a *attach) activationBlockedLocked(participant *frontendOperationParticipant) bool {
+	op := participant.op
+	currentEpoch := a.frontendPathEpoch.Load()
+	for scope := range a.frontendHandoffs {
+		if participant.merged {
+			if op.pathEpoch != currentEpoch || operationOverlapsScope(op.paths, scope) {
+				return true
+			}
+			continue
+		}
+		newOverlaps := participant.pendingEpoch != currentEpoch ||
+			operationOverlapsScope(participant.pendingPaths, scope)
+		alreadyOwned := op.gateActive &&
+			(op.pathEpoch != currentEpoch || operationOverlapsScope(op.paths, scope))
+		if newOverlaps && !alreadyOwned {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *attach) mergeParticipantPathsLocked(participant *frontendOperationParticipant) {
+	if participant.merged {
+		return
+	}
+	op := participant.op
+	seen := make(map[string]struct{}, len(op.paths)+len(participant.pendingPaths))
+	for _, path := range op.paths {
+		seen[path] = struct{}{}
+	}
+	for _, path := range participant.pendingPaths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		op.paths = append(op.paths, path)
+	}
+	if op.pathEpoch != participant.pendingEpoch {
+		// Zero cannot equal a real namespace epoch, so any later handoff
+		// conservatively treats this logical operation as mount-wide.
+		op.pathEpoch = 0
+	}
+	participant.merged = true
+	participant.pendingPaths = nil
+}
+
+// tryActivateFrontendParticipant attempts, WITHOUT WAITING, to make a reserved
+// participant a member of the active publication set. It is the only call the
+// dispatcher makes with the frontend mirrors held.
+//
+// ok reports membership: true means the request may proceed to its handler.
+// A nonpublishing participant is permanently suspended and reports true without
+// ever joining the set.
+func (a *attach) tryActivateFrontendParticipant(
+	participant *frontendOperationParticipant,
+) (ok bool, err error) {
+	if participant == nil || participant.op == nil || participant.op.attach != a {
+		return true, nil
+	}
+	if participant.nonpublishing {
+		return true, nil
+	}
+	op := participant.op
+	a.frontendGateMu.Lock()
+	defer a.frontendGateMu.Unlock()
+	a.initFrontendGateLocked()
+	if op.completed {
+		return false, net.ErrClosed
+	}
+	if participant.finished || participant.suspendDepth == 0 {
+		// Already active (or retired); nothing to do.
+		return true, nil
+	}
+	if participant.suspendDepth > 1 {
+		// A nested suspend inside a handler owns the outer depth; it resumes
+		// through its own closure, not here.
+		participant.suspendDepth--
+		return true, nil
+	}
+	if a.activationBlockedLocked(participant) {
+		return false, nil
+	}
+	a.mergeParticipantPathsLocked(participant)
+	participant.suspendDepth = 0
+	if op.suspended > 0 {
+		op.suspended--
+	}
+	if !op.gateActive {
+		a.frontendActive[op] = struct{}{}
+		op.gateActive = true
+	}
+	a.frontendGateCond.Broadcast()
+	return true, nil
+}
+
+// awaitFrontendActivation waits, holding NO frontend mirror, until this
+// participant's activation could succeed. It does not activate: the caller
+// retakes the mirrors and reattempts, so the window between them is covered by
+// the retry rather than by holding a lock across the wait.
+func (a *attach) awaitFrontendActivation(
+	ctx context.Context,
+	participant *frontendOperationParticipant,
+) error {
+	if participant == nil || participant.op == nil ||
+		participant.op.attach != a || participant.nonpublishing {
+		return nil
+	}
+	op := participant.op
+	a.frontendGateMu.Lock()
+	defer a.frontendGateMu.Unlock()
+	a.initFrontendGateLocked()
 	stopWake := context.AfterFunc(ctx, func() {
 		a.frontendGateMu.Lock()
 		a.frontendGateCond.Broadcast()
@@ -518,51 +729,88 @@ func (a *attach) extendFrontendOperation(
 	})
 	defer stopWake()
 	for {
-		if err := ctx.Err(); err != nil {
-			a.frontendGateMu.Unlock()
-			return nil, err
-		}
 		if op.completed {
-			a.frontendGateMu.Unlock()
-			return nil, net.ErrClosed
+			return net.ErrClosed
 		}
-		blocked := false
-		for scope := range a.frontendHandoffs {
-			currentEpoch := a.frontendPathEpoch.Load()
-			newOverlaps := pathEpoch != currentEpoch ||
-				operationOverlapsScope(paths, scope)
-			alreadyOwned := op.gateActive &&
-				(op.pathEpoch != currentEpoch ||
-					operationOverlapsScope(op.paths, scope))
-			if newOverlaps && !alreadyOwned {
-				blocked = true
-				break
-			}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if !blocked {
-			break
+		if participant.finished || participant.suspendDepth == 0 {
+			return nil
+		}
+		if !a.activationBlockedLocked(participant) {
+			return nil
 		}
 		a.frontendGateCond.Wait()
 	}
-	seen := make(map[string]struct{}, len(op.paths)+len(paths))
-	for _, path := range op.paths {
-		seen[path] = struct{}{}
-	}
-	for _, path := range paths {
-		if _, ok := seen[path]; ok {
-			continue
+}
+
+// enterFrontendMirrors is phase 2, once, for every request.
+//
+// It takes the frontend mirrors and makes this request a member of the active
+// publication set, and it does so in the only order that never waits under a
+// mirror:
+//
+//	take the mirrors (this request is SUSPENDED, so it blocks no handoff)
+//	ATTEMPT activation, nonblocking
+//	if blocked: drop the mirrors, wait SUSPENDED, retry
+//
+// Taking the mirrors first is what makes this safe. The alternative — activate
+// first, then take the mirrors — puts this request in the active publication
+// set while it waits for a name stripe or a handle gate, so a handoff started
+// by a recall that already holds a namespace mirror waits on this request while
+// this request waits on that recall. Suspended-while-holding-mirrors closes that
+// cycle: a handoff never waits on a suspended participant, so it always
+// completes and always lets the retry through.
+//
+// The returned unlock is nil only when the request takes no mirrors at all.
+func (a *attach) enterFrontendMirrors(
+	ctx context.Context,
+	body any,
+	participant *frontendOperationParticipant,
+) (func(), error) {
+	for {
+		unlockRequest := a.lockFrontendRequest(body)
+		activated, err := a.tryActivateFrontendParticipant(participant)
+		if err != nil {
+			if unlockRequest != nil {
+				unlockRequest()
+			}
+			return nil, err
 		}
-		seen[path] = struct{}{}
-		op.paths = append(op.paths, path)
+		if activated {
+			return unlockRequest, nil
+		}
+		if unlockRequest != nil {
+			unlockRequest()
+		}
+		if err := a.awaitFrontendActivation(ctx, participant); err != nil {
+			return nil, err
+		}
 	}
-	if op.pathEpoch != pathEpoch {
-		// Zero cannot equal a real namespace epoch, so any later handoff
-		// conservatively treats this logical operation as mount-wide.
-		op.pathEpoch = 0
+}
+
+// suspendFrontendParticipant returns an ACTIVE participant to the reserved,
+// suspended state. The ErrLaneChanged unwind uses it so the second pass's
+// claim and delegation release are paid exactly where the first pass's were:
+// holding nothing, out of the publication set.
+func (a *attach) suspendFrontendParticipant(participant *frontendOperationParticipant) {
+	if participant == nil || participant.op == nil ||
+		participant.op.attach != a || participant.nonpublishing {
+		return
 	}
-	op.participants++
+	op := participant.op
+	a.frontendGateMu.Lock()
+	if !op.completed && !participant.finished && participant.suspendDepth == 0 {
+		participant.suspendDepth = 1
+		op.suspended++
+		if op.gateActive && op.participants > 0 && op.suspended == op.participants {
+			delete(a.frontendActive, op)
+			op.gateActive = false
+		}
+		a.frontendGateCond.Broadcast()
+	}
 	a.frontendGateMu.Unlock()
-	return &frontendOperationParticipant{op: op}, nil
 }
 
 // joinFrontendOperationSuspended admits a NONPUBLISHING request into an
@@ -1297,6 +1545,41 @@ func matchesExpectedTruncate(req *pfslocal.SetAttrRequest) bool {
 		req.GID == nil && !req.SetFlags
 }
 
+// refreshWindowOpenLocked reports whether an (itemID, size) size-set falls
+// inside a PINNED refresh window this daemon is executing right now.
+//
+// It is THE provenance predicate, and it is deliberately the only one. Both
+// call sites — admission (internalRefreshPending) and the setattr handler
+// (consumeExpectedTruncate) — ask it the same question and must get the same
+// answer for the same request, because a request one of them calls daemon
+// bookkeeping and the other calls an application mutation is precisely how a
+// refresh becomes a data-destroying truncate.
+//
+// It CONSUMES NOTHING. Provenance is a property of the open window, never a
+// token some other request can spend: a marker was a single-use token once,
+// and an application ftruncate to the same item and the same size — byte
+// identical on the wire, reaching the dispatcher first, possibly through a
+// hard-link alias — could spend it. The daemon's own upcall then arrived
+// markerless, was classified as an application mutation, and truncated
+// whatever a concurrent write had appended past the sampled size. While the
+// window is open EVERY matching size-set is answered locally; the marker is
+// retired only by the refresh that installed it (retireExpectedTruncate, by
+// seq), on every exit path of applyKernelRefresh.
+//
+// The accepted cost is unchanged and already documented on truncateNoteTTL: an
+// application truncate to the already-current size inside the window is
+// answered as a no-op, losing only an mtime bump the remote edit has superseded.
+// A truncate to any OTHER size, or one carrying a real attribute group, does
+// not match the window and reaches the authority as it must.
+func (a *attach) refreshWindowOpenLocked(itemID uint64, size int64) bool {
+	for _, note := range a.expectedTruncates {
+		if note.pinned && note.itemID == itemID && note.size == size {
+			return true
+		}
+	}
+	return false
+}
+
 // internalRefreshPending answers, WITHOUT consuming anything, whether body is
 // the upcall of a kernel-state refresh this daemon is issuing right now.
 //
@@ -1320,31 +1603,43 @@ func (a *attach) internalRefreshPending(body any) bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	for _, note := range a.expectedTruncates {
-		if !note.pinned {
-			continue
-		}
-		if note.itemID == req.Item.ItemID && int64(*req.Size) == note.size {
-			return true
-		}
-	}
-	return false
+	return a.refreshWindowOpenLocked(req.Item.ItemID, int64(*req.Size))
 }
 
 // consumeExpectedTruncate reports whether req is the daemon's own pending
-// kernel-size refresh for path, consuming the note on a match. Only a pure
-// size set (optionally with the times the kernel attaches to truncates) can
-// match; anything touching mode or ownership is a real application setattr.
-// A size mismatch retires the note: the kernel is performing a REAL truncate
-// that must reach the authority, and the stale note must not linger.
+// kernel-size refresh for path. Only a pure size set (optionally with the
+// times the kernel attaches to truncates) can match; anything touching mode or
+// ownership is a real application setattr.
+//
+// A PINNED window answers first and is NOT consumed — see
+// refreshWindowOpenLocked. This is the same decision admission already made
+// for the same request, and keeping it non-consuming is what stops one
+// request from spending another's provenance.
+//
+// Below the window sits the UNPINNED sweeper arm, which is single-use and
+// deadline-bounded. No marker should ever be found unpinned —
+// applyKernelRefresh retires its own on every exit path — so this is a
+// backstop for a marker that outlived its refresh through a path that does not
+// exist today, never the primary decision. A size mismatch retires an unpinned
+// note: the kernel is performing a REAL truncate that must reach the
+// authority, and the stale note must not linger. A pinned note is never
+// retired here even on mismatch; it belongs to the refresh that installed it.
 func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest) bool {
 	if !matchesExpectedTruncate(req) {
 		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.refreshWindowOpenLocked(req.Item.ItemID, int64(*req.Size)) {
+		return true
+	}
 	now := time.Now()
 	if note, ok := a.expectedTruncates[p]; ok {
+		if note.pinned {
+			// A pinned marker that did not match the window is a DIFFERENT
+			// refresh's. Leave it alone and let this real setattr through.
+			return false
+		}
 		delete(a.expectedTruncates, p)
 		return expectedTruncateLive(note, now) &&
 			note.itemID == req.Item.ItemID &&
@@ -1356,7 +1651,15 @@ func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest)
 	// refresh remains a no-op at the authority rather than becoming a real
 	// truncate of the item's new name. Multiple hard-link aliases retain
 	// separate path markers and are consumed one at a time.
+	//
+	// Only UNPINNED markers are reachable here: the pinned window was tested
+	// first, over every marker, on exactly this (itemID, size), so a pinned
+	// marker matching the condition below would already have returned true.
+	// The guard states that rather than relying on it.
 	for notedPath, note := range a.expectedTruncates {
+		if note.pinned {
+			continue
+		}
 		if !expectedTruncateLive(note, now) {
 			delete(a.expectedTruncates, notedPath)
 			continue

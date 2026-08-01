@@ -510,12 +510,21 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// controlWriteLocked is PHASE 2+3 of a control write: it holds the exclusive
-// namespace gate for the complete logical operation and performs nothing but
-// the mutation and its bookkeeping. Every step that can wait on the uplink has
+// controlWriteLocked is PHASE 2+3 of a control write: it takes the same
+// namespace locks a name-mutating kernel request takes for the identical
+// authority calls (lockExternalNamespaceMutation) and performs nothing but the
+// mutation and its bookkeeping. Every step that can wait UNBOUNDEDLY on the
+// uplink — the delegation transition claim and the operand releases — has
 // already happened in the caller's phase 1.
 //
-// laneChanged reports that the pre-resolved lane no longer holds. The gate is
+// The locks are SHARED plus one name stripe, never the mount-wide exclusive
+// gate. The authority calls below are real round trips, and pre-lock admission
+// does not make them nonblocking; holding an exclusive nsMu across them parked
+// every namespace read in the mount behind a writer-preferring RWMutex. The
+// kernel frontend runs Create/Open/Write/Setattr under nsMu.RLock plus the one
+// name stripe (ops.go), and the control plane is a frontend.
+//
+// laneChanged reports that the pre-resolved lane no longer holds. The locks are
 // released before it returns, so the caller re-admits holding nothing — the same
 // unwind the two kernel frontends run.
 func (a *attach) controlWriteLocked(
@@ -525,7 +534,7 @@ func (a *attach) controlWriteLocked(
 	node *clientcore.NodeState,
 	data []byte,
 ) (laneChanged bool, httpStatus int, httpMessage string, refreshItemID uint64) {
-	unlockNamespace := a.lockExternalNamespaceWrite()
+	unlockNamespace := a.lockExternalNamespaceMutation(p)
 	defer unlockNamespace()
 	if err := a.controlAdmissionError(); err != nil {
 		return false, http.StatusConflict, err.Error(), 0

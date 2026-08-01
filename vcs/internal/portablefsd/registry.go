@@ -1020,7 +1020,15 @@ type attach struct {
 	// admission park a real metadata or credit lane can impose. It exists to make
 	// the dispatcher-ordering contract testable: a request held here must be
 	// holding no frontend lock at all.
-	testMutationAdmissionBarrier func()
+	//
+	// It receives the ADMISSION context, because that is exactly what the
+	// delegation release the real classifier performs carries: the engine
+	// overlays the triggering context's VALUES onto its own so a frontend
+	// handoff hook can identify the in-flight operation the release belongs to
+	// (writeback.prepareReleaseLocked). A barrier handed anything else cannot
+	// stand in for that step — it would drop the publication identity that
+	// decides whether a handoff is waiting on its own operation.
+	testMutationAdmissionBarrier func(ctx context.Context)
 	// testForcedDetachFenced fires the instant a forced detach has parked its
 	// tail and fenced, BEFORE it takes the namespace locks. It exists to make
 	// that ordering testable: the escape hatch must reach its fence whatever is
@@ -3028,6 +3036,43 @@ func (a *attach) lockExternalNamespaceWrite() func() {
 	return func() {
 		a.nsMu.Unlock()
 		a.frontendSerial.Unlock()
+	}
+}
+
+// lockExternalNamespaceMutation is the control plane's phase 2 for a write that
+// mutates exactly ONE name through the authority.
+//
+// It is deliberately the same shape as a name-mutating kernel request's:
+// lockFrontendRequest's shared serialization mirror and the frontend stripe for
+// that name, then the handler's own SHARED namespace lock and the concrete name
+// stripe — the exact sequence attach.create and attach.setattr establish for the
+// identical authority calls.
+//
+// The control write used lockExternalNamespaceWrite instead, so its Lookup,
+// Create, Open, Write, Setattr and Getattr — six real round trips — ran under a
+// mount-wide EXCLUSIVE nsMu.Lock. Pre-lock admission bounds the CLASSIFICATION,
+// not the mutation, so that hold lasted as long as the uplink did; and because
+// Go's RWMutex is writer-preferring, it parked every nsMu.RLock behind it, which
+// is every lookup, getattr, read and readdir in the mount, on every path,
+// including paths the write never touches. A control write is not more
+// privileged than the kernel frontend performing the same mutation and must not
+// hold a heavier lock than it.
+//
+// The exclusive gate also provided mutual exclusion between two control writes
+// to the same name by accident. The concrete name stripe provides it on purpose,
+// which is the same guarantee the kernel frontend relies on.
+//
+// The order — mirror before concrete lock — is the global one documented above.
+func (a *attach) lockExternalNamespaceMutation(p string) func() {
+	a.frontendSerial.RLock()
+	unlockFrontendNames := a.lockFrontendRequestNames([]string{p})
+	a.nsMu.RLock()
+	unlockNames := a.lockNames(entryKey(p))
+	return func() {
+		unlockNames()
+		a.nsMu.RUnlock()
+		unlockFrontendNames()
+		a.frontendSerial.RUnlock()
 	}
 }
 

@@ -218,12 +218,38 @@ func (s *legacyStream) applied(through uint64, digest [32]byte) {
 // a crash between the reclaim and the RELEASE frames must still recover from.
 func reclaimSegmentPrefix(t *testing.T, dir string) {
 	t.Helper()
+	names := streamSegmentNames(t, dir)
+	removed := map[string]bool{}
+	for _, name := range names[:len(names)-1] {
+		removed[filepath.Base(name)] = true
+	}
+	reclaimSegmentSubset(t, dir, removed)
+}
+
+// streamSegmentNames lists a stream's segment files in ordinal order. Ordinals
+// are zero-padded in the filename, so lexical order is ordinal order.
+func streamSegmentNames(t *testing.T, dir string) []string {
+	t.Helper()
 	names, err := filepath.Glob(filepath.Join(dir, "wb-*.pfw"))
 	if err != nil {
 		t.Fatalf("glob segments: %v", err)
 	}
 	sort.Strings(names)
-	for _, name := range names[:len(names)-1] {
+	return names
+}
+
+// reclaimSegmentSubset materializes an ARBITRARY persisted-unlink subset: the
+// on-disk state a crash leaves when the reclaim ISSUED a set of unlinks but the
+// filesystem persisted only `removed` of them. Persistence order is not syscall
+// order, so the reachable subsets are decided by where the reclaim put its
+// directory barriers, not by the order it called Remove in. reclaimSegmentPrefix
+// is the special case where every unlink but the last segment's persisted.
+func reclaimSegmentSubset(t *testing.T, dir string, removed map[string]bool) {
+	t.Helper()
+	for _, name := range streamSegmentNames(t, dir) {
+		if !removed[filepath.Base(name)] {
+			continue
+		}
 		if err := os.Remove(name); err != nil {
 			t.Fatalf("reclaim %s: %v", filepath.Base(name), err)
 		}

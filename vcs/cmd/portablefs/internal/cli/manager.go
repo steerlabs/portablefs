@@ -140,6 +140,35 @@ func leaseEpochSuperseded(err error) bool {
 	return he.Code == "ACCESS_LEASE_EPOCH_SUPERSEDED"
 }
 
+// leaseUnresolved is the middle row of THE lease decision table — the one
+// table both lease transitions (renew and release) classify their answers
+// with, because the manager distinguishes exactly these three outcomes:
+//
+//	DONE       the transition happened: the lease was renewed, or it is over
+//	           (released here, or already ended — see leaseReleaseSatisfied).
+//	ENDED      a definite answer about this lease (leaseDefinitelyEnded) or any
+//	           other definitive refusal (CAS conflict, evicted receipt, 4xx).
+//	           Fail closed. A replacement lease identity is NEVER minted.
+//	UNRESOLVED nobody has answered yet: transport failure, an untyped 5xx, or
+//	           503 ACCESS_LEASE_EPOCH_SUPERSEDED. This function.
+//
+// UNRESOLVED means the SAME operationId is retained and the SAME request is
+// replayed — identical accessLeaseId, accessToken, expectedControlSeq — against
+// the same manager endpoint. There is no successor discovery: convergence comes
+// from replaying the same identity until whoever now owns the epoch answers
+// definitely. The replay is bounded by a deadline the protocol already defines,
+// the lease's OWN expiry, so the loop always terminates definitely; reaching
+// that bound is a DEFINITE FAILURE, never a completed transition.
+//
+// Both callers used to break this table in the same direction, and each break
+// was a silent lie: renewal put epoch supersession in the terminal set, so a
+// manager epoch change killed a mount whose lease the successor would have
+// renewed unchanged; release put it in the SATISFIED set, so unmount reported
+// success while the durable lease stayed active until its own expiry.
+func leaseUnresolved(err error) bool {
+	return !leaseDefinitelyEnded(err) && (leaseEpochSuperseded(err) || ambiguousFailure(err))
+}
+
 // leaseWire is the lease shape shared by the create/renew/release responses
 // (packages/protocol accessLeaseSchema, trimmed to the fields the CLI uses).
 type leaseWire struct {
@@ -332,23 +361,10 @@ func (k *leaseKeeper) snapshot() leaseState {
 	return k.lease
 }
 
-// renewOnce performs one renewal and classifies the answer into exactly three
-// outcomes — the same three the manager actually distinguishes:
-//
-//	RENEWED    a fresh lease slice; the identity is unchanged.
-//	ENDED      a definite answer about this lease (leaseDefinitelyEnded) or any
-//	           other definitive refusal (CAS conflict, evicted receipt, 4xx).
-//	           Fail closed. A replacement lease identity is NEVER minted here.
-//	UNRESOLVED nobody has answered yet: transport failure, an untyped 5xx, or
-//	           503 ACCESS_LEASE_EPOCH_SUPERSEDED. The SAME operationId is
-//	           retained and the SAME renewal is replayed next tick, bounded by
-//	           the lease's own expiry — the protocol's existing deadline, so
-//	           the loop always terminates definitely.
-//
-// The middle and last rows used to be one row. Epoch supersession sat in the
-// terminal set, so a manager epoch change (and, once the hosted broker
-// flattened 409 REVOKED into 404, an authority retirement too) killed a mount
-// whose lease the successor manager would have renewed unchanged.
+// renewOnce performs one renewal and classifies the answer with the shared
+// lease decision table (see leaseUnresolved): DONE is a fresh lease slice at
+// the unchanged identity, ENDED fails closed, UNRESOLVED replays the SAME
+// renewal next tick until the lease's own expiry.
 func (k *leaseKeeper) renewOnce(ctx context.Context) {
 	k.mu.Lock()
 	if k.terminal {
@@ -380,7 +396,7 @@ func (k *leaseKeeper) renewOnce(ctx context.Context) {
 		k.applyUpdate(*renewed)
 		return
 	}
-	if !leaseDefinitelyEnded(err) && (leaseEpochSuperseded(err) || ambiguousFailure(err)) {
+	if leaseUnresolved(err) {
 		// UNRESOLVED. Bound the replay by the lease's own expiry: past it the
 		// lease is over by definition, so continuing would be a retry loop
 		// with no definite end. Inside it, the same operationId replays.
@@ -442,10 +458,11 @@ func (k *leaseKeeper) run(ctx context.Context) {
 	}
 }
 
-// release ends the lease on unmount. Ambiguous failures retry the SAME
-// operationId within the caller's deadline. A definitive refusal or an
-// exhausted deadline is returned visibly; cleanup never creates another
-// lease or silently changes routes.
+// release ends the lease on unmount, classified by the shared lease decision
+// table (see leaseUnresolved). A definitive refusal, an exhausted caller
+// deadline, or an unresolved release that reached the lease's own expiry is
+// returned visibly; cleanup never creates another lease or silently changes
+// routes, and it never reports a release it did not observe.
 func (k *leaseKeeper) release(ctx context.Context) error {
 	opID, err := newOperationID()
 	if err != nil {
@@ -462,14 +479,20 @@ func (k *leaseKeeper) releaseWithOperation(ctx context.Context, opID string) err
 	delay := 100 * time.Millisecond
 	for {
 		err := k.manager.releaseAccessLease(ctx, opID, lease)
-		if err == nil {
-			return nil
+		if err == nil || leaseReleaseSatisfied(err) {
+			return nil // DONE: the lease is over.
 		}
-		if leaseReleaseSatisfied(err) {
-			return nil
+		if !leaseUnresolved(err) {
+			return err // ENDED: a definitive refusal. Report it.
 		}
-		if !ambiguousFailure(err) || leaseDefinitelyEnded(err) {
-			return err
+		// UNRESOLVED. Bound the replay by the lease's own expiry, exactly as
+		// renewal does: past it nothing this loop sends can end the lease any
+		// sooner than the ledger already will, so continuing would be a retry
+		// loop with no definite end. Inside it, the same operationId replays.
+		if expiry := time.UnixMilli(lease.ExpiresAtMs); !k.now().Before(expiry) {
+			return fmt.Errorf(
+				"release access lease %s reached its own expiry with the release still unresolved: %w",
+				lease.AccessLeaseID, err)
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -487,6 +510,14 @@ func (k *leaseKeeper) releaseWithOperation(ctx context.Context, opID string) err
 	}
 }
 
+// leaseReleaseSatisfied reports the DONE row for a release: a definite answer
+// that the lease is OVER, which is all the release wanted. Every code here is
+// a statement about THIS LEASE (leaseDefinitelyEnded, minus UNAUTHORIZED —
+// that one says our credential failed, not that the lease ended).
+//
+// 503 ACCESS_LEASE_EPOCH_SUPERSEDED is deliberately NOT here. It is a
+// statement about the MANAGER (see leaseEpochSuperseded) and says nothing
+// about whether the lease ended, so it is UNRESOLVED and replays.
 func leaseReleaseSatisfied(err error) bool {
 	var he *httpError
 	if !errors.As(err, &he) {
@@ -496,8 +527,7 @@ func leaseReleaseSatisfied(err error) bool {
 	case "ACCESS_LEASE_NOT_FOUND",
 		"ACCESS_LEASE_EXPIRED",
 		"ACCESS_LEASE_REVOKED",
-		"ACCESS_LEASE_RELEASED",
-		"ACCESS_LEASE_EPOCH_SUPERSEDED":
+		"ACCESS_LEASE_RELEASED":
 		return true
 	default:
 		return false
