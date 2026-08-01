@@ -71,7 +71,47 @@ import (
 //
 // One point, one phase, one order: every claim in the daemon is taken before
 // every frontend lock.
+//
+// It is also where a SIZE mutation takes the item-scoped token that orders it
+// against a pinned kernel refresh (refreshpin.go). The token is taken here, and
+// only here, for the same reason everything else unbounded is: a waiter must
+// hold no frontend lock, because the thing it waits for is a syscall whose own
+// upcall needs those locks to complete. It is taken AFTER the lane admission
+// rather than around it — an admission park is unbounded, and a token held
+// across one would refuse every refresh on the item for the length of a
+// backlog it has nothing to do with.
 func (a *attach) admitRequest(
+	ctx context.Context,
+	body any,
+	forceAuthority bool,
+) (context.Context, func(), int32, bool) {
+	opCtx, settle, eno, classified := a.admitLane(ctx, body, forceAuthority)
+	if eno != 0 {
+		return opCtx, settle, eno, classified
+	}
+	release, reserveEno := a.reserveSizeMutationForRequest(opCtx, body)
+	if reserveEno != 0 {
+		settle()
+		return opCtx, func() {}, reserveEno, classified
+	}
+	if release != nil {
+		lane := settle
+		settle = func() {
+			// Order mirrors acquisition: the token was taken after the lane and
+			// is given back before it, so nothing can observe a request holding
+			// the lane's claim without its size token.
+			release()
+			lane()
+		}
+	}
+	return opCtx, settle, 0, classified
+}
+
+// admitLane resolves one request's LANE — the data-plane credit grant or the
+// namespace-plane transition claim. It is the half of admission that can block
+// on the uplink, and it is separated from the size token above it so the token
+// is never held across that park.
+func (a *attach) admitLane(
 	ctx context.Context,
 	body any,
 	forceAuthority bool,

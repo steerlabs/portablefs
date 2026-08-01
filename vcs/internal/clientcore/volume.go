@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
@@ -125,6 +126,11 @@ type PrefetchProgress struct {
 type Volume struct {
 	client *fsproto.Client
 	owner  string
+
+	// setattrSizeFault/setattrMetadataFault are TEST seams; see
+	// SetSetattrFaultForTest. Zero is the production value and is inert.
+	setattrSizeFault     atomic.Int32
+	setattrMetadataFault atomic.Int32
 
 	// lifecycleMu is the frontend mutation gate. Every externally initiated
 	// filesystem mutation holds it for the whole operation; close takes it

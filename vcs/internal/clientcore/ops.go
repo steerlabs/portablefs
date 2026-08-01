@@ -2099,7 +2099,107 @@ func (v *Volume) readlink(ctx context.Context, permit *readView, path string) (s
 	return t, st
 }
 
+// SetattrOutcome is one setattr's COMMITTED result, and it exists for the same
+// reason WriteOutcome does — with one difference that makes it sharper.
+//
+// A setattr is not one mutation. It is up to three ordered ones (the size, then
+// the metadata groups, each an individually exact-once record), and the SIZE
+// GOES FIRST. So the shape that has no representation in a bare (attr, status)
+// pair is routine rather than exotic: the truncate commits, a later group fails
+// on its own terms — EIO, a lane change, a transport error — and the call
+// returns nothing but the error. The caller learns that its request failed and
+// learns NOTHING about the file having been resized, which is a fact about the
+// authority that has already happened and that no retry can undo.
+//
+// A frontend that keeps its own attribute store therefore publishes the
+// pre-truncate size for an inode the authority has already shortened, and its
+// refresh fence — whose whole predicate is "the registry has not moved" —
+// concludes that nothing happened. See portablefsd/mutationseq.go.
+//
+// SizeCommitted says the size group applied; Size is the size it applied, which
+// for a truncate is EXACT rather than a floor: the authority (or the engine)
+// applied precisely the requested value.
+type SetattrOutcome struct {
+	Size          int64
+	SizeCommitted bool
+}
+
+func (o *SetattrOutcome) recordSize(size int64) {
+	if o == nil {
+		return
+	}
+	o.Size, o.SizeCommitted = size, true
+}
+
+// SetattrFaultGroup names one of a setattr's ordered mutation groups for the
+// test seam below. The SIZE group runs first and the METADATA group second, and
+// which one fails decides which partial commit a caller is left holding.
+type SetattrFaultGroup uint8
+
+const (
+	// SetattrFaultSize fails the truncate before it is attempted, so nothing is
+	// committed by the setattr at all. It is how a caller that committed
+	// something ELSE first — a replacement write's bytes — is put in the state
+	// where its own progress is all there is to publish.
+	SetattrFaultSize SetattrFaultGroup = iota
+	// SetattrFaultMetadata fails the metadata groups AFTER the size has
+	// committed. It is the partial commit itself.
+	SetattrFaultMetadata
+)
+
+// SetSetattrFaultForTest makes one group of every subsequent setattr on this
+// volume answer st instead of running.
+//
+// It is a test seam and nothing else. Neither interleaving can be produced
+// against a healthy authority — a truncate that succeeds is followed by a chmod
+// that also succeeds — and they are precisely the interleavings in which a
+// discarded outcome loses a commit that really happened. fsproto.OK, the
+// production value, is inert.
+func (v *Volume) SetSetattrFaultForTest(group SetattrFaultGroup, st Status) {
+	if v == nil {
+		return
+	}
+	switch group {
+	case SetattrFaultSize:
+		v.setattrSizeFault.Store(st)
+	case SetattrFaultMetadata:
+		v.setattrMetadataFault.Store(st)
+	}
+}
+
+func (v *Volume) setattrSizeFaultStatus() Status {
+	if v == nil {
+		return fsproto.OK
+	}
+	return v.setattrSizeFault.Load()
+}
+
+func (v *Volume) setattrMetadataFaultStatus() Status {
+	if v == nil {
+		return fsproto.OK
+	}
+	return v.setattrMetadataFault.Load()
+}
+
+// Setattr is SetattrCommitted for callers that only need the post-op attributes.
 func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
+	attr, _, st := v.SetattrCommitted(ctx, path, n, req)
+	return attr, st
+}
+
+// SetattrCommitted applies one setattr and reports what it COMMITTED, whether
+// or not it succeeded as a whole.
+func (v *Volume) SetattrCommitted(
+	ctx context.Context, path string, n *NodeState, req SetattrRequest,
+) (fsproto.Attr, SetattrOutcome, Status) {
+	var out SetattrOutcome
+	attr, st := v.setattr(ctx, path, n, req, &out)
+	return attr, out, st
+}
+
+func (v *Volume) setattr(
+	ctx context.Context, path string, n *NodeState, req SetattrRequest, out *SetattrOutcome,
+) (fsproto.Attr, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -2111,7 +2211,7 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	defer v.installPostAttrs(ctx)
 
 	if oi := n.Orphan(); oi != 0 {
-		return v.setattrOrphan(ctx, oi, req)
+		return v.setattrOrphan(ctx, oi, req, out)
 	}
 	if v.wb != nil && v.isHardlink(n) {
 		if st, unwind := v.releaseHardlinkScopesResolved(
@@ -2124,23 +2224,34 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		n.mu.Lock()
 		if oi := n.orphanIno.Load(); oi != 0 {
 			n.mu.Unlock()
-			return v.setattrOrphan(ctx, oi, req)
+			return v.setattrOrphan(ctx, oi, req, out)
 		}
 		n.mu.Unlock()
 		var last writeback.Result
 		handledAll := true
 		mutated := false
 		if req.SetSize {
+			if st := v.setattrSizeFaultStatus(); st != fsproto.OK {
+				return fsproto.Attr{}, st
+			}
 			res, handled, err := v.wb.Truncate(ctx, path, req.Size)
 			if !handled {
 				handledAll = false
 			} else if err != nil {
 				return fsproto.Attr{}, statusErr(err)
 			} else {
+				// COMMITTED. The engine spliced the new extent map under its own
+				// lock and the composed entry is decided; everything below is a
+				// separate mutation that can fail on its own terms, and none of
+				// those failures unmakes this one.
+				out.recordSize(req.Size)
 				last, mutated = res, true
 			}
 		}
 		if handledAll && (req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags) {
+			if st := v.setattrMetadataFaultStatus(); st != fsproto.OK {
+				return fsproto.Attr{}, st
+			}
 			engReq := writeback.SetattrRequest{
 				SetMode: req.SetMode, Mode: modebits.CleanUnix(req.Mode),
 				SetTime: req.SetMTime, MtimeMs: req.MtimeMs,
@@ -2195,10 +2306,14 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 	n.mu.Lock()
 	if oi := n.orphanIno.Load(); oi != 0 {
 		n.mu.Unlock()
-		return v.setattrOrphan(authorityCtx, oi, req)
+		return v.setattrOrphan(authorityCtx, oi, req, out)
 	}
 	handleIno := authHandleIno(n)
 	if req.SetSize {
+		if st := v.setattrSizeFaultStatus(); st != fsproto.OK {
+			n.mu.Unlock()
+			return fsproto.Attr{}, st
+		}
 		st, err := v.client.TruncateHandleContext(authorityCtx, path, handleIno, req.Size)
 		if err != nil {
 			n.mu.Unlock()
@@ -2208,9 +2323,17 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 			n.mu.Unlock()
 			return fsproto.Attr{}, st
 		}
+		// COMMITTED at the authority. The metadata groups below are separate
+		// exact-once records and each can fail; the size is not un-applied by any
+		// of them, and the caller must be able to publish it anyway.
+		out.recordSize(req.Size)
 		v.recent.record(path)
 	}
 	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags {
+		if st := v.setattrMetadataFaultStatus(); st != fsproto.OK {
+			n.mu.Unlock()
+			return fsproto.Attr{}, st
+		}
 		st, err := v.client.SetattrVContext(authorityCtx, path, handleIno, setattrV(req))
 		if err != nil {
 			n.mu.Unlock()
@@ -2258,6 +2381,25 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 // pathname. It covers both a parked last-link orphan and a detached inode that
 // still has an authority-only hard-link alias unknown to this frontend.
 func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
+	attr, _, st := v.SetattrExactHandleCommitted(ctx, n, req)
+	return attr, st
+}
+
+// SetattrExactHandleCommitted is SetattrExactHandle reporting what it committed.
+// The split it carries is the same one Setattr has — size first, metadata after —
+// so it loses a committed truncate in exactly the same way if the outcome is
+// discarded.
+func (v *Volume) SetattrExactHandleCommitted(
+	ctx context.Context, n *NodeState, req SetattrRequest,
+) (fsproto.Attr, SetattrOutcome, Status) {
+	var out SetattrOutcome
+	attr, st := v.setattrExactHandle(ctx, n, req, &out)
+	return attr, out, st
+}
+
+func (v *Volume) setattrExactHandle(
+	ctx context.Context, n *NodeState, req SetattrRequest, out *SetattrOutcome,
+) (fsproto.Attr, Status) {
 	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
 		return fsproto.Attr{}, fsproto.EIO
@@ -2269,6 +2411,9 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 	}
 	orphanIno := n.Orphan()
 	if req.SetSize {
+		if st := v.setattrSizeFaultStatus(); st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
 		var st int32
 		var err error
 		if orphanIno != 0 {
@@ -2282,8 +2427,12 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 		if st != fsproto.OK {
 			return fsproto.Attr{}, st
 		}
+		out.recordSize(req.Size)
 	}
 	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags {
+		if st := v.setattrMetadataFaultStatus(); st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
 		st, err := v.client.SetattrVContext(authorityCtx, "", ino, setattrV(req))
 		if err != nil {
 			return fsproto.Attr{}, fsproto.EIO
@@ -2309,28 +2458,50 @@ func (v *Volume) SetattrExactHandle(ctx context.Context, n *NodeState, req Setat
 }
 
 func (v *Volume) SetattrOpenHandle(ctx context.Context, path string, n *NodeState, req SetattrRequest) (fsproto.Attr, Status) {
-	path = cleanVolumePath(path)
-	if path == "" {
-		return v.SetattrExactHandle(ctx, n, req)
-	}
-	ctx = withDelegatedBindingExpectation(ctx, path, n)
-	attr, st := v.Setattr(ctx, path, n, req)
-	if st == statusExactRetry {
-		return v.SetattrExactHandle(ctx, n, req)
-	}
+	attr, _, st := v.SetattrOpenHandleCommitted(ctx, path, n, req)
 	return attr, st
 }
 
-func (v *Volume) setattrOrphan(ctx context.Context, ino uint64, req SetattrRequest) (fsproto.Attr, Status) {
+// SetattrOpenHandleCommitted carries the committed outcome across the
+// exact-retry handoff as well: a truncate that landed on the pathname arm
+// before the retry was decided is committed at the authority, and the retry
+// re-applying the same exact size does not make it any less so.
+func (v *Volume) SetattrOpenHandleCommitted(
+	ctx context.Context, path string, n *NodeState, req SetattrRequest,
+) (fsproto.Attr, SetattrOutcome, Status) {
+	path = cleanVolumePath(path)
+	var out SetattrOutcome
+	if path == "" {
+		attr, st := v.setattrExactHandle(ctx, n, req, &out)
+		return attr, out, st
+	}
+	ctx = withDelegatedBindingExpectation(ctx, path, n)
+	attr, st := v.setattr(ctx, path, n, req, &out)
+	if st == statusExactRetry {
+		attr, st = v.setattrExactHandle(ctx, n, req, &out)
+	}
+	return attr, out, st
+}
+
+func (v *Volume) setattrOrphan(
+	ctx context.Context, ino uint64, req SetattrRequest, out *SetattrOutcome,
+) (fsproto.Attr, Status) {
 	authorityCtx := v.authorityWaitContext(ctx)
 	if req.SetSize {
+		if st := v.setattrSizeFaultStatus(); st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
 		if st, err := v.client.TruncateOrphanContext(authorityCtx, ino, req.Size); err != nil {
 			return fsproto.Attr{}, fsproto.EIO
 		} else if st != fsproto.OK {
 			return fsproto.Attr{}, st
 		}
+		out.recordSize(req.Size)
 	}
 	if req.SetMode || req.SetMTime || req.SetATime || req.SetUID || req.SetGID || req.SetFlags {
+		if st := v.setattrMetadataFaultStatus(); st != fsproto.OK {
+			return fsproto.Attr{}, st
+		}
 		// The parked inode is the identity. An empty path deliberately avoids
 		// presenting the removed or overwritten name as namespace evidence;
 		// exact-protocol handle addressing applies the metadata to ino.

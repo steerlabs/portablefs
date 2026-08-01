@@ -401,7 +401,34 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 	// budget, and its mutation path deliberately bypasses the remote Volume
 	// lifecycle. It needs the namespace gate and nothing else.
 	if graft := a.localDirFor(p); graft != "" {
+		// The control plane is a frontend, so it takes the item-scoped size
+		// token exactly where every other frontend does: BEFORE the namespace
+		// gate, holding nothing (refreshpin.go). Taken under
+		// lockExternalNamespaceWrite — which is mount-wide and EXCLUSIVE — a wait
+		// for a pinned refresh would park the very upcall that refresh needs
+		// answered in order to release the pin.
+		graftCtx, cancelGraft := clientcore.WithOperationDeadline(r.Context())
+		var graftItem uint64
+		if rec := a.itemByPath(p); rec != nil {
+			graftItem = rec.item.ItemID
+		}
+		releaseToken, tokenEno := a.reserveSizeMutation(graftCtx, graftItem)
+		if tokenEno != 0 {
+			cancelGraft()
+			writeHTTPError(
+				w, httpStatusForErr(tokenEno), errMessage("fs/write admission", tokenEno),
+			)
+			return
+		}
 		unlockNamespace := a.lockExternalNamespaceWrite()
+		releaseGraftToken := func() {
+			if releaseToken != nil {
+				releaseToken()
+				releaseToken = nil
+			}
+			cancelGraft()
+		}
+		defer releaseGraftToken()
 		if err := a.controlAdmissionError(); err != nil {
 			unlockNamespace()
 			writeHTTPError(w, http.StatusConflict, err.Error())
@@ -409,6 +436,11 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		}
 		refreshItemID, eno := a.writeLocalFile(p, graft, data)
 		unlockNamespace()
+		// The token is given back BEFORE the refresh this write owes the kernel:
+		// the reservation's whole meaning is "a size mutation is on its way to a
+		// commit", the commit and its publication are behind us, and a refresh
+		// cannot arm over a reservation that has not been released.
+		releaseGraftToken()
 		if eno != 0 {
 			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
 			return
@@ -478,12 +510,30 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 			)
 			return
 		}
+		// The item-scoped size token, taken after the lane admission and before
+		// the namespace gate, exactly as attach.admitRequest takes it for a
+		// kernel frontend request (refreshpin.go).
+		var tokenItem uint64
+		if rec := a.itemByPath(p); rec != nil {
+			tokenItem = rec.item.ItemID
+		}
+		releaseToken, tokenEno := a.reserveSizeMutation(opCtx, tokenItem)
+		if tokenEno != 0 {
+			settle()
+			writeHTTPError(
+				w, httpStatusForErr(tokenEno), errMessage("fs/write admission", tokenEno),
+			)
+			return
+		}
 		if probe := a.testControlAdmissionProbe; probe != nil {
 			probe(mutCtx)
 		}
 		laneChanged, status, message, itemID := a.controlWriteLocked(
 			mutCtx, vol, p, node, data,
 		)
+		if releaseToken != nil {
+			releaseToken()
+		}
 		settle()
 		if laneChanged {
 			// PHASE 3 refused to transition under the locks, and every lock is
@@ -564,6 +614,15 @@ func (a *attach) controlWriteLocked(
 		bracketed = existing.item.ItemID
 		settleMutation := a.beginItemMutation(bracketed)
 		defer func() { settleMutation(commit.published) }()
+		// EVERY exit below the first committed byte publishes what it committed.
+		//
+		// A control replacement is TWO mutations — the write, then the truncate
+		// that cuts whatever the old contents left behind — and the second one
+		// can fail while the first has already landed. Registered after the
+		// bracket, this defer therefore runs BEFORE the settle (defers unwind
+		// last-in-first-out), which is the only order in which the sequence can
+		// close over a registry that has been told about the commit.
+		defer a.publishSetattrCommit(ctx, vol, bracketed, commit)
 	}
 	attr, st := vol.Lookup(ctx, p)
 	existed := st == fsproto.OK
@@ -617,7 +676,31 @@ func (a *attach) controlWriteLocked(
 			errMessage("fs/write open", toDarwinErr(st)), 0
 	}
 	defer vol.CloseHandle(p, node)
-	if _, st := vol.Write(ctx, p, node, 0, data); st != fsproto.OK {
+	// THE FIRST OF THE TWO MUTATIONS, AND ITS PROGRESS IS RECORDED BEFORE ITS
+	// STATUS IS INSPECTED.
+	//
+	// This call used to be the compatibility wrapper, which discards the
+	// committing lane's WriteOutcome and reports only a count — so a control
+	// write that committed its bytes and then failed at the truncate below
+	// recorded NOTHING: commit.published stayed its initial true, the sequence
+	// closed over a registry still holding the pre-write size, and the HTTP
+	// error skipped the kernel refresh that would otherwise have converged it.
+	// A short write with a positive count lost the same way.
+	//
+	// What the write proves on its own is a FLOOR. The old contents are still
+	// past the bytes just written until the truncate cuts them, so the file is
+	// at least this long and may be longer; publishing it as exact would shrink
+	// a registry that is not wrong. The floor is upgraded to the exact size the
+	// moment the truncate commits.
+	out, st := vol.WriteCommitted(ctx, p, node, 0, data)
+	if out.Count > 0 {
+		floor := int64(out.Count)
+		if out.SizeKnown {
+			floor = out.Size
+		}
+		commit.recordFloor(floor)
+	}
+	if st != fsproto.OK {
 		if clientcore.LaneChanged(st) {
 			return true, 0, "", 0
 		}
@@ -635,9 +718,14 @@ func (a *attach) controlWriteLocked(
 	// mutation sequence over a registry that still said 0. The next refresh
 	// armed on that sample and ftruncated the kernel's vnode back over the bytes
 	// this write had just acknowledged to its HTTP caller.
-	post, st := vol.Setattr(ctx, p, node, clientcore.SetattrRequest{
+	post, truncated, st := vol.SetattrCommitted(ctx, p, node, clientcore.SetattrRequest{
 		Size: int64(len(data)), SetSize: true,
 	})
+	if truncated.SizeCommitted {
+		// The floor becomes exact: the old tail is cut and the file is now
+		// precisely this long.
+		commit.recordExact(truncated.Size)
+	}
 	if st != fsproto.OK {
 		if clientcore.LaneChanged(st) {
 			return true, 0, "", 0
@@ -645,7 +733,6 @@ func (a *attach) controlWriteLocked(
 		return false, httpStatusForErr(toDarwinErr(st)),
 			errMessage("fs/write truncate", toDarwinErr(st)), 0
 	}
-	commit.size, commit.sizeKnown, commit.published = int64(len(data)), true, false
 	if post.Kind != "" {
 		attr = post
 	}
@@ -671,7 +758,7 @@ func (a *attach) controlWriteLocked(
 		// The registration was refused. The bytes are committed anyway, so the
 		// item this handler bracketed must not be declared stable over a
 		// registry that still holds the pre-write size.
-		a.publishItemSizeLocked(bracketed, a.items[bracketed], commit.size, false)
+		a.publishItemSizeLocked(bracketed, a.items[bracketed], commit.size, commit.floor)
 		commit.published = true
 	}
 	ticket := a.endReincarnationOwnerLocked(savedOwner)
