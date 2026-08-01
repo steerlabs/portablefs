@@ -2,6 +2,7 @@ package portablefsd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 const (
@@ -758,6 +760,16 @@ func (a *attach) open(ctx context.Context, req *pfslocal.OpenRequest) (*pfslocal
 	return &pfslocal.OpenReply{Handle: h}, 0
 }
 
+// close retires one descriptor. IT IS BOUNDED LOCAL BOOKKEEPING AND NEVER A
+// DRAIN BARRIER: admitted write-back belongs to the engine and ships in the
+// background, so close(2) returns after WAL admission exactly like every other
+// filesystem. fsync, synchronize (the FSKit volume barrier), unmount and a
+// delegation recall remain the only places a caller waits for the tail.
+// Because the pfslocal client shares one framework callback's operation ID
+// with every request that callback issues, a close can arrive as a
+// continuation of a publishing callback; beginLogicalOperation admits such
+// requests permanently suspended so they can never queue behind an
+// overlapping delegation handoff and, through it, behind that scope's drain.
 func (a *attach) close(req *pfslocal.CloseRequest) (*pfslocal.CloseReply, int32) {
 	// Descriptor operations serialize on this handle. The shared namespace
 	// lock keeps item reclamation exclusive without globally blocking
@@ -842,6 +854,15 @@ func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal
 }
 
 func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfslocal.WriteReply, int32) {
+	// Data-lane admission happens HERE, before a single lock. See
+	// admitWriteCredit: the whole point of the frontend placement is that the
+	// pacing wait — the one thing in a write that is unbounded by the local
+	// machine — is taken while this request holds nothing at all.
+	ctx, data, releaseCredit, eno := a.admitWriteCredit(ctx, req)
+	defer releaseCredit()
+	if eno != 0 {
+		return nil, eno
+	}
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
 	unlockHandle := a.lockHandleOperation(req.Handle, false)
@@ -878,17 +899,17 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 			// The fd carries O_APPEND, so the host kernel resolves EOF and
 			// commits atomically. WriteAt is invalid on such an fd (ESPIPE on
 			// Darwin); Write is the only positionless form.
-			_, err = h.file.Write(req.Data)
+			_, err = h.file.Write(data)
 		case appendWrite:
 			// Per-request append on a descriptor that was not opened O_APPEND.
 			// A graft is machine-local, so the worst exposure is two handles
 			// on this one daemon; resolve EOF as late as possible.
 			var end int64
 			if end, err = h.file.Seek(0, io.SeekEnd); err == nil {
-				_, err = h.file.WriteAt(req.Data, end)
+				_, err = h.file.WriteAt(data, end)
 			}
 		default:
-			_, err = h.file.WriteAt(req.Data, int64(req.Offset))
+			_, err = h.file.WriteAt(data, int64(req.Offset))
 		}
 		if err != nil {
 			return nil, localErrno(err)
@@ -908,7 +929,7 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 			return nil, eno
 		}
 		return &pfslocal.WriteReply{
-			Written: uint32(len(req.Data)),
+			Written: uint32(len(data)),
 			Attr:    a.localAttrForRecordPath(attr, rec, scope, detached),
 		}, 0
 	}
@@ -920,13 +941,13 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	var st clientcore.Status
 	switch {
 	case appendWrite && detached:
-		n, st = vol.AppendExactHandle(ctx, h.state, req.Data)
+		n, st = vol.AppendExactHandle(ctx, h.state, data)
 	case appendWrite:
-		n, st = vol.WriteAppendOpenHandle(ctx, scope, h.state, req.Data)
+		n, st = vol.WriteAppendOpenHandle(ctx, scope, h.state, data)
 	case detached:
-		n, st = vol.WriteExactHandle(ctx, h.state, int64(req.Offset), req.Data)
+		n, st = vol.WriteExactHandle(ctx, h.state, int64(req.Offset), data)
 	default:
-		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), req.Data)
+		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), data)
 	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
@@ -949,6 +970,89 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 		Written: uint32(n),
 		Attr:    a.localAttrForRecordPath(attr, rec, scope, detached),
 	}, 0
+}
+
+// admitWriteCredit runs one write request's data-lane admission BEFORE the
+// handler takes a.nsMu, the handle operation gate, or a.mu for anything but the
+// two lock-free-shaped lookups it needs to classify the request.
+//
+// Why here and not in the engine. Engine.WriteAt/WriteAppend pace internally,
+// which is correct for a caller holding nothing — but this handler calls them
+// under a.nsMu.RLock. Go's RWMutex is writer-preferring: a paced write holding
+// the read side blocks any pending nsMu.Lock (rename, remove, delegation
+// reclaim), and every lookup/getattr/read arriving after that writer queues
+// behind IT. One slow uplink becomes a namespace-wide stall on paths that have
+// nothing to do with the backlog. Moving the wait in front of the lock is the
+// whole fix: what crosses into the locked region is a decided answer.
+//
+// It returns the operation context to use (carrying the grant), the prefix of
+// the request the caller may write, a release that refunds anything the write
+// never consumed, and an errno for a definite refusal. The release is always
+// non-nil and must be deferred BEFORE the errno is checked.
+//
+// Classification is deliberately conservative. Only requests that can reach the
+// write-back WAL are charged:
+//
+//   - empty payloads have nothing to admit;
+//   - a graft handle (h.file != nil) writes a host file directly;
+//   - a detached handle (scope == "") takes the pathless exact lane, which is
+//     authority-only by construction (Volume.WriteExactHandle);
+//   - a handle that is not writable, or a request whose handle or volume no
+//     longer resolves, is left alone so the handler produces its own exact
+//     errno instead of inheriting one from admission.
+//
+// Everything else is offered to Volume.AcquireDataCredit, which makes the final
+// delegated-vs-write-through decision from the engine's own covering-delegation
+// state. Both lookups used here (volOrErr, handleTarget) take a.mu.RLock only
+// and never wait, so this runs entirely outside the namespace lock.
+func (a *attach) admitWriteCredit(
+	ctx context.Context,
+	req *pfslocal.WriteRequest,
+) (context.Context, []byte, func(), int32) {
+	noop := func() {}
+	data := req.Data
+	if len(data) == 0 {
+		return ctx, data, noop, 0
+	}
+	vol, eno := a.volOrErr()
+	if eno != 0 {
+		return ctx, data, noop, 0
+	}
+	h, scope, herr := a.handleTarget(req.Handle)
+	if herr != 0 || scope == "" || h.file != nil || !h.write {
+		return ctx, data, noop, 0
+	}
+	creditCtx, granted, err := vol.AcquireDataCredit(ctx, scope, len(data))
+	if err != nil {
+		return ctx, data, noop, creditErrno(err)
+	}
+	release := func() { vol.ReleaseDataCredit(creditCtx) }
+	if granted < len(data) {
+		// A short grant is a healthy outcome, not a failure: write exactly the
+		// granted prefix and let the reply's written count tell the kernel to
+		// reissue the rest as a fresh operation, which is paced from scratch.
+		// The FSKit adapter already loops on a short count (VolumeCore.write)
+		// and FUSE replies support short writes natively.
+		data = data[:granted]
+	}
+	return creditCtx, data, release, 0
+}
+
+// creditErrno is the frontend's POSIX classification of a refused admission.
+// ENOSPC means this store can never fit the operation. A far end that stopped
+// answering is EIO — never ENOSPC, or an application learns to delete files to
+// fix a network partition. A cancelled request is EINTR, which is what the
+// kernel already means by an interrupted operation.
+func creditErrno(err error) int32 {
+	switch {
+	case errors.Is(err, writeback.ErrNoSpace):
+		return darwinENOSPC
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return darwinEINTR
+	default:
+		// writeback.ErrUplinkStalled and every lifecycle refusal.
+		return darwinEIO
+	}
 }
 
 func (a *attach) fsync(_ context.Context, req *pfslocal.FsyncRequest) int32 {

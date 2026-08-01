@@ -24,16 +24,19 @@ const (
 	// authority costs one bounded attempt on the backoff schedule and a
 	// force-close can cancel the in-flight attempt promptly.
 	flushAttemptTimeout = 30 * time.Second
-
-	// noProgressWindow is the sticky-degraded watchdog: pending work whose
-	// authority watermark has not advanced for this long degrades the mount.
-	noProgressWindow = 30 * time.Second
-
-	// watchdogInterval is the health sweep cadence. The watchdog runs on its
-	// own goroutine so it fires even while a flush attempt is blocked inside
-	// the network call.
-	watchdogInterval = time.Second
 )
+
+// noProgressWindow is the sticky-degraded watchdog: pending work whose
+// authority watermark has not advanced for this long degrades the mount. It is
+// also the credit gate's stall verdict — the one signal that turns "no credit
+// yet" into ErrUplinkStalled. A var so tests compress it; production never
+// changes it.
+var noProgressWindow = 30 * time.Second
+
+// watchdogInterval is the health sweep cadence. The watchdog runs on its own
+// goroutine so it fires even while a flush attempt is blocked inside the
+// network call. A var for the same reason as noProgressWindow.
+var watchdogInterval = time.Second
 
 // pendingRec indexes one unshipped mutation: its payload stays in the WAL on
 // disk and is re-read at send time, so a large backlog does not live on the
@@ -44,7 +47,12 @@ type pendingRec struct {
 	ordinal uint64
 	off     int64
 	length  int
-	digest  [32]byte // chain digest after this record
+	// data is the record's BULK payload size (zero for metadata records). The
+	// credit ledger is charged in exactly these bytes at admission and refilled
+	// in exactly these bytes when the authority applies them, so a grant and
+	// its refund are the same quantity and the ledger cannot drift.
+	data   int
+	digest [32]byte // chain digest after this record
 }
 
 type drainWaiter struct {
@@ -132,18 +140,27 @@ func (f *flusher) watchdogLoop() {
 			return
 		case <-t.C:
 			f.watchdog()
+			// Republish the setpoint on the same cadence so a collapsing rate
+			// shrinks the gate even with nobody waiting on it.
+			f.e.credits.tick()
 		}
 	}
 }
 
 // admit registers appended records. Caller holds e.mu (append order == seq
 // order).
-func (f *flusher) admit(scope string, results []appendResult) {
+// dataBytes, when non-nil, is parallel to results and carries each record's
+// bulk payload size (the data lane); nil means the metadata lane.
+func (f *flusher) admit(scope string, results []appendResult, dataBytes []int) {
 	f.mu.Lock()
-	for _, r := range results {
+	for i, r := range results {
+		bulk := 0
+		if i < len(dataBytes) {
+			bulk = dataBytes[i]
+		}
 		f.pending = append(f.pending, pendingRec{
 			seq: r.seq, scope: scope, ordinal: r.ordinal,
-			off: r.payloadOff, length: r.payloadLen, digest: r.digest,
+			off: r.payloadOff, length: r.payloadLen, data: bulk, digest: r.digest,
 		})
 		f.pendingBytes += int64(r.payloadLen)
 		f.perScope[scope]++
@@ -396,7 +413,10 @@ func (f *flusher) advance(through uint64) {
 		f.lastProgress = time.Now()
 	}
 	i := 0
+	var appliedData, appliedTotal int64
 	for i < len(f.pending) && f.pending[i].seq <= through {
+		appliedData += int64(f.pending[i].data)
+		appliedTotal += int64(f.pending[i].length)
 		f.pendingBytes -= int64(f.pending[i].length)
 		f.perScope[f.pending[i].scope]--
 		if f.perScope[f.pending[i].scope] == 0 {
@@ -438,6 +458,9 @@ func (f *flusher) advance(through uint64) {
 	for _, wtr := range ready {
 		wtr.ch <- nil
 	}
+	// The ONLY input to the credit controller: bytes the authority made
+	// durable. Never an attempt, never a heartbeat, never a local append.
+	f.e.credits.noteApplied(appliedData, appliedTotal, time.Now())
 	f.e.noteApplied(appliedNow, digestNow)
 }
 
@@ -480,6 +503,7 @@ func (f *flusher) park(err error) {
 	for _, wtr := range waiters {
 		wtr.ch <- err
 	}
+	f.e.credits.seal(err)
 	f.e.markStreamDead(err)
 	if f.e.job != nil {
 		f.e.job.update(func(j *RecoveryJob) {
@@ -524,6 +548,26 @@ func (f *flusher) watchdog() {
 			recs, bytes, f.lastProgress.Format(time.RFC3339), f.lastFailure))
 	}
 	f.mu.Unlock()
+}
+
+// uplinkStalled is the credit gate's stall verdict: pending work exists and the
+// authority watermark has not moved for the no-progress window (or the stream
+// parked terminally). It reads the SAME state the health watchdog latches, and
+// deliberately recomputes the window rather than waiting for the sweep tick, so
+// a paced writer's outcome does not depend on watchdog phase.
+func (f *flusher) uplinkStalled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.terminal != nil {
+		return true
+	}
+	if len(f.pending) == 0 {
+		return false
+	}
+	if f.degraded {
+		return true
+	}
+	return !f.lastProgress.IsZero() && time.Since(f.lastProgress) >= noProgressWindow
 }
 
 // notifyHealthLocked reports the sticky verdict without holding the caller's

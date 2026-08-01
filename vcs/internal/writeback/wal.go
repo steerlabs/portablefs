@@ -905,6 +905,26 @@ func (w *streamWAL) appendCostLocked(payloads [][]byte) (int64, error) {
 	return cost, nil
 }
 
+// maxAppendCost is the cost appendMutationsWithin could charge for payloads at
+// ANY occupancy: every frame plus a segment rollover, whether or not the active
+// segment has reached its threshold right now. A budget below this refuses the
+// append no matter how empty the stream is — which is exactly the condition
+// that stays a definite ENOSPC rather than something a drain could relieve.
+// Callers use it to tell "this can never fit" from "this does not fit yet".
+func (w *streamWAL) maxAppendCost(payloads [][]byte) (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	reemit, err := w.reemitCostLocked()
+	if err != nil {
+		return 0, err
+	}
+	cost := int64(segmentHeaderSize) + reemit
+	for _, p := range payloads {
+		cost += frameLen(len(p))
+	}
+	return cost, nil
+}
+
 // reemitCostLocked mirrors reemitLiveDelegationsLocked's byte cost by encoding
 // the same frames it would write.
 func (w *streamWAL) reemitCostLocked() (int64, error) {

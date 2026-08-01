@@ -465,13 +465,67 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 	return nil
 }
 
-// lstatMountPath and kernelMountsAt are the two ways this package learns about
-// a mount path. They are vars so CLI tests can drive the dead-volume and
-// stale-record classifications without a real wedged kernel mount.
+// lstatMountPath, kernelMountsAt and liveDaemonAttachMountPaths are the three
+// ways this package learns about a mount path. They are vars so CLI tests can
+// drive the dead-volume and stale-record classifications without a real wedged
+// kernel mount.
 var (
-	lstatMountPath = os.Lstat
-	kernelMountsAt = platformKernelMountsAt
+	lstatMountPath             = os.Lstat
+	kernelMountsAt             = platformKernelMountsAt
+	liveDaemonAttachMountPaths = defaultLiveDaemonAttachMountPaths
 )
+
+// unresponsiveMountPathErr reports whether err is the shape a mount point
+// takes once its filesystem stops answering: EIO once the kernel has declared
+// the volume dead, ETIMEDOUT while it is still waiting for an extension that
+// will never reply. Both mean "this pathname cannot be resolved THROUGH the
+// filesystem", never "this pathname does not name a PortableFS mount", so both
+// must route to the identification paths that do not touch the filesystem.
+func unresponsiveMountPathErr(err error) bool {
+	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ETIMEDOUT)
+}
+
+// defaultLiveDaemonAttachMountPaths reports the mount paths of every attach a
+// LIVE portablefsd currently owns. It deliberately answers "no attaches, no
+// error" when the daemon is unreachable: an absent daemon is not evidence
+// about the path, and the caller's underlying error must stand in that case.
+func defaultLiveDaemonAttachMountPaths() ([]string, error) {
+	cfg, err := fskitConfigFromEnv(os.Getenv)
+	if err != nil {
+		return nil, nil
+	}
+	ctl := newFsdControl(cfg.controlSock)
+	ctl.httpClient.Timeout = 3 * time.Second
+	if !ctl.healthy() {
+		return nil, nil
+	}
+	attaches, err := ctl.listAttaches()
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(attaches))
+	for _, attach := range attaches {
+		if attach.MountPath != "" {
+			paths = append(paths, filepath.Clean(attach.MountPath))
+		}
+	}
+	return paths, nil
+}
+
+// liveDaemonAttachAt reports whether a live daemon owns an attach whose mount
+// path is exactly path.
+func liveDaemonAttachAt(path string) (bool, error) {
+	paths, err := liveDaemonAttachMountPaths()
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range paths {
+		if candidate == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 // exactKernelMountAt returns the single kernel mount whose mount point is
 // exactly path, or nil when nothing is mounted there. Stacked mounts are an
@@ -508,17 +562,36 @@ func canonicalMountPath(input string) (string, error) {
 		return "", fmt.Errorf("mount path %s is a symlink; use a real directory", absolute)
 	}
 	if lstatErr != nil && !os.IsNotExist(lstatErr) {
-		// A dead volume answers EIO for every pathname that resolves THROUGH
-		// it — including its own mount point. Detaching is the remedy for
-		// exactly that state, so the CLI must not need a working filesystem to
-		// name the mount. Ask the kernel mount table instead: a mount whose
-		// mount point is this exact path proves the path is already canonical
-		// (the kernel records the fully resolved mount point), and the caller
-		// can proceed to the daemon-owned detach. With no such mount the error
-		// is about something else and stands.
+		// A dead volume answers EIO — or, while the kernel is still waiting on
+		// an extension that will never reply, ETIMEDOUT — for every pathname
+		// that resolves THROUGH it, including its own mount point. Detaching
+		// is the remedy for exactly that state, so the CLI must not need a
+		// working filesystem to name the mount. Ask the kernel mount table
+		// instead: a mount whose mount point is this exact path proves the
+		// path is already canonical (the kernel records the fully resolved
+		// mount point), and the caller can proceed to the daemon-owned detach.
 		mount, tableErr := exactKernelMountAt(absolute)
 		if tableErr == nil && mount != nil {
 			return absolute, nil
+		}
+		if tableErr == nil && unresponsiveMountPathErr(lstatErr) {
+			// THE DEAD-RESIDUE SHAPE. The kernel already tore its mount down
+			// (or never published one the table can see) while portablefsd
+			// still owns a live attach at this path, holding the write-back
+			// tail the detach has to drain and reconcile. Nothing about that
+			// state is ambiguous and nothing about it is recoverable through
+			// the filesystem: the daemon's own attach inventory names the
+			// mount, so the path is canonical and the caller proceeds to the
+			// daemon-owned detach. Refusing here left the daemon control API
+			// as the only recovery.
+			live, attachErr := liveDaemonAttachAt(absolute)
+			if attachErr == nil && live {
+				return absolute, nil
+			}
+			return "", errors.Join(
+				fmt.Errorf("inspect mount path %s: %w", absolute, lstatErr),
+				attachErr,
+			)
 		}
 		return "", errors.Join(
 			fmt.Errorf("inspect mount path %s: %w", absolute, lstatErr),

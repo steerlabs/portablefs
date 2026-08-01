@@ -2079,9 +2079,13 @@ func TestBoundedMemoryLargeSequentialWrite(t *testing.T) {
 	}
 }
 
-// TestBudgetENOSPC: at the hard WAL budget with nothing foldable the engine
-// refuses new delegated mutations instead of evicting unshipped data.
-func TestBudgetENOSPC(t *testing.T) {
+// TestBudgetSaturationRefusesRatherThanEvicting: at the hard WAL budget with
+// nothing foldable the engine refuses new delegated mutations instead of
+// evicting unshipped data. With a blackholed authority the refusal is the
+// credit gate's stalled-uplink verdict — the local store is intact, the far end
+// is not answering — and never a silent drop of acknowledged bytes.
+func TestBudgetSaturationRefusesRatherThanEvicting(t *testing.T) {
+	pinCreditTimings(t, 150*time.Millisecond, 25*time.Second, 200*time.Millisecond)
 	auth := newFakeAuthority()
 	auth.mu.Lock()
 	auth.dirs["d"] = true
@@ -2100,23 +2104,28 @@ func TestBudgetENOSPC(t *testing.T) {
 	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
 		t.Fatalf("create: %v %v", handled, err)
 	}
-	var sawNoSpace bool
+	var refused bool
 	chunk := bytes.Repeat([]byte("b"), 256<<10)
 	for off := int64(0); off < 8<<20; off += int64(len(chunk)) {
-		_, handled, err := e.WriteAt(ctx, "d/f", off, chunk)
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		_, handled, err := e.WriteAt(wctx, "d/f", off, chunk)
+		cancel()
 		if err != nil {
-			if !errors.Is(err, ErrNoSpace) {
-				t.Fatalf("write failed with %v, want ErrNoSpace", err)
+			if !errors.Is(err, ErrUplinkStalled) {
+				t.Fatalf("write failed with %v, want ErrUplinkStalled", err)
 			}
-			sawNoSpace = true
+			refused = true
 			break
 		}
 		if !handled {
 			t.Fatal("write fell through mid-delegation")
 		}
 	}
-	if !sawNoSpace {
+	if !refused {
 		t.Fatal("budget never enforced")
+	}
+	if used := e.Status().WALBytes; used > 1<<20 {
+		t.Fatalf("stream WAL reached %d bytes, past its %d hard cap", used, 1<<20)
 	}
 }
 

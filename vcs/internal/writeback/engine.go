@@ -303,9 +303,10 @@ type Engine struct {
 	// with one atomic load.
 	held atomic.Int64
 
-	// walFull mirrors "stream WAL is at or over budget" so the data plane's
-	// pre-admission exhaustion check is one atomic load in the steady state.
-	// It is advisory: every definite verdict is re-derived under e.mu.
+	// walFull mirrors "the stream WAL leaves no headroom for the bulk-data
+	// lane". It is advisory — every definite verdict is re-derived under e.mu —
+	// and is published in Status so an operator can see the data lane sitting
+	// at its cap while metadata keeps flowing on the reserve.
 	walFull atomic.Bool
 
 	acquireMu sync.Mutex
@@ -318,6 +319,12 @@ type Engine struct {
 	wal *streamWAL
 	fl  *flusher
 	job *jobState
+
+	// credits is the drain-time admission gate for bulk data (see credit.go).
+	// It paces data mutations against the measured authority-applied rate so
+	// resident debt stays drainable inside one barrier bound; it never moves
+	// the hard WAL cap, which the exact reservation still enforces underneath.
+	credits *creditController
 
 	// createWAL is fixed to createStreamWAL in production and replaceable by
 	// package tests for deterministic initialization-failure coverage.
@@ -401,6 +408,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		createWAL:   createStreamWAL,
 	}
 	e.ctx, e.cancelCtx = context.WithCancel(context.Background())
+	e.credits = newCreditController(e)
 	e.fl = newFlusher(e)
 	e.recovery = newRecoveryRunner(e)
 	maxEpoch := e.recovery.discover()
@@ -811,6 +819,37 @@ func (e *Engine) fallThroughLocked(ctx context.Context, paths ...string) error {
 // ENOSPC, which is not a refusal at all — it is a mid-append local WAL failure
 // that fails the whole mount closed.
 func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]appendResult, error) {
+	return e.appendLaneLocked(d, records, laneMetadata)
+}
+
+// walLane selects which slice of the hard cap an append may consume.
+//
+// The cap is one number and stays one number; the lane only decides how much
+// of it a given record class is allowed to reach. Bulk data reserves against
+// dataBudgetBytes (cap minus the metadata reserve), so a data flood can never
+// consume the last segment. Metadata reserves against the whole cap, so it
+// always has that segment available and stays instant while data is paced.
+// Nothing about ordering changes: both lanes append to the same dense stream
+// in sequence order, and the flusher ships that stream untouched.
+type walLane int
+
+const (
+	// laneMetadata is every namespace/attribute/control record: create, mkdir,
+	// symlink, remove, rename, setattr, xattr — and truncate, whose record
+	// carries no bulk bytes at all. Never credit-charged.
+	laneMetadata walLane = iota
+	// laneData is bulk file data (OpWrite payloads). Credit-charged.
+	laneData
+)
+
+func (e *Engine) laneBudget(lane walLane) int64 {
+	if lane == laneData {
+		return e.dataBudgetBytes()
+	}
+	return e.cfg.BudgetBytes
+}
+
+func (e *Engine) appendLaneLocked(d *delegation, records []wal.Record, lane walLane) ([]appendResult, error) {
 	if err := e.ensureStreamLocked(); err != nil {
 		return nil, err
 	}
@@ -822,7 +861,8 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 		}
 		payloads[i] = p
 	}
-	results, err := e.wal.appendMutationsWithin(payloads, e.cfg.BudgetBytes)
+	budget := e.laneBudget(lane)
+	results, err := e.wal.appendMutationsWithin(payloads, budget)
 	if errors.Is(err, ErrNoSpace) {
 		// One relief pass: fold what the authority has applied and reclaim the
 		// segments that frees, then re-offer the SAME reservation. Relief is
@@ -832,13 +872,25 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 		if merr := e.MutationError(); merr != nil {
 			return nil, merr
 		}
-		results, err = e.wal.appendMutationsWithin(payloads, e.cfg.BudgetBytes)
+		results, err = e.wal.appendMutationsWithin(payloads, budget)
 	}
 	if errors.Is(err, ErrNoSpace) {
 		// Nothing was written, so nothing is latched: the engine stays healthy
 		// and keeps its delegations, and this exact mutation is admitted again
 		// once the uplink applies the backlog.
 		e.noteBudgetLocked()
+		if lane == laneData {
+			// The credit gate's ledger counts payload bytes; the hard cap
+			// counts framed on-disk bytes and whole unreclaimed segments, so
+			// the cap can bind first for a shape the gate thought fit. That is
+			// NOT the definite condition — an emptier stream would take this
+			// append. Report it as missing headroom so the caller paces on
+			// applied progress, exactly like a credit wait. ENOSPC stays
+			// reserved for the append that cannot fit an empty lane.
+			if cost, cerr := e.wal.maxAppendCost(payloads); cerr == nil && cost <= budget {
+				return nil, errDataHeadroom
+			}
+		}
 		return nil, ErrNoSpace
 	}
 	if err != nil {
@@ -847,15 +899,24 @@ func (e *Engine) appendRecordsLocked(d *delegation, records []wal.Record) ([]app
 	for i := range results {
 		records[i].Seq = results[i].seq
 	}
-	e.fl.admit(d.scope, results)
+	var dataBytes []int
+	if lane == laneData {
+		dataBytes = make([]int, len(records))
+		for i := range records {
+			dataBytes[i] = len(records[i].Data)
+		}
+	}
+	e.fl.admit(d.scope, results, dataBytes)
 	e.noteBudgetLocked()
 	return results, nil
 }
 
-// walExhaustedLocked reports that the stream WAL is at or over its on-disk
-// budget. Caller holds e.mu.
+// walExhaustedLocked reports that the stream WAL leaves no headroom for the
+// BULK-DATA lane, whose cap is the budget minus the metadata reserve. The
+// metadata lane still has that reserve by construction, which is the whole
+// point of the split. Caller holds e.mu.
 func (e *Engine) walExhaustedLocked() bool {
-	return e.wal != nil && e.wal.DiskBytes() >= e.cfg.BudgetBytes
+	return e.wal != nil && e.wal.DiskBytes() >= e.dataBudgetBytes()
 }
 
 // relieveBudgetLocked folds authority-applied extents and reclaims fully
@@ -886,7 +947,7 @@ func (e *Engine) noteBudgetLocked() {
 	e.walFull.Store(e.walExhaustedLocked())
 }
 
-// ─── bounded-resource admission (the data plane never waits on the uplink) ───
+// ─── bounded-resource admission ──────────────────────────────────────────────
 //
 // Every locally-acknowledged data mutation consumes two bounded local
 // resources: stream WAL bytes on disk, and extents in the file's overlay.
@@ -898,65 +959,106 @@ func (e *Engine) noteBudgetLocked() {
 // it until the frontend's operation deadline expired and surfaced ETIMEDOUT,
 // while every metadata and read operation queued behind those writers on the
 // frontend's own shared per-attach and per-mount admission gates, and the
-// kernel finally declared the whole volume dead.
+// kernel finally declared the whole volume dead. The engine therefore never
+// drains to escape a bound.
 //
-// Exhaustion of a bounded store is a DEFINITE condition, so it gets a definite
-// POSIX answer. The data plane relieves once and then refuses with ENOSPC. It
-// never initiates or joins a delegation drain, so there is no wait to wake:
-// after the fix no data admission is ever blocked on the budget, and callers
-// see either a local acknowledgement or ErrNoSpace. Relief is not self-healing
-// either — the refusal lasts exactly as long as the bound binds, and the next
-// admission after the authority applies the backlog is accepted normally.
+// The OVERLAY bound stays a definite ENOSPC: an extent set at its hard bound
+// is a local structural limit, and the operations that would grow it past it
+// cannot be paced into fitting.
+//
+// The WAL-BYTES bound is no longer answered at the cliff. Instant ENOSPC at
+// full was the emergency behaviour that kept a saturated mount alive; the
+// credit gate (credit.go) replaces it with an admission RATE derived from the
+// measured authority-applied rate. A data mutation now waits, bounded, for
+// credit and completes paced on a slow-but-draining uplink; only an uplink the
+// watchdog declares stalled produces an error (ErrUplinkStalled, EIO-class),
+// and only an operation larger than the whole data lane produces ENOSPC.
+// Metadata is never credit-charged and keeps its reserve, so it stays instant
+// in every one of those states.
 
 // spaceVerdict is the pre-admission decision for one data mutation.
 type spaceVerdict int
 
 const (
-	// spaceProceed: bounded local resources have room; admit normally.
+	// spaceProceed: the mutation has credit; admit normally.
 	spaceProceed spaceVerdict = iota
-	// spaceAuthority: the stream is full but nothing is delegated at this
+	// spaceAuthority: credit is unavailable but nothing is delegated at this
 	// path, so the mutation's lane consumes no stream budget at all. The
 	// authority lane is selected WITHOUT a drain (there is no grant to
-	// release), which keeps a full local store from failing write-through.
+	// release), which keeps a saturated local store from failing write-through.
 	spaceAuthority
-	// spaceExhausted: the mutation would consume a bounded local resource
-	// that only the uplink can free. Definite ENOSPC.
+	// spaceExhausted: a definite refusal (ENOSPC for an operation larger than
+	// the lane, ErrUplinkStalled for a stalled authority, or a latched engine
+	// failure). The error carries which.
 	spaceExhausted
 )
 
-// spaceForDataMutation is the data plane's pre-admission budget verdict. It
-// runs BEFORE admit so an exhausted stream never acquires a grant it cannot
-// use and never drains an ancestor grant it would have pushed down through.
-// The steady-state path is one atomic load.
-func (e *Engine) spaceForDataMutation(path string) (spaceVerdict, error) {
-	if !e.walFull.Load() {
-		return spaceProceed, nil
+// admitDataBytes is the data plane's pre-lock admission for n bulk bytes. It
+// runs BEFORE admit — and therefore before e.mu, before any grant acquisition
+// and before any handle lock — so a paced writer never holds anything a recall,
+// a barrier or a metadata mutation needs. The steady-state path is one atomic
+// load and one CAS inside the credit gate.
+//
+// It returns the number of bytes the caller may write. A short grant is normal
+// and becomes a POSIX short write; zero-with-nil-error never escapes here,
+// because the engine's own contract for a slow link is a paced completion, so
+// this loops until credit arrives, the uplink is declared stalled, or ctx ends.
+func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int64, spaceVerdict, error) {
+	if n <= 0 {
+		return 0, spaceProceed, nil
+	}
+	if e.credits.tryFast(n) {
+		return n, spaceProceed, nil
 	}
 	if err := e.MutationError(); err != nil {
-		return spaceExhausted, err
+		return 0, spaceExhausted, err
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed || e.frozen {
+	lifecycle := e.closed || e.frozen
+	covered := e.coveringLocked(path) != nil
+	if !lifecycle && e.streamOpen && e.walExhaustedLocked() {
+		// One relief pass before pacing: folding applied extents and reclaiming
+		// the segments that frees is what the old fail-fast floor did, and it
+		// can lift the hard bound immediately.
+		e.relieveBudgetLocked()
+	}
+	e.mu.Unlock()
+	if lifecycle {
 		// Lifecycle verdicts belong to admit, which owns the single
-		// "not accepting mutations" answer. Never pre-empt it with ENOSPC.
-		return spaceProceed, nil
+		// "not accepting mutations" answer. Never pre-empt it here.
+		return 0, spaceProceed, nil
 	}
-	if !e.streamOpen || !e.walExhaustedLocked() {
-		e.noteBudgetLocked()
-		return spaceProceed, nil
+	if !covered {
+		// No grant covers this path: write-through consumes no stream budget
+		// and has no grant to release, so there is nothing to wait for.
+		return 0, spaceAuthority, nil
 	}
-	e.relieveBudgetLocked()
-	if err := e.MutationError(); err != nil {
-		return spaceExhausted, err
+	if frontendPaced(ctx) {
+		// The frontend already ran this operation's admission OUTSIDE its
+		// namespace and handle locks and declined to charge, because at that
+		// moment nothing covered this path. Reaching here means a delegation
+		// appeared in between. Queueing now would move the wait back under the
+		// caller's locks — the one thing frontend pacing exists to prevent — so
+		// take the authority lane instead. See WithFrontendPacing.
+		return 0, spaceAuthority, nil
 	}
-	if !e.walExhaustedLocked() {
-		return spaceProceed, nil
+	for {
+		granted, err := e.credits.acquire(ctx, n)
+		if err != nil {
+			if granted > 0 {
+				e.credits.refund(int64(granted))
+			}
+			return 0, spaceExhausted, err
+		}
+		if granted > 0 {
+			return int64(granted), spaceProceed, nil
+		}
+		// Zero credit with a healthy uplink: the link is simply slower than one
+		// wait cap. Keep pacing — ctx bounds the total wait.
+		if err := ctx.Err(); err != nil {
+			return 0, spaceExhausted, err
+		}
 	}
-	if e.coveringLocked(path) == nil {
-		return spaceAuthority, nil
-	}
-	return spaceExhausted, nil
 }
 
 // nowMs is stubbed in tests.
@@ -1385,50 +1487,97 @@ func (e *Engine) WriteAt(ctx context.Context, path string, off int64, data []byt
 	if off < 0 {
 		return Result{}, false, errors.New("writeback: negative write offset")
 	}
-	switch verdict, err := e.spaceForDataMutation(path); {
-	case err != nil:
-		return Result{}, true, err
-	case verdict == spaceExhausted:
-		return Result{}, true, ErrNoSpace
-	case verdict == spaceAuthority:
-		return Result{}, false, nil
-	}
-	adm, ok, err := e.admit(ctx, path)
-	if !ok {
-		return Result{}, false, err
-	}
-	defer e.release(adm)
-	fv, ok := e.fileViewLocked(path)
-	if !ok {
-		return Result{}, false, e.fallThroughLocked(ctx, path)
-	}
-	return e.writeLocked(ctx, adm.d, path, fv, off, data)
+	return e.pacedWrite(ctx, path, data, func(*fileView) int64 { return off })
 }
 
 // WriteAppend acknowledges an O_APPEND write at the locally-authoritative
 // EOF (the exclusive delegation makes the local size exact).
 func (e *Engine) WriteAppend(ctx context.Context, path string, data []byte) (Result, bool, error) {
 	// The O_APPEND lane is the exact shape production saturated. It gets the
-	// same pre-admission verdict as a positional write: a full store answers
-	// ENOSPC, never a drain of the tail that filled it.
-	switch verdict, err := e.spaceForDataMutation(path); {
-	case err != nil:
-		return Result{}, true, err
-	case verdict == spaceExhausted:
-		return Result{}, true, ErrNoSpace
-	case verdict == spaceAuthority:
-		return Result{}, false, nil
+	// same pre-admission credit as a positional write: a saturated store paces
+	// the writer against the measured uplink, never drains the tail that filled
+	// it. EOF is resolved under the same e.mu that admits the append.
+	return e.pacedWrite(ctx, path, data, func(fv *fileView) int64 { return fv.entry.Size })
+}
+
+// pacedWrite is the shared body of WriteAt/WriteAppend: acquire data credit
+// outside every lock, write what was granted, and retry — paced on applied
+// progress — when the hard cap (rather than the credit gate) was the binding
+// constraint. `at` resolves the write offset under e.mu.
+func (e *Engine) pacedWrite(ctx context.Context, path string, data []byte, at func(*fileView) int64) (Result, bool, error) {
+	want := int64(len(data))
+	// A frontend that already took credit before its own locks passes it down;
+	// consume that grant once instead of charging twice. TAKING it here (rather
+	// than reading it) is what makes settlement exactly-once: whatever this
+	// write does not remove stays on the ctx for the frontend's own reclaim, and
+	// what it does remove is settled below by writeGranted.
+	pre := takeDataCredit(ctx, want)
+	havePre := pre > 0
+	for {
+		granted, verdict, err := want, spaceProceed, error(nil)
+		if havePre {
+			granted, havePre = pre, false
+		} else {
+			granted, verdict, err = e.admitDataBytes(ctx, path, want)
+		}
+		switch {
+		case err != nil:
+			return Result{}, true, err
+		case verdict == spaceAuthority:
+			return Result{}, false, nil
+		}
+		res, handled, err := e.writeGranted(ctx, path, data[:granted], granted, at)
+		if !errors.Is(err, errDataHeadroom) {
+			return res, handled, err
+		}
+		if records, _ := e.Pending(); records == 0 {
+			// The hard cap refuses with NOTHING left unshipped: the authority
+			// has applied everything and relief already reclaimed all it can.
+			// No amount of waiting can free another byte, so the condition is
+			// definite after all and gets the definite POSIX answer.
+			return Result{}, true, ErrNoSpace
+		}
+		if frontendPaced(ctx) {
+			// A frontend-paced operation is INSIDE its namespace and handle
+			// locks by the time it gets here, and it already spent its whole
+			// admission budget outside them. There is nothing left to spend in
+			// here, so it does not wait for applied progress: it takes the
+			// authority lane, which makes real forward progress precisely
+			// because it does not consume the resource that is exhausted. The
+			// grant is refunded by writeGranted above, and the next write on
+			// this path is probed and paced from outside the lock as usual.
+			return Result{}, false, nil
+		}
+		// The credit gate said yes and the hard cap said not yet. Wait for the
+		// one event that frees hard-cap headroom, then re-enter admission —
+		// which re-checks delegation state, lifecycle and credit from scratch.
+		if werr := e.credits.waitForApplied(ctx); werr != nil {
+			return Result{}, true, werr
+		}
 	}
-	adm, ok, err := e.admit(ctx, path)
+}
+
+// writeGranted runs ONE admitted write attempt and settles its credit grant:
+// every granted byte that does not become WAL bytes is refunded, after e.mu is
+// released. This is what keeps a grant racing a reservation failure honest —
+// the hard bound holds either way, and the ledger does not drift.
+func (e *Engine) writeGranted(ctx context.Context, path string, data []byte, granted int64, at func(*fileView) int64) (res Result, handled bool, err error) {
+	used := int64(0)
+	defer func() { e.credits.refund(granted - used) }()
+	adm, ok, aerr := e.admit(ctx, path)
 	if !ok {
-		return Result{}, false, err
+		return Result{}, false, aerr
 	}
 	defer e.release(adm)
 	fv, ok := e.fileViewLocked(path)
 	if !ok {
 		return Result{}, false, e.fallThroughLocked(ctx, path)
 	}
-	return e.writeLocked(ctx, adm.d, path, fv, fv.entry.Size, data)
+	res, handled, err = e.writeLocked(ctx, adm.d, path, fv, at(fv), data)
+	if err == nil && handled {
+		used = int64(len(data))
+	}
+	return res, handled, err
 }
 
 // fileExtentBoundBindsLocked reports that the mutation would leave fv's
@@ -1500,7 +1649,7 @@ func (e *Engine) writeLocked(ctx context.Context, d *delegation, path string, fv
 		// grow this far. Definite bounded-resource exhaustion: ENOSPC.
 		return Result{}, true, ErrNoSpace
 	}
-	results, err := e.appendRecordsLocked(d, records)
+	results, err := e.appendLaneLocked(d, records, laneData)
 	if err != nil {
 		return Result{}, true, err
 	}
@@ -1530,14 +1679,12 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) (Result,
 	if size < 0 {
 		return Result{}, false, errors.New("writeback: negative truncate size")
 	}
-	switch verdict, err := e.spaceForDataMutation(path); {
-	case err != nil:
-		return Result{}, true, err
-	case verdict == spaceExhausted:
-		return Result{}, true, ErrNoSpace
-	case verdict == spaceAuthority:
-		return Result{}, false, nil
-	}
+	// Truncate is a data-plane operation whose RECORD carries no bulk bytes: it
+	// is one size word. It is therefore never credit-charged and rides the
+	// metadata lane's budget, which also means a shrink or a truncate-to-zero —
+	// the cheapest way an application can free the resource it is out of — is
+	// never refused for want of space a data flood took. Its bounded resource
+	// is the overlay extent set, checked below.
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
 		return Result{}, false, err
@@ -1947,6 +2094,9 @@ func (e *Engine) CloseWithBarrier(ctx context.Context, barrier func() error) err
 	e.frozen = true
 	w := e.wal
 	e.mu.Unlock()
+	// No new data admission, and every paced writer wakes now with a definite
+	// outcome instead of sitting in the queue while the close drains.
+	e.credits.freeze(ErrFenced)
 	if w != nil {
 		if err := w.Sync(); err != nil {
 			e.thawAfterFailedClose()
@@ -1974,6 +2124,7 @@ func (e *Engine) CloseWithBarrier(ctx context.Context, barrier func() error) err
 	e.mu.Lock()
 	e.closed = true
 	e.mu.Unlock()
+	e.credits.seal(ErrFenced)
 	e.stopIdle()
 	e.cancelCtx()
 	e.fl.stop()
@@ -2002,6 +2153,7 @@ func (e *Engine) thawAfterFailedClose() {
 		e.frozen = false
 	}
 	e.mu.Unlock()
+	e.credits.thaw()
 }
 
 // ForceClose makes the WAL and recovery job durable and closes locally
@@ -2013,6 +2165,7 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 	w := e.wal
 	job := e.job
 	e.mu.Unlock()
+	e.credits.seal(ErrFenced)
 	e.signalIdleStop()
 	e.cancelCtx()
 	e.fl.stop()
@@ -2073,6 +2226,7 @@ func (e *Engine) Abandon() {
 	e.forcing = true
 	w := e.wal
 	e.mu.Unlock()
+	e.credits.seal(ErrFenced)
 	e.signalIdleStop()
 	e.cancelCtx()
 	e.fl.stop()
@@ -2097,7 +2251,21 @@ type Status struct {
 	LastProgressMs  int64
 	WALBytes        int64
 	WALBudget       int64
-	Jobs            []RecoveryJob
+	// Drain-time credit control (see credit.go). CreditSetpoint is the
+	// adapted operating limit on resident unapplied bulk data, CreditDebt is
+	// how much of it is outstanding, CreditCeiling is the data lane's hard cap,
+	// AppliedRateBps is the measured authority-applied rate the setpoint is
+	// derived from, and CreditWaiters is how many data mutations are currently
+	// paced (holding no locks).
+	CreditSetpoint int64
+	CreditDebt     int64
+	CreditCeiling  int64
+	AppliedRateBps float64
+	CreditWaiters  int
+	// DataLaneFull reports the bulk-data lane sitting at its hard cap while the
+	// metadata reserve still holds.
+	DataLaneFull bool
+	Jobs         []RecoveryJob
 }
 
 // DelegationStatus is one held scope's view.
@@ -2114,6 +2282,8 @@ func (e *Engine) Status() Status {
 		st.LastFailure = err.Error()
 	}
 	st.WALBudget = e.cfg.BudgetBytes
+	st.CreditSetpoint, st.CreditDebt, st.CreditCeiling, st.AppliedRateBps, st.CreditWaiters = e.credits.status()
+	st.DataLaneFull = e.walFull.Load()
 	e.mu.RLock()
 	if e.wal != nil {
 		st.AdmittedThrough = e.wal.LastSeq()
