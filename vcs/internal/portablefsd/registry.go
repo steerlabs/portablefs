@@ -112,8 +112,9 @@ type attachStatus struct {
 
 // writeBackStatus is the durability-debt view of an attach: the engine's
 // full health snapshot — the unshipped acknowledged backlog, the sticky
-// degraded verdict, the held delegations, and every parked stream the
-// recovery machinery or an operator must still resolve.
+// degraded verdict, the drain-time credit control that paces bulk data, the
+// held delegations, and every parked stream the recovery machinery or an
+// operator must still resolve.
 type writeBackStatus struct {
 	PendingRecords  int              `json:"pendingRecords"`
 	PendingBytes    int64            `json:"pendingBytes"`
@@ -124,7 +125,26 @@ type writeBackStatus struct {
 	LastFailure     string           `json:"lastFailure,omitempty"`
 	Delegations     []delegationView `json:"delegations"`
 	WALBytes        int64            `json:"walBytes,omitempty"`
-	Jobs            []recoveryJobRef `json:"jobs,omitempty"`
+	// WALBudget is the WAL's byte cap; WALBytes alone cannot say how close to
+	// it the engine is running. LastProgressMs is the age of the last drain
+	// progress, which is what separates a paced flusher from a stuck one.
+	WALBudget      int64 `json:"walBudget,omitempty"`
+	LastProgressMs int64 `json:"lastProgressMs,omitempty"`
+	// Drain-time credit control. CreditSetpoint is the adapted operating limit
+	// on resident unapplied bulk data and CreditCeiling is the data lane's hard
+	// cap — a setpoint is unreadable without its cap. CreditDebt is how much of
+	// the setpoint is outstanding, AppliedRateBps is the measured
+	// authority-applied rate the setpoint is derived from, CreditWaiters is how
+	// many data mutations are currently paced, and DataLaneFull reports the
+	// bulk-data lane sitting at its hard cap while the metadata reserve holds.
+	CreditSetpoint int64   `json:"creditSetpoint,omitempty"`
+	CreditDebt     int64   `json:"creditDebt,omitempty"`
+	CreditCeiling  int64   `json:"creditCeiling,omitempty"`
+	AppliedRateBps float64 `json:"appliedRateBps,omitempty"`
+	CreditWaiters  int     `json:"creditWaiters,omitempty"`
+	DataLaneFull   bool    `json:"dataLaneFull,omitempty"`
+
+	Jobs []recoveryJobRef `json:"jobs,omitempty"`
 	// ParkedWALs keeps the doctor/mounts wire name for parked recovery
 	// state: one entry per parked stream.
 	ParkedWALs []parkedWAL `json:"parkedWals,omitempty"`
@@ -1663,6 +1683,42 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	return jobID, priorErr
 }
 
+// newWriteBackStatus projects the engine's health snapshot onto the wire type.
+//
+// A healthy zero-debt engine is still operationally meaningful: expose it
+// instead of making clients guess whether write-back is absent or merely idle.
+// Scope names make contention and overly broad grants diagnosable without
+// exposing delegation epochs.
+func newWriteBackStatus(st writeback.Status) *writeBackStatus {
+	wb := &writeBackStatus{
+		PendingRecords: st.PendingRecords, PendingBytes: st.PendingBytes,
+		AppliedThrough: st.AppliedThrough, AdmittedThrough: st.AdmittedThrough,
+		OldestPendingMs: st.OldestPendingMs, Degraded: st.Degraded,
+		LastFailure: st.LastFailure, WALBytes: st.WALBytes,
+		WALBudget: st.WALBudget, LastProgressMs: st.LastProgressMs,
+		CreditSetpoint: st.CreditSetpoint, CreditDebt: st.CreditDebt,
+		CreditCeiling: st.CreditCeiling, AppliedRateBps: st.AppliedRateBps,
+		CreditWaiters: st.CreditWaiters, DataLaneFull: st.DataLaneFull,
+		Delegations: make([]delegationView, 0, len(st.Delegations)),
+	}
+	for _, d := range st.Delegations {
+		wb.Delegations = append(wb.Delegations, delegationView{Scope: d.Scope, Draining: d.Draining})
+	}
+	now := time.Now().UnixMilli()
+	for _, j := range st.Jobs {
+		wb.Jobs = append(wb.Jobs, recoveryJobRef{
+			JobID: j.JobID, State: j.State,
+			Records: j.PendingRecords, Bytes: j.PendingBytes,
+			LastError: j.LastError,
+		})
+		wb.ParkedWALs = append(wb.ParkedWALs, parkedWAL{
+			WAL: j.JobID, Records: int(j.PendingRecords), PayloadBytes: int64(j.PendingBytes),
+			AgeMs: now - j.CreatedAtMs, LastError: j.LastError,
+		})
+	}
+	return wb
+}
+
 func (a *attach) status() attachStatus {
 	a.mu.RLock()
 	state := a.currentStateLocked()
@@ -1680,33 +1736,7 @@ func (a *attach) status() attachStatus {
 		if vol.DiskCache != nil {
 			diskBytes, diskCap = vol.DiskCache.Stats()
 		}
-		st := vol.WritebackStatus()
-		// A healthy zero-debt engine is still operationally meaningful:
-		// expose it instead of making clients guess whether write-back is
-		// absent or merely idle. Scope names make contention and overly broad
-		// grants diagnosable without exposing delegation epochs.
-		wb = &writeBackStatus{
-			PendingRecords: st.PendingRecords, PendingBytes: st.PendingBytes,
-			AppliedThrough: st.AppliedThrough, AdmittedThrough: st.AdmittedThrough,
-			OldestPendingMs: st.OldestPendingMs, Degraded: st.Degraded,
-			LastFailure: st.LastFailure, WALBytes: st.WALBytes,
-			Delegations: make([]delegationView, 0, len(st.Delegations)),
-		}
-		for _, d := range st.Delegations {
-			wb.Delegations = append(wb.Delegations, delegationView{Scope: d.Scope, Draining: d.Draining})
-		}
-		now := time.Now().UnixMilli()
-		for _, j := range st.Jobs {
-			wb.Jobs = append(wb.Jobs, recoveryJobRef{
-				JobID: j.JobID, State: j.State,
-				Records: j.PendingRecords, Bytes: j.PendingBytes,
-				LastError: j.LastError,
-			})
-			wb.ParkedWALs = append(wb.ParkedWALs, parkedWAL{
-				WAL: j.JobID, Records: int(j.PendingRecords), PayloadBytes: int64(j.PendingBytes),
-				AgeMs: now - j.CreatedAtMs, LastError: j.LastError,
-			})
-		}
+		wb = newWriteBackStatus(vol.WritebackStatus())
 	}
 	a.mu.RLock()
 	localDirs := append([]string(nil), a.localDirs...)

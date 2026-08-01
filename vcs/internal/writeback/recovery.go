@@ -648,7 +648,7 @@ func appendRecoveryReleaseCertificate(
 	if err != nil {
 		return err
 	}
-	appliedPayload, err := json.Marshal(appliedFrame{
+	appliedPayload, err := encodeControlPayload(appliedFrame{
 		Through: through,
 		Digest:  fmt.Sprintf("%x", digest),
 	})
@@ -661,7 +661,7 @@ func appendRecoveryReleaseCertificate(
 		if scope.Scope == "" || scope.Epoch == "" {
 			return errors.New("writeback: invalid recovery release scope")
 		}
-		payload, err := json.Marshal(delegationFrame{Scope: scope.Scope, Epoch: scope.Epoch})
+		payload, err := encodeControlPayload(delegationFrame{Scope: scope.Scope, Epoch: scope.Epoch})
 		if err != nil {
 			return err
 		}

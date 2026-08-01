@@ -9,6 +9,22 @@ import (
 	"time"
 )
 
+// maxLiveDelegations is the ceiling on retained grants. Every live grant is a
+// DELEGATION frame that rotation re-emits and an APPLIED+RELEASE pair the
+// stream is later obliged to write, so the WAL's control reserve grows with the
+// live set; without a ceiling that reserve — and therefore the cap it is carved
+// from — has no closed form. The number is far above any real working set (the
+// idle releaser hands scopes back after one second), so it binds only on a
+// pathological fan-out, where refusing the grant is the correct answer anyway.
+const maxLiveDelegations = 64
+
+// errGrantNotAffordable is the definite "this stream cannot retain another
+// grant" outcome: the ceiling is reached, or the WAL's control reserve can no
+// longer dominate the close-out the new grant would join. It is not a failure —
+// the grant is handed back and the mutation takes the authority lane, which
+// consumes no stream budget at all.
+var errGrantNotAffordable = errors.New("writeback: stream cannot retain another delegation")
+
 type acquireFlight struct {
 	done chan struct{}
 	err  error
@@ -21,6 +37,15 @@ type acquireFlight struct {
 // never hold a grant the engine does not know exists. Callers wait bounded
 // on their own contexts.
 func (e *Engine) acquire(ctx context.Context, scope string) (bool, error) {
+	// A scope the WAL cannot represent, and a stream already holding the
+	// maximum number of grants, are both answered before the authority is asked:
+	// not delegable, so the mutation takes the authority lane. Both are definite
+	// outcomes of the local bound, not transient failures, so they never become
+	// an error that would fail the mutation instead of relanding it.
+	if len(scope) > maxScopeBytes || e.held.Load() >= maxLiveDelegations {
+		e.noteDenial(scope, 0)
+		return false, nil
+	}
 	e.acquireMu.Lock()
 	flight, inflight := e.acquiring[scope]
 	if !inflight {
@@ -148,6 +173,13 @@ func (e *Engine) resolveAcquire(scope string, flight *acquireFlight) {
 		// authority does not hold a scope we cannot use.
 		if releaseErr := e.remote.ReleaseDelegation(e.ctx, scope, reply.Epoch); releaseErr != nil {
 			flight.err = fmt.Errorf("writeback: install grant %q failed (%w); releasing unusable grant also failed: %v", scope, err, releaseErr)
+			return
+		}
+		if errors.Is(err, errGrantNotAffordable) {
+			// The grant is back with the authority and nothing was written.
+			// This is a denial, not a failure: the mutation takes the
+			// authority lane.
+			e.noteDenial(scope, 0)
 			return
 		}
 		flight.err = err
@@ -288,7 +320,30 @@ func (e *Engine) installGrant(scope string, reply AcquireReply) error {
 	if err := e.ensureStreamLocked(); err != nil {
 		return err
 	}
-	if err := e.wal.appendControl(frameDelegation, delegationFrame{Scope: scope, Epoch: reply.Epoch}); err != nil {
+	if len(e.delegations) >= maxLiveDelegations {
+		return errGrantNotAffordable
+	}
+	// An epoch the WAL cannot frame is an authority protocol violation, not a
+	// local resource bound: refuse the grant definitely rather than let the
+	// unrepresentable value reach the log.
+	if len(reply.Epoch) > maxEpochBytes {
+		return fmt.Errorf(
+			"writeback: authority grant epoch for %q is %d bytes, past the %d-byte control-frame bound",
+			scope, len(reply.Epoch), maxEpochBytes,
+		)
+	}
+	// The grant record is the ONE control frame that is refusable: it is what
+	// grows the control reserve, so it is admitted only while the reserve still
+	// dominates the close-out of the set it joins. It reserves against the whole
+	// cap, like every other control frame.
+	if err := e.wal.appendControlWithin(
+		frameDelegation,
+		delegationFrame{Scope: scope, Epoch: reply.Epoch},
+		e.cfg.BudgetBytes,
+	); err != nil {
+		if errors.Is(err, ErrNoSpace) {
+			return errGrantNotAffordable
+		}
 		return e.failLocalWAL("record delegation", err)
 	}
 	d := &delegation{

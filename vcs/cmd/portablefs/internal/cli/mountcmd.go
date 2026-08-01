@@ -3061,6 +3061,14 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			} else if wb.PendingRecords > 0 {
 				extras += fmt.Sprintf("  write-back:%d records flushing", wb.PendingRecords)
 			}
+			// The credit controller is pacing writers on purpose; without this
+			// the backlog above is indistinguishable from a stalled flusher.
+			if wb.paced() {
+				extras += fmt.Sprintf("  data-lane:%d writer(s) paced, credit %d/%d B", wb.CreditWaiters, wb.CreditDebt, wb.CreditSetpoint)
+				if wb.DataLaneFull {
+					extras += ", at ceiling"
+				}
+			}
 		}
 		fmt.Fprintf(e.stdout, "%s  %s@%s  %s  pid %d%s  %s\n", row.MountPath, row.VolumeID, row.Branch, row.Strategy, row.PID, extras, status)
 	}

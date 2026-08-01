@@ -853,16 +853,54 @@ func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal
 	return &pfslocal.ReadReply{Data: data}, 0
 }
 
+// write resolves the request's lane outside every lock, then executes it under
+// them.
+//
+// The loop is the second half of that invariant, not a retry-until-it-works. A
+// lane decided outside the locks can be invalidated inside them by a delegation
+// recall this frontend does not control, and both ways to recover — acquiring a
+// grant, or releasing one to reach the authority lane — are delegation
+// transitions, which is precisely what must never happen while a.nsMu is held.
+// So the operation unwinds to here and reclassifies, paying for the transition
+// where it costs one request instead of the namespace.
+//
+// It runs at most twice. The second pass classifies the authority lane
+// unconditionally, and that lane is not a claim about a grant — it consumes no
+// stream budget at all — so a recall has nothing left to invalidate.
 func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfslocal.WriteReply, int32) {
-	// Data-lane admission happens HERE, before a single lock. See
-	// admitWriteCredit: the whole point of the frontend placement is that the
-	// pacing wait — the one thing in a write that is unbounded by the local
-	// machine — is taken while this request holds nothing at all.
-	ctx, data, releaseCredit, eno := a.admitWriteCredit(ctx, req)
-	defer releaseCredit()
-	if eno != 0 {
-		return nil, eno
+	for forceAuthority := false; ; forceAuthority = true {
+		reply, eno, unwound := a.writeOnce(ctx, req, forceAuthority)
+		if !unwound {
+			return reply, eno
+		}
 	}
+}
+
+func (a *attach) writeOnce(
+	ctx context.Context,
+	req *pfslocal.WriteRequest,
+	forceAuthority bool,
+) (*pfslocal.WriteReply, int32, bool) {
+	// Lane, credit and every delegation transition are resolved HERE, before a
+	// single lock: the waits in a write that are unbounded by the local machine
+	// are taken while this request holds nothing at all.
+	ctx, data, settle, eno := a.admitWrite(ctx, req, forceAuthority)
+	defer settle()
+	if eno != 0 {
+		return nil, eno, false
+	}
+	reply, eno := a.writeLocked(ctx, req, data)
+	if eno == errnoLaneChanged {
+		return nil, 0, true
+	}
+	return reply, eno, false
+}
+
+func (a *attach) writeLocked(
+	ctx context.Context,
+	req *pfslocal.WriteRequest,
+	data []byte,
+) (*pfslocal.WriteReply, int32) {
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
 	unlockHandle := a.lockHandleOperation(req.Handle, false)
@@ -893,45 +931,40 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	// authority-assigned offsets.
 	appendWrite := h.appendOnly || req.Append
 	if h.file != nil {
+		var wrote int
 		var err error
 		switch {
 		case h.appendOnly:
 			// The fd carries O_APPEND, so the host kernel resolves EOF and
 			// commits atomically. WriteAt is invalid on such an fd (ESPIPE on
 			// Darwin); Write is the only positionless form.
-			_, err = h.file.Write(data)
+			wrote, err = h.file.Write(data)
 		case appendWrite:
 			// Per-request append on a descriptor that was not opened O_APPEND.
 			// A graft is machine-local, so the worst exposure is two handles
 			// on this one daemon; resolve EOF as late as possible.
 			var end int64
 			if end, err = h.file.Seek(0, io.SeekEnd); err == nil {
-				_, err = h.file.WriteAt(data, end)
+				wrote, err = h.file.WriteAt(data, end)
 			}
 		default:
-			_, err = h.file.WriteAt(data, int64(req.Offset))
+			wrote, err = h.file.WriteAt(data, int64(req.Offset))
 		}
-		if err != nil {
+		// A host short write reports both a count and an error. The count is
+		// committed progress and outranks the error for exactly the reason a
+		// post-commit failure does: reporting zero invites a retry that
+		// duplicates an append.
+		if err != nil && wrote <= 0 {
 			return nil, localErrno(err)
 		}
-		fi, err := h.file.Stat()
-		if err != nil {
-			return nil, localErrno(err)
+		var attr fsproto.Attr
+		fi, serr := h.file.Stat()
+		if serr == nil {
+			attr = localAttr(fi)
+		} else if wrote <= 0 {
+			return nil, localErrno(serr)
 		}
-		attr := localAttr(fi)
-		a.mu.Lock()
-		rec := a.registerHandleAttrLocked(h, attr)
-		a.mu.Unlock()
-		if rec == nil {
-			return nil, darwinEIO
-		}
-		if eno := a.flushBindingDelta(); eno != 0 {
-			return nil, eno
-		}
-		return &pfslocal.WriteReply{
-			Written: uint32(len(data)),
-			Attr:    a.localAttrForRecordPath(attr, rec, scope, detached),
-		}, 0
+		return a.writeReplyWithAttr(h, scope, detached, wrote, attr, serr == nil)
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -949,65 +982,152 @@ func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfsloc
 	default:
 		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), data)
 	}
-	if st != fsproto.OK {
-		return nil, toDarwinErr(st)
+	if n <= 0 {
+		if clientcore.LaneChanged(st) {
+			// The classifier's lane no longer holds and the engine refused to
+			// transition under these locks. Nothing was attempted; unwind.
+			return nil, errnoLaneChanged
+		}
+		if st != fsproto.OK {
+			return nil, toDarwinErr(st)
+		}
+		// Nothing was committed, so there is no progress to protect and the
+		// attribute half is answered on its own terms below.
 	}
-	var attr fsproto.Attr
-	attr, st = vol.GetattrOpenHandle(ctx, scope, h.state)
-	if st != fsproto.OK {
-		return nil, toDarwinErr(st)
-	}
-	a.mu.Lock()
-	rec := a.registerHandleAttrLocked(h, attr)
-	a.mu.Unlock()
-	if rec == nil {
-		return nil, darwinEIO
-	}
-	if eno := a.flushBindingDelta(); eno != 0 {
-		return nil, eno
-	}
-	return &pfslocal.WriteReply{
-		Written: uint32(n),
-		Attr:    a.localAttrForRecordPath(attr, rec, scope, detached),
-	}, 0
+	return a.writeReply(ctx, vol, h, scope, detached, n)
 }
 
-// admitWriteCredit runs one write request's data-lane admission BEFORE the
+// writeReply builds the reply for a write that has already run, and is the one
+// place the write path's two halves are separated.
+//
+// `Written` is the POSIX outcome. Once the bytes are committed it is DECIDED,
+// and no step after the commit may change it. `Attr` is a cache fill, produced
+// by operations that fail on their own terms — an attribute round trip, a
+// registry lookup, the binding journal.
+//
+// Collapsing the two is a data-corruption bug, not a cosmetic one. The daemon
+// answers with a body or an errno, never both, so returning an errno after a
+// commit tells the application "this write did nothing" about bytes that are
+// already in the WAL. The application retries, and on an O_APPEND descriptor
+// the retry resolves EOF a second time — it cannot land on the first copy — so
+// the record appears TWICE and no layer below can tell it was one write. A
+// transient disk error must not be able to duplicate an append.
+//
+// When the attribute half cannot be refreshed the reply carries the attributes
+// already registered for the handle's own item. That is truthful about what the
+// daemon knows and publishes NO new identity: the item is the one the kernel
+// addressed this very write with, so it is already known and already binding-
+// durable. The staleness costs nothing, because the daemon never serves
+// getattr(2) from this record — every getattr goes to the volume (see
+// attach.getattr) — so the next attribute read corrects it. If even that record
+// is gone the reply carries no attributes at all rather than inventing any; the
+// frontends already treat a write reply's attributes as a hint and fall back to
+// their own snapshot.
+func (a *attach) writeReply(
+	ctx context.Context,
+	vol *clientcore.Volume,
+	h *handleRecord,
+	scope string,
+	detached bool,
+	n int,
+) (*pfslocal.WriteReply, int32) {
+	attr, st := vol.GetattrOpenHandle(ctx, scope, h.state)
+	if st != fsproto.OK && n <= 0 {
+		return nil, toDarwinErr(st)
+	}
+	return a.writeReplyWithAttr(h, scope, detached, n, attr, st == fsproto.OK)
+}
+
+// writeReplyWithAttr is writeReply's shared tail, reached once the write's own
+// count and its attribute refresh have each reported independently. refreshed
+// says whether attr is a fresh observation or must be replaced by what the
+// daemon already holds.
+func (a *attach) writeReplyWithAttr(
+	h *handleRecord,
+	scope string,
+	detached bool,
+	n int,
+	attr fsproto.Attr,
+	refreshed bool,
+) (*pfslocal.WriteReply, int32) {
+	committed := n > 0
+
+	a.mu.Lock()
+	var rec *itemRecord
+	if refreshed {
+		rec = a.registerHandleAttrLocked(h, attr)
+	}
+	if rec == nil {
+		// No refresh, or the handle's binding no longer resolves: answer from
+		// the item the kernel already holds for this handle.
+		if known := a.items[h.itemID]; known != nil {
+			rec, attr = known, known.attr
+		}
+	}
+	var reply pfslocal.Attr
+	if rec != nil {
+		reply = a.localAttrForRecordPathLocked(attr, rec, scope, detached)
+	}
+	a.mu.Unlock()
+
+	if rec == nil && !committed {
+		return nil, darwinEIO
+	}
+	// The binding journal's own contract makes a failed append a correctness
+	// failure that fails the frontend gate closed (failBindingPersistence), so
+	// the mount is already going down and the next operation gets a definite
+	// error. That is exactly why this reply must still be honest about the
+	// bytes: it is the application's last chance to learn they are committed.
+	if eno := a.flushBindingDelta(); eno != 0 && !committed {
+		return nil, eno
+	}
+	return &pfslocal.WriteReply{Written: uint32(n), Attr: reply}, 0
+}
+
+// errnoLaneChanged is the internal unwind signal. It is not an errno: it is
+// negative, so it can never collide with a Darwin errno, and it never leaves
+// attach.write.
+const errnoLaneChanged int32 = -1
+
+// admitWrite runs one write request's COMPLETE lane resolution before the
 // handler takes a.nsMu, the handle operation gate, or a.mu for anything but the
-// two lock-free-shaped lookups it needs to classify the request.
+// two non-waiting lookups it needs to identify the request.
 //
-// Why here and not in the engine. Engine.WriteAt/WriteAppend pace internally,
-// which is correct for a caller holding nothing — but this handler calls them
-// under a.nsMu.RLock. Go's RWMutex is writer-preferring: a paced write holding
-// the read side blocks any pending nsMu.Lock (rename, remove, delegation
-// reclaim), and every lookup/getattr/read arriving after that writer queues
-// behind IT. One slow uplink becomes a namespace-wide stall on paths that have
-// nothing to do with the backlog. Moving the wait in front of the lock is the
-// whole fix: what crosses into the locked region is a decided answer.
+// Why here and not in the engine. Engine.WriteAt/WriteAppend resolve their own
+// lane, which is correct for a caller holding nothing — but this handler calls
+// them under a.nsMu.RLock. Go's RWMutex is writer-preferring: anything that
+// blocks on the read side parks the next nsMu.Lock (rename, remove, delegation
+// reclaim), and every lookup, getattr and read arriving after it queues behind
+// THAT. One slow uplink becomes a namespace-wide stall on paths with nothing to
+// do with the backlog.
 //
-// It returns the operation context to use (carrying the grant), the prefix of
-// the request the caller may write, a release that refunds anything the write
-// never consumed, and an errno for a definite refusal. The release is always
-// non-nil and must be deferred BEFORE the errno is checked.
+// And the lane resolution is exactly what blocks. Reaching the delegated lane
+// can mean draining an ancestor grant's whole unshipped tail and releasing it
+// durably, or acquiring a grant over an authority round trip; reaching the
+// authority lane can mean releasing whatever covers the path — the same drain.
+// Moving the credit wait alone was not enough, because those transitions stayed
+// behind. What crosses into the locked region now is a fully decided answer.
 //
-// Classification is deliberately conservative. Only requests that can reach the
-// write-back WAL are charged:
+// It returns the operation context, the prefix of the request the caller may
+// write, a settle that releases everything the classification took, and an
+// errno for a definite refusal. settle is always non-nil and must be deferred
+// BEFORE the errno is checked.
 //
-//   - empty payloads have nothing to admit;
-//   - a graft handle (h.file != nil) writes a host file directly;
-//   - a detached handle (scope == "") takes the pathless exact lane, which is
-//     authority-only by construction (Volume.WriteExactHandle);
-//   - a handle that is not writable, or a request whose handle or volume no
-//     longer resolves, is left alone so the handler produces its own exact
-//     errno instead of inheriting one from admission.
+// Requests that cannot reach the write-back WAL are identified here and passed
+// through unclassified, so the handler produces its own exact errno instead of
+// inheriting one from admission: an empty payload, a graft handle writing a
+// host file directly, an unwritable handle, and a request whose handle or
+// volume no longer resolves. Everything else goes to Volume.AdmitWrite, which
+// decides the lane from NODE IDENTITY as well as delegation state — a pathname
+// alone cannot see that an inode is orphaned or hard linked, and both of those
+// are authority-only by construction.
 //
-// Everything else is offered to Volume.AcquireDataCredit, which makes the final
-// delegated-vs-write-through decision from the engine's own covering-delegation
-// state. Both lookups used here (volOrErr, handleTarget) take a.mu.RLock only
-// and never wait, so this runs entirely outside the namespace lock.
-func (a *attach) admitWriteCredit(
+// forceAuthority is the unwind's terminator: on the second pass the authority
+// lane is taken unconditionally, so that attempt has no lane left to lose.
+func (a *attach) admitWrite(
 	ctx context.Context,
 	req *pfslocal.WriteRequest,
+	forceAuthority bool,
 ) (context.Context, []byte, func(), int32) {
 	noop := func() {}
 	data := req.Data
@@ -1019,23 +1139,23 @@ func (a *attach) admitWriteCredit(
 		return ctx, data, noop, 0
 	}
 	h, scope, herr := a.handleTarget(req.Handle)
-	if herr != 0 || scope == "" || h.file != nil || !h.write {
+	if herr != 0 || h.file != nil || !h.write {
 		return ctx, data, noop, 0
 	}
-	creditCtx, granted, err := vol.AcquireDataCredit(ctx, scope, len(data))
+	opCtx, granted, settle, err := vol.AdmitWrite(ctx, scope, h.state, len(data), forceAuthority)
 	if err != nil {
+		settle()
 		return ctx, data, noop, creditErrno(err)
 	}
-	release := func() { vol.ReleaseDataCredit(creditCtx) }
 	if granted < len(data) {
 		// A short grant is a healthy outcome, not a failure: write exactly the
 		// granted prefix and let the reply's written count tell the kernel to
-		// reissue the rest as a fresh operation, which is paced from scratch.
-		// The FSKit adapter already loops on a short count (VolumeCore.write)
-		// and FUSE replies support short writes natively.
+		// reissue the rest as a fresh operation, classified from scratch. The
+		// FSKit adapter already loops on a short count (VolumeCore.write) and
+		// FUSE replies support short writes natively.
 		data = data[:granted]
 	}
-	return creditCtx, data, release, 0
+	return opCtx, data, settle, 0
 }
 
 // creditErrno is the frontend's POSIX classification of a refused admission.

@@ -379,39 +379,62 @@ func (n *fuseNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 	return admission.Wrap(fuse.ReadResultData(data)), 0
 }
 
+// Write resolves the request's lane outside the volume call, then executes it.
+//
+// FUSE has no namespace lock of its own here, but the same argument as the
+// daemon's applies one layer down: clientcore's write path takes the NodeState
+// lock and the engine takes e.mu, and a delegation transition or a pacing wait
+// inside either blocks the open-pin and delegation-release machinery that must
+// be able to inspect this node. Resolving out here holds nothing.
+//
+// The two passes are the unwind: a lane resolved before the call can be
+// invalidated during it by a recall this frontend does not control, and the
+// engine reports that rather than transitioning under the locks. The second
+// pass takes the authority lane unconditionally, and that lane consumes no
+// stream budget at all, so a recall has nothing left to invalidate.
 func (n *fuseNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	ctx = n.gateOp(ctx)
+	for forceAuthority := false; ; forceAuthority = true {
+		cnt, eno, unwound := n.writeOnce(ctx, fh, data, off, forceAuthority)
+		if !unwound {
+			return cnt, eno
+		}
+	}
+}
+
+func (n *fuseNode) writeOnce(
+	ctx context.Context,
+	fh fs.FileHandle,
+	data []byte,
+	off int64,
+	forceAuthority bool,
+) (uint32, syscall.Errno, bool) {
 	p := n.curPath()
-	// Data-lane admission BEFORE the volume call, exactly as the daemon does it
-	// in front of a.nsMu. FUSE has no namespace lock of its own here, but the
-	// same argument applies one layer down: clientcore's write path takes the
-	// NodeState lock and the engine takes e.mu, and a pacing wait inside either
-	// blocks the open-pin and delegation-release machinery that must be able to
-	// inspect this node. Waiting out here holds nothing.
-	//
-	// gateOp is applied first and left untouched: the credit context wraps the
-	// gated one, so suspension and publication wiring see the identical
-	// operation identity they did before.
-	creditCtx, granted, err := n.v.AcquireDataCredit(ctx, p, len(data))
-	defer n.v.ReleaseDataCredit(creditCtx)
+	// gateOp is applied by the caller and left untouched: the operation context
+	// wraps the gated one, so suspension and publication wiring see the
+	// identical operation identity they did before.
+	opCtx, granted, settle, err := n.v.AdmitWrite(ctx, p, n.state, len(data), forceAuthority)
+	defer settle()
 	if err != nil {
-		return 0, creditErrno(err)
+		return 0, creditErrno(err), false
 	}
 	// A short grant becomes a short write, which FUSE replies natively; the
-	// kernel reissues the remainder as a new request that is paced from scratch.
+	// kernel reissues the remainder as a new request, classified from scratch.
 	data = data[:granted]
-	ctx = creditCtx
 	var cnt int
 	var st clientcore.Status
 	if h, ok := fh.(*fuseHandle); ok && h.append {
-		cnt, st = n.v.WriteAppend(ctx, p, n.state, off, data)
+		cnt, st = n.v.WriteAppend(opCtx, p, n.state, off, data)
 	} else {
-		cnt, st = n.v.Write(ctx, p, n.state, off, data)
+		cnt, st = n.v.Write(opCtx, p, n.state, off, data)
+	}
+	if clientcore.LaneChanged(st) {
+		return 0, 0, true
 	}
 	if st != fsproto.OK {
-		return 0, errno(st)
+		return 0, errno(st), false
 	}
-	return uint32(cnt), 0
+	return uint32(cnt), 0, false
 }
 
 // creditErrno maps a refused data-lane admission to the errno FUSE replies.
