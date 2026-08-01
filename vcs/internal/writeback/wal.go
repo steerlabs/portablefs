@@ -32,6 +32,44 @@ const (
 	groupSyncBytes = 4 << 20
 )
 
+// ─── the legacy-stream recovery contract ─────────────────────────────────────
+//
+// ANY WAL VALID UNDER THE FROZEN PFW5 FRAME DECODER MUST REACH A DEFINITE
+// RECOVERY OUTCOME WITHIN THE CONFIGURED BOUND.
+//
+// PFW5 is frozen. Its only on-disk size rule is decodeFrameAt's: every frame's
+// payloadLen is bounded by maxMutationPayload, whatever the frame type. A WAL
+// written by ANY version of this code that satisfies that rule is a WAL this
+// version must be able to finish, because the alternative — a stream that
+// replays forever and never releases — wedges the mount and strands authority
+// grants for every peer.
+//
+// Two things follow, and both are load-bearing:
+//
+//  1. FIELD CAPS ARE ADMISSION-ONLY. maxScopeBytes/maxEpochBytes/maxJobIDBytes/
+//     maxReasonBytes/maxDigestBytes were introduced (81e235b) so the control
+//     reserve's arithmetic has finite terms over the values the WRITE PATH can
+//     still choose. Applying them to a value that is already accepted and
+//     already durable in this stream turns a valid WAL into an unfinalizable
+//     one. So there are two encoders, not one flag: encodeControlPayload for a
+//     NEW value entering the log, encodeDurableControlPayload for re-emitting a
+//     value this stream already holds. The bytes they produce are identical;
+//     only the admissible input set differs.
+//
+//  2. CLOSE-OUT IS BUDGETED, NOT ASSUMED. A pre-upgrade stream carries no
+//     control reserve — it may sit at the full cap with nothing held back. So
+//     recovery's close-out cannot append blind: it computes the certificate's
+//     EXACT cost from the actual encoded payloads and, when that does not fit,
+//     reclaims the fully-applied segment prefix it is entitled to (recovery only
+//     writes the certificate once the whole tail is authority-applied) before
+//     appending. If it still does not fit, recovery lands in a TYPED TERMINAL
+//     state. See appendRecoveryReleaseCertificate.
+//
+// Reserve arithmetic is stated in ACTUAL encoded sizes wherever the value is
+// known (liveGrant.frameBytes, w.liveDelegationBytes); the maxima above are the
+// bound only for values not yet chosen. That is what keeps the reserve correct
+// for a live set of any frame size.
+
 // Control frames carry the only variable-length fields the log holds outside a
 // mutation payload. The stream's byte cap can only be a bound if the bytes
 // those fields can produce are bounded, so each is capped here and checked
@@ -167,12 +205,15 @@ func (f closeFrame) validate() error {
 	return nil
 }
 
-// encodeControlPayload is the ONE encoder every control frame's payload goes
-// through, online and offline. It bounds the variable-length fields before
-// marshalling, so the reserve's arithmetic holds over the payloads the write
-// path can actually produce, and re-checks the encoded result against the same
-// bound the decoder enforces. The encoded bytes are unchanged: this is an
-// admission-side check over the identical replay format.
+// encodeControlPayload is the ADMISSION-SIDE control encoder: the one every
+// control frame carrying a NEWLY CHOSEN value goes through, online and offline.
+// It bounds the variable-length fields before marshalling, so the reserve's
+// arithmetic holds over the payloads the write path can actually produce, and
+// then applies the frozen frame bound. The encoded bytes are unchanged: this is
+// an admission check over the identical replay format.
+//
+// It is NOT the encoder for a value this stream already holds durably — see
+// encodeDurableControlPayload and the legacy-stream recovery contract above.
 func encodeControlPayload(v any) ([]byte, error) {
 	switch f := v.(type) {
 	case delegationFrame:
@@ -192,6 +233,21 @@ func encodeControlPayload(v any) ([]byte, error) {
 	// encoded-length bound below: recovery's fail-closed contract for a
 	// CRC-valid payload that does not decode is exercised with exactly such a
 	// value, and it must reach the log to be exercised at all.
+	return encodeDurableControlPayload(v)
+}
+
+// encodeDurableControlPayload is the REPLAY / CLOSE-OUT side control encoder:
+// it re-emits a value that is ALREADY durable in this stream — a scope and
+// epoch scanned back out of its own DELEGATION frames, or a live grant copied
+// into a fresh segment by rotation. Such a value was admitted by whatever
+// version wrote it, so the only bound that may apply to it is the frozen
+// on-disk one the decoder enforces (maxMutationPayload). Re-checking it against
+// today's admission caps would make a WAL that replays fine impossible to
+// finalize, which is exactly what the contract above forbids.
+//
+// It produces byte-identical output to encodeControlPayload for every value the
+// admission caps accept; the two differ only in which inputs they refuse.
+func encodeDurableControlPayload(v any) ([]byte, error) {
 	payload, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -741,6 +797,12 @@ func (w *streamWAL) dropLiveDelegationLocked(scope string) {
 // reemitLiveDelegationsLocked makes the new active segment independently
 // recoverable before any mutation can use it. Scope sorting keeps physical WAL
 // bytes deterministic despite map iteration order.
+//
+// Every value here is already durable in this stream, so it goes through the
+// DURABLE encoder: a rotation must never be able to fail on a grant the log
+// already holds. The bytes are identical to the ones the admitting DELEGATION
+// frame wrote, which is what makes liveGrant.frameBytes — recorded at install
+// time — the exact cost of this re-emit for the reserve arithmetic.
 func (w *streamWAL) reemitLiveDelegationsLocked() error {
 	scopes := make([]string, 0, len(w.liveDelegations))
 	for scope := range w.liveDelegations {
@@ -748,7 +810,7 @@ func (w *streamWAL) reemitLiveDelegationsLocked() error {
 	}
 	sort.Strings(scopes)
 	for _, scope := range scopes {
-		payload, err := encodeControlPayload(delegationFrame{Scope: scope, Epoch: w.liveDelegations[scope].epoch})
+		payload, err := encodeDurableControlPayload(delegationFrame{Scope: scope, Epoch: w.liveDelegations[scope].epoch})
 		if err != nil {
 			return err
 		}

@@ -394,10 +394,60 @@ func (f *flusher) sendBatch() {
 		f.advance(reply.Through)
 	case reply.Status == 116: // ESTALE: fenced or scope no longer live
 		f.park(fmt.Errorf("%w: authority fenced the stream (status %d)", ErrFenced, reply.Status))
-	case reply.Status == 11: // EAGAIN: lease projection; retry
-		f.noteFailure("authority lease re-anchor pending (EAGAIN)")
+
+	// ── PROVEN CONTRADICTION: terminal ───────────────────────────────────────
+	//
+	// A status may end a stream only when it is a statement ABOUT THIS BATCH
+	// that re-sending the identical bytes cannot change. There are exactly two,
+	// and both are decided by the authority from the batch's own content:
+	//
+	//	EINVAL (22)  workfs.ErrWritebackCorrupt — the stream's typed structure
+	//	             does not decode or its digest chain does not link.
+	//	EPERM  (1)   a record falls outside the granted checkout subtree.
+	//
+	// Neither can be relieved by anything, on either side, ever. Parking is the
+	// honest outcome: the tail stays available for local sync and attach-time
+	// recovery, and the mount stops pretending it can drain.
+	case reply.Status == 22 || reply.Status == 1:
+		f.park(fmt.Errorf(
+			"%w: authority rejected the batch's own content (status %d)",
+			ErrConflict, reply.Status,
+		))
+
+	// ── EVERYTHING ELSE: retryable under the watchdog ────────────────────────
+	//
+	// This default used to park the stream as a terminal ErrConflict, which
+	// latched ErrFailedClosed and took the whole live mount to EIO — for good,
+	// with the authority demonstrably reachable and the backlog undrained.
+	// Production reached it with ONE reply carrying status 5.
+	//
+	// Status 5 is not a conflict. EIO is the authority's CATCH-ALL for an error
+	// it did not classify (fsproto.toErrno's default), so it means "something
+	// went wrong at the far end" and nothing whatsoever about this batch. The
+	// same is true of any status a future authority adds that this client does
+	// not yet know. Reading either as a proven contradiction is the client
+	// inventing a verdict from an absence of information, and the cost of being
+	// wrong is a permanently destroyed mount.
+	//
+	// So the rule is inverted, and it is the only sound direction: UNKNOWN IS
+	// RETRYABLE. Terminal requires proof, and proof is enumerated above.
+	//
+	// This is not "retry until it works". noteFailure enters the same bounded
+	// machinery every transport failure already uses: exponential backoff, and
+	// the flusher's no-progress watchdog as the ONE stall verdict. An authority
+	// that keeps refusing stops making durable progress, uplinkStalled() goes
+	// true within noProgressWindow, and every frontend surfaces the EIO-class
+	// answer it surfaces for a dead uplink — while force-detach still parks the
+	// stream durably and recovery still replays it. Bounded, definite, and
+	// reversible the instant the far end recovers, which is exactly what a
+	// two-minute database outage deserves instead of a forty-minute one.
+	case reply.Status == 11: // EAGAIN: the authority's typed retryable answer
+		f.noteFailure("authority cannot apply this batch yet (EAGAIN)")
 	default:
-		f.park(fmt.Errorf("%w: flush rejected with status %d", ErrConflict, reply.Status))
+		f.noteFailure(fmt.Sprintf(
+			"authority rejected the flush with unclassified status %d; retrying",
+			reply.Status,
+		))
 	}
 }
 

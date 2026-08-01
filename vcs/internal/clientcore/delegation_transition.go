@@ -24,11 +24,11 @@ type delegationTransitionTargets struct {
 }
 
 type delegationTransitionClaim struct {
-	gate    *delegationTransitionGate
-	kind    delegationTransitionKind
-	targets delegationTransitionTargets
+	gate     *delegationTransitionGate
+	kind     delegationTransitionKind
+	targets  delegationTransitionTargets
 	startSeq uint64
-	ended   bool
+	ended    bool
 }
 
 type delegationTransitionWaiter struct {
@@ -59,7 +59,7 @@ type delegationTransitionGate struct {
 	// claim's start sequence. History is cleared as soon as no older acquire
 	// can observe it, so the map is bounded by mutations concurrent with
 	// live remote acquire resolutions rather than mount lifetime.
-	authoritySeq    uint64
+	authoritySeq     uint64
 	lastAuthorityIno map[uint64]uint64
 }
 
@@ -162,6 +162,40 @@ func (c *delegationTransitionClaim) extend(
 		}
 		g.mu.Lock()
 	}
+}
+
+// tryExtend is extend WITHOUT the wait: it adds targets to an active claim if
+// nothing active conflicts, and reports failure instead of queueing.
+//
+// It is the ONLY form permitted while a frontend lock is held. A classified
+// operation reaches its locked region holding a transition token, discovers a
+// target its classifier could not see — a hard-linked inode's identity the
+// engine reports only from a reply, an alias the index learned in between — and
+// must either fold it into the claim it already owns or unwind. Blocking here
+// would be waiting for a delegation transition under a.nsMu, which is exactly
+// what the global lock order forbids.
+//
+// Failure is therefore not an error: the caller answers ErrLaneChanged, the
+// operation unwinds with every lock released, and the wider target set is
+// claimed properly outside them.
+func (c *delegationTransitionClaim) tryExtend(paths []string, inos []uint64) bool {
+	if c == nil || c.gate == nil {
+		return true
+	}
+	added := makeDelegationTransitionTargets(paths, inos)
+	g := c.gate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if c.ended {
+		return false
+	}
+	candidate := mergeDelegationTransitionTargets(c.targets, added)
+	if g.conflictsWithActiveLocked(c.kind, candidate, c) {
+		return false
+	}
+	c.targets = candidate
+	g.signalLocked()
+	return true
 }
 
 // reconcileAcquire atomically promotes a path-only acquire claim with the

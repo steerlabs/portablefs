@@ -1,6 +1,7 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -554,8 +555,20 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	// projection and the exact applied certificate, sweeping whichever
 	// recovery grants remain instead of trying to rebind already-released
 	// scopes.
-	if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, prev, scopes); err != nil {
+	if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, prev, scopes, e.cfg.BudgetBytes); err != nil {
 		cleanupPreparedFrom(0)
+		if errors.Is(err, errCloseOutUnbounded) {
+			// Definite and terminal: no retry can create budget. The tail is
+			// already applied at the authority and the grants stay checked out
+			// to this stream until an operator raises the cap, at which point
+			// the next attach finishes the close-out unchanged.
+			js.update(func(j *RecoveryJob) {
+				j.State = JobConflict
+				j.LastError = err.Error()
+				j.Conflicts = []ConflictDetail{{Kind: "CLOSE_OUT_UNBOUNDED"}}
+			})
+			return err
+		}
 		return fmt.Errorf("%w: persist recovery release certificate: %v", errRetryable, err)
 	}
 	for i, sc := range scopes {
@@ -631,54 +644,213 @@ func removeStreamDir(dir string) error {
 	return fsyncDir(filepath.Dir(dir))
 }
 
-// appendRecoveryReleaseCertificate appends APPLIED followed by every RELEASE
-// to the already-scanned final segment with one physical WriteAt and one sync.
-// The store lock guarantees the scanned tail has no concurrent writer.
+// errCloseOutUnbounded is the DEFINITE terminal outcome of a close-out that
+// cannot be made to fit: the certificate is not written at all and the stream
+// parks in a typed conflict an operator resolves (by raising BudgetBytes). It
+// is deliberately NOT errRetryable — an attach must never be failed forever by
+// a condition no amount of retrying can change.
+var errCloseOutUnbounded = errors.New("writeback: recovery close-out does not fit the configured WAL budget")
+
+// appendRecoveryReleaseCertificate makes every rebound scope locally final:
+// APPLIED at the drained tail followed by one RELEASE per scope, appended to
+// the scanned stream's last segment. The store lock guarantees no concurrent
+// writer. It is the close-out half of the legacy-stream recovery contract
+// stated in wal.go, and it is budget-aware for the reason stated there: a
+// pre-upgrade WAL carries NO control reserve, so the room this append needs
+// cannot be assumed to exist.
+//
+// The cost is EXACT, never a maximum: the RELEASE payloads are the actual
+// encoded bytes of the actual scopes, produced by the DURABLE encoder because
+// every one of them was already read back out of this stream's own DELEGATION
+// frames.
+//
+// When the certificate does not fit, recovery reclaims the fully-applied
+// segment prefix. It is entitled to: this function is only reached once the
+// whole tail is authority-applied (finalThrough == scan.lastSeq), so every
+// mutation frame in the stream is dead. The ordering is what makes that
+// crash-safe, in three barriers:
+//
+//	A. APPLIED(lastSeq, digest) alone, synced. The mark is what authorizes the
+//	   reclaim: after it, digestAt can still rebuild the digest at the tail from
+//	   a stream whose earlier segments are gone. Skipped entirely when the
+//	   scanned marks already carry it, so a crash loop cannot accumulate marks.
+//	   Like CheckpointAndReclaim's checkpoint, it is charged to the space its own
+//	   reclamation frees and is only written when that space dominates it.
+//	B. Delete the fully-applied segments in ASCENDING ordinal order, then fsync
+//	   the directory. A crash mid-delete always leaves a contiguous ordinal
+//	   suffix — the shape scanStream requires — with the barrier-A mark inside it.
+//	C. The RELEASE frames, one WriteAt, truncated back to the tail on a short
+//	   write, then synced. A crash here leaves a prefix of released scopes; the
+//	   next recovery sees them as already-final and sweeps their authority
+//	   remainder with Discard, which is exactly the documented shape.
+//
+// If the post-reclaim footprint still exceeds the budget, NOTHING is written and
+// errCloseOutUnbounded is returned. That is a definite terminal answer, not a
+// retry and not a mid-append ENOSPC.
 func appendRecoveryReleaseCertificate(
 	dir string,
 	scan *streamScan,
 	through uint64,
 	digest [32]byte,
 	scopes []RebindScope,
+	budget int64,
 ) error {
 	if scan == nil || through != scan.lastSeq || len(scopes) == 0 {
 		return errors.New("writeback: invalid recovery release certificate")
+	}
+	hexDigest := fmt.Sprintf("%x", digest)
+	// The APPLIED watermark and digest are values recovery computed just now,
+	// so they go through the ADMISSION encoder: nothing about them is legacy.
+	appliedPayload, err := encodeControlPayload(appliedFrame{Through: through, Digest: hexDigest})
+	if err != nil {
+		return err
+	}
+	releasePayloads := make([][]byte, len(scopes))
+	var releaseBytes int64
+	for i, scope := range scopes {
+		if scope.Scope == "" || scope.Epoch == "" {
+			return errors.New("writeback: invalid recovery release scope")
+		}
+		// Already durable in this stream: the frozen frame bound is the only
+		// bound that may apply.
+		payload, err := encodeDurableControlPayload(delegationFrame{Scope: scope.Scope, Epoch: scope.Epoch})
+		if err != nil {
+			return err
+		}
+		releasePayloads[i] = payload
+		releaseBytes += frameLen(len(payload))
+	}
+
+	segments, err := streamSegmentSizes(dir)
+	if err != nil {
+		return err
 	}
 	path, frameNo, end, err := abandonedStreamTail(&abandonedStream{dir: dir, scan: scan})
 	if err != nil {
 		return err
 	}
-	appliedPayload, err := encodeControlPayload(appliedFrame{
-		Through: through,
-		Digest:  fmt.Sprintf("%x", digest),
-	})
-	if err != nil {
-		return err
+	var used int64
+	for _, seg := range segments {
+		used += seg.size
 	}
-	body := encodeFrame(nil, frameApplied, frameNo+1, 0, appliedPayload)
-	frameNo++
-	for _, scope := range scopes {
-		if scope.Scope == "" || scope.Epoch == "" {
-			return errors.New("writeback: invalid recovery release scope")
+	// An identical mark may already be durable from an interrupted earlier
+	// close-out; re-emitting it would grow the log for nothing, and across a
+	// crash loop grow it without bound. It only counts when it sits in the
+	// segment the reclaim RETAINS — a mark inside a segment about to be deleted
+	// authorizes nothing.
+	appliedBytes := frameLen(len(appliedPayload))
+	if n := len(scan.frames); n > 0 {
+		tailOrdinal := scan.frames[n-1].ordinal
+		for _, fr := range scan.frames {
+			if fr.typ == frameApplied && fr.ordinal == tailOrdinal &&
+				bytes.Equal(fr.payload, appliedPayload) {
+				appliedBytes = 0
+				break
+			}
 		}
-		payload, err := encodeControlPayload(delegationFrame{Scope: scope.Scope, Epoch: scope.Epoch})
-		if err != nil {
+	}
+
+	if budget <= 0 || used+appliedBytes+releaseBytes <= budget {
+		var body []byte
+		if appliedBytes > 0 {
+			body = encodeFrame(body, frameApplied, frameNo+1, 0, appliedPayload)
+			frameNo++
+		}
+		for _, payload := range releasePayloads {
+			body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
+			frameNo++
+		}
+		return appendStreamTailFrames(path, end, body)
+	}
+
+	// Legacy accommodation. Every segment but the last is fully applied and
+	// unreferenced (offline recovery holds the store lock and has no readers).
+	var reclaimable int64
+	for _, seg := range segments[:len(segments)-1] {
+		reclaimable += seg.size
+	}
+	if reclaimable < appliedBytes || used-reclaimable+appliedBytes+releaseBytes > budget {
+		return fmt.Errorf(
+			"%w: %d live segment bytes plus a %d-byte close-out for %d scopes exceed the %d-byte budget (%d reclaimable)",
+			errCloseOutUnbounded, used, appliedBytes+releaseBytes, len(scopes), budget, reclaimable,
+		)
+	}
+
+	// Barrier A: the mark that authorizes the reclaim.
+	if appliedBytes > 0 {
+		body := encodeFrame(nil, frameApplied, frameNo+1, 0, appliedPayload)
+		if err := appendStreamTailFrames(path, end, body); err != nil {
 			return err
 		}
+		frameNo++
+		end += int64(len(body))
+	}
+	// Barrier B: reclaim, ascending, so every crash point leaves a contiguous
+	// ordinal suffix.
+	for _, seg := range segments[:len(segments)-1] {
+		if err := os.Remove(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("reclaim applied segment %s: %w", filepath.Base(seg.path), err)
+		}
+	}
+	if err := fsyncDir(dir); err != nil {
+		return fmt.Errorf("sync WAL directory after recovery reclaim: %w", err)
+	}
+	// Barrier C: the releases, now inside the budget.
+	var body []byte
+	for _, payload := range releasePayloads {
 		body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
 		frameNo++
+	}
+	return appendStreamTailFrames(path, end, body)
+}
+
+// segmentFile is one retained segment of an offline stream.
+type segmentFile struct {
+	path string
+	size int64
+}
+
+// streamSegmentSizes lists a stream's segments in ordinal order with their
+// on-disk sizes. Ordinals are zero-padded in the filename, so lexical order is
+// ordinal order — the same ordering scanStream and abandonedStreamTail use.
+func streamSegmentSizes(dir string) ([]segmentFile, error) {
+	names, err := filepath.Glob(filepath.Join(dir, "wb-*.pfw"))
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%w: stream %s has no segments", ErrCorrupt, dir)
+	}
+	sort.Strings(names)
+	out := make([]segmentFile, 0, len(names))
+	for _, name := range names {
+		info, err := os.Stat(name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, segmentFile{path: name, size: info.Size()})
+	}
+	return out, nil
+}
+
+// appendStreamTailFrames writes body at off in an offline stream's last segment
+// and makes it durable. A short write truncates back to off, so recovery never
+// leaves a half frame behind; an empty body is a no-op that still syncs nothing.
+func appendStreamTailFrames(path string, off int64, body []byte) error {
+	if len(body) == 0 {
+		return nil
 	}
 	active, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
-	n, writeErr := active.WriteAt(body, end)
+	n, writeErr := active.WriteAt(body, off)
 	if writeErr == nil && n != len(body) {
 		writeErr = io.ErrShortWrite
 	}
 	if writeErr != nil {
 		if n > 0 {
-			_ = active.Truncate(end)
+			_ = active.Truncate(off)
 		}
 		_ = active.Close()
 		return fmt.Errorf("append recovery release certificate: %w", writeErr)

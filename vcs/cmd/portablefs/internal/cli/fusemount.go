@@ -263,12 +263,89 @@ func (n *fuseNode) Setxattr(ctx context.Context, attr string, data []byte, flags
 	if flags&replaceBit != 0 {
 		wireFlags |= wal.XattrReplace
 	}
-	return xattrErrno(n.v.SetxattrFlags(ctx, p, n.state, attr, data, wireFlags))
+	return xattrErrno(fuseMutateStatus(ctx, n, fuseNodes(n.state), []string{p},
+		func(c context.Context) clientcore.Status {
+			return n.v.SetxattrFlags(c, p, n.state, attr, data, wireFlags)
+		}))
 }
 
 func (n *fuseNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	ctx = n.gateOp(ctx)
-	return xattrErrno(n.v.Removexattr(ctx, n.curPath(), n.state, attr))
+	p := n.curPath()
+	return xattrErrno(fuseMutateStatus(ctx, n, fuseNodes(n.state), []string{p},
+		func(c context.Context) clientcore.Status {
+			return n.v.Removexattr(c, p, n.state, attr)
+		}))
+}
+
+// ─── the FUSE frontend's pre-lock mutation admission ─────────────────────────
+//
+// FUSE has no namespace lock of its own, but the same argument as the daemon's
+// applies one layer down: clientcore takes NodeState and exact locks and the
+// engine takes e.mu, and a delegation transition or a backpressure wait inside
+// either blocks the open-pin and delegation-release machinery that must be able
+// to inspect those nodes. Resolving out here holds nothing.
+//
+// It is also the only place the namespace lane's BACKPRESSURE can be taken. A
+// delegated create/mkdir/rename/unlink/setattr/xattr that finds the metadata
+// lane momentarily full is answered ErrLaneChanged by the engine — never an
+// instant EIO — precisely so the wait happens here, where it costs one
+// operation instead of a mount.
+//
+// The loop is the unwind, not a retry-until-it-works: a lane resolved before
+// the call can be invalidated during it, and the second pass resolves the
+// authority lane unconditionally, which is not a claim about a grant. Every
+// pass shares ONE absolute operation deadline, so the loop terminates on a
+// definite interrupted outcome rather than on a pass count.
+
+// fuseMutate runs one value-returning namespace mutation under the classifier.
+func fuseMutate[T any](
+	ctx context.Context,
+	n *fuseNode,
+	nodes []*clientcore.NodeState,
+	paths []string,
+	run func(context.Context) (T, clientcore.Status),
+) (T, clientcore.Status) {
+	var zero T
+	opCtx, cancel := clientcore.WithOperationDeadline(ctx)
+	defer cancel()
+	for forceAuthority := false; ; forceAuthority = true {
+		mctx, settle, err := n.v.AdmitMutation(opCtx, nodes, forceAuthority, paths...)
+		if err != nil {
+			settle()
+			return zero, clientcore.MutationAdmissionStatus(err)
+		}
+		out, st := run(mctx)
+		settle()
+		if !clientcore.LaneChanged(st) {
+			return out, st
+		}
+	}
+}
+
+// fuseMutateStatus is fuseMutate for the mutations that answer with a status
+// and nothing else.
+func fuseMutateStatus(
+	ctx context.Context,
+	n *fuseNode,
+	nodes []*clientcore.NodeState,
+	paths []string,
+	run func(context.Context) clientcore.Status,
+) clientcore.Status {
+	_, st := fuseMutate(ctx, n, nodes, paths, func(c context.Context) (struct{}, clientcore.Status) {
+		return struct{}{}, run(c)
+	})
+	return st
+}
+
+func fuseNodes(states ...*clientcore.NodeState) []*clientcore.NodeState {
+	out := make([]*clientcore.NodeState, 0, len(states))
+	for _, s := range states {
+		if s != nil {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (n *fuseNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
@@ -434,6 +511,28 @@ func (n *fuseNode) writeOnce(
 	if st != fsproto.OK {
 		return 0, errno(st), false
 	}
+	if len(data) > 0 && cnt <= 0 {
+		// Zero committed progress for a non-empty payload is NOT a short
+		// write. A short write is progress an application can build on: it
+		// advances its buffer and issues the rest. Zero progress with no error
+		// is the one reply it cannot act on — the buffer is unchanged, nothing
+		// says why, and every libc write loop and io.Writer-shaped caller
+		// answers it by reissuing the identical request. That is a livelock on
+		// the positional lane and a duplication hazard on the appending one,
+		// where the retry resolves EOF a second time and cannot land on the
+		// first copy.
+		//
+		// The same rule already governs the count going the other way: this
+		// operation's admission (Volume.AdmitWrite) refuses to hand back a
+		// zero-byte grant without an error, because a zero-length successful
+		// write is not a signal any kernel write path can act on. What was
+		// GRANTED and what was COMMITTED answer to one contract, so the write
+		// ends in an errno rather than a success that made no progress.
+		//
+		// Positive counts stay short writes: those are correct, and the kernel
+		// reissues the remainder as a fresh request classified from scratch.
+		return 0, syscall.EIO, false
+	}
 	return uint32(cnt), 0, false
 }
 
@@ -462,13 +561,13 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, 
 		// a directory rule: EISDIR (CreateChild enforces it).
 		return n.g.CreateChild(ctx, n.EmbeddedInode(), cp, flags, mode, out)
 	}
-	var a fsproto.Attr
-	var st clientcore.Status
-	if flags&syscall.O_EXCL != 0 {
-		a, st = n.v.CreateExcl(ctx, cp, mode)
-	} else {
-		a, st = n.v.Create(ctx, cp, mode)
-	}
+	a, st := fuseMutate(ctx, n, nil, []string{cp},
+		func(c context.Context) (fsproto.Attr, clientcore.Status) {
+			if flags&syscall.O_EXCL != 0 {
+				return n.v.CreateExcl(c, cp, mode)
+			}
+			return n.v.Create(c, cp, mode)
+		})
 	if st != fsproto.OK {
 		return nil, nil, 0, errno(st)
 	}
@@ -497,7 +596,10 @@ func (n *fuseNode) Mkdir(ctx context.Context, name string, mode uint32, out *fus
 		// this is the only way a graft root comes into existence.
 		return n.g.MkdirChild(ctx, n.EmbeddedInode(), cp, mode, out)
 	}
-	a, st := n.v.Mkdir(ctx, cp, mode)
+	a, st := fuseMutate(ctx, n, nil, []string{cp},
+		func(c context.Context) (fsproto.Attr, clientcore.Status) {
+			return n.v.Mkdir(c, cp, mode)
+		})
 	if st != fsproto.OK {
 		return nil, errno(st)
 	}
@@ -513,7 +615,9 @@ func (n *fuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	if n.g.Owner(cp) != "" {
 		return n.g.Remove(cp, false)
 	}
-	return errno(n.v.Remove(ctx, cp, n.childState(name)))
+	child := n.childState(name)
+	return errno(fuseMutateStatus(ctx, n, fuseNodes(child), []string{cp},
+		func(c context.Context) clientcore.Status { return n.v.Remove(c, cp, child) }))
 }
 
 func (n *fuseNode) Rmdir(ctx context.Context, name string) syscall.Errno {
@@ -524,7 +628,9 @@ func (n *fuseNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		// while it has contents) — the npm-ci wholesale-rebuild path.
 		return n.g.Remove(cp, true)
 	}
-	return errno(n.v.Remove(ctx, cp, n.childState(name)))
+	child := n.childState(name)
+	return errno(fuseMutateStatus(ctx, n, fuseNodes(child), []string{cp},
+		func(c context.Context) clientcore.Status { return n.v.Remove(c, cp, child) }))
 }
 
 func (n *fuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
@@ -537,7 +643,11 @@ func (n *fuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 	if eno, handled := n.g.VolumeRenameCheck(oldp, newp); handled {
 		return eno
 	}
-	st := n.v.Rename(ctx, oldp, newp, n.childState(name), np.childState(newName))
+	src, dst := n.childState(name), np.childState(newName)
+	st := fuseMutateStatus(ctx, n, fuseNodes(src, dst), []string{oldp, newp},
+		func(c context.Context) clientcore.Status {
+			return n.v.Rename(c, oldp, newp, src, dst)
+		})
 	if st == fsproto.OK {
 		// A volume rename of a graft root's ancestor carries the graft and
 		// its machine-local backing to the new location.
@@ -553,7 +663,10 @@ func (n *fuseNode) Symlink(ctx context.Context, target, name string, out *fuse.E
 		// At a volume parent this can only be the graft root: EISDIR.
 		return n.g.SymlinkChild(ctx, n.EmbeddedInode(), target, cp, out)
 	}
-	a, st := n.v.Symlink(ctx, target, cp)
+	a, st := fuseMutate(ctx, n, nil, []string{cp},
+		func(c context.Context) (fsproto.Attr, clientcore.Status) {
+			return n.v.Symlink(c, target, cp)
+		})
 	if st != fsproto.OK {
 		return nil, errno(st)
 	}
@@ -574,7 +687,10 @@ func (n *fuseNode) Link(ctx context.Context, target fs.InodeEmbedder, name strin
 	if !ok {
 		return nil, syscall.EXDEV
 	}
-	a, st := n.v.Link(ctx, oldp, newp, src.state)
+	a, st := fuseMutate(ctx, n, fuseNodes(src.state), []string{oldp, newp},
+		func(c context.Context) (fsproto.Attr, clientcore.Status) {
+			return n.v.Link(c, oldp, newp, src.state)
+		})
 	if st != fsproto.OK {
 		return nil, errno(st)
 	}
@@ -617,7 +733,10 @@ func (n *fuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 		req.GID = gid
 		req.SetGID = true
 	}
-	a, st := n.v.Setattr(ctx, p, n.state, req)
+	a, st := fuseMutate(ctx, n, fuseNodes(n.state), []string{p},
+		func(c context.Context) (fsproto.Attr, clientcore.Status) {
+			return n.v.Setattr(c, p, n.state, req)
+		})
 	if st != fsproto.OK {
 		return errno(st)
 	}

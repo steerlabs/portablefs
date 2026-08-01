@@ -69,9 +69,17 @@ func TestTransientMetadataExhaustionIsNotENOSPC(t *testing.T) {
 			"would fit an empty lane and the next authority ack admits it, so an "+
 			"application is being told to delete files to fix a slow uplink", err)
 	}
-	if !errors.Is(err, ErrUplinkStalled) {
-		t.Fatalf("transient metadata exhaustion = %v, want the EIO-class "+
-			"ErrUplinkStalled the data lane produces for the same cause", err)
+	if errors.Is(err, ErrUplinkStalled) {
+		t.Fatalf("a transient metadata-lane full returned the watchdog's stall verdict "+
+			"(%v) from INSIDE e.mu, without consulting the watchdog at all. A healthy "+
+			"advancing stream that filled the reserve would abort mkdir(2) with EIO on a "+
+			"working mount, and the only recovery left to the application is a retry", err)
+	}
+	if !errors.Is(err, ErrLaneChanged) {
+		t.Fatalf("transient metadata exhaustion = %v, want ErrLaneChanged: the caller is "+
+			"inside e.mu and the frontend's namespace locks, where a wait is forbidden, so "+
+			"the only sound answer is the unwind that re-enters AdmitMetadataMutation "+
+			"outside them", err)
 	}
 }
 

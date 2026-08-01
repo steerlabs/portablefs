@@ -2156,7 +2156,6 @@ func scopeSet(paths []string) map[string]bool {
 	return got
 }
 
-
 // Rename and remove publish two names each (and every alias of whatever they
 // displace); the concrete lookup/enumerate scopes must not have regressed
 // those multi-name derivations.

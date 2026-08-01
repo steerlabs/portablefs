@@ -392,8 +392,16 @@ func TestStalledUplinkWriteRepliesEIONotENOSPC(t *testing.T) {
 	f := newWriteCreditFixture(t)
 	ctx := context.Background()
 
-	// Kill the uplink for real: admitted work can never be applied, so the
-	// watchdog's verdict becomes true on its own schedule.
+	// Admit real unshipped work, then take the whole lane, and only THEN kill
+	// the uplink.
+	//
+	// The order is the test's own determinism, not a detail. Fencing the session
+	// makes the flusher's next batch fail and SEALS the credit gate with the
+	// fence error, so a hold taken after the fence is racing the flusher's
+	// cadence for a gate that may already be closed — which is exactly how this
+	// test used to fail about half the time (`hold the data lane: granted=0 ...
+	// session fenced`). Saturating first cannot lose that race: the gate is
+	// healthy, the setpoint is whole, and the hold is deterministic.
 	f.releaseLane()
 	if _, eno := f.a.write(ctx, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
@@ -401,18 +409,11 @@ func TestStalledUplinkWriteRepliesEIONotENOSPC(t *testing.T) {
 	}); eno != 0 {
 		t.Fatalf("seed write: errno=%d", eno)
 	}
-	f.vol.Client().ExpireSession()
-	if _, eno := f.a.write(ctx, &pfslocal.WriteRequest{
-		Handle: delegatedHandle,
-		Offset: 64 << 10,
-		Data:   make([]byte, 64<<10),
-	}); eno != 0 && eno != darwinEIO {
-		t.Fatalf("write after fencing the session: errno=%d", eno)
-	}
 	if pending, _ := f.vol.WriteBackPending(); pending == 0 {
 		t.Skip("no unshipped backlog for the watchdog to judge")
 	}
 	f.holdWholeDataLane(t)
+	f.vol.Client().ExpireSession()
 
 	deadline := time.Now().Add(90 * time.Second)
 	for {

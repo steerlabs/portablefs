@@ -5,19 +5,6 @@ validation campaign. Updated as of the fix/root-architecture branch.
 
 ## Open
 
-### 1. Metadata mutations can still join an unbounded delegation drain
-
-The data plane no longer waits on the flush pipeline (see Fixed §8), but a
-namespace mutation (create/mkdir/rename/remove/setattr/setxattr) whose
-outcome the local overlay cannot decide still falls through into
-`ReleaseFor` and joins the drain of a delegation whose flush may be behind
-a slow or dead uplink. Volume is one wait per undecidable namespace op
-(versus the data plane's thousands per second), so the shared frontend
-gates now clear, but this is not a complete liveness proof for a fully
-blackholed authority. Root direction: the same
-acknowledged-locally-or-refused-definitely contract, extended to the
-namespace lane's drain dependency.
-
 ### 2. Path-scoped delegations vs inode-shared FSItems (documented boundary)
 
 A handoff for scope S that has already passed the frontend gate cannot be
@@ -137,6 +124,51 @@ radars for the API gaps.
 
 ## Fixed on fix/root-architecture
 
+- **One global lock order for every path-bearing transition** (closes the old
+  Open §1): the delegation transition claim is taken BEFORE the frontend's
+  namespace lock, for the namespace lane as well as the data lane
+  (`clientcore.AdmitMutation` + `writeback.Engine.PrepareDelegatedMutation`,
+  called from the daemon's single request dispatcher and from each FUSE
+  mutation). The classifier holds that claim through the locked mutation as a
+  TOKEN, so no acquisition can install a grant in the window the pre-lock
+  release opens, and `beginAuthorityMutation` is reduced to a pure coverage
+  CHECK that answers `ErrLaneChanged` — never a wait, never a drain — inside
+  the locks. Order: claim → nsMu → handle/inode locks → e.mu → WAL mutex.
+- **One absolute operation deadline**: `operationAdmissionBudget` (50s) is
+  installed once, outside the unwind loop, and covers classification, credit
+  or metadata backpressure, the delegation release a lane diversion needs, and
+  the authority RPC. Per-stage budgets compose (40s credit + an unbounded
+  post-expiry drain could exceed the 60s kernel ceiling); this one does not.
+  Chain: 30s + 5s < 40s < 50s < 60s.
+- **Namespace-lane backpressure** (the other half of the old Open §1): a
+  delegated namespace mutation that finds the metadata lane momentarily full is
+  answered `errMetadataHeadroom` (an `ErrLaneChanged`) under `e.mu` and paces on
+  applied progress OUTSIDE every lock in `Engine.AdmitMetadataMutation`, bounded
+  by the same watchdog-proved 40s budget. It used to be an instant fatal EIO on
+  a healthy, advancing mount, whose only recovery was an application retry.
+  `ErrUplinkStalled` now comes only from the watchdog; ENOSPC stays where the
+  exact payload sizes are known (the WAL reservation).
+- **An unclassified authority status is retryable, not terminal**: the flusher
+  parks a stream as a terminal `ErrConflict` only for a PROVEN contradiction
+  about the batch's own content (EINVAL typed corruption, EPERM out-of-scope
+  records) and fences on ESTALE; every other status — including the authority's
+  catch-all EIO and any status a future authority adds — retries under the
+  no-progress watchdog. One status-5 reply used to latch `ErrFailedClosed` and
+  take a live mount to EIO permanently with its backlog undrained. The authority
+  side no longer emits that catch-all for a flush apply failure either: an
+  authority-machinery failure answers the typed retryable EAGAIN (the existing
+  wire value, because pre-fix clients park on any code they do not recognise).
+- **Legacy PFW5 streams reach a definite recovery outcome**: control-frame field
+  caps are ADMISSION-only; values already durable in a stream are re-emitted
+  through a durable encoder bounded only by the frozen frame decoder, and the
+  recovery close-out is budget-aware and crash-safe (exact costs, reclaim the
+  fully-applied prefix, typed terminal conflict rather than an unbounded retry).
+- **Credit occupancy and debt are one atomic state**: the fast path can no
+  longer commit an admission decided against a queue snapshot taken before a
+  waiter published itself.
+- **Zero committed progress is EIO on both frontends**: a non-empty write that
+  commits nothing is never answered as a successful zero-byte write (there is no
+  such POSIX outcome); positive counts remain short writes.
 - **Drain-time credit controller (write backpressure)**: the instant-
   ENOSPC cliff at the WAL budget is gone. Writes burst to a setpoint
   (measured authority-applied rate × 25s drain target, capped at the

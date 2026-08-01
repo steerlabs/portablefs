@@ -375,11 +375,40 @@ func (r *exclusionRelease) held() bool {
 // read side, recheck every affected path, and release any grant that won
 // first. Keeping the read side through the authority RPC prevents a new local
 // grant from being recalled by this mount's own in-flight write-through.
+//
+// It has TWO callers with two different postures, and the difference is the
+// whole lock-order contract (see mutationadmit.go):
+//
+//   - A CLASSIFIED operation arrives carrying a transition token: the claim was
+//     taken and every operand released before the frontend took a single lock,
+//     and the token still holds that claim. This function then only CHECKS that
+//     the token covers the operand set the operation actually reached, and
+//     answers ErrLaneChanged if it does not. It never begins a claim, never
+//     waits for one, and never releases — all three are forbidden here because
+//     the caller is inside a.nsMu and its handle locks.
+//
+//   - A DIRECT embedder (the package's own API, tests, any caller holding
+//     nothing) arrives with no token, and gets the full behaviour: begin the
+//     claim, re-snapshot, extend, release. Waiting is free for a caller that
+//     holds no frontend lock, which is exactly the condition for taking this
+//     path.
 func (v *Volume) beginAuthorityMutation(
 	ctx context.Context,
 	nodes []*NodeState,
 	operands ...string,
 ) (context.Context, func(), error) {
+	if token := transitionTokenOf(ctx); token != nil {
+		paths, inos := v.hardlinkMutationTargets(nodes, operands...)
+		if !token.covers(paths, inos) {
+			// The operand set widened or moved between classification and here
+			// — a rename won the race, or an alias of a hard-linked inode became
+			// known. Extending the claim could block on an overlapping
+			// acquisition and releasing the new operand would be a drain, so the
+			// only answer that keeps the locked region pure is the unwind.
+			return ctx, nil, writeback.ErrLaneChanged
+		}
+		return v.parkTransferContext(ctx, token.guard), func() {}, nil
+	}
 	paths, inos := v.hardlinkMutationTargets(nodes, operands...)
 	// A conflicting active claim can be a remote acquire resolver mid-RPC,
 	// so admission into the transition gate is an authority-bound wait: the
