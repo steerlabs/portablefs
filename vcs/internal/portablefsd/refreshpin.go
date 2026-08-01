@@ -50,6 +50,10 @@ package portablefsd
 //     (refreshintent.go). Without the intent the second bullet had no
 //     counterpart: the refresh could only refuse and retry, and ordinary
 //     contention exhausted its budget into a terminal coherence failure.
+//   - Both claims are taken and given up through the item's one arrival order
+//     (itemturnstile.go), so "waits for" is a queue and not a race. Without it
+//     the intent's fairness ran one way only, and a stream of refresh passes
+//     could take the item ahead of an already-queued writer indefinitely.
 //
 // Both sides transition under a.mu, so for any (refresh, mutation) pair exactly
 // one of two things is true: the reservation was visible when the refresh
@@ -148,6 +152,9 @@ func (a *attach) pinRefreshItemLocked(itemID uint64) func() {
 		if a.refreshPins[itemID] == pin {
 			delete(a.refreshPins, itemID)
 		}
+		// The item may have become grantable; hand it on inside the hold that
+		// gave it up (itemturnstile.go).
+		a.advanceItemQueueLocked(itemID)
 		a.mu.Unlock()
 		pin.release()
 	}
@@ -202,6 +209,12 @@ func (a *attach) retireRefreshWindowLocked(
 		return nil
 	}
 	delete(a.refreshPins, itemID)
+	// Retiring the pin can make the item's next claim grantable, and the grant
+	// belongs in THIS hold: a claim handed out after it is a claim that could
+	// have been overtaken (itemturnstile.go). The pass's intent is normally
+	// still installed here, in which case nothing is grantable yet and this is
+	// inert — the intent's own release runs the queue again.
+	a.advanceItemQueueLocked(itemID)
 	return held
 }
 
@@ -211,15 +224,18 @@ func (a *attach) sizeMutationReservedLocked(itemID uint64) bool {
 	return a.sizeMutationReservations[itemID] > 0
 }
 
-// reserveSizeMutation is the mutation half of the token. It waits out any
-// pinned refresh on itemID — and any refresh that has declared an INTENT on it
-// but has not pinned yet (refreshintent.go) — and then registers this mutation,
-// returning the release.
+// reserveSizeMutation is the mutation half of the token. It takes this
+// mutation's place in the item's arrival order (itemturnstile.go) and returns
+// the release once the item has been handed to it — which happens only after
+// every claim that arrived earlier has been served, and never while a refresh
+// intent or pin is installed.
 //
-// Waiting for the intent as well as the pin is what makes the protocol FAIR.
-// Without it a refresh had no claim of its own: it could only re-check what was
-// reserved at each of its 41 ticks, so a stream of ordinary overlapping writers
-// starved it out of its whole budget and the failure was terminal at its caller.
+// Waiting for the intent as well as the pin is what makes the protocol fair to
+// the REFRESH: without it a refresh had no claim of its own, and a stream of
+// overlapping writers starved it out of its whole budget into a terminal
+// coherence failure. Taking a numbered ticket for that wait is what makes it
+// fair in the other direction too: a mutation that queues is recorded, so the
+// next refresh in a stream cannot be handed the item ahead of it.
 //
 // The wait is bounded by ctx — the request's own operation deadline — and its
 // refusal is EINTR, which is honest: nothing has been attempted, and the
@@ -234,24 +250,19 @@ func (a *attach) reserveSizeMutation(ctx context.Context, itemID uint64) (func()
 	if itemID == 0 {
 		return nil, 0
 	}
-	for {
-		a.mu.Lock()
-		blocked := a.refreshIntentBlockerLocked(itemID)
-		if blocked == nil {
-			if a.sizeMutationReservations == nil {
-				a.sizeMutationReservations = map[uint64]int{}
-			}
-			a.sizeMutationReservations[itemID]++
-			a.mu.Unlock()
-			return a.releaseSizeMutationOnce(itemID), 0
-		}
-		a.mu.Unlock()
-		select {
-		case <-blocked:
-		case <-ctx.Done():
-			return nil, darwinEINTR
+	a.mu.Lock()
+	ticket := a.takeItemTicketLocked(itemID, ticketMutation)
+	a.advanceItemQueueLocked(itemID)
+	a.mu.Unlock()
+	queued := func() {
+		if hook := a.testSizeMutationQueued; hook != nil {
+			hook(itemID)
 		}
 	}
+	if !a.awaitItemTicket(ctx.Done(), itemID, ticket, queued) {
+		return nil, darwinEINTR
+	}
+	return a.releaseSizeMutationOnce(itemID), 0
 }
 
 func (a *attach) releaseSizeMutationOnce(itemID uint64) func() {
