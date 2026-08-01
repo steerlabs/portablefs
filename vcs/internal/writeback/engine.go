@@ -988,6 +988,24 @@ func (e *Engine) PrepareDelegatedMutation(
 // release pairs with a successful admit.
 func (e *Engine) release(admission) { e.mu.Unlock() }
 
+// releaseForResolvedLane is ReleaseFor for a release discovered by a CLASSIFIED
+// operation — one that reached the engine already inside the frontend's
+// namespace, name and handle locks.
+//
+// The same rule as fallThroughLocked, and for the same reason: a release drains
+// the covering grant's whole unshipped tail through an uplink that is already
+// behind, and under a writer-preferring RWMutex's read side that parks the next
+// rename, remove or reclaim and every reader behind it. So a classified
+// operation is answered ErrLaneChanged, unwinds with every lock released, and
+// pays for the release outside them. An unclassified caller holds nothing and
+// pays for it here.
+func (e *Engine) releaseForResolvedLane(ctx context.Context, paths ...string) error {
+	if resolvedLaneOf(ctx) != LaneUnresolved {
+		return ErrLaneChanged
+	}
+	return e.ReleaseFor(ctx, paths...)
+}
+
 // fallThroughLocked is the ONE escape from delegated mode: the engine
 // cannot (or must not) acknowledge this mutation locally, so every
 // delegation covering the touched paths drains and RELEASES before the
@@ -2101,7 +2119,7 @@ func (e *Engine) listxattr(path string) ([]string, bool) {
 // conservatively release the grant and use the authority lane.
 func (e *Engine) Setxattr(ctx context.Context, path, name string, value []byte, flags uint8) (bool, error) {
 	if e.cfg.DisableDelegatedXattrs {
-		return false, e.ReleaseFor(ctx, path)
+		return false, e.releaseForResolvedLane(ctx, path)
 	}
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
@@ -2137,7 +2155,7 @@ func (e *Engine) Setxattr(ctx context.Context, path, name string, value []byte, 
 // rule as Setxattr, preserving ENODATA exactly.
 func (e *Engine) Removexattr(ctx context.Context, path, name string) (bool, error) {
 	if e.cfg.DisableDelegatedXattrs {
-		return false, e.ReleaseFor(ctx, path)
+		return false, e.releaseForResolvedLane(ctx, path)
 	}
 	adm, ok, err := e.admit(ctx, path)
 	if !ok {
@@ -2515,9 +2533,20 @@ type Status struct {
 
 // DelegationStatus is one held scope's view.
 type DelegationStatus struct {
-	Scope    string
-	Epoch    string
+	Scope string
+	Epoch string
+	// Draining means a release attempt is IN FLIGHT — still waiting on the
+	// authority, with no verdict yet. It is deliberately false once DrainError
+	// is set: a scope whose attempt reached a definite outcome is not draining,
+	// it is FAILED, and the difference is the whole point. A scope reported as
+	// draining forever is the wedge shape (delegation.go, finishRelease); a
+	// scope reported as failed carries a reason, refuses new mutations with that
+	// reason instead of parking them, and can be retried or force-detached.
 	Draining bool
+	// DrainError is the recorded verdict of the last release attempt, empty when
+	// there is none. ErrUplinkStalled here means the flusher's watchdog declared
+	// the far end dead while this scope's drain was outstanding.
+	DrainError string
 }
 
 func (e *Engine) Status() Status {
@@ -2535,7 +2564,15 @@ func (e *Engine) Status() Status {
 		st.WALBytes = e.wal.DiskBytes()
 	}
 	for _, d := range e.delegations {
-		st.Delegations = append(st.Delegations, DelegationStatus{Scope: d.scope, Epoch: d.epoch, Draining: d.draining})
+		view := DelegationStatus{
+			Scope:    d.scope,
+			Epoch:    d.epoch,
+			Draining: d.draining && d.drainErr == nil,
+		}
+		if d.drainErr != nil {
+			view.DrainError = d.drainErr.Error()
+		}
+		st.Delegations = append(st.Delegations, view)
 	}
 	e.mu.RUnlock()
 	sort.Slice(st.Delegations, func(i, j int) bool { return st.Delegations[i].Scope < st.Delegations[j].Scope })

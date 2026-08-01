@@ -58,6 +58,21 @@ const (
 	// for both fields (no flags set; an inode from a pre-revision tree), so no
 	// observed attribute can distinguish "unsupported" from "genuinely zero".
 	FeatureFlagPersistence
+	// FeatureMutationAttrs advertises that this authority carries the post-op
+	// attributes of every name a mutation's version stamp covers on the
+	// mutation reply itself (Response.PostAttrs), anchored to the reply's
+	// Version/Gen. A client that sees the bit INSTALLS those attributes in its
+	// version-gated caches instead of self-invalidating and re-reading them;
+	// without the bit it keeps evicting, exactly as before.
+	//
+	// A capability BIT rather than an empty-slice sniff, for the same reason as
+	// the bit above: an empty PostAttrs is a legitimate answer (a mutation
+	// whose stamp covers no nameable path — a handle- or orphan-addressed
+	// write), so the observed reply cannot distinguish "this authority does not
+	// speak it" from "there was nothing to report". Selecting the lane from the
+	// probe makes the difference a pre-mutation decision, never a
+	// failed-operation downgrade.
+	FeatureMutationAttrs
 )
 
 // OpProtocolVersion is the version probe. Its value is deliberately far above the

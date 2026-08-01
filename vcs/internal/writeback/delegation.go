@@ -425,14 +425,22 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 	}
 	w := e.wal
 	e.mu.RUnlock()
+	// target is THIS SCOPE'S OWN admitted tail, not the stream's. See
+	// flusher.scopeTail: a release is a claim about what this grant acknowledged
+	// locally, and nothing at all about the rest of a shared stream. Zero means
+	// the scope has nothing unshipped, so any applied watermark satisfies it.
+	// The snapshot is stable because d.draining is already set, so no further
+	// record can join the scope behind it.
 	var target uint64
 	if w != nil {
-		target = w.LastSeq()
 		if err := w.Sync(); err != nil {
 			return e.failRelease(d, attempt, e.failLocalWAL("pre-release sync", err))
 		}
-		if err := e.fl.drainThrough(ctx, target); err != nil {
-			return e.failRelease(d, attempt, err)
+		if tail, unshipped := e.fl.scopeTail(d.scope); unshipped {
+			target = tail
+			if err := e.fl.drainThrough(ctx, target); err != nil {
+				return e.failRelease(d, attempt, err)
+			}
 		}
 	}
 	select {

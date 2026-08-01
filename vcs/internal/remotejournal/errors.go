@@ -119,16 +119,34 @@ func retryableSQLFailure(err error) bool {
 	return errors.As(err, &network)
 }
 
-// callJSONB runs one SQL function call returning JSONB, bounded by the
-// per-call timeout and fenced by the lifecycle context.
+// callJSONB runs one SQL function call returning JSONB on the DATA-PLANE
+// seam, bounded by the per-call timeout and fenced by the lifecycle context.
 func (l *Log) callJSONB(parent context.Context, sql string, args ...any) ([]byte, error) {
+	return l.callJSONBOn(l.pool, parent, sql, args...)
+}
+
+// livenessDB resolves the seam the fencing probe speaks through: the reserved
+// liveness connection in every production open path. A directly constructed
+// Log (unit tests, benchmarks, the pre-claim provisioning probe) was handed
+// exactly one seam and uses it — production isolation is established at open,
+// not chosen per call.
+func (l *Log) livenessDB() journalDB {
+	if l.livenessPool != nil {
+		return l.livenessPool
+	}
+	return l.pool
+}
+
+// callJSONBOn is callJSONB against an explicit seam, so the liveness probe can
+// name the reserved connection instead of the data-plane pool.
+func (l *Log) callJSONBOn(db journalDB, parent context.Context, sql string, args ...any) ([]byte, error) {
 	if parent == nil {
 		parent = l.life
 	}
 	ctx, cancel := context.WithTimeout(parent, l.cfg.CallTimeout)
 	defer cancel()
 	var raw []byte
-	if err := l.pool.QueryRow(ctx, sql, args...).Scan(&raw); err != nil {
+	if err := db.QueryRow(ctx, sql, args...).Scan(&raw); err != nil {
 		return nil, err
 	}
 	return raw, nil

@@ -153,6 +153,10 @@ type writeBackStatus struct {
 type delegationView struct {
 	Scope    string `json:"scope"`
 	Draining bool   `json:"draining,omitempty"`
+	// DrainError is the recorded verdict of a release attempt that reached a
+	// definite outcome. Draining and DrainError are mutually exclusive: an
+	// attempt is either still in flight or it has an answer.
+	DrainError string `json:"drainError,omitempty"`
 }
 
 type recoveryJobRef struct {
@@ -902,6 +906,10 @@ type attach struct {
 	// itself issues through the mount so the setattr handler can consume them
 	// without touching the authority.
 	expectedTruncates map[string]expectedTruncate
+	// expectedTruncateSeq names each marker uniquely, so the refresh that
+	// installed one retires exactly that one and a later marker for the same
+	// path is never mistaken for it.
+	expectedTruncateSeq uint64
 	// Exact refreshes for one item are one sample→truncate/page-invalidate→
 	// verify transaction. Context-selectable channel stripes bound memory,
 	// prevent concurrent passes from overwriting each other's truncate
@@ -1008,6 +1016,21 @@ type attach struct {
 	// Test seam for the secure kernel refresh syscall; nil in production.
 	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64) (kernelRefreshOutcome, error)
 	testExactKernelRefresh func(context.Context, uint64) error
+	// testMutationAdmissionBarrier stands in, for tests, for the pre-lock
+	// admission park a real metadata or credit lane can impose. It exists to make
+	// the dispatcher-ordering contract testable: a request held here must be
+	// holding no frontend lock at all.
+	testMutationAdmissionBarrier func()
+	// testForcedDetachFenced fires the instant a forced detach has parked its
+	// tail and fenced, BEFORE it takes the namespace locks. It exists to make
+	// that ordering testable: the escape hatch must reach its fence whatever is
+	// holding the namespace.
+	testForcedDetachFenced func()
+	// testControlAdmissionProbe is called with the control plane's resolved
+	// operation context at the moment its pre-lock admission completes, so a test
+	// can observe both halves of the contract: what the namespace gate is doing
+	// and what bound the mutation will run under.
+	testControlAdmissionProbe func(context.Context)
 	// Test seam standing in for a NodeState mutex the recall path is about to
 	// contend for. It runs at exactly the point onMarkOrphan would block on
 	// n.mu, so a test can assert the recall path is not holding a.mu there.
@@ -1278,7 +1301,12 @@ func (a *attach) controlAdmissionError() error {
 	case a.detached:
 		return fmt.Errorf("attach is detached")
 	case a.detachPrepared || a.detachForce:
-		return fmt.Errorf("attach is quarantined by a durable prepared detach")
+		// ONE sentence for this state, shared with detach. It used to be
+		// described two different ways — "quarantined" here, "reconcile through
+		// the exact unmount endpoint" there — so an operator whose plain umount
+		// and whose --force were both refused had two unrelated messages and no
+		// way to tell they named the same condition or which command resolves it.
+		return errPreparedDetachPending
 	case a.coherenceFailFrozen:
 		return fmt.Errorf("%s", a.lastErr)
 	default:
@@ -1554,10 +1582,28 @@ func (a *attach) setCredential(tok string) {
 // the caller to surface.
 func (a *attach) detach(ctx context.Context, force bool) (jobID string, err error) {
 	_ = ctx
+	if force {
+		// FORCED DETACH TAKES NO NAMESPACE LOCK UNTIL IT HAS FENCED.
+		//
+		// The whole purpose of --force is to abandon in-flight work, so queueing
+		// it behind that work is a contradiction — and it was a live one: with a
+		// delegation release parked in an unbounded drain, one 12-minute nsMu
+		// writer had ~100 frontend goroutines behind it, and every `umount
+		// --force` joined the same queue. The escape hatch could not break into
+		// the mount it exists to abandon; only killing the daemon recovered it.
+		//
+		// So the fence comes first. CloseJournalDurable parks the acknowledged
+		// tail as a durable recovery job and fences the engine, which is what
+		// gives every operation still inside the namespace locks a definite
+		// outcome (ErrFenced). The terminal transition then takes those locks
+		// against work that is already converging rather than against work that
+		// is waiting on an authority which has stopped answering.
+		return a.forcedDetach()
+	}
 	// Quiesce every namespace/handle operation through the complete drain
 	// decision. A failed normal detach releases this lock with the attach and
-	// Volume still usable; a successful/forced detach publishes the terminal
-	// flag before operations can resume.
+	// Volume still usable; a successful detach publishes the terminal flag
+	// before operations can resume.
 	a.frontendSerial.Lock()
 	a.nsMu.Lock()
 	a.mu.RLock()
@@ -1574,18 +1620,10 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	if prepared {
 		a.nsMu.Unlock()
 		a.frontendSerial.Unlock()
-		return existingJobID, fmt.Errorf("attach has a durable prepared FSKit detach; reconcile it through the exact unmount endpoint")
+		return existingJobID, errPreparedDetachPending
 	}
 	if vol != nil {
-		if force {
-			id, cerr := vol.CloseJournalDurable()
-			jobID = id
-			if cerr != nil {
-				err = fmt.Errorf("forced detach: journal-durable close: %w", cerr)
-			} else if id != "" {
-				log.Printf("portablefsd: detach %s: forced; recovery job %s parked durably (recovers on the next attach)", a.ref, id)
-			}
-		} else if cerr := vol.Close(); cerr != nil {
+		if cerr := vol.Close(); cerr != nil {
 			// Close freezes admissions around the final drain and visibility
 			// barrier. It is retryable on failure and has not cancelled the
 			// Volume or parked its WAL. Keep the attach serving.
@@ -1595,6 +1633,63 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 			return "", fmt.Errorf("detach refused: final drain/release barrier failed with %d records (%d bytes) unshipped: %w (retry when the authority answers, or force-detach to park them as a durable recovery job)", recs, bytes, cerr)
 		}
 	}
+	return a.finishDetachWithNSLocked(jobID, err)
+}
+
+// errPreparedDetachPending is the ONE next action a caller is given when an
+// attach already carries a durable prepared FSKit detach. Both unmount paths
+// used to refuse with a different sentence — plain umount said the mount was
+// quarantined, --force said to reconcile through the exact unmount endpoint —
+// so an operator reading either one had no way to know that the two were
+// describing the same state and that only one endpoint could resolve it.
+var errPreparedDetachPending = errors.New(
+	"attach has a durable prepared FSKit detach: reconcile it through POST " +
+		"/v1/attaches/{ref}/unmount (portablefs umount), which is the only " +
+		"operation that can complete or discharge it",
+)
+
+// forcedDetach parks the acknowledged tail and fences the engine BEFORE it takes
+// the namespace locks. See detach for why the order is the whole point.
+func (a *attach) forcedDetach() (jobID string, err error) {
+	a.mu.RLock()
+	alreadyDetached := a.detached
+	existingJobID := a.detachJobID
+	vol := a.vol
+	prepared := a.detachPrepared || a.detachForce
+	a.mu.RUnlock()
+	if alreadyDetached {
+		return existingJobID, nil
+	}
+	if prepared {
+		return existingJobID, errPreparedDetachPending
+	}
+	if vol != nil {
+		id, cerr := vol.CloseJournalDurable()
+		jobID = id
+		if cerr != nil {
+			err = fmt.Errorf("forced detach: journal-durable close: %w", cerr)
+		} else if id != "" {
+			log.Printf("portablefsd: detach %s: forced; recovery job %s parked durably (recovers on the next attach)", a.ref, id)
+		}
+	}
+	if fenced := a.testForcedDetachFenced; fenced != nil {
+		fenced()
+	}
+	// The engine is fenced and the tail is durable. Every operation still inside
+	// the namespace locks now reaches a definite outcome, so this acquisition
+	// waits on work that is converging rather than on an authority that stopped
+	// answering.
+	a.frontendSerial.Lock()
+	a.nsMu.Lock()
+	a.mu.RLock()
+	if a.detached {
+		existingJobID = a.detachJobID
+		a.mu.RUnlock()
+		a.nsMu.Unlock()
+		a.frontendSerial.Unlock()
+		return existingJobID, err
+	}
+	a.mu.RUnlock()
 	return a.finishDetachWithNSLocked(jobID, err)
 }
 
@@ -1702,7 +1797,9 @@ func newWriteBackStatus(st writeback.Status) *writeBackStatus {
 		Delegations: make([]delegationView, 0, len(st.Delegations)),
 	}
 	for _, d := range st.Delegations {
-		wb.Delegations = append(wb.Delegations, delegationView{Scope: d.Scope, Draining: d.Draining})
+		wb.Delegations = append(wb.Delegations, delegationView{
+			Scope: d.Scope, Draining: d.Draining, DrainError: d.DrainError,
+		})
 	}
 	now := time.Now().UnixMilli()
 	for _, j := range st.Jobs {

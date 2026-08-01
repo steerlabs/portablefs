@@ -1104,11 +1104,18 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   // writable buffer can never accumulate a backlog of stale lease frames
   // that a stalled child could consume later and mistake for freshness.
   // Every delivered frame carries the next monotonic per-child sequence;
-  // the child fences on any non-increasing sequence. write() returning
-  // false (buffer above the high-water mark: the child is not consuming its
-  // fencing clock), a write error, or a closed pipe is FATAL for that
-  // child. This complements the capability-bound DB lease facts: the frame
-  // stream is fresh by construction or the child dies.
+  // the child fences on any non-increasing sequence.
+  //
+  // A write ERROR or a closed pipe is FATAL for that child: those are proof
+  // the channel is gone. write() returning FALSE is not — it is Node's
+  // documented flow-control signal ("buffered above the high-water mark,
+  // wait for 'drain'"), and treating it as death made a momentarily busy
+  // child indistinguishable from a dead one. Nothing is lost by respecting
+  // it: coalescing already caps the buffer at one frame, the write callback
+  // resumes delivery when the frame reaches the OS, and a child that truly
+  // stops draining stops receiving extensions and fences ITSELF on the
+  // capability-bound database deadline — the authoritative fence, which the
+  // manager cannot improve on by guessing from its own send buffer.
   // ------------------------------------------------------------------
 
   private writeHeartbeatFrames(dbTimeMs: number, claimExpiresAtDbMs: number): void {
@@ -1156,9 +1163,8 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       dbTimeMs: Math.floor(facts.dbTimeMs),
       leaseRemainingMs: Math.max(0, Math.floor(facts.claimExpiresAtDbMs - facts.dbTimeMs)),
     };
-    let delivered = false;
     try {
-      delivered = authority.heartbeat.write(`${JSON.stringify(frame)}\n`, (error) => {
+      authority.heartbeat.write(`${JSON.stringify(frame)}\n`, (error) => {
         authority.heartbeatBusy = false;
         if (error) {
           this.fenceHeartbeat(authority, `lease frame write failed: ${error.message}`);
@@ -1177,12 +1183,6 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
         `lease frame write threw: ${error instanceof Error ? error.message : String(error)}`
       );
       return;
-    }
-    if (!delivered) {
-      this.fenceHeartbeat(
-        authority,
-        "lease pipe backpressure (the child is not consuming its fencing clock)"
-      );
     }
   }
 

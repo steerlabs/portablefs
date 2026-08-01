@@ -295,6 +295,10 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 		return fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if st := validateXattr(name, value, flags, true); st != fsproto.OK {
 		return st
@@ -337,6 +341,10 @@ func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, nam
 		return fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if st := validateXattr(name, nil, 0, false); st != fsproto.OK {
 		return st

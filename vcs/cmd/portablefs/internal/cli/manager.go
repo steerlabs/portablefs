@@ -90,23 +90,26 @@ func ambiguousFailure(err error) bool {
 	return he.Status >= 500 || he.Status == 408 || he.Status == 429
 }
 
-// leaseTerminal reports whether the manager answered with a TYPED code
-// saying this lease can never renew again. The codes are the manager's
-// stable ACCESS_LEASE_* envelope (apps/authority-manager access-lease routes):
-// epoch-superseded and unknown-lease are what every mount sees after a
-// manager restart (lease state is scoped to the manager epoch), the terminal
-// trio after a release/expiry/revoke, unauthorized after a rotation this
-// client missed. Checked BEFORE the ambiguity rule because epoch-superseded
-// ships as a 503, which would otherwise read as "retry the same renew" and
-// leave the mount renewing a dead lease forever.
-func leaseTerminal(err error) bool {
+// leaseDefinitelyEnded reports whether the manager gave a DEFINITE answer
+// about THIS LEASE saying it can never renew again. The codes are the
+// manager's stable ACCESS_LEASE_* envelope (apps/authority-manager
+// access-lease routes):
+//
+//	404 ACCESS_LEASE_NOT_FOUND    the lease does not exist
+//	409 ACCESS_LEASE_REVOKED      ended (e.g. endReason "authority-retired")
+//	409 ACCESS_LEASE_RELEASED     ended by a release
+//	409/410 ACCESS_LEASE_EXPIRED  ended by expiry
+//	401 ACCESS_LEASE_UNAUTHORIZED our token no longer authenticates it
+//
+// Every one of these is a statement about the LEASE, and every one is final:
+// the keeper fails closed and never mints a replacement lease identity.
+func leaseDefinitelyEnded(err error) bool {
 	var he *httpError
 	if !errors.As(err, &he) {
 		return false
 	}
 	switch he.Code {
-	case "ACCESS_LEASE_EPOCH_SUPERSEDED",
-		"ACCESS_LEASE_NOT_FOUND",
+	case "ACCESS_LEASE_NOT_FOUND",
 		"ACCESS_LEASE_EXPIRED",
 		"ACCESS_LEASE_REVOKED",
 		"ACCESS_LEASE_RELEASED",
@@ -114,6 +117,27 @@ func leaseTerminal(err error) bool {
 		return true
 	}
 	return false
+}
+
+// leaseEpochSuperseded reports the one typed answer that is about the
+// MANAGER, not about the lease: 503 ACCESS_LEASE_EPOCH_SUPERSEDED means the
+// manager instance we reached discovered its own claim was superseded and
+// refused to answer — "reacquire against the new manager". It says NOTHING
+// about whether this lease is still live; the successor manager still holds
+// the same durable lease ledger and may renew it unchanged.
+//
+// So supersession leaves the renewal UNRESOLVED, not finished. Replaying it
+// is not minting anything: identical accessLeaseId, identical accessToken,
+// identical expectedControlSeq, identical operationId. It is the same
+// renewal, completed against whoever now owns the epoch — and it converges,
+// because the successor answers definitely (renewed, or ended). Treating it
+// as terminal is what turned every manager epoch change into a dead mount.
+func leaseEpochSuperseded(err error) bool {
+	var he *httpError
+	if !errors.As(err, &he) {
+		return false
+	}
+	return he.Code == "ACCESS_LEASE_EPOCH_SUPERSEDED"
 }
 
 // leaseWire is the lease shape shared by the create/renew/release responses
@@ -273,14 +297,24 @@ type leaseKeeper struct {
 	// a persisted status) instead of leaving a silent EIO zombie.
 	credWatch *credentialWatch
 
+	// now is the clock the expiry bound is measured against (injectable in
+	// tests). The bound itself is the lease's OWN expiry — a deadline the
+	// protocol already defines, never a retry budget invented here.
+	now func() time.Time
+
 	mu           sync.Mutex
 	lease        leaseState
-	pendingRenew string // retained operationId: ambiguous renew failures retry the SAME id
-	terminal     bool
+	pendingRenew string // retained operationId: an unresolved renew replays the SAME id
+	// unresolved records that the last renewal neither succeeded nor received
+	// a definite answer (ambiguous transport/5xx, or epoch supersession). The
+	// keeper then retries at the minimum cadence instead of half the TTL, so
+	// the renewal converges well inside the lease's own expiry.
+	unresolved bool
+	terminal   bool
 }
 
 func newLeaseKeeper(manager *managerClient, tokens *sessionTokenSource, initial leaseState, onUpdate func(leaseState)) *leaseKeeper {
-	return &leaseKeeper{manager: manager, tokens: tokens, onUpdate: onUpdate, lease: initial}
+	return &leaseKeeper{manager: manager, tokens: tokens, onUpdate: onUpdate, lease: initial, now: time.Now}
 }
 
 func (k *leaseKeeper) applyUpdate(lease leaseState) {
@@ -298,9 +332,23 @@ func (k *leaseKeeper) snapshot() leaseState {
 	return k.lease
 }
 
-// renewOnce performs one renewal. An ambiguous failure retains the
-// operationId so the next tick replays the SAME renewal (the manager's
-// receipts make that idempotent); a definitive failure stops this lease.
+// renewOnce performs one renewal and classifies the answer into exactly three
+// outcomes — the same three the manager actually distinguishes:
+//
+//	RENEWED    a fresh lease slice; the identity is unchanged.
+//	ENDED      a definite answer about this lease (leaseDefinitelyEnded) or any
+//	           other definitive refusal (CAS conflict, evicted receipt, 4xx).
+//	           Fail closed. A replacement lease identity is NEVER minted here.
+//	UNRESOLVED nobody has answered yet: transport failure, an untyped 5xx, or
+//	           503 ACCESS_LEASE_EPOCH_SUPERSEDED. The SAME operationId is
+//	           retained and the SAME renewal is replayed next tick, bounded by
+//	           the lease's own expiry — the protocol's existing deadline, so
+//	           the loop always terminates definitely.
+//
+// The middle and last rows used to be one row. Epoch supersession sat in the
+// terminal set, so a manager epoch change (and, once the hosted broker
+// flattened 409 REVOKED into 404, an authority retirement too) killed a mount
+// whose lease the successor manager would have renewed unchanged.
 func (k *leaseKeeper) renewOnce(ctx context.Context) {
 	k.mu.Lock()
 	if k.terminal {
@@ -327,18 +375,38 @@ func (k *leaseKeeper) renewOnce(ctx context.Context) {
 		k.mu.Lock()
 		k.lease = *renewed
 		k.pendingRenew = ""
+		k.unresolved = false
 		k.mu.Unlock()
 		k.applyUpdate(*renewed)
 		return
 	}
-	if !leaseTerminal(err) && ambiguousFailure(err) {
-		return // same operationId retries next tick
+	if !leaseDefinitelyEnded(err) && (leaseEpochSuperseded(err) || ambiguousFailure(err)) {
+		// UNRESOLVED. Bound the replay by the lease's own expiry: past it the
+		// lease is over by definition, so continuing would be a retry loop
+		// with no definite end. Inside it, the same operationId replays.
+		if expiry := time.UnixMilli(lease.ExpiresAtMs); !k.now().Before(expiry) {
+			k.mu.Lock()
+			k.pendingRenew = ""
+			k.unresolved = false
+			k.terminal = true
+			k.mu.Unlock()
+			k.credWatch.noteRejected(fmt.Errorf(
+				"access lease %s reached its own expiry with the renewal still unresolved: %w",
+				lease.AccessLeaseID, err))
+			return
+		}
+		k.mu.Lock()
+		k.unresolved = true
+		k.mu.Unlock()
+		return // same operationId replays next tick
 	}
-	// Definitive refusal (epoch superseded, unknown to the new epoch,
-	// expired/revoked/released, CAS conflict after a lost receipt): this
-	// lease can never renew again. Fail closed; never mint a replacement.
+	// ENDED. A definite answer about this lease (expired/revoked/released/
+	// unknown/unauthorized) or any other definitive refusal (CAS conflict
+	// after a lost receipt, evicted receipt). Fail closed; the mount never
+	// mints a replacement lease identity.
 	k.mu.Lock()
 	k.pendingRenew = ""
+	k.unresolved = false
 	k.terminal = true
 	k.mu.Unlock()
 	k.credWatch.noteRejected(err)
@@ -346,19 +414,23 @@ func (k *leaseKeeper) renewOnce(ctx context.Context) {
 
 // run renews until ctx is cancelled. The wait is recomputed from the live
 // lease each cycle: half the remaining TTL, floored so a short-TTL (or
-// clock-skewed) lease cannot spin.
+// clock-skewed) lease cannot spin. While a renewal is UNRESOLVED the wait
+// stays at the floor — the renewal is in flight against a definite deadline
+// (the lease's own expiry) and must be given every chance to converge before
+// it, rather than sleeping half the TTL between attempts.
 func (k *leaseKeeper) run(ctx context.Context) {
 	const minWait = 5 * time.Second
 	for {
 		k.mu.Lock()
 		lease := k.lease
 		terminal := k.terminal
+		unresolved := k.unresolved
 		k.mu.Unlock()
 		if terminal {
 			return
 		}
 		wait := minWait
-		if remaining := time.Until(time.UnixMilli(lease.ExpiresAtMs)); remaining/2 > minWait {
+		if remaining := time.Until(time.UnixMilli(lease.ExpiresAtMs)); !unresolved && remaining/2 > minWait {
 			wait = remaining / 2
 		}
 		select {
@@ -396,7 +468,7 @@ func (k *leaseKeeper) releaseWithOperation(ctx context.Context, opID string) err
 		if leaseReleaseSatisfied(err) {
 			return nil
 		}
-		if !ambiguousFailure(err) || leaseTerminal(err) {
+		if !ambiguousFailure(err) || leaseDefinitelyEnded(err) {
 			return err
 		}
 		timer := time.NewTimer(delay)

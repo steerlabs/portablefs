@@ -23,6 +23,38 @@ import (
 // the whole namespace down, on paths that have nothing to do with the backlog.
 // These tests pin the geometry that makes that impossible.
 
+// admittedWrite runs one write the way the DISPATCHER runs it: the complete
+// pre-lock admission first, holding no frontend lock at all, then the locked
+// handler, unwinding and re-admitting on a lane change.
+//
+// It exists because admission is not the handler's job any more. The daemon has
+// exactly one admission point — attach.admitRequest, called from
+// handleAttached before lockFrontendRequest — for the data lane and the
+// namespace lane alike, because two admission points meant two lock orders: a
+// write held a frontend name-stripe mirror while waiting for a transition claim
+// that a namespace mutation held while waiting for the same stripe. Driving
+// attach.write directly would exercise a shape production no longer has.
+func admittedWrite(
+	ctx context.Context,
+	a *attach,
+	req *pfslocal.WriteRequest,
+) (*pfslocal.WriteReply, int32) {
+	ctx, cancel := clientcore.WithOperationDeadline(ctx)
+	defer cancel()
+	for forceAuthority := false; ; forceAuthority = true {
+		opCtx, settle, eno, classified := a.admitRequest(ctx, req, forceAuthority)
+		if eno != 0 {
+			settle()
+			return nil, eno
+		}
+		reply, eno := a.write(opCtx, req)
+		settle()
+		if eno != errnoLaneChanged || !classified {
+			return reply, eno
+		}
+	}
+}
+
 // writeCreditFixture is a real daemon attach over a real volume, with the
 // data-lane credit ledger held at its operating setpoint.
 //
@@ -203,7 +235,7 @@ func TestPacedWriteDoesNotHoldTheNamespaceLock(t *testing.T) {
 
 	done := make(chan int32, 1)
 	go func() {
-		_, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+		_, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 			Handle: delegatedHandle,
 			Offset: 0,
 			Data:   make([]byte, 256<<10),
@@ -266,7 +298,7 @@ func TestWriteThroughIsNotThrottledByASaturatedDataLane(t *testing.T) {
 	payload := []byte("write-through under a saturated journal")
 
 	start := time.Now()
-	reply, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	reply, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: writeThroughHandle,
 		Offset: 0,
 		Data:   payload,
@@ -307,7 +339,7 @@ func TestShortGrantRepliesAShortWrittenCount(t *testing.T) {
 	f.vol.Writeback().ReleaseDataCredit(quantum)
 	f.held -= quantum
 
-	reply, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	reply, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
 		Offset: 0,
 		Data:   make([]byte, 4*quantum),
@@ -353,7 +385,7 @@ func TestHealthyUplinkIsNeverReportedAsStalled(t *testing.T) {
 	payload := make([]byte, 256<<10)
 
 	start := time.Now()
-	reply, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	reply, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
 		Offset: 0,
 		Data:   payload,
@@ -403,7 +435,7 @@ func TestStalledUplinkWriteRepliesEIONotENOSPC(t *testing.T) {
 	// session fenced`). Saturating first cannot lose that race: the gate is
 	// healthy, the setpoint is whole, and the hold is deterministic.
 	f.releaseLane()
-	if _, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	if _, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
 		Data:   make([]byte, 64<<10),
 	}); eno != 0 {
@@ -426,7 +458,7 @@ func TestStalledUplinkWriteRepliesEIONotENOSPC(t *testing.T) {
 		}
 		break
 	}
-	_, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	_, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
 		Offset: 128 << 10,
 		Data:   make([]byte, 256<<10),

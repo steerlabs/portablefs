@@ -263,7 +263,7 @@ func (n *fuseNode) Setxattr(ctx context.Context, attr string, data []byte, flags
 	if flags&replaceBit != 0 {
 		wireFlags |= wal.XattrReplace
 	}
-	return xattrErrno(fuseMutateStatus(ctx, n, fuseNodes(n.state), []string{p},
+	return xattrErrno(fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationOther}, fuseNodes(n.state), []string{p},
 		func(c context.Context) clientcore.Status {
 			return n.v.SetxattrFlags(c, p, n.state, attr, data, wireFlags)
 		}))
@@ -272,7 +272,7 @@ func (n *fuseNode) Setxattr(ctx context.Context, attr string, data []byte, flags
 func (n *fuseNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	ctx = n.gateOp(ctx)
 	p := n.curPath()
-	return xattrErrno(fuseMutateStatus(ctx, n, fuseNodes(n.state), []string{p},
+	return xattrErrno(fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationOther}, fuseNodes(n.state), []string{p},
 		func(c context.Context) clientcore.Status {
 			return n.v.Removexattr(c, p, n.state, attr)
 		}))
@@ -299,9 +299,16 @@ func (n *fuseNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 // definite interrupted outcome rather than on a pass count.
 
 // fuseMutate runs one value-returning namespace mutation under the classifier.
+//
+// intent is what the operation IS, and it is not decoration: link,
+// unlink-while-open, rename over an open destination and setattr on a
+// hard-linked inode are authority-only by SEMANTICS, and classifying them from
+// path coverage alone leaves the release they need to be discovered — and taken
+// — beneath clientcore's node and engine locks (clientcore.MutationIntent).
 func fuseMutate[T any](
 	ctx context.Context,
 	n *fuseNode,
+	intent clientcore.MutationIntent,
 	nodes []*clientcore.NodeState,
 	paths []string,
 	run func(context.Context) (T, clientcore.Status),
@@ -310,7 +317,7 @@ func fuseMutate[T any](
 	opCtx, cancel := clientcore.WithOperationDeadline(ctx)
 	defer cancel()
 	for forceAuthority := false; ; forceAuthority = true {
-		mctx, settle, err := n.v.AdmitMutation(opCtx, nodes, forceAuthority, paths...)
+		mctx, settle, err := n.v.AdmitMutation(opCtx, intent, nodes, forceAuthority, paths...)
 		if err != nil {
 			settle()
 			return zero, clientcore.MutationAdmissionStatus(err)
@@ -328,11 +335,12 @@ func fuseMutate[T any](
 func fuseMutateStatus(
 	ctx context.Context,
 	n *fuseNode,
+	intent clientcore.MutationIntent,
 	nodes []*clientcore.NodeState,
 	paths []string,
 	run func(context.Context) clientcore.Status,
 ) clientcore.Status {
-	_, st := fuseMutate(ctx, n, nodes, paths, func(c context.Context) (struct{}, clientcore.Status) {
+	_, st := fuseMutate(ctx, n, intent, nodes, paths, func(c context.Context) (struct{}, clientcore.Status) {
 		return struct{}{}, run(c)
 	})
 	return st
@@ -464,19 +472,45 @@ func (n *fuseNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 // inside either blocks the open-pin and delegation-release machinery that must
 // be able to inspect this node. Resolving out here holds nothing.
 //
-// The two passes are the unwind: a lane resolved before the call can be
+// The passes are the unwind: a lane resolved before the call can be
 // invalidated during it by a recall this frontend does not control, and the
 // engine reports that rather than transitioning under the locks. The second
 // pass takes the authority lane unconditionally, and that lane consumes no
 // stream budget at all, so a recall has nothing left to invalidate.
+//
+// ONE absolute deadline covers every pass, and it is installed HERE — outside
+// the loop — for the same reason the daemon's dispatcher and fuseMutate install
+// theirs outside theirs. Volume.AdmitWrite installs the deadline idempotently,
+// so a loop that handed it a fresh, deadline-free context on every pass got a
+// fresh 50s bound on every pass, and the passes COMPOSED: the force-authority
+// pass is not a guaranteed terminator (a concurrent path or identity change can
+// invalidate its token too), so N passes could compose past the kernel's 60s
+// ceiling on a write whose bound is supposed to be 50s. A per-pass bound is not
+// a bound on the operation.
 func (n *fuseNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	ctx = n.gateOp(ctx)
+	opCtx, cancel := clientcore.WithOperationDeadline(ctx)
+	defer cancel()
 	for forceAuthority := false; ; forceAuthority = true {
-		cnt, eno, unwound := n.writeOnce(ctx, fh, data, off, forceAuthority)
+		cnt, eno, unwound := fuseWritePass(n, opCtx, fh, data, off, forceAuthority)
 		if !unwound {
 			return cnt, eno
 		}
 	}
+}
+
+// fuseWritePass is (*fuseNode).writeOnce. It is a var solely so the unwind-shape
+// test can prove that every pass of the loop above receives the SAME absolute
+// deadline; production never replaces it.
+var fuseWritePass = func(
+	n *fuseNode,
+	ctx context.Context,
+	fh fs.FileHandle,
+	data []byte,
+	off int64,
+	forceAuthority bool,
+) (uint32, syscall.Errno, bool) {
+	return n.writeOnce(ctx, fh, data, off, forceAuthority)
 }
 
 func (n *fuseNode) writeOnce(
@@ -561,7 +595,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, 
 		// a directory rule: EISDIR (CreateChild enforces it).
 		return n.g.CreateChild(ctx, n.EmbeddedInode(), cp, flags, mode, out)
 	}
-	a, st := fuseMutate(ctx, n, nil, []string{cp},
+	a, st := fuseMutate(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationOther}, nil, []string{cp},
 		func(c context.Context) (fsproto.Attr, clientcore.Status) {
 			if flags&syscall.O_EXCL != 0 {
 				return n.v.CreateExcl(c, cp, mode)
@@ -596,7 +630,7 @@ func (n *fuseNode) Mkdir(ctx context.Context, name string, mode uint32, out *fus
 		// this is the only way a graft root comes into existence.
 		return n.g.MkdirChild(ctx, n.EmbeddedInode(), cp, mode, out)
 	}
-	a, st := fuseMutate(ctx, n, nil, []string{cp},
+	a, st := fuseMutate(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationOther}, nil, []string{cp},
 		func(c context.Context) (fsproto.Attr, clientcore.Status) {
 			return n.v.Mkdir(c, cp, mode)
 		})
@@ -616,7 +650,7 @@ func (n *fuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		return n.g.Remove(cp, false)
 	}
 	child := n.childState(name)
-	return errno(fuseMutateStatus(ctx, n, fuseNodes(child), []string{cp},
+	return errno(fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationUnlink, Target: child}, fuseNodes(child), []string{cp},
 		func(c context.Context) clientcore.Status { return n.v.Remove(c, cp, child) }))
 }
 
@@ -629,7 +663,9 @@ func (n *fuseNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return n.g.Remove(cp, true)
 	}
 	child := n.childState(name)
-	return errno(fuseMutateStatus(ctx, n, fuseNodes(child), []string{cp},
+	// rmdir has no orphan protocol and no alias fan-out: nothing about a
+	// directory removal diverts to the authority lane semantically.
+	return errno(fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationOther}, fuseNodes(child), []string{cp},
 		func(c context.Context) clientcore.Status { return n.v.Remove(c, cp, child) }))
 }
 
@@ -644,7 +680,7 @@ func (n *fuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 		return eno
 	}
 	src, dst := n.childState(name), np.childState(newName)
-	st := fuseMutateStatus(ctx, n, fuseNodes(src, dst), []string{oldp, newp},
+	st := fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationRename, Source: src, Target: dst}, fuseNodes(src, dst), []string{oldp, newp},
 		func(c context.Context) clientcore.Status {
 			return n.v.Rename(c, oldp, newp, src, dst)
 		})
@@ -663,7 +699,7 @@ func (n *fuseNode) Symlink(ctx context.Context, target, name string, out *fuse.E
 		// At a volume parent this can only be the graft root: EISDIR.
 		return n.g.SymlinkChild(ctx, n.EmbeddedInode(), target, cp, out)
 	}
-	a, st := fuseMutate(ctx, n, nil, []string{cp},
+	a, st := fuseMutate(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationOther}, nil, []string{cp},
 		func(c context.Context) (fsproto.Attr, clientcore.Status) {
 			return n.v.Symlink(c, target, cp)
 		})
@@ -687,7 +723,7 @@ func (n *fuseNode) Link(ctx context.Context, target fs.InodeEmbedder, name strin
 	if !ok {
 		return nil, syscall.EXDEV
 	}
-	a, st := fuseMutate(ctx, n, fuseNodes(src.state), []string{oldp, newp},
+	a, st := fuseMutate(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationLink}, fuseNodes(src.state), []string{oldp, newp},
 		func(c context.Context) (fsproto.Attr, clientcore.Status) {
 			return n.v.Link(c, oldp, newp, src.state)
 		})
@@ -733,7 +769,7 @@ func (n *fuseNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 		req.GID = gid
 		req.SetGID = true
 	}
-	a, st := fuseMutate(ctx, n, fuseNodes(n.state), []string{p},
+	a, st := fuseMutate(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationSetattr, Target: n.state}, fuseNodes(n.state), []string{p},
 		func(c context.Context) (fsproto.Attr, clientcore.Status) {
 			return n.v.Setattr(c, p, n.state, req)
 		})

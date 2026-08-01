@@ -409,6 +409,20 @@ func (v *Volume) beginAuthorityMutation(
 		}
 		return v.parkTransferContext(ctx, token.guard), func() {}, nil
 	}
+	if writeback.LaneOf(ctx) == writeback.LaneDelegated {
+		// A CLASSIFIED operation whose resolved lane is the delegated one, asking
+		// to perform an authority mutation. There is no token because the
+		// delegated lane never takes one, so the full path below would begin a
+		// claim and release every operand — a wait and a drain — and the caller is
+		// inside a.nsMu and its handle locks.
+		//
+		// This is the structural half of the semantic-diversion fix. The intent
+		// classifier (MutationIntent) is what makes the case rare; this is what
+		// makes it impossible: no blocking release is reachable beneath a frontend
+		// lock, whatever route discovered that one was needed. The frontend
+		// unwinds, and its next pass resolves the authority lane unconditionally.
+		return ctx, nil, writeback.ErrLaneChanged
+	}
 	paths, inos := v.hardlinkMutationTargets(nodes, operands...)
 	// A conflicting active claim can be a remote acquire resolver mid-RPC,
 	// so admission into the transition gate is an authority-bound wait: the

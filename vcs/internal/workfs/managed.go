@@ -380,6 +380,10 @@ type managedLeafMode interface {
 	onParked(orphanIno uint64)
 	// countSkip records a tolerated benign env-less outcome (replay metric).
 	countSkip()
+	// postAttrs: capture the leaf's post-op attributes for the live reply.
+	// Cold replay and materialization answer nobody, so they skip the work
+	// entirely — the observation is a reply payload, never durable state.
+	postAttrs() bool
 }
 
 type managedLeafLive struct {
@@ -390,6 +394,7 @@ type managedLeafLive struct {
 func (m managedLeafLive) owner() string  { return m.ownerName }
 func (managedLeafLive) stampCtime() bool { return false }
 func (managedLeafLive) countSkip()       {}
+func (managedLeafLive) postAttrs() bool  { return true }
 func (m managedLeafLive) onParked(ino uint64) {
 	m.tx.captureOrphanVersion(ino)
 }
@@ -398,6 +403,7 @@ type managedLeafReplay struct{}
 
 func (managedLeafReplay) owner() string    { return "" }
 func (managedLeafReplay) stampCtime() bool { return true }
+func (managedLeafReplay) postAttrs() bool  { return false }
 func (managedLeafReplay) onParked(uint64)  {}
 func (managedLeafReplay) countSkip()       { replaySkipsTotal.Inc() }
 
@@ -460,6 +466,15 @@ func (fs *FS) applyManagedLeaf(r wal.Record, mode managedLeafMode, sink exactOut
 			mode.onParked(orphanIno)
 		}
 		out.res.Version = fs.stampVersionAt(r, orphanIno, mode.stampCtime(), replayTs(r))
+		// Same lock hold, same ordered position: the attributes and the
+		// coherence anchor a client installs them under are ONE observation.
+		// Cold replay and materialization take this branch too; their callers
+		// discard it (no live reply exists), and it is deliberately NOT part
+		// of the durable exact outcome below, so the stored bytes stay
+		// byte-identical to the pre-change goldens.
+		if mode.postAttrs() {
+			out.res.Post = fs.postAttrsLocked(r, out.res.Version)
+		}
 	}
 	out.res.OrphanIno = orphanIno
 	if n := fs.resolveForRW(r.Path, r.Ino); n != nil {

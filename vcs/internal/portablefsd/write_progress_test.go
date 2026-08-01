@@ -58,7 +58,7 @@ func TestCommittedWriteSurvivesAPostCommitFailure(t *testing.T) {
 	payload := []byte("committed-bytes")
 	failingBindingJournal(t, f.a)
 
-	rep, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	rep, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
 		Data:   payload,
 	})
@@ -87,7 +87,7 @@ func TestCommittedAppendIsNeverDuplicatedByAPostCommitFailure(t *testing.T) {
 	payload := []byte("append-once")
 	failingBindingJournal(t, f.a)
 
-	rep, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+	rep, eno := admittedWrite(ctx, f.a, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
 		Data:   payload,
 		Append: true,

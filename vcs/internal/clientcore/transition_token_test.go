@@ -136,7 +136,7 @@ func TestClassifiedNamespaceMutationExcludesAcquisitionThroughTheLockedMutation(
 		t.Fatalf("delegated seed create: %d", st)
 	}
 
-	opCtx, settle, err := v.AdmitMutation(ctx, nil, true, "d/target")
+	opCtx, settle, err := v.AdmitMutation(ctx, MutationIntent{Kind: MutationOther}, nil, true, "d/target")
 	if err != nil {
 		t.Fatalf("pre-lock namespace classification: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestUncoveredOperandUnwindsInsteadOfTransitioning(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	opCtx, settle, err := v.AdmitMutation(ctx, nil, true, "d/claimed")
+	opCtx, settle, err := v.AdmitMutation(ctx, MutationIntent{Kind: MutationOther}, nil, true, "d/claimed")
 	if err != nil {
 		t.Fatalf("classify: %v", err)
 	}

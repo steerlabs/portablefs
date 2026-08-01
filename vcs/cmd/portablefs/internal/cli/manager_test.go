@@ -578,44 +578,181 @@ func TestAccessLeaseReleasePersistedOperationConvergesTerminalState(t *testing.T
 	}
 }
 
-// TestLeaseKeeperFailsClosedOnEpochSuperseded pins the manager-restart path:
-// ACCESS_LEASE_EPOCH_SUPERSEDED ships as a 503, which the ambiguity rule
-// alone would classify as "retry the same renew" — but the typed code means
-// this lease can NEVER renew again (its epoch is gone), so the keeper stops
-// without creating a replacement.
-func TestLeaseKeeperFailsClosedOnEpochSuperseded(t *testing.T) {
+// leaseClock pins the keeper's expiry bound to a moment inside the fixture
+// leases' TTL (they all expire at 1700000600000), so the tests exercise the
+// renewal classification rather than the expiry bound.
+func leaseClock() func() time.Time {
+	return func() time.Time { return time.UnixMilli(1700000000000) }
+}
+
+// TestLeaseKeeperEpochSupersededRenewsToSuccessWithTheSameIdentity pins the
+// manager-restart path. 503 ACCESS_LEASE_EPOCH_SUPERSEDED is a statement about
+// the MANAGER, not the lease: the successor manager owns the same durable
+// lease ledger and renews the SAME lease unchanged. The keeper must therefore
+// replay the identical renewal — same accessLeaseId, same accessToken, same
+// expectedControlSeq, same operationId — until a definite answer arrives, and
+// must never mint a replacement lease identity to get there.
+func TestLeaseKeeperEpochSupersededRenewsToSuccessWithTheSameIdentity(t *testing.T) {
 	f := newFakeServer(t)
-	renews := 0
-	f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {
-		renews++
-		return 503, `{"error":{"code":"ACCESS_LEASE_EPOCH_SUPERSEDED","message":"Manager epoch 4 has been superseded; reacquire against the new manager."}}`
+	var renewOps []string
+	var renewIDs []string
+	var renewSeqs []string
+	attempts := 0
+	f.on("POST", "/v1/access-leases/renew", func(body map[string]any) (int, string) {
+		attempts++
+		op, _ := body["operationId"].(string)
+		id, _ := body["accessLeaseId"].(string)
+		seq, _ := body["expectedControlSeq"].(string)
+		renewOps = append(renewOps, op)
+		renewIDs = append(renewIDs, id)
+		renewSeqs = append(renewSeqs, seq)
+		if attempts < 3 {
+			return 503, `{"error":{"code":"ACCESS_LEASE_EPOCH_SUPERSEDED","message":"Manager epoch 4 has been superseded; reacquire against the new manager."}}`
+		}
+		// The successor manager completes the very same renewal.
+		return 200, `{"lease":{"accessLeaseId":"pfal_epoch4","controlSeq":"8","expiresAt":1700000600000,"state":"active"}}`
+	})
+	created := 0
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+		created++
+		return 200, leaseCreateOK
 	})
 	m := newManagerClient(f.srv.URL, "mgr_tok")
 	tokens := &sessionTokenSource{}
 	k := newLeaseKeeper(m, tokens, leaseState{
 		AccessLeaseID: "pfal_epoch4", AccessToken: "tok_epoch4", ExpiresAtMs: 1700000600000, ControlSeq: "7",
 	}, nil)
+	k.now = leaseClock()
 
 	k.renewOnce(context.Background())
+	if k.terminal {
+		t.Fatal("epoch supersession must not be terminal: the lease may still be live")
+	}
+	if !k.unresolved {
+		t.Fatal("epoch supersession must leave the renewal unresolved so it replays")
+	}
+	k.renewOnce(context.Background())
+	k.renewOnce(context.Background())
+
+	if k.terminal {
+		t.Fatal("a completed renewal must not leave the keeper terminal")
+	}
+	if k.unresolved {
+		t.Fatal("a completed renewal must clear the unresolved marker")
+	}
+	if created != 0 {
+		t.Fatalf("supersession must NEVER mint a replacement lease (created %d)", created)
+	}
+	if len(renewOps) != 3 || renewOps[0] == "" || renewOps[0] != renewOps[1] || renewOps[1] != renewOps[2] {
+		t.Fatalf("supersession must replay the SAME operationId: %v", renewOps)
+	}
+	for i, id := range renewIDs {
+		if id != "pfal_epoch4" {
+			t.Fatalf("renew %d used lease identity %q; the identity must never change", i, id)
+		}
+		if renewSeqs[i] != "7" {
+			t.Fatalf("renew %d used expectedControlSeq %q; the CAS precondition must not drift", i, renewSeqs[i])
+		}
+	}
 	cur := k.snapshot()
-	if cur.AccessLeaseID != "pfal_epoch4" || cur.AccessToken != "tok_epoch4" {
-		t.Fatalf("terminal refusal must preserve the original lease, got %+v", cur)
-	}
-	if renews != 1 {
-		t.Fatalf("renew calls = %d — the dead lease must not be blindly re-renewed", renews)
-	}
-	if tokens.get() != "" {
-		t.Fatalf("terminal refusal must not install a replacement token: %q", tokens.get())
+	if cur.AccessLeaseID != "pfal_epoch4" || cur.ControlSeq != "8" {
+		t.Fatalf("the renewed lease must be the same identity at the new controlSeq: %+v", cur)
 	}
 	if k.pendingRenew != "" {
-		t.Fatal("a definitive refusal must clear the retained renew operationId")
+		t.Fatal("a completed renewal must clear the retained operationId")
 	}
+}
+
+// A definite answer about the lease stays terminal, even though it now arrives
+// as the 409 the manager actually sends (the hosted broker used to flatten
+// this into 404 ACCESS_LEASE_NOT_FOUND, which is why the two cases were
+// indistinguishable to this client).
+func TestLeaseKeeperRevokedStaysTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"authority retired", 409, `{"error":{"code":"ACCESS_LEASE_REVOKED","message":"Access lease pfal_1 is revoked (authority-retired); create a fresh lease."}}`},
+		{"released", 409, `{"error":{"code":"ACCESS_LEASE_RELEASED","message":"released; create a fresh lease."}}`},
+		{"expired", 409, `{"error":{"code":"ACCESS_LEASE_EXPIRED","message":"expired; create a fresh lease."}}`},
+		{"unknown", 404, `{"error":{"code":"ACCESS_LEASE_NOT_FOUND","message":"Unknown access lease pfal_1."}}`},
+		{"unauthorized", 401, `{"error":{"code":"ACCESS_LEASE_UNAUTHORIZED","message":"the presented access token does not authenticate lease pfal_1."}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeServer(t)
+			renews := 0
+			f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {
+				renews++
+				return tc.status, tc.body
+			})
+			created := 0
+			f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+				created++
+				return 200, leaseCreateOK
+			})
+			m := newManagerClient(f.srv.URL, "mgr_tok")
+			tokens := &sessionTokenSource{}
+			k := newLeaseKeeper(m, tokens, leaseState{
+				AccessLeaseID: "pfal_1", AccessToken: "tok_1", ExpiresAtMs: 1700000600000, ControlSeq: "7",
+			}, nil)
+			k.now = leaseClock()
+
+			k.renewOnce(context.Background())
+			if !k.terminal {
+				t.Fatal("a definite answer about the lease must stop the keeper")
+			}
+			if k.pendingRenew != "" {
+				t.Fatal("a definite refusal must clear the retained renew operationId")
+			}
+			k.renewOnce(context.Background())
+			if renews != 1 {
+				t.Fatalf("terminal keeper retried after stop: %d renewals", renews)
+			}
+			if created != 0 {
+				t.Fatalf("fail-closed must never mint a replacement lease (created %d)", created)
+			}
+			if tokens.get() != "" {
+				t.Fatalf("terminal refusal must not install a replacement token: %q", tokens.get())
+			}
+			if cur := k.snapshot(); cur.AccessLeaseID != "pfal_1" || cur.AccessToken != "tok_1" {
+				t.Fatalf("terminal refusal must preserve the original lease, got %+v", cur)
+			}
+		})
+	}
+}
+
+// The replay is bounded by a deadline that already exists — the lease's OWN
+// expiry — so an unresolved renewal always ends definitely instead of looping.
+func TestLeaseKeeperUnresolvedRenewalStopsAtTheLeaseExpiry(t *testing.T) {
+	f := newFakeServer(t)
+	renews := 0
+	f.on("POST", "/v1/access-leases/renew", func(map[string]any) (int, string) {
+		renews++
+		return 503, `{"error":{"code":"ACCESS_LEASE_EPOCH_SUPERSEDED","message":"superseded"}}`
+	})
+	created := 0
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+		created++
+		return 200, leaseCreateOK
+	})
+	m := newManagerClient(f.srv.URL, "mgr_tok")
+	k := newLeaseKeeper(m, nil, leaseState{
+		AccessLeaseID: "pfal_late", AccessToken: "tok_late", ExpiresAtMs: 1700000600000, ControlSeq: "7",
+	}, nil)
+	// The clock is already past the lease's own expiry.
+	k.now = func() time.Time { return time.UnixMilli(1700000600001) }
+
+	k.renewOnce(context.Background())
 	if !k.terminal {
-		t.Fatal("a definitive refusal must stop the keeper")
+		t.Fatal("an unresolved renewal past the lease's own expiry must end definitely")
+	}
+	if created != 0 {
+		t.Fatalf("the expiry bound must never mint a replacement lease (created %d)", created)
 	}
 	k.renewOnce(context.Background())
 	if renews != 1 {
-		t.Fatalf("terminal keeper retried after stop: %d renewals", renews)
+		t.Fatalf("the keeper kept renewing past its definite end: %d renewals", renews)
 	}
 }
 
@@ -631,6 +768,7 @@ func TestLeaseKeeperUnknownLeaseIsTerminal(t *testing.T) {
 	k := newLeaseKeeper(m, nil, leaseState{
 		AccessLeaseID: "pfal_old", AccessToken: "tok_old", ExpiresAtMs: 1, ControlSeq: "3",
 	}, nil)
+	k.now = leaseClock()
 	k.renewOnce(context.Background())
 	if cur := k.snapshot(); cur.AccessLeaseID != "pfal_old" || !k.terminal {
 		t.Fatalf("unknown-lease refusal must stop original lease: %+v terminal=%v", cur, k.terminal)
@@ -658,6 +796,7 @@ func TestLeaseKeeperPlain503StaysAmbiguous(t *testing.T) {
 		AccessLeaseID: "pfal_keep", AccessToken: "tok_keep", ExpiresAtMs: 1700000600000, ControlSeq: "7",
 	}, nil)
 
+	k.now = leaseClock()
 	k.renewOnce(context.Background())
 	k.renewOnce(context.Background())
 	if created != 0 {

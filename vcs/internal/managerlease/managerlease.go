@@ -229,9 +229,22 @@ type Guard struct {
 	fenced      bool
 	cause       error
 
+	// groundedGen counts COMPLETED groundings; groundedCh is closed and
+	// replaced after each one, so a caller can await settlement without
+	// polling.
+	groundedGen uint64
+	groundedCh  chan struct{}
+
 	fencedCh chan struct{}
 	firstCh  chan struct{}
 	firstOne sync.Once
+
+	// groundReq is the LATEST-VALUE trigger that hands the database probe to
+	// the grounder goroutine. Capacity one: a frame arriving while a
+	// grounding is already queued rides on it, because grounding reads the
+	// CURRENT database facts — a queued request can never be stale.
+	groundReq  chan struct{}
+	grounderOn sync.Once
 }
 
 // NewGuard builds a Guard for the exact identity. guard ≤ 0 uses DefaultGuard.
@@ -240,12 +253,62 @@ func NewGuard(identity Identity, guard time.Duration) *Guard {
 		guard = DefaultGuard
 	}
 	return &Guard{
-		identity: identity,
-		guard:    guard,
-		now:      time.Now,
-		fencedCh: make(chan struct{}),
-		firstCh:  make(chan struct{}),
+		identity:   identity,
+		guard:      guard,
+		now:        time.Now,
+		fencedCh:   make(chan struct{}),
+		firstCh:    make(chan struct{}),
+		groundedCh: make(chan struct{}),
+		groundReq:  make(chan struct{}, 1),
 	}
+}
+
+// requestGrounding hands ONE grounding to the grounder goroutine without ever
+// blocking the caller.
+//
+// The frame reader's only job is to keep the lease pipe drained. Running the
+// database probe inline made the reader's progress a function of database
+// latency, and the manager reads a stalled pipe as a dead child: a child that
+// is merely waiting on Postgres looks identical to one that has stopped
+// consuming its fencing clock. Handing the probe off makes the two states
+// structurally distinguishable — the pipe drains at pipe speed, the deadline
+// advances at database speed, and neither can be mistaken for the other.
+func (g *Guard) requestGrounding() {
+	g.grounderOn.Do(func() { go g.groundLoop() })
+	select {
+	case g.groundReq <- struct{}{}:
+	default:
+		// A grounding is already queued; it will read facts at least as fresh
+		// as this frame's.
+	}
+}
+
+// groundLoop runs groundings one at a time, off the frame reader, until the
+// guard fences. At most one probe is ever in flight.
+func (g *Guard) groundLoop() {
+	for {
+		select {
+		case <-g.fencedCh:
+			return
+		case <-g.groundReq:
+			g.groundDeadline()
+			g.mu.Lock()
+			g.groundedGen++
+			settled := g.groundedCh
+			g.groundedCh = make(chan struct{})
+			g.mu.Unlock()
+			close(settled)
+		}
+	}
+}
+
+// groundingSettled reports the completed-grounding count and a channel closed
+// when the NEXT grounding completes. Taken before an action, awaited after it,
+// this observes the asynchronous grounder without polling.
+func (g *Guard) groundingSettled() (uint64, <-chan struct{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.groundedGen, g.groundedCh
 }
 
 // SetProber installs the capability-bound lease-facts seam once the fenced
@@ -259,7 +322,7 @@ func (g *Guard) SetProber(prober LeaseFactsProber) {
 	g.pendingFrame = nil
 	g.mu.Unlock()
 	if pending != nil {
-		g.groundDeadline()
+		g.requestGrounding()
 	}
 }
 
@@ -401,7 +464,7 @@ func (g *Guard) observe(frame Frame) error {
 	}
 	g.mu.Unlock()
 
-	g.groundDeadline()
+	g.requestGrounding()
 	return nil
 }
 

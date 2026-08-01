@@ -572,29 +572,76 @@ func (c *frontendConn) handleAttached(
 	initializeOperation bool,
 	body any,
 ) {
-	// A request that extends an already-published logical callback must enter
-	// the frontend gate before it waits for the mirrored namespace locks. If a
-	// recall owns one of those locks, suspending this participant lets that
-	// recall finish; resumption then waits for the post-handoff view. A new
-	// logical operation takes the mirrors first so it can never become active
-	// while blocked behind an older concrete namespace lock.
+	// ── THE DISPATCHER-ORDERING CONTRACT ────────────────────────────────────
+	//
+	// One request runs in four phases, and the order is the whole point:
+	//
+	//	0. DEADLINE.    One absolute bound for the operation, installed before
+	//	                anything can wait.
+	//	1. ADMISSION.   Classification, delegation transition and metadata-lane
+	//	                pacing — every step that can BLOCK on the uplink — taken
+	//	                holding NOTHING.
+	//	2. PUBLICATION  The frontend mirrors (serialization, name stripes,
+	//	   + MIRRORS.   per-handle gate) and membership in the publication set.
+	//	                Nothing acquired here waits on the far end.
+	//	3. MUTATE.      The handler: a nonblocking revalidate of what phase 1
+	//	                decided, then the mutation itself.
+	//
+	// Phase 1 used to sit INSIDE phase 2. lockFrontendRequest takes the frontend
+	// serialization lock, the name stripes and a per-handle frontend RLock; then
+	// mutation admission could park for a full metadata admission budget. A
+	// close(2) on the same descriptor needs that handle gate EXCLUSIVELY, so it
+	// queued behind a request that was waiting on the authority — close-behind-
+	// backlog, the exact shape the close-is-local-bookkeeping work removed by one
+	// route, reappearing by another. The fix is structural and lives here, once,
+	// rather than in each handler: no frontend lock is held while anything waits
+	// on the uplink, on any request, ever.
+	//
+	// The unwind obeys the same contract. A lane invalidated inside the locks
+	// unwinds by RELEASING the mirrors and taking this request out of the
+	// publication set before it re-admits, so the second pass's claim and release
+	// are also paid holding nothing.
+	//
+	// Within phase 2 the existing order is preserved exactly: a CONTINUATION
+	// enters the gate first and suspends across the mirrors (if a recall owns one
+	// of them, suspending lets that recall finish, and resumption waits for the
+	// post-handoff view); a NEW logical operation takes the mirrors first so it
+	// can never become publication-active while blocked behind an older concrete
+	// namespace lock.
 	continuation := operationID != 0 && !initializeOperation
 	if operationID != 0 {
 		defer c.finishLogicalRequest(operationID)
 	}
+
+	// PHASE 0.
+	ctx, cancelOperation := clientcore.WithOperationDeadline(ctx)
+	defer cancelOperation()
+
+	// PHASE 1, first pass. Holds nothing at all.
+	opCtx, settleMutation, admitEno, classified := a.admitRequest(ctx, body, false)
+	settleOnce := func() {
+		if settleMutation != nil {
+			settleMutation()
+			settleMutation = nil
+		}
+	}
+	defer settleOnce()
+
+	// PHASE 2.
 	var (
 		unlockRequest func()
 		participant   *frontendOperationParticipant
 		participates  bool
 		publishes     bool
+		gateCtx       = ctx
 		err           error
 	)
 	if continuation {
-		ctx, participant, participates, publishes, err = c.beginLogicalOperation(
+		gateCtx, participant, participates, publishes, err = c.beginLogicalOperation(
 			ctx, a, operationID, false, body,
 		)
 		if err == nil {
-			resume := a.suspendFrontendOperation(ctx)
+			resume := a.suspendFrontendOperation(gateCtx)
 			unlockRequest = a.lockFrontendRequest(body)
 			if resume != nil {
 				resume()
@@ -602,7 +649,7 @@ func (c *frontendConn) handleAttached(
 		}
 	} else {
 		unlockRequest = a.lockFrontendRequest(body)
-		ctx, participant, participates, publishes, err = c.beginLogicalOperation(
+		gateCtx, participant, participates, publishes, err = c.beginLogicalOperation(
 			ctx, a, operationID, initializeOperation, body,
 		)
 	}
@@ -614,10 +661,20 @@ func (c *frontendConn) handleAttached(
 		return
 	}
 	if unlockRequest != nil {
-		defer unlockRequest()
+		defer func() {
+			if unlockRequest != nil {
+				unlockRequest()
+			}
+		}()
 	}
 	if participates {
 		defer a.finishFrontendParticipant(participant)
+		// The operation context was built before this request joined the
+		// publication set, so it does not yet carry the participant every
+		// authority-bound wait inside the handler suspends against. Fold it in
+		// now: the lane, the transition token and the deadline are phase 1's, the
+		// publication identity is phase 2's, and phase 3 needs both.
+		opCtx = context.WithValue(opCtx, frontendOperationContextKey{}, participant)
 	}
 	if err := a.frontendAdmissionError(); err != nil {
 		if publishes {
@@ -635,42 +692,45 @@ func (c *frontendConn) handleAttached(
 		return
 	}
 	started := time.Now()
-	// ONE absolute deadline for this operation, installed OUTSIDE the unwind
-	// loop so every pass shares it. It bounds classification, metadata or credit
-	// backpressure, the delegation release, and the authority RPC together —
-	// per-stage budgets compose, this does not — and it is what makes the unwind
-	// loop terminate on a definite interrupted outcome rather than on a pass
-	// count. See clientcore.WithOperationDeadline.
-	ctx, cancelOperation := clientcore.WithOperationDeadline(ctx)
-	defer cancelOperation()
 	var (
 		reply any
 		eno   int32
 	)
-	// The pre-lock mutation admission point, and the unwind it owns.
+	// PHASE 3, and the unwind it owns.
 	//
-	// Every path-bearing namespace mutation resolves its lane, its metadata-lane
-	// backpressure and its delegation transition claim HERE, before any handler
-	// takes a.nsMu — the global lock order the whole daemon depends on
-	// (mutationadmit.go). Under the locks the transition state is only CHECKED;
-	// a check that fails unwinds to here with every lock released, and the
-	// second pass resolves the authority lane unconditionally, which is not a
-	// claim about a grant and has nothing left for a recall to invalidate.
-	for forceAuthority := false; ; forceAuthority = true {
-		opCtx, settleMutation, admitEno, classified := a.admitMutation(ctx, body, forceAuthority)
+	// Under the locks the transition state is only CHECKED; a check that fails
+	// unwinds with every frontend lock released and this request suspended out of
+	// the publication set, and the next pass resolves the authority lane
+	// unconditionally — not a claim about a grant, so a recall has nothing left
+	// to invalidate.
+	for {
 		if admitEno != 0 {
-			settleMutation()
+			settleOnce()
 			reply, eno = nil, admitEno
 			break
 		}
 		var replied bool
 		reply, eno, replied = a.dispatchRequest(opCtx, c, requestID, body)
-		settleMutation()
+		settleOnce()
 		if replied {
 			return
 		}
 		if eno != errnoLaneChanged || !classified {
 			break
+		}
+		// UNWIND. Drop the mirrors and leave the publication set BEFORE
+		// re-admitting: the second pass's claim and delegation release are as
+		// unbounded as the first pass's and must be paid in the same place.
+		unlockRequest()
+		unlockRequest = nil
+		resume := a.suspendFrontendOperation(gateCtx)
+		opCtx, settleMutation, admitEno, classified = a.admitRequest(ctx, body, true)
+		if participates {
+			opCtx = context.WithValue(opCtx, frontendOperationContextKey{}, participant)
+		}
+		unlockRequest = a.lockFrontendRequest(body)
+		if resume != nil {
+			resume()
 		}
 	}
 	if eno == errnoLaneChanged {

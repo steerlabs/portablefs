@@ -76,11 +76,17 @@ import (
 // creditDrainTarget (25s), so 40s + 25s = 65s could be spent under a 60s
 // ceiling on a mount whose uplink was healthy the whole time.
 //
-// (1) + (2) < (3) is unchanged and still load-bearing: a genuinely stalled
-// uplink is DECLARED stalled by the watchdog strictly before the credit budget
-// can expire, so the diversion — whose release would drain into a dead far end
-// — is never reached on a stalled link. The frontend relays the watchdog's
-// verdict instead.
+// (1) + (2) < (3) still holds and is still worth keeping — it is what makes a
+// stall verdict AVAILABLE within the credit stage's budget in the common case —
+// but it does NOT prove the verdict at expiry, and nothing here may rely on it
+// doing so. flusher.advance resets lastProgress on every watermark advance, so
+// an advance at t39 followed by a stall pushes the earliest possible declaration
+// to ~t69 while the budget still expires at t40. Budget expiry is therefore a
+// statement about the WAIT, not about the far end.
+//
+// The classification comes from the live verdict instead: both admission gates
+// consult writeback.Engine.StallVerdict at expiry, relay ErrUplinkStalled when
+// it says stalled, and take their definite bounded outcome when it does not.
 //
 // (4) < (5) and (4) <= (6): the reply lands inside the barrier a concurrent
 // fsync/unmount is running under and inside the kernel's own ceiling on the
@@ -89,6 +95,12 @@ import (
 //
 // A var so failure-shape tests compress it; production never changes it.
 var operationAdmissionBudget = 50 * time.Second
+
+// OperationAdmissionBudget publishes the single absolute bound one frontend
+// mutation runs under, so the composition proof above is a test rather than a
+// comment — including from the frontends, which live in other packages and are
+// where the bound has to be INSTALLED.
+func OperationAdmissionBudget() time.Duration { return operationAdmissionBudget }
 
 // WithOperationDeadline installs the operation's single absolute deadline on a
 // frontend request context. A frontend whose handler can UNWIND and re-classify
@@ -202,6 +214,112 @@ func transitionTokenOf(ctx context.Context) *transitionToken {
 	return t
 }
 
+// MutationIntent names what a namespace mutation IS, independently of the
+// pathnames it happens to touch.
+//
+// It exists because path coverage is not a complete classifier. A delegation
+// answers the question "is this name inside a grant I hold?", and for most
+// mutations that is the whole question. For four of them it is not: link(2),
+// unlink-while-open, rename over an open destination, and setattr on a
+// hard-linked inode are AUTHORITY-ONLY BY SEMANTICS — the handler will divert to
+// the write-through lane no matter what any grant says, because one inode may be
+// spelled under several delegation scopes (link, hardlink setattr) or because the
+// orphan protocol cannot run inside a held grant (unlink/rename-over an open
+// target).
+//
+// Classifying those from path coverage alone produced LaneDelegated, and the
+// handler then discovered the diversion INSIDE the frontend's namespace and name
+// locks and released the covering delegations there — draining an unshipped tail
+// through an already-behind uplink while holding the namespace. That is the exact
+// stall the pre-lock classifier exists to remove, reached by a semantic route
+// instead of a path one. The intent closes it: the diversion is decided out here,
+// where the release costs one operation instead of the mount.
+type MutationKind uint8
+
+const (
+	// MutationOther is a mutation with no semantic diversion: its lane follows
+	// from path coverage alone.
+	MutationOther MutationKind = iota
+	// MutationLink is link(2). Always authority-only.
+	MutationLink
+	// MutationUnlink is unlink(2) on a non-directory.
+	MutationUnlink
+	// MutationRename is rename(2).
+	MutationRename
+	// MutationSetattr is setattr/truncate/chmod/chown/utimes/chflags.
+	MutationSetattr
+)
+
+// MutationIntent is one operation's semantics plus the ROLES of the nodes it
+// addresses. The roles are load-bearing: an open handle on a rename's
+// DESTINATION selects the orphan protocol, while an open handle on its SOURCE is
+// entirely ordinary, and a classifier that could not tell them apart would force
+// every rename of an open file onto the authority lane.
+type MutationIntent struct {
+	Kind MutationKind
+	// Target is the node whose state the semantics turn on: the subject of a
+	// setattr, the name an unlink removes, the name a rename REPLACES.
+	Target *NodeState
+	// Source is a rename's source. It matters only for hard-link identity and
+	// for the two-names-for-one-inode no-op.
+	Source *NodeState
+}
+
+// semanticAuthorityLane reports whether this operation can ONLY run on the
+// authority lane, decided from what it is and from the state of the nodes it
+// addresses — never from pathnames.
+//
+// Every arm mirrors a diversion the handler itself performs, and mirrors it
+// EXACTLY. Keeping the two in agreement is the point in both directions:
+// whatever the handler would discover under its locks is discovered here
+// instead, and nothing the handler would have left on the delegated lane is
+// dragged off it — an over-eager arm does not stall the namespace, but it does
+// silently disable write-back for a whole class of operation.
+func (v *Volume) semanticAuthorityLane(intent MutationIntent) bool {
+	switch intent.Kind {
+	case MutationLink:
+		// Volume.Link releases every scope covering either end unconditionally,
+		// and it must: one hard-linked inode may span delegation scopes, so the
+		// link has to order after the released state. That is a fact about
+		// link(2), not about what this mount's alias index happens to know yet —
+		// the very first link on an nlink==1 file is exactly the case the index
+		// cannot predict.
+		return true
+	case MutationUnlink:
+		// Volume.Remove: a hard-linked inode spans scopes, and unlink-while-open
+		// needs the orphan protocol, which never runs inside a held delegation.
+		return v.isHardlink(intent.Target) || openWriteThroughTarget(intent.Target)
+	case MutationRename:
+		// Volume.Rename, arm for arm: either endpoint hard-linked, both names
+		// already denoting one inode (a POSIX no-op the authority adjudicates),
+		// or an open DESTINATION, which is the orphan protocol again. An open
+		// SOURCE is not a diversion — the handler does not treat it as one, and
+		// treating it as one here would push every rename of an open file off the
+		// write-back lane.
+		return v.isHardlink(intent.Source) ||
+			v.isHardlink(intent.Target) ||
+			sameAuthorityIdentity(intent.Source, intent.Target) ||
+			openWriteThroughTarget(intent.Target)
+	case MutationSetattr:
+		// Volume.Setattr: an orphan is addressed by inode and routed to the
+		// orphan lane; a hard-linked inode spans scopes.
+		return intent.Target.Orphan() != 0 || v.isHardlink(intent.Target)
+	default:
+		return false
+	}
+}
+
+// openWriteThroughTarget reports the node state that forces the orphan protocol:
+// a live open handle on an inode that has not already been orphaned.
+func openWriteThroughTarget(n *NodeState) bool {
+	if n == nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.nopen > 0 && n.orphanIno.Load() == 0
+}
+
 // AdmitMutation is the pre-lock classifier for a path-bearing NAMESPACE
 // mutation: create, mkdir, symlink, link, unlink, rmdir, rename, setattr,
 // truncate, setxattr, removexattr.
@@ -236,11 +354,19 @@ func transitionTokenOf(ctx context.Context) *transitionToken {
 // nothing left to invalidate. Two passes, and the second one terminates.
 func (v *Volume) AdmitMutation(
 	ctx context.Context,
+	intent MutationIntent,
 	nodes []*NodeState,
 	forceAuthority bool,
 	operands ...string,
 ) (context.Context, func(), error) {
 	opCtx, cancelDeadline := withOperationDeadline(ctx)
+
+	// STEP 0 — the SEMANTIC diversions, decided before path coverage is even
+	// consulted. link/unlink-while-open/rename-over-open/hardlink-setattr end up
+	// on the authority lane whatever any grant says, so asking whether a grant
+	// covers them is asking the wrong question — and answering LaneDelegated to
+	// it is what pushed the resulting release under the frontend's locks.
+	semanticAuthority := v.semanticAuthorityLane(intent)
 
 	// STEP 1 — decide the lane, holding NOTHING.
 	//
@@ -250,7 +376,7 @@ func (v *Volume) AdmitMutation(
 	// that claimed first and asked for a grant second would block on itself
 	// until the operation deadline. Deciding first is also what makes the claim
 	// meaningful: it is taken for the lane the operation will actually run on.
-	if v.wb != nil && !forceAuthority {
+	if v.wb != nil && !forceAuthority && !semanticAuthority {
 		primary, touched := splitMutationOperands(
 			v.hardlinkMutationPaths(nodes, operands...),
 		)
