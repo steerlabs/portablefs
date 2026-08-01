@@ -73,9 +73,11 @@ func TestInternalRefreshCannotBecomeAnApplicationTruncate(t *testing.T) {
 		upcallReply *pfslocal.SetAttrReply
 		upcallEno   int32
 	)
-	a.testRefreshKernelFile = func(_ string, p string, _ uint64, size int64) (kernelRefreshOutcome, error) {
-		// Inside the daemon's own ftruncate(2). Everything below models what the
+	a.testRefreshKernelFile = func(_ string, p string, _ uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+		// Inside the daemon's own ftruncate(2): the provenance window is armed
+		// for exactly this call's extent. Everything below models what the
 		// kernel and the dispatcher do while that syscall is outstanding.
+		defer armTruncate()()
 		if p != "f" || size != sampledSize {
 			t.Errorf("refresh addressed path=%q size=%d, want f/%d", p, size, sampledSize)
 		}
@@ -173,8 +175,9 @@ func TestInternalRefreshBypassesMutationAdmission(t *testing.T) {
 		settle()
 	}
 
-	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
 		// Inside the daemon's own syscall: the marker is pinned.
+		defer armTruncate()()
 		if !a.internalRefreshPending(refresh) {
 			t.Error("a pinned refresh marker did not answer the provenance test")
 		}

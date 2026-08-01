@@ -569,13 +569,52 @@ func (s *mutationSequencer) waitApplied(target uint64) error {
 
 // ─── managed write-back flush ────────────────────────────────────────────────
 
-// ManagedFlushRow is one write-back record with its global stream sequence.
+// ManagedFlushRow is one write-back record with its LANE sequence (dense
+// within the batch's lane, starting at 1).
 type ManagedFlushRow struct {
 	Seq           uint64
 	Record        wal.Record
 	CheckoutPath  string
 	CheckoutEpoch string
 }
+
+// ManagedFlush is one lane-scoped write-back batch: a dense run of ONE lane of
+// one mount stream, chained onto that lane's durable digest.
+//
+// A batch is single-lane by construction. Two lanes in one request would have
+// to share one watermark reply and one retry pin, which is precisely the
+// coupling lanes exist to remove — and the transport already multiplexes, so
+// interleaving is a scheduling property of the client's two lane workers, not
+// of the request shape.
+type ManagedFlush struct {
+	WritebackID string
+	Lane        pfc2.StreamLane
+	// NSRequired is the namespace-lane watermark this batch's DATA records were
+	// admitted behind: every namespace record that precedes them in the client's
+	// WAL. The authority refuses to apply the batch until its own namespace
+	// watermark covers it, which is what makes "a data record may depend on
+	// namespace state" a checked property instead of a hope.
+	//
+	// It is meaningful only for StreamLaneData. The namespace lane depends on
+	// nothing outside itself and must carry zero here.
+	NSRequired uint64
+	PrevDigest [32]byte
+	EndDigest  [32]byte
+	Rows       []ManagedFlushRow
+}
+
+// ErrLaneDependencyUnmet is the definite, RETRYABLE verdict that a data batch
+// names a namespace watermark the authority has not applied yet. Nothing is
+// staged and nothing advances; the identical batch succeeds once the namespace
+// lane catches up.
+//
+// In practice it never fires: the namespace lane is small, ships on its own
+// worker with a 10ms max age, and the client refuses to dispatch a data batch
+// whose dependency its own applied watermark does not already cover. It is the
+// authority-side proof of that, not a mechanism the steady state relies on —
+// TestDataBatchAheadOfItsNamespaceDependencyIsHeld drives it directly, and
+// TestNamespaceDependencyNeverHoldsADataBatchInSteadyState asserts the absence.
+var ErrLaneDependencyUnmet = errors.New("vcs: data flush names a namespace watermark that is not applied yet")
 
 // ErrWritebackCorrupt is the definite verdict that a flush contradicted the
 // stream's durable identity (a sequence gap or digest divergence): the stream
@@ -614,17 +653,6 @@ func writebackStreamDigest(prev [32]byte, seq uint64, rec wal.Record) ([32]byte,
 	return out, nil
 }
 
-// ManagedFlushApply applies one dense run of a mount write-back stream as
-// ordered PFJ3 rows: each user record is ONE row whose controls carry the
-// matching FlushAdvance — tree state never applies without its watermark and
-// the watermark never advances without its tree state (same journal row,
-// same fenced transaction). The stream is one dense global sequence: rows at
-// or below the durable watermark are dropped (retry catch-up), the remainder
-// must continue at watermark+1 with no gaps, and the chained stream digest
-// must extend the durable digest to endDigest exactly — a contradiction is
-// the typed ErrWritebackCorrupt, never a partial apply. The whole bounded
-// batch stages as one ordered row list behind ONE CommitThrough barrier.
-// Returns the stream's durable through watermark.
 // pathWithinClean reports whether p equals root or lies beneath it; both must
 // already be cleanPath output (canonical, no leading/trailing slash).
 func pathWithinClean(p, root string) bool {
@@ -634,14 +662,77 @@ func pathWithinClean(p, root string) bool {
 	return len(p) > len(root) && p[:len(root)] == root && p[len(root)] == '/'
 }
 
-func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDigest, endDigest [32]byte, rows []ManagedFlushRow, owner string) (uint64, error) {
+// ManagedFlushApply applies one dense run of ONE LANE of a mount write-back
+// stream as ordered PFJ3 rows: each user record is ONE row whose controls carry
+// the matching FlushAdvance — tree state never applies without its watermark and
+// the watermark never advances without its tree state (same journal row, same
+// fenced transaction). Each lane is one dense sequence: rows at or below THAT
+// LANE's durable watermark are dropped (retry catch-up), the remainder must
+// continue at watermark+1 with no gaps, and the lane's chained digest must
+// extend that lane's durable digest to EndDigest exactly — a contradiction is
+// the typed ErrWritebackCorrupt, never a partial apply. The whole bounded batch
+// stages as one ordered row list behind ONE CommitThrough barrier. Returns the
+// lane's durable through watermark.
+//
+// ── WHY THE APPLIED TREE IS THE SAME TREE ────────────────────────────────────
+//
+// Splitting a total order into two independently-applicable lanes is only sound
+// if every pair of records whose relative order can be OBSERVED still applies in
+// that order. It does, and the argument has exactly three cases.
+//
+//  1. SAME LANE. A lane is a dense chained sequence applied in sequence order,
+//     so any two records of one lane keep their admission order exactly.
+//
+//  2. NAMESPACE BEFORE DATA. NSRequired is the count of namespace records that
+//     precede the data record in the client's WAL, so it is ≥ the lane sequence
+//     of EVERY namespace record admitted before it. The check below refuses the
+//     data batch until that watermark is durable. Order preserved.
+//
+//  3. DATA BEFORE NAMESPACE. This case does not exist in the stream. The client
+//     routes a namespace record into the DATA lane whenever its scope still has
+//     unapplied data records (writeback/engine.go laneForScopeLocked), so a
+//     record that would need to apply after pending bulk data is IN the lane
+//     that already orders it. What remains in the namespace lane is exactly the
+//     set with no such dependency.
+//
+// Records in different scopes need no ordering beyond what delegation already
+// guarantees: grants never overlap, so two records touching one node are always
+// under one grant, and a grant is drained in full before it is released — so a
+// node's records are never split across two epochs with work outstanding.
+//
+// The journal is the durability record and it preserves all of this by
+// construction: rows are staged in the order they are applied, so a cold replay
+// into pft2 sees namespace-then-data in exactly the order the live authority
+// committed them.
+func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, b ManagedFlush, owner string) (uint64, error) {
 	if fs.managed == nil {
 		return 0, ErrNotManaged
 	}
+	if !b.Lane.Valid() {
+		return 0, invalidMutation("managed flush names lane %d, which is not a stream lane", uint8(b.Lane))
+	}
+	if b.Lane != pfc2.StreamLaneData && b.NSRequired != 0 {
+		return 0, invalidMutation("only the data lane may name a namespace dependency")
+	}
+	writebackID := b.WritebackID
+	prevDigest, endDigest, rows := b.PrevDigest, b.EndDigest, b.Rows
 	durable := uint64(0)
 	digest := digestZeroStream()
+	nsApplied := uint64(0)
 	if view, ok := fs.managed.applied.StreamState(writebackID); ok {
-		durable, digest = view.Through, view.Digest
+		durable, nsApplied = view.LaneThrough(b.Lane), view.NSThrough
+		if d := view.LaneDigest(b.Lane); d != ([32]byte{}) {
+			digest = d
+		}
+	}
+	// The cross-lane dependency, checked BEFORE anything is staged: a data
+	// batch may not apply ahead of the namespace state it was admitted behind.
+	// It is a hold, not a contradiction — the identical batch applies unchanged
+	// once the namespace lane catches up — so it is retryable, and the caller's
+	// watermark is returned untouched.
+	if b.NSRequired > nsApplied {
+		return durable, fmt.Errorf("%w: batch requires namespace watermark %d, applied %d",
+			ErrLaneDependencyUnmet, b.NSRequired, nsApplied)
 	}
 	type grantKey struct {
 		path  string
@@ -690,7 +781,7 @@ func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDig
 			continue // already durably covered (retry catch-up)
 		}
 		if row.Seq != next+1 {
-			return durable, fmt.Errorf("%w: sequence %d does not continue the durable watermark %d", ErrWritebackCorrupt, row.Seq, next)
+			return durable, fmt.Errorf("%w: %s-lane sequence %d does not continue the durable watermark %d", ErrWritebackCorrupt, b.Lane, row.Seq, next)
 		}
 		if !applied && prevDigest != ([32]byte{}) && next == durable && row.Seq == durable+1 && prevDigest != digest {
 			return durable, fmt.Errorf("%w: presented digest does not extend the durable stream digest", ErrWritebackCorrupt)
@@ -714,7 +805,7 @@ func (fs *FS) ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDig
 				spec.controls = []pfc2.Record{{Kind: pfc2.KindFlushAdvance, FlushAdvance: &pfc2.FlushAdvance{
 					Session: ref, WritebackID: writebackID,
 					CheckoutPath: canonical, CheckoutEpoch: epoch,
-					Through: row.Seq, Digest: digest,
+					Through: row.Seq, Digest: digest, Lane: b.Lane,
 				}}}
 				spec.through = row.Seq
 			}

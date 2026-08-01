@@ -225,7 +225,7 @@ func TestManagedProbeAndLegacyWriteRefusal(t *testing.T) {
 	// A managed authority advertises every optional lane: atomic delegated
 	// xattrs, durable birth-time/BSD-flag persistence, and post-op mutation
 	// attributes.
-	if want := FeatureDelegatedXattrs | FeatureFlagPersistence | FeatureMutationAttrs; probe.Features != want {
+	if want := FeatureDelegatedXattrs | FeatureFlagPersistence | FeatureMutationAttrs | FeatureWritebackLanes; probe.Features != want {
 		t.Fatalf("managed features = %b, want %b", probe.Features, want)
 	}
 

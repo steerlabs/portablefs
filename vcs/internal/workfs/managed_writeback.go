@@ -201,12 +201,53 @@ type WritebackConflict struct {
 	Kind  string // SCOPE_MISSING, HOLDER_CHANGED, DIGEST_MISMATCH
 }
 
+// WritebackMark is a recovering stream's claimed durable position: the legacy
+// single-stream pair plus each lane's independent one. Every field must match
+// the authority's ledger exactly or the rebind is DIGEST_MISMATCH — verifying
+// only the legacy pair would leave a stream born after the lane boundary
+// (legacy watermark permanently 0) effectively unverified.
+type WritebackMark struct {
+	Through     uint64
+	Digest      [32]byte
+	NSThrough   uint64
+	NSDigest    [32]byte
+	DataThrough uint64
+	DataDigest  [32]byte
+}
+
+// normalized is the mark's CANONICAL form: a lane that has applied nothing
+// carries no digest.
+//
+// It exists because "the chain digest at watermark zero" is a constant
+// (digestZero), not an absence, and both sides may legitimately spell it either
+// way — the client rebuilding a lane's digest from an empty WAL prefix produces
+// the constant, while a ledger that has never seen the lane produces the zero
+// value. Comparing the raw structs would call those two spellings of "nothing
+// applied" a divergence, which is exactly the false DIGEST_MISMATCH a rebind
+// must never invent.
+func (m WritebackMark) normalized() WritebackMark {
+	if m.Through == 0 {
+		m.Digest = [32]byte{}
+	}
+	if m.NSThrough == 0 {
+		m.NSDigest = [32]byte{}
+	}
+	if m.DataThrough == 0 {
+		m.DataDigest = [32]byte{}
+	}
+	return m
+}
+
+// ClaimsNothing reports a mark that names no durable position in any lane.
+func (m WritebackMark) ClaimsNothing() bool {
+	return m.Through == 0 && m.NSThrough == 0 && m.DataThrough == 0
+}
+
 func evaluateWritebackRebind(
 	state *pfc2.State,
 	writebackID string,
 	scopes []WritebackScope,
-	through uint64,
-	digest [32]byte,
+	mark WritebackMark,
 ) ([]WritebackConflict, map[pfc2.SessionRef]bool) {
 	paths := make([]string, len(scopes))
 	for i, scope := range scopes {
@@ -215,10 +256,15 @@ func evaluateWritebackRebind(
 	view := state.WritebackRebindSnapshot(writebackID, paths)
 	conflicts := make([]WritebackConflict, 0, len(scopes)+1)
 	if view.StreamExists {
-		if view.Stream.Through != through || view.Stream.Digest != digest {
+		durable := WritebackMark{
+			Through: view.Stream.Through, Digest: view.Stream.Digest,
+			NSThrough: view.Stream.NSThrough, NSDigest: view.Stream.NSDigest,
+			DataThrough: view.Stream.DataThrough, DataDigest: view.Stream.DataDigest,
+		}
+		if durable.normalized() != mark.normalized() {
 			conflicts = append(conflicts, WritebackConflict{Kind: "DIGEST_MISMATCH"})
 		}
-	} else if through != 0 {
+	} else if !mark.ClaimsNothing() {
 		conflicts = append(conflicts, WritebackConflict{Kind: "DIGEST_MISMATCH"})
 	}
 	holders := make(map[pfc2.SessionRef]bool)
@@ -249,13 +295,12 @@ func evaluateWritebackRebind(
 func (fs *FS) ManagedWritebackConflicts(
 	writebackID string,
 	scopes []WritebackScope,
-	through uint64,
-	digest [32]byte,
+	mark WritebackMark,
 ) ([]WritebackConflict, error) {
 	if fs.managed == nil {
 		return nil, ErrNotManaged
 	}
-	conflicts, _ := evaluateWritebackRebind(fs.managed.applied, writebackID, scopes, through, digest)
+	conflicts, _ := evaluateWritebackRebind(fs.managed.applied, writebackID, scopes, mark)
 	return conflicts, nil
 }
 
@@ -292,7 +337,7 @@ func (fs *FS) reservedDelegationBlocks(self *pfc2.SessionRef, paths ...string) b
 // (the claim itself proves the mount identity moved on), and rebinds every
 // recovery scope to the caller — all in ONE journal row group. Conflicts are
 // returned typed; nothing partial commits.
-func (fs *FS) ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []WritebackScope, through uint64, digest [32]byte) ([]WritebackConflict, error) {
+func (fs *FS) ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []WritebackScope, mark WritebackMark) ([]WritebackConflict, error) {
 	if fs.managed == nil {
 		return nil, ErrNotManaged
 	}
@@ -309,7 +354,7 @@ func (fs *FS) ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebac
 	build := func() ([]pfc2.Record, error) {
 		var holders map[pfc2.SessionRef]bool
 		conflicts, holders = evaluateWritebackRebind(
-			fs.managed.reserved, writebackID, scopes, through, digest,
+			fs.managed.reserved, writebackID, scopes, mark,
 		)
 		for holder := range holders {
 			if holder == ref {

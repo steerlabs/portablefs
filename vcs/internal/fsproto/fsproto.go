@@ -414,12 +414,31 @@ type Request struct {
 	WBPrevDigest []byte
 	WBEndDigest  []byte
 	// WBScopes names the delegations an OpWritebackRebind/Discard resolves.
-	// For OpFlushBatch it is an ordered run table: Through is the last global
-	// stream sequence authorized by Path/Epoch.
+	// For OpFlushBatch it is an ordered run table: Through is the last LANE
+	// sequence authorized by Path/Epoch.
 	WBScopes []WBScope
 	// WBThrough is the recovering stream's claimed durable watermark
 	// (OpWritebackRebind; verified with WBPrevDigest as the digest at it).
 	WBThrough uint64
+	// WBLane selects which lane of the stream an OpFlushBatch advances: 0 the
+	// legacy single stream, 1 namespace, 2 data (pfc2.StreamLane). Absent (0)
+	// is exactly what every pre-round-7 client sends, so an old client's batch
+	// still names the stream it has always named.
+	WBLane uint8
+	// WBNSRequired is a DATA-lane batch's namespace dependency: the namespace
+	// watermark its records were admitted behind. The authority holds the batch
+	// (typed retryable) until its own namespace lane covers it. Zero on every
+	// other lane, and required to be zero there.
+	WBNSRequired uint64
+	// WBNS*/WBData* are an OpWritebackRebind's claimed PER-LANE positions,
+	// alongside the legacy pair in WBThrough/WBPrevDigest. All four must match
+	// the authority's ledger exactly: a stream born after the lane boundary has
+	// a permanently-zero legacy watermark, so verifying only the legacy pair
+	// would verify nothing at all about it.
+	WBNSThrough   uint64
+	WBNSDigest    []byte
+	WBDataThrough uint64
+	WBDataDigest  []byte
 
 	// AckPos is an OpInvalidationAck's cumulative acknowledged
 	// invalidation-stream position (client→server on the subscribe conn).
@@ -521,10 +540,18 @@ type Response struct {
 
 	// ---- write-back stream fields ----
 
-	// WBExists/WBDigest report a stream's durable state (OpWritebackState;
-	// the watermark rides AppliedThrough).
+	// WBExists/WBDigest report a stream's durable LEGACY-lane state
+	// (OpWritebackState; the watermark rides AppliedThrough).
 	WBExists bool
 	WBDigest []byte
+	// WBNS*/WBData* report the namespace and data lanes' independent durable
+	// positions. Additive gob fields: an older client ignores them and reads
+	// exactly the single-stream view it always read, which is the correct view
+	// of the only stream it can have written.
+	WBNSThrough   uint64
+	WBNSDigest    []byte
+	WBDataThrough uint64
+	WBDataDigest  []byte
 	// WBConflicts carries the typed recovery conflicts of a rejected
 	// OpWritebackRebind — never silently merged or discarded.
 	WBConflicts []WBConflict

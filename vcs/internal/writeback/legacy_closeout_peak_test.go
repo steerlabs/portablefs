@@ -225,7 +225,7 @@ func TestLegacyCloseOutPeakStaysWithinBudget(t *testing.T) {
 		}
 
 		probe := installCloseOutProbe(t, dir, 0)
-		err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, digest, scopes, budget)
+		err := appendRecoveryReleaseCertificate(dir, scan, legacyStreamMark(scan.lastSeq, digest), scopes, budget)
 		probe.observe()
 
 		if probe.peak > budget {
@@ -247,7 +247,7 @@ func TestLegacyCloseOutPeakStaysWithinBudget(t *testing.T) {
 		// same stream closes out unchanged and inside the new bound.
 		raised := int64(budget) * 2
 		retry := installCloseOutProbe(t, dir, 0)
-		if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, digest, scopes, raised); err != nil {
+		if err := appendRecoveryReleaseCertificate(dir, scan, legacyStreamMark(scan.lastSeq, digest), scopes, raised); err != nil {
 			t.Fatalf("raising the cap to %d must let the same close-out through: %v", raised, err)
 		}
 		retry.observe()
@@ -275,7 +275,7 @@ func TestLegacyCloseOutPeakStaysWithinBudget(t *testing.T) {
 		}
 
 		probe := installCloseOutProbe(t, dir, 0)
-		err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, digest, scopes, budget)
+		err := appendRecoveryReleaseCertificate(dir, scan, legacyStreamMark(scan.lastSeq, digest), scopes, budget)
 		probe.observe()
 
 		if err != nil {
@@ -331,7 +331,7 @@ func TestLegacyCloseOutRefusesBeforeAppendingWhenPeakCannotFit(t *testing.T) {
 	appliedBefore := countAppliedFrames(t, dir)
 
 	probe := installCloseOutProbe(t, dir, 0)
-	err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, digest, scopes, budget)
+	err := appendRecoveryReleaseCertificate(dir, scan, legacyStreamMark(scan.lastSeq, digest), scopes, budget)
 
 	if !errors.Is(err, errCloseOutUnbounded) {
 		t.Fatalf("want the definite typed close-out answer, got %v", err)
@@ -410,7 +410,7 @@ func TestLegacyCloseOutENOSPCAtMarkerBarrierIsDefinite(t *testing.T) {
 			// the budget disabled, so it takes the unreclaimed route.
 			dir, scan, digest, scopes := tc.build(t, budget)
 			probe := installCloseOutProbe(t, dir, tc.failAt)
-			err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, digest, scopes, tc.budget)
+			err := appendRecoveryReleaseCertificate(dir, scan, legacyStreamMark(scan.lastSeq, digest), scopes, tc.budget)
 
 			if probe.calls < tc.failAt {
 				t.Fatalf("the close-out never reached append %d (%d performed)", tc.failAt, probe.calls)

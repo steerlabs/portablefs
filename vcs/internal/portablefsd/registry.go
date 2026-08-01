@@ -196,12 +196,16 @@ type registry struct {
 	// queueing another one behind it on mutationMu.
 	unmountMu  sync.Mutex
 	unmounting map[string]*unmountTransaction
-	persistMu  sync.Mutex
-	stateDir   string
-	byRef      map[string]*attach
-	byKey      map[string]*attach
-	quiescing  bool
-	loadErr    error
+	// testUnmountDrain replaces the normal transaction's cancellable authority
+	// drain barrier so failure-shape tests can hold it open and drive a --force
+	// escalation against it. Production never sets it.
+	testUnmountDrain func(context.Context, func() error) (string, error)
+	persistMu        sync.Mutex
+	stateDir         string
+	byRef            map[string]*attach
+	byKey            map[string]*attach
+	quiescing        bool
+	loadErr          error
 
 	// Guarded by persistMu. An empty v1 registry is semantically compatible
 	// with v2, but accepting it must remain a read-only compatibility rule.
@@ -615,8 +619,16 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 	return true, jobID, err
 }
 
-func (r *registry) unmountFSKit(ref string, force bool) (bool, string, error) {
-	return r.unmountFSKitWith(ref, force, hostFSKitKernelOps())
+func (r *registry) unmountFSKit(ctx context.Context, ref string, force bool) (bool, string, error) {
+	return r.unmountFSKitWithContext(ctx, ref, force, hostFSKitKernelOps())
+}
+
+func (r *registry) unmountFSKitWith(
+	ref string,
+	force bool,
+	ops fskitKernelOps,
+) (bool, string, error) {
+	return r.unmountFSKitWithContext(context.Background(), ref, force, ops)
 }
 
 // unmountTransactionBudget is the daemon's OWN ceiling on how long one unmount
@@ -650,10 +662,29 @@ type unmountOutcome struct {
 	err   error
 }
 
-// unmountFSKitWith answers ONE unmount request within unmountTransactionBudget.
-// The transaction itself is started at most once per attach ref and runs to its
-// own completion regardless of how many requests observe it.
-func (r *registry) unmountFSKitWith(
+// unmountFSKitWithContext answers ONE unmount request within the transaction's
+// ABSOLUTE remaining budget. There is exactly ONE transaction per attach ref;
+// every later request — including a --force — joins it rather than queueing a
+// second one behind it.
+//
+// ── FORCE ESCALATES, IT DOES NOT RACE ───────────────────────────────────────
+//
+// Force used to start a SEPARATE transaction. Both transactions then took the
+// registry's global mutationMu, and the normal one holds it across the whole
+// authority drain barrier and the exact kernel detach. So --force — the escape
+// hatch from precisely that wait — parked behind it, burned the full request
+// budget, and returned having fenced nothing, parked nothing, and started no
+// recovery job. The one command whose entire purpose is to preempt the drain
+// could not preempt it.
+//
+// Force is now an ESCALATION of the running transaction, applied atomically:
+// the transaction is marked forced and its drain is CANCELLED, and the
+// transaction — which already owns the mutation lock — takes the journal-first
+// park/fence path itself, before anything irreversible. The park/fence phase is
+// therefore reachable without ever waiting on the normal drain's mutex, because
+// it runs on the goroutine that holds it.
+func (r *registry) unmountFSKitWithContext(
+	ctx context.Context,
 	ref string,
 	force bool,
 	ops fskitKernelOps,
@@ -662,62 +693,111 @@ func (r *registry) unmountFSKitWith(
 	if r.unmounting == nil {
 		r.unmounting = map[string]*unmountTransaction{}
 	}
-	tx, running := r.unmounting[ref]
-	// A FORCE request never joins a normal transaction. Force is a different
-	// decision — park the unshipped tail as a durable recovery job rather than
-	// drain it — and it is the escape hatch from exactly the wait a normal
-	// unmount is sitting in. Making it wait for that transaction's verdict
-	// would defeat its whole purpose.
-	if running && force && !tx.force {
-		running = false
-		tx = nil
-	}
-	if !running {
-		started := &unmountTransaction{done: make(chan struct{}), force: force}
-		if tx == nil {
-			r.unmounting[ref] = started
+	tx := r.unmounting[ref]
+	if tx == nil {
+		tx = &unmountTransaction{
+			done:     make(chan struct{}),
+			escalate: make(chan struct{}),
+			force:    force,
+			deadline: time.Now().Add(unmountTransactionBudget),
 		}
-		tx = started
+		r.unmounting[ref] = tx
 		go func() {
-			found, jobID, err := r.runUnmountTransaction(ref, force, ops)
+			found, jobID, err := r.runUnmountTransaction(ref, tx, ops)
+			// THE OUTCOME IS PUBLISHED BEFORE THE TRANSACTION BECOMES
+			// UNDISCOVERABLE. Removing the entry first opened a window in which
+			// a retry saw no running transaction and STARTED A SECOND ONE
+			// against an attach the first had already detached, and in which a
+			// joiner's expiring timer could report "unknown attach" for a
+			// detach that had just succeeded. A request that finds the entry in
+			// that window now joins a transaction that is already resolved and
+			// reads its terminal outcome immediately.
+			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
+			close(tx.done)
 			r.unmountMu.Lock()
 			if r.unmounting[ref] == tx {
 				delete(r.unmounting, ref)
 			}
 			r.unmountMu.Unlock()
-			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
-			close(tx.done)
 		}()
+	} else if force && !tx.force {
+		// ESCALATE the running normal transaction in place.
+		tx.force = true
+		close(tx.escalate)
 	}
+	deadline := tx.deadline
 	r.unmountMu.Unlock()
-	timer := time.NewTimer(unmountTransactionBudget)
+
+	// ONE ABSOLUTE DEADLINE for the transaction, not a fresh budget per joiner:
+	// a request that joins a transaction 39 seconds old must not wait another
+	// 40, or a caller retrying on the CLI's advice never reaches a verdict.
+	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case <-tx.done:
 		return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+	case <-ctx.Done():
+		// Only THIS waiter gave up. The transaction owns durable state and
+		// keeps running; it is never abandoned by a departing joiner.
+		select {
+		case <-tx.done:
+			return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+		default:
+		}
+		return true, "", r.unmountInProgressVerdict(ref, ctx.Err())
 	case <-timer.C:
-		return true, "", r.unmountInProgressVerdict(ref)
+		// The timer and completion can fire together; completion wins.
+		select {
+		case <-tx.done:
+			return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+		default:
+		}
+		return true, "", r.unmountInProgressVerdict(ref, nil)
 	}
 }
 
 // unmountTransaction is one running detach, shared by every request that
 // observes it. outcome is written exactly once, before done closes.
+//
+// force and escalate are the escalation channel: force is read under
+// registry.unmountMu by the transaction goroutine at each decision point, and
+// escalate is closed exactly once, by the force request that upgraded a normal
+// transaction, so an in-flight drain can be cancelled.
 type unmountTransaction struct {
-	done    chan struct{}
-	force   bool
-	outcome unmountOutcome
+	done     chan struct{}
+	escalate chan struct{}
+	deadline time.Time
+	force    bool
+	outcome  unmountOutcome
+}
+
+// escalated reports whether this transaction has been upgraded to a force.
+func (r *registry) escalated(tx *unmountTransaction) bool {
+	r.unmountMu.Lock()
+	defer r.unmountMu.Unlock()
+	return tx.force
 }
 
 // unmountInProgressVerdict is the definite answer to a request whose budget
 // expired with the transaction still running. It NAMES what the transaction is
 // waiting on and what to do next — the same shape as the recorded-verdict
 // refusal — so the CLI reports a verdict instead of a transport failure.
-func (r *registry) unmountInProgressVerdict(ref string) error {
+// waiterErr, when non-nil, says this particular request's own context ended;
+// the transaction is unaffected.
+func (r *registry) unmountInProgressVerdict(ref string, waiterErr error) error {
 	r.mu.RLock()
 	a := r.byRef[ref]
 	r.mu.RUnlock()
 	if a == nil {
-		return fmt.Errorf("unmount in progress for unknown attach %s", ref)
+		// The attach is already out of the registry while the transaction is
+		// still finishing its durable tail. This is NOT an unknown attach —
+		// saying so told a caller their unmount had never been seen moments
+		// after it succeeded.
+		return fmt.Errorf(
+			"unmount of %s is in its final durable phase; the attach is already "+
+				"detached — re-run `portablefs umount` to join it for the verdict%s",
+			ref, waiterSuffix(waiterErr),
+		)
 	}
 	detail := "the authority drain barrier"
 	if st := a.liveWriteBackStatus(); st != nil {
@@ -745,9 +825,16 @@ func (r *registry) unmountInProgressVerdict(ref string) error {
 		"unmount is still running after %s, waiting on %s; it continues in the "+
 			"background — re-run `portablefs umount` to join it, or "+
 			"`portablefs umount --force` to park the unshipped tail as a durable "+
-			"recovery job",
-		unmountTransactionBudget, detail,
+			"recovery job%s",
+		unmountTransactionBudget, detail, waiterSuffix(waiterErr),
 	)
+}
+
+func waiterSuffix(waiterErr error) string {
+	if waiterErr == nil {
+		return ""
+	}
+	return fmt.Sprintf(" (this request stopped waiting: %v)", waiterErr)
 }
 
 type fskitKernelOps struct {
@@ -761,7 +848,7 @@ type fskitKernelOps struct {
 // abandoning it partway would leave durable state without an owner.
 func (r *registry) runUnmountTransaction(
 	ref string,
-	force bool,
+	tx *unmountTransaction,
 	ops fskitKernelOps,
 ) (bool, string, error) {
 	r.mutationMu.Lock()
@@ -772,6 +859,7 @@ func (r *registry) runUnmountTransaction(
 	if a == nil {
 		return false, "", nil
 	}
+	force := r.escalated(tx)
 	a.mu.RLock()
 	prepared := a.detachPrepared
 	forceAuthorized := a.detachForce
@@ -810,7 +898,25 @@ func (r *registry) runUnmountTransaction(
 		if !volumeActive {
 			return true, "", fmt.Errorf("normal FSKit detach requires an active credentialed volume to prove the final authority barrier")
 		}
-		_, err := a.detachWithFinalizer(func() error {
+		// THE DRAIN IS CANCELLABLE BY ESCALATION. A --force arriving while this
+		// barrier is running closes tx.escalate; the drain then unwinds
+		// promptly and this same goroutine — which already owns mutationMu —
+		// takes the journal-first park/fence path, so force never queues behind
+		// the wait it exists to escape.
+		drainCtx, cancelDrain := context.WithCancel(context.Background())
+		drainDone := make(chan struct{})
+		go func() {
+			select {
+			case <-tx.escalate:
+				cancelDrain()
+			case <-drainDone:
+			}
+		}()
+		drain := a.detachWithFinalizerContext
+		if r.testUnmountDrain != nil {
+			drain = r.testUnmountDrain
+		}
+		_, err := drain(drainCtx, func() error {
 			a.mu.Lock()
 			a.detachPrepared = true
 			a.mu.Unlock()
@@ -845,9 +951,27 @@ func (r *registry) runUnmountTransaction(
 			}
 			return nil
 		})
+		close(drainDone)
+		cancelDrain()
 		if err != nil {
-			return true, "", err
+			// An ESCALATION that aborted this drain is not a failed unmount: it
+			// is the same transaction changing decision. Take the journal-first
+			// park/fence path now, on the goroutine that already holds
+			// mutationMu, before anything irreversible has happened. Any other
+			// error is the normal transaction's own definite failure.
+			if r.escalated(tx) {
+				forcedJobID, forceErr := r.forceUnmountFSKit(a, false, ops)
+				if forceErr != nil {
+					return true, forcedJobID, forceErr
+				}
+				jobID = forcedJobID
+			} else {
+				return true, "", err
+			}
 		}
+		// If the drain WON the race with an escalation, the normal detach is
+		// complete and durable — strictly stronger than parking the tail — and
+		// that is the outcome every joiner, force or not, is given.
 	}
 	r.mu.Lock()
 	delete(r.byRef, ref)
@@ -1125,11 +1249,17 @@ type attach struct {
 	// The identities differ for a create born under a delegation.
 	authorityItems         map[uint64]frontendItemIdentity
 	awaitingAuthorityItems map[uint64]struct{}
-	handles                map[uint64]*handleRecord
-	localDirs              []string
-	localRoot              string
-	localFS                *confinedfs.Root
-	localVersions          map[string]uint64
+	// reincarnatedAliases names retained hard-link aliases whose cached
+	// attributes were taken BEFORE a pathname reincarnation displaced their
+	// inode. The publisher that detected the reincarnation must reconcile them
+	// before its own reply leaves (see reconcileReincarnatedAliases). Guarded
+	// by mu.
+	reincarnatedAliases map[string]struct{}
+	handles             map[uint64]*handleRecord
+	localDirs           []string
+	localRoot           string
+	localFS             *confinedfs.Root
+	localVersions       map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1159,7 +1289,7 @@ type attach struct {
 	// Test seam for deterministic frontend ordering tests; nil in production.
 	testLookupAfterVolume func(path string)
 	// Test seam for the secure kernel refresh syscall; nil in production.
-	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64) (kernelRefreshOutcome, error)
+	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error)
 	testExactKernelRefresh func(context.Context, uint64) error
 	// testMutationAdmissionBarrier stands in, for tests, for the pre-lock
 	// admission park a real metadata or credit lane can impose. It exists to make
@@ -1868,6 +1998,16 @@ func (a *attach) forcedDetach() (jobID string, err error) {
 // keeps the volume usable when the callback fails, so a failed platform
 // unmount thaws back to the live mount.
 func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
+	return a.detachWithFinalizerContext(context.Background(), finalizer)
+}
+
+// detachWithFinalizerContext lets the unmount transaction cancel its own drain
+// barrier when a --force escalates it (see runUnmountTransaction). ctx bounds
+// only the barrier wait; nothing committed is abandoned.
+func (a *attach) detachWithFinalizerContext(
+	ctx context.Context,
+	finalizer func() error,
+) (string, error) {
 	a.mu.RLock()
 	alreadyDetached := a.detached
 	existingJobID := a.detachJobID
@@ -1877,7 +2017,7 @@ func (a *attach) detachWithFinalizer(finalizer func() error) (string, error) {
 		return existingJobID, nil
 	}
 	if vol != nil {
-		if err := vol.CloseWithFinalizer(finalizer); err != nil {
+		if err := vol.CloseWithFinalizerContext(ctx, finalizer); err != nil {
 			return "", fmt.Errorf("prepared FSKit detach refused: %w", err)
 		}
 	} else if err := finalizer(); err != nil {
@@ -2445,6 +2585,22 @@ func (a *attach) registerWithItemLocked(
 // or an open handle. If the detached record was canonical, prefer a surviving
 // alias as the canonical path; with no alias, retain the detached record until
 // the kernel's explicit Reclaim releases the old Item.
+// takeReincarnatedAliases drains the reconciliation debt recorded by
+// detachReincarnatedPathLocked.
+func (a *attach) takeReincarnatedAliases() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.reincarnatedAliases) == 0 {
+		return nil
+	}
+	aliases := make([]string, 0, len(a.reincarnatedAliases))
+	for alias := range a.reincarnatedAliases {
+		aliases = append(aliases, alias)
+	}
+	a.reincarnatedAliases = nil
+	return aliases
+}
+
 func (a *attach) detachReincarnatedPathLocked(p string, rec *itemRecord) {
 	if rec == nil || a.paths[p] != rec {
 		return
@@ -2473,6 +2629,28 @@ func (a *attach) detachReincarnatedPathLocked(p string, rec *itemRecord) {
 		}
 		// No alias intentionally leaves rec canonical. The Item remains
 		// addressable through its old NodeState until Reclaim.
+	}
+	// ── THE RETAINED ALIASES OWE A RECONCILIATION ───────────────────────────
+	//
+	// A pathname reincarnation replaces WHO `p` names; it does not change the
+	// displaced inode, but it does change its LINK COUNT, and every retained
+	// hard-link alias of that inode is now carrying a stale attribute snapshot
+	// taken before the replacement.
+	//
+	// Nothing here can refresh them (this runs under a.mu, and refreshing needs
+	// the authority), and the invalidation stream that normally does it is a
+	// SEPARATE path with no ordering relationship to the lookup that is about
+	// to publish the replacement. So applications saw the new `a` and then `b`
+	// still claiming Nlink=2 — a lookup published a post-replacement identity
+	// beside a pre-replacement alias.
+	//
+	// Record the debt; the publisher that detected the reincarnation settles it
+	// BEFORE its reply leaves (see reconcileReincarnatedAliases).
+	for aliasPath := range a.itemAliases[rec.item.ItemID] {
+		if a.reincarnatedAliases == nil {
+			a.reincarnatedAliases = map[string]struct{}{}
+		}
+		a.reincarnatedAliases[aliasPath] = struct{}{}
 	}
 	if len(a.itemAliases[rec.item.ItemID]) == 0 {
 		delete(a.awaitingAuthorityItems, rec.item.ItemID)

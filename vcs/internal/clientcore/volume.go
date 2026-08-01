@@ -931,12 +931,24 @@ func (r wbRemote) ReleaseDelegation(ctx context.Context, scope, epoch string) er
 	return r.cli.CheckinManaged(scope, epoch)
 }
 
-func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
+func flushBatchOf(req writeback.FlushRequest) fsproto.FlushBatch {
 	scopes := make([]fsproto.WBScope, 0, len(req.ScopeRuns))
 	for _, run := range req.ScopeRuns {
 		scopes = append(scopes, fsproto.WBScope{Path: run.Scope, Epoch: run.Epoch, Through: run.Through})
 	}
-	through, status, err := r.cli.FlushWritebackContext(ctx, req.WritebackID, scopes, req.PrevDigest, req.EndDigest, req.Records)
+	return fsproto.FlushBatch{
+		WritebackID: req.WritebackID,
+		Lane:        uint8(req.Lane),
+		NSRequired:  req.NSRequired,
+		Scopes:      scopes,
+		PrevDigest:  req.PrevDigest,
+		EndDigest:   req.EndDigest,
+		Records:     req.Records,
+	}
+}
+
+func (r wbRemote) Flush(ctx context.Context, req writeback.FlushRequest) (writeback.FlushReply, error) {
+	through, status, err := r.cli.FlushWritebackContext(ctx, flushBatchOf(req))
 	if err != nil {
 		return writeback.FlushReply{}, err
 	}
@@ -947,28 +959,32 @@ func (r wbRemote) FlushResolved(ctx context.Context, req writeback.FlushRequest)
 	if err := ctx.Err(); err != nil {
 		return writeback.FlushReply{}, err
 	}
-	scopes := make([]fsproto.WBScope, 0, len(req.ScopeRuns))
-	for _, run := range req.ScopeRuns {
-		scopes = append(scopes, fsproto.WBScope{Path: run.Scope, Epoch: run.Epoch, Through: run.Through})
-	}
-	through, status, err := r.cli.FlushWritebackResolved(req.WritebackID, scopes, req.PrevDigest, req.EndDigest, req.Records)
+	through, status, err := r.cli.FlushWritebackResolved(flushBatchOf(req))
 	if err != nil {
 		return writeback.FlushReply{}, err
 	}
 	return writeback.FlushReply{Through: through, Status: status}, nil
 }
 
+func (r wbRemote) SupportsLanes() bool {
+	return r.cli.Features()&fsproto.FeatureWritebackLanes != 0
+}
+
 func (r wbRemote) StreamState(ctx context.Context, writebackID string) (writeback.StreamState, error) {
 	return ctxCall(ctx, func() (writeback.StreamState, error) {
-		exists, through, digest, err := r.cli.WritebackState(writebackID)
+		v, err := r.cli.WritebackState(writebackID)
 		if err != nil {
 			return writeback.StreamState{}, err
 		}
-		return writeback.StreamState{Exists: exists, Through: through, Digest: digest}, nil
+		return writeback.StreamState{
+			Exists: v.Exists, Through: v.Through, Digest: v.Digest,
+			NSThrough: v.NSThrough, NSDigest: v.NSDigest,
+			DataThrough: v.DataThrough, DataDigest: v.DataDigest,
+		}, nil
 	})
 }
 
-func (r wbRemote) Rebind(ctx context.Context, writebackID string, scopes []writeback.RebindScope, through uint64, digest [32]byte) (writeback.RebindReply, error) {
+func (r wbRemote) Rebind(ctx context.Context, writebackID string, scopes []writeback.RebindScope, mark writeback.StreamState) (writeback.RebindReply, error) {
 	// Rebind is an exact ownership move. Once sent, returning on ctx
 	// cancellation would release the recovery store lock while the move was
 	// still resolving, allowing another attach to overlap the same stream.
@@ -981,7 +997,11 @@ func (r wbRemote) Rebind(ctx context.Context, writebackID string, scopes []write
 	for _, sc := range scopes {
 		wire = append(wire, fsproto.WBScope{Path: sc.Scope, Epoch: sc.Epoch})
 	}
-	conflicts, err := r.cli.WritebackRebind(writebackID, wire, through, digest)
+	conflicts, err := r.cli.WritebackRebind(writebackID, wire, fsproto.WritebackStateView{
+		Exists: mark.Exists, Through: mark.Through, Digest: mark.Digest,
+		NSThrough: mark.NSThrough, NSDigest: mark.NSDigest,
+		DataThrough: mark.DataThrough, DataDigest: mark.DataDigest,
+	})
 	if err != nil {
 		return writeback.RebindReply{}, err
 	}
@@ -1840,6 +1860,20 @@ func (v *Volume) Close() error {
 // thaws, the Volume remains live, and the mutation gate reopens. Once
 // finalize succeeds the frontend is gone before protocol resources close.
 func (v *Volume) CloseWithFinalizer(finalize func() error) error {
+	return v.CloseWithFinalizerContext(context.Background(), finalize)
+}
+
+// CloseWithFinalizerContext is CloseWithFinalizer with a caller-owned
+// cancellation on the DRAIN BARRIER only. The barrier keeps its own
+// volumeBarrierTimeout ceiling; ctx can only end the wait sooner.
+//
+// It exists so a normal unmount's drain can be preempted in place by a --force
+// escalation of the same transaction. Cancelling here abandons the barrier
+// attempt, never a committed transition: the volume is not closed, the
+// mutation seal is only latched for a genuine prepared-detach rollback failure
+// (latchFailFrozenFinalizer), and the escalated caller goes on to the
+// journal-first park/fence path with a live volume.
+func (v *Volume) CloseWithFinalizerContext(ctx context.Context, finalize func() error) error {
 	v.lifecycleMu.Lock()
 	defer v.lifecycleMu.Unlock()
 	if v.closed {
@@ -1856,7 +1890,7 @@ func (v *Volume) CloseWithFinalizer(finalize func() error) error {
 		return nil
 	}
 	if v.wb != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), volumeBarrierTimeout)
+		ctx, cancel := context.WithTimeout(ctx, volumeBarrierTimeout)
 		err := v.wb.CloseWithBarrier(ctx, barrierAndFinalize)
 		cancel()
 		if err != nil {

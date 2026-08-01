@@ -149,7 +149,7 @@ func TestForceParkAbandonedStoreClosesPreRegistryEmptyStreamAsZeroTail(t *testin
 	// Model a crash while a prior offline attempt was appending its clean
 	// marker. The strict scanner may discard only this physically torn EOF.
 	partialPayload, _ := json.Marshal(closeFrame{Through: 0})
-	partial := encodeFrame(nil, frameClose, 1, 0, partialPayload)
+	partial := encodeFrame(nil, frameClose, StreamLaneLegacy, 1, 0, partialPayload)
 	segment := segmentPath(streamDir, 1)
 	file, err := os.OpenFile(segment, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
@@ -373,7 +373,7 @@ func TestForceParkAbandonedStoreRejectsInconsistentForcedTerminal(t *testing.T) 
 		t.Fatal(err)
 	}
 	payload, _ := json.Marshal(closeFrame{Through: scan.lastSeq, JobID: jobID, Reason: "mismatch"})
-	replacement := encodeFrame(nil, frameForcedClose, last.frameNo, 0, payload)
+	replacement := encodeFrame(nil, frameForcedClose, StreamLaneLegacy, last.frameNo, 0, payload)
 	offset := info.Size() - frameLen(len(last.payload))
 	if len(replacement) != int(frameLen(len(last.payload))) {
 		t.Skip("replacement payload length differs; terminal identity path covered by job mismatch tests")

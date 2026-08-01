@@ -24,13 +24,18 @@ import (
 var requestWireMagic = [4]byte{'P', 'F', 'R', 'Q'}
 
 const (
-	requestWireVersion = 4
+	requestWireVersion = 5
 	// Accepted older request-wire versions. Each appended scalar/flag is gated
 	// on the version that introduced it, so an older peer's frame is decoded
 	// exactly as it was written instead of being misread field-by-field.
 	requestWireLegacyVersion  = 2
 	requestWireAtimeVersion   = 3
 	requestWireChflagsVersion = 4
+	// requestWireLanesVersion carries the write-back stream's LANE tag and the
+	// data lane's namespace dependency. Only a laned flush selects it, and a
+	// client only forms one after the probe advertised FeatureWritebackLanes —
+	// a bit an authority can only set if it decodes v5.
+	requestWireLanesVersion = 5
 
 	// requestWireDefaultVersion is the version EVERY request is written at
 	// unless it needs a newer field. An appended scalar raises requestWireVersion
@@ -125,6 +130,14 @@ type preparedRequest struct {
 // EINVAL; it still selects v4 so the authority judges the bytes the caller
 // actually built rather than a silently truncated version of them.
 func requestWireVersionFor(req *Request) uint8 {
+	// A laned flush cannot be expressed at all below v5: the lane tag is what
+	// says which watermark the batch advances, and dropping it would apply a
+	// namespace batch onto the legacy stream's chain.
+	if req.WBLane != 0 || req.WBNSRequired != 0 ||
+		req.WBNSThrough != 0 || req.WBDataThrough != 0 ||
+		len(req.WBNSDigest) != 0 || len(req.WBDataDigest) != 0 {
+		return requestWireLanesVersion
+	}
 	if req.SetFlags || req.Flags != 0 {
 		return requestWireChflagsVersion
 	}
@@ -156,6 +169,13 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 	// The chflags word is appended only by the versions that carry it.
 	if version >= requestWireChflagsVersion {
 		if err := add(4); err != nil {
+			return preparedRequest{}, err
+		}
+	}
+	// The lane tag, its namespace dependency, and the per-lane rebind
+	// watermarks, likewise.
+	if version >= requestWireLanesVersion {
+		if err := add(1 + 8 + 8 + 8); err != nil {
 			return preparedRequest{}, err
 		}
 	}
@@ -197,6 +217,14 @@ func prepareRequest(req *Request) (preparedRequest, error) {
 	}
 	if err := addBytes("end digest", req.WBEndDigest, maxRequestAuxBytes); err != nil {
 		return preparedRequest{}, err
+	}
+	if version >= requestWireLanesVersion {
+		if err := addBytes("namespace lane digest", req.WBNSDigest, maxRequestAuxBytes); err != nil {
+			return preparedRequest{}, err
+		}
+		if err := addBytes("data lane digest", req.WBDataDigest, maxRequestAuxBytes); err != nil {
+			return preparedRequest{}, err
+		}
 	}
 	if req.Env != nil {
 		if err := addText("envelope session id", req.Env.SessionID); err != nil {
@@ -408,6 +436,12 @@ func (e *requestEncoder) encodePrepared(req *Request, prepared preparedRequest) 
 	if prepared.version >= requestWireChflagsVersion {
 		w.u32(req.Flags)
 	}
+	if prepared.version >= requestWireLanesVersion {
+		w.u8(req.WBLane)
+		w.u64(req.WBNSRequired)
+		w.u64(req.WBNSThrough)
+		w.u64(req.WBDataThrough)
+	}
 
 	for _, value := range []string{
 		req.Path,
@@ -425,6 +459,10 @@ func (e *requestEncoder) encodePrepared(req *Request, prepared preparedRequest) 
 	w.bytes(req.Data)
 	w.bytes(req.WBPrevDigest)
 	w.bytes(req.WBEndDigest)
+	if prepared.version >= requestWireLanesVersion {
+		w.bytes(req.WBNSDigest)
+		w.bytes(req.WBDataDigest)
+	}
 	if req.Env != nil {
 		w.text(req.Env.SessionID)
 		w.u64(req.Env.Generation)
@@ -601,6 +639,12 @@ func (d *requestDecoder) Decode(dst *Request) error {
 	if version >= requestWireChflagsVersion {
 		req.Flags = r.u32()
 	}
+	if version >= requestWireLanesVersion {
+		req.WBLane = r.u8()
+		req.WBNSRequired = r.u64()
+		req.WBNSThrough = r.u64()
+		req.WBDataThrough = r.u64()
+	}
 
 	req.OrphanTarget = flags&requestFlagOrphanTarget != 0
 	req.Append = flags&requestFlagAppend != 0
@@ -628,6 +672,10 @@ func (d *requestDecoder) Decode(dst *Request) error {
 	req.Data = r.bytes("data", MaxWriteBytes)
 	req.WBPrevDigest = r.bytes("previous digest", maxRequestAuxBytes)
 	req.WBEndDigest = r.bytes("end digest", maxRequestAuxBytes)
+	if version >= requestWireLanesVersion {
+		req.WBNSDigest = r.bytes("namespace lane digest", maxRequestAuxBytes)
+		req.WBDataDigest = r.bytes("data lane digest", maxRequestAuxBytes)
+	}
 	if flags&requestFlagEnvelope != 0 {
 		req.Env = &wal.Envelope{
 			SessionID:  r.text("envelope session id"),

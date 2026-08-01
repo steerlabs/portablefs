@@ -14,6 +14,7 @@ package fsproto
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -26,6 +27,18 @@ import (
 // restart, lease rotation, revocation) and every redial with it will be
 // rejected too. Callers surface the error and explicitly remount.
 var ErrSessionTokenRejected = errors.New("fsproto: session token rejected by data-plane router")
+
+// ErrCredentialRefused is the EXPLICIT half of ErrSessionTokenRejected: the
+// peer read the token frame and answered ack 1. It is the only form strong
+// enough to latch a terminal, operator-facing credential verdict.
+//
+// The other form — a clean EOF before any ack — is a REDIAL heuristic, not
+// proof. A router restarting, a manager rolling, or an authority shutting down
+// mid-handshake all produce it, and treating it as "your credential is dead;
+// run portablefs login" told operators to fix a credential that was fine. It
+// still ends the dial pass and still stays off the transport breaker; it simply
+// makes no claim about the credential.
+var ErrCredentialRefused = fmt.Errorf("%w (peer refused the credential)", ErrSessionTokenRejected)
 
 // dialHandshakeTimeout bounds the auth exchange on a fresh connection,
 // mirroring secure.ClientHandshake's bound (a legit exchange is one round
@@ -66,7 +79,7 @@ func clientHandshake(nc net.Conn, token string) error {
 		return err
 	}
 	if ack[0] != 0 {
-		return ErrSessionTokenRejected
+		return ErrCredentialRefused
 	}
 	return nil
 }

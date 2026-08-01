@@ -25,12 +25,12 @@ const (
 	flushAttemptTimeout = 30 * time.Second
 )
 
-// flushMaxBytes is the UPLINK amortization knob: one batch is one request,
-// one authority apply turn, and one reply, so everything a batch costs
-// besides moving its bytes is paid once per batch. At 8 MiB the measured
+// flushMaxBytes is the UPLINK amortization knob for the DATA lane: one batch is
+// one request, one authority apply turn, and one reply, so everything a batch
+// costs besides moving its bytes is paid once per batch. At 8 MiB the measured
 // production shape was 1.52s per batch of which ~0.70s was transfer — 44%
 // link utilization, i.e. the majority of a batch's wall time was the fixed
-// cost, and the flusher ships strictly one batch at a time.
+// cost, and each lane worker ships strictly one batch at a time.
 //
 // 32 MiB is the largest value that stays comfortably inside every bound
 // that actually constrains it:
@@ -55,10 +55,10 @@ const (
 //     workload of small records is bounded by the record count first and
 //     amortizes the fixed cost less; that is a separate bound with a
 //     separate argument, not a knob to turn here.
-//   - THE RESEND CONTRACT. attemptEnd pins a batch by its END SEQUENCE, and a
-//     pinned resend replays exactly the records that sequence covers, with no
-//     size bound applied — so an exact resend is byte-identical at any batch
-//     size. Nothing here changes what a retry sends.
+//   - THE RESEND CONTRACT. attemptEnd pins a batch by its END LANE SEQUENCE,
+//     and a pinned resend replays exactly the records that sequence covers,
+//     with no size bound applied — so an exact resend is byte-identical at any
+//     batch size. Nothing here changes what a retry sends.
 //   - THE CREDIT LEDGER and the metadata/control reserves are all sized in
 //     WAL bytes and are independent of how the drained bytes are grouped for
 //     transmission.
@@ -67,9 +67,28 @@ const (
 // records on the heap plus its encoded frame, so ~64 MiB peak instead of
 // ~16 MiB, against a 512 MiB default local budget.
 //
+// It is emphatically NOT the namespace lane's bound — see laneMaxBytes. The
+// whole reason the batch may be this large is that nothing interactive is
+// queued behind it any more.
+//
 // A var so the batch-size measurement can compare two values in one process;
 // production never changes it.
 var flushMaxBytes int64 = 32 << 20
+
+// nsFlushMaxBytes bounds ONE namespace-lane request. Namespace records are
+// hundreds of bytes, so this is never the binding constraint in practice
+// (flushMaxRecords and flushMaxAge are); it exists so the lane's request size
+// is a stated bound rather than an inherited one. A namespace batch must stay
+// small enough that its TRANSFER TIME is not itself a latency source on a slow
+// uplink: 1 MiB is a quarter second at the 4 MB/s the live battery measured.
+var nsFlushMaxBytes int64 = 1 << 20
+
+func laneMaxBytes(lane StreamLane) int64 {
+	if lane == StreamLaneNamespace {
+		return nsFlushMaxBytes
+	}
+	return flushMaxBytes
+}
 
 // noProgressWindow is the sticky-degraded watchdog: pending work whose
 // authority watermark has not advanced for this long degrades the mount. It is
@@ -100,7 +119,7 @@ var watchdogInterval = time.Second
 // disk and is re-read at send time, so a large backlog does not live on the
 // heap.
 type pendingRec struct {
-	seq     uint64
+	seq     uint64 // GLOBAL stream sequence (local identity)
 	scope   string
 	ordinal uint64
 	off     int64
@@ -109,8 +128,14 @@ type pendingRec struct {
 	// credit ledger is charged in exactly these bytes at admission and refilled
 	// in exactly these bytes when the authority applies them, so a grant and
 	// its refund are the same quantity and the ledger cannot drift.
-	data   int
-	digest [32]byte // chain digest after this record
+	data int
+	// laneSeq is the record's dense sequence within its lane, and digest the
+	// lane chain digest after it — the pair the authority verifies.
+	laneSeq uint64
+	digest  [32]byte
+	// nsRequired is a data record's namespace dependency (zero on every other
+	// lane): the namespace watermark it was admitted behind.
+	nsRequired uint64
 }
 
 type drainWaiter struct {
@@ -118,22 +143,36 @@ type drainWaiter struct {
 	ch     chan error
 }
 
-// flusher owns network flush ordering: one goroutine, dense global batches
-// with explicit scope runs, exact watermark reconciliation, sticky health.
-type flusher struct {
-	e *Engine
+// laneQueue is ONE lane's independently-applicable stream state: its unshipped
+// records in sequence order, its durable watermark and chain digest, its retry
+// pin, and its own progress clock.
+//
+// Everything in here used to be a single set of fields on the flusher, and that
+// singleness WAS the defect this round exists to remove: one watermark over one
+// chained stream means "apply through X" transitively means "apply everything
+// admitted before X", so a metadata-only scope's release inherited the whole
+// bulk backlog's drain time (measured: 18.99s cold p99 at 4 MB/s). Splitting the
+// state is what lets the namespace watermark advance while megabytes of data sit
+// unshipped.
+type laneQueue struct {
+	lane StreamLane
 
-	mu            sync.Mutex
-	pending       []pendingRec
-	pendingBytes  int64
-	perScope      map[string]int
+	pending []pendingRec
+	// bytes is Σ payload length over pending. It is MAINTAINED rather than
+	// summed on demand because the dispatch decision reads it on every run-loop
+	// iteration, and the data lane's backlog is thousands of records under
+	// exactly the flood this round exists to survive.
+	bytes int64
+	// applied is the authority's durable watermark IN LANE SEQUENCE.
 	applied       uint64
 	appliedDigest [32]byte
 	// attemptEnd pins the exact batch prefix across ambiguous transport
-	// failures. New admissions may extend pending while an attempt is in
-	// flight, but retries MUST resend byte-for-byte the same digest range
-	// until its authority outcome is definite. Otherwise a late smaller
-	// request and a newer superset can reach the authority out of order.
+	// failures, in LANE sequence. New admissions may extend pending while an
+	// attempt is in flight, but retries MUST resend byte-for-byte the same
+	// digest range until its authority outcome is definite. Otherwise a late
+	// smaller request and a newer superset can reach the authority out of
+	// order. The pin is per lane because the resend is per lane: two lanes
+	// retrying at once are two independent exactness claims.
 	attemptEnd uint64
 	oldestAt   time.Time
 	urgent     bool
@@ -141,34 +180,73 @@ type flusher struct {
 
 	backoff     time.Duration
 	nextAttempt time.Time
-
-	degraded     bool
-	lastFailure  string
-	lastFailAt   time.Time
+	// lastProgress is this lane's own advance clock. A shared clock would let a
+	// healthy namespace lane mask a dead data lane, and a drain waiting on the
+	// data lane would then never get a verdict — the exact permanent-draining
+	// shape round 3 eliminated.
 	lastProgress time.Time
-	terminal     error
 
-	wake   chan struct{}
+	wake chan struct{}
+}
+
+// flusher owns network flush ordering. Each lane has its own worker goroutine,
+// its own dense batches with explicit scope runs, and its own exact watermark
+// reconciliation; health, parking and the credit ledger stay stream-wide.
+type flusher struct {
+	e *Engine
+
+	mu     sync.Mutex
+	lanes  [streamLaneCount]laneQueue
+	stream streamMark // the GLOBAL applied prefix and every lane's mark at it
+
+	pendingBytes int64
+	// admitted is the highest GLOBAL sequence ever handed to this flusher. With
+	// no lane holding anything, it IS the applied prefix.
+	admitted uint64
+	perScope map[string]int
+	// perScopeData counts a scope's UNAPPLIED data-lane records. It is the lane
+	// router's whole input: a namespace record admitted into a scope with
+	// unapplied bulk data must apply after it, so it joins the data lane
+	// instead (see Engine.streamLaneLocked). Zero means every data record of
+	// that scope is durable at the authority, so a namespace record admitted
+	// now cannot be ordered before any of them.
+	perScopeData map[string]int
+
+	degraded    bool
+	lastFailure string
+	lastFailAt  time.Time
+	terminal    error
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
 
 func newFlusher(e *Engine) *flusher {
-	return &flusher{
-		e: e, perScope: map[string]int{},
-		appliedDigest: digestZero(),
-		wake:          make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
+	f := &flusher{
+		e: e, perScope: map[string]int{}, perScopeData: map[string]int{},
+		stopCh: make(chan struct{}),
 	}
+	for lane := range f.lanes {
+		f.lanes[lane] = laneQueue{
+			lane:          StreamLane(lane),
+			appliedDigest: digestZero(),
+			wake:          make(chan struct{}, 1),
+		}
+		f.stream.lanes[lane].digest = digestZero()
+	}
+	return f
 }
 
 func (f *flusher) start() {
-	f.wg.Add(2)
-	go func() { defer f.wg.Done(); f.run() }()
+	f.wg.Add(1 + streamLaneCount)
+	for lane := range f.lanes {
+		lane := StreamLane(lane)
+		go func() { defer f.wg.Done(); f.run(lane) }()
+	}
 	go func() { defer f.wg.Done(); f.watchdogLoop() }()
 }
 
-// stop signals the run loop and waits for ACTUAL termination. The engine
+// stop signals every lane worker and waits for ACTUAL termination. The engine
 // cancels its lifetime context first, which resolves any in-flight remote
 // call promptly, so a late flush can never run against a closed WAL.
 func (f *flusher) stop() {
@@ -178,8 +256,11 @@ func (f *flusher) stop() {
 		close(f.stopCh)
 	}
 	f.mu.Lock()
-	waiters := f.waiters
-	f.waiters = nil
+	var waiters []*drainWaiter
+	for lane := range f.lanes {
+		waiters = append(waiters, f.lanes[lane].waiters...)
+		f.lanes[lane].waiters = nil
+	}
 	f.mu.Unlock()
 	for _, waiter := range waiters {
 		waiter.ch <- ErrFenced
@@ -206,34 +287,45 @@ func (f *flusher) watchdogLoop() {
 }
 
 // admit registers appended records. Caller holds e.mu (append order == seq
-// order).
+// order). Every result carries its own lane, so one call never spans lanes.
 // dataBytes, when non-nil, is parallel to results and carries each record's
-// bulk payload size (the data lane); nil means the metadata lane.
+// bulk payload size; nil means the record class carries no bulk bytes.
 func (f *flusher) admit(scope string, results []appendResult, dataBytes []int) {
+	if len(results) == 0 {
+		return
+	}
+	lane := results[0].lane
 	f.mu.Lock()
+	q := &f.lanes[lane]
 	for i, r := range results {
 		bulk := 0
 		if i < len(dataBytes) {
 			bulk = dataBytes[i]
 		}
-		f.pending = append(f.pending, pendingRec{
+		q.pending = append(q.pending, pendingRec{
 			seq: r.seq, scope: scope, ordinal: r.ordinal,
-			off: r.payloadOff, length: r.payloadLen, data: bulk, digest: r.digest,
+			off: r.payloadOff, length: r.payloadLen, data: bulk,
+			laneSeq: r.laneSeq, digest: r.digest, nsRequired: r.nsRequired,
 		})
+		q.bytes += int64(r.payloadLen)
 		f.pendingBytes += int64(r.payloadLen)
+		f.admitted = max(f.admitted, r.seq)
 		f.perScope[scope]++
+		if lane == StreamLaneData {
+			f.perScopeData[scope]++
+		}
 	}
-	if f.oldestAt.IsZero() && len(f.pending) > 0 {
-		f.oldestAt = time.Now()
-		f.lastProgress = time.Now()
+	if q.oldestAt.IsZero() {
+		q.oldestAt = time.Now()
+		q.lastProgress = time.Now()
 	}
 	f.mu.Unlock()
-	f.kick()
+	f.kick(lane)
 }
 
-func (f *flusher) kick() {
+func (f *flusher) kick(lane StreamLane) {
 	select {
-	case f.wake <- struct{}{}:
+	case f.lanes[lane].wake <- struct{}{}:
 	default:
 	}
 }
@@ -244,57 +336,92 @@ func (f *flusher) outstanding(scope string) int {
 	return f.perScope[scope]
 }
 
-// scopeTail reports the highest admitted sequence still unshipped for scope, and
-// whether the scope has any unshipped record at all.
+// scopeHasUnappliedData reports whether scope still holds data-lane records the
+// authority has not applied. It is the lane router's question, asked under the
+// same e.mu that admits the record, so the answer cannot change underneath it:
+// the count only rises through admit (which holds e.mu) and only falls through
+// advance (which holds f.mu and retires records the authority has made
+// durable).
+func (f *flusher) scopeHasUnappliedData(scope string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.perScopeData[scope] > 0
+}
+
+// scopeTails reports, per lane, the highest admitted LANE SEQUENCE still
+// unshipped for scope (0 = that lane holds nothing for this scope).
 //
 // It is the drain target a RELEASE of that scope actually needs. Releasing a
 // scope means one thing: everything this mount acknowledged locally under that
 // grant is durable at the authority, so a peer that acquires it next sees the
-// complete state. Nothing about that claim mentions the rest of the stream.
+// complete state. Nothing about that claim mentions the rest of the stream, and
+// — since round 7 — nothing about it mentions the OTHER LANE either.
 //
-// Draining to the STREAM's tail instead made a release head-of-line blocked
-// behind every byte any other scope had appended since. With the data lane
-// deliberately holding a backlog at its credit setpoint, that turned releasing
-// an already-applied metadata scope into a wait for hundreds of megabytes of
-// unrelated bulk data — and Engine.admit takes exactly that transition whenever
-// a mutation lands outside the current grant, which is what walking into a fresh
-// directory does. Measured live: a cold-scope mkdir blocked 26.6s on a mount
-// whose own metadata was long since applied.
+// That second narrowing is the round's whole point. Round 3 already reduced the
+// target from the STREAM's tail to the SCOPE's tail, but a single chained
+// stream made "this scope's last record" transitively mean "every record
+// admitted before it", including every megabyte of unrelated bulk data. A
+// metadata-only scope therefore inherited the bulk backlog's drain time — 18.99s
+// at 4 MB/s in the throttled contract test, 38s live. With lanes, a scope that
+// has no data-lane record waits on the namespace watermark alone, and the
+// namespace lane's backlog is its own records only.
 //
-// The stream is dense and ordered, so waiting for THIS scope's last record still
-// implies waiting for everything appended before it. That is inherent and
-// correct — those bytes precede the scope's own state at the authority. What is
-// excluded is everything appended AFTER, which the scope's release cannot
-// depend on: admission for a draining delegation is already closed, so no new
-// record can join the scope behind this snapshot.
-func (f *flusher) scopeTail(scope string) (uint64, bool) {
+// Within a lane the stream is still dense and ordered, so waiting for THIS
+// scope's last record still implies waiting for everything of that lane
+// appended before it. That is inherent and correct — those bytes precede the
+// scope's own state at the authority. What is excluded is everything appended
+// AFTER (admission for a draining delegation is already closed) and everything
+// in the OTHER lane, which by the lane-routing rule cannot be ordered before
+// this scope's namespace records.
+func (f *flusher) scopeTails(scope string) [streamLaneCount]uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var tails [streamLaneCount]uint64
 	if f.perScope[scope] == 0 {
-		return 0, false
+		return tails
 	}
-	for i := len(f.pending) - 1; i >= 0; i-- {
-		if f.pending[i].scope == scope {
-			return f.pending[i].seq, true
+	for lane := range f.lanes {
+		q := &f.lanes[lane]
+		for i := len(q.pending) - 1; i >= 0; i-- {
+			if q.pending[i].scope == scope {
+				tails[lane] = q.pending[i].laneSeq
+				break
+			}
 		}
 	}
-	return 0, false
+	return tails
 }
 
 func (f *flusher) pendingStats() (int, int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.pending), f.pendingBytes
+	n := 0
+	for lane := range f.lanes {
+		n += len(f.lanes[lane].pending)
+	}
+	return n, f.pendingBytes
 }
 
+// appliedThrough is the GLOBAL applied prefix: the highest global sequence such
+// that every record at or below it is durable at the authority. It is what
+// segment reclamation, extent folding and the recovery job counters are
+// statements about, and it is deliberately a PREFIX rather than a per-lane
+// maximum — a segment holds records of both lanes, so retiring it needs both.
 func (f *flusher) appliedThrough() uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.applied
+	return f.stream.global
 }
 
-// drainThrough blocks until the authority watermark covers target, the stream
-// parks terminally, the WATCHDOG declares the uplink stalled, or ctx ends.
+// laneApplied reads one lane's durable watermark.
+func (f *flusher) laneApplied(lane StreamLane) uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lanes[lane].applied
+}
+
+// drainThrough blocks until LANE's authority watermark covers target, the
+// stream parks terminally, the WATCHDOG declares that lane stalled, or ctx ends.
 //
 // The watchdog arm is not a convenience, it is the bound. A delegation release
 // runs detached under the ENGINE's lifetime context — deliberately, so that a
@@ -312,11 +439,15 @@ func (f *flusher) appliedThrough() uint64 {
 // and the same one force-detach relies on: the grant can be surrendered with the
 // tail parked durably. A scope must never be permanently draining.
 //
-// It cannot fire on a healthy-but-slow link: the window is measured from the
-// last watermark ADVANCE, so any progress at all rearms it.
-func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
+// It cannot fire on a healthy-but-slow link: the window is measured from that
+// lane's last watermark ADVANCE, so any progress at all rearms it.
+func (f *flusher) drainThrough(ctx context.Context, lane StreamLane, target uint64) error {
+	if target == 0 {
+		return nil
+	}
 	f.mu.Lock()
-	if f.applied >= target {
+	q := &f.lanes[lane]
+	if q.applied >= target {
 		f.mu.Unlock()
 		return nil
 	}
@@ -325,20 +456,21 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 		f.mu.Unlock()
 		return err
 	}
-	f.urgent = true
+	q.urgent = true
 	// A barrier tries NOW: the backoff schedule protects steady state, not
 	// an explicit durability request after a transient failure.
-	f.nextAttempt = time.Time{}
+	q.nextAttempt = time.Time{}
 	w := &drainWaiter{target: target, ch: make(chan error, 1)}
-	f.waiters = append(f.waiters, w)
-	verdict := f.stallVerdictLocked(time.Now())
+	q.waiters = append(q.waiters, w)
+	verdict := f.laneStallVerdictLocked(lane, time.Now())
 	f.mu.Unlock()
-	f.kick()
+	f.kick(lane)
 	drop := func() {
 		f.mu.Lock()
-		for i, waiter := range f.waiters {
+		q := &f.lanes[lane]
+		for i, waiter := range q.waiters {
 			if waiter == w {
-				f.waiters = append(f.waiters[:i], f.waiters[i+1:]...)
+				q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
 				break
 			}
 		}
@@ -357,7 +489,7 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 			drop()
 			return ctx.Err()
 		case <-timer.C:
-			if v := f.stallVerdict(); v.Stalled {
+			if v := f.laneStallVerdict(lane); v.Stalled {
 				drop()
 				return ErrUplinkStalled
 			} else {
@@ -365,6 +497,36 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 			}
 		}
 	}
+}
+
+// drainLanesThrough drains every lane's target. Targets are per lane and a zero
+// target is "this lane holds nothing for the caller", so a metadata-only scope
+// waits on the namespace lane alone — which is exactly the contract this round
+// delivers.
+//
+// The order is namespace FIRST, deliberately. It is the lane that is fast, and
+// the lane a data batch's dependency names: draining it first can only help the
+// data lane's own dispatch, never delay it.
+func (f *flusher) drainLanesThrough(ctx context.Context, targets [streamLaneCount]uint64) error {
+	order := [...]StreamLane{StreamLaneNamespace, StreamLaneLegacy, StreamLaneData}
+	for _, lane := range order {
+		if err := f.drainThrough(ctx, lane, targets[lane]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// drainAll drains every lane to the WAL's own tail: the fsync-class barrier,
+// which by definition is a claim about everything this mount has acknowledged
+// and therefore about both lanes.
+func (f *flusher) drainAll(ctx context.Context, w *streamWAL) error {
+	lanes := w.Lanes()
+	var targets [streamLaneCount]uint64
+	for i := range lanes {
+		targets[i] = lanes[i].through
+	}
+	return f.drainLanesThrough(ctx, targets)
 }
 
 // stallRecheckDelay is how long a drain may sleep before asking the watchdog
@@ -378,7 +540,7 @@ func stallRecheckDelay(v StallVerdict) time.Duration {
 	return v.Remaining
 }
 
-func (f *flusher) run() {
+func (f *flusher) run(lane StreamLane) {
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	for {
@@ -388,10 +550,10 @@ func (f *flusher) run() {
 		default:
 		}
 		f.mu.Lock()
-		wait := f.nextWaitLocked()
+		wait := f.nextWaitLocked(lane)
 		f.mu.Unlock()
 		if wait == 0 {
-			f.sendBatch()
+			f.sendBatch(lane)
 			continue
 		}
 		if !timer.Stop() {
@@ -404,60 +566,89 @@ func (f *flusher) run() {
 		select {
 		case <-f.stopCh:
 			return
-		case <-f.wake:
+		case <-f.lanes[lane].wake:
 		case <-timer.C:
 		}
 	}
 }
 
-// nextWaitLocked reports how long to wait before the next dispatch attempt
-// (0 = dispatch now).
-func (f *flusher) nextWaitLocked() time.Duration {
-	if len(f.pending) == 0 || f.terminal != nil {
+// nextWaitLocked reports how long to wait before the next dispatch attempt for
+// lane (0 = dispatch now).
+func (f *flusher) nextWaitLocked(lane StreamLane) time.Duration {
+	q := &f.lanes[lane]
+	if len(q.pending) == 0 || f.terminal != nil {
 		return time.Hour
 	}
-	if until := time.Until(f.nextAttempt); until > 0 {
+	if until := time.Until(q.nextAttempt); until > 0 {
 		return until
 	}
-	if f.urgent || len(f.pending) >= flushMaxRecords || f.pendingBytes >= flushMaxBytes {
+	// THE CROSS-LANE DEPENDENCY, CLIENT SIDE. A data batch may not be offered
+	// ahead of the namespace state its records were admitted behind. The
+	// authority enforces this too (and definitively); refusing to dispatch here
+	// keeps the steady state free of a round trip that would only be held.
+	//
+	// It can only ever wait on the namespace lane, never the reverse, so it
+	// cannot deadlock: the namespace lane's own dispatch consults nothing.
+	if lane == StreamLaneData && q.pending[0].nsRequired > f.lanes[StreamLaneNamespace].applied {
+		return flushMaxAge
+	}
+	if q.urgent || len(q.pending) >= flushMaxRecords || q.bytes >= laneMaxBytes(lane) {
 		return 0
 	}
-	if age := time.Since(f.oldestAt); age >= flushMaxAge {
+	if age := time.Since(q.oldestAt); age >= flushMaxAge {
 		return 0
 	}
-	return flushMaxAge - time.Since(f.oldestAt)
+	return flushMaxAge - time.Since(q.oldestAt)
 }
 
-// sendBatch builds and ships the next dense same-scope run.
-func (f *flusher) sendBatch() {
+// sendBatch builds and ships the next dense run of one lane.
+func (f *flusher) sendBatch(lane StreamLane) {
 	f.mu.Lock()
-	if len(f.pending) == 0 || f.terminal != nil {
-		f.urgent = len(f.pending) != 0 && f.urgent
+	q := &f.lanes[lane]
+	if len(q.pending) == 0 || f.terminal != nil {
+		q.urgent = len(q.pending) != 0 && q.urgent
 		f.mu.Unlock()
 		return
 	}
 	n := 0
-	if f.attemptEnd != 0 {
-		for n < len(f.pending) && f.pending[n].seq <= f.attemptEnd {
+	if q.attemptEnd != 0 {
+		for n < len(q.pending) && q.pending[n].laneSeq <= q.attemptEnd {
 			n++
 		}
-		if n == 0 || f.pending[n-1].seq != f.attemptEnd {
-			err := fmt.Errorf("%w: pinned flush batch ending at %d is absent from pending stream", ErrConflict, f.attemptEnd)
+		if n == 0 || q.pending[n-1].laneSeq != q.attemptEnd {
+			err := fmt.Errorf("%w: pinned %s-lane flush batch ending at %d is absent from pending stream", ErrConflict, lane, q.attemptEnd)
 			f.mu.Unlock()
 			f.park(err)
 			return
 		}
 	} else {
 		var bytes int64
-		for n < len(f.pending) && n < flushMaxRecords && bytes < flushMaxBytes {
-			bytes += int64(f.pending[n].length)
+		maxBytes := laneMaxBytes(lane)
+		for n < len(q.pending) && n < flushMaxRecords && bytes < maxBytes {
+			bytes += int64(q.pending[n].length)
 			n++
 		}
-		f.attemptEnd = f.pending[n-1].seq
+		q.attemptEnd = q.pending[n-1].laneSeq
 	}
-	batch := append([]pendingRec(nil), f.pending[:n]...)
-	prevDigest := f.appliedDigest
+	batch := append([]pendingRec(nil), q.pending[:n]...)
+	prevDigest := q.appliedDigest
+	nsApplied := f.lanes[StreamLaneNamespace].applied
 	f.mu.Unlock()
+
+	var nsRequired uint64
+	if lane == StreamLaneData {
+		for _, p := range batch {
+			nsRequired = max(nsRequired, p.nsRequired)
+		}
+		if nsRequired > nsApplied {
+			// The dependency moved under a pinned resend. Re-offering would be
+			// a certain hold; wait for the namespace lane instead. The pin
+			// stays, so whatever is eventually sent is still byte-identical.
+			f.noteFailure(lane, fmt.Sprintf(
+				"data batch requires namespace watermark %d, applied %d", nsRequired, nsApplied))
+			return
+		}
+	}
 
 	e := f.e
 	e.mu.RLock()
@@ -487,9 +678,9 @@ func (f *flusher) sendBatch() {
 		if len(scopeRuns) != 0 &&
 			scopeRuns[len(scopeRuns)-1].Scope == p.scope &&
 			scopeRuns[len(scopeRuns)-1].Epoch == epoch {
-			scopeRuns[len(scopeRuns)-1].Through = p.seq
+			scopeRuns[len(scopeRuns)-1].Through = p.laneSeq
 		} else {
-			scopeRuns = append(scopeRuns, FlushScope{Scope: p.scope, Epoch: epoch, Through: p.seq})
+			scopeRuns = append(scopeRuns, FlushScope{Scope: p.scope, Epoch: epoch, Through: p.laneSeq})
 		}
 	}
 	if len(scopeRuns) == 0 {
@@ -510,31 +701,34 @@ func (f *flusher) sendBatch() {
 			f.park(fmt.Errorf("%w: pending payload undecodable: %v", ErrCorrupt, err))
 			return
 		}
-		rec.Seq = p.seq
+		// The authority sequences records IN LANE SPACE: that is what its
+		// density check and its digest chain are written in.
+		rec.Seq = p.laneSeq
 		records = append(records, rec)
 	}
 	ctx, cancel := context.WithTimeout(e.ctx, flushAttemptTimeout)
 	reply, err := e.remote.Flush(ctx, FlushRequest{
 		WritebackID: e.writebackID,
-		PrevDigest:  prevDigest, EndDigest: batch[len(batch)-1].digest,
+		Lane:        lane, NSRequired: nsRequired,
+		PrevDigest: prevDigest, EndDigest: batch[len(batch)-1].digest,
 		Records: records, ScopeRuns: scopeRuns,
 	})
 	cancel()
 	if err != nil {
-		f.noteFailure(err.Error())
+		f.noteFailure(lane, err.Error())
 		return
 	}
 	switch {
 	case reply.Status == 0:
 		// The durable watermark is EXACTLY reply.Through, never past it. A
-		// A success must name this batch's exact end. A short watermark would
+		// success must name this batch's exact end. A short watermark would
 		// drop unshipped records; a watermark past the sent end claims bytes
 		// this request never supplied. Either is a protocol-integrity failure.
-		if batchEnd := batch[len(batch)-1].seq; reply.Through != batchEnd {
-			f.park(fmt.Errorf("%w: flush succeeded with authority watermark %d, want exact batch end %d", ErrConflict, reply.Through, batchEnd))
+		if batchEnd := batch[len(batch)-1].laneSeq; reply.Through != batchEnd {
+			f.park(fmt.Errorf("%w: %s-lane flush succeeded with authority watermark %d, want exact batch end %d", ErrConflict, lane, reply.Through, batchEnd))
 			return
 		}
-		f.advance(reply.Through)
+		f.advance(lane, reply.Through)
 	case reply.Status == 116: // ESTALE: fenced or scope no longer live
 		f.park(fmt.Errorf("%w: authority fenced the stream (status %d)", ErrFenced, reply.Status))
 
@@ -584,70 +778,90 @@ func (f *flusher) sendBatch() {
 	// stream durably and recovery still replays it. Bounded, definite, and
 	// reversible the instant the far end recovers, which is exactly what a
 	// two-minute database outage deserves instead of a forty-minute one.
+	//
+	// EAGAIN is also how the authority reports a HELD data batch whose
+	// namespace dependency is not applied yet. That is a hold, not a verdict,
+	// and it resolves by itself the moment the namespace lane advances.
 	case reply.Status == 11: // EAGAIN: the authority's typed retryable answer
-		f.noteFailure("authority cannot apply this batch yet (EAGAIN)")
+		f.noteFailure(lane, "authority cannot apply this batch yet (EAGAIN)")
 	default:
-		f.noteFailure(fmt.Sprintf(
+		f.noteFailure(lane, fmt.Sprintf(
 			"authority rejected the flush with unclassified status %d; retrying",
 			reply.Status,
 		))
 	}
 }
 
-// advance applies an authority watermark: trims pending, wakes drains, and
+// advance applies one lane's authority watermark: trims that lane's pending
+// prefix, recomputes the GLOBAL applied prefix, wakes the lane's drains, and
 // records the durable APPLIED checkpoint.
-func (f *flusher) advance(through uint64) {
+func (f *flusher) advance(lane StreamLane, through uint64) {
 	f.mu.Lock()
-	if f.attemptEnd != 0 && through >= f.attemptEnd {
-		f.attemptEnd = 0
+	q := &f.lanes[lane]
+	if q.attemptEnd != 0 && through >= q.attemptEnd {
+		q.attemptEnd = 0
 	}
-	if through > f.applied {
-		f.applied = through
-		f.lastProgress = time.Now()
+	if through > q.applied {
+		q.applied = through
+		q.lastProgress = time.Now()
 	}
 	i := 0
 	var appliedData, appliedTotal int64
-	for i < len(f.pending) && f.pending[i].seq <= through {
-		appliedData += int64(f.pending[i].data)
-		appliedTotal += int64(f.pending[i].length)
-		f.pendingBytes -= int64(f.pending[i].length)
-		f.perScope[f.pending[i].scope]--
-		if f.perScope[f.pending[i].scope] == 0 {
-			delete(f.perScope, f.pending[i].scope)
+	for i < len(q.pending) && q.pending[i].laneSeq <= through {
+		appliedData += int64(q.pending[i].data)
+		appliedTotal += int64(q.pending[i].length)
+		q.bytes -= int64(q.pending[i].length)
+		f.pendingBytes -= int64(q.pending[i].length)
+		scope := q.pending[i].scope
+		f.perScope[scope]--
+		if f.perScope[scope] == 0 {
+			delete(f.perScope, scope)
 		}
-		f.appliedDigest = f.pending[i].digest
+		if lane == StreamLaneData {
+			f.perScopeData[scope]--
+			if f.perScopeData[scope] == 0 {
+				delete(f.perScopeData, scope)
+			}
+		}
+		q.appliedDigest = q.pending[i].digest
 		i++
 	}
-	f.pending = f.pending[i:]
-	if len(f.pending) == 0 {
-		f.oldestAt = time.Time{}
-		f.urgent = false
-		if f.degraded {
-			// Every admission from before the failure is applied: clear the
-			// sticky verdict (lastFailure stays visible for diagnosis).
-			f.degraded = false
-			f.notifyHealthLocked(nil)
-		}
+	q.pending = q.pending[i:]
+	if len(q.pending) == 0 {
+		q.oldestAt = time.Time{}
+		q.urgent = false
 	} else {
-		f.oldestAt = time.Now()
+		q.oldestAt = time.Now()
 	}
-	f.backoff = 0
-	f.nextAttempt = time.Time{}
+	q.backoff = 0
+	q.nextAttempt = time.Time{}
+	if f.degraded && f.allLanesDrainedLocked() {
+		// Every admission from before the failure is applied: clear the
+		// sticky verdict (lastFailure stays visible for diagnosis).
+		f.degraded = false
+		f.notifyHealthLocked(nil)
+	}
+	f.recomputeStreamLocked()
 	var ready []*drainWaiter
-	kept := f.waiters[:0]
-	for _, wtr := range f.waiters {
-		if wtr.target <= f.applied {
+	kept := q.waiters[:0]
+	for _, wtr := range q.waiters {
+		if wtr.target <= q.applied {
 			ready = append(ready, wtr)
 		} else {
 			kept = append(kept, wtr)
 		}
 	}
-	f.waiters = kept
-	// Capture the (watermark, digest) pair atomically: a racing later
-	// advance must not pair this watermark with a newer digest in the
-	// APPLIED checkpoint.
-	appliedNow, digestNow := f.applied, f.appliedDigest
+	q.waiters = kept
+	// Capture the whole applied position atomically: a racing later advance in
+	// the other lane must not pair this global watermark with a newer lane
+	// digest in the APPLIED checkpoint.
+	mark := f.stream
 	f.mu.Unlock()
+	// A namespace advance can release a data batch that was waiting on its
+	// dependency. Nudge the data worker rather than making it poll.
+	if lane == StreamLaneNamespace {
+		f.kick(StreamLaneData)
+	}
 	// The ONLY input to the credit controller: bytes the authority made
 	// durable. Never an attempt, never a heartbeat, never a local append.
 	//
@@ -661,44 +875,101 @@ func (f *flusher) advance(through uint64) {
 	for _, wtr := range ready {
 		wtr.ch <- nil
 	}
-	f.e.noteApplied(appliedNow, digestNow)
+	f.e.noteApplied(mark)
 }
 
-// appliedState reads the (watermark, digest-at-watermark) pair atomically.
-func (f *flusher) appliedState() (uint64, [32]byte) {
+func (f *flusher) allLanesDrainedLocked() bool {
+	for lane := range f.lanes {
+		if len(f.lanes[lane].pending) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// recomputeStreamLocked republishes the GLOBAL applied prefix and the per-lane
+// marks at it.
+//
+// The prefix is the lowest still-unshipped global sequence minus one, over ALL
+// lanes — not the maximum of the lanes' own progress. Segment reclamation and
+// extent folding are statements about the global sequence, and a segment holds
+// records of both lanes, so a segment is only retirable when both lanes have
+// passed it. This is the one place lane independence is deliberately given up,
+// and it costs nothing that matters: reclamation is a space optimisation with no
+// latency contract, whereas a release is a latency contract with no space one.
+func (f *flusher) recomputeStreamLocked() {
+	first := uint64(0)
+	for lane := range f.lanes {
+		if p := f.lanes[lane].pending; len(p) > 0 {
+			if first == 0 || p[0].seq < first {
+				first = p[0].seq
+			}
+		}
+	}
+	// With nothing unshipped the prefix is everything ever admitted. f.admitted
+	// is tracked here rather than read from the WAL on purpose: admission takes
+	// e.mu then f.mu, so reaching back for e.mu under f.mu would invert the
+	// order and deadlock.
+	global := f.admitted
+	if first > 0 {
+		global = first - 1
+	}
+	if global < f.stream.global {
+		global = f.stream.global
+	}
+	f.stream.global = global
+	for lane := range f.lanes {
+		f.stream.lanes[lane] = laneMark{
+			through: f.lanes[lane].applied,
+			digest:  f.lanes[lane].appliedDigest,
+		}
+	}
+}
+
+// appliedState reads the whole applied position atomically.
+func (f *flusher) appliedState() streamMark {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.applied, f.appliedDigest
+	return f.stream
 }
 
-// noteFailure schedules the jittered retry and feeds the watchdog.
-func (f *flusher) noteFailure(msg string) {
+// noteFailure schedules the jittered retry for one lane and feeds the watchdog.
+func (f *flusher) noteFailure(lane StreamLane, msg string) {
 	f.mu.Lock()
+	q := &f.lanes[lane]
 	f.lastFailure = msg
 	f.lastFailAt = time.Now()
-	if f.backoff == 0 {
-		f.backoff = flushBackoffMin
+	if q.backoff == 0 {
+		q.backoff = flushBackoffMin
 	} else {
-		f.backoff = min(f.backoff*2, flushBackoffMax)
+		q.backoff = min(q.backoff*2, flushBackoffMax)
 	}
-	delay := time.Duration(rand.Int63n(int64(f.backoff) + 1))
-	f.nextAttempt = time.Now().Add(delay)
+	delay := time.Duration(rand.Int63n(int64(q.backoff) + 1))
+	q.nextAttempt = time.Now().Add(delay)
 	f.mu.Unlock()
 }
 
-// park permanently stops flushing (definite fence, conflict, corruption):
-// the stream's written tail stays available for an explicit local sync and
-// exact attach-time recovery. The engine seals all mutation admission — a
-// local ack without a live stream would violate the active-delegation
+// park permanently stops flushing EVERY lane (definite fence, conflict,
+// corruption): the stream's written tail stays available for an explicit local
+// sync and exact attach-time recovery. The engine seals all mutation admission —
+// a local ack without a live stream would violate the active-delegation
 // invariant, and another lane must not order around it.
+//
+// Parking is stream-wide on purpose. The lanes are independently APPLICABLE,
+// not independently SURVIVABLE: they share a WAL, a session, a set of grants and
+// a recovery job, so a proven contradiction in one is a proven contradiction
+// about the stream that holds both.
 func (f *flusher) park(err error) {
 	f.mu.Lock()
 	f.terminal = err
 	f.lastFailure = err.Error()
 	f.lastFailAt = time.Now()
 	f.degraded = true
-	waiters := f.waiters
-	f.waiters = nil
+	var waiters []*drainWaiter
+	for lane := range f.lanes {
+		waiters = append(waiters, f.lanes[lane].waiters...)
+		f.lanes[lane].waiters = nil
+	}
 	f.mu.Unlock()
 	for _, wtr := range waiters {
 		wtr.ch <- err
@@ -735,17 +1006,23 @@ func (e *Engine) markStreamDead(err error) {
 	e.mu.Unlock()
 }
 
-// watchdog flips sticky degraded when pending work makes no watermark
-// progress for the window.
+// watchdog flips sticky degraded when ANY lane's pending work makes no
+// watermark progress for the window.
 func (f *flusher) watchdog() {
 	f.mu.Lock()
-	if len(f.pending) > 0 && !f.degraded && !f.lastProgress.IsZero() &&
-		time.Since(f.lastProgress) >= noProgressWindow {
-		f.degraded = true
-		recs, bytes := len(f.pending), f.pendingBytes
-		f.notifyHealthLocked(fmt.Errorf(
-			"writeback: flush stalled: %d records (%d bytes) pending with no watermark progress since %s (last failure: %s)",
-			recs, bytes, f.lastProgress.Format(time.RFC3339), f.lastFailure))
+	if !f.degraded {
+		for lane := range f.lanes {
+			q := &f.lanes[lane]
+			if len(q.pending) > 0 && !q.lastProgress.IsZero() &&
+				time.Since(q.lastProgress) >= noProgressWindow {
+				f.degraded = true
+				recs, bytes := len(q.pending), f.pendingBytes
+				f.notifyHealthLocked(fmt.Errorf(
+					"writeback: flush stalled: %d %s-lane records (%d bytes pending) with no watermark progress since %s (last failure: %s)",
+					recs, StreamLane(lane), bytes, q.lastProgress.Format(time.RFC3339), f.lastFailure))
+				break
+			}
+		}
 	}
 	f.mu.Unlock()
 }
@@ -787,6 +1064,11 @@ type StallVerdict struct {
 // namespace lane's own (AdmitMetadataMutation) and clientcore's data lane — so
 // both classify their expiry from ONE verdict instead of restating an
 // arithmetic proof of it in a comment.
+//
+// Across lanes it is the WORST of them: an uplink with one dead lane is a
+// stalled uplink, whichever lane the asking caller happens to sit behind. Per-
+// lane drains take the per-lane verdict instead, because a drain IS a statement
+// about one lane.
 func (e *Engine) StallVerdict() StallVerdict {
 	if e == nil || e.fl == nil {
 		return StallVerdict{}
@@ -801,16 +1083,36 @@ func (e *Engine) StallVerdict() StallVerdict {
 func (f *flusher) stallVerdict() StallVerdict {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.stallVerdictLocked(time.Now())
+	now := time.Now()
+	var worst StallVerdict
+	for lane := range f.lanes {
+		v := f.laneStallVerdictLocked(StreamLane(lane), now)
+		if v.Stalled {
+			return v
+		}
+		if !worst.Pending && v.Pending {
+			worst = v
+		} else if v.Pending && v.Remaining < worst.Remaining {
+			worst = v
+		}
+	}
+	return worst
 }
 
-func (f *flusher) stallVerdictLocked(now time.Time) StallVerdict {
+func (f *flusher) laneStallVerdict(lane StreamLane) StallVerdict {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.laneStallVerdictLocked(lane, time.Now())
+}
+
+func (f *flusher) laneStallVerdictLocked(lane StreamLane, now time.Time) StallVerdict {
 	if f.terminal != nil {
 		// A parked stream is stalled with or without pending work: nothing it
 		// holds can ever be applied, and nothing will ever advance again.
 		return StallVerdict{Stalled: true}
 	}
-	if len(f.pending) == 0 {
+	q := &f.lanes[lane]
+	if len(q.pending) == 0 {
 		return StallVerdict{}
 	}
 	v := StallVerdict{Pending: true}
@@ -818,7 +1120,7 @@ func (f *flusher) stallVerdictLocked(now time.Time) StallVerdict {
 	case f.degraded:
 		// The health sweep already latched the sticky verdict.
 		v.Stalled = true
-	case f.lastProgress.IsZero():
+	case q.lastProgress.IsZero():
 		// Pending work whose progress clock never started. Nothing has been
 		// observed to stall yet, and a whole window would have to elapse first.
 		v.Remaining = noProgressWindow
@@ -826,7 +1128,7 @@ func (f *flusher) stallVerdictLocked(now time.Time) StallVerdict {
 		// The same recomputation the sweep does, deliberately live rather than
 		// waiting for the sweep tick, so a paced caller's outcome does not
 		// depend on watchdog phase.
-		if since := now.Sub(f.lastProgress); since >= noProgressWindow {
+		if since := now.Sub(q.lastProgress); since >= noProgressWindow {
 			v.Stalled = true
 		} else {
 			v.Remaining = noProgressWindow - since
@@ -856,18 +1158,31 @@ func (f *flusher) notifyHealthLocked(err error) {
 func (f *flusher) status() Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	records := 0
+	var oldest time.Time
+	var progress time.Time
+	for lane := range f.lanes {
+		q := &f.lanes[lane]
+		records += len(q.pending)
+		if !q.oldestAt.IsZero() && (oldest.IsZero() || q.oldestAt.Before(oldest)) {
+			oldest = q.oldestAt
+		}
+		if !q.lastProgress.IsZero() && (progress.IsZero() || q.lastProgress.Before(progress)) {
+			progress = q.lastProgress
+		}
+	}
 	st := Status{
-		PendingRecords: len(f.pending),
+		PendingRecords: records,
 		PendingBytes:   f.pendingBytes,
-		AppliedThrough: f.applied,
+		AppliedThrough: f.stream.global,
 		Degraded:       f.degraded,
 		LastFailure:    f.lastFailure,
 	}
-	if !f.oldestAt.IsZero() {
-		st.OldestPendingMs = time.Since(f.oldestAt).Milliseconds()
+	if !oldest.IsZero() {
+		st.OldestPendingMs = time.Since(oldest).Milliseconds()
 	}
-	if !f.lastProgress.IsZero() {
-		st.LastProgressMs = time.Since(f.lastProgress).Milliseconds()
+	if !progress.IsZero() {
+		st.LastProgressMs = time.Since(progress).Milliseconds()
 	}
 	if f.terminal != nil {
 		st.LastFailure = f.terminal.Error()
@@ -880,7 +1195,8 @@ func (f *flusher) status() Status {
 // advance (not just under budget pressure): applied extents' bytes are
 // authority-served now, so dropping them keeps the steady-state overlay heap
 // proportional to the UNSHIPPED tail, not to everything ever written.
-func (e *Engine) noteApplied(through uint64, digest [32]byte) {
+func (e *Engine) noteApplied(mark streamMark) {
+	through := mark.global
 	e.mu.Lock()
 	w := e.wal
 	for _, fv := range e.files {
@@ -891,7 +1207,7 @@ func (e *Engine) noteApplied(through uint64, digest [32]byte) {
 		for _, fv := range e.files {
 			fv.segmentsPinned(pins)
 		}
-		if err := w.CheckpointAndReclaim(through, digest, func(ord uint64) bool { return pins[ord] }); err != nil {
+		if err := w.CheckpointAndReclaim(mark, func(ord uint64) bool { return pins[ord] }); err != nil {
 			// The checkpoint could not be made durable, so nothing was
 			// reclaimed. The WAL latches the sync failure — subsequent
 			// appends fail loudly rather than acknowledging onto a log that

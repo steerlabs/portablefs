@@ -85,16 +85,54 @@ type connHealth struct {
 	lastFailure  time.Time
 	engaged      bool
 	probing      bool
-	// credentialRejected latches the DEFINITE verdict that a reachable
-	// authority refused this client's credential. It is not reachability
-	// state — engaging it CLEARS the transport breaker, because the peer
-	// answered — and it is the one verdict a probe cannot undo: only a fresh
-	// credential can, through CredentialInstalled.
-	credentialRejected bool
+	// ── THE CREDENTIAL VERDICT IS GENERATION-TAGGED ─────────────────────────
+	//
+	// The verdict used to be one bool, and a bool cannot say WHICH credential
+	// it is about. Three untruths followed from that, and every one of them
+	// reported a healthy mount:
+	//
+	//   - installing a credential CLEARED the verdict and only probed when the
+	//     transport breaker happened to be engaged, so installing another
+	//     INVALID credential left the mount reporting healthy and untested;
+	//   - a successful round trip on an ALREADY-AUTHENTICATED connection
+	//     cleared the verdict without any handshake having proved the CURRENT
+	//     credential;
+	//   - an ordinary (non-probe) handshake rejection was not recorded as a
+	//     credential rejection at all — only the prober's was.
+	//
+	// So the credential has a GENERATION, bumped by every installation, and
+	// every verdict names the generation it is about:
+	//
+	//   credGen        the generation now offered to handshakes
+	//   credRejectedAt the generation a reachable authority refused (0 = none)
+	//   credVerifiedAt the generation a handshake proved good (0 = none)
+	//   credPending    an installed generation that has not been proved either
+	//                  way yet
+	//
+	// The rules are then exact: only a handshake using credGen may clear or
+	// confirm it, a rejection of credGen LATCHES wherever it happens, and an
+	// installation is unproven until its own bounded gate-exempt handshake
+	// says otherwise.
+	credGen        uint64
+	credRejectedAt uint64
+	credVerifiedAt uint64
+	credPending    bool
 }
 
 func newConnHealth() *connHealth {
-	return &connHealth{now: time.Now}
+	return &connHealth{now: time.Now, credGen: 1, credPending: true}
+}
+
+// generation reports the credential generation a handshake starting now will
+// be offering. The caller carries it back into the verdict recorders so a
+// handshake that raced an install cannot claim anything about the successor.
+func (h *connHealth) generation() uint64 {
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.credGen
 }
 
 // recordFailure counts one transport failure and engages fail-fast when the
@@ -121,8 +159,12 @@ func (h *connHealth) recordFailure() {
 }
 
 // recordSuccess clears the failure streak and exits fail-fast: reachability
-// has been re-proven, so ops flow normally again. A successful handshake also
-// clears any latched credential verdict — the credential it just used works.
+// has been re-proven, so ops flow normally again.
+//
+// It says NOTHING about the credential. It is called for every successful round
+// trip, and a round trip travels an ALREADY-AUTHENTICATED connection whose
+// handshake may predate the current credential entirely — clearing a verdict
+// here declared a credential healthy that nothing had ever offered.
 func (h *connHealth) recordSuccess() {
 	if h == nil {
 		return
@@ -130,43 +172,82 @@ func (h *connHealth) recordSuccess() {
 	h.mu.Lock()
 	h.failures = 0
 	h.engaged = false
-	h.credentialRejected = false
 	h.mu.Unlock()
 }
 
-// recordCredentialRejected latches the definite credential verdict and CLEARS
-// the transport breaker, because a peer that refuses a credential has answered.
-func (h *connHealth) recordCredentialRejected() {
+// recordHandshakeSuccess is recordSuccess PLUS the credential verdict a
+// completed handshake is entitled to make. Only a handshake that offered the
+// CURRENT generation may clear or confirm it: one that raced an install proves
+// something about the predecessor and must not speak for its successor.
+func (h *connHealth) recordHandshakeSuccess(gen uint64) {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
-	h.credentialRejected = true
 	h.failures = 0
 	h.engaged = false
+	if gen != 0 && gen == h.credGen {
+		h.credRejectedAt = 0
+		h.credVerifiedAt = gen
+		h.credPending = false
+	}
 	h.mu.Unlock()
 }
 
-// clearCredentialRejected re-arms probing after a fresh credential is
-// installed. It does not claim the new credential works — only that the
-// previous verdict is no longer about the credential in use.
-func (h *connHealth) clearCredentialRejected() {
+// recordCredentialRejected latches the definite credential verdict for gen and
+// CLEARS the transport breaker, because a peer that refuses a credential has
+// answered. It is called from EVERY handshake that is refused — ordinary pooled
+// dials included, not only the prober's — because a rejection is a rejection
+// wherever the authority delivers it.
+func (h *connHealth) recordCredentialRejected(gen uint64) {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
-	h.credentialRejected = false
+	h.failures = 0
+	h.engaged = false
+	if gen != 0 && gen == h.credGen {
+		h.credRejectedAt = gen
+		h.credPending = false
+	}
 	h.mu.Unlock()
 }
 
-// credentialDead reports the latched verdict.
+// installCredential opens a new credential generation. The new generation is
+// UNPROVEN — not healthy — until a handshake offering it says otherwise, which
+// is what Client.CredentialInstalled goes on to run.
+func (h *connHealth) installCredential() uint64 {
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.credGen++
+	h.credRejectedAt = 0
+	h.credVerifiedAt = 0
+	h.credPending = true
+	return h.credGen
+}
+
+// credentialDead reports the latched verdict for the CURRENT generation.
 func (h *connHealth) credentialDead() bool {
 	if h == nil {
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.credentialRejected
+	return h.credRejectedAt != 0 && h.credRejectedAt == h.credGen
+}
+
+// credentialUnproven reports that the current generation has neither been
+// accepted nor refused by any handshake yet.
+func (h *connHealth) credentialUnproven() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.credPending && h.credVerifiedAt != h.credGen && h.credRejectedAt != h.credGen
 }
 
 // maybeEngageLocked flips to engaged when the entry conditions hold and
@@ -275,22 +356,52 @@ func (c *Client) FailFast() bool { return c.health.active() }
 // belongs to the durable parked-job path rather than to a retry loop.
 func (c *Client) CredentialRejected() bool { return c.health.credentialDead() }
 
-// CredentialInstalled re-arms reachability probing after a fresh credential is
-// installed, so a mount that latched a credential verdict recovers without a
-// restart if the new credential is accepted.
+// CredentialUnproven reports that the installed credential has not yet been
+// offered to the authority by any handshake. It is neither healthy nor dead —
+// it is UNTESTED — and a mount must not be reported as recovered on it.
+func (c *Client) CredentialUnproven() bool { return c.health.credentialUnproven() }
+
+// CredentialInstalled opens a new credential generation and IMMEDIATELY proves
+// it, with a bounded, gate-exempt handshake, on this call's own goroutine
+// budget (asynchronously, so an installer is never blocked by a dead peer).
+//
+// It used to merely clear the verdict bool and start the prober only when the
+// transport breaker happened to be engaged. Installing a second INVALID
+// credential therefore moved the mount from "credential rejected" to "healthy",
+// with nothing anywhere having offered the new credential to anyone: the mount
+// reported recovered and untested, and the next real op discovered the truth.
+//
+// Installation now enters VERIFICATION-PENDING (see connHealth.credPending) and
+// runs the handshake at once. Only that handshake — offering this generation —
+// can move it to verified or to latched-rejected.
 func (c *Client) CredentialInstalled() {
-	c.health.clearCredentialRejected()
+	gen := c.health.installCredential()
 	c.health.mu.Lock()
+	onEngage := c.health.onEngage
 	engaged := c.health.engaged
-	start := !c.health.probing && c.health.onEngage != nil && engaged
-	if start {
+	startProber := engaged && !c.health.probing && onEngage != nil
+	if startProber {
 		c.health.probing = true
 	}
-	onEngage := c.health.onEngage
 	c.health.mu.Unlock()
-	if start && onEngage != nil {
+	if startProber {
 		onEngage()
 	}
+	go c.verifyCredential(gen)
+}
+
+// verifyCredential performs ONE bounded gate-exempt handshake for gen and
+// records the verdict it earns. A transport failure proves nothing about the
+// credential and leaves it pending: the prober and the subscribe reconnect loop
+// own reachability, and the next successful handshake will classify it.
+func (c *Client) verifyCredential(gen uint64) {
+	if c.isClosed() {
+		return
+	}
+	// The verdict is recorded by the handshake itself (conn.ensureWithGate,
+	// generation-tagged), so this only has to make the handshake happen.
+	_ = gen
+	c.probeAuthority()
 }
 
 // probeOutcome is what ONE reachability probe proved. The three cases are
@@ -347,7 +458,8 @@ func (c *Client) runReachabilityProbe() {
 			// instead of a reachability one, and this loop stops: nothing it
 			// can do changes a rejected credential. A credential INSTALL
 			// re-arms it (see CredentialInstalled).
-			c.health.recordCredentialRejected()
+			// The verdict was already latched, against the exact generation the
+			// refused handshake offered, by conn.ensureWithGate.
 			return
 		}
 		select {
@@ -382,7 +494,10 @@ func (c *Client) probeAuthority() probeOutcome {
 		c.unregisterDedicated(cn)
 	}()
 	if err := cn.ensure(); err != nil {
-		if errors.Is(err, ErrSessionTokenRejected) {
+		// Only an EXPLICIT refusal is terminal. A clean EOF before any ack is
+		// a router or authority tearing the connection down mid-handshake; the
+		// prober must keep going rather than declare a healthy credential dead.
+		if errors.Is(err, ErrCredentialRefused) {
 			return probeCredentialRejected
 		}
 		return probeUnreachable

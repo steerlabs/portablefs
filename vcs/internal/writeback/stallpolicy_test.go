@@ -310,11 +310,18 @@ func TestUplinkStalledAndStallVerdictAgree(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &flusher{
-				terminal: tc.terminal, pending: tc.pending,
-				degraded: tc.degraded, lastProgress: tc.lastProgress,
+			// The verdict is per LANE now; the table's cases are all
+			// statements about one lane's backlog, so they are driven
+			// through the namespace lane and read back through both the
+			// lane form and the stream-wide worst-of form (which must
+			// agree when only one lane holds anything).
+			f := &flusher{terminal: tc.terminal, degraded: tc.degraded}
+			for lane := range f.lanes {
+				f.lanes[lane].lane = StreamLane(lane)
 			}
-			v := f.stallVerdictLocked(now)
+			f.lanes[StreamLaneNamespace].pending = tc.pending
+			f.lanes[StreamLaneNamespace].lastProgress = tc.lastProgress
+			v := f.laneStallVerdictLocked(StreamLaneNamespace, now)
 			if v.Stalled != tc.wantStalled {
 				t.Fatalf("verdict %+v, want Stalled=%v", v, tc.wantStalled)
 			}

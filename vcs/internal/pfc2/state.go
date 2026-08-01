@@ -99,12 +99,59 @@ type checkoutGrant struct {
 	recovery bool
 }
 
-// ledgerEntry is one mount stream's durable flush state: the watermark, the
-// chained mutation digest at it, and the session that last advanced it.
-type ledgerEntry struct {
+// laneMark is one lane's durable position: its watermark and the chained
+// mutation digest at that watermark. The zero value means the lane has never
+// applied anything, which is distinguishable from any applied position because
+// a lane's first sequence is 1.
+type laneMark struct {
 	through uint64
 	digest  [DigestBytes]byte
+}
+
+// ledgerEntry is one mount stream's durable flush state: ONE entry per stream
+// carrying every lane's independent (watermark, digest) pair, plus the session
+// that last advanced any of them.
+//
+// The lanes live in one entry rather than one entry per (stream, lane) so that
+// every landed bound and sweep keeps meaning what it meant: MaxFlushEntries
+// still counts STREAMS, session death still retires a stream in one step, and
+// the projection key is still the writeback id alone (so a stream with no laned
+// state projects to byte-identical bytes and the projection digest of existing
+// control state is unchanged).
+type ledgerEntry struct {
+	// through/digest are the LEGACY lane, spelled as the original fields so
+	// every existing read of "the stream's watermark" keeps naming the single
+	// total-order stream it has always named.
+	through uint64
+	digest  [DigestBytes]byte
+	ns      laneMark
+	data    laneMark
 	owner   SessionRef
+}
+
+// mark reads one lane's durable position.
+func (e ledgerEntry) mark(lane StreamLane) laneMark {
+	switch lane {
+	case StreamLaneNamespace:
+		return e.ns
+	case StreamLaneData:
+		return e.data
+	default:
+		return laneMark{through: e.through, digest: e.digest}
+	}
+}
+
+// withMark returns e with one lane's position replaced.
+func (e ledgerEntry) withMark(lane StreamLane, m laneMark) ledgerEntry {
+	switch lane {
+	case StreamLaneNamespace:
+		e.ns = m
+	case StreamLaneData:
+		e.data = m
+	default:
+		e.through, e.digest = m.through, m.digest
+	}
+	return e
 }
 
 // NewState returns the empty control state of a fresh generation: no
@@ -403,12 +450,44 @@ func (st *State) RecallDigestAt(path string) [DigestBytes]byte {
 	return RecallDigest(st.OverlappingCheckouts(path))
 }
 
-// StreamStateView is one mount stream's durable flush state.
+// StreamStateView is one mount stream's durable flush state: the legacy
+// single-stream watermark plus every lane's independent one.
 type StreamStateView struct {
 	WritebackID string
 	Through     uint64
 	Digest      [DigestBytes]byte
 	Owner       SessionRef
+	// NSThrough/NSDigest and DataThrough/DataDigest are the namespace and data
+	// lanes. Zero means the lane has applied nothing — either the stream is
+	// still pre-boundary (legacy) or the lane simply has no records yet.
+	NSThrough   uint64
+	NSDigest    [DigestBytes]byte
+	DataThrough uint64
+	DataDigest  [DigestBytes]byte
+}
+
+// LaneThrough reads one lane's durable watermark out of the view.
+func (v StreamStateView) LaneThrough(lane StreamLane) uint64 {
+	switch lane {
+	case StreamLaneNamespace:
+		return v.NSThrough
+	case StreamLaneData:
+		return v.DataThrough
+	default:
+		return v.Through
+	}
+}
+
+// LaneDigest reads one lane's durable chain digest out of the view.
+func (v StreamStateView) LaneDigest(lane StreamLane) [DigestBytes]byte {
+	switch lane {
+	case StreamLaneNamespace:
+		return v.NSDigest
+	case StreamLaneData:
+		return v.DataDigest
+	default:
+		return v.Digest
+	}
 }
 
 // WritebackRebindView is one coherent read-only snapshot of the stream ledger
@@ -429,7 +508,17 @@ func (st *State) StreamState(writebackID string) (StreamStateView, bool) {
 	if !ok {
 		return StreamStateView{}, false
 	}
-	return StreamStateView{WritebackID: writebackID, Through: e.through, Digest: e.digest, Owner: e.owner}, true
+	return streamStateView(writebackID, e), true
+}
+
+func streamStateView(writebackID string, e ledgerEntry) StreamStateView {
+	return StreamStateView{
+		WritebackID: writebackID,
+		Through:     e.through, Digest: e.digest,
+		NSThrough: e.ns.through, NSDigest: e.ns.digest,
+		DataThrough: e.data.through, DataDigest: e.data.digest,
+		Owner: e.owner,
+	}
 }
 
 // WritebackRebindSnapshot reads every fact used by rebind conflict
@@ -445,12 +534,7 @@ func (st *State) WritebackRebindSnapshot(writebackID string, paths []string) Wri
 		ScopeExists: make([]bool, len(paths)),
 	}
 	if e, ok := st.ledger[writebackID]; ok {
-		view.Stream = StreamStateView{
-			WritebackID: writebackID,
-			Through:     e.through,
-			Digest:      e.digest,
-			Owner:       e.owner,
-		}
+		view.Stream = streamStateView(writebackID, e)
 		view.StreamExists = true
 	}
 	for i, path := range paths {

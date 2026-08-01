@@ -133,7 +133,7 @@ func (s *legacyStream) legacyPayload(v any) []byte {
 
 func (s *legacyStream) writeFrame(typ frameType, seq uint64, payload []byte) {
 	s.t.Helper()
-	body := encodeFrame(nil, typ, s.frameNo+1, seq, payload)
+	body := encodeFrame(nil, typ, StreamLaneLegacy, s.frameNo+1, seq, payload)
 	if _, err := s.f.WriteAt(body, s.size); err != nil {
 		s.t.Fatalf("legacy fixture write frame: %v", err)
 	}

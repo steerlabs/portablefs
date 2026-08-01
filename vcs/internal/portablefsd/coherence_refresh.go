@@ -343,38 +343,54 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 		)
 	}
 	a.mu.Lock()
-	if a.expectedTruncates == nil {
-		a.expectedTruncates = map[string]expectedTruncate{}
-	}
-	a.expectedTruncateSeq++
-	// PINNED from here until the ftruncate below returns. That window is the
-	// exact extent of the daemon's own syscall, and while it is open no amount
-	// of admission latency in the frontend dispatcher can turn this request into
-	// an application truncate (see expectedTruncate.pinned).
-	note := expectedTruncate{
-		itemID: rec.item.ItemID, size: size,
-		pinned:   true,
-		deadline: time.Now().Add(truncateNoteTTL),
-		seq:      a.expectedTruncateSeq,
-	}
 	if current := a.items[rec.item.ItemID]; current != nil &&
 		current.item.ItemGeneration == rec.item.ItemGeneration {
 		current.attr.Size = size
 	}
-	a.expectedTruncates[p] = note
 	a.mu.Unlock()
 	refresh := refreshKernelFile
 	if a.testRefreshKernelFile != nil {
 		refresh = a.testRefreshKernelFile
 	}
-	outcome, err := refresh(mount, p, expectedKernelItemID, size)
-	// The syscall has returned, so the pin's premise no longer holds. If the
-	// setattr callback did not consume this exact note (for example, the vnode
-	// size already matched and only page invalidation was needed), retire it
-	// now; a later application truncate must never match a stale daemon marker.
-	// Identity is the sequence number, so a successor installed for the same
-	// path by a concurrent pass is never retired by this one.
-	a.retireExpectedTruncate(p, note.seq)
+	// THE PIN IS ARMED AROUND THE FTRUNCATE, NOT AROUND THE REFRESH.
+	//
+	// The window's whole claim is "the daemon is inside the syscall that
+	// produces this upcall". A refresh that finds the vnode size already
+	// correct issues NO ftruncate at all — and used to pin a window anyway,
+	// across an mmap/msync sweep that is O(file size). Every application
+	// size-set matching (item, size) in that stretch was answered as daemon
+	// bookkeeping for a syscall that was never made.
+	//
+	// So the refresh itself arms the window, exactly once, immediately before
+	// unix.Ftruncate, and disarms it the instant that call returns. One
+	// ftruncate, one window; no ftruncate, no window.
+	var armedSeq uint64
+	arm := func() func() {
+		a.mu.Lock()
+		if a.expectedTruncates == nil {
+			a.expectedTruncates = map[string]expectedTruncate{}
+		}
+		a.expectedTruncateSeq++
+		note := expectedTruncate{
+			itemID: rec.item.ItemID, size: size,
+			pinned:   true,
+			deadline: time.Now().Add(truncateNoteTTL),
+			seq:      a.expectedTruncateSeq,
+		}
+		armedSeq = note.seq
+		a.expectedTruncates[p] = note
+		a.mu.Unlock()
+		return func() { a.retireExpectedTruncate(p, note.seq) }
+	}
+	outcome, err := refresh(mount, p, expectedKernelItemID, size, arm)
+	// Belt and braces: the refresh disarms its own window on every path, but a
+	// marker that somehow outlived it must never be left where a later
+	// application truncate could match it. Identity is the sequence number, so
+	// a successor installed for the same path by a concurrent pass is never
+	// retired by this one.
+	if armedSeq != 0 {
+		a.retireExpectedTruncate(p, armedSeq)
+	}
 	if outcome != kernelRefreshApplied {
 		// A failed safe-open means the name disappeared, changed identity,
 		// became a symlink, or is inaccessible. Do not spin on that stale
@@ -449,6 +465,11 @@ type errPublicationUnsettled struct {
 	blockers  int
 	live      int
 	unsettled time.Duration
+	// overBudget records that the RELEASE's own absolute budget ran out inside
+	// this wait rather than the settle window expiring. The verdict is the same
+	// shape — the frontend is alive and the scope may be released again — but
+	// the reason is different and the message must say so.
+	overBudget bool
 }
 
 func (e *errPublicationUnsettled) Error() string {
@@ -456,10 +477,21 @@ func (e *errPublicationUnsettled) Error() string {
 	if scope == "" {
 		scope = "/"
 	}
+	reason := fmt.Sprintf(
+		"unacknowledged by a CONNECTED frontend for %s",
+		e.unsettled.Round(time.Millisecond),
+	)
+	if e.overBudget {
+		reason = fmt.Sprintf(
+			"still unacknowledged by a CONNECTED frontend (last barrier progress %s ago)"+
+				" when the release's own budget ran out",
+			e.unsettled.Round(time.Millisecond),
+		)
+	}
 	return fmt.Sprintf(
 		"kernel publication barrier for %q did not settle: %d exposed publication(s)"+
-			" (%d still executing) unacknowledged by a CONNECTED frontend for %s",
-		scope, e.blockers, e.live, e.unsettled.Round(time.Millisecond),
+			" (%d still executing) %s",
+		scope, e.blockers, e.live, reason,
 	)
 }
 
@@ -1086,10 +1118,10 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 }
 
 func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
-	var own *frontendOperation
+	var own *frontendOperationParticipant
 	if participant, ok := ctx.Value(frontendOperationContextKey{}).(*frontendOperationParticipant); ok &&
 		participant.op != nil && participant.op.attach == a {
-		own = participant.op
+		own = participant
 	}
 	a.frontendGateMu.Lock()
 	a.initFrontendGateLocked()
@@ -1112,6 +1144,13 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 		}
 		if err := ctx.Err(); err != nil {
 			a.frontendGateMu.Unlock()
+			if errors.Is(err, context.DeadlineExceeded) {
+				// The release's own budget, not a cancellation. An overlapping
+				// handoff still owns this scope: transient and scope-local,
+				// exactly like an unsettled barrier, and it must NOT surface as
+				// a cancellation the release would treat as terminal.
+				return &errPublicationUnsettled{scope: scope, overBudget: true}
+			}
 			return err
 		}
 		overlap := false
@@ -1143,13 +1182,43 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 	// interrupt Checkin), so the bound cannot come from the caller — it has to
 	// be the gate's own. publicationSettleWindow, measured from the gate's
 	// PROGRESS clock, is that bound.
+	//
+	// ── PROGRESS IS THIS SCOPE'S BLOCKER SET, NOT THE MOUNT'S CLOCK ──────────
+	//
+	// The rearm used to read a mount-wide retraction counter. Any operation
+	// leaving the active set anywhere rearmed every waiting handoff, so
+	// unrelated traffic in a disjoint subtree — an x/* publication retiring
+	// every few hundred milliseconds — held this wait open forever while THIS
+	// scope's blockers never changed. The settle window is supposed to bound a
+	// wait on an event the daemon does not produce; measured against somebody
+	// else's events it bounds nothing.
+	//
+	// So progress is defined on the identity of the blockers for THIS scope: a
+	// blocker this wait has already seen leaving the set (acknowledged,
+	// finished, or lost with its connection) is progress; a NEW blocker
+	// arriving is not, and neither is anything happening off-scope. The set is
+	// compared by operation identity, not by count, so one blocker retiring
+	// while another joins still rearms — the gate really did advance — while a
+	// steady-state blocker that never moves cannot be kept alive by traffic it
+	// has nothing to do with.
+	//
+	// ── AND THE OUTER BUDGET IS ENFORCED ON THIS WAIT ────────────────────────
+	//
+	// startHandoffBounded's 20s release budget used to be checked only BETWEEN
+	// calls, so a single invocation that never returned could not be bounded by
+	// it at all. It now passes its absolute deadline on ctx, and this loop
+	// treats reaching it exactly like the settle window expiring: a definite,
+	// scoped, TRANSIENT refusal — never a cancellation error, which the release
+	// would classify as terminal.
 	var settleWake *time.Timer
 	defer func() {
 		if settleWake != nil {
 			settleWake.Stop()
 		}
 	}()
-	progress := a.frontendGateProgress
+	budget, hasBudget := ctx.Deadline()
+	tracked := map[*frontendOperation]struct{}{}
+	firstPass := true
 	lastProgress := time.Now()
 	for {
 		if a.frontendGateErr != nil {
@@ -1158,32 +1227,46 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 			a.frontendGateMu.Unlock()
 			return err
 		}
+		blockers, live, current := a.publicationBlockersLocked(scope, own)
+		if blockers == 0 {
+			break
+		}
+		if !firstPass {
+			for op := range tracked {
+				if _, still := current[op]; !still {
+					// A blocker this wait was holding for is gone: the barrier
+					// for THIS scope advanced.
+					lastProgress = time.Now()
+					break
+				}
+			}
+		}
+		tracked = current
+		firstPass = false
+		unsettled := time.Since(lastProgress)
+		overBudget := hasBudget && !time.Now().Before(budget)
+		if unsettled >= publicationSettleWindow || overBudget {
+			removeHandoff()
+			a.frontendGateMu.Unlock()
+			return &errPublicationUnsettled{
+				scope:      scope,
+				blockers:   blockers,
+				live:       live,
+				unsettled:  unsettled,
+				overBudget: overBudget && unsettled < publicationSettleWindow,
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			removeHandoff()
 			a.frontendGateMu.Unlock()
 			return err
 		}
-		blockers, live := a.publicationBlockersLocked(scope, own)
-		if blockers == 0 {
-			break
-		}
-		if a.frontendGateProgress != progress {
-			// The set cleared something: the gate is advancing, rearm.
-			progress = a.frontendGateProgress
-			lastProgress = time.Now()
-		}
-		unsettled := time.Since(lastProgress)
-		if unsettled >= publicationSettleWindow {
-			removeHandoff()
-			a.frontendGateMu.Unlock()
-			return &errPublicationUnsettled{
-				scope:     scope,
-				blockers:  blockers,
-				live:      live,
-				unsettled: unsettled,
+		remaining := publicationSettleWindow - unsettled
+		if hasBudget {
+			if toBudget := time.Until(budget); toBudget < remaining {
+				remaining = toBudget
 			}
 		}
-		remaining := publicationSettleWindow - unsettled
 		if remaining < publicationRecheckFloor {
 			remaining = publicationRecheckFloor
 		}
@@ -1207,27 +1290,65 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 }
 
 // publicationBlockersLocked counts the members of the active publication set
-// that hold back a handoff of scope, and how many of them still have a handler
-// running. A blocker with no running handler is one the daemon has finished
-// exposing: only the frontend's PublicationAck can retire it, which is exactly
-// the wait publicationSettleWindow bounds. Caller holds frontendGateMu.
+// that hold back a handoff of scope, how many of them still have a handler
+// running, and returns their IDENTITIES so the settle wait can measure progress
+// against this scope's own barrier (see startFrontendHandoff). A blocker with
+// no running handler is one the daemon has finished exposing: only the
+// frontend's PublicationAck can retire it, which is exactly the wait
+// publicationSettleWindow bounds. Caller holds frontendGateMu.
+//
+// ── SELF-EXCLUSION IS PER PARTICIPANT, NOT PER OPERATION ────────────────────
+//
+// own used to be the whole frontendOperation, and the loop skipped it outright.
+// One FSKit framework callback can have SEVERAL requests in flight at once
+// (frontendConn.reserveLogicalOperation admits each as another participant of
+// the same operation ID, and each runs in its own handler goroutine), so
+// excluding the operation excluded the initiator's SIBLINGS too: participant A
+// triggered a delegation release while sibling B was still executing, and the
+// handoff crossed B — B then published a pre-handoff view of state the new
+// delegation holder believes is exclusively theirs.
+//
+// The exclusion that is actually needed is the initiator itself: it is inside
+// the release, so waiting for it is a self-deadlock. Everything else about its
+// operation must still block. So the operation is skipped only when own is the
+// ONLY thing keeping it live.
+//
+// What is deliberately NOT counted for the initiator's own operation is a reply
+// a sibling has already exposed. That publication happened BEFORE the handoff —
+// nothing can cross it now — and its acknowledgement is unreachable while the
+// initiator runs, because the extension emits one PublicationAck per operation
+// after the whole framework callback returns and this callback cannot return
+// while one of its requests is parked in a release. Blocking on it would be a
+// guaranteed settle-window stall followed by a failed release, bounding a wait
+// that has no possible resolution. Live siblings, whose replies are still
+// ahead of them, are the ones that matter and the ones that block.
 func (a *attach) publicationBlockersLocked(
 	scope string,
-	own *frontendOperation,
-) (blockers, live int) {
+	own *frontendOperationParticipant,
+) (blockers, live int, set map[*frontendOperation]struct{}) {
 	epoch := a.frontendPathEpoch.Load()
+	set = make(map[*frontendOperation]struct{}, len(a.frontendActive))
 	for op := range a.frontendActive {
-		if op == own {
-			continue
-		}
 		if op.pathEpoch != epoch || operationOverlapsScope(op.paths, scope) {
+			liveHandlers := op.participants - op.suspended
+			if own != nil && op == own.op {
+				if !own.finished && own.suspendDepth == 0 {
+					// The initiator is still counted as a running handler by
+					// the operation; it is the one thing that must not block.
+					liveHandlers--
+				}
+				if liveHandlers <= 0 {
+					continue
+				}
+			}
 			blockers++
-			if op.participants > op.suspended {
+			if liveHandlers > 0 {
 				live++
 			}
+			set[op] = struct{}{}
 		}
 	}
-	return blockers, live
+	return blockers, live, set
 }
 
 func (a *attach) endFrontendHandoff(scope string) {
@@ -1704,15 +1825,31 @@ func matchesExpectedTruncate(req *pfslocal.SetAttrRequest) bool {
 		req.GID == nil && !req.SetFlags
 }
 
-// refreshWindowOpenLocked reports whether an (itemID, size) size-set falls
-// inside a PINNED refresh window this daemon is executing right now.
-//
-// It is THE provenance predicate, and it is deliberately the only one. Both
-// call sites — admission (internalRefreshPending) and the setattr handler
-// (consumeExpectedTruncate) — ask it the same question and must get the same
-// answer for the same request, because a request one of them calls daemon
-// bookkeeping and the other calls an application mutation is precisely how a
-// refresh becomes a data-destroying truncate.
+// refreshClass is the verdict on one pure size-set: whose request is it?
+type refreshClass uint8
+
+const (
+	// refreshClassApplication: no pinned window claims this (item, size). The
+	// request is an application mutation and reaches the authority.
+	refreshClassApplication refreshClass = iota
+	// refreshClassInternal: a pinned window claims this (item, size) AND the
+	// item's current composed size still equals it, so the request is either
+	// the daemon's own refresh upcall or an application size-set that is a
+	// semantic no-op. Both are answered locally, identically and safely.
+	refreshClassInternal
+	// refreshClassAmbiguous: a pinned window claims this (item, size) but a
+	// local write has since moved the item's composed size, so the two
+	// candidates now demand OPPOSITE answers and the daemon cannot tell them
+	// apart. It refuses instead of guessing (see refreshWindowClassLocked).
+	refreshClassAmbiguous
+)
+
+// refreshWindowClassLocked is THE provenance predicate, and it is deliberately
+// the only one. Both call sites — admission (internalRefreshPending) and the
+// setattr handler (classifyExpectedTruncate) — ask it the same question and
+// must get the same answer for the same request, because a request one of them
+// calls daemon bookkeeping and the other calls an application mutation is
+// precisely how a refresh becomes a data-destroying truncate.
 //
 // It CONSUMES NOTHING. Provenance is a property of the open window, never a
 // token some other request can spend: a marker was a single-use token once,
@@ -1720,23 +1857,64 @@ func matchesExpectedTruncate(req *pfslocal.SetAttrRequest) bool {
 // identical on the wire, reaching the dispatcher first, possibly through a
 // hard-link alias — could spend it. The daemon's own upcall then arrived
 // markerless, was classified as an application mutation, and truncated
-// whatever a concurrent write had appended past the sampled size. While the
-// window is open EVERY matching size-set is answered locally; the marker is
-// retired only by the refresh that installed it (retireExpectedTruncate, by
-// seq), on every exit path of applyKernelRefresh.
+// whatever a concurrent write had appended past the sampled size.
 //
-// The accepted cost is unchanged and already documented on truncateNoteTTL: an
-// application truncate to the already-current size inside the window is
-// answered as a no-op, losing only an mtime bump the remote edit has superseded.
-// A truncate to any OTHER size, or one carrying a real attribute group, does
-// not match the window and reaches the authority as it must.
-func (a *attach) refreshWindowOpenLocked(itemID uint64, size int64) bool {
+// ── WHY (item, size, window) IS NOT ENOUGH ON ITS OWN ───────────────────────
+//
+// A pinned window used to answer "internal" for every matching request, full
+// stop. That is safe for the daemon and UNSAFE for the application, and the
+// interleaving is short: the refresh samples S and enters its ftruncate; a
+// local write extends the inode to N > S; the application then issues a REAL
+// ftruncate(item, S) (or open(O_TRUNC) with S == 0). Byte-identical on the
+// wire, suppressed as bookkeeping — the app got success, the bytes S..N
+// survived, and getattr still reported N.
+//
+// The size is what separates the two cases, because it decides whether the
+// request MEANS anything:
+//
+//   - current composed size == S. A size-set to S changes no bytes whoever
+//     issued it. Answering locally is correct for the daemon's refresh and
+//     costs the application only an mtime bump the remote edit has already
+//     superseded — the cost documented on truncateNoteTTL, unchanged.
+//   - current composed size == N != S. Now the two candidates demand OPPOSITE
+//     answers: the daemon's refresh must NOT reach the authority (it would
+//     destroy bytes S..N that no application asked to drop), and the
+//     application's truncate MUST reach it (suppressing it silently discards
+//     the app's intent). Nothing on the wire distinguishes them — FSKit's
+//     setAttributes carries no provenance, and its handle is the frontend's
+//     per-ITEM open handle, not the issuing descriptor's.
+//
+// So the second case is refused rather than guessed, and refusal is safe for
+// BOTH candidates: the daemon's own ftruncate(2) sees EINTR, which
+// refreshKernelFile already classifies as kernelRefreshRetry and the exact
+// transaction re-samples and re-runs; an application ftruncate(2) sees EINTR,
+// the documented interrupted-syscall outcome, and its retry lands on a window
+// that has closed or a size that once again agrees. Neither ever loses data.
+//
+// The ambiguous window is also as small as it can be made: it opens only when
+// the refresh actually issues an ftruncate, and only for that syscall's
+// duration (see applyKernelRefresh).
+//
+// A size-set carrying a real attribute group (mode, ownership, flags) never
+// reaches here at all — matchesExpectedTruncate rejects it — and a size-set to
+// any OTHER size matches no window and reaches the authority as it must.
+func (a *attach) refreshWindowClassLocked(itemID uint64, size int64) refreshClass {
+	open := false
 	for _, note := range a.expectedTruncates {
 		if note.pinned && note.itemID == itemID && note.size == size {
-			return true
+			open = true
+			break
 		}
 	}
-	return false
+	if !open {
+		return refreshClassApplication
+	}
+	// An item the daemon no longer tracks cannot prove the window is dead, and
+	// the daemon's own refresh must never be forwarded on an unproven claim.
+	if current := a.items[itemID]; current != nil && current.attr.Size != size {
+		return refreshClassAmbiguous
+	}
+	return refreshClassInternal
 }
 
 // internalRefreshPending answers, WITHOUT consuming anything, whether body is
@@ -1755,6 +1933,10 @@ func (a *attach) refreshWindowOpenLocked(itemID uint64, size int64) bool {
 // reads are installed exclusively by applyKernelRefresh, only for the duration
 // of its own syscall, and a request that matches one is by construction a
 // request this daemon is about to answer locally.
+// A request the handler will REFUSE as ambiguous also answers true: it is
+// answered locally and never reaches the authority, so pacing it against the
+// metadata lane would be as pointless as pacing the refresh itself, and the
+// two call sites keep the identical verdict for the identical request.
 func (a *attach) internalRefreshPending(body any) bool {
 	req, ok := body.(*pfslocal.SetAttrRequest)
 	if !ok || !matchesExpectedTruncate(req) {
@@ -1762,16 +1944,17 @@ func (a *attach) internalRefreshPending(body any) bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.refreshWindowOpenLocked(req.Item.ItemID, int64(*req.Size))
+	return a.refreshWindowClassLocked(req.Item.ItemID, int64(*req.Size)) !=
+		refreshClassApplication
 }
 
-// consumeExpectedTruncate reports whether req is the daemon's own pending
+// classifyExpectedTruncate decides whether req is the daemon's own pending
 // kernel-size refresh for path. Only a pure size set (optionally with the
 // times the kernel attaches to truncates) can match; anything touching mode or
 // ownership is a real application setattr.
 //
 // A PINNED window answers first and is NOT consumed — see
-// refreshWindowOpenLocked. This is the same decision admission already made
+// refreshWindowClassLocked. This is the same decision admission already made
 // for the same request, and keeping it non-consuming is what stops one
 // request from spending another's provenance.
 //
@@ -1783,26 +1966,31 @@ func (a *attach) internalRefreshPending(body any) bool {
 // note: the kernel is performing a REAL truncate that must reach the
 // authority, and the stale note must not linger. A pinned note is never
 // retired here even on mismatch; it belongs to the refresh that installed it.
-func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest) bool {
+func (a *attach) classifyExpectedTruncate(p string, req *pfslocal.SetAttrRequest) refreshClass {
 	if !matchesExpectedTruncate(req) {
-		return false
+		return refreshClassApplication
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.refreshWindowOpenLocked(req.Item.ItemID, int64(*req.Size)) {
-		return true
+	if class := a.refreshWindowClassLocked(
+		req.Item.ItemID, int64(*req.Size),
+	); class != refreshClassApplication {
+		return class
 	}
 	now := time.Now()
 	if note, ok := a.expectedTruncates[p]; ok {
 		if note.pinned {
 			// A pinned marker that did not match the window is a DIFFERENT
 			// refresh's. Leave it alone and let this real setattr through.
-			return false
+			return refreshClassApplication
 		}
 		delete(a.expectedTruncates, p)
-		return expectedTruncateLive(note, now) &&
+		if expectedTruncateLive(note, now) &&
 			note.itemID == req.Item.ItemID &&
-			int64(*req.Size) == note.size
+			int64(*req.Size) == note.size {
+			return refreshClassInternal
+		}
+		return refreshClassApplication
 	}
 	// ftruncate addresses an already-open FSItem, not a pathname. A rename
 	// can therefore move that item after the secure open/fstat but before its
@@ -1825,8 +2013,8 @@ func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest)
 		}
 		if note.itemID == req.Item.ItemID && int64(*req.Size) == note.size {
 			delete(a.expectedTruncates, notedPath)
-			return true
+			return refreshClassInternal
 		}
 	}
-	return false
+	return refreshClassApplication
 }

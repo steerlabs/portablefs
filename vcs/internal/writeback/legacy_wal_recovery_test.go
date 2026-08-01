@@ -39,7 +39,7 @@ func seedLegacyGrants(auth *fakeAuthority, wbID string, scopes map[string]string
 		auth.grants[scope] = fakeGrant{epoch: epoch, wbID: wbID}
 	}
 	if _, ok := auth.streams[wbID]; !ok {
-		auth.streams[wbID] = &fakeStream{digest: digestZero()}
+		auth.streams[wbID] = newFakeStream()
 	}
 }
 
@@ -407,7 +407,7 @@ func TestReclaimedCloseOutPrefixIsCrashSafe(t *testing.T) {
 			auth := newFakeAuthority()
 			seedLegacyGrants(auth, wbID, map[string]string{"s0": epoch})
 			auth.mu.Lock()
-			auth.streams[wbID] = &fakeStream{through: lastSeq, digest: tailDigest}
+			auth.streams[wbID] = newFakeStreamAt(lastSeq, tailDigest)
 			auth.mu.Unlock()
 
 			e, err := Open(ctx, Config{

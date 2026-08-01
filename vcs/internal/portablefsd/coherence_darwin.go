@@ -29,7 +29,18 @@ const darwinResolveBeneath = 0x00001000
 // component, fails instead of escaping the mount and truncating a host file.
 // The same descriptor is used for truncate and mmap so there is no second
 // pathname race between the two operations.
-func refreshKernelFile(mountPath, relativePath string, expectedItemID uint64, size int64) (kernelRefreshOutcome, error) {
+//
+// armTruncate opens the daemon's provenance window and returns its closer. It
+// is called ONCE, immediately before the ftruncate, and only when an ftruncate
+// is actually issued: the window's claim is "this process is inside the
+// syscall that produced the upcall you are classifying", and a refresh that
+// finds the vnode size already correct makes no such syscall.
+func refreshKernelFile(
+	mountPath, relativePath string,
+	expectedItemID uint64,
+	size int64,
+	armTruncate func() func(),
+) (kernelRefreshOutcome, error) {
 	fd, err := openKernelRefreshFile(mountPath, relativePath)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) ||
@@ -55,7 +66,7 @@ func refreshKernelFile(mountPath, relativePath string, expectedItemID uint64, si
 		)
 	}
 	if stat.Size != size {
-		if err := unix.Ftruncate(fd, size); err != nil {
+		if err := truncateWithProvenance(fd, size, armTruncate); err != nil {
 			return kernelRefreshRetry, err
 		}
 	}
@@ -81,6 +92,18 @@ func refreshKernelFile(mountPath, relativePath string, expectedItemID uint64, si
 		_ = unix.Munmap(data)
 	}
 	return kernelRefreshApplied, nil
+}
+
+// truncateWithProvenance holds the provenance window open for EXACTLY the
+// extent of the ftruncate(2) that produces the upcall it identifies. The
+// disarm runs before the error is inspected: the syscall has returned, so its
+// premise ("this process has not left the call") no longer holds either way.
+func truncateWithProvenance(fd int, size int64, armTruncate func() func()) error {
+	if armTruncate != nil {
+		disarm := armTruncate()
+		defer disarm()
+	}
+	return unix.Ftruncate(fd, size)
 }
 
 func openKernelRefreshFile(mountPath, relativePath string) (int, error) {

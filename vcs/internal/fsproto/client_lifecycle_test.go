@@ -188,7 +188,7 @@ func TestFlushContextCancelsDisconnectedRedialBeforeAnySend(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := cli.FlushWritebackContext(ctx, "wb", nil, [32]byte{}, [32]byte{}, nil)
+		_, _, err := cli.FlushWritebackContext(ctx, FlushBatch{WritebackID: "wb"})
 		done <- err
 	}()
 	select {

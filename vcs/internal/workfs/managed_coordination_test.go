@@ -444,7 +444,7 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	rows = flushRowsForScope(rows, "ws", epoch)
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	through, err := fs.ManagedFlushApply(a, "wb-1", prev, end, rows, "M")
+	through, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-1", PrevDigest: prev, EndDigest: end, Rows: rows}, "M")
 	if err != nil || through != 4 {
 		t.Fatalf("flush: through=%d err=%v", through, err)
 	}
@@ -453,7 +453,7 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	}
 	// A lost-reply retry of the identical batch converges without double
 	// apply: everything at or below the durable watermark drops.
-	through2, err := fs.ManagedFlushApply(a, "wb-1", prev, end, rows, "M")
+	through2, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-1", PrevDigest: prev, EndDigest: end, Rows: rows}, "M")
 	if err != nil || through2 != 4 {
 		t.Fatalf("retry flush: through=%d err=%v", through2, err)
 	}
@@ -464,12 +464,12 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 	}
 	// A gapped continuation is the typed corrupt verdict, not a partial apply.
 	gap := flushRowsForScope([]ManagedFlushRow{{Seq: 6, Record: wal.Record{Op: wal.OpCreate, Path: "ws/gap", Mode: 0o644}}}, "ws", epoch)
-	if _, err := fs.ManagedFlushApply(a, "wb-1", end, flushDigests(t, end, gap), gap, "M"); !errors.Is(err, ErrWritebackCorrupt) {
+	if _, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-1", PrevDigest: end, EndDigest: flushDigests(t, end, gap), Rows: gap}, "M"); !errors.Is(err, ErrWritebackCorrupt) {
 		t.Fatalf("gapped flush: %v, want ErrWritebackCorrupt", err)
 	}
 	// A diverging digest at the same sequences fences too.
 	forged := flushRowsForScope([]ManagedFlushRow{{Seq: 5, Record: wal.Record{Op: wal.OpCreate, Path: "ws/forged", Mode: 0o644}}}, "ws", epoch)
-	if _, err := fs.ManagedFlushApply(a, "wb-1", end, end, forged, "M"); !errors.Is(err, ErrWritebackCorrupt) {
+	if _, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-1", PrevDigest: end, EndDigest: end, Rows: forged}, "M"); !errors.Is(err, ErrWritebackCorrupt) {
 		t.Fatalf("digest-diverging flush: %v, want ErrWritebackCorrupt", err)
 	}
 	// A flush naming a released epoch is fenced; the STREAM watermark
@@ -484,7 +484,7 @@ func TestManagedFlushRowsAdvanceAndRetry(t *testing.T) {
 		t.Fatalf("release: d=%+v err=%v", d, err)
 	}
 	late := flushRowsForScope([]ManagedFlushRow{{Seq: 5, Record: wal.Record{Op: wal.OpCreate, Path: "ws/late", Mode: 0o644}}}, "ws", epoch)
-	if _, err := fs.ManagedFlushApply(a, "wb-1", end, flushDigests(t, end, late), late, "M"); !errors.Is(err, ErrSessionStale) {
+	if _, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-1", PrevDigest: end, EndDigest: flushDigests(t, end, late), Rows: late}, "M"); !errors.Is(err, ErrSessionStale) {
 		t.Fatalf("stale-epoch flush: %v, want stale", err)
 	}
 	if view, ok, _ := fs.ManagedWritebackState("wb-1"); !ok || view.Through != 4 {
@@ -523,7 +523,7 @@ func TestManagedFlushInterleavedScopesIsAtomicAndRetryable(t *testing.T) {
 	}
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	through, err := fs.ManagedFlushApply(a, "wb-mixed", prev, end, rows, "M")
+	through, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-mixed", PrevDigest: prev, EndDigest: end, Rows: rows}, "M")
 	if err != nil || through != 4 {
 		t.Fatalf("mixed flush: through=%d err=%v", through, err)
 	}
@@ -531,7 +531,7 @@ func TestManagedFlushInterleavedScopesIsAtomicAndRetryable(t *testing.T) {
 	// A lost success reply can only cause the exact same global batch to be
 	// retried. The durable stream watermark drops the duplicate prefix, so
 	// no mutation is applied twice.
-	retryThrough, err := fs.ManagedFlushApply(a, "wb-mixed", prev, end, rows, "M")
+	retryThrough, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-mixed", PrevDigest: prev, EndDigest: end, Rows: rows}, "M")
 	if err != nil || retryThrough != 4 {
 		t.Fatalf("mixed lost-reply retry: through=%d err=%v", retryThrough, err)
 	}
@@ -566,7 +566,7 @@ func TestManagedFlushInterleavedScopesIsAtomicAndRetryable(t *testing.T) {
 		{Seq: 5, CheckoutPath: "a", CheckoutEpoch: epochA, Record: wal.Record{Op: wal.OpCreate, Path: "a/must-not-apply", Mode: 0o644}},
 		{Seq: 6, CheckoutPath: "b", CheckoutEpoch: epochB, Record: wal.Record{Op: wal.OpCreate, Path: "b/stale", Mode: 0o644}},
 	}
-	if _, err := fs.ManagedFlushApply(a, "wb-mixed", end, flushDigests(t, end, late), late, "M"); !errors.Is(err, ErrSessionStale) {
+	if _, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb-mixed", PrevDigest: end, EndDigest: flushDigests(t, end, late), Rows: late}, "M"); !errors.Is(err, ErrSessionStale) {
 		t.Fatalf("mixed stale batch: %v, want ErrSessionStale", err)
 	}
 	if _, err := fs.Stat("a/must-not-apply"); !errors.Is(err, os.ErrNotExist) {
@@ -716,13 +716,13 @@ func TestManagedFlushGroupCrashKeepsRowAtomicity(t *testing.T) {
 	rows = flushRowsForScope(rows, "ws", epoch)
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	if _, err := fs.ManagedFlushApply(a, "wb", prev, end, rows, "M"); err == nil {
+	if _, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb", PrevDigest: prev, EndDigest: end, Rows: rows}, "M"); err == nil {
 		t.Fatal("injected append failure did not surface")
 	}
 	if _, ok, _ := fs.ManagedWritebackState("wb"); ok {
 		t.Fatal("failed group advanced the stream ledger")
 	}
-	through, err := fs.ManagedFlushApply(a, "wb", prev, end, rows, "M")
+	through, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb", PrevDigest: prev, EndDigest: end, Rows: rows}, "M")
 	if err != nil || through != 3 {
 		t.Fatalf("retry flush: through=%d err=%v", through, err)
 	}
@@ -743,7 +743,7 @@ func TestManagedWritebackRecoveryLifecycle(t *testing.T) {
 	rows = flushRowsForScope(rows, "ws", epoch)
 	prev := digestZeroStream()
 	end := flushDigests(t, prev, rows)
-	if _, err := fs.ManagedFlushApply(a, "wb", prev, end, rows, "M"); err != nil {
+	if _, err := fs.ManagedFlushApply(a, ManagedFlush{WritebackID: "wb", PrevDigest: prev, EndDigest: end, Rows: rows}, "M"); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	// The holder dies without a clean release: the scope is recovery-
@@ -762,13 +762,13 @@ func TestManagedWritebackRecoveryLifecycle(t *testing.T) {
 	benv := coordEnv(b, 0, 1, nil)
 	rh := []byte("recovery-rebind-hash-32-bytes...")[:32]
 	benv.ReqHash = rh
-	conflicts, err := fs.ManagedWritebackRebind(benv, rh, "wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, 2, end)
+	conflicts, err := fs.ManagedWritebackRebind(benv, rh, "wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, WritebackMark{Through: 2, Digest: end})
 	if err != nil || len(conflicts) != 0 {
 		t.Fatalf("rebind: conflicts=%v err=%v", conflicts, err)
 	}
 	tail := flushRowsForScope([]ManagedFlushRow{{Seq: 3, Record: wal.Record{Op: wal.OpWrite, Path: "ws/a", Data: []byte("recovered")}}}, "ws", epoch)
 	tailEnd := flushDigests(t, end, tail)
-	if _, err := fs.ManagedFlushApply(b, "wb", end, tailEnd, tail, "M"); err != nil {
+	if _, err := fs.ManagedFlushApply(b, ManagedFlush{WritebackID: "wb", PrevDigest: end, EndDigest: tailEnd, Rows: tail}, "M"); err != nil {
 		t.Fatalf("recovery flush: %v", err)
 	}
 	data := make([]byte, 16)
@@ -781,12 +781,12 @@ func TestManagedWritebackRecoveryLifecycle(t *testing.T) {
 	cenv := coordEnv(c, 0, 1, nil)
 	ch := []byte("conflicting-rebind-hash-32-byte.")[:32]
 	cenv.ReqHash = ch
-	conflicts, err = fs.ManagedWritebackRebind(cenv, ch, "wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, 1, prev)
+	conflicts, err = fs.ManagedWritebackRebind(cenv, ch, "wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, WritebackMark{Through: 1, Digest: prev})
 	if err != nil || len(conflicts) == 0 {
 		t.Fatalf("conflicting rebind: conflicts=%v err=%v", conflicts, err)
 	}
 	audited, err := fs.ManagedWritebackConflicts(
-		"wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, 1, prev,
+		"wb", []WritebackScope{{Path: "ws", Epoch: epoch}}, WritebackMark{Through: 1, Digest: prev},
 	)
 	if err != nil || len(audited) == 0 || audited[0].Kind != "DIGEST_MISMATCH" {
 		t.Fatalf("applied-state conflict audit: conflicts=%v err=%v", audited, err)

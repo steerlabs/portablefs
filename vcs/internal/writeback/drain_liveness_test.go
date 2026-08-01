@@ -123,26 +123,32 @@ func (r *committedRecoveryReleaseErrorRemote) ReleaseDelegation(ctx context.Cont
 // executing.
 type lateRecoveryFlushRemote struct {
 	*fakeAuthority
-	late FlushRequest
+	// late is the batch set one interrupted recovery already had in flight —
+	// one request per LANE, in the same legacy/namespace/data order recovery
+	// itself replays them.
+	late []FlushRequest
 	once sync.Once
 	err  error
 }
 
-func (r *lateRecoveryFlushRemote) Rebind(ctx context.Context, writebackID string, scopes []RebindScope, through uint64, digest [32]byte) (RebindReply, error) {
+func (r *lateRecoveryFlushRemote) Rebind(ctx context.Context, writebackID string, scopes []RebindScope, mark StreamState) (RebindReply, error) {
 	r.once.Do(func() {
-		reply, err := r.fakeAuthority.FlushResolved(ctx, r.late)
-		if err != nil {
-			r.err = err
-			return
-		}
-		if reply.Status != 0 {
-			r.err = fmt.Errorf("late recovery flush status %d", reply.Status)
+		for _, batch := range r.late {
+			reply, err := r.fakeAuthority.FlushResolved(ctx, batch)
+			if err != nil {
+				r.err = err
+				return
+			}
+			if reply.Status != 0 {
+				r.err = fmt.Errorf("late recovery %s-lane flush status %d", batch.Lane, reply.Status)
+				return
+			}
 		}
 	})
 	if r.err != nil {
 		return RebindReply{}, r.err
 	}
-	return r.fakeAuthority.Rebind(ctx, writebackID, scopes, through, digest)
+	return r.fakeAuthority.Rebind(ctx, writebackID, scopes, mark)
 }
 
 func openDrainLivenessEngine(t *testing.T, remote Remote) *Engine {
@@ -197,36 +203,51 @@ func TestRecoveryReconcilesLatePriorFlushBeforeRebind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode parked stream: %v", err)
 	}
-	records := make([]wal.Record, 0, len(mutations))
-	runs := make([]FlushScope, 0, len(mutations))
-	for _, mutation := range mutations {
-		rec, err := wal.DecodePFR1(mutation.payload)
-		if err != nil {
-			t.Fatalf("decode mutation %d: %v", mutation.seq, err)
+	_ = marks
+	// One batch per lane, chained in that lane's own sequence — the shape
+	// recovery itself sends, so the "already executing" flush is a genuine
+	// duplicate of what the retry will produce.
+	var late []FlushRequest
+	for _, lane := range [...]StreamLane{StreamLaneLegacy, StreamLaneNamespace, StreamLaneData} {
+		records := make([]wal.Record, 0, len(mutations))
+		runs := make([]FlushScope, 0, len(mutations))
+		end := digestZero()
+		var nsRequired uint64
+		for _, mutation := range mutations {
+			if mutation.lane != lane {
+				continue
+			}
+			rec, err := wal.DecodePFR1(mutation.payload)
+			if err != nil {
+				t.Fatalf("decode mutation %d: %v", mutation.seq, err)
+			}
+			rec.Seq = mutation.laneSeq
+			scope := coveringScope(live, decodePathOf(mutation))
+			end = digestNext(end, mutation.laneSeq, mutation.payload)
+			nsRequired = max(nsRequired, mutation.nsRequired)
+			records = append(records, rec)
+			if len(runs) != 0 && runs[len(runs)-1].Scope == scope {
+				runs[len(runs)-1].Through = mutation.laneSeq
+			} else {
+				runs = append(runs, FlushScope{Scope: scope, Epoch: live[scope], Through: mutation.laneSeq})
+			}
 		}
-		rec.Seq = mutation.seq
-		scope := coveringScope(live, decodePathOf(mutation))
-		records = append(records, rec)
-		if len(runs) != 0 && runs[len(runs)-1].Scope == scope {
-			runs[len(runs)-1].Through = mutation.seq
-		} else {
-			runs = append(runs, FlushScope{Scope: scope, Epoch: live[scope], Through: mutation.seq})
+		if len(records) == 0 {
+			continue
 		}
-	}
-	end, err := digestAt(scan, marks, scan.lastSeq)
-	if err != nil {
-		t.Fatalf("rebuild parked digest: %v", err)
+		if lane != StreamLaneData {
+			nsRequired = 0
+		}
+		late = append(late, FlushRequest{
+			WritebackID: wbID, Lane: lane, NSRequired: nsRequired,
+			PrevDigest: digestZero(), EndDigest: end,
+			Records: records, ScopeRuns: runs,
+		})
 	}
 	auth.mu.Lock()
 	auth.flushErr = nil
 	auth.mu.Unlock()
-	remote := &lateRecoveryFlushRemote{
-		fakeAuthority: auth,
-		late: FlushRequest{
-			WritebackID: wbID, PrevDigest: digestZero(), EndDigest: end,
-			Records: records, ScopeRuns: runs,
-		},
-	}
+	remote := &lateRecoveryFlushRemote{fakeAuthority: auth, late: late}
 
 	e2, err := Open(context.Background(), Config{
 		StateDir: dir, VolumeID: "vol", Branch: "main",
@@ -308,20 +329,28 @@ func requireWriteFailure(t *testing.T, out <-chan writeOutcome, want error) {
 	}
 }
 
-func TestDrainThroughCancellationUnregistersWaiters(t *testing.T) {
-	f := &flusher{
-		wake:   make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
+// bareFlusher is a flusher with no engine behind it: enough for the waiter
+// bookkeeping contracts below, which are about drainThrough's own registration
+// and not about anything a lane worker does.
+func bareFlusher() *flusher {
+	f := &flusher{stopCh: make(chan struct{})}
+	for lane := range f.lanes {
+		f.lanes[lane] = laneQueue{lane: StreamLane(lane), wake: make(chan struct{}, 1)}
 	}
+	return f
+}
+
+func TestDrainThroughCancellationUnregistersWaiters(t *testing.T) {
+	f := bareFlusher()
 	for i := 0; i < 100; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := f.drainThrough(ctx, 1); !errors.Is(err, context.Canceled) {
+		if err := f.drainThrough(ctx, StreamLaneNamespace, 1); !errors.Is(err, context.Canceled) {
 			t.Fatalf("drain %d error = %v, want context canceled", i, err)
 		}
 	}
 	f.mu.Lock()
-	waiters := len(f.waiters)
+	waiters := len(f.lanes[StreamLaneNamespace].waiters)
 	f.mu.Unlock()
 	if waiters != 0 {
 		t.Fatalf("canceled drains leaked %d waiters", waiters)
@@ -329,16 +358,13 @@ func TestDrainThroughCancellationUnregistersWaiters(t *testing.T) {
 }
 
 func TestFlusherStopWakesDrainWaiters(t *testing.T) {
-	f := &flusher{
-		wake:   make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
-	}
+	f := bareFlusher()
 	out := make(chan error, 1)
-	go func() { out <- f.drainThrough(context.Background(), 1) }()
+	go func() { out <- f.drainThrough(context.Background(), StreamLaneData, 1) }()
 	deadline := time.Now().Add(time.Second)
 	for {
 		f.mu.Lock()
-		registered := len(f.waiters) == 1
+		registered := len(f.lanes[StreamLaneData].waiters) == 1
 		f.mu.Unlock()
 		if registered {
 			break
@@ -710,9 +736,9 @@ func TestRecoveryReleaseCertificateSurvivesCommittedCheckinFailure(t *testing.T)
 			if len(live) != 0 {
 				t.Fatalf("recovery certificate left scopes live locally: %+v", live)
 			}
-			through, _, err := highestAppliedCertificate(marks, scan.lastSeq)
-			if err != nil || through != scan.lastSeq {
-				t.Fatalf("recovery certificate through=%d tail=%d err=%v", through, scan.lastSeq, err)
+			cert, err := highestAppliedCertificate(marks, scan.lastSeq)
+			if err != nil || cert.global != scan.lastSeq {
+				t.Fatalf("recovery certificate through=%d tail=%d err=%v", cert.global, scan.lastSeq, err)
 			}
 			job, ok := loadJob(streamDir)
 			if !ok {

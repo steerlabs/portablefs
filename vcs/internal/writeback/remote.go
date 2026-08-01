@@ -34,10 +34,10 @@ type Remote interface {
 	// never guessed.
 	ReleaseDelegation(ctx context.Context, scope, epoch string) error
 
-	// Flush ships one dense same-scope run of the mount stream. The records
-	// carry their global stream sequences; the authority verifies density and
-	// the chained stream digest, applies, and advances the durable watermark
-	// in the same transaction.
+	// Flush ships one dense run of ONE LANE of the mount stream. The records
+	// carry their lane sequences; the authority verifies density and the lane's
+	// chained digest, enforces a data batch's namespace dependency, applies,
+	// and advances that lane's durable watermark in the same transaction.
 	Flush(ctx context.Context, req FlushRequest) (FlushReply, error)
 
 	// FlushResolved is the recovery-only flush surface. Once a request may
@@ -52,13 +52,25 @@ type Remote interface {
 
 	// Rebind atomically fences the stream's dead holder session and rebinds
 	// its recovery scopes to the caller's session after verifying stream
-	// identity and digest. Typed conflicts are returned in the reply.
-	Rebind(ctx context.Context, writebackID string, scopes []RebindScope, through uint64, digest [32]byte) (RebindReply, error)
+	// identity and EVERY LANE's watermark + digest. Typed conflicts are returned
+	// in the reply. The claim covers all lanes because a stream born after the
+	// lane boundary has a permanently-zero legacy watermark: verifying only that
+	// pair would verify nothing about it.
+	Rebind(ctx context.Context, writebackID string, scopes []RebindScope, mark StreamState) (RebindReply, error)
 
 	// Discard releases the stream's recovery scopes as an audited data-loss
 	// decision. It has the same resolved-until-terminal contract as Rebind and
 	// FlushResolved.
 	Discard(ctx context.Context, writebackID string, scopes []RebindScope) error
+
+	// SupportsLanes reports whether the connected authority keeps a per-lane
+	// durable watermark (fsproto FeatureWritebackLanes). It gates the ONE
+	// irreversible decision lanes involve — opening a stream's laned era — and
+	// nothing else: a stream that has not opened it keeps writing the legacy
+	// single stream, which every authority understands. It is deliberately NOT
+	// consulted per flush; a capability that could change mid-stream would make
+	// the WAL's own framing ambiguous.
+	SupportsLanes() bool
 }
 
 // AcquireReply is the authority's adaptive decision for one scope.
@@ -77,36 +89,105 @@ type AcquireReply struct {
 	Children    []Entry
 }
 
+// StreamLane names one independently-applicable lane of the write-back stream.
+// The values are the wire values (fsproto Request.WBLane / pfc2.StreamLane);
+// this package does not import either, so they are restated here and pinned by
+// TestStreamLaneValuesMatchTheWire.
+type StreamLane uint8
+
+const (
+	// StreamLaneLegacy is the single total-order stream every pre-round-7 WAL
+	// is written in. A stream leaves it once, at the upgrade boundary, and
+	// never returns; it is not a runtime fallback.
+	StreamLaneLegacy StreamLane = 0
+	// StreamLaneNamespace carries namespace and attribute records whose apply
+	// order depends on nothing outside the namespace lane.
+	StreamLaneNamespace StreamLane = 1
+	// StreamLaneData carries bulk write payloads — and any namespace record
+	// whose scope still holds unapplied bulk data, so that a record which must
+	// apply AFTER pending data rides the lane that already orders it.
+	StreamLaneData StreamLane = 2
+
+	streamLaneCount = 3
+)
+
+func (l StreamLane) String() string {
+	switch l {
+	case StreamLaneLegacy:
+		return "legacy"
+	case StreamLaneNamespace:
+		return "namespace"
+	case StreamLaneData:
+		return "data"
+	default:
+		return "invalid"
+	}
+}
+
 // FlushScope is one contiguous run in a mixed-scope mount-stream flush.
-// Through is the last global stream sequence covered by the run.
+// Through is the last LANE sequence covered by the run.
 type FlushScope struct {
 	Scope   string
 	Epoch   string
 	Through uint64
 }
 
-// FlushRequest is one dense global run of the mount stream. ScopeRuns map
+// FlushRequest is one dense run of one lane of the mount stream. ScopeRuns map
 // every record to the exact live delegation that authorizes it.
 type FlushRequest struct {
 	WritebackID string
-	PrevDigest  [32]byte
-	EndDigest   [32]byte
-	// Records carry their global stream sequences in Seq.
+	Lane        StreamLane
+	// NSRequired is a data-lane batch's namespace dependency: the namespace
+	// lane watermark its records were admitted behind. The authority holds the
+	// batch until its namespace watermark covers it. Zero on every other lane.
+	NSRequired uint64
+	PrevDigest [32]byte
+	EndDigest  [32]byte
+	// Records carry their LANE sequences in Seq.
 	Records   []wal.Record
 	ScopeRuns []FlushScope
 }
 
-// FlushReply reports the stream's durable authority watermark.
+// FlushReply reports the flushed lane's durable authority watermark.
 type FlushReply struct {
 	Through uint64
 	Status  int32 // fsproto status: 0 OK; ESTALE fence; EINVAL corrupt-class
 }
 
-// StreamState is the authority's durable stream view.
+// StreamState is the authority's durable stream view: the legacy single-stream
+// position plus each lane's independent one.
 type StreamState struct {
-	Exists  bool
-	Through uint64
-	Digest  [32]byte
+	Exists      bool
+	Through     uint64
+	Digest      [32]byte
+	NSThrough   uint64
+	NSDigest    [32]byte
+	DataThrough uint64
+	DataDigest  [32]byte
+}
+
+// LaneThrough reads one lane's durable watermark.
+func (s StreamState) LaneThrough(lane StreamLane) uint64 {
+	switch lane {
+	case StreamLaneNamespace:
+		return s.NSThrough
+	case StreamLaneData:
+		return s.DataThrough
+	default:
+		return s.Through
+	}
+}
+
+// LaneDigest reads one lane's durable chain digest.
+func (s StreamState) LaneDigest(lane StreamLane) [32]byte {
+	switch lane {
+	case StreamLaneNamespace:
+		return s.NSDigest
+	case StreamLaneData:
+		return s.DataDigest
+	default:
+		return s.Digest
+	}
 }
 
 // RebindScope names one delegation the recovering stream claims.
