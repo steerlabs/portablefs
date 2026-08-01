@@ -377,6 +377,43 @@ func (s *Server) controlFSRead(w http.ResponseWriter, r *http.Request, a *attach
 	_, _ = w.Write(data)
 }
 
+// reservedIdentity is the pathname identity a control write resolved BEFORE the
+// namespace gate and took its item-scoped size reservation against.
+//
+// ── WHY THE RESERVATION IS ABOUT AN IDENTITY, NOT A PATHNAME ────────────────
+//
+// The reservation must be taken pre-lock, holding nothing (refreshpin.go), so
+// it is necessarily taken against a sample. A concurrent create or rename-over
+// then moves the name from A to B — or from absent to B — before the handler
+// reaches the lock, and a reservation held on A proves nothing whatever about
+// B: if B is pinned, the whole of this write's bracket (begin the sequence,
+// commit, publish, settle) can open and close inside the exact gap the pin
+// protocol exists to close, and the refresh's ftruncate lands after a commit the
+// caller has already been told succeeded.
+//
+// So the sample is carried into phase 3 and COMPARED with what the name
+// resolves to under the lock. The generation is part of the identity because an
+// item can be retired and reincarnated at the same ID; the zero value is the
+// honest representation of "absent", which is what makes absent-to-present a
+// mismatch rather than a match against nothing.
+type reservedIdentity struct {
+	itemID     uint64
+	generation uint64
+}
+
+// reservedIdentityForPath resolves the identity currently bound to p, or the
+// zero value if the name is unbound.
+func (a *attach) reservedIdentityForPath(p string) reservedIdentity {
+	rec := a.itemByPath(p)
+	if rec == nil {
+		return reservedIdentity{}
+	}
+	return reservedIdentity{
+		itemID:     rec.item.ItemID,
+		generation: rec.item.ItemGeneration,
+	}
+}
+
 func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attach) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -397,53 +434,40 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 	}
 	p := cleanControlPath(req.Path)
 
-	// A GRAFT is machine-local: no delegation covers it, it consumes no stream
-	// budget, and its mutation path deliberately bypasses the remote Volume
-	// lifecycle. It needs the namespace gate and nothing else.
+	// The graft arm (controlGraftWriteOnce), which is machine-local and needs
+	// the namespace gate and nothing else.
 	if graft := a.localDirFor(p); graft != "" {
-		// The control plane is a frontend, so it takes the item-scoped size
-		// token exactly where every other frontend does: BEFORE the namespace
-		// gate, holding nothing (refreshpin.go). Taken under
-		// lockExternalNamespaceWrite — which is mount-wide and EXCLUSIVE — a wait
-		// for a pinned refresh would park the very upcall that refresh needs
-		// answered in order to release the pin.
+		// One absolute deadline for the whole arm, re-admissions included: it is
+		// what terminates the loop below, exactly as it does on the authority
+		// arm. Deriving a fresh one per attempt would give the retry an
+		// unbounded budget.
 		graftCtx, cancelGraft := clientcore.WithOperationDeadline(r.Context())
-		var graftItem uint64
-		if rec := a.itemByPath(p); rec != nil {
-			graftItem = rec.item.ItemID
-		}
-		releaseToken, tokenEno := a.reserveSizeMutation(graftCtx, graftItem)
-		if tokenEno != 0 {
-			cancelGraft()
-			writeHTTPError(
-				w, httpStatusForErr(tokenEno), errMessage("fs/write admission", tokenEno),
-			)
-			return
-		}
-		unlockNamespace := a.lockExternalNamespaceWrite()
-		releaseGraftToken := func() {
-			if releaseToken != nil {
-				releaseToken()
-				releaseToken = nil
+		defer cancelGraft()
+		var refreshItemID uint64
+		for {
+			readmit, status, message, itemID := a.controlGraftWriteOnce(graftCtx, p, graft, data)
+			if readmit {
+				// PHASE 3 refused to mutate under the locks because the name no
+				// longer names the identity this attempt reserved. Every lock
+				// and the reservation are released by now, so re-admit out here
+				// against the identity that is actually there — the same unwind
+				// discipline a lane change runs.
+				if graftCtx.Err() != nil {
+					writeHTTPError(
+						w,
+						httpStatusForErr(creditErrno(graftCtx.Err())),
+						errMessage("fs/write admission", creditErrno(graftCtx.Err())),
+					)
+					return
+				}
+				continue
 			}
-			cancelGraft()
-		}
-		defer releaseGraftToken()
-		if err := a.controlAdmissionError(); err != nil {
-			unlockNamespace()
-			writeHTTPError(w, http.StatusConflict, err.Error())
-			return
-		}
-		refreshItemID, eno := a.writeLocalFile(p, graft, data)
-		unlockNamespace()
-		// The token is given back BEFORE the refresh this write owes the kernel:
-		// the reservation's whole meaning is "a size mutation is on its way to a
-		// commit", the commit and its publication are behind us, and a refresh
-		// cannot arm over a reservation that has not been released.
-		releaseGraftToken()
-		if eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
-			return
+			if status != 0 {
+				writeHTTPError(w, status, message)
+				return
+			}
+			refreshItemID = itemID
+			break
 		}
 		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
 		err := a.exactKernelRefresh(refreshCtx, refreshItemID)
@@ -512,12 +536,11 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		}
 		// The item-scoped size token, taken after the lane admission and before
 		// the namespace gate, exactly as attach.admitRequest takes it for a
-		// kernel frontend request (refreshpin.go).
-		var tokenItem uint64
-		if rec := a.itemByPath(p); rec != nil {
-			tokenItem = rec.item.ItemID
-		}
-		releaseToken, tokenEno := a.reserveSizeMutation(opCtx, tokenItem)
+		// kernel frontend request (refreshpin.go). The identity it is taken
+		// against travels into phase 3, which compares it with the locked target
+		// before it mutates anything (see reservedIdentity).
+		reserved := a.reservedIdentityForPath(p)
+		releaseToken, tokenEno := a.reserveSizeMutation(opCtx, reserved.itemID)
 		if tokenEno != 0 {
 			settle()
 			writeHTTPError(
@@ -528,17 +551,19 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		if probe := a.testControlAdmissionProbe; probe != nil {
 			probe(mutCtx)
 		}
-		laneChanged, status, message, itemID := a.controlWriteLocked(
-			mutCtx, vol, p, node, data,
+		readmit, status, message, itemID := a.controlWriteLocked(
+			mutCtx, vol, p, node, data, reserved,
 		)
 		if releaseToken != nil {
 			releaseToken()
 		}
 		settle()
-		if laneChanged {
-			// PHASE 3 refused to transition under the locks, and every lock is
-			// released by now. Re-admit out here, under the SAME deadline, which
-			// is what terminates the loop.
+		if readmit {
+			// PHASE 3 refused to transition under the locks — either the lane it
+			// pre-resolved no longer holds, or the name no longer names the
+			// identity this attempt reserved — and every lock, the reservation
+			// and the lane token are released by now. Re-admit out here, under
+			// the SAME deadline, which is what terminates the loop.
 			if opCtx.Err() != nil {
 				writeHTTPError(
 					w,
@@ -570,6 +595,66 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// controlGraftWriteOnce is ONE admission-and-mutation attempt of the graft arm.
+//
+// A GRAFT is machine-local: no delegation covers it, it consumes no stream
+// budget, and its mutation path deliberately bypasses the remote Volume
+// lifecycle. It needs the namespace gate and nothing else — but it is still a
+// frontend, so it takes the item-scoped size token exactly where every other
+// frontend does: BEFORE the namespace gate, holding nothing (refreshpin.go).
+// Taken under lockExternalNamespaceWrite — which is mount-wide and EXCLUSIVE — a
+// wait for a pinned refresh would park the very upcall that refresh needs
+// answered in order to release the pin.
+//
+// readmit reports that the identity this attempt reserved is not the identity
+// the name resolves to under the lock. Every lock and the reservation are
+// released before it returns, so the caller re-admits holding nothing.
+func (a *attach) controlGraftWriteOnce(
+	ctx context.Context,
+	p, graft string,
+	data []byte,
+) (readmit bool, httpStatus int, httpMessage string, refreshItemID uint64) {
+	reserved := a.reservedIdentityForPath(p)
+	releaseToken, tokenEno := a.reserveSizeMutation(ctx, reserved.itemID)
+	if tokenEno != 0 {
+		return false, httpStatusForErr(tokenEno),
+			errMessage("fs/write admission", tokenEno), 0
+	}
+	releaseGraftToken := func() {
+		if releaseToken != nil {
+			releaseToken()
+			releaseToken = nil
+		}
+	}
+	// The token is given back BEFORE the refresh this write owes the kernel,
+	// which the caller issues: the reservation's whole meaning is "a size
+	// mutation is on its way to a commit", the commit and its publication are
+	// behind this return, and a refresh cannot arm over a reservation that has
+	// not been released.
+	defer releaseGraftToken()
+	if probe := a.testControlAdmissionProbe; probe != nil {
+		probe(ctx)
+	}
+	unlockNamespace := a.lockExternalNamespaceWrite()
+	defer unlockNamespace()
+	if err := a.controlAdmissionError(); err != nil {
+		return false, http.StatusConflict, err.Error(), 0
+	}
+	// PHASE 3's FIRST QUESTION. writeLocalFile brackets whatever the name
+	// resolves to NOW; this attempt reserved whatever it resolved to THEN. If
+	// they differ, the bracket and the reservation would be about two different
+	// identities, and the reservation would be protecting an item this write
+	// never touches (see reservedIdentity).
+	if current := a.reservedIdentityForPath(p); current != reserved {
+		return true, 0, "", 0
+	}
+	itemID, eno := a.writeLocalFile(p, graft, data)
+	if eno != 0 {
+		return false, httpStatusForErr(eno), errMessage("fs/write", eno), 0
+	}
+	return false, 0, "", itemID
+}
+
 // controlWriteLocked is PHASE 2+3 of a control write: it takes the same
 // namespace locks a name-mutating kernel request takes for the identical
 // authority calls (lockExternalNamespaceMutation) and performs nothing but the
@@ -584,20 +669,34 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 // kernel frontend runs Create/Open/Write/Setattr under nsMu.RLock plus the one
 // name stripe (ops.go), and the control plane is a frontend.
 //
-// laneChanged reports that the pre-resolved lane no longer holds. The locks are
-// released before it returns, so the caller re-admits holding nothing — the same
-// unwind the two kernel frontends run.
+// readmit reports that something the caller pre-resolved no longer holds under
+// the locks: the delegation lane, or the identity the name is bound to. The
+// locks are released before it returns, so the caller re-admits holding nothing
+// — the same unwind the two kernel frontends run.
 func (a *attach) controlWriteLocked(
 	ctx context.Context,
 	vol *clientcore.Volume,
 	p string,
 	node *clientcore.NodeState,
 	data []byte,
-) (laneChanged bool, httpStatus int, httpMessage string, refreshItemID uint64) {
+	reserved reservedIdentity,
+) (readmit bool, httpStatus int, httpMessage string, refreshItemID uint64) {
 	unlockNamespace := a.lockExternalNamespaceMutation(p)
 	defer unlockNamespace()
 	if err := a.controlAdmissionError(); err != nil {
 		return false, http.StatusConflict, err.Error(), 0
+	}
+	// PHASE 3's FIRST QUESTION, ASKED BEFORE ANYTHING IS MUTATED OR BRACKETED.
+	//
+	// The bracket below names the item the name has NOW; the reservation this
+	// handler runs under was taken against the item the name had before the
+	// gate. A concurrent create or rename-over between the two makes them
+	// different identities, and the reservation then protects an item this write
+	// never touches while the item it does touch is unprotected — free to be
+	// mutated inside a refresh pin. Unwind and re-admit against what is
+	// actually there (see reservedIdentity).
+	if current := a.reservedIdentityForPath(p); current != reserved {
+		return true, 0, "", 0
 	}
 	// A control write is a write-through with the kernel frontend's exact
 	// commit-then-publish shape (vol.Write and vol.Setattr below, registerLocked

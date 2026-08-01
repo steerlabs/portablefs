@@ -478,14 +478,16 @@ func (a *attach) applyKernelRefresh(
 	// marker that somehow outlived it must never be left where a later
 	// application truncate could match it. Identity is the sequence number, so
 	// a successor installed for the same path by a concurrent pass is never
-	// retired by this one. The pin goes with it for the same reason: a pin left
-	// behind a returned refresh would park every size mutation on the item until
-	// their operation deadlines.
+	// retired by this one. The pin goes with it, in the SAME hold, for two
+	// reasons: a pin left behind a returned refresh would park every size
+	// mutation on the item until their operation deadlines, and a marker left
+	// standing without one is a provenance claim with nothing behind it
+	// (retireRefreshWindowLocked).
 	if armedSeq != 0 {
-		a.retireExpectedTruncate(p, armedSeq)
 		a.mu.Lock()
-		a.releaseRefreshPinLocked(rec.item.ItemID)
+		stale := a.retireRefreshWindowLocked(p, armedSeq, rec.item.ItemID, nil)
 		a.mu.Unlock()
+		stale.release()
 	}
 	if outcome == kernelRefreshApplied && settleErr != nil {
 		// THE PASS MAY NOT REPORT WHAT IT CANNOT PROVE.
@@ -654,13 +656,20 @@ func (a *attach) armRefreshWindowLocked(
 	}
 	a.expectedTruncates[p] = note
 	current.attr.Size = size
-	unpin := a.pinRefreshItemLocked(rec.item.ItemID)
+	itemID := rec.item.ItemID
+	pin := a.installRefreshPinLocked(itemID)
 	return func() error {
+		// ONE HOLD. The post-syscall verdict is read, the marker is retired and
+		// the pin is removed together, so no observer can find the window's
+		// provenance claim standing with nothing behind it (retireRefreshWindowLocked).
 		a.mu.Lock()
-		err := a.refreshWindowViolationLocked(p, rec.item.ItemID)
+		err := a.refreshWindowViolationLocked(p, itemID)
+		a.retireRefreshWindowLocked(p, note.seq, itemID, pin)
 		a.mu.Unlock()
-		unpin()
-		a.retireExpectedTruncate(p, note.seq)
+		pin.release()
+		if probe := a.testRefreshWindowTeardown; probe != nil {
+			probe(p, itemID)
+		}
 		return err
 	}, note.seq, nil
 }
@@ -2412,6 +2421,23 @@ func (a *attach) refreshKernelItemExactMode(
 	itemID uint64,
 	requireAuthorityIdentity bool,
 ) error {
+	// THE INTENT COMES FIRST, AND IT IS NOT ONE OF THE ATTEMPTS.
+	//
+	// Reservation contention is not a failure to converge, and spending
+	// stale-sample retries on it made the two indistinguishable: one ordinary
+	// mutation held past this loop's ≈1.025s budget, or a stream of overlapping
+	// writers with no slow mutation at all, exhausted the transaction — and the
+	// caller turns that into failCoherence, which is terminal. So the pass
+	// declares its intent and WAITS for the item to drain, under a bound that
+	// is a property of the reservation holders rather than of this loop, before
+	// spending a single attempt. From here on no reservation can appear on the
+	// item, so the attempts below are free to be about what they were always
+	// about: racing the authority sample, not racing local writers.
+	releaseIntent, err := a.acquireRefreshIntent(ctx, itemID)
+	if err != nil {
+		return fmt.Errorf("portablefsd: exact kernel refresh item %d: %w", itemID, err)
+	}
+	defer releaseIntent()
 	// A concurrent application write can advance the composed view between
 	// sample, marked truncate, and verification. Re-run that optimistic
 	// transaction a bounded number of times; this is ordering against a live

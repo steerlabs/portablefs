@@ -43,17 +43,27 @@ package portablefsd
 //     handler's commit and publication.
 //   - A refresh PINS the item, under a.mu, in the same critical section that
 //     opens its provenance window, and holds the pin until unix.Ftruncate has
-//     returned. It refuses to arm at all while any reservation is outstanding.
+//     returned. It never arms while any reservation is outstanding.
 //   - A mutation that finds a pin installed WAITS for it.
+//   - And before any of that, a refresh declares an INTENT on the item, so the
+//     reservations it must not arm over DRAIN while later ones queue behind it
+//     (refreshintent.go). Without the intent the second bullet had no
+//     counterpart: the refresh could only refuse and retry, and ordinary
+//     contention exhausted its budget into a terminal coherence failure.
 //
 // Both sides transition under a.mu, so for any (refresh, mutation) pair exactly
-// one of two things is true: the reservation was visible when the refresh tried
-// to arm — and the refresh refused, which is an ordinary retry outcome — or the
-// pin was visible when the mutation tried to reserve, and the mutation is
-// behind the syscall. There is no third state, and in particular there is no
-// state in which a commit lands between the last check and the completion of
-// the ftruncate. The ftruncate becomes the linearization point it always
-// claimed to be.
+// one of two things is true: the reservation was visible when the refresh
+// declared its intent — and the refresh waited for it, which is an ordinary
+// ordering outcome — or the intent or the pin was visible when the mutation
+// tried to reserve, and the mutation is behind the syscall. There is no third
+// state, and in particular there is no state in which a commit lands between
+// the last check and the completion of the ftruncate. The ftruncate becomes the
+// linearization point it always claimed to be.
+//
+// Both halves of a window are also torn down together, under one a.mu hold
+// (retireRefreshWindowLocked): a marker outliving its pin is a provenance claim
+// with nothing behind it, and an application truncate arriving in that interval
+// was answered as the daemon's own bookkeeping.
 //
 // ── WHY THE WAIT IS PRE-LOCK, AND WHY THAT IS NOT NEGOTIABLE ────────────────
 //
@@ -106,21 +116,33 @@ func (p *refreshPin) release() {
 	p.once.Do(func() { close(p.done) })
 }
 
-// pinRefreshItemLocked takes the item's size for the caller's ftruncate and
-// returns the release. Callers hold a.mu, and must have already established
-// that no reservation is outstanding (refreshSampleSupersededLocked).
+// installRefreshPinLocked takes the item's size for the caller's ftruncate and
+// returns the pin. Callers hold a.mu, and must have already established that no
+// reservation is outstanding (refreshSampleSupersededLocked).
 //
-// The release is idempotent and takes a.mu itself, so it must be called with
-// a.mu released.
-func (a *attach) pinRefreshItemLocked(itemID uint64) func() {
+// It is deliberately NOT paired with a release closure of its own. A window is
+// torn down by retireRefreshWindowLocked, which removes this pin and the
+// provenance marker together — see there for why they may not be two steps.
+func (a *attach) installRefreshPinLocked(itemID uint64) *refreshPin {
 	if itemID == 0 {
-		return func() {}
+		return nil
 	}
 	if a.refreshPins == nil {
 		a.refreshPins = map[uint64]*refreshPin{}
 	}
 	pin := &refreshPin{done: make(chan struct{})}
 	a.refreshPins[itemID] = pin
+	return pin
+}
+
+// pinRefreshItemLocked is installRefreshPinLocked plus the standalone release
+// that the pin-only tests drive. Production code arms a pin only as half of a
+// window and therefore always goes through retireRefreshWindowLocked.
+func (a *attach) pinRefreshItemLocked(itemID uint64) func() {
+	pin := a.installRefreshPinLocked(itemID)
+	if pin == nil {
+		return func() {}
+	}
 	return func() {
 		a.mu.Lock()
 		if a.refreshPins[itemID] == pin {
@@ -131,17 +153,56 @@ func (a *attach) pinRefreshItemLocked(itemID uint64) func() {
 	}
 }
 
-// releaseRefreshPinLocked drops any pin this attach still holds for itemID.
-// Callers hold a.mu. It exists for the belt-and-braces retirement in
-// applyKernelRefresh, which must never leave a pin behind a refresh that has
-// returned.
-func (a *attach) releaseRefreshPinLocked(itemID uint64) {
-	pin := a.refreshPins[itemID]
-	if pin == nil {
-		return
+// retireRefreshWindowLocked removes BOTH halves of one refresh window — the
+// provenance marker bound to p under seq, and the item's pin — inside the
+// caller's single a.mu hold, and returns the pin so its waiters are woken only
+// after that hold is released.
+//
+// ── WHY THIS IS ONE STEP AND NOT TWO ────────────────────────────────────────
+//
+// The two halves state the same fact from opposite ends. The marker says "the
+// daemon is inside its own ftruncate(2) for this (item, size)"; the pin is what
+// MAKES that true, because it is the only thing holding an application size
+// mutation on the item behind that syscall.
+//
+// Retiring them in separate critical sections left an interval in which the
+// marker was still installed and the pin was already gone, and that interval is
+// not benign. A size-set matching (item, S) admitted inside it takes no wait —
+// nothing is pinned — and phase 1 reads the still-pinned marker, calls the
+// request daemon bookkeeping, and FREEZES that verdict (the freeze is
+// one-directional by design: a non-application verdict can never be promoted
+// later). The request takes no reservation, the handler answers it locally, and
+// a real application truncate has been silently converted into refresh
+// bookkeeping: the authority never sees it, and the mutation and version
+// ordering it owed every other observer never happens.
+//
+// The ORDER within the hold does not matter, because no observer can see
+// between them; that they share one hold is the whole point. The pin's waiters
+// are woken outside it for the ordinary reason — a woken waiter's first act is
+// to take a.mu.
+//
+// pin names the exact pin the caller installed. A nil pin retires whichever pin
+// the item currently carries, which is what the belt-and-braces sweep in
+// applyKernelRefresh needs: it is repairing a window whose own teardown did not
+// run, so it has no pin identity to match.
+func (a *attach) retireRefreshWindowLocked(
+	p string,
+	seq uint64,
+	itemID uint64,
+	pin *refreshPin,
+) *refreshPin {
+	if current, exists := a.expectedTruncates[p]; exists && current.seq == seq {
+		delete(a.expectedTruncates, p)
+	}
+	if itemID == 0 {
+		return nil
+	}
+	held := a.refreshPins[itemID]
+	if held == nil || (pin != nil && held != pin) {
+		return nil
 	}
 	delete(a.refreshPins, itemID)
-	pin.release()
+	return held
 }
 
 // sizeMutationReservedLocked reports whether a size mutation has been admitted
@@ -151,8 +212,14 @@ func (a *attach) sizeMutationReservedLocked(itemID uint64) bool {
 }
 
 // reserveSizeMutation is the mutation half of the token. It waits out any
-// pinned refresh on itemID and then registers this mutation, returning the
-// release.
+// pinned refresh on itemID — and any refresh that has declared an INTENT on it
+// but has not pinned yet (refreshintent.go) — and then registers this mutation,
+// returning the release.
+//
+// Waiting for the intent as well as the pin is what makes the protocol FAIR.
+// Without it a refresh had no claim of its own: it could only re-check what was
+// reserved at each of its 41 ticks, so a stream of ordinary overlapping writers
+// starved it out of its whole budget and the failure was terminal at its caller.
 //
 // The wait is bounded by ctx — the request's own operation deadline — and its
 // refusal is EINTR, which is honest: nothing has been attempted, and the
@@ -169,8 +236,8 @@ func (a *attach) reserveSizeMutation(ctx context.Context, itemID uint64) (func()
 	}
 	for {
 		a.mu.Lock()
-		pin := a.refreshPins[itemID]
-		if pin == nil {
+		blocked := a.refreshIntentBlockerLocked(itemID)
+		if blocked == nil {
 			if a.sizeMutationReservations == nil {
 				a.sizeMutationReservations = map[uint64]int{}
 			}
@@ -178,10 +245,9 @@ func (a *attach) reserveSizeMutation(ctx context.Context, itemID uint64) (func()
 			a.mu.Unlock()
 			return a.releaseSizeMutationOnce(itemID), 0
 		}
-		done := pin.done
 		a.mu.Unlock()
 		select {
-		case <-done:
+		case <-blocked:
 		case <-ctx.Done():
 			return nil, darwinEINTR
 		}
@@ -198,6 +264,9 @@ func (a *attach) releaseSizeMutationOnce(itemID uint64) func() {
 			} else {
 				a.sizeMutationReservations[itemID] = n - 1
 			}
+			// A pending refresh is waiting for exactly this: the last
+			// reservation that was outstanding when it declared its intent.
+			a.signalRefreshIntentDrainLocked(itemID)
 			a.mu.Unlock()
 		})
 	}
