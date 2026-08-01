@@ -64,7 +64,7 @@ func TestWALReclaimPreservesLiveGrantForLaterTail(t *testing.T) {
 	if got := len(w.segments); got != 2 {
 		t.Fatalf("rotation produced %d segments, want 2", got)
 	}
-	if err := w.CheckpointAndReclaim(first[0].seq, first[0].digest, func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(first[0].seq, first[0].digest), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint and reclaim segment 1: %v", err)
 	}
 	if _, err := os.Stat(segmentPath(streamDir, 1)); !errors.Is(err, os.ErrNotExist) {
@@ -167,7 +167,7 @@ func TestWALRotationDoesNotReemitReleasedGrant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-	if err := w.CheckpointAndReclaim(0, digestZero(), func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(0, digestZero()), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint and reclaim: %v", err)
 	}
 	if err := w.Close(); err != nil {
@@ -223,7 +223,7 @@ func TestRecordDrainedReleasePersistsAppliedCertificateBeforeRelease(t *testing.
 		certificateSyncs.Add(1)
 		return f.Sync()
 	}
-	if err := w.recordDrainedRelease(grant.Scope, grant.Epoch, appended[0].seq, appended[0].digest); err != nil {
+	if err := w.recordDrainedRelease(grant.Scope, grant.Epoch, legacyStreamMark(appended[0].seq, appended[0].digest)); err != nil {
 		t.Fatalf("record drained release: %v", err)
 	}
 	if got := certificateSyncs.Load(); got != 1 {
@@ -247,12 +247,12 @@ func TestRecordDrainedReleasePersistsAppliedCertificateBeforeRelease(t *testing.
 	if len(mutations) != 1 {
 		t.Fatalf("mutations = %d, want 1", len(mutations))
 	}
-	through, digest, err := highestAppliedCertificate(marks, scan.lastSeq)
+	cert, err := highestAppliedCertificate(marks, scan.lastSeq)
 	if err != nil {
 		t.Fatalf("select applied certificate: %v", err)
 	}
-	if through != appended[0].seq || digest != appended[0].digest {
-		t.Fatalf("certificate = (%d,%x), want (%d,%x)", through, digest, appended[0].seq, appended[0].digest)
+	if cert.global != appended[0].seq || cert.lanes[StreamLaneLegacy].digest != appended[0].digest {
+		t.Fatalf("certificate = (%d,%x), want (%d,%x)", cert.global, cert.lanes[StreamLaneLegacy].digest, appended[0].seq, appended[0].digest)
 	}
 	if len(scan.frames) != 4 ||
 		scan.frames[0].typ != frameDelegation ||
@@ -310,12 +310,12 @@ func TestAppliedCertificatesSelectHighestIndependentOfFrameOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode stream: %v", err)
 	}
-	through, digest, err := highestAppliedCertificate(marks, scan.lastSeq)
+	cert, err := highestAppliedCertificate(marks, scan.lastSeq)
 	if err != nil {
 		t.Fatalf("select highest applied certificate: %v", err)
 	}
-	if through != appended[1].seq || digest != appended[1].digest {
-		t.Fatalf("highest certificate=(%d,%x), want (%d,%x)", through, digest, appended[1].seq, appended[1].digest)
+	if cert.global != appended[1].seq || cert.lanes[StreamLaneLegacy].digest != appended[1].digest {
+		t.Fatalf("highest certificate=(%d,%x), want (%d,%x)", cert.global, cert.lanes[StreamLaneLegacy].digest, appended[1].seq, appended[1].digest)
 	}
 	analyzed, err := analyzeAbandonedStream(streamDir, 1, scan, RecoveryJob{})
 	if err != nil {
@@ -330,7 +330,7 @@ func TestAppliedCertificatesSelectHighestIndependentOfFrameOrder(t *testing.T) {
 		Through: appended[0].seq,
 		Digest:  fmt.Sprintf("%x", [32]byte{}),
 	})
-	if _, _, err := highestAppliedCertificate(conflict, scan.lastSeq); !errors.Is(err, ErrCorrupt) {
+	if _, err := highestAppliedCertificate(conflict, scan.lastSeq); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("conflicting same-watermark digest error=%v, want ErrCorrupt", err)
 	}
 }

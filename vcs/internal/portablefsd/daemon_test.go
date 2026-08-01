@@ -2458,6 +2458,25 @@ func TestDaemonRevivesAttachRefAfterRestart(t *testing.T) {
 	if ref2 != ref {
 		t.Fatalf("reattach ref=%q want old ref %q", ref2, ref)
 	}
+	// ensureAttachWithPolicy's idempotency pass installs the placeholder
+	// "renewed" credential, which this authority's handshake refuses. A
+	// credential install is now PROVED by its own bounded handshake instead of
+	// being assumed healthy, so leaving it installed would (correctly) latch a
+	// credential verdict on a mount that is otherwise fine. Restore the
+	// credential this authority actually accepts before asserting the mount is
+	// clean; TestDaemonNeverPersistsCredentials still covers the placeholder.
+	controlJSON(t, p2.hc, http.MethodPost, "/v1/attaches/"+ref+"/credential", map[string]any{
+		"authToken": "",
+	}, http.StatusNoContent, nil)
+	credentialDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(credentialDeadline) {
+		var probe attachStatus
+		controlJSON(t, p2.hc, http.MethodGet, "/v1/attaches/"+ref, nil, http.StatusOK, &probe)
+		if probe.LastError == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	lr := c2.call(&pfslocal.LookupRequest{Dir: res2.Root, Name: []byte("alive.txt")}).(*pfslocal.LookupReply)
 	if lr.Attr.Kind != pfslocal.ItemKindFile {
 		t.Fatalf("post-credential lookup = %+v", lr)

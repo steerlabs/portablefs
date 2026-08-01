@@ -11,6 +11,14 @@ func sizeSetAttr(item pfslocal.Item, size uint64) *pfslocal.SetAttrRequest {
 	return &pfslocal.SetAttrRequest{Item: item, Size: &size}
 }
 
+// consumedInternal is the boolean the handler's classification used to be:
+// "answered locally as the daemon's own refresh". It is a test convenience so
+// the provenance assertions read as they always did; the handler itself needs
+// the third verdict (refreshClassAmbiguous) that this collapses away.
+func consumedInternal(a *attach, p string, req *pfslocal.SetAttrRequest) bool {
+	return a.classifyExpectedTruncate(p, req) == refreshClassInternal
+}
+
 // TestCompetingApplicationTruncateCannotStealRefreshProvenance is the exact
 // same-item same-size race the marker protocol exists to survive.
 //
@@ -42,21 +50,22 @@ func TestCompetingApplicationTruncateCannotStealRefreshProvenance(t *testing.T) 
 		selfAdmitted bool
 		selfConsumed bool
 	)
-	a.testRefreshKernelFile = func(_, p string, _ uint64, size int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, p string, _ uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
 		// Inside the daemon's own synchronous ftruncate: the pin is held.
+		defer armTruncate()()
 
 		// 1. A competing APPLICATION ftruncate(item, refreshSize) — byte
 		//    identical on the wire — reaches the dispatcher first.
 		appReq := sizeSetAttr(item, uint64(refreshSize))
 		appAdmitted = a.internalRefreshPending(appReq)
-		appConsumed = a.consumeExpectedTruncate(rec.path, appReq)
+		appConsumed = consumedInternal(a, rec.path, appReq)
 
 		// 2. The daemon's OWN upcall for this very ftruncate arrives after it.
 		//    It must still be recognised as daemon bookkeeping; anything else
 		//    sends a truncate the application never asked for to the authority.
 		selfReq := sizeSetAttr(item, uint64(refreshSize))
 		selfAdmitted = a.internalRefreshPending(selfReq)
-		selfConsumed = a.consumeExpectedTruncate(rec.path, selfReq)
+		selfConsumed = consumedInternal(a, rec.path, selfReq)
 		return kernelRefreshApplied, nil
 	}
 
@@ -84,7 +93,7 @@ func TestCompetingApplicationTruncateCannotStealRefreshProvenance(t *testing.T) 
 	if a.internalRefreshPending(sizeSetAttr(item, uint64(refreshSize))) {
 		t.Fatal("refresh window stayed open after the refresh returned")
 	}
-	if a.consumeExpectedTruncate(rec.path, sizeSetAttr(item, uint64(refreshSize))) {
+	if consumedInternal(a, rec.path, sizeSetAttr(item, uint64(refreshSize))) {
 		t.Fatal("a post-refresh application truncate was suppressed")
 	}
 }
@@ -104,9 +113,12 @@ func TestHardLinkAliasTruncateCannotStealRefreshProvenance(t *testing.T) {
 
 	const refreshSize = int64(32)
 	var aliasConsumed, selfConsumed bool
-	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
-		aliasConsumed = a.consumeExpectedTruncate("dir/alias", sizeSetAttr(item, uint64(refreshSize)))
-		selfConsumed = a.consumeExpectedTruncate(rec.path, sizeSetAttr(item, uint64(refreshSize)))
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+		// Model the real refresh: the window is armed for exactly the extent of
+		// the ftruncate(2) this hook stands in for.
+		defer armTruncate()()
+		aliasConsumed = consumedInternal(a, "dir/alias", sizeSetAttr(item, uint64(refreshSize)))
+		selfConsumed = consumedInternal(a, rec.path, sizeSetAttr(item, uint64(refreshSize)))
 		return kernelRefreshApplied, nil
 	}
 	if outcome, err := a.applyKernelRefresh("", rec.path, rec, refreshSize); outcome != kernelRefreshApplied || err != nil {
@@ -136,12 +148,13 @@ func TestRealTruncateInsideAPinnedWindowStillReachesTheAuthority(t *testing.T) {
 
 	mode := uint32(0o600)
 	var shorter, withMode, self bool
-	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
-		shorter = a.consumeExpectedTruncate(rec.path, sizeSetAttr(item, 7))
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+		defer armTruncate()()
+		shorter = consumedInternal(a, rec.path, sizeSetAttr(item, 7))
 		modeReq := sizeSetAttr(item, 100)
 		modeReq.Mode = &mode
-		withMode = a.consumeExpectedTruncate(rec.path, modeReq)
-		self = a.consumeExpectedTruncate(rec.path, sizeSetAttr(item, 100))
+		withMode = consumedInternal(a, rec.path, modeReq)
+		self = consumedInternal(a, rec.path, sizeSetAttr(item, 100))
 		return kernelRefreshApplied, nil
 	}
 	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 100); outcome != kernelRefreshApplied || err != nil {
@@ -173,10 +186,11 @@ func TestRefreshProvenancePredicatesAgree(t *testing.T) {
 	a := &attach{items: map[uint64]*itemRecord{item.ItemID: rec}}
 
 	var disagreements int
-	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+		defer armTruncate()()
 		for i := 0; i < 8; i++ {
 			req := sizeSetAttr(item, 5)
-			if a.internalRefreshPending(req) != a.consumeExpectedTruncate(rec.path, req) {
+			if a.internalRefreshPending(req) != consumedInternal(a, rec.path, req) {
 				disagreements++
 			}
 		}

@@ -87,19 +87,19 @@ func TestWriteBackManagedCoordination(t *testing.T) {
 	prev := wbZeroDigest()
 	end := wbTestDigest(t, prev, records)
 	scopes := []WBScope{{Path: "w", Epoch: grant.Epoch, Through: records[len(records)-1].Seq}}
-	through, st, err := cli.FlushWriteback("wb-stream-1", scopes, prev, end, records)
+	through, st, err := cli.FlushWriteback(FlushBatch{WritebackID: "wb-stream-1", Scopes: scopes, PrevDigest: prev, EndDigest: end, Records: records})
 	if err != nil || st != OK || through != 2 {
 		t.Fatalf("managed write-back flush: through=%d st=%d err=%v", through, st, err)
 	}
-	through2, st2, err := cli.FlushWriteback("wb-stream-1", scopes, prev, end, records)
+	through2, st2, err := cli.FlushWriteback(FlushBatch{WritebackID: "wb-stream-1", Scopes: scopes, PrevDigest: prev, EndDigest: end, Records: records})
 	if err != nil || st2 != OK || through2 != 2 {
 		t.Fatalf("retry flush: through=%d st=%d err=%v", through2, st2, err)
 	}
 
 	// The durable stream state is queryable for recovery.
-	exists, wbThrough, wbDigest, err := cli.WritebackState("wb-stream-1")
-	if err != nil || !exists || wbThrough != 2 || wbDigest != end {
-		t.Fatalf("writeback state: exists=%v through=%d err=%v", exists, wbThrough, err)
+	view, err := cli.WritebackState("wb-stream-1")
+	if err != nil || !view.Exists || view.Through != 2 || view.Digest != end {
+		t.Fatalf("writeback state: %+v err=%v", view, err)
 	}
 
 	// The acked write is durable on the authority.

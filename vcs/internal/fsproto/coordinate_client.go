@@ -227,20 +227,38 @@ func (c *Client) PrepareDelegationRelease(path, epoch string, paths []string) ([
 	return append([]uint64(nil), resp.OpenInos...), resp.Gen, nil
 }
 
-// FlushWriteback ships one dense global run of the mount write-back stream.
-// scopes maps every record to the exact live grant authorizing it. Exactness
-// rides the stream's durable watermark + digest (a lost reply resends
-// identical bytes and the authority drops the covered prefix), so no slot
-// identity is consumed.
-func (c *Client) FlushWriteback(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
-	return c.flushWriteback(context.Background(), writebackID, scopes, prevDigest, endDigest, records, false)
+// FlushBatch is one lane-scoped write-back batch as the client presents it.
+// Scopes maps every record to the exact live grant authorizing it. Exactness
+// rides the LANE's durable watermark + digest (a lost reply resends identical
+// bytes and the authority drops the covered prefix), so no slot identity is
+// consumed.
+type FlushBatch struct {
+	WritebackID string
+	// Lane is pfc2.StreamLane as a wire scalar: 0 legacy, 1 namespace, 2 data.
+	// It is deliberately not the typed constant — fsproto is the wire layer and
+	// does not decide lane policy, it carries it.
+	Lane uint8
+	// NSRequired is a data-lane batch's namespace dependency (see
+	// Request.WBNSRequired). Zero on every other lane.
+	NSRequired uint64
+	Scopes     []WBScope
+	PrevDigest [32]byte
+	EndDigest  [32]byte
+	Records    []wal.Record
+}
+
+// FlushWriteback ships one dense run of one lane of the mount write-back
+// stream.
+func (c *Client) FlushWriteback(b FlushBatch) (uint64, int32, error) {
+	return c.flushWriteback(context.Background(), b, false)
 }
 
 // FlushWritebackContext is the normal flusher path. When ctx expires it
-// interrupts and joins the checked-out transport before returning, so the
-// single flusher remains the single authority writer even across timeouts.
-func (c *Client) FlushWritebackContext(ctx context.Context, writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
-	return c.flushWriteback(ctx, writebackID, scopes, prevDigest, endDigest, records, false)
+// interrupts and joins the checked-out transport before returning, so a lane's
+// single worker remains that lane's single authority writer even across
+// timeouts.
+func (c *Client) FlushWritebackContext(ctx context.Context, b FlushBatch) (uint64, int32, error) {
+	return c.flushWriteback(ctx, b, false)
 }
 
 // FlushWritebackResolved is the recovery-only form of FlushWriteback. Once
@@ -248,19 +266,30 @@ func (c *Client) FlushWritebackContext(ctx context.Context, writebackID string, 
 // digest-addressed batch until a definite reply, session fence, or client
 // teardown. Recovery callers retain their exclusive local store lock for this
 // entire call, so a possibly-sent flush never becomes a detached writer.
-func (c *Client) FlushWritebackResolved(writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record) (uint64, int32, error) {
-	return c.flushWriteback(context.Background(), writebackID, scopes, prevDigest, endDigest, records, true)
+func (c *Client) FlushWritebackResolved(b FlushBatch) (uint64, int32, error) {
+	return c.flushWriteback(context.Background(), b, true)
 }
 
-func (c *Client) flushWriteback(ctx context.Context, writebackID string, scopes []WBScope, prevDigest, endDigest [32]byte, records []wal.Record, resolved bool) (uint64, int32, error) {
+func (c *Client) flushWriteback(ctx context.Context, b FlushBatch, resolved bool) (uint64, int32, error) {
+	if b.Lane != 0 && c.Features()&FeatureWritebackLanes == 0 {
+		// A pre-mutation refusal, not a downgrade: there is no single-stream
+		// encoding of a laned batch, and re-serializing the lanes onto one chain
+		// would rebuild the head-of-line coupling the lanes exist to remove.
+		// The engine never reaches here — it refuses to OPEN its laned era
+		// without the bit — so this is the wire layer proving the same thing.
+		return 0, EIO, fmt.Errorf(
+			"fsproto: this authority does not advertise write-back lanes; a laned batch has no legacy encoding")
+	}
 	req := &Request{
 		Op:           OpFlushBatch,
-		SessionID:    writebackID,
+		SessionID:    b.WritebackID,
 		Owner:        c.owner,
-		WBPrevDigest: prevDigest[:],
-		WBEndDigest:  endDigest[:],
-		Records:      records,
-		WBScopes:     scopes,
+		WBPrevDigest: b.PrevDigest[:],
+		WBEndDigest:  b.EndDigest[:],
+		Records:      b.Records,
+		WBScopes:     b.Scopes,
+		WBLane:       b.Lane,
+		WBNSRequired: b.NSRequired,
 	}
 	var (
 		resp *Response
@@ -323,27 +352,56 @@ func (c *Client) DelegationAcquire(scope, writebackID string) (DelegationGrant, 
 	}
 }
 
-// WritebackState reads a stream's durable watermark + digest.
-func (c *Client) WritebackState(writebackID string) (exists bool, through uint64, digest [32]byte, err error) {
+// WritebackStateView is a stream's durable per-lane position as the client
+// reads it back.
+type WritebackStateView struct {
+	Exists      bool
+	Through     uint64
+	Digest      [32]byte
+	NSThrough   uint64
+	NSDigest    [32]byte
+	DataThrough uint64
+	DataDigest  [32]byte
+}
+
+// WritebackState reads a stream's durable per-lane watermarks + digests.
+func (c *Client) WritebackState(writebackID string) (WritebackStateView, error) {
 	resp, err := c.doAttached(&Request{Op: OpWritebackState, SessionID: writebackID}, true)
 	if err != nil {
-		return false, 0, digest, err
+		return WritebackStateView{}, err
 	}
 	if resp.Status != OK {
-		return false, 0, digest, statusError("writeback state", resp.Status)
+		return WritebackStateView{}, statusError("writeback state", resp.Status)
 	}
-	copy(digest[:], resp.WBDigest)
-	return resp.WBExists, resp.AppliedThrough, digest, nil
+	v := WritebackStateView{
+		Exists: resp.WBExists, Through: resp.AppliedThrough,
+		NSThrough: resp.WBNSThrough, DataThrough: resp.WBDataThrough,
+	}
+	copy(v.Digest[:], resp.WBDigest)
+	copy(v.NSDigest[:], resp.WBNSDigest)
+	copy(v.DataDigest[:], resp.WBDataDigest)
+	return v, nil
 }
 
 // WritebackRebind claims a parked stream's recovery scopes under this
 // session after the authority verified the stream identity and digest.
 // Typed conflicts are returned without error; nothing partial commits.
-func (c *Client) WritebackRebind(writebackID string, scopes []WBScope, through uint64, digest [32]byte) ([]WBConflict, error) {
-	resp, err := c.doCoordinateResolved(&Request{
+func (c *Client) WritebackRebind(writebackID string, scopes []WBScope, mark WritebackStateView) ([]WBConflict, error) {
+	req := &Request{
 		Op: OpWritebackRebind, SessionID: writebackID, Owner: c.owner,
-		WBScopes: scopes, WBThrough: through, WBPrevDigest: digest[:],
-	})
+		WBScopes: scopes, WBThrough: mark.Through, WBPrevDigest: mark.Digest[:],
+		WBNSThrough: mark.NSThrough, WBDataThrough: mark.DataThrough,
+	}
+	// A lane with nothing applied claims nothing: leaving its digest ABSENT
+	// (rather than 32 zero bytes) keeps a legacy stream's rebind frame, and its
+	// exact identity, byte-for-byte what it always was.
+	if mark.NSThrough != 0 {
+		req.WBNSDigest = mark.NSDigest[:]
+	}
+	if mark.DataThrough != 0 {
+		req.WBDataDigest = mark.DataDigest[:]
+	}
+	resp, err := c.doCoordinateResolved(req)
 	if err != nil {
 		return nil, err
 	}

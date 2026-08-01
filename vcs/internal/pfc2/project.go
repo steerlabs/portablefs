@@ -107,12 +107,22 @@ type PinEntryValue struct {
 	Ino     uint64
 }
 
-// FlushEntryValue is one mount stream's durable flush state.
+// FlushEntryValue is one mount stream's durable flush state: the legacy
+// single-stream position plus each lane's independent one.
+//
+// The lane fields are encoded only when a lane has actually applied something,
+// so a stream that never left the legacy era projects to EXACTLY the bytes it
+// projected before round 7 — the projection digest of existing control state is
+// unchanged, and no checkpoint needs rewriting at the upgrade.
 type FlushEntryValue struct {
 	Owner       SessionRef
 	WritebackID string
 	Through     uint64
 	Digest      [DigestBytes]byte
+	NSThrough   uint64
+	NSDigest    [DigestBytes]byte
+	DataThrough uint64
+	DataDigest  [DigestBytes]byte
 }
 
 // Entry is one typed control-map entry (exactly one arm, matching Kind).
@@ -324,11 +334,35 @@ func (e *Entry) Validate() error {
 		if !restrictedName(f.WritebackID, MaxWritebackIDBytes) {
 			return malformedf("flush entry: malformed writeback id")
 		}
-		if f.Through == 0 {
-			return malformedf("flush entry: through must be nonzero")
+		// A ledger entry exists because SOME lane applied something, so at
+		// least one watermark must be nonzero — but no longer necessarily the
+		// legacy one: a stream created after the upgrade never writes an
+		// unlaned record and its legacy watermark stays 0 forever. Each lane
+		// that is present must carry a canonical digest; each lane that is
+		// absent must carry no digest at all.
+		lanes := [...]struct {
+			name    string
+			through uint64
+			digest  [DigestBytes]byte
+		}{
+			{"legacy", f.Through, f.Digest},
+			{"namespace", f.NSThrough, f.NSDigest},
+			{"data", f.DataThrough, f.DataDigest},
 		}
-		if f.Digest == ([DigestBytes]byte{}) {
-			return malformedf("flush entry: all-zero stream digest is never a canonical chain value")
+		present := 0
+		for _, l := range lanes {
+			zero := l.digest == ([DigestBytes]byte{})
+			switch {
+			case l.through != 0 && zero:
+				return malformedf("flush entry: %s lane watermark %d without a chain digest", l.name, l.through)
+			case l.through == 0 && !zero:
+				return malformedf("flush entry: %s lane digest without a watermark", l.name)
+			case l.through != 0:
+				present++
+			}
+		}
+		if present == 0 {
+			return malformedf("flush entry: no lane has a watermark")
 		}
 	default:
 		return malformedf("unknown entry kind %d", e.Kind)
@@ -416,8 +450,18 @@ func EncodeEntry(e *Entry) ([]byte, error) {
 		f := e.Flush
 		arm = pfwire.AppendBytes(arm, 1, appendSessionRef(nil, f.Owner))
 		arm = pfwire.AppendString(arm, 2, f.WritebackID)
-		arm = pfwire.AppendUint(arm, 5, f.Through)
-		arm = pfwire.AppendBytes(arm, 6, f.Digest[:])
+		if f.Through != 0 {
+			arm = pfwire.AppendUint(arm, 5, f.Through)
+			arm = pfwire.AppendBytes(arm, 6, f.Digest[:])
+		}
+		if f.NSThrough != 0 {
+			arm = pfwire.AppendUint(arm, 7, f.NSThrough)
+			arm = pfwire.AppendBytes(arm, 8, f.NSDigest[:])
+		}
+		if f.DataThrough != 0 {
+			arm = pfwire.AppendUint(arm, 9, f.DataThrough)
+			arm = pfwire.AppendBytes(arm, 10, f.DataDigest[:])
+		}
 		field = 8
 	}
 	body = pfwire.AppendUint(body, 1, uint64(e.Kind))
@@ -881,6 +925,22 @@ func decodeFlushEntryValue(body []byte) (*FlushEntryValue, error) {
 			if err := fixed32(rd, field, &f.Digest); err != nil {
 				return nil, err
 			}
+		case field == 7 && wt == pfwire.TypeVarint:
+			if f.NSThrough, err = rd.Uint(field); err != nil {
+				return nil, err
+			}
+		case field == 8 && wt == pfwire.TypeBytes:
+			if err := fixed32(rd, field, &f.NSDigest); err != nil {
+				return nil, err
+			}
+		case field == 9 && wt == pfwire.TypeVarint:
+			if f.DataThrough, err = rd.Uint(field); err != nil {
+				return nil, err
+			}
+		case field == 10 && wt == pfwire.TypeBytes:
+			if err := fixed32(rd, field, &f.DataDigest); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, rd.RejectUnknown(field)
 		}
@@ -979,6 +1039,8 @@ func (st *State) Project() *Projection {
 	for id, e := range st.ledger {
 		p.Entries = append(p.Entries, Entry{Kind: EntryFlush, Flush: &FlushEntryValue{
 			Owner: e.owner, WritebackID: id, Through: e.through, Digest: e.digest,
+			NSThrough: e.ns.through, NSDigest: e.ns.digest,
+			DataThrough: e.data.through, DataDigest: e.data.digest,
 		}})
 		p.Counts.Flushes++
 	}
@@ -1199,7 +1261,12 @@ func Rebuild(p *Projection) (*State, error) {
 					return nil, fmt.Errorf("projection entry %d: %w", i, err)
 				}
 			}
-			st.ledger[v.WritebackID] = ledgerEntry{through: v.Through, digest: v.Digest, owner: v.Owner}
+			st.ledger[v.WritebackID] = ledgerEntry{
+				through: v.Through, digest: v.Digest,
+				ns:    laneMark{through: v.NSThrough, digest: v.NSDigest},
+				data:  laneMark{through: v.DataThrough, digest: v.DataDigest},
+				owner: v.Owner,
+			}
 			counts.Flushes++
 		}
 	}

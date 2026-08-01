@@ -276,7 +276,7 @@ func TestExactGraftRefreshSamplesOnlyConfinedLocalFile(t *testing.T) {
 	var wantPath string
 	var wantItem uint64
 	var wantSize int64
-	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64, _ func() func()) (kernelRefreshOutcome, error) {
 		if path != wantPath || itemID != wantItem || size != wantSize {
 			t.Fatalf("graft refresh path=%q item=%d size=%d want path=%q item=%d size=%d",
 				path, itemID, size, wantPath, wantItem, wantSize)

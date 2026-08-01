@@ -143,7 +143,7 @@ func TestRefreshSampleRejectsReplacementAuthorityInode(t *testing.T) {
 		paths:       map[string]*itemRecord{"replacement": rec},
 		itemAliases: map[uint64]map[string]struct{}{item.ItemID: {"replacement": {}}},
 	}
-	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(string, string, uint64, int64, func() func()) (kernelRefreshOutcome, error) {
 		applied = true
 		return kernelRefreshApplied, nil
 	}

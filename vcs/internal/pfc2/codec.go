@@ -66,7 +66,8 @@ func asMalformed(err error) error {
 //	ExactOutcome:    1 key  2 outcome
 //	OutcomeFloor:    1 session  2 slot  3 through
 //	FlushAdvance:    1 session  2 writeback_id  3 checkout_path
-//	                 4 checkout_epoch  5 through
+//	                 4 checkout_epoch  5 through  6 digest[32]
+//	                 7 lane (absent = legacy single stream)
 //	LockChange:      1 key  2 outcome  3 ino  4 lock_owner  5 op
 //	                 6 start  7 length (0 = through EOF)
 //	CheckoutChange:  1 key  2 outcome  3 op  4 path  5 epoch
@@ -267,6 +268,13 @@ func appendRecord(dst []byte, r *Record) ([]byte, error) {
 		b = pfwire.AppendString(b, 4, string(f.CheckoutEpoch))
 		b = pfwire.AppendUint(b, 5, f.Through)
 		b = pfwire.AppendBytes(b, 6, f.Digest[:])
+		// The legacy lane is field-absent, not field-zero: a pre-round-7
+		// journal row and a round-7 row for the same single-stream advance
+		// encode to the SAME bytes, so no durable record changes shape at the
+		// upgrade and the journal's canonical encoding stays stable.
+		if f.Lane != StreamLaneLegacy {
+			b = pfwire.AppendUint(b, 7, uint64(f.Lane))
+		}
 		dst = pfwire.AppendBytes(dst, 7, b)
 	case KindLockChange:
 		l := r.LockChange
@@ -882,6 +890,20 @@ func decodeFlushAdvance(body []byte) (*FlushAdvance, error) {
 			if err := fixed32(rd, field, &f.Digest); err != nil {
 				return nil, err
 			}
+		case field == 7 && wt == pfwire.TypeVarint:
+			v, err := rd.Uint(field)
+			if err != nil {
+				return nil, err
+			}
+			if v == uint64(StreamLaneLegacy) || v >= StreamLaneCount {
+				// Absent means legacy, so an EXPLICIT legacy tag is a
+				// non-canonical encoding of the same record and is refused
+				// like any other malformed field: the journal has exactly one
+				// byte string per state, which is what the projection digest
+				// is a statement about.
+				return nil, malformedf("pfc2 flush advance: lane %d is not a non-legacy stream lane", v)
+			}
+			f.Lane = StreamLane(v)
 		default:
 			return nil, rd.RejectUnknown(field)
 		}

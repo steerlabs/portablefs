@@ -396,9 +396,9 @@ func TestResolvedRecoveryMutatorsReplayLostReplies(t *testing.T) {
 
 	activeResolver.Store(cli)
 	engageFailFast(cli)
-	through, st, err := cli.FlushWritebackResolved(
-		"wb-recovery-resolved", scopes, prev, end, records,
-	)
+	through, st, err := cli.FlushWritebackResolved(FlushBatch{
+		WritebackID: "wb-recovery-resolved", Scopes: scopes, PrevDigest: prev, EndDigest: end, Records: records,
+	})
 	if err != nil || st != OK || through != 2 {
 		t.Fatalf("resolved recovery flush: through=%d status=%d err=%v", through, st, err)
 	}
@@ -460,13 +460,10 @@ func TestWritebackRebindLostDigestReplyRetainsTypedConflict(t *testing.T) {
 	}
 	zero := wbZeroDigest()
 	atTwo := wbTestDigest(t, zero, initial)
-	if through, st, err := holder.FlushWriteback(
-		"wb-late-flush",
-		[]WBScope{{Path: "w", Epoch: grant.Epoch, Through: 2}},
-		zero,
-		atTwo,
-		initial,
-	); err != nil || st != OK || through != 2 {
+	if through, st, err := holder.FlushWriteback(FlushBatch{
+		WritebackID: "wb-late-flush", Scopes: []WBScope{{Path: "w", Epoch: grant.Epoch, Through: 2}},
+		PrevDigest: zero, EndDigest: atTwo, Records: initial,
+	}); err != nil || st != OK || through != 2 {
 		t.Fatalf("initial flush: through=%d status=%d err=%v", through, st, err)
 	}
 
@@ -474,9 +471,9 @@ func TestWritebackRebindLostDigestReplyRetainsTypedConflict(t *testing.T) {
 	if _, err := recovery.EnsureExactSession(); err != nil {
 		t.Fatalf("recovery session: %v", err)
 	}
-	exists, through, observed, err := recovery.WritebackState("wb-late-flush")
-	if err != nil || !exists || through != 2 || observed != atTwo {
-		t.Fatalf("first stream state: exists=%v through=%d digest=%x err=%v", exists, through, observed, err)
+	view, err := recovery.WritebackState("wb-late-flush")
+	if err != nil || !view.Exists || view.Through != 2 || view.Digest != atTwo {
+		t.Fatalf("first stream state: %+v err=%v", view, err)
 	}
 
 	// The earlier holder's possibly-sent batch lands after recovery's read but
@@ -485,13 +482,10 @@ func TestWritebackRebindLostDigestReplyRetainsTypedConflict(t *testing.T) {
 		{Seq: 3, Op: wal.OpWrite, Path: "w/file", Offset: 6, Data: []byte("-late")},
 	}
 	atThree := wbTestDigest(t, atTwo, late)
-	if got, st, err := holder.FlushWriteback(
-		"wb-late-flush",
-		[]WBScope{{Path: "w", Epoch: grant.Epoch, Through: 3}},
-		atTwo,
-		atThree,
-		late,
-	); err != nil || st != OK || got != 3 {
+	if got, st, err := holder.FlushWriteback(FlushBatch{
+		WritebackID: "wb-late-flush", Scopes: []WBScope{{Path: "w", Epoch: grant.Epoch, Through: 3}},
+		PrevDigest: atTwo, EndDigest: atThree, Records: late,
+	}); err != nil || st != OK || got != 3 {
 		t.Fatalf("late prior flush: through=%d status=%d err=%v", got, st, err)
 	}
 
@@ -502,7 +496,7 @@ func TestWritebackRebindLostDigestReplyRetainsTypedConflict(t *testing.T) {
 			dropped.CompareAndSwap(false, true)
 	})
 	scopes := []WBScope{{Path: "w", Epoch: grant.Epoch}}
-	conflicts, err := recovery.WritebackRebind("wb-late-flush", scopes, through, observed)
+	conflicts, err := recovery.WritebackRebind("wb-late-flush", scopes, view)
 	if err != nil {
 		t.Fatalf("lost rejected Rebind reply did not resolve: %v", err)
 	}
@@ -518,11 +512,11 @@ func TestWritebackRebindLostDigestReplyRetainsTypedConflict(t *testing.T) {
 		}
 	}
 
-	exists, through, observed, err = recovery.WritebackState("wb-late-flush")
-	if err != nil || !exists || through != 3 || observed != atThree {
-		t.Fatalf("refreshed stream state: exists=%v through=%d digest=%x err=%v", exists, through, observed, err)
+	view, err = recovery.WritebackState("wb-late-flush")
+	if err != nil || !view.Exists || view.Through != 3 || view.Digest != atThree {
+		t.Fatalf("refreshed stream state: %+v err=%v", view, err)
 	}
-	if conflicts, err = recovery.WritebackRebind("wb-late-flush", scopes, through, observed); err != nil || len(conflicts) != 0 {
+	if conflicts, err = recovery.WritebackRebind("wb-late-flush", scopes, view); err != nil || len(conflicts) != 0 {
 		t.Fatalf("reconciled Rebind: conflicts=%+v err=%v", conflicts, err)
 	}
 }
@@ -736,7 +730,7 @@ func TestClientFencedSessionNeverMintsFreshGeneration(t *testing.T) {
 	}
 	// And a fenced mount cannot flush old dirty write-back bytes either.
 	batch := []wal.Record{{Seq: 1, Op: wal.OpCreate, Path: "wb-file", Mode: 0o644}}
-	if _, st, err := cli.FlushWriteback("wb", []WBScope{{Path: "wb-file", Epoch: "1", Through: batch[len(batch)-1].Seq}}, wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), batch), batch); err != nil || st != ESTALE {
+	if _, st, err := cli.FlushWriteback(FlushBatch{WritebackID: "wb", Scopes: []WBScope{{Path: "wb-file", Epoch: "1", Through: batch[len(batch)-1].Seq}}, PrevDigest: wbZeroDigest(), EndDigest: wbTestDigest(t, wbZeroDigest(), batch), Records: batch}); err != nil || st != ESTALE {
 		t.Fatalf("flush after fence: st=%d err=%v, want ESTALE", st, err)
 	}
 }

@@ -2,7 +2,6 @@ package portablefsd
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -44,47 +43,37 @@ func TestMetadataStaysInteractiveUnderADataFlood(t *testing.T) {
 		runMetadataFloodContract(t, 0)
 	})
 	t.Run("throttled uplink", func(t *testing.T) {
-		// ── OPEN DEFECT: METADATA INHERITS THE BULK BACKLOG'S DRAIN TIME ────
+		// ── THE CONFIGURATION THE CONTRACT IS ACTUALLY ABOUT ────────────────
 		//
-		// This is the live battery's scenario-2 residual, reproduced
-		// mechanically. With the uplink throttled to the 4 MB/s the battery
-		// measured while calling it HEALTHY, this configuration reproduces the
-		// live numbers almost exactly:
+		// An in-process authority over loopback applies as fast as the client
+		// can write, so the fast-uplink variant above never builds a backlog
+		// and therefore never tests the ordering the contract is about. This
+		// one throttles the uplink to the 4 MB/s the live battery measured
+		// while calling it HEALTHY, and reproduces the live numbers exactly.
 		//
-		//	46a5e8d  cold p99 18.38s  max 18.38s   28 ops completed in 12s
-		//	HEAD     cold p99 18.56s  max 18.56s   14 ops completed in 12s
-		//	live     cold p99 19.58s  max 38.02s (round-4 scenario 2)
+		// It ran behind PORTABLEFS_CONTRACT_B=1 through rounds 4-6 as a
+		// REPRODUCTION of an open defect. Round 7 closed the defect, so it runs
+		// by default: it is the contract, not a diagnostic.
 		//
-		// and the round-6 handoff fix does not move it, because it is a
-		// different mechanism. Goroutine dumps taken 8s into the run show the
-		// stalled metadata mutation inside Engine.admit → waitReleaseForCaller:
-		// it is waiting for the delegation release of ITS OWN cold scope.
+		//	46a5e8d   cold p99 18.38s  max 18.38s    28 ops in 12s
+		//	35f0e1a   cold p99 18.99s  max 18.99s    14 ops in 12s
+		//	live      cold p99 19.58s  max 38.02s   (round-4 scenario 2)
+		//	round 7   cold p99  0.15s  max  0.20s   770 ops in 12s
 		//
-		// ROOT CAUSE. finishRelease waits for flusher.drainThrough(scopeTail)
-		// — round 3 already narrowed the target from the STREAM's tail to the
-		// SCOPE's own tail — but f.applied is a stream watermark and
-		// flusher.sendBatch ships a strict PREFIX of f.pending under a hash
-		// chain (prevDigest/appliedDigest, verified by the authority). So
-		// "apply through this scope's tail" transitively means "apply every
+		// WHAT THE DEFECT WAS. finishRelease waits for the releasing SCOPE's
+		// own tail — round 3 already narrowed the target from the STREAM's
+		// tail — but the applied watermark was a STREAM watermark and
+		// sendBatch shipped a strict PREFIX of one hash-chained stream. So
+		// "apply through this scope's tail" transitively meant "apply every
 		// record admitted before it", including every megabyte of unrelated
-		// bulk data. A metadata-only scope's release therefore inherits the
-		// whole bulk backlog's drain time: 18s at 4 MB/s, and the live 38s at
-		// the same rate with a deeper backlog.
+		// bulk data. A metadata-only scope's release inherited the whole bulk
+		// backlog's drain time.
 		//
-		// The fix is NOT a bound or a verdict — the wait is already bounded and
-		// the uplink is healthy — it is lane separation in the stream itself:
-		// the namespace lane needs an applied watermark that can advance
-		// independently of bulk data, which means either its own chained
-		// stream or an out-of-band targeted batch the authority can verify.
-		// That reaches the WAL format, recovery, rebind and the digest
-		// contract, so it is deliberately NOT attempted here.
-		if os.Getenv("PORTABLEFS_CONTRACT_B") != "1" {
-			t.Skip(
-				"open defect: metadata scope releases are ordered behind bulk " +
-					"data in the hash-chained write-back stream; set " +
-					"PORTABLEFS_CONTRACT_B=1 to run the reproduction",
-			)
-		}
+		// WHAT FIXED IT. Lane separation in the stream itself: the namespace
+		// lane has its own dense sequence, its own digest chain, its own
+		// authority watermark and its own flush worker, so a metadata-only
+		// scope's release drains against the namespace watermark alone. See
+		// writeback/lane_separation_test.go for the mechanism, piece by piece.
 		runMetadataFloodContract(t, 4<<20)
 	})
 }

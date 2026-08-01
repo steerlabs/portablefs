@@ -287,6 +287,12 @@ type Engine struct {
 	closed     bool
 	frozen     bool // no further delegated admissions (unmount/force-close)
 	streamOpen bool
+	// laned mirrors the stream WAL's lane era under e.mu, so the per-append
+	// lane decision costs a field read instead of a WAL mutex acquire. The
+	// boundary is one-way (openLanedEraLocked), so a cached copy can only ever
+	// lag into the SAFE direction — writing the legacy stream for one more
+	// admission, never writing a laned frame on a stream that has not crossed.
+	laned bool
 	// streamDead is the flusher's terminal verdict (fence/conflict/corrupt).
 	// It also latches failure, sealing the whole mount mutation gate until
 	// remount so no operation changes lanes around parked history.
@@ -1066,6 +1072,85 @@ func (e *Engine) laneBudget(lane walLane) int64 {
 	return e.cfg.BudgetBytes
 }
 
+// streamLaneLocked maps a record's BUDGET lane to its STREAM lane. Caller holds
+// e.mu.
+//
+// The two are different questions with the same word. The budget lane asks "how
+// much of the on-disk cap may this record consume"; the stream lane asks "which
+// independently-applicable chain does the authority verify it in". They agree
+// for bulk data and they usually agree for metadata, and the ONE case where they
+// do not is the entire soundness argument for lane separation:
+//
+//	A NAMESPACE RECORD ADMITTED INTO A SCOPE THAT STILL HOLDS UNAPPLIED BULK
+//	DATA GOES IN THE DATA LANE.
+//
+// Without that rule the split would not be order-preserving. `echo hi > f; rm f`
+// admits a data record and then a namespace record on the same node; the
+// namespace lane ships eagerly, so the remove would reach the authority before
+// the write and the write would then apply to a path that no longer exists.
+// Routing the remove into the data lane puts it AFTER the write in the only
+// order that matters — the data lane's own — and costs nothing anywhere else,
+// because a scope with unapplied bulk data was never going to release quickly
+// anyway. Metadata-only scopes, which are the ones the interactive contract is
+// about, never take this branch.
+//
+// The condition is a fact about applied state, not about shipping: "unapplied"
+// means the authority has not made the data durable yet, so a namespace record
+// entering the namespace lane while it is false can only apply after data the
+// authority already holds. It is read under e.mu, and the count it reads only
+// rises under e.mu (admission) and only falls under f.mu (an authority advance),
+// so the answer cannot become stale in the direction that would matter.
+func (e *Engine) streamLaneLocked(d *delegation, lane walLane) StreamLane {
+	if !e.laned {
+		return StreamLaneLegacy
+	}
+	if lane == laneData {
+		return StreamLaneData
+	}
+	if d != nil && e.fl.scopeHasUnappliedData(d.scope) {
+		return StreamLaneData
+	}
+	return StreamLaneNamespace
+}
+
+// openLanedEraLocked crosses the stream's lane boundary when it is safe to, and
+// is a no-op otherwise. Caller holds e.mu.
+//
+// THE BOUNDARY, STATED EXACTLY. A stream is in the LEGACY era until the first
+// laned mutation frame is appended; from that frame on it is in the LANED era
+// and an unlaned mutation is refused outright (streamWAL.appendLaneMutations
+// -Within). The boundary may be crossed only when BOTH hold:
+//
+//   - the authority advertises FeatureWritebackLanes, because a laned batch has
+//     no legacy encoding and re-serializing the lanes onto one chain would
+//     rebuild exactly the coupling lanes remove; and
+//   - every unlaned record this stream ever wrote is authority-applied, so the
+//     legacy chain is COMPLETE at the instant it freezes.
+//
+// The second condition is what makes a mixed WAL well-defined: the legacy
+// prefix has no outstanding tail, so recovery replays legacy (nothing), then the
+// namespace lane, then the data lane, and the two lanes each start from
+// digestZero with nothing behind them. It also means the transitional cost is
+// paid exactly once, at the first quiet moment after an upgrade, and is bounded
+// by the legacy backlog that already existed.
+//
+// A fresh stream reaches it immediately: it has no unlaned record, so the very
+// first mutation is laned.
+func (e *Engine) openLanedEraLocked() {
+	if e.laned || e.wal == nil || !e.remote.SupportsLanes() {
+		return
+	}
+	lanes := e.wal.Lanes()
+	if e.fl.laneApplied(StreamLaneLegacy) < lanes[StreamLaneLegacy].through {
+		return // the legacy chain still has an unapplied tail
+	}
+	e.wal.markLaned()
+	// Mirrored on the engine under e.mu so the per-append lane decision is a
+	// plain field read: the boundary is crossed once and never uncrossed, so a
+	// cached copy cannot go stale in the direction that matters.
+	e.laned = true
+}
+
 func (e *Engine) appendLaneLocked(d *delegation, records []wal.Record, lane walLane) ([]appendResult, error) {
 	if err := e.ensureStreamLocked(); err != nil {
 		return nil, err
@@ -1078,8 +1163,13 @@ func (e *Engine) appendLaneLocked(d *delegation, records []wal.Record, lane walL
 		}
 		payloads[i] = p
 	}
+	// Every admission is a chance to leave the legacy era: the condition is
+	// "the legacy tail is applied", which becomes true at the first quiet
+	// moment after an upgrade and can never become false again.
+	e.openLanedEraLocked()
 	budget := e.laneBudget(lane)
-	results, err := e.wal.appendMutationsWithin(payloads, budget)
+	stream := e.streamLaneLocked(d, lane)
+	results, err := e.wal.appendLaneMutationsWithin(payloads, budget, stream)
 	if errors.Is(err, ErrNoSpace) {
 		// One relief pass: fold what the authority has applied and reclaim the
 		// segments that frees, then re-offer the SAME reservation. Relief is
@@ -1089,7 +1179,7 @@ func (e *Engine) appendLaneLocked(d *delegation, records []wal.Record, lane walL
 		if merr := e.MutationError(); merr != nil {
 			return nil, merr
 		}
-		results, err = e.wal.appendMutationsWithin(payloads, budget)
+		results, err = e.wal.appendLaneMutationsWithin(payloads, budget, stream)
 	}
 	if errors.Is(err, ErrNoSpace) {
 		// Nothing was written, so nothing is latched: the engine stays healthy
@@ -1173,18 +1263,18 @@ func (e *Engine) walExhaustedLocked() bool {
 // Reclamation happens only through the unified durable-checkpoint operation;
 // a checkpoint failure relieves nothing (the caller then refuses admission).
 func (e *Engine) relieveBudgetLocked() {
-	through, digest := e.fl.appliedState()
+	mark := e.fl.appliedState()
 	for _, fv := range e.files {
-		fv.foldApplied(through)
+		fv.foldApplied(mark.global)
 	}
 	pins := map[uint64]bool{}
 	for _, fv := range e.files {
 		fv.segmentsPinned(pins)
 	}
 	if e.wal != nil {
-		if err := e.wal.CheckpointAndReclaim(through, digest, func(ord uint64) bool { return pins[ord] }); err != nil {
+		if err := e.wal.CheckpointAndReclaim(mark, func(ord uint64) bool { return pins[ord] }); err != nil {
 			e.failLocalWAL("checkpoint", err)
-			e.logf("writeback: budget-relief checkpoint at %d failed: %v", through, err)
+			e.logf("writeback: budget-relief checkpoint at %d failed: %v", mark.global, err)
 		}
 	}
 	e.noteBudgetLocked()
@@ -2313,7 +2403,7 @@ func (e *Engine) DrainAll(ctx context.Context) error {
 	if failure != nil {
 		return failure
 	}
-	return e.fl.drainThrough(ctx, w.LastSeq())
+	return e.fl.drainAll(ctx, w)
 }
 
 // SyncLocal makes every accepted mutation locally durable (journal-first
@@ -2365,7 +2455,7 @@ func (e *Engine) CloseWithBarrier(ctx context.Context, barrier func() error) err
 			e.thawAfterFailedClose()
 			return e.failLocalWAL("clean-unmount sync", err)
 		}
-		if err := e.fl.drainThrough(ctx, w.LastSeq()); err != nil {
+		if err := e.fl.drainAll(ctx, w); err != nil {
 			e.thawAfterFailedClose()
 			return err
 		}

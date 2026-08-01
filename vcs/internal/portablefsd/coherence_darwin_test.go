@@ -53,7 +53,7 @@ func TestRefreshKernelFileRejectsSymlinkEscapesAndRenameSwap(t *testing.T) {
 	if err := os.Symlink(absoluteSentinel, filepath.Join(mount, "absolute-link")); err != nil {
 		t.Fatal(err)
 	}
-	if outcome, _ := refreshKernelFile(mount, "absolute-link", inode(absoluteSentinel), 1); outcome == kernelRefreshApplied {
+	if outcome, _ := refreshKernelFile(mount, "absolute-link", inode(absoluteSentinel), 1, nil); outcome == kernelRefreshApplied {
 		t.Fatal("absolute symlink refresh unexpectedly succeeded")
 	}
 	assertContents(absoluteSentinel, "absolute-sentinel")
@@ -63,7 +63,7 @@ func TestRefreshKernelFileRejectsSymlinkEscapesAndRenameSwap(t *testing.T) {
 	if err := os.Symlink("../outside/relative", filepath.Join(mount, "relative-link")); err != nil {
 		t.Fatal(err)
 	}
-	if outcome, _ := refreshKernelFile(mount, "relative-link", inode(relativeSentinel), 1); outcome == kernelRefreshApplied {
+	if outcome, _ := refreshKernelFile(mount, "relative-link", inode(relativeSentinel), 1, nil); outcome == kernelRefreshApplied {
 		t.Fatal("relative symlink refresh unexpectedly succeeded")
 	}
 	assertContents(relativeSentinel, "relative-sentinel")
@@ -73,7 +73,7 @@ func TestRefreshKernelFileRejectsSymlinkEscapesAndRenameSwap(t *testing.T) {
 	if err := os.Symlink("../outside", filepath.Join(mount, "linked-directory")); err != nil {
 		t.Fatal(err)
 	}
-	if outcome, _ := refreshKernelFile(mount, "linked-directory/nested", inode(nestedSentinel), 1); outcome == kernelRefreshApplied {
+	if outcome, _ := refreshKernelFile(mount, "linked-directory/nested", inode(nestedSentinel), 1, nil); outcome == kernelRefreshApplied {
 		t.Fatal("intermediate symlink refresh unexpectedly succeeded")
 	}
 	assertContents(nestedSentinel, "nested-sentinel")
@@ -90,7 +90,7 @@ func TestRefreshKernelFileRejectsSymlinkEscapesAndRenameSwap(t *testing.T) {
 	if err := os.Rename(replacement, victim); err != nil {
 		t.Fatal(err)
 	}
-	if outcome, _ := refreshKernelFile(mount, "victim", expectedItemID, 1); outcome == kernelRefreshApplied {
+	if outcome, _ := refreshKernelFile(mount, "victim", expectedItemID, 1, nil); outcome == kernelRefreshApplied {
 		t.Fatal("regular-file rename-swap refresh unexpectedly succeeded")
 	}
 	assertContents(victim, "rename-swap-sentinel")
@@ -107,7 +107,7 @@ func TestRefreshKernelFileTruncatesExpectedRegularFile(t *testing.T) {
 	if err := unix.Stat(name, &stat); err != nil {
 		t.Fatal(err)
 	}
-	if outcome, err := refreshKernelFile(mount, "regular", uint64(stat.Ino), 3); outcome != kernelRefreshApplied {
+	if outcome, err := refreshKernelFile(mount, "regular", uint64(stat.Ino), 3, nil); outcome != kernelRefreshApplied {
 		t.Fatalf("regular-file refresh failed: outcome=%d err=%v", outcome, err)
 	}
 	got, err := os.ReadFile(name)
@@ -162,7 +162,7 @@ func TestRefreshKernelFileResistsConcurrentSymlinkSwap(t *testing.T) {
 	// O_NOFOLLOW_ANY resolution this defeats the post-open inode check and
 	// turns any successful symlink traversal into an outside truncation.
 	for i := 0; i < 2_000; i++ {
-		_, _ = refreshKernelFile(mount, "victim", expectedOutsideID, 1)
+		_, _ = refreshKernelFile(mount, "victim", expectedOutsideID, 1, nil)
 	}
 	close(stop)
 	wg.Wait()
@@ -223,7 +223,7 @@ func TestRefreshKernelFileResistsConcurrentRegularFileSwap(t *testing.T) {
 	}()
 
 	for i := 0; i < 2_000; i++ {
-		_, _ = refreshKernelFile(mount, "victim", expectedVictimID, 1)
+		_, _ = refreshKernelFile(mount, "victim", expectedVictimID, 1, nil)
 	}
 	close(stop)
 	wg.Wait()

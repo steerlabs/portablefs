@@ -153,7 +153,10 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		force := r.URL.Query().Get("force") == "1"
-		found, jobID, err := s.registry.unmountFSKit(ref, force)
+		// The HTTP request's context bounds only THIS waiter: a client that
+		// hangs up (or its own timeout) must never abandon a transaction that
+		// owns durable state.
+		found, jobID, err := s.registry.unmountFSKit(r.Context(), ref, force)
 		if err != nil {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return

@@ -73,6 +73,25 @@ const (
 	// probe makes the difference a pre-mutation decision, never a
 	// failed-operation downgrade.
 	FeatureMutationAttrs
+	// FeatureWritebackLanes advertises that this authority keeps a write-back
+	// stream's durable watermark PER LANE (namespace and data), verifies each
+	// lane's own digest chain, and enforces a data batch's declared namespace
+	// dependency before applying it.
+	//
+	// It is a REQUIREMENT, not an option. A client that has laned records in its
+	// WAL cannot express them to an authority without the bit: there is no
+	// single-stream encoding of two independent chains, and inventing one by
+	// re-serializing the lanes would rebuild exactly the head-of-line coupling
+	// lanes exist to remove. So the bit gates the boundary rather than the
+	// writes — a client that does not see it never OPENS its laned era and keeps
+	// writing the legacy single stream, which every authority understands. Once
+	// the era is open, a later authority without the bit is a definite refusal.
+	//
+	// The deployment order this implies is the one already in force: the server
+	// deploys first. The legacy single-stream path stays for WALs written before
+	// the boundary; it is never a runtime fallback for new writes against a new
+	// server.
+	FeatureWritebackLanes
 )
 
 // OpProtocolVersion is the version probe. Its value is deliberately far above the

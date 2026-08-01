@@ -71,10 +71,10 @@ type CoordinationStore interface {
 	ManagedPrepareDelegationPins(ref pfc2.SessionRef, scope, epoch string, paths []string) ([]uint64, error)
 	ManagedDelegationsOverlapping(path string) []pfc2.CheckoutView
 	ManagedWritebackState(writebackID string) (pfc2.StreamStateView, bool, error)
-	ManagedWritebackConflicts(writebackID string, scopes []workfs.WritebackScope, through uint64, digest [32]byte) ([]workfs.WritebackConflict, error)
-	ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope, through uint64, digest [32]byte) ([]workfs.WritebackConflict, error)
+	ManagedWritebackConflicts(writebackID string, scopes []workfs.WritebackScope, mark workfs.WritebackMark) ([]workfs.WritebackConflict, error)
+	ManagedWritebackRebind(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope, mark workfs.WritebackMark) ([]workfs.WritebackConflict, error)
 	ManagedWritebackDiscard(env *wal.Envelope, envHash []byte, writebackID string, scopes []workfs.WritebackScope) error
-	ManagedFlushApply(ref pfc2.SessionRef, writebackID string, prevDigest, endDigest [32]byte, rows []workfs.ManagedFlushRow, owner string) (uint64, error)
+	ManagedFlushApply(ref pfc2.SessionRef, batch workfs.ManagedFlush, owner string) (uint64, error)
 
 	SyncBarrier() error
 	WaitCoordinationClear(deadline time.Time, check func() bool) bool
@@ -687,6 +687,16 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	if len(req.Records) > MaxBatchRecords {
 		return &Response{Status: EINVAL}
 	}
+	lane := pfc2.StreamLane(req.WBLane)
+	if !lane.Valid() {
+		return &Response{Status: EINVAL}
+	}
+	// Only the data lane has a cross-lane dependency to declare. A namespace or
+	// legacy batch naming one is a client that does not understand the
+	// asymmetry, and the asymmetry is the safety argument.
+	if lane != pfc2.StreamLaneData && req.WBNSRequired != 0 {
+		return &Response{Status: EINVAL}
+	}
 	for i, run := range req.WBScopes {
 		if run.Path == "" || run.Epoch == "" || run.Through == 0 {
 			return &Response{Status: EINVAL}
@@ -753,13 +763,23 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 	if len(req.WBEndDigest) == 32 {
 		copy(end[:], req.WBEndDigest)
 	}
-	through, err := store.ManagedFlushApply(ref, req.SessionID, prev, end, rows, cs.owner)
+	through, err := store.ManagedFlushApply(ref, workfs.ManagedFlush{
+		WritebackID: req.SessionID, Lane: lane, NSRequired: req.WBNSRequired,
+		PrevDigest: prev, EndDigest: end, Rows: rows,
+	}, cs.owner)
 	if err != nil {
 		if errors.Is(err, workfs.ErrSessionStale) {
 			return &Response{Status: ESTALE, AppliedThrough: through}
 		}
 		if errors.Is(err, workfs.ErrWritebackCorrupt) {
 			return &Response{Status: EINVAL, AppliedThrough: through, Gen: s.gen()}
+		}
+		if errors.Is(err, workfs.ErrLaneDependencyUnmet) {
+			// A HOLD, not a verdict about the batch: the identical bytes apply
+			// unchanged once the namespace lane catches up. EAGAIN is the
+			// authority's typed retryable answer and the client's data worker
+			// re-offers on its backoff schedule.
+			return &Response{Status: EAGAIN, AppliedThrough: through, Gen: s.gen()}
 		}
 		if errors.Is(err, workfs.ErrSessionExpiryPending) {
 			return &Response{Status: EAGAIN, AppliedThrough: through, Gen: s.gen()}
@@ -893,12 +913,16 @@ func (s *Server) writebackStateRead(req *Request) *Response {
 	if ok {
 		resp.AppliedThrough = view.Through
 		resp.WBDigest = append([]byte(nil), view.Digest[:]...)
+		resp.WBNSThrough = view.NSThrough
+		resp.WBNSDigest = append([]byte(nil), view.NSDigest[:]...)
+		resp.WBDataThrough = view.DataThrough
+		resp.WBDataDigest = append([]byte(nil), view.DataDigest[:]...)
 	}
 	return resp
 }
 
 // rebindRequestHash fingerprints one stream-rebind identity.
-func rebindRequestHash(writebackID string, scopes []WBScope, through uint64, digest []byte) []byte {
+func rebindRequestHash(writebackID string, scopes []WBScope, through uint64, digest []byte, lanes []wbLaneClaim) []byte {
 	h := sha256.New()
 	h.Write([]byte("PFC2-WB-REBIND"))
 	h.Write([]byte{0})
@@ -917,7 +941,35 @@ func rebindRequestHash(writebackID string, scopes []WBScope, through uint64, dig
 	binary.BigEndian.PutUint64(b[:], through)
 	h.Write(b[:])
 	h.Write(digest)
+	// The per-lane claim is part of the rebind's IDENTITY, not a decoration on
+	// it: two rebinds of the same stream that disagree about a lane watermark
+	// are different requests and must not share an exact-once slot outcome.
+	// Absent lane state hashes to nothing, so a legacy stream's rebind keeps its
+	// existing identity byte-for-byte.
+	for _, lane := range lanes {
+		if lane.Through == 0 && len(lane.Digest) == 0 {
+			continue
+		}
+		h.Write([]byte{lane.Lane})
+		binary.BigEndian.PutUint64(b[:], lane.Through)
+		h.Write(b[:])
+		h.Write(lane.Digest)
+	}
 	return h.Sum(nil)
+}
+
+// wbLaneClaim is one lane's claimed position inside a rebind identity.
+type wbLaneClaim struct {
+	Lane    uint8
+	Through uint64
+	Digest  []byte
+}
+
+func rebindLaneClaims(req *Request) []wbLaneClaim {
+	return []wbLaneClaim{
+		{Lane: uint8(pfc2.StreamLaneNamespace), Through: req.WBNSThrough, Digest: req.WBNSDigest},
+		{Lane: uint8(pfc2.StreamLaneData), Through: req.WBDataThrough, Digest: req.WBDataDigest},
+	}
 }
 
 // coordinateWritebackRebind claims a parked stream's recovery scopes for the
@@ -932,13 +984,15 @@ func (s *Server) coordinateWritebackRebind(store CoordinationStore, req *Request
 	for _, sc := range req.WBScopes {
 		scopes = append(scopes, workfs.WritebackScope{Path: sc.Path, Epoch: sc.Epoch})
 	}
-	var digest [32]byte
-	copy(digest[:], req.WBPrevDigest)
-	reqHash := rebindRequestHash(req.SessionID, req.WBScopes, req.WBThrough, req.WBPrevDigest)
+	mark := workfs.WritebackMark{Through: req.WBThrough, NSThrough: req.WBNSThrough, DataThrough: req.WBDataThrough}
+	copy(mark.Digest[:], req.WBPrevDigest)
+	copy(mark.NSDigest[:], req.WBNSDigest)
+	copy(mark.DataDigest[:], req.WBDataDigest)
+	reqHash := rebindRequestHash(req.SessionID, req.WBScopes, req.WBThrough, req.WBPrevDigest, rebindLaneClaims(req))
 	var conflicts []workfs.WritebackConflict
 	resp := s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
 		var err error
-		conflicts, err = store.ManagedWritebackRebind(full, reqHash, req.SessionID, scopes, req.WBThrough, digest)
+		conflicts, err = store.ManagedWritebackRebind(full, reqHash, req.SessionID, scopes, mark)
 		if err != nil {
 			return workfs.CoordinationDecision{}, err
 		}
@@ -951,7 +1005,7 @@ func (s *Server) coordinateWritebackRebind(store CoordinationStore, req *Request
 		if resp.Duplicate && resp.Status == EIO && len(conflicts) == 0 {
 			var err error
 			conflicts, err = store.ManagedWritebackConflicts(
-				req.SessionID, scopes, req.WBThrough, digest,
+				req.SessionID, scopes, mark,
 			)
 			if err != nil {
 				return nil
@@ -975,7 +1029,7 @@ func (s *Server) coordinateWritebackDiscard(store CoordinationStore, req *Reques
 	for _, sc := range req.WBScopes {
 		scopes = append(scopes, workfs.WritebackScope{Path: sc.Path, Epoch: sc.Epoch})
 	}
-	reqHash := rebindRequestHash("discard\x00"+req.SessionID, req.WBScopes, 0, nil)
+	reqHash := rebindRequestHash("discard\x00"+req.SessionID, req.WBScopes, 0, nil, nil)
 	return s.coordinateDecide(env, reqHash, func(full *wal.Envelope) (workfs.CoordinationDecision, error) {
 		if err := store.ManagedWritebackDiscard(full, reqHash, req.SessionID, scopes); err != nil {
 			return workfs.CoordinationDecision{}, err

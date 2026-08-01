@@ -200,7 +200,7 @@ func TestXattrFlushBatchAppliesDelegatedRecords(t *testing.T) {
 		{Seq: 1, Op: wal.OpCreate, Path: "wb/f", Mode: 0o644},
 		{Seq: 2, Op: wal.OpSetxattr, Path: "wb/f", XattrName: "user.a", Data: []byte("v")},
 	}
-	_, st, err := cli.FlushWriteback("sess-x", []WBScope{{Path: "wb", Epoch: grant.Epoch, Through: records[len(records)-1].Seq}}, wbZeroDigest(), wbTestDigest(t, wbZeroDigest(), records), records)
+	_, st, err := cli.FlushWriteback(FlushBatch{WritebackID: "sess-x", Scopes: []WBScope{{Path: "wb", Epoch: grant.Epoch, Through: records[len(records)-1].Seq}}, PrevDigest: wbZeroDigest(), EndDigest: wbTestDigest(t, wbZeroDigest(), records), Records: records})
 	if err != nil || st != OK {
 		t.Fatalf("delegated xattr flush: st=%d err=%v", st, err)
 	}

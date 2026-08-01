@@ -284,10 +284,68 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 	if rec == nil {
 		return nil, darwinEIO
 	}
+	// A pathname reincarnation detected by this lookup owes its displaced
+	// inode's retained aliases a refresh, and it must be paid BEFORE the
+	// replacement is published — see reconcileReincarnatedAliases.
+	a.reconcileReincarnatedAliases(ctx, vol)
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
 	return &pfslocal.LookupReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
+}
+
+// reconcileReincarnatedAliases refreshes every retained hard-link alias of an
+// authority inode that a pathname reincarnation has just displaced, and it runs
+// BEFORE the caller publishes the replacement.
+//
+// ── WHY THE ORDER IS THE FIX ────────────────────────────────────────────────
+//
+// A remote rename-over replaces WHO a name identifies while the displaced inode
+// stays alive behind its other links. Two independent paths carry that one
+// event to the frontend:
+//
+//	the LOOKUP that resolves the name -> publishes the replacement Item
+//	the INVALIDATION stream's RelatedInos fan-out -> refreshes the aliases
+//
+// Nothing ordered them. When the lookup reached the authority directly it could
+// publish the new `a` while `b` was still serving the attribute snapshot taken
+// at hard-link time — new identity, Nlink=2, an impossible pair for an
+// application to observe. (Round 5 did not create this hole; it removed the
+// incidental serialization that used to hide it. Before that split, a lookup
+// entered the publication gate BLOCKING, before its handler ran, which paid for
+// the invalidation to land often enough that the race was invisible. See the
+// publication activation protocol in coherence_refresh.go.)
+//
+// The publisher that DETECTS the reincarnation is the one that owes the
+// reconciliation, and it settles it on its own reply path rather than hoping
+// another path wins a race. This is ordering, not polling: the debt is recorded
+// synchronously by detachReincarnatedPathLocked, and it is discharged before
+// the reply is written.
+//
+// An alias that cannot be restated is left evicted rather than refreshed: a
+// stale cached snapshot is exactly what must not survive, and the next
+// resolution of that name will reach the authority.
+func (a *attach) reconcileReincarnatedAliases(ctx context.Context, vol *clientcore.Volume) {
+	aliases := a.takeReincarnatedAliases()
+	if len(aliases) == 0 || vol == nil {
+		return
+	}
+	for _, alias := range aliases {
+		a.mu.RLock()
+		rec := a.paths[alias]
+		a.mu.RUnlock()
+		if rec == nil || rec.graft {
+			continue
+		}
+		vol.AttrCache.Evict(alias)
+		attr, st := vol.Getattr(ctx, alias, rec.state)
+		if st != fsproto.OK {
+			continue
+		}
+		a.mu.Lock()
+		a.registerLocked(alias, attr)
+		a.mu.Unlock()
+	}
 }
 
 func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) (*pfslocal.EnumerateReply, int32) {
@@ -617,7 +675,18 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	// A size-only setattr the daemon itself issued to refresh the kernel's
 	// stale vnode state (see exactKernelRefresh) must not reach the
 	// authority: consume the note and answer with current attributes.
-	if a.consumeExpectedTruncate(rec.path, req) {
+	switch a.classifyExpectedTruncate(rec.path, req) {
+	case refreshClassAmbiguous:
+		// A pinned refresh window claims this exact (item, size), but a local
+		// write has moved the item's composed size since the window opened, so
+		// suppressing and forwarding are now OPPOSITE answers and nothing on
+		// the wire says which request this is (see refreshWindowClassLocked).
+		// Refuse rather than guess: EINTR is safe for both candidates — the
+		// daemon's own ftruncate(2) retries through kernelRefreshRetry, an
+		// application's retries the interrupted syscall — and neither can lose
+		// data on it.
+		return nil, darwinEINTR
+	case refreshClassInternal:
 		a.mu.RLock()
 		current := a.items[rec.item.ItemID]
 		if current == nil || current.item.ItemGeneration != rec.item.ItemGeneration {

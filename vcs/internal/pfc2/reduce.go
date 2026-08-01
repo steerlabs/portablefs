@@ -578,8 +578,13 @@ func (st *State) applyFlushAdvance(tx *Txn, f *FlushAdvance, dry bool) (ApplyRes
 		return res, integrityf("flush advance stream %q does not match the grant's stream", f.WritebackID)
 	}
 	cur, exists := st.ledger[f.WritebackID]
-	if exists && f.Through <= cur.through {
-		return res, integrityf("flush advance to %d does not advance the durable watermark %d", f.Through, cur.through)
+	// Monotonicity is PER LANE, because a lane is what a watermark is a
+	// statement about. The lanes are independently applicable by construction,
+	// so a data advance that lands while the namespace lane sits at a higher
+	// sequence is not a regression of anything — it is the point.
+	if exists && f.Through <= cur.mark(f.Lane).through {
+		return res, integrityf("flush advance of the %s lane to %d does not advance its durable watermark %d",
+			f.Lane, f.Through, cur.mark(f.Lane).through)
 	}
 	if !exists && len(st.ledger) >= MaxFlushEntries {
 		return res, capacityf("flush ledger exhausted (%d)", MaxFlushEntries)
@@ -587,7 +592,13 @@ func (st *State) applyFlushAdvance(tx *Txn, f *FlushAdvance, dry bool) (ApplyRes
 	if dry {
 		return res, nil
 	}
-	tx.setLedger(f.WritebackID, ledgerEntry{through: f.Through, digest: f.Digest, owner: f.Session})
+	next := cur
+	if !exists {
+		next = ledgerEntry{}
+	}
+	next = next.withMark(f.Lane, laneMark{through: f.Through, digest: f.Digest})
+	next.owner = f.Session
+	tx.setLedger(f.WritebackID, next)
 	return res, nil
 }
 

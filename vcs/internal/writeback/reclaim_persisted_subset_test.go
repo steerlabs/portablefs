@@ -241,7 +241,7 @@ func TestCloseOutReclaimSurvivesEveryPersistedUnlinkSubset(t *testing.T) {
 	// already durable in the tail segment (appliedBytes == 0), so the fast path
 	// cannot fit the RELEASE frames and barrier B must reclaim first.
 	budget := streamFootprint(t, probeDir)
-	if err := appendRecoveryReleaseCertificate(probeDir, scan, probeSeq, probeDigest,
+	if err := appendRecoveryReleaseCertificate(probeDir, scan, legacyStreamMark(probeSeq, probeDigest),
 		[]RebindScope{{Scope: "s0", Epoch: epoch}}, budget); err != nil {
 		t.Fatalf("probe close-out: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestCloseOutReclaimSurvivesEveryPersistedUnlinkSubset(t *testing.T) {
 			auth := newFakeAuthority()
 			seedLegacyGrants(auth, wbID, map[string]string{"s0": epoch})
 			auth.mu.Lock()
-			auth.streams[wbID] = &fakeStream{through: lastSeq, digest: digest}
+			auth.streams[wbID] = newFakeStreamAt(lastSeq, digest)
 			auth.mu.Unlock()
 
 			e, err := Open(context.Background(), Config{
@@ -339,7 +339,7 @@ func TestCheckpointReclaimSurvivesEveryPersistedUnlinkSubset(t *testing.T) {
 	template := filepath.Join(root, "template")
 	rec := &reclaimRecorder{onFirst: func() { copyDirFiles(t, streamDir, template) }}
 	rec.install(t)
-	if err := w.CheckpointAndReclaim(through, digest, func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(through, digest), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint and reclaim: %v", err)
 	}
 	_ = w.Close()

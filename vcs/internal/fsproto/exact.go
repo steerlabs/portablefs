@@ -386,6 +386,11 @@ func (s *Server) probeResponse(clientVersion int64) *Response {
 		// a reply observation, never stored state).
 		if s.coordStore() != nil {
 			resp.Features |= FeatureMutationAttrs
+			// Lane separation is a property of the managed coordination store's
+			// flush apply — per-lane watermark, per-lane chain, and the data
+			// batch's namespace dependency — so its presence is exactly the
+			// managed store's presence, on the same terms as the bit above.
+			resp.Features |= FeatureWritebackLanes
 		}
 	}
 	return resp

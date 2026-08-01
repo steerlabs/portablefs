@@ -106,9 +106,28 @@ func TestCredentialDeathIsNotUnreachabilityAndStopsTheProbe(t *testing.T) {
 	}
 
 	// Installing a fresh credential re-arms the probe: the verdict was about
-	// the credential, not about the mount.
+	// the credential, not about the mount. It clears only once the installed
+	// credential has actually been PROVED by a handshake — installation alone
+	// proves nothing (see TestInvalidReplacementCredentialStaysRejected).
+	c.SetAuthToken("the-only-valid-token")
 	c.CredentialInstalled()
-	if c.CredentialRejected() {
-		t.Fatal("a credential install must clear the previous credential's verdict")
+	if !waitFor(3*time.Second, func() bool { return !c.CredentialUnproven() }) {
+		t.Fatal("the installed credential was never proved by a handshake: " +
+			"installation must enter verification-pending and verify immediately")
 	}
+	if c.CredentialRejected() {
+		t.Fatal("installing a VALID credential did not clear the previous " +
+			"credential's verdict once its own handshake proved it")
+	}
+}
+
+func waitFor(d time.Duration, ok func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return ok()
 }

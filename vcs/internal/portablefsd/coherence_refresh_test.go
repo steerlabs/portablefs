@@ -142,42 +142,42 @@ func TestConsumeExpectedTruncate(t *testing.T) {
 	}
 
 	// No note: never consumed.
-	if a.consumeExpectedTruncate("f", request(7, 22)) {
+	if consumedInternal(a, "f", request(7, 22)) {
 		t.Fatal("consumed without a note")
 	}
 	// Matching size-only request consumes exactly once.
 	note("f", 7, 22, time.Minute)
-	if !a.consumeExpectedTruncate("f", request(7, 22)) {
+	if !consumedInternal(a, "f", request(7, 22)) {
 		t.Fatal("matching refresh truncate not consumed")
 	}
-	if a.consumeExpectedTruncate("f", request(7, 22)) {
+	if consumedInternal(a, "f", request(7, 22)) {
 		t.Fatal("note consumed twice")
 	}
 	// A mode-bearing setattr is a real application request even if size matches.
 	note("f", 7, 22, time.Minute)
 	withMode := request(7, 22)
 	withMode.Mode = &mode
-	if a.consumeExpectedTruncate("f", withMode) {
+	if consumedInternal(a, "f", withMode) {
 		t.Fatal("application setattr with mode was suppressed")
 	}
 	// Size mismatch: a REAL truncate races the note; it must pass through AND
 	// retire the note so it cannot suppress anything later.
-	if a.consumeExpectedTruncate("f", request(7, 7)) {
+	if consumedInternal(a, "f", request(7, 7)) {
 		t.Fatal("mismatched truncate was suppressed")
 	}
-	if a.consumeExpectedTruncate("f", request(7, 22)) {
+	if consumedInternal(a, "f", request(7, 22)) {
 		t.Fatal("note survived a mismatched truncate")
 	}
 	// Expired notes never match.
 	note("f", 7, 22, -time.Second)
-	if a.consumeExpectedTruncate("f", request(7, 22)) {
+	if consumedInternal(a, "f", request(7, 22)) {
 		t.Fatal("expired note consumed")
 	}
 	// A rename between secure open and ftruncate changes the current path but
 	// not the descriptor's FSItem identity. The moved marker must still be
 	// consumed so the refresh cannot mutate the item's new authority path.
 	note("old-name", 7, 22, time.Minute)
-	if !a.consumeExpectedTruncate("new-name", request(7, 22)) {
+	if !consumedInternal(a, "new-name", request(7, 22)) {
 		t.Fatal("renamed FSItem refresh note not consumed")
 	}
 }
@@ -192,7 +192,7 @@ func TestAppliedRefreshCannotLeaveConsumableTruncateMarker(t *testing.T) {
 		attr: fsproto.Attr{Kind: "file", Size: 8},
 	}
 	a.items[rec.item.ItemID] = rec
-	a.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(string, string, uint64, int64, func() func()) (kernelRefreshOutcome, error) {
 		// Models a vnode whose size already matches: no setattr callback
 		// consumes the marker, but page invalidation succeeds.
 		return kernelRefreshApplied, nil
@@ -200,7 +200,7 @@ func TestAppliedRefreshCannotLeaveConsumableTruncateMarker(t *testing.T) {
 	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 8); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("apply = (%v, %v)", outcome, err)
 	}
-	if a.consumeExpectedTruncate(rec.path, &pfslocal.SetAttrRequest{
+	if consumedInternal(a, rec.path, &pfslocal.SetAttrRequest{
 		Item: rec.item,
 		Size: func() *uint64 { value := uint64(8); return &value }(),
 	}) {
@@ -222,7 +222,7 @@ func TestUnrepresentableRefreshCannotMutateTruncateOrAttributeState(t *testing.T
 	a := &attach{
 		items:             map[uint64]*itemRecord{rec.item.ItemID: rec},
 		expectedTruncates: map[string]expectedTruncate{"sentinel": originalNote},
-		testRefreshKernelFile: func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+		testRefreshKernelFile: func(string, string, uint64, int64, func() func()) (kernelRefreshOutcome, error) {
 			t.Fatal("kernel refresh ran for an unrepresentable item")
 			return kernelRefreshApplied, nil
 		},
@@ -326,7 +326,7 @@ func TestQueuedRemoteRefreshSamplesNewDelegatedViewAtExecution(t *testing.T) {
 		},
 	}
 	a.items = map[uint64]*itemRecord{7: a.paths["d/f"]}
-	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64, _ func() func()) (kernelRefreshOutcome, error) {
 		expectedItemID, ok := fskitItemID(7)
 		if !ok {
 			t.Fatal("map expected FSKit item ID")
@@ -1210,7 +1210,7 @@ func TestRestartRestoredRegularAndSymlinkFlushAll(t *testing.T) {
 		},
 	})
 	var regularApplies atomic.Int32
-	a.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64, _ func() func()) (kernelRefreshOutcome, error) {
 		expectedItemID, ok := fskitItemID(fileAttr.Ino)
 		if !ok {
 			t.Fatal("map expected FSKit item ID")
@@ -1316,7 +1316,7 @@ func TestRelatedRetainedInodeCannotAckThroughReplacementPath(t *testing.T) {
 		authorityItems:    map[uint64]frontendItemIdentity{oldAttr.Ino: {item: oldItem, state: oldState}},
 		expectedTruncates: map[string]expectedTruncate{},
 	}
-	blocked.testRefreshKernelFile = func(string, string, uint64, int64) (kernelRefreshOutcome, error) {
+	blocked.testRefreshKernelFile = func(string, string, uint64, int64, func() func()) (kernelRefreshOutcome, error) {
 		t.Fatal("replacement pathname was applied to retained old vnode")
 		return kernelRefreshRetry, errors.New("unreachable")
 	}
@@ -1354,7 +1354,7 @@ func TestRelatedRetainedInodeCannotAckThroughReplacementPath(t *testing.T) {
 		expectedTruncates: map[string]expectedTruncate{},
 	}
 	var oldFlushApplied atomic.Bool
-	flushBlocked.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+	flushBlocked.testRefreshKernelFile = func(_ string, p string, itemID uint64, size int64, _ func() func()) (kernelRefreshOutcome, error) {
 		oldFSKitItemID, ok := fskitItemID(oldItem.ItemID)
 		if !ok {
 			t.Fatal("map old FSKit item ID")
@@ -1414,7 +1414,7 @@ func TestRelatedRetainedInodeCannotAckThroughReplacementPath(t *testing.T) {
 		authorityItems: map[uint64]frontendItemIdentity{oldAttr.Ino: {item: oldItem, state: oldState}},
 	}
 	applied := make(chan struct{}, 1)
-	resolved.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64) (kernelRefreshOutcome, error) {
+	resolved.testRefreshKernelFile = func(_ string, path string, itemID uint64, size int64, _ func() func()) (kernelRefreshOutcome, error) {
 		expectedItemID, ok := fskitItemID(oldItem.ItemID)
 		if !ok {
 			t.Fatal("map expected FSKit item ID")

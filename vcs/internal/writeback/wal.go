@@ -3,6 +3,7 @@ package writeback
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -101,12 +102,18 @@ const (
 	// field caps above plus each struct's fixed punctuation:
 	//
 	//	{"scope":"S","epoch":"E"}               23 + |S| + |E|
-	//	{"through":N,"digest":"D"}              24 + |N| + |D|
+	//	{"through":N,"digest":"D",...}          82 + 3|N| + 3|D|  (all lanes)
 	//	{"through":N,"jobId":"J","reason":"R"}  35 + |N| + |J| + |R|
 	//
 	// These are the terms the control reserve's arithmetic is written in.
+	//
+	// The APPLIED shape carries the LEGACY pair plus one pair per lane, each
+	// omitted when its lane has applied nothing — so a legacy stream's
+	// certificate is byte-for-byte the frame it always was, and the bound below
+	// is the all-lanes worst case (82 bytes of keys and punctuation rounded up
+	// to 96 for headroom).
 	maxDelegationPayload = 23 + jsonEscapeFactor*(maxScopeBytes+maxEpochBytes)
-	maxAppliedPayload    = 24 + maxUint64Digits + maxDigestBytes
+	maxAppliedPayload    = 96 + 3*maxUint64Digits + 3*maxDigestBytes
 	maxClosePayload      = 35 + maxUint64Digits + jsonEscapeFactor*(maxJobIDBytes+maxReasonBytes)
 )
 
@@ -167,9 +174,28 @@ type delegationFrame struct {
 	Epoch string `json:"epoch"`
 }
 
+// appliedFrame is the durable APPLIED certificate: the GLOBAL sequence prefix
+// the authority has made durable, together with every lane's own watermark and
+// chain digest at that same point.
+//
+// Through is a global sequence because that is what reclamation is a statement
+// about — a segment is retired when every record it holds is applied, and a
+// segment holds records of both lanes. The per-lane pairs are what recovery
+// needs, and they cannot be recomputed once the prefix they cover is reclaimed,
+// which is exactly why the legacy pair was recorded here in the first place.
+//
+// A pre-round-7 certificate carries only Through/Digest and decodes with the
+// lane fields zero — the correct reading of a stream that never left the legacy
+// era. A certificate written after the boundary carries the frozen legacy pair
+// unchanged plus the live lanes.
 type appliedFrame struct {
 	Through uint64 `json:"through"`
-	Digest  string `json:"digest"` // hex chain digest at Through
+	Digest  string `json:"digest"` // hex legacy chain digest at Through
+	// Per-lane watermark + hex chain digest, omitted while the lane is empty.
+	NSThrough   uint64 `json:"nsThrough,omitempty"`
+	NSDigest    string `json:"nsDigest,omitempty"`
+	DataThrough uint64 `json:"dataThrough,omitempty"`
+	DataDigest  string `json:"dataDigest,omitempty"`
 }
 
 type closeFrame struct {
@@ -189,10 +215,77 @@ func (f delegationFrame) validate() error {
 }
 
 func (f appliedFrame) validate() error {
-	if len(f.Digest) > maxDigestBytes {
-		return fmt.Errorf("writeback: applied digest of %d bytes exceeds the %d-byte control-frame bound", len(f.Digest), maxDigestBytes)
+	for _, d := range []string{f.Digest, f.NSDigest, f.DataDigest} {
+		if len(d) > maxDigestBytes {
+			return fmt.Errorf("writeback: applied digest of %d bytes exceeds the %d-byte control-frame bound", len(d), maxDigestBytes)
+		}
 	}
 	return nil
+}
+
+// mark reconstructs the typed stream position an APPLIED certificate records.
+func (f appliedFrame) mark() (streamMark, error) {
+	m := streamMark{global: f.Through}
+	parse := func(lane StreamLane, through uint64, hexDigest string) error {
+		if through == 0 && hexDigest == "" {
+			return nil
+		}
+		raw, err := hex.DecodeString(hexDigest)
+		if err != nil || len(raw) != 32 {
+			return fmt.Errorf("%w: APPLIED certificate carries a malformed %s digest", ErrCorrupt, lane)
+		}
+		var d [32]byte
+		copy(d[:], raw)
+		m.lanes[lane] = laneMark{through: through, digest: d}
+		return nil
+	}
+	if err := parse(StreamLaneLegacy, f.Through, f.Digest); err != nil {
+		return streamMark{}, err
+	}
+	if err := parse(StreamLaneNamespace, f.NSThrough, f.NSDigest); err != nil {
+		return streamMark{}, err
+	}
+	if err := parse(StreamLaneData, f.DataThrough, f.DataDigest); err != nil {
+		return streamMark{}, err
+	}
+	return m, nil
+}
+
+// laneMark is one lane's durable position: its dense lane sequence and the
+// chained payload digest at it.
+type laneMark struct {
+	through uint64
+	digest  [32]byte
+}
+
+// streamMark is the whole stream's applied position: the GLOBAL sequence prefix
+// that is applied (what segment reclamation is a statement about) plus each
+// lane's own watermark and chain digest at that same point.
+type streamMark struct {
+	global uint64
+	lanes  [streamLaneCount]laneMark
+}
+
+// legacyStreamMark is the position of a stream that has never left the legacy
+// era: one lane, whose watermark IS the global sequence.
+func legacyStreamMark(through uint64, digest [32]byte) streamMark {
+	m := streamMark{global: through}
+	m.lanes[StreamLaneLegacy] = laneMark{through: through, digest: digest}
+	return m
+}
+
+// frame renders the mark as the certificate payload.
+func (m streamMark) appliedFrame() appliedFrame {
+	hexOf := func(l laneMark) string {
+		if l.through == 0 {
+			return ""
+		}
+		return fmt.Sprintf("%x", l.digest)
+	}
+	f := appliedFrame{Through: m.global, Digest: fmt.Sprintf("%x", m.lanes[StreamLaneLegacy].digest)}
+	f.NSThrough, f.NSDigest = m.lanes[StreamLaneNamespace].through, hexOf(m.lanes[StreamLaneNamespace])
+	f.DataThrough, f.DataDigest = m.lanes[StreamLaneData].through, hexOf(m.lanes[StreamLaneData])
+	return f
 }
 
 func (f closeFrame) validate() error {
@@ -282,6 +375,14 @@ func digestNext(prev [32]byte, seq uint64, payload []byte) [32]byte {
 	return out
 }
 
+// segmentLaneBase is where the per-lane sequence bases live inside the 4096-byte
+// segment header: a region every version of this format has written as zeros
+// and covered by the header CRC, far past the identity strings (68 + 1024 + 255
+// at the very most). Placing them here keeps format version 1 valid for a
+// pre-round-7 header, whose all-zero region is exactly the statement "this
+// segment predates lanes".
+const segmentLaneBase = 3072
+
 // segmentHeader identifies one segment within a stream.
 type segmentHeader struct {
 	MountID    [16]byte
@@ -290,8 +391,15 @@ type segmentHeader struct {
 	WALEpoch   uint64
 	Ordinal    uint64
 	FirstFrame uint64 // dense physical frame number of the first frame
-	FirstSeq   uint64 // first mutation sequence that may appear
+	FirstSeq   uint64 // first GLOBAL mutation sequence that may appear
 	CreatedMs  int64
+	// FirstLaneSeq[i] is the LANE sequence the first frame of lane i in this
+	// segment would receive. It is what makes a reclaimed prefix survivable
+	// per-lane: the lane sequence is derived by counting frames, and a segment
+	// whose predecessors were deleted has to be told where its lane counters
+	// stood. All zero means a pre-round-7 header, whose only lane is the legacy
+	// one and whose base is therefore FirstSeq.
+	FirstLaneSeq [streamLaneCount]uint64
 }
 
 func encodeSegmentHeader(h segmentHeader) ([]byte, error) {
@@ -312,6 +420,9 @@ func encodeSegmentHeader(h segmentHeader) ([]byte, error) {
 	off := 68
 	off += copy(buf[off:], h.VolumeID)
 	copy(buf[off:], h.Branch)
+	for i, base := range h.FirstLaneSeq {
+		binary.BigEndian.PutUint64(buf[segmentLaneBase+8*i:segmentLaneBase+8*i+8], base)
+	}
 	crc := crc32.Checksum(buf[:segmentHeaderSize-4], crcTable)
 	binary.BigEndian.PutUint32(buf[segmentHeaderSize-4:], crc)
 	return buf, nil
@@ -339,11 +450,23 @@ func decodeSegmentHeader(buf []byte) (segmentHeader, error) {
 	h.CreatedMs = int64(binary.BigEndian.Uint64(buf[56:64]))
 	vl := int(binary.BigEndian.Uint16(buf[64:66]))
 	bl := int(binary.BigEndian.Uint16(buf[66:68]))
-	if 68+vl+bl > segmentHeaderSize-4 {
+	// The identity strings must stay clear of the lane-base region. The encoder
+	// has always capped them at 1024+255 bytes, so no header ever written can
+	// reach it; tightening the bound here makes that a decoded FACT rather than
+	// a property of the writer.
+	if 68+vl+bl > segmentLaneBase {
 		return h, fmt.Errorf("%w: segment identity overflows header", ErrCorrupt)
 	}
 	h.VolumeID = string(buf[68 : 68+vl])
 	h.Branch = string(buf[68+vl : 68+vl+bl])
+	for i := range h.FirstLaneSeq {
+		h.FirstLaneSeq[i] = binary.BigEndian.Uint64(buf[segmentLaneBase+8*i : segmentLaneBase+8*i+8])
+	}
+	if h.FirstLaneSeq == ([streamLaneCount]uint64{}) {
+		// A pre-round-7 header: its only lane is the legacy one and its base is
+		// the global sequence base, which is the same number.
+		h.FirstLaneSeq[StreamLaneLegacy] = h.FirstSeq
+	}
 	return h, nil
 }
 
@@ -351,11 +474,26 @@ func decodeSegmentHeader(buf []byte) (segmentHeader, error) {
 type frame struct {
 	typ     frameType
 	frameNo uint64
-	seq     uint64 // mutation sequence; zero for control frames
+	seq     uint64 // GLOBAL mutation sequence; zero for control frames
 	payload []byte
 	// ordinal/payloadOff locate the payload on disk for extent references.
 	ordinal    uint64
 	payloadOff int64
+
+	// lane is the stream lane this mutation belongs to, read from the frame
+	// header. StreamLaneLegacy on every frame written before the boundary and
+	// on every control frame.
+	lane StreamLane
+	// laneSeq is the frame's DENSE sequence WITHIN its lane, derived by
+	// counting: the WAL's physical order is the only place a lane sequence is
+	// recorded, which is what makes it dense by construction and impossible to
+	// disagree with the frames it numbers.
+	laneSeq uint64
+	// nsRequired is a DATA-lane frame's namespace dependency: the number of
+	// namespace-lane frames that precede it in this WAL. Derived the same way,
+	// for the same reason — the physical order IS the dependency record, so it
+	// costs no bytes and cannot drift from what it describes.
+	nsRequired uint64
 }
 
 func frameLen(payloadLen int) int64 {
@@ -366,7 +504,14 @@ func frameLen(payloadLen int) int64 {
 	return n
 }
 
-func encodeFrame(dst []byte, typ frameType, frameNo, seq uint64, payload []byte) []byte {
+// encodeFrame writes one frame. The LANE TAG lives in header byte 6 — a byte
+// that has always been written as zero and has always been covered by the
+// header CRC, so a laned frame is a well-formed PFW5 frame whose lane a
+// pre-round-7 reader would silently read as legacy. That reader is never asked
+// to: forward compatibility is not part of the contract (the contract is that
+// THIS build finishes ANY older WAL), and the boundary rule below guarantees a
+// stream only starts writing laned frames once every unlaned record is applied.
+func encodeFrame(dst []byte, typ frameType, lane StreamLane, frameNo, seq uint64, payload []byte) []byte {
 	start := len(dst)
 	total := frameLen(len(payload))
 	dst = append(dst, make([]byte, total)...)
@@ -374,6 +519,7 @@ func encodeFrame(dst []byte, typ frameType, frameNo, seq uint64, payload []byte)
 	copy(buf[0:4], frameMagic[:])
 	buf[4] = 1 // frame version
 	buf[5] = byte(typ)
+	buf[6] = byte(lane)
 	binary.BigEndian.PutUint64(buf[8:16], frameNo)
 	binary.BigEndian.PutUint64(buf[16:24], seq)
 	binary.BigEndian.PutUint32(buf[24:28], uint32(len(payload)))
@@ -415,8 +561,23 @@ type streamWAL struct {
 	active    *os.File
 	files     map[uint64]*os.File // open segment fds by ordinal (reads)
 	nextFrame uint64
-	lastSeq   uint64
-	digest    [32]byte // chain digest at lastSeq
+	lastSeq   uint64   // GLOBAL dense mutation sequence across every lane
+	digest    [32]byte // LEGACY-lane chain digest (== lanes[0].digest)
+
+	// lanes holds each lane's dense sequence and chain digest. The legacy lane
+	// mirrors lastSeq/digest while the stream is pre-boundary and freezes at the
+	// boundary; the namespace and data lanes start at zero/digestZero and run
+	// independently from there.
+	//
+	// The GLOBAL sequence keeps running across both lanes because it is the
+	// local identity of a record — extents reference it, segment reclamation
+	// compares against it, and the applied checkpoint is a prefix of it. Only
+	// the AUTHORITY-facing sequence is per-lane, and that is the only thing lane
+	// separation needed to change.
+	lanes [streamLaneCount]laneMark
+	// laned records that the boundary has been crossed: from the first laned
+	// mutation on, an unlaned mutation is a programming error, not a fallback.
+	laned bool
 
 	// liveDelegations is the control-frame projection for grants that have
 	// been installed but not released. Rotation re-emits this set into the new
@@ -476,6 +637,9 @@ func createStreamWAL(dir string, mountID [16]byte, volumeID, branch string, epoc
 		liveDelegations: map[string]liveGrant{},
 		digest:          digestZero(),
 	}
+	for i := range w.lanes {
+		w.lanes[i].digest = digestZero()
+	}
 	if err := w.openSegmentLocked(1, 1, 1); err != nil {
 		return nil, err
 	}
@@ -493,6 +657,9 @@ func (w *streamWAL) openSegmentLocked(ordinal, firstFrame, firstSeq uint64) erro
 		WALEpoch: w.epoch, Ordinal: ordinal,
 		FirstFrame: firstFrame, FirstSeq: firstSeq,
 		CreatedMs: time.Now().UnixMilli(),
+	}
+	for i := range h.FirstLaneSeq {
+		h.FirstLaneSeq[i] = w.lanes[i].through + 1
 	}
 	buf, err := encodeSegmentHeader(h)
 	if err != nil {
@@ -527,12 +694,17 @@ type appendResult struct {
 	ordinal    uint64
 	payloadOff int64
 	payloadLen int
-	digest     [32]byte // chain digest AFTER this record
+	digest     [32]byte // LANE chain digest AFTER this record
+	// lane/laneSeq are the record's authority-facing identity; nsRequired is a
+	// data record's namespace dependency at admission.
+	lane       StreamLane
+	laneSeq    uint64
+	nsRequired uint64
 }
 
-// appendMutations appends one syscall's mutation records all-or-nothing:
-// a partial append is truncated before any acknowledgment. Sequences are
-// assigned densely from lastSeq+1. Returns per-record placements.
+// appendMutations appends one syscall's mutation records all-or-nothing to the
+// LEGACY lane: a partial append is truncated before any acknowledgment.
+// Sequences are assigned densely from lastSeq+1. Returns per-record placements.
 func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
 	return w.appendMutationsWithin(payloads, 0)
 }
@@ -555,6 +727,28 @@ func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
 // saturated mutation lane always leaves the lifecycle control frames it cannot
 // refuse enough room to land inside the same cap (controlReserveLocked).
 func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]appendResult, error) {
+	return w.appendLaneMutationsWithin(payloads, budget, StreamLaneLegacy)
+}
+
+// appendLaneMutationsWithin is appendMutationsWithin into an explicit lane.
+//
+// The GLOBAL sequence and the physical frame numbering are unchanged and
+// continue across both lanes: they are the record's LOCAL identity (extent
+// references, segment reclamation, the applied prefix) and nothing about lane
+// separation needed them to change. What the lane adds is a second, dense,
+// AUTHORITY-facing sequence and a second chain, so the authority can verify and
+// advance one lane without seeing the other.
+//
+// THE BOUNDARY. A stream is in the legacy era until the first laned mutation is
+// appended; from that frame on it is in the laned era and an unlaned mutation is
+// refused outright. The caller (Engine.openLanedEraLocked) only crosses the
+// boundary once every unlaned record is authority-applied, so the legacy chain
+// is complete at the instant it freezes and the two lanes each start from
+// digestZero with nothing outstanding behind them.
+func (w *streamWAL) appendLaneMutationsWithin(payloads [][]byte, budget int64, lane StreamLane) ([]appendResult, error) {
+	if lane >= streamLaneCount {
+		return nil, fmt.Errorf("writeback: append into unknown stream lane %d", uint8(lane))
+	}
 	if budget > 0 {
 		// Budgeted admissions serialize across the whole append, including the
 		// rotation window where rotateIfNeededLocked releases w.mu to wait on
@@ -574,6 +768,13 @@ func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]ap
 	}
 	if w.syncErr != nil {
 		return nil, w.syncErr
+	}
+	if lane == StreamLaneLegacy && w.laned {
+		// The boundary is one-way. A stream that has written a laned frame has
+		// two live chains and a frozen legacy one; appending an unlaned record
+		// after that would put a record in no lane's chain at all, which no
+		// authority and no recovery could place.
+		return nil, fmt.Errorf("writeback: unlaned append after the stream's lane boundary")
 	}
 	for _, p := range payloads {
 		if len(p) > maxMutationPayload {
@@ -606,18 +807,29 @@ func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]ap
 	results := make([]appendResult, 0, len(payloads))
 	seq := w.lastSeq
 	fno := w.nextFrame
-	digest := w.digest
+	laneSeq := w.lanes[lane].through
+	digest := w.lanes[lane].digest
+	nsRequired := w.lanes[StreamLaneNamespace].through
 	for _, p := range payloads {
 		seq++
 		fno++
-		digest = digestNext(digest, seq, p)
+		laneSeq++
+		// The chain is over the LANE sequence, so a record moved between lanes
+		// — or replayed under the other lane's watermark — does not link. That
+		// is what makes cross-lane tampering a digest contradiction rather than
+		// a silently accepted reordering.
+		digest = digestNext(digest, laneSeq, p)
 		results = append(results, appendResult{
 			seq: seq, ordinal: seg.ordinal,
 			payloadOff: startSize + int64(len(buf)) + frameHeaderSize,
 			payloadLen: len(p),
 			digest:     digest,
+			lane:       lane, laneSeq: laneSeq,
 		})
-		buf = encodeFrame(buf, frameMutation, fno, seq, p)
+		if lane == StreamLaneData {
+			results[len(results)-1].nsRequired = nsRequired
+		}
+		buf = encodeFrame(buf, frameMutation, lane, fno, seq, p)
 	}
 	if err := w.writeActiveLocked(buf, startSize); err != nil {
 		return nil, err
@@ -627,7 +839,12 @@ func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]ap
 	seg.lastFrame = fno
 	w.lastSeq = seq
 	w.nextFrame = fno
-	w.digest = digest
+	w.lanes[lane] = laneMark{through: laneSeq, digest: digest}
+	if lane == StreamLaneLegacy {
+		w.digest = digest
+	} else {
+		w.laned = true
+	}
 	return results, nil
 }
 
@@ -677,14 +894,11 @@ func (w *streamWAL) appendControlWithin(typ frameType, v any, budget int64) erro
 // Recovery can therefore use the APPLIED certificate when Checkin committed
 // but its reply was lost and the authority has already retired the stream
 // ledger. No mutation may be admitted under scope after this operation.
-func (w *streamWAL) recordDrainedRelease(scope, epoch string, through uint64, digest [32]byte) error {
+func (w *streamWAL) recordDrainedRelease(scope, epoch string, mark streamMark) error {
 	if scope == "" || epoch == "" {
 		return errors.New("writeback: invalid drained release")
 	}
-	appliedPayload, err := encodeControlPayload(appliedFrame{
-		Through: through,
-		Digest:  fmt.Sprintf("%x", digest),
-	})
+	appliedPayload, err := encodeControlPayload(mark.appliedFrame())
 	if err != nil {
 		return err
 	}
@@ -701,11 +915,24 @@ func (w *streamWAL) recordDrainedRelease(scope, epoch string, through uint64, di
 	if w.syncErr != nil {
 		return w.syncErr
 	}
-	if through > w.lastSeq {
-		return fmt.Errorf("writeback: drained release watermark %d is past WAL tail %d", through, w.lastSeq)
+	if mark.global > w.lastSeq {
+		return fmt.Errorf("writeback: drained release watermark %d is past WAL tail %d", mark.global, w.lastSeq)
 	}
-	if through == w.lastSeq && digest != w.digest {
-		return errors.New("writeback: drained release digest does not match WAL tail")
+	// A certificate that claims the WHOLE tail must agree with the WAL's own
+	// chains, lane by lane. Checking only the legacy pair would let a laned
+	// stream record a tail digest for a chain that stopped advancing.
+	//
+	// A lane that has applied NOTHING is exempt from the digest half: "the
+	// chain digest at watermark zero" is a constant, not an absence, and a
+	// caller may legitimately spell it either as that constant or as the zero
+	// value. Only the watermark distinguishes those two, and it is checked.
+	if mark.global == w.lastSeq {
+		for lane := range w.lanes {
+			got, want := w.lanes[lane], mark.lanes[lane]
+			if got.through != want.through || (got.through != 0 && got.digest != want.digest) {
+				return fmt.Errorf("writeback: drained release %s-lane certificate does not match WAL tail", StreamLane(lane))
+			}
+		}
 	}
 	// Rotate at most once before constructing the pair. Writing both encoded
 	// frames in one WriteAt means a partial write truncates both, and neither
@@ -715,8 +942,8 @@ func (w *streamWAL) recordDrainedRelease(scope, epoch string, through uint64, di
 	}
 	seg := &w.segments[len(w.segments)-1]
 	firstFrame := w.nextFrame + 1
-	buf := encodeFrame(nil, frameApplied, firstFrame, 0, appliedPayload)
-	buf = encodeFrame(buf, frameRelease, firstFrame+1, 0, releasePayload)
+	buf := encodeFrame(nil, frameApplied, StreamLaneLegacy, firstFrame, 0, appliedPayload)
+	buf = encodeFrame(buf, frameRelease, StreamLaneLegacy, firstFrame+1, 0, releasePayload)
 	if err := w.writeActiveLocked(buf, seg.size); err != nil {
 		return err
 	}
@@ -750,7 +977,7 @@ func (w *streamWAL) appendControlLocked(typ frameType, payload []byte) error {
 func (w *streamWAL) writeControlLocked(typ frameType, payload []byte) error {
 	seg := &w.segments[len(w.segments)-1]
 	fno := w.nextFrame + 1
-	buf := encodeFrame(nil, typ, fno, 0, payload)
+	buf := encodeFrame(nil, typ, StreamLaneLegacy, fno, 0, payload)
 	if err := w.writeActiveLocked(buf, seg.size); err != nil {
 		return err
 	}
@@ -1053,12 +1280,13 @@ var (
 // failure returns the error with every segment intact (and latches syncErr,
 // so later appends fail loudly instead of acknowledging onto a broken log).
 // A call with nothing reclaimable is a no-op (no checkpoint spam).
-func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned func(ordinal uint64) bool) error {
+func (w *streamWAL) CheckpointAndReclaim(mark streamMark, pinned func(ordinal uint64) bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return errors.New("writeback: wal closed")
 	}
+	through := mark.global
 	var reclaimable int64
 	for i := 0; i < len(w.segments)-1; i++ {
 		seg := w.segments[i]
@@ -1066,7 +1294,7 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 			reclaimable += seg.size
 		}
 	}
-	payload, err := encodeControlPayload(appliedFrame{Through: through, Digest: fmt.Sprintf("%x", digest)})
+	payload, err := encodeControlPayload(mark.appliedFrame())
 	if err != nil {
 		return err
 	}
@@ -1269,6 +1497,38 @@ func (w *streamWAL) Digest() [32]byte {
 	return w.digest
 }
 
+// Lanes reports every lane's tail (sequence + chain digest).
+func (w *streamWAL) Lanes() [streamLaneCount]laneMark {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lanes
+}
+
+// Tail is the WAL's full position: the global sequence and every lane's tail.
+// It is what a certificate claiming the whole tail must equal.
+func (w *streamWAL) Tail() streamMark {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return streamMark{global: w.lastSeq, lanes: w.lanes}
+}
+
+// Laned reports whether this stream has crossed its lane boundary.
+func (w *streamWAL) Laned() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.laned
+}
+
+// markLaned crosses the stream's lane boundary. It is idempotent, and from here
+// on an unlaned mutation append is refused: the era is one-way by construction,
+// not by convention. The caller (Engine.openLanedEraLocked) owns the conditions
+// under which crossing is safe.
+func (w *streamWAL) markLaned() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.laned = true
+}
+
 func (w *streamWAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1343,6 +1603,14 @@ type streamScan struct {
 	// (fully reclaimed prefix; zero for a fresh stream).
 	lastSeq   uint64
 	truncated bool // a torn tail was discarded
+	// laneCounts is how many retained frames each lane holds; laneFirst is the
+	// first RETAINED lane sequence per lane (0 = none retained). Both are
+	// derived by counting frames during the scan, which is also how the lane
+	// sequence itself is assigned at append time — the two cannot disagree.
+	laneCounts [streamLaneCount]uint64
+	laneFirst  [streamLaneCount]uint64
+	// laned records that the retained frames include a laned mutation.
+	laned bool
 }
 
 // scanStream reads and validates every segment of a stream directory.
@@ -1374,6 +1642,7 @@ func scanStreamWithTailRepair(dir string, repairTornTail bool) (*streamScan, err
 	scan := &streamScan{}
 	var prev *segmentHeader
 	var frameNo, lastSeq uint64
+	var laneSeq [streamLaneCount]uint64
 	for i, name := range names {
 		buf, err := os.ReadFile(name)
 		if err != nil {
@@ -1388,10 +1657,17 @@ func scanStreamWithTailRepair(dir string, repairTornTail bool) (*streamScan, err
 		}
 		if prev == nil {
 			// The first retained segment establishes the dense frame and
-			// mutation-sequence bases (earlier segments were reclaimed whole).
+			// mutation-sequence bases (earlier segments were reclaimed whole) —
+			// per LANE as well as globally, which is the only way a reclaimed
+			// prefix keeps its lane numbering.
 			scan.header = h
 			frameNo = h.FirstFrame - 1
 			lastSeq = h.FirstSeq - 1
+			for l := range laneSeq {
+				if h.FirstLaneSeq[l] > 0 {
+					laneSeq[l] = h.FirstLaneSeq[l] - 1
+				}
+			}
 		} else {
 			if h.Ordinal != prev.Ordinal+1 || h.WALEpoch != prev.WALEpoch || h.MountID != prev.MountID {
 				return nil, fmt.Errorf("%w: segment chain broken at %s", ErrCorrupt, filepath.Base(name))
@@ -1405,11 +1681,20 @@ func scanStreamWithTailRepair(dir string, repairTornTail bool) (*streamScan, err
 			if h.FirstSeq != lastSeq+1 {
 				return nil, fmt.Errorf("%w: segment %s first sequence %d does not continue %d", ErrCorrupt, filepath.Base(name), h.FirstSeq, lastSeq)
 			}
+			// A lane base of zero is a pre-round-7 header's silence about a lane
+			// that cannot exist in it; every base a writer actually chose must
+			// continue the counters this scan has been maintaining.
+			for l := range laneSeq {
+				if h.FirstLaneSeq[l] != 0 && h.FirstLaneSeq[l] != laneSeq[l]+1 {
+					return nil, fmt.Errorf("%w: segment %s %s-lane base %d does not continue %d",
+						ErrCorrupt, filepath.Base(name), StreamLane(l), h.FirstLaneSeq[l], laneSeq[l])
+				}
+			}
 		}
 		hCopy := h
 		prev = &hCopy
 		last := i == len(names)-1
-		validEnd, err := scanSegmentFrames(scan, buf, h.Ordinal, &frameNo, &lastSeq, last)
+		validEnd, err := scanSegmentFrames(scan, buf, h.Ordinal, &frameNo, &lastSeq, &laneSeq, last)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", filepath.Base(name), err)
 		}
@@ -1452,7 +1737,7 @@ var errTornTail = errors.New("torn frame at physical EOF")
 // of the end of the last valid frame. A physically short final frame in the
 // LAST segment is a torn tail (valid end returned short); every other
 // invalid frame — anywhere, including the final one — is corruption.
-func scanSegmentFrames(scan *streamScan, buf []byte, ordinal uint64, frameNo, lastSeq *uint64, lastSegment bool) (int64, error) {
+func scanSegmentFrames(scan *streamScan, buf []byte, ordinal uint64, frameNo, lastSeq *uint64, laneSeq *[streamLaneCount]uint64, lastSegment bool) (int64, error) {
 	off := int64(segmentHeaderSize)
 	for {
 		if off == int64(len(buf)) {
@@ -1472,12 +1757,32 @@ func scanSegmentFrames(scan *streamScan, buf []byte, ordinal uint64, frameNo, la
 			if f.seq != *lastSeq+1 {
 				return off, fmt.Errorf("%w: mutation sequence %d does not continue %d", ErrCorrupt, f.seq, *lastSeq)
 			}
+			if f.lane == StreamLaneLegacy && scan.laned {
+				// The boundary is one-way, so an unlaned record after a laned
+				// one is a stream no reader can place. Fail closed rather than
+				// guess which chain it belongs to.
+				return off, fmt.Errorf("%w: unlaned mutation %d follows the stream's lane boundary", ErrCorrupt, f.seq)
+			}
+			if f.lane != StreamLaneLegacy {
+				scan.laned = true
+			}
+			laneSeq[f.lane]++
+			f.laneSeq = laneSeq[f.lane]
+			if f.lane == StreamLaneData {
+				f.nsRequired = laneSeq[StreamLaneNamespace]
+			}
 			if scan.firstSeq == 0 {
 				scan.firstSeq = f.seq
 			}
+			if scan.laneFirst[f.lane] == 0 {
+				scan.laneFirst[f.lane] = f.laneSeq
+			}
+			scan.laneCounts[f.lane]++
 			*lastSeq = f.seq
 		} else if f.seq != 0 {
 			return off, fmt.Errorf("%w: control frame %d carries mutation sequence %d", ErrCorrupt, f.frameNo, f.seq)
+		} else if f.lane != StreamLaneLegacy {
+			return off, fmt.Errorf("%w: control frame %d carries lane tag %d", ErrCorrupt, f.frameNo, uint8(f.lane))
 		}
 		scan.frames = append(scan.frames, f)
 		off += fLen
@@ -1502,6 +1807,13 @@ func decodeFrameAt(buf []byte, off int64, wantFrameNo uint64) (frame, int64, err
 	f.typ = frameType(h[5])
 	if !validFrameType(f.typ) {
 		return f, 0, fmt.Errorf("unknown frame type %d", f.typ)
+	}
+	f.lane = StreamLane(h[6])
+	if f.lane >= streamLaneCount {
+		return f, 0, fmt.Errorf("unknown stream lane %d", uint8(f.lane))
+	}
+	if h[7] != 0 {
+		return f, 0, fmt.Errorf("nonzero reserved frame-header byte")
 	}
 	f.frameNo = binary.BigEndian.Uint64(h[8:16])
 	if f.frameNo != wantFrameNo {

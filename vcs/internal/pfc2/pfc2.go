@@ -404,24 +404,82 @@ type OutcomeFloor struct {
 	Through uint64
 }
 
-// FlushAdvance (kind 6) advances one mount write-back stream's durable
-// watermark: writebackID -> (throughSequence, streamDigest), strictly
-// monotonic per stream and surviving session-generation rebinds. It rides
-// the SAME atomic outer batch as the flushed user PFR1 records. The named
+// StreamLane names one independently-applicable lane of a mount write-back
+// stream. A lane owns its OWN dense sequence, its own chained digest, and its
+// own durable watermark, so one lane's watermark advances without waiting on
+// the other's backlog.
+//
+// The lanes are not symmetric and the asymmetry is the whole design:
+//
+//   - StreamLaneNamespace carries create/mkdir/link/symlink/rename/remove/
+//     setattr/xattr/truncate. It is small, ships eagerly, and depends on
+//     NOTHING outside itself.
+//   - StreamLaneData carries bulk write payloads. A data record may depend on
+//     namespace state (the create of its inode), so every data flush names the
+//     namespace watermark it requires and the authority refuses to apply it
+//     before that watermark is durable. The reverse dependency does not exist
+//     by construction — see the lane-routing rule in writeback/engine.go, which
+//     keeps a namespace record that WOULD have needed applied bulk data in the
+//     data lane instead.
+//   - StreamLaneLegacy is the single total-order stream every pre-round-7 WAL
+//     is written in. It is not a fallback for new writes: a stream leaves it
+//     exactly once, at the upgrade boundary, and never returns.
+type StreamLane uint8
+
+const (
+	StreamLaneLegacy    StreamLane = 0
+	StreamLaneNamespace StreamLane = 1
+	StreamLaneData      StreamLane = 2
+
+	// StreamLaneCount bounds the lane tag: a value outside it is malformed,
+	// never a lane this build does not know about. Lanes are a closed set
+	// because each one is a durable watermark the authority must be able to
+	// name; an unknown lane is an unnameable watermark.
+	StreamLaneCount = 3
+)
+
+// Valid reports whether l names a lane of the write-back stream.
+func (l StreamLane) Valid() bool { return l < StreamLaneCount }
+
+func (l StreamLane) String() string {
+	switch l {
+	case StreamLaneLegacy:
+		return "legacy"
+	case StreamLaneNamespace:
+		return "namespace"
+	case StreamLaneData:
+		return "data"
+	default:
+		return "invalid"
+	}
+}
+
+// FlushAdvance (kind 6) advances one LANE of one mount write-back stream's
+// durable watermark: (writebackID, lane) -> (throughSequence, streamDigest),
+// strictly monotonic per lane and surviving session-generation rebinds. It
+// rides the SAME atomic outer batch as the flushed user PFR1 records. The named
 // checkout (path, epoch) is the live delegation grant covering the flushed
 // record — held by the same session and bound to the same stream — so a
 // delayed flush after release/transfer is ESTALE even if the path later
 // becomes free.
+//
+// Lane is the round-7 addition and it is deliberately a field on the record
+// rather than a suffix on WritebackID: the stream id is the grant's recovery
+// capability and must keep meaning exactly one stream. A record without the
+// field decodes as StreamLaneLegacy, which is precisely what every journal row
+// written before round 7 is.
 type FlushAdvance struct {
 	Session       SessionRef
 	WritebackID   string
 	CheckoutPath  string
 	CheckoutEpoch Epoch
 	Through       uint64
-	// Digest is the chained mutation-stream digest at Through. The client
-	// maintains the identical chain over its WAL; recovery rebinds only on
-	// an exact match.
+	// Digest is the chained mutation-stream digest at Through, within Lane.
+	// The client maintains the identical per-lane chain over its WAL; recovery
+	// rebinds only on an exact match.
 	Digest [DigestBytes]byte
+	// Lane names which of the stream's watermarks this record advances.
+	Lane StreamLane
 }
 
 // LockChange (kind 7) applies one granted POSIX byte-range transition keyed
@@ -745,6 +803,9 @@ func (r *Record) Validate() error {
 		}
 		if f.Digest == ([DigestBytes]byte{}) {
 			return malformedf("flush advance: all-zero stream digest is never a canonical chain value")
+		}
+		if !f.Lane.Valid() {
+			return malformedf("flush advance: lane %d is not a stream lane", uint8(f.Lane))
 		}
 	case KindLockChange:
 		l := r.LockChange

@@ -128,10 +128,16 @@ func (c *Client) SetOwner(owner string) { c.owner = owner }
 // which the old `c.authSource = nil` did on any RenewCredential — was a bug (it silently disabled the
 // rotating source). SetAuthToken now only updates the static FALLBACK used when no source is installed;
 // tokenForHandshake still prefers the source. Configure exactly one of source/token at startup.
+// Changing the credential opens a new UNPROVEN generation: any latched verdict
+// was about the predecessor, and the successor is untested until a handshake
+// offers it. (CredentialInstalled is the entry point that also runs that
+// handshake immediately; this one only keeps the bookkeeping honest for callers
+// that renew the token without asking for verification.)
 func (c *Client) SetAuthToken(tok string) {
 	c.authMu.Lock()
 	c.authToken = tok
 	c.authMu.Unlock()
+	c.health.installCredential()
 }
 
 // SetAuthTokenSource installs a callback used for future connection handshakes. It lets a mount or
@@ -140,6 +146,7 @@ func (c *Client) SetAuthTokenSource(fn func() string) {
 	c.authMu.Lock()
 	c.authSource = fn
 	c.authMu.Unlock()
+	c.health.installCredential()
 }
 
 func (c *Client) tokenForHandshake() string {
@@ -212,9 +219,16 @@ func (cn *conn) ensureWithGateContext(ctx context.Context, resolved bool) error 
 	if err := cn.health.gate(cn.gateExempt || resolved); err != nil {
 		return err
 	}
+	// The generation is read BEFORE the handshake offers its token, so a
+	// verdict earned here can only ever be attributed to the credential this
+	// dial actually used. An install racing the dial leaves gen != credGen and
+	// the verdict is simply not claimed — never mis-attributed to the successor.
+	gen := cn.health.generation()
 	err := cn.dialOnceContext(ctx)
 	if err == nil {
-		cn.health.recordSuccess()
+		// A completed HANDSHAKE is the only thing entitled to speak about the
+		// credential (see connHealth.recordHandshakeSuccess).
+		cn.health.recordHandshakeSuccess(gen)
 		if cn.client != nil && cn.client.redial != nil {
 			cn.client.redial.Reset()
 		}
@@ -222,8 +236,20 @@ func (cn *conn) ensureWithGateContext(ctx context.Context, resolved bool) error 
 	}
 	// A definite token rejection is an ANSWER from a reachable peer, not
 	// unreachability (see failfast.go), so it does not trip the transport
-	// breaker. It still returns immediately and fails closed.
-	if !errors.Is(err, ErrSessionTokenRejected) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	// breaker. It still returns immediately and fails closed — and it LATCHES
+	// the credential verdict, wherever it happened. Only the prober's rejection
+	// used to latch, so an ordinary pooled dial refused by the authority left
+	// the mount reporting a healthy credential.
+	if errors.Is(err, ErrSessionTokenRejected) {
+		// Only an EXPLICIT refusal (ack 1) latches. The clean-EOF form is a
+		// redial heuristic and proves nothing about the credential — see
+		// ErrCredentialRefused.
+		if errors.Is(err, ErrCredentialRefused) {
+			cn.health.recordCredentialRejected(gen)
+		}
+		return err
+	}
+	if !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		cn.health.recordFailure()
 	}
 	return err

@@ -431,7 +431,7 @@ func cleanProvablyEmptyStream(stream *abandonedStream) error {
 	if err != nil {
 		return err
 	}
-	body := encodeFrame(nil, frameClose, frameNo+1, 0, payload)
+	body := encodeFrame(nil, frameClose, StreamLaneLegacy, frameNo+1, 0, payload)
 	n, err := active.WriteAt(body, end)
 	if err == nil && n != len(body) {
 		err = io.ErrShortWrite
@@ -600,7 +600,7 @@ func analyzeAbandonedStream(
 		}
 	}
 	applied := job.AppliedThrough
-	markThrough, _, err := highestAppliedCertificate(marks, scan.lastSeq)
+	cert, err := highestAppliedCertificate(marks, scan.lastSeq)
 	if err != nil {
 		return stream, err
 	}
@@ -608,8 +608,20 @@ func analyzeAbandonedStream(
 		if _, err := digestAt(scan, marks, mark.Through); err != nil {
 			return stream, err
 		}
+		decoded, err := mark.mark()
+		if err != nil {
+			return stream, err
+		}
+		for lane := range decoded.lanes {
+			if lane == int(StreamLaneLegacy) {
+				continue
+			}
+			if _, err := laneDigestAt(scan, marks, StreamLane(lane), decoded.lanes[lane].through); err != nil {
+				return stream, err
+			}
+		}
 	}
-	applied = max(applied, markThrough)
+	applied = max(applied, cert.global)
 	if scan.firstSeq > 0 && applied < scan.firstSeq-1 {
 		return stream, fmt.Errorf("%w: applied watermark predates the reclaimed WAL prefix", ErrCorrupt)
 	}
@@ -717,7 +729,7 @@ func forceParkStream(stream *abandonedStream, reason string) (string, error) {
 			_ = active.Close()
 			return jobID, err
 		}
-		frameBody := encodeFrame(nil, frameForcedClose, frameNo+1, 0, payload)
+		frameBody := encodeFrame(nil, frameForcedClose, StreamLaneLegacy, frameNo+1, 0, payload)
 		n, err := active.WriteAt(frameBody, end)
 		if err == nil && n != len(frameBody) {
 			err = io.ErrShortWrite

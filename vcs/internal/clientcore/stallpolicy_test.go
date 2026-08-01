@@ -92,10 +92,12 @@ func (r *stallRemote) StreamState(
 }
 
 func (r *stallRemote) Rebind(
-	context.Context, string, []writeback.RebindScope, uint64, [32]byte,
+	context.Context, string, []writeback.RebindScope, writeback.StreamState,
 ) (writeback.RebindReply, error) {
 	return writeback.RebindReply{}, nil
 }
+
+func (r *stallRemote) SupportsLanes() bool { return true }
 
 func (r *stallRemote) Discard(context.Context, string, []writeback.RebindScope) error {
 	return nil

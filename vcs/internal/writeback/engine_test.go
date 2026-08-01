@@ -520,7 +520,18 @@ func TestDelegatedCreateStormZeroRemoteCalls(t *testing.T) {
 	}
 }
 
-func TestInterleavedDelegationsFlushAsOneGlobalBatch(t *testing.T) {
+// TestInterleavedDelegationsFlushAsOneBatchPerLane pins the SCOPE-coalescing
+// property: records of different delegations that are interleaved in the stream
+// still ship in ONE request per lane, with explicit scope runs, rather than one
+// request per scope run.
+//
+// Round 7 changed the unit from "one global batch" to "one batch PER LANE" —
+// and only that. A batch is single-lane by construction (two lanes in one
+// request would share one watermark and one retry pin, which is the coupling
+// lanes exist to remove), so 8 creates and 8 writes are 2 requests, not 1. The
+// scope interleaving inside each is unchanged, which is what this test is
+// actually about.
+func TestInterleavedDelegationsFlushAsOneBatchPerLane(t *testing.T) {
 	auth := newFakeAuthority()
 	auth.mu.Lock()
 	auth.dirs["a"] = true
@@ -531,10 +542,8 @@ func TestInterleavedDelegationsFlushAsOneGlobalBatch(t *testing.T) {
 
 	// Prevent the age timer from dispatching a prefix while the test admits
 	// the interleaved stream. DrainAll clears this steady-state backoff and
-	// asks for an immediate global batch.
-	e.fl.mu.Lock()
-	e.fl.nextAttempt = time.Now().Add(time.Hour)
-	e.fl.mu.Unlock()
+	// asks for an immediate batch on each lane.
+	e.fl.holdLanesForTest(time.Hour)
 	for i := 0; i < 8; i++ {
 		scope := "a"
 		if i%2 == 1 {
@@ -552,8 +561,9 @@ func TestInterleavedDelegationsFlushAsOneGlobalBatch(t *testing.T) {
 	auth.mu.Lock()
 	flushes := auth.flushes
 	auth.mu.Unlock()
-	if flushes != 1 {
-		t.Fatalf("16 interleaved records shipped in %d authority RPCs, want one global batch", flushes)
+	if flushes != 2 {
+		t.Fatalf("16 interleaved records shipped in %d authority RPCs, want one batch per lane "+
+			"(8 namespace creates + 8 data writes)", flushes)
 	}
 	for i := 0; i < 8; i++ {
 		scope := "a"
@@ -583,9 +593,7 @@ func TestCrashRecoveryReplaysInterleavedScopesAsOneBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open first engine: %v", err)
 	}
-	e1.fl.mu.Lock()
-	e1.fl.nextAttempt = time.Now().Add(time.Hour)
-	e1.fl.mu.Unlock()
+	e1.fl.holdLanesForTest(time.Hour)
 	for i := 0; i < 8; i++ {
 		scope := "a"
 		if i%2 == 1 {
@@ -929,7 +937,7 @@ func TestFoldedRenameBaseReadsFollowOldName(t *testing.T) {
 	auth.files["d/index"] = []byte("index-000")
 	auth.files["d/index.lock"] = []byte("index-001")
 	auth.mu.Unlock()
-	e.noteApplied(4, [32]byte{})
+	e.noteApplied(streamMark{global: 4})
 
 	dst := make([]byte, 16)
 	n, handled, err := e.ReadAt("d/index", dst, 0, auth.baseReader(""))
@@ -945,7 +953,7 @@ func TestFoldedRenameBaseReadsFollowOldName(t *testing.T) {
 	auth.files["d/index"] = []byte("index-001")
 	delete(auth.files, "d/index.lock")
 	auth.mu.Unlock()
-	e.noteApplied(5, [32]byte{})
+	e.noteApplied(streamMark{global: 5})
 	n, handled, err = e.ReadAt("d/index", dst, 0, auth.baseReader(""))
 	if err != nil || !handled || string(dst[:n]) != "index-001" {
 		t.Fatalf("read post-rename-apply = %q handled=%v err=%v", dst[:n], handled, err)
@@ -1004,9 +1012,7 @@ func TestRecallKeepsAcknowledgedOverlayReadableDuringDrain(t *testing.T) {
 
 	// Prevent the steady-state flusher from applying the overlay before the
 	// recall establishes the deterministic drain window.
-	e.fl.mu.Lock()
-	e.fl.nextAttempt = time.Now().Add(time.Hour)
-	e.fl.mu.Unlock()
+	e.fl.holdLanesForTest(time.Hour)
 
 	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
 		t.Fatalf("create: handled=%v err=%v", handled, err)
@@ -1816,7 +1822,7 @@ func TestFencedStreamParksRefusesAndRebindsMonotonic(t *testing.T) {
 	}
 	wbID := e1.writebackID
 	auth.mu.Lock()
-	fencedAt := auth.streams[wbID].through
+	fencedAt := auth.streams[wbID].total()
 	auth.flushStat = 116 // every flush now answers ESTALE (definite fence)
 	auth.mu.Unlock()
 
@@ -1876,7 +1882,7 @@ func TestFencedStreamParksRefusesAndRebindsMonotonic(t *testing.T) {
 		t.Fatalf("acked pre-fence write lost: %v", err)
 	}
 	auth.mu.Lock()
-	finalThrough := auth.streams[wbID].through
+	finalThrough := auth.streams[wbID].total()
 	rebinds := auth.rebinds
 	auth.mu.Unlock()
 	if rebinds == 0 {
@@ -1984,9 +1990,7 @@ func TestStickyDegradedClearsOnlyAfterExactDrain(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	e.fl.mu.Lock()
-	e.fl.lastProgress = time.Now().Add(-2 * noProgressWindow)
-	e.fl.mu.Unlock()
+	e.fl.backdateProgressForTest(2 * noProgressWindow)
 	e.fl.watchdog()
 	select {
 	case err := <-healthCh:
@@ -2451,7 +2455,7 @@ func TestCheckpointFailureBlocksReclaim(t *testing.T) {
 	w.mu.Lock()
 	w.syncErr = errors.New("injected media failure")
 	w.mu.Unlock()
-	if err := w.CheckpointAndReclaim(lastSeq, [32]byte{}, func(uint64) bool { return false }); err == nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(lastSeq, [32]byte{}), func(uint64) bool { return false }); err == nil {
 		t.Fatal("checkpoint with a failing sync must return the error")
 	}
 	after, _ := filepath.Glob(filepath.Join(sd, "wb-*.pfw"))
@@ -2491,14 +2495,14 @@ func TestReadPinsBlockReclaim(t *testing.T) {
 	}
 	first := w.segments[0].ordinal
 	w.pinSegments([]uint64{first})
-	if err := w.CheckpointAndReclaim(lastSeq, [32]byte{}, func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(lastSeq, [32]byte{}), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if _, err := os.Stat(segmentPath(sd, first)); err != nil {
 		t.Fatalf("read-pinned segment was reclaimed: %v", err)
 	}
 	w.unpinSegments([]uint64{first})
-	if err := w.CheckpointAndReclaim(lastSeq, [32]byte{}, func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(lastSeq, [32]byte{}), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint after unpin: %v", err)
 	}
 	if _, err := os.Stat(segmentPath(sd, first)); !errors.Is(err, os.ErrNotExist) {

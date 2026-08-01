@@ -107,7 +107,7 @@ func TestControlFramesStayInsideTheHardCap(t *testing.T) {
 		fillToBudgetEpsilon(t, w, budget)
 		// APPLIED + RELEASE for a grant that is already live must NEVER be
 		// refused, and must still fit.
-		if err := w.recordDrainedRelease("d", "e1", w.LastSeq(), w.Digest()); err != nil {
+		if err := w.recordDrainedRelease("d", "e1", w.Tail()); err != nil {
 			t.Fatalf("drained release at the bound was refused: %v", err)
 		}
 		if got := w.DiskBytes(); got > budget {
@@ -135,7 +135,7 @@ func TestReclamationCheckpointNeverGrowsTheLog(t *testing.T) {
 
 	// Nothing is applied, so nothing is reclaimable and nothing may be written.
 	before := w.DiskBytes()
-	if err := w.CheckpointAndReclaim(0, digestZero(), func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(0, digestZero()), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint with nothing reclaimable: %v", err)
 	}
 	if got := w.DiskBytes(); got != before {
@@ -143,7 +143,7 @@ func TestReclamationCheckpointNeverGrowsTheLog(t *testing.T) {
 	}
 	// Everything is applied and unpinned: the checkpoint pays for its
 	// certificate out of the segments it retires.
-	if err := w.CheckpointAndReclaim(w.LastSeq(), w.Digest(), func(uint64) bool { return false }); err != nil {
+	if err := w.CheckpointAndReclaim(legacyStreamMark(w.LastSeq(), w.Digest()), func(uint64) bool { return false }); err != nil {
 		t.Fatalf("checkpoint at the bound: %v", err)
 	}
 	if got := w.DiskBytes(); got > before {
@@ -180,7 +180,7 @@ func TestGrantReleaseCyclesStayBounded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cycle %d install: %v", cycle, err)
 		}
-		if err := w.recordDrainedRelease(scope, "e", w.LastSeq(), w.Digest()); err != nil {
+		if err := w.recordDrainedRelease(scope, "e", w.Tail()); err != nil {
 			t.Fatalf("cycle %d release: %v", cycle, err)
 		}
 		if got := w.DiskBytes(); got > budget {
@@ -225,7 +225,7 @@ func TestControlFrameRotationAtBudgetEpsilonStaysInsideTheCap(t *testing.T) {
 	segmentTargetBytes = w.segments[len(w.segments)-1].size
 	segments := len(w.segments)
 	w.mu.Unlock()
-	if err := w.recordDrainedRelease("scope-0", "epoch-0", w.LastSeq(), w.Digest()); err != nil {
+	if err := w.recordDrainedRelease("scope-0", "epoch-0", w.Tail()); err != nil {
 		t.Fatalf("rotation-tripping control frame was refused: %v", err)
 	}
 	// The new segment must hold more than its bare header: that surplus is the
@@ -310,7 +310,7 @@ func TestLifecycleIsNeverWedgedAtTheBound(t *testing.T) {
 	fillToBudgetEpsilon(t, w, budget)
 
 	for _, scope := range scopes {
-		if err := w.recordDrainedRelease(scope, "epoch-"+scope, w.LastSeq(), w.Digest()); err != nil {
+		if err := w.recordDrainedRelease(scope, "epoch-"+scope, w.Tail()); err != nil {
 			t.Fatalf("release %q at a saturated log: %v", scope, err)
 		}
 		if got := w.DiskBytes(); got > budget {
@@ -364,7 +364,7 @@ func TestControlReserveDominatesCloseOut(t *testing.T) {
 	before := w.DiskBytes()
 	for i := 0; i < live; i++ {
 		scope := fmt.Sprintf("scope-%02d", i)
-		if err := w.recordDrainedRelease(scope, fmt.Sprintf("epoch-%02d", i), 0, digestZero()); err != nil {
+		if err := w.recordDrainedRelease(scope, fmt.Sprintf("epoch-%02d", i), legacyStreamMark(0, digestZero())); err != nil {
 			t.Fatalf("release %s: %v", scope, err)
 		}
 	}

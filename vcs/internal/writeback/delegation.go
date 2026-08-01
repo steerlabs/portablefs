@@ -58,11 +58,20 @@ var handoffRetryBackoff = 50 * time.Millisecond
 // startHandoffBounded opens the frontend handoff for scope with a definite
 // outcome. An unsettled publication is retried within releaseHandoffBudget;
 // every other error, and budget exhaustion, is final.
+// The budget is ABSOLUTE and it is enforced on the wait itself, not merely
+// between attempts. Checking it only between calls bounded nothing: one
+// OnHandoffStart that never returned could outlive the budget by any amount.
+// The deadline therefore travels on the context each attempt is given — values
+// only, never cancellation, so the release's own durability is still owned by
+// the engine — and the gate answers it with the same transient, scoped
+// publication-unsettled verdict it answers its settle window with.
 func (e *Engine) startHandoffBounded(attempt *releaseAttempt, scope string) error {
 	deadline := time.Now().Add(releaseHandoffBudget)
 	var last error
 	for {
-		err := e.cfg.Events.OnHandoffStart(attempt.eventCtx, scope)
+		attemptCtx, cancel := context.WithDeadline(attempt.eventCtx, deadline)
+		err := e.cfg.Events.OnHandoffStart(attemptCtx, scope)
+		cancel()
 		if err == nil {
 			return nil
 		}
@@ -484,22 +493,24 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 	}
 	w := e.wal
 	e.mu.RUnlock()
-	// target is THIS SCOPE'S OWN admitted tail, not the stream's. See
-	// flusher.scopeTail: a release is a claim about what this grant acknowledged
-	// locally, and nothing at all about the rest of a shared stream. Zero means
-	// the scope has nothing unshipped, so any applied watermark satisfies it.
+	// targets are THIS SCOPE'S OWN admitted tails, PER LANE — not the stream's,
+	// and not one lane's on behalf of the other. See flusher.scopeTails: a
+	// release is a claim about what this grant acknowledged locally, and nothing
+	// at all about the rest of a shared stream or about a lane this scope never
+	// used. A zero target means that lane holds nothing for the scope, so any
+	// watermark satisfies it — which is why a metadata-only scope releases in
+	// milliseconds no matter how deep the bulk backlog is.
+	//
 	// The snapshot is stable because d.draining is already set, so no further
 	// record can join the scope behind it.
-	var target uint64
+	var targets [streamLaneCount]uint64
 	if w != nil {
 		if err := w.Sync(); err != nil {
 			return e.failRelease(d, attempt, e.failLocalWAL("pre-release sync", err))
 		}
-		if tail, unshipped := e.fl.scopeTail(d.scope); unshipped {
-			target = tail
-			if err := e.fl.drainThrough(ctx, target); err != nil {
-				return e.failRelease(d, attempt, err)
-			}
+		targets = e.fl.scopeTails(d.scope)
+		if err := e.fl.drainLanesThrough(ctx, targets); err != nil {
+			return e.failRelease(d, attempt, err)
 		}
 	}
 	select {
@@ -583,15 +594,17 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 	// is lost and the authority retires the stream ledger, recovery has the
 	// exact prefix certificate needed to retire the stream.
 	if w != nil {
-		through, digest := e.fl.appliedState()
-		if through < target {
-			endProtections(false)
-			return e.failRelease(d, attempt, fmt.Errorf(
-				"%w: release drain stopped at %d before target %d",
-				ErrConflict, through, target,
-			))
+		mark := e.fl.appliedState()
+		for lane, target := range targets {
+			if mark.lanes[lane].through < target {
+				endProtections(false)
+				return e.failRelease(d, attempt, fmt.Errorf(
+					"%w: %s-lane release drain stopped at %d before target %d",
+					ErrConflict, StreamLane(lane), mark.lanes[lane].through, target,
+				))
+			}
 		}
-		if err := w.recordDrainedRelease(d.scope, d.epoch, through, digest); err != nil {
+		if err := w.recordDrainedRelease(d.scope, d.epoch, mark); err != nil {
 			endProtections(false)
 			return e.failRelease(d, attempt, e.failLocalWAL("record drained delegation release", err))
 		}

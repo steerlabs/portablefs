@@ -309,7 +309,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		return fmt.Errorf("%w: persist recovery registry: %v", errRetryable, err)
 	}
 
-	certThrough, certDigest, err := highestAppliedCertificate(marks, scan.lastSeq)
+	cert, err := highestAppliedCertificate(marks, scan.lastSeq)
 	if err != nil {
 		js.update(func(j *RecoveryJob) {
 			j.State = JobCorrupt
@@ -321,47 +321,60 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	if err != nil {
 		return fmt.Errorf("%w: stream state: %v", errRetryable, err)
 	}
-	through := certThrough
-	if ss.Exists {
-		through = ss.Through
-	}
-	if through > scan.lastSeq {
-		js.update(func(j *RecoveryJob) {
-			j.State = JobCorrupt
-			j.LastError = fmt.Sprintf("authority watermark %d is past the local tail %d", through, scan.lastSeq)
-		})
-		return errors.New("watermark past local tail")
-	}
-	localDigest, err := digestAt(scan, marks, through)
-	if err != nil {
-		js.update(func(j *RecoveryJob) {
-			j.State = JobCorrupt
-			j.LastError = err.Error()
-		})
-		return err
-	}
-	if !ss.Exists && localDigest != certDigest {
-		js.update(func(j *RecoveryJob) {
-			j.State = JobCorrupt
-			j.LastError = "local applied certificate does not match the retained stream"
-		})
-		return errors.New("local applied certificate mismatch")
-	}
-	if ss.Exists && localDigest != ss.Digest {
-		js.update(func(j *RecoveryJob) {
-			j.State = JobConflict
-			j.LastError = "stream digest diverged from the authority's durable state"
-			j.Conflicts = []ConflictDetail{{Kind: "DIGEST_MISMATCH"}}
-		})
-		return errors.New("digest mismatch")
-	}
-
-	var tail []frame
-	for _, m := range mutations {
-		if m.seq > through {
-			tail = append(tail, m)
+	// ── THE PER-LANE RECOVERY POSITION ───────────────────────────────────────
+	//
+	// A lane is an independently-applicable chain, so "where is this stream"
+	// is one question PER LANE, and the answers can legitimately disagree: the
+	// namespace lane is normally ahead of the data lane, which is the whole
+	// point of splitting them. The authority's ledger is the truth when it has
+	// one; the local APPLIED certificate is the truth when it does not (the
+	// stream was fully drained and its ledger retired).
+	tails := laneTails(scan, cert)
+	var pos streamMark
+	for lane := range pos.lanes {
+		l := StreamLane(lane)
+		want := cert.lanes[lane]
+		if ss.Exists {
+			want = laneMark{through: ss.LaneThrough(l), digest: ss.LaneDigest(l)}
 		}
+		if want.through > tails[lane] {
+			js.update(func(j *RecoveryJob) {
+				j.State = JobCorrupt
+				j.LastError = fmt.Sprintf("authority %s-lane watermark %d is past the local tail %d", l, want.through, tails[lane])
+			})
+			return errors.New("watermark past local tail")
+		}
+		local, derr := laneDigestAt(scan, marks, l, want.through)
+		if derr != nil {
+			js.update(func(j *RecoveryJob) {
+				j.State = JobCorrupt
+				j.LastError = derr.Error()
+			})
+			return derr
+		}
+		if want.through == 0 {
+			// A lane with nothing applied has no digest to agree about: the
+			// chain base is the same constant on both sides by construction.
+			want.digest = local
+		}
+		if local != want.digest {
+			if ss.Exists {
+				js.update(func(j *RecoveryJob) {
+					j.State = JobConflict
+					j.LastError = fmt.Sprintf("%s-lane digest diverged from the authority's durable state", l)
+					j.Conflicts = []ConflictDetail{{Kind: "DIGEST_MISMATCH"}}
+				})
+				return errors.New("digest mismatch")
+			}
+			js.update(func(j *RecoveryJob) {
+				j.State = JobCorrupt
+				j.LastError = "local applied certificate does not match the retained stream"
+			})
+			return errors.New("local applied certificate mismatch")
+		}
+		pos.lanes[lane] = laneMark{through: want.through, digest: local}
 	}
+	tail := laneTailFrames(mutations, pos)
 	if len(tail) == 0 && len(live) == 0 {
 		if err := e.remote.Discard(ctx, wbID, nil); err != nil {
 			return fmt.Errorf("%w: discard drained stream: %v", errRetryable, err)
@@ -389,7 +402,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	// a fresh exact identity. A stationary/missing/divergent state remains a
 	// real typed conflict.
 	for {
-		reply, err := e.remote.Rebind(ctx, wbID, scopes, through, localDigest)
+		reply, err := e.remote.Rebind(ctx, wbID, scopes, markState(pos))
 		if err != nil {
 			return fmt.Errorf("%w: rebind: %v", errRetryable, err)
 		}
@@ -408,18 +421,42 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			if stateErr != nil {
 				return fmt.Errorf("%w: refresh stream state after rebind race: %v", errRetryable, stateErr)
 			}
-			if next.Exists && next.Through > through && next.Through <= scan.lastSeq {
-				nextDigest, digestErr := digestAt(scan, marks, next.Through)
-				if digestErr != nil {
-					js.update(func(j *RecoveryJob) {
-						j.State = JobCorrupt
-						j.LastError = digestErr.Error()
-					})
-					return digestErr
+			// Accept only a STRICTLY FORWARD move in at least one lane, with
+			// every lane still provable from this WAL. Nothing else is a race;
+			// everything else is a real conflict.
+			if next.Exists {
+				forward, ok := true, false
+				var advanced streamMark
+				for lane := range advanced.lanes {
+					l := StreamLane(lane)
+					want := laneMark{through: next.LaneThrough(l), digest: next.LaneDigest(l)}
+					if want.through < pos.lanes[lane].through || want.through > tails[lane] {
+						forward = false
+						break
+					}
+					if want.through > pos.lanes[lane].through {
+						ok = true
+					}
+					local, digestErr := laneDigestAt(scan, marks, l, want.through)
+					if digestErr != nil {
+						js.update(func(j *RecoveryJob) {
+							j.State = JobCorrupt
+							j.LastError = digestErr.Error()
+						})
+						return digestErr
+					}
+					if want.through == 0 {
+						want.digest = local
+					}
+					if local != want.digest {
+						forward = false
+						break
+					}
+					advanced.lanes[lane] = laneMark{through: want.through, digest: local}
 				}
-				if nextDigest == next.Digest {
-					through = next.Through
-					localDigest = nextDigest
+				if forward && ok {
+					pos = advanced
+					tail = laneTailFrames(mutations, pos)
 					continue
 				}
 			}
@@ -432,95 +469,149 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 		return errors.New("rebind conflict")
 	}
 
-	// Drain the dense tail as mixed-scope batches, chaining the digest
-	// forward. Every run names the exact rebound grant authorizing it.
-	tail = tail[:0]
-	for _, m := range mutations {
-		if m.seq > through {
-			tail = append(tail, m)
-		}
-	}
-	prev := localDigest
-	finalThrough := through
-	i := 0
-	for i < len(tail) {
-		var records []wal.Record
-		var scopeRuns []FlushScope
-		var bytes int64
-		end := prev
-		j := i
-		for ; j < len(tail) && len(records) < flushMaxRecords && bytes < flushMaxBytes; j++ {
-			scope := coveringScope(live, decodePathOf(tail[j]))
-			if scope == "" {
-				missingSeq := tail[j].seq
-				js.update(func(job *RecoveryJob) {
-					job.State = JobCorrupt
-					job.LastError = fmt.Sprintf("record %d has no covering delegation", missingSeq)
-				})
-				return errors.New("record without covering delegation")
+	// ── DRAIN THE TAIL, LANE BY LANE ─────────────────────────────────────────
+	//
+	// The order is legacy, then namespace, then data, and it is the order that
+	// makes the replay sound rather than a convenience:
+	//
+	//   - LEGACY first because it is a strict prefix of the stream: the lane
+	//     boundary is only crossed once every unlaned record is applied, so a
+	//     WAL that holds laned frames holds NO unapplied legacy ones. This arm
+	//     is empty in every laned stream and carries the whole tail in every
+	//     pre-upgrade one.
+	//   - NAMESPACE next, in full. Nothing in the namespace lane depends on
+	//     anything outside it (the lane router guarantees it), so it can always
+	//     be replayed first.
+	//   - DATA last. Every data record's namespace dependency is ≤ the namespace
+	//     lane's total, which is now applied, so no batch can be held.
+	//
+	// Each lane chains from its own verified base and names its own watermark.
+	tail = laneTailFrames(mutations, pos)
+	drained := 0
+	for _, lane := range [...]StreamLane{StreamLaneLegacy, StreamLaneNamespace, StreamLaneData} {
+		laneFrames := make([]frame, 0, len(tail))
+		for _, fr := range tail {
+			if fr.lane == lane {
+				laneFrames = append(laneFrames, fr)
 			}
-			rec, err := wal.DecodePFR1(tail[j].payload)
+		}
+		if len(laneFrames) == 0 {
+			continue
+		}
+		prev := pos.lanes[lane].digest
+		i := 0
+		for i < len(laneFrames) {
+			var records []wal.Record
+			var scopeRuns []FlushScope
+			var bytes int64
+			var nsRequired uint64
+			end := prev
+			j := i
+			for ; j < len(laneFrames) && len(records) < flushMaxRecords && bytes < laneMaxBytes(lane); j++ {
+				scope := coveringScope(live, decodePathOf(laneFrames[j]))
+				if scope == "" {
+					missingSeq := laneFrames[j].seq
+					js.update(func(job *RecoveryJob) {
+						job.State = JobCorrupt
+						job.LastError = fmt.Sprintf("record %d has no covering delegation", missingSeq)
+					})
+					return errors.New("record without covering delegation")
+				}
+				rec, err := wal.DecodePFR1(laneFrames[j].payload)
+				if err != nil {
+					js.update(func(jb *RecoveryJob) {
+						jb.State = JobCorrupt
+						jb.LastError = err.Error()
+					})
+					return err
+				}
+				rec.Seq = laneFrames[j].laneSeq
+				end = digestNext(end, laneFrames[j].laneSeq, laneFrames[j].payload)
+				nsRequired = max(nsRequired, laneFrames[j].nsRequired)
+				records = append(records, rec)
+				bytes += int64(len(laneFrames[j].payload))
+				if len(scopeRuns) != 0 && scopeRuns[len(scopeRuns)-1].Scope == scope {
+					scopeRuns[len(scopeRuns)-1].Through = laneFrames[j].laneSeq
+				} else {
+					scopeRuns = append(scopeRuns, FlushScope{
+						Scope: scope, Epoch: live[scope], Through: laneFrames[j].laneSeq,
+					})
+				}
+			}
+			if lane != StreamLaneData {
+				nsRequired = 0
+			}
+			reply, err := e.remote.FlushResolved(ctx, FlushRequest{
+				WritebackID: wbID, Lane: lane, NSRequired: nsRequired,
+				PrevDigest: prev, EndDigest: end,
+				Records: records, ScopeRuns: scopeRuns,
+			})
 			if err != nil {
+				return fmt.Errorf("%w: recovery flush: %v", errRetryable, err)
+			}
+			if reply.Status != 0 {
 				js.update(func(jb *RecoveryJob) {
-					jb.State = JobCorrupt
-					jb.LastError = err.Error()
+					jb.State = JobConflict
+					jb.LastError = fmt.Sprintf("recovery %s-lane flush rejected with status %d", lane, reply.Status)
 				})
-				return err
+				return errors.New("recovery flush rejected")
 			}
-			rec.Seq = tail[j].seq
-			end = digestNext(end, tail[j].seq, tail[j].payload)
-			records = append(records, rec)
-			bytes += int64(len(tail[j].payload))
-			if len(scopeRuns) != 0 && scopeRuns[len(scopeRuns)-1].Scope == scope {
-				scopeRuns[len(scopeRuns)-1].Through = tail[j].seq
+			// A success must name this batch's exact end. A short watermark would
+			// drop unshipped records; a watermark past the sent end claims bytes
+			// this request never supplied.
+			if batchEnd := laneFrames[j-1].laneSeq; reply.Through != batchEnd {
+				js.update(func(jb *RecoveryJob) {
+					jb.State = JobConflict
+					jb.LastError = fmt.Sprintf("recovery %s-lane flush succeeded with authority watermark %d, want exact batch end %d", lane, reply.Through, batchEnd)
+				})
+				return errors.New("recovery flush watermark short of batch end")
+			}
+			prev = end
+			pos.lanes[lane] = laneMark{through: reply.Through, digest: end}
+			drained += j - i
+			i = j
+			remaining := len(tail) - drained
+			// The registry's AppliedThrough is a GLOBAL-sequence progress
+			// figure, and a per-lane replay does not produce one directly: the
+			// lanes are drained one after another, so no single lane watermark
+			// is a prefix of the stream mid-replay. What IS exact at every step
+			// is how many records are still outstanding, so the global figure
+			// is derived from the tail rather than from a lane.
+			applied := scan.lastSeq
+			if uint64(remaining) < applied {
+				applied -= uint64(remaining)
 			} else {
-				scopeRuns = append(scopeRuns, FlushScope{
-					Scope: scope, Epoch: live[scope], Through: tail[j].seq,
-				})
+				applied = 0
+			}
+			if err := js.updateDebounced(func(jb *RecoveryJob) {
+				jb.AppliedThrough = applied
+				jb.PendingRecords = uint64(remaining)
+			}); err != nil {
+				return fmt.Errorf("%w: persist recovery progress: %v", errRetryable, err)
 			}
 		}
-		reply, err := e.remote.FlushResolved(ctx, FlushRequest{
-			WritebackID: wbID, PrevDigest: prev, EndDigest: end,
-			Records: records, ScopeRuns: scopeRuns,
-		})
-		if err != nil {
-			return fmt.Errorf("%w: recovery flush: %v", errRetryable, err)
-		}
-		if reply.Status != 0 {
-			js.update(func(jb *RecoveryJob) {
-				jb.State = JobConflict
-				jb.LastError = fmt.Sprintf("recovery flush rejected with status %d", reply.Status)
+		if pos.lanes[lane].through != tails[lane] {
+			err := fmt.Errorf("%w: recovery %s-lane drain ended at %d before WAL tail %d",
+				ErrCorrupt, lane, pos.lanes[lane].through, tails[lane])
+			js.update(func(j *RecoveryJob) {
+				j.State = JobCorrupt
+				j.LastError = err.Error()
 			})
-			return errors.New("recovery flush rejected")
-		}
-		// A success must name this batch's exact end. A short watermark would
-		// drop unshipped records; a watermark past the sent end claims bytes
-		// this request never supplied.
-		if batchEnd := tail[j-1].seq; reply.Through != batchEnd {
-			js.update(func(jb *RecoveryJob) {
-				jb.State = JobConflict
-				jb.LastError = fmt.Sprintf("recovery flush succeeded with authority watermark %d, want exact batch end %d", reply.Through, batchEnd)
-			})
-			return errors.New("recovery flush watermark short of batch end")
-		}
-		prev = end
-		finalThrough = reply.Through
-		i = j
-		if err := js.updateDebounced(func(jb *RecoveryJob) {
-			jb.AppliedThrough = reply.Through
-			jb.PendingRecords = uint64(len(tail) - i)
-		}); err != nil {
-			return fmt.Errorf("%w: persist recovery progress: %v", errRetryable, err)
+			return err
 		}
 	}
-	if finalThrough != scan.lastSeq {
-		err := fmt.Errorf("%w: recovery drain ended at %d before WAL tail %d", ErrCorrupt, finalThrough, scan.lastSeq)
-		js.update(func(j *RecoveryJob) {
-			j.State = JobCorrupt
-			j.LastError = err.Error()
-		})
-		return err
+	for lane := range pos.lanes {
+		if pos.lanes[lane].through != tails[lane] {
+			err := fmt.Errorf("%w: recovery %s-lane drain ended at %d before WAL tail %d",
+				ErrCorrupt, StreamLane(lane), pos.lanes[lane].through, tails[lane])
+			js.update(func(j *RecoveryJob) {
+				j.State = JobCorrupt
+				j.LastError = err.Error()
+			})
+			return err
+		}
 	}
+	pos.global = scan.lastSeq
 	// Resolve and durably publish every frontend identity before recording
 	// any local RELEASE. If the process crashes after a RELEASE certificate,
 	// the next recovery deliberately treats that scope as locally final and
@@ -556,7 +647,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	// projection and the exact applied certificate, sweeping whichever
 	// recovery grants remain instead of trying to rebind already-released
 	// scopes.
-	if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, prev, scopes, e.cfg.BudgetBytes); err != nil {
+	if err := appendRecoveryReleaseCertificate(dir, scan, pos, scopes, e.cfg.BudgetBytes); err != nil {
 		cleanupPreparedFrom(0)
 		if errors.Is(err, errCloseOutUnbounded) {
 			// Definite and terminal: no retry can create budget, and none can
@@ -725,18 +816,17 @@ var errCloseOutUnbounded = errors.New("writeback: recovery close-out does not fi
 func appendRecoveryReleaseCertificate(
 	dir string,
 	scan *streamScan,
-	through uint64,
-	digest [32]byte,
+	mark streamMark,
 	scopes []RebindScope,
 	budget int64,
 ) error {
-	if scan == nil || through != scan.lastSeq || len(scopes) == 0 {
+	if scan == nil || mark.global != scan.lastSeq || len(scopes) == 0 {
 		return errors.New("writeback: invalid recovery release certificate")
 	}
-	hexDigest := fmt.Sprintf("%x", digest)
-	// The APPLIED watermark and digest are values recovery computed just now,
-	// so they go through the ADMISSION encoder: nothing about them is legacy.
-	appliedPayload, err := encodeControlPayload(appliedFrame{Through: through, Digest: hexDigest})
+	// The APPLIED watermark and every lane digest are values recovery computed
+	// just now, so they go through the ADMISSION encoder: nothing about them is
+	// legacy.
+	appliedPayload, err := encodeControlPayload(mark.appliedFrame())
 	if err != nil {
 		return err
 	}
@@ -788,11 +878,11 @@ func appendRecoveryReleaseCertificate(
 	if budget <= 0 || used+appliedBytes+releaseBytes <= budget {
 		var body []byte
 		if appliedBytes > 0 {
-			body = encodeFrame(body, frameApplied, frameNo+1, 0, appliedPayload)
+			body = encodeFrame(body, frameApplied, StreamLaneLegacy, frameNo+1, 0, appliedPayload)
 			frameNo++
 		}
 		for _, payload := range releasePayloads {
-			body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
+			body = encodeFrame(body, frameRelease, StreamLaneLegacy, frameNo+1, 0, payload)
 			frameNo++
 		}
 		return closeOutWrite(path, end, body)
@@ -831,7 +921,7 @@ func appendRecoveryReleaseCertificate(
 
 	// Barrier A: the mark that authorizes the reclaim.
 	if appliedBytes > 0 {
-		body := encodeFrame(nil, frameApplied, frameNo+1, 0, appliedPayload)
+		body := encodeFrame(nil, frameApplied, StreamLaneLegacy, frameNo+1, 0, appliedPayload)
 		if err := closeOutWrite(path, end, body); err != nil {
 			return err
 		}
@@ -867,7 +957,7 @@ func appendRecoveryReleaseCertificate(
 	// Barrier C: the releases, now inside the budget.
 	var body []byte
 	for _, payload := range releasePayloads {
-		body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
+		body = encodeFrame(body, frameRelease, StreamLaneLegacy, frameNo+1, 0, payload)
 		frameNo++
 	}
 	return closeOutWrite(path, end, body)
@@ -968,43 +1058,54 @@ func appendStreamTailFrames(path string, off int64, body []byte) error {
 // acknowledgement. Concurrent release workers may append an older snapshot
 // after a newer checkpoint, so physical frame order does not imply watermark
 // order. Two different digests for the same watermark remain corruption.
-func highestAppliedCertificate(marks []appliedFrame, lastSeq uint64) (uint64, [32]byte, error) {
-	through := uint64(0)
-	digest := digestZero()
-	seen := map[uint64][32]byte{0: digest}
+func highestAppliedCertificate(marks []appliedFrame, lastSeq uint64) (streamMark, error) {
+	best := streamMark{}
+	for lane := range best.lanes {
+		best.lanes[lane].digest = digestZero()
+	}
+	zero := digestZero()
+	seen := map[uint64][streamLaneCount]laneMark{0: best.lanes}
 	for _, mark := range marks {
-		raw, err := hex.DecodeString(mark.Digest)
-		if err != nil || len(raw) != len(digest) {
-			return 0, digestZero(), fmt.Errorf("%w: applied checkpoint digest malformed", ErrCorrupt)
+		decoded, err := mark.mark()
+		if err != nil {
+			return streamMark{}, err
 		}
-		var next [32]byte
-		copy(next[:], raw)
+		for lane := range decoded.lanes {
+			if decoded.lanes[lane].through == 0 {
+				decoded.lanes[lane].digest = zero
+			}
+		}
 		if mark.Through > lastSeq {
-			return 0, digestZero(), fmt.Errorf(
+			return streamMark{}, fmt.Errorf(
 				"%w: applied checkpoint %d is past local tail %d",
 				ErrCorrupt, mark.Through, lastSeq,
 			)
 		}
 		if prior, ok := seen[mark.Through]; ok {
-			if next != prior {
-				return 0, digestZero(), fmt.Errorf(
+			if decoded.lanes != prior {
+				return streamMark{}, fmt.Errorf(
 					"%w: conflicting applied digests at watermark %d",
 					ErrCorrupt, mark.Through,
 				)
 			}
 			continue
 		}
-		seen[mark.Through] = next
-		if mark.Through > through {
-			through = mark.Through
-			digest = next
+		seen[mark.Through] = decoded.lanes
+		if mark.Through > best.global {
+			best.global = mark.Through
+			best.lanes = decoded.lanes
 		}
 	}
-	return through, digest, nil
+	return best, nil
 }
 
-// digestAt reconstructs the stream digest at seq from the retained frames
-// and the latest APPLIED checkpoint at or below it.
+// digestAt reconstructs the LEGACY-lane digest at global sequence seq from the
+// retained frames and the latest APPLIED checkpoint at or below it.
+//
+// In the legacy era the lane sequence IS the global sequence, so this is the
+// same function it has always been. Past the boundary the legacy chain is
+// frozen and every laned frame is skipped, which is exactly right: the legacy
+// digest at any point after the boundary is the digest at the boundary.
 func digestAt(scan *streamScan, marks []appliedFrame, seq uint64) ([32]byte, error) {
 	base := digestZero()
 	var baseSeq uint64
@@ -1022,15 +1123,90 @@ func digestAt(scan *streamScan, marks []appliedFrame, seq uint64) ([32]byte, err
 		return base, fmt.Errorf("%w: retained frames start at %d, cannot rebuild digest from %d", ErrCorrupt, scan.firstSeq, baseSeq)
 	}
 	for _, fr := range scan.frames {
-		if fr.typ != frameMutation || fr.seq <= baseSeq {
+		if fr.typ != frameMutation || fr.lane != StreamLaneLegacy || fr.seq <= baseSeq {
 			continue
 		}
 		if fr.seq > seq {
 			break
 		}
-		base = digestNext(base, fr.seq, fr.payload)
+		base = digestNext(base, fr.laneSeq, fr.payload)
 	}
 	return base, nil
+}
+
+// laneDigestAt reconstructs LANE's chain digest at laneSeq from the retained
+// frames and the newest APPLIED checkpoint at or below it in that lane.
+//
+// It is the per-lane form of digestAt and works for the same reason: a
+// certificate carries every lane's (watermark, digest) at one applied prefix,
+// so the newest certificate not past laneSeq is a valid base for that lane, and
+// the retained frames of that lane chain forward from it.
+func laneDigestAt(scan *streamScan, marks []appliedFrame, lane StreamLane, laneSeq uint64) ([32]byte, error) {
+	base := digestZero()
+	var baseSeq uint64
+	for _, m := range marks {
+		decoded, err := m.mark()
+		if err != nil {
+			return base, err
+		}
+		lm := decoded.lanes[lane]
+		if lm.through <= laneSeq && lm.through > baseSeq {
+			base, baseSeq = lm.digest, lm.through
+		}
+	}
+	if first := scan.laneFirst[lane]; first != 0 && baseSeq+1 < first && laneSeq > baseSeq {
+		return base, fmt.Errorf("%w: retained %s-lane frames start at %d, cannot rebuild digest from %d",
+			ErrCorrupt, lane, first, baseSeq)
+	}
+	for _, fr := range scan.frames {
+		if fr.typ != frameMutation || fr.lane != lane || fr.laneSeq <= baseSeq {
+			continue
+		}
+		if fr.laneSeq > laneSeq {
+			break
+		}
+		base = digestNext(base, fr.laneSeq, fr.payload)
+	}
+	return base, nil
+}
+
+// laneTailFrames selects the mutation frames each lane has NOT applied, in
+// physical order. A frame belongs to the tail when its own lane's watermark
+// does not cover it — never when some other lane's does.
+func laneTailFrames(mutations []frame, pos streamMark) []frame {
+	var tail []frame
+	for _, fr := range mutations {
+		if fr.laneSeq > pos.lanes[fr.lane].through {
+			tail = append(tail, fr)
+		}
+	}
+	return tail
+}
+
+// markState renders a recovery position as the wire-facing stream view the
+// rebind claims.
+func markState(pos streamMark) StreamState {
+	return StreamState{
+		Exists:  true,
+		Through: pos.lanes[StreamLaneLegacy].through, Digest: pos.lanes[StreamLaneLegacy].digest,
+		NSThrough: pos.lanes[StreamLaneNamespace].through, NSDigest: pos.lanes[StreamLaneNamespace].digest,
+		DataThrough: pos.lanes[StreamLaneData].through, DataDigest: pos.lanes[StreamLaneData].digest,
+	}
+}
+
+// laneTails is the highest retained LANE sequence per lane, falling back to the
+// certificate's watermark for a lane whose whole prefix was reclaimed.
+func laneTails(scan *streamScan, cert streamMark) [streamLaneCount]uint64 {
+	var tails [streamLaneCount]uint64
+	for lane := range tails {
+		tails[lane] = cert.lanes[lane].through
+	}
+	for _, fr := range scan.frames {
+		if fr.typ == frameMutation && fr.laneSeq > tails[fr.lane] {
+			tails[fr.lane] = fr.laneSeq
+		}
+	}
+	return tails
 }
 
 // coveringScope resolves the delegation covering p among the recovered

@@ -11,8 +11,8 @@ package writeback
 //
 // and which drains the whole stream before it may check in:
 //
-//	target = w.LastSeq()
-//	e.fl.drainThrough(ctx, target)
+//	targets = e.fl.scopeTails(d.scope)   // per lane, since round 7
+//	e.fl.drainLanesThrough(ctx, targets)
 //
 // Repro A (wedge): e.ctx has no deadline and drainThrough has no
 // no-progress bound of its own, so an authority that stops applying
@@ -37,16 +37,20 @@ import (
 	"time"
 )
 
-// walLastSeq is the drain target finishRelease actually uses: the last
-// sequence of the WHOLE shared stream.
-func walLastSeq(t *testing.T, e *Engine) uint64 {
+// engineWAL is the stream a barrier drains. It is deliberately no longer used
+// to compute a drain TARGET: round 3 narrowed the target from the stream's tail
+// to the scope's, and round 7 narrowed it again to the scope's tail PER LANE
+// (flusher.scopeTails). Only an explicit fsync-class barrier still drains
+// everything, and it asks the WAL for each lane's tail rather than one global
+// sequence.
+func engineWAL(t *testing.T, e *Engine) *streamWAL {
 	t.Helper()
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if e.wal == nil {
 		t.Fatal("engine has no stream")
 	}
-	return e.wal.LastSeq()
+	return e.wal
 }
 
 // shutUplink installs a FRESH closed gate on an authority whose original gate
@@ -175,8 +179,7 @@ func TestMetadataScopeReleaseWaitsForUnrelatedBulkData(t *testing.T) {
 		t.Fatal("metadata scope was not delegated")
 	}
 	drainCtx, cancelDrain := context.WithTimeout(ctx, 20*time.Second)
-	metaTail := walLastSeq(t, f.e)
-	if err := f.e.fl.drainThrough(drainCtx, metaTail); err != nil {
+	if err := f.e.fl.drainAll(drainCtx, engineWAL(t, f.e)); err != nil {
 		cancelDrain()
 		t.Fatalf("drain the metadata scope's own tail: %v", err)
 	}
