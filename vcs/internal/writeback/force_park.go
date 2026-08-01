@@ -427,7 +427,7 @@ func cleanProvablyEmptyStream(stream *abandonedStream) error {
 	if err := active.Sync(); err != nil {
 		return fmt.Errorf("sync empty WAL: %w", err)
 	}
-	payload, err := json.Marshal(closeFrame{Through: 0})
+	payload, err := encodeControlPayload(closeFrame{Through: 0})
 	if err != nil {
 		return err
 	}
@@ -708,7 +708,7 @@ func forceParkStream(stream *abandonedStream, reason string) (string, error) {
 	}
 	jobID := job.snapshot().JobID
 	if !stream.alreadyForced {
-		payload, err := json.Marshal(closeFrame{
+		payload, err := encodeControlPayload(closeFrame{
 			Through: stream.appliedThrough,
 			JobID:   jobID,
 			Reason:  reason,

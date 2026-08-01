@@ -9,24 +9,24 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
-// TestAcquireDataCreditWithoutAnEngineIsAFullInstantGrant covers the mount
-// shapes that have no write-back engine at all. There is no bounded WAL to
-// protect, so admission must cost nothing and grant everything: a frontend that
-// paused on a mount with no journal would be inventing back pressure out of
-// thin air.
-func TestAcquireDataCreditWithoutAnEngineIsAFullInstantGrant(t *testing.T) {
+// TestAdmitWriteWithoutAnEngineIsAFullInstantGrant covers the mount shapes that
+// have no write-back engine at all. There is no bounded WAL to protect, so
+// classification must cost nothing and grant everything: a frontend that paused
+// on a mount with no journal would be inventing back pressure out of thin air.
+func TestAdmitWriteWithoutAnEngineIsAFullInstantGrant(t *testing.T) {
 	v := &Volume{}
 	ctx := context.Background()
 	start := time.Now()
-	opCtx, granted, err := v.AcquireDataCredit(ctx, "d/f", 4<<20)
+	opCtx, granted, settle, err := v.AdmitWrite(ctx, "d/f", nil, 4<<20, false)
+	defer settle()
 	if err != nil {
-		t.Fatalf("acquire with no engine: %v", err)
+		t.Fatalf("classify with no engine: %v", err)
 	}
 	if granted != 4<<20 {
 		t.Fatalf("granted %d of %d with no engine", granted, 4<<20)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("acquire with no engine took %v", elapsed)
+		t.Fatalf("classify with no engine took %v", elapsed)
 	}
 	// Nothing was charged, so nothing must be refundable: a grant that was
 	// never taken from a ledger must not decrement one on the way out.
@@ -36,11 +36,12 @@ func TestAcquireDataCreditWithoutAnEngineIsAFullInstantGrant(t *testing.T) {
 	v.ReleaseDataCredit(opCtx) // must not panic on a nil engine
 }
 
-// TestAcquireDataCreditIgnoresEmptyWrites keeps the zero-length case off every
-// slow path: no ledger traffic, no ctx allocation, no probe.
-func TestAcquireDataCreditIgnoresEmptyWrites(t *testing.T) {
+// TestAdmitWriteIgnoresEmptyWrites keeps the zero-length case off every slow
+// path: no ledger traffic, no ctx allocation, no delegation probe.
+func TestAdmitWriteIgnoresEmptyWrites(t *testing.T) {
 	v := &Volume{}
-	opCtx, granted, err := v.AcquireDataCredit(context.Background(), "d/f", 0)
+	opCtx, granted, settle, err := v.AdmitWrite(context.Background(), "d/f", nil, 0, false)
+	defer settle()
 	if err != nil || granted != 0 {
 		t.Fatalf("empty write: granted=%d err=%v", granted, err)
 	}
@@ -69,19 +70,49 @@ func TestDataCreditStatusKeepsENOSPCForTheLocalStoreOnly(t *testing.T) {
 	}
 }
 
-// TestFrontendCreditBudgetSitsUnderEveryEnclosingBound is the constant's
-// argument, checked rather than asserted in prose. It has to be several
-// per-call wait caps (so an operation gets real chances at the queue) and
-// comfortably under the barrier timeout that bounds the operation the kernel is
-// actually waiting on.
-func TestFrontendCreditBudgetSitsUnderEveryEnclosingBound(t *testing.T) {
-	if frontendCreditBudget >= volumeBarrierTimeout {
-		t.Fatalf("frontend budget %v is not under the %v barrier bound", frontendCreditBudget, volumeBarrierTimeout)
+// TestLaneChangeIsAnUnwindSignalAndNeverAnErrno keeps the internal signal
+// internal. If it ever mapped to a POSIX class an application would be handed a
+// failure for a write that was not attempted at all.
+func TestLaneChangeIsAnUnwindSignalAndNeverAnErrno(t *testing.T) {
+	st := statusErr(writeback.ErrLaneChanged)
+	if !LaneChanged(st) {
+		t.Fatalf("statusErr(ErrLaneChanged) = %d; frontends cannot recognise the unwind", st)
 	}
-	if frontendCreditBudget > volumeBarrierTimeout/3 {
-		t.Fatalf("frontend budget %v leaves less than 3x headroom under %v", frontendCreditBudget, volumeBarrierTimeout)
+	if st == fsproto.EIO || st == fsproto.ENOSPC || st == fsproto.OK {
+		t.Fatalf("the unwind signal collides with the POSIX outcome %d", st)
 	}
-	if frontendCreditBudget < 15*time.Second {
-		t.Fatalf("frontend budget %v is too short to give a queued write several passes at the gate", frontendCreditBudget)
+	if LaneChanged(fsproto.EIO) || LaneChanged(fsproto.OK) || LaneChanged(statusExactRetry) {
+		t.Fatal("LaneChanged accepted a status that is not the unwind signal")
+	}
+	if got := DataCreditStatus(writeback.ErrLaneChanged); !LaneChanged(got) {
+		t.Fatalf("DataCreditStatus(ErrLaneChanged) = %d, want the unwind signal", got)
+	}
+}
+
+// TestCreditAdmissionBudgetProofChain checks the constant's argument rather
+// than trusting its prose. Two inequalities carry the whole design:
+//
+//	noProgressWindow + creditWaitCap < creditAdmissionBudget
+//	    The watchdog's stall verdict always lands STRICTLY BEFORE the budget
+//	    expires, so the budget can never be the thing that reports a stall.
+//	    Without this the frontend would synthesise ErrUplinkStalled for a link
+//	    the engine considers perfectly healthy, and an application would see EIO
+//	    on a mount that is merely slow.
+//
+//	creditAdmissionBudget < volumeBarrierTimeout
+//	    The budget and the reply it produces both land inside the bound on the
+//	    operation the kernel is actually waiting for.
+func TestCreditAdmissionBudgetProofChain(t *testing.T) {
+	verdict := writeback.NoProgressWindow() + writeback.CreditWaitCap()
+	if creditAdmissionBudget <= verdict {
+		t.Fatalf("admission budget %v does not exceed the watchdog verdict bound %v "+
+			"(noProgressWindow %v + creditWaitCap %v); the frontend would time out "+
+			"before the engine could tell it whether the uplink is actually stalled",
+			creditAdmissionBudget, verdict,
+			writeback.NoProgressWindow(), writeback.CreditWaitCap())
+	}
+	if creditAdmissionBudget >= volumeBarrierTimeout {
+		t.Fatalf("admission budget %v is not under the %v barrier bound",
+			creditAdmissionBudget, volumeBarrierTimeout)
 	}
 }

@@ -681,6 +681,15 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 		return admission{}, false, nil
 	}
 	scope := governingScope(path)
+	switch resolvedLaneOf(ctx) {
+	case LaneAuthority:
+		// Decided outside the frontend's locks, with the covering grant already
+		// released and the transition exclusion held. There is nothing to check
+		// and nothing to transition: the authority lane IS the answer.
+		return admission{}, false, nil
+	case LaneDelegated:
+		return e.admitResolved(ctx, path, scope)
+	}
 	for {
 		e.mu.Lock()
 		if e.closed || e.frozen {
@@ -772,6 +781,118 @@ func (e *Engine) admit(ctx context.Context, path string) (admission, bool, error
 	}
 }
 
+// ErrLaneChanged reports that a frontend-resolved operation's lane no longer
+// holds: the classifier proved a delegation at the mutation's exact scope
+// OUTSIDE the frontend's locks, and by the time the operation reached the
+// engine that grant was gone (recalled, released for idleness, or taken by an
+// exact operation).
+//
+// It is not a failure and never reaches an application. It is the ONE answer
+// the engine may give in that situation, because both alternatives are
+// forbidden here: acquiring the grant again is a transition, and taking the
+// authority lane requires releasing whatever now covers the path, which is a
+// drain — and the caller is inside its namespace and handle locks, which is
+// precisely where neither may happen. The frontend unwinds to the pre-lock
+// point and reclassifies, paying any transition where it costs nothing.
+var ErrLaneChanged = errors.New("writeback: resolved write lane changed; reclassify outside the frontend locks")
+
+// PrepareDelegatedWrite resolves — OUTSIDE every frontend lock — whether a data
+// mutation at path will take the delegated write-back lane, performing whatever
+// delegation transition that answer requires: pushing an ancestor grant down
+// (drain + durable release) so the exact scope can be held, or acquiring the
+// exact scope outright.
+//
+// This is the pre-lock half of admit, and the reason it exists is the reason
+// the credit gate is placed where it is. admit's transitions are the two
+// genuinely unbounded steps in a write: a push-down drain ships the ancestor's
+// whole unshipped tail through the uplink that is already behind, and an
+// acquisition is an authority round trip. Taken under a frontend's namespace
+// lock, either one converts a slow uplink into a namespace-wide stall — the
+// writer-preferring RWMutex parks one pending rename or reclaim behind the
+// paced writer and every subsequent lookup behind THAT. Taken here, holding
+// nothing, they cost only the operation that asked for them.
+//
+// A true answer is a fact about a grant that was retained at the instant of the
+// call, not a lease. The engine enforces the rest: a frontend-resolved
+// operation that arrives to find that grant gone is answered ErrLaneChanged
+// rather than being allowed to transition under the caller's locks.
+func (e *Engine) PrepareDelegatedWrite(ctx context.Context, path string, n int64) (bool, error) {
+	if e.cfg.DisableDelegation {
+		return false, nil
+	}
+	if !e.Covers(path) && !e.credits.hasHeadroom(n) {
+		// Nothing covers this path, so the write is write-through TODAY: it
+		// consumes no stream budget, is charged nothing, and waits for nothing.
+		// Acquiring a grant would change all three — it would convert a free
+		// write into one that must be credit-admitted, and then pace it against
+		// a backlog it has contributed nothing to and cannot help drain.
+		//
+		// A delegation is an OPTIMIZATION, and it is only an optimization while
+		// the lane it moves work onto can actually take that work. When the lane
+		// is full the honest answer is the one the write already had.
+		return false, nil
+	}
+	adm, ok, err := e.admit(ctx, path)
+	if err != nil || !ok {
+		return false, err
+	}
+	e.release(adm)
+	return true, nil
+}
+
+// admitResolved is admit for an operation whose lane was resolved outside the
+// frontend's locks (see WithResolvedLane / PrepareDelegatedWrite).
+//
+// It is a PEEK and nothing else. It proceeds iff the exact grant the classifier
+// proved is still retained and usable, and otherwise reports ErrLaneChanged. It
+// never drains, never acquires, never releases and never waits: every one of
+// those is a delegation transition, and by the time this runs the caller is
+// inside the namespace and handle locks a rename, a remove or a delegation
+// reclaim needs. Answering "authority lane" here would be no better — the
+// authority lane requires releasing whatever covers the path, and that release
+// is the drain this placement exists to keep out of the locked region.
+//
+// Caller holds nothing of the engine's; on success e.mu stays held exactly as
+// admit's own success path leaves it.
+func (e *Engine) admitResolved(ctx context.Context, path, scope string) (admission, bool, error) {
+	e.mu.Lock()
+	if e.closed || e.frozen {
+		e.mu.Unlock()
+		return admission{}, false, errors.New("writeback: engine is not accepting mutations")
+	}
+	if err := e.MutationError(); err != nil {
+		e.mu.Unlock()
+		return admission{}, false, err
+	}
+	d := e.coveringLocked(path)
+	if d == nil || d.draining || d.scope != scope {
+		// No grant, a grant already handing off, or a grant at a different
+		// scope than the one that was resolved. Each needs a transition to turn
+		// into an answer, so none of them may be answered here.
+		e.mu.Unlock()
+		return admission{}, false, ErrLaneChanged
+	}
+	if validate := e.cfg.Events.ValidateDelegatedMutation; validate != nil {
+		var snapshot Entry
+		entry, present := e.entryLocked(path)
+		if present {
+			snapshot = *entry
+		}
+		if err := validate(ctx, path, snapshot, present); err != nil {
+			// A refusal is a lane decision, and the lane it selects is the
+			// authority's — which this operation cannot enter from in here.
+			e.mu.Unlock()
+			return admission{}, false, ErrLaneChanged
+		}
+	}
+	if allow := e.cfg.Events.AllowDelegatedMutation; allow != nil && !allow(ctx, path) {
+		e.mu.Unlock()
+		return admission{}, false, ErrLaneChanged
+	}
+	d.lastActive = time.Now()
+	return admission{d: d}, true, nil // e.mu stays held; caller releases
+}
+
 // admitAcross resolves local admission from primary for a mutation touching
 // every path in touched. If primary selects the authority lane, all touched
 // paths must leave delegated mode before the caller can issue that mutation:
@@ -803,6 +924,14 @@ func (e *Engine) release(admission) { e.mu.Unlock() }
 // caller executes write-through — a mutation never runs write-through
 // inside a held delegation. Called with e.mu held; returns with it held.
 func (e *Engine) fallThroughLocked(ctx context.Context, paths ...string) error {
+	if resolvedLaneOf(ctx) != LaneUnresolved {
+		// A classified operation is inside the frontend's namespace and handle
+		// locks. This release IS the drain the pre-lock classifier exists to
+		// hoist out of them — the same one, reached by a different route — so
+		// it is refused here and paid for outside. e.mu stays held, as the
+		// caller's contract requires.
+		return ErrLaneChanged
+	}
 	e.mu.Unlock()
 	err := e.ReleaseFor(ctx, paths...)
 	e.mu.Lock()
@@ -879,19 +1008,44 @@ func (e *Engine) appendLaneLocked(d *delegation, records []wal.Record, lane walL
 		// and keeps its delegations, and this exact mutation is admitted again
 		// once the uplink applies the backlog.
 		e.noteBudgetLocked()
-		if lane == laneData {
-			// The credit gate's ledger counts payload bytes; the hard cap
-			// counts framed on-disk bytes and whole unreclaimed segments, so
-			// the cap can bind first for a shape the gate thought fit. That is
-			// NOT the definite condition — an emptier stream would take this
-			// append. Report it as missing headroom so the caller paces on
-			// applied progress, exactly like a credit wait. ENOSPC stays
-			// reserved for the append that cannot fit an empty lane.
-			if cost, cerr := e.wal.maxAppendCost(payloads); cerr == nil && cost <= budget {
-				return nil, errDataHeadroom
-			}
+		// ENOSPC is a DEFINITE claim — "a bounded local store is full and this
+		// operation can never fit" — and it is the answer an application acts on
+		// by deleting things. So the definite-size question is asked for EVERY
+		// lane, not just the credit-gated one: whether an append could fit an
+		// empty lane is a property of the append, and a lane whose budget is
+		// merely occupied right now has not earned that errno.
+		//
+		// The two lanes then differ only in what a TRANSIENT full means for the
+		// caller, because only one of them has a caller that can wait.
+		cost, cerr := e.wal.maxAppendCost(payloads)
+		transient := cerr == nil && cost <= budget
+		switch {
+		case !transient:
+			// Larger than the lane at any occupancy: draining the entire stream
+			// would still not make room. That is what ENOSPC means.
+			return nil, ErrNoSpace
+		case lane == laneData:
+			// The credit gate's ledger counts payload bytes; the hard cap counts
+			// framed on-disk bytes and whole unreclaimed segments, so the cap can
+			// bind first for a shape the gate thought fit. Report it as missing
+			// headroom so the caller paces on applied progress, exactly like a
+			// credit wait.
+			return nil, errDataHeadroom
+		default:
+			// A transient metadata-lane full. The metadata lane is bounded by the
+			// whole cap and holds a reserve bulk data can never touch, so
+			// reaching here means metadata itself outran the uplink — the store
+			// is not permanently full and the very same operation is admitted
+			// once the authority applies the backlog.
+			//
+			// It is therefore not ENOSPC, and it is not a wait either. Pacing
+			// here would be a wait taken under e.mu with a delegation held, and
+			// the namespace lane's drain dependency is already bounded precisely
+			// because it never does that. What is left is the truthful statement:
+			// the local store is fine and the far end is behind, which is exactly
+			// the EIO-class verdict the data lane produces for the same cause.
+			return nil, ErrUplinkStalled
 		}
-		return nil, ErrNoSpace
 	}
 	if err != nil {
 		return nil, e.failLocalWAL("append mutation", err)
@@ -1007,6 +1161,18 @@ func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int6
 	if n <= 0 {
 		return 0, spaceProceed, nil
 	}
+	if resolvedLaneOf(ctx) == LaneAuthority {
+		// Classified outside the frontend's locks as authority-only: these bytes
+		// will never become WAL bytes, so they are neither charged nor queued.
+		//
+		// This is consulted BEFORE the credit fast path deliberately. The fast
+		// path is one CAS and would happily succeed here, charging the ledger
+		// for a write that cannot produce a single stream byte — a debt only
+		// refundable from wherever clientcore's own lane routing happens to end,
+		// and one that paces honest delegated writers in the meantime. Charging
+		// is a property of the LANE, not of whether credit happened to be free.
+		return 0, spaceAuthority, nil
+	}
 	if e.credits.tryFast(n) {
 		return n, spaceProceed, nil
 	}
@@ -1033,14 +1199,13 @@ func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int6
 		// and has no grant to release, so there is nothing to wait for.
 		return 0, spaceAuthority, nil
 	}
-	if frontendPaced(ctx) {
-		// The frontend already ran this operation's admission OUTSIDE its
-		// namespace and handle locks and declined to charge, because at that
-		// moment nothing covered this path. Reaching here means a delegation
-		// appeared in between. Queueing now would move the wait back under the
-		// caller's locks — the one thing frontend pacing exists to prevent — so
-		// take the authority lane instead. See WithFrontendPacing.
-		return 0, spaceAuthority, nil
+	if resolvedLaneOf(ctx) == LaneDelegated {
+		// A resolved delegated write reaches the gate only on a retry, and by
+		// then it is inside the frontend's locks. Queueing here would move the
+		// wait back under them — the one thing the pre-lock classifier exists to
+		// prevent — so the lane is reported changed and the frontend reclassifies
+		// where waiting is affordable.
+		return 0, spaceExhausted, ErrLaneChanged
 	}
 	for {
 		granted, err := e.credits.acquire(ctx, n)
@@ -1537,16 +1702,19 @@ func (e *Engine) pacedWrite(ctx context.Context, path string, data []byte, at fu
 			// definite after all and gets the definite POSIX answer.
 			return Result{}, true, ErrNoSpace
 		}
-		if frontendPaced(ctx) {
-			// A frontend-paced operation is INSIDE its namespace and handle
-			// locks by the time it gets here, and it already spent its whole
-			// admission budget outside them. There is nothing left to spend in
-			// here, so it does not wait for applied progress: it takes the
-			// authority lane, which makes real forward progress precisely
-			// because it does not consume the resource that is exhausted. The
-			// grant is refunded by writeGranted above, and the next write on
-			// this path is probed and paced from outside the lock as usual.
-			return Result{}, false, nil
+		if resolvedLaneOf(ctx) != LaneUnresolved {
+			// A classified operation is INSIDE its namespace and handle locks by
+			// the time it gets here, and both remaining moves are forbidden in
+			// there: waiting for applied progress is the namespace-wide stall,
+			// and diverting to the authority lane means releasing the grant that
+			// is holding these very bytes — a drain, taken under the same locks.
+			//
+			// The previous shape took that divert, which is exactly how a
+			// frontend-granted write ended up draining a delegation under nsMu.
+			// The lane is reported changed instead: the frontend unwinds, and
+			// the reclassification pays for the release outside every lock. The
+			// grant is already refunded by writeGranted above.
+			return Result{}, true, ErrLaneChanged
 		}
 		// The credit gate said yes and the hard cap said not yet. Wait for the
 		// one event that frees hard-cap headroom, then re-enter admission —

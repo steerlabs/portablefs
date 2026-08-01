@@ -11,8 +11,17 @@
 //	go run ./bench/cmd/fsops -dir /tmp/bench-m1/enum -enum 1000,10000
 //	go run ./bench/cmd/fsops -dir /tmp/bench-m1/bulk -bulk 512 -bulkchunk 1048576
 //
+// -dir names a WORKSPACE, not the directory the benchmark writes into. The
+// workspace is created if absent and is never removed; every phase runs inside
+// a freshly created, uniquely named fsops-<pid>-<rand> child of it, and only
+// that child is deleted on exit (-keep leaves even that in place). The tool
+// therefore never removes a directory it did not create, so pointing -dir at a
+// workspace that already holds data is safe.
+//
 // Every phase is independent and reported separately; -json emits machine
-// readable records for the roadmap tables.
+// readable records for the roadmap tables. The -bulk phase additionally emits
+// one stable `fsops-bulk key=value ...` line that separates the write(2)
+// acknowledgement rate from the fsync barrier that follows it.
 package main
 
 import (
@@ -90,8 +99,33 @@ func pct(sorted []float64, p int) float64 {
 	return sorted[i]
 }
 
+// provisionWorkDir creates the directory every phase operates in: a freshly
+// created, uniquely named child of the caller's workspace.
+//
+// The workspace itself is only ever created, never removed — it is the user's
+// directory and may already hold anything. The returned cleanup removes the
+// child and nothing else, so the tool can only ever delete a directory it
+// created and uniquely owns.
+func provisionWorkDir(parent string, keep bool) (string, func(), error) {
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", nil, err
+	}
+	// MkdirTemp creates exclusively: the returned path did not exist a moment
+	// ago and belongs to this process alone.
+	work, err := os.MkdirTemp(parent, fmt.Sprintf("fsops-%d-", os.Getpid()))
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() {
+		if !keep {
+			_ = os.RemoveAll(work)
+		}
+	}
+	return work, cleanup, nil
+}
+
 func main() {
-	dir := flag.String("dir", "", "directory to benchmark in (created if absent)")
+	dir := flag.String("dir", "", "workspace to benchmark in (created if absent, never removed); every phase runs in a freshly created fsops-* child of it")
 	n := flag.Int("n", 100, "iterations per op phase")
 	size := flag.Int("size", 4096, "bytes written per small-file write")
 	enum := flag.String("enum", "", "comma-separated dir sizes to enumerate, e.g. 1000,10000")
@@ -100,32 +134,32 @@ func main() {
 	bulkChunk := flag.Int("bulkchunk", 1<<20, "write(2) chunk size for the bulk phase")
 	fsyncEvery := flag.Bool("fsync", false, "fsync each small file after write (durability barrier cost)")
 	asJSON := flag.Bool("json", false, "emit JSON")
-	keep := flag.Bool("keep", false, "leave the probe directory in place")
+	keep := flag.Bool("keep", false, "leave this run's fsops-* work directory in place instead of removing it")
 	flag.Parse()
 
 	if *dir == "" {
 		fmt.Fprintln(os.Stderr, "fsops: -dir required")
 		os.Exit(2)
 	}
-	if err := os.MkdirAll(*dir, 0o755); err != nil {
+	work, cleanup, err := provisionWorkDir(*dir, *keep)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
 		os.Exit(1)
 	}
-	if !*keep {
-		defer os.RemoveAll(*dir)
-	}
+	defer cleanup()
+	fmt.Fprintf(os.Stderr, "# fsops work dir %s\n", work)
 
 	rec := newRecorder()
 	switch {
 	case *scale != "":
-		runScale(rec, *dir, *scale)
+		runScale(rec, work, *scale)
 	case *enum != "":
-		runEnum(rec, *dir, *enum)
+		runEnum(rec, work, *enum)
 	case *bulk > 0:
-		runBulk(*dir, *bulk, *bulkChunk)
+		runBulk(work, *bulk, *bulkChunk)
 		return
 	default:
-		runOps(rec, *dir, *n, *size, *fsyncEvery)
+		runOps(rec, work, *n, *size, *fsyncEvery)
 	}
 
 	res := rec.results()
@@ -446,7 +480,8 @@ func runBulk(dir string, mb, chunk int) {
 		}
 	}
 	acked := time.Since(t0)
-	fmt.Printf("write-acked   %.1fMiB in %.2fs = %.2f MB/s\n", float64(written)/(1<<20), acked.Seconds(), float64(written)/(1<<20)/acked.Seconds())
+	mib := float64(written) / (1 << 20)
+	fmt.Printf("write-acked   %.1fMiB in %.2fs = %.2f MB/s (write(2) return only; no barrier)\n", mib, acked.Seconds(), mib/acked.Seconds())
 
 	t1 := time.Now()
 	if err := f.Sync(); err != nil {
@@ -454,8 +489,14 @@ func runBulk(dir string, mb, chunk int) {
 	}
 	sync := time.Since(t1)
 	_ = f.Close()
-	fmt.Printf("fsync-barrier %.2fs (drains the unshipped tail to the authority)\n", sync.Seconds())
+	fmt.Printf("fsync-barrier %.2fs (drains the unshipped tail to the authority, then the authority barrier RPC)\n", sync.Seconds())
 	end := acked + sync
-	fmt.Printf("durable-total %.1fMiB in %.2fs = %.2f MB/s effective upload\n",
-		float64(written)/(1<<20), end.Seconds(), float64(written)/(1<<20)/end.Seconds())
+	fmt.Printf("durable-total %.1fMiB in %.2fs = %.2f MB/s effective upload\n", mib, end.Seconds(), mib/end.Seconds())
+
+	// One stable machine-readable line so a harness consumes THESE numbers
+	// instead of re-deriving a rate from process exit — which would fold the
+	// fsync barrier into the write phase and report a durable rate as an ack
+	// rate.
+	fmt.Printf("fsops-bulk mib=%.4f write_acked_s=%.6f fsync_barrier_s=%.6f durable_total_s=%.6f write_acked_mbps=%.4f durable_total_mbps=%.4f\n",
+		mib, acked.Seconds(), sync.Seconds(), end.Seconds(), mib/acked.Seconds(), mib/end.Seconds())
 }

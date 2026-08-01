@@ -66,28 +66,45 @@ can fail UPSTREAM_UNREACHABLE (502) while the router warms; the intent
 machinery preserves and later reconciles these correctly, but deploy
 tooling should gate on a lease-create probe, not just /readyz.
 
-### 6. Handle close drains its backlog inside the op pipeline
+### 6. (FIXED on fix/root-architecture — see the Fixed list) Handle close
+drained its backlog inside the op pipeline. All three root fixes landed:
+close(2) returns after WAL admission (fsync remains the durability
+barrier), drain completion survives frontend death (permanently-suspended
+non-publishing continuations), and the CLI umount preflight classifies
+EIO/ETIMEDOUT-with-live-attach as the daemon-owned detach case.
 
-Reproduced live on the fixed build (deliberate saturation): the ENOSPC
-admission contract held perfectly (definite refusals in ~11s, metadata
-responsive throughout the flood, engine unpoisoned) — but CLOSING the
-flooded handle with ~2 GB of admitted backlog drained synchronously in
-the frontend op pipeline. Unrelated stats queued behind it until the
-kernel timed out the volume and declared it dead; with the frontend
-gone, the drain then stalled permanently (97 MB pending, no failure
-recorded) because release completion awaits a frontend publication
-acknowledgment that a dead frontend can never send. Recovery worked
-(force-detach parked the tail as a durable job; no reboot), but three
-root fixes fall out:
-- close(2) must not synchronously drain admitted data — fsync is the
-  durability barrier; close returns after WAL admission and the engine
-  owns the drain (same contract as Open §1, handle lane);
-- drain completion must not depend on a live frontend (the publication
-  ack path must treat frontend death as a definite non-ack);
-- the CLI umount preflight must classify an unresponsive/EIO mountpoint
-  with NO kernel mount but a LIVE attach as the daemon-owned detach
-  case (today only EIO-with-matching-kernel-mount proceeds; this shape
-  refuses, and the only recovery is the daemon control API directly).
+### 9. Unify the pre-lock credit grant with the WAL reservation
+
+The pre-lock lane classifier guarantees a granted write performs no RPC,
+transition, or wait under frontend locks; a granted write that still
+finds the exact framed-byte reservation full (errDataHeadroom — the
+credit ledger counts payload bytes, the WAL counts framed bytes plus
+unreclaimed segments) unwinds via ErrLaneChanged with locks released and
+retakes the authority lane. Bounded and correct, but the residue is
+structural: making errDataHeadroom impossible for a granted write means
+the grant must BE the reservation (one ledger, framed units, rotation
+cost reserved at grant). Deferred only because it collides with the
+control-reserve rewrite landed in the same change set; top follow-up.
+
+### 10. Production recovery gaps (2026-07-31 Railway Postgres outage)
+
+The fencing design held (no split-brain, every acknowledged write
+durable), but a ~2-minute database outage became a ~40-minute admission
+outage because of three recovery gaps, all root-fixable:
+- an authority-manager that fences itself (claim-deadline-exceeded) must
+  EXIT so the platform restarts it into a fresh epoch claim — epoch 29
+  hung fenced with the process alive and no successor for 40+ minutes;
+- volume-api crashed applying metadata migrations while Postgres was
+  still in crash recovery and stayed dead (no retry, no platform
+  restart) — startup must retry-until-ready or fail the deploy;
+- the client daemon wedges silently when its access lease dies:
+  pendingBytes frozen, degraded unset, lastFailure empty,
+  unmarkOpenBatchManaged in an unbounded retry, and processes on the
+  mount left in uninterruptible D state until force-detach. Lease death
+  must surface as a definite degraded state with the parked-job path
+  engaged, not a silent stall.
+Related: §5 already records that deploy tooling must gate on a
+lease-create probe, not /readyz.
 
 ### 7. Transient ENODATA reading a peer's just-created file
 
@@ -119,6 +136,37 @@ These belong in user-facing consistency documentation as contracts, with
 radars for the API gaps.
 
 ## Fixed on fix/root-architecture
+
+- **Drain-time credit controller (write backpressure)**: the instant-
+  ENOSPC cliff at the WAL budget is gone. Writes burst to a setpoint
+  (measured authority-applied rate × 25s drain target, capped at the
+  hard budget) then pace to the uplink; the hard budget remains the sole
+  bound via the untouched reservation ledger, now extended so every
+  on-disk append — including delegation/release/lifecycle control frames
+  — reserves inside the cap (bounded control reserve, worst case &lt;1% of
+  a 512 MiB cap). Metadata rides a reserved lane and is never
+  credit-charged; transient lane exhaustion is EIO-class (the store
+  isn't full), ENOSPC is reserved for operations that can never fit.
+  Live-validated: burst-then-pace at the applied rate, 25.3s measured
+  drain vs the 25s target, zero ENOSPC past the old 2 GiB cliff.
+- **Pre-lock lane classification**: every frontend write resolves its
+  lane exactly once from node identity BEFORE any frontend lock
+  (Volume.AdmitWrite + Engine.PrepareDelegatedWrite hoists delegation
+  transitions outside the locks); under the locks the engine only
+  checks, and staleness unwinds with all locks released (ErrLaneChanged
+  → reclassify, at most two passes). Orphan/hardlink/pathless writes are
+  never charged. A write that cannot obtain delegated credit within a
+  40s admission budget (provably after the 30s no-progress watchdog
+  would have declared a real stall) succeeds via the authority lane —
+  a slow-but-healthy uplink is never reported as stalled.
+- **Close is local bookkeeping**: close(2) returns after WAL admission
+  (fsync is the durability barrier), never joins exactMu, and the
+  engine-owned drain survives frontend death; CLI umount classifies
+  dead-volume residue (EIO/ETIMEDOUT with a live attach) definitively.
+- **Committed progress is never reported as failure**: the write reply's
+  count is decided by the write; a failed post-commit attribute refresh
+  answers from the already-published item (closing an O_APPEND
+  duplication path). Short writes propagate end-to-end.
 
 - **parkExact claim transfer**: an exact identity that may have been sent
   now reaches a definite outcome before the exclusion it was issued under

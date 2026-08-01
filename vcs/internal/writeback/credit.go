@@ -130,6 +130,12 @@ func metadataReserveFor(budget int64) int64 {
 // dataBudgetBytes is the HARD cap of the bulk-data lane: the stream budget
 // minus the metadata reserve. Data appends are reserved against this; metadata
 // appends are reserved against the full budget.
+//
+// A third slice — the WAL's control reserve — is subtracted from whichever of
+// these two numbers reaches admission, once, inside the WAL (see
+// streamWAL.controlReserveLocked for the full partition of BudgetBytes). This
+// function therefore states only the data/metadata boundary; both lanes inherit
+// the control reserve without double-counting it.
 func (e *Engine) dataBudgetBytes() int64 {
 	return e.cfg.BudgetBytes - metadataReserveFor(e.cfg.BudgetBytes)
 }
@@ -341,39 +347,94 @@ func takeDataCredit(ctx context.Context, want int64) int64 {
 	return g.take(want)
 }
 
-type frontendPacedKey struct{}
+type resolvedLaneKey struct{}
 
-// WithFrontendPacing marks ctx as an operation whose data-lane admission was
-// already decided by a frontend BEFORE the frontend took its namespace and
-// handle locks (see the AcquireDataCredit surface each frontend calls).
+// ResolvedLane is a frontend classifier's DEFINITE answer for one data
+// mutation, reached before the frontend took any namespace, inode or handle
+// lock, and binding on everything the operation does afterwards.
 //
-// The marker means ONE thing, applied at both places the engine could
-// otherwise block a data write: this operation must never wait again. It has
-// already had its wait, in the only place where waiting costs nothing.
+// The lane exists because a data mutation has exactly two of them and choosing
+// between them is not free. Reaching the delegated lane can require pushing an
+// ancestor grant down — drain its whole unshipped tail through the uplink, then
+// release it durably — or acquiring a grant over an authority round trip.
+// Reaching the authority lane can require releasing whatever covers the path,
+// which is the same drain. Both are DELEGATION TRANSITIONS, and a transition
+// taken while a frontend lock is held is the incident this whole placement
+// exists to prevent: Go's RWMutex is writer-preferring, so one paced writer on
+// the read side parks the next rename, remove or delegation reclaim, and every
+// lookup, getattr and read behind it — a namespace-wide stall caused by a
+// backlog on one path.
 //
-//   - Credit gate (admitDataBytes). The marker's presence without a grant means
-//     that at probe time — outside every lock — nothing covered this path, so
-//     the write was classified write-through and deliberately not charged. If a
-//     delegation appears in the microseconds between that probe and the
-//     engine's own check, the correct answer is the authority lane, not a wait.
-//   - Hard-cap headroom (pacedWrite's errDataHeadroom retry). The credit ledger
-//     counts payload bytes and the WAL counts framed bytes, so a granted write
-//     can still find the exact reservation full. Waiting for applied progress
-//     is the right answer for a lock-free caller and the wrong one here.
-//
-// In both cases the operation takes the authority lane. It stays correct (the
-// authority lane is always a legal answer for a data mutation), it makes real
-// forward progress because it does not consume the exhausted resource, and the
-// NEXT operation on the path sees the state from outside the lock and is paced
-// normally.
-func WithFrontendPacing(ctx context.Context) context.Context {
-	return context.WithValue(ctx, frontendPacedKey{}, true)
+// So the transition is paid where it costs one operation instead of a mount,
+// and what crosses into the locked region is not a hint but a decided answer.
+// Inside the locks the engine only ever CHECKS the answer; if it no longer
+// holds it says so (ErrLaneChanged) and the frontend reclassifies outside its
+// locks, rather than transitioning where it must not.
+type ResolvedLane int
+
+const (
+	// LaneUnresolved: no frontend classifier ran. The engine owns the entire
+	// decision and may transition freely — a caller that reached it without a
+	// classifier holds no frontend lock, so waiting costs only that caller.
+	// This is the engine's own API surface and every non-frontend embedder.
+	LaneUnresolved ResolvedLane = iota
+
+	// LaneAuthority: this mutation will not reach the write-back WAL. Either
+	// the node's identity forbids it — an orphaned inode, a hard link, a
+	// pathless detached handle — or nothing delegates the path. It consumes no
+	// stream budget, so it is never credit-charged and never queued: pacing it
+	// would throttle a workload that is not responsible for the backlog and
+	// cannot help drain it.
+	//
+	// When the path WAS covered, the classifier has already released the
+	// covering grant and holds the transition exclusion that keeps a new one
+	// from being installed underneath the operation. That is what makes the
+	// answer definite rather than a guess: the engine can assert it without
+	// re-deriving it, and clientcore never has to release anything under a
+	// frontend lock.
+	LaneAuthority
+
+	// LaneDelegated: a grant at the mutation's exact governing scope was
+	// retained when the classifier looked, and data credit was charged against
+	// it. A grant can still be recalled between then and the write — by the
+	// authority, by the idle releaser, by an exact operation — and the engine
+	// answers that with ErrLaneChanged rather than by transitioning.
+	LaneDelegated
+)
+
+// WithResolvedLane records a classifier's decision on ctx.
+func WithResolvedLane(ctx context.Context, lane ResolvedLane) context.Context {
+	if lane == LaneUnresolved {
+		return ctx
+	}
+	return context.WithValue(ctx, resolvedLaneKey{}, lane)
 }
 
-func frontendPaced(ctx context.Context) bool {
-	paced, _ := ctx.Value(frontendPacedKey{}).(bool)
-	return paced
+func resolvedLaneOf(ctx context.Context) ResolvedLane {
+	lane, _ := ctx.Value(resolvedLaneKey{}).(ResolvedLane)
+	return lane
 }
+
+// LaneOf reports the lane a frontend classifier decided for this operation, or
+// LaneUnresolved if none ran. Frontends read it to tell "I am inside my locks
+// with a decided answer" from "no classifier ran", which is what makes a
+// delegation transition forbidden in the first case and free in the second.
+func LaneOf(ctx context.Context) ResolvedLane { return resolvedLaneOf(ctx) }
+
+// NoProgressWindow and CreditWaitCap publish the two bounds a frontend's own
+// admission budget must be proved against: the watchdog's stall verdict window
+// and one credit acquisition's wait. A frontend budget that does not strictly
+// exceed their sum would expire before the engine could say whether the uplink
+// is stalled, and the frontend would have to invent the verdict — which is
+// exactly the lie the split exists to prevent. Exported so that proof is a test
+// rather than a comment.
+func NoProgressWindow() time.Duration { return noProgressWindow }
+func CreditWaitCap() time.Duration    { return creditWaitCap }
+
+// UplinkStalled is the engine's stall verdict — the ONLY thing that may make a
+// frontend report ErrUplinkStalled. A frontend that derives it from elapsed
+// time instead reports a dead far end for a link the engine considers healthy.
+func (e *Engine) UplinkStalled() bool { return e.fl.uplinkStalled() }
 
 // ─── acquisition ─────────────────────────────────────────────────────────────
 
@@ -405,23 +466,61 @@ func (c *creditController) acquire(ctx context.Context, n int64) (int, error) {
 	return c.wait(ctx, n)
 }
 
+// creditFastPathCAS is the seam that lets a test land a waiter in the exact
+// window between the fast path's debt snapshot and the CAS that commits it. It
+// is nil in production, where it costs one predicted-not-taken nil compare per
+// admission and nothing else.
+var creditFastPathCAS func()
+
 // tryFast is the whole hot path: two atomic loads and one CAS. It yields to a
 // non-empty queue so a flood of small arrivals cannot starve waiters that are
 // already in line.
+//
+// The queue check lives INSIDE the loop, after the debt snapshot the CAS will
+// commit. That ordering is the fairness property itself. Reading `waiting` once
+// before the loop admits a barge: a caller that observes an empty queue, loses
+// its CAS to a racing admission, and retries would commit its second attempt
+// against a queue that became non-empty in between — precisely the "flood of
+// small arrivals starves the waiter already in line" case the queue exists to
+// prevent. Re-reading it every iteration gives the strongest property a
+// lock-free fast path can carry: between the last observation of an empty queue
+// and the successful CAS, this goroutine performs no other operation, so no
+// admission ever COMPLETES after the queue was seen to be non-empty.
 func (c *creditController) tryFast(n int64) bool {
-	if c.waiting.Load() != 0 {
-		return false
-	}
 	setpoint := c.setpoint.Load()
 	for {
 		cur := c.debt.Load()
 		if cur+n > setpoint {
 			return false
 		}
+		if c.waiting.Load() != 0 {
+			return false
+		}
+		if creditFastPathCAS != nil {
+			creditFastPathCAS()
+		}
 		if c.debt.CompareAndSwap(cur, cur+n) {
 			return true
 		}
 	}
+}
+
+// hasHeadroom reports whether the gate could admit n right now, WITHOUT
+// charging anything. It is the question a classifier asks before deciding
+// whether taking a delegation is worth it at all: a grant that cannot be
+// credit-admitted turns a free write-through into a paced delegated write.
+//
+// It reads the same two atomics tryFast does and yields to a non-empty queue
+// for the same reason — a caller that would have to queue does not have
+// headroom, it has a place in line.
+func (c *creditController) hasHeadroom(n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	if c.gated.Load() || c.waiting.Load() != 0 {
+		return false
+	}
+	return c.debt.Load()+n <= c.setpoint.Load()
 }
 
 // refund returns unspent credit to the ledger and re-runs the queue: a refund

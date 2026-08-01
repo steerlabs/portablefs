@@ -70,6 +70,40 @@ func (v *Volume) releaseHardlinkScopes(
 	return v.wb.ReleaseFor(ctx, v.hardlinkMutationPaths(nodes, operands...)...)
 }
 
+// releaseHardlinkScopesResolved is releaseHardlinkScopes for a write, and it
+// exists to keep that release out of the frontend's locks.
+//
+// Three cases, and the distinction is the whole point:
+//
+//   - The classifier resolved the AUTHORITY lane. It identified the hard link
+//     on identity and already released every alias scope out of the locks, so
+//     there is nothing left to drain here.
+//   - The classifier resolved the DELEGATED lane. The node BECAME a hard-linked
+//     alias — a link(2) elsewhere — after classification. Draining the alias
+//     scopes now would be exactly the release the classifier was built to
+//     hoist, taken in exactly the wrong place, so the operation unwinds and the
+//     next classification routes it on identity like any other hard link.
+//   - No classifier ran. The caller holds no frontend lock, so the release
+//     costs only it.
+//
+// unwind=true means the caller must return st and go no further.
+func (v *Volume) releaseHardlinkScopesResolved(
+	ctx context.Context,
+	n *NodeState,
+	path string,
+) (Status, bool) {
+	switch writeback.LaneOf(ctx) {
+	case writeback.LaneAuthority:
+		return fsproto.OK, false
+	case writeback.LaneDelegated:
+		return statusLaneRetry, true
+	}
+	if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
+		return statusErr(err), true
+	}
+	return fsproto.OK, false
+}
+
 // hardlinkMutationPaths returns every known spelling whose delegation view
 // can be affected by a path-bearing inode mutation. It is also used by the
 // authority/delegation transition gate so an alias grant cannot install in

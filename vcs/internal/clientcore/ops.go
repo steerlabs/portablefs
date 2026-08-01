@@ -14,12 +14,31 @@ import (
 
 const statusExactRetry Status = -4096
 
+// statusLaneRetry reports that a classified write's lane no longer holds and
+// the operation must unwind to the pre-lock classifier.
+//
+// It is an internal signal and never reaches an application. It exists because
+// the two ways to recover from a stale lane — acquiring a grant, or releasing
+// one to reach the authority lane — are both delegation TRANSITIONS, and the
+// operation is inside the frontend's namespace and handle locks by the time it
+// finds out. Unwinding is the only recovery that keeps the transition outside
+// them, which is the whole invariant the pre-lock classifier establishes.
+const statusLaneRetry Status = -4097
+
+// LaneChanged reports that st is the unwind signal rather than a POSIX outcome.
+// A frontend that sees it must discard the attempt, leave its locks, and
+// re-enter AdmitWrite; mapping it to an errno would hand an application a
+// failure for a write that has not been attempted.
+func LaneChanged(st Status) bool { return st == statusLaneRetry }
+
 func statusErr(err error) Status {
 	switch {
 	case err == nil:
 		return fsproto.OK
 	case errors.Is(err, writeback.ErrDelegatedBindingMismatch):
 		return statusExactRetry
+	case errors.Is(err, writeback.ErrLaneChanged):
+		return statusLaneRetry
 	case errors.Is(err, os.ErrNotExist):
 		return fsproto.ENOENT
 	case errors.Is(err, os.ErrExist):
@@ -634,11 +653,31 @@ func (v *Volume) rollbackTrackedOpen(path string, n *NodeState) {
 	}
 }
 
+// CloseHandle retires one local handle reference. It is LOCAL bookkeeping in
+// full: the open tracker, the NodeState's open count and orphan identity, and
+// the open registry's refcount — each under its own short lock, none of them
+// across authority I/O.
+//
+// It therefore joins the lifecycle gate and NOTHING else. In particular it does
+// not join exactMu. exactMu orders path-keyed write-back admission against
+// inode-addressed authority mutation (see the field's own contract): the exact
+// lane holds it EXCLUSIVELY across a mount-wide delegation release and the
+// inode-addressed round trip that follows, and hands the unlock to an exclusion
+// a parked identity can keep until a session fence resolves it. Close admits
+// nothing, addresses no inode remotely and moves no delegation, so it has no
+// share in that invariant — and because Go's RWMutex is writer-preferring, even
+// taking it shared would park every close behind a merely PENDING exact
+// operation. That is how close inherits an unbounded authority wait it has no
+// business waiting on, and it is why the close-returns-fast contract requires
+// the retirement path to stay out of this lock entirely.
+//
+// The lifecycle gate is the one exclusion close does need: it is what stops a
+// retirement from racing Volume.Close's exclusive lifecycle transition.
 func (v *Volume) CloseHandle(path string, n *NodeState) Status {
-	if err := v.beginSharedOperation(); err != nil {
+	if err := v.beginLifecycleOperation(); err != nil {
 		return fsproto.EIO
 	}
-	defer v.endSharedOperation()
+	defer v.lifecycleMu.RUnlock()
 
 	v.openStateMu.Lock()
 	if currentPath, found := v.opens.CurrentPath(path, n); found {
@@ -901,8 +940,8 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		return cnt, st
 	}
 	if v.wb != nil && v.isHardlink(n) {
-		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
-			return 0, statusErr(err)
+		if st, unwind := v.releaseHardlinkScopesResolved(ctx, n, path); unwind {
+			return 0, st
 		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
@@ -935,6 +974,9 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			return 0, statusErr(werr)
 		}
 	}
+	// The classifier already paid this lane's delegation release outside the
+	// frontend's locks whenever it resolved the authority lane, so the release
+	// inside here has nothing left to drain.
 	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)
@@ -1041,8 +1083,8 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		return cnt, st
 	}
 	if v.wb != nil && v.isHardlink(n) {
-		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
-			return 0, statusErr(err)
+		if st, unwind := v.releaseHardlinkScopesResolved(ctx, n, path); unwind {
+			return 0, st
 		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
@@ -1072,6 +1114,9 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 			return 0, statusErr(werr)
 		}
 	}
+	// The classifier already paid this lane's delegation release outside the
+	// frontend's locks whenever it resolved the authority lane, so the release
+	// inside here has nothing left to drain.
 	authorityCtx, endAuthority, releaseErr := v.beginAuthorityMutation(
 		ctx, []*NodeState{n}, path,
 	)

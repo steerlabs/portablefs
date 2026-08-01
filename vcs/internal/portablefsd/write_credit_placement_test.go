@@ -327,37 +327,114 @@ func TestShortGrantRepliesAShortWrittenCount(t *testing.T) {
 	f.releaseLane()
 }
 
-// TestStalledUplinkWriteRepliesEIONotENOSPC is the errno contract. A gate that
-// hands out nothing for the whole frontend budget while the local store is
-// perfectly healthy is reporting a far end that stopped answering. That is EIO.
-// Reporting ENOSPC instead teaches applications to delete files to fix a
-// network partition, which is why the two are kept structurally distinct all
-// the way from writeback.ErrUplinkStalled to the darwin errno.
+// TestHealthyUplinkIsNeverReportedAsStalled is the wait policy's core claim: a
+// frontend never SYNTHESISES a stall the engine has not declared.
+//
+// The distinction is not academic. writeback.AcquireDataCredit returns
+// (0, nil) precisely when the no-progress watchdog has NOT declared a stall —
+// "no credit yet, but the uplink IS making durable progress". A frontend that
+// converts elapsed time into ErrUplinkStalled therefore reports a dead far end
+// for a link the engine considers perfectly healthy, and the application sees
+// EIO on a mount that is merely slow. Under the measured saturation profile
+// that is not a corner case: healthy paced writes routinely block for tens of
+// seconds while the kernel's aggregated dirty pages drain.
+//
+// Here the lane is held full by a credit holder while the authority is
+// untouched, so the engine's verdict is unambiguously "not stalled". The write
+// must not fail. It reaches a definite outcome by taking the OTHER lane — the
+// authority lane consumes no stream budget, so it is admitted immediately — and
+// the application gets its bytes written instead of an error it cannot act on.
+func TestHealthyUplinkIsNeverReportedAsStalled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spends the whole credit admission budget by design")
+	}
+	f := newWriteCreditFixture(t)
+	ctx := context.Background()
+	payload := make([]byte, 256<<10)
+
+	start := time.Now()
+	reply, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+		Handle: delegatedHandle,
+		Offset: 0,
+		Data:   payload,
+	})
+	elapsed := time.Since(start)
+	if eno != 0 {
+		t.Fatalf("a write against a full lane on a HEALTHY uplink replied errno=%d; "+
+			"the engine's watchdog never declared a stall, so the frontend invented one", eno)
+	}
+	if int(reply.Written) != len(payload) {
+		t.Fatalf("write reported %d of %d bytes", reply.Written, len(payload))
+	}
+	if elapsed > creditAdmissionCeiling {
+		t.Fatalf("the frontend held the operation open for %v, past any kernel's patience", elapsed)
+	}
+	f.releaseLane()
+}
+
+// creditAdmissionCeiling is the outer bound one daemon write op may take. The
+// kernel can aggregate several ops into one write(2), so this has to stay well
+// under the FSKit reply ceiling with room for a few of them.
+const creditAdmissionCeiling = 50 * time.Second
+
+// TestStalledUplinkWriteRepliesEIONotENOSPC is the errno contract, and it now
+// tests it against a REAL stall rather than against elapsed time.
+//
+// A far end that stopped answering is EIO. Reporting ENOSPC instead teaches
+// applications to delete files to fix a network partition, which is why the two
+// are kept structurally distinct all the way from writeback.ErrUplinkStalled to
+// the darwin errno. The verdict comes from the engine's no-progress watchdog
+// and from nowhere else.
 func TestStalledUplinkWriteRepliesEIONotENOSPC(t *testing.T) {
 	if testing.Short() {
-		t.Skip("spends the whole frontend credit budget by design")
+		t.Skip("waits out the engine's no-progress window by design")
 	}
 	f := newWriteCreditFixture(t)
 	ctx := context.Background()
 
-	start := time.Now()
+	// Kill the uplink for real: admitted work can never be applied, so the
+	// watchdog's verdict becomes true on its own schedule.
+	f.releaseLane()
+	if _, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+		Handle: delegatedHandle,
+		Data:   make([]byte, 64<<10),
+	}); eno != 0 {
+		t.Fatalf("seed write: errno=%d", eno)
+	}
+	f.vol.Client().ExpireSession()
+	if _, eno := f.a.write(ctx, &pfslocal.WriteRequest{
+		Handle: delegatedHandle,
+		Offset: 64 << 10,
+		Data:   make([]byte, 64<<10),
+	}); eno != 0 && eno != darwinEIO {
+		t.Fatalf("write after fencing the session: errno=%d", eno)
+	}
+	if pending, _ := f.vol.WriteBackPending(); pending == 0 {
+		t.Skip("no unshipped backlog for the watchdog to judge")
+	}
+	f.holdWholeDataLane(t)
+
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		if !f.vol.Writeback().UplinkStalled() {
+			if time.Now().After(deadline) {
+				t.Skip("the watchdog did not declare a stall inside the test's patience")
+			}
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		break
+	}
 	_, eno := f.a.write(ctx, &pfslocal.WriteRequest{
 		Handle: delegatedHandle,
-		Offset: 0,
+		Offset: 128 << 10,
 		Data:   make([]byte, 256<<10),
 	})
-	elapsed := time.Since(start)
-	if eno != darwinEIO {
-		t.Fatalf("a write against a lane that grants nothing replied errno=%d, want EIO (%d)", eno, darwinEIO)
-	}
 	if eno == darwinENOSPC {
 		t.Fatal("a stalled uplink must never be reported as a full local store")
 	}
-	if elapsed < 10*time.Second {
-		t.Fatalf("the frontend gave up after %v; it must spend its whole budget before calling a slow uplink dead", elapsed)
-	}
-	if elapsed > 40*time.Second {
-		t.Fatalf("the frontend held the operation open for %v, past any kernel's patience", elapsed)
+	if eno != darwinEIO {
+		t.Fatalf("a write against a STALLED uplink replied errno=%d, want EIO (%d)", eno, darwinEIO)
 	}
 	f.releaseLane()
 }

@@ -382,10 +382,28 @@ type cliAttachStatus struct {
 }
 
 type cliWriteBackStatus struct {
-	PendingRecords int                 `json:"pendingRecords"`
-	PendingBytes   int64               `json:"pendingBytes"`
+	PendingRecords int   `json:"pendingRecords"`
+	PendingBytes   int64 `json:"pendingBytes"`
+	WALBytes       int64 `json:"walBytes"`
+	WALBudget      int64 `json:"walBudget"`
+	LastProgressMs int64 `json:"lastProgressMs"`
+	// Drain-time credit control: the pacing state that distinguishes a
+	// flusher deliberately holding writers back from one that is not draining
+	// at all. PendingRecords alone cannot tell those apart.
+	CreditSetpoint int64               `json:"creditSetpoint"`
+	CreditDebt     int64               `json:"creditDebt"`
+	CreditCeiling  int64               `json:"creditCeiling"`
+	AppliedRateBps float64             `json:"appliedRateBps"`
+	CreditWaiters  int                 `json:"creditWaiters"`
+	DataLaneFull   bool                `json:"dataLaneFull"`
 	Delegations    []cliDelegationView `json:"delegations"`
 	ParkedWALs     []cliParkedWAL      `json:"parkedWals"`
+}
+
+// paced reports the data lane holding writers back: either mutations are
+// currently blocked on credit or the bulk lane is sitting at its hard cap.
+func (w *cliWriteBackStatus) paced() bool {
+	return w != nil && (w.CreditWaiters > 0 || w.DataLaneFull)
 }
 
 type cliDelegationView struct {

@@ -32,6 +32,46 @@ const (
 	groupSyncBytes = 4 << 20
 )
 
+// Control frames carry the only variable-length fields the log holds outside a
+// mutation payload. The stream's byte cap can only be a bound if the bytes
+// those fields can produce are bounded, so each is capped here and checked
+// before the frame is encoded: an over-long value is a definite refusal at the
+// write path, never a frame the strict decoder would later reject as
+// corruption (decodeFrameAt bounds payloadLen by maxMutationPayload for EVERY
+// frame type, so an unchecked control frame is writable and unreplayable).
+const (
+	// maxScopeBytes bounds a delegation scope. A scope is a path, so this
+	// mirrors fsproto.MaxPathBytes (not imported here: the WAL owns its own
+	// frame bounds and must not inherit them from the wire protocol).
+	maxScopeBytes = 4096
+	// maxEpochBytes bounds the authority-supplied grant epoch.
+	maxEpochBytes = 256
+	// maxJobIDBytes bounds a recovery job identifier.
+	maxJobIDBytes = 128
+	// maxReasonBytes bounds a forced-close diagnostic string.
+	maxReasonBytes = 256
+	// maxDigestBytes is the hex chain digest an APPLIED certificate carries.
+	maxDigestBytes = 2 * 32
+
+	// jsonEscapeFactor is encoding/json's worst-case expansion for one input
+	// byte: \uXXXX, emitted for a control byte and for < > &.
+	jsonEscapeFactor = 6
+	// maxUint64Digits bounds a JSON-encoded uint64.
+	maxUint64Digits = 20
+
+	// The worst-case JSON encoding of each control payload shape, from the
+	// field caps above plus each struct's fixed punctuation:
+	//
+	//	{"scope":"S","epoch":"E"}               23 + |S| + |E|
+	//	{"through":N,"digest":"D"}              24 + |N| + |D|
+	//	{"through":N,"jobId":"J","reason":"R"}  35 + |N| + |J| + |R|
+	//
+	// These are the terms the control reserve's arithmetic is written in.
+	maxDelegationPayload = 23 + jsonEscapeFactor*(maxScopeBytes+maxEpochBytes)
+	maxAppliedPayload    = 24 + maxUint64Digits + maxDigestBytes
+	maxClosePayload      = 35 + maxUint64Digits + jsonEscapeFactor*(maxJobIDBytes+maxReasonBytes)
+)
+
 var (
 	segmentMagic = [4]byte{'P', 'F', 'W', '5'}
 	frameMagic   = [4]byte{'P', 'F', 'R', '5'}
@@ -98,6 +138,68 @@ type closeFrame struct {
 	Through uint64 `json:"through"`
 	JobID   string `json:"jobId,omitempty"`
 	Reason  string `json:"reason,omitempty"`
+}
+
+func (f delegationFrame) validate() error {
+	if len(f.Scope) > maxScopeBytes {
+		return fmt.Errorf("writeback: delegation scope of %d bytes exceeds the %d-byte control-frame bound", len(f.Scope), maxScopeBytes)
+	}
+	if len(f.Epoch) > maxEpochBytes {
+		return fmt.Errorf("writeback: delegation epoch of %d bytes exceeds the %d-byte control-frame bound", len(f.Epoch), maxEpochBytes)
+	}
+	return nil
+}
+
+func (f appliedFrame) validate() error {
+	if len(f.Digest) > maxDigestBytes {
+		return fmt.Errorf("writeback: applied digest of %d bytes exceeds the %d-byte control-frame bound", len(f.Digest), maxDigestBytes)
+	}
+	return nil
+}
+
+func (f closeFrame) validate() error {
+	if len(f.JobID) > maxJobIDBytes {
+		return fmt.Errorf("writeback: close job id of %d bytes exceeds the %d-byte control-frame bound", len(f.JobID), maxJobIDBytes)
+	}
+	if len(f.Reason) > maxReasonBytes {
+		return fmt.Errorf("writeback: close reason of %d bytes exceeds the %d-byte control-frame bound", len(f.Reason), maxReasonBytes)
+	}
+	return nil
+}
+
+// encodeControlPayload is the ONE encoder every control frame's payload goes
+// through, online and offline. It bounds the variable-length fields before
+// marshalling, so the reserve's arithmetic holds over the payloads the write
+// path can actually produce, and re-checks the encoded result against the same
+// bound the decoder enforces. The encoded bytes are unchanged: this is an
+// admission-side check over the identical replay format.
+func encodeControlPayload(v any) ([]byte, error) {
+	switch f := v.(type) {
+	case delegationFrame:
+		if err := f.validate(); err != nil {
+			return nil, err
+		}
+	case appliedFrame:
+		if err := f.validate(); err != nil {
+			return nil, err
+		}
+	case closeFrame:
+		if err := f.validate(); err != nil {
+			return nil, err
+		}
+	}
+	// Anything else carries no bounded fields to check and is left to the
+	// encoded-length bound below: recovery's fail-closed contract for a
+	// CRC-valid payload that does not decode is exercised with exactly such a
+	// value, and it must reach the log to be exercised at all.
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxMutationPayload {
+		return nil, fmt.Errorf("writeback: control payload %d exceeds frame bound", len(payload))
+	}
+	return payload, nil
 }
 
 // streamDigest chains the mutation payload digests:
@@ -225,6 +327,13 @@ func encodeFrame(dst []byte, typ frameType, frameNo, seq uint64, payload []byte)
 	return dst
 }
 
+// liveGrant is one entry of the re-emit projection: the grant's epoch and the
+// exact framed size of the DELEGATION record rotation re-emits for it.
+type liveGrant struct {
+	epoch      string
+	frameBytes int64
+}
+
 // segmentInfo tracks one live segment.
 type segmentInfo struct {
 	ordinal uint64
@@ -257,7 +366,12 @@ type streamWAL struct {
 	// been installed but not released. Rotation re-emits this set into the new
 	// segment before it can accept mutations, so reclaiming every older
 	// segment can never erase the recovery authority for a later tail.
-	liveDelegations map[string]string // scope -> epoch
+	liveDelegations map[string]liveGrant // scope -> grant
+	// liveDelegationBytes is Σ frameBytes over liveDelegations: the exact
+	// number of bytes one rotation's re-emit writes. It is the term the control
+	// reserve is built on, so it is maintained with the projection rather than
+	// recomputed per append.
+	liveDelegationBytes int64
 
 	// readRefs pins segments a composed read snapshot references, so
 	// checkpoint+reclaim can never delete a segment out from under an
@@ -303,7 +417,7 @@ func createStreamWAL(dir string, mountID [16]byte, volumeID, branch string, epoc
 		dir: dir, mountID: mountID, volumeID: volumeID, branch: branch, epoch: epoch,
 		files:           map[uint64]*os.File{},
 		readRefs:        map[uint64]int{},
-		liveDelegations: map[string]string{},
+		liveDelegations: map[string]liveGrant{},
 		digest:          digestZero(),
 	}
 	if err := w.openSegmentLocked(1, 1, 1); err != nil {
@@ -380,6 +494,10 @@ func (w *streamWAL) appendMutations(payloads [][]byte) ([]appendResult, error) {
 // refused whether usage is at 99% or at zero. budget <= 0 means unbounded, for
 // the control-plane and recovery paths that must be able to close out a stream
 // which is already at its bound.
+//
+// The reservation is taken against the budget MINUS the control reserve, so a
+// saturated mutation lane always leaves the lifecycle control frames it cannot
+// refuse enough room to land inside the same cap (controlReserveLocked).
 func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]appendResult, error) {
 	if budget > 0 {
 		// Budgeted admissions serialize across the whole append, including the
@@ -411,7 +529,11 @@ func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]ap
 		if err != nil {
 			return nil, err
 		}
-		if w.diskBytesLocked()+w.reserved+cost > budget {
+		// The control reserve is held back from the mutation lanes: it is the
+		// headroom the lifecycle frames a mutation lane cannot refuse (APPLIED,
+		// RELEASE, CLOSE, FORCED_CLOSE and the rotations they trip) are
+		// guaranteed to find. See controlReserveLocked.
+		if w.diskBytesLocked()+w.reserved+cost+w.controlReserveLocked(0, 0) > budget {
 			return nil, ErrNoSpace
 		}
 		w.reserved += cost
@@ -453,14 +575,43 @@ func (w *streamWAL) appendMutationsWithin(payloads [][]byte, budget int64) ([]ap
 	return results, nil
 }
 
-// appendControl appends one control frame.
+// appendControl appends one LIFECYCLE control frame: a frame the stream can be
+// obliged to write and that therefore must never be refused for want of space —
+// an unwritable CLOSE, FORCED_CLOSE, APPLIED or RELEASE is a wedged mount. It
+// draws from the control reserve, which controlReserveLocked sizes to dominate
+// exactly this set. New grants are NOT lifecycle: they use appendControlWithin.
 func (w *streamWAL) appendControl(typ frameType, v any) error {
-	payload, err := json.Marshal(v)
+	payload, err := encodeControlPayload(v)
 	if err != nil {
 		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.appendControlLocked(typ, payload)
+}
+
+// appendControlWithin appends one control frame under the stream's hard cap,
+// keeping the control reserve for the live set this frame would produce intact.
+// It is how a NEW delegation enters the log: a new grant is the one control
+// frame that is not obliged — it raises the re-emit cost of every later
+// rotation and adds an eventual release, so it is admitted only while the
+// reserve still dominates the close-out of the set it joins. ErrNoSpace here is
+// a definite "not delegable now", not a failure: the caller hands the grant
+// back and the mutation takes the authority lane.
+func (w *streamWAL) appendControlWithin(typ frameType, v any, budget int64) error {
+	payload, err := encodeControlPayload(v)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if budget > 0 {
+		frame := frameLen(len(payload))
+		cost := w.controlCostLocked(frame)
+		if w.diskBytesLocked()+w.reserved+cost+w.controlReserveLocked(frame, 1) > budget {
+			return ErrNoSpace
+		}
+	}
 	return w.appendControlLocked(typ, payload)
 }
 
@@ -474,14 +625,14 @@ func (w *streamWAL) recordDrainedRelease(scope, epoch string, through uint64, di
 	if scope == "" || epoch == "" {
 		return errors.New("writeback: invalid drained release")
 	}
-	appliedPayload, err := json.Marshal(appliedFrame{
+	appliedPayload, err := encodeControlPayload(appliedFrame{
 		Through: through,
 		Digest:  fmt.Sprintf("%x", digest),
 	})
 	if err != nil {
 		return err
 	}
-	releasePayload, err := json.Marshal(delegationFrame{Scope: scope, Epoch: epoch})
+	releasePayload, err := encodeControlPayload(delegationFrame{Scope: scope, Epoch: epoch})
 	if err != nil {
 		return err
 	}
@@ -567,11 +718,24 @@ func (w *streamWAL) applyDelegationControlLocked(typ frameType, payload []byte) 
 	switch typ {
 	case frameDelegation:
 		if df.Epoch != "" {
-			w.liveDelegations[df.Scope] = df.Epoch
+			w.dropLiveDelegationLocked(df.Scope)
+			w.liveDelegations[df.Scope] = liveGrant{epoch: df.Epoch, frameBytes: frameLen(len(payload))}
+			w.liveDelegationBytes += frameLen(len(payload))
 		}
 	case frameRelease:
-		delete(w.liveDelegations, df.Scope)
+		w.dropLiveDelegationLocked(df.Scope)
 	}
+}
+
+// dropLiveDelegationLocked removes a scope from the re-emit projection together
+// with its exact contribution to the re-emit size, so the two never diverge.
+func (w *streamWAL) dropLiveDelegationLocked(scope string) {
+	grant, ok := w.liveDelegations[scope]
+	if !ok {
+		return
+	}
+	delete(w.liveDelegations, scope)
+	w.liveDelegationBytes -= grant.frameBytes
 }
 
 // reemitLiveDelegationsLocked makes the new active segment independently
@@ -584,7 +748,7 @@ func (w *streamWAL) reemitLiveDelegationsLocked() error {
 	}
 	sort.Strings(scopes)
 	for _, scope := range scopes {
-		payload, err := json.Marshal(delegationFrame{Scope: scope, Epoch: w.liveDelegations[scope]})
+		payload, err := encodeControlPayload(delegationFrame{Scope: scope, Epoch: w.liveDelegations[scope].epoch})
 		if err != nil {
 			return err
 		}
@@ -819,20 +983,26 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 	if w.closed {
 		return errors.New("writeback: wal closed")
 	}
-	reclaimable := false
+	var reclaimable int64
 	for i := 0; i < len(w.segments)-1; i++ {
 		seg := w.segments[i]
 		if seg.lastSeq <= through && !pinned(seg.ordinal) && w.readRefs[seg.ordinal] == 0 {
-			reclaimable = true
-			break
+			reclaimable += seg.size
 		}
 	}
-	if !reclaimable {
-		return nil
-	}
-	payload, err := json.Marshal(appliedFrame{Through: through, Digest: fmt.Sprintf("%x", digest)})
+	payload, err := encodeControlPayload(appliedFrame{Through: through, Digest: fmt.Sprintf("%x", digest)})
 	if err != nil {
 		return err
+	}
+	// The certificate is charged to the space its own reclamation frees, so a
+	// checkpoint can never leave more frame bytes behind than it retired. That
+	// is what lets the control reserve hold a SINGLE checkpoint term instead of
+	// one per authority advance. (A rollover this call happens to trip is not
+	// charged here: a rollover fires at most once per segment, and a segment is
+	// only created after segmentTargetBytes of already-admitted bytes filled the
+	// previous one.)
+	if reclaimable < frameLen(len(payload)) {
+		return nil
 	}
 	if err := w.appendControlLocked(frameApplied, payload); err != nil {
 		return err
@@ -840,7 +1010,7 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 	if err := w.syncLocked(); err != nil {
 		return err
 	}
-	kept := w.segments[:0]
+	kept := make([]segmentInfo, 0, len(w.segments))
 	for i := range w.segments {
 		seg := w.segments[i]
 		isActive := i == len(w.segments)-1
@@ -853,11 +1023,16 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 			delete(w.files, seg.ordinal)
 		}
 		if err := os.Remove(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			kept = append(kept, seg)
-			continue
+			// The certificate is already durable but the space it was charged
+			// against did not come back. Retrying would append another one
+			// against the same segments, so the footprint would grow without a
+			// bound: fail the stream closed instead.
+			kept = append(kept, w.segments[i:]...)
+			w.segments = kept
+			return w.failLocked(fmt.Errorf("reclaim segment %d: %w", seg.ordinal, err))
 		}
 	}
-	w.segments = append([]segmentInfo(nil), kept...)
+	w.segments = kept
 	if err := fsyncDir(w.dir); err != nil {
 		return w.failLocked(fmt.Errorf("sync WAL directory after reclaim: %w", err))
 	}
@@ -890,19 +1065,88 @@ func (w *streamWAL) diskBytesLocked() int64 {
 // rollover cannot appear where none was projected: the decision is read from
 // the same seg.size under the same held mutex that rotateIfNeededLocked reads.
 func (w *streamWAL) appendCostLocked(payloads [][]byte) (int64, error) {
-	var cost int64
-	if seg := &w.segments[len(w.segments)-1]; seg.size >= segmentTargetBytes {
-		cost += segmentHeaderSize
-		reemit, err := w.reemitCostLocked()
-		if err != nil {
-			return 0, err
-		}
-		cost += reemit
-	}
+	cost := w.rolloverCostLocked()
 	for _, p := range payloads {
 		cost += frameLen(len(p))
 	}
 	return cost, nil
+}
+
+// rolloverCostLocked is the segment rollover the NEXT append pays: zero unless
+// the active segment has reached its threshold, otherwise a fresh header plus
+// the live-delegation set re-emitted into it before it may carry anything else.
+func (w *streamWAL) rolloverCostLocked() int64 {
+	if seg := &w.segments[len(w.segments)-1]; seg.size >= segmentTargetBytes {
+		return segmentHeaderSize + w.liveDelegationBytes
+	}
+	return 0
+}
+
+// controlCostLocked is the EXACT footprint one control operation writing
+// frameBytes of frames adds, rollover included.
+func (w *streamWAL) controlCostLocked(frameBytes int64) int64 {
+	return w.rolloverCostLocked() + frameBytes
+}
+
+// controlReserveLocked is the CONTROL RESERVE: the number of bytes held back
+// inside the stream's cap so that every control frame the current live set can
+// still OBLIGE this stream to write is guaranteed to fit. `pendingBytes` and
+// `pendingCount` add a delegation frame that is being admitted right now.
+//
+// Terms, with n live grants and G = Σ frameLen(delegation frame) over them
+// (w.liveDelegationBytes — a RELEASE frame has the same payload shape as the
+// DELEGATION it retires, so G is also the total release-frame cost):
+//
+//	R    = segmentHeaderSize + G                 one segment rollover
+//	body = n·frameLen(maxAppliedPayload) + G     n drained releases (APPLIED+RELEASE)
+//	     + frameLen(maxAppliedPayload)           one reclamation checkpoint
+//	     + 2·frameLen(maxClosePayload)           CLOSE and FORCED_CLOSE
+//	C    = R·rolloverCount(n+3, body, R) + body
+//
+// C dominates the whole close-out because each of those n+3 operations trips at
+// most one rollover and rolloverCount bounds how many rollovers they can trip
+// between them. It also SHRINKS by at least what it pays out: releasing scope s
+// costs R + frameLen(maxAppliedPayload) + f_s, while C falls by
+// R + (n+3)·f_s + frameLen(maxAppliedPayload). So the reserve stays dominant
+// through an arbitrarily long close-out.
+//
+// C is bounded because both of its inputs are: n by maxLiveDelegations and each
+// frame by the control-field caps, giving a worst case of
+// C ≤ R·(n+3) + body with R ≤ segmentHeaderSize + n·frameLen(maxDelegationPayload).
+//
+// The reserve is a THIRD slice of BudgetBytes, and it composes with the
+// two-lane split by being subtracted ONCE, inside admission, from whichever
+// lane budget the caller presents (credit.go's metadataReserveFor decides the
+// other boundary). The resulting partition of the cap B is:
+//
+//	[0, B − metadataReserve − C)   bulk data, metadata and control
+//	[B − metadataReserve − C, B−C) metadata and control
+//	[B − C, B]                     control only — this reserve
+func (w *streamWAL) controlReserveLocked(pendingBytes, pendingCount int64) int64 {
+	n := int64(len(w.liveDelegations)) + pendingCount
+	g := w.liveDelegationBytes + pendingBytes
+	rollover := int64(segmentHeaderSize) + g
+	body := n*frameLen(maxAppliedPayload) + g +
+		frameLen(maxAppliedPayload) + 2*frameLen(maxClosePayload)
+	return rollover*rolloverCount(n+3, body, rollover) + body
+}
+
+// rolloverCount bounds how many segment rollovers `ops` control operations
+// writing `body` bytes between them can trip. The first operation can rotate
+// immediately (the active segment may already be at its threshold); every later
+// rotation needs the fresh segment — which starts at `rollover` bytes — filled
+// back to segmentTargetBytes. No operation rotates more than once.
+func rolloverCount(ops, body, rollover int64) int64 {
+	room := segmentTargetBytes - rollover
+	if room <= 0 {
+		// A re-emit set that alone fills a segment: every operation rotates.
+		return ops
+	}
+	n := 1 + (body+room-1)/room
+	if n > ops {
+		return ops
+	}
+	return n
 }
 
 // maxAppendCost is the cost appendMutationsWithin could charge for payloads at
@@ -914,27 +1158,11 @@ func (w *streamWAL) appendCostLocked(payloads [][]byte) (int64, error) {
 func (w *streamWAL) maxAppendCost(payloads [][]byte) (int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	reemit, err := w.reemitCostLocked()
-	if err != nil {
-		return 0, err
-	}
-	cost := int64(segmentHeaderSize) + reemit
+	// The control reserve is held back from the mutation lanes at every
+	// occupancy, so it belongs in the "can this ever fit" answer too.
+	cost := int64(segmentHeaderSize) + w.liveDelegationBytes + w.controlReserveLocked(0, 0)
 	for _, p := range payloads {
 		cost += frameLen(len(p))
-	}
-	return cost, nil
-}
-
-// reemitCostLocked mirrors reemitLiveDelegationsLocked's byte cost by encoding
-// the same frames it would write.
-func (w *streamWAL) reemitCostLocked() (int64, error) {
-	var cost int64
-	for scope, epoch := range w.liveDelegations {
-		payload, err := json.Marshal(delegationFrame{Scope: scope, Epoch: epoch})
-		if err != nil {
-			return 0, err
-		}
-		cost += frameLen(len(payload))
 	}
 	return cost, nil
 }

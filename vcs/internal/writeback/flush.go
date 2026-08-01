@@ -455,12 +455,19 @@ func (f *flusher) advance(through uint64) {
 	// APPLIED checkpoint.
 	appliedNow, digestNow := f.applied, f.appliedDigest
 	f.mu.Unlock()
+	// The ONLY input to the credit controller: bytes the authority made
+	// durable. Never an attempt, never a heartbeat, never a local append.
+	//
+	// It runs BEFORE the drain waiters are woken, and the order is load-bearing.
+	// A drain waiter's whole claim is "everything admitted up to my target is
+	// applied", and the credit ledger is part of what that means: a waiter woken
+	// first can observe a drained stream whose ledger still carries the debt for
+	// the very bytes that drain just retired. Returning the credit first makes
+	// the two views agree at the instant the waiter is released.
+	f.e.credits.noteApplied(appliedData, appliedTotal, time.Now())
 	for _, wtr := range ready {
 		wtr.ch <- nil
 	}
-	// The ONLY input to the credit controller: bytes the authority made
-	// durable. Never an attempt, never a heartbeat, never a local append.
-	f.e.credits.noteApplied(appliedData, appliedTotal, time.Now())
 	f.e.noteApplied(appliedNow, digestNow)
 }
 

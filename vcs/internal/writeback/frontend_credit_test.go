@@ -67,7 +67,7 @@ func TestFrontendGrantedWriteNeverEntersTheCreditQueue(t *testing.T) {
 	}
 	exhaustCreditLedger(t, f.e)
 
-	opCtx := WithFrontendPacing(WithDataCredit(ctx, granted))
+	opCtx := WithResolvedLane(WithDataCredit(ctx, granted), LaneDelegated)
 	peak, stop := sampleCreditWaiters(f.e)
 	promptly(t, 2*time.Second, "frontend-granted write under an exhausted ledger", func() {
 		_, handled, werr := f.e.WriteAt(opCtx, "d/f", 0, chunk)
@@ -84,15 +84,29 @@ func TestFrontendGrantedWriteNeverEntersTheCreditQueue(t *testing.T) {
 	}
 }
 
-// TestFrontendPacedWriteTakesTheAuthorityLaneInsteadOfQueuing covers the race
-// the frontend probe cannot close on its own: the path was uncovered when the
-// frontend classified it write-through (and therefore did not charge), and a
-// delegation appeared before the engine's own check. The engine must NOT take
-// the wait back under the caller's locks. It takes the authority lane.
+// TestAuthorityResolvedWriteIsNeverChargedAndNeverQueues is the authority
+// lane's half of the classifier contract.
 //
-// The contrast half is the same write without the marker: a lock-free caller
+// A write the classifier resolved as authority-only — an orphaned inode, a hard
+// link, a pathless handle, or simply an uncovered path — produces no stream
+// bytes at all. It must therefore be neither charged nor queued, WHATEVER the
+// delegation state has become since, and whatever the credit ledger looks like.
+// Both halves matter and they fail differently:
+//
+//   - queuing would take the wait back under the caller's locks, which is the
+//     namespace-wide stall the pre-lock classifier exists to remove;
+//   - charging would put a debt on the ledger for bytes that can never become
+//     WAL bytes, throttling honest delegated writers against a phantom.
+//
+// The second is why the lane is consulted BEFORE the credit fast path: with a
+// free ledger the fast path is one successful CAS and would charge silently.
+// This test covers a delegation that appeared after classification (the ledger
+// exhausted, so a charge would be visible as a queue) and then the same write
+// against a free ledger (where a charge would be visible as debt).
+//
+// The contrast half is the same write with no classifier: a lock-free caller
 // SHOULD pace there, and does, until its context ends.
-func TestFrontendPacedWriteTakesTheAuthorityLaneInsteadOfQueuing(t *testing.T) {
+func TestAuthorityResolvedWriteIsNeverChargedAndNeverQueues(t *testing.T) {
 	pinCreditTimings(t, 400*time.Millisecond, 25*time.Second, 30*time.Second)
 	f := newSaturationFixture(t, 8<<20)
 	ctx := context.Background()
@@ -102,34 +116,45 @@ func TestFrontendPacedWriteTakesTheAuthorityLaneInsteadOfQueuing(t *testing.T) {
 	if !f.e.Covers("d/f") {
 		t.Fatal("fixture did not take a delegation over d/f")
 	}
-	exhaustCreditLedger(t, f.e)
+	authority := WithResolvedLane(ctx, LaneAuthority)
 	chunk := make([]byte, 256<<10)
 
+	// A free ledger: a charge would show up as debt.
+	before := f.e.Status().CreditDebt
+	if _, handled, werr := f.e.WriteAt(authority, "d/f", 0, chunk); werr != nil || handled {
+		t.Fatalf("authority-resolved write: handled=%v err=%v, want the authority lane", handled, werr)
+	}
+	if after := f.e.Status().CreditDebt; after != before {
+		t.Fatalf("an authority-resolved write charged %d bytes it can never turn into WAL bytes", after-before)
+	}
+
+	// An exhausted ledger: a charge would show up as a queued waiter.
+	exhaustCreditLedger(t, f.e)
 	peak, stop := sampleCreditWaiters(f.e)
-	promptly(t, time.Second, "frontend-paced write whose lane changed", func() {
-		_, handled, werr := f.e.WriteAt(WithFrontendPacing(ctx), "d/f", 0, chunk)
+	promptly(t, time.Second, "authority-resolved write under an exhausted ledger", func() {
+		_, handled, werr := f.e.WriteAt(authority, "d/f", 0, chunk)
 		if werr != nil {
-			t.Errorf("frontend-paced write errored instead of changing lanes: %v", werr)
+			t.Errorf("authority-resolved write errored: %v", werr)
 		}
 		if handled {
-			t.Error("frontend-paced write was admitted locally; it must take the authority lane rather than queue under the caller's locks")
+			t.Error("authority-resolved write was admitted locally")
 		}
 	})
 	stop()
 	if got := peak.Load(); got != 0 {
-		t.Fatalf("a frontend-paced write queued for credit (peak waiters %d)", got)
+		t.Fatalf("an authority-resolved write queued for credit (peak waiters %d)", got)
 	}
 
-	// Contrast: the identical write with no marker is a lock-free caller and
-	// paces, exactly as the engine's own contract says it should.
+	// Contrast: the identical write with no classifier is a lock-free caller
+	// and paces, exactly as the engine's own contract says it should.
 	wctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	start := time.Now()
 	if _, handled, werr := f.e.WriteAt(wctx, "d/f", 0, chunk); werr == nil || !handled {
-		t.Fatalf("an unmarked write did not pace: handled=%v err=%v", handled, werr)
+		t.Fatalf("an unclassified write did not pace: handled=%v err=%v", handled, werr)
 	}
 	if waited := time.Since(start); waited < 400*time.Millisecond {
-		t.Fatalf("an unmarked write returned after %v; it never entered the credit queue at all", waited)
+		t.Fatalf("an unclassified write returned after %v; it never entered the credit queue at all", waited)
 	}
 }
 
@@ -178,14 +203,19 @@ func TestFrontendGrantIsSettledExactlyOnce(t *testing.T) {
 // TestFrontendGrantIsRefundedWhenTheWriteNeverReachesTheWAL is the error-path
 // audit in ledger form. The frontend charges before its locks; the write then
 // fails to become WAL bytes (here: the target does not exist locally, so the
-// engine changes lanes). Every granted byte must come back, or the ledger
-// drifts away from the exact reservation underneath it and the gate starts
-// throttling against debt nobody owes.
+// only way on is the authority lane, which the engine may not enter from inside
+// the caller's locks). Every granted byte must come back, or the ledger drifts
+// away from the exact reservation underneath it and the gate starts throttling
+// against debt nobody owes.
+//
+// It also pins WHICH answer the engine gives. Reaching the authority lane from
+// here means releasing the covering delegation — a drain, under the caller's
+// namespace and handle locks — so the engine reports ErrLaneChanged and the
+// frontend pays for that release outside them. Silently taking the lane, as the
+// pre-classifier shape did, is what put a drain under nsMu.
 func TestFrontendGrantIsRefundedWhenTheWriteNeverReachesTheWAL(t *testing.T) {
 	pinCreditTimings(t, 400*time.Millisecond, 25*time.Second, 30*time.Second)
 	f := newSaturationFixture(t, 8<<20)
-	// The lane change below releases the covering delegation, which drains; the
-	// uplink has to be open for that. Saturation is not what this test measures.
 	f.openUplink()
 	ctx := context.Background()
 	if _, handled, err := f.e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
@@ -202,9 +232,14 @@ func TestFrontendGrantIsRefundedWhenTheWriteNeverReachesTheWAL(t *testing.T) {
 		t.Fatalf("acquire charged %d, want %d", charged-before, granted)
 	}
 
-	opCtx := WithFrontendPacing(WithDataCredit(ctx, granted))
-	if _, handled, werr := f.e.WriteAt(opCtx, "d/absent", 0, chunk); handled {
+	opCtx := WithResolvedLane(WithDataCredit(ctx, granted), LaneDelegated)
+	_, handled, werr := f.e.WriteAt(opCtx, "d/absent", 0, chunk)
+	if handled {
 		t.Fatalf("write to an unknown path was admitted locally: err=%v", werr)
+	}
+	if !errors.Is(werr, ErrLaneChanged) {
+		t.Fatalf("write to an unknown path = %v, want ErrLaneChanged: reaching the "+
+			"authority lane from here means releasing a delegation under the caller's locks", werr)
 	}
 	if left := ReclaimDataCredit(opCtx); left != 0 {
 		t.Fatalf("the engine consumed the grant but left %d bytes on the ctx", left)
@@ -228,7 +263,7 @@ func TestFrontendGrantSurvivesTheFrontendsOwnErrorPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("frontend acquire: %v", err)
 	}
-	opCtx := WithFrontendPacing(WithDataCredit(ctx, granted))
+	opCtx := WithResolvedLane(WithDataCredit(ctx, granted), LaneDelegated)
 	// ... the frontend fails here and never reaches the engine.
 	f.e.ReleaseDataCredit(ReclaimDataCredit(opCtx))
 	if after := f.e.Status().CreditDebt; after != before {
@@ -241,13 +276,15 @@ func TestFrontendGrantSurvivesTheFrontendsOwnErrorPath(t *testing.T) {
 	}
 }
 
-// TestFrontendPacedWriteNeverWaitsOnHardCapHeadroom is the second no-wait
-// promise. The credit ledger counts payload bytes; the WAL counts framed bytes
-// and whole segments, so a granted write can still find the exact reservation
-// full. A lock-free caller waits for applied progress there — correct for it,
-// and wrong for a frontend that is already holding its namespace lock. The
-// frontend-paced write changes lanes instead of blocking.
-func TestFrontendPacedWriteNeverWaitsOnHardCapHeadroom(t *testing.T) {
+// TestClassifiedWriteNeverWaitsOnHardCapHeadroom is the second no-wait promise.
+// The credit ledger counts payload bytes; the WAL counts framed bytes and whole
+// segments, so a fully granted write can still find the exact reservation full.
+// A lock-free caller waits for applied progress there — correct for it, and
+// wrong for a frontend already holding its namespace lock. A classified write
+// reports the lane changed instead of blocking, and instead of diverting: the
+// divert would mean releasing the grant that is holding these very bytes, which
+// is the same drain under the same locks.
+func TestClassifiedWriteNeverWaitsOnHardCapHeadroom(t *testing.T) {
 	pinCreditTimings(t, 3*time.Second, 25*time.Second, 30*time.Second)
 	// 4 MiB of stream budget leaves a 3 MiB data lane, for BOTH the credit
 	// ceiling and the WAL's exact data reservation. Three 1 MiB writes therefore
@@ -268,21 +305,24 @@ func TestFrontendPacedWriteNeverWaitsOnHardCapHeadroom(t *testing.T) {
 		if granted == 0 {
 			t.Skipf("the credit gate bound before the hard cap at write %d", i)
 		}
-		opCtx := WithFrontendPacing(WithDataCredit(ctx, granted))
+		opCtx := WithResolvedLane(WithDataCredit(ctx, granted), LaneDelegated)
 		start := time.Now()
 		_, handled, werr := f.e.WriteAppend(opCtx, "d/f", chunk[:granted])
 		waited := time.Since(start)
 		f.e.ReleaseDataCredit(ReclaimDataCredit(opCtx))
 		if waited > 2*time.Second {
-			t.Fatalf("frontend-paced append %d blocked for %v: it waited on hard-cap headroom, which a caller holding a namespace lock must never do", i, waited)
+			t.Fatalf("classified append %d blocked for %v: it waited on hard-cap headroom, which a caller holding a namespace lock must never do", i, waited)
+		}
+		if errors.Is(werr, ErrLaneChanged) {
+			// The hard cap bound and the engine reported the lane changed
+			// instead of waiting or diverting. That is the whole contract.
+			return
 		}
 		if werr != nil && !errors.Is(werr, ErrNoSpace) {
-			t.Fatalf("frontend-paced append %d: %v", i, werr)
+			t.Fatalf("classified append %d: %v", i, werr)
 		}
 		if !handled {
-			// The hard cap bound and the engine answered with the authority
-			// lane instead of waiting. That is the whole contract.
-			return
+			t.Fatalf("classified append %d changed lanes without saying so", i)
 		}
 	}
 	t.Skip("the hard cap never became the binding constraint at this budget")

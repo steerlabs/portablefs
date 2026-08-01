@@ -462,6 +462,20 @@ func (r *doctorRun) checkWriteBack() doctorResult {
 			if wb.PendingRecords > 0 && len(wb.ParkedWALs) == 0 {
 				line += fmt.Sprintf("  (%d record(s) flushing)", wb.PendingRecords)
 			}
+			// Data-lane pacing is the credit controller working, not a fault:
+			// it is reported so a backlog held back on purpose is never read
+			// as a hung flusher, and it does not count as a problem.
+			if wb.paced() {
+				detail := fmt.Sprintf("data-lane pacing (not a failure): %d writer(s) waiting on credit, debt %d of setpoint %d bytes (ceiling %d), authority applying %.0f B/s",
+					wb.CreditWaiters, wb.CreditDebt, wb.CreditSetpoint, wb.CreditCeiling, wb.AppliedRateBps)
+				if wb.DataLaneFull {
+					detail += "; bulk-data lane at its hard cap, metadata reserve still held"
+				}
+				if wb.LastProgressMs > 0 {
+					detail += fmt.Sprintf("; last drain progress %s ago", (time.Duration(wb.LastProgressMs) * time.Millisecond).Round(time.Second))
+				}
+				line += "\n        " + detail
+			}
 		}
 		lines = append(lines, line)
 	}
