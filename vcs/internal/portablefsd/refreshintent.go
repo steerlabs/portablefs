@@ -37,9 +37,8 @@ package portablefsd
 //   - Reservations OUTSTANDING when the intent registers are untouched. They
 //     drain on their own terms, which is the only correct thing to do with a
 //     mutation that is already on its way to a commit.
-//   - Reservations arriving AFTER it QUEUE, on the same channel discipline the
-//     pin uses, so the drain can actually complete. This is the priority the
-//     refresh previously lacked.
+//   - Reservations arriving AFTER it QUEUE, so the drain can actually complete.
+//     This is the priority the refresh previously lacked.
 //   - When the last outstanding reservation is released the intent is DRAINED,
 //     and the refresh proceeds to sample, arm, and pin. Because the intent is
 //     still held, the pin arms over an item on which no reservation can have
@@ -48,6 +47,23 @@ package portablefsd
 // Contention is then a WAIT under the refresh transaction's own bounded
 // context, not a consumed retry, and failCoherence is left for the thing it
 // should always have meant: genuine no-progress.
+//
+// ── AND THE INTENT IS NOT ITS OWN QUEUE ─────────────────────────────────────
+//
+// The intent says who must WAIT. It says nothing about who goes NEXT, and for
+// one round that was the same thing only by accident: a queued mutation was
+// recorded nowhere, so when the intent was released the item went to whichever
+// waiter reached a.mu first — and the next pass in a refresh stream, woken
+// directly by the per-stripe kernel-refresh gate, is not even waiting on the
+// same channel the mutation is. Sustained invalidations then starved every
+// writer on the item for its whole deadline.
+//
+// So an intent is TAKEN and RELEASED through the item's one arrival order
+// (itemturnstile.go), which covers refresh intents and mutation reservations
+// alike. Everything above is preserved exactly — this pass still waits pre-lock
+// holding nothing, still drains the reservations outstanding when it was
+// granted, and still escalates on the same two bounds — and the item now moves
+// to the head of a written-down queue instead of to whoever wakes up fastest.
 //
 // ── WHY THE DRAIN CANNOT DEADLOCK AGAINST A RESERVATION HOLDER ──────────────
 //
@@ -141,8 +157,9 @@ func (a *attach) signalRefreshIntentDrainLocked(itemID uint64) {
 	close(intent.drained)
 }
 
-// acquireRefreshIntent registers this pass's intent on itemID and returns once
-// every reservation that was outstanding at registration has drained.
+// acquireRefreshIntent takes this pass's place in the item's arrival order,
+// registers its intent when the item is handed to it, and returns once every
+// reservation that was outstanding at that moment has drained.
 //
 // It holds no lock while it waits, and the wait is bounded twice over: by the
 // caller's own context — the refresh transaction's — and by
@@ -155,62 +172,68 @@ func (a *attach) acquireRefreshIntent(ctx context.Context, itemID uint64) (func(
 	if itemID == 0 {
 		return func() {}, nil
 	}
-	for {
-		a.mu.Lock()
-		if a.refreshIntents == nil {
-			a.refreshIntents = map[uint64]*refreshIntent{}
-		}
-		if held := a.refreshIntents[itemID]; held != nil {
-			// Another pass is already pending on this item. Passes are
-			// serialized by the per-item refresh gate, so this is a narrow
-			// overlap rather than a queue; wait it out rather than arming a
-			// second intent whose drain the first one's pin would satisfy.
-			done := held.done
-			a.mu.Unlock()
-			select {
-			case <-done:
-				continue
-			case <-ctx.Done():
-				return nil, fmt.Errorf(
-					"portablefsd: refresh intent for item %d: %w", itemID, ctx.Err(),
-				)
-			}
-		}
-		intent := &refreshIntent{
-			done:    make(chan struct{}),
-			drained: make(chan struct{}),
-		}
-		a.refreshIntents[itemID] = intent
-		// From this instant every ARRIVING size mutation on the item queues.
-		// Whatever was already outstanding drains on its own terms.
-		a.signalRefreshIntentDrainLocked(itemID)
-		a.mu.Unlock()
-
-		release := func() {
-			intent.release.Do(func() {
-				a.mu.Lock()
-				if a.refreshIntents[itemID] == intent {
-					delete(a.refreshIntents, itemID)
-				}
-				a.mu.Unlock()
-				close(intent.done)
-			})
-		}
-		drainCtx, cancelDrain := context.WithTimeout(ctx, refreshIntentDrainBudget)
-		select {
-		case <-intent.drained:
-			cancelDrain()
-			return release, nil
-		case <-drainCtx.Done():
-			cancelDrain()
-			// The intent is given back before reporting: a pending intent left
-			// behind a pass that is not running would queue every size mutation
-			// on the item for nothing.
-			release()
-			return nil, fmt.Errorf(
-				"portablefsd: refresh intent for item %d: size mutations did not "+
-					"drain within %s: %w", itemID, refreshIntentDrainBudget, drainCtx.Err(),
-			)
-		}
+	a.mu.Lock()
+	ticket := a.takeItemTicketLocked(itemID, ticketRefresh)
+	a.advanceItemQueueLocked(itemID)
+	a.mu.Unlock()
+	if !a.awaitItemTicket(ctx.Done(), itemID, ticket, nil) {
+		return nil, fmt.Errorf(
+			"portablefsd: refresh intent for item %d: %w", itemID, ctx.Err(),
+		)
 	}
+	// The grant IS the installed intent (advanceItemQueueLocked): from the
+	// instant it was published every ARRIVING size mutation on the item queues
+	// behind this pass, and whatever was already outstanding drains below on its
+	// own terms.
+	intent := ticket.intent
+	release := func() { a.releaseRefreshIntent(itemID, intent) }
+	if ctx.Err() != nil {
+		// Granted at the same moment the transaction died. Give the item back
+		// rather than leaving a pending intent behind a pass that will not run.
+		release()
+		return nil, fmt.Errorf(
+			"portablefsd: refresh intent for item %d: %w", itemID, ctx.Err(),
+		)
+	}
+	drainCtx, cancelDrain := context.WithTimeout(ctx, refreshIntentDrainBudget)
+	defer cancelDrain()
+	select {
+	case <-intent.drained:
+		return release, nil
+	case <-drainCtx.Done():
+		// The intent is given back before reporting: a pending intent left
+		// behind a pass that is not running would queue every size mutation
+		// on the item for nothing.
+		release()
+		return nil, fmt.Errorf(
+			"portablefsd: refresh intent for item %d: size mutations did not "+
+				"drain within %s: %w", itemID, refreshIntentDrainBudget, drainCtx.Err(),
+		)
+	}
+}
+
+// releaseRefreshIntent gives the item up and hands it to the next claim in
+// arrival order INSIDE THE SAME a.mu HOLD.
+//
+// That single hold is the whole of finding 1. Deleting the intent and then
+// letting whoever reaches a.mu first take the item is what let the next refresh
+// pass — woken directly by the per-stripe kernel-refresh gate — install the
+// following intent before an already-queued mutation could retry, for as long
+// as invalidations kept arriving. See itemturnstile.go.
+//
+// The intent's own waiters are woken outside the hold for the ordinary reason:
+// a woken waiter's first act is to take a.mu.
+func (a *attach) releaseRefreshIntent(itemID uint64, intent *refreshIntent) {
+	if intent == nil {
+		return
+	}
+	intent.release.Do(func() {
+		a.mu.Lock()
+		if a.refreshIntents[itemID] == intent {
+			delete(a.refreshIntents, itemID)
+		}
+		a.advanceItemQueueLocked(itemID)
+		a.mu.Unlock()
+		close(intent.done)
+	})
 }

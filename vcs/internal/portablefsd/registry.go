@@ -1309,6 +1309,16 @@ type attach struct {
 	// contention — one slow mutation, or a stream of overlapping writers —
 	// exhausted its whole budget and fail-froze the mount. Guarded by mu.
 	refreshIntents map[uint64]*refreshIntent
+	// itemTurnstiles is the ORDER the other three are served in
+	// (itemturnstile.go). Every refresh intent and every size-mutation
+	// reservation takes a numbered ticket under mu, and the item is handed to
+	// the head of that queue inside the same hold that gives it up. Without it
+	// the intent's fairness ran one way only: a queued mutation was recorded
+	// nowhere, so the next refresh pass off the kernel-refresh gate could take
+	// the item ahead of it every time an invalidation arrived, and the writer
+	// spent its whole operation deadline without attempting anything. Guarded
+	// by mu.
+	itemTurnstiles map[uint64]*itemTurnstile
 	handles        map[uint64]*handleRecord
 	localDirs      []string
 	localRoot      string
@@ -1395,6 +1405,20 @@ type attach struct {
 	// for a size change that had really happened with nothing recorded anywhere.
 	// nil in production.
 	testAfterLocalFileWrite func(path string)
+	// testSizeMutationQueued fires when an admitted size mutation cannot take the
+	// item immediately and must wait for its turn, holding no frontend lock at
+	// all. It exists because that instant is the whole of the fairness question:
+	// a test standing here can arrange for another refresh to arrive AFTER the
+	// mutation has queued and prove the item is not handed to it first. nil in
+	// production.
+	testSizeMutationQueued func(itemID uint64)
+	// testControlWriteAuthorityTarget fires at the instant a control write has
+	// resolved the identity the AUTHORITY binds to its pathname and is about to
+	// mutate it. It exists because the local registry cannot fence a remote
+	// namespace change: a test standing here is the only way to compare the
+	// identity actually being mutated with the one this attempt reserved. nil in
+	// production.
+	testControlWriteAuthorityTarget func(authorityIno uint64)
 	// testRefreshWindowTeardown fires at the instant one refresh window's PIN
 	// has become invisible — removed from a.refreshPins and its waiters woken —
 	// with a.mu released. It exists because the teardown of a window is two

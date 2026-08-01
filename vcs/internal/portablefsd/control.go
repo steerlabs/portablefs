@@ -396,9 +396,26 @@ func (s *Server) controlFSRead(w http.ResponseWriter, r *http.Request, a *attach
 // item can be retired and reincarnated at the same ID; the zero value is the
 // honest representation of "absent", which is what makes absent-to-present a
 // mismatch rather than a match against nothing.
+//
+// The NodeState is part of it for the same reason and one more: it is the
+// object every authority call in the handler runs THROUGH, so a sample that did
+// not include it could compare equal while the handler mutated a node the
+// registry had already replaced. One reading answers both questions.
+//
+// ── AND WHY THE LOCAL REGISTRY IS ONLY HALF THE ANSWER ──────────────────────
+//
+// Every field here is read from this daemon's registry, and the registry is
+// exactly what a REMOTE namespace change makes wrong: nsMu and the name stripes
+// fence this daemon's own frontends and nothing else. A peer that renames B
+// over p — or a registry that is simply behind — leaves this comparison
+// perfectly consistent while vol.Lookup(p) answers B. The authority's own
+// answer is therefore the FINAL step of target resolution, and it is proved
+// against this identity before anything is opened or mutated; see
+// authorityTargetProvenLocked.
 type reservedIdentity struct {
 	itemID     uint64
 	generation uint64
+	state      *clientcore.NodeState
 }
 
 // reservedIdentityForPath resolves the identity currently bound to p, or the
@@ -411,7 +428,80 @@ func (a *attach) reservedIdentityForPath(p string) reservedIdentity {
 	return reservedIdentity{
 		itemID:     rec.item.ItemID,
 		generation: rec.item.ItemGeneration,
+		state:      rec.state,
 	}
+}
+
+// authorityTargetProvenLocked reports whether the identity the AUTHORITY has
+// just named for p is the frontend item this attempt reserved. Callers hold
+// a.mu in either mode.
+//
+// It asks the phase-3 identity question and one more that only the authority
+// can answer: does the reserved item already CARRY this authority identity?
+// Anything else — a pathname the registry no longer binds the same way, a
+// different inode, or a reserved NodeState with no authority identity at all —
+// is an observation this daemon has yet to record, and the one thing it must
+// not do is adopt it in passing and mutate through it.
+func (a *attach) authorityTargetProvenLocked(
+	p string,
+	reserved reservedIdentity,
+	authorityIno uint64,
+) bool {
+	rec := a.paths[p]
+	if rec == nil {
+		// The name is unbound here, so nothing local claims the object the
+		// authority just named.
+		return reserved == reservedIdentity{} && authorityIno == 0
+	}
+	if (reservedIdentity{
+		itemID:     rec.item.ItemID,
+		generation: rec.item.ItemGeneration,
+		state:      rec.state,
+	}) != reserved {
+		return false
+	}
+	if authorityIno == 0 {
+		// An authority that names no inode cannot be proved against — and
+		// cannot be confused either, because there is no second identity to
+		// mistake this one for.
+		return true
+	}
+	return rec.state.AuthorityIno() == authorityIno
+}
+
+// registerAuthorityTarget records the identity the authority named for p and
+// publishes the invalidations that identity change owes the kernel.
+//
+// It is not a repair and not a fallback: a control write that reaches it has
+// LEARNED something true about the namespace — the object at this name is not
+// the one this daemon had — and the registry is where that belongs. Publishing
+// it here is also what lets the caller unwind without losing anything: the
+// namespace invalidation a create would otherwise have published is published
+// from here instead, and the re-admission reserves the item that is really
+// there.
+func (a *attach) registerAuthorityTarget(
+	ctx context.Context,
+	vol *clientcore.Volume,
+	p string,
+	attr fsproto.Attr,
+) int32 {
+	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
+	rec := a.registerLocked(p, attr)
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
+	if rec == nil {
+		a.mu.Unlock()
+		return darwinEIO
+	}
+	// The name carries an identity no live vnode has been told about, and its
+	// contents are that object's, not the one the kernel has cached.
+	a.publishNamespaceInvalidationLocked(p, 0, 0)
+	a.publishContentInvalidationLocked(p, 0, 0)
+	a.mu.Unlock()
+	if eno, _ := ticket.settle(ctx, vol); eno != 0 {
+		return eno
+	}
+	return a.flushBindingDelta()
 }
 
 func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attach) {
@@ -519,9 +609,19 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		httpMessage   string
 	)
 	for {
-		node := clientcore.NewNodeState(0, false)
-		if rec := a.itemByPath(p); rec != nil && rec.state != nil {
-			node = rec.state
+		// ONE READING OF THE PATHNAME'S IDENTITY, USED FOR BOTH HALVES.
+		//
+		// The reservation is taken against this sample and phase 3 compares the
+		// locked target with it — and every authority call in the handler runs
+		// through this sample's NodeState. Reading the node separately from the
+		// identity is how the two could be about different objects: the registry
+		// can replace a record's NodeState while its item and generation stay
+		// exactly what they were, and the comparison would then pass over a node
+		// nothing in the registry points at any more.
+		reserved := a.reservedIdentityForPath(p)
+		node := reserved.state
+		if node == nil {
+			node = clientcore.NewNodeState(0, false)
 		}
 		// PHASE 1.
 		mutCtx, _, settle, err := vol.AdmitWrite(opCtx, p, node, len(data), true)
@@ -538,8 +638,8 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		// the namespace gate, exactly as attach.admitRequest takes it for a
 		// kernel frontend request (refreshpin.go). The identity it is taken
 		// against travels into phase 3, which compares it with the locked target
-		// before it mutates anything (see reservedIdentity).
-		reserved := a.reservedIdentityForPath(p)
+		// — and with the authority's own answer — before it mutates anything
+		// (see reservedIdentity).
 		releaseToken, tokenEno := a.reserveSizeMutation(opCtx, reserved.itemID)
 		if tokenEno != 0 {
 			settle()
@@ -766,9 +866,47 @@ func (a *attach) controlWriteLocked(
 		return false, http.StatusInternalServerError,
 			errMessage("fs/write item identity", darwinEIO), 0
 	}
-	if !node.AuthIno() && attr.Ino != 0 && !node.RecordAuthorityIno(attr.Ino) {
+	// PHASE 3's LAST QUESTION, AND THE ONLY ONE THE AUTHORITY CAN ANSWER.
+	//
+	// Everything checked so far — the pre-lock sample, the comparison above —
+	// was read out of the LOCAL registry, and nsMu and the name stripes fence
+	// only this daemon's frontends. A peer renaming B over p, or a registry
+	// merely running behind the authority, leaves all of it consistent while the
+	// lookup right above answers B.
+	//
+	// What used to happen then is the whole of this finding: an unproven
+	// NodeState was BOUND to the lookup's inode in passing (and a proven one was
+	// compared against nothing at all), and the open, the write and the truncate
+	// below ran against B while the reservation, the mutation sequence and the
+	// published size all belonged to A. B is then free to be mutated inside B's
+	// own outstanding refresh syscall — the exact linearization failure the size
+	// token exists to make impossible.
+	//
+	// So the authority's answer is the final target resolution. If it does not
+	// belong to the item this attempt reserved, that is a coherence fact and not
+	// an error: REGISTER it, publish the invalidations the identity change owes
+	// the kernel, and unwind to pre-lock admission so the next attempt reserves
+	// the object that is actually there. Nothing is bound and nothing is mutated
+	// on the way out.
+	a.mu.RLock()
+	proven := a.authorityTargetProvenLocked(p, reserved, attr.Ino)
+	a.mu.RUnlock()
+	if !proven {
+		if eno := a.registerAuthorityTarget(ctx, vol, p, attr); eno != 0 {
+			return false, httpStatusForErr(eno),
+				errMessage("fs/write item identity", eno), 0
+		}
+		return true, 0, "", 0
+	}
+	if attr.Ino != 0 && !node.RecordAuthorityIno(attr.Ino) {
+		// Proven above, so this can only be a node the registry replaced between
+		// the proof and here. It is never a binding: RecordAuthorityIno is a
+		// no-op on an identity it already carries.
 		return false, http.StatusInternalServerError,
 			errMessage("fs/write item identity", darwinEIO), 0
+	}
+	if hook := a.testControlWriteAuthorityTarget; hook != nil {
+		hook(attr.Ino)
 	}
 	if st := vol.Open(ctx, p, node, true); st != fsproto.OK {
 		return false, httpStatusForErr(toDarwinErr(st)),
