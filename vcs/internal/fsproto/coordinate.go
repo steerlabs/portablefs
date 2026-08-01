@@ -767,7 +767,26 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 		if errors.Is(err, workfs.ErrDurabilityUnknown) || errors.Is(err, wal.ErrPoisoned) {
 			return nil // UNKNOWN: drop conn; the retry re-reads the durable watermark
 		}
-		return &Response{Status: toErrno(err), AppliedThrough: through}
+		// Everything left is the AUTHORITY'S OWN MACHINERY failing — a control
+		// store that is unreachable or out of disk, a backing service that is
+		// restarting — and none of it is a statement about the client's batch.
+		//
+		// It must therefore never be answered with toErrno's catch-all. That
+		// catch-all is EIO, and EIO is exactly the shape a client cannot
+		// interpret: it names no condition, so a client reading it as a verdict
+		// reads a verdict that was never issued. Production did precisely that
+		// and one such reply destroyed a live mount.
+		//
+		// EAGAIN is the authority's typed retryable answer: nothing was applied,
+		// the watermark is unchanged, and the identical batch may be re-sent.
+		// It is deliberately the EXISTING wire value rather than a new one:
+		// clients built before this change already treat 11 as retryable and
+		// treat every UNRECOGNISED status as a terminal conflict, so a new code
+		// would wedge exactly the mounts this fix exists to protect. Newer
+		// clients no longer have that hazard (writeback/flush.go now retries on
+		// any unclassified status), which is what makes a future typed code
+		// safe to introduce — but only once no old client remains.
+		return &Response{Status: EAGAIN, AppliedThrough: through, Gen: s.gen()}
 	}
 	return &Response{AppliedThrough: through, Gen: s.gen()}
 }

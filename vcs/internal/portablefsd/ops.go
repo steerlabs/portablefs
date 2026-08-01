@@ -991,7 +991,28 @@ func (a *attach) writeLocked(
 		if st != fsproto.OK {
 			return nil, toDarwinErr(st)
 		}
-		// Nothing was committed, so there is no progress to protect and the
+		if len(data) > 0 {
+			// A non-empty write that committed NOTHING and reported no error.
+			//
+			// There is no such POSIX outcome. write(2) returns a positive count,
+			// or -1 with an errno; a successful zero is a statement the caller
+			// cannot act on — it is not a short write (no progress to resume
+			// from) and it is not a refusal (no reason to report), so a writer
+			// loop either spins forever or silently drops the buffer. The
+			// pre-lock classifier already refuses to hand out a zero-length
+			// grant for exactly this reason (clientcore.AdmitWrite).
+			//
+			// So zero progress on a non-empty payload is EIO, and the guard is
+			// on len(data) rather than on the count: a genuine write(fd, buf, 0)
+			// is a legitimate successful zero-byte write and must stay one.
+			// Positive counts remain short writes, which resume correctly.
+			//
+			// The FUSE frontend applies the identical rule in
+			// fuseNode.writeOnce; the two frontends must not disagree about what
+			// "nothing happened" looks like to an application.
+			return nil, darwinEIO
+		}
+		// An empty payload: nothing was asked for and nothing committed. The
 		// attribute half is answered on its own terms below.
 	}
 	return a.writeReply(ctx, vol, h, scope, detached, n)

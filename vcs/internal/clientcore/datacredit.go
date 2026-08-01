@@ -124,6 +124,15 @@ func (v *Volume) AdmitWrite(
 		return writeback.WithResolvedLane(ctx, writeback.LaneAuthority), want, noop, nil
 	}
 
+	// ONE absolute deadline for the whole operation: classification, the credit
+	// wait, the delegation release a lane diversion needs, and the authority RPC
+	// that follows all run under it. Per-stage budgets compose; this does not.
+	opCtx, cancelDeadline := withOperationDeadline(ctx)
+	fail := func(err error) (context.Context, int, func(), error) {
+		cancelDeadline()
+		return ctx, 0, noop, err
+	}
+
 	path = cleanVolumePath(path)
 	if n != nil && v.isHardlink(n) {
 		// A path-keyed overlay cannot safely buffer two independently
@@ -133,7 +142,7 @@ func (v *Volume) AdmitWrite(
 		// must leave delegated mode before the write. admitAuthorityLane
 		// releases exactly that set (hardlinkMutationPaths) out here, so the
 		// release inside the locks has nothing left to drain.
-		return v.admitAuthorityLane(ctx, path, n, want)
+		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want)
 	}
 	if v.authorityOnlyByIdentity(path, n) {
 		// Identity, not pathname, decides this. An orphaned inode is addressed
@@ -143,21 +152,27 @@ func (v *Volume) AdmitWrite(
 		// CONSTRUCTION, so charging it would make a write that can never
 		// produce a stream byte wait — and, at the budget, fail — for credit it
 		// does not need and cannot use.
-		return writeback.WithResolvedLane(ctx, writeback.LaneAuthority), want, noop, nil
+		//
+		// No transition token: neither identity reaches beginAuthorityMutation
+		// (Volume.Write routes an orphan to the inode-addressed lane and a
+		// pathless handle to WriteExactHandle), so there is no locked-region
+		// transition to protect.
+		return writeback.WithResolvedLane(opCtx, writeback.LaneAuthority),
+			want, func() { cancelDeadline() }, nil
 	}
 	if forceAuthority {
-		return v.admitAuthorityLane(ctx, path, n, want)
+		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want)
 	}
 
 	// Resolve the delegated lane, paying any transition it needs out here.
-	delegated, err := v.wb.PrepareDelegatedWrite(ctx, path, int64(want))
+	delegated, err := v.wb.PrepareDelegatedWrite(opCtx, path, int64(want))
 	if err != nil {
-		return ctx, 0, noop, err
+		return fail(err)
 	}
 	if !delegated {
-		return v.admitAuthorityLane(ctx, path, n, want)
+		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want)
 	}
-	return v.admitDelegatedLane(ctx, path, n, want)
+	return v.admitDelegatedLane(opCtx, cancelDeadline, path, n, want)
 }
 
 // authorityOnlyByIdentity reports the lanes that follow from WHAT the node is,
@@ -181,11 +196,20 @@ func (v *Volume) authorityOnlyByIdentity(path string, n *NodeState) bool {
 // The wait happens here, holding nothing, and its outcome is definite.
 func (v *Volume) admitDelegatedLane(
 	ctx context.Context,
+	cancelDeadline context.CancelFunc,
 	path string,
 	n *NodeState,
 	want int,
 ) (context.Context, int, func(), error) {
 	noop := func() {}
+	fail := func(err error) (context.Context, int, func(), error) {
+		cancelDeadline()
+		return ctx, 0, noop, err
+	}
+	// The credit stage's budget is a SUB-deadline of the operation's, never an
+	// independent one: whatever it leaves is what the authority-lane diversion
+	// and its release have to work with, and the sum is bounded by
+	// operationAdmissionBudget rather than by 40s + an unbounded drain.
 	admitCtx, cancel := context.WithTimeout(ctx, creditAdmissionBudget)
 	defer cancel()
 	for {
@@ -193,7 +217,10 @@ func (v *Volume) admitDelegatedLane(
 		if granted > 0 {
 			opCtx := writeback.WithResolvedLane(
 				writeback.WithDataCredit(ctx, granted), writeback.LaneDelegated)
-			return opCtx, granted, func() { v.ReleaseDataCredit(opCtx) }, nil
+			return opCtx, granted, func() {
+				v.ReleaseDataCredit(opCtx)
+				cancelDeadline()
+			}, nil
 		}
 		switch {
 		case err == nil:
@@ -203,18 +230,20 @@ func (v *Volume) admitDelegatedLane(
 		case errors.Is(err, writeback.ErrUplinkStalled):
 			// The engine's watchdog, relayed unchanged. This is the only stall
 			// the frontend ever reports.
-			return ctx, 0, noop, err
+			return fail(err)
 		case admitCtx.Err() != nil && ctx.Err() == nil:
-			// The admission budget expired, not the caller's context.
-			return v.admitAuthorityLane(ctx, path, n, want)
+			// The credit budget expired while the operation deadline still has
+			// room. Divert to the authority lane — under the SAME deadline, so
+			// the release it needs cannot push the operation past the bound.
+			return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want)
 		default:
-			return ctx, 0, noop, err
+			return fail(err)
 		}
 		if ctx.Err() != nil {
-			return ctx, 0, noop, ctx.Err()
+			return fail(ctx.Err())
 		}
 		if admitCtx.Err() != nil {
-			return v.admitAuthorityLane(ctx, path, n, want)
+			return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want)
 		}
 	}
 }
@@ -229,18 +258,24 @@ func (v *Volume) admitDelegatedLane(
 // under a writer-preferring RWMutex's read side that parks the next rename or
 // reclaim and every reader behind it. Moved here it costs one operation.
 //
-// What it deliberately does NOT do is hold the delegation-transition claim
-// across the frontend's locks. That would make the answer immune to a
-// concurrent acquisition, but it would also invert the lock order: metadata
-// mutations take a.nsMu.RLock and THEN the claim, so an operation holding the
-// claim while waiting for a.nsMu behind a pending writer closes a cycle. A
-// deadlock is a worse outcome than the residue it would remove — and the
-// residue is small and bounded: a grant that reinstalls in the window between
-// this release and the write is one another writer has only just acquired, so
-// the release inside beginAuthorityMutation drains at most what that writer put
-// in it, never an accumulated backlog.
+// It also HOLDS the delegation-transition claim across the frontend's locks,
+// and that is what makes the answer definite rather than a guess.
+//
+// Releasing without the claim left a race the previous revision documented as a
+// bounded residue and it was not one: writer A's pre-lock release could find
+// nothing to release, writer B could then win the acquire transition and install
+// a fresh grant, and A — already inside a.nsMu.RLock and its handle lock —
+// would wait for B's claim (an authority round trip) and then DRAIN B's grant,
+// under the frontend's locks. The claim taken here excludes that acquisition
+// entirely: between this release and the write, no grant can install.
+//
+// Holding the claim across the locks is only safe because the lock order is now
+// GLOBAL — every path-bearing transition admission, metadata included, happens
+// ahead of a.nsMu (see mutationadmit.go). Nothing that holds a.nsMu waits for a
+// claim, so there is no cycle for this ordering to close.
 func (v *Volume) admitAuthorityLane(
 	ctx context.Context,
+	cancelDeadline context.CancelFunc,
 	path string,
 	n *NodeState,
 	want int,
@@ -250,10 +285,22 @@ func (v *Volume) admitAuthorityLane(
 	if n != nil {
 		nodes = []*NodeState{n}
 	}
-	if err := v.wb.ReleaseFor(ctx, v.hardlinkMutationPaths(nodes, path)...); err != nil {
+	token, paths, endToken, err := v.beginTransitionToken(ctx, nodes, path)
+	if err != nil {
+		cancelDeadline()
 		return ctx, 0, noop, err
 	}
-	return writeback.WithResolvedLane(ctx, writeback.LaneAuthority), want, noop, nil
+	settle := func() {
+		endToken()
+		cancelDeadline()
+	}
+	if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
+		settle()
+		return ctx, 0, noop, err
+	}
+	return writeback.WithResolvedLane(
+		withTransitionToken(ctx, token), writeback.LaneAuthority,
+	), want, settle, nil
 }
 
 // ReleaseDataCredit refunds whatever of opCtx's grant the engine never turned

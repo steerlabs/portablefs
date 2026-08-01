@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -634,10 +635,85 @@ func (c *frontendConn) handleAttached(
 		return
 	}
 	started := time.Now()
+	// ONE absolute deadline for this operation, installed OUTSIDE the unwind
+	// loop so every pass shares it. It bounds classification, metadata or credit
+	// backpressure, the delegation release, and the authority RPC together —
+	// per-stage budgets compose, this does not — and it is what makes the unwind
+	// loop terminate on a definite interrupted outcome rather than on a pass
+	// count. See clientcore.WithOperationDeadline.
+	ctx, cancelOperation := clientcore.WithOperationDeadline(ctx)
+	defer cancelOperation()
 	var (
 		reply any
 		eno   int32
 	)
+	// The pre-lock mutation admission point, and the unwind it owns.
+	//
+	// Every path-bearing namespace mutation resolves its lane, its metadata-lane
+	// backpressure and its delegation transition claim HERE, before any handler
+	// takes a.nsMu — the global lock order the whole daemon depends on
+	// (mutationadmit.go). Under the locks the transition state is only CHECKED;
+	// a check that fails unwinds to here with every lock released, and the
+	// second pass resolves the authority lane unconditionally, which is not a
+	// claim about a grant and has nothing left for a recall to invalidate.
+	for forceAuthority := false; ; forceAuthority = true {
+		opCtx, settleMutation, admitEno, classified := a.admitMutation(ctx, body, forceAuthority)
+		if admitEno != 0 {
+			settleMutation()
+			reply, eno = nil, admitEno
+			break
+		}
+		var replied bool
+		reply, eno, replied = a.dispatchRequest(opCtx, c, requestID, body)
+		settleMutation()
+		if replied {
+			return
+		}
+		if eno != errnoLaneChanged || !classified {
+			break
+		}
+	}
+	if eno == errnoLaneChanged {
+		// The sentinel escaped. It cannot: only a CLASSIFIED operation carries a
+		// resolved lane, and only a resolved lane lets the engine answer
+		// ErrLaneChanged — so an unclassified handler has no way to produce it.
+		// Reaching here means that invariant broke, and the one thing that must
+		// not happen is replying -1 to the kernel. Answer definitely instead.
+		eno = darwinEIO
+	}
+	if pfsdTrace {
+		log.Printf("pfsd-trace %s eno=%d duration=%s", traceOp(a, body), eno, time.Since(started))
+	}
+	if eno != 0 {
+		if publishes {
+			c.replyWithPublication(
+				requestID,
+				operationID,
+				&pfslocal.ErrorReply{
+					Errno:   eno,
+					Message: errMessage(fmt.Sprintf("%T", body), eno),
+				},
+				true,
+			)
+		} else {
+			c.errorReply(requestID, eno, errMessage(fmt.Sprintf("%T", body), eno))
+		}
+		return
+	}
+	a.synthesizeFrontendMutation(body, c.origin)
+	c.replyWithPublication(requestID, operationID, reply, publishes)
+}
+
+// dispatchRequest runs one request's handler under the operation context the
+// pre-lock classifier produced. replied reports that the handler already
+// answered the connection itself, and the caller must return without replying
+// again.
+func (a *attach) dispatchRequest(
+	ctx context.Context,
+	c *frontendConn,
+	requestID uint64,
+	body any,
+) (reply any, eno int32, replied bool) {
 	switch req := body.(type) {
 	case *pfslocal.LookupRequest:
 		reply, eno = a.lookup(ctx, req)
@@ -692,34 +768,14 @@ func (c *frontendConn) handleAttached(
 	case *pfslocal.SubscribeEventsRequest:
 		if err := c.subscribeEvents(a); err != nil {
 			c.errorReply(requestID, darwinEIO, err.Error())
-			return
+			return nil, 0, true
 		}
 		reply = &pfslocal.SubscribeEventsReply{}
 	default:
 		c.errorReply(requestID, darwinEINVAL, fmt.Sprintf("unsupported request %T", body))
-		return
+		return nil, 0, true
 	}
-	if pfsdTrace {
-		log.Printf("pfsd-trace %s eno=%d duration=%s", traceOp(a, body), eno, time.Since(started))
-	}
-	if eno != 0 {
-		if publishes {
-			c.replyWithPublication(
-				requestID,
-				operationID,
-				&pfslocal.ErrorReply{
-					Errno:   eno,
-					Message: errMessage(fmt.Sprintf("%T", body), eno),
-				},
-				true,
-			)
-		} else {
-			c.errorReply(requestID, eno, errMessage(fmt.Sprintf("%T", body), eno))
-		}
-		return
-	}
-	a.synthesizeFrontendMutation(body, c.origin)
-	c.replyWithPublication(requestID, operationID, reply, publishes)
+	return reply, eno, false
 }
 
 // pfsdTrace (PFSD_TRACE=1) logs every frontend op with its resolved paths and

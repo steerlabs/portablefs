@@ -909,10 +909,80 @@ func (e *Engine) admitAcross(ctx context.Context, primary string, touched ...str
 	if ok || err != nil {
 		return adm, ok, err
 	}
+	if resolvedLaneOf(ctx) != LaneUnresolved {
+		// A classified operation is inside the frontend's namespace and handle
+		// locks, and the classifier already released every operand out there
+		// (PrepareDelegatedMutation resolves the authority lane across the whole
+		// operand set, not just the primary). Releasing again here would be the
+		// drain the classification exists to hoist out of the locked region.
+		return admission{}, false, nil
+	}
 	if err := e.ReleaseFor(ctx, touched...); err != nil {
 		return admission{}, false, err
 	}
 	return admission{}, false, nil
+}
+
+// PrepareDelegatedMutation is the NAMESPACE lane's pre-lock classifier: the
+// exact analogue of PrepareDelegatedWrite for create/mkdir/symlink/rename/
+// remove/setattr/truncate/xattr.
+//
+// The data plane has had this since the credit controller landed; the namespace
+// plane had not, and that was the other half of the incident geometry. A
+// metadata mutation reached Engine.admit with LaneUnresolved while the frontend
+// held a.nsMu, and admit is allowed to do both unbounded things in there: push
+// an ancestor grant down (drain its whole unshipped tail through the uplink that
+// is already behind, then release it durably) or acquire a grant over an
+// authority round trip. Under a writer-preferring RWMutex's read side either one
+// parks the next rename, remove or reclaim and every lookup behind it.
+//
+// So the transition is paid HERE, holding nothing, and what crosses into the
+// locked region is a decided lane:
+//
+//   - true: every operand is covered by ONE retained grant at the mutation's
+//     exact scope. The caller records LaneDelegated; under the locks admit is a
+//     peek and answers ErrLaneChanged if that grant is gone.
+//   - false: the authority lane. The caller then takes its transition claim and
+//     releases every operand — including the destination-only grant of a rename,
+//     which is just as exclusive as one covering the source — before it takes a
+//     frontend lock.
+//
+// It DECIDES and acquires; it never releases. The two halves are separated on
+// purpose, and the order matters: an acquisition needs the acquire side of the
+// transition gate, which conflicts with the authority claim the caller will
+// hold, so a caller that claimed first and asked for a grant second would
+// deadlock against itself. Decide here holding nothing, claim afterwards, and
+// the authority lane's release happens under a claim no acquisition can slip
+// past.
+//
+// primary is the operand whose governing scope decides the lane; touched is
+// every other path the mutation binds. An operand set that cannot be served by
+// a single grant is an authority-lane operation by construction: two grants
+// cannot be made atomic with respect to one syscall.
+func (e *Engine) PrepareDelegatedMutation(
+	ctx context.Context,
+	primary string,
+	touched ...string,
+) (bool, error) {
+	if e == nil || e.cfg.DisableDelegation {
+		return false, nil
+	}
+	adm, ok, err := e.admit(ctx, primary)
+	if err != nil || !ok {
+		return false, err
+	}
+	covered := true
+	for _, p := range touched {
+		if p == "" || p == primary {
+			continue
+		}
+		if e.coveringLocked(p) != adm.d {
+			covered = false
+			break
+		}
+	}
+	e.release(adm)
+	return covered, nil
 }
 
 // release pairs with a successful admit.
@@ -1038,13 +1108,20 @@ func (e *Engine) appendLaneLocked(d *delegation, records []wal.Record, lane walL
 			// is not permanently full and the very same operation is admitted
 			// once the authority applies the backlog.
 			//
-			// It is therefore not ENOSPC, and it is not a wait either. Pacing
-			// here would be a wait taken under e.mu with a delegation held, and
-			// the namespace lane's drain dependency is already bounded precisely
-			// because it never does that. What is left is the truthful statement:
-			// the local store is fine and the far end is behind, which is exactly
-			// the EIO-class verdict the data lane produces for the same cause.
-			return nil, ErrUplinkStalled
+			// It is therefore not ENOSPC, and it is not an EIO either: reporting
+			// a dead far end for a link the watchdog considers healthy aborts
+			// mkdir(2) on a mount that is working, and the only recovery left to
+			// the application is a retry. It is also not a wait — pacing here
+			// would be a wait taken under e.mu with a delegation held, and the
+			// namespace lane's drain dependency is bounded precisely because it
+			// never does that.
+			//
+			// So the engine says "not here": errMetadataHeadroom is an
+			// ErrLaneChanged, the operation unwinds with every frontend lock
+			// released, and it re-enters AdmitMetadataMutation outside them,
+			// where the wait on applied progress is free and the ONLY stall
+			// verdict is the watchdog's. See metadatacredit.go.
+			return nil, errMetadataHeadroom
 		}
 	}
 	if err != nil {

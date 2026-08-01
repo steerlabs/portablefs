@@ -159,6 +159,142 @@ func (w *creditWaiter) signal() {
 	}
 }
 
+// creditLedger is the admission gate's ONE atomic state word. It carries BOTH
+// quantities the fast path decides on:
+//
+//	bits  0..55   debt: bulk data bytes granted but not yet applied
+//	bits 56..63   waiters: queue occupancy, saturating at creditWaitersMax
+//
+// They cannot be two words. The fast path's decision is a CONJUNCTION over both
+// — "the debt fits under the setpoint AND nobody is queued" — and a conjunction
+// over two independently published words is not a decision at all. A caller
+// that observes an empty queue, then has a waiter published underneath it, then
+// commits a CAS against an unchanged debt has barged past that waiter with
+// every individual step correct: the CAS compared debt, and the publication
+// moved a different word, so nothing could refuse it. Re-reading occupancy
+// inside the retry loop does not close that window either; it only governs
+// RETRIES, and there is no retry when the commit succeeds. Packing the two
+// quantities makes publishing a waiter change the very word the fast path's CAS
+// compares, so an admission decided against a pre-publication observation
+// CANNOT commit — the CAS fails and the retry sees the queue.
+//
+// Field widths. 56 bits of debt is 64 PiB. BudgetBytes is a local write-back
+// cache budget sized in gigabytes; newCreditController clamps the ceiling to
+// creditDebtMax, the setpoint is clamped to the ceiling, and every path that
+// raises debt first checks it against the setpoint — so debt stays within one
+// grant quantum of the ceiling and can never carry into the waiters field. The
+// waiters field only ever has to answer "is the queue empty?", so 8 saturating
+// bits are enough; the EXACT queue length is len(c.queue), which status() reads
+// under c.mu where it is exact by construction.
+type creditLedger struct{ w atomic.Uint64 }
+
+const (
+	creditDebtBits   = 56
+	creditDebtMask   = uint64(1)<<creditDebtBits - 1
+	creditDebtMax    = int64(creditDebtMask)
+	creditWaitersMax = int64(1)<<(64-creditDebtBits) - 1
+)
+
+func creditDebtOf(w uint64) int64    { return int64(w & creditDebtMask) }
+func creditWaitersOf(w uint64) int64 { return int64(w >> creditDebtBits) }
+
+// creditPack builds a state word, clamping each field into its own bits so a
+// pack can never spill one quantity into the other.
+func creditPack(debt, waiters int64) uint64 {
+	if debt < 0 {
+		debt = 0
+	}
+	if debt > creditDebtMax {
+		debt = creditDebtMax
+	}
+	if waiters < 0 {
+		waiters = 0
+	}
+	if waiters > creditWaitersMax {
+		waiters = creditWaitersMax
+	}
+	return uint64(waiters)<<creditDebtBits | uint64(debt)
+}
+
+// snapshot reads both quantities from ONE load, so a reader can never see a
+// debt from before a publication together with an occupancy from after it.
+func (l *creditLedger) snapshot() (debt, waiters int64) {
+	w := l.w.Load()
+	return creditDebtOf(w), creditWaitersOf(w)
+}
+
+// Load reports the outstanding debt.
+func (l *creditLedger) Load() int64 { return creditDebtOf(l.w.Load()) }
+
+// Store replaces the debt and leaves the occupancy exactly as it was.
+func (l *creditLedger) Store(n int64) {
+	for {
+		w := l.w.Load()
+		if l.w.CompareAndSwap(w, creditPack(n, creditWaitersOf(w))) {
+			return
+		}
+	}
+}
+
+// Add moves the debt by n (negative to release), floors it at zero, and returns
+// the new debt.
+func (l *creditLedger) Add(n int64) int64 {
+	for {
+		w := l.w.Load()
+		next := creditDebtOf(w) + n
+		if next < 0 {
+			next = 0
+		}
+		if l.w.CompareAndSwap(w, creditPack(next, creditWaitersOf(w))) {
+			return next
+		}
+	}
+}
+
+// setWaiters publishes queue occupancy into the same word the fast path commits
+// against. Callers hold c.mu, which is what makes len(c.queue) the truth being
+// published; the CAS loop is what makes the publication visible to a lock-free
+// admission that is mid-flight.
+func (l *creditLedger) setWaiters(k int64) {
+	for {
+		w := l.w.Load()
+		if l.w.CompareAndSwap(w, creditPack(creditDebtOf(w), k)) {
+			return
+		}
+	}
+}
+
+// admit is the whole hot path: one load and one CAS on the single state word.
+func (l *creditLedger) admit(n, setpoint int64) bool {
+	for {
+		w := l.w.Load()
+		debt, waiters := creditDebtOf(w), creditWaitersOf(w)
+		if debt+n > setpoint {
+			return false
+		}
+		if waiters != 0 {
+			return false
+		}
+		if creditFastPathCAS != nil {
+			creditFastPathCAS()
+		}
+		// The CAS compares the WHOLE word, so it fails if a waiter published
+		// itself after the occupancy check above — that is the fairness
+		// property, not a retry heuristic.
+		if l.w.CompareAndSwap(w, creditPack(debt+n, waiters)) {
+			return true
+		}
+	}
+}
+
+// creditWaiters is the occupancy FIELD of the ledger word, not a second
+// variable. Reading or publishing occupancy goes through the same word — and
+// therefore the same CAS domain — as debt.
+type creditWaiters struct{ l *creditLedger }
+
+func (v creditWaiters) Load() int64   { return creditWaitersOf(v.l.w.Load()) }
+func (v creditWaiters) Store(k int64) { v.l.setWaiters(k) }
+
 // creditController is the admission gate for bulk data bytes.
 type creditController struct {
 	e *Engine
@@ -169,12 +305,14 @@ type creditController struct {
 	floor   int64
 
 	// setpoint and debt are the fast path: one load and one CAS, no lock, no
-	// allocation. debt is bulk data bytes granted but not yet applied by the
-	// authority. waiting is non-zero exactly while the queue is non-empty and
-	// makes the fast path yield to it (no barging past a queued waiter).
+	// allocation. debt is the packed ledger word — bulk data bytes granted but
+	// not yet applied, TOGETHER with the queue's occupancy. waiting is the
+	// occupancy view of that same word, non-zero exactly while the queue is
+	// non-empty, and makes the fast path yield to it (no barging past a queued
+	// waiter). See creditLedger for why the two quantities share one word.
 	setpoint atomic.Int64
-	debt     atomic.Int64
-	waiting  atomic.Int64
+	debt     creditLedger
+	waiting  creditWaiters
 
 	mu         sync.Mutex
 	queue      []*creditWaiter
@@ -198,6 +336,14 @@ func newCreditController(e *Engine) *creditController {
 	if ceiling < 0 {
 		ceiling = 0
 	}
+	if ceiling > creditDebtMax {
+		// The ledger's debt field is 56 bits (64 PiB). A configured budget past
+		// that is not a real cache size, and letting it through would let debt
+		// carry into the occupancy field — so the lane is capped at what the
+		// ledger can represent exactly. The WAL's own hard reservation still
+		// enforces whatever BudgetBytes says; this bounds only ADMISSION.
+		ceiling = creditDebtMax
+	}
 	floor := int64(creditFloorBytes)
 	if floor > ceiling {
 		// A cap too small to hold one maximum-size operation: the floor cannot
@@ -210,6 +356,8 @@ func newCreditController(e *Engine) *creditController {
 		lastSample: time.Now(),
 		drainWake:  make(chan struct{}),
 	}
+	// waiting is a view of debt's word, not storage of its own.
+	c.waiting = creditWaiters{l: &c.debt}
 	// Before the first applied sample the setpoint is the full data cap:
 	// optimistic, and still bounded by the hard cap. A fresh mount must absorb
 	// its first burst at full speed — there is no measurement yet that could
@@ -466,43 +614,28 @@ func (c *creditController) acquire(ctx context.Context, n int64) (int, error) {
 	return c.wait(ctx, n)
 }
 
-// creditFastPathCAS is the seam that lets a test land a waiter in the exact
-// window between the fast path's debt snapshot and the CAS that commits it. It
-// is nil in production, where it costs one predicted-not-taken nil compare per
-// admission and nothing else.
+// creditFastPathCAS is the seam that lets a test land a complete waiter
+// publication in the exact window between the fast path's observation of the
+// ledger word and the CAS that commits against it — the one window where a
+// pre-publication observation could still become an admission. It is nil in
+// production, where it costs one predicted-not-taken nil compare per admission
+// and nothing else.
 var creditFastPathCAS func()
 
-// tryFast is the whole hot path: two atomic loads and one CAS. It yields to a
-// non-empty queue so a flood of small arrivals cannot starve waiters that are
-// already in line.
+// tryFast is the whole hot path: one atomic load of the ledger word, one load
+// of the setpoint, and one CAS. It yields to a non-empty queue so a flood of
+// small arrivals cannot starve waiters that are already in line.
 //
-// The queue check lives INSIDE the loop, after the debt snapshot the CAS will
-// commit. That ordering is the fairness property itself. Reading `waiting` once
-// before the loop admits a barge: a caller that observes an empty queue, loses
-// its CAS to a racing admission, and retries would commit its second attempt
-// against a queue that became non-empty in between — precisely the "flood of
-// small arrivals starves the waiter already in line" case the queue exists to
-// prevent. Re-reading it every iteration gives the strongest property a
-// lock-free fast path can carry: between the last observation of an empty queue
-// and the successful CAS, this goroutine performs no other operation, so no
-// admission ever COMPLETES after the queue was seen to be non-empty.
+// The queue is not consulted separately, and that is the fairness property
+// itself. Occupancy is a FIELD of the word the CAS commits, so the observation
+// and the commit are one state transition: an admission decided while the queue
+// was empty can only commit if the queue is still empty at the instant it
+// commits. A waiter that publishes itself anywhere in between — including
+// inside the window between the check and the CAS instruction — invalidates the
+// observed state and the CAS fails, after which the retry sees the queue and
+// steps aside. No admission ever COMPLETES after the queue became non-empty.
 func (c *creditController) tryFast(n int64) bool {
-	setpoint := c.setpoint.Load()
-	for {
-		cur := c.debt.Load()
-		if cur+n > setpoint {
-			return false
-		}
-		if c.waiting.Load() != 0 {
-			return false
-		}
-		if creditFastPathCAS != nil {
-			creditFastPathCAS()
-		}
-		if c.debt.CompareAndSwap(cur, cur+n) {
-			return true
-		}
-	}
+	return c.debt.admit(n, c.setpoint.Load())
 }
 
 // hasHeadroom reports whether the gate could admit n right now, WITHOUT
@@ -510,17 +643,22 @@ func (c *creditController) tryFast(n int64) bool {
 // whether taking a delegation is worth it at all: a grant that cannot be
 // credit-admitted turns a free write-through into a paced delegated write.
 //
-// It reads the same two atomics tryFast does and yields to a non-empty queue
-// for the same reason — a caller that would have to queue does not have
-// headroom, it has a place in line.
+// It reads the same state tryFast does — in ONE load, so it can never mix a
+// debt from before a publication with an occupancy from after it — and yields
+// to a non-empty queue for the same reason: a caller that would have to queue
+// does not have headroom, it has a place in line.
 func (c *creditController) hasHeadroom(n int64) bool {
 	if n <= 0 {
 		return true
 	}
-	if c.gated.Load() || c.waiting.Load() != 0 {
+	if c.gated.Load() {
 		return false
 	}
-	return c.debt.Load()+n <= c.setpoint.Load()
+	debt, waiters := c.debt.snapshot()
+	if waiters != 0 {
+		return false
+	}
+	return debt+n <= c.setpoint.Load()
 }
 
 // refund returns unspent credit to the ledger and re-runs the queue: a refund
@@ -536,16 +674,10 @@ func (c *creditController) refund(n int64) {
 }
 
 func (c *creditController) release(n int64) {
-	for {
-		cur := c.debt.Load()
-		next := cur - n
-		if next < 0 {
-			next = 0
-		}
-		if c.debt.CompareAndSwap(cur, next) {
-			return
-		}
+	if n <= 0 {
+		return
 	}
+	c.debt.Add(-n)
 }
 
 // wait queues the request and serves it in chunks until it is satisfied, the
@@ -856,10 +988,16 @@ func (c *creditController) thaw() {
 }
 
 // creditStatus snapshots the controller for Status/observability.
+//
+// Every quantity is read under c.mu, which is where occupancy is published, so
+// the reported debt and waiter count belong to the same instant rather than to
+// two unrelated ones. The queue LENGTH is reported from len(c.queue), not from
+// the ledger's saturating occupancy field: the field only has to answer "is the
+// queue empty?" for the fast path, and observability wants the exact number.
 func (c *creditController) status() (setpoint, debt, ceiling int64, rate float64, waiting int) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	rate = c.decayedRateLocked(time.Now())
 	waiting = len(c.queue)
-	c.mu.Unlock()
 	return c.setpoint.Load(), c.debt.Load(), c.ceiling, rate, waiting
 }

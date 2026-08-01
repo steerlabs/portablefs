@@ -38,11 +38,11 @@ func TestDelegationTransitionOverlapAndConcurrency(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
-		name          string
-		heldKind      delegationTransitionKind
-		heldPath      string
-		waitingKind   delegationTransitionKind
-		waitingPath   string
+		name        string
+		heldKind    delegationTransitionKind
+		heldPath    string
+		waitingKind delegationTransitionKind
+		waitingPath string
 	}{
 		{
 			name:        "ancestor authority excludes descendant acquire",

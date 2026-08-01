@@ -1,6 +1,9 @@
 package portablefsd
 
-import "github.com/steerlabs/portablefs/vcs/internal/fsproto"
+import (
+	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
+	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+)
 
 const (
 	darwinEPERM  int32 = 1
@@ -34,6 +37,13 @@ const (
 )
 
 func toDarwinErr(st int32) int32 {
+	if clientcore.LaneChanged(st) {
+		// Not an errno and never an answer to a client: the classified
+		// operation's lane no longer holds and the engine refused to transition
+		// under the frontend's locks. It unwinds at the request dispatcher and
+		// re-classifies with every lock released (see mutationadmit.go).
+		return errnoLaneChanged
+	}
 	switch st {
 	case fsproto.OK:
 		return 0
