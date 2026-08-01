@@ -66,20 +66,27 @@ const (
 	// inode-renewal and write-back recovery lists.
 	maxRequestCollectionItems = MaxBatchRecords
 
-	requestFlagOrphanTarget uint32 = 1 << iota
-	requestFlagAppend
-	requestFlagSetMode
-	requestFlagSetTime
-	requestFlagSetUID
-	requestFlagSetGID
-	requestFlagLockWrite
-	requestFlagLockUnlock
-	requestFlagOpenState
-	requestFlagRegisterOpen
-	requestFlagExcl
-	requestFlagEnvelope
-	requestFlagSetATime
-	requestFlagSetFlags
+	// Request flag bits are WIRE VALUES shared with every deployed peer.
+	// They are written as explicit literals — never iota — because an iota
+	// chain takes its start from the ConstSpec index in the enclosing block,
+	// so an unrelated line added above it silently renumbers every bit on
+	// the wire (both sides of an in-tree build shift together, so no test
+	// that encodes and decodes with the same binary can notice). The exact
+	// values are pinned by TestRequestFlagWireValuesArePinned.
+	requestFlagOrphanTarget uint32 = 1 << 9
+	requestFlagAppend       uint32 = 1 << 10
+	requestFlagSetMode      uint32 = 1 << 11
+	requestFlagSetTime      uint32 = 1 << 12
+	requestFlagSetUID       uint32 = 1 << 13
+	requestFlagSetGID       uint32 = 1 << 14
+	requestFlagLockWrite    uint32 = 1 << 15
+	requestFlagLockUnlock   uint32 = 1 << 16
+	requestFlagOpenState    uint32 = 1 << 17
+	requestFlagRegisterOpen uint32 = 1 << 18
+	requestFlagExcl         uint32 = 1 << 19
+	requestFlagEnvelope     uint32 = 1 << 20
+	requestFlagSetATime     uint32 = 1 << 21
+	requestFlagSetFlags     uint32 = 1 << 22
 )
 
 const requestKnownFlags = requestFlagOrphanTarget |
