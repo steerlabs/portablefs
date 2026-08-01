@@ -75,6 +75,14 @@ type frontendConn struct {
 	closeOnce         sync.Once
 	inFlight          atomic.Int32
 	handlerWG         sync.WaitGroup
+
+	// testAfterRetractionCapture fires between a reply's retraction-verdict
+	// capture and its frame write. It exists because that gap is not otherwise
+	// reachable from a test and it is exactly the gap a delegation handoff used
+	// to fit a crossing into: the verdict said "not retracted", the crossing
+	// happened, and the frame carrying the stale verdict went out afterwards.
+	// nil in production.
+	testAfterRetractionCapture func(operationID uint64)
 }
 
 type frontendOperationEntry struct {
@@ -358,6 +366,20 @@ func (c *frontendConn) replyWithPublication(
 		_ = c.conn.Close()
 		return
 	}
+	// THE VERDICT AND THE FRAME ARE ONE GATE TRANSITION.
+	//
+	// The retraction is read under the same lock a crossing takes, and — when it
+	// answers "not retracted" — this frame is registered as a carrier the
+	// crossing must wait for until the bytes are out. Sampling the verdict and
+	// then writing left a gap a handoff fitted into exactly: the frame was built
+	// before the crossing and delivered after it, so the frontend installed a
+	// view the daemon had already decided to retract, with the only carrier the
+	// retraction had already spent. See attach.captureRetractionCarrier.
+	retracted, releaseCarrier := c.captureRetraction(operationID)
+	defer releaseCarrier()
+	if c.testAfterRetractionCapture != nil {
+		c.testAfterRetractionCapture(operationID)
+	}
 	if err := c.write(&pfslocal.Envelope{
 		RequestID:              req,
 		PublicationAckRequired: ackRequired,
@@ -377,7 +399,7 @@ func (c *frontendConn) replyWithPublication(
 		// parked inside the delegation release — and whether that request
 		// happens to publish is unrelated to whether it is the last one the
 		// callback is waiting for.
-		PublicationRetracted: c.publicationRetracted(operationID),
+		PublicationRetracted: retracted,
 	}); err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
@@ -409,8 +431,19 @@ func (c *frontendConn) replyWithPublication(
 // somehow reached an unexposed operation is DROPPED and announced, which fails
 // towards the behaviour that existed before retractions did.
 func (c *frontendConn) publicationRetracted(operationID uint64) bool {
+	retracted, release := c.captureRetraction(operationID)
+	release()
+	return retracted
+}
+
+// captureRetraction is publicationRetracted for the reply that will CARRY the
+// verdict: it takes the gate transition rather than a sample, and the returned
+// release must run once the frame is on the wire. See
+// attach.captureRetractionCarrier.
+func (c *frontendConn) captureRetraction(operationID uint64) (bool, func()) {
+	noop := func() {}
 	if operationID == 0 {
-		return false
+		return false, noop
 	}
 	c.publicationMu.Lock()
 	entry := c.operations[operationID]
@@ -423,15 +456,17 @@ func (c *frontendConn) publicationRetracted(operationID uint64) bool {
 	}
 	c.publicationMu.Unlock()
 	if op == nil {
-		return false
+		return false, noop
 	}
 	// publicationMu is released first. The gate lock is taken from this
 	// connection's side in exactly one other place
 	// (markPublicationReplyExposed) and with the same discipline, so the two
 	// stay unordered rather than newly nested.
-	if !op.attach.publicationRetracted(op) {
-		return false
+	retracted, release := op.attach.captureRetractionCarrier(op)
+	if !retracted {
+		return false, release
 	}
+	release()
 	if !exposed {
 		log.Printf(
 			"portablefsd: attach %s retracted logical operation %d before it had "+
@@ -439,9 +474,9 @@ func (c *frontendConn) publicationRetracted(operationID uint64) bool {
 				"would have no connection to acknowledge it on",
 			op.attach.ref, operationID,
 		)
-		return false
+		return false, noop
 	}
-	return true
+	return true, noop
 }
 
 func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {

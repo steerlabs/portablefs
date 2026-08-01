@@ -217,15 +217,15 @@ func TestMutationSequenceBracketsEveryConcurrentWriterOnOneItem(t *testing.T) {
 	if !a.itemMutationInFlightLocked(item) {
 		t.Fatal("two open mutations reported nothing in flight")
 	}
-	settleFirst()
+	settleFirst(true)
 	if !a.itemMutationInFlightLocked(item) {
 		t.Fatal("one writer's publication cleared the other writer's open commit")
 	}
-	settleFirst() // idempotent: a double settle must not close the survivor
+	settleFirst(true) // idempotent: a double settle must not close the survivor
 	if !a.itemMutationInFlightLocked(item) {
 		t.Fatal("a repeated settle closed a sequence it did not own")
 	}
-	settleSecond()
+	settleSecond(true)
 	if a.itemMutationInFlightLocked(item) {
 		t.Fatal("the item stayed unstable after every writer published")
 	}
@@ -234,6 +234,46 @@ func TestMutationSequenceBracketsEveryConcurrentWriterOnOneItem(t *testing.T) {
 	}
 	if got := a.beginItemMutation(0); got == nil {
 		t.Fatal("an unnamed item must still return a settle")
+	}
+}
+
+// TestSettlingWithoutPublishingRetainsADefiniteUnstableVerdict is the half of
+// the bracket that a bare defer could never express.
+//
+// A handler reaching its settle proves it got to the publication STEP, not that
+// it published: the post-op attribute refresh is optional and its failure is
+// answered with the committed count on purpose. Closing the sequence there
+// declares stable an item whose registry is provably behind its own commit, and
+// the next refresh arms on that stale sample. So an unpublished settle retains
+// the verdict, and only a real publication clears it.
+func TestSettlingWithoutPublishingRetainsADefiniteUnstableVerdict(t *testing.T) {
+	a := &attach{}
+	const item = uint64(21)
+
+	settle := a.beginItemMutation(item)
+	settle(false)
+	if !a.itemMutationInFlightLocked(item) {
+		t.Fatal("a commit that never published its post-op state closed the item's " +
+			"mutation sequence: the registry still holds the pre-write size and the " +
+			"next refresh will arm on it and truncate over committed bytes")
+	}
+
+	// Another settle is not a publication and must not clear it either.
+	second := a.beginItemMutation(item)
+	second(true)
+	if !a.itemMutationInFlightLocked(item) {
+		t.Fatal("a later writer's publication cleared an unpublished commit's verdict")
+	}
+
+	// The ordered repair: the next publisher that states this item's attributes.
+	a.mu.Lock()
+	a.notePublicationLocked(item)
+	a.mu.Unlock()
+	if a.itemMutationInFlightLocked(item) {
+		t.Fatal("the item stayed unstable after its attributes were published")
+	}
+	if len(a.itemMutations) != 0 {
+		t.Fatalf("the unstable-item set retained a repaired entry: %+v", a.itemMutations)
 	}
 }
 
@@ -270,7 +310,7 @@ func TestRefreshRefusesToArmWhileASizeMutationIsUnpublished(t *testing.T) {
 		t.Fatalf("arm refused with %v, want a supersession retry", err)
 	}
 	a.mu.Lock()
-	a.settleItemMutationLocked(9)
+	a.settleItemMutationLocked(9, true)
 	a.mu.Unlock()
 	if _, _, err := a.armRefreshWindowLocked("d/f", snapshot, 4, fence); err != nil {
 		t.Fatalf("the item stayed fenced after its mutation published: %v", err)

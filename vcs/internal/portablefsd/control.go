@@ -555,8 +555,15 @@ func (a *attach) controlWriteLocked(
 	// item is named from the record the path ALREADY has: a control write that
 	// creates the name mints a fresh identity no refresh pass can be carrying a
 	// stale sample of, and a zero ID is inert by construction.
+	// published starts TRUE: every exit before the size is committed — a lane
+	// change, a refused create, a refused write — leaves nothing for the
+	// registry to be behind on, and the sequence must close on those paths.
+	commit := &setattrCommit{published: true}
+	var bracketed uint64
 	if existing := a.itemByPath(p); existing != nil {
-		defer a.beginItemMutation(existing.item.ItemID)()
+		bracketed = existing.item.ItemID
+		settleMutation := a.beginItemMutation(bracketed)
+		defer func() { settleMutation(commit.published) }()
 	}
 	attr, st := vol.Lookup(ctx, p)
 	existed := st == fsproto.OK
@@ -617,21 +624,56 @@ func (a *attach) controlWriteLocked(
 		return false, httpStatusForErr(toDarwinErr(st)),
 			errMessage("fs/write data", toDarwinErr(st)), 0
 	}
-	if _, st := vol.Setattr(ctx, p, node, clientcore.SetattrRequest{
+	// THE COMMITTING CALL'S OWN REPLY IS THE POST-OP STATE.
+	//
+	// vol.Setattr returns the inode's post-op attributes at the mutation's own
+	// ordered apply position (postattrs.go / clientcore.Volume.Setattr), and
+	// discarding them was the whole of this path's half of finding 1: the
+	// composed size was then only ever published if the OPTIONAL trailing
+	// getattr below succeeded, and when it failed the handler registered `attr`
+	// — the PRE-write lookup or create attributes — and settled the item's
+	// mutation sequence over a registry that still said 0. The next refresh
+	// armed on that sample and ftruncated the kernel's vnode back over the bytes
+	// this write had just acknowledged to its HTTP caller.
+	post, st := vol.Setattr(ctx, p, node, clientcore.SetattrRequest{
 		Size: int64(len(data)), SetSize: true,
-	}); st != fsproto.OK {
+	})
+	if st != fsproto.OK {
 		if clientcore.LaneChanged(st) {
 			return true, 0, "", 0
 		}
 		return false, httpStatusForErr(toDarwinErr(st)),
 			errMessage("fs/write truncate", toDarwinErr(st)), 0
 	}
-	if fresh, st := vol.Getattr(ctx, p, node); st == fsproto.OK {
-		attr = fresh
+	commit.size, commit.sizeKnown, commit.published = int64(len(data)), true, false
+	if post.Kind != "" {
+		attr = post
+	}
+	// The trailing getattr is now a REFINEMENT and never the only source of the
+	// size: it picks up whatever the authority states about the name after the
+	// mutation, and its failure costs nothing the reply needs.
+	if a.testControlWriteRefreshFails == nil || !a.testControlWriteRefreshFails() {
+		if fresh, st := vol.Getattr(ctx, p, node); st == fsproto.OK {
+			attr = fresh
+		}
+	}
+	if attr.Size != int64(len(data)) && post.Kind == "" {
+		// No post-op attributes and no successful refresh: the only statement
+		// left about this name's size is the one this write committed.
+		attr.Size = int64(len(data))
 	}
 	a.mu.Lock()
 	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	rec := a.registerLocked(p, attr)
+	if rec != nil {
+		commit.published = true
+	} else if bracketed != 0 {
+		// The registration was refused. The bytes are committed anyway, so the
+		// item this handler bracketed must not be declared stable over a
+		// registry that still holds the pre-write size.
+		a.publishItemSizeLocked(bracketed, a.items[bracketed], commit.size, false)
+		commit.published = true
+	}
 	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	if rec == nil {
 		a.mu.Unlock()

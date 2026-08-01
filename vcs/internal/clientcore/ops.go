@@ -1077,10 +1077,40 @@ func (v *Volume) readBase(ctx context.Context, permit *readView, path string, n 
 	return data, fsproto.OK
 }
 
+// WriteOutcome is one write's COMMITTED result, and it exists because the count
+// alone is not enough for a caller that keeps its own attribute store.
+//
+// `Count` is the POSIX outcome and is DECIDED the instant the lane returns.
+// `Size` is the file's composed size AFTER the write, as stated by whichever
+// lane committed it — the engine's own overlay entry on the delegated lane, the
+// authority's post-op attributes or its assigned append offset on the write-
+// through lane. SizeKnown says the lane stated one.
+//
+// The frontend cannot reconstruct it. A positional write proves only the floor
+// off+count (the file may have been longer already), and an APPEND resolves its
+// offset at the authority or under the engine's lock precisely so the frontend
+// never computes one — so if the committing lane does not hand the resulting
+// size back, the frontend has no way to publish the post-op state of a write it
+// has just acknowledged, and its registry stays behind a commit the application
+// already believes is durable. See portablefsd/mutationseq.go.
+type WriteOutcome struct {
+	Count     int
+	Size      int64
+	SizeKnown bool
+}
+
+// Write is WriteCommitted for callers that only need the POSIX count.
 func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64, data []byte) (int, Status) {
+	out, st := v.WriteCommitted(ctx, path, n, off, data)
+	return out.Count, st
+}
+
+func (v *Volume) WriteCommitted(
+	ctx context.Context, path string, n *NodeState, off int64, data []byte,
+) (WriteOutcome, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1091,13 +1121,13 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	if oi := n.Orphan(); oi != 0 {
 		cnt, st, err := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 		if err != nil {
-			return 0, fsproto.EIO
+			return WriteOutcome{}, fsproto.EIO
 		}
-		return cnt, st
+		return WriteOutcome{Count: cnt}, st
 	}
 	if v.wb != nil && v.isHardlink(n) {
 		if st, unwind := v.releaseHardlinkScopesResolved(ctx, []*NodeState{n}, path); unwind {
-			return 0, st
+			return WriteOutcome{}, st
 		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
@@ -1106,9 +1136,9 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 			n.mu.Unlock()
 			cnt, st, werr := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 			if werr != nil {
-				return 0, fsproto.EIO
+				return WriteOutcome{}, fsproto.EIO
 			}
-			return cnt, st
+			return WriteOutcome{Count: cnt}, st
 		}
 		// Never retain the node lock while write-back admission may wait for a
 		// delegation release. Open-pin protection reads the same orphan state
@@ -1120,14 +1150,18 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		if handled {
 			if werr != nil {
 				v.debug("Write engine %q off=%d: %v", path, off, werr)
-				return 0, statusErr(werr)
+				return WriteOutcome{}, statusErr(werr)
 			}
 			v.recent.record(path)
 			v.noteSelfMutation(path, 0, 0, true)
-			return res.Count, fsproto.OK
+			// The engine spliced the extents and composed the entry under its own
+			// lock; res.Entry.Size IS the post-write size of this file.
+			return WriteOutcome{
+				Count: res.Count, Size: res.Entry.Size, SizeKnown: true,
+			}, fsproto.OK
 		}
 		if werr != nil {
-			return 0, statusErr(werr)
+			return WriteOutcome{}, statusErr(werr)
 		}
 	}
 	// The classifier already paid this lane's delegation release outside the
@@ -1137,7 +1171,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
-		return 0, statusErr(releaseErr)
+		return WriteOutcome{}, statusErr(releaseErr)
 	}
 	defer endAuthority()
 	n.mu.Lock()
@@ -1145,27 +1179,27 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		n.mu.Unlock()
 		cnt, st, err := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 		if err != nil {
-			return 0, fsproto.EIO
+			return WriteOutcome{}, fsproto.EIO
 		}
-		return cnt, st
+		return WriteOutcome{Count: cnt}, st
 	}
 	handleIno := authHandleIno(n)
 	cnt, version, gen, st, err := v.client.WriteVHandleContext(authorityCtx, path, handleIno, off, data, 0o644)
 	n.mu.Unlock()
 	if err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
 	if st == fsproto.ENOENT {
 		if oi := v.RedirectToOrphan(authorityCtx, n); oi != 0 {
 			c2, ost, oerr := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 			if oerr != nil {
-				return 0, fsproto.EIO
+				return WriteOutcome{}, fsproto.EIO
 			}
-			return c2, ost
+			return WriteOutcome{Count: c2}, ost
 		}
 	}
 	if st != fsproto.OK {
-		return 0, st
+		return WriteOutcome{}, st
 	}
 	v.recent.record(path)
 	v.VersionCache.FillOK(gen, path, version)
@@ -1173,34 +1207,51 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 	if v.isHardlink(n) {
 		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, gen, version, false)
 	}
-	return cnt, fsproto.OK
+	// The write-through reply carried this name's post-op attributes at the
+	// mutation's own ordered apply position (postattrs.go). That IS the post-op
+	// size, and it is strictly better than anything read afterwards: a separate
+	// getattr samples a later moment. An authority without the capability, or a
+	// wire path a peer renamed off this inode, reports nothing — the caller then
+	// falls back to the floor it can prove for itself.
+	out := WriteOutcome{Count: cnt}
+	if post, reported := v.latestPostAttr(authorityCtx, path); reported {
+		out.Size, out.SizeKnown = post.Size, true
+	}
+	return out, fsproto.OK
 }
 
 // WriteExactHandle is the detached-descriptor mutation lane. A mount-wide
 // release is rare but necessary: with an unseen surviving hard link there is
 // no trustworthy pathname scope to release more narrowly.
 func (v *Volume) WriteExactHandle(ctx context.Context, n *NodeState, off int64, data []byte) (int, Status) {
+	out, st := v.WriteExactHandleCommitted(ctx, n, off, data)
+	return out.Count, st
+}
+
+func (v *Volume) WriteExactHandleCommitted(
+	ctx context.Context, n *NodeState, off int64, data []byte,
+) (WriteOutcome, Status) {
 	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
 	defer end()
 	ino := authHandleIno(n)
 	if n == nil || !n.IsOpen() || ino == 0 {
-		return 0, fsproto.ENOENT
+		return WriteOutcome{}, fsproto.ENOENT
 	}
 	if oi := n.Orphan(); oi != 0 {
 		count, st, err := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 		if err != nil {
-			return 0, fsproto.EIO
+			return WriteOutcome{}, fsproto.EIO
 		}
-		return count, st
+		return WriteOutcome{Count: count}, st
 	}
 	count, _, _, st, err := v.client.WriteVHandleContext(authorityCtx, "", ino, off, data, 0o644)
 	if err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
-	return count, st
+	return WriteOutcome{Count: count}, st
 }
 
 // WriteOpenHandle validates any delegated snapshot against the descriptor
@@ -1208,16 +1259,23 @@ func (v *Volume) WriteExactHandle(ctx context.Context, n *NodeState, off int64, 
 // the stable inode handle, so a stale alias can never redirect the write to a
 // rename-over replacement.
 func (v *Volume) WriteOpenHandle(ctx context.Context, path string, n *NodeState, off int64, data []byte) (int, Status) {
+	out, st := v.WriteOpenHandleCommitted(ctx, path, n, off, data)
+	return out.Count, st
+}
+
+func (v *Volume) WriteOpenHandleCommitted(
+	ctx context.Context, path string, n *NodeState, off int64, data []byte,
+) (WriteOutcome, Status) {
 	path = cleanVolumePath(path)
 	if path == "" {
-		return v.WriteExactHandle(ctx, n, off, data)
+		return v.WriteExactHandleCommitted(ctx, n, off, data)
 	}
 	ctx = withDelegatedBindingExpectation(ctx, path, n)
-	count, st := v.Write(ctx, path, n, off, data)
+	out, st := v.WriteCommitted(ctx, path, n, off, data)
 	if st == statusExactRetry {
-		return v.WriteExactHandle(ctx, n, off, data)
+		return v.WriteExactHandleCommitted(ctx, n, off, data)
 	}
-	return count, st
+	return out, st
 }
 
 // WriteAppend executes O_APPEND. Under a delegation the local size is
@@ -1225,9 +1283,16 @@ func (v *Volume) WriteOpenHandle(ctx context.Context, path string, n *NodeState,
 // locally at the exact EOF; otherwise the authority resolves EOF in
 // sequencer order.
 func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, legacyOff int64, data []byte) (int, Status) {
+	out, st := v.WriteAppendCommitted(ctx, path, n, legacyOff, data)
+	return out.Count, st
+}
+
+func (v *Volume) WriteAppendCommitted(
+	ctx context.Context, path string, n *NodeState, legacyOff int64, data []byte,
+) (WriteOutcome, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1236,26 +1301,26 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	defer v.installPostAttrs(ctx)
 
 	if oi := n.Orphan(); oi != 0 {
-		cnt, _, st, err := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
+		cnt, off, st, err := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
 		if err != nil {
-			return 0, fsproto.EIO
+			return WriteOutcome{}, fsproto.EIO
 		}
-		return cnt, st
+		return appendOutcome(cnt, off, st), st
 	}
 	if v.wb != nil && v.isHardlink(n) {
 		if st, unwind := v.releaseHardlinkScopesResolved(ctx, []*NodeState{n}, path); unwind {
-			return 0, st
+			return WriteOutcome{}, st
 		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
 		n.mu.Lock()
 		if oi := n.orphanIno.Load(); oi != 0 {
 			n.mu.Unlock()
-			cnt, _, st, werr := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
+			cnt, off, st, werr := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
 			if werr != nil {
-				return 0, fsproto.EIO
+				return WriteOutcome{}, fsproto.EIO
 			}
-			return cnt, st
+			return appendOutcome(cnt, off, st), st
 		}
 		// See Write: delegation admission can wait for open-pin protection,
 		// which must be able to inspect this NodeState.
@@ -1264,14 +1329,18 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		if handled {
 			if werr != nil {
 				v.debug("WriteAppend engine %q: %v", path, werr)
-				return 0, statusErr(werr)
+				return WriteOutcome{}, statusErr(werr)
 			}
 			v.recent.record(path)
 			v.noteSelfMutation(path, 0, 0, true)
-			return res.Count, fsproto.OK
+			// The engine resolved EOF and spliced under one lock hold, so its
+			// composed entry is the exact post-append size.
+			return WriteOutcome{
+				Count: res.Count, Size: res.Entry.Size, SizeKnown: true,
+			}, fsproto.OK
 		}
 		if werr != nil {
-			return 0, statusErr(werr)
+			return WriteOutcome{}, statusErr(werr)
 		}
 	}
 	// The classifier already paid this lane's delegation release outside the
@@ -1281,35 +1350,35 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		ctx, []*NodeState{n}, path,
 	)
 	if releaseErr != nil {
-		return 0, statusErr(releaseErr)
+		return WriteOutcome{}, statusErr(releaseErr)
 	}
 	defer endAuthority()
 	n.mu.Lock()
 	if oi := n.orphanIno.Load(); oi != 0 {
 		n.mu.Unlock()
-		cnt, _, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
+		cnt, off, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
 		if err != nil {
-			return 0, fsproto.EIO
+			return WriteOutcome{}, fsproto.EIO
 		}
-		return cnt, st
+		return appendOutcome(cnt, off, st), st
 	}
 	handleIno := authHandleIno(n)
-	cnt, _, version, gen, st, err := v.client.AppendVHandleContext(authorityCtx, path, handleIno, data, 0o644)
+	cnt, off, version, gen, st, err := v.client.AppendVHandleContext(authorityCtx, path, handleIno, data, 0o644)
 	n.mu.Unlock()
 	if err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
 	if st == fsproto.ENOENT {
 		if oi := v.RedirectToOrphan(authorityCtx, n); oi != 0 {
-			c2, _, ost, oerr := v.client.AppendOrphanContext(authorityCtx, oi, data)
+			c2, ooff, ost, oerr := v.client.AppendOrphanContext(authorityCtx, oi, data)
 			if oerr != nil {
-				return 0, fsproto.EIO
+				return WriteOutcome{}, fsproto.EIO
 			}
-			return c2, ost
+			return appendOutcome(c2, ooff, ost), ost
 		}
 	}
 	if st != fsproto.OK {
-		return 0, st
+		return WriteOutcome{}, st
 	}
 	v.recent.record(path)
 	v.VersionCache.FillOK(gen, path, version)
@@ -1317,7 +1386,24 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 	if v.isHardlink(n) {
 		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, gen, version, false)
 	}
-	return cnt, fsproto.OK
+	out := appendOutcome(cnt, off, st)
+	if post, reported := v.latestPostAttr(authorityCtx, path); reported {
+		out.Size, out.SizeKnown = post.Size, true
+	}
+	return out, fsproto.OK
+}
+
+// appendOutcome composes an append's committed post-state from the offset the
+// AUTHORITY assigned it. That offset is the whole point of the append lane —
+// the frontend never computes one — so off+count is the file's size at the
+// instant this append was applied, and it is the only statement about the
+// post-op size an authority without post-op attributes ever makes.
+func appendOutcome(count int, off int64, st Status) WriteOutcome {
+	out := WriteOutcome{Count: count}
+	if st == fsproto.OK && count > 0 && off >= 0 {
+		out.Size, out.SizeKnown = off+int64(count), true
+	}
+	return out
 }
 
 // AppendExactHandle is WriteExactHandle for O_APPEND: the descriptor has no
@@ -1325,27 +1411,34 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 // resolved by the authority against the handle's inode, in sequencer order.
 // It never computes an offset from a cached size.
 func (v *Volume) AppendExactHandle(ctx context.Context, n *NodeState, data []byte) (int, Status) {
+	out, st := v.AppendExactHandleCommitted(ctx, n, data)
+	return out.Count, st
+}
+
+func (v *Volume) AppendExactHandleCommitted(
+	ctx context.Context, n *NodeState, data []byte,
+) (WriteOutcome, Status) {
 	authorityCtx, end, err := v.beginExactOperation(ctx)
 	if err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
 	defer end()
 	ino := authHandleIno(n)
 	if n == nil || !n.IsOpen() || ino == 0 {
-		return 0, fsproto.ENOENT
+		return WriteOutcome{}, fsproto.ENOENT
 	}
 	if oi := n.Orphan(); oi != 0 {
-		count, _, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
+		count, off, st, err := v.client.AppendOrphanContext(authorityCtx, oi, data)
 		if err != nil {
-			return 0, fsproto.EIO
+			return WriteOutcome{}, fsproto.EIO
 		}
-		return count, st
+		return appendOutcome(count, off, st), st
 	}
-	count, _, _, _, st, err := v.client.AppendVHandleContext(authorityCtx, "", ino, data, 0o644)
+	count, off, _, _, st, err := v.client.AppendVHandleContext(authorityCtx, "", ino, data, 0o644)
 	if err != nil {
-		return 0, fsproto.EIO
+		return WriteOutcome{}, fsproto.EIO
 	}
-	return count, st
+	return appendOutcome(count, off, st), st
 }
 
 // WriteAppendOpenHandle is WriteOpenHandle for O_APPEND. It is the descriptor
@@ -1354,16 +1447,23 @@ func (v *Volume) AppendExactHandle(ctx context.Context, n *NodeState, data []byt
 // serialize on the authority (or on the exclusive delegation that makes the
 // local EOF authoritative) instead of racing to the same byte range.
 func (v *Volume) WriteAppendOpenHandle(ctx context.Context, path string, n *NodeState, data []byte) (int, Status) {
+	out, st := v.WriteAppendOpenHandleCommitted(ctx, path, n, data)
+	return out.Count, st
+}
+
+func (v *Volume) WriteAppendOpenHandleCommitted(
+	ctx context.Context, path string, n *NodeState, data []byte,
+) (WriteOutcome, Status) {
 	path = cleanVolumePath(path)
 	if path == "" {
-		return v.AppendExactHandle(ctx, n, data)
+		return v.AppendExactHandleCommitted(ctx, n, data)
 	}
 	ctx = withDelegatedBindingExpectation(ctx, path, n)
-	count, st := v.WriteAppend(ctx, path, n, 0, data)
+	out, st := v.WriteAppendCommitted(ctx, path, n, 0, data)
 	if st == statusExactRetry {
-		return v.AppendExactHandle(ctx, n, data)
+		return v.AppendExactHandleCommitted(ctx, n, data)
 	}
-	return count, st
+	return out, st
 }
 
 func (v *Volume) Create(ctx context.Context, path string, mode uint32) (fsproto.Attr, Status) {

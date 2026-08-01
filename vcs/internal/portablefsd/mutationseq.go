@@ -74,32 +74,59 @@ package portablefsd
 // The pair is a monotone sequence rather than a bare counter so the invariant
 // reads as what it is — a publication has caught up with a commit — and so a
 // diagnostic can say how far behind it is.
+//
+// ── AND WHY SETTLING TAKES A VERDICT ────────────────────────────────────────
+//
+// `settled` used to advance unconditionally, from a bare defer, on the theory
+// that the handler had reached its publication step. It had reached the step;
+// it had not necessarily PUBLISHED. Every one of these handlers refreshes its
+// post-op attributes through an OPTIONAL round trip — writeReply's
+// GetattrOpenHandle, the control write's trailing Getattr — and deliberately
+// answers with the committed count even when that refresh fails, because the
+// count is the application's only chance to learn the bytes are durable (see
+// attach.writeReply). On that path the registry keeps the PRE-write size, and
+// closing the sequence there hands the fence a verdict of "stable" for an item
+// whose registry is provably behind its own commit: the very next refresh arms
+// on the stale sample and ftruncates over the committed bytes.
+//
+// So the settle carries what actually happened. `published` closes the
+// sequence; anything else RETAINS it, and the item stays unstable — refreshes
+// for it are refused, which is an ordinary retry outcome and never data loss —
+// until an ordered repair publishes attributes for it (notePublicationLocked).
 type itemMutationSeq struct {
 	bumped  uint64
 	settled uint64
+	// unpublished records that at least one commit on this item settled without
+	// its post-op state reaching the registry. It is cleared only by a real
+	// publication, never by another settle.
+	unpublished bool
 }
 
 // beginItemMutation opens one size mutation on itemID and returns its settle.
 // The settle is idempotent and must be deferred by the caller BEFORE the engine
 // commit is attempted, so that no return path can leave the sequence open.
 //
+// The settle takes the handler's own verdict: true when the item's post-op
+// state reached the registry, false when the handler is returning without
+// having published it. See itemMutationSeq.
+//
 // A zero itemID is an item the registry cannot name; there is nothing for a
 // refresh to hold a stale sample of, so the bracket is inert.
-func (a *attach) beginItemMutation(itemID uint64) func() {
+func (a *attach) beginItemMutation(itemID uint64) func(published bool) {
 	if itemID == 0 {
-		return func() {}
+		return func(bool) {}
 	}
 	a.mu.Lock()
 	a.beginItemMutationLocked(itemID)
 	a.mu.Unlock()
 	var once bool
-	return func() {
+	return func(published bool) {
 		if once {
 			return
 		}
 		once = true
 		a.mu.Lock()
-		a.settleItemMutationLocked(itemID)
+		a.settleItemMutationLocked(itemID, published)
 		a.mu.Unlock()
 	}
 }
@@ -120,7 +147,9 @@ func (a *attach) beginItemMutationLocked(itemID uint64) {
 
 // settleItemMutationLocked advances the item's settled sequence, and drops the
 // entry once publication has caught up with every commit. Callers hold a.mu.
-func (a *attach) settleItemMutationLocked(itemID uint64) {
+//
+// published is the handler's verdict about its OWN commit; see itemMutationSeq.
+func (a *attach) settleItemMutationLocked(itemID uint64, published bool) {
 	if itemID == 0 {
 		return
 	}
@@ -129,10 +158,39 @@ func (a *attach) settleItemMutationLocked(itemID uint64) {
 		return
 	}
 	seq.settled++
-	if seq.settled >= seq.bumped {
+	if !published {
+		seq.unpublished = true
+	}
+	if seq.settled >= seq.bumped && !seq.unpublished {
 		// Equal is the stable state, and the map is a set of UNSTABLE items
 		// only: retaining an entry whose two halves agree would make the map
 		// grow with the working set for no proof it does not already carry.
+		delete(a.itemMutations, itemID)
+		return
+	}
+	a.itemMutations[itemID] = seq
+}
+
+// notePublicationLocked is the ORDERED REPAIR for an item whose commit settled
+// without publishing.
+//
+// It is called from the one place every attribute assignment into the registry
+// now goes through (attach.publishRecordAttrLocked), so the repair is whatever
+// publisher next states this item's attributes — a getattr, the next write's
+// own post-op refresh, a reconciliation install. Until one arrives the item
+// stays unstable and no refresh may arm a truncate window over it, which is the
+// safe direction: a refused refresh retries, a truncate over committed bytes
+// does not come back. Callers hold a.mu.
+func (a *attach) notePublicationLocked(itemID uint64) {
+	if itemID == 0 {
+		return
+	}
+	seq, ok := a.itemMutations[itemID]
+	if !ok || !seq.unpublished {
+		return
+	}
+	seq.unpublished = false
+	if seq.settled >= seq.bumped {
 		delete(a.itemMutations, itemID)
 		return
 	}
@@ -144,5 +202,5 @@ func (a *attach) settleItemMutationLocked(itemID uint64) {
 // either mode.
 func (a *attach) itemMutationInFlightLocked(itemID uint64) bool {
 	seq, ok := a.itemMutations[itemID]
-	return ok && seq.bumped != seq.settled
+	return ok && (seq.bumped != seq.settled || seq.unpublished)
 }

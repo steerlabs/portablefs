@@ -1359,6 +1359,15 @@ type attach struct {
 	// because that gap is not otherwise reachable from a test, and it is exactly
 	// the gap the per-item mutation sequence covers (see mutationseq.go).
 	testAfterWriteCommit func()
+	// testControlWriteRefreshFails stands in for the control write's OPTIONAL
+	// trailing attribute refresh failing — a transient authority error arriving
+	// after a commit that has already happened. It exists because that is the
+	// interleaving in which the control path used to register its PRE-write
+	// attributes and settle the item's mutation sequence over them, and it is
+	// not otherwise reachable from a test: the refresh is served from the
+	// engine's own overlay or from a cache the mutation just filled. nil in
+	// production.
+	testControlWriteRefreshFails func() bool
 }
 
 type itemRecord struct {
@@ -2459,6 +2468,90 @@ func (a *attach) registerSyntheticRootLocked() *itemRecord {
 	return a.registerLocked("", syntheticRootAttr())
 }
 
+// publishRecordAttrLocked is THE attribute assignment. Every write of
+// itemRecord.attr in this daemon goes through it, and that centralization is
+// the whole point.
+//
+// ── WHY ADMISSION CANNOT LIVE AT THE REGISTRATION ENTRY POINTS ──────────────
+//
+// Publication admission (admitPublicationLocked) used to sit at
+// registerWithItemLocked and at registerHardLinkAliasLocked, which covers every
+// registration that RESOLVES A NAME — and misses every assignment that reaches
+// a record some other way. registerHandleAttrLocked is exactly that: a detached
+// handle's post-op attributes are written straight onto the canonical record
+// and onto every retained alias, by item identity rather than by name. A
+// getattr issued before a peer's rename-over, answered after the reconciliation
+// that repaired those aliases, therefore wrote the pre-reincarnation snapshot
+// (Nlink=2 beside a fresh identity) back over the repair — permanently, since
+// its ticket was inert and no fresh generation was ever minted for it.
+//
+// So admission is bound to the assignment, not to the entry point. A publisher
+// that assigns attributes to an indebted alias mints a new generation exactly
+// as a name registration does, and its OWN ticket then pays for a refresh
+// ordered strictly after the assignment (see admitPublicationLocked).
+//
+// It is also where a settled-but-unpublished mutation is repaired: this is the
+// moment the registry stops being behind the engine. See notePublicationLocked.
+//
+// admit is false for the one caller that has already admitted this exact
+// pathname a few lines earlier (registerWithItemLocked), so a single
+// registration cannot mint two generations for one name.
+func (a *attach) publishRecordAttrLocked(rec *itemRecord, attr fsproto.Attr, admit bool) {
+	if rec == nil {
+		return
+	}
+	if admit {
+		a.admitPublicationLocked(rec.path)
+	}
+	rec.attr = attr
+	a.notePublicationLocked(rec.item.ItemID)
+}
+
+// publishItemSizeLocked installs a size a MUTATION decided onto the item it
+// changed and onto every alias of that identity.
+//
+// It is the publication of last resort: it is reached only when a handler's
+// optional post-op attribute refresh failed, and it exists because the
+// alternative — publishing nothing — leaves the registry behind a commit the
+// application has already been told is durable (see attach.writeReplyWithAttr).
+//
+// Only the size moves. Everything else in the record is whatever the last real
+// observation stated, and a commit says nothing about it.
+//
+// floorOnly separates the two kinds of statement a commit makes. A WRITE proves
+// a lower bound: it extended the file to at least this point, so a record
+// already holding more holds something the write does not contradict (a peer's
+// extension, or a later write of this daemon's that published first), and
+// lowering it would be a fabrication. A TRUNCATE is exact — the authority
+// applied precisely this size — and a shrink is the whole point of it, so it is
+// installed as stated. Callers hold a.mu.
+func (a *attach) publishItemSizeLocked(
+	itemID uint64,
+	rec *itemRecord,
+	size int64,
+	floorOnly bool,
+) {
+	if rec == nil {
+		return
+	}
+	install := func(r *itemRecord) {
+		if r == nil || (floorOnly && r.attr.Size >= size) {
+			return
+		}
+		next := r.attr
+		next.Size = size
+		a.publishRecordAttrLocked(r, next, true)
+	}
+	install(rec)
+	for aliasPath := range a.itemAliases[itemID] {
+		alias := a.paths[aliasPath]
+		if alias == nil || alias.item != rec.item {
+			continue
+		}
+		install(alias)
+	}
+}
+
 func (a *attach) registerLocked(p string, attr fsproto.Attr) *itemRecord {
 	ino := attr.Ino
 	authIno := ino != 0
@@ -2506,13 +2599,13 @@ func (a *attach) registerHandleAttrLocked(h *handleRecord, attr fsproto.Attr) *i
 		if !rec.graft {
 			return nil
 		}
-		rec.attr = attr
+		a.publishRecordAttrLocked(rec, attr, true)
 		for aliasPath := range a.itemAliases[h.itemID] {
 			alias := a.paths[aliasPath]
 			if alias == nil || alias.item != rec.item || !alias.graft {
 				continue
 			}
-			alias.attr = attr
+			a.publishRecordAttrLocked(alias, attr, true)
 		}
 		return rec
 	}
@@ -2537,13 +2630,13 @@ func (a *attach) registerHandleAttrLocked(h *handleRecord, attr fsproto.Attr) *i
 		}
 		promoted = true
 	}
-	rec.attr = attr
+	a.publishRecordAttrLocked(rec, attr, true)
 	for aliasPath := range a.itemAliases[h.itemID] {
 		alias := a.paths[aliasPath]
 		if alias == nil || alias.item != rec.item || alias.state != rec.state {
 			continue
 		}
-		alias.attr = attr
+		a.publishRecordAttrLocked(alias, attr, true)
 	}
 	a.indexAuthorityIdentityLocked(rec)
 	if promoted {
@@ -2594,10 +2687,13 @@ func (a *attach) registerHardLinkAliasLocked(p string, source *itemRecord, attr 
 	if current := a.paths[source.path]; current != nil {
 		source = current
 	}
-	source.attr = attr
+	// The SOURCE name's attributes are restated too (its Nlink moved), so that
+	// assignment is a publication of the source pathname and is admitted as one.
+	a.publishRecordAttrLocked(source, attr, true)
 	a.indexAuthorityIdentityLocked(source)
 	a.pendBindingLocked(source)
-	rec := &itemRecord{item: source.item, path: p, state: source.state, attr: attr, graft: source.graft}
+	rec := &itemRecord{item: source.item, path: p, state: source.state, graft: source.graft}
+	a.publishRecordAttrLocked(rec, attr, false) // p was admitted at the top
 	a.paths[p] = rec
 	a.addItemAliasLocked(rec)
 	a.frontendPathEpoch.Add(1)
@@ -2642,7 +2738,7 @@ func (a *attach) registerWithItemLocked(
 			return a.registerWithItemLocked(p, attr, ino, authIno, reuseByItemID, graft)
 		}
 
-		rec.attr = attr
+		a.publishRecordAttrLocked(rec, attr, false) // p was admitted above
 		// Preserve the pfslocal Item already handed to the kernel for this same path. A write-back
 		// create starts life with a local item, then may gain an authority inode when it flushes or
 		// recovers after a daemon restart; changing ItemID at that boundary would strand existing
@@ -2692,7 +2788,7 @@ func (a *attach) registerWithItemLocked(
 		rec.state = identity.state
 	}
 	rec.path = p
-	rec.attr = attr
+	a.publishRecordAttrLocked(rec, attr, false) // p was admitted above
 	a.paths[p] = rec
 	a.addItemAliasLocked(rec)
 	a.frontendPathEpoch.Add(1)

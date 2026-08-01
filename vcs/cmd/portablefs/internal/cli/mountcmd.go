@@ -915,10 +915,31 @@ func (o *mountOpts) resolveMountToken(getenv func(string) string) string {
 // reconnect handshakes. Only the lease keeper may advance it; rejection is a
 // terminal visible failure, never a trigger to mint a replacement lease.
 type sessionTokenSource struct {
-	mu          sync.Mutex
+	mu sync.Mutex
+	// seq is the source's MONOTONE state sequence, advanced by every accepted
+	// credential change. It is what makes delivery ordered; see deliver.
+	seq         uint64
 	token       string
 	expiresAtMs int64
-	dataPlanes  []credentialInstaller
+	dataPlanes  []*boundDataPlane
+
+	// deliverMu serializes DELIVERY, and is never held together with mu.
+	// Installation reaches the data plane's own locks and opens a credential
+	// generation, neither of which may happen under the source lock — and two
+	// installations that overlap are precisely the defect this serialization
+	// closes, so the delivery pass needs a lock of its own.
+	deliverMu sync.Mutex
+}
+
+// boundDataPlane is one registered data plane and the highest SOURCE sequence
+// installed into it. delivered and seeded are guarded by deliverMu alone; the
+// slice they live in is guarded by mu.
+type boundDataPlane struct {
+	inst       credentialInstaller
+	delivered  uint64
+	seeded     bool
+	seedToken  string
+	seedExpiry int64
 }
 
 // credentialInstaller is a data plane a rotated lease credential must reach.
@@ -946,11 +967,16 @@ type credentialInstaller interface {
 // plane is holding a superseded credential and nothing else would tell it.
 func (t *sessionTokenSource) bindDataPlane(inst credentialInstaller, seedToken string, seedExpiry int64) {
 	t.mu.Lock()
-	t.dataPlanes = append(t.dataPlanes, inst)
+	t.dataPlanes = append(t.dataPlanes, &boundDataPlane{
+		inst: inst, seeded: true, seedToken: seedToken, seedExpiry: seedExpiry,
+	})
 	t.mu.Unlock()
-	if token, expiresAtMs := t.get(); token != seedToken || expiresAtMs != seedExpiry {
-		inst.InstallCredential(token, expiresAtMs)
-	}
+	// The bind runs through the SAME ordered delivery pass a rotation does. It
+	// used to install from its own read of the source, which is a second,
+	// unordered writer into the data plane: a rotation racing the bind could be
+	// overtaken by the bind's older read, or vice versa, and the data plane was
+	// left holding whichever arrived last rather than whichever is current.
+	t.deliver()
 }
 
 // setToken installs a fresh data-plane credential (the lease keeper pushes
@@ -965,17 +991,64 @@ func (t *sessionTokenSource) bindDataPlane(inst credentialInstaller, seedToken s
 // and no pending state was ever entered, so the credential's own stated expiry
 // could not harden it either. A mount rotated onto a dead credential reported
 // itself perfectly healthy.
+// ── AND WHY DELIVERY CARRIES A SEQUENCE ─────────────────────────────────────
+//
+// The push used to be "store under the lock, copy the installers, install after
+// unlocking", and that loses the ORDER the source establishes. Two rotations
+// overlap — T2 blocks between the unlock and its install while T3 stores and
+// installs — and T2's install lands LAST: the source says T3, the data plane
+// offers T2's credential under the newest generation's tag, and verification
+// then faithfully verifies the wrong credential and latches a verdict about it.
+// Nothing repairs that, because from every layer's point of view the
+// installation succeeded. Atomicity inside Client.InstallCredential cannot help;
+// the order was already lost above it.
+//
+// So the source carries a monotone sequence and delivery is a serialized pass
+// that always installs the source's CURRENT state, skipping any data plane
+// already at that sequence. An overtaken delivery therefore finds the newer
+// state and installs it (or finds it already installed and does nothing); it
+// can never install an older one.
 func (t *sessionTokenSource) setToken(token string, expiresAtMs int64) {
 	t.mu.Lock()
+	t.seq++
 	t.token = token
 	t.expiresAtMs = expiresAtMs
-	dataPlanes := append([]credentialInstaller(nil), t.dataPlanes...)
 	t.mu.Unlock()
-	// Outside the lock: installation reaches the data plane's own locks and
-	// starts a verification handshake, and the token source must not be held
-	// across either.
-	for _, inst := range dataPlanes {
-		inst.InstallCredential(token, expiresAtMs)
+	t.deliver()
+}
+
+// deliver installs the source's current credential into every bound data plane
+// that has not already received this sequence.
+//
+// It runs with mu RELEASED — installation reaches the data plane's own locks and
+// opens a credential generation — and under deliverMu, which orders the passes
+// against each other. Reading the source state INSIDE that serialization is
+// what makes an obsolete delivery impossible rather than merely unlikely: a
+// pass that was overtaken re-reads the newer state and either installs it or
+// finds the sequence already delivered.
+func (t *sessionTokenSource) deliver() {
+	t.deliverMu.Lock()
+	defer t.deliverMu.Unlock()
+	t.mu.Lock()
+	seq, token, expiresAtMs := t.seq, t.token, t.expiresAtMs
+	planes := append([]*boundDataPlane(nil), t.dataPlanes...)
+	t.mu.Unlock()
+	for _, plane := range planes {
+		if plane.delivered >= seq && !plane.seeded {
+			continue
+		}
+		seeded := plane.seeded
+		plane.seeded = false
+		plane.delivered = seq
+		if seeded && token == plane.seedToken && expiresAtMs == plane.seedExpiry {
+			// The data plane's construction handshake already proved exactly this
+			// credential. Installing it would open a generation that completed
+			// handshake can no longer speak for, and nothing in a quiet mount
+			// would ever go on to prove it. A rotation that landed between the
+			// seed and the bind does NOT match, and is installed at once.
+			continue
+		}
+		plane.inst.InstallCredential(token, expiresAtMs)
 	}
 }
 
