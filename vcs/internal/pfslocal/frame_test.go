@@ -117,6 +117,91 @@ func TestPublicationAckRequirementRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPublicationRetractionRoundTrip pins the field a delegation handoff uses to
+// tell a frontend that everything a crossed logical operation published must be
+// discarded rather than installed.
+func TestPublicationRetractionRoundTrip(t *testing.T) {
+	env := &Envelope{
+		RequestID:            42,
+		OperationID:          7,
+		PublicationRetracted: true,
+		Body:                 &RemoveReply{},
+	}
+	frame, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RequestID != 42 || decoded.OperationID != 7 || !decoded.PublicationRetracted {
+		t.Fatalf("decoded envelope = %#v", decoded)
+	}
+}
+
+// TestGoldenPublicationRetractedFrame is the CROSS-LANGUAGE pin for the
+// retraction, and it is the only golden that fixes all four envelope scalars
+// ahead of the body oneof.
+//
+// Every other fixture would still round-trip if field 4 were silently dropped
+// on one side, which is exactly the drift these files exist to catch: a
+// frontend that decodes the retraction as absent installs state the daemon has
+// already withdrawn, and does it silently.
+func TestGoldenPublicationRetractedFrame(t *testing.T) {
+	env := &Envelope{
+		RequestID:              7,
+		PublicationAckRequired: true,
+		OperationID:            3,
+		PublicationRetracted:   true,
+		Body: &GetAttrReply{Attr: Attr{
+			Item: Item{ItemID: 23, ItemGeneration: 29}, Kind: ItemKindFile,
+		}},
+	}
+	got, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := readGolden(t, "publication_retracted.hex"); !bytes.Equal(got, want) {
+		t.Fatalf("publication retraction frame\n got %x\nwant %x", got, want)
+	}
+	dec, err := ReadFrame(bytes.NewReader(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, ok := dec.Body.(*GetAttrReply)
+	if !ok ||
+		dec.RequestID != 7 ||
+		!dec.PublicationAckRequired ||
+		dec.OperationID != 3 ||
+		!dec.PublicationRetracted ||
+		rep.Attr.Item != (Item{ItemID: 23, ItemGeneration: 29}) ||
+		rep.Attr.Kind != ItemKindFile {
+		t.Fatalf("decoded envelope = %#v body = %#v", dec, dec.Body)
+	}
+}
+
+// TestUnretractedEnvelopeIsByteIdenticalToTheOlderEncoding is the compatibility
+// half of the same field. The overwhelmingly common envelope is not retracted,
+// and it must not have grown a byte: the goldens are shared with the Swift
+// frontend, and a silent encoding drift is exactly the cross-language skew they
+// exist to catch.
+func TestUnretractedEnvelopeIsByteIdenticalToTheOlderEncoding(t *testing.T) {
+	plain, err := EncodeFrame(&Envelope{RequestID: 3, Body: &RemoveReply{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit, err := EncodeFrame(&Envelope{
+		RequestID: 3, PublicationRetracted: false, Body: &RemoveReply{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plain, explicit) {
+		t.Fatalf("an unretracted envelope encoded differently\n got %x\nwant %x", explicit, plain)
+	}
+}
+
 func TestExactObjectHandlesRoundTrip(t *testing.T) {
 	mode := uint32(0o600)
 	size := uint64(17)

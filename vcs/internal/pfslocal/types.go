@@ -4,7 +4,19 @@ package pfslocal
 
 const (
 	ProtocolMajor = 1
-	ProtocolMinor = 5
+	// ProtocolMinor 6 adds Envelope.PublicationRetracted.
+	//
+	// It is a MINOR BUMP rather than a silently additive field, which breaks
+	// with the rule the O_APPEND and chflags fields follow (see pfslocal.proto:
+	// "deliberately NOT gated behind a minor bump ... these fields default to
+	// false, which reproduces the previous behavior exactly"). Defaulting to
+	// false does NOT reproduce the previous behaviour here: a frontend that
+	// ignores the flag installs, into the kernel, state the daemon has already
+	// retracted because a delegation handoff crossed it. That is a silent
+	// correctness failure, not a missing feature, so the two sides must not be
+	// able to pair at all. The daemon refuses any frontend whose minor is below
+	// its own (portablefsd/frontend.go), and that refusal IS the gate.
+	ProtocolMinor = 6
 	MaxFrameBytes = 16 << 20
 )
 
@@ -12,7 +24,28 @@ type Envelope struct {
 	RequestID              uint64
 	PublicationAckRequired bool
 	OperationID            uint64
-	Body                   any
+	// PublicationRetracted says that everything this envelope's LOGICAL
+	// OPERATION has published must not be installed. The frontend discards the
+	// operation's collected values and fails the framework callback rather than
+	// returning them, so nothing reaches the kernel; the syscall retries and
+	// reads state taken after the boundary that caused the retraction.
+	//
+	// ── WHY IT RIDES A REPLY AND IS NOT A MESSAGE OF ITS OWN ────────────────
+	//
+	// The retraction has to be observed BEFORE the framework installs the
+	// operation's results, and the install happens the instant the callback
+	// returns. A standalone message cannot promise that: the frontend dispatches
+	// received frames onto concurrent tasks, so a retraction written before the
+	// reply can still be PROCESSED after it. Riding the reply's own envelope
+	// removes the question — one frame, one delivery, no ordering to lose.
+	//
+	// And there is always such a reply. The only case that retracts is a handoff
+	// crossing an operation with participants left and all of them parked; a
+	// parked participant is a request in flight that will be answered, and the
+	// callback cannot return before its last request is answered. So a
+	// retraction always has a carrier that precedes the install.
+	PublicationRetracted bool
+	Body                 any
 }
 
 type Hello struct {

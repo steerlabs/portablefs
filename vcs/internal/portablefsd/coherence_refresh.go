@@ -439,7 +439,7 @@ func (a *attach) applyKernelRefresh(
 	// to be superseded has no business opening the file, stat-ing it, or
 	// sweeping its pages, so it stops here before touching the kernel at all.
 	a.mu.RLock()
-	preflight := refreshSampleSupersededLocked(a.items[rec.item.ItemID], p, rec, fence)
+	preflight := a.refreshSampleSupersededLocked(a.items[rec.item.ItemID], p, rec, fence)
 	a.mu.RUnlock()
 	if preflight != nil {
 		return kernelRefreshRetry, preflight
@@ -518,7 +518,7 @@ func (a *attach) applyKernelRefresh(
 // refreshSampleSupersededLocked names, in one place, everything that makes a
 // refresh pass's sample no longer a statement about the object in front of it.
 // Caller holds a.mu (either mode).
-func refreshSampleSupersededLocked(
+func (a *attach) refreshSampleSupersededLocked(
 	current *itemRecord,
 	p string,
 	rec *itemRecord,
@@ -527,6 +527,25 @@ func refreshSampleSupersededLocked(
 	switch {
 	case current == nil:
 		return &errRefreshSampleSuperseded{path: p, reason: "item is no longer registered"}
+	case a.itemMutationInFlightLocked(rec.item.ItemID):
+		// A SIZE MUTATION IS COMMITTED BUT NOT YET PUBLISHED.
+		//
+		// This arm is the one that composed size cannot answer, and it is not a
+		// variant of the arm below it: the composed size has NOT moved, and that
+		// is exactly the problem. A delegated write's extension is already in the
+		// engine and already acknowledged to the application, while the registry
+		// — which is only written by writeReplyWithAttr, later — still holds the
+		// pre-write value this pass sampled. Both halves of the fence therefore
+		// agree that nothing has happened, and the window this pass would open
+		// would truncate the kernel's vnode back over durable bytes.
+		//
+		// Only the mutation sequence witnesses the gap, because only it is
+		// advanced before the commit rather than after the publication. See
+		// mutationseq.go.
+		return &errRefreshSampleSuperseded{
+			path:   p,
+			reason: "a size mutation has committed but has not published its attributes",
+		}
 	case current.item.ItemGeneration != rec.item.ItemGeneration:
 		return &errRefreshSampleSuperseded{
 			path: p,
@@ -561,7 +580,7 @@ func (a *attach) armRefreshWindowLocked(
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	current := a.items[rec.item.ItemID]
-	if err := refreshSampleSupersededLocked(current, p, rec, fence); err != nil {
+	if err := a.refreshSampleSupersededLocked(current, p, rec, fence); err != nil {
 		return nil, 0, err
 	}
 	if a.expectedTruncates == nil {
@@ -625,6 +644,50 @@ type frontendOperation struct {
 	// crossing is recorded, never forgotten, and repaired the instant the
 	// acknowledgement lands.
 	fenced []string
+	// retracted says a handoff crossed this operation, so nothing it has
+	// published may be installed. Every remaining reply the operation receives
+	// carries it (frontendConn.replyWithPublication), and the frontend answers
+	// by discarding what it collected and failing the framework callback rather
+	// than returning values the daemon no longer stands behind.
+	//
+	// ── WHY REFUSING TO INSTALL, AND NOT REPAIRING AFTER ────────────────────
+	//
+	// The mount's coherence model is version-anchored with a zero TTL: a value
+	// the frontend holds is either current or it is not there. "Install it and
+	// invalidate afterwards" is a TTL by another name — it names a window in
+	// which an application reads a value the daemon already knows is wrong —
+	// and it is the model, not the length of the window, that forbids it. A
+	// value that will have to be retracted must never be installed.
+	//
+	// ── WHY THIS DOES NOT LIVELOCK, AND REFUSING THE MUTATION WOULD ─────────
+	//
+	// The alternative considered was to refuse the initiating mutation before
+	// it executes and let the syscall retry. It does not terminate. The shape
+	// that reaches this case is one framework callback issuing a publishing
+	// request and then a mutation needing the delegation released — FSKit's
+	// removeItem is exactly that. A refusal leaves the delegation in place, so
+	// the retry runs the SAME callback, exposes the SAME sibling publication,
+	// and is refused again, forever: the state the retry is waiting to change
+	// is the state the refusal prevents from changing.
+	//
+	// Retraction inverts that. The handoff COMPLETES — the delegation really is
+	// released — and only the crossed operation's results are thrown away. The
+	// retry therefore finds nothing left to release, takes the authority lane
+	// directly, never reaches this case, and converges in one attempt.
+	//
+	// Guarded by frontendGateMu.
+	retracted bool
+}
+
+// publicationRetracted reports whether a handoff has crossed op, so every reply
+// still owed to it must tell the frontend to discard what it has collected.
+func (a *attach) publicationRetracted(op *frontendOperation) bool {
+	if op == nil || op.attach != a {
+		return false
+	}
+	a.frontendGateMu.Lock()
+	defer a.frontendGateMu.Unlock()
+	return op.retracted
 }
 
 // ── THE PUBLICATION SETTLE VERDICT ──────────────────────────────────────────
@@ -839,32 +902,48 @@ func (a *attach) notePublicationExposed(op *frontendOperation) {
 // handoff was permitted to cross while this operation still owed an
 // acknowledgement, at the exact moment that acknowledgement lands.
 //
-// ── WHY A CROSSING IS REPAIRED RATHER THAN PREVENTED ────────────────────────
+// ── WHAT THIS IS, NOW THAT RETRACTION EXISTS ────────────────────────────────
 //
-// When the operation that owes the acknowledgement is the RELEASE'S OWN, the
-// obligation cannot be waited for. The acknowledgement is one message the
-// extension sends after its whole framework callback returns; that callback
-// cannot return until the request parked inside this release is answered; and
-// that request is not answered until the release reaches a verdict. Blocking
-// closes that cycle deterministically — not racily — for a shape that is
-// completely ordinary: FSKit's removeItem callback issues a publishing
-// getattr and THEN the remove that needs the delegation transition, so `rm`
-// inside a delegated subtree would fail every single time.
+// The crossing's primary answer is frontendOperation.retracted: the frontend is
+// told, on a reply that provably precedes the framework install, to discard what
+// the crossed operation collected. Nothing stale is installed, so there is
+// nothing to repair.
 //
-// What the daemon can do is the same thing it does for every other view it
-// discovers to be behind: state it. The kernel installs the crossed reply when
-// the callback returns; the acknowledgement that says so arrives immediately
-// after; and this publishes, for exactly the paths that operation published,
-// the ordinary invalidation a peer change would have published. The stale
-// install is superseded by the frontend's normal remote-change refresh path
-// instead of surviving forever.
+// This is the backstop for what retraction cannot reach: cache state the crossed
+// operation caused to be installed BEFORE the crossing (an earlier reply of the
+// same operation whose values the framework has already taken), and any frontend
+// whose retraction is partial. It runs on every crossing regardless, because a
+// backstop that only runs when the daemon thinks it is needed is a backstop that
+// depends on the daemon being right about the thing it just got wrong.
 //
-// Forever is the real defect being fixed. Without this, the peer's own
-// invalidation is delivered and APPLIED BEFORE the kernel install, so the
-// refresh lands first and the stale value overwrites it, and nothing ever
-// contradicts it again. With it, the divergence window is one acknowledgement
-// round trip on a live socket — the same window every remote change already
-// has — and it always closes.
+// ── WHY IT NO LONGER PUBLISHES AN EVENT AND CALLS THAT A REPAIR ─────────────
+//
+// It used to publish content and namespace invalidations to the attach's event
+// subscribers, and that was not a repair at all on the frontend it exists for.
+// pfslocal events reach a connection only after SubscribeEventsRequest, and the
+// FSKit extension never sends one — the request is served (frontend.go) and
+// exercised by tests, and has no production caller. So on an FSKit mount the
+// entire repair was a fan-out to an empty subscriber set: the crossed value was
+// installed and NOTHING ever contradicted it. "The divergence window is one
+// acknowledgement round trip" described a mechanism that was not connected.
+//
+// What actually reaches an FSKit vnode is the daemon's own kernel refresh —
+// exactKernelRefresh, which opens the file through the mount and drives the size
+// and page cache itself (coherence_darwin.go). That is exactly what the authority
+// invalidation watcher does for a peer change: it publishes the event AND runs
+// the refresh, and treats a refresh failure as a coherence failure rather than
+// as unproven visibility. The crossing repair owes the same, for the same
+// reason, so it does the same.
+//
+// The event publication stays alongside it for frontends that DO subscribe. It
+// is not the proof.
+//
+// ── ORDERING ────────────────────────────────────────────────────────────────
+//
+// This runs from the acknowledgement, which the frontend emits after its whole
+// framework callback returns. So the refresh is issued strictly after any
+// install that callback performed, which is the one ordering a repair must have
+// and the one an event fired at crossing time could never have had.
 func (a *attach) dischargeFrontendPublicationFence(op *frontendOperation) {
 	if op == nil || op.attach != a {
 		return
@@ -872,6 +951,7 @@ func (a *attach) dischargeFrontendPublicationFence(op *frontendOperation) {
 	a.frontendGateMu.Lock()
 	fenced := op.fenced
 	op.fenced = nil
+	op.retracted = false
 	var paths []string
 	if len(fenced) != 0 {
 		paths = append(paths, op.paths...)
@@ -896,11 +976,68 @@ func (a *attach) dischargeFrontendPublicationFence(op *frontendOperation) {
 	// could have installed. Both are the same events the authority invalidation
 	// path publishes, so the extension needs no new handling for them.
 	a.mu.Lock()
+	items := make(map[uint64]struct{}, len(paths))
 	for _, p := range paths {
 		a.publishContentInvalidationLocked(p, 0, 0)
 		a.publishNamespaceInvalidationLocked(p, 0, 0)
+		if rec := a.paths[p]; rec != nil {
+			items[rec.item.ItemID] = struct{}{}
+		}
 	}
 	a.mu.Unlock()
+	a.refreshCrossedItems(items)
+}
+
+// refreshCrossedItems drives the daemon's own kernel refresh for every item a
+// crossing may have left stale, and fails coherence closed if it cannot.
+//
+// Failing closed is the same verdict the authority invalidation watcher reaches
+// for the same failure, and for the same reason: an unrefreshed vnode is a
+// kernel that disagrees with the authority about a file, with no further event
+// coming to correct it. Continuing to serve from that state is the one option
+// that is never acceptable. It is deliberately NOT the acknowledgement's own
+// error — the acknowledgement is a statement of fact about the frontend, and it
+// has already been made — so this reports through the attach's terminal verdict
+// rather than through any reply.
+//
+// The refresh runs on the ATTACH's lifetime rather than on the caller's. This is
+// reached from the frontend's acknowledgement handler, whose request context is
+// gone the moment that handler returns, and abandoning a coherence repair
+// because the message that triggered it has been processed is how the repair
+// silently stops happening.
+func (a *attach) refreshCrossedItems(items map[uint64]struct{}) {
+	if len(items) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(a.refreshLifetimeContext(), crossedRefreshTimeout)
+	defer cancel()
+	for itemID := range items {
+		// requireAuthorityIdentity is false: a crossed scope's item may have
+		// been renamed or replaced by the peer that took the delegation, and a
+		// namespace transition is owned by namespace handling rather than by
+		// this repair. The exact-identity claim belongs to a RelatedInos
+		// refresh, which is making a stronger statement than this one.
+		if err := a.exactKernelRefreshMode(ctx, itemID, false); err != nil {
+			a.failCoherence(err)
+			return
+		}
+	}
+}
+
+// crossedRefreshTimeout bounds the backstop repair. It matches the control
+// plane's own post-write refresh bound, because it is the same operation
+// against the same kernel.
+const crossedRefreshTimeout = 2 * time.Minute
+
+// refreshLifetimeContext is the attach's own lifetime, or the background context
+// for a bare test attach that never activated one.
+func (a *attach) refreshLifetimeContext() context.Context {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.lifeCtx != nil {
+		return a.lifeCtx
+	}
+	return context.Background()
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -1569,7 +1706,7 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 		}
 		blockers, live, current, fenceable := a.publicationBlockersLocked(scope, own)
 		if blockers == 0 {
-			if fenceable != nil {
+			for _, op := range fenceable {
 				// The crossing is recorded HERE, under the same lock hold that
 				// decided to take the handoff, and nowhere else. Recording it
 				// inside the blocker probe would attach a debt to an operation
@@ -1577,7 +1714,29 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 				// back to waiting and iterations that ended in a refusal — and
 				// a debt for a handoff that never happened would invalidate
 				// live, correct kernel state for no reason.
-				fenceable.fenced = append(fenceable.fenced, scope)
+				//
+				// RETRACTION IS THE PRIMARY ANSWER; THE FENCE IS THE BACKSTOP.
+				//
+				// retracted is what actually keeps the stale view out of the
+				// kernel: every remaining reply this operation receives carries
+				// the flag, the frontend discards what it collected instead of
+				// handing it to the framework, and the syscall retries against
+				// post-handoff state. Because that is a REFUSAL TO INSTALL
+				// rather than a repair, there is no window in which an
+				// application can read the crossed value at all.
+				//
+				// fenced stays because retraction depends on a frontend that
+				// honours it. A frontend below the minor that introduced the
+				// flag cannot connect at all, so this is not a compatibility
+				// fallback — it is the answer for the residue no publication
+				// contract covers: state the crossed operation had already
+				// caused to be cached before this reply, and any future
+				// frontend whose retraction is partial. Discharge makes it an
+				// ORDERED repair through the daemon's own kernel refresh, not
+				// an event nothing subscribes to; see
+				// dischargeFrontendPublicationFence.
+				op.retracted = true
+				op.fenced = append(op.fenced, scope)
 			}
 			break
 		}
@@ -1730,7 +1889,7 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 func (a *attach) publicationBlockersLocked(
 	scope string,
 	own *frontendOperationParticipant,
-) (blockers, live int, set map[*frontendOperation]struct{}, fenceable *frontendOperation) {
+) (blockers, live int, set map[*frontendOperation]struct{}, fenceable []*frontendOperation) {
 	epoch := a.frontendPathEpoch.Load()
 	set = make(map[*frontendOperation]struct{}, len(a.frontendActive))
 	for op := range a.frontendActive {
@@ -1747,7 +1906,14 @@ func (a *attach) publicationBlockersLocked(
 				case op.published && op.participants > 0:
 					// Parked participants only: the acknowledgement cannot be
 					// produced until this handoff lets go of the scope.
-					fenceable = op
+					//
+					// EVERY such operation is collected, not just the newest one
+					// the map iteration happened to see. This was a single slot,
+					// so two overlapping all-parked publications left one of them
+					// crossed with NO record at all: not retracted, not repaired,
+					// and permanently stale with nothing to contradict it. Map
+					// iteration order made which one that was unpredictable.
+					fenceable = append(fenceable, op)
 					continue
 				case op.published:
 					// Nothing left on the daemon's side; the acknowledgement is

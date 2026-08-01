@@ -1279,11 +1279,22 @@ type attach struct {
 	// they nest (see reincarnationOwnerScope).
 	reincarnationArmed bool
 	reincarnationOwner *reincarnationTicket
-	handles            map[uint64]*handleRecord
-	localDirs          []string
-	localRoot          string
-	localFS            *confinedfs.Root
-	localVersions      map[string]uint64
+	// reincarnationSettling marks the ONE registration that is a reconciliation
+	// paying its own debt, so publication admission does not treat it as another
+	// publisher arriving over unsettled state and bump the requirement it is in
+	// the middle of satisfying. See beginReincarnationSettleLocked.
+	reincarnationSettling bool
+	// itemMutations is the set of items with a size mutation somewhere between
+	// its ENGINE COMMIT and its REGISTRY PUBLICATION. The refresh fence needs
+	// it because itemRecord.attr witnesses only the second of those two events,
+	// so an acknowledged extension is invisible to the fence for the whole gap
+	// between them. See mutationseq.go. Guarded by mu.
+	itemMutations map[uint64]itemMutationSeq
+	handles       map[uint64]*handleRecord
+	localDirs     []string
+	localRoot     string
+	localFS       *confinedfs.Root
+	localVersions map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1342,6 +1353,12 @@ type attach struct {
 	// contend for. It runs at exactly the point onMarkOrphan would block on
 	// n.mu, so a test can assert the recall path is not holding a.mu there.
 	testBeforeMarkOrphan func()
+	// testAfterWriteCommit fires at the ONE instant this daemon's registry is
+	// provably behind the engine: the write has committed and been counted, and
+	// writeReplyWithAttr has not yet published its post-op attributes. It exists
+	// because that gap is not otherwise reachable from a test, and it is exactly
+	// the gap the per-item mutation sequence covers (see mutationseq.go).
+	testAfterWriteCommit func()
 }
 
 type itemRecord struct {
@@ -1560,19 +1577,14 @@ func (a *attach) activateWithOptionsMode(
 	if onlyIfPending && !credentialPending {
 		return false, nil
 	}
+	// ONE installation. setCredential publishes the credential into the live
+	// volume, which opens the new generation, re-arms the reachability prober
+	// and verifies the credential — all of it. This used to call the token
+	// setter here and a separate CredentialInstalled notification below, so a
+	// single rotation opened TWO generations: the first was never offered to
+	// anyone and was superseded before any handshake could classify it.
 	a.setCredential(tok, expiresAtMs)
 	if active {
-		// A live volume that had latched a credential verdict must re-arm its
-		// reachability prober: the verdict was about the PREVIOUS credential,
-		// and nothing else in the mount will ever retry the handshake (the
-		// prober stops on a definite credential rejection precisely because
-		// re-handshaking with a dead credential can never succeed).
-		a.mu.RLock()
-		vol := a.vol
-		a.mu.RUnlock()
-		if vol != nil {
-			vol.CredentialInstalled()
-		}
 		return true, nil
 	}
 	if options != nil {
@@ -1862,7 +1874,7 @@ func (a *attach) start(ctx context.Context) error {
 	// the same footing as every frontend publisher — an activation that could
 	// not reconcile is one whose first served reply would carry the impossible
 	// pair, so it fails the activation instead.
-	if eno := rootTicket.settle(a.lifetime(), vol); eno != 0 {
+	if eno, _ := rootTicket.settle(a.lifetime(), vol); eno != 0 {
 		a.mu.Lock()
 		a.vol = nil
 		a.eventClient = nil
@@ -1908,13 +1920,21 @@ func (a *attach) setCredential(tok string, expiresAtMs int64) {
 	vol := a.vol
 	a.mu.RUnlock()
 	if vol != nil {
-		vol.RenewCredential(tok)
+		// One call: it opens the generation, publishes the token WITH the
+		// issuer's stated deadline, re-arms the reachability prober and starts
+		// verification. The deadline used to be dropped here — the volume was
+		// handed the token alone — so the daemon's own unproven state had no
+		// boundary even though the expiry was sitting in the very next field.
+		vol.InstallCredential(tok, expiresAtMs)
 	}
 	a.mu.RLock()
 	events := a.eventClient
 	a.mu.RUnlock()
 	if events != nil {
-		events.SetAuthToken(tok)
+		// The invalidation stream's client carries the SAME credential and the
+		// same deadline. Handing it the token alone left its own unproven state
+		// unbounded for exactly the reason the volume's was.
+		events.InstallCredential(fsproto.Credential{Token: tok, ExpiresAtMs: expiresAtMs})
 	}
 }
 
@@ -2564,6 +2584,10 @@ func (a *attach) registerCreatedLocked(p string, attr fsproto.Attr) *itemRecord 
 // authority inode as a second FSKit item would split one POSIX inode into two
 // independent frontend objects.
 func (a *attach) registerHardLinkAliasLocked(p string, source *itemRecord, attr fsproto.Attr) *itemRecord {
+	// Binding a new name onto an existing identity publishes attributes for
+	// that name, so it is admitted like any other publication. It does not
+	// reach registerWithItemLocked, where the check otherwise lives.
+	a.admitPublicationLocked(p)
 	if a.paths[p] != nil {
 		a.removePathLocked(p)
 	}
@@ -2595,6 +2619,10 @@ func (a *attach) registerWithItemLocked(
 	if _, ok := fskitItemID(ino); !ok {
 		return nil
 	}
+	// PUBLICATION ADMISSION. Every registration that can put this pathname's
+	// attributes in front of an application passes through here, so this is the
+	// one place the check belongs. See admitPublicationLocked.
+	a.admitPublicationLocked(p)
 	gen := a.identityEpoch
 	if gen == 0 {
 		gen = 1

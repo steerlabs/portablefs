@@ -109,8 +109,7 @@ func TestCredentialDeathIsNotUnreachabilityAndStopsTheProbe(t *testing.T) {
 	// the credential, not about the mount. It clears only once the installed
 	// credential has actually been PROVED by a handshake — installation alone
 	// proves nothing (see TestInvalidReplacementCredentialStaysRejected).
-	c.SetAuthToken("the-only-valid-token")
-	c.CredentialInstalled()
+	c.InstallCredential(Credential{Token: "the-only-valid-token"})
 	if !waitFor(3*time.Second, func() bool { return !c.CredentialUnproven() }) {
 		t.Fatal("the installed credential was never proved by a handshake: " +
 			"installation must enter verification-pending and verify immediately")

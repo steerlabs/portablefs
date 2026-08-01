@@ -278,6 +278,33 @@ private func makeRecordingPacker(capacity: Int) -> (RecordingDirectoryEntryPacke
     return (packer, state)
 }
 
+/// Captures an acknowledgement baseline that a later `==` can be trusted
+/// against. See the transport-test twin for the full argument; the short
+/// version is that an ack is one-way, so a `stats()` snapshot taken after a
+/// publishing request can land on either side of an ack still in flight, and
+/// the resulting off-by-one surfaces on a downstream assertion rather than
+/// here.
+///
+/// `makeAdapterHarness` owes nothing — hello, resolve and statfs do not
+/// publish, and `rootItem()` is answered from the resolve reply without a
+/// request — so the harness settles at zero. Asserting that is what keeps it
+/// true: a harness that later gains a publishing step fails here rather than
+/// making every ack count in this file quietly wrong.
+@available(macOS 26.0, *)
+private func settledAckBaseline(
+    _ daemon: PfsLocalMockDaemon,
+    owed: Int,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async throws -> Int {
+    let stats = try await waitForPublicationAcks(daemon, atLeast: owed)
+    #expect(
+        stats.publicationAcks == owed,
+        "setup owed \(owed) publication acks",
+        sourceLocation: sourceLocation
+    )
+    return owed
+}
+
 @available(macOS 26.0, *)
 private func waitForPublicationAcks(
     _ daemon: PfsLocalMockDaemon,
@@ -451,10 +478,8 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
 @Test func operationsAdapterAcknowledgesSuccessfulAndNegativePublications() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
-    try await Task.sleep(for: .milliseconds(20))
-    let initialStats = await harness.daemon.stats()
-    let baseline = initialStats.publicationAcks
-    let baselineGetattrs = initialStats.getAttrRequests
+    let baseline = try await settledAckBaseline(harness.daemon, owed: 0)
+    let baselineGetattrs = await harness.daemon.stats().getAttrRequests
 
     let attributesGate = PublicationReplyGate()
     harness.volume.getAttributes(FSItem.GetAttributesRequest(), of: harness.root) { _, error in
@@ -489,13 +514,56 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
     #expect(stats.publicationAcks >= baseline + 2)
 }
 
+/// The retraction contract at the FSKit boundary: a crossed operation's values
+/// must never reach the reply handler, because the reply handler IS the
+/// framework install. The daemon's gate is still released — retraction governs
+/// what the framework caches, not the daemon's bookkeeping.
+@available(macOS 26.0, *)
+@Test func operationsAdapterWithholdsRetractedValuesAndStillAcknowledges() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let baseline = try await settledAckBaseline(harness.daemon, owed: 0)
+    let baselineGetattrs = await harness.daemon.stats().getAttrRequests
+
+    await harness.daemon.retractNextPublications()
+
+    let outcome: Int32 = await withCheckedContinuation { continuation in
+        harness.volume.getAttributes(
+            FSItem.GetAttributesRequest(),
+            of: harness.root
+        ) { attributes, error in
+            guard let error else {
+                // Reaching here at all means retracted values were handed to
+                // the framework.
+                Issue.record("expected a retracted getattr to withhold its attributes")
+                continuation.resume(returning: 0)
+                return
+            }
+            #expect(attributes == nil)
+            continuation.resume(returning: Int32((error as NSError).code))
+        }
+    }
+    // EINTR: the syscall retries against a frontend that installed nothing.
+    #expect(outcome == EINTR)
+
+    let stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks == baseline + 1)
+    #expect(stats.getAttrRequests == baselineGetattrs + 1)
+
+    // Only the retracted operation is affected; the next one publishes.
+    _ = try await harness.volume.attributes(
+        FSItem.GetAttributesRequest(),
+        of: harness.root
+    )
+    let after = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 2)
+    #expect(after.publicationAcks == baseline + 2)
+}
+
 @available(macOS 26.0, *)
 @Test func operationsAdapterDrainsPublicationAcksUnderConcurrentLoad() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
-    try await Task.sleep(for: .milliseconds(20))
-
-    let baseline = await harness.daemon.stats().publicationAcks
+    let baseline = try await settledAckBaseline(harness.daemon, owed: 0)
     let workerCount = 1_200
     let operationsPerWorker = 2
 

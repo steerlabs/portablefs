@@ -1022,6 +1022,10 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 		}
 		return nil
 	}
+	// The credential this dial is seeded with. Binding compares against it so a
+	// rotation that lands while the pool is still coming up is not lost, and a
+	// data plane that is already current is not disturbed.
+	seedToken, seedExpiry := tokens.get()
 	vol, err := clientcore.Dial(context.Background(), clientcore.Options{
 		Addr:             addr,
 		Pool:             16,
@@ -1074,6 +1078,12 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 	if err != nil {
 		return nil, fmt.Errorf("connect to authority %s: %w", addr, err)
 	}
+	// Every future lease rotation is now an INSTALLATION in this data plane: a
+	// new credential generation, verified at once by its own handshake. Without
+	// it the keeper's renewals only changed which token reconnects offered,
+	// leaving the mount's credential health describing a credential that had
+	// already been replaced.
+	tokens.bindDataPlane(vol, seedToken, seedExpiry)
 
 	// Effective grafts = flag/persisted dirs ∪ the volume's declaration file.
 	// Union semantics are permissive (dedupe, outer graft wins over nested)

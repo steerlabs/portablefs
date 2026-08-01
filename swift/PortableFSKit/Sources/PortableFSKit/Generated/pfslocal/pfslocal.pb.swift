@@ -34,7 +34,37 @@
 // Item attribute/xattr operations after unlink or rename-over. Protocol minor
 // 5 adds frontend parent identity, BSD flags, and allocated size to Attr so
 // FSKit can satisfy its requested-attribute contract without inventing
-// metadata.
+// metadata. Protocol minor 6 adds Envelope.publication_retracted, the
+// daemon's instruction that an operation's already-delivered results must
+// never be installed into the frontend's cache.
+//
+// O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
+// is deliberately NOT gated behind a minor bump: the daemon rejects any
+// frontend whose minor is below its own, and these fields default to false,
+// which reproduces the previous positional-write behavior exactly. A frontend
+// that can express append opts in; one that cannot is unaffected.
+//
+// chflags(2) (SetAttrRequest.set_flags/flags plus Capabilities.flags_supported
+// and Capabilities.flags_understood) follows that SAME rule and is likewise
+// NOT gated behind a minor bump. set_flags defaults to false, which is
+// byte-for-byte the previous "this setattr changes no flags" meaning;
+// flags_supported defaults to false, which is the previous "this authority
+// does not persist a flag word" meaning; and flags_understood defaults to
+// false, which is exactly "the daemon on this connection predates set_flags
+// and would silently discard it". An older frontend is therefore unaffected,
+// and a newer one opts in. Note the daemon already rejects any frontend whose
+// minor is below its own, so a bump could only lock out frontends for no
+// semantic gain.
+//
+// PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface append intent to
+// a filesystem extension. FSVolumeOpenModes has only Read and Write, and
+// writeContents:toFile:atOffset: hands down an off_t the KERNEL already
+// resolved from its own cached vnode size. On that frontend an O_APPEND write
+// is indistinguishable from a positional write at the then-current EOF, so
+// two machines appending concurrently can still collide no matter what this
+// protocol offers. These fields exist so every frontend that DOES have the
+// intent (FUSE today, a future FSKit that surfaces it) gets serialized,
+// authority-assigned append offsets.
 //
 // Identity model: items are addressed by (item_id, item_generation) — the
 // authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
@@ -167,6 +197,44 @@ public struct PfsEnvelope: @unchecked Sendable {
   public var operationID: UInt64 {
     get {return _storage._operationID}
     set {_uniqueStorage()._operationID = newValue}
+  }
+
+  /// Set on a daemon reply for an operation whose ALREADY-DELIVERED results
+  /// must never be installed into the frontend's cache. The daemon retracts
+  /// when a delegation handoff has crossed that operation: the frontend is
+  /// holding pre-handoff values, a peer may already have acquired the
+  /// delegation and mutated, and installing those values would let an
+  /// application read a stale byte after a remote write it happens-after.
+  ///
+  /// WHY IT RIDES A REPLY FRAME rather than travelling as its own message:
+  /// ordering is the entire mechanism. The crossing case only arises while
+  /// the operation still has parked participants — requests in flight that
+  /// WILL be answered — and a framework callback cannot return before its
+  /// last request is answered. So at least one further reply for that
+  /// operation is written AFTER the crossing, and a bit on that reply's
+  /// envelope is therefore strictly ordered before the framework install. A
+  /// standalone retraction message would carry no such ordering: frontends
+  /// dispatch inbound frames concurrently (the FSKit extension hands each
+  /// decoded frame to its own Task), so a separate frame can be observed
+  /// after the reply it was meant to precede. Same frame, no reordering.
+  ///
+  /// A retracted operation still owes its PublicationAck. Retraction governs
+  /// what the FRONTEND installs; the ack is the daemon's own handoff gate and
+  /// must be released either way, or the daemon waits on a callback that has
+  /// already given up.
+  ///
+  /// UNLIKE the O_APPEND and chflags fields described below, this one IS
+  /// gated behind a minor bump (5 -> 6), and deliberately so. Those fields
+  /// default to a value that reproduces the previous behaviour exactly, so a
+  /// frontend that ignores them is merely missing a feature. A frontend that
+  /// ignores THIS bit installs state the daemon has retracted — a silent
+  /// correctness failure, invisible to both ends, and not expressible as a
+  /// missing feature. The daemon rejects any frontend whose minor is below
+  /// its own, and that rejection IS the gate: it is the only mechanism that
+  /// can guarantee no connected frontend ignores the bit.
+  public var publicationRetracted: Bool {
+    get {return _storage._publicationRetracted}
+    set {_uniqueStorage()._publicationRetracted = newValue}
   }
 
   public var body: OneOf_Body? {
@@ -696,7 +764,7 @@ public struct PfsHello: Sendable {
   /// 1
   public var protocolMajor: UInt32 = 0
 
-  /// 5
+  /// 6
   public var protocolMinor: UInt32 = 0
 
   /// e.g. "fskit-appex"
@@ -760,59 +828,52 @@ public struct PfsResolveRequest: Sendable {
   public init() {}
 }
 
-public struct PfsResolveReply: @unchecked Sendable {
+public struct PfsResolveReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var root: PfsItem {
-    get {return _storage._root ?? PfsItem()}
-    set {_uniqueStorage()._root = newValue}
+    get {return _root ?? PfsItem()}
+    set {_root = newValue}
   }
   /// Returns true if `root` has been explicitly set.
-  public var hasRoot: Bool {return _storage._root != nil}
+  public var hasRoot: Bool {return self._root != nil}
   /// Clears the value of `root`. Subsequent reads from it will return its default value.
-  public mutating func clearRoot() {_uniqueStorage()._root = nil}
+  public mutating func clearRoot() {self._root = nil}
 
   public var rootAttr: PfsAttr {
-    get {return _storage._rootAttr ?? PfsAttr()}
-    set {_uniqueStorage()._rootAttr = newValue}
+    get {return _rootAttr ?? PfsAttr()}
+    set {_rootAttr = newValue}
   }
   /// Returns true if `rootAttr` has been explicitly set.
-  public var hasRootAttr: Bool {return _storage._rootAttr != nil}
+  public var hasRootAttr: Bool {return self._rootAttr != nil}
   /// Clears the value of `rootAttr`. Subsequent reads from it will return its default value.
-  public mutating func clearRootAttr() {_uniqueStorage()._rootAttr = nil}
+  public mutating func clearRootAttr() {self._rootAttr = nil}
 
-  public var volumeID: String {
-    get {return _storage._volumeID}
-    set {_uniqueStorage()._volumeID = newValue}
-  }
+  public var volumeID: String = String()
 
-  public var branch: String {
-    get {return _storage._branch}
-    set {_uniqueStorage()._branch = newValue}
-  }
+  public var branch: String = String()
 
   /// display name for the mounted volume
-  public var volumeName: String {
-    get {return _storage._volumeName}
-    set {_uniqueStorage()._volumeName = newValue}
-  }
+  public var volumeName: String = String()
 
   public var capabilities: PfsCapabilities {
-    get {return _storage._capabilities ?? PfsCapabilities()}
-    set {_uniqueStorage()._capabilities = newValue}
+    get {return _capabilities ?? PfsCapabilities()}
+    set {_capabilities = newValue}
   }
   /// Returns true if `capabilities` has been explicitly set.
-  public var hasCapabilities: Bool {return _storage._capabilities != nil}
+  public var hasCapabilities: Bool {return self._capabilities != nil}
   /// Clears the value of `capabilities`. Subsequent reads from it will return its default value.
-  public mutating func clearCapabilities() {_uniqueStorage()._capabilities = nil}
+  public mutating func clearCapabilities() {self._capabilities = nil}
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
-  fileprivate var _storage = _StorageClass.defaultInstance
+  fileprivate var _root: PfsItem? = nil
+  fileprivate var _rootAttr: PfsAttr? = nil
+  fileprivate var _capabilities: PfsCapabilities? = nil
 }
 
 public struct PfsCapabilities: Sendable {
@@ -893,71 +954,109 @@ public struct PfsItem: Sendable {
   public init() {}
 }
 
-public struct PfsAttr: Sendable {
+public struct PfsAttr: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
-    set {_item = newValue}
+    get {return _storage._item ?? PfsItem()}
+    set {_uniqueStorage()._item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {return _storage._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
-  public mutating func clearItem() {self._item = nil}
+  public mutating func clearItem() {_uniqueStorage()._item = nil}
 
-  public var kind: PfsItemKind = .unspecified
+  public var kind: PfsItemKind {
+    get {return _storage._kind}
+    set {_uniqueStorage()._kind = newValue}
+  }
 
   /// permission bits only (kind is separate)
-  public var mode: UInt32 = 0
+  public var mode: UInt32 {
+    get {return _storage._mode}
+    set {_uniqueStorage()._mode = newValue}
+  }
 
-  public var nlink: UInt32 = 0
+  public var nlink: UInt32 {
+    get {return _storage._nlink}
+    set {_uniqueStorage()._nlink = newValue}
+  }
 
-  public var uid: UInt32 = 0
+  public var uid: UInt32 {
+    get {return _storage._uid}
+    set {_uniqueStorage()._uid = newValue}
+  }
 
-  public var gid: UInt32 = 0
+  public var gid: UInt32 {
+    get {return _storage._gid}
+    set {_uniqueStorage()._gid = newValue}
+  }
 
-  public var size: UInt64 = 0
+  public var size: UInt64 {
+    get {return _storage._size}
+    set {_uniqueStorage()._size = newValue}
+  }
 
-  public var mtimeMs: Int64 = 0
+  public var mtimeMs: Int64 {
+    get {return _storage._mtimeMs}
+    set {_uniqueStorage()._mtimeMs = newValue}
+  }
 
-  public var ctimeMs: Int64 = 0
+  public var ctimeMs: Int64 {
+    get {return _storage._ctimeMs}
+    set {_uniqueStorage()._ctimeMs = newValue}
+  }
 
-  public var atimeMs: Int64 = 0
+  public var atimeMs: Int64 {
+    get {return _storage._atimeMs}
+    set {_uniqueStorage()._atimeMs = newValue}
+  }
 
-  public var birthtimeMs: Int64 = 0
+  public var birthtimeMs: Int64 {
+    get {return _storage._birthtimeMs}
+    set {_uniqueStorage()._birthtimeMs = newValue}
+  }
 
   /// coherence version; bumps on content change
-  public var contentVersion: UInt64 = 0
+  public var contentVersion: UInt64 {
+    get {return _storage._contentVersion}
+    set {_uniqueStorage()._contentVersion = newValue}
+  }
 
   /// Actual frontend identity of one live parent binding. Absent for the root
   /// and for retained-but-unlinked Items. Hard-linked Items may have multiple
   /// parents; the daemon returns the parent of the concrete alias used for the
   /// operation, or a deterministic live alias for identity-only operations.
   public var parent: PfsItem {
-    get {return _parent ?? PfsItem()}
-    set {_parent = newValue}
+    get {return _storage._parent ?? PfsItem()}
+    set {_uniqueStorage()._parent = newValue}
   }
   /// Returns true if `parent` has been explicitly set.
-  public var hasParent: Bool {return self._parent != nil}
+  public var hasParent: Bool {return _storage._parent != nil}
   /// Clears the value of `parent`. Subsequent reads from it will return its default value.
-  public mutating func clearParent() {self._parent = nil}
+  public mutating func clearParent() {_uniqueStorage()._parent = nil}
 
   /// Darwin st_flags. Authority-backed PortableFS Items are zero because the
   /// authority exposes no BSD file-flags operation; local grafts carry st_flags.
-  public var flags: UInt32 = 0
+  public var flags: UInt32 {
+    get {return _storage._flags}
+    set {_uniqueStorage()._flags = newValue}
+  }
 
   /// Storage allocation reported to FSKit. Authority-backed PortableFS uses
   /// logical quota allocation; local grafts carry the backing stat allocation.
-  public var allocSize: UInt64 = 0
+  public var allocSize: UInt64 {
+    get {return _storage._allocSize}
+    set {_uniqueStorage()._allocSize = newValue}
+  }
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
-  fileprivate var _item: PfsItem? = nil
-  fileprivate var _parent: PfsItem? = nil
+  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
 /// errno values use the darwin numbering (the daemon translates); message is for logs only.
@@ -1285,6 +1384,12 @@ public struct PfsOpenRequest: Sendable {
 
   public var mode: PfsOpenMode = .unspecified
 
+  /// O_APPEND, sticky on the returned handle (POSIX puts the flag on the open
+  /// file description, not on the write). Every write through that handle has
+  /// its offset resolved at EOF by the authority in sequencer order, so two
+  /// machines appending to one file can never land on the same byte range.
+  public var append: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1377,6 +1482,13 @@ public struct PfsWriteRequest: @unchecked Sendable {
 
   public var data: Data = Data()
 
+  /// O_APPEND for THIS write, for frontends that learn the intent per write
+  /// rather than at open. Offset must be zero and is ignored: the offset is
+  /// assigned at EOF under the authority's write serialization and is never
+  /// computed by the frontend from a cached size. A handle opened with
+  /// OpenRequest.append appends regardless of this bit.
+  public var append: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1448,6 +1560,9 @@ public struct PfsCreateRequest: @unchecked Sendable {
 
   /// O_EXCL
   public var exclusive: Bool = false
+
+  /// O_APPEND, sticky on the returned handle (see OpenRequest.append)
+  public var append: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2172,6 +2287,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     1: .standard(proto: "request_id"),
     2: .standard(proto: "publication_ack_required"),
     3: .standard(proto: "operation_id"),
+    4: .standard(proto: "publication_retracted"),
     10: .same(proto: "hello"),
     11: .same(proto: "resolve"),
     12: .same(proto: "lookup"),
@@ -2233,6 +2349,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     var _requestID: UInt64 = 0
     var _publicationAckRequired: Bool = false
     var _operationID: UInt64 = 0
+    var _publicationRetracted: Bool = false
     var _body: PfsEnvelope.OneOf_Body?
 
     #if swift(>=5.10)
@@ -2251,6 +2368,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
       _requestID = source._requestID
       _publicationAckRequired = source._publicationAckRequired
       _operationID = source._operationID
+      _publicationRetracted = source._publicationRetracted
       _body = source._body
     }
   }
@@ -2273,6 +2391,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
         case 1: try { try decoder.decodeSingularUInt64Field(value: &_storage._requestID) }()
         case 2: try { try decoder.decodeSingularBoolField(value: &_storage._publicationAckRequired) }()
         case 3: try { try decoder.decodeSingularUInt64Field(value: &_storage._operationID) }()
+        case 4: try { try decoder.decodeSingularBoolField(value: &_storage._publicationRetracted) }()
         case 10: try {
           var v: PfsHello?
           var hadOneofValue = false
@@ -3009,6 +3128,9 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
       if _storage._operationID != 0 {
         try visitor.visitSingularUInt64Field(value: _storage._operationID, fieldNumber: 3)
       }
+      if _storage._publicationRetracted != false {
+        try visitor.visitSingularBoolField(value: _storage._publicationRetracted, fieldNumber: 4)
+      }
       switch _storage._body {
       case .hello?: try {
         guard case .hello(let v)? = _storage._body else { preconditionFailure() }
@@ -3244,6 +3366,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
         if _storage._requestID != rhs_storage._requestID {return false}
         if _storage._publicationAckRequired != rhs_storage._publicationAckRequired {return false}
         if _storage._operationID != rhs_storage._operationID {return false}
+        if _storage._publicationRetracted != rhs_storage._publicationRetracted {return false}
         if _storage._body != rhs_storage._body {return false}
         return true
       }
@@ -3429,106 +3552,56 @@ extension PfsResolveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     6: .same(proto: "capabilities"),
   ]
 
-  fileprivate class _StorageClass {
-    var _root: PfsItem? = nil
-    var _rootAttr: PfsAttr? = nil
-    var _volumeID: String = String()
-    var _branch: String = String()
-    var _volumeName: String = String()
-    var _capabilities: PfsCapabilities? = nil
-
-    #if swift(>=5.10)
-      // This property is used as the initial default value for new instances of the type.
-      // The type itself is protecting the reference to its storage via CoW semantics.
-      // This will force a copy to be made of this reference when the first mutation occurs;
-      // hence, it is safe to mark this as `nonisolated(unsafe)`.
-      static nonisolated(unsafe) let defaultInstance = _StorageClass()
-    #else
-      static let defaultInstance = _StorageClass()
-    #endif
-
-    private init() {}
-
-    init(copying source: _StorageClass) {
-      _root = source._root
-      _rootAttr = source._rootAttr
-      _volumeID = source._volumeID
-      _branch = source._branch
-      _volumeName = source._volumeName
-      _capabilities = source._capabilities
-    }
-  }
-
-  fileprivate mutating func _uniqueStorage() -> _StorageClass {
-    if !isKnownUniquelyReferenced(&_storage) {
-      _storage = _StorageClass(copying: _storage)
-    }
-    return _storage
-  }
-
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    _ = _uniqueStorage()
-    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
-      while let fieldNumber = try decoder.nextFieldNumber() {
-        // The use of inline closures is to circumvent an issue where the compiler
-        // allocates stack space for every case branch when no optimizations are
-        // enabled. https://github.com/apple/swift-protobuf/issues/1034
-        switch fieldNumber {
-        case 1: try { try decoder.decodeSingularMessageField(value: &_storage._root) }()
-        case 2: try { try decoder.decodeSingularMessageField(value: &_storage._rootAttr) }()
-        case 3: try { try decoder.decodeSingularStringField(value: &_storage._volumeID) }()
-        case 4: try { try decoder.decodeSingularStringField(value: &_storage._branch) }()
-        case 5: try { try decoder.decodeSingularStringField(value: &_storage._volumeName) }()
-        case 6: try { try decoder.decodeSingularMessageField(value: &_storage._capabilities) }()
-        default: break
-        }
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularMessageField(value: &self._root) }()
+      case 2: try { try decoder.decodeSingularMessageField(value: &self._rootAttr) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.volumeID) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.branch) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.volumeName) }()
+      case 6: try { try decoder.decodeSingularMessageField(value: &self._capabilities) }()
+      default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every if/case branch local when no optimizations
-      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-      // https://github.com/apple/swift-protobuf/issues/1182
-      try { if let v = _storage._root {
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
-      } }()
-      try { if let v = _storage._rootAttr {
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
-      } }()
-      if !_storage._volumeID.isEmpty {
-        try visitor.visitSingularStringField(value: _storage._volumeID, fieldNumber: 3)
-      }
-      if !_storage._branch.isEmpty {
-        try visitor.visitSingularStringField(value: _storage._branch, fieldNumber: 4)
-      }
-      if !_storage._volumeName.isEmpty {
-        try visitor.visitSingularStringField(value: _storage._volumeName, fieldNumber: 5)
-      }
-      try { if let v = _storage._capabilities {
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
-      } }()
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    try { if let v = self._root {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+    } }()
+    try { if let v = self._rootAttr {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
+    } }()
+    if !self.volumeID.isEmpty {
+      try visitor.visitSingularStringField(value: self.volumeID, fieldNumber: 3)
     }
+    if !self.branch.isEmpty {
+      try visitor.visitSingularStringField(value: self.branch, fieldNumber: 4)
+    }
+    if !self.volumeName.isEmpty {
+      try visitor.visitSingularStringField(value: self.volumeName, fieldNumber: 5)
+    }
+    try { if let v = self._capabilities {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
+    } }()
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsResolveReply, rhs: PfsResolveReply) -> Bool {
-    if lhs._storage !== rhs._storage {
-      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
-        let _storage = _args.0
-        let rhs_storage = _args.1
-        if _storage._root != rhs_storage._root {return false}
-        if _storage._rootAttr != rhs_storage._rootAttr {return false}
-        if _storage._volumeID != rhs_storage._volumeID {return false}
-        if _storage._branch != rhs_storage._branch {return false}
-        if _storage._volumeName != rhs_storage._volumeName {return false}
-        if _storage._capabilities != rhs_storage._capabilities {return false}
-        return true
-      }
-      if !storagesAreEqual {return false}
-    }
+    if lhs._root != rhs._root {return false}
+    if lhs._rootAttr != rhs._rootAttr {return false}
+    if lhs.volumeID != rhs.volumeID {return false}
+    if lhs.branch != rhs.branch {return false}
+    if lhs.volumeName != rhs.volumeName {return false}
+    if lhs._capabilities != rhs._capabilities {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -3672,101 +3745,169 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
     15: .standard(proto: "alloc_size"),
   ]
 
+  fileprivate class _StorageClass {
+    var _item: PfsItem? = nil
+    var _kind: PfsItemKind = .unspecified
+    var _mode: UInt32 = 0
+    var _nlink: UInt32 = 0
+    var _uid: UInt32 = 0
+    var _gid: UInt32 = 0
+    var _size: UInt64 = 0
+    var _mtimeMs: Int64 = 0
+    var _ctimeMs: Int64 = 0
+    var _atimeMs: Int64 = 0
+    var _birthtimeMs: Int64 = 0
+    var _contentVersion: UInt64 = 0
+    var _parent: PfsItem? = nil
+    var _flags: UInt32 = 0
+    var _allocSize: UInt64 = 0
+
+    #if swift(>=5.10)
+      // This property is used as the initial default value for new instances of the type.
+      // The type itself is protecting the reference to its storage via CoW semantics.
+      // This will force a copy to be made of this reference when the first mutation occurs;
+      // hence, it is safe to mark this as `nonisolated(unsafe)`.
+      static nonisolated(unsafe) let defaultInstance = _StorageClass()
+    #else
+      static let defaultInstance = _StorageClass()
+    #endif
+
+    private init() {}
+
+    init(copying source: _StorageClass) {
+      _item = source._item
+      _kind = source._kind
+      _mode = source._mode
+      _nlink = source._nlink
+      _uid = source._uid
+      _gid = source._gid
+      _size = source._size
+      _mtimeMs = source._mtimeMs
+      _ctimeMs = source._ctimeMs
+      _atimeMs = source._atimeMs
+      _birthtimeMs = source._birthtimeMs
+      _contentVersion = source._contentVersion
+      _parent = source._parent
+      _flags = source._flags
+      _allocSize = source._allocSize
+    }
+  }
+
+  fileprivate mutating func _uniqueStorage() -> _StorageClass {
+    if !isKnownUniquelyReferenced(&_storage) {
+      _storage = _StorageClass(copying: _storage)
+    }
+    return _storage
+  }
+
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularMessageField(value: &self._item) }()
-      case 2: try { try decoder.decodeSingularEnumField(value: &self.kind) }()
-      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.mode) }()
-      case 4: try { try decoder.decodeSingularUInt32Field(value: &self.nlink) }()
-      case 5: try { try decoder.decodeSingularUInt32Field(value: &self.uid) }()
-      case 6: try { try decoder.decodeSingularUInt32Field(value: &self.gid) }()
-      case 7: try { try decoder.decodeSingularUInt64Field(value: &self.size) }()
-      case 8: try { try decoder.decodeSingularInt64Field(value: &self.mtimeMs) }()
-      case 9: try { try decoder.decodeSingularInt64Field(value: &self.ctimeMs) }()
-      case 10: try { try decoder.decodeSingularInt64Field(value: &self.atimeMs) }()
-      case 11: try { try decoder.decodeSingularInt64Field(value: &self.birthtimeMs) }()
-      case 12: try { try decoder.decodeSingularUInt64Field(value: &self.contentVersion) }()
-      case 13: try { try decoder.decodeSingularMessageField(value: &self._parent) }()
-      case 14: try { try decoder.decodeSingularUInt32Field(value: &self.flags) }()
-      case 15: try { try decoder.decodeSingularUInt64Field(value: &self.allocSize) }()
-      default: break
+    _ = _uniqueStorage()
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      while let fieldNumber = try decoder.nextFieldNumber() {
+        // The use of inline closures is to circumvent an issue where the compiler
+        // allocates stack space for every case branch when no optimizations are
+        // enabled. https://github.com/apple/swift-protobuf/issues/1034
+        switch fieldNumber {
+        case 1: try { try decoder.decodeSingularMessageField(value: &_storage._item) }()
+        case 2: try { try decoder.decodeSingularEnumField(value: &_storage._kind) }()
+        case 3: try { try decoder.decodeSingularUInt32Field(value: &_storage._mode) }()
+        case 4: try { try decoder.decodeSingularUInt32Field(value: &_storage._nlink) }()
+        case 5: try { try decoder.decodeSingularUInt32Field(value: &_storage._uid) }()
+        case 6: try { try decoder.decodeSingularUInt32Field(value: &_storage._gid) }()
+        case 7: try { try decoder.decodeSingularUInt64Field(value: &_storage._size) }()
+        case 8: try { try decoder.decodeSingularInt64Field(value: &_storage._mtimeMs) }()
+        case 9: try { try decoder.decodeSingularInt64Field(value: &_storage._ctimeMs) }()
+        case 10: try { try decoder.decodeSingularInt64Field(value: &_storage._atimeMs) }()
+        case 11: try { try decoder.decodeSingularInt64Field(value: &_storage._birthtimeMs) }()
+        case 12: try { try decoder.decodeSingularUInt64Field(value: &_storage._contentVersion) }()
+        case 13: try { try decoder.decodeSingularMessageField(value: &_storage._parent) }()
+        case 14: try { try decoder.decodeSingularUInt32Field(value: &_storage._flags) }()
+        case 15: try { try decoder.decodeSingularUInt64Field(value: &_storage._allocSize) }()
+        default: break
+        }
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    // The use of inline closures is to circumvent an issue where the compiler
-    // allocates stack space for every if/case branch local when no optimizations
-    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-    // https://github.com/apple/swift-protobuf/issues/1182
-    try { if let v = self._item {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
-    } }()
-    if self.kind != .unspecified {
-      try visitor.visitSingularEnumField(value: self.kind, fieldNumber: 2)
-    }
-    if self.mode != 0 {
-      try visitor.visitSingularUInt32Field(value: self.mode, fieldNumber: 3)
-    }
-    if self.nlink != 0 {
-      try visitor.visitSingularUInt32Field(value: self.nlink, fieldNumber: 4)
-    }
-    if self.uid != 0 {
-      try visitor.visitSingularUInt32Field(value: self.uid, fieldNumber: 5)
-    }
-    if self.gid != 0 {
-      try visitor.visitSingularUInt32Field(value: self.gid, fieldNumber: 6)
-    }
-    if self.size != 0 {
-      try visitor.visitSingularUInt64Field(value: self.size, fieldNumber: 7)
-    }
-    if self.mtimeMs != 0 {
-      try visitor.visitSingularInt64Field(value: self.mtimeMs, fieldNumber: 8)
-    }
-    if self.ctimeMs != 0 {
-      try visitor.visitSingularInt64Field(value: self.ctimeMs, fieldNumber: 9)
-    }
-    if self.atimeMs != 0 {
-      try visitor.visitSingularInt64Field(value: self.atimeMs, fieldNumber: 10)
-    }
-    if self.birthtimeMs != 0 {
-      try visitor.visitSingularInt64Field(value: self.birthtimeMs, fieldNumber: 11)
-    }
-    if self.contentVersion != 0 {
-      try visitor.visitSingularUInt64Field(value: self.contentVersion, fieldNumber: 12)
-    }
-    try { if let v = self._parent {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
-    } }()
-    if self.flags != 0 {
-      try visitor.visitSingularUInt32Field(value: self.flags, fieldNumber: 14)
-    }
-    if self.allocSize != 0 {
-      try visitor.visitSingularUInt64Field(value: self.allocSize, fieldNumber: 15)
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every if/case branch local when no optimizations
+      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+      // https://github.com/apple/swift-protobuf/issues/1182
+      try { if let v = _storage._item {
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+      } }()
+      if _storage._kind != .unspecified {
+        try visitor.visitSingularEnumField(value: _storage._kind, fieldNumber: 2)
+      }
+      if _storage._mode != 0 {
+        try visitor.visitSingularUInt32Field(value: _storage._mode, fieldNumber: 3)
+      }
+      if _storage._nlink != 0 {
+        try visitor.visitSingularUInt32Field(value: _storage._nlink, fieldNumber: 4)
+      }
+      if _storage._uid != 0 {
+        try visitor.visitSingularUInt32Field(value: _storage._uid, fieldNumber: 5)
+      }
+      if _storage._gid != 0 {
+        try visitor.visitSingularUInt32Field(value: _storage._gid, fieldNumber: 6)
+      }
+      if _storage._size != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._size, fieldNumber: 7)
+      }
+      if _storage._mtimeMs != 0 {
+        try visitor.visitSingularInt64Field(value: _storage._mtimeMs, fieldNumber: 8)
+      }
+      if _storage._ctimeMs != 0 {
+        try visitor.visitSingularInt64Field(value: _storage._ctimeMs, fieldNumber: 9)
+      }
+      if _storage._atimeMs != 0 {
+        try visitor.visitSingularInt64Field(value: _storage._atimeMs, fieldNumber: 10)
+      }
+      if _storage._birthtimeMs != 0 {
+        try visitor.visitSingularInt64Field(value: _storage._birthtimeMs, fieldNumber: 11)
+      }
+      if _storage._contentVersion != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._contentVersion, fieldNumber: 12)
+      }
+      try { if let v = _storage._parent {
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
+      } }()
+      if _storage._flags != 0 {
+        try visitor.visitSingularUInt32Field(value: _storage._flags, fieldNumber: 14)
+      }
+      if _storage._allocSize != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._allocSize, fieldNumber: 15)
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsAttr, rhs: PfsAttr) -> Bool {
-    if lhs._item != rhs._item {return false}
-    if lhs.kind != rhs.kind {return false}
-    if lhs.mode != rhs.mode {return false}
-    if lhs.nlink != rhs.nlink {return false}
-    if lhs.uid != rhs.uid {return false}
-    if lhs.gid != rhs.gid {return false}
-    if lhs.size != rhs.size {return false}
-    if lhs.mtimeMs != rhs.mtimeMs {return false}
-    if lhs.ctimeMs != rhs.ctimeMs {return false}
-    if lhs.atimeMs != rhs.atimeMs {return false}
-    if lhs.birthtimeMs != rhs.birthtimeMs {return false}
-    if lhs.contentVersion != rhs.contentVersion {return false}
-    if lhs._parent != rhs._parent {return false}
-    if lhs.flags != rhs.flags {return false}
-    if lhs.allocSize != rhs.allocSize {return false}
+    if lhs._storage !== rhs._storage {
+      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
+        let _storage = _args.0
+        let rhs_storage = _args.1
+        if _storage._item != rhs_storage._item {return false}
+        if _storage._kind != rhs_storage._kind {return false}
+        if _storage._mode != rhs_storage._mode {return false}
+        if _storage._nlink != rhs_storage._nlink {return false}
+        if _storage._uid != rhs_storage._uid {return false}
+        if _storage._gid != rhs_storage._gid {return false}
+        if _storage._size != rhs_storage._size {return false}
+        if _storage._mtimeMs != rhs_storage._mtimeMs {return false}
+        if _storage._ctimeMs != rhs_storage._ctimeMs {return false}
+        if _storage._atimeMs != rhs_storage._atimeMs {return false}
+        if _storage._birthtimeMs != rhs_storage._birthtimeMs {return false}
+        if _storage._contentVersion != rhs_storage._contentVersion {return false}
+        if _storage._parent != rhs_storage._parent {return false}
+        if _storage._flags != rhs_storage._flags {return false}
+        if _storage._allocSize != rhs_storage._allocSize {return false}
+        return true
+      }
+      if !storagesAreEqual {return false}
+    }
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4243,6 +4384,7 @@ extension PfsOpenRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .same(proto: "item"),
     2: .same(proto: "mode"),
+    3: .same(proto: "append"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4253,6 +4395,7 @@ extension PfsOpenRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._item) }()
       case 2: try { try decoder.decodeSingularEnumField(value: &self.mode) }()
+      case 3: try { try decoder.decodeSingularBoolField(value: &self.append) }()
       default: break
       }
     }
@@ -4269,12 +4412,16 @@ extension PfsOpenRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
     if self.mode != .unspecified {
       try visitor.visitSingularEnumField(value: self.mode, fieldNumber: 2)
     }
+    if self.append != false {
+      try visitor.visitSingularBoolField(value: self.append, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsOpenRequest, rhs: PfsOpenRequest) -> Bool {
     if lhs._item != rhs._item {return false}
     if lhs.mode != rhs.mode {return false}
+    if lhs.append != rhs.append {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4464,6 +4611,7 @@ extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     1: .same(proto: "handle"),
     2: .same(proto: "offset"),
     3: .same(proto: "data"),
+    4: .same(proto: "append"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4475,6 +4623,7 @@ extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
       case 1: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.offset) }()
       case 3: try { try decoder.decodeSingularBytesField(value: &self.data) }()
+      case 4: try { try decoder.decodeSingularBoolField(value: &self.append) }()
       default: break
       }
     }
@@ -4490,6 +4639,9 @@ extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     if !self.data.isEmpty {
       try visitor.visitSingularBytesField(value: self.data, fieldNumber: 3)
     }
+    if self.append != false {
+      try visitor.visitSingularBoolField(value: self.append, fieldNumber: 4)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4497,6 +4649,7 @@ extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     if lhs.handle != rhs.handle {return false}
     if lhs.offset != rhs.offset {return false}
     if lhs.data != rhs.data {return false}
+    if lhs.append != rhs.append {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4602,6 +4755,7 @@ extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
     2: .same(proto: "name"),
     3: .same(proto: "mode"),
     4: .same(proto: "exclusive"),
+    5: .same(proto: "append"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4614,6 +4768,7 @@ extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
       case 2: try { try decoder.decodeSingularBytesField(value: &self.name) }()
       case 3: try { try decoder.decodeSingularUInt32Field(value: &self.mode) }()
       case 4: try { try decoder.decodeSingularBoolField(value: &self.exclusive) }()
+      case 5: try { try decoder.decodeSingularBoolField(value: &self.append) }()
       default: break
       }
     }
@@ -4636,6 +4791,9 @@ extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
     if self.exclusive != false {
       try visitor.visitSingularBoolField(value: self.exclusive, fieldNumber: 4)
     }
+    if self.append != false {
+      try visitor.visitSingularBoolField(value: self.append, fieldNumber: 5)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4644,6 +4802,7 @@ extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
     if lhs.name != rhs.name {return false}
     if lhs.mode != rhs.mode {return false}
     if lhs.exclusive != rhs.exclusive {return false}
+    if lhs.append != rhs.append {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

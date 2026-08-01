@@ -549,6 +549,15 @@ func (a *attach) controlWriteLocked(
 	if err := a.controlAdmissionError(); err != nil {
 		return false, http.StatusConflict, err.Error(), 0
 	}
+	// A control write is a write-through with the kernel frontend's exact
+	// commit-then-publish shape (vol.Write and vol.Setattr below, registerLocked
+	// several steps later), so it owes the refresh fence the same bracket. The
+	// item is named from the record the path ALREADY has: a control write that
+	// creates the name mints a fresh identity no refresh pass can be carrying a
+	// stale sample of, and a zero ID is inert by construction.
+	if existing := a.itemByPath(p); existing != nil {
+		defer a.beginItemMutation(existing.item.ItemID)()
+	}
 	attr, st := vol.Lookup(ctx, p)
 	existed := st == fsproto.OK
 	if st == fsproto.ENOENT {
@@ -571,7 +580,7 @@ func (a *attach) controlWriteLocked(
 			// displaced a peer-replaced name leaves that inode's retained
 			// aliases stale for every later frontend reply, not just for this
 			// HTTP response.
-			if eno := ticket.settle(ctx, vol); eno != 0 {
+			if eno, _ := ticket.settle(ctx, vol); eno != 0 {
 				return false, httpStatusForErr(eno),
 					errMessage("fs/write reconcile aliases", eno), 0
 			}
@@ -635,7 +644,7 @@ func (a *attach) controlWriteLocked(
 	}
 	a.publishContentInvalidationLocked(p, 0, 0)
 	a.mu.Unlock()
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	if eno, _ := ticket.settle(ctx, vol); eno != 0 {
 		return false, httpStatusForErr(eno),
 			errMessage("fs/write reconcile aliases", eno), 0
 	}

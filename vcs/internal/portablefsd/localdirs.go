@@ -449,6 +449,12 @@ func (a *attach) readLocalDir(p string) ([]clientcore.DirEntry, int32) {
 // from recyclable path hashes or backing-disk inodes.
 func (a *attach) registerLocalLocked(p string, attr fsproto.Attr) *itemRecord {
 	if rec := a.paths[p]; rec != nil {
+		// This arm bypasses registerWithItemLocked, where publication admission
+		// otherwise lives, and it is still a publication: it overwrites the
+		// record's attributes with an observation this caller is about to
+		// expose. It is taken HERE rather than at the top of the function so
+		// the other arm is admitted exactly once, by registerWithItemLocked.
+		a.admitPublicationLocked(p)
 		rec.attr = attr
 		return rec
 	}
@@ -456,6 +462,10 @@ func (a *attach) registerLocalLocked(p string, attr fsproto.Attr) *itemRecord {
 }
 
 func (a *attach) registerLocalAliasLocked(p string, source *itemRecord, attr fsproto.Attr) *itemRecord {
+	// Binding a new name onto an existing identity publishes attributes for
+	// that name, so it is admitted like any other publication. It does not
+	// reach registerWithItemLocked, where the check otherwise lives.
+	a.admitPublicationLocked(p)
 	if a.paths[p] != nil {
 		a.removePathLocked(p)
 	}

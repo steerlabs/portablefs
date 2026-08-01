@@ -88,6 +88,44 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     try assertFrameRoundTrip(expectedEnvelope, golden: frame)
 }
 
+/// Protocol minor 6's retraction bit is an ENVELOPE field, so unlike every
+/// other cross-language fixture its whole job is to pin the four scalars that
+/// precede the body: request_id, publication_ack_required, operation_id and
+/// publication_retracted, in that order, ahead of the oneof. A frontend that
+/// silently dropped field 4 would still round-trip every other golden here.
+@Test func goPublicationRetractedGoldenDecodesAndReencodesByteIdentically() throws {
+    let frame = try goldenFrame("publication_retracted.hex")
+    let envelope = try decodeSingleGoldenEnvelope(frame)
+
+    #expect(envelope.requestID == 7)
+    #expect(envelope.publicationAckRequired)
+    #expect(envelope.operationID == 3)
+    #expect(envelope.publicationRetracted)
+    guard case let .getAttrReply(reply)? = envelope.body else {
+        Issue.record("expected getAttrReply body, got \(String(describing: envelope.body))")
+        return
+    }
+    #expect(reply.attr.item.itemID == 23)
+    #expect(reply.attr.item.itemGeneration == 29)
+    #expect(reply.attr.kind == .file)
+
+    var item = PfsItem()
+    item.itemID = 23
+    item.itemGeneration = 29
+    var attr = PfsAttr()
+    attr.item = item
+    attr.kind = .file
+    var expectedReply = PfsGetAttrReply()
+    expectedReply.attr = attr
+    var expectedEnvelope = PfsEnvelope()
+    expectedEnvelope.requestID = 7
+    expectedEnvelope.publicationAckRequired = true
+    expectedEnvelope.operationID = 3
+    expectedEnvelope.publicationRetracted = true
+    expectedEnvelope.body = .getAttrReply(expectedReply)
+    try assertFrameRoundTrip(expectedEnvelope, golden: frame)
+}
+
 @Test func goAttrParentAndFlagsGoldenDecodesAndReencodesByteIdentically() throws {
     let frame = try goldenFrame("attr_parent_flags.hex")
     let envelope = try decodeSingleGoldenEnvelope(frame)

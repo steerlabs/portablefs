@@ -1,0 +1,148 @@
+package portablefsd
+
+// THE PER-ITEM MUTATION SEQUENCE.
+//
+// ── THE HOLE IT CLOSES ──────────────────────────────────────────────────────
+//
+// A size mutation is two separate events, and the daemon's own registry only
+// witnesses the second one:
+//
+//  1. THE ENGINE COMMIT. vol.Write / vol.Setattr (or, for a graft, the host
+//     file's own write(2)/ftruncate(2)) returns. The extension is in the WAL,
+//     the count is DECIDED, and the application is about to be told so.
+//  2. THE REGISTRY PUBLICATION. The handler takes a.mu and installs the
+//     post-op attributes into itemRecord.attr (writeReplyWithAttr,
+//     setattr's registerLocked, controlWriteLocked).
+//
+// Between them the item is committed at N and the registry still says S, and
+// the refresh fence — whose composed arm is exactly "itemRecord.attr.Size has
+// not moved since I sampled" (refreshSampleSupersededLocked) — reads S and
+// concludes nothing has happened. It then arms an Internal window and issues
+// ftruncate(S) through the mount. The window predicate agrees (the registry
+// still says S), the upcall is answered locally as daemon bookkeeping, and the
+// kernel's vnode is shortened to S over an extension the application has
+// already been told is durable. The publication of N lands a moment later into
+// a registry the kernel no longer agrees with, and nothing re-states it.
+//
+// The registry is therefore not a sufficient witness. It is the END of a
+// mutation, not the mutation, and a proof built only on it proves only that no
+// mutation has FINISHED.
+//
+// ── THE SEQUENCE ────────────────────────────────────────────────────────────
+//
+// So every size mutation brackets itself with a per-item sequence:
+//
+//	bumped   is advanced BEFORE the engine commit is attempted.
+//	settled  is advanced AFTER the registry publication has been installed.
+//
+// `bumped == settled` is the whole predicate, and it is a statement about the
+// object rather than about any particular handler: for this item, there is no
+// mutation anywhere between its commit and its publication. A refresh arms only
+// from that state, so the composed size it re-reads under a.mu is the composed
+// size of every acknowledged mutation, with none in flight behind it.
+//
+// The bracket is deliberately CONSERVATIVE at both ends. Bumping before the
+// commit rather than inside it costs a refresh nothing (it retries, which is an
+// ordinary outcome — see errRefreshSampleSuperseded) and needs no atomicity
+// with the engine's own internals, which the frontend does not own and must not
+// reach into. Settling after the publication rather than inside the same lock
+// hold is the same trade in the other direction: a slightly longer refusal
+// window in exchange for a bracket that is a plain defer at the top of the
+// handler and therefore cannot be skipped by any early return, error path, or
+// panic on the way out.
+//
+// ── WHAT IS BRACKETED ───────────────────────────────────────────────────────
+//
+// Every path that can move an item's composed size and then publish it:
+//
+//   - attach.write, both arms — the delegated/authority engine write and the
+//     graft handle's host write(2).
+//   - attach.setattr's authority arm and setattrLocal's graft arm, for a
+//     size-set (a truncate is a size mutation with no bytes).
+//   - controlWriteLocked, whose write+truncate+publish sequence has the same
+//     shape as the kernel frontend's and the same gap in the middle.
+//
+// Operations that MINT an identity (create, mkdir, symlink) are not bracketed
+// and need not be: a refresh pass can only carry a stale sample for an item it
+// already found in the registry, and a fresh identity was not there to sample.
+//
+// ── WHY A COUNT AND NOT A FLAG ──────────────────────────────────────────────
+//
+// Two descriptors on one inode write concurrently. A flag cleared by whichever
+// finishes first would declare the item stable while the other is still between
+// its commit and its publication, which is precisely the state being excluded.
+// The pair is a monotone sequence rather than a bare counter so the invariant
+// reads as what it is — a publication has caught up with a commit — and so a
+// diagnostic can say how far behind it is.
+type itemMutationSeq struct {
+	bumped  uint64
+	settled uint64
+}
+
+// beginItemMutation opens one size mutation on itemID and returns its settle.
+// The settle is idempotent and must be deferred by the caller BEFORE the engine
+// commit is attempted, so that no return path can leave the sequence open.
+//
+// A zero itemID is an item the registry cannot name; there is nothing for a
+// refresh to hold a stale sample of, so the bracket is inert.
+func (a *attach) beginItemMutation(itemID uint64) func() {
+	if itemID == 0 {
+		return func() {}
+	}
+	a.mu.Lock()
+	a.beginItemMutationLocked(itemID)
+	a.mu.Unlock()
+	var once bool
+	return func() {
+		if once {
+			return
+		}
+		once = true
+		a.mu.Lock()
+		a.settleItemMutationLocked(itemID)
+		a.mu.Unlock()
+	}
+}
+
+// beginItemMutationLocked advances the item's bumped sequence. Callers hold
+// a.mu.
+func (a *attach) beginItemMutationLocked(itemID uint64) {
+	if itemID == 0 {
+		return
+	}
+	if a.itemMutations == nil {
+		a.itemMutations = map[uint64]itemMutationSeq{}
+	}
+	seq := a.itemMutations[itemID]
+	seq.bumped++
+	a.itemMutations[itemID] = seq
+}
+
+// settleItemMutationLocked advances the item's settled sequence, and drops the
+// entry once publication has caught up with every commit. Callers hold a.mu.
+func (a *attach) settleItemMutationLocked(itemID uint64) {
+	if itemID == 0 {
+		return
+	}
+	seq, ok := a.itemMutations[itemID]
+	if !ok {
+		return
+	}
+	seq.settled++
+	if seq.settled >= seq.bumped {
+		// Equal is the stable state, and the map is a set of UNSTABLE items
+		// only: retaining an entry whose two halves agree would make the map
+		// grow with the working set for no proof it does not already carry.
+		delete(a.itemMutations, itemID)
+		return
+	}
+	a.itemMutations[itemID] = seq
+}
+
+// itemMutationInFlightLocked reports whether any size mutation on itemID has
+// committed (or is about to) without yet having published. Callers hold a.mu in
+// either mode.
+func (a *attach) itemMutationInFlightLocked(itemID uint64) bool {
+	seq, ok := a.itemMutations[itemID]
+	return ok && seq.bumped != seq.settled
+}

@@ -207,7 +207,7 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 		// removes from the alias index before the debt loop runs. Paying the
 		// (inert) ticket anyway is what keeps that an observation rather than an
 		// assumption the next edit here can quietly break.
-		if eno := ticket.settle(ctx, vol); eno != 0 {
+		if eno, _ := ticket.settle(ctx, vol); eno != 0 {
 			return pfslocal.ResolveReply{}, eno
 		}
 	}
@@ -295,8 +295,12 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 	// inode's retained aliases a refresh, and it must be paid BEFORE the
 	// replacement is published — see reincarnation.go. a.mu is released here
 	// because settling issues authority RPCs.
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	eno, reconciled := ticket.settle(ctx, vol)
+	if eno != 0 {
 		return nil, eno
+	}
+	if reconciled {
+		attr = a.reconciledAttr(rec, attr)
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -339,7 +343,7 @@ func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) 
 	// registrations created is just as real as a successful page's — dropping it
 	// here would leave an alias permanently stale with no publisher left owning
 	// its refresh. The page's own error still wins the reply.
-	settleEno := ticket.settle(ctx, a.enumerateVolume())
+	settleEno, reconciledPage := ticket.settle(ctx, a.enumerateVolume())
 	if eno != 0 {
 		return nil, eno
 	}
@@ -351,6 +355,17 @@ func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) 
 	// need not be in this page or even in this directory.
 	if settleEno != 0 {
 		return nil, settleEno
+	}
+	if reconciledPage {
+		// The page's entries were registered from observations taken on the way
+		// in, and this ticket has just proved at least one alias's retained
+		// snapshot was stale. Restate every entry from the registry the
+		// reconciliation repaired, for the reason spelled out on
+		// attach.reconciledAttr: a readdir-plus entry is a published attribute
+		// set exactly as a lookup reply is, and a listing is precisely where an
+		// impossible attribute pair is most visible — the replacement and its
+		// stale alias side by side in one answer.
+		a.restatePageFromRegistry(dir.path, rep)
 	}
 	if rep != nil && len(rep.Entries) > 0 {
 		if eno := a.flushBindingDelta(); eno != 0 {
@@ -540,6 +555,35 @@ func (a *attach) enumeratePageLocked(dir string, ordered []enumerationEntry, sta
 	return &pfslocal.EnumerateReply{Entries: out, NextCookie: next, DirVersion: dirVersion}, 0
 }
 
+// restatePageFromRegistry rewrites one already-built enumeration page from the
+// records the registry holds NOW. It is the enumerate arm of the ordering
+// barrier described on attach.reconciledAttr, and it exists because a page is
+// many publications at once: one reconciliation anywhere in the listing makes
+// every entry's snapshot suspect, and there is no cheaper honest answer than
+// re-reading the store the reconciliation just repaired.
+//
+// Entries whose record has since been detached keep the attributes they were
+// built with. There is nothing newer to restate them from, and dropping the
+// entry would turn a coherence repair into a namespace change.
+func (a *attach) restatePageFromRegistry(dir string, rep *pfslocal.EnumerateReply) {
+	if rep == nil {
+		return
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for i := range rep.Entries {
+		p := string(rep.Entries[i].Name)
+		if dir != "" {
+			p = dir + "/" + p
+		}
+		rec := a.paths[p]
+		if rec == nil {
+			continue
+		}
+		rep.Entries[i].Attr = a.localAttrForRecordLocked(rec.attr, rec, false)
+	}
+}
+
 func encodeEnumerationCookie(cursor uint64) (uint64, bool) {
 	if cursor == 0 || cursor > enumerateCursorMax {
 		return 0, false
@@ -631,8 +675,12 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 	// getattr publishes an Item to FSKit exactly as lookup does, so a
 	// reincarnation IT discovers owes the displaced inode's retained aliases the
 	// same refresh, on this reply path.
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	eno, reconciled := ticket.settle(ctx, vol)
+	if eno != 0 {
 		return nil, eno
+	}
+	if reconciled {
+		attr = a.reconciledAttr(rec, attr)
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -654,6 +702,18 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	rec := target.rec
 	if req.Size != nil && target.detached && target.handle != nil && !target.handle.write {
 		return nil, darwinEBADF
+	}
+	if req.Size != nil {
+		// A truncate is a size mutation with no bytes, and it has the write
+		// path's exact shape: the engine (or the host file, on the graft arm)
+		// commits the new size, and only later does the handler publish it into
+		// the registry. Bracket it for the same reason and on the same terms —
+		// see attach.write and mutationseq.go.
+		//
+		// Only a size-set opens a sequence. A mode/ownership/timestamp setattr
+		// moves nothing a refresh fence reads, so bracketing it would refuse
+		// refreshes for an item that is not changing size at all.
+		defer a.beginItemMutation(rec.item.ItemID)()
 	}
 	if rec.graft {
 		exactHandle := target.handle
@@ -823,8 +883,12 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	// setattr publishes an Item too: a post-op attribute registration can land
 	// on a name a peer replaced mid-flight, and the displaced inode's retained
 	// aliases owe the same refresh before this reply leaves.
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	eno, reconciled := ticket.settle(ctx, vol)
+	if eno != 0 {
 		return nil, eno
+	}
+	if reconciled {
+		attr = a.reconciledAttr(rec, attr)
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -1003,6 +1067,21 @@ func (a *attach) writeLocked(
 	if !h.write {
 		return nil, darwinEBADF
 	}
+	// OPEN THE ITEM'S MUTATION SEQUENCE BEFORE ANYTHING COMMITS.
+	//
+	// Everything below this line — the graft handle's host write(2), the
+	// engine's delegated or authority write — can return with bytes DECIDED and
+	// acknowledged while the registry still holds the pre-write size, and it
+	// stays that way until writeReplyWithAttr publishes. A kernel refresh that
+	// samples the item in that gap sees a composed size that has not moved and
+	// concludes, wrongly, that nothing has happened. The bracket is what makes
+	// the gap visible to the fence; see mutationseq.go.
+	//
+	// It is deferred here, above every commit and every early return, because a
+	// sequence left open would freeze refreshes for the item and one left
+	// unopened would reopen the hole. The settle runs after writeReplyWithAttr
+	// has returned, which is after the publication it must not precede.
+	defer a.beginItemMutation(h.itemID)()
 	// O_APPEND is a property of the open file description OR of this one
 	// request. Either way the offset is resolved at EOF by whoever owns the
 	// serialization (host kernel for a graft, authority/delegation otherwise)
@@ -1071,6 +1150,9 @@ func (a *attach) writeLocked(
 		n, st = vol.WriteExactHandle(ctx, h.state, int64(req.Offset), data)
 	default:
 		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), data)
+	}
+	if a.testAfterWriteCommit != nil {
+		a.testAfterWriteCommit()
 	}
 	if n <= 0 {
 		if clientcore.LaneChanged(st) {
@@ -1195,8 +1277,18 @@ func (a *attach) writeReplyWithAttr(
 	// chance to learn they are durable, and an unreconciled alias is a
 	// coherence defect rather than a reason to lie about committed data.
 	vol, _ := a.volOrErr()
-	if eno := ticket.settle(ctx, vol); eno != 0 && !committed {
+	eno, reconciled := ticket.settle(ctx, vol)
+	if eno != 0 && !committed {
 		return nil, eno
+	}
+	if reconciled && rec != nil {
+		// This ticket paid for an alias whose retained snapshot was known to be
+		// stale, so `attr` — read on the way in — may be the pre-reincarnation
+		// one. Restate the reply from the registry the reconciliation repaired;
+		// see attach.reconciledAttr. The nil check mirrors the one above: with
+		// no record there is no attribute half to restate, and the reply carries
+		// the committed count on its own.
+		reply = a.localAttrForRecordPath(a.reconciledAttr(rec, attr), rec, scope, detached)
 	}
 	// The binding journal's own contract makes a failed append a correctness
 	// failure that fails the frontend gate closed (failBindingPersistence), so
@@ -1407,7 +1499,13 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 	// A create that lands on a name a peer already replaced reincarnates it,
 	// and the displaced inode's retained aliases owe a refresh before this
 	// reply publishes the new identity.
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	//
+	// No reconciledAttr re-read here, and the asymmetry with lookup/getattr is
+	// structural rather than an omission: attr is this create's OWN authority
+	// reply for the identity it just minted, so it cannot be the pre-
+	// reincarnation snapshot of the name it publishes. The debt it owes belongs
+	// to the DISPLACED inode's other aliases, which this reply does not carry.
+	if eno, _ := ticket.settle(ctx, vol); eno != 0 {
 		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
@@ -1480,7 +1578,13 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 	// A create that lands on a name a peer already replaced reincarnates it,
 	// and the displaced inode's retained aliases owe a refresh before this
 	// reply publishes the new identity.
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	//
+	// No reconciledAttr re-read here, and the asymmetry with lookup/getattr is
+	// structural rather than an omission: attr is this create's OWN authority
+	// reply for the identity it just minted, so it cannot be the pre-
+	// reincarnation snapshot of the name it publishes. The debt it owes belongs
+	// to the DISPLACED inode's other aliases, which this reply does not carry.
+	if eno, _ := ticket.settle(ctx, vol); eno != 0 {
 		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
@@ -1774,7 +1878,13 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 	// A create that lands on a name a peer already replaced reincarnates it,
 	// and the displaced inode's retained aliases owe a refresh before this
 	// reply publishes the new identity.
-	if eno := ticket.settle(ctx, vol); eno != 0 {
+	//
+	// No reconciledAttr re-read here, and the asymmetry with lookup/getattr is
+	// structural rather than an omission: attr is this create's OWN authority
+	// reply for the identity it just minted, so it cannot be the pre-
+	// reincarnation snapshot of the name it publishes. The debt it owes belongs
+	// to the DISPLACED inode's other aliases, which this reply does not carry.
+	if eno, _ := ticket.settle(ctx, vol); eno != 0 {
 		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
