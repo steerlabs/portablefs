@@ -25,6 +25,65 @@ const maxLiveDelegations = 64
 // consumes no stream budget at all.
 var errGrantNotAffordable = errors.New("writeback: stream cannot retain another delegation")
 
+// ErrPublicationUnsettled is the frontend handoff's bounded, TRANSIENT verdict:
+// the kernel publication barrier could not be proved clear within the gate's
+// settle window, and the frontend is ALIVE. It is deliberately distinct from a
+// disconnect (which is terminal and fails coherence closed) and from a stalled
+// uplink (ErrUplinkStalled, which is about the far end).
+//
+// The distinction matters because the two demand opposite responses. A
+// disconnect can never be retried — nothing will ever acknowledge the exposed
+// publication. An unsettled publication is a statement about a moment: the
+// frontend simply had not acknowledged yet, and by the time the release is
+// re-attempted it almost always has. So the release RETRIES it, bounded, before
+// it fails the attempt (see startHandoffBounded).
+var ErrPublicationUnsettled = errors.New("writeback: frontend publication did not settle")
+
+// releaseHandoffBudget is the total time a release spends trying to open the
+// frontend handoff before it records a definite failure. It sits strictly under
+// clientcore's 50s operation admission budget so the triggering syscall reaches
+// the engine's verdict rather than its own deadline: the syscall learns WHY,
+// not merely that it ran out of time.
+//
+// A var so failure-shape tests compress it; production never changes it.
+var releaseHandoffBudget = 20 * time.Second
+
+// handoffRetryBackoff is the pause between handoff attempts. It is not a
+// backoff schedule — the gate is re-asked, not the network — it only keeps a
+// wedged gate from spinning, and it deliberately leaves the handoff scope
+// UNREGISTERED in between, so requests queued on that subtree drain instead of
+// starving behind one release's repeated attempts.
+var handoffRetryBackoff = 50 * time.Millisecond
+
+// startHandoffBounded opens the frontend handoff for scope with a definite
+// outcome. An unsettled publication is retried within releaseHandoffBudget;
+// every other error, and budget exhaustion, is final.
+func (e *Engine) startHandoffBounded(attempt *releaseAttempt, scope string) error {
+	deadline := time.Now().Add(releaseHandoffBudget)
+	var last error
+	for {
+		err := e.cfg.Events.OnHandoffStart(attempt.eventCtx, scope)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrPublicationUnsettled) {
+			return err
+		}
+		last = err
+		if !time.Now().Before(deadline) {
+			return last
+		}
+		select {
+		case <-attempt.done:
+			// Someone already resolved this attempt (fence, force, close).
+			return last
+		case <-e.ctx.Done():
+			return last
+		case <-time.After(handoffRetryBackoff):
+		}
+	}
+}
+
 type acquireFlight struct {
 	done chan struct{}
 	err  error
@@ -458,7 +517,7 @@ func (e *Engine) finishRelease(ctx context.Context, d *delegation, attempt *rele
 	}
 	handoffStarted := false
 	if e.cfg.Events.OnHandoffStart != nil {
-		if err := e.cfg.Events.OnHandoffStart(attempt.eventCtx, d.scope); err != nil {
+		if err := e.startHandoffBounded(attempt, d.scope); err != nil {
 			return e.failRelease(d, attempt, fmt.Errorf("writeback: frontend handoff start %q: %w", d.scope, err))
 		}
 		handoffStarted = true

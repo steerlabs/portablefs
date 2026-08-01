@@ -2959,6 +2959,10 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// AttachState is the daemon-reported attach state (degraded carries
 		// the daemon's last error in the printed line).
 		AttachState string `json:"attachState,omitempty"`
+		// AttachError is the daemon's own lastError for the attach. The
+		// printed line already shows it; the JSON view dropped it, so an agent
+		// reading --json could see attachState=degraded with no reason at all.
+		AttachError string `json:"attachError,omitempty"`
 		// CleanupRequired marks a durable operation intent with no matching
 		// mount-state record. It is deliberately a first-class inventory row:
 		// crash recovery must never disappear from the CLI or app view.
@@ -3001,6 +3005,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		if a, ok := daemonView[states[i].AttachRef]; ok {
 			row.WriteBack = a.WriteBack
 			row.AttachState = a.State
+			row.AttachError = a.LastError
 		}
 		rows = append(rows, row)
 	}

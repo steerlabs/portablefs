@@ -191,6 +191,11 @@ type cacheStatus struct {
 type registry struct {
 	mu         sync.RWMutex
 	mutationMu sync.Mutex
+	// unmountMu guards unmounting, the at-most-one-transaction-per-attach map
+	// that lets a second unmount request JOIN a running transaction instead of
+	// queueing another one behind it on mutationMu.
+	unmountMu  sync.Mutex
+	unmounting map[string]*unmountTransaction
 	persistMu  sync.Mutex
 	stateDir   string
 	byRef      map[string]*attach
@@ -614,14 +619,147 @@ func (r *registry) unmountFSKit(ref string, force bool) (bool, string, error) {
 	return r.unmountFSKitWith(ref, force, hostFSKitKernelOps())
 }
 
+// unmountTransactionBudget is the daemon's OWN ceiling on how long one unmount
+// REQUEST may take to answer, as distinct from how long the unmount TRANSACTION
+// may take to finish.
+//
+// The two were the same thing, and that is the defect. The transaction is a
+// durable, admission-freezing sequence — freeze, authority drain barrier
+// (clientcore's volumeBarrierTimeout, 60s, for ONE attempt), exact kernel
+// detach, durable registry removal — and it must not be abandoned partway. The
+// REQUEST, on the other hand, is answered to `portablefs umount` over a control
+// socket whose HTTP client gives up at 60s. Blocking the request on the whole
+// transaction therefore raced the CLI's own timeout and, on an ACTIVE HEALTHY
+// drain, lost: the CLI reported rc=1 with a transport-shaped error and no
+// verdict at all, while the recorded-verdict refusal path answers a definite
+// HTTP 409 in under a second whenever a verdict already exists.
+//
+// So the request gets its own bound, strictly under the CLI's, and the
+// transaction keeps running detached. Past the bound the request answers the
+// definite in-progress verdict, and — this is what makes it definite rather
+// than a rename of the same wait — a RETRY joins the same transaction instead
+// of queueing a second one behind it, so every later request answers
+// immediately too.
+//
+// A var so failure-shape tests compress it; production never changes it.
+var unmountTransactionBudget = 40 * time.Second
+
+type unmountOutcome struct {
+	found bool
+	jobID string
+	err   error
+}
+
+// unmountFSKitWith answers ONE unmount request within unmountTransactionBudget.
+// The transaction itself is started at most once per attach ref and runs to its
+// own completion regardless of how many requests observe it.
+func (r *registry) unmountFSKitWith(
+	ref string,
+	force bool,
+	ops fskitKernelOps,
+) (bool, string, error) {
+	r.unmountMu.Lock()
+	if r.unmounting == nil {
+		r.unmounting = map[string]*unmountTransaction{}
+	}
+	tx, running := r.unmounting[ref]
+	// A FORCE request never joins a normal transaction. Force is a different
+	// decision — park the unshipped tail as a durable recovery job rather than
+	// drain it — and it is the escape hatch from exactly the wait a normal
+	// unmount is sitting in. Making it wait for that transaction's verdict
+	// would defeat its whole purpose.
+	if running && force && !tx.force {
+		running = false
+		tx = nil
+	}
+	if !running {
+		started := &unmountTransaction{done: make(chan struct{}), force: force}
+		if tx == nil {
+			r.unmounting[ref] = started
+		}
+		tx = started
+		go func() {
+			found, jobID, err := r.runUnmountTransaction(ref, force, ops)
+			r.unmountMu.Lock()
+			if r.unmounting[ref] == tx {
+				delete(r.unmounting, ref)
+			}
+			r.unmountMu.Unlock()
+			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
+			close(tx.done)
+		}()
+	}
+	r.unmountMu.Unlock()
+	timer := time.NewTimer(unmountTransactionBudget)
+	defer timer.Stop()
+	select {
+	case <-tx.done:
+		return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+	case <-timer.C:
+		return true, "", r.unmountInProgressVerdict(ref)
+	}
+}
+
+// unmountTransaction is one running detach, shared by every request that
+// observes it. outcome is written exactly once, before done closes.
+type unmountTransaction struct {
+	done    chan struct{}
+	force   bool
+	outcome unmountOutcome
+}
+
+// unmountInProgressVerdict is the definite answer to a request whose budget
+// expired with the transaction still running. It NAMES what the transaction is
+// waiting on and what to do next — the same shape as the recorded-verdict
+// refusal — so the CLI reports a verdict instead of a transport failure.
+func (r *registry) unmountInProgressVerdict(ref string) error {
+	r.mu.RLock()
+	a := r.byRef[ref]
+	r.mu.RUnlock()
+	if a == nil {
+		return fmt.Errorf("unmount in progress for unknown attach %s", ref)
+	}
+	detail := "the authority drain barrier"
+	if st := a.liveWriteBackStatus(); st != nil {
+		scope := ""
+		for _, d := range st.Delegations {
+			if d.Draining {
+				scope = d.Scope
+				break
+			}
+		}
+		switch {
+		case scope != "":
+			detail = fmt.Sprintf(
+				"the delegation release for scope %q with %d record(s) (%d bytes) unshipped",
+				scope, st.PendingRecords, st.PendingBytes,
+			)
+		case st.PendingRecords > 0:
+			detail = fmt.Sprintf(
+				"the authority drain barrier with %d record(s) (%d bytes) unshipped",
+				st.PendingRecords, st.PendingBytes,
+			)
+		}
+	}
+	return fmt.Errorf(
+		"unmount is still running after %s, waiting on %s; it continues in the "+
+			"background — re-run `portablefs umount` to join it, or "+
+			"`portablefs umount --force` to park the unshipped tail as a durable "+
+			"recovery job",
+		unmountTransactionBudget, detail,
+	)
+}
+
 type fskitKernelOps struct {
 	present      func(mountPath, attachRef string) (bool, error)
 	unmountExact func(mountPath, attachRef string) error
 }
 
-// unmountFSKitWith owns the complete admission-freeze → durability barrier →
-// exact kernel detach → registry removal transaction in one daemon request.
-func (r *registry) unmountFSKitWith(
+// runUnmountTransaction owns the complete admission-freeze → durability
+// barrier → exact kernel detach → registry removal transaction. It runs
+// DETACHED from the request that started it (see unmountTransactionBudget):
+// abandoning it partway would leave durable state without an owner.
+func (r *registry) runUnmountTransaction(
 	ref string,
 	force bool,
 	ops fskitKernelOps,
@@ -925,6 +1063,13 @@ type attach struct {
 	frontendGateCond *sync.Cond
 	frontendActive   map[*frontendOperation]struct{}
 	frontendHandoffs map[string]int
+	// frontendGateProgress counts every RETRACTION from the active publication
+	// set. It is the publication gate's progress clock: a handoff's settle
+	// window (publicationSettleWindow) is measured from the last time this
+	// advanced, so a gate that keeps clearing operations never reaches a stall
+	// verdict however long it is busy, while a gate that has stopped clearing
+	// them reaches a definite one. Guarded by frontendGateMu.
+	frontendGateProgress uint64
 	// frontendGateErr is the terminal correctness verdict observed by
 	// handoffs while they hold frontendGateMu. It wakes and aborts a handoff
 	// that was already waiting when the attach failed closed.
@@ -1260,6 +1405,17 @@ func (a *attach) activateWithOptionsMode(
 	}
 	a.setCredential(tok)
 	if active {
+		// A live volume that had latched a credential verdict must re-arm its
+		// reachability prober: the verdict was about the PREVIOUS credential,
+		// and nothing else in the mount will ever retry the handshake (the
+		// prober stops on a definite credential rejection precisely because
+		// re-handshaking with a dead credential can never succeed).
+		a.mu.RLock()
+		vol := a.vol
+		a.mu.RUnlock()
+		if vol != nil {
+			vol.CredentialInstalled()
+		}
 		return true, nil
 	}
 	if options != nil {
@@ -1792,6 +1948,19 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 // instead of making clients guess whether write-back is absent or merely idle.
 // Scope names make contention and overly broad grants diagnosable without
 // exposing delegation epochs.
+// liveWriteBackStatus snapshots the engine's durability-debt view without
+// taking the whole attach status apart. It exists for verdicts that must NAME
+// what a barrier is waiting on.
+func (a *attach) liveWriteBackStatus() *writeBackStatus {
+	a.mu.RLock()
+	vol := a.vol
+	a.mu.RUnlock()
+	if vol == nil {
+		return nil
+	}
+	return newWriteBackStatus(vol.WritebackStatus())
+}
+
 func newWriteBackStatus(st writeback.Status) *writeBackStatus {
 	wb := &writeBackStatus{
 		PendingRecords: st.PendingRecords, PendingBytes: st.PendingBytes,
@@ -1842,6 +2011,22 @@ func (a *attach) status() attachStatus {
 			diskBytes, diskCap = vol.DiskCache.Stats()
 		}
 		wb = newWriteBackStatus(vol.WritebackStatus())
+		// CREDENTIAL DEATH IS NOT UNREACHABILITY. A reachable authority that
+		// refuses this mount's access credential is a DEFINITE, terminal
+		// classification: no retry loop can recover it (per the lease decision
+		// table only login + remount can), and the admitted backlog belongs to
+		// the durable parked-job path. Reporting it as a transport problem —
+		// which is what "authority unreachable (fail-fast engaged after
+		// repeated transport failures)" said while a concurrent fresh mount
+		// proved the authority healthy — sends the operator to the network and
+		// hides the one action that works.
+		if vol.CredentialExpired() {
+			state = pfslocal.AttachStateDegraded
+			lastErr = "access credential rejected by a REACHABLE authority " +
+				"(lease expired or revoked); run `portablefs login` and remount. " +
+				"Unshipped write-back is retained locally and can be parked as a " +
+				"durable recovery job with `portablefs umount --force`"
+		}
 	}
 	a.mu.RLock()
 	localDirs := append([]string(nil), a.localDirs...)
