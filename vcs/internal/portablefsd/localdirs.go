@@ -140,7 +140,7 @@ func (a *attach) transitionGraftProvenanceLocked(effective []string) []string {
 	sort.Strings(paths)
 	for _, p := range paths {
 		if rec := a.paths[p]; rec != nil {
-			a.detachReincarnatedPathLocked(p, rec)
+			a.detachReincarnatedPathLocked(p, rec, detachReprovisioned)
 		}
 	}
 	return paths

@@ -74,10 +74,10 @@ func TestRefreshWindowCannotDiscardARealApplicationTruncate(t *testing.T) {
 		sizeInside  int64
 		selfOutcome kernelRefreshOutcome
 	)
-	a.testRefreshKernelFile = func(_, p string, _ uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, p string, _ uint64, size int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
 		// Inside the daemon's own ftruncate(2): the provenance window is armed
 		// for exactly this call's extent.
-		disarm := armTruncate()
+		disarm := mustArmRefreshWindow(t, armTruncate)
 		defer disarm()
 
 		// A LOCAL WRITE extends the inode past the sampled size. The frontend
@@ -106,7 +106,7 @@ func TestRefreshWindowCannotDiscardARealApplicationTruncate(t *testing.T) {
 	}
 
 	selfOutcome, err = func() (kernelRefreshOutcome, error) {
-		return a.applyKernelRefresh("", "f", rec, sampledSize)
+		return a.applyKernelRefresh("", "f", rec, sampledSize, refreshApplyFence{observedSize: rec.attr.Size})
 	}()
 	if selfOutcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("apply kernel refresh = (%v, %v)", selfOutcome, err)
@@ -180,7 +180,7 @@ func TestRefreshWithNoTruncateArmsNoWindow(t *testing.T) {
 	a := &attach{items: map[uint64]*itemRecord{item.ItemID: rec}}
 
 	var pendingInside, consumedInside bool
-	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, _ func() func()) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, _ func() (func(), error)) (kernelRefreshOutcome, error) {
 		// The vnode size already matched: no ftruncate, so armTruncate is never
 		// called and no window exists.
 		req := sizeSetAttr(item, 64)
@@ -188,7 +188,7 @@ func TestRefreshWithNoTruncateArmsNoWindow(t *testing.T) {
 		consumedInside = consumedInternal(a, rec.path, req)
 		return kernelRefreshApplied, nil
 	}
-	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 64); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 64, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("applyKernelRefresh = (%v, %v)", outcome, err)
 	}
 	if pendingInside || consumedInside {

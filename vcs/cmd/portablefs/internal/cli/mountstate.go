@@ -79,6 +79,18 @@ type mountState struct {
 	ForceRecoveryJobID    string `json:"forceRecoveryJobId,omitempty"`
 }
 
+// attachCredentialRejected / attachCredentialPendingVerification mirror the
+// daemon's two disjoint credential faults (portablefsd attachStatus.credential)
+// on the DATA-PLANE path. They are deliberately separate from
+// mountStatusCredentialExpired, which is the CLI-side lease-keeper's own
+// persisted verdict: the two paths observe different things (a control-plane
+// renewal refusal vs a data-plane handshake outcome) and collapsing them would
+// make a mount claim a verdict nothing on that path ever reached.
+const (
+	attachCredentialRejected            = "rejected"
+	attachCredentialPendingVerification = "pending-verification"
+)
+
 // mountStatusCredentialExpired marks a running mount whose credentials the
 // control plane has definitively rejected: the kernel mount is still attached
 // but operations degrade until re-login and remount.

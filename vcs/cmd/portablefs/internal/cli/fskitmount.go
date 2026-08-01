@@ -301,17 +301,21 @@ func fskitOptionsFromPerf(perf perfOptions, localDirs []string, volumeLocalDirs 
 }
 
 type fskitEnsureAttachRequest struct {
-	AttachRef           string             `json:"attachRef"`
-	VolumeID            string             `json:"volumeId"`
-	Branch              string             `json:"branch"`
-	AuthorityURL        string             `json:"authorityUrl"`
-	AuthToken           string             `json:"authToken"`
-	DataPlaneTransport  string             `json:"dataPlaneTransport"`
-	DataPlaneServerName string             `json:"dataPlaneServerName,omitempty"`
-	TLSCAPEM            string             `json:"tlsCaPem,omitempty"`
-	TLSCASHA256         string             `json:"tlsCaSha256,omitempty"`
-	MountPath           string             `json:"mountPath"`
-	Options             fskitAttachOptions `json:"options"`
+	AttachRef    string `json:"attachRef"`
+	VolumeID     string `json:"volumeId"`
+	Branch       string `json:"branch"`
+	AuthorityURL string `json:"authorityUrl"`
+	AuthToken    string `json:"authToken"`
+	// AuthTokenExpiresAtMs is the access lease's own stated expiry for
+	// AuthToken (unix ms), the deadline that bounds the daemon-side UNPROVEN
+	// credential state. Omitted (0) states no deadline.
+	AuthTokenExpiresAtMs int64              `json:"authTokenExpiresAtMs,omitempty"`
+	DataPlaneTransport   string             `json:"dataPlaneTransport"`
+	DataPlaneServerName  string             `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM             string             `json:"tlsCaPem,omitempty"`
+	TLSCASHA256          string             `json:"tlsCaSha256,omitempty"`
+	MountPath            string             `json:"mountPath"`
+	Options              fskitAttachOptions `json:"options"`
 }
 
 type fskitEnsureAttachReply struct {
@@ -372,13 +376,18 @@ func (c *fsdControl) forceDetach(ref string) (jobID string, err error) {
 // cliAttachStatus is the slice of portablefsd's attach status the CLI reads
 // for `portablefs mounts` and `portablefs doctor`.
 type cliAttachStatus struct {
-	AttachRef string              `json:"attachRef"`
-	MountPath string              `json:"mountPath"`
-	VolumeID  string              `json:"volumeId"`
-	Branch    string              `json:"branch"`
-	State     string              `json:"state"`
-	LastError string              `json:"lastError"`
-	WriteBack *cliWriteBackStatus `json:"writeBack"`
+	AttachRef string `json:"attachRef"`
+	MountPath string `json:"mountPath"`
+	VolumeID  string `json:"volumeId"`
+	Branch    string `json:"branch"`
+	State     string `json:"state"`
+	LastError string `json:"lastError"`
+	// Credential names WHICH credential fault a degraded attach has, so the
+	// CLI can print (and --json can carry) the difference between a
+	// proven-dead credential and an UNTESTED one instead of flattening both
+	// into the word "degraded".
+	Credential string              `json:"credential"`
+	WriteBack  *cliWriteBackStatus `json:"writeBack"`
 }
 
 type cliWriteBackStatus struct {
@@ -530,17 +539,20 @@ func (c *fsdControl) unmountAttach(ref string) error {
 	return nil
 }
 
-func (c *fsdControl) setCredential(ref, token string) error {
-	return c.setCredentialWithMode(ref, token, false)
+func (c *fsdControl) setCredential(ref, token string, expiresAtMs int64) error {
+	return c.setCredentialWithMode(ref, token, expiresAtMs, false)
 }
 
-func (c *fsdControl) setCredentialIfPending(ref, token string) error {
-	return c.setCredentialWithMode(ref, token, true)
+func (c *fsdControl) setCredentialIfPending(ref, token string, expiresAtMs int64) error {
+	return c.setCredentialWithMode(ref, token, expiresAtMs, true)
 }
 
-func (c *fsdControl) setCredentialWithMode(ref, token string, onlyIfPending bool) error {
+// setCredentialWithMode pushes the credential AND the deadline its issuer
+// stated for it. The expiry is what bounds the daemon-side UNPROVEN state; a
+// zero states no deadline and preserves the pre-expiry behaviour exactly.
+func (c *fsdControl) setCredentialWithMode(ref, token string, expiresAtMs int64, onlyIfPending bool) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/credential",
-		map[string]any{"authToken": token, "onlyIfPending": onlyIfPending})
+		map[string]any{"authToken": token, "authTokenExpiresAtMs": expiresAtMs, "onlyIfPending": onlyIfPending})
 	if err != nil {
 		return err
 	}
@@ -566,7 +578,7 @@ func (c *fsdControl) unmountRecordedAttach(st *mountState) error {
 		if !validLeaseState(st.AccessLease) {
 			return fmt.Errorf("recorded access lease for attach %s is invalid", st.AttachRef)
 		}
-		if err := c.setCredentialIfPending(st.AttachRef, st.AccessLease.AccessToken); err != nil {
+		if err := c.setCredentialIfPending(st.AttachRef, st.AccessLease.AccessToken, st.AccessLease.ExpiresAtMs); err != nil {
 			return fmt.Errorf("reactivate attach %s with its recorded access lease: %w", st.AttachRef, err)
 		}
 	}

@@ -83,28 +83,39 @@ type AttachOptions struct {
 }
 
 type ensureAttachRequest struct {
-	AttachRef           string        `json:"attachRef,omitempty"`
-	VolumeID            string        `json:"volumeId"`
-	Branch              string        `json:"branch"`
-	AuthorityURL        string        `json:"authorityUrl"`
-	AuthToken           string        `json:"authToken"`
-	DataPlaneTransport  string        `json:"dataPlaneTransport"`
-	DataPlaneServerName string        `json:"dataPlaneServerName,omitempty"`
-	TLSCAPEM            string        `json:"tlsCaPem"`
-	TLSCASHA256         string        `json:"tlsCaSha256,omitempty"`
-	MountPath           string        `json:"mountPath"`
-	Options             AttachOptions `json:"options"`
+	AttachRef    string `json:"attachRef,omitempty"`
+	VolumeID     string `json:"volumeId"`
+	Branch       string `json:"branch"`
+	AuthorityURL string `json:"authorityUrl"`
+	AuthToken    string `json:"authToken"`
+	// AuthTokenExpiresAtMs is the access lease's own stated expiry for
+	// AuthToken (unix ms). Additive and OPTIONAL: an older CLI omits it, the
+	// zero value means "no stated deadline", and nothing hardens — a daemon
+	// must never start declaring credentials dead just because a newer field
+	// exists.
+	AuthTokenExpiresAtMs int64         `json:"authTokenExpiresAtMs,omitempty"`
+	DataPlaneTransport   string        `json:"dataPlaneTransport"`
+	DataPlaneServerName  string        `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM             string        `json:"tlsCaPem"`
+	TLSCASHA256          string        `json:"tlsCaSha256,omitempty"`
+	MountPath            string        `json:"mountPath"`
+	Options              AttachOptions `json:"options"`
 }
 
 type attachStatus struct {
-	AttachRef  string           `json:"attachRef"`
-	VolumeID   string           `json:"volumeId"`
-	Branch     string           `json:"branch"`
-	MountPath  string           `json:"mountPath"`
-	State      string           `json:"state"`
-	Prefetch   prefetchStatus   `json:"prefetch"`
-	Cache      cacheStatus      `json:"cache"`
-	LastError  string           `json:"lastError,omitempty"`
+	AttachRef string         `json:"attachRef"`
+	VolumeID  string         `json:"volumeId"`
+	Branch    string         `json:"branch"`
+	MountPath string         `json:"mountPath"`
+	State     string         `json:"state"`
+	Prefetch  prefetchStatus `json:"prefetch"`
+	Cache     cacheStatus    `json:"cache"`
+	LastError string         `json:"lastError,omitempty"`
+	// Credential names WHICH credential verdict is behind a degraded state,
+	// because "degraded" plus a prose lastError is not something a program can
+	// branch on and the two credential faults call for different repairs.
+	// Empty means no credential fault at all.
+	Credential string           `json:"credential,omitempty"`
 	VolumeName string           `json:"volumeName,omitempty"`
 	LocalDirs  []string         `json:"localDirs,omitempty"`
 	WriteBack  *writeBackStatus `json:"writeBack,omitempty"`
@@ -446,7 +457,7 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		// .portablefs/local-dirs. Active attaches keep their established
 		// routing table; ensure remains idempotent and only adds explicit
 		// grafts below.
-		if err := a.activateWithOptions(ctx, req.AuthToken, &req.Options); err != nil {
+		if err := a.activateWithOptions(ctx, req.AuthToken, req.AuthTokenExpiresAtMs, &req.Options); err != nil {
 			return a, false, err
 		}
 		// Ensure is idempotent and additive for grafts: re-attaching with
@@ -496,7 +507,7 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 	r.byRef[ref] = a
 	r.byKey[key] = a
 	r.mu.Unlock()
-	if err := a.activate(ctx, req.AuthToken); err != nil {
+	if err := a.activate(ctx, req.AuthToken, req.AuthTokenExpiresAtMs); err != nil {
 		r.mu.Lock()
 		delete(r.byRef, ref)
 		delete(r.byKey, key)
@@ -556,7 +567,7 @@ func (r *registry) get(ref string) *attach {
 // activate serializes credential-driven revival with every attach membership
 // mutation. Resolving the ref and publishing a live Volume therefore cannot
 // race an exact detach that is removing the same registry entry.
-func (r *registry) activate(ctx context.Context, ref, token string, onlyIfPending bool) (bool, bool, error) {
+func (r *registry) activate(ctx context.Context, ref, token string, expiresAtMs int64, onlyIfPending bool) (bool, bool, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
 	r.mu.RLock()
@@ -566,10 +577,10 @@ func (r *registry) activate(ctx context.Context, ref, token string, onlyIfPendin
 		return false, false, nil
 	}
 	if onlyIfPending {
-		activated, err := a.activateIfPending(ctx, token)
+		activated, err := a.activateIfPending(ctx, token, expiresAtMs)
 		return true, activated, err
 	}
-	return true, true, a.activate(ctx, token)
+	return true, true, a.activate(ctx, token, expiresAtMs)
 }
 
 func (r *registry) list() []*attach {
@@ -1206,6 +1217,13 @@ type attach struct {
 
 	credMu sync.RWMutex
 	token  string
+	// tokenExpiresAtMs is the access lease's OWN stated expiry for token
+	// (unix ms; 0 = the caller stated none). It travels with the credential
+	// so the mount can bound the UNPROVEN state: past this instant a
+	// credential no handshake ever accepted or refused hardens into the
+	// definite expired verdict instead of pending forever. Old CLIs send
+	// nothing, land on 0, and keep the pre-expiry behaviour exactly.
+	tokenExpiresAtMs int64
 
 	// lifeCtx scopes everything that must live for the whole ATTACH, not for
 	// the control request that happened to start it. `POST .../credential`
@@ -1249,17 +1267,23 @@ type attach struct {
 	// The identities differ for a create born under a delegation.
 	authorityItems         map[uint64]frontendItemIdentity
 	awaitingAuthorityItems map[uint64]struct{}
-	// reincarnatedAliases names retained hard-link aliases whose cached
+	// reincarnatedAliases maps each retained hard-link alias whose cached
 	// attributes were taken BEFORE a pathname reincarnation displaced their
-	// inode. The publisher that detected the reincarnation must reconcile them
-	// before its own reply leaves (see reconcileReincarnatedAliases). Guarded
-	// by mu.
-	reincarnatedAliases map[string]struct{}
-	handles             map[uint64]*handleRecord
-	localDirs           []string
-	localRoot           string
-	localFS             *confinedfs.Root
-	localVersions       map[string]uint64
+	// inode to its unit of reconciliation work. The publisher that detected the
+	// reincarnation must settle its OWN ticket before its reply leaves; see
+	// reincarnation.go for why the ownership is load-bearing. Guarded by mu.
+	reincarnatedAliases map[string]*aliasReconcileState
+	// reincarnationArmed/reincarnationOwner attribute newly created debt to the
+	// registration that created it. They are set only across a registration
+	// running under mu, so they need no lock of their own beyond mu itself, and
+	// they nest (see reincarnationOwnerScope).
+	reincarnationArmed bool
+	reincarnationOwner *reincarnationTicket
+	handles            map[uint64]*handleRecord
+	localDirs          []string
+	localRoot          string
+	localFS            *confinedfs.Root
+	localVersions      map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1289,7 +1313,7 @@ type attach struct {
 	// Test seam for deterministic frontend ordering tests; nil in production.
 	testLookupAfterVolume func(path string)
 	// Test seam for the secure kernel refresh syscall; nil in production.
-	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error)
+	testRefreshKernelFile  func(mount, path string, itemID uint64, size int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error)
 	testExactKernelRefresh func(context.Context, uint64) error
 	// testMutationAdmissionBarrier stands in, for tests, for the pre-lock
 	// admission park a real metadata or credit lane can impose. It exists to make
@@ -1404,6 +1428,7 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		stateDir:               stateDir,
 		identityEpoch:          1,
 		token:                  req.AuthToken,
+		tokenExpiresAtMs:       req.AuthTokenExpiresAtMs,
 		state:                  pfslocal.AttachStateAttached,
 		items:                  map[uint64]*itemRecord{},
 		paths:                  map[string]*itemRecord{},
@@ -1446,13 +1471,14 @@ func newRevivedAttach(
 		a.identityEpoch = identityEpoch
 	}
 	a.token = ""
+	a.tokenExpiresAtMs = 0
 	a.credentialPending = true
 	a.state = pfslocal.AttachStateDegraded
 	a.lastErr = "credentials required after daemon restart"
 	a.mu.Lock()
 	a.restoreItemsLocked(items)
 	if a.root == nil {
-		a.root = a.registerLocked("", syntheticRootAttr())
+		a.root = a.registerSyntheticRootLocked()
 	}
 	if a.root == nil {
 		a.mu.Unlock()
@@ -1495,22 +1521,23 @@ func (a *attach) persistedEntry() persistedAttachEntry {
 	}
 }
 
-func (a *attach) activate(ctx context.Context, tok string) error {
-	return a.activateWithOptions(ctx, tok, nil)
+func (a *attach) activate(ctx context.Context, tok string, expiresAtMs int64) error {
+	return a.activateWithOptions(ctx, tok, expiresAtMs, nil)
 }
 
-func (a *attach) activateIfPending(ctx context.Context, tok string) (bool, error) {
-	return a.activateWithOptionsMode(ctx, tok, nil, true)
+func (a *attach) activateIfPending(ctx context.Context, tok string, expiresAtMs int64) (bool, error) {
+	return a.activateWithOptionsMode(ctx, tok, expiresAtMs, nil, true)
 }
 
-func (a *attach) activateWithOptions(ctx context.Context, tok string, options *AttachOptions) error {
-	_, err := a.activateWithOptionsMode(ctx, tok, options, false)
+func (a *attach) activateWithOptions(ctx context.Context, tok string, expiresAtMs int64, options *AttachOptions) error {
+	_, err := a.activateWithOptionsMode(ctx, tok, expiresAtMs, options, false)
 	return err
 }
 
 func (a *attach) activateWithOptionsMode(
 	ctx context.Context,
 	tok string,
+	expiresAtMs int64,
 	options *AttachOptions,
 	onlyIfPending bool,
 ) (bool, error) {
@@ -1533,7 +1560,7 @@ func (a *attach) activateWithOptionsMode(
 	if onlyIfPending && !credentialPending {
 		return false, nil
 	}
-	a.setCredential(tok)
+	a.setCredential(tok, expiresAtMs)
 	if active {
 		// A live volume that had latched a credential verdict must re-arm its
 		// reachability prober: the verdict was about the PREVIOUS credential,
@@ -1653,10 +1680,10 @@ func (a *attach) start(ctx context.Context) error {
 		TLSConfig: tlsCfg,
 		Owner:     a.ownerID(),
 		VolumeID:  a.volumeID,
-		CredentialSource: func() string {
+		CredentialSource: func() (string, int64) {
 			a.credMu.RLock()
 			defer a.credMu.RUnlock()
-			return a.token
+			return a.token, a.tokenExpiresAtMs
 		},
 		Branch:            a.branch,
 		WALDir:            filepath.Join(a.stateDir, "wal", a.storageID),
@@ -1808,7 +1835,8 @@ func (a *attach) start(ctx context.Context) error {
 	a.localFS = localFS
 	a.vol = vol
 	a.eventClient = eventClient
-	a.root = a.registerLocked("", rootAttr)
+	var rootTicket *reincarnationTicket
+	a.root, rootTicket = a.registerOwnedLocked("", rootAttr)
 	aliasCounts := map[uint64]int{}
 	for _, rec := range a.paths {
 		if rec != nil && rec.path != "" && rec.state != nil && rec.state.AuthIno() {
@@ -1828,6 +1856,27 @@ func (a *attach) start(ctx context.Context) error {
 		a.publishNamespaceInvalidationLocked(p, 0, 0)
 	}
 	a.mu.Unlock()
+	// Activation republishes the root against the real authority inode, which
+	// makes it a publisher that can displace a restored pathname. It settles its
+	// own ticket here, with a.mu released and the volume already installed, on
+	// the same footing as every frontend publisher — an activation that could
+	// not reconcile is one whose first served reply would carry the impossible
+	// pair, so it fails the activation instead.
+	if eno := rootTicket.settle(a.lifetime(), vol); eno != 0 {
+		a.mu.Lock()
+		a.vol = nil
+		a.eventClient = nil
+		if openedLocalFS {
+			a.localFS = nil
+		}
+		a.mu.Unlock()
+		if openedLocalFS {
+			_ = localFS.Close()
+		}
+		_ = eventClient.Close()
+		_ = vol.Close()
+		return fmt.Errorf("reconcile retained aliases of a reincarnated root: errno %d", eno)
+	}
 	if err := a.flushBindingDeltaError(); err != nil {
 		a.mu.Lock()
 		a.vol = nil
@@ -1850,9 +1899,10 @@ func (a *attach) start(ctx context.Context) error {
 	return nil
 }
 
-func (a *attach) setCredential(tok string) {
+func (a *attach) setCredential(tok string, expiresAtMs int64) {
 	a.credMu.Lock()
 	a.token = tok
+	a.tokenExpiresAtMs = expiresAtMs
 	a.credMu.Unlock()
 	a.mu.RLock()
 	vol := a.vol
@@ -2133,10 +2183,23 @@ func newWriteBackStatus(st writeback.Status) *writeBackStatus {
 	return wb
 }
 
+// credentialStateRejected / credentialStatePendingVerification are the two
+// DISJOINT credential faults an attach can report. They are distinct words
+// because they are distinct facts with distinct repairs: rejected is a
+// proven-dead credential (the authority answered "no" -> log in again),
+// pending-verification is an UNTESTED one (the authority never answered ->
+// look at the router). Overloading "expired" for both told operators to fix
+// the wrong thing.
+const (
+	credentialStateRejected            = "rejected"
+	credentialStatePendingVerification = "pending-verification"
+)
+
 func (a *attach) status() attachStatus {
 	a.mu.RLock()
 	state := a.currentStateLocked()
 	lastErr := a.lastErr
+	credential := ""
 	volumeName := a.volumeName
 	vol := a.vol
 	attrEntries := 0
@@ -2162,10 +2225,33 @@ func (a *attach) status() attachStatus {
 		// hides the one action that works.
 		if vol.CredentialExpired() {
 			state = pfslocal.AttachStateDegraded
+			credential = credentialStateRejected
 			lastErr = "access credential rejected by a REACHABLE authority " +
 				"(lease expired or revoked); run `portablefs login` and remount. " +
 				"Unshipped write-back is retained locally and can be parked as a " +
 				"durable recovery job with `portablefs umount --force`"
+		} else if vol.CredentialUnproven() {
+			// AN UNTESTED CREDENTIAL IS NOT A HEALTHY ONE. The mount has
+			// offered this credential and the authority has neither accepted
+			// nor refused it — the handshake is being torn down before the ack
+			// byte ever arrives (a router rolling, an authority shutting down
+			// mid-handshake). That produces no ack to latch and no transport
+			// failure to count, so nothing else in the mount says a word about
+			// it, and status used to report a perfectly live attach.
+			//
+			// It is reported SEPARATELY from rejection on purpose. Rejection
+			// means the authority answered "no" and only login + remount can
+			// change it. This means nobody answered at all, and telling an
+			// operator to log in again would send them to repair the one thing
+			// that is not known to be broken.
+			state = pfslocal.AttachStateDegraded
+			credential = credentialStatePendingVerification
+			lastErr = "access credential is UNPROVEN: the authority has neither " +
+				"accepted nor refused it (the handshake is being torn down before " +
+				"the ack), so this mount is NOT known healthy. Verification keeps " +
+				"retrying until the credential's own expiry, after which it hardens " +
+				"to rejected; check the data-plane router/authority rather than " +
+				"re-authenticating"
 		}
 	}
 	a.mu.RLock()
@@ -2181,10 +2267,11 @@ func (a *attach) status() attachStatus {
 	return attachStatus{
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
-		Prefetch:  prefetchStatus{Done: pf.Done, EntriesWalked: pf.Entries},
-		Cache:     cacheStatus{AttrEntries: attrEntries, DiskBytes: diskBytes, DiskCapBytes: diskCap},
-		LocalDirs: localDirs,
-		WriteBack: wb,
+		Credential: credential,
+		Prefetch:   prefetchStatus{Done: pf.Done, EntriesWalked: pf.Entries},
+		Cache:      cacheStatus{AttrEntries: attrEntries, DiskBytes: diskBytes, DiskCapBytes: diskCap},
+		LocalDirs:  localDirs,
+		WriteBack:  wb,
 	}
 }
 
@@ -2334,6 +2421,22 @@ func (a *attach) persistStateOrEIO(context string) int32 {
 		return darwinEIO
 	}
 	return 0
+}
+
+// registerSyntheticRootLocked binds the placeholder root of an attach that has
+// no authority yet (pre-activation restore, or a resolve that arrives before
+// credentials do).
+//
+// It is a named call site rather than an inline registerLocked because it is the
+// one publisher that deliberately settles NO reconciliation ticket, and that
+// deserves a stated reason rather than an omission: the root's alias set is
+// exactly its own name, and detachReincarnatedPathLocked drops the detached name
+// from that set BEFORE it records debt, so a root reincarnation has no retained
+// alias to owe anything to. There is also no authority to ask at this point,
+// which is why the reason has to be structural and not "we will refresh later".
+// Callers hold a.mu.
+func (a *attach) registerSyntheticRootLocked() *itemRecord {
+	return a.registerLocked("", syntheticRootAttr())
 }
 
 func (a *attach) registerLocked(p string, attr fsproto.Attr) *itemRecord {
@@ -2507,7 +2610,7 @@ func (a *attach) registerWithItemLocked(
 			// inodes into one frontend object. Detach only this name, retain
 			// the old Item/NodeState for its aliases and kernel references,
 			// then register the replacement as a fresh identity.
-			a.detachReincarnatedPathLocked(p, rec)
+			a.detachReincarnatedPathLocked(p, rec, detachReplaced)
 			return a.registerWithItemLocked(p, attr, ino, authIno, reuseByItemID, graft)
 		}
 
@@ -2579,29 +2682,38 @@ func (a *attach) registerWithItemLocked(
 	return rec
 }
 
+// detachCause says WHY a pathname is being separated from its identity, because
+// the two causes owe the retained aliases completely different things.
+type detachCause int
+
+const (
+	// detachReplaced: a peer atomically rebound this directory entry to a
+	// DIFFERENT inode. The displaced inode survives behind its other links, but
+	// its LINK COUNT just changed, so every retained alias is now carrying an
+	// attribute snapshot that predates the replacement. That is real debt.
+	detachReplaced detachCause = iota
+	// detachReprovisioned: the path's ROUTING OWNER changed under a new graft
+	// rule set. Item provenance is immutable, so the published Item is retired
+	// and the next resolution mints a fresh one — but the underlying inode was
+	// not touched at all. Its link count is what it was, and every retained
+	// alias's attribute snapshot is exactly as valid as it was a moment ago, so
+	// there is nothing to reconcile and no debt to record.
+	//
+	// What DID change is which frontend identity names the path, and that is
+	// already published by the caller's own namespace invalidation for every
+	// changed path (addLocalDirs). Recording refresh debt here would not fix
+	// anything; it would only mint obligations that no publisher owns, on a
+	// control-plane call that has no reply to hold back.
+	detachReprovisioned
+)
+
 // detachReincarnatedPathLocked removes one pathname from its old identity
 // without reclaiming that identity. The authority may still expose the inode
 // through another hard-link alias, and FSKit may still hold the published Item
 // or an open handle. If the detached record was canonical, prefer a surviving
 // alias as the canonical path; with no alias, retain the detached record until
 // the kernel's explicit Reclaim releases the old Item.
-// takeReincarnatedAliases drains the reconciliation debt recorded by
-// detachReincarnatedPathLocked.
-func (a *attach) takeReincarnatedAliases() []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.reincarnatedAliases) == 0 {
-		return nil
-	}
-	aliases := make([]string, 0, len(a.reincarnatedAliases))
-	for alias := range a.reincarnatedAliases {
-		aliases = append(aliases, alias)
-	}
-	a.reincarnatedAliases = nil
-	return aliases
-}
-
-func (a *attach) detachReincarnatedPathLocked(p string, rec *itemRecord) {
+func (a *attach) detachReincarnatedPathLocked(p string, rec *itemRecord, cause detachCause) {
 	if rec == nil || a.paths[p] != rec {
 		return
 	}
@@ -2644,13 +2756,13 @@ func (a *attach) detachReincarnatedPathLocked(p string, rec *itemRecord) {
 	// still claiming Nlink=2 — a lookup published a post-replacement identity
 	// beside a pre-replacement alias.
 	//
-	// Record the debt; the publisher that detected the reincarnation settles it
-	// BEFORE its reply leaves (see reconcileReincarnatedAliases).
-	for aliasPath := range a.itemAliases[rec.item.ItemID] {
-		if a.reincarnatedAliases == nil {
-			a.reincarnatedAliases = map[string]struct{}{}
+	// Record the debt against the registration that created it; that publisher
+	// settles its OWN ticket BEFORE its reply leaves (see reincarnation.go).
+	// Only a genuine replacement owes anything — see detachCause.
+	if cause == detachReplaced {
+		for aliasPath := range a.itemAliases[rec.item.ItemID] {
+			a.recordReincarnationDebtLocked(aliasPath)
 		}
-		a.reincarnatedAliases[aliasPath] = struct{}{}
 	}
 	if len(a.itemAliases[rec.item.ItemID]) == 0 {
 		delete(a.awaitingAuthorityItems, rec.item.ItemID)

@@ -353,15 +353,32 @@ func (c *frontendConn) replyWithPublication(
 
 func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 	c.publicationMu.Lock()
-	defer c.publicationMu.Unlock()
 	entry := c.operations[operationID]
 	if c.publicationClosed ||
 		entry == nil ||
 		entry.op == nil ||
 		entry.ackPending {
+		c.publicationMu.Unlock()
 		return false
 	}
 	entry.replyExposed = true
+	op := entry.op
+	c.publicationMu.Unlock()
+	// PUBLISH THE OBLIGATION TO THE HANDOFF GATE BEFORE THE BYTES GO OUT.
+	//
+	// replyWithPublication calls this and only then writes the frame, so the
+	// gate learns that this logical operation owes an acknowledgement while the
+	// daemon can still decide what a delegation handoff is allowed to do about
+	// it. Recording it after the write would leave a window in which the reply
+	// is on the wire and the barrier does not know — which is precisely the
+	// state finding 5 describes, reached by a different route.
+	//
+	// The gate lock is taken with publicationMu RELEASED. That direction is the
+	// established one (beginLogicalOperation drops publicationMu before every
+	// reserve/activate call), and nothing under frontendGateMu ever reaches
+	// back into a connection's publication table, so the two locks stay
+	// unordered with respect to each other rather than newly nested.
+	op.attach.notePublicationExposed(op)
 	return true
 }
 
@@ -387,6 +404,13 @@ func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
 	c.publicationMu.Unlock()
 	if finish {
 		entry.op.attach.finishFrontendOperation(entry.op)
+		// The acknowledgement is the ONE moment at which the daemon knows the
+		// frontend has installed or discarded this operation's published state.
+		// If a delegation handoff was permitted to cross that state, this is
+		// therefore the earliest instant at which the repair can be issued —
+		// and issuing it any later would leave the stale install unchallenged
+		// for exactly as long as the delay.
+		entry.op.attach.dischargeFrontendPublicationFence(entry.op)
 	}
 	return true
 }
@@ -406,6 +430,11 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 	c.publicationMu.Unlock()
 	if finish {
 		entry.op.attach.finishFrontendOperation(entry.op)
+		// The other retirement order: the acknowledgement arrived while a
+		// request of the same callback was still running, so the operation is
+		// only now retired. The crossing debt is discharged from whichever of
+		// the two paths actually retires the operation, never from both.
+		entry.op.attach.dischargeFrontendPublicationFence(entry.op)
 	}
 }
 

@@ -500,8 +500,8 @@ func TestAccessLeaseRenewAndRelease(t *testing.T) {
 	if cur.ControlSeq != "8" || cur.AccessToken != "lease_tok_rotated" || cur.ExpiresAtMs != 1700001200000 {
 		t.Fatalf("renewed lease = %+v", cur)
 	}
-	if tokens.get() != "lease_tok_rotated" {
-		t.Fatalf("rotated token must reach the token source: %q", tokens.get())
+	if tok, _ := tokens.get(); tok != "lease_tok_rotated" {
+		t.Fatalf("rotated token must reach the token source: %q", tokens.token)
 	}
 	if len(persisted) != 1 || persisted[0].ControlSeq != "8" {
 		t.Fatalf("renewal must persist the new lease slice: %+v", persisted)
@@ -818,8 +818,8 @@ func TestLeaseKeeperRevokedStaysTerminal(t *testing.T) {
 			if created != 0 {
 				t.Fatalf("fail-closed must never mint a replacement lease (created %d)", created)
 			}
-			if tokens.get() != "" {
-				t.Fatalf("terminal refusal must not install a replacement token: %q", tokens.get())
+			if tok, _ := tokens.get(); tok != "" {
+				t.Fatalf("terminal refusal must not install a replacement token: %q", tokens.token)
 			}
 			if cur := k.snapshot(); cur.AccessLeaseID != "pfal_1" || cur.AccessToken != "tok_1" {
 				t.Fatalf("terminal refusal must preserve the original lease, got %+v", cur)
@@ -934,7 +934,7 @@ func TestAccessLeaseRenewFailureStopsOriginalLease(t *testing.T) {
 	if cur.AccessLeaseID != "pfal_1" || cur.AccessToken != "dead_tok" || !k.terminal {
 		t.Fatalf("keeper must stop the original lease: %+v terminal=%v", cur, k.terminal)
 	}
-	if tokens.get() != "" {
-		t.Fatalf("replacement token must never be installed: %q", tokens.get())
+	if tok, _ := tokens.get(); tok != "" {
+		t.Fatalf("replacement token must never be installed: %q", tokens.token)
 	}
 }

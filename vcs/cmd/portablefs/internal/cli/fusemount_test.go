@@ -76,11 +76,11 @@ func TestSessionTokenSourceOnlyAdvancesExplicitly(t *testing.T) {
 		token:       "tok_old",
 		expiresAtMs: time.Now().UnixMilli() - 1,
 	}
-	if got := src.get(); got != "tok_old" {
+	if got, _ := src.get(); got != "tok_old" {
 		t.Fatalf("expired token must not trigger hidden resolution: %q", got)
 	}
 	src.setToken("tok_renewed", time.Now().Add(time.Hour).UnixMilli())
-	if got := src.get(); got != "tok_renewed" {
+	if got, _ := src.get(); got != "tok_renewed" {
 		t.Fatalf("explicit lease renewal token = %q", got)
 	}
 }
@@ -386,7 +386,7 @@ func TestFsdControlAttachRoundTrip(t *testing.T) {
 	if len(gotAttach.Options.LocalDirs) != 1 || !gotAttach.Options.VolumeLocalDirs {
 		t.Fatalf("attach options did not travel: %+v", gotAttach.Options)
 	}
-	if err := ctl.setCredential(ref, "tok-rotated"); err != nil {
+	if err := ctl.setCredential(ref, "tok-rotated", 0); err != nil {
 		t.Fatalf("setCredential: %v", err)
 	}
 	if credentialToken != "tok-rotated" {

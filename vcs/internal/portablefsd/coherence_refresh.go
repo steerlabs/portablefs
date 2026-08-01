@@ -216,7 +216,16 @@ func (a *attach) refreshKernelItemStateComposedModeContext(
 	case refreshSampleRetry:
 		return false
 	}
-	applyOutcome, _ := a.applyKernelRefresh(mount, p, rec, size)
+	// rec.attr is the composed size this pass snapshotted BEFORE it sampled, so
+	// it is the honest "nothing has been published for this item since I started"
+	// baseline the arm re-checks under a.mu. Taking it from the snapshot rather
+	// than re-reading the registry here is deliberate: a re-read would only prove
+	// that nothing changed between two adjacent instructions.
+	applyOutcome, _ := a.applyKernelRefresh(mount, p, rec, size, refreshApplyFence{
+		observedSize: rec.attr.Size,
+		version:      version,
+		generation:   generation,
+	})
 	if applyOutcome != kernelRefreshApplied {
 		if applyOutcome == kernelRefreshRetry {
 			return false
@@ -334,7 +343,67 @@ func fskitItemID(itemID uint64) (uint64, bool) {
 	return itemID + 1, true
 }
 
-func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64) (kernelRefreshOutcome, error) {
+// refreshApplyFence is what one refresh pass must still be able to PROVE at the
+// instant it opens its provenance window, and it is the answer to a sample that
+// has quietly gone stale underneath the pass carrying it.
+//
+// A refresh is three separable steps — snapshot the item, sample the authority,
+// push the sample into the kernel — and an acknowledged local write can land
+// between any two of them. The push step is not a read: it installs the sampled
+// size as the daemon's COMPOSED view (see armRefreshWindowLocked for why it must),
+// so a pass that pushes a superseded sample overwrites newer state with older
+// state and then answers the kernel from the result.
+//
+// The fence carries the two independent proofs that the sample has not been
+// superseded, and both are checked, because each catches an interleaving the
+// other cannot:
+//
+//   - observedSize is the composed size the pass snapshotted BEFORE it sampled.
+//     Re-reading it under a.mu at the moment the window opens turns "nothing was
+//     published for this item across the whole pass" into an atomic check: any
+//     install — a write's post-op attributes, a getattr, an alias reconciliation —
+//     goes through a.mu and moves this value. This is the one that closes the
+//     race, because it is taken under the same lock that opens the window.
+//   - version/generation are the authority sample's own coordinates. They catch
+//     the case observedSize cannot: a write ACKNOWLEDGED and published before
+//     this pass ever snapshotted, whose composed size is therefore stable at N
+//     across the pass while the sample still says S. refreshLocalSample already
+//     fences the sample against the version cache at sample time; this re-reads
+//     that floor and refuses a sample the cache has since moved past.
+//
+// A zero generation is a delegated-overlay or graft sample, which has no
+// authority version to order against. Its composed view is local by
+// construction — it already contains every acknowledged local write — so
+// observedSize is the whole proof there, and it is sufficient: the only writer
+// that can move such an item is this daemon, through a.mu.
+type refreshApplyFence struct {
+	observedSize int64
+	version      uint64
+	generation   uint64
+}
+
+// errRefreshSampleSuperseded is a refresh pass refusing to push a sample it can
+// no longer prove current. It is deliberately an ordinary retry outcome and not
+// a failure: the item is fine, this pass's view of it is not, and the caller's
+// convergence loop re-samples against the state that actually exists.
+type errRefreshSampleSuperseded struct {
+	path   string
+	reason string
+}
+
+func (e *errRefreshSampleSuperseded) Error() string {
+	return fmt.Sprintf(
+		"portablefsd: kernel refresh sample for %q was superseded before it could "+
+			"be applied (%s)", e.path, e.reason,
+	)
+}
+
+func (a *attach) applyKernelRefresh(
+	mount, p string,
+	rec *itemRecord,
+	size int64,
+	fence refreshApplyFence,
+) (kernelRefreshOutcome, error) {
 	expectedKernelItemID, ok := fskitItemID(rec.item.ItemID)
 	if !ok {
 		return kernelRefreshRetry, fmt.Errorf(
@@ -342,12 +411,39 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 			rec.item.ItemID,
 		)
 	}
-	a.mu.Lock()
-	if current := a.items[rec.item.ItemID]; current != nil &&
-		current.item.ItemGeneration == rec.item.ItemGeneration {
-		current.attr.Size = size
+	// THE CHEAP HALF OF THE FENCE, PAID BEFORE ANY SYSCALL.
+	//
+	// The version floor is read without a.mu — the version cache has its own
+	// lock and nothing in it ever reaches back for a.mu, and nesting the two
+	// here would invent a lock order the daemon does not otherwise have. It is
+	// a "happened before" proof, not a race check: a publication that lands
+	// after this read is caught by the observedSize arm below, which is taken
+	// under the same lock that opens the window.
+	if fence.generation != 0 {
+		if vol, eno := a.volOrErr(); eno == 0 && vol != nil {
+			gen, ver := vol.VersionCache.GenAndVersion(p)
+			if gen != fence.generation || ver > fence.version {
+				return kernelRefreshRetry, &errRefreshSampleSuperseded{
+					path: p,
+					reason: fmt.Sprintf(
+						"sampled generation/version %d/%d, cache now at %d/%d",
+						fence.generation, fence.version, gen, ver,
+					),
+				}
+			}
+		}
 	}
-	a.mu.Unlock()
+	// The composed half of the fence, checked once here as well as inside the
+	// arm. The arm's copy is the one that closes the race — it is taken under
+	// the lock that opens the window — but a pass whose sample is ALREADY known
+	// to be superseded has no business opening the file, stat-ing it, or
+	// sweeping its pages, so it stops here before touching the kernel at all.
+	a.mu.RLock()
+	preflight := refreshSampleSupersededLocked(a.items[rec.item.ItemID], p, rec, fence)
+	a.mu.RUnlock()
+	if preflight != nil {
+		return kernelRefreshRetry, preflight
+	}
 	refresh := refreshKernelFile
 	if a.testRefreshKernelFile != nil {
 		refresh = a.testRefreshKernelFile
@@ -365,22 +461,13 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 	// unix.Ftruncate, and disarms it the instant that call returns. One
 	// ftruncate, one window; no ftruncate, no window.
 	var armedSeq uint64
-	arm := func() func() {
-		a.mu.Lock()
-		if a.expectedTruncates == nil {
-			a.expectedTruncates = map[string]expectedTruncate{}
+	arm := func() (func(), error) {
+		disarm, seq, err := a.armRefreshWindowLocked(p, rec, size, fence)
+		if err != nil {
+			return nil, err
 		}
-		a.expectedTruncateSeq++
-		note := expectedTruncate{
-			itemID: rec.item.ItemID, size: size,
-			pinned:   true,
-			deadline: time.Now().Add(truncateNoteTTL),
-			seq:      a.expectedTruncateSeq,
-		}
-		armedSeq = note.seq
-		a.expectedTruncates[p] = note
-		a.mu.Unlock()
-		return func() { a.retireExpectedTruncate(p, note.seq) }
+		armedSeq = seq
+		return disarm, nil
 	}
 	outcome, err := refresh(mount, p, expectedKernelItemID, size, arm)
 	// Belt and braces: the refresh disarms its own window on every path, but a
@@ -403,6 +490,95 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 	return kernelRefreshApplied, nil
 }
 
+// armRefreshWindowLocked opens one provenance window and installs the sampled
+// size as the daemon's composed view, ATOMICALLY, under a.mu.
+//
+// ── WHY THE COMPOSED WRITE BELONGS HERE AND NOWHERE ELSE ────────────────────
+//
+// The write is not incidental bookkeeping, it is half the mechanism. The window
+// predicate (refreshWindowClassLocked) decides Internal-versus-Ambiguous by
+// asking whether the item's composed size still equals the size the window
+// names, and the Internal arm answers the upcall FROM the composed attributes.
+// Without the write, a refresh whose whole purpose is to install a size the
+// registry does not yet hold would classify its own upcall as ambiguous, refuse
+// it, and never converge.
+//
+// It used to run unconditionally, at the top of applyKernelRefresh, several
+// steps before the window opened. That made it a FABRICATION: an acknowledged
+// local write that had already published a longer composed size was silently
+// rewritten back to the stale sample, which simultaneously (a) told the kernel
+// the file was shorter than it is and (b) disarmed the ambiguity guard whose
+// entire job is to notice that exact event.
+//
+// So the write is now conditional on the fence and taken under the same lock
+// hold that installs the marker. Either this pass can still prove its sample is
+// current — in which case installing it is an honest observation and the window
+// it opens is honestly described — or it cannot, in which case there is no
+// window, no ftruncate, and the caller re-samples.
+// refreshSampleSupersededLocked names, in one place, everything that makes a
+// refresh pass's sample no longer a statement about the object in front of it.
+// Caller holds a.mu (either mode).
+func refreshSampleSupersededLocked(
+	current *itemRecord,
+	p string,
+	rec *itemRecord,
+	fence refreshApplyFence,
+) error {
+	switch {
+	case current == nil:
+		return &errRefreshSampleSuperseded{path: p, reason: "item is no longer registered"}
+	case current.item.ItemGeneration != rec.item.ItemGeneration:
+		return &errRefreshSampleSuperseded{
+			path: p,
+			reason: fmt.Sprintf(
+				"item generation moved %d -> %d",
+				rec.item.ItemGeneration, current.item.ItemGeneration,
+			),
+		}
+	case current.path != p:
+		return &errRefreshSampleSuperseded{
+			path:   p,
+			reason: fmt.Sprintf("item now bound to %q", current.path),
+		}
+	case current.attr.Size != fence.observedSize:
+		return &errRefreshSampleSuperseded{
+			path: p,
+			reason: fmt.Sprintf(
+				"composed size moved %d -> %d while the sample was in flight",
+				fence.observedSize, current.attr.Size,
+			),
+		}
+	}
+	return nil
+}
+
+func (a *attach) armRefreshWindowLocked(
+	p string,
+	rec *itemRecord,
+	size int64,
+	fence refreshApplyFence,
+) (func(), uint64, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	current := a.items[rec.item.ItemID]
+	if err := refreshSampleSupersededLocked(current, p, rec, fence); err != nil {
+		return nil, 0, err
+	}
+	if a.expectedTruncates == nil {
+		a.expectedTruncates = map[string]expectedTruncate{}
+	}
+	a.expectedTruncateSeq++
+	note := expectedTruncate{
+		itemID: rec.item.ItemID, size: size,
+		pinned:   true,
+		deadline: time.Now().Add(truncateNoteTTL),
+		seq:      a.expectedTruncateSeq,
+	}
+	a.expectedTruncates[p] = note
+	current.attr.Size = size
+	return func() { a.retireExpectedTruncate(p, note.seq) }, note.seq, nil
+}
+
 type frontendOperation struct {
 	attach       *attach
 	paths        []string
@@ -411,6 +587,44 @@ type frontendOperation struct {
 	participants int
 	suspended    int
 	completed    bool
+	// published records that at least one reply belonging to this logical
+	// operation has been WRITTEN with PublicationAckRequired.
+	//
+	// ── EXPOSURE IS THE OBLIGATION; PARTICIPANT LIVENESS IS NOT ─────────────
+	//
+	// Everything else about a logical operation's membership of the active
+	// publication set is derived from its participants: it activates when a
+	// request enters, it retracts when every request has suspended or retired.
+	// That derivation used participant liveness as a PROXY for "this operation
+	// still owes the kernel-coherence barrier something", and the proxy is
+	// simply false once a reply is on the wire. The daemon's own side of a
+	// publication ends when the bytes are written; the obligation — that the
+	// frontend has installed or discarded the state those bytes describe —
+	// begins there and is discharged only by the PublicationAck, or by the
+	// connection dying (which resolves it terminally, failing coherence
+	// closed).
+	//
+	// So exposure PINS the operation into the active set, and the pin is
+	// independent of whether any request is still running. Two doors were open
+	// before it existed, and a delegation handoff walked through both:
+	//
+	//	1. the ALL-SUSPENDED RETRACTION. A sibling replies and retires, the
+	//	   initiator suspends for its own release, and the operation now has
+	//	   participants == suspended — so it was retracted from the active set
+	//	   and stopped being a blocker ENTIRELY. The handoff then completed
+	//	   instantly and silently, with the sibling's reply still in flight.
+	//	2. the initiator's own-operation exception in publicationBlockersLocked
+	//	   (see there), which reached the same state by the other route when
+	//	   the release goroutine ran before the initiator suspended —
+	//	   prepareReleaseLocked spawns finishRelease BEFORE its caller reaches
+	//	   OnReleaseWait, so that ordering is ordinary, not exotic.
+	published bool
+	// fenced names the delegation scopes a handoff was permitted to cross
+	// while this operation still owed an acknowledgement. See
+	// publicationBlockersLocked and dischargeFrontendPublicationFence: a
+	// crossing is recorded, never forgotten, and repaired the instant the
+	// acknowledgement lands.
+	fenced []string
 }
 
 // ── THE PUBLICATION SETTLE VERDICT ──────────────────────────────────────────
@@ -436,6 +650,14 @@ type frontendOperation struct {
 // later request in that subtree blocked in beginFrontendPathsAtEpochContext.
 // The subtree was dead until remount. Live shape: `mkdir d; touch d/f;
 // rm d/f; rmdir d`, 100% reproducible.
+//
+// This bound applies to a wait that has a possible resolution: a FOREIGN
+// operation's acknowledgement is not held up by this release, so it can and
+// usually does arrive. The one case where the acknowledgement is provably
+// unreachable — the release's OWN callback owes it — is not bounded here at
+// all, because bounding it would only choose how long to wait before failing
+// deterministically. It is handled by the crossing fence instead; see
+// publicationBlockersLocked and dischargeFrontendPublicationFence.
 //
 // The window is measured from PROGRESS, not from the start of the wait, so it
 // cannot fire on a busy-but-advancing gate: every operation that leaves the set
@@ -548,6 +770,137 @@ func (a *attach) retractFromPublicationSetLocked(op *frontendOperation) {
 	}
 	delete(a.frontendActive, op)
 	a.frontendGateProgress++
+}
+
+// retractIdleOperationLocked applies the ONE rule by which a live logical
+// operation leaves the active publication set without being finished: every
+// one of its requests is suspended, so none of them can publish anything and a
+// handoff has nothing to wait for.
+//
+// It is a single function because the rule has one exception and that
+// exception must not be re-derived at each of the four call sites that used to
+// spell the predicate out (suspendFrontendParticipant,
+// joinFrontendOperationSuspended, finishFrontendParticipant and the resume half
+// of suspendFrontendOperation). The exception is frontendOperation.published:
+// an operation that has already WRITTEN an acknowledgement-required reply owes
+// the kernel-coherence barrier a settlement that no amount of suspending can
+// discharge, so "nobody is running" is not the same statement as "nothing is
+// outstanding". Retracting it there dropped a real, unsettled publication out
+// of the barrier and let a delegation handoff cross it silently.
+//
+// Caller holds frontendGateMu. Returns whether the operation was retracted.
+func (a *attach) retractIdleOperationLocked(op *frontendOperation) bool {
+	if op.completed || !op.gateActive || op.published {
+		return false
+	}
+	if op.participants <= 0 || op.suspended != op.participants {
+		return false
+	}
+	a.retractFromPublicationSetLocked(op)
+	op.gateActive = false
+	return true
+}
+
+// notePublicationExposed records that a reply belonging to op has been written
+// with PublicationAckRequired, and pins op into the active publication set for
+// the whole life of that obligation.
+//
+// It is called from frontendConn.replyWithPublication BEFORE the bytes reach
+// the socket, which is the only order that works: once the reply is on the wire
+// the daemon has already lost the ability to decide whether a handoff may cross
+// it, so the pin has to be installed while the decision is still the daemon's
+// to make.
+//
+// The pin re-enters the set even for an operation whose requests are all
+// suspended. That looks like it contradicts the activation protocol's liveness
+// rule ("a handoff never waits on a suspended participant"), and it does not:
+// that rule is about REQUESTS, which can be made to wait and therefore must
+// never be waited on while they hold a mirror. This is about a REPLY that has
+// already left, which no lock can be holding and which no request can be asked
+// to retract.
+func (a *attach) notePublicationExposed(op *frontendOperation) {
+	if op == nil || op.attach != a {
+		return
+	}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	if !op.completed && !op.published {
+		op.published = true
+		if !op.gateActive {
+			a.frontendActive[op] = struct{}{}
+			op.gateActive = true
+		}
+	}
+	a.frontendGateCond.Broadcast()
+	a.frontendGateMu.Unlock()
+}
+
+// dischargeFrontendPublicationFence repairs every publication a delegation
+// handoff was permitted to cross while this operation still owed an
+// acknowledgement, at the exact moment that acknowledgement lands.
+//
+// ── WHY A CROSSING IS REPAIRED RATHER THAN PREVENTED ────────────────────────
+//
+// When the operation that owes the acknowledgement is the RELEASE'S OWN, the
+// obligation cannot be waited for. The acknowledgement is one message the
+// extension sends after its whole framework callback returns; that callback
+// cannot return until the request parked inside this release is answered; and
+// that request is not answered until the release reaches a verdict. Blocking
+// closes that cycle deterministically — not racily — for a shape that is
+// completely ordinary: FSKit's removeItem callback issues a publishing
+// getattr and THEN the remove that needs the delegation transition, so `rm`
+// inside a delegated subtree would fail every single time.
+//
+// What the daemon can do is the same thing it does for every other view it
+// discovers to be behind: state it. The kernel installs the crossed reply when
+// the callback returns; the acknowledgement that says so arrives immediately
+// after; and this publishes, for exactly the paths that operation published,
+// the ordinary invalidation a peer change would have published. The stale
+// install is superseded by the frontend's normal remote-change refresh path
+// instead of surviving forever.
+//
+// Forever is the real defect being fixed. Without this, the peer's own
+// invalidation is delivered and APPLIED BEFORE the kernel install, so the
+// refresh lands first and the stale value overwrites it, and nothing ever
+// contradicts it again. With it, the divergence window is one acknowledgement
+// round trip on a live socket — the same window every remote change already
+// has — and it always closes.
+func (a *attach) dischargeFrontendPublicationFence(op *frontendOperation) {
+	if op == nil || op.attach != a {
+		return
+	}
+	a.frontendGateMu.Lock()
+	fenced := op.fenced
+	op.fenced = nil
+	var paths []string
+	if len(fenced) != 0 {
+		paths = append(paths, op.paths...)
+		if len(paths) == 0 {
+			// An operation with no derived scope was treated as mount-wide by
+			// the gate that crossed it, so it is repaired the same way: at the
+			// root, which is the widest statement the invalidation vocabulary
+			// has. frontendOperationPaths already spells the conservative scope
+			// as the root path, so this only covers an operation that never
+			// derived one at all.
+			paths = append(paths, "")
+		}
+	}
+	a.frontendGateMu.Unlock()
+	if len(fenced) == 0 {
+		return
+	}
+	// Content and namespace both: the daemon does not record WHICH class of
+	// state the crossed reply carried (the publication classification is per
+	// request kind, and one logical operation can mix lookup, getattr and read
+	// over the same paths), so the repair has to cover every class the frontend
+	// could have installed. Both are the same events the authority invalidation
+	// path publishes, so the extension needs no new handling for them.
+	a.mu.Lock()
+	for _, p := range paths {
+		a.publishContentInvalidationLocked(p, 0, 0)
+		a.publishNamespaceInvalidationLocked(p, 0, 0)
+	}
+	a.mu.Unlock()
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -930,10 +1283,7 @@ func (a *attach) suspendFrontendParticipant(participant *frontendOperationPartic
 	if !op.completed && !participant.finished && participant.suspendDepth == 0 {
 		participant.suspendDepth = 1
 		op.suspended++
-		if op.gateActive && op.participants > 0 && op.suspended == op.participants {
-			a.retractFromPublicationSetLocked(op)
-			op.gateActive = false
-		}
+		a.retractIdleOperationLocked(op)
 		a.frontendGateCond.Broadcast()
 	}
 	a.frontendGateMu.Unlock()
@@ -972,10 +1322,7 @@ func (a *attach) joinFrontendOperationSuspended(
 	}
 	op.participants++
 	op.suspended++
-	if op.gateActive && op.participants > 0 && op.suspended == op.participants {
-		a.retractFromPublicationSetLocked(op)
-		op.gateActive = false
-	}
+	a.retractIdleOperationLocked(op)
 	a.frontendGateCond.Broadcast()
 	a.frontendGateMu.Unlock()
 	return &frontendOperationParticipant{
@@ -1023,11 +1370,7 @@ func (a *attach) finishFrontendParticipant(participant *frontendOperationPartici
 	if op.participants > 0 {
 		op.participants--
 	}
-	if !op.completed && op.gateActive &&
-		op.participants > 0 && op.suspended == op.participants {
-		a.retractFromPublicationSetLocked(op)
-		op.gateActive = false
-	}
+	a.retractIdleOperationLocked(op)
 	a.frontendGateCond.Broadcast()
 	a.frontendGateMu.Unlock()
 }
@@ -1050,10 +1393,7 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 		}
 		participant.suspendDepth++
 	}
-	if !op.completed && op.gateActive &&
-		op.participants > 0 && op.suspended == op.participants {
-		a.retractFromPublicationSetLocked(op)
-		op.gateActive = false
+	if a.retractIdleOperationLocked(op) {
 		a.frontendGateCond.Broadcast()
 	}
 	a.frontendGateMu.Unlock()
@@ -1227,8 +1567,18 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 			a.frontendGateMu.Unlock()
 			return err
 		}
-		blockers, live, current := a.publicationBlockersLocked(scope, own)
+		blockers, live, current, fenceable := a.publicationBlockersLocked(scope, own)
 		if blockers == 0 {
+			if fenceable != nil {
+				// The crossing is recorded HERE, under the same lock hold that
+				// decided to take the handoff, and nowhere else. Recording it
+				// inside the blocker probe would attach a debt to an operation
+				// on every loop iteration, including iterations that then went
+				// back to waiting and iterations that ended in a refusal — and
+				// a debt for a handoff that never happened would invalidate
+				// live, correct kernel state for no reason.
+				fenceable.fenced = append(fenceable.fenced, scope)
+			}
 			break
 		}
 		if !firstPass {
@@ -1313,31 +1663,98 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 // operation must still block. So the operation is skipped only when own is the
 // ONLY thing keeping it live.
 //
-// What is deliberately NOT counted for the initiator's own operation is a reply
-// a sibling has already exposed. That publication happened BEFORE the handoff —
-// nothing can cross it now — and its acknowledgement is unreachable while the
-// initiator runs, because the extension emits one PublicationAck per operation
-// after the whole framework callback returns and this callback cannot return
-// while one of its requests is parked in a release. Blocking on it would be a
-// guaranteed settle-window stall followed by a failed release, bounding a wait
-// that has no possible resolution. Live siblings, whose replies are still
-// ahead of them, are the ones that matter and the ones that block.
+// ── AN EXPOSED REPLY IS NEVER "NOTHING CAN CROSS IT NOW" ────────────────────
+//
+// This function used to skip the initiator's own operation outright whenever
+// the initiator was the only thing keeping it live, and justified that with the
+// claim that a reply a sibling had already exposed "happened BEFORE the handoff
+// — nothing can cross it now". That claim is false, and it is the whole of
+// finding 5. Exposure means the daemon WROTE the reply; it does not mean the
+// kernel has it. The extension holds the sibling's values until its framework
+// callback returns, which is after the initiator is answered, which is after
+// this release completes. So the ordering the claim asserts is exactly
+// inverted: Checkin lands, a new delegation holder mutates, and only THEN does
+// the kernel install the sibling's pre-handoff view — permanently, because the
+// peer's own invalidation was delivered and applied before that install and
+// nothing contradicts it afterwards.
+//
+// The second half of the old justification is true and stays true: that
+// acknowledgement is unreachable while the initiator runs. One PublicationAck
+// per operation, emitted after the whole framework callback returns; the
+// callback cannot return while one of its requests is parked in a release; the
+// release cannot return without a verdict. Waiting is therefore a DETERMINISTIC
+// cycle, not a race — and the shape is completely ordinary, since FSKit's
+// removeItem callback issues a publishing getattr and then the remove that
+// needs the delegation transition. Blocking would fail every `rm` that has to
+// release a delegation.
+//
+// So the rule is neither "skip it" nor "wait for it". It turns on the one
+// question that decides whether waiting is a wait at all: CAN THIS OPERATION'S
+// ACKNOWLEDGEMENT STILL ARRIVE while this handoff owns the scope?
+//
+//   - a RUNNABLE participant means yes. The callback still has work the daemon
+//     is not holding up, so it can finish and the acknowledgement can follow.
+//     The operation blocks — this is round 8's live sibling, unchanged.
+//   - NO runnable participant and NO exposed reply means the operation owes
+//     nothing at all. It is skipped, exactly as before.
+//   - NO runnable participant, an exposed reply, and PARTICIPANTS THAT ARE ALL
+//     SUSPENDED means no. Every remaining request is parked — on a delegation
+//     handoff or on a frontend mirror — so the callback cannot end and the
+//     acknowledgement cannot be produced until this handoff releases the scope.
+//     That is a cycle. The handoff crosses, against a recorded debt that
+//     dischargeFrontendPublicationFence repairs the instant the acknowledgement
+//     lands.
+//   - NO participants at all and an exposed reply means yes again: the daemon
+//     has no work left, the acknowledgement is in flight on a live socket, and
+//     the bounded settle wait is a real wait with a real resolution. It blocks.
+//
+// The initiator counts as parked for this test even though its handler is
+// running, because it is running INSIDE this release: waiting for it is the
+// self-deadlock the per-participant self-exclusion exists to avoid.
+//
+// The crossing is never REFUSED, and that is deliberate. A refusal here is not
+// a bound, it is the round-4 wedge reached by a new route: startHandoffBounded
+// would retry a verdict that cannot change until its own budget expired,
+// failRelease would record a definite failure, and the triggering syscall would
+// answer EIO. So the fence is total — the daemon repairs what it crossed using
+// the best statement it has rather than declining to cross. Where the operation
+// published a nameable path the repair names that path; the conservative
+// mount-wide publication scope IS the root path, so it repairs at the root.
+// Either way the crossing is recorded and answered, which is strictly more than
+// the exception this replaces ever did.
+//
+// fenceable is returned rather than recorded here so the debt is written by the
+// caller at the moment it actually takes the handoff — never by a probe that
+// then loops again, and never for a handoff that ends in a refusal, where a
+// debt would invalidate live and correct kernel state for nothing.
 func (a *attach) publicationBlockersLocked(
 	scope string,
 	own *frontendOperationParticipant,
-) (blockers, live int, set map[*frontendOperation]struct{}) {
+) (blockers, live int, set map[*frontendOperation]struct{}, fenceable *frontendOperation) {
 	epoch := a.frontendPathEpoch.Load()
 	set = make(map[*frontendOperation]struct{}, len(a.frontendActive))
 	for op := range a.frontendActive {
 		if op.pathEpoch != epoch || operationOverlapsScope(op.paths, scope) {
+			isOwn := own != nil && op == own.op
 			liveHandlers := op.participants - op.suspended
-			if own != nil && op == own.op {
-				if !own.finished && own.suspendDepth == 0 {
-					// The initiator is still counted as a running handler by
-					// the operation; it is the one thing that must not block.
-					liveHandlers--
-				}
-				if liveHandlers <= 0 {
+			if isOwn && !own.finished && own.suspendDepth == 0 {
+				// The initiator is still counted as a running handler by the
+				// operation; it is the one thing that must not block.
+				liveHandlers--
+			}
+			if liveHandlers <= 0 {
+				switch {
+				case op.published && op.participants > 0:
+					// Parked participants only: the acknowledgement cannot be
+					// produced until this handoff lets go of the scope.
+					fenceable = op
+					continue
+				case op.published:
+					// Nothing left on the daemon's side; the acknowledgement is
+					// in flight. Block, bounded by the settle window.
+				case isOwn:
+					// Owes nothing and the initiator is all that is left. The
+					// original self-exclusion, unchanged.
 					continue
 				}
 			}
@@ -1348,7 +1765,7 @@ func (a *attach) publicationBlockersLocked(
 			set[op] = struct{}{}
 		}
 	}
-	return blockers, live, set
+	return blockers, live, set, fenceable
 }
 
 func (a *attach) endFrontendHandoff(scope string) {
@@ -1814,15 +2231,34 @@ func expectedTruncateLive(note expectedTruncate, now time.Time) bool {
 	return note.pinned || now.Before(note.deadline)
 }
 
-// matchesExpectedTruncate reports whether req is a pure size set that could be
-// the daemon's own refresh. Anything touching mode, ownership or flags is a
-// real application setattr: the daemon's refresh never carries one.
+// matchesExpectedTruncate reports whether req is a size set that a refresh
+// window could conceivably be about at all.
+//
+// Anything touching mode, ownership or flags is a real application setattr and
+// leaves here immediately: the daemon's refresh never carries one, and a
+// request carrying one is BOTH provably not the daemon's and safe to forward,
+// because forwarding it is what the application asked for.
+//
+// Timestamps are the case that is provably not the daemon's and NOT safe to
+// forward, so they are deliberately still admitted here and separated by
+// explicitTimeSet below — see refreshWindowClassLocked.
 func matchesExpectedTruncate(req *pfslocal.SetAttrRequest) bool {
 	// SetFlags disqualifies the request like any other real attribute group:
 	// the daemon's own refresh never carries one, so a request that does is a
 	// genuine chflags whose intent must not be swallowed by the no-op arm.
 	return req.Size != nil && req.Mode == nil && req.UID == nil &&
 		req.GID == nil && !req.SetFlags
+}
+
+// explicitTimeSet reports whether req asks for a timestamp of its own.
+//
+// ftruncate(2) asks the kernel for a SIZE and nothing else, so the daemon's own
+// refresh upcall never carries MtimeMs or AtimeMs. A size-set that does is
+// therefore provably NOT this daemon's refresh — but that is only half a
+// verdict, and the missing half is what made this a data-losing hole rather
+// than a cosmetic one (see refreshWindowClassLocked).
+func explicitTimeSet(req *pfslocal.SetAttrRequest) bool {
+	return req.MtimeMs != nil || req.AtimeMs != nil
 }
 
 // refreshClass is the verdict on one pure size-set: whose request is it?
@@ -1898,7 +2334,32 @@ const (
 // A size-set carrying a real attribute group (mode, ownership, flags) never
 // reaches here at all — matchesExpectedTruncate rejects it — and a size-set to
 // any OTHER size matches no window and reaches the authority as it must.
-func (a *attach) refreshWindowClassLocked(itemID uint64, size int64) refreshClass {
+//
+// ── AND WHY EXPLICIT TIMESTAMPS ARE THE THIRD CASE ──────────────────────────
+//
+// The predicate used to ignore MtimeMs/AtimeMs entirely, so an application
+// issuing a size-set S together with explicit times inside an open window was
+// answered Internal: the size was a no-op, and the timestamps were dropped
+// without an error. They never reached the authority, and the ctime ordering
+// every other observer derives from that mutation never happened.
+//
+// The honest reading of such a request is that it is provably NOT the daemon's
+// — ftruncate(2) asks for a size and nothing else — but it is not therefore
+// safe to forward. While this daemon is inside its own syscall for the same
+// (item, size), the request in front of the handler is one of two things, and
+// forwarding is catastrophic for one of them: if some path the daemon has not
+// foreseen ever attaches a timestamp to its own refresh upcall, forwarding
+// sends the daemon's refresh to the authority and destroys whatever a
+// concurrent writer appended past the sampled size. Suppressing is merely wrong
+// for the other. So an explicit-time set inside a window is AMBIGUOUS: refused,
+// never suppressed as bookkeeping and never forwarded on an unproven claim. Its
+// EINTR retry lands on a closed window and reaches the authority with its
+// timestamps intact.
+func (a *attach) refreshWindowClassLocked(
+	itemID uint64,
+	size int64,
+	explicitTimes bool,
+) refreshClass {
 	open := false
 	for _, note := range a.expectedTruncates {
 		if note.pinned && note.itemID == itemID && note.size == size {
@@ -1908,6 +2369,9 @@ func (a *attach) refreshWindowClassLocked(itemID uint64, size int64) refreshClas
 	}
 	if !open {
 		return refreshClassApplication
+	}
+	if explicitTimes {
+		return refreshClassAmbiguous
 	}
 	// An item the daemon no longer tracks cannot prove the window is dead, and
 	// the daemon's own refresh must never be forwarded on an unproven claim.
@@ -1938,14 +2402,95 @@ func (a *attach) refreshWindowClassLocked(itemID uint64, size int64) refreshClas
 // metadata lane would be as pointless as pacing the refresh itself, and the
 // two call sites keep the identical verdict for the identical request.
 func (a *attach) internalRefreshPending(body any) bool {
+	verdict, ok := a.classifyRefreshRequest(body)
+	return ok && verdict.class != refreshClassApplication
+}
+
+// ── THE FROZEN PHASE-1 VERDICT ──────────────────────────────────────────────
+//
+// Provenance is decided ONCE, in phase 1, holding nothing — and then it is
+// CARRIED. It is not re-derived under the locks, because between phase 1 and
+// the handler the request is deliberately parked: it suspends waiting to
+// activate into the publication set, and a pinned refresh window lives for
+// exactly the extent of one ftruncate(2). The window can therefore close while
+// the request it describes is still in flight.
+//
+// When the handler re-derived the verdict from scratch it found no window,
+// called the request an application mutation, and executed a real Setattr
+// against the authority — under the frontend mirrors, with NO admission behind
+// it, because phase 1 had waved it past admission precisely on the grounds that
+// it would never reach the authority. The request that arrived at the authority
+// was the daemon's own refresh, and the bytes a concurrent writer had appended
+// past the sampled size were destroyed.
+//
+// The rule the freeze establishes is one-directional and absolute: a request
+// phase 1 did not classify as an application mutation can never become one
+// under the locks. If the handler finds the frozen verdict's PREREQUISITES no
+// longer hold, it unwinds (EINTR) so phase 1 can run again holding nothing — it
+// never promotes.
+type refreshVerdictKey struct{}
+
+// refreshVerdict is one setattr's provenance, as phase 1 saw it.
+//
+// item and size are recorded so the handler can tell "the verdict is about this
+// request" from "the verdict is about an item that has since been replaced":
+// the frozen answer is only binding while the object it was computed for is
+// still the object in front of the handler.
+type refreshVerdict struct {
+	class refreshClass
+	item  pfslocal.Item
+	size  int64
+}
+
+// classifyRefreshRequest is phase 1's provenance test, and the ONLY place a
+// verdict is minted.
+//
+// ok is false for anything that is not a size-bearing setattr the window
+// protocol can be about at all; such a request has no provenance question and
+// needs no frozen answer.
+func (a *attach) classifyRefreshRequest(body any) (refreshVerdict, bool) {
 	req, ok := body.(*pfslocal.SetAttrRequest)
 	if !ok || !matchesExpectedTruncate(req) {
-		return false
+		return refreshVerdict{}, false
 	}
+	size := int64(*req.Size)
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.refreshWindowClassLocked(req.Item.ItemID, int64(*req.Size)) !=
-		refreshClassApplication
+	return refreshVerdict{
+		class: a.refreshWindowClassLocked(req.Item.ItemID, size, explicitTimeSet(req)),
+		item:  req.Item,
+		size:  size,
+	}, true
+}
+
+// withRefreshVerdict freezes a phase-1 verdict into the operation context the
+// handler will run under.
+func withRefreshVerdict(ctx context.Context, verdict refreshVerdict) context.Context {
+	return context.WithValue(ctx, refreshVerdictKey{}, verdict)
+}
+
+// frozenRefreshVerdict returns the verdict phase 1 recorded for req.
+//
+// A request that did not travel the dispatcher carries no frozen verdict — the
+// control plane's own local operations and the in-package tests are the only
+// such callers — and there is no admission gap for it to fall through, because
+// there was no admission phase. Those classify on the spot, against the same
+// predicate. The distinction matters: the freeze exists to close a gap that
+// only exists when a request is parked between two phases, not to make the
+// predicate itself unreachable.
+func (a *attach) frozenRefreshVerdict(
+	ctx context.Context,
+	req *pfslocal.SetAttrRequest,
+) (refreshVerdict, bool) {
+	if verdict, ok := ctx.Value(refreshVerdictKey{}).(refreshVerdict); ok {
+		if verdict.item == req.Item && req.Size != nil && verdict.size == int64(*req.Size) {
+			return verdict, true
+		}
+		// A verdict minted for a different object cannot speak for this one.
+		// Fall through to a fresh classification rather than silently applying
+		// somebody else's answer.
+	}
+	return a.classifyRefreshRequest(req)
 }
 
 // classifyExpectedTruncate decides whether req is the daemon's own pending
@@ -1973,7 +2518,7 @@ func (a *attach) classifyExpectedTruncate(p string, req *pfslocal.SetAttrRequest
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if class := a.refreshWindowClassLocked(
-		req.Item.ItemID, int64(*req.Size),
+		req.Item.ItemID, int64(*req.Size), explicitTimeSet(req),
 	); class != refreshClassApplication {
 		return class
 	}
@@ -1988,6 +2533,14 @@ func (a *attach) classifyExpectedTruncate(p string, req *pfslocal.SetAttrRequest
 		if expectedTruncateLive(note, now) &&
 			note.itemID == req.Item.ItemID &&
 			int64(*req.Size) == note.size {
+			if explicitTimeSet(req) {
+				// Same rule as the pinned window: a request carrying its own
+				// timestamps is provably not the daemon's refresh and must not
+				// be answered as bookkeeping, but it is not proved to be the
+				// application's either while a marker for this exact (item,
+				// size) is still live. Refuse.
+				return refreshClassAmbiguous
+			}
 			return refreshClassInternal
 		}
 		return refreshClassApplication
@@ -2013,6 +2566,9 @@ func (a *attach) classifyExpectedTruncate(p string, req *pfslocal.SetAttrRequest
 		}
 		if note.itemID == req.Item.ItemID && int64(*req.Size) == note.size {
 			delete(a.expectedTruncates, notedPath)
+			if explicitTimeSet(req) {
+				return refreshClassAmbiguous
+			}
 			return refreshClassInternal
 		}
 	}

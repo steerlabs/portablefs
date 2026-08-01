@@ -60,7 +60,85 @@ func (v *Volume) debug(format string, a ...any) {
 	}
 }
 
+// AttrObservation carries the coherence coordinates one attribute read was
+// answered under, so a SECOND authoritative attribute store can re-run this
+// mount's own monotonic gate at ITS install point rather than re-deriving the
+// verdict from scratch or installing blind.
+//
+// ── WHY THE VERDICT HAS TO TRAVEL ───────────────────────────────────────────
+//
+// The mount already refuses to let an attribute install travel backwards:
+// VersionCache.PublishOKToken rejects on generation, on prefix fence, and on
+// MONOTONICITY, and postattrs.go deliberately routes a mutation's own post-op
+// attributes through it for exactly that reason. But that gate protects the
+// caches inside this package only. portablefsd keeps a SECOND authoritative
+// copy of every attribute (itemRecord.attr, which drives kernel refresh size
+// decisions and item-kind decisions), and it had no gate at all — so a read
+// whose reply lost the race to a newer mutation could still be written there,
+// and the two stores would disagree with the older value winning.
+//
+// Returning only "here is an attr, status OK" cannot express that: an accepted
+// read and a refused one are indistinguishable at the call site. An
+// AttrObservation is the missing half of the answer.
+//
+// ── WHY IT IS RE-EVALUATED, NOT PRE-COMPUTED ────────────────────────────────
+//
+// Deliberately no boolean verdict is stored here. A verdict computed when the
+// reply arrived would be stale by the time the caller installs it: the caller
+// may do arbitrary work (take its own locks, coalesce with a peer publisher)
+// between the read and the install, and a newer mutation can raise the path's
+// version floor in that window. InstallOK therefore re-runs the SAME gate
+// atomically with the caller's install, which is the only placement that makes
+// "never travel backwards" true for both stores.
+type AttrObservation struct {
+	// token/gen/version are the exact three arguments PublishOKToken needs.
+	// A zero value therefore fails the gate (g == 0), which is the safe
+	// default for any path that forgets to fill it in.
+	token   CacheToken
+	gen     uint64
+	version uint64
+	// exact marks an observation that NO path version orders: an
+	// orphan-addressed or delegation-overlay answer. There is no floor to
+	// compare against because the answer did not come from the path-versioned
+	// authority state at all — it describes the retained inode itself, or the
+	// engine's own uncommitted truth, either of which is the newest statement
+	// that exists. Installing it is always correct.
+	exact bool
+	// refused marks an observation that must never be installed: the read
+	// failed, or it answered a negative, or it crossed a generation change.
+	refused bool
+}
+
+// InstallOK reports whether obs may still be installed for path, and runs
+// install while that decision is held under the version cache's own lock.
+//
+// The callback shape is not decoration: it is what makes the check and the
+// install ATOMIC with respect to FencePrefix and to any concurrent publisher.
+// A caller that tested first and installed afterwards would reopen exactly the
+// window this exists to close.
+func (v *Volume) InstallOK(path string, obs AttrObservation, install func()) bool {
+	if obs.refused {
+		return false
+	}
+	if obs.exact {
+		if install != nil {
+			install()
+		}
+		return true
+	}
+	return v.VersionCache.PublishOKToken(
+		obs.token, obs.gen, cleanVolumePath(path), obs.version, install,
+	)
+}
+
 func (v *Volume) cachedGetattr(ctx context.Context, view *readView, path string) (fsproto.Attr, Status) {
+	a, st, _ := v.cachedGetattrObserved(ctx, view, path)
+	return a, st
+}
+
+func (v *Volume) cachedGetattrObserved(
+	ctx context.Context, view *readView, path string,
+) (fsproto.Attr, Status, AttrObservation) {
 	if gen, curVer, pathValid := v.VersionCache.CacheState(path); gen != 0 && pathValid {
 		dir, _ := splitPath(path)
 		_, parentCurVer, parentValid := v.VersionCache.CacheState(dir)
@@ -78,10 +156,15 @@ func (v *Volume) cachedGetattr(ctx context.Context, view *readView, path string)
 		if parentValid {
 			if e, ok := v.AttrCache.GetLookup(gen, curVer, parentCurVer, path); ok {
 				if !e.Exists {
-					return fsproto.Attr{}, fsproto.ENOENT
+					return fsproto.Attr{}, fsproto.ENOENT, AttrObservation{refused: true}
 				}
 				v.observeHardlink(path, e.Attr)
-				return e.Attr, fsproto.OK
+				// A served cache entry IS the accepted value: it passed this
+				// gate when it was filled and nothing has evicted it since, so
+				// it publishes at the current floor rather than below it.
+				return e.Attr, fsproto.OK, AttrObservation{
+					token: view.cacheToken, gen: gen, version: curVer,
+				}
 			}
 		}
 	}
@@ -98,11 +181,15 @@ func (v *Volume) cachedGetattr(ctx context.Context, view *readView, path string)
 	}
 	if err != nil {
 		v.debug("CachedGetattr GetattrV %q: %v", path, err)
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, fsproto.EIO, AttrObservation{refused: true}
 	}
 	token, cacheOK := v.VersionCache.AcceptGeneration(view.cacheToken, rgen)
 	if cacheOK {
 		view.cacheToken = token
+	}
+	obs := AttrObservation{refused: true}
+	if cacheOK && st == fsproto.OK {
+		obs = AttrObservation{token: token, gen: rgen, version: rver}
 	}
 	if cacheOK && st == fsproto.OK {
 		v.VersionCache.PublishOKToken(token, rgen, path, rver, func() {
@@ -119,7 +206,7 @@ func (v *Volume) cachedGetattr(ctx context.Context, view *readView, path string)
 	if st == fsproto.OK {
 		observation.Observe(path, a)
 	}
-	return a, st
+	return a, st, obs
 }
 
 func (v *Volume) observeHardlink(path string, a fsproto.Attr) {
@@ -215,10 +302,25 @@ func (v *Volume) lookup(ctx context.Context, permit *readView, path string) (fsp
 	return v.cachedGetattr(ctx, permit, path)
 }
 
+// Getattr answers a path-addressed stat and DISCARDS the observation's
+// coherence coordinates. That is correct for every caller whose only consumer
+// of the answer is its own reply — the value it returns and the value it caches
+// are the same value, so there is no second store to keep ordered. A caller
+// that installs the answer into another authoritative attribute store must use
+// GetattrObserved instead; see AttrObservation.
 func (v *Volume) Getattr(ctx context.Context, path string, n *NodeState) (fsproto.Attr, Status) {
+	a, st, _ := v.GetattrObserved(ctx, path, n)
+	return a, st
+}
+
+// GetattrObserved is Getattr plus the coordinates InstallOK needs to re-run
+// this mount's monotonic gate at the caller's install point.
+func (v *Volume) GetattrObserved(
+	ctx context.Context, path string, n *NodeState,
+) (fsproto.Attr, Status, AttrObservation) {
 	permit, err := v.beginRead(ctx, path)
 	if err != nil {
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, fsproto.EIO, AttrObservation{refused: true}
 	}
 	defer permit.Close()
 	return v.getattr(ctx, &permit, path, n)
@@ -344,35 +446,41 @@ func (v *Volume) cachedHandleAttr(path string, ino uint64) (fsproto.Attr, bool) 
 	return e.Attr, true
 }
 
-func (v *Volume) getattr(ctx context.Context, permit *readView, path string, n *NodeState) (fsproto.Attr, Status) {
+func (v *Volume) getattr(
+	ctx context.Context, permit *readView, path string, n *NodeState,
+) (fsproto.Attr, Status, AttrObservation) {
 	if oi := n.Orphan(); oi != 0 {
 		a, st, err := v.client.GetattrOrphanContext(v.authorityWaitContext(ctx), oi)
 		if err != nil {
-			return fsproto.Attr{}, fsproto.EIO
+			return fsproto.Attr{}, fsproto.EIO, AttrObservation{refused: true}
 		}
 		if st != fsproto.OK {
-			return fsproto.Attr{}, st
+			return fsproto.Attr{}, st, AttrObservation{refused: true}
 		}
-		return *a, fsproto.OK
+		// An orphan is addressed by its retained inode, not by a name, so no
+		// path version orders this answer — see AttrObservation.exact.
+		return *a, fsproto.OK, AttrObservation{exact: true}
 	}
 	if v.wb != nil {
 		if ent, res := permit.Lookup(path); res == writeback.LookupHit {
 			a := engineAttr(path, ent)
 			v.observeHardlink(path, a)
-			return a, fsproto.OK
+			// The engine holds the delegation for this name: its overlay is
+			// the newest statement about the object that exists anywhere.
+			return a, fsproto.OK, AttrObservation{exact: true}
 		} else if res == writeback.LookupNegative {
-			return fsproto.Attr{}, fsproto.ENOENT
+			return fsproto.Attr{}, fsproto.ENOENT, AttrObservation{refused: true}
 		}
 	}
-	a, st := v.cachedGetattr(ctx, permit, path)
+	a, st, obs := v.cachedGetattrObserved(ctx, permit, path)
 	if st == fsproto.ENOENT {
 		if oi := v.RedirectToOrphan(ctx, n); oi != 0 {
 			if oa, ost, oerr := v.client.GetattrOrphanContext(v.authorityWaitContext(ctx), oi); oerr == nil && ost == fsproto.OK {
-				return *oa, fsproto.OK
+				return *oa, fsproto.OK, AttrObservation{exact: true}
 			}
 		}
 	}
-	return a, st
+	return a, st, obs
 }
 
 func (v *Volume) Readdir(ctx context.Context, dir string) ([]DirEntry, Status) {

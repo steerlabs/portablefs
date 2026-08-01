@@ -929,16 +929,29 @@ func (t *sessionTokenSource) setToken(token string, expiresAtMs int64) {
 	t.mu.Unlock()
 }
 
-func (t *sessionTokenSource) get() string {
+// get serves the live credential AND the deadline its issuer stated for it.
+//
+// It used to drop the expiry on the floor, which is how the mount ended up
+// with an unbounded UNPROVEN credential state: the deadline existed one layer
+// up the whole time (leaseState.ExpiresAtMs, carried into this very struct by
+// setToken) and simply never reached the client that needed it. Handing it
+// down is what lets an unproven credential stop being unproven — past the
+// lease's own expiry it hardens to expired, on the lease's terms rather than
+// on some retry budget invented in the data plane.
+//
+// The env-token fallback states NO deadline (0). A static VCS_AUTH_TOKEN is
+// not a lease: nothing about it expires, so nothing about it may harden.
+func (t *sessionTokenSource) get() (string, int64) {
 	t.mu.Lock()
 	token := t.token
+	expiresAtMs := t.expiresAtMs
 	t.mu.Unlock()
 	if token != "" {
-		return token
+		return token, expiresAtMs
 	}
 	// Direct --addr mounts without a token: the VCS_AUTH_TOKEN environment
 	// variable authenticates the data plane.
-	return os.Getenv("VCS_AUTH_TOKEN")
+	return os.Getenv("VCS_AUTH_TOKEN"), 0
 }
 
 // resolveVolumeTeamID looks up the volume's tenant id through the volume API
@@ -1507,18 +1520,20 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return failReady(err)
 		}
 		leaseCleanupSafe = false
+		mountToken, mountTokenExpiresAtMs := tokens.get()
 		attachReply, err := ctl.ensureAttachDetailed(fskitEnsureAttachRequest{
-			AttachRef:           attachRef,
-			VolumeID:            volumeID,
-			Branch:              o.branch,
-			AuthorityURL:        authorityURL,
-			AuthToken:           tokens.get(),
-			DataPlaneTransport:  transport.Mode,
-			DataPlaneServerName: transport.ServerName,
-			TLSCAPEM:            transport.CAPEM,
-			TLSCASHA256:         transport.CASHA256,
-			MountPath:           mountPath,
-			Options:             fskitOptionsFromPerf(perfOptionsFromEnv(e.getenv), flagLocalDirs, volumeFileEnabled),
+			AttachRef:            attachRef,
+			VolumeID:             volumeID,
+			Branch:               o.branch,
+			AuthorityURL:         authorityURL,
+			AuthToken:            mountToken,
+			AuthTokenExpiresAtMs: mountTokenExpiresAtMs,
+			DataPlaneTransport:   transport.Mode,
+			DataPlaneServerName:  transport.ServerName,
+			TLSCAPEM:             transport.CAPEM,
+			TLSCASHA256:          transport.CASHA256,
+			MountPath:            mountPath,
+			Options:              fskitOptionsFromPerf(perfOptionsFromEnv(e.getenv), flagLocalDirs, volumeFileEnabled),
 		})
 		if err != nil {
 			return failReady(err)
@@ -1579,7 +1594,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// Rotated/renewed lease credentials must reach the daemon: it owns
 		// the authority connection for this attach.
 		leaseHook.Store(func(lease leaseState) {
-			if err := ctl.setCredential(attachRef, lease.AccessToken); err != nil {
+			if err := ctl.setCredential(attachRef, lease.AccessToken, lease.ExpiresAtMs); err != nil {
 				fmt.Fprintf(e.stderr, "portablefs mount: push rotated credential to portablefsd: %v\n", err)
 			}
 		})
@@ -2656,7 +2671,7 @@ func (e *cmdEnv) drainBeforeUnmount(st *mountState) error {
 			if !validLeaseState(st.AccessLease) {
 				return fmt.Errorf("pre-unmount access lease for attach %s is invalid", st.AttachRef)
 			}
-			if err := ctl.setCredential(st.AttachRef, st.AccessLease.AccessToken); err != nil {
+			if err := ctl.setCredential(st.AttachRef, st.AccessLease.AccessToken, st.AccessLease.ExpiresAtMs); err != nil {
 				return fmt.Errorf("pre-unmount credential activation failed: %w", err)
 			}
 		}
@@ -2963,6 +2978,14 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// printed line already shows it; the JSON view dropped it, so an agent
 		// reading --json could see attachState=degraded with no reason at all.
 		AttachError string `json:"attachError,omitempty"`
+		// AttachCredential names WHICH credential fault a degraded attach has:
+		// "rejected" (the authority answered no -> log in again) or
+		// "pending-verification" (the authority never answered at all -> the
+		// handshake is being torn down before the ack, so look at the router).
+		// Empty means no credential fault. These are DELIBERATELY not folded
+		// into Health: Health carries the CLI-side lease-keeper verdict from
+		// persisted mount state, which is a different, disjoint path.
+		AttachCredential string `json:"attachCredential,omitempty"`
 		// CleanupRequired marks a durable operation intent with no matching
 		// mount-state record. It is deliberately a first-class inventory row:
 		// crash recovery must never disappear from the CLI or app view.
@@ -3006,6 +3029,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			row.WriteBack = a.WriteBack
 			row.AttachState = a.State
 			row.AttachError = a.LastError
+			row.AttachCredential = a.Credential
 		}
 		rows = append(rows, row)
 	}
@@ -3034,24 +3058,14 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		return 0
 	}
 	for _, row := range rows {
-		var status string
-		switch row.Health {
-		case "stale":
-			status = "stale (daemon gone; run `portablefs umount " + row.MountPath + "` to clean up)"
-		case "cleanup-required":
-			status = "cleanup-required (incomplete " + row.OperationPhase + " operation; run `portablefs umount " + row.MountPath + "`)"
-		case mountStatusCredentialExpired:
-			since := ""
-			if row.StatusChangedAtMs != 0 {
-				since = " since " + formatMs(row.StatusChangedAtMs)
-			}
-			status = "credential-expired" + since + " (credentials revoked or expired; run `portablefs login` and remount)"
-		default:
-			status = "live"
-			if row.AttachState == "degraded" {
-				status = "degraded"
-			}
-		}
+		status := mountStatusWord(mountStatusInput{
+			health:            row.Health,
+			mountPath:         row.MountPath,
+			operationPhase:    row.OperationPhase,
+			statusChangedAtMs: row.StatusChangedAtMs,
+			attachState:       row.AttachState,
+			attachCredential:  row.AttachCredential,
+		})
 		extras := ""
 		if len(row.LocalDirs) > 0 {
 			extras = "  local-dirs:" + strings.Join(row.LocalDirs, ",")
@@ -3083,6 +3097,59 @@ func cmdMounts(e *cmdEnv, args []string) int {
 // fskitAttachStatuses reads the daemon's observational attach table, keyed by
 // attach ref. This bounded status query is not used for lifecycle authority;
 // strict persisted/live inventories guard mount and account mutations.
+// mountStatusInput is one inventory row reduced to the facts that decide its
+// operator-facing status word.
+type mountStatusInput struct {
+	health            string
+	mountPath         string
+	operationPhase    string
+	statusChangedAtMs int64
+	attachState       string
+	attachCredential  string
+}
+
+// mountStatusWord renders the status word `portablefs mounts` prints for a row,
+// with the remediation that word implies.
+//
+// It is a named function rather than an inline switch because these words are
+// the whole operator-facing contract of the command, and one of them was
+// actively misleading: a data-plane attach could be degraded for a credential
+// reason and the line said only "degraded", which reads as a write-back
+// problem. The two credential faults are distinguished here because they call
+// for opposite actions — a REJECTED credential is answered by logging in
+// again, an UNPROVEN one is answered by looking at whatever is tearing the
+// handshake down before the authority replies, and telling someone to
+// re-authenticate for the second one wastes the outage.
+func mountStatusWord(row mountStatusInput) string {
+	switch row.health {
+	case "stale":
+		return "stale (daemon gone; run `portablefs umount " + row.mountPath + "` to clean up)"
+	case "cleanup-required":
+		return "cleanup-required (incomplete " + row.operationPhase + " operation; run `portablefs umount " + row.mountPath + "`)"
+	case mountStatusCredentialExpired:
+		// The CLI-side lease keeper's own persisted verdict. It stays exactly
+		// as it was: a control-plane renewal refusal is a different, disjoint
+		// path from anything the data-plane handshake observes.
+		since := ""
+		if row.statusChangedAtMs != 0 {
+			since = " since " + formatMs(row.statusChangedAtMs)
+		}
+		return "credential-expired" + since + " (credentials revoked or expired; run `portablefs login` and remount)"
+	}
+	if row.attachState != "degraded" {
+		return "live"
+	}
+	switch row.attachCredential {
+	case attachCredentialPendingVerification:
+		return "degraded (credential pending-verification; the authority has " +
+			"neither accepted nor refused it — check the data-plane " +
+			"router/authority, not your login)"
+	case attachCredentialRejected:
+		return "degraded (credential rejected; run `portablefs login` and remount)"
+	}
+	return "degraded"
+}
+
 func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[string]cliAttachStatus, error) {
 	cfg, err := fskitConfigFromEnv(getenv)
 	if err != nil {

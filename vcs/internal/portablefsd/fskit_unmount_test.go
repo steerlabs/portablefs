@@ -22,9 +22,9 @@ func TestActivateIfPendingNeverRollsBackActiveCredential(t *testing.T) {
 		AuthorityURL:       "127.0.0.1:1",
 		DataPlaneTransport: "plaintext",
 	}, privateTestDir(t))
-	a.setCredential("newest-token")
+	a.setCredential("newest-token", 0)
 
-	activated, err := a.activateIfPending(context.Background(), "stale-recorded-token")
+	activated, err := a.activateIfPending(context.Background(), "stale-recorded-token", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func TestRevivedForcedFSKitPublishesOfflineZeroTailProofBeforeDetach(t *testing.
 		DataPlaneServerName: "",
 	}
 	a := newAttach(testFSKitAttachRef, attachKey(req.VolumeID, req.Branch, req.MountPath), req, stateDir)
-	if err := a.activate(context.Background(), ""); err != nil {
+	if err := a.activate(context.Background(), "", 0); err != nil {
 		t.Fatal(err)
 	}
 	a.mu.RLock()

@@ -161,6 +161,24 @@ func (f *flusher) laneStateForTest(lane StreamLane) (pending int, applied uint64
 	return len(f.lanes[lane].pending), f.lanes[lane].applied
 }
 
+// laneDependencyBlockedForTest exposes the dispatchability predicate so a test
+// can assert its fixture actually reached the hold rather than merely running
+// fast enough to miss it.
+func (f *flusher) laneDependencyBlockedForTest(lane StreamLane) (blocked bool, needed uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.laneDependencyBlockedLocked(lane)
+}
+
+// degradedForTest reads the STREAM-WIDE sticky verdict. It is separate from the
+// per-lane stall verdict on purpose: the promotion of a lane-local condition
+// into this flag is itself the thing some tests are about.
+func (f *flusher) degradedForTest() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.degraded
+}
+
 func (a *fakeAuthority) DelegationAcquire(_ context.Context, scope, writebackID string) (AcquireReply, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

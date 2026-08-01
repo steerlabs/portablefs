@@ -179,14 +179,21 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			AuthToken     string `json:"authToken"`
-			OnlyIfPending bool   `json:"onlyIfPending,omitempty"`
+			AuthToken string `json:"authToken"`
+			// AuthTokenExpiresAtMs is the access lease's OWN stated expiry for
+			// this credential (unix ms). It is what bounds the UNPROVEN state:
+			// past it a credential no handshake ever accepted or refused
+			// hardens into the definite expired verdict instead of pending
+			// forever. OPTIONAL and additive — an older CLI omits it, the zero
+			// value states no deadline, and nothing hardens.
+			AuthTokenExpiresAtMs int64 `json:"authTokenExpiresAtMs,omitempty"`
+			OnlyIfPending        bool  `json:"onlyIfPending,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.OnlyIfPending)
+		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.AuthTokenExpiresAtMs, req.OnlyIfPending)
 		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, err.Error())
 			return
@@ -551,11 +558,22 @@ func (a *attach) controlWriteLocked(
 		}
 		if st == fsproto.OK {
 			a.mu.Lock()
+			savedOwner := a.beginReincarnationOwnerLocked(nil)
 			created := a.registerCreatedLocked(p, attr)
+			ticket := a.endReincarnationOwnerLocked(savedOwner)
 			a.mu.Unlock()
 			if created == nil {
 				return false, http.StatusInternalServerError,
 					errMessage("fs/write item identity", darwinEIO), 0
+			}
+			// The control plane publishes into the same registry the kernel
+			// frontend reads, so it owes the same reconciliation: a create that
+			// displaced a peer-replaced name leaves that inode's retained
+			// aliases stale for every later frontend reply, not just for this
+			// HTTP response.
+			if eno := ticket.settle(ctx, vol); eno != 0 {
+				return false, httpStatusForErr(eno),
+					errMessage("fs/write reconcile aliases", eno), 0
 			}
 		}
 	}
@@ -603,7 +621,9 @@ func (a *attach) controlWriteLocked(
 		attr = fresh
 	}
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	rec := a.registerLocked(p, attr)
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	if rec == nil {
 		a.mu.Unlock()
 		return false, http.StatusInternalServerError,
@@ -615,6 +635,10 @@ func (a *attach) controlWriteLocked(
 	}
 	a.publishContentInvalidationLocked(p, 0, 0)
 	a.mu.Unlock()
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return false, httpStatusForErr(eno),
+			errMessage("fs/write reconcile aliases", eno), 0
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return false, httpStatusForErr(eno),
 			errMessage("fs/write identity journal", eno), 0
