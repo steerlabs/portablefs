@@ -609,7 +609,7 @@ func (a *attach) setattrLocal(
 		// return an errno, and none of them may close this item's mutation
 		// sequence over a registry that still holds the pre-truncate size; see
 		// the bracket in attach.setattr.
-		commit.size, commit.sizeKnown, commit.published = int64(*req.Size), true, false
+		commit.recordExact(int64(*req.Size))
 	}
 	if req.SetFlags {
 		// Grafts need no FeatureFlagPersistence: their backing IS a real host
@@ -701,6 +701,23 @@ func (a *attach) readLocalFile(p string, offset int64, length int) ([]byte, int3
 // mirroring the frontend create+write identity bookkeeping. Creating the
 // graft root's scaffold and parents on demand lets management writes land
 // before anything mkdir'ed the root through the mount.
+//
+// ── IT IS A BRACKETED, TWO-STEP MUTATION LIKE ITS AUTHORITY TWIN ────────────
+//
+// It used to be one os.WriteFile call followed by a stat, which hid two
+// separate defects behind one line. os.WriteFile opens O_TRUNC, so a failure
+// after the open left the host inode at ZERO with nothing recorded; and a
+// failure of the stat AFTER a completely successful write returned an errno for
+// a size change that had really happened, with no bracket to keep the item
+// unstable and no committed size to publish. Either way the registry kept the
+// pre-write size and the next refresh armed on it.
+//
+// So the host mutation is now explicit and in the same order the authority arm
+// uses: write the bytes at offset 0 first — never truncating first, which would
+// make a mid-flight failure destroy the file's contents in exchange for
+// nothing — then cut the old tail. Progress is recorded as a FLOOR after the
+// write, because the old contents may still extend past it, and upgraded to the
+// exact size once the truncate commits.
 func (a *attach) writeLocalFile(p string, graft string, data []byte) (uint64, int32) {
 	if p == graft {
 		// A graft rule is a directory rule; the root itself is never a file.
@@ -719,8 +736,24 @@ func (a *attach) writeLocalFile(p string, graft string, data []byte) (uint64, in
 	if err := a.localFS.MkdirAll(parentPath(p), 0o755); err != nil {
 		return 0, localErrno(err)
 	}
-	if err := a.localFS.WriteFile(p, data, 0o644); err != nil {
-		return 0, localErrno(err)
+	// published starts TRUE for the same reason every other carrier's does:
+	// every exit before the first committed byte leaves nothing for the registry
+	// to be behind on. The publish defer is registered AFTER the bracket so it
+	// unwinds BEFORE the settle.
+	commit := &setattrCommit{published: true}
+	if existing := a.itemByPath(p); existing != nil {
+		bracketed := existing.item.ItemID
+		settleMutation := a.beginItemMutation(bracketed)
+		defer func() { settleMutation(commit.published) }()
+		defer func() {
+			a.publishSetattrCommit(context.Background(), nil, bracketed, commit)
+		}()
+	}
+	if eno := a.replaceLocalFileContents(p, data, commit); eno != 0 {
+		return 0, eno
+	}
+	if hook := a.testAfterLocalFileWrite; hook != nil {
+		hook(p)
 	}
 	attr, eno := a.statLocal(p)
 	if eno != 0 {
@@ -728,6 +761,9 @@ func (a *attach) writeLocalFile(p string, graft string, data []byte) (uint64, in
 	}
 	a.mu.Lock()
 	refreshItemID := a.registerLocalLocked(p, attr).item.ItemID
+	// A real registration has stated this item's attributes, so the commit's
+	// own fallback publication is inert from here on.
+	commit.published = true
 	a.bumpLocalVersionLocked(parentPath(p))
 	if !rootExisted {
 		// The write materialized the graft root implicitly: the root's parent
@@ -742,6 +778,34 @@ func (a *attach) writeLocalFile(p string, graft string, data []byte) (uint64, in
 		return 0, eno
 	}
 	return refreshItemID, 0
+}
+
+// replaceLocalFileContents performs the host half of a control replacement
+// write on one descriptor, recording what it commits as it commits it.
+//
+// The descriptor is opened WITHOUT O_TRUNC deliberately: truncating first turns
+// every subsequent failure into data destruction, and the tail the truncate at
+// the end removes is the only thing the ordering costs. A short write reports
+// both a count and an error, and the count is committed progress that outranks
+// the error for the reason it does everywhere else in this daemon.
+func (a *attach) replaceLocalFileContents(p string, data []byte, commit *setattrCommit) int32 {
+	file, err := a.localFS.OpenFile(p, os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return localErrno(err)
+	}
+	defer func() { _ = file.Close() }()
+	wrote, werr := file.WriteAt(data, 0)
+	if wrote > 0 {
+		commit.recordFloor(int64(wrote))
+	}
+	if werr != nil {
+		return localErrno(werr)
+	}
+	if err := file.Truncate(int64(len(data))); err != nil {
+		return localErrno(err)
+	}
+	commit.recordExact(int64(len(data)))
+	return 0
 }
 
 func localOpenFlags(mode pfslocal.OpenMode) int {

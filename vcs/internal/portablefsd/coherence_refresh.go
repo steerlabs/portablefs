@@ -461,22 +461,41 @@ func (a *attach) applyKernelRefresh(
 	// unix.Ftruncate, and disarms it the instant that call returns. One
 	// ftruncate, one window; no ftruncate, no window.
 	var armedSeq uint64
+	// settleErr is written by the disarm, which the refresh calls synchronously
+	// on this goroutine the instant its ftruncate returns. It carries the
+	// post-syscall verdict out to where the pass decides what it may claim.
+	var settleErr error
 	arm := func() (func(), error) {
-		disarm, seq, err := a.armRefreshWindowLocked(p, rec, size, fence)
+		settle, seq, err := a.armRefreshWindowLocked(p, rec, size, fence)
 		if err != nil {
 			return nil, err
 		}
 		armedSeq = seq
-		return disarm, nil
+		return func() { settleErr = settle() }, nil
 	}
 	outcome, err := refresh(mount, p, expectedKernelItemID, size, arm)
 	// Belt and braces: the refresh disarms its own window on every path, but a
 	// marker that somehow outlived it must never be left where a later
 	// application truncate could match it. Identity is the sequence number, so
 	// a successor installed for the same path by a concurrent pass is never
-	// retired by this one.
+	// retired by this one. The pin goes with it for the same reason: a pin left
+	// behind a returned refresh would park every size mutation on the item until
+	// their operation deadlines.
 	if armedSeq != 0 {
 		a.retireExpectedTruncate(p, armedSeq)
+		a.mu.Lock()
+		a.releaseRefreshPinLocked(rec.item.ItemID)
+		a.mu.Unlock()
+	}
+	if outcome == kernelRefreshApplied && settleErr != nil {
+		// THE PASS MAY NOT REPORT WHAT IT CANNOT PROVE.
+		//
+		// The truncate went out, and by the time it returned the item was no
+		// longer the one the window described. Reporting kernelRefreshApplied
+		// here would end the transaction on a kernel vnode this daemon has just
+		// stated it can no longer vouch for; the retry outcome re-samples and
+		// runs the corrective pass under the same bounded budget.
+		return kernelRefreshRetry, settleErr
 	}
 	if outcome != kernelRefreshApplied {
 		// A failed safe-open means the name disappeared, changed identity,
@@ -527,6 +546,24 @@ func (a *attach) refreshSampleSupersededLocked(
 	switch {
 	case current == nil:
 		return &errRefreshSampleSuperseded{path: p, reason: "item is no longer registered"}
+	case a.sizeMutationReservedLocked(rec.item.ItemID):
+		// A SIZE MUTATION IS ADMITTED AND HAS NOT FINISHED.
+		//
+		// This arm is earlier than the sequence arm below it, and deliberately
+		// so: the sequence is opened immediately before the engine commit, which
+		// is late enough that a mutation admitted a moment ago is still
+		// invisible to it. The reservation is taken at pre-lock admission and
+		// released only once the handler has published, so it covers the whole
+		// of the interval in which that mutation can commit.
+		//
+		// Refusing here is what lets the pin below be an ORDER rather than
+		// another check: the refresh only pins an item on which no mutation can
+		// already be on its way to a commit, and any mutation that arrives after
+		// the pin waits for it (refreshpin.go).
+		return &errRefreshSampleSuperseded{
+			path:   p,
+			reason: "a size mutation has been admitted for this item and has not published",
+		}
 	case a.itemMutationInFlightLocked(rec.item.ItemID):
 		// A SIZE MUTATION IS COMMITTED BUT NOT YET PUBLISHED.
 		//
@@ -571,12 +608,34 @@ func (a *attach) refreshSampleSupersededLocked(
 	return nil
 }
 
+// armRefreshWindowLocked opens the provenance window described above, takes the
+// item's size token for the syscall that follows, and returns the SETTLE that
+// closes both.
+//
+// The settle runs at exactly the instant unix.Ftruncate(2) returns, and it is
+// the PROOF that the token did its job.
+//
+// It asserts EXACTLY the invariant the token establishes and nothing wider: no
+// LOCAL size mutation on this item was between its admission and its
+// publication at any point inside the syscall. The pin makes that impossible,
+// so the assertion never fires; if it ever did, the pass must report a retry
+// rather than claim it applied a vnode state the daemon can no longer vouch for.
+//
+// It deliberately does NOT re-check the composed size. A size this daemon
+// merely LEARNED during the window — a peer mount's write, discovered by a
+// getattr or an invalidation and published like any other observation — moves
+// that value without any local mutation being in flight, and it is neither a
+// violation nor this settle's business: the pass's own post-apply verification
+// sample already refuses to declare such a pass settled, and the bounded
+// transaction re-runs against the state that actually exists
+// (refreshKernelItemStateComposedModeContext). Widening the assertion to cover
+// it would turn an ordinary remote observation into a refresh failure.
 func (a *attach) armRefreshWindowLocked(
 	p string,
 	rec *itemRecord,
 	size int64,
 	fence refreshApplyFence,
-) (func(), uint64, error) {
+) (func() error, uint64, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	current := a.items[rec.item.ItemID]
@@ -595,7 +654,34 @@ func (a *attach) armRefreshWindowLocked(
 	}
 	a.expectedTruncates[p] = note
 	current.attr.Size = size
-	return func() { a.retireExpectedTruncate(p, note.seq) }, note.seq, nil
+	unpin := a.pinRefreshItemLocked(rec.item.ItemID)
+	return func() error {
+		a.mu.Lock()
+		err := a.refreshWindowViolationLocked(p, rec.item.ItemID)
+		a.mu.Unlock()
+		unpin()
+		a.retireExpectedTruncate(p, note.seq)
+		return err
+	}, note.seq, nil
+}
+
+// refreshWindowViolationLocked answers whether a local size mutation was in
+// flight for itemID at the instant the pass's ftruncate returned. Callers hold
+// a.mu in either mode. See armRefreshWindowLocked.
+func (a *attach) refreshWindowViolationLocked(p string, itemID uint64) error {
+	switch {
+	case a.sizeMutationReservedLocked(itemID):
+		return &errRefreshSampleSuperseded{
+			path:   p,
+			reason: "a size mutation was admitted for this item inside the refresh truncate",
+		}
+	case a.itemMutationInFlightLocked(itemID):
+		return &errRefreshSampleSuperseded{
+			path:   p,
+			reason: "a size mutation committed inside the refresh truncate",
+		}
+	}
+	return nil
 }
 
 type frontendOperation struct {

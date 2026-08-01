@@ -36,6 +36,17 @@ atomic setattr batch — one syscall outcome, per-group exact
 sub-identities in a single journal record. Design it with the format
 machinery; do not paper it with ordering.
 
+The non-atomicity itself is unchanged and still wants that batch. What
+has been closed is the SILENT half of it: a partial commit is no longer
+lost. `clientcore.SetattrOutcome` carries `SizeCommitted` plus the exact
+size out of every arm (delegated, authority, exact-handle, orphan) even
+when a later group fails, and the daemon records it BEFORE it inspects
+the status, so the committed size is published — or, if there is nothing
+to publish into, the item's mutation sequence settles unpublished — on
+every unwinding path. A caller that fails a multi-group setattr now
+learns what actually applied; it still cannot ask for the whole thing to
+be atomic.
+
 ### 5. Mount intent for a nonexistent branch cannot reconcile
 
 Reproduced live: a mount attempt against a branch that does not exist

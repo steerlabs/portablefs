@@ -885,33 +885,38 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	}
 	var attr fsproto.Attr
 	var st clientcore.Status
+	var outcome clientcore.SetattrOutcome
 	if target.handle != nil {
-		attr, st = vol.SetattrOpenHandle(ctx, target.scope, rec.state, cr)
+		attr, outcome, st = vol.SetattrOpenHandleCommitted(ctx, target.scope, rec.state, cr)
 	} else {
-		attr, st = vol.Setattr(ctx, rec.path, rec.state, cr)
+		attr, outcome, st = vol.SetattrCommitted(ctx, rec.path, rec.state, cr)
+	}
+	// THE SIZE IS COMMITTED FROM HERE ON, WHATEVER HAPPENS TO THE REPLY —
+	// INCLUDING THE SETATTR'S OWN FAILURE.
+	//
+	// A setattr is up to three ordered mutations and the SIZE GOES FIRST, so
+	// "the call returned an error" and "the truncate happened" are independent
+	// facts. Reading the commit off `st` — the shape this handler used to have,
+	// which recorded nothing unless the whole call succeeded — loses every
+	// partial commit: EIO, a lane change or a transport failure in the metadata
+	// group returned before the size was ever recorded, the deferred settlement
+	// then reported published=true, and the registry kept the PRE-truncate size
+	// while the authority held the new one. The next refresh armed on that
+	// sample.
+	//
+	// So the commit is read off the OUTCOME, which the committing lane states,
+	// and it is recorded before the status is inspected. Everything below can
+	// still fail on its own terms — the optional attribute refresh, the
+	// registration, the reconciliation, the binding journal — and each of those
+	// returns an errno for a truncate that really happened; none of them may
+	// close the item's mutation sequence over the pre-truncate size. The publish
+	// is inert once a real registration has done it.
+	if outcome.SizeCommitted {
+		commit.size, commit.sizeKnown, commit.published = outcome.Size, true, false
+		defer a.publishSetattrCommit(ctx, vol, rec.item.ItemID, commit)
 	}
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
-	}
-	// THE SIZE IS COMMITTED FROM HERE ON, WHATEVER HAPPENS TO THE REPLY.
-	//
-	// Everything below can still fail — the optional attribute refresh, the
-	// registration, the reconciliation, the binding journal — and every one of
-	// those failures returns an errno for a truncate the authority has already
-	// applied. That is the caller's problem to retry; it is NOT a licence to
-	// close the item's mutation sequence over a registry that still holds the
-	// pre-truncate size, which is what would let the next refresh arm on a stale
-	// sample. So the committed size is recorded now and published below even on
-	// the paths that do not produce a reply.
-	if req.Size != nil {
-		commit.size, commit.sizeKnown, commit.published = int64(*req.Size), true, false
-		// EVERY exit from here down publishes the size the authority applied.
-		// The optional refresh, the registration, the reconciliation and the
-		// binding journal can each fail on their own terms, and each of those
-		// returns an errno for a truncate that really happened; none of them may
-		// close the item's mutation sequence over the pre-truncate size. The
-		// publish is inert once a real registration has done it.
-		defer a.publishSetattrCommit(ctx, vol, rec.item.ItemID, commit)
 	}
 	if attr.Kind == "" {
 		if target.handle != nil {
@@ -938,7 +943,7 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		// resolves, an item the registry cannot name). The truncate committed
 		// anyway, so its size is published on its own before this handler
 		// settles.
-		a.publishItemSizeLocked(mutated, a.items[mutated], commit.size, false)
+		a.publishItemSizeLocked(mutated, a.items[mutated], commit.size, commit.floor)
 		commit.published = true
 	}
 	ticket := a.endReincarnationOwnerLocked(savedOwner)
@@ -1321,10 +1326,30 @@ type writeCommit struct {
 // inode has already applied, and whether the registry has been told about it.
 // A truncate's committed size is EXACT rather than a floor — the authority
 // applied precisely the requested size — so a shrink publishes as stated.
+//
+// floor inverts that for the one carrier that holds BOTH kinds of statement in
+// turn. A replacement write (the control plane's, and the graft path's) commits
+// bytes first and applies the exact size second, and between those two steps the
+// only truthful thing it can say is a lower bound: the file is at least this
+// long, and it may still be longer because the old contents have not been cut
+// yet. Publishing that bound as if it were exact would SHRINK a registry that
+// legitimately holds more. So the carrier records a floor after the write and is
+// upgraded to exact after the truncate; see controlWriteLocked.
 type setattrCommit struct {
 	size      int64
 	sizeKnown bool
+	floor     bool
 	published bool
+}
+
+// recordFloor states the lower bound a positive write proves on its own.
+func (c *setattrCommit) recordFloor(size int64) {
+	c.size, c.sizeKnown, c.floor, c.published = size, true, true, false
+}
+
+// recordExact states the size a truncate applied.
+func (c *setattrCommit) recordExact(size int64) {
+	c.size, c.sizeKnown, c.floor, c.published = size, true, false, false
 }
 
 // publishSetattrCommit publishes a committed truncate whose handler is about to
@@ -1352,7 +1377,7 @@ func (a *attach) publishSetattrCommit(
 	a.mu.Lock()
 	saved := a.beginReincarnationOwnerLocked(nil)
 	if rec := a.items[itemID]; rec != nil {
-		a.publishItemSizeLocked(itemID, rec, commit.size, false)
+		a.publishItemSizeLocked(itemID, rec, commit.size, commit.floor)
 		commit.published = true
 	}
 	ticket := a.endReincarnationOwnerLocked(saved)

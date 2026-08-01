@@ -1290,11 +1290,21 @@ type attach struct {
 	// so an acknowledged extension is invisible to the fence for the whole gap
 	// between them. See mutationseq.go. Guarded by mu.
 	itemMutations map[uint64]itemMutationSeq
-	handles       map[uint64]*handleRecord
-	localDirs     []string
-	localRoot     string
-	localFS       *confinedfs.Root
-	localVersions map[string]uint64
+	// refreshPins and sizeMutationReservations are the two halves of the
+	// item-scoped size-mutation token (refreshpin.go). A pin is one refresh's
+	// ownership of an item's size for the extent of its unix.Ftruncate(2); a
+	// reservation is one admitted size mutation's claim on the same item, held
+	// from pre-lock admission until its handler has published. A refresh may not
+	// arm over a reservation, and a mutation waits out a pin — which is what
+	// makes the ftruncate a linearization point rather than a checked guess.
+	// Both guarded by mu.
+	refreshPins              map[uint64]*refreshPin
+	sizeMutationReservations map[uint64]int
+	handles                  map[uint64]*handleRecord
+	localDirs                []string
+	localRoot                string
+	localFS                  *confinedfs.Root
+	localVersions            map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1368,6 +1378,14 @@ type attach struct {
 	// engine's own overlay or from a cache the mutation just filled. nil in
 	// production.
 	testControlWriteRefreshFails func() bool
+	// testAfterLocalFileWrite fires on the graft arm of a control replacement
+	// write at the instant the HOST inode has committed and nothing has been
+	// registered for it yet. It is the graft twin of testAfterWriteCommit, and
+	// it exists for the same reason: the step that follows the commit is a stat
+	// that can fail on its own terms, and that failure used to return an errno
+	// for a size change that had really happened with nothing recorded anywhere.
+	// nil in production.
+	testAfterLocalFileWrite func(path string)
 }
 
 type itemRecord struct {
