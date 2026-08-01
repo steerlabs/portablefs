@@ -1300,11 +1300,20 @@ type attach struct {
 	// Both guarded by mu.
 	refreshPins              map[uint64]*refreshPin
 	sizeMutationReservations map[uint64]int
-	handles                  map[uint64]*handleRecord
-	localDirs                []string
-	localRoot                string
-	localFS                  *confinedfs.Root
-	localVersions            map[string]uint64
+	// refreshIntents is the third half — the FAIRNESS half — of the same
+	// protocol (refreshintent.go). A pending refresh declares an intent on the
+	// item before it samples: reservations already outstanding drain on their
+	// own terms, arriving ones QUEUE, and the pass pins the item the moment the
+	// last outstanding one is released. Without it a refresh could only re-check
+	// what was reserved at each of its stale-sample ticks, so ordinary
+	// contention — one slow mutation, or a stream of overlapping writers —
+	// exhausted its whole budget and fail-froze the mount. Guarded by mu.
+	refreshIntents map[uint64]*refreshIntent
+	handles        map[uint64]*handleRecord
+	localDirs      []string
+	localRoot      string
+	localFS        *confinedfs.Root
+	localVersions  map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1386,6 +1395,14 @@ type attach struct {
 	// for a size change that had really happened with nothing recorded anywhere.
 	// nil in production.
 	testAfterLocalFileWrite func(path string)
+	// testRefreshWindowTeardown fires at the instant one refresh window's PIN
+	// has become invisible — removed from a.refreshPins and its waiters woken —
+	// with a.mu released. It exists because the teardown of a window is two
+	// removals, and a test has no other way to stand at the point BETWEEN them
+	// if they are not one step: the marker states "the daemon is inside its own
+	// ftruncate" and the pin is what makes that true, so a marker still visible
+	// here is a provenance claim with nothing behind it. nil in production.
+	testRefreshWindowTeardown func(path string, itemID uint64)
 }
 
 type itemRecord struct {
