@@ -61,7 +61,7 @@ func TestMutationAdmissionHoldsNoFrontendLock(t *testing.T) {
 	admitting := make(chan struct{})
 	releaseAdmission := make(chan struct{})
 	entered := false
-	a.testMutationAdmissionBarrier = func() {
+	a.testMutationAdmissionBarrier = func(context.Context) {
 		if entered {
 			return
 		}
@@ -142,7 +142,7 @@ func TestUnwindReAdmitsWithEveryFrontendLockReleased(t *testing.T) {
 	// takeable exclusively at that instant, which it can only be if this request
 	// is holding none of the frontend mirrors.
 	var passHeldLocks []bool
-	a.testMutationAdmissionBarrier = func() {
+	a.testMutationAdmissionBarrier = func(context.Context) {
 		gate := a.handles[handleID].operationLocks
 		free := make(chan struct{})
 		go func() {

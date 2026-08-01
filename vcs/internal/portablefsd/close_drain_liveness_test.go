@@ -66,7 +66,10 @@ func TestCloseContinuationNeverWaitsForADelegationHandoff(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		// Exactly what handleAttached does for a continuation.
+		// The reservation handleAttached makes for a nonpublishing
+		// continuation, plus a suspend/resume around it: a permanently
+		// suspended participant must be inert to both, never joining the
+		// publication set and never waiting for a handoff to end.
 		ctx, participant, participates, publishes, err := conn.beginLogicalOperation(
 			context.Background(), a, 1, false, &pfslocal.CloseRequest{Handle: 1},
 		)

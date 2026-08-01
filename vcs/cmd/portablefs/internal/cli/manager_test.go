@@ -548,6 +548,10 @@ func TestAccessLeaseReleaseRetriesSameOperationID(t *testing.T) {
 	k := newLeaseKeeper(m, nil, leaseState{
 		AccessLeaseID: "pfal_1", AccessToken: "lease_tok_1", ExpiresAtMs: 1700000600000, ControlSeq: "8",
 	}, nil)
+	// Pin the clock inside the fixture lease's TTL so this exercises the
+	// replay classification rather than the expiry bound, which
+	// TestAccessLeaseReleaseUnresolvedStopsAtTheLeaseExpiry covers.
+	k.now = leaseClock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -660,6 +664,108 @@ func TestLeaseKeeperEpochSupersededRenewsToSuccessWithTheSameIdentity(t *testing
 	}
 	if k.pendingRenew != "" {
 		t.Fatal("a completed renewal must clear the retained operationId")
+	}
+}
+
+// TestAccessLeaseReleaseEpochSupersededIsUnresolvedAndReplays pins the RELEASE
+// half of the same decision table. Release used to count
+// ACCESS_LEASE_EPOCH_SUPERSEDED as a satisfied release, so unmount reported
+// SUCCESS while the durable lease stayed active until its own expiry. It is a
+// statement about the MANAGER: the successor owns the same durable lease
+// ledger and completes the very same release. So it is UNRESOLVED — the same
+// operationId, accessLeaseId and accessToken replay until a definite answer.
+func TestAccessLeaseReleaseEpochSupersededIsUnresolvedAndReplays(t *testing.T) {
+	f := newFakeServer(t)
+	var releaseOps, releaseIDs, releaseTokens []string
+	attempts := 0
+	f.on("POST", "/v1/access-leases/release", func(body map[string]any) (int, string) {
+		attempts++
+		op, _ := body["operationId"].(string)
+		id, _ := body["accessLeaseId"].(string)
+		tok, _ := body["accessToken"].(string)
+		releaseOps = append(releaseOps, op)
+		releaseIDs = append(releaseIDs, id)
+		releaseTokens = append(releaseTokens, tok)
+		if attempts < 3 {
+			return 503, `{"error":{"code":"ACCESS_LEASE_EPOCH_SUPERSEDED","message":"Manager epoch 4 has been superseded; reacquire against the new manager."}}`
+		}
+		// The successor manager completes the very same release.
+		return 200, `{"lease":{"accessLeaseId":"pfal_epoch4","controlSeq":"9","expiresAt":1700000600000,"state":"released"}}`
+	})
+	created := 0
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+		created++
+		return 200, leaseCreateOK
+	})
+	m := newManagerClient(f.srv.URL, "mgr_tok")
+	k := newLeaseKeeper(m, nil, leaseState{
+		AccessLeaseID: "pfal_epoch4", AccessToken: "tok_epoch4", ExpiresAtMs: 1700000600000, ControlSeq: "7",
+	}, nil)
+	k.now = leaseClock()
+
+	const releaseOp = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := k.releaseWithOperation(ctx, releaseOp); err != nil {
+		t.Fatalf("the successor manager answered the release definitely: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("supersession must leave the release UNRESOLVED and replay it until a definite answer, got %d attempt(s)", attempts)
+	}
+	if created != 0 {
+		t.Fatalf("supersession must NEVER mint a replacement lease (created %d)", created)
+	}
+	for i := range releaseOps {
+		if releaseOps[i] != releaseOp {
+			t.Fatalf("release %d used operationId %q; the exact release operation must replay unchanged", i, releaseOps[i])
+		}
+		if releaseIDs[i] != "pfal_epoch4" {
+			t.Fatalf("release %d used lease identity %q; the identity must never change", i, releaseIDs[i])
+		}
+		if releaseTokens[i] != "tok_epoch4" {
+			t.Fatalf("release %d used accessToken %q; the credential must not drift", i, releaseTokens[i])
+		}
+	}
+}
+
+// TestAccessLeaseReleaseUnresolvedStopsAtTheLeaseExpiry mirrors the renewal
+// bound: the replay is bounded by a deadline the protocol already defines —
+// the lease's OWN expiry — and past it the release ends DEFINITELY, as a
+// reported failure rather than a silent success.
+func TestAccessLeaseReleaseUnresolvedStopsAtTheLeaseExpiry(t *testing.T) {
+	f := newFakeServer(t)
+	releases := 0
+	f.on("POST", "/v1/access-leases/release", func(map[string]any) (int, string) {
+		releases++
+		return 503, `{"error":{"code":"ACCESS_LEASE_EPOCH_SUPERSEDED","message":"superseded"}}`
+	})
+	created := 0
+	f.on("POST", "/v1/access-leases/create", func(map[string]any) (int, string) {
+		created++
+		return 200, leaseCreateOK
+	})
+	m := newManagerClient(f.srv.URL, "mgr_tok")
+	k := newLeaseKeeper(m, nil, leaseState{
+		AccessLeaseID: "pfal_late", AccessToken: "tok_late", ExpiresAtMs: 1700000600000, ControlSeq: "7",
+	}, nil)
+	// The clock is already past the lease's own expiry.
+	k.now = func() time.Time { return time.UnixMilli(1700000600001) }
+
+	const releaseOp = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := k.releaseWithOperation(ctx, releaseOp)
+	if err == nil {
+		t.Fatal("an unresolved release must never be reported as a completed release")
+	}
+	if !strings.Contains(err.Error(), "pfal_late") {
+		t.Fatalf("the reported failure must name the lease it could not release: %v", err)
+	}
+	if releases != 1 {
+		t.Fatalf("the release kept replaying past its definite end: %d attempts", releases)
+	}
+	if created != 0 {
+		t.Fatalf("the expiry bound must never mint a replacement lease (created %d)", created)
 	}
 }
 

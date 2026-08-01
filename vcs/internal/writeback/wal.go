@@ -1031,6 +1031,20 @@ func (w *streamWAL) unpinSegments(ordinals []uint64) {
 	w.mu.Unlock()
 }
 
+// reclaimUnlinkSegment and reclaimSyncDir are the indirections every segment
+// reclaim goes through — the online one here and the offline one at barrier B
+// of the recovery close-out. They exist so a test can record the exact ORDER of
+// unlinks and directory barriers a reclaim issues, and from that order derive
+// every set of unlinks a crash could have left persisted. Persistence order is
+// not syscall order: without a barrier between two unlinks, either, both, or
+// neither may survive the crash, and a surviving hole in the ordinal chain is
+// an unrecoverable stream. In production these are os.Remove and fsyncDir and
+// nothing else.
+var (
+	reclaimUnlinkSegment = os.Remove
+	reclaimSyncDir       = fsyncDir
+)
+
 // CheckpointAndReclaim is the ONE reclamation operation: it appends the
 // durable APPLIED checkpoint (through + the stream digest at through), syncs
 // it to media, and only then deletes whole segments fully covered by the
@@ -1072,6 +1086,16 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 	if err := w.syncLocked(); err != nil {
 		return err
 	}
+	// Ascending, EACH UNLINK MADE DURABLE BEFORE THE NEXT IS ISSUED. Persistence
+	// order is not syscall order: with a single trailing fsyncDir the whole
+	// batch is unordered against a crash, and the crash that persists the unlink
+	// of ordinal 2 but not ordinal 1 leaves a HOLE in the retained ordinal
+	// chain. scanStreamWithTailRepair rejects that gap as ErrCorrupt, so the
+	// stream comes back unreadable rather than merely shorter. One directory
+	// barrier per unlink reduces the reachable crash states to prefixes of this
+	// loop — a retained contiguous suffix, which is what the reader accepts.
+	// Reclaim is rare (it runs behind the applied watermark, at most once per
+	// retired segment), so the extra syncs are not on any hot path.
 	kept := make([]segmentInfo, 0, len(w.segments))
 	for i := range w.segments {
 		seg := w.segments[i]
@@ -1084,7 +1108,7 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 			_ = f.Close()
 			delete(w.files, seg.ordinal)
 		}
-		if err := os.Remove(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := reclaimUnlinkSegment(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			// The certificate is already durable but the space it was charged
 			// against did not come back. Retrying would append another one
 			// against the same segments, so the footprint would grow without a
@@ -1093,11 +1117,15 @@ func (w *streamWAL) CheckpointAndReclaim(through uint64, digest [32]byte, pinned
 			w.segments = kept
 			return w.failLocked(fmt.Errorf("reclaim segment %d: %w", seg.ordinal, err))
 		}
+		if err := reclaimSyncDir(w.dir); err != nil {
+			// The unlink is gone from the in-memory set either way; only the
+			// segments after it are still accounted for.
+			kept = append(kept, w.segments[i+1:]...)
+			w.segments = kept
+			return w.failLocked(fmt.Errorf("sync WAL directory after reclaiming segment %d: %w", seg.ordinal, err))
+		}
 	}
 	w.segments = kept
-	if err := fsyncDir(w.dir); err != nil {
-		return w.failLocked(fmt.Errorf("sync WAL directory after reclaim: %w", err))
-	}
 	return nil
 }
 

@@ -838,15 +838,31 @@ func appendRecoveryReleaseCertificate(
 		frameNo++
 		end += int64(len(body))
 	}
-	// Barrier B: reclaim, ascending, so every crash point leaves a contiguous
-	// ordinal suffix.
+	// Barrier B: reclaim, ascending, EACH UNLINK MADE DURABLE BEFORE THE NEXT IS
+	// ISSUED, so that every crash point leaves a contiguous ordinal suffix.
+	//
+	// Ascending issue order alone does not buy that. Persistence order is not
+	// syscall order: two unlinks with no directory barrier between them may
+	// reach media in either order, or one and not the other. A single trailing
+	// fsyncDir therefore leaves the whole batch unordered against a crash, and
+	// the crash that persists the unlink of ordinal 2 but not ordinal 1 leaves
+	// the HOLE {0,2,3}. That is not a survivable state: scanStreamWithTailRepair
+	// rejects a gap in the ordinal chain as ErrCorrupt, recoverStream maps
+	// ErrCorrupt to JobCorrupt, and attempt() treats JobCorrupt as terminal — so
+	// the stream parks forever with its delegation grants still checked out.
+	//
+	// One fsyncDir per unlink makes each removal a barrier of its own, which is
+	// what reduces the reachable crash states to prefixes of this loop, which is
+	// exactly the contiguous-suffix retained set the reader accepts. Close-out
+	// runs once per abandoned stream, so paying N directory syncs here is free
+	// next to the alternative of an unrecoverable stream.
 	for _, seg := range segments[:len(segments)-1] {
-		if err := os.Remove(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := reclaimUnlinkSegment(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("reclaim applied segment %s: %w", filepath.Base(seg.path), err)
 		}
-	}
-	if err := fsyncDir(dir); err != nil {
-		return fmt.Errorf("sync WAL directory after recovery reclaim: %w", err)
+		if err := reclaimSyncDir(dir); err != nil {
+			return fmt.Errorf("sync WAL directory after reclaiming %s: %w", filepath.Base(seg.path), err)
+		}
 	}
 	// Barrier C: the releases, now inside the budget.
 	var body []byte

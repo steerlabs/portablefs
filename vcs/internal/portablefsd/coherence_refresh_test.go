@@ -33,6 +33,13 @@ func (f *blockingFrontendLstatFS) Lstat(path string) (os.FileInfo, error) {
 	return f.FS.Lstat(path)
 }
 
+// beginTestLogicalOperation stands in for the dispatcher's whole path to
+// publication membership, which is TWO steps (handleAttached): the request
+// RESERVES its place in the logical operation suspended — holding nothing,
+// waiting for nothing, so its own admission cannot deadlock against it — and
+// then ACTIVATES into the publication set. A helper that only reserved would
+// hand back a request that is not a member, and every "a handoff must not
+// cross this" assertion below would pass vacuously.
 func beginTestLogicalOperation(
 	t *testing.T,
 	conn *frontendConn,
@@ -46,9 +53,38 @@ func beginTestLogicalOperation(
 		return context.Background(), nil, false, false,
 			errors.New("reserve logical operation failed")
 	}
-	return conn.beginLogicalOperation(
+	ctx, participant, participates, publishes, err := conn.beginLogicalOperation(
 		context.Background(), a, operationID, initialize, body,
 	)
+	if err != nil || participant == nil {
+		return ctx, participant, participates, publishes, err
+	}
+	if err := activateTestParticipant(ctx, a, participant); err != nil {
+		return ctx, participant, participates, publishes, err
+	}
+	return ctx, participant, participates, publishes, nil
+}
+
+// activateTestParticipant is enterFrontendMirrors without the mirrors: the
+// attempt/wait/retry loop the dispatcher runs, so a test request reaches
+// membership by the same route production does.
+func activateTestParticipant(
+	ctx context.Context,
+	a *attach,
+	participant *frontendOperationParticipant,
+) error {
+	for {
+		activated, err := a.tryActivateFrontendParticipant(participant)
+		if err != nil {
+			return err
+		}
+		if activated {
+			return nil
+		}
+		if err := a.awaitFrontendActivation(ctx, participant); err != nil {
+			return err
+		}
+	}
 }
 
 func exposeTestLogicalOperation(
@@ -875,17 +911,23 @@ func TestLogicalOperationIDsAreAdmittedInWireOrderNotHandlerOrder(t *testing.T) 
 	// Deliberately run the second handler first. Frame ingress already proved
 	// 1 then 2, so parallel goroutine scheduling must not reinterpret this as
 	// a malformed decreasing operation stream.
-	_, second, participates, publishes, err := conn.beginLogicalOperation(
+	ctxTwo, second, participates, publishes, err := conn.beginLogicalOperation(
 		context.Background(), a, 2, initializeTwo, &pfslocal.GetAttrRequest{},
 	)
 	if err != nil || !participates || !publishes || second == nil {
 		t.Fatalf("operation 2 admission: participant=%v err=%v", second, err)
 	}
-	_, first, participates, publishes, err := conn.beginLogicalOperation(
+	if err := activateTestParticipant(ctxTwo, a, second); err != nil {
+		t.Fatalf("operation 2 activation: %v", err)
+	}
+	ctxOne, first, participates, publishes, err := conn.beginLogicalOperation(
 		context.Background(), a, 1, initializeOne, &pfslocal.GetAttrRequest{},
 	)
 	if err != nil || !participates || !publishes || first == nil {
 		t.Fatalf("operation 1 admission: participant=%v err=%v", first, err)
+	}
+	if err := activateTestParticipant(ctxOne, a, first); err != nil {
+		t.Fatalf("operation 1 activation: %v", err)
 	}
 
 	a.finishFrontendParticipant(first)
