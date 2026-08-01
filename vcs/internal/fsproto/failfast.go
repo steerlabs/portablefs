@@ -25,8 +25,8 @@ package fsproto
 // stream's own 500ms reconnect loop (gate-exempt) doubles as an on-demand
 // probe — so recovery needs no operator action and no op ever has to burn a
 // full deadline to discover the authority came back. A credential install
-// flows through tokenForHandshake, so a probe after renewal also recovers a
-// previously-rejected handshake.
+// publishes the credential every handshake reads, so a probe after renewal also
+// recovers a previously-rejected handshake.
 //
 // Fail-fast is reachability state only. It never fences the exact session,
 // never drops parked identities (their replayer keeps retrying at its own
@@ -143,20 +143,27 @@ type connHealth struct {
 	// indefinite pending state.
 	//
 	// It is installed once, at client construction, and is therefore read
-	// WITHOUT h.mu — it takes the client's auth lock, and nesting the two
-	// would invent a lock order for no reason at all.
-	credExpiry func() int64
+	// WITHOUT h.mu — it reads the client's published credential, and nesting
+	// the two locks would invent a lock order for no reason at all.
+	//
+	// It returns the expiry TOGETHER WITH the generation that expiry belongs
+	// to. The pair is what makes the boundary safe to apply: an expiry read
+	// for generation G says nothing about generation G+1, and hardening G+1
+	// against G's deadline would declare a credential dead on a predecessor's
+	// terms.
+	credExpiry func() (int64, uint64)
 }
 
 func newConnHealth() *connHealth {
 	return &connHealth{now: time.Now, credGen: 1, credPending: true}
 }
 
-// statedExpiry is the CURRENT credential's own stated expiry (unix ms), or 0
-// when its issuer stated none. Never called with h.mu held.
-func (h *connHealth) statedExpiry() int64 {
+// statedExpiry is the CURRENT credential's own stated expiry (unix ms) and the
+// generation it belongs to; 0 expiry means the issuer stated none. Never called
+// with h.mu held.
+func (h *connHealth) statedExpiry() (int64, uint64) {
 	if h == nil || h.credExpiry == nil {
-		return 0
+		return 0, 0
 	}
 	return h.credExpiry()
 }
@@ -251,10 +258,17 @@ func (h *connHealth) recordCredentialRejected(gen uint64) {
 	h.mu.Unlock()
 }
 
-// installCredential opens a new credential generation. The new generation is
+// installCredential opens a new credential generation and PUBLISHES, under the
+// same lock, the exact credential that generation names. The new generation is
 // UNPROVEN — not healthy — until a handshake offering it says otherwise, which
-// is what Client.CredentialInstalled goes on to run.
-func (h *connHealth) installCredential() uint64 {
+// is what Client.InstallCredential goes on to run.
+//
+// publish runs while h.mu is held, so no observer can ever see a generation
+// without its token or a token without its generation. That pairing is the
+// whole point: the counter and the credential used to be written separately,
+// and a handshake that read one before and the other after filed its verdict
+// against a credential it had never presented.
+func (h *connHealth) installCredential(publish func(gen uint64)) uint64 {
 	if h == nil {
 		return 0
 	}
@@ -264,6 +278,9 @@ func (h *connHealth) installCredential() uint64 {
 	h.credRejectedAt = 0
 	h.credVerifiedAt = 0
 	h.credPending = true
+	if publish != nil {
+		publish(h.credGen)
+	}
 	return h.credGen
 }
 
@@ -280,8 +297,14 @@ func (h *connHealth) pendingLocked() bool {
 // old CLIs, static --addr mounts and VCS_AUTH_TOKEN all land there, and none
 // of them may start reporting a dead credential just because this boundary now
 // exists. A deadline is only ever honoured when somebody actually stated one.
-func (h *connHealth) hardenedLocked(expiresAtMs int64) bool {
-	if expiresAtMs <= 0 || !h.pendingLocked() {
+//
+// expiryGen is the generation that deadline was published with. It is read
+// outside h.mu, so an install can land in between; a deadline belonging to a
+// SUPERSEDED credential says nothing about the current one, and applying it
+// would harden a freshly installed credential on its predecessor's terms.
+// A pair that no longer names the current generation simply does not apply.
+func (h *connHealth) hardenedLocked(expiresAtMs int64, expiryGen uint64) bool {
+	if expiresAtMs <= 0 || expiryGen != h.credGen || !h.pendingLocked() {
 		return false
 	}
 	return !h.now().Before(time.UnixMilli(expiresAtMs))
@@ -294,13 +317,13 @@ func (h *connHealth) credentialDead() bool {
 	if h == nil {
 		return false
 	}
-	expiresAtMs := h.statedExpiry()
+	expiresAtMs, expiryGen := h.statedExpiry()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.credRejectedAt != 0 && h.credRejectedAt == h.credGen {
 		return true
 	}
-	return h.hardenedLocked(expiresAtMs)
+	return h.hardenedLocked(expiresAtMs, expiryGen)
 }
 
 // credentialUnproven reports that the current generation has neither been
@@ -312,10 +335,10 @@ func (h *connHealth) credentialUnproven() bool {
 	if h == nil {
 		return false
 	}
-	expiresAtMs := h.statedExpiry()
+	expiresAtMs, expiryGen := h.statedExpiry()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.pendingLocked() && !h.hardenedLocked(expiresAtMs)
+	return h.pendingLocked() && !h.hardenedLocked(expiresAtMs, expiryGen)
 }
 
 // generationPending reports whether gen is STILL the current generation and
@@ -449,21 +472,33 @@ func (c *Client) CredentialRejected() bool { return c.health.credentialDead() }
 // down before the ack: look at the router, not at the login.
 func (c *Client) CredentialUnproven() bool { return c.health.credentialUnproven() }
 
-// CredentialInstalled opens a new credential generation and IMMEDIATELY proves
-// it, with a bounded, gate-exempt handshake, on this call's own goroutine
-// budget (asynchronously, so an installer is never blocked by a dead peer).
+// CredentialGeneration reports the generation of the credential this client is
+// currently offering to handshakes. It exists so callers (and tests) can prove
+// that ONE credential installation opens exactly ONE generation: the seam
+// between clientcore and the daemon used to bump it twice — once through the
+// token setter and once through a separate "installed" notification — opening a
+// generation that nothing would ever go on to prove.
+func (c *Client) CredentialGeneration() uint64 { return c.health.generation() }
+
+// installVerify starts verification for a freshly opened generation and re-arms
+// the reachability prober when the transport breaker had latched.
 //
-// It used to merely clear the verdict bool and start the prober only when the
-// transport breaker happened to be engaged. Installing a second INVALID
-// credential therefore moved the mount from "credential rejected" to "healthy",
-// with nothing anywhere having offered the new credential to anyone: the mount
-// reported recovered and untested, and the next real op discovered the truth.
+// It used to be the whole of installation: clear the verdict bool, and start
+// the prober only when the breaker happened to be engaged. Installing a second
+// INVALID credential therefore moved the mount from "credential rejected" to
+// "healthy", with nothing anywhere having offered the new credential to anyone:
+// the mount reported recovered and untested, and the next real op discovered
+// the truth.
 //
 // Installation now enters VERIFICATION-PENDING (see connHealth.credPending) and
 // runs the handshake at once. Only that handshake — offering this generation —
 // can move it to verified or to latched-rejected.
-func (c *Client) CredentialInstalled() {
-	gen := c.health.installCredential()
+func (c *Client) installVerify(gen uint64) {
+	// A client with no health tracker (an embedder-built zero Client) opened no
+	// generation, so there is nothing to verify and nobody to tell.
+	if c.health == nil || gen == 0 {
+		return
+	}
 	c.health.mu.Lock()
 	onEngage := c.health.onEngage
 	engaged := c.health.engaged
@@ -514,7 +549,12 @@ func (c *Client) verifyCredential(gen uint64) {
 		if !c.health.generationPending(gen) {
 			return
 		}
-		expiresAtMs := c.health.statedExpiry()
+		expiresAtMs, expiryGen := c.health.statedExpiry()
+		if expiryGen != gen {
+			// The deadline on offer belongs to some other credential; this
+			// generation has been superseded and owns no boundary any more.
+			return
+		}
 		if expiresAtMs <= 0 {
 			// No stated deadline: no boundary, so no loop.
 			return
@@ -584,7 +624,7 @@ func (c *Client) runReachabilityProbe() {
 			// (refused). Ops then surface a credential-expired classification
 			// instead of a reachability one, and this loop stops: nothing it
 			// can do changes a rejected credential. A credential INSTALL
-			// re-arms it (see CredentialInstalled).
+			// re-arms it (see InstallCredential).
 			// The verdict was already latched, against the exact generation the
 			// refused handshake offered, by conn.ensureWithGate.
 			return
@@ -599,14 +639,15 @@ func (c *Client) runReachabilityProbe() {
 
 // probeAuthority performs one bounded dial + auth handshake and CLASSIFIES the
 // result. Success proves the authority is reachable AND accepting this client's
-// current credential (tokenForHandshake reads the live source, so a credential
-// install is picked up automatically); an explicit token rejection proves it is
-// reachable and this credential is dead.
+// current credential (credentialForHandshake reads the published value, so a
+// credential install is picked up automatically, and the verdict it records
+// names that installation's own generation); an explicit token rejection proves
+// it is reachable and this credential is dead.
 func (c *Client) probeAuthority() probeOutcome {
 	cn := &conn{
 		addrs:       c.addrs,
 		tls:         c.tls,
-		auth:        c.tokenForHandshake,
+		auth:        c.credentialForHandshake,
 		transport:   c.transport,
 		client:      c,
 		health:      c.health,

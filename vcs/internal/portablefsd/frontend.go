@@ -266,6 +266,23 @@ func (c *frontendConn) close() {
 		// remaining coherence obligation.
 		for _, op := range orphaned {
 			op.attach.finishFrontendOperation(op)
+			// A CROSSING'S REPAIR SURVIVES THE CONNECTION THAT LOST IT.
+			//
+			// Retiring the gate membership resolves the ACKNOWLEDGEMENT, which
+			// is a statement about a live frontend and is genuinely moot once
+			// the frontend is gone. It does not resolve a crossing: the FSKit
+			// mount outlives the daemon connection (an extension reconnects to
+			// a restarted daemon and keeps every vnode it holds), so a scope a
+			// handoff crossed can still be cached in a kernel this daemon is
+			// about to go on serving. Dropping the debt here left that state
+			// with nothing to contradict it, permanently and silently.
+			//
+			// The repair runs off the teardown path because it reaches the
+			// kernel through the mount and is bounded in minutes, while this
+			// function is on the connection's close and is about to join every
+			// handler. Its own failure verdict is terminal for the attach, which
+			// is where a failed coherence repair belongs.
+			go op.attach.dischargeFrontendPublicationFence(op)
 		}
 		// A handler may still be completing a local syscall or mutation after
 		// cancellation. Joining it here keeps connection teardown ordered
@@ -345,10 +362,86 @@ func (c *frontendConn) replyWithPublication(
 		RequestID:              req,
 		PublicationAckRequired: ackRequired,
 		Body:                   body,
+		// THE RETRACTION RIDES THE REPLY, AND THAT IS THE WHOLE ORDERING.
+		//
+		// A handoff that crossed this operation needs the frontend to discard
+		// what the operation collected BEFORE the framework installs it, and
+		// the install happens the instant the callback returns. Stamping the
+		// verdict on the reply the callback is waiting for makes that ordering
+		// a property of the byte stream rather than of anything the two sides
+		// have to agree about: one frame, delivered once, and the callback
+		// cannot proceed past it.
+		//
+		// It is read on EVERY reply of the operation, not only publishing ones.
+		// The reply that unblocks the callback is the initiator's — the request
+		// parked inside the delegation release — and whether that request
+		// happens to publish is unrelated to whether it is the last one the
+		// callback is waiting for.
+		PublicationRetracted: c.publicationRetracted(operationID),
 	}); err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
 	}
+}
+
+// publicationRetracted answers whether a delegation handoff has crossed this
+// operation, so its reply must tell the frontend to install nothing.
+//
+// ── THE INVARIANT THE FRONTEND DEPENDS ON, CHECKED HERE ─────────────────────
+//
+// A retraction is only ever carried on an operation that has ALREADY written an
+// acknowledgement-required reply on this connection. The frontend relies on
+// that: it learns which connection owes the acknowledgement from the earlier
+// ack-required reply, so a retraction arriving as an operation's FIRST reply
+// would leave it holding no connection to acknowledge on, and the daemon would
+// wait out its settle window for an acknowledgement nobody could send.
+//
+// The invariant is structural — op.retracted is set only by a crossing, and
+// publicationBlockersLocked only ever nominates an operation with op.published
+// set, which notePublicationExposed sets from markPublicationReplyExposed, i.e.
+// from a written ack-required reply on this same connection. An operation never
+// spans connections either: it is created per connection and every operation is
+// retired when its connection closes.
+//
+// It is checked rather than assumed anyway, because the failure it prevents is
+// a silent hang rather than a wrong answer, and because "structural" is a claim
+// about code that has now been rearranged several times. A retraction that
+// somehow reached an unexposed operation is DROPPED and announced, which fails
+// towards the behaviour that existed before retractions did.
+func (c *frontendConn) publicationRetracted(operationID uint64) bool {
+	if operationID == 0 {
+		return false
+	}
+	c.publicationMu.Lock()
+	entry := c.operations[operationID]
+	var (
+		op      *frontendOperation
+		exposed bool
+	)
+	if entry != nil {
+		op, exposed = entry.op, entry.replyExposed
+	}
+	c.publicationMu.Unlock()
+	if op == nil {
+		return false
+	}
+	// publicationMu is released first. The gate lock is taken from this
+	// connection's side in exactly one other place
+	// (markPublicationReplyExposed) and with the same discipline, so the two
+	// stay unordered rather than newly nested.
+	if !op.attach.publicationRetracted(op) {
+		return false
+	}
+	if !exposed {
+		log.Printf(
+			"portablefsd: attach %s retracted logical operation %d before it had "+
+				"exposed any reply; the retraction is dropped because the frontend "+
+				"would have no connection to acknowledge it on",
+			op.attach.ref, operationID,
+		)
+		return false
+	}
+	return true
 }
 
 func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
@@ -384,6 +477,17 @@ func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 
 func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
 	c.reply(req, &pfslocal.ErrorReply{Errno: eno, Message: msg})
+}
+
+// errorReplyForOperation is errorReply for a request that belongs to a logical
+// operation but does not publish. It exists only so the reply can carry a
+// retraction: a non-publishing request is very often the LAST one a framework
+// callback is waiting for, and a retraction that misses that reply misses the
+// only carrier it had.
+func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32, msg string) {
+	c.replyWithPublication(
+		req, operationID, &pfslocal.ErrorReply{Errno: eno, Message: msg}, false,
+	)
 }
 
 func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
@@ -716,7 +820,7 @@ func (c *frontendConn) handleAttached(
 				true,
 			)
 		} else {
-			c.errorReply(requestID, darwinEIO, err.Error())
+			c.errorReplyForOperation(requestID, operationID, darwinEIO, err.Error())
 		}
 		return
 	}
@@ -736,6 +840,34 @@ func (c *frontendConn) handleAttached(
 		if admitEno != 0 {
 			settleOnce()
 			reply, eno = nil, admitEno
+			break
+		}
+		if participant != nil && a.publicationRetracted(participant.op) {
+			// A HANDOFF CROSSED THIS OPERATION WHILE ITS ADMISSION RAN, SO THIS
+			// REQUEST MUST NOT EXECUTE.
+			//
+			// The crossing retracts everything the operation published, and the
+			// frontend answers by failing the whole framework callback. If this
+			// request had already run, that failure would be a lie about a
+			// mutation that really happened: the shape that reaches a crossing is
+			// a callback whose LAST request is the one that needed the delegation
+			// released, so `rm` would remove the file, be reported as interrupted,
+			// and answer ENOENT on the retry the interruption asks for.
+			//
+			// Refusing here is what makes the retraction safe for mutations, and
+			// it is reachable only because the release has ALREADY COMPLETED by
+			// the time it is checked. That is the whole difference from refusing
+			// the mutation up front: a refusal taken before the release leaves the
+			// delegation in place, so the retry runs the identical callback,
+			// exposes the identical sibling publication, and is refused again
+			// forever. Taken here, the delegation is gone, the retry has nothing
+			// left to release, and it reaches this point at most once.
+			//
+			// EINTR is the honest answer — nothing was attempted and nothing was
+			// published — and it is the errno the frontend was going to surface
+			// for the retraction anyway.
+			settleOnce()
+			reply, eno = nil, darwinEINTR
 			break
 		}
 		var replied bool
@@ -787,7 +919,9 @@ func (c *frontendConn) handleAttached(
 				true,
 			)
 		} else {
-			c.errorReply(requestID, eno, errMessage(fmt.Sprintf("%T", body), eno))
+			c.errorReplyForOperation(
+				requestID, operationID, eno, errMessage(fmt.Sprintf("%T", body), eno),
+			)
 		}
 		return
 	}

@@ -24,7 +24,9 @@
 // Item attribute/xattr operations after unlink or rename-over. Protocol minor
 // 5 adds frontend parent identity, BSD flags, and allocated size to Attr so
 // FSKit can satisfy its requested-attribute contract without inventing
-// metadata.
+// metadata. Protocol minor 6 adds Envelope.publication_retracted, the
+// daemon's instruction that an operation's already-delivered results must
+// never be installed into the frontend's cache.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -83,6 +85,40 @@ message Envelope {
   // across handoffs. Protocol minor 3 introduced this lazy allocation rule;
   // a fresh nonpublishing request with a nonzero ID is a protocol violation.
   uint64 operation_id = 3;
+  // Set on a daemon reply for an operation whose ALREADY-DELIVERED results
+  // must never be installed into the frontend's cache. The daemon retracts
+  // when a delegation handoff has crossed that operation: the frontend is
+  // holding pre-handoff values, a peer may already have acquired the
+  // delegation and mutated, and installing those values would let an
+  // application read a stale byte after a remote write it happens-after.
+  //
+  // WHY IT RIDES A REPLY FRAME rather than travelling as its own message:
+  // ordering is the entire mechanism. The crossing case only arises while
+  // the operation still has parked participants — requests in flight that
+  // WILL be answered — and a framework callback cannot return before its
+  // last request is answered. So at least one further reply for that
+  // operation is written AFTER the crossing, and a bit on that reply's
+  // envelope is therefore strictly ordered before the framework install. A
+  // standalone retraction message would carry no such ordering: frontends
+  // dispatch inbound frames concurrently (the FSKit extension hands each
+  // decoded frame to its own Task), so a separate frame can be observed
+  // after the reply it was meant to precede. Same frame, no reordering.
+  //
+  // A retracted operation still owes its PublicationAck. Retraction governs
+  // what the FRONTEND installs; the ack is the daemon's own handoff gate and
+  // must be released either way, or the daemon waits on a callback that has
+  // already given up.
+  //
+  // UNLIKE the O_APPEND and chflags fields described below, this one IS
+  // gated behind a minor bump (5 -> 6), and deliberately so. Those fields
+  // default to a value that reproduces the previous behaviour exactly, so a
+  // frontend that ignores them is merely missing a feature. A frontend that
+  // ignores THIS bit installs state the daemon has retracted — a silent
+  // correctness failure, invisible to both ends, and not expressible as a
+  // missing feature. The daemon rejects any frontend whose minor is below
+  // its own, and that rejection IS the gate: it is the only mechanism that
+  // can guarantee no connected frontend ignores the bit.
+  bool publication_retracted = 4;
   oneof body {
     // client → daemon
     Hello hello = 10;
@@ -151,7 +187,7 @@ message Envelope {
 
 message Hello {
   uint32 protocol_major = 1; // 1
-  uint32 protocol_minor = 2; // 5
+  uint32 protocol_minor = 2; // 6
   string client_name = 3;    // e.g. "fskit-appex"
   string client_version = 4;
 }

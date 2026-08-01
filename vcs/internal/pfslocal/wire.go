@@ -22,6 +22,7 @@ func MarshalEnvelope(e *Envelope) ([]byte, error) {
 	b = appendU64(b, 1, e.RequestID)
 	b = appendBool(b, 2, e.PublicationAckRequired)
 	b = appendU64(b, 3, e.OperationID)
+	b = appendBool(b, 4, e.PublicationRetracted)
 	if e.Body == nil {
 		return b, nil
 	}
@@ -62,6 +63,16 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.PublicationAckRequired = v != 0
+		case 4:
+			if wt != wireVarint {
+				return nil, ErrMalformed
+			}
+			var v uint64
+			v, b, err = consumeVarint(b)
+			if err != nil {
+				return nil, err
+			}
+			e.PublicationRetracted = v != 0
 		case 3:
 			if wt != wireVarint {
 				return nil, ErrMalformed

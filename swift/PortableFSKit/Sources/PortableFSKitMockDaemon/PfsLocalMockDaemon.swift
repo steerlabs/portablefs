@@ -161,6 +161,32 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.loseNextRetiredCloseReply(errno: errno)
     }
 
+    /// Marks the next `count` publication-bearing replies as retracted,
+    /// modelling the daemon discovering that a delegation handoff crossed the
+    /// operation those replies belong to.
+    ///
+    /// The retraction rides an ordinary reply rather than arriving as its own
+    /// frame, which is the whole ordering argument: the frontend cannot see it
+    /// after the values it condemns. A mock that emitted a separate message
+    /// would be testing a protocol this one does not have.
+    public func retractNextPublications(count: Int = 1) async {
+        await fileSystem.retractNextPublications(count: count)
+    }
+
+    /// Retracts the next `count` publication-bearing requests AND refuses them
+    /// without executing, which is what the real daemon does once an operation
+    /// has been crossed: it fails every still-undispatched request of that
+    /// operation EINTR rather than running it.
+    ///
+    /// This is the production shape of a retraction. The bit rides the
+    /// refusal's own reply, so the frame that condemns the operation is
+    /// usually an ErrorReply rather than a successful one — and a mutation
+    /// that was waiting on the handoff never lands, which is what lets the
+    /// frontend answer EINTR without lying about what happened.
+    public func refuseNextPublicationsAsRetracted(count: Int = 1) async {
+        await fileSystem.refuseNextPublicationsAsRetracted(count: count)
+    }
+
     public func delayNextOpen(nanoseconds: UInt64) async {
         await fileSystem.delayNextOpen(nanoseconds: nanoseconds)
     }
@@ -506,6 +532,8 @@ private actor MockFileSystem {
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
     private var publicationAcks = 0
+    private var pendingRetractions = 0
+    private var pendingRetractionRefusals = 0
     private var pendingCloseFailures = 0
     private var pendingRetiredCloseErrnos: [Int32] = []
     private var pendingLostRetiredCloseErrnos: [Int32] = []
@@ -554,6 +582,14 @@ private actor MockFileSystem {
         publicationAcks = 0
     }
 
+    func retractNextPublications(count: Int) {
+        pendingRetractions += count
+    }
+
+    func refuseNextPublicationsAsRetracted(count: Int) {
+        pendingRetractionRefusals += count
+    }
+
     func failNextClose() {
         pendingCloseFailures += 1
     }
@@ -597,6 +633,23 @@ private actor MockFileSystem {
                 reply.publicationAckRequired = true
             default:
                 reply.publicationAckRequired = false
+            }
+            // Only a reply the frontend could publish can be retracted, and
+            // the retraction still leaves the acknowledgement owed: the
+            // daemon's handoff gate is released by the ack, not by whether
+            // the frontend kept the values.
+            if reply.publicationAckRequired && pendingRetractions > 0 {
+                pendingRetractions -= 1
+                reply.publicationRetracted = true
+            }
+            // The refusal arm must throw BEFORE the dispatch switch below, or
+            // the mock would be modelling a daemon that retracts an operation
+            // and mutates for it anyway — precisely the state the real
+            // daemon's pre-dispatch check exists to make unreachable.
+            if reply.publicationAckRequired && pendingRetractionRefusals > 0 {
+                pendingRetractionRefusals -= 1
+                reply.publicationRetracted = true
+                throw MockPOSIXError(errno: EINTR, message: "operation retracted before dispatch")
             }
             switch body {
             case let .hello(request):

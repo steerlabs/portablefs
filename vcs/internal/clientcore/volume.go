@@ -1538,15 +1538,30 @@ func (h volumeInvalidationHandler) ReleaseSubtree(path string) {
 	}
 }
 
-// SetAuthToken updates the static token used by future reconnect handshakes. An installed
-// CredentialSource takes precedence and is left intact (see fsproto.Client.SetAuthToken).
-func (v *Volume) SetAuthToken(tok string) { v.client.SetAuthToken(tok) }
+// InstallCredential is the clientcore-level credential installation entry
+// point: EVERY renewal, rotation and re-login goes through it, and one call
+// opens exactly ONE credential generation and verifies it.
+//
+// It replaces the three-method arrangement (SetAuthToken to move the token,
+// RenewCredential to mean it, CredentialInstalled to re-arm the prober) that
+// let one logical installation reach the client twice. The daemon called the
+// token setter and then the notification, so a single rotation bumped the
+// generation counter twice: the intermediate generation was opened, never
+// offered to anybody, and immediately superseded — an unproven generation by
+// construction, and one no handshake would ever go on to prove.
+//
+// expiresAtMs is the credential issuer's OWN stated deadline (0 = it stated
+// none). It travels with the token because it is what bounds the UNPROVEN
+// state: past it an untested credential hardens into the definite expired
+// verdict instead of pending forever.
+func (v *Volume) InstallCredential(tok string, expiresAtMs int64) {
+	v.client.InstallCredential(fsproto.Credential{Token: tok, ExpiresAtMs: expiresAtMs})
+}
 
-// RenewCredential is the clientcore-level credential renewal entry point. Precedence (m3): when the
-// volume was configured with a CredentialSource, renewal flows through that source on the next
-// handshake and this static token is only a fallback — so RenewCredential can never pin a
-// source-configured volume to a stale static token.
-func (v *Volume) RenewCredential(tok string) { v.SetAuthToken(tok) }
+// CredentialGeneration reports the generation of the credential the data plane
+// is currently offering. It exists so a caller can prove that one installation
+// opens exactly one generation.
+func (v *Volume) CredentialGeneration() uint64 { return v.client.CredentialGeneration() }
 
 // protectOpenPins establishes an authority-durable open pin for every open
 // handle under scope and returns the subtree handoff barrier the engine must
@@ -1823,13 +1838,6 @@ func (v *Volume) CredentialExpired() bool {
 // fsproto.Client.CredentialUnproven), so the two are never simultaneously true.
 func (v *Volume) CredentialUnproven() bool {
 	return v.client.CredentialUnproven()
-}
-
-// CredentialInstalled re-arms reachability probing after the daemon installs a
-// fresh access credential, so a mount that latched a credential verdict can
-// recover without a restart when the new credential is accepted.
-func (v *Volume) CredentialInstalled() {
-	v.client.CredentialInstalled()
 }
 
 // SessionFenced reports whether the mount session was fenced (stale

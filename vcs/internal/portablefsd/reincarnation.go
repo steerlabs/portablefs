@@ -121,8 +121,9 @@ type reincarnationTicket struct {
 // a refresh can itself discover a further reincarnation. That newly created debt
 // must join the SAME ticket rather than becoming an orphan nobody owns.
 type reincarnationOwnerScope struct {
-	armed  bool
-	ticket *reincarnationTicket
+	armed    bool
+	ticket   *reincarnationTicket
+	settling bool
 }
 
 // reincarnationSettleAttempts bounds how many times one alias may be re-attempted
@@ -137,8 +138,23 @@ const reincarnationSettleAttempts = 8
 // about to run under a.mu. Pass nil to mint a fresh ticket on demand, or an
 // existing ticket to add to it. Callers hold a.mu.
 func (a *attach) beginReincarnationOwnerLocked(t *reincarnationTicket) reincarnationOwnerScope {
-	saved := reincarnationOwnerScope{armed: a.reincarnationArmed, ticket: a.reincarnationOwner}
+	saved := reincarnationOwnerScope{
+		armed:    a.reincarnationArmed,
+		ticket:   a.reincarnationOwner,
+		settling: a.reincarnationSettling,
+	}
 	a.reincarnationArmed, a.reincarnationOwner = true, t
+	return saved
+}
+
+// beginReincarnationSettleLocked arms the reconciliation's OWN install. It is
+// the one registration over an indebted alias that must not mint further debt
+// for it: that registration IS the payment, so treating it as another publisher
+// arriving over unsettled state would bump the requirement it is in the middle
+// of satisfying and the alias would never converge. Callers hold a.mu.
+func (a *attach) beginReincarnationSettleLocked(t *reincarnationTicket) reincarnationOwnerScope {
+	saved := a.beginReincarnationOwnerLocked(t)
+	a.reincarnationSettling = true
 	return saved
 }
 
@@ -148,6 +164,7 @@ func (a *attach) beginReincarnationOwnerLocked(t *reincarnationTicket) reincarna
 func (a *attach) endReincarnationOwnerLocked(saved reincarnationOwnerScope) *reincarnationTicket {
 	t := a.reincarnationOwner
 	a.reincarnationArmed, a.reincarnationOwner = saved.armed, saved.ticket
+	a.reincarnationSettling = saved.settling
 	return t
 }
 
@@ -178,6 +195,28 @@ func (a *attach) recordReincarnationDebtLocked(alias string) {
 		a.reincarnatedAliases[alias] = st
 	}
 	st.needGen++
+	// OPENING THE DEBT AND RETIRING THE OBSERVATION ARE ONE EVENT.
+	//
+	// The debt says "this alias's cached attributes predate a reincarnation".
+	// Leaving those attributes reachable while saying so is the whole hole:
+	// another publisher's getattr(alias) between here and the reconciliation
+	// gets a cache hit, and a cache hit is served without any authority round
+	// trip, without any observation to gate, and — before publication admission
+	// existed — with an inert ticket that settled instantly. It published the
+	// pre-reincarnation snapshot beside the post-reincarnation identity, which
+	// is the impossible attribute pair this whole file exists to prevent.
+	//
+	// The eviction used to live in settleAliasDebt, which is the wrong place by
+	// construction: that runs with a.mu RELEASED, so the window between opening
+	// the debt and evicting the observation was exactly the window a competing
+	// publisher fits into. Under a.mu, with the bump, there is no such window.
+	//
+	// a.vol is read directly rather than through volOrErr because that helper
+	// takes a.mu, which this caller already holds. A detached or unattached
+	// mount has no cache to retire and nothing to publish from it either.
+	if a.vol != nil {
+		a.vol.AttrCache.Evict(alias)
+	}
 	if !a.reincarnationArmed {
 		// Unowned debt. Every registration that can displace a pathname is
 		// armed by its publisher, so reaching here means a new call site was
@@ -193,6 +232,53 @@ func (a *attach) recordReincarnationDebtLocked(alias string) {
 		a.reincarnationOwner = &reincarnationTicket{a: a}
 	}
 	a.reincarnationOwner.requireLocked(alias, st.needGen)
+}
+
+// admitPublicationLocked is PUBLICATION ADMISSION for one pathname, and it runs
+// on every registration that could put that pathname's attributes in front of an
+// application. Callers hold a.mu.
+//
+// ── WHY REGISTERING OVER AN INDEBTED ALIAS IS ITSELF AN EVENT ───────────────
+//
+// Outstanding debt on an alias is a statement that the newest thing the daemon
+// holds for it is known to predate a reincarnation. A publisher that registers
+// its own observation of that alias is therefore doing one of two things, and
+// the daemon cannot tell which:
+//
+//   - it read AFTER the debt opened, so its observation is post-reincarnation
+//     and installing it is exactly right;
+//   - it read BEFORE the debt opened — a cache hit taken a moment earlier, an
+//     authority round trip already in flight — so its observation is the very
+//     snapshot the debt exists to retire, and it has just written it into the
+//     registry and is about to expose it.
+//
+// Nothing on either observation orders them: a plain getattr carries no version
+// the daemon can compare, which is why the alias needed a debt rather than a
+// version floor in the first place.
+//
+// So the publisher does not JOIN the outstanding generation — it MINTS A NEW
+// ONE. Joining is not enough and the difference is not academic: a runner that
+// completes between the competing read and this registration would satisfy the
+// joined generation with a refresh that happened BEFORE the stale value was
+// written, and the publisher would then re-read its own stale write and call it
+// reconciled. A fresh generation forces a refresh that is ordered strictly after
+// this registration, so whatever this publisher just wrote is overwritten by an
+// authority observation taken later than it, and the publisher's reply carries
+// that.
+//
+// The cost is one authority round trip for a publisher that touches an alias
+// with reconciliation outstanding — a state that lasts exactly as long as one
+// refresh, on the rare path where a peer replaced a hard-linked name.
+func (a *attach) admitPublicationLocked(p string) {
+	if a.reincarnationSettling {
+		// The reconciliation's own install. See beginReincarnationSettleLocked.
+		return
+	}
+	st := a.reincarnatedAliases[p]
+	if st == nil || st.doneGen >= st.needGen {
+		return
+	}
+	a.recordReincarnationDebtLocked(p)
 }
 
 // requireLocked adds one (alias, generation) obligation. Callers hold a.mu.
@@ -232,10 +318,18 @@ func (a *attach) debtOutstanding(alias string) bool {
 //
 // A nil (inert) ticket settles instantly, which is the whole point of minting
 // one per registration rather than draining a shared bag.
-func (t *reincarnationTicket) settle(ctx context.Context, vol *clientcore.Volume) int32 {
+//
+// reconciled reports that this ticket owned at least one obligation, which is
+// exactly the condition under which the publisher's OWN pre-settle attribute
+// snapshot may be older than the registry it just repaired. The publisher must
+// answer from the registry in that case; see attach.reconciledAttr.
+func (t *reincarnationTicket) settle(
+	ctx context.Context, vol *clientcore.Volume,
+) (eno int32, reconciled bool) {
 	if t == nil || len(t.need) == 0 {
-		return 0
+		return 0, false
 	}
+	reconciled = true
 	a := t.a
 	// The budget is per-alias, not per-loop-iteration, because a coalesced
 	// waiter consumes an iteration without doing any work of its own.
@@ -243,18 +337,50 @@ func (t *reincarnationTicket) settle(ctx context.Context, vol *clientcore.Volume
 	for {
 		alias, want, ok := a.nextUnsettledDebt(t)
 		if !ok {
-			return 0
+			return 0, reconciled
 		}
 		if budget <= 0 {
 			log.Printf("portablefsd: attach %s could not settle reincarnation debt for %q",
 				a.ref, alias)
-			return darwinEIO
+			return darwinEIO, reconciled
 		}
 		budget--
 		if eno := a.settleAliasDebt(ctx, vol, t, alias, want); eno != 0 {
-			return eno
+			return eno, reconciled
 		}
 	}
+}
+
+// reconciledAttr is the ORDERING BARRIER between a reconciliation and the reply
+// that waited for it.
+//
+// A publisher that settled a non-inert ticket has just paid for an alias whose
+// retained snapshot was known to be stale, and the payment installed a strictly
+// later authority observation into the registry. Its own `attr` variable is the
+// snapshot it read on the way in — which, on the interleaving publication
+// admission exists to catch, is the pre-reincarnation one. Answering from it
+// would put the exact value the debt retired back in front of the application,
+// having just gone to the authority to establish that it was wrong.
+//
+// So the reply is answered from the record. That is not a fallback and it is
+// never worse: the registry is the mount's attribute store, the publisher's own
+// registration wrote `attr` into it a moment ago, and anything that has moved it
+// since is by construction newer. fallback covers the record having been
+// detached (a second reincarnation) in the meantime, where there is nothing
+// newer to answer from and the caller's own snapshot is all that exists.
+func (a *attach) reconciledAttr(rec *itemRecord, fallback fsproto.Attr) fsproto.Attr {
+	if rec == nil {
+		return fallback
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if current := a.paths[rec.path]; current != nil && current.item == rec.item {
+		return current.attr
+	}
+	if current := a.items[rec.item.ItemID]; current != nil {
+		return current.attr
+	}
+	return fallback
 }
 
 // nextUnsettledDebt picks this ticket's lowest-named outstanding obligation and
@@ -402,22 +528,56 @@ func (a *attach) settleAliasDebt(
 	if install {
 		// Arm the ticket across the install so that a reincarnation THIS refresh
 		// discovers joins the same ticket instead of becoming an orphan the
-		// take-all could never see.
-		saved := a.beginReincarnationOwnerLocked(t)
+		// take-all could never see. The settling arm additionally exempts this
+		// one registration from publication admission — it IS the payment, not
+		// another publisher arriving over unsettled state.
+		saved := a.beginReincarnationSettleLocked(t)
 		if fromHost {
 			a.registerLocalLocked(alias, attr)
 		} else {
 			// THE GATE. InstallOK re-runs the mount's own monotonicity /
-			// generation / fence check ATOMICALLY with the install. A refusal
-			// means a strictly newer observation already owns this path's
-			// version floor — so the reconciliation this debt asked for has
-			// already happened, by something fresher than what we hold, and the
-			// debt is discharged with the newer state left standing. Installing
-			// anyway would be the daemon registry (the mount's SECOND
+			// generation / fence check ATOMICALLY with the install. Installing
+			// past it would be the daemon registry (the mount's SECOND
 			// authoritative attribute store) travelling backwards behind the
 			// caches' backs, which is exactly what postattrs.go routes every
 			// mutation's post-op attributes through this same gate to prevent.
-			vol.InstallOK(alias, obs, func() { a.registerLocked(alias, attr) })
+			//
+			// ── A REFUSAL IS NOT A PAYMENT ──────────────────────────────────
+			//
+			// Its verdict used to be discarded, and the debt was settled from
+			// `eno == 0` alone — that is, from the RPC having succeeded, which
+			// says nothing about whether anything was installed. The
+			// justification was that a refusal proves a strictly newer
+			// observation already owns the path's version floor, so the
+			// reconciliation had already happened by something fresher.
+			//
+			// That is true of exactly one of the four ways PublishOKToken
+			// refuses, and not even fully of that one:
+			//
+			//   - v < state.version. The VERSION CACHE has moved past this
+			//     observation. But the version cache is not the daemon registry,
+			//     and this debt is about the registry: whoever advanced the floor
+			//     may never have touched itemRecord.attr at all.
+			//   - token.fenceSeq < fence. A delegation ownership boundary was
+			//     installed after this read began. Nothing was published by it.
+			//   - token.genEpoch != c.genEpoch. A generation epoch moved, which
+			//     WIPES every retained version. Strictly less is known than
+			//     before, not more.
+			//   - g != c.gen. The reply belongs to a generation the cache is no
+			//     longer anchored to. It is discarded, not superseded.
+			//
+			// In every one of those the alias keeps the exact pre-reincarnation
+			// snapshot in itemRecord.attr while doneGen advances and the debt is
+			// deleted — the stale value made permanent by the machinery that
+			// exists to retire it.
+			//
+			// So the verdict is load-bearing: a refusal leaves the debt
+			// OUTSTANDING and the settle loop resamples with a fresh token (the
+			// eviction above guarantees a real round trip), until an install
+			// succeeds, a definite absence proves the question moot, or the
+			// per-alias budget runs out and the publishing operation fails
+			// rather than publishing past it.
+			settled = vol.InstallOK(alias, obs, func() { a.registerLocked(alias, attr) })
 		}
 		a.endReincarnationOwnerLocked(saved)
 	}

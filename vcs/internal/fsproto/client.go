@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
@@ -38,17 +39,22 @@ func splitAddrs(addr string) []string {
 // over to a promoted standby without an external VIP. A non-nil tls config
 // encrypts every connection.
 type Client struct {
-	addrs      []string
-	tls        *tls.Config
-	conns      chan *conn
-	poolSize   int
-	pool       []*conn
-	owner      string             // this mount's checkout-owner id, sent on Subscribe for liveness-release
-	ops        *metrics.Counter   // authority round-trips (the RTT metric; write-back keeps it low)
-	opLat      *metrics.Histogram // authority round-trip latency
+	addrs    []string
+	tls      *tls.Config
+	conns    chan *conn
+	poolSize int
+	pool     []*conn
+	owner    string             // this mount's checkout-owner id, sent on Subscribe for liveness-release
+	ops      *metrics.Counter   // authority round-trips (the RTT metric; write-back keeps it low)
+	opLat    *metrics.Histogram // authority round-trip latency
+	// authMu guards the credential INPUTS (the rotating source and the static
+	// fallback). cred is the published OUTPUT: the one (token, expiry,
+	// generation) value every handshake offers, swapped atomically under the
+	// health lock so the generation can never be observed without its token.
 	authMu     sync.RWMutex
 	authToken  string
 	authSource func() Credential
+	cred       atomic.Pointer[installedCredential]
 
 	// redial paces reconnection attempts across the WHOLE pool (shared
 	// full-jitter backoff): concurrent ops failing against a dead authority
@@ -142,24 +148,79 @@ type Credential struct {
 	ExpiresAtMs int64
 }
 
+// installedCredential is ONE credential installation: the exact token and
+// expiry a handshake will offer, together with the generation that names them.
+//
+// It is a single published value on purpose. The three facts used to live in
+// three places — the token in the auth source, the expiry behind a second call
+// into that source, the generation in a counter under the health lock — and a
+// handshake read them at three different instants. A credential that landed
+// between the reads was offered under its predecessor's generation tag, so the
+// verdict it earned was filed against a credential nobody had ever presented.
+// Publishing the triple as one immutable value removes the interleaving rather
+// than trying to order it.
+//
+// A ZERO Gen means "not published by this client": a credential assembled out
+// of band names no generation and its handshake therefore claims nothing (see
+// connHealth.recordHandshakeSuccess).
+type installedCredential struct {
+	Credential
+	Gen uint64
+}
+
+// InstallCredential publishes a new credential — token, stated expiry and a
+// freshly opened generation, as ONE value — and IMMEDIATELY proves it with a
+// bounded, gate-exempt handshake started on its own goroutine (so an installer
+// is never blocked by a dead peer).
+//
+// This is the single credential-installation entry point. Every renewal,
+// rotation and re-login goes through it, and each call opens exactly ONE
+// generation: the clientcore/daemon seam used to reach installation through a
+// token setter AND a separate "installed" notification, bumping the counter
+// twice and opening an intermediate generation that nothing would ever prove.
+//
+// The new generation is UNPROVEN — not healthy — until a handshake offering it
+// says otherwise. Installing a second INVALID credential must not move a mount
+// from "credential rejected" to "healthy"; only the verification handshake this
+// call starts can move the verdict either way.
+// An installed CredentialSource is left intact (the m3 precedence rule): the
+// published value is what handshakes offer, so the source matters only as the
+// seed a later re-resolution would read.
+func (c *Client) InstallCredential(cred Credential) {
+	c.authMu.Lock()
+	c.authToken = cred.Token
+	gen := c.publishLocked(cred)
+	c.authMu.Unlock()
+	c.installVerify(gen)
+}
+
+// publishLocked opens a generation and publishes cred as that generation's
+// credential, atomically. Callers hold authMu so the client's own view of the
+// credential (source vs static fallback) cannot change underneath the publish.
+func (c *Client) publishLocked(cred Credential) uint64 {
+	return c.health.installCredential(func(gen uint64) {
+		c.cred.Store(&installedCredential{Credential: cred, Gen: gen})
+	})
+}
+
 // SetAuthToken sets the static token used for future connection handshakes. Existing live connections
 // keep their handshake-time auth; reconnects pick up this value.
 //
 // Precedence (m3): an installed CredentialSource WINS and is NOT cleared here. A source-configured
-// volume renews credentials dynamically through the source, so pinning it to a static token forever —
-// which the old `c.authSource = nil` did on any RenewCredential — was a bug (it silently disabled the
-// rotating source). SetAuthToken now only updates the static FALLBACK used when no source is installed;
-// tokenForHandshake still prefers the source. Configure exactly one of source/token at startup.
-// Changing the credential opens a new UNPROVEN generation: any latched verdict
-// was about the predecessor, and the successor is untested until a handshake
-// offers it. (CredentialInstalled is the entry point that also runs that
-// handshake immediately; this one only keeps the bookkeeping honest for callers
-// that renew the token without asking for verification.)
+// client renews credentials dynamically through the source, so pinning it to a static token forever —
+// which the old `c.authSource = nil` did on any renewal — was a bug (it silently disabled the
+// rotating source). SetAuthToken only updates the static FALLBACK used when no source is installed.
+// Configure exactly one of source/token at startup.
+//
+// Changing the credential opens a new UNPROVEN generation and verifies it, on
+// exactly the same terms as InstallCredential: any latched verdict was about
+// the predecessor, and the successor is untested until a handshake offers it.
 func (c *Client) SetAuthToken(tok string) {
 	c.authMu.Lock()
 	c.authToken = tok
+	gen := c.publishLocked(c.resolveLocked())
 	c.authMu.Unlock()
-	c.health.installCredential()
+	c.installVerify(gen)
 }
 
 // SetAuthTokenSource installs a callback used for future connection handshakes. It lets a mount or
@@ -190,22 +251,20 @@ func (c *Client) SetAuthTokenSource(fn func() string) {
 func (c *Client) SetCredentialSource(fn func() Credential) {
 	c.authMu.Lock()
 	c.authSource = fn
+	gen := c.publishLocked(c.resolveLocked())
 	c.authMu.Unlock()
-	c.health.installCredential()
+	c.installVerify(gen)
 }
 
-// credentialForHandshake reads the live credential a handshake starting now
-// would offer, together with whatever deadline its issuer stated for it.
-func (c *Client) credentialForHandshake() Credential {
-	c.authMu.RLock()
-	source := c.authSource
-	tok := c.authToken
-	c.authMu.RUnlock()
-	if source != nil {
-		return source()
+// resolveLocked applies the credential precedence — installed source, then the
+// static fallback, then the process-wide environment token — to produce the
+// credential the next installation should publish. Callers hold authMu.
+func (c *Client) resolveLocked() Credential {
+	if c.authSource != nil {
+		return c.authSource()
 	}
-	if tok != "" {
-		return Credential{Token: tok}
+	if c.authToken != "" {
+		return Credential{Token: c.authToken}
 	}
 	// The process-wide fallback token carries no issuer statement at all, so
 	// it states no deadline and can never harden. That is the honest answer:
@@ -213,24 +272,47 @@ func (c *Client) credentialForHandshake() Credential {
 	return Credential{Token: secure.AuthToken()}
 }
 
+// credentialForHandshake returns the PUBLISHED credential a handshake starting
+// now must offer: token, stated expiry and the generation naming both, as one
+// value read with a single atomic load.
+//
+// It used to call back into the live source on every handshake, which is what
+// let a rotation change the token while the generation counter stood still: the
+// mount then offered a credential no generation described, and a verdict earned
+// on it was credited to its predecessor. A rotation now publishes (see
+// InstallCredential), so the value a handshake reads is always self-consistent.
+func (c *Client) credentialForHandshake() installedCredential {
+	if cred := c.cred.Load(); cred != nil {
+		return *cred
+	}
+	// No installation has been published (an embedder that dialled without any
+	// credential at all). Nothing is claimed for it.
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return installedCredential{Credential: c.resolveLocked()}
+}
+
 func (c *Client) tokenForHandshake() string {
 	return c.credentialForHandshake().Token
 }
 
 // statedCredentialExpiry is the connHealth hook: the CURRENT credential's own
-// stated expiry in unix ms, or 0 when its issuer stated none. It is read live
-// rather than stamped at install time so that a renewal which pushes the
-// deadline out is honoured immediately, and so a mount that has gone idle
-// since the install still hardens on schedule rather than only when some
-// unrelated dial happens to refresh a cached copy.
-func (c *Client) statedCredentialExpiry() int64 {
-	return c.credentialForHandshake().ExpiresAtMs
+// stated expiry in unix ms (0 when its issuer stated none) and the generation
+// that expiry belongs to. The pair travels together so the hardening boundary
+// can never be applied to a credential other than the one whose issuer stated
+// it.
+func (c *Client) statedCredentialExpiry() (int64, uint64) {
+	cred := c.credentialForHandshake()
+	return cred.ExpiresAtMs, cred.Gen
 }
 
 type conn struct {
 	addrs []string
 	tls   *tls.Config
-	auth  func() string
+	// auth returns the whole published credential — token, expiry AND the
+	// generation naming them — so one dial offers one credential and records
+	// its verdict against that exact generation.
+	auth func() installedCredential
 	// transport, when set, replaces TCP dialing entirely (deterministic
 	// in-process transports such as net.Pipe). It receives the owning
 	// client's lifecycle context, and the auth handshake still runs.
@@ -283,12 +365,17 @@ func (cn *conn) ensureWithGateContext(ctx context.Context, resolved bool) error 
 	if err := cn.health.gate(cn.gateExempt || resolved); err != nil {
 		return err
 	}
-	// The generation is read BEFORE the handshake offers its token, so a
-	// verdict earned here can only ever be attributed to the credential this
-	// dial actually used. An install racing the dial leaves gen != credGen and
-	// the verdict is simply not claimed — never mis-attributed to the successor.
-	gen := cn.health.generation()
-	err := cn.dialOnceContext(ctx)
+	// The dial hands back the exact credential it offered, generation included,
+	// so a verdict earned here can only ever be attributed to the credential
+	// this dial actually used. The generation used to be read from the health
+	// counter HERE and the token from the source several microseconds later,
+	// inside the dial — two reads of state that changes together — so a
+	// credential arriving between them was offered under its predecessor's tag.
+	// An install racing the dial now leaves gen != credGen and the verdict is
+	// simply not claimed: never mis-attributed, in either direction.
+	offered := cn.credential()
+	gen := offered.Gen
+	err := cn.dialOnceWith(ctx, offered)
 	if err == nil {
 		// A completed HANDSHAKE is the only thing entitled to speak about the
 		// credential (see connHealth.recordHandshakeSuccess).
@@ -329,11 +416,25 @@ func (cn *conn) dialOnce() error {
 	return cn.dialOnceContext(context.Background())
 }
 
-func (cn *conn) dialOnceContext(ctx context.Context) error {
-	token := secure.AuthToken()
+// credential snapshots the credential this dial will offer. ONE read per dial
+// pass: every address in the list shares it, and the caller keeps the same
+// value to record the verdict against, so the token on the wire and the
+// generation in the verdict can never disagree.
+func (cn *conn) credential() installedCredential {
 	if cn.auth != nil {
-		token = cn.auth()
+		return cn.auth()
 	}
+	// No credential configured at all: the process-wide environment token,
+	// naming no generation and therefore claiming nothing.
+	return installedCredential{Credential: Credential{Token: secure.AuthToken()}}
+}
+
+func (cn *conn) dialOnceContext(ctx context.Context) error {
+	return cn.dialOnceWith(ctx, cn.credential())
+}
+
+func (cn *conn) dialOnceWith(ctx context.Context, cred installedCredential) error {
+	token := cred.Token
 	dialCtx, cancelDial := context.WithCancel(ctx)
 	defer cancelDial()
 	stopLifecycle := func() bool { return true }
@@ -734,11 +835,21 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() Credential,
 	// wiring it here (once, before any dial) keeps the hook immutable, so it
 	// is safe to consult without holding the health lock.
 	c.health.credExpiry = c.statedCredentialExpiry
+	c.authMu.Lock()
 	if auth != nil {
 		c.authSource = auth
 	}
+	// Publish the FIRST generation before the pool dials, so the construction
+	// handshakes below prove exactly the credential they offer. Publishing it
+	// here rather than opening a second generation afterwards is what keeps a
+	// healthy mount out of the unproven state: a generation installed after the
+	// dial that already proved it is one nothing would ever go on to prove.
+	// newConnHealth starts at generation 1, so this names that generation
+	// without bumping the counter.
+	c.cred.Store(&installedCredential{Credential: c.resolveLocked(), Gen: c.health.generation()})
+	c.authMu.Unlock()
 	for i := 0; i < pool; i++ {
-		cn := &conn{addrs: addrs, tls: tlsCfg, auth: c.tokenForHandshake, transport: transport, client: c, health: c.health}
+		cn := &conn{addrs: addrs, tls: tlsCfg, auth: c.credentialForHandshake, transport: transport, client: c, health: c.health}
 		if err := cn.ensure(); err != nil {
 			c.Close()
 			return nil, err
@@ -1053,7 +1164,7 @@ func (c *Client) Subscribe() (<-chan coherence.Batch, AckFunc, error) {
 	cn := &conn{
 		addrs:      c.addrs,
 		tls:        c.tls,
-		auth:       c.tokenForHandshake,
+		auth:       c.credentialForHandshake,
 		transport:  c.transport,
 		client:     c,
 		health:     c.health,

@@ -918,15 +918,65 @@ type sessionTokenSource struct {
 	mu          sync.Mutex
 	token       string
 	expiresAtMs int64
+	dataPlanes  []credentialInstaller
+}
+
+// credentialInstaller is a data plane a rotated lease credential must reach.
+// *clientcore.Volume is the production implementation.
+type credentialInstaller interface {
+	InstallCredential(token string, expiresAtMs int64)
+}
+
+// bindDataPlane registers a data plane that every FUTURE rotation is installed
+// into, and repairs the one gap the registration itself opens.
+//
+// It hangs off the token SOURCE deliberately. The rotated credential used to
+// reach the data plane through a per-strategy hook, and the FUSE branch simply
+// never stored one — a mistake nothing could catch, because a missing hook
+// looks exactly like a healthy mount. Every strategy's lease keeper already
+// writes every renewal through setToken, so binding here leaves no per-strategy
+// step to forget.
+//
+// seedToken/seedExpiry are the credential the caller ALREADY seeded this data
+// plane with (the one its construction handshake proved). A data plane that is
+// still current is left alone: installing a credential it has already proved
+// would open a generation that completed handshake can no longer speak for, and
+// nothing in a quiet mount would ever go on to prove it. A rotation that landed
+// in the window between that seed and this call is installed at once — the data
+// plane is holding a superseded credential and nothing else would tell it.
+func (t *sessionTokenSource) bindDataPlane(inst credentialInstaller, seedToken string, seedExpiry int64) {
+	t.mu.Lock()
+	t.dataPlanes = append(t.dataPlanes, inst)
+	t.mu.Unlock()
+	if token, expiresAtMs := t.get(); token != seedToken || expiresAtMs != seedExpiry {
+		inst.InstallCredential(token, expiresAtMs)
+	}
 }
 
 // setToken installs a fresh data-plane credential (the lease keeper pushes
-// renewed/rotated tokens here so reconnect handshakes always use the live one).
+// renewed/rotated tokens here so reconnect handshakes always use the live one)
+// and PUSHES it into every bound data plane.
+//
+// The push is the point. Storing the token here used to be the whole of a FUSE
+// renewal: the data plane read this source live on each handshake, so it went
+// on offering the NEW token under the OLD credential generation's tag. No
+// generation was opened, so nothing verified the replacement; the old
+// generation stayed "verified" on evidence a superseded credential had earned;
+// and no pending state was ever entered, so the credential's own stated expiry
+// could not harden it either. A mount rotated onto a dead credential reported
+// itself perfectly healthy.
 func (t *sessionTokenSource) setToken(token string, expiresAtMs int64) {
 	t.mu.Lock()
 	t.token = token
 	t.expiresAtMs = expiresAtMs
+	dataPlanes := append([]credentialInstaller(nil), t.dataPlanes...)
 	t.mu.Unlock()
+	// Outside the lock: installation reaches the data plane's own locks and
+	// starts a verification handshake, and the token source must not be held
+	// across either.
+	for _, inst := range dataPlanes {
+		inst.InstallCredential(token, expiresAtMs)
+	}
 }
 
 // get serves the live credential AND the deadline its issuer stated for it.

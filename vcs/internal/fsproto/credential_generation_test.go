@@ -61,8 +61,7 @@ func TestInvalidReplacementCredentialStaysRejected(t *testing.T) {
 	}
 
 	// Install ANOTHER invalid credential.
-	c.SetAuthToken("second-dead-token")
-	c.CredentialInstalled()
+	c.InstallCredential(Credential{Token: "second-dead-token"})
 	if !waitFor(3*time.Second, func() bool { return !c.CredentialUnproven() }) {
 		t.Fatal("the installed credential was never verified: installation " +
 			"entered no verification at all, so the mount reports whatever the " +
@@ -86,7 +85,7 @@ func TestOrdinaryHandshakeRejectionLatchesTheVerdict(t *testing.T) {
 	cn := &conn{
 		addrs:     c.addrs,
 		tls:       c.tls,
-		auth:      c.tokenForHandshake,
+		auth:      c.credentialForHandshake,
 		transport: c.transport,
 		client:    c,
 		health:    c.health,
@@ -149,7 +148,7 @@ func TestVerdictRacingAnInstallIsNotMisattributed(t *testing.T) {
 	inFlight := h.generation()
 	// The operator installs a fresh credential while that handshake is in the
 	// air; it then comes back refused.
-	h.installCredential()
+	h.installCredential(nil)
 	h.recordCredentialRejected(inFlight)
 	if h.credentialDead() {
 		t.Fatal("a rejection of the PREVIOUS credential was attributed to the " +

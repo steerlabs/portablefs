@@ -484,13 +484,35 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         let operation = PfsUncheckedSendableBox(operation)
         let reply = PfsUncheckedSendableBox(reply)
         Task {
+            // `withDeferredPublication` has already applied the daemon's
+            // retraction verdict to `result`: a crossed operation comes back
+            // as a thrown EINTR, never as values. The check is therefore
+            // strictly BEFORE the line below, which is the only ordering that
+            // helps — the whole point of retraction is that the framework
+            // must not install what the daemon has withdrawn, and once
+            // `reply.value` has run the install has happened.
+            //
+            // Reporting EINTR for a mutating callback (removeItem, rename,
+            // write) is not a lie: the daemon refuses a retracted
+            // operation's unanswered requests without executing them, so
+            // nothing this callback failed to observe has landed. See
+            // `PfsLocalClient.settlePublications`.
             let (result, complete) = await core.client.withDeferredPublication {
                 try await operation.value()
             }
             // FSKit's callback is the framework publication boundary. Invoke
             // it first; only after it returns may the daemon let Checkin and a
-            // competing peer mutation proceed.
-            reply.value(result)
+            // competing peer mutation proceed. A retracted operation still
+            // reaches `complete()`: the daemon's gate is released either way,
+            // because the frontend having thrown away its values is exactly
+            // what the daemon is waiting to hear.
+            // Every adapter method maps its own failures, but the publication
+            // boundary can fail the operation on its own account — a
+            // retraction is not raised by any request — and that failure
+            // reaches no adapter catch block. Map here so FSKit always sees a
+            // POSIX/FSKit error. The mapping is idempotent for errors that
+            // were already mapped.
+            reply.value(result.mapError { PfsErrorMapper.fsKitError(for: $0) as Error })
             await complete()
         }
     }

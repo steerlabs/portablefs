@@ -461,6 +461,253 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
+private func waitForTransportPublicationAcks(
+    _ daemon: PfsLocalMockDaemon,
+    atLeast expected: Int
+) async throws -> PfsLocalMockDaemon.Stats {
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+        let stats = await daemon.stats()
+        if stats.publicationAcks >= expected {
+            return stats
+        }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    return await daemon.stats()
+}
+
+/// Captures an acknowledgement baseline that a later `==` can be trusted
+/// against.
+///
+/// A publication acknowledgement is one-way by design: `PfsLocalClient`
+/// returns from a publishing request once the ack has been WRITTEN to the
+/// socket, and the daemon counts it whenever it gets round to reading that
+/// frame. A bare `stats()` snapshot taken right after a publishing request
+/// therefore lands on either side of an ack that is already in flight. The
+/// damage never shows up here — it shows up on a LATER assertion, as an
+/// off-by-one that reads as if the operation under test acknowledged twice.
+///
+/// So the baseline is taken by waiting for the counter to reach the number of
+/// acks the setup is KNOWN to owe, rather than by sampling it at an arbitrary
+/// instant. That is a wait on a specific condition that is guaranteed to
+/// become true, not a delay, and it weakens nothing: `owed` is exact, so a
+/// setup that starts acknowledging more fails loudly right here instead of
+/// flaking somewhere downstream.
+private func settledAckBaseline(
+    _ daemon: PfsLocalMockDaemon,
+    owed: Int,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async throws -> Int {
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: owed)
+    #expect(
+        stats.publicationAcks == owed,
+        "setup owed \(owed) publication acks",
+        sourceLocation: sourceLocation
+    )
+    return owed
+}
+
+@Test func retractedDeferredPublicationWithholdsValuesAndStillAcknowledges() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    // Nothing before this point publishes, so no ack can be in flight — but
+    // say so exactly rather than assuming it.
+    let baseline = try await settledAckBaseline(daemon, owed: 0)
+    await daemon.retractNextPublications()
+
+    let (result, complete) = await client.withDeferredPublication {
+        try await client.request(.getAttr(getattr))
+    }
+    do {
+        _ = try result.get()
+        Issue.record("expected a retracted operation to withhold its reply")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .publicationRetracted)
+        // EINTR, so the kernel retries against a frontend holding nothing
+        // rather than surfacing a coherence event as an application failure.
+        #expect(error.posixErrno == EINTR)
+    }
+
+    // The daemon's handoff gate is released either way: retraction is about
+    // what the FRAMEWORK installs, not about the daemon's bookkeeping.
+    await complete()
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks == baseline + 1)
+
+    // The connection is unaffected — a retraction is the daemon speaking on a
+    // healthy connection, not a transport failure.
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
+}
+
+@Test func retractedPublicationBoundaryWithholdsValuesAndStillAcknowledges() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    // Nothing before this point publishes, so no ack can be in flight — but
+    // say so exactly rather than assuming it.
+    let baseline = try await settledAckBaseline(daemon, owed: 0)
+    await daemon.retractNextPublications()
+
+    do {
+        _ = try await client.withPublicationBoundary {
+            try await client.request(.getAttr(getattr))
+        }
+        Issue.record("expected a retracted boundary to withhold its value")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .publicationRetracted)
+    }
+
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks == baseline + 1)
+}
+
+/// A retraction condemns the whole logical operation, not just the reply that
+/// carried the bit. The framework installs a callback's result as one unit, so
+/// an earlier reply that was individually fine cannot be published on its own.
+@Test func retractionOnLaterReplyCondemnsTheWholeOperation() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    // Nothing before this point publishes, so no ack can be in flight — but
+    // say so exactly rather than assuming it.
+    let baseline = try await settledAckBaseline(daemon, owed: 0)
+
+    let (result, complete) = await client.withDeferredPublication {
+        _ = try await client.request(.getAttr(getattr))
+        // The handoff crosses here: the first reply is already in hand and
+        // uncondemned, and only the parked continuation carries the verdict.
+        await daemon.retractNextPublications()
+        return try await client.request(.getAttr(getattr))
+    }
+    do {
+        _ = try result.get()
+        Issue.record("expected a late retraction to condemn the whole operation")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .publicationRetracted)
+    }
+
+    await complete()
+    // Both requests share one operation ID, so the operation owes exactly one
+    // acknowledgement.
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks == baseline + 1)
+}
+
+/// The production shape: the daemon refuses the crossed operation's last,
+/// still-undispatched request instead of running it, and the retraction rides
+/// that refusal's own ErrorReply. Two things must hold at once — the frontend
+/// reports one retraction for the whole operation rather than an incidental
+/// per-request EINTR, and the mutation that was waiting on the handoff has not
+/// landed. Without the second, `rm` would report EINTR after unlinking and
+/// answer ENOENT on the retry.
+@Test func retractionCarriedOnRefusedRequestWithholdsValuesAndLeavesNoMutation() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    var create = PfsCreateRequest()
+    create.dir = resolved.root
+    create.name = transportBytes("doomed")
+    create.mode = 0o644
+    _ = try await client.request(.create(create))
+
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+    var remove = PfsRemoveRequest()
+    remove.dir = resolved.root
+    remove.name = transportBytes("doomed")
+
+    // `create` is itself a publishing operation and owes an ack of its own,
+    // which may still be in flight at this point.
+    let baseline = try await settledAckBaseline(daemon, owed: 1)
+
+    let (result, complete) = await client.withDeferredPublication {
+        // A first reply binds the operation and arrives uncondemned.
+        _ = try await client.request(.getAttr(getattr))
+        // The handoff crosses. The unlink is the parked request, and the
+        // daemon answers it without executing it.
+        await daemon.refuseNextPublicationsAsRetracted()
+        return try await client.request(.remove(remove))
+    }
+    do {
+        _ = try result.get()
+        Issue.record("expected a refused-and-retracted operation to withhold its result")
+    } catch let error as PfsLocalClientError {
+        // The collector's verdict wins over the refusal's own errno, so the
+        // caller sees one retraction for the operation.
+        #expect(error == .publicationRetracted)
+        #expect(error.posixErrno == EINTR)
+    }
+    await complete()
+
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks == baseline + 1)
+
+    // The name is still there: the refusal executed no mutation, so the
+    // retried syscall will find exactly the state it started from.
+    var lookup = PfsLookupRequest()
+    lookup.dir = resolved.root
+    lookup.name = transportBytes("doomed")
+    let survivor = try await client.request(.lookup(lookup))
+    guard case .lookupReply? = survivor.body else {
+        Issue.record("expected the retracted unlink to have left its target in place")
+        return
+    }
+}
+
+@Test func unretractedPublicationOperationDeliversValuesAndAcknowledges() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    // Nothing before this point publishes, so no ack can be in flight — but
+    // say so exactly rather than assuming it.
+    let baseline = try await settledAckBaseline(daemon, owed: 0)
+
+    let (result, complete) = await client.withDeferredPublication {
+        try await client.request(.getAttr(getattr))
+    }
+    let envelope = try result.get()
+    guard case let .getAttrReply(reply)? = envelope.body else {
+        Issue.record("expected getAttrReply body, got \(String(describing: envelope.body))")
+        return
+    }
+    #expect(reply.attr.item.itemID == resolved.root.itemID)
+
+    await complete()
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
+    #expect(stats.publicationAcks == baseline + 1)
+
+    // And the boundary form is equally unaffected.
+    _ = try await client.withPublicationBoundary {
+        try await client.request(.getAttr(getattr))
+    }
+    let afterBoundary = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
+    #expect(afterBoundary.publicationAcks == baseline + 2)
+}
+
 private func nextEvent(from stream: AsyncStream<PfsEvent>) async throws -> PfsEvent {
     try await withThrowingTaskGroup(of: PfsEvent?.self) { group in
         group.addTask {

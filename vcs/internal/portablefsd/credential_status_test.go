@@ -63,9 +63,11 @@ func credentialStatusAttach(t *testing.T, key string) *attach {
 func TestDaemonStatusReportsRejectedCredentialAsDegraded(t *testing.T) {
 	a := credentialStatusAttach(t, "CredentialRejected")
 
-	// A dead credential, offered for real and refused for real.
+	// A dead credential, offered for real and refused for real. ONE call: the
+	// credential setter is the installation — it opens the generation and
+	// verifies it. It used to need a second, separate notification to make the
+	// installation real, and calling both bumped the generation twice.
 	a.setCredential("revoked-credential", 0)
-	a.vol.CredentialInstalled()
 
 	if !waitForStatus(3*time.Second, a, func(st attachStatus) bool {
 		return st.Credential == credentialStateRejected

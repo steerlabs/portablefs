@@ -249,6 +249,24 @@ private final class PfsPublicationCollector: @unchecked Sendable {
     private var connections: [UUID: PfsConnection] = [:]
     private var boundConnectionID: UUID?
     private var operationID: UInt64?
+    private var retracted = false
+
+    /// Records that the daemon retracted this logical operation. The flag is
+    /// sticky: a single retracted reply condemns every value the operation
+    /// produced, including values that arrived on earlier replies and were
+    /// individually fine, because the framework installs the callback's
+    /// result as one unit.
+    func markRetracted() {
+        lock.lock()
+        retracted = true
+        lock.unlock()
+    }
+
+    var isRetracted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return retracted
+    }
 
     func bind(to connectionID: UUID, allocating candidate: UInt64) -> (id: UInt64, isNew: Bool)? {
         lock.lock()
@@ -399,19 +417,58 @@ public actor PfsLocalClient {
             return try await sendRequestOnCurrentConnection(body)
         }
         let collector = PfsPublicationCollector()
-        return try await PfsPublicationContext.$collector.withValue(collector) {
+        let outcome: Result<PfsEnvelope, Error> = await PfsPublicationContext.$collector.withValue(collector) {
             do {
-                let envelope = try await self.sendRequestOnCurrentConnection(body)
-                await self.completePublications(collector.snapshot())
-                return envelope
+                return .success(try await self.sendRequestOnCurrentConnection(body))
             } catch {
                 // Cacheable negative replies are publications too. `receive`
                 // records their request ID before resuming the throwing
-                // continuation, so the daemon gate is released only here.
-                await self.completePublications(collector.snapshot())
-                throw error
+                // continuation, so the daemon gate is released only below.
+                return .failure(error)
             }
         }
+        return try await settlePublications(collector, outcome: outcome)
+    }
+
+    /// Releases the daemon's handoff gate for `collector` and then applies the
+    /// operation's retraction verdict.
+    ///
+    /// The acknowledgement is sent for a retracted operation exactly as for a
+    /// live one. Retraction says what the FRONTEND may install; the ack is the
+    /// daemon's own bookkeeping, and withholding it would leave the daemon
+    /// blocked on a callback that has already abandoned its values.
+    ///
+    /// A retracted operation throws instead of returning its values and then
+    /// refreshing them. This model is version-anchored with a zero TTL: a
+    /// value is valid only for the delegation epoch it was read in, and there
+    /// is no interval over which a superseded value is "still mostly right".
+    /// Install-then-invalidate would publish a value the daemon has already
+    /// declared wrong and rely on a later, merely eventual event to remove it
+    /// — and an application that read in between would have read a stale byte
+    /// with no error anywhere. Throwing costs one retried syscall; installing
+    /// costs correctness.
+    ///
+    /// Throwing away the whole result is safe for MUTATING callbacks, not
+    /// just reads, and that is a property of the daemon rather than of this
+    /// code. A retracted operation's requests that had not already been
+    /// answered are refused EINTR without being executed, so the callback's
+    /// last request — typically the very mutation that was waiting on the
+    /// delegation — has not landed when this throws. Were that not so, an
+    /// `rm` could be reported interrupted after the unlink had happened and
+    /// then answer ENOENT on the retry. The retry itself terminates: the
+    /// refusal only becomes reachable once the handoff has completed, so the
+    /// second attempt finds nothing left to hand off.
+    private nonisolated func settlePublications<T>(
+        _ collector: PfsPublicationCollector,
+        outcome: Result<T, Error>
+    ) async throws -> T {
+        let tickets = collector.snapshot()
+        let retracted = collector.isRetracted
+        await completePublications(tickets)
+        if retracted {
+            throw PfsLocalClientError.publicationRetracted
+        }
+        return try outcome.get()
     }
 
     /// Extends every request issued by operation through the point where the
@@ -425,16 +482,16 @@ public actor PfsLocalClient {
             return try await operation()
         }
         let collector = PfsPublicationCollector()
-        return try await PfsPublicationContext.$collector.withValue(collector) {
+        let outcome: Result<T, Error> = await PfsPublicationContext.$collector.withValue(collector) {
             do {
-                let value = try await operation()
-                await self.completePublications(collector.snapshot())
-                return value
+                return .success(try await operation())
             } catch {
-                await self.completePublications(collector.snapshot())
-                throw error
+                return .failure(error)
             }
         }
+        // A retracted operation never hands its values back, even though the
+        // operation itself succeeded. See `settlePublications`.
+        return try await settlePublications(collector, outcome: outcome)
     }
 
     /// Collects the request IDs issued by `operation` without acknowledging
@@ -454,10 +511,24 @@ public actor PfsLocalClient {
             }
         }
         let tickets = collector.snapshot()
+        // The retraction verdict is applied HERE, before this function
+        // returns, so a caller that hands `result` to a framework reply
+        // handler physically cannot hand back retracted values: by the time
+        // it sees the result, a retracted operation is already a thrown
+        // EINTR. Every reply for the operation has been received at this
+        // point — `operation()` cannot have returned otherwise — so the flag
+        // is final. See `settlePublications` for why throwing, not
+        // installing-then-refreshing, is the only sound answer.
+        let published: Result<T, Error> = collector.isRetracted
+            ? .failure(PfsLocalClientError.publicationRetracted)
+            : result
+        // The acknowledgement is still owed for a retracted operation: the
+        // daemon's handoff gate must be released whether or not the frontend
+        // kept the values.
         let complete: @Sendable () async -> Void = {
             await self.completePublications(tickets)
         }
-        return (result, complete)
+        return (published, complete)
     }
 
     /// Resolves this connection to an attach reference and remembers it for reconnects.
@@ -606,6 +677,24 @@ public actor PfsLocalClient {
                 request.publicationCollector?.append(connection: connection)
             }
         }
+        if envelope.publicationRetracted {
+            // The retraction rides this reply's own frame, so recording it
+            // here — before the continuation resumes — is what makes it
+            // strictly ordered ahead of the framework install. The daemon
+            // guarantees at least one further reply for a crossed operation
+            // precisely so this bit has a frame to ride; a separate message
+            // would race the reply, because every decoded frame is handed to
+            // its own Task by the reader above.
+            //
+            // In practice that frame is usually an ErrorReply: the daemon
+            // refuses the crossed operation's still-undispatched requests
+            // with EINTR instead of running them, and the refusal is what
+            // carries the bit. Marking before the error branch below is
+            // therefore load-bearing — the collector's verdict must win over
+            // the per-request errno so the caller sees one retraction for the
+            // operation rather than an incidental EINTR on one request.
+            request.publicationCollector?.markRetracted()
+        }
 
         if case let .error(error)? = envelope.body {
             request.continuation.resume(throwing: PfsLocalClientError.daemon(errno: error.errno, message: error.message))
@@ -643,7 +732,12 @@ public actor PfsLocalClient {
     private func helloOnCurrentConnection() async throws {
         var hello = PfsHello()
         hello.protocolMajor = 1
-        hello.protocolMinor = 5
+        // Protocol minor 6: this frontend honours
+        // Envelope.publication_retracted. The daemon refuses any frontend
+        // below its own minor, which is what makes the retraction bit safe to
+        // rely on — an extension that ignored it would install state the
+        // daemon has withdrawn, and nothing on the wire would say so.
+        hello.protocolMinor = 6
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -651,7 +745,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 5 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 6 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
     }

@@ -73,7 +73,9 @@ func TestCleanEOFBeforeAckLeavesTheCredentialUnprovenAndKeepsProbing(t *testing.
 	router.rotate("tok-epoch2")
 
 	before := router.rejected.Load()
-	cli.CredentialInstalled()
+	// The credential is re-installed with its issuer's stated deadline intact:
+	// that deadline is the boundary the verification loop converges inside.
+	cli.InstallCredential(Credential{Token: "tok-epoch1", ExpiresAtMs: expiresAt})
 
 	if !waitFor(3*time.Second, func() bool { return router.rejected.Load() > before }) {
 		t.Fatal("installing a credential did not offer it to the authority at all")
@@ -117,10 +119,12 @@ func TestCleanEOFBeforeAckLeavesTheCredentialUnprovenAndKeepsProbing(t *testing.
 func TestUnprovenCredentialHardensAtItsOwnStatedExpiry(t *testing.T) {
 	h, clk := newFakeHealth()
 	expiresAt := clk.t.Add(10 * time.Minute)
-	h.credExpiry = func() int64 { return expiresAt.UnixMilli() }
+	// The expiry travels with the generation it belongs to, exactly as the
+	// client's published credential does.
+	h.credExpiry = func() (int64, uint64) { return expiresAt.UnixMilli(), h.generation() }
 
 	// A fresh install: unproven, and inside its stated life.
-	h.installCredential()
+	h.installCredential(nil)
 	if !h.credentialUnproven() {
 		t.Fatal("precondition: an installed credential is unproven until a " +
 			"handshake classifies it")
@@ -170,9 +174,9 @@ func TestUnprovenCredentialWithNoStatedExpiryNeverHardens(t *testing.T) {
 	h, clk := newFakeHealth()
 	// The default: no credExpiry hook at all (an embedder-built health), which
 	// must behave identically to a source that states zero.
-	for _, expiry := range []func() int64{nil, func() int64 { return 0 }} {
+	for _, expiry := range []func() (int64, uint64){nil, func() (int64, uint64) { return 0, h.generation() }} {
 		h.credExpiry = expiry
-		h.installCredential()
+		h.installCredential(nil)
 
 		clk.advance(100 * 365 * 24 * time.Hour)
 		if h.credentialDead() {
@@ -215,7 +219,8 @@ func TestCredentialVerificationWithNoStatedExpiryProbesExactlyOnce(t *testing.T)
 	router.rotate("tok-epoch2")
 
 	before := router.rejected.Load()
-	cli.CredentialInstalled()
+	// Re-installed with NO stated deadline: no boundary, so no loop.
+	cli.InstallCredential(Credential{Token: "tok-epoch1"})
 	if !waitFor(3*time.Second, func() bool { return router.rejected.Load() > before }) {
 		t.Fatal("installing a credential did not offer it to the authority at all")
 	}

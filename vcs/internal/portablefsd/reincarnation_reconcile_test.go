@@ -207,7 +207,7 @@ func TestReincarnationDebtIsNotSettleableByAnotherPublisher(t *testing.T) {
 	// obligation: an unreconcilable alias is exactly the state that must never
 	// be published past, and the old take-all could not even express it because
 	// the drain had already destroyed what it took.
-	if eno := ticketB.settle(context.Background(), nil); eno != darwinEIO {
+	if eno, _ := ticketB.settle(context.Background(), nil); eno != darwinEIO {
 		t.Fatalf("settling an unreconcilable ticket errno=%d, want EIO", eno)
 	}
 	if !a.debtOutstanding("y") {
@@ -223,7 +223,7 @@ func TestReincarnationDebtIsNotSettleableByAnotherPublisher(t *testing.T) {
 	if inert != nil {
 		t.Fatalf("a registration that created no debt minted ticket %+v, want inert", inert)
 	}
-	if eno := inert.settle(context.Background(), nil); eno != 0 {
+	if eno, _ := inert.settle(context.Background(), nil); eno != 0 {
 		t.Fatalf("settling an inert ticket errno=%d", eno)
 	}
 	if !a.debtOutstanding("b") || !a.debtOutstanding("y") {
@@ -242,7 +242,7 @@ func TestReincarnationDebtIsNotSettleableByAnotherPublisher(t *testing.T) {
 	a.mu.Lock()
 	a.removePathLocked("q")
 	a.mu.Unlock()
-	if eno := ticketC.settle(context.Background(), nil); eno != 0 {
+	if eno, _ := ticketC.settle(context.Background(), nil); eno != 0 {
 		t.Fatalf("settling ticket C errno=%d", eno)
 	}
 	if a.debtOutstanding("q") {
@@ -343,17 +343,50 @@ func TestReincarnationReconcileDoesNotOverwriteNewerAttributes(t *testing.T) {
 
 	// The reconciliation now holds a pre-mutation observation of links/b.
 	// Publish a strictly newer one for the same name from another connection.
+	//
+	// THE MUTATION RUNS CONCURRENTLY, AND THAT IS THE CONTRACT, NOT A DETAIL.
+	//
+	// links/b has outstanding reconciliation debt, so this setattr is a
+	// publisher of an INDEBTED ALIAS and publication admission applies to it:
+	// its registry write lands immediately, and its REPLY then joins the
+	// reconciliation already in flight rather than being exposed beside it (see
+	// reincarnation.go, admitPublicationLocked). Calling it synchronously here
+	// would park it behind a reconciliation this test holds open by hand, which
+	// is an artefact of the wedge and not a production shape — the real
+	// reconciliation is bounded by one authority round trip.
+	//
+	// What the test is actually about is unchanged and is asserted below: the
+	// mutation's strictly newer state reaches the registry, and the parked
+	// reconciliation's older observation must not overwrite it when it resumes.
 	mode := uint32(0o600)
-	mc := dialPFS(t, cfg.FrontendSocket)
-	defer mc.close()
-	mc.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "reconcile-monotonic-mutator"})
-	mc.call(&pfslocal.ResolveRequest{AttachRef: ref})
-	mc.call(&pfslocal.SetAttrRequest{Item: b.Attr.Item, Mode: &mode})
-	if got := registryAttr(t, a, "links/b").Mode & 0o777; got != 0o600 {
-		t.Fatalf("mutation did not reach the registry: mode=%o", got)
+	mutationDone := make(chan struct{})
+	go func() {
+		defer close(mutationDone)
+		mc := dialPFS(t, cfg.FrontendSocket)
+		defer mc.close()
+		mc.call(&pfslocal.Hello{ProtocolMajor: 1, ClientName: "reconcile-monotonic-mutator"})
+		mc.call(&pfslocal.ResolveRequest{AttachRef: ref})
+		mc.call(&pfslocal.SetAttrRequest{Item: b.Attr.Item, Mode: &mode})
+	}()
+
+	// The mutation's registry write happens under a.mu, before its own
+	// publication admission joins anything, so it is observable while the
+	// reconciliation is still parked.
+	mutationDeadline := time.Now().Add(15 * time.Second)
+	for registryAttr(t, a, "links/b").Mode&0o777 != 0o600 {
+		if time.Now().After(mutationDeadline) {
+			t.Fatalf("mutation did not reach the registry: mode=%o",
+				registryAttr(t, a, "links/b").Mode&0o777)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	close(release)
+	select {
+	case <-mutationDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the mutation never completed after the reconciliation was released")
+	}
 	select {
 	case <-lookupDone:
 	case <-time.After(15 * time.Second):
