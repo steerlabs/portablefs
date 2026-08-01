@@ -93,7 +93,7 @@ func TestCorruptLegacyWALLeavesAttachUnstartedAndDebtVisible(t *testing.T) {
 		DataPlaneTransport: "plaintext",
 	}
 	a := newAttach("legacy-corrupt-ref", attachKey(volumeID, branch, req.MountPath), req, stateDir)
-	err := a.activate(ctx, "")
+	err := a.activate(ctx, "", 0)
 	if err == nil || !strings.Contains(err.Error(), "legacy write-back debt blocks attach readiness") {
 		t.Fatalf("activate error = %v, want blocked legacy debt", err)
 	}

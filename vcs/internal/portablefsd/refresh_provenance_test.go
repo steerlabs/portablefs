@@ -11,6 +11,20 @@ func sizeSetAttr(item pfslocal.Item, size uint64) *pfslocal.SetAttrRequest {
 	return &pfslocal.SetAttrRequest{Item: item, Size: &size}
 }
 
+// mustArmRefreshWindow opens the provenance window a test's fake ftruncate is
+// standing in for. The arm may refuse — it is atomic with installing the sampled
+// size as the composed view, so it declines when the sample can no longer be
+// proved current — and a test that expects to be INSIDE a window must fail
+// loudly rather than silently assert against a window that was never opened.
+func mustArmRefreshWindow(t *testing.T, arm func() (func(), error)) func() {
+	t.Helper()
+	disarm, err := arm()
+	if err != nil {
+		t.Fatalf("the refresh declined to open its provenance window: %v", err)
+	}
+	return disarm
+}
+
 // consumedInternal is the boolean the handler's classification used to be:
 // "answered locally as the daemon's own refresh". It is a test convenience so
 // the provenance assertions read as they always did; the handler itself needs
@@ -50,9 +64,9 @@ func TestCompetingApplicationTruncateCannotStealRefreshProvenance(t *testing.T) 
 		selfAdmitted bool
 		selfConsumed bool
 	)
-	a.testRefreshKernelFile = func(_, p string, _ uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, p string, _ uint64, size int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
 		// Inside the daemon's own synchronous ftruncate: the pin is held.
-		defer armTruncate()()
+		defer mustArmRefreshWindow(t, armTruncate)()
 
 		// 1. A competing APPLICATION ftruncate(item, refreshSize) — byte
 		//    identical on the wire — reaches the dispatcher first.
@@ -69,7 +83,7 @@ func TestCompetingApplicationTruncateCannotStealRefreshProvenance(t *testing.T) 
 		return kernelRefreshApplied, nil
 	}
 
-	if outcome, err := a.applyKernelRefresh("", rec.path, rec, refreshSize); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, refreshSize, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("applyKernelRefresh = (%v, %v)", outcome, err)
 	}
 
@@ -113,15 +127,15 @@ func TestHardLinkAliasTruncateCannotStealRefreshProvenance(t *testing.T) {
 
 	const refreshSize = int64(32)
 	var aliasConsumed, selfConsumed bool
-	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
 		// Model the real refresh: the window is armed for exactly the extent of
 		// the ftruncate(2) this hook stands in for.
-		defer armTruncate()()
+		defer mustArmRefreshWindow(t, armTruncate)()
 		aliasConsumed = consumedInternal(a, "dir/alias", sizeSetAttr(item, uint64(refreshSize)))
 		selfConsumed = consumedInternal(a, rec.path, sizeSetAttr(item, uint64(refreshSize)))
 		return kernelRefreshApplied, nil
 	}
-	if outcome, err := a.applyKernelRefresh("", rec.path, rec, refreshSize); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, refreshSize, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("applyKernelRefresh = (%v, %v)", outcome, err)
 	}
 	if !aliasConsumed {
@@ -148,8 +162,8 @@ func TestRealTruncateInsideAPinnedWindowStillReachesTheAuthority(t *testing.T) {
 
 	mode := uint32(0o600)
 	var shorter, withMode, self bool
-	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
-		defer armTruncate()()
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
+		defer mustArmRefreshWindow(t, armTruncate)()
 		shorter = consumedInternal(a, rec.path, sizeSetAttr(item, 7))
 		modeReq := sizeSetAttr(item, 100)
 		modeReq.Mode = &mode
@@ -157,7 +171,7 @@ func TestRealTruncateInsideAPinnedWindowStillReachesTheAuthority(t *testing.T) {
 		self = consumedInternal(a, rec.path, sizeSetAttr(item, 100))
 		return kernelRefreshApplied, nil
 	}
-	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 100); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 100, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("applyKernelRefresh = (%v, %v)", outcome, err)
 	}
 	if shorter {
@@ -186,8 +200,8 @@ func TestRefreshProvenancePredicatesAgree(t *testing.T) {
 	a := &attach{items: map[uint64]*itemRecord{item.ItemID: rec}}
 
 	var disagreements int
-	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
-		defer armTruncate()()
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
+		defer mustArmRefreshWindow(t, armTruncate)()
 		for i := 0; i < 8; i++ {
 			req := sizeSetAttr(item, 5)
 			if a.internalRefreshPending(req) != consumedInternal(a, rec.path, req) {
@@ -196,7 +210,7 @@ func TestRefreshProvenancePredicatesAgree(t *testing.T) {
 		}
 		return kernelRefreshApplied, nil
 	}
-	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 5); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", rec.path, rec, 5, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("applyKernelRefresh = (%v, %v)", outcome, err)
 	}
 	if disagreements != 0 {

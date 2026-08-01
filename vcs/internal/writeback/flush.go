@@ -184,6 +184,16 @@ type laneQueue struct {
 	// healthy namespace lane mask a dead data lane, and a drain waiting on the
 	// data lane would then never get a verdict — the exact permanent-draining
 	// shape round 3 eliminated.
+	//
+	// It moves on this lane's authority watermark advance, and on exactly one
+	// other event: an advance in the lane this one is DEPENDENCY-BLOCKED on (see
+	// laneDependencyBlockedLocked and advance). That is not a shared clock
+	// creeping back in. A blocked lane is forbidden by this client to dispatch
+	// at all, so its own watermark cannot move by construction, and reading its
+	// stillness as evidence about the far end is reading the client's own queue
+	// discipline as a fault in the authority. The lane it waits on is watched on
+	// its own terms, and when THAT lane goes quiet the inheritance stops with
+	// it — so a genuinely dead uplink still closes the window here.
 	lastProgress time.Time
 
 	wake chan struct{}
@@ -586,10 +596,7 @@ func (f *flusher) nextWaitLocked(lane StreamLane) time.Duration {
 	// ahead of the namespace state its records were admitted behind. The
 	// authority enforces this too (and definitively); refusing to dispatch here
 	// keeps the steady state free of a round trip that would only be held.
-	//
-	// It can only ever wait on the namespace lane, never the reverse, so it
-	// cannot deadlock: the namespace lane's own dispatch consults nothing.
-	if lane == StreamLaneData && q.pending[0].nsRequired > f.lanes[StreamLaneNamespace].applied {
+	if blocked, _ := f.laneDependencyBlockedLocked(lane); blocked {
 		return flushMaxAge
 	}
 	if q.urgent || len(q.pending) >= flushMaxRecords || q.bytes >= laneMaxBytes(lane) {
@@ -601,6 +608,65 @@ func (f *flusher) nextWaitLocked(lane StreamLane) time.Duration {
 	return flushMaxAge - time.Since(q.oldestAt)
 }
 
+// nextBatchLenLocked selects the prefix of q.pending that the NEXT attempt on
+// this lane would carry: the pinned range if a resend is armed, otherwise the
+// dense run the size bounds admit.
+//
+// It is factored out because two callers have to agree about it EXACTLY. The
+// dispatch decision (nextWaitLocked) and the dispatch itself (sendBatch) both
+// ask whether the next batch may go, and if they select different batches they
+// answer different questions: the loop used to test the HEAD record's namespace
+// dependency while sendBatch tested the MAXIMUM over the whole batch, so the
+// loop could wave through a batch sendBatch then refused. That disagreement was
+// structural, not a bug in either predicate, and the only way to remove it is to
+// make "the next batch" one definition.
+//
+// A pinned selection is returned as-is even when it does not cover the pin;
+// validating the pin is sendBatch's job, because the answer there is to PARK the
+// stream and this is a read.
+func (f *flusher) nextBatchLenLocked(q *laneQueue) int {
+	if q.attemptEnd != 0 {
+		n := 0
+		for n < len(q.pending) && q.pending[n].laneSeq <= q.attemptEnd {
+			n++
+		}
+		return n
+	}
+	n := 0
+	var bytes int64
+	maxBytes := laneMaxBytes(q.lane)
+	for n < len(q.pending) && n < flushMaxRecords && bytes < maxBytes {
+		bytes += int64(q.pending[n].length)
+		n++
+	}
+	return n
+}
+
+// laneDependencyBlockedLocked is THE dispatchability predicate: may the batch
+// this lane would offer right now be sent, or is it still waiting on the
+// namespace state its records were admitted behind? needed is the namespace
+// watermark that batch declares (its MAXIMUM nsRequired — every record in the
+// request has to be applicable, not just the first).
+//
+// Only the data lane can be blocked, and only ever on the namespace lane, so
+// this cannot deadlock: the namespace lane's own dispatch consults nothing.
+//
+// The distinction this names is the one the health machinery kept getting
+// wrong. A blocked lane is not a failing lane and not a slow lane — it is a lane
+// with nothing it is ALLOWED to do yet, and the thing it is waiting for lives in
+// another lane that is being watched on its own terms. Wherever the engine asks
+// "has this lane made progress", it first has to ask this.
+func (f *flusher) laneDependencyBlockedLocked(lane StreamLane) (blocked bool, needed uint64) {
+	q := &f.lanes[lane]
+	if lane != StreamLaneData || len(q.pending) == 0 {
+		return false, 0
+	}
+	for _, p := range q.pending[:f.nextBatchLenLocked(q)] {
+		needed = max(needed, p.nsRequired)
+	}
+	return needed > f.lanes[StreamLaneNamespace].applied, needed
+}
+
 // sendBatch builds and ships the next dense run of one lane.
 func (f *flusher) sendBatch(lane StreamLane) {
 	f.mu.Lock()
@@ -610,45 +676,40 @@ func (f *flusher) sendBatch(lane StreamLane) {
 		f.mu.Unlock()
 		return
 	}
-	n := 0
-	if q.attemptEnd != 0 {
-		for n < len(q.pending) && q.pending[n].laneSeq <= q.attemptEnd {
-			n++
-		}
-		if n == 0 || q.pending[n-1].laneSeq != q.attemptEnd {
-			err := fmt.Errorf("%w: pinned %s-lane flush batch ending at %d is absent from pending stream", ErrConflict, lane, q.attemptEnd)
-			f.mu.Unlock()
-			f.park(err)
-			return
-		}
-	} else {
-		var bytes int64
-		maxBytes := laneMaxBytes(lane)
-		for n < len(q.pending) && n < flushMaxRecords && bytes < maxBytes {
-			bytes += int64(q.pending[n].length)
-			n++
-		}
+	n := f.nextBatchLenLocked(q)
+	if q.attemptEnd != 0 && (n == 0 || q.pending[n-1].laneSeq != q.attemptEnd) {
+		err := fmt.Errorf("%w: pinned %s-lane flush batch ending at %d is absent from pending stream", ErrConflict, lane, q.attemptEnd)
+		f.mu.Unlock()
+		f.park(err)
+		return
+	}
+	// Asked over the SAME selection the batch is built from, and under the same
+	// hold of f.mu, so this is the authoritative answer rather than a second
+	// opinion: an admission that arrived since the run loop last looked can
+	// widen the batch and raise its declared watermark, and that has to be
+	// caught here, where the request is actually formed.
+	//
+	// A hold is deliberately NOT noteFailure. It used to be, and that was wrong
+	// in both directions. It wrote the hold into the stream-wide lastFailure, so
+	// a perfectly healthy stream reported "data batch requires namespace
+	// watermark N" as its failure string in Status and in the watchdog's health
+	// message — a diagnosis pointing at nothing. And it grew this lane's
+	// exponential backoff, up to five seconds, for a condition that resolves the
+	// instant the namespace lane advances and already wakes this worker by kick:
+	// the penalty for waiting was a delay in noticing the wait had ended. No
+	// request was sent, nothing failed, and nothing here is retried — the run
+	// loop re-polls on flushMaxAge and the namespace advance kicks it sooner.
+	blocked, nsRequired := f.laneDependencyBlockedLocked(lane)
+	if blocked {
+		f.mu.Unlock()
+		return
+	}
+	if q.attemptEnd == 0 {
 		q.attemptEnd = q.pending[n-1].laneSeq
 	}
 	batch := append([]pendingRec(nil), q.pending[:n]...)
 	prevDigest := q.appliedDigest
-	nsApplied := f.lanes[StreamLaneNamespace].applied
 	f.mu.Unlock()
-
-	var nsRequired uint64
-	if lane == StreamLaneData {
-		for _, p := range batch {
-			nsRequired = max(nsRequired, p.nsRequired)
-		}
-		if nsRequired > nsApplied {
-			// The dependency moved under a pinned resend. Re-offering would be
-			// a certain hold; wait for the namespace lane instead. The pin
-			// stays, so whatever is eventually sent is still byte-identical.
-			f.noteFailure(lane, fmt.Sprintf(
-				"data batch requires namespace watermark %d, applied %d", nsRequired, nsApplied))
-			return
-		}
-	}
 
 	e := f.e
 	e.mu.RLock()
@@ -801,9 +862,46 @@ func (f *flusher) advance(lane StreamLane, through uint64) {
 	if q.attemptEnd != 0 && through >= q.attemptEnd {
 		q.attemptEnd = 0
 	}
+	// THE DEPENDENCY-BLOCKED LANE INHERITS THIS ADVANCE.
+	//
+	// Two conditions, and both are load-bearing. The watermark must actually
+	// MOVE: a success reply naming a watermark this lane already holds is a
+	// resend landing on durable state, and while that is a live round trip it is
+	// not new progress — crediting it would let a namespace lane looping on
+	// already-applied batches keep the data lane's clock fresh while its own ran
+	// out, which is a hole exactly the size of the one being closed. And the
+	// block must be read BEFORE q.applied moves, because the question is about
+	// the interval this advance closes: the lane was held for all of it,
+	// including by the advance that finally releases it, and that last one is
+	// precisely the moment it inherits a clock it then has to run on alone.
+	//
+	// See laneDependencyBlockedLocked for why this is the honest reading and not
+	// a favour. A blocked data lane has not failed to make progress; it has not
+	// been ALLOWED to, by a rule this client enforces on itself, and the entity
+	// that decides when it may go is the namespace lane's watermark. So the
+	// namespace lane's advances ARE the blocked lane's progress, and this is the
+	// one place they are observed.
+	//
+	// It is inheritance and not exemption, and the difference is the whole
+	// safety argument: when the namespace lane stops advancing there are no
+	// advances to inherit, the blocked lane's clock freezes where the last one
+	// left it, and the window closes on it exactly as it would on any other
+	// silent lane. A dead uplink still reaches a verdict, so a drain on the data
+	// lane still terminates. Nothing here can hide one.
+	//
+	// It also stays narrow. Only a lane the predicate says is blocked takes
+	// anything from this, so the round-7 property that a healthy namespace lane
+	// must never mask a DEAD data lane is untouched: an unblocked data lane that
+	// stops applying keeps its own frozen clock however busy the other lane is.
+	now := time.Now()
+	if lane == StreamLaneNamespace && through > q.applied {
+		if blocked, _ := f.laneDependencyBlockedLocked(StreamLaneData); blocked {
+			f.lanes[StreamLaneData].lastProgress = now
+		}
+	}
 	if through > q.applied {
 		q.applied = through
-		q.lastProgress = time.Now()
+		q.lastProgress = now
 	}
 	i := 0
 	var appliedData, appliedTotal int64
@@ -1008,6 +1106,14 @@ func (e *Engine) markStreamDead(err error) {
 
 // watchdog flips sticky degraded when ANY lane's pending work makes no
 // watermark progress for the window.
+//
+// f.degraded is STREAM-WIDE, so what this sweep latches on one lane it latches
+// on the mount. That is right for a lane that has genuinely gone silent and
+// catastrophically wrong for a lane that is merely waiting on another lane's
+// watermark, which is why a dependency-blocked lane's progress clock tracks the
+// lane it waits on (see laneQueue.lastProgress). The sweep needs no case for it:
+// it reads one clock per lane, and a blocked lane's clock is already telling the
+// truth about whether anything is still moving.
 func (f *flusher) watchdog() {
 	f.mu.Lock()
 	if !f.degraded {

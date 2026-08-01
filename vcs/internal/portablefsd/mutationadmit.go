@@ -97,22 +97,35 @@ func (a *attach) admitMutation(
 		// nothing else is held while admission waits.
 		barrier(ctx)
 	}
-	if a.internalRefreshPending(body) {
-		// DAEMON-ORIGINATED, not application-originated. This is the setattr
-		// upcall of a kernel-state refresh this daemon is issuing through its own
-		// mount (coherence_refresh.go): the handler consumes it, it never reaches
-		// the authority, and it appends nothing to the write-back stream.
-		//
-		// It must bypass admission for two independent reasons, and the second is
-		// a correctness one. Pacing it is MEANINGLESS — it publishes state the
-		// authority has already applied, so it neither caused the metadata backlog
-		// nor can help drain it, exactly like an authority-lane mutation. And
-		// pacing it is UNSAFE — an admission park is unbounded relative to the
-		// syscall that produced the upcall, and the longer the handler is held
-		// away from its marker the longer the window in which some other rule
-		// could decide this is an application truncate. Provenance is settled
-		// here, once, before anything can wait.
-		return ctx, noop, 0, false
+	// PROVENANCE IS DECIDED HERE, ONCE, AND THEN CARRIED.
+	//
+	// The verdict is frozen into the operation context for EVERY size-bearing
+	// setattr — including the ones this classifier hands on to ordinary
+	// admission. Freezing only the internal ones would leave the handler free to
+	// re-derive an answer for the rest, and the direction that must be
+	// impossible is the one that turns the daemon's own refresh into an
+	// authority mutation: a request that was waved past admission because it
+	// would never reach the authority must not be able to reach it later. See
+	// refreshVerdictKey.
+	if verdict, isSizeSet := a.classifyRefreshRequest(body); isSizeSet {
+		ctx = withRefreshVerdict(ctx, verdict)
+		if verdict.class != refreshClassApplication {
+			// DAEMON-ORIGINATED, not application-originated. This is the setattr
+			// upcall of a kernel-state refresh this daemon is issuing through its own
+			// mount (coherence_refresh.go): the handler consumes it, it never reaches
+			// the authority, and it appends nothing to the write-back stream.
+			//
+			// It must bypass admission for two independent reasons, and the second is
+			// a correctness one. Pacing it is MEANINGLESS — it publishes state the
+			// authority has already applied, so it neither caused the metadata backlog
+			// nor can help drain it, exactly like an authority-lane mutation. And
+			// pacing it is UNSAFE — an admission park is unbounded relative to the
+			// syscall that produced the upcall, and the longer the handler is held
+			// away from its marker the longer the window in which some other rule
+			// could decide this is an application truncate. Provenance is settled
+			// here, once, before anything can wait.
+			return ctx, noop, 0, false
+		}
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {

@@ -22,7 +22,17 @@ type Options struct {
 	TLSConfig *tls.Config
 	Owner     string
 
-	CredentialSource func() string
+	// CredentialSource serves the mount's LIVE data-plane credential to every
+	// handshake, together with the deadline its issuer stated for it (unix
+	// ms). The expiry is not decoration: it is the boundary that lets an
+	// UNPROVEN credential — one no handshake has ever accepted or refused —
+	// stop being unproven. Past it the mount hardens the pending state into
+	// the definite credential-expired verdict.
+	//
+	// Returning 0 for expiresAtMs means "the issuer stated no deadline" and
+	// preserves the pre-expiry behaviour exactly: nothing hardens. Direct
+	// --addr mounts, VCS_AUTH_TOKEN and embedders all belong there.
+	CredentialSource func() (token string, expiresAtMs int64)
 	AuthToken        string
 
 	// WALDir is the write-back engine's durable state directory (the mount
@@ -575,22 +585,31 @@ func Dial(ctx context.Context, opts Options) (*Volume, error) {
 	if opts.Addr == "" {
 		return nil, fmt.Errorf("clientcore: Addr is required")
 	}
-	auth := opts.CredentialSource
-	if auth == nil && opts.AuthToken != "" {
+	var auth func() fsproto.Credential
+	switch {
+	case opts.CredentialSource != nil:
+		src := opts.CredentialSource
+		auth = func() fsproto.Credential {
+			tok, expiresAtMs := src()
+			return fsproto.Credential{Token: tok, ExpiresAtMs: expiresAtMs}
+		}
+	case opts.AuthToken != "":
 		tok := opts.AuthToken
-		auth = func() string { return tok }
+		auth = func() fsproto.Credential { return fsproto.Credential{Token: tok} }
 	}
-	cli, err := fsproto.DialTLSAuth(opts.Addr, opts.Pool, opts.TLSConfig, auth)
+	// The source is installed BEFORE the pool dials, and deliberately not
+	// re-installed afterwards. Re-installing it opened a fresh credential
+	// generation that the completed construction handshakes had already
+	// proved, so every healthy mount sat permanently in the UNPROVEN state
+	// with nothing left that would ever prove it — which is precisely why the
+	// unproven state could not be surfaced to operators at all. One
+	// installation, proved by the dial it configures.
+	cli, err := fsproto.DialTLSCredential(opts.Addr, opts.Pool, opts.TLSConfig, auth)
 	if err != nil {
 		return nil, err
 	}
 	if opts.Owner != "" {
 		cli.SetOwner(opts.Owner)
-	}
-	if opts.CredentialSource != nil {
-		cli.SetAuthTokenSource(opts.CredentialSource)
-	} else if opts.AuthToken != "" {
-		cli.SetAuthToken(opts.AuthToken)
 	}
 	return Attach(ctx, cli, opts)
 }
@@ -1786,6 +1805,24 @@ func (v *Volume) AuthorityUnreachable() bool {
 // and the admitted backlog belongs to the durable parked-job path.
 func (v *Volume) CredentialExpired() bool {
 	return v.client.CredentialRejected()
+}
+
+// CredentialUnproven reports the THIRD credential state, the one the mount used
+// to have no word for: the installed credential has been offered and no
+// handshake has either accepted or refused it.
+//
+// It is not CredentialExpired. Expired is a proven-dead credential and its
+// remedy is `portablefs login` plus a remount. Unproven is an UNTESTED
+// credential — the authority never answered, because something between this
+// mount and it is tearing the handshake down before the ack byte — and telling
+// an operator to log in again fixes nothing. Overloading the expired word for
+// both hid the difference and sent people to the wrong repair.
+//
+// The state is bounded, not open-ended: past the credential's own stated
+// expiry it hardens and CredentialExpired takes over (see
+// fsproto.Client.CredentialUnproven), so the two are never simultaneously true.
+func (v *Volume) CredentialUnproven() bool {
+	return v.client.CredentialUnproven()
 }
 
 // CredentialInstalled re-arms reachability probing after the daemon installs a

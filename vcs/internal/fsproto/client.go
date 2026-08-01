@@ -48,7 +48,7 @@ type Client struct {
 	opLat      *metrics.Histogram // authority round-trip latency
 	authMu     sync.RWMutex
 	authToken  string
-	authSource func() string
+	authSource func() Credential
 
 	// redial paces reconnection attempts across the WHOLE pool (shared
 	// full-jitter backoff): concurrent ops failing against a dead authority
@@ -120,6 +120,28 @@ func (c *Client) SetMetrics(reg *metrics.Registry) {
 // before Subscribe.
 func (c *Client) SetOwner(owner string) { c.owner = owner }
 
+// Credential is ONE credential offering: the token a handshake presents, plus
+// the deadline the credential's ISSUER stated for it.
+//
+// The token alone was never enough. A credential that no handshake has yet
+// accepted or refused is UNPROVEN, and an unproven credential with no stated
+// deadline is unprovable in both directions forever — the mount can neither
+// call it healthy nor call it dead. The issuer (the access lease) already
+// knows when it stops being valid; carrying that number alongside the token is
+// what lets the unproven state end.
+type Credential struct {
+	// Token is the data-plane credential offered in the handshake frame.
+	Token string
+	// ExpiresAtMs is the issuer's own stated expiry, unix milliseconds.
+	//
+	// ZERO MEANS "NO STATED DEADLINE" — it does NOT mean "expired at the unix
+	// epoch". Static --addr mounts, VCS_AUTH_TOKEN, embedders and every caller
+	// written before this field existed all state nothing, and they must keep
+	// behaving exactly as they did: an unproven credential with no stated
+	// deadline never hardens, because nothing ever said it should.
+	ExpiresAtMs int64
+}
+
 // SetAuthToken sets the static token used for future connection handshakes. Existing live connections
 // keep their handshake-time auth; reconnects pick up this value.
 //
@@ -143,13 +165,38 @@ func (c *Client) SetAuthToken(tok string) {
 // SetAuthTokenSource installs a callback used for future connection handshakes. It lets a mount or
 // daemon renew credentials in place without rebuilding the client or dropping warm caches.
 func (c *Client) SetAuthTokenSource(fn func() string) {
+	if fn == nil {
+		c.SetCredentialSource(nil)
+		return
+	}
+	c.SetCredentialSource(func() Credential { return Credential{Token: fn()} })
+}
+
+// SetCredentialSource installs the EXPIRY-CARRYING form of the token source.
+//
+// It exists because "how long is this credential supposed to be good for?" is
+// the one fact that turns an UNPROVEN credential from an open-ended state into
+// a bounded one. Without it the mount can only say "no handshake has ever
+// accepted or refused this credential", and it says that forever; with it the
+// mount can say "…and its own issuer stated it would be dead by T", so past T
+// the unproven state HARDENS into the definite credential-expired verdict
+// instead of hanging around as a permanent maybe.
+//
+// The deadline is deliberately the credential's OWN stated expiry — the same
+// house rule the lease keeper follows (bound the replay by the lease's own
+// expiry, never by a retry budget invented at this layer). A source that
+// states nothing (ExpiresAtMs == 0) keeps EXACTLY the old behaviour: nothing
+// hardens, because nothing ever stated that anything should.
+func (c *Client) SetCredentialSource(fn func() Credential) {
 	c.authMu.Lock()
 	c.authSource = fn
 	c.authMu.Unlock()
 	c.health.installCredential()
 }
 
-func (c *Client) tokenForHandshake() string {
+// credentialForHandshake reads the live credential a handshake starting now
+// would offer, together with whatever deadline its issuer stated for it.
+func (c *Client) credentialForHandshake() Credential {
 	c.authMu.RLock()
 	source := c.authSource
 	tok := c.authToken
@@ -158,9 +205,26 @@ func (c *Client) tokenForHandshake() string {
 		return source()
 	}
 	if tok != "" {
-		return tok
+		return Credential{Token: tok}
 	}
-	return secure.AuthToken()
+	// The process-wide fallback token carries no issuer statement at all, so
+	// it states no deadline and can never harden. That is the honest answer:
+	// a static environment token is not a lease.
+	return Credential{Token: secure.AuthToken()}
+}
+
+func (c *Client) tokenForHandshake() string {
+	return c.credentialForHandshake().Token
+}
+
+// statedCredentialExpiry is the connHealth hook: the CURRENT credential's own
+// stated expiry in unix ms, or 0 when its issuer stated none. It is read live
+// rather than stamped at install time so that a renewal which pushes the
+// deadline out is honoured immediately, and so a mount that has gone idle
+// since the install still hardens on schedule rather than only when some
+// unrelated dial happens to refresh a cached copy.
+func (c *Client) statedCredentialExpiry() int64 {
+	return c.credentialForHandshake().ExpiresAtMs
 }
 
 type conn struct {
@@ -565,8 +629,26 @@ func DialTLS(addr string, pool int, tlsCfg *tls.Config) (*Client, error) {
 }
 
 // DialTLSAuth is DialTLS with a token source installed before the initial connection pool is opened.
+// The source states no expiry, so nothing about the resulting client's credential can ever harden
+// (see Credential.ExpiresAtMs); DialTLSCredential is the form that carries the issuer's deadline.
 func DialTLSAuth(addr string, pool int, tlsCfg *tls.Config, auth func() string) (*Client, error) {
-	return dialPool(addr, pool, tlsCfg, auth, nil)
+	if auth == nil {
+		return dialPool(addr, pool, tlsCfg, nil, nil)
+	}
+	return dialPool(addr, pool, tlsCfg, func() Credential { return Credential{Token: auth()} }, nil)
+}
+
+// DialTLSCredential is DialTLSAuth with the EXPIRY-CARRYING source installed
+// before the pool is opened.
+//
+// Installing it here rather than after the dial matters: the pool's own
+// construction handshakes are what PROVE the credential, and a source
+// installed afterwards opens a fresh, unproven generation that nothing in a
+// healthy mount would ever go on to prove — every mount would then report
+// "credential pending verification" for its entire life, which is exactly the
+// noise that made the unproven state unsurfaceable in the first place.
+func DialTLSCredential(addr string, pool int, tlsCfg *tls.Config, src func() Credential) (*Client, error) {
+	return dialPool(addr, pool, tlsCfg, src, nil)
 }
 
 // DialWithTransport opens a client whose connections use the given transport
@@ -628,7 +710,7 @@ func adaptLegacyTransport(transport func() (net.Conn, error)) transportDialer {
 	}
 }
 
-func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, transport transportDialer) (*Client, error) {
+func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() Credential, transport transportDialer) (*Client, error) {
 	if pool < 1 {
 		pool = 1
 	}
@@ -648,6 +730,10 @@ func dialPool(addr string, pool int, tlsCfg *tls.Config, auth func() string, tra
 	}
 	c.health = newConnHealth()
 	c.health.onEngage = func() { go c.runReachabilityProbe() }
+	// The breaker asks the LIVE credential source for its stated deadline;
+	// wiring it here (once, before any dial) keeps the hook immutable, so it
+	// is safe to consult without holding the health lock.
+	c.health.credExpiry = c.statedCredentialExpiry
 	if auth != nil {
 		c.authSource = auth
 	}

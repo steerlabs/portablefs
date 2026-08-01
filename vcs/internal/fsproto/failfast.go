@@ -59,6 +59,11 @@ const (
 	failFastProbeInterval = 2 * time.Second
 	// failFastProbeDialTimeout bounds one probe dial+handshake attempt.
 	failFastProbeDialTimeout = 3 * time.Second
+	// credentialVerifyInterval is the cadence at which an installed but still
+	// UNPROVEN credential is re-offered to the authority. It only ever runs
+	// inside the credential's OWN stated expiry (see connHealth.credExpiry),
+	// so it is a bounded convergence loop, not an open-ended retry budget.
+	credentialVerifyInterval = 2 * time.Second
 )
 
 // ErrAuthorityUnreachable is returned WITHOUT touching the network while
@@ -117,10 +122,43 @@ type connHealth struct {
 	credRejectedAt uint64
 	credVerifiedAt uint64
 	credPending    bool
+
+	// ── THE UNPROVEN STATE HAS A BOUNDARY ───────────────────────────────────
+	//
+	// credPending had no timestamp, no deadline and no TTL. A credential that
+	// was neither accepted nor refused therefore stayed pending FOREVER, and
+	// the one interleaving that produces it in production — the router or
+	// authority tearing the connection down cleanly after reading the token
+	// frame but before answering ack (see ErrCredentialRefused) — never trips
+	// the transport breaker either, because a clean EOF is not a transport
+	// failure. So the mount latched nothing, engaged nothing, and reported
+	// nothing: a permanent maybe.
+	//
+	// credExpiry closes that. It reports the CURRENT credential's own stated
+	// expiry (unix ms; 0 = the issuer stated none), read live from the
+	// credential source. Past that instant an unproven credential HARDENS into
+	// the same definite verdict a refusal would have latched: the lease is
+	// over by its own terms, so "we never found out" resolves to "dead", and
+	// the operator gets the one instruction that works instead of an
+	// indefinite pending state.
+	//
+	// It is installed once, at client construction, and is therefore read
+	// WITHOUT h.mu — it takes the client's auth lock, and nesting the two
+	// would invent a lock order for no reason at all.
+	credExpiry func() int64
 }
 
 func newConnHealth() *connHealth {
 	return &connHealth{now: time.Now, credGen: 1, credPending: true}
+}
+
+// statedExpiry is the CURRENT credential's own stated expiry (unix ms), or 0
+// when its issuer stated none. Never called with h.mu held.
+func (h *connHealth) statedExpiry() int64 {
+	if h == nil || h.credExpiry == nil {
+		return 0
+	}
+	return h.credExpiry()
 }
 
 // generation reports the credential generation a handshake starting now will
@@ -229,25 +267,67 @@ func (h *connHealth) installCredential() uint64 {
 	return h.credGen
 }
 
-// credentialDead reports the latched verdict for the CURRENT generation.
+// pendingLocked is the raw "no handshake has classified the current
+// generation" predicate, before the expiry boundary is applied.
+func (h *connHealth) pendingLocked() bool {
+	return h.credPending && h.credVerifiedAt != h.credGen && h.credRejectedAt != h.credGen
+}
+
+// hardenedLocked reports that an unproven credential has outlived the deadline
+// its OWN issuer stated for it, so the pending state resolves to dead.
+//
+// expiresAtMs of 0 is "the issuer stated no deadline" and can never harden:
+// old CLIs, static --addr mounts and VCS_AUTH_TOKEN all land there, and none
+// of them may start reporting a dead credential just because this boundary now
+// exists. A deadline is only ever honoured when somebody actually stated one.
+func (h *connHealth) hardenedLocked(expiresAtMs int64) bool {
+	if expiresAtMs <= 0 || !h.pendingLocked() {
+		return false
+	}
+	return !h.now().Before(time.UnixMilli(expiresAtMs))
+}
+
+// credentialDead reports the latched verdict for the CURRENT generation — or
+// the HARDENED one: an unproven credential past its own stated expiry is dead
+// by the issuer's own terms even though no handshake ever said so out loud.
 func (h *connHealth) credentialDead() bool {
 	if h == nil {
 		return false
 	}
+	expiresAtMs := h.statedExpiry()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.credRejectedAt != 0 && h.credRejectedAt == h.credGen
+	if h.credRejectedAt != 0 && h.credRejectedAt == h.credGen {
+		return true
+	}
+	return h.hardenedLocked(expiresAtMs)
 }
 
 // credentialUnproven reports that the current generation has neither been
-// accepted nor refused by any handshake yet.
+// accepted nor refused by any handshake yet AND is still inside whatever
+// deadline its issuer stated. Past that deadline it is no longer unproven —
+// it is expired (credentialDead), and the two states must never both be true:
+// "we never found out" and "it is dead" call for different operator actions.
 func (h *connHealth) credentialUnproven() bool {
+	if h == nil {
+		return false
+	}
+	expiresAtMs := h.statedExpiry()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pendingLocked() && !h.hardenedLocked(expiresAtMs)
+}
+
+// generationPending reports whether gen is STILL the current generation and
+// still unclassified. The credential verifier uses it to stop the moment its
+// generation is superseded by a newer install or resolved by any handshake.
+func (h *connHealth) generationPending(gen uint64) bool {
 	if h == nil {
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.credPending && h.credVerifiedAt != h.credGen && h.credRejectedAt != h.credGen
+	return gen != 0 && gen == h.credGen && h.pendingLocked()
 }
 
 // maybeEngageLocked flips to engaged when the entry conditions hold and
@@ -357,8 +437,16 @@ func (c *Client) FailFast() bool { return c.health.active() }
 func (c *Client) CredentialRejected() bool { return c.health.credentialDead() }
 
 // CredentialUnproven reports that the installed credential has not yet been
-// offered to the authority by any handshake. It is neither healthy nor dead —
-// it is UNTESTED — and a mount must not be reported as recovered on it.
+// accepted or refused by any handshake. It is neither healthy nor dead — it is
+// UNTESTED — and a mount must not be reported as recovered on it.
+//
+// It is DISJOINT from CredentialRejected by construction: once the credential
+// passes its own stated expiry the unproven state hardens into the rejected
+// one, so exactly one of the two is ever true. The distinction is not
+// cosmetic — the operator actions differ. Rejected means the authority
+// answered "no": log in again. Unproven means the authority never answered at
+// all, because something between the mount and it is tearing the handshake
+// down before the ack: look at the router, not at the login.
 func (c *Client) CredentialUnproven() bool { return c.health.credentialUnproven() }
 
 // CredentialInstalled opens a new credential generation and IMMEDIATELY proves
@@ -390,18 +478,57 @@ func (c *Client) CredentialInstalled() {
 	go c.verifyCredential(gen)
 }
 
-// verifyCredential performs ONE bounded gate-exempt handshake for gen and
-// records the verdict it earns. A transport failure proves nothing about the
-// credential and leaves it pending: the prober and the subscribe reconnect loop
-// own reachability, and the next successful handshake will classify it.
+// verifyCredential offers gen to the authority with bounded, gate-exempt
+// handshakes until it is CLASSIFIED — or until the credential's own stated
+// expiry says there is nothing left to classify.
+//
+// It used to be a single probe. One probe is enough when the answer arrives
+// (accepted, or refused with ack 1), and it is enough when the peer is
+// genuinely unreachable, because that trips the transport breaker and the
+// reachability prober takes over. It is NOT enough for the interleaving this
+// whole boundary exists for: a router or authority that closes cleanly after
+// reading the token frame and before answering ack. That produces no ack to
+// latch, no transport failure to count, and therefore no breaker, no prober
+// and no second attempt — one probe, then silence, with the credential pending
+// forever. A streak of those now gets re-offered.
+//
+// The loop is bounded by the credential's OWN stated expiry, exactly as the
+// lease keeper bounds its unresolved renewals: past that instant the pending
+// state hardens to dead (see connHealth.hardenedLocked) and there is nothing
+// left to prove. A credential whose issuer stated NO deadline has no boundary
+// to loop inside, so it keeps precisely the old single-probe behaviour rather
+// than acquiring an open-ended retry loop this layer would have had to invent.
 func (c *Client) verifyCredential(gen uint64) {
-	if c.isClosed() {
-		return
+	for {
+		if c.isClosed() {
+			return
+		}
+		switch c.probeAuthority() {
+		case probeReachable, probeCredentialRejected:
+			// The handshake itself recorded the generation-tagged verdict
+			// (conn.ensureWithGate); either way gen is now classified.
+			return
+		}
+		// INCONCLUSIVE. Only keep offering while this exact generation is
+		// still the live, still-unclassified one.
+		if !c.health.generationPending(gen) {
+			return
+		}
+		expiresAtMs := c.health.statedExpiry()
+		if expiresAtMs <= 0 {
+			// No stated deadline: no boundary, so no loop.
+			return
+		}
+		if !c.health.now().Before(time.UnixMilli(expiresAtMs)) {
+			// The credential is over by its own terms; it has hardened.
+			return
+		}
+		select {
+		case <-c.closed:
+			return
+		case <-time.After(credentialVerifyInterval):
+		}
 	}
-	// The verdict is recorded by the handshake itself (conn.ensureWithGate,
-	// generation-tagged), so this only has to make the handshake happen.
-	_ = gen
-	c.probeAuthority()
 }
 
 // probeOutcome is what ONE reachability probe proved. The three cases are

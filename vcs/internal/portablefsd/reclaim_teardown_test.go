@@ -70,7 +70,7 @@ func TestForceUnmountAdmitsKernelReclaim(t *testing.T) {
 		DataPlaneTransport: "plaintext",
 	}
 	seed := newAttach(testFSKitAttachRef, attachKey(req.VolumeID, req.Branch, req.MountPath), req, stateDir)
-	if err := seed.activate(context.Background(), ""); err != nil {
+	if err := seed.activate(context.Background(), "", 0); err != nil {
 		t.Fatal(err)
 	}
 	seed.mu.RLock()

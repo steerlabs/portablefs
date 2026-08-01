@@ -73,11 +73,11 @@ func TestInternalRefreshCannotBecomeAnApplicationTruncate(t *testing.T) {
 		upcallReply *pfslocal.SetAttrReply
 		upcallEno   int32
 	)
-	a.testRefreshKernelFile = func(_ string, p string, _ uint64, size int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_ string, p string, _ uint64, size int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
 		// Inside the daemon's own ftruncate(2): the provenance window is armed
 		// for exactly this call's extent. Everything below models what the
 		// kernel and the dispatcher do while that syscall is outstanding.
-		defer armTruncate()()
+		defer mustArmRefreshWindow(t, armTruncate)()
 		if p != "f" || size != sampledSize {
 			t.Errorf("refresh addressed path=%q size=%d, want f/%d", p, size, sampledSize)
 		}
@@ -97,7 +97,7 @@ func TestInternalRefreshCannotBecomeAnApplicationTruncate(t *testing.T) {
 		return kernelRefreshApplied, nil
 	}
 
-	if outcome, err := a.applyKernelRefresh("", "f", rec, sampledSize); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", "f", rec, sampledSize, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("apply kernel refresh = (%v, %v)", outcome, err)
 	}
 	if upcallEno != 0 || upcallReply == nil {
@@ -175,9 +175,9 @@ func TestInternalRefreshBypassesMutationAdmission(t *testing.T) {
 		settle()
 	}
 
-	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() func()) (kernelRefreshOutcome, error) {
+	a.testRefreshKernelFile = func(_, _ string, _ uint64, _ int64, armTruncate func() (func(), error)) (kernelRefreshOutcome, error) {
 		// Inside the daemon's own syscall: the marker is pinned.
-		defer armTruncate()()
+		defer mustArmRefreshWindow(t, armTruncate)()
 		if !a.internalRefreshPending(refresh) {
 			t.Error("a pinned refresh marker did not answer the provenance test")
 		}
@@ -199,7 +199,7 @@ func TestInternalRefreshBypassesMutationAdmission(t *testing.T) {
 		}
 		return kernelRefreshApplied, nil
 	}
-	if outcome, err := a.applyKernelRefresh("", "f", rec, 5); outcome != kernelRefreshApplied || err != nil {
+	if outcome, err := a.applyKernelRefresh("", "f", rec, 5, refreshApplyFence{observedSize: rec.attr.Size}); outcome != kernelRefreshApplied || err != nil {
 		t.Fatalf("apply kernel refresh = (%v, %v)", outcome, err)
 	}
 

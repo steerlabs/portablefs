@@ -178,7 +178,7 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 			a.mu.Lock()
 			root = a.root
 			if root == nil {
-				root = a.registerLocked("", syntheticRootAttr())
+				root = a.registerSyntheticRootLocked()
 				if root == nil {
 					a.mu.Unlock()
 					return pfslocal.ResolveReply{}, darwinEIO
@@ -193,14 +193,23 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 		if st != fsproto.OK {
 			return pfslocal.ResolveReply{}, toDarwinErr(st)
 		}
+		var ticket *reincarnationTicket
 		a.mu.Lock()
-		root = a.registerLocked("", attr)
+		root, ticket = a.registerOwnedLocked("", attr)
 		if root == nil {
 			a.mu.Unlock()
 			return pfslocal.ResolveReply{}, darwinEIO
 		}
 		changed = true
 		a.mu.Unlock()
+		// The root is a publisher like any other. In practice it owes nothing:
+		// the root's only alias is its own name, which detachReincarnatedPath
+		// removes from the alias index before the debt loop runs. Paying the
+		// (inert) ticket anyway is what keeps that an observation rather than an
+		// assumption the next edit here can quietly break.
+		if eno := ticket.settle(ctx, vol); eno != 0 {
+			return pfslocal.ResolveReply{}, eno
+		}
 	}
 	if changed {
 		if eno := a.persistStateOrEIO("resolve root identity"); eno != 0 {
@@ -278,74 +287,21 @@ func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfsl
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
-	a.mu.Lock()
-	rec := a.registerLocked(p, attr)
-	a.mu.Unlock()
+	rec, ticket := a.registerOwned(p, attr)
 	if rec == nil {
 		return nil, darwinEIO
 	}
 	// A pathname reincarnation detected by this lookup owes its displaced
 	// inode's retained aliases a refresh, and it must be paid BEFORE the
-	// replacement is published — see reconcileReincarnatedAliases.
-	a.reconcileReincarnatedAliases(ctx, vol)
+	// replacement is published — see reincarnation.go. a.mu is released here
+	// because settling issues authority RPCs.
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return nil, eno
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}
 	return &pfslocal.LookupReply{Attr: a.localAttrForRecord(attr, rec, false)}, 0
-}
-
-// reconcileReincarnatedAliases refreshes every retained hard-link alias of an
-// authority inode that a pathname reincarnation has just displaced, and it runs
-// BEFORE the caller publishes the replacement.
-//
-// ── WHY THE ORDER IS THE FIX ────────────────────────────────────────────────
-//
-// A remote rename-over replaces WHO a name identifies while the displaced inode
-// stays alive behind its other links. Two independent paths carry that one
-// event to the frontend:
-//
-//	the LOOKUP that resolves the name -> publishes the replacement Item
-//	the INVALIDATION stream's RelatedInos fan-out -> refreshes the aliases
-//
-// Nothing ordered them. When the lookup reached the authority directly it could
-// publish the new `a` while `b` was still serving the attribute snapshot taken
-// at hard-link time — new identity, Nlink=2, an impossible pair for an
-// application to observe. (Round 5 did not create this hole; it removed the
-// incidental serialization that used to hide it. Before that split, a lookup
-// entered the publication gate BLOCKING, before its handler ran, which paid for
-// the invalidation to land often enough that the race was invisible. See the
-// publication activation protocol in coherence_refresh.go.)
-//
-// The publisher that DETECTS the reincarnation is the one that owes the
-// reconciliation, and it settles it on its own reply path rather than hoping
-// another path wins a race. This is ordering, not polling: the debt is recorded
-// synchronously by detachReincarnatedPathLocked, and it is discharged before
-// the reply is written.
-//
-// An alias that cannot be restated is left evicted rather than refreshed: a
-// stale cached snapshot is exactly what must not survive, and the next
-// resolution of that name will reach the authority.
-func (a *attach) reconcileReincarnatedAliases(ctx context.Context, vol *clientcore.Volume) {
-	aliases := a.takeReincarnatedAliases()
-	if len(aliases) == 0 || vol == nil {
-		return
-	}
-	for _, alias := range aliases {
-		a.mu.RLock()
-		rec := a.paths[alias]
-		a.mu.RUnlock()
-		if rec == nil || rec.graft {
-			continue
-		}
-		vol.AttrCache.Evict(alias)
-		attr, st := vol.Getattr(ctx, alias, rec.state)
-		if st != fsproto.OK {
-			continue
-		}
-		a.mu.Lock()
-		a.registerLocked(alias, attr)
-		a.mu.Unlock()
-	}
 }
 
 func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) (*pfslocal.EnumerateReply, int32) {
@@ -377,9 +333,24 @@ func (a *attach) enumerate(ctx context.Context, req *pfslocal.EnumerateRequest) 
 	}
 	ordered := orderEnumeration(ents)
 	start := sort.Search(len(ordered), func(i int) bool { return ordered[i].cursor > resume })
-	rep, eno := a.enumeratePage(dir.path, ordered, start, dirVersion, int(req.MaxEntries))
+	rep, ticket, eno := a.enumeratePage(dir.path, ordered, start, dirVersion, int(req.MaxEntries))
+	// Settle BEFORE the page's own errno is acted on. A page that fails partway
+	// has already registered the entries ahead of the failure, so the debt those
+	// registrations created is just as real as a successful page's — dropping it
+	// here would leave an alias permanently stale with no publisher left owning
+	// its refresh. The page's own error still wins the reply.
+	settleEno := ticket.settle(ctx, a.enumerateVolume())
 	if eno != 0 {
 		return nil, eno
+	}
+	// Enumerate is a publishing operation by the same classification lookup is
+	// (frontendRequestPublishes) and exposes its reply through the same
+	// replyWithPublication, so a reincarnation this page discovered owes the
+	// displaced inode's retained aliases exactly what a lookup owes them —
+	// settled here, with a.mu released, before the page is exposed. The alias
+	// need not be in this page or even in this directory.
+	if settleEno != 0 {
+		return nil, settleEno
 	}
 	if rep != nil && len(rep.Entries) > 0 {
 		if eno := a.flushBindingDelta(); eno != 0 {
@@ -499,9 +470,28 @@ func orderEnumeration(ents []clientcore.DirEntry) []enumerationEntry {
 	return ordered
 }
 
-func (a *attach) enumeratePage(dir string, ordered []enumerationEntry, start int, dirVersion uint64, limit int) (*pfslocal.EnumerateReply, int32) {
+// enumerateVolume is the volume a page's reconciliation refreshes through. The
+// errno is deliberately dropped: an inert (nil) ticket owes nothing and never
+// touches the volume, while a ticket that DOES owe something and finds no
+// authority fails inside settle — the decision belongs there, next to the debt
+// it is refusing to abandon, not at the call site.
+func (a *attach) enumerateVolume() *clientcore.Volume {
+	vol, _ := a.volOrErr()
+	return vol
+}
+
+// enumeratePage registers every entry of one page under a SINGLE ticket: the
+// page is one publication, so all the reconciliation debt it creates is owed by
+// one publisher and settles as one unit.
+func (a *attach) enumeratePage(dir string, ordered []enumerationEntry, start int, dirVersion uint64, limit int) (*pfslocal.EnumerateReply, *reincarnationTicket, int32) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	saved := a.beginReincarnationOwnerLocked(nil)
+	rep, eno := a.enumeratePageLocked(dir, ordered, start, dirVersion, limit)
+	return rep, a.endReincarnationOwnerLocked(saved), eno
+}
+
+func (a *attach) enumeratePageLocked(dir string, ordered []enumerationEntry, start int, dirVersion uint64, limit int) (*pfslocal.EnumerateReply, int32) {
 	if start > len(ordered) {
 		start = len(ordered)
 	}
@@ -627,14 +617,22 @@ func (a *attach) getattr(ctx context.Context, req *pfslocal.GetAttrRequest) (*pf
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
+	saved := a.beginReincarnationOwnerLocked(nil)
 	if target.handle != nil {
 		rec = a.registerHandleAttrLocked(target.handle, attr)
 	} else {
 		rec = a.registerLocked(rec.path, attr)
 	}
+	ticket := a.endReincarnationOwnerLocked(saved)
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
+	}
+	// getattr publishes an Item to FSKit exactly as lookup does, so a
+	// reincarnation IT discovers owes the displaced inode's retained aliases the
+	// same refresh, on this reply path.
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -672,10 +670,54 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	if eno != 0 {
 		return nil, eno
 	}
-	// A size-only setattr the daemon itself issued to refresh the kernel's
-	// stale vnode state (see exactKernelRefresh) must not reach the
-	// authority: consume the note and answer with current attributes.
-	switch a.classifyExpectedTruncate(rec.path, req) {
+	// A size-only setattr the daemon itself issued to refresh the kernel's stale
+	// vnode state (see exactKernelRefresh) must not reach the authority: it is
+	// answered here, from current attributes.
+	//
+	// PHASE 1'S VERDICT, NOT A NEW ONE.
+	//
+	// The handler consumes the provenance verdict the dispatcher froze into this
+	// operation's context; it does not re-derive one. Re-deriving is what let a
+	// pinned window close while the request it described was parked waiting to
+	// activate, after which the handler called the daemon's OWN refresh upcall
+	// an application mutation and executed it against the authority with no
+	// admission behind it. See refreshVerdictKey.
+	//
+	// classifyExpectedTruncate is still reached below for the unpinned sweeper
+	// arm, whose markers are a backstop rather than a live claim.
+	verdict, sizeSet := a.frozenRefreshVerdict(ctx, req)
+	class := refreshClassApplication
+	if sizeSet {
+		class = verdict.class
+	}
+	if class == refreshClassApplication && sizeSet {
+		// Only a request phase 1 already called an application mutation may be
+		// re-examined here, and only against the sweeper arm — which can answer
+		// Internal or Ambiguous but never promotes anything to the authority
+		// that was not already headed there.
+		class = a.classifyExpectedTruncate(rec.path, req)
+	}
+	if class == refreshClassInternal {
+		// REVALIDATE THE PREREQUISITES, NEVER THE VERDICT.
+		//
+		// The frozen answer says "this is answered locally". What it cannot say
+		// is that the item's composed size is still the one that made answering
+		// locally harmless: a local write landing between phase 1 and here makes
+		// suppression a silent discard of somebody's intent. The only move
+		// available is to REFUSE — never to promote the request to the authority,
+		// which is the direction the freeze exists to forbid. EINTR unwinds to
+		// phase 1, which classifies again holding nothing.
+		a.mu.RLock()
+		current := a.items[rec.item.ItemID]
+		stale := current == nil ||
+			current.item.ItemGeneration != rec.item.ItemGeneration ||
+			current.attr.Size != int64(*req.Size)
+		a.mu.RUnlock()
+		if stale && current != nil {
+			class = refreshClassAmbiguous
+		}
+	}
+	switch class {
 	case refreshClassAmbiguous:
 		// A pinned refresh window claims this exact (item, size), but a local
 		// write has moved the item's composed size since the window opened, so
@@ -767,14 +809,22 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		}
 	}
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	if target.handle != nil {
 		rec = a.registerHandleAttrLocked(target.handle, attr)
 	} else {
 		rec = a.registerLocked(rec.path, attr)
 	}
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
+	}
+	// setattr publishes an Item too: a post-op attribute registration can land
+	// on a name a peer replaced mid-flight, and the displaced inode's retained
+	// aliases owe the same refresh before this reply leaves.
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -1004,7 +1054,7 @@ func (a *attach) writeLocked(
 		} else if wrote <= 0 {
 			return nil, localErrno(serr)
 		}
-		return a.writeReplyWithAttr(h, scope, detached, wrote, attr, serr == nil)
+		return a.writeReplyWithAttr(ctx, h, scope, detached, wrote, attr, serr == nil)
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -1096,7 +1146,7 @@ func (a *attach) writeReply(
 	if st != fsproto.OK && n <= 0 {
 		return nil, toDarwinErr(st)
 	}
-	return a.writeReplyWithAttr(h, scope, detached, n, attr, st == fsproto.OK)
+	return a.writeReplyWithAttr(ctx, h, scope, detached, n, attr, st == fsproto.OK)
 }
 
 // writeReplyWithAttr is writeReply's shared tail, reached once the write's own
@@ -1104,6 +1154,7 @@ func (a *attach) writeReply(
 // says whether attr is a fresh observation or must be replaced by what the
 // daemon already holds.
 func (a *attach) writeReplyWithAttr(
+	ctx context.Context,
 	h *handleRecord,
 	scope string,
 	detached bool,
@@ -1114,10 +1165,12 @@ func (a *attach) writeReplyWithAttr(
 	committed := n > 0
 
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	var rec *itemRecord
 	if refreshed {
 		rec = a.registerHandleAttrLocked(h, attr)
 	}
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	if rec == nil {
 		// No refresh, or the handle's binding no longer resolves: answer from
 		// the item the kernel already holds for this handle.
@@ -1133,6 +1186,17 @@ func (a *attach) writeReplyWithAttr(
 
 	if rec == nil && !committed {
 		return nil, darwinEIO
+	}
+	// A post-write attribute refresh can land on a name a peer replaced while
+	// the write was in flight, which reincarnates it and leaves the displaced
+	// inode's aliases owing a refresh. Settle before the reply, on the same
+	// terms the binding-journal failure below is on: a write that COMMITTED
+	// bytes still reports them, because that report is the application's only
+	// chance to learn they are durable, and an unreconciled alias is a
+	// coherence defect rather than a reason to lie about committed data.
+	vol, _ := a.volOrErr()
+	if eno := ticket.settle(ctx, vol); eno != 0 && !committed {
+		return nil, eno
 	}
 	// The binding journal's own contract makes a failed append a correctness
 	// failure that fails the frontend gate closed (failBindingPersistence), so
@@ -1333,10 +1397,18 @@ func (a *attach) create(ctx context.Context, req *pfslocal.CreateRequest) (*pfsl
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	rec := a.registerCreatedLocked(p, attr)
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
+	}
+	// A create that lands on a name a peer already replaced reincarnates it,
+	// and the displaced inode's retained aliases owe a refresh before this
+	// reply publishes the new identity.
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -1398,10 +1470,18 @@ func (a *attach) mkdir(ctx context.Context, req *pfslocal.MkdirRequest) (*pfsloc
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	rec := a.registerCreatedLocked(p, attr)
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
+	}
+	// A create that lands on a name a peer already replaced reincarnates it,
+	// and the displaced inode's retained aliases owe a refresh before this
+	// reply publishes the new identity.
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
@@ -1684,10 +1764,18 @@ func (a *attach) symlink(ctx context.Context, req *pfslocal.SymlinkRequest) (*pf
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	rec := a.registerCreatedLocked(p, attr)
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
 	if rec == nil {
 		return nil, darwinEIO
+	}
+	// A create that lands on a name a peer already replaced reincarnates it,
+	// and the displaced inode's retained aliases owe a refresh before this
+	// reply publishes the new identity.
+	if eno := ticket.settle(ctx, vol); eno != 0 {
+		return nil, eno
 	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno

@@ -35,11 +35,19 @@ const darwinResolveBeneath = 0x00001000
 // is actually issued: the window's claim is "this process is inside the
 // syscall that produced the upcall you are classifying", and a refresh that
 // finds the vnode size already correct makes no such syscall.
+//
+// armTruncate may REFUSE. The window is opened atomically with the daemon
+// installing the sampled size as its composed view, so an arm that can no
+// longer prove the sample current has nothing truthful to install and nothing
+// truthful to claim. Its refusal must abort the ftruncate rather than let it
+// proceed unwindowed: an unwindowed refresh upcall is indistinguishable from an
+// application truncate and would be forwarded to the authority — the one
+// outcome that destroys data.
 func refreshKernelFile(
 	mountPath, relativePath string,
 	expectedItemID uint64,
 	size int64,
-	armTruncate func() func(),
+	armTruncate func() (func(), error),
 ) (kernelRefreshOutcome, error) {
 	fd, err := openKernelRefreshFile(mountPath, relativePath)
 	if err != nil {
@@ -98,9 +106,15 @@ func refreshKernelFile(
 // extent of the ftruncate(2) that produces the upcall it identifies. The
 // disarm runs before the error is inspected: the syscall has returned, so its
 // premise ("this process has not left the call") no longer holds either way.
-func truncateWithProvenance(fd int, size int64, armTruncate func() func()) error {
+func truncateWithProvenance(fd int, size int64, armTruncate func() (func(), error)) error {
 	if armTruncate != nil {
-		disarm := armTruncate()
+		disarm, err := armTruncate()
+		if err != nil {
+			// No window, no syscall. The refusal is a retry outcome, never a
+			// licence to truncate the kernel's view on a sample the daemon can
+			// no longer vouch for.
+			return err
+		}
 		defer disarm()
 	}
 	return unix.Ftruncate(fd, size)
