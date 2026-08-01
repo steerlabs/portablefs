@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
@@ -44,6 +45,12 @@ type fakeAuthority struct {
 	// caller's context ends; flushEntered signals entry (buffered).
 	flushGate    chan struct{}
 	flushEntered chan struct{}
+	// flushRateBps models an uplink of a finite throughput: each flush is
+	// delayed in proportion to the bulk bytes it carries before it applies.
+	// Unlike flushGate (a blackhole), this authority DOES make durable
+	// progress — just slowly — which is the shape the credit gate must turn
+	// into a paced completion rather than an error.
+	flushRateBps int64
 	// discardContent keeps only sizes for applied writes (RSS-bounding tests
 	// stream gigabytes; the fake must not hold them on the heap).
 	discardContent bool
@@ -157,8 +164,24 @@ func (a *fakeAuthority) ReleaseDelegation(_ context.Context, scope, epoch string
 
 func (a *fakeAuthority) Flush(ctx context.Context, req FlushRequest) (FlushReply, error) {
 	a.mu.Lock()
-	gate, entered := a.flushGate, a.flushEntered
+	gate, entered, rate := a.flushGate, a.flushEntered, a.flushRateBps
 	a.mu.Unlock()
+	if rate > 0 {
+		var bulk int64
+		for _, rec := range req.Records {
+			bulk += int64(len(rec.Data))
+		}
+		delay := time.Duration(float64(bulk) / float64(rate) * float64(time.Second))
+		if delay > 0 {
+			t := time.NewTimer(delay)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return FlushReply{}, ctx.Err()
+			}
+		}
+	}
 	if gate != nil {
 		if entered != nil {
 			select {

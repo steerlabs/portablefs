@@ -3,9 +3,16 @@ package portablefsd
 import "github.com/steerlabs/portablefs/vcs/internal/fsproto"
 
 const (
-	darwinEPERM        int32 = 1
-	darwinENOENT       int32 = 2
+	darwinEPERM  int32 = 1
+	darwinENOENT int32 = 2
+	// darwinEIO is the EIO-class answer for a far end that stopped answering:
+	// the local store is intact, the authority is not applying. It is
+	// deliberately distinct from darwinENOSPC (28), which promises the operation
+	// can never fit locally. writeback.ErrUplinkStalled maps HERE, so an
+	// application under a dead uplink retries or reports an I/O error instead of
+	// deleting files to fix a network problem. See creditErrno in ops.go.
 	darwinEIO          int32 = 5
+	darwinEINTR        int32 = 4
 	darwinENXIO        int32 = 6
 	darwinE2BIG        int32 = 7
 	darwinEBADF        int32 = 9

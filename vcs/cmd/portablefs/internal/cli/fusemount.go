@@ -23,6 +23,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/modebits"
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 // This file is the product FUSE frontend: it forwards kernel ops through
@@ -380,17 +381,54 @@ func (n *fuseNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 
 func (n *fuseNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	ctx = n.gateOp(ctx)
+	p := n.curPath()
+	// Data-lane admission BEFORE the volume call, exactly as the daemon does it
+	// in front of a.nsMu. FUSE has no namespace lock of its own here, but the
+	// same argument applies one layer down: clientcore's write path takes the
+	// NodeState lock and the engine takes e.mu, and a pacing wait inside either
+	// blocks the open-pin and delegation-release machinery that must be able to
+	// inspect this node. Waiting out here holds nothing.
+	//
+	// gateOp is applied first and left untouched: the credit context wraps the
+	// gated one, so suspension and publication wiring see the identical
+	// operation identity they did before.
+	creditCtx, granted, err := n.v.AcquireDataCredit(ctx, p, len(data))
+	defer n.v.ReleaseDataCredit(creditCtx)
+	if err != nil {
+		return 0, creditErrno(err)
+	}
+	// A short grant becomes a short write, which FUSE replies natively; the
+	// kernel reissues the remainder as a new request that is paced from scratch.
+	data = data[:granted]
+	ctx = creditCtx
 	var cnt int
 	var st clientcore.Status
 	if h, ok := fh.(*fuseHandle); ok && h.append {
-		cnt, st = n.v.WriteAppend(ctx, n.curPath(), n.state, off, data)
+		cnt, st = n.v.WriteAppend(ctx, p, n.state, off, data)
 	} else {
-		cnt, st = n.v.Write(ctx, n.curPath(), n.state, off, data)
+		cnt, st = n.v.Write(ctx, p, n.state, off, data)
 	}
 	if st != fsproto.OK {
 		return 0, errno(st)
 	}
 	return uint32(cnt), 0
+}
+
+// creditErrno maps a refused data-lane admission to the errno FUSE replies.
+// ENOSPC only for an operation this store can never fit; a far end that stopped
+// answering (writeback.ErrUplinkStalled) is EIO, and a cancelled request is
+// EINTR. The daemon frontend makes the identical classification in
+// portablefsd.creditErrno — the two frontends must not disagree about what a
+// stalled uplink looks like to an application.
+func creditErrno(err error) syscall.Errno {
+	switch {
+	case errors.Is(err, writeback.ErrNoSpace):
+		return syscall.ENOSPC
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return syscall.EINTR
+	default:
+		return syscall.EIO
+	}
 }
 
 func (n *fuseNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {

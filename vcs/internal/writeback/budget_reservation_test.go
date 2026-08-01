@@ -55,10 +55,19 @@ func TestLargeWriteIsRefusedInsteadOfOvershootingTheBudget(t *testing.T) {
 }
 
 // TestConcurrentAdmissionsNeverExceedTheBudget proves the budget is an
-// invariant rather than an observation: however admissions interleave, the
-// stream's on-disk footprint is never above the configured budget. Run under
-// -race, it also covers the reservation counter itself.
+// invariant rather than an observation: however admissions interleave — now
+// including credit grants, paced waits and refunds on top of the exact
+// reservation — the stream's on-disk footprint is never above the configured
+// budget. Run under -race, it also covers the reservation counter and the
+// credit ledger's CAS loops.
+//
+// The uplink is gated shut, so writers reach the operating setpoint and pace.
+// Under the credit contract their refusals are ErrUplinkStalled (the far end
+// stopped answering) or ErrNoSpace (this one operation cannot fit the lane at
+// any occupancy); neither may poison the engine, and neither may let a byte
+// past the cap.
 func TestConcurrentAdmissionsNeverExceedTheBudget(t *testing.T) {
+	pinCreditTimings(t, 150*time.Millisecond, 25*time.Second, 200*time.Millisecond)
 	const budget = 4 << 20
 	f := newSaturationFixture(t, budget)
 	ctx := context.Background()
@@ -77,10 +86,10 @@ func TestConcurrentAdmissionsNeverExceedTheBudget(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < 16; i++ {
-				wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				_, handled, err := f.e.WriteAt(wctx, fileName(w), int64(i)*int64(len(chunk)), chunk)
 				cancel()
-				if err != nil && (!handled || !errors.Is(err, ErrNoSpace)) {
+				if err != nil && (!handled || !(errors.Is(err, ErrNoSpace) || errors.Is(err, ErrUplinkStalled))) {
 					t.Errorf("writer %d append %d: handled=%v err=%v", w, i, handled, err)
 					return
 				}
@@ -103,6 +112,82 @@ func TestConcurrentAdmissionsNeverExceedTheBudget(t *testing.T) {
 	if err := f.e.MutationError(); err != nil {
 		t.Fatalf("budget refusals poisoned the engine: %v", err)
 	}
+	if debt := f.e.Status().CreditDebt; debt > f.e.dataBudgetBytes() {
+		t.Fatalf("outstanding credit %d exceeds the data lane's %d cap", debt, f.e.dataBudgetBytes())
+	}
+}
+
+// TestConcurrentPacedAdmissionsNeverExceedTheBudget is the same invariant with
+// the uplink DRAINING at a finite rate, which is the state the credit gate
+// actually governs: grants, applied refills, refunds and reclamation all move
+// at once. The footprint still may not pass the cap, every write completes, and
+// the credit ledger settles back to zero when the stream drains.
+func TestConcurrentPacedAdmissionsNeverExceedTheBudget(t *testing.T) {
+	pinCreditTimings(t, 2*time.Second, 200*time.Millisecond, 30*time.Second)
+	oldTarget := segmentTargetBytes
+	segmentTargetBytes = 1 << 20
+	t.Cleanup(func() { segmentTargetBytes = oldTarget })
+	const budget = 16 << 20
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.flushRateBps = 16 << 20
+	auth.mu.Unlock()
+	e, err := Open(context.Background(), Config{
+		StateDir: t.TempDir(), VolumeID: "vol", Branch: "main",
+		Remote: auth, BudgetBytes: budget,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	defer func() { _, _ = e.ForceClose("test teardown") }()
+
+	ctx := context.Background()
+	const writers = 4
+	for w := 0; w < writers; w++ {
+		if _, handled, err := e.Create(ctx, fileName(w), 0o644, false, false); err != nil || !handled {
+			t.Fatalf("create %s: handled=%v err=%v", fileName(w), handled, err)
+		}
+	}
+	chunk := bytes.Repeat([]byte("y"), 256<<10)
+	var wg sync.WaitGroup
+	over := make(chan int64, writers)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 12; i++ {
+				wctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				_, handled, err := e.WriteAt(wctx, fileName(w), int64(i)*int64(len(chunk)), chunk)
+				cancel()
+				if err != nil || !handled {
+					t.Errorf("paced writer %d append %d: handled=%v err=%v", w, i, handled, err)
+					return
+				}
+				if used := walBytes(t, e); used > budget {
+					select {
+					case over <- used:
+					default:
+					}
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	select {
+	case used := <-over:
+		t.Fatalf("stream WAL reached %d bytes under paced admission, past its %d budget", used, budget)
+	default:
+	}
+	dctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if err := e.DrainAll(dctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if debt := e.Status().CreditDebt; debt != 0 {
+		t.Fatalf("%d bytes of credit survived a full drain: the ledger drifts", debt)
+	}
 }
 
 // TestBudgetRelievedByTheUplinkReadmitsALargeWrite keeps the refusal honest as
@@ -119,6 +204,7 @@ func TestBudgetRelievedByTheUplinkReadmitsALargeWrite(t *testing.T) {
 	segmentTargetBytes = 1 << 20
 	t.Cleanup(func() { segmentTargetBytes = oldTarget })
 
+	pinCreditTimings(t, 150*time.Millisecond, 25*time.Second, 200*time.Millisecond)
 	f := newSaturationFixture(t, budget)
 	ctx := context.Background()
 	if _, handled, err := f.e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
@@ -128,7 +214,7 @@ func TestBudgetRelievedByTheUplinkReadmitsALargeWrite(t *testing.T) {
 	var refused error
 	off := int64(0)
 	for i := 0; i < 64 && refused == nil; i++ {
-		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		_, handled, err := f.e.WriteAt(wctx, "d/f", off, chunk)
 		cancel()
 		switch {
@@ -140,8 +226,8 @@ func TestBudgetRelievedByTheUplinkReadmitsALargeWrite(t *testing.T) {
 			off += int64(len(chunk))
 		}
 	}
-	if !errors.Is(refused, ErrNoSpace) {
-		t.Fatalf("budget exhaustion surfaced %v, want %v", refused, ErrNoSpace)
+	if !errors.Is(refused, ErrUplinkStalled) {
+		t.Fatalf("a blocked uplink at the budget surfaced %v, want %v", refused, ErrUplinkStalled)
 	}
 	if used := walBytes(t, f.e); used > budget {
 		t.Fatalf("stream WAL reached %d bytes, past its %d budget", used, budget)
@@ -159,7 +245,7 @@ func TestBudgetRelievedByTheUplinkReadmitsALargeWrite(t *testing.T) {
 		if err == nil && handled {
 			break
 		}
-		if !errors.Is(err, ErrNoSpace) {
+		if !errors.Is(err, ErrNoSpace) && !errors.Is(err, ErrUplinkStalled) {
 			t.Fatalf("post-drain write: handled=%v err=%v", handled, err)
 		}
 		if time.Now().After(deadline) {

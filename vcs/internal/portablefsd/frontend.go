@@ -230,11 +230,16 @@ func (c *frontendConn) close() {
 		c.publicationMu.Lock()
 		c.publicationClosed = true
 		var exposedUnacknowledged *frontendOperation
+		orphaned := make([]*frontendOperation, 0, len(c.operations))
 		for _, entry := range c.operations {
-			if entry.op != nil && entry.replyExposed && !entry.ackPending {
-				exposedUnacknowledged = entry.op
-				break
+			if entry.op == nil {
+				continue
 			}
+			if exposedUnacknowledged == nil &&
+				entry.replyExposed && !entry.ackPending {
+				exposedUnacknowledged = entry.op
+			}
+			orphaned = append(orphaned, entry.op)
 		}
 		c.publicationMu.Unlock()
 		if exposedUnacknowledged != nil {
@@ -243,9 +248,27 @@ func (c *frontendConn) close() {
 				errors.New("frontend disconnected before acknowledging an exposed kernel publication"),
 			))
 		}
+		// DEFINITIVE RESOLUTION OF EVERY OUTSTANDING PUBLICATION ACK.
+		//
+		// A publication acknowledgement is a statement about a LIVE frontend's
+		// cache. Once the connection is gone that cache is gone with it: the
+		// kernel-coherence barrier a handoff waits for is vacuously satisfied,
+		// and there is no future event that could ever satisfy it otherwise.
+		// Resolving these operations only AFTER handlerWG.Wait() made the
+		// verdict conditional on every handler exiting, which is exactly the
+		// wrong order: a handler can be parked inside the drain that the
+		// handoff waiting on this operation is performing, so the drain and
+		// the disconnect deadlock and the acknowledged tail strands with no
+		// failure recorded. Retire the gate membership FIRST — nothing can be
+		// published on a closed connection (markPublicationReplyExposed
+		// refuses once publicationClosed is set), so the operations carry no
+		// remaining coherence obligation.
+		for _, op := range orphaned {
+			op.attach.finishFrontendOperation(op)
+		}
 		// A handler may still be completing a local syscall or mutation after
-		// cancellation. Keep its logical operation in the handoff gate until
-		// the handler has fully exited.
+		// cancellation. Joining it here keeps connection teardown ordered
+		// behind its own handlers; it no longer gates any delegation handoff.
 		c.handlerWG.Wait()
 		c.publicationMu.Lock()
 		pending := c.operations
@@ -475,6 +498,41 @@ func (c *frontendConn) beginLogicalOperation(
 		}
 		if entry.err != nil {
 			return ctx, nil, false, false, entry.err
+		}
+		if !publishes {
+			// HANDLE CLOSE NEVER WAITS FOR A DELEGATION HANDOFF.
+			//
+			// The publication gate exists to hold a handoff until cacheable
+			// state a callback exposed has been acknowledged, and to keep a
+			// request's reply on the correct side of that handoff. A request
+			// that publishes nothing — close, fsync, statfs, reclaim,
+			// syncVolume — exposes no such state, so it has no side to be on.
+			// Admitting it as an ordinary participant made it WAIT twice for
+			// no coherence benefit: extendFrontendOperation collapses the
+			// logical operation to the mount-wide scope on any path-epoch
+			// change, and the resume half of suspendFrontendOperation blocks
+			// until every overlapping delegation handoff has ended — a window
+			// that spans the release's authority round trips and is unbounded
+			// when the uplink is slow or dead. A close(2) carrying an
+			// operation ID therefore queued on a scope release while the
+			// identical close carrying none returned instantly.
+			//
+			// Join PERMANENTLY SUSPENDED instead. The participant still
+			// exists, so the logical operation cannot be considered finished
+			// while this request runs (that is what keeps a recall holding a
+			// namespace mirror lock from deadlocking against the very
+			// operation it is waiting to publish), but it is never a member
+			// of the active publication set, so it neither blocks a handoff
+			// nor waits for one. close(2) is bounded local bookkeeping:
+			// admitted data belongs to the engine and drains in the
+			// background; fsync, synchronize, unmount and recall remain the
+			// only drain barriers.
+			participant, err := a.joinFrontendOperationSuspended(entry.op)
+			if err != nil {
+				return ctx, nil, false, false, err
+			}
+			return context.WithValue(ctx, frontendOperationContextKey{}, participant),
+				participant, true, false, nil
 		}
 		participant, err := a.extendFrontendOperation(ctx, entry.op, paths, pathEpoch)
 		if err != nil {

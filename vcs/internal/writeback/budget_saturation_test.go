@@ -1,8 +1,10 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -68,12 +70,19 @@ func promptly(t *testing.T, limit time.Duration, what string, fn func()) {
 	}
 }
 
-// TestStreamWALBudgetExhaustionIsDefiniteENOSPC pins the base contract: once
-// the stream WAL is at budget and folding/reclaiming cannot relieve it, a
-// data admission is refused with ErrNoSpace. It stays in the delegated lane
-// (handled=true) and never drains, so the caller gets a definite POSIX
-// outcome instead of a wait on the uplink that is behind.
-func TestStreamWALBudgetExhaustionIsDefiniteENOSPC(t *testing.T) {
+// TestBlockedRemotePacesThenReportsUplinkStalled is the WAL-budget saturation
+// contract AFTER the credit gate replaced the instant-ENOSPC cliff.
+//
+// The uplink is gated shut, so the measured applied rate is zero and nothing
+// can ever drain. Writers are admitted up to the operating setpoint and then
+// PACE: they wait, bounded, holding nothing. When the flusher's no-progress
+// watchdog declares the uplink stalled, the wait resolves into a typed
+// ErrUplinkStalled — an EIO-class outcome for a far end that stopped
+// answering, deliberately distinct from the ENOSPC that means a local store is
+// full. As before, the refusal stays in the delegated lane, releases no
+// delegation, and does not poison the engine.
+func TestBlockedRemotePacesThenReportsUplinkStalled(t *testing.T) {
+	pinCreditTimings(t, 150*time.Millisecond, 25*time.Second, 200*time.Millisecond)
 	f := newSaturationFixture(t, 1<<20)
 	ctx := context.Background()
 	if _, handled, err := f.e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
@@ -84,14 +93,9 @@ func TestStreamWALBudgetExhaustionIsDefiniteENOSPC(t *testing.T) {
 
 	var refused error
 	for i := 0; i < 256 && refused == nil; i++ {
-		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		start := time.Now()
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		_, handled, err := f.e.WriteAppend(wctx, "d/f", chunk)
-		elapsed := time.Since(start)
 		cancel()
-		if elapsed > 2*time.Second {
-			t.Fatalf("append %d blocked for %s under budget pressure", i, elapsed)
-		}
 		switch {
 		case err != nil && !handled:
 			t.Fatalf("append %d changed lanes on an error: %v", i, err)
@@ -101,15 +105,399 @@ func TestStreamWALBudgetExhaustionIsDefiniteENOSPC(t *testing.T) {
 			t.Fatalf("append %d left the delegated lane while the budget was the binding constraint", i)
 		}
 	}
-	if !errors.Is(refused, ErrNoSpace) {
-		t.Fatalf("budget exhaustion surfaced %v, want %v", refused, ErrNoSpace)
+	if !errors.Is(refused, ErrUplinkStalled) {
+		t.Fatalf("a blocked uplink surfaced %v, want %v", refused, ErrUplinkStalled)
+	}
+	if errors.Is(refused, ErrNoSpace) {
+		t.Fatal("a stalled uplink must not be reported as a full local store")
+	}
+	if err := f.e.MutationError(); err != nil {
+		t.Fatalf("the stalled-uplink refusal poisoned the engine: %v", err)
 	}
 	if _, _, releasesAfter := f.auth.calls(); releasesAfter != releasesBefore {
-		t.Fatalf("budget exhaustion released %d delegations; a definite ENOSPC must not hand off",
+		t.Fatalf("saturation released %d delegations; a paced refusal must not hand off",
 			releasesAfter-releasesBefore)
 	}
 	if !f.e.Covers("d/f") {
-		t.Fatal("budget exhaustion dropped the covering delegation")
+		t.Fatal("saturation dropped the covering delegation")
+	}
+	if used := walBytes(t, f.e); used > 1<<20 {
+		t.Fatalf("stream WAL reached %d bytes, past its %d hard cap", used, 1<<20)
+	}
+}
+
+// TestMetadataStaysInstantWhileTheDataLaneIsSaturated is the metadata reserve
+// under test. One segment of the hard cap is carved out for records that carry
+// no bulk bytes, and metadata is never credit-charged — so while a data flood
+// is paced against a dead uplink, create/mkdir/rename/unlink/setattr keep
+// answering IMMEDIATELY. Before the split, appendRecordsLocked answered every
+// caller at hard-full with ENOSPC, which is how a saturated data plane took the
+// namespace down with it.
+func TestMetadataStaysInstantWhileTheDataLaneIsSaturated(t *testing.T) {
+	pinCreditTimings(t, 150*time.Millisecond, 25*time.Second, 200*time.Millisecond)
+	f := newSaturationFixture(t, 4<<20)
+	ctx := context.Background()
+	if _, handled, err := f.e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	// Drive the data lane to its bound.
+	chunk := make([]byte, 256<<10)
+	var stalled error
+	for i := 0; i < 64 && stalled == nil; i++ {
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		_, _, err := f.e.WriteAppend(wctx, "d/f", chunk)
+		cancel()
+		stalled = err
+	}
+	if !errors.Is(stalled, ErrUplinkStalled) {
+		t.Fatalf("data lane surfaced %v, want %v", stalled, ErrUplinkStalled)
+	}
+
+	// Every metadata surface, timed. None may block and none may ENOSPC.
+	promptly(t, 3*time.Second, "metadata mutations during data saturation", func() {
+		for i := 0; i < 32; i++ {
+			name := "d/meta" + strconv.Itoa(i)
+			if _, handled, err := f.e.Create(ctx, name, 0o644, false, false); err != nil || !handled {
+				t.Errorf("create %s under data saturation: handled=%v err=%v", name, handled, err)
+				return
+			}
+			if _, handled, err := f.e.Setattr(ctx, name, SetattrRequest{SetMode: true, Mode: 0o600}); err != nil || !handled {
+				t.Errorf("setattr %s under data saturation: handled=%v err=%v", name, handled, err)
+				return
+			}
+			if _, handled, err := f.e.Rename(ctx, name, name+"r", nil); err != nil || !handled {
+				t.Errorf("rename %s under data saturation: handled=%v err=%v", name, handled, err)
+				return
+			}
+			if _, handled, err := f.e.Remove(ctx, name+"r"); err != nil || !handled {
+				t.Errorf("remove %s under data saturation: handled=%v err=%v", name, handled, err)
+				return
+			}
+		}
+	})
+	if used := walBytes(t, f.e); used > 4<<20 {
+		t.Fatalf("stream WAL reached %d bytes, past its %d hard cap: the reserve is inside the cap, not on top of it", used, 4<<20)
+	}
+}
+
+// TestPacedWritersHoldNothingWhileQueued is the property that makes the whole
+// gate safe to sit in front of the data plane: a writer parked waiting for
+// credit holds NO engine lock, no delegation and no handle. It is checked the
+// only way that proves it — by taking the engine mutex, the read-admission
+// path and a delegated metadata mutation while writers are demonstrably queued.
+// If a waiter held e.mu (or its grant) across the wait, a recall, a barrier and
+// every metadata operation would queue behind a stalled uplink, which is the
+// original production failure this design exists to prevent.
+func TestPacedWritersHoldNothingWhileQueued(t *testing.T) {
+	pinCreditTimings(t, 5*time.Second, 25*time.Second, 30*time.Second)
+	f := newSaturationFixture(t, 4<<20) // uplink gated shut: writers park
+	ctx := context.Background()
+	if _, handled, err := f.e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	chunk := make([]byte, 512<<10)
+	for w := 0; w < 4; w++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				_, _, _ = f.e.WriteAppend(wctx, "d/f", chunk)
+				cancel()
+			}
+		}()
+	}
+	defer func() {
+		close(stop)
+		writers.Wait()
+	}()
+
+	// Wait until writers are actually parked in the credit queue (or against
+	// hard-cap headroom), not merely running.
+	deadline := time.Now().Add(10 * time.Second)
+	for f.e.Status().CreditDebt == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	promptly(t, 5*time.Second, "engine mutex while writers are paced", func() {
+		for i := 0; i < 50; i++ {
+			f.e.mu.Lock()
+			f.e.mu.Unlock() //nolint:staticcheck // the point IS that it is grantable
+			time.Sleep(time.Millisecond)
+		}
+	})
+	promptly(t, 5*time.Second, "read admission while writers are paced", func() {
+		for i := 0; i < 20; i++ {
+			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			permit, err := f.e.BeginRead(rctx, "d/f")
+			cancel()
+			if err != nil {
+				t.Errorf("read admission with writers paced: %v", err)
+				return
+			}
+			permit.Lookup("d/f")
+			permit.Close()
+		}
+	})
+	promptly(t, 5*time.Second, "delegated metadata while writers are paced", func() {
+		for i := 0; i < 20; i++ {
+			name := "d/held" + strconv.Itoa(i)
+			if _, handled, err := f.e.Create(ctx, name, 0o644, false, false); err != nil || !handled {
+				t.Errorf("create %s with writers paced: handled=%v err=%v", name, handled, err)
+				return
+			}
+			if _, handled, err := f.e.Remove(ctx, name); err != nil || !handled {
+				t.Errorf("remove %s with writers paced: handled=%v err=%v", name, handled, err)
+				return
+			}
+		}
+	})
+}
+
+// TestMetadataReserveHoldsWhenFramingOverrunsTheCreditLedger pins the RESERVE
+// at the layer that actually guarantees it. The credit ledger counts payload
+// bytes; the WAL counts framed bytes. For small writes the framing overhead is
+// most of the record, so a data flood governed only by credit would still walk
+// the stream's real footprint into the last segment and start answering
+// metadata with ENOSPC — the pre-split behaviour, where a bulk-data flood took
+// the namespace down with it. The lane budget is what makes it impossible: data
+// reserves against budget-minus-reserve, so the reserve is untouchable no
+// matter what shape the data takes.
+func TestMetadataReserveHoldsWhenFramingOverrunsTheCreditLedger(t *testing.T) {
+	pinCreditTimings(t, 100*time.Millisecond, 25*time.Second, 150*time.Millisecond)
+	// Lift the overlay extent bound out of the way: this test is about the WAL
+	// lane split, and with tiny writes the extent bound would bind first.
+	oldExtents := maxFileExtents
+	maxFileExtents = 1 << 20
+	t.Cleanup(func() { maxFileExtents = oldExtents })
+
+	const budget = 4 << 20
+	f := newSaturationFixture(t, budget) // uplink gated shut
+	ctx := context.Background()
+	if _, handled, err := f.e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+
+	// 128-byte writes: the frame header, PFR1 header and path dominate, so the
+	// stream's framed footprint grows far faster than the credit ledger's
+	// payload-byte view of it.
+	chunk := make([]byte, 128)
+	var refused error
+	for i := 0; i < 1<<20 && refused == nil; i++ {
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		_, handled, err := f.e.WriteAppend(wctx, "d/f", chunk)
+		cancel()
+		if err != nil && !handled {
+			t.Fatalf("append %d changed lanes: %v", i, err)
+		}
+		refused = err
+	}
+	if !errors.Is(refused, ErrUplinkStalled) && !errors.Is(refused, ErrNoSpace) {
+		t.Fatalf("the data lane surfaced %v", refused)
+	}
+	dataCap := f.e.dataBudgetBytes()
+	if used := walBytes(t, f.e); used > dataCap {
+		t.Fatalf("bulk data drove the stream to %d bytes, past the data lane's %d cap "+
+			"(hard cap %d): the metadata reserve was consumed by data", used, dataCap, budget)
+	}
+
+	// The reserve is intact, so every metadata surface is still instant.
+	promptly(t, 3*time.Second, "metadata mutations with the data lane at its cap", func() {
+		for i := 0; i < 64; i++ {
+			name := "d/m" + strconv.Itoa(i)
+			if _, handled, err := f.e.Create(ctx, name, 0o644, false, false); err != nil || !handled {
+				t.Errorf("create %s with the data lane full: handled=%v err=%v", name, handled, err)
+				return
+			}
+		}
+	})
+	if used := walBytes(t, f.e); used > budget {
+		t.Fatalf("the reserve pushed the stream to %d bytes, past its %d hard cap", used, budget)
+	}
+}
+
+// TestPacedWritesCompleteAgainstASlowButDrainingRemote is the outcome the whole
+// controller exists for. The remote applies at a finite rate rather than not at
+// all, so the measured rate is non-zero, the setpoint is non-zero, and every
+// write COMPLETES — paced to the uplink — instead of either failing at a cliff
+// or blocking unboundedly. The data lands byte-exact on the authority.
+func TestPacedWritesCompleteAgainstASlowButDrainingRemote(t *testing.T) {
+	// A compressed drain horizon puts the setpoint (rate x T_drain) well below
+	// the hard cap, so the CREDIT gate — not the cap — is what paces the writer.
+	pinCreditTimings(t, 2*time.Second, 250*time.Millisecond, 30*time.Second)
+	// Small segments so whole-segment reclamation actually returns applied
+	// bytes to the cap while the writer is still going.
+	oldTarget := segmentTargetBytes
+	segmentTargetBytes = 1 << 20
+	t.Cleanup(func() { segmentTargetBytes = oldTarget })
+
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.flushRateBps = 8 << 20 // 8 MiB/s uplink
+	auth.mu.Unlock()
+	e, err := Open(context.Background(), Config{
+		StateDir: t.TempDir(), VolumeID: "vol", Branch: "main",
+		Remote: auth, BudgetBytes: 16 << 20,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	defer func() { _, _ = e.ForceClose("test teardown") }()
+
+	ctx := context.Background()
+	if _, handled, err := e.Create(ctx, "d/f", 0o644, false, false); err != nil || !handled {
+		t.Fatalf("create: handled=%v err=%v", handled, err)
+	}
+	chunk := bytes.Repeat([]byte("p"), 256<<10)
+	const writes = 64 // far more than the cap can hold at once: pacing is forced
+	want := make([]byte, 0, writes*len(chunk))
+	start := time.Now()
+	for i := 0; i < writes; i++ {
+		wctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		res, handled, err := e.WriteAppend(wctx, "d/f", chunk)
+		cancel()
+		if err != nil || !handled {
+			t.Fatalf("paced append %d: handled=%v err=%v", i, handled, err)
+		}
+		if res.Count != len(chunk) {
+			t.Fatalf("paced append %d wrote %d of %d bytes", i, res.Count, len(chunk))
+		}
+		want = append(want, chunk...)
+	}
+	elapsed := time.Since(start)
+
+	// The setpoint must have engaged: a measured 8 MiB/s link over a 250ms
+	// horizon is ~2 MiB of resident debt, far below the 24 MiB data cap.
+	st := e.Status()
+	if st.CreditSetpoint >= st.CreditCeiling {
+		t.Fatalf("setpoint %d never fell below the %d data cap against an 8 MiB/s link; "+
+			"the measured-rate loop did not engage", st.CreditSetpoint, st.CreditCeiling)
+	}
+	if st.AppliedRateBps <= 0 {
+		t.Fatalf("no applied rate was measured (%v) after %d paced writes", st.AppliedRateBps, writes)
+	}
+	// Pacing means the writers actually waited on the uplink rather than
+	// absorbing everything into the cap: 6 MiB at 8 MiB/s cannot finish
+	// instantly.
+	if floor := time.Duration(float64(len(want)) / float64(8<<20) * float64(time.Second)); elapsed < floor/2 {
+		t.Fatalf("wrote %d bytes in %s against an 8 MiB/s uplink: nothing was paced", len(want), elapsed)
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if err := e.DrainAll(dctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if err := auth.equalFile("d/f", want); err != nil {
+		t.Fatalf("paced writes did not land byte-exact: %v", err)
+	}
+	if used := walBytes(t, e); used > 16<<20 {
+		t.Fatalf("stream WAL reached %d bytes, past its %d hard cap", used, 16<<20)
+	}
+}
+
+// TestLargeAndSmallPacedWritersBothProgress is the fairness argument at the
+// engine surface: while a multi-megabyte writer is paced against a slow uplink,
+// a small writer on another file is not starved behind it. Credit is handed out
+// a chunk at a time in arrival order, so the small writer's completions
+// interleave with the large one's.
+func TestLargeAndSmallPacedWritersBothProgress(t *testing.T) {
+	pinCreditTimings(t, 2*time.Second, 200*time.Millisecond, 30*time.Second)
+	oldTarget := segmentTargetBytes
+	segmentTargetBytes = 1 << 20
+	t.Cleanup(func() { segmentTargetBytes = oldTarget })
+
+	auth := newFakeAuthority()
+	auth.mu.Lock()
+	auth.dirs["d"] = true
+	auth.flushRateBps = 8 << 20
+	auth.mu.Unlock()
+	e, err := Open(context.Background(), Config{
+		StateDir: t.TempDir(), VolumeID: "vol", Branch: "main",
+		Remote: auth, BudgetBytes: 16 << 20,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	defer func() { _, _ = e.ForceClose("test teardown") }()
+
+	ctx := context.Background()
+	for _, name := range []string{"d/big", "d/small"} {
+		if _, handled, err := e.Create(ctx, name, 0o644, false, false); err != nil || !handled {
+			t.Fatalf("create %s: handled=%v err=%v", name, handled, err)
+		}
+	}
+
+	stop := make(chan struct{})
+	bigDone := make(chan error, 1)
+	go func() {
+		big := bytes.Repeat([]byte("B"), 2<<20)
+		for i := 0; i < 8; i++ {
+			wctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			_, handled, err := e.WriteAppend(wctx, "d/big", big)
+			cancel()
+			if err != nil || !handled {
+				bigDone <- err
+				return
+			}
+		}
+		bigDone <- nil
+	}()
+
+	// The small writer must keep completing while the large one is in flight.
+	small := bytes.Repeat([]byte("s"), 4<<10)
+	completed := 0
+	deadline := time.Now().Add(30 * time.Second)
+	for completed < 40 && time.Now().Before(deadline) {
+		select {
+		case err := <-bigDone:
+			if err != nil {
+				t.Fatalf("large writer: %v", err)
+			}
+			bigDone = nil
+			close(stop)
+		default:
+		}
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		startOne := time.Now()
+		_, handled, err := e.WriteAppend(wctx, "d/small", small)
+		cancel()
+		if err != nil || !handled {
+			t.Fatalf("small write %d starved behind the large writer: handled=%v err=%v", completed, handled, err)
+		}
+		if waited := time.Since(startOne); waited > 15*time.Second {
+			t.Fatalf("small write %d waited %s behind the large writer", completed, waited)
+		}
+		completed++
+		if bigDone == nil {
+			break // the large writer finished; fairness held for its whole run
+		}
+	}
+	if completed == 0 {
+		t.Fatal("the small writer never completed a single write")
+	}
+	select {
+	case <-stop:
+	default:
+	}
+	if bigDone != nil {
+		select {
+		case err := <-bigDone:
+			if err != nil {
+				t.Fatalf("large writer: %v", err)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("the large writer never finished")
+		}
 	}
 }
 

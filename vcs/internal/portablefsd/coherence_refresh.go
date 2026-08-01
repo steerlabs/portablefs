@@ -353,6 +353,11 @@ type frontendOperationParticipant struct {
 	op           *frontendOperation
 	suspendDepth int
 	finished     bool
+	// nonpublishing marks a participant that entered the logical operation
+	// permanently suspended because its request exposes no cacheable state.
+	// It is accounted for (the operation is not finished while it runs) but
+	// is never a member of the active publication set.
+	nonpublishing bool
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -515,6 +520,52 @@ func (a *attach) extendFrontendOperation(
 	return &frontendOperationParticipant{op: op}, nil
 }
 
+// joinFrontendOperationSuspended admits a NONPUBLISHING request into an
+// already active logical FSKit callback without ever making it a member of
+// the active publication set.
+//
+// close(2) is the motivating case. FSKit lets one framework callback issue
+// several daemon requests, and the pfslocal client shares that callback's
+// operation ID with every one of them — including requests that publish
+// nothing. Admitting those as ordinary participants coupled them to
+// delegation handoffs in both directions: they blocked handoffs while active,
+// and the resume half of suspendFrontendOperation held them until every
+// overlapping handoff ended. A handoff spans the release's authority round
+// trips, so with a slow or dead uplink that wait is unbounded and a close(2)
+// with an admitted write-back backlog stalls behind its own scope's drain.
+//
+// A request that cannot publish cacheable state has nothing to keep coherent,
+// so it enters already suspended and stays that way for its whole lifetime.
+// It still counts as a participant, which is what prevents a recall that owns
+// a namespace mirror lock from deadlocking against the operation it is
+// waiting to publish, and finishFrontendParticipant retires both counters.
+func (a *attach) joinFrontendOperationSuspended(
+	op *frontendOperation,
+) (*frontendOperationParticipant, error) {
+	if op == nil || op.attach != a {
+		return nil, fmt.Errorf("portablefsd: invalid logical frontend operation")
+	}
+	a.frontendGateMu.Lock()
+	a.initFrontendGateLocked()
+	if op.completed {
+		a.frontendGateMu.Unlock()
+		return nil, net.ErrClosed
+	}
+	op.participants++
+	op.suspended++
+	if op.gateActive && op.participants > 0 && op.suspended == op.participants {
+		delete(a.frontendActive, op)
+		op.gateActive = false
+	}
+	a.frontendGateCond.Broadcast()
+	a.frontendGateMu.Unlock()
+	return &frontendOperationParticipant{
+		op:            op,
+		suspendDepth:  1,
+		nonpublishing: true,
+	}, nil
+}
+
 func (a *attach) finishFrontendOperation(op *frontendOperation) {
 	if op == nil {
 		return
@@ -606,6 +657,13 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 		}
 		participant.suspendDepth--
 		if participant.suspendDepth > 0 {
+			return
+		}
+		if participant.nonpublishing {
+			// A nonpublishing participant is suspended for its whole
+			// lifetime and never re-enters the active publication set, so it
+			// must never wait for an overlapping handoff to end.
+			participant.suspendDepth = 1
 			return
 		}
 		for !op.completed {
