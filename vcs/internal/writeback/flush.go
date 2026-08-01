@@ -13,7 +13,6 @@ import (
 const (
 	// Batch dispatch thresholds.
 	flushMaxRecords = 128
-	flushMaxBytes   = 8 << 20
 	flushMaxAge     = 10 * time.Millisecond
 
 	// Retry backoff bounds (full jitter, no attempt limit).
@@ -26,12 +25,71 @@ const (
 	flushAttemptTimeout = 30 * time.Second
 )
 
+// flushMaxBytes is the UPLINK amortization knob: one batch is one request,
+// one authority apply turn, and one reply, so everything a batch costs
+// besides moving its bytes is paid once per batch. At 8 MiB the measured
+// production shape was 1.52s per batch of which ~0.70s was transfer — 44%
+// link utilization, i.e. the majority of a batch's wall time was the fixed
+// cost, and the flusher ships strictly one batch at a time.
+//
+// 32 MiB is the largest value that stays comfortably inside every bound
+// that actually constrains it:
+//
+//   - THE REQUEST FRAME. A batch is one PFRQ2 request, bounded by
+//     fsproto.maxRequestBytes (72 MiB). The build loop admits records while
+//     bytes < flushMaxBytes, so the worst case is flushMaxBytes plus one
+//     whole record (maxMutationPayload, 1 MiB + 64 KiB) plus per-record
+//     paths and envelopes — ~34 MiB against a 72 MiB ceiling.
+//   - THE JOURNAL ENTRY. wal.MaxPFR1RecordBytes and pfj3.MaxEntryBytes are
+//     both 8 MiB and neither applies to the batch: the authority journals a
+//     flush as ONE ROW PER RECORD (see fsproto flushBatchManaged), so the
+//     entry bound is a bound on a single 1 MiB write, not on the batch. This
+//     is the constraint that would otherwise cap the batch at 8 MiB, and it
+//     is worth stating explicitly because the two numbers coinciding at
+//     8 MiB invites exactly the wrong conclusion.
+//   - THE RECORD COUNT. flushMaxRecords still caps the batch independently.
+//     It is deliberately NOT raised with the byte bound: it bounds one
+//     authority apply turn (each record is its own journal row), not the
+//     transfer. The upload path the byte bound exists for chunks writes at
+//     1 MiB, so 32 MiB is 32 records — a quarter of the record cap. A
+//     workload of small records is bounded by the record count first and
+//     amortizes the fixed cost less; that is a separate bound with a
+//     separate argument, not a knob to turn here.
+//   - THE RESEND CONTRACT. attemptEnd pins a batch by its END SEQUENCE, and a
+//     pinned resend replays exactly the records that sequence covers, with no
+//     size bound applied — so an exact resend is byte-identical at any batch
+//     size. Nothing here changes what a retry sends.
+//   - THE CREDIT LEDGER and the metadata/control reserves are all sized in
+//     WAL bytes and are independent of how the drained bytes are grouped for
+//     transmission.
+//
+// The cost is transient client memory: one in-flight batch materializes its
+// records on the heap plus its encoded frame, so ~64 MiB peak instead of
+// ~16 MiB, against a 512 MiB default local budget.
+//
+// A var so the batch-size measurement can compare two values in one process;
+// production never changes it.
+var flushMaxBytes int64 = 32 << 20
+
 // noProgressWindow is the sticky-degraded watchdog: pending work whose
 // authority watermark has not advanced for this long degrades the mount. It is
 // also the credit gate's stall verdict — the one signal that turns "no credit
 // yet" into ErrUplinkStalled. A var so tests compress it; production never
 // changes it.
 var noProgressWindow = 30 * time.Second
+
+// SetNoProgressWindowForTest compresses the watchdog's verdict window and
+// returns its restore.
+//
+// The verdict is a CROSS-PACKAGE contract now: clientcore's data gate classifies
+// its own budget expiry from Engine.StallVerdict rather than from an arithmetic
+// claim about this constant, and a test of that contract cannot spend 30 real
+// seconds waiting for the window to become closable. Production never calls it.
+func SetNoProgressWindowForTest(d time.Duration) (restore func()) {
+	old := noProgressWindow
+	noProgressWindow = d
+	return func() { noProgressWindow = old }
+}
 
 // watchdogInterval is the health sweep cadence. The watchdog runs on its own
 // goroutine so it fires even while a flush attempt is blocked inside the
@@ -186,6 +244,43 @@ func (f *flusher) outstanding(scope string) int {
 	return f.perScope[scope]
 }
 
+// scopeTail reports the highest admitted sequence still unshipped for scope, and
+// whether the scope has any unshipped record at all.
+//
+// It is the drain target a RELEASE of that scope actually needs. Releasing a
+// scope means one thing: everything this mount acknowledged locally under that
+// grant is durable at the authority, so a peer that acquires it next sees the
+// complete state. Nothing about that claim mentions the rest of the stream.
+//
+// Draining to the STREAM's tail instead made a release head-of-line blocked
+// behind every byte any other scope had appended since. With the data lane
+// deliberately holding a backlog at its credit setpoint, that turned releasing
+// an already-applied metadata scope into a wait for hundreds of megabytes of
+// unrelated bulk data — and Engine.admit takes exactly that transition whenever
+// a mutation lands outside the current grant, which is what walking into a fresh
+// directory does. Measured live: a cold-scope mkdir blocked 26.6s on a mount
+// whose own metadata was long since applied.
+//
+// The stream is dense and ordered, so waiting for THIS scope's last record still
+// implies waiting for everything appended before it. That is inherent and
+// correct — those bytes precede the scope's own state at the authority. What is
+// excluded is everything appended AFTER, which the scope's release cannot
+// depend on: admission for a draining delegation is already closed, so no new
+// record can join the scope behind this snapshot.
+func (f *flusher) scopeTail(scope string) (uint64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.perScope[scope] == 0 {
+		return 0, false
+	}
+	for i := len(f.pending) - 1; i >= 0; i-- {
+		if f.pending[i].scope == scope {
+			return f.pending[i].seq, true
+		}
+	}
+	return 0, false
+}
+
 func (f *flusher) pendingStats() (int, int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -198,8 +293,27 @@ func (f *flusher) appliedThrough() uint64 {
 	return f.applied
 }
 
-// drainThrough blocks until the authority watermark covers target, the
-// stream parks terminally, or ctx ends.
+// drainThrough blocks until the authority watermark covers target, the stream
+// parks terminally, the WATCHDOG declares the uplink stalled, or ctx ends.
+//
+// The watchdog arm is not a convenience, it is the bound. A delegation release
+// runs detached under the ENGINE's lifetime context — deliberately, so that a
+// cancelled request cannot interrupt Checkin — and until this function had a
+// verdict of its own that meant a release against an authority which had stopped
+// applying waited FOREVER. The scope stayed `draining` with drainErr never set,
+// which is the one state that has no exit: every later mutation on that scope
+// joins the same attempt, the namespace lock holder in front of them never
+// returns, and the mount wedges. Observed live at 13-14 minutes with ~100
+// frontend goroutines queued behind one release.
+//
+// The verdict makes it definite instead. A stalled uplink yields
+// ErrUplinkStalled, the caller records it as drainErr, and the scope LEAVES
+// draining with a recorded reason — the same shape a fence or a park produces,
+// and the same one force-detach relies on: the grant can be surrendered with the
+// tail parked durably. A scope must never be permanently draining.
+//
+// It cannot fire on a healthy-but-slow link: the window is measured from the
+// last watermark ADVANCE, so any progress at all rearms it.
 func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 	f.mu.Lock()
 	if f.applied >= target {
@@ -217,12 +331,10 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 	f.nextAttempt = time.Time{}
 	w := &drainWaiter{target: target, ch: make(chan error, 1)}
 	f.waiters = append(f.waiters, w)
+	verdict := f.stallVerdictLocked(time.Now())
 	f.mu.Unlock()
 	f.kick()
-	select {
-	case err := <-w.ch:
-		return err
-	case <-ctx.Done():
+	drop := func() {
 		f.mu.Lock()
 		for i, waiter := range f.waiters {
 			if waiter == w {
@@ -231,8 +343,39 @@ func (f *flusher) drainThrough(ctx context.Context, target uint64) error {
 			}
 		}
 		f.mu.Unlock()
-		return ctx.Err()
 	}
+	// Arm for the exact instant the watchdog could first declare, then re-ask.
+	// Sleeping on the verdict's own Remaining keeps this free of a second stall
+	// policy: the timer is a wake-up, the verdict is the decision.
+	timer := time.NewTimer(stallRecheckDelay(verdict))
+	defer timer.Stop()
+	for {
+		select {
+		case err := <-w.ch:
+			return err
+		case <-ctx.Done():
+			drop()
+			return ctx.Err()
+		case <-timer.C:
+			if v := f.stallVerdict(); v.Stalled {
+				drop()
+				return ErrUplinkStalled
+			} else {
+				timer.Reset(stallRecheckDelay(v))
+			}
+		}
+	}
+}
+
+// stallRecheckDelay is how long a drain may sleep before asking the watchdog
+// again: exactly the time the verdict says it still needs, floored so a verdict
+// that is momentarily unavailable (no pending work registered yet) does not spin.
+func stallRecheckDelay(v StallVerdict) time.Duration {
+	const floor = 100 * time.Millisecond
+	if v.Remaining < floor {
+		return floor
+	}
+	return v.Remaining
 }
 
 func (f *flusher) run() {
@@ -607,25 +750,95 @@ func (f *flusher) watchdog() {
 	f.mu.Unlock()
 }
 
-// uplinkStalled is the credit gate's stall verdict: pending work exists and the
-// authority watermark has not moved for the no-progress window (or the stream
-// parked terminally). It reads the SAME state the health watchdog latches, and
-// deliberately recomputes the window rather than waiting for the sweep tick, so
-// a paced writer's outcome does not depend on watchdog phase.
-func (f *flusher) uplinkStalled() bool {
+// StallVerdict is the flusher watchdog's LIVE state: the ONE place in the engine
+// where a stall is decided. Admission gates RELAY it; they never synthesize one
+// from elapsed time.
+//
+// It exists because elapsed time does not prove a verdict, and two admission
+// gates used to assume it did. Each justified a fixed budget with the chain
+//
+//	noProgressWindow (30s) + creditWaitCap (5s) = 35s  <  budget (40s)
+//
+// and concluded that a genuinely stalled uplink must already have been DECLARED
+// stalled by the time the budget expired — so expiry could only mean "healthy
+// but slow". It cannot. The window below is measured from the last WATERMARK
+// ADVANCE (advance resets lastProgress), not from the moment a caller began to
+// wait: an operation that parks at t0 and sees the authority advance at t39
+// reaches a 40s budget at t40 with the watchdog unable to declare anything
+// before ~t69. Budget expiry proves NEITHER a stall NOR progress, so the gates
+// ask for the verdict instead of deriving one.
+//
+//   - Stalled: the watchdog holds — or, recomputed now, would hold — a stall
+//     verdict. This is the only thing that makes ErrUplinkStalled honest.
+//   - Pending: there is pending work whose progress is being watched. With none,
+//     there is nothing a stall could be a statement about.
+//   - Remaining: how long until the watchdog COULD declare, measured from the
+//     last advance. Zero when Stalled (it already has) and when !Pending (there
+//     is nothing to declare). A non-zero Remaining is the exact refutation of
+//     the old arithmetic: the verdict is NOT AVAILABLE yet, however long the
+//     caller has already waited.
+type StallVerdict struct {
+	Stalled   bool
+	Pending   bool
+	Remaining time.Duration
+}
+
+// StallVerdict publishes the watchdog's live state to the admission gates — the
+// namespace lane's own (AdmitMetadataMutation) and clientcore's data lane — so
+// both classify their expiry from ONE verdict instead of restating an
+// arithmetic proof of it in a comment.
+func (e *Engine) StallVerdict() StallVerdict {
+	if e == nil || e.fl == nil {
+		return StallVerdict{}
+	}
+	return e.fl.stallVerdict()
+}
+
+// stallVerdict snapshots terminal, pending, degraded and lastProgress against
+// noProgressWindow under ONE hold of f.mu. Reading them across separate holds
+// would be two verdicts again: a caller could pair pending work observed before
+// an advance with a lastProgress observed after it.
+func (f *flusher) stallVerdict() StallVerdict {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.stallVerdictLocked(time.Now())
+}
+
+func (f *flusher) stallVerdictLocked(now time.Time) StallVerdict {
 	if f.terminal != nil {
-		return true
+		// A parked stream is stalled with or without pending work: nothing it
+		// holds can ever be applied, and nothing will ever advance again.
+		return StallVerdict{Stalled: true}
 	}
 	if len(f.pending) == 0 {
-		return false
+		return StallVerdict{}
 	}
-	if f.degraded {
-		return true
+	v := StallVerdict{Pending: true}
+	switch {
+	case f.degraded:
+		// The health sweep already latched the sticky verdict.
+		v.Stalled = true
+	case f.lastProgress.IsZero():
+		// Pending work whose progress clock never started. Nothing has been
+		// observed to stall yet, and a whole window would have to elapse first.
+		v.Remaining = noProgressWindow
+	default:
+		// The same recomputation the sweep does, deliberately live rather than
+		// waiting for the sweep tick, so a paced caller's outcome does not
+		// depend on watchdog phase.
+		if since := now.Sub(f.lastProgress); since >= noProgressWindow {
+			v.Stalled = true
+		} else {
+			v.Remaining = noProgressWindow - since
+		}
 	}
-	return !f.lastProgress.IsZero() && time.Since(f.lastProgress) >= noProgressWindow
+	return v
 }
+
+// uplinkStalled is the credit gate's stall verdict, and it is now exactly the
+// Stalled field of the one verdict above rather than a second computation that
+// has to be kept in agreement with it.
+func (f *flusher) uplinkStalled() bool { return f.stallVerdict().Stalled }
 
 // notifyHealthLocked reports the sticky verdict without holding the caller's
 // callback under f.mu.

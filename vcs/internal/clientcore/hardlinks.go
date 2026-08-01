@@ -70,27 +70,33 @@ func (v *Volume) releaseHardlinkScopes(
 	return v.wb.ReleaseFor(ctx, v.hardlinkMutationPaths(nodes, operands...)...)
 }
 
-// releaseHardlinkScopesResolved is releaseHardlinkScopes for a write, and it
-// exists to keep that release out of the frontend's locks.
+// releaseUnderResolvedLane is the ONE gate every delegation release a
+// frontend-locked operation discovers it needs must pass through. It is the
+// structural guarantee behind the pre-lock classifier: no route — path coverage,
+// hard-link identity, the orphan protocol, an engine fall-through — can put a
+// blocking drain underneath a.nsMu, a name stripe or a handle lock.
 //
 // Three cases, and the distinction is the whole point:
 //
-//   - The classifier resolved the AUTHORITY lane. It identified the hard link
-//     on identity and already released every alias scope out of the locks, so
-//     there is nothing left to drain here.
-//   - The classifier resolved the DELEGATED lane. The node BECAME a hard-linked
-//     alias — a link(2) elsewhere — after classification. Draining the alias
-//     scopes now would be exactly the release the classifier was built to
-//     hoist, taken in exactly the wrong place, so the operation unwinds and the
-//     next classification routes it on identity like any other hard link.
-//   - No classifier ran. The caller holds no frontend lock, so the release
-//     costs only it.
+//   - The classifier resolved the AUTHORITY lane. It released every operand
+//     scope out of the locks already — hardlinkMutationTargets over the same
+//     nodes and operands the handler is working with — and it HOLDS the
+//     transition claim, so nothing could have installed a grant underneath in
+//     the meantime. There is provably nothing left to drain here.
+//   - The classifier resolved the DELEGATED lane, and the handler has now
+//     discovered a diversion it could not see: a node that became a hard-link
+//     alias, an open handle that appeared, an engine that cannot acknowledge the
+//     mutation locally. Draining now would be exactly the release the classifier
+//     exists to hoist, taken in exactly the wrong place. The operation unwinds
+//     with every lock released and its next pass resolves the authority lane
+//     unconditionally.
+//   - No classifier ran (a direct embedder, a test). The caller holds no
+//     frontend lock, so the release costs only it.
 //
 // unwind=true means the caller must return st and go no further.
-func (v *Volume) releaseHardlinkScopesResolved(
+func (v *Volume) releaseUnderResolvedLane(
 	ctx context.Context,
-	n *NodeState,
-	path string,
+	release func(context.Context) error,
 ) (Status, bool) {
 	switch writeback.LaneOf(ctx) {
 	case writeback.LaneAuthority:
@@ -98,10 +104,33 @@ func (v *Volume) releaseHardlinkScopesResolved(
 	case writeback.LaneDelegated:
 		return statusLaneRetry, true
 	}
-	if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
+	if err := release(ctx); err != nil {
 		return statusErr(err), true
 	}
 	return fsproto.OK, false
+}
+
+// releaseHardlinkScopesResolved is releaseUnderResolvedLane for the alias-scope
+// release a hard-linked inode needs.
+func (v *Volume) releaseHardlinkScopesResolved(
+	ctx context.Context,
+	nodes []*NodeState,
+	operands ...string,
+) (Status, bool) {
+	return v.releaseUnderResolvedLane(ctx, func(c context.Context) error {
+		return v.releaseHardlinkScopes(c, nodes, operands...)
+	})
+}
+
+// releaseScopesResolved is releaseUnderResolvedLane for a plain operand release
+// (the orphan protocol's "leave delegated mode before write-through" step).
+func (v *Volume) releaseScopesResolved(
+	ctx context.Context,
+	operands ...string,
+) (Status, bool) {
+	return v.releaseUnderResolvedLane(ctx, func(c context.Context) error {
+		return v.wb.ReleaseFor(c, operands...)
+	})
 }
 
 // hardlinkMutationPaths returns every known spelling whose delegation view

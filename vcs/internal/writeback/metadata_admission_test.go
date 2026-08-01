@@ -170,12 +170,19 @@ func TestMetadataAdmissionNeverSynthesizesENOSPC(t *testing.T) {
 	// (TestOversizedMetadataAppendKeepsDefiniteENOSPC covers the errno itself).
 }
 
-// TestMetadataAdmissionBudgetIsProvedAgainstTheWatchdog turns the comment's
-// proof chain into a test. The namespace lane's budget must strictly exceed the
-// watchdog's verdict window plus one acquisition wait, or the gate could expire
-// before the engine could say whether the uplink is stalled — and would then
-// have to invent the verdict.
-func TestMetadataAdmissionBudgetIsProvedAgainstTheWatchdog(t *testing.T) {
+// TestMetadataAdmissionBudgetExceedsTheWatchdogWindow keeps the sizing
+// relationship the namespace lane's budget is chosen for: it must strictly
+// exceed the watchdog's verdict window plus one acquisition wait, so that on a
+// link which made no progress at all the verdict is AVAILABLE before the budget
+// runs out.
+//
+// It is deliberately no longer stated as a proof that expiry implies a verdict.
+// It does not: flusher.advance resets lastProgress on every advance, so a late
+// advance pushes the earliest possible declaration well past this budget. What
+// makes the outcome definite is that both gates consult the LIVE verdict
+// (Engine.StallVerdict) at expiry rather than inferring one from the arithmetic
+// — see stallpolicy_test.go.
+func TestMetadataAdmissionBudgetExceedsTheWatchdogWindow(t *testing.T) {
 	if got, want := MetadataAdmissionBudget(), NoProgressWindow()+CreditWaitCap(); got <= want {
 		t.Fatalf("metadataAdmissionBudget = %s, must strictly exceed "+
 			"noProgressWindow + creditWaitCap = %s", got, want)

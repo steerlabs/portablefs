@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -445,7 +446,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	for i < len(tail) {
 		var records []wal.Record
 		var scopeRuns []FlushScope
-		var bytes int
+		var bytes int64
 		end := prev
 		j := i
 		for ; j < len(tail) && len(records) < flushMaxRecords && bytes < flushMaxBytes; j++ {
@@ -469,7 +470,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			rec.Seq = tail[j].seq
 			end = digestNext(end, tail[j].seq, tail[j].payload)
 			records = append(records, rec)
-			bytes += len(tail[j].payload)
+			bytes += int64(len(tail[j].payload))
 			if len(scopeRuns) != 0 && scopeRuns[len(scopeRuns)-1].Scope == scope {
 				scopeRuns[len(scopeRuns)-1].Through = tail[j].seq
 			} else {
@@ -558,10 +559,12 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	if err := appendRecoveryReleaseCertificate(dir, scan, scan.lastSeq, prev, scopes, e.cfg.BudgetBytes); err != nil {
 		cleanupPreparedFrom(0)
 		if errors.Is(err, errCloseOutUnbounded) {
-			// Definite and terminal: no retry can create budget. The tail is
-			// already applied at the authority and the grants stay checked out
-			// to this stream until an operator raises the cap, at which point
-			// the next attach finishes the close-out unchanged.
+			// Definite and terminal: no retry can create budget, and none can
+			// create free space on a full device either — both arrive here as
+			// this one typed answer. The tail is already applied at the
+			// authority and the grants stay checked out to this stream until an
+			// operator raises the cap or frees the device, at which point the
+			// next attach finishes the close-out unchanged.
 			js.update(func(j *RecoveryJob) {
 				j.State = JobConflict
 				j.LastError = err.Error()
@@ -645,10 +648,15 @@ func removeStreamDir(dir string) error {
 }
 
 // errCloseOutUnbounded is the DEFINITE terminal outcome of a close-out that
-// cannot be made to fit: the certificate is not written at all and the stream
-// parks in a typed conflict an operator resolves (by raising BudgetBytes). It
-// is deliberately NOT errRetryable — an attach must never be failed forever by
-// a condition no amount of retrying can change.
+// cannot be made to fit: the stream parks in a typed conflict an operator
+// resolves, by raising BudgetBytes or by freeing space on the device. It is
+// deliberately NOT errRetryable — an attach must never be failed forever by a
+// condition no amount of retrying can change.
+//
+// It covers both ways a close-out fails to fit. When the arithmetic gate refuses
+// it, nothing at all was written. When a physical ENOSPC produces it (see
+// closeOutWrite), a partial barrier may be on disk — which the three-barrier
+// ordering already makes safe, and which the next attach re-derives from scratch.
 var errCloseOutUnbounded = errors.New("writeback: recovery close-out does not fit the configured WAL budget")
 
 // appendRecoveryReleaseCertificate makes every rebound scope locally final:
@@ -684,9 +692,36 @@ var errCloseOutUnbounded = errors.New("writeback: recovery close-out does not fi
 //	   next recovery sees them as already-final and sweeps their authority
 //	   remainder with Discard, which is exactly the documented shape.
 //
-// If the post-reclaim footprint still exceeds the budget, NOTHING is written and
-// errCloseOutUnbounded is returned. That is a definite terminal answer, not a
-// retry and not a mid-append ENOSPC.
+// A-before-B is NOT an efficiency choice and must never be inverted to make the
+// arithmetic easier. digestAt refuses to rebuild a digest when the retained
+// frames start past baseSeq+1, so deleting the earlier segments before a durable
+// mark exists in the RETAINED one leaves a stream that fails closed as ErrCorrupt
+// across a crash — an unrecoverable outcome traded for a transient byte saving.
+// The mark's cost is paid up front, in full, and the budget must accommodate it
+// in that order rather than the order that happens to be cheapest.
+//
+// Because the mark lands while everything it authorizes deleting is still on
+// disk, the protocol's PEAK occupancy is not its final footprint. BudgetBytes
+// bounds occupancy — a WAL that momentarily exceeds the cap has exceeded it, and
+// on a store sized to the cap that moment IS the ENOSPC. So every bound is
+// checked before the first byte is written:
+//
+//	PEAK-A: used + appliedBytes         <= budget   (occupancy at barrier A)
+//	FINAL:  used - reclaimable + appliedBytes + releaseBytes <= budget
+//
+// plus reclaimable >= appliedBytes, without which the mark costs more than the
+// reclaim it authorizes ever returns. Barrier C needs no bound of its own: the
+// reclaim of barrier B has already happened by then, so C's peak IS the final
+// footprint that FINAL bounds. The fast path needs none either, for the mirror
+// reason — it reclaims nothing, so its peak is likewise its final footprint,
+// which its own single condition bounds.
+//
+// If any bound fails, NOTHING is written and errCloseOutUnbounded is returned.
+// That is a definite terminal answer, not a retry and not a mid-append ENOSPC.
+// A physical ENOSPC from one of the close-out's own appends asserts the same
+// fact about a device the budget cannot see, so closeOutWrite converts it into
+// the same typed answer: see the comment there for why anything else strands the
+// grant forever.
 func appendRecoveryReleaseCertificate(
 	dir string,
 	scan *streamScan,
@@ -760,7 +795,7 @@ func appendRecoveryReleaseCertificate(
 			body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
 			frameNo++
 		}
-		return appendStreamTailFrames(path, end, body)
+		return closeOutWrite(path, end, body)
 	}
 
 	// Legacy accommodation. Every segment but the last is fully applied and
@@ -769,7 +804,25 @@ func appendRecoveryReleaseCertificate(
 	for _, seg := range segments[:len(segments)-1] {
 		reclaimable += seg.size
 	}
-	if reclaimable < appliedBytes || used-reclaimable+appliedBytes+releaseBytes > budget {
+	// Every bound, decided here, before anything is written. A gate that admits
+	// the protocol and then discovers at barrier B that it cannot finish has
+	// already overshot the cap and already lost the choice of writing nothing.
+	switch {
+	case reclaimable < appliedBytes:
+		return fmt.Errorf(
+			"%w: the %d-byte applied mark authorizing the reclaim costs more than the %d bytes that reclaim returns (%d live segment bytes, %d-byte budget)",
+			errCloseOutUnbounded, appliedBytes, reclaimable, used, budget,
+		)
+	case used+appliedBytes > budget:
+		// PEAK-A. The mark must be durable BEFORE the segments it authorizes
+		// deleting go away (inverting that order trades a recoverable stream for
+		// an ErrCorrupt one), so this sum is genuinely occupied at once. An
+		// at-cap pre-upgrade stream simply has nowhere to put it.
+		return fmt.Errorf(
+			"%w: the close-out's transient peak of %d bytes (%d live segment bytes plus the %d-byte applied mark, which must be durable before the %d reclaimable bytes may be freed) exceeds the %d-byte budget",
+			errCloseOutUnbounded, used+appliedBytes, used, appliedBytes, reclaimable, budget,
+		)
+	case used-reclaimable+appliedBytes+releaseBytes > budget:
 		return fmt.Errorf(
 			"%w: %d live segment bytes plus a %d-byte close-out for %d scopes exceed the %d-byte budget (%d reclaimable)",
 			errCloseOutUnbounded, used, appliedBytes+releaseBytes, len(scopes), budget, reclaimable,
@@ -779,7 +832,7 @@ func appendRecoveryReleaseCertificate(
 	// Barrier A: the mark that authorizes the reclaim.
 	if appliedBytes > 0 {
 		body := encodeFrame(nil, frameApplied, frameNo+1, 0, appliedPayload)
-		if err := appendStreamTailFrames(path, end, body); err != nil {
+		if err := closeOutWrite(path, end, body); err != nil {
 			return err
 		}
 		frameNo++
@@ -801,7 +854,37 @@ func appendRecoveryReleaseCertificate(
 		body = encodeFrame(body, frameRelease, frameNo+1, 0, payload)
 		frameNo++
 	}
-	return appendStreamTailFrames(path, end, body)
+	return closeOutWrite(path, end, body)
+}
+
+// writeStreamTailFrames is the indirection every close-out append goes through.
+// It exists so a test can observe the stream's occupancy at the exact instant
+// each barrier lands — the peak the budget arithmetic must bound — and so a
+// physical ENOSPC can be injected at a named barrier without a full disk. In
+// production it is appendStreamTailFrames and nothing else.
+var writeStreamTailFrames = appendStreamTailFrames
+
+// closeOutWrite performs one of the close-out's own appends and classifies its
+// failure.
+//
+// The budget arithmetic bounds this stream's share of the device; it cannot
+// bound the device. A close-out that is arithmetically admissible can still hit
+// a physically full filesystem, and the two say the same thing: this close-out
+// does not fit. They must therefore reach the caller as the same DEFINITE
+// answer. If a raw ENOSPC escapes here, recoverStream's default branch wraps it
+// in errRetryable, and because this function is only reached once the whole tail
+// is already applied at the authority, the result is an attach that fails
+// forever on a condition retrying cannot change, with the delegation grants
+// checked out to a stream that can never resolve. errCloseOutUnbounded is the
+// answer an operator can actually act on — raise BudgetBytes, or free space —
+// so the underlying errno stays wrapped and visible in the message rather than
+// being flattened into the typed sentinel.
+func closeOutWrite(path string, off int64, body []byte) error {
+	err := writeStreamTailFrames(path, off, body)
+	if err != nil && errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("%w: the device is physically full: %w", errCloseOutUnbounded, err)
+	}
+	return err
 }
 
 // segmentFile is one retained segment of an offline stream.

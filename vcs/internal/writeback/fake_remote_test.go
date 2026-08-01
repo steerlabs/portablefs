@@ -51,6 +51,13 @@ type fakeAuthority struct {
 	// progress — just slowly — which is the shape the credit gate must turn
 	// into a paced completion rather than an error.
 	flushRateBps int64
+	// flushFixedCost models everything ONE batch costs besides moving its
+	// bytes: the round trip, the authority's apply turn, its durability
+	// commit, and the reply. It is charged per flush regardless of size, which
+	// is exactly why batch size is the amortization knob — the measured
+	// production shape was 1.52s for an 8 MiB batch of which only ~0.70s was
+	// transfer.
+	flushFixedCost time.Duration
 	// discardContent keeps only sizes for applied writes (RSS-bounding tests
 	// stream gigabytes; the fake must not hold them on the heap).
 	discardContent bool
@@ -165,13 +172,17 @@ func (a *fakeAuthority) ReleaseDelegation(_ context.Context, scope, epoch string
 func (a *fakeAuthority) Flush(ctx context.Context, req FlushRequest) (FlushReply, error) {
 	a.mu.Lock()
 	gate, entered, rate := a.flushGate, a.flushEntered, a.flushRateBps
+	fixed := a.flushFixedCost
 	a.mu.Unlock()
-	if rate > 0 {
+	if rate > 0 || fixed > 0 {
 		var bulk int64
 		for _, rec := range req.Records {
 			bulk += int64(len(rec.Data))
 		}
-		delay := time.Duration(float64(bulk) / float64(rate) * float64(time.Second))
+		delay := fixed
+		if rate > 0 {
+			delay += time.Duration(float64(bulk) / float64(rate) * float64(time.Second))
+		}
 		if delay > 0 {
 			t := time.NewTimer(delay)
 			select {

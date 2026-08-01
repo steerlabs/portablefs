@@ -63,9 +63,19 @@ func TestDelegationReleaseBlocksWhenPreparedPinsAreUnconfirmed(t *testing.T) {
 		t.Fatal("delegation release succeeded without confirmed prepared pins")
 	}
 
+	// The grant must still be HELD — a failed prepare may not surrender it — and
+	// the attempt must carry its reason. Draining and DrainError are mutually
+	// exclusive by construction: an attempt is either still in flight (draining,
+	// no verdict) or answered (a verdict, not draining). A scope reported as
+	// draining with a recorded error would be the wedge shape this engine
+	// deliberately cannot produce.
 	status := v.wb.Status()
-	if len(status.Delegations) != 1 || status.Delegations[0].Scope != "d" || !status.Delegations[0].Draining {
-		t.Fatalf("failed prepare did not keep the delegation held and draining: %+v", status.Delegations)
+	if len(status.Delegations) != 1 || status.Delegations[0].Scope != "d" {
+		t.Fatalf("failed prepare did not keep the delegation held: %+v", status.Delegations)
+	}
+	if held := status.Delegations[0]; held.Draining || held.DrainError == "" {
+		t.Fatalf("failed prepare left the release attempt without a definite recorded "+
+			"outcome: %+v", held)
 	}
 	if ino := n.AuthorityIno(); ino != 0 {
 		t.Fatalf("failed prepare bound authority inode %d", ino)

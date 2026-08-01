@@ -113,9 +113,9 @@ func TestProbeNegotiation(t *testing.T) {
 	if r.Status != OK || r.ProtoVersion != ProtocolVersion {
 		t.Fatalf("probe: version=%d status=%d, want %d/OK", r.ProtoVersion, r.Status, ProtocolVersion)
 	}
-	// Both optional lanes: atomic delegated xattrs and durable
-	// birth-time/BSD-flag persistence.
-	if want := FeatureDelegatedXattrs | FeatureFlagPersistence; r.Features != want {
+	// Every optional lane: atomic delegated xattrs, durable birth-time/BSD-flag
+	// persistence, and post-op mutation attributes.
+	if want := FeatureDelegatedXattrs | FeatureFlagPersistence | FeatureMutationAttrs; r.Features != want {
 		t.Fatalf("managed authority features = %b, want %b", r.Features, want)
 	}
 	if r.LeaseMs <= 0 {

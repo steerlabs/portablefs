@@ -385,29 +385,24 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Hold the exclusive namespace gate for the complete logical operation.
-	// This also covers grafted local files, whose mutation path deliberately
-	// bypasses the remote Volume lifecycle.
-	unlockNamespace := a.lockExternalNamespaceWrite()
-	namespaceLocked := true
-	defer func() {
-		if namespaceLocked {
-			unlockNamespace()
-		}
-	}()
-	if err := a.controlAdmissionError(); err != nil {
-		writeHTTPError(w, http.StatusConflict, err.Error())
-		return
-	}
 	p := cleanControlPath(req.Path)
+
+	// A GRAFT is machine-local: no delegation covers it, it consumes no stream
+	// budget, and its mutation path deliberately bypasses the remote Volume
+	// lifecycle. It needs the namespace gate and nothing else.
 	if graft := a.localDirFor(p); graft != "" {
+		unlockNamespace := a.lockExternalNamespaceWrite()
+		if err := a.controlAdmissionError(); err != nil {
+			unlockNamespace()
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
 		refreshItemID, eno := a.writeLocalFile(p, graft, data)
+		unlockNamespace()
 		if eno != 0 {
 			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
 			return
 		}
-		unlockNamespace()
-		namespaceLocked = false
 		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
 		err := a.exactKernelRefresh(refreshCtx, refreshItemID)
 		cancelRefresh()
@@ -419,81 +414,91 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
 		return
 	}
-	attr, st := vol.Lookup(r.Context(), p)
-	existed := st == fsproto.OK
-	if st == fsproto.ENOENT {
-		attr, st = vol.Create(r.Context(), p, 0o644)
-		if st == fsproto.OK {
-			a.mu.Lock()
-			created := a.registerCreatedLocked(p, attr)
-			a.mu.Unlock()
-			if created == nil {
-				writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
+
+	// The control plane is a FRONTEND. It mutates the same namespace the FSKit
+	// and FUSE frontends mutate, through the same clientcore entry points, so it
+	// obeys the same dispatcher-ordering contract (frontend.go) rather than a
+	// private one of its own:
+	//
+	//	PHASE 0  one absolute operation deadline — the raw HTTP context carries
+	//	         none, so before this a control write could hold the EXCLUSIVE
+	//	         namespace gate for as long as the uplink took;
+	//	PHASE 1  pre-lock admission: the delegation transition claim and the
+	//	         release of every operand scope, taken holding nothing;
+	//	PHASE 2  the namespace gate;
+	//	PHASE 3  nonblocking token revalidation plus the mutation itself.
+	//
+	// Taking the claim under lockExternalNamespaceWrite (which is
+	// frontendSerial.Lock + nsMu.Lock, mount-wide and exclusive) was not merely
+	// slow: it inverted the one global lock order the whole daemon depends on.
+	// Every frontend request holds the mirrors while its handler runs, and the
+	// pre-lock classifier holds a transition claim across them; a control write
+	// holding the mirrors and WAITING for a claim closes that cycle exactly.
+	//
+	// The authority lane is resolved unconditionally. A control write is an
+	// administrative write-through: it publishes to a path the caller does not
+	// hold open, and resolving the delegated lane would only guarantee an unwind
+	// the moment the Create or the Setattr reached beginAuthorityMutation.
+	opCtx, cancelOperation := clientcore.WithOperationDeadline(r.Context())
+	defer cancelOperation()
+	var (
+		refreshItemID uint64
+		httpStatus    int
+		httpMessage   string
+	)
+	for {
+		node := clientcore.NewNodeState(0, false)
+		if rec := a.itemByPath(p); rec != nil && rec.state != nil {
+			node = rec.state
+		}
+		// PHASE 1.
+		mutCtx, _, settle, err := vol.AdmitWrite(opCtx, p, node, len(data), true)
+		if err != nil {
+			settle()
+			writeHTTPError(
+				w,
+				httpStatusForErr(creditErrno(err)),
+				errMessage("fs/write admission", creditErrno(err)),
+			)
+			return
+		}
+		if probe := a.testControlAdmissionProbe; probe != nil {
+			probe(mutCtx)
+		}
+		laneChanged, status, message, itemID := a.controlWriteLocked(
+			mutCtx, vol, p, node, data,
+		)
+		settle()
+		if laneChanged {
+			// PHASE 3 refused to transition under the locks, and every lock is
+			// released by now. Re-admit out here, under the SAME deadline, which
+			// is what terminates the loop.
+			if opCtx.Err() != nil {
+				writeHTTPError(
+					w,
+					httpStatusForErr(creditErrno(opCtx.Err())),
+					errMessage("fs/write admission", creditErrno(opCtx.Err())),
+				)
 				return
 			}
+			continue
 		}
+		refreshItemID, httpStatus, httpMessage = itemID, status, message
+		break
 	}
-	if st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write", toDarwinErr(st)))
-		return
-	}
-	candidateItemID := attr.Ino
-	if candidateItemID == 0 {
-		candidateItemID = clientcore.InoOf(p)
-	}
-	if _, ok := fskitItemID(candidateItemID); !ok {
-		writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
-		return
-	}
-	n := clientcore.NewNodeState(attr.Ino, attr.Ino != 0)
-	if rec := a.itemByPath(p); rec != nil {
-		n = rec.state
-	}
-	if st := vol.Open(r.Context(), p, n, true); st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write open", toDarwinErr(st)))
-		return
-	}
-	defer vol.CloseHandle(p, n)
-	if _, st := vol.Write(r.Context(), p, n, 0, data); st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write data", toDarwinErr(st)))
-		return
-	}
-	if _, st := vol.Setattr(r.Context(), p, n, clientcore.SetattrRequest{Size: int64(len(data)), SetSize: true}); st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write truncate", toDarwinErr(st)))
-		return
-	}
-	if fresh, st := vol.Getattr(r.Context(), p, n); st == fsproto.OK {
-		attr = fresh
-	}
-	a.mu.Lock()
-	rec := a.registerLocked(p, attr)
-	if rec == nil {
-		a.mu.Unlock()
-		writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
-		return
-	}
-	refreshItemID := rec.item.ItemID
-	if !existed {
-		a.publishNamespaceInvalidationLocked(p, 0, 0)
-	}
-	a.publishContentInvalidationLocked(p, 0, 0)
-	a.mu.Unlock()
-	if eno := a.flushBindingDelta(); eno != 0 {
-		writeHTTPError(
-			w, httpStatusForErr(eno), errMessage("fs/write identity journal", eno),
-		)
+	if httpStatus != 0 {
+		writeHTTPError(w, httpStatus, httpMessage)
 		return
 	}
 	// This write bypassed the kernel entirely. Do not acknowledge it until
 	// every live vnode reflects the composed local view; otherwise FSKit can
 	// serve pre-write pages after a successful control response.
-	unlockNamespace()
-	namespaceLocked = false
 	refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
 	err = a.exactKernelRefresh(refreshCtx, refreshItemID)
 	cancelRefresh()
@@ -503,6 +508,106 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// controlWriteLocked is PHASE 2+3 of a control write: it holds the exclusive
+// namespace gate for the complete logical operation and performs nothing but
+// the mutation and its bookkeeping. Every step that can wait on the uplink has
+// already happened in the caller's phase 1.
+//
+// laneChanged reports that the pre-resolved lane no longer holds. The gate is
+// released before it returns, so the caller re-admits holding nothing — the same
+// unwind the two kernel frontends run.
+func (a *attach) controlWriteLocked(
+	ctx context.Context,
+	vol *clientcore.Volume,
+	p string,
+	node *clientcore.NodeState,
+	data []byte,
+) (laneChanged bool, httpStatus int, httpMessage string, refreshItemID uint64) {
+	unlockNamespace := a.lockExternalNamespaceWrite()
+	defer unlockNamespace()
+	if err := a.controlAdmissionError(); err != nil {
+		return false, http.StatusConflict, err.Error(), 0
+	}
+	attr, st := vol.Lookup(ctx, p)
+	existed := st == fsproto.OK
+	if st == fsproto.ENOENT {
+		attr, st = vol.Create(ctx, p, 0o644)
+		if clientcore.LaneChanged(st) {
+			return true, 0, "", 0
+		}
+		if st == fsproto.OK {
+			a.mu.Lock()
+			created := a.registerCreatedLocked(p, attr)
+			a.mu.Unlock()
+			if created == nil {
+				return false, http.StatusInternalServerError,
+					errMessage("fs/write item identity", darwinEIO), 0
+			}
+		}
+	}
+	if clientcore.LaneChanged(st) {
+		return true, 0, "", 0
+	}
+	if st != fsproto.OK {
+		return false, httpStatusForErr(toDarwinErr(st)),
+			errMessage("fs/write", toDarwinErr(st)), 0
+	}
+	candidateItemID := attr.Ino
+	if candidateItemID == 0 {
+		candidateItemID = clientcore.InoOf(p)
+	}
+	if _, ok := fskitItemID(candidateItemID); !ok {
+		return false, http.StatusInternalServerError,
+			errMessage("fs/write item identity", darwinEIO), 0
+	}
+	if !node.AuthIno() && attr.Ino != 0 && !node.RecordAuthorityIno(attr.Ino) {
+		return false, http.StatusInternalServerError,
+			errMessage("fs/write item identity", darwinEIO), 0
+	}
+	if st := vol.Open(ctx, p, node, true); st != fsproto.OK {
+		return false, httpStatusForErr(toDarwinErr(st)),
+			errMessage("fs/write open", toDarwinErr(st)), 0
+	}
+	defer vol.CloseHandle(p, node)
+	if _, st := vol.Write(ctx, p, node, 0, data); st != fsproto.OK {
+		if clientcore.LaneChanged(st) {
+			return true, 0, "", 0
+		}
+		return false, httpStatusForErr(toDarwinErr(st)),
+			errMessage("fs/write data", toDarwinErr(st)), 0
+	}
+	if _, st := vol.Setattr(ctx, p, node, clientcore.SetattrRequest{
+		Size: int64(len(data)), SetSize: true,
+	}); st != fsproto.OK {
+		if clientcore.LaneChanged(st) {
+			return true, 0, "", 0
+		}
+		return false, httpStatusForErr(toDarwinErr(st)),
+			errMessage("fs/write truncate", toDarwinErr(st)), 0
+	}
+	if fresh, st := vol.Getattr(ctx, p, node); st == fsproto.OK {
+		attr = fresh
+	}
+	a.mu.Lock()
+	rec := a.registerLocked(p, attr)
+	if rec == nil {
+		a.mu.Unlock()
+		return false, http.StatusInternalServerError,
+			errMessage("fs/write item identity", darwinEIO), 0
+	}
+	refreshItemID = rec.item.ItemID
+	if !existed {
+		a.publishNamespaceInvalidationLocked(p, 0, 0)
+	}
+	a.publishContentInvalidationLocked(p, 0, 0)
+	a.mu.Unlock()
+	if eno := a.flushBindingDelta(); eno != 0 {
+		return false, httpStatusForErr(eno),
+			errMessage("fs/write identity journal", eno), 0
+	}
+	return false, 0, "", refreshItemID
 }
 
 func (s *Server) controlFSStat(w http.ResponseWriter, r *http.Request, a *attach) {

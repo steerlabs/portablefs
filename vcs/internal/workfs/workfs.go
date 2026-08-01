@@ -1232,6 +1232,67 @@ func (fs *FS) stampVersionAt(r wal.Record, orphanIno uint64, stampCtime bool, no
 	return v
 }
 
+// postAttrsLocked captures the post-op state of every name whose coherence
+// version this record's stamp just set to version. It is THE root fix for the
+// mutation→re-stat round trip: the attributes a client would otherwise fetch
+// with a follow-up getattr are already resolved here, at the ordered apply
+// position, under the same fs.mu hold that assigned the version.
+//
+// Membership is decided by the stamp itself, never by the record's shape: a
+// name is reported only when the inode it resolves to carries exactly this
+// record's version. That is what makes a stale wire name safe — a
+// handle-addressed write whose Path was renamed away by a peer resolves to
+// some OTHER inode, whose version is not this one, and is simply omitted. And
+// it is what keeps the answer exact under concurrency: a mutation ordered
+// after this one carries a strictly greater version, so it can never be
+// reported here, and its invalidation strictly supersedes what is.
+//
+// Absence is reported the same way and with the same rigor: a name that no
+// longer resolves is emitted as a NEGATIVE only when its parent directory was
+// stamped by this record, because the parent version is the anchor a cached
+// negative is ordered against. Without that anchor the absence is simply not
+// reported and the client refetches.
+//
+// Caller holds fs.mu (or is the single-threaded constructor).
+func (fs *FS) postAttrsLocked(r wal.Record, version uint64) []PostAttr {
+	paths := affectedPaths(r)
+	if len(paths) == 0 || version == 0 {
+		return nil
+	}
+	// At most four names (a rename's two endpoints and their parents), so
+	// dedup is a linear scan rather than a per-mutation map allocation.
+	out := make([]PostAttr, 0, 2*len(paths))
+	stampedAt := func(p string) bool {
+		n := fs.resolve(p)
+		return n != nil && n.version == version
+	}
+	add := func(p string) {
+		p = cleanPath(p)
+		for i := range out {
+			if out[i].Path == p {
+				return
+			}
+		}
+		n := fs.resolve(p)
+		switch {
+		case n != nil && n.version == version:
+			out = append(out, PostAttr{Path: p, Exists: true, Info: fs.infoOfNamed(n, direntName(p))})
+		case n == nil && stampedAt(parentPath(p)):
+			out = append(out, PostAttr{Path: p})
+		}
+	}
+	for _, p := range paths {
+		add(p)
+		if stampsParentVersion(r.Op) {
+			add(parentPath(p))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func stampsParentVersion(op wal.Op) bool {
 	switch op {
 	case wal.OpCreate, wal.OpMkdir, wal.OpSymlink, wal.OpRemove, wal.OpRename, wal.OpOrphan, wal.OpLink:

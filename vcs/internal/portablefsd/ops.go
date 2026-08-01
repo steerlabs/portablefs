@@ -853,47 +853,18 @@ func (a *attach) read(ctx context.Context, req *pfslocal.ReadRequest) (*pfslocal
 	return &pfslocal.ReadReply{Data: data}, 0
 }
 
-// write resolves the request's lane outside every lock, then executes it under
-// them.
+// write executes a request whose lane, credit and every delegation transition
+// the DISPATCHER already resolved — before a single frontend lock, in the same
+// phase 1 every namespace mutation is admitted in (frontend.go).
 //
-// The loop is the second half of that invariant, not a retry-until-it-works. A
-// lane decided outside the locks can be invalidated inside them by a delegation
-// recall this frontend does not control, and both ways to recover — acquiring a
-// grant, or releasing one to reach the authority lane — are delegation
-// transitions, which is precisely what must never happen while a.nsMu is held.
-// So the operation unwinds to here and reclassifies, paying for the transition
-// where it costs one request instead of the namespace.
-//
-// It runs at most twice. The second pass classifies the authority lane
-// unconditionally, and that lane is not a claim about a grant — it consumes no
-// stream budget at all — so a recall has nothing left to invalidate.
+// The write path had its own admission loop here, one layer below the frontend
+// mirrors, and that was an order inversion the moment metadata admission moved
+// above them: a write held a name-stripe mirror while waiting for a transition
+// claim, and a namespace mutation held a conflicting claim while waiting for
+// that same stripe. There is one admission point for the whole daemon, and it is
+// the dispatcher's; the unwind loop lives there too.
 func (a *attach) write(ctx context.Context, req *pfslocal.WriteRequest) (*pfslocal.WriteReply, int32) {
-	for forceAuthority := false; ; forceAuthority = true {
-		reply, eno, unwound := a.writeOnce(ctx, req, forceAuthority)
-		if !unwound {
-			return reply, eno
-		}
-	}
-}
-
-func (a *attach) writeOnce(
-	ctx context.Context,
-	req *pfslocal.WriteRequest,
-	forceAuthority bool,
-) (*pfslocal.WriteReply, int32, bool) {
-	// Lane, credit and every delegation transition are resolved HERE, before a
-	// single lock: the waits in a write that are unbounded by the local machine
-	// are taken while this request holds nothing at all.
-	ctx, data, settle, eno := a.admitWrite(ctx, req, forceAuthority)
-	defer settle()
-	if eno != 0 {
-		return nil, eno, false
-	}
-	reply, eno := a.writeLocked(ctx, req, data)
-	if eno == errnoLaneChanged {
-		return nil, 0, true
-	}
-	return reply, eno, false
+	return a.writeLocked(ctx, req, writeGrantOf(ctx, req.Data))
 }
 
 func (a *attach) writeLocked(
@@ -1149,34 +1120,42 @@ func (a *attach) admitWrite(
 	ctx context.Context,
 	req *pfslocal.WriteRequest,
 	forceAuthority bool,
-) (context.Context, []byte, func(), int32) {
+) (context.Context, func(), int32, bool) {
 	noop := func() {}
-	data := req.Data
-	if len(data) == 0 {
-		return ctx, data, noop, 0
+	if len(req.Data) == 0 {
+		return ctx, noop, 0, false
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
-		return ctx, data, noop, 0
+		return ctx, noop, 0, false
 	}
 	h, scope, herr := a.handleTarget(req.Handle)
 	if herr != 0 || h.file != nil || !h.write {
-		return ctx, data, noop, 0
+		return ctx, noop, 0, false
 	}
-	opCtx, granted, settle, err := vol.AdmitWrite(ctx, scope, h.state, len(data), forceAuthority)
+	opCtx, granted, settle, err := vol.AdmitWrite(ctx, scope, h.state, len(req.Data), forceAuthority)
 	if err != nil {
 		settle()
-		return ctx, data, noop, creditErrno(err)
+		return ctx, noop, creditErrno(err), true
 	}
-	if granted < len(data) {
-		// A short grant is a healthy outcome, not a failure: write exactly the
-		// granted prefix and let the reply's written count tell the kernel to
-		// reissue the rest as a fresh operation, classified from scratch. The
-		// FSKit adapter already loops on a short count (VolumeCore.write) and
-		// FUSE replies support short writes natively.
-		data = data[:granted]
+	// A short grant is a healthy outcome, not a failure: the handler writes
+	// exactly the granted prefix and the reply's written count tells the kernel
+	// to reissue the rest as a fresh operation, classified from scratch. The
+	// FSKit adapter already loops on a short count (VolumeCore.write) and FUSE
+	// replies support short writes natively.
+	return context.WithValue(opCtx, writeGrantKey{}, granted), settle, 0, true
+}
+
+// writeGrantKey carries the admitted byte count from the dispatcher's pre-lock
+// admission to the handler that runs under the locks.
+type writeGrantKey struct{}
+
+func writeGrantOf(ctx context.Context, data []byte) []byte {
+	granted, ok := ctx.Value(writeGrantKey{}).(int)
+	if !ok || granted >= len(data) {
+		return data
 	}
-	return opCtx, data, settle, 0
+	return data[:granted]
 }
 
 // creditErrno is the frontend's POSIX classification of a refused admission.

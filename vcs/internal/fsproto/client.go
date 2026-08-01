@@ -1109,6 +1109,7 @@ func (c *Client) WriteVHandleContext(ctx context.Context, path string, handleIno
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, true)
+		c.collectPostAttrs(ctx, r)
 	}
 	return int(r.Count), r.Version, r.Gen, r.Status, nil
 }
@@ -1129,6 +1130,7 @@ func (c *Client) AppendVHandleContext(ctx context.Context, path string, handleIn
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, true)
+		c.collectPostAttrs(ctx, r)
 	}
 	return int(r.Count), r.Offset, r.Version, r.Gen, r.Status, nil
 }
@@ -1645,6 +1647,7 @@ func (c *Client) createContext(ctx context.Context, path string, mode uint32, re
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, false)
+		c.collectPostAttrs(ctx, r)
 	}
 	return c.ensureAttrContext(ctx, path, "file", r), r.Gen, r.Status, nil
 }
@@ -1661,6 +1664,7 @@ func (c *Client) MkdirContext(ctx context.Context, path string, mode uint32) (*A
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, false)
+		c.collectPostAttrs(ctx, r)
 	}
 	return c.ensureAttrContext(ctx, path, "directory", r), r.Status, nil
 }
@@ -1677,6 +1681,7 @@ func (c *Client) RemoveContext(ctx context.Context, path string) (int32, error) 
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, false)
+		c.collectPostAttrs(ctx, r)
 	}
 	return r.Status, nil
 }
@@ -1705,6 +1710,7 @@ func (c *Client) RenameWithOrphanTargetContext(ctx context.Context, oldPath, new
 		// owner-suppressed.
 		c.selfWrote(oldPath, r, false)
 		c.selfWrote(newPath, r, false)
+		c.collectPostAttrs(ctx, r)
 	}
 	return r.Status, r.OrphanIno, nil
 }
@@ -1721,6 +1727,7 @@ func (c *Client) SymlinkContext(ctx context.Context, target, link string) (*Attr
 	}
 	if r.Status == OK {
 		c.selfWrote(link, r, false)
+		c.collectPostAttrs(ctx, r)
 	}
 	return c.ensureAttrContext(ctx, link, "symlink", r), r.Status, nil
 }
@@ -1739,6 +1746,7 @@ func (c *Client) LinkContext(ctx context.Context, oldPath, newPath string) (*Att
 	if r.Status == OK {
 		c.selfWrote(oldPath, r, false)
 		c.selfWrote(newPath, r, false)
+		c.collectPostAttrs(ctx, r)
 	}
 	return c.ensureAttrContext(ctx, newPath, "file", r), r.Status, nil
 }
@@ -1896,6 +1904,7 @@ func (c *Client) SetattrVContext(
 				return r.Status, nil
 			}
 			c.selfWrote(path, r, true)
+			c.collectPostAttrs(ctx, r)
 		}
 		return OK, nil
 	}
@@ -1912,6 +1921,7 @@ func (c *Client) SetattrVContext(
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, true)
+		c.collectPostAttrs(ctx, r)
 	}
 	return r.Status, nil
 }
@@ -1969,6 +1979,7 @@ func (c *Client) SetxattrFlagsContext(ctx context.Context, path string, handleIn
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, true) // attr-level in-place change, like chmod
+		c.collectPostAttrs(ctx, r)
 	}
 	return r.Status, nil
 }
@@ -1985,6 +1996,7 @@ func (c *Client) RemovexattrContext(ctx context.Context, path string, handleIno 
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, true)
+		c.collectPostAttrs(ctx, r)
 	}
 	return r.Status, nil
 }
@@ -2006,6 +2018,7 @@ func (c *Client) TruncateHandleContext(ctx context.Context, path string, handleI
 	}
 	if r.Status == OK {
 		c.selfWrote(path, r, true)
+		c.collectPostAttrs(ctx, r)
 	}
 	return r.Status, nil
 }

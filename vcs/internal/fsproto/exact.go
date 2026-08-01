@@ -380,6 +380,13 @@ func (s *Server) probeResponse(clientVersion int64) *Response {
 		if s.persistsInodeMetadata() {
 			resp.Features |= FeatureFlagPersistence
 		}
+		// Post-op mutation attributes come from the ordered apply position of
+		// the managed journal, so the bit is exactly the managed store's
+		// presence — no separate durability promise is involved (the payload is
+		// a reply observation, never stored state).
+		if s.coordStore() != nil {
+			resp.Features |= FeatureMutationAttrs
+		}
 	}
 	return resp
 }
@@ -642,6 +649,7 @@ func (s *Server) exactMutate(cs *connSession, req *Request) *Response {
 			Offset: result.Offset, Ino: result.Ino, OrphanIno: result.OrphanIno, Gen: s.gen(),
 		}
 		if result.Status == OK {
+			resp.PostAttrs = postAttrsOf(result.Post)
 			s.fillExactAttr(req, record, resp)
 		}
 		return resp
@@ -761,6 +769,39 @@ func duplicateResponse(o workfs.SlotOutcome, gen uint64) *Response {
 	}
 }
 
+// postAttrsOf projects the authority's ordered-apply observation onto the wire
+// shape. It is a pure translation: membership, absence, and the version anchor
+// were all decided at the apply position under the tree lock (see
+// workfs.postAttrsLocked); nothing here re-reads the tree, so the reply cannot
+// disagree with the version it is stamped with.
+func postAttrsOf(post []workfs.PostAttr) []PathAttr {
+	if len(post) == 0 {
+		return nil
+	}
+	out := make([]PathAttr, 0, len(post))
+	for _, p := range post {
+		pa := PathAttr{Path: p.Path, Exists: p.Exists}
+		if p.Exists {
+			if p.Info == nil {
+				continue
+			}
+			pa.Attr = attrOf(p.Info)
+		}
+		out = append(out, pa)
+	}
+	return out
+}
+
+// findPostAttr returns the observation for path, or nil.
+func findPostAttr(post []PathAttr, path string) *PathAttr {
+	for i := range post {
+		if post[i].Path == path {
+			return &post[i]
+		}
+	}
+	return nil
+}
+
 // fillExactAttr adds the fresh-execution convenience Attr for ops whose v1
 // responses carried one. Duplicate retries never carry it (the stored outcome
 // is essential-only); the client re-stats when it needs attributes.
@@ -770,6 +811,17 @@ func (s *Server) fillExactAttr(req *Request, record wal.Record, resp *Response) 
 		attrPath := record.Path
 		if req.Op == OpLink {
 			attrPath = record.NewPath
+		}
+		// The ordered-apply observation is the authoritative one: it was taken
+		// under the same lock hold that stamped resp.Version, so serving it
+		// makes the reply's attributes and its coherence anchor agree by
+		// construction. The re-stats below remain for the paths that carry no
+		// observation (a stale wire name a peer renamed away, or a
+		// non-managed store).
+		if pa := findPostAttr(resp.PostAttrs, cleanWirePath(attrPath)); pa != nil && pa.Exists {
+			a := pa.Attr
+			resp.Attr = &a
+			return
 		}
 		if hs, ok := s.fs.(HandleStore); ok && resp.Ino != 0 {
 			// Attr is a fresh-execution convenience only: the mutation

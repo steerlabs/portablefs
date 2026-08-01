@@ -128,6 +128,13 @@ type stagedRecord struct {
 // wal.DurableLog. All exported methods are safe for concurrent use.
 type Log struct {
 	pool journalDB
+	// livenessPool is the reserved single connection that answers the
+	// capability-bound lease-facts probe. It is set by every production open
+	// path and is NEVER used by the data plane, so the child's fencing clock
+	// cannot queue behind its own apply/flush traffic. Direct struct literals
+	// (tests, benchmarks, the discovery probe) leave it nil and speak through
+	// the one seam they were given.
+	livenessPool journalDB
 	// life fences every request: no call outlives the process lifecycle
 	// context supplied to Open (no context.Background in request paths).
 	life     context.Context
@@ -343,6 +350,88 @@ func connect(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+// livenessPoolConfig builds the DEDICATED single-connection pool that answers
+// pfj.authority_lease_facts and nothing else.
+//
+// The child's fencing deadline is only extended by a successful lease-facts
+// answer; an ambiguous one (timeout included) never extends. Sharing the
+// data-plane pool therefore made the fencing clock a function of write load:
+// a saturating apply/flush workload holds every one of the (default 4)
+// connections, the probe blocks in pgxpool waiting for one, its bounded
+// context expires, nothing extends, and the armed deadline runs out — a
+// child that is demonstrably healthy and applying records at full speed
+// fences itself. Load, not failure, killed the authority.
+//
+// One connection is reserved, kept warm (MinConns = 1), and never handed to
+// the data plane, so probe latency is one round trip regardless of how busy
+// the journal is. It is deliberately NOT a fallback path or a retry: it is a
+// separate channel, which is the only structure under which "the child is
+// alive" cannot be starved by the child's own useful work.
+func livenessPoolConfig(cfg Config) (*pgxpool.Config, error) {
+	livenessCfg := cfg
+	if livenessCfg.ApplicationName == "" {
+		livenessCfg.ApplicationName = "portablefs-vcs"
+	}
+	livenessCfg.ApplicationName += "-liveness"
+	pc, err := poolConfig(livenessCfg)
+	if err != nil {
+		return nil, err
+	}
+	pc.MaxConns = 1
+	pc.MinConns = 1
+	return pc, nil
+}
+
+// journalPool is the child's database seam: the data-plane pool plus the
+// reserved liveness connection. It satisfies journalDB with the DATA pool, so
+// every existing call site (and every error path's Close) keeps its exact
+// meaning while owning both connections' lifetimes.
+type journalPool struct {
+	data     *pgxpool.Pool
+	liveness *pgxpool.Pool
+}
+
+func (p *journalPool) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return p.data.QueryRow(ctx, sql, args...)
+}
+
+func (p *journalPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return p.data.Query(ctx, sql, args...)
+}
+
+func (p *journalPool) Close() {
+	p.data.Close()
+	p.liveness.Close()
+}
+
+// connectWithLiveness opens the data-plane pool and the reserved liveness
+// connection together. A liveness connection that cannot be established fails
+// the open: a managed child with no isolated fencing clock must never serve.
+func connectWithLiveness(ctx context.Context, cfg Config) (*journalPool, error) {
+	data, err := connect(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	pc, err := livenessPoolConfig(cfg)
+	if err != nil {
+		data.Close()
+		return nil, err
+	}
+	liveness, err := pgxpool.NewWithConfig(ctx, pc)
+	if err != nil {
+		data.Close()
+		return nil, fmt.Errorf("remotejournal: build liveness pool: %w", err)
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := liveness.Ping(pingCtx); err != nil {
+		liveness.Close()
+		data.Close()
+		return nil, fmt.Errorf("remotejournal: liveness connection unreachable: %w", err)
+	}
+	return &journalPool{data: data, liveness: liveness}, nil
+}
+
 func normalize(cfg *Config) error {
 	if cfg.TenantID == "" || cfg.VolumeID == "" || cfg.Branch == "" {
 		return fmt.Errorf("remotejournal: tenant, volume, and branch are required")
@@ -407,12 +496,12 @@ func Open(ctx context.Context, cfg Config) (*Log, error) {
 	if cfg.ClaimOperationID == "" || len(cfg.ClaimOperationID) > 200 {
 		return nil, fmt.Errorf("remotejournal: manager-issued claim operation id is required and bounded to 200 bytes")
 	}
-	pool, err := connect(ctx, cfg)
+	pool, err := connectWithLiveness(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	l := &Log{
-		pool: pool, life: ctx, cfg: cfg,
+		pool: pool, livenessPool: pool.liveness, life: ctx, cfg: cfg,
 		capability:   cfg.AuthorityCapability,
 		managerEpoch: managerEpoch,
 		runtimeSeq:   runtimeSeq,
@@ -490,12 +579,12 @@ func OpenReadOnly(ctx context.Context, cfg Config) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	pool, err := connect(ctx, cfg)
+	pool, err := connectWithLiveness(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	l := &Log{
-		pool: pool, life: ctx, cfg: cfg, readOnly: true,
+		pool: pool, livenessPool: pool.liveness, life: ctx, cfg: cfg, readOnly: true,
 		capability:   cfg.AuthorityCapability,
 		managerEpoch: managerEpoch,
 		runtimeSeq:   runtimeSeq,

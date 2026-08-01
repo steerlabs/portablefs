@@ -256,6 +256,26 @@ type Attr struct {
 	AllocSize int64
 }
 
+// PathAttr is one affected name's POST-OP state, carried on a mutation reply
+// (Response.PostAttrs). Exists=false is a positive statement of absence at the
+// mutation's ordered position — the name a remove destroyed or a rename moved
+// away — not "unknown"; the authority emits it only when the parent
+// directory's version was stamped by the same record, which is the anchor a
+// cached negative is ordered against.
+//
+// Every element shares the reply's Version and Gen as its coherence anchor,
+// because the authority stamps one version across the mutated inode and the
+// parent it rebound, and that is the SAME version the invalidation stream
+// publishes for them. A client may therefore install these attributes under
+// exactly the monotonic rule a read fill uses (install only while the cached
+// floor has not advanced past this version), so an install can never travel
+// backwards against a concurrent invalidation.
+type PathAttr struct {
+	Path   string
+	Exists bool
+	Attr   Attr
+}
+
 // Dirent is one entry in a directory listing.
 type Dirent struct {
 	Name string
@@ -517,6 +537,26 @@ type Response struct {
 	// must flush every cache and acknowledge InvPos before the authority
 	// counts this subscriber as coherent at any barrier position.
 	InvBootstrap bool
+
+	// PostAttrs is a MUTATION reply's post-op attribute set: the mutated
+	// name (or its proven absence) and, for a namespace mutation, the parent
+	// directory it rebound. Version/Gen above are its coherence anchor.
+	//
+	// It exists so a mutation's own client never has to re-read what the
+	// mutation just produced. The authority resolved these attributes at the
+	// record's ordered apply position anyway — that is where the version is
+	// stamped — so carrying them costs one already-materialized observation
+	// on a reply that is already crossing the wire, and removes a full
+	// round trip per affected name from every create, remove, rename,
+	// setattr, write, truncate and xattr mutation.
+	//
+	// Gob-additive, so an older client drops the field and keeps its
+	// evict-and-refetch behavior. A newer client selects the lane from the
+	// version probe's FeatureMutationAttrs bit, never from an empty slice:
+	// emptiness is a legitimate answer (nothing this record stamped is
+	// nameable), so it can never distinguish "unsupported" from "nothing to
+	// report".
+	PostAttrs []PathAttr
 }
 
 // toErrno maps a Go filesystem error to a wire errno.

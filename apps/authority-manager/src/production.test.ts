@@ -1208,7 +1208,8 @@ const PROD_ENV = {
 //   trailing   — a valid frame followed by more bytes (one-shot violated);
 //   foreign    — reports a DIFFERENT authority instance (spoofed identity);
 //   spoofed-addr — reports a non-loopback fs address;
-//   heartbeat-backpressure — the lease pipe refuses writes (write() false).
+//   heartbeat-backpressure — the lease pipe is above its high-water mark
+//                            (write() returns false) but is otherwise healthy.
 type ChildPipeMode =
   | "normal"
   | "silent"
@@ -1313,8 +1314,15 @@ async function newProductionHarness(
     const stderr = new PassThrough();
     const heartbeat = new PassThrough();
     if (pipeMode === "heartbeat-backpressure") {
-      // The lease pipe refuses delivery: write() reports backpressure.
-      heartbeat.write = (() => false) as typeof heartbeat.write;
+      // Node flow control: the chunk IS buffered and its callback still
+      // fires; the false return only says "above the high-water mark, wait
+      // for drain". It is not evidence the child is gone.
+      heartbeat.write = ((chunk: unknown, callback?: (error?: Error | null) => void) => {
+        const frame = JSON.parse(String(chunk)) as Record<string, unknown>;
+        heartbeatWrites.push({ frame, release: (error?: Error) => callback?.(error ?? null) });
+        setImmediate(() => callback?.(null));
+        return false;
+      }) as typeof heartbeat.write;
     } else if (options.heartbeat) {
       // Capture every lease frame plus its completion callback so tests
       // drive the coalescing state machine deterministically.
@@ -1384,7 +1392,6 @@ async function newProductionHarness(
       }
       switch (pipeMode) {
         case "silent":
-        case "heartbeat-backpressure":
           return;
         case "truncated":
           bootstrap.write('{"v":1,"authorityInstanceId":"pf');
@@ -2201,17 +2208,22 @@ describe("manager pipes fence the child", () => {
     expect(await h.registry.inspectAuthority(ref)).toBeNull();
   });
 
-  test("lease-frame backpressure is FATAL for the child, never silently ignored", async () => {
-    const h = await newProductionHarness({
-      pipeMode: "heartbeat-backpressure",
-      env: { PORTABLEFS_MANAGED_VCS_READY_TIMEOUT_MS: "500" },
-    });
-    // The very first lease frame is refused by the pipe; the manager
-    // terminates the child instead of letting it serve on a stale (absent)
-    // lease view. The start attempt therefore fails and nothing is adopted.
-    await expect(h.registry.ensureAuthority(ref)).rejects.toThrow();
-    expect(h.kills.length).toBeGreaterThan(0);
-    expect(await h.registry.inspectAuthority(ref)).toBeNull();
+  // ROOT FIX: write() returning false is Node's documented flow-control
+  // signal, not proof of a dead peer. Fencing on it made a momentarily busy
+  // child indistinguishable from a hung one — and under sustained write load
+  // that is exactly the child that is doing the most useful work. A child
+  // whose lease pipe reports backpressure must keep running; if it really has
+  // stopped consuming its fencing clock it receives no extensions and fences
+  // ITSELF on the capability-bound database deadline.
+  test("lease-pipe backpressure is flow control, not death: the child keeps serving", async () => {
+    const h = await newProductionHarness({ pipeMode: "heartbeat-backpressure" });
+    const authority = await h.registry.ensureAuthority(ref);
+    expect(authority.authorityInstanceId).toBeTruthy();
+    expect(h.kills).toHaveLength(0);
+    expect(await h.registry.inspectAuthority(ref)).not.toBeNull();
+    // Delivery continued: the coalescing state machine is driven by the write
+    // CALLBACK, which fires regardless of the false return.
+    expect(h.heartbeatWrites.length).toBeGreaterThan(0);
   });
 
   test("a lease-frame write ERROR is fatal for the child too", async () => {

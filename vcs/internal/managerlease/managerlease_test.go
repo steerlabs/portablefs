@@ -140,6 +140,25 @@ func expectNotClosed(t *testing.T, ch <-chan struct{}, what string) {
 
 // --- deadline grounding -----------------------------------------------------
 
+// observeSettled observes a frame and waits for the grounding it triggers to
+// complete. Grounding deliberately runs OFF the frame reader — the reader's
+// only job is to keep the lease pipe drained, at pipe speed, no matter how
+// slow the database is — so assertions about the armed deadline synchronize
+// on the grounder here instead of relying on an inline probe.
+func observeSettled(t *testing.T, g *Guard, frame Frame) error {
+	t.Helper()
+	_, settled := g.groundingSettled()
+	if err := g.observe(frame); err != nil {
+		return err
+	}
+	select {
+	case <-settled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("grounding did not settle")
+	}
+	return nil
+}
+
 // TestGroundedDeadlineUsesLeaseFactsNotFrame: the deadline is
 // capturedLocal(pre-query) + (expiresAtDbMs − dbTimeMs) − guard, from the
 // capability-bound lease-facts answer. The frame's own generous
@@ -191,7 +210,7 @@ func TestQueryDelayShrinksTheProof(t *testing.T) {
 	guard.SetProber(prober)
 
 	anchor := clock.now() // observe captures this BEFORE the query
-	if err := guard.observe(baseFrame()); err != nil {
+	if err := observeSettled(t, guard, baseFrame()); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
 	wantDeadline := anchor.Add(10*time.Second - 100*time.Millisecond)
@@ -219,7 +238,7 @@ func TestSupersededBeforePriorExpiryNeverExtends(t *testing.T) {
 	guard.now = clock.now
 	prober := newFakeProber(1_000_000, 1_010_000) // 10s remain
 	guard.SetProber(prober)
-	if err := guard.observe(baseFrame()); err != nil {
+	if err := observeSettled(t, guard, baseFrame()); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
 	guard.mu.Lock()
@@ -234,7 +253,7 @@ func TestSupersededBeforePriorExpiryNeverExtends(t *testing.T) {
 	// A valid old frame after the takeover (correct identity, next seq).
 	second := baseFrame()
 	second.Seq = 2
-	if err := guard.observe(second); err != nil {
+	if err := observeSettled(t, guard, second); err != nil {
 		t.Fatalf("a valid frame after takeover must not fence by itself: %v", err)
 	}
 	guard.mu.Lock()
@@ -265,7 +284,7 @@ func TestAmbiguousFactsNeverExtend(t *testing.T) {
 	guard.now = clock.now
 	prober := newFakeProber(1_000_000, 1_030_000)
 	guard.SetProber(prober)
-	if err := guard.observe(baseFrame()); err != nil {
+	if err := observeSettled(t, guard, baseFrame()); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
 	guard.mu.Lock()
@@ -289,7 +308,7 @@ func TestAmbiguousFactsNeverExtend(t *testing.T) {
 		prober.set(testCase.facts, testCase.err)
 		frame := baseFrame()
 		frame.Seq = int64(index + 2)
-		if err := guard.observe(frame); err != nil {
+		if err := observeSettled(t, guard, frame); err != nil {
 			t.Fatalf("%s: observe must not fence: %v", testCase.name, err)
 		}
 		guard.mu.Lock()
@@ -366,7 +385,7 @@ func TestWallClockStepsAreIrrelevant(t *testing.T) {
 	// only (expires − dbTime) matters.
 	prober := newFakeProber(999_999_999_999, 999_999_999_999+10_000)
 	guard.SetProber(prober)
-	if err := guard.observe(baseFrame()); err != nil {
+	if err := observeSettled(t, guard, baseFrame()); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
 	deadline1 := clock.now().Add(10*time.Second - 100*time.Millisecond)
@@ -381,7 +400,7 @@ func TestWallClockStepsAreIrrelevant(t *testing.T) {
 	prober.set(currentFacts(1_315_360_000_000_000, 1_315_360_000_000_000+20_000), nil)
 	second := baseFrame()
 	second.Seq = 2
-	if err := guard.observe(second); err != nil {
+	if err := observeSettled(t, guard, second); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
 	deadline2 := clock.now().Add(20*time.Second - 100*time.Millisecond)
@@ -408,7 +427,7 @@ func TestStaleTimerCallbackNeverFencesAfterValidFrame(t *testing.T) {
 	guard.SetProber(prober)
 
 	// Frame 1 arms deadline D1 (10s − guard from now).
-	if err := guard.observe(baseFrame()); err != nil {
+	if err := observeSettled(t, guard, baseFrame()); err != nil {
 		t.Fatalf("observe first: %v", err)
 	}
 
@@ -419,7 +438,7 @@ func TestStaleTimerCallbackNeverFencesAfterValidFrame(t *testing.T) {
 	prober.set(currentFacts(1_010_000, 1_040_000), nil)
 	second := baseFrame()
 	second.Seq = 2
-	if err := guard.observe(second); err != nil {
+	if err := observeSettled(t, guard, second); err != nil {
 		t.Fatalf("observe second: %v", err)
 	}
 
@@ -448,7 +467,7 @@ func TestTimerCallbackGenerationBumpsPerArm(t *testing.T) {
 	for seq := int64(1); seq <= 3; seq++ {
 		frame := baseFrame()
 		frame.Seq = seq
-		if err := guard.observe(frame); err != nil {
+		if err := observeSettled(t, guard, frame); err != nil {
 			t.Fatalf("observe %d: %v", seq, err)
 		}
 	}

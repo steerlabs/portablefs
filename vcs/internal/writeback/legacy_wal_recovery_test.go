@@ -92,6 +92,28 @@ func TestLegacyOversizedEpochStreamReachesADefiniteRelease(t *testing.T) {
 	}
 }
 
+// appliedMarkCost is the exact on-disk cost of one close-out APPLIED mark. The
+// digest is always 64 hex characters, so only the decimal watermark varies;
+// costing it at the maximum watermark is an upper bound within a few bytes.
+//
+// It is the headroom the PEAK-bounded close-out protocol requires. Barrier A
+// appends the mark BEFORE the reclaim — it has to, because digestAt cannot
+// rebuild a digest across segments that are already gone — so the transient
+// occupancy peak is used+appliedBytes, and a stream with literally zero bytes to
+// spare cannot close out at all. That is now a definite typed conflict
+// (CLOSE_OUT_UNBOUNDED) rather than a transient overshoot of the hard cap.
+func appliedMarkCost(t *testing.T) int64 {
+	t.Helper()
+	payload, err := encodeControlPayload(appliedFrame{
+		Through: ^uint64(0),
+		Digest:  fmt.Sprintf("%x", [32]byte{}),
+	})
+	if err != nil {
+		t.Fatalf("cost the close-out applied mark: %v", err)
+	}
+	return frameLen(len(payload))
+}
+
 // TestLegacyStreamAtTheCapClosesOutInsideTheBound is FINDING 5.
 //
 // A pre-upgrade stream may occupy the whole configured cap: no control reserve
@@ -99,8 +121,15 @@ func TestLegacyOversizedEpochStreamReachesADefiniteRelease(t *testing.T) {
 // APPLIED plus one RELEASE per live grant with no budget arithmetic at all, so
 // the close-out pushes the stream past the bound it claims to enforce (and, on a
 // real store at its cap, into a mid-append physical ENOSPC).
+//
+// The stream is filled to one applied-mark short of the cap rather than to the
+// last byte: that is the tightest shape the peak-bounded protocol can still
+// close out, and it is the shape under test — everything past it is the typed
+// terminal conflict, which TestLegacyCloseOutBeyondTheCapIsTerminalNotRetryable
+// and the peak tests own.
 func TestLegacyStreamAtTheCapClosesOutInsideTheBound(t *testing.T) {
 	const budget = 256 << 10
+	markCost := appliedMarkCost(t)
 	// The in-cap shape isolates FINDING 5 from FINDING 4: every epoch would be
 	// admissible today, so the ONLY thing that can push the stream past its cap
 	// is the unbudgeted certificate append itself.
@@ -127,10 +156,11 @@ func TestLegacyStreamAtTheCapClosesOutInsideTheBound(t *testing.T) {
 				grants[scope] = epoch
 				s.delegation(scope, epoch)
 			}
-			// Take the stream to the last byte the cap will give it, as a
+			// Take the stream to within one applied mark of the cap, as a
 			// pre-upgrade mutation lane could: nothing was held back for
-			// close-out because no control reserve existed.
-			s.fillToCap(budget, 1024)
+			// close-out because no control reserve existed, and this is the
+			// tightest stream a peak-bounded close-out can still resolve.
+			s.fillToCap(budget-markCost, 1024)
 			s.finish()
 
 			dir := filepath.Join(stateDir, streamDirName(1))
@@ -269,8 +299,11 @@ func TestStaleAppliedMarkDoesNotAuthorizeTheReclaim(t *testing.T) {
 	s.finish()
 
 	dir := filepath.Join(stateDir, streamDirName(1))
-	// A budget with no headroom at all forces the accommodation.
-	budget := streamFootprint(t, dir)
+	// Exactly the applied mark's room and not one byte more. That still forces
+	// the accommodation — the RELEASE frames do not fit — and it expresses the
+	// peak invariant directly: barrier A's append is the transient peak, so a
+	// close-out is possible iff the stream has at least the mark's headroom.
+	budget := streamFootprint(t, dir) + appliedMarkCost(t)
 	if streamSegmentCount(t, dir) < 3 {
 		t.Fatalf("fixture did not put the mark below the tail segment (%d segments)", streamSegmentCount(t, dir))
 	}

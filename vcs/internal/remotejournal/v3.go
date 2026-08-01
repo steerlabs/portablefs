@@ -172,12 +172,12 @@ func OpenV3(ctx context.Context, cfg Config) (*Log, error) {
 	if cfg.ClaimOperationID == "" || len(cfg.ClaimOperationID) > 200 {
 		return nil, fmt.Errorf("remotejournal: manager-issued claim operation id is required and bounded to 200 bytes")
 	}
-	pool, err := connect(ctx, cfg)
+	pool, err := connectWithLiveness(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	l := &Log{
-		pool: pool, life: ctx, cfg: cfg,
+		pool: pool, livenessPool: pool.liveness, life: ctx, cfg: cfg,
 		capability:   cfg.AuthorityCapability,
 		managerEpoch: managerEpoch,
 		runtimeSeq:   runtimeSeq,

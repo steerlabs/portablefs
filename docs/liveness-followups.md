@@ -122,6 +122,89 @@ Kernel-verified on macOS 26:
 These belong in user-facing consistency documentation as contracts, with
 radars for the API gaps.
 
+## Fixed on fix/root-architecture (round 3)
+
+- **Internal coherence refreshes are distinguished by PROVENANCE, not by a
+  clock**: the daemon's own kernel-size refresh installs a marker that is PINNED
+  for the whole of its synchronous `ftruncate(2)` and retired by sequence number
+  when that syscall returns. The marker used to carry a 5s wall-clock TTL, and
+  the resulting FSKit setattr upcall travels the frontend dispatcher, where
+  metadata admission can park it far longer than that; when it did, the handler
+  reinterpreted the daemon's own no-op as an APPLICATION truncate and sent it to
+  the authority, destroying every byte a concurrent writer had appended past the
+  sampled size. Elapsed time now cannot decide provenance at all, and a pending
+  internal refresh BYPASSES mutation admission outright: it publishes state the
+  authority has already applied, so it neither caused the backlog nor can help
+  drain it.
+- **One dispatcher-ordering contract for every daemon request**: deadline →
+  pre-lock admission (holding nothing) → publication membership and the frontend
+  mirrors → nonblocking revalidate + mutate. Mutation admission used to run
+  INSIDE `lockFrontendRequest`, so a metadata-lane park held the frontend
+  serialization lock, the name stripes and a per-handle frontend RLock — and a
+  `close(2)` needing that handle gate exclusively queued behind it. The unwind
+  obeys the same contract: it drops the mirrors and suspends the request out of
+  the publication set before re-admitting.
+- **Semantic authority diversions are classified pre-lock**: link,
+  unlink-while-open, rename-over-an-open-destination and setattr on a
+  hard-linked inode are authority-only by SEMANTICS, not by path coverage, and
+  they now force the authority lane in the classifier (`MutationIntent`).
+  Structurally, `beginAuthorityMutation` answers `ErrLaneChanged` for any
+  classified operation whose resolved lane is delegated, and every remaining
+  under-lock release goes through one lane-aware gate, so no blocking drain is
+  reachable beneath `nsMu`, a name stripe or a handle lock by any route.
+- **The live control API is a frontend**: control mutations take the operation
+  deadline and their pre-lock admission before `lockExternalNamespaceWrite`, and
+  the locked region does nonblocking revalidation and the mutation only. It used
+  to hold the mount-wide EXCLUSIVE namespace gate across a transition claim and a
+  delegation release, with the raw HTTP context and no bound — which also
+  inverted the one global lock order the rest of the daemon depends on.
+- **FUSE writes share one absolute deadline across every unwind pass**:
+  `WithOperationDeadline` is installed once in `fuseNode.Write`, outside the
+  loop. `AdmitWrite` installs it idempotently, so a loop handing it a
+  deadline-free context got a fresh 50s bound per pass and the passes composed
+  past the kernel ceiling.
+- **Legacy close-out is PEAK-bounded**: the reclaim path's preconditions now
+  include the transient peak at the marker barrier (`used + appliedBytes <=
+  budget`), decided before a single byte is written, and a physical ENOSPC from
+  any close-out append becomes the typed definite `CLOSE_OUT_UNBOUNDED` conflict
+  instead of an `errRetryable` that failed every attach forever with the grants
+  stranded. Mark-before-reclaim ordering is unchanged and load-bearing (`digestAt`
+  cannot rebuild a digest across segments that are already gone).
+- **A release drains its OWN scope's tail, not the whole stream**:
+  `finishRelease` targeted `w.LastSeq()` — the last sequence of the shared
+  stream — so releasing an already-applied metadata scope waited behind every
+  byte another scope had appended since. With the data lane deliberately holding
+  a backlog at its credit setpoint that was worth 25-30s per transition, and
+  `Engine.admit` takes exactly that transition whenever a mutation lands outside
+  the current grant, i.e. whenever a workload walks into a fresh directory.
+  Measured live: cold-scope mkdir/rmdir/open_creat blocked 26.6s/27.5s/48.7s,
+  each returning precisely when the whole backlog hit zero. The flusher already
+  indexes pending records by scope, so the drain target is now that scope's own
+  last unshipped sequence (`flusher.scopeTail`), and zero when it has none.
+- **A release drain reaches a verdict**: `finishRelease` runs detached under the
+  engine lifetime context, and `drainThrough` had no bound of its own, so an
+  authority that stopped applying left the scope `draining` forever with
+  `drainErr` never set — the one state with no exit. `drainThrough` now consults
+  the watchdog (`StallVerdict`), returns `ErrUplinkStalled`, and the scope leaves
+  draining with a recorded reason that later callers get as a typed failure
+  instead of an unbounded wait. `DelegationStatus` reports `Draining` and
+  `DrainError` as mutually exclusive: in flight, or answered.
+- **Forced detach fences before it locks**: `attach.detach` took
+  `frontendSerial` and `nsMu` unconditionally, ahead of the `force` branch, so
+  `umount --force` queued behind the very work it exists to abandon (observed
+  live: one 12-minute nsMu writer with ~100 frontend goroutines behind it, five
+  consecutive force-unmount timeouts, recovery only by killing the daemon). The
+  forced path now parks the tail and fences first and takes the namespace locks
+  only for the terminal transition. Both unmount paths also name ONE next action
+  for a prepared detach instead of two unrelated refusals.
+- **One shared stall verdict**: `Engine.StallVerdict` publishes the flusher
+  watchdog's live state, and both admission gates consult it at budget expiry
+  instead of inferring a verdict from copied duration constants. The old
+  `30 + 5 < 40` argument does not prove the verdict — `advance` resets
+  `lastProgress`, so a late advance pushes the earliest possible declaration well
+  past the budget — and the data lane's expiry used to divert into what could be
+  a dead far end on the strength of it.
+
 ## Fixed on fix/root-architecture
 
 - **One global lock order for every path-bearing transition** (closes the old

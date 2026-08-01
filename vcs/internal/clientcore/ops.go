@@ -288,6 +288,10 @@ func (v *Volume) GetattrOpenHandle(ctx context.Context, path string, n *NodeStat
 	if ino == 0 {
 		return fsproto.Attr{}, fsproto.ENOENT
 	}
+	if a, ok := v.cachedHandleAttr(path, ino); ok {
+		v.observeHardlink(path, a)
+		return a, fsproto.OK
+	}
 	resume := v.suspendAuthorityPublication(ctx)
 	a, st, err := v.client.GetattrHandleContext(ctx, path, ino)
 	resume()
@@ -298,6 +302,46 @@ func (v *Volume) GetattrOpenHandle(ctx context.Context, path string, n *NodeStat
 		return fsproto.Attr{}, st
 	}
 	return *a, fsproto.OK
+}
+
+// cachedHandleAttr answers a HANDLE-addressed getattr from the version-gated
+// attribute cache — but only when the cached entry PROVES it describes the very
+// inode the descriptor holds.
+//
+// The shared-lane handle read used to bypass the cache entirely, and for a real
+// reason: an open descriptor must report the object it holds, while the cache is
+// keyed by NAME, and a name can be rebound under a live descriptor. Bypassing
+// was the conservative answer to that, and it cost a full authority round trip
+// for every getattr(2) on an open file — the dominant term in the measured
+// seven-getattr create sequence.
+//
+// The identity check is the exact answer the bypass was approximating. A served
+// entry has to satisfy BOTH invariants, and each is checked against the thing
+// that actually establishes it:
+//
+//   - COHERENCE comes from the version anchor, unchanged: the entry is served
+//     only while its version is not behind the highest one the invalidation
+//     stream has recorded for the path, so any peer mutation to it evicts.
+//   - IDENTITY comes from the stable ino: the entry is served only when it names
+//     the same inode the descriptor is bound to. A rename-over rebinds the name
+//     to a different inode — and stamps a new version on it, so the entry is
+//     already gone; the ino comparison is what makes that argument independent
+//     of the stream's timing rather than reliant on it.
+//
+// A miss is a miss: the caller issues the handle-addressed read it always did.
+func (v *Volume) cachedHandleAttr(path string, ino uint64) (fsproto.Attr, bool) {
+	if ino == 0 {
+		return fsproto.Attr{}, false
+	}
+	gen, curVer, valid := v.VersionCache.CacheState(path)
+	if gen == 0 || !valid {
+		return fsproto.Attr{}, false
+	}
+	e, ok := v.AttrCache.Get(gen, curVer, path)
+	if !ok || !e.Exists || e.Attr.Ino != ino {
+		return fsproto.Attr{}, false
+	}
+	return e.Attr, true
 }
 
 func (v *Volume) getattr(ctx context.Context, permit *readView, path string, n *NodeState) (fsproto.Attr, Status) {
@@ -931,6 +975,10 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		return 0, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if oi := n.Orphan(); oi != 0 {
 		cnt, st, err := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
@@ -940,7 +988,7 @@ func (v *Volume) Write(ctx context.Context, path string, n *NodeState, off int64
 		return cnt, st
 	}
 	if v.wb != nil && v.isHardlink(n) {
-		if st, unwind := v.releaseHardlinkScopesResolved(ctx, n, path); unwind {
+		if st, unwind := v.releaseHardlinkScopesResolved(ctx, []*NodeState{n}, path); unwind {
 			return 0, st
 		}
 	}
@@ -1074,6 +1122,10 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		return 0, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if oi := n.Orphan(); oi != 0 {
 		cnt, _, st, err := v.client.AppendOrphanContext(v.authorityWaitContext(ctx), oi, data)
@@ -1083,7 +1135,7 @@ func (v *Volume) WriteAppend(ctx context.Context, path string, n *NodeState, leg
 		return cnt, st
 	}
 	if v.wb != nil && v.isHardlink(n) {
-		if st, unwind := v.releaseHardlinkScopesResolved(ctx, n, path); unwind {
+		if st, unwind := v.releaseHardlinkScopesResolved(ctx, []*NodeState{n}, path); unwind {
 			return 0, st
 		}
 	}
@@ -1223,6 +1275,10 @@ func (v *Volume) createCommon(ctx context.Context, path string, mode uint32, exc
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	mode = modebits.CleanUnix(mode)
 	if v.wb != nil {
@@ -1300,6 +1356,10 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	mode = modebits.CleanUnix(mode)
 	if v.wb != nil {
@@ -1348,6 +1408,10 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 		return fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	// A remove's park-vs-destroy decision at the authority reads OUR open
 	// holds too: release any zero-ref retained registration on the target
@@ -1357,8 +1421,10 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 	// paths below own those.
 	v.openReg.ReleaseNameChange(path, authHandleIno(child))
 	if v.wb != nil && v.isHardlink(child) {
-		if err := v.releaseHardlinkScopes(ctx, []*NodeState{child}, path); err != nil {
-			return statusErr(err)
+		if st, unwind := v.releaseHardlinkScopesResolved(
+			ctx, []*NodeState{child}, path,
+		); unwind {
+			return st
 		}
 	}
 	if v.wb != nil && !v.isHardlink(child) {
@@ -1372,8 +1438,8 @@ func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Stat
 			child.mu.Unlock()
 		}
 		if openHandle && v.wb.Covers(path) {
-			if err := v.wb.ReleaseFor(ctx, path); err != nil {
-				return statusErr(err)
+			if st, unwind := v.releaseScopesResolved(ctx, path); unwind {
+				return st
 			}
 		} else if !openHandle {
 			res, handled, err := v.wb.Remove(ctx, path)
@@ -1505,6 +1571,10 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 		return fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	sameAuthorityInode := sameAuthorityIdentity(src, dst)
 	// Rename-over reads OUR open holds on the replaced destination the same
@@ -1518,8 +1588,10 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 		v.openReg.ReleaseNameChange(newp, authHandleIno(dst))
 	}
 	if v.wb != nil && (sameAuthorityInode || v.isHardlink(src) || v.isHardlink(dst)) {
-		if err := v.releaseHardlinkScopes(ctx, []*NodeState{src, dst}, oldp, newp); err != nil {
-			return statusErr(err)
+		if st, unwind := v.releaseHardlinkScopesResolved(
+			ctx, []*NodeState{src, dst}, oldp, newp,
+		); unwind {
+			return st
 		}
 	}
 	if v.wb != nil && !sameAuthorityInode && !v.isHardlink(src) && !v.isHardlink(dst) {
@@ -1533,8 +1605,8 @@ func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeSt
 			unlockTwo(src, dst)
 		}
 		if openDst && (v.wb.Covers(oldp) || v.wb.Covers(newp)) {
-			if err := v.wb.ReleaseFor(ctx, oldp, newp); err != nil {
-				return statusErr(err)
+			if st, unwind := v.releaseScopesResolved(ctx, oldp, newp); unwind {
+				return st
 			}
 		} else if !openDst {
 			res, handled, err := v.wb.Rename(ctx, oldp, newp, func() {
@@ -1673,6 +1745,10 @@ func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if v.wb != nil {
 		res, handled, err := v.wb.Symlink(ctx, path, target)
@@ -1724,10 +1800,16 @@ func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (f
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if v.wb != nil {
-		if err := v.releaseHardlinkScopes(ctx, []*NodeState{src}, oldp, newp); err != nil {
-			return fsproto.Attr{}, statusErr(err)
+		if st, unwind := v.releaseHardlinkScopesResolved(
+			ctx, []*NodeState{src}, oldp, newp,
+		); unwind {
+			return fsproto.Attr{}, st
 		}
 	}
 	var (
@@ -1815,13 +1897,19 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		return fsproto.Attr{}, fsproto.EIO
 	}
 	defer v.endMutation()
+	// This operation's own mutation replies carry the post-op attributes; they
+	// install LAST, after every cache step below (postattrs.go).
+	ctx = v.withPostAttrs(ctx)
+	defer v.installPostAttrs(ctx)
 
 	if oi := n.Orphan(); oi != 0 {
 		return v.setattrOrphan(ctx, oi, req)
 	}
 	if v.wb != nil && v.isHardlink(n) {
-		if err := v.releaseHardlinkScopes(ctx, []*NodeState{n}, path); err != nil {
-			return fsproto.Attr{}, statusErr(err)
+		if st, unwind := v.releaseHardlinkScopesResolved(
+			ctx, []*NodeState{n}, path,
+		); unwind {
+			return fsproto.Attr{}, st
 		}
 	}
 	if v.wb != nil && !v.isHardlink(n) {
@@ -1926,14 +2014,31 @@ func (v *Volume) Setattr(ctx context.Context, path string, n *NodeState, req Set
 		}
 		v.recent.record(path)
 	}
-	a, st, err := v.client.GetattrHandleContext(authorityCtx, path, handleIno)
+	// The mutations above already reported the inode's post-op attributes at
+	// their ordered apply positions — the setattr reply IS the stat. Re-reading
+	// them was a full authority round trip for state this mount had just
+	// written, and it was strictly WEAKER than what it replaced: a separate
+	// getattr samples a later moment, so a peer mutation landing in between
+	// made the returned attributes disagree with the version the reply was
+	// stamped with. Only a name that no mutation here stamped (an authority
+	// without the capability, or a wire path a peer renamed off this inode)
+	// still needs the handle-addressed read.
+	post, reported := v.latestPostAttr(authorityCtx, path)
+	a := &post
+	if !reported {
+		var st Status
+		var err error
+		a, st, err = v.client.GetattrHandleContext(authorityCtx, path, handleIno)
+		if err != nil {
+			n.mu.Unlock()
+			return fsproto.Attr{}, fsproto.EIO
+		}
+		if st != fsproto.OK {
+			n.mu.Unlock()
+			return fsproto.Attr{}, st
+		}
+	}
 	n.mu.Unlock()
-	if err != nil {
-		return fsproto.Attr{}, fsproto.EIO
-	}
-	if st != fsproto.OK {
-		return fsproto.Attr{}, st
-	}
 	v.observeHardlink(path, *a)
 	if v.isHardlink(n) {
 		v.invalidateRelatedInodes([]uint64{n.AuthorityIno()}, path, 0, 0, false)

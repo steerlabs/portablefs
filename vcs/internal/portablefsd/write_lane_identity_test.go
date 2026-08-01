@@ -60,7 +60,7 @@ func TestOrphanedHandleWriteIsNotChargedAgainstASaturatedDataLane(t *testing.T) 
 	// queues and receives nothing for the whole admission budget.
 	done := make(chan int32, 1)
 	go func() {
-		_, eno := f.a.write(context.Background(), &pfslocal.WriteRequest{
+		_, eno := admittedWrite(context.Background(), f.a, &pfslocal.WriteRequest{
 			Handle: delegatedHandle,
 			Data:   make([]byte, 64<<10),
 		})

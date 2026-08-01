@@ -50,37 +50,48 @@ import (
 // that into ErrUplinkStalled reports a dead far end for a link that is merely
 // slower than one wait cap. An application then sees EIO on a healthy mount.
 //
-// The proof chain, entirely between named constants:
+// It used to claim its own arithmetic PROVED the verdict:
 //
-//	(1) writeback.noProgressWindow      = 30s   the watchdog's verdict window
-//	(2) writeback.creditWaitCap         =  5s   one AcquireDataCredit call
-//	(3) creditAdmissionBudget           = 40s   this constant
-//	(4) clientcore.volumeBarrierTimeout = 60s   one fsync/unmount drain attempt
-//	(5) the FSKit / FUSE operation ceiling     ~60s and 120s respectively
+//	writeback.noProgressWindow (30s) + writeback.creditWaitCap (5s) = 35s < 40s
 //
-//	(1) + (2) = 35s  <  (3) = 40s
-//	    A genuinely stalled uplink is DECLARED stalled strictly before this
-//	    budget can expire. An acquisition call still running when the watchdog's
-//	    window closes reaches its own cap within one creditWaitCap of it, and
-//	    that cap consults the watchdog — which by then holds the verdict. So the
-//	    budget can never be the thing that reports a stall; the watchdog is, and
-//	    the frontend only relays it.
+// read as "a genuinely stalled uplink is DECLARED stalled strictly before this
+// budget can expire", which made expiry mean "healthy but slow" and licensed an
+// unconditional divert to the authority lane. It proves no such thing. The
+// watchdog's window runs from the last WATERMARK ADVANCE — the flusher resets it
+// on every advance — not from the moment this write began to wait. A write that
+// parks at t0 and sees the authority advance at t39 reaches 40s with the
+// watchdog unable to declare before ~t69, so expiry is SILENT about the far end.
+// It therefore no longer licenses anything: the expiry arm asks
+// writeback.Engine.StallVerdict for the live verdict, and a stalled one is
+// relayed as ErrUplinkStalled rather than diverting a release-and-RPC into a far
+// end that is applying nothing (see divertAfterCreditBudget).
 //
-//	(3) = 40s  <  (4) = 60s  and  <  (5)
-//	    The budget and the reply it produces both land inside every enclosing
-//	    bound: the barrier a concurrent fsync/unmount is running under, and the
-//	    kernel's own ceiling on the operation it is waiting for. On Linux/FUSE
-//	    an uninterruptible request past hung_task_timeout_secs becomes a kernel
-//	    log incident; on macOS/FSKit the reply holds the extension's write
-//	    callback and the kernel's vnode open for its whole duration.
+// What this constant still carries is the BOUND, and the bound is what composes:
 //
-// Reaching the budget therefore means one specific thing: the uplink made
-// durable progress inside the last window, and this write still collected no
-// delegated credit. The truthful answer to that is not an error at all — it is
-// the OTHER lane. The authority lane consumes no stream budget, so it is
-// admitted immediately, and the write SUCCEEDS rather than failing an
-// application over a queue it lost.
-const creditAdmissionBudget = 40 * time.Second
+//	(1) creditAdmissionBudget               = 40s   this budget
+//	(2) clientcore.operationAdmissionBudget = 50s   ONE mutation's deadline
+//	(3) clientcore.volumeBarrierTimeout     = 60s   one fsync/unmount drain
+//	(4) the FSKit / FUSE operation ceiling        ~60s and 120s respectively
+//
+//	(1) < (2) < (3) <= (4)
+//	    The credit stage is a SUB-deadline of the operation's, so whatever it
+//	    leaves over is exactly what the authority-lane diversion and the release
+//	    it needs run inside — they cannot compose past (2). And the reply lands
+//	    inside the barrier a concurrent fsync/unmount is running under and inside
+//	    the kernel's own ceiling on the operation it is waiting for. On
+//	    Linux/FUSE an uninterruptible request past hung_task_timeout_secs becomes
+//	    a kernel log incident; on macOS/FSKit the reply holds the extension's
+//	    write callback and the kernel's vnode open for its whole duration.
+//
+// Reaching the budget therefore means one specific thing, and only it: this
+// write collected no delegated credit inside the bound. Whether the far end is
+// alive is a separate question with a separate owner — and when the answer is
+// yes, it is not an error at all but the OTHER lane, which consumes no stream
+// budget, is admitted immediately, and lets the write SUCCEED rather than
+// failing an application over a queue it lost.
+//
+// A var so failure-shape tests can compress it; production never changes it.
+var creditAdmissionBudget = 40 * time.Second
 
 // AdmitWrite is the pre-lock classifier. Callers MUST invoke it BEFORE taking
 // any namespace, inode or handle lock, and MUST pass the returned context to
@@ -233,9 +244,9 @@ func (v *Volume) admitDelegatedLane(
 			return fail(err)
 		case admitCtx.Err() != nil && ctx.Err() == nil:
 			// The credit budget expired while the operation deadline still has
-			// room. Divert to the authority lane — under the SAME deadline, so
-			// the release it needs cannot push the operation past the bound.
-			return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want)
+			// room. Expiry bounds the wait; it does not say whether the far end
+			// is alive, so ask before diverting into it.
+			return v.divertAfterCreditBudget(ctx, cancelDeadline, path, n, want)
 		default:
 			return fail(err)
 		}
@@ -243,9 +254,36 @@ func (v *Volume) admitDelegatedLane(
 			return fail(ctx.Err())
 		}
 		if admitCtx.Err() != nil {
-			return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want)
+			return v.divertAfterCreditBudget(ctx, cancelDeadline, path, n, want)
 		}
 	}
+}
+
+// divertAfterCreditBudget is the credit stage's ONE expiry outcome, so the
+// stalled-vs-slow split cannot drift between the two points the admission loop
+// reaches it from.
+//
+// The divert itself is unchanged and still the right answer for a live uplink:
+// the authority lane consumes no stream budget, and it runs under the SAME
+// operation deadline, so the release it needs cannot push the operation past the
+// bound. What is new is that it is no longer taken on faith. The budget's expiry
+// never proved the uplink healthy (see creditAdmissionBudget), and diverting on
+// a stalled one sends this write's release and RPC into a far end that is
+// applying nothing. So the engine's watchdog is consulted, and a stall verdict is
+// relayed unchanged — the same EIO-class answer every other lane gives for a
+// dead uplink, and still the only stall this frontend ever reports.
+func (v *Volume) divertAfterCreditBudget(
+	ctx context.Context,
+	cancelDeadline context.CancelFunc,
+	path string,
+	n *NodeState,
+	want int,
+) (context.Context, int, func(), error) {
+	if v.wb.StallVerdict().Stalled {
+		cancelDeadline()
+		return ctx, 0, func() {}, writeback.ErrUplinkStalled
+	}
+	return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want)
 }
 
 // admitAuthorityLane resolves the authority lane and PAYS FOR IT out here: it

@@ -24,10 +24,11 @@ package writeback
 //     frontend classifier BEFORE any namespace lock, exactly where
 //     AcquireDataCredit is called, and it blocks on the ONE event that frees
 //     metadata bytes — the authority applying the backlog — never on a lock.
-//   - ErrUplinkStalled comes from the watchdog and nowhere else. The frontend
-//     never synthesizes a stall verdict from elapsed time; the bound below is
-//     proved against the watchdog's window so a genuinely dead uplink is
-//     DECLARED dead strictly before this budget can expire.
+//   - ErrUplinkStalled comes from the watchdog and nowhere else. The gate never
+//     synthesizes a stall verdict from elapsed time: when its budget expires it
+//     ASKS (Engine.StallVerdict) rather than inferring, because elapsed time
+//     proves nothing here — the watchdog's window runs from the last watermark
+//     advance, not from the moment this mutation began to wait.
 //   - ENOSPC stays definite. An operation larger than the lane at any occupancy
 //     can never fit and is refused immediately, at every occupancy, exactly as
 //     the data lane refuses an oversized write.
@@ -67,24 +68,34 @@ var errMetadataHeadroom = fmt.Errorf(
 )
 
 // metadataAdmissionBudget bounds the TOTAL time one namespace mutation spends
-// in pre-lock metadata admission.
+// in pre-lock metadata admission. It bounds the WAIT. It does not classify the
+// OUTCOME, and keeping those two jobs apart is this gate's whole contract with
+// the watchdog.
 //
-// It is the same constant, proved the same way, as clientcore's
-// creditAdmissionBudget:
+// It used to claim both. The comment here restated clientcore's chain —
 //
 //	noProgressWindow (30s) + creditWaitCap (5s) = 35s  <  40s
 //
-// A genuinely stalled uplink is DECLARED stalled by the flusher's watchdog
-// strictly before this budget can expire, so the budget can never be the thing
-// that reports a stall — an admission call still running when the watchdog's
-// window closes reaches its own cap within one creditWaitCap of it, and that
-// cap consults the watchdog, which by then holds the verdict.
+// — and read it as "a genuinely stalled uplink is DECLARED stalled strictly
+// before this budget can expire", which made expiry mean "the uplink is healthy
+// and the namespace stream simply outran it". The arithmetic is right and the
+// conclusion does not follow. The watchdog's window is measured from the last
+// WATERMARK ADVANCE (flusher.advance resets lastProgress), not from the moment
+// this mutation started waiting: a mutation that parks at t0 and sees the
+// authority advance at t39 reaches this budget at t40 with the watchdog unable
+// to declare anything before ~t69. Expiry proves neither a stall nor progress.
 //
-// Unlike the data lane, expiry here has no second lane to divert to: a
-// namespace mutation that cannot reach the WAL takes the authority lane by
-// falling through, which the caller decides, not this gate. Expiry therefore
-// surfaces the caller's own deadline unchanged (an interrupted operation),
-// which is a definite outcome inside every enclosing bound.
+// So the budget keeps the job it can do — the pre-lock wait is bounded, and both
+// it and the reply it produces land inside every enclosing bound — and the
+// CLASSIFICATION at expiry is asked of the one thing that can answer it,
+// Engine.StallVerdict (see metadataAdmissionExpired). Unlike the data lane there
+// is still no second lane to divert to: a namespace mutation that cannot reach
+// the WAL takes the authority lane by falling through, which the caller decides,
+// not this gate. Expiry is therefore a definite outcome either way — the
+// EIO-class stall the watchdog actually holds, or the deadline the caller's own
+// operation bound already promised.
+//
+// A var so failure-shape tests can compress it; production never changes it.
 var metadataAdmissionBudget = 40 * time.Second
 
 // metadataAdmissionCost is the headroom one namespace mutation must find
@@ -123,10 +134,12 @@ func metadataAdmissionCostFor(budget int64) int64 {
 //
 //   - nil: the metadata lane has headroom for one maximum-size frame. The
 //     mutation proceeds and reserves exactly its own size under e.mu.
-//   - ErrUplinkStalled: the flusher's watchdog declared the far end dead.
-//     EIO-class, relayed, never synthesized here.
-//   - a context error: the caller's own deadline or cancellation, including the
-//     metadata admission budget.
+//   - ErrUplinkStalled: the flusher's watchdog declared the far end dead —
+//     either while the gate was waiting, or when the gate reached its budget and
+//     ASKED (Engine.StallVerdict). EIO-class, relayed, never synthesized here.
+//   - a context error: the caller's own deadline or cancellation, or the
+//     metadata admission budget expiring with the watchdog reporting a live
+//     uplink.
 //
 // It NEVER produces ENOSPC. ENOSPC is a definite claim about a specific
 // operation — "this can never fit, at any occupancy" — and the gate does not
@@ -168,14 +181,9 @@ func (e *Engine) AdmitMetadataMutation(ctx context.Context) error {
 		// re-evaluate) on an advance, its own cap, or a healthy quiet link.
 		if err := e.credits.waitForApplied(admitCtx); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-				// The metadata admission budget expired while the caller's own
-				// deadline still has room. By the proof above the uplink is
-				// healthy — the namespace stream simply outran it — so report
-				// the budget as the definite deadline it is.
-				return fmt.Errorf(
-					"writeback: metadata admission budget expired: %w",
-					context.DeadlineExceeded,
-				)
+				// The budget expired while the caller's own deadline still has
+				// room. Ask the watchdog what that means; do not assume.
+				return e.metadataAdmissionExpired(context.DeadlineExceeded)
 			}
 			return err
 		}
@@ -183,11 +191,37 @@ func (e *Engine) AdmitMetadataMutation(ctx context.Context) error {
 			return err
 		}
 		if err := admitCtx.Err(); err != nil {
-			return fmt.Errorf(
-				"writeback: metadata admission budget expired: %w", err,
-			)
+			return e.metadataAdmissionExpired(err)
 		}
 	}
+}
+
+// metadataAdmissionExpired turns budget expiry into the outcome the LIVE
+// watchdog verdict justifies.
+//
+// It is the only place this file names an expiry outcome, so the stalled-vs-slow
+// split cannot drift between the two points the admission loop can reach it
+// from — and it is asked, never derived. cause is the expiry the loop observed;
+// it survives in the healthy answer so the caller still sees the deadline class
+// its own bound promised.
+func (e *Engine) metadataAdmissionExpired(cause error) error {
+	verdict := e.StallVerdict()
+	if verdict.Stalled {
+		// Unreachable before this arm consulted the verdict: it assumed its own
+		// arithmetic had already proved the uplink healthy, so a mutation that
+		// waited out a genuinely dead far end was answered an interrupted
+		// operation instead of the EIO-class truth.
+		return fmt.Errorf(
+			"writeback: metadata admission budget expired and the watchdog holds "+
+				"a stall verdict: %w", ErrUplinkStalled,
+		)
+	}
+	return fmt.Errorf(
+		"writeback: metadata admission budget expired; the watchdog reports a "+
+			"live uplink (%s before it could declare a stall), so this is the "+
+			"budget's own deadline and not a stall: %w",
+		verdict.Remaining, cause,
+	)
 }
 
 // metadataLaneFull answers the gate's question without charging anything and

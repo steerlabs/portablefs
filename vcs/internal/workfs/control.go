@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -314,6 +315,29 @@ type MutationResult struct {
 	Offset    int64
 	Ino       uint64
 	OrphanIno uint64
+	// Post is the post-op state of every NAME this record's version stamp
+	// covers — the mutated name (or its absence) and, for a namespace
+	// mutation, the parent directory. It is captured at the record's ordered
+	// apply position under the SAME lock hold that assigned Version, so the
+	// attributes and their coherence anchor are one atomic observation: a
+	// concurrent mutation is either ordered before this one (and visible in
+	// these attributes) or after it (and carries a strictly greater version).
+	//
+	// It is NOT part of the durable exact outcome: a duplicate replay carries
+	// only the essential fields, and its client re-stats. Post is a
+	// fresh-execution observation, never a replayed fact.
+	Post []PostAttr
+}
+
+// PostAttr is one affected name's post-op state. Exists=false is a POSITIVE
+// statement of absence at the record's ordered position (the name the record
+// removed or renamed away), not "unknown": it is emitted only when the parent
+// directory's version was stamped by the same record, which is the anchor a
+// cached negative is gated on.
+type PostAttr struct {
+	Path   string
+	Exists bool
+	Info   os.FileInfo // nil when Exists is false
 }
 
 // MutateEnv commits one exact-once mutation as one managed journal row and

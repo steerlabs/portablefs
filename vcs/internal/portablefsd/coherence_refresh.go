@@ -35,26 +35,66 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
+// expectedTruncate marks one kernel-size refresh the daemon is issuing through
+// its own mount, so the setattr handler can recognise the resulting FSKit
+// upcall as coherence bookkeeping instead of an application truncate.
+//
+// The distinction is the whole point, and it must be a fact about PROVENANCE,
+// never about elapsed time. A daemon-originated refresh and a user truncate to
+// the same size are byte-identical on the wire; the only thing that separates
+// them is that this process issued one of them and is still inside the
+// ftruncate(2) that produced it. So the marker is PINNED for exactly that
+// window (see pinned below) and is retired by the refresh that installed it.
 type expectedTruncate struct {
-	itemID   uint64
-	size     int64
+	itemID uint64
+	size   int64
+	// pinned is true for the whole of the daemon's own synchronous ftruncate.
+	//
+	// ftruncate(2) is synchronous with its VNOP_SETATTR upcall, but the upcall
+	// is not synchronous with the daemon's ANSWER to it: the request travels the
+	// frontend dispatcher, where metadata-lane backpressure can pace it for up
+	// to a full admission budget. A wall-clock TTL therefore decided the
+	// question "is this the daemon's own refresh?" using a quantity that has
+	// nothing to do with provenance — and when admission outran the TTL the
+	// handler reclassified the daemon's own no-op as an APPLICATION truncate and
+	// sent it to the authority, destroying every byte a concurrent local write
+	// had appended past the sampled size.
+	//
+	// While pinned, the marker's validity is exactly "the refresh that installed
+	// it has not returned yet", which is the true statement, is unforgeable by
+	// anything outside applyKernelRefresh, and cannot be outrun by any amount of
+	// admission latency.
+	pinned bool
+	// deadline bounds an UNPINNED marker only. No marker should ever be found
+	// unpinned — applyKernelRefresh retires its own on every exit path — so this
+	// is a sweeper for a marker that outlived its refresh through a path that
+	// does not exist today, never the primary decision.
 	deadline time.Time
+	// seq identifies this exact marker, so the refresh that installed it retires
+	// that one and not a successor installed for the same path in between.
+	seq uint64
 }
 
 const (
 	// refreshCoalesce absorbs a burst of remote-write invalidations for one
 	// file into a single kernel refresh.
 	refreshCoalesce = 25 * time.Millisecond
-	// truncateNoteTTL bounds how long a marked refresh may stay pending. An
-	// application truncate to the exact same (already current) size inside
-	// this window is also consumed — its only observable loss is an mtime
-	// bump the remote edit has already superseded.
-	truncateNoteTTL = 5 * time.Second
 	// staleSampleRetries bounds how long a refresh waits for the authority
 	// sample to catch up with state the daemon has already seen (see
 	// refreshLocalSample). 40 × refreshCoalesce ≈ 1s, comfortably past a flush.
 	staleSampleRetries = 40
 )
+
+// truncateNoteTTL is the sweeper bound on an UNPINNED marker. The pin (see
+// expectedTruncate.pinned) is what actually decides whether a request is the
+// daemon's own refresh; this only stops a marker that somehow outlived its
+// refresh from lingering. An application truncate to the exact same (already
+// current) size inside a pinned window is still consumed — its only observable
+// loss is an mtime bump the remote edit has already superseded.
+//
+// A var so failure-shape tests can compress it and drive the case where a
+// request's admission outlasts the TTL; production never changes it.
+var truncateNoteTTL = 5 * time.Second
 
 type refreshSampleOutcome uint8
 
@@ -301,9 +341,16 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 	if a.expectedTruncates == nil {
 		a.expectedTruncates = map[string]expectedTruncate{}
 	}
+	a.expectedTruncateSeq++
+	// PINNED from here until the ftruncate below returns. That window is the
+	// exact extent of the daemon's own syscall, and while it is open no amount
+	// of admission latency in the frontend dispatcher can turn this request into
+	// an application truncate (see expectedTruncate.pinned).
 	note := expectedTruncate{
 		itemID: rec.item.ItemID, size: size,
+		pinned:   true,
 		deadline: time.Now().Add(truncateNoteTTL),
+		seq:      a.expectedTruncateSeq,
 	}
 	if current := a.items[rec.item.ItemID]; current != nil &&
 		current.item.ItemGeneration == rec.item.ItemGeneration {
@@ -316,15 +363,13 @@ func (a *attach) applyKernelRefresh(mount, p string, rec *itemRecord, size int64
 		refresh = a.testRefreshKernelFile
 	}
 	outcome, err := refresh(mount, p, expectedKernelItemID, size)
-	// ftruncate is synchronous with its FSKit setattr callback. If that
-	// callback did not consume this exact note (for example, the vnode size
-	// already matched and only page invalidation was needed), retire it now;
-	// a later application truncate must never match a stale daemon marker.
-	a.mu.Lock()
-	if current, exists := a.expectedTruncates[p]; exists && current == note {
-		delete(a.expectedTruncates, p)
-	}
-	a.mu.Unlock()
+	// The syscall has returned, so the pin's premise no longer holds. If the
+	// setattr callback did not consume this exact note (for example, the vnode
+	// size already matched and only page invalidation was needed), retire it
+	// now; a later application truncate must never match a stale daemon marker.
+	// Identity is the sequence number, so a successor installed for the same
+	// path by a concurrent pass is never retired by this one.
+	a.retireExpectedTruncate(p, note.seq)
 	if outcome != kernelRefreshApplied {
 		// A failed safe-open means the name disappeared, changed identity,
 		// became a symlink, or is inaccessible. Do not spin on that stale
@@ -1218,6 +1263,74 @@ func refreshLocalSampleAuthorityContext(
 	}
 }
 
+// retireExpectedTruncate removes the marker installed under seq, if it is still
+// the marker bound to p. Identity is the sequence number: a successor installed
+// for the same path by a concurrent refresh pass belongs to that pass.
+func (a *attach) retireExpectedTruncate(p string, seq uint64) {
+	a.mu.Lock()
+	if current, exists := a.expectedTruncates[p]; exists && current.seq == seq {
+		delete(a.expectedTruncates, p)
+	}
+	a.mu.Unlock()
+}
+
+// expectedTruncateLive reports whether note is still a valid claim of
+// daemon provenance at now.
+//
+// A PINNED note is valid unconditionally: the refresh that installed it has not
+// returned, so the request being classified against it can only be that
+// refresh's own upcall. Elapsed time says nothing about provenance and must
+// never be allowed to overrule it — that reinterpretation is exactly how an
+// internal refresh became a real truncate of a file another writer had extended.
+func expectedTruncateLive(note expectedTruncate, now time.Time) bool {
+	return note.pinned || now.Before(note.deadline)
+}
+
+// matchesExpectedTruncate reports whether req is a pure size set that could be
+// the daemon's own refresh. Anything touching mode, ownership or flags is a
+// real application setattr: the daemon's refresh never carries one.
+func matchesExpectedTruncate(req *pfslocal.SetAttrRequest) bool {
+	// SetFlags disqualifies the request like any other real attribute group:
+	// the daemon's own refresh never carries one, so a request that does is a
+	// genuine chflags whose intent must not be swallowed by the no-op arm.
+	return req.Size != nil && req.Mode == nil && req.UID == nil &&
+		req.GID == nil && !req.SetFlags
+}
+
+// internalRefreshPending answers, WITHOUT consuming anything, whether body is
+// the upcall of a kernel-state refresh this daemon is issuing right now.
+//
+// It is the dispatcher's provenance test. A daemon-originated refresh is
+// coherence bookkeeping, not an application mutation: it publishes state the
+// authority has ALREADY applied, it is consumed by the setattr handler and never
+// reaches the authority, and it appends nothing to the write-back stream. Pacing
+// it against the metadata lane therefore throttles an operation that is not
+// responsible for the backlog and cannot help drain it — the same argument that
+// keeps the authority lane off the credit ledger — and, worse, the pacing delay
+// is precisely what used to let the marker's meaning change underneath it.
+//
+// The predicate is unforgeable in the only sense that matters: the markers it
+// reads are installed exclusively by applyKernelRefresh, only for the duration
+// of its own syscall, and a request that matches one is by construction a
+// request this daemon is about to answer locally.
+func (a *attach) internalRefreshPending(body any) bool {
+	req, ok := body.(*pfslocal.SetAttrRequest)
+	if !ok || !matchesExpectedTruncate(req) {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, note := range a.expectedTruncates {
+		if !note.pinned {
+			continue
+		}
+		if note.itemID == req.Item.ItemID && int64(*req.Size) == note.size {
+			return true
+		}
+	}
+	return false
+}
+
 // consumeExpectedTruncate reports whether req is the daemon's own pending
 // kernel-size refresh for path, consuming the note on a match. Only a pure
 // size set (optionally with the times the kernel attaches to truncates) can
@@ -1225,10 +1338,7 @@ func refreshLocalSampleAuthorityContext(
 // A size mismatch retires the note: the kernel is performing a REAL truncate
 // that must reach the authority, and the stale note must not linger.
 func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest) bool {
-	// SetFlags disqualifies the request like any other real attribute group:
-	// the daemon's own refresh never carries one, so a request that does is a
-	// genuine chflags whose intent must not be swallowed by the no-op arm.
-	if req.Size == nil || req.Mode != nil || req.UID != nil || req.GID != nil || req.SetFlags {
+	if !matchesExpectedTruncate(req) {
 		return false
 	}
 	a.mu.Lock()
@@ -1236,7 +1346,7 @@ func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest)
 	now := time.Now()
 	if note, ok := a.expectedTruncates[p]; ok {
 		delete(a.expectedTruncates, p)
-		return now.Before(note.deadline) &&
+		return expectedTruncateLive(note, now) &&
 			note.itemID == req.Item.ItemID &&
 			int64(*req.Size) == note.size
 	}
@@ -1247,7 +1357,7 @@ func (a *attach) consumeExpectedTruncate(p string, req *pfslocal.SetAttrRequest)
 	// truncate of the item's new name. Multiple hard-link aliases retain
 	// separate path markers and are consumed one at a time.
 	for notedPath, note := range a.expectedTruncates {
-		if !now.Before(note.deadline) {
+		if !expectedTruncateLive(note, now) {
 			delete(a.expectedTruncates, notedPath)
 			continue
 		}

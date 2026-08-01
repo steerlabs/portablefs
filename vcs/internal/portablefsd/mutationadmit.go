@@ -58,12 +58,62 @@ import (
 // inheriting one from admission: a non-mutating request, an operand that does
 // not resolve, an operand owned by a local-directory graft (machine-local, no
 // delegation, no stream bytes), and a detached or volume-less attach.
+
+// admitRequest is the daemon's ONE pre-lock admission point, for the data lane
+// and the namespace lane alike.
+//
+// Having two — the dispatcher's for metadata and attach.write's own for data —
+// was not a duplication but an ORDER INVERSION. lockFrontendRequest marks a
+// write as name-mutating, so a write held a frontend name-stripe mirror while
+// its admission waited for a transition claim, while a namespace mutation held a
+// conflicting claim (taken in phase 1) and waited for that same stripe. The two
+// deadlocked until the operation deadline expired and both were answered EINTR.
+//
+// One point, one phase, one order: every claim in the daemon is taken before
+// every frontend lock.
+func (a *attach) admitRequest(
+	ctx context.Context,
+	body any,
+	forceAuthority bool,
+) (context.Context, func(), int32, bool) {
+	if req, ok := body.(*pfslocal.WriteRequest); ok {
+		if barrier := a.testMutationAdmissionBarrier; barrier != nil {
+			barrier()
+		}
+		return a.admitWrite(ctx, req, forceAuthority)
+	}
+	return a.admitMutation(ctx, body, forceAuthority)
+}
+
 func (a *attach) admitMutation(
 	ctx context.Context,
 	body any,
 	forceAuthority bool,
 ) (context.Context, func(), int32, bool) {
 	noop := func() {}
+	if barrier := a.testMutationAdmissionBarrier; barrier != nil {
+		// Stands in for the one thing this step can do that no frontend lock may
+		// span: a metadata- or credit-lane park. Tests hold it to prove that
+		// nothing else is held while admission waits.
+		barrier()
+	}
+	if a.internalRefreshPending(body) {
+		// DAEMON-ORIGINATED, not application-originated. This is the setattr
+		// upcall of a kernel-state refresh this daemon is issuing through its own
+		// mount (coherence_refresh.go): the handler consumes it, it never reaches
+		// the authority, and it appends nothing to the write-back stream.
+		//
+		// It must bypass admission for two independent reasons, and the second is
+		// a correctness one. Pacing it is MEANINGLESS — it publishes state the
+		// authority has already applied, so it neither caused the metadata backlog
+		// nor can help drain it, exactly like an authority-lane mutation. And
+		// pacing it is UNSAFE — an admission park is unbounded relative to the
+		// syscall that produced the upcall, and the longer the handler is held
+		// away from its marker the longer the window in which some other rule
+		// could decide this is an application truncate. Provenance is settled
+		// here, once, before anything can wait.
+		return ctx, noop, 0, false
+	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		// The handler answers a detached/failing attach on its own terms.
@@ -81,7 +131,9 @@ func (a *attach) admitMutation(
 			return ctx, noop, 0, false
 		}
 	}
-	opCtx, settle, err := vol.AdmitMutation(ctx, nodes, forceAuthority, paths...)
+	opCtx, settle, err := vol.AdmitMutation(
+		ctx, a.mutationIntent(body), nodes, forceAuthority, paths...,
+	)
 	if err != nil {
 		settle()
 		return ctx, noop, mutationAdmissionErrno(err), true
@@ -95,6 +147,64 @@ func (a *attach) admitMutation(
 // far end that stopped answering is EIO, a cancelled request is EINTR. The two
 // lanes must not disagree about what backpressure looks like to an application.
 func mutationAdmissionErrno(err error) int32 { return creditErrno(err) }
+
+// mutationIntent names what a request IS, so the classifier can force the
+// authority lane for the mutations whose diversion is SEMANTIC rather than
+// path-shaped (clientcore.MutationIntent). Without it a link, an
+// unlink-while-open, a rename over an open destination or a setattr on a
+// hard-linked inode classifies from path coverage, resolves LaneDelegated, and
+// the handler then discovers the diversion inside a.nsMu and the name stripes —
+// where the release it implies is the drain this whole admission point exists to
+// hoist out.
+//
+// A directory remove is deliberately MutationOther: rmdir has no orphan
+// protocol and no alias fan-out, so nothing about it diverts.
+//
+// The roles are resolved from the item registry under a.mu only, never blocking.
+// A node the registry does not hold yet is nil, which is the honest answer — the
+// classifier then relies on path coverage and, if the handler discovers the
+// diversion anyway, the operation unwinds and re-admits.
+func (a *attach) mutationIntent(body any) clientcore.MutationIntent {
+	child := func(dir pfslocal.Item, name []byte) *clientcore.NodeState {
+		rec, eno := a.item(dir)
+		if eno != 0 {
+			return nil
+		}
+		p, eno := cleanChild(rec.path, name)
+		if eno != 0 {
+			return nil
+		}
+		return a.nodeAt(p)
+	}
+	switch req := body.(type) {
+	case *pfslocal.HardLinkRequest:
+		return clientcore.MutationIntent{Kind: clientcore.MutationLink}
+	case *pfslocal.RemoveRequest:
+		if req.Directory {
+			return clientcore.MutationIntent{Kind: clientcore.MutationOther}
+		}
+		return clientcore.MutationIntent{
+			Kind:   clientcore.MutationUnlink,
+			Target: child(req.Dir, req.Name),
+		}
+	case *pfslocal.RenameRequest:
+		return clientcore.MutationIntent{
+			Kind:   clientcore.MutationRename,
+			Source: child(req.FromDir, req.FromName),
+			Target: child(req.ToDir, req.ToName),
+		}
+	case *pfslocal.SetAttrRequest:
+		var target *clientcore.NodeState
+		if rec, eno := a.item(req.Item); eno == 0 {
+			target = rec.state
+		}
+		return clientcore.MutationIntent{
+			Kind:   clientcore.MutationSetattr,
+			Target: target,
+		}
+	}
+	return clientcore.MutationIntent{Kind: clientcore.MutationOther}
+}
 
 // mutationOperands resolves — without any namespace lock — the operand paths
 // and node identities one request will mutate.

@@ -37,18 +37,27 @@ type authorityLeaseFactsJSON struct {
 }
 
 // AuthorityLeaseFacts performs ONE bounded capability/runtime-bound
-// lease-facts read on the already-open fenced pool. The database verifies
+// lease-facts read on the RESERVED liveness connection. The database verifies
 // the exact manager epoch + live runtime row + raw authority capability
 // under the same locks every journal mutation takes, and answers the live
 // claim's dbTimeMs/expiresAtDbMs. A PF001 (superseded, expired, revoked, or
 // mismatched binding) returns Current=false with a NIL error — a definitive
 // fact; every other failure is an error (ambiguous: the caller must not
 // extend anything from it).
+//
+// The connection matters as much as the query. Only a SUCCESSFUL answer
+// extends the child's fencing deadline, so running this read on the shared
+// data-plane pool made the deadline a function of write load: saturating
+// apply traffic holds every data connection, the probe waits for one, its
+// bounded context expires, and a perfectly healthy child fences itself. The
+// reserved connection (Log.livenessPool, see connectWithLiveness) removes
+// that coupling structurally — the probe never queues behind the child's own
+// work, so the busiest child answers as fast as an idle one.
 func (l *Log) AuthorityLeaseFacts(ctx context.Context) (AuthorityLeaseFacts, error) {
 	if l.readOnly {
 		return AuthorityLeaseFacts{}, errReadOnly
 	}
-	raw, err := l.callJSONB(ctx,
+	raw, err := l.callJSONBOn(l.livenessDB(), ctx,
 		`SELECT pfj.authority_lease_facts($1,$2,$3,$4,$5,$6,$7)`,
 		l.cfg.TenantID, l.cfg.VolumeID, l.cfg.Branch,
 		l.managerEpoch, l.runtimeSeq, l.cfg.AuthorityRuntimeID, l.capability,
