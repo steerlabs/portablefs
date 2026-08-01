@@ -1758,6 +1758,23 @@ func (v *Volume) AuthorityUnreachable() bool {
 	return v.client.FailFast()
 }
 
+// CredentialExpired reports the DEFINITE verdict that a REACHABLE authority
+// refused this mount's access credential. It is not unreachability and it is
+// not a session fence: the authority is healthy and the credential is dead, so
+// no retry loop can recover it — per the lease decision table only login plus
+// remount can. Status must report this rather than an unreachability claim,
+// and the admitted backlog belongs to the durable parked-job path.
+func (v *Volume) CredentialExpired() bool {
+	return v.client.CredentialRejected()
+}
+
+// CredentialInstalled re-arms reachability probing after the daemon installs a
+// fresh access credential, so a mount that latched a credential verdict can
+// recover without a restart when the new credential is accepted.
+func (v *Volume) CredentialInstalled() {
+	v.client.CredentialInstalled()
+}
+
 // SessionFenced reports whether the mount session was fenced (stale
 // generation / lease lost). A fence is a definite verdict from a (possibly
 // perfectly reachable) authority: barrier paths surface it as an error.

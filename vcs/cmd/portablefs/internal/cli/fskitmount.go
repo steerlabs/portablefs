@@ -398,6 +398,14 @@ type cliWriteBackStatus struct {
 	DataLaneFull   bool                `json:"dataLaneFull"`
 	Delegations    []cliDelegationView `json:"delegations"`
 	ParkedWALs     []cliParkedWAL      `json:"parkedWals"`
+	// Degraded and LastFailure are the engine's sticky health verdict and the
+	// reason behind it. Without them `portablefs mounts --json` could show a
+	// mount with a small, stable backlog and no visible problem while the
+	// flusher had already latched a stall — the exact blind spot the live
+	// battery hit. They are the same two fields the daemon publishes; the CLI
+	// simply carries them.
+	Degraded    bool   `json:"degraded,omitempty"`
+	LastFailure string `json:"lastFailure,omitempty"`
 }
 
 // paced reports the data lane holding writers back: either mutations are
@@ -409,6 +417,12 @@ func (w *cliWriteBackStatus) paced() bool {
 type cliDelegationView struct {
 	Scope    string `json:"scope"`
 	Draining bool   `json:"draining"`
+	// DrainError is the RECORDED verdict of a release attempt that reached a
+	// definite outcome. Draining and DrainError are mutually exclusive at the
+	// daemon, so a scope that is neither draining nor erroring is simply held.
+	// Dropping it made every failed release look identical to an idle grant in
+	// `portablefs mounts --json` — including the one an unmount refusal names.
+	DrainError string `json:"drainError,omitempty"`
 }
 
 type cliParkedWAL struct {

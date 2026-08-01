@@ -24,6 +24,7 @@ package portablefsd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 // expectedTruncate marks one kernel-size refresh the daemon is issuing through
@@ -395,6 +397,85 @@ type frontendOperation struct {
 	completed    bool
 }
 
+// ── THE PUBLICATION SETTLE VERDICT ──────────────────────────────────────────
+//
+// publicationSettleWindow bounds how long a delegation handoff waits for the
+// active publication set to clear, measured from the last time that set made
+// PROGRESS (an operation left it). It is the publication gate's analogue of the
+// flusher watchdog's no-progress window, and it exists for the same reason.
+//
+// The wait it bounds is a wait on an event the daemon does not produce. An
+// operation joins the active set when it activates and leaves it only through
+// acknowledgePublication — a one-way PublicationAck the FSKit extension emits
+// after its whole framework callback returns — or through connection death.
+// The daemon's own side of a publication is finished the instant the reply is
+// written; everything after that belongs to the kernel's scheduling of the
+// rest of that callback, which the daemon can neither observe nor bound.
+// startFrontendHandoff used to wait on it with the ENGINE's context (no
+// deadline, no cancellation, see writeback.Engine.prepareReleaseLocked), so an
+// operation whose handler had already returned but whose ack had not yet
+// arrived pinned a release forever: the triggering syscall burned its whole
+// operation budget and answered EIO, and — far worse — the handoff goroutine
+// kept frontendHandoffs[scope] registered for the life of the mount, so every
+// later request in that subtree blocked in beginFrontendPathsAtEpochContext.
+// The subtree was dead until remount. Live shape: `mkdir d; touch d/f;
+// rm d/f; rmdir d`, 100% reproducible.
+//
+// The window is measured from PROGRESS, not from the start of the wait, so it
+// cannot fire on a busy-but-advancing gate: every operation that leaves the set
+// rearms it. When it does fire the verdict is definite and SCOPED — the release
+// attempt fails with a typed refusal that names the scope, the delegation stays
+// held and draining with a recorded reason (recall semantics: a later caller
+// starts a fresh attempt), the handoff registration is removed, and the attach
+// is untouched. It never claims the frontend disconnected.
+//
+// A var so failure-shape tests can compress or stretch it; production never
+// changes it.
+var publicationSettleWindow = 2 * time.Second
+
+// publicationRecheckFloor keeps a rearmed settle timer from spinning when the
+// remaining window is vanishingly small.
+const publicationRecheckFloor = 25 * time.Millisecond
+
+// errPublicationUnsettled is the handoff's definite verdict when the active
+// publication set did not clear within publicationSettleWindow.
+//
+// It is deliberately NOT the disconnect verdict. The frontend is connected; it
+// has simply not acknowledged an exposed publication yet. Reporting a
+// disconnect here would install a terminal attach-wide coherence failure for a
+// live mount, which is exactly the misdiagnosis the live battery observed.
+type errPublicationUnsettled struct {
+	scope     string
+	blockers  int
+	live      int
+	unsettled time.Duration
+}
+
+func (e *errPublicationUnsettled) Error() string {
+	scope := e.scope
+	if scope == "" {
+		scope = "/"
+	}
+	return fmt.Sprintf(
+		"kernel publication barrier for %q did not settle: %d exposed publication(s)"+
+			" (%d still executing) unacknowledged by a CONNECTED frontend for %s",
+		scope, e.blockers, e.live, e.unsettled.Round(time.Millisecond),
+	)
+}
+
+// Unwrap ties the verdict to writeback.ErrPublicationUnsettled, the sentinel
+// the release's own bounded retry (startHandoffBounded) classifies on. It is
+// what makes this a TRANSIENT, scope-local refusal rather than the terminal
+// disconnect verdict.
+func (e *errPublicationUnsettled) Unwrap() error { return writeback.ErrPublicationUnsettled }
+
+// PublicationUnsettled reports whether err is a bounded publication-settle
+// refusal: the frontend is alive and the scope may be released again later.
+func PublicationUnsettled(err error) bool {
+	var unsettled *errPublicationUnsettled
+	return errors.As(err, &unsettled)
+}
+
 type frontendOperationContextKey struct{}
 
 type frontendOperationParticipant struct {
@@ -422,6 +503,19 @@ type frontendOperationParticipant struct {
 	pendingPaths []string
 	pendingEpoch uint64
 	merged       bool
+}
+
+// retractFromPublicationSetLocked removes op from the active publication set
+// and advances the gate's progress clock. Every retraction goes through here so
+// a handoff's settle verdict is measured against real progress rather than
+// against elapsed time (see publicationSettleWindow). Caller holds
+// frontendGateMu.
+func (a *attach) retractFromPublicationSetLocked(op *frontendOperation) {
+	if _, ok := a.frontendActive[op]; !ok {
+		return
+	}
+	delete(a.frontendActive, op)
+	a.frontendGateProgress++
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -805,7 +899,7 @@ func (a *attach) suspendFrontendParticipant(participant *frontendOperationPartic
 		participant.suspendDepth = 1
 		op.suspended++
 		if op.gateActive && op.participants > 0 && op.suspended == op.participants {
-			delete(a.frontendActive, op)
+			a.retractFromPublicationSetLocked(op)
 			op.gateActive = false
 		}
 		a.frontendGateCond.Broadcast()
@@ -847,7 +941,7 @@ func (a *attach) joinFrontendOperationSuspended(
 	op.participants++
 	op.suspended++
 	if op.gateActive && op.participants > 0 && op.suspended == op.participants {
-		delete(a.frontendActive, op)
+		a.retractFromPublicationSetLocked(op)
 		op.gateActive = false
 	}
 	a.frontendGateCond.Broadcast()
@@ -867,7 +961,7 @@ func (a *attach) finishFrontendOperation(op *frontendOperation) {
 	if !op.completed {
 		op.completed = true
 		if op.gateActive {
-			delete(a.frontendActive, op)
+			a.retractFromPublicationSetLocked(op)
 			op.gateActive = false
 		}
 		if a.frontendGateCond != nil {
@@ -899,7 +993,7 @@ func (a *attach) finishFrontendParticipant(participant *frontendOperationPartici
 	}
 	if !op.completed && op.gateActive &&
 		op.participants > 0 && op.suspended == op.participants {
-		delete(a.frontendActive, op)
+		a.retractFromPublicationSetLocked(op)
 		op.gateActive = false
 	}
 	a.frontendGateCond.Broadcast()
@@ -926,7 +1020,7 @@ func (a *attach) suspendFrontendOperation(ctx context.Context) func() {
 	}
 	if !op.completed && op.gateActive &&
 		op.participants > 0 && op.suspended == op.participants {
-		delete(a.frontendActive, op)
+		a.retractFromPublicationSetLocked(op)
 		op.gateActive = false
 		a.frontendGateCond.Broadcast()
 	}
@@ -1041,6 +1135,22 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 		}
 		a.frontendGateCond.Broadcast()
 	}
+	// THE BOUNDED PUBLICATION WAIT.
+	//
+	// The drain immediately above this in writeback.(*Engine).finishRelease has
+	// been StallVerdict-bounded since round 3; this wait had no verdict at all.
+	// It runs under the ENGINE's context by design (a cancelled request must not
+	// interrupt Checkin), so the bound cannot come from the caller — it has to
+	// be the gate's own. publicationSettleWindow, measured from the gate's
+	// PROGRESS clock, is that bound.
+	var settleWake *time.Timer
+	defer func() {
+		if settleWake != nil {
+			settleWake.Stop()
+		}
+	}()
+	progress := a.frontendGateProgress
+	lastProgress := time.Now()
 	for {
 		if a.frontendGateErr != nil {
 			err := a.frontendGateErr
@@ -1053,22 +1163,71 @@ func (a *attach) startFrontendHandoff(ctx context.Context, scope string) error {
 			a.frontendGateMu.Unlock()
 			return err
 		}
-		blocked := false
-		for op := range a.frontendActive {
-			if op != own &&
-				(op.pathEpoch != a.frontendPathEpoch.Load() ||
-					operationOverlapsScope(op.paths, scope)) {
-				blocked = true
-				break
+		blockers, live := a.publicationBlockersLocked(scope, own)
+		if blockers == 0 {
+			break
+		}
+		if a.frontendGateProgress != progress {
+			// The set cleared something: the gate is advancing, rearm.
+			progress = a.frontendGateProgress
+			lastProgress = time.Now()
+		}
+		unsettled := time.Since(lastProgress)
+		if unsettled >= publicationSettleWindow {
+			removeHandoff()
+			a.frontendGateMu.Unlock()
+			return &errPublicationUnsettled{
+				scope:     scope,
+				blockers:  blockers,
+				live:      live,
+				unsettled: unsettled,
 			}
 		}
-		if !blocked {
-			break
+		remaining := publicationSettleWindow - unsettled
+		if remaining < publicationRecheckFloor {
+			remaining = publicationRecheckFloor
+		}
+		// sync.Cond has no timed wait: arm a wake-up so the verdict above is
+		// reached even when nothing at all happens on the gate. The timer is the
+		// wake-up, the loop is the decision — the same split drainThrough uses
+		// between stallRecheckDelay and StallVerdict.
+		if settleWake == nil {
+			settleWake = time.AfterFunc(remaining, func() {
+				a.frontendGateMu.Lock()
+				a.frontendGateCond.Broadcast()
+				a.frontendGateMu.Unlock()
+			})
+		} else {
+			settleWake.Reset(remaining)
 		}
 		a.frontendGateCond.Wait()
 	}
 	a.frontendGateMu.Unlock()
 	return nil
+}
+
+// publicationBlockersLocked counts the members of the active publication set
+// that hold back a handoff of scope, and how many of them still have a handler
+// running. A blocker with no running handler is one the daemon has finished
+// exposing: only the frontend's PublicationAck can retire it, which is exactly
+// the wait publicationSettleWindow bounds. Caller holds frontendGateMu.
+func (a *attach) publicationBlockersLocked(
+	scope string,
+	own *frontendOperation,
+) (blockers, live int) {
+	epoch := a.frontendPathEpoch.Load()
+	for op := range a.frontendActive {
+		if op == own {
+			continue
+		}
+		if op.pathEpoch != epoch || operationOverlapsScope(op.paths, scope) {
+			blockers++
+			if op.participants > op.suspended {
+				live++
+			}
+		}
+	}
+	return blockers, live
 }
 
 func (a *attach) endFrontendHandoff(scope string) {

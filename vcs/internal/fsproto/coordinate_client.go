@@ -386,6 +386,18 @@ func (c *Client) MarkOpenManaged(ino uint64, open bool) (int32, error) {
 	return resp.Status, nil
 }
 
+// unmarkResolveBudget bounds one batched open-pin release's total attempt
+// window. It is sized against what waits BEHIND it, not against the network:
+// the open registry holds a per-ino pending barrier for the whole call, and
+// every frontend open, close and name change on those inodes queues on it
+// under clientcore's 50s operation admission budget. A barrier that outlives
+// that budget converts one slow release into a mount-wide stall with no
+// verdict, so the ceiling sits above one full op round trip (opTimeout) and
+// below the point where a queued operation has already given up.
+//
+// A var so failure-shape tests compress it; production never changes it.
+var unmarkResolveBudget = opTimeout + 15*time.Second
+
 // unmarkOpenBatchManaged releases a batch of open pins under ONE exact
 // identity (OpUnmarkOpenInodes) and does not return until that identity
 // RESOLVES — the stored outcome, a fence, or client teardown. It must never
@@ -414,6 +426,7 @@ func (c *Client) unmarkOpenBatchManaged(req *Request) (int32, error) {
 	}
 	sent := false
 	backoff := parkRetryMin
+	deadline := time.Now().Add(unmarkResolveBudget)
 	for {
 		resp, wasSent, rerr := c.roundtripExactResolved(req)
 		if rerr == nil {
@@ -428,6 +441,41 @@ func (c *Client) unmarkOpenBatchManaged(req *Request) (int32, error) {
 				return ESTALE, nil
 			}
 			return EIO, rerr
+		}
+		// THE RETRY IS BOUNDED, AND ITS BOUND IS NOT A TIMEOUT ON A HOPE.
+		//
+		// This loop used to have no exit but a fence or client teardown, and
+		// the open registry holds its per-ino pending barrier across the whole
+		// call — so an authority that stopped answering held that barrier for
+		// as long as the outage lasted. Observed live at 33+ MINUTES on an
+		// otherwise idle, healthy attach, with ~250 frontend goroutines queued
+		// behind it and `umount --force` among them: the force path needs the
+		// volume's lifecycle lock exclusively, and every queued open/close was
+		// already holding it shared. A silent wedge with no verdict anywhere.
+		//
+		// Two definite exits replace it, in the order of what they PROVE:
+		//
+		//   - ErrAuthorityUnreachable: the transport's fail-fast gate has
+		//     CONFIRMED the far end unreachable (a failure streak past the
+		//     confirmation grace) and its own prober owns recovery. Spinning
+		//     here adds nothing the prober is not already doing and holds the
+		//     barrier while it does it.
+		//   - unmarkResolveBudget: no confirmation either way, but the
+		//     identity has been unresolved for longer than any operation
+		//     queued behind the barrier can survive.
+		//
+		// Both resolve the identity the only way a SENT exact identity may be
+		// resolved without a reply: by fencing the session. That is not a
+		// choice made here to be convenient — it is the same terminal the
+		// <-es.stop arm above relies on, and its meaning is exact. The slot
+		// retires with the session, the authority releases every pin this
+		// session holds at the terminal, and no parked identity can ever
+		// execute after a later MarkOpen of the same inode. Backgrounding the
+		// identity instead would violate precisely that ordering (see this
+		// function's contract above).
+		if errors.Is(rerr, ErrAuthorityUnreachable) || !time.Now().Before(deadline) {
+			es.fence()
+			return ESTALE, nil
 		}
 		select {
 		case <-es.stop:

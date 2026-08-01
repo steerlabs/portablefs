@@ -85,6 +85,12 @@ type connHealth struct {
 	lastFailure  time.Time
 	engaged      bool
 	probing      bool
+	// credentialRejected latches the DEFINITE verdict that a reachable
+	// authority refused this client's credential. It is not reachability
+	// state — engaging it CLEARS the transport breaker, because the peer
+	// answered — and it is the one verdict a probe cannot undo: only a fresh
+	// credential can, through CredentialInstalled.
+	credentialRejected bool
 }
 
 func newConnHealth() *connHealth {
@@ -115,7 +121,8 @@ func (h *connHealth) recordFailure() {
 }
 
 // recordSuccess clears the failure streak and exits fail-fast: reachability
-// has been re-proven, so ops flow normally again.
+// has been re-proven, so ops flow normally again. A successful handshake also
+// clears any latched credential verdict — the credential it just used works.
 func (h *connHealth) recordSuccess() {
 	if h == nil {
 		return
@@ -123,7 +130,43 @@ func (h *connHealth) recordSuccess() {
 	h.mu.Lock()
 	h.failures = 0
 	h.engaged = false
+	h.credentialRejected = false
 	h.mu.Unlock()
+}
+
+// recordCredentialRejected latches the definite credential verdict and CLEARS
+// the transport breaker, because a peer that refuses a credential has answered.
+func (h *connHealth) recordCredentialRejected() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.credentialRejected = true
+	h.failures = 0
+	h.engaged = false
+	h.mu.Unlock()
+}
+
+// clearCredentialRejected re-arms probing after a fresh credential is
+// installed. It does not claim the new credential works — only that the
+// previous verdict is no longer about the credential in use.
+func (h *connHealth) clearCredentialRejected() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.credentialRejected = false
+	h.mu.Unlock()
+}
+
+// credentialDead reports the latched verdict.
+func (h *connHealth) credentialDead() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.credentialRejected
 }
 
 // maybeEngageLocked flips to engaged when the entry conditions hold and
@@ -223,9 +266,58 @@ func (h *connHealth) proberDone() {
 // clientcore.Volume.SyncVolumeBounded).
 func (c *Client) FailFast() bool { return c.health.active() }
 
-// runReachabilityProbe re-dials the authority (bounded) until it answers or
-// the client closes, then clears fail-fast. It runs at most once per client
-// at a time (connHealth.probing).
+// CredentialRejected reports the DEFINITE verdict that a reachable authority
+// refused this client's credential. It is deliberately distinct from FailFast
+// (no answer at all) and from SessionFenced (a rejected session generation):
+// a mount in this state has a healthy authority and a dead access credential,
+// and only `portablefs login` + remount can change it. Status surfaces it as
+// credential-expired rather than as unreachability, and the admitted backlog
+// belongs to the durable parked-job path rather than to a retry loop.
+func (c *Client) CredentialRejected() bool { return c.health.credentialDead() }
+
+// CredentialInstalled re-arms reachability probing after a fresh credential is
+// installed, so a mount that latched a credential verdict recovers without a
+// restart if the new credential is accepted.
+func (c *Client) CredentialInstalled() {
+	c.health.clearCredentialRejected()
+	c.health.mu.Lock()
+	engaged := c.health.engaged
+	start := !c.health.probing && c.health.onEngage != nil && engaged
+	if start {
+		c.health.probing = true
+	}
+	onEngage := c.health.onEngage
+	c.health.mu.Unlock()
+	if start && onEngage != nil {
+		onEngage()
+	}
+}
+
+// probeOutcome is what ONE reachability probe proved. The three cases are
+// genuinely different facts about the far end and the mount must not conflate
+// them — conflating the last two is exactly how a mount whose ACCESS LEASE had
+// died reported `authority unreachable (fail-fast engaged after repeated
+// transport failures)` while a concurrent fresh mount proved the authority
+// perfectly healthy.
+type probeOutcome uint8
+
+const (
+	// probeUnreachable: no answer. Reachability is still unknown-bad; keep
+	// probing, since only the network can change this.
+	probeUnreachable probeOutcome = iota
+	// probeReachable: dial + handshake succeeded. Fail-fast clears.
+	probeReachable
+	// probeCredentialRejected: the authority ANSWERED and refused this
+	// client's credential. That is a definite classification about the
+	// CREDENTIAL, not about reachability, and it is terminal for this
+	// client: re-handshaking with the same dead credential can never succeed
+	// (per the lease decision table only login + remount can). Probing stops.
+	probeCredentialRejected
+)
+
+// runReachabilityProbe re-dials the authority (bounded) until it answers, the
+// authority definitively rejects this client's credential, or the client
+// closes. It runs at most once per client at a time (connHealth.probing).
 func (c *Client) runReachabilityProbe() {
 	defer c.health.proberDone()
 	for {
@@ -235,11 +327,28 @@ func (c *Client) runReachabilityProbe() {
 		if c.health.proberShouldExit() {
 			return
 		}
-		if c.probeAuthority() {
+		switch c.probeAuthority() {
+		case probeReachable:
 			c.health.recordSuccess()
 			// Loop once more: proberShouldExit clears probing under the
 			// same lock that a racing re-engage takes.
 			continue
+		case probeCredentialRejected:
+			// THE AUTHORITY IS REACHABLE. Saying otherwise is a lie, and it
+			// was the lie that made a dead-lease mount indistinguishable from
+			// a network outage: every op answered "authority unreachable", the
+			// admitted backlog stranded with no parked-job engagement, and this
+			// loop re-handshook with the same dead credential every two seconds
+			// for as long as the mount lived.
+			//
+			// Clearing the transport breaker publishes the truth (reachable),
+			// and latching the credential verdict publishes the rest of it
+			// (refused). Ops then surface a credential-expired classification
+			// instead of a reachability one, and this loop stops: nothing it
+			// can do changes a rejected credential. A credential INSTALL
+			// re-arms it (see CredentialInstalled).
+			c.health.recordCredentialRejected()
+			return
 		}
 		select {
 		case <-c.closed:
@@ -249,11 +358,12 @@ func (c *Client) runReachabilityProbe() {
 	}
 }
 
-// probeAuthority performs one bounded dial + auth handshake. Success proves
-// the authority is reachable AND accepting this client's current credential
-// (tokenForHandshake reads the live source, so a credential install is
-// picked up automatically).
-func (c *Client) probeAuthority() bool {
+// probeAuthority performs one bounded dial + auth handshake and CLASSIFIES the
+// result. Success proves the authority is reachable AND accepting this client's
+// current credential (tokenForHandshake reads the live source, so a credential
+// install is picked up automatically); an explicit token rejection proves it is
+// reachable and this credential is dead.
+func (c *Client) probeAuthority() probeOutcome {
 	cn := &conn{
 		addrs:       c.addrs,
 		tls:         c.tls,
@@ -265,14 +375,17 @@ func (c *Client) probeAuthority() bool {
 		dialTimeout: failFastProbeDialTimeout,
 	}
 	if !c.registerDedicated(cn) {
-		return false
+		return probeUnreachable
 	}
 	defer func() {
 		cn.reset()
 		c.unregisterDedicated(cn)
 	}()
 	if err := cn.ensure(); err != nil {
-		return false
+		if errors.Is(err, ErrSessionTokenRejected) {
+			return probeCredentialRejected
+		}
+		return probeUnreachable
 	}
-	return true
+	return probeReachable
 }
