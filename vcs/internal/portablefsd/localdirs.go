@@ -30,6 +30,7 @@ package portablefsd
 //   - renaming a volume ancestor of a graft root moves the graft with it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -454,8 +455,7 @@ func (a *attach) registerLocalLocked(p string, attr fsproto.Attr) *itemRecord {
 		// record's attributes with an observation this caller is about to
 		// expose. It is taken HERE rather than at the top of the function so
 		// the other arm is admitted exactly once, by registerWithItemLocked.
-		a.admitPublicationLocked(p)
-		rec.attr = attr
+		a.publishRecordAttrLocked(rec, attr, true)
 		return rec
 	}
 	return a.registerWithItemLocked(p, attr, a.newLocalItemIDLocked(p), false, false, true)
@@ -470,8 +470,9 @@ func (a *attach) registerLocalAliasLocked(p string, source *itemRecord, attr fsp
 		a.removePathLocked(p)
 	}
 	rec := &itemRecord{
-		item: source.item, path: p, state: source.state, attr: attr, graft: true,
+		item: source.item, path: p, state: source.state, graft: true,
 	}
+	a.publishRecordAttrLocked(rec, attr, false) // p was admitted at the top
 	a.paths[p] = rec
 	a.addItemAliasLocked(rec)
 	a.frontendPathEpoch.Add(1)
@@ -561,7 +562,18 @@ func (a *attach) setattrLocal(
 	scope string,
 	detached bool,
 	req *pfslocal.SetAttrRequest,
+	commit *setattrCommit,
 ) (*pfslocal.SetAttrReply, int32) {
+	// EVERY exit after the host truncate commits publishes the size it applied.
+	// A mode, flags or timestamp step below the truncate can still fail on its
+	// own terms, and each of those returns an errno for a size change that
+	// really happened; none of them may close the item's mutation sequence over
+	// a registry that still holds the pre-truncate size. The publish is inert
+	// until the truncate records one and inert again once a real registration
+	// has published it.
+	defer func() {
+		a.publishSetattrCommit(context.Background(), nil, rec.item.ItemID, commit)
+	}()
 	var file *os.File
 	closeFile := false
 	if exactHandle != nil {
@@ -593,6 +605,11 @@ func (a *attach) setattrLocal(
 		if err := file.Truncate(int64(*req.Size)); err != nil {
 			return nil, localErrno(err)
 		}
+		// Committed on the host inode. Every step below can still fail and
+		// return an errno, and none of them may close this item's mutation
+		// sequence over a registry that still holds the pre-truncate size; see
+		// the bracket in attach.setattr.
+		commit.size, commit.sizeKnown, commit.published = int64(*req.Size), true, false
 	}
 	if req.SetFlags {
 		// Grafts need no FeatureFlagPersistence: their backing IS a real host
@@ -645,6 +662,7 @@ func (a *attach) setattrLocal(
 	if updated == nil {
 		return nil, darwinEIO
 	}
+	commit.published = true
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}

@@ -703,19 +703,36 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	if req.Size != nil && target.detached && target.handle != nil && !target.handle.write {
 		return nil, darwinEBADF
 	}
-	if req.Size != nil {
-		// A truncate is a size mutation with no bytes, and it has the write
-		// path's exact shape: the engine (or the host file, on the graft arm)
-		// commits the new size, and only later does the handler publish it into
-		// the registry. Bracket it for the same reason and on the same terms —
-		// see attach.write and mutationseq.go.
-		//
-		// Only a size-set opens a sequence. A mode/ownership/timestamp setattr
-		// moves nothing a refresh fence reads, so bracketing it would refuse
-		// refreshes for an item that is not changing size at all.
-		defer a.beginItemMutation(rec.item.ItemID)()
-	}
+	// A truncate is a size mutation with no bytes, and it has the write path's
+	// exact shape: the engine (or the host file, on the graft arm) commits the
+	// new size, and only later does the handler publish it into the registry.
+	// Bracket it for the same reason and on the same terms — see attach.write
+	// and mutationseq.go.
+	//
+	// Only a size-set opens a sequence. A mode/ownership/timestamp setattr moves
+	// nothing a refresh fence reads, so bracketing it would refuse refreshes for
+	// an item that is not changing size at all.
+	//
+	// ── AND IT IS OPENED AFTER PROVENANCE, NEVER BEFORE ─────────────────────
+	//
+	// An open mutation on an item now makes an already-armed refresh window
+	// AMBIGUOUS (refreshWindowClassLocked), which is exactly right for a
+	// foreign mutation and self-defeating for this one: the daemon's OWN
+	// refresh upcall is a size-set, so bracketing it above the classification
+	// would make every refresh upcall refuse itself and the pass would never
+	// converge. The bracket therefore opens only where a real commit is about
+	// to be attempted — inside the graft arm, and after the internal/ambiguous
+	// decision on the authority arm — which is still strictly before anything
+	// commits, and that is the only ordering the fence needs.
+	// published starts TRUE, for the same reason attach.write's does: every exit
+	// before the size is committed leaves nothing for the registry to be behind
+	// on, and it is cleared the instant a commit succeeds.
+	commit := &setattrCommit{published: true}
 	if rec.graft {
+		if req.Size != nil {
+			settleMutation := a.beginItemMutation(rec.item.ItemID)
+			defer func() { settleMutation(commit.published) }()
+		}
 		exactHandle := target.handle
 		if !target.detached && req.Size != nil &&
 			exactHandle != nil && !exactHandle.write {
@@ -724,7 +741,7 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 			// open a purpose-scoped writable local file for this bound name.
 			exactHandle = nil
 		}
-		return a.setattrLocal(rec, exactHandle, target.scope, target.detached, req)
+		return a.setattrLocal(rec, exactHandle, target.scope, target.detached, req, commit)
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
@@ -767,11 +784,22 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		// available is to REFUSE — never to promote the request to the authority,
 		// which is the direction the freeze exists to forbid. EINTR unwinds to
 		// phase 1, which classifies again holding nothing.
+		//
+		// The composed size is not the only prerequisite, and it is the one a
+		// newly STARTED mutation cannot move yet: a control write (or a peer
+		// frontend's write) that has committed N and not yet published still
+		// leaves the registry at the sampled S, so this check would pass and the
+		// stale kernel truncate would complete after the newer commit. The
+		// mutation sequence is the witness the registry cannot be, and it is
+		// consulted here for exactly the same reason phase 1 consults it. This
+		// handler's own bracket is deliberately not open yet; see the comment on
+		// the bracket above.
 		a.mu.RLock()
 		current := a.items[rec.item.ItemID]
 		stale := current == nil ||
 			current.item.ItemGeneration != rec.item.ItemGeneration ||
-			current.attr.Size != int64(*req.Size)
+			current.attr.Size != int64(*req.Size) ||
+			a.itemMutationInFlightLocked(rec.item.ItemID)
 		a.mu.RUnlock()
 		if stale && current != nil {
 			class = refreshClassAmbiguous
@@ -804,6 +832,13 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 		)
 		a.mu.RUnlock()
 		return &pfslocal.SetAttrReply{Attr: local}, 0
+	}
+	// PAST THE PROVENANCE DECISION: this request is an application mutation and
+	// is about to reach the authority. Open its bracket now, above every commit
+	// below and above every return path out of them.
+	if req.Size != nil {
+		settleMutation := a.beginItemMutation(rec.item.ItemID)
+		defer func() { settleMutation(commit.published) }()
 	}
 	if req.SetFlags && !vol.SupportsFlagPersistence() {
 		// AUTHORITY-BACKED arm only: control reaches here exactly when the
@@ -858,6 +893,26 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	if st != fsproto.OK {
 		return nil, toDarwinErr(st)
 	}
+	// THE SIZE IS COMMITTED FROM HERE ON, WHATEVER HAPPENS TO THE REPLY.
+	//
+	// Everything below can still fail — the optional attribute refresh, the
+	// registration, the reconciliation, the binding journal — and every one of
+	// those failures returns an errno for a truncate the authority has already
+	// applied. That is the caller's problem to retry; it is NOT a licence to
+	// close the item's mutation sequence over a registry that still holds the
+	// pre-truncate size, which is what would let the next refresh arm on a stale
+	// sample. So the committed size is recorded now and published below even on
+	// the paths that do not produce a reply.
+	if req.Size != nil {
+		commit.size, commit.sizeKnown, commit.published = int64(*req.Size), true, false
+		// EVERY exit from here down publishes the size the authority applied.
+		// The optional refresh, the registration, the reconciliation and the
+		// binding journal can each fail on their own terms, and each of those
+		// returns an errno for a truncate that really happened; none of them may
+		// close the item's mutation sequence over the pre-truncate size. The
+		// publish is inert once a real registration has done it.
+		defer a.publishSetattrCommit(ctx, vol, rec.item.ItemID, commit)
+	}
 	if attr.Kind == "" {
 		if target.handle != nil {
 			attr, st = vol.GetattrOpenHandle(ctx, target.scope, rec.state)
@@ -868,12 +923,23 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 			return nil, toDarwinErr(st)
 		}
 	}
+	mutated := rec.item.ItemID
 	a.mu.Lock()
 	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	if target.handle != nil {
 		rec = a.registerHandleAttrLocked(target.handle, attr)
 	} else {
 		rec = a.registerLocked(rec.path, attr)
+	}
+	if rec != nil {
+		commit.published = true
+	} else if commit.sizeKnown {
+		// The registration was refused (a handle whose binding no longer
+		// resolves, an item the registry cannot name). The truncate committed
+		// anyway, so its size is published on its own before this handler
+		// settles.
+		a.publishItemSizeLocked(mutated, a.items[mutated], commit.size, false)
+		commit.published = true
 	}
 	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
@@ -1080,8 +1146,19 @@ func (a *attach) writeLocked(
 	// It is deferred here, above every commit and every early return, because a
 	// sequence left open would freeze refreshes for the item and one left
 	// unopened would reopen the hole. The settle runs after writeReplyWithAttr
-	// has returned, which is after the publication it must not precede.
-	defer a.beginItemMutation(h.itemID)()
+	// has returned, which is after the publication it must not precede — and it
+	// carries that publication's VERDICT, so a reply that answered with the
+	// committed count while its optional attribute refresh failed cannot close
+	// the sequence over a registry that is still behind the commit. See
+	// mutationseq.go and attach.writeReplyWithAttr.
+	// published starts TRUE: every exit before a commit — a bad descriptor, a
+	// lane change, a refused write — leaves the registry describing an object
+	// nothing moved, and the sequence must close on those paths rather than
+	// fencing the item for a mutation that never happened. writeReplyWithAttr
+	// states the real verdict once there is a commit to have an opinion about.
+	commit := &writeCommit{published: true}
+	settleMutation := a.beginItemMutation(h.itemID)
+	defer func() { settleMutation(commit.published) }()
 	// O_APPEND is a property of the open file description OR of this one
 	// request. Either way the offset is resolved at EOF by whoever owns the
 	// serialization (host kernel for a graft, authority/delegation otherwise)
@@ -1102,22 +1179,36 @@ func (a *attach) writeLocked(
 	if h.file != nil {
 		var wrote int
 		var err error
+		// The host file's own post-write size, when this arm can prove one. A
+		// positional write ends at off+wrote and a per-request append ends at the
+		// EOF this handler itself resolved; an O_APPEND fd resolved its offset
+		// inside the kernel and states nothing the frontend can reconstruct.
+		var end int64 = -1
 		switch {
 		case h.appendOnly:
 			// The fd carries O_APPEND, so the host kernel resolves EOF and
 			// commits atomically. WriteAt is invalid on such an fd (ESPIPE on
 			// Darwin); Write is the only positionless form.
 			wrote, err = h.file.Write(data)
+			if err == nil || wrote > 0 {
+				// The descriptor's offset now sits at the end of what was just
+				// appended, which for O_APPEND is the file's end.
+				if at, serr := h.file.Seek(0, io.SeekCurrent); serr == nil {
+					end = at
+				}
+			}
 		case appendWrite:
 			// Per-request append on a descriptor that was not opened O_APPEND.
 			// A graft is machine-local, so the worst exposure is two handles
 			// on this one daemon; resolve EOF as late as possible.
-			var end int64
-			if end, err = h.file.Seek(0, io.SeekEnd); err == nil {
-				wrote, err = h.file.WriteAt(data, end)
+			var at int64
+			if at, err = h.file.Seek(0, io.SeekEnd); err == nil {
+				wrote, err = h.file.WriteAt(data, at)
+				end = at + int64(wrote)
 			}
 		default:
 			wrote, err = h.file.WriteAt(data, int64(req.Offset))
+			end = int64(req.Offset) + int64(wrote)
 		}
 		// A host short write reports both a count and an error. The count is
 		// committed progress and outranks the error for exactly the reason a
@@ -1126,6 +1217,10 @@ func (a *attach) writeLocked(
 		if err != nil && wrote <= 0 {
 			return nil, localErrno(err)
 		}
+		commit.n = wrote
+		if wrote > 0 && end >= 0 {
+			commit.size, commit.sizeKnown = end, true
+		}
 		var attr fsproto.Attr
 		fi, serr := h.file.Stat()
 		if serr == nil {
@@ -1133,23 +1228,40 @@ func (a *attach) writeLocked(
 		} else if wrote <= 0 {
 			return nil, localErrno(serr)
 		}
-		return a.writeReplyWithAttr(ctx, h, scope, detached, wrote, attr, serr == nil)
+		return a.writeReplyWithAttr(ctx, h, scope, detached, commit, attr, serr == nil)
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {
 		return nil, eno
 	}
-	var n int
+	var out clientcore.WriteOutcome
 	var st clientcore.Status
 	switch {
 	case appendWrite && detached:
-		n, st = vol.AppendExactHandle(ctx, h.state, data)
+		out, st = vol.AppendExactHandleCommitted(ctx, h.state, data)
 	case appendWrite:
-		n, st = vol.WriteAppendOpenHandle(ctx, scope, h.state, data)
+		out, st = vol.WriteAppendOpenHandleCommitted(ctx, scope, h.state, data)
 	case detached:
-		n, st = vol.WriteExactHandle(ctx, h.state, int64(req.Offset), data)
+		out, st = vol.WriteExactHandleCommitted(ctx, h.state, int64(req.Offset), data)
 	default:
-		n, st = vol.WriteOpenHandle(ctx, scope, h.state, int64(req.Offset), data)
+		out, st = vol.WriteOpenHandleCommitted(ctx, scope, h.state, int64(req.Offset), data)
+	}
+	n := out.Count
+	commit.n = n
+	// THE COMMIT ITSELF STATES THE POST-OP SIZE.
+	//
+	// Whichever lane committed knows it — the engine composed the overlay entry
+	// under its own lock, the authority stamped post-op attributes on the reply
+	// or assigned the append its offset — and the frontend cannot reconstruct
+	// it: an append's offset is deliberately never computed here. What the
+	// frontend CAN prove for a positional write is the floor off+n, which is
+	// exactly what a stale-sample fence needs, so it is used when the lane
+	// stated nothing.
+	switch {
+	case out.SizeKnown:
+		commit.size, commit.sizeKnown = out.Size, true
+	case n > 0 && !appendWrite:
+		commit.size, commit.sizeKnown = int64(req.Offset)+int64(n), true
 	}
 	if a.testAfterWriteCommit != nil {
 		a.testAfterWriteCommit()
@@ -1187,7 +1299,67 @@ func (a *attach) writeLocked(
 		// An empty payload: nothing was asked for and nothing committed. The
 		// attribute half is answered on its own terms below.
 	}
-	return a.writeReply(ctx, vol, h, scope, detached, n)
+	return a.writeReply(ctx, vol, h, scope, detached, commit)
+}
+
+// writeCommit is one write's COMMITTED result as it travels from the lane that
+// decided it to the reply that publishes it.
+//
+// size/sizeKnown are the post-op composed size the COMMIT stated (see
+// clientcore.WriteOutcome). published is written back by writeReplyWithAttr and
+// read by the mutation sequence's settle: it is the difference between "this
+// handler reached its publication step" and "the registry now agrees with the
+// engine", and the fence needs the second one.
+type writeCommit struct {
+	n         int
+	size      int64
+	sizeKnown bool
+	published bool
+}
+
+// setattrCommit is writeCommit for a truncate: the size the engine or the host
+// inode has already applied, and whether the registry has been told about it.
+// A truncate's committed size is EXACT rather than a floor — the authority
+// applied precisely the requested size — so a shrink publishes as stated.
+type setattrCommit struct {
+	size      int64
+	sizeKnown bool
+	published bool
+}
+
+// publishSetattrCommit publishes a committed truncate whose handler is about to
+// return an ERRNO.
+//
+// Everything after the authority (or the host) applies the size can still fail,
+// and every one of those failures is an errno for a truncate that really
+// happened. The application will retry, which is correct; what must not happen
+// is that the item's mutation sequence closes over a registry still holding the
+// pre-truncate size, because the refresh fence's whole predicate is that the
+// registry has not moved. So the size is published before the handler unwinds.
+//
+// A ticket minted here is settled on the spot. Its verdict is deliberately not
+// propagated: this path is already returning a failure, and an unsettled debt
+// stays recorded for the next publisher exactly as it would anywhere else.
+func (a *attach) publishSetattrCommit(
+	ctx context.Context,
+	vol *clientcore.Volume,
+	itemID uint64,
+	commit *setattrCommit,
+) {
+	if commit == nil || commit.published || !commit.sizeKnown {
+		return
+	}
+	a.mu.Lock()
+	saved := a.beginReincarnationOwnerLocked(nil)
+	if rec := a.items[itemID]; rec != nil {
+		a.publishItemSizeLocked(itemID, rec, commit.size, false)
+		commit.published = true
+	}
+	ticket := a.endReincarnationOwnerLocked(saved)
+	a.mu.Unlock()
+	if ticket != nil {
+		_, _ = ticket.settle(ctx, vol)
+	}
 }
 
 // writeReply builds the reply for a write that has already run, and is the one
@@ -1222,29 +1394,52 @@ func (a *attach) writeReply(
 	h *handleRecord,
 	scope string,
 	detached bool,
-	n int,
+	commit *writeCommit,
 ) (*pfslocal.WriteReply, int32) {
 	attr, st := vol.GetattrOpenHandle(ctx, scope, h.state)
-	if st != fsproto.OK && n <= 0 {
+	if st != fsproto.OK && commit.n <= 0 {
 		return nil, toDarwinErr(st)
 	}
-	return a.writeReplyWithAttr(ctx, h, scope, detached, n, attr, st == fsproto.OK)
+	return a.writeReplyWithAttr(ctx, h, scope, detached, commit, attr, st == fsproto.OK)
 }
 
 // writeReplyWithAttr is writeReply's shared tail, reached once the write's own
 // count and its attribute refresh have each reported independently. refreshed
 // says whether attr is a fresh observation or must be replaced by what the
 // daemon already holds.
+//
+// ── A FAILED OPTIONAL REFRESH IS NOT A REASON TO PUBLISH NOTHING ────────────
+//
+// The attribute half is allowed to fail on its own terms, and this reply is
+// still honest about the committed count. What it may NOT do is leave the
+// registry holding the pre-write size while telling the mutation sequence the
+// item is stable again: the refresh fence's whole predicate is "itemRecord.attr
+// has not moved since I sampled", so a sequence closed over a stale registry
+// hands the next refresh a proof that nothing happened, and it ftruncates the
+// kernel's vnode back over bytes the application was just told are durable.
+//
+// The commit itself carries what is needed. writeCommit.size is the post-op
+// size the committing lane STATED (the engine's composed entry, the authority's
+// post-op attributes or its assigned append offset) or, failing that, the floor
+// off+n that a positional write proves on its own. Installing it is a
+// publication in the full sense — admitted, ordered, alias-fanned — and it is
+// applied as a FLOOR, never as a replacement: this write can only have extended
+// the file, so a registry that already knows a larger size knows something this
+// reply does not contradict.
 func (a *attach) writeReplyWithAttr(
 	ctx context.Context,
 	h *handleRecord,
 	scope string,
 	detached bool,
-	n int,
+	commit *writeCommit,
 	attr fsproto.Attr,
 	refreshed bool,
 ) (*pfslocal.WriteReply, int32) {
+	n := commit.n
 	committed := n > 0
+	// Nothing committed means the registry cannot be behind a commit at all, so
+	// the sequence closes on its own terms whatever the attribute half did.
+	commit.published = !committed
 
 	a.mu.Lock()
 	savedOwner := a.beginReincarnationOwnerLocked(nil)
@@ -1252,14 +1447,22 @@ func (a *attach) writeReplyWithAttr(
 	if refreshed {
 		rec = a.registerHandleAttrLocked(h, attr)
 	}
-	ticket := a.endReincarnationOwnerLocked(savedOwner)
+	if rec != nil {
+		commit.published = true
+	}
 	if rec == nil {
 		// No refresh, or the handle's binding no longer resolves: answer from
-		// the item the kernel already holds for this handle.
+		// the item the kernel already holds for this handle, and publish the size
+		// the commit itself decided into it before this handler settles.
 		if known := a.items[h.itemID]; known != nil {
+			if committed && commit.sizeKnown {
+				a.publishItemSizeLocked(h.itemID, known, commit.size, true)
+				commit.published = true
+			}
 			rec, attr = known, known.attr
 		}
 	}
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	var reply pfslocal.Attr
 	if rec != nil {
 		reply = a.localAttrForRecordPathLocked(attr, rec, scope, detached)
@@ -1793,9 +1996,19 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 			return nil, eno
 		}
 		a.mu.Lock()
+		savedGraftOwner := a.beginReincarnationOwnerLocked(nil)
 		rec := a.registerLocalAliasLocked(newp, src, attr)
+		graftTicket := a.endReincarnationOwnerLocked(savedGraftOwner)
 		a.bumpLocalVersionLocked(dir.path)
 		a.mu.Unlock()
+		// registerLocalAliasLocked admits the new name like every other
+		// publication, so this caller owns and settles whatever that admission
+		// mints — the same rule the authority arm below now follows. A graft
+		// alias's refresh source is the host inode, so the settle needs no
+		// volume.
+		if eno, _ := graftTicket.settle(ctx, nil); eno != 0 {
+			return nil, eno
+		}
 		if eno := a.flushBindingDelta(); eno != 0 {
 			return nil, eno
 		}
@@ -1814,8 +2027,24 @@ func (a *attach) hardLink(ctx context.Context, req *pfslocal.HardLinkRequest) (*
 		return nil, toDarwinErr(st)
 	}
 	a.mu.Lock()
+	savedOwner := a.beginReincarnationOwnerLocked(nil)
 	rec := a.registerHardLinkAliasLocked(newp, src, attr)
+	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
+	// link(2) publishes TWO names — the new alias and the source, whose Nlink it
+	// restated — so it owns whatever reconciliation debt those publications mint
+	// and settles it before its reply leaves, exactly like every other publisher.
+	// It used to install under no owner at all, so an indebted reused name minted
+	// debt nobody was obliged to pay: registerHardLinkAliasLocked called
+	// admission, the ticket went nowhere, and the alias kept its
+	// pre-reincarnation snapshot with a fresh identity beside it.
+	eno, reconciled := ticket.settle(ctx, vol)
+	if eno != 0 {
+		return nil, eno
+	}
+	if reconciled {
+		attr = a.reconciledAttr(rec, attr)
+	}
 	if eno := a.flushBindingDelta(); eno != 0 {
 		return nil, eno
 	}

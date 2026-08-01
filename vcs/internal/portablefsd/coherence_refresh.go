@@ -677,10 +677,41 @@ type frontendOperation struct {
 	//
 	// Guarded by frontendGateMu.
 	retracted bool
+	// carriers counts the replies of this operation whose retraction verdict has
+	// been CAPTURED and whose frame has not yet been written.
+	//
+	// ── WHY SAMPLING THE VERDICT IS NOT ENOUGH ──────────────────────────────
+	//
+	// The retraction is delivered by riding a reply, so the reply is the only
+	// carrier it has, and the verdict was read a moment BEFORE the frame went
+	// out. That gap is a real interleaving and it is the worst one available: a
+	// non-publishing participant of an operation whose other participants are
+	// all permanently suspended reads retracted==false, and before its frame
+	// reaches the socket a handoff sees exactly the state
+	// publicationBlockersLocked crosses (published, no runnable participant,
+	// everything parked), crosses it, and sets retracted. The frame that goes
+	// out is the one built before the crossing; the framework installs the
+	// pre-handoff view; and the only mechanism that could have prevented the
+	// install has already been used up.
+	//
+	// So capturing the verdict is a GATE TRANSITION, not a read: under
+	// frontendGateMu the reply either observes an existing retraction, or it
+	// registers itself here — and a handoff must then block on it rather than
+	// cross it. The registration is released when the frame has been written, so
+	// the wait is bounded by one socket write on a connection whose peer is
+	// waiting for that very frame; it never becomes a wait on the acknowledgement
+	// (which is the unreachable one the fence exists for). Guarded by
+	// frontendGateMu.
+	carriers int
 }
 
 // publicationRetracted reports whether a handoff has crossed op, so every reply
 // still owed to it must tell the frontend to discard what it has collected.
+//
+// It is the read-only form, for a caller deciding what to DO (the initiator
+// refusing its own mutation). A caller about to WRITE a frame stamped with the
+// verdict must use captureRetractionCarrier instead: the answer has to be
+// ordered against the crossing, not merely sampled before it.
 func (a *attach) publicationRetracted(op *frontendOperation) bool {
 	if op == nil || op.attach != a {
 		return false
@@ -688,6 +719,44 @@ func (a *attach) publicationRetracted(op *frontendOperation) bool {
 	a.frontendGateMu.Lock()
 	defer a.frontendGateMu.Unlock()
 	return op.retracted
+}
+
+// captureRetractionCarrier is the ATOMIC GATE TRANSITION for one reply frame.
+//
+// Under frontendGateMu the reply either observes a retraction that has already
+// happened — in which case it carries it and registers nothing, because the
+// crossing it would have to block is already complete — or it commits itself
+// into op.carriers, a state a future handoff must block on until the frame is
+// written. Both outcomes are decided under the same lock the crossing takes, so
+// there is no instant at which a reply has decided "not retracted" and a
+// crossing is free to happen behind it.
+//
+// The returned release must be called after the frame has left, and never
+// before: the whole point of the registration is that it spans the write.
+func (a *attach) captureRetractionCarrier(op *frontendOperation) (retracted bool, release func()) {
+	if op == nil || op.attach != a {
+		return false, func() {}
+	}
+	a.frontendGateMu.Lock()
+	if op.retracted {
+		a.frontendGateMu.Unlock()
+		return true, func() {}
+	}
+	op.carriers++
+	a.frontendGateMu.Unlock()
+	var once sync.Once
+	return false, func() {
+		once.Do(func() {
+			a.frontendGateMu.Lock()
+			if op.carriers > 0 {
+				op.carriers--
+			}
+			if a.frontendGateCond != nil {
+				a.frontendGateCond.Broadcast()
+			}
+			a.frontendGateMu.Unlock()
+		})
+	}
 }
 
 // ── THE PUBLICATION SETTLE VERDICT ──────────────────────────────────────────
@@ -1903,6 +1972,22 @@ func (a *attach) publicationBlockersLocked(
 			}
 			if liveHandlers <= 0 {
 				switch {
+				case op.published && op.carriers > 0:
+					// A reply of this operation has already captured its
+					// retraction verdict and its frame has not yet been written.
+					// Crossing now would produce exactly the frame the crossing
+					// needs to stamp — built before it, delivered after it — so
+					// the handoff waits for the write instead. That wait is one
+					// socket write to a peer that is blocked waiting for this very
+					// frame, not the unreachable acknowledgement the fence exists
+					// for, so it terminates. See frontendOperation.carriers.
+					//
+					// Only a PUBLISHED operation is held: a retraction that
+					// reached an operation with no exposed reply is dropped by
+					// frontendConn.captureRetraction anyway (the frontend would
+					// have no connection to acknowledge it on), so blocking a
+					// crossing for its carrier would buy nothing and would widen
+					// the wait beyond the case the finding names.
 				case op.published && op.participants > 0:
 					// Parked participants only: the acknowledgement cannot be
 					// produced until this handoff lets go of the scope.
@@ -2537,6 +2622,31 @@ func (a *attach) refreshWindowClassLocked(
 		return refreshClassApplication
 	}
 	if explicitTimes {
+		return refreshClassAmbiguous
+	}
+	// A MUTATION THAT STARTED AFTER THE WINDOW OPENED IS THE SAME AMBIGUITY.
+	//
+	// The size comparison below asks whether the item's composed size still
+	// equals the one the window names, and it is exactly the question a mutation
+	// between its commit and its publication cannot answer: the registry has NOT
+	// moved, which is the whole defect. A control write (or any other frontend's
+	// write) that opened its sequence after this window armed commits N, and
+	// until it publishes the comparison reads S and says "still the sampled
+	// size, answer locally" — so the daemon answers its own upcall as
+	// bookkeeping and the stale ftruncate(S) completes AFTER the newer commit.
+	//
+	// The arm side already refuses to open a window over an in-flight mutation
+	// (refreshSampleSupersededLocked); this is the other half of the same
+	// ordering, for a mutation that starts while the window is already open. The
+	// two are ordered against each other because both the window and the
+	// sequence are mutated under a.mu.
+	//
+	// Ambiguous, not Application: the refusal is safe for both candidates (the
+	// daemon's own ftruncate retries through kernelRefreshRetry, an
+	// application's retries the interrupted syscall), while calling it an
+	// application mutation would forward the daemon's own refresh to the
+	// authority — the one direction that destroys data.
+	if a.itemMutationInFlightLocked(itemID) {
 		return refreshClassAmbiguous
 	}
 	// An item the daemon no longer tracks cannot prove the window is dead, and
