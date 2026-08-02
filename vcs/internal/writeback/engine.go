@@ -2584,6 +2584,11 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 			j.AppliedThrough = e.fl.appliedThrough()
 			j.PendingRecords = uint64(recs)
 			j.PendingBytes = uint64(bytes)
+			// pendingStats is the sum of each lane's unshipped queue, so it is
+			// already the per-lane set the next attach's replay selects and
+			// reconciles against. Naming the basis is what makes that
+			// reconciliation possible at all — see RecoveryJob.PendingBasis.
+			j.PendingBasis = pendingBasisLane
 			j.LastError = reason
 			if unreplayable != nil {
 				// NOT JobForced: a forced job says "replay me". This one is a
@@ -2675,7 +2680,17 @@ func verifyParkedStreamReplayable(dir string) error {
 			return err
 		}
 	}
-	tail := laneTailFrames(mutations, streamMark{global: cert.global, lanes: cert.lanes})
+	pos := streamMark{global: cert.global, lanes: cert.lanes}
+	tail := laneTailFrames(mutations, pos)
+	// The park promises the next attach will replay this tail EXACTLY. A tail
+	// that is not a dense per-lane run from the verified base cannot be replayed
+	// exactly by anyone — the missing records are already gone — so promising it
+	// would be the lie this check exists to refuse. Proving it here also means
+	// the operator learns at unmount time, when they are still present, rather
+	// than at the next attach.
+	if err := verifyTailPrefixConsistent(tail, pos, tails); err != nil {
+		return err
+	}
 	if len(tail) == 0 {
 		return nil
 	}

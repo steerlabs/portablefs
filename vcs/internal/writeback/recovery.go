@@ -50,6 +50,21 @@ type RecoveryJob struct {
 	UpdatedAtMs      int64 `json:"updatedAtMs"`
 	LastProgressAtMs int64 `json:"lastProgressAtMs,omitempty"`
 
+	// PendingBasis names the rule PendingRecords/PendingBytes were counted
+	// under. It exists because the two numbers are a PROMISE the next attach
+	// reconciles its replay against, and a promise counted under a different
+	// rule than the one that checks it is not checkable at all.
+	//
+	// pendingBasisLane is the only rule a writer of this build uses: a record is
+	// pending when its OWN LANE's applied watermark does not cover it — exactly
+	// the set laneTailFrames selects and exactly the set replay drains. The
+	// field is empty on a job written before this round, whose counters used the
+	// GLOBAL applied prefix instead. That basis over-counts by construction (a
+	// wedged lane pins the global prefix while another lane's applied records sit
+	// above it), so an empty basis is reported as-is and never reconciled — an
+	// over-count is not evidence of loss.
+	PendingBasis string `json:"pendingBasis,omitempty"`
+
 	LastError string           `json:"lastError,omitempty"`
 	Conflicts []ConflictDetail `json:"conflicts,omitempty"`
 
@@ -82,6 +97,81 @@ func (j RecoveryJob) Unrecovered() (records uint64, bytes uint64) {
 		return j.LostRecords, j.LostBytes
 	}
 	return j.PendingRecords, j.PendingBytes
+}
+
+// pendingBasisLane is the one accounting rule this build's park paths use for
+// PendingRecords/PendingBytes: per LANE, not per global prefix. See
+// RecoveryJob.PendingBasis.
+const pendingBasisLane = "lane"
+
+// laneTailStats counts the mutation frames each lane has NOT applied at mark,
+// with their exact payload bytes.
+//
+// It is the ONE definition of "what this stream still owes the authority", and
+// both halves of the parked-tail contract are stated in it: the park records it
+// as its promise, and the replay reconciles against it before it applies a
+// single record. Counting the two ends differently is what let a park promise 34
+// records, a replay drain 2, and the difference be reported as nothing at all.
+func laneTailStats(mutations []frame, mark streamMark) (records, bytes uint64) {
+	for _, fr := range mutations {
+		if fr.laneSeq > mark.lanes[fr.lane].through {
+			records++
+			bytes += uint64(len(fr.payload))
+		}
+	}
+	return records, bytes
+}
+
+// verifyTailPrefixConsistent proves the tail about to be replayed is, in every
+// lane, a DENSE run from the verified base to the retained tail.
+//
+// ── WHY THIS IS THE PROPERTY, NOT AN EXTRA CHECK ─────────────────────────────
+//
+// A lane is a chain, and a chain has exactly one meaning: record N+1 is defined
+// on the state record N produced. So a replay that cannot apply record N may not
+// apply record N+1 either — not "should not", CANNOT, because what it would be
+// applying N+1 to is not the state N+1 was written against. When it does anyway,
+// the loss stops being a truncated tail and becomes a HOLE: a 0.94 MiB run of
+// zeros in the middle of a 1 GiB file, with correct data on both sides of it and
+// nothing anywhere saying so. Zeros where acknowledged bytes belong are worse
+// than a short file, because a short file is visibly short.
+//
+// Nothing else in the replay path establishes this. scanStream proves the
+// RETAINED frames are dense in global sequence, and the lane sequence is derived
+// by counting them — so within the retained set a gap cannot exist. What it
+// cannot prove is the join: the retained set begins wherever a reclaimed prefix
+// left it, the base is whatever the authority (or the local certificate) names,
+// and the two are separate facts. If the first retained record of a lane sits
+// above base+1, every record between them is simply absent from the replay, and
+// every later record is applied on top of the gap. The per-lane completeness
+// check at the END of the drain does not see it either: it compares the position
+// reached against the retained tail, and both sides of that comparison come from
+// the same retained set the missing records are already absent from.
+func verifyTailPrefixConsistent(tail []frame, pos streamMark, tails [streamLaneCount]uint64) error {
+	for lane := range pos.lanes {
+		l := StreamLane(lane)
+		want := pos.lanes[lane].through
+		for _, fr := range tail {
+			if fr.lane != l {
+				continue
+			}
+			want++
+			if fr.laneSeq != want {
+				return fmt.Errorf(
+					"%w: %s-lane replay would apply record %d over a missing record %d; "+
+						"a chain cannot be continued across a gap, and applying the later record would write a hole",
+					ErrCorrupt, l, fr.laneSeq, want,
+				)
+			}
+		}
+		if want != tails[lane] {
+			return fmt.Errorf(
+				"%w: %s-lane replay covers through %d but the retained WAL tail is %d",
+				ErrCorrupt, l, want, tails[lane],
+			)
+		}
+	}
+	return nil
 }
 
 // jobState is the atomic on-disk registry for one stream directory.
@@ -458,13 +548,32 @@ func summarizeUnreplayableStream(dir string, job RecoveryJob) (records, bytes ui
 		}
 	}
 	if decodeErr == nil {
-		records, bytes = 0, 0
-		for _, fr := range mutations {
-			if fr.seq > applied {
-				records++
-				bytes += uint64(len(fr.payload))
+		// The frame-level count is per LANE, matching the basis both park paths
+		// record and the basis replay reconciles against — but only when the
+		// certificates FOLD. A stream whose certificates contradict each other is
+		// one of the two shapes that reach containment at all, and it has no lane
+		// position: reading its lanes as zero would count every retained record
+		// as lost, including the ones the authority demonstrably applied. That
+		// stream's only surviving position is the job's own global watermark, so
+		// it is counted against that, exactly as before.
+		var scanRecords, scanBytes uint64
+		if cert, certErr := highestAppliedCertificate(marks, scan.lastSeq); certErr == nil {
+			scanRecords, scanBytes = laneTailStats(mutations, streamMark{global: applied, lanes: cert.lanes})
+		} else {
+			for _, fr := range mutations {
+				if fr.seq > applied {
+					scanRecords++
+					scanBytes += uint64(len(fr.payload))
+				}
 			}
 		}
+		// The LARGER of the two, never the frame count alone. The job's durable
+		// counters are what the park PROMISED was still owed to the authority;
+		// the frame count is what the stream can still produce. When they differ
+		// the difference is precisely the loss this verdict exists to state, and
+		// overwriting the promise with the remainder would report the vanished
+		// records as never having existed.
+		records, bytes = max(records, scanRecords), max(bytes, scanBytes)
 		for scope := range live {
 			scopes = append(scopes, scope)
 		}
@@ -615,6 +724,38 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			j.LastError = err.Error()
 		})
 		return err
+	}
+	// ── RECONCILE THE PARK'S OWN PROMISE, BEFORE ANYTHING IS SENT ────────────
+	//
+	// The park published a DEFINITE count of the acknowledged records it was
+	// holding. This is the only moment that count can still be checked against
+	// the bytes it was a count OF, and it has to be checked before the first
+	// record is shipped: once a suffix has been applied, "the stream is shorter
+	// than it promised" is no longer a recoverable situation, it is a hole.
+	//
+	// Only a SHORTFALL is a finding. The claim may legitimately sit BELOW the
+	// retained tail — a re-entered replay records its own dwindling remainder as
+	// it goes, and the authority may already hold records whose acknowledgement
+	// was lost — so the one direction that means anything is `claim > have`:
+	// records the park promised are no longer in the stream at all.
+	// That is unreplayable, and it must reach a reported verdict rather than a
+	// success that drains what is left and calls the difference zero.
+	claim := js.snapshot()
+	promisedRecords, promisedBytes := claim.PendingRecords, claim.PendingBytes
+	if claim.PendingBasis == pendingBasisLane {
+		haveRecords, haveBytes := laneTailStats(mutations, cert)
+		if claim.PendingRecords > haveRecords || claim.PendingBytes > haveBytes {
+			js.update(func(j *RecoveryJob) {
+				j.State = JobCorrupt
+				j.LastError = fmt.Sprintf(
+					"the parked snapshot promised %d acknowledged record(s) / %d byte(s) but the stream retains only %d / %d",
+					claim.PendingRecords, claim.PendingBytes, haveRecords, haveBytes)
+			})
+			return fmt.Errorf(
+				"%w: parked stream lost %d of %d acknowledged record(s) before replay",
+				ErrCorrupt, claim.PendingRecords-min(claim.PendingRecords, haveRecords), claim.PendingRecords,
+			)
+		}
 	}
 	ss, err := e.remote.StreamState(ctx, wbID)
 	if err != nil {
@@ -786,7 +927,31 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	//
 	// Each lane chains from its own verified base and names its own watermark.
 	tail = laneTailFrames(mutations, pos)
+	// PREFIX CONSISTENCY, proved before the first record is shipped. See
+	// verifyTailPrefixConsistent: a lane whose tail does not begin exactly at
+	// its verified base+1 has records missing UNDER the ones about to be
+	// applied, and applying them anyway is how a lost tail becomes a mid-file
+	// hole. There is nothing to salvage record-by-record here — the lane is a
+	// chain — so the answer is one terminal verdict for the stream.
+	if err := verifyTailPrefixConsistent(tail, pos, tails); err != nil {
+		js.update(func(j *RecoveryJob) {
+			j.State = JobCorrupt
+			j.LastError = err.Error()
+		})
+		return err
+	}
 	drained := 0
+	// The BYTE half of the replay's own progress, tracked beside the record
+	// half. It used to be absent, and the absence was a silent dishonesty of its
+	// own: a replay that shipped every record left PendingRecords at 0 and
+	// PendingBytes at whatever the park had written, so a job mid-replay — and
+	// any job that was re-attempted from a persisted snapshot — carried a byte
+	// count that no longer described anything. Two counters that are supposed to
+	// be two views of one set must move together or neither can be trusted.
+	var tailBytes, drainedBytes uint64
+	for _, fr := range tail {
+		tailBytes += uint64(len(fr.payload))
+	}
 	for _, lane := range [...]StreamLane{StreamLaneLegacy, StreamLaneNamespace, StreamLaneData} {
 		laneFrames := make([]frame, 0, len(tail))
 		for _, fr := range tail {
@@ -868,8 +1033,10 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			prev = end
 			pos.lanes[lane] = laneMark{through: reply.Through, digest: end}
 			drained += j - i
+			drainedBytes += uint64(bytes)
 			i = j
 			remaining := len(tail) - drained
+			remainingBytes := tailBytes - min(tailBytes, drainedBytes)
 			// The registry's AppliedThrough is a GLOBAL-sequence progress
 			// figure, and a per-lane replay does not produce one directly: the
 			// lanes are drained one after another, so no single lane watermark
@@ -885,6 +1052,8 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			if err := js.updateDebounced(func(jb *RecoveryJob) {
 				jb.AppliedThrough = applied
 				jb.PendingRecords = uint64(remaining)
+				jb.PendingBytes = remainingBytes
+				jb.PendingBasis = pendingBasisLane
 			}); err != nil {
 				return fmt.Errorf("%w: persist recovery progress: %v", errRetryable, err)
 			}
@@ -909,6 +1078,21 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			})
 			return err
 		}
+	}
+	// Every selected record was shipped. This is a statement about the drain
+	// loop itself, not about the stream, and it is asserted rather than assumed
+	// because everything downstream — the removal of the stream directory, the
+	// job leaving the parked set, Pending() returning to zero — is authorized by
+	// it. A success that shipped fewer records than it selected is the exact
+	// shape this round exists to make impossible.
+	if drained != len(tail) {
+		err := fmt.Errorf("%w: recovery drained %d of the %d selected record(s)",
+			ErrCorrupt, drained, len(tail))
+		js.update(func(j *RecoveryJob) {
+			j.State = JobCorrupt
+			j.LastError = err.Error()
+		})
+		return err
 	}
 	pos.global = scan.lastSeq
 	// Resolve and durably publish every frontend identity before recording
@@ -982,7 +1166,12 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 	if err := e.remote.Discard(ctx, wbID, nil); err != nil {
 		return fmt.Errorf("%w: discard stream remainder: %v", errRetryable, err)
 	}
-	e.logf("writeback: recovered stream %s: %d records drained, %d scopes released", wbID, len(tail), len(scopes))
+	// The count is what was actually SHIPPED, and the promise it satisfied is
+	// named beside it. Reporting the size of the selection instead made the one
+	// number an operator reads to check a replay against the park a restatement
+	// of the replay's own opinion of itself.
+	e.logf("writeback: recovered stream %s: %d record(s) drained, satisfying the parked promise of %d record(s) / %d byte(s); %d scope(s) released",
+		wbID, drained, promisedRecords, promisedBytes, len(scopes))
 	return removeStreamDir(dir)
 }
 
