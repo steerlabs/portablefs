@@ -496,7 +496,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             // write) is not a lie: the daemon refuses a retracted
             // operation's unanswered requests without executing them, so
             // nothing this callback failed to observe has landed. See
-            // `PfsLocalClient.settlePublications`.
+            // `PfsLocalClient.runPublicationBoundary`.
             let (result, complete) = await core.client.withDeferredPublication {
                 try await operation.value()
             }

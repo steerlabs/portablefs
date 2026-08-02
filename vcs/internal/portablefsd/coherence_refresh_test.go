@@ -707,7 +707,25 @@ func TestFrontendDisconnectCompletesReservedOperationWhoseInitializerHasNotStart
 	}
 }
 
-func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.T) {
+// A disconnect that loses an acknowledgement RETIRES the operation and lets the
+// mount go on serving. It does not install a terminal verdict.
+//
+// The old contract was the opposite: one exposed-unacknowledged publication at
+// disconnect published a terminal gate error, froze the attach, and aborted the
+// waiting handoff. That is the live blocker — a latency outlier closed the
+// connection and the mount answered EIO forever after. The acknowledgement is
+// genuinely unreachable once the connection is gone, but "unreachable" is a
+// statement about the ACK, not about the kernel: the mount outlives the
+// connection and the daemon can rewrite the affected kernel state through it.
+//
+// So what this test pins is the liveness the verdict used to provide by force:
+//   - the waiting handoff PROCEEDS (its blocker was retired, not failed),
+//   - the attach is still admitting,
+//   - a later handoff still succeeds,
+//   - and close() does not deadlock against a handler parked behind that very
+//     handoff, which is the cycle the terminal verdict was introduced to break:
+//     close -> handlerWG -> handler -> handoff -> exposed operation -> close.
+func TestClosedFrontendConnectionRepairsExposedUnacknowledgedOperation(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
 	defer clientSide.Close()
 	a := &attach{}
@@ -723,14 +741,15 @@ func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.
 	}
 	exposeTestLogicalOperation(t, conn, 1)
 	handoffDone := make(chan error, 1)
+	handoffFinished := make(chan struct{})
 	go func() {
-		// A real attached handler holds the frontend proxy for reading while
-		// a delegation handoff runs. The disconnect verdict must wake this
-		// wait before failCoherence takes that proxy exclusively.
+		// A real attached handler holds the frontend proxy for reading while a
+		// delegation handoff runs.
 		a.frontendSerial.RLock()
 		err := a.startFrontendHandoff(context.Background(), "d")
 		a.frontendSerial.RUnlock()
 		handoffDone <- err
+		close(handoffFinished)
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -745,24 +764,17 @@ func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// Model a connection handler whose only exit is the cancellation chain
-	// that follows the terminal gate verdict. Joining handlers before
-	// publishing that verdict creates a closed cycle:
-	// close -> handlerWG -> handler -> handoff -> exposed operation -> close.
+	// Model a connection handler whose only exit is the completion of that
+	// handoff. If close() joined handlers before retiring the exposed
+	// operation, this would be the closed cycle above and the test would hang.
 	handlerStarted := make(chan struct{})
-	gateSeen := make(chan struct{})
-	releaseHandler := make(chan struct{})
+	handlerDone := make(chan struct{})
 	conn.handlerWG.Add(1)
 	go func() {
 		defer conn.handlerWG.Done()
 		close(handlerStarted)
-		a.frontendGateMu.Lock()
-		for a.frontendGateErr == nil {
-			a.frontendGateCond.Wait()
-		}
-		a.frontendGateMu.Unlock()
-		close(gateSeen)
-		<-releaseHandler
+		<-handoffFinished
+		close(handlerDone)
 	}()
 	<-handlerStarted
 	closeDone := make(chan struct{})
@@ -771,40 +783,43 @@ func TestClosedFrontendConnectionFailsExposedUnacknowledgedOperation(t *testing.
 		close(closeDone)
 	}()
 	select {
-	case <-gateSeen:
-	case <-time.After(time.Second):
-		t.Fatal("disconnect did not publish its terminal gate verdict before joining handlers")
-	}
-	if err := a.frontendAdmissionError(); err == nil {
-		t.Fatal("replacement frontend was admitted during disconnect fence linearization")
-	}
-	close(releaseHandler)
-
-	select {
-	case err := <-handoffDone:
-		if err == nil {
-			t.Fatal("waiting handoff crossed an unacknowledged exposed publication")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("waiting handoff did not abort after coherence failed")
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("disconnect did not retire the exposed operation before joining handlers")
 	}
 	select {
 	case <-closeDone:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("exposed disconnect deadlocked behind the waiting handoff")
 	}
-	if err := a.frontendAdmissionError(); err == nil {
-		t.Fatal("attach remained admitted after exposed publication disconnected")
+	// The handoff CROSSED rather than aborting: its blocker was retired, not
+	// failed. It owns the scope until its release ends, exactly as a successful
+	// handoff always has.
+	if err := <-handoffDone; err != nil {
+		t.Fatalf("handoff was refused by a lost acknowledgement: %v", err)
+	}
+	a.endFrontendHandoff("d")
+	// THE POSTURE. A lost acknowledgement leaves the mount serving.
+	if err := a.frontendAdmissionError(); err != nil {
+		t.Fatalf("attach was terminally degraded by a lost acknowledgement: %v", err)
+	}
+	a.frontendGateMu.Lock()
+	stillActive := len(a.frontendActive)
+	a.frontendGateMu.Unlock()
+	if stillActive != 0 {
+		t.Fatalf("disconnect left %d operation(s) in the publication set", stillActive)
 	}
 	a.frontendGateMu.Lock()
 	waiting := len(a.frontendHandoffs)
 	a.frontendGateMu.Unlock()
 	if waiting != 0 {
-		t.Fatalf("aborted handoff left %d scope(s) installed", waiting)
+		t.Fatalf("completed handoff left %d scope(s) installed", waiting)
 	}
-	if err := a.startFrontendHandoff(context.Background(), "d"); err == nil {
-		t.Fatal("later handoff crossed terminal frontend gate failure")
+
+	if err := a.startFrontendHandoff(context.Background(), "d"); err != nil {
+		t.Fatalf("later handoff was refused after a lost acknowledgement: %v", err)
 	}
+	a.endFrontendHandoff("d")
 }
 
 func TestClosedFrontendConnectionReleasesAcknowledgedOperation(t *testing.T) {
@@ -942,7 +957,20 @@ func TestLogicalOperationIDsAreAdmittedInWireOrderNotHandlerOrder(t *testing.T) 
 	}
 }
 
-func TestLogicalOperationAckRequiresExposedReplyAndWaitsForEveryPipelinedRequest(t *testing.T) {
+// An acknowledgement is accepted whether or not a reply has been exposed yet,
+// and either way the operation is retired only once EVERY pipelined request of
+// it has finished.
+//
+// The first half is the changed contract. The daemon used to refuse an
+// acknowledgement for an operation with no exposed reply and kill the
+// connection over it, which was right while the frontend created its obligation
+// on RECEIVING an ack-required reply. The obligation now begins where the daemon's
+// own does — when the operation ID is stamped on a request — so a frontend that
+// gave up on a reply this daemon is still computing can say it has finished, and
+// that is the statement that used to strand: the operation stayed pinned in the
+// publication set on a healthy connection, blocking every handoff over its scope
+// and refusing clean unmount, with no event left that could ever retire it.
+func TestLogicalOperationAckBeforeExposureRetiresAfterEveryPipelinedRequest(t *testing.T) {
 	a := &attach{}
 	conn := &frontendConn{}
 	const operationID uint64 = 1
@@ -959,12 +987,16 @@ func TestLogicalOperationAckRequiresExposedReplyAndWaitsForEveryPipelinedRequest
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conn.acknowledgePublication(operationID) {
-		t.Fatal("acknowledgement before a reply was exposed was accepted")
-	}
-	exposeTestLogicalOperation(t, conn, operationID)
 	if !conn.acknowledgePublication(operationID) {
-		t.Fatal("acknowledgement after reply exposure was rejected")
+		t.Fatal("acknowledgement before a reply was exposed was refused")
+	}
+	// A reply written after the acknowledgement still goes out — the request is
+	// owed one either way — and simply pins nothing, because the obligation has
+	// already been discharged and there is exactly one acknowledgement per
+	// operation.
+	exposeTestLogicalOperation(t, conn, operationID)
+	if conn.acknowledgePublication(operationID) {
+		t.Fatal("operation was acknowledged twice")
 	}
 
 	handoffDone := make(chan error, 1)

@@ -37,6 +37,20 @@ private final class PfsConnection: @unchecked Sendable {
     var resolvedAttachRef: String?
     var eventsSubscribed = false
     var nextOperationID: UInt64 = 1
+    /// The per-request reply bound this connection's DAEMON asked for
+    /// (HelloReply.request_deadline_ms, protocol minor 7). It is per connection
+    /// because it is a property of the peer, not of this process: a client
+    /// compiled-in constant is exactly what could not see the daemon's own
+    /// budgets and expired ahead of them. Zero until Hello completes, which is
+    /// why `deadlineNanoseconds(default:)` falls back to the configuration for
+    /// the Hello exchange itself.
+    var negotiatedRequestDeadlineNanoseconds: UInt64 = 0
+
+    func deadlineNanoseconds(default fallback: UInt64) -> UInt64 {
+        negotiatedRequestDeadlineNanoseconds == 0
+            ? fallback
+            : negotiatedRequestDeadlineNanoseconds
+    }
 
     init(socket: PfsAsyncSocket) {
         self.socket = socket
@@ -268,17 +282,50 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         return retracted
     }
 
-    func bind(to connectionID: UUID, allocating candidate: UInt64) -> (id: UInt64, isNew: Bool)? {
+    /// Binds this operation to `connection` and RECORDS THE ACKNOWLEDGEMENT
+    /// OBLIGATION IN THE SAME STEP.
+    ///
+    /// ── WHY THE TICKET IS CREATED HERE AND NOT ON THE REPLY ─────────────────
+    ///
+    /// The daemon creates its logical operation the instant it sees this
+    /// operation ID on a request (`reserveLogicalOperation`), and from that
+    /// moment only a `PublicationAck` for that ID can retire it. The obligation
+    /// is therefore incurred when the ID is STAMPED, not when a reply comes
+    /// back.
+    ///
+    /// The ticket used to be created in `receive`, on observing
+    /// `publicationAckRequired`. That left a gap with nothing bridging it: an
+    /// operation whose reply was never observed — dropped because its `pending`
+    /// entry had already been removed, or never delivered at all — produced an
+    /// operation ID the daemon was holding and a collector that would snapshot
+    /// to an EMPTY ticket list. `snapshot()` returning `[]` while `operationID`
+    /// is non-nil means precisely "we told the daemon to create operation N and
+    /// then forgot about it", and it was silent: no ack, no log, no fallback.
+    /// The daemon's side is not silent about it — the operation stays pinned in
+    /// the publication set forever, blocking every delegation handoff over its
+    /// scope and refusing clean unmount, on a connection that is perfectly
+    /// healthy. That is the accumulation of exposed-unacknowledged publications
+    /// on a CONNECTED frontend that the live battery recorded on an idle mount.
+    ///
+    /// Acknowledging an operation whose reply was never seen is not merely safe,
+    /// it is the STRONGER statement: the ack says the callback has finished and
+    /// whatever the operation published is now installed or discarded, and a
+    /// reply that was never observed installed nothing at all.
+    func bind(
+        to connection: PfsConnection,
+        allocating candidate: UInt64
+    ) -> (id: UInt64, isNew: Bool)? {
         lock.lock()
         defer { lock.unlock() }
         if let boundConnectionID {
-            guard boundConnectionID == connectionID, let operationID else {
+            guard boundConnectionID == connection.id, let operationID else {
                 return nil
             }
             return (operationID, false)
         }
-        boundConnectionID = connectionID
+        boundConnectionID = connection.id
         operationID = candidate
+        connections[connection.id] = connection
         return (candidate, true)
     }
 
@@ -416,60 +463,118 @@ public actor PfsLocalClient {
         if PfsPublicationContext.collector != nil {
             return try await sendRequestOnCurrentConnection(body)
         }
-        let collector = PfsPublicationCollector()
-        let outcome: Result<PfsEnvelope, Error> = await PfsPublicationContext.$collector.withValue(collector) {
-            do {
-                return .success(try await self.sendRequestOnCurrentConnection(body))
-            } catch {
-                // Cacheable negative replies are publications too. `receive`
-                // records their request ID before resuming the throwing
-                // continuation, so the daemon gate is released only below.
-                return .failure(error)
+        // The reissue loop is spelled out here rather than delegated to
+        // `runPublicationBoundary` because `sendRequestOnCurrentConnection` is
+        // isolated to this actor: handing it to a nonisolated helper would send
+        // an actor-isolated closure across domains. The policy is identical —
+        // see `runPublicationBoundary` for why a retracted attempt is
+        // acknowledged and then reissued rather than surfaced.
+        var attempt = 0
+        while true {
+            let collector = PfsPublicationCollector()
+            let outcome: Result<PfsEnvelope, Error> = await PfsPublicationContext
+                .$collector.withValue(collector) {
+                    do {
+                        return .success(try await self.sendRequestOnCurrentConnection(body))
+                    } catch {
+                        // Cacheable negative replies are publications too.
+                        // `receive` records their request ID before resuming the
+                        // throwing continuation, so the daemon gate is released
+                        // by the settlement below either way.
+                        return .failure(error)
+                    }
+                }
+            await completePublications(collector.snapshot())
+            guard collector.isRetracted else {
+                return try outcome.get()
+            }
+            attempt += 1
+            if attempt >= PfsLocalClient.publicationRetractionReissueLimit {
+                throw PfsLocalClientError.publicationRetracted
             }
         }
-        return try await settlePublications(collector, outcome: outcome)
     }
 
-    /// Releases the daemon's handoff gate for `collector` and then applies the
-    /// operation's retraction verdict.
+    /// Runs `operation` as ONE logical publication boundary, REISSUING it in
+    /// full if the daemon retracts it, and returns the surviving attempt's
+    /// tickets as a deferred acknowledgement.
     ///
-    /// The acknowledgement is sent for a retracted operation exactly as for a
-    /// live one. Retraction says what the FRONTEND may install; the ack is the
-    /// daemon's own bookkeeping, and withholding it would leave the daemon
-    /// blocked on a callback that has already abandoned its values.
+    /// ── WHY THE EXTENSION RETRIES AND NOT THE KERNEL ────────────────────────
     ///
-    /// A retracted operation throws instead of returning its values and then
-    /// refreshing them. This model is version-anchored with a zero TTL: a
-    /// value is valid only for the delegation epoch it was read in, and there
-    /// is no interval over which a superseded value is "still mostly right".
-    /// Install-then-invalidate would publish a value the daemon has already
-    /// declared wrong and rely on a later, merely eventual event to remove it
-    /// — and an application that read in between would have read a stale byte
-    /// with no error anywhere. Throwing costs one retried syscall; installing
-    /// costs correctness.
+    /// A retraction used to be surfaced to FSKit as EINTR on the belief that the
+    /// kernel would then restart the syscall against a frontend holding nothing
+    /// — the belief is written out in `PfsLocalClientError.publicationRetracted`
+    /// and it is FALSE on macOS 26. FSKit does not restart rmdir(2): the EINTR
+    /// propagates all the way to userspace. `/bin/rmdir` and `rm -rf` do not
+    /// retry EINTR either, so every cold-cycle rmdir that a delegation handoff
+    /// happened to cross failed the application, deterministically, on an
+    /// otherwise idle mount (live: 8/8).
     ///
-    /// Throwing away the whole result is safe for MUTATING callbacks, not
-    /// just reads, and that is a property of the daemon rather than of this
-    /// code. A retracted operation's requests that had not already been
-    /// answered are refused EINTR without being executed, so the callback's
-    /// last request — typically the very mutation that was waiting on the
-    /// delegation — has not landed when this throws. Were that not so, an
-    /// `rm` could be reported interrupted after the unlink had happened and
-    /// then answer ENOENT on the retry. The retry itself terminates: the
+    /// The retry has to happen below userspace, and this is the only place that
+    /// both knows the operation was retracted and still holds everything needed
+    /// to run it again. Nothing about the retraction contract changes; what
+    /// changes is who honours it.
+    ///
+    /// ── WHY REISSUING IS SOUND, INCLUDING FOR MUTATIONS ─────────────────────
+    ///
+    /// The daemon refuses a retracted operation's UNANSWERED requests without
+    /// executing them, so the reissue cannot double-apply a mutation: the
+    /// request that was going to mutate is precisely the one that did not run.
+    /// (Structurally, a crossing is only ever taken against an operation whose
+    /// participants are ALL PARKED — a parked request has not dispatched — so
+    /// there is no interleaving in which the mutation landed and the operation
+    /// was still retracted.)
+    ///
+    /// ── WHY THE ACK COMES BEFORE THE REISSUE ────────────────────────────────
+    ///
+    /// The retracted attempt still owes its acknowledgement: that ack is what
+    /// releases the daemon's handoff gate. Reissuing while holding it would
+    /// queue the new attempt behind a handoff that is waiting for this very ack.
+    /// So each retracted attempt is acknowledged in full before the next begins,
+    /// which is also what makes the daemon's convergence promise apply — the
     /// refusal only becomes reachable once the handoff has completed, so the
-    /// second attempt finds nothing left to hand off.
-    private nonisolated func settlePublications<T>(
-        _ collector: PfsPublicationCollector,
-        outcome: Result<T, Error>
-    ) async throws -> T {
-        let tickets = collector.snapshot()
-        let retracted = collector.isRetracted
-        await completePublications(tickets)
-        if retracted {
-            throw PfsLocalClientError.publicationRetracted
+    /// reissue finds nothing left to hand off.
+    ///
+    /// ── WHY IT IS BOUNDED ───────────────────────────────────────────────────
+    ///
+    /// One reissue converges against the handoff that caused the retraction, but
+    /// an unrelated handoff can always cross a later attempt. The bound keeps a
+    /// pathological mount from spinning a syscall forever; on exhaustion the old
+    /// behaviour is restored exactly (EINTR to the framework), so this is never
+    /// worse than what it replaces.
+    private nonisolated func runPublicationBoundary<T>(
+        _ operation: () async throws -> T
+    ) async -> (Result<T, Error>, @Sendable () async -> Void) {
+        var attempt = 0
+        while true {
+            let collector = PfsPublicationCollector()
+            let outcome: Result<T, Error> = await PfsPublicationContext.$collector
+                .withValue(collector) {
+                    do {
+                        return .success(try await operation())
+                    } catch {
+                        // Cacheable negative replies are publications too.
+                        // `receive` records their request ID before resuming the
+                        // throwing continuation, so the daemon gate is released
+                        // by the ticket settlement below either way.
+                        return .failure(error)
+                    }
+                }
+            let tickets = collector.snapshot()
+            guard collector.isRetracted else {
+                return (outcome, { await self.completePublications(tickets) })
+            }
+            await completePublications(tickets)
+            attempt += 1
+            if attempt >= PfsLocalClient.publicationRetractionReissueLimit {
+                return (.failure(PfsLocalClientError.publicationRetracted), {})
+            }
         }
-        return try outcome.get()
     }
+
+    /// How many times a retracted logical operation is reissued by the
+    /// extension before the retraction is surfaced to the framework.
+    static let publicationRetractionReissueLimit = 4
 
     /// Extends every request issued by operation through the point where the
     /// FSKit adapter has copied/installed the returned values. The daemon
@@ -481,17 +586,12 @@ public actor PfsLocalClient {
         if PfsPublicationContext.collector != nil {
             return try await operation()
         }
-        let collector = PfsPublicationCollector()
-        let outcome: Result<T, Error> = await PfsPublicationContext.$collector.withValue(collector) {
-            do {
-                return .success(try await operation())
-            } catch {
-                return .failure(error)
-            }
-        }
-        // A retracted operation never hands its values back, even though the
-        // operation itself succeeded. See `settlePublications`.
-        return try await settlePublications(collector, outcome: outcome)
+        // A retracted operation is REISSUED rather than handed back, and only a
+        // retraction that survives the reissue bound reaches the caller. See
+        // `runPublicationBoundary`.
+        let (result, complete) = await runPublicationBoundary(operation)
+        await complete()
+        return try result.get()
     }
 
     /// Collects the request IDs issued by `operation` without acknowledging
@@ -502,33 +602,15 @@ public actor PfsLocalClient {
     public nonisolated func withDeferredPublication<T>(
         _ operation: () async throws -> T
     ) async -> (Result<T, Error>, @Sendable () async -> Void) {
-        let collector = PfsPublicationCollector()
-        let result: Result<T, Error> = await PfsPublicationContext.$collector.withValue(collector) {
-            do {
-                return .success(try await operation())
-            } catch {
-                return .failure(error)
-            }
-        }
-        let tickets = collector.snapshot()
-        // The retraction verdict is applied HERE, before this function
-        // returns, so a caller that hands `result` to a framework reply
-        // handler physically cannot hand back retracted values: by the time
-        // it sees the result, a retracted operation is already a thrown
-        // EINTR. Every reply for the operation has been received at this
-        // point — `operation()` cannot have returned otherwise — so the flag
-        // is final. See `settlePublications` for why throwing, not
-        // installing-then-refreshing, is the only sound answer.
-        let published: Result<T, Error> = collector.isRetracted
-            ? .failure(PfsLocalClientError.publicationRetracted)
-            : result
-        // The acknowledgement is still owed for a retracted operation: the
-        // daemon's handoff gate must be released whether or not the frontend
-        // kept the values.
-        let complete: @Sendable () async -> Void = {
-            await self.completePublications(tickets)
-        }
-        return (published, complete)
+        // The retraction verdict is applied INSIDE the boundary, before this
+        // function returns, so a caller that hands `result` to a framework reply
+        // handler physically cannot hand back retracted values: a retracted
+        // attempt is reissued, and only a retraction that survives the reissue
+        // bound comes back — already as a thrown EINTR, never as values. Every
+        // reply for an attempt has been received before it is judged
+        // (`operation()` cannot have returned otherwise), so each verdict is
+        // final. See `runPublicationBoundary`.
+        return await runPublicationBoundary(operation)
     }
 
     /// Resolves this connection to an attach reference and remembers it for reconnects.
@@ -737,7 +819,14 @@ public actor PfsLocalClient {
         // below its own minor, which is what makes the retraction bit safe to
         // rely on — an extension that ignored it would install state the
         // daemon has withdrawn, and nothing on the wire would say so.
-        hello.protocolMinor = 6
+        //
+        // Protocol minor 7: this frontend takes its per-request reply deadline
+        // from HelloReply.request_deadline_ms instead of from a constant of its
+        // own. The same gate applies for the same reason — a frontend that
+        // ignored the field would keep the compiled-in 60s bound that was
+        // observed live to expire ahead of the daemon's own 50s admission
+        // budget, and nothing on the wire would say so.
+        hello.protocolMinor = 7
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -745,8 +834,20 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 6 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 7 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
+        }
+        // ADOPT THE DAEMON'S BOUND, AND NEVER SHORTEN IT.
+        //
+        // max() with the configured value is deliberate: the configuration is a
+        // floor for tests and for a daemon that answers zero, never a ceiling.
+        // A frontend that could shorten the daemon's bound would reintroduce
+        // exactly the defect the field exists to remove.
+        if reply.requestDeadlineMs != 0 {
+            connection?.negotiatedRequestDeadlineNanoseconds = max(
+                configuration.requestDeadlineNanoseconds,
+                UInt64(reply.requestDeadlineMs) * 1_000_000
+            )
         }
     }
 
@@ -778,7 +879,7 @@ public actor PfsLocalClient {
         if let collector = PfsPublicationContext.collector {
             if pfsRequestPublishes(body) {
                 guard let binding = collector.bind(
-                    to: connection.id,
+                    to: connection,
                     allocating: connection.nextOperationID
                 ) else {
                     // A framework reply cannot combine cacheable results from two
@@ -824,7 +925,12 @@ public actor PfsLocalClient {
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let timeoutTask = Task.detached { [requestID, deadline = configuration.requestDeadlineNanoseconds] in
+                let timeoutTask = Task.detached { [
+                    requestID,
+                    deadline = connection.deadlineNanoseconds(
+                        default: configuration.requestDeadlineNanoseconds
+                    ),
+                ] in
                     do {
                         try await Task.sleep(nanoseconds: deadline)
                         await self.timeoutRequest(requestID)
@@ -887,19 +993,40 @@ public actor PfsLocalClient {
         closeCurrentConnection(connectionID, error: error)
     }
 
+    /// Fails ONE request whose reply never arrived, and leaves the connection —
+    /// and therefore every other operation's publication — untouched.
+    ///
+    /// ── WHY THIS NO LONGER RESETS THE CONNECTION ────────────────────────────
+    ///
+    /// It used to, and the justification was that a late reply for this request
+    /// would otherwise arrive with nobody to acknowledge it, leaving an
+    /// unacknowledgeable operation in the daemon's handoff gate. That reasoning
+    /// is about ONE operation and the remedy it chose was mount-wide: closing
+    /// the connection strands every OTHER in-flight operation's publication too,
+    /// and the daemon's disconnect path treats an exposed-unacknowledged
+    /// publication as a kernel-coherence failure. So a single slow reply — a
+    /// latency outlier on a healthy mount, which the live battery recorded as a
+    /// 58.8s cold create against a 60s bound — became a permanent whole-mount
+    /// EIO. The cure was categorically worse than the disease.
+    ///
+    /// It is also unnecessary. A late reply is already handled: `receive` looks
+    /// the request ID up in `pending`, finds nothing, and drops the frame —
+    /// including its publication ticket. What the OPERATION owes is unaffected,
+    /// because the operation is acknowledged as a whole by `completePublications`
+    /// from the tickets its ALREADY-RECEIVED publishing replies registered, and
+    /// the daemon retires it when its own handler finishes. The two orders are
+    /// independent by construction (see the daemon's acknowledgePublication /
+    /// finishLogicalRequest pair).
+    ///
+    /// The deadline itself is now the daemon's own (protocol minor 7), set far
+    /// above anything a healthy handler can reach, so reaching it means a wedged
+    /// request rather than a slow one — and a wedged request deserves a definite
+    /// answer for itself, not a mount-wide verdict.
     private func timeoutRequest(_ requestID: UInt64) {
         guard let request = pending.removeValue(forKey: requestID) else {
             return
         }
-        let connectionID = connection?.id
         request.continuation.resume(throwing: PfsLocalClientError.timeout)
-        if let connectionID {
-            // The daemon may still publish a late reply for this request. A
-            // connection reset is the exact cancellation boundary: it
-            // retires every server-side publication ticket instead of
-            // leaving an unacknowledgeable operation in the handoff gate.
-            closeCurrentConnection(connectionID, error: PfsLocalClientError.timeout)
-        }
     }
 
     private func cancelRequest(_ requestID: UInt64) {

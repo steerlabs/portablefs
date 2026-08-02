@@ -518,8 +518,15 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
 /// must never reach the reply handler, because the reply handler IS the
 /// framework install. The daemon's gate is still released — retraction governs
 /// what the framework caches, not the daemon's bookkeeping.
+///
+/// What the FRAMEWORK sees is a REISSUE, not an interruption. Surfacing EINTR
+/// here assumed the kernel would restart the syscall against a frontend holding
+/// nothing; FSKit on macOS 26 does not restart rmdir(2), so that EINTR reached
+/// userspace and failed the application on an idle mount. The extension retries
+/// below userspace instead: the retracted attempt is acknowledged in full, the
+/// operation is reissued, and only the surviving attempt's values are installed.
 @available(macOS 26.0, *)
-@Test func operationsAdapterWithholdsRetractedValuesAndStillAcknowledges() async throws {
+@Test func operationsAdapterReissuesRetractedOperationAndAcknowledgesBoth() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
     let baseline = try await settledAckBaseline(harness.daemon, owed: 0)
@@ -527,36 +534,41 @@ private func readViaCore(_ core: VolumeCore, item: FSItem, length: Int) async th
 
     await harness.daemon.retractNextPublications()
 
-    let outcome: Int32 = await withCheckedContinuation { continuation in
+    // The framework is handed the REISSUE's values. Nothing from the retracted
+    // attempt reaches it, and no EINTR reaches userspace: `delivered` is true
+    // and `failure` is nil.
+    let (delivered, failure): (Bool, Int32?) = await withCheckedContinuation { continuation in
         harness.volume.getAttributes(
             FSItem.GetAttributesRequest(),
             of: harness.root
         ) { attributes, error in
-            guard let error else {
-                // Reaching here at all means retracted values were handed to
-                // the framework.
-                Issue.record("expected a retracted getattr to withhold its attributes")
-                continuation.resume(returning: 0)
+            if let error {
+                continuation.resume(returning: (false, Int32((error as NSError).code)))
                 return
             }
-            #expect(attributes == nil)
-            continuation.resume(returning: Int32((error as NSError).code))
+            continuation.resume(returning: (attributes != nil, nil))
         }
     }
-    // EINTR: the syscall retries against a frontend that installed nothing.
-    #expect(outcome == EINTR)
+    #expect(failure == nil)
+    #expect(delivered)
 
-    let stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 1)
-    #expect(stats.publicationAcks == baseline + 1)
-    #expect(stats.getAttrRequests == baselineGetattrs + 1)
+    // TWO daemon getattrs for ONE framework callback: the retracted attempt and
+    // the reissue. That count IS the proof the retry happened below userspace.
+    let stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 2)
+    #expect(stats.getAttrRequests == baselineGetattrs + 2)
+    // BOTH attempts are acknowledged. The retracted attempt still owes its ack —
+    // that ack is what releases the daemon's handoff gate — and it is sent
+    // BEFORE the reissue so the reissue cannot queue behind the handoff that is
+    // waiting for it.
+    #expect(stats.publicationAcks == baseline + 2)
 
-    // Only the retracted operation is affected; the next one publishes.
+    // Only the retracted operation is affected; the next one publishes once.
     _ = try await harness.volume.attributes(
         FSItem.GetAttributesRequest(),
         of: harness.root
     )
-    let after = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 2)
-    #expect(after.publicationAcks == baseline + 2)
+    let after = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 3)
+    #expect(after.publicationAcks == baseline + 3)
 }
 
 @available(macOS 26.0, *)

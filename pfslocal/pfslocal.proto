@@ -26,7 +26,10 @@
 // FSKit can satisfy its requested-attribute contract without inventing
 // metadata. Protocol minor 6 adds Envelope.publication_retracted, the
 // daemon's instruction that an operation's already-delivered results must
-// never be installed into the frontend's cache.
+// never be installed into the frontend's cache. Protocol minor 7 adds
+// HelloReply.request_deadline_ms, which moves ownership of the per-request
+// reply bound from a constant compiled into the frontend to the daemon that
+// actually owns the budgets it has to exceed.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -207,6 +210,23 @@ message HelloReply {
   uint32 protocol_major = 1;
   uint32 protocol_minor = 2;
   string daemon_version = 3;
+  // How long a frontend must be willing to wait for ONE reply before it may
+  // conclude the daemon has stopped answering. The DAEMON owns this number
+  // because the daemon owns the budgets it is derived from.
+  //
+  // It exists because the two bounds used to be independent constants in two
+  // languages: the daemon gave one request a 50s admission budget, the
+  // extension gave one request a 60s reply deadline, and nothing anywhere
+  // related the two. Ten seconds of margin is not a margin — a single cold
+  // create that legitimately spent most of its admission budget tripped the
+  // extension's deadline first, and the extension answered by closing the
+  // WHOLE connection, which stranded every other in-flight operation's
+  // publication and cost the mount its kernel-coherence barrier permanently.
+  //
+  // Zero means the frontend keeps its own default: a daemon that predates
+  // this field cannot be paired with a frontend that requires it anyway (the
+  // minor gate below), so zero only ever appears in tests and fixtures.
+  uint32 request_deadline_ms = 4;
 }
 
 // Resolve binds this connection to one attach. All subsequent item ops on the

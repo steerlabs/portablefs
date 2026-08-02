@@ -808,6 +808,11 @@ public struct PfsHelloReply: Sendable {
 
   public var daemonVersion: String = String()
 
+  ///How long a frontend must be willing to wait for ONE reply before it may
+  ///conclude the daemon has stopped answering. The DAEMON owns this number
+  ///because the daemon owns the budgets it is derived from.
+  public var requestDeadlineMs: UInt32 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -3471,6 +3476,7 @@ extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
     1: .standard(proto: "protocol_major"),
     2: .standard(proto: "protocol_minor"),
     3: .standard(proto: "daemon_version"),
+    4: .standard(proto: "request_deadline_ms"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -3482,6 +3488,7 @@ extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self.protocolMajor) }()
       case 2: try { try decoder.decodeSingularUInt32Field(value: &self.protocolMinor) }()
       case 3: try { try decoder.decodeSingularStringField(value: &self.daemonVersion) }()
+      case 4: try { try decoder.decodeSingularUInt32Field(value: &self.requestDeadlineMs) }()
       default: break
       }
     }
@@ -3497,6 +3504,9 @@ extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
     if !self.daemonVersion.isEmpty {
       try visitor.visitSingularStringField(value: self.daemonVersion, fieldNumber: 3)
     }
+    if self.requestDeadlineMs != 0 {
+      try visitor.visitSingularUInt32Field(value: self.requestDeadlineMs, fieldNumber: 4)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3504,6 +3514,7 @@ extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
     if lhs.protocolMajor != rhs.protocolMajor {return false}
     if lhs.protocolMinor != rhs.protocolMinor {return false}
     if lhs.daemonVersion != rhs.daemonVersion {return false}
+    if lhs.requestDeadlineMs != rhs.requestDeadlineMs {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

@@ -16,7 +16,18 @@ const (
 	// correctness failure, not a missing feature, so the two sides must not be
 	// able to pair at all. The daemon refuses any frontend whose minor is below
 	// its own (portablefsd/frontend.go), and that refusal IS the gate.
-	ProtocolMinor = 6
+	//
+	// ProtocolMinor 7 adds HelloReply.RequestDeadlineMs.
+	//
+	// It is a MINOR BUMP for the same reason: the default does not reproduce
+	// the previous behaviour, it reproduces the DEFECT. A frontend that ignores
+	// the field keeps its own compiled-in reply deadline, and the whole point of
+	// the field is that a frontend's compiled-in deadline has no relationship to
+	// the daemon's budgets and was observed live to expire FIRST — costing the
+	// mount its kernel-coherence barrier permanently. Pairing a daemon that
+	// knows its bound with a frontend that ignores it is precisely the pairing
+	// that broke, so the two must not be able to pair at all.
+	ProtocolMinor = 7
 	MaxFrameBytes = 16 << 20
 )
 
@@ -59,6 +70,10 @@ type HelloReply struct {
 	ProtocolMajor uint32
 	ProtocolMinor uint32
 	DaemonVersion string
+	// RequestDeadlineMs is how long a frontend must be willing to wait for one
+	// reply before concluding this daemon has stopped answering. See
+	// pfslocal.proto and Server.frontendRequestDeadline.
+	RequestDeadlineMs uint32
 }
 
 type PublicationAck struct {

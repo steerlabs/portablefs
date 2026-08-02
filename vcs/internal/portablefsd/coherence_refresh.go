@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -1169,24 +1170,259 @@ func (a *attach) dischargeFrontendPublicationFence(op *frontendOperation) {
 // gone the moment that handler returns, and abandoning a coherence repair
 // because the message that triggered it has been processed is how the repair
 // silently stops happening.
+// THE REPAIR NEVER RUNS ON ITS CALLER'S GOROUTINE.
+//
+// Its callers are the acknowledgement handler and the connection close. The
+// acknowledgement handler IS the connection's serial frame reader
+// (frontendConn.serve), so anything it waits for stalls every request and every
+// further acknowledgement on that connection — including the acknowledgements
+// other operations need in order to leave the publication set. A refresh that
+// blocked there for its two-minute bound was a two-minute stall of the whole
+// frontend, self-inflicted at the exact moment the mount was already unhappy;
+// with the retry below it would never return at all.
+//
+// So the repair is handed to the attach's own lifetime and the caller returns
+// immediately. Nothing is lost by that: the repair's ordering requirement is
+// that it run AFTER the framework install, and the acknowledgement is what
+// proves the install has happened — it does not have to be the thing that waits
+// for the repair.
 func (a *attach) refreshCrossedItems(items map[uint64]struct{}) {
 	if len(items) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(a.refreshLifetimeContext(), crossedRefreshTimeout)
-	defer cancel()
-	for itemID := range items {
+	lifetime := a.refreshLifetimeContext()
+	go func() {
+		for itemID := range items {
+			a.repairCrossedItem(lifetime, itemID)
+		}
+	}()
+}
+
+// repairCrossedItem drives one item's exact kernel refresh, RETRYING until it
+// converges or the attach ends.
+//
+// ── WHY A RETRY AND NOT A VERDICT ───────────────────────────────────────────
+//
+// This used to make one attempt under a two-minute bound and hand any error to
+// failCoherence, which freezes the attach permanently. That collapsed two
+// completely different things into the same terminal outcome:
+//
+//   - "the kernel disagrees with the authority and cannot be corrected", which
+//     is what failCoherence means and is genuinely terminal; and
+//   - "this item is BUSY", which is not a failure at all.
+//
+// The second is what the live battery hit. refreshKernelItemExactMode acquires
+// a refresh intent first and waits for the item's outstanding size mutations to
+// drain — and on a file under continuous local write they do not drain, because
+// a new writer arrives before the last one leaves. That is contention, and the
+// refresh path already says so in as many words ("Reservation contention is not
+// a failure to converge"); the intent exists precisely to keep the two apart.
+// But the OUTER bound put them back together: a 1.5 MB/s soak on ONE file spent
+// the whole two minutes queueing, reported `context deadline exceeded`, and the
+// caller froze the entire mount over a file it was itself busy writing.
+//
+// A busy item is also the case where the repair matters LEAST. The kernel's view
+// of a file this daemon is actively writing is being driven by those writes; the
+// crossed publication concerned a value the daemon's own subsequent traffic
+// supersedes. So waiting is not a compromise, it is the correct order.
+//
+// ── WHAT IS STILL DEFINITE ──────────────────────────────────────────────────
+//
+// Every attempt still ends definitely, and the debt is never dropped: it is
+// retried until the refresh reports success, which is the only thing that
+// discharges it. The retry ends only when the ATTACH ends, and an attach that is
+// going away takes the kernel state in question with it — there is no window in
+// which the daemon serves on while quietly abandoning a repair.
+func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
+	a.noteCoherenceRepairing(1)
+	defer a.noteCoherenceRepairing(-1)
+	giveUp := time.Now().Add(crossedRepairBudget)
+	backoff := crossedRepairRetryDelay
+	var err error
+	for attempt := 0; ; attempt++ {
+		if lifetime.Err() != nil {
+			return
+		}
+		// THE REPAIR YIELDS TO THE APPLICATION. IT NEVER QUEUES AHEAD OF IT.
+		//
+		// exactKernelRefreshMode acquires the item's REFRESH INTENT, and an
+		// installed intent blocks every ARRIVING size mutation on that item
+		// until the pass is done. That is correct for a single pass and fatal
+		// for a retry loop: re-entering the turnstile every two seconds means a
+		// writer on the same file never gets a sustained window, so the retry
+		// that was supposed to make a busy item eventually repairable instead
+		// STOPPED the writer. Measured live on the 1.5 MB/s soak: the writer
+		// went from 1 tick/s to zero ticks for 4½ minutes, with no error — a
+		// stall, which is worse than the fail-closed verdict this replaces
+		// because it is silent.
+		//
+		// So a busy item is not attempted at all. The check is a read of the
+		// reservation count and takes no ticket, so it cannot itself delay a
+		// mutation, and an item that is being written is an item whose kernel
+		// view its own writer is re-establishing anyway.
+		if a.sizeMutationReserved(itemID) {
+			if !a.waitBeforeRepairRetry(lifetime, &backoff, giveUp) {
+				a.reportRepairGaveUp(itemID, errRepairItemStayedBusy)
+				return
+			}
+			continue
+		}
+		ctx, cancel := context.WithTimeout(lifetime, crossedRefreshTimeout)
 		// requireAuthorityIdentity is false: a crossed scope's item may have
 		// been renamed or replaced by the peer that took the delegation, and a
 		// namespace transition is owned by namespace handling rather than by
 		// this repair. The exact-identity claim belongs to a RelatedInos
 		// refresh, which is making a stronger statement than this one.
-		if err := a.exactKernelRefreshMode(ctx, itemID, false); err != nil {
-			a.failCoherence(err)
+		err = a.exactKernelRefreshMode(ctx, itemID, false)
+		cancel()
+		if err == nil {
+			if attempt > 0 {
+				log.Printf(
+					"portablefsd: attach %s: kernel coherence repair for item %d "+
+						"converged after %d retries", a.ref, itemID, attempt,
+				)
+			}
+			return
+		}
+		if attempt == 0 {
+			log.Printf(
+				"portablefsd: attach %s: kernel coherence repair for item %d did "+
+					"not converge (%v); retrying every %s until it does",
+				a.ref, itemID, err, crossedRepairRetryDelay,
+			)
+		}
+		if !a.waitBeforeRepairRetry(lifetime, &backoff, giveUp) {
+			a.reportRepairGaveUp(itemID, err)
 			return
 		}
 	}
 }
+
+// waitBeforeRepairRetry paces one retry and reports whether the loop may go
+// round again. It returns false when the whole repair budget is spent, and
+// backs off geometrically so a persistently busy item is polled rarely rather
+// than hammered.
+func (a *attach) waitBeforeRepairRetry(
+	lifetime context.Context,
+	backoff *time.Duration,
+	giveUp time.Time,
+) bool {
+	if !time.Now().Before(giveUp) {
+		return false
+	}
+	delay := *backoff
+	if next := delay * 2; next < crossedRepairMaxRetryDelay {
+		*backoff = next
+	} else {
+		*backoff = crossedRepairMaxRetryDelay
+	}
+	select {
+	case <-lifetime.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
+}
+
+// reportRepairGaveUp ends a repair DEFINITELY, and not by freezing.
+//
+// The budget exists so the retry is bounded rather than eternal and so this
+// goroutine cannot outlive any plausible repair. Exhausting it is reported and
+// STICKY — the attach stays degraded with this reason, which is the honest
+// statement ("some kernel state here was never proven") — but it does not fail
+// admissions closed. Freezing is what round 15 removed: it turned an unprovable
+// CACHE ENTRY into an unusable MOUNT, and the mount's own answers were never in
+// doubt.
+func (a *attach) reportRepairGaveUp(itemID uint64, cause error) {
+	if cause == nil {
+		cause = errRepairItemStayedBusy
+	}
+	log.Printf(
+		"portablefsd: attach %s: kernel coherence repair for item %d gave up "+
+			"after %s (%v); the mount continues to serve and reports degraded",
+		a.ref, itemID, crossedRepairBudget, cause,
+	)
+	a.mu.Lock()
+	a.coherenceRepairGaveUp = true
+	a.mu.Unlock()
+	a.setErr(fmt.Errorf(
+		"kernel coherence repair for item %d did not converge within %s: %w",
+		itemID, crossedRepairBudget, cause,
+	))
+}
+
+// errRepairItemStayedBusy is the give-up cause for an item that never went
+// quiet. It is distinct from a refresh failure because it says nothing went
+// wrong — the item was simply being written for the whole budget, and its own
+// writer owns the kernel view this repair wanted to correct.
+var errRepairItemStayedBusy = errors.New(
+	"the item was continuously reserved by local size mutations, so the repair " +
+		"never had a quiet moment to run in",
+)
+
+// crossedRepairMaxRetryDelay caps the geometric backoff. A busy item is polled
+// at this rate, which is cheap and — crucially — leaves the application's own
+// turnstile claims uncontended in between.
+var crossedRepairMaxRetryDelay = 30 * time.Second
+
+// crossedRepairBudget bounds the whole retry, not one attempt. It is generous
+// on purpose: the case it must outlast is an item under sustained local write,
+// where the refresh cannot acquire its intent until the writer pauses.
+//
+// A var so failure-shape tests can compress it; production never changes it.
+var crossedRepairBudget = 10 * time.Minute
+
+// crossedRepairRetryDelay paces the repair retry. It is long enough that a busy
+// item is not polled hard and short enough that a repair lands promptly once the
+// item goes quiet.
+//
+// A var so failure-shape tests can compress it; production never changes it.
+var crossedRepairRetryDelay = 2 * time.Second
+
+// noteCoherenceRepairing tracks how many kernel coherence repairs are
+// outstanding, so the attach can report REPAIRING rather than either lying that
+// it is healthy or freezing as if it were broken. delta is +1 on entry and -1 on
+// completion.
+func (a *attach) noteCoherenceRepairing(delta int) {
+	a.mu.Lock()
+	a.coherenceRepairs += delta
+	if a.coherenceRepairs < 0 {
+		a.coherenceRepairs = 0
+	}
+	repairing := a.coherenceRepairs > 0
+	gaveUp := a.coherenceRepairGaveUp
+	a.mu.Unlock()
+	if gaveUp {
+		// A repair that ran out of budget left a sticky reason behind. Clearing
+		// it here would erase the one record that some kernel state was never
+		// proven, which is the only thing an operator has to go on.
+		return
+	}
+	if repairing {
+		a.setErr(errors.New(coherenceRepairingDetail))
+		return
+	}
+	// CLEAR ONLY WHAT THIS REPAIR SAID.
+	//
+	// The debt really is discharged — leaving the attach degraded after a repair
+	// converged would reproduce the permanent degradation this replaces with a
+	// longer fuse — but setErr(nil) clears whatever reason is currently
+	// recorded, and by the time the last repair finishes that reason may belong
+	// to something else entirely (a rejected credential, a drain failure). So
+	// the clear is conditional on this being OUR message.
+	a.mu.Lock()
+	ours := a.lastErr == coherenceRepairingDetail
+	a.mu.Unlock()
+	if ours {
+		a.setErr(nil)
+	}
+}
+
+// coherenceRepairingDetail is the exact degraded reason a running repair
+// publishes. It is a constant because noteCoherenceRepairing must be able to
+// recognise its OWN message before clearing it.
+const coherenceRepairingDetail = "kernel coherence repair in progress: " +
+	"refreshing kernel state the daemon could not prove; the mount continues to serve"
 
 // crossedRefreshTimeout bounds the backstop repair. It matches the control
 // plane's own post-write refresh bound, because it is the same operation
@@ -1202,6 +1438,77 @@ func (a *attach) refreshLifetimeContext() context.Context {
 		return a.lifeCtx
 	}
 	return context.Background()
+}
+
+// repairDisconnectedPublications repairs the kernel view for publications a
+// frontend exposed but never acknowledged before its connection died.
+//
+// ── WHY THIS EXISTS INSTEAD OF A TERMINAL VERDICT ───────────────────────────
+//
+// A lost acknowledgement used to be the end of the mount. frontendConn.close
+// found one exposed-unacknowledged publication and called failCoherence, which
+// sets coherenceFailFrozen — a flag nothing ever clears — so every later request
+// on the attach answered EIO forever. The reasoning was that an acknowledgement
+// is a statement about a live frontend, so once the frontend is gone the
+// statement can never be made.
+//
+// That is true and it is not the same as "the kernel cannot be corrected". The
+// FSKit mount OUTLIVES the daemon connection: the extension reconnects and keeps
+// every vnode it holds, so the kernel this daemon is about to go on serving is
+// reachable — through the mount, by the daemon itself. exactKernelRefresh drives
+// exactly that refresh, and it is what the crossing fence has used since round 9
+// to repair state it could not prove any other way. The disconnect owes the same
+// repair for the same reason, and the only thing that was different was the
+// posture: one path repaired, the other despaired.
+//
+// So a lost acknowledgement is now a DEBT, not a verdict. The affected scopes are
+// invalidated and refreshed, with retry (see repairCrossedItem); the attach
+// reports REPAIRING while that runs and returns to attached when it converges;
+// and the mount keeps serving throughout, which is correct because the daemon's
+// own answers were never in doubt — only the kernel's cache was, and that is
+// precisely what is being rewritten.
+//
+// It runs off the teardown path because it reaches the kernel through the mount
+// and is unbounded in principle, while its caller is on the connection's close
+// and is about to join every handler.
+func (a *attach) repairDisconnectedPublications(ops []*frontendOperation) {
+	if len(ops) == 0 {
+		return
+	}
+	var paths []string
+	a.frontendGateMu.Lock()
+	for _, op := range ops {
+		if op == nil || op.attach != a {
+			continue
+		}
+		if len(op.paths) == 0 {
+			// An operation with no derived scope published under the
+			// conservative mount-wide scope, and the root path is how that scope
+			// is spelled in the invalidation vocabulary.
+			paths = append(paths, "")
+			continue
+		}
+		paths = append(paths, op.paths...)
+	}
+	a.frontendGateMu.Unlock()
+	if len(paths) == 0 {
+		return
+	}
+	items := make(map[uint64]struct{}, len(paths))
+	a.mu.Lock()
+	for _, p := range paths {
+		// Content and namespace both: the daemon does not record WHICH class of
+		// state the unacknowledged reply carried, so the repair covers every
+		// class the frontend could have installed. Same events the authority
+		// invalidation path publishes, so the extension needs no new handling.
+		a.publishContentInvalidationLocked(p, 0, 0)
+		a.publishNamespaceInvalidationLocked(p, 0, 0)
+		if rec := a.paths[p]; rec != nil {
+			items[rec.item.ItemID] = struct{}{}
+		}
+	}
+	a.mu.Unlock()
+	a.refreshCrossedItems(items)
 }
 
 func (a *attach) initFrontendGateLocked() {
@@ -2054,6 +2361,32 @@ func (a *attach) publicationBlockersLocked(
 	scope string,
 	own *frontendOperationParticipant,
 ) (blockers, live int, set map[*frontendOperation]struct{}, fenceable []*frontendOperation) {
+	// A MOUNT THAT IS BEING TORN DOWN HAS NO KERNEL LEFT TO PROTECT.
+	//
+	// Every blocker here is an operation whose acknowledgement would tell the
+	// daemon that the kernel has finished installing or discarding what the
+	// operation published. The barrier exists to keep a delegation handoff from
+	// crossing state the kernel is about to cache. Once the attach is detaching,
+	// there is no "about to cache": the vnodes and their pages go away with the
+	// mount, and the publication set is a set of statements about a cache that
+	// is being destroyed.
+	//
+	// Waiting on it was therefore not conservative, it was unsatisfiable. The
+	// final drain barrier a clean unmount runs takes a delegation release; the
+	// release waited here for acknowledgements from a frontend that had nothing
+	// left to acknowledge them for; the settle window expired; and the unmount
+	// was refused with ZERO records unshipped — a healthy, idle, fully drained
+	// mount that could only be detached with --force. Forcing a clean unmount is
+	// how a durable recovery job gets parked for a volume that never needed one.
+	//
+	// The verdict is unchanged for every attach that is still serving. This is
+	// the one state in which the acknowledgement is not merely late but MOOT.
+	a.mu.RLock()
+	detaching := a.detached || a.detachPrepared || a.detachForce || a.detachBarrier
+	a.mu.RUnlock()
+	if detaching {
+		return 0, 0, map[*frontendOperation]struct{}{}, nil
+	}
 	epoch := a.frontendPathEpoch.Load()
 	set = make(map[*frontendOperation]struct{}, len(a.frontendActive))
 	for op := range a.frontendActive {
