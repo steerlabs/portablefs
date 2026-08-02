@@ -812,6 +812,45 @@ func (f *flusher) sendBatch(lane StreamLane) {
 			ErrConflict, reply.Status,
 		))
 
+	// ── DEFINITE CAPACITY REFUSAL: terminal, and NAMED ───────────────────────
+	//
+	//	ENOSPC (28)   a bounded store on the authority is full — its resident
+	//	              dirty-block pool (VCS_DIRTY_RSS_MAX_MB) or its WAL.
+	//	EDQUOT (122)  the generation's durable journal backlog quota.
+	//
+	// These are the ONLY two statuses fsproto's quota classifier issues, from
+	// the exact path and the flush path alike, and unlike EIO or an unknown
+	// status they name the condition exactly: nothing was applied because a
+	// bounded resource is full.
+	//
+	// They belong here rather than in the retry arm below for one reason that
+	// production proved: RETRYING THEM NEVER TERMINATES. Nothing folds the
+	// authority's dirty pool for a live generation — there is no in-process
+	// checkpoint on the managed path, and history-cut adoption advances the
+	// journal base without releasing the child's resident blocks — so a batch
+	// refused at the bound is refused identically on every re-offer, forever.
+	// Held as a transient it froze the watermark, tripped the no-progress
+	// watchdog, and took a live mount to EIO; the operator's documented escape
+	// (truncate/remove to release the memory) was itself EIO by the time it
+	// could be issued.
+	//
+	// So the verdict is taken at face value and the stream parks — with a cause
+	// that wraps ErrNoSpace, so every surface that already maps writeback
+	// errors (clientcore statusErr, the FUSE mount) answers the application a
+	// real ENOSPC. That is the whole point: a write that cannot be made durable
+	// must FAIL, in the application's own hands, with the errno POSIX defines
+	// for exactly this. An unexplained stall is not an answer.
+	//
+	// This does not weaken the "UNKNOWN IS RETRYABLE" rule above it — it is the
+	// enumerated exception that rule always allowed for. Terminal still
+	// requires proof; a named capacity refusal is proof, and a catch-all is not.
+	case reply.Status == 28 || reply.Status == 122: // ENOSPC / EDQUOT
+		f.park(fmt.Errorf(
+			"%w: authority refused the %s-lane batch for capacity (status %d); "+
+				"nothing on this side can relieve it",
+			ErrNoSpace, lane, reply.Status,
+		))
+
 	// ── EVERYTHING ELSE: retryable under the watchdog ────────────────────────
 	//
 	// This default used to park the stream as a terminal ErrConflict, which

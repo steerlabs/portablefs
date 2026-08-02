@@ -692,9 +692,17 @@ func (s *Server) exactMutate(cs *connSession, req *Request) *Response {
 }
 
 // quotaErrno classifies definite capacity rejections: the database-owned
-// journal DATA quota maps to EDQUOT; the local WAL capacity threshold maps
-// to ENOSPC. Both are recorded as durable outcomes through the control
-// reserve.
+// journal DATA quota maps to EDQUOT; the local WAL capacity threshold — and
+// the resident dirty-block bound, which chains into it (workfs
+// ErrDirtyRSSCapacity) — map to ENOSPC.
+//
+// It is the ONE classifier for both write paths. On the EXACT path the verdict
+// is additionally recorded as a durable outcome through the control reserve
+// (rejectLocked below); on the WRITE-BACK FLUSH path (coordinate.go) there is
+// no exact slot to record, so the definite status is simply answered. What must
+// not differ between the two is the ANSWER: a capacity refusal that reads as a
+// definite ENOSPC through one door and as a retry-forever EAGAIN through the
+// other is a mount that wedges instead of a write that fails.
 func quotaErrno(err error) (int32, bool) {
 	switch {
 	case errors.Is(err, wal.ErrJournalQuota):

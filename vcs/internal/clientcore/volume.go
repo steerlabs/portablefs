@@ -798,6 +798,15 @@ func Attach(ctx context.Context, cli *fsproto.Client, opts Options) (*Volume, er
 		return nil, werr
 	}
 	v.wb = wb
+	// The authority lane's durability proof. client.SyncVolume is the barrier
+	// that makes earlier authority writes durable, applied and published, which
+	// is exactly the claim an acknowledged write-through byte is waiting to
+	// have made about it. Installing it here is what lets the lane's gate prove
+	// its own backlog instead of wedging at its floor until an application
+	// happens to call fsync (writeback.SetAuthorityProver).
+	wb.SetAuthorityProver(func(ctx context.Context) error {
+		return v.boundedBarrier(v.client.SyncVolume)
+	})
 	if opts.PrefetchTree {
 		maxEntries := opts.PrefetchMaxEntries
 		if maxEntries <= 0 {
@@ -1730,7 +1739,13 @@ func (v *Volume) fsync(path string) error {
 	// The authority barrier: earlier journal rows durable + applied +
 	// published, and every live subscriber acked the covering invalidation
 	// position at its supported frontend boundary.
-	return v.boundedBarrier(v.client.Sync)
+	if err := v.boundedBarrier(v.client.Sync); err != nil {
+		return err
+	}
+	if v.wb != nil {
+		v.wb.NoteAuthorityProven()
+	}
+	return nil
 }
 
 // boundedBarrier runs one authority-barrier RPC under volumeBarrierTimeout:
@@ -1807,7 +1822,17 @@ func (v *Volume) syncVolume() error {
 			return err
 		}
 	}
-	return v.boundedBarrier(v.client.SyncVolume)
+	if err := v.boundedBarrier(v.client.SyncVolume); err != nil {
+		return err
+	}
+	// The barrier returned, so every byte the authority had acknowledged before
+	// it started is now proven. Clearing the lane's unproven ledger here is
+	// what makes "the volume is synced" a statement about BOTH lanes: a drain
+	// that empties the WAL while acknowledged write-through bytes remain
+	// unproven has not finished, and this is the call that makes the second
+	// half true rather than assumed.
+	v.wb.NoteAuthorityProven()
+	return nil
 }
 
 // AuthorityUnreachable reports confirmed transport unreachability (fail-fast
@@ -1844,6 +1869,21 @@ func (v *Volume) CredentialExpired() bool {
 // fsproto.Client.CredentialUnproven), so the two are never simultaneously true.
 func (v *Volume) CredentialUnproven() bool {
 	return v.client.CredentialUnproven()
+}
+
+// DialRefusal reports the last data-plane router refusal that was NOT a
+// credential verdict: the access lease at its concurrent tunnel limit, a lease
+// transition race, or an authority-side outage behind the router. It is nil
+// when the router has made no such statement.
+//
+// The three used to be indistinguishable from a dead credential on the wire, so
+// a mount that merely lost a race for a tunnel slot reported "credentials
+// revoked or expired; run `portablefs login`" over a lease with minutes of
+// validity left. They are retryable, none of them is repaired by
+// re-authenticating, and each has a different remedy — see
+// fsproto.RefusalRemedy.
+func (v *Volume) DialRefusal() error {
+	return v.client.DialRefusal()
 }
 
 // SessionFenced reports whether the mount session was fenced (stale

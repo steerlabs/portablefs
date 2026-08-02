@@ -3234,11 +3234,14 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// printed line already shows it; the JSON view dropped it, so an agent
 		// reading --json could see attachState=degraded with no reason at all.
 		AttachError string `json:"attachError,omitempty"`
-		// AttachCredential names WHICH credential fault a degraded attach has:
-		// "rejected" (the authority answered no -> log in again) or
+		// AttachCredential names WHICH credential-plane fault a degraded attach
+		// has: "rejected" (the authority answered no -> log in again),
 		// "pending-verification" (the authority never answered at all -> the
-		// handshake is being torn down before the ack, so look at the router).
-		// Empty means no credential fault. These are DELIBERATELY not folded
+		// handshake is being torn down before the ack, so look at the router),
+		// or "router-refused" (the router answered, and its answer was not
+		// about the credential -> capacity, a lease transition, or an
+		// authority outage behind it; retryable, and re-authenticating changes
+		// none of them). Empty means no credential-plane fault. These are DELIBERATELY not folded
 		// into Health: Health carries the CLI-side lease-keeper verdict from
 		// persisted mount state, which is a different, disjoint path.
 		AttachCredential string `json:"attachCredential,omitempty"`
@@ -3321,6 +3324,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			statusChangedAtMs: row.StatusChangedAtMs,
 			attachState:       row.AttachState,
 			attachCredential:  row.AttachCredential,
+			attachLastError:   row.AttachError,
 		})
 		extras := ""
 		if len(row.LocalDirs) > 0 {
@@ -3362,6 +3366,12 @@ type mountStatusInput struct {
 	statusChangedAtMs int64
 	attachState       string
 	attachCredential  string
+	// attachLastError is the daemon's own sentence for this degradation. A
+	// router refusal has three different conditions behind it with three
+	// different remedies, and a fixed status word cannot name which — so for
+	// that one word the daemon's sentence is carried through verbatim rather
+	// than being flattened into a generic instruction.
+	attachLastError string
 }
 
 // mountStatusWord renders the status word `portablefs mounts` prints for a row,
@@ -3390,7 +3400,14 @@ func mountStatusWord(row mountStatusInput) string {
 		if row.statusChangedAtMs != 0 {
 			since = " since " + formatMs(row.statusChangedAtMs)
 		}
-		return "credential-expired" + since + " (credentials revoked or expired; run `portablefs login` and remount)"
+		// The persisted verdict does not record WHICH typed answer ended the
+		// lease (see leaseEndMessage), and four of the five are ended LEASES
+		// rather than revoked credentials — so the word leads with the action
+		// that works for all five and qualifies the one that does not.
+		return "credential-expired" + since +
+			" (this mount's access lease ended and cannot be renewed; remount to " +
+			"re-establish it — run `portablefs login` first only if the saved " +
+			"account credential is also rejected; see the mount log for which)"
 	}
 	if row.attachState != "degraded" {
 		return "live"
@@ -3402,6 +3419,19 @@ func mountStatusWord(row mountStatusInput) string {
 			"router/authority, not your login)"
 	case attachCredentialRejected:
 		return "degraded (credential rejected; run `portablefs login` and remount)"
+	case attachCredentialRouterRefused:
+		// The router refused for a reason that is NOT the credential, and the
+		// three reasons have three different remedies (wait out a full lease,
+		// remount through a lease transition, wait out an authority outage).
+		// A word that named one of them would be wrong for the other two, and
+		// the word this used to render — "credential rejected; run `portablefs
+		// login`" — was wrong for all three.
+		if row.attachLastError != "" {
+			return "degraded (data-plane tunnel refused, retrying: " +
+				row.attachLastError + ")"
+		}
+		return "degraded (data-plane tunnel refused, retrying; this is NOT a " +
+			"credential failure and `portablefs login` will not change it)"
 	}
 	return "degraded"
 }

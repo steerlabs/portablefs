@@ -394,18 +394,24 @@ func (cn *conn) ensureWithGateContext(ctx context.Context, resolved bool) error 
 		}
 		return nil
 	}
-	// A definite token rejection is an ANSWER from a reachable peer, not
-	// unreachability (see failfast.go), so it does not trip the transport
-	// breaker. It still returns immediately and fails closed — and it LATCHES
-	// the credential verdict, wherever it happened. Only the prober's rejection
-	// used to latch, so an ordinary pooled dial refused by the authority left
-	// the mount reporting a healthy credential.
-	if errors.Is(err, ErrSessionTokenRejected) {
-		// Only an EXPLICIT refusal (ack 1) latches. The clean-EOF form is a
-		// redial heuristic and proves nothing about the credential — see
-		// ErrCredentialRefused.
+	// A refusal is an ANSWER from a reachable peer, not unreachability (see
+	// failfast.go), so it does not trip the transport breaker. It still returns
+	// immediately and fails closed.
+	//
+	// WHICH refusal decides what is recorded, and the wire now says which (see
+	// reconnect.go's ack vocabulary). Only ack 1 — the token did not resolve —
+	// LATCHES the credential verdict, wherever it happened; only the prober's
+	// rejection used to latch, so an ordinary pooled dial refused by the
+	// authority left the mount reporting a healthy credential. Capacity, lease
+	// transitions, authority outages behind the router and unknown codes are
+	// remembered as themselves and claim nothing, because latching a terminal
+	// credential verdict for them told operators to repair a credential that
+	// had minutes of validity left.
+	if errors.Is(err, ErrDialRefused) {
 		if errors.Is(err, ErrCredentialRefused) {
 			cn.health.recordCredentialRejected(gen)
+		} else {
+			cn.health.recordDialRefused(err)
 		}
 		return err
 	}
@@ -546,14 +552,16 @@ func (cn *conn) dialOnceWith(ctx context.Context, cred installedCredential) erro
 			return net.ErrClosed
 		}
 		// Authenticate to the server before using the connection (no-op when
-		// unset). The typed classification is the point: rejection means the
-		// CREDENTIAL is dead, not the network.
+		// unset). The typed classification is the point: a REFUSAL is an answer
+		// from a reachable peer, not a network failure, and reconnect.go says
+		// which refusal it was. Every address in this list carries the same
+		// credential, so a refusal ends the pass rather than offering it again.
 		if err := clientHandshake(nc, token); err != nil {
 			cn.reset()
 			if callerErr := ctx.Err(); callerErr != nil {
 				return callerErr
 			}
-			if errors.Is(err, ErrSessionTokenRejected) {
+			if errors.Is(err, ErrDialRefused) {
 				return fmt.Errorf("fsproto: dial %s: %w", addr, err)
 			}
 			lastErr = err
@@ -1085,9 +1093,13 @@ func (c *Client) DoContext(ctx context.Context, req *Request) (*Response, error)
 				// re-consulting the gate; surface EIO immediately.
 				return nil, err
 			}
-			if errors.Is(err, ErrSessionTokenRejected) {
-				// A rejection cannot be fixed by redialing with the same
-				// credential. Fail closed without another resolution path.
+			if errors.Is(err, ErrDialRefused) {
+				// The peer ANSWERED and refused. Redialing inside this op's
+				// backoff cannot change a refusal that was just made about the
+				// exact credential this client holds, whatever the reason was.
+				// Fail closed without another resolution path; retryable
+				// refusals recover on the next op or the next credential
+				// install, not by spinning here.
 				return nil, err
 			}
 			if cn.connected() {

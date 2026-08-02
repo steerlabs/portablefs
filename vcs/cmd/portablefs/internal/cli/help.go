@@ -403,9 +403,12 @@ and no umount path — including --force — ever reads standard input.
 
 List this machine's recorded mounts with their health: live (daemon serving),
 stale (daemon gone; umount cleans up), or credential-expired (the daemon is
-running but the server rejected its credentials — revoked or expired keys;
-run ` + "`portablefs login`" + ` and remount). The same transition is logged once in
-the mount's log file under ~/.local/state/portablefs/mounts/.
+running but its ACCESS LEASE ended and cannot be renewed — expired, released,
+revoked, or the account credential itself rejected). A lease is minted by a
+mount, so remounting is what re-establishes one; run ` + "`portablefs login`" + `
+first only when the saved account credential is the thing that was rejected.
+The mount log under ~/.local/state/portablefs/mounts/ names which of the two
+it was.
 `,
 		"mount-check": `USAGE
   portablefs mount-check [--strategy auto|fskit|fuse] [--json]

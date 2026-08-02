@@ -332,6 +332,17 @@ type Engine struct {
 	// the hard WAL cap, which the exact reservation still enforces underneath.
 	credits *creditController
 
+	// lanes tallies which door each write took onto the authority lane, and
+	// how many bytes went through it (see lanerouting.go). It is pure
+	// measurement: nothing reads it to make a decision.
+	lanes laneCounters
+
+	// authority is the authority lane's admission gate and unproven-byte
+	// ledger (see authoritycredit.go). Every byte acknowledged on the
+	// write-through lane is charged here, so no lane is uncharged and the
+	// durability check has something to read.
+	authority *authorityGate
+
 	// createWAL is fixed to createStreamWAL in production and replaceable by
 	// package tests for deterministic initialization-failure coverage.
 	createWAL func(string, [16]byte, string, string, uint64) (*streamWAL, error)
@@ -415,6 +426,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 	e.ctx, e.cancelCtx = context.WithCancel(context.Background())
 	e.credits = newCreditController(e)
+	e.authority = newAuthorityGate(e.dataBudgetBytes())
 	e.fl = newFlusher(e)
 	e.recovery = newRecoveryRunner(e)
 	maxEpoch := e.recovery.discover()
@@ -1348,17 +1360,25 @@ func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int6
 	}
 	if resolvedLaneOf(ctx) == LaneAuthority {
 		// Classified outside the frontend's locks as authority-only: these bytes
-		// will never become WAL bytes, so they are neither charged nor queued.
+		// will never become WAL bytes, so they are not charged against the
+		// STREAM ledger and never queue behind delegated traffic.
 		//
 		// This is consulted BEFORE the credit fast path deliberately. The fast
-		// path is one CAS and would happily succeed here, charging the ledger
-		// for a write that cannot produce a single stream byte — a debt only
-		// refundable from wherever clientcore's own lane routing happens to end,
-		// and one that paces honest delegated writers in the meantime. Charging
-		// is a property of the LANE, not of whether credit happened to be free.
+		// path is one CAS and would happily succeed here, charging the stream
+		// ledger for a write that cannot produce a single stream byte — a debt
+		// only refundable from wherever clientcore's own lane routing happens to
+		// end, and one that paces honest delegated writers in the meantime.
+		// Charging the STREAM is a property of the lane, not of whether credit
+		// happened to be free.
+		//
+		// It is NOT, however, a licence to be uncharged. The lane's own gate
+		// (authoritycredit.go) has already charged these bytes in the pre-lock
+		// classifier, and no door counts here: whichever decision routed this
+		// write counted itself where it was made.
 		return 0, spaceAuthority, nil
 	}
 	if e.credits.tryFast(n) {
+		e.lanes.noteDelegated(n)
 		return n, spaceProceed, nil
 	}
 	if err := e.MutationError(); err != nil {
@@ -1381,7 +1401,12 @@ func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int6
 	}
 	if !covered {
 		// No grant covers this path: write-through consumes no stream budget
-		// and has no grant to release, so there is nothing to wait for.
+		// and has no grant to release, so there is nothing to wait for HERE.
+		// The lane's own gate still charges it — an unclassified caller (FUSE's
+		// pre-lock pass, package tests) reaches this point without having
+		// passed clientcore's classifier, and "nothing to wait for" must not
+		// mean "nothing to account".
+		e.lanes.note(DoorUncovered, n)
 		return 0, spaceAuthority, nil
 	}
 	if resolvedLaneOf(ctx) == LaneDelegated {
@@ -1390,6 +1415,7 @@ func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int6
 		// wait back under them — the one thing the pre-lock classifier exists to
 		// prevent — so the lane is reported changed and the frontend reclassifies
 		// where waiting is affordable.
+		e.lanes.note(DoorLaneChanged, n)
 		return 0, spaceExhausted, ErrLaneChanged
 	}
 	for {
@@ -1401,6 +1427,7 @@ func (e *Engine) admitDataBytes(ctx context.Context, path string, n int64) (int6
 			return 0, spaceExhausted, err
 		}
 		if granted > 0 {
+			e.lanes.noteDelegated(int64(granted))
 			return int64(granted), spaceProceed, nil
 		}
 		// Zero credit with a healthy uplink: the link is simply slower than one
@@ -1899,6 +1926,7 @@ func (e *Engine) pacedWrite(ctx context.Context, path string, data []byte, at fu
 			// The lane is reported changed instead: the frontend unwinds, and
 			// the reclassification pays for the release outside every lock. The
 			// grant is already refunded by writeGranted above.
+			e.lanes.note(DoorLaneChanged, want)
 			return Result{}, true, ErrLaneChanged
 		}
 		// The credit gate said yes and the hard cap said not yet. Wait for the
@@ -2491,6 +2519,7 @@ func (e *Engine) CloseWithBarrier(ctx context.Context, barrier func() error) err
 	e.closed = true
 	e.mu.Unlock()
 	e.credits.seal(ErrFenced)
+	e.authority.seal(ErrFenced)
 	e.stopIdle()
 	e.cancelCtx()
 	e.fl.stop()
@@ -2557,6 +2586,7 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 	job := e.job
 	e.mu.Unlock()
 	e.credits.seal(ErrFenced)
+	e.authority.seal(ErrFenced)
 	e.signalIdleStop()
 	e.cancelCtx()
 	e.fl.stop()
@@ -2720,6 +2750,7 @@ func (e *Engine) Abandon() {
 	w := e.wal
 	e.mu.Unlock()
 	e.credits.seal(ErrFenced)
+	e.authority.seal(ErrFenced)
 	e.signalIdleStop()
 	e.cancelCtx()
 	e.fl.stop()
@@ -2773,6 +2804,22 @@ type Status struct {
 	// must read — is PendingBytes.
 	UnrecoveredRecords uint64
 	UnrecoveredBytes   uint64
+
+	// Authority is the OTHER lane's durability accounting (authoritycredit.go).
+	//
+	// It is reported beside PendingBytes rather than folded into it because the
+	// two are different obligations with different owners: PendingBytes is
+	// acknowledged data THIS mount holds locally and will replay, and
+	// Authority.Unproven is acknowledged data the FAR END holds and has not
+	// proven. A drain-completeness check must read both — a mount that has
+	// drained its WAL to zero while the authority lane holds unproven
+	// acknowledged bytes has not finished, and reporting only the first is the
+	// drain-success lie that let 734 MiB disappear with every local check
+	// green.
+	Authority AuthorityLedger
+	// Routing is the lane-routing tally (lanerouting.go): which door each write
+	// took onto the authority lane, and how many bytes went through it.
+	Routing LaneRouting
 }
 
 // DelegationStatus is one held scope's view.
@@ -2802,6 +2849,8 @@ func (e *Engine) Status() Status {
 	st.WALBudget = e.cfg.BudgetBytes
 	st.CreditSetpoint, st.CreditDebt, st.CreditCeiling, st.AppliedRateBps, st.CreditWaiters = e.credits.status()
 	st.DataLaneFull = e.walFull.Load()
+	st.Authority = e.AuthorityLedgerStatus()
+	st.Routing = e.lanes.snapshot()
 	e.mu.RLock()
 	if e.wal != nil {
 		st.AdmittedThrough = e.wal.LastSeq()

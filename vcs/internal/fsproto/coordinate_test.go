@@ -718,3 +718,203 @@ func TestManagedSessionTerminalReleasesCoordination(t *testing.T) {
 		t.Fatalf("fenced create: %+v", r)
 	}
 }
+
+// TestManagedFlushCapacityRefusalIsDefinite is the round-18g contract: a
+// CAPACITY refusal on the WRITE-BACK FLUSH path must reach the client as the
+// same DEFINITE outcome the exact path already answers, never as the
+// "authority machinery is having a bad minute" EAGAIN.
+//
+// Both capacity classes are exercised, because both reach ManagedFlushApply
+// and both were falling through to the EAGAIN catch-all:
+//
+//	dirty-RSS bound  (workfs.ErrDirtyRSSCapacity -> ErrWALCapacity) -> ENOSPC
+//	journal quota    (wal.ErrJournalQuota)                          -> EDQUOT
+//
+// The production consequence of getting this wrong is not cosmetic. EAGAIN is
+// a HOLD, so writeback/flush.go retries it forever; nothing on either side
+// folds the authority's dirty pool for a live generation, so the retry never
+// succeeds, the watermark freezes, the no-progress watchdog fires, and the
+// whole mount goes to EIO — for a condition the application could have handled
+// if it had simply been told "no space".
+func TestManagedFlushCapacityRefusalIsDefinite(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arm     func(log *protoEntryLog, fs *workfs.FS)
+		want    int32
+		wantMsg string
+	}{
+		{
+			name: "resident dirty-block bound",
+			arm: func(_ *protoEntryLog, fs *workfs.FS) {
+				// Any write leaf reserves at least one whole block, so a
+				// one-byte bound refuses the first one deterministically.
+				fs.SetDirtyRSSMax(1)
+			},
+			want:    ENOSPC,
+			wantMsg: "ENOSPC",
+		},
+		{
+			name: "durable journal backlog quota",
+			arm: func(log *protoEntryLog, _ *workfs.FS) {
+				log.mu.Lock()
+				log.quotaErr = fmt.Errorf("proto fake: %w", wal.ErrJournalQuota)
+				log.mu.Unlock()
+			},
+			want:    EDQUOT,
+			wantMsg: "EDQUOT",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := newProtoEntryLog()
+			s, fs := newManagedServer(t, log)
+			a := openJournaledSession(t, s, "pfs-cap", 1, "MA", "tokA", 8)
+
+			if r := exactDo(s, a, &Request{Op: OpMkdir, Path: "ws", Mode: 0o755}, 0, 1); r == nil || r.Status != OK {
+				t.Fatalf("mkdir ws: %+v", r)
+			}
+			co := exactDo(s, a, &Request{Op: OpDelegationAcquire, Path: "ws", SessionID: "wb-cap", Owner: "MA"}, 0, 2)
+			if co == nil || co.Status != OK {
+				t.Fatalf("delegation acquire: %+v", co)
+			}
+			tc.arm(log, fs)
+
+			records := []wal.Record{
+				{Seq: 1, Op: wal.OpWrite, Path: "ws/f", Data: []byte("payload")},
+			}
+			prev := wbZeroDigest()
+			end := wbTestDigest(t, prev, records)
+			flush := &Request{
+				Op: OpFlushBatch, SessionID: "wb-cap", Owner: "MA",
+				WBPrevDigest: prev[:], WBEndDigest: end[:],
+				Records: records, WBScopes: []WBScope{{Path: "ws", Epoch: co.CheckoutEpoch, Through: 1}},
+			}
+			r := s.dispatchConn(a, flush)
+			if r == nil {
+				t.Fatalf("capacity refusal dropped the connection; want a definite %s", tc.wantMsg)
+			}
+			if r.Status == EAGAIN {
+				t.Fatalf("capacity refusal answered EAGAIN: the client holds this as a "+
+					"transient and retries forever against a bound nothing relieves. want %s", tc.wantMsg)
+			}
+			if r.Status != tc.want {
+				t.Fatalf("capacity refusal status = %d, want %s (%d)", r.Status, tc.wantMsg, tc.want)
+			}
+			// A definite refusal applied NOTHING: the watermark is unmoved.
+			if r.AppliedThrough != 0 {
+				t.Fatalf("refused flush reported AppliedThrough=%d, want 0", r.AppliedThrough)
+			}
+		})
+	}
+}
+
+// TestManagedFlushAtDirtyBoundStillAdmitsRelease is the AUTHORITY half of the
+// documented recovery, isolated and pinned.
+//
+// dirtyrss.go promises that only tree WRITES are refused at the dirty-block
+// bound, so an operation that RELEASES resident blocks stays admissible and
+// reopens admission. That promise is true, and this proves it holds all the way
+// through the write-back flush path — not just through the in-process
+// CommitEntry the workfs suite exercises.
+//
+// It is deliberately a separate test from the client's behaviour, because the
+// two halves failed differently. The authority never refused the remove; the
+// MOUNT could no longer issue one, having been taken to EIO by the watchdog
+// while it retried a capacity refusal it had been handed as EAGAIN. Pinning the
+// authority half here is what makes that attribution honest: the escape hatch
+// exists, and what broke was the client's ability to reach it.
+func TestManagedFlushAtDirtyBoundStillAdmitsRelease(t *testing.T) {
+	log := newProtoEntryLog()
+	s, fs := newManagedServer(t, log)
+	a := openJournaledSession(t, s, "pfs-relief", 1, "MA", "tokA", 8)
+
+	if r := exactDo(s, a, &Request{Op: OpMkdir, Path: "ws", Mode: 0o755}, 0, 1); r == nil || r.Status != OK {
+		t.Fatalf("mkdir ws: %+v", r)
+	}
+	co := exactDo(s, a, &Request{Op: OpDelegationAcquire, Path: "ws", SessionID: "wb-relief", Owner: "MA"}, 0, 2)
+	if co == nil || co.Status != OK {
+		t.Fatalf("delegation acquire: %+v", co)
+	}
+	epoch := co.CheckoutEpoch
+
+	// One flush that lands: the volume now HOLDS resident dirty blocks, which
+	// is the only state in which the bound means anything.
+	seed := []wal.Record{
+		{Seq: 1, Op: wal.OpCreate, Path: "ws/f", Mode: 0o644},
+		{Seq: 2, Op: wal.OpWrite, Path: "ws/f", Data: []byte("resident")},
+	}
+	zero := wbZeroDigest()
+	seedEnd := wbTestDigest(t, zero, seed)
+	seedFlush := &Request{
+		Op: OpFlushBatch, SessionID: "wb-relief", Owner: "MA",
+		WBPrevDigest: zero[:], WBEndDigest: seedEnd[:],
+		Records: seed, WBScopes: []WBScope{{Path: "ws", Epoch: epoch, Through: 2}},
+	}
+	if r := s.dispatchConn(a, seedFlush); r == nil || r.Status != OK {
+		t.Fatalf("seed flush: %+v", r)
+	}
+	held := fs.DirtyBlockBytes()
+	if held == 0 {
+		t.Fatal("seed flush left no resident dirty blocks; the fixture proves nothing")
+	}
+
+	// The bound is now one block — the smallest bound under which a write can
+	// ever be admitted, since every write leaf reserves its whole 4 MiB block.
+	// With any residency at all, the next write no longer fits.
+	const oneBlock = 4 << 20 // workfs blockSize
+	fs.SetDirtyRSSMax(oneBlock)
+
+	// A write is refused, definitely.
+	over := []wal.Record{{Seq: 3, Op: wal.OpWrite, Path: "ws/f", Offset: 1 << 20, Data: []byte("more")}}
+	overEnd := wbTestDigest(t, seedEnd, over)
+	overFlush := &Request{
+		Op: OpFlushBatch, SessionID: "wb-relief", Owner: "MA",
+		WBPrevDigest: seedEnd[:], WBEndDigest: overEnd[:],
+		Records: over, WBScopes: []WBScope{{Path: "ws", Epoch: epoch, Through: 3}},
+	}
+	if r := s.dispatchConn(a, overFlush); r == nil || r.Status != ENOSPC {
+		t.Fatalf("write flush at the bound: %+v, want ENOSPC", r)
+	}
+
+	// The release is ADMITTED at the very same bound, and it actually frees
+	// the memory. This is the whole content of the "recoverable, not wedged"
+	// claim, and on this side of the wire it holds.
+	//
+	// Truncate, not remove, and the difference is not cosmetic. OpRemove is
+	// equally admissible at the bound and it applies cleanly — it just does
+	// not RELEASE anything on a managed authority. applyManagedMutation parks
+	// the detached inode on EVERY successful unlink (OpReap is its sole
+	// destruction transition, so live apply and cold replay cannot disagree
+	// over a non-replicated open-handle observation), and a parked orphan
+	// keeps every dirty block it had. So the escape dirtyrss.go used to
+	// advertise — "truncate/remove releases blocks" — is half wrong here:
+	// `rm` returns no memory at all until the last close reaps the inode.
+	// Truncate is the operation that actually works, and this is it.
+	release := []wal.Record{{Seq: 3, Op: wal.OpTruncate, Path: "ws/f", Size: 0}}
+	releaseEnd := wbTestDigest(t, seedEnd, release)
+	releaseFlush := &Request{
+		Op: OpFlushBatch, SessionID: "wb-relief", Owner: "MA",
+		WBPrevDigest: seedEnd[:], WBEndDigest: releaseEnd[:],
+		Records: release, WBScopes: []WBScope{{Path: "ws", Epoch: epoch, Through: 3}},
+	}
+	if r := s.dispatchConn(a, releaseFlush); r == nil || r.Status != OK || r.AppliedThrough != 3 {
+		t.Fatalf("release flush at the bound: %+v, want OK through 3", r)
+	}
+	if got := fs.DirtyBlockBytes(); got != 0 {
+		t.Fatalf("release left %d resident dirty bytes, want 0", got)
+	}
+
+	// And admission is open again.
+	after := []wal.Record{
+		{Seq: 4, Op: wal.OpCreate, Path: "ws/g", Mode: 0o644},
+		{Seq: 5, Op: wal.OpWrite, Path: "ws/g", Data: []byte("again")},
+	}
+	afterEnd := wbTestDigest(t, releaseEnd, after)
+	afterFlush := &Request{
+		Op: OpFlushBatch, SessionID: "wb-relief", Owner: "MA",
+		WBPrevDigest: releaseEnd[:], WBEndDigest: afterEnd[:],
+		Records: after, WBScopes: []WBScope{{Path: "ws", Epoch: epoch, Through: 5}},
+	}
+	if r := s.dispatchConn(a, afterFlush); r == nil || r.Status != OK || r.AppliedThrough != 5 {
+		t.Fatalf("write flush after the release: %+v, want OK through 5", r)
+	}
+}

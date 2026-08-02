@@ -76,6 +76,16 @@ export type VolumeApiTelemetryEvent =
       cutsCreated: number;
       cutsPending: number;
       cutsFailed: number;
+      // Terminal recovery-cut lifecycle (migration 034). Counters only —
+      // the affected tenant/volume/branch/generation goes to the operator
+      // LOG, never here: this event set is deliberately free of identity so
+      // it needs no redaction anywhere downstream.
+      cutsRecreated: number;
+      cutsTerminal: number;
+      cutsRetryDeferred: number;
+      stuckGenerations: number;
+      oldestStuckAgeMs: number;
+      stuckSurveyUnavailable: boolean;
       adoptionsApplied: number;
       adoptionsBlocked: number;
       pinsScanned: number;

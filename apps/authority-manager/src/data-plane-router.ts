@@ -23,6 +23,39 @@ import {
 import type { DataPlaneTransport } from "@portablefs/protocol";
 import { parseAuthorityAddress } from "./authority-address.js";
 
+// ── THE ACK VOCABULARY ───────────────────────────────────────────────────────
+//
+// The router answers a client's token frame with ONE byte. Until round 18d that
+// byte was 0 (admit) or 1 (refuse), and 1 was written for four unrelated
+// conditions: a token that did not resolve, a lease at its tunnel limit, a
+// lease that ended or rotated mid-handshake, and a reservation that could not
+// be consumed. The client could only read "the credential was rejected" out of
+// that, so it latched a terminal credential verdict and told operators to run
+// `portablefs login` — measured live against a lease with 4.5 minutes of
+// validity left, for which re-login was not the remedy.
+//
+// One byte can carry the difference, so it does. Zero still means, and only
+// ever means, admitted; every refusal now names itself.
+//
+// Compatibility: an OLD client reads any nonzero byte as a credential refusal,
+// which is exactly what it did with ack 1 for these same conditions — no
+// regression, and no code it would newly admit. A NEW client reading an OLD
+// router only ever sees 0 or 1, whose meanings are unchanged. See
+// vcs/internal/fsproto/reconnect.go, which holds the mirrored list.
+export const AckCode = {
+  Admitted: 0,
+  /** The session token did not resolve. TERMINAL: the credential is dead. */
+  CredentialRejected: 1,
+  /** maxTunnelsPerLease or maxOpenTunnels is reached. RETRYABLE. */
+  AtCapacity: 2,
+  /** The lease ended or rotated its token generation mid-handshake. RETRYABLE. */
+  LeaseTransition: 3,
+  /** No backend authority was reachable for a resolved route. RETRYABLE. */
+  AuthorityUnavailable: 4,
+} as const;
+
+export type AckCodeValue = (typeof AckCode)[keyof typeof AckCode];
+
 const MAX_TOKEN_BYTES = 4096;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_BACKEND_CONNECT_TIMEOUT_MS = 5_000;
@@ -1006,7 +1039,9 @@ async function handleClient(
     const sessionToken = await readTokenFrame(client, handshakeTimeoutMs);
     const route = routeTable.resolveSessionToken(sessionToken);
     if (!route) {
-      await rejectClient(client);
+      // The ONLY credential verdict this router makes: the token resolves to
+      // no route at all (manager restart, rotation, release, revoke, expiry).
+      await rejectClient(client, AckCode.CredentialRejected);
       return;
     }
     if (route.accessLeaseId !== undefined && config.tunnelRegistry) {
@@ -1016,14 +1051,25 @@ async function handleClient(
           route.tokenGeneration ?? "1"
         ) ?? undefined;
       if (!reservation) {
-        await rejectClient(client);
+        // The token resolved. The lease simply has no tunnel slot left.
+        await rejectClient(client, AckCode.AtCapacity);
         return;
       }
     }
-    const connectedBackend = await connectBackend(route, {
-      connectTimeoutMs: config.backendConnectTimeoutMs ?? DEFAULT_BACKEND_CONNECT_TIMEOUT_MS,
-      handshakeTimeoutMs,
-    });
+    let connectedBackend: Socket;
+    try {
+      connectedBackend = await connectBackend(route, {
+        connectTimeoutMs: config.backendConnectTimeoutMs ?? DEFAULT_BACKEND_CONNECT_TIMEOUT_MS,
+        handshakeTimeoutMs,
+      });
+    } catch {
+      // The credential was good enough to route; there is no authority behind
+      // it right now. Answering rather than closing silently is the difference
+      // between the client reading an authority-side outage and the client
+      // guessing at a dead credential.
+      await rejectClient(client, AckCode.AuthorityUnavailable);
+      return;
+    }
     backend = connectedBackend;
     if (reservation && config.tunnelRegistry) {
       // The lease may have ended or rotated while the backend dial awaited
@@ -1036,13 +1082,19 @@ async function handleClient(
         revalidated.accessLeaseId !== route.accessLeaseId ||
         revalidated.tokenGeneration !== route.tokenGeneration
       ) {
+        // The lease ended or rotated WHILE the backend dial awaited. The
+        // token the client offered was live when it offered it; a race is not
+        // a dead credential, and the next dial with a current credential is
+        // what settles which.
         connectedBackend.destroy();
-        await rejectClient(client);
+        await rejectClient(client, AckCode.LeaseTransition);
         return;
       }
       if (!config.tunnelRegistry.registerReserved(reservation, client, connectedBackend)) {
+        // The reservation could not be consumed: a socket died during the
+        // backend dial, or a rotation sweep took it. Same class of race.
         connectedBackend.destroy();
-        await rejectClient(client);
+        await rejectClient(client, AckCode.LeaseTransition);
         return;
       }
       reservation = undefined;
@@ -1190,11 +1242,14 @@ async function writeBackendTokenFrame(
 }
 
 async function acceptClient(socket: Socket): Promise<void> {
-  await writeAll(socket, Buffer.from([0]));
+  await writeAll(socket, Buffer.from([AckCode.Admitted]));
 }
 
-async function rejectClient(socket: Socket): Promise<void> {
-  await writeAll(socket, Buffer.from([1])).catch(() => undefined);
+// rejectClient answers the exact refusal and closes. The code is REQUIRED:
+// there is no such thing here as a refusal whose reason the router does not
+// know, and defaulting one would put the old lie back.
+async function rejectClient(socket: Socket, code: AckCodeValue): Promise<void> {
+  await writeAll(socket, Buffer.from([code])).catch(() => undefined);
   socket.destroy();
 }
 

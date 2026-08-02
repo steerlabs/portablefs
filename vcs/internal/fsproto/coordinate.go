@@ -787,6 +787,36 @@ func (s *Server) flushBatchManaged(cs *connSession, req *Request) *Response {
 		if errors.Is(err, workfs.ErrDurabilityUnknown) || errors.Is(err, wal.ErrPoisoned) {
 			return nil // UNKNOWN: drop conn; the retry re-reads the durable watermark
 		}
+		if errno, quota := quotaErrno(err); quota {
+			// CAPACITY IS A DEFINITE OUTCOME, NOT A HOLD.
+			//
+			// This is the same classifier the EXACT path uses (exact.go), and
+			// it must be the same answer here: the durable journal backlog
+			// quota is EDQUOT, the resident dirty-block bound and the local WAL
+			// capacity threshold are ENOSPC. Nothing was appended and nothing
+			// was applied — the watermark below is the unmoved one.
+			//
+			// It deliberately precedes the EAGAIN catch-all, and the difference
+			// is the whole point. EAGAIN says "the authority is having a bad
+			// minute, re-offer the identical bytes"; the client honours that by
+			// retrying forever. But NOTHING FOLDS A LIVE GENERATION'S DIRTY
+			// POOL — no in-process checkpoint, and cut adoption advances the
+			// journal base without releasing the child's resident blocks — so a
+			// batch refused for capacity is refused identically for as long as
+			// the volume keeps the bytes it already has. Answering EAGAIN there
+			// wedges the mount at the bound: the watermark freezes, the client's
+			// no-progress watchdog fires, and every operation on the volume —
+			// including the truncate/remove that would have RELEASED the memory
+			// — becomes EIO. That is precisely how a bound turns into a
+			// deadlock.
+			//
+			// A capacity refusal may of course be relieved later (a release, an
+			// adopted base). "Definite" here is a claim about THIS batch at THIS
+			// moment, which is exactly what an application needs to hear: a
+			// write that cannot be made durable must fail as ENOSPC/EDQUOT, in
+			// the application's own hands, not as an unexplained stall.
+			return &Response{Status: errno, AppliedThrough: through, Gen: s.gen()}
+		}
 		// Everything left is the AUTHORITY'S OWN MACHINERY failing — a control
 		// store that is unreachable or out of disk, a backing service that is
 		// restarting — and none of it is a statement about the client's batch.

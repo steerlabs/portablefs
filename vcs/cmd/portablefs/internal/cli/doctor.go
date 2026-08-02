@@ -482,7 +482,10 @@ func (r *doctorRun) checkWriteBack() doctorResult {
 	if problems > 0 {
 		res := doctorFail(
 			fmt.Sprintf("%d attach(es) with degraded state or parked write-back records", problems),
-			"the daemon retries recovery automatically; if it persists, check authority reachability and credentials (`portablefs login`)")
+			"the daemon retries recovery automatically; if it persists, read each attach's "+
+				"lastError — it names the exact condition and the action that changes it "+
+				"(a data-plane tunnel refusal, an unproven credential and a rejected one "+
+				"call for three different responses)")
 		res.Lines = lines
 		return res
 	}
@@ -527,7 +530,9 @@ func (r *doctorRun) checkMounts() doctorResult {
 	}
 	if len(expired) > 0 {
 		problems = append(problems, fmt.Sprintf("%d credential-expired", len(expired)))
-		remedies = append(remedies, "run `portablefs login` and remount credential-expired paths")
+		remedies = append(remedies, "remount credential-expired paths to mint a fresh access lease "+
+			"(run `portablefs login` first only if the saved account credential is "+
+			"also rejected — the mount log names which)")
 	}
 	res := doctorFail(
 		fmt.Sprintf("%d mount(s): %s", len(states), strings.Join(problems, ", ")),

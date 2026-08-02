@@ -79,16 +79,22 @@ type mountState struct {
 	ForceRecoveryJobID    string `json:"forceRecoveryJobId,omitempty"`
 }
 
-// attachCredentialRejected / attachCredentialPendingVerification mirror the
-// daemon's two disjoint credential faults (portablefsd attachStatus.credential)
-// on the DATA-PLANE path. They are deliberately separate from
-// mountStatusCredentialExpired, which is the CLI-side lease-keeper's own
-// persisted verdict: the two paths observe different things (a control-plane
-// renewal refusal vs a data-plane handshake outcome) and collapsing them would
-// make a mount claim a verdict nothing on that path ever reached.
+// These mirror the daemon's disjoint credential-plane faults (portablefsd
+// attachStatus.credential) on the DATA-PLANE path. They are deliberately
+// separate from mountStatusCredentialExpired, which is the CLI-side
+// lease-keeper's own persisted verdict: the two paths observe different things
+// (a control-plane renewal refusal vs a data-plane handshake outcome) and
+// collapsing them would make a mount claim a verdict nothing on that path ever
+// reached.
+//
+// attachCredentialRouterRefused is the third: the router answered, and its
+// answer was not about the credential at all (capacity, a lease transition, an
+// authority outage behind it). It is retryable, and `portablefs login` is not
+// its remedy — which is exactly what the mount used to say.
 const (
 	attachCredentialRejected            = "rejected"
 	attachCredentialPendingVerification = "pending-verification"
+	attachCredentialRouterRefused       = "router-refused"
 )
 
 // mountStatusCredentialExpired marks a running mount whose credentials the

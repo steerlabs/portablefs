@@ -280,6 +280,32 @@ const migrationIds = [
   // matrix proves cannot conflict — while every genuine fence transition
   // keeps FOR UPDATE and therefore keeps serializing against appends.
   "034_liveness_lock_isolation",
+  // 035 names the generations whose history work is terminal. A recovery cut
+  // that reaches 'failed' has no path out on its own: the maintenance loop's
+  // per-(generation, base) operation id replays the recorded outcome forever,
+  // so production logged "adoption is blocked until an operator intervenes"
+  // every 60 seconds indefinitely, naming only a cut id and a generation id.
+  // 035 adds the bounded projection an operator (and the per-cycle telemetry)
+  // needs to act — identity, failure classification, age — plus the partial
+  // index that keeps it off a sequential scan. It changes no behavior and
+  // deliberately leaves the reclamation horizon alone: 031 already clamps
+  // only on pending/materializing cuts, so a terminally failed one never
+  // holds reclamation hostage. (Authored as 034 and renumbered: a parallel
+  // round took 034 for the journal-plane lock-mode fix. Nothing here touches
+  // an object 034 replaces.)
+  "035_recovery_cut_lifecycle",
+  // 036 stops the history plane's liveness beat from queueing behind its own
+  // work. Every pfh claim function opened by upserting its worker heartbeat
+  // row and held it until COMMIT, while pfh.worker_beat wrote ALL FOUR kinds'
+  // rows in one transaction — so the beat queued behind whichever claim was
+  // running while holding the rows the other claims needed. Measured with
+  // pg_blocking_pids: cut_claim blocked by worker_beat blocked by
+  // repair_claim, three different rows, one chain, seconds long against a 5s
+  // lock_timeout. The heartbeat write becomes pfh.worker_touch, which skips a
+  // locked row instead of waiting (the holder is the same worker beating for
+  // the same kind). No claim policy, fence, epoch or work-item lock mode
+  // changes: the work-item distribution was already correct.
+  "036_history_worker_beat_convoy",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";
