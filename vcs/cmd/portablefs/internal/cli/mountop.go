@@ -134,7 +134,11 @@ func acquireMountOperation(stateDir, mountPath, volumeID, branch, strategy strin
 		return nil, errors.Join(err, op.close(false))
 	}
 	if prior != nil && volumeID != "" {
-		conflictErr := fmt.Errorf("an incomplete prior mount operation (%s) remains for %s; run `portablefs umount %s` to reconcile it before mounting", prior.Phase, mountPath, mountPath)
+		conflictErr := fmt.Errorf(
+			"an incomplete prior mount operation (%s) remains for %s; run `portablefs umount %s` to reconcile it before mounting"+
+				" (if that operation's owner is gone and nothing is mounted there, `portablefs umount --discard-record %s` ends it)",
+			prior.Phase, mountPath, mountPath, mountPath,
+		)
 		return nil, errors.Join(conflictErr, op.close(false))
 	}
 	op.prior = prior

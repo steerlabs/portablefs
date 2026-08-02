@@ -139,7 +139,7 @@ func TestRefreshRefusesToArmOverAnAdmittedSizeMutation(t *testing.T) {
 	a.mu.RUnlock()
 	fence := refreshApplyFence{observedSize: snapshot.attr.Size}
 
-	settle, eno := a.reserveSizeMutation(context.Background(), itemID)
+	settle, _, eno := a.reserveSizeMutation(context.Background(), itemID)
 	if eno != 0 {
 		t.Fatalf("reserving an unpinned item was refused: errno=%d", eno)
 	}
@@ -180,7 +180,7 @@ func TestPinnedRefreshHoldsASizeMutationAndThenReleasesIt(t *testing.T) {
 
 	reserved := make(chan int32, 1)
 	go func() {
-		release, eno := a.reserveSizeMutation(context.Background(), item)
+		release, _, eno := a.reserveSizeMutation(context.Background(), item)
 		if release != nil {
 			defer release()
 		}
@@ -217,7 +217,7 @@ func TestReservationWaitIsBoundedByTheOperationDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	release, eno := a.reserveSizeMutation(ctx, item)
+	release, _, eno := a.reserveSizeMutation(ctx, item)
 	if release != nil {
 		release()
 		t.Fatal("a reservation was granted while the item was pinned")

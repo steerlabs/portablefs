@@ -376,9 +376,15 @@ func (k *leaseKeeper) renewOnce(ctx context.Context) {
 		var err error
 		opID, err = newOperationID()
 		if err != nil {
-			k.terminal = true
+			// A LOCAL entropy failure says NOTHING about this lease, and the
+			// lease decision table only ever goes terminal on a definite answer
+			// ABOUT THE LEASE. Latching the keeper here killed a perfectly live
+			// mount on a transient rand(2) failure and there was nothing to
+			// un-latch it: run() returns on terminal and never comes back.
+			// Treat it as UNRESOLVED — no operation id was minted, so nothing
+			// was sent and nothing needs replaying; the next tick mints one.
+			k.unresolved = true
 			k.mu.Unlock()
-			k.credWatch.noteRejected(err)
 			return
 		}
 		k.pendingRenew = opID

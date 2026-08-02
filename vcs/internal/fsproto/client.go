@@ -80,6 +80,9 @@ type Client struct {
 	// see renewLoop. Guarded by renewMu.
 	renewMu   sync.Mutex
 	renewConn *conn
+	// renewErr is the last renewal failure (nil when the last attempt confirmed
+	// a fresh expiry). See Client.LeaseRenewalError.
+	renewErr  error
 	closed    chan struct{}
 	closeOnce sync.Once
 	poolOnce  sync.Once

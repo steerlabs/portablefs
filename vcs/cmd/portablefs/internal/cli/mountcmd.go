@@ -475,6 +475,55 @@ var (
 	liveDaemonAttachMountPaths = defaultLiveDaemonAttachMountPaths
 )
 
+// mountPathProbeBudget bounds every filesystem probe of a mount path.
+//
+// EVERY `portablefs umount` BEGINS BY STATTING THE MOUNT POINT, AND THAT IS A
+// CALL INTO THE FILESYSTEM BEING UNMOUNTED. lstat(2) on a mount point resolves
+// to the mounted filesystem's root vnode, so on a wedged mount it parks in the
+// VFS until the extension answers — which, for the mount an operator is trying
+// to unmount precisely because it stopped answering, is never. Both `portablefs
+// umount` and `portablefs umount --force` hung there for more than five minutes
+// before reaching a single line of unmount logic; the operator killed them.
+//
+// The probe is therefore bounded, and a probe that exceeds its budget reports
+// ETIMEDOUT — the exact shape canonicalMountPath already routes to the
+// identification paths that never touch the filesystem (the kernel mount table
+// via getfsstat(2), and the daemon's own attach inventory). An unresponsive
+// mount now takes the dead-volume path instead of stopping the command.
+//
+// A var so tests compress it; production never changes it.
+var mountPathProbeBudget = 10 * time.Second
+
+// boundedLstatMountPath runs the lstat probe with a hard ceiling.
+//
+// The probe runs on its own goroutine because there is no interruptible lstat.
+// If the budget expires that goroutine stays parked until the kernel releases
+// it; it holds no lock and owns no state, and — unlike an unmount(2) teardown —
+// a path lookup is an interruptible VFS wait, so it can never keep this process
+// from exiting.
+func boundedLstatMountPath(path string) (os.FileInfo, error) {
+	type probe struct {
+		info os.FileInfo
+		err  error
+	}
+	// Resolve the statter on THIS goroutine. The probe goroutine can outlive the
+	// call, and it must not still be reading a package variable afterwards.
+	stat := lstatMountPath
+	done := make(chan probe, 1)
+	go func() {
+		info, err := stat(path)
+		done <- probe{info: info, err: err}
+	}()
+	timer := time.NewTimer(mountPathProbeBudget)
+	defer timer.Stop()
+	select {
+	case result := <-done:
+		return result.info, result.err
+	case <-timer.C:
+		return nil, &os.PathError{Op: "lstat", Path: path, Err: syscall.ETIMEDOUT}
+	}
+}
+
 // unresponsiveMountPathErr reports whether err is the shape a mount point
 // takes once its filesystem stops answering: EIO once the kernel has declared
 // the volume dead, ETIMEDOUT while it is still waiting for an extension that
@@ -557,7 +606,7 @@ func canonicalMountPath(input string) (string, error) {
 		return "", err
 	}
 	absolute = filepath.Clean(absolute)
-	info, lstatErr := lstatMountPath(absolute)
+	info, lstatErr := boundedLstatMountPath(absolute)
 	if lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("mount path %s is a symlink; use a real directory", absolute)
 	}
@@ -601,7 +650,7 @@ func canonicalMountPath(input string) (string, error) {
 	current := absolute
 	var missing []string
 	for {
-		_, err := lstatMountPath(current)
+		_, err := boundedLstatMountPath(current)
 		if err == nil {
 			break
 		}
@@ -1764,13 +1813,39 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// unmount request can ever race a live pin. See the pin's definition in
 		// runMountForeground.
 		releaseMountTargetPin()
-		// Rotated/renewed lease credentials must reach the daemon: it owns
-		// the authority connection for this attach.
-		leaseHook.Store(func(lease leaseState) {
-			if err := ctl.setCredential(attachRef, lease.AccessToken, lease.ExpiresAtMs); err != nil {
-				fmt.Fprintf(e.stderr, "portablefs mount: push rotated credential to portablefsd: %v\n", err)
-			}
-		})
+		// Rotated/renewed lease credentials must reach the daemon: it owns the
+		// authority connection for this attach, so a credential the daemon does
+		// not have is a credential that is not in force.
+		//
+		// The push used to be a bare call whose error was printed and dropped —
+		// fire-and-forget, after the keeper had already committed the lease. A
+		// failed push therefore left the daemon presenting a superseded token
+		// while every layer above believed the rotation had landed. The handoff
+		// is now retried until portablefsd ACKNOWLEDGES it or the credential
+		// reaches its own expiry undelivered, which is a definite, reported
+		// failure. See credentialHandoff.
+		handoff := newCredentialHandoff(
+			func(lease leaseState) error {
+				return ctl.setCredential(attachRef, lease.AccessToken, lease.ExpiresAtMs)
+			},
+			func(format string, args ...any) {
+				fmt.Fprintf(e.stderr, "portablefs mount: "+format+"\n", args...)
+			},
+			func(error) {
+				// The daemon is running on a credential the control plane has
+				// superseded and cannot be given the replacement. That is the
+				// same operator situation mountStatusCredentialExpired already
+				// names — access degrades until `portablefs login` and a
+				// remount — reached by a different route, so it reuses the
+				// status word rather than inventing a second one that every
+				// consumer would have to learn.
+				setMountStatus(stateDir, mountPath, mountStatusCredentialExpired, time.Now().UnixMilli())
+			},
+		)
+		handoffCtx, stopHandoff := context.WithCancel(context.Background())
+		defer stopHandoff()
+		go handoff.run(handoffCtx)
+		leaseHook.Store(func(lease leaseState) { handoff.deliver(lease) })
 		ready.AttachRef = attachRef
 		state.LocalDirs = attachReply.LocalDirs
 		ready.LocalDirs = attachReply.LocalDirs
@@ -1885,8 +1960,10 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	fs := newFlagSet("umount")
 	var o commonOpts
 	var force bool
+	var discardRecord bool
 	addCommonFlags(fs, &o)
 	fs.BoolVar(&force, "force", false, "detach even with an unshipped write-back tail: it parks as a durable recovery job (its ID is printed) for verified exact replay on the next attach")
+	fs.BoolVar(&discardRecord, "discard-record", false, "discard this mount's bookkeeping after proving its kernel mount, owner process, and daemon attach are all gone; it unmounts nothing and refuses if any of them survives")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		return e.handleParseError("umount", err)
@@ -1928,8 +2005,14 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 	defer lifecycleGuard.Close()
 	st, err := readMountState(stateDir, mountPath)
-	if err != nil {
+	if err != nil && !discardRecord {
 		return e.fail("umount", fmt.Errorf("recorded mount state is invalid; nothing was unmounted: %w", err))
+	}
+	if discardRecord {
+		if force {
+			return e.usageError("umount", fmt.Errorf("--discard-record and --force are different operations: --force detaches a live mount, --discard-record only removes bookkeeping whose resources are already gone"))
+		}
+		return e.discardMountRecord(&o, stateDir, mountPath, st, operation, finalize)
 	}
 	if st != nil {
 		hydrateMountOperationFromState(operation, st)

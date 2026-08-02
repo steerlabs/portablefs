@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"golang.org/x/sys/unix"
@@ -18,15 +21,52 @@ type unmountOps struct {
 	validateHelper func(string) error
 }
 
+// platformUnmountBudget bounds the external unmount helper.
+//
+// `/sbin/umount` on a wedged mount blocks in the same uninterruptible kernel
+// wait that made portablefsd unkillable, and the CLI used to wait on it with
+// exec.Command(...).CombinedOutput() — no deadline, and an output read that
+// cannot finish until every descriptor the child holds is closed. That is the
+// second half of why `portablefs umount` hung indefinitely.
+//
+// It is now bounded, the child is killed and its pipes are released at the
+// deadline (WaitDelay), and the command answers a definite verdict.
+//
+// A var so tests compress it; production never changes it.
+var platformUnmountBudget = 30 * time.Second
+
+// errPlatformUnmountAbandoned marks an unmount helper that never returned. The
+// detach is neither known-failed nor known-succeeded; the caller re-reads the
+// kernel mount table (which always answers) to decide.
+var errPlatformUnmountAbandoned = errors.New("platform unmount helper did not return within its budget")
+
 func hostUnmountOps() unmountOps {
 	return unmountOps{
-		goos:   runtime.GOOS,
-		direct: unix.Unmount,
-		combinedOut: func(name string, args ...string) ([]byte, error) {
-			return exec.Command(name, args...).CombinedOutput()
-		},
+		goos:           runtime.GOOS,
+		direct:         unix.Unmount,
+		combinedOut:    boundedCombinedOutput,
 		validateHelper: mounthost.ValidateFUSEHelper,
 	}
+}
+
+func boundedCombinedOutput(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), platformUnmountBudget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	// A DETACH IS NEVER AN INTERACTIVE ACT. Handing the helper this process's
+	// stdin lets it stop and wait for input that a non-tty caller — a script, a
+	// CI job, the operator's own `< /dev/null` — can never supply. It gets
+	// nothing to read.
+	cmd.Stdin = nil
+	// WaitDelay is what makes the ceiling real: past it, Go closes the pipes it
+	// owns rather than waiting for a child that may be pinned in the kernel to
+	// release them.
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return out, fmt.Errorf("%w after %s", errPlatformUnmountAbandoned, platformUnmountBudget)
+	}
+	return out, err
 }
 
 // platformUnmountRecorded proves that the exact recorded kernel object is

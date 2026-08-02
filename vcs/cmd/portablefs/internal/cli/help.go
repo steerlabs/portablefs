@@ -364,7 +364,7 @@ EXAMPLES
   portablefs mount my-workspace /mnt/w --addr 127.0.0.1:2050 --mount-token tok
 `,
 		"umount": `USAGE
-  portablefs umount <mountPath> [--force] [--json]
+  portablefs umount <mountPath> [--force] [--discard-record] [--json]
 
 Unmount a portablefs mount and stop its daemon. A NORMAL unmount first runs
 the full drain barrier — every accepted write is locally synced, reaches the authority, and
@@ -383,6 +383,20 @@ switches mechanisms after a failure. The command then reconciles the exact
 recorded process, resources, access lease, and mount state.
 Missing state or missing drain proof fails closed; PortableFS never substitutes
 an unverified plain unmount.
+
+--discard-record is the terminal for BOOKKEEPING, not for a mount. It unmounts
+nothing, signals nothing and parks nothing; it removes this path's mount record
+and any incomplete operation intent, and only after proving all of: no kernel
+mount exists at the path, the recorded mount owner is gone, the incomplete
+operation's owner is gone, portablefsd holds no durable attach for the path, and
+no live portablefsd owns an attach there. Any survivor is a refusal that names
+the command owning it. Use it when an interrupted unmount left an intent (for
+example phase "unmounting") that blocks new mounts at a path where nothing is
+mounted. Never edit ~/.local/state/portablefs/mounts by hand.
+
+Every probe of the mount path and every external unmount helper is bounded, so
+umount always reaches a verdict even when the filesystem has stopped answering,
+and no umount path — including --force — ever reads standard input.
 `,
 		"mounts": `USAGE
   portablefs mounts [--json]

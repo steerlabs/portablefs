@@ -948,6 +948,14 @@ func (a *attach) setattr(ctx context.Context, req *pfslocal.SetAttrRequest) (*pf
 	}
 	ticket := a.endReincarnationOwnerLocked(savedOwner)
 	a.mu.Unlock()
+	if commit.sizeKnown && commit.published {
+		// The truncate committed and the registry now holds its post-op size,
+		// which this reply carries. See repairwitness.go and the write path's
+		// identical mark: the DELIVERY of the reply is what advances the item's
+		// witness generation, so a setattr that fails below still counts for
+		// nothing.
+		markSizeMutationPublished(ctx)
+	}
 	if rec == nil {
 		return nil, darwinEIO
 	}
@@ -1493,6 +1501,15 @@ func (a *attach) writeReplyWithAttr(
 		reply = a.localAttrForRecordPathLocked(attr, rec, scope, detached)
 	}
 	a.mu.Unlock()
+	if committed && commit.published {
+		// This request holds the item's size-mutation reservation, it COMMITTED,
+		// and the registry now carries the post-op size that is about to travel
+		// back in this reply. That is the first half of the crossed repair's
+		// convergence witness; the delivery of the reply is the second (see
+		// repairwitness.go). Marking it says nothing on its own — a reply that
+		// ends up carrying an errno is never delivered and never counts.
+		markSizeMutationPublished(ctx)
+	}
 
 	if rec == nil && !committed {
 		return nil, darwinEIO

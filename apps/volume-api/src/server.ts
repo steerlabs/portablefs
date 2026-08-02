@@ -873,50 +873,87 @@ async function routeRequest(
       sendJson(res, 404, notOwned().body);
       return;
     }
-    // The retirement receipt is durable once the flip (or its stored replay
-    // answer) is in hand; the history cascade runs strictly AFTER it so the
-    // flip is never coupled to cleanup. Tracked like every other durable
-    // effect: a drain waits for a dispatched cleanup instead of stranding a
-    // half-cancelled volume.
-    const history = (deps.metadata as { history?: PostgresHistoryRepository }).history;
-    if (history) {
-      const cleanup = await deps.runtime.trackEffect(
-        history.volumeRetireCleanup({
-          tenantId: auth.tenantId,
-          volumeId: receipt.volumeId,
-        })
-      );
-      console.log(`volume-api: volume retirement history cleanup ${JSON.stringify(cleanup)}`);
-      // JOURNAL RECLAMATION (migration 031). Retiring a volume used to leave
-      // every journal record it ever wrote in the control store forever:
-      // 021 set volumes.retired_at, 022 cancelled the cuts, and NOTHING
-      // released the pfj.journal_records payloads. That is how `portablefs
-      // rm` on test volumes filled this production Postgres twice.
-      //
-      // This drives the volume's generations terminal and moves each base to
-      // its own tip, so the WHOLE journal falls below the reclamation
-      // horizon; the maintenance loop's bounded pass then deletes the rows.
-      // Deletion is deliberately NOT done inline: it is unbounded work, and
-      // the retirement receipt must not wait on it. Idempotent, so it
-      // re-runs cleanly on every replay.
-      if (history.retireVolumeJournals) {
-        try {
-          const journals = await deps.runtime.trackEffect(
-            history.retireVolumeJournals({
-              tenantId: auth.tenantId,
-              volumeId: receipt.volumeId,
-            })
-          );
-          console.log(`volume-api: volume retirement journal release ${JSON.stringify(journals)}`);
-        } catch (error) {
-          // The retirement receipt is already durable and MUST be answered.
-          // A failed journal release is retried by the next replay and by
-          // the maintenance loop, which re-derives candidates from rows.
-          console.warn(
-            `volume-api: volume retirement journal release deferred for ${receipt.volumeId}: ${
-              error instanceof Error ? error.message.slice(0, 200) : "unknown error"
-            }`
-          );
+    // THE TRANSITION (migration 033). The receipt and the obligation to run
+    // this transition were committed together by retireVolume, so what
+    // follows is an OPPORTUNISTIC fast path, never the only chance:
+    //
+    //   * pfh.volume_retire_cleanup (022) releases the volume's
+    //     conversion/adoption consumer pins, voids its non-terminal
+    //     conversions and cancels its pending/materializing cuts;
+    //   * pfj.journal_retire_for_volume (031) drives the volume's
+    //     generations terminal and moves each base to its own tip, so the
+    //     WHOLE journal falls below the reclamation horizon and the
+    //     maintenance loop's bounded pass can delete the rows.
+    //
+    // 033 runs BOTH in one transaction under every branch advisory lock of
+    // the volume. Before that they were separate transactions with no common
+    // lock and cut_create never checked volumes.retired_at, so a cut created
+    // between them clamped the reclamation horizon forever — cleanup had
+    // already run, the maintenance loop only creates cuts, and the volume was
+    // gone, so nothing would ever settle it.
+    //
+    // A failure here costs the caller NOTHING: the receipt is durable, the
+    // task row is durable, and the maintenance loop's drain retries with
+    // backoff. That is the round 16 property, now backed by a schedule
+    // instead of by a log line.
+    const finishRetirement = deps.metadata.finishVolumeRetirement;
+    if (finishRetirement) {
+      try {
+        const finished = await deps.runtime.trackEffect(
+          finishRetirement.call(deps.metadata, {
+            tenantId: auth.tenantId,
+            volumeId: receipt.volumeId,
+          })
+        );
+        console.log(`volume-api: volume retirement transition ${JSON.stringify(finished)}`);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message.slice(0, 200) : "unknown error";
+        console.warn(
+          `volume-api: volume retirement transition deferred for ${receipt.volumeId}: ${message}`
+        );
+        // Best effort, and deliberately so: the retry is ALREADY scheduled by
+        // the durable task row. This only records why, and its own failure
+        // must not touch the caller's receipt either.
+        await deps.metadata
+          .deferVolumeRetirementTask?.({
+            tenantId: auth.tenantId,
+            volumeId: receipt.volumeId,
+            error: message,
+          })
+          .catch(() => undefined);
+      }
+    } else {
+      // A repository on a pre-033 lineage: the 021/022/031 cascade, exactly
+      // as round 16 shipped it. Kept so an embedder that has not migrated
+      // still retires volumes; it does NOT get the durable schedule.
+      const history = (deps.metadata as { history?: PostgresHistoryRepository }).history;
+      if (history) {
+        const cleanup = await deps.runtime.trackEffect(
+          history.volumeRetireCleanup({
+            tenantId: auth.tenantId,
+            volumeId: receipt.volumeId,
+          })
+        );
+        console.log(`volume-api: volume retirement history cleanup ${JSON.stringify(cleanup)}`);
+        if (history.retireVolumeJournals) {
+          try {
+            const journals = await deps.runtime.trackEffect(
+              history.retireVolumeJournals({
+                tenantId: auth.tenantId,
+                volumeId: receipt.volumeId,
+              })
+            );
+            console.log(
+              `volume-api: volume retirement journal release ${JSON.stringify(journals)}`
+            );
+          } catch (error) {
+            console.warn(
+              `volume-api: volume retirement journal release deferred for ${receipt.volumeId}: ${
+                error instanceof Error ? error.message.slice(0, 200) : "unknown error"
+              }`
+            );
+          }
         }
       }
     }

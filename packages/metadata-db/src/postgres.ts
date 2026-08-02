@@ -70,6 +70,8 @@ import {
   type RenewLeaseInput,
   type RetireVolumeInput,
   type RetireVolumeResult,
+  type VolumeRetirementFinishResult,
+  type VolumeRetirementTask,
   type SnapshotCutInput,
   type SnapshotCutRecord,
   type SnapshotInput,
@@ -244,6 +246,29 @@ const migrationIds = [
   // pfj.journal_retire_for_volume (the reclamation half of `portablefs rm`),
   // an age-aware candidate list, and pfj.journal_storage_usage accounting.
   "031_journal_reclamation",
+  // 032 makes readiness prove an ALLOCATION. 030's fixed 16-slot ring only
+  // extends the relation while no reusable page exists; after the first
+  // vacuum its own dead versions become FSM free space and the probe answers
+  // healthy forever without allocating a byte (measured: 40/40 probes green
+  // on a 100%-full tablespace, relation growth 0, while a journal-class
+  // insert in the same session failed 53100). 032 adds an INSERT-ONLY probe
+  // relation whose ~6 KiB PLAIN rows cannot share a page, so every probe
+  // must EXTEND, verified by pg_relation_size and bounded by a TRUNCATE
+  // +refill reset that allocates its refill before the old file is released.
+  "032_headroom_allocation_probe",
+  // 033 turns volume retirement into a transition. 031's journal release was
+  // best-effort inline work: the DELETE route logged its failure and answered
+  // success, nothing was written down, and the maintenance loop only reclaims
+  // below EXISTING horizons (it never retires a generation), so a live
+  // generation kept its whole tail forever without a client replay. Cleanup
+  // and journal retirement were also separate transactions with no common
+  // lock, and cut_create never looked at volumes.retired_at, so a cut created
+  // in the gap pinned the reclamation horizon indefinitely. 033 enqueues the
+  // obligation in the SAME transaction as the retirement flip, executes
+  // cleanup + journal retirement atomically under every branch lock of the
+  // volume, refuses cuts on a retired volume, and puts cut_cancel in the same
+  // lock order.
+  "033_retirement_transition",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";
@@ -379,34 +404,35 @@ const attachReceiptLockPrefix = "portablefs-attach-receipt";
 // database. Callers may configure smaller pools; larger requests are clamped.
 const maxPoolConnections = 32;
 
-// The readiness write probe. ON CONFLICT DO UPDATE on a fixed key: exactly
-// one heap tuple version, one WAL record, one commit — the same durable
-// transition class as a journal or lease write — with NO row accumulation.
-// The database clock stamps the row; the caller's host clock never does.
+// The readiness write probe (migration 032). ONE round trip, ONE transaction,
+// TWO proofs:
 //
-// The 4 KiB incompressible filler is what makes this catch an out-of-disk
-// DATA volume and not merely an out-of-disk WAL volume: a one-word update
-// can be satisfied in place by a HOT update, but a new 4 KiB row version on
-// a fillfactor-100 page must find a free page or EXTEND the relation — the
-// exact "could not extend file ... No space left on device" the failing
-// lease writes hit. Fresh bytes every probe, so it can never be a no-op.
-const controlWriteProbeStatement = `INSERT INTO portablefs_control_write_probes AS p
-    (probe_key, probe_seq, probed_at_ms, filler)
-  VALUES (
-    $1,
-    1,
-    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
-    (SELECT decode(string_agg(md5(random()::TEXT || g::TEXT), ''), 'hex')
-       FROM generate_series(1, 256) g))
-  ON CONFLICT (probe_key) DO UPDATE
-    SET probe_seq = p.probe_seq + 1,
-        probed_at_ms = EXCLUDED.probed_at_ms,
-        filler = EXCLUDED.filler`;
+//   1. TRANSACTION / WAL / ROW-LOCK health — the 030 fixed-ring update: one
+//      heap tuple version, one WAL record, one synchronous commit, the same
+//      durable-transition class as a journal or lease write, with no row
+//      accumulation. The database clock stamps the row; the host clock never
+//      does.
+//   2. ALLOCATION HEADROOM — an insert into an INSERT-ONLY relation whose
+//      ~6 KiB PLAIN rows cannot share an 8 KiB page, so it must EXTEND the
+//      relation, verified inside the same transaction by pg_relation_size.
+//
+// Leg 2 is what 030 lacked. 030 argued the ring update "must take a free
+// page from the FSM or extend", and only the second arm proves anything:
+// once vacuum has recycled the ring's own dead versions, the FSM arm is the
+// one that always runs. Measured on postgres:18 with the ring in a
+// 100%-full tablespace (WAL writable): 40/40 probes succeeded, the relation
+// grew 0 bytes, and a journal-class insert in the same session failed 53100.
+// An insert-only relation has no dead tuples, so vacuum can never hand it a
+// reusable page and there is no FSM arm to fall into.
+const controlWriteProbeStatement = `SELECT public.portablefs_control_headroom_probe($1) AS probe`;
 
-// The probe ring bound. One slot is picked per repository instance so N
-// replicas do not serialize every readiness check on one row lock (a lock
-// convoy on a healthy store must never read as an outage), while the table
-// stays bounded at this many rows forever.
+// The probe ring bound for leg 1 (must match public.portablefs_control_
+// headroom_probe's own reduction). One slot is picked per repository instance
+// so N replicas do not serialize the durable-transition leg on one row lock —
+// a lock convoy on a healthy store must never read as an outage — while that
+// table stays bounded at this many rows forever. Leg 2's relation is bounded
+// differently, by its TRUNCATE+refill reset, because an allocation proof by
+// definition cannot reuse a fixed row.
 const controlWriteProbeSlots = 16;
 
 // Control-store consumption. Sizes come from the RELATION, not from summing
@@ -430,6 +456,15 @@ const controlStoreUsageStatement = `SELECT
       AS reclaimable_journal_records
   FROM pfj.journal_generations g`;
 
+// The JSONB shape public.portablefs_volume_retire returns. `retiredAtMs` is a
+// canonical decimal string (BIGINT epoch ms); `flipped` distinguishes the
+// winning flip from a replay of an already-retired volume.
+interface RetireFlipRow {
+  volumeId: string;
+  retiredAtMs: string;
+  flipped: boolean;
+}
+
 function decimalString(value: string | undefined): string {
   return typeof value === "string" && /^(?:0|[1-9][0-9]*)$/u.test(value) ? value : "0";
 }
@@ -438,9 +473,7 @@ export class PostgresMetadataRepository implements MetadataRepository {
   private readonly pool: Pool;
   private readonly manifestIndexCache: ManifestIndexCache;
   private historyRepository: PostgresHistoryRepository | undefined;
-  private readonly controlWriteProbeKey = `readyz:${Math.floor(
-    Math.random() * controlWriteProbeSlots
-  )}`;
+  private readonly controlWriteProbeSlot = Math.floor(Math.random() * controlWriteProbeSlots);
 
   constructor(config: PoolConfig | string) {
     const poolConfig: PoolConfig =
@@ -516,7 +549,7 @@ export class PostgresMetadataRepository implements MetadataRepository {
       };
     }
     try {
-      const write = this.pool.query(controlWriteProbeStatement, [this.controlWriteProbeKey]);
+      const write = this.pool.query(controlWriteProbeStatement, [this.controlWriteProbeSlot]);
       await (options?.signal
         ? raceAbort(write, options.signal, "control-plane write probe aborted")
         : write);
@@ -1754,30 +1787,96 @@ export class PostgresMetadataRepository implements MetadataRepository {
     }));
   }
 
-  // retireVolume is the receipted retirement flip (migration 021): one atomic
-  // conditional UPDATE scoped to the verified tenant. A null answer means the
-  // volume is unknown, foreign, or already retired — the route serves all
-  // three as the same non-enumerating 404, and a concurrent second retire
-  // loses this exact race. After the flip the ownership resolvers below treat
-  // the volume as absent, which fences every per-volume plane; nothing is
-  // deleted (storage reclamation is deferred) and live authorities are not
+  // retireVolume is the receipted retirement flip (migration 021) PLUS the
+  // durable obligation to release the volume's journal (migration 033), in
+  // ONE transaction. A null answer means the volume is unknown or foreign —
+  // the route serves both as the same non-enumerating 404. After the flip the
+  // ownership resolvers below treat the volume as absent, which fences every
+  // per-volume plane; nothing is deleted here (deletion is unbounded work and
+  // the receipt must not wait on it) and live authorities are not
   // force-detached — their leases/credentials expire on their own.
+  //
+  // The enqueue is what makes retirement a transition rather than a wish.
+  // Before 033 the route ran the journal release inline, LOGGED any failure,
+  // and answered success; nothing was written down, and the maintenance loop
+  // only reclaims below EXISTING horizons — it never retires a generation —
+  // so without a client replay an active generation kept its whole tail
+  // forever. That is the accumulation that filled this control store twice.
+  //
+  // An already-retired volume answers its stored receipt AND re-asserts the
+  // task, so a receipt minted before 033 (or one whose enqueue was lost to a
+  // crash) acquires its obligation on the next replay instead of never.
   async retireVolume(input: RetireVolumeInput): Promise<RetireVolumeResult | null> {
-    const result = await this.pool.query(
-      `UPDATE volumes
-       SET retired_at = to_timestamp($3::double precision / 1000.0)
-       WHERE id = $1 AND tenant_id = $2 AND retired_at IS NULL
-       RETURNING retired_at`,
-      [input.volumeId, input.tenantId, input.now ?? Date.now()]
+    const result = await this.pool.query<{ out: RetireFlipRow | null }>(
+      `SELECT public.portablefs_volume_retire($1,$2,$3) AS out`,
+      [input.tenantId, input.volumeId, String(input.now ?? Date.now())]
     );
-    const row = result.rows[0];
-    if (!row) {
+    const row = result.rows[0]?.out ?? null;
+    if (!row || typeof row.retiredAtMs !== "string") {
       return null;
     }
-    return {
-      volumeId: input.volumeId,
-      retiredAtMs: new Date(row.retired_at as string | Date).getTime(),
-    };
+    // A replayed DELETE of an already-retired volume is NOT a fresh flip; the
+    // route's own replay path answers those, so preserve the 021 contract
+    // that only the winning flip returns a receipt from this call.
+    if (row.flipped !== true) {
+      return null;
+    }
+    return { volumeId: input.volumeId, retiredAtMs: Number(row.retiredAtMs) };
+  }
+
+  // The atomic retirement transition (migration 033). pfh.volume_retire_cleanup
+  // and pfj.journal_retire_for_volume in ONE transaction, under every branch
+  // advisory lock of the volume — the SAME keys pfh.cut_create takes through
+  // pfj.history_head_capture. Before 033 they were separate transactions with
+  // no common lock, so a cut created between them pinned the reclamation
+  // horizon indefinitely: cleanup had already run, the maintenance loop only
+  // creates cuts, and the volume was gone so no client would ever settle it.
+  async finishVolumeRetirement(input: {
+    tenantId: string;
+    volumeId: string;
+  }): Promise<VolumeRetirementFinishResult> {
+    const result = await this.pool.query<{ out: VolumeRetirementFinishResult }>(
+      `SELECT public.portablefs_volume_retire_finish($1,$2,$3) AS out`,
+      [input.tenantId, input.volumeId, String(Date.now())]
+    );
+    return result.rows[0]!.out;
+  }
+
+  // The drain's claim step: due obligations, bounded, SKIP LOCKED, with the
+  // attempt/backoff bump committed by the CLAIM so a claimer that then
+  // crashes still yields a retry rather than a stuck row.
+  async claimVolumeRetirementTasks(input?: {
+    limit?: number;
+    backoffMs?: number;
+  }): Promise<VolumeRetirementTask[]> {
+    const result = await this.pool.query<{ out: unknown }>(
+      `SELECT public.portablefs_volume_retirement_tasks_claim($1,$2,$3) AS out`,
+      [input?.limit ?? 8, String(Date.now()), String(input?.backoffMs ?? 60_000)]
+    );
+    const rows = result.rows[0]?.out;
+    if (!Array.isArray(rows)) {
+      return [];
+    }
+    return rows.map((row) => {
+      const entry = row as { volumeId: string; tenantId: string; attempts: string };
+      return {
+        volumeId: entry.volumeId,
+        tenantId: entry.tenantId,
+        attempts: Number(entry.attempts),
+      };
+    });
+  }
+
+  async deferVolumeRetirementTask(input: {
+    tenantId: string;
+    volumeId: string;
+    error: string;
+  }): Promise<void> {
+    await this.pool.query(`SELECT public.portablefs_volume_retirement_task_defer($1,$2,$3)`, [
+      input.tenantId,
+      input.volumeId,
+      input.error.slice(0, 500),
+    ]);
   }
 
   // The replay half of receipted retirement: the stored receipt for the

@@ -185,7 +185,7 @@ func TestRefreshBargeCannotStarveAQueuedSizeMutation(t *testing.T) {
 	// EINTR for a request that was never given the chance to attempt anything.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	release, eno := a.reserveSizeMutation(ctx, item)
+	release, _, eno := a.reserveSizeMutation(ctx, item)
 	if eno != 0 {
 		t.Fatalf("a size mutation queued for the item and was woken %d times "+
 			"without ever being given it; %d later refresh passes took it instead, "+
@@ -244,7 +244,7 @@ func TestItemTicketsAreServedInArrivalOrder(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	release, eno := a.reserveSizeMutation(ctx, item)
+	release, _, eno := a.reserveSizeMutation(ctx, item)
 	if eno != 0 {
 		t.Fatalf("the size mutation was refused with errno=%d after queueing %d "+
 			"time(s)", eno, queuedFor.Load())
@@ -328,7 +328,7 @@ func TestSustainedRefreshStreamStillYieldsTheItemToAQueuedMutation(t *testing.T)
 		atQueue.Store(-1)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		start := time.Now()
-		release, eno := a.reserveSizeMutation(ctx, itemID)
+		release, _, eno := a.reserveSizeMutation(ctx, itemID)
 		waited := time.Since(start)
 		cancel()
 		if eno != 0 {
@@ -380,7 +380,7 @@ func TestAbandonedTicketDoesNotWedgeTheItemQueue(t *testing.T) {
 	var once sync.Once
 	a.testSizeMutationQueued = func(uint64) { once.Do(func() { close(queued) }) }
 	go func() {
-		release, eno := a.reserveSizeMutation(dying, item)
+		release, _, eno := a.reserveSizeMutation(dying, item)
 		if release != nil {
 			release()
 		}
@@ -394,7 +394,7 @@ func TestAbandonedTicketDoesNotWedgeTheItemQueue(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		release, eno := a.reserveSizeMutation(ctx, item)
+		release, _, eno := a.reserveSizeMutation(ctx, item)
 		if release != nil {
 			release()
 		}

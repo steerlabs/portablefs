@@ -52,6 +52,36 @@ type RecoveryJob struct {
 
 	LastError string           `json:"lastError,omitempty"`
 	Conflicts []ConflictDetail `json:"conflicts,omitempty"`
+
+	// ── THE UNREPLAYABLE VERDICT ─────────────────────────────────────────────
+	//
+	// Set only when a parked job was PROVEN unreplayable and contained (see
+	// recoveryRunner.contain). Until then every field here is zero, so a job
+	// that is merely retrying is never mistaken for a job that lost data.
+	//
+	// Quarantined says the stream's bytes were moved aside and its authority
+	// grants swept, so the namespace it covered is usable again. The Lost*
+	// fields are the DEFINITE loss statement an operator acts on: how much
+	// acknowledged data never reached the authority and which scopes it was
+	// written under. Remedy names what to do about it.
+	Quarantined    bool     `json:"quarantined,omitempty"`
+	QuarantinePath string   `json:"quarantinePath,omitempty"`
+	LostRecords    uint64   `json:"lostRecords,omitempty"`
+	LostBytes      uint64   `json:"lostBytes,omitempty"`
+	LostScopes     []string `json:"lostScopes,omitempty"`
+	Remedy         string   `json:"remedy,omitempty"`
+}
+
+// Unrecovered reports the acknowledged bytes this job still holds that the
+// authority has never made durable. It is nonzero for a parked job that has not
+// drained AND for a contained one whose bytes are unrecoverable — in both cases
+// the data is locally durable and not at the authority, which is the only thing
+// a drain-completeness check may conclude from.
+func (j RecoveryJob) Unrecovered() (records uint64, bytes uint64) {
+	if j.Quarantined {
+		return j.LostRecords, j.LostBytes
+	}
+	return j.PendingRecords, j.PendingBytes
 }
 
 // jobState is the atomic on-disk registry for one stream directory.
@@ -70,6 +100,14 @@ func (js *jobState) snapshot() RecoveryJob {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 	return js.job
+}
+
+// retarget repoints the registry at the stream's new directory after a
+// containment rename, so later persists land beside the bytes they describe.
+func (js *jobState) retarget(streamDir string) {
+	js.mu.Lock()
+	js.path = filepath.Join(streamDir, "job.json")
+	js.mu.Unlock()
 }
 
 func (js *jobState) update(fn func(*RecoveryJob)) {
@@ -128,6 +166,12 @@ func loadJob(streamDir string) (RecoveryJob, bool) {
 // attach — the mount never serves with parked streams in limbo.
 var errRetryable = errors.New("writeback: recovery attempt failed")
 
+// errForeignStream marks a parked stream that belongs to another volume or
+// branch. It is reported and never adopted — and, unlike every other terminal
+// verdict, never contained: its grants and its bytes are not this engine's to
+// sweep or move.
+var errForeignStream = errors.New("writeback: parked stream belongs to another volume or branch")
+
 // recoveryRunner reconciles every parked stream of this store at engine
 // open, BEFORE the mount serves. A stream either drains fully, or parks in
 // an explicit terminal state (conflict/corrupt/foreign — surfaced, never
@@ -137,20 +181,35 @@ type recoveryRunner struct {
 
 	mu     sync.Mutex
 	parked map[string]*jobState // stream dir -> registry (terminal only, post-open)
+	// contained holds the CONTAINED jobs: proven unreplayable, their namespace
+	// already released, their bytes moved aside. They are never attempted
+	// again — retrying a proof does not change it — but they stay surfaced on
+	// every attach, forever, so the loss cannot become invisible.
+	contained map[string]*jobState
 }
 
 func newRecoveryRunner(e *Engine) *recoveryRunner {
-	return &recoveryRunner{e: e, parked: map[string]*jobState{}}
+	return &recoveryRunner{
+		e:         e,
+		parked:    map[string]*jobState{},
+		contained: map[string]*jobState{},
+	}
 }
+
+// quarantineDirName holds streams whose replay was proven impossible. It is
+// deliberately NOT a "stream-" directory: the recovery scan, the force-park
+// inventory and the epoch allocator all key off that prefix, and a contained
+// stream must never again be mistaken for a replay candidate.
+const quarantineDirName = "unreplayable"
 
 // discover registers every parked stream directory and returns the highest
 // epoch seen (the live stream picks the next one).
 func (r *recoveryRunner) discover() uint64 {
+	var maxEpoch uint64
 	entries, err := os.ReadDir(r.e.cfg.StateDir)
 	if err != nil {
 		return 0
 	}
-	var maxEpoch uint64
 	for _, ent := range entries {
 		if !ent.IsDir() {
 			continue
@@ -164,6 +223,45 @@ func (r *recoveryRunner) discover() uint64 {
 		job, _ := loadJob(dir)
 		js := newJobState(dir, job)
 		r.parked[dir] = js
+	}
+	return max(maxEpoch, r.discoverContained())
+}
+
+// discoverContained re-registers every previously contained stream so its
+// verdict is reported on this attach too. A contained stream's epoch still
+// counts toward the high-water mark: its writeback identity is durable at the
+// authority's ledger and must never be minted twice.
+func (r *recoveryRunner) discoverContained() uint64 {
+	root := filepath.Join(r.e.cfg.StateDir, quarantineDirName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	var maxEpoch uint64
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		epoch, ok := streamEpochFromDir(ent.Name())
+		if !ok {
+			continue
+		}
+		maxEpoch = max(maxEpoch, epoch)
+		dir := filepath.Join(root, ent.Name())
+		job, ok := loadJob(dir)
+		if !ok {
+			// The bytes are there but the verdict is not readable. Report the
+			// containment anyway — an unreadable verdict is still a loss, and
+			// silence is the one answer that is never allowed here.
+			job = RecoveryJob{
+				State:     JobCorrupt,
+				WALEpoch:  epoch,
+				LastError: "contained stream has no readable recovery verdict",
+			}
+		}
+		job.Quarantined = true
+		job.QuarantinePath = dir
+		r.contained[dir] = newJobState(dir, job)
 	}
 	return maxEpoch
 }
@@ -215,10 +313,23 @@ func (r *recoveryRunner) attempt(ctx context.Context, dir string) error {
 			return fmt.Errorf("writeback: persist retryable recovery state for %s: %w", filepath.Base(dir), persistErr)
 		}
 		return fmt.Errorf("writeback: parked stream %s not drained: %w", filepath.Base(dir), err)
+	case isUnreplayable(err):
+		// PROVEN unreplayable. Leaving it parked is what turned a lost tail
+		// into a lost NAMESPACE: the stream's grants stay checked out to a
+		// dead writeback identity, so every enumeration of the covered subtree
+		// fails with EAGAIN on every future attach, including clean ones. The
+		// tail is gone either way — no retry, no setting, and no later attach
+		// changes a proof — so the only question left is whether the loss also
+		// takes the directory with it. Contain it: sweep the grants, move the
+		// bytes aside, and publish a definite verdict.
+		if containErr := r.contain(ctx, dir, js, err); containErr != nil {
+			return containErr
+		}
+		return nil
 	default:
-		// Terminal (conflict/corrupt/foreign): stays registered for
-		// surfacing; the mount serves — the scopes stay fenced server-side
-		// and typed locally, nothing is silently merged.
+		// Terminal but NOT proven unreplayable — a foreign stream, or a
+		// close-out an operator can still make fit. It stays registered for
+		// surfacing and keeps its grants; the mount serves.
 		if persistErr := js.persist(); persistErr != nil {
 			return fmt.Errorf("writeback: persist terminal recovery state for %s: %w", filepath.Base(dir), persistErr)
 		}
@@ -226,15 +337,203 @@ func (r *recoveryRunner) attempt(ctx context.Context, dir string) error {
 	}
 }
 
+// contain makes a proven-unreplayable stream harmless to everything except
+// itself, in an order every crash point survives:
+//
+//  1. Publish the verdict INTO the stream directory and sync it. Everything
+//     after this point is idempotent, so a crash simply repeats it.
+//  2. Sweep the authority grants bound to this stream. This is the step that
+//     gives the namespace back: until it runs, the covered subtree answers
+//     EAGAIN for every peer and every future attach. A transport failure here
+//     fails the attach — loudly and retryably — rather than serving a mount
+//     whose namespace is still hostage.
+//  3. Rename the stream out of the scan path, atomically, and sync both
+//     parents. A crash before the rename leaves a stream that is re-proven
+//     unreplayable and re-contained; a crash after it leaves a contained
+//     stream carrying its verdict.
+//
+// The bytes are KEPT. They are unrecoverable through this protocol, not
+// worthless: they are the only remaining copy of what was acknowledged, and an
+// operator (or a forensic tool) may still extract from them. Deleting them
+// would turn a reported loss into an unexaminable one.
+func (r *recoveryRunner) contain(ctx context.Context, dir string, js *jobState, cause error) error {
+	records, bytes, scopes, wbID := summarizeUnreplayableStream(dir, js.snapshot())
+	js.update(func(j *RecoveryJob) {
+		if j.State != JobConflict {
+			j.State = JobCorrupt
+		}
+		if j.LastError == "" {
+			j.LastError = cause.Error()
+		}
+		if wbID != "" {
+			j.WritebackID = wbID
+		}
+		j.Quarantined = true
+		j.QuarantinePath = filepath.Join(r.e.cfg.StateDir, quarantineDirName, filepath.Base(dir))
+		j.LostRecords, j.LostBytes, j.LostScopes = records, bytes, scopes
+		j.PendingRecords, j.PendingBytes = records, bytes
+		j.Remedy = unreplayableRemedy(j)
+	})
+	if err := js.persist(); err != nil {
+		return fmt.Errorf("writeback: publish unreplayable verdict for %s: %w", filepath.Base(dir), err)
+	}
+	if wbID != "" {
+		if err := r.e.remote.Discard(ctx, wbID, nil); err != nil {
+			return fmt.Errorf(
+				"writeback: release the namespace held by unreplayable stream %s: %w",
+				filepath.Base(dir), err,
+			)
+		}
+	}
+	moved, err := quarantineStreamDir(r.e.cfg.StateDir, dir)
+	if err != nil {
+		return fmt.Errorf("writeback: contain unreplayable stream %s: %w", filepath.Base(dir), err)
+	}
+	js.retarget(moved)
+	r.mu.Lock()
+	delete(r.parked, dir)
+	r.contained[moved] = js
+	r.mu.Unlock()
+	job := js.snapshot()
+	r.e.logf(
+		"writeback: parked stream %s CANNOT be replayed (%v); %d acknowledged record(s) / %d byte(s) under %v are unrecoverable; the bytes are kept at %s and the namespace has been released",
+		job.WritebackID, cause, job.LostRecords, job.LostBytes, job.LostScopes, moved,
+	)
+	return nil
+}
+
+// isUnreplayable reports a terminal verdict that no retry, no operator setting
+// and no later attach can change.
+//
+// The two exclusions are the whole content of the predicate. A FOREIGN stream
+// belongs to another volume or branch: this engine has no standing to sweep its
+// grants or move its bytes, and its replayability is not this engine's finding.
+// An UNBOUNDED CLOSE-OUT is definite but not final: its tail is already applied
+// at the authority and only the local close-out does not fit, which an operator
+// resolves by raising the budget or freeing the device — containing it would
+// throw away a stream that is one setting away from finishing.
+func isUnreplayable(err error) bool {
+	switch {
+	case err == nil, errors.Is(err, errRetryable):
+		return false
+	case errors.Is(err, errForeignStream), errors.Is(err, errCloseOutUnbounded):
+		return false
+	default:
+		return true
+	}
+}
+
+func unreplayableRemedy(j *RecoveryJob) string {
+	if j.LostRecords == 0 {
+		return "No acknowledged record was lost: the stream held nothing the authority had not already made durable. " +
+			"The retained bytes may be deleted once the verdict has been noted."
+	}
+	return fmt.Sprintf(
+		"%d acknowledged record(s) (%d byte(s)) written under %v never reached the authority and cannot be replayed. "+
+			"Treat every path under those scopes as having lost its most recent writes, re-copy them from the source if one exists, "+
+			"and keep %s until you have done so — it holds the only remaining copy.",
+		j.LostRecords, j.LostBytes, j.LostScopes, j.QuarantinePath,
+	)
+}
+
+// summarizeUnreplayableStream states the loss as exactly as the stream still
+// allows. It is deliberately best-effort in that order: the exact frame-level
+// count when the stream still decodes, the parked job's own durable counters
+// when it does not. A stream too damaged to enumerate is exactly the one whose
+// loss must still be reported rather than reported as zero.
+func summarizeUnreplayableStream(dir string, job RecoveryJob) (records, bytes uint64, scopes []string, wbID string) {
+	records, bytes, wbID = job.PendingRecords, job.PendingBytes, job.WritebackID
+	scan, err := scanStreamReadOnly(dir)
+	if err != nil {
+		return records, bytes, nil, wbID
+	}
+	if wbID == "" {
+		wbID = streamID(scan.header.MountID, scan.header.WALEpoch)
+	}
+	live, mutations, marks, _, decodeErr := decodeStreamFrames(scan.frames)
+	applied := job.AppliedThrough
+	if decodeErr == nil {
+		if cert, certErr := highestAppliedCertificate(marks, scan.lastSeq); certErr == nil {
+			applied = max(applied, cert.global)
+		}
+	}
+	if decodeErr == nil {
+		records, bytes = 0, 0
+		for _, fr := range mutations {
+			if fr.seq > applied {
+				records++
+				bytes += uint64(len(fr.payload))
+			}
+		}
+		for scope := range live {
+			scopes = append(scopes, scope)
+		}
+		sort.Strings(scopes)
+	}
+	return records, bytes, scopes, wbID
+}
+
+// quarantineStreamDir moves a stream out of the scan path with one atomic
+// rename and makes both directory changes durable.
+func quarantineStreamDir(stateDir, dir string) (string, error) {
+	root := filepath.Join(stateDir, quarantineDirName)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	if err := fsyncDir(stateDir); err != nil {
+		return "", err
+	}
+	target := filepath.Join(root, filepath.Base(dir))
+	if _, err := os.Lstat(target); err == nil {
+		// Epochs are allocated from a durable monotone high-water mark, so a
+		// collision here means the store's identity has been reused. Refuse
+		// rather than overwrite the earlier verdict and its bytes.
+		return "", fmt.Errorf("writeback: quarantine slot %s already exists", target)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := os.Rename(dir, target); err != nil {
+		return "", err
+	}
+	if err := fsyncDir(stateDir); err != nil {
+		return "", err
+	}
+	if err := fsyncDir(root); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
 func (r *recoveryRunner) jobs() []RecoveryJob {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]RecoveryJob, 0, len(r.parked))
+	out := make([]RecoveryJob, 0, len(r.parked)+len(r.contained))
 	for _, js := range r.parked {
+		out = append(out, js.snapshot())
+	}
+	for _, js := range r.contained {
 		out = append(out, js.snapshot())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].WALEpoch < out[j].WALEpoch })
 	return out
+}
+
+// unrecovered is the store's whole durable-but-unapplied debt outside the live
+// stream: every parked job that has not drained plus every contained one whose
+// bytes are unrecoverable. It is what makes a drain-completeness answer honest —
+// see Engine.Pending.
+func (r *recoveryRunner) unrecovered() (records uint64, bytes uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, js := range r.parked {
+		jr, jb := js.snapshot().Unrecovered()
+		records, bytes = records+jr, bytes+jb
+	}
+	for _, js := range r.contained {
+		jr, jb := js.snapshot().Unrecovered()
+		records, bytes = records+jr, bytes+jb
+	}
+	return records, bytes
 }
 
 // recoverStream reconciles one parked stream: scan, verify against the
@@ -261,7 +560,7 @@ func (r *recoveryRunner) recoverStream(ctx context.Context, dir string, js *jobS
 			j.LastError = fmt.Sprintf("stream belongs to %s@%s, not %s@%s",
 				scan.header.VolumeID, scan.header.Branch, e.cfg.VolumeID, e.cfg.Branch)
 		})
-		return errors.New("foreign stream")
+		return errForeignStream
 	}
 
 	live, mutations, marks, closed, err := decodeStreamFrames(scan.frames)
@@ -863,12 +1162,32 @@ func appendRecoveryReleaseCertificate(
 	// crash loop grow it without bound. It only counts when it sits in the
 	// segment the reclaim RETAINS — a mark inside a segment about to be deleted
 	// authorizes nothing.
+	//
+	// The test is SEMANTIC, not byte equality. What authorizes the reclaim is
+	// the POSITION the durable certificate decodes to, and the same position has
+	// more than one valid encoding — a pre-round-7 stream spells its legacy
+	// watermark as Through alone, where this close-out spells it with the
+	// self-describing legacy field as well. Comparing bytes would call those two
+	// different marks and charge for a duplicate that adds nothing, which on an
+	// at-cap pre-upgrade stream is the difference between a close-out that fits
+	// and one that parks the grant in a typed conflict forever.
 	appliedBytes := frameLen(len(appliedPayload))
 	if n := len(scan.frames); n > 0 {
 		tailOrdinal := scan.frames[n-1].ordinal
 		for _, fr := range scan.frames {
-			if fr.typ == frameApplied && fr.ordinal == tailOrdinal &&
-				bytes.Equal(fr.payload, appliedPayload) {
+			if fr.typ != frameApplied || fr.ordinal != tailOrdinal {
+				continue
+			}
+			if bytes.Equal(fr.payload, appliedPayload) {
+				appliedBytes = 0
+				break
+			}
+			var durable appliedFrame
+			if json.Unmarshal(fr.payload, &durable) != nil {
+				continue
+			}
+			position, derr := durable.mark()
+			if derr == nil && sameAppliedPosition(position, mark) {
 				appliedBytes = 0
 				break
 			}
@@ -1054,26 +1373,77 @@ func appendStreamTailFrames(path string, off int64, body []byte) error {
 	return nil
 }
 
-// highestAppliedCertificate selects the newest durable local authority
-// acknowledgement. Concurrent release workers may append an older snapshot
-// after a newer checkpoint, so physical frame order does not imply watermark
-// order. Two different digests for the same watermark remain corruption.
+// sameAppliedPosition reports whether two marks name the same durable position.
+// A lane with nothing applied has no digest to agree about: the chain base is
+// the same constant on both sides by construction, and callers legitimately
+// spell it either as that constant or as the zero value.
+func sameAppliedPosition(a, b streamMark) bool {
+	if a.global != b.global {
+		return false
+	}
+	for lane := range a.lanes {
+		if a.lanes[lane].through != b.lanes[lane].through {
+			return false
+		}
+		if a.lanes[lane].through != 0 && a.lanes[lane].digest != b.lanes[lane].digest {
+			return false
+		}
+	}
+	return true
+}
+
+// highestAppliedCertificate folds every durable local authority
+// acknowledgement into one position. Concurrent release workers may append an
+// older snapshot after a newer checkpoint, so physical frame order does not
+// imply watermark order.
+//
+// ── WHY THE AGREEMENT TEST IS PER LANE, NOT PER GLOBAL WATERMARK ─────────────
+//
+// The exactly-once proof is "one lane watermark names exactly one chain
+// digest". It is a statement about a LANE, because a chain is a lane. Two
+// certificates that name the same GLOBAL watermark and different lane marks are
+// not a contradiction about anything — they are the ORDINARY steady state of a
+// laned stream, and the reason is structural:
+//
+//   - The global prefix is the lowest still-unshipped global sequence minus one
+//     over ALL lanes (see flusher.recomputeStreamLocked). One stuck record pins
+//     it, however far the other lanes run.
+//   - Each lane's watermark advances on its own. That independence is the whole
+//     point of splitting the lanes.
+//
+// So a wedged data lane pins the global watermark while the namespace lane
+// keeps applying, and every certificate written in that window — one per drained
+// scope release, one per reclaiming checkpoint — carries the same Through and a
+// different namespace mark. Reading that as WAL corruption condemned a stream
+// that was in perfect health: the parked tail became unreplayable, its bytes
+// unrecoverable, and its delegation grants stayed checked out to a dead stream
+// forever. That is the defect this function exists in its present form to close.
+//
+// What IS corruption is two different digests for the SAME lane at the SAME lane
+// watermark: one chain cannot have two values at one position.
+//
+// The result is the per-lane MAXIMUM rather than one certificate's snapshot.
+// Each certificate is an independent durable statement about each lane, and
+// authority lane watermarks only advance, so the highest watermark seen for a
+// lane is proven durable for that lane regardless of which frame carried it.
+// Taking one frame's whole array instead could adopt an OLDER position for a
+// lane that a different frame had already proven further along.
 func highestAppliedCertificate(marks []appliedFrame, lastSeq uint64) (streamMark, error) {
 	best := streamMark{}
 	for lane := range best.lanes {
 		best.lanes[lane].digest = digestZero()
 	}
 	zero := digestZero()
-	seen := map[uint64][streamLaneCount]laneMark{0: best.lanes}
+	// lane watermark -> chain digest at it. Seeded with the chain base, which is
+	// the same constant on both sides by construction.
+	seen := make([]map[uint64][32]byte, streamLaneCount)
+	for lane := range seen {
+		seen[lane] = map[uint64][32]byte{0: zero}
+	}
 	for _, mark := range marks {
 		decoded, err := mark.mark()
 		if err != nil {
 			return streamMark{}, err
-		}
-		for lane := range decoded.lanes {
-			if decoded.lanes[lane].through == 0 {
-				decoded.lanes[lane].digest = zero
-			}
 		}
 		if mark.Through > lastSeq {
 			return streamMark{}, fmt.Errorf(
@@ -1081,20 +1451,24 @@ func highestAppliedCertificate(marks []appliedFrame, lastSeq uint64) (streamMark
 				ErrCorrupt, mark.Through, lastSeq,
 			)
 		}
-		if prior, ok := seen[mark.Through]; ok {
-			if decoded.lanes != prior {
+		for lane := range decoded.lanes {
+			lm := decoded.lanes[lane]
+			if lm.through == 0 {
+				// A lane with nothing applied has no digest to agree about.
+				lm.digest = zero
+			}
+			if prior, ok := seen[lane][lm.through]; ok && prior != lm.digest {
 				return streamMark{}, fmt.Errorf(
-					"%w: conflicting applied digests at watermark %d",
-					ErrCorrupt, mark.Through,
+					"%w: conflicting %s-lane applied digests at lane watermark %d",
+					ErrCorrupt, StreamLane(lane), lm.through,
 				)
 			}
-			continue
+			seen[lane][lm.through] = lm.digest
+			if lm.through > best.lanes[lane].through {
+				best.lanes[lane] = lm
+			}
 		}
-		seen[mark.Through] = decoded.lanes
-		if mark.Through > best.global {
-			best.global = mark.Through
-			best.lanes = decoded.lanes
-		}
+		best.global = max(best.global, mark.Through)
 	}
 	return best, nil
 }

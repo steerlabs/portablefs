@@ -1286,8 +1286,8 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 	defer a.noteCoherenceRepairing(-1)
 	// The convergence witness is armed BEFORE the first attempt, so no
 	// publication that happens during the repair can be missed.
-	stopWatch := a.watchRepairPublications(itemID)
-	defer stopWatch()
+	watch := a.watchRepairPublications(itemID)
+	defer watch.stop()
 	giveUp := time.Now().Add(crossedRepairBudget)
 	backoff := crossedRepairRetryDelay
 	var err error
@@ -1296,7 +1296,7 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 		if lifetime.Err() != nil {
 			return
 		}
-		if a.repairDischargedByPublication(itemID, attempt, yields) {
+		if a.repairDischargedByPublication(watch, attempt, yields) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(lifetime, crossedRefreshTimeout)
@@ -1321,7 +1321,7 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 				if lifetime.Err() != nil {
 					return
 				}
-				if a.repairDischargedByPublication(itemID, attempt, yields) {
+				if a.repairDischargedByPublication(watch, attempt, yields) {
 					return
 				}
 				a.reportRepairGaveUp(itemID, errRepairItemStayedBusy)
@@ -1344,7 +1344,7 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 				// that no longer exists.
 				return
 			}
-			if a.repairDischargedByPublication(itemID, attempt, yields) {
+			if a.repairDischargedByPublication(watch, attempt, yields) {
 				return
 			}
 			a.reportRepairGaveUp(itemID, err)
@@ -1353,28 +1353,47 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 	}
 }
 
-// repairDischargedByPublication reports whether this daemon has restated the
-// item's attributes since the repair began watching, and logs the discharge.
+// repairDischargedByPublication reports whether a SIZE MUTATION has committed
+// and delivered its own post-op attributes to the kernel since this repair
+// began watching, and logs the discharge.
 //
 // A publication is only a discharge for a repair that has ALREADY yielded at
 // least once. Before that the item is quiet as far as this repair knows, and a
-// quiet item must be proved by the exact pass — a stray publication from a
-// getattr is not a reason to skip a refresh that would have succeeded anyway.
-// After a yield the situation is the opposite: the writer is live, its own
-// publications are what the kernel is being driven by, and the exact pass has
-// nothing to add.
-func (a *attach) repairDischargedByPublication(itemID uint64, attempt, yields int) bool {
-	if yields == 0 {
+// quiet item must be proved by the exact pass — a publication that happens to
+// land during a quiet window is not a reason to skip a refresh that would have
+// succeeded anyway. After a yield the situation is the opposite: the writer is
+// live, its own publications are what the kernel is being driven by, and the
+// exact pass has nothing to add.
+//
+// ── WHAT COUNTS, AND WHY IT IS NOT "ANY PUBLICATION UNDER A RESERVATION" ────
+//
+// The witness used to credit any attribute assignment made while any size
+// reservation existed on the item, and that is not a statement about a
+// mutation at all. An older getattr, already in flight and holding the locks
+// the preempting write is queued behind, publishes its PRE-WRITE observation;
+// the write's reservation exists, so it counted; the repair exited discharged;
+// and the write was then cancelled without committing anything. The debt was
+// discarded on the very value it existed to correct.
+//
+// watch.since() now counts only mutations that (a) held the item's reservation
+// token, (b) committed and installed their post-op size into the registry, and
+// (c) had that reply DELIVERED to the frontend un-retracted. See
+// repairwitness.go.
+func (a *attach) repairDischargedByPublication(
+	watch *repairPublicationWatcher,
+	attempt, yields int,
+) bool {
+	if yields == 0 || watch == nil {
 		return false
 	}
-	published := a.repairPublicationsSince(itemID)
+	published := watch.since()
 	if published == 0 {
 		return false
 	}
 	log.Printf(
 		"portablefsd: attach %s: kernel coherence repair for item %d discharged by "+
-			"%d local attribute publication(s) after %d attempt(s) and %d yield(s) to "+
-			"the application", a.ref, itemID, published, attempt, yields,
+			"%d delivered size-mutation publication(s) after %d attempt(s) and %d "+
+			"yield(s) to the application", a.ref, watch.itemID, published, attempt, yields,
 	)
 	return true
 }

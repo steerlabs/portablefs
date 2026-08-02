@@ -246,9 +246,18 @@ func (a *attach) sizeMutationReservedLocked(itemID uint64) bool {
 //
 // A zero itemID is an item the registry cannot name, so no refresh can be
 // carrying a sample of it and the reservation is inert.
-func (a *attach) reserveSizeMutation(ctx context.Context, itemID uint64) (func(), int32) {
+//
+// The GRANT is also where this mutation's generation token is minted
+// (repairwitness.go). A crossed-scope repair that yields the item to a mutation
+// discharges its debt only when THAT mutation's own committed publication
+// reaches the kernel, so the mutation needs an identity from the instant it
+// takes the item — not merely the ambient fact that something is reserved.
+func (a *attach) reserveSizeMutation(
+	ctx context.Context,
+	itemID uint64,
+) (func(), *sizeMutationToken, int32) {
 	if itemID == 0 {
-		return nil, 0
+		return nil, nil, 0
 	}
 	a.mu.Lock()
 	ticket := a.takeItemTicketLocked(itemID, ticketMutation)
@@ -260,9 +269,9 @@ func (a *attach) reserveSizeMutation(ctx context.Context, itemID uint64) (func()
 		}
 	}
 	if !a.awaitItemTicket(ctx.Done(), itemID, ticket, queued) {
-		return nil, darwinEINTR
+		return nil, nil, darwinEINTR
 	}
-	return a.releaseSizeMutationOnce(itemID), 0
+	return a.releaseSizeMutationOnce(itemID), &sizeMutationToken{itemID: itemID}, 0
 }
 
 func (a *attach) releaseSizeMutationOnce(itemID uint64) func() {
@@ -324,19 +333,19 @@ func (a *attach) sizeMutationItem(body any) (uint64, bool) {
 func (a *attach) reserveSizeMutationForRequest(
 	ctx context.Context,
 	body any,
-) (func(), int32) {
+) (func(), *sizeMutationToken, int32) {
 	if req, ok := body.(*pfslocal.SetAttrRequest); ok {
 		if verdict, known := a.frozenRefreshVerdict(ctx, req); known &&
 			verdict.class != refreshClassApplication {
 			// The daemon's own kernel-state refresh. It commits nothing, and
 			// making it wait for the pin would make it wait for the syscall it
 			// is itself the upcall of.
-			return nil, 0
+			return nil, nil, 0
 		}
 	}
 	itemID, ok := a.sizeMutationItem(body)
 	if !ok {
-		return nil, 0
+		return nil, nil, 0
 	}
 	return a.reserveSizeMutation(ctx, itemID)
 }
