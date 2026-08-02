@@ -173,3 +173,74 @@ func TestApplyGenerationAcceptsProofCarryingBaseAdvance(t *testing.T) {
 			l.baseSeq, l.baseCommitID, l.backlogRecords, l.cut)
 	}
 }
+
+func adoptionProofJSON(oldBaseSeq, newBaseSeq uint64, oldDigest, newDigest, newCommit string) *adoptionJSON {
+	return &adoptionJSON{
+		AdoptionID: "hadopt_1", GenerationID: "jgen-1", CutID: "hcut_1",
+		AnchorID: "hanchor_1", OperationID: "hadopt-hcut_1", State: "applied",
+		OldBaseSeq: exactU(oldBaseSeq), OldBaseDigest: oldDigest,
+		NewBaseSeq: exactU(newBaseSeq), NewBaseDigest: newDigest, NewBaseCommitID: newCommit,
+		SubtractBacklogBytes: exactI(10), SubtractBacklogRecords: exactI(1),
+		CutState: "ready", CutKind: "recovery",
+		CutSeqExclusive: exactU(newBaseSeq), CutDigest: newDigest, CutResultCommitID: newCommit,
+	}
+}
+
+// TestApplyGenerationAcceptsAdoptionProofCarryingBaseAdvance covers the OTHER
+// lane that validates the same transition: the generation snapshot returned by
+// trim/rotate/suspend. It read the same legacy-cut-only proof and would fence a
+// detaching writer whose branch had adopted since its last append.
+func TestApplyGenerationAcceptsAdoptionProofCarryingBaseAdvance(t *testing.T) {
+	l := validationLog()
+	initial := validWriterHead(2)
+	if err := l.adoptHead(&initial, true); err != nil {
+		t.Fatalf("adopt initial: %v", err)
+	}
+	next := validWriterHead(2)
+	next.BaseSeq = exactU(1)
+	next.BaseDigest = strings.Repeat("2", 64)
+	next.BaseCommitID = "cpft2-after-adoption"
+	next.BacklogBytes = exactI(10)
+	next.BacklogRecords = exactI(1)
+	next.Adoption = adoptionProofJSON(
+		0, 1, strings.Repeat("0", 64), strings.Repeat("2", 64), "cpft2-after-adoption")
+	raw, err := json.Marshal(next)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := l.applyGeneration(raw); err != nil {
+		t.Fatalf("apply adoption-proof-carrying base advance: %v", err)
+	}
+	if l.baseSeq != 1 || l.baseCommitID != "cpft2-after-adoption" || l.backlogRecords != 1 || l.hasCut {
+		t.Fatalf("adoption base advance not installed: base=%d commit=%s records=%d hasCut=%v",
+			l.baseSeq, l.baseCommitID, l.backlogRecords, l.hasCut)
+	}
+}
+
+// TestAdoptionProofNeverReachesBehindTheLocalBase pins the one clause that
+// keeps a real, correctly-formed adoption row from being replayed to authorize
+// an advance the child has already moved past. A proof may skip links (several
+// adoptions can land between two calls, each independently row-authorized), but
+// it may never start from a base older than the one the child already holds.
+func TestAdoptionProofNeverReachesBehindTheLocalBase(t *testing.T) {
+	digest := [32]byte{2}
+	proof := adoptionProof{
+		newBaseSeq: 9, newBaseDigest: digest, newBaseCommitID: "cpft2-9",
+		oldBaseSeq: 4,
+	}
+	if !proof.provesBaseAdvance(4, 9, digest, "cpft2-9") {
+		t.Fatal("an exact-chain proof was rejected")
+	}
+	if !proof.provesBaseAdvance(2, 9, digest, "cpft2-9") {
+		t.Fatal("a proof that skipped an intermediate adoption was rejected")
+	}
+	if proof.provesBaseAdvance(5, 9, digest, "cpft2-9") {
+		t.Fatal("a proof reaching back behind the local base was accepted")
+	}
+	if proof.provesBaseAdvance(4, 9, [32]byte{3}, "cpft2-9") {
+		t.Fatal("a proof for another base digest was accepted")
+	}
+	if proof.provesBaseAdvance(4, 10, digest, "cpft2-9") {
+		t.Fatal("a proof for another base seq was accepted")
+	}
+}

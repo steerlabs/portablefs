@@ -245,6 +245,7 @@ type generationJSON struct {
 	ControlDbFloorMs    *decimalInt64  `json:"controlDbFloorMs"`
 	ClaimedAt           *decimalInt64  `json:"claimedAt"`
 	Cut                 *cutJSON       `json:"cut"`
+	Adoption            *adoptionJSON  `json:"adoption"`
 	UpdatedAt           *decimalInt64  `json:"updatedAt"`
 
 	// Claim/head extras.
@@ -268,6 +269,44 @@ type cutJSON struct {
 	CanonicalRequestHash     string         `json:"canonicalRequestHash"`
 	AuxiliaryBlobDigestsHash string         `json:"auxiliaryBlobDigestsHash"`
 	CommitID                 string         `json:"commitId"`
+}
+
+// adoptionJSON mirrors pfj.adoption_proof_json: the durable pfh.adoptions row
+// (joined to its pfh.history_cuts row) that authorized the generation's
+// CURRENT base tuple.
+//
+// THE LEGACY CUT IS NOT A PROOF A PFJ3 GENERATION CAN CARRY. A checkpoint cut
+// lives in journal_generations.cut_* and migrations 013/031 raise PF005 on any
+// write to those columns for a pfj3 generation — the modern base advance is
+// authorized by a pfh.adoptions ROW instead, re-verified inside the freeze
+// trigger against the exact old/new tuple AND the backlog subtraction. So a
+// child that demands a landed legacy cut before accepting a base advance is
+// demanding something the schema forbids the server to produce: it refuses
+// every legitimate adoption. This is the shape it must demand instead.
+//
+// The safety content is the cut tuple, not the row's existence: cutSeqExclusive
+// / cutDigest pin the boundary to the child's own record CHAIN DIGEST, and
+// cutResultCommitId is the PFT2 commit that materialized exactly that prefix.
+// Records below the new base are covered by that commit and may be deleted.
+type adoptionJSON struct {
+	AdoptionID             string         `json:"adoptionId"`
+	GenerationID           string         `json:"generationId"`
+	CutID                  string         `json:"cutId"`
+	AnchorID               string         `json:"anchorId"`
+	OperationID            string         `json:"operationId"`
+	State                  string         `json:"state"`
+	OldBaseSeq             *decimalUint64 `json:"oldBaseSeq"`
+	OldBaseDigest          string         `json:"oldBaseDigest"`
+	NewBaseSeq             *decimalUint64 `json:"newBaseSeq"`
+	NewBaseDigest          string         `json:"newBaseDigest"`
+	NewBaseCommitID        string         `json:"newBaseCommitId"`
+	SubtractBacklogBytes   *decimalInt64  `json:"subtractBacklogBytes"`
+	SubtractBacklogRecords *decimalInt64  `json:"subtractBacklogRecords"`
+	CutState               string         `json:"cutState"`
+	CutKind                string         `json:"cutKind"`
+	CutSeqExclusive        *decimalUint64 `json:"cutSeqExclusive"`
+	CutDigest              string         `json:"cutDigest"`
+	CutResultCommitID      string         `json:"cutResultCommitId"`
 }
 
 func decodeDigest(hexDigest string) ([32]byte, error) {
@@ -861,6 +900,22 @@ func (l *Log) poisonLocked(cause error) {
 	l.poisoned = true
 	l.poisonCause = cause
 	close(l.poisonedCh)
+}
+
+// PoisonCause reports WHY the log was fenced (nil while healthy).
+//
+// The cause was recorded from the start but never readable, so a poisoned
+// child logged "journal poisoned (durability/fence failure)" and stopped —
+// naming the category and withholding the only fact an operator needs. Every
+// poison here is a specific, enumerated proof failure (a response that
+// regressed the base, miscounted the backlog, or advanced the base commit
+// without an exact cut proof), and which one it was decides whether the
+// answer is "retry", "the maintenance loop raced this writer", or "corruption".
+// Exposing it costs nothing and turns an unexplained fence into a diagnosis.
+func (l *Log) PoisonCause() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.poisonCause
 }
 
 // IsPoisoned reports whether the log refuses further mutations.

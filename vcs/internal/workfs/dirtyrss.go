@@ -26,7 +26,27 @@ import (
 // lifecycle, lock releases), and anything that RELEASES memory keep working
 // (TestDirtyBoundManagedRefusesReleasesAndReplays).
 //
-// ── WHAT THAT DOES AND DOES NOT PROMISE (round 18g) ─────────────────────────
+// ── ROUND 19: THE FOLD EXISTS NOW ───────────────────────────────────────────
+//
+// Everything from here to the end of this comment describes the state of the
+// world BEFORE dirtyfold.go, and is kept because the reasoning it records is
+// what the fold had to answer. One sentence changes the conclusion:
+//
+//	History-cut adoption now RELEASES this counter. FoldToBase re-resolves the
+//	adopted base and drops the resident copy of every block that base provably
+//	contains (per-block, proved by the journal LSN each block was last written
+//	at against the cut's watermark). MarkClean's production counterpart finally
+//	exists; the counter is no longer monotone.
+//
+// So the counter is bounded by the UNCUT JOURNAL SUFFIX rather than by the
+// branch's lifetime, the volume-api's maintenance loop coordinates its trigger
+// against this bound so the two cannot invert (coordinatedBacklogPercent, both
+// sides), and the paragraphs below stand as the record of what was true when
+// they were written — not as the current contract. What survives unchanged is
+// the refusal ITSELF: it is still definite, still ENOSPC, and truncate is
+// still the one releasing operation a mount can issue by hand.
+//
+// ── WHAT THAT DID AND DID NOT PROMISE (round 18g) ───────────────────────────
 //
 // This file used to end that sentence with "so a volume at the bound stays
 // recoverable — never wedged." That claim was false, and production collected
@@ -68,12 +88,12 @@ import (
 //     write-admission bounds — this one or the journal backlog quota — is the
 //     binding one for the generation (cmd/vcs logBindingWriteBound).
 //
-// Making a healthy volume NEVER reach the bound needs the fold that does not
-// exist yet: on history-cut adoption the live child must re-resolve the new
-// base and MarkClean every inode whose content it now contains (the dirtyEpoch
-// guard already handles the racing writer). The child holds a content.BlobReader
-// and can read the adopted base, so this is buildable without giving it write
-// access to the object store — it is simply not built.
+// Making a healthy volume NEVER reach the bound needed a fold that did not
+// exist: on history-cut adoption the live child must re-resolve the new base
+// and release every block whose content it now contains. The child holds a
+// content.BlobReader and can read the adopted base, so this was buildable
+// without giving it write access to the object store — it was simply not
+// built. Round 19 built it: see dirtyfold.go.
 //
 // The counter is the sum of len() over every dirty block buffer. A truncate
 // that trims a boundary block keeps the buffer's backing capacity for the
@@ -88,11 +108,18 @@ var (
 
 // ErrDirtyRSSCapacity reports a write refused because it would push resident
 // dirty-block bytes past the configured bound. It is a DEFINITE
-// pre-reservation rejection: nothing was journaled or applied, and the next
-// truncate (or reap — on a managed authority a bare remove only PARKS the
-// inode) on this volume reopens admission. Nothing ELSE reopens it — see the
-// fold discussion above; an external history cut relieves the journal, not
-// this counter.
+// pre-reservation rejection: nothing was journaled or applied.
+//
+// Three things reopen admission, and it is worth naming them in the order a
+// stalled operator will reach for them:
+//
+//   - HISTORY-CUT ADOPTION, which is automatic and is the one that makes a
+//     healthy volume never arrive here at all (dirtyfold.go). The maintenance
+//     loop's trigger is coordinated against THIS bound so the cut lands first.
+//   - TRUNCATE, which any live mount can issue by hand.
+//   - REAP. Note that a bare `remove` is NOT reap on a managed authority: the
+//     reducer PARKS the detached inode and only the last close destroys it.
+//     A parked orphan is foldable, though, so adoption relieves it too.
 var ErrDirtyRSSCapacity error = dirtyRSSCapacityError{}
 
 type dirtyRSSCapacityError struct{}

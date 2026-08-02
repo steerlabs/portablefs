@@ -3,7 +3,6 @@ package workfs
 import (
 	"os"
 	"testing"
-
 )
 
 func overwrite(t *testing.T, fs *FS, name, data string) {

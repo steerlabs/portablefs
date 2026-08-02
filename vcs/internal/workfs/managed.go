@@ -348,6 +348,12 @@ func (fs *FS) replayManagedTree(lsn uint64, intent wal.Record) error {
 	if lerr != nil {
 		return fmt.Errorf("workfs: managed replay intent %d: %w", lsn, lerr)
 	}
+	// Cold replay stamps the SAME provenance live apply does (the row's LSN),
+	// so a restarted child's fold decisions are byte-identical to the ones the
+	// process it replaced would have made.
+	prevApplySeq := fs.applySeq
+	fs.applySeq = lsn
+	defer func() { fs.applySeq = prevApplySeq }()
 	for _, r := range leaves {
 		if r.Op.IsControl() {
 			return fmt.Errorf("workfs: managed replay intent %d carries an OpControl leaf", lsn)
@@ -967,6 +973,15 @@ func (fs *FS) applyCommittedEntry(entry pfj3.JournalEntry, owner string, applied
 		fs.log.Poison()
 		fs.seq.poisonWith(fmt.Errorf("managed apply diverged from durable row %d: %v", entry.LSN, err))
 	}()
+	// Durable-order provenance for the dirty-block fold: every block this row
+	// writes is stamped with the row's OWN LSN (its exclusive applied position
+	// minus one), which is exactly the number a history cut compares against
+	// when it decides which records its base materialised. Set inside the same
+	// fs.mu hold as the apply, and restored after, so nothing outside a
+	// reducer can ever observe a stale stamp.
+	prevApplySeq := fs.applySeq
+	fs.applySeq = appliedEnd - 1
+	defer func() { fs.applySeq = prevApplySeq }()
 	var invs []coherence.Invalidation
 	var parkedInos, unpinnedInos []uint64
 	if entry.Tree != nil {

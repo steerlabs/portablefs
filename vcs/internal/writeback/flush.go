@@ -824,15 +824,21 @@ func (f *flusher) sendBatch(lane StreamLane) {
 	// bounded resource is full.
 	//
 	// They belong here rather than in the retry arm below for one reason that
-	// production proved: RETRYING THEM NEVER TERMINATES. Nothing folds the
-	// authority's dirty pool for a live generation — there is no in-process
-	// checkpoint on the managed path, and history-cut adoption advances the
-	// journal base without releasing the child's resident blocks — so a batch
-	// refused at the bound is refused identically on every re-offer, forever.
-	// Held as a transient it froze the watermark, tripped the no-progress
-	// watchdog, and took a live mount to EIO; the operator's documented escape
-	// (truncate/remove to release the memory) was itself EIO by the time it
-	// could be issued.
+	// production proved: RETRYING THEM FROM THIS SIDE NEVER TERMINATES. The
+	// refusal is a statement about a bounded resource at the AUTHORITY, and no
+	// number of re-offers from the client changes it. Held as a transient it
+	// froze the watermark, tripped the no-progress watchdog, and took a live
+	// mount to EIO; the operator's documented escape (truncate to release the
+	// memory) was itself EIO by the time it could be issued.
+	//
+	// Round 19 gave the AUTHORITY a release path for its dirty pool
+	// (history-cut adoption now folds it — workfs/dirtyfold.go), which is why
+	// a healthy volume should never produce this status at all. It does not
+	// change the classification one bit: relief still happens over there, on
+	// the authority's own schedule, and a client that sat here re-offering
+	// would still be a client inventing progress it cannot make. Parking with
+	// a definite verdict and letting the application see ENOSPC remains the
+	// only honest answer.
 	//
 	// So the verdict is taken at face value and the stream parks — with a cause
 	// that wraps ErrNoSpace, so every surface that already maps writeback
@@ -1108,11 +1114,23 @@ func (f *flusher) park(err error) {
 		f.lanes[lane].waiters = nil
 	}
 	f.mu.Unlock()
+	// LATCH BEFORE RELEASING THE WAITERS. A drain waiter wakes with the
+	// terminal verdict in its hand and its very next act is typically to ask
+	// the engine what the mount's standing answer now is (Engine.MutationError,
+	// which clientcore's statusErr maps to the application's errno). Releasing
+	// the waiters first left a window where DrainAll had already returned
+	// ErrNoSpace while MutationError still said "healthy" — so a mutation
+	// racing that window got the EIO-class default instead of the definite
+	// ENOSPC this whole classification exists to deliver, and the parked
+	// stream's own drain could report a verdict the engine did not yet hold.
+	// Sealing the credit ledger and latching the engine first makes the
+	// verdict indivisible: nobody can observe the refusal without also
+	// observing that it is terminal.
+	f.e.credits.seal(err)
+	f.e.markStreamDead(err)
 	for _, wtr := range waiters {
 		wtr.ch <- err
 	}
-	f.e.credits.seal(err)
-	f.e.markStreamDead(err)
 	if f.e.job != nil {
 		f.e.job.update(func(j *RecoveryJob) {
 			j.State = JobParked

@@ -294,6 +294,7 @@ func (fs *FS) truncateBlocks(n *inode, size int64) {
 	case size == 0:
 		fs.addDirtyBlockBytesLocked(-dirtyBlockBytesOf(n))
 		n.blocks = map[int64][]byte{}
+		n.blockSeq = map[int64]uint64{} // provenance follows residency exactly
 		n.source = content.Source{}
 		n.born = true
 	case size < n.size:
@@ -302,6 +303,7 @@ func (fs *FS) truncateBlocks(n *inode, size int64) {
 			if bi*blockSize >= size {
 				released += int64(len(blk))
 				delete(n.blocks, bi)
+				delete(n.blockSeq, bi)
 			}
 		}
 		bi := (size - 1) / blockSize

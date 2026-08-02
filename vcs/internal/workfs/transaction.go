@@ -46,6 +46,13 @@ type blockUndo struct {
 	index  int64
 	value  []byte
 	ok     bool
+	// seqs/seq/seqOK undo the block's durable-order provenance alongside its
+	// bytes. Provenance MUST track residency exactly (dirtyfold.go reads a
+	// missing entry as "unknown, not foldable"), so a rolled-back write that
+	// restored a block's bytes must restore its stamp in the same step.
+	seqs  map[int64]uint64
+	seq   uint64
+	seqOK bool
 }
 
 type inodeEntryUndo struct {
@@ -112,11 +119,15 @@ func (tx *mutationTransaction) captureBlock(n *inode, index int64) {
 		return
 	}
 	block, ok := n.blocks[index]
+	seq, seqOK := n.blockSeq[index]
 	// applyWrite publishes a new slice and truncate only changes map entries or
 	// slice headers, so retaining this immutable pre-apply slice is sufficient.
 	// Retain the map itself as well: truncate-to-zero can replace n.blocks, and
 	// reverse undo must repair the exact historical map before inode restoration.
-	tx.blocks = append(tx.blocks, blockUndo{blocks: n.blocks, index: index, value: block, ok: ok})
+	tx.blocks = append(tx.blocks, blockUndo{
+		blocks: n.blocks, index: index, value: block, ok: ok,
+		seqs: n.blockSeq, seq: seq, seqOK: seqOK,
+	})
 }
 
 func (tx *mutationTransaction) captureWriteBlocks(n *inode, off int64, length int) {
@@ -295,6 +306,13 @@ func (tx *mutationTransaction) rollback() {
 			undo.blocks[undo.index] = undo.value
 		} else {
 			delete(undo.blocks, undo.index)
+		}
+		if undo.seqs != nil {
+			if undo.seqOK {
+				undo.seqs[undo.index] = undo.seq
+			} else {
+				delete(undo.seqs, undo.index)
+			}
 		}
 	}
 	for ino, undo := range tx.orphans {

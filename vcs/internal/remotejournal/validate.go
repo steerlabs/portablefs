@@ -24,6 +24,26 @@ type validatedGeneration struct {
 	quotaRecords       int64
 	cut                wal.CheckpointCut
 	hasCut             bool
+	adoption           adoptionProof
+	hasAdoption        bool
+}
+
+// adoptionProof is the checked, exactly decoded form of pfj.adoption_proof_json
+// — the modern (PFJ3) authorization for a destructive base advance.
+type adoptionProof struct {
+	adoptionID      string
+	generationID    string
+	cutID           string
+	state           string
+	oldBaseSeq      uint64
+	oldBaseDigest   [32]byte
+	newBaseSeq      uint64
+	newBaseDigest   [32]byte
+	newBaseCommitID string
+	cutState        string
+	cutSeqExclusive uint64
+	cutDigest       [32]byte
+	cutCommitID     string
 }
 
 func canonicalHexDigest(value string) ([32]byte, bool) {
@@ -85,6 +105,107 @@ func validateCutJSON(raw *cutJSON, epoch, nextSeq uint64) (wal.CheckpointCut, er
 		return wal.CheckpointCut{}, fmt.Errorf("remotejournal: checkpoint cut has invalid status %q", cut.Status)
 	}
 	return cut, nil
+}
+
+// adoptionStateIsLanded reports the two states in which the database has
+// ALREADY durably advanced the base behind this row. 'applying' is what the
+// freeze trigger itself matches on (the row is inserted, the base moves, and
+// the row flips to 'applied' in ONE transaction), so both are equally landed
+// from any reader's perspective; 'applying' is simply the state the trigger
+// sees. Anything else — 'failed', or a shape this client does not know — is
+// not a landing and authorizes nothing.
+func adoptionStateIsLanded(state string) bool {
+	return state == "applied" || state == "applying"
+}
+
+// validateAdoptionJSON decodes and self-checks a base-advance proof. It never
+// consults the local mirror — that comparison belongs to the transition
+// checks, which know what the child already holds.
+func validateAdoptionJSON(raw *adoptionJSON, generationID string) (adoptionProof, error) {
+	if raw == nil {
+		return adoptionProof{}, fmt.Errorf("remotejournal: nil adoption proof")
+	}
+	if raw.OldBaseSeq == nil || raw.NewBaseSeq == nil || raw.CutSeqExclusive == nil ||
+		raw.SubtractBacklogBytes == nil || raw.SubtractBacklogRecords == nil {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof is missing exact integer fields")
+	}
+	if raw.AdoptionID == "" || len(raw.AdoptionID) > 512 ||
+		raw.CutID == "" || len(raw.CutID) > 512 ||
+		raw.NewBaseCommitID == "" || len(raw.NewBaseCommitID) > 512 ||
+		raw.CutResultCommitID == "" || len(raw.CutResultCommitID) > 512 {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof is missing bounded identity fields")
+	}
+	if raw.GenerationID != generationID {
+		return adoptionProof{}, fmt.Errorf("%w: adoption proof belongs to generation %q, not %q",
+			ErrConflict, raw.GenerationID, generationID)
+	}
+	if !adoptionStateIsLanded(raw.State) {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof has non-landed state %q", raw.State)
+	}
+	// A base advance may only be adopted from a MATERIALIZED cut. 'ready' is
+	// the one terminal success state of pfh.history_cuts; every other state is
+	// either still running or terminal-failed, and neither covers the prefix
+	// the advance is about to make deletable.
+	if raw.CutState != "ready" {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof cites a %q cut, not a ready one", raw.CutState)
+	}
+	oldDigest, oldOK := canonicalHexDigest(raw.OldBaseDigest)
+	newDigest, newOK := canonicalHexDigest(raw.NewBaseDigest)
+	cutDigest, cutOK := canonicalHexDigest(raw.CutDigest)
+	if !oldOK || !newOK || !cutOK {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof carries a non-canonical digest")
+	}
+	proof := adoptionProof{
+		adoptionID:      raw.AdoptionID,
+		generationID:    raw.GenerationID,
+		cutID:           raw.CutID,
+		state:           raw.State,
+		oldBaseSeq:      uint64(*raw.OldBaseSeq),
+		oldBaseDigest:   oldDigest,
+		newBaseSeq:      uint64(*raw.NewBaseSeq),
+		newBaseDigest:   newDigest,
+		newBaseCommitID: raw.NewBaseCommitID,
+		cutState:        raw.CutState,
+		cutSeqExclusive: uint64(*raw.CutSeqExclusive),
+		cutDigest:       cutDigest,
+		cutCommitID:     raw.CutResultCommitID,
+	}
+	if proof.newBaseSeq < proof.oldBaseSeq {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof regresses the base (%d -> %d)",
+			proof.oldBaseSeq, proof.newBaseSeq)
+	}
+	if _, err := checkedSQLBigint("adoption new base sequence", proof.newBaseSeq); err != nil {
+		return adoptionProof{}, err
+	}
+	// THE PROOF'S OWN INTERNAL BINDING. The adoption row says "the base is now
+	// X"; the cut row says "the prefix ending at X was materialized into commit
+	// C with chain digest D". If those two disagree the row pair proves nothing
+	// at all, whatever the server asserts separately.
+	if proof.cutSeqExclusive != proof.newBaseSeq || proof.cutDigest != proof.newBaseDigest ||
+		proof.cutCommitID != proof.newBaseCommitID {
+		return adoptionProof{}, fmt.Errorf(
+			"%w: adoption proof and its cut disagree (cut %d/%s vs base %d/%s)",
+			ErrProofMissing, proof.cutSeqExclusive, proof.cutCommitID, proof.newBaseSeq, proof.newBaseCommitID)
+	}
+	if int64(*raw.SubtractBacklogBytes) < 0 || int64(*raw.SubtractBacklogRecords) < 0 {
+		return adoptionProof{}, fmt.Errorf("remotejournal: adoption proof carries a negative backlog subtraction")
+	}
+	return proof, nil
+}
+
+// provesBaseAdvance reports whether this proof authorizes moving a local base
+// at haveSeq to the reported (wantSeq, wantDigest, wantCommitID).
+//
+// It deliberately does NOT require the proof to chain to the child's exact old
+// base: several adoptions may land between two of this writer's calls, and each
+// link was independently authorized by its own row under the freeze trigger.
+// What it does require is that the proof attests EXACTLY the tuple being
+// installed and that it never reaches back behind what the child already holds.
+func (p adoptionProof) provesBaseAdvance(
+	haveSeq uint64, wantSeq uint64, wantDigest [32]byte, wantCommitID string,
+) bool {
+	return p.newBaseSeq == wantSeq && p.newBaseDigest == wantDigest &&
+		p.newBaseCommitID == wantCommitID && p.oldBaseSeq >= haveSeq
 }
 
 func (l *Log) validateGenerationSnapshot(head *generationJSON, asWriter bool) (validatedGeneration, error) {
@@ -180,6 +301,13 @@ func (l *Log) validateGenerationSnapshot(head *generationJSON, asWriter bool) (v
 		}
 		validated.cut, validated.hasCut = cut, true
 	}
+	if head.Adoption != nil {
+		proof, err := validateAdoptionJSON(head.Adoption, head.GenerationID)
+		if err != nil {
+			return validatedGeneration{}, err
+		}
+		validated.adoption, validated.hasAdoption = proof, true
+	}
 	return validated, nil
 }
 
@@ -227,10 +355,57 @@ func (l *Log) validateCutTransition(next wal.CheckpointCut, hasNext bool) error 
 	return nil
 }
 
+// baseAdvance is the exact tuple a response asks the child to install, plus
+// whichever proof it carried for it.
+type baseAdvance struct {
+	baseSeq      uint64
+	baseDigest   [32]byte
+	baseCommitID string
+	cut          wal.CheckpointCut
+	hasCut       bool
+	adoption     adoptionProof
+	hasAdoption  bool
+}
+
+// checkDestructiveBaseAdvanceLocked is the ONE place that decides whether a
+// reported base-commit change may be installed. Records below the new base
+// become deletable the moment it is, so this refuses anything it cannot prove
+// — but it demands the proof the system ACTUALLY ISSUES for the generation's
+// codec, which is the whole of the fix here.
+//
+// Two proof shapes are legitimate, and exactly one of them exists per codec:
+//
+//   - LEGACY (PFR1/PFC1): a landed or finalized checkpoint cut in
+//     journal_generations.cut_*, at exactly the new watermark and commit.
+//   - MODERN (PFJ3/PFC2): a landed pfh.adoptions row, bound to a 'ready'
+//     pfh.history_cuts row at exactly the new base seq/digest/commit.
+//
+// The modern one used to be unrepresentable in this response, so this check
+// demanded the legacy shape from a generation whose schema RAISES PF005 on any
+// write to the legacy cut columns (migrations 013 and 031). It was therefore
+// unsatisfiable, not protective: every real adoption that landed under an
+// attached writer poisoned that writer and fenced the mount, and — because
+// l.baseSeq is only assigned after this returns — CompactedThrough could never
+// advance either.
+func (l *Log) checkDestructiveBaseAdvanceLocked(next baseAdvance) error {
+	if next.hasAdoption &&
+		next.adoption.provesBaseAdvance(l.baseSeq, next.baseSeq, next.baseDigest, next.baseCommitID) {
+		return nil
+	}
+	if next.hasCut &&
+		(next.cut.Status == wal.CheckpointLanded || next.cut.Status == wal.CheckpointFinalized) &&
+		next.cut.Watermark == next.baseSeq && next.cut.CommitID == next.baseCommitID {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: base commit advanced to %q at seq %d without an exact proof (adoption=%v cut=%v)",
+		ErrProofMissing, next.baseCommitID, next.baseSeq, next.hasAdoption, next.hasCut)
+}
+
 // validateGenerationTransition checks facts that require the current local
 // mirror. It accepts the two legitimate base advances: a proof-carrying
-// checkpoint trim (base commit moves to the landed cut commit) and a
-// control-only rotation (base commit stays fixed).
+// base adoption/checkpoint trim (base commit moves to the materialized commit)
+// and a control-only rotation (base commit stays fixed).
 func (l *Log) validateGenerationTransition(head *generationJSON, next validatedGeneration) error {
 	if next.epoch != l.epoch || next.nextSeq != l.durableSeq || next.tipDigest != l.durableTip ||
 		next.baseSeq < l.baseSeq || next.physicalTrimmedSeq < l.physicalTrimmedSeq ||
@@ -251,9 +426,12 @@ func (l *Log) validateGenerationTransition(head *generationJSON, next validatedG
 		return fmt.Errorf("%w: base advance did not reduce backlog", ErrAccounting)
 	}
 	if head.BaseCommitID != l.baseCommitID {
-		if !next.hasCut || (next.cut.Status != wal.CheckpointLanded && next.cut.Status != wal.CheckpointFinalized) ||
-			next.cut.Watermark != next.baseSeq || next.cut.CommitID != head.BaseCommitID {
-			return fmt.Errorf("%w: base commit advanced without exact landed checkpoint proof", ErrProofMissing)
+		if err := l.checkDestructiveBaseAdvanceLocked(baseAdvance{
+			baseSeq: next.baseSeq, baseDigest: next.baseDigest, baseCommitID: head.BaseCommitID,
+			cut: next.cut, hasCut: next.hasCut,
+			adoption: next.adoption, hasAdoption: next.hasAdoption,
+		}); err != nil {
+			return err
 		}
 	} else if next.hasCut && next.cut.Status == wal.CheckpointPrepared && next.cut.Watermark < next.baseSeq {
 		return fmt.Errorf("%w: control rotation crossed a prepared checkpoint cut", ErrProofMissing)

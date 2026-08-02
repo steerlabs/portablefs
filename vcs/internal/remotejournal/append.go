@@ -217,6 +217,7 @@ type quotaRefreshJSON struct {
 	BaseDigest          string         `json:"baseDigest"`
 	PhysicalTrimmedSeq  *decimalUint64 `json:"physicalTrimmedSeq"`
 	Cut                 *cutJSON       `json:"cut"`
+	Adoption            *adoptionJSON  `json:"adoption"`
 	BacklogBytes        *decimalInt64  `json:"backlogBytes"`
 	BacklogRecords      *decimalInt64  `json:"backlogRecords"`
 	QuotaBacklogBytes   *decimalInt64  `json:"quotaBacklogBytes"`
@@ -290,6 +291,14 @@ func (l *Log) refreshCapacityLocked() error {
 			return fmt.Errorf("%w: invalid quota refresh checkpoint cut: %v", ErrAccounting, err)
 		}
 	}
+	var adoption adoptionProof
+	hasAdoption := refreshed.Adoption != nil
+	if hasAdoption {
+		adoption, err = validateAdoptionJSON(refreshed.Adoption, l.generationID)
+		if err != nil {
+			return fmt.Errorf("%w: invalid quota refresh adoption proof: %v", ErrAccounting, err)
+		}
+	}
 	span := l.durableSeq - baseSeq
 	if span > math.MaxInt64 || backlogRecords != int64(span) {
 		return fmt.Errorf("%w: quota refresh backlog does not cover the exact retained range", ErrAccounting)
@@ -301,6 +310,7 @@ func (l *Log) refreshCapacityLocked() error {
 		backlogBytes:       backlogBytes, backlogRecords: backlogRecords,
 		quotaBytes: quotaBytes, quotaRecords: quotaRecords,
 		cut: cut, hasCut: hasCut,
+		adoption: adoption, hasAdoption: hasAdoption,
 	}
 	transitionHead := generationJSON{BaseCommitID: refreshed.BaseCommitID}
 	if err := l.validateGenerationTransition(&transitionHead, validated); err != nil {
@@ -338,9 +348,12 @@ type appendResult struct {
 	CurrentQuotaRecords      *decimalInt64  `json:"currentQuotaBacklogRecords"`
 	CurrentControlFloorMs    *decimalInt64  `json:"currentControlDbFloorMs"`
 	CurrentCut               *cutJSON       `json:"currentCut"`
+	CurrentAdoption          *adoptionJSON  `json:"currentAdoption"`
 	currentBaseDigestDecoded [32]byte
 	currentCutDecoded        wal.CheckpointCut
 	hasCurrentCut            bool
+	currentAdoptionDecoded   adoptionProof
+	hasCurrentAdoption       bool
 }
 
 // CommitThrough returns nil only when every record with LSN ≤ seq is durable
@@ -467,7 +480,17 @@ func (l *Log) appendGroup(group []stagedRecord) (appendResult, error) {
 		firstSeqSQL, payloads, hashes, endTip,
 	}
 	if record, _ := l.codecPair(); record == pfj3RecordCodec {
-		appendSQL = `SELECT pfj.journal_append_v3($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`
+		// v4 is v3's exact contract — same arguments, same durable effect, same
+		// frozen receipt body — plus the one field v3 structurally could not
+		// carry: `currentAdoption`, the pfh.adoptions/pfh.history_cuts proof
+		// that authorized the generation's CURRENT base tuple. A PFJ3 base
+		// advance is authorized by that row pair and never by the legacy
+		// cut_* columns (migrations 013/031 raise PF005 on writing them), so
+		// without it a child had NO satisfiable proof to demand and refused
+		// every legitimate adoption. Fail-closed against an older schema: v4
+		// simply does not exist there and the call raises undefined_function,
+		// rather than silently degrading to a writer that poisons on adoption.
+		appendSQL = `SELECT pfj.journal_append_v4($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`
 		appendArgs = []any{
 			l.generationID, int64(l.epoch), l.capability, l.cfg.LeaseID, l.cfg.FencingToken,
 			l.managerEpoch, l.runtimeSeq, l.cfg.AuthorityRuntimeID,
@@ -589,6 +612,13 @@ func (l *Log) validateAppendResult(
 		}
 		res.currentCutDecoded, res.hasCurrentCut = cut, true
 	}
+	if res.CurrentAdoption != nil {
+		proof, err := validateAdoptionJSON(res.CurrentAdoption, l.generationID)
+		if err != nil {
+			return fmt.Errorf("%w: append current adoption proof is invalid: %v", ErrAccounting, err)
+		}
+		res.currentAdoptionDecoded, res.hasCurrentAdoption = proof, true
+	}
 	return nil
 }
 
@@ -631,10 +661,14 @@ func (l *Log) applyAppendResultLocked(res appendResult, group []stagedRecord, gr
 			return fmt.Errorf("%w: append+trim result did not reduce projected backlog", ErrAccounting)
 		}
 		if res.CurrentBaseCommitID != l.baseCommitID {
-			cut := res.currentCutDecoded
-			if !res.hasCurrentCut || (cut.Status != wal.CheckpointLanded && cut.Status != wal.CheckpointFinalized) ||
-				cut.Watermark != baseSeq || cut.CommitID != res.CurrentBaseCommitID {
-				return fmt.Errorf("%w: append response advanced base commit without exact cut proof", ErrProofMissing)
+			if err := l.checkDestructiveBaseAdvanceLocked(baseAdvance{
+				baseSeq:      baseSeq,
+				baseDigest:   res.currentBaseDigestDecoded,
+				baseCommitID: res.CurrentBaseCommitID,
+				cut:          res.currentCutDecoded, hasCut: res.hasCurrentCut,
+				adoption: res.currentAdoptionDecoded, hasAdoption: res.hasCurrentAdoption,
+			}); err != nil {
+				return err
 			}
 		} else if res.hasCurrentCut && res.currentCutDecoded.Status == wal.CheckpointPrepared &&
 			res.currentCutDecoded.Watermark < baseSeq {
