@@ -218,6 +218,16 @@ func (a *attach) retireRefreshWindowLocked(
 	return held
 }
 
+// sizeMutationReserved is sizeMutationReservedLocked for a caller that holds
+// nothing. It exists for the crossed-item repair, which must be able to ask
+// "is this item busy?" WITHOUT taking a turnstile ticket — taking one is
+// exactly what starves the writer it is asking about.
+func (a *attach) sizeMutationReserved(itemID uint64) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.sizeMutationReservedLocked(itemID)
+}
+
 // sizeMutationReservedLocked reports whether a size mutation has been admitted
 // for itemID and has not finished. Callers hold a.mu in either mode.
 func (a *attach) sizeMutationReservedLocked(itemID uint64) bool {

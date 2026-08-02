@@ -700,6 +700,16 @@ func (e *cmdEnv) daemonizeMount(o *mountOpts, volumeID, mountPath, stateDir stri
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.ExtraFiles = []*os.File{w, operation.file} // child fd 3: readiness; fd 4: path operation lock
+	// THE SUPERVISOR MUST NOT INHERIT A WORKING DIRECTORY IT COULD BE PINNING.
+	//
+	// A working directory is an open directory reference exactly like any other
+	// fd, and it is invisible in the code that opens things. An operator who
+	// runs `portablefs mount ~/vol ~/vol` from inside (or at) the mount point
+	// hands this long-lived, session-detached supervisor a cwd on the directory
+	// it is about to mount over — which then answers EBUSY to that same mount's
+	// unmount for the life of the process, with nothing in the mount code to
+	// point at. Root is the only directory that can never be a mount target.
+	cmd.Dir = "/"
 	// Detach into its own session so the mount daemon survives this process's
 	// terminal and signals. Credentials travel via environment, never argv.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -1377,7 +1387,32 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	if err != nil {
 		return failReady(err)
 	}
-	defer mountTarget.Close()
+	// THE PIN IS FOR THE VALIDATE→MOUNT WINDOW, AND FOR NOTHING AFTER IT.
+	//
+	// openValidatedMountTarget returns an O_DIRECTORY fd on the mount point so
+	// the dev/ino identity it captured cannot be defeated by inode reuse
+	// between here and the moment the kernel mount lands: revalidatePinnedMount
+	// Target reopens BY PATH and compares identities, and holding the original
+	// inode open is what makes that comparison mean "the same directory" rather
+	// than "a directory with the same numbers".
+	//
+	// The instant the mount is established that fd stops referring to the
+	// directory this process validated and starts referring to the COVERED
+	// vnode underneath a live mount — and an open fd on a covered vnode is
+	// precisely what unmount(2) answers EBUSY for. Held to the end of
+	// runMountForeground (a plain `defer`, as it was), it made this supervisor
+	// the thing that blocked the unmount of its own mount: `umount` refused,
+	// `umount --force` refused, and the only recovery was to kill the
+	// supervisor — the product's own process — by hand.
+	//
+	// So the release is EXPLICIT, at the point where the pin's purpose is
+	// discharged, and the defer remains only as the failure-path backstop.
+	// releaseMountTargetPin is idempotent so the two never double-close.
+	var mountTargetPinOnce sync.Once
+	releaseMountTargetPin := func() {
+		mountTargetPinOnce.Do(func() { _ = mountTarget.Close() })
+	}
+	defer releaseMountTargetPin()
 	processIdentity, err := processStartIdentity(os.Getpid())
 	if err != nil {
 		return failReady(fmt.Errorf("record exact mount process identity: %w", err))
@@ -1520,6 +1555,11 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			// explicit reconciliation classify the exact mount.
 			return failReady(err)
 		}
+		// The kernel mount is established and identified, so the pin's
+		// validate→mount window is closed. It is a covered-vnode reference from
+		// here on and would answer EBUSY to this mount's own unmount; see the
+		// pin's definition in runMountForeground.
+		releaseMountTargetPin()
 		state.KernelMountID = kernelMountID
 		operation.kernelMountID = kernelMountID
 		m.detachExact = func() error {
@@ -1714,6 +1754,16 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		); err != nil {
 			return failAfterKernelMount(err)
 		}
+		// THE MOUNT IS PROVEN; DROP THE PIN BEFORE ANYONE CAN ASK TO UNMOUNT.
+		//
+		// waitForFSKitRoot has confirmed the exact kernel mount for this attach
+		// is present and serving, so the validate→mount window this fd exists to
+		// protect is closed. From here on the fd is only a covered-vnode
+		// reference, and the one thing it can still do is answer EBUSY to this
+		// mount's own unmount. Release it BEFORE readiness is reported, so no
+		// unmount request can ever race a live pin. See the pin's definition in
+		// runMountForeground.
+		releaseMountTargetPin()
 		// Rotated/renewed lease credentials must reach the daemon: it owns
 		// the authority connection for this attach.
 		leaseHook.Store(func(lease leaseState) {

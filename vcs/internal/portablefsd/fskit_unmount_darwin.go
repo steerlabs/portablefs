@@ -17,7 +17,7 @@ type fskitKernelMount struct {
 func hostFSKitKernelOps() fskitKernelOps {
 	return fskitKernelOps{
 		present: exactFSKitMountPresent,
-		unmountExact: func(mountPath, attachRef string) error {
+		unmountExact: func(mountPath, attachRef string, force bool) error {
 			present, err := exactFSKitMountPresent(mountPath, attachRef)
 			if err != nil {
 				return err
@@ -25,7 +25,22 @@ func hostFSKitKernelOps() fskitKernelOps {
 			if !present {
 				return fmt.Errorf("exact FSKit mount is absent at %s", mountPath)
 			}
-			if err := unix.Unmount(mountPath, 0); err != nil {
+			// MNT_FORCE IS WHAT MAKES `umount --force` A FORCE.
+			//
+			// Every unmount used to reach the kernel with flags 0, so a single
+			// remaining reference anywhere in the mount answered EBUSY to BOTH
+			// the clean unmount and the escape hatch. The escape hatch's whole
+			// premise is that in-flight work is being abandoned — the durable
+			// tail has already been parked as a recovery job by the time this
+			// runs — so a detach that stops for a busy vnode is not an escape
+			// hatch at all. The clean path still passes flags 0: a mount that
+			// needs forcing is not cleanly unmountable, and saying so is the
+			// only way a leaked reference ever gets found.
+			flags := 0
+			if force {
+				flags = unix.MNT_FORCE
+			}
+			if err := unix.Unmount(mountPath, flags); err != nil {
 				return fmt.Errorf("unmount exact FSKit mount at %s: %w", mountPath, err)
 			}
 			present, err = exactFSKitMountPresent(mountPath, attachRef)

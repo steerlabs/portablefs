@@ -67,7 +67,7 @@ func TestForcePreemptsTheNormalUnmountTransaction(t *testing.T) {
 	}
 	ops := fskitKernelOps{
 		present:      func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error { return nil },
+		unmountExact: func(string, string, bool) error { return nil },
 	}
 
 	normal := make(chan error, 1)
@@ -141,7 +141,7 @@ func TestUnmountOutcomeIsPublishedBeforeUndiscoverability(t *testing.T) {
 	}
 	ops := fskitKernelOps{
 		present:      func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error { return nil },
+		unmountExact: func(string, string, bool) error { return nil },
 	}
 
 	const joiners = 8
@@ -230,7 +230,7 @@ func TestUnmountJoinerGetsTheAbsoluteRemainingBudget(t *testing.T) {
 	}
 	ops := fskitKernelOps{
 		present:      func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error { return nil },
+		unmountExact: func(string, string, bool) error { return nil },
 	}
 
 	start := time.Now()
@@ -281,7 +281,7 @@ func TestUnmountWaiterCancellationDoesNotAbandonTheTransaction(t *testing.T) {
 	}
 	ops := fskitKernelOps{
 		present:      func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error { return nil },
+		unmountExact: func(string, string, bool) error { return nil },
 	}
 
 	survivor := make(chan error, 1)

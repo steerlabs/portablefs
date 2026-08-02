@@ -507,7 +507,15 @@ private func settledAckBaseline(
     return owed
 }
 
-@Test func retractedDeferredPublicationWithholdsValuesAndStillAcknowledges() async throws {
+/// A retraction is answered by REISSUING the operation, below userspace.
+///
+/// The retraction contract itself is unchanged — the crossed attempt's values
+/// are never handed back — but the frontend no longer surfaces that as EINTR
+/// and hope the kernel restarts the syscall. FSKit on macOS 26 does not restart
+/// rmdir(2), so the EINTR reached the application. The extension runs the
+/// operation again instead, and only the surviving attempt's values are
+/// returned.
+@Test func retractedDeferredPublicationIsReissuedAndBothAttemptsAcknowledged() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
@@ -524,28 +532,23 @@ private func settledAckBaseline(
     let (result, complete) = await client.withDeferredPublication {
         try await client.request(.getAttr(getattr))
     }
-    do {
-        _ = try result.get()
-        Issue.record("expected a retracted operation to withhold its reply")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .publicationRetracted)
-        // EINTR, so the kernel retries against a frontend holding nothing
-        // rather than surfacing a coherence event as an application failure.
-        #expect(error.posixErrno == EINTR)
-    }
+    // The reissue converged, so the caller gets a value rather than an errno.
+    _ = try result.get()
 
-    // The daemon's handoff gate is released either way: retraction is about
-    // what the FRAMEWORK installs, not about the daemon's bookkeeping.
+    // The daemon's handoff gate is released for EVERY attempt: retraction is
+    // about what the FRAMEWORK installs, not about the daemon's bookkeeping.
+    // The retracted attempt's ack was sent before the reissue began, so the
+    // reissue could not queue behind the handoff waiting for it.
     await complete()
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
-    #expect(stats.publicationAcks == baseline + 1)
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
+    #expect(stats.publicationAcks == baseline + 2)
 
     // The connection is unaffected — a retraction is the daemon speaking on a
     // healthy connection, not a transport failure.
     _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
-@Test func retractedPublicationBoundaryWithholdsValuesAndStillAcknowledges() async throws {
+@Test func retractedPublicationBoundaryIsReissuedAndBothAttemptsAcknowledged() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
@@ -559,23 +562,23 @@ private func settledAckBaseline(
     let baseline = try await settledAckBaseline(daemon, owed: 0)
     await daemon.retractNextPublications()
 
-    do {
-        _ = try await client.withPublicationBoundary {
-            try await client.request(.getAttr(getattr))
-        }
-        Issue.record("expected a retracted boundary to withhold its value")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .publicationRetracted)
+    _ = try await client.withPublicationBoundary {
+        try await client.request(.getAttr(getattr))
     }
 
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
-    #expect(stats.publicationAcks == baseline + 1)
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
+    #expect(stats.publicationAcks == baseline + 2)
 }
 
 /// A retraction condemns the whole logical operation, not just the reply that
 /// carried the bit. The framework installs a callback's result as one unit, so
 /// an earlier reply that was individually fine cannot be published on its own.
-@Test func retractionOnLaterReplyCondemnsTheWholeOperation() async throws {
+///
+/// Here EVERY attempt is retracted, which is what makes the two halves of the
+/// contract visible at once: the reissue is bounded, and a retraction that
+/// never stops still reaches the caller as one verdict for the operation rather
+/// than as an incidental per-request errno.
+@Test func retractionOnLaterReplyCondemnsTheWholeOperationAndReissueIsBounded() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
@@ -592,6 +595,7 @@ private func settledAckBaseline(
         _ = try await client.request(.getAttr(getattr))
         // The handoff crosses here: the first reply is already in hand and
         // uncondemned, and only the parked continuation carries the verdict.
+        // Re-arming on every attempt models a mount that keeps crossing.
         await daemon.retractNextPublications()
         return try await client.request(.getAttr(getattr))
     }
@@ -603,19 +607,13 @@ private func settledAckBaseline(
     }
 
     await complete()
-    // Both requests share one operation ID, so the operation owes exactly one
-    // acknowledgement.
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
-    #expect(stats.publicationAcks == baseline + 1)
+    // Both requests of an attempt share one operation ID, so each ATTEMPT owes
+    // exactly one acknowledgement — and every attempt made is acknowledged.
+    let attempts = PfsLocalClient.publicationRetractionReissueLimit
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + attempts)
+    #expect(stats.publicationAcks == baseline + attempts)
 }
 
-/// The production shape: the daemon refuses the crossed operation's last,
-/// still-undispatched request instead of running it, and the retraction rides
-/// that refusal's own ErrorReply. Two things must hold at once — the frontend
-/// reports one retraction for the whole operation rather than an incidental
-/// per-request EINTR, and the mutation that was waiting on the handoff has not
-/// landed. Without the second, `rm` would report EINTR after unlinking and
-/// answer ENOENT on the retry.
 @Test func retractionCarriedOnRefusedRequestWithholdsValuesAndLeavesNoMutation() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -652,14 +650,19 @@ private func settledAckBaseline(
         Issue.record("expected a refused-and-retracted operation to withhold its result")
     } catch let error as PfsLocalClientError {
         // The collector's verdict wins over the refusal's own errno, so the
-        // caller sees one retraction for the operation.
+        // caller sees one retraction for the operation. Re-arming the refusal
+        // on every attempt means the reissue can never converge, so the bound
+        // is what ends it — and this is the ONLY way the caller sees a
+        // retraction at all now.
         #expect(error == .publicationRetracted)
         #expect(error.posixErrno == EINTR)
     }
     await complete()
 
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
-    #expect(stats.publicationAcks == baseline + 1)
+    // Every attempt is acknowledged; none of them mutated anything.
+    let attempts = PfsLocalClient.publicationRetractionReissueLimit
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + attempts)
+    #expect(stats.publicationAcks == baseline + attempts)
 
     // The name is still there: the refusal executed no mutation, so the
     // retried syscall will find exactly the state it started from.

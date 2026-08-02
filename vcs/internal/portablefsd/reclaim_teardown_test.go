@@ -97,7 +97,7 @@ func TestForceUnmountAdmitsKernelReclaim(t *testing.T) {
 	reclaimed := make(chan int32, 1)
 	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 		present: func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error {
+		unmountExact: func(string, string, bool) error {
 			go func() {
 				unlock := a.lockFrontendRequest(&pfslocal.ReclaimRequest{})
 				defer unlock()

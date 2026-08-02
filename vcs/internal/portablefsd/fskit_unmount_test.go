@@ -78,7 +78,7 @@ func TestPreparedFSKitDetachRecoveryClassifiesAndRemoves(t *testing.T) {
 					}
 					return tc.present, nil
 				},
-				unmountExact: func(path, ref string) error {
+				unmountExact: func(path, ref string, _ bool) error {
 					detaches++
 					return nil
 				},
@@ -108,7 +108,7 @@ func TestPreparedFSKitIdentityMismatchPreservesAttach(t *testing.T) {
 	mismatch := errors.New("foreign kernel mount at persisted path")
 	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 		present: func(string, string) (bool, error) { return false, mismatch },
-		unmountExact: func(string, string) error {
+		unmountExact: func(string, string, bool) error {
 			t.Fatal("identity mismatch reached unmount")
 			return nil
 		},
@@ -132,7 +132,7 @@ func TestRevivedUnpreparedNormalFSKitDetachRequiresBarrier(t *testing.T) {
 	t.Cleanup(r.stopPersister)
 	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 		present:      func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error { t.Fatal("unverified detach"); return nil },
+		unmountExact: func(string, string, bool) error { t.Fatal("unverified detach"); return nil },
 	})
 	if !found || err == nil {
 		t.Fatalf("unmount=(%v,%v), want active-volume barrier refusal", found, err)
@@ -175,7 +175,7 @@ func TestForcedFSKitDetachWithoutParkProofRefuses(t *testing.T) {
 			t.Fatal("force authorization without park proof reached kernel classification")
 			return false, nil
 		},
-		unmountExact: func(string, string) error {
+		unmountExact: func(string, string, bool) error {
 			t.Fatal("force authorization without park proof reached exact detach")
 			return nil
 		},
@@ -195,15 +195,53 @@ func TestForcedFSKitPreparedProofPermitsExactRecovery(t *testing.T) {
 	r := newRegistry(stateDir)
 	t.Cleanup(r.stopPersister)
 	detaches := 0
+	forced := false
 	found, jobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 		present: func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string) error {
+		unmountExact: func(_, _ string, force bool) error {
 			detaches++
+			forced = force
 			return nil
 		},
 	})
 	if err != nil || !found || jobID != "" || detaches != 1 {
 		t.Fatalf("unmount=(%v,%q,%v) detaches=%d", found, jobID, err, detaches)
+	}
+	// A FORCE-AUTHORIZED reconciliation reaches the kernel AS a force.
+	//
+	// Every unmount used to call unmount(2) with flags 0, so a single open
+	// reference anywhere in the mount answered EBUSY to the escape hatch as
+	// well as to the clean path — and the reference observed live was the
+	// product's own mount supervisor holding a directory fd on the mount root.
+	// `umount --force` could not detach the mount it exists to abandon.
+	if !forced {
+		t.Fatal("force-authorized detach did not ask the kernel to force")
+	}
+}
+
+// A CLEAN unmount never forces. A mount that would need MNT_FORCE is not
+// cleanly unmountable, and saying so is the only way a leaked reference is ever
+// found rather than papered over.
+func TestNormalFSKitDetachNeverForcesTheKernel(t *testing.T) {
+	stateDir := privateTestDir(t)
+	writeFSKitDetachFixture(t, stateDir, true, false)
+	r := newRegistry(stateDir)
+	t.Cleanup(r.stopPersister)
+	detaches := 0
+	forced := false
+	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
+		present: func(string, string) (bool, error) { return true, nil },
+		unmountExact: func(_, _ string, force bool) error {
+			detaches++
+			forced = force
+			return nil
+		},
+	})
+	if err != nil || !found || detaches != 1 {
+		t.Fatalf("unmount=(%v,%v) detaches=%d", found, err, detaches)
+	}
+	if forced {
+		t.Fatal("clean unmount asked the kernel to force a busy mount")
 	}
 }
 
@@ -227,7 +265,7 @@ func TestForcedFSKitJobWithoutExactStoreProofIsPreserved(t *testing.T) {
 	t.Cleanup(r.stopPersister)
 	found, gotJobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 		present:      func(string, string) (bool, error) { return false, nil },
-		unmountExact: func(string, string) error { t.Fatal("absent mount was detached"); return nil },
+		unmountExact: func(string, string, bool) error { t.Fatal("absent mount was detached"); return nil },
 	})
 	if err == nil || !found || gotJobID != jobID {
 		t.Fatalf("unmount=(%v,%q,%v), want exact-store proof refusal", found, gotJobID, err)
@@ -279,7 +317,7 @@ func TestRevivedForcedFSKitPublishesOfflineZeroTailProofBeforeDetach(t *testing.
 	detaches := 0
 	found, jobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 		present: func(path, ref string) (bool, error) { return true, nil },
-		unmountExact: func(path, ref string) error {
+		unmountExact: func(path, ref string, _ bool) error {
 			detaches++
 			return nil
 		},

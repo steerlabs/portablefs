@@ -381,6 +381,7 @@ func marshalHelloReply(m *HelloReply) []byte {
 	b = appendU32(b, 1, m.ProtocolMajor)
 	b = appendU32(b, 2, m.ProtocolMinor)
 	b = appendString(b, 3, m.DaemonVersion)
+	b = appendU32(b, 4, m.RequestDeadlineMs)
 	return b
 }
 
@@ -399,6 +400,10 @@ func unmarshalHelloReply(b []byte) (*HelloReply, error) {
 		case 3:
 			v, err := scalarBytes(wt, raw)
 			m.DaemonVersion = string(v)
+			return err
+		case 4:
+			v, err := scalarU64(wt, raw)
+			m.RequestDeadlineMs = uint32(v)
 			return err
 		}
 		return nil

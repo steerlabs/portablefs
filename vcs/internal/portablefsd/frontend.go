@@ -94,6 +94,43 @@ type frontendOperationEntry struct {
 	ackPending     bool
 }
 
+// frontendRequestDeadline is what the daemon TELLS a frontend to wait for one
+// reply, and it is derived from the daemon's own budgets rather than chosen.
+//
+// ── WHY THE FRONTEND MUST NOT PICK THIS NUMBER ──────────────────────────────
+//
+// It used to. The extension carried requestDeadlineNanoseconds = 60s; the
+// daemon gave one request an operationAdmissionBudget of 50s. Nothing related
+// the two, and 10s is not a margin: one request's ADMISSION may legitimately
+// consume most of its 50s, and admission is only part of a handler — the live
+// battery recorded a warm rmdir that took 80s and SUCCEEDED. So the frontend's
+// bound expired first on an operation the daemon was still going to answer
+// correctly, and a latency outlier was converted into a protocol event.
+//
+// ── WHY IT IS A MULTIPLE, NOT A SUM ─────────────────────────────────────────
+//
+// The daemon does not promise a total handler bound; it promises a definite
+// OUTCOME, and its internal budgets bound the waits it can be asked to make.
+// A frontend deadline exists only to notice a daemon that has stopped
+// answering at all, which is a different question from "is this slow". So the
+// number is deliberately far above anything a healthy handler can reach, and it
+// moves with operationAdmissionBudget so the two can never drift apart again.
+//
+// The remaining bound on a genuinely wedged request is the frontend's, and its
+// expiry is now REQUEST-LOCAL (see PfsLocalClient.timeoutRequest): it answers
+// that one request and leaves the connection — and therefore every other
+// operation's publication — alone.
+func frontendRequestDeadline() time.Duration {
+	return frontendRequestDeadlineFactor * clientcore.OperationAdmissionBudget()
+}
+
+// frontendRequestDeadlineFactor is how far the advertised bound sits above the
+// daemon's own per-operation budget. It must be strictly greater than 1: a
+// frontend bound at or below the daemon's budget expires on operations the
+// daemon is still going to answer correctly, which is exactly the pairing that
+// broke (60s frontend vs 50s daemon).
+const frontendRequestDeadlineFactor = 4
+
 const maxFrontendOperationsPerConnection = 4096
 const maxFrontendRequestsInFlight = 1024
 const maxFrontendConnections = 256
@@ -149,9 +186,10 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			c.reply(env.RequestID, &pfslocal.HelloReply{
-				ProtocolMajor: pfslocal.ProtocolMajor,
-				ProtocolMinor: pfslocal.ProtocolMinor,
-				DaemonVersion: c.srv.cfg.Version,
+				ProtocolMajor:     pfslocal.ProtocolMajor,
+				ProtocolMinor:     pfslocal.ProtocolMinor,
+				DaemonVersion:     c.srv.cfg.Version,
+				RequestDeadlineMs: uint32(frontendRequestDeadline().Milliseconds()),
 			})
 			state = frontendAwaitingResolve
 		case *pfslocal.ResolveRequest:
@@ -238,24 +276,43 @@ func (c *frontendConn) close() {
 		// joined safely until the gate has been woken and the handoff aborts.
 		c.publicationMu.Lock()
 		c.publicationClosed = true
-		var exposedUnacknowledged *frontendOperation
+		var unacknowledged []*frontendOperation
 		orphaned := make([]*frontendOperation, 0, len(c.operations))
 		for _, entry := range c.operations {
 			if entry.op == nil {
 				continue
 			}
-			if exposedUnacknowledged == nil &&
-				entry.replyExposed && !entry.ackPending {
-				exposedUnacknowledged = entry.op
+			if entry.replyExposed && !entry.ackPending {
+				unacknowledged = append(unacknowledged, entry.op)
 			}
 			orphaned = append(orphaned, entry.op)
 		}
 		c.publicationMu.Unlock()
-		if exposedUnacknowledged != nil {
-			exposedUnacknowledged.attach.failFrontendGate(fmt.Errorf(
-				"kernel coherence barrier failed closed: %w",
-				errors.New("frontend disconnected before acknowledging an exposed kernel publication"),
-			))
+		// A LOST ACKNOWLEDGEMENT IS A DEBT, NOT A DEATH SENTENCE.
+		//
+		// This used to publish a terminal coherence verdict to the gate the
+		// instant it found ONE exposed-unacknowledged publication, and a second
+		// terminal verdict per operation below. Both set coherenceFailFrozen,
+		// which nothing clears, so the whole mount answered EIO forever — the
+		// blast radius of a single reply the frontend happened not to
+		// acknowledge before its connection went away.
+		//
+		// The gate still has to be WOKEN, and promptly: a handler can be waiting
+		// behind the very handoff that is waiting for one of these operations,
+		// so handlerWG cannot be joined until every one of them has left the
+		// publication set. That is what the retirement loop below does, and it is
+		// sufficient on its own — a handoff blocked on these operations sees an
+		// empty blocker set and proceeds. What is NOT needed is a verdict.
+		//
+		// The kernel state those publications may have left behind is repaired
+		// instead, through the mount, with retry. See
+		// repairDisconnectedPublications.
+		if len(unacknowledged) > 0 {
+			log.Printf(
+				"portablefsd: attach %s: frontend disconnected owing %d publication "+
+					"acknowledgement(s); repairing the affected kernel scopes",
+				c.currentAttachRef(), len(unacknowledged),
+			)
 		}
 		// DEFINITIVE RESOLUTION OF EVERY OUTSTANDING PUBLICATION ACK.
 		//
@@ -303,13 +360,20 @@ func (c *frontendConn) close() {
 		for _, entry := range pending {
 			<-entry.ready
 			if entry.op != nil {
+				// An operation that only became exposed-unacknowledged while
+				// handlers were draining owes the same repair as one seen above,
+				// and for the same reason. It is never a terminal verdict.
 				if entry.replyExposed && !entry.ackPending {
-					entry.op.attach.failCoherence(errors.New(
-						"frontend disconnected before acknowledging an exposed kernel publication",
-					))
+					unacknowledged = append(unacknowledged, entry.op)
 				}
 				entry.op.attach.finishFrontendOperation(entry.op)
 			}
+		}
+		// The repair runs off the teardown path: it reaches the kernel through
+		// the mount, it retries until it converges, and this function is on the
+		// connection's close.
+		if a := c.currentAttach(); a != nil && len(unacknowledged) > 0 {
+			go a.repairDisconnectedPublications(unacknowledged)
 		}
 		if a := c.currentAttach(); a != nil {
 			a.removeConn(c.conn)
@@ -323,6 +387,15 @@ func (c *frontendConn) close() {
 		}
 		c.eventsMu.Unlock()
 	})
+}
+
+// currentAttachRef names this connection's attach for logging. It answers "-"
+// for a connection that never resolved one.
+func (c *frontendConn) currentAttachRef() string {
+	if a := c.currentAttach(); a != nil {
+		return a.ref
+	}
+	return "-"
 }
 
 func (c *frontendConn) currentAttach() *attach {
@@ -484,10 +557,24 @@ func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 	entry := c.operations[operationID]
 	if c.publicationClosed ||
 		entry == nil ||
-		entry.op == nil ||
-		entry.ackPending {
+		entry.op == nil {
 		c.publicationMu.Unlock()
 		return false
+	}
+	if entry.ackPending {
+		// THE OBLIGATION IS ALREADY DISCHARGED, SO THIS REPLY PINS NOTHING.
+		//
+		// The frontend has acknowledged this operation and therefore finished
+		// its callback (see acknowledgePublication). Writing the frame is still
+		// correct — a reply is owed to the request either way, and the frontend
+		// drops what it can no longer use — but pinning it into the publication
+		// set would create an obligation that has already been met and that
+		// nothing could ever meet again: one acknowledgement per operation, and
+		// it has been spent. That is the stranded-publication shape, reached
+		// from the other side.
+		entry.replyExposed = true
+		c.publicationMu.Unlock()
+		return true
 	}
 	entry.replyExposed = true
 	op := entry.op
@@ -525,12 +612,34 @@ func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32
 	)
 }
 
+// acknowledgePublication retires the logical operation the frontend has
+// finished with.
+//
+// ── AN ACKNOWLEDGEMENT MAY ARRIVE BEFORE THE REPLY IS EXPOSED ───────────────
+//
+// It used to refuse an operation with no exposed reply, treating that as a
+// protocol violation and killing the connection. That was right when the
+// frontend created its acknowledgement obligation on RECEIVING an ack-required
+// reply; it is wrong now that the obligation is created when the operation ID is
+// STAMPED ON A REQUEST, which is also the moment the daemon creates the
+// operation. The two now agree on when the obligation begins, and the honest
+// consequence is that a frontend can finish a callback — and say so — for a
+// request this daemon has not answered yet.
+//
+// That is not a violation, it is the case that used to strand: the frontend gave
+// up on a reply (its own deadline, a dropped frame) while a handler here was
+// still running. Accepting the acknowledgement is also the SAFER reading of it,
+// because it says the callback installed nothing it has not already accounted
+// for — and a reply the frontend never observed installed nothing at all.
+//
+// markPublicationReplyExposed completes the pair: a reply written after this
+// point still goes out, and simply does not pin an obligation that has already
+// been discharged.
 func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
 	c.publicationMu.Lock()
 	entry := c.operations[operationID]
 	if entry == nil ||
 		entry.op == nil ||
-		!entry.replyExposed ||
 		entry.ackPending {
 		c.publicationMu.Unlock()
 		return false

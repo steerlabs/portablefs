@@ -849,8 +849,20 @@ func waiterSuffix(waiterErr error) string {
 }
 
 type fskitKernelOps struct {
-	present      func(mountPath, attachRef string) (bool, error)
-	unmountExact func(mountPath, attachRef string) error
+	present func(mountPath, attachRef string) (bool, error)
+	// unmountExact detaches the exact kernel mount for attachRef. force asks
+	// the kernel to detach a BUSY mount (MNT_FORCE) rather than answering
+	// EBUSY.
+	//
+	// The flag exists because `umount --force` did not previously reach the
+	// kernel as a force at all: every path called unmount(2) with flags 0, so a
+	// single open reference anywhere in the mount — including one held by this
+	// product's own mount supervisor — refused the escape hatch that exists
+	// precisely to abandon a mount whose references cannot be recovered. The
+	// normal path still passes false: a clean unmount that would need MNT_FORCE
+	// is not a clean unmount, and forcing it silently would hide exactly the
+	// leaked-reference defects the flag was added to stop papering over.
+	unmountExact func(mountPath, attachRef string, force bool) error
 }
 
 // runUnmountTransaction owns the complete admission-freeze → durability
@@ -887,7 +899,12 @@ func (r *registry) runUnmountTransaction(
 			return true, jobID, fmt.Errorf("classify prepared FSKit detach: %w", err)
 		}
 		if present {
-			if err := ops.unmountExact(a.mountPath, ref); err != nil {
+			// A PREPARED detach is being reconciled, and it is reconciled
+			// under whatever authorization the caller carries: an escalated or
+			// force-authorized reconciliation is still a force.
+			if err := ops.unmountExact(
+				a.mountPath, ref, forceAuthorized || force,
+			); err != nil {
 				return true, jobID, err
 			}
 		}
@@ -939,7 +956,10 @@ func (r *registry) runUnmountTransaction(
 			}
 			present, err := ops.present(a.mountPath, ref)
 			if err == nil && present {
-				err = ops.unmountExact(a.mountPath, ref)
+				// A CLEAN unmount is never a force. If this mount is busy, the
+				// honest answer is EBUSY and the reference that holds it is a
+				// defect to find, not one to force past.
+				err = ops.unmountExact(a.mountPath, ref, false)
 			}
 			if err != nil {
 				a.mu.Lock()
@@ -1115,7 +1135,11 @@ func (r *registry) forceUnmountFSKit(
 	a.frontendSerial.Unlock()
 	present, err := ops.present(a.mountPath, a.ref)
 	if err == nil && present {
-		err = ops.unmountExact(a.mountPath, a.ref)
+		// THE FORCE PATH FORCES. Its entire purpose is to detach a mount whose
+		// remaining references cannot be recovered; asking the kernel for a
+		// polite detach here made `umount --force` fail for exactly the reason
+		// it was invoked.
+		err = ops.unmountExact(a.mountPath, a.ref, true)
 	}
 	if err != nil {
 		// Force authorization and the parked-tail proof remain durable.
@@ -1256,7 +1280,29 @@ type attach struct {
 	// refresh fails, authority visibility was not proven. Operations fail
 	// closed until an explicit unmount/restart.
 	coherenceFailFrozen bool
-	credentialPending   bool
+	// coherenceRepairs counts kernel coherence repairs currently running for
+	// this attach. It is the RECOVERABLE counterpart of coherenceFailFrozen:
+	// the daemon could not prove some kernel state, is actively rewriting it
+	// through the mount, and keeps serving meanwhile. Nonzero reports the
+	// attach as degraded-with-a-reason; reaching zero clears that report,
+	// because a repair that converged has discharged its debt. Guarded by mu.
+	coherenceRepairs int
+	// coherenceRepairGaveUp records that some repair exhausted its budget. It
+	// makes that reason STICKY — unlike the transient repairing state, it is
+	// never cleared by a later repair converging, because it is the only record
+	// that a piece of kernel state was never proven. It still does not fail
+	// admissions closed. Guarded by mu.
+	coherenceRepairGaveUp bool
+	// detachBarrier is set while this attach's FINAL drain/release barrier is
+	// running — the window inside vol.Close/CloseWithFinalizerContext in which a
+	// delegation release takes a publication handoff. It is the earliest point
+	// at which the kernel cache this mount owns is provably going away, and it
+	// is strictly earlier than detachPrepared/detached, which are only set AFTER
+	// that barrier has already succeeded. publicationBlockersLocked needs the
+	// earlier signal, because the barrier is precisely what used to be refused.
+	// Guarded by mu.
+	detachBarrier     bool
+	credentialPending bool
 	root                *itemRecord
 	items               map[uint64]*itemRecord
 	paths               map[string]*itemRecord
@@ -1626,6 +1672,31 @@ func (a *attach) activateWithOptionsMode(
 	options *AttachOptions,
 	onlyIfPending bool,
 ) (bool, error) {
+	// ── A CREDENTIAL ROTATION INTO A LIVE VOLUME TAKES NO NAMESPACE LOCK ─────
+	//
+	// This whole function used to run under lockExternalNamespaceWrite, i.e.
+	// frontendSerial plus a mount-wide EXCLUSIVE nsMu. For the revive path that
+	// is right — start() rebuilds the volume and republishes items, which really
+	// is a namespace-wide event. For a ROTATION it is not: the body below
+	// reduces to setCredential and an immediate return, and setCredential
+	// publishes a token into a live volume that synchronises itself.
+	//
+	// The cost of taking it anyway was the D2 stranding. Go's RWMutex is
+	// writer-preferring and every frontend write holds nsMu.RLock across an
+	// authority round trip, so under a full-speed flood this Lock() queued
+	// behind the slowest in-flight write — and the caller is the lease keeper's
+	// renewal, arriving on an HTTP control request with a 60s client timeout.
+	// The renewal timed out, its error was logged and dropped, the lease expired
+	// underneath a mount that was busy proving it was alive, and the attach
+	// fenced with "access credential rejected by a REACHABLE authority" while
+	// its backlog stranded. The one operation that must never queue behind bulk
+	// traffic was queued behind all of it.
+	//
+	// So the rotation is separated out and takes nothing heavier than a.mu.
+	// Every other path keeps the lock it had.
+	if done, handled := a.rotateLiveCredential(tok, expiresAtMs, onlyIfPending); handled {
+		return done, nil
+	}
 	unlockNamespace := a.lockExternalNamespaceWrite()
 	defer unlockNamespace()
 	a.startMu.Lock()
@@ -1689,6 +1760,41 @@ func (a *attach) activateWithOptionsMode(
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: a.state}})
 	a.mu.Unlock()
 	return true, nil
+}
+
+// rotateLiveCredential installs a rotated credential into an ALREADY ACTIVE
+// attach without taking the mount-wide namespace lock, and reports whether it
+// handled the request.
+//
+// handled is false for every state whose verdict belongs to the locked path —
+// detached, quarantined by a prepared detach, or not yet started — so those
+// callers still get the exact error and the exact serialization they had. It is
+// true only for the case the locked path would have reduced to a single
+// setCredential and an immediate return.
+//
+// See activateWithOptionsMode for why the rotation must not queue behind the
+// mount's write traffic.
+func (a *attach) rotateLiveCredential(
+	tok string,
+	expiresAtMs int64,
+	onlyIfPending bool,
+) (bool, bool) {
+	a.mu.RLock()
+	unavailable := a.detached || a.detachPrepared || a.detachForce
+	credentialPending := a.credentialPending
+	active := a.vol != nil && !credentialPending
+	a.mu.RUnlock()
+	if unavailable || !active {
+		return false, false
+	}
+	if onlyIfPending {
+		// An active attach has no pending credential by definition, so a
+		// pending-only installation has nothing to do. Same answer the locked
+		// path gives, reached without the lock.
+		return false, true
+	}
+	a.setCredential(tok, expiresAtMs)
+	return true, true
 }
 
 // controlAdmissionError is called only while nsMu is held. A persisted
@@ -2055,7 +2161,10 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 		return existingJobID, errPreparedDetachPending
 	}
 	if vol != nil {
-		if cerr := vol.Close(); cerr != nil {
+		exitBarrier := a.enterDetachBarrier()
+		cerr := vol.Close()
+		exitBarrier()
+		if cerr != nil {
 			// Close freezes admissions around the final drain and visibility
 			// barrier. It is retryable on failure and has not cancelled the
 			// Volume or parked its WAL. Keep the attach serving.
@@ -2096,7 +2205,9 @@ func (a *attach) forcedDetach() (jobID string, err error) {
 		return existingJobID, errPreparedDetachPending
 	}
 	if vol != nil {
+		exitBarrier := a.enterDetachBarrier()
 		id, cerr := vol.CloseJournalDurable()
+		exitBarrier()
 		jobID = id
 		if cerr != nil {
 			err = fmt.Errorf("forced detach: journal-durable close: %w", cerr)
@@ -2155,7 +2266,10 @@ func (a *attach) detachWithFinalizerContext(
 		return existingJobID, nil
 	}
 	if vol != nil {
-		if err := vol.CloseWithFinalizerContext(ctx, finalizer); err != nil {
+		exitBarrier := a.enterDetachBarrier()
+		err := vol.CloseWithFinalizerContext(ctx, finalizer)
+		exitBarrier()
+		if err != nil {
 			return "", fmt.Errorf("prepared FSKit detach refused: %w", err)
 		}
 	} else if err := finalizer(); err != nil {
@@ -2402,6 +2516,21 @@ func (a *attach) setErr(err error) {
 		a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: a.state}})
 	}
 	a.mu.Unlock()
+}
+
+// enterDetachBarrier marks the final drain/release barrier as running and
+// returns the function that clears it. A barrier that SUCCEEDS goes on to set
+// detached/detachPrepared, so clearing it afterwards is harmless; a barrier that
+// FAILS leaves the attach fully alive and must restore the serving verdict.
+func (a *attach) enterDetachBarrier() func() {
+	a.mu.Lock()
+	a.detachBarrier = true
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		a.detachBarrier = false
+		a.mu.Unlock()
+	}
 }
 
 func (a *attach) failCoherence(err error) {
