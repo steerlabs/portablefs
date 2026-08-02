@@ -1,6 +1,11 @@
 import { createHash, createHmac } from "node:crypto";
 import { Pool, type PoolConfig } from "pg";
 import {
+  InProcessClaimHeartbeat,
+  WorkerClaimHeartbeat,
+  type ClaimHeartbeat,
+} from "./claim-heartbeat.js";
+import {
   parseAccessLeaseControlSeq,
   parseAccessLeaseTokenGeneration,
   parseManagerEpoch,
@@ -403,6 +408,14 @@ export interface ManagerControlStore {
   // any mismatch or DB-time expiry — the caller tears down, never retries
   // into a fresh epoch here.
   renewManagerClaim(args: { identity: ManagerIdentity; ttlMs: number }): Promise<ManagerClaimRenewal>;
+
+  // The liveness channel that DRIVES renewal. The adapter answers with a
+  // channel whose isolation matches its own transport: the Postgres adapter
+  // hands back a worker thread holding a RESERVED connection, because a
+  // renewal must never queue behind bulk traffic in the shared pool nor
+  // behind data-plane socket callbacks on the main event loop. Liveness is
+  // the fencing authority; it is isolated by construction, not by tuning.
+  createClaimHeartbeat(): ClaimHeartbeat;
 
   // Best-effort clean shutdown: expire the claim NOW so a successor need not
   // wait out the TTL.
@@ -1010,10 +1023,36 @@ export function mapManagerControlError(err: PgLikeError, staleEpoch?: string): E
   }
 }
 
+// The exact pfm renewal statement. It lives in ONE place because the liveness
+// worker thread issues the identical call on its reserved connection.
+export const MANAGER_RENEW_SQL = `SELECT pfm.manager_renew($1,$2,$3,$4) AS r`;
+
+export function managerRenewStatement(args: {
+  identity: ManagerIdentity;
+  ttlMs: number;
+}): { sql: string; values: unknown[] } {
+  return {
+    sql: MANAGER_RENEW_SQL,
+    values: [
+      args.identity.managerEpoch,
+      args.identity.managerRuntimeId,
+      args.identity.managerCapability,
+      args.ttlMs,
+    ],
+  };
+}
+
 export class PostgresManagerControlStore implements ManagerControlStore {
   private readonly pool: ManagerControlPool;
+  private readonly connectionString: string;
+  private readonly connectTimeoutMs: number;
+  private readonly statementTimeoutMs: number;
+  private readonly heartbeats: ClaimHeartbeat[] = [];
 
   constructor(connectionString: string, options: PostgresManagerControlStoreOptions = {}) {
+    this.connectionString = connectionString;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? 5_000;
+    this.statementTimeoutMs = options.statementTimeoutMs ?? 10_000;
     if (options.pool) {
       this.pool = options.pool;
     } else {
@@ -1032,7 +1071,28 @@ export class PostgresManagerControlStore implements ManagerControlStore {
     this.pool.on?.("error", () => {});
   }
 
+  // createClaimHeartbeat hands back the ISOLATED liveness channel: a
+  // dedicated worker thread with its own reserved connection. It shares
+  // neither this pool (where a burst of client-driven lease work can hold
+  // every connection and make a queued renewal time out) nor the main event
+  // loop (where the data-plane router's socket callbacks live). Those two
+  // shared resources are exactly how a HEALTHY manager under full-speed load
+  // used to fence itself.
+  createClaimHeartbeat(): ClaimHeartbeat {
+    const heartbeat = new WorkerClaimHeartbeat({
+      connectionString: this.connectionString,
+      renewalStatement: managerRenewStatement,
+      connectTimeoutMs: this.connectTimeoutMs,
+      statementTimeoutMs: this.statementTimeoutMs,
+    });
+    this.heartbeats.push(heartbeat);
+    return heartbeat;
+  }
+
   async close(): Promise<void> {
+    for (const heartbeat of this.heartbeats.splice(0)) {
+      heartbeat.stop();
+    }
     await this.pool.end();
   }
 
@@ -1109,17 +1169,9 @@ export class PostgresManagerControlStore implements ManagerControlStore {
     identity: ManagerIdentity;
     ttlMs: number;
   }): Promise<ManagerClaimRenewal> {
+    const statement = managerRenewStatement(args);
     const row = asRecord(
-      await this.call(
-        `SELECT pfm.manager_renew($1,$2,$3,$4) AS r`,
-        [
-          args.identity.managerEpoch,
-          args.identity.managerRuntimeId,
-          args.identity.managerCapability,
-          args.ttlMs,
-        ],
-        args.identity.managerEpoch
-      ),
+      await this.call(statement.sql, statement.values, args.identity.managerEpoch),
       "manager renew"
     );
     return {
@@ -1766,6 +1818,13 @@ export class InMemoryManagerControlStore implements ManagerControlStore {
 
   constructor(options: InMemoryManagerControlStoreOptions = {}) {
     this.dbNow = options.dbNow ?? Date.now;
+  }
+
+  // An in-memory store has no connection to reserve and no data plane to be
+  // starved by, so its liveness channel is in-process — and it reports
+  // isolated=false, which is exactly what the production composition refuses.
+  createClaimHeartbeat(): ClaimHeartbeat {
+    return new InProcessClaimHeartbeat((args) => this.renewManagerClaim(args));
   }
 
   // Makes the next `count` calls to `target` fail with

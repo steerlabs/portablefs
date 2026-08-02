@@ -8,6 +8,10 @@ import { historyStoreRegistryFromEnv } from "./history-stores.js";
 import { ControlReadiness } from "./readiness.js";
 import { loadVolumeApiReleaseIdentity } from "./release-identity.js";
 import { installSignalHandlers, VolumeApiRuntime } from "./runtime.js";
+import {
+  applyMigrationsUntilReady,
+  startupMigrationBudgetFromEnv,
+} from "./startup-migrations.js";
 import { createTelemetry, stdoutTelemetrySink } from "./telemetry.js";
 import type { BlobStore } from "@portablefs/core";
 import { PostgresMetadataRepository } from "@portablefs/metadata-db";
@@ -34,8 +38,15 @@ const metadata = new PostgresMetadataRepository({
   max: intEnv("VOLUME_DATABASE_POOL_MAX", 32, 1, 32),
   ...databaseSslConfig(),
 });
+// Migrations run before ANYTHING listens, so a throw here is the whole
+// deployment. A database that is still in crash recovery has not answered
+// about the migrations at all — it has only said "not yet" — so the gate waits
+// it out on a bounded budget and fails the deploy definitively if it never
+// arrives. A real migration failure still propagates on the first attempt.
 console.log("PortableFS API applying metadata migrations.");
-await metadata.applyMigrations();
+await applyMigrationsUntilReady(() => metadata.applyMigrations(), {
+  budget: startupMigrationBudgetFromEnv(process.env),
+});
 console.log("PortableFS API metadata migrations are ready.");
 
 // Data gate for the retired pfr1/pfc1 journal codec era: serving and

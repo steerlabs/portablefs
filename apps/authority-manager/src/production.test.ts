@@ -1813,6 +1813,119 @@ describe("production children are disposable and journal remotely (no local file
 });
 
 // ---------------------------------------------------------------------------
+// A fenced manager is TERMINAL and must EXIT.
+//
+// A manager that fences itself holds no claim, serves nothing, and cannot mint
+// a successor epoch from inside its own process. Recorded incident: two
+// consecutive epochs fenced themselves and then hung fenced for 40+ minutes
+// with no successor until a manual redeploy. The registry therefore announces
+// the fence exactly once, and the composition root exits on it.
+// ---------------------------------------------------------------------------
+
+describe("a self-fenced manager announces the fence so the process can exit", () => {
+  test("the claim deadline passing announces the fence exactly once, after readiness is false and children are gone", async () => {
+    const local = { now: 10_000 };
+    const store = new InMemoryManagerControlStore();
+    const h = await newProductionHarness({
+      store,
+      localNow: () => local.now,
+      env: { PORTABLEFS_MANAGER_CLAIM_TTL_MS: "1000" },
+    });
+    // Every renewal fails: nothing can move the deadline forward.
+    h.store.failNext("renewManagerClaim", 1_000_000);
+    await h.registry.ensureAuthority(ref);
+
+    const fences: string[] = [];
+    h.registry.onFenced((reason) => fences.push(reason));
+
+    // Cross the DB-derived hard deadline and let the watchdog run.
+    local.now += 5_000;
+    const deadline = Date.now() + 3_000;
+    while (fences.length === 0 && Date.now() < deadline) {
+      await delay(10);
+    }
+
+    expect(fences).toEqual(["claim-deadline-exceeded"]);
+    expect(h.registry.ready()).toBe(false);
+    expect(h.registry.leases.healthy()).toBe(false);
+    expect(await h.registry.inspectAuthority(ref)).toBeNull();
+    expect(h.kills.length).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("a lease-path epoch loss fences the WHOLE manager and announces it, rather than serving on to the deadline", async () => {
+    const h = await newProductionHarness();
+    const created = await createHarnessLease(h);
+    const fences: string[] = [];
+    h.registry.onFenced((reason) => fences.push(reason));
+
+    // A competing manager takes the epoch; this manager discovers it on its
+    // next fenced lease write, NOT through the claim renewal.
+    h.store.supersedeEpoch();
+    await expectAccessLeaseError(
+      () =>
+        h.registry.leases.create({
+          operationId: "op-create-after-lease-path-loss",
+          teamId: ref.teamId,
+          volumeId: ref.volumeId,
+          branch: ref.branch,
+          consumerId: "sandbox-b",
+          authorityInstanceId: created.endpoint.authorityInstanceId!,
+          authorityRuntimeGeneration: "1",
+          authorityRuntimeId: h.spawnEnvs[0]!.VCS_AUTHORITY_RUNTIME_ID as string,
+        }),
+      "ACCESS_LEASE_EPOCH_SUPERSEDED"
+    );
+
+    expect(fences).toEqual(["manager-epoch-superseded"]);
+    expect(h.registry.ready()).toBe(false);
+    // The children are torn down immediately, not left serving under a claim
+    // that another manager now holds.
+    expect(await h.registry.inspectAuthority(ref)).toBeNull();
+  }, 15_000);
+
+  test("an ordinary shutdown is not a fence and announces nothing", async () => {
+    const h = await newProductionHarness();
+    const fences: string[] = [];
+    h.registry.onFenced((reason) => fences.push(reason));
+    await h.registry.shutdown();
+    expect(fences).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The claim heartbeat's isolation is a property of the COMPOSITION.
+// ---------------------------------------------------------------------------
+
+describe("claim heartbeat isolation", () => {
+  test("the in-memory control store's heartbeat is honestly reported as NOT isolated", async () => {
+    const h = await newProductionHarness();
+    // It renews on the caller's event loop, which is correct for a store with
+    // no connection to reserve — and is exactly what main.ts refuses.
+    expect(h.registry.claimHeartbeatIsolated()).toBe(false);
+  });
+
+  test("the registry renews ONLY through its heartbeat channel, never on its own timer", async () => {
+    const store = new InMemoryManagerControlStore();
+    const h = await newProductionHarness({
+      store,
+      env: { PORTABLEFS_MANAGER_CLAIM_TTL_MS: "3000" },
+    });
+    const before = h.renewSuccesses;
+    const deadline = Date.now() + 4_000;
+    while (h.renewSuccesses <= before && Date.now() < deadline) {
+      await delay(25);
+    }
+    expect(h.renewSuccesses).toBeGreaterThan(before);
+    // Stopping the channel stops renewal entirely: there is no second,
+    // main-loop renewal path left behind.
+    await h.registry.shutdown();
+    const afterShutdown = h.renewSuccesses;
+    await delay(1_500);
+    expect(h.renewSuccesses).toBe(afterShutdown);
+  }, 15_000);
+});
+
+// ---------------------------------------------------------------------------
 // Manager claim/renew deadline projection: the local deadline anchors at the
 // PRE-CALL monotonic instant, so a slow control-store response can never
 // extend readiness past the database's own expiry.

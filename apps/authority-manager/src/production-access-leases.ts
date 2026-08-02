@@ -221,6 +221,7 @@ export class ProductionAccessLeaseService {
   >();
   private readonly activityListeners = new Set<(refKey: string) => void>();
   private readonly zeroActiveListeners = new Set<(refKey: string) => void>();
+  private readonly supersededListeners = new Set<() => void>();
   // Monotonic per-ref activity versions: idle eviction snapshots the version,
   // and any create/renew during its awaits advances it, losing the eviction.
   private readonly activityVersions = new Map<string, number>();
@@ -292,6 +293,18 @@ export class ProductionAccessLeaseService {
         this.endProjectionLocked(record, "manager-epoch-superseded");
       }
     }
+    // A lease-path PF001 is the same durable proof the renewal path gets. The
+    // registry fences the WHOLE manager on it rather than leaving children
+    // serving until the claim deadline runs out.
+    for (const listener of [...this.supersededListeners]) {
+      listener();
+    }
+  }
+
+  // Fires once, synchronously, the first time this service is superseded —
+  // whether the registry drove it or a fenced store write discovered it.
+  onSuperseded(listener: () => void): void {
+    this.supersededListeners.add(listener);
   }
 
   onLeaseEnded(listener: (event: { accessLeaseId: string }) => void): void {

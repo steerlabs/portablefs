@@ -182,6 +182,27 @@ monotonic hard deadline derived from each successful renewal response; an
 ambiguous renewal (outage, timeout) never extends it, and when it passes the
 manager fences itself even if the store is unreachable.
 
+**Claim renewal is structurally isolated from load.** The claim is the fencing
+authority, so its liveness must not share any resource with the traffic it
+governs. Renewal runs on a dedicated worker thread that carries nothing else —
+no listener, no tunnel, no HTTP server, no child pipe — and holds its own
+reserved database connection rather than queueing in the pool that serves
+client-driven lease and runtime calls. Each attempt is hard-bounded to one
+renewal interval (TTL/3), so two attempts can never overlap or add up past the
+TTL. Confirmed renewals are published into shared memory and read by the
+fencing watchdog with an atomic load, so a renewal is visible the instant the
+database confirms it rather than waiting for the main event loop to drain a
+message. A manager under maximum data-plane load therefore renews on time by
+construction; before this, a healthy manager under a full-speed client write
+flood could starve its own heartbeat and fence itself, stranding client
+backlogs. Startup proves the isolation (separate thread, shared monotonic
+clock) and refuses to reach readiness without it.
+
+The safety side is unchanged and unweakened: the deadline moves only on a
+renewal the database actually confirmed, anchored at the instant *before* the
+statement was issued, and every failure mode of the liveness channel — slow,
+wedged, crashed, gone — is silence, which fences on schedule.
+
 Losing the epoch — a competitor claimed a newer one, or the deadline passed —
 stops all mutation: readiness fails, every local lease projection ends and its
 router tunnels close (the durable lease rows settle server-side under the new
@@ -189,7 +210,15 @@ epoch), the children are terminated, and the manager never writes through the
 store again. Lease routes answer 503 `ACCESS_LEASE_EPOCH_SUPERSEDED` and
 authority operations answer the equivalent supersession code. Access-token
 keys are derived from the root secret plus the manager epoch and token
-generation, so every predecessor token dies with its epoch.
+generation, so every predecessor token dies with its epoch. A supersession
+discovered on the *lease* path (a fenced store write) fences the whole manager
+too, not just the lease service.
+
+**A fenced manager exits.** It holds no claim, serves nothing, and cannot mint
+a successor epoch from inside its own process, so it tears down its listeners
+(bounded, 5 seconds) and exits non-zero for the platform to restart it into a
+fresh epoch. A fenced manager that lingers is a deployment with no live manager
+at all.
 
 ### Child contract (environment + inherited pipes)
 
