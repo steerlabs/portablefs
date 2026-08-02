@@ -3,10 +3,10 @@ module github.com/steerlabs/portablefs/vcs
 go 1.26.5
 
 require (
-	github.com/go-git/go-billy/v5 v5.9.0
-	github.com/hanwen/go-fuse/v2 v2.10.1
-	github.com/jackc/pgx/v5 v5.9.2
-	golang.org/x/sys v0.46.0
+	github.com/go-git/go-billy/v5 v5.9.1
+	github.com/hanwen/go-fuse/v2 v2.11.0
+	github.com/jackc/pgx/v5 v5.10.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
