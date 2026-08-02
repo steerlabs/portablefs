@@ -26,7 +26,12 @@ type fakeRouter struct {
 	mu             sync.Mutex
 	accepted       string
 	closeBeforeAck bool // reject by closing with NO ack byte (the clean-close case)
-	tunnels        map[net.Conn]net.Conn
+	// refuseWith is the ack byte answered to EVERY dial, admissible token or
+	// not: the router's own refusals (capacity, lease transition, no reachable
+	// backend) happen after the token has already resolved. Zero means "answer
+	// on the token".
+	refuseWith byte
+	tunnels    map[net.Conn]net.Conn
 
 	rejected atomic.Int64
 }
@@ -68,6 +73,15 @@ func (r *fakeRouter) setCloseBeforeAck(v bool) {
 	r.mu.Unlock()
 }
 
+// refuseEveryDialWith makes the router answer code to every handshake, the way
+// a lease at its tunnel limit or a lease transition refuses a token that
+// resolved perfectly well.
+func (r *fakeRouter) refuseEveryDialWith(code byte) {
+	r.mu.Lock()
+	r.refuseWith = code
+	r.mu.Unlock()
+}
+
 func (r *fakeRouter) serve() {
 	for {
 		conn, err := r.ln.Accept()
@@ -93,7 +107,14 @@ func (r *fakeRouter) handle(conn net.Conn) {
 	r.mu.Lock()
 	admit := r.accepted != "" && string(token) == r.accepted
 	closeBeforeAck := r.closeBeforeAck
+	refuseWith := r.refuseWith
 	r.mu.Unlock()
+	if refuseWith != 0 {
+		r.rejected.Add(1)
+		_, _ = conn.Write([]byte{refuseWith})
+		_ = conn.Close()
+		return
+	}
 	if !admit {
 		r.rejected.Add(1)
 		if !closeBeforeAck {

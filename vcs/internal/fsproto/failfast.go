@@ -12,9 +12,11 @@ package fsproto
 // Entry: failFastThreshold consecutive transport failures (dial errors,
 // handshake transport failures, request/response encode/decode errors —
 // deadline timeouts included) whose streak has persisted for at least
-// failFastGrace. A DEFINITE auth rejection (ErrSessionTokenRejected) never
-// counts: the peer answered, so it is reachable — only its credential check
-// failed, and that terminal result is not reachability state.
+// failFastGrace. A REFUSAL (ErrDialRefused and everything under it) never
+// counts: the peer answered, so it is reachable — whatever it refused for, that
+// answer is not reachability state. Which refusal it was decides what else gets
+// recorded: only ack 1 latches a credential verdict, the rest are remembered as
+// themselves (see recordDialRefused).
 // The grace window means a transient blip (an authority restart, a brief
 // LB flap) never engages fail-fast: ops keep retrying normally for the
 // first ~10s of any outage.
@@ -122,6 +124,20 @@ type connHealth struct {
 	credRejectedAt uint64
 	credVerifiedAt uint64
 	credPending    bool
+
+	// ── THE REFUSAL THAT IS NOT A CREDENTIAL VERDICT ────────────────────────
+	//
+	// The router refuses a dial for four different reasons and only one of them
+	// is about the credential (see reconnect.go). The other three used to be
+	// invisible: they latched a credential verdict they had no right to, and
+	// once that was corrected they would have become invisible instead — a
+	// mount failing every dial on a full lease, reporting nothing at all.
+	//
+	// So a non-credential refusal is REMEMBERED, with the reason, and reported
+	// as itself. It is not a verdict and it does not harden into one: the next
+	// successful handshake clears it, and a genuine credential refusal replaces
+	// it (the stronger statement wins).
+	lastRefusal error
 
 	// ── THE UNPROVEN STATE HAS A BOUNDARY ───────────────────────────────────
 	//
@@ -231,6 +247,7 @@ func (h *connHealth) recordHandshakeSuccess(gen uint64) {
 	h.mu.Lock()
 	h.failures = 0
 	h.engaged = false
+	h.lastRefusal = nil
 	if gen != 0 && gen == h.credGen {
 		h.credRejectedAt = 0
 		h.credVerifiedAt = gen
@@ -251,11 +268,41 @@ func (h *connHealth) recordCredentialRejected(gen uint64) {
 	h.mu.Lock()
 	h.failures = 0
 	h.engaged = false
+	// A credential verdict is the stronger statement: it supersedes whatever
+	// retryable refusal preceded it.
+	h.lastRefusal = nil
 	if gen != 0 && gen == h.credGen {
 		h.credRejectedAt = gen
 		h.credPending = false
 	}
 	h.mu.Unlock()
+}
+
+// recordDialRefused remembers a refusal that is NOT a credential verdict —
+// capacity, a lease transition, an authority-side outage behind the router, or
+// a code from a newer peer. Like a credential refusal it CLEARS the transport
+// breaker, because the peer answered; unlike one it touches no credential
+// state at all. Nothing here ever hardens into a verdict.
+func (h *connHealth) recordDialRefused(err error) {
+	if h == nil || err == nil {
+		return
+	}
+	h.mu.Lock()
+	h.failures = 0
+	h.engaged = false
+	h.lastRefusal = err
+	h.mu.Unlock()
+}
+
+// dialRefusal reports the last non-credential refusal the router gave this
+// client, or nil.
+func (h *connHealth) dialRefusal() error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastRefusal
 }
 
 // installCredential opens a new credential generation and PUBLISHES, under the
@@ -451,12 +498,20 @@ func (h *connHealth) proberDone() {
 func (c *Client) FailFast() bool { return c.health.active() }
 
 // CredentialRejected reports the DEFINITE verdict that a reachable authority
-// refused this client's credential. It is deliberately distinct from FailFast
-// (no answer at all) and from SessionFenced (a rejected session generation):
-// a mount in this state has a healthy authority and a dead access credential,
-// and only `portablefs login` + remount can change it. Status surfaces it as
-// credential-expired rather than as unreachability, and the admitted backlog
-// belongs to the durable parked-job path rather than to a retry loop.
+// refused this client's credential — ack 1, and ONLY ack 1: the manager could
+// not resolve this mount's session credential at all. It is deliberately
+// distinct from FailFast (no answer at all), from SessionFenced (a rejected
+// session generation), and from DialRefusal (the router answered about
+// something other than the credential). A mount in this state has a healthy
+// authority and a dead session credential, and no retry loop can recover it:
+// the mount must be re-established. Status surfaces it as credential-expired
+// rather than as unreachability, and the admitted backlog belongs to the
+// durable parked-job path rather than to a retry loop.
+//
+// The remedy is a REMOUNT, which mints a fresh lease; `portablefs login` is
+// additionally required only when the saved account credential is itself
+// rejected. Prescribing login for every case sent operators to repair a
+// credential that a manager restart or a lease rotation had left untouched.
 func (c *Client) CredentialRejected() bool { return c.health.credentialDead() }
 
 // CredentialUnproven reports that the installed credential has not yet been
@@ -471,6 +526,17 @@ func (c *Client) CredentialRejected() bool { return c.health.credentialDead() }
 // all, because something between the mount and it is tearing the handshake
 // down before the ack: look at the router, not at the login.
 func (c *Client) CredentialUnproven() bool { return c.health.credentialUnproven() }
+
+// DialRefusal reports the last refusal the data-plane router gave this client
+// that was NOT a credential verdict — the lease at its tunnel limit, a lease
+// transition race, or an authority-side outage behind the router — or nil.
+//
+// It exists because those three conditions used to be reported as the fourth.
+// They are retryable and none of them is repaired by re-authenticating, so a
+// mount in this state must say what is actually happening instead of latching
+// "credential rejected" and sending the operator to `portablefs login`. Pass it
+// to RefusalRemedy for the operator-facing sentence.
+func (c *Client) DialRefusal() error { return c.health.dialRefusal() }
 
 // CredentialGeneration reports the generation of the credential this client is
 // currently offering to handshakes. It exists so callers (and tests) can prove
@@ -585,11 +651,16 @@ const (
 	probeUnreachable probeOutcome = iota
 	// probeReachable: dial + handshake succeeded. Fail-fast clears.
 	probeReachable
-	// probeCredentialRejected: the authority ANSWERED and refused this
+	// probeCredentialRejected: the authority ANSWERED ack 1 and refused this
 	// client's credential. That is a definite classification about the
 	// CREDENTIAL, not about reachability, and it is terminal for this
 	// client: re-handshaking with the same dead credential can never succeed
-	// (per the lease decision table only login + remount can). Probing stops.
+	// (only a remount, which mints a fresh lease, can). Probing stops.
+	//
+	// Every OTHER refusal the router can make — capacity, a lease transition,
+	// an authority outage behind it — lands on probeUnreachable instead: they
+	// are retryable, so probing continues, and none of them is allowed to end
+	// this loop with a verdict it has not earned.
 	probeCredentialRejected
 )
 

@@ -417,7 +417,12 @@ func TestDoctorMountHealthFailures(t *testing.T) {
 		"FAIL  mounts: 2 mount(s): 1 stale, 1 credential-expired",
 		"/tmp/stale  vol1@main  fuse  stale",
 		"/tmp/expired  vol2@main  fuse  credential-expired",
-		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; run `portablefs login` and remount credential-expired paths",
+		// A credential-expired mount is an ENDED ACCESS LEASE, and four of the
+		// five typed answers that end one leave the account credential
+		// untouched. Leading with `portablefs login` prescribed a repair that
+		// cannot mint a lease; the remount that can is now the instruction, and
+		// login is qualified rather than commanded.
+		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; remount credential-expired paths to mint a fresh access lease (run `portablefs login` first only if the saved account credential is also rejected — the mount log names which)",
 	)
 }
 

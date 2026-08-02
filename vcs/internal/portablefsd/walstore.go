@@ -11,7 +11,14 @@ import (
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+// inspectStreamTail measures a stream's unshipped tail from the stream's own
+// segments. It is a package variable ONLY so the sweep's classifier can be
+// tested against every stream shape without synthesizing WAL bytes; production
+// never replaces it.
+var inspectStreamTail = writeback.InspectStreamTail
 
 // The write-back WAL store lives at stateDir/wal/<storageID>, where storageID
 // is derived from (volumeID, branch) ONLY. Every store carries an
@@ -226,14 +233,22 @@ func sweepWALRoot(stateDir string, attaches []persistedAttachEntry) {
 //
 //   - Legacy session logs that replay empty are removed; ones holding records
 //     are preserved and reported, exactly as before.
-//   - An engine store whose streams hold no unshipped segment records is
-//     removed WHOLE — lock, mount identity, epoch floor, stream directories.
-//     Drained bytes are garbage and are collected.
-//   - An engine store that still holds records is PRESERVED and reported with
-//     its size and the exact command that resolves it. Deleting an unshipped
-//     tail would silently discard a user's writes, which this product never
-//     does; leaving it undiscoverable is what made it a leak.
+//   - An engine store whose streams are all PROVEN drained is removed WHOLE —
+//     lock, mount identity, epoch floor, stream directories. Drained bytes are
+//     garbage and are collected.
+//   - An engine store with any stream that is not proven drained is PRESERVED
+//     and reported with what it holds, why, and the command that resolves it.
+//     Deleting an unshipped tail would silently discard a user's writes, which
+//     this product never does; leaving it undiscoverable is what made it a leak.
 //   - A store whose engine.lock is held by a live engine is skipped entirely.
+//
+// ── THE REGISTRY IS BELIEVED ONLY WHEN IT SAYS "PRESERVE" ────────────────────
+//
+// Round 17e classified stores from job.json alone, and job.json cannot carry
+// that weight (see classifyOrphanStream). Preserving on the registry's word is
+// safe in every direction — the worst case is disk that survives one more
+// restart. DELETING on its word is not, so deletion now requires positive
+// proof measured from the stream's own WAL.
 func sweepOrphanWALDir(dir string) {
 	if storeLockHeld(dir) {
 		// A live engine owns this store. It is not an orphan, whatever the
@@ -269,21 +284,21 @@ func sweepOrphanWALDir(dir string) {
 			log.Printf("portablefsd: remove drained orphan WAL %s: %v", p, err)
 		}
 	}
-	streams, records, bytes := orphanEngineStoreTail(dir)
-	if records > 0 {
-		// A store holding unshipped records is never deleted — those are the
-		// user's writes. It is made RECLAIMABLE instead: stamping the identity
-		// its own recovery registry already names lets the next attach of that
-		// volume+branch adopt and drain it, which is what turns a permanent
-		// 2.2 GB leak into a store that goes away on its own.
+	tail := orphanEngineStoreTail(dir)
+	if tail.streams > 0 {
+		// A store that is not PROVEN drained is never deleted — what it holds
+		// is the user's writes. It is made RECLAIMABLE instead: stamping the
+		// identity its own recovery registry already names lets the next attach
+		// of that volume+branch adopt and drain it, which is what turns a
+		// permanent 2.2 GB leak into a store that goes away on its own.
 		//
 		// The 95 stranded stores had no identity.json at all: they predate the
 		// (volume, branch) re-keying, so adoption could not see them and the
 		// sweep could not claim them. They were unreachable by every path.
 		adopted := stampOrphanStoreIdentity(dir)
 		log.Printf(
-			"portablefsd: orphan write-back store %s holds %d unshipped record(s) (%d bytes) across %d stream(s); preserved%s",
-			dir, records, bytes, streams, adopted,
+			"portablefsd: orphan write-back store %s is preserved: %d stream(s) not proven drained, holding %d unshipped record(s) (%d bytes) — %s%s",
+			dir, tail.streams, tail.records, tail.bytes, strings.Join(tail.reasons, "; "), adopted,
 		)
 		return
 	}
@@ -345,63 +360,111 @@ func engineStoreStreamDirs(dir string) []string {
 	return out
 }
 
-// orphanEngineStoreTail measures what an engine store still holds. A stream is
-// considered to hold records unless it carries a clean-close marker: this sweep
-// is a garbage collector, not a recovery engine, and it must err toward
-// preserving bytes it cannot prove are drained.
-func orphanEngineStoreTail(dir string) (streams int, records uint64, bytes uint64) {
-	for _, name := range engineStoreStreamDirs(dir) {
-		streamDir := filepath.Join(dir, name)
-		pending, size, drained := streamPendingBytes(streamDir)
-		if drained {
-			continue
-		}
-		streams++
-		records += pending
-		bytes += size
-	}
-	return streams, records, bytes
+// orphanStoreTail is what an engine store still holds, summed over the streams
+// that are NOT proven drained. reasons carries one operator-facing sentence per
+// preserved stream: a preserved store the operator cannot explain is the same
+// leak in a politer form.
+type orphanStoreTail struct {
+	streams int
+	records uint64
+	bytes   uint64
+	reasons []string
 }
 
-// streamPendingBytes reports one stream's unshipped tail. drained is true only
-// when the stream's recovery job proves everything it admitted was applied, or
-// when the stream holds no segment bytes beyond its headers.
-func streamPendingBytes(streamDir string) (records uint64, bytes uint64, drained bool) {
-	entries, err := os.ReadDir(streamDir)
-	if err != nil {
-		return 0, 0, false
-	}
-	var segmentBytes uint64
-	segments := 0
-	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), "wb-") || !strings.HasSuffix(e.Name(), ".pfw") {
+// orphanEngineStoreTail classifies every stream of an engine store. This sweep
+// is a garbage collector, not a recovery engine: it must err toward preserving
+// bytes it cannot PROVE are drained, and it must never let an unmeasurable
+// stream read as an empty one.
+func orphanEngineStoreTail(dir string) orphanStoreTail {
+	var out orphanStoreTail
+	for _, name := range engineStoreStreamDirs(dir) {
+		v := classifyOrphanStream(filepath.Join(dir, name))
+		if v.drained {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
-			return 0, 0, false
+		out.streams++
+		out.records = addSaturating(out.records, v.records)
+		out.bytes = addSaturating(out.bytes, v.bytes)
+		out.reasons = append(out.reasons, name+" "+v.reason)
+	}
+	return out
+}
+
+// streamVerdict is one stream's classification. drained is a POSITIVE claim —
+// it is set only where the stream's own WAL proved there is nothing left — and
+// reason states why a stream that is not drained is being kept.
+type streamVerdict struct {
+	drained bool
+	records uint64
+	bytes   uint64
+	reason  string
+}
+
+// ── WHY job.json CANNOT DECIDE THIS ─────────────────────────────────────────
+//
+// Round 17e classified a stream from its recovery registry alone, and derived
+// "how much is pending" from admittedThrough - appliedThrough on uint64 with no
+// guard. Both halves of that were wrong, and they failed in OPPOSITE
+// directions:
+//
+//   - admittedThrough is a SNAPSHOT of the WAL tail, written only when a stream
+//     enters a recovery or park lifecycle (recovery start, force-park). The
+//     LIVE engine never advances it. An active stream therefore keeps the zero
+//     it was created with while appliedThrough climbs on every apply, so
+//     appliedThrough legitimately EXCEEDS admittedThrough and the subtraction
+//     wrapped: a drained store reported 18446744073709551205 unshipped records
+//     and was preserved forever. Their difference is not a quantity of
+//     anything, in either order.
+//
+//   - pendingRecords/pendingBytes are refreshed by Engine.noteApplied, which
+//     runs when the authority APPLIES something. Appending does not touch them.
+//     A stream that appended records and then died therefore reports the
+//     pending count from its last apply — zero, over a tail that is not empty.
+//     Read as proof of drainage, that DELETED the user's unshipped writes.
+//
+// So the registry is consulted only where believing it is safe: it may say
+// "preserve", it may never say "delete". Deletion is decided by counting the
+// mutation frames the stream still retains past its own applied certificate —
+// a count of things that exist, taken from one file set, which cannot invert.
+func classifyOrphanStream(streamDir string) streamVerdict {
+	if job, ok := readRecoveryJobSummary(filepath.Join(streamDir, "job.json")); ok {
+		records, bytes := job.unrecovered()
+		switch job.State {
+		case jobStateConflict, jobStateCorrupt:
+			// The two states force-park refuses to touch because they require
+			// an explicit recovery resolution. Reclaiming one destroys the only
+			// copy of the damage an operator was asked to resolve.
+			return streamVerdict{records: records, bytes: bytes, reason: fmt.Sprintf(
+				"awaits an explicit recovery resolution (job state %q)", job.State)}
 		}
-		segments++
-		segmentBytes += uint64(info.Size())
+		if records > 0 || bytes > 0 {
+			return streamVerdict{records: records, bytes: bytes,
+				reason: "is recorded as holding an unshipped tail"}
+		}
 	}
-	job, ok := readRecoveryJobSummary(filepath.Join(streamDir, "job.json"))
-	if !ok {
-		// No job registry: a stream that crashed before registering. It is
-		// drained only if it has no segment bytes at all.
-		return 0, segmentBytes, segments == 0
+	tail, err := inspectStreamTail(streamDir)
+	if err != nil {
+		// UNREADABLE IS NOT EMPTY. The old code said drained=false here and
+		// reported zero records with it, and the caller branched on the record
+		// count — so the store was reclaimed anyway.
+		return streamVerdict{bytes: tail.SegmentBytes, reason: fmt.Sprintf(
+			"could not be read, so it cannot be proven drained: %v", err)}
 	}
-	if job.PendingRecords == 0 && job.AdmittedThrough == job.AppliedThrough {
-		return 0, segmentBytes, true
+	if tail.Records > 0 || tail.Bytes > 0 {
+		return streamVerdict{records: tail.Records, bytes: tail.Bytes,
+			reason: "retains records past its own applied certificate"}
 	}
-	pending := job.PendingRecords
-	if pending == 0 {
-		pending = job.AdmittedThrough - job.AppliedThrough
+	return streamVerdict{drained: true}
+}
+
+// addSaturating adds two record/byte counts without wrapping. Nothing here
+// should ever approach 2^64, which is exactly what the last unguarded uint64
+// expression in this file assumed.
+func addSaturating(a, b uint64) uint64 {
+	if sum := a + b; sum >= a {
+		return sum
 	}
-	size := job.PendingBytes
-	if size == 0 {
-		size = segmentBytes
-	}
-	return pending, size, false
+	return ^uint64(0)
 }
 
 // stampOrphanStoreIdentity gives an unidentified store the (volume, branch)
@@ -433,13 +496,39 @@ func stampOrphanStoreIdentity(dir string) string {
 // sweep reads. It is deliberately a local, tolerant decode: the sweep must not
 // fail a daemon start because a job file grew a field.
 type recoveryJobSummary struct {
-	State           string `json:"state"`
-	VolumeID        string `json:"volumeId"`
-	Branch          string `json:"branch"`
-	AdmittedThrough uint64 `json:"admittedThrough"`
-	AppliedThrough  uint64 `json:"appliedThrough"`
-	PendingRecords  uint64 `json:"pendingRecords"`
-	PendingBytes    uint64 `json:"pendingBytes"`
+	State    string `json:"state"`
+	VolumeID string `json:"volumeId"`
+	Branch   string `json:"branch"`
+	// AdmittedThrough and AppliedThrough are DELIBERATELY not decoded. They are
+	// watermarks written by different writers at different points of a stream's
+	// life, they can legitimately appear in either order, and nothing this
+	// sweep decides may be derived from them (see classifyOrphanStream).
+	PendingRecords uint64 `json:"pendingRecords"`
+	PendingBytes   uint64 `json:"pendingBytes"`
+	// The contained-loss statement. writeback.RecoveryJob.Unrecovered reads
+	// these instead of the pending pair once a job has been quarantined, and a
+	// sweep that ignored them would treat a proven data loss as an empty store.
+	Quarantined bool   `json:"quarantined"`
+	LostRecords uint64 `json:"lostRecords"`
+	LostBytes   uint64 `json:"lostBytes"`
+}
+
+// Recovery job states this sweep must recognize. They mirror
+// writeback.Job* and are matched textually because the sweep decodes job.json
+// tolerantly rather than through the writeback registry's strict reader.
+const (
+	jobStateConflict = "conflict"
+	jobStateCorrupt  = "corrupt"
+)
+
+// unrecovered mirrors writeback.RecoveryJob.Unrecovered: what this job still
+// holds that the authority never made durable. Both forms are COUNTS, never a
+// difference of watermarks.
+func (j recoveryJobSummary) unrecovered() (records uint64, bytes uint64) {
+	if j.Quarantined {
+		return j.LostRecords, j.LostBytes
+	}
+	return j.PendingRecords, j.PendingBytes
 }
 
 func readRecoveryJobSummary(path string) (recoveryJobSummary, bool) {

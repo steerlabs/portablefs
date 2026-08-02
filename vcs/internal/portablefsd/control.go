@@ -643,7 +643,34 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 			node = clientcore.NewNodeState(0, false)
 		}
 		// PHASE 1.
-		mutCtx, _, settle, err := vol.AdmitWrite(opCtx, p, node, len(data), true)
+		mutCtx, granted, settle, err := vol.AdmitWrite(opCtx, p, node, len(data), true)
+		if err == nil && granted < len(data) {
+			// A CONTROL WRITE CANNOT TAKE A SHORT GRANT.
+			//
+			// Every kernel frontend can: it writes the granted prefix and the
+			// reply's count makes the kernel reissue the rest as a fresh
+			// operation (portablefsd/ops.go, writeGrantOf). This path has no
+			// kernel to reissue anything — it publishes a whole file in one
+			// shot and its handler writes all of `data` regardless — so
+			// accepting a prefix would write bytes the lane never admitted and
+			// never charged, which is the exact accounting hole this round
+			// exists to close, reopened in a different lane.
+			//
+			// So the grant is returned and the admission retried under the SAME
+			// operation deadline, which is what bounds the loop. The lane is
+			// paced, not refused: whatever frees room for the delegated lane
+			// frees it for this one.
+			settle()
+			if opCtx.Err() != nil {
+				writeHTTPError(
+					w,
+					httpStatusForErr(creditErrno(opCtx.Err())),
+					errMessage("fs/write admission", creditErrno(opCtx.Err())),
+				)
+				return
+			}
+			continue
+		}
 		if err != nil {
 			settle()
 			writeHTTPError(

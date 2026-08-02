@@ -2573,16 +2573,27 @@ func recoveryConflictScopes(j writeback.RecoveryJob) string {
 	return strings.Join(out, ", ")
 }
 
-// credentialStateRejected / credentialStatePendingVerification are the two
-// DISJOINT credential faults an attach can report. They are distinct words
-// because they are distinct facts with distinct repairs: rejected is a
-// proven-dead credential (the authority answered "no" -> log in again),
-// pending-verification is an UNTESTED one (the authority never answered ->
-// look at the router). Overloading "expired" for both told operators to fix
-// the wrong thing.
+// The DISJOINT credential-plane faults an attach can report. They are distinct
+// words because they are distinct facts with distinct repairs, and every time
+// two of them were spelled the same the operator was sent to fix the wrong
+// thing:
+//
+//   - rejected: a proven-dead credential. The authority answered "no" ->
+//     log in again and remount.
+//   - pending-verification: an UNTESTED credential. Nobody answered at all ->
+//     look at the router, not at the login.
+//   - router-refused: the router ANSWERED, and its answer was not about the
+//     credential — the lease is at its tunnel limit, or it ended/rotated
+//     mid-handshake, or no backend authority was reachable. Retryable, and
+//     re-authenticating changes none of them. This one existed as a fact long
+//     before it had a word: the router spelled it ack 1, the same byte it used
+//     for a dead credential, so a mount that lost a race for one of the
+//     lease's 64 tunnel slots latched "credentials revoked or expired" over a
+//     lease with four and a half minutes left.
 const (
 	credentialStateRejected            = "rejected"
 	credentialStatePendingVerification = "pending-verification"
+	credentialStateRouterRefused       = "router-refused"
 )
 
 func (a *attach) status() attachStatus {
@@ -2642,10 +2653,38 @@ func (a *attach) status() attachStatus {
 		} else if vol.CredentialExpired() {
 			state = pfslocal.AttachStateDegraded
 			credential = credentialStateRejected
-			lastErr = "access credential rejected by a REACHABLE authority " +
-				"(lease expired or revoked); run `portablefs login` and remount. " +
+			// The condition is EXACTLY "the manager could not resolve this
+			// mount's session credential", which a lease expiry, a revoke, a
+			// rotation and a manager restart all produce. Naming only the first
+			// two made the other two read as a contradiction of the operator's
+			// own dashboard, so the message names the fact and the remedy that
+			// covers all four.
+			lastErr = "access credential REJECTED by a reachable authority: the " +
+				"manager no longer resolves this mount's session credential " +
+				"(lease expired, released, revoked, rotated, or the manager " +
+				"restarted). Run `portablefs login` if the account credential is " +
+				"stale, then remount — a remount is required either way. " +
 				"Unshipped write-back is retained locally and can be parked as a " +
 				"durable recovery job with `portablefs umount --force`"
+		} else if refusal := vol.DialRefusal(); refusal != nil {
+			// THE ROUTER ANSWERED, AND IT WAS NOT ABOUT THE CREDENTIAL.
+			//
+			// Nothing here could say this before: the router spelled capacity,
+			// lease transitions and its own backend outages with the same ack
+			// byte it used for a dead credential, so all three arrived as
+			// "credential rejected" and the mount told its operator to run
+			// `portablefs login`. Measured live against a lease with 4.5
+			// minutes of validity left, for which re-login was not the remedy.
+			//
+			// These are RETRYABLE, so the mount is degraded rather than
+			// verdicted, and the message names the condition the router
+			// actually reported together with the action that changes it.
+			state = pfslocal.AttachStateDegraded
+			credential = credentialStateRouterRefused
+			lastErr = "the manager's data-plane router REFUSED this mount's " +
+				"tunnel, and not because of the credential: " +
+				fsproto.RefusalRemedy(refusal) + ". The mount retries " +
+				"automatically and unshipped write-back is retained locally"
 		} else if vol.CredentialUnproven() {
 			// AN UNTESTED CREDENTIAL IS NOT A HEALTHY ONE. The mount has
 			// offered this credential and the authority has neither accepted

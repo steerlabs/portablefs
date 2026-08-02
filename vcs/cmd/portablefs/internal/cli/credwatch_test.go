@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -90,8 +91,46 @@ func TestLeaseKeeperExpiredIsVisible(t *testing.T) {
 	if st.Status != mountStatusCredentialExpired {
 		t.Fatalf("terminal expiry must be visible: %+v", st)
 	}
-	if !strings.Contains(logBuf.String(), "credentials revoked or expired") {
-		t.Fatalf("terminal expiry must be logged: %q", logBuf.String())
+	// AN EXPIRED LEASE IS NOT A REVOKED CREDENTIAL. This used to log
+	// "credentials revoked or expired ... run `portablefs login` and remount",
+	// which names an action that cannot mint a lease: a lease is minted by a
+	// MOUNT. The saved account credential here is untouched and perfectly good.
+	log := logBuf.String()
+	if !strings.Contains(log, "access lease ENDED") || !strings.Contains(log, "REMOUNT") {
+		t.Fatalf("terminal expiry must be logged with the action that works: %q", log)
+	}
+	if strings.Contains(log, "credentials revoked or expired") {
+		t.Fatalf("an ended lease must not be reported as a revoked credential: %q", log)
+	}
+}
+
+// TestLeaseEndMessageNamesTheRemedyThatMatchesTheCondition pins the split the
+// live battery exposed: of the five typed answers that end a lease, exactly
+// ONE is about the account credential, and only that one may prescribe
+// `portablefs login` as the fix.
+func TestLeaseEndMessageNamesTheRemedyThatMatchesTheCondition(t *testing.T) {
+	unauthorized := leaseEndMessage(&httpError{Status: 401, Code: "ACCESS_LEASE_UNAUTHORIZED", Message: "no"})
+	if !strings.Contains(unauthorized, "portablefs login") {
+		t.Fatalf("a rejected account credential must still name login: %q", unauthorized)
+	}
+	for _, code := range []string{
+		"ACCESS_LEASE_EXPIRED",
+		"ACCESS_LEASE_REVOKED",
+		"ACCESS_LEASE_RELEASED",
+		"ACCESS_LEASE_NOT_FOUND",
+	} {
+		got := leaseEndMessage(&httpError{Status: 409, Code: code, Message: "ended"})
+		if !strings.Contains(got, "REMOUNT") {
+			t.Fatalf("%s must name the remount that actually mints a new lease: %q", code, got)
+		}
+		if !strings.Contains(got, "does not renew one") {
+			t.Fatalf("%s must say plainly that logging in cannot fix it: %q", code, got)
+		}
+	}
+	// An untyped terminal error (a renewal unresolved at the lease's own
+	// expiry) is the same condition: the lease is over.
+	if got := leaseEndMessage(errors.New("unresolved at expiry")); !strings.Contains(got, "REMOUNT") {
+		t.Fatalf("an unresolved-at-expiry lease must name the remount: %q", got)
 	}
 }
 

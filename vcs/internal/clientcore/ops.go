@@ -31,6 +31,17 @@ const statusLaneRetry Status = -4097
 // failure for a write that has not been attempted.
 func LaneChanged(st Status) bool { return st == statusLaneRetry }
 
+// statusErr is the ONE place a clientcore error becomes a POSIX status, and
+// every mutation entry point routes its fail-closed refusal through it —
+// including beginMutation's, which used to answer a hardcoded EIO.
+//
+// That hardcoding was the last mile of round 18g's dishonesty. The engine's
+// latched error already carried the truth (writeback.ErrNoSpace, from a
+// capacity refusal the authority classified and the flusher parked on), and it
+// was thrown away one call short of the application, which then read "your
+// filesystem broke" for "your volume is full". Nothing else changes: the
+// default arm below is still EIO, so every cause that is not one of the named
+// ones answers exactly what it answered before.
 func statusErr(err error) Status {
 	switch {
 	case err == nil:
@@ -671,7 +682,7 @@ func (v *Volume) evictDirCachePrefix(rp string) {
 
 func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeIntent bool) Status {
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.EIO
+		return statusErr(err)
 	}
 	defer v.endMutation()
 
@@ -698,7 +709,7 @@ func (v *Volume) Open(ctx context.Context, path string, n *NodeState, writeInten
 
 func (v *Volume) RegisterOpened(ctx context.Context, path string, n *NodeState) Status {
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.EIO
+		return statusErr(err)
 	}
 	defer v.endMutation()
 
@@ -1110,7 +1121,7 @@ func (v *Volume) WriteCommitted(
 ) (WriteOutcome, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return WriteOutcome{}, fsproto.EIO
+		return WriteOutcome{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1122,6 +1133,9 @@ func (v *Volume) WriteCommitted(
 		cnt, st, err := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 		if err != nil {
 			return WriteOutcome{}, fsproto.EIO
+		}
+		if st == fsproto.OK {
+			writeback.NoteAuthorityAck(ctx, cnt)
 		}
 		return WriteOutcome{Count: cnt}, st
 	}
@@ -1137,6 +1151,9 @@ func (v *Volume) WriteCommitted(
 			cnt, st, werr := v.client.WriteOrphanContext(v.authorityWaitContext(ctx), oi, off, data)
 			if werr != nil {
 				return WriteOutcome{}, fsproto.EIO
+			}
+			if st == fsproto.OK {
+				writeback.NoteAuthorityAck(ctx, cnt)
 			}
 			return WriteOutcome{Count: cnt}, st
 		}
@@ -1181,6 +1198,9 @@ func (v *Volume) WriteCommitted(
 		if err != nil {
 			return WriteOutcome{}, fsproto.EIO
 		}
+		if st == fsproto.OK {
+			writeback.NoteAuthorityAck(authorityCtx, cnt)
+		}
 		return WriteOutcome{Count: cnt}, st
 	}
 	handleIno := authHandleIno(n)
@@ -1189,11 +1209,27 @@ func (v *Volume) WriteCommitted(
 	if err != nil {
 		return WriteOutcome{}, fsproto.EIO
 	}
+	if st == fsproto.OK {
+		// THE ACKNOWLEDGEMENT, RECORDED WHERE IT HAPPENS.
+		//
+		// These bytes are about to be reported to the kernel as a successful
+		// write, and the authority's reply is the only evidence behind that
+		// report. It is a receipt, not a durability proof: a fenced session
+		// discards exactly these bytes at its deferred flush
+		// (fsproto/session_client.go:414-419). Recording them here is what
+		// makes them nameable afterwards — without it the only way to learn
+		// this number is to subtract, which is how the last incident had to be
+		// investigated.
+		writeback.NoteAuthorityAck(authorityCtx, cnt)
+	}
 	if st == fsproto.ENOENT {
 		if oi := v.RedirectToOrphan(authorityCtx, n); oi != 0 {
 			c2, ost, oerr := v.client.WriteOrphanContext(authorityCtx, oi, off, data)
 			if oerr != nil {
 				return WriteOutcome{}, fsproto.EIO
+			}
+			if ost == fsproto.OK {
+				writeback.NoteAuthorityAck(authorityCtx, c2)
 			}
 			return WriteOutcome{Count: c2}, ost
 		}
@@ -1245,11 +1281,17 @@ func (v *Volume) WriteExactHandleCommitted(
 		if err != nil {
 			return WriteOutcome{}, fsproto.EIO
 		}
+		if st == fsproto.OK {
+			writeback.NoteAuthorityAck(authorityCtx, count)
+		}
 		return WriteOutcome{Count: count}, st
 	}
 	count, _, _, st, err := v.client.WriteVHandleContext(authorityCtx, "", ino, off, data, 0o644)
 	if err != nil {
 		return WriteOutcome{}, fsproto.EIO
+	}
+	if st == fsproto.OK {
+		writeback.NoteAuthorityAck(authorityCtx, count)
 	}
 	return WriteOutcome{Count: count}, st
 }
@@ -1292,7 +1334,7 @@ func (v *Volume) WriteAppendCommitted(
 ) (WriteOutcome, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return WriteOutcome{}, fsproto.EIO
+		return WriteOutcome{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1480,7 +1522,7 @@ func (v *Volume) CreateExcl(ctx context.Context, path string, mode uint32) (fspr
 
 func (v *Volume) createCommon(ctx context.Context, path string, mode uint32, excl bool) (fsproto.Attr, Status) {
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1561,7 +1603,7 @@ func (v *Volume) createWriteThrough(
 
 func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.Attr, Status) {
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1613,7 +1655,7 @@ func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) (fsproto.A
 func (v *Volume) Remove(ctx context.Context, path string, child *NodeState) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, child)
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.EIO
+		return statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1776,7 +1818,7 @@ func unlockTwo(a, b *NodeState) {
 func (v *Volume) Rename(ctx context.Context, oldp, newp string, src, dst *NodeState) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, src, dst)
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.EIO
+		return statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -1950,7 +1992,7 @@ func (v *Volume) evictNamespacePaths(oldp, newp string) {
 
 func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr, Status) {
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -2005,7 +2047,7 @@ func (v *Volume) Symlink(ctx context.Context, target, path string) (fsproto.Attr
 // scope.
 func (v *Volume) Link(ctx context.Context, oldp, newp string, src *NodeState) (fsproto.Attr, Status) {
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -2202,7 +2244,7 @@ func (v *Volume) setattr(
 ) (fsproto.Attr, Status) {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.Attr{}, fsproto.EIO
+		return fsproto.Attr{}, statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they

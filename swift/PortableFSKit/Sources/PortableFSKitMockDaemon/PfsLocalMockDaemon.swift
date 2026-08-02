@@ -203,6 +203,23 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.delayNextWrite(nanoseconds: nanoseconds)
     }
 
+    /// Refuses the Nth-next write request with `errno`, AFTER any earlier
+    /// request in the same framework callback has already committed. That is
+    /// the shape one FSKit write callback takes when it spans several daemon
+    /// requests and a later one hits a fence, a lane change or an EIO: the
+    /// earlier chunks are on media and the callback still has to say something
+    /// truthful about them.
+    public func failWrite(atIndex index: Int, errno code: Int32 = EIO) async {
+        await fileSystem.failWrite(atIndex: index, errno: code)
+    }
+
+    /// Answers the Nth-next write request with a SHORT count — `written` bytes
+    /// of the request's payload — which is a healthy POSIX outcome the daemon
+    /// produces whenever a credit grant covers only a prefix.
+    public func shortenNextWrite(to written: Int) async {
+        await fileSystem.shortenNextWrite(to: written)
+    }
+
     public func emitInvalidation(
         item: PfsItem,
         contentChanged: Bool = true,
@@ -542,6 +559,12 @@ private actor MockFileSystem {
     private var pendingCloseDelaysNanoseconds: [UInt64] = []
     private var pendingReadDelaysNanoseconds: [UInt64] = []
     private var pendingWriteDelaysNanoseconds: [UInt64] = []
+    /// Write-request index (0-based, counted across the whole session) → errno.
+    /// Positional rather than a queue because the shape under test is "chunk k
+    /// of one framework callback fails after chunks 0..<k committed", and that
+    /// needs the failure placed at a known request, not merely next in line.
+    private var writeErrnoByIndex: [Int: Int32] = [:]
+    private var pendingWriteShortCounts: [Int] = []
 
     init(configuration: PfsLocalMockDaemon.Configuration) {
         self.configuration = configuration
@@ -616,6 +639,14 @@ private actor MockFileSystem {
 
     func delayNextWrite(nanoseconds: UInt64) {
         pendingWriteDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func failWrite(atIndex index: Int, errno code: Int32) {
+        writeErrnoByIndex[index] = code
+    }
+
+    func shortenNextWrite(to written: Int) {
+        pendingWriteShortCounts.append(written)
     }
 
     func handle(_ envelope: PfsEnvelope, session: MockSession) async -> PfsEnvelope {
@@ -822,16 +853,25 @@ private actor MockFileSystem {
                 response.data = node.data.subdata(in: offset..<end)
                 reply.body = .readReply(response)
             case let .write(request):
+                let writeIndex = writeRequests
                 writeRequests += 1
                 maxWriteLength = max(maxWriteLength, request.data.count)
                 if !pendingWriteDelaysNanoseconds.isEmpty {
                     let delay = pendingWriteDelaysNanoseconds.removeFirst()
                     try await Task.sleep(nanoseconds: delay)
                 }
+                if let code = writeErrnoByIndex[writeIndex] {
+                    throw MockPOSIXError(errno: code, message: "injected write failure")
+                }
                 let node = try node(forHandle: request.handle)
-                write(node: node, offset: Int(request.offset), data: request.data)
+                var payload = request.data
+                if !pendingWriteShortCounts.isEmpty {
+                    let want = pendingWriteShortCounts.removeFirst()
+                    payload = payload.prefix(max(0, min(want, payload.count)))
+                }
+                write(node: node, offset: Int(request.offset), data: payload)
                 var response = PfsWriteReply()
-                response.written = UInt32(request.data.count)
+                response.written = UInt32(payload.count)
                 response.attr = attr(for: node)
                 reply.body = .writeReply(response)
             case let .create(request):

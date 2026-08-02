@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -31,12 +32,41 @@ func (w *credentialWatch) noteRejected(err error) {
 	w.once.Do(func() {
 		at := w.now()
 		if w.logf != nil {
-			w.logf("credentials revoked or expired (%v); filesystem access is degraded until re-authenticated — run `portablefs login` and remount", err)
+			w.logf("%s", leaseEndMessage(err))
 		}
 		if w.onChange != nil {
 			w.onChange(mountStatusCredentialExpired, at.UnixMilli())
 		}
 	})
+}
+
+// ── A LEASE THAT ENDED IS NOT A CREDENTIAL THAT WAS REVOKED ──────────────────
+//
+// The keeper reaches this line for five typed answers, and ONE of them is
+// about the account credential:
+//
+//	401 ACCESS_LEASE_UNAUTHORIZED  our token no longer authenticates — log in
+//	404 ACCESS_LEASE_NOT_FOUND     )
+//	409 ACCESS_LEASE_REVOKED       ) the LEASE ended. The saved account
+//	409 ACCESS_LEASE_RELEASED      ) credential may be perfectly good; a lease
+//	410 ACCESS_LEASE_EXPIRED       ) is minted by a MOUNT, not by a login
+//
+// plus a renewal still unresolved at the lease's own expiry, which is the last
+// four again. All five rendered as "credentials revoked or expired ... run
+// `portablefs login` and remount", so four out of five sent the operator to
+// re-authenticate a credential that was not the problem, and buried the action
+// that was (remount) at the end of the sentence as an afterthought.
+func leaseEndMessage(err error) string {
+	var he *httpError
+	if errors.As(err, &he) && he.Code == "ACCESS_LEASE_UNAUTHORIZED" {
+		return fmt.Sprintf("credentials revoked or expired (%v); filesystem access "+
+			"is degraded until re-authenticated — run `portablefs login` and remount", err)
+	}
+	return fmt.Sprintf("this mount's access lease ENDED and cannot be renewed (%v); "+
+		"filesystem access is degraded until the mount is re-established — REMOUNT "+
+		"this path. A lease is minted by a mount, so `portablefs login` does not "+
+		"renew one and will not change this; re-run it only if `portablefs doctor` "+
+		"reports the saved account credential itself rejected", err)
 }
 
 // ── THE CREDENTIAL HANDOFF IS A TWO-PARTY TRANSITION ────────────────────────

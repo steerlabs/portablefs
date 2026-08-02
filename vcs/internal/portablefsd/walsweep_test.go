@@ -54,6 +54,11 @@ func writeEngineStore(t *testing.T, walRoot, storeID string, job map[string]any,
 // sweep found no sess-*.wal files, concluded there was nothing to keep, called
 // os.Remove(dir) — which failed ENOTEMPTY against engine.lock/mount-id/
 // wal-epoch/stream-* — and discarded the error.
+//
+// The store's segment is stubbed as measuring drained: whether the WAL reader
+// can measure a real stream is proven where the format lives
+// (writeback.TestInspectStreamTailMeasuresARealStream). What is proven here is
+// that a stream MEASURED drained is reclaimed whole.
 func TestSweepReclaimsADrainedOrphanEngineStore(t *testing.T) {
 	stateDir := privateTempDir(t)
 	walRoot := filepath.Join(stateDir, "wal")
@@ -63,6 +68,7 @@ func TestSweepReclaimsADrainedOrphanEngineStore(t *testing.T) {
 		"admittedThrough": 12, "appliedThrough": 12,
 		"pendingRecords": 0, "pendingBytes": 0,
 	}, 4096)
+	stubStreamTails(t, nil, nil)
 
 	sweepWALRoot(stateDir, nil)
 

@@ -140,6 +140,16 @@ const maintenanceLoop = historyMaintenance.enabled
       // eventually runs, so a transient failure never leaves a retired
       // volume's journal tail retained forever.
       retirement: metadata,
+      // Terminal recovery cuts (migration 034): a failed cut used to have NO
+      // path out — the deterministic operation id replayed the same dead
+      // outcome forever, so production logged "adoption is blocked" every 60
+      // seconds for days on one generation. A transient failure is now
+      // re-cut under the next revision, bounded and backed off; a permanent
+      // one becomes a terminal, throttled, operator-visible obligation with
+      // its identity and remedy on the line.
+      recoveryCutMaxRevisions: historyMaintenance.recoveryCutMaxRevisions,
+      recoveryCutBackoffMs: historyMaintenance.recoveryCutBackoffMs,
+      stuckLogIntervalMs: historyMaintenance.stuckLogIntervalMs,
       telemetry: createTelemetry(telemetryHook ?? stdoutTelemetrySink()),
       // Adoption is gated on THIS deployment serving exact PFT2 history
       // reads: the adopted base is what the next cold start must fetch

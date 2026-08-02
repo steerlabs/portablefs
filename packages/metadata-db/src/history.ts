@@ -261,6 +261,54 @@ export interface GenerationBacklogStatus {
   backlogPercent: number;
 }
 
+/**
+ * One live generation whose history work is TERMINAL (migration 034), exactly
+ * as pfj.stuck_recovery_generations projects it: a failed or canceled cut
+ * would have moved this generation's base and nothing live is in flight to do
+ * it instead. This is the identity the per-cycle `cutsFailed: 1` counter never
+ * carried — the counter said a cut had died, not which volume was affected,
+ * why, for how long, or what to do about it.
+ */
+export interface StuckRecoveryGeneration {
+  tenantId: string;
+  volumeId: string;
+  branchId: string;
+  branchName: string;
+  generationId: string;
+  status: "active" | "suspended";
+  baseSeq: string;
+  nextSeq: string;
+  backlogBytes: string;
+  backlogRecords: string;
+  /** The newest terminal cut: the boundary this generation failed to install. */
+  cutId: string;
+  cutState: "failed" | "canceled";
+  cutKind: HistoryCutKind;
+  cutSeqExclusive: string;
+  /**
+   * The dedup revision of that cut. cut_create mints MAX+1 at the same dedup
+   * key after a definite failure, so this is also the number of materialization
+   * attempts the boundary has had, and the input to a bounded re-cut policy.
+   */
+  dedupRevision: string;
+  /** Worker attempts INSIDE the newest cut (its own 013 retry budget). */
+  attemptCount: number;
+  /**
+   * `last_error.kind` as the worker recorded it. "corrupt" is definite source
+   * damage — re-cutting the same range folds the same bytes and fails
+   * identically — while "transient"/"dead_letter" can be worth another cut.
+   */
+  failureKind: string;
+  /** Truncated `last_error.message`; the full row keeps the rest. */
+  failureMessage: string;
+  firstFailedDbMs: string;
+  lastFailedDbMs: string;
+  /** Database clock minus firstFailedDbMs: how long this has been stuck. */
+  stuckAgeMs: string;
+  terminalCuts: string;
+  dbTimeMs: string;
+}
+
 /** One unreleased adoption serving pin (pfh.serving_pins_unreleased). */
 export interface ServingPinStatus {
   adoptionId: string;
@@ -657,6 +705,23 @@ export class PostgresHistoryRepository {
       [backlogPercent, limit]
     );
     return rows.map((row) => row.out as GenerationBacklogStatus);
+  }
+
+  /**
+   * Live generations whose history work is terminal (migration 034), oldest
+   * stuck first, bounded. A read-only MVCC projection: it takes no lock and
+   * never enters the append lock order, so it is safe on every cycle of every
+   * replica.
+   *
+   * This is the query that did not exist while production logged "adoption is
+   * blocked until an operator intervenes" once a minute for days.
+   */
+  async stuckRecoveryGenerations(limit = 32): Promise<StuckRecoveryGeneration[]> {
+    const { rows } = await this.pool.query(
+      `SELECT pfj.stuck_recovery_generations($1) AS out`,
+      [limit]
+    );
+    return rows.map((row) => row.out as StuckRecoveryGeneration);
   }
 
   /** Unreleased adoption serving pins, oldest-first (bounded). */

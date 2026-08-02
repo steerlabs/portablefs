@@ -292,7 +292,7 @@ func (v *Volume) Setxattr(ctx context.Context, path string, n *NodeState, name s
 func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, name string, value []byte, flags uint8) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.EIO
+		return statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they
@@ -338,7 +338,7 @@ func (v *Volume) SetxattrFlags(ctx context.Context, path string, n *NodeState, n
 func (v *Volume) Removexattr(ctx context.Context, path string, n *NodeState, name string) Status {
 	ctx = withHardlinkAdmissionIdentities(ctx, n)
 	if err := v.beginMutation(ctx); err != nil {
-		return fsproto.EIO
+		return statusErr(err)
 	}
 	defer v.endMutation()
 	// This operation's own mutation replies carry the post-op attributes; they

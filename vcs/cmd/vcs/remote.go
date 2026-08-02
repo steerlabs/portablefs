@@ -260,7 +260,57 @@ func runRemotePrimary(ctx context.Context, client *backend.Client, cfg config) e
 	wfs.SetDirtyRSSMax(dirtyMax)
 	log.Printf("remote primary: proven %s base commit %s + %d journal records replayed (generation %s, epoch %d), exclusive lease (%dms) held, dirty-block bound %d MiB (%d MiB resident after replay)",
 		resolved.proof.Kind, baseCommit, rlog.Watermark()-rlog.CompactedThrough(), rlog.GenerationID(), rlog.Epoch(), cfg.leaseTTLms, dirtyMax>>20, wfs.DirtyBlockBytes()>>20)
+	logBindingWriteBound(dirtyMax, rlog.QuotaBytes())
 	return serveRemotePrimary(ctx, cfg, wfs, auth, rlog, guard, policyHash, leaseLost)
+}
+
+// logBindingWriteBound names WHICH of the two write-admission bounds this
+// generation will actually hit first, because they are bounds on different
+// resources with different relief and only one of them has a driver.
+//
+//	journal backlog quota   durable bytes in PFJ3. RELIEVABLE: the volume-api's
+//	                        history-maintenance loop scans generations past
+//	                        PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT of
+//	                        THIS number, creates a recovery cut, and adoption
+//	                        subtracts the backlog. That loop is the only driver
+//	                        of journal shrink, and this is the only quantity it
+//	                        watches.
+//
+//	dirty-block bound       resident RAM in THIS child. NOT RELIEVABLE by that
+//	                        loop, or by anything else running: the managed child
+//	                        has no in-process checkpoint, and cut adoption
+//	                        advances the journal base without rebinding this
+//	                        child's inodes to it — so its resident blocks are
+//	                        released only by truncate/remove/reap.
+//
+// When the dirty bound is the smaller of the two it is the BINDING one, and a
+// volume that keeps what it writes reaches it with the maintenance loop still
+// well below its trigger, having seen nothing. That is not a tuning nit: it is
+// the difference between a bound that gets folded and a bound that just
+// arrives. Sustained writes past it now fail as a definite ENOSPC (fsproto's
+// quota classification) rather than stalling, but failing is still the outcome,
+// so the relationship belongs in the startup record where an operator sizing a
+// container can see it.
+func logBindingWriteBound(dirtyMax, journalQuota int64) {
+	switch {
+	case dirtyMax <= 0:
+		log.Printf("remote primary: write-admission bound = journal backlog quota %d MiB "+
+			"(resident dirty blocks unbounded: VCS_DIRTY_RSS_MAX_MB disabled)", journalQuota>>20)
+	case journalQuota <= 0:
+		log.Printf("remote primary: write-admission bound = resident dirty blocks %d MiB "+
+			"(journal quota unknown); relief is truncate/remove only", dirtyMax>>20)
+	case dirtyMax < journalQuota:
+		log.Printf("remote primary: BINDING write-admission bound is RESIDENT DIRTY BLOCKS "+
+			"(%d MiB), reached at %d%% of the %d MiB journal backlog quota. The history-cut "+
+			"maintenance loop triggers on journal backlog only, so it will not have acted; "+
+			"relief for this bound is truncate/remove/reap on this volume, and sustained "+
+			"writes past it are refused ENOSPC.",
+			dirtyMax>>20, dirtyMax*100/journalQuota, journalQuota>>20)
+	default:
+		log.Printf("remote primary: binding write-admission bound is the journal backlog "+
+			"quota (%d MiB), reached before the %d MiB dirty-block bound; history-cut "+
+			"adoption is its relief", journalQuota>>20, dirtyMax>>20)
+	}
 }
 
 type remoteBaseIdentity struct {

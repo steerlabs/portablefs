@@ -85,6 +85,36 @@ export async function routeAdminHistoryRequest(
       sendJson(res, 200, outcome);
       return;
     }
+    // GET /v1/admin/history/stuck — the query that did not exist while
+    // production logged "adoption is blocked until an operator intervenes"
+    // once a minute for days on one generation, naming only a cut id. Each
+    // row carries the tenant/volume/branch/generation, the recorded failure,
+    // how long it has been stuck, and the boundary that was never installed.
+    // A repository on a pre-034 lineage answers 501 rather than an empty
+    // list: "nothing is stuck" and "I cannot tell" must not look alike.
+    if (method === "GET" && rest.length === 1 && rest[0] === "stuck") {
+      if (typeof history.stuckRecoveryGenerations !== "function") {
+        sendJson(res, 501, {
+          error: {
+            code: "HISTORY_STUCK_SURVEY_UNAVAILABLE",
+            message:
+              "This deployment's metadata lineage predates migration 034; stuck generations cannot be enumerated.",
+          },
+        });
+        return;
+      }
+      const limitParam = url.searchParams.get("limit");
+      const limit = limitParam === null ? 32 : Number(limitParam);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+        throw new MetadataConflictError(
+          "HISTORY_LIMIT_INVALID",
+          "limit must be an integer in 1..256.",
+          400
+        );
+      }
+      sendJson(res, 200, { stuck: await history.stuckRecoveryGenerations(limit) });
+      return;
+    }
     sendJson(res, 404, { error: { code: "VOLUME_NOT_FOUND", message: "Route not found." } });
   } catch (error) {
     sendHistoryError(res, error);

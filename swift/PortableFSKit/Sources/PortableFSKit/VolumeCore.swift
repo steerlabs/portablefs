@@ -487,18 +487,68 @@ public actor VolumeCore {
                 return result
             }
 
+            // ── COMMITTED PROGRESS OUTRANKS THE ERROR THAT FOLLOWED IT ──────
+            //
+            // One framework write callback becomes SEVERAL daemon requests, and
+            // every one of them is separately acknowledged: by the time chunk k
+            // fails, chunks 0..<k are already in the mount's stream WAL (or at
+            // the authority) and are as durable as anything this stack ever
+            // promises. Throwing here discarded that count and the adapter
+            // replied `(0, error)` — telling the kernel that nothing at all was
+            // written about bytes that are on media.
+            //
+            // That is a lie in the direction POSIX is least forgiving of, and
+            // the daemon already refuses to tell it on its own half of the same
+            // boundary: "A host short write reports both a count and an error.
+            // The count is committed progress and outranks the error for exactly
+            // the reason a post-commit failure does: reporting zero invites a
+            // retry that duplicates an append." (portablefsd/ops.go, attach.write).
+            // The two ends of one wire must not disagree about what a partially
+            // completed write looks like.
+            //
+            // So a failure that arrives with committed bytes behind it is
+            // reported as a SHORT WRITE, not as a failure. Nothing is swallowed:
+            // the kernel reissues the remainder as a fresh callback, that
+            // callback starts at totalWritten == 0, and whatever is still wrong
+            // surfaces there as the error it is — plus at the next fsync,
+            // synchronize or unmount barrier, which are the drain barriers this
+            // mount's durability contract is actually written about. An error is
+            // thrown from here only when NOTHING committed, which is the one
+            // case where the error is the whole truth.
             var totalWritten = 0
             var currentOffset = offset
             var latestAttr: PfsAttr?
             let chunkSize = ioChunkSize()
+
+            let fallbackAttr = openHandles[objectID]?.attrSnapshot ?? PfsAttr()
+            func committed() -> (written: UInt32, attr: PfsAttr) {
+                (UInt32(clamping: totalWritten), latestAttr ?? fallbackAttr)
+            }
+
             while totalWritten < data.count {
                 let end = min(data.count, totalWritten + chunkSize)
                 let chunk = data.subdata(in: totalWritten..<end)
-                let result = try await writeChunk(handle: handle, offset: currentOffset, data: chunk)
+                let result: (written: UInt32, attr: PfsAttr)
+                do {
+                    result = try await writeChunk(handle: handle, offset: currentOffset, data: chunk)
+                } catch {
+                    if totalWritten > 0 {
+                        return committed()
+                    }
+                    throw error
+                }
                 latestAttr = result.attr
                 rememberAttrSnapshot(result.attr, for: objectID)
                 let written = Int(result.written)
                 if written <= 0 {
+                    // A non-empty chunk that committed nothing and reported no
+                    // errno. The daemon refuses to produce this outcome
+                    // (attach.write answers EIO for it), so reaching here means
+                    // the invariant broke — but whatever earlier chunks
+                    // committed is still committed.
+                    if totalWritten > 0 {
+                        return committed()
+                    }
                     throw PfsLocalClientError.daemon(
                         errno: EIO,
                         message: "daemon write made no progress"
@@ -510,10 +560,7 @@ public actor VolumeCore {
                     break
                 }
             }
-            return (
-                UInt32(clamping: totalWritten),
-                latestAttr ?? openHandles[objectID]?.attrSnapshot ?? PfsAttr()
-            )
+            return committed()
         }
     }
 

@@ -94,7 +94,15 @@ func TestProvenContradictionStaysTerminal(t *testing.T) {
 func TestUnclassifiedStatusIsRetriedNotLatched(t *testing.T) {
 	// 5 is the authority's catch-all (the live trigger); 250 stands for any
 	// status a future authority adds that this client does not know.
-	for _, status := range []int32{5, 28, 250} {
+	//
+	// 28 (ENOSPC) used to sit in this list and no longer does. That was not a
+	// tightening of the rule but a correction of a MISCLASSIFICATION: 28 is not
+	// a status this client cannot interpret, it is the authority's named answer
+	// for a full bounded store, and holding a named capacity refusal as a
+	// transient is what wedged production at the dirty-block bound. It is now
+	// covered by TestCapacityStatusIsDefiniteNotRetriedForever, which asserts
+	// the opposite behaviour for exactly that reason.
+	for _, status := range []int32{5, 250} {
 		t.Run("status "+itoa(int(status)), func(t *testing.T) {
 			e, remote := newStatusFixture(t, status)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

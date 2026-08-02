@@ -153,7 +153,7 @@ func (v *Volume) AdmitWrite(
 		// must leave delegated mode before the write. admitAuthorityLane
 		// releases exactly that set (hardlinkMutationPaths) out here, so the
 		// release inside the locks has nothing left to drain.
-		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want)
+		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want, writeback.DoorIdentity)
 	}
 	if v.authorityOnlyByIdentity(path, n) {
 		// Identity, not pathname, decides this. An orphaned inode is addressed
@@ -168,11 +168,41 @@ func (v *Volume) AdmitWrite(
 		// (Volume.Write routes an orphan to the inode-addressed lane and a
 		// pathless handle to WriteExactHandle), so there is no locked-region
 		// transition to protect.
-		return writeback.WithResolvedLane(opCtx, writeback.LaneAuthority),
-			want, func() { cancelDeadline() }, nil
+		//
+		// It still passes through the lane's gate. "The overlay cannot
+		// represent this inode" is a statement about ROUTING; it says nothing
+		// about durability, and an orphan's bytes are acknowledged out of the
+		// same session, discarded by the same fence, and invisible to the same
+		// WAL-derived checks as everything else on this lane.
+		granted, charged, cerr := v.chargeAuthorityLane(opCtx, want, writeback.DoorIdentity)
+		if cerr != nil {
+			return fail(cerr)
+		}
+		return writeback.WithResolvedLane(charged, writeback.LaneAuthority),
+			granted, func() {
+				v.wb.SettleAuthorityCharge(charged)
+				cancelDeadline()
+			}, nil
 	}
 	if forceAuthority {
-		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want)
+		// THE UNWIND'S TERMINATING SECOND PASS.
+		//
+		// It resolves the authority lane unconditionally, and that is correct:
+		// a delegated answer could be invalidated again, and this pass must
+		// terminate. What it is NOT is ungated. Resolving a lane without a
+		// recall to fear is a routing guarantee; it was never an admission
+		// exemption, and reading it as one is what let a saturated mount
+		// convert its own backpressure into unpaced write-through — the door
+		// this round exists to close.
+		//
+		// The pass still terminates, and for a reason that has nothing to do
+		// with how long admission takes: ErrLaneChanged is produced for exactly
+		// one input, a ctx resolved to LaneDelegated (writeback.admitDataBytes).
+		// This pass resolves LaneAuthority, so it CANNOT be answered
+		// ErrLaneChanged and cannot unwind a third time however long it waits.
+		// The two-pass bound is a property of the lane, not of the speed of
+		// admission.
+		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want, writeback.DoorForced)
 	}
 
 	// Resolve the delegated lane, paying any transition it needs out here.
@@ -181,7 +211,7 @@ func (v *Volume) AdmitWrite(
 		return fail(err)
 	}
 	if !delegated {
-		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want)
+		return v.admitAuthorityLane(opCtx, cancelDeadline, path, n, want, writeback.DoorUncovered)
 	}
 	return v.admitDelegatedLane(opCtx, cancelDeadline, path, n, want)
 }
@@ -226,6 +256,7 @@ func (v *Volume) admitDelegatedLane(
 	for {
 		granted, err := v.wb.AcquireDataCredit(admitCtx, want)
 		if granted > 0 {
+			v.wb.NoteDelegatedAdmission(int64(granted))
 			opCtx := writeback.WithResolvedLane(
 				writeback.WithDataCredit(ctx, granted), writeback.LaneDelegated)
 			return opCtx, granted, func() {
@@ -283,7 +314,44 @@ func (v *Volume) divertAfterCreditBudget(
 		cancelDeadline()
 		return ctx, 0, func() {}, writeback.ErrUplinkStalled
 	}
-	return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want)
+	return v.admitAuthorityLane(ctx, cancelDeadline, path, n, want, writeback.DoorBudget)
+}
+
+// chargeAuthorityLane is the authority lane's admission, and the reason no lane
+// is uncharged any more.
+//
+// It exists as its own step because the lane's two costs are paid to different
+// creditors. The DELEGATION RELEASE below is paid to the frontend's locks — it
+// is why this whole classifier is pre-lock. The ADMISSION CHARGE is paid to
+// durability: every byte the authority acknowledges is a byte held by a session
+// that a fence discards, so the mount has to bound how many of them it is
+// carrying and has to be able to name them afterwards. The stream lane has
+// bounded and named its bytes since the credit gate existed; this lane did
+// neither, and the difference was 734 MiB nobody could account for.
+//
+// A short grant is normal here for exactly the reason it is normal on the other
+// lane: it becomes a POSIX short write, the kernel reissues the remainder as a
+// fresh operation, and the write COMPLETES paced instead of failing.
+func (v *Volume) chargeAuthorityLane(
+	ctx context.Context, want int, door writeback.LaneDoor,
+) (int, context.Context, error) {
+	// The CHOICE is recorded here and the BYTES after the gate answers: a write
+	// that picks this door and is then refused took the door but admitted
+	// nothing, and a tally that credited it the request's bytes would report
+	// traffic that never happened.
+	v.wb.NoteLaneDoorChoice(door)
+	granted, err := v.wb.AdmitAuthorityBytes(ctx, int64(want))
+	if err != nil {
+		return 0, ctx, err
+	}
+	if granted <= 0 {
+		// The gate's contract forbids this (zero-with-nil-error is not a signal
+		// any kernel write path can act on). Treat a violation as the typed
+		// condition rather than returning a success no caller can use.
+		return 0, ctx, writeback.ErrAuthorityUnproven
+	}
+	v.wb.NoteLaneDoorAdmitted(door, granted)
+	return int(granted), writeback.WithAuthorityCharge(ctx, granted), nil
 }
 
 // admitAuthorityLane resolves the authority lane and PAYS FOR IT out here: it
@@ -317,28 +385,51 @@ func (v *Volume) admitAuthorityLane(
 	path string,
 	n *NodeState,
 	want int,
+	door writeback.LaneDoor,
 ) (context.Context, int, func(), error) {
 	noop := func() {}
+	// Charge FIRST, before the transition claim and the release.
+	//
+	// The order is load-bearing. A charge taken after the claim would hold the
+	// claim — which excludes every delegation acquisition on these paths —
+	// across a wait for the far end to prove its backlog, so a slow authority
+	// would block delegation transitions mount-wide. Taken here the wait holds
+	// nothing at all, which is the same property the delegated lane's credit
+	// wait has and the same reason this classifier is pre-lock in the first
+	// place.
+	granted, charged, cerr := v.chargeAuthorityLane(ctx, want, door)
+	if cerr != nil {
+		cancelDeadline()
+		return ctx, 0, noop, cerr
+	}
+	releaseCharge := func() { v.wb.SettleAuthorityCharge(charged) }
+
 	var nodes []*NodeState
 	if n != nil {
 		nodes = []*NodeState{n}
 	}
-	token, paths, endToken, err := v.beginTransitionToken(ctx, nodes, path)
+	token, paths, endToken, err := v.beginTransitionToken(charged, nodes, path)
 	if err != nil {
+		releaseCharge()
 		cancelDeadline()
 		return ctx, 0, noop, err
 	}
 	settle := func() {
+		// The charge settles LAST: whatever the authority acknowledged was
+		// recorded on this ctx by the code that ran the RPC, and settling
+		// before the token is released would publish an unproven byte count
+		// that a concurrent status read could see as already closed out.
 		endToken()
+		releaseCharge()
 		cancelDeadline()
 	}
-	if err := v.wb.ReleaseFor(ctx, paths...); err != nil {
+	if err := v.wb.ReleaseFor(charged, paths...); err != nil {
 		settle()
 		return ctx, 0, noop, err
 	}
 	return writeback.WithResolvedLane(
-		withTransitionToken(ctx, token), writeback.LaneAuthority,
-	), want, settle, nil
+		withTransitionToken(charged, token), writeback.LaneAuthority,
+	), granted, settle, nil
 }
 
 // ReleaseDataCredit refunds whatever of opCtx's grant the engine never turned

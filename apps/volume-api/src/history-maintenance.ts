@@ -8,6 +8,7 @@ import {
   type JournalReclaimCandidate,
   type JournalReclaimResult,
   type ServingPinStatus,
+  type StuckRecoveryGeneration,
   type VolumeRetirementTask,
 } from "@portablefs/metadata-db";
 import { intEnv } from "./config.js";
@@ -35,6 +36,11 @@ import type { VolumeApiTelemetry } from "./telemetry.js";
 //      (generation, base) — replays (crash, restart, a concurrent replica)
 //      return the recorded outcome instead of minting a second cut. Exact-
 //      once is by construction, not by in-memory tracking.
+//   2b. If that cut is TERMINAL (failed/canceled), walk the revision chain:
+//      the SAME deterministic scheme with an explicit revision suffix
+//      (hcut-<generation>-<base>-r<N>) drives a BOUNDED re-cut. See
+//      "TERMINAL RECOVERY CUTS" below — this is the step whose absence made
+//      one dead cut log forever with adoption blocked.
 //   3. When the cut reports ready, adopt it (anchor + serving capability)
 //      under the deterministic id hadopt-<cutId>: an operation replay is a
 //      recorded no-op, so a crash between adopt and ack replays cleanly.
@@ -50,6 +56,51 @@ import type { VolumeApiTelemetry } from "./telemetry.js";
 // rows that vanished between scan and call) are counted, never logged as
 // errors. Real failures (policy missing, dead-lettered cuts) are logged with
 // their typed code and surface in the per-cycle counters.
+//
+// TERMINAL RECOVERY CUTS (the 60-second log loop this replaces).
+//
+// A recovery cut can reach 'failed'. Before this pass existed, that was a
+// dead end with no exit at all: the operation id hcut-<generation>-<base> is
+// a permanent database row, and the base seq only advances THROUGH adoption,
+// so every later cycle replayed the same recorded operation, read the same
+// failed cut, logged the same line, and gave up. Production did exactly that
+// once a minute for days on one generation, with adoption blocked and its
+// journal unreclaimable, while the cycle counter said only `cutsFailed: 1`.
+//
+// A terminal cut now reaches a DEFINITE outcome, chosen from the failure the
+// worker actually recorded:
+//
+//   * TRANSIENT (last_error.kind 'transient', a dead_letter that exhausted
+//     its 013 attempt budget on transient errors, or an unrecorded kind).
+//     The source is intact; the environment was not. The loop re-cuts the
+//     same boundary under the NEXT revision — pfh.cut_create already mints
+//     dedup_revision = MAX+1 at the same dedup key after a definite failure
+//     — bounded by recoveryCutMaxRevisions and spaced by an exponential
+//     backoff measured on the DATABASE clock. Determinism is preserved:
+//     the revision comes from the cut row, not from a replica's memory, so
+//     every replica derives the same operation id for the same attempt.
+//
+//   * PERMANENT ('corrupt', or an operator's 'canceled'). Re-cutting folds
+//     the same bytes and fails identically — production's cut died on
+//     "journal page at seq 0 is empty below the cut 32", i.e. the captured
+//     range has no records at all. There is no automatic outcome that is not
+//     data loss, so the loop stops trying and reports a TERMINAL, operator-
+//     visible state: the affected tenant/volume/branch/generation, the
+//     recorded failure, how long it has been stuck, and the documented
+//     remedy. Logged on first observation and then at most once per
+//     stuckLogIntervalMs — never once per minute forever.
+//
+// WHY THE JOURNAL IS STILL NOT HOSTAGE. pfj.journal_reclaim_horizon (031)
+// clamps on cuts in ('pending','materializing') only. A cut that might still
+// materialize keeps its read window pinned — deleting under a live fold
+// would corrupt it. A 'failed'/'canceled' cut is excluded, and must be: it
+// can never produce the recovery anchor that gives its window meaning, so
+// clamping on it would pin the prefix on a proof that will never arrive.
+// What actually pins a terminally-stuck generation is that base_seq never
+// advances (the horizon is at most base_seq), and moving a base without an
+// adoption proof is a decision about DATA, not accounting: it discards the
+// tail. That stays an operator action, named in the log line, never
+// something this loop does on its own.
 //
 // DRAIN INVARIANT (see runtime.ts): process shutdown must never checkpoint
 // or block on history work. The loop's timer is unref'd, cycles check the
@@ -70,6 +121,27 @@ export interface HistoryMaintenanceSettings {
   reclaimBatchRows: number;
   /** PORTABLEFS_JOURNAL_RECLAIM_MAX_PAGES — reclaim txns per cycle. */
   reclaimMaxPagesPerCycle: number;
+  /**
+   * PORTABLEFS_HISTORY_RECOVERY_CUT_MAX_REVISIONS — how many times ONE
+   * boundary may be re-cut after a transient failure before the generation
+   * is declared terminal and handed to an operator. The floor is 1 (never
+   * re-cut); the ceiling keeps a permanently broken source from minting cut
+   * rows without bound.
+   */
+  recoveryCutMaxRevisions: number;
+  /**
+   * PORTABLEFS_HISTORY_RECOVERY_CUT_BACKOFF_MS — base spacing before a
+   * failed boundary is re-cut, doubled per revision. Measured on the
+   * database clock, so replicas agree without a shared timer.
+   */
+  recoveryCutBackoffMs: number;
+  /**
+   * PORTABLEFS_HISTORY_STUCK_LOG_INTERVAL_MS — how often ONE stuck
+   * generation may re-log. The first observation always logs; after that
+   * the per-cycle counters carry it. The default is an hour, because the
+   * behaviour this replaces was the same line every 60 seconds forever.
+   */
+  stuckLogIntervalMs: number;
 }
 
 /**
@@ -118,6 +190,30 @@ export function historyMaintenanceSettingsFromEnv(
       64,
       1,
       4_096
+    ),
+    // Terminal recovery-cut lifecycle (migration 034). Three revisions is
+    // deliberately small: a boundary that a fresh cut cannot materialize
+    // three times, five minutes apart and doubling, is not waiting on
+    // weather — it needs a human, and minting more cut rows only grows the
+    // table the reclamation pass is trying to shrink.
+    recoveryCutMaxRevisions: intEnv(
+      env,
+      "PORTABLEFS_HISTORY_RECOVERY_CUT_MAX_REVISIONS",
+      3,
+      1,
+      16
+    ),
+    recoveryCutBackoffMs: intEnv(
+      env,
+      "PORTABLEFS_HISTORY_RECOVERY_CUT_BACKOFF_MS",
+      300_000,
+      1_000
+    ),
+    stuckLogIntervalMs: intEnv(
+      env,
+      "PORTABLEFS_HISTORY_STUCK_LOG_INTERVAL_MS",
+      3_600_000,
+      1_000
     ),
   };
 }
@@ -168,6 +264,15 @@ export interface HistoryMaintenanceStore {
     generationId: string;
     maxRows?: number;
   }): Promise<JournalReclaimResult>;
+  /**
+   * Live generations whose history work is TERMINAL (migration 034).
+   * Optional so an embedder on an older lineage still composes; when absent
+   * the cycle reports it rather than pretending nothing is stuck. This is
+   * the fleet-wide view — the threshold scan only ever sees the generations
+   * that happen to be past a backlog percent, which is why production's
+   * stuck generation was visible as a bare `cutsFailed: 1` and nothing else.
+   */
+  stuckRecoveryGenerations?(limit?: number): Promise<StuckRecoveryGeneration[]>;
 }
 
 /**
@@ -197,7 +302,40 @@ export interface HistoryMaintenanceCycleSummary {
   generationsScanned: number;
   cutsCreated: number;
   cutsPending: number;
+  /** Terminal (failed/canceled) recovery cuts observed, one per generation. */
   cutsFailed: number;
+  /**
+   * Boundaries RE-CUT this cycle after a transient failure: a fresh dedup
+   * revision was minted under the next deterministic operation id. The
+   * number that was structurally impossible before — a failed cut had no
+   * path forward at all.
+   */
+  cutsRecreated: number;
+  /**
+   * Terminal cuts whose re-cut is deliberately NOT attempted: the recorded
+   * failure is permanent (corrupt source, operator cancel) or the revision
+   * budget is spent. Each one is an operator obligation, logged with its
+   * identity and remedy on first observation.
+   */
+  cutsTerminal: number;
+  /**
+   * Terminal cuts waiting out their re-cut backoff. Distinct from
+   * cutsTerminal on purpose: this cycle chose to wait, not to give up.
+   */
+  cutsRetryDeferred: number;
+  /**
+   * Live generations the 034 survey reports as stuck, FLEET-WIDE — not just
+   * the ones this cycle's backlog scan happened to reach.
+   */
+  stuckGenerations: number;
+  /** Age of the oldest stuck generation, in ms, from the database clock. */
+  oldestStuckAgeMs: number;
+  /**
+   * This store cannot survey stuck generations (migration 034 absent).
+   * Reported per cycle, never as a failure: an older lineage is a deployment
+   * fact, but "nobody can enumerate the blocked volumes" must not be silent.
+   */
+  stuckSurveyUnavailable: boolean;
   adoptionsApplied: number;
   /** Ready cuts NOT adopted because exact history serving is unconfigured. */
   adoptionsBlocked: number;
@@ -289,11 +427,45 @@ export interface HistoryMaintenanceLoopOptions {
   retirementBatch?: number | undefined;
   /** Base backoff before a failed obligation is retried (grows per attempt). */
   retirementBackoffMs?: number | undefined;
+  // ── terminal recovery-cut lifecycle (migration 034) ──────────────────────
+  /** How many revisions ONE boundary may be cut at before it is terminal. */
+  recoveryCutMaxRevisions?: number | undefined;
+  /** Base re-cut spacing, doubled per revision, on the database clock. */
+  recoveryCutBackoffMs?: number | undefined;
+  /** How often one stuck generation may re-log its operator line. */
+  stuckLogIntervalMs?: number | undefined;
+  /** Stuck generations surveyed per cycle (034). */
+  stuckSurveyLimit?: number | undefined;
+  /**
+   * Wall clock, injectable for tests. Used ONLY for log throttling; every
+   * retry decision is measured on database timestamps so replicas agree.
+   */
+  now?: (() => number) | undefined;
 }
 
-/** Deterministic per-(generation, base) cut identity: exact-once by construction. */
-export function recoveryCutOperationId(generationId: string, baseSeq: string): string {
-  return `hcut-${generationId}-${baseSeq}`;
+/**
+ * Deterministic per-(generation, base, revision) cut identity: exact-once by
+ * construction.
+ *
+ * Revision 1 is byte-identical to the pre-034 id (`hcut-<gen>-<base>`) ON
+ * PURPOSE. Those operation rows are permanent and already exist in production
+ * with a frozen request fingerprint; a changed shape would answer PF009
+ * "operation replayed with different content" on every cycle for every
+ * generation, replacing one stuck cut with a fleet-wide one.
+ *
+ * Revisions above 1 are the bounded re-cut of the SAME boundary after a
+ * definite failure. The revision is read off the failed cut row
+ * (dedup_revision, which pfh.cut_create mints as MAX+1 at the dedup key), so
+ * two replicas racing on the same terminal cut derive the same id and dedupe
+ * in the database exactly as revision 1 does.
+ */
+export function recoveryCutOperationId(
+  generationId: string,
+  baseSeq: string,
+  revision = 1
+): string {
+  const base = `hcut-${generationId}-${baseSeq}`;
+  return revision <= 1 ? base : `${base}-r${revision}`;
 }
 
 /** Deterministic per-cut adoption identity: crash/replay is a recorded no-op. */
@@ -305,14 +477,17 @@ export function adoptionOperationId(cutId: string): string {
 // FROZEN: the database fingerprints these bytes permanently, and a replay
 // with different bytes is a typed PF009 conflict — every replica must
 // therefore derive byte-identical requests from the same scan facts.
-function recoveryCutCanonicalJson(row: {
-  tenantId: string;
-  volumeId: string;
-  branchName: string;
-  generationId: string;
-  baseSeq: string;
-}): string {
-  return JSON.stringify({
+function recoveryCutCanonicalJson(
+  row: {
+    tenantId: string;
+    volumeId: string;
+    branchName: string;
+    generationId: string;
+    baseSeq: string;
+  },
+  revision = 1
+): string {
+  const base = {
     v: "1",
     op: "history-maintenance-recovery-cut",
     tenantId: row.tenantId,
@@ -320,7 +495,14 @@ function recoveryCutCanonicalJson(row: {
     branchName: row.branchName,
     generationId: row.generationId,
     baseSeq: row.baseSeq,
-  });
+  };
+  // Revision 1 keeps the EXACT frozen bytes (see recoveryCutOperationId): the
+  // production fingerprints were computed from this object and nothing may be
+  // added to it. A re-cut carries its revision, which is what makes the two
+  // requests legitimately different operations rather than a PF009 conflict.
+  return revision <= 1
+    ? JSON.stringify(base)
+    : JSON.stringify({ ...base, revision: String(revision) });
 }
 
 function adoptionCanonicalJson(input: {
@@ -347,6 +529,81 @@ function adoptionCanonicalJson(input: {
 export function isBenignHistoryRefusal(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
   return code === "PF011" || code === "PF002" || code === "PF007";
+}
+
+/**
+ * How a terminal cut should be treated. The distinction is the whole point of
+ * the lifecycle: "permanent" means a re-cut folds the same bytes and fails
+ * the same way, so attempting one is not recovery, it is a slower infinite
+ * loop that also grows the cut table.
+ */
+export type CutFailureClass = "transient" | "permanent";
+
+interface RecordedCutFailure {
+  kind: string;
+  message: string;
+}
+
+/** The worker's recorded failure, flattened for classification and display. */
+export function recordedCutFailure(cut: {
+  state: string;
+  lastError?: unknown;
+}): RecordedCutFailure {
+  if (cut.state === "canceled") {
+    return { kind: "canceled", message: "canceled by an operator" };
+  }
+  const error = cut.lastError as
+    | { kind?: unknown; message?: unknown; lastError?: { kind?: unknown; message?: unknown } }
+    | null
+    | undefined;
+  const kind = typeof error?.kind === "string" ? error.kind : "unknown";
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (kind === "dead_letter") {
+    // 013's dead letter wraps the error that exhausted the attempt budget.
+    // The WRAPPED kind is the one that decides whether a fresh cut can do
+    // better: sixteen transient failures are still a transient story.
+    const inner = typeof error?.lastError?.kind === "string" ? error.lastError.kind : "unknown";
+    const innerMessage =
+      typeof error?.lastError?.message === "string" ? error.lastError.message : message;
+    return { kind: `dead_letter/${inner}`, message: innerMessage };
+  }
+  return { kind, message };
+}
+
+/**
+ * PERMANENT: 'corrupt' (a definite integrity failure of the captured source —
+ * production's cut died on "journal page at seq 0 is empty below the cut 32",
+ * i.e. the range has no records at all, and no future cut of that range can
+ * find them) and an operator's 'canceled' (a human said stop; the loop must
+ * not quietly undo that).
+ *
+ * TRANSIENT: everything else, INCLUDING an unrecorded kind. The bias is
+ * deliberate — a bounded, backed-off re-cut of a boundary that turns out to
+ * be unrecoverable costs at most recoveryCutMaxRevisions cut rows and then
+ * reports terminal, while wrongly calling a transient failure permanent
+ * strands a writable volume until a human notices.
+ */
+export function classifyCutFailure(cut: { state: string; lastError?: unknown }): CutFailureClass {
+  const { kind } = recordedCutFailure(cut);
+  if (kind === "canceled" || kind === "corrupt" || kind === "dead_letter/corrupt") {
+    return "permanent";
+  }
+  return "transient";
+}
+
+/** dedup_revision as a positive integer; anything unparseable reads as 1. */
+function cutRevision(cut: { dedupRevision?: string }): number {
+  const value = Number(cut.dedupRevision);
+  return Number.isSafeInteger(value) && value >= 1 ? value : 1;
+}
+
+/** A canonical decimal millisecond string as a number; unparseable reads as 0. */
+function decimalMs(value: string | undefined): number {
+  if (value === undefined || !/^(?:0|[1-9][0-9]*)$/u.test(value)) {
+    return 0;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : 0;
 }
 
 function isOperationReplay(
@@ -380,6 +637,12 @@ function emptySummary(): HistoryMaintenanceCycleSummary {
     cutsCreated: 0,
     cutsPending: 0,
     cutsFailed: 0,
+    cutsRecreated: 0,
+    cutsTerminal: 0,
+    cutsRetryDeferred: 0,
+    stuckGenerations: 0,
+    oldestStuckAgeMs: 0,
+    stuckSurveyUnavailable: false,
     adoptionsApplied: 0,
     adoptionsBlocked: 0,
     pinsScanned: 0,
@@ -415,6 +678,17 @@ export class HistoryMaintenanceLoop {
   private readonly retirement: VolumeRetirementDrainStore | undefined;
   private readonly retirementBatch: number;
   private readonly retirementBackoffMs: number;
+  private readonly recoveryCutMaxRevisions: number;
+  private readonly recoveryCutBackoffMs: number;
+  private readonly stuckLogIntervalMs: number;
+  private readonly stuckSurveyLimit: number;
+  private readonly now: () => number;
+  /**
+   * Per-generation log throttle. Bounded: the map is cleared wholesale once
+   * it passes the ceiling, which costs one extra log line per stuck
+   * generation and can never grow without bound on a fleet with many.
+   */
+  private readonly stuckLoggedAt = new Map<string, number>();
   private warnedServingUnconfigured = false;
 
   private stopped = false;
@@ -445,6 +719,23 @@ export class HistoryMaintenanceLoop {
       options.retirementBackoffMs ?? 60_000,
       "retirementBackoffMs"
     );
+    this.recoveryCutMaxRevisions = validatedPositiveInt(
+      options.recoveryCutMaxRevisions ?? 3,
+      "recoveryCutMaxRevisions"
+    );
+    this.recoveryCutBackoffMs = validatedPositiveInt(
+      options.recoveryCutBackoffMs ?? 300_000,
+      "recoveryCutBackoffMs"
+    );
+    this.stuckLogIntervalMs = validatedPositiveInt(
+      options.stuckLogIntervalMs ?? 3_600_000,
+      "stuckLogIntervalMs"
+    );
+    this.stuckSurveyLimit = validatedPositiveInt(
+      options.stuckSurveyLimit ?? 32,
+      "stuckSurveyLimit"
+    );
+    this.now = options.now ?? (() => Date.now());
   }
 
   /** Runs one cycle immediately, then re-arms after each completed cycle. */
@@ -507,6 +798,14 @@ export class HistoryMaintenanceLoop {
         break;
       }
       await this.boundGeneration(row, summary);
+    }
+
+    // The fleet-wide stuck survey (034) runs right after the scan: the
+    // backlog scan only reaches generations past a threshold, and the whole
+    // point of this pass is that a stuck generation must be visible whether
+    // or not it happens to be one of them.
+    if (!this.halted()) {
+      await this.surveyStuckGenerations(summary);
     }
 
     if (!this.halted()) {
@@ -674,6 +973,191 @@ export class HistoryMaintenanceLoop {
     }
   }
 
+  // ── terminal recovery-cut lifecycle (migration 034) ──────────────────────
+
+  /**
+   * Present the deterministic cut-create operation for ONE revision of this
+   * (generation, base) boundary and return the cut it names. `minted` says
+   * whether THIS call created the row (a replay is another replica's — or an
+   * earlier cycle's — recorded outcome, and must not be counted twice).
+   *
+   * Returns undefined for the mid-race shapes the next cycle re-derives: an
+   * operation that exists but records no cut yet, or a cut row that vanished
+   * between the two calls.
+   */
+  private async ensureRecoveryCut(
+    row: GenerationBacklogStatus,
+    revision: number,
+    summary: HistoryMaintenanceCycleSummary
+  ): Promise<{ cut: HistoryCutStatus; minted: boolean } | undefined> {
+    const outcome = await this.store.createCut({
+      tenantId: row.tenantId,
+      volumeId: row.volumeId,
+      branchName: row.branchName,
+      kind: "recovery",
+      operationId: recoveryCutOperationId(row.generationId, row.baseSeq, revision),
+      requestCanonicalJson: recoveryCutCanonicalJson(row, revision),
+      materializerVersion: historyMaterializerVersion,
+      targetIds: { generationId: row.generationId },
+    });
+    if (!isOperationReplay(outcome)) {
+      return { cut: outcome, minted: true };
+    }
+    const cutId = replayCutId(outcome);
+    if (!cutId) {
+      summary.benignRefusals += 1;
+      return undefined;
+    }
+    const status = await this.store.cutStatus(row.tenantId, cutId);
+    if (!status) {
+      summary.benignRefusals += 1;
+      return undefined;
+    }
+    return { cut: status, minted: false };
+  }
+
+  /**
+   * Take a terminal cut to a DEFINITE outcome, and return a live cut when
+   * one now exists (so the caller can go on to adopt it).
+   *
+   * The walk is what makes this stateless and replica-safe. Every cycle
+   * re-enters at revision 1 — the operation row is permanent, so revision 1
+   * always replays the original failed cut — and follows dedup_revision
+   * upward until it finds a live cut, a permanent failure, or the revision
+   * budget. At most recoveryCutMaxRevisions store calls, no memory between
+   * cycles, and two replicas racing derive identical operation ids.
+   */
+  private async resolveTerminalCut(
+    row: GenerationBacklogStatus,
+    terminal: HistoryCutStatus,
+    summary: HistoryMaintenanceCycleSummary
+  ): Promise<HistoryCutStatus | undefined> {
+    summary.cutsFailed += 1;
+    let cut = terminal;
+    for (let hop = 0; hop < this.recoveryCutMaxRevisions; hop += 1) {
+      const revision = cutRevision(cut);
+      if (classifyCutFailure(cut) === "permanent") {
+        this.reportTerminalCut(row, cut, "the recorded failure is permanent", summary);
+        return undefined;
+      }
+      if (revision >= this.recoveryCutMaxRevisions) {
+        this.reportTerminalCut(
+          row,
+          cut,
+          `the re-cut budget of ${this.recoveryCutMaxRevisions} revisions is spent`,
+          summary
+        );
+        return undefined;
+      }
+      // Backoff on the DATABASE clock (the cut carries both its own last
+      // update and the server's current time), so replicas with skewed wall
+      // clocks agree on when the next revision is due.
+      const dbNow = decimalMs(cut.dbTimeMs) || decimalMs(cut.updatedDbMs);
+      const waited = dbNow - decimalMs(cut.updatedDbMs);
+      const due = this.recoveryCutBackoffMs * 2 ** (revision - 1);
+      if (waited < due) {
+        summary.cutsRetryDeferred += 1;
+        return undefined;
+      }
+      const next = await this.ensureRecoveryCut(row, revision + 1, summary);
+      if (!next) {
+        return undefined;
+      }
+      if (next.minted) {
+        summary.cutsRecreated += 1;
+      }
+      if (next.cut.state !== "failed" && next.cut.state !== "canceled") {
+        return next.cut;
+      }
+      cut = next.cut;
+    }
+    this.reportTerminalCut(
+      row,
+      cut,
+      `the re-cut budget of ${this.recoveryCutMaxRevisions} revisions is spent`,
+      summary
+    );
+    return undefined;
+  }
+
+  /**
+   * The fleet-wide stuck survey (034). The threshold scan only ever reaches
+   * generations past a backlog percent, so a stuck generation below it was
+   * invisible; this pass enumerates them all, oldest first, and gives the
+   * cycle line a count and an age instead of a bare `cutsFailed: 1`.
+   */
+  private async surveyStuckGenerations(summary: HistoryMaintenanceCycleSummary): Promise<void> {
+    if (!this.store.stuckRecoveryGenerations) {
+      // A deployment fact, not a failure — reported in the cycle line for
+      // the same reason reclaimUnavailable is: "nobody can enumerate the
+      // blocked volumes" must never be silent.
+      summary.stuckSurveyUnavailable = true;
+      return;
+    }
+    let rows: StuckRecoveryGeneration[] = [];
+    try {
+      rows = await this.store.stuckRecoveryGenerations(this.stuckSurveyLimit);
+    } catch (error) {
+      this.recordFailure(summary, "stuck recovery survey", error);
+      return;
+    }
+    summary.stuckGenerations = rows.length;
+    for (const stuck of rows) {
+      summary.oldestStuckAgeMs = Math.max(summary.oldestStuckAgeMs, decimalMs(stuck.stuckAgeMs));
+      // Counted always, LOGGED only when the same policy the loop applies
+      // says the generation is genuinely an operator's problem. A generation
+      // merely waiting out a re-cut backoff is stuck this instant and fine by
+      // the next cycle; paging on it would rebuild the noise this replaces.
+      if (
+        classifyCutFailure({ state: stuck.cutState, lastError: { kind: stuck.failureKind } }) ===
+          "permanent" ||
+        cutRevision(stuck) >= this.recoveryCutMaxRevisions
+      ) {
+        this.logStuck(stuck.generationId, describeStuckGeneration(stuck));
+      }
+    }
+  }
+
+  /** One terminal cut, with everything an operator needs to act on it. */
+  private reportTerminalCut(
+    row: GenerationBacklogStatus,
+    cut: HistoryCutStatus,
+    reason: string,
+    summary: HistoryMaintenanceCycleSummary
+  ): void {
+    summary.cutsTerminal += 1;
+    const failure = recordedCutFailure(cut);
+    this.logStuck(
+      row.generationId,
+      `PortableFS history maintenance: generation ${row.generationId} is STUCK — recovery cut ` +
+        `${cut.cutId} is ${cut.state} at revision ${cutRevision(cut)} and ${reason}. ` +
+        `tenant=${row.tenantId} volume=${row.volumeId} branch=${row.branchName} ` +
+        `baseSeq=${row.baseSeq} nextSeq=${row.nextSeq} failure=${failure.kind}` +
+        (failure.message ? `: ${failure.message.slice(0, 200)}` : "") +
+        `. Adoption is blocked, so this generation's backlog cannot shrink and its journal ` +
+        `records stay unreclaimable. ${terminalRemedy(failure.kind)}`
+    );
+  }
+
+  /**
+   * Throttled operator logging, keyed by generation. The first observation
+   * always logs; after that the per-cycle counters carry it until
+   * stuckLogIntervalMs elapses. The behaviour this replaces printed the same
+   * line every 60 seconds indefinitely.
+   */
+  private logStuck(generationId: string, message: string): void {
+    const now = this.now();
+    const last = this.stuckLoggedAt.get(generationId);
+    if (last !== undefined && now - last < this.stuckLogIntervalMs) {
+      return;
+    }
+    if (this.stuckLoggedAt.size >= 1024) {
+      this.stuckLoggedAt.clear();
+    }
+    this.stuckLoggedAt.set(generationId, now);
+    this.log(message);
+  }
+
   // Drive one backlogged generation one step forward: ensure its recovery
   // cut exists (deterministic id; replay-safe), and adopt it once ready.
   private async boundGeneration(
@@ -681,52 +1165,29 @@ export class HistoryMaintenanceLoop {
     summary: HistoryMaintenanceCycleSummary
   ): Promise<void> {
     try {
-      const outcome = await this.store.createCut({
-        tenantId: row.tenantId,
-        volumeId: row.volumeId,
-        branchName: row.branchName,
-        kind: "recovery",
-        operationId: recoveryCutOperationId(row.generationId, row.baseSeq),
-        requestCanonicalJson: recoveryCutCanonicalJson(row),
-        materializerVersion: historyMaterializerVersion,
-        targetIds: { generationId: row.generationId },
-      });
+      const first = await this.ensureRecoveryCut(row, 1, summary);
+      if (!first) {
+        return;
+      }
+      let cut = first.cut;
+      if (first.minted && cut.state === "pending") {
+        summary.cutsCreated += 1;
+      }
 
-      let cut: HistoryCutStatus;
-      if (isOperationReplay(outcome)) {
-        const cutId = replayCutId(outcome);
-        if (!cutId) {
-          // The operation exists but records no cut yet — only observable
-          // mid-race; the next cycle re-derives everything from the database.
-          summary.benignRefusals += 1;
+      if (cut.state === "failed" || cut.state === "canceled") {
+        // The dead end this loop used to log once a minute forever. Walk the
+        // revision chain to a definite outcome: a bounded re-cut when the
+        // recorded failure is transient, a terminal operator obligation when
+        // it is not.
+        const resolved = await this.resolveTerminalCut(row, cut, summary);
+        if (!resolved) {
           return;
         }
-        const status = await this.store.cutStatus(row.tenantId, cutId);
-        if (!status) {
-          summary.benignRefusals += 1;
-          return;
-        }
-        cut = status;
-      } else {
-        cut = outcome;
-        if (cut.state === "pending") {
-          summary.cutsCreated += 1;
-        }
+        cut = resolved;
       }
 
       if (cut.state === "pending" || cut.state === "materializing") {
         summary.cutsPending += 1;
-        return;
-      }
-      if (cut.state === "failed" || cut.state === "canceled") {
-        // Permanent for this (generation, base): the worker dead-lettered or
-        // an operator canceled. Not a race — surface it for operators (the
-        // admin history routes drive the same machinery manually).
-        summary.cutsFailed += 1;
-        this.log(
-          `PortableFS history maintenance: recovery cut ${cut.cutId} for generation ` +
-            `${row.generationId} is ${cut.state}; adoption is blocked until an operator intervenes.`
-        );
         return;
       }
 
@@ -843,6 +1304,52 @@ function safeCount(decimal: string): number {
   }
   const value = Number(decimal);
   return Number.isSafeInteger(value) ? value : 0;
+}
+
+/**
+ * The documented operator action for a terminal recovery cut. A log line that
+ * says "an operator must intervene" without saying WITH WHAT is the defect
+ * this replaces, so every branch here names a concrete next step.
+ */
+export function terminalRemedy(failureKind: string): string {
+  if (failureKind === "canceled") {
+    return (
+      "REMEDY: an operator canceled this cut, so the loop will not re-cut it. " +
+      "Create a replacement cut through POST /v1/admin/history/cuts with a fresh operationId " +
+      "once the reason for the cancel is resolved."
+    );
+  }
+  if (failureKind === "corrupt" || failureKind === "dead_letter/corrupt") {
+    return (
+      "REMEDY: the captured journal range cannot be folded, so re-cutting it can never " +
+      "succeed — check pfj.journal_records for this generation (a range with no rows below " +
+      "the cut is the shape production hit). Restore the missing records from a control-store " +
+      "backup and re-cut, or, if the data is genuinely gone, retire the volume " +
+      "(DELETE /v1/volumes/:id) which releases the whole journal through the 033 retirement " +
+      "transition. Nothing here is safe to automate: both paths change what the branch holds."
+    );
+  }
+  return (
+    "REMEDY: inspect pfh.history_cuts.last_error for this generation, clear the underlying " +
+    "failure (history worker health, object-store reachability, replication policy), then " +
+    "drive a fresh cut through POST /v1/admin/history/cuts with a new operationId."
+  );
+}
+
+/** One survey row rendered as the operator line for that generation. */
+function describeStuckGeneration(stuck: StuckRecoveryGeneration): string {
+  const ageMinutes = Math.floor(decimalMs(stuck.stuckAgeMs) / 60_000);
+  return (
+    `PortableFS history maintenance: generation ${stuck.generationId} is STUCK — cut ` +
+    `${stuck.cutId} is ${stuck.cutState} at revision ${stuck.dedupRevision} ` +
+    `(${stuck.terminalCuts} terminal cut(s), stuck ${ageMinutes} min). ` +
+    `tenant=${stuck.tenantId} volume=${stuck.volumeId} branch=${stuck.branchName} ` +
+    `baseSeq=${stuck.baseSeq} nextSeq=${stuck.nextSeq} ` +
+    `backlogRecords=${stuck.backlogRecords} failure=${stuck.failureKind}` +
+    (stuck.failureMessage ? `: ${stuck.failureMessage}` : "") +
+    `. Adoption is blocked and this generation's journal stays unreclaimable. ` +
+    `${terminalRemedy(stuck.failureKind)}`
+  );
 }
 
 function validatedPositiveInt(value: number, name: string): number {

@@ -23,8 +23,57 @@ import (
 // The bound follows the journal control-reserve philosophy: only tree WRITES
 // (the sole dirty-block allocators) are refused at the bound. Reads, deletes,
 // truncates, metadata ops, control rows (exactness outcomes, session
-// lifecycle, lock releases), and anything that RELEASES memory keep working,
-// so a volume at the bound stays recoverable — never wedged.
+// lifecycle, lock releases), and anything that RELEASES memory keep working
+// (TestDirtyBoundManagedRefusesReleasesAndReplays).
+//
+// ── WHAT THAT DOES AND DOES NOT PROMISE (round 18g) ─────────────────────────
+//
+// This file used to end that sentence with "so a volume at the bound stays
+// recoverable — never wedged." That claim was false, and production collected
+// the receipt: at the bound, `rm` on the offending file returned EIO, and so
+// did `ls`. The admissibility above is real, but admissibility is a statement
+// about THIS package. Reaching it takes a whole live mount, and the mount was
+// already gone.
+//
+// The gap is that NOTHING FOLDS A LIVE GENERATION'S DIRTY POOL. On the managed
+// path there is no in-process checkpoint (MarkClean has no production caller
+// there), and the external HistoryCut that does materialise the content
+// advances the journal base without rebinding THIS child's inodes to it — so
+// the counter is monotone for the life of the child except for
+// truncate/remove/reap. A write-back client that keeps writing therefore does
+// not approach the bound and get held; it arrives, and every re-offer of the
+// refused batch is refused identically. Answering that with EAGAIN wedged the
+// mount: the watermark froze, the no-progress watchdog latched, and the
+// releasing operation the paragraph above is so careful to keep admissible
+// became unissuable before anyone could issue it.
+//
+// So the honest statement of the contract is:
+//
+//   - The refusal is DEFINITE, and it now says so. fsproto classifies it
+//     identically on the exact path and the write-back flush path (one
+//     classifier, quotaErrno), the client parks the stream instead of retrying
+//     forever, and the application gets ENOSPC — the errno for exactly this.
+//   - Relief is admissible but not automatic, and it is not reachable from a
+//     mount whose stream has already parked. A volume that reaches the bound
+//     needs its blocks released through a path that is still live (another
+//     mount, the volume API) or a new base adopted and a child restarted on it.
+//   - On a MANAGED authority, "remove" is not relief. applyManagedMutation
+//     parks the detached inode on every successful unlink — OpReap is its only
+//     destruction transition — and a parked orphan keeps every dirty block it
+//     had. TRUNCATE is the releasing operation; `rm` returns nothing until the
+//     last close reaps. TestManagedFlushAtDirtyBoundStillAdmitsRelease pins
+//     which of the two actually works.
+//   - A volume that does not reach the bound stays healthy. Sizing is the
+//     operator's lever, and the startup record now names which of the two
+//     write-admission bounds — this one or the journal backlog quota — is the
+//     binding one for the generation (cmd/vcs logBindingWriteBound).
+//
+// Making a healthy volume NEVER reach the bound needs the fold that does not
+// exist yet: on history-cut adoption the live child must re-resolve the new
+// base and MarkClean every inode whose content it now contains (the dirtyEpoch
+// guard already handles the racing writer). The child holds a content.BlobReader
+// and can read the adopted base, so this is buildable without giving it write
+// access to the object store — it is simply not built.
 //
 // The counter is the sum of len() over every dirty block buffer. A truncate
 // that trims a boundary block keeps the buffer's backing capacity for the
@@ -40,7 +89,10 @@ var (
 // ErrDirtyRSSCapacity reports a write refused because it would push resident
 // dirty-block bytes past the configured bound. It is a DEFINITE
 // pre-reservation rejection: nothing was journaled or applied, and the next
-// truncate/remove (or an external checkpoint fold) reopens admission.
+// truncate (or reap — on a managed authority a bare remove only PARKS the
+// inode) on this volume reopens admission. Nothing ELSE reopens it — see the
+// fold discussion above; an external history cut relieves the journal, not
+// this counter.
 var ErrDirtyRSSCapacity error = dirtyRSSCapacityError{}
 
 type dirtyRSSCapacityError struct{}
@@ -51,9 +103,14 @@ func (dirtyRSSCapacityError) Error() string {
 
 // Unwrap chains the refusal into the existing capacity vocabulary instead of
 // minting a new wire mapping: ErrWALCapacity is what the protocol layer's
-// quota classifier already records as a definite, durable ENOSPC exact
-// outcome (through the journal control reserve), and syscall.ENOSPC is what
-// every generic errno mapper translates for legacy surfaces.
+// quota classifier (fsproto quotaErrno) turns into a definite ENOSPC — on the
+// EXACT path as a durable outcome through the journal control reserve, and on
+// the WRITE-BACK FLUSH path as the definite status the client parks on — and
+// syscall.ENOSPC is what every generic errno mapper translates for legacy
+// surfaces. The flush arm of that classification did not exist until round
+// 18g; without it this chain terminated in coordinate.go's EAGAIN catch-all
+// and the whole "definite" property above was unobservable to any client that
+// wrote through a delegation.
 func (dirtyRSSCapacityError) Unwrap() []error { return []error{ErrWALCapacity, syscall.ENOSPC} }
 
 // SetDirtyRSSMax bounds resident dirty-block bytes (0 or negative =

@@ -461,6 +461,23 @@ data-plane surface on the worker.
 The same worker process runs independent maintenance loops, all fenced
 through database claims:
 
+> **Liveness never queues behind the work (migration 036).** Every claim
+> function used to open by upserting its `(worker_kind, worker_id)` row in
+> `pfh.worker_heartbeats`, holding it until COMMIT, while `pfh.worker_beat`
+> wrote all four kinds' rows in one transaction. With one deployed worker id
+> and four rows, that serialized the whole plane through the heartbeat table:
+> measured with `pg_blocking_pids`, `cut_claim` blocked by `worker_beat`
+> blocked by `repair_claim` — three functions, three different rows, one
+> chain, 913 ms and 708 ms against a 5 s `lock_timeout`. The heartbeat write
+> is now `pfh.worker_touch`, which takes the row with `FOR UPDATE SKIP
+> LOCKED` and skips rather than waits. Skipping loses nothing: the only
+> possible holder is another in-flight transaction of the SAME worker for the
+> SAME kind, which is itself writing a fresh beat, and the write is monotonic
+> so a late beat can never regress one. `worker_beat` reports `skippedKinds`.
+> The work-item claims themselves were always correct — `pfh.cut_claim` and
+> `pfh.sweep_claim` distribute with `FOR UPDATE SKIP LOCKED`, `repair_claim`
+> with a conditional lease upsert — and none of that changed.
+
 **Scrub** claims due copies and verifies each against its own recorded exact
 key in its own failure domain, streaming with constant memory. Proven
 absence or a content mismatch is a definite negative receipt; transport
@@ -574,7 +591,73 @@ Two operational properties of adoption worth knowing:
 
 Admin routes under `/v1/admin/history/*` (admin token) expose the same
 caller surface for manual drives and inspection: `POST /cuts`,
-`GET /cuts/:cutId?tenantId=...`, `POST /cuts/:cutId/adopt`.
+`GET /cuts/:cutId?tenantId=...`, `POST /cuts/:cutId/adopt`,
+`GET /stuck?limit=N`.
+
+### A recovery cut that cannot be re-cut
+
+A recovery cut can reach `failed`. Before migration 035 that was a dead end
+with no exit: the deterministic operation id `hcut-<generation>-<baseSeq>` is
+a permanent row, and the base seq only advances THROUGH adoption, so every
+later maintenance cycle replayed the same recorded operation, read the same
+failed cut, logged `adoption is blocked until an operator intervenes`, and
+gave up — once a minute, indefinitely, with that generation's backlog frozen
+and its journal records unreclaimable.
+
+The lifecycle now ends somewhere definite, chosen from the failure the worker
+recorded on the cut row (`pfh.history_cuts.last_error`):
+
+- **Transient** (`transient`, a `dead_letter` that exhausted its attempt
+  budget on transient errors, or an unrecorded kind) — the source is intact
+  and the environment was not. The loop re-cuts the same boundary under the
+  next dedup revision (`hcut-<generation>-<baseSeq>-r<N>`), bounded by
+  `PORTABLEFS_HISTORY_RECOVERY_CUT_MAX_REVISIONS` (default 3) and spaced by
+  `PORTABLEFS_HISTORY_RECOVERY_CUT_BACKOFF_MS` (default 5 min, doubling per
+  revision, measured on the database clock so replicas agree). Counted as
+  `cutsRecreated` / `cutsRetryDeferred`.
+- **Permanent** (`corrupt`, or an operator's `canceled`) — re-cutting folds
+  the same bytes and fails identically. The loop stops and reports a
+  TERMINAL, operator-visible state: `cutsTerminal` in the cycle line, plus one
+  log line carrying the tenant, volume, branch, generation, cut, revision,
+  recorded failure and remedy. That line repeats at most once per
+  `PORTABLEFS_HISTORY_STUCK_LOG_INTERVAL_MS` (default 1 h) per generation.
+
+`GET /v1/admin/history/stuck` (and `pfj.stuck_recovery_generations`) lists
+every live generation whose newest cut past its base is terminal with nothing
+in flight, oldest first, with the identity, the flattened failure kind and the
+age. `stuckGenerations` / `oldestStuckAgeMs` in the per-cycle telemetry are the
+same set, fleet-wide.
+
+**Operator actions.**
+
+- `corrupt` — the captured journal range cannot be folded. Production's case
+  was exact: `journal page at seq 0 is empty below the cut 32`, on a
+  generation whose 32 append receipts all survived in
+  `pfj.journal_append_receipts` while `pfj.journal_records` held zero rows for
+  it. Check the records for that generation. If they can be restored from a
+  control-store backup, restore them and drive a fresh cut through
+  `POST /v1/admin/history/cuts` with a new `operationId`. If the data is
+  genuinely gone, the only way to release the journal is to retire the volume
+  (`DELETE /v1/volumes/:id`), which drives every generation terminal through
+  the 033 retirement transition. Neither is automated: both change what the
+  branch holds.
+- `canceled` — a human stopped this cut, so the loop will not undo that.
+  Create a replacement cut with a fresh `operationId` once the reason is
+  resolved.
+- anything else — read `last_error`, clear the underlying failure (history
+  worker health, object-store reachability, replication policy), then drive a
+  fresh cut.
+
+**Why a dead cut does not hold reclamation hostage.**
+`pfj.journal_reclaim_horizon` clamps on cuts in `('pending','materializing')`
+only. A cut that might still materialize keeps its read window pinned —
+deleting records under a live fold would corrupt it. A `failed`/`canceled` cut
+is excluded, and must be: it can never produce the recovery anchor that gives
+its window meaning, so clamping on it would pin the prefix on a proof that
+will never arrive. What actually pins a terminally-stuck generation is that
+`base_seq` never advances (the horizon is at most `base_seq`), and moving a
+base without an adoption proof discards the tail — a decision about DATA, not
+accounting, which is why it stays an operator action.
 
 ## Serving history reads
 

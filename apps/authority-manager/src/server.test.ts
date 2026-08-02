@@ -13,6 +13,8 @@ import {
   type ReadinessAnswer,
 } from "./server.js";
 import {
+  AckCode,
+  type AckCodeValue,
   authorityDataPlaneRouterLimitsFromEnv,
   createAuthorityDataPlaneRouterServer,
   InMemoryAuthorityDataPlaneRouteTable,
@@ -674,7 +676,40 @@ describe("authority data-plane router", () => {
     const client = await connectClient(routerAddress);
     await writeTokenFrame(client, "missing-token");
     const ack = await readExactly(client, 1);
-    expect(ack[0]).toBe(1);
+    // A token that resolves to nothing IS a credential verdict — the one
+    // condition ack 1 is entitled to mean.
+    expect(ack[0]).toBe(AckCode.CredentialRejected);
+    client.destroy();
+  });
+
+  // AN AUTHORITY OUTAGE IS NOT A DEAD CREDENTIAL. The router used to close
+  // this connection with no ack at all, leaving the client to guess; guessing
+  // "the credential is dead" over an authority that is merely down sends the
+  // operator to re-authenticate through an outage they cannot affect.
+  test("answers an authority-side outage as its own condition, not as a credential refusal", async () => {
+    // A listener that is bound and then closed gives a deterministic ECONNREFUSED.
+    const dead = createServer(() => undefined);
+    const deadAddress = await listenTcp(dead);
+    await new Promise<void>((resolve) => dead.close(() => resolve()));
+
+    const routeTable = new InMemoryAuthorityDataPlaneRouteTable();
+    const session = routeTable.createSession({
+      authorityInstanceId: "pfai_1",
+      backendAddresses: [`${deadAddress.host}:${deadAddress.port}`],
+      backendAuthToken: "backend-token",
+    });
+    const router = createAuthorityDataPlaneRouterServer(routeTable, {
+      backendConnectTimeoutMs: 250,
+      handshakeTimeoutMs: 250,
+    });
+    tcpServers.push(router);
+    const routerAddress = await listenTcp(router);
+
+    const client = await connectClient(routerAddress);
+    await writeTokenFrame(client, session.token);
+    const ack = await readExactly(client, 1);
+    expect(ack[0]).toBe(AckCode.AuthorityUnavailable);
+    expect(ack[0]).not.toBe(AckCode.CredentialRejected);
     client.destroy();
   });
 
@@ -1178,15 +1213,19 @@ describe("access-lease data-plane tunnels", () => {
     return client;
   }
 
-  async function expectHandshakeRejected(
+  // THE REFUSAL CODE IS THE POINT. A client that cannot tell a full lease from
+  // a dead credential latches a terminal credential verdict over a lease that
+  // is perfectly alive, and tells its operator to run `portablefs login`.
+  async function expectHandshakeRefused(
     routerAddress: { host: string; port: number },
-    token: string
+    token: string,
+    expected: AckCodeValue
   ): Promise<void> {
     const client = await connectClient(routerAddress);
     await writeTokenFrame(client, token);
     const ack = await readExactly(client, 1);
     client.destroy();
-    expect(ack[0]).toBe(1);
+    expect(ack[0]).toBe(expected);
   }
 
   function waitForClose(socket: Socket): Promise<void> {
@@ -1216,7 +1255,12 @@ describe("access-lease data-plane tunnels", () => {
     const { lease, accessToken } = await createLease(harness.service);
     const first = await openTunnel(harness.routerAddress, accessToken);
     const second = await openTunnel(harness.routerAddress, accessToken);
-    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    // A FULL LEASE IS NOT A DEAD CREDENTIAL. accessToken is the same token the
+    // two live tunnels were admitted with; the only thing wrong is that there
+    // is no slot. Answering AckCode.CredentialRejected here is what made a
+    // mount latch "lease expired or revoked; run `portablefs login`" over a
+    // lease with minutes of validity left.
+    await expectHandshakeRefused(harness.routerAddress, accessToken, AckCode.AtCapacity);
     expect(harness.tunnelRegistry.openTunnelCount(lease.accessLeaseId)).toBe(2);
 
     second.write("still-live");
@@ -1250,7 +1294,7 @@ describe("access-lease data-plane tunnels", () => {
     expect(harness.tunnelRegistry.openTunnelCount(lease.accessLeaseId)).toBe(0);
 
     // The superseded token no longer handshakes; the rotated one does.
-    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    await expectHandshakeRefused(harness.routerAddress, accessToken, AckCode.CredentialRejected);
     const fresh = await openTunnel(harness.routerAddress, rotated.accessToken!);
     fresh.write("ping");
     expect((await readExactly(fresh, 4)).toString("utf8")).toBe("ping");
@@ -1271,7 +1315,7 @@ describe("access-lease data-plane tunnels", () => {
 
     await waitForClose(client);
     await waitForClose(backendSocket);
-    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    await expectHandshakeRefused(harness.routerAddress, accessToken, AckCode.CredentialRejected);
   });
 
   test("administrative revocation closes live tunnels", async () => {
@@ -1282,7 +1326,7 @@ describe("access-lease data-plane tunnels", () => {
     await harness.service.revoke(lease.accessLeaseId);
 
     await waitForClose(client);
-    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    await expectHandshakeRefused(harness.routerAddress, accessToken, AckCode.CredentialRejected);
   });
 
   test("authority retirement closes live tunnels", async () => {
@@ -1293,7 +1337,7 @@ describe("access-lease data-plane tunnels", () => {
     await harness.service.revokeAuthority("pfai_1");
 
     await waitForClose(client);
-    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    await expectHandshakeRefused(harness.routerAddress, accessToken, AckCode.CredentialRejected);
   });
 
   test("the expiry sweep closes live tunnels without any caller action", async () => {
@@ -1312,7 +1356,7 @@ describe("access-lease data-plane tunnels", () => {
     // avoids confusing the intentional pre-expiry guard with final expiry.
     const untilDurableExpiryMs = Math.max(0, lease.expiresAt - Date.now());
     await new Promise((resolve) => setTimeout(resolve, untilDurableExpiryMs + 50));
-    await expectHandshakeRejected(harness.routerAddress, accessToken);
+    await expectHandshakeRefused(harness.routerAddress, accessToken, AckCode.CredentialRejected);
   });
 });
 
