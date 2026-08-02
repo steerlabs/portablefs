@@ -26,6 +26,9 @@ import type { AccessLeaseHandler } from "./server.js";
 import { parseAuthorityAddress } from "./authority-address.js";
 
 const port = Number(process.env.PORT || process.env.AUTHORITY_MANAGER_PORT || 8788);
+// Bound on the fenced-exit teardown. Short: nothing this process still holds
+// is worth keeping a fenced manager alive for.
+const FENCE_EXIT_GRACE_MS = 5_000;
 const authToken = process.env.PORTABLEFS_AUTHORITY_MANAGER_TOKEN?.trim();
 const allowUnauthenticated =
   process.env.PORTABLEFS_AUTHORITY_MANAGER_ALLOW_UNAUTHENTICATED === "1";
@@ -65,6 +68,26 @@ const productionRegistry: ProductionAuthorityRegistry = await createProductionAu
   process.env,
   { controlStore: managerControlStore }
 );
+// The claim heartbeat MUST be isolated from this process's event loop and
+// from the shared control pool. It is the fencing authority: if its renewal
+// can queue behind data-plane traffic, a HEALTHY manager under full-speed
+// load fences itself and strands every client's backlog. Verified here rather
+// than assumed, because the composition is what makes it true.
+if (!productionRegistry.claimHeartbeatIsolated()) {
+  throw new Error(
+    "The production authority manager's singleton-claim heartbeat is not isolated from this event loop and its control pool. Production requires the worker-thread heartbeat with a reserved database connection."
+  );
+}
+
+// A self-fenced manager is TERMINAL: it holds no claim, serves nothing, and
+// cannot mint a successor epoch from inside this process. It must EXIT so the
+// platform restarts it into a fresh epoch. (Recorded incident: two consecutive
+// epochs fenced themselves and then hung fenced for 40+ minutes with no
+// successor until a manual redeploy.)
+productionRegistry.onFenced((reason) => {
+  void exitAfterFence(reason);
+});
+
 const accessLeases: AccessLeaseHandler = productionRegistry.leases;
 // Lease lifecycle fences live tunnels: end closes them, rotation closes
 // older-generation ones.
@@ -138,6 +161,33 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.once(signal, () => {
     void shutdown(signal);
   });
+}
+
+// exitAfterFence stops accepting anything and leaves the process, bounded.
+// Exit code 1 marks it as an abnormal termination so the platform's restart
+// policy applies and the restart is visible in the deploy log. The registry
+// has ALREADY invalidated every lease and terminated every child by the time
+// this runs; closing the listeners is only about not accepting new work
+// during the exit, and it is bounded so a wedged socket cannot hold the
+// process fenced-and-alive — which is the exact failure this exists to end.
+let fenceExiting = false;
+async function exitAfterFence(reason: string): Promise<void> {
+  if (fenceExiting || shuttingDown) {
+    return;
+  }
+  fenceExiting = true;
+  console.error(
+    `PortableFS authority manager fenced itself (${reason}); exiting so the platform restarts it into a fresh epoch.`
+  );
+  const forceExit = setTimeout(() => process.exit(1), FENCE_EXIT_GRACE_MS);
+  forceExit.unref?.();
+  await Promise.allSettled([
+    closeServer(server).catch(() => undefined),
+    closeServer(dataPlaneRouter).catch(() => undefined),
+  ]);
+  await managerControlStore.close().catch(() => undefined);
+  clearTimeout(forceExit);
+  process.exit(1);
 }
 
 async function shutdown(signal: string): Promise<void> {

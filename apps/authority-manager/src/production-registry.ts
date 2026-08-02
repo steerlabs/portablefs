@@ -26,6 +26,7 @@ import {
   type ManagerIdentity,
 } from "./manager-control-store.js";
 import { ProductionAccessLeaseService } from "./production-access-leases.js";
+import type { ClaimHeartbeat, ClaimRenewalFacts } from "./claim-heartbeat.js";
 import { parseAccessTokenRootSecret } from "./access-tokens.js";
 import type { AuthorityDataPlaneRoute } from "./data-plane-router.js";
 import {
@@ -637,8 +638,17 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   // even if the store is unreachable.
   private claimDeadlineLocalMs: number;
   private deadlineTimer: NodeJS.Timeout | null = null;
-  private renewTimer: NodeJS.Timeout | null = null;
+  // The ISOLATED liveness channel that drives renewal (see claim-heartbeat.ts).
+  // The registry never renews on its own event loop: the loop that carries the
+  // data-plane router's socket callbacks is exactly the loop that must not be
+  // able to delay the fencing authority's heartbeat.
+  private heartbeat: ClaimHeartbeat | null = null;
   private consecutiveRenewFailures = 0;
+  // Notified exactly once when this manager fences itself. The process MUST
+  // exit on it: a fenced manager holds no claim, serves nothing, and produces
+  // no successor — the platform restart is what mints the next epoch.
+  private readonly fencedListeners = new Set<(reason: string) => void>();
+  private fencedNotified = false;
 
   readonly leases: ProductionAccessLeaseService;
 
@@ -714,6 +724,10 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     // never be allowed to idle forever.
     this.leases.onZeroActive((refKey) => this.scheduleIdleEviction(refKey));
     this.leases.onLeaseActivity((refKey) => this.cancelIdleEviction(refKey));
+    // A lease-path PF001 is the same durable proof the renewal path gets: the
+    // claim is gone. Fence the WHOLE manager on it instead of leaving children
+    // serving until the deadline runs out.
+    this.leases.onSuperseded(() => this.fenceSelf("manager-epoch-superseded"));
     this.startGate = new StartSemaphore(config.maxConcurrentStarts);
     this.armDeadlineWatchdog();
   }
@@ -757,8 +771,21 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       managerCapability,
     };
     const registry = new ProductionAuthorityRegistry(config, deps, identity, claim, claimStartLocalMs);
-    registry.armClaimRenewal();
+    try {
+      await registry.startClaimHeartbeat(deps.controlStore.createClaimHeartbeat());
+    } catch (error) {
+      // An unproven liveness channel is a manager that cannot be trusted to
+      // fence on time. Release the claim so a successor starts immediately
+      // instead of waiting out the TTL, and fail the boot.
+      await registry.shutdown().catch(() => undefined);
+      throw error;
+    }
     return registry;
+  }
+
+  /** Registered before readiness; invoked once when this manager fences itself. */
+  onFenced(listener: (reason: string) => void): void {
+    this.fencedListeners.add(listener);
   }
 
   epoch(): string {
@@ -776,9 +803,23 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       this.claimed &&
       !this.superseded &&
       !this.closed &&
-      this.localNow() < this.claimDeadlineLocalMs &&
+      this.localNow() < this.currentClaimDeadline() &&
       this.leases.healthy()
     );
+  }
+
+  // currentClaimDeadline reads the deadline the LIVENESS CHANNEL has published
+  // and folds it in. The channel publishes each confirmed renewal into shared
+  // memory before it posts anything, so this read sees a renewal the instant
+  // the database confirms it — it never waits for the main event loop to drain
+  // a message that a data-plane flood is competing with. The deadline only
+  // ever moves forward, and only a confirmed renewal moves it.
+  private currentClaimDeadline(): number {
+    const published = this.heartbeat?.publishedDeadlineLocalMs() ?? null;
+    if (published !== null && published > this.claimDeadlineLocalMs) {
+      this.claimDeadlineLocalMs = published;
+    }
+    return this.claimDeadlineLocalMs;
   }
 
   // ------------------------------------------------------------------
@@ -813,7 +854,7 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       claimed: this.claimed,
       superseded: this.superseded,
       closed: this.closed,
-      claimRemainingMs: Math.max(0, Math.round(this.claimDeadlineLocalMs - this.localNow())),
+      claimRemainingMs: Math.max(0, Math.round(this.currentClaimDeadline() - this.localNow())),
       consecutiveRenewFailures: this.consecutiveRenewFailures,
       managerEpoch: this.identity.managerEpoch,
       childrenTotal: this.authorities.size,
@@ -969,12 +1010,89 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   // Singleton claim: renewal loop + local monotonic hard deadline.
   // ------------------------------------------------------------------
 
-  private armClaimRenewal(): void {
-    const interval = Math.max(1_000, Math.floor(this.config.claimTtlMs / 3));
-    this.renewTimer = setInterval(() => {
-      void this.renewClaim();
-    }, interval);
-    this.renewTimer.unref?.();
+  // startClaimHeartbeat proves the liveness channel and starts renewal. The
+  // channel runs OFF this event loop on a reserved database connection, so
+  // neither a full-speed data-plane flood nor a saturated control pool can
+  // delay a renewal. The cadence is TTL/3: three whole renewal windows fit
+  // inside one claim lifetime, and each attempt is hard-bounded to one
+  // interval by the channel itself, so two consecutive slow attempts can
+  // never add up past the TTL.
+  private async startClaimHeartbeat(heartbeat: ClaimHeartbeat): Promise<void> {
+    if (!heartbeat.isolated) {
+      this.log(
+        `PortableFS manager epoch ${this.identity.managerEpoch}: the claim heartbeat is IN-PROCESS (not isolated from this event loop). This is correct only for a non-production control store.`
+      );
+    }
+    this.heartbeat = heartbeat;
+    await heartbeat.start({
+      identity: this.identity,
+      ttlMs: this.config.claimTtlMs,
+      intervalMs: Math.max(1_000, Math.floor(this.config.claimTtlMs / 3)),
+      now: this.localNow,
+      listeners: {
+        onRenewed: (facts) => this.applyRenewal(facts),
+        onSuperseded: () => this.onEpochSuperseded(),
+        onFailure: (message) => this.onRenewalFailure(message),
+      },
+    });
+  }
+
+  /** True when renewal is driven off this event loop on a reserved connection. */
+  claimHeartbeatIsolated(): boolean {
+    return this.heartbeat?.isolated === true;
+  }
+
+  // applyRenewal projects a CONFIRMED database renewal onto the local
+  // monotonic deadline. The anchor was captured BEFORE the statement was
+  // issued (on the heartbeat's clock, proven to be this thread's clock at
+  // startup), so anchor + granted-remaining can never reach past the true
+  // database expiry no matter how slowly the response arrived. The deadline
+  // only ever moves FORWARD.
+  private applyRenewal(facts: ClaimRenewalFacts): void {
+    if (this.closed || this.superseded) {
+      return;
+    }
+    if (
+      !Number.isFinite(facts.anchorLocalMs) ||
+      !Number.isSafeInteger(facts.dbTimeMs) ||
+      !Number.isSafeInteger(facts.claimExpiresAtDbMs)
+    ) {
+      this.onRenewalFailure("the claim heartbeat reported a malformed renewal");
+      return;
+    }
+    this.renewalsTotal += 1;
+    this.consecutiveRenewFailures = 0;
+    // currentClaimDeadline() may already carry this renewal (an isolated
+    // channel publishes to shared memory before it posts), so compare against
+    // the folded value and re-arm on any forward move.
+    const before = this.claimDeadlineLocalMs;
+    this.currentClaimDeadline();
+    const nextDeadline = facts.anchorLocalMs + (facts.claimExpiresAtDbMs - facts.dbTimeMs);
+    if (nextDeadline > this.claimDeadlineLocalMs) {
+      this.claimDeadlineLocalMs = nextDeadline;
+    }
+    if (this.claimDeadlineLocalMs > before) {
+      this.armDeadlineWatchdog();
+    }
+    this.writeHeartbeatFrames(facts.dbTimeMs, facts.claimExpiresAtDbMs);
+  }
+
+  // An AMBIGUOUS renewal (outage/timeout/dead liveness thread) NEVER extends
+  // the deadline and is NEVER silent: the failure count is logged every tick,
+  // and the deadline watchdog fences the manager when the DB-time lease runs
+  // out.
+  private onRenewalFailure(message: string): void {
+    if (this.closed || this.superseded) {
+      return;
+    }
+    this.renewalFailuresTotal += 1;
+    this.consecutiveRenewFailures += 1;
+    this.log(
+      `PortableFS manager epoch ${this.identity.managerEpoch}: claim renewal failed (${this.consecutiveRenewFailures} consecutive): ${message}; hard deadline in ${Math.max(
+        0,
+        this.currentClaimDeadline() - this.localNow()
+      )}ms.`
+    );
   }
 
   private armDeadlineWatchdog(): void {
@@ -985,13 +1103,16 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     if (this.closed || this.superseded) {
       return;
     }
-    const delayMs = Math.max(0, this.claimDeadlineLocalMs - this.localNow());
+    const delayMs = Math.max(0, this.currentClaimDeadline() - this.localNow());
     this.deadlineTimer = setTimeout(() => {
       this.deadlineTimer = null;
       if (this.closed || this.superseded) {
         return;
       }
-      if (this.localNow() >= this.claimDeadlineLocalMs) {
+      // Re-read the published deadline HERE, at the decision. A watchdog that
+      // fires late (its own loop was busy) must not fence on a stale copy
+      // while a confirmed renewal is already visible in shared memory.
+      if (this.localNow() >= this.currentClaimDeadline()) {
         this.log(
           `PortableFS manager epoch ${this.identity.managerEpoch}: the singleton claim's database-time deadline passed without a successful renewal; fencing this manager (readiness false, admission stopped, leases invalidated, children terminated).`
         );
@@ -1004,47 +1125,6 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     this.deadlineTimer.unref?.();
   }
 
-  private async renewClaim(): Promise<void> {
-    if (this.closed || this.superseded) {
-      return;
-    }
-    // Pre-call anchor: the renewal's remaining TTL is measured by the
-    // database at some instant AFTER this; anchoring after the response
-    // would stretch the local deadline past DB expiry by the response delay.
-    const renewStartLocalMs = this.localNow();
-    try {
-      const renewal = await this.store.renewManagerClaim({
-        identity: this.identity,
-        ttlMs: this.config.claimTtlMs,
-      });
-      this.renewalsTotal += 1;
-      this.consecutiveRenewFailures = 0;
-      // The deadline is derived ONLY from the successful DB response and only
-      // moves forward.
-      const nextDeadline = renewStartLocalMs + (renewal.claimExpiresAtDbMs - renewal.dbTimeMs);
-      if (nextDeadline > this.claimDeadlineLocalMs) {
-        this.claimDeadlineLocalMs = nextDeadline;
-        this.armDeadlineWatchdog();
-      }
-      this.writeHeartbeatFrames(renewal.dbTimeMs, renewal.claimExpiresAtDbMs);
-    } catch (error) {
-      if (error instanceof ManagerEpochSupersededError) {
-        this.onEpochSuperseded();
-        return;
-      }
-      // An AMBIGUOUS renewal (outage/timeout) NEVER extends the deadline and
-      // is NEVER silent: the failure count is logged every tick, and the
-      // deadline watchdog fences the manager when the DB-time lease runs out.
-      this.renewalFailuresTotal += 1;
-      this.consecutiveRenewFailures += 1;
-      this.log(
-        `PortableFS manager epoch ${this.identity.managerEpoch}: claim renewal failed (${this.consecutiveRenewFailures} consecutive): ${
-          error instanceof Error ? error.message : String(error)
-        }; hard deadline in ${Math.max(0, this.claimDeadlineLocalMs - this.localNow())}ms.`
-      );
-    }
-  }
-
   // onEpochSuperseded: another manager claimed a newer epoch. This manager
   // stops mutating IMMEDIATELY.
   private onEpochSuperseded(): void {
@@ -1055,6 +1135,13 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   // invalidated, heartbeat pipes closed (EOF fences the children), children
   // terminated. The journal truth is remote; a successor manager demand-
   // starts replacements that cold-replay.
+  //
+  // A fenced manager is TERMINAL. It holds no claim, it can serve nothing, and
+  // nothing in this process can ever un-fence it: only a fresh process claims
+  // a fresh epoch. So the fence notifies its listeners, and the composition
+  // root EXITS on that notification — a fenced manager that lingers is a
+  // deployment with no live manager at all (observed: two epochs fenced and
+  // then hung for 40+ minutes until a manual redeploy).
   private fenceSelf(reason: string): void {
     if (this.superseded) {
       return;
@@ -1072,13 +1159,30 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       );
     }
     this.log(`PortableFS manager epoch ${this.identity.managerEpoch} fenced itself: ${reason}.`);
+    this.notifyFenced(reason);
+  }
+
+  private notifyFenced(reason: string): void {
+    if (this.fencedNotified) {
+      return;
+    }
+    this.fencedNotified = true;
+    for (const listener of [...this.fencedListeners]) {
+      try {
+        listener(reason);
+      } catch (error) {
+        this.log(
+          `PortableFS manager epoch ${this.identity.managerEpoch}: a fence listener threw: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
   }
 
   private stopTimers(): void {
-    if (this.renewTimer) {
-      clearInterval(this.renewTimer);
-      this.renewTimer = null;
-    }
+    this.heartbeat?.stop();
+    this.heartbeat = null;
     if (this.deadlineTimer) {
       clearTimeout(this.deadlineTimer);
       this.deadlineTimer = null;
@@ -1086,7 +1190,7 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   }
 
   private requireCurrentEpoch(): void {
-    if (!this.claimed || this.superseded || this.localNow() >= this.claimDeadlineLocalMs) {
+    if (!this.claimed || this.superseded || this.localNow() >= this.currentClaimDeadline()) {
       throw new AuthorityOperationError(
         503,
         authorityOperationErrorCodes.managerEpochSuperseded,
@@ -1737,7 +1841,7 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       runtime.dbTimeMs,
       // Approximate remaining lease from the LOCAL deadline; subsequent
       // renewals carry exact DB facts.
-      runtime.dbTimeMs + Math.max(0, this.claimDeadlineLocalMs - this.localNow())
+      runtime.dbTimeMs + Math.max(0, this.currentClaimDeadline() - this.localNow())
     );
     return authority;
   }

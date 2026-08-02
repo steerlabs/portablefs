@@ -35,7 +35,15 @@ Railway-specific wiring.
    naming the worker's failure domains — its `policy_epoch` is what
    `PFH_WORKER_POLICY_EPOCH` pins. The script prints the exact next steps.
 4. **volume-api** — applies migrations again at startup (harmless; the
-   gate already did the work) and serves `/readyz`.
+   gate already did the work) and serves `/readyz`. The startup gate waits out
+   a database that is not accepting work yet — crash recovery, `57P03 the
+   database system is starting up`, connection refused — for up to
+   `VOLUME_MIGRATION_READY_BUDGET_MS` (default 300000) with exponential
+   backoff, then fails the deploy definitively. A real migration failure (a
+   syntax error, a permission denial, any definitive SQLSTATE) still fails on
+   the first attempt and is never retried. Before this, a deploy that landed
+   while Postgres was in crash recovery killed the process on the first
+   attempt and the service stayed dead.
 5. **history-worker** — needs the policy epoch from step 3's
    `pfh.history_policies` install and the stores JSON below.
 6. **authority-manager** — last, using the explicit stop-before-start
@@ -69,6 +77,26 @@ The bounded manager unavailability during this handoff is intentional. It is a
 fail-closed singleton transition, not a fallback. Never bypass the claim,
 disable readiness, run two replicas, or silently route around the manager.
 
+The handoff procedure is unchanged by the self-fencing exit below — a fenced
+manager is exactly the situation the handoff is designed to avoid, not an
+alternative to it.
+
+**A manager that fences itself now exits non-zero**, because it holds no claim
+and cannot mint a successor epoch from inside its own process. The service's
+existing `restartPolicyType: ON_FAILURE` (see
+`railway/authority-manager.railway.json`) is what turns that exit into a fresh
+epoch — the restarted process claims a new one, waiting out the previous
+claim's database TTL if it was not released. Do not set `NEVER` on this
+service: it would leave the fenced manager down until someone redeployed by
+hand (observed: two consecutive epochs fenced and then hung for 40+ minutes).
+
+The policy's `restartPolicyMaxRetries: 10` is a deliberate bound. Ten
+fence-and-restart cycles without recovery means the control database is
+unreachable or another manager holds the claim; that is an operator page, not
+something to restart into forever. Read the fence reason in the manager's log
+(`fenced itself: claim-deadline-exceeded` vs `manager-epoch-superseded`) before
+redeploying.
+
 ## Environment matrix
 
 Set variables per service in the dashboard. Sealed variables for every
@@ -92,6 +120,7 @@ secret (tokens, passwords, PEMs). Names below are code-verified.
 | `VOLUME_BLOB_STORE` | `s3` (the default when unset; `railway-bucket` remains a compat alias for one release) |
 | `AWS_ENDPOINT_URL` / `AWS_S3_BUCKET_NAME` / `AWS_DEFAULT_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | reference the Railway bucket service's variables of the same names directly; `VOLUME_S3_PREFIX` is the optional key prefix. The retired `VOLUME_RAILWAY_BUCKET_*` spellings remain accepted as aliases (see [self-hosting.md](./self-hosting.md)) |
 | `PORTABLEFS_RELEASE_ID` / `PORTABLEFS_SOURCE_REVISION` | from `RAILWAY_GIT_COMMIT_SHA` (see [release identity](#release-identity)) |
+| optional | `VOLUME_MIGRATION_READY_BUDGET_MS` (default 300000), `VOLUME_MIGRATION_RETRY_INITIAL_BACKOFF_MS` (default 1000), `VOLUME_MIGRATION_RETRY_MAX_BACKOFF_MS` (default 15000) — how long startup waits out a database that is not accepting work yet before failing the deploy definitively |
 
 `PORT` is Railway-injected; the API listens on it (image default 8787) and
 the `/readyz` health check probes it — no coupling needed here.
