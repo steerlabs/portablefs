@@ -54,6 +54,7 @@ import {
   type CommitVolumeResult,
   type CommitVolumeSummaryResult,
   type ControlPlaneProbeResult,
+  type ControlStoreUsage,
   type CreateVolumeInput,
   type CreateVolumeResult,
   type DetachVolumeInput,
@@ -226,6 +227,23 @@ const migrationIds = [
   // its label onto an unlabeled live row) and lets adoption consume any
   // ready pfj3 managed cut — every ready cut carries a verified anchor.
   "029_history_cut_kind_dedup",
+  // 030 makes readiness able to fail. Both control probes were catalog
+  // READS, which an out-of-disk primary answers perfectly while every lease
+  // write fails; 030 adds the bounded DURABLE WRITE probe (public
+  // portablefs_control_write_probes for this service, pfm.control_write_probe
+  // for the manager — same durability admission as a lease write) plus
+  // pfm.control_store_usage() consumption accounting. Both targets are
+  // bounded to a fixed ring of rows updated in place.
+  "030_control_store_headroom",
+  // 031 gives journal records a release path. pfj.journal_records rows were
+  // NEVER physically deleted: adoption advanced base_seq logically while the
+  // BYTEA payloads below it stayed forever, pfj.journal_physical_trim was
+  // ungranted, uncalled and frozen for pfj3, and volume retirement deleted
+  // nothing. 031 unfreezes trim behind a horizon proven by ROWS
+  // (pfj.journal_reclaim_horizon), adds bounded pfj.journal_reclaim,
+  // pfj.journal_retire_for_volume (the reclamation half of `portablefs rm`),
+  // an age-aware candidate list, and pfj.journal_storage_usage accounting.
+  "031_journal_reclamation",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";
@@ -361,10 +379,68 @@ const attachReceiptLockPrefix = "portablefs-attach-receipt";
 // database. Callers may configure smaller pools; larger requests are clamped.
 const maxPoolConnections = 32;
 
+// The readiness write probe. ON CONFLICT DO UPDATE on a fixed key: exactly
+// one heap tuple version, one WAL record, one commit — the same durable
+// transition class as a journal or lease write — with NO row accumulation.
+// The database clock stamps the row; the caller's host clock never does.
+//
+// The 4 KiB incompressible filler is what makes this catch an out-of-disk
+// DATA volume and not merely an out-of-disk WAL volume: a one-word update
+// can be satisfied in place by a HOT update, but a new 4 KiB row version on
+// a fillfactor-100 page must find a free page or EXTEND the relation — the
+// exact "could not extend file ... No space left on device" the failing
+// lease writes hit. Fresh bytes every probe, so it can never be a no-op.
+const controlWriteProbeStatement = `INSERT INTO portablefs_control_write_probes AS p
+    (probe_key, probe_seq, probed_at_ms, filler)
+  VALUES (
+    $1,
+    1,
+    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+    (SELECT decode(string_agg(md5(random()::TEXT || g::TEXT), ''), 'hex')
+       FROM generate_series(1, 256) g))
+  ON CONFLICT (probe_key) DO UPDATE
+    SET probe_seq = p.probe_seq + 1,
+        probed_at_ms = EXCLUDED.probed_at_ms,
+        filler = EXCLUDED.filler`;
+
+// The probe ring bound. One slot is picked per repository instance so N
+// replicas do not serialize every readiness check on one row lock (a lock
+// convoy on a healthy store must never read as an outage), while the table
+// stays bounded at this many rows forever.
+const controlWriteProbeSlots = 16;
+
+// Control-store consumption. Sizes come from the RELATION, not from summing
+// row payloads: pg_total_relation_size is O(1) and also the more honest
+// number, because it counts indexes, TOAST and dead-tuple bloat — the things
+// that actually consume the disk. Summing payload_bytes across the journal
+// would cost a full sequential scan that gets slower precisely as the
+// problem it reports gets worse (measured: 63 ms on a 320k-record fixture).
+//
+// Record counts come from each generation's seq span, so this statement
+// reads only pfj.journal_generations (a handful of rows) plus catalog size.
+// `reclaimable` here uses base_seq, an UPPER BOUND: the exact, proven
+// horizon additionally clamps to in-flight cut windows and recovery-anchor
+// evidence, and is reported by pfj.journal_storage_usage().
+const controlStoreUsageStatement = `SELECT
+    pg_database_size(current_database())::TEXT AS database_bytes,
+    pg_total_relation_size('pfj.journal_records')::TEXT AS journal_table_bytes,
+    COALESCE(SUM(GREATEST(g.next_seq - g.physical_trimmed_seq, 0)), 0)::TEXT
+      AS journal_records,
+    COALESCE(SUM(GREATEST(g.base_seq - g.physical_trimmed_seq, 0)), 0)::TEXT
+      AS reclaimable_journal_records
+  FROM pfj.journal_generations g`;
+
+function decimalString(value: string | undefined): string {
+  return typeof value === "string" && /^(?:0|[1-9][0-9]*)$/u.test(value) ? value : "0";
+}
+
 export class PostgresMetadataRepository implements MetadataRepository {
   private readonly pool: Pool;
   private readonly manifestIndexCache: ManifestIndexCache;
   private historyRepository: PostgresHistoryRepository | undefined;
+  private readonly controlWriteProbeKey = `readyz:${Math.floor(
+    Math.random() * controlWriteProbeSlots
+  )}`;
 
   constructor(config: PoolConfig | string) {
     const poolConfig: PoolConfig =
@@ -391,12 +467,24 @@ export class PostgresMetadataRepository implements MetadataRepository {
     await this.pool.end();
   }
 
-  // probeControlPlane is the readiness primitive: one cheap round-trip plus a
-  // migration lineage count, bounded by the caller's signal. It reports
-  // problems instead of throwing so readiness handlers stay allocation-free.
-  // pg has no per-query cancellation, so an abort abandons the wait (the
-  // query settles on its own and its connection returns to the pool).
+  // probeControlPlane is the readiness primitive: a migration lineage read
+  // AND a bounded durable WRITE, both bounded by the caller's signal. It
+  // reports problems instead of throwing so readiness handlers stay
+  // allocation-free. pg has no per-query cancellation, so an abort abandons
+  // the wait (the query settles on its own and its connection returns to the
+  // pool).
+  //
+  // The write leg is the point. A read-only probe cannot distinguish "the
+  // control store is serving" from "the control store cannot accept another
+  // byte": an out-of-disk primary answers `SELECT count(*) FROM
+  // portablefs_migrations` perfectly while every journal and lease write
+  // fails, which is exactly how a total control-store outage once shipped as
+  // a healthy deploy. The write leg performs the same class of operation the
+  // failing writes performed — a real heap tuple version, a real WAL record,
+  // a real commit — against a BOUNDED ring of probe rows that are updated in
+  // place and never accumulate.
   async probeControlPlane(options?: { signal?: AbortSignal }): Promise<ControlPlaneProbeResult> {
+    let migrationLineageComplete = false;
     try {
       const query = this.pool.query<{ applied: string }>(
         `SELECT count(*)::text AS applied FROM portablefs_migrations WHERE id = ANY($1)`,
@@ -406,23 +494,66 @@ export class PostgresMetadataRepository implements MetadataRepository {
         ? await raceAbort(query, options.signal, "control-plane probe aborted")
         : await query;
       const applied = Number(result.rows[0]?.applied ?? 0);
-      const migrationLineageComplete = applied === migrationIds.length;
-      return {
-        ok: migrationLineageComplete,
-        migrationLineageComplete,
-        reachable: true,
-        ...(migrationLineageComplete
-          ? {}
-          : { error: `applied ${applied} of ${migrationIds.length} expected migrations` }),
-      };
+      migrationLineageComplete = applied === migrationIds.length;
+      if (!migrationLineageComplete) {
+        // A short lineage cannot be repaired by proving writes work, and the
+        // probe table may not exist yet; report the lineage gap as-is.
+        return {
+          ok: false,
+          migrationLineageComplete,
+          reachable: true,
+          writable: false,
+          error: `applied ${applied} of ${migrationIds.length} expected migrations`,
+        };
+      }
     } catch (error) {
       return {
         ok: false,
         migrationLineageComplete: false,
         reachable: false,
+        writable: false,
         error: error instanceof Error ? error.message.slice(0, 256) : "control-plane probe failed",
       };
     }
+    try {
+      const write = this.pool.query(controlWriteProbeStatement, [this.controlWriteProbeKey]);
+      await (options?.signal
+        ? raceAbort(write, options.signal, "control-plane write probe aborted")
+        : write);
+      return { ok: true, migrationLineageComplete: true, reachable: true, writable: true };
+    } catch (error) {
+      // Reachable (the read succeeded moments ago) but NOT writable: the
+      // honest shape of a full disk, a read-only replica, or a wedged writer.
+      return {
+        ok: false,
+        migrationLineageComplete: true,
+        reachable: true,
+        writable: false,
+        error:
+          error instanceof Error ? error.message.slice(0, 256) : "control-plane write probe failed",
+      };
+    }
+  }
+
+  // controlStoreUsage reports EXACT control-store consumption. Core
+  // PostgreSQL exposes no free-space primitive, so headroom cannot be
+  // measured honestly from inside the database — consumption can, and it is
+  // the curve that filled this database twice. Never inferred, never capped
+  // by a guessed capacity: the caller owns the budget.
+  async controlStoreUsage(): Promise<ControlStoreUsage> {
+    const result = await this.pool.query<{
+      database_bytes: string;
+      journal_table_bytes: string;
+      journal_records: string;
+      reclaimable_journal_records: string;
+    }>(controlStoreUsageStatement, []);
+    const row = result.rows[0];
+    return {
+      databaseBytes: decimalString(row?.database_bytes),
+      journalTableBytes: decimalString(row?.journal_table_bytes),
+      journalRecords: decimalString(row?.journal_records),
+      reclaimableJournalRecords: decimalString(row?.reclaimable_journal_records),
+    };
   }
 
   private manifestIndexForCommit(commit: VolumeCommit): ManifestIndex {

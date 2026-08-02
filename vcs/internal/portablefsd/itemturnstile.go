@@ -108,6 +108,10 @@ type itemTicket struct {
 	// intent is the refresh intent installed by this ticket's grant, for a
 	// refresh ticket. Nil for a mutation ticket.
 	intent *refreshIntent
+	// yielding requests a DEFERENTIAL intent for a refresh ticket: one that is
+	// preempted the moment a size mutation reaches the head of the item's queue
+	// behind it. Meaningless for a mutation ticket. See refreshintent.go.
+	yielding bool
 }
 
 // itemTurnstile is one item's arrival order. It exists only while something is
@@ -155,6 +159,12 @@ func (a *attach) advanceItemQueueLocked(itemID uint64) {
 			// Exactly the pre-existing rule: an intent or a pin on the item
 			// holds every size mutation behind the refresh that owns it.
 			if a.refreshIntentBlockerLocked(itemID) != nil {
+				// ...unless that refresh is DEFERENTIAL, in which case this is
+				// the moment it agreed to give the item back. The mutation still
+				// waits here — the intent has not gone away yet — but the wait is
+				// now bounded by how long the pass takes to notice rather than by
+				// the pass's whole transaction. See refreshintent.go.
+				a.preemptRefreshIntentLocked(itemID)
 				return
 			}
 			if a.sizeMutationReservations == nil {
@@ -172,8 +182,10 @@ func (a *attach) advanceItemQueueLocked(itemID uint64) {
 				a.refreshIntents = map[uint64]*refreshIntent{}
 			}
 			intent := &refreshIntent{
-				done:    make(chan struct{}),
-				drained: make(chan struct{}),
+				done:     make(chan struct{}),
+				drained:  make(chan struct{}),
+				preempt:  make(chan struct{}),
+				yielding: t.yielding,
 			}
 			a.refreshIntents[itemID] = intent
 			t.intent = intent

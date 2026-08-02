@@ -5,6 +5,8 @@ import {
   type GenerationBacklogStatus,
   type HistoryCutCreateInput,
   type HistoryCutStatus,
+  type JournalReclaimCandidate,
+  type JournalReclaimResult,
   type ServingPinStatus,
 } from "@portablefs/metadata-db";
 import { intEnv } from "./config.js";
@@ -60,6 +62,13 @@ export interface HistoryMaintenanceSettings {
   enabled: boolean;
   intervalMs: number;
   backlogPercent: number;
+  /** PORTABLEFS_JOURNAL_RETENTION_MS — the age at which a suspended
+   * generation is cut regardless of backlog size. Default 7 days. */
+  journalRetentionMs: number;
+  /** PORTABLEFS_JOURNAL_RECLAIM_BATCH — rows per bounded reclaim txn. */
+  reclaimBatchRows: number;
+  /** PORTABLEFS_JOURNAL_RECLAIM_MAX_PAGES — reclaim txns per cycle. */
+  reclaimMaxPagesPerCycle: number;
 }
 
 /**
@@ -91,6 +100,24 @@ export function historyMaintenanceSettingsFromEnv(
     // Floor of 1s: a misconfigured near-zero interval would hammer PostgreSQL.
     intervalMs: intEnv(env, "PORTABLEFS_HISTORY_MAINTENANCE_INTERVAL_MS", 60_000, 1_000),
     backlogPercent: intEnv(env, "PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT", 70, 1, 100),
+    // Journal reclamation (migration 031). The retention floor is one hour:
+    // shorter would cut branches that are merely between mounts. The batch
+    // and page ceilings bound reclamation on a database that is, by
+    // definition, already under storage pressure.
+    journalRetentionMs: intEnv(
+      env,
+      "PORTABLEFS_JOURNAL_RETENTION_MS",
+      604_800_000,
+      3_600_000
+    ),
+    reclaimBatchRows: intEnv(env, "PORTABLEFS_JOURNAL_RECLAIM_BATCH", 512, 1, 4_096),
+    reclaimMaxPagesPerCycle: intEnv(
+      env,
+      "PORTABLEFS_JOURNAL_RECLAIM_MAX_PAGES",
+      64,
+      1,
+      4_096
+    ),
   };
 }
 
@@ -129,6 +156,17 @@ export interface HistoryMaintenanceStore {
   }): Promise<AdoptCutResult | HistoryOperationReplay>;
   unreleasedServingPins(limit?: number): Promise<ServingPinStatus[]>;
   releaseServingPinFenced(adoptionId: string): Promise<{ released: boolean; reason: string }>;
+  // Journal reclamation (migration 031). Optional so an embedder on an older
+  // lineage still composes; when absent the loop reports it once and does no
+  // reclamation rather than pretending storage is bounded.
+  journalReclaimCandidates?(
+    limit?: number,
+    retentionMs?: number
+  ): Promise<JournalReclaimCandidate[]>;
+  reclaimJournalRecords?(input: {
+    generationId: string;
+    maxRows?: number;
+  }): Promise<JournalReclaimResult>;
 }
 
 export interface HistoryMaintenanceCycleSummary {
@@ -144,6 +182,25 @@ export interface HistoryMaintenanceCycleSummary {
   benignRefusals: number;
   failures: number;
   topBacklogPercent: number;
+  // ── journal reclamation (migration 031) ──────────────────────────────────
+  /** Generations that had records below their proven reclamation horizon. */
+  reclaimCandidates: number;
+  /** Journal records physically DELETED from the control store this cycle. */
+  recordsReclaimed: number;
+  /** Bytes released. The number this deployment had no signal for, twice. */
+  bytesReclaimed: number;
+  /**
+   * Suspended generations cut on AGE rather than on backlog size. A branch
+   * that is suspended and abandoned never crosses a percent-of-quota
+   * threshold, so it was never cut, never adopted, and never reclaimable.
+   */
+  agedGenerationsForced: number;
+  /**
+   * This store cannot reclaim (migration 031 absent). Surfaced per cycle
+   * rather than logged as a failure: an older lineage is a deployment fact,
+   * but "journal records accumulate without bound" must never be silent.
+   */
+  reclaimUnavailable: boolean;
 }
 
 export interface HistoryMaintenanceLoopOptions {
@@ -168,6 +225,21 @@ export interface HistoryMaintenanceLoopOptions {
   /** Real failures only — benign concurrency refusals never reach it. */
   log?: ((message: string) => void) | undefined;
   scanLimit?: number | undefined;
+  // ── journal reclamation bounds (migration 031) ───────────────────────────
+  /**
+   * How long a SUSPENDED generation may sit idle before it is cut on AGE
+   * rather than on backlog size. A suspended-and-abandoned branch never
+   * crosses a percent-of-quota threshold, so without this it is never cut,
+   * never adopted, and its journal is never reclaimable — the exact shape of
+   * the test-branch data that filled production twice.
+   */
+  journalRetentionMs?: number | undefined;
+  /** Rows deleted per bounded reclaim transaction. */
+  reclaimBatchRows?: number | undefined;
+  /** Ceiling on reclaim transactions per cycle: a bound on a pressured DB. */
+  reclaimMaxPagesPerCycle?: number | undefined;
+  /** Generations examined per reclaim scan, largest waste first. */
+  reclaimScanLimit?: number | undefined;
 }
 
 /** Deterministic per-(generation, base) cut identity: exact-once by construction. */
@@ -266,6 +338,11 @@ function emptySummary(): HistoryMaintenanceCycleSummary {
     benignRefusals: 0,
     failures: 0,
     topBacklogPercent: 0,
+    reclaimCandidates: 0,
+    recordsReclaimed: 0,
+    bytesReclaimed: 0,
+    agedGenerationsForced: 0,
+    reclaimUnavailable: false,
   };
 }
 
@@ -278,6 +355,10 @@ export class HistoryMaintenanceLoop {
   private readonly shouldPause: () => boolean;
   private readonly log: (message: string) => void;
   private readonly scanLimit: number;
+  private readonly journalRetentionMs: number;
+  private readonly reclaimBatchRows: number;
+  private readonly reclaimMaxPagesPerCycle: number;
+  private readonly reclaimScanLimit: number;
   private warnedServingUnconfigured = false;
 
   private stopped = false;
@@ -292,6 +373,16 @@ export class HistoryMaintenanceLoop {
     this.shouldPause = options.shouldPause ?? (() => false);
     this.log = options.log ?? ((message) => console.warn(message));
     this.scanLimit = options.scanLimit ?? 256;
+    this.journalRetentionMs = validatedPositiveInt(
+      options.journalRetentionMs ?? 604_800_000,
+      "journalRetentionMs"
+    );
+    this.reclaimBatchRows = validatedPositiveInt(options.reclaimBatchRows ?? 512, "reclaimBatchRows");
+    this.reclaimMaxPagesPerCycle = validatedPositiveInt(
+      options.reclaimMaxPagesPerCycle ?? 64,
+      "reclaimMaxPagesPerCycle"
+    );
+    this.reclaimScanLimit = validatedPositiveInt(options.reclaimScanLimit ?? 32, "reclaimScanLimit");
   }
 
   /** Runs one cycle immediately, then re-arms after each completed cycle. */
@@ -360,8 +451,98 @@ export class HistoryMaintenanceLoop {
       await this.sweepServingPins(summary);
     }
 
+    if (!this.halted()) {
+      await this.reclaimJournalStorage(summary);
+    }
+
     this.emit(summary);
     return summary;
+  }
+
+  // ── journal reclamation (migration 031) ──────────────────────────────────
+  //
+  // Cutting and adopting bounds the LOGICAL backlog; it does not delete one
+  // byte. Every payload below a generation's base stayed in
+  // pfj.journal_records forever, which is how this deployment filled its
+  // production control store twice with nothing but test-branch journal
+  // data. This pass is the physical half.
+  //
+  // Bounded on every axis, because reclamation runs on a database that is by
+  // definition already under storage pressure: at most maxPages bounded
+  // pages per cycle, each its own small transaction, largest waste first,
+  // and the drain check between every call.
+  private async reclaimJournalStorage(summary: HistoryMaintenanceCycleSummary): Promise<void> {
+    if (!this.store.journalReclaimCandidates || !this.store.reclaimJournalRecords) {
+      // Reported in the cycle telemetry, NOT through the failure log: the
+      // log hook is documented as real failures only, and an older lineage
+      // is a deployment fact, not a failure. It still has to be visible —
+      // "journal records accumulate without bound" is the whole incident.
+      summary.reclaimUnavailable = true;
+      return;
+    }
+    let candidates: JournalReclaimCandidate[] = [];
+    try {
+      candidates = await this.store.journalReclaimCandidates(
+        this.reclaimScanLimit,
+        this.journalRetentionMs
+      );
+    } catch (error) {
+      this.recordFailure(summary, "journal reclaim scan", error);
+      return;
+    }
+    summary.reclaimCandidates = candidates.length;
+
+    let pagesLeft = this.reclaimMaxPagesPerCycle;
+    for (const candidate of candidates) {
+      if (this.halted() || pagesLeft <= 0) {
+        break;
+      }
+      // A suspended generation idle past retention still holding an un-cut
+      // tail is driven through the SAME deterministic recovery-cut path as a
+      // backlogged one. Nothing is deleted for it here — the cut and its
+      // adoption are what move the base, after which its records fall below
+      // the horizon like any other generation's.
+      if (candidate.suspendedPastRetention && candidate.nextSeq !== candidate.baseSeq) {
+        summary.agedGenerationsForced += 1;
+        await this.boundGeneration(
+          {
+            tenantId: candidate.tenantId,
+            volumeId: candidate.volumeId,
+            branchName: candidate.branchName,
+            generationId: candidate.generationId,
+            baseSeq: candidate.baseSeq,
+          } as GenerationBacklogStatus,
+          summary
+        );
+        if (this.halted()) {
+          break;
+        }
+      }
+      if (candidate.reclaimableRecords === "0") {
+        continue;
+      }
+      // Drain this generation in bounded pages; `more` says the horizon still
+      // has work below it. One unbounded DELETE would need the very disk
+      // space it is trying to release.
+      let more = true;
+      while (more && pagesLeft > 0 && !this.halted()) {
+        pagesLeft -= 1;
+        try {
+          const result = await this.store.reclaimJournalRecords({
+            generationId: candidate.generationId,
+            maxRows: this.reclaimBatchRows,
+          });
+          summary.recordsReclaimed += safeCount(result.deletedRecords);
+          summary.bytesReclaimed += safeCount(result.deletedBytes);
+          more = result.more;
+        } catch (error) {
+          // A generation that vanished between scan and reclaim (PF007), or
+          // a racing writer, is benign: the next cycle re-derives everything.
+          this.classify(summary, `journal reclaim ${candidate.generationId}`, error);
+          more = false;
+        }
+      }
+    }
   }
 
   // Drive one backlogged generation one step forward: ensure its recovery
@@ -521,6 +702,18 @@ export class HistoryMaintenanceLoop {
   private emit(summary: HistoryMaintenanceCycleSummary): void {
     this.telemetry.emit({ type: "history_maintenance", ...summary });
   }
+}
+
+// Reclamation counts arrive as canonical decimal strings (BIGINT). A value
+// past exact double representation is DROPPED from the cycle counter rather
+// than rounded: a per-cycle count that large means something is wrong, and an
+// approximate number would hide it.
+function safeCount(decimal: string): number {
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(decimal)) {
+    return 0;
+  }
+  const value = Number(decimal);
+  return Number.isSafeInteger(value) ? value : 0;
 }
 
 function validatedPositiveInt(value: number, name: string): number {

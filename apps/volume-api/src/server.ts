@@ -697,6 +697,40 @@ async function routeRequest(
     return;
   }
 
+  // Operator-visible control-store accounting (migration 031). Before this
+  // there was NONE: the only storage signal anywhere in the deployment was a
+  // percent-of-quota telemetry field that counted generations already past
+  // 70%, so the curve that filled this Postgres twice was invisible until it
+  // hit 100%. Admin-gated by guardTenantAccess above — these are byte counts
+  // across every tenant, so they are operator data, never tenant data.
+  if (
+    method === "GET" &&
+    parts.length === 4 &&
+    parts[1] === "admin" &&
+    parts[2] === "control-store" &&
+    parts[3] === "usage"
+  ) {
+    const usageHistory = (deps.metadata as { history?: PostgresHistoryRepository }).history;
+    if (!usageHistory?.journalStorageUsage) {
+      sendJson(res, 501, {
+        error: {
+          code: "CONTROL_STORE_USAGE_UNSUPPORTED",
+          message:
+            "Control-store accounting is not supported by this repository (migration 031 required).",
+        },
+      });
+      return;
+    }
+    const journal = await usageHistory.journalStorageUsage();
+    sendJson(res, 200, {
+      journal,
+      ...(deps.metadata.controlStoreUsage
+        ? { controlStore: await deps.metadata.controlStoreUsage() }
+        : {}),
+    });
+    return;
+  }
+
   if (method === "GET" && parts.length === 3 && parts[1] === "admin" && parts[2] === "integrity") {
     // Read-only referenced-blob existence walk (the retired volume-worker's
     // integrity job). Admin-gated by guardTenantAccess above.
@@ -853,6 +887,38 @@ async function routeRequest(
         })
       );
       console.log(`volume-api: volume retirement history cleanup ${JSON.stringify(cleanup)}`);
+      // JOURNAL RECLAMATION (migration 031). Retiring a volume used to leave
+      // every journal record it ever wrote in the control store forever:
+      // 021 set volumes.retired_at, 022 cancelled the cuts, and NOTHING
+      // released the pfj.journal_records payloads. That is how `portablefs
+      // rm` on test volumes filled this production Postgres twice.
+      //
+      // This drives the volume's generations terminal and moves each base to
+      // its own tip, so the WHOLE journal falls below the reclamation
+      // horizon; the maintenance loop's bounded pass then deletes the rows.
+      // Deletion is deliberately NOT done inline: it is unbounded work, and
+      // the retirement receipt must not wait on it. Idempotent, so it
+      // re-runs cleanly on every replay.
+      if (history.retireVolumeJournals) {
+        try {
+          const journals = await deps.runtime.trackEffect(
+            history.retireVolumeJournals({
+              tenantId: auth.tenantId,
+              volumeId: receipt.volumeId,
+            })
+          );
+          console.log(`volume-api: volume retirement journal release ${JSON.stringify(journals)}`);
+        } catch (error) {
+          // The retirement receipt is already durable and MUST be answered.
+          // A failed journal release is retried by the next replay and by
+          // the maintenance loop, which re-derives candidates from rows.
+          console.warn(
+            `volume-api: volume retirement journal release deferred for ${receipt.volumeId}: ${
+              error instanceof Error ? error.message.slice(0, 200) : "unknown error"
+            }`
+          );
+        }
+      }
     }
     // The response is EXACTLY the receipt the hosted control plane's ledger
     // validates and persists ({volumeId, retiredAt}) — operational detail
@@ -2932,8 +2998,16 @@ async function guardTenantAccess(
   }
 }
 
+// Liveness: the process is up. Dependency-free by design — a sick control
+// store must fail /readyz (which the deploy gate polls), never this, because
+// restarting a process cannot fix a database. /livez is the conventional
+// spelling of the identical check.
 function isHealthCheck(req: IncomingMessage): boolean {
-  return req.method === "GET" && (req.url ?? "/").split("?")[0] === "/healthz";
+  if (req.method !== "GET") {
+    return false;
+  }
+  const path = (req.url ?? "/").split("?")[0];
+  return path === "/healthz" || path === "/livez";
 }
 
 function isReadinessCheck(req: IncomingMessage): boolean {

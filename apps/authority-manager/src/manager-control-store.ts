@@ -553,12 +553,51 @@ export interface ManagerControlStore {
     operationId: string;
   }): Promise<LifecycleReceiptLookup>;
 
-  // Bounded readiness probe: control-store reachability plus pfm migration
-  // lineage (the SECURITY DEFINER surface exists). Never mutates. Optional —
-  // manager readiness treats absence as a failed component (fail closed).
-  healthProbe?(): Promise<{ ok: boolean; lineageComplete: boolean }>;
+  // Bounded readiness probe: control-store reachability, pfm migration
+  // lineage (the SECURITY DEFINER surface exists), AND a DURABLE WRITE.
+  //
+  // The write leg is not decoration. This probe used to be
+  // `SELECT to_regproc('pfm.manager_renew') IS NOT NULL` — a catalog read
+  // that an out-of-disk primary answers perfectly. During a total
+  // control-store outage (disk full, every lease write failing) it kept
+  // answering ok, /readyz kept answering 200, and the deploy gate declared
+  // the release healthy. Readiness for a control plane whose only job is
+  // durable transitions MUST be the ability to perform one.
+  //
+  // Optional — manager readiness treats absence as a failed component
+  // (fail closed).
+  healthProbe?(options?: { signal?: AbortSignal }): Promise<ManagerControlProbe>;
+
+  // Exact control-store consumption for operator accounting. Optional; an
+  // absent implementation simply publishes no usage gauges.
+  usageProbe?(options?: { signal?: AbortSignal }): Promise<ManagerControlStoreUsage>;
 
   close(): Promise<void>;
+}
+
+/**
+ * The coarse, stable readiness verdict. `code` is the ONLY failure detail
+ * that may reach an unauthenticated /readyz payload: no driver text, no SQL,
+ * no DSN fragment ever survives to it.
+ *
+ *   unreachable        the round-trip itself failed
+ *   lineage_incomplete reachable, but the pfm surface this build needs is absent
+ *   not_writable       reachable and current, but a durable write was REFUSED
+ *                      (out of disk, read-only primary, wedged writer)
+ */
+export type ManagerControlProbeCode = "unreachable" | "lineage_incomplete" | "not_writable";
+
+export interface ManagerControlProbe {
+  ok: boolean;
+  lineageComplete: boolean;
+  writable: boolean;
+  code?: ManagerControlProbeCode;
+}
+
+/** Canonical decimal strings: these are BIGINT byte counts. */
+export interface ManagerControlStoreUsage {
+  databaseBytes: string;
+  planeBytes: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,12 +1081,32 @@ export function managerRenewStatement(args: {
   };
 }
 
+// The bounded readiness-probe ring, matching pfm.control_write_probe_slots().
+// The SQL reduces any slot into range, so a drifted constant here can only
+// cost slot spread — never unbounded rows.
+const managerWriteProbeSlots = 16;
+
+function requireDecimalString(row: Record<string, unknown>, key: string): string {
+  const value = row[key];
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value)) {
+    throw new ControlStoreUnavailableError(
+      `control store response field ${key} is not a canonical decimal string`
+    );
+  }
+  return value;
+}
+
 export class PostgresManagerControlStore implements ManagerControlStore {
   private readonly pool: ManagerControlPool;
   private readonly connectionString: string;
   private readonly connectTimeoutMs: number;
   private readonly statementTimeoutMs: number;
   private readonly heartbeats: ClaimHeartbeat[] = [];
+  // One slot out of the bounded probe ring, chosen once per process. N
+  // manager replicas therefore do not serialize every readiness check on one
+  // row lock — a lock convoy on a HEALTHY store must never read as an outage
+  // — while the probe table stays bounded at the ring size forever.
+  private readonly writeProbeSlot = Math.floor(Math.random() * managerWriteProbeSlots);
 
   constructor(connectionString: string, options: PostgresManagerControlStoreOptions = {}) {
     this.connectionString = connectionString;
@@ -1096,23 +1155,123 @@ export class PostgresManagerControlStore implements ManagerControlStore {
     await this.pool.end();
   }
 
-  // healthProbe proves reachability with one cheap round-trip and pfm
-  // lineage by checking the SECURITY DEFINER renewal function exists —
-  // a reachable database missing the pfm surface is lineage-incomplete,
-  // not ready.
-  async healthProbe(): Promise<{ ok: boolean; lineageComplete: boolean }> {
+  // healthProbe proves, in this order:
+  //   1. reachability + pfm lineage — the SECURITY DEFINER renewal function
+  //      and the write probe this build needs both exist;
+  //   2. WRITE CAPABILITY — pfm.control_write_probe performs the same class
+  //      of durable transition a lease write performs (same SECURITY DEFINER
+  //      boundary, same pfm.require_durable_primary() admission, a real heap
+  //      tuple version, a real WAL record, a real synchronous commit).
+  //
+  // Step 2 is the whole point. Step 1 alone is a catalog read, and a Postgres
+  // whose disk is full answers catalog reads perfectly while refusing every
+  // lease write — which is exactly how a total control-store outage once
+  // passed the deploy gate. The write target is a BOUNDED ring of rows
+  // updated in place, so proving readiness never grows the control store.
+  //
+  // It reports instead of throwing: readiness handlers must not have to
+  // catch, and no driver text may escape toward an unauthenticated payload.
+  async healthProbe(options?: { signal?: AbortSignal }): Promise<ManagerControlProbe> {
+    let lineageComplete = false;
     try {
-      const result = await this.pool.query(
-        `SELECT to_regproc('pfm.manager_renew') IS NOT NULL AS lineage`,
-        []
+      const result = await this.probeQuery(
+        `SELECT to_regproc('pfm.manager_renew') IS NOT NULL
+            AND to_regprocedure('pfm.control_write_probe(int)') IS NOT NULL AS lineage`,
+        [],
+        options?.signal
       );
-      const lineageComplete = Boolean(
-        (result.rows[0] as { lineage?: boolean } | undefined)?.lineage
-      );
-      return { ok: lineageComplete, lineageComplete };
+      lineageComplete = Boolean((result.rows[0] as { lineage?: boolean } | undefined)?.lineage);
     } catch {
-      return { ok: false, lineageComplete: false };
+      return { ok: false, lineageComplete: false, writable: false, code: "unreachable" };
     }
+    if (!lineageComplete) {
+      // The write probe function may not exist yet; proving writes work
+      // cannot repair a short lineage, so report the lineage gap as-is.
+      return { ok: false, lineageComplete: false, writable: false, code: "lineage_incomplete" };
+    }
+    try {
+      await this.probeQuery(
+        `SELECT pfm.control_write_probe($1) AS r`,
+        [this.writeProbeSlot],
+        options?.signal
+      );
+      return { ok: true, lineageComplete: true, writable: true };
+    } catch {
+      // Reachable and current, but the store refused a durable transition.
+      return { ok: false, lineageComplete: true, writable: false, code: "not_writable" };
+    }
+  }
+
+  // usageProbe reports EXACT control-store consumption. PostgreSQL exposes no
+  // free-space primitive, so honest headroom cannot be computed inside the
+  // database; consumption can, and it is the curve that filled this database
+  // twice. The capacity budget belongs to the deployment, never to a guess
+  // made here.
+  async usageProbe(options?: { signal?: AbortSignal }): Promise<ManagerControlStoreUsage> {
+    const result = await this.probeQuery(
+      `SELECT pfm.control_store_usage() AS r`,
+      [],
+      options?.signal
+    );
+    const row = asRecord(result.rows[0], "control store usage");
+    const usage = asRecord(row["r"], "control store usage");
+    const planes = usage["planeBytes"];
+    const planeBytes: Record<string, string> = {};
+    if (planes !== null && typeof planes === "object" && !Array.isArray(planes)) {
+      for (const [plane, bytes] of Object.entries(planes as Record<string, unknown>)) {
+        if (typeof bytes === "string" && /^(?:0|[1-9][0-9]*)$/u.test(bytes)) {
+          planeBytes[plane] = bytes;
+        }
+      }
+    }
+    return {
+      databaseBytes: requireDecimalString(usage, "databaseBytes"),
+      planeBytes,
+    };
+  }
+
+  // Readiness probes must be bounded by the CALLER's deadline as well as by
+  // the pool's statement timeout: pg has no per-query cancellation, so an
+  // abort abandons the wait while the query settles on its own.
+  private async probeQuery(
+    text: string,
+    values: unknown[],
+    signal: AbortSignal | undefined
+  ): Promise<{ rows: unknown[] }> {
+    const query = this.pool.query(text, values);
+    if (!signal) {
+      return query;
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = (): void => {
+        if (!settled) {
+          settled = true;
+          reject(new ControlStoreUnavailableError("control store probe aborted"));
+        }
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+      query.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          if (!settled) {
+            settled = true;
+            resolve(value);
+          }
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          if (!settled) {
+            settled = true;
+            reject(error instanceof Error ? error : new Error("control store probe failed"));
+          }
+        }
+      );
+    });
   }
 
   // call runs one pfm function invocation. Single-statement transactions:
@@ -1865,8 +2024,14 @@ export class InMemoryManagerControlStore implements ManagerControlStore {
     this.closed = true;
   }
 
-  async healthProbe(): Promise<{ ok: boolean; lineageComplete: boolean }> {
-    return { ok: !this.closed, lineageComplete: !this.closed };
+  async healthProbe(): Promise<ManagerControlProbe> {
+    const live = !this.closed;
+    return {
+      ok: live,
+      lineageComplete: live,
+      writable: live,
+      ...(live ? {} : { code: "unreachable" as const }),
+    };
   }
 
   private async enter(target: FaultTarget): Promise<void> {

@@ -74,9 +74,15 @@ type Client struct {
 	establishMu sync.Mutex // serializes the one-time session establish
 	exact       *exactSession
 	exactSlots  uint32
-	closed      chan struct{}
-	closeOnce   sync.Once
-	poolOnce    sync.Once
+	// renewConn is the session lease's RESERVED transport, dialed on first
+	// renewal and never returned to the pool. Renewing through the pool let four
+	// concurrent bulk writes starve the lease past its TTL and fence the mount;
+	// see renewLoop. Guarded by renewMu.
+	renewMu   sync.Mutex
+	renewConn *conn
+	closed    chan struct{}
+	closeOnce sync.Once
+	poolOnce  sync.Once
 
 	// lifecycleMu serializes the terminal close transition with transport
 	// adoption. A dial that returns after Close/Abort cannot install its

@@ -33,13 +33,26 @@ Why these values:
   liveness `/healthz`) is the correct gate:
   - volume-api applies the metadata migrations at startup before serving,
     hence the generous 300s `healthcheckTimeout`. `/readyz` is control
-    readiness — metadata connectivity plus applied migration lineage —
-    which is exactly what must hold before traffic switches.
-  - authority-manager serves `/healthz` and `/readyz` on its HTTP control
-    port — 8788 by default, `PORT` when Railway injects it
+    readiness — applied migration lineage plus a bounded **durable write**
+    against the control store — which is exactly what must hold before
+    traffic switches.
+  - authority-manager serves `/healthz`, `/livez` and `/readyz` on its HTTP
+    control port — 8788 by default, `PORT` when Railway injects it
     (`apps/authority-manager/src/main.ts`, `src/server.ts`
     `readHealthCheck`). `/readyz` fails closed until the manager lease,
     control plane, and router hold (`docs/authority-manager.md`).
+
+  Both readiness probes WRITE. A read-only probe cannot tell a serving
+  control store apart from one that cannot accept another byte: an
+  out-of-disk primary answers `SELECT` perfectly while every lease and
+  journal write fails, and that gap once carried a "healthy" deploy through
+  a total control-store outage. On failure `/readyz` names a coarse,
+  stable code (`unreachable`, `migration_lineage_incomplete`,
+  `not_writable`, `timeout`, `components_unavailable`) and nothing else —
+  the endpoint is unauthenticated, so no database text reaches it.
+  Liveness (`/healthz`, `/livez`) stays dependency-free on purpose:
+  restarting a process cannot fix a database, and restarting the manager
+  throws away its epoch claim.
   - history-worker serves `/healthz`, `/readyz`, and `/metrics` on
     `PFH_WORKER_LISTEN_ADDR` (`vcs/internal/histworker/http.go`).
     **REQUIRED port coupling** — the config file alone is not sufficient:

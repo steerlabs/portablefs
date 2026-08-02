@@ -532,10 +532,17 @@ export interface MetadataRepository {
     volumeId: string;
     branchName: string;
   }): Promise<JournalActivationStatus>;
-  // Bounded control-plane readiness probe: one cheap query plus a migration
-  // lineage check. Never mutates and never touches blob stores.
+  // Bounded control-plane readiness probe: a migration lineage check plus a
+  // DURABLE WRITE against a bounded probe ring. It deliberately mutates —
+  // a read-only probe cannot tell a serving control store apart from one
+  // that cannot accept another byte, and that gap once shipped a healthy
+  // deploy through a total out-of-disk outage. Never touches blob stores.
   // Implementations must honor the abort signal.
   probeControlPlane?(options?: { signal?: AbortSignal }): Promise<ControlPlaneProbeResult>;
+  // Exact control-store consumption for operator accounting. Never inferred:
+  // PostgreSQL exposes no free-space primitive, so this reports what IS
+  // consumed and the caller owns the capacity budget.
+  controlStoreUsage?(): Promise<ControlStoreUsage>;
 }
 
 export interface ControlPlaneProbeResult {
@@ -544,7 +551,35 @@ export interface ControlPlaneProbeResult {
   migrationLineageComplete: boolean;
   /** True when the round-trip itself succeeded (lineage may still be short). */
   reachable?: boolean;
+  /**
+   * True when a durable write COMMITTED during this probe. This is the leg an
+   * out-of-disk primary fails while every read still succeeds.
+   */
+  writable?: boolean;
   error?: string;
+}
+
+/**
+ * Exact control-store consumption. Every value is a canonical decimal string:
+ * these are BIGINT byte counts that outgrow the JS safe integer exactly when
+ * a deployment is large enough to care about them.
+ */
+export interface ControlStoreUsage {
+  databaseBytes: string;
+  /**
+   * pg_total_relation_size of the journal: heap + indexes + TOAST + bloat.
+   * Deliberately the relation size and not a sum of payload bytes — this is
+   * what consumes the disk, and it costs O(1) instead of a full scan that
+   * would slow down exactly as the backlog it reports grows.
+   */
+  journalTableBytes: string;
+  journalRecords: string;
+  /**
+   * Records below every generation's logical base. An UPPER BOUND: the
+   * proven horizon additionally clamps to in-flight cut windows and
+   * recovery-anchor evidence (see pfj.journal_storage_usage).
+   */
+  reclaimableJournalRecords: string;
 }
 
 export class MetadataConflictError extends Error {

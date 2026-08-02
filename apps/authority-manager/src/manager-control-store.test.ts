@@ -837,15 +837,31 @@ describe("PostgresManagerControlStore (scripted pool)", () => {
     ).rejects.toBeInstanceOf(ControlStoreUnavailableError);
   });
 
-  test("healthProbe reports pfm lineage and never throws on outages", async () => {
-    const pool = new ScriptedPool().replyRaw([{ lineage: true }]);
+  // healthProbe used to answer {ok:true} off a single catalog read. That is
+  // the probe that stayed green through a total out-of-disk control-store
+  // outage, so its contract is now lineage read THEN durable write, and
+  // `ok` requires BOTH.
+  test("healthProbe proves pfm lineage AND write capability, and never throws on outages", async () => {
+    const pool = new ScriptedPool()
+      .replyRaw([{ lineage: true }])
+      .reply({ ok: true, slot: 0, probeSeq: "7", dbTimeMs: "1783710000000" });
     const store = new PostgresManagerControlStore("postgres://ignored", { pool });
-    expect(await store.healthProbe()).toEqual({ ok: true, lineageComplete: true });
+    expect(await store.healthProbe()).toEqual({
+      ok: true,
+      lineageComplete: true,
+      writable: true,
+    });
     expect(pool.calls[0]!.text).toContain("to_regproc('pfm.manager_renew')");
+    expect(pool.calls[1]!.text).toContain("pfm.control_write_probe(");
 
     const down = new ScriptedPool().fail(new Error("ECONNREFUSED"));
     const downStore = new PostgresManagerControlStore("postgres://ignored", { pool: down });
-    expect(await downStore.healthProbe()).toEqual({ ok: false, lineageComplete: false });
+    expect(await downStore.healthProbe()).toEqual({
+      ok: false,
+      lineageComplete: false,
+      writable: false,
+      code: "unreachable",
+    });
   });
 
   test("an unexpected row count or malformed dbTime is a retryable store failure, never a guess", async () => {

@@ -1226,54 +1226,81 @@ func (a *attach) refreshCrossedItems(items map[uint64]struct{}) {
 // crossed publication concerned a value the daemon's own subsequent traffic
 // supersedes. So waiting is not a compromise, it is the correct order.
 //
+// ── ROUND 16: WHY THE POINT-IN-TIME CHECK WAS NOT A YIELD ───────────────────
+//
+// The paragraph above was right about the principle and wrong about the
+// mechanism. `if a.sizeMutationReserved(itemID) { continue }` samples the
+// reservation count ONE INSTRUCTION BEFORE acquireRefreshIntent installs an
+// exclusive intent, and it samples it from outside the item's arrival order. An
+// ordinary write loop — open(O_APPEND), write, fsync, close, repeat — is idle in
+// exactly that sense between one close and the next open. The repair wins that
+// gap by construction, installs its intent, and from that instant every
+// ARRIVING size mutation on the item queues behind it for the whole pass.
+//
+// Measured live on a fresh mount with ONE file: fsync=400.9s (uninterruptible,
+// state UN), open=50.1s, fsync=300.3s, and NORMAL the instant the 10-minute
+// budget expired. Round 15 turned one two-minute stall into up to ten minutes of
+// them.
+//
+// A check cannot fix this, because the thing being checked is a property of the
+// future: whether a mutation will arrive during the pass. So the repair stops
+// checking and starts YIELDING.
+//
+// ── THE TWO WAYS THIS REPAIR NOW ENDS ───────────────────────────────────────
+//
+//  1. IT CONVERGES BY REFRESHING, on an item that is genuinely quiet. The pass
+//     is the same exact transaction as before, and it is fast.
+//
+//  2. IT CONVERGES BY OBSERVING THE WRITER, on an item that is not. The pass
+//     takes its intent DEFERENTIALLY (refreshintent.go): a size mutation
+//     queueing behind it preempts it, it unwinds, and the application proceeds.
+//     The debt is then discharged by the writer itself, and this is a proof
+//     rather than a shrug:
+//
+//     – The caller published the item's lazy content AND namespace
+//     invalidations before this repair was ever started — that is the first
+//     thing noteCrossedScope and repairDisconnectedPublications do — so the
+//     kernel has already been told to drop its cached pages and names for it.
+//     – What the exact pass adds on top is the item's SIZE, pushed into the
+//     vnode. A size mutation that reaches publishRecordAttrLocked has installed
+//     this daemon's own post-op attributes for the item, which is the same
+//     value from the same source arriving by the ordinary reply path.
+//
+//     So an attribute publication observed after the crossing supersedes
+//     anything the crossed reply could have left behind, and the repair is
+//     DONE — not deferred, not degraded.
+//
+// Preemption is therefore never counted as a failed attempt, and a busy file no
+// longer walks the budget down to the give-up path. The give-up path stays
+// exactly as it is, as the backstop for the case both of the above miss: an item
+// that neither goes quiet nor is written for the whole budget.
+//
 // ── WHAT IS STILL DEFINITE ──────────────────────────────────────────────────
 //
-// Every attempt still ends definitely, and the debt is never dropped: it is
-// retried until the refresh reports success, which is the only thing that
-// discharges it. The retry ends only when the ATTACH ends, and an attach that is
-// going away takes the kernel state in question with it — there is no window in
-// which the daemon serves on while quietly abandoning a repair.
+// Every attempt still ends definitely, and the debt is never dropped: it ends by
+// converging, by being discharged by a publication, or on the reported give-up.
+// The retry still ends when the ATTACH ends, and an attach that is going away
+// takes the kernel state in question with it.
 func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 	a.noteCoherenceRepairing(1)
 	defer a.noteCoherenceRepairing(-1)
+	// The convergence witness is armed BEFORE the first attempt, so no
+	// publication that happens during the repair can be missed.
+	stopWatch := a.watchRepairPublications(itemID)
+	defer stopWatch()
 	giveUp := time.Now().Add(crossedRepairBudget)
 	backoff := crossedRepairRetryDelay
 	var err error
+	var yields int
 	for attempt := 0; ; attempt++ {
 		if lifetime.Err() != nil {
 			return
 		}
-		// THE REPAIR YIELDS TO THE APPLICATION. IT NEVER QUEUES AHEAD OF IT.
-		//
-		// exactKernelRefreshMode acquires the item's REFRESH INTENT, and an
-		// installed intent blocks every ARRIVING size mutation on that item
-		// until the pass is done. That is correct for a single pass and fatal
-		// for a retry loop: re-entering the turnstile every two seconds means a
-		// writer on the same file never gets a sustained window, so the retry
-		// that was supposed to make a busy item eventually repairable instead
-		// STOPPED the writer. Measured live on the 1.5 MB/s soak: the writer
-		// went from 1 tick/s to zero ticks for 4½ minutes, with no error — a
-		// stall, which is worse than the fail-closed verdict this replaces
-		// because it is silent.
-		//
-		// So a busy item is not attempted at all. The check is a read of the
-		// reservation count and takes no ticket, so it cannot itself delay a
-		// mutation, and an item that is being written is an item whose kernel
-		// view its own writer is re-establishing anyway.
-		if a.sizeMutationReserved(itemID) {
-			if !a.waitBeforeRepairRetry(lifetime, &backoff, giveUp) {
-				a.reportRepairGaveUp(itemID, errRepairItemStayedBusy)
-				return
-			}
-			continue
+		if a.repairDischargedByPublication(itemID, attempt, yields) {
+			return
 		}
 		ctx, cancel := context.WithTimeout(lifetime, crossedRefreshTimeout)
-		// requireAuthorityIdentity is false: a crossed scope's item may have
-		// been renamed or replaced by the peer that took the delegation, and a
-		// namespace transition is owned by namespace handling rather than by
-		// this repair. The exact-identity claim belongs to a RelatedInos
-		// refresh, which is making a stronger statement than this one.
-		err = a.exactKernelRefreshMode(ctx, itemID, false)
+		err = a.exactKernelRefreshYielding(ctx, itemID)
 		cancel()
 		if err == nil {
 			if attempt > 0 {
@@ -1284,6 +1311,24 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 			}
 			return
 		}
+		if errors.Is(err, errRefreshIntentPreempted) {
+			// The application took the item. That is the outcome this repair
+			// wants on a busy file, so it costs no budget commentary and — see
+			// repairDischargedByPublication — the writer that took it is about to
+			// discharge the debt itself.
+			yields++
+			if !a.waitBeforeRepairRetry(lifetime, &backoff, giveUp) {
+				if lifetime.Err() != nil {
+					return
+				}
+				if a.repairDischargedByPublication(itemID, attempt, yields) {
+					return
+				}
+				a.reportRepairGaveUp(itemID, errRepairItemStayedBusy)
+				return
+			}
+			continue
+		}
 		if attempt == 0 {
 			log.Printf(
 				"portablefsd: attach %s: kernel coherence repair for item %d did "+
@@ -1292,10 +1337,46 @@ func (a *attach) repairCrossedItem(lifetime context.Context, itemID uint64) {
 			)
 		}
 		if !a.waitBeforeRepairRetry(lifetime, &backoff, giveUp) {
+			if lifetime.Err() != nil {
+				// The ATTACH is going away, not the budget. It takes the kernel
+				// state in question with it, and recording a sticky degraded
+				// reason on the way out would be a false statement about a mount
+				// that no longer exists.
+				return
+			}
+			if a.repairDischargedByPublication(itemID, attempt, yields) {
+				return
+			}
 			a.reportRepairGaveUp(itemID, err)
 			return
 		}
 	}
+}
+
+// repairDischargedByPublication reports whether this daemon has restated the
+// item's attributes since the repair began watching, and logs the discharge.
+//
+// A publication is only a discharge for a repair that has ALREADY yielded at
+// least once. Before that the item is quiet as far as this repair knows, and a
+// quiet item must be proved by the exact pass — a stray publication from a
+// getattr is not a reason to skip a refresh that would have succeeded anyway.
+// After a yield the situation is the opposite: the writer is live, its own
+// publications are what the kernel is being driven by, and the exact pass has
+// nothing to add.
+func (a *attach) repairDischargedByPublication(itemID uint64, attempt, yields int) bool {
+	if yields == 0 {
+		return false
+	}
+	published := a.repairPublicationsSince(itemID)
+	if published == 0 {
+		return false
+	}
+	log.Printf(
+		"portablefsd: attach %s: kernel coherence repair for item %d discharged by "+
+			"%d local attribute publication(s) after %d attempt(s) and %d yield(s) to "+
+			"the application", a.ref, itemID, published, attempt, yields,
+	)
+	return true
 }
 
 // waitBeforeRepairRetry paces one retry and reports whether the loop may go
@@ -1427,7 +1508,15 @@ const coherenceRepairingDetail = "kernel coherence repair in progress: " +
 // crossedRefreshTimeout bounds the backstop repair. It matches the control
 // plane's own post-write refresh bound, because it is the same operation
 // against the same kernel.
-const crossedRefreshTimeout = 2 * time.Minute
+//
+// It is no longer a bound the APPLICATION can be made to wait for: the pass it
+// bounds is deferential, so a size mutation arriving at any point inside it
+// preempts it (refreshintent.go). What is left is a bound on how long a pass may
+// spend against a quiet item that will not settle, and the give-up path is the
+// backstop for that.
+//
+// A var so failure-shape tests can compress it; production never changes it.
+var crossedRefreshTimeout = 2 * time.Minute
 
 // refreshLifetimeContext is the attach's own lifetime, or the background context
 // for a bare test attach that never activated one.
@@ -2754,6 +2843,31 @@ func (a *attach) refreshKernelItemExactMode(
 	itemID uint64,
 	requireAuthorityIdentity bool,
 ) error {
+	return a.refreshKernelItemExactPass(ctx, itemID, requireAuthorityIdentity, false)
+}
+
+// refreshKernelItemExactPass is the exact transaction, in one of two modes.
+//
+// yieldToMutations takes the item's intent DEFERENTIALLY (refreshintent.go): an
+// application size mutation queueing behind this pass preempts it, the pass's
+// own context is cancelled, and it returns errRefreshIntentPreempted having
+// touched nothing. Only the crossed-scope repair asks for that; every barrier
+// caller runs the exclusive mode, unchanged.
+//
+// The preemption is delivered by CANCELLING THE PASS CONTEXT rather than by a
+// check the pass consults at the top of each attempt. That is deliberate: every
+// wait inside the pass — the authority sample's own retries, the sample RPC, the
+// inter-attempt coalesce — is already context-aware, so one cancellation unwinds
+// all of them at once and the application's wait is a wakeup rather than a
+// polling interval. The one region that is not cancellable is the pinned
+// ftruncate, and preemption is refused while a pin is installed for exactly that
+// reason.
+func (a *attach) refreshKernelItemExactPass(
+	ctx context.Context,
+	itemID uint64,
+	requireAuthorityIdentity bool,
+	yieldToMutations bool,
+) (err error) {
 	// THE INTENT COMES FIRST, AND IT IS NOT ONE OF THE ATTEMPTS.
 	//
 	// Reservation contention is not a failure to converge, and spending
@@ -2766,11 +2880,35 @@ func (a *attach) refreshKernelItemExactMode(
 	// spending a single attempt. From here on no reservation can appear on the
 	// item, so the attempts below are free to be about what they were always
 	// about: racing the authority sample, not racing local writers.
-	releaseIntent, err := a.acquireRefreshIntent(ctx, itemID)
+	releaseIntent, preempt, err := a.acquireRefreshIntentMode(ctx, itemID, yieldToMutations)
 	if err != nil {
+		if errors.Is(err, errRefreshIntentPreempted) {
+			return err
+		}
 		return fmt.Errorf("portablefsd: exact kernel refresh item %d: %w", itemID, err)
 	}
 	defer releaseIntent()
+	if yieldToMutations {
+		passCtx, cancelPass := context.WithCancel(ctx)
+		defer cancelPass()
+		go func() {
+			select {
+			case <-preempt:
+				cancelPass()
+			case <-passCtx.Done():
+			}
+		}()
+		ctx = passCtx
+		defer func() {
+			// The pass's own error is whatever the cancellation produced; the
+			// CAUSE is what the caller has to act on, and preemption is not a
+			// failure. Rewriting it here keeps every return path honest without
+			// threading the distinction through each of them.
+			if err != nil && preemptedNow(preempt) {
+				err = errRefreshIntentPreempted
+			}
+		}()
+	}
 	// A concurrent application write can advance the composed view between
 	// sample, marked truncate, and verification. Re-run that optimistic
 	// transaction a bounded number of times; this is ordering against a live
@@ -2817,6 +2955,43 @@ func (a *attach) exactKernelRefreshMode(
 		return a.testExactKernelRefresh(ctx, itemID)
 	}
 	return a.refreshKernelItemExactMode(ctx, itemID, requireAuthorityIdentity)
+}
+
+// exactKernelRefreshYielding is exactKernelRefreshMode for the crossed-scope
+// repair: a DEFERENTIAL pass that stands aside for application size mutations.
+//
+// The per-stripe gate is still taken, and taking it is safe here for the reason
+// it always was — a pass waiting on the gate holds no claim on any item, so it
+// starves nobody — and the wait is bounded by ctx like every other.
+func (a *attach) exactKernelRefreshYielding(ctx context.Context, itemID uint64) error {
+	release, err := a.acquireKernelRefreshGate(ctx, itemID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if a.testExactKernelRefresh != nil {
+		return a.testExactKernelRefresh(ctx, itemID)
+	}
+	// requireAuthorityIdentity is false: a crossed scope's item may have been
+	// renamed or replaced by the peer that took the delegation, and a namespace
+	// transition is owned by namespace handling rather than by this repair. The
+	// exact-identity claim belongs to a RelatedInos refresh, which is making a
+	// stronger statement than this one.
+	return a.refreshKernelItemExactPass(ctx, itemID, false, true)
+}
+
+// preemptedNow reports whether a deferential pass's preemption has already been
+// announced. It never blocks.
+func preemptedNow(preempt <-chan struct{}) bool {
+	if preempt == nil {
+		return false
+	}
+	select {
+	case <-preempt:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *attach) acquireKernelRefreshGate(

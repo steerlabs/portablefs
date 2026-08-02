@@ -29,7 +29,7 @@ import type { ServingPhase } from "./runtime.js";
 interface ControlStatus {
   ok: boolean;
   migrationLineageComplete: boolean;
-  code?: "timeout" | "unreachable" | "migration_lineage_incomplete";
+  code?: "timeout" | "unreachable" | "migration_lineage_incomplete" | "not_writable";
 }
 
 export interface ReadinessReport {
@@ -141,16 +141,32 @@ function toControlStatus(result: ControlPlaneProbeResult): ControlStatus {
   if (result.ok) {
     return { ok: true, migrationLineageComplete: result.migrationLineageComplete };
   }
-  // Coarse classification only: lineage state is a boolean the probe already
-  // computed; everything else collapses to "unreachable".
+  // Coarse classification only: lineage and write capability are booleans the
+  // probe already computed; everything else collapses to "unreachable".
+  //
+  // `not_writable` is the code the out-of-disk outage needed and did not
+  // have: the store answered every read, so "unreachable" would have been a
+  // lie and "ok" was the lie that actually shipped.
   return {
     ok: false,
     migrationLineageComplete: result.migrationLineageComplete,
-    code:
-      result.migrationLineageComplete === false && result.reachable === true
-        ? "migration_lineage_incomplete"
-        : "unreachable",
+    code: coarseFailureCode(result),
   };
+}
+
+function coarseFailureCode(
+  result: ControlPlaneProbeResult
+): "unreachable" | "migration_lineage_incomplete" | "not_writable" {
+  if (result.reachable !== true) {
+    return "unreachable";
+  }
+  if (result.migrationLineageComplete === false) {
+    return "migration_lineage_incomplete";
+  }
+  if (result.writable === false) {
+    return "not_writable";
+  }
+  return "unreachable";
 }
 
 function validatedPositiveInt(value: number, name: string): number {

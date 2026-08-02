@@ -170,6 +170,60 @@ export interface VolumeRetireCleanupResult {
   cutsCanceled: number;
 }
 
+/**
+ * One reclaimable generation (migration 031). Byte and record counts are
+ * canonical decimal strings: they are BIGINTs, and a 20 GB journal is exactly
+ * the situation where rounding them would be a lie.
+ */
+export interface JournalReclaimCandidate {
+  generationId: string;
+  tenantId: string;
+  volumeId: string;
+  branchId: string;
+  branchName: string;
+  status: string;
+  recordCodec: string;
+  baseSeq: string;
+  nextSeq: string;
+  /** The proven exclusive floor below which records may be deleted. */
+  horizonSeq: string;
+  /**
+   * Records below the horizon, taken from the generation's seq span rather
+   * than counted: exact while seqs are dense, an upper bound after a partial
+   * trim. Counting them would cost a scan of the very backlog this exists to
+   * drain.
+   */
+  reclaimableRecords: string;
+  /** Suspended and idle past retention: cut it on AGE, not on backlog size. */
+  suspendedPastRetention: boolean;
+}
+
+export interface JournalReclaimResult {
+  generationId: string;
+  deletedRecords: string;
+  deletedBytes: string;
+  horizonSeq: string;
+  /** Another bounded page is waiting below the horizon. */
+  more: boolean;
+}
+
+export interface JournalRetireResult {
+  volumeId: string;
+  generationsRetired: string;
+  reclaimableRecords: string;
+}
+
+export interface JournalStorageUsage {
+  generations: string;
+  terminalGenerations: string;
+  records: string;
+  /** Records below the PROVEN horizon (clamped by cut windows + anchors). */
+  reclaimableRecords: string;
+  /** heap + indexes + TOAST + bloat: what actually consumes the disk. */
+  tableBytes: string;
+  dbTimeMs: string;
+}
+
 export interface AdoptCutResult {
   adoptionId: string;
   cutId: string;
@@ -612,6 +666,81 @@ export class PostgresHistoryRepository {
       [limit]
     );
     return rows.map((row) => row.out as ServingPinStatus);
+  }
+
+  // ── journal reclamation (migration 031) ───────────────────────────────────
+  //
+  // Adoption is a LOGICAL trim: it moves base_seq and subtracts the backlog
+  // counters, leaving every BYTEA payload below the base in the table. That
+  // is how this deployment filled its control store twice with nothing but
+  // test-branch journal data. These four calls are the physical half.
+
+  /**
+   * Generations with records below their PROVEN reclamation horizon,
+   * largest waste first. `suspendedPastRetention` marks a generation that a
+   * backlog-percent threshold can never reach: suspended, idle past the
+   * retention window, and therefore never cut, never adopted and never
+   * reclaimable until it is cut on AGE instead of on size.
+   */
+  async journalReclaimCandidates(
+    limit = 32,
+    retentionMs = 604_800_000
+  ): Promise<JournalReclaimCandidate[]> {
+    const { rows } = await this.pool.query(
+      `SELECT pfj.journal_reclaim_candidates($1,$2) AS out`,
+      [limit, String(retentionMs)]
+    );
+    const out = firstRowJson<JournalReclaimCandidate[]>(rows, "out");
+    return Array.isArray(out) ? out : [];
+  }
+
+  /**
+   * Delete one BOUNDED page of records below the generation's proven
+   * horizon. Bounded on purpose: a 20 GB backlog must drain as a stream of
+   * small transactions, never as one unbounded DELETE that would itself need
+   * the disk space it is trying to release. `more` says another page is
+   * waiting; every call is independently retryable.
+   */
+  async reclaimJournalRecords(input: {
+    generationId: string;
+    maxRows?: number;
+  }): Promise<JournalReclaimResult> {
+    const { rows } = await this.pool.query(`SELECT pfj.journal_reclaim($1,$2) AS out`, [
+      input.generationId,
+      input.maxRows ?? 512,
+    ]);
+    return firstRowJson<JournalReclaimResult>(rows, "out")!;
+  }
+
+  /**
+   * The reclamation half of `portablefs rm <volume>`. Retiring a volume used
+   * to set volumes.retired_at and cancel its cuts while leaving every
+   * journal record it ever wrote in the control store forever. This drives
+   * the volume's generations terminal and moves each base to its own tip, so
+   * the WHOLE journal falls below the reclaim horizon and the ordinary
+   * bounded reclaim pass releases it. Refuses a live volume (PF008): the
+   * retirement receipt is the precondition, never an effect.
+   */
+  async retireVolumeJournals(input: {
+    tenantId: string;
+    volumeId: string;
+  }): Promise<JournalRetireResult> {
+    const { rows } = await this.pool.query(
+      `SELECT pfj.journal_retire_for_volume($1,$2) AS out`,
+      [input.tenantId, input.volumeId]
+    );
+    return firstRowJson<JournalRetireResult>(rows, "out")!;
+  }
+
+  /**
+   * Operator-visible journal accounting. Before this there was none: the
+   * only storage signal in the whole deployment was a percent-of-quota
+   * telemetry field that only counted generations already past 70%, so the
+   * curve that filled the disk was invisible until it hit 100%.
+   */
+  async journalStorageUsage(): Promise<JournalStorageUsage> {
+    const { rows } = await this.pool.query(`SELECT pfj.journal_storage_usage() AS out`, []);
+    return firstRowJson<JournalStorageUsage>(rows, "out")!;
   }
 
   // ── legacy → managed conversion (the 013 activation plane) ────────────────

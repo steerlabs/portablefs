@@ -362,9 +362,37 @@ func (c *Client) Features() uint64 {
 	return es.features
 }
 
-// renewLoop periodically resumes (durably renews) the session lease. On a
-// definite ESTALE the session is fenced — the lease was lost or a newer
-// generation took over; this mount must not mutate again.
+// ── THE LEASE IS NOT DATA (ROUND 16, DEFECT B) ──────────────────────────────
+//
+// The renewal used to run through doRaw, which takes a POOLED connection, and
+// takeConn is an unbounded blocking receive on a pool of four that every
+// write-through mutation also draws from — each holding its connection for up
+// to opTimeout (60s). Four concurrent bulk writes is therefore all it takes to
+// stop the lease renewing, and a burst produces far more than four.
+//
+// Measured live: 768 MiB written unpaced at 110 MB/s (every byte on the
+// uncharged authority lane, so nothing paced it) starved the renewal past the
+// 90-second lease TTL. The authority's sweeper journaled the session terminal,
+// the next reply was ESTALE, finishExact fenced the session PERMANENTLY, and
+// 734 MiB of data the kernel had already acknowledged to the application was
+// lost at the deferred flush. The same 768 MiB paced at 8 MB/s was byte-exact.
+//
+// This is the identical disease the authority-manager's claim heartbeat had one
+// commit ago, and it takes the identical cure: the renewal gets a RESERVED
+// transport of its own, so no amount of data-plane traffic can queue in front of
+// the one call that keeps this mount alive. Two further properties come with it,
+// both borrowed from the manager fix:
+//
+//   - EACH ATTEMPT IS BOUNDED TO ONE INTERVAL. Two slow attempts can no longer
+//     overrun the TTL between them; a hung attempt is abandoned and the next
+//     tick redials.
+//   - EVERY FAILURE MODE IS SILENCE. A renewal that cannot be made simply does
+//     not move the lease, and the authority fences on schedule — which is the
+//     correct, conservative outcome and exactly what happened before.
+//
+// It is deliberately NOT a wider change to the pool. The pool is sized for the
+// data plane and should be; what was wrong is that a control-plane obligation
+// was drawing from it at all.
 func (c *Client) renewLoop(es *exactSession) {
 	interval := time.Duration(es.leaseMs) * time.Millisecond / 3
 	if interval <= 0 {
@@ -373,6 +401,7 @@ func (c *Client) renewLoop(es *exactSession) {
 	if interval > 30*time.Second {
 		interval = 30 * time.Second
 	}
+	defer c.releaseLeaseConn()
 	for {
 		select {
 		case <-es.stop:
@@ -381,17 +410,91 @@ func (c *Client) renewLoop(es *exactSession) {
 			return
 		case <-time.After(interval):
 		}
-		resp, err := c.doRaw(&Request{
-			Op: OpSessionResume, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
-		}, true)
-		if err != nil {
-			continue // transport trouble: keep trying; the lease has slack
-		}
-		if resp.Status == ESTALE {
-			es.fence()
+		if fenced := c.renewOnce(es, interval); fenced {
 			return
 		}
 	}
+}
+
+// renewOnce makes one lease renewal on the session's own reserved transport and
+// reports whether the session was definitely fenced by it.
+//
+// bound is one renewal interval: an attempt that cannot finish inside its own
+// tick has already lost that tick, and holding the reserved transport past it
+// would only make the NEXT tick late too.
+func (c *Client) renewOnce(es *exactSession, bound time.Duration) (fenced bool) {
+	cn, err := c.leaseConn()
+	if err != nil {
+		return false // transport trouble: keep trying; the lease has slack
+	}
+	resp, err := cn.boundedRoundtrip(&Request{
+		Op: OpSessionResume, SessionID: es.id, SessionGen: es.gen, SessionToken: es.token,
+	}, bound)
+	if err != nil {
+		// The reserved transport is this loop's alone, so a failed roundtrip may
+		// have left it mid-frame with nobody else to notice. Retire it; the next
+		// tick dials a fresh one.
+		c.releaseLeaseConn()
+		return false
+	}
+	if resp.Status == ESTALE {
+		es.fence()
+		return true
+	}
+	return false
+}
+
+// leaseConn returns the session lease's reserved transport, dialing it on first
+// use. It is registered as a DEDICATED conn, so it is interrupted and joined by
+// the client's own close exactly like the subscribe stream.
+//
+// gateExempt for the same reason the subscribe stream is: the lease is a
+// recovery-critical path, and refusing to dial it while the fail-fast breaker is
+// engaged would guarantee the fence the breaker is trying to survive.
+func (c *Client) leaseConn() (*conn, error) {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
+	if c.renewConn != nil {
+		return c.renewConn, nil
+	}
+	cn := &conn{
+		addrs:      c.addrs,
+		tls:        c.tls,
+		auth:       c.credentialForHandshake,
+		transport:  c.transport,
+		client:     c,
+		health:     c.health,
+		gateExempt: true,
+	}
+	if !c.registerDedicated(cn) {
+		return nil, net.ErrClosed
+	}
+	if err := cn.ensure(); err != nil {
+		cn.reset()
+		c.unregisterDedicated(cn)
+		return nil, err
+	}
+	if c.isClosed() {
+		cn.reset()
+		c.unregisterDedicated(cn)
+		return nil, net.ErrClosed
+	}
+	c.renewConn = cn
+	return cn, nil
+}
+
+// releaseLeaseConn retires the reserved transport. It is idempotent, and safe to
+// call from the renew loop's exit as well as from a failed attempt.
+func (c *Client) releaseLeaseConn() {
+	c.renewMu.Lock()
+	cn := c.renewConn
+	c.renewConn = nil
+	c.renewMu.Unlock()
+	if cn == nil {
+		return
+	}
+	cn.reset()
+	c.unregisterDedicated(cn)
 }
 
 // doRaw runs one session-management request (probe/open/resume) on a pooled
