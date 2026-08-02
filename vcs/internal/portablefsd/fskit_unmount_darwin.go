@@ -33,14 +33,23 @@ func hostFSKitKernelOps() fskitKernelOps {
 			// premise is that in-flight work is being abandoned — the durable
 			// tail has already been parked as a recovery job by the time this
 			// runs — so a detach that stops for a busy vnode is not an escape
-			// hatch at all. The clean path still passes flags 0: a mount that
-			// needs forcing is not cleanly unmountable, and saying so is the
-			// only way a leaked reference ever gets found.
-			flags := 0
+			// hatch at all. The clean path still passes no force flag: a mount
+			// that needs forcing is not cleanly unmountable, and saying so is
+			// the only way a leaked reference ever gets found.
+			//
+			// THE SYSCALL IS ISSUED OUT OF PROCESS. `umount -f` is exactly
+			// unmount(2) with MNT_FORCE, and `umount` is exactly unmount(2) with
+			// flags 0 — but in a child whose kernel wait cannot pin portablefsd.
+			// See kerneldetach.go for why an in-process unmount(2) is the one
+			// call that can make this daemon unkillable.
+			args := []string{"--", mountPath}
 			if force {
-				flags = unix.MNT_FORCE
+				args = append([]string{"-f"}, args...)
 			}
-			if err := unix.Unmount(mountPath, flags); err != nil {
+			if err := runKernelDetach(kernelDetachBudget, mountPath, args...); err != nil {
+				if abandonedKernelDetach(err) {
+					return err
+				}
 				return fmt.Errorf("unmount exact FSKit mount at %s: %w", mountPath, err)
 			}
 			present, err = exactFSKitMountPresent(mountPath, attachRef)

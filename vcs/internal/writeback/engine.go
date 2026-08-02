@@ -2421,9 +2421,22 @@ func (e *Engine) SyncLocal() error {
 	return nil
 }
 
-// Pending reports the unshipped acknowledged backlog.
+// Pending reports the unshipped acknowledged backlog: the live stream's
+// unshipped records PLUS every parked or contained recovery job's
+// durable-but-unapplied remainder.
+//
+// The parked half is not a refinement. A forced unmount parks its undrained
+// tail as a durable recovery job, and until that job actually replays, those
+// bytes are acknowledged, on disk, and NOT at the authority — which is the
+// definition of this number. Reading only the live flusher made a fresh attach
+// over an unreplayed 156 MiB tail report zero pending, so every drain-to-zero
+// check in the product answered "drained" over data that was in fact
+// unrecoverable. A contained job's remainder keeps counting for the same
+// reason, and stops only when an operator clears the containment.
 func (e *Engine) Pending() (records int, bytes int64) {
-	return e.fl.pendingStats()
+	records, bytes = e.fl.pendingStats()
+	jobRecords, jobBytes := e.recovery.unrecovered()
+	return records + int(jobRecords), bytes + int64(jobBytes)
 }
 
 // Close drains everything, releases every delegation, writes the clean CLOSE
@@ -2511,6 +2524,31 @@ func (e *Engine) thawAfterFailedClose() {
 
 // ForceClose makes the WAL and recovery job durable and closes locally
 // without releasing delegations. It returns the visible job ID.
+//
+// ── PARKING IS A PROMISE, SO IT IS PROVED BEFORE IT IS MADE ──────────────────
+//
+// A forced unmount tells the operator, in the product's own words, that the
+// undrained tail "will be verified and replayed exactly on the next attach".
+// That is a durability promise, and a promise made about bytes nobody has
+// looked at is a guess. Before the marker that publishes it is written, this
+// function replays the ENTIRE LOCAL HALF of the next attach's verification
+// against the stream's own synced bytes: the applied certificates must be
+// mutually consistent, every lane's chain must be rebuildable from the retained
+// frames at both its applied watermark and its tail, and every unapplied record
+// must have a covering delegation to ship under.
+//
+// If that verification fails, the park does NOT promise a replay. It records a
+// DEFINITE unreplayable verdict instead and returns ErrParkNotReplayable, while
+// still completing the local teardown — a forced unmount is invoked precisely
+// because the mount must go away, so refusing to finish would leave the operator
+// with a wedged mount AND a lie. The next attach then contains the stream (see
+// recoveryRunner.contain) rather than latching on it.
+//
+// The verification is local-only, deliberately: a forced unmount is defined by
+// the authority being unreachable or unresponsive. It therefore proves that the
+// snapshot is INTERNALLY replayable, which is the whole of what this side owns.
+// A divergence that only the authority can reveal still surfaces at the next
+// attach as a typed conflict.
 func (e *Engine) ForceClose(reason string) (string, error) {
 	e.mu.Lock()
 	e.frozen = true
@@ -2534,6 +2572,9 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 	if err := w.Sync(); err != nil {
 		return "", e.failLocalWAL("forced-unmount sync", err)
 	}
+	// Every byte this park is about is now on media, so the snapshot the next
+	// attach will read is exactly the one that can be proved here.
+	unreplayable := verifyParkedStreamReplayable(w.Dir())
 	jobID := ""
 	if job != nil {
 		recs, bytes := e.fl.pendingStats()
@@ -2544,6 +2585,14 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 			j.PendingRecords = uint64(recs)
 			j.PendingBytes = uint64(bytes)
 			j.LastError = reason
+			if unreplayable != nil {
+				// NOT JobForced: a forced job says "replay me". This one is a
+				// proof that replay is impossible, and the state must say so
+				// from the moment it becomes durable — including across a crash
+				// between here and the next attach.
+				j.State = JobCorrupt
+				j.LastError = fmt.Sprintf("%s: %v", reason, unreplayable)
+			}
 		})
 		if err := job.persist(); err != nil {
 			return "", e.failLocalWAL("persist forced recovery job", err)
@@ -2565,7 +2614,83 @@ func (e *Engine) ForceClose(reason string) (string, error) {
 	e.closed = true
 	e.mu.Unlock()
 	_ = e.lock.Close()
+	if unreplayable != nil {
+		// The teardown is complete and the verdict is durable. The error is the
+		// operator-visible half: it must never be mistaken for a parked tail
+		// that will come back.
+		recs, bytes := e.fl.pendingStats()
+		return jobID, fmt.Errorf(
+			"%w: %d acknowledged record(s) / %d byte(s) will NOT be replayed on the next attach: %w",
+			ErrParkNotReplayable, recs, bytes, unreplayable,
+		)
+	}
 	return jobID, nil
+}
+
+// ErrParkNotReplayable is the definite verdict of a forced unmount whose
+// undrained tail could not be parked as a replayable snapshot. The teardown
+// still completed and the bytes are still durable; what is NOT true is the
+// ordinary parking promise that the next attach will replay them.
+var ErrParkNotReplayable = errors.New("writeback: the forced unmount could not park a replayable snapshot")
+
+// verifyParkedStreamReplayable runs the local half of the next attach's replay
+// verification over a synced stream directory. nil means the snapshot is
+// replayable by construction as far as this side can prove.
+//
+// It is the same evidence recoverStream demands, in the same order, and it is
+// deliberately a separate reader over the on-disk bytes rather than a check
+// against the engine's in-memory state: the in-memory state is what WROTE the
+// stream, so agreeing with it proves nothing about whether a fresh process can
+// read it back.
+func verifyParkedStreamReplayable(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	scan, err := scanStreamReadOnly(dir)
+	if err != nil {
+		return err
+	}
+	live, mutations, marks, _, err := decodeStreamFrames(scan.frames)
+	if err != nil {
+		return err
+	}
+	cert, err := highestAppliedCertificate(marks, scan.lastSeq)
+	if err != nil {
+		return err
+	}
+	tails := laneTails(scan, cert)
+	for lane := range cert.lanes {
+		l := StreamLane(lane)
+		if cert.lanes[lane].through > tails[lane] {
+			return fmt.Errorf("%w: applied %s-lane watermark %d is past the local tail %d",
+				ErrCorrupt, l, cert.lanes[lane].through, tails[lane])
+		}
+		// The base recovery chains from, and the tail it chains to. A lane whose
+		// digest cannot be rebuilt at either point cannot be replayed, and the
+		// only moment that is cheap to discover is now.
+		if _, err := laneDigestAt(scan, marks, l, cert.lanes[lane].through); err != nil {
+			return err
+		}
+		if _, err := laneDigestAt(scan, marks, l, tails[lane]); err != nil {
+			return err
+		}
+	}
+	tail := laneTailFrames(mutations, streamMark{global: cert.global, lanes: cert.lanes})
+	if len(tail) == 0 {
+		return nil
+	}
+	if len(live) == 0 {
+		return fmt.Errorf("%w: unshipped tail without a recorded delegation", ErrCorrupt)
+	}
+	for _, fr := range tail {
+		if _, err := wal.DecodePFR1(fr.payload); err != nil {
+			return fmt.Errorf("%w: unshipped record %d does not decode: %v", ErrCorrupt, fr.seq, err)
+		}
+		if coveringScope(live, decodePathOf(fr)) == "" {
+			return fmt.Errorf("%w: unshipped record %d has no covering delegation", ErrCorrupt, fr.seq)
+		}
+	}
+	return nil
 }
 
 // Abandon simulates a process crash for tests: background work stops and the
@@ -2619,6 +2744,20 @@ type Status struct {
 	// metadata reserve still holds.
 	DataLaneFull bool
 	Jobs         []RecoveryJob
+	// UnrecoveredRecords/UnrecoveredBytes are the share of PendingRecords/
+	// PendingBytes that belongs to PARKED or CONTAINED recovery jobs rather
+	// than to the live stream: acknowledged, locally durable, and not at the
+	// authority. They are reported separately because the two halves need
+	// different actions — the live half drains on its own, this half does not.
+	//
+	// CreditDebt above is deliberately NOT summed with these. It is the data
+	// lane's PACING gauge (resident unapplied bulk bytes admitted by THIS
+	// engine, bounded by CreditSetpoint), not a durability-debt figure, and a
+	// previous mount's parked tail is not something this engine's controller
+	// can pace. The durability-debt figure — the one a drain-completeness check
+	// must read — is PendingBytes.
+	UnrecoveredRecords uint64
+	UnrecoveredBytes   uint64
 }
 
 // DelegationStatus is one held scope's view.
@@ -2667,6 +2806,13 @@ func (e *Engine) Status() Status {
 	e.mu.RUnlock()
 	sort.Slice(st.Delegations, func(i, j int) bool { return st.Delegations[i].Scope < st.Delegations[j].Scope })
 	st.Jobs = e.recovery.jobs()
+	// Fold the parked/contained debt into the reported backlog for the reason
+	// stated on Engine.Pending: a status that reports zero pending while
+	// acknowledged bytes sit unreplayed is the drain-success lie this round
+	// exists to remove.
+	st.UnrecoveredRecords, st.UnrecoveredBytes = e.recovery.unrecovered()
+	st.PendingRecords += int(st.UnrecoveredRecords)
+	st.PendingBytes += int64(st.UnrecoveredBytes)
 	return st
 }
 

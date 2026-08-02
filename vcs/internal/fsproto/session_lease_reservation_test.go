@@ -71,12 +71,19 @@ func TestSessionLeaseRenewsWithTheWholePoolHeld(t *testing.T) {
 		}
 	}()
 
-	done := make(chan bool, 1)
-	go func() { done <- cli.renewOnce(es, 5*time.Second) }()
+	type outcome struct{ renewed, fenced bool }
+	done := make(chan outcome, 1)
+	go func() {
+		renewed, fenced := cli.renewOnce(es, 5*time.Second)
+		done <- outcome{renewed, fenced}
+	}()
 	select {
-	case fenced := <-done:
-		if fenced {
+	case got := <-done:
+		if got.fenced {
 			t.Fatal("the lease renewal fenced the session")
+		}
+		if !got.renewed {
+			t.Fatal("the lease renewal did not confirm a fresh expiry")
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the session lease renewal never completed while the connection " +

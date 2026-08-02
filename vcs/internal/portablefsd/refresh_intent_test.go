@@ -62,7 +62,7 @@ func TestOneSlowSizeMutationDoesNotExhaustTheRefreshBudget(t *testing.T) {
 	// Comfortably past staleSampleRetries+1 attempts of refreshCoalesce each.
 	hold := time.Duration(staleSampleRetries+1)*refreshCoalesce + 400*time.Millisecond
 
-	release, eno := a.reserveSizeMutation(context.Background(), itemID)
+	release, _, eno := a.reserveSizeMutation(context.Background(), itemID)
 	if eno != 0 {
 		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
 	}
@@ -106,7 +106,7 @@ func TestContinuousWritersCannotBargePastAPendingRefresh(t *testing.T) {
 	// refresh that is allowed to WAIT converges quickly; a refresh that must
 	// re-check against whatever is reserved at each 25ms tick never does,
 	// because the arriving writers below keep the item covered.
-	primer, eno := a.reserveSizeMutation(context.Background(), itemID)
+	primer, _, eno := a.reserveSizeMutation(context.Background(), itemID)
 	if eno != 0 {
 		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
 	}
@@ -137,7 +137,7 @@ func TestContinuousWritersCannotBargePastAPendingRefresh(t *testing.T) {
 				defer writers.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				rel, eno := a.reserveSizeMutation(ctx, itemID)
+				rel, _, eno := a.reserveSizeMutation(ctx, itemID)
 				if eno != 0 {
 					return
 				}
@@ -173,7 +173,7 @@ func TestRefreshIntentQueuesLaterReservationsAndDrainsExistingOnes(t *testing.T)
 	a := &attach{}
 	const item = uint64(41)
 
-	outstanding, eno := a.reserveSizeMutation(context.Background(), item)
+	outstanding, _, eno := a.reserveSizeMutation(context.Background(), item)
 	if eno != 0 {
 		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
 	}
@@ -201,7 +201,7 @@ func TestRefreshIntentQueuesLaterReservationsAndDrainsExistingOnes(t *testing.T)
 	// granted, the drain the intent is waiting for could never complete.
 	queued := make(chan int32, 1)
 	go func() {
-		rel, eno := a.reserveSizeMutation(context.Background(), item)
+		rel, _, eno := a.reserveSizeMutation(context.Background(), item)
 		if rel != nil {
 			defer rel()
 		}
@@ -254,7 +254,7 @@ func TestRefreshIntentWaitIsBoundedAndDoesNotHoldAnyLock(t *testing.T) {
 	a := &attach{}
 	const item = uint64(42)
 
-	stuck, eno := a.reserveSizeMutation(context.Background(), item)
+	stuck, _, eno := a.reserveSizeMutation(context.Background(), item)
 	if eno != 0 {
 		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
 	}
@@ -279,7 +279,7 @@ func TestRefreshIntentWaitIsBoundedAndDoesNotHoldAnyLock(t *testing.T) {
 			"mutation on the item would queue forever", pending)
 	}
 	// And the item is usable again: a new reservation is granted immediately.
-	rel, eno := a.reserveSizeMutation(ctx, item)
+	rel, _, eno := a.reserveSizeMutation(ctx, item)
 	if eno != 0 {
 		t.Fatalf("a reservation after a refused intent failed with errno=%d", eno)
 	}

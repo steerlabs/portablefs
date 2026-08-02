@@ -134,6 +134,12 @@ const maintenanceLoop = historyMaintenance.enabled
       journalRetentionMs: historyMaintenance.journalRetentionMs,
       reclaimBatchRows: historyMaintenance.reclaimBatchRows,
       reclaimMaxPagesPerCycle: historyMaintenance.reclaimMaxPagesPerCycle,
+      // Volume retirement (migration 033): the durable obligation the DELETE
+      // route commits with the retirement receipt. The route attempts the
+      // transition inline as a fast path; this drain is what guarantees it
+      // eventually runs, so a transient failure never leaves a retired
+      // volume's journal tail retained forever.
+      retirement: metadata,
       telemetry: createTelemetry(telemetryHook ?? stdoutTelemetrySink()),
       // Adoption is gated on THIS deployment serving exact PFT2 history
       // reads: the adopted base is what the next cold start must fetch

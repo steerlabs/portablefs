@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // watchHarness wires a credentialWatch to a log buffer and a real mount-state
@@ -90,6 +92,177 @@ func TestLeaseKeeperExpiredIsVisible(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "credentials revoked or expired") {
 		t.Fatalf("terminal expiry must be logged: %q", logBuf.String())
+	}
+}
+
+// ── THE CREDENTIAL HANDOFF TO portablefsd ───────────────────────────────────
+//
+// The push used to be one fire-and-forget line whose error went to stderr and
+// was dropped, run AFTER the keeper had committed the lease. These pin the
+// three properties that replaced it: it retries, it does not block the keeper,
+// and an undelivered credential ends in a reported definite failure rather than
+// in silence.
+
+// handoffRecord collects what the handoff reported, guarded because the loop
+// runs on its own goroutine.
+type handoffRecord struct {
+	mu       sync.Mutex
+	log      bytes.Buffer
+	failures []error
+}
+
+func (r *handoffRecord) logf(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fmt.Fprintf(&r.log, format+"\n", args...)
+}
+
+func (r *handoffRecord) failed(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failures = append(r.failures, err)
+}
+
+func (r *handoffRecord) logged() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.log.String()
+}
+
+func (r *handoffRecord) failureCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.failures)
+}
+
+// handoffHarness builds a handoff whose retry pacing is injected, so nothing
+// here waits on the wall clock.
+func handoffHarness(t *testing.T, push func(leaseState) error) (*credentialHandoff, *handoffRecord) {
+	t.Helper()
+	rec := &handoffRecord{}
+	h := newCredentialHandoff(push, rec.logf, rec.failed)
+	// Retry pacing is not the property under test; fire immediately.
+	h.after = func(time.Duration) <-chan time.Time {
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+	return h, rec
+}
+
+// TestCredentialHandoffRetriesUntilTheDaemonAcknowledges is the defect stated
+// directly: a push that fails must not be dropped. Pre-fix the daemon simply
+// never received this credential and every layer above believed it had.
+func TestCredentialHandoffRetriesUntilTheDaemonAcknowledges(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	delivered := make(chan leaseState, 1)
+	h, rec := handoffHarness(t, func(l leaseState) error {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n < 4 {
+			// The production shape of this failure: the daemon's control
+			// request queues behind a registry mutation and times out.
+			return fmt.Errorf("push credential: control request timed out")
+		}
+		delivered <- l
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.run(ctx)
+
+	lease := leaseState{AccessLeaseID: "pfal_1", AccessToken: "tok2", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}
+	h.deliver(lease)
+
+	select {
+	case got := <-delivered:
+		if got.AccessToken != "tok2" {
+			t.Fatalf("delivered the wrong credential: %+v", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the credential was never delivered to portablefsd.\n" +
+			"A push that fails must be retried until the daemon acknowledges it: a daemon " +
+			"holding a superseded token is a mount that will be fenced by a REACHABLE " +
+			"authority with its backlog stranded.")
+	}
+	mu.Lock()
+	got := attempts
+	mu.Unlock()
+	if got < 4 {
+		t.Fatalf("expected the handoff to retry, saw %d attempts", got)
+	}
+	if rec.failureCount() != 0 {
+		t.Fatalf("a delivery that eventually succeeded must not report failure: %v", rec.logged())
+	}
+}
+
+// TestCredentialHandoffNeverBlocksTheKeeper pins the other half: delivering a
+// credential must not wait on the daemon. The lease keeper's renewal path
+// queuing behind data-plane work is the disease, not the cure.
+func TestCredentialHandoffNeverBlocksTheKeeper(t *testing.T) {
+	release := make(chan struct{})
+	h, _ := handoffHarness(t, func(leaseState) error {
+		<-release
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.run(ctx)
+	defer close(release)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.deliver(leaseState{AccessLeaseID: "pfal_1", AccessToken: "t", ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliver blocked on the daemon; the keeper must never wait on data-plane work")
+	}
+}
+
+// TestCredentialHandoffFailsDefinitelyAtTheCredentialsOwnExpiry pins the bound
+// and the outcome. The replay is bounded by the credential's OWN expiry — the
+// same house rule renewal and release follow — and reaching it is a DEFINITE,
+// reported failure, never a silent one.
+func TestCredentialHandoffFailsDefinitelyAtTheCredentialsOwnExpiry(t *testing.T) {
+	h, rec := handoffHarness(t, func(leaseState) error {
+		return fmt.Errorf("push credential: control request timed out")
+	})
+	// The credential is already past its own expiry: redelivering it cannot
+	// help anyone.
+	expired := leaseState{AccessLeaseID: "pfal_dead", AccessToken: "t", ExpiresAtMs: time.Now().Add(-time.Minute).UnixMilli()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); h.run(ctx) }()
+	h.deliver(expired)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if rec.failureCount() > 0 && !h.outstanding() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if rec.failureCount() == 0 {
+		t.Fatal("an undelivered credential that reached its own expiry reported nothing.\n" +
+			"A handoff that cannot complete must reach a DEFINITE failure with a truthful " +
+			"status, not retry forever in silence.")
+	}
+	if !strings.Contains(rec.logged(), "FAILED definitively") {
+		t.Fatalf("the definite failure must be logged: %q", rec.logged())
+	}
+	if h.outstanding() {
+		t.Fatal("a definitely failed credential must not stay outstanding forever")
 	}
 }
 

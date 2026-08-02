@@ -247,6 +247,31 @@ export interface RetireVolumeResult {
   retiredAtMs: number;
 }
 
+/**
+ * One outstanding volume-retirement obligation (migration 033). Enqueued in
+ * the SAME transaction as the retirement flip, so a caller can never hold a
+ * receipt the fleet has no record of. Drained by the maintenance loop.
+ */
+export interface VolumeRetirementTask {
+  volumeId: VolumeId;
+  tenantId: string;
+  /** Attempts INCLUDING this claim; the backoff grows with it. */
+  attempts: number;
+}
+
+/**
+ * The result of the atomic retirement transition (migration 033): history
+ * cleanup and journal retirement in ONE transaction, under every branch lock
+ * of the volume.
+ */
+export interface VolumeRetirementFinishResult {
+  volumeId: VolumeId;
+  branchesLocked: string;
+  cleanup: unknown;
+  journal: unknown;
+  completedAtMs: string;
+}
+
 export interface VolumeListEntry {
   volume: Volume;
   branches: Array<Pick<VolumeBranch, "name" | "headCommitId">>;
@@ -417,6 +442,31 @@ export interface MetadataRepository {
   // crashed response by replaying the same key — while unknown and foreign
   // ids keep the non-enumerating 404.
   retiredVolumeReceipt?(input: RetireVolumeInput): Promise<RetireVolumeResult | null>;
+  // The atomic retirement transition (migration 033; additive). Runs the
+  // history cleanup AND the journal retirement in ONE transaction under every
+  // branch advisory lock of the volume, then marks the durable task complete.
+  // It is safe to call repeatedly: both halves are idempotent. A failure here
+  // never costs the caller its receipt — the obligation is already durable
+  // and the maintenance loop retries it.
+  finishVolumeRetirement?(input: {
+    tenantId: string;
+    volumeId: VolumeId;
+  }): Promise<VolumeRetirementFinishResult>;
+  // Claim due retirement obligations for the drain (bounded, SKIP LOCKED,
+  // attempt/backoff bumped in the claim transaction so a crashed claimer
+  // still yields a retry).
+  claimVolumeRetirementTasks?(input?: {
+    limit?: number;
+    backoffMs?: number;
+  }): Promise<VolumeRetirementTask[]>;
+  // Record why an attempt failed. Observability only: the retry is already
+  // scheduled by the claim, and this must be callable in a FRESH transaction
+  // after the failed one rolled back.
+  deferVolumeRetirementTask?(input: {
+    tenantId: string;
+    volumeId: VolumeId;
+    error: string;
+  }): Promise<void>;
   // Manifest-free branch history, newest-first, walking parent links from the
   // branch head (crossing branch points into pre-fork ancestry). Returns null when
   // the volume or branch does not exist.

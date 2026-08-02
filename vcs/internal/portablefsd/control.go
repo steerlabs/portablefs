@@ -244,9 +244,28 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		recs, bytes := vol.WriteBackPending()
+		// A SUCCESSFUL DRAIN IS NOT THE SAME CLAIM AS "NOTHING IS PENDING".
+		//
+		// This endpoint is what a drain-to-zero check reads, and it used to
+		// answer with the live engine's pending figures alone. A forced unmount
+		// parks its undrained tail as a durable recovery job, and the live
+		// engine then legitimately reports zero while the parked stream still
+		// holds every byte — so the check was told the volume was clean over
+		// data that had not reached the authority.
+		//
+		// The unrecovered split rides along, always, so a caller can tell the
+		// two apart without having to fetch and interpret the job list itself.
+		// See writeBackStatus.UnrecoveredRecords.
+		unrecoveredRecords, unrecoveredBytes := 0, int64(0)
+		if wb := a.liveWriteBackStatus(); wb != nil {
+			unrecoveredRecords = wb.UnrecoveredRecords
+			unrecoveredBytes = wb.UnrecoveredBytes
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"pendingRecords": recs,
-			"pendingBytes":   bytes,
+			"pendingRecords":     recs,
+			"pendingBytes":       bytes,
+			"unrecoveredRecords": unrecoveredRecords,
+			"unrecoveredBytes":   unrecoveredBytes,
 		})
 	case "local-dirs":
 		if r.Method != http.MethodPost {
@@ -640,7 +659,14 @@ func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attac
 		// against travels into phase 3, which compares it with the locked target
 		// — and with the authority's own answer — before it mutates anything
 		// (see reservedIdentity).
-		releaseToken, tokenEno := a.reserveSizeMutation(opCtx, reserved.itemID)
+		// The generation token is deliberately DISCARDED here. It exists so a
+		// crossed repair can recognise the mutation that preempted it by the
+		// post-op attributes that mutation sends back to the KERNEL, and a
+		// control-plane write has no kernel reply to send: it publishes into the
+		// registry and then issues its own exact refresh. Counting it would
+		// discharge a repair on the daemon's own bookkeeping, which is the
+		// precise thing the witness exists to stop (repairwitness.go).
+		releaseToken, _, tokenEno := a.reserveSizeMutation(opCtx, reserved.itemID)
 		if tokenEno != 0 {
 			settle()
 			writeHTTPError(
@@ -715,7 +741,10 @@ func (a *attach) controlGraftWriteOnce(
 	data []byte,
 ) (readmit bool, httpStatus int, httpMessage string, refreshItemID uint64) {
 	reserved := a.reservedIdentityForPath(p)
-	releaseToken, tokenEno := a.reserveSizeMutation(ctx, reserved.itemID)
+	// The generation token is discarded for the same reason as in the
+	// authority-lane control write above: this write's publication reaches the
+	// kernel through the refresh its caller issues, not through a reply.
+	releaseToken, _, tokenEno := a.reserveSizeMutation(ctx, reserved.itemID)
 	if tokenEno != 0 {
 		return false, httpStatusForErr(tokenEno),
 			errMessage("fs/write admission", tokenEno), 0

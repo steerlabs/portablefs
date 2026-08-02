@@ -92,6 +92,15 @@ type frontendOperationEntry struct {
 	activeRequests int
 	replyExposed   bool
 	ackPending     bool
+	// lateExposure records that a publishing reply was written for this
+	// operation AFTER the frontend had already acknowledged it — i.e. after the
+	// framework callback had finished, so nothing this daemon publishes for the
+	// operation from that point on can be installed.
+	//
+	// See markPublicationReplyExposed: it is a COHERENCE DEBT, not a protocol
+	// error, and it is discharged by repairing the operation's kernel scopes
+	// when the operation retires.
+	lateExposure bool
 }
 
 // frontendRequestDeadline is what the daemon TELLS a frontend to wait for one
@@ -120,6 +129,42 @@ type frontendOperationEntry struct {
 // expiry is now REQUEST-LOCAL (see PfsLocalClient.timeoutRequest): it answers
 // that one request and leaves the connection — and therefore every other
 // operation's publication — alone.
+//
+// ── ROUND 17: WHY THIS NUMBER IS NOT A SAFETY MECHANISM, AND MUST NOT BE ────
+//
+// The obvious reading of "200s exceeds the ~60s FSKit reply envelope" is that
+// the multiplier is the defect and the advertised bound should be CLAMPED to
+// the kernel's own ceiling, so that an expiry would mean "the mutation did not
+// and will not commit". It cannot mean that, for two independent reasons, and
+// clamping would buy nothing while costing a certified property:
+//
+//  1. THE DAEMON PROMISES NO TOTAL HANDLER BOUND. operationAdmissionBudget is
+//     an absolute deadline on the WAITS a request may be asked to make, not on
+//     the request. A handler past every wait can still commit — the live
+//     battery's 80s warm rmdir SUCCEEDED against a 50s budget — so there is no
+//     instant T after which "has not committed" implies "will not commit".
+//     Advertising 60s instead of 200s changes when the extension gives up; it
+//     changes nothing about when the daemon can commit.
+//
+//  2. THE KERNEL'S CEILING IS EXTERNAL. Whatever this daemon advertises, FSKit
+//     abandons an upcall on its own schedule. A negotiated number can neither
+//     enlarge that ceiling nor make the extension's expiry coincide with it, so
+//     the extension's deadline can never be the mechanism that keeps the
+//     kernel's view correct.
+//
+// And clamping has a real cost: a 60s frontend bound against a 50s daemon
+// budget is exactly the pairing round 15 removed, on exactly the operation
+// (the 80s rmdir) that motivated removing it.
+//
+// So the deadline is demoted, deliberately, from a correctness mechanism to a
+// LIVENESS one — it exists to notice a daemon that has stopped answering — and
+// the correctness it used to be asked for lives where it can actually be
+// established: on the daemon side, as a debt. An operation acknowledged before
+// its publishing reply is exposed records a repair obligation that the
+// acknowledgement does not erase, and the affected kernel scopes are
+// invalidated and exactly refreshed. See markPublicationReplyExposed and
+// repairLatePublication. That obligation holds for an expiry at 60s, at 200s,
+// or at any other number, which is the property a deadline could never have.
 func frontendRequestDeadline() time.Duration {
 	return frontendRequestDeadlineFactor * clientcore.OperationAdmissionBudget()
 }
@@ -282,7 +327,12 @@ func (c *frontendConn) close() {
 			if entry.op == nil {
 				continue
 			}
-			if entry.replyExposed && !entry.ackPending {
+			if (entry.replyExposed && !entry.ackPending) || entry.lateExposure {
+				// The second disjunct is the timed-out publishing mutation's
+				// debt (see markPublicationReplyExposed). It is ACKNOWLEDGED, so
+				// the first disjunct misses it, and it owes exactly the same
+				// repair: a reply the frontend could not install left kernel
+				// state this daemon cannot prove.
 				unacknowledged = append(unacknowledged, entry.op)
 			}
 			orphaned = append(orphaned, entry.op)
@@ -363,7 +413,7 @@ func (c *frontendConn) close() {
 				// An operation that only became exposed-unacknowledged while
 				// handlers were draining owes the same repair as one seen above,
 				// and for the same reason. It is never a terminal verdict.
-				if entry.replyExposed && !entry.ackPending {
+				if (entry.replyExposed && !entry.ackPending) || entry.lateExposure {
 					unacknowledged = append(unacknowledged, entry.op)
 				}
 				entry.op.attach.finishFrontendOperation(entry.op)
@@ -429,15 +479,25 @@ func (c *frontendConn) reply(req uint64, body any) {
 	c.replyWithPublication(req, 0, body, false)
 }
 
+// replyWithPublication writes one reply frame and reports whether that frame
+// was DELIVERED: written to the transport without error and not carrying a
+// retraction.
+//
+// The delivered verdict is what the crossed repair's convergence witness is
+// built on (repairwitness.go). A retracted frame tells the frontend to discard
+// everything the operation produced, and a frame the transport refused reached
+// nobody; in neither case did this daemon's post-op attributes reach the kernel
+// by the ordinary reply path, so in neither case may a coherence debt be
+// considered paid by them.
 func (c *frontendConn) replyWithPublication(
 	req uint64,
 	operationID uint64,
 	body any,
 	ackRequired bool,
-) {
+) (delivered bool) {
 	if ackRequired && !c.markPublicationReplyExposed(operationID) {
 		_ = c.conn.Close()
-		return
+		return false
 	}
 	// THE VERDICT AND THE FRAME ARE ONE GATE TRANSITION.
 	//
@@ -476,7 +536,9 @@ func (c *frontendConn) replyWithPublication(
 	}); err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
+		return false
 	}
+	return !retracted
 }
 
 // publicationRetracted answers whether a delegation handoff has crossed this
@@ -562,7 +624,8 @@ func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 		return false
 	}
 	if entry.ackPending {
-		// THE OBLIGATION IS ALREADY DISCHARGED, SO THIS REPLY PINS NOTHING.
+		// THE ACKNOWLEDGEMENT IS SPENT, SO THIS REPLY PINS NOTHING — AND THAT
+		// LEAVES A DEBT THAT USED TO BE DROPPED ON THE FLOOR.
 		//
 		// The frontend has acknowledged this operation and therefore finished
 		// its callback (see acknowledgePublication). Writing the frame is still
@@ -571,8 +634,57 @@ func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 		// set would create an obligation that has already been met and that
 		// nothing could ever meet again: one acknowledgement per operation, and
 		// it has been spent. That is the stranded-publication shape, reached
-		// from the other side.
+		// from the other side. So the pin stays out.
+		//
+		// ── WHY THE ABSENCE OF A PIN IS NOT THE END OF THE STORY ────────────
+		//
+		// A pin asks the frontend to tell the daemon what it did with a
+		// publication. Here there is nothing to ask: the callback is over. But
+		// "there is nobody to ask" is a statement about the FRONTEND, and the
+		// question the coherence model actually cares about is about the KERNEL,
+		// which outlives every callback and every connection.
+		//
+		// The shape that reaches this branch is the timed-out publishing
+		// mutation, and it is ordinary rather than exotic:
+		//
+		//	1. a mutation request reaches the daemon and stalls;
+		//	2. the extension's request-local deadline expires, it removes the
+		//	   pending entry and fails THAT REQUEST with a timeout;
+		//	3. the framework callback finishes — with an error — and
+		//	   completePublications sends this operation's acknowledgement,
+		//	   because the obligation was incurred when the operation ID was
+		//	   stamped on the request, not when a reply came back;
+		//	4. the daemon's handler, which was never cancelled and is under no
+		//	   total bound, COMMITS the mutation and arrives here;
+		//	5. the frame goes out and the extension drops it: the request ID is
+		//	   no longer in `pending`.
+		//
+		// The application was told the operation failed, the mutation happened
+		// anyway, and — before this branch recorded anything — nothing in the
+		// system was left holding the fact that the kernel's cached view of the
+		// affected scopes had not been updated. No advertised deadline can close
+		// that: the daemon promises a definite OUTCOME, not a total handler
+		// bound, so there is no instant after which "it has not committed yet"
+		// implies "it will not commit", and the kernel's own reply envelope is
+		// an EXTERNAL ceiling that a negotiated number cannot enlarge or shrink.
+		//
+		// What CAN close it is the same thing the disconnect path uses: a debt.
+		// The operation's scopes are invalidated and exactly refreshed through
+		// the mount once the operation retires — see
+		// repairLatePublications/repairDisconnectedPublications — so the kernel
+		// stops holding a view this daemon can no longer prove, and the mount
+		// keeps serving throughout because its own answers were never in doubt.
 		entry.replyExposed = true
+		if !entry.lateExposure {
+			entry.lateExposure = true
+			log.Printf(
+				"portablefsd: attach %s: logical operation %d exposed a publishing "+
+					"reply after it had already been acknowledged; the frontend "+
+					"callback is over, so the affected kernel scopes are repaired "+
+					"when the operation retires",
+				c.currentAttachRef(), operationID,
+			)
+		}
 		c.publicationMu.Unlock()
 		return true
 	}
@@ -607,7 +719,7 @@ func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
 // callback is waiting for, and a retraction that misses that reply misses the
 // only carrier it had.
 func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32, msg string) {
-	c.replyWithPublication(
+	_ = c.replyWithPublication(
 		req, operationID, &pfslocal.ErrorReply{Errno: eno, Message: msg}, false,
 	)
 }
@@ -659,6 +771,9 @@ func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
 		// and issuing it any later would leave the stale install unchallenged
 		// for exactly as long as the delay.
 		entry.op.attach.dischargeFrontendPublicationFence(entry.op)
+		// An operation with no live request cannot expose a late reply, so this
+		// is only ever the retirement of a debt some earlier exposure recorded.
+		entry.op.attach.repairLatePublication(entry)
 	}
 	return true
 }
@@ -683,7 +798,36 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 		// only now retired. The crossing debt is discharged from whichever of
 		// the two paths actually retires the operation, never from both.
 		entry.op.attach.dischargeFrontendPublicationFence(entry.op)
+		// THIS is the retirement order the timed-out publishing mutation takes:
+		// the acknowledgement arrived first (the callback gave up on the reply),
+		// the handler then committed and exposed its reply into an operation
+		// with a spent acknowledgement, and it is only now — with no request of
+		// the operation still running, and the frame already on the wire — that
+		// the debt that exposure recorded can be repaired.
+		entry.op.attach.repairLatePublication(entry)
 	}
+}
+
+// repairLatePublication discharges the debt a publishing reply left when it was
+// exposed after its operation had already been acknowledged.
+//
+// It is the same repair the disconnect path performs, for the same reason and
+// through the same machinery: the affected scopes are invalidated and exactly
+// refreshed through the mount, with retry, because the FSKit mount outlives any
+// one callback and any one connection and is therefore still reachable. It is
+// never a terminal verdict — the daemon's own answers were never in doubt, only
+// the kernel's cache was, and that is precisely what is being rewritten.
+//
+// It runs off the caller's goroutine for the same reason
+// dischargeFrontendPublicationFence does: the repair reaches the kernel through
+// the mount, retries until it converges, and its caller is on a request's
+// retirement path.
+func (a *attach) repairLatePublication(entry *frontendOperationEntry) {
+	if a == nil || entry == nil || entry.op == nil || !entry.lateExposure {
+		return
+	}
+	op := entry.op
+	go a.repairDisconnectedPublications([]*frontendOperation{op})
 }
 
 // reserveLogicalOperation runs only on the connection's serial frame-reader
@@ -1070,7 +1214,19 @@ func (c *frontendConn) handleAttached(
 		return
 	}
 	a.synthesizeFrontendMutation(body, c.origin)
-	c.replyWithPublication(requestID, operationID, reply, publishes)
+	if c.replyWithPublication(requestID, operationID, reply, publishes) {
+		// THE ONE POINT AT WHICH A SIZE MUTATION HAS TOLD THE KERNEL ANYTHING.
+		//
+		// The handler marked its token when it committed and installed its
+		// post-op size into the registry; the registry agreeing with the engine
+		// is a fact about this daemon, not about the kernel. The frame that just
+		// went out is what carries that size back through the framework, so this
+		// is where the item's convergence generation advances — and it advances
+		// for no other publisher, for no reply that carried an errno (those
+		// return above), and for no retracted reply (the frontend discards a
+		// retracted operation wholesale). See repairwitness.go.
+		a.noteSizeMutationDelivered(opCtx)
+	}
 }
 
 // dispatchRequest runs one request's handler under the operation context the

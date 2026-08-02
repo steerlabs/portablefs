@@ -101,7 +101,7 @@ func TestCrossedRepairNeverHoldsAnArrivingSizeMutation(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		start := time.Now()
-		release, eno := a.reserveSizeMutation(ctx, itemID)
+		release, _, eno := a.reserveSizeMutation(ctx, itemID)
 		waited := time.Since(start)
 		cancel()
 		if eno != 0 {
@@ -140,6 +140,15 @@ func TestCrossedRepairNeverHoldsAnArrivingSizeMutation(t *testing.T) {
 // restating this item's attributes to the kernel is precisely the correction
 // the repair wanted, and the crossed path has already published the lazy
 // content invalidation that covers the item's pages.
+//
+// ROUND 17: the writer below runs the WHOLE bracket a real write handler runs,
+// and it must. It used to reserve, assign attributes, and release — which is
+// only the daemon-side half — and that is the same assumption the witness
+// itself made, so the test could not have failed on the defect it was meant to
+// pin. A publication is a discharge only when it is the RESERVING mutation's
+// own committed publication and that publication has been DELIVERED to the
+// frontend (repairwitness.go), so the writer marks and delivers exactly as
+// ops.go and the dispatcher do.
 func TestCrossedRepairConvergesWhileTheItemIsContinuouslyWritten(t *testing.T) {
 	a, _, itemID, _ := newMutationSeqAttach(t)
 	a.mountPath = "/unused-test-mount"
@@ -163,19 +172,26 @@ func TestCrossedRepairConvergesWhileTheItemIsContinuouslyWritten(t *testing.T) {
 			case <-time.After(10 * time.Millisecond):
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			release, eno := a.reserveSizeMutation(ctx, itemID)
-			cancel()
+			release, token, eno := a.reserveSizeMutation(ctx, itemID)
 			if eno != 0 {
+				cancel()
 				continue
 			}
+			// The request context every handler for this mutation runs under.
+			reqCtx := withSizeMutationToken(ctx, token)
 			a.mu.Lock()
 			if rec := a.items[itemID]; rec != nil {
 				attr := rec.attr
 				attr.Size += 4096
 				a.publishRecordAttrLocked(rec, attr, false)
+				// ops.go: committed, and the post-op size is in the registry.
+				markSizeMutationPublished(reqCtx)
 			}
 			a.mu.Unlock()
 			release()
+			// The dispatcher: the reply frame carrying that size went out.
+			a.noteSizeMutationDelivered(reqCtx)
+			cancel()
 		}
 	}()
 
@@ -225,7 +241,7 @@ func TestCrossedRepairYieldsTheItemBeforeItPins(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		rel, eno := a.reserveSizeMutation(ctx, item)
+		rel, _, eno := a.reserveSizeMutation(ctx, item)
 		if rel != nil {
 			rel()
 		}
@@ -268,7 +284,7 @@ func TestNonYieldingRefreshIntentIsNotPreemptible(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		rel, eno := a.reserveSizeMutation(ctx, item)
+		rel, _, eno := a.reserveSizeMutation(ctx, item)
 		if rel != nil {
 			rel()
 		}
@@ -285,12 +301,25 @@ func TestNonYieldingRefreshIntentIsNotPreemptible(t *testing.T) {
 	}
 }
 
-// TestRepairPublicationWatchCountsOnlyWatchedItems keeps the convergence
-// witness honest in both directions: it never grows with the working set
-// (publications are counted only while a repair is watching the item), and it
-// counts only the publications an APPLICATION WRITE made — the ones whose value
-// also reached the kernel in that write's own reply.
-func TestRepairPublicationWatchCountsOnlyWatchedItems(t *testing.T) {
+// TestRepairPublicationWatchCountsOnlyDeliveredSizeMutations keeps the
+// convergence witness honest in every direction that matters.
+//
+// -- WHAT THE OLD VERSION OF THIS TEST ASSERTED, AND WHY IT WAS VACUOUS ------
+//
+// It published ARBITRARY attributes under an ARBITRARY reservation and demanded
+// that they be counted. That is exactly the assumption the defect is made of:
+// "some publication happened while some reservation existed" is a statement
+// about the item, not about any mutation, so a test written that way agrees
+// with the bug by construction and can never fail on it.
+//
+// The witness now counts a publication only when all three hold:
+//
+//   - it came from the request holding the item's reservation TOKEN;
+//   - that request COMMITTED and installed its post-op size into the registry;
+//   - the reply carrying it was DELIVERED to the frontend.
+//
+// and the map still never grows with the working set.
+func TestRepairPublicationWatchCountsOnlyDeliveredSizeMutations(t *testing.T) {
 	a := newMetadataTestAttach()
 	rec := a.bindTestRecord(&itemRecord{
 		item: pfslocal.Item{ItemID: 91, ItemGeneration: 1},
@@ -305,41 +334,89 @@ func TestRepairPublicationWatchCountsOnlyWatchedItems(t *testing.T) {
 	a.publishRecordAttrLocked(unwatched, unwatched.attr, false)
 	a.mu.Unlock()
 	a.mu.RLock()
-	tracked := len(a.repairAttrPublications)
+	tracked := len(a.repairPublicationWatches)
 	a.mu.RUnlock()
 	if tracked != 0 {
 		t.Fatalf("publishing attributes for an unwatched item recorded %d entries: "+
 			"the witness would grow with the working set", tracked)
 	}
 
-	stop := a.watchRepairPublications(rec.item.ItemID)
-	if got := a.repairPublicationsSince(rec.item.ItemID); got != 0 {
+	watch := a.watchRepairPublications(rec.item.ItemID)
+	if got := watch.since(); got != 0 {
 		t.Fatalf("a fresh watch already counted %d publications", got)
 	}
-	// A publication with NO size mutation reserved is not a writer's: it says
-	// nothing about what the kernel was told, and must not discharge a repair.
-	a.mu.Lock()
-	a.publishRecordAttrLocked(rec, rec.attr, false)
-	a.mu.Unlock()
-	if got := a.repairPublicationsSince(rec.item.ItemID); got != 0 {
-		t.Fatalf("a publication outside any size mutation counted %d: the repair "+
-			"would discharge on the daemon's own bookkeeping", got)
-	}
-	release, eno := a.reserveSizeMutation(context.Background(), rec.item.ItemID)
+
+	// (1) A publication by something holding NO token -- a getattr, a
+	// reconciliation install -- counts for nothing whatever is reserved.
+	release, _, eno := a.reserveSizeMutation(context.Background(), rec.item.ItemID)
 	if eno != 0 {
 		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
 	}
 	a.mu.Lock()
 	a.publishRecordAttrLocked(rec, rec.attr, false)
+	a.mu.Unlock()
+	a.noteSizeMutationDelivered(context.Background())
+	if got := watch.since(); got != 0 {
+		t.Fatalf("a publication by a request holding no size-mutation token "+
+			"counted %d: the repair would discharge on state that says nothing "+
+			"about what the kernel was told", got)
+	}
+	release()
+
+	// (2) A mutation that holds its token and NEVER COMMITS counts for nothing.
+	release, token, eno := a.reserveSizeMutation(context.Background(), rec.item.ItemID)
+	if eno != 0 {
+		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
+	}
+	abandoned := withSizeMutationToken(context.Background(), token)
+	release()
+	a.noteSizeMutationDelivered(abandoned)
+	if got := watch.since(); got != 0 {
+		t.Fatalf("a size mutation that took its reservation and committed nothing "+
+			"counted %d", got)
+	}
+
+	// (3) A mutation that COMMITS but whose reply is never delivered -- an errno
+	// after the commit, or a retracted operation -- counts for nothing either:
+	// the kernel was not told.
+	release, token, eno = a.reserveSizeMutation(context.Background(), rec.item.ItemID)
+	if eno != 0 {
+		t.Fatalf("reserving an idle item was refused: errno=%d", eno)
+	}
+	undelivered := withSizeMutationToken(context.Background(), token)
+	a.mu.Lock()
 	a.publishRecordAttrLocked(rec, rec.attr, false)
+	markSizeMutationPublished(undelivered)
 	a.mu.Unlock()
 	release()
-	if got := a.repairPublicationsSince(rec.item.ItemID); got != 2 {
-		t.Fatalf("watched writer publications = %d, want 2", got)
+	if got := watch.since(); got != 0 {
+		t.Fatalf("a committed publication whose reply never reached the frontend "+
+			"counted %d", got)
 	}
-	stop()
+
+	// (4) The real thing: token, commit, delivery. Twice, and it counts twice --
+	// and a single token delivered twice counts once.
+	for i := 0; i < 2; i++ {
+		release, token, eno = a.reserveSizeMutation(context.Background(), rec.item.ItemID)
+		if eno != 0 {
+			t.Fatalf("reserving an idle item was refused: errno=%d", eno)
+		}
+		reqCtx := withSizeMutationToken(context.Background(), token)
+		a.mu.Lock()
+		a.publishRecordAttrLocked(rec, rec.attr, false)
+		markSizeMutationPublished(reqCtx)
+		a.mu.Unlock()
+		release()
+		a.noteSizeMutationDelivered(reqCtx)
+		a.noteSizeMutationDelivered(reqCtx)
+	}
+	if got := watch.since(); got != 2 {
+		t.Fatalf("delivered size-mutation publications = %d, want 2", got)
+	}
+
+	watch.stop()
 	a.mu.RLock()
-	tracked = len(a.repairAttrPublications)
+	tracked = len(a.repairPublicationWatches)
 	a.mu.RUnlock()
 	if tracked != 0 {
 		t.Fatalf("stopping the watch left %d entries behind", tracked)
@@ -360,6 +437,8 @@ func TestCrossedRepairOnAQuietItemConvergesByRefreshing(t *testing.T) {
 	a.mountPath = "/unused-test-mount"
 	compressRepairBudgets(t, 10*time.Second, 50*time.Millisecond, 20*time.Second)
 	stubRefreshSyscall(a)
+	quietWatch := a.watchRepairPublications(itemID)
+	defer quietWatch.stop()
 
 	start := time.Now()
 	a.repairCrossedItem(context.Background(), itemID)
@@ -382,7 +461,7 @@ func TestCrossedRepairOnAQuietItemConvergesByRefreshing(t *testing.T) {
 	}
 	// And it converged by REFRESHING: no writer ever ran, so the publication
 	// witness must have counted nothing.
-	if n := a.repairPublicationsSince(itemID); n != 0 {
-		t.Fatalf("a quiet item recorded %d writer publications", n)
+	if n := quietWatch.since(); n != 0 {
+		t.Fatalf("a quiet item recorded %d delivered writer publications", n)
 	}
 }

@@ -1157,17 +1157,29 @@ export class PostgresManagerControlStore implements ManagerControlStore {
 
   // healthProbe proves, in this order:
   //   1. reachability + pfm lineage — the SECURITY DEFINER renewal function
-  //      and the write probe this build needs both exist;
-  //   2. WRITE CAPABILITY — pfm.control_write_probe performs the same class
+  //      and the headroom probe this build needs both exist;
+  //   2. WRITE CAPABILITY AND ALLOCATION HEADROOM —
+  //      pfm.control_headroom_probe (migration 032) performs the same class
   //      of durable transition a lease write performs (same SECURITY DEFINER
   //      boundary, same pfm.require_durable_primary() admission, a real heap
-  //      tuple version, a real WAL record, a real synchronous commit).
+  //      tuple version, a real WAL record, a real synchronous commit) AND an
+  //      insert that provably EXTENDS its relation.
   //
-  // Step 2 is the whole point. Step 1 alone is a catalog read, and a Postgres
-  // whose disk is full answers catalog reads perfectly while refusing every
-  // lease write — which is exactly how a total control-store outage once
-  // passed the deploy gate. The write target is a BOUNDED ring of rows
-  // updated in place, so proving readiness never grows the control store.
+  // Step 2 is the whole point, and both halves of it are load-bearing. Step 1
+  // alone is a catalog read, and a Postgres whose disk is full answers
+  // catalog reads perfectly while refusing every lease write — which is
+  // exactly how a total control-store outage once passed the deploy gate.
+  // The 030 fixed ring fixed only half of that: after vacuum recycles its own
+  // dead row versions, the ring update is served from FSM free space and
+  // succeeds on a 100%-full data volume while allocating nothing (measured:
+  // 40/40 green, 0 bytes of growth, journal-class insert 53100 in the same
+  // session). 032's probe relation is INSERT-ONLY, so it has no dead tuples,
+  // so the FSM can never hand it a page back — every probe must take space
+  // from the filesystem, and the function verifies that it did.
+  //
+  // The lineage predicate names the 032 function deliberately: a store
+  // without it must read as an incomplete lineage, never as a green answer
+  // from the weaker 030 probe.
   //
   // It reports instead of throwing: readiness handlers must not have to
   // catch, and no driver text may escape toward an unauthenticated payload.
@@ -1176,7 +1188,7 @@ export class PostgresManagerControlStore implements ManagerControlStore {
     try {
       const result = await this.probeQuery(
         `SELECT to_regproc('pfm.manager_renew') IS NOT NULL
-            AND to_regprocedure('pfm.control_write_probe(int)') IS NOT NULL AS lineage`,
+            AND to_regprocedure('pfm.control_headroom_probe(int)') IS NOT NULL AS lineage`,
         [],
         options?.signal
       );
@@ -1191,7 +1203,7 @@ export class PostgresManagerControlStore implements ManagerControlStore {
     }
     try {
       await this.probeQuery(
-        `SELECT pfm.control_write_probe($1) AS r`,
+        `SELECT pfm.control_headroom_probe($1) AS r`,
         [this.writeProbeSlot],
         options?.signal
       );

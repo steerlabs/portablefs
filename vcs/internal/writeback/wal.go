@@ -188,14 +188,38 @@ type delegationFrame struct {
 // lane fields zero — the correct reading of a stream that never left the legacy
 // era. A certificate written after the boundary carries the frozen legacy pair
 // unchanged plus the live lanes.
+//
+// LegacyThrough exists because Through is a GLOBAL sequence and the legacy
+// lane's own watermark is NOT. In the legacy era the two are the same number,
+// which is why the field could be omitted for as long as there was only one
+// lane. Past the boundary they diverge — a stream born laned has a legacy
+// watermark of 0 while its global sequence counts every record ever admitted —
+// and reading Through back as the legacy lane's watermark invents a legacy tail
+// the stream never had. Recovery then finds a legacy lane it can never drain to
+// its (phantom) tail and parks the whole stream as corrupt, which is exactly the
+// unreplayable-park defect this field closes. See mark() for how a certificate
+// written before this field existed is still read correctly.
 type appliedFrame struct {
 	Through uint64 `json:"through"`
-	Digest  string `json:"digest"` // hex legacy chain digest at Through
+	Digest  string `json:"digest"` // hex legacy chain digest at LegacyThrough
+	// LegacyThrough is the LEGACY lane's own watermark. Omitted while the
+	// legacy lane is empty (a stream born after the lane boundary).
+	LegacyThrough uint64 `json:"legacyThrough,omitempty"`
 	// Per-lane watermark + hex chain digest, omitted while the lane is empty.
 	NSThrough   uint64 `json:"nsThrough,omitempty"`
 	NSDigest    string `json:"nsDigest,omitempty"`
 	DataThrough uint64 `json:"dataThrough,omitempty"`
 	DataDigest  string `json:"dataDigest,omitempty"`
+}
+
+// laned reports whether the certificate was written past the lane boundary.
+// Only a laned certificate can have a legacy watermark that differs from the
+// global sequence, so this is the discriminator mark() needs to read a
+// certificate that predates LegacyThrough.
+func (f appliedFrame) laned() bool {
+	return f.LegacyThrough != 0 ||
+		f.NSThrough != 0 || f.NSDigest != "" ||
+		f.DataThrough != 0 || f.DataDigest != ""
 }
 
 type closeFrame struct {
@@ -224,6 +248,21 @@ func (f appliedFrame) validate() error {
 }
 
 // mark reconstructs the typed stream position an APPLIED certificate records.
+//
+// The legacy lane's watermark is resolved in three cases, and the order is what
+// makes every certificate this package has ever written decode correctly:
+//
+//  1. LegacyThrough is present — use it. Every certificate written since the
+//     field exists says what it means, in both eras.
+//  2. Absent but the certificate is otherwise LANED — the legacy lane is read as
+//     empty. That is exact for the common shape (a stream born laned, whose
+//     legacy lane is 0 forever) and deliberately conservative for the rare one
+//     (a stream that crossed the boundary in place under a build that wrote the
+//     global sequence here): a zero watermark is never used as a digest base, so
+//     laneDigestAt rebuilds the legacy chain from the retained frames instead of
+//     trusting a number that cannot be told apart from the global one.
+//  3. Absent and the certificate is not laned — the pre-round-7 shape, where the
+//     legacy watermark IS the global sequence. Read Through, as always.
 func (f appliedFrame) mark() (streamMark, error) {
 	m := streamMark{global: f.Through}
 	parse := func(lane StreamLane, through uint64, hexDigest string) error {
@@ -239,7 +278,11 @@ func (f appliedFrame) mark() (streamMark, error) {
 		m.lanes[lane] = laneMark{through: through, digest: d}
 		return nil
 	}
-	if err := parse(StreamLaneLegacy, f.Through, f.Digest); err != nil {
+	legacyThrough := f.Through
+	if f.laned() {
+		legacyThrough = f.LegacyThrough
+	}
+	if err := parse(StreamLaneLegacy, legacyThrough, f.Digest); err != nil {
 		return streamMark{}, err
 	}
 	if err := parse(StreamLaneNamespace, f.NSThrough, f.NSDigest); err != nil {
@@ -285,6 +328,14 @@ func (m streamMark) appliedFrame() appliedFrame {
 	f := appliedFrame{Through: m.global, Digest: fmt.Sprintf("%x", m.lanes[StreamLaneLegacy].digest)}
 	f.NSThrough, f.NSDigest = m.lanes[StreamLaneNamespace].through, hexOf(m.lanes[StreamLaneNamespace])
 	f.DataThrough, f.DataDigest = m.lanes[StreamLaneData].through, hexOf(m.lanes[StreamLaneData])
+	// The legacy lane names its OWN watermark whenever it differs from the
+	// global sequence, and whenever any other lane is live — otherwise a reader
+	// cannot tell case 2 from case 3 in mark(). In the pure legacy era the two
+	// numbers are equal and the field is written for the same reason: so the
+	// certificate is self-describing rather than inferred.
+	if lm := m.lanes[StreamLaneLegacy]; lm.through != 0 {
+		f.LegacyThrough = lm.through
+	}
 	return f
 }
 
@@ -1483,6 +1534,12 @@ func (w *streamWAL) maxAppendCost(payloads [][]byte) (int64, error) {
 		cost += frameLen(len(p))
 	}
 	return cost, nil
+}
+
+// Dir is the stream's directory. It is immutable for the WAL's whole life, so
+// an offline reader may open the same bytes without taking the WAL's mutex.
+func (w *streamWAL) Dir() string {
+	return w.dir
 }
 
 func (w *streamWAL) LastSeq() uint64 {

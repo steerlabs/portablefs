@@ -30,7 +30,7 @@ class OutOfDiskPool implements ManagerControlPool {
   async query(text: string, values: unknown[]): Promise<{ rows: unknown[] }> {
     this.calls.push({ text, values });
     // The WRITE call, not the lineage read that merely names the function.
-    if (text.includes("SELECT pfm.control_write_probe(")) {
+    if (text.includes("SELECT pfm.control_headroom_probe(")) {
       if (this.failWrites) {
         throw Object.assign(
           new Error('could not extend file "base/16384/24576": No space left on device'),
@@ -82,7 +82,7 @@ describe("manager control-store readiness", () => {
 
     expect(probe).toEqual({ ok: true, lineageComplete: true, writable: true });
     const write = pool.calls.find((call) =>
-      call.text.includes("SELECT pfm.control_write_probe(")
+      call.text.includes("SELECT pfm.control_headroom_probe(")
     );
     expect(write, "healthProbe must exercise write capability").toBeDefined();
     // Bounded: the write targets a fixed ring slot, so proving readiness can
@@ -90,6 +90,44 @@ describe("manager control-store readiness", () => {
     expect(typeof write!.values[0]).toBe("number");
     expect(write!.values[0] as number).toBeGreaterThanOrEqual(0);
     expect(write!.values[0] as number).toBeLessThan(16);
+  });
+
+  // ROUND 17c / FINDING 4. The 030 probe (pfm.control_write_probe) is a fixed
+  // 16-slot ring of in-place UPDATEs. Its own migration concedes such an
+  // update "must take a free page from the FSM or extend", and after vacuum
+  // recycles the ring's own dead versions the FSM arm is the one that always
+  // runs: measured on postgres:18 with the ring in a 100%-full tablespace
+  // (WAL writable), 40/40 probes answered HEALTHY, the relation grew 0 bytes,
+  // and a journal-class insert in the same session failed 53100.
+  //
+  // Readiness must therefore call the probe that PROVES AN ALLOCATION
+  // (pfm.control_headroom_probe, migration 032), and the lineage predicate
+  // must name it so a store without 032 reads as incomplete rather than
+  // getting a green answer out of the weaker probe.
+  test("readiness proves ALLOCATION headroom, not merely a fixed-row update", async () => {
+    const pool = new OutOfDiskPool(false);
+    const store = new PostgresManagerControlStore("postgres://ignored", { pool });
+
+    await store.healthProbe();
+
+    const lineage = pool.calls[0]!;
+    expect(
+      lineage.text,
+      "the lineage gate must name the 032 headroom probe, so a pre-032 store fails closed"
+    ).toContain("pfm.control_headroom_probe(int)");
+    const probes = pool.calls.filter((call) => call.text.includes("SELECT pfm."));
+    expect(
+      probes.some((call) => call.text.includes("pfm.control_headroom_probe(")),
+      "healthProbe must exercise the allocation probe"
+    ).toBe(true);
+    expect(
+      probes.some(
+        (call) =>
+          call.text.includes("pfm.control_write_probe(") &&
+          !call.text.includes("pfm.control_headroom_probe(")
+      ),
+      "readiness must NOT rest on the 030 fixed-ring probe: it answers healthy from FSM-reused pages on a full data volume"
+    ).toBe(false);
   });
 
   test("a control store missing the probe surface is lineage-incomplete, never optimistically ready", async () => {

@@ -141,6 +141,51 @@ func TestRoundTripSuccessDoesNotProveTheCurrentCredential(t *testing.T) {
 	}
 }
 
+// TestCredentialRejectionIsUnlatchedByAFreshInstall pins the RECOVERY path.
+//
+// A round-17 audit reported that connHealth.credRejectedAt is a latch with
+// nothing to clear it, leaving a mount permanently reporting "rejected" and
+// doing nothing about it. That is not what the code does, and the difference
+// matters: installing a fresh credential opens a NEW generation, and the latch
+// is keyed to the generation it was earned against, so it stops applying the
+// moment a replacement is installed. The prober is re-armed by the same
+// installation (see installVerify).
+//
+// What is genuinely broken is one layer up — nothing was reliably DELIVERING a
+// fresh credential (see credentialHandoff in the CLI). This test exists so the
+// distinction stays pinned: the data plane can recover, and the recovery is
+// gated on delivery.
+func TestCredentialRejectionIsUnlatchedByAFreshInstall(t *testing.T) {
+	h := newConnHealth()
+	rejected := h.generation()
+	h.recordCredentialRejected(rejected)
+	if !h.credentialDead() {
+		t.Fatal("precondition: the current credential's rejection is latched")
+	}
+
+	// The operator (or the lease keeper's handoff) installs a replacement.
+	fresh := h.installCredential(nil)
+	if fresh == rejected {
+		t.Fatal("an install must open a NEW generation")
+	}
+	if h.credentialDead() {
+		t.Fatal("a freshly installed credential is still reported dead: the rejection " +
+			"latch outlived the credential it was about, so no delivery could ever " +
+			"recover this mount")
+	}
+	if !h.credentialUnproven() {
+		t.Fatal("a freshly installed credential must be UNPROVEN, not healthy: nothing " +
+			"has offered it to the authority yet")
+	}
+
+	// And it resolves normally from there, in either direction.
+	h.recordHandshakeSuccess(fresh)
+	if h.credentialDead() || h.credentialUnproven() {
+		t.Fatalf("a handshake offering the fresh credential left dead=%v unproven=%v",
+			h.credentialDead(), h.credentialUnproven())
+	}
+}
+
 // TestVerdictRacingAnInstallIsNotMisattributed pins that a handshake which
 // started before an install cannot latch its verdict against the successor.
 func TestVerdictRacingAnInstallIsNotMisattributed(t *testing.T) {

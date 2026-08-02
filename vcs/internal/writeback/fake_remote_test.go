@@ -42,6 +42,11 @@ type fakeAuthority struct {
 	omitChildren bool
 	flushErr     error
 	flushStat    int32
+	// laneErr fails ONE lane's flushes while every other lane keeps applying.
+	// It is the shape a real wedge takes: bulk data stops moving while
+	// namespace traffic in unrelated scopes continues to be made durable, which
+	// is what pins the GLOBAL applied prefix while the per-lane marks advance.
+	laneErr [streamLaneCount]error
 	// throughShortfall simulates a protocol-violating authority: flushes
 	// apply and succeed, but the reported watermark is lowered by this much.
 	throughShortfall uint64
@@ -303,6 +308,9 @@ func (a *fakeAuthority) Flush(ctx context.Context, req FlushRequest) (FlushReply
 	if a.flushErr != nil {
 		return FlushReply{}, a.flushErr
 	}
+	if req.Lane < streamLaneCount && a.laneErr[req.Lane] != nil {
+		return FlushReply{}, a.laneErr[req.Lane]
+	}
 	if a.flushStat != 0 {
 		return FlushReply{Status: a.flushStat}, nil
 	}
@@ -534,6 +542,19 @@ func (a *fakeAuthority) Discard(_ context.Context, writebackID string, scopes []
 		}
 	}
 	return nil
+}
+
+// holdLaneForTest wedges one lane's uplink; releaseLaneForTest reopens it.
+func (a *fakeAuthority) holdLaneForTest(lane StreamLane, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.laneErr[lane] = err
+}
+
+func (a *fakeAuthority) releaseLaneForTest(lane StreamLane) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.laneErr[lane] = nil
 }
 
 func (a *fakeAuthority) fileContent(p string) ([]byte, bool) {

@@ -89,11 +89,16 @@ func (a *attach) admitRequest(
 	if eno != 0 {
 		return opCtx, settle, eno, classified
 	}
-	release, reserveEno := a.reserveSizeMutationForRequest(opCtx, body)
+	release, token, reserveEno := a.reserveSizeMutationForRequest(opCtx, body)
 	if reserveEno != 0 {
 		settle()
 		return opCtx, func() {}, reserveEno, classified
 	}
+	// The granted reservation's generation token travels on the operation
+	// context, so the handler's committed publication and the dispatcher's
+	// delivery step can both name the mutation that took the item. See
+	// repairwitness.go.
+	opCtx = withSizeMutationToken(opCtx, token)
 	if release != nil {
 		lane := settle
 		settle = func() {

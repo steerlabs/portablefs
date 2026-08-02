@@ -8,6 +8,7 @@ import {
   type JournalReclaimCandidate,
   type JournalReclaimResult,
   type ServingPinStatus,
+  type VolumeRetirementTask,
 } from "@portablefs/metadata-db";
 import { intEnv } from "./config.js";
 import type { VolumeApiTelemetry } from "./telemetry.js";
@@ -169,6 +170,29 @@ export interface HistoryMaintenanceStore {
   }): Promise<JournalReclaimResult>;
 }
 
+/**
+ * The durable volume-retirement queue (migration 033), as the loop uses it.
+ *
+ * It is deliberately NOT part of HistoryMaintenanceStore: the queue is a
+ * metadata-repository surface (it spans public.volumes, pfh and pfj), and the
+ * loop should be able to drain it on a deployment whose history store is a
+ * test double. Optional throughout, so an embedder on a pre-033 lineage still
+ * composes and reports the gap per cycle instead of pretending retirement
+ * releases anything.
+ */
+export interface VolumeRetirementDrainStore {
+  claimVolumeRetirementTasks(input?: {
+    limit?: number;
+    backoffMs?: number;
+  }): Promise<VolumeRetirementTask[]>;
+  finishVolumeRetirement(input: { tenantId: string; volumeId: string }): Promise<unknown>;
+  deferVolumeRetirementTask?(input: {
+    tenantId: string;
+    volumeId: string;
+    error: string;
+  }): Promise<void>;
+}
+
 export interface HistoryMaintenanceCycleSummary {
   generationsScanned: number;
   cutsCreated: number;
@@ -201,6 +225,20 @@ export interface HistoryMaintenanceCycleSummary {
    * but "journal records accumulate without bound" must never be silent.
    */
   reclaimUnavailable: boolean;
+  // ── volume retirement drain (migration 033) ──────────────────────────────
+  /** Durable retirement obligations claimed this cycle. */
+  retirementTasksClaimed: number;
+  /** Obligations whose atomic cleanup+journal-retirement transition ran. */
+  retirementTasksCompleted: number;
+  /** Obligations that failed and stay queued with backoff. */
+  retirementTasksDeferred: number;
+  /**
+   * This store cannot drain retirement obligations (migration 033 absent).
+   * Surfaced per cycle, never as a failure: an older lineage is a deployment
+   * fact, but "a retired volume's journal is never released" must not be
+   * silent — it is the accumulation that filled this control store twice.
+   */
+  retirementDrainUnavailable: boolean;
 }
 
 export interface HistoryMaintenanceLoopOptions {
@@ -240,6 +278,17 @@ export interface HistoryMaintenanceLoopOptions {
   reclaimMaxPagesPerCycle?: number | undefined;
   /** Generations examined per reclaim scan, largest waste first. */
   reclaimScanLimit?: number | undefined;
+  // ── volume retirement drain (migration 033) ──────────────────────────────
+  /**
+   * The durable retirement queue. Absent on a pre-033 lineage (or in tests
+   * that do not exercise it); the cycle then reports
+   * `retirementDrainUnavailable` instead of silently dropping the work.
+   */
+  retirement?: VolumeRetirementDrainStore | undefined;
+  /** Obligations claimed per cycle. */
+  retirementBatch?: number | undefined;
+  /** Base backoff before a failed obligation is retried (grows per attempt). */
+  retirementBackoffMs?: number | undefined;
 }
 
 /** Deterministic per-(generation, base) cut identity: exact-once by construction. */
@@ -343,6 +392,10 @@ function emptySummary(): HistoryMaintenanceCycleSummary {
     bytesReclaimed: 0,
     agedGenerationsForced: 0,
     reclaimUnavailable: false,
+    retirementTasksClaimed: 0,
+    retirementTasksCompleted: 0,
+    retirementTasksDeferred: 0,
+    retirementDrainUnavailable: false,
   };
 }
 
@@ -359,6 +412,9 @@ export class HistoryMaintenanceLoop {
   private readonly reclaimBatchRows: number;
   private readonly reclaimMaxPagesPerCycle: number;
   private readonly reclaimScanLimit: number;
+  private readonly retirement: VolumeRetirementDrainStore | undefined;
+  private readonly retirementBatch: number;
+  private readonly retirementBackoffMs: number;
   private warnedServingUnconfigured = false;
 
   private stopped = false;
@@ -383,6 +439,12 @@ export class HistoryMaintenanceLoop {
       "reclaimMaxPagesPerCycle"
     );
     this.reclaimScanLimit = validatedPositiveInt(options.reclaimScanLimit ?? 32, "reclaimScanLimit");
+    this.retirement = options.retirement;
+    this.retirementBatch = validatedPositiveInt(options.retirementBatch ?? 8, "retirementBatch");
+    this.retirementBackoffMs = validatedPositiveInt(
+      options.retirementBackoffMs ?? 60_000,
+      "retirementBackoffMs"
+    );
   }
 
   /** Runs one cycle immediately, then re-arms after each completed cycle. */
@@ -451,12 +513,79 @@ export class HistoryMaintenanceLoop {
       await this.sweepServingPins(summary);
     }
 
+    // The retirement drain runs BEFORE reclamation: it is what makes a
+    // retired volume's records reclaimable at all (it moves each generation's
+    // base to its own tip), so draining first lets the same cycle delete what
+    // it just released instead of waiting a full interval.
+    if (!this.halted()) {
+      await this.drainVolumeRetirements(summary);
+    }
+
     if (!this.halted()) {
       await this.reclaimJournalStorage(summary);
     }
 
     this.emit(summary);
     return summary;
+  }
+
+  // ── volume retirement drain (migration 033) ──────────────────────────────
+  //
+  // The DELETE route commits the retirement receipt and this obligation in
+  // ONE transaction, then attempts the transition inline as a fast path. This
+  // pass is what makes the attempt optional. Before it existed, a transient
+  // failure of the inline journal release was LOGGED and forgotten: nothing
+  // retried it, and this loop's reclamation pass could not pick it up either
+  // — reclamation only deletes below an EXISTING horizon, and a generation
+  // that was never retired has a horizon of its own base_seq, so it offers
+  // zero reclaimable records and never appears as a candidate. Without a
+  // client replay, that volume's whole journal tail was retained forever.
+  //
+  // Bounded like every other pass: a fixed batch per cycle, one bounded
+  // transaction per obligation, the drain check between each, and a
+  // per-attempt backoff enforced by the claim itself.
+  private async drainVolumeRetirements(summary: HistoryMaintenanceCycleSummary): Promise<void> {
+    const retirement = this.retirement;
+    if (!retirement) {
+      summary.retirementDrainUnavailable = true;
+      return;
+    }
+    let tasks: VolumeRetirementTask[] = [];
+    try {
+      tasks = await retirement.claimVolumeRetirementTasks({
+        limit: this.retirementBatch,
+        backoffMs: this.retirementBackoffMs,
+      });
+    } catch (error) {
+      this.recordFailure(summary, "volume retirement claim", error);
+      return;
+    }
+    summary.retirementTasksClaimed = tasks.length;
+    for (const task of tasks) {
+      if (this.halted()) {
+        break;
+      }
+      try {
+        await retirement.finishVolumeRetirement({
+          tenantId: task.tenantId,
+          volumeId: task.volumeId,
+        });
+        summary.retirementTasksCompleted += 1;
+      } catch (error) {
+        // The obligation stays queued: the claim already bumped its attempt
+        // and pushed out next_attempt_ms, so this only records WHY, and its
+        // own failure must not end the pass.
+        summary.retirementTasksDeferred += 1;
+        this.classify(summary, `volume retirement ${task.volumeId}`, error);
+        await retirement
+          .deferVolumeRetirementTask?.({
+            tenantId: task.tenantId,
+            volumeId: task.volumeId,
+            error: describeError(error),
+          })
+          .catch(() => undefined);
+      }
+    }
   }
 
   // ── journal reclamation (migration 031) ──────────────────────────────────

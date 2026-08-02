@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,15 +128,34 @@ type attachStatus struct {
 // held delegations, and every parked stream the recovery machinery or an
 // operator must still resolve.
 type writeBackStatus struct {
-	PendingRecords  int              `json:"pendingRecords"`
-	PendingBytes    int64            `json:"pendingBytes"`
-	AppliedThrough  uint64           `json:"appliedThrough,omitempty"`
-	AdmittedThrough uint64           `json:"admittedThrough,omitempty"`
-	OldestPendingMs int64            `json:"oldestPendingMs,omitempty"`
-	Degraded        bool             `json:"degraded,omitempty"`
-	LastFailure     string           `json:"lastFailure,omitempty"`
-	Delegations     []delegationView `json:"delegations"`
-	WALBytes        int64            `json:"walBytes,omitempty"`
+	PendingRecords int   `json:"pendingRecords"`
+	PendingBytes   int64 `json:"pendingBytes"`
+	// UnrecoveredRecords/UnrecoveredBytes is the SUBSET of the pending debt that
+	// is not going to drain on its own: every parked, forced, conflicted or
+	// corrupt recovery job's remainder.
+	//
+	// ── WHY THE SPLIT IS ITS OWN NUMBER ─────────────────────────────────────
+	//
+	// "Pending is zero" was being read as "the drain completed", and those are
+	// not the same statement. A forced unmount parks its undrained tail as a
+	// durable recovery job; the live engine then legitimately reports nothing
+	// pending while the parked stream still holds every byte of it. An operator
+	// — or an automated drain-to-zero check — reading only PendingBytes was
+	// told the mount was clean over data that had not reached the authority and
+	// might never.
+	//
+	// So the two facts are reported separately and always together: what is
+	// still moving, and what has stopped. A drain is complete only when BOTH
+	// are zero, and that is now something a caller can actually check.
+	UnrecoveredRecords int              `json:"unrecoveredRecords,omitempty"`
+	UnrecoveredBytes   int64            `json:"unrecoveredBytes,omitempty"`
+	AppliedThrough     uint64           `json:"appliedThrough,omitempty"`
+	AdmittedThrough    uint64           `json:"admittedThrough,omitempty"`
+	OldestPendingMs    int64            `json:"oldestPendingMs,omitempty"`
+	Degraded           bool             `json:"degraded,omitempty"`
+	LastFailure        string           `json:"lastFailure,omitempty"`
+	Delegations        []delegationView `json:"delegations"`
+	WALBytes           int64            `json:"walBytes,omitempty"`
 	// WALBudget is the WAL's byte cap; WALBytes alone cannot say how close to
 	// it the engine is running. LastProgressMs is the age of the last drain
 	// progress, which is what separates a paced flusher from a stuck one.
@@ -171,11 +191,31 @@ type delegationView struct {
 }
 
 type recoveryJobRef struct {
-	JobID     string `json:"jobId"`
-	State     string `json:"state"`
-	Records   uint64 `json:"records"`
-	Bytes     uint64 `json:"bytes"`
+	JobID   string `json:"jobId"`
+	State   string `json:"state"`
+	Records uint64 `json:"records"`
+	Bytes   uint64 `json:"bytes"`
+	// Unrecovered says this job's remainder is NOT going to drain on its own —
+	// it is parked, forced, conflicted or corrupt — and is therefore part of the
+	// attach's unrecovered split. It is derived from State rather than reported
+	// separately so the two can never disagree.
+	Unrecovered bool `json:"unrecovered,omitempty"`
+	// Conflicts is the typed recovery conflict set: which SCOPES are affected
+	// and why. It was already carried on the durable job and dropped here, so
+	// `portablefs mounts --json` and doctor could report "conflict" and nothing
+	// else — an operator was told a decision was required without being told
+	// what the decision was about.
+	Conflicts []recoveryConflictRef `json:"conflicts,omitempty"`
+	// Remedy is the one sentence an operator can act on for this job's state.
+	Remedy    string `json:"remedy,omitempty"`
 	LastError string `json:"lastError,omitempty"`
+}
+
+// recoveryConflictRef is one typed recovery conflict on the wire.
+type recoveryConflictRef struct {
+	Scope string `json:"scope"`
+	Epoch string `json:"epoch,omitempty"`
+	Kind  string `json:"kind"`
 }
 
 type parkedWAL struct {
@@ -568,10 +608,53 @@ func (r *registry) get(ref string) *attach {
 // mutation. Resolving the ref and publishing a live Volume therefore cannot
 // race an exact detach that is removing the same registry entry.
 func (r *registry) activate(ctx context.Context, ref, token string, expiresAtMs int64, onlyIfPending bool) (bool, bool, error) {
+	// ── A ROTATION INTO A LIVE ATTACH TAKES NO REGISTRY MUTATION LOCK ────────
+	//
+	// Round 15 took the mount-wide namespace lock off this path
+	// (attach.rotateLiveCredential), and the registry's global mutationMu was
+	// left behind — which is the same defect one level up. runUnmountTransaction
+	// holds mutationMu across the ENTIRE drain barrier (clientcore's 60s
+	// volumeBarrierTimeout per attempt) plus the exact kernel detach, and
+	// registry.delete holds it across a full detach. Under a flood the lease
+	// keeper's credential push therefore queued behind all of that, burned its
+	// full 60s control timeout, and was DROPPED — so the daemon went on using a
+	// credential the keeper believed it had delivered, and the ACCESS lease died
+	// underneath a mount that was busy proving it was alive.
+	//
+	// Safe on exactly round 15's terms, and for one more reason of its own:
+	//
+	//   – rotateLiveCredential answers handled=false for every state whose
+	//     verdict belongs to the locked path — detached, quarantined by a
+	//     prepared detach, or not yet started — so those callers keep the exact
+	//     error and the exact serialization they had. handled=true is only the
+	//     case the locked path reduces to one setCredential and an immediate
+	//     return, so the fast path is behaviour-identical where it applies.
+	//   – it re-checks detached/quarantined/started under a.mu, and its
+	//     remaining window (a detach that begins after that check) installs a
+	//     fresh credential into a volume that is DRAINING — which is what the
+	//     barrier needs to reach the authority at all, not a hazard. That window
+	//     is also not new: every in-flight frontend request calls into the same
+	//     Volume concurrently with a detach and always has.
+	//   – it mutates no registry state, persists nothing, and starts nothing, so
+	//     there is no registry invariant for mutationMu to have been protecting.
+	//
+	// The read below is lock-free with respect to mutationMu, so the slow path
+	// RE-RESOLVES the ref after acquiring it. That is what keeps the slow path
+	// identical to the code this replaced: a concurrent delete may have removed
+	// the attach (answer: not found, as before) and a concurrent ensure may have
+	// registered or replaced it (answer: the current attach, as before).
+	r.mu.RLock()
+	a := r.byRef[ref]
+	r.mu.RUnlock()
+	if a != nil {
+		if done, handled := a.rotateLiveCredential(token, expiresAtMs, onlyIfPending); handled {
+			return true, done, nil
+		}
+	}
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
 	r.mu.RLock()
-	a := r.byRef[ref]
+	a = r.byRef[ref]
 	r.mu.RUnlock()
 	if a == nil {
 		return false, false, nil
@@ -1365,20 +1448,28 @@ type attach struct {
 	// spent its whole operation deadline without attempting anything. Guarded
 	// by mu.
 	itemTurnstiles map[uint64]*itemTurnstile
-	// repairAttrPublications counts the attribute publications this daemon has
-	// made for an item since a crossed-scope repair started WATCHING it, and is
-	// how such a repair converges on a continuously written file instead of
-	// spending its whole budget being preempted (coherence_refresh.go).
+	// repairPublicationWatches is the crossed-scope repair's convergence witness
+	// (repairwitness.go): a per-item MONOTONIC generation of the committed size
+	// publications this daemon has actually delivered to the kernel, plus a
+	// reference count of the repairs currently watching that item.
 	//
-	// It is a watch rather than a census on purpose: an entry exists only while a
-	// repair is outstanding for that item, so this map is the size of the
+	// It is how such a repair converges on a continuously written file instead
+	// of spending its whole budget being preempted (coherence_refresh.go), and
+	// it replaces a resettable per-item counter that (a) credited ANY attribute
+	// assignment made while ANY reservation existed — a getattr's pre-write
+	// observation discharged the debt of the write that had not committed yet —
+	// and (b) was reset by every new watcher and deleted by every stop, so two
+	// repairs on one item blinded each other.
+	//
+	// It is a watch rather than a census on purpose: an entry exists only while
+	// some repair is outstanding for that item, so this map is the size of the
 	// in-flight repair set and never of the working set. Guarded by mu.
-	repairAttrPublications map[uint64]uint64
-	handles                map[uint64]*handleRecord
-	localDirs              []string
-	localRoot              string
-	localFS                *confinedfs.Root
-	localVersions          map[string]uint64
+	repairPublicationWatches map[uint64]*repairPublicationWatch
+	handles                  map[uint64]*handleRecord
+	localDirs                []string
+	localRoot                string
+	localFS                  *confinedfs.Root
+	localVersions            map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -2384,17 +2475,102 @@ func newWriteBackStatus(st writeback.Status) *writeBackStatus {
 	}
 	now := time.Now().UnixMilli()
 	for _, j := range st.Jobs {
-		wb.Jobs = append(wb.Jobs, recoveryJobRef{
+		ref := recoveryJobRef{
 			JobID: j.JobID, State: j.State,
 			Records: j.PendingRecords, Bytes: j.PendingBytes,
-			LastError: j.LastError,
-		})
+			Unrecovered: recoveryJobIsUnrecovered(j.State),
+			Remedy:      recoveryJobRemedy(j),
+			LastError:   j.LastError,
+		}
+		for _, c := range j.Conflicts {
+			ref.Conflicts = append(ref.Conflicts, recoveryConflictRef{
+				Scope: c.Scope, Epoch: c.Epoch, Kind: c.Kind,
+			})
+		}
+		if ref.Unrecovered {
+			// The attach's honest drain verdict. A caller that reads
+			// PendingBytes alone cannot tell "nothing left" from "nothing left
+			// that is still moving"; this is the difference, and it is summed
+			// from the jobs rather than asserted so it can never disagree with
+			// the job list beside it.
+			wb.UnrecoveredRecords += int(j.PendingRecords)
+			wb.UnrecoveredBytes += int64(j.PendingBytes)
+		}
+		wb.Jobs = append(wb.Jobs, ref)
 		wb.ParkedWALs = append(wb.ParkedWALs, parkedWAL{
 			WAL: j.JobID, Records: int(j.PendingRecords), PayloadBytes: int64(j.PendingBytes),
 			AgeMs: now - j.CreatedAtMs, LastError: j.LastError,
 		})
 	}
 	return wb
+}
+
+// recoveryJobIsUnrecovered reports whether a job's remainder has STOPPED — it
+// will not drain without an attach, an operator decision, or a repair.
+//
+// JobActive is the live stream and JobReplaying is draining right now; both are
+// still moving and belong to the pending figure alone. Everything else is data
+// that is sitting still, and a drain-to-zero check that cannot see it is not a
+// drain-to-zero check.
+func recoveryJobIsUnrecovered(state string) bool {
+	switch state {
+	case writeback.JobForced,
+		writeback.JobParked,
+		writeback.JobConflict,
+		writeback.JobCorrupt:
+		return true
+	default:
+		return false
+	}
+}
+
+// recoveryJobRemedy is the one sentence an operator can act on for a stopped
+// job, NAMING the affected scopes where the job records them.
+//
+// It exists because "state: corrupt" and "state: conflict" are verdicts without
+// instructions: they tell an operator that something needs a decision and
+// nothing about what the decision is, which scopes it concerns, or which
+// command makes it. A status field that cannot be acted on is a status field
+// that gets ignored.
+func recoveryJobRemedy(j writeback.RecoveryJob) string {
+	switch j.State {
+	case writeback.JobForced:
+		return "a forced unmount parked this stream; re-attach the volume to " +
+			"replay it, or export it with `portablefs recover export`"
+	case writeback.JobParked:
+		return "the live stream stalled terminally; re-attach the volume to " +
+			"resume recovery"
+	case writeback.JobConflict:
+		if scopes := recoveryConflictScopes(j); scopes != "" {
+			return "recovery conflicts on " + scopes +
+				"; resolve them with `portablefs recover resolve`"
+		}
+		return "a typed recovery conflict needs an operator decision; resolve " +
+			"it with `portablefs recover resolve`"
+	case writeback.JobCorrupt:
+		return "WAL damage blocks automatic replay; export what survives with " +
+			"`portablefs recover export` before removing the job"
+	default:
+		return ""
+	}
+}
+
+// recoveryConflictScopes renders the distinct scopes a job's conflicts name, in
+// first-seen order, as a quoted comma-separated list.
+func recoveryConflictScopes(j writeback.RecoveryJob) string {
+	seen := make(map[string]struct{}, len(j.Conflicts))
+	var out []string
+	for _, c := range j.Conflicts {
+		if c.Scope == "" {
+			continue
+		}
+		if _, dup := seen[c.Scope]; dup {
+			continue
+		}
+		seen[c.Scope] = struct{}{}
+		out = append(out, strconv.Quote(c.Scope))
+	}
+	return strings.Join(out, ", ")
 }
 
 // credentialStateRejected / credentialStatePendingVerification are the two
@@ -2744,64 +2920,15 @@ func (a *attach) publishRecordAttrLocked(rec *itemRecord, attr fsproto.Attr, adm
 	}
 	rec.attr = attr
 	a.notePublicationLocked(rec.item.ItemID)
-	a.noteRepairPublicationLocked(rec.item.ItemID)
-}
-
-// watchRepairPublications starts counting this daemon's own attribute
-// publications for itemID, and returns the stop that forgets them.
-//
-// It is the crossed-scope repair's convergence witness. See
-// repairCrossedItem for what a publication proves and why.
-func (a *attach) watchRepairPublications(itemID uint64) func() {
-	if itemID == 0 {
-		return func() {}
-	}
-	a.mu.Lock()
-	if a.repairAttrPublications == nil {
-		a.repairAttrPublications = map[uint64]uint64{}
-	}
-	a.repairAttrPublications[itemID] = 0
-	a.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			a.mu.Lock()
-			delete(a.repairAttrPublications, itemID)
-			a.mu.Unlock()
-		})
-	}
-}
-
-// repairPublicationsSince reports how many attribute publications this daemon
-// has made for itemID since its watch began.
-func (a *attach) repairPublicationsSince(itemID uint64) uint64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.repairAttrPublications[itemID]
-}
-
-// noteRepairPublicationLocked records one attribute publication against a
-// watched item, and does nothing at all for every other item. Callers hold mu.
-//
-// It counts only publications made while a SIZE MUTATION IS RESERVED on the
-// item, and that restriction is the whole precision of the witness. The
-// reservation strictly contains its handler's commit and publication
-// (refreshpin.go), so a publication inside one is an application write's own
-// post-op attributes — the value that also travels back to the kernel in that
-// write's reply. Publications from anything else (a reconciliation install, a
-// background repair) say nothing about what the kernel was told, and counting
-// them would let the crossed repair discharge on the daemon's own bookkeeping.
-func (a *attach) noteRepairPublicationLocked(itemID uint64) {
-	if itemID == 0 {
-		return
-	}
-	if _, watched := a.repairAttrPublications[itemID]; !watched {
-		return
-	}
-	if !a.sizeMutationReservedLocked(itemID) {
-		return
-	}
-	a.repairAttrPublications[itemID]++
+	// NOTE: this is deliberately NOT the crossed repair's convergence witness.
+	//
+	// It used to be: an assignment here credited a repair's publication counter
+	// whenever ANY size reservation happened to be outstanding on the item. That
+	// counted a getattr's PRE-WRITE observation as proof that the write which
+	// had merely been granted its reservation had told the kernel something —
+	// and the write could then fail without committing at all. The witness is
+	// now bound to the mutation's own token and to the DELIVERY of its reply;
+	// see repairwitness.go.
 }
 
 // publishItemSizeLocked installs a size a MUTATION decided onto the item it

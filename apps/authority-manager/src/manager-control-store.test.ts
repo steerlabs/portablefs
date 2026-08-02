@@ -852,7 +852,7 @@ describe("PostgresManagerControlStore (scripted pool)", () => {
       writable: true,
     });
     expect(pool.calls[0]!.text).toContain("to_regproc('pfm.manager_renew')");
-    expect(pool.calls[1]!.text).toContain("pfm.control_write_probe(");
+    expect(pool.calls[1]!.text).toContain("pfm.control_headroom_probe(");
 
     const down = new ScriptedPool().fail(new Error("ECONNREFUSED"));
     const downStore = new PostgresManagerControlStore("postgres://ignored", { pool: down });
