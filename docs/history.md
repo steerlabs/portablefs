@@ -578,16 +578,38 @@ Two operational properties of adoption worth knowing:
   cycle telemetry, with a one-time operator warning) on deployments without
   `PFH_WORKER_STORES_JSON` / `VOLUME_HISTORY_STORES_JSON`; ready cuts wait,
   instantly adoptable once serving is configured.
-- **Adopting under a live writer forces that authority to restart.** The
-  live child's journal mirror treats any base-commit move it cannot prove as
-  poison (fail-closed by design: an unproven base move is indistinguishable
-  from corruption), so its next append fences the data plane and steps down;
-  the manager demand-starts a replacement that cold-starts FROM the adopted
-  base (a short replay, which is the point of adoption). Acknowledged writes
-  are journal-durable throughout — the cost is one bounded authority restart
-  per adoption on actively-writing branches. A future hot base swap rides
-  the `pfh.serving_pin_ack` seam (the child acknowledging the swapped base
-  in place); until then the restart IS the swap.
+- **Adoption is survivable by a live writer** (migration 037 onward). The
+  child still treats a base-commit move it cannot prove as poison — an
+  unproven base move is indistinguishable from corruption, and records below
+  the base become physically deletable — but the proof it demands is now the
+  one the schema actually issues. `pfj.journal_append_v4` carries
+  `currentAdoption`: the `pfh.adoptions` row that authorized the current base
+  tuple, joined to the `ready` `pfh.history_cuts` row it adopted. The child
+  accepts the advance only when that row pair attests **exactly** the tuple
+  being installed — `cut_seq_exclusive` / `cut_digest` / `result_commit_id`
+  equal the new base seq / digest / commit id, and `cut_digest` is the
+  journal chain digest at the boundary, so the proof is bound to the child's
+  own byte history — and only when the adoption does not reach back behind
+  the base the child already holds. The base swap happens in place: no
+  fence, no restart, no replay, and `CompactedThrough()` advances so the
+  child can release everything the new base now covers.
+
+  Before 037 this was a documented restart. It was not a design property, it
+  was a defect: the child demanded a LANDED legacy checkpoint cut, and 013
+  and 031 raise PF005 on any write to the legacy cut columns of a `pfj3`
+  generation (the base advance is authorized by a `pfh.adoptions` row
+  instead). The proof was unsatisfiable, so **every** adoption under an
+  attached writer poisoned it, and — because the child assigns its local
+  base only after that check passes — `CompactedThrough()` never advanced
+  for the life of the writer either.
+
+  The generation snapshot (`pfj.generation_json`) and the zero-addition
+  quota preflight (`pfj.journal_check_append_quota`) carry the same proof
+  under the key `adoption`, because they validate the same transition on the
+  trim/rotate/suspend and admission lanes. `pfj.journal_append_v3` is
+  unchanged and keeps its grant, so an un-upgraded child keeps working
+  exactly as it did; a 037-aware child against a pre-037 schema fails closed
+  on `undefined_function` rather than silently losing the proof.
 
 Admin routes under `/v1/admin/history/*` (admin token) expose the same
 caller surface for manual drives and inspection: `POST /cuts`,

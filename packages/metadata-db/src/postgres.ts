@@ -306,6 +306,23 @@ const migrationIds = [
   // the same kind). No claim policy, fence, epoch or work-item lock mode
   // changes: the work-item distribution was already correct.
   "036_history_worker_beat_convoy",
+  // 037 makes a history-cut adoption survivable by an attached writer. The
+  // child refuses any base-commit move it cannot prove — correctly, because
+  // records below the base become physically deletable — but it demanded a
+  // LANDED legacy checkpoint cut, and 013/031 raise PF005 on any write to the
+  // legacy cut columns of a pfj3 generation. The modern base advance is
+  // authorized by a pfh.adoptions ROW instead, so the proof the child required
+  // was one the schema forbids the server to produce: unsatisfiable, not
+  // protective. Every adoption that landed under a live writer poisoned it,
+  // fenced the data plane and took the mount to EIO — and because the child
+  // assigns its local base only after that check passes, CompactedThrough
+  // never advanced either. 037 projects the adoption + its ready history cut
+  // as pfj.adoption_proof_json and carries it on generation_json ('adoption'),
+  // on the quota preflight ('adoption'), and on a new pfj.journal_append_v4
+  // ('currentAdoption') that wraps v3 without touching its frozen receipt
+  // body. The child still refuses what it cannot prove; the proof it demands
+  // is now the one the system actually issues.
+  "037_adoption_base_proof",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";

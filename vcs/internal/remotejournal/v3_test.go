@@ -96,7 +96,12 @@ func TestAppendEntriesUsesV3SQLWithManifestInBytes(t *testing.T) {
 	if err := l.CommitThrough(0); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if !strings.Contains(db.query, "pfj.journal_append_v3") {
+	// v4 is v3's exact contract (same 12 arguments, same durable effect, and
+	// v4's body is a wrapper that calls v3) plus the `currentAdoption` proof
+	// field a PFJ3 base advance is authorized by. Pinning the entry point here
+	// is what makes an accidental downgrade to v3 — which silently loses the
+	// proof and restores the unsatisfiable check — a test failure.
+	if !strings.Contains(db.query, "pfj.journal_append_v4") {
 		t.Fatalf("append SQL %q", db.query)
 	}
 	if len(db.args) != 12 {

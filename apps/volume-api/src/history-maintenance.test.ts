@@ -11,6 +11,7 @@ import {
   adoptionOperationId,
   classifyCutFailure,
   HistoryMaintenanceLoop,
+  coordinatedBacklogPercent,
   historyMaintenanceSettingsFromEnv,
   isBenignHistoryRefusal,
   recordedCutFailure,
@@ -451,11 +452,47 @@ function loopWith(
   });
 }
 
+describe("coordinatedBacklogPercent", () => {
+  const gib = 1024 * 1024 * 1024;
+
+  test("clamps the production inversion that wedged a branch at 2 GiB", () => {
+    // The shipped defaults: a 2048 MiB RAM bound and a 4096 MiB journal quota
+    // is 50%, and the loop's configured trigger was 70% — so RAM filled twenty
+    // points before the loop looked. The clamp puts the cut at 25%, a full
+    // fold window below the RAM bound.
+    expect(coordinatedBacklogPercent(70, 2 * gib, 4 * gib, true)).toBe(25);
+  });
+
+  test("a larger RAM bound buys a later cut, never past the configured trigger", () => {
+    expect(coordinatedBacklogPercent(70, 8 * gib, 4 * gib, true)).toBe(70);
+    expect(coordinatedBacklogPercent(40, 8 * gib, 4 * gib, true)).toBe(40);
+  });
+
+  test("a tiny RAM bound still yields an admissible percentage", () => {
+    // generationsPastThreshold refuses anything outside 1..100 (PF008), so the
+    // clamp must never produce 0 however small the RAM bound is.
+    expect(coordinatedBacklogPercent(70, 1024 * 1024, 4 * gib, true)).toBe(1);
+  });
+
+  test("a disabled or unknown bound leaves the configured value alone", () => {
+    expect(coordinatedBacklogPercent(70, 0, 4 * gib, true)).toBe(70);
+    expect(coordinatedBacklogPercent(70, 2 * gib, 0, true)).toBe(70);
+  });
+
+  test("gated off, the configured value passes through untouched", () => {
+    // The clamp is correct but must stay off until a cut adopted under a live
+    // writer stops poisoning the child (see the block comment): cutting at 25%
+    // makes adoption-under-writer certain rather than rare.
+    expect(coordinatedBacklogPercent(70, 2 * gib, 4 * gib, false)).toBe(70);
+  });
+});
+
 describe("historyMaintenanceSettingsFromEnv", () => {
-  test("defaults to enabled with 60s interval and 70 percent threshold", () => {
+  test("defaults to enabled with 60s interval and the UNCOORDINATED threshold", () => {
     expect(historyMaintenanceSettingsFromEnv({})).toEqual({
       enabled: true,
       intervalMs: 60_000,
+      // Still 70: the dirty-bound coordination is gated off by default.
       backlogPercent: 70,
       // Journal reclamation defaults (migration 031): a 7-day suspended-
       // generation retention, and bounded reclaim work per cycle.
@@ -467,6 +504,19 @@ describe("historyMaintenanceSettingsFromEnv", () => {
       recoveryCutBackoffMs: 300_000,
       stuckLogIntervalMs: 3_600_000,
     });
+  });
+
+  test("the dirty-bound coordination applies only when explicitly enabled", () => {
+    const on = historyMaintenanceSettingsFromEnv({
+      PORTABLEFS_HISTORY_COORDINATE_DIRTY_BOUND: "on",
+    });
+    expect(on.backlogPercent).toBe(25);
+    const sized = historyMaintenanceSettingsFromEnv({
+      PORTABLEFS_HISTORY_COORDINATE_DIRTY_BOUND: "on",
+      PORTABLEFS_DIRTY_RSS_MAX_MB: "8192",
+    });
+    // A child sized at 8 GiB against a 4 GiB journal quota needs no clamp.
+    expect(sized.backlogPercent).toBe(70);
   });
 
   test("the terminal recovery-cut lifecycle bounds are configurable and floored", () => {

@@ -261,6 +261,17 @@ func runRemotePrimary(ctx context.Context, client *backend.Client, cfg config) e
 	log.Printf("remote primary: proven %s base commit %s + %d journal records replayed (generation %s, epoch %d), exclusive lease (%dms) held, dirty-block bound %d MiB (%d MiB resident after replay)",
 		resolved.proof.Kind, baseCommit, rlog.Watermark()-rlog.CompactedThrough(), rlog.GenerationID(), rlog.Epoch(), cfg.leaseTTLms, dirtyMax>>20, wfs.DirtyBlockBytes()>>20)
 	logBindingWriteBound(dirtyMax, rlog.QuotaBytes())
+	// The dirty-block fold: cut adoption now RELEASES this child's resident
+	// blocks instead of only advancing the journal base underneath them.
+	// Started before serving so the first adoption after readiness is folded.
+	folder := &foldDriver{
+		client: client, fs: wfs, rlog: rlog,
+		identity: remoteBaseIdentity{
+			TenantID: cfg.tenantID, GenerationID: rlog.GenerationID(),
+			RecordCodec: rlog.RecordCodec(), ControlCodec: rlog.ControlCodec(),
+		},
+	}
+	go folder.run(ctx)
 	return serveRemotePrimary(ctx, cfg, wfs, auth, rlog, guard, policyHash, leaseLost)
 }
 
@@ -276,21 +287,54 @@ func runRemotePrimary(ctx context.Context, client *backend.Client, cfg config) e
 //	                        of journal shrink, and this is the only quantity it
 //	                        watches.
 //
-//	dirty-block bound       resident RAM in THIS child. NOT RELIEVABLE by that
-//	                        loop, or by anything else running: the managed child
-//	                        has no in-process checkpoint, and cut adoption
-//	                        advances the journal base without rebinding this
-//	                        child's inodes to it — so its resident blocks are
-//	                        released only by truncate/remove/reap.
+//	dirty-block bound       resident RAM in THIS child. As of the dirty-block
+//	                        FOLD (workfs/dirtyfold.go + foldDriver) it is
+//	                        relieved by the SAME event: on cut adoption the
+//	                        child re-proves the adopted base and releases every
+//	                        resident block that base now contains. Before the
+//	                        fold existed, adoption advanced the journal base
+//	                        without rebinding this child's inodes to it and the
+//	                        counter was monotone for the life of the child —
+//	                        a hard ceiling on CUMULATIVE writes.
 //
-// When the dirty bound is the smaller of the two it is the BINDING one, and a
-// volume that keeps what it writes reaches it with the maintenance loop still
-// well below its trigger, having seen nothing. That is not a tuning nit: it is
-// the difference between a bound that gets folded and a bound that just
-// arrives. Sustained writes past it now fail as a definite ENOSPC (fsproto's
-// quota classification) rather than stalling, but failing is still the outcome,
-// so the relationship belongs in the startup record where an operator sizing a
-// container can see it.
+// Both bounds are now relieved by history-cut adoption, so the remaining
+// question is purely one of ORDER: the loop must cut before RAM fills. It
+// triggers at PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT of the JOURNAL
+// quota, and if that trigger point sits above the dirty bound the RAM bound is
+// still reached first with the loop having seen nothing — the inversion that
+// wedged production (2048 MiB of RAM against 4096 MiB of journal is 50%, and
+// the loop's default is 70%).
+//
+// coordinatedBacklogPercent is the largest maintenance percentage that CANNOT
+// invert, for the dominant case where journal bytes track written bytes. This
+// record names it so an operator (and the volume-api's own coordination, which
+// derives the same number from PORTABLEFS_DIRTY_RSS_MAX_MB) can be checked
+// against reality at a glance.
+//
+// It is a bound on the JOURNAL-PROPORTIONAL case only, and deliberately not
+// claimed for more. A write pattern that touches one byte per 4 MiB region
+// materialises a whole block per ~40 journal bytes; no percentage of a journal
+// quota bounds that. For that shape the fold still turns a terminal ceiling
+// into a recovering one — every adoption releases the amplified blocks — and a
+// burst that outruns any cadence still lands on the definite ENOSPC.
+func coordinatedBacklogPercent(dirtyMax, journalQuota int64) int64 {
+	if dirtyMax <= 0 || journalQuota <= 0 {
+		return 0
+	}
+	// Half the dirty bound as the journal trigger leaves a full fold window of
+	// headroom between "the loop decides to cut" and "RAM is full": the cut
+	// must be created, materialised, adopted and folded while writes continue,
+	// and that whole pipeline has to fit inside the remaining half.
+	percent := dirtyMax * 100 / (2 * journalQuota)
+	if percent < 1 {
+		return 1
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
 func logBindingWriteBound(dirtyMax, journalQuota int64) {
 	switch {
 	case dirtyMax <= 0:
@@ -298,18 +342,19 @@ func logBindingWriteBound(dirtyMax, journalQuota int64) {
 			"(resident dirty blocks unbounded: VCS_DIRTY_RSS_MAX_MB disabled)", journalQuota>>20)
 	case journalQuota <= 0:
 		log.Printf("remote primary: write-admission bound = resident dirty blocks %d MiB "+
-			"(journal quota unknown); relief is truncate/remove only", dirtyMax>>20)
+			"(journal quota unknown); relief is history-cut adoption (folded) plus truncate/reap", dirtyMax>>20)
 	case dirtyMax < journalQuota:
 		log.Printf("remote primary: BINDING write-admission bound is RESIDENT DIRTY BLOCKS "+
-			"(%d MiB), reached at %d%% of the %d MiB journal backlog quota. The history-cut "+
-			"maintenance loop triggers on journal backlog only, so it will not have acted; "+
-			"relief for this bound is truncate/remove/reap on this volume, and sustained "+
-			"writes past it are refused ENOSPC.",
-			dirtyMax>>20, dirtyMax*100/journalQuota, journalQuota>>20)
+			"(%d MiB), reached at %d%% of the %d MiB journal backlog quota. Cut adoption now "+
+			"FOLDS this bound (resident blocks the adopted base contains are released), so the "+
+			"maintenance loop must cut at or below %d%% for the fold to land in time — "+
+			"PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT above that reaches RAM first.",
+			dirtyMax>>20, dirtyMax*100/journalQuota, journalQuota>>20,
+			coordinatedBacklogPercent(dirtyMax, journalQuota))
 	default:
 		log.Printf("remote primary: binding write-admission bound is the journal backlog "+
 			"quota (%d MiB), reached before the %d MiB dirty-block bound; history-cut "+
-			"adoption is its relief", journalQuota>>20, dirtyMax>>20)
+			"adoption is the relief for both", journalQuota>>20, dirtyMax>>20)
 	}
 }
 
@@ -623,7 +668,17 @@ func serveRemotePrimary(
 	go func() {
 		select {
 		case <-wfs.PoisonedCh():
-			log.Print("journal poisoned (durability/fence failure): fencing data plane and stepping down")
+			// Name the proof that failed. Without it this line reported a
+			// CATEGORY ("durability/fence failure") for an event that always
+			// has one specific, enumerated cause, and every diagnosis of a
+			// fenced child had to start by guessing which one.
+			cause := "cause unrecorded"
+			if rlog != nil {
+				if c := rlog.PoisonCause(); c != nil {
+					cause = c.Error()
+				}
+			}
+			log.Printf("journal poisoned (durability/fence failure): fencing data plane and stepping down: %s", cause)
 			fence()
 		case <-serveCtx.Done():
 		}

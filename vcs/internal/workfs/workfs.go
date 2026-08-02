@@ -139,6 +139,22 @@ type inode struct {
 	//                             a checkpoint must re-commit the new size even with no dirty blocks
 	dirtyEpoch int64  // fs.epoch at this file's last content mutation
 	version    uint64 // coherence version: fs.version at this inode's last mutation
+
+	// blockSeq/truncSeq are the DURABLE-ORDER provenance of this file's local
+	// content: the journal LSN at which each resident dirty block was last
+	// written, and the LSN of this inode's last truncate. They are the proof
+	// the history-cut fold runs on (see dirtyfold.go): a committed base cut at
+	// watermark W materialises exactly the records with LSN < W, so a block
+	// whose last write sits below W is provably already IN that base and its
+	// resident copy can be released. They are pure in-memory provenance —
+	// never serialized, never hashed, rebuilt identically by cold replay
+	// because both live apply and replay stamp them from the same row LSN.
+	//
+	// blockSeq is kept exactly in step with blocks: an entry exists iff the
+	// block is resident. A MISSING entry is read as "provenance unknown",
+	// which the fold treats as NOT foldable — the conservative direction.
+	blockSeq map[int64]uint64
+	truncSeq uint64
 }
 
 func (n *inode) curSize() int64 {
@@ -220,6 +236,20 @@ type FS struct {
 	dirtyBytes    int64
 	dirtyReserved int64
 	dirtyMax      int64
+
+	// applySeq is the journal LSN of the record CURRENTLY being applied under
+	// mu. Every apply site (managed live apply, managed cold replay, and the
+	// WAL store's buffered append) sets it immediately before the reducer
+	// runs, so applyWrite/applyTruncate can stamp the durable-order provenance
+	// the history-cut fold proves foldability with. Zero outside an apply.
+	applySeq uint64
+	// foldWatermark is the highest cut watermark this generation has already
+	// folded to. It makes FoldToBase idempotent and monotone: a re-offered or
+	// out-of-order adoption never re-binds inodes to an OLDER base.
+	foldWatermark uint64
+	// foldMu serialises fold passes. It is NOT part of the tree lock order:
+	// FoldToBase takes it OUTSIDE mu and never holds mu across a base resolve.
+	foldMu sync.Mutex
 
 	// coherence versioning (independent of epoch): a per-process generation nonce plus a
 	// monotonic version assigned to every mutation and stamped on the affected inode. A
@@ -1047,6 +1077,7 @@ func (fs *FS) commitMutationResultLocked(r wal.Record, owner string) (version ui
 		fs.mu.Unlock()
 		return 0, 0, bufErr // record was not buffered; nothing to commit
 	}
+	fs.applySeq = seq // durable-order provenance (see inode.blockSeq)
 	fs.epoch++
 	relatedInos := fs.relatedInodesLocked(r)
 	orphanIno, changed, applyErr := fs.applyMutationAs(r, owner)
@@ -1406,6 +1437,7 @@ func (fs *FS) ApplyBatch(records []wal.Record, owner string) error {
 			fs.mu.Unlock()
 			return bufErr // nothing from here on was buffered
 		}
+		fs.applySeq = seq // durable-order provenance (see inode.blockSeq)
 		fs.epoch++
 		relatedInos := fs.relatedInodesLocked(records[i])
 		orphanIno, changed, _ := fs.applyMutationAs(records[i], owner) // tolerant: guard-rejected ops are deterministic phantoms
@@ -1811,6 +1843,7 @@ func (fs *FS) applyCreate(name, kind string, mode os.FileMode, target string, in
 	if kind == "file" {
 		n.born = true // a freshly created file is local + empty (no backend base)
 		n.blocks = map[int64][]byte{}
+		n.blockSeq = map[int64]uint64{}
 		n.dirtyEpoch = fs.epoch
 	}
 	parent.children[base] = n
@@ -2001,8 +2034,15 @@ func (fs *FS) applyWrite(n *inode, off int64, data []byte) error {
 		published += int64(len(staged.blocks[bi]))
 	}
 	fs.addDirtyBlockBytesLocked(published - replaced)
+	if n.blockSeq == nil {
+		n.blockSeq = make(map[int64]uint64, last-first+1)
+	}
 	for bi := first; bi <= last; bi++ {
 		n.blocks[bi] = staged.blocks[bi]
+		// Durable-order provenance for the fold: this block's content is
+		// exactly what THIS record's ordered position produced, so it enters a
+		// committed base only once a cut watermark passes fs.applySeq.
+		n.blockSeq[bi] = fs.applySeq
 	}
 	n.size = staged.size
 	n.mtime = staged.mtime
@@ -2015,6 +2055,13 @@ func (fs *FS) applyTruncate(n *inode, size int64) error {
 		return invalidMutation("negative replay/apply truncate size %d", size)
 	}
 	fs.truncateBlocks(n, size)
+	// A truncate is the one content transition the fold cannot reason about
+	// per block: it drops blocks, trims a boundary buffer, and MONOTONICALLY
+	// caps the visible base (source.Size) so a later regrow reads holes rather
+	// than resurrected base bytes. Rebinding such an inode to a base cut
+	// BEFORE the truncate would undo that cap. Stamping the LSN here lets the
+	// fold skip exactly those inodes (see dirtyfold.go).
+	n.truncSeq = fs.applySeq
 	n.dirtyEpoch = fs.epoch
 	return nil
 }
@@ -2838,6 +2885,7 @@ func (fs *FS) MarkClean(snap *Snapshot, pathName string, src content.Source) {
 	fs.addDirtyBlockBytesLocked(-dirtyBlockBytesOf(n)) // folded into the committed base: resident copies released
 	n.source = src
 	n.blocks = map[int64][]byte{}
+	n.blockSeq = map[int64]uint64{}
 	n.born = false
 	n.truncated = false // committed: source.Size now matches the live size
 	n.size = src.Size

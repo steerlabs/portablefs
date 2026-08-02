@@ -341,14 +341,62 @@ Memory tuning: `VCS_CACHE_RAM_MB` (default 256) sizes the read cache, and
 `VCS_DIRTY_RSS_MAX_MB` (default 2048; must be a positive integer) bounds the
 resident memory of uncommitted dirty file blocks — dirty blocks materialise at
 4 MiB granularity, so unbounded they are the process's dominant RAM cost.
-Writes past the bound refuse with `ENOSPC` until a truncate/remove releases
-memory or a history cut folds the blocks out; reads, deletes, and metadata
+Writes past the bound refuse with `ENOSPC`; reads, truncates, and metadata
 operations always keep working. Both knobs pass to managed children through
-the manager's `PORTABLEFS_MANAGED_VCS_EXTRA_ENV_JSON` allowlist — the managed
-child never checkpoints in-process, so its dirty blocks live for the whole
-generation and the bound is what keeps one tenant's write pattern from
-exhausting the shared host's memory. The manager + PostgreSQL journal is the
-ONLY authority shape: there is no standalone file-WAL VCS.
+the manager's `PORTABLEFS_MANAGED_VCS_EXTRA_ENV_JSON` allowlist. The manager +
+PostgreSQL journal is the ONLY authority shape: there is no standalone
+file-WAL VCS.
+
+**How the bound is relieved, and why it is not a ceiling on lifetime writes.**
+The managed child never checkpoints in-process, so for a long time nothing
+released these blocks at all: adoption of a history cut advanced the journal
+base without rebinding the child's inodes to it, and the counter only ever
+grew. A branch therefore stopped accepting writes after roughly
+`VCS_DIRTY_RSS_MAX_MB` of CUMULATIVE writes, whatever the rate.
+
+Cut adoption now folds them. When the maintenance loop's recovery cut is
+adopted, the child re-proves the adopted base and releases the resident copy
+of every block that base contains — per block, and only where the journal
+position the block was last written at proves the cut already materialised it,
+so a block written since the cut keeps its in-memory copy and keeps overriding
+the base. Resident memory is therefore bounded by the part of the journal that
+has NOT yet been cut, not by the branch's history.
+
+That makes the two bounds one question of ordering, so they can be coordinated
+rather than tuned independently. With
+`PORTABLEFS_HISTORY_COORDINATE_DIRTY_BOUND=on`, the Volume API clamps
+`PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT` so the cut is triggered at
+half the dirty bound expressed as a fraction of the journal quota — 25% with
+the shipped defaults (a 2048 MiB RAM bound against a 4096 MiB journal quota),
+where the default of 70% fills RAM twenty points before the loop looks. Tell
+the Volume API what the children are sized at with `PORTABLEFS_DIRTY_RSS_MAX_MB`
+(same value, same default) if you change `VCS_DIRTY_RSS_MAX_MB`. Raising the
+RAM bound raises the clamp; that is the intended lever. `vcs` prints the
+number it derives in its own startup record either way, so the two sides stay
+checkable against each other.
+
+> **This coordination is OFF by default and should stay off for now.** Cutting
+> at 25% instead of 70% means recovery cuts are adopted while a writer is
+> attached, and a PFJ3 authority does not currently survive that: the journal
+> client requires the append response to carry a landed *legacy* checkpoint cut
+> whenever the base commit changes, while migrations 013/031 forbid those
+> columns from ever being set on a PFJ3 generation (PF005) and authorize the
+> advance with a `pfh.adoptions` proof row instead. The client's check is
+> therefore unsatisfiable, and the writer responds by poisoning its journal and
+> fencing its data plane — the mount takes EIO. Until the append response
+> carries the adoption proof the database actually issues, and the client
+> checks that, a deployment is better off reaching the dirty bound (a definite,
+> recoverable `ENOSPC`) than losing its authority.
+
+Two limits worth knowing. The clamp bounds the trigger POINT, while
+`PORTABLEFS_HISTORY_MAINTENANCE_INTERVAL_MS` (default 60 s) bounds the
+overshoot between scans: a branch can add `write-rate x interval` of backlog
+before the loop next looks, so a deployment with very fast writers relative to
+its child RAM should shorten the interval. And neither bounds write
+AMPLIFICATION: one byte written into each 4 MiB region materialises a whole
+block per ~40 journal bytes, which no fraction of a journal quota can track.
+For that shape the fold still recovers the memory at each adoption, and a
+burst that outruns any cut cadence still lands on the definite `ENOSPC`.
 
 ## Maintenance Jobs (GC And Integrity)
 

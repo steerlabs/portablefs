@@ -145,6 +145,97 @@ export interface HistoryMaintenanceSettings {
 }
 
 /**
+ * THRESHOLD COORDINATION between the two write-admission bounds.
+ *
+ * A managed branch has two independent write-admission bounds, and until
+ * round 19 only one of them had a driver:
+ *
+ *   journal backlog quota   durable PFJ3 bytes (4 GiB by DB column default).
+ *                           This loop is its driver, triggering at
+ *                           PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT.
+ *   dirty-block bound       resident RAM in the authority child
+ *                           (VCS_DIRTY_RSS_MAX_MB, 2048 MiB by default).
+ *
+ * Cut adoption now relieves BOTH: the child folds its resident dirty blocks
+ * into each adopted base (vcs/internal/workfs/dirtyfold.go). So both bounds
+ * share one driver — this loop — and the only remaining question is ORDER.
+ *
+ * The defaults inverted. 2048 MiB of RAM against a 4096 MiB journal quota is
+ * 50%, and this loop's default trigger was 70%: a branch whose journal bytes
+ * track its written bytes filled RAM twenty points before the loop so much as
+ * looked at it. Production collected that receipt twice, one journal record
+ * apart. Leaving the two numbers to be tuned independently is what allowed it.
+ *
+ * So the configured percentage is CLAMPED here to one that cannot invert:
+ * trigger at half the dirty bound expressed as a fraction of the journal
+ * quota, leaving the other half as headroom for the cut to be created,
+ * materialised, adopted and folded while writes continue. With the defaults
+ * that is 25% — a cut at 1024 MiB of backlog against a 2048 MiB RAM bound.
+ * `vcs/cmd/vcs` derives the identical number in coordinatedBacklogPercent and
+ * prints it in its startup record, so the two sides are checkable against each
+ * other without reading either config.
+ *
+ * SCOPE, stated honestly. This bounds the journal-PROPORTIONAL case, which is
+ * every ordinary write pattern. It does not bound write amplification: one
+ * byte into each 4 MiB region materialises a whole block per ~40 journal
+ * bytes, and no percentage of a journal quota bounds that ratio. For that
+ * shape the fold turns a terminal ceiling into a recovering one (each adoption
+ * releases the amplified blocks) and a burst that outruns any cut cadence
+ * still lands on the child's definite ENOSPC.
+ *
+ * Sizing the RAM bound (VCS_DIRTY_RSS_MAX_MB) raises the clamp, which is the
+ * correct lever — more RAM per child buys a later cut.
+ *
+ * ── WHY THIS IS GATED OFF BY DEFAULT ────────────────────────────────────────
+ *
+ * The clamp is correct and is NOT enabled, because enabling it today trades a
+ * bad outcome for a worse one. Cutting at 25% instead of 70% means recovery
+ * cuts get ADOPTED WHILE A WRITER IS ATTACHED — and that is a case the journal
+ * client cannot currently survive:
+ *
+ *   remotejournal.applyAppendResultLocked (vcs/internal/remotejournal/append.go)
+ *   requires, whenever an append response reports a changed base COMMIT, that
+ *   the response's `currentCut` be a LANDED or FINALIZED legacy checkpoint cut
+ *   at exactly the new base seq. On a PFJ3 generation that projection is
+ *   permanently NULL: migrations 013 and 031 raise PF005 ("legacy cut/rotate
+ *   is not defined for a PFJ3 generation") on ANY write to cut_operation_id /
+ *   cut_status, and authorize the base advance with a pfh.adoptions proof row
+ *   instead. The client therefore demands a proof the database forbids from
+ *   ever existing. The check is not protective, it is unsatisfiable: the
+ *   writer poisons its own journal, fences its data plane, and the live mount
+ *   takes EIO.
+ *
+ * Verified directly against a live stack — every adopted PFJ3 generation row
+ * carries base_seq > 0 with cut_operation_id IS NULL — and it reproduces
+ * identically on the pre-round-19 binary, so the fold did not introduce it.
+ * What the fold DID do is make it reachable: with cuts landing seconds apart
+ * under load, adoption-under-writer stops being rare and becomes certain.
+ *
+ * The two halves have to be reconciled first — the append response must carry
+ * the adoption proof the database actually issues, and the client must check
+ * THAT — and until they are, a deployment is better off reaching the dirty
+ * bound (a definite, recoverable ENOSPC) than losing its authority outright.
+ *
+ * Set PORTABLEFS_HISTORY_COORDINATE_DIRTY_BOUND=on to enable the clamp once
+ * that reconciliation lands. `vcs` prints the number it independently derives
+ * either way (cmd/vcs coordinatedBacklogPercent) so the two sides stay
+ * checkable against each other in the meantime.
+ */
+export function coordinatedBacklogPercent(
+  configuredPercent: number,
+  dirtyRssMaxBytes: number,
+  journalQuotaBytes: number,
+  enabled: boolean
+): number {
+  if (!enabled || dirtyRssMaxBytes <= 0 || journalQuotaBytes <= 0) {
+    // Gated off, or a bound is disabled/unknown: nothing to coordinate.
+    return configuredPercent;
+  }
+  const ceiling = Math.floor((dirtyRssMaxBytes * 100) / (2 * journalQuotaBytes));
+  return Math.max(1, Math.min(configuredPercent, ceiling));
+}
+
+/**
  * PORTABLEFS_HISTORY_MAINTENANCE(_INTERVAL_MS/_BACKLOG_PERCENT) parsing.
  * "off" is refused in production NODE_ENV: without the loop, managed
  * branches accumulate backlog until the admission quota bricks writes.
@@ -172,7 +263,22 @@ export function historyMaintenanceSettingsFromEnv(
     enabled,
     // Floor of 1s: a misconfigured near-zero interval would hammer PostgreSQL.
     intervalMs: intEnv(env, "PORTABLEFS_HISTORY_MAINTENANCE_INTERVAL_MS", 60_000, 1_000),
-    backlogPercent: intEnv(env, "PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT", 70, 1, 100),
+    backlogPercent: coordinatedBacklogPercent(
+      intEnv(env, "PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT", 70, 1, 100),
+      // The dirty-block bound the authority-manager injects into every managed
+      // child as VCS_DIRTY_RSS_MAX_MB. Mirrored here (same name, same default
+      // as vcs/cmd/vcs defaultDirtyRSSMaxMB) so this loop can be told about
+      // the OTHER write-admission bound it is implicitly racing.
+      intEnv(env, "PORTABLEFS_DIRTY_RSS_MAX_MB", 2048, 0) * 1024 * 1024,
+      // The PFJ3 per-generation backlog quota. It is a database column default
+      // (pfj.journal_claim_v3: 4 GiB), not an env knob, and no caller
+      // overrides it — so it is a constant here, overridable only for
+      // deployments that changed the column default.
+      intEnv(env, "PORTABLEFS_JOURNAL_QUOTA_BYTES", 4_294_967_296, 0),
+      // Gated OFF until adoption-under-a-live-writer is survivable; see the
+      // block comment on coordinatedBacklogPercent for the exact blocker.
+      env.PORTABLEFS_HISTORY_COORDINATE_DIRTY_BOUND?.trim() === "on"
+    ),
     // Journal reclamation (migration 031). The retention floor is one hour:
     // shorter would cut branches that are merely between mounts. The batch
     // and page ceilings bound reclamation on a database that is, by

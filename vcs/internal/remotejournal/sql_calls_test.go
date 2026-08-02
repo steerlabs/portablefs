@@ -413,6 +413,193 @@ func TestAppendReceiptReplayAfterTrimAdoptsCurrentFactsNotOriginalBacklog(t *tes
 	}
 }
 
+// pfj3AdoptionResponse is the shape a REAL production adoption produces, and
+// the fixture the round-19 characterization test replaced.
+//
+// The test this grew out of fed `"currentCut":{"status":"finalized",...}` — a
+// legacy checkpoint cut. No PFJ3 generation can ever return that: migrations
+// 013 and 031 raise PF005 on ANY write to cut_operation_id / cut_status for a
+// pfj3 generation, so pfj.generation_json's `cut` CASE is unconditionally NULL
+// for them and the base advance is authorized by a pfh.adoptions ROW instead
+// (verified against the live database: 8 applied adoptions, every one of them
+// on a generation with cut_operation_id IS NULL). The old fixture therefore
+// asserted a path production cannot reach, which is exactly why an
+// unsatisfiable check survived in the one code path that had coverage.
+//
+// This builds the real thing: base tuple moved, backlog subtracted,
+// currentCut null, and the adoption proof pfj.journal_append_v4 now carries.
+func pfj3AdoptionResponse(baseSeq uint64, baseDigestHex, baseCommitID, adoptionJSON string) []byte {
+	tipHex := baseDigestHex
+	return []byte(fmt.Sprintf(`{
+		"generationId":"jgen-1","epoch":"1","nextSeq":"%d","tipDigest":"%s","appended":"1","duplicated":"0","replayed":false,
+		"currentBaseCommitId":"%s","currentBaseSeq":"%d",
+		"currentBaseDigest":"%s","currentPhysicalTrimmedSeq":"0",
+		"currentBacklogBytes":"0","currentBacklogRecords":"0",
+		"currentQuotaBacklogBytes":"100","currentQuotaBacklogRecords":"100",
+		"currentCut":null,
+		"currentAdoption":%s
+	}`, baseSeq, tipHex, baseCommitID, baseSeq, baseDigestHex, adoptionJSON))
+}
+
+// pfj3AdoptionProof is the exact projection of one pfh.adoptions row joined to
+// its ready pfh.history_cuts row, as pfj.adoption_proof_json emits it.
+func pfj3AdoptionProof(oldBaseSeq, newBaseSeq uint64, oldDigestHex, newDigestHex, newCommitID string) string {
+	return fmt.Sprintf(`{
+		"adoptionId":"hadopt_1","generationId":"jgen-1","cutId":"hcut_1","anchorId":"hanchor_1",
+		"operationId":"hadopt-hcut_1","state":"applied",
+		"oldBaseSeq":"%d","oldBaseDigest":"%s",
+		"newBaseSeq":"%d","newBaseDigest":"%s","newBaseCommitId":"%s",
+		"subtractBacklogBytes":"4","subtractBacklogRecords":"1",
+		"cutState":"ready","cutKind":"recovery",
+		"cutSeqExclusive":"%d","cutDigest":"%s","cutResultCommitId":"%s"
+	}`, oldBaseSeq, oldDigestHex, newBaseSeq, newDigestHex, newCommitID, newBaseSeq, newDigestHex, newCommitID)
+}
+
+func pfj3AdoptionLog(db journalDB, group stagedRecord, baseCommitID string) *Log {
+	return &Log{
+		pool: db, life: context.Background(),
+		cfg: Config{
+			LeaseID: "lease-1", FencingToken: 3, AuthorityRuntimeID: "runtime-1",
+			CallTimeout: time.Second,
+		},
+		generationID: "jgen-1", epoch: 1,
+		capability: "authority-capability-1", managerEpoch: 2, runtimeSeq: 4,
+		baseCommitID: baseCommitID,
+		nextSeq:      1, durableSeq: 0,
+		staged: []stagedRecord{group}, stagedBytes: int64(len(group.payload)),
+		quotaBytes: 100, quotaRecords: 100,
+		poisonedCh: make(chan struct{}),
+	}
+}
+
+// TestPfj3BaseAdvanceWithoutLegacyCutPoisonsTheWriter is round 19's pin,
+// inverted now that the defect it pinned is fixed.
+//
+// THE DEFECT IT PINNED. applyAppendResultLocked required, whenever an append
+// response reported a changed base COMMIT, a LANDED or FINALIZED legacy
+// checkpoint cut at exactly the new base seq. Migrations 013 and 031 raise
+// PF005 on any write to cut_operation_id / cut_status for a PFJ3 generation and
+// authorize the base advance with a pfh.adoptions row instead, so the demanded
+// proof was one the schema forbids the server to produce. The check was
+// UNSATISFIABLE, not protective: a history-cut adoption that landed while a
+// writer was appending poisoned the journal, fenced the data plane and took the
+// mount to EIO. `docs/history.md` documented that as a design property
+// ("Adopting under a live writer forces that authority to restart").
+//
+// WHAT IT ASSERTS NOW. The same production-shaped response — legacy cut null,
+// base tuple moved — is ACCEPTED when it carries the adoption proof, the base
+// mirror is installed exactly, and the writer is not poisoned.
+func TestPfj3BaseAdvanceWithoutLegacyCutPoisonsTheWriter(t *testing.T) {
+	tip := [32]byte{9, 9, 9}
+	tipHex := hex.EncodeToString(tip[:])
+	oldDigestHex := hex.EncodeToString(make([]byte, 32))
+	// The adoption caught the base up to the head, so the base digest IS the
+	// tip digest (validateAppendResult requires exactly that when
+	// baseSeq == nextSeq).
+	proof := pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-after-adoption")
+	db := &fakeJournalDB{response: pfj3AdoptionResponse(1, tipHex, "cpft2-after-adoption", proof)}
+	group := stagedRecord{
+		seq: 0, payload: []byte("PFR1"), hashHex: strings.Repeat("e", 64), tipAfter: tip,
+	}
+	l := pfj3AdoptionLog(db, group, "cpft2-before-adoption")
+	if err := l.CommitThrough(0); err != nil {
+		t.Fatalf("commit across an adoption: %v (poison cause: %v)", err, l.PoisonCause())
+	}
+	if l.IsPoisoned() {
+		t.Fatalf("the writer was poisoned by a proven adoption: %v", l.PoisonCause())
+	}
+	if l.baseSeq != 1 || l.baseDigest != tip || l.baseCommitID != "cpft2-after-adoption" ||
+		l.backlogBytes != 0 || l.backlogRecords != 0 || len(l.staged) != 0 || l.durableSeq != 1 {
+		t.Fatalf("adoption installed the wrong base mirror: base=%d/%s commit=%s backlog=%d/%d staged=%d durable=%d",
+			l.baseSeq, hex.EncodeToString(l.baseDigest[:]), l.baseCommitID,
+			l.backlogBytes, l.backlogRecords, len(l.staged), l.durableSeq)
+	}
+}
+
+// TestPfj3AdoptionAdvancesCompactedThrough is the corollary the fold in the
+// dirty-block work triggers on. l.baseSeq is assigned AFTER the proof check, so
+// while the check was unsatisfiable CompactedThrough() could never move off its
+// attach-time value no matter how much of the journal the base had absorbed.
+func TestPfj3AdoptionAdvancesCompactedThrough(t *testing.T) {
+	tip := [32]byte{4, 2}
+	tipHex := hex.EncodeToString(tip[:])
+	oldDigestHex := hex.EncodeToString(make([]byte, 32))
+	proof := pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-adopted")
+	db := &fakeJournalDB{response: pfj3AdoptionResponse(1, tipHex, "cpft2-adopted", proof)}
+	group := stagedRecord{
+		seq: 0, payload: []byte("PFR1"), hashHex: strings.Repeat("d", 64), tipAfter: tip,
+	}
+	l := pfj3AdoptionLog(db, group, "cpft2-original")
+	if before := l.CompactedThrough(); before != 0 {
+		t.Fatalf("pre-adoption CompactedThrough=%d, want 0", before)
+	}
+	if err := l.CommitThrough(0); err != nil {
+		t.Fatalf("commit across an adoption: %v", err)
+	}
+	if after := l.CompactedThrough(); after != 1 {
+		t.Fatalf("CompactedThrough=%d after adoption, want 1 — the fold never fires", after)
+	}
+}
+
+// TestPfj3BaseAdvanceStillRefusedWithoutProof: the refusal itself is the point
+// of the check and must survive the fix. A response that moves the base commit
+// and carries NEITHER proof shape is still a destructive advance on the
+// server's word alone.
+func TestPfj3BaseAdvanceStillRefusedWithoutProof(t *testing.T) {
+	tip := [32]byte{9, 9, 9}
+	tipHex := hex.EncodeToString(tip[:])
+	db := &fakeJournalDB{response: pfj3AdoptionResponse(1, tipHex, "cpft2-after-adoption", "null")}
+	group := stagedRecord{
+		seq: 0, payload: []byte("PFR1"), hashHex: strings.Repeat("e", 64), tipAfter: tip,
+	}
+	l := pfj3AdoptionLog(db, group, "cpft2-before-adoption")
+	err := l.CommitThrough(0)
+	if !errors.Is(err, ErrProofMissing) {
+		t.Fatalf("unproven base advance: %v, want ErrProofMissing", err)
+	}
+	if !l.IsPoisoned() || !errors.Is(l.PoisonCause(), ErrProofMissing) {
+		t.Fatalf("unproven advance did not poison: poisoned=%v cause=%v", l.IsPoisoned(), l.PoisonCause())
+	}
+}
+
+// TestPfj3AdoptionProofMustMatchTheTupleItInstalls: a proof for some OTHER base
+// authorizes nothing. This is what stops a stale or mismatched adoption row
+// from being reused to wave through an advance the database never made.
+func TestPfj3AdoptionProofMustMatchTheTupleItInstalls(t *testing.T) {
+	tip := [32]byte{9, 9, 9}
+	tipHex := hex.EncodeToString(tip[:])
+	oldDigestHex := hex.EncodeToString(make([]byte, 32))
+	group := stagedRecord{
+		seq: 0, payload: []byte("PFR1"), hashHex: strings.Repeat("e", 64), tipAfter: tip,
+	}
+	for name, proof := range map[string]string{
+		"commit id disagrees": pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-some-other-commit"),
+		"cut is not ready": strings.Replace(
+			pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-after-adoption"),
+			`"cutState":"ready"`, `"cutState":"materializing"`, 1),
+		"cut boundary disagrees with the base": strings.Replace(
+			pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-after-adoption"),
+			`"cutSeqExclusive":"1"`, `"cutSeqExclusive":"0"`, 1),
+		"proof is for another generation": strings.Replace(
+			pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-after-adoption"),
+			`"generationId":"jgen-1"`, `"generationId":"jgen-2"`, 1),
+		"proof is not landed": strings.Replace(
+			pfj3AdoptionProof(0, 1, oldDigestHex, tipHex, "cpft2-after-adoption"),
+			`"state":"applied"`, `"state":"failed"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := &fakeJournalDB{response: pfj3AdoptionResponse(1, tipHex, "cpft2-after-adoption", proof)}
+			l := pfj3AdoptionLog(db, group, "cpft2-before-adoption")
+			if err := l.CommitThrough(0); err == nil {
+				t.Fatal("a proof that does not match the installed tuple was accepted")
+			}
+			if !l.IsPoisoned() {
+				t.Fatalf("mismatched proof did not poison the writer (cause %v)", l.PoisonCause())
+			}
+		})
+	}
+}
+
 func TestCommitMuPreventsLaterGroupCallUntilFirstResponseResolves(t *testing.T) {
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
