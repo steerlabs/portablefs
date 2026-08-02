@@ -19,7 +19,7 @@ jobs:
   workflow-pins:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Enforce workflow pin policy (SHA pins, versioned runners, permissions)
@@ -28,12 +28,12 @@ jobs:
   ts:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Enable corepack (pnpm 10 from packageManager)
         run: corepack enable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -47,10 +47,10 @@ jobs:
   go:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -89,12 +89,12 @@ jobs:
       VOLUME_DATABASE_CONNECT_TIMEOUT_MS: "10000"
       PORTABLEFS_TEST_POSTGRES: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Enable corepack (pnpm 10 from packageManager)
         run: corepack enable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
