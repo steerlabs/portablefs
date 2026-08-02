@@ -269,6 +269,17 @@ const migrationIds = [
   // volume, refuses cuts on a retired volume, and puts cut_cancel in the same
   // lock order.
   "033_retirement_transition",
+  // 034 takes the liveness paths out of the bulk write's lock queue. A
+  // journal append validated its writer by taking FOR SHARE on
+  // public.leases and on the singleton pfm.manager_claims row and held both
+  // across up to 16 MiB of payload and a synchronous commit, while the two
+  // heartbeats that keep the system alive (volume-api's lease renewal and
+  // pfm.manager_renew) needed FOR UPDATE on those exact rows. 034 downgrades
+  // the validation reads to FOR KEY SHARE and makes the heartbeats plain
+  // conditional UPDATEs (FOR NO KEY UPDATE) — a pair PostgreSQL's row-lock
+  // matrix proves cannot conflict — while every genuine fence transition
+  // keeps FOR UPDATE and therefore keeps serializing against appends.
+  "034_liveness_lock_isolation",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";
@@ -404,6 +415,11 @@ const attachReceiptLockPrefix = "portablefs-attach-receipt";
 // database. Callers may configure smaller pools; larger requests are clamped.
 const maxPoolConnections = 32;
 
+// The reserved liveness pool (see the constructor). Separate from
+// maxPoolConnections and NOT drawn from it: these connections exist so a
+// heartbeat never queues for a checkout behind bulk work.
+const livenessPoolConnections = 4;
+
 // The readiness write probe (migration 032). ONE round trip, ONE transaction,
 // TWO proofs:
 //
@@ -471,6 +487,7 @@ function decimalString(value: string | undefined): string {
 
 export class PostgresMetadataRepository implements MetadataRepository {
   private readonly pool: Pool;
+  private readonly livenessPool: Pool;
   private readonly manifestIndexCache: ManifestIndexCache;
   private historyRepository: PostgresHistoryRepository | undefined;
   private readonly controlWriteProbeSlot = Math.floor(Math.random() * controlWriteProbeSlots);
@@ -480,6 +497,24 @@ export class PostgresMetadataRepository implements MetadataRepository {
       typeof config === "string" ? { connectionString: config } : { ...config };
     poolConfig.max = Math.max(1, Math.min(poolConfig.max ?? maxPoolConnections, maxPoolConnections));
     this.pool = new Pool(poolConfig);
+    // RESERVED LIVENESS POOL. Writer-lease renewal is the heartbeat that
+    // decides whether an authority keeps serving: a renewal that misses its
+    // bound makes the child self-fence and strands every mount behind it. It
+    // must therefore never wait for a checkout behind bulk work — and on the
+    // shared pool it would, because the same 32 connections carry GC mark
+    // scans over the whole commits table, up-to-60s parked waitForHead
+    // LISTEN clients, journal reclamation pages, and the history-maintenance
+    // cycle. This is the same isolation the Go authority gives its lease-facts
+    // prober (remotejournal's single-connection liveness pool) and the manager
+    // gives its claim heartbeat (a worker thread with its own pg Client).
+    // Small and separate on purpose: renewals are tiny and rare per authority,
+    // so a handful of connections bounds the concurrency without ever
+    // competing with data.
+    this.livenessPool = new Pool({
+      ...poolConfig,
+      max: livenessPoolConnections,
+      application_name: `${poolConfig.application_name ?? "portablefs-volume-api"}-liveness`,
+    });
     this.manifestIndexCache = new ManifestIndexCache(manifestIndexCacheMaxBytesFromEnv(process.env));
   }
 
@@ -497,7 +532,7 @@ export class PostgresMetadataRepository implements MetadataRepository {
   }
 
   async close(): Promise<void> {
-    await this.pool.end();
+    await Promise.all([this.pool.end(), this.livenessPool.end()]);
   }
 
   // probeControlPlane is the readiness primitive: a migration lineage read
@@ -1118,27 +1153,66 @@ export class PostgresMetadataRepository implements MetadataRepository {
     });
   }
 
+  // renewLease is a LIVENESS path, not a fence transition, and it is written
+  // so the database can tell the difference.
+  //
+  // It used to open with `SELECT * FROM leases WHERE id = $1 FOR UPDATE`,
+  // validate in TypeScript, then UPDATE. That FOR UPDATE conflicts with the
+  // FOR SHARE that pfj.require_writer held on the very same lease row for the
+  // whole of a journal append — 16 MiB of payload plus a synchronous commit.
+  // Under a sustained write flood the renewal therefore queued behind the
+  // data it was supposed to keep alive, blew the 5 s lock_timeout, answered
+  // the child a 500, and the child's 20 s watchdog fenced the authority
+  // (round 18b; pg_stat_activity caught the renewal blocked on transactionid
+  // by the appending backend, which was itself inside LWLock/WALWrite).
+  //
+  // Now: ONE conditional UPDATE. Every precondition the FOR UPDATE read used
+  // to check is a WHERE predicate, so the write is its own validation. A
+  // plain UPDATE takes FOR NO KEY UPDATE, which — after migration 034
+  // downgraded the append path's validation locks to FOR KEY SHARE — cannot
+  // conflict with an append. Under READ COMMITTED the predicates are
+  // re-evaluated against the LATEST committed row version, so a release or
+  // takeover that commits underneath is seen and refused, exactly as before.
+  // Fence transitions still take FOR UPDATE (getLeaseForUpdate) and so still
+  // beat a renewal: the safety direction is unchanged.
+  //
+  // The extension is monotone (GREATEST). A renewal can only ever push a
+  // lease's expiry forward, never pull it in.
   async renewLease(input: RenewLeaseInput): Promise<VolumeLease> {
-    return this.transaction(async (client) => {
+    return this.livenessTransaction(async (client) => {
       const now = input.now ?? Date.now();
-      const lease = await this.getLeaseForUpdate(client, input.leaseId);
-      if (!lease || lease.fencingToken !== input.fencingToken || lease.releasedAt) {
-        throw new MetadataConflictError("VOLUME_LEASE_STALE", "Volume write lease is stale.", 409);
+      const expiresAt = now + input.leaseTtlMs;
+      const renewed = await client.query(
+        `UPDATE leases
+            SET expires_at = GREATEST(expires_at, $1)
+          WHERE id = $2
+            AND fencing_token = $3
+            AND released_at IS NULL
+            AND expires_at > $4
+          RETURNING *`,
+        [expiresAt, input.leaseId, input.fencingToken, now]
+      );
+      if (renewed.rowCount !== 1) {
+        // The renewal was refused. Read the row WITHOUT a lock to report the
+        // exact reason — the classification is diagnostic, so it must not
+        // reintroduce the lock this method exists to avoid.
+        const lease = await this.getLease(client, input.leaseId);
+        if (!lease || lease.fencingToken !== input.fencingToken || lease.releasedAt) {
+          throw new MetadataConflictError("VOLUME_LEASE_STALE", "Volume write lease is stale.", 409);
+        }
+        throw new MetadataConflictError(
+          "VOLUME_LEASE_EXPIRED",
+          "Volume write lease expired.",
+          409
+        );
       }
-      if (lease.expiresAt <= now) {
-        throw new MetadataConflictError("VOLUME_LEASE_EXPIRED", "Volume write lease expired.", 409);
-      }
-      await client.query(`UPDATE leases SET expires_at = $1 WHERE id = $2`, [
-        now + input.leaseTtlMs,
-        input.leaseId,
-      ]);
       await client.query(
         `UPDATE path_delegations
-         SET expires_at = $1
+         SET expires_at = GREATEST(expires_at, $1)
          WHERE lease_id = $2 AND released_at IS NULL AND revoked_at IS NULL`,
-        [now + input.leaseTtlMs, input.leaseId]
+        [expiresAt, input.leaseId]
       );
-      return requireRow(await this.getLease(client, input.leaseId), "Lease");
+      return toLease(renewed.rows[0]);
     });
   }
 
@@ -1608,6 +1682,24 @@ export class PostgresMetadataRepository implements MetadataRepository {
         throw new MetadataConflictError("VOLUME_ATTACH_SESSION_NOT_FOUND", "Attach session not found.", 404);
       }
       if (input.releaseLease) {
+        // A release is a FENCE TRANSITION, and after migration 034 it must
+        // say so with the lock, not by accident. 034 downgraded the append
+        // path's validation of this row to FOR KEY SHARE so a heartbeat's
+        // forward-only UPDATE stops queueing behind bulk data — but a plain
+        // UPDATE of released_at is also FOR NO KEY UPDATE, and it would slip
+        // past an in-flight append the same way. Taking FOR UPDATE first
+        // restores exactly what the append's old FOR SHARE guaranteed: no
+        // release commits while an append against that lease is in flight,
+        // so a successor (which must wait for this release) can never overlap
+        // one. The renewal deliberately does NOT take this lock; that is the
+        // whole distinction 034 draws.
+        await client.query(
+          `SELECT id FROM leases
+            WHERE attach_session_id = $1 AND released_at IS NULL
+            ORDER BY id
+            FOR UPDATE`,
+          [input.attachSessionId]
+        );
         await client.query(
           `UPDATE leases SET released_at = COALESCE(released_at, $1)
            WHERE attach_session_id = $2 AND released_at IS NULL`,
@@ -3436,8 +3528,28 @@ export class PostgresMetadataRepository implements MetadataRepository {
     }
   }
 
+  /**
+   * A transaction on the RESERVED liveness pool. Only heartbeat work may use
+   * this: work that decides whether something keeps serving, is tiny, and
+   * must complete within a bound no matter what the data plane is doing. It
+   * exists so a heartbeat never waits for a pool checkout behind bulk work
+   * (see the constructor). Anything that reads or writes bulk data belongs on
+   * `transaction`, and putting it here would defeat the isolation for
+   * everyone.
+   */
+  private async livenessTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+    return this.runTransaction(this.livenessPool, run);
+  }
+
   private async transaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    return this.runTransaction(this.pool, run);
+  }
+
+  private async runTransaction<T>(
+    pool: Pool,
+    run: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    const client = await pool.connect();
     try {
       await client.query("BEGIN");
       const result = await run(client);

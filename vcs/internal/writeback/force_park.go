@@ -55,6 +55,13 @@ type abandonedStream struct {
 	clean          bool
 	alreadyForced  bool
 	appliedThrough uint64
+	// tailRecords/tailBytes are the acknowledged records this stream still owes
+	// the authority, counted PER LANE — the same set laneTailFrames selects and
+	// the same set the next attach's replay drains and reconciles against. See
+	// RecoveryJob.PendingBasis for why the basis has to be the lane's and not the
+	// global prefix's.
+	tailRecords uint64
+	tailBytes   uint64
 }
 
 func clearForceParkProof(dir string) error {
@@ -626,6 +633,7 @@ func analyzeAbandonedStream(
 		return stream, fmt.Errorf("%w: applied watermark predates the reclaimed WAL prefix", ErrCorrupt)
 	}
 	stream.appliedThrough = applied
+	stream.tailRecords, stream.tailBytes = laneTailStats(mutations, cert)
 
 	for i, fr := range scan.frames {
 		if fr.typ != frameClose && fr.typ != frameForcedClose {
@@ -697,21 +705,24 @@ func forceParkStream(stream *abandonedStream, reason string) (string, error) {
 		return stream.job.JobID, nil
 	}
 
-	pendingRecords := uint64(0)
-	pendingBytes := uint64(0)
-	for _, fr := range stream.scan.frames {
-		if fr.typ == frameMutation && fr.seq > stream.appliedThrough {
-			pendingRecords++
-			pendingBytes += uint64(len(fr.payload))
-		}
-	}
+	// PER LANE, deliberately, and this is the offline path's half of the fix.
+	//
+	// Counting `fr.seq > appliedThrough` counted against the GLOBAL applied
+	// prefix, which one wedged lane pins at its own first unshipped record while
+	// every other lane keeps applying above it. Every already-applied record
+	// above that pin was therefore parked as "pending", and the next attach —
+	// which selects its tail per lane — correctly drained far fewer. The two
+	// numbers were about different sets, so their disagreement could not be read
+	// as anything, and a park promising 34 records whose replay shipped 2 was
+	// indistinguishable from a park that had actually lost 32.
 	job := newJobState(stream.dir, stream.job)
 	job.update(func(j *RecoveryJob) {
 		j.State = JobForced
 		j.AdmittedThrough = stream.scan.lastSeq
 		j.AppliedThrough = stream.appliedThrough
-		j.PendingRecords = pendingRecords
-		j.PendingBytes = pendingBytes
+		j.PendingRecords = stream.tailRecords
+		j.PendingBytes = stream.tailBytes
+		j.PendingBasis = pendingBasisLane
 		j.LastError = reason
 	})
 	if err := job.persist(); err != nil {
