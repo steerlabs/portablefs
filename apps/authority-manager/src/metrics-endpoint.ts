@@ -9,7 +9,7 @@
 // aggregated child metrics render as pfm_child_<child metric name>.
 import type { ChildMetricsCollector } from "./child-metrics.js";
 import type { LeaseTunnelRegistry } from "./data-plane-router.js";
-import type { ManagerMetrics } from "./manager-metrics.js";
+import { ManagerMetrics } from "./manager-metrics.js";
 import type { ProductionAuthorityRegistry } from "./production-registry.js";
 
 export interface ManagerMetricsEndpointDeps {
@@ -19,6 +19,35 @@ export interface ManagerMetricsEndpointDeps {
   registry?: ProductionAuthorityRegistry;
   childMetrics?: ChildMetricsCollector;
   tunnels?: LeaseTunnelRegistry;
+  // Control-store consumption accounting. This deployment filled its
+  // control-store Postgres twice with journal data and had NO byte-level
+  // signal either time — the curve was invisible until the disk hit 100%.
+  // Optional and single-flight/TTL-cached by its provider; a failure renders
+  // no usage gauges rather than failing the whole scrape, because capacity
+  // reporting must never take the operator's other metrics down with it.
+  controlStoreUsage?: () => Promise<ControlStoreUsageSnapshot | null>;
+}
+
+export interface ControlStoreUsageSnapshot {
+  databaseBytes: string;
+  planeBytes: Record<string, string>;
+}
+
+// The closed plane set. Anything else the database reports is ignored rather
+// than minted as a new series.
+const allowedPlanes = new Set(["pfj", "pfm", "pfh", "public"]);
+
+// Byte counts arrive as canonical decimal strings because they are BIGINTs.
+// A value beyond exact double representation is DROPPED, never rounded: an
+// approximate capacity number on a capacity dashboard is worse than none.
+function setByteGauge(metrics: ManagerMetrics, name: string, decimal: string): void {
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(decimal)) {
+    return;
+  }
+  const value = Number(decimal);
+  if (Number.isSafeInteger(value)) {
+    metrics.setGauge(name, value);
+  }
 }
 
 export function createManagerMetricsEndpoint(
@@ -79,6 +108,21 @@ export function createManagerMetricsEndpoint(
     }
     if (deps.tunnels) {
       metrics.setGauge("pfm_router_open_tunnels", deps.tunnels.totalOpenTunnels());
+    }
+    if (deps.controlStoreUsage) {
+      // Never let capacity reporting fail the scrape: an operator watching a
+      // filling control store needs the REST of these numbers most of all.
+      const usage = await deps.controlStoreUsage().catch(() => null);
+      if (usage) {
+        setByteGauge(metrics, "pfm_control_store_database_bytes", usage.databaseBytes);
+        // Fixed names only — the plane set is closed (pfj/pfm/pfh/public), so
+        // there are no labels and no cardinality growth.
+        for (const [plane, bytes] of Object.entries(usage.planeBytes)) {
+          if (allowedPlanes.has(plane)) {
+            setByteGauge(metrics, `pfm_control_store_${plane}_bytes`, bytes);
+          }
+        }
+      }
     }
     const childLines = deps.childMetrics ? (await deps.childMetrics.collect()).lines : [];
     return (

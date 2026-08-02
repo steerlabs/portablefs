@@ -43,6 +43,14 @@ describe("createVolumeApiServer", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ ok: true });
 
+    // /livez is the conventional spelling of the same dependency-free
+    // liveness check. Liveness and readiness stay strictly apart: a sick
+    // control store must fail /readyz (the deploy gate), never this —
+    // restarting a process cannot fix a database.
+    const live = await fetch(`${baseUrl}/livez`);
+    expect(live.status).toBe(200);
+    expect(await live.json()).toEqual({ ok: true });
+
     const unauthorizedApi = await fetch(`${baseUrl}/v1/volumes/example/status`);
     expect(unauthorizedApi.status).toBe(401);
     expect(await unauthorizedApi.json()).toEqual({
@@ -138,6 +146,66 @@ describe("createVolumeApiServer", () => {
         httpDefenses: { maxConnections: 0 },
       })
     ).toThrow(/maxConnections/);
+  });
+
+  // Verified gap: there was NO operator-visible accounting of control-store
+  // bytes anywhere in this deployment — no pg_*_size call in the repo, no
+  // /metrics on the volume-api, and only a percent-of-quota telemetry field
+  // that counted generations already past 70%. The curve that filled this
+  // Postgres twice was invisible until it hit 100%.
+  test("control-store usage is operator-visible, admin-gated, and exact", async () => {
+    const metadata = throwingMetadata();
+    asTenant(metadata);
+    const usage = {
+      generations: "12",
+      terminalGenerations: "3",
+      records: "5242880",
+      reclaimableRecords: "5000000",
+      // pg_total_relation_size: heap + indexes + TOAST + bloat. Deliberately
+      // the relation size, not a sum of payload bytes — the latter costs a
+      // full scan that slows down as the backlog it reports grows.
+      tableBytes: "22011707392",
+      dbTimeMs: "1783710000000",
+    };
+    (metadata as MetadataRepository & { history?: unknown }).history = {
+      journalStorageUsage: async () => usage,
+    };
+    const baseUrl = await startServer("secret-token", throwingBlobStore(), metadata);
+
+    // Byte counts across every tenant are operator data, so the route is
+    // admin-only and fail-closed exactly like the rest of /v1/admin.
+    const unauthenticated = await fetch(`${baseUrl}/v1/admin/control-store/usage`);
+    expect(unauthenticated.status).toBe(401);
+    const tenant = await fetch(`${baseUrl}/v1/admin/control-store/usage`, {
+      headers: TENANT_HEADERS,
+    });
+    expect(tenant.status).toBe(403);
+
+    const response = await fetch(`${baseUrl}/v1/admin/control-store/usage`, {
+      headers: { authorization: "Bearer secret-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { journal: Record<string, string> };
+    expect(body.journal).toEqual(usage);
+    // Canonical decimal strings, never rounded numbers: a 20 GB journal is
+    // exactly the case where a double would start lying.
+    expect(body.journal.tableBytes).toBe("22011707392");
+    expect(body.journal.reclaimableRecords).toBe("5000000");
+  });
+
+  test("control-store usage answers a typed 501 on a repository without the accounting surface", async () => {
+    const metadata = throwingMetadata();
+    asTenant(metadata);
+    const baseUrl = await startServer("secret-token", throwingBlobStore(), metadata);
+
+    const response = await fetch(`${baseUrl}/v1/admin/control-store/usage`, {
+      headers: { authorization: "Bearer secret-token" },
+    });
+
+    expect(response.status).toBe(501);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "CONTROL_STORE_USAGE_UNSUPPORTED"
+    );
   });
 
   test("admin history routes require the admin token and answer typed errors", async () => {

@@ -10,6 +10,7 @@ import {
   createAuthorityManagerServer,
   type AccessLeaseHandler,
   type AuthorityRegistry,
+  type ReadinessAnswer,
 } from "./server.js";
 import {
   authorityDataPlaneRouterLimitsFromEnv,
@@ -117,9 +118,41 @@ describe("createAuthorityManagerServer", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ ok: true });
 
+    // /livez is the conventional spelling of the same dependency-free check.
+    // Restarting a manager whose DATABASE is sick fixes nothing and throws
+    // away its epoch claim, so a sick control store must fail /readyz only.
+    const live = await fetch(`${baseUrl}/livez`);
+    expect(live.status).toBe(200);
+    expect(await live.json()).toEqual({ ok: true });
+
     const ready = await fetch(`${baseUrl}/readyz`);
     expect(ready.status).toBe(503);
     expect(await ready.json()).toEqual({ ok: false });
+  });
+
+  test("/readyz names the coarse reason on failure and stays exactly {ok:true} when ready", async () => {
+    const registry = {
+      ensureAuthority: async () => ({ authorityUrl: "router.example:2050" }),
+      isHealthy: async () => true,
+    };
+    // The incident's shape: the control store answers reads but refuses a
+    // durable write. `unreachable` would be a lie and `ok` was the lie that
+    // shipped a healthy deploy.
+    const unreadyUrl = await startCustomServer(registry, undefined, () => ({
+      ok: false,
+      code: "not_writable",
+    }));
+    const unready = await fetch(`${unreadyUrl}/readyz`);
+    expect(unready.status).toBe(503);
+    expect(await unready.json()).toEqual({ ok: false, code: "not_writable" });
+
+    // A ready manager's body is byte-identical to what it always was: no
+    // code, and nothing that could leak database detail to this
+    // UNAUTHENTICATED route.
+    const readyUrl = await startCustomServer(registry, undefined, () => ({ ok: true }));
+    const ready = await fetch(`${readyUrl}/readyz`);
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toEqual({ ok: true });
   });
 
   test("typed backpressure refusals render 503 with a Retry-After header so mount clients back off", async () => {
@@ -1337,7 +1370,7 @@ async function startServer(authToken?: string): Promise<string> {
 async function startCustomServer(
   registry: AuthorityRegistry,
   authToken?: string,
-  readiness?: () => boolean | Promise<boolean>,
+  readiness?: () => ReadinessAnswer | Promise<ReadinessAnswer>,
   accessLeases?: AccessLeaseHandler,
   metricsEndpoint?: () => Promise<string>
 ): Promise<string> {

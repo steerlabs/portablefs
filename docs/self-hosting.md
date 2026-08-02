@@ -138,6 +138,51 @@ PORTABLEFS_HISTORY_MAINTENANCE_INTERVAL_MS=60000     # cycle interval (min 1000)
 PORTABLEFS_HISTORY_MAINTENANCE_BACKLOG_PERCENT=70    # 1..100, percent of the generation quota
 ```
 
+### Journal storage reclamation
+
+Cutting and adopting bounds the **logical** backlog: it advances the
+generation's base and subtracts the backlog counters, but every journal record
+payload below that base stays in `pfj.journal_records`. Migration 031 adds the
+physical half — the maintenance loop deletes those rows in bounded pages, and
+volume retirement (`portablefs rm`) drives the volume's generations terminal so
+its whole journal becomes reclaimable.
+
+```bash
+PORTABLEFS_JOURNAL_RETENTION_MS=604800000   # 7d; a SUSPENDED generation idle this long is
+                                            # cut on AGE, not on backlog size (min 3600000)
+PORTABLEFS_JOURNAL_RECLAIM_BATCH=512        # rows deleted per bounded reclaim transaction
+PORTABLEFS_JOURNAL_RECLAIM_MAX_PAGES=64     # reclaim transactions per maintenance cycle
+```
+
+The retention knob exists because a percent-of-quota threshold can never reach
+an abandoned branch: it is suspended, small, and therefore never cut, never
+adopted, and never reclaimable. Reclamation only ever deletes below a horizon
+proven by rows — never at or above a generation's base, never below a
+pending/materializing cut's read window, and for PFJ3 never without a ready cut
+carrying a materialized recovery anchor.
+
+**What reclamation does and does not give back.** Deleting rows returns their
+space to the table's free space map once (auto)vacuum runs, so the journal
+stops growing and new records reuse the space — verified: re-inserting 190k
+records after reclaiming 190k grew the table by 13 MB instead of ~100 MB. It
+does **not** shrink the files on disk. Returning bytes to the operating system
+needs `VACUUM FULL` or `pg_repack`, and `VACUUM FULL` rewrites the whole table,
+so it needs free space equal to the table's size — the one thing a full disk
+does not have. On a control store that is already full, reclaim first, let
+autovacuum settle, and only then consider a rewrite.
+
+Accounting: `GET /v1/admin/control-store/usage` (admin token) reports journal
+record counts, the reclaimable subset, and relation/database bytes. Sizes come
+from `pg_total_relation_size` (heap + indexes + TOAST + bloat) rather than a
+sum of row payloads: it is both the number that matches the disk and O(1),
+where summing payloads costs a full scan that slows down exactly as the
+backlog it reports grows. The
+authority manager publishes the same consumption on its authenticated
+`/metrics` as `pfm_control_store_database_bytes` and
+`pfm_control_store_{pfj,pfm,pfh,public}_bytes`. Each maintenance cycle's
+telemetry line carries `recordsReclaimed`, `bytesReclaimed`,
+`reclaimCandidates`, and `agedGenerationsForced`.
+
 `PORTABLEFS_HISTORY_MAINTENANCE=off` is allowed only outside production `NODE_ENV`
 (local debugging); a production process refuses to start with it because the loop is
 what keeps volumes writable. Adoption requires the resident Go history worker

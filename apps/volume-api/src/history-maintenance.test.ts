@@ -350,7 +350,28 @@ describe("historyMaintenanceSettingsFromEnv", () => {
       enabled: true,
       intervalMs: 60_000,
       backlogPercent: 70,
+      // Journal reclamation defaults (migration 031): a 7-day suspended-
+      // generation retention, and bounded reclaim work per cycle.
+      journalRetentionMs: 604_800_000,
+      reclaimBatchRows: 512,
+      reclaimMaxPagesPerCycle: 64,
     });
+  });
+
+  test("journal reclamation bounds are configurable and floored", () => {
+    const settings = historyMaintenanceSettingsFromEnv({
+      PORTABLEFS_JOURNAL_RETENTION_MS: "3600000",
+      PORTABLEFS_JOURNAL_RECLAIM_BATCH: "128",
+      PORTABLEFS_JOURNAL_RECLAIM_MAX_PAGES: "8",
+    });
+    expect(settings.journalRetentionMs).toBe(3_600_000);
+    expect(settings.reclaimBatchRows).toBe(128);
+    expect(settings.reclaimMaxPagesPerCycle).toBe(8);
+    // A retention below the one-hour floor would cut branches that are
+    // merely between mounts. Refused loudly, never silently clamped.
+    expect(() =>
+      historyMaintenanceSettingsFromEnv({ PORTABLEFS_JOURNAL_RETENTION_MS: "1000" })
+    ).toThrow(/PORTABLEFS_JOURNAL_RETENTION_MS/);
   });
 
   test("refuses off in production with a clear error", () => {

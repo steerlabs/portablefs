@@ -93,6 +93,7 @@ package portablefsd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -123,7 +124,60 @@ type refreshIntent struct {
 	drained     chan struct{}
 	drainClosed bool
 	release     sync.Once
+	// yielding marks an intent whose holder has undertaken to give the item
+	// straight back when an application size mutation queues for it. See
+	// "THE DEFERENTIAL INTENT" below.
+	yielding bool
+	// preempt is closed when a size mutation reaches the head of a yielding
+	// intent's item queue. It is never closed for a non-yielding intent.
+	preempt       chan struct{}
+	preemptClosed bool
 }
+
+// ── THE DEFERENTIAL INTENT (ROUND 16, DEFECT A) ─────────────────────────────
+//
+// Everything above describes an intent that EXCLUDES arriving mutations, and
+// for the authority's coherence barrier that is exactly right: the watcher's
+// exact refresh is a proof the authority waits on before it advances a
+// durability barrier, so it must be able to say "no writer moved this item
+// underneath me", and a writer that has to wait for it waits for a bounded
+// pass.
+//
+// The crossed-scope repair is not that. It is a correction the daemon owes
+// ITSELF for state the frontend may have exposed from a scope that had already
+// crossed — nobody is waiting on its answer, and the lazy content and namespace
+// invalidations that cover the same items have ALREADY been published by the
+// time it starts (see noteCrossedScope). Giving it the same exclusive claim
+// cost exactly what an exclusive claim costs when the holder has no deadline
+// anyone cares about: it guarded itself with a point-in-time
+// `sizeMutationReserved` read taken outside the turnstile, won the gap an
+// ordinary write loop leaves between close(2) and the next open(2), installed
+// its intent, and held an application's fsync for the whole two-minute pass —
+// then did it again every two seconds for ten minutes.
+//
+// So an intent may be taken as DEFERENTIAL. It is the same claim in every
+// respect but one: when a size-mutation ticket reaches the head of the item's
+// queue behind it, the intent is PREEMPTED — its holder's pass context is
+// cancelled, the pass unwinds to its nearest yield point and releases, and the
+// mutation is granted. The application never queues behind a repair for longer
+// than it takes the pass to notice.
+//
+// Two properties keep that from being a way to break the protocol:
+//
+//   - PREEMPTION NEVER REACHES AN ARMED PIN. A pass that has installed its pin
+//     is inside the one local ftruncate(2) the pin brackets, and that syscall's
+//     completion is what makes the pin's exclusion true (refreshpin.go).
+//     preemptRefreshIntentLocked refuses to fire while a pin is installed, and
+//     the pass itself checks for preemption only at points where it holds no
+//     window. The linearization argument is untouched.
+//   - ONLY THE REPAIR ASKS FOR IT. acquireRefreshIntent — every barrier caller —
+//     is unchanged and takes a non-yielding intent, which can never be
+//     preempted.
+//
+// And a preempted pass is not a failure. It is the repair observing that the
+// item's own writer is live, which is the case the repair matters least in and
+// the case its debt is discharged by the writer's own publications: see
+// repairCrossedItem.
 
 // refreshIntentBlockerLocked returns the channel a size mutation on itemID must
 // wait for before it may reserve, or nil if it may reserve now. Callers hold
@@ -157,6 +211,28 @@ func (a *attach) signalRefreshIntentDrainLocked(itemID uint64) {
 	close(intent.drained)
 }
 
+// preemptRefreshIntentLocked hands a DEFERENTIAL intent's item back to the
+// application. Callers hold a.mu, and call it from the one place that knows a
+// size mutation is waiting: advanceItemQueueLocked, with that mutation at the
+// head of the item's queue.
+//
+// It is deliberately inert while a pin is installed. A pin means the pass is
+// inside the ftruncate(2) it brackets, and interrupting that is precisely the
+// event the token protocol exists to make impossible; the pin is bounded by one
+// local syscall, and its retirement re-runs the queue (retireRefreshWindowLocked),
+// so the mutation is granted a moment later without anybody racing anything.
+func (a *attach) preemptRefreshIntentLocked(itemID uint64) {
+	intent := a.refreshIntents[itemID]
+	if intent == nil || !intent.yielding || intent.preemptClosed {
+		return
+	}
+	if a.refreshPins[itemID] != nil {
+		return
+	}
+	intent.preemptClosed = true
+	close(intent.preempt)
+}
+
 // acquireRefreshIntent takes this pass's place in the item's arrival order,
 // registers its intent when the item is handed to it, and returns once every
 // reservation that was outstanding at that moment has drained.
@@ -169,15 +245,30 @@ func (a *attach) signalRefreshIntentDrainLocked(itemID uint64) {
 // A zero itemID is an item the registry cannot name; no mutation can reserve it
 // and the intent is inert.
 func (a *attach) acquireRefreshIntent(ctx context.Context, itemID uint64) (func(), error) {
+	release, _, err := a.acquireRefreshIntentMode(ctx, itemID, false)
+	return release, err
+}
+
+// acquireRefreshIntentMode is acquireRefreshIntent plus the DEFERENTIAL mode.
+//
+// It returns the channel on which preemption is announced. For a non-yielding
+// intent that channel is never closed, so a caller that selects on it selects on
+// nothing — which is exactly the pre-round-16 behaviour of every barrier caller.
+func (a *attach) acquireRefreshIntentMode(
+	ctx context.Context,
+	itemID uint64,
+	yielding bool,
+) (func(), <-chan struct{}, error) {
 	if itemID == 0 {
-		return func() {}, nil
+		return func() {}, make(chan struct{}), nil
 	}
 	a.mu.Lock()
 	ticket := a.takeItemTicketLocked(itemID, ticketRefresh)
+	ticket.yielding = yielding
 	a.advanceItemQueueLocked(itemID)
 	a.mu.Unlock()
 	if !a.awaitItemTicket(ctx.Done(), itemID, ticket, nil) {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"portablefsd: refresh intent for item %d: %w", itemID, ctx.Err(),
 		)
 	}
@@ -191,7 +282,7 @@ func (a *attach) acquireRefreshIntent(ctx context.Context, itemID uint64) (func(
 		// Granted at the same moment the transaction died. Give the item back
 		// rather than leaving a pending intent behind a pass that will not run.
 		release()
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"portablefsd: refresh intent for item %d: %w", itemID, ctx.Err(),
 		)
 	}
@@ -199,18 +290,35 @@ func (a *attach) acquireRefreshIntent(ctx context.Context, itemID uint64) (func(
 	defer cancelDrain()
 	select {
 	case <-intent.drained:
-		return release, nil
+		return release, intent.preempt, nil
+	case <-intent.preempt:
+		// A deferential intent whose item was claimed while it was still
+		// draining. The reservations it was waiting for are the application's,
+		// and so is the one queued behind it; there is nothing here worth making
+		// any of them wait for.
+		release()
+		return nil, nil, errRefreshIntentPreempted
 	case <-drainCtx.Done():
 		// The intent is given back before reporting: a pending intent left
 		// behind a pass that is not running would queue every size mutation
 		// on the item for nothing.
 		release()
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"portablefsd: refresh intent for item %d: size mutations did not "+
 				"drain within %s: %w", itemID, refreshIntentDrainBudget, drainCtx.Err(),
 		)
 	}
 }
+
+// errRefreshIntentPreempted is a DEFERENTIAL refresh pass standing aside for an
+// application size mutation on the same item.
+//
+// It is not a failure and must never be reported as one: nothing was attempted,
+// nothing is inconsistent, and the item is being driven by the very writer whose
+// publications discharge the debt this pass carries.
+var errRefreshIntentPreempted = errors.New(
+	"the refresh yielded the item to an arriving application size mutation",
+)
 
 // releaseRefreshIntent gives the item up and hands it to the next claim in
 // arrival order INSIDE THE SAME a.mu HOLD.

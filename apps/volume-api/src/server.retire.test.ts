@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import type { BlobStore } from "@portablefs/core";
 import type {
+  JournalRetireResult,
   MetadataRepository,
   PostgresHistoryRepository,
   VolumeRetireCleanupResult,
@@ -259,6 +260,65 @@ describe("volume retirement", () => {
     // Both blocking consumer pins released; the conversion is voided.
     expect(history.state.consumers.every((consumer) => consumer.released)).toBe(true);
     expect(history.state.conversions).toEqual([{ id: "hconv_1", state: "failed" }]);
+  });
+
+  // ── the `portablefs rm` ledger item ──────────────────────────────────────
+  //
+  // Verified gap: retirement set volumes.retired_at (021, whose own header
+  // says "this migration deletes nothing") and cancelled the volume's cuts
+  // (022). NOTHING released pfj.journal_records. `portablefs rm` on test
+  // volumes is exactly what filled this production Postgres twice.
+  test("retire RELEASES the volume's journal storage, not just its metadata flag", async () => {
+    const metadata = retireFixture();
+    const history = fakeRetireHistory(metadata);
+    const baseUrl = await startServer({ metadata });
+
+    const response = await fetch(`${baseUrl}/v1/volumes/vol_live`, {
+      method: "DELETE",
+      headers: TENANT_HEADERS,
+    });
+    expect(response.status).toBe(200);
+
+    // Tenant-scoped, and strictly AFTER the retirement receipt is durable:
+    // the receipt is the precondition for journal retirement, never an
+    // effect of it.
+    expect(history.state.journalCalls).toEqual([
+      { tenantId: "t1", volumeId: "vol_live", volumeAlreadyRetired: true },
+    ]);
+    // Every generation is terminal with its base driven to its own tip —
+    // which is what puts the WHOLE journal below the reclamation horizon.
+    // The bounded maintenance pass deletes the rows; the route does not do
+    // unbounded work while the caller waits.
+    expect(history.state.journalGenerations).toEqual([
+      { id: "gen_live", status: "retired", baseSeq: 4_000, nextSeq: 4_000 },
+      { id: "gen_old", status: "retired", baseSeq: 900, nextSeq: 900 },
+    ]);
+    // The receipt shape is unchanged: reclamation detail never rides it.
+    const receipt = (await response.json()) as Record<string, unknown>;
+    expect(Object.keys(receipt).sort()).toEqual(["retiredAt", "volumeId"]);
+  });
+
+  test("a failed journal release never costs the caller its durable retirement receipt", async () => {
+    const metadata = retireFixture();
+    const history = fakeRetireHistory(metadata);
+    (history.repository as unknown as { retireVolumeJournals: () => Promise<never> })
+      .retireVolumeJournals = async () => {
+      throw Object.assign(new Error("control store unavailable"), { code: "57P01" });
+    };
+    const baseUrl = await startServer({ metadata });
+
+    const response = await fetch(`${baseUrl}/v1/volumes/vol_live`, {
+      method: "DELETE",
+      headers: TENANT_HEADERS,
+    });
+
+    // The flip is already durable, so it MUST be answered. The release is
+    // retried by the next replay and by the maintenance loop, which derives
+    // its candidates from rows rather than from this call succeeding.
+    expect(response.status).toBe(200);
+    const receipt = (await response.json()) as Record<string, unknown>;
+    expect(Object.keys(receipt).sort()).toEqual(["retiredAt", "volumeId"]);
+    expect(history.state.calls).toHaveLength(1);
   });
 
   test("a replayed retire re-runs the idempotent cascade and answers the identical receipt", async () => {
@@ -570,6 +630,10 @@ interface FakeRetireHistoryState {
   consumers: Array<{ kind: "conversion" | "adoption"; id: string; released: boolean }>;
   conversions: Array<{ id: string; state: string }>;
   calls: Array<{ tenantId: string; volumeId: string; volumeAlreadyRetired: boolean }>;
+  // Journal reclamation (migration 031): the generations the route drove
+  // terminal, and whether the volume was already retired when it did.
+  journalCalls: Array<{ tenantId: string; volumeId: string; volumeAlreadyRetired: boolean }>;
+  journalGenerations: Array<{ id: string; status: string; baseSeq: number; nextSeq: number }>;
 }
 
 // fakeRetireHistory attaches a stateful pfh.volume_retire_cleanup double to
@@ -594,6 +658,11 @@ function fakeRetireHistory(metadata: RetireFixture): {
     ],
     conversions: [{ id: "hconv_1", state: "final_cut" }],
     calls: [],
+    journalCalls: [],
+    journalGenerations: [
+      { id: "gen_live", status: "active", baseSeq: 0, nextSeq: 4_000 },
+      { id: "gen_old", status: "suspended", baseSeq: 100, nextSeq: 900 },
+    ],
   };
   const facade = {
     volumeRetireCleanup: async (input: {
@@ -628,6 +697,33 @@ function fakeRetireHistory(metadata: RetireFixture): {
         }
       }
       return { volumeId: input.volumeId, consumersReleased, conversionsVoided, cutsCanceled };
+    },
+    // pfj.journal_retire_for_volume (migration 031): drives the volume's
+    // generations terminal and moves each base to its own tip, which is what
+    // makes the WHOLE journal fall below the reclamation horizon. Idempotent.
+    retireVolumeJournals: async (input: {
+      tenantId: string;
+      volumeId: string;
+    }): Promise<JournalRetireResult> => {
+      state.journalCalls.push({
+        ...input,
+        volumeAlreadyRetired: metadata.state.retired.has(input.volumeId),
+      });
+      let generationsRetired = 0;
+      for (const generation of state.journalGenerations) {
+        if (generation.status !== "retired") {
+          generation.status = "retired";
+          generation.baseSeq = generation.nextSeq;
+          generationsRetired += 1;
+        }
+      }
+      return {
+        volumeId: input.volumeId,
+        generationsRetired: String(generationsRetired),
+        reclaimableRecords: String(
+          state.journalGenerations.reduce((sum, g) => sum + g.baseSeq, 0)
+        ),
+      };
     },
   };
   const repository = facade as unknown as PostgresHistoryRepository;

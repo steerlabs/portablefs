@@ -1303,10 +1303,10 @@ type attach struct {
 	// Guarded by mu.
 	detachBarrier     bool
 	credentialPending bool
-	root                *itemRecord
-	items               map[uint64]*itemRecord
-	paths               map[string]*itemRecord
-	itemAliases         map[uint64]map[string]struct{}
+	root              *itemRecord
+	items             map[uint64]*itemRecord
+	paths             map[string]*itemRecord
+	itemAliases       map[uint64]map[string]struct{}
 	// authorityItems is the second half of frontend identity. items maps the
 	// stable ItemID already published to FSKit; authorityItems maps the inode
 	// later assigned by the authority back to that same Item and NodeState.
@@ -1365,11 +1365,20 @@ type attach struct {
 	// spent its whole operation deadline without attempting anything. Guarded
 	// by mu.
 	itemTurnstiles map[uint64]*itemTurnstile
-	handles        map[uint64]*handleRecord
-	localDirs      []string
-	localRoot      string
-	localFS        *confinedfs.Root
-	localVersions  map[string]uint64
+	// repairAttrPublications counts the attribute publications this daemon has
+	// made for an item since a crossed-scope repair started WATCHING it, and is
+	// how such a repair converges on a continuously written file instead of
+	// spending its whole budget being preempted (coherence_refresh.go).
+	//
+	// It is a watch rather than a census on purpose: an entry exists only while a
+	// repair is outstanding for that item, so this map is the size of the
+	// in-flight repair set and never of the working set. Guarded by mu.
+	repairAttrPublications map[uint64]uint64
+	handles                map[uint64]*handleRecord
+	localDirs              []string
+	localRoot              string
+	localFS                *confinedfs.Root
+	localVersions          map[string]uint64
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1458,6 +1467,9 @@ type attach struct {
 	// mutation has queued and prove the item is not handed to it first. nil in
 	// production.
 	testSizeMutationQueued func(itemID uint64)
+	// testSessionFenced substitutes for the volume's fence predicate. See
+	// attach.sessionFenced.
+	testSessionFenced func() bool
 	// testControlWriteAuthorityTarget fires at the instant a control write has
 	// resolved the identity the AUTHORITY binds to its pathname and is about to
 	// mutate it. It exists because the local registry cannot fence a remote
@@ -2425,7 +2437,33 @@ func (a *attach) status() attachStatus {
 		// repeated transport failures)" said while a concurrent fresh mount
 		// proved the authority healthy — sends the operator to the network and
 		// hides the one action that works.
-		if vol.CredentialExpired() {
+		// A FENCED SESSION IS A DEFINITE DEGRADED STATE, AND IT IS REPORTED
+		// FIRST.
+		//
+		// It is checked ahead of the credential branches because it is the
+		// strongest statement available about this mount: a fenced session
+		// answers EVERY subsequent request with ESTALE — open, read, mkdir,
+		// close, all of them — and it never mints a fresh generation, so nothing
+		// short of a remount changes that.
+		//
+		// Nothing here asked before. attach.status() consulted exactly two
+		// predicates (both credential-shaped), the write-back watchdog can only
+		// latch degraded when it has pending records to be stuck on
+		// (writeback/flush.go), and `portablefs mounts` derives health from pid
+		// liveness plus the kernel mount table without entering the filesystem.
+		// So a fenced mount reported state=attached, lastErr empty, degraded
+		// absent and health=live while every operation on it returned ESTALE —
+		// measured live, and the fence only became visible at umount, in the
+		// final barrier's error. A mount that cannot serve must say so at the
+		// moment it stops serving.
+		if a.sessionFenced(vol) {
+			state = pfslocal.AttachStateDegraded
+			lastErr = "mount session FENCED (stale generation): the authority " +
+				"terminated this mount's session lease, so every operation on this " +
+				"mount now fails with ESTALE and no new generation will be minted. " +
+				"Remount to recover; unshipped write-back can be parked as a durable " +
+				"recovery job with `portablefs umount --force`"
+		} else if vol.CredentialExpired() {
 			state = pfslocal.AttachStateDegraded
 			credential = credentialStateRejected
 			lastErr = "access credential rejected by a REACHABLE authority " +
@@ -2475,6 +2513,19 @@ func (a *attach) status() attachStatus {
 		LocalDirs:  localDirs,
 		WriteBack:  wb,
 	}
+}
+
+// sessionFenced reports whether this attach's mount session has been fenced.
+//
+// The test seam exists because a fence is a durable authority decision (a lease
+// swept terminal, a slot conflict) that a unit test cannot manufacture through
+// the real handshake without racing a real TTL. The production answer is always
+// the volume's own.
+func (a *attach) sessionFenced(vol *clientcore.Volume) bool {
+	if hook := a.testSessionFenced; hook != nil {
+		return hook()
+	}
+	return vol != nil && vol.SessionFenced()
 }
 
 func (a *attach) currentStateLocked() pfslocal.AttachStateState {
@@ -2693,6 +2744,64 @@ func (a *attach) publishRecordAttrLocked(rec *itemRecord, attr fsproto.Attr, adm
 	}
 	rec.attr = attr
 	a.notePublicationLocked(rec.item.ItemID)
+	a.noteRepairPublicationLocked(rec.item.ItemID)
+}
+
+// watchRepairPublications starts counting this daemon's own attribute
+// publications for itemID, and returns the stop that forgets them.
+//
+// It is the crossed-scope repair's convergence witness. See
+// repairCrossedItem for what a publication proves and why.
+func (a *attach) watchRepairPublications(itemID uint64) func() {
+	if itemID == 0 {
+		return func() {}
+	}
+	a.mu.Lock()
+	if a.repairAttrPublications == nil {
+		a.repairAttrPublications = map[uint64]uint64{}
+	}
+	a.repairAttrPublications[itemID] = 0
+	a.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.mu.Lock()
+			delete(a.repairAttrPublications, itemID)
+			a.mu.Unlock()
+		})
+	}
+}
+
+// repairPublicationsSince reports how many attribute publications this daemon
+// has made for itemID since its watch began.
+func (a *attach) repairPublicationsSince(itemID uint64) uint64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.repairAttrPublications[itemID]
+}
+
+// noteRepairPublicationLocked records one attribute publication against a
+// watched item, and does nothing at all for every other item. Callers hold mu.
+//
+// It counts only publications made while a SIZE MUTATION IS RESERVED on the
+// item, and that restriction is the whole precision of the witness. The
+// reservation strictly contains its handler's commit and publication
+// (refreshpin.go), so a publication inside one is an application write's own
+// post-op attributes — the value that also travels back to the kernel in that
+// write's reply. Publications from anything else (a reconciliation install, a
+// background repair) say nothing about what the kernel was told, and counting
+// them would let the crossed repair discharge on the daemon's own bookkeeping.
+func (a *attach) noteRepairPublicationLocked(itemID uint64) {
+	if itemID == 0 {
+		return
+	}
+	if _, watched := a.repairAttrPublications[itemID]; !watched {
+		return
+	}
+	if !a.sizeMutationReservedLocked(itemID) {
+		return
+	}
+	a.repairAttrPublications[itemID]++
 }
 
 // publishItemSizeLocked installs a size a MUTATION decided onto the item it

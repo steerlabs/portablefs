@@ -127,6 +127,13 @@ const maintenanceLoop = historyMaintenance.enabled
       store: metadata.history,
       intervalMs: historyMaintenance.intervalMs,
       backlogPercent: historyMaintenance.backlogPercent,
+      // Journal reclamation: cutting and adopting bounds the LOGICAL
+      // backlog, but every payload below the base stayed in
+      // pfj.journal_records forever — that is what filled this control store
+      // twice. The loop now also deletes those rows, in bounded pages.
+      journalRetentionMs: historyMaintenance.journalRetentionMs,
+      reclaimBatchRows: historyMaintenance.reclaimBatchRows,
+      reclaimMaxPagesPerCycle: historyMaintenance.reclaimMaxPagesPerCycle,
       telemetry: createTelemetry(telemetryHook ?? stdoutTelemetrySink()),
       // Adoption is gated on THIS deployment serving exact PFT2 history
       // reads: the adopted base is what the next cold start must fetch

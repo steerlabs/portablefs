@@ -197,11 +197,34 @@ export interface AccessLeaseHandler {
   }): Promise<string[]> | string[];
 }
 
+/**
+ * The readiness verdict. `code` is the ONLY failure detail that reaches the
+ * unauthenticated /readyz payload — a stable coarse token, never database or
+ * exception text. Usage and capacity numbers are operator data and belong on
+ * the authenticated /metrics endpoint, not here.
+ */
+export interface ReadinessVerdict {
+  ok: boolean;
+  code?: string;
+}
+
+export type ReadinessAnswer = boolean | ReadinessVerdict;
+
 export interface AuthorityManagerServerDeps {
   authToken?: string;
   allowUnauthenticated?: boolean;
   registry: AuthorityRegistry;
-  readiness?: () => boolean | Promise<boolean>;
+  // READINESS (GET /readyz): can this manager perform a durable control
+  // transition right now? A bare boolean stays supported for embedders; a
+  // ReadinessVerdict additionally names the coarse, stable reason so an
+  // operator can tell "this manager" apart from "the control store" without
+  // leaking any driver text to this UNAUTHENTICATED route.
+  //
+  // Absent -> ready. That default belongs to embedders that have no
+  // dependencies; production ALWAYS supplies one (see main.ts), because a
+  // manager whose control store cannot accept a write is not ready no matter
+  // how healthy its process is.
+  readiness?: () => ReadinessAnswer | Promise<ReadinessAnswer>;
   // Canonical access-lease service (production mode). When absent, the
   // /v1/access-leases/* routes answer ACCESS_LEASE_UNSUPPORTED.
   accessLeases?: AccessLeaseHandler;
@@ -242,8 +265,15 @@ export function createAuthorityManagerServer(deps: AuthorityManagerServerDeps): 
         return;
       }
       if (healthCheck === "readyz") {
-        const ready = deps.readiness ? await deps.readiness() : true;
-        sendJson(res, ready ? 200 : 503, { ok: ready });
+        const answer = deps.readiness ? await deps.readiness() : true;
+        const verdict: ReadinessVerdict =
+          typeof answer === "boolean" ? { ok: answer } : answer;
+        sendJson(res, verdict.ok ? 200 : 503, {
+          ok: verdict.ok,
+          // Only on failure, and only the coarse code: a ready manager's body
+          // stays exactly `{"ok":true}`.
+          ...(!verdict.ok && verdict.code ? { code: verdict.code } : {}),
+        });
         return;
       }
 
@@ -727,12 +757,21 @@ async function readJsonBody(
   return parseJsonObject(Buffer.concat(chunks).toString("utf8"));
 }
 
+// LIVENESS vs READINESS, kept explicitly apart:
+//   /healthz, /livez  the process is up. Dependency-free, always 200 while
+//                     the event loop runs. Restarting a manager whose
+//                     DATABASE is sick fixes nothing and throws away its
+//                     epoch claim, so a sick control store must never reach
+//                     this answer. /livez is the conventional spelling; both
+//                     names serve the identical dependency-free check.
+//   /readyz           the manager can perform a durable control transition.
+//                     Deploy gates poll THIS path (railway healthcheckPath).
 function readHealthCheck(req: IncomingMessage): "healthz" | "readyz" | null {
   if (req.method !== "GET") {
     return null;
   }
   const url = new URL(req.url ?? "/", "http://authority-manager.local");
-  if (url.pathname === "/healthz") {
+  if (url.pathname === "/healthz" || url.pathname === "/livez") {
     return "healthz";
   }
   if (url.pathname === "/readyz") {
