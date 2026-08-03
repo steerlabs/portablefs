@@ -379,7 +379,21 @@ describe("the claim heartbeat survives a fully blocked main event loop", () => {
     const mainThreadAttempts: number[] = [];
     const mainThreadLoop = setInterval(() => mainThreadAttempts.push(performance.now()), intervalMs);
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // WAIT for the worker to boot, do not ASSUME a boot time. Spawning a real
+    // worker_thread means creating an OS thread, loading this module graph and
+    // importing `pg`; that is BOOT cost, and it has nothing to do with the
+    // steady-state cadence this test exists to prove. A fixed 100 ms sleep
+    // here made the test fail on a loaded machine while the property under
+    // test still held perfectly: measured at 4x CPU oversubscription (72
+    // spinning threads on 18 cores) the hello frame arrived in 123..475 ms
+    // (p50 200 ms) in 8 of 8 trials, while renewal attempts issued during the
+    // hard main-thread block below stayed at 3-5 per block in 8 of 8 trials.
+    // Production does not assume a boot time either: WorkerClaimHeartbeat
+    // awaits the hello frame with a 10 s bound and refuses to run without it.
+    const helloDeadline = Date.now() + 10_000;
+    while (!messages.some((message) => message.type === "hello") && Date.now() < helloDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     expect(messages.some((message) => message.type === "hello")).toBe(true);
     const attemptsBeforeBlock = messages.filter((message) => message.type !== "hello").length;
     const mainAttemptsBeforeBlock = mainThreadAttempts.length;

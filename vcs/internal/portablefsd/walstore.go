@@ -434,8 +434,17 @@ func classifyOrphanStream(streamDir string) streamVerdict {
 			// The two states force-park refuses to touch because they require
 			// an explicit recovery resolution. Reclaiming one destroys the only
 			// copy of the damage an operator was asked to resolve.
+			// NAME THE RESOLUTION. "awaits an explicit recovery resolution" was
+			// the only place this phrase appeared outside the error that
+			// refused, and neither named a command that performed one — so an
+			// operator reading this line had nowhere to go. The adoption hint
+			// this message carries ("re-attach ... to replay it") is also wrong
+			// for these two states specifically: a conflict/corrupt stream is
+			// never replayed, it is contained.
 			return streamVerdict{records: records, bytes: bytes, reason: fmt.Sprintf(
-				"awaits an explicit recovery resolution (job state %q)", job.State)}
+				"awaits an explicit recovery resolution (job state %q) — "+
+					"`portablefs recovery resolve <mountPath> --all-terminal` performs it, "+
+					"quarantining the bytes and reporting exactly what is lost", job.State)}
 		}
 		if records > 0 || bytes > 0 {
 			return streamVerdict{records: records, bytes: bytes,

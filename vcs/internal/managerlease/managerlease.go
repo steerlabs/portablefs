@@ -83,9 +83,61 @@ const FrameVersion = 1
 // fence.
 const DefaultGuard = 2 * time.Second
 
-// probeTimeout bounds one lease-facts query. A query slower than this is
-// ambiguous and extends nothing.
-const probeTimeout = 5 * time.Second
+// Bounds on ONE lease-facts query, clamping the DERIVED budget below.
+//
+// ROUND 21c. This used to be a flat `probeTimeout = 5 * time.Second`, and
+// production showed it to be the same defect the manager's own renewal had,
+// one layer down. On 2026-08-02 at 22:06:34 a child logged
+//
+//	manager lease-facts probe failed (never extends the fencing deadline):
+//	remotejournal: authority lease facts: timeout: context deadline exceeded
+//
+// against a Postgres that a bulk write flood had saturated, and fenced 13 s
+// later at 22:06:47 — "manager lease deadline passed without a fresh grounded
+// frame" — taking the mount to EIO. The manager itself was healthy throughout
+// (one rejected renewal, hard deadline still 18.7 s out). A 6 s answer would
+// have grounded the child perfectly well; the flat 5 s threw it away.
+//
+// The budget is now DERIVED from the deadline the probe exists to extend: a
+// probe that has not answered by the time the guard fences cannot help, and a
+// probe that answers before then is always usable, because its facts are
+// anchored at the local instant captured BEFORE the query (so a slow answer
+// arms a proportionally SHORTER window, never a longer one). There is no
+// tuned constant left — only degenerate-case clamps.
+const (
+	// A probe always gets at least this long, so a nearly-expired deadline
+	// cannot produce a zero-length context.
+	minProbeBudget = 1 * time.Second
+	// A probe can never usefully outlive one whole default claim window, and
+	// the grounder runs one probe at a time, so this bounds a wedged query
+	// from occupying the grounder indefinitely. (The armed deadline fences on
+	// its own timer regardless, so this is containment, not safety.)
+	maxProbeBudget = 30 * time.Second
+	// The budget when NOTHING is armed yet. Deliberately the same 5 s the flat
+	// constant used: the only probe with no armed deadline is the very first
+	// one, its wait is separately bounded by the child's 30 s
+	// firstLeaseFrameTimeout, and startup behaviour is not what the incident
+	// was about. The derivation applies where it mattered — every probe that
+	// exists to EXTEND a deadline the child is already serving under.
+	unarmedProbeBudget = 5 * time.Second
+)
+
+// probeBudget derives the bound on one lease-facts query from the fencing
+// deadline currently armed. Exported behaviour, unexported helper: tested
+// directly so the derivation cannot silently become a constant again.
+func probeBudget(deadlineAt, now time.Time) time.Duration {
+	if deadlineAt.IsZero() {
+		return unarmedProbeBudget
+	}
+	remaining := deadlineAt.Sub(now)
+	if remaining < minProbeBudget {
+		return minProbeBudget
+	}
+	if remaining > maxProbeBudget {
+		return maxProbeBudget
+	}
+	return remaining
+}
 
 // maxLeaseRemainingMs bounds a frame's claimed remaining lease. The manager
 // claim TTL is bounded to one hour in SQL (pfm.manager_claim); anything
@@ -481,13 +533,20 @@ func (g *Guard) observe(frame Frame) error {
 func (g *Guard) groundDeadline() {
 	g.mu.Lock()
 	prober := g.prober
+	deadlineAt := g.deadlineAt
 	g.mu.Unlock()
 	if prober == nil {
 		return
 	}
 
 	capturedLocal := g.now()
-	probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	// The budget comes from the deadline this probe exists to extend, not
+	// from a constant: see probeBudget. capturedLocal is taken BEFORE the
+	// query, so however long the answer takes, the window armed from it is
+	// shortened by exactly that long — a slow probe is charged against its
+	// own grant, never against the soundness of the fence.
+	probeCtx, cancel := context.WithTimeout(
+		context.Background(), probeBudget(deadlineAt, capturedLocal))
 	facts, err := prober.ProbeLeaseFacts(probeCtx)
 	cancel()
 

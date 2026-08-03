@@ -43,6 +43,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/fstransition"
@@ -264,7 +265,11 @@ type Store interface {
 // Spool is the deterministic content-addressed object set one materialization
 // produces (and the fetch surface for base-tree objects already staged). It
 // implements pft2.NodeSink, pft2.PackSink, and pft2.Fetcher.
+//
+// Fetch is safe for concurrent use: the closure walk resolves the objects it
+// must actually read in parallel, and a miss mutates the needs map.
 type Spool struct {
+	mu      sync.Mutex
 	objects map[pft2.Ref][]byte
 	order   []pft2.Ref
 	needs   map[string]int64 // digest -> size (missing base/blob objects)
@@ -280,6 +285,8 @@ func (s *Spool) Seed(ref pft2.Ref, data []byte) error {
 	if pft2.RefOf(data) != ref {
 		return corruptf("seeded object does not match its reference")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.objects[ref]; !ok {
 		s.objects[ref] = append([]byte(nil), data...)
 		s.order = append(s.order, ref)
@@ -295,7 +302,10 @@ func (s *Spool) PutPack(ref pft2.Ref, data []byte) error { return s.Seed(ref, da
 
 // Fetch implements pft2.Fetcher; a miss registers a need and fails typed.
 func (s *Spool) Fetch(_ context.Context, ref pft2.Ref) ([]byte, error) {
-	if data, ok := s.objects[ref]; ok {
+	s.mu.Lock()
+	data, ok := s.objects[ref]
+	s.mu.Unlock()
+	if ok {
 		return data, nil
 	}
 	s.NeedDigest("sha256:"+ref.Hex(), int64(ref.Size))
@@ -303,10 +313,16 @@ func (s *Spool) Fetch(_ context.Context, ref pft2.Ref) ([]byte, error) {
 }
 
 // NeedDigest registers one missing content address.
-func (s *Spool) NeedDigest(digest string, size int64) { s.needs[digest] = size }
+func (s *Spool) NeedDigest(digest string, size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.needs[digest] = size
+}
 
 // Needs lists the missing digests registered by failed fetches.
 func (s *Spool) Needs() map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := make(map[string]int64, len(s.needs))
 	for k, v := range s.needs {
 		out[k] = v
@@ -315,10 +331,16 @@ func (s *Spool) Needs() map[string]int64 {
 }
 
 // Objects enumerates every spooled object in insertion order.
-func (s *Spool) Objects() []pft2.Ref { return append([]pft2.Ref(nil), s.order...) }
+func (s *Spool) Objects() []pft2.Ref {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]pft2.Ref(nil), s.order...)
+}
 
 // Bytes returns one object's bytes.
 func (s *Spool) Bytes(ref pft2.Ref) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, ok := s.objects[ref]
 	return data, ok
 }
@@ -436,31 +458,134 @@ type Materializer struct {
 	// same-branch base to copy from. Committed object bytes are identical
 	// either way.
 	DeltaClosures bool
+	// MaxClosureEdgeBytes bounds the produced-object adjacency the closure
+	// walk reads instead of re-fetching this run's own output. Zero selects
+	// defaultClosureEdgeBytes; NEGATIVE disables the cache entirely and makes
+	// every edge come back from a fetch. Exhausting (or disabling) the budget
+	// only costs speed: the fallback resolves the identical edges from the
+	// identical content-addressed bytes, which is exactly what the
+	// disable switch exists to prove.
+	MaxClosureEdgeBytes int64
 
-	// produced records every object written during the current Run when
-	// the delta-closure path is active.
+	// produced records every object written during the current Run, with its
+	// outgoing references decoded at production time. It is the WRITE side of
+	// the reduction (m.sink()); Spool stays exactly what the caller supplied
+	// and remains the read side.
 	produced *producedRecorder
+	// deltaClosures reports that THIS run bound an adopted base and may
+	// report O(delta) closures.
+	deltaClosures bool
 }
 
-// producedRecorder marks every object the reduction writes; the closure
-// delta is the reachable subset of exactly these.
+// sink is the reduction's write surface: the caller's Store behind the
+// recorder that notes what this run produces.
+func (m *Materializer) sink() Store { return m.produced }
+
+// producedRecorder marks every object the reduction writes and caches the
+// object graph edges it can already see. Two distinct jobs ride one wrapper:
+//
+//   - refs is the delta closure's admission predicate (membership only, and
+//     it must stay COMPLETE: a produced object missing here would make the
+//     restricted walk refuse to descend and under-report the closure);
+//   - edges is a bounded cache of each produced object's outgoing references,
+//     decoded from the very bytes being written. The closure walk runs AFTER
+//     the whole fold, by which time a multi-hundred-megabyte delta has long
+//     been evicted from the worker's bounded object LRU — so without this
+//     cache the walk re-downloads (and re-verifies) essentially every object
+//     the run just uploaded, one blocking round trip at a time. That single
+//     re-read was the dominant cost of a large cut.
+//
+// The cached edges are provably the edges a fetching walk would compute: the
+// bytes are content-addressed, so decoding them here and decoding them after
+// a round trip cannot disagree.
 type producedRecorder struct {
 	Store
-	refs map[pft2.Ref]bool
+	refs      map[pft2.Ref]struct{}
+	edges     map[pft2.Ref][]pft2.Ref
+	edgeBytes int64
+	edgeMax   int64
+}
+
+const (
+	// defaultClosureEdgeBytes bounds the produced-object adjacency cache. A
+	// 1 GiB fold produces ~19k objects whose widest nodes carry 16 children:
+	// ~12 MiB of edges, comfortably inside this budget.
+	defaultClosureEdgeBytes = 64 << 20
+	// edgeEntryBytes / edgeRefBytes are the accounting weights of one cached
+	// adjacency entry and one cached child reference.
+	edgeEntryBytes = 64
+	edgeRefBytes   = 48
+)
+
+func newProducedRecorder(store Store, edgeMax int64) *producedRecorder {
+	if edgeMax == 0 {
+		edgeMax = defaultClosureEdgeBytes
+	}
+	if edgeMax < 0 {
+		edgeMax = 0 // cache disabled: every edge comes back from a fetch
+	}
+	return &producedRecorder{
+		Store:   store,
+		refs:    map[pft2.Ref]struct{}{},
+		edges:   map[pft2.Ref][]pft2.Ref{},
+		edgeMax: edgeMax,
+	}
+}
+
+// record notes one produced object and caches its outgoing references. An
+// object whose bytes do not decode as a node is an opaque leaf — exactly the
+// conclusion a fetching walk reaches — and caches an empty edge list.
+func (r *producedRecorder) record(ref pft2.Ref, data []byte) {
+	if _, ok := r.refs[ref]; ok {
+		return
+	}
+	r.refs[ref] = struct{}{}
+	if r.edgeBytes >= r.edgeMax {
+		return
+	}
+	node, err := pft2.DecodeNode(data)
+	if err != nil {
+		r.edges[ref] = nil
+		r.edgeBytes += edgeEntryBytes
+		return
+	}
+	children := nodeChildren(node)
+	r.edges[ref] = children
+	r.edgeBytes += edgeEntryBytes + int64(len(children))*edgeRefBytes
+}
+
+// children reports one produced object's outgoing references without any
+// I/O. The second result is false when the object was not produced by this
+// run, or when the adjacency budget was already full when it was.
+func (r *producedRecorder) children(ref pft2.Ref) ([]pft2.Ref, bool) {
+	if r == nil {
+		return nil, false
+	}
+	children, ok := r.edges[ref]
+	return children, ok
+}
+
+// wrote reports whether this run produced the object.
+func (r *producedRecorder) wrote(ref pft2.Ref) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.refs[ref]
+	return ok
 }
 
 func (r *producedRecorder) Seed(ref pft2.Ref, data []byte) error {
-	r.refs[ref] = true
+	r.record(ref, data)
 	return r.Store.Seed(ref, data)
 }
 
 func (r *producedRecorder) PutNode(ref pft2.Ref, encoded []byte) error {
-	r.refs[ref] = true
+	r.record(ref, encoded)
 	return r.Store.PutNode(ref, encoded)
 }
 
 func (r *producedRecorder) PutPack(ref pft2.Ref, data []byte) error {
-	r.refs[ref] = true
+	r.record(ref, data)
 	return r.Store.PutPack(ref, data)
 }
 
@@ -468,6 +593,13 @@ func (r *producedRecorder) PutPack(ref pft2.Ref, data []byte) error {
 // needs and calls Run again (cursors + the content-addressed spool make the
 // rerun deterministic).
 func (m *Materializer) Run(ctx context.Context) (*Result, error) {
+	// Every reduction records what it writes: the closure walk that closes it
+	// must never pay a network round trip for an object this very run
+	// produced. A rerun (ErrNeedBlobs) starts from an empty record over the
+	// same caller-supplied store.
+	m.produced = newProducedRecorder(m.Spool, m.MaxClosureEdgeBytes)
+	m.deltaClosures = false
+
 	switch {
 	case m.Facts.SourceKind == "legacy_manifest":
 		return m.runLegacy(ctx, 0)
@@ -536,9 +668,10 @@ func (m *Materializer) runManaged(ctx context.Context) (*Result, error) {
 				}
 				if m.DeltaClosures {
 					// Every write from here on is delta: the base cut's
-					// registered closure covers the reused remainder.
-					m.produced = &producedRecorder{Store: m.Spool, refs: map[pft2.Ref]bool{}}
-					m.Spool = m.produced
+					// registered closure covers the reused remainder. Only an
+					// ADOPTED base licenses that; the recorder itself is
+					// always running (it also serves the closure walk).
+					m.deltaClosures = true
 				}
 			case "fork":
 				// A fork is a fresh generation origin by construction; a
@@ -933,7 +1066,7 @@ func (m *Materializer) foldJournalWithControl(
 	stagedThreshold := m.managedStagedByteThreshold()
 	chunkOps := 0
 	checkpoint := func() error {
-		res, err := editor.Commit(ctx, m.Spool, m.Spool)
+		res, err := editor.Commit(ctx, m.sink(), m.sink())
 		if err != nil {
 			return err
 		}
@@ -1005,14 +1138,14 @@ func (m *Materializer) foldJournalWithControl(
 			hexDigest(chain), m.Facts.CutDigest)
 	}
 
-	userXattrLeaves, err := buildXattrLeaves(engine.UserXattrs(), m.Spool)
+	userXattrLeaves, err := buildXattrLeaves(engine.UserXattrs(), m.sink())
 	if err != nil {
 		return nil, err
 	}
 	if err := editor.SetRootXattrLeaves(userXattrLeaves); err != nil {
 		return nil, err
 	}
-	res, err := commitOrEmptyFilesystem(ctx, editor, m.Spool)
+	res, err := commitOrEmptyFilesystem(ctx, editor, m.sink())
 	if err != nil {
 		return nil, err
 	}
@@ -1242,7 +1375,7 @@ func (m *Materializer) assemble(
 				Value: value,
 			})
 		}
-		builtRoot, _, builtCounts, err := pft2.BuildControlTree(entries, m.Spool)
+		builtRoot, _, builtCounts, err := pft2.BuildControlTree(entries, m.sink())
 		if err != nil {
 			return nil, err
 		}
@@ -1267,7 +1400,7 @@ func (m *Materializer) assemble(
 		return nil, err
 	}
 	controlRef := pft2.RefOf(encoded)
-	if err := m.Spool.PutNode(controlRef, encoded); err != nil {
+	if err := m.sink().PutNode(controlRef, encoded); err != nil {
 		return nil, err
 	}
 	controlRoot := &controlRef
@@ -1293,7 +1426,7 @@ func (m *Materializer) assemble(
 	// preserve metadata. RecoveryRoot carries the complete set, including
 	// parked open-after-unlink orphans that must survive authority adoption
 	// but must never leak into a user snapshot.
-	recoveryXattrLeaves, err := buildXattrLeaves(engine.Xattrs(), m.Spool)
+	recoveryXattrLeaves, err := buildXattrLeaves(engine.Xattrs(), m.sink())
 	if err != nil {
 		return nil, err
 	}
@@ -1311,7 +1444,7 @@ func (m *Materializer) assemble(
 		return nil, err
 	}
 	recoveryRef := pft2.RefOf(recoveryEncoded)
-	if err := m.Spool.PutNode(recoveryRef, recoveryEncoded); err != nil {
+	if err := m.sink().PutNode(recoveryRef, recoveryEncoded); err != nil {
 		return nil, err
 	}
 
@@ -1320,8 +1453,8 @@ func (m *Materializer) assemble(
 	// every ancestor of a changed node), so the restricted reachability is
 	// exactly "produced and reachable" with no fetch beyond the delta.
 	var include func(pft2.Ref) bool
-	if m.produced != nil {
-		include = func(ref pft2.Ref) bool { return m.produced.refs[ref] }
+	if m.deltaClosures {
+		include = m.produced.wrote
 	}
 	userSet := map[pft2.Ref]uint64{}
 	if err := m.closureInto(ctx, res.Root, userSet, nil, include); err != nil {
@@ -1356,7 +1489,7 @@ func (m *Materializer) assemble(
 		RecoveryObjectCount: uint64(len(recoveryClosure)),
 		RecoveryObjectBytes: recoveryBytes,
 		RecoveryClosure:     recoveryClosure,
-		DeltaClosures:       m.produced != nil,
+		DeltaClosures:       m.deltaClosures,
 	}, nil
 }
 
@@ -1407,46 +1540,103 @@ func buildXattrLeaves(rows []fstransition.XattrRow, sink Store) ([]pft2.Ref, err
 	return refs, nil
 }
 
+// closureFetchConcurrency bounds the object reads one closure walk has in
+// flight. Objects this run produced cost nothing (their edges were recorded
+// at production time); the remainder are genuinely reused base objects, and
+// each one is a database locate plus a verified store read. Walking those
+// one at a time made a cut over an inherited tree cost
+// objectCount × round-trip seconds no matter how little the cut captured.
+const closureFetchConcurrency = 32
+
 // closureInto walks the exact object graph from root (every edge re-verified
 // by decode) into out, skipping members of exclude (already accounted to the
 // other closure). A non-nil include restricts the walk to admitted refs
 // without descending past a refused one (delta closures: reused subtrees
 // are covered by the base cut's registered rows).
+//
+// The walk proceeds in waves. Each wave drains everything resolvable without
+// I/O — this run's own output, whose edges the producedRecorder already holds
+// — and collects the refs that must actually be read; those are then read
+// CONCURRENTLY and decoded, and their children seed the next wave. The result
+// is independent of scheduling: admission, insertion and error selection all
+// run on the single-threaded drain, so out is a pure function of the graph
+// and the first failure in deterministic wave order always wins.
 func (m *Materializer) closureInto(
 	ctx context.Context, root pft2.Ref, out map[pft2.Ref]uint64, exclude map[pft2.Ref]uint64,
 	include func(pft2.Ref) bool,
 ) error {
-	var visit func(ref pft2.Ref) error
-	visit = func(ref pft2.Ref) error {
+	admit := func(ref pft2.Ref) bool {
 		if _, ok := out[ref]; ok {
-			return nil
+			return false
 		}
 		if exclude != nil {
 			if _, ok := exclude[ref]; ok {
-				return nil
+				return false
 			}
 		}
-		if include != nil && !include(ref) {
-			return nil
-		}
-		raw, err := m.Spool.Fetch(ctx, ref)
-		if err != nil {
-			return err
-		}
-		out[ref] = uint64(len(raw))
-		node, err := pft2.DecodeNode(raw)
-		if err != nil {
-			// Packed data objects are opaque leaves.
-			return nil
-		}
-		for _, child := range nodeChildren(node) {
-			if err := visit(child); err != nil {
-				return err
-			}
-		}
-		return nil
+		return include == nil || include(ref)
 	}
-	return visit(root)
+
+	frontier := []pft2.Ref{root}
+	for len(frontier) > 0 {
+		// Drain: everything the recorder can answer resolves here, for free,
+		// and grows the same queue. What is left is the genuinely reused set.
+		var fetch []pft2.Ref
+		queue := frontier
+		frontier = nil
+		for len(queue) > 0 {
+			ref := queue[0]
+			queue = queue[1:]
+			if !admit(ref) {
+				continue
+			}
+			children, known := m.produced.children(ref)
+			if !known {
+				// Reserve the slot so a ref reached twice in one wave is read
+				// once, then read the bytes below.
+				out[ref] = ref.Size
+				fetch = append(fetch, ref)
+				continue
+			}
+			out[ref] = ref.Size
+			queue = append(queue, children...)
+		}
+		if len(fetch) == 0 {
+			continue
+		}
+
+		raws := make([][]byte, len(fetch))
+		errs := make([]error, len(fetch))
+		sem := make(chan struct{}, closureFetchConcurrency)
+		var wg sync.WaitGroup
+		for i, ref := range fetch {
+			wg.Add(1)
+			go func(i int, ref pft2.Ref) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if err := ctx.Err(); err != nil {
+					errs[i] = err
+					return
+				}
+				raws[i], errs[i] = m.Spool.Fetch(ctx, ref)
+			}(i, ref)
+		}
+		wg.Wait()
+		for i, ref := range fetch {
+			if errs[i] != nil {
+				return errs[i]
+			}
+			out[ref] = uint64(len(raws[i]))
+			node, err := pft2.DecodeNode(raws[i])
+			if err != nil {
+				// Packed data objects are opaque leaves.
+				continue
+			}
+			frontier = append(frontier, nodeChildren(node)...)
+		}
+	}
+	return nil
 }
 
 func sortedClosure(set map[pft2.Ref]uint64) ([]string, uint64) {
@@ -1597,7 +1787,7 @@ func (m *Materializer) runLegacy(ctx context.Context, asOfSeq uint64) (*Result, 
 	chunkBytes := int64(0)
 
 	flush := func() error {
-		res, err := editor.Commit(ctx, m.Spool, m.Spool)
+		res, err := editor.Commit(ctx, m.sink(), m.sink())
 		if err != nil {
 			return err
 		}
@@ -1684,7 +1874,7 @@ func (m *Materializer) runLegacy(ctx context.Context, asOfSeq uint64) (*Result, 
 		}
 	}
 
-	res, err := editor.Commit(ctx, m.Spool, m.Spool)
+	res, err := editor.Commit(ctx, m.sink(), m.sink())
 	if err != nil {
 		return nil, err
 	}

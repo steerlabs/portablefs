@@ -399,14 +399,18 @@ type cliWriteBackStatus struct {
 	// Drain-time credit control: the pacing state that distinguishes a
 	// flusher deliberately holding writers back from one that is not draining
 	// at all. PendingRecords alone cannot tell those apart.
-	CreditSetpoint int64               `json:"creditSetpoint"`
-	CreditDebt     int64               `json:"creditDebt"`
-	CreditCeiling  int64               `json:"creditCeiling"`
-	AppliedRateBps float64             `json:"appliedRateBps"`
-	CreditWaiters  int                 `json:"creditWaiters"`
-	DataLaneFull   bool                `json:"dataLaneFull"`
-	Delegations    []cliDelegationView `json:"delegations"`
-	ParkedWALs     []cliParkedWAL      `json:"parkedWals"`
+	CreditSetpoint int64   `json:"creditSetpoint"`
+	CreditDebt     int64   `json:"creditDebt"`
+	CreditCeiling  int64   `json:"creditCeiling"`
+	AppliedRateBps float64 `json:"appliedRateBps"`
+	CreditWaiters  int     `json:"creditWaiters"`
+	DataLaneFull   bool    `json:"dataLaneFull"`
+	// CapacityRefused is the authority's live capacity verdict: writes refuse
+	// with ENOSPC, reads/metadata/truncate keep working, and it clears by itself
+	// when the authority releases. Distinct from Degraded on purpose.
+	CapacityRefused bool                `json:"capacityRefused,omitempty"`
+	Delegations     []cliDelegationView `json:"delegations"`
+	ParkedWALs      []cliParkedWAL      `json:"parkedWals"`
 	// Degraded and LastFailure are the engine's sticky health verdict and the
 	// reason behind it. Without them `portablefs mounts --json` could show a
 	// mount with a small, stable backlog and no visible problem while the

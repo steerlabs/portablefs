@@ -444,17 +444,24 @@ func (s *cutStore) recordReceipts(receipts []CopyReceipt) error {
 	return nil
 }
 
-// readbackVerified is ReadVerified with propagation patience: it retries
-// ONLY histstore.ErrNotFound (the just-written key not yet visible to
-// readers) within the bounded backoff schedule above, so seconds of
-// eventual consistency stop costing whole attempt restarts. Any other
-// error, and absence that outlives the schedule, fail immediately.
-// (Throttling is absorbed inside the store itself — see
-// histstore.RetryPolicy — never here, so the two layers cannot multiply.)
+// readbackVerified is the read-after-write proof with propagation patience:
+// it retries ONLY histstore.ErrNotFound (the just-written key not yet visible
+// to readers) within the bounded backoff schedule above, so seconds of
+// eventual consistency stop costing whole attempt restarts. Any other error,
+// and absence that outlives the schedule, fail immediately. (Throttling is
+// absorbed inside the store itself — see histstore.RetryPolicy — never here,
+// so the two layers cannot multiply.)
+//
+// It STREAMS the proof (VerifyStream) rather than materializing the object:
+// the caller wants a yes/no, and the bytes were already in hand when the
+// upload started. Buffering a whole object per in-flight readback made the
+// upload wave's memory O(UploadConcurrency x domains x object size) — up to
+// 4 MiB apiece — which is precisely what pinned the concurrency ceiling that
+// bounds a cut's upload throughput.
 func readbackVerified(ctx context.Context, store histstore.Store, key string, size int64, digestHex string) error {
 	backoff := readbackInitialBackoff
 	for attempt := 0; ; attempt++ {
-		_, err := histstore.ReadVerified(ctx, store, key, size, digestHex)
+		err := histstore.VerifyStream(ctx, store, key, size, digestHex)
 		if err == nil || !errors.Is(err, histstore.ErrNotFound) || attempt >= readbackNotFoundRetries {
 			return err
 		}

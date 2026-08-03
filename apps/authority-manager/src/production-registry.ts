@@ -666,6 +666,12 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
   // owns every increment — the metrics module never reaches into it.
   private renewalsTotal = 0;
   private renewalFailuresTotal = 0;
+  // Renewals that SUCCEEDED but whose granted window was already shorter than
+  // TTL - interval: the control database is slow enough that the renewal
+  // schedule no longer has headroom. See applyRenewal.
+  private renewalsDegradedTotal = 0;
+  // The renewal cadence the liveness channel was started with (TTL/3).
+  private renewIntervalMs = 0;
   private childStartsTotal = 0;
   private childStartFailuresTotal = 0;
   private childUnexpectedExitsTotal = 0;
@@ -842,6 +848,7 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     startGateWaiters: number;
     renewalsTotal: number;
     renewalFailuresTotal: number;
+    renewalsDegradedTotal: number;
     childStartsTotal: number;
     childStartFailuresTotal: number;
     childUnexpectedExitsTotal: number;
@@ -865,6 +872,7 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       startGateWaiters: this.startGate.waiterCount(),
       renewalsTotal: this.renewalsTotal,
       renewalFailuresTotal: this.renewalFailuresTotal,
+      renewalsDegradedTotal: this.renewalsDegradedTotal,
       childStartsTotal: this.childStartsTotal,
       childStartFailuresTotal: this.childStartFailuresTotal,
       childUnexpectedExitsTotal: this.childUnexpectedExitsTotal,
@@ -1024,10 +1032,11 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
       );
     }
     this.heartbeat = heartbeat;
+    this.renewIntervalMs = Math.max(1_000, Math.floor(this.config.claimTtlMs / 3));
     await heartbeat.start({
       identity: this.identity,
       ttlMs: this.config.claimTtlMs,
-      intervalMs: Math.max(1_000, Math.floor(this.config.claimTtlMs / 3)),
+      intervalMs: this.renewIntervalMs,
       now: this.localNow,
       listeners: {
         onRenewed: (facts) => this.applyRenewal(facts),
@@ -1062,6 +1071,29 @@ export class ProductionAuthorityRegistry implements AuthorityRegistry {
     }
     this.renewalsTotal += 1;
     this.consecutiveRenewFailures = 0;
+    // THE EARLY WARNING (round 21c). The database reports its OWN cost
+    // honestly: dbTimeMs is the post-write clock (migration 038), so the
+    // granted window is the TTL minus however long the renewal statement
+    // actually took. That makes the schedule's stability condition directly
+    // observable, and it is exact rather than tuned: an attempt that starts
+    // at t and costs T yields a deadline of t + TTL - T, the next attempt
+    // starts at t + interval, so the deadline stays ahead of the schedule
+    // precisely while T < interval — i.e. while granted > TTL - interval.
+    // Below that the manager is still serving and still correct, but it is
+    // no longer self-stabilising, and THAT is the moment worth paging on.
+    // Before 038 this window was invisible: a renewal that cost too much was
+    // discarded outright, so the only signal was the fence itself.
+    const grantedMs = facts.claimExpiresAtDbMs - facts.dbTimeMs;
+    if (grantedMs < this.config.claimTtlMs - this.renewIntervalMs) {
+      this.renewalsDegradedTotal += 1;
+      this.log(
+        `PortableFS manager epoch ${this.identity.managerEpoch}: the claim renewal cost ${
+          this.config.claimTtlMs - grantedMs
+        }ms of its ${this.config.claimTtlMs}ms TTL (granted ${grantedMs}ms, renewal interval ${
+          this.renewIntervalMs
+        }ms); the control database is slow enough that the renewal schedule is no longer self-stabilising.`
+      );
+    }
     // currentClaimDeadline() may already carry this renewal (an isolated
     // channel publishes to shared memory before it posts), so compare against
     // the folded value and re-arm on any forward move.

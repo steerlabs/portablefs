@@ -190,10 +190,34 @@ func (s staticStore) Get(context.Context, string) (io.ReadCloser, int64, error) 
 func (s staticStore) Head(context.Context, string) (int64, error) { return 0, histstore.ErrNotFound }
 func (s staticStore) Delete(context.Context, string) error        { return nil }
 
-func TestDefaultsUseFullBoundedUploadConcurrency(t *testing.T) {
+// Upload concurrency is a cut's throughput knob, and the ceiling used to sit
+// at 32 because every in-flight readback buffered a whole object. It streams
+// now, so the ceiling reflects what a store can be asked to absorb rather
+// than what the worker can hold; the DEFAULT stays well under it, because
+// saturating a shared bucket is an operator's decision, not a default.
+func TestUploadConcurrencyDefaultLeavesHeadroomUnderTheCeiling(t *testing.T) {
 	cfg := Config{}.withDefaults()
-	if cfg.UploadConcurrency != 32 {
-		t.Fatalf("upload concurrency = %d, want the validated maximum 32", cfg.UploadConcurrency)
+	if cfg.UploadConcurrency != 64 {
+		t.Fatalf("upload concurrency default = %d, want 64", cfg.UploadConcurrency)
+	}
+	base := func(n int) Config {
+		return Config{
+			DSN: "postgres://worker:secret@localhost/pfs", WorkerID: "worker",
+			ExpectedPolicyEpoch: 1, UploadConcurrency: n,
+			Stores: []StoreConfig{
+				{FailureDomain: "a", Kind: "fs", RootDir: "/tmp/history-a"},
+				{FailureDomain: "b", Kind: "fs", RootDir: "/tmp/history-b"},
+			},
+		}.withDefaults()
+	}
+	if err := base(256).Validate(); err != nil {
+		t.Fatalf("the ceiling must be reachable by an operator: %v", err)
+	}
+	if err := base(257).Validate(); err == nil {
+		t.Fatal("upload concurrency above the ceiling was accepted")
+	}
+	if err := base(cfg.UploadConcurrency).Validate(); err != nil {
+		t.Fatalf("the default must validate: %v", err)
 	}
 }
 

@@ -107,6 +107,7 @@ export {
   parseChildExposition,
   type ChildMetricSpec,
   type ChildParseResult,
+  type ChildParseSkips,
   type ChildScrapeTarget,
 } from "./child-metrics.js";
 export { ManagerMetrics } from "./manager-metrics.js";

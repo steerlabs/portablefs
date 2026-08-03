@@ -1882,6 +1882,17 @@ func (e *Engine) WriteAppend(ctx context.Context, path string, data []byte) (Res
 // progress — when the hard cap (rather than the credit gate) was the binding
 // constraint. `at` resolves the write offset under e.mu.
 func (e *Engine) pacedWrite(ctx context.Context, path string, data []byte, at func(*fileView) int64) (Result, bool, error) {
+	// THE CAPACITY GATE, ASKED WHERE "WRITE" IS THE OPERATION. The credit
+	// controller is frozen under a capacity refusal and would answer this on its
+	// own, but only for a write that actually consults it: a frontend that
+	// acquired its credit BEFORE the refusal carries the grant on its ctx and
+	// takes it below without asking the ledger anything. That grant is still
+	// real credit and would still be spent, so a refused mount would keep
+	// acknowledging bytes it has just been told the authority cannot hold.
+	// Asking here makes ENOSPC the answer for every write, granted or not.
+	if err := e.CapacityRefusal(); err != nil {
+		return Result{}, true, err
+	}
 	want := int64(len(data))
 	// A frontend that already took credit before its own locks passes it down;
 	// consume that grant once instead of charging twice. TAKING it here (rather
@@ -2789,7 +2800,13 @@ type Status struct {
 	// DataLaneFull reports the bulk-data lane sitting at its hard cap while the
 	// metadata reserve still holds.
 	DataLaneFull bool
-	Jobs         []RecoveryJob
+	// CapacityRefused reports a live capacity verdict from the AUTHORITY: a
+	// bounded store over there is full, so this mount refuses new bytes with
+	// ENOSPC while reads, metadata and releasing truncates keep working. It is
+	// deliberately distinct from Degraded (a far end that stopped answering) and
+	// from a terminal park: it clears by itself when the authority releases.
+	CapacityRefused bool
+	Jobs            []RecoveryJob
 	// UnrecoveredRecords/UnrecoveredBytes are the share of PendingRecords/
 	// PendingBytes that belongs to PARKED or CONTAINED recovery jobs rather
 	// than to the live stream: acknowledged, locally durable, and not at the

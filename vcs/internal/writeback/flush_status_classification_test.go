@@ -23,11 +23,26 @@ type statusRemote struct {
 	calls  int
 }
 
-func (r *statusRemote) Flush(context.Context, FlushRequest) (FlushReply, error) {
+func (r *statusRemote) Flush(ctx context.Context, req FlushRequest) (FlushReply, error) {
 	r.mu.Lock()
 	r.calls++
+	status := r.status
 	r.mu.Unlock()
-	return FlushReply{Status: r.status}, nil
+	if status == 0 {
+		// The authority released whatever it was refusing for and now applies
+		// normally. Delegating to the fake keeps the watermark arithmetic real,
+		// which is what a relief test has to exercise.
+		return r.fakeAuthority.Flush(ctx, req)
+	}
+	return FlushReply{Status: status}, nil
+}
+
+// setStatus retunes the fixture mid-test: the authority's bounded store is
+// relieved (0) or refuses again.
+func (r *statusRemote) setStatus(status int32) {
+	r.mu.Lock()
+	r.status = status
+	r.mu.Unlock()
 }
 
 func (r *statusRemote) flushCalls() int {

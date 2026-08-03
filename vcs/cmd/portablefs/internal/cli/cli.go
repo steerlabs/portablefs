@@ -179,6 +179,7 @@ func commands() []command {
 		{"mount", "mount a live volume on this machine", cmdMount},
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
+		{"recovery", "list and resolve a mount's write-back recovery jobs", cmdRecovery},
 		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},
 		{"lifecycle", "hold the internal mount/update lifecycle guard", cmdLifecycle},
 		{"install-macos-app", "install the signed macOS app bundle", cmdInstallMacOSApp},

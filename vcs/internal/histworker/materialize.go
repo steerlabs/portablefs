@@ -23,6 +23,10 @@ import (
 // still reach the database or the row dies silently on lease expiry.
 const settleTimeout = 30 * time.Second
 
+// locateBatch is the digest page size of one pfh.object_locate_batch call —
+// the surface's own documented ceiling (repo.Repository.LocateObjects).
+const locateBatch = 512
+
 // heartbeatRetries bounds the rapid in-tick retry train after a failed
 // lease renewal. Each retry backs off HeartbeatInterval/8, doubling, so
 // the full train (1/8+1/4+1/2) always completes before the next regular
@@ -119,7 +123,15 @@ func (w *Worker) materializeClaim(rootCtx, ctx context.Context, claim CutClaim) 
 			"uploadedObjects": store.ObjectsUploaded.Load(),
 			"uploadedBytes":   store.BytesUploaded.Load(),
 			"skippedObjects":  store.ObjectsSkipped.Load(),
-			"elapsedMs":       time.Since(started).Milliseconds(),
+			// fetchedObjects is the cut's read amplification: every one is a
+			// database locate plus a verified store read, and it is what
+			// decides whether a cut can outrun a sustained writer. It counts
+			// ONLY genuinely reused base objects — the reduction resolves its
+			// own output's graph edges without reading anything back — so a
+			// chained cut over an adopted base should report a number
+			// proportional to the paths it touched, never to the tree size.
+			"fetchedObjects": store.ObjectsFetched.Load(),
+			"elapsedMs":      time.Since(started).Milliseconds(),
 		})
 	case rootCtx.Err() != nil:
 		// Worker shutdown: nothing settles by local assertion on the way
@@ -404,13 +416,40 @@ func (w *Worker) addClosure(ctx context.Context, claim CutClaim, closure string,
 // digest in closure order regardless of scheduling.
 func (w *Worker) proveClosure(ctx context.Context, claim CutClaim, store *cutStore, digests []string) error {
 	freshFloor := claim.DbTimeMs - w.cfg.FreshenAge.Milliseconds()
-	sem := make(chan struct{}, w.cfg.UploadConcurrency)
-	proofErrs := make([]error, len(digests))
-	var wg sync.WaitGroup
-	for i, digest := range digests {
+
+	// Only the reused remainder needs proving; this run's uploads carry a
+	// read-after-write receipt already.
+	reused := make([]string, 0, len(digests))
+	for _, digest := range digests {
 		if _, uploadedNow := store.UploadedIncarnation(digest); uploadedNow {
-			continue // receipted with read-after-write proof during upload
+			continue
 		}
+		reused = append(reused, digest)
+	}
+	if len(reused) == 0 {
+		return nil
+	}
+
+	// Resolve every registration in bounded BATCHES first. One locate per
+	// object turned a cut over a large inherited tree into thousands of
+	// separate database round trips before a single byte was verified; the
+	// batch surface answers the same rows in one statement per 512.
+	located := make(map[string]*ObjectLocation, len(reused))
+	for start := 0; start < len(reused); start += locateBatch {
+		end := min(start+locateBatch, len(reused))
+		page, err := w.repo.LocateObjects(ctx, claim.TenantID, "pft2", reused[start:end])
+		if err != nil {
+			return err
+		}
+		for digest, loc := range page {
+			located[digest] = loc
+		}
+	}
+
+	sem := make(chan struct{}, w.cfg.UploadConcurrency)
+	proofErrs := make([]error, len(reused))
+	var wg sync.WaitGroup
+	for i, digest := range reused {
 		wg.Add(1)
 		go func(i int, digest string) {
 			defer wg.Done()
@@ -420,7 +459,7 @@ func (w *Worker) proveClosure(ctx context.Context, claim CutClaim, store *cutSto
 				proofErrs[i] = err
 				return
 			}
-			proofErrs[i] = w.proveOne(ctx, claim, store, digest, freshFloor)
+			proofErrs[i] = w.proveOne(ctx, claim, store, digest, located[digest], freshFloor)
 		}(i, digest)
 	}
 	wg.Wait()
@@ -432,11 +471,7 @@ func (w *Worker) proveClosure(ctx context.Context, claim CutClaim, store *cutSto
 	return nil
 }
 
-func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, digest string, freshFloor int64) error {
-	loc, err := w.repo.LocateObject(ctx, claim.TenantID, "pft2", digest)
-	if err != nil {
-		return err
-	}
+func (w *Worker) proveOne(ctx context.Context, claim CutClaim, store *cutStore, digest string, loc *ObjectLocation, freshFloor int64) error {
 	if loc == nil {
 		return fmt.Errorf("histworker: closure object %s has no registration", digest)
 	}

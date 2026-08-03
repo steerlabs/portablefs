@@ -2177,7 +2177,20 @@ func cmdUmount(e *cmdEnv, args []string) int {
 				detail = "the recorded FSKit mount has no exact attach identity, so PortableFS cannot prove a clean drain"
 			}
 			if force {
-				return e.fail("umount", fmt.Errorf("%s; --force cannot durably park a tail without its exact owner/attach, so state and intent were preserved", detail))
+				// A DEAD END NEEDS AN EXIT NAMED ON IT. This is the state the
+				// live transcript reached after kill -9 + daemon restart, and it
+				// used to end here: no command named, and --discard-record's own
+				// refusal pointed back at --force. Both remaining moves are
+				// stated, in the order they apply.
+				return e.fail("umount", fmt.Errorf(
+					"%s; --force cannot durably park a tail without its exact owner/attach, so state and intent were preserved.\n"+
+						"Inspect what the local store still holds with\n"+
+						"    portablefs recovery list %s\n"+
+						"resolve any terminally conflict/corrupt job with\n"+
+						"    portablefs recovery resolve %s --all-terminal\n"+
+						"and, once nothing owns the path any more, end the bookkeeping with\n"+
+						"    portablefs umount --discard-record %s",
+					detail, mountPath, mountPath, mountPath))
 			}
 			return e.fail("umount", fmt.Errorf("%s; nothing was unmounted and state was preserved (retry with `portablefs umount --force %s` only while its exact owner/attach remains available to park any durable recovery tail)", detail, mountPath))
 		}
@@ -3080,6 +3093,20 @@ func (e *cmdEnv) forceParkAbandonedFUSEMount(stateDir string, st *mountState) ([
 		"explicit forced FUSE unmount after exact owner death",
 	)
 	if err != nil {
+		if errors.Is(err, writeback.ErrRecoveryResolutionRequired) {
+			// The FUSE half of the same cycle. See recoverycmd.go: this refusal
+			// named a resolution that had no command, and --discard-record's
+			// refusal pointed straight back here.
+			return nil, fmt.Errorf(
+				"durably park abandoned FUSE store: %w\n"+
+					"this job blocks force-park and every attach until it is resolved. Inspect it with\n"+
+					"    portablefs recovery list %s\n"+
+					"and resolve it with\n"+
+					"    portablefs recovery resolve %s --all-terminal\n"+
+					"which quarantines the job's bytes (nothing is deleted) and reports exactly what was lost",
+				err, st.MountPath, st.MountPath,
+			)
+		}
 		return nil, fmt.Errorf("durably park abandoned FUSE store: %w", err)
 	}
 	jobID := ""

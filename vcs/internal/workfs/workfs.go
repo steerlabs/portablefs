@@ -236,6 +236,11 @@ type FS struct {
 	dirtyBytes    int64
 	dirtyReserved int64
 	dirtyMax      int64
+	// dirtyPacePercent places the PACING SETPOINT as a percentage of dirtyMax
+	// (0 = pacing disabled). dirtyMax is the emergency invariant; the
+	// setpoint is where write admission starts being held to the rate at
+	// which resident bytes are actually released. See dirtypace.go.
+	dirtyPacePercent int
 
 	// applySeq is the journal LSN of the record CURRENTLY being applied under
 	// mu. Every apply site (managed live apply, managed cold replay, and the
@@ -250,6 +255,12 @@ type FS struct {
 	// foldMu serialises fold passes. It is NOT part of the tree lock order:
 	// FoldToBase takes it OUTSIDE mu and never holds mu across a base resolve.
 	foldMu sync.Mutex
+
+	// pace holds write admission to the rate at which resident dirty bytes
+	// are actually released. It shares NO lock with mu — a writer waiting for
+	// memory under mu would block the fold that is the only thing able to
+	// wake it — and is therefore always consulted in the pre-lock region.
+	pace *dirtyPacer
 
 	// coherence versioning (independent of epoch): a per-process generation nonce plus a
 	// monotonic version assigned to every mutation and stamped on the affected inode. A
@@ -344,6 +355,7 @@ func NewWithCache(entries []backend.Entry, blobs content.BlobReader, w *wal.WAL,
 		byIno:        map[uint64]*inode{},
 		xattrs:       map[uint64]map[string][]byte{},
 		deadBaseInos: map[uint64]struct{}{},
+		pace:         newDirtyPacer(),
 	}
 	fs.byIno[1] = fs.root
 	sorted := append([]backend.Entry(nil), entries...)

@@ -755,3 +755,104 @@ func TestBootstrapFrameRoundTripsAndIsBounded(t *testing.T) {
 		t.Fatalf("oversized bootstrap must be refused before writing, err=%v written=%d", err, refused.Len())
 	}
 }
+
+// --- the lease-facts probe budget (round 21c) -------------------------------
+
+// budgetProber records the context deadline it was handed for each probe, so
+// the DERIVED budget can be asserted directly instead of inferred from timing.
+type budgetProber struct {
+	mu      sync.Mutex
+	facts   LeaseFacts
+	budgets []time.Duration
+}
+
+func (p *budgetProber) ProbeLeaseFacts(ctx context.Context) (LeaseFacts, error) {
+	deadline, ok := ctx.Deadline()
+	p.mu.Lock()
+	if ok {
+		p.budgets = append(p.budgets, time.Until(deadline).Round(time.Second))
+	} else {
+		p.budgets = append(p.budgets, 0)
+	}
+	facts := p.facts
+	p.mu.Unlock()
+	return facts, nil
+}
+
+func (p *budgetProber) seen() []time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Duration(nil), p.budgets...)
+}
+
+// TestProbeBudgetIsDerivedFromTheArmedDeadline is the round-21c fix, one layer
+// below the manager's own renewal. The budget used to be a flat 5 s, and on
+// 2026-08-02 at 22:06:34 a child threw away a lease-facts answer to a
+// WAL-saturated Postgres on that constant and fenced 13 s later — while the
+// manager itself was healthy with 18.7 s of hard deadline left. A probe may
+// now run for as long as the deadline it exists to extend: any less discards
+// a proof that was still usable, any more cannot help because the guard has
+// already fenced.
+func TestProbeBudgetIsDerivedFromTheArmedDeadline(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	// Nothing armed yet: startup behaviour is deliberately unchanged from the
+	// flat constant this replaces — the only unarmed probe is the very first
+	// one, and its wait is bounded separately by firstLeaseFrameTimeout.
+	if got := probeBudget(time.Time{}, now); got != unarmedProbeBudget {
+		t.Fatalf("unarmed budget = %v, want %v", got, unarmedProbeBudget)
+	}
+	// The ordinary case: a 30 s claim minus a 2 s guard leaves 28 s, and the
+	// probe gets all 28 — well past the constant it replaces.
+	if got := probeBudget(now.Add(28*time.Second), now); got != 28*time.Second {
+		t.Fatalf("armed budget = %v, want 28s", got)
+	}
+	if probeBudget(now.Add(28*time.Second), now) <= 5*time.Second {
+		t.Fatal("the derived budget must exceed the flat 5s constant it replaces")
+	}
+	// A nearly-expired deadline still yields a usable, non-zero context.
+	if got := probeBudget(now.Add(10*time.Millisecond), now); got != minProbeBudget {
+		t.Fatalf("near-expiry budget = %v, want %v", got, minProbeBudget)
+	}
+	// An already-passed deadline never yields a negative context.
+	if got := probeBudget(now.Add(-time.Hour), now); got != minProbeBudget {
+		t.Fatalf("expired budget = %v, want %v", got, minProbeBudget)
+	}
+	// A pathologically long claim is clamped, so a wedged query cannot
+	// occupy the single grounder indefinitely.
+	if got := probeBudget(now.Add(time.Hour), now); got != maxProbeBudget {
+		t.Fatalf("long-claim budget = %v, want %v", got, maxProbeBudget)
+	}
+}
+
+// TestGroundingHandsTheProbeTheDerivedBudget proves the derivation reaches the
+// actual query, not just the helper: the first probe (nothing armed) gets the
+// cap, and the next one gets the window the previous grounding armed.
+func TestGroundingHandsTheProbeTheDerivedBudget(t *testing.T) {
+	guard := NewGuard(testIdentity(), 2*time.Second)
+	clock := newFakeClock()
+	guard.now = clock.now
+	prober := &budgetProber{facts: currentFacts(1_000_000, 1_030_000)} // 30s remain
+	guard.SetProber(prober)
+
+	if err := observeSettled(t, guard, baseFrame()); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	next := baseFrame()
+	next.Seq = 2
+	if err := observeSettled(t, guard, next); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+
+	budgets := prober.seen()
+	if len(budgets) != 2 {
+		t.Fatalf("probes = %d, want 2", len(budgets))
+	}
+	if budgets[0] != unarmedProbeBudget {
+		t.Fatalf("first probe budget = %v, want %v (nothing armed yet)", budgets[0], unarmedProbeBudget)
+	}
+	// 30s of claim minus the 2s guard.
+	if budgets[1] != 28*time.Second {
+		t.Fatalf("second probe budget = %v, want 28s (the armed deadline)", budgets[1])
+	}
+}

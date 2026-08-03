@@ -342,7 +342,22 @@ Memory tuning: `VCS_CACHE_RAM_MB` (default 256) sizes the read cache, and
 resident memory of uncommitted dirty file blocks — dirty blocks materialise at
 4 MiB granularity, so unbounded they are the process's dominant RAM cost.
 Writes past the bound refuse with `ENOSPC`; reads, truncates, and metadata
-operations always keep working. Both knobs pass to managed children through
+operations always keep working. That is a mount-level guarantee and not a
+description of intent: a capacity refusal from the authority freezes the mount's
+DATA CREDIT gate and nothing else, so a write gets a definite `ENOSPC` before it
+takes a lock while `read`, `stat`, `ls`, `mkdir`, `chmod` and — critically —
+`truncate` are never consulted against it. Truncate is the remedy for this
+condition (it is what hands the authority's resident dirty blocks back), so it
+must not be refused BY the condition. Note that `rm` is not the remedy on a
+managed authority: an unlinked inode parks until reap and releases nothing.
+
+The refusal is also relievable rather than terminal. It is a statement about the
+authority's occupancy at one instant, so the mount keeps re-offering the refused
+batch on a slow probe; the first batch the authority applies clears the refusal
+and re-admits writes with no remount. `portablefs mounts --json` reports it as
+`capacityRefused` — distinct from a degraded mount (a far end that stopped
+answering) and from a parked stream (a proven contradiction that fences the
+mount until remount). Both knobs pass to managed children through
 the manager's `PORTABLEFS_MANAGED_VCS_EXTRA_ENV_JSON` allowlist. The manager +
 PostgreSQL journal is the ONLY authority shape: there is no standalone
 file-WAL VCS.
@@ -397,6 +412,36 @@ AMPLIFICATION: one byte written into each 4 MiB region materialises a whole
 block per ~40 journal bytes, which no fraction of a journal quota can track.
 For that shape the fold still recovers the memory at each adoption, and a
 burst that outruns any cut cadence still lands on the definite `ENOSPC`.
+
+## Unmount Recovery (When `--force` Refuses)
+
+A mount's unshipped tail lives in a local write-back store as a RECOVERY JOB.
+Almost every job needs nothing from you: the next attach of the same
+volume+branch verifies and replays it. Two states do not — `conflict` and
+`corrupt` — and a job in either of them blocks `portablefs umount --force` and
+every future attach until an operator resolves it.
+
+```
+portablefs umount <path>                          # clean drain; refuses if it cannot drain
+portablefs umount --force <path>                  # detach now; the tail parks as a recovery job
+portablefs recovery list <path>                   # what the local store holds, and what is blocking
+portablefs recovery resolve <path> --all-terminal # resolve the terminal jobs
+portablefs umount --discard-record <path>         # end the bookkeeping once nothing owns the path
+```
+
+`recovery list` takes no lock and changes nothing, so it answers while a daemon
+still owns the store. `recovery resolve` NEVER deletes: a terminal job's bytes
+are the only remaining copy of what was acknowledged, so it moves them to
+`<store>/unreplayable/`, reports exactly how many acknowledged records and bytes
+never reached the authority and under which scopes, and leaves that verdict on
+disk so it is re-reported on every later attach. It refuses any job that is not
+proven terminal, any store a live engine still owns, and any stream whose
+recorded identity does not match the store. Name the job with `--job` or say
+`--all-terminal`; there is no default, because quarantining acknowledged bytes is
+a data decision.
+
+Never move or delete anything under the state directory by hand. If a refusal
+names a command, that command exists and can make progress.
 
 ## Maintenance Jobs (GC And Integrity)
 

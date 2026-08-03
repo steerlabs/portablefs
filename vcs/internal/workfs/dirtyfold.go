@@ -126,6 +126,18 @@ import (
 // it was given, through the content.BlobReader/Ranger it already holds. That
 // is why this is buildable where an in-process checkpoint is not.
 
+// These are registered at PACKAGE INIT, so every managed child exposes all
+// four on /metrics from the moment it starts — even at zero, before a fold has
+// ever run. That makes them part of the child's published exposition, and the
+// authority-manager aggregates child metrics through a CLOSED ALLOWLIST:
+// apps/authority-manager/src/child-metrics.ts must declare each name with an
+// explicit aggregator or the manager drops the line.
+//
+// Adding a metric here therefore has a second, non-optional half. A test
+// derives this file's registrations from source and fails if the allowlist has
+// not kept up (child-metrics.test.ts, "every metric name the Go child
+// registers is allowlisted"). Do not add a metrics.Default.* registration in
+// any package the child binary links without adding it there too.
 var (
 	dirtyFoldReleasedTotal = metrics.Default.Counter("vcs_dirty_fold_released_bytes")
 	dirtyFoldBlocksTotal   = metrics.Default.Counter("vcs_dirty_fold_blocks")
@@ -173,7 +185,15 @@ type FoldReport struct {
 	Absent        int   // candidates the base does not contain
 	Raced         int   // candidates a concurrent write/truncate/reap disqualified
 	Failed        int   // candidates whose base resolve failed (retried next pass)
+	Deferred      int   // candidates MaxInodes left for the next pass
 	Resident      int64 // fs.dirtyBytes after the pass
+	// Retryable reports that this pass left FOLDABLE work at this watermark —
+	// a resolve failure, a cancellation, or a MaxInodes-bounded candidate list
+	// it made progress through. The folded watermark is deliberately NOT
+	// advanced then, so the driver's next tick runs another pass at the SAME
+	// watermark instead of parking the remaining blocks until a later
+	// adoption. Relief that waits on the next cut is not relief.
+	Retryable bool
 }
 
 // foldCandidate is one inode selected for a pass.
@@ -335,6 +355,7 @@ func (fs *FS) FoldToBase(ctx context.Context, base FoldBase) (FoldReport, error)
 		return candidates[i].ino < candidates[j].ino
 	})
 	if base.MaxInodes > 0 && len(candidates) > base.MaxInodes {
+		report.Deferred = len(candidates) - base.MaxInodes
 		candidates = candidates[:base.MaxInodes]
 	}
 
@@ -369,13 +390,30 @@ func (fs *FS) FoldToBase(ctx context.Context, base FoldBase) (FoldReport, error)
 		report.BytesReleased += bytes
 	}
 
+	// A skip is not a skip. The watermark used to advance unconditionally, on
+	// the reasoning that "a LATER cut will cover it" — and the driver refuses
+	// a second pass at a watermark it has already folded, so every deferral
+	// became a wait for the NEXT ADOPTION. Two of the three deferral shapes
+	// are ordinary, not exceptional: a bounded pass (MaxInodes) leaves the
+	// tail of a wide namespace behind, and a single object-store blip defers
+	// whatever it touched. On a pressure-relief path that turns a transient
+	// error into minutes of retained memory and silently caps the relief
+	// RATE at MaxInodes inodes per adoption — the FoldReport.Failed doc
+	// ("retried next pass") and the MaxInodes doc ("the next tick takes the
+	// rest") both described behaviour the code did not have.
+	//
+	// So the watermark advances only when this pass left nothing foldable at
+	// it. Absent and Raced still advance — an absent inode is absent from
+	// THIS base permanently, and a raced inode's newer blocks sit above this
+	// watermark and would be refused by an identical repeat. A deferral is
+	// only worth retrying when the pass PROVED it can make progress
+	// (Inodes > 0) or when the failure was transient (Failed > 0); the
+	// progress condition is what stops a candidate set that is entirely
+	// absent/raced from looping forever at one watermark.
+	report.Retryable = report.Failed > 0 || (report.Deferred > 0 && report.Inodes > 0)
+
 	fs.mu.Lock()
-	// The folded watermark advances even when individual inodes were skipped:
-	// every skip is either a racing writer (whose blocks are ABOVE this
-	// watermark and would be skipped by a repeat pass identically) or an
-	// absent/failed inode a LATER cut will cover. Holding the watermark back
-	// would only make the next adoption redo the same resolves.
-	if base.Watermark > fs.foldWatermark {
+	if !report.Retryable && base.Watermark > fs.foldWatermark {
 		fs.foldWatermark = base.Watermark
 	}
 	report.Resident = fs.dirtyBytes
@@ -384,7 +422,9 @@ func (fs *FS) FoldToBase(ctx context.Context, base FoldBase) (FoldReport, error)
 	dirtyFoldPassesTotal.Inc()
 	dirtyFoldBlocksTotal.Add(int64(report.Blocks))
 	dirtyFoldReleasedTotal.Add(report.BytesReleased)
-	dirtyFoldWatermark.Set(int64(base.Watermark))
+	// The gauge reports the watermark actually FOLDED TO, not the one offered:
+	// a retryable pass has not folded this watermark and must not claim it.
+	dirtyFoldWatermark.Set(int64(fs.FoldedWatermark()))
 	return report, firstErr
 }
 

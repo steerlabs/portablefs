@@ -489,7 +489,11 @@ export interface ManagerControlStore {
     operationId: string;
     tenantKey: string;
     leaseId: string;
-    expectedControlSeq: AccessLeaseControlSeq | null;
+    // Exact CAS, and REQUIRED: pfm.access_release refuses a missing
+    // precondition with PF008 before it looks at anything else, and the
+    // release wire contract has no field a caller could use to supply one.
+    // Making it non-nullable here is what keeps that refusal unreachable.
+    expectedControlSeq: AccessLeaseControlSeq;
   }): Promise<AccessOperationResult>;
 
   accessRevoke(args: {
@@ -1619,7 +1623,7 @@ export class PostgresManagerControlStore implements ManagerControlStore {
     operationId: string;
     tenantKey: string;
     leaseId: string;
-    expectedControlSeq: AccessLeaseControlSeq | null;
+    expectedControlSeq: AccessLeaseControlSeq;
   }): Promise<AccessOperationResult> {
     return parseAccessOperationResult(
       await this.call(
@@ -2798,9 +2802,23 @@ export class InMemoryManagerControlStore implements ManagerControlStore {
     operationId: string;
     tenantKey: string;
     leaseId: string;
-    expectedControlSeq: string | null;
+    expectedControlSeq: AccessLeaseControlSeq;
   }): Promise<AccessOperationResult> {
     await this.enter("accessRelease");
+    // Mirrors pfm.access_release's FIRST statement exactly, including its
+    // position: the CAS precondition is required, and it is demanded before
+    // the receipt claim, the lease lookup and the state check. This double
+    // used to tolerate null while the SQL raised PF008 on it, so every test
+    // passed and production answered HTTP 400 on a path whose only job is to
+    // end a lease (round 21c). A double that is laxer than the ledger it
+    // stands in for cannot catch the bug it is there to catch.
+    if (
+      args.expectedControlSeq === null ||
+      args.expectedControlSeq === undefined ||
+      BigInt(args.expectedControlSeq) < 1n
+    ) {
+      throw new InvalidControlArgumentError("release expected control sequence is required");
+    }
     const now = this.requireManager(args.identity);
     const receiptFingerprint = serverFingerprint("access-release", [args.tenantKey, args.leaseId]);
     const replay = this.receiptClaim(args.tenantKey, "access", args.operationId, receiptFingerprint);
@@ -2817,7 +2835,7 @@ export class InMemoryManagerControlStore implements ManagerControlStore {
     if (effective.state !== "active") {
       throw new AccessLeaseNotActiveError(`access lease ${args.leaseId} is ${effective.state}`, effective);
     }
-    if (args.expectedControlSeq !== null && lease.controlSeq.toString(10) !== args.expectedControlSeq) {
+    if (lease.controlSeq.toString(10) !== args.expectedControlSeq) {
       throw new ControlOperationConflictError(
         `access lease ${args.leaseId} control seq is ${lease.controlSeq} (caller expected ${args.expectedControlSeq})`,
         this.leaseFacts(lease)

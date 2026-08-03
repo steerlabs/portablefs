@@ -62,12 +62,26 @@ func TestCapacityStatusIsDefiniteNotRetriedForever(t *testing.T) {
 				t.Fatalf("status %d produced %d flush attempts; a definite capacity "+
 					"refusal must not be re-offered indefinitely", tc.status, n)
 			}
-			// Every subsequent mutation carries the same definite answer, so
-			// the frontend's errno mapping (clientcore statusErr, which tests
+			// Every subsequent WRITE carries the same definite answer, so the
+			// frontend's errno mapping (clientcore statusErr, which tests
 			// ErrNoSpace before its EIO default) answers ENOSPC.
-			if merr := e.MutationError(); !errors.Is(merr, ErrNoSpace) {
-				t.Fatalf("status %d left MutationError = %v, want ErrNoSpace so writes "+
-					"fail as ENOSPC instead of EIO", tc.status, merr)
+			//
+			// Round 21b moved this assertion off MutationError deliberately.
+			// MutationError is the mount-lifetime FAIL-CLOSED latch, and it is
+			// consulted by clientcore's beginExactOperation — the gate in front
+			// of the exact-handle read, getattr and getxattr paths, and in front
+			// of Truncate. Latching it here delivered "the application sees
+			// ENOSPC" as "ls, stat, read and the documented truncate remedy are
+			// all EIO until remount". The verdict now lives on CapacityRefusal,
+			// which is asked by writes and by nothing else. See
+			// capacity_degradation_test.go for the full contract.
+			if merr := e.MutationError(); merr != nil {
+				t.Fatalf("status %d fail-closed the engine (MutationError = %v); a "+
+					"capacity refusal must not fence the mount", tc.status, merr)
+			}
+			if cerr := e.CapacityRefusal(); !errors.Is(cerr, ErrNoSpace) {
+				t.Fatalf("status %d left CapacityRefusal = %v, want ErrNoSpace so writes "+
+					"fail as ENOSPC instead of EIO", tc.status, cerr)
 			}
 		})
 	}

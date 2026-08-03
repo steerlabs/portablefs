@@ -258,8 +258,14 @@ func runRemotePrimary(ctx context.Context, client *backend.Client, cfg config) e
 	// whole generation — from outgrowing the shared container.
 	dirtyMax, _ := cfg.dirtyRSSMaxBytes() // validated at startup
 	wfs.SetDirtyRSSMax(dirtyMax)
-	log.Printf("remote primary: proven %s base commit %s + %d journal records replayed (generation %s, epoch %d), exclusive lease (%dms) held, dirty-block bound %d MiB (%d MiB resident after replay)",
-		resolved.proof.Kind, baseCommit, rlog.Watermark()-rlog.CompactedThrough(), rlog.GenerationID(), rlog.Epoch(), cfg.leaseTTLms, dirtyMax>>20, wfs.DirtyBlockBytes()>>20)
+	// Pacing goes on with the bound, not after it: the bound alone cannot
+	// keep residency down while a writer is accepted faster than the fold
+	// releases, and every knob that only moves the bound only moves when the
+	// cliff arrives. Above the setpoint a write waits for an actual release.
+	pacePercent, _ := cfg.dirtyPaceSetpointPercent() // validated at startup
+	wfs.SetDirtyPacePercent(pacePercent)
+	log.Printf("remote primary: proven %s base commit %s + %d journal records replayed (generation %s, epoch %d), exclusive lease (%dms) held, dirty-block bound %d MiB (%d MiB resident after replay), write pacing setpoint %d MiB",
+		resolved.proof.Kind, baseCommit, rlog.Watermark()-rlog.CompactedThrough(), rlog.GenerationID(), rlog.Epoch(), cfg.leaseTTLms, dirtyMax>>20, wfs.DirtyBlockBytes()>>20, wfs.DirtyPaceSetpoint()>>20)
 	logBindingWriteBound(dirtyMax, rlog.QuotaBytes())
 	// The dirty-block fold: cut adoption now RELEASES this child's resident
 	// blocks instead of only advancing the journal base underneath them.

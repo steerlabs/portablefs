@@ -165,6 +165,7 @@ services:
       # Single-domain self-host posture: one filesystem failure domain, floor 1.
       PFH_WORKER_MIN_FAILURE_DOMAINS: "1"
       PFH_WORKER_STORES_JSON: '[{"failureDomain":"local","kind":"fs","rootDir":"/data/blobs/history"}]'
+      PFH_WORKER_MAX_CACHE_BYTES: "${QUICKSTART_WORKER_CACHE_BYTES:-134217728}"
       # The legacy digest-addressed blob store conversions read from: the
       # volume-api's filesystem blob root (shared volume), where adopted
       # content's recorded file:// keys resolve. Without it, journal

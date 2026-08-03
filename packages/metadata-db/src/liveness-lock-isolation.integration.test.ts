@@ -497,13 +497,19 @@ describePostgres("liveness lock isolation (migration 034)", () => {
     }
   }, 30_000);
 
-  test("a renewal that had to wait refuses with PF011 instead of extending on stale evidence", async () => {
-    // The one thing the lock-free shape gives up is the old post-lock clock
-    // sample. It is replaced by a bounded, CHECKED sample: a renewal that did
-    // wait rolls back rather than extending the deadline from an instant it
-    // can no longer vouch for. PF011 (proof missing), never PF001 — a stale
-    // sample must not be reported as a supersession, because the manager
-    // fences immediately on PF001.
+  test("a renewal that had to wait still extends, and charges the wait to its own grant", async () => {
+    // SUPERSEDED BY MIGRATION 038 (round 21c). The one thing the lock-free
+    // shape gave up was the old post-lock clock sample, and 034 replaced it
+    // with a FIXED 250 ms bound that rolled the whole renewal back. That guard
+    // is what fenced the fleet's manager under an ordinary tenant write:
+    // production logged "manager renew liveness sample went stale (1007 /
+    // 1146 / 2123 / 3551 / 4174 ms > 250 ms bound)" until expires_at stopped
+    // advancing and the manager fenced itself, killing every child and every
+    // tenant's leases. 038 keeps the wait honest instead of fatal: the
+    // reported dbTimeMs is the POST-WRITE clock, so the grant shrinks by
+    // exactly the wait, and the only refusal left is the exact unsoundness
+    // case (the claim's own expiry passed while the statement ran), which is
+    // covered in src/manager-renew-anchored-grant.integration.test.ts.
     const metadata = new PostgresMetadataRepository(databaseUrl);
     try {
       await metadata.applyMigrations();
@@ -521,24 +527,32 @@ describePostgres("liveness lock isolation (migration 034)", () => {
       const heartbeat = await openClient();
       await heartbeat.query(`SET portablefs.test_allow_unsafe_durability = 'on'`);
       await heartbeat.query(`SET lock_timeout = '10s'`);
-      const renewal = heartbeat.query(`SELECT pfm.manager_renew($1,$2,$3,$4) AS r`, [
-        claim.epoch,
-        claim.runtimeId,
-        claim.capability,
-        900_000,
-      ]);
-      // Hold well past pfm.manager_renew_sample_bound_ms() (250 ms), then let
-      // the renewal through.
+      const before = await heartbeat.query<{ expires_at: string }>(
+        `SELECT expires_at FROM pfm.manager_claims WHERE singleton_key='manager'`
+      );
+      const renewal = heartbeat.query<{ r: { dbTimeMs: string; expiresAtDbMs: string } }>(
+        `SELECT pfm.manager_renew($1,$2,$3,$4) AS r`,
+        [claim.epoch, claim.runtimeId, claim.capability, 900_000]
+      );
+      // Hold six times past the bound 034 used to enforce, then let the
+      // renewal through.
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       await fencer.query("ROLLBACK");
 
-      await expect(renewal).rejects.toMatchObject({ code: "PF011" });
+      const answer = (await renewal).rows[0]?.r;
+      const remaining = Number(answer?.expiresAtDbMs) - Number(answer?.dbTimeMs);
+      // A usable window, shortened by the wait, never longer than the TTL.
+      expect(remaining).toBeGreaterThan(0);
+      expect(remaining).toBeLessThanOrEqual(900_000);
+      expect(remaining).toBeLessThan(900_000 - 1_000);
 
-      // ...and the rollback was total: the claim was NOT extended.
-      const after = await heartbeat.query<{ expires_at: string; renewed_at: string }>(
-        `SELECT expires_at, renewed_at FROM pfm.manager_claims WHERE singleton_key='manager'`
+      // ...and the claim really moved.
+      const after = await heartbeat.query<{ expires_at: string }>(
+        `SELECT expires_at FROM pfm.manager_claims WHERE singleton_key='manager'`
       );
-      expect(Number(after.rows[0]?.expires_at)).toBeLessThan(Date.now() + 900_000);
+      expect(Number(after.rows[0]?.expires_at)).toBeGreaterThan(
+        Number(before.rows[0]?.expires_at)
+      );
     } finally {
       await metadata.close();
     }
