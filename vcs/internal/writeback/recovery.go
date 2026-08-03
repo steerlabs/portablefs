@@ -85,6 +85,15 @@ type RecoveryJob struct {
 	LostBytes      uint64   `json:"lostBytes,omitempty"`
 	LostScopes     []string `json:"lostScopes,omitempty"`
 	Remedy         string   `json:"remedy,omitempty"`
+
+	// ResolvedAtMs/ResolvedReason record an EXPLICIT OPERATOR RESOLUTION
+	// (`portablefs recovery resolve`, ResolveTerminalRecoveryJobs). They exist
+	// so a quarantine that a human decided on is distinguishable, forever, from
+	// one the attach path decided on by itself: the two are the same disposition
+	// of the same bytes reached by different authorities, and an audit of a data
+	// loss has to be able to tell which.
+	ResolvedAtMs   int64  `json:"resolvedAtMs,omitempty"`
+	ResolvedReason string `json:"resolvedReason,omitempty"`
 }
 
 // Unrecovered reports the acknowledged bytes this job still holds that the
@@ -441,6 +450,20 @@ func (r *recoveryRunner) attempt(ctx context.Context, dir string) error {
 //     parents. A crash before the rename leaves a stream that is re-proven
 //     unreplayable and re-contained; a crash after it leaves a contained
 //     stream carrying its verdict.
+//  4. Publish the quarantine PATH, once the bytes are actually at it.
+//
+// Step 4 used to be part of step 1, and that was a small lie with a real cost:
+// the verdict named <stateDir>/unreplayable/<stream> as the place the only
+// surviving copy could be found, and published it BEFORE the rename. For the
+// whole window between the two — which includes the authority round trip in
+// step 2, and every crash inside it — the remedy pointed an operator at a path
+// that did not exist while the bytes sat at the original stream path with
+// nothing naming them. A verdict is a set of directions; directions to a
+// nonexistent location are worse than none, because they read as proof the
+// bytes are gone. The path is now written only once it is true.
+//
+// The verdict itself (Quarantined, the Lost* counts, the remedy) is still
+// published first, because that is what makes everything after it idempotent.
 //
 // The bytes are KEPT. They are unrecoverable through this protocol, not
 // worthless: they are the only remaining copy of what was acknowledged, and an
@@ -459,7 +482,11 @@ func (r *recoveryRunner) contain(ctx context.Context, dir string, js *jobState, 
 			j.WritebackID = wbID
 		}
 		j.Quarantined = true
-		j.QuarantinePath = filepath.Join(r.e.cfg.StateDir, quarantineDirName, filepath.Base(dir))
+		// The bytes are still HERE. Naming the destination now would name a
+		// path that does not exist yet; naming the current one is true at every
+		// instant, and step 4 replaces it the moment the rename makes the
+		// destination true instead.
+		j.QuarantinePath = dir
 		j.LostRecords, j.LostBytes, j.LostScopes = records, bytes, scopes
 		j.PendingRecords, j.PendingBytes = records, bytes
 		j.Remedy = unreplayableRemedy(j)
@@ -480,6 +507,16 @@ func (r *recoveryRunner) contain(ctx context.Context, dir string, js *jobState, 
 		return fmt.Errorf("writeback: contain unreplayable stream %s: %w", filepath.Base(dir), err)
 	}
 	js.retarget(moved)
+	// The remedy TEXT embeds the location, so it is recomputed with it. Leaving
+	// the step-1 string in place would republish the pre-rename path inside the
+	// one field an operator actually reads.
+	js.update(func(j *RecoveryJob) {
+		j.QuarantinePath = moved
+		j.Remedy = unreplayableRemedy(j)
+	})
+	if err := js.persist(); err != nil {
+		return fmt.Errorf("writeback: publish quarantine location for %s: %w", filepath.Base(moved), err)
+	}
 	r.mu.Lock()
 	delete(r.parked, dir)
 	r.contained[moved] = js

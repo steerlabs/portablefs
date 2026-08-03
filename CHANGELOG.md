@@ -13,8 +13,40 @@ this file is the human-curated summary.
 
 Initial open-source release preparation. No tagged release yet.
 
+### Added
+
+- `portablefs recovery list|resolve <mountPath>` — inspect a mount's local
+  write-back recovery jobs and resolve the terminally `conflict`/`corrupt` ones
+  that block `portablefs umount --force` and every attach. `list` takes no lock
+  and changes nothing; `resolve` never deletes (the job's bytes are moved to
+  `<store>/unreplayable/` and kept), reports exactly what was lost, and refuses
+  any job it cannot prove terminal, any store a live engine owns, and any stream
+  whose identity does not match. Before this the product instructed operators to
+  perform an "explicit recovery resolution" that no command implemented; the only
+  escape was moving the state directory by hand.
+
 ### Fixed
 
+- A capacity refusal from the authority (`ENOSPC`/`EDQUOT` — the bounded dirty
+  block pool or the journal backlog quota) no longer fences the whole mount. It
+  used to park the stream terminally, which latched the engine's fail-closed
+  verdict, and that verdict gates the exact-handle read/getattr/getxattr paths
+  and `Truncate` — so a full store answered EIO to `ls`, `stat`, `read`, `mkdir`
+  and the documented truncate remedy until remount. Writes now refuse with a
+  definite `ENOSPC` while reads, metadata and releasing truncates keep working,
+  exactly as documented, and the refusal clears by itself when the authority
+  releases. Genuine fail-closed conditions (fence/ESTALE, typed corruption,
+  out-of-subtree records) still fence.
+- Every refusal in the umount / `--force` / `--discard-record` graph now names a
+  command that exists and can make progress. The forced-unmount progress verdict
+  no longer prescribes another `--force`, `--discard-record`'s daemon-attach
+  blocker names the resolution that unblocks the force it points at, and both
+  force-park call sites name `portablefs recovery resolve` when a terminal
+  recovery job is what refused.
+- The contained-stream verdict no longer publishes its quarantine path before
+  the bytes are at it: for the whole window between the verdict and the rename —
+  including an authority round trip — the only durable statement about where the
+  last surviving copy lived named a path that did not exist.
 - Publish and inventory the complete signed macOS FSKit identity tuple end to
   end: filesystem type `pfs`, generic-resource scheme
   `dev.portablefs.oss`, and the OSS app group. FSKit URL routing, lifecycle,

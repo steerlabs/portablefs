@@ -714,13 +714,34 @@ export class ProductionAccessLeaseService {
       // a rotated-past token never authorizes it.
       throw this.unauthorized(record.facts.leaseId);
     }
+    // ALWAYS send the CAS precondition, whatever this manager's local
+    // projection currently believes about the lease's state.
+    //
+    // ROUND 21c. This used to send null once the projection was not 'active',
+    // and pfm.access_release raises PF008 'release expected control sequence
+    // is required' on null as its FIRST statement — before the receipt claim,
+    // the lease lookup and the state check. So a lease that had already ended
+    // answered HTTP 400 ACCESS_LEASE_INVALID_REQUEST instead of the 409
+    // released/expired/revoked that says the release's work was already done.
+    // Since POST /v1/access-leases/release has no expectedControlSeq field on
+    // the wire, no caller could ever satisfy that demand: unsatisfiable, not
+    // protective. Observed in the field as `portablefs umount --force`
+    // completing but stranding the mount record in cleanup-required, which
+    // only --discard-record could clear.
+    //
+    // controlSeq is NOT NULL CHECK (control_seq >= 1) in the schema, so the
+    // projection always carries a usable precondition and the PF008 branch
+    // becomes unreachable from this path. Sending it hands the decision to the
+    // LEDGER, which is the only thing that knows: already over -> PF012 -> a
+    // terminal 409 the caller's teardown accepts as done; still live and the
+    // sequence matches -> released; sequence drifted -> an honest conflict.
     const result = await this.wrapStore(() =>
       this.store.accessRelease({
         identity: this.identity,
         operationId: args.operationId,
         tenantKey: record.facts.tenantKey,
         leaseId: args.accessLeaseId,
-        expectedControlSeq: record.facts.state === "active" ? record.facts.controlSeq : null,
+        expectedControlSeq: record.facts.controlSeq,
       })
     );
     this.applyOperationResult(result, record.teamId);

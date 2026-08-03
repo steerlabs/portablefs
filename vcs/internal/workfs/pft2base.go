@@ -161,6 +161,7 @@ func NewManagedFromPft2(ctx context.Context, base Pft2Base, blobs content.BlobRe
 		byIno:        map[uint64]*inode{},
 		xattrs:       map[uint64]map[string][]byte{},
 		deadBaseInos: map[uint64]struct{}{},
+		pace:         newDirtyPacer(),
 		managed: &managedState{
 			log:      log,
 			reserved: pfc2.NewState(),

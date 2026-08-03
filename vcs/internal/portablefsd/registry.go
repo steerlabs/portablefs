@@ -174,6 +174,12 @@ type writeBackStatus struct {
 	AppliedRateBps float64 `json:"appliedRateBps,omitempty"`
 	CreditWaiters  int     `json:"creditWaiters,omitempty"`
 	DataLaneFull   bool    `json:"dataLaneFull,omitempty"`
+	// CapacityRefused is a live capacity verdict from the AUTHORITY: a bounded
+	// store over there is full, so writes refuse with ENOSPC while reads,
+	// metadata and releasing truncates keep working. It is deliberately its own
+	// field: Degraded means a far end that stopped answering, and reporting the
+	// two as one is what let a full store read as a broken mount.
+	CapacityRefused bool `json:"capacityRefused,omitempty"`
 
 	Jobs []recoveryJobRef `json:"jobs,omitempty"`
 	// ParkedWALs keeps the doctor/mounts wire name for parked recovery
@@ -838,7 +844,7 @@ func (r *registry) unmountFSKitWithContext(
 			return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
 		default:
 		}
-		return true, "", r.unmountInProgressVerdict(ref, ctx.Err())
+		return true, "", r.unmountInProgressVerdict(ref, r.escalated(tx), ctx.Err())
 	case <-timer.C:
 		// The timer and completion can fire together; completion wins.
 		select {
@@ -846,7 +852,7 @@ func (r *registry) unmountFSKitWithContext(
 			return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
 		default:
 		}
-		return true, "", r.unmountInProgressVerdict(ref, nil)
+		return true, "", r.unmountInProgressVerdict(ref, r.escalated(tx), nil)
 	}
 }
 
@@ -878,7 +884,7 @@ func (r *registry) escalated(tx *unmountTransaction) bool {
 // refusal — so the CLI reports a verdict instead of a transport failure.
 // waiterErr, when non-nil, says this particular request's own context ended;
 // the transaction is unaffected.
-func (r *registry) unmountInProgressVerdict(ref string, waiterErr error) error {
+func (r *registry) unmountInProgressVerdict(ref string, forced bool, waiterErr error) error {
 	r.mu.RLock()
 	a := r.byRef[ref]
 	r.mu.RUnlock()
@@ -915,6 +921,31 @@ func (r *registry) unmountInProgressVerdict(ref string, waiterErr error) error {
 			)
 		}
 	}
+	// NEVER PRESCRIBE THE COMMAND THE CALLER IS ALREADY RUNNING.
+	//
+	// This message used to end with "or `portablefs umount --force` to park the
+	// unshipped tail" unconditionally — including when it was answering a
+	// --force. Live, that produced seven identical --force invocations over four
+	// minutes, each told to run --force. A progress report that prescribes the
+	// caller's own command is not advice; it is a loop with a delay in it.
+	//
+	// A force ALREADY escalated has exactly one honest next step that is
+	// different from re-running it: the escalation is durable and running, so
+	// joining it is what "wait" means, and if it never completes the exit is the
+	// abandoned-store path (kill the daemon, then --force again, and resolve any
+	// terminal recovery job it names). That is stated instead of a self-loop.
+	if forced {
+		return fmt.Errorf(
+			"forced unmount is still running after %s, waiting on %s; the force is "+
+				"already durable and continues in the background — re-running "+
+				"`portablefs umount --force` only rejoins THIS transaction and cannot "+
+				"speed it up. Join it with `portablefs umount --force %s`; if it never "+
+				"completes, stop the daemon (`portablefs daemon stop`) and force again, "+
+				"which parks the tail offline and, if a terminal recovery job blocks "+
+				"that, names `portablefs recovery resolve`%s",
+			unmountTransactionBudget, detail, mountPathHint(a), waiterSuffix(waiterErr),
+		)
+	}
 	return fmt.Errorf(
 		"unmount is still running after %s, waiting on %s; it continues in the "+
 			"background — re-run `portablefs umount` to join it, or "+
@@ -922,6 +953,18 @@ func (r *registry) unmountInProgressVerdict(ref string, waiterErr error) error {
 			"recovery job%s",
 		unmountTransactionBudget, detail, waiterSuffix(waiterErr),
 	)
+}
+
+// mountPathHint names the attach's mount path for a message, falling back to
+// its ref when the path is not recorded.
+func mountPathHint(a *attach) string {
+	if a != nil && a.mountPath != "" {
+		return a.mountPath
+	}
+	if a != nil {
+		return a.ref
+	}
+	return "<mountPath>"
 }
 
 func waiterSuffix(waiterErr error) string {
@@ -1175,6 +1218,23 @@ func (r *registry) forceUnmountFSKit(
 			if err != nil {
 				a.nsMu.Unlock()
 				a.frontendSerial.Unlock()
+				if errors.Is(err, writeback.ErrRecoveryResolutionRequired) {
+					// NAME THE COMMAND THAT EXISTS. This refusal used to close
+					// the umount/--force/--discard-record cycle with a phrase
+					// ("requires explicit recovery resolution") that appeared
+					// nowhere else in the product, so the operator's only exit
+					// was to move the store by hand. It now names the exact
+					// invocation that performs the resolution.
+					return jobID, fmt.Errorf(
+						"durably park abandoned FSKit store: %w\n"+
+							"this job blocks force-park and every attach until it is resolved. Inspect it with\n"+
+							"    portablefs recovery list %s\n"+
+							"and resolve it with\n"+
+							"    portablefs recovery resolve %s --all-terminal\n"+
+							"which quarantines the job's bytes under %s (nothing is deleted) and reports exactly what was lost",
+						err, a.mountPath, a.mountPath, filepath.Join(storeDir, "unreplayable"),
+					)
+				}
 				return jobID, fmt.Errorf("durably park abandoned FSKit store: %w", err)
 			}
 			if len(proof.JobIDs) != 0 {
@@ -2466,7 +2526,8 @@ func newWriteBackStatus(st writeback.Status) *writeBackStatus {
 		CreditSetpoint: st.CreditSetpoint, CreditDebt: st.CreditDebt,
 		CreditCeiling: st.CreditCeiling, AppliedRateBps: st.AppliedRateBps,
 		CreditWaiters: st.CreditWaiters, DataLaneFull: st.DataLaneFull,
-		Delegations: make([]delegationView, 0, len(st.Delegations)),
+		CapacityRefused: st.CapacityRefused,
+		Delegations:     make([]delegationView, 0, len(st.Delegations)),
 	}
 	for _, d := range st.Delegations {
 		wb.Delegations = append(wb.Delegations, delegationView{

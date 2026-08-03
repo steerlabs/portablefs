@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,10 +18,21 @@ type slowProber struct {
 	calls   atomic.Int64
 	inFlgt  atomic.Int64
 	maxFlgt atomic.Int64
+	// entered is closed when the FIRST probe is ENTERED (before its latency is
+	// paid). Grounding runs on its own goroutine by design — that is the whole
+	// point of this file — so "a probe was issued" is an event a test must
+	// WAIT for, never one it may assume has already happened.
+	enteredOnce sync.Once
+	entered     chan struct{}
+}
+
+func newSlowProber(latency time.Duration) *slowProber {
+	return &slowProber{latency: latency, entered: make(chan struct{})}
 }
 
 func (p *slowProber) ProbeLeaseFacts(ctx context.Context) (LeaseFacts, error) {
 	p.calls.Add(1)
+	p.enteredOnce.Do(func() { close(p.entered) })
 	if n := p.inFlgt.Add(1); n > p.maxFlgt.Load() {
 		p.maxFlgt.Store(n)
 	}
@@ -107,7 +119,7 @@ func TestSlowProbeNeverStallsTheLeasePipeReader(t *testing.T) {
 		ManagerEpoch: "7", ManagerRuntimeID: "pfmr_a", AuthorityInstanceID: "pfai_a",
 		AuthorityRuntimeSeq: "3", AuthorityRuntimeID: "pfrt_a",
 	}, 100*time.Millisecond)
-	prober := &slowProber{latency: probeLatency}
+	prober := newSlowProber(probeLatency)
 	guard.SetProber(prober)
 
 	reader := &countingReader{drain: make(chan struct{}), park: make(chan struct{})}
@@ -136,11 +148,36 @@ func TestSlowProbeNeverStallsTheLeasePipeReader(t *testing.T) {
 		t.Fatalf("guard fenced a healthy child: %v", guard.Cause())
 	default:
 	}
+	// WAIT for the first grounding rather than assuming it beat the drain.
+	//
+	// The two events are concurrent by construction and have no ordering
+	// between them: the reader consumes 12 in-memory frames without ever
+	// reaching a scheduling point, so by the time `drain` closes, the
+	// `go groundLoop()` that the first frame spawned has had essentially no
+	// opportunity to run. Whether it did depends entirely on whether some
+	// other P stole it in that window — this test used to pass on that luck.
+	// Proof it was luck: at aad03e9, with none of the round-21c changes
+	// present, GOMAXPROCS=1 fails this assertion 30 out of 30 runs and
+	// GOMAXPROCS=2 passes 30 out of 30.
+	//
+	// The bound is generous on purpose but still catches the regression that
+	// matters — grounding not starting at all — because the first probe is
+	// issued exactly when the child has NO armed deadline to fall back on.
+	// Measured on this package over 900 iterations of that unarmed path:
+	// p50 25 us, p99 ~130 us, max 396 us, never-started 0. Two seconds is
+	// over 5000x the observed maximum.
+	select {
+	case <-prober.entered:
+	case <-guard.Fenced():
+		t.Fatalf("guard fenced a healthy child before grounding: %v", guard.Cause())
+	case <-time.After(2 * time.Second):
+		t.Fatal("no grounding ran at all")
+	}
+
+	// Checked only once a probe is known to have started, so single-flight is
+	// asserted against real evidence instead of an empty counter.
 	if got := prober.maxFlgt.Load(); got > 1 {
 		t.Fatalf("%d probes were in flight at once; grounding must stay single-flight", got)
-	}
-	if got := prober.calls.Load(); got < 1 {
-		t.Fatal("no grounding ran at all")
 	}
 }
 
@@ -152,7 +189,7 @@ func TestSlowProbeStillGroundsAndAuthorizesServing(t *testing.T) {
 		ManagerEpoch: "7", ManagerRuntimeID: "pfmr_a", AuthorityInstanceID: "pfai_a",
 		AuthorityRuntimeSeq: "3", AuthorityRuntimeID: "pfrt_a",
 	}, 100*time.Millisecond)
-	guard.SetProber(&slowProber{latency: 150 * time.Millisecond})
+	guard.SetProber(newSlowProber(150 * time.Millisecond))
 
 	reader := &countingReader{drain: make(chan struct{}), park: make(chan struct{})}
 	for seq := int64(1); seq <= 5; seq++ {

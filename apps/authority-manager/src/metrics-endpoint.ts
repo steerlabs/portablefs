@@ -81,6 +81,11 @@ export function createManagerMetricsEndpoint(
       // counter (the registry owns every increment).
       metrics.setGauge("pfm_manager_renewals_total", snapshot.renewalsTotal);
       metrics.setGauge("pfm_manager_renewal_failures_total", snapshot.renewalFailuresTotal);
+      // Renewals that SUCCEEDED but came back with less than TTL - interval
+      // of headroom: the control database is slow enough that the renewal
+      // schedule no longer self-stabilises. This is the leading indicator of
+      // the round-21c self-fence, and it rises long before any failure does.
+      metrics.setGauge("pfm_manager_renewals_degraded_total", snapshot.renewalsDegradedTotal);
       metrics.setGauge("pfm_child_starts_total", snapshot.childStartsTotal);
       metrics.setGauge("pfm_child_start_failures_total", snapshot.childStartFailuresTotal);
       metrics.setGauge("pfm_child_unexpected_exits_total", snapshot.childUnexpectedExitsTotal);

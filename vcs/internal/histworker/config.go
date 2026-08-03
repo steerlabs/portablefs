@@ -58,7 +58,13 @@ type Config struct {
 	// attempts on claim — the backstop for attempts that die without ever
 	// reaching a worker-side settlement.
 	MaxCutAttempts int
-	// UploadConcurrency bounds parallel object uploads per flush (1..32).
+	// UploadConcurrency bounds parallel object uploads per flush (1..256).
+	// Each in-flight upload holds one already-materialized object (bounded in
+	// aggregate by MaxPendingUploadBytes) and streams its read-after-write
+	// proof, so raising this costs store round trips in flight, not memory.
+	// It is the knob that decides whether a cut's upload plane can outrun a
+	// sustained writer: one 1 GiB cut publishes ~19k objects, and every one
+	// costs a PUT plus a verification per required failure domain.
 	UploadConcurrency int
 	// ScrubBatch / ScrubConcurrency bound one scrub pass (1..512 / 1..32).
 	ScrubBatch       int
@@ -149,7 +155,7 @@ func (c Config) withDefaults() Config {
 	def(&c.MaterializeConcurrency, 1)
 	def(&c.MaxCutAttempts, 12)
 	def(&c.MinFailureDomains, 2)
-	def(&c.UploadConcurrency, 32)
+	def(&c.UploadConcurrency, 64)
 	def(&c.ScrubBatch, 64)
 	def(&c.ScrubConcurrency, 8)
 	def(&c.RepairBatch, 16)
@@ -293,7 +299,7 @@ func (c Config) Validate() error {
 	}{
 		{"materialize concurrency", c.MaterializeConcurrency, 1, 8},
 		{"max cut attempts", c.MaxCutAttempts, 3, 50},
-		{"upload concurrency", c.UploadConcurrency, 1, 32},
+		{"upload concurrency", c.UploadConcurrency, 1, 256},
 		{"scrub batch", c.ScrubBatch, 1, 512},
 		{"scrub concurrency", c.ScrubConcurrency, 1, 32},
 		{"repair batch", c.RepairBatch, 1, 128},

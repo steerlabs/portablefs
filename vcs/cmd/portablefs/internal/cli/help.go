@@ -46,6 +46,8 @@ MOUNTS (this machine)
   mount <volumeId> <path>      attach the live volume (FSKit on macOS, FUSE on Linux)
   umount <path>                sync and detach one mounted volume
   mounts                       list active mounts
+  recovery list|resolve <path> inspect and resolve a mount's write-back recovery
+                               jobs — the terminal ones block umount --force
   daemon stop                  atomically stop portablefsd only when no attach exists
   mount-check                  inspect mount prerequisites (no network or mutation)
 
@@ -397,6 +399,53 @@ mounted. Never edit ~/.local/state/portablefs/mounts by hand.
 Every probe of the mount path and every external unmount helper is bounded, so
 umount always reaches a verdict even when the filesystem has stopped answering,
 and no umount path — including --force — ever reads standard input.
+
+If --force refuses because a recovery job is terminally conflict or corrupt,
+that job is the blocker and "portablefs recovery resolve" is what clears it:
+
+  portablefs recovery list <mountPath>
+  portablefs recovery resolve <mountPath> --all-terminal
+  portablefs umount --force <mountPath>
+`,
+		"recovery": `USAGE
+  portablefs recovery list <mountPath> [--json]
+  portablefs recovery resolve <mountPath> (--job <jobId> | --all-terminal)
+                              [--reason TEXT] [--json]
+
+Inspect and resolve the write-back RECOVERY JOBS of one mount's local store.
+
+A recovery job holds the acknowledged writes a mount had not yet shipped to the
+authority. Most jobs need nothing: the next attach of the same volume+branch
+verifies and replays them. Two states do not — "conflict" and "corrupt" — and a
+job in either of them BLOCKS "portablefs umount --force" and every
+attach until an operator resolves it. That is what this command does.
+
+  list     Reads every job in the mount's store: state, how much it still owes
+           the authority, why it is stuck, and — for a blocking job — the exact
+           resolve invocation. Takes no lock and changes nothing, so it works
+           while a daemon still owns the store.
+
+  resolve  Resolves the terminal jobs. It NEVER DELETES: the job's bytes are the
+           only remaining copy of what was acknowledged, so they are MOVED to
+           <store>/unreplayable/ and kept. It reports exactly what is lost — how
+           many acknowledged records and bytes, and the scopes they were written
+           under — and leaves that verdict on disk so it is re-reported on every
+           later attach. It refuses any job that is NOT proven terminal (an
+           active, parked, forced or replaying job has a future: the next attach
+           replays it), any store a live engine still owns, and any stream whose
+           recorded identity does not match the store.
+
+           Name the job with --job (repeatable) or say --all-terminal. There is
+           no default: quarantining acknowledged bytes is a data decision.
+
+The resolution is OFFLINE — it contacts no authority — so the delegation grants
+a resolved stream held are released by the next attach rather than immediately.
+That is reported when it applies.
+
+EXAMPLES
+  portablefs recovery list ~/work
+  portablefs recovery resolve ~/work --job wbj_3f2a1c --reason "disk lost, re-copied from backup"
+  portablefs recovery resolve ~/work --all-terminal
 `,
 		"mounts": `USAGE
   portablefs mounts [--json]

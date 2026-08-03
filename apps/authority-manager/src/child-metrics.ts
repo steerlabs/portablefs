@@ -18,12 +18,34 @@
 //                         ONLY when boundaries match the declared set
 //                         exactly (+Inf required); any mismatch rejects
 //
-// Anything else — unknown names, unknown/duplicate labels, duplicate series,
-// NaN/Inf, HELP/TYPE lines (this exporter emits none), oversized responses,
-// line/series/label/bucket overruns — marks that child's scrape MALFORMED:
-// its entire contribution is dropped (one bad child cannot poison the
-// aggregate) and a bounded error counter increments. Logs carry coarse codes
-// only — never the target URL and never raw parse errors.
+// Anything else — unknown/duplicate labels, duplicate series, NaN/Inf,
+// oversized responses, line/series/label/bucket overruns — marks that child's
+// scrape MALFORMED: its entire contribution is dropped (one bad child cannot
+// poison the aggregate) and a bounded error counter increments. Logs carry
+// coarse codes only — never the target URL and never raw parse errors.
+//
+// TWO KINDS OF "not in the allowlist", and they are NOT the same failure.
+// The allowlist exists for CARDINALITY AND NAMESPACE CONTROL: no child may
+// mint a series in the manager's pfm_child_* namespace that an operator did
+// not declare, and no child-chosen label may ride along. It does NOT exist to
+// assert that the manager and the child were built from the same commit.
+// Treating a merely UNRECOGNIZED metric name as a fatal, whole-body rejection
+// conflated the two and cost the fleet all child observability: aad03e9 added
+// four vcs_dirty_fold_* metrics to the child, which registers them at package
+// init so they appear in EVERY exposition, and the manager then dropped every
+// child's entire body — pfm_child_* vanished, including the dirty-block
+// residency gauge the fold work exists to be judged by.
+//
+// So an unrecognized metric NAME (and a HELP/TYPE/comment line, which carries
+// no series at all) is now SKIPPED AND COUNTED, never rendered and never
+// aggregated: the closed namespace is preserved exactly — nothing undeclared
+// reaches the output, and no child-chosen label is even inspected, let alone
+// forwarded — while a version-skewed child stays fully observable for every
+// metric both sides DO agree on. The drops are visible as
+// pfm_child_scrape_unknown_metrics_total (an allowlist gap to close) and
+// pfm_child_scrape_ignored_lines_total (comment/HELP/TYPE lines). Structural
+// corruption of a KNOWN metric stays fail-closed for the whole body: that is
+// a broken or hostile exporter, not a newer one.
 import type { ManagerMetrics } from "./manager-metrics.js";
 
 export type ChildMetricAggregator =
@@ -95,6 +117,13 @@ export const childMetricAllowlist: Readonly<Record<string, ChildMetricSpec>> = {
   vcs_fsproto_op_other: { aggregator: "counter" },
   vcs_mutations: { aggregator: "counter" },
   vcs_wal_replay_skips: { aggregator: "counter" },
+  // History-cut dirty fold (vcs/internal/workfs/dirtyfold.go). Registered at
+  // package init, so every child exposes all four at value 0 even before a
+  // fold ever runs. Released bytes / folded blocks / completed passes are
+  // monotonic totals that sum across the fleet.
+  vcs_dirty_fold_released_bytes: { aggregator: "counter" },
+  vcs_dirty_fold_blocks: { aggregator: "counter" },
+  vcs_dirty_fold_passes: { aggregator: "counter" },
   vcs_checkpoint_sidecar_overflows: { aggregator: "counter" },
   vcs_checkpoint_commits: { aggregator: "counter" },
   vcs_checkpoint_bytes: { aggregator: "counter" },
@@ -133,6 +162,31 @@ export const childMetricAllowlist: Readonly<Record<string, ChildMetricSpec>> = {
   vcs_dirty_block_bytes: { aggregator: "gauge_additive" },
   vcs_dirty_block_bytes_max: { aggregator: "gauge_additive" },
 
+  // Resident-byte pacing (vcs/internal/workfs/dirtypace.go). Above the
+  // setpoint the pacer admits a dirty byte only behind an OBSERVED release,
+  // so accepted rate converges on release rate by construction rather than by
+  // estimate. Waits / wait-nanos / refusals and released-bytes are monotonic
+  // per-child totals that sum across the fleet. The setpoint is a per-child
+  // level in bytes and the release rate a per-child byte rate; both sum to a
+  // meaningful host-wide total, exactly like vcs_dirty_block_bytes above.
+  // vcs_dirty_release_bytes_per_sec is TELEMETRY ONLY — nothing in the
+  // admission path reads it, deliberately: a rate estimate goes optimistic
+  // precisely when the relief plane is collapsing under WAL back-pressure.
+  vcs_dirty_pace_waits: { aggregator: "counter" },
+  vcs_dirty_pace_wait_nanos: { aggregator: "counter" },
+  vcs_dirty_pace_refusals: { aggregator: "counter" },
+  vcs_dirty_released_bytes: { aggregator: "counter" },
+  vcs_dirty_pace_setpoint_bytes: { aggregator: "gauge_additive" },
+  vcs_dirty_release_bytes_per_sec: { aggregator: "gauge_additive" },
+
+  // The fold's last-folded journal watermark. LSNs belong to each child's OWN
+  // journal, so they are NOT comparable across children and summing them
+  // would be meaningless arithmetic on unrelated sequences. Aggregated as the
+  // MINIMUM — the worst case, "no resident child has folded past this" — the
+  // same treatment the other worst-case gauges get. Per-child watermarks are
+  // read from the child's own /metrics, never from this fleet series.
+  vcs_dirty_fold_watermark: { aggregator: "gauge_min" },
+
   // Latency summaries (Go histograms rendered as summaries): _count/_sum
   // aggregate; precomputed quantiles are dropped.
   vcs_fsproto_op_latency: { aggregator: "summary" },
@@ -162,8 +216,6 @@ export type ChildParseFailureCode =
   | "too_many_lines"
   | "too_many_series"
   | "malformed_line"
-  | "help_type_line"
-  | "unknown_metric"
   | "unknown_label"
   | "duplicate_label"
   | "duplicate_series"
@@ -178,8 +230,16 @@ interface ParsedSeries {
   value: number;
 }
 
+/** Lines a child sent that this manager deliberately did not aggregate. */
+export interface ChildParseSkips {
+  /** Lines whose metric name is not in the closed allowlist. */
+  unknownMetrics: number;
+  /** HELP/TYPE/comment lines — no series, nothing to aggregate. */
+  ignoredLines: number;
+}
+
 export type ChildParseResult =
-  | { ok: true; series: ParsedSeries[] }
+  | { ok: true; series: ParsedSeries[]; skips: ChildParseSkips }
   | { ok: false; code: ChildParseFailureCode };
 
 // Strict line parser for the child exposition format. Rejection is by coarse
@@ -193,6 +253,7 @@ export function parseChildExposition(text: string): ChildParseResult {
     return { ok: false, code: "too_many_lines" };
   }
   const series: ParsedSeries[] = [];
+  const skips: ChildParseSkips = { unknownMetrics: 0, ignoredLines: 0 };
   const seen = new Set<string>();
   for (const [index, line] of lines.entries()) {
     if (line === "" && index === lines.length - 1) {
@@ -202,12 +263,24 @@ export function parseChildExposition(text: string): ChildParseResult {
       return { ok: false, code: "malformed_line" };
     }
     if (line.startsWith("#")) {
-      // This exporter emits no HELP/TYPE/comment lines; any is malformed.
-      return { ok: false, code: "help_type_line" };
+      // HELP/TYPE/comment lines carry no series and no cardinality: skipping
+      // one cannot pollute the aggregate, so an exporter that starts emitting
+      // them (or a hosted child that always did) must not cost the fleet
+      // every OTHER metric on the body. Counted, never rendered.
+      skips.ignoredLines += 1;
+      continue;
     }
     const parsed = parseLine(line);
     if (!parsed.ok) {
       return parsed;
+    }
+    if (parsed.skip) {
+      // Name not in the closed allowlist. The line is dropped WHOLE and
+      // unexamined — its labels are never inspected and nothing about it
+      // reaches the output — so the namespace stays exactly as closed as
+      // before, while every allowlisted metric on the same body survives.
+      skips.unknownMetrics += 1;
+      continue;
     }
     const key = seriesKey(parsed.series);
     if (seen.has(key)) {
@@ -219,12 +292,43 @@ export function parseChildExposition(text: string): ChildParseResult {
       return { ok: false, code: "too_many_series" };
     }
   }
-  return { ok: true, series };
+  return { ok: true, series, skips };
 }
 
 const namePattern = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
+// The metric name is the leading identifier of a line, before any "{" or " ".
+const leadingNamePattern = /^[a-zA-Z_:][a-zA-Z0-9_:]*/;
 
-function parseLine(line: string): { ok: true; series: ParsedSeries } | { ok: false; code: ChildParseFailureCode } {
+/**
+ * Own-property lookup ONLY. A child emitting `constructor 1` or `toString 1`
+ * must be an unrecognized name like any other, not an inherited Object.
+ * prototype member that reads as truthy and slips past the closed registry.
+ */
+function allowlistSpec(name: string): ChildMetricSpec | undefined {
+  return Object.hasOwn(childMetricAllowlist, name) ? childMetricAllowlist[name] : undefined;
+}
+
+type ParseLineOutcome =
+  | { ok: true; skip: true }
+  | { ok: true; skip: false; series: ParsedSeries }
+  | { ok: false; code: ChildParseFailureCode };
+
+function parseLine(line: string): ParseLineOutcome {
+  // ALLOWLIST FIRST, on the leading identifier alone. A name this manager
+  // does not know is skipped before ANY other structural rule is applied to
+  // it, because every one of those rules (label enum, label count, value
+  // finiteness, suffix discipline) is a statement about metrics we DO know.
+  // Applying them to an unrecognized metric is what turned "the child is
+  // newer than the manager" into "the manager reports nothing at all".
+  const leadingName = leadingNamePattern.exec(line)?.[0];
+  if (leadingName === undefined) {
+    // Not even an identifier: genuine corruption, still fail-closed.
+    return { ok: false, code: "malformed_line" };
+  }
+  if (!allowlistSpec(splitSuffix(leadingName).base)) {
+    return { ok: true, skip: true };
+  }
+
   // Format: name[{labels}] value   (exactly one space between name and value)
   const spaceIndex = line.lastIndexOf(" ");
   if (spaceIndex <= 0 || spaceIndex === line.length - 1) {
@@ -273,9 +377,11 @@ function parseLine(line: string): { ok: true; series: ParsedSeries } | { ok: fal
   }
 
   const { base, suffix } = splitSuffix(name);
-  const spec = childMetricAllowlist[base];
+  const spec = allowlistSpec(base);
   if (!spec) {
-    return { ok: false, code: "unknown_metric" };
+    // Reachable only when the label-stripped name differs from the leading
+    // identifier gate above (it cannot today). Skip, never discard the body.
+    return { ok: true, skip: true };
   }
   // Label/type discipline per aggregator.
   if (spec.aggregator === "summary") {
@@ -306,7 +412,7 @@ function parseLine(line: string): { ok: true; series: ParsedSeries } | { ok: fal
       return { ok: false, code: "label_not_allowed" };
     }
   }
-  return { ok: true, series: { base, suffix, labels, value } };
+  return { ok: true, skip: false, series: { base, suffix, labels, value } };
 }
 
 function splitSuffix(name: string): { base: string; suffix: "" | "_count" | "_sum" | "_bucket" } {
@@ -316,7 +422,7 @@ function splitSuffix(name: string): { base: string; suffix: "" | "_count" | "_su
       // Only treat the suffix as structural when the base is an allowlisted
       // summary/histogram — a counter literally named *_total_count would
       // otherwise be misparsed.
-      const spec = childMetricAllowlist[base];
+      const spec = allowlistSpec(base);
       if (spec && (spec.aggregator === "summary" || spec.aggregator === "histogram")) {
         return { base, suffix };
       }
@@ -339,6 +445,14 @@ export interface AggregatedChildMetrics {
   lines: string[];
   childrenAggregated: number;
   childrenMalformed: number;
+  /**
+   * Lines skipped because the metric name is not allowlisted. Non-zero means
+   * a child emits something this manager does not know how to aggregate —
+   * an allowlist gap to close, NOT a reason the rest was lost.
+   */
+  unknownMetricLines: number;
+  /** HELP/TYPE/comment lines skipped (informational; nothing to aggregate). */
+  ignoredLines: number;
 }
 
 export function aggregateChildMetrics(results: ChildParseResult[]): AggregatedChildMetrics {
@@ -347,6 +461,8 @@ export function aggregateChildMetrics(results: ChildParseResult[]): AggregatedCh
   const maxs = new Map<string, number>();
   let aggregated = 0;
   let malformed = 0;
+  let unknownMetricLines = 0;
+  let ignoredLines = 0;
 
   for (const result of results) {
     if (!result.ok) {
@@ -354,8 +470,10 @@ export function aggregateChildMetrics(results: ChildParseResult[]): AggregatedCh
       continue;
     }
     aggregated += 1;
+    unknownMetricLines += result.skips.unknownMetrics;
+    ignoredLines += result.skips.ignoredLines;
     for (const series of result.series) {
-      const spec = childMetricAllowlist[series.base]!;
+      const spec = allowlistSpec(series.base)!;
       switch (spec.aggregator) {
         case "counter":
         case "gauge_additive":
@@ -396,7 +514,13 @@ export function aggregateChildMetrics(results: ChildParseResult[]): AggregatedCh
     lines.push(`pfm_child_${name} ${renderValue(value)}`);
   }
   lines.sort();
-  return { lines, childrenAggregated: aggregated, childrenMalformed: malformed };
+  return {
+    lines,
+    childrenAggregated: aggregated,
+    childrenMalformed: malformed,
+    unknownMetricLines,
+    ignoredLines,
+  };
 }
 
 function addTo(map: Map<string, number>, key: string, value: number): void {
@@ -509,6 +633,17 @@ export class ChildMetricsCollector {
       if (body.childrenMalformed > 0) {
         metrics.counter("pfm_child_scrape_malformed_total").add(body.childrenMalformed);
       }
+      // A child emitting a metric this manager does not allowlist no longer
+      // costs that child its whole exposition — but it must never be silent
+      // either, or the allowlist drifts behind the children unnoticed (which
+      // is exactly how aad03e9's four vcs_dirty_fold_* metrics blinded the
+      // fleet). This counter climbing is the signal to extend the allowlist.
+      // Added unconditionally (0 is a legal increment) so both series are
+      // ALWAYS present in the body: an instrument that only exists once it
+      // has fired cannot be alerted on, and "absent" would read the same as
+      // "healthy" — the precise failure mode this fix exists to end.
+      metrics.counter("pfm_child_scrape_unknown_metrics_total").add(body.unknownMetricLines);
+      metrics.counter("pfm_child_scrape_ignored_lines_total").add(body.ignoredLines);
       this.cache = { at: this.now(), body };
       return body;
     } finally {

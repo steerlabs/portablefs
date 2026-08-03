@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -249,7 +250,18 @@ type config struct {
 	// Kept as the raw string so validation can reject 0/negative/garbage
 	// loudly instead of silently substituting the default.
 	dirtyRSSMaxMB string
-	metricsAddr   string // VCS_METRICS_ADDR — serve /stats, /metrics, /healthz; "" disables
+	// dirtyPacePercent (VCS_DIRTY_PACE_PERCENT, default 50, "off" disables)
+	// places the PACING SETPOINT as a percentage of the dirty bound. The
+	// bound is a cliff — it refuses with ENOSPC — and no cliff can fix the
+	// conservation law: while a writer is accepted faster than resident bytes
+	// are RELEASED, residency grows and the only question a threshold answers
+	// is when it arrives. At or above the setpoint a write WAITS for an
+	// actual release, so accepted throughput equals release throughput by
+	// construction and the bound goes back to being the emergency invariant
+	// it was documented as. Kept as the raw string so a typo is a loud
+	// startup error rather than a silent default.
+	dirtyPacePercent string
+	metricsAddr      string // VCS_METRICS_ADDR — serve /stats, /metrics, /healthz; "" disables
 	// authorityInstanceID is the opaque manager-assigned identity of this authority
 	// instance (VCS_AUTHORITY_INSTANCE_ID). Lifecycle operations are fenced by it.
 	authorityInstanceID string
@@ -314,18 +326,19 @@ func (c config) managed() bool {
 
 func loadConfig() config {
 	return config{
-		apiURL:        os.Getenv("VOLUME_API_URL"),
-		token:         os.Getenv("VOLUME_API_TOKEN"),
-		volumeID:      os.Getenv("VCS_VOLUME_ID"),
-		branch:        env("VCS_BRANCH", "main"),
-		production:    os.Getenv("VCS_PRODUCTION") == "1",
-		writable:      os.Getenv("VCS_WRITABLE") == "1",
-		fsAddr:        os.Getenv("VCS_FS_ADDR"),
-		failoverPoll:  time.Duration(mustInt(env("VCS_FAILOVER_POLL", "2"))) * time.Second,
-		leaseTTLms:    int64(mustInt(env("VCS_LEASE_TTL", "30"))) * 1000,
-		cacheRAMBytes: int64(envInt("VCS_CACHE_RAM_MB", 256)) << 20,
-		dirtyRSSMaxMB: os.Getenv("VCS_DIRTY_RSS_MAX_MB"),
-		metricsAddr:   os.Getenv("VCS_METRICS_ADDR"),
+		apiURL:           os.Getenv("VOLUME_API_URL"),
+		token:            os.Getenv("VOLUME_API_TOKEN"),
+		volumeID:         os.Getenv("VCS_VOLUME_ID"),
+		branch:           env("VCS_BRANCH", "main"),
+		production:       os.Getenv("VCS_PRODUCTION") == "1",
+		writable:         os.Getenv("VCS_WRITABLE") == "1",
+		fsAddr:           os.Getenv("VCS_FS_ADDR"),
+		failoverPoll:     time.Duration(mustInt(env("VCS_FAILOVER_POLL", "2"))) * time.Second,
+		leaseTTLms:       int64(mustInt(env("VCS_LEASE_TTL", "30"))) * 1000,
+		cacheRAMBytes:    int64(envInt("VCS_CACHE_RAM_MB", 256)) << 20,
+		dirtyRSSMaxMB:    os.Getenv("VCS_DIRTY_RSS_MAX_MB"),
+		dirtyPacePercent: os.Getenv("VCS_DIRTY_PACE_PERCENT"),
+		metricsAddr:      os.Getenv("VCS_METRICS_ADDR"),
 
 		authorityInstanceID: os.Getenv("VCS_AUTHORITY_INSTANCE_ID"),
 		journalDSN:          os.Getenv("VCS_JOURNAL_DSN"),
@@ -362,11 +375,41 @@ func (c config) dirtyRSSMaxBytes() (int64, error) {
 	return int64(n) << 20, nil
 }
 
+// defaultDirtyPacePercent puts the pacing setpoint at half the dirty bound —
+// the same fraction coordinatedBacklogPercent already sizes the cut trigger
+// against and the same one the fold driver switches cadence at, so pacing
+// engages exactly when the fold is already running as hard as it can.
+const defaultDirtyPacePercent = 50
+
+// dirtyPaceSetpointPercent resolves VCS_DIRTY_PACE_PERCENT: unset applies the
+// default; "off" (or 0) disables pacing and restores the pre-pacing behaviour
+// of the hard bound alone; anything else outside 1..99 is a startup error,
+// because a setpoint at or above the bound paces nothing and one below 1
+// refuses everything.
+func (c config) dirtyPaceSetpointPercent() (int, error) {
+	raw := strings.TrimSpace(c.dirtyPacePercent)
+	switch raw {
+	case "":
+		return defaultDirtyPacePercent, nil
+	case "off", "0":
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > 99 {
+		return 0, fmt.Errorf("VCS_DIRTY_PACE_PERCENT must be 1..99 (default %d) or \"off\": it places the write-pacing setpoint below VCS_DIRTY_RSS_MAX_MB; got %q",
+			defaultDirtyPacePercent, c.dirtyPacePercent)
+	}
+	return n, nil
+}
+
 func validateConfig(cfg config) error {
 	if cfg.apiURL == "" || cfg.volumeID == "" {
 		return fmt.Errorf("VOLUME_API_URL and VCS_VOLUME_ID are required")
 	}
 	if _, err := cfg.dirtyRSSMaxBytes(); err != nil {
+		return err
+	}
+	if _, err := cfg.dirtyPaceSetpointPercent(); err != nil {
 		return err
 	}
 	// The remote journal is the ONLY serving mode: cmd/vcs is the managed

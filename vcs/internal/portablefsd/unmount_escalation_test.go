@@ -336,7 +336,7 @@ func TestUnmountWaiterCancellationDoesNotAbandonTheTransaction(t *testing.T) {
 func TestUnmountInProgressVerdictNeverClaimsUnknownAttach(t *testing.T) {
 	r := newRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
-	err := r.unmountInProgressVerdict(testFSKitAttachRef, nil)
+	err := r.unmountInProgressVerdict(testFSKitAttachRef, false, nil)
 	if err == nil {
 		t.Fatal("no verdict")
 	}
@@ -344,7 +344,7 @@ func TestUnmountInProgressVerdictNeverClaimsUnknownAttach(t *testing.T) {
 		t.Fatalf("a verdict for an attach the transaction already detached claims "+
 			"it was never known: %v", err)
 	}
-	waiter := r.unmountInProgressVerdict(testFSKitAttachRef, errors.New("client hung up"))
+	waiter := r.unmountInProgressVerdict(testFSKitAttachRef, false, errors.New("client hung up"))
 	if !strings.Contains(waiter.Error(), "client hung up") {
 		t.Fatalf("the verdict hid why THIS waiter stopped waiting: %v", waiter)
 	}

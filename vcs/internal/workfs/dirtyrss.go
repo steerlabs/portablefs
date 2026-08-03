@@ -151,8 +151,11 @@ func (fs *FS) SetDirtyRSSMax(maxBytes int64) {
 	}
 	fs.mu.Lock()
 	fs.dirtyMax = maxBytes
+	percent := fs.dirtyPacePercent
 	fs.mu.Unlock()
 	dirtyBlockBytesMaxGauge.Set(maxBytes)
+	// The setpoint is a fraction of the bound, so it moves with it.
+	fs.pace.configure(maxBytes, percent)
 }
 
 // DirtyRSSMax reports the configured dirty-block byte bound (0 = unbounded).
@@ -186,14 +189,21 @@ func (fs *FS) addDirtyBlockBytesLocked(delta int64) {
 	}
 	fs.dirtyBytes += delta
 	dirtyBlockBytesGauge.Set(fs.dirtyBytes)
+	// A negative delta IS the release the pacer credits: fold, truncate,
+	// orphan reap. This is the one place the exact total falls, which is why
+	// the credit is taken here and not from any upstream "a cut is ready"
+	// event that may have moved no memory at all.
+	fs.publishDirtyLevelLocked(-delta)
 }
 
 // restoreDirtyBlockBytesLocked resets the total to a snapshot (transaction
 // rollback restores block state byte-for-byte, so the counter snapshot is
 // exact). Caller holds fs.mu.
 func (fs *FS) restoreDirtyBlockBytesLocked(v int64) {
+	released := fs.dirtyBytes - v
 	fs.dirtyBytes = v
 	dirtyBlockBytesGauge.Set(fs.dirtyBytes)
+	fs.publishDirtyLevelLocked(released)
 }
 
 // dirtyWriteReserve is the worst-case dirty-block growth one OpWrite leaf can
@@ -259,6 +269,7 @@ func (fs *FS) reserveDirtyGrowthLocked(reserve int64) error {
 		return ErrDirtyRSSCapacity
 	}
 	fs.dirtyReserved += reserve
+	fs.publishDirtyLevelLocked(0)
 	return nil
 }
 
@@ -270,5 +281,8 @@ func (fs *FS) releaseDirtyReserve(reserve int64) {
 	}
 	fs.mu.Lock()
 	fs.dirtyReserved -= reserve
+	// The level falls (the worst-case charge exceeded the real growth), which
+	// can admit a waiter — but it freed no memory, so it credits no release.
+	fs.publishDirtyLevelLocked(0)
 	fs.mu.Unlock()
 }

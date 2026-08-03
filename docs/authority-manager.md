@@ -460,22 +460,44 @@ process-local counters):
 | `pfm_tenant_lease_limit_refusals_total` | `TENANT_LEASE_LIMIT` refusals (429, per-tenant lease budget). |
 | `pfm_router_open_tunnels` | Live lease-scoped data-plane tunnels. |
 | `pfm_child_scrape_targets`, `pfm_child_scrape_aggregated`, `pfm_child_scrape_malformed_total`, `pfm_child_scrape_refused_total`, `pfm_child_scrape_errors_total` | Child-scrape pipeline health (below). |
+| `pfm_child_scrape_unknown_metrics_total` | Child lines skipped because the metric name is not allowlisted — a child ahead of this manager. Non-zero is an allowlist gap to close, NOT lost observability: everything else on the body still aggregates. Always rendered (0 when healthy) so it can be alerted on. |
+| `pfm_child_scrape_ignored_lines_total` | HELP/TYPE/comment lines skipped (no series, nothing to aggregate). Informational. |
 
 The same body carries the aggregated CHILD metrics as `pfm_child_<name>`
 series (for example `pfm_child_vcs_dirty_block_bytes`, the fleet-wide
-resident dirty-block bytes from the journal children's dirty-RSS accounting).
+resident dirty-block bytes from the journal children's dirty-RSS accounting,
+and `pfm_child_vcs_dirty_fold_released_bytes` / `_blocks` / `_passes` /
+`_watermark` from the history-cut dirty fold).
 The manager is the only scraper of the children's loopback `/metrics`
 listeners — each managed child self-binds `127.0.0.1:0` and reports the exact
 address on its bootstrap pipe, and child listeners are never exposed off the
 host. Aggregation is fail-closed through a CLOSED ALLOWLIST: every child
 metric name is declared with an explicit aggregator (counters and additive
-gauges sum; the `vcs_ready` boolean takes the minimum, so one unready child
-reports 0; latency summaries sum `_count`/`_sum` and DROP precomputed
-quantiles — no fake fleet percentile is ever derived). Unknown names, unknown
-labels, HELP/TYPE lines, non-finite values, or oversized bodies mark that
-child's whole scrape malformed and drop its entire contribution — one
-misbehaving child can never pollute the aggregate — visible as
-`pfm_child_scrape_malformed_total`. Scrapes are bounded (256 KiB per child,
+gauges sum; the `vcs_ready` boolean and the per-journal
+`vcs_dirty_fold_watermark` take the minimum — one unready child reports 0, and
+the fleet watermark is the worst case, never a sum of unrelated LSNs; latency
+summaries sum `_count`/`_sum` and DROP precomputed quantiles — no fake fleet
+percentile is ever derived). Unknown labels, non-finite values, duplicate
+series, or oversized bodies mark that child's whole scrape malformed and drop
+its entire contribution — one misbehaving child can never pollute the
+aggregate — visible as `pfm_child_scrape_malformed_total`.
+
+An UNRECOGNIZED metric NAME is different, and is deliberately not fatal. The
+allowlist exists for cardinality and namespace control — nothing undeclared
+may ever be minted as a `pfm_child_*` series, and no child-chosen label may
+ride along — not to assert that manager and child were built from the same
+commit. A line whose name is not allowlisted is therefore dropped WHOLE and
+unexamined (its labels are never even inspected, so nothing can leak) while
+every allowlisted metric on the same body still aggregates, and the drop is
+counted in `pfm_child_scrape_unknown_metrics_total`. HELP/TYPE/comment lines
+are skipped the same way into `pfm_child_scrape_ignored_lines_total`. Treating
+an unknown name as a whole-body rejection previously cost the fleet ALL child
+observability the moment a child gained a metric the manager had not been
+taught: four `vcs_dirty_fold_*` metrics registered at package init made
+`pfm_child_*` disappear entirely. A test now derives the child binary's metric
+registrations from the Go source and fails if the allowlist falls behind.
+
+Scrapes are bounded (256 KiB per child,
 per-child and overall deadlines, loopback-literal targets only) and cached
 for one second with single-flight collection. There are no per-child,
 per-volume, or per-branch labels: children are counted and summed, never

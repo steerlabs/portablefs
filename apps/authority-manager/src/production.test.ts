@@ -1028,6 +1028,81 @@ describe("ProductionAccessLeaseService", () => {
     );
   });
 
+  test("a release whose projection is not active still ENDS the lease instead of refusing 400 with an argument no caller can supply", async () => {
+    // ROUND 21c, SECOND DEFECT. Reported from the field:
+    //
+    //   portablefs umount --force ... completed, but:
+    //   release access lease pfal_...: release expected control sequence is
+    //   required (ACCESS_LEASE_INVALID_REQUEST, HTTP 400)
+    //
+    // leaving the mount record in cleanup-required, clearable only with
+    // --discard-record.
+    //
+    // WHY. release() derived the CAS precondition from its own IN-MEMORY
+    // projection and sent NULL whenever that projection was not 'active':
+    //
+    //   expectedControlSeq: record.facts.state === "active" ? ... : null
+    //
+    // and pfm.access_release raises PF008 'release expected control sequence
+    // is required' on NULL -> InvalidControlArgumentError -> HTTP 400
+    // ACCESS_LEASE_INVALID_REQUEST. The wire contract for
+    // POST /v1/access-leases/release has NO expectedControlSeq field at all,
+    // so no client can ever satisfy that demand: unsatisfiable, not
+    // protective — the same shape as the 037 adoption-proof defect.
+    //
+    // It bit hardest on forced teardown, which is exactly when the local
+    // projection has already gone terminal.
+    //
+    // The lease's control sequence is NOT NULL CHECK (control_seq >= 1) in
+    // the schema, so the projection always HAS a usable precondition. Sending
+    // it lets the LEDGER decide: already over -> PF012 -> 409
+    // released/expired/revoked, which the CLI's leaseReleaseSatisfied() treats
+    // as DONE and the mount tears down cleanly.
+    // pfm.access_release checks the NULL precondition as its very FIRST
+    // statement — before the receipt claim, before the lease lookup, before
+    // the state check. So a lease that has ALREADY ended answers 400
+    // "expected control sequence is required" instead of the 409
+    // released/expired/revoked that would have satisfied the release. That is
+    // the dead end: the teardown is told its request is malformed when in
+    // truth its work was already done.
+    const h = await newLeaseHarness();
+    const created = await h.service.create(createArgs);
+    await h.service.revoke(created.lease.accessLeaseId);
+
+    await expectAccessLeaseError(
+      () =>
+        h.service.release({
+          operationId: "op-release-forced",
+          accessLeaseId: created.lease.accessLeaseId,
+          accessToken: created.accessToken,
+        }),
+      // A statement about THIS LEASE, which the CLI's leaseReleaseSatisfied()
+      // accepts as DONE so the mount tears down — NOT the unsatisfiable
+      // ACCESS_LEASE_INVALID_REQUEST.
+      "ACCESS_LEASE_REVOKED"
+    );
+  });
+
+  test("the control store REFUSES a release with no CAS precondition, exactly as pfm.access_release does", async () => {
+    // The reason the defect above shipped: the in-memory double accepted a
+    // NULL expectedControlSeq (`!== null && ...`) while pfm.access_release
+    // raises PF008 on it. Every test passed; production answered 400. The
+    // double must enforce the same precondition as the SQL, so the two can
+    // never disagree about it again.
+    const h = await newLeaseHarness();
+    const created = await h.service.create(createArgs);
+    await expect(
+      h.store.accessRelease({
+        identity: h.identity,
+        operationId: "op-release-null-cas",
+        tenantKey: managedTenantKey(ref),
+        leaseId: created.lease.accessLeaseId,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expectedControlSeq: null as any,
+      })
+    ).rejects.toThrow(/release expected control sequence is required/u);
+  });
+
   test("overlapping managers: the successor's service never validates the predecessor's tokens", async () => {
     const db = { time: 1_000_000 };
     const store = new InMemoryManagerControlStore({ dbNow: () => db.time });

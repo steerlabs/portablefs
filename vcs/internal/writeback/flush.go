@@ -227,6 +227,14 @@ type flusher struct {
 	lastFailAt  time.Time
 	terminal    error
 
+	// capacity is the DEFINITE-BUT-RELIEVABLE verdict, and it is deliberately
+	// NOT terminal. See parkCapacity: a bounded store at the authority is full,
+	// which is a statement about that store's occupancy and about nothing else —
+	// not about this stream's bytes, not about this mount's local state, and not
+	// about whether reads, metadata or a releasing truncate can be served.
+	capacity   error
+	capacityAt time.Time
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -466,6 +474,24 @@ func (f *flusher) drainThrough(ctx context.Context, lane StreamLane, target uint
 		f.mu.Unlock()
 		return err
 	}
+	if f.capacity != nil {
+		// A DRAIN RE-ASKS THE AUTHORITY; IT NEVER REPLAYS A CACHED REFUSAL.
+		//
+		// A capacity verdict is a statement about the far end's occupancy at the
+		// instant it was made, and the far end is the only thing that can change
+		// it. Returning the latched error here would make the refusal permanent
+		// for every barrier — including the one an operator runs precisely
+		// because they believe the authority has since released — so the probe
+		// is armed for NOW and the caller joins the ordinary waiter path.
+		//
+		// It still terminates definitely: the re-offer produces either an
+		// advance (which relieves the verdict and satisfies the waiter) or
+		// another refusal (which wakes every waiter with the ENOSPC-wrapped
+		// cause through parkCapacity). One round trip, one answer, and a scope
+		// never stays `draining` — the property this function's doc insists on,
+		// now reached without killing the mount.
+		f.capacityAt = time.Time{}
+	}
 	q.urgent = true
 	// A barrier tries NOW: the backoff schedule protects steady state, not
 	// an explicit durability request after a transient failure.
@@ -588,6 +614,16 @@ func (f *flusher) nextWaitLocked(lane StreamLane) time.Duration {
 	q := &f.lanes[lane]
 	if len(q.pending) == 0 || f.terminal != nil {
 		return time.Hour
+	}
+	if f.capacity != nil {
+		// Re-offer on the slow probe rather than never. The condition is owned
+		// by the authority and clears there; a client that stopped asking would
+		// turn a relievable refusal into a permanent one and make remount the
+		// only exit, which is what this round removed.
+		if until := time.Until(f.capacityAt.Add(capacityProbeInterval)); until > 0 {
+			return until
+		}
+		return 0
 	}
 	if until := time.Until(q.nextAttempt); until > 0 {
 		return until
@@ -840,20 +876,38 @@ func (f *flusher) sendBatch(lane StreamLane) {
 	// a definite verdict and letting the application see ENOSPC remains the
 	// only honest answer.
 	//
-	// So the verdict is taken at face value and the stream parks — with a cause
-	// that wraps ErrNoSpace, so every surface that already maps writeback
+	// So the verdict is taken at face value and the WRITE LANE degrades — with a
+	// cause that wraps ErrNoSpace, so every surface that already maps writeback
 	// errors (clientcore statusErr, the FUSE mount) answers the application a
 	// real ENOSPC. That is the whole point: a write that cannot be made durable
 	// must FAIL, in the application's own hands, with the errno POSIX defines
 	// for exactly this. An unexplained stall is not an answer.
 	//
+	// WHAT IT MUST NOT DO IS FENCE THE MOUNT. This arm used to call f.park,
+	// which calls markStreamDead, which latches ErrFailedClosed for the mount's
+	// lifetime — and ErrFailedClosed is consulted by clientcore's
+	// beginExactOperation, the gate in front of the exact-handle READ, GETATTR
+	// and GETXATTR paths. So "let the application see ENOSPC" was delivered as:
+	// ls EIO, stat EIO, read EIO, mkdir EIO, on every path of the volume, until
+	// remount — and the documented remedy (truncate to release the authority's
+	// memory) was itself refused, because Truncate takes the same gate. The
+	// product's own promise is the opposite one (docs/self-hosting.md: "Writes
+	// past the bound refuse with ENOSPC; reads, truncates, and metadata
+	// operations always keep working").
+	//
+	// parkCapacity is that promise. It is definite for WRITES and inert for
+	// everything else, and it is relievable: the authority's dirty pool folds on
+	// cut adoption (round 19), and the truncate this now permits is exactly what
+	// hands those blocks back. See parkCapacity.
+	//
 	// This does not weaken the "UNKNOWN IS RETRYABLE" rule above it — it is the
-	// enumerated exception that rule always allowed for. Terminal still
-	// requires proof; a named capacity refusal is proof, and a catch-all is not.
+	// enumerated exception that rule always allowed for. Definite still requires
+	// proof; a named capacity refusal is proof, and a catch-all is not.
 	case reply.Status == 28 || reply.Status == 122: // ENOSPC / EDQUOT
-		f.park(fmt.Errorf(
+		f.parkCapacity(fmt.Errorf(
 			"%w: authority refused the %s-lane batch for capacity (status %d); "+
-				"nothing on this side can relieve it",
+				"writes refuse until the authority releases the bounded store "+
+				"(reads, metadata and releasing truncates keep working)",
 			ErrNoSpace, lane, reply.Status,
 		))
 
@@ -903,6 +957,14 @@ func (f *flusher) sendBatch(lane StreamLane) {
 // records the durable APPLIED checkpoint.
 func (f *flusher) advance(lane StreamLane, through uint64) {
 	f.mu.Lock()
+	// THE AUTHORITY JUST DISPROVED THE REFUSAL. An applied batch is the only
+	// evidence that can un-refuse a capacity verdict, and it is conclusive: the
+	// bounded store took bytes. Thaw the write gate here, under the same hold
+	// that records the advance, so no writer can observe the progress without
+	// also observing that writing is allowed again. Relief is why this whole
+	// path is a freeze and not a seal — an operator should not have to remount
+	// to notice that a history cut folded the authority's dirty pool.
+	relieved := f.relieveCapacityLocked()
 	q := &f.lanes[lane]
 	if q.attemptEnd != 0 && through >= q.attemptEnd {
 		q.attemptEnd = 0
@@ -1000,6 +1062,12 @@ func (f *flusher) advance(lane StreamLane, through uint64) {
 	// digest in the APPLIED checkpoint.
 	mark := f.stream
 	f.mu.Unlock()
+	if relieved && f.e.thawCapacityIfLive() {
+		f.e.logf("writeback: authority applied a %s-lane batch; the capacity refusal is relieved and writes are admitted again", lane)
+		if cb := f.e.cfg.Events.OnHealth; cb != nil {
+			go cb(nil)
+		}
+	}
 	// A namespace advance can release a data batch that was waiting on its
 	// dependency. Nudge the data worker rather than making it poll.
 	if lane == StreamLaneNamespace {
@@ -1105,6 +1173,11 @@ func (f *flusher) noteFailure(lane StreamLane, msg string) {
 func (f *flusher) park(err error) {
 	f.mu.Lock()
 	f.terminal = err
+	// A proven contradiction OUTRANKS a capacity refusal and replaces it. Both
+	// verdicts standing would let Status report a mount as capacity-refused
+	// (writes ENOSPC, everything else fine) while it is in fact fenced.
+	f.capacity = nil
+	f.capacityAt = time.Time{}
 	f.lastFailure = err.Error()
 	f.lastFailAt = time.Now()
 	f.degraded = true
@@ -1142,6 +1215,146 @@ func (f *flusher) park(err error) {
 	}
 }
 
+// capacityProbeInterval is how often a capacity-refused lane re-offers its
+// batch. It is slow on purpose: the refusal is a statement about a bounded
+// store at the AUTHORITY, and the only events that change it (a history cut
+// being adopted and folding the dirty pool, or a releasing truncate landing)
+// happen on the authority's own schedule in tens of seconds, not milliseconds.
+// Re-offering faster would be the client inventing progress; never re-offering
+// at all would make a relievable condition permanent, which is the bug this
+// whole path exists to remove.
+const capacityProbeInterval = 15 * time.Second
+
+// parkCapacity is the CAPACITY verdict: definite for writes, inert for
+// everything else, and relievable by the authority.
+//
+// It is deliberately a different function from park, and the difference is the
+// entire round-21b fix. park is for a PROVEN CONTRADICTION about this stream —
+// a fence, an authority that rejected the batch's own content, a corrupt local
+// WAL. Those say the stream can never be drained by anyone, so sealing mutation
+// admission for the mount's lifetime (markStreamDead -> Engine.failClosed ->
+// ErrFailedClosed) is the honest answer.
+//
+// A capacity refusal says none of that. It says a bounded store at the far end
+// is FULL RIGHT NOW. Every byte this stream holds is intact, every byte the
+// authority holds is intact, and the local mount is in perfect health. Treating
+// it as a contradiction latched ErrFailedClosed, and ErrFailedClosed is the
+// gate in front of clientcore's exact-handle read/getattr/getxattr paths and in
+// front of Truncate — so a full store took ls, stat, read and the documented
+// remedy itself to EIO, for the lifetime of the mount.
+//
+// So this path latches exactly one thing: the DATA CREDIT gate, frozen with the
+// ErrNoSpace-wrapped cause. That is the narrowest object that means "writes".
+// Every byte-admitting path already routes through it (Engine.AcquireDataCredit
+// from the frontends, admitDataBytes from the engine's own write path), so a
+// write gets a definite ENOSPC before it touches a lock, while reads, metadata
+// mutations, and a releasing truncate never consult it at all.
+//
+// It is a FREEZE and not a SEAL because it must be reversible: creditController
+// .thaw is what a later successful flush calls (see advance), so an authority
+// that folds its dirty pool un-refuses the mount without a remount.
+//
+// The refused lane is not abandoned either. Its records stay pending and its
+// batch is re-offered on capacityProbeInterval, which is what turns "definite"
+// into "definite and recoverable" rather than "permanent".
+func (f *flusher) parkCapacity(err error) {
+	f.mu.Lock()
+	if f.terminal != nil {
+		// A real terminal verdict outranks a capacity refusal and is never
+		// downgraded by one.
+		f.mu.Unlock()
+		return
+	}
+	first := f.capacity == nil
+	f.capacity = err
+	f.capacityAt = time.Now()
+	f.lastFailure = err.Error()
+	f.lastFailAt = f.capacityAt
+	var waiters []*drainWaiter
+	for lane := range f.lanes {
+		waiters = append(waiters, f.lanes[lane].waiters...)
+		f.lanes[lane].waiters = nil
+	}
+	f.mu.Unlock()
+	// Freeze BEFORE releasing the waiters, for the same indivisibility reason
+	// park documents: a drain waiter's next act is typically to try another
+	// write, and it must not observe the refusal without also observing that
+	// writes are refused.
+	f.e.credits.freeze(err)
+	for _, wtr := range waiters {
+		wtr.ch <- err
+	}
+	if !first {
+		return
+	}
+	if cb := f.e.cfg.Events.OnHealth; cb != nil {
+		go cb(err)
+	}
+	if f.e.job != nil {
+		f.e.job.update(func(j *RecoveryJob) { j.LastError = err.Error() })
+		if persistErr := f.e.job.persist(); persistErr != nil {
+			f.e.logf("writeback: persist capacity-refused recovery job: %v", persistErr)
+		}
+	}
+}
+
+// relieveCapacityLocked clears a capacity refusal that the authority has just
+// disproved by applying a batch. Called from advance under f.mu.
+func (f *flusher) relieveCapacityLocked() (relieved bool) {
+	if f.capacity == nil {
+		return false
+	}
+	f.capacity = nil
+	f.capacityAt = time.Time{}
+	return true
+}
+
+// thawCapacityIfLive reopens the write gate a capacity refusal froze, but only
+// when this engine is still serving.
+//
+// The guard exists because the ledger's freeze is shared with the LIFECYCLE:
+// CloseWithBarrier freezes it with ErrFenced and then drains, and that drain can
+// be exactly the round trip that relieves a capacity refusal. Thawing there
+// would reopen a gate the close deliberately shut. (Mutation admission would
+// still refuse on e.frozen, so this is a defence in depth rather than a live
+// hole — but a gate that means one thing must not be reopened for another
+// thing's reason.)
+func (e *Engine) thawCapacityIfLive() bool {
+	if e.MutationError() != nil {
+		return false
+	}
+	e.mu.RLock()
+	live := !e.closed && !e.frozen
+	e.mu.RUnlock()
+	if !live {
+		return false
+	}
+	e.credits.thaw()
+	return true
+}
+
+// capacityRefusal reports the live capacity verdict, or nil.
+func (f *flusher) capacityRefusal() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.capacity
+}
+
+// CapacityRefusal reports the mount's live capacity verdict: non-nil (and
+// ErrNoSpace-wrapped) exactly while a bounded store at the authority is
+// refusing this stream's writes.
+//
+// It is NOT MutationError. MutationError is the mount-lifetime fail-closed
+// latch and answers every operation; this answers only the question "may this
+// mount admit new bytes right now", it clears by itself when the authority
+// releases, and reads, metadata and releasing truncates never ask it.
+func (e *Engine) CapacityRefusal() error {
+	if e == nil || e.fl == nil {
+		return nil
+	}
+	return e.fl.capacityRefusal()
+}
+
 func (e *Engine) markStreamDead(err error) {
 	dead := e.failClosed(err)
 	e.mu.Lock()
@@ -1173,7 +1386,15 @@ func (e *Engine) markStreamDead(err error) {
 // truth about whether anything is still moving.
 func (f *flusher) watchdog() {
 	f.mu.Lock()
-	if !f.degraded {
+	// A CAPACITY REFUSAL IS AN ANSWER, NOT A SILENCE. The sweep exists to catch
+	// a far end that has stopped answering, and it decides that from elapsed
+	// time alone — which is exactly the wrong instrument here, because the
+	// authority IS answering, promptly, with a verdict this client already
+	// holds. Latching degraded on it would convert the definite ENOSPC the
+	// application is being handed into the EIO-class "uplink stalled" answer
+	// every admission gate relays (see laneStallVerdictLocked, metadata
+	// admission, the credit gate) — the same misdiagnosis, one layer up.
+	if !f.degraded && f.capacity == nil {
 		for lane := range f.lanes {
 			q := &f.lanes[lane]
 			if len(q.pending) > 0 && !q.lastProgress.IsZero() &&
@@ -1274,6 +1495,18 @@ func (f *flusher) laneStallVerdictLocked(lane StreamLane, now time.Time) StallVe
 		// holds can ever be applied, and nothing will ever advance again.
 		return StallVerdict{Stalled: true}
 	}
+	if f.capacity != nil {
+		// NOT stalled. Stalled means "the far end has stopped answering", and
+		// every consumer of this verdict treats it that way — the credit gate
+		// returns ErrUplinkStalled (EIO-class) and the metadata gate relays it.
+		// A capacity-refused stream has a live, prompt far end and a definite
+		// answer already in the application's hands; reporting it as a dead
+		// uplink would replace that ENOSPC with the EIO this round removed.
+		//
+		// Pending is still true, and the remaining window is the probe: there IS
+		// unapplied work and there IS an event that could apply it.
+		return StallVerdict{Pending: len(f.lanes[lane].pending) > 0, Remaining: capacityProbeInterval}
+	}
 	q := &f.lanes[lane]
 	if len(q.pending) == 0 {
 		return StallVerdict{}
@@ -1346,6 +1579,10 @@ func (f *flusher) status() Status {
 	}
 	if !progress.IsZero() {
 		st.LastProgressMs = time.Since(progress).Milliseconds()
+	}
+	if f.capacity != nil {
+		st.CapacityRefused = true
+		st.LastFailure = f.capacity.Error()
 	}
 	if f.terminal != nil {
 		st.LastFailure = f.terminal.Error()

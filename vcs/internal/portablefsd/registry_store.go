@@ -91,6 +91,18 @@ func ReadPersistedAttachInventory(stateDir string) ([]PersistedAttachIdentity, e
 	return out, nil
 }
 
+// WritebackStoreDir names the write-back store portablefsd uses for one
+// (volume, branch) under stateDir — the same directory attach.forceDetach hands
+// to writeback.ForceParkAbandonedStore.
+//
+// It is exported so an OPERATOR TOOL can address the store without a daemon.
+// The recovery resolution (`portablefs recovery resolve`) is reached exactly
+// when the daemon cannot start serving this attach, so deriving the path from a
+// live attach is not available at the moment it is needed.
+func WritebackStoreDir(stateDir, volumeID, branch string) string {
+	return filepath.Join(stateDir, "wal", stableStorageID(storageKey(volumeID, branch)))
+}
+
 func (i persistedItemRecord) authorityItemID() uint64 {
 	if i.AuthorityItemID != 0 {
 		return i.AuthorityItemID

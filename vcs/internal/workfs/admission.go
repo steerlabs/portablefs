@@ -103,6 +103,12 @@ func (g *admissionGate) seal() <-chan struct{} {
 // authority is created through the normal ensure/start path instead.
 func (fs *FS) Seal(ctx context.Context) error {
 	drained := fs.admit.seal()
+	// Release every writer parked for memory. A paced write is in flight by
+	// the gate's accounting, so without this a quiesce would wait behind
+	// memory pressure that a sealing authority is never going to relieve.
+	if fs.pace != nil {
+		fs.pace.stop()
+	}
 	select {
 	case <-drained:
 		return nil

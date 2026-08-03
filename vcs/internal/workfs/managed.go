@@ -252,6 +252,7 @@ func NewManagedFromBase(base BaseImage, blobs content.BlobReader, log pfj3.Entry
 		byIno:        map[uint64]*inode{},
 		xattrs:       map[uint64]map[string][]byte{},
 		deadBaseInos: map[uint64]struct{}{},
+		pace:         newDirtyPacer(),
 		managed: &managedState{
 			log:      log,
 			reserved: pfc2.NewState(),
@@ -610,6 +611,21 @@ func (fs *FS) commitEntryDynamicTreePre(
 		fs.warmIntentWriteTargets(leavesOf(records))
 	}
 
+	// RESIDENT-BYTE PACING, and it happens HERE for a reason. Above the
+	// setpoint a write waits for memory to actually be released, and this is
+	// the last point before fs.mu, the per-inode locks, the exact-op slot and
+	// the LSN reservation. Waiting inside any of those converts memory
+	// pressure into lock and delegation deadlock: the fold is the only thing
+	// that can release the memory, and it needs fs.mu to do it. A row that
+	// allocates no dirty blocks — control-only, metadata, truncate, reap —
+	// charges nothing and passes straight through, which is what keeps the
+	// releasing operations admissible while a writer is being held.
+	if records != nil {
+		if err := fs.paceDirtyGrowth(dirtyWriteReserveTotal(leavesOf(records))); err != nil {
+			return entryOutcome{}, err
+		}
+	}
+
 	fs.mu.Lock()
 	// Identity preassignment below burns allocator ids. Until the buffered
 	// append succeeds nothing durable references them, and fs.mu is held
@@ -826,6 +842,20 @@ func (fs *FS) commitEntriesGroup(specs []entrySpec, owner string) (uint64, error
 			return 0, fmt.Errorf("managed group row %d: %w", i, herr)
 		}
 		fs.warmIntentWriteTargets(leavesOf([]wal.Record{*specs[i].tree}))
+	}
+
+	// Pacing for the write-back batch path, on the same pre-lock boundary and
+	// for the same reason (see commitEntryDynamicTreePre). The whole group is
+	// charged once: it reserves and applies as one, so holding it per row
+	// would let part of a batch through and stall the rest under the lock.
+	var groupReserve int64
+	for i := range specs {
+		if specs[i].tree != nil {
+			groupReserve += dirtyWriteReserveTotal(leavesOf([]wal.Record{*specs[i].tree}))
+		}
+	}
+	if err := fs.paceDirtyGrowth(groupReserve); err != nil {
+		return 0, err
 	}
 
 	fs.mu.Lock()

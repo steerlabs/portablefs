@@ -82,9 +82,17 @@ func (e *cmdEnv) discardMountRecord(
 		if filepath.Clean(entry.MountPath) != mountPath {
 			continue
 		}
+		// THE OTHER END OF THE CYCLE. This blocker sends the operator to
+		// `umount --force`, which is exactly what sent them here when a
+		// terminally conflict/corrupt recovery job refused the force. Naming
+		// only --force made the two refusals point at each other with no exit;
+		// naming the resolution too is what turns the cycle into a path.
 		blockers = append(blockers, fmt.Errorf(
-			"portablefsd still holds a durable attach %s for %s, which may own an unshipped write-back tail; run `portablefs umount --force %s` to park it as a recovery job first",
-			entry.AttachRef, mountPath, mountPath,
+			"portablefsd still holds a durable attach %s for %s, which may own an unshipped write-back tail; "+
+				"run `portablefs umount --force %s` to park it as a recovery job first "+
+				"(if that force refuses with a terminally conflict or corrupt recovery job, "+
+				"clear it with `portablefs recovery resolve %s --all-terminal`, then force again)",
+			entry.AttachRef, mountPath, mountPath, mountPath,
 		))
 	}
 

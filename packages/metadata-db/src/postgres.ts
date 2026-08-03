@@ -323,6 +323,26 @@ const migrationIds = [
   // body. The child still refuses what it cannot prove; the proof it demands
   // is now the one the system actually issues.
   "037_adoption_base_proof",
+  // 038 stops a SLOW manager claim renewal from being thrown away. 034 could
+  // not sample the database clock after its own row wait, so it sampled
+  // before the write and rolled the whole renewal back when more than a fixed
+  // 250 ms had elapsed by the time the write settled. Under an ordinary bulk
+  // write flood that fired constantly — measured: the renewal's UPDATE costs
+  // the same as a trivial single-row UPDATE of an unrelated table (max 78.85
+  // vs 64.53 ms), waiting on IO/WALSync, LWLock/WALWrite and LWLock/WALInsert
+  // with zero Lock/transactionid, and removing the claim row from the flood
+  // changes nothing. It is generic WAL back-pressure, which a durable
+  // renewal cannot be isolated from. So three correct renewals inside one
+  // 30 s TTL were discarded, expires_at stopped advancing, and the fleet's
+  // singleton manager fenced itself — taking every child and every tenant's
+  // leases with it. 038 reports the POST-WRITE clock as dbTimeMs (a renewal
+  // that cost T ms hands back T ms less instead of nothing) and replaces the
+  // fixed bound with the exact condition under which extending is unsound:
+  // the claim's pre-existing expiry had already passed when the write
+  // settled. That case now raises PF001 and fences immediately, so the
+  // change is strictly stronger where it matters and strictly more tolerant
+  // where it does not.
+  "038_manager_renew_anchored_grant",
 ] as const;
 const maxManifestDiffChainDepth = 32;
 const headNotifyChannel = "portablefs_head";

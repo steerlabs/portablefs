@@ -50,8 +50,18 @@ const foldPressureThreshold = 0.5
 // foldMaxInodesPerPass bounds one pass's base resolves so a pathological
 // namespace cannot turn a fold into an unbounded stall. Candidates are taken
 // biggest-resident-first, so a bounded pass still releases the most memory
-// available, and the next tick takes the rest.
+// available, and the next tick takes the rest — which it now actually does:
+// FoldToBase holds the folded watermark back on a pass that left foldable
+// work, and this driver comes straight back at foldRetryInterval.
 const foldMaxInodesPerPass = 4096
+
+// foldRetryInterval is the cadence of the follow-up pass after one that left
+// foldable work at the same watermark (a bounded candidate list it made
+// progress through, or a transient resolve failure). It is short because the
+// memory in question is resident NOW and the pass already proved the relief
+// is available; it is not zero because a persistent resolve failure must not
+// become a spin against the object store.
+const foldRetryInterval = 1 * time.Second
 
 // foldDriver folds this child's resident dirty blocks into each newly adopted
 // history-cut base.
@@ -87,7 +97,23 @@ func (d *foldDriver) run(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		d.once(ctx)
+		// Refresh the release-rate estimate on every tick: it is the number
+		// that decides what sustained write throughput this volume can
+		// actually promise, and an operator watching a paced volume needs it
+		// next to the pacing setpoint.
+		d.fs.DirtyReleaseRate()
+
+		// A pass that left foldable work AT THIS WATERMARK comes back at the
+		// fast cadence rather than the relaxed one: the blocks it did not get
+		// to are resident right now, and the relief they represent is already
+		// proven available. Waiting the relaxed interval — or, before the
+		// watermark stopped advancing on an incomplete pass, waiting for the
+		// NEXT ADOPTION — is what let a bounded pass or one object-store blip
+		// cap the relief rate.
+		if d.once(ctx) {
+			timer.Reset(foldRetryInterval)
+			continue
+		}
 		timer.Reset(d.interval())
 	}
 }
@@ -109,15 +135,17 @@ func (d *foldDriver) pressure() float64 {
 	return float64(d.fs.DirtyBlockBytes()) / float64(max)
 }
 
-// once runs at most one fold pass against the currently adopted base.
-func (d *foldDriver) once(ctx context.Context) {
+// once runs at most one fold pass against the currently adopted base. It
+// reports whether the pass left foldable work at that watermark, so the
+// caller can come back promptly instead of parking the remaining blocks.
+func (d *foldDriver) once(ctx context.Context) bool {
 	baseSeq := d.rlog.CompactedThrough()
 	if baseSeq == 0 || baseSeq <= d.fs.FoldedWatermark() {
-		return // no adoption has landed since the last fold
+		return false // no adoption has landed since the last fold
 	}
 	commitID := d.rlog.BaseCommitID()
 	if commitID == "" {
-		return
+		return false
 	}
 	id := d.identity
 	id.CommitID = commitID
@@ -130,7 +158,7 @@ func (d *foldDriver) once(ctx context.Context) {
 			log.Printf("dirty-block fold: prove adopted base %s at seq %d: %v (blocks stay resident; retrying)",
 				commitID, baseSeq, err)
 		}
-		return
+		return false
 	}
 	if resolved.proof.Kind != "pft2" {
 		// Only a PFT2 base carries the numeric inode index the fold resolves
@@ -142,12 +170,12 @@ func (d *foldDriver) once(ctx context.Context) {
 				"are released by truncate/reap only on this generation", resolved.proof.Kind)
 			d.unsupportedLogged = true
 		}
-		return
+		return false
 	}
 	root, err := resolved.proof.RootRef()
 	if err != nil {
 		log.Printf("dirty-block fold: adopted base %s root ref: %v", commitID, err)
-		return
+		return false
 	}
 	// Bind the proof to the exact watermark being folded to. The anchor's
 	// as-of sequence IS the cut sequence the base was materialised at; folding
@@ -157,12 +185,12 @@ func (d *foldDriver) once(ctx context.Context) {
 		asOf, aerr := resolved.proof.AnchorAsOf()
 		if aerr != nil {
 			log.Printf("dirty-block fold: adopted base %s anchor as-of: %v", commitID, aerr)
-			return
+			return false
 		}
 		if asOf != baseSeq {
 			log.Printf("dirty-block fold: adopted base %s anchor as-of %d does not restate the journal base seq %d; refusing to fold",
 				commitID, asOf, baseSeq)
-			return
+			return false
 		}
 	}
 
@@ -172,22 +200,24 @@ func (d *foldDriver) once(ctx context.Context) {
 	base, err := workfs.Pft2FoldBase(d.cache, baseSeq, commitID, root)
 	if err != nil {
 		log.Printf("dirty-block fold: open adopted base %s: %v", commitID, err)
-		return
+		return false
 	}
 	base.MaxInodes = foldMaxInodesPerPass
 
 	before := d.fs.DirtyBlockBytes()
 	report, ferr := d.fs.FoldToBase(ctx, base)
 	if ferr != nil && errors.Is(ferr, workfs.ErrFoldStale) {
-		return // a concurrent pass already folded this watermark
+		return false // a concurrent pass already folded this watermark
 	}
 	if report.Blocks > 0 || ferr != nil {
 		log.Printf("dirty-block fold: base %s seq %d -> %d inodes / %d blocks / %d MiB released "+
-			"(resident %d -> %d MiB, candidates %d absent %d raced %d failed %d)%s",
+			"(resident %d -> %d MiB, candidates %d absent %d raced %d failed %d deferred %d)%s",
 			commitID, baseSeq, report.Inodes, report.Blocks, report.BytesReleased>>20,
 			before>>20, report.Resident>>20,
-			report.Candidates, report.Absent, report.Raced, report.Failed, foldErrSuffix(ferr))
+			report.Candidates, report.Absent, report.Raced, report.Failed, report.Deferred,
+			foldErrSuffix(ferr))
 	}
+	return report.Retryable && ctx.Err() == nil
 }
 
 func foldErrSuffix(err error) string {

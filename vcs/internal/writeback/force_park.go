@@ -579,7 +579,15 @@ func validateJobIdentity(
 	switch job.State {
 	case JobActive, JobForced, JobReplaying, JobParked:
 	case JobConflict, JobCorrupt:
-		return fmt.Errorf("writeback: job is terminally %s and requires explicit recovery resolution", job.State)
+		// TYPED, so the daemon and the CLI can name the exact command that
+		// performs the resolution for the mount in hand. Until round 21b this
+		// was a bare string naming a procedure that did not exist, and it closed
+		// the umount/--force/--discard-record cycle with no exit at all. See
+		// resolve_recovery.go.
+		return fmt.Errorf(
+			"%w: job %s is terminally %s (%s)",
+			ErrRecoveryResolutionRequired, job.JobID, job.State, job.LastError,
+		)
 	default:
 		return fmt.Errorf("%w: job has unknown state %q", ErrCorrupt, job.State)
 	}
