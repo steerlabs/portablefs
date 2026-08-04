@@ -1,0 +1,22 @@
+experiment,engine,parameter,samples,logical_bytes,kernel_disk_bytes,kernel_amplification,kernel_bytes_per_sample,duration_ms,p50_us,p95_us,p99_us,max_us,notes,go_version,os,arch
+fsync-floor,apfs,0,128,0,0,,0.000,21,0.458,0.667,4148.250,5091.917,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,64,128,8192,786432,96.000000,6144.000,429,3185.208,4054.500,4112.791,4424.708,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,512,128,65536,1310720,20.000000,10240.000,439,3219.333,3894.875,4069.625,5158.750,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,4096,128,524288,1310720,2.500000,10240.000,519,3847.708,5876.625,6102.458,6961.167,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,16384,128,2097152,2097152,1.000000,16384.000,489,3802.250,4148.375,4234.666,5825.833,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,65536,128,8388608,8388608,1.000000,65536.000,494,3834.125,4125.917,4136.125,4158.291,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,262144,128,33554432,33554432,1.000000,262144.000,510,3790.458,4149.625,7584.000,7816.959,append bytes per durable barrier,go1.26.5,darwin,arm64
+fsync-floor,apfs,1048576,128,134217728,134217728,1.000000,1048576.000,505,3702.084,4087.208,4108.917,4125.667,append bytes per durable barrier,go1.26.5,darwin,arm64
+batch-benefit,seglog,1,8192,33554432,164024320,4.888306,20022.500,27888,3149.791,4068.958,4820.792,8137.958,groups=8192 appended=34086912,go1.26.5,darwin,arm64
+batch-benefit,seglog,2,8192,33554432,97402880,2.902832,11890.000,14526,3209.333,4132.625,5778.375,15700.500,groups=4097 appended=33988632,go1.26.5,darwin,arm64
+batch-benefit,seglog,4,8192,33554432,64212992,1.913696,7838.500,7770,3759.708,4159.417,5880.916,12765.750,groups=2050 appended=33939504,go1.26.5,darwin,arm64
+batch-benefit,seglog,8,8192,33554432,47878144,1.426880,5844.500,4511,3910.417,5991.875,7592.334,31015.667,groups=1025 appended=33914904,go1.26.5,darwin,arm64
+batch-benefit,seglog,16,8192,33554432,39219200,1.168823,4787.500,2112,3806.250,4592.541,5994.458,6126.417,groups=514 appended=33902640,go1.26.5,darwin,arm64
+batch-benefit,seglog,32,8192,33554432,36503552,1.087891,4456.000,1101,3780.292,5517.083,6367.042,8003.292,groups=258 appended=33896496,go1.26.5,darwin,arm64
+batch-benefit,seglog,64,8192,33554432,35172352,1.048218,4293.500,547,3648.542,4519.334,6139.041,6596.000,groups=130 appended=33893424,go1.26.5,darwin,arm64
+batch-benefit,seglog,128,8192,33554432,34549760,1.029663,4217.500,266,3637.625,3995.709,4518.459,4627.542,groups=66 appended=33891888,go1.26.5,darwin,arm64
+batch-benefit,seglog,256,8192,33554432,34226176,1.020020,4178.000,145,3630.584,4080.625,4135.583,4466.541,groups=34 appended=33891120,go1.26.5,darwin,arm64
+recovery,seglog,full-scan,262144,0,0,,0.000,236,215209.833,0.000,0.000,0.000,scanned=1084515480 segments=65 keys=262144,go1.26.5,darwin,arm64
+index-memory,seglog,in-memory-map,262144,0,0,,0.000,0,0.000,0.000,0.000,0.000,heap_delta_bytes=31710336 bytes_per_key=121.0,go1.26.5,darwin,arm64
+read-latency,seglog,random-point-read,20000,0,0,,0.000,42,1.791,3.042,5.625,81.833,page cache warm; index lookup plus one pread,go1.26.5,darwin,arm64
+recovery,seglog,index+tail,262144,0,0,,0.000,73,52190.417,0.000,0.000,0.000,scanned=0 index_entries=262144 keys=262144,go1.26.5,darwin,arm64
