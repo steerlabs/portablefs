@@ -6,25 +6,57 @@ package xfsstore
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
+	"syscall"
+
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 )
 
+// Every sentinel below carries the exact errno it must become at the protocol
+// boundary. The errno is part of the value, so the shared wire mapping
+// classifies it through errors.Is without having to recognize this package,
+// and in particular without inspecting any message text.
 var (
-	ErrUnsupportedPlatform = errors.New("xfsstore: production storage requires Linux")
-	ErrNotXFS              = errors.New("xfsstore: volume root is not on XFS")
-	ErrStaleObject         = errors.New("xfsstore: stale object capability")
-	ErrStaleOpen           = errors.New("xfsstore: stale open-handle capability")
-	ErrClosed              = errors.New("xfsstore: volume is closed")
-	ErrFenced              = errors.New("xfsstore: authoritative storage is fenced")
-	ErrOutcomeUncertain    = errors.New("xfsstore: operation changed XFS before a later local step failed")
-	ErrWrongDevice         = errors.New("xfsstore: object crossed the volume device boundary")
-	ErrProjectIsolation    = errors.New("xfsstore: XFS project inheritance does not match the volume")
-	ErrForbiddenType       = errors.New("xfsstore: object type is not remotely accessible")
-	ErrForbiddenXattr      = errors.New("xfsstore: extended attribute namespace is forbidden")
+	// ENOSYS: this build of PortableFS cannot serve authoritative storage at
+	// all on this platform, as opposed to failing one operation.
+	ErrUnsupportedPlatform = errnos.Sentinel("xfsstore: production storage requires Linux", syscall.ENOSYS)
+	// ENOTSUP: the configured root is a filesystem that cannot provide the
+	// guarantees this store is built on (project quota, reflink, d_type).
+	ErrNotXFS = errnos.Sentinel("xfsstore: volume root is not on XFS", syscall.ENOTSUP)
+	// ESTALE: capabilities are epoch-local. A capability this epoch never
+	// issued, or one issued by a closed epoch, is exactly a stale handle.
+	ErrStaleObject = errnos.Sentinel("xfsstore: stale object capability", syscall.ESTALE)
+	ErrStaleOpen   = errnos.Sentinel("xfsstore: stale open-handle capability", syscall.ESTALE)
+	ErrClosed      = errnos.Sentinel("xfsstore: volume is closed", syscall.ESTALE)
+	// EIO: fencing follows a storage failure, and the client must treat the
+	// volume as broken rather than retry.
+	ErrFenced = errnos.Sentinel("xfsstore: authoritative storage is fenced", syscall.EIO)
+	// EXDEV: an object outside this volume's device is exactly the condition
+	// rename(2) reports so callers fall back to copy+unlink.
+	ErrWrongDevice = errnos.Sentinel("xfsstore: object crossed the volume device boundary", syscall.EXDEV)
+	// EPERM: the object exists but is not this volume's to operate on.
+	ErrProjectIsolation = errnos.Sentinel("xfsstore: XFS project inheritance does not match the volume", syscall.EPERM)
+	ErrForbiddenType    = errnos.Sentinel("xfsstore: object type is not remotely accessible", syscall.EPERM)
+	// ENOTSUP is what getxattr(2)/setxattr(2) report for a namespace the
+	// filesystem does not serve, which is what a refused namespace is here.
+	ErrForbiddenXattr = errnos.Sentinel("xfsstore: extended attribute namespace is forbidden", syscall.ENOTSUP)
 )
 
-func outcomeUncertain(err error) error {
-	return errors.Join(ErrOutcomeUncertain, err)
+// ErrOutcomeUncertain deliberately carries no errno: it is a marker that is
+// only ever joined to the failure that produced it, and that failure supplies
+// the errno. Giving it one would also make every uncertain outcome look like
+// the storage EIO that fences the volume.
+var ErrOutcomeUncertain = errors.New("xfsstore: operation changed XFS before a later local step failed")
+
+// outcomeUncertain marks a failure that happened after XFS was already
+// modified. It refuses a nil cause so the marker can never travel alone and
+// reach the wire mapping without an errno.
+func outcomeUncertain(cause error) error {
+	if cause == nil {
+		panic("xfsstore: uncertain outcome without a cause")
+	}
+	return fmt.Errorf("%w: %w", ErrOutcomeUncertain, cause)
 }
 
 // Config contains provisioned identity, not tuning knobs. Project zero is
@@ -48,6 +80,14 @@ const (
 	KindRegular Kind = iota + 1
 	KindDirectory
 	KindSymlink
+	// KindOpaque names a directory entry that exists in the namespace but
+	// whose inode this authority never exposes: a device node, FIFO or socket
+	// that some other writer placed in the tree. It appears only in Dirent,
+	// never in Attr, because no capability is ever issued for such an inode.
+	// Listing it keeps one non-portable inode from making a whole directory
+	// unreadable, exactly as a local readdir(3) lists it and a later stat(2)
+	// on it fails.
+	KindOpaque
 )
 
 // Attr is the portable part of Linux statx. Change is assigned by the upper

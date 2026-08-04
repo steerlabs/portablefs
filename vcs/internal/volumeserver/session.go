@@ -52,8 +52,23 @@ type Config struct {
 	MaxReplaySlots uint32
 	MaxSessions    uint32
 	MaxLockRecords uint32
-	Now            func() time.Time
+	// MaxLockRecordsPerSession bounds the held plus queued byte-range lock
+	// records one session may occupy. Zero selects the equal-share value
+	// MaxLockRecords/MaxSessions: the largest bound under which a session that
+	// exhausts its budget provably cannot deny any other session the budget it
+	// was admitted on. Raising it above the equal share deliberately
+	// over-commits the table and gives up that guarantee.
+	MaxLockRecordsPerSession uint32
+	Now                      func() time.Time
 }
+
+// sessionCredentialGeneration is the single credential generation an authority
+// mints for a session. The authority has no in-session credential rotation
+// path, so this is a protocol constant rather than a counter, and any other
+// value in a presented credential is stale or forged and fences the session.
+// If rotation is ever added, this becomes per-session state and every
+// comparison site it needs already exists.
+const sessionCredentialGeneration uint64 = 1
 
 type SessionCredential struct {
 	Epoch      Epoch
@@ -90,13 +105,16 @@ type replaySlot struct {
 type session struct {
 	mu                    sync.Mutex
 	id                    SessionID
-	generation            uint64
 	secret                ResumeSecret
 	peer                  PeerIdentity
 	access                Access
 	leaseExpires          time.Time
 	authorizationDeadline time.Time
-	fenced                bool
+	// lockLease publishes leaseExpires to the lock table. It is written under
+	// s.mu wherever leaseExpires is, so the table can never read a lease
+	// boundary the authority has not granted.
+	lockLease *LockLease
+	fenced    bool
 	ending                bool
 	active                uint64
 	cleanupStarted        bool
@@ -167,7 +185,17 @@ func New(volumeID string, cfg Config) (*Authority, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	a := &Authority{volumeID: volumeID, cfg: cfg, sessions: make(map[SessionID]*session), locks: NewLockTable(cfg.MaxLockRecords)}
+	perSession := cfg.MaxLockRecordsPerSession
+	if perSession == 0 {
+		if perSession = cfg.MaxLockRecords / cfg.MaxSessions; perSession == 0 {
+			perSession = 1
+		}
+	}
+	if perSession > cfg.MaxLockRecords {
+		return nil, errors.New("volumeserver: per-session lock budget exceeds the lock table bound")
+	}
+	cfg.MaxLockRecordsPerSession = perSession
+	a := &Authority{volumeID: volumeID, cfg: cfg, sessions: make(map[SessionID]*session), locks: NewLockTable(cfg.MaxLockRecords, perSession, cfg.Now)}
 	if _, err := rand.Read(a.epoch[:]); err != nil {
 		return nil, fmt.Errorf("generate authority epoch: %w", err)
 	}
@@ -221,7 +249,7 @@ func (a *Authority) Attach(slots uint32, peer PeerIdentity, authorization Author
 		return SessionCredential{}, err
 	}
 	s := &session{
-		id: id, generation: 1, secret: secret, peer: peer, access: access,
+		id: id, secret: secret, peer: peer, access: access,
 		leaseExpires:          minTime(now.Add(a.cfg.SessionLease), authorization.Deadline),
 		authorizationDeadline: authorization.Deadline,
 		slots:                 make([]replaySlot, slots),
@@ -236,7 +264,11 @@ func (a *Authority) Attach(slots uint32, peer PeerIdentity, authorization Author
 	}
 	a.sessions[id] = s
 	a.sessionCount++
-	return SessionCredential{Epoch: a.epoch, ID: id, Generation: 1, Secret: secret, Peer: peer, Access: access}, nil
+	// A session becomes able to hold locks at exactly the moment it becomes
+	// live, and stops at exactly the moment it becomes terminal or its lease
+	// runs out. Registration is the only way a record or waiter can ever exist.
+	s.lockLease = a.locks.RegisterSession(id, s.leaseExpires)
+	return SessionCredential{Epoch: a.epoch, ID: id, Generation: sessionCredentialGeneration, Secret: secret, Peer: peer, Access: access}, nil
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -266,7 +298,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		}
 		return nil, ErrSessionFenced
 	}
-	if s.generation != cred.Generation || subtle.ConstantTimeCompare(s.secret[:], cred.Secret[:]) != 1 {
+	if cred.Generation != sessionCredentialGeneration || subtle.ConstantTimeCompare(s.secret[:], cred.Secret[:]) != 1 {
 		s.fenced = true
 		cleanup := a.endSessionLocked(cred.ID, s)
 		s.mu.Unlock()
@@ -299,6 +331,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 	}
 	if renew {
 		s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), s.authorizationDeadline)
+		s.lockLease.Renew(s.leaseExpires)
 	}
 	s.active++
 	use := &SessionUse{authority: a, session: s, id: cred.ID, access: s.access}
@@ -315,6 +348,19 @@ func (a *Authority) Begin(cred SessionCredential) (*SessionUse, error) {
 
 // endSessionLocked marks a session terminal and removes it from admission. The
 // caller holds a.mu and s.mu. It reports whether cleanup can start immediately.
+//
+// Byte-range locks are surrendered here rather than in finishSession. A
+// terminal session may still have admitted operations in flight — including a
+// blocking F_SETLKW whose pin is precisely what keeps cleanup deferred — and
+// those operations must not be able to acquire, hold, or be granted a lock
+// under a session the authority has already given up on. Releasing at the
+// instant the session becomes terminal makes the two facts, "the authority
+// still recognises this session" and "this session may own locks", the same
+// fact, and it unblocks the waiters whose pins would otherwise stall the drain
+// forever.
+//
+// Lock order is a.mu -> s.mu -> LockTable.mu. The lock table is a leaf: it
+// never calls back into the authority.
 func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 	if !s.ending {
 		s.ending = true
@@ -322,6 +368,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 		if a.sessions[id] == s {
 			delete(a.sessions, id)
 		}
+		a.locks.ReleaseSession(id)
 	}
 	if s.active == 0 && !s.cleanupStarted {
 		s.cleanupStarted = true
@@ -330,8 +377,11 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 	return false
 }
 
+// finishSession runs once the last admitted operation of a terminal session has
+// released its pin. Byte-range locks are already gone by then; what remains is
+// the runtime resource cleanup that must outlive in-flight operations, such as
+// the open file descriptions they are still reading and writing.
 func (a *Authority) finishSession(id SessionID) {
-	a.locks.ReleaseSession(id)
 	a.notifySessionEnd(id)
 	a.mu.Lock()
 	if a.sessionCount > 0 {

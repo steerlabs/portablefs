@@ -11,13 +11,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// XATTR_SIZE_MAX and XATTR_LIST_MAX from <uapi/linux/limits.h>. The VFS
+// enforces both on every filesystem in vfs_setxattr and when assembling a
+// listing, so a buffer of this size cannot come back short.
+const (
+	xattrSizeMax = 65536
+	xattrListMax = 65536
+)
+
 func (v *Volume) withDataFD(id Capability, write bool, fn func(int) error) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	obj, err := v.objectLocked(id)
+	obj, err := v.holdObject(id)
 	if err != nil {
 		return err
 	}
+	defer obj.release()
 	if obj.kind == KindSymlink {
 		return syscall.EOPNOTSUPP
 	}
@@ -28,7 +35,7 @@ func (v *Volume) withDataFD(id Capability, write bool, fn func(int) error) error
 	if obj.kind == KindDirectory {
 		flags |= unix.O_DIRECTORY
 	}
-	fd, err := reopen(obj.fd, flags)
+	fd, err := v.reopen(obj.fd(), flags, obj.kind)
 	if err != nil {
 		return err
 	}
@@ -37,32 +44,44 @@ func (v *Volume) withDataFD(id Capability, write bool, fn func(int) error) error
 }
 
 func (v *Volume) Chmod(id Capability, mode fs.FileMode) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	obj, err := v.objectLocked(id)
+	unixMode, err := modeToUnix(mode)
 	if err != nil {
 		return err
 	}
+	obj, err := v.holdObject(id)
+	if err != nil {
+		return err
+	}
+	defer obj.release()
 	if obj.kind == KindSymlink {
 		return syscall.EOPNOTSUPP
 	}
-	return unix.Fchmodat(obj.fd, "", modeToUnix(mode), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	return unix.Fchmodat(obj.fd(), "", unixMode, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
-// Chown uses -1 to leave one side unchanged, matching fchownat.
+// Chown uses -1 to leave one side unchanged, matching fchownat. The owner
+// identity it compares against is written once, before the volume is
+// published, and never afterwards.
 func (v *Volume) Chown(id Capability, uid, gid int) error {
 	if uid >= 0 && uint32(uid) != v.ownerUID || gid >= 0 && uint32(gid) != v.ownerGID {
 		return syscall.EPERM
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	obj, err := v.objectLocked(id)
+	obj, err := v.holdObject(id)
 	if err != nil {
 		return err
 	}
-	return unix.Fchownat(obj.fd, "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	defer obj.release()
+	return unix.Fchownat(obj.fd(), "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
+// SetTimes addresses the inode through the descriptor itself. x/sys passes a
+// pointer to an empty string rather than NULL, so this is the AT_EMPTY_PATH
+// form of utimensat(2) rather than the NULL-pathname form; utimensat(2)
+// documents only "0 or AT_SYMLINK_NOFOLLOW", but the kernel accepts and
+// implements AT_EMPTY_PATH here (verified on Linux 6.8 against XFS, for both
+// a regular file and a symlink held by an O_PATH descriptor, including that
+// the requested timestamps land). The same call without AT_EMPTY_PATH returns
+// ENOENT, so this is not an optional flag that could be dropped.
 func (v *Volume) SetTimes(id Capability, atimeNS, mtimeNS *int64, atimeNow, mtimeNow bool) error {
 	if atimeNS == nil && mtimeNS == nil && !atimeNow && !mtimeNow {
 		return fs.ErrInvalid
@@ -70,12 +89,11 @@ func (v *Volume) SetTimes(id Capability, atimeNS, mtimeNS *int64, atimeNow, mtim
 	if atimeNS != nil && atimeNow || mtimeNS != nil && mtimeNow {
 		return fs.ErrInvalid
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	obj, err := v.objectLocked(id)
+	obj, err := v.holdObject(id)
 	if err != nil {
 		return err
 	}
+	defer obj.release()
 	times := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, {Nsec: unix.UTIME_OMIT}}
 	if atimeNow {
 		times[0].Nsec = unix.UTIME_NOW
@@ -87,7 +105,7 @@ func (v *Volume) SetTimes(id Capability, atimeNS, mtimeNS *int64, atimeNow, mtim
 	} else if mtimeNS != nil {
 		times[1] = unix.NsecToTimespec(*mtimeNS)
 	}
-	return unix.UtimesNanoAt(obj.fd, "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	return unix.UtimesNanoAt(obj.fd(), "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func (v *Volume) TruncateObject(id Capability, size int64) error {
@@ -110,29 +128,42 @@ func (v *Volume) GetXattr(id Capability, name string) ([]byte, error) {
 	return value, err
 }
 
-func getXattrValue(fd int, name string) ([]byte, error) {
-	// getxattr's size probe and read are not atomic with replacement. Never use
-	// the returned count until the syscall succeeds: Linux returns -1 on ERANGE,
-	// which would otherwise become a negative slice bound and panic the worker.
-	for range 8 {
-		size, err := unix.Fgetxattr(fd, name, nil)
-		if err != nil {
-			return nil, err
-		}
-		value := make([]byte, size)
-		n, err := unix.Fgetxattr(fd, name, value)
-		if errors.Is(err, syscall.ERANGE) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if n < 0 || n > len(value) {
-			return nil, syscall.EIO
-		}
-		return value[:n], nil
+// sizedRead runs the two-call size-probe pattern shared by getxattr and
+// listxattr. The probe and the fetch are not atomic, so a concurrent
+// replacement can grow the value in between and the fetch fails with ERANGE.
+// The retry then uses the kernel's own hard ceiling for the object, which
+// vfs_setxattr enforces on every filesystem, so the second call cannot report
+// ERANGE for any value that could exist. Two bounded attempts always settle
+// it; there is no attempt count to run out of and therefore no need to invent
+// an errno - getxattr(2) has no EAGAIN, and a client that receives one has no
+// correct handling for it.
+func sizedRead(ceiling int, fetch func(buf []byte) (int, error)) ([]byte, error) {
+	size, err := fetch(nil)
+	if err != nil {
+		return nil, err
 	}
-	return nil, syscall.EAGAIN
+	if size < 0 || size > ceiling {
+		return nil, syscall.EIO
+	}
+	buf := make([]byte, size)
+	n, err := fetch(buf)
+	if errors.Is(err, syscall.ERANGE) {
+		buf = make([]byte, ceiling)
+		n, err = fetch(buf)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if n < 0 || n > len(buf) {
+		return nil, syscall.EIO
+	}
+	return buf[:n], nil
+}
+
+func getXattrValue(fd int, name string) ([]byte, error) {
+	return sizedRead(xattrSizeMax, func(buf []byte) (int, error) {
+		return unix.Fgetxattr(fd, name, buf)
+	})
 }
 
 func (v *Volume) SetXattr(id Capability, name string, value []byte, mode XattrMode) error {
@@ -158,16 +189,13 @@ func (v *Volume) RemoveXattr(id Capability, name string) error {
 func (v *Volume) ListXattr(id Capability) ([]string, error) {
 	var names []string
 	err := v.withDataFD(id, false, func(fd int) error {
-		size, err := unix.Flistxattr(fd, nil)
+		list, err := sizedRead(xattrListMax, func(buf []byte) (int, error) {
+			return unix.Flistxattr(fd, buf)
+		})
 		if err != nil {
 			return err
 		}
-		buf := make([]byte, size)
-		n, err := unix.Flistxattr(fd, buf)
-		if err != nil {
-			return err
-		}
-		for _, raw := range bytes.Split(buf[:n], []byte{0}) {
+		for _, raw := range bytes.Split(list, []byte{0}) {
 			if len(raw) == 0 {
 				continue
 			}
@@ -181,25 +209,35 @@ func (v *Volume) ListXattr(id Capability) ([]string, error) {
 	return names, err
 }
 
+// StatFS reports this volume's entitlement, not the cell's.
+//
+// The descriptor is the volume root, which carries XFS_DIFLAG_PROJINHERIT and
+// a provisioned project ID. xfs_fs_statfs calls xfs_qm_statvfs for exactly
+// such an inode when the mount has project-quota accounting and enforcement
+// (-o prjquota), and rewrites f_blocks/f_bfree/f_bavail and f_files/f_ffree to
+// the project's limits and usage. No capability is required for that: it is
+// statfs(2) on a directory, not quotactl(2), and it is how per-container df
+// works on overlay2 with pquota.
+//
+// Verified on Linux 6.8 against a real XFS mounted -o prjquota with a project
+// carrying bhard=100m,ihard=1000: the volume root reports f_blocks*f_bsize =
+// 104857600 and f_files = 1000, while the cell root on the same mount reports
+// 4227858432 and 2097152. Writes into the volume stopped at exactly the
+// reported capacity.
+//
+// This depends on provisioning setting a limit for the project: XFS reports
+// cell-wide values for a project with no limit, and then every free-space
+// precheck in rsync, an installer or a database sees the cell.
 func (v *Volume) StatFS() (FSStat, error) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	if v.closed {
-		return FSStat{}, ErrClosed
-	}
-	if v.fenced != nil {
-		return FSStat{}, v.fenced
-	}
-	var stat unix.Statfs_t
-	if err := unix.Fstatfs(v.rootFD, &stat); err != nil {
+	root, err := v.holdObject(v.rootCapability())
+	if err != nil {
 		return FSStat{}, err
 	}
-	// Project quota accounting is intentionally not queried here. Linux protects
-	// project-quota records with CAP_SYS_ADMIN, while the data-plane process must
-	// remain unprivileged. XFS still enforces the provisioned hard limits and
-	// returns EDQUOT; statfs has the same cell-wide meaning it has for an ordinary
-	// local directory on that XFS mount. Privileged provisioning and monitoring
-	// attest the per-project limits outside the request process.
+	defer root.release()
+	var stat unix.Statfs_t
+	if err := unix.Fstatfs(root.fd(), &stat); err != nil {
+		return FSStat{}, err
+	}
 	return FSStat{
 		BlockSize:       uint64(stat.Bsize),
 		Blocks:          stat.Blocks,

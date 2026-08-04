@@ -31,6 +31,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/backend"
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
 	"github.com/steerlabs/portablefs/vcs/internal/content"
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/fstransition"
 	"github.com/steerlabs/portablefs/vcs/internal/metrics"
 	"github.com/steerlabs/portablefs/vcs/internal/pfj3"
@@ -61,10 +62,10 @@ var (
 // POSIX rename/dir errors. The messages match the fsproto error mapper so a
 // client sees the right errno (ENOTEMPTY / EISDIR / ENOTDIR / EINVAL).
 var (
-	errNotEmpty      = errors.New("directory not empty")
-	errIsDir         = errors.New("is a directory")
-	errNotDir        = errors.New("not a directory")
-	errInvalidRename = errors.New("invalid argument: rename into own subtree")
+	errNotEmpty      = errnos.Sentinel("directory not empty", syscall.ENOTEMPTY)
+	errIsDir         = errnos.Sentinel("is a directory", syscall.EISDIR)
+	errNotDir        = errnos.Sentinel("not a directory", syscall.ENOTDIR)
+	errInvalidRename = errnos.Sentinel("invalid argument: rename into own subtree", syscall.EINVAL)
 	// errNoXattr is the removexattr/getxattr missing-name outcome (Linux
 	// ENODATA semantics — deliberately an error, never a silent no-op).
 	// Wrapping syscall.ENODATA routes it through the shared errnos mapping.

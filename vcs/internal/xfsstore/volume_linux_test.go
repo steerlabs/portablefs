@@ -18,7 +18,7 @@ import (
 
 func openTestVolume(t *testing.T) *Volume {
 	t.Helper()
-	v, err := open(filepath.Clean(t.TempDir()), false, 0)
+	v, err := open(filepath.Clean(t.TempDir()), false, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestGetXattrHandlesConcurrentReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	v.mu.RLock()
-	fd, err := reopen(v.objects[item].fd, unix.O_RDWR)
+	fd, err := v.reopen(v.objects[item].res.fd, unix.O_RDWR, KindRegular)
 	v.mu.RUnlock()
 	if err != nil {
 		t.Fatal(err)
@@ -288,8 +288,11 @@ func TestGetXattrHandlesConcurrentReplacement(t *testing.T) {
 		}
 	}()
 	for range 2000 {
+		// Never EAGAIN: getxattr(2) cannot return it, so a client that gets
+		// one has no correct handling for it. The probe/fetch race resolves
+		// against the kernel's own value ceiling instead.
 		value, err := v.GetXattr(item, "user.race")
-		if err != nil && !errors.Is(err, syscall.EAGAIN) {
+		if err != nil {
 			close(done)
 			wg.Wait()
 			t.Fatalf("GetXattr during replacement: %v", err)
@@ -417,7 +420,7 @@ func TestForeignOwnerFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	v.mu.RLock()
-	fd := v.objects[item].fd
+	fd := v.objects[item].res.fd
 	v.mu.RUnlock()
 	if err := unix.Fchownat(fd, "", 12345, 12345, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		t.Fatal(err)

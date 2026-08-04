@@ -34,6 +34,9 @@ type options struct {
 	maxSessions, maxLockRecords                    uint
 	maxItemsPerSession, maxOpensPerSession         uint
 	maxItems, maxOpens                             uint
+	maxRetainedReplyBytes, maxFrameBytesInFlight   uint64
+	capabilityLifetime                             time.Duration
+	capabilityNonces                               uint
 	sessionLease                                   time.Duration
 	maxInFlight, maxConnections                    int
 	handshakeTimeout, idleTimeout, writeTimeout    time.Duration
@@ -59,6 +62,10 @@ func run() error {
 	flag.UintVar(&o.maxOpensPerSession, "max-opens-per-session", 4096, "maximum open file descriptions per session")
 	flag.UintVar(&o.maxItems, "max-items", 65536, "maximum descriptor-backed item capabilities for the worker")
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
+	flag.Uint64Var(&o.maxRetainedReplyBytes, "max-retained-reply-bytes", 512<<20, "total bytes this worker may hold in replay slots")
+	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", 512<<20, "total bytes this worker may have allocated for inbound frames")
+	flag.DurationVar(&o.capabilityLifetime, "capability-max-lifetime", 15*time.Minute, "longest capability validity window this authority will honour")
+	flag.UintVar(&o.capabilityNonces, "capability-nonce-records", 65536, "single-use capability records retained until expiry")
 	flag.DurationVar(&o.sessionLease, "session-lease", 2*time.Minute, "renewable session lease")
 	flag.IntVar(&o.maxInFlight, "max-in-flight", 256, "requests concurrently executing per TLS connection")
 	flag.IntVar(&o.maxConnections, "max-connections", 2048, "maximum accepted TLS connections for the worker")
@@ -81,11 +88,29 @@ func run() error {
 		o.maxItemsPerSession == 0 || o.maxItemsPerSession > maxUint32 || o.maxOpensPerSession == 0 || o.maxOpensPerSession > maxUint32 ||
 		o.maxItems == 0 || o.maxItems > maxUint32 || o.maxOpens == 0 || o.maxOpens > maxUint32 ||
 		o.maxItemsPerSession > o.maxItems || o.maxOpensPerSession > o.maxOpens ||
-		o.maxInFlight <= 0 || uint64(o.maxInFlight) > uint64(maxUint32) || o.maxConnections <= 0 || o.handshakeTimeout <= 0 || o.idleTimeout <= o.sessionLease || o.writeTimeout <= 0 {
-		return errors.New("protocol allocation and replay bounds must be positive uint32 values")
+		o.capabilityLifetime <= 0 || o.capabilityNonces == 0 || o.capabilityNonces > uint(^uint32(0)) ||
+		o.maxInFlight < 2 || uint64(o.maxInFlight) > uint64(maxUint32) || o.maxConnections <= 0 || o.handshakeTimeout <= 0 || o.idleTimeout <= o.sessionLease || o.writeTimeout <= 0 {
+		return errors.New("protocol allocation and replay bounds must be positive uint32 values, and max-in-flight must admit an ordinary request alongside a blocking lock wait")
 	}
-	if uint64(o.maxRead)+1024 > uint64(o.maxFrame) || uint64(o.maxWrite)+1024 > uint64(o.maxFrame) {
-		return errors.New("max-frame-bytes must leave at least 1024 bytes around each read/write payload")
+	// The reserve straddles a process boundary: the client checks the bounds it
+	// is told against the same constant, so both sides must read it from the
+	// protocol package rather than repeat a literal.
+	reserve := uint64(authorityrpc.FramePayloadReserve)
+	if o.maxFrame < uint(authorityrpc.MinimumFrameBytes) {
+		return fmt.Errorf("max-frame-bytes must be at least %d so a fixed-shape reply always fits", authorityrpc.MinimumFrameBytes)
+	}
+	if uint64(o.maxRead)+reserve > uint64(o.maxFrame) || uint64(o.maxWrite)+reserve > uint64(o.maxFrame) {
+		return fmt.Errorf("max-frame-bytes must leave at least %d bytes around each read/write payload", reserve)
+	}
+	// A directory listing is built to a byte budget derived from the frame, so
+	// no configuration can produce a volume whose directories cannot be listed.
+	// What must still be sized explicitly is how many reply bytes the worker may
+	// retain and how many inbound frame bytes it may have allocated at once.
+	if o.maxRetainedReplyBytes < uint64(o.maxFrame) {
+		return errors.New("max-retained-reply-bytes must admit at least one maximal reply")
+	}
+	if o.maxFrameBytesInFlight < uint64(o.maxWrite)+reserve {
+		return errors.New("max-frame-bytes-in-flight must admit at least one maximal request")
 	}
 
 	store, err := xfsstore.Open(o.root, xfsstore.Config{
@@ -107,7 +132,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	authorizer := &volumecap.Authorizer{PublicKey: publicKey, ClockSkew: 5 * time.Second}
+	authorizer := &volumecap.Authorizer{
+		PublicKey: publicKey, ClockSkew: 5 * time.Second,
+		MaxLifetime: o.capabilityLifetime, MaxRetainedNonces: int(o.capabilityNonces),
+	}
 	tlsConfig, err := serverTLSConfig(o.tlsCert, o.tlsKey, o.clientCA)
 	if err != nil {
 		return err
@@ -116,11 +144,15 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	storageFailure := make(chan error, 1)
+	// The transport bound and the advertised bound are one value here, and
+	// Serve refuses to start if the handler ever advertises anything else.
+	maxFrame, maxInFlight := uint32(o.maxFrame), o.maxInFlight
 	handler := &authorityrpc.VolumeHandler{
 		Store: store, Runtime: runtime, Authorizer: authorizer,
-		MaxFrame: uint32(o.maxFrame), MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(o.maxInFlight),
+		MaxFrame: maxFrame, MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(maxInFlight),
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
+		MaxRetainedReplyBytes: o.maxRetainedReplyBytes,
 		OnStorageFailure: func(err error) {
 			select {
 			case storageFailure <- err:
@@ -130,8 +162,9 @@ func run() error {
 		},
 	}
 	server := &authorityrpc.Server{
-		Handler: handler, MaxFrame: uint32(o.maxFrame), MaxInFlight: o.maxInFlight, MaxConnections: o.maxConnections,
-		HandshakeTimeout: o.handshakeTimeout, IdleTimeout: o.idleTimeout, WriteTimeout: o.writeTimeout,
+		Handler: handler, MaxFrame: maxFrame, MaxInFlight: maxInFlight, MaxConnections: o.maxConnections,
+		MaxFrameBytesInFlight: o.maxFrameBytesInFlight,
+		HandshakeTimeout:      o.handshakeTimeout, IdleTimeout: o.idleTimeout, WriteTimeout: o.writeTimeout,
 	}
 	listener, err := net.Listen("tcp", o.listen)
 	if err != nil {

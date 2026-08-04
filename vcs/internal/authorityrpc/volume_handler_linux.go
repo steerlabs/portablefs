@@ -18,10 +18,16 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
 var errInternal = errors.New("authorityrpc: internal handler failure")
+
+// readDirReplyOverhead bounds the fixed part of a directory reply: the 16-byte
+// verifier, the EOF flag, and the protobuf tags wrapping the reply inside a
+// Response. Entries are budgeted against the remainder.
+const readDirReplyOverhead uint32 = 64
 
 // Authorizer validates a short-lived control-plane capability. Implementations
 // must bind it to the authenticated TLS peer and exact volume; the data-plane
@@ -45,6 +51,11 @@ type VolumeHandler struct {
 	MaxOpensPerSession uint32
 	MaxItems           uint32
 	MaxOpens           uint32
+	// MaxRetainedReplyBytes bounds the real quantity the replay cache consumes:
+	// the total encoded bytes retained across every live session's replay
+	// slots. Slot counts are not a proxy for it; one directory listing is five
+	// orders of magnitude larger than one create.
+	MaxRetainedReplyBytes uint64
 	// OnStorageFailure is called once after an EIO fences the store. Production
 	// uses it to terminate this epoch instead of remaining deceptively ready.
 	OnStorageFailure func(error)
@@ -55,13 +66,49 @@ type VolumeHandler struct {
 	resources          map[volumeserver.SessionID]*sessionResources
 	totalItems         uint32
 	totalOpens         uint32
+	// retainedReplyBytes is the exact number of bytes currently held in replay
+	// slots; reservedReplyBytes covers mutations that are executing and whose
+	// reply size is not yet known.
+	retainedReplyBytes uint64
+	reservedReplyBytes uint64
 }
 
 type sessionResources struct {
 	ended bool
+	// root is the one shared volume-root capability. It is owned by xfsstore,
+	// not by this session, so it is never forgotten during cleanup.
+	root  xfsstore.Capability
 	items map[xfsstore.Capability]struct{}
 	opens map[xfsstore.Capability]struct{}
+	// reply holds the retained reply size for each of this session's replay
+	// slots. Its length is the slot count the runtime admitted.
+	reply []uint32
 }
+
+// Epoch implements Handler. It is what the transport stamps on any response it
+// has to synthesize itself.
+func (h *VolumeHandler) Epoch() []byte {
+	if h.Runtime == nil {
+		return nil
+	}
+	epoch := h.Runtime.Epoch()
+	return append([]byte(nil), epoch[:]...)
+}
+
+// Bounds implements Handler. These are exactly the values advertised in Hello,
+// so the server refuses to run with a transport that enforces anything else.
+func (h *VolumeHandler) Bounds() TransportBounds {
+	request := uint64(h.MaxWrite) + uint64(FramePayloadReserve)
+	if request > uint64(h.MaxFrame) {
+		request = uint64(h.MaxFrame)
+	}
+	return TransportBounds{MaxFrame: h.MaxFrame, MaxRequestFrame: uint32(request), MaxInFlight: int(h.MaxInFlight)}
+}
+
+// maxReplyBytes is the largest operation reply this authority can both retain
+// and put on the wire: whatever fits in a frame once the response envelope the
+// transport adds back is accounted for.
+func (h *VolumeHandler) maxReplyBytes() uint32 { return h.MaxFrame - responseEnvelopeReserve }
 
 func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
 	if h.Runtime != nil {
@@ -79,6 +126,9 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	if h.Store == nil || h.Runtime == nil || h.Authorizer == nil {
 		return h.errorResponse(req.GetRequestId(), errInternal, false)
 	}
+	if req.GetCancel() != nil {
+		return h.cancelAcknowledgment(ctx, req)
+	}
 	cred, err := h.credential(ctx, req)
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
@@ -90,10 +140,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	defer use.End()
 	access := use.Access()
 	if access&volumeserver.AccessRead == 0 {
-		if err == nil {
-			err = syscall.EPERM
-		}
-		return h.errorResponse(req.GetRequestId(), err, false)
+		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
 	}
 	if requestRequiresWrite(req) && access&volumeserver.AccessWrite == 0 {
 		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
@@ -105,15 +152,13 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		return h.success(req.GetRequestId())
-	case *authoritypb.Request_Cancel:
-		return h.success(req.GetRequestId())
 	case *authoritypb.Request_Detach:
 		if err := h.Runtime.Detach(cred); err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		return h.success(req.GetRequestId())
 	case *authoritypb.Request_Lookup:
-		parent, err := capability(body.Lookup.GetParent())
+		parent, err := h.item(cred.ID, body.Lookup.GetParent())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -128,7 +173,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr)}}
 		return resp
 	case *authoritypb.Request_GetAttr:
-		attr, err := h.getattr(body.GetAttr)
+		attr, err := h.getattr(cred.ID, body.GetAttr)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -145,13 +190,13 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			changed := false
 			var err error
 			if len(set.GetItem()) != 0 {
-				item, err = capability(set.GetItem())
+				item, err = h.item(cred.ID, set.GetItem())
 				if err != nil {
 					return h.errorResponse(0, err, false)
 				}
 			}
 			if len(set.GetHandle()) != 0 {
-				handle, err = capability(set.GetHandle())
+				handle, err = h.open(cred.ID, set.GetHandle())
 				if err != nil {
 					return h.errorResponse(0, err, false)
 				}
@@ -204,10 +249,8 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if set.Size != nil {
 				if handle != (xfsstore.Capability{}) {
 					err = h.Store.Truncate(handle, set.GetSize())
-				} else if item != (xfsstore.Capability{}) {
-					err = h.Store.TruncateObject(item, set.GetSize())
 				} else {
-					err = syscall.EINVAL
+					err = h.Store.TruncateObject(item, set.GetSize())
 				}
 				if err != nil {
 					return h.errorResponse(0, err, changed)
@@ -236,7 +279,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Create:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			parent, err := capability(body.Create.GetParent())
+			parent, err := h.item(cred.ID, body.Create.GetParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -262,7 +305,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Mkdir:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			parent, err := capability(body.Mkdir.GetParent())
+			parent, err := h.item(cred.ID, body.Mkdir.GetParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -283,7 +326,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Unlink:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			parent, err := capability(body.Unlink.GetParent())
+			parent, err := h.item(cred.ID, body.Unlink.GetParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -294,11 +337,11 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Rename:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			oldParent, err := capability(body.Rename.GetOldParent())
+			oldParent, err := h.item(cred.ID, body.Rename.GetOldParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
-			newParent, err := capability(body.Rename.GetNewParent())
+			newParent, err := h.item(cred.ID, body.Rename.GetNewParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -316,11 +359,11 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Link:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			source, err := capability(body.Link.GetExistingItem())
+			source, err := h.item(cred.ID, body.Link.GetExistingItem())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
-			parent, err := capability(body.Link.GetNewParent())
+			parent, err := h.item(cred.ID, body.Link.GetNewParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -334,7 +377,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Symlink:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			parent, err := capability(body.Symlink.GetParent())
+			parent, err := h.item(cred.ID, body.Symlink.GetParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -350,7 +393,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return resp
 		})
 	case *authoritypb.Request_Readlink:
-		item, err := capability(body.Readlink.GetItem())
+		item, err := h.item(cred.ID, body.Readlink.GetItem())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -363,7 +406,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		return resp
 	case *authoritypb.Request_Open:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			item, err := capability(body.Open.GetItem())
+			item, err := h.item(cred.ID, body.Open.GetItem())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -381,7 +424,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_Close:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			handle, err := capability(body.Close.GetHandle())
+			handle, err := h.open(cred.ID, body.Close.GetHandle())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -397,7 +440,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return h.success(0)
 		})
 	case *authoritypb.Request_Flush:
-		handle, err := capability(body.Flush.GetHandle())
+		handle, err := h.open(cred.ID, body.Flush.GetHandle())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -409,7 +452,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if body.Read.GetLength() > h.MaxRead {
 			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 		}
-		handle, err := capability(body.Read.GetHandle())
+		handle, err := h.open(cred.ID, body.Read.GetHandle())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -426,7 +469,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 		}
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			handle, err := capability(body.Write.GetHandle())
+			handle, err := h.open(cred.ID, body.Write.GetHandle())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -440,22 +483,10 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			} else {
 				n, err = h.Store.WriteAt(handle, body.Write.GetData(), int64(body.Write.GetOffset()))
 			}
-			if err != nil && n == 0 {
-				return h.errorResponse(0, err, false)
-			}
-			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{Count: uint32(n), AssignedOffset: uint64(assigned)}}
-			if err != nil {
-				h.recordStorageFailure(err)
-				resp.Errno = wireErrno(err)
-				if errors.Is(err, syscall.EIO) {
-					resp.Uncertain = true
-				}
-			}
-			return resp
+			return h.writeOutcome(n, assigned, err)
 		})
 	case *authoritypb.Request_Fsync:
-		handle, err := capability(body.Fsync.GetHandle())
+		handle, err := h.open(cred.ID, body.Fsync.GetHandle())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -468,7 +499,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if body.ReadDir.GetMaxEntries() == 0 || body.ReadDir.GetMaxEntries() > 4096 {
 				return h.errorResponse(0, syscall.EINVAL, false)
 			}
-			handle, err := capability(body.ReadDir.GetHandle())
+			handle, err := h.open(cred.ID, body.ReadDir.GetHandle())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -488,12 +519,31 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				return h.errorResponse(0, err, false)
 			}
 			result := &authoritypb.ReadDirReply{Verifier: current[:], Eof: eof}
+			// The reply is built to the same byte budget that was reserved for
+			// it, so a directory listing can never be the reply that does not
+			// fit in a frame. Stopping early is an ordinary short readdir: the
+			// caller resumes from the last entry's cookie.
+			budget := h.readDirEntryBudget(body.ReadDir.GetMaxEntries())
+			used := uint64(0)
 			for i, entry := range entries {
 				attr, err := h.Store.StatOpenDirChild(handle, entry.Name)
 				if err != nil {
 					return h.errorResponse(0, syscall.ESTALE, false)
 				}
-				result.Entries = append(result.Entries, &authoritypb.Dirent{Name: []byte(entry.Name), Attr: attrProto(attr), NextCookie: encodeCookie(cookie + uint64(i) + 1)})
+				dirent := &authoritypb.Dirent{Name: []byte(entry.Name), Attr: attrProto(attr), NextCookie: encodeCookie(cookie + uint64(i) + 1)}
+				cost := direntCost(dirent)
+				if used+cost > uint64(budget) {
+					result.Eof = false
+					break
+				}
+				used += cost
+				result.Entries = append(result.Entries, dirent)
+			}
+			if len(entries) != 0 && len(result.Entries) == 0 {
+				// A single entry larger than the whole budget would make this
+				// directory unreadable at any cookie. Say so instead of
+				// returning an empty page forever.
+				return h.errorResponse(0, syscall.EOVERFLOW, false)
 			}
 			parentAttr, err := h.Store.GetattrOpen(handle)
 			if err != nil || !verifierMatches(current, parentAttr) {
@@ -504,7 +554,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return resp
 		})
 	case *authoritypb.Request_Reclaim:
-		item, err := capability(body.Reclaim.GetItem())
+		item, err := h.item(cred.ID, body.Reclaim.GetItem())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -514,7 +564,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		h.untrackItem(cred.ID, item)
 		return h.success(req.GetRequestId())
 	case *authoritypb.Request_GetXattr:
-		item, err := capability(body.GetXattr.GetItem())
+		item, err := h.item(cred.ID, body.GetXattr.GetItem())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -527,11 +577,14 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		return resp
 	case *authoritypb.Request_SetXattr:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			item, err := capability(body.SetXattr.GetItem())
+			item, err := h.item(cred.ID, body.SetXattr.GetItem())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
-			mode := xfsstore.XattrMode(body.SetXattr.GetMode())
+			mode, valid := xattrMode(body.SetXattr.GetMode())
+			if !valid {
+				return h.errorResponse(0, syscall.EINVAL, false)
+			}
 			if err := h.Store.SetXattr(item, string(body.SetXattr.GetName()), body.SetXattr.GetValue(), mode); err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -539,7 +592,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		})
 	case *authoritypb.Request_RemoveXattr:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			item, err := capability(body.RemoveXattr.GetItem())
+			item, err := h.item(cred.ID, body.RemoveXattr.GetItem())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -549,7 +602,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return h.success(0)
 		})
 	case *authoritypb.Request_ListXattr:
-		item, err := capability(body.ListXattr.GetItem())
+		item, err := h.item(cred.ID, body.ListXattr.GetItem())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -581,6 +634,59 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	}
 }
 
+// cancelAcknowledgment answers a cancellation without pinning or renewing the
+// session. The transport has already delivered the cancellation to the target
+// operation on this authenticated connection; the reply is only an
+// acknowledgment, and running it through the ordinary lease-renewing path would
+// let a peer hold a session open indefinitely using cancels alone.
+func (h *VolumeHandler) cancelAcknowledgment(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
+	if _, ok := PeerIdentity(ctx); !ok {
+		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+	}
+	var epoch volumeserver.Epoch
+	if len(req.GetEpoch()) != len(epoch) {
+		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+	}
+	copy(epoch[:], req.GetEpoch())
+	if epoch != h.Runtime.Epoch() {
+		return h.errorResponse(req.GetRequestId(), volumeserver.ErrEpochMismatch, false)
+	}
+	return h.success(req.GetRequestId())
+}
+
+// writeOutcome turns one store write into exactly one reported outcome. A
+// write that made partial progress reports the short count and nothing else:
+// n bytes are already durable in XFS, so reporting a count together with an
+// errno would let the application conclude that nothing was written while the
+// file has already grown. The next write on the same range re-encounters the
+// condition and reports it with a zero count, which is what Linux does.
+func (h *VolumeHandler) writeOutcome(n int, assigned int64, err error) *authoritypb.Response {
+	if n == 0 {
+		if err != nil {
+			return h.errorResponse(0, err, false)
+		}
+		// A zero-length write is a legal no-op, not a failure.
+		resp := h.success(0)
+		resp.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}
+		return resp
+	}
+	h.recordStorageFailure(err)
+	resp := h.success(0)
+	resp.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{Count: uint32(n), AssignedOffset: uint64(assigned)}}
+	if uncertainFailure(err) {
+		// The store itself is gone. The count is still exact, but this mount
+		// cannot continue, so the outcome stays explicitly uncertain.
+		resp.Uncertain = true
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_STORAGE
+	}
+	return resp
+}
+
+func direntCost(dirent *authoritypb.Dirent) uint64 {
+	size := uint64(proto.Size(dirent))
+	return 1 + uint64(protowire.SizeVarint(size)) + size
+}
+
 func decodeCookie(raw []byte) (uint64, error) {
 	if len(raw) == 0 {
 		return 0, nil
@@ -605,11 +711,16 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	if hello.GetProtocolMajor() != ProtocolMajor {
 		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
 	}
-	resp := h.success(requestID)
-	if h.MaxFrame == 0 || h.MaxRead == 0 || h.MaxWrite == 0 || h.MaxInFlight == 0 {
+	if !h.validBounds() {
 		return h.errorResponse(requestID, syscall.EINVAL, false)
 	}
-	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...), MaxFrameBytes: h.MaxFrame, MaxReadBytes: h.MaxRead, MaxWriteBytes: h.MaxWrite, MaxInFlight: h.MaxInFlight}}
+	bounds := h.Bounds()
+	resp := h.success(requestID)
+	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
+		ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+		MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: h.MaxRead, MaxWriteBytes: h.MaxWrite,
+		MaxInFlight: uint32(bounds.MaxInFlight),
+	}}
 	return resp
 }
 
@@ -617,7 +728,7 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	if h.Store == nil || h.Runtime == nil || h.Authorizer == nil || attach.GetVolumeId() != h.Runtime.VolumeID() {
 		return h.errorResponse(requestID, syscall.EPERM, false)
 	}
-	if !h.validResourceLimits() {
+	if !h.validResourceLimits() || !h.validBounds() {
 		return h.errorResponse(requestID, syscall.EINVAL, false)
 	}
 	authorization, err := h.Authorizer.Authorize(ctx, attach.GetVolumeId(), attach.GetAccessToken())
@@ -627,6 +738,10 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	peer, ok := PeerIdentity(ctx)
 	if !ok {
 		return h.errorResponse(requestID, syscall.EPERM, false)
+	}
+	root, err := h.Store.Root()
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
 	}
 	cred, err := h.Runtime.Attach(attach.GetReplaySlots(), volumeserver.PeerIdentity(peer), authorization)
 	if err != nil {
@@ -638,11 +753,9 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 			_ = h.Runtime.Detach(cred)
 		}
 	}()
-	if err := h.startSessionResources(cred.ID); err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	root, err := h.Store.Root()
-	if err != nil {
+	// The runtime accepted this exact slot count, so the per-slot reply
+	// accounting has the same length as the session's replay slots.
+	if err := h.startSessionResources(cred.ID, root, attach.GetReplaySlots()); err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
 	attr, err := h.Store.Getattr(root)
@@ -658,6 +771,43 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 func (h *VolumeHandler) validResourceLimits() bool {
 	return h.MaxItemsPerSession > 0 && h.MaxOpensPerSession > 0 && h.MaxItems > 0 && h.MaxOpens > 0 &&
 		h.MaxItemsPerSession <= h.MaxItems && h.MaxOpensPerSession <= h.MaxOpens
+}
+
+func (h *VolumeHandler) validBounds() bool {
+	return h.MaxFrame >= MinimumFrameBytes && h.MaxRead > 0 && h.MaxWrite > 0 && h.MaxInFlight >= 2 &&
+		uint64(h.MaxRead)+uint64(FramePayloadReserve) <= uint64(h.MaxFrame) &&
+		uint64(h.MaxWrite)+uint64(FramePayloadReserve) <= uint64(h.MaxFrame) &&
+		h.MaxRetainedReplyBytes >= uint64(h.maxReplyBytes())
+}
+
+// readDirEntryBudget is the byte budget available to directory entries. It is
+// a pure function of the request, so the reservation taken before the operation
+// runs and the budget the reply is built to are necessarily the same number.
+func (h *VolumeHandler) readDirEntryBudget(maxEntries uint32) uint32 {
+	return h.replyReserve(maxEntries) - readDirReplyOverhead
+}
+
+// replyReserve bounds the reply of one directory listing. Every other mutation
+// reply has a fixed shape (an item, an attribute block, a handle, a count).
+func (h *VolumeHandler) replyReserve(readDirMaxEntries uint32) uint32 {
+	if readDirMaxEntries == 0 {
+		return fixedMutationReplyBytes
+	}
+	budget := uint64(readDirMaxEntries)*uint64(maxDirentBytes) + uint64(readDirReplyOverhead)
+	if budget < uint64(fixedMutationReplyBytes) {
+		budget = uint64(fixedMutationReplyBytes)
+	}
+	if limit := uint64(h.maxReplyBytes()); budget > limit {
+		budget = limit
+	}
+	return uint32(budget)
+}
+
+func (h *VolumeHandler) requestReplyReserve(req *authoritypb.Request) uint32 {
+	if dir := req.GetReadDir(); dir != nil {
+		return h.replyReserve(dir.GetMaxEntries())
+	}
+	return fixedMutationReplyBytes
 }
 
 func (h *VolumeHandler) mutate(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, apply func() *authoritypb.Response) *authoritypb.Response {
@@ -676,27 +826,38 @@ func (h *VolumeHandler) mutate(ctx context.Context, req *authoritypb.Request, cr
 	if err != nil || !bytes.Equal(hash[:], mutation.GetRequestHash()) {
 		return h.errorResponse(req.GetRequestId(), volumeserver.ErrRequestMismatch, false)
 	}
+	// Admission is taken against the bytes this outcome may retain, before the
+	// operation reaches XFS. Refusing here is retryable; refusing after the
+	// filesystem changed would not be.
+	reserve := h.requestReplyReserve(req)
 	id := volumeserver.MutationID{Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Hash: hash}
+	reserved, err := h.reserveReplyBytes(cred.ID, id.Slot, reserve)
+	if err != nil {
+		return h.errorResponse(req.GetRequestId(), err, false)
+	}
+	settled := false
+	defer func() {
+		if !settled {
+			h.releaseReplyReservation(reserved)
+		}
+	}()
 	out, err := h.Runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
 		resp := apply()
-		resp.RequestId = 0
-		resp.Epoch = nil
-		encoded, encodeErr := proto.MarshalOptions{Deterministic: true}.Marshal(resp)
-		if encodeErr != nil {
-			return volumeserver.Outcome{Errno: errnos.EIO}
-		}
-		if uint64(len(encoded)) > uint64(h.MaxFrame) {
+		encoded, encodeErr := marshalOutcome(resp)
+		if encodeErr != nil || uint32(len(encoded)) > reserve {
 			resp = h.errorResponse(0, syscall.EOVERFLOW, true)
-			resp.RequestId = 0
-			resp.Epoch = nil
-			encoded, encodeErr = proto.MarshalOptions{Deterministic: true}.Marshal(resp)
-			if encodeErr != nil || uint64(len(encoded)) > uint64(h.MaxFrame) {
+			encoded, encodeErr = marshalOutcome(resp)
+			if encodeErr != nil || uint32(len(encoded)) > reserve {
 				return volumeserver.Outcome{Errno: errnos.EIO}
 			}
 		}
+		h.settleReplyBytes(cred.ID, id.Slot, uint32(len(encoded)), reserved)
+		settled = true
 		return volumeserver.Outcome{Errno: resp.GetErrno(), Reply: encoded}
 	})
 	if err != nil {
+		// Nothing was recorded for this identity, so the response deliberately
+		// carries no MutationState and the peer's slot stays where it is.
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
 	resp := new(authoritypb.Response)
@@ -705,25 +866,63 @@ func (h *VolumeHandler) mutate(ctx context.Context, req *authoritypb.Request, cr
 	}
 	epoch := h.Runtime.Epoch()
 	resp.RequestId, resp.Epoch, resp.Errno = req.GetRequestId(), epoch[:], out.Errno
+	// ExecuteMutation returning without error means this exact identity is the
+	// one recorded in the slot, whether it just executed or replayed. Reporting
+	// it is what keeps the peer's slot state a copy rather than an inference.
+	resp.Mutation = &authoritypb.MutationState{Slot: id.Slot, AcceptedSequence: id.Sequence}
 	return resp
 }
 
-func requestRequiresWrite(req *authoritypb.Request) bool {
-	switch body := req.GetBody().(type) {
-	case *authoritypb.Request_Create, *authoritypb.Request_Mkdir,
-		*authoritypb.Request_Unlink, *authoritypb.Request_Rename,
-		*authoritypb.Request_Link, *authoritypb.Request_Symlink,
-		*authoritypb.Request_Write, *authoritypb.Request_SetAttr,
-		*authoritypb.Request_SetXattr, *authoritypb.Request_RemoveXattr:
-		return true
-	case *authoritypb.Request_Open:
-		flags := body.Open.GetFlags()
-		return flags != nil && (flags.GetWrite() || flags.GetAppend() || flags.GetTruncate())
-	case *authoritypb.Request_SetLock:
-		return !body.SetLock.GetUnlock() && body.SetLock.GetLock() != nil && body.SetLock.GetLock().GetWrite()
-	default:
-		return false
+// marshalOutcome encodes the retained form of a reply: the envelope the
+// transport restores on every delivery is stripped, so a replay and its
+// original are byte-identical bodies.
+func marshalOutcome(resp *authoritypb.Response) ([]byte, error) {
+	resp.RequestId, resp.Epoch, resp.Mutation = 0, nil, nil
+	return proto.MarshalOptions{Deterministic: true}.Marshal(resp)
+}
+
+// reserveReplyBytes admits one mutation against the bytes its outcome may add
+// to the replay cache. The slot's current outcome is replaced, not appended to,
+// so only the growth beyond what that slot already holds has to be reserved:
+// re-running an operation on a slot that is already at the budget is admitted,
+// while a slot that would grow the total past it is refused.
+func (h *VolumeHandler) reserveReplyBytes(id volumeserver.SessionID, slot, n uint32) (uint32, error) {
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	held := uint32(0)
+	if resources := h.resources[id]; resources != nil && !resources.ended && uint64(slot) < uint64(len(resources.reply)) {
+		held = resources.reply[slot]
 	}
+	if held >= n {
+		return 0, nil
+	}
+	growth := n - held
+	if h.retainedReplyBytes+h.reservedReplyBytes+uint64(growth) > h.MaxRetainedReplyBytes {
+		return 0, volumeserver.ErrAdmission
+	}
+	h.reservedReplyBytes += uint64(growth)
+	return growth, nil
+}
+
+func (h *VolumeHandler) releaseReplyReservation(n uint32) {
+	h.resourcesMu.Lock()
+	h.reservedReplyBytes -= uint64(n)
+	h.resourcesMu.Unlock()
+}
+
+// settleReplyBytes converts a reservation into the exact retained size of the
+// outcome now held in the slot. A session that ended while the operation ran
+// has already had its whole slot array released, so its bytes are not counted.
+func (h *VolumeHandler) settleReplyBytes(id volumeserver.SessionID, slot uint32, size, reserve uint32) {
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	h.reservedReplyBytes -= uint64(reserve)
+	resources := h.resources[id]
+	if resources == nil || resources.ended || uint64(slot) >= uint64(len(resources.reply)) {
+		return
+	}
+	h.retainedReplyBytes += uint64(size) - uint64(resources.reply[slot])
+	resources.reply[slot] = size
 }
 
 func (h *VolumeHandler) credential(ctx context.Context, req *authoritypb.Request) (volumeserver.SessionCredential, error) {
@@ -751,6 +950,48 @@ func capability(raw []byte) (xfsstore.Capability, error) {
 	copy(cap[:], raw)
 	return cap, nil
 }
+
+// item resolves an object capability that this session actually holds. A
+// capability is a volume-epoch bearer token; scoping resolution to the issuing
+// session is what keeps one session from reclaiming another session's objects.
+func (h *VolumeHandler) item(id volumeserver.SessionID, raw []byte) (xfsstore.Capability, error) {
+	cap, err := capability(raw)
+	if err != nil {
+		return cap, err
+	}
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	resources := h.resources[id]
+	if resources == nil || resources.ended {
+		return xfsstore.Capability{}, volumeserver.ErrSessionExpired
+	}
+	if cap == resources.root {
+		return cap, nil
+	}
+	if _, held := resources.items[cap]; !held {
+		return xfsstore.Capability{}, xfsstore.ErrStaleObject
+	}
+	return cap, nil
+}
+
+// open resolves an open-handle capability that this session actually holds.
+func (h *VolumeHandler) open(id volumeserver.SessionID, raw []byte) (xfsstore.Capability, error) {
+	cap, err := capability(raw)
+	if err != nil {
+		return cap, err
+	}
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	resources := h.resources[id]
+	if resources == nil || resources.ended {
+		return xfsstore.Capability{}, volumeserver.ErrSessionExpired
+	}
+	if _, held := resources.opens[cap]; !held {
+		return xfsstore.Capability{}, xfsstore.ErrStaleOpen
+	}
+	return cap, nil
+}
+
 func openFlags(flags *authoritypb.OpenFlags) xfsstore.OpenFlags {
 	if flags == nil {
 		return xfsstore.OpenFlags{}
@@ -762,7 +1003,36 @@ func itemProto(item xfsstore.Capability, attr xfsstore.Attr) *authoritypb.Item {
 	return &authoritypb.Item{Token: item[:], Attr: attrProto(attr)}
 }
 func attrProto(attr xfsstore.Attr) *authoritypb.Attr {
-	return &authoritypb.Attr{Kind: authoritypb.Attr_Kind(attr.Kind), Inode: attr.Ino, Size: attr.Size, Blocks: attr.Blocks, Mode: modeToProtocol(attr.Mode), Uid: attr.UID, Gid: attr.GID, Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS, CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS}
+	return &authoritypb.Attr{Kind: attrKindProto(attr.Kind), Inode: attr.Ino, Size: attr.Size, Blocks: attr.Blocks, Mode: modeToProtocol(attr.Mode), Uid: attr.UID, Gid: attr.GID, Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS, CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS}
+}
+
+// attrKindProto and xattrMode translate between two independently numbered
+// enumerations. They are written out so that renumbering either side is a
+// compile-time or test failure rather than a silent reinterpretation.
+func attrKindProto(kind xfsstore.Kind) authoritypb.Attr_Kind {
+	switch kind {
+	case xfsstore.KindRegular:
+		return authoritypb.Attr_REGULAR
+	case xfsstore.KindDirectory:
+		return authoritypb.Attr_DIRECTORY
+	case xfsstore.KindSymlink:
+		return authoritypb.Attr_SYMLINK
+	default:
+		return authoritypb.Attr_KIND_UNSPECIFIED
+	}
+}
+
+func xattrMode(mode authoritypb.SetXattrRequest_Mode) (xfsstore.XattrMode, bool) {
+	switch mode {
+	case authoritypb.SetXattrRequest_UPSERT:
+		return xfsstore.XattrUpsert, true
+	case authoritypb.SetXattrRequest_CREATE:
+		return xfsstore.XattrCreate, true
+	case authoritypb.SetXattrRequest_REPLACE:
+		return xfsstore.XattrReplace, true
+	default:
+		return 0, false
+	}
 }
 
 func modeFromProtocol(mode uint32) (fs.FileMode, bool) {
@@ -796,15 +1066,15 @@ func modeToProtocol(mode fs.FileMode) uint32 {
 	return result
 }
 
-func (h *VolumeHandler) getattr(req *authoritypb.GetAttrRequest) (xfsstore.Attr, error) {
+func (h *VolumeHandler) getattr(id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, error) {
 	if len(req.GetHandle()) != 0 {
-		handle, err := capability(req.GetHandle())
+		handle, err := h.open(id, req.GetHandle())
 		if err != nil {
 			return xfsstore.Attr{}, err
 		}
 		return h.Store.GetattrOpen(handle)
 	}
-	item, err := capability(req.GetItem())
+	item, err := h.item(id, req.GetItem())
 	if err != nil {
 		return xfsstore.Attr{}, err
 	}
@@ -853,7 +1123,7 @@ func (h *VolumeHandler) lock(cred volumeserver.SessionCredential, spec *authorit
 	if spec == nil || spec.GetRange() == nil {
 		return volumeserver.Lock{}, syscall.EINVAL
 	}
-	item, err := capability(spec.GetItem())
+	item, err := h.item(cred.ID, spec.GetItem())
 	if err != nil {
 		return volumeserver.Lock{}, err
 	}
@@ -882,17 +1152,12 @@ func (h *VolumeHandler) unlockOpenOwner(cred volumeserver.SessionCredential, han
 }
 
 func (h *VolumeHandler) success(requestID uint64) *authoritypb.Response {
-	epoch := h.Runtime
-	var raw []byte
-	if epoch != nil {
-		value := epoch.Epoch()
-		raw = append([]byte(nil), value[:]...)
-	}
-	return &authoritypb.Response{RequestId: requestID, Epoch: raw}
+	return &authoritypb.Response{RequestId: requestID, Epoch: h.Epoch()}
 }
+
 func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain bool) *authoritypb.Response {
 	h.recordStorageFailure(err)
-	if errors.Is(err, syscall.EIO) || errors.Is(err, xfsstore.ErrOutcomeUncertain) {
+	if uncertainFailure(err) {
 		uncertain = true
 	}
 	errno := wireErrno(err)
@@ -916,7 +1181,26 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 	}
 	resp := h.success(requestID)
 	resp.Errno, resp.Uncertain = errno, uncertain
+	if errno == errnos.EIO {
+		// EIO alone cannot say whether the filesystem is gone or the authority
+		// merely failed to recognise one of its own errors. The client needs
+		// that difference: one requires a remount, the other does not.
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL
+		if storageFailure(err) {
+			resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_STORAGE
+		}
+	}
 	return resp
+}
+
+// storageFailure reports whether an error came from the authoritative store
+// itself rather than from this handler's own logic.
+func storageFailure(err error) bool {
+	return errors.Is(err, syscall.EIO) || errors.Is(err, xfsstore.ErrFenced) || errors.Is(err, xfsstore.ErrOutcomeUncertain)
+}
+
+func uncertainFailure(err error) bool {
+	return errors.Is(err, syscall.EIO) || errors.Is(err, xfsstore.ErrOutcomeUncertain)
 }
 
 func (h *VolumeHandler) recordStorageFailure(err error) {
@@ -937,7 +1221,7 @@ func wireErrno(err error) int32 {
 	return errnos.Of(err)
 }
 
-func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID) error {
+func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID, root xfsstore.Capability, slots uint32) error {
 	h.resourcesMu.Lock()
 	defer h.resourcesMu.Unlock()
 	if h.resources == nil {
@@ -946,8 +1230,32 @@ func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID) error {
 	if _, exists := h.resources[id]; exists {
 		return volumeserver.ErrAdmission
 	}
-	h.resources[id] = &sessionResources{items: make(map[xfsstore.Capability]struct{}), opens: make(map[xfsstore.Capability]struct{})}
+	h.resources[id] = &sessionResources{
+		root:  root,
+		items: make(map[xfsstore.Capability]struct{}),
+		opens: make(map[xfsstore.Capability]struct{}),
+		reply: make([]uint32, slots),
+	}
 	return nil
+}
+
+// add inserts a capability and keeps the worker-wide counter in step with the
+// set in one place, so the two can never diverge and no clamp is needed when
+// they are taken apart again.
+func trackCapability(set map[xfsstore.Capability]struct{}, cap xfsstore.Capability, total *uint32) {
+	if _, exists := set[cap]; exists {
+		return
+	}
+	set[cap] = struct{}{}
+	*total++
+}
+
+func untrackCapability(set map[xfsstore.Capability]struct{}, cap xfsstore.Capability, total *uint32) {
+	if _, exists := set[cap]; !exists {
+		return
+	}
+	delete(set, cap)
+	*total--
 }
 
 func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capability) error {
@@ -960,10 +1268,7 @@ func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capab
 	case uint32(len(resources.items)) >= h.MaxItemsPerSession || h.totalItems >= h.MaxItems:
 		err = volumeserver.ErrAdmission
 	default:
-		if _, exists := resources.items[item]; !exists {
-			resources.items[item] = struct{}{}
-			h.totalItems++
-		}
+		trackCapability(resources.items, item, &h.totalItems)
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {
@@ -983,10 +1288,8 @@ func (h *VolumeHandler) trackItemAndOpen(id volumeserver.SessionID, item, handle
 		uint32(len(resources.opens)) >= h.MaxOpensPerSession || h.totalOpens >= h.MaxOpens:
 		err = volumeserver.ErrAdmission
 	default:
-		resources.items[item] = struct{}{}
-		resources.opens[handle] = struct{}{}
-		h.totalItems++
-		h.totalOpens++
+		trackCapability(resources.items, item, &h.totalItems)
+		trackCapability(resources.opens, handle, &h.totalOpens)
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {
@@ -999,12 +1302,7 @@ func (h *VolumeHandler) trackItemAndOpen(id volumeserver.SessionID, item, handle
 func (h *VolumeHandler) untrackItem(id volumeserver.SessionID, item xfsstore.Capability) {
 	h.resourcesMu.Lock()
 	if resources := h.resources[id]; resources != nil {
-		if _, exists := resources.items[item]; exists {
-			delete(resources.items, item)
-			if h.totalItems > 0 {
-				h.totalItems--
-			}
-		}
+		untrackCapability(resources.items, item, &h.totalItems)
 	}
 	h.resourcesMu.Unlock()
 }
@@ -1019,10 +1317,7 @@ func (h *VolumeHandler) trackOpen(id volumeserver.SessionID, handle xfsstore.Cap
 	case uint32(len(resources.opens)) >= h.MaxOpensPerSession || h.totalOpens >= h.MaxOpens:
 		err = volumeserver.ErrAdmission
 	default:
-		if _, exists := resources.opens[handle]; !exists {
-			resources.opens[handle] = struct{}{}
-			h.totalOpens++
-		}
+		trackCapability(resources.opens, handle, &h.totalOpens)
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {
@@ -1034,12 +1329,7 @@ func (h *VolumeHandler) trackOpen(id volumeserver.SessionID, handle xfsstore.Cap
 func (h *VolumeHandler) untrackOpen(id volumeserver.SessionID, handle xfsstore.Capability) {
 	h.resourcesMu.Lock()
 	if resources := h.resources[id]; resources != nil {
-		if _, exists := resources.opens[handle]; exists {
-			delete(resources.opens, handle)
-			if h.totalOpens > 0 {
-				h.totalOpens--
-			}
-		}
+		untrackCapability(resources.opens, handle, &h.totalOpens)
 	}
 	h.resourcesMu.Unlock()
 }
@@ -1060,18 +1350,16 @@ func (h *VolumeHandler) closeSessionResources(id volumeserver.SessionID) {
 	for item := range resources.items {
 		items = append(items, item)
 	}
-	if count := uint32(len(handles)); count <= h.totalOpens {
-		h.totalOpens -= count
-	} else {
-		h.totalOpens = 0
-	}
-	if count := uint32(len(items)); count <= h.totalItems {
-		h.totalItems -= count
-	} else {
-		h.totalItems = 0
+	// Every insertion incremented these counters exactly once, so the totals
+	// are the sum of the live sets and the subtraction is exact.
+	h.totalOpens -= uint32(len(handles))
+	h.totalItems -= uint32(len(items))
+	for _, size := range resources.reply {
+		h.retainedReplyBytes -= uint64(size)
 	}
 	resources.opens = nil
 	resources.items = nil
+	resources.reply = nil
 	h.resourcesMu.Unlock()
 	for _, handle := range handles {
 		h.closeOpen(handle)
