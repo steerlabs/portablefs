@@ -1,12 +1,11 @@
-// Package errnos is the single source of the wire errno space shared by the
-// protocol layer (fsproto) and the authority filesystem (workfs). The exact-once
-// mutation machinery stores each mutation's OUTCOME errno durably (so a
-// lost-response retry returns the byte-identical status); that stored value and
-// the live reply must come from one mapping, or a retry could observe a
-// different status than the original execution.
+// Package errnos is the single source of the Linux-numbered wire errno space
+// shared by PortableFS protocols. Both the frozen v2 path and the current v3
+// same-epoch replay path retain encoded outcomes, so a replay and its original
+// reply must use one mapping.
 package errnos
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -19,6 +18,7 @@ import (
 const (
 	OK           int32 = 0
 	EPERM        int32 = 1
+	EINTR        int32 = 4
 	ENOENT       int32 = 2
 	E2BIG        int32 = 7
 	EIO          int32 = 5
@@ -39,9 +39,8 @@ const (
 	EDQUOT       int32 = 122
 )
 
-// Of maps a Go filesystem error to a wire errno. It is the canonical mapping:
-// fsproto's reply path and workfs's outcome recording both use it, so a retried
-// mutation's recorded status always equals the status the original reply carried.
+// Of maps a Go filesystem error to a wire errno. It is the canonical mapping
+// for live replies and any retained replay outcome.
 func Of(err error) int32 {
 	switch {
 	case err == nil:
@@ -52,6 +51,8 @@ func Of(err error) int32 {
 		return EEXIST
 	case errors.Is(err, os.ErrPermission):
 		return EPERM
+	case errors.Is(err, context.Canceled):
+		return EINTR
 	case errors.Is(err, syscall.ENAMETOOLONG):
 		return ENAMETOOLONG
 	case errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP):

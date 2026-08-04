@@ -1,5 +1,10 @@
 # Replicated Readable Store Exploration
 
+> **Concluded exploration.** The segmented prototype remains useful measured
+> evidence, but its stop rule fired and it is not the PortableFS v3 runtime.
+> The successor design uses an ordinary authoritative XFS directory; see
+> [xfs-authority-architecture.md](./xfs-authority-architecture.md).
+
 Status: design only. This document proposes an additive experiment; it does
 not change the v2 architecture or compatibility contract.
 

@@ -1,5 +1,9 @@
 # Failure Modes
 
+> **Frozen v2 document.** These failures describe the retired Postgres-journal
+> authority. The v3 XFS/EBS epoch and fencing model is in
+> [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 ## VCS Process Dies
 
 In local development, mounted clients disconnect until the VCS restarts. On restart, the VCS

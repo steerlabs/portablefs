@@ -1,5 +1,9 @@
 # Volume API
 
+> **Frozen v2 document.** These endpoints and branch/history concepts are the
+> retired v2 control plane. They are not a v3 filesystem data-path contract;
+> see [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 All endpoints are under `/v1`. If `VOLUME_API_TOKEN` is configured, clients send `Authorization: Bearer <token>`.
 
 ## Release Identity

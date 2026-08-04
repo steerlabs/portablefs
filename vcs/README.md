@@ -1,4 +1,15 @@
-# vcs — Volume Cache Service (live mount)
+# PortableFS storage and authority implementations
+
+> **v3 direction:** the production successor is the authoritative-XFS path in
+> `internal/xfsstore`, `internal/authorityrpc`, `internal/volumeserver`, and
+> `internal/fusev3`, with binaries in `cmd/portablefs-authority` and
+> `cmd/portablefs-mount-v3`. XFS is current-state truth; v3 has no branches,
+> history, custom journal, or client write-back WAL. See
+> [`../docs/xfs-authority-architecture.md`](../docs/xfs-authority-architecture.md).
+> The documentation below describes the frozen v2 implementation retained
+> during migration and must not be read as the v3 design.
+
+# vcs — Volume Cache Service (frozen v2)
 
 The VCS serves a PortableFS volume as the live filesystem authority over one data
 plane: fsproto v8, the custom protocol spoken by the product FUSE/FSKit mounts.

@@ -1,5 +1,9 @@
 # The FSKit Mount (macOS)
 
+> **Frozen v2 document.** This is the retired v2 FSKit implementation. v3
+> macOS support is intentionally gated on the coherency APIs and tests listed
+> in [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 `portablefs mount` on macOS has exactly one transport: the `fskit` strategy.
 The CLI drives the same `portablefsd` + FSKit extension pair the PortableFS
 menu-bar app uses. There is deliberately no fallback transport: a Mac that

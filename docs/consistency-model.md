@@ -1,5 +1,9 @@
 # Consistency Model
 
+> **Frozen v2 document.** This contract belongs to the retired
+> journal/branch/write-back architecture. PortableFS v3's current-state-only
+> contract is in [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 PortableFS separates write acceptance from two linked durability layers:
 
 - **Local write acceptance:** under an active delegation, `write(2)` returns

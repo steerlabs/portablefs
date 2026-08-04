@@ -1,5 +1,9 @@
 # Agent Workspaces
 
+> **Frozen v2 document.** The branch and write-back behavior below is not part
+> of PortableFS v3. The current ordinary-directory contract is
+> [authoritative XFS](./xfs-authority-architecture.md).
+
 How to run coding agents (Claude Code, Codex, custom harnesses) on PortableFS
 volumes. This is the long-form companion to
 [../skills/portablefs/SKILL.md](../skills/portablefs/SKILL.md) — the skill is the

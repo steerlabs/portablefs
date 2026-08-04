@@ -1,5 +1,9 @@
 # Authority Manager
 
+> **Frozen v2 document.** This manager design targets the retired v2 data
+> plane. It must not be used as the v3 authority contract; see
+> [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 The authority manager is the PortableFS control-plane boundary for hosted mounts.
 Applications should not start VCS processes inside their product workers. They
 should call this service to resolve a `volumeId` + `branch` into the current
