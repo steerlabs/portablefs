@@ -1,5 +1,9 @@
 # Self-Hosting
 
+> **Frozen v2 document.** These instructions deploy the retired v2 stack, not
+> PortableFS v3. The v3 launch topology is documented in
+> [the authoritative-XFS runbook](./xfs-authority-deployment.md).
+
 Production deployment guide for a self-hosted PortableFS. For a laptop-local stack,
 use `./scripts/quickstart.sh` instead; nothing in the quickstart compose file is
 production-safe.

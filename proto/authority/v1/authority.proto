@@ -1,0 +1,237 @@
+syntax = "proto3";
+
+package portablefs.authority.v1;
+
+option go_package = "github.com/steerlabs/portablefs/vcs/internal/authoritypb;authoritypb";
+
+// Authority v1 is the PortableFS v3 data-plane protocol. Names are bytes so a
+// Linux mount can preserve every legal directory-entry name. All byte-string
+// identifiers are fixed-size and bounded by the frame decoder before protobuf
+// decoding.
+
+message Request {
+  reserved 45; // regular FUSE does not forward syncfs to userspace
+  uint64 request_id = 1;
+  bytes epoch = 2; // 16 bytes after Hello/Attach
+  SessionProof session = 3;
+  Mutation mutation = 4; // required on mutating bodies
+
+  oneof body {
+    HelloRequest hello = 10;
+    AttachRequest attach = 11;
+    ResumeRequest resume = 12;
+    KeepAliveRequest keep_alive = 13;
+    DetachRequest detach = 14;
+    CancelRequest cancel = 15;
+    LookupRequest lookup = 20;
+    GetAttrRequest get_attr = 21;
+    SetAttrRequest set_attr = 22;
+    CreateRequest create = 23;
+    MkdirRequest mkdir = 24;
+    UnlinkRequest unlink = 25;
+    RenameRequest rename = 26;
+    LinkRequest link = 27;
+    SymlinkRequest symlink = 28;
+    ReadlinkRequest readlink = 29;
+    OpenRequest open = 30;
+    CloseRequest close = 31;
+    ReadRequest read = 32;
+    WriteRequest write = 33;
+    FsyncRequest fsync = 34;
+    ReadDirRequest read_dir = 35;
+    ReclaimRequest reclaim = 36;
+    FlushRequest flush = 37;
+    GetXattrRequest get_xattr = 40;
+    SetXattrRequest set_xattr = 41;
+    ListXattrRequest list_xattr = 42;
+    RemoveXattrRequest remove_xattr = 43;
+    StatFSRequest stat_fs = 44;
+    GetLockRequest get_lock = 50;
+    SetLockRequest set_lock = 51;
+  }
+}
+
+message Response {
+  uint64 request_id = 1;
+  bytes epoch = 2;
+  int32 errno = 3; // Linux errno; zero is success
+  bool uncertain = 4; // operation may have reached XFS; never auto-retry
+  Attr post_attr = 5;
+
+  oneof body {
+    HelloReply hello = 10;
+    AttachReply attach = 11;
+    LookupReply lookup = 20;
+    GetAttrReply get_attr = 21;
+    CreateReply create = 22;
+    ReadlinkReply readlink = 23;
+    OpenReply open = 24;
+    ReadReply read = 25;
+    WriteReply write = 26;
+    ReadDirReply read_dir = 27;
+    GetXattrReply get_xattr = 28;
+    ListXattrReply list_xattr = 29;
+    StatFSReply stat_fs = 30;
+    GetLockReply get_lock = 31;
+    LinkReply link = 32;
+  }
+}
+
+message SessionProof {
+  bytes id = 1; // 16 bytes
+  uint64 generation = 2;
+  bytes resume_secret = 3; // 32 bytes; protected by TLS
+}
+
+message Mutation {
+  uint32 slot = 1;
+  uint64 sequence = 2;
+  bytes request_hash = 3; // SHA-256 of canonical protobuf body
+}
+
+message Item {
+  bytes token = 1; // 16-byte, volume+epoch-local random capability
+  Attr attr = 2;
+}
+
+message Attr {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    REGULAR = 1;
+    DIRECTORY = 2;
+    SYMLINK = 3;
+  }
+  Kind kind = 1;
+  uint64 inode = 2;
+  int64 size = 3;
+  uint64 blocks = 4;
+  uint32 mode = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  uint32 nlink = 8;
+  int64 atime_ns = 9;
+  int64 mtime_ns = 10;
+  int64 ctime_ns = 11;
+  int64 birth_time_ns = 12;
+}
+
+message HelloRequest { uint32 protocol_major = 1; repeated string features = 2; }
+message HelloReply {
+  uint32 protocol_major = 1;
+  repeated string features = 2;
+  uint32 max_frame_bytes = 3;
+  uint32 max_read_bytes = 4;
+  uint32 max_write_bytes = 5;
+  uint32 max_in_flight = 6; // per TLS connection
+}
+
+message AttachRequest {
+  reserved 3; // removed unused client identity; mTLS + session ID are authoritative
+  string volume_id = 1;
+  bytes access_token = 2;
+  uint32 replay_slots = 4;
+}
+message AttachReply {
+  bytes session_id = 1;
+  uint64 session_generation = 2;
+  bytes resume_secret = 3;
+  Item root = 4;
+  repeated string features = 5;
+  uint64 session_lease_milliseconds = 6;
+}
+message ResumeRequest {}
+message KeepAliveRequest {}
+message DetachRequest {}
+message CancelRequest { uint64 target_request_id = 1; }
+
+message LookupRequest { bytes parent = 1; bytes name = 2; }
+message LookupReply { Item item = 1; }
+message GetAttrRequest { bytes item = 1; bytes handle = 2; }
+message GetAttrReply { Attr attr = 1; }
+
+message SetAttrRequest {
+  bytes item = 1;
+  bytes handle = 2;
+  optional uint32 mode = 3;
+  optional uint32 uid = 4;
+  optional uint32 gid = 5;
+  optional int64 size = 6;
+  optional int64 atime_ns = 7;
+  optional int64 mtime_ns = 8;
+  bool atime_now = 9;
+  bool mtime_now = 10;
+}
+
+message OpenFlags {
+  bool read = 1;
+  bool write = 2;
+  bool append = 3;
+  bool truncate = 4;
+  bool sync = 5;
+  bool data_sync = 6;
+}
+
+message CreateRequest { bytes parent = 1; bytes name = 2; uint32 mode = 3; OpenFlags flags = 4; bool exclusive = 5; }
+message CreateReply { Item item = 1; bytes handle = 2; }
+message MkdirRequest { bytes parent = 1; bytes name = 2; uint32 mode = 3; }
+message UnlinkRequest { bytes parent = 1; bytes name = 2; bool directory = 3; }
+
+message RenameRequest {
+  bytes old_parent = 1;
+  bytes old_name = 2;
+  bytes new_parent = 3;
+  bytes new_name = 4;
+  bool no_replace = 5;
+  bool exchange = 6;
+}
+message LinkRequest { bytes existing_item = 1; bytes new_parent = 2; bytes new_name = 3; }
+message LinkReply { Item item = 1; }
+message SymlinkRequest { bytes parent = 1; bytes name = 2; bytes target = 3; }
+message ReadlinkRequest { bytes item = 1; }
+message ReadlinkReply { bytes target = 1; }
+
+message OpenRequest { bytes item = 1; OpenFlags flags = 2; }
+message OpenReply { bytes handle = 1; }
+message CloseRequest {
+  bytes handle = 1;
+  uint64 lock_owner = 2;
+  bool flock_unlock = 3;
+}
+message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
+message ReadReply { bytes data = 1; }
+message WriteRequest {
+  bytes handle = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool append = 4; // distinct append intent; offset must be zero
+}
+message WriteReply { uint32 count = 1; uint64 assigned_offset = 2; }
+message FsyncRequest { bytes handle = 1; bool data_only = 2; }
+message FlushRequest { bytes handle = 1; uint64 lock_owner = 2; }
+
+message ReadDirRequest { bytes handle = 1; bytes cookie = 2; bytes verifier = 3; uint32 max_entries = 4; }
+message Dirent { bytes name = 1; Attr attr = 2; bytes next_cookie = 3; }
+message ReadDirReply { repeated Dirent entries = 1; bytes verifier = 2; bool eof = 3; }
+message ReclaimRequest { bytes item = 1; }
+
+message GetXattrRequest { bytes item = 1; bytes handle = 2; bytes name = 3; }
+message GetXattrReply { bytes value = 1; }
+message SetXattrRequest {
+  enum Mode { UPSERT = 0; CREATE = 1; REPLACE = 2; }
+  bytes item = 1; bytes handle = 2; bytes name = 3; bytes value = 4; Mode mode = 5;
+}
+message ListXattrRequest { bytes item = 1; bytes handle = 2; }
+message ListXattrReply { repeated bytes names = 1; }
+message RemoveXattrRequest { bytes item = 1; bytes handle = 2; bytes name = 3; }
+
+message StatFSRequest {}
+message StatFSReply {
+  uint64 block_size = 1; uint64 blocks = 2; uint64 blocks_free = 3;
+  uint64 blocks_available = 4; uint64 files = 5; uint64 files_free = 6;
+  uint32 name_max = 7;
+}
+message LockRange { uint64 start = 1; uint64 end = 2; }
+message LockSpec { bytes item = 1; uint64 owner = 2; bool write = 3; LockRange range = 4; bool flock = 5; }
+message GetLockRequest { LockSpec lock = 1; }
+message GetLockReply { bool conflict = 1; LockSpec held = 2; }
+message SetLockRequest { LockSpec lock = 1; bool wait = 2; bool unlock = 3; }

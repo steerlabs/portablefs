@@ -1,5 +1,9 @@
 # Open-after-unlink / orphan handling — design + status
 
+> **Frozen v2 document.** v3 retains the authoritative server file descriptor
+> and needs no orphan table. See
+> [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 POSIX delete-on-last-close: an unlinked-but-still-open file is detached from the name tree
 but kept readable/writable by its open fds until the last close. portablefs implements this
 with **inode identity** (Stage 1: every inode has a stable `ino` independent of its name) and

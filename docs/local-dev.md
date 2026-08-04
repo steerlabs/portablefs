@@ -1,5 +1,9 @@
 # Local Development
 
+> **Frozen v2 document.** These commands exercise the retained v2 stack. The
+> v3 implementation and verification entry points are listed in the repository
+> [README](../README.md).
+
 Run the normal local suite:
 
 ```bash

@@ -1,5 +1,9 @@
 # Architecture
 
+> **Frozen v2 document.** This describes the retired journal/branch/write-back
+> architecture and is not the PortableFS v3 direction. The current decision is
+> [authoritative XFS](./xfs-authority-architecture.md).
+
 PortableFS is a live filesystem for agents. The product contract is simple:
 
 ```text

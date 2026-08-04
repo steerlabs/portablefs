@@ -1,5 +1,9 @@
 # Your Mac Mini As An Always-On Workspace Server
 
+> **Frozen v2 document.** This guide deploys the retired v2 journal-backed
+> architecture and is not the v3 hosting model. See
+> [the authoritative-XFS runbook](./xfs-authority-deployment.md).
+
 A copy-paste guide to running PortableFS on a home server (a Mac Mini in the
 examples, but any always-on Linux or macOS box works) and reaching it from your
 laptop over Tailscale. The result: agent workspaces that live on the Mini, mount

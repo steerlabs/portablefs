@@ -1,5 +1,9 @@
 # The mount write-back engine
 
+> **Frozen v2 document.** PortableFS v3 has no client dirty WAL or write-back
+> engine. Its current write and durability contract is documented in
+> [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 One `writeback.Engine` per mounted `(volume, branch)` replaces the per-subtree
 `session.Manager`/`Session` system. Write mode is not a mount property: every
 mutation is either executed synchronously by the authority (write-through) or

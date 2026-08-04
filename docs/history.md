@@ -1,5 +1,9 @@
 # History
 
+> **Frozen v2 document.** PortableFS v3 exposes no history, commits, snapshots,
+> branches, or forks. Operator backups are outside filesystem semantics; see
+> [the authoritative-XFS decision](./xfs-authority-architecture.md).
+
 History in PortableFS is asynchronous. The fenced Postgres journal is the
 authority durability layer: a mutation is authority-durable when that
 journal transaction commits, and nothing on the write path ever waits for a
