@@ -188,6 +188,159 @@ func TestIndependentReplaySlotsExecuteConcurrently(t *testing.T) {
 	}
 }
 
+// TestBlockingLockAcrossASweepIsNotGranted is the sequence the authority is
+// deployed into: the connection idle timeout is required to exceed the session
+// lease, so a swept session's connection and request contexts stay alive for
+// minutes afterwards. Two sessions attach, one holds an exclusive range, the
+// other blocks on it, the partition expires both leases, and the sweep runs.
+// Lock ownership used to be surrendered only when the last pin dropped — and the
+// blocked waiter was itself the pin — so the holder's cleanup granted the
+// waiter, F_SETLKW reported success under a session the authority had already
+// destroyed, and the range then became available to a fresh mount while the
+// client still believed it held it.
+func TestBlockingLockAcrossASweepIsNotGranted(t *testing.T) {
+	a, now := testAuthority(t)
+	holder, err := a.Attach(1, PeerIdentity{1}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := a.Attach(1, PeerIdentity{2}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := ObjectKey{7}
+	if err := a.Locks().Set(writeLock(object, LockOwner{Session: holder.ID}, ToEOF(0))); err != nil {
+		t.Fatal(err)
+	}
+
+	// The blocked request is an admitted operation: its pin is exactly what
+	// keeps the session's cleanup deferred.
+	pin, err := a.Begin(blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		waited <- a.Locks().Wait(context.Background(), writeLock(object, LockOwner{Session: blocked.ID}, ToEOF(0)))
+	}()
+	waitForQueued(t, a.Locks(), object, 1)
+
+	*now = now.Add(3 * time.Minute)
+	if swept := a.Sweep(); swept != 2 {
+		t.Fatalf("Sweep=%d, want 2", swept)
+	}
+	select {
+	case err := <-waited:
+		if !errors.Is(err, ErrSessionExpired) {
+			t.Fatalf("blocking lock across a sweep = %v, want ErrSessionExpired", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a blocked waiter kept its session pin after the sweep, so cleanup could never run")
+	}
+	if got := len(heldRecords(a.Locks(), object)); got != 0 {
+		t.Fatalf("swept sessions left %d records behind", got)
+	}
+	pin.End()
+
+	fresh, err := a.Attach(1, PeerIdentity{3}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Locks().Set(writeLock(object, LockOwner{Session: fresh.ID}, ToEOF(0))); err != nil {
+		t.Fatalf("fresh mount could not take the vacated range: %v", err)
+	}
+}
+
+// TestExpiredSessionCannotAcquireBeforeTheSweep: the sweeper is periodic, so
+// lease expiry and session removal are not the same instant. An operation
+// admitted before the expiry must not be able to install a record after it.
+func TestExpiredSessionCannotAcquireBeforeTheSweep(t *testing.T) {
+	a, now := testAuthority(t)
+	cred, err := a.Attach(1, PeerIdentity{1}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := ObjectKey{4}
+	if err := a.Locks().Set(writeLock(object, LockOwner{Session: cred.ID}, ToEOF(0))); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(2 * time.Minute)
+	if err := a.Locks().Set(writeLock(object, LockOwner{Session: cred.ID}, LockRange{Start: 0, End: 0})); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("Set on an expired lease = %v, want ErrSessionExpired", err)
+	}
+	if err := a.Locks().Wait(context.Background(), writeLock(object, LockOwner{Session: cred.ID}, LockRange{Start: 0, End: 0})); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("Wait on an expired lease = %v, want ErrSessionExpired", err)
+	}
+}
+
+func TestDetachSurrendersLocksBeforeInFlightOperationsDrain(t *testing.T) {
+	a, _ := testAuthority(t)
+	cred, err := a.Attach(1, PeerIdentity{1}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := ObjectKey{5}
+	if err := a.Locks().Set(writeLock(object, LockOwner{Session: cred.ID}, ToEOF(0))); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := a.Begin(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Detach(cred); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(heldRecords(a.Locks(), object)); got != 0 {
+		t.Fatalf("a terminal session still held %d records while draining", got)
+	}
+	if err := a.Locks().Set(writeLock(object, LockOwner{Session: cred.ID}, ToEOF(0))); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("Set under a detached session = %v, want ErrSessionExpired", err)
+	}
+	pin.End()
+}
+
+// TestCredentialGenerationIsVerified pins the credential generation as a
+// checked protocol constant rather than a field that is compared but can never
+// differ.
+func TestCredentialGenerationIsVerified(t *testing.T) {
+	a, _ := testAuthority(t)
+	cred, err := a.Attach(1, PeerIdentity{1}, testAuthorization(AccessRead))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.Generation != sessionCredentialGeneration {
+		t.Fatalf("minted generation = %d, want %d", cred.Generation, sessionCredentialGeneration)
+	}
+	forged := cred
+	forged.Generation = cred.Generation + 1
+	if err := a.Resume(forged); !errors.Is(err, ErrSessionFenced) {
+		t.Fatalf("Resume with a foreign generation = %v, want ErrSessionFenced", err)
+	}
+	if err := a.Resume(cred); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("Resume after terminal fencing = %v", err)
+	}
+}
+
+func TestPerSessionLockBudgetDefaultsToAnEqualShare(t *testing.T) {
+	a, err := New("shares", Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.MaxLockRecordsPerSession; got != 4 {
+		t.Fatalf("derived per-session lock budget = %d, want 4", got)
+	}
+	explicit, err := New("explicit", Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16, MaxLockRecordsPerSession: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := explicit.cfg.MaxLockRecordsPerSession; got != 12 {
+		t.Fatalf("explicit per-session lock budget = %d", got)
+	}
+	if _, err := New("oversized", Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16, MaxLockRecordsPerSession: 17}); err == nil {
+		t.Fatal("a per-session budget larger than the table was accepted")
+	}
+}
+
 func TestSessionAdmissionIsBoundedAndReleased(t *testing.T) {
 	a, err := New("bounded", Config{SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 1, MaxLockRecords: 8})
 	if err != nil {

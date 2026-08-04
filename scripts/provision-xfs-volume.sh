@@ -39,7 +39,7 @@ decimal_at_most "$service_gid" 4294967294 || fail "service-gid must be a nonzero
 [[ $block_limit =~ ^[1-9][0-9]*[kKmMgGtTpP]?$ ]] || fail "invalid XFS block hard limit" 64
 [[ $inode_limit =~ ^[1-9][0-9]*$ ]] || fail "invalid inode hard limit" 64
 
-for command_name in find findmnt flock mktemp readlink stat sync xfs_quota; do
+for command_name in find findmnt flock mktemp readlink stat sync xfs_io xfs_quota; do
   command -v "$command_name" >/dev/null || fail "required command is missing: $command_name" 69
 done
 
@@ -114,8 +114,19 @@ trap cleanup EXIT
 chmod 0700 "$stage"
 xfs_quota -x -c "project -s -p $stage $project_id" "$mount_target"
 xfs_quota -x -c "limit -p bhard=$block_limit ihard=$inode_limit $project_id" "$mount_target"
-project_check=$(xfs_quota -x -c "project -c -p $stage $project_id" "$mount_target")
-[[ -z $project_check ]] || fail "XFS project validation failed: $project_check"
+# Read the result back through FS_IOC_FSGETXATTR, the same ioctl the data plane
+# uses at startup, instead of parsing xfs_quota's progress text. `project -c`
+# always prints two informational lines, so treating any output as a failure
+# rejected every correctly provisioned volume.
+stage_attributes=$(LC_ALL=C xfs_io -r -c stat -- "$stage")
+stage_project=$(printf '%s\n' "$stage_attributes" | sed -n 's/^fsxattr\.projid = \([0-9]\{1,\}\)$/\1/p')
+stage_xflags=$(printf '%s\n' "$stage_attributes" | sed -n 's/^fsxattr\.xflags = 0x\([0-9a-fA-F]\{1,\}\).*$/\1/p')
+[[ $stage_project == "$project_id" ]] ||
+  fail "XFS project validation failed: project ID is ${stage_project:-unreadable}, want $project_id"
+[[ $stage_xflags =~ ^[0-9a-fA-F]+$ ]] || fail "XFS project validation failed: xflags are unreadable"
+# FS_XFLAG_PROJINHERIT. Without it, children of this directory escape the
+# project and its quota, which is the whole isolation guarantee.
+(( (16#$stage_xflags & 0x200) != 0 )) || fail "XFS project validation failed: project inheritance flag is not set"
 # Project limits are separate XFS metadata from the directory inode. Force the
 # quota transaction as well as fsyncing the directory and its publish parent.
 sync -f -- "$mount_root"

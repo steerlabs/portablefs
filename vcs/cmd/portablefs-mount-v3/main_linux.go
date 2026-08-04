@@ -108,7 +108,7 @@ func run() error {
 	}
 	mount, err := fusev3.MountVolume(context.Background(), absoluteMount, client, fusev3.Config{
 		FSName: "portablefs:" + *volumeID, RequestTimeout: *requestTimeout,
-		MaxBackground: *maxBackground, ReclaimQueue: *reclaimQueue,
+		MaxBackground: *maxBackground, MaxInFlight: *maxInFlight, ReclaimQueue: *reclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
 	})
 	if err != nil {
@@ -121,11 +121,42 @@ func run() error {
 	case <-done:
 		return mount.Close()
 	case <-ctx.Done():
-		if err := mount.Unmount(); err != nil {
-			return fmt.Errorf("unmount: %w", err)
+		return shutdown(mount, done, absoluteMount)
+	}
+}
+
+// shutdown removes the kernel mount before this process exits.
+//
+// Exiting while the mount is still installed is strictly worse than waiting:
+// /dev/fuse would close, every process under the mountpoint would see ENOTCONN
+// with no way to recover, the stale mount would still be listed, and the
+// authority session would be dropped without a Detach. EBUSY simply means some
+// process still holds a file under the mountpoint, so the only correct answer
+// is to keep serving and try again.
+func shutdown(mount *fusev3.Mount, done <-chan struct{}, mountpoint string) error {
+	const (
+		firstRetry = 250 * time.Millisecond
+		maxRetry   = 30 * time.Second
+	)
+	for delay := firstRetry; ; delay = min(2*delay, maxRetry) {
+		err := mount.Unmount()
+		if err == nil {
+			<-done
+			return nil
 		}
-		<-done
-		return nil
+		select {
+		case <-done:
+			// The kernel mount disappeared underneath us (an external
+			// fusermount -u, for example). Release the authority session.
+			return mount.Close()
+		default:
+		}
+		log.Printf("unmount %s: %v; the mount is still in use and remains served, retrying in %s", mountpoint, err, delay)
+		select {
+		case <-done:
+			return mount.Close()
+		case <-time.After(delay):
+		}
 	}
 }
 

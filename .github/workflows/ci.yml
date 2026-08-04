@@ -66,6 +66,29 @@ jobs:
       - name: Race suite
         run: go -C vcs test -race ./...
 
+  # The privileged Linux data-plane suite. Everything below `go test ./...` in
+  # the `go` job runs on an ordinary tmpfs with no XFS project quotas and no
+  # kernel FUSE mount, so the two-mount coherence, locking, paging, session and
+  # durability assertions are only ever executed here. The suite is fail-closed:
+  # PORTABLEFS_XFS_TEST_REQUIRED=1 turns a missing gate into a test failure, and
+  # the script additionally verifies that each required test reported PASS, so a
+  # provisioning regression or a deleted test cannot present as a green run.
+  linux-xfs-fuse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify the runner can provide loop devices and /dev/fuse
+        run: |
+          sudo modprobe loop
+          sudo modprobe fuse
+          test -e /dev/loop-control
+          test -e /dev/fuse
+      - name: Privileged XFS (prjquota) and kernel FUSE integration suite
+        run: bash scripts/xfs-fuse-integration.sh
+
   postgres-integration:
     runs-on: ubuntu-24.04
     services:

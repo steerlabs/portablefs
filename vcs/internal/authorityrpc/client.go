@@ -13,6 +13,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -20,6 +21,10 @@ var (
 	ErrTransportUncertain = errors.New("authorityrpc: connection ended before the operation outcome was received")
 	ErrAuthorityChanged   = errors.New("authorityrpc: authority epoch changed; remount is required")
 	ErrSessionEnded       = errors.New("authorityrpc: authority session ended; remount is required")
+	// ErrReplayDesynchronized is terminal. It means the authority recorded a
+	// replay identity this client did not submit, which invalidates exact-once
+	// delivery for the whole session.
+	ErrReplayDesynchronized = errors.New("authorityrpc: authority recorded a different replay identity; remount is required")
 )
 
 type ClientConfig struct {
@@ -41,6 +46,19 @@ type callResult struct {
 	err      error
 }
 
+// lane is one admission class. Ordinary operations and blocking POSIX lock
+// waits never share permits, and each lane owns a private, disjoint range of
+// replay slots sized at least as large as its own permit count. A caller takes
+// its permit before it takes a slot index, so at most one caller can hold any
+// slot at a time: slot ownership cannot contend, and a parked lock waiter can
+// neither consume an ordinary permit nor stall an ordinary mutation.
+type lane struct {
+	permits  chan struct{}
+	slots    []clientSlot
+	nextSlot atomic.Uint32
+	base     uint32
+}
+
 type Client struct {
 	cfg ClientConfig
 
@@ -50,7 +68,8 @@ type Client struct {
 	pendingMu sync.Mutex
 	pending   map[uint64]chan callResult
 	nextID    atomic.Uint64
-	sem       chan struct{}
+	ordinary  lane
+	blocking  lane
 	epoch     []byte
 	proof     *authoritypb.SessionProof
 	root      *authoritypb.Item
@@ -58,8 +77,6 @@ type Client struct {
 	maxWrite  uint32
 	lease     time.Duration
 	frameMax  atomic.Uint32
-	slots     []clientSlot
-	nextSlot  atomic.Uint32
 	poisoned  atomic.Bool
 	closed    bool
 	fatalOnce sync.Once
@@ -69,7 +86,10 @@ type Client struct {
 }
 
 type clientSlot struct {
-	mu       sync.Mutex
+	mu sync.Mutex
+	// sequence mirrors what the authority reported as recorded for this slot.
+	// It is only ever assigned from a MutationState the authority returned, so
+	// the two counters cannot drift apart.
 	sequence uint64
 }
 
@@ -78,8 +98,14 @@ func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		cfg.ReplaySlots == 0 || cfg.MaxFrame == 0 || cfg.MaxInFlight <= 0 || cfg.DialTimeout <= 0 || cfg.CancelDrainTimeout <= 0 {
 		return nil, errors.New("authorityrpc: complete client configuration is required")
 	}
+	if cfg.MaxInFlight < 2 {
+		return nil, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
+	}
 	if uint64(cfg.ReplaySlots) < uint64(cfg.MaxInFlight) {
 		return nil, errors.New("authorityrpc: replay slots must cover every possible in-flight mutation")
+	}
+	if cfg.MaxFrame < MinimumFrameBytes {
+		return nil, fmt.Errorf("authorityrpc: frame bound must be at least %d bytes", MinimumFrameBytes)
 	}
 	if cfg.TLS.InsecureSkipVerify || cfg.TLS.ServerName == "" {
 		return nil, errors.New("authorityrpc: verified TLS server name is required")
@@ -87,9 +113,13 @@ func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS = cfg.TLS.Clone()
 	cfg.TLS.MinVersion = tls.VersionTLS13
 	cfg.TLS.NextProtos = []string{protocolALPN}
+	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
+	slots := make([]clientSlot, cfg.ReplaySlots)
+	split := cfg.ReplaySlots - uint32(blockingLimit)
 	c := &Client{
-		cfg: cfg, pending: make(map[uint64]chan callResult), sem: make(chan struct{}, cfg.MaxInFlight),
-		slots: make([]clientSlot, cfg.ReplaySlots), fatalDone: make(chan struct{}),
+		cfg: cfg, pending: make(map[uint64]chan callResult), fatalDone: make(chan struct{}),
+		ordinary: lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
+		blocking: lane{permits: make(chan struct{}, blockingLimit), slots: slots[split:], base: split},
 	}
 	if err := c.connect(ctx, false); err != nil {
 		return nil, err
@@ -145,7 +175,7 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 		return fail(err)
 	}
 	var hello authoritypb.Response
-	if err := readFrame(conn, c.cfg.MaxFrame, &hello); err != nil {
+	if err := readFrame(conn, c.cfg.MaxFrame, nil, 0, &hello); err != nil {
 		return fail(err)
 	}
 	if hello.GetRequestId() != helloReq.GetRequestId() || hello.GetErrno() != 0 || hello.GetHello() == nil || hello.GetHello().GetProtocolMajor() != ProtocolMajor {
@@ -167,8 +197,8 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 	if negotiatedFrame > c.cfg.MaxFrame {
 		negotiatedFrame = c.cfg.MaxFrame
 	}
-	if uint64(hello.GetHello().GetMaxReadBytes())+uint64(framePayloadReserve) > uint64(negotiatedFrame) ||
-		uint64(hello.GetHello().GetMaxWriteBytes())+uint64(framePayloadReserve) > uint64(negotiatedFrame) {
+	if uint64(hello.GetHello().GetMaxReadBytes())+uint64(FramePayloadReserve) > uint64(negotiatedFrame) ||
+		uint64(hello.GetHello().GetMaxWriteBytes())+uint64(FramePayloadReserve) > uint64(negotiatedFrame) {
 		return fail(errors.New("authorityrpc: I/O payload bounds exceed the negotiated frame"))
 	}
 	c.frameMax.Store(negotiatedFrame)
@@ -182,7 +212,7 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 			return fail(err)
 		}
 		var response authoritypb.Response
-		if err := readFrame(conn, c.frameMax.Load(), &response); err != nil {
+		if err := readFrame(conn, c.frameMax.Load(), nil, 0, &response); err != nil {
 			return fail(err)
 		}
 		if response.GetRequestId() != request.GetRequestId() || !equalBytes(response.GetEpoch(), c.epoch) {
@@ -199,7 +229,7 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 			return fail(err)
 		}
 		var response authoritypb.Response
-		if err := readFrame(conn, c.frameMax.Load(), &response); err != nil {
+		if err := readFrame(conn, c.frameMax.Load(), nil, 0, &response); err != nil {
 			return fail(err)
 		}
 		if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || response.GetAttach() == nil {
@@ -212,7 +242,7 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 			len(response.GetAttach().GetSessionId()) != len(volumeserver.SessionID{}) ||
 			len(response.GetAttach().GetResumeSecret()) != len(volumeserver.ResumeSecret{}) ||
 			response.GetAttach().GetSessionGeneration() == 0 ||
-			response.GetAttach().GetRoot() == nil || len(response.GetAttach().GetRoot().GetToken()) != 16 {
+			response.GetAttach().GetRoot() == nil || len(response.GetAttach().GetRoot().GetToken()) != len(xfsstore.Capability{}) {
 			return fail(errors.New("authorityrpc: attach returned malformed session state"))
 		}
 		c.epoch = append([]byte(nil), response.GetEpoch()...)
@@ -228,10 +258,12 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return fail(err)
 	}
+	// The request-ID counter is reset before the connection is published, so a
+	// concurrent caller can never register a pending entry under a pre-reset ID.
+	c.nextID.Store(2)
 	c.pendingMu.Lock()
 	c.conn = conn
 	c.pendingMu.Unlock()
-	c.nextID.Store(2)
 	go c.readLoop(conn)
 	return nil
 }
@@ -289,16 +321,32 @@ func (c *Client) signalSessionEnd(err error) {
 	})
 }
 
+func (c *Client) laneFor(request *authoritypb.Request) *lane {
+	if blockingWait(request) {
+		return &c.blocking
+	}
+	return &c.ordinary
+}
+
+// Call submits one request under this client's admission bounds. Mutations
+// must go through CallMutation, which owns the replay identity.
 func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if request == nil || request.GetHello() != nil || request.GetAttach() != nil {
 		return nil, syscall.EINVAL
 	}
+	admitted := c.laneFor(request)
 	select {
-	case c.sem <- struct{}{}:
+	case admitted.permits <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	defer func() { <-c.sem }()
+	defer func() { <-admitted.permits }()
+	return c.dispatch(ctx, request)
+}
+
+// dispatch performs one round trip. Admission is the caller's responsibility so
+// that a replay slot is never taken before the permit that bounds it.
+func (c *Client) dispatch(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	request = protoCloneRequest(request)
 	request.RequestId = c.nextID.Add(1)
 	request.Epoch = append([]byte(nil), c.epoch...)
@@ -396,26 +444,43 @@ func (c *Client) CallRead(ctx context.Context, request *authoritypb.Request) (*a
 	return c.Call(ctx, request)
 }
 
-// CallMutation assigns one replay slot/sequence, reconnects and replays only
-// against the same live authority epoch, and advances the slot after any exact
-// response. Cancellation after send poisons the client because the outcome is
-// genuinely uncertain to the caller.
+// CallMutation assigns one replay slot/sequence from this request's admission
+// lane, reconnects and replays only against the same live authority epoch, and
+// then synchronizes the slot to the state the authority reports it recorded.
+// The client never infers that the authority advanced a slot: every rejection
+// the authority makes before recording an outcome leaves both counters equal.
+// Cancellation after send poisons the client because the outcome is genuinely
+// uncertain to the caller.
 func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if c.poisoned.Load() {
 		return nil, ErrTransportUncertain
 	}
-	index := (c.nextSlot.Add(1) - 1) % uint32(len(c.slots))
-	slot := &c.slots[index]
+	admitted := c.laneFor(request)
+	select {
+	case admitted.permits <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-admitted.permits }()
+
+	// The permit is held, so at most cap(permits) callers can be between here
+	// and the matching release, and the lane owns at least that many slots.
+	// Round-robin therefore hands every concurrent caller a distinct slot.
+	local := (admitted.nextSlot.Add(1) - 1) % uint32(len(admitted.slots))
+	slot := &admitted.slots[local]
+	index := admitted.base + local
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
+
 	request = protoCloneRequest(request)
-	request.Mutation = &authoritypb.Mutation{Slot: index, Sequence: slot.sequence + 1, RequestHash: make([]byte, 32)}
+	sequence := slot.sequence + 1
+	request.Mutation = &authoritypb.Mutation{Slot: index, Sequence: sequence}
 	hash, err := canonicalHash(request)
 	if err != nil {
 		return nil, err
 	}
 	request.Mutation.RequestHash = append([]byte(nil), hash[:]...)
-	response, err := c.Call(ctx, request)
+	response, err := c.dispatch(ctx, request)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		c.signalSessionEnd(ErrTransportUncertain)
 		return nil, ErrTransportUncertain
@@ -425,22 +490,41 @@ func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request)
 			c.signalSessionEnd(reconnectErr)
 			return nil, reconnectErr
 		}
-		response, err = c.Call(ctx, request)
+		response, err = c.dispatch(ctx, request)
 	}
 	if err != nil {
 		return nil, err
 	}
-	slot.sequence++
+	if err := synchronizeSlot(slot, index, sequence, response.GetMutation()); err != nil {
+		c.signalSessionEnd(err)
+		return nil, err
+	}
 	if response.GetUncertain() {
 		c.signalSessionEnd(ErrTransportUncertain)
 	}
 	return response, nil
 }
 
+// synchronizeSlot copies the authority's recorded slot state. An absent state
+// means the authority refused the request before recording anything, so the
+// slot legitimately stays where it is and the next mutation reuses the same
+// sequence. Any other value is a desynchronization, not a recoverable error.
+func synchronizeSlot(slot *clientSlot, index uint32, sequence uint64, state *authoritypb.MutationState) error {
+	if state == nil {
+		return nil
+	}
+	if state.GetSlot() != index || state.GetAcceptedSequence() != sequence {
+		return fmt.Errorf("%w: submitted slot %d sequence %d, authority recorded slot %d sequence %d",
+			ErrReplayDesynchronized, index, sequence, state.GetSlot(), state.GetAcceptedSequence())
+	}
+	slot.sequence = sequence
+	return nil
+}
+
 func (c *Client) readLoop(conn net.Conn) {
 	for {
 		var response authoritypb.Response
-		if err := readFrame(conn, c.frameMax.Load(), &response); err != nil {
+		if err := readFrame(conn, c.frameMax.Load(), nil, 0, &response); err != nil {
 			c.failConnection(conn, ErrTransportUncertain)
 			return
 		}

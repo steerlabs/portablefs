@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -22,28 +23,77 @@ func PeerIdentity(ctx context.Context) ([32]byte, bool) {
 	return identity, ok
 }
 
+// TransportBounds are the limits a handler advertises to its clients. The
+// server refuses to run unless it enforces exactly these, so a client can
+// never be sized to a bound the server kills it for exceeding, and the server
+// can never retain a reply the transport is unable to write.
+type TransportBounds struct {
+	// MaxFrame is the largest frame either direction may carry.
+	MaxFrame uint32
+	// MaxRequestFrame is the largest frame a well-formed request can occupy.
+	// It is smaller than MaxFrame because only replies carry bulk read and
+	// directory data, and it is what bounds inbound allocation.
+	MaxRequestFrame uint32
+	// MaxInFlight is the per-connection concurrent execution bound.
+	MaxInFlight int
+}
+
 type Handler interface {
+	// Epoch is the current authority epoch. The server stamps it on every
+	// response it has to generate itself, so a transport-level substitution is
+	// never read by a client as an authority failover.
+	Epoch() []byte
+	// Bounds are the limits this handler advertises during Hello.
+	Bounds() TransportBounds
 	Handle(context.Context, *authoritypb.Request) *authoritypb.Response
 }
 
 type Server struct {
-	Handler          Handler
-	MaxFrame         uint32
-	MaxInFlight      int
-	MaxConnections   int
-	HandshakeTimeout time.Duration
-	IdleTimeout      time.Duration
-	WriteTimeout     time.Duration
+	Handler        Handler
+	MaxFrame       uint32
+	MaxInFlight    int
+	MaxConnections int
+	// MaxFrameBytesInFlight bounds the bytes this worker will have allocated
+	// for inbound frame payloads at any instant, across all connections.
+	MaxFrameBytesInFlight uint64
+	HandshakeTimeout      time.Duration
+	IdleTimeout           time.Duration
+	WriteTimeout          time.Duration
+
+	budget *frameBudget
+}
+
+func (s *Server) validate() (TransportBounds, error) {
+	if s.Handler == nil || s.MaxFrame == 0 || s.MaxInFlight <= 0 || s.MaxConnections <= 0 ||
+		s.MaxFrameBytesInFlight == 0 || s.HandshakeTimeout <= 0 || s.IdleTimeout <= 0 || s.WriteTimeout <= 0 {
+		return TransportBounds{}, errors.New("authorityrpc: handler, admission bounds, allocation budget, and connection timeouts are required")
+	}
+	if s.MaxInFlight < 2 {
+		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
+	}
+	bounds := s.Handler.Bounds()
+	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {
+		return TransportBounds{}, fmt.Errorf("authorityrpc: handler advertises frame %d/in-flight %d but the transport enforces %d/%d",
+			bounds.MaxFrame, bounds.MaxInFlight, s.MaxFrame, s.MaxInFlight)
+	}
+	if bounds.MaxRequestFrame == 0 || bounds.MaxRequestFrame > s.MaxFrame {
+		return TransportBounds{}, errors.New("authorityrpc: advertised request-frame bound must be positive and within the transport frame")
+	}
+	if s.MaxFrameBytesInFlight < uint64(bounds.MaxRequestFrame) {
+		return TransportBounds{}, errors.New("authorityrpc: frame allocation budget cannot admit one maximal request")
+	}
+	return bounds, nil
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tls.Config) error {
-	if s.Handler == nil || s.MaxFrame == 0 || s.MaxInFlight <= 0 || s.MaxConnections <= 0 ||
-		s.HandshakeTimeout <= 0 || s.IdleTimeout <= 0 || s.WriteTimeout <= 0 {
-		return errors.New("authorityrpc: handler, admission bounds, and connection timeouts are required")
+	bounds, err := s.validate()
+	if err != nil {
+		return err
 	}
 	if tlsConfig == nil || tlsConfig.MinVersion < tls.VersionTLS13 || tlsConfig.ClientAuth != tls.RequireAndVerifyClientCert || tlsConfig.ClientCAs == nil {
 		return errors.New("authorityrpc: TLS 1.3 and CA-verified client certificates are required")
 	}
+	s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{protocolALPN}
 	tlsListener := tls.NewListener(listener, tlsConfig)
@@ -73,7 +123,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 			go func() {
 				defer connectionWorkers.Done()
 				defer func() { <-connections }()
-				_ = s.serveConn(serveCtx, conn)
+				_ = s.serveConn(serveCtx, conn, bounds)
 			}()
 		default:
 			_ = conn.Close()
@@ -81,40 +131,59 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	}
 }
 
-func (s *Server) serveConn(parent context.Context, conn net.Conn) error {
-	ctx, cancel := context.WithCancel(parent)
-	requestCtx := ctx
-	defer cancel()
+// serveConn owns the authenticated boundary. It accepts only a TLS connection:
+// peer identity is not an optional decoration on this protocol, and every
+// authorization decision downstream reads it from the request context.
+func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds TransportBounds) error {
 	defer conn.Close()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return errors.New("authorityrpc: authority connections must be mutually authenticated TLS")
+	}
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
 	}()
-	if tlsConn, ok := conn.(*tls.Conn); ok {
-		if err := conn.SetDeadline(time.Now().Add(s.HandshakeTimeout)); err != nil {
-			return err
-		}
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return err
-		}
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			return err
-		}
-		state := tlsConn.ConnectionState()
-		if len(state.PeerCertificates) == 0 {
-			return errors.New("authorityrpc: authenticated peer certificate is missing")
-		}
-		if state.NegotiatedProtocol != protocolALPN {
-			return errors.New("authorityrpc: TLS peer did not negotiate the PortableFS authority protocol")
-		}
-		identity := sha256.Sum256(state.PeerCertificates[0].RawSubjectPublicKeyInfo)
-		requestCtx = context.WithValue(ctx, peerIdentityKey{}, identity)
+	if err := conn.SetDeadline(time.Now().Add(s.HandshakeTimeout)); err != nil {
+		return err
 	}
-	sem := make(chan struct{}, s.MaxInFlight)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return errors.New("authorityrpc: authenticated peer certificate is missing")
+	}
+	if state.NegotiatedProtocol != protocolALPN {
+		return errors.New("authorityrpc: TLS peer did not negotiate the PortableFS authority protocol")
+	}
+	identity := sha256.Sum256(state.PeerCertificates[0].RawSubjectPublicKeyInfo)
+	return s.serveSession(ctx, cancel, conn, bounds, identity)
+}
+
+// serveSession multiplexes one authenticated connection. It is separate from
+// serveConn so the transport can be exercised without standing up TLS, while
+// the exported path stays fail-closed.
+func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, conn net.Conn, bounds TransportBounds, identity [32]byte) error {
+	requestCtx := context.WithValue(ctx, peerIdentityKey{}, identity)
+	ordinaryLimit, blockingLimit := blockingWaitLane(s.MaxInFlight)
+	ordinary := make(chan struct{}, ordinaryLimit)
+	blocking := make(chan struct{}, blockingLimit)
 	var writers sync.Mutex
-	writeResponse := func(response *authoritypb.Response) error {
+	writeResponse := func(requestID uint64, response *authoritypb.Response) error {
 		if response == nil {
-			response = &authoritypb.Response{Errno: int32(syscall.EIO), Uncertain: true}
+			// A handler that produced nothing is an internal defect, never an
+			// epoch change: stamp the live epoch so the client is not told to
+			// remount after a failover that did not happen.
+			response = &authoritypb.Response{
+				RequestId: requestID, Epoch: s.Handler.Epoch(),
+				Errno: int32(syscall.EIO), Uncertain: true, Failure: authoritypb.FailureClass_FAILURE_CLASS_INTERNAL,
+			}
 		}
 		writers.Lock()
 		defer writers.Unlock()
@@ -123,9 +192,12 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) error {
 		}
 		err := writeFrame(conn, s.MaxFrame, response)
 		if errors.Is(err, ErrFrameBounds) {
+			// The replacement must carry the same epoch and the same recorded
+			// replay-slot state as the reply it stands in for. Dropping either
+			// would report a failover or desynchronize the client's slot.
 			response = &authoritypb.Response{
-				RequestId: response.GetRequestId(), Epoch: append([]byte(nil), response.GetEpoch()...),
-				Errno: int32(syscall.EOVERFLOW), Uncertain: true,
+				RequestId: response.GetRequestId(), Epoch: s.Handler.Epoch(),
+				Mutation: response.GetMutation(), Errno: int32(syscall.EOVERFLOW), Uncertain: true,
 			}
 			err = writeFrame(conn, s.MaxFrame, response)
 		}
@@ -144,7 +216,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) error {
 			return err
 		}
 		request := new(authoritypb.Request)
-		if err := readFrame(conn, s.MaxFrame, request); err != nil {
+		if err := readFrame(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
 			}
@@ -161,16 +233,23 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) error {
 				cancelTarget()
 			}
 			// Cancellation must remain processable when every normal execution
-			// slot is occupied. Its handler only validates the session and returns
+			// slot is occupied. Its handler only validates the epoch and returns
 			// the acknowledgment, so execute it inline outside the normal slots.
-			if err := writeResponse(s.Handler.Handle(requestCtx, request)); err != nil {
+			if err := writeResponse(request.GetRequestId(), s.Handler.Handle(requestCtx, request)); err != nil {
 				return err
 			}
 			continue
 		}
+		// A blocking POSIX lock wait parks until an unrelated session releases a
+		// lock. It gets its own lane so it can never occupy the last ordinary
+		// slot, which is what the client's keepalive needs to stay live.
+		lane := ordinary
+		if blockingWait(request) {
+			lane = blocking
+		}
 		admissionTimer := time.NewTimer(s.WriteTimeout)
 		select {
-		case sem <- struct{}{}:
+		case lane <- struct{}{}:
 			if !admissionTimer.Stop() {
 				select {
 				case <-admissionTimer.C:
@@ -188,38 +267,29 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) error {
 			return errors.New("authorityrpc: connection in-flight bound exceeded")
 		}
 		opCtx, opCancel := context.WithCancel(requestCtx)
-		if request.GetCancel() == nil {
-			inflightMu.Lock()
-			if _, duplicate := inflight[request.GetRequestId()]; duplicate {
-				inflightMu.Unlock()
-				opCancel()
-				<-sem
-				return errors.New("authorityrpc: duplicate in-flight request ID")
-			}
-			inflight[request.GetRequestId()] = opCancel
+		inflightMu.Lock()
+		if _, duplicate := inflight[request.GetRequestId()]; duplicate {
 			inflightMu.Unlock()
+			opCancel()
+			<-lane
+			return errors.New("authorityrpc: duplicate in-flight request ID")
 		}
+		inflight[request.GetRequestId()] = opCancel
+		inflightMu.Unlock()
 		workers.Add(1)
-		go func(req *authoritypb.Request, opCtx context.Context, opCancel context.CancelFunc) {
+		go func(req *authoritypb.Request, opCtx context.Context, opCancel context.CancelFunc, lane chan struct{}) {
 			defer workers.Done()
-			defer func() { <-sem }()
+			defer func() { <-lane }()
 			defer opCancel()
-			if req.GetCancel() == nil {
-				defer func() {
-					inflightMu.Lock()
-					delete(inflight, req.GetRequestId())
-					inflightMu.Unlock()
-				}()
-			}
-			response := s.Handler.Handle(opCtx, req)
-			if response == nil {
-				response = &authoritypb.Response{RequestId: req.GetRequestId(), Errno: 5, Uncertain: true}
-			}
-			err := writeResponse(response)
-			if err != nil {
+			defer func() {
+				inflightMu.Lock()
+				delete(inflight, req.GetRequestId())
+				inflightMu.Unlock()
+			}()
+			if err := writeResponse(req.GetRequestId(), s.Handler.Handle(opCtx, req)); err != nil {
 				cancel()
 				_ = conn.Close()
 			}
-		}(request, opCtx, opCancel)
+		}(request, opCtx, opCancel, lane)
 	}
 }

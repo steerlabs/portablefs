@@ -27,6 +27,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pft2"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
 )
@@ -60,18 +61,18 @@ type Tx interface {
 var (
 	ErrNotExist = os.ErrNotExist
 	ErrExist    = os.ErrExist
-	errNotDir   = errors.New("fstransition: not a directory")
-	errIsDir    = errors.New("fstransition: is a directory")
-	errNotEmpty = errors.New("fstransition: directory not empty")
+	errNotDir   = errnos.Sentinel("fstransition: not a directory", syscall.ENOTDIR)
+	errIsDir    = errnos.Sentinel("fstransition: is a directory", syscall.EISDIR)
+	errNotEmpty = errnos.Sentinel("fstransition: directory not empty", syscall.ENOTEMPTY)
 	// errInvalid covers structurally invalid mutations (write-range
 	// overflow, negative truncate). The live authority validates these
 	// pre-append, so a DURABLE record producing it is corruption — it is
 	// deterministic but never a benign env-less replay outcome.
-	errInvalid = errors.New("fstransition: invalid argument: invalid mutation")
+	errInvalid = errnos.Sentinel("fstransition: invalid argument: invalid mutation", syscall.EINVAL)
 	// errInvalidRename is the rename-into-own-subtree guard: deterministic
 	// AND benign on env-less replay (exactly like the live authority's
 	// errInvalidRename), unlike the other errInvalid cases.
-	errInvalidRename = errors.New("fstransition: invalid argument: rename into own subtree")
+	errInvalidRename = errnos.Sentinel("fstransition: invalid argument: rename into own subtree", syscall.EINVAL)
 	// errNoXattr is the removexattr-of-a-missing-name outcome (Linux
 	// removexattr semantics: ENODATA, never a silent no-op). Deterministic
 	// at the record's ordered position and benign on env-less replay (an
@@ -108,6 +109,14 @@ func BenignEnvlessOutcome(op wal.Op, tsMs int64, err error) bool {
 	if err == nil {
 		return true
 	}
+	// Exact outcome identity precedes the portable os.Err* aliases. Several
+	// errnos satisfy an alias they do not mean — syscall.ENOTEMPTY matches
+	// os.ErrExist — so testing an alias first would misclassify the very
+	// outcomes this set names.
+	if errors.Is(err, errNotEmpty) || errors.Is(err, errIsDir) ||
+		errors.Is(err, errNotDir) || errors.Is(err, errInvalidRename) {
+		return true
+	}
 	if errors.Is(err, os.ErrNotExist) && (op == wal.OpWrite || op == wal.OpTruncate) {
 		return tsMs == 0
 	}
@@ -119,10 +128,6 @@ func BenignEnvlessOutcome(op wal.Op, tsMs int64, err error) bool {
 	}
 	return errors.Is(err, os.ErrNotExist) ||
 		errors.Is(err, syscall.ENAMETOOLONG) ||
-		errors.Is(err, errNotEmpty) ||
-		errors.Is(err, errIsDir) ||
-		errors.Is(err, errNotDir) ||
-		errors.Is(err, errInvalidRename) ||
 		errors.Is(err, syscall.ENODATA) ||
 		errors.Is(err, syscall.ENOSPC)
 }

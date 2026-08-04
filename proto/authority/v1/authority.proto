@@ -57,6 +57,12 @@ message Response {
   int32 errno = 3; // Linux errno; zero is success
   bool uncertain = 4; // operation may have reached XFS; never auto-retry
   Attr post_attr = 5;
+  // mutation is present exactly when the authority recorded this request in a
+  // replay slot. It is the authoritative slot state; a client must copy it
+  // rather than infer its own sequence, so the two counters cannot diverge.
+  MutationState mutation = 6;
+  // failure disambiguates the errno space where one number has two meanings.
+  FailureClass failure = 7;
 
   oneof body {
     HelloReply hello = 10;
@@ -87,6 +93,24 @@ message Mutation {
   uint32 slot = 1;
   uint64 sequence = 2;
   bytes request_hash = 3; // SHA-256 of canonical protobuf body
+}
+
+// MutationState reports the replay-slot state the authority actually recorded.
+// It is envelope, not body: it is never part of a retained replay outcome and
+// never part of the canonical request hash.
+message MutationState {
+  uint32 slot = 1;
+  uint64 accepted_sequence = 2; // sequence now durable in that slot for this session
+}
+
+// FailureClass separates the two unrelated conditions that both surface as
+// EIO. A client can act on the difference: STORAGE means this authority's
+// filesystem is gone, INTERNAL means the authority did not recognise its own
+// error and the volume is otherwise intact.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_STORAGE = 1;
+  FAILURE_CLASS_INTERNAL = 2;
 }
 
 message Item {
