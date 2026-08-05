@@ -180,6 +180,8 @@ func commands() []command {
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
 		{"recovery", "list and resolve a mount's write-back recovery jobs", cmdRecovery},
+		{"route", "explain whether a path is served machine-locally or by the volume", cmdRoute},
+		{"prune-local", "reclaim machine-local backing that no route can reach", cmdPruneLocal},
 		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},
 		{"lifecycle", "hold the internal mount/update lifecycle guard", cmdLifecycle},
 		{"install-macos-app", "install the signed macOS app bundle", cmdInstallMacOSApp},

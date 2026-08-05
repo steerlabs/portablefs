@@ -34,6 +34,17 @@ type Access uint8
 const (
 	AccessRead Access = 1 << iota
 	AccessWrite
+	// AccessAdmin authorizes volume-wide configuration, which is a different
+	// thing from writing files and is granted separately. There was no such bit
+	// before machine-local routing existed: the only volume-wide state was the
+	// filesystem itself, so write access covered everything. It does not cover
+	// this. .portablefs/local-dirs decides which subtrees a mount can see at
+	// all, so a capability that lets an agent write files must not also let it
+	// hide a directory tree from every other machine. Mount mutations under
+	// .portablefs/ are refused outright for the same reason: the file is
+	// reachable only through ApplyRoutes, which runs the change through the
+	// visibility barrier instead of skewing one machine's topology silently.
+	AccessAdmin
 )
 
 // Authorization is the complete, signed authorization installed when a
@@ -113,12 +124,13 @@ type session struct {
 	// lockLease publishes leaseExpires to the lock table. It is written under
 	// s.mu wherever leaseExpires is, so the table can never read a lease
 	// boundary the authority has not granted.
-	lockLease *LockLease
-	fenced    bool
-	ending                bool
-	active                uint64
-	cleanupStarted        bool
-	slots                 []replaySlot
+	lockLease      *LockLease
+	fenced         bool
+	ending         bool
+	active         uint64
+	cleanupStarted bool
+	terminal       chan struct{}
+	slots          []replaySlot
 }
 
 // SessionUse pins runtime resources for one admitted operation. Ending a
@@ -207,6 +219,16 @@ func (a *Authority) VolumeID() string            { return a.volumeID }
 func (a *Authority) Locks() *LockTable           { return a.locks }
 func (a *Authority) SessionLease() time.Duration { return a.cfg.SessionLease }
 
+// ValidateAttachSlots checks the peer-controlled replay allocation without
+// creating a session. Handlers use it before spending a single-use attach
+// capability; Attach repeats the check so direct callers get the same bound.
+func (a *Authority) ValidateAttachSlots(slots uint32) error {
+	if slots == 0 || slots > a.cfg.MaxReplaySlots {
+		return ErrSlotRange
+	}
+	return nil
+}
+
 // OnSessionEnd registers runtime-resource cleanup. Hooks must be fast enough
 // for session sweeping and must not call back into this Authority. Durable
 // filesystem state never belongs in a hook.
@@ -229,11 +251,11 @@ func (a *Authority) notifySessionEnd(id SessionID) {
 }
 
 func (a *Authority) Attach(slots uint32, peer PeerIdentity, authorization Authorization) (SessionCredential, error) {
-	if slots == 0 || slots > a.cfg.MaxReplaySlots {
-		return SessionCredential{}, ErrSlotRange
+	if err := a.ValidateAttachSlots(slots); err != nil {
+		return SessionCredential{}, err
 	}
 	access := authorization.Access
-	if access&AccessRead == 0 || access&^(AccessRead|AccessWrite) != 0 {
+	if access&AccessRead == 0 || access&^(AccessRead|AccessWrite|AccessAdmin) != 0 {
 		return SessionCredential{}, ErrSessionFenced
 	}
 	now := a.cfg.Now()
@@ -253,6 +275,7 @@ func (a *Authority) Attach(slots uint32, peer PeerIdentity, authorization Author
 		leaseExpires:          minTime(now.Add(a.cfg.SessionLease), authorization.Deadline),
 		authorizationDeadline: authorization.Deadline,
 		slots:                 make([]replaySlot, slots),
+		terminal:              make(chan struct{}),
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -269,6 +292,42 @@ func (a *Authority) Attach(slots uint32, peer PeerIdentity, authorization Author
 	// runs out. Registration is the only way a record or waiter can ever exist.
 	s.lockLease = a.locks.RegisterSession(id, s.leaseExpires)
 	return SessionCredential{Epoch: a.epoch, ID: id, Generation: sessionCredentialGeneration, Secret: secret, Peer: peer, Access: access}, nil
+}
+
+// SessionTerminal closes at the exact fencing boundary, before deferred
+// descriptor cleanup. Cache-coherence coordination uses it because a blocked
+// operation must not keep an unclean mount looking live.
+func (a *Authority) SessionTerminal(id SessionID) (<-chan struct{}, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := a.sessions[id]
+	if s == nil {
+		return nil, ErrSessionExpired
+	}
+	return s.terminal, nil
+}
+
+// FenceSession ends one session immediately and permanently. It is the action
+// behind participant-scoped cache fencing: the authority stops recognising this
+// mount, and the mount learns it has been fenced from its own session dying,
+// which is what obliges it to revoke its kernel mount locally. It is idempotent,
+// so the path that fences a session and the terminal-channel watcher that
+// observes the result can both call it.
+func (a *Authority) FenceSession(id SessionID) {
+	a.mu.Lock()
+	s := a.sessions[id]
+	if s == nil {
+		a.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	s.fenced = true
+	cleanup := a.endSessionLocked(id, s)
+	s.mu.Unlock()
+	a.mu.Unlock()
+	if cleanup {
+		a.finishSession(id)
+	}
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -365,6 +424,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 	if !s.ending {
 		s.ending = true
 		s.fenced = true
+		close(s.terminal)
 		if a.sessions[id] == s {
 			delete(a.sessions, id)
 		}

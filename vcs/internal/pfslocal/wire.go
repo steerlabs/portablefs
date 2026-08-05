@@ -83,8 +83,8 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.OperationID = v
-		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
-			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 90, 91:
+		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
+			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 90, 91:
 			if wt != wireBytes {
 				return nil, ErrMalformed
 			}
@@ -164,6 +164,10 @@ func marshalBody(v any) (int, []byte, error) {
 		return 35, nil, nil
 	case *PublicationAck:
 		return 36, marshalPublicationAck(m), nil
+	case *VisibilityAckRequest:
+		return 37, marshalVisibilityAckRequest(m), nil
+	case *V3LivenessRequest:
+		return 38, marshalV3LivenessRequest(m), nil
 	case *HelloReply:
 		return 60, marshalHelloReply(m), nil
 	case *ResolveReply:
@@ -216,6 +220,10 @@ func marshalBody(v any) (int, []byte, error) {
 		return 84, marshalHardLinkReply(m), nil
 	case *SyncVolumeReply:
 		return 85, marshalSyncVolumeReply(m), nil
+	case *VisibilityAckReply:
+		return 86, nil, nil
+	case *V3LivenessReply:
+		return 87, marshalV3LivenessReply(m), nil
 	case *ErrorReply:
 		return 90, marshalErrorReply(m), nil
 	case *Event:
@@ -281,6 +289,10 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return &SyncVolumeRequest{}, nil
 	case 36:
 		return unmarshalPublicationAck(b)
+	case 37:
+		return unmarshalVisibilityAckRequest(b)
+	case 38:
+		return unmarshalV3LivenessRequest(b)
 	case 60:
 		return unmarshalHelloReply(b)
 	case 61:
@@ -333,6 +345,10 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalHardLinkReply(b)
 	case 85:
 		return unmarshalSyncVolumeReply(b)
+	case 86:
+		return &VisibilityAckReply{}, nil
+	case 87:
+		return unmarshalV3LivenessReply(b)
 	case 90:
 		return unmarshalErrorReply(b)
 	case 91:
@@ -433,6 +449,77 @@ func unmarshalPublicationAck(b []byte) (*PublicationAck, error) {
 	})
 }
 
+func marshalVisibilityAckRequest(m *VisibilityAckRequest) []byte {
+	var b []byte
+	b = appendBytesField(b, 1, m.AuthorityEpoch)
+	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
+	b = appendBool(b, 3, m.Blocked)
+	b = appendString(b, 4, m.Reason)
+	return b
+}
+
+func unmarshalVisibilityAckRequest(b []byte) (*VisibilityAckRequest, error) {
+	m := &VisibilityAckRequest{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			m.AuthorityEpoch, err = scalarBytes(wt, raw)
+		case 2:
+			m.Cursor, err = parseVisibilityCursorField(wt, raw)
+		case 3:
+			m.Blocked, err = scalarBool(wt, raw)
+		case 4:
+			var v []byte
+			v, err = scalarBytes(wt, raw)
+			m.Reason = string(v)
+		}
+		return err
+	})
+}
+
+func marshalV3LivenessRequest(m *V3LivenessRequest) []byte {
+	var b []byte
+	b = appendBytesField(b, 1, m.AuthorityEpoch)
+	b = appendBytesField(b, 2, m.SessionID)
+	return b
+}
+
+func unmarshalV3LivenessRequest(b []byte) (*V3LivenessRequest, error) {
+	m := &V3LivenessRequest{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			m.AuthorityEpoch, err = scalarBytes(wt, raw)
+		case 2:
+			m.SessionID, err = scalarBytes(wt, raw)
+		}
+		return err
+	})
+}
+
+func marshalV3LivenessReply(m *V3LivenessReply) []byte {
+	var b []byte
+	b = appendBytesField(b, 1, m.AuthorityEpoch)
+	b = appendBytesField(b, 2, m.SessionID)
+	return b
+}
+
+func unmarshalV3LivenessReply(b []byte) (*V3LivenessReply, error) {
+	m := &V3LivenessReply{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			m.AuthorityEpoch, err = scalarBytes(wt, raw)
+		case 2:
+			m.SessionID, err = scalarBytes(wt, raw)
+		}
+		return err
+	})
+}
+
 func marshalResolveRequest(m *ResolveRequest) []byte {
 	var b []byte
 	return appendString(b, 1, m.AttachRef)
@@ -458,6 +545,9 @@ func marshalResolveReply(m *ResolveReply) []byte {
 	b = appendString(b, 4, m.Branch)
 	b = appendString(b, 5, m.VolumeName)
 	b = appendMsg(b, 6, marshalCapabilities(&m.Capabilities))
+	if m.V3Coherence != nil {
+		b = appendMsg(b, 7, marshalV3CoherenceContract(m.V3Coherence))
+	}
 	return b
 }
 
@@ -484,6 +574,52 @@ func unmarshalResolveReply(b []byte) (*ResolveReply, error) {
 			m.VolumeName = string(v)
 		case 6:
 			m.Capabilities, err = parseCapabilitiesField(wt, raw)
+		case 7:
+			m.V3Coherence, err = parseV3CoherenceContractField(wt, raw)
+		}
+		return err
+	})
+}
+
+func marshalV3CoherenceContract(m *V3CoherenceContract) []byte {
+	var b []byte
+	b = appendU32(b, 1, m.AuthorityProtocolMajor)
+	b = appendBytesField(b, 2, m.AuthorityEpoch)
+	b = appendBytesField(b, 3, m.SessionID)
+	b = appendString(b, 4, m.CachePolicy)
+	b = appendU64(b, 5, m.RepairBudgetMillis)
+	if m.InitialCursor != nil {
+		b = appendMsg(b, 6, marshalVisibilityCursor(m.InitialCursor))
+	}
+	return b
+}
+
+func parseV3CoherenceContractField(wt int, raw []byte) (*V3CoherenceContract, error) {
+	if wt != wireBytes {
+		return nil, ErrMalformed
+	}
+	m := &V3CoherenceContract{}
+	return m, scan(raw, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			var v uint64
+			v, err = scalarU64(wt, raw)
+			m.AuthorityProtocolMajor = uint32(v)
+		case 2:
+			m.AuthorityEpoch, err = scalarBytes(wt, raw)
+		case 3:
+			m.SessionID, err = scalarBytes(wt, raw)
+		case 4:
+			var v []byte
+			v, err = scalarBytes(wt, raw)
+			m.CachePolicy = string(v)
+		case 5:
+			m.RepairBudgetMillis, err = scalarU64(wt, raw)
+		case 6:
+			var cursor VisibilityCursor
+			cursor, err = parseVisibilityCursorField(wt, raw)
+			m.InitialCursor = &cursor
 		}
 		return err
 	})
@@ -555,6 +691,9 @@ func marshalItem(m *Item) []byte {
 	var b []byte
 	b = appendU64(b, 1, m.ItemID)
 	b = appendU64(b, 2, m.ItemGeneration)
+	if m.StableIdentity != ([16]byte{}) {
+		b = appendBytesField(b, 3, m.StableIdentity[:])
+	}
 	return b
 }
 
@@ -573,6 +712,16 @@ func parseItemField(wt int, raw []byte) (Item, error) {
 			v, err := scalarU64(wt, raw)
 			m.ItemGeneration = v
 			return err
+		case 3:
+			v, err := scalarBytes(wt, raw)
+			if err != nil {
+				return err
+			}
+			if len(v) != len(m.StableIdentity) {
+				return ErrMalformed
+			}
+			copy(m.StableIdentity[:], v)
+			return nil
 		}
 		return nil
 	})
@@ -1637,6 +1786,8 @@ func marshalEvent(m *Event) []byte {
 		b = appendMsg(b, 1, marshalInvalidation(k))
 	case *AttachState:
 		b = appendMsg(b, 2, marshalAttachState(k))
+	case *V3VisibilityEvent:
+		b = appendMsg(b, 3, marshalV3VisibilityEvent(k))
 	}
 	return b
 }
@@ -1654,6 +1805,150 @@ func unmarshalEvent(b []byte) (*Event, error) {
 			var st AttachState
 			st, err = parseAttachStateField(wt, raw)
 			m.Kind = &st
+		case 3:
+			var visibility V3VisibilityEvent
+			visibility, err = parseV3VisibilityEventField(wt, raw)
+			m.Kind = &visibility
+		}
+		return err
+	})
+}
+
+func marshalVisibilityCursor(m *VisibilityCursor) []byte {
+	var b []byte
+	b = appendU64(b, 1, m.Sequence)
+	b = appendI32(b, 2, int32(m.Phase))
+	return b
+}
+
+func parseVisibilityCursorField(wt int, raw []byte) (VisibilityCursor, error) {
+	if wt != wireBytes {
+		return VisibilityCursor{}, ErrMalformed
+	}
+	m := VisibilityCursor{}
+	return m, scan(raw, func(num int, wt int, raw []byte) error {
+		switch num {
+		case 1:
+			v, err := scalarU64(wt, raw)
+			m.Sequence = v
+			return err
+		case 2:
+			v, err := scalarU64(wt, raw)
+			m.Phase = VisibilityPhase(v)
+			return err
+		}
+		return nil
+	})
+}
+
+func marshalVisibilityTarget(m *VisibilityTarget) []byte {
+	var b []byte
+	b = appendI32(b, 1, int32(m.Scope))
+	b = appendBytesField(b, 2, m.Identity)
+	b = appendBytesField(b, 3, m.ParentIdentity)
+	b = appendBytesField(b, 4, m.Name)
+	b = appendI64(b, 5, m.Size)
+	return b
+}
+
+func parseVisibilityTargetField(wt int, raw []byte) (VisibilityTarget, error) {
+	if wt != wireBytes {
+		return VisibilityTarget{}, ErrMalformed
+	}
+	m := VisibilityTarget{}
+	return m, scan(raw, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			var v uint64
+			v, err = scalarU64(wt, raw)
+			m.Scope = VisibilityScope(v)
+		case 2:
+			m.Identity, err = scalarBytes(wt, raw)
+		case 3:
+			m.ParentIdentity, err = scalarBytes(wt, raw)
+		case 4:
+			m.Name, err = scalarBytes(wt, raw)
+		case 5:
+			var v uint64
+			v, err = scalarU64(wt, raw)
+			m.Size = int64(v)
+		}
+		return err
+	})
+}
+
+func marshalRoutesChange(m *RoutesChange) []byte {
+	var b []byte
+	b = appendBytesField(b, 1, m.Revision)
+	b = appendBytesField(b, 2, m.Rules)
+	return b
+}
+
+func parseRoutesChangeField(wt int, raw []byte) (*RoutesChange, error) {
+	if wt != wireBytes {
+		return nil, ErrMalformed
+	}
+	m := &RoutesChange{}
+	return m, scan(raw, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			m.Revision, err = scalarBytes(wt, raw)
+		case 2:
+			m.Rules, err = scalarBytes(wt, raw)
+		}
+		return err
+	})
+}
+
+func marshalV3VisibilityEvent(m *V3VisibilityEvent) []byte {
+	var b []byte
+	b = appendBytesField(b, 1, m.AuthorityEpoch)
+	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
+	b = appendBytesField(b, 3, m.InitiatorSessionID)
+	b = appendU32(b, 4, m.MutationSlot)
+	for i := range m.Targets {
+		b = appendMsg(b, 5, marshalVisibilityTarget(&m.Targets[i]))
+	}
+	b = appendU64(b, 6, m.MutationSequence)
+	if m.Routes != nil {
+		b = appendMsg(b, 7, marshalRoutesChange(m.Routes))
+	}
+	b = appendU64(b, 8, m.LocalOperationID)
+	return b
+}
+
+func parseV3VisibilityEventField(wt int, raw []byte) (V3VisibilityEvent, error) {
+	if wt != wireBytes {
+		return V3VisibilityEvent{}, ErrMalformed
+	}
+	m := V3VisibilityEvent{}
+	return m, scan(raw, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			m.AuthorityEpoch, err = scalarBytes(wt, raw)
+		case 2:
+			m.Cursor, err = parseVisibilityCursorField(wt, raw)
+		case 3:
+			m.InitiatorSessionID, err = scalarBytes(wt, raw)
+		case 4:
+			var v uint64
+			v, err = scalarU64(wt, raw)
+			m.MutationSlot = uint32(v)
+		case 5:
+			var target VisibilityTarget
+			target, err = parseVisibilityTargetField(wt, raw)
+			if err == nil {
+				m.Targets = append(m.Targets, target)
+			}
+		case 6:
+			m.MutationSequence, err = scalarU64(wt, raw)
+		case 7:
+			m.Routes, err = parseRoutesChangeField(wt, raw)
+		case 8:
+			m.LocalOperationID, err = scalarU64(wt, raw)
 		}
 		return err
 	})

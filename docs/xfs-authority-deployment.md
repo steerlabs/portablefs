@@ -56,6 +56,8 @@ The worker requires:
 - a server certificate and `0600` private key;
 - the client CA used for mount identities;
 - the control plane's Ed25519 public verification key;
+- the provisioned, volume-bound durable strict-membership file outside the
+  user-visible project directory;
 - explicit protocol allocation/concurrency bounds;
 - a TCP listener reachable only through the intended security group/load
   balancer.
@@ -72,6 +74,8 @@ portablefs-authority \
   --tls-key /run/portablefs/server.key \
   --client-ca /run/portablefs/client-ca.pem \
   --capability-public-key /run/portablefs/capability-public.pem \
+  --visibility-membership-file \
+    /srv/portablefs/.portablefs-control/vol_01JXYZ/strict-membership \
   --max-sessions 1024 \
   --max-lock-records 65536
 ```
@@ -80,6 +84,24 @@ Size session, lock, replay, in-flight, descriptor, cgroup-memory, and I/O
 admission from the worker class and workload measurements. They protect one
 volume worker from denial of service; they are not PortableFS filesystem-size
 limits and do not imply a universal RAM budget.
+
+The membership file contains only active strict mount-session identifiers. It
+is not filesystem content or operation history. Startup proceeds only when the
+record is empty (or prior mounts were externally fenced). If the prior process
+stopped with recorded strict mounts, startup refuses writes. The control plane must
+first prove each exact kernel mount absent or fence its host; only that recovery
+workflow may add `--prior-strict-mounts-fenced` once to clear the old record.
+Never set the flag merely because the authority process or network connection
+stopped.
+
+The standalone authority currently configures no external
+`MountAbsenceVerifier`. Consequently, client-supplied mount-table bytes cannot
+clear durable membership even after a clean strict unmount; the session is
+fenced and the record remains for the restart recovery workflow above. A
+production deployment that wants automatic clean-detach deactivation must add a
+bounded attestation verifier tied to the exact host and session. Treat that as a
+deployment gate—never replace it with a verifier that accepts the frontend's
+opaque bytes on trust.
 
 User-xattr writes are disabled at launch. XFS does not charge attribute-fork
 blocks to a project, so per-inode RPC limits cannot isolate a shared cell and a
@@ -129,6 +151,53 @@ The mountpoint must be a clean absolute, real, empty directory.
 Use `fsync`/`fdatasync` on files and `fsync` on changed parent directories for
 durability. Linux currently does not forward `syncfs(2)` to ordinary FUSE
 userspace servers, so it is not a remote durability boundary for this mount.
+
+## Verifying cross-mount coherence
+
+The claim this topology exists to support is that one volume mounted on several
+machines behaves like one POSIX filesystem. That claim is verified by a
+runnable matrix, not by inspection:
+
+```bash
+scripts/coherence-matrix-linux.sh
+```
+
+It provisions a real XFS cell with project quotas in a privileged container,
+starts the real `portablefs-authority` process, starts two real
+`portablefs-mount-v3` processes against it, and then drives both mountpoints
+with ordinary syscalls from a separate black-box program
+(`vcs/test/coherence/cmd/pfs-coherence-matrix`). Nothing is in process and no
+kernel is faked, which is also what makes the last case possible: the mounts
+are separate processes, so one can be killed uncleanly and the other required
+to keep serving.
+
+Each case asserts the real quantity. Content is compared against the bytes a
+descriptor actually returns when read to EOF, never against `stat.Size`; the
+namespace is compared against the entries `readdir` actually enumerates; an
+atomic replacement is compared against the inode number the surviving mount
+resolves. No case polls or retries: with zero cache timeouts the correct answer
+is the first answer, so a case that needed a settling delay would be reporting a
+defect, not a timing artefact.
+
+The run has three phases. The first points the second mount at a directory that
+is not the volume and requires every mountpoint-dependent case to fail. The
+second replays mount A's first successful pathname observations and requires
+every case declared sensitive to that stale-view fault to fail; stateful
+descriptor behavior and the attach-time route contract are intentionally not
+misclassified as pathname-cache tests. Only then does the third report the real
+result. A case that misses its declared control result fails the job. A case
+that cannot be honestly asserted - for example the ownership case with no
+alternate GID available - skips with a stated reason and a nonzero exit, never
+a quiet pass.
+
+The case list, the falsifiability controls and the macOS half are documented
+in [the cross-mount coherence matrix](./cross-mount-coherence-matrix.md).
+
+`scripts/coherence-matrix-macos.sh` runs the same named cases against two live
+mounts, either two on one Mac or one local macOS mount and a remote macOS or
+Linux peer over ssh, so the platforms' matrices can be compared line for line.
+It refuses to run against ordinary directories and skips loudly when the
+second verified peer mount is unavailable.
 
 ## Failure and replacement
 

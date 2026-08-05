@@ -95,6 +95,23 @@ func TestRenameKeepsObjectIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stableBefore, err := v.Identity(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.WriteAt(handle, []byte("identity"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.CloseOpen(handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Chmod(item, 0o640); err != nil {
+		t.Fatal(err)
+	}
 	if err := v.Rename(root, "old", root, "new", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +129,13 @@ func TestRenameKeepsObjectIdentity(t *testing.T) {
 	defer v.Forget(looked)
 	if got.Ino != before.Ino {
 		t.Fatalf("lookup inode = %d, want %d", got.Ino, before.Ino)
+	}
+	stableAfter, err := v.Identity(looked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stableAfter != stableBefore {
+		t.Fatalf("write/chmod/rename changed stable identity: %x -> %x", stableBefore, stableAfter)
 	}
 }
 
@@ -137,6 +161,17 @@ func TestHardLinkUsesUnprivilegedRetainedFD(t *testing.T) {
 	if aliasAttr.Ino != sourceAttr.Ino || sourceAttr.Nlink != 2 {
 		t.Fatalf("hard-link attrs source=%+v alias=%+v", sourceAttr, aliasAttr)
 	}
+	sourceIdentity, err := v.Identity(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasIdentity, err := v.Identity(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceIdentity != aliasIdentity {
+		t.Fatalf("hard-link aliases have different stable identities: %x != %x", sourceIdentity, aliasIdentity)
+	}
 
 	symlink, _, err := v.Symlink(root, "symlink", "source")
 	if err != nil {
@@ -155,6 +190,30 @@ func TestHardLinkUsesUnprivilegedRetainedFD(t *testing.T) {
 	}
 	if target, err := v.Readlink(linkedSymlink); err != nil || target != "source" {
 		t.Fatalf("hard-linked symlink target = %q, %v", target, err)
+	}
+}
+
+func TestExactXFSHandleIdentityIncludesGeneration(t *testing.T) {
+	firstRaw := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	first, ok := exactXFSHandleIdentity(129, firstRaw)
+	if !ok || first == ([16]byte{}) {
+		t.Fatalf("exact XFS handle was refused: %x, %v", first, ok)
+	}
+	same, ok := exactXFSHandleIdentity(129, append([]byte(nil), firstRaw...))
+	if !ok || same != first {
+		t.Fatal("the same XFS handle did not preserve hard-link identity")
+	}
+	reusedRaw := append([]byte(nil), firstRaw...)
+	reusedRaw[len(reusedRaw)-1]++ // model the XFS i_generation component
+	reused, ok := exactXFSHandleIdentity(129, reusedRaw)
+	if !ok || reused == first {
+		t.Fatal("a reused inode generation aliased the prior XFS identity")
+	}
+	if _, ok := exactXFSHandleIdentity(1, firstRaw); ok {
+		t.Fatal("a non-XFS export handle was accepted as exact production identity")
+	}
+	if _, ok := exactXFSHandleIdentity(129, firstRaw[:11]); ok {
+		t.Fatal("a truncated XFS export handle was accepted")
 	}
 }
 
@@ -476,4 +535,34 @@ func mustOpenDir(t *testing.T, v *Volume, item Capability) Capability {
 	}
 	t.Cleanup(func() { _ = v.CloseOpen(handle) })
 	return handle
+}
+
+// A name that disappears between resolution and export-handle derivation is
+// the ordinary two-mount race: a peer unlinks or renames the name while this
+// authority is still deriving its incarnation identity. NameToHandleAt
+// returns the zero FileHandle on every error, so the error must be inspected
+// before the handle is touched — the regression this guards against was a nil
+// dereference that took the whole authority process down. Both identity modes
+// must report ordinary staleness instead.
+func TestStableIdentityAtMissingNameIsStaleNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	dirfd, err := unix.Open(dir, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(dirfd)
+	path := filepath.Join(dir, "victim")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, production := range []bool{false, true} {
+		if _, err := stableIdentityAt(dirfd, "victim", int(f.Fd()), production); !errors.Is(err, ErrStaleObject) {
+			t.Fatalf("production=%v: stableIdentityAt on unlinked name = %v, want ErrStaleObject", production, err)
+		}
+	}
 }

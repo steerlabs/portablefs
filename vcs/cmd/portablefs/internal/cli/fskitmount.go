@@ -316,11 +316,30 @@ type fskitEnsureAttachRequest struct {
 	TLSCASHA256          string             `json:"tlsCaSha256,omitempty"`
 	MountPath            string             `json:"mountPath"`
 	Options              fskitAttachOptions `json:"options"`
+	// V3 selects the daemon-owned authority-v3 attach (portablefsd's
+	// v3AttachRequest; see vcs/internal/portablefsd/v3attach.go). The daemon —
+	// never the FSKit extension — receives the mutual-TLS identity and dials
+	// the authority with it.
+	V3 *fskitV3AttachRequest `json:"v3,omitempty"`
+}
+
+// fskitV3AttachRequest mirrors portablefsd's v3AttachRequest JSON: the
+// mutual-TLS identity the daemon presents, the two numbers the authority
+// sizes the visibility barrier from, the declared coherence policy, and the
+// 64-hex routing revision this mount runs.
+type fskitV3AttachRequest struct {
+	ClientCertPEM      string `json:"clientCertPem"`
+	ClientKeyPEM       string `json:"clientKeyPem"`
+	CachedNameCapacity uint64 `json:"cachedNameCapacity"`
+	RepairBudgetMillis uint64 `json:"repairBudgetMillis"`
+	CachePolicy        string `json:"cachePolicy"`
+	RoutesRevision     string `json:"routesRevision"`
 }
 
 type fskitEnsureAttachReply struct {
-	AttachRef string   `json:"attachRef"`
-	LocalDirs []string `json:"localDirs,omitempty"`
+	AttachRef         string   `json:"attachRef"`
+	LocalDirs         []string `json:"localDirs,omitempty"`
+	LocalDirsDeclared bool     `json:"localDirsDeclared,omitempty"`
 }
 
 func (c *fsdControl) ensureAttachDetailed(req fskitEnsureAttachRequest) (fskitEnsureAttachReply, error) {

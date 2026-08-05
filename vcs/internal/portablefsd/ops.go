@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
@@ -162,6 +163,12 @@ func (a *attach) localAttrForRecordPath(
 }
 
 func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
+	// An authority-v3 attach resolves wholly from its own data plane — root
+	// identity, capabilities, and the V3CoherenceContract — and never touches
+	// the clientcore item registry below (see v3attach.go).
+	if a.isV3() {
+		return a.v3RootReply()
+	}
 	a.nsMu.RLock()
 	defer a.nsMu.RUnlock()
 	changed := false
@@ -231,8 +238,8 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 	// told this so it can report the truth, not so it can gate on it.
 	// A nil vol is the synthetic-root attach (no authority yet): false is the
 	// honest answer, and it is the conservative one.
-	flagsSupported := vol.SupportsFlagPersistence()
-	return pfslocal.ResolveReply{
+	flagsSupported := vol != nil && vol.SupportsFlagPersistence()
+	reply := pfslocal.ResolveReply{
 		Root: root.item, RootAttr: a.localAttrForRecord(root.attr, root, false),
 		VolumeID: a.volumeID, Branch: a.branch, VolumeName: a.volumeName,
 		Capabilities: pfslocal.Capabilities{
@@ -251,7 +258,11 @@ func (a *attach) rootReply(ctx context.Context) (pfslocal.ResolveReply, int32) {
 			// would resurrect the volume-wide refusal this replaced.
 			FlagsUnderstood: true,
 		},
-	}, 0
+	}
+	if bridge := a.v3CoherenceBridge(); bridge != nil {
+		reply.V3Coherence = bridge.resolveContract()
+	}
+	return reply, 0
 }
 
 func (a *attach) lookup(ctx context.Context, req *pfslocal.LookupRequest) (*pfslocal.LookupReply, int32) {
@@ -1905,8 +1916,8 @@ func (a *attach) remove(ctx context.Context, req *pfslocal.RemoveRequest) int32 
 }
 
 func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 {
-	// Exclusive: a rename can rekey an entire subtree of paths (and carry
-	// grafts with it), so every path resolved under a shared nsMu must stay
+	// Exclusive: a rename can rekey an entire subtree of paths, so every path
+	// resolved under a shared nsMu must stay
 	// valid for the duration of its op. File-grain mutations instead hold
 	// nsMu shared plus a per-directory stripe (see lockNames).
 	a.nsMu.Lock()
@@ -1927,8 +1938,21 @@ func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 
 	if eno != 0 {
 		return eno
 	}
-	fromGraft := a.localDirFor(oldp)
-	toGraft := a.localDirFor(newp)
+	// Snapshot routing once. addLocalDirs takes this same nsMu exclusively, so
+	// the answer remains stable through the authority RPC and registry rekey.
+	a.mu.RLock()
+	fromGraft := a.localDirForLocked(oldp)
+	toGraft := a.localDirForLocked(newp)
+	ancestorOfGraft := false
+	if fromGraft == "" && toGraft == "" {
+		for _, root := range a.localDirs {
+			if strings.HasPrefix(root, oldp+"/") || strings.HasPrefix(root, newp+"/") {
+				ancestorOfGraft = true
+				break
+			}
+		}
+	}
+	a.mu.RUnlock()
 	if fromGraft != "" || toGraft != "" {
 		if fromGraft == "" || toGraft == "" || fromGraft != toGraft {
 			// A rename across the graft boundary crosses filesystems; EXDEV
@@ -1937,6 +1961,13 @@ func (a *attach) rename(ctx context.Context, req *pfslocal.RenameRequest) int32 
 			return darwinEXDEV
 		}
 		return a.renameLocal(oldp, newp, req.NoReplace)
+	}
+	if ancestorOfGraft {
+		// Moving this shared ancestor would make names in its subtree stop
+		// matching at the source or start matching at the destination. Carrying
+		// backing would rewrite the declared topology; not carrying it would
+		// silently flip storage ownership. EBUSY admits neither interpretation.
+		return darwinEBUSY
 	}
 	vol, eno := a.volOrErr()
 	if eno != 0 {

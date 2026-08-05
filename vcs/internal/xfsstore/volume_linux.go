@@ -72,8 +72,9 @@ func (r *resource) release() error {
 // object is a held reference to an installed inode. Values are copied freely;
 // the descriptor stays valid until release is called exactly once.
 type object struct {
-	res  *resource
-	kind Kind
+	res      *resource
+	kind     Kind
+	identity [16]byte
 	// grant is the file description this authority created the inode with,
 	// for as long as no handle has taken it. See createGrant.
 	grant *createGrant
@@ -110,6 +111,15 @@ func (g *createGrant) take() *resource {
 	return res
 }
 
+// restore returns a taken description to the slot after a failed adoption.
+// The grant is filled once, at creation, and taken exactly once, so the slot
+// is empty for as long as the caller holds the description.
+func (g *createGrant) restore(res *resource) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.res = res
+}
+
 // discard releases an unused grant. Every path that drops an object runs it,
 // so an ungranted description is never leaked.
 func (g *createGrant) discard() error {
@@ -120,7 +130,8 @@ func (g *createGrant) discard() error {
 }
 
 type openFile struct {
-	res *resource
+	res      *resource
+	identity [16]byte
 	// read and write are the access this handle was opened for. They are
 	// enforced here rather than left to the underlying description, because a
 	// handle may be served by a creation grant whose description is wider than
@@ -166,6 +177,11 @@ type Volume struct {
 	ownerUID  uint32
 	ownerGID  uint32
 	projectID uint32
+	// productionIdentity requires the exact XFS export handle shape
+	// (type 129, 12 opaque bytes containing inode+generation). Tests on a
+	// non-XFS filesystem may fall back to device+inode, but production never
+	// does: inode reuse must create a different coordination identity.
+	productionIdentity bool
 }
 
 // holdObject resolves a capability and takes a reference to its descriptor.
@@ -193,19 +209,28 @@ func (v *Volume) holdOpen(id Capability) (*openFile, error) {
 	return f, nil
 }
 
-func (v *Volume) openChild(parent Capability, name string) (int, error) {
+func (v *Volume) openChild(parent Capability, name string) (int, [16]byte, error) {
 	if err := ValidateComponent(name); err != nil {
-		return -1, err
+		return -1, [16]byte{}, err
 	}
 	p, err := v.holdObject(parent)
 	if err != nil {
-		return -1, err
+		return -1, [16]byte{}, err
 	}
 	defer p.release()
 	if p.kind != KindDirectory {
-		return -1, syscall.ENOTDIR
+		return -1, [16]byte{}, syscall.ENOTDIR
 	}
-	return openChildAt(p.fd(), name)
+	fd, err := openChildAt(p.fd(), name)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	identity, err := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+	if err != nil {
+		_ = unix.Close(fd)
+		return -1, [16]byte{}, err
+	}
+	return fd, identity, nil
 }
 
 func openChildAt(parentFD int, name string) (int, error) {
@@ -249,6 +274,10 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		return fail(ErrNotXFS)
 	}
 	if requireXFS {
+		requiredFlags := int64(unix.ST_NODEV | unix.ST_NOSUID | unix.ST_NOEXEC | unix.ST_NOATIME)
+		if int64(statfs.Flags)&requiredFlags != requiredFlags {
+			return fail(fmt.Errorf("%w: flags=%#x require=%#x", ErrUnsafeMount, statfs.Flags, requiredFlags))
+		}
 		// The root descriptor is opened for access, so the project ioctl is
 		// available on it.
 		if err := verifyProject(fd, expectedProjectID, true); err != nil {
@@ -278,13 +307,19 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 	}
 
 	v := &Volume{
-		rootFD:    fd,
-		device:    uint64(st.Dev),
-		ownerUID:  ownerUID,
-		ownerGID:  ownerGID,
-		projectID: expectedProjectID,
-		objects:   make(map[Capability]object),
-		opens:     make(map[Capability]*openFile),
+		rootFD:             fd,
+		device:             uint64(st.Dev),
+		ownerUID:           ownerUID,
+		ownerGID:           ownerGID,
+		projectID:          expectedProjectID,
+		objects:            make(map[Capability]object),
+		opens:              make(map[Capability]*openFile),
+		productionIdentity: requireXFS,
+	}
+	rootIdentity, err := stableIdentityAt(unix.AT_FDCWD, rootPath, fd, requireXFS)
+	if err != nil {
+		_ = unix.Flock(fd, unix.LOCK_UN)
+		return fail(fmt.Errorf("derive stable root identity: %w", err))
 	}
 	root, err := randomCapability(v.objects)
 	if err != nil {
@@ -292,7 +327,7 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		return fail(err)
 	}
 	v.root = root
-	v.objects[root] = object{res: newResource(fd), kind: KindDirectory}
+	v.objects[root] = object{res: newResource(fd), kind: KindDirectory, identity: rootIdentity}
 	return v, nil
 }
 
@@ -407,7 +442,7 @@ func (v *Volume) openLocked(id Capability) (*openFile, error) {
 // this inode, and issues a capability for them. Every check that decides
 // whether this inode belongs to the volume happens here, before any capability
 // exists, and independently of how the descriptor was obtained.
-func (v *Volume) installObject(fd int, grant *resource) (Capability, Attr, error) {
+func (v *Volume) installObject(fd int, grant *resource, identity [16]byte) (Capability, Attr, error) {
 	fail := func(err error) (Capability, Attr, error) {
 		_ = unix.Close(fd)
 		if grant != nil {
@@ -444,7 +479,10 @@ func (v *Volume) installObject(fd int, grant *resource) (Capability, Attr, error
 	if err != nil {
 		return fail(err)
 	}
-	installed := object{res: newResource(fd), kind: attr.Kind}
+	if identity == ([16]byte{}) {
+		return fail(errors.New("xfsstore: object has no stable incarnation identity"))
+	}
+	installed := object{res: newResource(fd), kind: attr.Kind, identity: identity}
 	if grant != nil {
 		installed.grant = &createGrant{res: grant}
 	}
@@ -462,11 +500,11 @@ func allowedKind(kind Kind) error {
 }
 
 func (v *Volume) Lookup(parent Capability, name string) (Capability, Attr, error) {
-	fd, err := v.openChild(parent, name)
+	fd, identity, err := v.openChild(parent, name)
 	if err != nil {
 		return Capability{}, Attr{}, err
 	}
-	return v.installObject(fd, nil)
+	return v.installObject(fd, nil, identity)
 }
 
 func (v *Volume) Forget(id Capability) error {
@@ -495,30 +533,100 @@ func (v *Volume) Getattr(id Capability) (Attr, error) {
 	return statFD(obj.fd())
 }
 
-// Identity is stable for every hard-link alias during this mounted XFS
-// lifetime. It is coordination identity only, never authorization.
+// Identity is the stored XFS export-handle identity. XFS includes inode
+// generation in that handle, so hard-link aliases compare equal while a reused
+// inode number in the same authority epoch does not. It is coordination
+// identity only, never authorization.
 func (v *Volume) Identity(id Capability) ([16]byte, error) {
-	attr, err := v.Getattr(id)
+	obj, err := v.holdObject(id)
 	if err != nil {
 		return [16]byte{}, err
 	}
-	return identityFromAttr(attr), nil
+	defer obj.release()
+	return obj.identity, nil
 }
 
 func (v *Volume) IdentityOpen(id Capability) ([16]byte, error) {
-	attr, err := v.GetattrOpen(id)
+	opened, err := v.holdOpen(id)
 	if err != nil {
 		return [16]byte{}, err
 	}
-	return identityFromAttr(attr), nil
+	defer opened.release()
+	return opened.identity, nil
 }
 
-func identityFromAttr(attr Attr) [16]byte {
+func fallbackIdentityFromAttr(attr Attr) [16]byte {
 	var identity [16]byte
 	binary.BigEndian.PutUint32(identity[0:4], attr.DeviceMajor)
 	binary.BigEndian.PutUint32(identity[4:8], attr.DeviceMinor)
 	binary.BigEndian.PutUint64(identity[8:16], attr.Ino)
 	return identity
+}
+
+// stableIdentityAt copies the exact 12-byte XFS export handle plus its 4-byte
+// type. Linux export handles are designed for file-server identity and include
+// XFS i_generation. Holding fd prevents inode reuse while the pathname handle
+// is derived; the trailing stat comparison proves the path still names fd.
+func stableIdentityAt(dirfd int, path string, fd int, production bool) ([16]byte, error) {
+	var identity [16]byte
+	handle, _, err := unix.NameToHandleAt(dirfd, path, 0)
+	if err != nil {
+		// The error must be inspected before the handle: on every error path
+		// NameToHandleAt returns the zero FileHandle, whose accessors
+		// dereference a nil pointer. ENOENT/ESTALE here is an ordinary race —
+		// another mount unlinked or renamed the name between resolution and
+		// handle derivation — so it is stale-object staleness, not an
+		// invariant break and never a reason to take the process down.
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
+			return identity, ErrStaleObject
+		}
+		if production {
+			return identity, fmt.Errorf("xfsstore: XFS export handle cannot provide incarnation identity: %w", err)
+		}
+		attr, statErr := statFD(fd)
+		if statErr != nil {
+			return identity, statErr
+		}
+		return fallbackIdentityFromAttr(attr), nil
+	}
+	packed, exact := exactXFSHandleIdentity(handle.Type(), handle.Bytes())
+	if exact || !production && len(handle.Bytes()) == 12 {
+		var held, named unix.Stat_t
+		if err := unix.Fstat(fd, &held); err != nil {
+			return identity, err
+		}
+		if err := unix.Fstatat(dirfd, path, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return identity, err
+		}
+		if held.Dev != named.Dev || held.Ino != named.Ino {
+			return identity, ErrStaleObject
+		}
+		if exact {
+			return packed, nil
+		}
+		binary.BigEndian.PutUint32(identity[:4], uint32(handle.Type()))
+		copy(identity[4:], handle.Bytes())
+		return identity, nil
+	}
+	if production {
+		return identity, fmt.Errorf("xfsstore: XFS export handle cannot provide incarnation identity: unexpected XFS export handle type=%d bytes=%d",
+			handle.Type(), len(handle.Bytes()))
+	}
+	attr, statErr := statFD(fd)
+	if statErr != nil {
+		return identity, statErr
+	}
+	return fallbackIdentityFromAttr(attr), nil
+}
+
+func exactXFSHandleIdentity(handleType int32, raw []byte) ([16]byte, bool) {
+	var identity [16]byte
+	if handleType != 129 || len(raw) != 12 {
+		return identity, false
+	}
+	binary.BigEndian.PutUint32(identity[:4], uint32(handleType))
+	copy(identity[4:], raw)
+	return identity, true
 }
 
 func statFD(fd int) (Attr, error) {
@@ -674,7 +782,7 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	// does for every non-creating open.
 	if !flags.Sync && !flags.DataSync {
 		if granted := obj.grant.take(); granted != nil {
-			return v.adoptGrantedDescription(granted, id, obj.kind, flags)
+			return v.adoptGrantedDescription(obj.grant, granted, id, obj.kind, flags)
 		}
 	}
 	linuxFlags := unix.O_RDONLY
@@ -709,21 +817,29 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 // O_APPEND and O_TRUNC are the two open-time behaviors that still have to be
 // applied to it; both are expressible on an existing description, which is why
 // this is a handover and not an approximation of one.
-func (v *Volume) adoptGrantedDescription(granted *resource, id Capability, kind Kind, flags OpenFlags) (Capability, error) {
-	if flags.Append {
-		current, err := unix.FcntlInt(uintptr(granted.fd), unix.F_GETFL, 0)
-		if err != nil {
-			_ = granted.release()
-			return Capability{}, err
-		}
-		if _, err := unix.FcntlInt(uintptr(granted.fd), unix.F_SETFL, current|unix.O_APPEND); err != nil {
-			_ = granted.release()
+//
+// A failed step returns the description to the grant slot instead of closing
+// it. The grant is the only carrier of the access the creation conferred —
+// that is what makes open(O_CREAT|O_EXCL, 0444) writable — so consuming it on
+// a transient failure would permanently re-derive a later open's access from
+// the mode, the exact behavior the grant exists to prevent. The truncate runs
+// before the flag change so every restorable failure restores a description
+// whose flags are still exactly what creation produced.
+func (v *Volume) adoptGrantedDescription(grant *createGrant, granted *resource, id Capability, kind Kind, flags OpenFlags) (Capability, error) {
+	if flags.Truncate {
+		if err := unix.Ftruncate(granted.fd, 0); err != nil {
+			grant.restore(granted)
 			return Capability{}, err
 		}
 	}
-	if flags.Truncate {
-		if err := unix.Ftruncate(granted.fd, 0); err != nil {
-			_ = granted.release()
+	if flags.Append {
+		current, err := unix.FcntlInt(uintptr(granted.fd), unix.F_GETFL, 0)
+		if err != nil {
+			grant.restore(granted)
+			return Capability{}, err
+		}
+		if _, err := unix.FcntlInt(uintptr(granted.fd), unix.F_SETFL, current|unix.O_APPEND); err != nil {
+			grant.restore(granted)
 			return Capability{}, err
 		}
 	}
@@ -749,9 +865,13 @@ func (v *Volume) installHandle(res *resource, id Capability, kind Kind, flags Op
 	if err != nil {
 		return fail(err)
 	}
+	obj, ok := v.objects[id]
+	if !ok {
+		return fail(ErrStaleObject)
+	}
 	v.opens[openID] = &openFile{
 		res: res, read: flags.Read, write: flags.Write, append: flags.Append,
-		object: id, kind: kind,
+		object: id, kind: kind, identity: obj.identity,
 	}
 	return openID, nil
 }

@@ -50,7 +50,7 @@ mount_target=$(findmnt -n -r -o TARGET -T "$mount_root")
 mount_target=$(readlink -f -- "$mount_target") || fail "cannot resolve XFS mount target"
 [[ $mount_root == "$mount_target" ]] || fail "xfs-mount must be the dedicated XFS mount point, not a nested directory"
 mount_options=$(findmnt -n -r -o OPTIONS -T "$mount_root")
-for required in nodev nosuid noexec; do
+for required in nodev nosuid noexec noatime; do
   [[ ,$mount_options, == *,$required,* ]] || fail "XFS mount is missing $required"
 done
 [[ ,$mount_options, == *,prjquota,* || ,$mount_options, == *,pquota,* ]] || fail "XFS project quotas are not enabled"
@@ -135,6 +135,24 @@ sync -- "$stage"
 mv -- "$stage" "$destination"
 stage=
 sync -- "$mount_root"
+# Strict-cache membership is durable coordination metadata, not user-visible
+# filesystem state. Keep it beside the project volumes, in a per-worker private
+# directory, so an authority restart cannot forget a still-mounted kernel while
+# agents can never reach or mutate the record through PortableFS.
+control_root=$mount_root/.portablefs-control
+if [[ ! -e $control_root && ! -L $control_root ]]; then
+  mkdir -m 0711 -- "$control_root"
+  chown 0:0 "$control_root"
+  sync -- "$control_root"
+  sync -- "$mount_root"
+fi
+[[ -d $control_root && ! -L $control_root ]] || fail "visibility control root is not a real directory"
+[[ $(stat -c '%u:%g:%a' -- "$control_root") == 0:0:711 ]] || fail "visibility control root must be root:root mode 0711"
+control_dir=$control_root/$volume_name
+mkdir -m 0700 -- "$control_dir"
+chown "$service_uid:$service_gid" "$control_dir"
+sync -- "$control_dir"
+sync -- "$control_root"
 write_registry_record published
 
-echo "provisioned $destination (project $project_id, owner $service_uid:$service_gid, hard limits $block_limit / $inode_limit inodes)"
+echo "provisioned $destination (project $project_id, owner $service_uid:$service_gid, hard limits $block_limit / $inode_limit inodes; visibility state $control_dir/strict-membership)"

@@ -44,6 +44,22 @@ jobs:
       - run: pnpm -r --sort test
       - run: pnpm -r --sort typecheck
 
+  # The Swift suite covers the FSKit adapter, the installer core, and the
+  # macOS 26 cache-coherence enforcement (reserved-namespace refusal, one-shot
+  # repair provenance, and the real-syscall actuator paths). It ran only in
+  # release.yml, so every one of those assertions was invisible to pull
+  # requests; a regression could reach a tag before anything executed it.
+  swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build the Swift package
+        run: swift build --package-path swift/PortableFSKit
+      - name: Swift suite (FSKit adapter, app core, macOS 26 coherence)
+        run: swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+
   go:
     runs-on: ubuntu-24.04
     steps:
@@ -88,6 +104,52 @@ jobs:
           test -e /dev/fuse
       - name: Privileged XFS (prjquota) and kernel FUSE integration suite
         run: bash scripts/xfs-fuse-integration.sh
+
+  # The cross-mount coherence matrix. It is a different instrument from
+  # linux-xfs-fuse above and does not replace it: that job runs in-process Go
+  # tests that can inspect the frontend, while this one drives two real
+  # portablefs-mount-v3 processes through ordinary syscalls only, from a
+  # black-box program that cannot see any internal state. A case here cannot
+  # pass because a fake agreed with itself, and one mount can be killed
+  # uncleanly - which is only possible because the mounts are separate processes.
+  #
+  # The script runs its own falsifiability controls first (a disjoint-namespace
+  # phase where every case must fail, and a stale-view phase where every
+  # coherence case must fail) and fails the job if a control does not turn a case
+  # red. So a green result here is evidence rather than an absence of evidence.
+  linux-coherence-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify the runner can provide loop devices and /dev/fuse
+        run: |
+          sudo modprobe loop
+          sudo modprobe fuse
+          test -e /dev/loop-control
+          test -e /dev/fuse
+      # Both profiles run against a volume that really declares machine-local
+      # routes: the script installs the declaration through the admin
+      # ApplyRoutes call before either mount attaches, so every run also
+      # exercises the mount's adopt-and-retry attach path.
+      - name: Two-mount cross-mount coherence matrix (strict profile)
+        env:
+          PORTABLEFS_COHERENCE: strict
+        run: bash scripts/coherence-matrix-linux.sh
+      - name: Two-mount cross-mount coherence matrix (uncached profile)
+        env:
+          PORTABLEFS_COHERENCE: uncached
+        run: bash scripts/coherence-matrix-linux.sh
+      - name: Package-manager concurrent-reader matrix (strict profile)
+        env:
+          PORTABLEFS_COHERENCE: strict
+        run: bash scripts/package-manager-matrix.sh
+      - name: Package-manager concurrent-reader matrix (uncached profile)
+        env:
+          PORTABLEFS_COHERENCE: uncached
+        run: bash scripts/package-manager-matrix.sh
 
   postgres-integration:
     runs-on: ubuntu-24.04

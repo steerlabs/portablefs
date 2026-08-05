@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"testing"
@@ -40,6 +41,31 @@ func TestPostMutationLocalFailureIsMarkedUncertain(t *testing.T) {
 	response := h.errorResponse(7, errors.Join(xfsstore.ErrOutcomeUncertain, syscall.EMFILE), false)
 	if !response.GetUncertain() || response.GetErrno() != int32(syscall.EMFILE) {
 		t.Fatalf("response = %+v, want uncertain EMFILE", response)
+	}
+}
+
+// EIO is not the only errno with which the kernel declares the filesystem
+// gone: XFS surfaces detected corruption as EUCLEAN (EFSCORRUPTED), an
+// already-failed filesystem answers ESHUTDOWN, and terminal state loss is
+// ENOTRECOVERABLE. Every one of them must classify as a storage failure and
+// stay uncertain — a volume that kept serving mutations after corruption was
+// detected would be trusting durable state the kernel just disavowed.
+func TestCorruptionAndShutdownErrnosFenceLikeEIO(t *testing.T) {
+	h := &VolumeHandler{}
+	for _, errno := range []syscall.Errno{syscall.EUCLEAN, syscall.ESHUTDOWN, syscall.ENOTRECOVERABLE} {
+		if !fatalStorageErrno(errno) {
+			t.Fatalf("%v is not treated as fatal storage state", errno)
+		}
+		response := h.errorResponse(1, errno, false)
+		if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE {
+			t.Fatalf("%v = %+v, want FAILURE_CLASS_STORAGE", errno, response)
+		}
+		if !response.GetUncertain() {
+			t.Fatalf("%v must stay uncertain: the operation may have partially reached the device", errno)
+		}
+	}
+	if fatalStorageErrno(syscall.ENOSPC) {
+		t.Fatal("ENOSPC is an ordinary, retryable outcome and must not fence the volume")
 	}
 }
 
@@ -140,10 +166,16 @@ func TestDirectoryReplyBudgetAlwaysFitsTheFrame(t *testing.T) {
 			reply := &authoritypb.ReadDirReply{Verifier: make([]byte, 16)}
 			used := uint64(0)
 			for i := 0; ; i++ {
+				attr := xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: ^uint64(0), Size: 1 << 40}
+				var identity [16]byte
+				for j := range identity {
+					identity[j] = 0xff
+				}
 				dirent := &authoritypb.Dirent{
 					Name:       bytes.Repeat([]byte{'n'}, 255),
-					Attr:       attrProto(xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: ^uint64(0), Size: 1 << 40}),
+					Attr:       attrProto(attr),
 					NextCookie: encodeCookie(uint64(i)),
+					Item:       itemProto(xfsstore.Capability(identity), attr, identity),
 				}
 				cost := direntCost(dirent)
 				if used+cost > uint64(budget) {
@@ -179,7 +211,7 @@ func TestReplyCacheIsBoundedInBytes(t *testing.T) {
 	h := testVolumeHandler()
 	h.MaxRetainedReplyBytes = 3 * uint64(fixedMutationReplyBytes)
 	session := volumeserver.SessionID{1}
-	if err := h.startSessionResources(session, xfsstore.Capability{0xFF}, 4); err != nil {
+	if err := h.startSessionResources(session, xfsstore.Capability{0xFF}, 4, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	for slot := uint32(0); slot < 3; slot++ {
@@ -224,7 +256,7 @@ func TestReplyReservationIsReleasedWhenNothingIsRetained(t *testing.T) {
 	h := testVolumeHandler()
 	h.MaxRetainedReplyBytes = uint64(fixedMutationReplyBytes)
 	session := volumeserver.SessionID{4}
-	if err := h.startSessionResources(session, xfsstore.Capability{0xF3}, 2); err != nil {
+	if err := h.startSessionResources(session, xfsstore.Capability{0xF3}, 2, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	reserved, err := h.reserveReplyBytes(session, 0, fixedMutationReplyBytes)
@@ -244,23 +276,23 @@ func TestSessionResourceAdmissionAndTerminalState(t *testing.T) {
 	h := &VolumeHandler{MaxItemsPerSession: 1, MaxOpensPerSession: 1, MaxItems: 1, MaxOpens: 1, MaxFrame: 1 << 20, MaxRetainedReplyBytes: 1 << 20}
 	first := volumeserver.SessionID{1}
 	second := volumeserver.SessionID{2}
-	if err := h.startSessionResources(first, xfsstore.Capability{0xF1}, 2); err != nil {
+	if err := h.startSessionResources(first, xfsstore.Capability{0xF1}, 2, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.startSessionResources(second, xfsstore.Capability{0xF1}, 2); err != nil {
+	if err := h.startSessionResources(second, xfsstore.Capability{0xF1}, 2, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.trackItem(first, xfsstore.Capability{1}); err != nil {
+	if err := h.trackItem(first, xfsstore.Capability{1}, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.trackItem(second, xfsstore.Capability{2}); !errors.Is(err, volumeserver.ErrAdmission) {
+	if err := h.trackItem(second, xfsstore.Capability{2}, false); !errors.Is(err, volumeserver.ErrAdmission) {
 		t.Fatalf("global item admission = %v, want ErrAdmission", err)
 	}
 	h.closeSessionResources(first)
-	if err := h.trackItem(first, xfsstore.Capability{3}); !errors.Is(err, volumeserver.ErrSessionExpired) {
+	if err := h.trackItem(first, xfsstore.Capability{3}, false); !errors.Is(err, volumeserver.ErrSessionExpired) {
 		t.Fatalf("track after session end = %v, want ErrSessionExpired", err)
 	}
-	if err := h.trackItem(second, xfsstore.Capability{4}); err != nil {
+	if err := h.trackItem(second, xfsstore.Capability{4}, false); err != nil {
 		t.Fatalf("admission was not released by cleanup: %v", err)
 	}
 }
@@ -271,15 +303,15 @@ func TestSessionResourceAdmissionAndTerminalState(t *testing.T) {
 func TestCapabilityAccountingIsSymmetric(t *testing.T) {
 	h := testVolumeHandler()
 	session := volumeserver.SessionID{3}
-	if err := h.startSessionResources(session, xfsstore.Capability{0xF2}, 2); err != nil {
+	if err := h.startSessionResources(session, xfsstore.Capability{0xF2}, 2, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	item, handle := xfsstore.Capability{7}, xfsstore.Capability{8}
 	for range 4 {
-		if err := h.trackItem(session, item); err != nil {
+		if err := h.trackItem(session, item, false); err != nil {
 			t.Fatal(err)
 		}
-		if err := h.trackOpen(session, handle); err != nil {
+		if err := h.trackOpen(session, handle, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -305,15 +337,15 @@ func TestCapabilitiesResolveOnlyInsideTheirSession(t *testing.T) {
 	root := xfsstore.Capability{0xAA}
 	owner, other := volumeserver.SessionID{1}, volumeserver.SessionID{2}
 	for _, id := range []volumeserver.SessionID{owner, other} {
-		if err := h.startSessionResources(id, root, 2); err != nil {
+		if err := h.startSessionResources(id, root, 2, [32]byte{}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	item, handle := xfsstore.Capability{5}, xfsstore.Capability{6}
-	if err := h.trackItem(owner, item); err != nil {
+	if err := h.trackItem(owner, item, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.trackOpen(owner, handle); err != nil {
+	if err := h.trackOpen(owner, handle, false); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := h.item(owner, item[:]); err != nil || got != item {
@@ -404,6 +436,7 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	if required && os.Geteuid() == 0 {
 		t.Fatal("PORTABLEFS_XFS_TEST_REQUIRED=1 requires the unprivileged volume identity, not root")
 	}
+	resetXFSRouteDeclaration(t, root)
 	project, err := strconv.ParseUint(projectRaw, 10, 32)
 	if err != nil {
 		t.Fatal(err)
@@ -419,13 +452,14 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	}
 	h := &VolumeHandler{
 		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite},
+		Routes:   testRoutesController(t, store),
 		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
 		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 8192, MaxOpens: 8192,
 		MaxRetainedReplyBytes: 8 << 20,
 	}
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{7})
 
-	attach := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{VolumeId: "volume-e2e", AccessToken: []byte("test-only"), ReplaySlots: 2}}})
+	attach := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{VolumeId: "volume-e2e", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision()}}})
 	if attach.GetErrno() != 0 || attach.GetAttach() == nil {
 		t.Fatalf("attach = %v", attach)
 	}
@@ -468,6 +502,156 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	fsync := h.Handle(ctx, &authoritypb.Request{RequestId: 7, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: created.GetCreate().GetHandle()}}})
 	if fsync.GetErrno() != 0 {
 		t.Fatalf("fsync = %v", fsync)
+	}
+}
+
+// TestBlockedLockWaitDoesNotHoldTheTopologyGuard reproduces the volume-wide
+// freeze this classification exists to prevent: one session parks in a
+// blocking F_SETLKW-style wait, an administrator runs ApplyRoutes, and — with
+// the wait misclassified as a topology request — the queued topology writer
+// stalls every guarded request on the volume for as long as the wait lasts,
+// while KeepAlive (exempt from the guard) keeps the waiting session alive
+// indefinitely. The lock table never reaches XFS, so the wait must be admitted
+// through the ordinary session-routes check instead of holding the guard.
+func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
+	root := os.Getenv("PORTABLEFS_XFS_TEST_ROOT")
+	projectRaw := os.Getenv("PORTABLEFS_XFS_TEST_PROJECT")
+	required := os.Getenv("PORTABLEFS_XFS_TEST_REQUIRED") == "1"
+	if root == "" || projectRaw == "" {
+		if required {
+			t.Fatalf("PORTABLEFS_XFS_TEST_REQUIRED=1 but PORTABLEFS_XFS_TEST_ROOT=%q PORTABLEFS_XFS_TEST_PROJECT=%q", root, projectRaw)
+		}
+		t.Skip("privileged XFS gate is not configured")
+	}
+	resetXFSRouteDeclaration(t, root)
+	project, err := strconv.ParseUint(projectRaw, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := xfsstore.Open(root, xfsstore.Config{ExpectedProjectID: uint32(project), ExpectedOwnerUID: uint32(os.Geteuid()), ExpectedOwnerGID: uint32(os.Getegid())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime, err := volumeserver.New("volume-lockwait", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &VolumeHandler{
+		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite},
+		Routes:   testRoutesController(t, store),
+		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
+		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 8192, MaxOpens: 8192,
+		MaxRetainedReplyBytes: 8 << 20,
+	}
+	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{9})
+
+	attachSession := func(id uint64) (*authoritypb.AttachReply, []byte, *authoritypb.SessionProof) {
+		t.Helper()
+		attach := h.Handle(ctx, &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{VolumeId: "volume-lockwait", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision()}}})
+		if attach.GetErrno() != 0 || attach.GetAttach() == nil {
+			t.Fatalf("attach = %v", attach)
+		}
+		return attach.GetAttach(), attach.GetEpoch(), &authoritypb.SessionProof{Id: attach.GetAttach().GetSessionId(), Generation: attach.GetAttach().GetSessionGeneration(), ResumeSecret: attach.GetAttach().GetResumeSecret()}
+	}
+	holder, epoch, holderProof := attachSession(1)
+	waiter, _, waiterProof := attachSession(2)
+
+	create := &authoritypb.Request{RequestId: 3, Epoch: epoch, Session: holderProof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: holder.GetRoot().GetToken(), Name: []byte("lock-wait-target"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
+	stampMutation(t, create, 0, 1)
+	created := h.Handle(ctx, create)
+	if created.GetErrno() != 0 {
+		t.Fatalf("create = %v", created)
+	}
+	t.Cleanup(func() {
+		// Removed behind the store, like resetXFSRouteDeclaration: the routing
+		// revision this test installs makes the holder's session stale by
+		// design, so an in-protocol unlink could not run in every exit path.
+		if err := os.Remove(filepath.Join(root, "lock-wait-target")); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove shared XFS lock fixture: %v", err)
+		}
+	})
+	itemToken := created.GetCreate().GetItem().GetToken()
+
+	// The waiter needs its own capability for the same object.
+	waiterLookup := h.Handle(ctx, &authoritypb.Request{RequestId: 4, Epoch: epoch, Session: waiterProof, Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: waiter.GetRoot().GetToken(), Name: []byte("lock-wait-target")}}})
+	if waiterLookup.GetErrno() != 0 {
+		t.Fatalf("waiter lookup = %v", waiterLookup)
+	}
+	waiterToken := waiterLookup.GetLookup().GetItem().GetToken()
+
+	wholeFile := &authoritypb.LockRange{Start: 0, End: 0}
+	hold := &authoritypb.Request{RequestId: 5, Epoch: epoch, Session: holderProof, Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: &authoritypb.LockSpec{Item: itemToken, Owner: 1, Write: true, Range: wholeFile}}}}
+	stampMutation(t, hold, 0, 2)
+	if response := h.Handle(ctx, hold); response.GetErrno() != 0 {
+		t.Fatalf("holder SetLock = %v", response)
+	}
+
+	waitCtx, cancelWait := context.WithCancel(ctx)
+	defer cancelWait()
+	waitDone := make(chan *authoritypb.Response, 1)
+	go func() {
+		wait := &authoritypb.Request{RequestId: 6, Epoch: epoch, Session: waiterProof, Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: &authoritypb.LockSpec{Item: waiterToken, Owner: 2, Write: true, Range: wholeFile}, Wait: true}}}
+		stampMutation(t, wait, 0, 1)
+		waitDone <- h.Handle(waitCtx, wait)
+	}()
+	select {
+	case response := <-waitDone:
+		t.Fatalf("the conflicting blocking wait returned immediately: %v", response)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The topology writer must not queue behind the parked wait. Before the
+	// fix, this Apply blocked until the lock wait ended — and because a queued
+	// RWMutex writer stops new readers, every guarded request on the volume
+	// blocked with it.
+	active, err := h.Routes.Revision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDone := make(chan error, 1)
+	go func() {
+		_, err := h.Routes.Apply(ctx, []byte("node_modules\n"), active)
+		applyDone <- err
+	}()
+	select {
+	case err := <-applyDone:
+		if err != nil {
+			t.Fatalf("ApplyRoutes beside a blocked lock wait: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ApplyRoutes deadlocked behind a blocked lock wait")
+	}
+
+	// Ending the holder's session releases its locks and completes the parked
+	// wait: the waiter's admission happened before the routing change, exactly
+	// once, and is not re-litigated when the lock is granted.
+	if response := h.Handle(ctx, &authoritypb.Request{RequestId: 7, Epoch: epoch, Session: holderProof, Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}}); response.GetErrno() != 0 {
+		t.Fatalf("holder detach = %v", response)
+	}
+	select {
+	case response := <-waitDone:
+		if response.GetErrno() != 0 {
+			t.Fatalf("the parked wait completed with errno %d after the lock was released", response.GetErrno())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parked lock wait never completed after the holder detached")
+	}
+}
+
+func TestRoutingRevisionContractRejectsTheOldExactProtocolAtHello(t *testing.T) {
+	h := testVolumeHandler()
+	old := h.Handle(context.Background(), &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{
+		Hello: &authoritypb.HelloRequest{ProtocolMajor: ProtocolMajor - 1},
+	}})
+	if old.GetErrno() != int32(syscall.EOPNOTSUPP) || old.GetHello() != nil {
+		t.Fatalf("old-protocol hello = %v, want EOPNOTSUPP before attach", old)
+	}
+	current := h.Handle(context.Background(), &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Hello{
+		Hello: &authoritypb.HelloRequest{ProtocolMajor: ProtocolMajor},
+	}})
+	if current.GetErrno() != 0 || current.GetHello().GetProtocolMajor() != ProtocolMajor {
+		t.Fatalf("current-protocol hello = %v", current)
 	}
 }
 

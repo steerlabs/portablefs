@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
@@ -55,10 +56,11 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 }
 
 type frontendConn struct {
-	srv    *Server
-	conn   net.Conn
-	origin uint64
-	cancel context.CancelFunc
+	srv     *Server
+	conn    net.Conn
+	origin  uint64
+	connCtx context.Context
+	cancel  context.CancelFunc
 
 	writeMu sync.Mutex
 
@@ -67,6 +69,7 @@ type frontendConn struct {
 
 	eventsMu sync.Mutex
 	events   *eventSubscriber
+	v3Events bool
 
 	publicationMu     sync.Mutex
 	operations        map[uint64]*frontendOperationEntry
@@ -74,6 +77,7 @@ type frontendConn struct {
 	publicationClosed bool
 	closeOnce         sync.Once
 	inFlight          atomic.Int32
+	visibilityAckBusy atomic.Bool
 	handlerWG         sync.WaitGroup
 
 	// testAfterRetractionCapture fires between a reply's retraction-verdict
@@ -190,6 +194,7 @@ const (
 
 func (c *frontendConn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
+	c.connCtx = connCtx
 	c.cancel = cancel
 	defer c.close()
 	defer cancel()
@@ -212,6 +217,11 @@ func (c *frontendConn) serve(ctx context.Context) {
 				req.OperationID == 0 ||
 				!c.acknowledgePublication(req.OperationID) {
 				return
+			}
+			if a := c.currentAttach(); a != nil {
+				if bridge := a.v3CoherenceBridge(); bridge != nil {
+					_ = bridge.acknowledgePublication(req.OperationID)
+				}
 			}
 			continue
 		} else {
@@ -259,6 +269,30 @@ func (c *frontendConn) serve(ctx context.Context) {
 		default:
 			if state != frontendAttached {
 				return
+			}
+			// Visibility acknowledgement is the strict mount's reserved control
+			// lane. It bypasses ordinary admission and frontend namespace locks,
+			// and runs off the serial reader so a source COMPLETE can wait for a
+			// PublicationAck arriving later on this same connection.
+			if ack, ok := req.(*pfslocal.VisibilityAckRequest); ok {
+				if env.OperationID != 0 {
+					return
+				}
+				// Exactly one visibility event can be outstanding, and a correct
+				// frontend waits for this request's reply before issuing another.
+				// Bound the reserved lane independently instead of permitting a
+				// local peer to create an unbounded set of goroutines parked on
+				// the source-publication barrier.
+				if !c.visibilityAckBusy.CompareAndSwap(false, true) {
+					return
+				}
+				c.handlerWG.Add(1)
+				go func(requestID uint64, request *pfslocal.VisibilityAckRequest) {
+					defer c.handlerWG.Done()
+					defer c.visibilityAckBusy.Store(false)
+					c.handleVisibilityAck(connCtx, requestID, request)
+				}(env.RequestID, ack)
+				continue
 			}
 			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
 				c.inFlight.Add(-1)
@@ -435,6 +469,7 @@ func (c *frontendConn) close() {
 			}
 			c.events = nil
 		}
+		c.v3Events = false
 		c.eventsMu.Unlock()
 	})
 }
@@ -1051,6 +1086,15 @@ func (c *frontendConn) handleAttached(
 	// a new operation in the gate entry it took after them, a continuation in
 	// the resume half of its suspend/mirrors/resume sequence — and that wait
 	// spans a delegation release's authority round trips.
+	// An authority-v3 attach is served by the v3 data plane through its own
+	// handler: it keeps the logical-operation/PublicationAck ledger this
+	// connection owns but never enters the clientcore admission, mirror, or
+	// delegation machinery below (see v3attach.go).
+	if a.isV3() {
+		c.handleV3Attached(ctx, a, requestID, operationID, initializeOperation, body)
+		return
+	}
+
 	if operationID != 0 {
 		defer c.finishLogicalRequest(operationID)
 	}
@@ -1303,6 +1347,28 @@ func (a *attach) dispatchRequest(
 	return reply, eno, false
 }
 
+func (c *frontendConn) handleVisibilityAck(ctx context.Context, requestID uint64, request *pfslocal.VisibilityAckRequest) {
+	a := c.currentAttach()
+	if a == nil {
+		c.errorReply(requestID, darwinENXIO, "v3 attach is unavailable")
+		return
+	}
+	bridge := a.v3CoherenceBridge()
+	if bridge == nil {
+		c.errorReply(requestID, darwinENOTSUP, "attach does not use v3 visibility")
+		return
+	}
+	if err := bridge.acknowledge(ctx, request); err != nil {
+		errno := darwinEIO
+		if errors.Is(err, syscall.EINVAL) {
+			errno = darwinEINVAL
+		}
+		c.errorReply(requestID, errno, err.Error())
+		return
+	}
+	c.reply(requestID, &pfslocal.VisibilityAckReply{})
+}
+
 // pfsdTrace (PFSD_TRACE=1) logs every frontend op with its resolved paths and
 // errno — the pfslocal boundary is otherwise invisible, and kernel-side
 // caching bugs can only be diagnosed by seeing exactly what the extension
@@ -1341,7 +1407,20 @@ func traceOp(a *attach, body any) string {
 func (c *frontendConn) subscribeEvents(a *attach) error {
 	c.eventsMu.Lock()
 	defer c.eventsMu.Unlock()
-	if c.events != nil {
+	if c.events != nil || c.v3Events {
+		return nil
+	}
+	if bridge := a.v3CoherenceBridge(); bridge != nil {
+		c.v3Events = true
+		go func() {
+			err := bridge.run(c.connCtx, func(event *pfslocal.Event) error {
+				return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
+			})
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+				log.Printf("portablefsd: attach %s v3 visibility stream failed: %v", a.ref, err)
+			}
+			_ = c.conn.Close()
+		}()
 		return nil
 	}
 	if !a.isCredentialPending() {

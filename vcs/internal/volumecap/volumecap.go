@@ -133,6 +133,12 @@ func (a *Authorizer) Verify(volumeID string, token []byte, peer [32]byte) (volum
 			access |= volumeserver.AccessRead
 		case "write":
 			access |= volumeserver.AccessRead | volumeserver.AccessWrite
+		case "admin":
+			// Volume-wide configuration, not file contents. It implies write
+			// because an administrator of a volume can necessarily also write
+			// it, but write deliberately does not imply admin: changing
+			// .portablefs/local-dirs changes what every other machine can see.
+			access |= volumeserver.AccessRead | volumeserver.AccessWrite | volumeserver.AccessAdmin
 		default:
 			return volumeserver.Authorization{}, ErrInvalid
 		}

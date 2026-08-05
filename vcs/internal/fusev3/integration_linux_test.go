@@ -657,6 +657,57 @@ func TestCrossMountDirectoryListingCoherence(t *testing.T) {
 	}
 }
 
+// TestDirectoryWithNonPortableInodeRemainsListable places a FIFO behind the
+// authority — the server is the only supported writer, but a restore, an
+// operator, or a legacy tree can leave a non-portable inode in the volume —
+// and asserts the directory stays readable. The regression this guards
+// against failed the whole readdir page with ESTALE for one such entry,
+// making the directory permanently unlistable from every mount. The correct
+// shape is the local one: the name is listed opaquely (no d_type, no
+// capability), the follow-up stat on it fails, and every portable sibling is
+// unaffected.
+func TestDirectoryWithNonPortableInodeRemainsListable(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	directoryA, directoryB := f.join(0, "mixed"), f.join(1, "mixed")
+	mustMkdir(t, directoryA)
+	for _, name := range []string{"alpha", "beta"} {
+		mustWrite(t, filepath.Join(directoryA, name), []byte(name), 0o600)
+	}
+	if err := unix.Mkfifo(filepath.Join(f.volumeRoot, "mixed", "pipe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Readdirnames, not os.ReadDir: enumeration itself must succeed. Go's
+	// os.ReadDir eagerly lstats a DT_UNKNOWN entry and fails the whole listing
+	// on the pipe's EPERM, which is a Go convenience choice — ls(1) lists the
+	// name and reports the failed stat beside it, and that is the boundary the
+	// authority promises.
+	dir, err := os.Open(directoryB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, err := dir.Readdirnames(-1)
+	dir.Close()
+	if err != nil {
+		t.Fatalf("a directory containing a FIFO is unlistable: %v", err)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"alpha", "beta", "pipe"}) {
+		t.Fatalf("listing = %v, want the FIFO listed opaquely beside its portable siblings", names)
+	}
+	// The opaque entry carries no capability: addressing it fails exactly as
+	// the authority's forbidden-type contract states, while the portable
+	// siblings remain fully readable.
+	if _, err := os.Lstat(filepath.Join(directoryB, "pipe")); err == nil {
+		t.Fatal("stat of a non-portable inode unexpectedly succeeded")
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		data, err := os.ReadFile(filepath.Join(directoryB, name))
+		if err != nil || string(data) != name {
+			t.Fatalf("read %s beside a non-portable inode = %q, %v", name, data, err)
+		}
+	}
+}
+
 const pagedEntryCount = 600
 
 func pagedEntryName(i int) string { return fmt.Sprintf("entry-%04d", i) }
@@ -879,7 +930,15 @@ func TestAuthorityLossFailsCleanlyInsteadOfHanging(t *testing.T) {
 		if err == nil {
 			t.Fatal("a read through a descriptor of a destroyed authority succeeded")
 		}
-		requireErrno(t, err, syscall.EIO, "read through a descriptor of a destroyed authority")
+		// A strict mount answers ENOTCONN rather than EIO here, and the
+		// difference is the point of the change: losing the authority means
+		// this frontend can no longer be told that what it cached has changed,
+		// so it revokes itself and stops being a filesystem at all. EIO
+		// remains correct for the uncached profile, which caches nothing and
+		// therefore only ever fails the individual operation.
+		if !errors.Is(err, syscall.ENOTCONN) && !errors.Is(err, syscall.EIO) {
+			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked) or EIO", err)
+		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("a read through a descriptor of a destroyed authority hung")
 	}
@@ -1205,4 +1264,264 @@ func distinctBytes(value []byte) int {
 		seen[b] = struct{}{}
 	}
 	return len(seen)
+}
+
+// --- the strict cache contract, against real kernel mounts ------------------
+
+// TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority is the whole point
+// of the change. A metadata-heavy workload re-walks the same names constantly;
+// with zero entry lifetimes every one of those walks costs one authority round
+// trip per component, which is the multiplier that made `git status` on a few
+// thousand files cost tens of thousands of RPCs. This fails on any frontend
+// that publishes nothing cacheable.
+func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	const files = 64
+	directory := f.join(0, "tree")
+	mustMkdir(t, directory)
+	for i := range files {
+		mustWrite(t, filepath.Join(directory, fmt.Sprintf("file-%03d", i)), []byte("x"), 0o600)
+	}
+	observed := filepath.Join(f.mountPath(1), "tree")
+	walk := func() {
+		for i := range files {
+			if _, err := os.Lstat(filepath.Join(observed, fmt.Sprintf("file-%03d", i))); err != nil {
+				t.Fatalf("stat during the walk: %v", err)
+			}
+		}
+	}
+	cost := func() (int, int) {
+		lookups := f.counter.count("lookup")
+		attrs := f.counter.count("getattr")
+		walk()
+		return f.counter.count("lookup") - lookups, f.counter.count("getattr") - attrs
+	}
+	first, firstAttrs := cost()
+	if first == 0 {
+		t.Fatal("the first walk reached the authority zero times; the fixture is not measuring what it thinks")
+	}
+	second, secondAttrs := cost()
+	third, thirdAttrs := cost()
+	t.Logf("per %d-name walk: LOOKUP first=%d second=%d third=%d; GETATTR first=%d second=%d third=%d",
+		files, first, second, third, firstAttrs, secondAttrs, thirdAttrs)
+	if secondAttrs > files/8 || thirdAttrs > files/8 {
+		t.Fatalf("repeated walks cost %d and %d GETATTRs for %d names; a cached attribute must answer lstat(2) without the authority", secondAttrs, thirdAttrs, files)
+	}
+	// The kernel resolves "tree" itself too, so a perfectly cached repeat walk
+	// is zero LOOKUPs. Allow a small margin for a dentry the kernel evicted
+	// under memory pressure, but nothing like a per-name round trip.
+	if second > files/8 || third > files/8 {
+		t.Fatalf("repeated walks cost %d and %d LOOKUPs for %d names; a strict mount must resolve a cached path without the authority", second, third, files)
+	}
+}
+
+// TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's
+// actual promise. The observing mount has the name cached with a one-minute
+// lifetime, so nothing but a synchronous repair can make it stop resolving --
+// and it must have stopped by the time the removing side's syscall returns,
+// with no polling, no retry, and no sleep anywhere in this test.
+func TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	mustWrite(t, f.join(0, "cached"), []byte("payload"), 0o600)
+	requireContent(t, f.join(1, "cached"), []byte("payload"), "establishing the cached binding")
+	// Prove it really is cached: a second resolution must not reach the wire.
+	if reached := f.countRequests("lookup", func() {
+		if _, err := os.Lstat(f.join(1, "cached")); err != nil {
+			t.Fatal(err)
+		}
+	}); reached != 0 {
+		t.Fatalf("the observing mount still asked the authority %d times; this test needs a genuinely cached binding to be meaningful", reached)
+	}
+
+	if err := os.Remove(f.join(0, "cached")); err != nil {
+		t.Fatalf("remote unlink: %v", err)
+	}
+	// No waitUntil. The unlink has returned, so the repair has already happened.
+	requireAbsent(t, f.join(1, "cached"), "immediately after the remote unlink returned")
+}
+
+// TestRemoteWriteIsRepairedBeforeTheWritersCallReturns is the same assertion
+// for inode state: a cached size must be wrong for zero time.
+func TestRemoteWriteIsRepairedBeforeTheWritersCallReturns(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	mustWrite(t, f.join(0, "growing"), []byte("small"), 0o600)
+	requireSize(t, f.join(1, "growing"), 5, "establishing the cached size")
+
+	mustWrite(t, f.join(0, "growing"), []byte("considerably larger"), 0o600)
+	requireSize(t, f.join(1, "growing"), 19, "immediately after the remote write returned")
+	requireContent(t, f.join(1, "growing"), []byte("considerably larger"), "immediately after the remote write returned")
+}
+
+// TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation walks the shapes whose
+// repair would need the very VFS lock the initiating syscall holds. Every one
+// of them completes, and the mount is still usable afterwards; a frontend that
+// repaired its own mutation would hang here instead of failing.
+func TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	directory := f.join(0, "self")
+	mustMkdir(t, directory)
+	for i := range 32 {
+		name := filepath.Join(directory, fmt.Sprintf("entry-%02d", i))
+		mustWrite(t, name, []byte("v1"), 0o600)
+		// Resolve it, so the binding is genuinely in this mount's kernel cache
+		// before the operation that changes it again.
+		if _, err := os.Lstat(name); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(name, name+".renamed"); err != nil {
+			t.Fatalf("self rename: %v", err)
+		}
+		if _, err := os.Lstat(name + ".renamed"); err != nil {
+			t.Fatalf("stat after self rename: %v", err)
+		}
+		if err := os.Remove(name + ".renamed"); err != nil {
+			t.Fatalf("self unlink: %v", err)
+		}
+	}
+	requireDirectoryNames(t, directory, nil, "after the self-mutation sequence")
+	// The other mount is still live, which is the real proof that none of the
+	// above stalled the barrier.
+	requireDirectoryNames(t, f.join(1, "self"), nil, "observed from the second mount")
+}
+
+// TestVisibilityAcknowledgmentSurvivesSaturatedIO is the liveness assertion.
+// Acknowledging is what releases the mutating machine, so a visibility loop
+// queued behind bulk work converts local load on one host into a stall on
+// every other host in the volume.
+func TestVisibilityAcknowledgmentSurvivesSaturatedIO(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	mustMkdir(t, f.join(1, "load"))
+	payload := make([]byte, 256*1024)
+
+	stop := make(chan struct{})
+	var loaders sync.WaitGroup
+	for worker := range 8 {
+		loaders.Add(1)
+		go func() {
+			defer loaders.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				name := f.join(1, "load", fmt.Sprintf("w%d-%d", worker, i%4))
+				if err := os.WriteFile(name, payload, 0o600); err != nil {
+					return
+				}
+				if _, err := os.ReadFile(name); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	t.Cleanup(func() { close(stop); loaders.Wait() })
+
+	// Mount 0 mutates while mount 1 is saturated. Every one of these blocks
+	// until mount 1 has acknowledged both phases.
+	deadline := time.Now().Add(30 * time.Second)
+	for i := range 40 {
+		name := f.join(0, fmt.Sprintf("barrier-%02d", i))
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 40 barriered mutations completed in 30s; the observing mount's acknowledgments were starved behind its own I/O", i)
+		}
+		mustWrite(t, name, []byte("through the barrier"), 0o600)
+		if err := os.Remove(name); err != nil {
+			t.Fatalf("remove through the barrier: %v", err)
+		}
+	}
+}
+
+// TestUncachedProfileRemainsFullyCorrect keeps the other supported deployment
+// profile honest against a real kernel. It caches nothing, joins no barrier,
+// and must still be exactly coherent.
+func TestUncachedProfileRemainsFullyCorrect(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Uncached: true})
+	mustWrite(t, f.join(0, "shared"), []byte("one"), 0o600)
+	requireContent(t, f.join(1, "shared"), []byte("one"), "uncached cross-mount read")
+
+	// Nothing is cached, so every resolution reaches the authority. That is the
+	// profile's defining property, not a defect.
+	reached := f.countRequests("lookup", func() {
+		for range 3 {
+			if _, err := os.Lstat(f.join(1, "shared")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	if reached == 0 {
+		t.Fatal("an uncached mount answered a path walk without the authority; it has no way to be told the answer changed")
+	}
+	mustWrite(t, f.join(0, "shared"), []byte("two"), 0o600)
+	requireContent(t, f.join(1, "shared"), []byte("two"), "uncached cross-mount read after a remote write")
+	if err := os.Remove(f.join(0, "shared")); err != nil {
+		t.Fatal(err)
+	}
+	requireAbsent(t, f.join(1, "shared"), "uncached mount after a remote unlink")
+}
+
+// TestMetadataWorkloadRPCCost measures the thing this whole change is for, on a
+// real workload, on both supported profiles. `git status` re-lstats every
+// tracked path; with nothing cacheable that is one authority round trip per
+// path component per invocation, which is the multiplier that made this
+// frontend unusable at scale.
+//
+// The assertion is on name resolution alone. That is the part a name and
+// attribute cache is responsible for; the rest of what `git status` does --
+// reading its index, listing directories, and re-hashing any file git considers
+// racily clean -- reaches the authority on both profiles by design, and how
+// much of it happens depends on wall-clock timing git owns, not on coherence.
+// All of it is logged, because the interesting number is the whole shape.
+func TestMetadataWorkloadRPCCost(t *testing.T) {
+	requireWorkloadEnvironment(t)
+	const files = 200
+	kinds := []string{"lookup", "getattr", "reclaim", "other"}
+	measure := func(t *testing.T, uncached bool) (lookups, total int) {
+		t.Helper()
+		f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Uncached: uncached})
+		repository := f.join(0, "repo")
+		f.runWorkload("git", "init", "-q", repository)
+		f.runWorkload("git", "-C", repository, "config", "user.email", "portablefs@example.invalid")
+		f.runWorkload("git", "-C", repository, "config", "user.name", "PortableFS Test")
+		for i := range files {
+			mustWrite(t, filepath.Join(repository, fmt.Sprintf("source-%03d.txt", i)), []byte("content\n"), 0o600)
+		}
+		f.runWorkload("git", "-C", repository, "add", ".")
+		f.runWorkload("git", "-C", repository, "commit", "-q", "-m", "exercise PortableFS")
+		// git treats a file whose mtime is not strictly older than its index as
+		// racily clean and re-reads its contents, and mtime comparison there is
+		// at one-second granularity. Letting the second turn over before the
+		// warm-up run is what makes the measured run a steady state on both
+		// profiles instead of a race against how fast the profile happens to be.
+		time.Sleep(1100 * time.Millisecond)
+		f.runWorkload("git", "-C", repository, "status", "--porcelain")
+
+		before := make([]int, len(kinds))
+		for i, kind := range kinds {
+			before[i] = f.counter.count(kind)
+		}
+		f.runWorkload("git", "-C", repository, "status", "--porcelain")
+		breakdown := make([]string, 0, len(kinds))
+		for i, kind := range kinds {
+			delta := f.counter.count(kind) - before[i]
+			total += delta
+			if kind == "lookup" {
+				lookups = delta
+			}
+			breakdown = append(breakdown, fmt.Sprintf("%s=%d", kind, delta))
+		}
+		t.Logf("%s: %d authority requests for one `git status` over %d tracked files (%s)",
+			map[bool]string{true: "uncached", false: "strict"}[uncached], total, files, strings.Join(breakdown, " "))
+		return lookups, total
+	}
+	var strictLookups, strictTotal, uncachedLookups, uncachedTotal int
+	t.Run("strict", func(t *testing.T) { strictLookups, strictTotal = measure(t, false) })
+	t.Run("uncached", func(t *testing.T) { uncachedLookups, uncachedTotal = measure(t, true) })
+	t.Logf("strict=%d requests (%d LOOKUP) uncached=%d requests (%d LOOKUP)", strictTotal, strictLookups, uncachedTotal, uncachedLookups)
+	if uncachedLookups < files {
+		t.Fatalf("the uncached profile issued %d LOOKUPs for %d tracked files; the measurement is not measuring the walk", uncachedLookups, files)
+	}
+	if strictLookups*4 > uncachedLookups {
+		t.Fatalf("strict issued %d LOOKUPs against uncached %d; a strict mount must resolve a cached path without the authority", strictLookups, uncachedLookups)
+	}
 }

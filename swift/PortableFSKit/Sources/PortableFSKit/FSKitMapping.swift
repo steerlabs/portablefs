@@ -25,8 +25,15 @@ public enum PfsFSKitMapping {
     /// so expose the complete pfslocal identity space through one checked
     /// offset at the platform boundary. VolumeCore and portablefsd continue
     /// to use the unmodified durable identity.
+    ///
+    /// The top of the identifier space is minted locally for macOS 26 repair
+    /// scratch items, which the daemon must never know about. Refusing a daemon
+    /// item that lands here is what makes the two spaces provably disjoint
+    /// rather than merely unlikely to collide.
+    public static let localRepairIdentifierFloor: UInt64 = UInt64.max - 4096
+
     public static func itemIdentifier(from itemID: UInt64) throws -> FSItem.Identifier {
-        guard itemID > 0, itemID < UInt64.max,
+        guard itemID > 0, itemID < localRepairIdentifierFloor,
               let identifier = FSItem.Identifier(rawValue: itemID + 1) else {
             throw PfsLocalClientError.daemon(
                 errno: EOVERFLOW,

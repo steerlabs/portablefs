@@ -13,6 +13,12 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
     case missingBody
     case unexpectedReply(String)
     case daemon(errno: Int32, message: String)
+    /// The daemon resolved a strict-v3 authority attach whose declared cache
+    /// policy this build does not implement — an unknown policy string, or the
+    /// native macOS 27 policy that stays gated on the final SDK. Mounting
+    /// while ignoring the declared contract would serve stale kernel state,
+    /// so resolution closes the client and terminates with ENOTSUP.
+    case v3CoherenceIntegrationUnavailable
     case socketPath(String)
     case system(errno: Int32, operation: String)
     /// The daemon retracted this logical operation's publications before the
@@ -59,6 +65,8 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
             return "unexpected pfslocal reply: \(message)"
         case let .daemon(errnoValue, message):
             return "daemon error errno=\(errnoValue): \(message)"
+        case .v3CoherenceIntegrationUnavailable:
+            return "strict v3 coherence is not integrated into the live FSKit mount"
         case let .socketPath(message):
             return "invalid socket path: \(message)"
         case let .system(errnoValue, operation):
@@ -89,6 +97,8 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
             // attempt has no delegation left to release and cannot be
             // retracted for the same reason.
             return EINTR
+        case .v3CoherenceIntegrationUnavailable:
+            return ENOTSUP
         case .socketPath, .protocolMismatch, .missingBody, .unexpectedReply, .invalidFrame:
             return EINVAL
         case .frameTooLarge:

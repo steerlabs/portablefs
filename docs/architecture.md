@@ -280,8 +280,19 @@ contract:
   unchanged.
 - Renames across the graft boundary fail with EXDEV (callers fall back to
   copy+delete, exactly as across a bind mount). The root can only ever be a
-  directory (EISDIR for create/symlink at the root). Volume renames of an
-  ancestor directory carry the graft and its local backing along.
+  directory (EISDIR for create/symlink at the root).
+- Renaming a **shared ancestor** whose subtree still holds an active local route
+  fails with **EBUSY**, not EXDEV, and the difference is load-bearing. Both
+  endpoints are on the volume, so EXDEV would be a lie about the topology — but
+  worse, EXDEV is the errno that *invites* a copy+delete fallback, and here that
+  fallback would recursively read machine-local backing and write it into shared
+  storage. That is precisely the outcome local routing exists to prevent, and it
+  would be silent. EBUSY is what Linux itself returns for renaming a directory
+  that contains a mount point; it is the errno that makes tools stop rather than
+  improvise. A rename that would make some path in the subtree newly match, or
+  stop matching, a route rule is EBUSY for the same reason: routing is
+  path-based, so ownership would otherwise flip under directories nobody
+  touched.
 - Nothing under a graft is ever written to or read from the authority.
 
 Three implementations serve the contract:
@@ -302,15 +313,40 @@ Three implementations serve the contract:
 - Privileged sandboxes may still bind-mount local disk over the FUSE mount;
   grafts make that unnecessary where privileges are absent.
 
-Configuration: `portablefs mount --local-dir <rel>` (repeatable; persisted per
-volume+branch+mountPath; explicit flags update the persisted set;
-`--no-local-dirs` clears it and ignores the declaration), or a
-`.portablefs/local-dirs` file in the volume
-(one workspace-relative path per line, `#` comments) that is unioned with the
-flags at mount time so a repository declares its per-machine dirs once for
-every machine. Linux FUSE and macOS FSKit resolve the same union and reject a
-graft of `.portablefs` or `.portablefs/local-dirs`, which would hide the
-configuration source ([fskit-mount.md](./fskit-mount.md)).
+The retained macOS daemon now matches the ancestor-rename rule for the subset it
+can serve: a rename that would change ownership below an anchored literal graft
+returns `EBUSY`; it no longer carries or rewrites the rule. Two gaps remain:
+
+- **Pattern parity.** `portablefsd` parses declarations with the shared parser
+  but can lower only anchored literal roots. A floating or wildcard rule fails
+  the entire activation rather than being approximated. It also does not join
+  the v3 authority's global route-revision protocol.
+- **Case-exact backing.** `portablefsd` probes the machine-local backing
+  filesystem at graft activation and refuses when it folds names the shared
+  namespace keeps distinct (`ErrBackingCaseUnsafe`,
+  `vcs/internal/portablefsd/localcasesafety.go`). Since a stock Mac's APFS is
+  case-insensitive, grafts on macOS require the daemon state dir to be on an
+  APFS (Case-sensitive) volume; there is no unprivileged way to create one, and
+  a case-sensitive disk image is deliberately not accepted. The Linux FUSE
+  frontend has no equivalent probe, so a graft backed by a case-insensitive
+  filesystem mounted on Linux is still unguarded.
+
+Configuration is volume-first. `.portablefs/local-dirs` in the volume is the one
+source of routing truth: the revision a mount reports at attach is the hash of
+that file, and the authority refuses a mount whose revision disagrees. **When a
+volume publishes a declaration, per-machine `--local-dir` additions are
+refused** — by the Linux FUSE client and by `portablefsd` alike, with the same
+message — because a per-machine rule would hide on one machine a directory every
+peer still treats as shared, invisibly and without moving the revision. Presence
+decides it, not content: a declaration holding only comments still owns routing.
+
+With no declaration published, the retained v2 CLI still permits its legacy
+per-machine `--local-dir <rel>` path. The v3 Linux mount refuses that flag
+unconditionally: it adopts only the authority's volume-wide declaration, and
+`--no-local-dirs` refuses a declaring volume instead of ignoring its topology.
+All parsers reject `.git` and `.portablefs` routes, which would fork repository
+history or hide the configuration source
+([fskit-mount.md](./fskit-mount.md)).
 Grafts are orthogonal to the write-back engine: delegated write-back batches
 volume writes while graft writes never enter the flush path at all.
 

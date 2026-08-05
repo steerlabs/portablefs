@@ -6,20 +6,23 @@ import FSKit
 public struct PfsItemIdentity: Hashable, Sendable {
     public var itemID: UInt64
     public var generation: UInt64
+    public var stableIdentity: Data
 
-    public init(itemID: UInt64, generation: UInt64) {
+    public init(itemID: UInt64, generation: UInt64, stableIdentity: Data = Data()) {
         self.itemID = itemID
         self.generation = generation
+        self.stableIdentity = stableIdentity
     }
 
     public init(_ item: PfsItem) {
-        self.init(itemID: item.itemID, generation: item.itemGeneration)
+        self.init(itemID: item.itemID, generation: item.itemGeneration, stableIdentity: item.stableIdentity)
     }
 
     public var proto: PfsItem {
         var item = PfsItem()
         item.itemID = itemID
         item.itemGeneration = generation
+        item.stableIdentity = stableIdentity
         return item
     }
 }
@@ -129,6 +132,12 @@ public actor VolumeCore {
 
     public let client: PfsLocalClient
     public private(set) var resolvedVolume: PfsResolvedVolume?
+    /// The raw resolve reply and validated terms of a strict-v3 attach whose
+    /// declared cache policy this build implements. Set only for the macOS 26
+    /// compatibility policy; the FSKit adapter composes its coherence stack
+    /// from these before the volume may serve.
+    public private(set) var strictV3ResolveReply: PfsResolveReply?
+    public private(set) var strictV3Contract: PfsMacOSV3LocalContract?
 
     private var itemsByIdentity: [PfsItemIdentity: PortableFSItem] = [:]
     private var identitiesByObject: [ObjectIdentifier: PfsItemIdentity] = [:]
@@ -137,6 +146,16 @@ public actor VolumeCore {
     private var currentGenerationByItemID: [UInt64: UInt64] = [:]
     private var openHandles: [ObjectIdentifier: OpenState] = [:]
     private var lifecycleGates: [ObjectIdentifier: LifecycleGateState] = [:]
+    /// Items that exist only inside this process, for the macOS 26 repair
+    /// scratch entry. FSKit's create callback must hand the kernel an `FSItem`,
+    /// but the entry it names must never be known to the daemon, so these are
+    /// deliberately absent from every identity table above. The only thing that
+    /// can reach one is the kernel reference the create callback returned.
+    private var localRepairItems: [ObjectIdentifier: PfsItemIdentity] = [:]
+    /// Minted downward from the top of the identifier space; `item(for:)`
+    /// refuses a daemon item that lands in it, so a synthetic identifier can
+    /// never be confused with an authority item.
+    private var nextLocalRepairItemID: UInt64 = UInt64.max - 1
 
     private struct OpenState: Sendable {
         var identity: PfsItemIdentity
@@ -186,6 +205,35 @@ public actor VolumeCore {
     @discardableResult
     public func resolve(attachRef: String) async throws -> PfsResolvedVolume {
         let reply = try await client.resolve(attachRef: attachRef)
+        if reply.hasV3Coherence {
+            // Cache-coherence behavior is a DECLARED policy carried by the
+            // resolve contract, never an inference. This build implements
+            // exactly one policy — the macOS 26 compatibility policy — and a
+            // contract naming anything else fails closed with the same
+            // close-first discipline the old unconditional guard used, so
+            // portablefsd's bridge fails its authority session rather than
+            // waiting for a subscriber that will never exist. The native
+            // macOS 27 policy stays refused until the final SDK supplies its
+            // revocation API.
+            let contract: PfsMacOSV3LocalContract
+            do {
+                contract = try PfsLocalMacOSV3CoherenceTransport.parseContract(reply.v3Coherence)
+            } catch {
+                await client.close()
+                if case PfsMacOSCoherenceError.invalidCachePolicy = error {
+                    throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
+                }
+                throw error
+            }
+            switch contract.cachePolicy {
+            case .synchronousVFSRepairV1:
+                strictV3ResolveReply = reply
+                strictV3Contract = contract
+            case .nativeFSKitRevocationV1:
+                await client.close()
+                throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
+            }
+        }
         let root = item(for: reply.root)
         let resolved = PfsResolvedVolume(
             root: root,
@@ -203,6 +251,40 @@ public actor VolumeCore {
     public func subscribeEvents() async throws -> AsyncStream<PfsEvent> {
         try await client.subscribeEvents()
     }
+
+    /// Mints a process-local `FSItem` for a macOS 26 repair scratch entry.
+    ///
+    /// The identifier comes from the reserved top of the space that
+    /// `PfsFSKitMapping.itemIdentifier(from:)` refuses for daemon items, so the
+    /// kernel can never see one identifier standing for two different things.
+    /// The item is registered in no identity table: `identity(for:)` will
+    /// refuse it, which is the point — nothing can turn it into a pfslocal
+    /// request.
+    public func mintLocalRepairItem() throws -> PortableFSItem {
+        guard nextLocalRepairItemID >= PfsFSKitMapping.localRepairIdentifierFloor else {
+            throw PfsLocalClientError.daemon(
+                errno: ENOSPC,
+                message: "local repair identifier space exhausted"
+            )
+        }
+        let identity = PfsItemIdentity(itemID: nextLocalRepairItemID, generation: 0)
+        nextLocalRepairItemID -= 1
+        let item = PortableFSItem(identity: identity)
+        localRepairItems[ObjectIdentifier(item)] = identity
+        return item
+    }
+
+    public func isLocalRepairItem(_ item: PortableFSItem) -> Bool {
+        localRepairItems[ObjectIdentifier(item)] != nil
+    }
+
+    public func releaseLocalRepairItem(_ item: PortableFSItem) {
+        if localRepairItems.removeValue(forKey: ObjectIdentifier(item)) != nil {
+            item.markReclaimed()
+        }
+    }
+
+    public func localRepairItemCount() -> Int { localRepairItems.count }
 
     public func rootItem() throws -> PortableFSItem {
         guard let root = resolvedVolume?.root else {
@@ -877,6 +959,7 @@ public actor VolumeCore {
         deletedItemsByObject.removeAll()
         currentGenerationByItemID.removeAll()
         openHandles.removeAll()
+        localRepairItems.removeAll()
     }
 
     func testingAdoptItem(identity: PfsItemIdentity) -> PortableFSItem {
@@ -1276,7 +1359,11 @@ public actor VolumeCore {
         let identity = PfsItemIdentity(proto)
         if let currentGeneration = currentGenerationByItemID[identity.itemID],
            currentGeneration != identity.generation {
-            let oldIdentity = PfsItemIdentity(itemID: identity.itemID, generation: currentGeneration)
+            let oldIdentity = PfsItemIdentity(
+                itemID: identity.itemID,
+                generation: currentGeneration,
+                stableIdentity: identity.stableIdentity
+            )
             forgetKnownItems(for: oldIdentity)
             removeOpenHandles(for: oldIdentity)
         }

@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,7 +20,17 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/confinedfs"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
+
+// ---- literal-path config (the macOS daemon's reader) ----
+//
+// portablefsd serves grafts to the FSKit frontend from a fixed list of
+// literal paths, so it keeps reading the declaration as literal paths. The
+// FUSE client reads the same file through localroutes instead, which is the
+// full pattern language; the two agree on every literal line, and a line
+// carrying pattern metacharacters is refused here rather than turned into a
+// graft literally named "**".
 
 // Normalize cleans, validates, and deduplicates workspace-relative graft
 // roots. Blank entries are dropped; dirs nested inside another configured dir
@@ -69,12 +78,19 @@ func cleanOne(raw string) (string, error) {
 	if strings.HasPrefix(trimmed, "/") {
 		return "", fmt.Errorf("local dirs must be workspace-relative paths: %q", raw)
 	}
+	if strings.ContainsAny(trimmed, "*?[]") {
+		// A literal reader must never mint a graft named after a pattern it
+		// cannot evaluate; the pattern engine owns those lines.
+		return "", fmt.Errorf("local dir %q is a pattern; this client accepts literal paths only", raw)
+	}
 	p := path.Clean(strings.Trim(strings.ReplaceAll(trimmed, "\\", "/"), "/"))
 	if p == "" || p == "." || p == ".." || strings.HasPrefix(p, "../") {
 		return "", fmt.Errorf("local dirs must be workspace-relative paths: %q", raw)
 	}
-	if p == ".portablefs" || p == VolumeConfigPath {
-		return "", fmt.Errorf("local dir %q would shadow the local-dirs declaration", raw)
+	for _, comp := range strings.Split(p, "/") {
+		if localroutes.Protected(comp) {
+			return "", fmt.Errorf("local dir %q names the protected path %q", raw, comp)
+		}
 	}
 	return p, nil
 }
@@ -110,9 +126,11 @@ func ValidateStrict(dirs []string) error {
 	return nil
 }
 
-// VolumeConfigPath is the in-volume declaration file: one workspace-relative
-// path per line, '#' comments, unioned with --local-dir flags at mount time.
-const VolumeConfigPath = ".portablefs/local-dirs"
+// VolumeConfigPath is the in-volume declaration file: one rule per line, '#'
+// comments. It is the ONE source of a volume's routing: the revision every
+// mount reports is the hash of this file's canonical form and of nothing
+// else. The pattern language it is written in lives in localroutes.
+const VolumeConfigPath = localroutes.ConfigPath
 
 // ParseVolumeConfig parses VolumeConfigPath content. Invalid lines are
 // returned separately so the mount can warn without failing: the file is repo
@@ -165,18 +183,37 @@ func ReadVolumeConfig(ctx context.Context, vol *clientcore.Volume, logf func(str
 	return dirs
 }
 
-// StorageID keys one mount's machine-local backing under the state dir,
-// mirroring portablefsd's stableStorageID convention: backing lives at
-// <stateBase>/local/<StorageID>/ and survives remounts of the same
-// volume+branch+mountPath.
-func StorageID(volumeID, branch, mountPath string) string {
-	sum := sha256.Sum256([]byte(volumeID + "\x00" + branch + "\x00" + mountPath))
+// ---- backing identity ----
+//
+// Machine-local backing is keyed by (volume, route root path) and by nothing
+// else. The volume half is this StorageID; the route-root half is structural,
+// because inside the volume's backing tree a route root's backing sits at
+// exactly its volume-relative path. That identity is the whole point of the
+// feature:
+//
+//   - node_modules survives unmount and remount of the same volume, and
+//     survives remounting it at a DIFFERENT path — the dependency tree is a
+//     property of the workspace, not of where it happens to be attached;
+//   - mounting a different volume at the same path can never inherit it;
+//   - nothing is random per mount, so nothing is orphaned by a clean restart.
+//
+// The consequence to know about: two simultaneous mounts of the same volume
+// (two paths, or two branches) share one machine-local backing tree, exactly
+// as two bind mounts of one directory would. Branch is deliberately NOT part
+// of the key — a machine-local dependency tree is not branch state, and
+// keying it per branch would rebuild node_modules on every branch switch.
+
+// StorageID keys one VOLUME's machine-local backing under the state dir,
+// keeping portablefsd's 32-hex storage-id convention.
+func StorageID(volumeID string) string {
+	sum := sha256.Sum256([]byte(volumeID))
 	return fmt.Sprintf("%x", sum[:16])
 }
 
-// BackingRoot is the conventional backing directory for one mount.
-func BackingRoot(stateBase, volumeID, branch, mountPath string) string {
-	return filepath.Join(stateBase, "local", StorageID(volumeID, branch, mountPath))
+// BackingRoot is the backing tree for one volume: route roots live under it
+// at their volume-relative paths.
+func BackingRoot(stateBase, volumeID string) string {
+	return filepath.Join(stateBase, "local", StorageID(volumeID))
 }
 
 // localInoMarker tags every kernel inode number minted for grafted paths.
@@ -195,42 +232,49 @@ func LocalIno(backingIno uint64) uint64 {
 	return backingIno | localInoMarker
 }
 
-// Grafts is one mount's immutable-at-match-time graft configuration plus its
-// machine-local backing root. The dirs slice is swapped atomically so the
-// non-graft hot path pays one atomic load and a short prefix scan; mutations
-// (ancestor-rename remaps) serialize on mu.
+// Grafts is one mount's route set plus its machine-local backing tree. The
+// rule set is IMMUTABLE for the life of the mount: routing is a pure function
+// of the declared configuration, which is what makes the revision the mount
+// reports to the authority describe the routing it is actually serving. There
+// is no remap-on-rename path, and nothing here ever rewrites the declaration.
 type Grafts struct {
-	root *confinedfs.Root
-	dirs atomic.Value // []string, sorted, normalized
-	mu   sync.Mutex   // serializes remaps (writers to dirs)
-	fsMu sync.Mutex   // serializes compound no-replace mutations
+	root  *confinedfs.Root
+	rules localroutes.RuleSet
+	fsMu  sync.Mutex // serializes compound no-replace mutations
 
-	// onChange, when set, observes every configured-dirs change (ancestor
-	// renames). The CLI persists the new list into its mount state so a
-	// remount reuses the carried names.
-	onChange func([]string)
+	// onShadow, when set, observes the instantiation of a route root whose
+	// name already exists on the volume. The CLI logs what became hidden.
+	onShadow func(root string)
 }
 
-// New builds a Grafts set rooted at backingRoot. dirs are normalized; an
-// empty result returns (nil, nil) so callers keep a nil fast path.
-func New(backingRoot string, dirs []string, onChange func([]string)) (*Grafts, error) {
-	norm, err := Normalize(dirs)
-	if err != nil {
-		return nil, err
-	}
-	if len(norm) == 0 {
+// Config builds one mount's graft set.
+type Config struct {
+	// BackingRoot is <stateBase>/local/<volume storage id>, the tree route
+	// roots live in at their volume-relative paths.
+	BackingRoot string
+	// Rules is the activated route set (the volume's declaration, or — only
+	// on a volume that declares nothing — this machine's --local-dir flags).
+	Rules localroutes.RuleSet
+	// OnShadow reports a route root that was just instantiated over an
+	// existing volume subtree. It is called from a goroutine: shadowing is a
+	// warning, never a blocking check on the mkdir path.
+	OnShadow func(root string)
+}
+
+// New builds a Grafts set. An empty rule set returns (nil, nil) so callers
+// keep a nil fast path.
+func New(cfg Config) (*Grafts, error) {
+	if cfg.Rules.Empty() {
 		return nil, nil
 	}
-	if backingRoot == "" {
+	if cfg.BackingRoot == "" {
 		return nil, errors.New("localdirs: backing root is required")
 	}
-	root, err := confinedfs.Open(backingRoot, 0o700)
+	root, err := confinedfs.Open(cfg.BackingRoot, 0o700)
 	if err != nil {
 		return nil, fmt.Errorf("localdirs: open confined backing: %w", err)
 	}
-	g := &Grafts{root: root, onChange: onChange}
-	g.dirs.Store(norm)
-	return g, nil
+	return &Grafts{root: root, rules: cfg.Rules, onShadow: cfg.OnShadow}, nil
 }
 
 // Close releases the backing-directory capability.
@@ -241,41 +285,115 @@ func (g *Grafts) Close() error {
 	return g.root.Close()
 }
 
-// Dirs returns the current normalized graft roots.
-func (g *Grafts) Dirs() []string {
+// Rules returns the activated route set.
+func (g *Grafts) Rules() localroutes.RuleSet {
+	if g == nil {
+		return localroutes.RuleSet{}
+	}
+	return g.rules
+}
+
+// Patterns returns the canonical rule texts this mount serves.
+func (g *Grafts) Patterns() []string {
 	if g == nil {
 		return nil
 	}
-	return append([]string(nil), g.dirs.Load().([]string)...)
+	return g.rules.Patterns()
 }
 
-// Owner returns the configured graft root that owns p ("" if p is served by
-// the authority volume). Safe on a nil receiver so adapters can call it
-// unconditionally.
+// RevisionHex is the hex revision of the activated route set — the value the
+// authority pins this mount to.
+func (g *Grafts) RevisionHex() string {
+	if g == nil {
+		return localroutes.RuleSet{}.RevisionHex()
+	}
+	return g.rules.RevisionHex()
+}
+
+// Owner returns the route root that owns p ("" if p is served by the
+// authority volume). Safe on a nil receiver so adapters can call it
+// unconditionally, and allocation-free for the overwhelmingly common
+// literal-name rule set.
 func (g *Grafts) Owner(p string) string {
 	if g == nil {
 		return ""
 	}
-	for _, dir := range g.dirs.Load().([]string) {
-		if p == dir || strings.HasPrefix(p, dir+"/") {
-			return dir
-		}
-	}
-	return ""
+	root, _ := g.rules.Match(p)
+	return root
 }
 
-// RootsUnder lists graft roots whose parent directory is dir.
-func (g *Grafts) RootsUnder(dir string) []string {
+// ActiveRootsUnder lists the route roots at or under dir whose machine-local
+// backing exists — the roots that are real, as opposed to names the rules
+// merely own. Scaffold directories are walked through; an active root is
+// never descended into, so the cost is the scaffold, not the dependency tree.
+func (g *Grafts) ActiveRootsUnder(dir string) ([]string, syscall.Errno) {
 	if g == nil {
-		return nil
+		return nil, 0
 	}
 	var out []string
-	for _, root := range g.dirs.Load().([]string) {
-		if parentPath(root) == dir {
-			out = append(out, root)
+	_, eno := g.walkBacking(dir, 0, func(p string) bool {
+		out = append(out, p)
+		return true
+	})
+	sort.Strings(out)
+	return out, eno
+}
+
+// HasActiveRouteUnder reports whether any route root at or under p has
+// machine-local backing. It stops at the first one: a rename only needs to
+// know that the subtree carries local storage, not how much.
+func (g *Grafts) HasActiveRouteUnder(p string) bool {
+	if g == nil {
+		return false
+	}
+	stopped, _ := g.walkBacking(p, 0, func(string) bool { return false })
+	return stopped
+}
+
+// maxScaffoldDepth bounds the backing walk. Scaffold depth is the depth of
+// the deepest rule, so this only ever truncates a backing tree that no longer
+// matches any rule — which prune-local is the tool for.
+const maxScaffoldDepth = 32
+
+// walkBacking visits every existing route root at or under rel, calling visit
+// with its volume-relative path; visit returns false to stop the walk, which
+// walkBacking reports as stopped.
+func (g *Grafts) walkBacking(rel string, depth int, visit func(string) bool) (stopped bool, eno syscall.Errno) {
+	if depth > maxScaffoldDepth {
+		return false, 0
+	}
+	if rel != "" {
+		if root, ok := g.rules.Match(rel); ok {
+			if root != rel {
+				return false, 0 // inside another root; the outer one counted
+			}
+			if st, e := g.Lstat(rel); e == 0 && st.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+				return !visit(rel), 0
+			}
+			return false, 0
 		}
 	}
-	return out
+	entries, err := g.root.ReadDir(rel)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, 0
+		}
+		return false, errnoOf(err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		child := e.Name()
+		if rel != "" {
+			child = rel + "/" + child
+		}
+		stopped, eno := g.walkBacking(child, depth+1, visit)
+		if stopped || eno != 0 {
+			return stopped, eno
+		}
+	}
+	return false, 0
 }
 
 // ensureScaffold creates the machine-local bookkeeping directories that lead
@@ -286,49 +404,26 @@ func (g *Grafts) ensureScaffold(root string) error {
 	return g.root.MkdirAll(parentPath(root), 0o755)
 }
 
-// RemapForRename follows a successful authority rename of a volume path:
-// graft roots under the renamed subtree move with it, and their backing
-// directories are relocated so contents survive — a graft travels with its
-// directory exactly like a mountpoint travels with its vnode.
-func (g *Grafts) RemapForRename(oldp, newp string) {
-	if g == nil {
-		return
-	}
-	g.mu.Lock()
-	cur := g.dirs.Load().([]string)
-	var next []string
-	changed := false
-	for _, dir := range cur {
-		np, ok := renamedPath(dir, oldp, newp)
-		if !ok {
-			next = append(next, dir)
-			continue
-		}
-		if err := g.root.MkdirAll(parentPath(np), 0o755); err == nil {
-			// Best-effort like portablefsd: a backing move failure leaves the
-			// rule pointing at empty backing (root simply not created yet),
-			// never at stale content under the old name.
-			_ = g.root.Rename(dir, np)
-		}
-		next = append(next, np)
-		changed = true
-	}
-	if changed {
-		sort.Strings(next)
-		g.dirs.Store(next)
-	}
-	g.mu.Unlock()
-	if changed && g.onChange != nil {
-		g.onChange(append([]string(nil), next...))
-	}
-}
-
 // VolumeRenameCheck answers renames seen by VOLUME nodes. handled means the
-// rename must not reach the authority: any endpoint at or under a graft is a
-// cross-filesystem move (EXDEV), exactly like a bind mount. Renames entirely
-// inside one graft never reach volume nodes (those directories are local
-// nodes). An ancestor rename (neither endpoint graft-owned) passes through;
-// the caller invokes RemapForRename after the authority accepts it.
+// rename must not reach the authority. There are exactly three answers, and
+// the declared configuration is never one of the things that changes:
+//
+//   - an endpoint at or under a route root is a cross-filesystem move:
+//     EXDEV, exactly like a bind mount, and callers may fall back to
+//     copy+delete because that is what crossing a filesystem means;
+//   - a shared directory whose subtree holds ACTIVE machine-local backing is
+//     EBUSY — the errno Linux returns for renaming a directory that contains
+//     a mount point. EXDEV would be actively dangerous here: the fallback
+//     would copy machine-local backing into shared storage. Tools do not fall
+//     back on EBUSY;
+//   - a rename that would make some path in the subtree newly match, or stop
+//     matching, a rule is EBUSY too. Routing is path-based, so ownership
+//     would silently flip under directories nobody touched; refusing the
+//     rename is the only answer that keeps the declaration authoritative.
+//
+// Anything else passes through to the authority and needs no follow-up: the
+// route set is a pure function of the declaration, so there is nothing to
+// remap afterwards.
 func (g *Grafts) VolumeRenameCheck(oldp, newp string) (syscall.Errno, bool) {
 	if g == nil {
 		return 0, false
@@ -336,14 +431,13 @@ func (g *Grafts) VolumeRenameCheck(oldp, newp string) (syscall.Errno, bool) {
 	if g.Owner(oldp) != "" || g.Owner(newp) != "" {
 		return syscall.EXDEV, true
 	}
-	return 0, false
-}
-
-func renamedPath(p, oldp, newp string) (string, bool) {
-	if p != oldp && !strings.HasPrefix(p, oldp+"/") {
-		return "", false
+	if g.HasActiveRouteUnder(oldp) || g.HasActiveRouteUnder(newp) {
+		return syscall.EBUSY, true
 	}
-	return newp + strings.TrimPrefix(p, oldp), true
+	if g.rules.SubtreeKey(oldp) != g.rules.SubtreeKey(newp) {
+		return syscall.EBUSY, true
+	}
+	return 0, false
 }
 
 func parentPath(p string) string {
@@ -400,17 +494,25 @@ func (g *Grafts) Lstat(p string) (syscall.Stat_t, syscall.Errno) {
 	return st, 0
 }
 
-// Mkdir creates a grafted directory. Creating the graft root itself also
-// creates the machine-local scaffold directories that lead up to its backing
-// path.
+// Mkdir creates a grafted directory. Creating a route ROOT — which is how a
+// route root comes into existence, including one a floating pattern matched
+// for the first time at some depth nobody enumerated in advance — also
+// creates the machine-local scaffold directories leading up to its backing
+// path, and reports the shadowing it just started.
 func (g *Grafts) Mkdir(p string, mode uint32) syscall.Errno {
-	if g.Owner(p) == p {
+	root := g.Owner(p) == p
+	if root {
 		if err := g.ensureScaffold(p); err != nil {
 			return errnoOf(err)
 		}
 	}
 	if err := g.root.Mkdir(p, os.FileMode(mode)&os.ModePerm); err != nil {
 		return errnoOf(err)
+	}
+	if root && g.onShadow != nil {
+		// Off the hot path deliberately: what is being hidden is a warning
+		// for the operator, never a check the mkdir waits on.
+		go g.onShadow(p)
 	}
 	return 0
 }
@@ -443,8 +545,8 @@ func (g *Grafts) Remove(p string, directory bool) syscall.Errno {
 
 // Rename renames within grafts. Both endpoints must be owned by the SAME
 // graft rule; anything else crosses a filesystem boundary and fails EXDEV.
-// noReplace emulates RENAME_NOREPLACE portably (the same lstat-then-rename
-// emulation portablefsd ships); exchange is not supported.
+// noReplace uses the host's descriptor-relative atomic primitive; exchange is
+// not supported.
 func (g *Grafts) Rename(oldp, newp string, flags uint32) syscall.Errno {
 	const renameNoReplace = 1 // RENAME_NOREPLACE, identical on every linux arch
 	const renameExchange = 2  // RENAME_EXCHANGE
@@ -463,11 +565,7 @@ func (g *Grafts) Rename(oldp, newp string, flags uint32) syscall.Errno {
 	g.fsMu.Lock()
 	defer g.fsMu.Unlock()
 	if flags&renameNoReplace != 0 {
-		if _, err := g.root.Lstat(newp); err == nil {
-			return syscall.EEXIST
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return errnoOf(err)
-		}
+		return errnoOf(g.root.RenameNoReplace(oldp, newp))
 	}
 	if err := g.root.Rename(oldp, newp); err != nil {
 		return errnoOf(err)

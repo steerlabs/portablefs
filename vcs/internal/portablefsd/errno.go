@@ -19,21 +19,42 @@ const (
 	darwinENXIO        int32 = 6
 	darwinE2BIG        int32 = 7
 	darwinEBADF        int32 = 9
+	darwinENOMEM       int32 = 12
 	darwinEACCES       int32 = 13
 	darwinEAGAIN       int32 = 35
 	darwinEBUSY        int32 = 16
 	darwinEEXIST       int32 = 17
 	darwinEXDEV        int32 = 18
+	darwinENODEV       int32 = 19
 	darwinENOTDIR      int32 = 20
 	darwinEISDIR       int32 = 21
 	darwinEINVAL       int32 = 22
+	darwinENFILE       int32 = 23
+	darwinEMFILE       int32 = 24
+	darwinENOTTY       int32 = 25
+	darwinETXTBSY      int32 = 26
+	darwinEFBIG        int32 = 27
 	darwinENOSPC       int32 = 28
+	darwinESPIPE       int32 = 29
+	darwinEROFS        int32 = 30
+	darwinEMLINK       int32 = 31
+	darwinEPIPE        int32 = 32
 	darwinERANGE       int32 = 34
 	darwinENAMETOOLONG int32 = 63
 	darwinENOTEMPTY    int32 = 66
+	darwinELOOP        int32 = 62
+	darwinEDQUOT       int32 = 69
 	darwinESTALE       int32 = 70
-	darwinENOTSUP      int32 = 45
-	darwinENOATTR      int32 = 93 // "attribute not found" — the wire's Linux ENODATA
+	// darwinENOTCONN is the terminal-session answer for an authority-v3 attach:
+	// the strict session is dead and no retry against this attach can revive it,
+	// so FSKit is told the daemon-side endpoint is gone rather than that one
+	// operation suffered an I/O fault. Only an exact unmount resolves it.
+	darwinENOTCONN  int32 = 57
+	darwinEOVERFLOW int32 = 84
+	darwinENOTSUP   int32 = 45
+	darwinETIMEDOUT int32 = 60
+	darwinENOSYS    int32 = 78
+	darwinENOATTR   int32 = 93 // "attribute not found" — the wire's Linux ENODATA
 )
 
 func toDarwinErr(st int32) int32 {

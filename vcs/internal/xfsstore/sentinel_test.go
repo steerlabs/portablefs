@@ -25,6 +25,7 @@ func TestSentinelsCarryTheirErrno(t *testing.T) {
 	}{
 		{ErrUnsupportedPlatform, syscall.ENOSYS, errnos.ENOSYS},
 		{ErrNotXFS, syscall.ENOTSUP, errnos.EOPNOTSUPP},
+		{ErrUnsafeMount, syscall.ENOTSUP, errnos.EOPNOTSUPP},
 		{ErrStaleObject, syscall.ESTALE, errnos.ESTALE},
 		{ErrStaleOpen, syscall.ESTALE, errnos.ESTALE},
 		{ErrClosed, syscall.ESTALE, errnos.ESTALE},
@@ -68,7 +69,7 @@ func TestSentinelsStayDistinct(t *testing.T) {
 	if errors.Is(ErrForbiddenType, ErrProjectIsolation) {
 		t.Fatal("EPERM sentinels collapsed into one another")
 	}
-	if errors.Is(ErrNotXFS, ErrForbiddenXattr) {
+	if errors.Is(ErrNotXFS, ErrForbiddenXattr) || errors.Is(ErrUnsafeMount, ErrNotXFS) {
 		t.Fatal("ENOTSUP sentinels collapsed into one another")
 	}
 }

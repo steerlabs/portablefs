@@ -126,6 +126,60 @@ func TestRootRejectsUntrustedPathSyntax(t *testing.T) {
 	}
 }
 
+func TestOpenExistingRefusesASymlinkedBackingRoot(t *testing.T) {
+	host := t.TempDir()
+	realRoot := filepath.Join(host, "real")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realRoot, "sentinel"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(host, "backing")
+	if err := os.Symlink(realRoot, link); err != nil {
+		t.Fatal(err)
+	}
+	if root, err := OpenExisting(link); err == nil {
+		_ = root.Close()
+		t.Fatal("a final-component symlink was opened as a backing capability")
+	}
+	if got, err := os.ReadFile(filepath.Join(realRoot, "sentinel")); err != nil || string(got) != "keep" {
+		t.Fatalf("refused open changed the target: %q, %v", got, err)
+	}
+}
+
+func TestRenameNoReplaceIsOneAtomicFilesystemDecision(t *testing.T) {
+	root, err := Open(filepath.Join(t.TempDir(), "root"), 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := root.MkdirAll("a", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.WriteFile("a/source", []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.WriteFile("a/destination", []byte("destination"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.RenameNoReplace("a/source", "a/destination"); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("rename over existing destination = %v, want EEXIST", err)
+	}
+	if got, err := root.ReadFile("a/source"); err != nil || string(got) != "source" {
+		t.Fatalf("refused rename changed source: %q, %v", got, err)
+	}
+	if got, err := root.ReadFile("a/destination"); err != nil || string(got) != "destination" {
+		t.Fatalf("refused rename changed destination: %q, %v", got, err)
+	}
+	if err := root.Remove("a/destination"); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.RenameNoReplace("a/source", "a/destination"); err != nil {
+		t.Fatalf("rename to absent destination: %v", err)
+	}
+}
+
 func TestRootResistsConcurrentDestinationParentSymlinkSwap(t *testing.T) {
 	host := t.TempDir()
 	backing := filepath.Join(host, "root")

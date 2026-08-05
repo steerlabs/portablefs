@@ -106,10 +106,12 @@ func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {
 			writeHTTPError(w, http.StatusBadGateway, err.Error())
 			return
 		}
+		status := a.status()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"attachRef":  a.ref,
-			"volumeName": a.volumeName,
-			"localDirs":  a.status().LocalDirs,
+			"attachRef":         a.ref,
+			"volumeName":        a.volumeName,
+			"localDirs":         status.LocalDirs,
+			"localDirsDeclared": status.LocalDirsDeclared,
 		})
 	case http.MethodGet:
 		var out []attachStatus
