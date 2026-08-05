@@ -3,92 +3,130 @@
 Machine-local graft paths are tenant-controlled input. Their host backing
 directory is therefore a capability boundary: runtime code must never join a
 graft path onto a host path and pass the result to an `os` or `syscall` path
-operation. The implementation and threat model are described in
-[architecture.md](./architecture.md#machine-local-dirs-grafts).
+operation. The routing language, the topology rules, and the errno contract are
+described in
+[xfs-authority-architecture.md](./xfs-authority-architecture.md#machine-local-routing).
+
+## What the boundary is in v3
+
+- Routes are declared volume-wide in `.portablefs/local-dirs` and replaced only
+  through the authority's admin `ApplyRoutes` call, which canonicalizes the
+  declaration and compare-and-swaps its revision. A mount or an existing
+  session carrying a different revision fails closed
+  (`vcs/internal/authorityrpc/routes_linux.go`,
+  `vcs/internal/localroutes`).
+- `--local-dir` is refused unconditionally on every platform. The refusal lives
+  in the one gate every mount invocation passes
+  (`validateDirectV3MountOpts`, `vcs/cmd/portablefs/internal/cli/mountcmd.go`)
+  and is not conditioned on whether the volume publishes a declaration.
+  `--no-local-dirs` refuses a declaring volume rather than ignoring its
+  topology.
+- macOS does not join route adoption. The v3 attach refuses local-dir and graft
+  options outright (`vcs/internal/portablefsd/v3attach.go`), so a volume that
+  declares routes mounts from Linux. Grafts are Linux-only:
+  `vcs/internal/fusev3/graft_linux.go`, `vcs/internal/localdirs`,
+  `vcs/internal/localroutes`.
+- Confinement is `vcs/internal/confinedfs`. Linux requires `openat2(2)` with
+  `RESOLVE_IN_ROOT` and `RESOLVE_NO_MAGICLINKS` and fails closed when the
+  primitive is unavailable or blocked: `probe_linux.go` maps `ENOSYS`,
+  `EINVAL` and `EPERM` to `ErrUnsupportedPlatform` rather than continuing
+  without confinement.
+- Nothing under a graft reaches the authority. Grafted operations run on
+  file-descriptor-backed handles against machine-local disk.
 
 ## Required verification
 
-Run the capability and graft suites on the development host, including the
-concurrent destination-parent symlink-swap attack under the race detector:
+Run the capability, routing and graft suites on the development host, under the
+race detector:
 
 ```bash
 cd vcs
-go test -race ./internal/confinedfs ./internal/localdirs -count=1
-go test -race ./internal/portablefsd \
-  -run '^(TestRefreshKernelFile|TestRefreshSample)' -count=3
+go test -race ./internal/confinedfs ./internal/localdirs ./internal/localroutes -count=1
 go test ./internal/portablefsd -count=1
 go test ./cmd/portablefs/internal/cli -count=1
 ```
 
-**On a stock Mac, most of `./internal/portablefsd`'s graft cases now SKIP, and
-that is the correct result.** Graft activation probes the machine-local backing
-filesystem and refuses when it folds names the shared namespace keeps distinct
-(`ErrBackingCaseUnsafe`, `vcs/internal/portablefsd/localcasesafety.go`). A stock
-Mac's APFS is case-insensitive, so PortableFS genuinely refuses to serve grafts
-there and a graft assertion on such a host would be asserting behaviour the
-product deliberately does not provide. Each skip names the host behaviour that
-caused it. To exercise those cases, run them on a case-sensitive filesystem —
-Linux CI does this on every run, or point the daemon state dir at an APFS
-(Case-sensitive) volume. `TestBackingCaseProbe*` and
+The `portablefsd` suite carries the case-safety probe and the v3 attach
+refusal; the `cli` suite carries the unconditional `--local-dir` gate and the
+`--no-local-dirs` semantics.
+
+### Case-exact backing, and what the probe does not cover
+
+Graft activation probes the machine-local backing filesystem and refuses when
+it folds names the shared namespace keeps distinct: `ErrBackingCaseUnsafe`, or
+`ErrBackingProbeIncomplete` when the probe could not reach a verdict at all
+(`vcs/internal/portablefsd/localcasesafety.go`). `TestBackingCaseProbe*` and
 `TestOpenLocalBackingRefusesAFoldingBacking` run and assert on every host: they
 compare the probe's verdict against ground truth measured independently with
-plain `os` calls, so the same test proves the refusal here and the acceptance
-there.
+plain `os` calls, so the same test proves the refusal on a case-insensitive
+host and the acceptance on a case-sensitive one.
 
-On macOS, the targeted `portablefsd` suite also attacks the live-vnode
-coherence refresh boundary. The authority controls the mounted path being
-refreshed, so the daemon resolves it with one descriptor-relative
-`openat(2)` using `O_RESOLVE_BENEATH|O_NOFOLLOW_ANY`, verifies the expected
-FSItem inode and regular-file type with `fstat(2)`, and performs
-`ftruncate(2)` plus `mmap(2)`/`msync(2)` on that same descriptor. The tests
-cover absolute, relative, and intermediate symlinks, an ordinary-file
-rename-over, and concurrent symlink and regular-file swaps while checking
-outside sentinel files byte-for-byte.
+Two honest limits apply to that probe today:
 
-Run the same confinement tests on a real Linux kernel using the repository's
-pinned Go toolchain. This exercises `openat2(2)` rather than merely
-cross-compiling it:
+- It sits on the retained daemon-side backing path. Because the v3 macOS attach
+  refuses grafts before any backing is opened, no macOS v3 mount reaches it.
+- The Linux FUSE frontend has no equivalent probe. A graft backed by a
+  case-insensitive filesystem mounted on Linux is still unguarded. That is an
+  open gap, not a covered case.
+
+## Real kernel confinement
+
+Unit tests and cross-compilation do not exercise `openat2(2)`. The privileged
+Linux gate does, against real XFS and a real kernel FUSE mount:
 
 ```bash
-cd /path/to/portablefs
-docker run --rm \
-  -v "$PWD:/src:ro" \
-  -w /src/vcs \
-  golang:1.26-bookworm \
-  go test ./internal/confinedfs ./internal/localdirs -count=1
+bash scripts/xfs-fuse-integration.sh
 ```
 
-The Linux suite includes both a live capability probe and an injected `ENOSYS`
-case proving that unsupported or blocked `openat2` fails closed. CI obtains its
-Go version from `vcs/go.mod`; release images use the same Go 1.26 toolchain
-family.
+Its `REQUIRED_TESTS` list names the graft tests explicitly, including
+`TestGraftedSubtreeReachesTheAuthorityZeroTimes`,
+`TestRenamingAnAncestorOfAnActiveGraftIsEBUSY`,
+`TestTheGraftBoundaryIsEXDEV` and
+`TestARouteRootShadowsTheVolumeSubtreeOfTheSameName`. A required test that is
+renamed, deleted or skipped fails the job rather than quietly shrinking
+coverage. The suite also includes a live capability probe and an injected
+`ENOSYS` case proving that unsupported or blocked `openat2` fails closed.
+
+Two-machine routing isolation is proven separately and black box by the
+`local_route_isolation` and `routes_revision_mismatch` cases in
+[the cross-mount coherence matrix](./cross-mount-coherence-matrix.md).
 
 Run the FSKit protocol and adapter suite on macOS:
 
 ```bash
-cd swift/PortableFSKit
-swift test
+swift test --package-path swift/PortableFSKit --parallel --num-workers 1
 ```
+
+`--num-workers 1` is required rather than a performance choice: several tests
+bind fixed per-process resources. This suite covers the FSKit frontend, not
+graft confinement — the macOS graft refusal is a Go-side property and is
+covered by the `portablefsd` suite above.
+
+`bash scripts/verify-local.sh` is the repository's single local merge gate and
+runs the Go and Swift suites together.
 
 ## Source audit
 
 Before release, search the graft implementations for newly introduced host-path
-operations. Expected host paths are limited to creation/opening of the trusted
-backing root in `internal/confinedfs`; tenant-relative operations must be
-methods on the confined capability:
+operations. Expected host paths are limited to creation and opening of the
+trusted backing root in `internal/confinedfs`, and to daemon state-directory
+management; tenant-relative operations must be methods on the confined
+capability:
 
 ```bash
-rg -n 'localBackingPath|BackingPath' vcs/internal vcs/cmd
+cd vcs
+rg -n 'localBackingPath|BackingPath' internal cmd
 rg -n 'os\.(Open|OpenFile|Lstat|Stat|Mkdir|MkdirAll|Remove|Rename|Link|Symlink|Readlink|Chmod|Chtimes|Truncate)' \
-  vcs/internal/localdirs vcs/internal/portablefsd
+  internal/localdirs internal/localroutes internal/fusev3 internal/portablefsd \
+  --glob '!**/*_test.go'
 rg -n 'filepath\.Join\(.*mount|unix\.Truncate\(' \
-  vcs/internal/portablefsd --glob '!**/*_test.go'
+  internal/fusev3 internal/portablefsd --glob '!**/*_test.go'
 ```
 
 Review any match rather than blindly allowlisting it. A test may intentionally
 use raw host paths to construct an attack fixture; production graft operations
-may not. The final search must have no matches: mounted paths must never be
-joined into a host pathname or passed to path-based `truncate(2)`.
+may not. The last search must have no matches at all: mounted paths must never
+be joined into a host pathname or passed to path-based `truncate(2)`.
 
 ## External certification gates
 
@@ -96,8 +134,8 @@ Unit tests, race tests, native Linux syscall tests, and cross-compilation do not
 replace these release-environment checks:
 
 - A Linux host with `/dev/fuse` and `fusermount3` must run the real kernel-mount
-  integration/torture suite. Docker Desktop does not expose `/dev/fuse` to its
-  Linux VM by default, so it cannot certify this gate.
+  integration suite. Docker Desktop does not expose `/dev/fuse` to its Linux VM
+  by default, so it cannot certify this gate.
 - A production-signed and installed PortableFS FSKit extension must run the live
   macOS kernel-mount matrix. The Swift mock/live-adapter suite cannot certify
   extension activation, entitlements, signing, or kernel handoff.

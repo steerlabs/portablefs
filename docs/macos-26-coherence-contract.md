@@ -1,12 +1,23 @@
 # macOS 26 coherence contract
 
-Status: **failure-model audit and release gate**
+Status: **declared compatibility cache policy — composed and shipping; live-kernel gates open**
 
-This document defines what PortableFS must prove before a macOS 26 FSKit mount
-can join the v3 shared-write data plane. It is deliberately separate from the
-XFS storage contract: XFS remains the only filesystem truth. The state below is
+This document defines the contract a macOS 26 FSKit mount joins the v3 data
+plane under, what the composition actually does today, and what has still not
+been proven against a real kernel. It is deliberately separate from the XFS
+storage contract: XFS remains the only filesystem truth. The state below is
 mount-membership and cache-coordination state, not a second inode tree, a
-mutation journal, or file history.
+mutation log, or file history.
+
+The macOS 26 path is a **declared compatibility cache policy**, named
+`macos26-synchronous-vfs-repair-v1`. It is selected explicitly by the mount and
+validated on both sides; it is never an automatic fallback and never a silent
+downgrade from the exact contract. Its owner-accepted fidelity target is
+approximately 98 percent: one residual race is known, exactly characterised, and
+described in [What the armed truncate coalesces](#what-the-armed-truncate-coalesces)
+below. macOS 27's native cache-control API is the primary target and closes that
+gap; no implementation of it exists, and selecting the native policy
+(`fskit-native-revocation-v1`) fails closed with `ENOTSUP` today.
 
 ## Required user-visible boundary
 
@@ -70,10 +81,12 @@ The transitions are fail-closed:
   authority that forgets an old macOS 26 participant and begins accepting
   writes can make that still-mounted kernel serve stale state indefinitely.
 
-The existing v2 macOS teardown code demonstrates the usable local mechanism:
-`/sbin/umount` runs in a bounded child process, and `getfsstat(MNT_NOWAIT)`
-verifies exact absence afterward. v3 may reuse that mechanism, but not v2's
-storage, journal, or history architecture.
+The local mechanism is a bounded child process running `/sbin/umount`, followed
+by `getfsstat(MNT_NOWAIT)` to verify exact absence without traversing the
+filesystem being removed. `portablefsd` owns that transaction — authority sync
+barrier, frozen drain, exact kernel unmount, durable attach removal — and the
+absence claim it produces is what the authority's configured verification command
+corroborates before deactivating a membership record.
 
 ### Why an unreachable mount does not block the volume
 
@@ -102,15 +115,16 @@ must make the old kernel cache unservable before the obligation is discharged.
 This bounds one failed phase at two budgets (its phase deadline plus fencing
 grace) without converting a broken laptop into an indefinite volume-wide outage.
 
-That paragraph is the required end-state, not a claim about today's macOS
-frontend. The Swift foundation now races each delivered phase against the
-negotiated repair budget, cancels the repair, reports the cursor blocked, and
-terminates its pfslocal client/runner when the timer wins. Those actions stop
-the extension from participating in the authority session, but macOS 26 FSKit
-exposes no API here that proves already-cached kernel state became unservable.
-The watchdog therefore detects and terminates; it does **not** yet self-revoke
-or force-unmount the kernel mount. `VolumeCore` continues to reject every v3
-resolve with `ENOTSUP` until that withdrawal/absence proof exists.
+That paragraph is the required end-state. The Linux half of it is implemented and
+tested; the macOS half is not. The Swift runner races each delivered phase
+against the negotiated repair budget, cancels the repair, reports the cursor
+blocked, and terminates its pfslocal client and runner when the timer wins.
+Those actions stop the extension from participating in the authority session,
+but macOS 26 FSKit exposes no API that proves already-cached kernel state became
+unservable. The watchdog therefore detects and terminates; it does **not**
+self-revoke or force-unmount the kernel mount. That is an open gate, listed
+below, and it is the single largest difference between the declared policy and
+the exact contract Linux meets.
 
 What is *not* traded away: the fenced mount stays in durable membership, so the
 authority-restart gate below still applies to it in full. Availability is
@@ -171,14 +185,15 @@ source exemption.
 
 The v3 Swift coherence model represents PREPARE and COMPLETE as distinct cursor
 phases and carries the opaque initiator session/slot/sequence ticket plus the
-exact pfslocal callback operation ID for a source event. pfslocal minor 8 now
-has a dedicated ordered visibility event/ack contract, and `portablefsd` has a
+exact pfslocal callback operation ID for a source event. `portablefsd` has a
 lossless one-event bridge whose source COMPLETE waits for the initiating
-callback's `PublicationAck`. The production FSKit volume remains deliberately
-gated until it installs that transport together with its namespace index,
-callback barrier, and repair backend; a resolve carrying `v3_coherence` closes
-and returns `ENOTSUP` today. It never ignores the contract or reinterprets a v2
-invalidation as v3 visibility.
+callback's publication acknowledgement. The production FSKit volume installs
+that transport together with its namespace and live-object indexes, the callback
+barrier, and the repair backend, and it does so as one composition: if any part
+of it fails to build, the volume shuts the core down and fails the mount rather
+than serving without it. A resolve is admitted only when it declares
+`macos26-synchronous-vfs-repair-v1`; any other policy string, including the
+macOS 27 native one, closes the client and returns `ENOTSUP`.
 
 A single volume-wide ticket is the simplest correct starting point. Finer
 path/inode tickets are an optimization only after measurements justify their
@@ -240,10 +255,20 @@ The scratch item the swallowed create returns is minted from a reserved top
 band of the identifier space that `PfsFSKitMapping.itemIdentifier(from:)`
 refuses for daemon items, and it rejects `setAttributes`, `read`, and `write`.
 
-Production installs no gate: `PortableFSVolume.make` defaults `repairGate` to
-`nil`, and with no gate every reserved name is refused `EPERM`. That is the
-fail-closed end of the same contract — no repair can run, and no user file can
-occupy a name the repair machinery would later claim.
+Production installs the gate. `PortableFSFileSystem.loadResource` connects
+`VolumeCore`, which validates the declared cache policy and records the resolved
+strict contract; `PortableFSVolume.make` then composes
+`PfsMacOSV3VolumeCoherence` and installs its `repairGate` on the volume. A
+composition failure shuts the core down and rethrows, so the mount fails closed
+rather than activating without coherence. A volume built without a gate — which
+production no longer produces — refuses every reserved name `EPERM`, which is
+the same contract's other end: no repair can run, and no user file can occupy a
+name the repair machinery would later claim.
+
+`PfsMacOSV3VolumeCoherence` also owns the two client-side indexes and the
+callback barrier, and it binds the POSIX actuator's mount root lazily: the root
+descriptor is opened on the first served callback, and until it is installed the
+actuator fails `ENXIO` rather than acting on an unidentified directory.
 
 `PfsMacOSCoherenceRunner` records the barrier cursor in its completed ledger
 before it acknowledges, so a lost, refused, or cancelled acknowledgment costs a
@@ -253,45 +278,104 @@ fresh nonce.
 `PfsMacOS26POSIXActuator` rolls the isolating rename back if any later step of
 the transaction fails, and re-throws either way; a rollback that itself fails
 throws an error naming the stranded operand rather than leaving it unreported.
+Before it acts, it compares the operand's `st_ino` against the
+`expectedVFSFileID` the planner derived locally, so a coordinate that no longer
+names the object the plan was built for is an error rather than surgery on the
+wrong inode.
+
+### The armed truncate
+
+`.dataInvalidation` is armed in production.
+`PfsMacOS26RepairArmRegistry.defaultSupportedKinds` contains `.negativeScratch`,
+`.positiveEviction`, and `.dataInvalidation`, and `compose` builds the registry
+with that default. This is the one place where the declared policy admits a
+callback that carries no operand of its own, so the provenance is stated exactly.
+
+A plain `ftruncate` cannot carry a reserved name: its FSKit callback carries an
+item and a requested size and nothing else. An "armed next truncate" table keyed
+on nothing but intent would be raceable by any process that reads the hidden name
+out of the directory during the transaction, and it could acknowledge a user's
+mutation without changing XFS. The registry therefore admits a truncate only
+inside a coordinate that an ordinary process cannot address by accident:
+
+- **Arm time.** The plan must carry both a non-nil `expectedVFSFileID` and a
+  non-nil `authoritativeSize`, and its operand HMAC must validate over the
+  authority epoch, the barrier sequence, the step, the kind, the parent identity,
+  the item identity, and the source name, under the per-mount key bound to that
+  mount's session UUID. A forged or step-shifted plan opens no window.
+- **Consumption time.** The transaction must be a `.dataInvalidation`, its
+  isolation window must be open, the callback's item stable identity must equal
+  the plan's, and the requested size must equal the plan's exact authoritative
+  size. Epoch and sequence are bound transitively: they were verified into the
+  operand HMAC at arm time and cannot be re-shaped afterwards.
+- **The window is namespace state, never a clock.** It is open exactly between
+  the operand rename and the operand removal, and closed by rollback. There is no
+  interval an ordinary process can wait for.
+- **The adapter narrows it further.** A consumed truncate must set only `size`;
+  a callback that also sets mode, uid, gid, or flags is not a repair. Removing the
+  operand is refused until the truncate has been consumed, and `finish` requires
+  it, so the nameless half of the transaction cannot be skipped.
+
+Forwarding an unauthenticated repair truncate to the authority is not an
+alternative. A stale positive vnode may name the replaced, unlinked inode;
+changing it would alter the view of a legitimate open-before-replace descriptor
+even though the repair was supposed to affect only kernel cache state.
+
+### What the armed truncate coalesces
+
+This is the residual race, stated exactly. It is the reason macOS 26 is a
+declared compatibility policy with an approximate fidelity target rather than the
+exact contract.
+
+A process that, during the isolation window, addresses the hidden operand and
+truncates it to exactly the authoritative post-state size has that metadata-only
+effect coalesced with the repair. It observes success for a syscall the authority
+never saw. Reaching that state requires reading a per-transaction hidden name out
+of the directory inside a window bounded by two authority round trips and issuing
+a truncate to one exact byte count, but it is possible, and it is not detected.
+
+A second, narrower coalescing follows from the same key. The armed-truncate check
+is keyed on stable identity alone, so while the window is open, any `openItem` or
+`closeItem` for that identity — not only the actuator's own — returns locally
+without a corresponding daemon open or close. The observable effect is confined
+to open bookkeeping for one item during one window, but it is a real deviation
+and is recorded here rather than left implicit.
+
+macOS 27's native cache-control API removes the need for the hidden-rename shape
+entirely and therefore closes both.
 
 ### What is still refused
 
-`PfsMacOS26RepairArmRegistry.defaultSupportedKinds` contains
-`.negativeScratch` and `.positiveEviction` only. `.dataInvalidation` cannot be
-armed and therefore cannot be actuated through the gate.
-
-The hidden-rename shape carries provenance in its operand. A plain `ftruncate`
-cannot: its FSKit callback carries an item and requested size, but no
-unforgeable repair token. An "armed next truncate" table is raceable by an
-ordinary process that reads the hidden name out of the directory during the
-transaction and issues the same truncate, and it could acknowledge a user
-mutation without changing XFS. Until a non-raceable provenance channel or a
-native cache-control API is proven, swallowing `ftruncate`/`setattr` as a local
-repair is a security and correctness blocker, and the registry refuses to arm
-the plan that would need it.
-
-Forwarding an unauthenticated repair truncate is not an answer either. A stale
-positive vnode may name the replaced, unlinked inode; changing it would alter
-the view of a legitimate open-before-replace descriptor even though the repair
-was supposed to affect only kernel cache state.
+`.invalidateDataObject` and `.invalidateAttributesObject` — the repairs a native
+revoker would use for an open-but-unlinked vnode with no remaining path — are
+unrepresentable on macOS 26. The backend refuses to build a plan for them, so
+such a barrier fails closed and is never acknowledged.
 
 The hidden-rename actuator also creates a transient local interval in which the
 source name is absent: the kernel has completed `source -> authenticated-hidden`
 but has not yet removed the hidden name and fetched the authority's current
 binding. Draining FSKit callbacks prevents an older callback from publishing
 across that interval, but it does not by itself prove that another process
-cannot observe the kernel's local rename directly from cache. Production needs
-a live test proving the admission gate prevents that observation, or a
-different actuator with an atomic replacement boundary. Healthy connected
-experiments are encouraging; they are not a proof of ordinary-directory
-atomicity.
+cannot observe the kernel's local rename directly from cache. That proof needs a
+live kernel; it is an open gate below.
 
 ## Identity, path, and inode number
 
 `VisibilityTarget` carries `scope`, `identity`, `parent_identity`, `name`, and
-`size`. It carries no path and no inode number, and it must not: a path is a
-per-mount rendering of a tree, and an inode number is a per-mount projection
-that the authority cannot compute for a mount it does not run.
+`size`. It carries no path, and it must not: a path is a per-mount rendering of a
+tree that the authority cannot compute for a mount it does not run.
+
+It does carry explicit kernel-cache coordination facts — `kernel_ino`,
+`parent_kernel_ino`, and `device` — and the reason is worth stating, because an
+earlier revision of this document asserted the opposite and the code was wrong to
+match it. The stable identity is an XFS export handle: it encodes type, inode,
+and generation, and never a device. A frontend that indexes by item identity
+needs nothing else, but a FUSE frontend keys its kernel caches by the inode
+number the authority publishes in attributes. When those facts did not travel,
+the FUSE frontend parsed them out of an identity whose layout does not contain
+them, and the first strict repair against real XFS revoked every mount. The
+coordination facts now travel explicitly, as separate fields, so neither frontend
+has to infer a projection from an opaque handle.
 
 `Sources/PortableFSKit/MacOSV3Namespace.swift` derives both on the client.
 `PfsMacOSNamespaceIndex` maps a stable identity to its parent identity, its
@@ -311,12 +395,25 @@ an unpathable open object fails the barrier and is never acknowledged.
 A skip is sound only when the identity is absent from both indexes: the kernel
 cannot hold a cached binding this extension never returned, and it has no live
 object after the last close/reclaim. Upholding that claim requires updating the
-namespace index at every published/retired coordinate and the live-object index
-at every open/retaining-close/reclaim boundary. **The FSKit adapter does not yet
-populate either index.** That wiring is part of the live path and is an unmet
-release gate, listed below. Production also needs a hard bound for both indexes;
-an exact record can be dropped only after synchronous kernel revocation, never
-by silent LRU eviction.
+namespace index at every published or retired coordinate and the live-object
+index at every open, retaining-close, and reclaim boundary. The adapter now does
+this. Every callback that publishes a binding records it — `lookupItem` on a hit,
+`createItem`, `createSymbolicLink`, `createLink`, both sides of `renameItem`, and
+every entry packed by `enumerateDirectory` — `removeItem` retires the binding
+while deliberately keeping the live object, `openItem` records the live object on
+both its repair-isolated and ordinary branches, and `reclaimItem` retires it.
+Callbacks that publish no binding — attribute reads and writes, symlink reads,
+data reads and writes, xattr operations — record nothing, which is correct
+because they cannot introduce a coordinate the kernel did not already hold.
+
+The namespace index is keyed by `(parentIdentity, name)` with a reverse index
+from identity to keys, so every hard-link alias survives independently. Both
+indexes are hard-bounded, and the bound is a refusal rather than an eviction
+policy: over capacity, the recording callback fails `EIO`. An exact record may be
+dropped only after synchronous kernel revocation, never by silent LRU eviction,
+so a bound that is too small is a loud mount failure rather than a quiet
+coherence hole. An item with no 16-byte stable identity fails its callback for the
+same reason.
 
 ## Authority restart and host loss
 
@@ -336,102 +433,99 @@ history. If PortableFS refuses any durable membership record, the honest
 alternative is to keep macOS 26 multi-writer support experimental and not
 claim exact behavior across authority restart or a partitioned mount.
 
+
 ## Release gates
 
-macOS 26 shared-write support remains blocked. Every item below is unmet
-today. Nothing in this section describes existing behavior; it describes what
-must be established on the selected production OS build before the live path
-may be enabled.
+This section is the honest ledger. The first list is what the composition
+establishes today; the second is what remains open, and every item in it is a
+reason the macOS 26 path is a declared compatibility policy rather than the exact
+contract.
 
-Implemented foundation that is not yet a production mount:
+### Established
 
-- pfslocal minor 9 carries a validated v3 attach contract, exact two-phase
-  visibility events, route-change events, source callback operation IDs, and
-  cursor/blocked acknowledgments, plus an on-demand daemon-to-authority
-  liveness round trip bound to the resolved epoch and session. The Go bridge is
-  lossless, permits one outstanding event, starts an independent repair
-  deadline, treats disconnect as terminal, and does not advance source COMPLETE
-  before the exact callback publication acknowledgment;
-- `PfsLocalMacOSV3CoherenceTransport` consumes that wire shape, validates the
-  authority epoch/session/protocol, maps exact coordinates through the local
-  namespace and live-object planners, acknowledges through the priority lane,
-  and turns route replacement or malformed input into a blocked/terminal
-  result. Resolve binds strict participation to one exact UDS connection, which
-  cannot reconnect after participant loss. Connect requires the first exact
-  authority liveness proof synchronously; an independent priority-lane pulse
-  repeats no slower than one third of the repair budget and fails closed on a
-  timeout or changed epoch/session. It does not use `SyncVolume` as a liveness
-  substitute. The runner also enforces the negotiated local per-phase deadline without waiting for a
-  cancellation-ignoring backend, but this is session termination rather than
-  kernel-cache withdrawal;
-- the planner preserves every hard-link coordinate separately from live FSKit
-  objects, including native object-target repair plans for open-but-unlinked
-  data and attributes. The macOS 26 backend rejects unpathable object repairs
-  rather than acknowledging an empty plan;
-- a standalone portablefsd v3 data plane maps the pfslocal operation surface to
-  authority RPC, including exact source publication identity, readdir-plus
-  items, bounded reads and directory cursors, liveness, stable XFS incarnation
-  identity, and `SyncVolume` backed by authority `syncfs(2)`. It remains outside
-  the production attach registry until the rest of this list is satisfied; and
-- the production `VolumeCore` currently refuses any resolved v3 contract with
-  `ENOTSUP`. This guard is intentional: the isolated transport tests cannot be
-  mistaken for a live coherent mount.
+- The mount declares `macos26-synchronous-vfs-repair-v1` and the authority
+  validates it. `VolumeCore` admits only that policy; an unknown string or the
+  macOS 27 native policy closes the client and fails `ENOTSUP`. A second,
+  independent check refuses a runner whose backend policy disagrees with the
+  resolved contract, so the two cannot drift apart silently.
+- `portablefsd` serves a real v3 authority attach: mutual-TLS dial with no mode
+  fallback, a real coherence contract on resolve, every operation routed to the
+  v3 data plane, and an evidence-bearing detach that either delivers a
+  mount-absence proof or ends fenced.
+- The FSKit composition is installed as one unit at `loadResource` time, and a
+  failure to build it fails the mount closed rather than activating a volume with
+  no coherence.
+- Both client indexes are populated from every binding-publishing and
+  binding-retiring callback, with hard-link aliases preserved separately from
+  live objects, and both bound by refusal rather than eviction.
+- A real publication barrier closes and reopens callback admission, drains
+  already-admitted callbacks to the point where their FSKit reply has crossed the
+  framework boundary, and identifies exactly one initiating callback so the
+  source cannot deadlock against its own mutation.
+- The repair gate is installed, its operands are unforgeable and one-shot, its
+  declared callbacks are consumed exactly once in order, and a torn transaction
+  permanently seals the registry.
+- `.dataInvalidation` is armed under the exact one-shot provenance described
+  above, with the residual coalescing stated rather than hidden.
+- The authority carries kernel-cache coordination facts explicitly, so a strict
+  repair against real XFS addresses the coordinate the frontend actually keys on.
+- The offline Swift suite establishes operand unforgeability, one-shot
+  consumption under concurrency, callback ordering, reserved-namespace refusal at
+  the adapter with a mock daemon witnessing that no request crossed the socket,
+  exactly-once barrier accounting across a lost acknowledgment, index population
+  and capacity refusal, barrier behaviour, and the dangerous actuator paths
+  executed against a real temporary directory with real `renameat`, `unlinkat`,
+  `ftruncate`, `mmap`, and `msync` syscalls including their rollback. Those are
+  real syscalls on a local filesystem. They say nothing about what the FSKit
+  kernel path does with them.
 
-Gates that still require production integration code:
+### Open — these require a live kernel
 
-- production control/registry composition for the standalone v3 data plane.
-  The daemon—not Swift—must install the manager-issued mutual-TLS identity and
-  access capability, bind the exact authority epoch/session and route revision,
-  own the evidence-bearing detach lifecycle, and expose only that independent
-  backend to the v3 attach. It must not mix the authority session into the
-  legacy `clientcore` attach;
-- the FSKit adapter populates `PfsMacOSNamespaceIndex` on every callback that
-  publishes or retires every binding, including all hard-link aliases, and
-  populates `PfsMacOSLiveObjectIndex` across open, retaining-close, unlink, and
-  reclaim. Both are required before an unresolved target is provably uncached
-  rather than merely unknown; the two indexes must stay separate so losing the
-  last pathname cannot hide an extant vnode from native revocation;
-- a `PfsMacOSCallbackPublicationBarrier` implementation that actually closes
-  and reopens callback admission, and production installation of the existing
-  v3 local transport/runner/backend before FSKit activation;
-- a provenance channel for `setattr`/`ftruncate`, without which
-  `.dataInvalidation` stays unarmable and the data half of the contract cannot
-  be satisfied at all. The public macOS 26.5 FSKit SDK has no vnode/name/data
-  cache-revocation API and its only requested mount option is read-only, so
-  this is an OS/API blocker rather than missing socket plumbing;
-- a watchdog terminal action that makes the exact macOS kernel mount
-  unservable (or force-unmounts it and proves exact absence). Closing pfslocal,
-  cancelling the runner, and fencing authority credentials do not revoke data
-  already resident in the macOS kernel cache;
-- a durable participant-membership record, without which the authority-restart
-  gate below cannot be met.
+Nothing in the Swift suite mounts a real FSKit volume, and the one live-path test
+is opt-in, drives `VolumeCore` over a socket, and does not exercise a kernel
+mount. The following are therefore unproven:
 
-Gates that require a live mount to test, and which the doubles in
-`Tests/PortableFSKitTests` cannot establish:
+- **Mount-root binding.** That the actuator's mount-root locator finds the real
+  `pfs` mount through `getfsstat` and that the root inode number matches. Until
+  the root is bound the actuator fails `ENXIO`; nobody has watched it succeed on
+  a live kernel.
+- **Kernel callback shapes for the data path.** That a real macOS 26 kernel
+  delivers the truncate, open, and close callbacks in the shape and order the
+  armed transaction declares, rather than in a shape the gate refuses.
+- **That the synthetic repairs do what they are assumed to do.** That create plus
+  unlink actually purges a negative dentry; that rename-to-hidden plus unlink
+  actually purges a positive dentry and its cached attributes; that `ftruncate`
+  plus `mmap(MAP_SHARED)` plus `msync(MS_INVALIDATE)` actually drops the kernel's
+  cached pages and EOF for an FSKit vnode.
+- **Hostile races through a real kernel.** Every swallowed local operation, raced
+  by an ordinary process against a real VFS rather than against the arm registry
+  directly. This includes the specific question of whether the admission gate
+  prevents observation of the transient hidden-rename interval.
+- **Watchdog kernel-cache withdrawal.** A terminal action that makes the exact
+  macOS kernel mount unservable, or force-unmounts it and proves absence. Closing
+  pfslocal, cancelling the runner, and fencing authority credentials do not revoke
+  data already resident in the macOS kernel cache. This is the gate that keeps the
+  fencing grace from being load-bearing on macOS.
+- **Durable membership across authority restart.** The membership record and the
+  mount-absence verification command exist and are wired; the drill — restart the
+  authority with a live old mount and observe the refusal, then the verified
+  deactivation — has not been run end to end.
+- **The live cross-platform matrix.** `scripts/coherence-matrix-macos.sh` runs the
+  same 23 cases against two already-mounted paths, including a remote Linux peer.
+  It has not been run against a live macOS mount, so no macOS-to-Linux result
+  exists.
+- **Bounded barrier latency under metadata-heavy workloads.**
 
-- negative lookup, positive lookup, attributes, size, file data, rename-over,
-  unlink, and open-before-replace behavior;
-- lookups whose replies cross quiesce, repair, and resume boundaries;
-- two simultaneous mutators from different mounts without deadlock;
-- an initiating mutation plus local repair without nested-VFS deadlock;
-- proof that the admission gate prevents an ordinary process from observing the
-  transient hidden-rename interval;
-- daemon/event-channel freeze, disconnect, reconnect, and exact unmount;
-- authority restart with a live old mount;
-- hostile races against every swallowed local operation, run through a real
-  kernel rather than against the arm registry directly; and
-- bounded barrier latency under metadata-heavy workloads.
+### macOS 27
 
-What the offline suite does establish, without a kernel mount: operand
-unforgeability, one-shot consumption under concurrency, callback ordering,
-reserved-namespace refusal at the adapter with a mock daemon witnessing that no
-request crossed the socket, exactly-once barrier accounting across a lost
-acknowledgment, and the two dangerous actuator paths — `.positiveEviction` and
-`.dataInvalidation` — executed against a real temporary directory with real
-`renameat`/`unlinkat`/`ftruncate`/`mmap`/`msync` syscalls, including their
-rollback on failure. Those are real syscalls on a local filesystem; they say
-nothing about what the FSKit kernel path does with them.
+macOS 27's native cache control is the primary target, not an eventual
+improvement. It removes the hidden-rename actuator entirely, closes the armed
+truncate's residual coalescing, and makes the open-but-unlinked object repairs
+representable. The surface exists in this tree only as an SDK-symbol-free
+protocol with no conformance; nothing implements it, and the policy that would
+select it fails closed. Release remains gated on the final SDK plus the same live
+matrix — an OS version number is not accepted as proof.
 
-If any test cannot establish the exact boundary, the frontend fails its
-production gate. It does not silently downgrade to asynchronous "mostly
-coherent" behavior.
+If any of these gates cannot establish its exact boundary, the frontend fails.
+It does not silently downgrade to asynchronous "mostly coherent" behaviour, and
+it does not quietly widen the declared policy's accepted deviations.

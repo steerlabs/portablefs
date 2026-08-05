@@ -17,10 +17,10 @@ builds:
     ldflags:
       - -s -w -X main.version={{ .Version }}
 
-  - id: vcs
+  - id: portablefs-authority
     dir: vcs
-    main: ./cmd/vcs
-    binary: vcs
+    main: ./cmd/portablefs-authority
+    binary: portablefs-authority
     env:
       - CGO_ENABLED=0
     goos: [linux]
@@ -51,7 +51,7 @@ archives:
       - none*
 
   - id: portablefs-server
-    ids: [vcs]
+    ids: [portablefs-authority]
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:

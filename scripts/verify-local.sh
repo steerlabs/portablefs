@@ -72,8 +72,10 @@ fi
 # The package identifiers are matched as import paths (internal/<pkg>), not as
 # bare words: "writeback" and "fsproto" are also ordinary nouns in the current
 # system's vocabulary — pfsbench has a -writeback flag for the kernel writeback
-# cache, and pfslocal.proto's prose refers to the retired fsproto wire — and a
-# bare-word scan would fail on those forever.
+# cache, pfslocal.proto's prose refers to the retired fsproto wire, and Go
+# comments legitimately explain "no fallback to the retired clientcore engine"
+# — so package terms are matched as import paths, which is what resurrection
+# actually looks like.
 #
 # Excluded: docs/ and CHANGELOG.md (history is supposed to name the thing it
 # replaced), this script, and scripts/package-manager-matrix.sh, which really
@@ -82,7 +84,7 @@ step "stale architecture scan"
 if rg --hidden -n \
   -e 'JournalRecord\b' \
   -e '\bremotejournal\b' \
-  -e '\bclientcore\b' \
+  -e 'internal/clientcore\b' \
   -e 'internal/fsproto\b' \
   -e 'internal/writeback\b' \
   -e '\bhistworker\b' \

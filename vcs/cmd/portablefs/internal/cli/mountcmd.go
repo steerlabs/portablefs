@@ -1060,7 +1060,9 @@ type boundDataPlane struct {
 }
 
 // credentialInstaller is a data plane a rotated lease credential must reach.
-// *clientcore.Volume is the production implementation.
+// No production implementation exists in v3: the mount capability is single
+// use and nothing rotates, so this seam survives only for the recorded-lease
+// reconciliation tests until those records age out of the wild.
 type credentialInstaller interface {
 	InstallCredential(token string, expiresAtMs int64)
 }

@@ -29,12 +29,15 @@ change as complete with a failing or skipped `verify-local.sh`.
 
 ## Frozen Surfaces
 
-Read [COMPATIBILITY.md](./COMPATIBILITY.md) before changing: environment variable
-names (`VCS_*`, `VOLUME_*`, `PORTABLEFS_*`), `/v1` HTTP routes, the `pfslocal`
-wire protocol, persisted formats (WAL, manifests, tree hash, digests), or the
-pinned repo layout (`vcs/cmd/*` binaries, `swift/PortableFSKit`). Those are
-frozen: evolve additively (new route, new env var, new protocol version), never
-rename or repurpose.
+Read [COMPATIBILITY.md](./COMPATIBILITY.md) before changing: the authority wire
+(ALPN, protocol major, required feature strings, canonical encoding), the
+declared macOS cache policy names, the `.portablefs/local-dirs` rule syntax and
+its revision hash, the `pfslocal` protocol between the daemon and the FSKit
+extension, `PORTABLEFS_*` environment variable names, the user-facing CLI
+commands and their documented flags, and the release identity chain. Those are
+frozen: evolve additively (new operation, new optional field, new env var), never
+rename or repurpose. A wire-incompatible change gets a new exact protocol major
+and refuses the old one at the handshake.
 
 ## Code Style
 
@@ -42,17 +45,20 @@ rename or repurpose.
 - Swift: follow the existing package's conventions; no force-unwraps on I/O paths.
 - Comments explain intent, invariants, and trade-offs — not what the code does.
 - No emojis in code, docs, or commit messages.
-- Match the register of [docs/architecture.md](./docs/architecture.md) when writing
-  docs: concise, technical, honest.
+- Match the register of
+  [docs/xfs-authority-architecture.md](./docs/xfs-authority-architecture.md) when
+  writing docs: concise, technical, honest about what is unproven.
 
 ## Repo Shape
 
-- `vcs/`: Go data plane (authority server, Linux FUSE mount client, the macOS
-  `portablefsd` daemon behind the FSKit extension, NFS compat, WAL,
-  replication, checkpoints). Internals live under `vcs/internal/`.
-- `swift/PortableFSKit`: the macOS FSKit extension, the app, and the installer core.
+- `vcs/`: the Go data plane — the XFS authority, the Linux kernel-FUSE mount
+  client, the macOS `portablefsd` v3 data plane behind the FSKit extension, and
+  the CLI. Internals live under `vcs/internal/`; see [vcs/README.md](./vcs/README.md).
+- `swift/`: the FSKit extension and its coherence stack (`PortableFSKit`), the
+  shipping app (`PortableFSApp`), and a manual-registration dev host.
 - `pfslocal/`, `proto/`: the wire protocol sources shared by the Go daemon and the
   Swift frontend, plus their golden frames.
-- `scripts/`: the local gate, the privileged Linux batteries, release packaging,
-  and the release-trust policy checkers.
-- `docs/`: contracts and guides; `docs/architecture.md` is the root contract.
+- `scripts/`: the local gate, the privileged Linux batteries, the coherence
+  matrices, release packaging, and the release-trust policy checkers.
+- `docs/`: contracts and guides. `docs/architecture.md` states the product
+  contract; `docs/xfs-authority-architecture.md` is the core design document.

@@ -1,10 +1,34 @@
 # Direct-store consensus component evaluation
 
-Status: Phase 0 decision record. This evaluates a component for the replicated
-readable-store experiment in `docs/direct-store-exploration.md`; it does not
-change the v2 architecture or any frozen protocol.
+> **Concluded exploration — historical record, not a live decision.**
+>
+> This is the Phase 0 component evaluation for the replicated readable-store
+> experiment described in
+> [direct-store-exploration.md](./direct-store-exploration.md). That exploration
+> was concluded without adopting a replicated store, so nothing here is an
+> active dependency choice: PortableFS v3 runs no consensus protocol and takes
+> no dependency on `go.etcd.io/raft/v3`. The design that superseded the
+> exploration is recorded in
+> [xfs-authority-architecture.md](./xfs-authority-architecture.md).
+>
+> One artifact survives and is still runnable:
+> `vcs/spikes/directstore-stable-boundary` exists in this tree, and
+> `go -C vcs test ./spikes/directstore-stable-boundary -v` still runs it. The
+> segmented-log measurement spike the exploration cites,
+> `vcs/spikes/direct-store-seglog`, does not — it was removed at commit
+> `dba5b8f` ("v3: remove the v2 architecture entirely") along with the rest of
+> the v2 architecture.
+>
+> The original status line said this evaluation does not change the v2
+> architecture or any frozen protocol. v2 no longer exists, so read that as a
+> statement about the document's scope at the time it was written, not about the
+> current system.
+
+Status: Phase 0 decision record, retained as a historical evaluation.
 
 Review date: 2026-08-03.
+
+The body below is unedited.
 
 ## Decision
 

@@ -140,10 +140,11 @@ tls-system-pki with --data-plane-server-name, or tls-private-ca with that
 name plus --data-plane-ca), and the manager-issued mutual-TLS client
 identity (--client-cert/--client-key; the key must be chmod 600). v3
 authority sessions are mutually authenticated TLS 1.3, so plaintext cannot
-mount. The retained authority manager mints only v2 leases and cannot admit
-a v3 session; a manager/lease-only invocation is refused with this shape
-named, never silently mounted on the retired v2 engine. A v3 volume is
-branchless: the retired --branch flag is an error.
+mount. There is no manager or lease flow: credentials are minted by the
+deployment's own provisioning (see docs/xfs-authority-deployment.md), and an
+invocation missing any of the direct-credential flags is refused with the
+missing flags named. A v3 volume is branchless: the retired --branch flag is
+an error.
 
 There is no write-back cache: write(2) returns after the authority has
 applied the bytes to XFS, and fsync waits for the authoritative server

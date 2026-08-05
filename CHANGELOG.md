@@ -13,51 +13,93 @@ this file is the human-curated summary.
 
 Initial open-source release preparation. No tagged release yet.
 
-### Added
+### Removed
 
-- `portablefs recovery list|resolve <mountPath>` — inspect a mount's local
-  write-back recovery jobs and resolve the terminally `conflict`/`corrupt` ones
-  that block `portablefs umount --force` and every attach. `list` takes no lock
-  and changes nothing; `resolve` never deletes (the job's bytes are moved to
-  `<store>/unreplayable/` and kept), reports exactly what was lost, and refuses
-  any job it cannot prove terminal, any store a live engine owns, and any stream
-  whose identity does not match. Before this the product instructed operators to
-  perform an "explicit recovery resolution" that no command implemented; the only
-  escape was moving the state directory by hand.
+- **The v2 architecture, in its entirety.** The XFS authority, the `fusev3`
+  kernel mount, the `portablefsd` v3 data plane, and the v3 mount CLI are now the
+  only paths. Deleted: every v2 Go plane — the client core, the v2 mount wire,
+  the write-back engine, the work filesystem, the mount WAL, the base-tree and
+  control formats, the history and journal machinery, delegation, coherence, and
+  the v2 FUSE frontend, together with the packages orphaned by the cut, the
+  journal server command, and the history worker; the daemon's v2 attach path;
+  and the CLI's legacy mount engine along with every command backed by the
+  journal-era control plane. Deleted with them: that control plane's TypeScript
+  services and workspace packages, the Railway reference deployment, the
+  docker-compose stacks, the control-plane container images, and the JavaScript
+  package-manager machinery.
+
+  With the journal went the product surfaces built on it: history, branches,
+  forks, snapshots, `adopt`, server-side exec and grep, and renewable access
+  leases. v3 mounts carry direct credentials — an authority address, a single-use
+  capability, and a mutual-TLS client identity — and a v3 volume is branchless.
+
+  Legacy persisted attach and lease records are recognised and refused with
+  remount-or-discard guidance rather than silently dropped. Module dependencies
+  fall from five to three.
+
+### Changed
+
+- **CI and the local gate are Go and Swift only.** `scripts/verify-local.sh` is
+  one bash gate: cross-OS builds, vet, the Go suite, the Go race suite, the Swift
+  suite, the release-trust policy checks, and a stale-architecture scan that fails
+  the build if the journal-era identifiers reappear. The release workflow no
+  longer builds control-plane images and its trust check refuses their return.
+- **`portablefsd` serves a real v3 authority attach**: a mutual-TLS dial with no
+  mode fallback, a real coherence contract on resolve, every local operation
+  routed to the v3 data plane, and an evidence-bearing detach that either delivers
+  a mount-absence proof or ends fenced.
+- **`portablefs mount` is v3-only on both platforms**: direct credentials, strict
+  coherence by default, a shared mount engine, and a daemon-driven FSKit attach on
+  macOS.
+- **macOS 26 FSKit is composed end to end** as the declared compatibility cache
+  policy `macos26-synchronous-vfs-repair-v1`: the namespace and live-object
+  indexes are populated from every binding callback, the publication barrier is
+  real, the repair gate is installed at resolve, and data invalidation is armed
+  under exact one-shot provenance. Its residual race and its open live-kernel
+  gates are stated in `docs/macos-26-coherence-contract.md`.
+- **`portablefs-authority` gained a wireable mount-absence verification command**,
+  so a clean detach can deactivate durable strict membership. Without it, clean
+  detach fails closed and every restart after a strict mount depends on the
+  operator asserting that prior mounts were fenced.
 
 ### Fixed
 
-- A capacity refusal from the authority (`ENOSPC`/`EDQUOT` — the bounded dirty
-  block pool or the journal backlog quota) no longer fences the whole mount. It
-  used to park the stream terminally, which latched the engine's fail-closed
-  verdict, and that verdict gates the exact-handle read/getattr/getxattr paths
-  and `Truncate` — so a full store answered EIO to `ls`, `stat`, `read`, `mkdir`
-  and the documented truncate remedy until remount. Writes now refuse with a
-  definite `ENOSPC` while reads, metadata and releasing truncates keep working,
-  exactly as documented, and the refusal clears by itself when the authority
-  releases. Genuine fail-closed conditions (fence/ESTALE, typed corruption,
-  out-of-subtree records) still fence.
-- Every refusal in the umount / `--force` / `--discard-record` graph now names a
-  command that exists and can make progress. The forced-unmount progress verdict
-  no longer prescribes another `--force`, `--discard-record`'s daemon-attach
-  blocker names the resolution that unblocks the force it points at, and both
-  force-park call sites name `portablefs recovery resolve` when a terminal
-  recovery job is what refused.
-- The contained-stream verdict no longer publishes its quarantine path before
-  the bytes are at it: for the whole window between the verdict and the rename —
-  including an authority round trip — the only durable statement about where the
-  last surviving copy lived named a path that did not exist.
+Each of the following carries a regression test and was verified against the
+privileged XFS and kernel-FUSE suite.
+
+- Stable-identity resolution inspected the export handle before its error, so a
+  routine cross-mount `ENOENT` race nil-dereferenced and killed the whole
+  authority. Absence now reports a stale-object error.
+- A blocking `F_SETLKW` held the topology read guard for its whole park, so one
+  queued routing writer stalled every request on the volume. Blocking waits are
+  admitted through the session-routes check instead of the guard.
+- Applying a routing change fenced every strict participant through silent budget
+  burn. Mounts now report themselves blocked — which fences immediately — before
+  revoking, and visibility control is exempt from the session-routes gate.
+- One raced-away or non-portable directory entry failed a whole readdir page with
+  `ESTALE`, making a directory containing a foreign FIFO permanently unlistable.
+  Entries now degrade exactly as local readdir does: raced entries are skipped
+  with cookie progress, and non-portable inodes list opaquely with no capability.
+- Name invalidation treated a benign `ENOENT` from an evicted dentry as a repair
+  failure and revoked healthy mounts on hard links, open-after-unlink, and dcache
+  pressure. Absence is the invalidated state.
+- Visibility targets carried the exact XFS export-handle identity while the FUSE
+  frontend parsed them as device and inode, so the first strict repair on real
+  XFS revoked every mount. The kernel-cache coordination facts — inode, parent
+  inode, and device — now travel explicitly.
+- Reclaim mutations consumed replay-slot sequences without settling the
+  publication ledger, deadlocking the next visible mutation's deferred source
+  completion.
+- Corruption and shutdown errnos (`EUCLEAN`, `ESHUTDOWN`, `ENOTRECOVERABLE`)
+  fence the volume like `EIO` and carry the storage failure class.
+- A completed hard link whose local bookkeeping failed was misreported as `EIO`;
+  a creation grant was permanently consumed by a transient adoption failure; and
+  the coherence-matrix harness now fails loudly on a non-shared namespace and
+  names declared-away cases in its verdict.
 - Publish and inventory the complete signed macOS FSKit identity tuple end to
-  end: filesystem type `pfs`, generic-resource scheme
-  `dev.portablefs.oss`, and the OSS app group. FSKit URL routing, lifecycle,
-  readiness, and exact-unmount operations now remain isolated from products
-  embedding the shared engine under a different identity.
-- Linearize local delegation installation against concurrent authority-lane
-  mutations with cancellable subtree/inode claims, including hardlink aliases
-  and descendant grants, closing the same-mount acquire-to-RPC recall race
-  without mount-wide head-of-line blocking. Frontend disconnects now publish
-  an exposed/unacknowledged operation failure before joining blocked handlers,
-  so ownership handoff cannot deadlock during FSKit timeout cleanup.
-- Preserve atomic in-place upgrades from the immediately preceding signed OSS
-  FSKit identity while staged releases remain current-identity-only, and keep
-  the previous public Swift adapter call shapes source-compatible.
+  end: filesystem type `pfs`, generic-resource scheme `dev.portablefs.oss`, and
+  the app group. FSKit URL routing, lifecycle, readiness, and exact-unmount
+  operations remain isolated from products embedding the shared engine under a
+  different identity.
+- Preserve atomic in-place upgrades from the immediately preceding signed FSKit
+  identity while staged releases remain current-identity-only.

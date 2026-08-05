@@ -1,147 +1,168 @@
 # Compatibility
 
-This is the PortableFS v2 stability contract. v2 is a deliberate
-compatibility reset: the previous contract froze package paths, Docker
-images, every environment variable name, and both product generations so
-broadly that meaningful deletion was impossible. v2 freezes the product —
-what deployments and clients depend on — and unfreezes the implementation.
-Names retired at the boundary keep typed tombstones for exactly one
-release.
+This is the PortableFS v3 stability contract.
 
-The reset includes the mount wire. Released v0.1 clients speak `fsproto` v3;
-the current v2 authority speaks v8 and intentionally refuses older
-protocol rather than silently weakening exact-session semantics. Upgrade
-clients and authorities together; PortableFS deliberately fails closed
-instead of carrying a second compatibility execution path.
+## v2 is gone
 
-Every surface is in one of four tiers: **frozen**, **tombstoned**,
-**deprecated for removal**, or **internal**. If a surface is not listed,
-treat it as internal.
+v3 is a breaking reset, not a migration. The v2 product — the remote
+append-only journal, its TypeScript control plane, the client write-back stack,
+and the history, branch, fork, snapshot, and lease surfaces built on them — was
+deleted from the tree, not deprecated. There are no tombstones, because there is
+no service left to answer with one, and there is no conversion path, because
+there is nothing left to convert with.
+
+What survives from v2 is a small amount of local-machine machinery that was
+never journal-specific: mount records, the daemon control socket, the installers,
+and the macOS bundle identity. Persisted v2 attach and lease records are
+recognised and refused with remount-or-discard guidance rather than silently
+reinterpreted.
+
+If you are running v2, v3 is a separate product. Its wire protocol refuses a v2
+client at the handshake rather than negotiating down.
+
+Everything below describes v3 and only v3. If a surface is not listed here,
+treat it as internal and unstable.
 
 ## Frozen
 
-Breaking changes are prohibited. Deployments and clients may pin against
-these.
+Breaking changes are prohibited. Deployments and clients may pin against these.
 
-- **Journal-born volumes.** Every volume is journal-native: the fenced
-  Postgres journal (PFJ3 records, PFC2 controls) is the authority durability
-  layer. Authority-lane replies and successful mount `fsync` barriers are
-  journal-durable; delegated `write(2)` uses standard filesystem semantics
-  and may return before local physical sync. Committed history keeps its
-  content-addressed identity forever.
-- **The Volume API `/v1` surface** as documented in
-  [docs/api.md](./docs/api.md): request/response shapes, error codes, and
-  the token semantics (admin provisioning token, per-tenant bearer tokens,
-  volume-pinned runtime read credentials) — minus the tombstoned routes
-  below. Existing fields are never removed or repurposed; new optional
-  fields may appear and consumers must ignore unknown fields.
-- **The authority manager `/v1` control surface** (ensure/health/stop and
-  the access-lease family) with its fencing semantics
-  (`authorityInstanceId`, manager epochs), plus `/healthz` and `/readyz`
-  on both services. See
-  [docs/authority-manager.md](./docs/authority-manager.md).
-- **Mount transports: Linux FUSE and macOS FSKit.** `portablefs mount`
-  (FUSE through portablefsd) and `swift/PortableFSKit` (FSKit) are the two
-  supported clients. Wire-visible changes ship only behind `fsproto`
-  protocol version negotiation and the versioned `pfslocal`
-  `Hello`/`HelloReply` handshake. Compatible releases interoperate; a
-  wire-incompatible release gets a new exact protocol version and requires a
-  coordinated client/authority upgrade.
-- **PFT2**, the immutable content-addressed base format: the strict
-  canonical object encoding, the digest scheme, and the node kinds. A
-  committed PFT2 object keeps its exact bytes and digest forever. Postgres
-  metadata migrations remain append-only — a released migration file is
-  never edited or reordered.
-- **Postgres 16 or newer is the deployment requirement** for metadata and
-  the journal, self-hosted or managed (synchronous replication for
-  production durability). There is no supported deployment without it.
+### The authority wire
 
-## Tombstones (one release)
+- **Transport is mutually authenticated TLS 1.3**, with ALPN
+  `portablefs-authority-v2` and authority protocol major `2`. Plaintext is
+  refused; there is no fallback mode and no environment escape.
 
-Retired at the v2 boundary. Each keeps a stable, typed refusal for exactly
-one release and then disappears entirely:
+  The names are worth reading carefully, because two version numbers are in play
+  and they do not mean the same thing. `portablefs-authority-v2` and protocol
+  major `2` name the *authority protocol* generation, not the product
+  generation. The v3 product speaks authority protocol 2 because protocol 1 could
+  not express a mandatory attach-time routing revision: a client that cannot
+  state which routing topology it is joining must fail at `Hello` rather than
+  spend a single-use capability and fail later at `Attach`.
 
-- `POST /v1/volumes/:id/exec` (volume API): `410 VOLUME_EXEC_RETIRED`; the
-  body is never parsed and no volume state is read. Mount the volume and
-  run commands locally.
-- `POST /v1/mount-sessions` and `POST /v1/volumes/:id/mount-sessions`
-  (authority manager): `410 MOUNT_SESSION_RETIRED`. Successor:
-  `POST /v1/access-leases/create`.
-- `POST /v1/authorities/session` (authority manager):
-  `410 AUTHORITY_SESSION_RETIRED`. Same successor.
-- Manager registry modes: `PORTABLEFS_AUTHORITY_MODE=env` and `=managed`
-  refuse startup by name (as do the retired `PORTABLEFS_AUTHORITY_URL` and
-  `PORTABLEFS_AUTHORITY_MAP_JSON` variables); `production` is the only
-  mode.
-- The Railway storage spelling: the `railway-bucket` store kind and the
-  `VOLUME_RAILWAY_BUCKET_*` variables alias onto the `s3` store
-  configuration for one release, then disappear.
-- The volume-worker image: `Dockerfile.volume-worker` is gone. Integrity
-  and GC live on the volume API admin surface (`GET /v1/admin/integrity`,
-  `POST /v1/admin/gc`).
+- **Both peers name what they require, and refuse on absence.** A session
+  requires the `xfs-current-state`, `session-exact-epoch`, and `direct-write`
+  features at `Hello`, and `write-through`, `no-history`, `no-branches`,
+  `direct-io-no-file-mmap`, `user-xattr-readonly`, `single-principal`,
+  `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`, and
+  `volume-syncfs-barrier` at `Attach`. These strings are the contract's shape
+  written down: an authority that stopped meeting one of them would be refused
+  rather than silently tolerated.
 
-## Deprecated for removal (the legacy generation)
+- **A wire-incompatible change gets a new exact protocol major and a new ALPN**,
+  and requires a coordinated client and authority upgrade. PortableFS fails
+  closed instead of carrying a second compatibility execution path.
 
-The pre-journal product generation is deprecated and will be deleted in
-the next release. These surfaces accept no new work, new volumes never use
-them, and remaining legacy volumes must be imported (legacy→managed
-conversion) inside this release window:
+- **Requests are object-relative.** Attach returns an opaque root token; lookup
+  takes a parent token and one raw name component. The authority never accepts a
+  host path or a client-supplied inode number, and every token is invalidated at
+  an epoch change.
 
-- **File-WAL authority mode** — the file-log single-node authority as a
-  supported production topology, with its checkpoint and standby
-  machinery. Deployment requires Postgres (see Frozen); the file log
-  survives only as an internal test harness.
-- **NFSv3 serving** (`vcs/internal/server`, `cmd/nfsio`).
-- **The manifest commit plane** — attach-session manifest authoring
-  (attach/checkout/checkin/commit/commit-summary/commit-delta-summary over
-  manifest heads), manifest head/status/diff/wait-head/tree/file reads,
-  manifest blob authoring, and the legacy→managed conversion pipeline
-  itself once the remaining volumes are imported.
-- **The raw `cmd/mount` FUSE client** — `portablefs mount` is the one
-  Linux frontend.
+### Filesystem semantics
 
-Removal follows the process below; during the window these surfaces answer
-typed refusals or deprecation warnings, never silence.
+The guarantees in [docs/consistency-model.md](./docs/consistency-model.md) are
+frozen: write-through acknowledgement, `fsync` on the authoritative descriptor,
+`close` is not an implicit `fsync`, session-exact replay inside an epoch, no
+silent continuation across an epoch, atomic rename, open-after-unlink, and
+independent POSIX record and `flock` lock namespaces.
+
+The explicit refusals are equally frozen, because programs depend on getting an
+errno rather than incoherent data: shared file-backed `mmap`, `setxattr`, device
+nodes, FIFOs, sockets, setuid execution, and cross-volume link and rename.
+
+### Mount transports
+
+Linux mounts through kernel FUSE; macOS mounts through the FSKit extension and
+the `portablefsd` v3 data plane. One transport per platform, no fallback. A host
+that cannot serve its platform's transport fails with guidance rather than
+degrading to a weaker consistency model.
+
+### Declared macOS cache policies
+
+A macOS mount names its cache policy and the authority validates it. Two names
+are declared: `macos26-synchronous-vfs-repair-v1`, the shipping compatibility
+policy, and `fskit-native-revocation-v1`, the macOS 27 native policy, which is
+declared so that it can be refused explicitly rather than approximated. An
+unknown policy fails closed with `ENOTSUP`. A policy name means exactly one set
+of semantics forever; a changed contract gets a new name. See
+[docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
+
+### The routing declaration
+
+`.portablefs/local-dirs` is the single source of a volume's machine-local
+routing. Its rule syntax and its canonicalization — which determines the revision
+hash every mount must agree on — are frozen. Routes are replaced only through the
+authority's admin `ApplyRoutes` compare-and-swap; a mount or a live session on a
+different revision fails closed.
+
+### The CLI surface
+
+`portablefs mount`, `umount`, `mounts`, `route`, `prune-local`, `daemon`,
+`doctor`, `mount-check`, and `version` are the user-facing commands, along with
+`--json` on every one of them and the `PORTABLEFS_MOUNT_TOKEN` environment
+variable. Documented flags keep their meaning; new flags and new JSON fields may
+appear, and consumers must ignore unknown fields. `lifecycle`,
+`internal-root-probe`, `install-macos-app`, and `install-linux-release` are
+installer and app coordination surfaces, not a user contract.
+
+### Release identity
+
+The tag-to-artifact identity chain — SemVer tag, stamped binary version, the
+exact two-binary client archive membership, `checksums.txt`, the published
+attestation bundles, and on macOS the signed bundle identity tuple (team ID,
+bundle identifier, app group, FSKit type `pfs`, resource scheme
+`dev.portablefs.oss`) — is frozen. Clients and installers verify against it. See
+[docs/release-identity.md](./docs/release-identity.md).
 
 ## Evolvable
 
 Additive evolution with versioning; consumers tolerate additions.
 
-- New `/v1` routes and new optional request/response fields.
-- New environment variables (unset must preserve previous behavior).
-- New `fsproto` operations and feature bits behind version negotiation;
-  `pfslocal` minor version bumps.
-- Telemetry and metrics: new series and events may appear; a shipped name
-  keeps its meaning or follows the deprecation path.
+- New authority operations and new feature strings behind the existing
+  handshake, where an authority that lacks them still serves the frozen set.
+- New optional protobuf fields. Unknown fields are not part of the protocol —
+  the canonical request encoding rejects them — so a field is added on both sides
+  or not at all.
+- `pfslocal` minor version bumps. The local protocol between `portablefsd` and
+  the FSKit extension is major 1, currently minor 9, and grows additively.
+- New environment variables, where leaving one unset preserves previous
+  behaviour.
+- New authority bounds and timeouts. Their defaults may change; a deployment that
+  cares pins them explicitly.
+- New telemetry series and events. A shipped name keeps its meaning or follows
+  the deprecation process below.
 
 ## Internal
 
-No stability promise, including in patch releases: Go package paths and
-layout (everything under `vcs/`), TypeScript package internals and
-inter-workspace import shapes, Dockerfile internals and build layout,
-environment knobs not documented in [docs/](./docs/) (operator budgets
-replace toggles over time), test helpers and `packages/testkit`, scripts,
-benchmark harnesses, and documentation wording.
+No stability promise, including in patch releases: Go package paths and layout
+under `vcs/`, Swift package internals under `swift/`, the on-disk shapes of mount
+records and the strict-membership file, environment knobs not documented under
+[docs/](./docs/), test helpers, scripts, benchmark harnesses, and documentation
+wording.
 
 The per-user `portablefsd` HTTP control API is also a private paired-release
-surface. The CLI and menu app require an exact `/v1/identity` match for the
+surface. The CLI and the menu app require an exact `/v1/identity` match for the
 daemon version, executable digest, and control protocol before issuing any
-operational request. This is intentionally stricter than the additive
-`pfslocal` mount-wire policy: an older live daemon is left untouched and the
-operation fails closed until it is cleanly drained.
+operational request. This is deliberately stricter than the additive `pfslocal`
+policy: an older live daemon is left untouched and the operation fails closed
+until it is cleanly drained.
 
-## Changing A Frozen Surface
+## Changing a frozen surface
 
-Frozen does not mean immortal; changes are deliberate and staged:
+Frozen does not mean immortal; changes are deliberate and staged.
 
-1. Propose the change in an issue explaining why additive evolution cannot
-   work.
-2. Ship the replacement additively while the old surface keeps working,
-   and mark the old surface deprecated in docs and release notes.
-3. Keep the deprecated surface for at least one minor release line with a
-   typed warning or refusal where feasible.
+1. Propose the change in an issue explaining why additive evolution cannot work.
+2. Ship the replacement additively while the old surface keeps working, and mark
+   the old surface deprecated in docs and release notes.
+3. Keep the deprecated surface for at least one minor release line, with a typed
+   warning or refusal where feasible.
 4. Remove it only in the next major version.
 
+A protocol-visible change is the exception that skips straight to a new exact
+protocol major: PortableFS would rather refuse a mount at the handshake than
+serve one under a contract neither side can name.
+
 PRs that touch a frozen surface must say so explicitly and explain the
-compatibility story. Reviewers should reject silent changes to anything in
-the frozen list.
+compatibility story. Reviewers should reject silent changes to anything in the
+frozen list.

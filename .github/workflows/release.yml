@@ -144,12 +144,12 @@ jobs:
               }
             ' "$RUNNER_TEMP/member-types-${arch}"
             tar -tzf "$server_archive" >"$RUNNER_TEMP/server-members-${arch}"
-            printf '%s\n' vcs >"$RUNNER_TEMP/expected-server-members-${arch}"
+            printf '%s\n' portablefs-authority >"$RUNNER_TEMP/expected-server-members-${arch}"
             cmp "$RUNNER_TEMP/expected-server-members-${arch}" "$RUNNER_TEMP/server-members-${arch}"
             tar -tvzf "$server_archive" >"$RUNNER_TEMP/server-member-types-${arch}"
             awk '
               $1 !~ /^-/ { exit 1 }
-              $NF != "vcs" { exit 1 }
+              $NF != "portablefs-authority" { exit 1 }
               { count++ }
               END { exit(count != 1) }
             ' "$RUNNER_TEMP/server-member-types-${arch}"

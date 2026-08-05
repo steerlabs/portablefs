@@ -1,185 +1,279 @@
-# Failure Modes
+# Failure modes
 
-> **Frozen v2 document.** These failures describe the retired Postgres-journal
-> authority. The v3 XFS/EBS epoch and fencing model is in
-> [the authoritative-XFS decision](./xfs-authority-architecture.md).
+Status: **v3 failure contract**
 
-## VCS Process Dies
+PortableFS v3 has one durable truth per volume — the XFS instance the authority
+addresses — and one active authority epoch in front of it. Every failure below
+is therefore answered by one of three questions: is the durable filesystem
+still trustworthy, is this epoch still able to serve, and is this one mount
+still a participant. The implementation never mixes those scopes, and neither
+does this document.
 
-In local development, mounted clients disconnect until the VCS restarts. On restart, the VCS
-loads the last committed manifest, replays the local WAL, and resumes from the live-durable
-state it had acknowledged.
+The architectural decision is in
+[xfs-authority-architecture.md](./xfs-authority-architecture.md); the
+application-visible guarantees are in
+[consistency-model.md](./consistency-model.md).
 
-In production, the authority process is a disposable cache over the remote journal: every
-authority-acknowledged write already committed to the fenced PostgreSQL journal before the
-client heard "done". The manager demand-starts a replacement child anywhere; it claims the journal
-generation (fencing any stale writer in the same transaction), cold-replays the immutable base
-plus the retained journal suffix, and serves — no authority-durable write is lost, and there is no
-promotion protocol and no warm standby to keep consistent.
+## Failure scopes
 
-## Mount Process Or Machine Dies
+| scope | what it costs | recovery |
+| --- | --- | --- |
+| storage fatal | the epoch; the process exits | investigate the device/filesystem, then a new epoch |
+| coherence poison | the epoch | a new epoch |
+| participant fenced | one mount's session | that mount revokes itself and remounts |
+| session fenced | one mount's session | remount |
+| ordinary errno | one operation | the application's own error handling |
 
-A delegated `write(2)` is accepted after its frames reach the local WAL file
-descriptor and overlay; it does not wait for physical local sync. The 5 ms /
-4 MiB group-sync normally closes that window quickly. A process crash leaves
-the kernel page cache available to write the tail, but a complete machine
-power loss may lose writes that had not crossed group-sync or `fsync`.
+Responses carry the scope explicitly rather than making the client infer it
+from an errno: `FAILURE_CLASS_STORAGE`, `FAILURE_CLASS_COHERENCE`,
+`FAILURE_CLASS_ROUTES` and `FAILURE_CLASS_INTERNAL`. A bare `EIO` cannot say
+whether the filesystem is gone or the authority merely failed to recognise one
+of its own errors, and those need different operator actions.
 
-`fsync`, synchronize, explicit flush, and clean unmount
-force the local WAL before draining to authority durability. A verified local
-tail replays exactly on the next attach. Recovery never guesses: malformed
-WAL, identity mismatch, or authority conflict remains a typed blocked job for
-an operator.
+## Storage failure fences the store and ends the epoch
 
-Any WAL initialization, append, rotation, checkpoint, group-sync, or explicit
-sync error latches a terminal mount verdict. Every later mutation fails until
-remount; no operation silently becomes write-through and no unrelated scope
-continues around the failed stream.
+`EIO` is the classic device failure, `EUCLEAN` is how XFS surfaces detected
+metadata corruption, `ESHUTDOWN` is a filesystem the kernel already shut down
+after an earlier failure, and `ENOTRECOVERABLE` is terminal state loss. All
+four are treated identically: the store is permanently fenced for this epoch
+and the authority process exits.
 
-## Manager Restart (Session Token Rejection)
+Fencing is not a retry backoff. After it, no mutation is attempted against a
+filesystem whose durable state can no longer be trusted, because continuing to
+serve would mean acknowledging writes that may never have landed. Operator
+guidance: treat the exit as not-ready, investigate the device and filesystem,
+and do not restart-loop a volume onto unhealthy storage.
 
-A manager restart is an epoch handoff, and access-lease session tokens are HMACs keyed per
-(manager epoch, token generation) — so the moment a new epoch claims, EVERY mount's token is
-dead at once. The data-plane router answers a dead token's frame with a one-byte ack `1` and
-closes.
+## Authority death, restart, and epoch change
 
-The mount client treats that ack (or a clean close right after the token frame, before any ack)
-as a typed credential failure, distinct from an ordinary dead socket: redialing with the same
-token can never succeed. It surfaces the failure and does not re-resolve, create a replacement
-lease, or retry through another route. The operator cleanly unmounts, authenticates if needed,
-and mounts again as a new explicit session.
+The authority holds no durable state of its own, so there is no promotion
+protocol, no warm standby to keep consistent, and nothing to replay. A
+replacement mounts the same XFS, increments the epoch, and serves.
 
-The lease keeper is reactive to the same event on its HTTP path: a renew refused with a typed
-terminal code — `ACCESS_LEASE_EPOCH_SUPERSEDED` (which ships as a 503, deliberately overriding
-the "5xx is ambiguous, retry the same operation" rule), `ACCESS_LEASE_NOT_FOUND`,
-`ACCESS_LEASE_EXPIRED`, `ACCESS_LEASE_REVOKED`, `ACCESS_LEASE_RELEASED`, or
-`ACCESS_LEASE_UNAUTHORIZED` — stops that lease and surfaces a terminal mount status. It never
-creates a replacement lease.
+Everything scoped to the old epoch is gone at that instant:
 
-## Authority Loses Its Fencing
+- All object and open-handle capabilities are invalid. Tokens are bound to the
+  epoch by construction, so a stale one is exactly a stale handle: `ESTALE`.
+- All POSIX and `flock` locks are released. They were epoch runtime state.
+- All same-epoch replay slots are gone, which is why no mutation is continued
+  across the boundary.
+- All server file descriptors are closed. An unlinked-but-still-open file whose
+  last name was already removed is destroyed by XFS at that point and cannot be
+  recovered; holders receive `ESTALE`/`EIO`. See
+  [open-after-unlink.md](./open-after-unlink.md).
 
-A child that loses its writer lease, its manager lease pipe (EOF, a stale or foreign frame, a
-lease deadline passing without a database-grounded extension), or its journal fencing must stop
-serving the data plane and report not-ready. The journal rejects appends and suspends from a
-superseded manager/runtime binding at the database, so a deposed authority cannot advance the
-branch after a replacement has claimed — even if its process lingers.
+What survives is exactly what XFS made durable, plus the durable strict-mount
+membership record described below. `TestUnmountRemountObservesDurableState` in
+the privileged suite pins the first half of that.
 
-## Journal Append Failure
+## A lost reply is UNCERTAIN, not a retry
 
-If the authority cannot commit a mutation to its durable log — the remote journal in
-production, the local WAL in development — it must fail the filesystem operation rather than
-acknowledge a write it cannot prove durable. A proven fence, conflict, or integrity failure
-poisons the log handle: the node fences its data plane and a replacement recovers from the
-journal instead of the poisoned process state.
+A connection can die after XFS has already applied a mutation but before its
+reply arrives. The authority does not invent an errno for that, and the client
+does not replay it into a new epoch.
 
-## Checkpoint Fails After Blob Upload
+The response carries an explicit `uncertain` marker, and the server-side marker
+`ErrOutcomeUncertain` (`vcs/internal/xfsstore`) deliberately carries no errno of
+its own, so an uncertain outcome can never be mistaken for the storage `EIO`
+that fences a volume. The application observes a definite error and inspects
+current state to decide what happened. Append offsets and namespace outcomes
+are never guessed.
 
-Uploaded blobs may become orphaned if the metadata commit never lands. The live filesystem state
-remains in the VCS working tree and WAL, and the branch head remains unchanged. A later checkpoint
-can reuse or re-upload the same content-addressed blobs and commit normally.
+Inside a live epoch the opposite holds: duplicate delivery returns the recorded
+outcome from the session's replay slot and never re-executes.
 
-## Railway Bucket Failure
+## Session fencing
 
-Blob upload or download failure affects history materialization or cold content fetch, not the
-already acknowledged live journal state. The branch head does not advance until required
-content is present and verified.
+A mount session ends — every further operation from it fails, and the mount
+must remount — for these reasons:
 
-## Postgres Failure
+- **Proven client-state loss.** A replay slot identity reused with a different
+  request (`ErrRequestMismatch`), or a slot sequence that gapped
+  (`ErrSequenceGap`). Interleaving with lost state would be undefined, so the
+  authority refuses to execute anything further from that session.
+- **A slot outside the negotiated range** (`ErrSlotRange`).
+- **Session lease expiry.** Keepalive is a liveness proof; a session that stops
+  renewing is reaped along with its locks and handles.
+- **Capability expiry.** A capability's validity window is an absolute session
+  deadline. Keepalive cannot renew it — issue a new credential and mount again.
+- **Strict participant fencing**, below.
 
-In production the journal database IS the durability layer: while it is unavailable or cannot
-prove its durability evidence, authority-lane writes and durability barriers fail loudly.
-Already authority-durable writes stay safe in the journal; a delegated mount may continue to
-accept into its bounded local WAL until its own health or capacity gate refuses more. Metadata operations
-— lease renewal, branch-head reads, snapshots, forks, history — fail while their database is
-unavailable; an authority that cannot renew self-fences before its lease expires. In
-development, authority-acknowledged writes remain WAL-durable locally but cannot become
-checkpoint-durable until metadata commits resume.
+A fenced session never re-establishes itself under the same identity. A zombie
+that minted a fresh generation could overwrite its successor's work.
+`TestSessionExpiryReleasesABlockedLockWait` pins that a blocked lock waiter is
+released rather than left hanging when its session ends, and
+`TestAuthorityLossFailsCleanlyInsteadOfHanging` pins the same property for the
+authority disappearing underneath a mount.
 
-## Local Disk Full
+## A lost strict participant is fenced individually
 
-A managed production authority child keeps no persistent local files — its
-disk pressure affects only RAM-bounded caches and temp space. Mounts do keep
-their delegated stream WAL locally. If that store cannot initialize, append,
-rotate, checkpoint, or sync, the mount seals its full mutation gate and
-reports a sticky unhealthy verdict; it does not redirect writes to the
-authority. In development, an authority-local WAL failure likewise fails the
-operation and should report unhealthy/not-ready. Previously committed branch
-history remains intact.
+This is the availability decision that matters most in a multi-mount volume: a
+single dead cached frontend must not freeze the volume.
 
-## Cache Corruption
+A broken session, a missed repair budget, or an acknowledgement-cursor
+violation removes exactly that mount from admission to later visibility
+barriers and ends its authority session immediately through the
+`SessionFencer`. The volume keeps serving; the running mutation completes.
 
-The VCS and API verify cached blobs and chunks by digest before serving them. A corrupt cache entry
-is discarded and refetched. Cache files are acceleration only; the durable records are the journal
-(the local WAL in development) for live state and content-addressed blobs plus Postgres metadata
-for committed history.
+The obligation already held by that running mutation is retained for one full
+additional declared repair-budget grace and then discharged. A failed
+participant therefore costs at most two budgets — one phase deadline plus one
+fencing grace — rather than an unbounded volume outage. The grace is
+load-bearing only when the frontend can prove its old kernel cache became
+unservable before the grace ends.
 
-## Lost Reply (UNKNOWN Mutation Outcome)
+Linux proves it (below). The macOS frontend does not yet: the current Swift
+watchdog terminates protocol participation but does not prove kernel
+withdrawal, so the production FSKit resolve guard remains closed. The unmet
+gates are enumerated in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
-A connection can die after a mutation was durably prepared but before its reply arrived. The
-authority never invents an errno for such a request — it drops the connection — and the mount
-parks the mutation's exact-once identity and replays the identical bytes until it gets a definite
-answer: the original execution's stored outcome, a stored rejection, or a session fence. The
-caller that was blocked on the mutation sees a definite error after the foreground budget
-(`mutation outcome unknown; identity parked for replay`), but the identity keeps replaying in the
-background and lands at most once.
+Participant-scoped fencing is reported to the client as `ESTALE`, never as a
+volume-wide I/O failure, precisely because the volume is unaffected.
 
-Operator guidance: parked identities resolve by exact replay across authority
-restarts and failover (against whichever authority holds the durable log);
-this is completion of the original identity, not inferred repair. A mount logging repeated
-replay attempts indicates the authority is unreachable or cannot record durably (a poisoned
-log) — resolve the authority; do not restart the mount to "clear" it, since a remount abandons
-the mount's session and its parked identities resolve as fenced.
+## Linux self-revocation
 
-## Session Fence (ESTALE)
+When a strict Linux mount learns it can no longer repair, `Mount.revoke`
+(`vcs/internal/fusev3/coherence_linux.go`) makes the stale cache unservable in
+three steps, strongest first:
 
-A mount session generation is fenced — every further mutation from it fails ESTALE — for exactly
-these reasons:
+1. every new request is refused synchronously, before the call returns;
+2. the mount point is detached with `MNT_DETACH`, so the tree is unreachable
+   from the namespace root in one syscall, and every published kernel binding
+   is withdrawn within the declared repair budget;
+3. the FUSE connection is aborted through
+   `/sys/fs/fuse/connections/<minor>/abort`, after which there is no request
+   this frontend could answer wrongly at all.
 
-- **Lease expiry.** The mount stopped renewing (crashed, partitioned past the lease TTL). The
-  sweeper durably fences the session and releases its locks and delegations.
-- **Supersession.** A newer generation of the same session id established (a remount of the same
-  volume identity).
-- **Voluntary expire.** A clean unmount expires its own session.
-- **Proven client-state corruption.** An identity was replayed with different content, or the
-  slot sequence gapped. The authority refuses to execute anything further from that generation
-  because interleaving with the lost state would be undefined.
+Afterwards the mount reports `ENOTCONN`. That is the exact truth: this frontend
+is no longer connected to anything it may speak for.
 
-A fenced mount never re-establishes itself: a zombie that auto-minted a fresh generation could
-overwrite its successor's writes. Operator guidance: remount. The fence is durable — it survives
-authority restarts — and the fenced mount's write-back records are kept locally (never applied,
-never compacted away) so nothing is silently lost.
+## Coherence poison
 
-## Manifest-Only Rebuild (Catastrophic Recovery)
+Poison is reserved for authority-internal invariant violations — a COMPLETE
+naming a coordinate that PREPARE did not, a participant found holding two
+outstanding events. Those are defects no mount can cause, and no client input
+can trigger. `ErrVisibilityPoisoned` is permanent for the epoch and recovery
+requires a new one.
 
-Rebuilding an authority from only a committed base — a fresh journal generation with no
-retained suffix, or a fresh WAL in development — loses journaled control state: sessions,
-exact-once outcomes, and flush watermarks. Under `VCS_REQUIRE_EXACT_SESSIONS=1` (the managed
-posture) the authority then fails closed — straggler flushes without a live authenticated
-session are fenced ESTALE and apply nothing. Under the permissive development default a
-straggler flush would reset its dedup cursor, so after a catastrophic rebuild prefer the
-fail-closed posture until mounts have re-established.
+The distinction from participant fencing is deliberate and must stay that way:
+one is a peer that died, the other is a bug in the coordinator. Collapsing them
+would either turn a dead laptop into a volume outage or turn a coordinator
+defect into silently degraded coherence.
 
-## Delegation Conflict
+## Durable strict-mount membership and restart refusal
 
-The authority can reject conflicting subtree checkout attempts or force-revoke a stale holder.
-Force revocation fences the old holder so delayed flushes from that owner cannot overwrite the new
-owner's state.
+Durable membership is the one piece of authority state that outlives an epoch.
+It records only which cached kernel mounts a previous epoch admitted — no
+paths, inodes, bytes, mutations, or history — and it exists so a *replacement*
+authority cannot start serving underneath a kernel cache that is still live on
+some machine.
 
-## Concurrent Reader During Checkpoint
+- It is deliberately **not** cleared by fencing. A fenced mount is gone from
+  this epoch's barrier while still recorded.
+- Only a session-bound mount-absence proof accepted by the configured
+  verifier deactivates a record. With
+  `--mount-absence-verify-command` unset, clean detach always fails closed: a
+  syntactically plausible client blob is not evidence.
+- On startup, a replacement authority refuses to serve until every recorded
+  prior strict kernel mount is proven absent, or the operator asserts
+  `--prior-strict-mounts-fenced` once after the control plane has actually
+  fenced those hosts.
 
-Mounted readers see the live VCS tree. Committed-history readers see the old branch head until the
-checkpoint metadata transaction commits. They do not see partial checkpoint blobs or manifests.
+Availability is preserved inside an epoch and paid for across one. Never set
+`--prior-strict-mounts-fenced` merely because the authority process or its
+network connection stopped; a dead socket is not proof that a kernel cache is
+unservable. Deployment detail is in
+[xfs-authority-deployment.md](./xfs-authority-deployment.md).
 
-## Snapshot During Active Session
+## Mount process or machine dies
 
-On a base-authoring branch, snapshots pin the committed branch head. On a journal-served (live)
-branch, a snapshot records a HistoryCut at the current journal position — every
-authority-visible write up to the cut is captured — and materializes asynchronously; the record lists as pending
-until ready, and a cut that fails to materialize is definitively `failed` (create a fresh one).
+A v3 mount holds no durability debt: every acknowledged write was already
+applied to XFS before `write(2)` returned. A dead mount therefore loses
+nothing that was acknowledged. What it loses is its session — locks, handles,
+and any unlinked-but-open inode whose last name was already removed.
 
-## Retired Server-Side Exec
+Surviving mounts are unaffected. The coherence matrix asserts that directly
+with `peer_loss_does_not_break_surviving_mount`, which is only possible because
+the mounts are separate OS processes that can be killed uncleanly.
 
-The Volume API never runs tenant commands. The retained `/exec` route answers
-`410 VOLUME_EXEC_RETIRED` before parsing its body or reading volume state.
-Commands run through a mount in the caller's own isolation boundary, so command
-failure has ordinary mounted-filesystem semantics.
+## Capacity, quota, and admission
+
+- **Quota and disk exhaustion surface as the kernel's own `EDQUOT` and
+  `ENOSPC`.** They are ordinary operation failures. They do not fence the store
+  and are not in the fatal-storage set.
+- **`statfs` retains the ordinary local-XFS meaning** of cell-wide physical
+  capacity. Purchased per-volume entitlement is reported by quota and billing
+  APIs, not by `statfs`.
+- **Deployment-sized bounds** on live sessions, replay slots, lock records,
+  in-flight requests, frame allocations, descriptors, tasks, and memory are
+  denial-of-service admission controls, not filesystem-size limits. Reaching one
+  answers `EAGAIN`. Because launch isolates one worker per volume, exhausting
+  them can fail that volume but cannot consume another tenant's worker state.
+
+## Routing revision mismatch
+
+`.portablefs/local-dirs` is volume-wide configuration replaced only through the
+authority's admin `ApplyRoutes`, which canonicalizes the declaration and
+compare-and-swaps its revision. An attach or an existing session on a different
+revision fails closed.
+
+The refusal is recoverable without spending a single-use capability: the
+routing check runs *before* the capability is verified, and the refusal carries
+the volume's active canonical rules, so a mount adopts them and attaches again
+on the same capability. A second refusal is a real disagreement and is surfaced
+verbatim; `routes_revision_mismatch` in the coherence matrix asserts that
+contract including the attempt count. A routing change applied while mounts are
+live revokes them with a remount message rather than letting two machines
+disagree about which paths are shared.
+
+## Launch topology
+
+Launch is one Nitro EC2 instance and one encrypted, non-Multi-Attach EBS volume
+formatted XFS, with `DeleteOnTermination=false` so the volume outlives the
+instance. This is single-AZ durable storage, **not** cross-AZ HA. EBS
+replicates within one AZ; SLOs must use that fact rather than call one volume a
+replica set.
+
+Instance replacement is manual and ordered: prove the previous process cannot
+write, detach, attach in the same AZ, mount XFS and let journal replay finish,
+start a fresh epoch, publish the endpoint. There is no automatic second writer.
+
+Heartbeats, DNS, and leases do not fence an old writer. Force-detach is an
+emergency action, not a promotion protocol. Do not call EBS Multi-Attach a
+replica and do not mount ordinary XFS read-write on two hosts. Optional
+active-passive HA is a separate topology requiring independent fencing,
+one-writer enforcement, epoch advancement, and destructive split-brain tests
+before it is credible.
+
+Backups are disaster recovery, not a failure mode of the filesystem: they
+protect against deletion, bugs, compromised credentials, and operator error —
+the failures a live replica would faithfully copy. A snapshot is never mounted
+inside the live namespace and users see no version history. See
+[xfs-authority-deployment.md](./xfs-authority-deployment.md).
+
+## What this contract does not promise
+
+- Transparent exactly-once mutation across authority death. An uncertain
+  outcome is reported as uncertain.
+- Recovery of unlinked-but-open file content across an epoch change.
+- Cross-AZ high availability at launch.
+- Automatic failover of any kind.
+- That a macOS frontend can currently prove kernel withdrawal within the
+  fencing grace.
+
+## Verification
+
+These are the executable gates, not inspection:
+
+```bash
+bash scripts/verify-local.sh            # the single local merge gate
+bash scripts/xfs-fuse-integration.sh    # privileged Linux: real XFS + kernel FUSE
+bash scripts/coherence-matrix-linux.sh  # black-box two-mount matrix, with controls
+```
+
+The privileged suite enumerates every test that must actually run and pass; a
+required test that is renamed, deleted, or skipped fails the job rather than
+quietly shrinking coverage. The coherence matrix proves a red result is
+reachable — a disjoint-namespace phase and a first-success stale-view phase —
+before it reports a green one.
