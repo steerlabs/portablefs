@@ -86,18 +86,14 @@ final class PortableFSCLILease: @unchecked Sendable {
     }
 }
 
-struct PortableFSCLIMount: Decodable, Sendable {
-    let ok: Bool
-    let mountPath: String
-    let volumeId: String
-    let branch: String
-    let attachRef: String?
-}
-
 typealias PortableFSCLIMountRow = PortableFSMountInventoryRow
 
 private struct PortableFSCLIMounts: Decodable {
     let mounts: [PortableFSCLIMountRow]
+}
+
+private struct PortableFSCLIVersion: Decodable {
+    let version: String
 }
 
 struct PortableFSCLIError: LocalizedError, Sendable {
@@ -113,20 +109,15 @@ struct PortableFSCLIError: LocalizedError, Sendable {
     }
 }
 
-/// Strict subprocess boundary to the one bundled mount implementation.
+/// Strict subprocess boundary to the one bundled PortableFS implementation.
+///
+/// The app never mounts. A v3 mount is admitted by direct credentials — an
+/// authority address, a single-use volume capability, and a mutual-TLS client
+/// identity — which the app neither holds nor can mint, so `portablefs mount`
+/// is deliberately absent here. What the app owns is the lifecycle of mounts
+/// that already exist: inventory, unmount, and the per-user daemon.
 struct PortableFSCLI: Sendable {
     private let decoder = JSONDecoder()
-
-    func mount(volumeID: String, branch: String, mountPath: String) async throws -> PortableFSCLIMount {
-        let data = try await run([
-            "mount",
-            volumeID,
-            mountPath,
-            "--branch", branch,
-            "--json"
-        ])
-        return try decode(PortableFSCLIMount.self, from: data, command: "portablefs mount")
-    }
 
     func unmount(mountPath: String) async throws {
         _ = try await run(["umount", mountPath, "--json"])
@@ -149,17 +140,28 @@ struct PortableFSCLI: Sendable {
         return rows
     }
 
+    /// Stops the per-user daemon, which the CLI refuses unless the daemon
+    /// atomically proves itself idle. A daemon still serving an attach is a
+    /// conflict, not something the app escalates past.
+    func stopDaemon() async throws {
+        _ = try await run(["daemon", "stop", "--json"])
+    }
+
+    /// Version of the exact bundled CLI, which is also the version of the
+    /// daemon and FSKit extension it will admit.
+    func version() async throws -> String {
+        let data = try await run(["version", "--json"])
+        return try decode(
+            PortableFSCLIVersion.self,
+            from: data,
+            command: "portablefs version"
+        ).version
+    }
+
     func holdLifecycle() async throws -> PortableFSCLILease {
         try await hold(
             arguments: ["lifecycle", "hold-shared", "--json"],
             expectedReadiness: #"{"schemaVersion":1,"held":true}"#
-        )
-    }
-
-    func holdAccountExclusive() async throws -> PortableFSCLILease {
-        try await hold(
-            arguments: ["lifecycle", "hold-account-exclusive", "--json"],
-            expectedReadiness: #"{"schemaVersion":1,"held":true,"mounts":0,"attaches":0}"#
         )
     }
 

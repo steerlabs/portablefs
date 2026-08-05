@@ -1,12 +1,31 @@
 # Replicated Readable Store Exploration
 
-> **Concluded exploration.** The segmented prototype remains useful measured
-> evidence, but its stop rule fired and it is not the PortableFS v3 runtime.
-> The successor design uses an ordinary authoritative XFS directory; see
+> **Concluded exploration — historical record, not a live proposal.**
+>
+> This document is preserved for the reasoning and the measurements, not as a
+> plan. Its stop rule fired and the replicated readable store is not the
+> PortableFS v3 runtime; the successor design uses an ordinary authoritative XFS
+> directory, and that decision is recorded in
 > [xfs-authority-architecture.md](./xfs-authority-architecture.md).
+>
+> **Every path this document names below has to be read historically.** The
+> segmented-log measurement spike it cites, `vcs/spikes/direct-store-seglog`,
+> was removed at commit `dba5b8f` ("v3: remove the v2 architecture entirely"),
+> so its numbers can no longer be reproduced from this tree. So were the v2
+> packages it inventories as work that would shrink or disappear — the remote
+> journal, history cut and materialization, the dirty fold and its pacing
+> controller, the `vcs/cmd/vcs` command, and the TypeScript volume API and
+> metadata database. They were deleted outright rather than superseded in place.
+> Only one artifact from the exploration still exists in the tree:
+> `vcs/spikes/directstore-stable-boundary`, which is discussed in
+> [direct-store-consensus-evaluation.md](./direct-store-consensus-evaluation.md).
+>
+> The original status line said this document does not change the v2
+> architecture. That is no longer a meaningful statement: v2 no longer exists.
+> Nothing here describes the current system, and nothing here should be read as
+> a commitment about it.
 
-Status: design only. This document proposes an additive experiment; it does
-not change the v2 architecture or compatibility contract.
+The body below is unedited.
 
 ## Decision summary
 

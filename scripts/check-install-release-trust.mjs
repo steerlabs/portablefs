@@ -145,7 +145,7 @@ requireText(
 );
 for (const serverArchiveContract of [
   'server_archive="dist/portablefs-server_${version}_linux_${arch}.tar.gz"',
-  "printf '%s\\n' vcs",
+  "printf '%s\\n' portablefs-authority",
   '"$RUNNER_TEMP/server-member-types-${arch}"',
 ]) {
   requireText(workflow, serverArchiveContract, `exact server archive contract ${serverArchiveContract}`);

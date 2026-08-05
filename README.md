@@ -1,137 +1,232 @@
 # PortableFS
 
-PortableFS makes one durable workspace appear as an ordinary, live directory
-on multiple machines. Every mount reads and writes the same current filesystem;
-there are no branches, merges, commits, or user-visible history.
+PortableFS makes one durable workspace appear as an ordinary, live directory on
+several machines at once. Every mount reads and writes the same current
+filesystem. There are no commits, no branches, and no user-visible history: the
+mounted tree is the product.
 
-## v3 root architecture
+One volume is one XFS project directory on one Linux host, served by one
+`portablefs-authority` process. XFS is the only durable filesystem truth.
+PortableFS adds authentication, object capabilities, session-exact replay,
+distributed POSIX locks, and — for cached frontends — a synchronous visibility
+barrier. It adds no second inode tree, no mutation log, no checkpoint format,
+and no write-back cache.
 
 ```text
-Linux FUSE mount       macOS 27+ FSKit mount
-        \                    /
-         authenticated TLS RPC
-                  |
-       one active authority per volume
-                  |
-       descriptor-relative Linux syscalls
-                  |
-     one project-quota directory on XFS
-                  |
-          encrypted SSD / EBS
+Linux FUSE mount            macOS FSKit mount
+       \                          /
+        mutually authenticated TLS 1.3
+                     |
+        portablefs-authority (one per volume)
+                     |
+         descriptor-relative Linux syscalls
+                     |
+        one XFS project directory (PROJINHERIT)
+                     |
+              encrypted SSD / EBS
 ```
 
-XFS is the durable filesystem truth. The authority is a disposable,
-single-epoch coordinator for authentication, opaque object handles, retained
-open file descriptions, same-epoch request replay, cancellation, and POSIX
-advisory locks. It does not contain a second inode tree, custom storage engine,
-permanent operation log, checkpoint format, branch graph, or write-back cache.
+## What a two-machine demo looks like
 
-Normal filesystem durability rules apply:
-
-- `write` returns after the authority has applied the reported bytes to XFS;
-- `fsync`/`fdatasync` waits for the authoritative server descriptor;
-- `close` does not imply `fsync`;
-- atomic rename decides whole-file replacement conflicts; and
-- open descriptors continue working after unlink until final close.
-
-Distributed POSIX record locks and BSD `flock` are authority runtime state;
-normal close/flush cleanup is forwarded to the same authority, and all locks
-disappear at the epoch boundary.
-
-The full design, failure model, security boundaries, HA choices, and proof
-gates are in [the v3 architecture decision](./docs/xfs-authority-architecture.md).
-The decision also records the current regular-FUSE `syncfs(2)` platform gap;
-applications use file and directory `fsync` when they require durability.
-
-## Current implementation
-
-The greenfield v3 path lives beside the frozen v2 implementation until its
-production gates are complete:
-
-- `vcs/internal/xfsstore`: XFS-only, descriptor-relative volume backend;
-- `proto/authority/v1`: bounded branchless protobuf protocol;
-- `vcs/internal/volumeserver`: epoch sessions, replay slots, cancellation,
-  locks, fail-closed strict-cache barriers, and runtime cleanup;
-- `vcs/internal/authorityrpc`: TLS 1.3/mTLS transport and XFS request handler;
-- `vcs/internal/volumecap`: signed, short-lived, volume- and peer-bound access
-  capabilities;
-- `vcs/internal/fusev3`: exact Linux frontend with direct file I/O, a
-  synchronous strict name/attribute cache profile, and an uncached profile;
-  and
-- `vcs/cmd/portablefs-authority` and `vcs/cmd/portablefs-mount-v3`: standalone
-  authority and mount binaries.
-
-These binaries are the semantic/integration surface, not yet a production
-control plane. The retained authority manager issues branch-bound renewable v2
-HMAC leases and proxies the v2 transport; it neither provisions XFS authority
-workers nor issues the end-to-end client identity and SPKI-bound Ed25519 grant
-that v3 requires. The standalone grant also has an absolute, non-renewable
-deadline (15 minutes by default), and an Attach reply lost after the one-time
-grant is consumed is not yet replayable. Production registration therefore
-requires an additive branchless v3 mount-grant/runtime contract, exact Attach
-replay, and in-session reauthorization shared by Linux and macOS.
-
-Linux is the first exact frontend. The mount binary defaults to `strict`: file
-data stays direct-I/O, while names and attributes use bounded lifetimes backed
-by the authority's synchronous PREPARE/apply/COMPLETE visibility barrier. The
-`uncached` profile keeps zero name and attribute TTLs. Both profiles pass the
-same two-mount behavior matrix; strict additionally proves that repeated path
-walks avoid authority lookups without weakening the observable result.
-Shared file-backed `mmap` is explicitly unsupported because PortableFS does not
-advertise the FUSE capability that would allow shared mapped pages on a
-direct-I/O inode. `MAP_PRIVATE` remains available with normal process-local
-copy-on-write semantics; it is not a shared write path, and visibility of later
-external file changes is unspecified just as it is for ordinary filesystems.
-PortableFS does not silently substitute incoherent page caching. macOS 27 is
-the primary FSKit architecture: Apple added module-initiated synchronous cache
-state control in its June 2026 beta SDK. Production support remains gated on
-the final SDK and the namespace, negative-name, data-cache, and failure matrix;
-the documented data-cache API alone is not proof of every namespace cache
-transition.
-
-The authority now contains the exact two-phase protocol and durable
-strict-mount membership needed by a cached frontend. pfslocal minor 8 carries
-that ordered contract, and minor 9 adds a frontend-demanded end-to-end liveness
-proof, to a tested Swift transport without exposing authority credentials to
-the extension. A standalone portablefsd v3 data plane now maps
-the FSKit operation surface to the authority, including incarnation-stable XFS
-identity, readdir-plus items, source publication IDs, keepalive, and a real
-authority `syncfs(2)` barrier. It is deliberately not registered as a production
-attach yet. The production volume continues to refuse a v3 resolve until that
-composition, both local indexes, the callback barrier, and the native macOS 27
-handler are installed; it cannot advertise strict participation and ignore
-events.
-
-A separately selected macOS 26 synchronous-VFS-repair policy exercises the
-same contract, including the initiating-callback deadlock boundary, but Apple
-exposes no general invalidation primitive on that release and its remaining
-live-kernel proofs have not passed. It is an explicit compatibility policy,
-never an automatic fallback, and not a claim that macOS 26 multi-writer mounting
-is production-ready. See the
-[macOS 26 coherence contract](./docs/macos-26-coherence-contract.md).
-
-## Build and test
+Two machines mount the same volume with direct credentials — an authority
+address, a single-use capability, and a mutual-TLS client identity. There is no
+control plane in between.
 
 ```bash
-bash scripts/verify-local.sh
+# machine A
+portablefs mount my-workspace ~/work \
+  --addr 10.0.0.7:2050 --mount-token "$PORTABLEFS_MOUNT_TOKEN" \
+  --data-plane-transport tls-private-ca --data-plane-server-name authority.internal \
+  --data-plane-ca ca.pem --client-cert a.pem --client-key a.key
 
-go -C vcs test -race ./internal/authorityrpc ./internal/volumeserver \
-  ./internal/volumecap ./internal/xfsstore
-
-GOOS=linux GOARCH=amd64 go -C vcs build \
-  ./cmd/portablefs-authority ./cmd/portablefs-mount-v3
+# machine B, same volume, its own capability and identity
+portablefs mount my-workspace /mnt/work \
+  --addr 10.0.0.7:2050 --mount-token "$PORTABLEFS_MOUNT_TOKEN" \
+  --data-plane-transport tls-private-ca --data-plane-server-name authority.internal \
+  --data-plane-ca ca.pem --client-cert b.pem --client-key b.key
 ```
 
-The privileged Linux gate creates a disposable project-quota XFS filesystem
-and two real kernel mounts. It verifies cross-mount visibility,
-open-after-unlink, rejection of shared file-backed `mmap` and user-xattr writes,
-locks, paged enumeration, Git integrity, and SQLite rollback-journal behavior. See the
-environment-gated integration test in
-`vcs/internal/fusev3/integration_linux_test.go`.
+A file created on A is visible on B. `write(2)` on either mount returns only
+after the authority has applied the bytes to XFS, so there is no window in which
+one machine has acknowledged data the other cannot see. `portablefs umount
+<path>` drains and detaches.
 
-The previous v2 contract remains frozen as documented in
-[COMPATIBILITY.md](./COMPATIBILITY.md). v2 and v3 reject one another at the
-protocol handshake; this work does not silently reinterpret existing volumes.
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh
+```
+
+`PORTABLEFS_VERSION` pins a release; `PORTABLEFS_INSTALL_DIR` chooses the
+activation-link directory (default `~/.local/bin`).
+
+On Linux the installer downloads the two-binary client archive
+(`portablefs` and `portablefsd`), verifies its SHA-256 against `checksums.txt`,
+and verifies the published GitHub artifact attestation with a pinned, digest-
+checked `gh` — bound to the exact repository, the exact release workflow, the
+exact tag, and non-self-hosted runners — **before** extracting anything. The
+archive's member list must be exactly those two regular files. Both binaries
+must then print the expected version. Activation is a lock-held atomic symlink
+swap performed by the verified binary itself.
+
+On macOS there is no standalone CLI. PortableFS ships only as the notarized
+`PortableFS.app`, which carries the CLI, the `portablefsd` daemon, and the FSKit
+extension as one signed unit. The installer audits the zip before extraction,
+then checks the Developer ID signature, the hardened runtime, Gatekeeper
+assessment, and the exact bundle identity: team ID, bundle identifier, app
+group, FSKit type, and resource scheme, with the CLI, daemon, and extension all
+agreeing on that tuple. Enabling the extension under System Settings is a
+one-time manual step Apple does not let an installer perform.
+
+What establishes a release's identity, and the one known gap in the release
+pipeline, is in [docs/release-identity.md](./docs/release-identity.md).
+
+## Quickstart: run your own volume
+
+Provision an XFS project directory on a dedicated XFS mount that carries
+`prjquota` and `nodev,nosuid,noexec,noatime`:
+
+```bash
+sudo scripts/provision-xfs-volume.sh /srv/portablefs my-workspace 42001 200001 200001 100g 10000000
+```
+
+Run the authority as the volume's service account. It refuses to run as root.
+
+```bash
+portablefs-authority \
+  -listen 0.0.0.0:2050 \
+  -volume-id my-workspace \
+  -root /srv/portablefs/my-workspace \
+  -project-id 42001 \
+  -tls-cert server.pem -tls-key server.key \
+  -client-ca clients-ca.pem \
+  -capability-public-key capability.pub.pem \
+  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership \
+  -mount-absence-verify-command /usr/local/libexec/portablefs-verify-absence
+```
+
+Then mount it, as above. Without `-mount-absence-verify-command` a clean detach
+always fails closed: the authority cannot observe a remote kernel's mount table,
+so every restart after a strict mount then depends on the operator asserting
+`-prior-strict-mounts-fenced`.
+
+Full operator guidance — provisioning, credentials, bounds, restart, and backups
+— is in [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md).
+
+## What PortableFS guarantees
+
+- **XFS is the truth.** There is no PortableFS journal, manifest, checkpoint, or
+  content index. XFS's own metadata journal is a crash-recovery mechanism inside
+  XFS; it is not PortableFS history and is not user-visible.
+- **Writes are through.** A successful `write(2)` means the authority applied the
+  reported bytes to authoritative XFS state. No acknowledged byte lives only in
+  a client cache.
+- **`fsync` means fsync.** A successful `fsync`/`fdatasync` means the authority
+  completed it on the authoritative open file description. `close` is not an
+  implicit `fsync`. On regular FUSE, `syncfs(2)` does not reach the authority at
+  all, so applications that need a durability boundary use file and directory
+  `fsync`.
+- **Execution is session-exact.** Duplicate delivery inside a live epoch returns
+  the retained outcome from a replay slot and never re-executes. Nothing is
+  silently continued across an epoch: a mutation whose reply is lost to authority
+  death is reported `UNCERTAIN`, and the application inspects current state.
+  Transparent exactly-once across server death is not claimed.
+- **Visibility is two-phase for cached mounts.** With a strict frontend attached,
+  a cache-affecting mutation quiesces every participant, applies to XFS, repairs
+  and collects acknowledgements, and only then returns. A mount that misses its
+  declared repair budget is fenced individually; the volume keeps serving.
+- **POSIX stays POSIX.** Atomic rename decides whole-file replacement. Open
+  descriptors keep working after unlink until final close. POSIX record locks and
+  BSD `flock` are distributed and independent of each other.
+
+## What PortableFS is not
+
+- **Not versioned storage.** No history, forks, branches, snapshots, commits, or
+  `adopt`. That was the v2 product, and the v3 reset removed it and its entire
+  journal architecture and control plane. See [COMPATIBILITY.md](./COMPATIBILITY.md).
+- **Not eventually consistent.** There is no asynchronous invalidation stream
+  that a reader can race. Either a mount holds no cached state for a name, or the
+  authority repaired it synchronously before the mutation returned.
+- **Not offline-capable.** There is no local write-back tail to replay. A mount
+  that cannot reach its authority stops serving rather than diverging.
+- **Not a multi-user filesystem yet.** A volume is single-principal: every inode
+  is owned by the volume worker's service UID/GID, and each mount projects that
+  principal onto its local user.
+- **Not a home for shared file-backed `mmap` or SQLite WAL.** `MAP_SHARED` on a
+  file is refused rather than served incoherently, and SQLite's WAL mode requires
+  every participant to be on one host.
+
+## Platforms
+
+| Platform | Transport | Status |
+| --- | --- | --- |
+| Linux | kernel FUSE (`vcs/internal/fusev3`) | Production path. `strict` (default) and `uncached` profiles; proven by the privileged XFS + kernel-FUSE gate and the two-mount coherence matrix. |
+| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Runs under the declared compatibility cache policy `macos26-synchronous-vfs-repair-v1`. Bounded semantics, an accepted residual race, and live-kernel gates that have not been run. |
+| macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. No implementation exists; gated on the final SDK. Selecting the native policy today fails closed with `ENOTSUP`. |
+
+The macOS 26 policy is an explicitly declared, owner-accepted compatibility
+policy with a stated fidelity target — never an automatic fallback and never a
+silent downgrade. Its exact contract, its residual race, and the list of proofs
+that still require a live kernel are in
+[docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
+
+## Development and verification
+
+```bash
+bash scripts/verify-local.sh        # the single local merge gate
+```
+
+`verify-local.sh` runs cross-OS Go builds and vet, the Go suite, the Go race
+suite, the Swift suite (`swift test --package-path swift/PortableFSKit --parallel
+--num-workers 1`; `--num-workers 1` is required, not a tuning knob), the
+release-trust policy checkers, and a stale-architecture scan.
+
+Deeper gates:
+
+```bash
+bash scripts/xfs-fuse-integration.sh    # privileged: real XFS + kernel FUSE, 43 required tests
+bash scripts/coherence-matrix-linux.sh  # 23-case two-mount black-box matrix, with falsifiability controls
+bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume, recorded not gated
+```
+
+The macOS matrix runs against two already-mounted paths, optionally with a
+remote peer:
+
+```bash
+scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-mount /path/b
+```
+
+## Documentation
+
+- [docs/architecture.md](./docs/architecture.md) — the product contract, in brief.
+- [docs/xfs-authority-architecture.md](./docs/xfs-authority-architecture.md) — the
+  full v3 design, failure model, security boundaries, and proof gates.
+- [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md) — running
+  a volume yourself.
+- [docs/consistency-model.md](./docs/consistency-model.md) — the exact
+  visibility, durability, and retry rules.
+- [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a
+  process observes when it does.
+- [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md) —
+  the declared macOS 26 cache policy and its open gates.
+- [docs/fskit-mount.md](./docs/fskit-mount.md) — how a macOS mount happens.
+- [docs/cross-mount-coherence-matrix.md](./docs/cross-mount-coherence-matrix.md) —
+  the black-box behaviour matrix and its falsifiability controls.
+- [docs/agents.md](./docs/agents.md) — using a workspace from an agent.
+- [docs/open-after-unlink.md](./docs/open-after-unlink.md) and
+  [docs/graft-security.md](./docs/graft-security.md) — two specific contracts
+  worth reading before relying on them.
+- [docs/performance.md](./docs/performance.md) — the deliberate baseline costs,
+  the measurement tools that exist, and the absence of published v3 numbers.
+- [docs/local-dev.md](./docs/local-dev.md),
+  [docs/release-identity.md](./docs/release-identity.md),
+  [docs/liveness-followups.md](./docs/liveness-followups.md) — working on it.
+- [docs/direct-store-exploration.md](./docs/direct-store-exploration.md) and
+  [docs/direct-store-consensus-evaluation.md](./docs/direct-store-consensus-evaluation.md)
+  — concluded exploration records, kept for their reasoning.
+
+Agents changing this repository should read [AGENTS.md](./AGENTS.md); agents
+using a workspace should read [skills/portablefs/SKILL.md](./skills/portablefs/SKILL.md).
 
 ## License
 

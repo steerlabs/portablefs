@@ -7,14 +7,15 @@ XFS. XFS and the block device beneath it are the only durable filesystem
 state. PortableFS does not maintain a second inode tree, content index,
 permanent operation history, branch graph, or write-back overlay.
 
-This is a deliberate v3 compatibility reset. It does not silently change the
-frozen v2 contract in `COMPATIBILITY.md`; v2 clients and v3 authorities fail
-their version handshake rather than enter a mixed mode.
+This was a deliberate compatibility reset. The v2 journal architecture and its
+control plane were removed rather than deprecated, and the protocol handshake
+refuses anything that does not speak the v3 contract rather than entering a
+mixed mode. See [../COMPATIBILITY.md](../COMPATIBILITY.md).
 
 ## Root design
 
 ```text
-Linux FUSE mount     macOS 27+ FSKit mount           another mount
+Linux FUSE mount        macOS FSKit mount            another mount
        |                       |                    |
        +---------- authenticated TLS RPC ----------+
                                |
@@ -52,9 +53,20 @@ module-initiated synchronous kernel data-cache control. That API is still beta
 as of August 2026 and its documented contract does not separately promise
 negative-name invalidation. Release therefore remains gated on the final SDK and
 the live namespace/data/attribute matrix; an OS version number is not accepted
-as proof. macOS 26, if shipped, selects an explicit compatibility cache policy
-implementing the same local visibility interface. It is never an automatic
-fallback and never changes the authority, filesystem, or session architecture.
+as proof. Nothing in this tree implements it, and the policy string that would
+select it fails closed.
+
+What ships on macOS today is an explicitly declared compatibility cache policy,
+`macos26-synchronous-vfs-repair-v1`, implementing the same local visibility
+interface through synthetic VFS repair. It is selected by name, validated on both
+sides, and refused if it does not match — never an automatic fallback, never a
+silent downgrade — and it does not change the authority, filesystem, or session
+architecture. It is composed and wired end to end: both client indexes, a real
+publication barrier, an installed repair gate, and data invalidation armed under
+exact one-shot provenance. It carries one known, exactly characterised residual
+race and a list of proofs that still require a live kernel. Both are in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md), and neither
+is elided here.
 
 ## Source of truth
 
@@ -244,12 +256,12 @@ write-back remains out of scope.
 
 Apple's June 2026 FSKit beta adds `DataCacheHandler`, `noCache`, synchronous
 cache-state changes, invalidate, and revoke. The locally installed Xcode 26.6 /
-macOS 26.5 SDK does not contain those APIs. macOS production support therefore
-remains gated on the final macOS 27 SDK/OS plus direct tests for data,
-attributes, positive and negative dentries, rename, unlink, writable mappings,
-and failed revocation. The macOS 27 path never falls back to synthetic VFS
-repair. macOS 26 compatibility, if explicitly selected, is a separate declared
-cache policy and retains its own stricter release gates.
+macOS 26.5 SDK does not contain those APIs. macOS 27 support therefore remains
+gated on the final SDK/OS plus direct tests for data, attributes, positive and
+negative dentries, rename, unlink, writable mappings, and failed revocation. The
+macOS 27 path never falls back to synthetic VFS repair, and the macOS 26 declared
+policy never claims to be it: they are two named policies, each validated
+exactly, and a mount that asks for one and is offered the other fails closed.
 The platform gate is tracked against Apple's
 [FSKit updates](https://developer.apple.com/documentation/updates/fskit) and
 [`DataCacheHandler`](https://developer.apple.com/documentation/fskit/fsvolume/datacachehandler),
@@ -272,13 +284,21 @@ The obligation already held by the running mutation is retained for one full
 additional declared repair-budget grace, then discharged. That grace is
 load-bearing only when the frontend can prove that its old kernel cache became
 unservable before the grace ends. Linux does this by revoking published FUSE
-bindings and aborting the connection. The macOS 27 frontend must prove the same
-property with native synchronous FSKit cache-state transitions plus terminal
-session handling; the current Swift watchdog only terminates protocol
-participation and does not prove kernel withdrawal. Consequently the production
-FSKit resolve guard remains closed. Once a frontend has that proof, a phase that
-first consumes its ordinary deadline costs at most two budgets rather than an
-unbounded volume outage, and later requests on the fenced mount must fail.
+bindings and aborting the connection, after which every request on that mount
+fails `ENOTCONN`. macOS does not yet have that proof: the Swift watchdog
+terminates protocol participation and ends the session, but macOS 26 exposes no
+API that withdraws already-cached kernel state, and macOS 27's native transitions
+are unimplemented. On macOS the fencing grace therefore bounds the authority's
+obligation without bounding the stale window, and that is a stated deviation of
+the declared compatibility policy rather than an equivalence. Where a frontend
+does have the proof, a phase that first consumes its ordinary deadline costs at
+most two budgets rather than an unbounded volume outage, and later requests on
+the fenced mount must fail.
+
+A mount reports itself blocked before it revokes, and a routing change is a
+distinct event shape rather than an overloaded namespace target. Both exist so
+that a participant which cannot meet an obligation fences immediately and
+visibly, instead of burning its budget silently and being discovered late.
 
 **Poison is reserved for authority-internal invariant violations** — a completion
 naming a coordinate PREPARE did not, a participant found holding two outstanding
@@ -293,12 +313,16 @@ gone from this epoch's barrier while still recorded, and a replacement authority
 refuses to serve until an external fencing proof covers every recorded old kernel
 mount. Availability is preserved inside an epoch and paid for across one.
 
-The macOS 26 Swift implementation in this tree is a tested protocol/actuator
-foundation only. It is not wired into the v3 FSKit operations adapter, and its
-synthetic hidden-rename/truncate mechanism retains explicit provenance,
-transient-namespace, alias-resolution, and live-kernel proof gates. It must not
-be enabled as production exact coherence or silently selected as a fallback.
-The complete failure contract is in
+The macOS 26 Swift implementation is composed into the production FSKit volume:
+the operations adapter maintains the namespace and live-object indexes, the
+publication barrier closes and reopens callback admission, and the repair gate is
+installed at resolve time so that a composition failure fails the mount rather
+than serving without coherence. Its synthetic hidden-rename and armed-truncate
+mechanism carries unforgeable one-shot provenance, but it retains a known
+residual coalescing and a set of live-kernel proofs that have not been run. It is
+a declared compatibility policy with a stated fidelity target, not exact
+coherence, and it is never selected as a fallback. The complete contract, the
+exact residual race, and the open gates are in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 ## Machine-local routing
@@ -358,9 +382,15 @@ single-use grant bound to the volume, authority epoch, session, peer SPKI,
 access, route revision, frontend cache policy, monotone authorization sequence,
 and new deadline. Reauthorization is an exact replay operation on a reserved
 lifecycle lane; it may extend the deadline but cannot broaden access or change
-cache/routing terms. Keepalive remains only a liveness proof. The current v2
-branch lease, HMAC token, TLS-terminating router, and journal-child registry are
-not reinterpreted as any part of this contract.
+cache/routing terms. Keepalive remains only a liveness proof.
+
+None of that control plane exists in this tree. Today an operator or an
+integration mints capabilities out of band and hands the mount its address, its
+single-use capability, and its client identity directly. That is sufficient for
+the standalone and test topologies and is deliberately not a production mount
+lifecycle: a long-lived mount currently ends at the capability's absolute
+deadline. Building it is future work, and the contract above is the shape it must
+take.
 
 The unprivileged request process verifies the root's project ID and
 `PROJINHERIT` flag but deliberately has no quota-administration capability.
@@ -457,31 +487,68 @@ to adopt a distributed filesystem, not to grow a custom inode database here.
 
 ## Proof required before production
 
-1. XFS comparison on repositories, package installs, compilers, metadata
-   storms, large I/O, sparse files, and concurrent mounts.
-2. FUSE and target-version FSKit coherence tests for data, attributes,
-   positive/negative dentries, rename-over, unlink, rejection of unsupported
-   mappings, and any future synchronously leased mappings.
-3. Frontend liveness tests proving that daemon freeze, an open-but-dead local
-   event socket, and authority partition make the exact kernel mount unservable
-   before the fencing grace expires.
-4. Confinement fuzzing for symlink races, mount grafts, hard links, rename
-   exchange, malformed names, stale tokens, and cross-volume attempts.
-5. File/directory sync fault tests over process kill, kernel crash, detach,
+The list is kept as a ledger rather than a wish: an item moves only when
+something in the tree establishes it, and partial progress is stated as partial.
+
+**Established.**
+
+1. **Linux coherence on a real kernel.** `scripts/xfs-fuse-integration.sh` builds
+   a disposable project-quota XFS filesystem in a privileged container, runs the
+   production provisioning script against it, and executes 43 required tests
+   against real kernel FUSE mounts as an unprivileged service account.
+   `scripts/coherence-matrix-linux.sh` then drives 23 black-box cases across two
+   real mounts in both `strict` and `uncached` profiles, bracketed by two
+   falsifiability controls — a disjoint-namespace phase and a stale-view phase —
+   that must turn the mountpoint-dependent cases red or the run fails. Data,
+   attributes, positive and negative names, rename-over, unlink,
+   open-after-unlink, hard links, symlinks, concurrent writers, routing
+   revisions, and peer loss are all in that matrix.
+2. **Rejection of unsupported mappings.** Shared file-backed `mmap` and user-xattr
+   writes are refused rather than served, and the refusal is in the privileged
+   suite.
+3. **Confinement.** `openat2` with `RESOLVE_BENEATH`/`RESOLVE_NO_MAGICLINKS`/
+   `RESOLVE_NO_XDEV`, descriptor-relative `*at` syscalls, device verification,
+   cross-volume rejection by construction, and a machine-local backing boundary
+   that fails closed when `openat2` is unavailable. Fuzzing breadth is still
+   thinner than this item eventually wants.
+4. **Storage-failure fencing.** Corruption and shutdown errnos — `EIO`,
+   `EUCLEAN`, `ESHUTDOWN`, `ENOTRECOVERABLE` — fence the volume and carry the
+   storage failure class rather than being reported as ordinary errors.
+5. **A mount-absence verification hook.** `portablefs-authority` accepts a
+   verification command that corroborates a strict mount's kernel-absence claim,
+   and clean detach fails closed when no command is configured. The frontend
+   produces evidence-bearing detach to feed it.
+
+**Open.**
+
+6. XFS comparison on repositories, package installs, compilers, metadata storms,
+   large I/O, sparse files, and concurrent mounts. The measurement tools exist;
+   no comparison has been published. See [performance.md](./performance.md).
+7. Live FSKit coherence on the target macOS, and the live macOS-to-Linux matrix.
+   Every gate is enumerated in
+   [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
+8. Frontend liveness proving that daemon freeze, an open-but-dead local event
+   socket, and authority partition make the exact kernel mount unservable before
+   the fencing grace expires. Linux revokes and aborts; macOS terminates
+   participation without withdrawing kernel cache state.
+9. File and directory sync fault tests over process kill, kernel crash, detach,
    full disk, quota exhaustion, short writes, and injected `EIO`.
-6. Multi-tenant saturation tests proving bounded RAM/descriptors and fair
-   progress for unrelated volumes.
-7. Recovery drills from live EBS and locked backup with measured RTO/RPO.
-8. A fenced branchless XFS cell/runtime control plane that attests placement,
-   exclusive-writer state, project/quota identity, endpoint identity, and
-   authority epoch before issuing a mount grant.
-9. Lost-response tests for idempotent grant creation and Attach, plus saturated
-   in-session reauthorization tests proving a long-lived mount neither expires
-   at the short grant boundary nor silently broadens its authorization.
-10. Signed exact-mount-absence or host-fence verification that can deactivate
-    durable strict membership; a dead socket, expired session, or frontend blob
-    is not evidence that an old kernel cache is unservable.
+10. Multi-tenant saturation tests proving bounded RAM and descriptors and fair
+    progress for unrelated volumes.
+11. Recovery drills from live EBS and locked backup with measured RTO/RPO, and
+    the authority-restart drill against a live prior strict mount.
+12. A branchless XFS cell and runtime control plane that attests placement,
+    exclusive-writer state, project and quota identity, endpoint identity, and
+    authority epoch before issuing a mount grant — together with lost-response
+    tests for idempotent grant creation and Attach, and saturated in-session
+    reauthorization tests proving a long-lived mount neither expires at the short
+    grant boundary nor silently broadens its authorization. None of this exists
+    yet; mounts are credentialed directly.
+13. Per-RPC observability at the authority, without which several matrix
+    assertions can only check behaviour and not work performed.
 
 The segmented-log experiment remains evidence about append-only write
-amplification. It is not a production dependency and did not compare the
-prototype with XFS on PortableFS workloads.
+amplification. Its spike module was removed with the rest of the v2 tree; it was
+never a production dependency and never compared the prototype with XFS on
+PortableFS workloads. See
+[direct-store-exploration.md](./direct-store-exploration.md).
