@@ -67,7 +67,12 @@ func (v *Volume) Create(parent Capability, name string, mode fs.FileMode, exclus
 	for range 16 {
 		fd, err := createRegular(p.fd(), name, unixMode)
 		if err == nil {
-			return v.installCreated(fd, unixMode)
+			identity, identityErr := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+			if identityErr != nil {
+				_ = unix.Close(fd)
+				return Capability{}, Attr{}, outcomeUncertain(identityErr)
+			}
+			return v.installCreated(fd, unixMode, identity)
 		}
 		if exclusive || err != syscall.EEXIST {
 			return Capability{}, Attr{}, err
@@ -82,7 +87,12 @@ func (v *Volume) Create(parent Capability, name string, mode fs.FileMode, exclus
 			// Nothing was mutated on this path, so no failure below it can be
 			// an uncertain outcome: reporting one would re-establish the mount
 			// for an operation that provably did not touch XFS.
-			return v.installObject(existing, nil)
+			identity, identityErr := stableIdentityAt(p.fd(), name, existing, v.productionIdentity)
+			if identityErr != nil {
+				_ = unix.Close(existing)
+				return Capability{}, Attr{}, identityErr
+			}
+			return v.installObject(existing, nil, identity)
 		}
 		if err != syscall.ENOENT {
 			return Capability{}, Attr{}, err
@@ -105,7 +115,7 @@ func createRegular(parentFD int, name string, unixMode uint32) (int, error) {
 
 // installCreated takes ownership of the creation description. Everything from
 // here on has already modified XFS, so every failure is an uncertain outcome.
-func (v *Volume) installCreated(fd int, unixMode uint32) (Capability, Attr, error) {
+func (v *Volume) installCreated(fd int, unixMode uint32, identity [16]byte) (Capability, Attr, error) {
 	fail := func(err error) (Capability, Attr, error) {
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(err)
@@ -129,7 +139,7 @@ func (v *Volume) installCreated(fd int, unixMode uint32) (Capability, Attr, erro
 	if err != nil {
 		return fail(err)
 	}
-	item, attr, err := v.installObject(reference, newResource(fd))
+	item, attr, err := v.installObject(reference, newResource(fd), identity)
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
@@ -192,7 +202,12 @@ func (v *Volume) Mkdir(parent Capability, name string, mode fs.FileMode) (Capabi
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
-	item, attr, err := v.installObject(fd, nil)
+	identity, identityErr := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+	if identityErr != nil {
+		_ = unix.Close(fd)
+		return Capability{}, Attr{}, outcomeUncertain(identityErr)
+	}
+	item, attr, err := v.installObject(fd, nil, identity)
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
@@ -243,7 +258,12 @@ func (v *Volume) Symlink(parent Capability, name, target string) (Capability, At
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
-	item, attr, err := v.installObject(fd, nil)
+	identity, identityErr := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+	if identityErr != nil {
+		_ = unix.Close(fd)
+		return Capability{}, Attr{}, outcomeUncertain(identityErr)
+	}
+	item, attr, err := v.installObject(fd, nil, identity)
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}

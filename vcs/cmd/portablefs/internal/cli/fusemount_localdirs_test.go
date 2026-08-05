@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
 // skipWithoutFUSE gates the real-kernel-mount tests on the prerequisites that
@@ -107,12 +109,13 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 	seedFile(t, seed, "agent-app/node_modules/linux-only.so", "volume binary")
 	seedFile(t, seed, "agent-app/package.json", `{"scripts":{"dev":"vite"}}`)
 	seedMkdir(t, seed, ".portablefs")
-	seedFile(t, seed, localdirs.VolumeConfigPath, "# per-machine dirs\ntarget\n")
+	// The volume DECLARES its routes; routing is volume-wide state, so this
+	// file is the only source of it and of the revision every mount reports.
+	seedFile(t, seed, localdirs.VolumeConfigPath, "# machine-local dirs\ntarget/\n/agent-app/node_modules/\n")
 
 	mnt := t.TempDir()
 	backing := filepath.Join(t.TempDir(), "local", "sid")
 	m, err := mountFUSE(addr, &sessionTokenSource{}, dataPlaneTransport{Mode: dataPlaneTransportPlaintext}, mnt, "mnt_AAAAAAAAAAAAAAAAAAAAAA", "direct", "", perfOptions{}, localDirsMountConfig{
-		dirs:        []string{"agent-app/node_modules"},
 		backingRoot: backing,
 	})
 	if err != nil {
@@ -131,8 +134,28 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 			}
 		}
 	})
-	if strings.Join(m.localDirs, ",") != "agent-app/node_modules,target" {
-		t.Fatalf("effective local dirs = %v (flags plus volume file)", m.localDirs)
+	// The mount serves exactly what the volume declares, and answers for
+	// exactly that declaration's revision — the value every peer computes
+	// from the same bytes.
+	if got := strings.Join(m.routes.rules.Patterns(), " "); got != "**/target/ /agent-app/node_modules/" {
+		t.Fatalf("effective routes = %q (the volume declaration)", got)
+	}
+	declared, err := localroutes.Parse([]byte("# machine-local dirs\ntarget/\n/agent-app/node_modules/\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.routes.revision != declared.RevisionHex() || m.routes.perMachine || !m.routes.declared {
+		t.Fatalf("reported revision = %q perMachine=%v declared=%v; it must be the declaration's alone",
+			m.routes.revision, m.routes.perMachine, m.routes.declared)
+	}
+	// A per-machine addition on a volume that declares its routes is refused:
+	// it would hide from this machine a directory every peer treats as
+	// shared, and no revision could describe that honestly.
+	if _, err := resolveRoutes(context.Background(), m.vol, localDirsMountConfig{
+		dirs:        []string{"crates/target"},
+		backingRoot: backing,
+	}); err == nil || !strings.Contains(err.Error(), localdirs.VolumeConfigPath) {
+		t.Fatalf("--local-dir on a declaring volume = %v, want an actionable refusal", err)
 	}
 
 	app := filepath.Join(mnt, "agent-app")
@@ -239,32 +262,59 @@ func TestFUSELocalDirsEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Ancestor rename carries the graft and its backing.
-	if err := os.WriteFile(filepath.Join(nm, "keep.txt"), []byte("carried"), 0o644); err != nil {
+	// Renaming a shared ancestor of ACTIVE machine-local backing is EBUSY —
+	// the errno Linux gives for renaming a directory that contains a mount
+	// point. Not EXDEV: a copy+delete fallback would copy machine-local
+	// backing into shared storage.
+	if err := os.WriteFile(filepath.Join(nm, "keep.txt"), []byte("kept"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(app, filepath.Join(mnt, "agent-app-v2")); err != nil {
-		t.Fatalf("ancestor rename: %v", err)
+	if err := os.Rename(app, filepath.Join(mnt, "agent-app-v2")); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("ancestor rename over active backing = %v, want EBUSY", err)
 	}
-	kept, err := os.ReadFile(filepath.Join(mnt, "agent-app-v2", "node_modules", "keep.txt"))
-	if err != nil || string(kept) != "carried" {
-		t.Fatalf("carried read = %q, %v", kept, err)
+	// Nothing moved, and the declared routing is untouched.
+	if got, err := os.ReadFile(filepath.Join(nm, "keep.txt")); err != nil || string(got) != "kept" {
+		t.Fatalf("refused rename disturbed the backing: %q %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(mnt, "agent-app-v2")); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("refused rename left a destination behind: %v", err)
+	}
+	// A shared directory with no machine-local backing under it, whose move
+	// changes nothing about what the rules route, renames normally.
+	if err := os.Mkdir(filepath.Join(mnt, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(mnt, "docs"), filepath.Join(mnt, "papers")); err != nil {
+		t.Fatalf("ordinary shared rename must still work: %v", err)
 	}
 
-	// The in-volume declaration grafts "target" too.
-	if err := os.Mkdir(filepath.Join(mnt, "target"), 0o755); err != nil {
+	// The in-volume declaration routes "target" at ANY depth: a directory
+	// created deep in the tree becomes a graft root the moment it matches,
+	// with no configured list naming it.
+	deep := filepath.Join(app, "crates", "engine", "target")
+	if err := os.MkdirAll(filepath.Join(app, "crates", "engine"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mnt, "target", "debug.bin"), []byte("artifact"), 0o644); err != nil {
+	if err := os.Mkdir(deep, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "debug.bin"), []byte("artifact"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := lsNames(t, filepath.Join(app, "crates", "engine")); got != "target" {
+		t.Fatalf("deep listing = %q", got)
 	}
 
 	// The authority never saw ANY graft content — the shadowed subtree is
 	// intact and the local names do not exist volume-side.
-	if a, st, err := seed.Getattr("agent-app-v2/node_modules/linux-only.so"); err != nil || st != fsproto.OK || a.Size != int64(len("volume binary")) {
+	if a, st, err := seed.Getattr("agent-app/node_modules/linux-only.so"); err != nil || st != fsproto.OK || a.Size != int64(len("volume binary")) {
 		t.Fatalf("authority shadowed file st=%d attr=%+v err=%v", st, a, err)
 	}
-	for _, p := range []string{"agent-app-v2/node_modules/keep.txt", "agent-app-v2/node_modules/fresh.txt", "target/debug.bin"} {
+	for _, p := range []string{
+		"agent-app/node_modules/keep.txt",
+		"agent-app/node_modules/fresh.txt",
+		"agent-app/crates/engine/target/debug.bin",
+	} {
 		if _, st, err := seed.Getattr(p); err != nil || st != fsproto.ENOENT {
 			t.Fatalf("authority must never see %s: st=%d err=%v", p, st, err)
 		}

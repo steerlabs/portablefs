@@ -335,7 +335,7 @@ func TestGraftControlWriteThatFailsItsStatPublishesTheCommittedSize(t *testing.T
 		Branch:    "main",
 		MountPath: "/Volumes/GraftPartial",
 		Options:   AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +388,7 @@ func TestGraftControlWriteNeverTruncatesBeforeItWrites(t *testing.T) {
 		Branch:    "main",
 		MountPath: "/Volumes/GraftOrder",
 		Options:   AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
 		t.Fatal(err)
 	}

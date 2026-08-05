@@ -10,7 +10,6 @@ option go_package = "github.com/steerlabs/portablefs/vcs/internal/authoritypb;au
 // decoding.
 
 message Request {
-  reserved 45; // regular FUSE does not forward syncfs to userspace
   uint64 request_id = 1;
   bytes epoch = 2; // 16 bytes after Hello/Attach
   SessionProof session = 3;
@@ -23,6 +22,8 @@ message Request {
     KeepAliveRequest keep_alive = 13;
     DetachRequest detach = 14;
     CancelRequest cancel = 15;
+    NextVisibilityRequest next_visibility = 16;
+    AckVisibilityRequest ack_visibility = 17;
     LookupRequest lookup = 20;
     GetAttrRequest get_attr = 21;
     SetAttrRequest set_attr = 22;
@@ -46,8 +47,10 @@ message Request {
     ListXattrRequest list_xattr = 42;
     RemoveXattrRequest remove_xattr = 43;
     StatFSRequest stat_fs = 44;
+    SyncFSRequest sync_fs = 45;
     GetLockRequest get_lock = 50;
     SetLockRequest set_lock = 51;
+    ApplyRoutesRequest apply_routes = 18;
   }
 }
 
@@ -63,6 +66,13 @@ message Response {
   MutationState mutation = 6;
   // failure disambiguates the errno space where one number has two meanings.
   FailureClass failure = 7;
+  // routes_mismatch is present exactly when this request was refused because
+  // the peer is running a routing topology that is not this volume's active
+  // one. A refusal reaches a mount as an errno, and an errno cannot say which
+  // two configurations disagreed; naming both revisions here is what turns
+  // "your mount was refused" into "your local-dirs file is revision X, the
+  // volume's is Y". See RoutesMismatch.
+  RoutesMismatch routes_mismatch = 8;
 
   oneof body {
     HelloReply hello = 10;
@@ -80,6 +90,9 @@ message Response {
     StatFSReply stat_fs = 30;
     GetLockReply get_lock = 31;
     LinkReply link = 32;
+    VisibilityEvent visibility = 33;
+    ApplyRoutesReply apply_routes = 34;
+    SyncFSReply sync_fs = 35;
   }
 }
 
@@ -111,11 +124,49 @@ enum FailureClass {
   FAILURE_CLASS_UNSPECIFIED = 0;
   FAILURE_CLASS_STORAGE = 1;
   FAILURE_CLASS_INTERNAL = 2;
+  FAILURE_CLASS_COHERENCE = 3;
+  // ROUTES means this peer and this volume disagree about the machine-local
+  // routing topology. It is neither a storage failure nor a cache-coherence
+  // failure: the volume is healthy and this mount's configuration is wrong.
+  FAILURE_CLASS_ROUTES = 4;
+}
+
+// RoutesMismatch names both sides of a routing-topology disagreement. All
+// mounts of a volume must agree on which directories are machine-local: if one
+// machine routes node_modules to local disk and another shares it, the second
+// machine uploads its platform-specific dependency tree into a subtree the
+// first has hidden, and neither mount ever sees an error. Refusing the mount is
+// the only safe answer, and the refusal has to be readable by a human holding
+// two configuration files.
+message RoutesMismatch {
+  bytes active_revision = 1;     // 32-byte SHA-256 over the volume's canonical rules
+  bytes presented_revision = 2;  // 32 bytes; empty when the peer declared none
+  string detail = 3;             // human-readable, names both revisions
+  // session_refused is true exactly when the refusal is "the revision this
+  // session was admitted against is no longer the active one". That is terminal
+  // for the mount: it is running a topology the volume has replaced, so it must
+  // reconcile its declaration and remount rather than retry. It is stated
+  // explicitly rather than inferred from the revisions, because an ApplyRoutes
+  // whose compare-and-swap lost carries the same two values and is not terminal
+  // for anyone.
+  bool session_refused = 4;
+  // canonical_rules is the volume's active declaration, in the canonical form
+  // active_revision is the digest of. It is here so the refusal is
+  // self-sufficient: a mount cannot read .portablefs/local-dirs before it has a
+  // session, and it cannot get a session before it declares a revision, so
+  // without this the first attach of a mount that has never seen the volume
+  // would have nowhere to start. Present only on an attach refusal, where the
+  // caller is already authorized and could read the file anyway.
+  bytes canonical_rules = 5;
 }
 
 message Item {
   bytes token = 1; // 16-byte, volume+epoch-local random capability
   Attr attr = 2;
+  // Stable XFS (device-major, device-minor, inode) identity. This is cache
+  // coordination metadata, never authorization; every operation still uses
+  // token. All capabilities for hard-link aliases carry the same 16 bytes.
+  bytes stable_identity = 3;
 }
 
 message Attr {
@@ -154,6 +205,36 @@ message AttachRequest {
   string volume_id = 1;
   bytes access_token = 2;
   uint32 replay_slots = 4;
+  CoherenceProfile coherence_profile = 5;
+  // cached_name_capacity is how many distinct resolutions this frontend's
+  // kernel cache is expected to hold. It sizes the authority's per-session
+  // resolved-name index, which is what lets a mutation skip mounts that cannot
+  // be holding the affected name. It is a precision and memory setting only:
+  // the index never drops a coordinate, so understating this number costs
+  // wasted acknowledgments and never a missed one. Required and nonzero for a
+  // strict profile; ignored for an uncached one.
+  uint64 cached_name_capacity = 6;
+  // repair_budget_millis is the per-phase deadline this frontend commits to:
+  // the longest it may take to acknowledge one PREPARE or one COMPLETE. The
+  // authority fences this participant individually when the budget expires, and
+  // the frontend must revoke its own kernel mount if it has not acknowledged a
+  // phase within the same budget. The two sides use one number so the window in
+  // which a fenced mount could still serve a stale name is bounded by it.
+  uint64 repair_budget_millis = 7;
+  // routes_revision is the 32-byte SHA-256 over the canonical machine-local
+  // routing rules this mount will run, derived from the volume file
+  // .portablefs/local-dirs. The authority is the source of truth for that file
+  // and refuses any mount whose revision is not the active one, for every
+  // coherence profile: an uncached mount that routes a subtree locally hides
+  // exactly as much from its peers as a strict one does. An empty rule set has
+  // a revision too, so this field is required and a mount that omits it is
+  // refused - "I did not say" must never be admitted as "I agree".
+  bytes routes_revision = 8;
+  // namespace_repair states how this frontend's kernel makes a cached binding
+  // unservable. Required and non-UNSPECIFIED for a strict profile; ignored for
+  // an uncached one, which caches no binding to repair. It is what lets the
+  // authority tell a proven repair cycle apart from an ordinary slow lock.
+  NamespaceRepair namespace_repair = 9;
 }
 message AttachReply {
   bytes session_id = 1;
@@ -162,11 +243,169 @@ message AttachReply {
   Item root = 4;
   repeated string features = 5;
   uint64 session_lease_milliseconds = 6;
+  VisibilityCursor visibility_cursor = 7; // strict participant's initial cursor
+  // routes_revision is the revision this session was admitted against. It is
+  // the same value the mount presented - an attach that disagreed was refused -
+  // so it is an explicit confirmation rather than a value to adopt.
+  bytes routes_revision = 8;
 }
 message ResumeRequest {}
 message KeepAliveRequest {}
-message DetachRequest {}
+// MountAbsenceProof is the evidence a strict frontend presents that its own
+// kernel mount is gone. It replaced a boolean the client could only ever set to
+// true: a flag records an intention, an observation records a fact. The
+// authority cannot re-derive a remote kernel's mount table, so it does not try
+// to interpret `observation`. What it does enforce is the ordering that makes
+// the evidence load-bearing: the absence must have been observed after this
+// session attached and after the barrier obligation it is being used to
+// discharge was created, and it must not be dated in the future. A frontend
+// that cannot observe its own mount's absence has nothing to send and must let
+// its session die instead, which fences it.
+message MountAbsenceProof {
+  int64 observed_unix_nanos = 1;
+  bytes observation = 2;   // opaque, component-specific (e.g. fsid + mount-table generation)
+  string component = 3;    // which local component observed the absence
+}
+
+message DetachRequest {
+  MountAbsenceProof mount_absence = 1;
+}
 message CancelRequest { uint64 target_request_id = 1; }
+
+// A frontend declares cache behavior, never an operating-system name. An
+// uncached mount has no remote repair obligation. A strict mount participates
+// in the ordered two-phase visibility barrier.
+enum CoherenceProfile {
+  COHERENCE_PROFILE_UNCACHED = 0;
+  COHERENCE_PROFILE_STRICT = 1;
+}
+
+// NamespaceRepair is how a strict frontend's kernel makes one cached
+// name->inode binding unservable. It is declared, not inferred, because the
+// authority cannot see a remote kernel and the two answers have different
+// provable properties.
+//
+// PARENT_EXCLUSIVE is Linux FUSE. fs/fuse/dir.c:1351 takes
+// down_write(&parent->i_rwsem) unconditionally - before the FUSE_EXPIRE_ONLY
+// test at dir.c:1367 - and fs/namei.c:4389 / :3895 / :4975 hold that same
+// semaphore for write across the whole server round trip of any directory
+// mutation. A mount with an unanswered directory mutation in that parent
+// therefore cannot repair a name in it, and if the authority is the party that
+// owes the answer, the wait is a closed cycle rather than a slow lock. See the
+// proof at VisibilityCoordinator.ReportBlocked.
+//
+// INDEPENDENT means repair never waits on a lock the mount's own unanswered
+// operation can hold. A frontend may only declare it if that is true of its
+// kernel; there is no default, because guessing wrong turns a proven cycle into
+// an unbounded hang.
+enum NamespaceRepair {
+  NAMESPACE_REPAIR_UNSPECIFIED = 0;
+  NAMESPACE_REPAIR_PARENT_EXCLUSIVE = 1;
+  NAMESPACE_REPAIR_INDEPENDENT = 2;
+}
+
+enum VisibilityPhase {
+  VISIBILITY_PHASE_UNSPECIFIED = 0;
+  VISIBILITY_PHASE_PREPARE = 1;
+  VISIBILITY_PHASE_COMPLETE = 2;
+}
+
+enum VisibilityScope {
+  VISIBILITY_SCOPE_UNSPECIFIED = 0;
+  VISIBILITY_SCOPE_NAMESPACE = 1;
+  VISIBILITY_SCOPE_DATA = 2;
+  VISIBILITY_SCOPE_ATTRIBUTES = 3;
+}
+
+message VisibilityCursor {
+  uint64 sequence = 1;
+  VisibilityPhase phase = 2;
+}
+
+message VisibilityTarget {
+  VisibilityScope scope = 1;
+  bytes identity = 2; // 16-byte stable XFS identity for data/attributes
+  bytes parent_identity = 3; // 16-byte stable XFS identity for namespace
+  bytes name = 4;
+  int64 size = 5; // authoritative post-mutation EOF for DATA
+  // Kernel-cache coordination facts. The stable identities above name the
+  // object for frontends that index by item identity; a FUSE frontend keys
+  // its kernel caches by the inode number the authority publishes in
+  // attributes, so that number travels explicitly rather than being parsed
+  // out of an identity whose layout does not contain it (the exact XFS export
+  // handle encodes type, inode and generation — never a device).
+  uint64 kernel_ino = 6;        // attr inode of the data/attributes target
+  uint64 parent_kernel_ino = 7; // attr inode of the namespace target's parent
+  fixed64 device = 8;           // major<<32 | minor of the one backing filesystem
+}
+
+// RoutesChange makes a two-phase event say "this is a routing-topology change"
+// without overloading a namespace target. A routing change has no parent, no
+// name and no inode: it is not a cache coordinate, and encoding it as one would
+// mean a frontend could satisfy it by invalidating a dentry, which is not the
+// obligation. What a frontend owes here is to stop serving the old topology
+// entirely before it acknowledges COMPLETE.
+message RoutesChange {
+  bytes revision = 1; // 32 bytes; the revision that becomes active at COMPLETE
+  bytes rules = 2;    // canonical rule bytes the revision is the digest of
+}
+
+message VisibilityEvent {
+  VisibilityCursor cursor = 1;
+  bytes initiator_session_id = 2; // 16 bytes
+  uint32 mutation_slot = 3; // initiating callback exemption ticket
+  repeated VisibilityTarget targets = 4;
+  uint64 mutation_sequence = 5;
+  // routes is set exactly on the two phases of a routing-topology change, and
+  // targets is empty on those phases. The two are disjoint by construction.
+  RoutesChange routes = 6;
+}
+
+// ApplyRoutes installs a new machine-local routing topology for the whole
+// volume. It is admin-scope: an ordinary write grant lets a mount change file
+// contents, and .portablefs/local-dirs is not file contents to a mount - it is
+// the definition of which subtrees the volume can even see. Mounts are refused
+// every mutation under .portablefs/ for the same reason.
+//
+// expected_revision is a compare-and-swap against the currently active
+// revision. Two operators editing the routing file concurrently must not
+// silently last-writer-win, and the CAS is also what makes a retry after an
+// uncertain outcome safe to reason about: it either applies once or reports
+// which revision is active now.
+message ApplyRoutesRequest {
+  bytes rules = 1;             // the new declaration file, verbatim
+  bytes expected_revision = 2; // 32 bytes; the revision the caller read
+}
+message ApplyRoutesReply {
+  bytes revision = 1; // 32 bytes; the now-active revision
+  bytes canonical = 2; // canonical rule bytes the revision is the digest of
+  // participants is how many strict mounts acknowledged the change. A mount
+  // that could not is fenced individually, so this is smaller than the attached
+  // mount count exactly when someone was fenced.
+  uint32 acknowledged_participants = 3;
+}
+
+message NextVisibilityRequest { VisibilityCursor after = 1; }
+message AckVisibilityRequest {
+  VisibilityCursor cursor = 1;
+  // blocked is a frontend saying it cannot service this phase, because doing so
+  // would wait on a kernel lock its own unanswered request to this authority
+  // holds. It is a report, not a request for more time: the authority fences
+  // this participant immediately, which is the same outcome its repair budget
+  // would eventually produce and is reached without stopping every other
+  // mount's mutations for the length of that budget.
+  //
+  // Only the frontend can evaluate this. It needs BOTH that the mount has an
+  // unanswered namespace mutation in the affected parent - which the authority
+  // also knows - and that the mount actually holds a cached binding this phase
+  // names, which the authority does not: its audience comes from a monotone
+  // filter with no false negatives and therefore many false positives. A mount
+  // that has nothing cached to repair must acknowledge normally.
+  //
+  // The authority verifies the half it can see and treats an unsupported claim
+  // as a cursor violation, so this cannot be used to skip a repair.
+  bool blocked = 2;
+}
 
 message LookupRequest { bytes parent = 1; bytes name = 2; }
 message LookupReply { Item item = 1; }
@@ -233,8 +472,21 @@ message WriteReply { uint32 count = 1; uint64 assigned_offset = 2; }
 message FsyncRequest { bytes handle = 1; bool data_only = 2; }
 message FlushRequest { bytes handle = 1; uint64 lock_owner = 2; }
 
-message ReadDirRequest { bytes handle = 1; bytes cookie = 2; bytes verifier = 3; uint32 max_entries = 4; }
-message Dirent { bytes name = 1; Attr attr = 2; bytes next_cookie = 3; }
+message ReadDirRequest {
+  bytes handle = 1;
+  bytes cookie = 2;
+  bytes verifier = 3;
+  uint32 max_entries = 4;
+  // Ask for a fresh usable Item capability for every returned entry. Linux
+  // readdir leaves this false; the macOS pfslocal contract requires Items.
+  bool want_items = 5;
+}
+message Dirent {
+  bytes name = 1;
+  Attr attr = 2;
+  bytes next_cookie = 3;
+  Item item = 4; // present for every entry exactly when want_items is true
+}
 message ReadDirReply { repeated Dirent entries = 1; bytes verifier = 2; bool eof = 3; }
 message ReclaimRequest { bytes item = 1; }
 
@@ -254,6 +506,10 @@ message StatFSReply {
   uint64 blocks_available = 4; uint64 files = 5; uint64 files_free = 6;
   uint32 name_max = 7;
 }
+// Replay-safe, volume-wide durability barrier ordered with mutations before
+// invoking syncfs(2). It carries no cache visibility change of its own.
+message SyncFSRequest {}
+message SyncFSReply {}
 message LockRange { uint64 start = 1; uint64 end = 2; }
 message LockSpec { bytes item = 1; uint64 owner = 2; bool write = 3; LockRange range = 4; bool flock = 5; }
 message GetLockRequest { LockSpec lock = 1; }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 	"golang.org/x/sys/unix"
@@ -34,7 +36,15 @@ type mountState struct {
 	// have been recycled.
 	ProcessStartIdentity string `json:"processStartIdentity,omitempty"`
 	Strategy             string `json:"strategy"`
-	FSType               string `json:"fsType,omitempty"`
+	// Engine names the data plane behind the strategy's platform transport:
+	// mountEngineFuseV3 (the Linux fusev3 stack) or mountEngineDaemonV3 (the
+	// portablefsd-owned macOS v3 attach). Empty marks a record written by the
+	// retired clientcore engine. Unmount picks its teardown from the
+	// (strategy, engine) pair — a v3 FUSE mount has no write-back tail to
+	// drain or park, and a v3 FSKit mount's evidence-bearing detach is owned
+	// entirely by the daemon.
+	Engine string `json:"engine,omitempty"`
+	FSType string `json:"fsType,omitempty"`
 	MountInstanceID      string `json:"mountInstanceId,omitempty"`
 	KernelMountID        string `json:"kernelMountId,omitempty"`
 	MountTargetDevice    uint64 `json:"mountTargetDevice,omitempty"`
@@ -51,9 +61,27 @@ type mountState struct {
 	// diagnostics correlate on it.
 	AttachRef   string `json:"attachRef,omitempty"`
 	StartedAtMs int64  `json:"startedAtMs"`
-	// LocalDirs are the machine-local graft roots this mount serves
-	// (--local-dir plus the volume's .portablefs/local-dirs file).
-	LocalDirs []string `json:"localDirs,omitempty"`
+	// LocalDirs are the machine-local graft roots an FSKit mount serves, as
+	// literal paths (the macOS daemon's shape).
+	LocalDirs         []string `json:"localDirs,omitempty"`
+	LocalDirsDeclared bool     `json:"localDirsDeclared,omitempty"`
+	// LocalRoutes is the canonical rule set a FUSE mount serves and
+	// LocalBackingRoot the volume's machine-local backing tree.
+	//
+	// LocalRouteRevision is the VOLUME DECLARATION's revision — the SHA-256 of
+	// the canonical form of .portablefs/local-dirs and of nothing else. It is
+	// the value the authority pins the attach to, so it describes what the
+	// volume declares, identically on every machine. It is deliberately NOT a
+	// hash of LocalRoutes: on the legacy --local-dir path (allowed only when
+	// the volume publishes no declaration) the two differ, and
+	// LocalRoutesPerMachine records exactly that case.
+	//
+	// Together they let `portablefs route`, `portablefs status` and
+	// `portablefs prune-local` answer without re-reading the volume.
+	LocalRoutes           []string `json:"localRoutes,omitempty"`
+	LocalRouteRevision    string   `json:"localRouteRevision,omitempty"`
+	LocalRoutesPerMachine bool     `json:"localRoutesPerMachine,omitempty"`
+	LocalBackingRoot      string   `json:"localBackingRoot,omitempty"`
 	// AccessLease is the manager access lease backing this mount's data-plane
 	// credential (nil only when --addr was used). Persisted so the daemon can
 	// renew/release it and an operator can correlate a mount with its lease.
@@ -95,6 +123,14 @@ const (
 	attachCredentialRejected            = "rejected"
 	attachCredentialPendingVerification = "pending-verification"
 	attachCredentialRouterRefused       = "router-refused"
+)
+
+// The recorded mount engines. Empty is deliberately NOT a constant: it is the
+// absence of a claim, the shape every record written by the retired
+// clientcore engine has.
+const (
+	mountEngineFuseV3   = "fusev3"
+	mountEngineDaemonV3 = "daemon-v3"
 )
 
 // mountStatusCredentialExpired marks a running mount whose credentials the
@@ -324,8 +360,24 @@ func validateMountStateRecord(path string, st *mountState) error {
 	if !validCanonicalMountPath(st.MountPath) {
 		return fmt.Errorf("mount state %s has non-canonical mount path %q", path, st.MountPath)
 	}
-	if !validVolumeName(st.VolumeID) || !validStateString(st.Branch, 1024) {
-		return fmt.Errorf("mount state %s has invalid volume or branch identity", path)
+	if !validVolumeName(st.VolumeID) {
+		return fmt.Errorf("mount state %s has invalid volume identity", path)
+	}
+	// A v3 engine is branchless and a legacy clientcore record is
+	// branch-bound. Both claims are checked rather than defaulted: a
+	// branchless record carrying a branch (or the reverse) is two different
+	// mounts wearing one file.
+	switch st.Engine {
+	case "":
+		if !validStateString(st.Branch, 1024) {
+			return fmt.Errorf("mount state %s has invalid branch identity", path)
+		}
+	case mountEngineFuseV3, mountEngineDaemonV3:
+		if st.Branch != "" {
+			return fmt.Errorf("mount state %s carries a branch on a branchless v3 engine record", path)
+		}
+	default:
+		return fmt.Errorf("mount state %s has invalid engine %q", path, st.Engine)
 	}
 	if st.PID <= 0 || !validStateString(st.ProcessStartIdentity, 128) {
 		return fmt.Errorf("mount state %s has incomplete process identity", path)
@@ -342,6 +394,9 @@ func validateMountStateRecord(path string, st *mountState) error {
 
 	switch st.Strategy {
 	case "fuse":
+		if st.Engine != "" && st.Engine != mountEngineFuseV3 {
+			return fmt.Errorf("mount state %s has engine %q for a FUSE mount", path, st.Engine)
+		}
 		if st.FSType != "" || st.AttachRef != "" || !validKernelMountID(st.KernelMountID) {
 			return fmt.Errorf("mount state %s has invalid FUSE kernel identity", path)
 		}
@@ -358,6 +413,9 @@ func validateMountStateRecord(path string, st *mountState) error {
 			return fmt.Errorf("mount state %s has invalid FUSE mount mechanism %q", path, st.MountMechanism)
 		}
 	case "fskit":
+		if st.Engine != "" && st.Engine != mountEngineDaemonV3 {
+			return fmt.Errorf("mount state %s has engine %q for an FSKit mount", path, st.Engine)
+		}
 		if !validFSKitType(st.FSType) || !mountid.ValidAttachRef(st.AttachRef) || st.KernelMountID != "" {
 			return fmt.Errorf("mount state %s has invalid FSKit attach identity", path)
 		}
@@ -373,6 +431,9 @@ func validateMountStateRecord(path string, st *mountState) error {
 	}
 	if err := validatePersistedLocalDirs(st.LocalDirs); err != nil {
 		return fmt.Errorf("mount state %s has invalid local dirs: %w", path, err)
+	}
+	if err := validatePersistedLocalRoutes(st); err != nil {
+		return fmt.Errorf("mount state %s has invalid machine-local routes: %w", path, err)
 	}
 
 	leaseTransaction := st.ManagerURL != "" || st.AccessLeaseReleaseOperationID != "" || st.AccessLease != nil
@@ -458,6 +519,44 @@ func validatePersistedDataPlaneTransport(st *mountState) error {
 		}
 	default:
 		return fmt.Errorf("unsupported mode %q", st.DataPlaneTransport)
+	}
+	return nil
+}
+
+// emptyRoutesRevision is the revision of a volume that declares nothing —
+// the hash of the empty canonical rule set. A mount serving per-machine
+// --local-dir routes reports exactly this, because such routes are allowed
+// only when the volume publishes no declaration.
+func emptyRoutesRevision() string { return localroutes.RuleSet{}.RevisionHex() }
+
+// validatePersistedLocalRoutes proves a record's routing and the revision it
+// answers for are each exactly what they claim. Declared routing must be the
+// canonical form of its revision; per-machine routing must answer for the
+// empty-declaration revision, since that is the only case it is permitted in.
+// A record that failed either check would let `portablefs route` answer for
+// one rule set while the authority pinned the attach to another.
+func validatePersistedLocalRoutes(st *mountState) error {
+	if len(st.LocalRoutes) == 0 && st.LocalRouteRevision == "" && st.LocalBackingRoot == "" && !st.LocalRoutesPerMachine {
+		return nil
+	}
+	if st.LocalBackingRoot != "" && !validAbsoluteCleanPath(st.LocalBackingRoot) {
+		return fmt.Errorf("invalid backing root %q", st.LocalBackingRoot)
+	}
+	rules, err := localroutes.Parse([]byte(strings.Join(st.LocalRoutes, "\n")))
+	if err != nil {
+		return err
+	}
+	if strings.Join(rules.Patterns(), "\n") != strings.Join(st.LocalRoutes, "\n") {
+		return fmt.Errorf("route patterns are not canonical")
+	}
+	if st.LocalRoutesPerMachine {
+		if st.LocalRouteRevision != emptyRoutesRevision() {
+			return fmt.Errorf("per-machine routes must answer for the empty-declaration revision, not %q", st.LocalRouteRevision)
+		}
+		return nil
+	}
+	if rules.RevisionHex() != st.LocalRouteRevision {
+		return fmt.Errorf("route revision %q does not match the recorded patterns", st.LocalRouteRevision)
 	}
 	return nil
 }
@@ -550,25 +649,112 @@ func listMountStates(dir string) ([]mountState, error) {
 
 // ---- machine-local dirs (grafts) persistence ----
 //
-// Grafted content lives under <stateBase>/local/<storageID>/ (stateBase is
-// the parent of the mounts dir), the same convention portablefsd uses for its
-// attaches. The configured graft roots are remembered in a sidecar file next
-// to that backing so a remount of the same volume+branch+mountPath reuses
-// them; the per-mount state file is removed on clean unmount, but the backing
-// (and this record) must survive it — persistent local dependency trees are
-// the whole point.
+// FUSE-grafted content lives under <stateBase>/local/<volume storage id>/
+// (stateBase is the parent of the mounts dir), with each route root at its own
+// volume-relative path inside that tree. portablefsd deliberately has a
+// separate <stateBase>/portablefsd/local/<volume+branch storage id>/ tree;
+// operator tooling derives that path through portablefsd.LocalBackingRoot.
+// The FUSE identity is (volume, route root) and nothing else, so
+// a dependency tree survives unmount, remount, and remount at a different
+// path, while a different volume at the same mountpoint can never inherit it.
+//
+// Two sidecars sit BESIDE the tree (never inside it, where a name could
+// collide with a route root): the per-mount --local-dir record, which
+// preserves the flag precedence across remounts, and the per-volume active
+// route record, which tells `portablefs prune-local` what is still routed
+// when no mount of the volume is running. Both must survive a clean unmount —
+// persistent local dependency trees are the whole point.
 
-// localDirsBackingRoot is the machine-local backing directory for one mount.
-func localDirsBackingRoot(mountsDir, volumeID, branch, mountPath string) string {
-	return localdirs.BackingRoot(filepath.Dir(mountsDir), volumeID, branch, mountPath)
+// localDirsBackingRoot is the machine-local backing tree for one volume.
+func localDirsBackingRoot(mountsDir, volumeID string) string {
+	return localdirs.BackingRoot(filepath.Dir(mountsDir), volumeID)
+}
+
+// localMountRecordKey distinguishes the per-mount sidecars of one volume.
+func localMountRecordKey(branch, mountPath string) string {
+	sum := sha256.Sum256([]byte(branch + "\x00" + mountPath))
+	return hex.EncodeToString(sum[:8])
 }
 
 func localDirsRecordPath(mountsDir, volumeID, branch, mountPath string) string {
-	return localDirsBackingRoot(mountsDir, volumeID, branch, mountPath) + ".dirs.json"
+	return localDirsBackingRoot(mountsDir, volumeID) + ".dirs-" + localMountRecordKey(branch, mountPath) + ".json"
+}
+
+// localRoutesRecordPath names the volume's active route record.
+func localRoutesRecordPath(mountsDir, volumeID string) string {
+	return localDirsBackingRoot(mountsDir, volumeID) + ".routes.json"
 }
 
 type localDirsRecord struct {
 	LocalDirs []string `json:"localDirs"`
+}
+
+// localRoutesRecord is the volume's last activated routing on this machine.
+// prune-local reads it to decide which backing subtrees are still reachable
+// when nothing is mounted; it is written on every successful activation.
+// Revision is the volume declaration's, exactly as in mountState.
+type localRoutesRecord struct {
+	VolumeID    string   `json:"volumeId"`
+	Patterns    []string `json:"patterns"`
+	Revision    string   `json:"revision"`
+	PerMachine  bool     `json:"perMachine,omitempty"`
+	UpdatedAtMs int64    `json:"updatedAtMs"`
+}
+
+// readLocalRoutesRecord loads a volume's active route set. A missing record
+// means "no route set is known", which prune-local treats as "every backing
+// subtree of this volume is orphaned" — the honest reading, since nothing on
+// this machine can reach it.
+func readLocalRoutesRecord(mountsDir, volumeID string) (*localRoutesRecord, error) {
+	p := localRoutesRecordPath(mountsDir, volumeID)
+	data, err := privatepath.ReadFile(p)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read local-routes record %s: %w", p, err)
+	}
+	return decodeLocalRoutesRecord(data, p)
+}
+
+// decodeLocalRoutesRecord parses and self-checks one record: the patterns
+// must be a valid canonical rule set and must hash to the revision recorded
+// beside them, so nothing downstream can act on a half-written file.
+func decodeLocalRoutesRecord(data []byte, p string) (*localRoutesRecord, error) {
+	var rec localRoutesRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, fmt.Errorf("parse local-routes record %s: %w", p, err)
+	}
+	rules, err := localroutes.Parse([]byte(strings.Join(rec.Patterns, "\n")))
+	if err != nil {
+		return nil, fmt.Errorf("validate local-routes record %s: %w", p, err)
+	}
+	want := rules.RevisionHex()
+	if rec.PerMachine {
+		want = emptyRoutesRevision()
+	}
+	if want != rec.Revision {
+		return nil, fmt.Errorf("local-routes record %s does not match its revision", p)
+	}
+	return &rec, nil
+}
+
+func writeLocalRoutesRecord(mountsDir, volumeID string, routes mountRoutes, nowMs int64) error {
+	p := localRoutesRecordPath(mountsDir, volumeID)
+	data, err := json.MarshalIndent(localRoutesRecord{
+		VolumeID:    volumeID,
+		Patterns:    routes.rules.Patterns(),
+		Revision:    routes.revision,
+		PerMachine:  routes.perMachine,
+		UpdatedAtMs: nowMs,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := privatepath.WriteFileAtomic(p, append(data, '\n')); err != nil {
+		return fmt.Errorf("write local-routes record %s: %w", p, err)
+	}
+	return nil
 }
 
 // readPersistedLocalDirs loads the graft roots remembered for a mount key;
@@ -594,9 +780,9 @@ func readPersistedLocalDirs(mountsDir, volumeID, branch, mountPath string) ([]st
 }
 
 // writePersistedLocalDirs remembers the EXPLICITLY configured graft roots
-// (flag-level config; the volume's .portablefs/local-dirs file re-unions on
-// every mount and is deliberately not baked in). An empty list removes the
-// record: explicit flags win and update state.
+// (flag-level config; the volume's declaration is re-read on every mount and
+// is deliberately not baked in). An empty list removes the record: explicit
+// flags win and update state.
 func writePersistedLocalDirs(mountsDir, volumeID, branch, mountPath string, dirs []string) error {
 	p := localDirsRecordPath(mountsDir, volumeID, branch, mountPath)
 	if len(dirs) == 0 {

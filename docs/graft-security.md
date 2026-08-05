@@ -20,6 +20,21 @@ go test ./internal/portablefsd -count=1
 go test ./cmd/portablefs/internal/cli -count=1
 ```
 
+**On a stock Mac, most of `./internal/portablefsd`'s graft cases now SKIP, and
+that is the correct result.** Graft activation probes the machine-local backing
+filesystem and refuses when it folds names the shared namespace keeps distinct
+(`ErrBackingCaseUnsafe`, `vcs/internal/portablefsd/localcasesafety.go`). A stock
+Mac's APFS is case-insensitive, so PortableFS genuinely refuses to serve grafts
+there and a graft assertion on such a host would be asserting behaviour the
+product deliberately does not provide. Each skip names the host behaviour that
+caused it. To exercise those cases, run them on a case-sensitive filesystem —
+Linux CI does this on every run, or point the daemon state dir at an APFS
+(Case-sensitive) volume. `TestBackingCaseProbe*` and
+`TestOpenLocalBackingRefusesAFoldingBacking` run and assert on every host: they
+compare the probe's verdict against ground truth measured independently with
+plain `os` calls, so the same test proves the refusal here and the acceptance
+there.
+
 On macOS, the targeted `portablefsd` suite also attacks the live-vnode
 coherence refresh boundary. The authority controls the mounted path being
 refreshed, so the daemon resolves it with one descriptor-relative

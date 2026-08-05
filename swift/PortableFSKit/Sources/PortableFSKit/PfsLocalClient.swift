@@ -5,10 +5,13 @@ private final class PfsEventSink: @unchecked Sendable {
     let stream: AsyncStream<PfsEvent>
     private let lock = NSLock()
     private var continuation: AsyncStream<PfsEvent>.Continuation?
+    private var delivered = 0
 
-    init() {
+    init(
+        bufferingPolicy: AsyncStream<PfsEvent>.Continuation.BufferingPolicy = .bufferingNewest(1024)
+    ) {
         var captured: AsyncStream<PfsEvent>.Continuation?
-        stream = AsyncStream(PfsEvent.self, bufferingPolicy: .bufferingNewest(1024)) { continuation in
+        stream = AsyncStream(PfsEvent.self, bufferingPolicy: bufferingPolicy) { continuation in
             captured = continuation
         }
         continuation = captured
@@ -17,8 +20,16 @@ private final class PfsEventSink: @unchecked Sendable {
     func yield(_ event: PfsEvent) {
         lock.lock()
         let continuation = continuation
+        delivered += 1
         lock.unlock()
         continuation?.yield(event)
+    }
+
+    func deliveredCount() -> Int {
+        lock.lock()
+        let count = delivered
+        lock.unlock()
+        return count
     }
 
     func finish() {
@@ -422,6 +433,13 @@ public actor PfsLocalClient {
     private let socketPathProvider: @Sendable () async throws -> String
     private let configuration: Configuration
     private let eventSink = PfsEventSink()
+    /// A strict-v3 subscription is bound to one physical UDS connection. Its
+    /// authority bridge treats loss of that frontend connection as terminal;
+    /// replay must never be silently migrated through the legacy reconnect
+    /// stream.
+    private var strictV3EventSink: PfsEventSink?
+    private var strictV3ConnectionID: UUID?
+    private var strictV3Terminal = false
     private var connection: PfsConnection?
     private var connectingTask: Task<Void, Error>?
     private var pending: [UInt64: PfsPendingRequest] = [:]
@@ -451,6 +469,7 @@ public actor PfsLocalClient {
     deinit {
         connection?.socket.close()
         eventSink.finish()
+        strictV3EventSink?.finish()
     }
 
     /// Sends a raw pfslocal request body and returns the matching reply envelope.
@@ -618,6 +637,23 @@ public actor PfsLocalClient {
     public func resolve(attachRef: String) async throws -> PfsResolveReply {
         try await ensureConnected()
         let reply = try await resolveOnCurrentConnection(attachRef: attachRef)
+        if reply.hasV3Coherence {
+            guard let connection else {
+                strictV3Terminal = true
+                throw PfsLocalClientError.connectionClosed
+            }
+            // Bind strict intent at the Resolve reply, before SubscribeEvents.
+            // A disconnect in that gap is participant loss and may not be
+            // repaired by transparently resolving the attach on connection B.
+            strictV3ConnectionID = connection.id
+            if connection.eventsSubscribed {
+                let error = PfsLocalClientError.unexpectedReply(
+                    "strict-v3 resolve cannot adopt a legacy event subscription"
+                )
+                closeCurrentConnection(connection.id, error: error)
+                throw error
+            }
+        }
         resolvedAttachRef = attachRef
         connection?.resolvedAttachRef = attachRef
         return reply
@@ -635,6 +671,98 @@ public actor PfsLocalClient {
         return eventSink.stream
     }
 
+    /// Subscribes on one exact physical connection for strict-v3 coherence.
+    /// Unlike the legacy diagnostic stream, this stream finishes as soon as
+    /// that UDS connection closes and permanently disables client reconnect.
+    /// Losing the local participant is an authority-session failure, not an
+    /// invitation to wait indefinitely for another connection epoch.
+    public func subscribeStrictV3Events() async throws -> AsyncStream<PfsEvent> {
+        guard strictV3EventSink == nil, !strictV3Terminal else {
+            throw PfsLocalClientError.connectionClosed
+        }
+        guard let connection,
+              let strictV3ConnectionID,
+              strictV3ConnectionID == connection.id else {
+            throw PfsLocalClientError.connectionClosed
+        }
+        if connection.eventsSubscribed {
+            let error = PfsLocalClientError.unexpectedReply(
+                "strict-v3 subscription cannot join an event stream already in progress"
+            )
+            closeCurrentConnection(connection.id, error: error)
+            throw error
+        }
+
+        // Install the sink before SubscribeEvents can expose the first event.
+        // Otherwise an immediately-ready authority barrier could arrive in the
+        // actor turn between the subscribe reply and this method's return.
+        wantsEvents = true
+        let sink = PfsEventSink(bufferingPolicy: .unbounded)
+        strictV3EventSink = sink
+        do {
+            try await subscribeOnCurrentConnection()
+            connection.eventsSubscribed = true
+            return sink.stream
+        } catch {
+            if self.strictV3ConnectionID == connection.id {
+                // Once Resolve selected strict-v3, failing to establish its
+                // subscription on that exact connection is terminal. Leaving
+                // the socket live here would let ordinary filesystem requests
+                // continue on a participant that cannot receive barriers.
+                closeCurrentConnection(connection.id, error: error)
+            }
+            throw error
+        }
+    }
+
+    /// Sends one v3 visibility cursor verdict on the priority control lane.
+    /// Acknowledging a repair is what releases the authority-side mutation, so
+    /// this request must not queue behind an arbitrary backlog of filesystem
+    /// calls on the same local connection.
+    public func acknowledgeVisibility(_ request: PfsVisibilityAckRequest) async throws {
+        try Task.checkCancellation()
+        if attachIsDetaching {
+            throw PfsLocalClientError.daemon(errno: ENXIO, message: "attach is detaching")
+        }
+        guard !isShutdown,
+              !strictV3Terminal,
+              let strictV3ConnectionID,
+              connection?.id == strictV3ConnectionID else {
+            throw PfsLocalClientError.connectionClosed
+        }
+        let envelope = try await sendRequestOnCurrentConnection(
+            .visibilityAck(request),
+            lane: .publication
+        )
+        guard case .visibilityAckReply? = envelope.body else {
+            throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+        }
+    }
+
+    /// Performs the strict frontend's on-demand daemon-to-authority liveness
+    /// round trip on the priority lane of the exact resolved connection.
+    /// This deliberately bypasses `ensureConnected`: reconnecting would turn
+    /// loss of the authority participant into a new, unrelated UDS session.
+    public func checkV3Liveness(
+        _ request: PfsV3LivenessRequest
+    ) async throws -> PfsV3LivenessReply {
+        try Task.checkCancellation()
+        guard !isShutdown,
+              !strictV3Terminal,
+              let strictV3ConnectionID,
+              connection?.id == strictV3ConnectionID else {
+            throw PfsLocalClientError.connectionClosed
+        }
+        let envelope = try await sendRequestOnCurrentConnection(
+            .v3Liveness(request),
+            lane: .publication
+        )
+        guard case let .v3LivenessReply(reply)? = envelope.body else {
+            throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+        }
+        return reply
+    }
+
     /// Closes the active connection and fails all in-flight requests.
     public func close() {
         guard !isShutdown else {
@@ -647,6 +775,10 @@ public actor PfsLocalClient {
         connection = nil
         failAllPending(with: PfsLocalClientError.shutdown)
         eventSink.finish()
+        strictV3EventSink?.finish()
+        strictV3EventSink = nil
+        strictV3ConnectionID = nil
+        strictV3Terminal = true
     }
 
     private func ensureConnected() async throws {
@@ -655,6 +787,9 @@ public actor PfsLocalClient {
         }
         if isShutdown {
             throw PfsLocalClientError.shutdown
+        }
+        if strictV3Terminal {
+            throw PfsLocalClientError.connectionClosed
         }
         if let task = connectingTask {
             try await task.value
@@ -745,7 +880,11 @@ public actor PfsLocalClient {
                 if case let .attachState(state)? = event.kind, state.state == .detaching {
                     attachIsDetaching = true
                 }
-                eventSink.yield(event)
+                if strictV3ConnectionID == connectionID {
+                    strictV3EventSink?.yield(event)
+                } else {
+                    eventSink.yield(event)
+                }
             }
             return
         }
@@ -796,6 +935,12 @@ public actor PfsLocalClient {
         guard connection?.id == connectionID else {
             return
         }
+        if strictV3ConnectionID == connectionID {
+            strictV3Terminal = true
+            strictV3EventSink?.finish()
+            strictV3EventSink = nil
+            strictV3ConnectionID = nil
+        }
         let socket = connection?.socket
         connection = nil
         socket?.close()
@@ -809,6 +954,13 @@ public actor PfsLocalClient {
             request.timeoutTask?.cancel()
             request.continuation.resume(throwing: error)
         }
+    }
+
+    func testingEventDeliveryCounts() -> (legacy: Int, strictV3: Int) {
+        (
+            legacy: eventSink.deliveredCount(),
+            strictV3: strictV3EventSink?.deliveredCount() ?? 0
+        )
     }
 
     private func helloOnCurrentConnection() async throws {
@@ -826,7 +978,14 @@ public actor PfsLocalClient {
         // ignored the field would keep the compiled-in 60s bound that was
         // observed live to expire ahead of the daemon's own 50s admission
         // budget, and nothing on the wire would say so.
-        hello.protocolMinor = 7
+        // Protocol minor 8: this wire client understands the resolved v3
+        // coherence contract, ordered visibility events, and request/reply
+        // cursor acks. VolumeCore still rejects a strict attach until its live
+        // namespace index, callback barrier, and backend are installed;
+        // recognizing and refusing is materially different from ignoring.
+        // Protocol minor 9: a strict frontend independently demands an exact
+        // daemon-to-authority liveness round trip on its resolved session.
+        hello.protocolMinor = 9
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -834,7 +993,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 7 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 9 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
         // ADOPT THE DAEMON'S BOUND, AND NEVER SHORTEN IT.
@@ -868,7 +1027,10 @@ public actor PfsLocalClient {
         }
     }
 
-    private func sendRequestOnCurrentConnection(_ body: PfsEnvelope.OneOf_Body) async throws -> PfsEnvelope {
+    private func sendRequestOnCurrentConnection(
+        _ body: PfsEnvelope.OneOf_Body,
+        lane: PfsEnvelopeWriteLane = .request
+    ) async throws -> PfsEnvelope {
         if isShutdown {
             throw PfsLocalClientError.shutdown
         }
@@ -888,6 +1050,12 @@ public actor PfsLocalClient {
                     throw PfsLocalClientError.connectionClosed
                 }
                 operationID = binding.id
+                // The publication-barrier ticket must learn this callback's
+                // logical operation ID at the same instant the daemon does:
+                // it is the identity a source COMPLETE names, and stamping it
+                // any later would let a PREPARE barrier mistake the initiating
+                // callback for an ordinary one and deadlock draining it.
+                PfsMacOSCallbackAdmission.ticket?.noteOperationID(binding.id)
                 if binding.isNew {
                     guard connection.nextOperationID != UInt64.max else {
                         connection.socket.close()
@@ -946,7 +1114,10 @@ public actor PfsLocalClient {
                     return
                 }
                 let outboundEnvelope = envelope
-                let writeReceipt = connection.writer.enqueue(outboundEnvelope)
+                let writeReceipt = connection.writer.enqueue(
+                    outboundEnvelope,
+                    lane: lane
+                )
                 Task.detached { [connectionID = connection.id, writeReceipt] in
                     do {
                         try await writeReceipt.wait()

@@ -11,12 +11,15 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -69,6 +72,10 @@ const (
 
 // RPC is the exact authority contract required by the mount. Keeping this
 // interface narrow makes kernel mapping independently fault-testable.
+//
+// The last five methods are the strict cache contract. An uncached mount never
+// calls them, so a transport that only implements the first seven can still
+// serve CoherenceUncached, which remains a supported deployment profile.
 type RPC interface {
 	Root() *authoritypb.Item
 	IOLimits() (uint32, uint32)
@@ -78,6 +85,24 @@ type RPC interface {
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	Close() error
+
+	// SessionID is this mount's authority session identity. It is the only way
+	// a frontend can recognise a visibility event it initiated itself, and
+	// therefore the only way it can avoid deadlocking against its own syscall.
+	SessionID() []byte
+	// InitialVisibilityCursor is the cursor the attach reply carried. Starting
+	// anywhere else is a protocol violation the authority fences.
+	InitialVisibilityCursor() *authoritypb.VisibilityCursor
+	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
+	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
+	// ReportVisibilityBlocked says this mount cannot service the phase it is
+	// holding. It always ends the session, so it is never speculative: see
+	// rawFileSystem.blockedRepair for the two facts that must both be true, and
+	// note that only this frontend holds the second one.
+	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor) error
+	// DetachAfterUnmount may be called only with evidence that this frontend's
+	// kernel mount is gone.
+	DetachAfterUnmount(context.Context, MountAbsenceProof) error
 }
 
 type Config struct {
@@ -93,6 +118,29 @@ type Config struct {
 	ReclaimQueue int
 	PresentedUID uint32
 	PresentedGID uint32
+	// Coherence is the kernel-cache contract this mount declares. It must be
+	// the same profile the transport attached with, because the authority sized
+	// its barrier obligations from that declaration.
+	Coherence CoherenceProfile
+	// CachedNameCapacity bounds the directory bindings a strict mount may leave
+	// resident in its kernel, and therefore also the work self-revocation has
+	// to do. Zero selects defaultCachedNameCapacity.
+	CachedNameCapacity int
+	// RepairBudget is the per-phase deadline a strict mount commits to. Zero
+	// selects defaultRepairBudget.
+	RepairBudget time.Duration
+
+	// Routes is the activated machine-local route set: the volume's
+	// .portablefs/local-dirs declaration unioned with whatever the command line
+	// added, compiled once (see ActivateRoutes). An empty set means every path
+	// is served from the authority. Its Revision is the value this mount must
+	// have declared at attach, so the two can never describe different
+	// topologies.
+	Routes localroutes.RuleSet
+	// LocalBacking is the per-machine tree that holds grafted subtrees. It is
+	// required whenever Routes is non-empty, because a route that cannot be
+	// served locally is not a route.
+	LocalBacking string
 }
 
 type Mount struct {
@@ -115,17 +163,61 @@ type Mount struct {
 	requestTimeout time.Duration
 	uid            uint32
 	gid            uint32
+
+	// The strict cache contract. raw is the kernel-facing table that owns the
+	// cached-name registry and the publication gate; kernelMount is the
+	// installed mount's identity, which is what makes both self-revocation and
+	// a mount-absence proof exact rather than path-shaped guesses.
+	profile      CoherenceProfile
+	nameCapacity int
+	repairBudget time.Duration
+	raw          *rawFileSystem
+	kernelMount  kernelMount
+	revoked      atomic.Bool
+	revokeOnce   sync.Once
+	notifyMu     sync.Mutex
+	notify       kernelNotifier
+	publications mutationPublicationLedger
+
+	// grafts serves the machine-local routes, nil when the volume declares
+	// none. routesRevision is the declaration this mount attached with, and is
+	// what a routes-change event is judged against.
+	grafts         *localdirs.Grafts
+	backing        string
+	routesRevision [32]byte
 }
 
-// MountVolume mounts one authority session without a write-back cache. Direct
-// I/O plus zero attr/entry TTLs is the correctness-first coherence contract:
-// every completed read has gone through the one active volume authority.
-// Shared mmap is intentionally unavailable because the mount cannot revoke
-// kernel-cached pages coherently when another machine mutates the same file.
+// publishAttr routes one stat answer through the cache contract. A mount with
+// no kernel-facing table yet (or an uncached one) publishes no lifetime at all.
+func (m *Mount) publishAttr(out *fuse.AttrOut, attr *authoritypb.Attr) {
+	if m.raw == nil {
+		fillAttr(attr, &out.Attr, m.uid, m.gid)
+		out.SetTimeout(0)
+		return
+	}
+	m.raw.publishAttr(out, attr)
+}
+
+// MountVolume mounts one authority session without a write-back cache.
+//
+// File data is never cached: direct I/O keeps every completed read on the wire
+// to the one active volume authority, and shared mmap stays unavailable because
+// no kernel primitive can revoke a mapped page coherently across machines.
+// Names and attributes are a different question, and the answer depends on the
+// declared profile. CoherenceUncached publishes nothing with a lifetime and
+// owes the authority nothing. CoherenceStrict caches both and pays for them by
+// executing the authority's two-phase visibility barrier, so a change made on
+// another machine is repaired here before that machine's syscall returns.
 func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
 	if mountpoint == "" || rpc == nil || cfg.FSName == "" || cfg.RequestTimeout <= 0 ||
 		cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.MaxInFlight < minMaxInFlight {
 		return nil, fmt.Errorf("fusev3: complete mount configuration is required with at least %d authority in-flight slots", minMaxInFlight)
+	}
+	if cfg.Coherence != CoherenceUncached && cfg.Coherence != CoherenceStrict {
+		return nil, errors.New("fusev3: unknown coherence profile")
+	}
+	if cfg.Coherence == CoherenceStrict && len(rpc.SessionID()) == 0 {
+		return nil, errors.New("fusev3: strict coherence requires the authority session identity; without it this mount cannot recognise -- and would deadlock against -- its own mutations")
 	}
 	rootItem := rpc.Root()
 	if rootItem == nil || rootItem.GetAttr() == nil || len(rootItem.GetToken()) == 0 {
@@ -144,14 +236,36 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		return nil, err
 	}
 	m := newMount(parent, rpc, cfg)
+	// The machine-local serving state is built before the kernel mount exists.
+	// A mount that cannot serve the routes it declared at attach is serving a
+	// different topology than the authority admitted it with, so this fails the
+	// mount rather than degrading to authority-only service.
+	grafts, err := localdirs.New(localdirs.Config{BackingRoot: cfg.LocalBacking, Rules: cfg.Routes})
+	if err != nil {
+		m.cancel()
+		_ = rpc.Close()
+		return nil, fmt.Errorf("fusev3: serve machine-local routes: %w", err)
+	}
+	m.grafts, m.backing = grafts, cfg.LocalBacking
 	root := &node{mount: m, item: cloneItem(rootItem), requestTimeout: cfg.RequestTimeout, maxRead: maxRead, maxWrite: maxWrite}
 	server, err := fuse.NewServer(newRawFileSystem(m, root), mountpoint, options)
 	if err != nil {
 		m.cancel()
+		_ = grafts.Close()
 		_ = rpc.Close()
 		return nil, fmt.Errorf("mount PortableFS v3: %w", err)
 	}
 	m.server = server
+	m.setNotifier(server)
+	// NewServer has installed the kernel mount, so it is now observable. Its
+	// identity is recorded before anything can use the mount: its later absence
+	// is the only thing that authorises a clean strict detach, and
+	// self-revocation needs its device to abort the connection.
+	installed, err := observeKernelMount(mountpoint)
+	if err != nil {
+		return nil, m.abortMount(err)
+	}
+	m.kernelMount = installed
 	// Every background goroutine is registered before the request loop can run.
 	// A request that fails the mount inside Serve reaches Unmount -> wg.Wait,
 	// which must never observe a counter that is still being raised from zero.
@@ -163,7 +277,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		// session so callers can never observe a mounted but unserved path.
 		return nil, m.abortMount(fmt.Errorf("initialize PortableFS v3 mount: %w", err))
 	}
-	if err := verifyKernelGuarantees(server.KernelSettings(), maxWrite); err != nil {
+	if err := verifyKernelGuarantees(server.KernelSettings(), maxWrite, cfg.Coherence); err != nil {
 		return nil, m.abortMount(err)
 	}
 	return m, nil
@@ -172,14 +286,32 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	ctx, cancel := context.WithCancel(parent)
 	workers := reclaimLaneWidth(cfg.MaxInFlight)
+	if cfg.CachedNameCapacity <= 0 {
+		cfg.CachedNameCapacity = defaultCachedNameCapacity
+	}
+	if cfg.RepairBudget <= 0 {
+		cfg.RepairBudget = defaultRepairBudget
+	}
+	reserved := livenessReserve
+	if cfg.Coherence == CoherenceStrict {
+		// The visibility loop owns a transport slot no bulk request can take.
+		// Acknowledging is what releases the mutating machine on every other
+		// participant in the volume, so starving this lane behind saturated I/O
+		// would convert local load into a volume-wide stall.
+		reserved += visibilityReserve
+	}
 	return &Mount{
 		rpc: rpc, ctx: ctx, cancel: cancel,
 		reclaim:        newReclaimQueue(cfg.ReclaimQueue),
 		reclaimWorkers: workers,
-		bulk:           make(chan struct{}, cfg.MaxInFlight-workers-livenessReserve),
+		bulk:           make(chan struct{}, cfg.MaxInFlight-workers-reserved),
 		requestTimeout: cfg.RequestTimeout,
 		uid:            cfg.PresentedUID,
 		gid:            cfg.PresentedGID,
+		profile:        cfg.Coherence,
+		nameCapacity:   cfg.CachedNameCapacity,
+		repairBudget:   cfg.RepairBudget,
+		routesRevision: cfg.Routes.Revision(),
 	}
 }
 
@@ -201,6 +333,11 @@ func (m *Mount) start(lease time.Duration) {
 	for range m.reclaimWorkers {
 		go m.reclaimLoop(m.ctx)
 	}
+	if m.profile != CoherenceStrict {
+		return
+	}
+	m.wg.Add(1)
+	go (&coherence{mount: m, session: cloneBytes(m.rpc.SessionID()), budget: m.repairBudget}).run(m.ctx)
 }
 
 // abortMount removes a kernel mount that was installed but cannot be served,
@@ -226,12 +363,14 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 		MaxWrite:      int(maxWrite),
 		MaxBackground: cfg.MaxBackground,
 		EnableLocks:   true,
-		// READDIRPLUS is refused rather than merely unimplemented. Its whole
-		// value is installing dentries with a nonzero entry timeout; with the
-		// zero timeouts this mount's coherence contract requires, every entry
-		// it returned would already be expired, so the kernel would re-issue
-		// LOOKUP anyway while the authority minted one extra capability per
-		// directory entry for this frontend to hand straight back.
+		// READDIRPLUS stays refused. Now that a strict mount does publish
+		// nonzero entry lifetimes the old reason no longer holds, but the
+		// remaining one is decisive: the authority mints one capability per
+		// entry it returns, so serving READDIRPLUS means interning -- and
+		// eventually reclaiming -- every name in a directory whether or not
+		// anything ever looks at it. `ls` on a large tree would pay for a full
+		// LOOKUP-equivalent per entry to populate a cache the caller does not
+		// use. Ordinary READDIR plus cached LOOKUPs is strictly less work.
 		DisableReadDirPlus: true,
 		// Shared mmap over direct I/O is a decision of this mount, not an
 		// accident of which capabilities go-fuse happens to forward. The mount
@@ -263,13 +402,23 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 // evidence at all: on a kernel that does not support forwarded locks the mount
 // silently falls back to the local lock manager, two mounts on one host still
 // exclude each other, and only mounts on different hosts lose exclusion.
-func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
+func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32, profile CoherenceProfile) error {
 	if settings == nil {
 		return errors.New("fusev3: kernel INIT settings are unavailable; the mount guarantees cannot be verified")
 	}
 	granted := settings.Flags64()
 	if granted&fuse.CAP_POSIX_LOCKS == 0 || granted&fuse.CAP_FLOCK_LOCKS == 0 {
 		return fmt.Errorf("fusev3: kernel does not forward POSIX and BSD file locks (INIT flags %#x); cross-machine lock exclusion is unavailable", granted)
+	}
+	// A strict mount publishes names and attributes with a lifetime, and the
+	// only thing that makes that safe is being able to take them back. Both
+	// notifications are protocol 7.12; a kernel that cannot receive them cannot
+	// host this profile, and the mount must be refused rather than served with
+	// a cache nothing can revoke.
+	if profile == CoherenceStrict &&
+		(!settings.SupportsNotify(fuse.NOTIFY_INVAL_ENTRY) || !settings.SupportsNotify(fuse.NOTIFY_INVAL_INODE)) {
+		return fmt.Errorf("fusev3: kernel FUSE protocol %d.%d cannot receive entry and inode invalidations; strict coherence has no way to revoke what it caches",
+			settings.Major, settings.Minor)
 	}
 	if uint64(maxWrite) > uint64(kernelDefaultMaxPages)*uint64(syscall.Getpagesize()) && granted&fuse.CAP_MAX_PAGES == 0 {
 		return fmt.Errorf("fusev3: kernel caps every request at %d pages and cannot carry the negotiated %d-byte write as one request", kernelDefaultMaxPages, maxWrite)
@@ -279,7 +428,7 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 
 func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 	defer m.wg.Done()
-	interval := lease / 3
+	interval := keepAliveInterval(lease, m.profile, m.repairBudget)
 	timer := time.NewTicker(interval)
 	defer timer.Stop()
 	for {
@@ -310,6 +459,27 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 	}
 }
 
+// keepAliveInterval makes the strict frontend's authority-contact failure
+// bound no larger than its cache-repair contract. The authority may fence a
+// participant whose visibility reply was lost; after that fence, this lane is
+// how the frontend learns it must abort even though it never received the
+// event that would have started a phase timer. One interval to start a renewal
+// plus one interval for its deadline is at most two thirds of RepairBudget.
+func keepAliveInterval(lease time.Duration, profile CoherenceProfile, repairBudget time.Duration) time.Duration {
+	interval := lease / 3
+	if profile == CoherenceStrict {
+		if strict := repairBudget / 3; strict < interval {
+			interval = strict
+		}
+	}
+	if interval <= 0 {
+		// Mount admission already requires positive bounds. This floor merely
+		// keeps sub-nanosecond integer division from reaching NewTicker.
+		return time.Nanosecond
+	}
+	return interval
+}
+
 func (m *Mount) watchSession(ctx context.Context, done <-chan struct{}) {
 	defer m.wg.Done()
 	select {
@@ -337,9 +507,17 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 			return
 		}
 		callCtx, cancel := context.WithTimeout(ctx, m.requestTimeout)
-		response, err := m.rpc.CallRead(callCtx, &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: token}}})
+		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: token}}}
+		response, err := m.rpc.CallMutation(callCtx, request)
 		cancel()
 		if ctx.Err() != nil {
+			return
+		}
+		// A reclaim runs on no raw callback, but it still occupies a replay
+		// sequence on its slot, and the publication ledger must see that
+		// sequence settle or the slot's watermark stops advancing forever.
+		if publicationErr := m.recordMutationResponse(ctx, request, response, err); publicationErr != nil {
+			m.revoke(publicationErr)
 			return
 		}
 		if err != nil || responseErrno(response) != 0 {
@@ -371,6 +549,12 @@ func (m *Mount) cleanupFailed(operation string, err error) {
 // are ready, so a single combined select would fail an admissible call roughly
 // half the time whenever the operation deadline had already expired.
 func (m *Mount) acquireBulk(ctx context.Context) syscall.Errno {
+	// A revoked mount answers nothing. This is the single choke point every
+	// authority-backed operation passes through, so refusing here is what makes
+	// self-revocation immediate rather than eventual.
+	if m.isRevoked() {
+		return revokedErrno
+	}
 	select {
 	case m.bulk <- struct{}{}:
 		return 0
@@ -532,10 +716,8 @@ func (m *Mount) closeLocked() error {
 	m.wg.Wait()
 	// Any capability still queued for reclaim is released by Detach: ending the
 	// session drops every item and open this session holds.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_, _ = m.rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
-	cancel()
-	return errors.Join(m.fatalError(), m.rpc.Close())
+	m.detach()
+	return errors.Join(m.fatalError(), m.grafts.Close(), m.rpc.Close())
 }
 
 func (m *Mount) fatalError() error {
@@ -578,6 +760,17 @@ type dirHandle struct {
 	pendingCookie []byte
 	eof           bool
 	once          sync.Once
+
+	// local is the set of machine-local route roots this directory contains and
+	// shadow is the set of names they own. Both are decided once, when the
+	// stream is opened, for the same reason the authority pages its own listing
+	// from a verifier: a listing that recomputed them per reply could show a
+	// name twice or lose it across the reply boundary. The roots are delivered
+	// after the volume's own entries, in an offset space of their own, so
+	// resuming from any offset the kernel was given lands exactly where it did.
+	local      []fuse.DirEntry
+	shadow     func(name string) bool
+	localIndex int
 }
 
 func (n *node) opContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -603,6 +796,10 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 	}
 	defer n.mount.releaseBulk()
 	response, err := n.mount.rpc.CallMutation(ctx, request)
+	if publicationErr := n.mount.recordMutationResponse(parent, request, response, err); publicationErr != nil {
+		n.mount.revoke(publicationErr)
+		return response, syscall.EIO
+	}
 	return response, rpcErrno(response, err)
 }
 
@@ -631,10 +828,7 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 	if attr == nil {
 		return syscall.EIO
 	}
-	fillAttr(attr, &out.Attr, n.mount.uid, n.mount.gid)
-	// See fillEntry: a nonzero attribute timeout would let this kernel answer
-	// stat(2) from its own page-less attribute cache without the authority.
-	out.SetTimeout(0)
+	n.mount.publishAttr(out, attr)
 	return 0
 }
 
@@ -703,7 +897,12 @@ func (n *node) Write(ctx context.Context, handle *fileHandle, data []byte, off i
 	if handle.append {
 		requestOffset = 0
 	}
-	response, err := n.mount.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: cloneBytes(handle.token), Offset: requestOffset, Data: cloneBytes(data), Append: handle.append}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: cloneBytes(handle.token), Offset: requestOffset, Data: cloneBytes(data), Append: handle.append}}}
+	response, err := n.mount.rpc.CallMutation(ctx, request)
+	if publicationErr := n.mount.recordMutationResponse(ctx, request, response, err); publicationErr != nil {
+		n.mount.revoke(publicationErr)
+		return 0, syscall.EIO
+	}
 	if err != nil {
 		return 0, rpcErrno(response, err)
 	}
@@ -782,40 +981,69 @@ func (h *dirHandle) peek(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
 	if h.pending != nil {
 		return h.pending, 0
 	}
-	for h.index >= len(h.page) {
-		if h.eof {
-			return nil, 0
+	for {
+		for h.index >= len(h.page) {
+			if h.eof {
+				return h.peekLocalLocked(), 0
+			}
+			response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), Verifier: cloneBytes(h.verifier), MaxEntries: 256}}})
+			if errno != 0 {
+				return nil, errno
+			}
+			page := response.GetReadDir()
+			if page == nil || len(page.GetVerifier()) == 0 {
+				return nil, syscall.EIO
+			}
+			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
+			h.verifier = cloneBytes(page.GetVerifier())
+			if len(h.page) == 0 && !h.eof {
+				return nil, syscall.EIO
+			}
 		}
-		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), Verifier: cloneBytes(h.verifier), MaxEntries: 256}}})
-		if errno != 0 {
-			return nil, errno
-		}
-		page := response.GetReadDir()
-		if page == nil || len(page.GetVerifier()) == 0 {
+		entry := h.page[h.index]
+		attr := entry.GetAttr()
+		if attr == nil {
 			return nil, syscall.EIO
 		}
-		h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
-		h.verifier = cloneBytes(page.GetVerifier())
-		if len(h.page) == 0 && !h.eof {
+		offset, ok := decodeCookie(entry.GetNextCookie())
+		if !ok {
+			// go-fuse substitutes `lastOffset + 1` for a zero DirEntry.Off, so a
+			// short or zero authority cookie would be silently replaced by an
+			// offset the authority cannot resume from, turning `ls` on a directory
+			// larger than one reply into an infinite loop.
 			return nil, syscall.EIO
 		}
+		if offset&graftDirOffsetBase != 0 {
+			// The top bit of the offset space belongs to merged route roots.
+			// An authority cookie that carried it would alias onto one of them,
+			// so it is refused rather than served as the wrong entry.
+			return nil, syscall.EIO
+		}
+		name := string(entry.GetName())
+		if h.shadow != nil && h.shadow(name) {
+			// A route rule owns this name unconditionally: the volume's
+			// same-named entry is not merged, it is replaced. Advancing here
+			// rather than emitting is what makes the name appear exactly once.
+			h.index++
+			h.cookie = cloneBytes(entry.GetNextCookie())
+			h.next = offset
+			continue
+		}
+		h.pending = &fuse.DirEntry{Name: name, Mode: direntMode(attr.GetKind()), Ino: attr.GetInode(), Off: offset}
+		h.pendingCookie = cloneBytes(entry.GetNextCookie())
+		return h.pending, 0
 	}
-	entry := h.page[h.index]
-	attr := entry.GetAttr()
-	if attr == nil {
-		return nil, syscall.EIO
+}
+
+// peekLocalLocked returns the next merged route root. They are delivered after
+// the volume's own entries because the volume's offsets are the authority's to
+// choose and this frontend has nowhere to put an entry in front of them.
+func (h *dirHandle) peekLocalLocked() *fuse.DirEntry {
+	if h.localIndex >= len(h.local) {
+		return nil
 	}
-	offset, ok := decodeCookie(entry.GetNextCookie())
-	if !ok {
-		// go-fuse substitutes `lastOffset + 1` for a zero DirEntry.Off, so a
-		// short or zero authority cookie would be silently replaced by an
-		// offset the authority cannot resume from, turning `ls` on a directory
-		// larger than one reply into an infinite loop.
-		return nil, syscall.EIO
-	}
-	h.pending = &fuse.DirEntry{Name: string(entry.GetName()), Mode: kindMode(attr.GetKind()), Ino: attr.GetInode(), Off: offset}
-	h.pendingCookie = cloneBytes(entry.GetNextCookie())
-	return h.pending, 0
+	entry := h.local[h.localIndex]
+	return &entry
 }
 
 // consume accepts the entry last returned by peek. Until it is called the entry
@@ -825,6 +1053,10 @@ func (h *dirHandle) consume() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.pending == nil {
+		if h.localIndex < len(h.local) {
+			h.next = h.local[h.localIndex].Off
+			h.localIndex++
+		}
 		return
 	}
 	h.index++
@@ -841,13 +1073,25 @@ func (h *dirHandle) Seekdir(_ context.Context, off uint64) syscall.Errno {
 		// buffered page is the whole point of fetching 256 entries at a time.
 		return 0
 	}
+	h.pending, h.pendingCookie = nil, nil
 	h.next = off
+	if off&graftDirOffsetBase != 0 {
+		// The kernel is resuming inside the merged route roots, so the volume's
+		// own listing is already finished for this stream.
+		index := int(off &^ graftDirOffsetBase)
+		if index > len(h.local) {
+			return syscall.EINVAL
+		}
+		h.localIndex = index
+		h.page, h.index, h.eof = nil, 0, true
+		return 0
+	}
+	h.localIndex = 0
 	h.cookie = encodeCookie(off)
 	if off == 0 {
 		h.verifier = nil
 	}
 	h.page, h.index, h.eof = nil, 0, false
-	h.pending, h.pendingCookie = nil, nil
 	return 0
 }
 
@@ -1036,8 +1280,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	if response.GetPostAttr() == nil {
 		return syscall.EIO
 	}
-	fillAttr(response.GetPostAttr(), &out.Attr, n.mount.uid, n.mount.gid)
-	out.SetTimeout(0)
+	n.mount.publishAttr(out, response.GetPostAttr())
 	return 0
 }
 
@@ -1163,6 +1406,10 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	}
 	defer n.mount.releaseBulk()
 	response, err := n.mount.rpc.CallMutation(ctx, request)
+	if publicationErr := n.mount.recordMutationResponse(ctx, request, response, err); publicationErr != nil {
+		n.mount.revoke(publicationErr)
+		return syscall.EIO
+	}
 	return rpcErrno(response, err)
 }
 
@@ -1209,6 +1456,19 @@ func setTime(ns int64, seconds *uint64, nanos *uint32) {
 		return
 	}
 	*seconds, *nanos = uint64(ns/1e9), uint32(ns%1e9)
+}
+
+// direntMode is the readdir rendering of a kind. Unlike kindMode it passes an
+// unspecified kind through as DT_UNKNOWN (mode 0): the authority lists an
+// inode it never exposes — a device node or FIFO another writer placed in the
+// tree — as an opaque entry, and the application's follow-up stat fails
+// exactly as it does on a local directory. Defaulting it to a regular file
+// here would invent a type the authority deliberately refused to state.
+func direntMode(kind authoritypb.Attr_Kind) uint32 {
+	if kind == authoritypb.Attr_KIND_UNSPECIFIED {
+		return 0
+	}
+	return kindMode(kind)
 }
 
 func kindMode(kind authoritypb.Attr_Kind) uint32 {

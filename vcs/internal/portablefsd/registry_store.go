@@ -49,6 +49,11 @@ type persistedAttachEntry struct {
 	DetachForce         bool                  `json:"detachForce,omitempty"`
 	DetachJobID         string                `json:"detachJobId,omitempty"`
 	Items               []persistedItemRecord `json:"items,omitempty"`
+	// V3 marks an authority-v3 attach. It carries only the credential-free
+	// declared contract (see v3attach.go): the strict session dies with the
+	// daemon process, so a revived v3 entry supports exactly one operation —
+	// the exact unmount — and is never reactivated from disk.
+	V3 *persistedV3Attach `json:"v3,omitempty"`
 }
 
 type persistedItemRecord struct {
@@ -268,8 +273,24 @@ func validatePersistedAttach(e *persistedAttachEntry) error {
 	if strings.TrimSpace(e.VolumeID) == "" || strings.TrimSpace(e.VolumeID) != e.VolumeID {
 		return fmt.Errorf("volumeId is empty or has surrounding whitespace")
 	}
-	if strings.TrimSpace(e.Branch) == "" || strings.TrimSpace(e.Branch) != e.Branch {
-		return fmt.Errorf("branch is empty or has surrounding whitespace")
+	if strings.TrimSpace(e.Branch) != e.Branch {
+		return fmt.Errorf("branch has surrounding whitespace")
+	}
+	// A v3 attach is exactly the branchless case; every other attach still
+	// requires a branch, so the two modes cannot be confused in the inventory.
+	if e.Branch == "" && e.V3 == nil {
+		return fmt.Errorf("branch is empty")
+	}
+	if e.Branch != "" && e.V3 != nil {
+		return fmt.Errorf("a v3 attach must be branchless")
+	}
+	if e.V3 != nil {
+		if err := validPersistedV3Attach(e.V3); err != nil {
+			return fmt.Errorf("invalid v3 attach contract: %w", err)
+		}
+		if e.DataPlaneTransport != "tls-private-ca" && e.DataPlaneTransport != "tls-system-pki" {
+			return fmt.Errorf("v3 attach requires mutually authenticated TLS; transport %q is invalid", e.DataPlaneTransport)
+		}
 	}
 	if !filepath.IsAbs(e.MountPath) || filepath.Clean(e.MountPath) != e.MountPath {
 		return fmt.Errorf("mountPath %q is not canonical and absolute", e.MountPath)

@@ -2,6 +2,8 @@ package localdirs
 
 import (
 	"context"
+	"errors"
+	iofs "io/fs"
 	"syscall"
 	"time"
 
@@ -179,43 +181,69 @@ func (g *Grafts) LinkChild(ctx context.Context, parent *fs.Inode, target fs.Inod
 	return g.attachChild(ctx, parent, &st), 0
 }
 
-// MergeParentListing merges graft roots into their parent directory's volume
-// listing: a graft root's name appears exactly once — shadowing any
+// MergeParentListing merges route roots into their parent directory's volume
+// listing: a route root's name appears exactly once — shadowing any
 // same-named volume entry — and only when its local backing exists. Applied
 // per-readdir by the volume adapters, after (and outside) clientcore's dir
 // cache, which stays pure-volume.
+//
+// Both halves are driven by the rules rather than by an enumerable list of
+// roots, because a floating pattern's roots cannot be enumerated in advance:
+// every volume entry whose path the rules route is dropped (the name belongs
+// to the rules, whether or not anything local exists yet), and the backing
+// directory for dir is scanned for names that ARE roots and do exist. The
+// scan is one local readdir of a directory holding only scaffold and roots —
+// never the dependency tree itself.
 func (g *Grafts) MergeParentListing(dir string, ents []clientcore.DirEntry) ([]clientcore.DirEntry, syscall.Errno) {
-	roots := g.RootsUnder(dir)
-	if len(roots) == 0 {
+	if g == nil {
 		return ents, 0
 	}
-	shadowed := map[string]bool{}
-	for _, root := range roots {
-		shadowed[baseName(root)] = true
-	}
-	merged := make([]clientcore.DirEntry, 0, len(ents)+len(roots))
+	merged := make([]clientcore.DirEntry, 0, len(ents)+4)
 	for _, e := range ents {
-		if !shadowed[e.Name] {
-			merged = append(merged, e)
+		if root, ok := g.rules.Match(childPathOf(dir, e.Name)); ok && root == childPathOf(dir, e.Name) {
+			continue // the rules own this name; the volume's copy is hidden
 		}
+		merged = append(merged, e)
 	}
-	for _, root := range roots {
-		st, eno := g.Lstat(root)
-		if eno == syscall.ENOENT {
-			// The rule owns the name but nothing has created the directory
-			// yet; it is simply absent (no phantom entries).
+	entries, err := g.root.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, iofs.ErrNotExist) {
+			return merged, 0
+		}
+		return nil, errnoOf(err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
 			continue
+		}
+		cp := childPathOf(dir, e.Name())
+		if root, ok := g.rules.Match(cp); !ok || root != cp {
+			// Scaffold on the way to a deeper root, or backing left behind by
+			// a rule that no longer exists: neither is a name in this
+			// directory. (`portablefs prune-local` reclaims the latter.)
+			continue
+		}
+		st, eno := g.Lstat(cp)
+		if eno == syscall.ENOENT {
+			continue // raced a concurrent removal
 		}
 		if eno != 0 {
 			return nil, eno
 		}
 		merged = append(merged, clientcore.DirEntry{
-			Name: baseName(root),
+			Name: e.Name(),
 			Attr: fsproto.Attr{Kind: "directory", Mode: uint32(st.Mode) & 0o7777, MtimeMs: statMtimeMs(&st), Nlink: 1},
 			Ino:  LocalIno(st.Ino),
 		})
 	}
 	return merged, 0
+}
+
+func childPathOf(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
 }
 
 func baseName(p string) string {

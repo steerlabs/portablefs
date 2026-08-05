@@ -12,10 +12,16 @@ import (
 )
 
 // ProtocolMajor is intentionally incompatible with every v2 fsproto/pfslocal
-// data path. Coordinated v3 peers fail closed instead of emulating old storage.
-const ProtocolMajor uint32 = 1
+// data path. Version 2 makes the attach-time routing revision mandatory; a v1
+// client cannot express that contract and must fail at Hello rather than spend
+// a capability only to fail later at Attach.
+const ProtocolMajor uint32 = 2
 
-const protocolALPN = "portablefs-authority-v1"
+// ProtocolALPN is exported so the production authority listener and the RPC
+// server package cannot drift onto different exact protocols.
+const ProtocolALPN = "portablefs-authority-v2"
+
+const protocolALPN = ProtocolALPN
 
 // FramePayloadReserve leaves deterministic room for the response envelope,
 // handles, attributes, and protobuf length tags around a negotiated data chunk.
@@ -44,8 +50,9 @@ const responseEnvelopeReserve uint32 = 64
 const fixedMutationReplyBytes uint32 = 4096
 
 // maxDirentBytes bounds one encoded directory entry: a name of at most
-// NAME_MAX (255) bytes, one Attr, one 8-byte cookie, and their protobuf tags.
-const maxDirentBytes uint32 = 512
+// NAME_MAX (255) bytes, one Attr, one 8-byte cookie, and an optional Item whose
+// nested Attr is intentionally duplicated for a self-contained capability.
+const maxDirentBytes uint32 = 768
 
 // MinimumFrameBytes is the smallest frame an authority may be configured with.
 // Below it a legal fixed-shape mutation reply could not be written, so a
@@ -54,7 +61,7 @@ const MinimumFrameBytes uint32 = fixedMutationReplyBytes + responseEnvelopeReser
 
 var (
 	requiredHelloFeatures  = []string{"xfs-current-state", "session-exact-epoch", "direct-write"}
-	requiredAttachFeatures = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks"}
+	requiredAttachFeatures = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier"}
 )
 
 func hasFeatures(advertised, required []string) bool {
@@ -97,7 +104,8 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		*authoritypb.Request_Unlink, *authoritypb.Request_Rename,
 		*authoritypb.Request_Link, *authoritypb.Request_Symlink,
 		*authoritypb.Request_Write, *authoritypb.Request_SetAttr,
-		*authoritypb.Request_SetXattr, *authoritypb.Request_RemoveXattr:
+		*authoritypb.Request_SetXattr, *authoritypb.Request_RemoveXattr,
+		*authoritypb.Request_SyncFs:
 		return true
 	case *authoritypb.Request_Open:
 		flags := body.Open.GetFlags()
@@ -106,6 +114,46 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		return !body.SetLock.GetUnlock() && body.SetLock.GetLock() != nil && body.SetLock.GetLock().GetWrite()
 	default:
 		return false
+	}
+}
+
+// requestRequiresAdmin classifies an operation as volume-wide configuration
+// rather than filesystem work. Write access covers file contents; it does not
+// cover the declaration that decides which subtrees exist for every machine at
+// once, so that one is gated separately and explicitly.
+func requestRequiresAdmin(req *authoritypb.Request) bool {
+	_, admin := req.GetBody().(*authoritypb.Request_ApplyRoutes)
+	return admin
+}
+
+// requestUsesTopology reports whether a request is a filesystem operation whose
+// path ownership was decided by the mount's active machine-local routes. Those
+// requests hold the coordinator's topology read guard from revision admission
+// through their final result. Session and visibility control must not take the
+// guard: ApplyRoutes waits for visibility acknowledgments while holding the
+// writer, so making Ack depend on the read side would deadlock the barrier.
+func requestUsesTopology(req *authoritypb.Request) bool {
+	switch body := req.GetBody().(type) {
+	case *authoritypb.Request_Resume, *authoritypb.Request_KeepAlive,
+		*authoritypb.Request_Detach, *authoritypb.Request_Cancel,
+		*authoritypb.Request_NextVisibility, *authoritypb.Request_AckVisibility,
+		*authoritypb.Request_ApplyRoutes:
+		return false
+	case *authoritypb.Request_SetLock:
+		// A blocking lock wait never reaches XFS: the lock table is
+		// authority-epoch runtime state, so the topology invariant — no
+		// filesystem operation reaches XFS under a stale routing revision —
+		// does not apply to the wait. Holding the read guard across an
+		// unbounded F_SETLKW would let one waiter plus one queued ApplyRoutes
+		// writer stall every guarded request on the volume (a Go RWMutex
+		// admits no new readers once a writer is queued), so the wait is
+		// admitted through the ordinary session-routes check instead.
+		// Non-blocking lock calls keep the guard: they are cheap and complete
+		// immediately, so uniformity there costs nothing.
+		return body.SetLock.GetUnlock() || !body.SetLock.GetWait()
+	default:
+		// Unknown future filesystem operations fail closed into the guarded side.
+		return true
 	}
 }
 

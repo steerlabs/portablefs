@@ -24,6 +24,10 @@ var (
 	// ENOTSUP: the configured root is a filesystem that cannot provide the
 	// guarantees this store is built on (project quota, reflink, d_type).
 	ErrNotXFS = errnos.Sentinel("xfsstore: volume root is not on XFS", syscall.ENOTSUP)
+	// ENOTSUP: production mount flags are part of confinement and coherence,
+	// not deployment hints. In particular, without noatime an ordinary read is
+	// a hidden metadata mutation that bypasses the strict write barrier.
+	ErrUnsafeMount = errnos.Sentinel("xfsstore: XFS mount is missing required safety options", syscall.ENOTSUP)
 	// ESTALE: capabilities are epoch-local. A capability this epoch never
 	// issued, or one issued by a closed epoch, is exactly a stale handle.
 	ErrStaleObject = errnos.Sentinel("xfsstore: stale object capability", syscall.ESTALE)

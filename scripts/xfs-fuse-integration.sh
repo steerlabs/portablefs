@@ -27,6 +27,8 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSProjectGate"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSGateRefusesAForeignProjectID"
   "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFS"
+  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestBlockedLockWaitDoesNotHoldTheTopologyGuard"
+  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestRoutesControllerRefusesGitTrackedContentOnXFS"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTwoKernelMountsShareAuthoritativeXFS"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateWithAReadOnlyModeReturnsAWritableHandle"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountContentCoherence"
@@ -36,6 +38,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountNegativeDentryInvalidation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountRenameCoherence"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountDirectoryListingCoherence"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDirectoryWithNonPortableInodeRemainsListable"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirReturnsEveryNameExactlyOnce"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirRefusesToPageAcrossARemoteMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestConcurrentCrossMountWritersToOneFile"
@@ -44,6 +47,37 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts"
+  # The strict-profile cache-coherence battery. These are the only tests that
+  # execute the two-phase visibility barrier against a real kernel FUSE mount:
+  # everything else about strict coherence is either unit-level (no kernel) or
+  # black box through the coherence matrix (no RPC accounting). They are listed
+  # here for the same reason the rest are - a privileged test that is renamed or
+  # deleted must fail this job rather than quietly shrink the coverage that
+  # justifies caching names and attributes at all.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUncachedProfileRemainsFullyCorrect"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost"
+  # Machine-local routing must be proven against the real kernel and the real
+  # authority transport. Keep the zero-RPC tests here in particular: the
+  # cross-process matrix proves two-machine isolation, but intentionally does
+  # not infer request counts from noisy whole-process I/O counters.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedSubtreeReachesTheAuthorityZeroTimes"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftDentriesRemainUsableAcrossRenameUnlinkAndHardlink"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAGraftIsInvisibleToTheOtherMachine"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheWholesaleRebuildShapeWorksUnderAFloatingPattern"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMkdirAtDepthInstantiatesARoute"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRenamingAnAncestorOfAnActiveGraftIsEBUSY"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheGraftBoundaryIsEXDEV"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateAtAnUncreatedRouteRootIsEISDIR"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARouteRootShadowsTheVolumeSubtreeOfTheSameName"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSharedPathsKeepTheirCoherenceWithRoutesConfigured"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeRevokesEveryMountWithARemountMessage"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
 )
 
 fail() {
@@ -93,7 +127,7 @@ provision_xfs() {
   rm -f -- "$image"
   truncate -s "$PORTABLEFS_XFS_IMAGE_SIZE" "$image"
   mkfs.xfs -q -f "$image"
-  mount -o "loop,prjquota,nodev,nosuid,noexec" "$image" /srv/portablefs
+  mount -o "loop,prjquota,nodev,nosuid,noexec,noatime" "$image" /srv/portablefs
   local options
   options=$(findmnt -n -r -o OPTIONS -T /srv/portablefs)
   [[ ,$options, == *,prjquota,* ]] || fail "XFS mounted without prjquota (options: $options)"
@@ -119,6 +153,10 @@ run_suite() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
   local log=/home/portablefs/tmp/go-test.log
   local status=0
+  local -a extra_go_test_flags=()
+  if [[ -n ${PORTABLEFS_GO_TEST_FLAGS:-} ]]; then
+    read -r -a extra_go_test_flags <<<"$PORTABLEFS_GO_TEST_FLAGS"
+  fi
   # Deliberately unprivileged: the permission assertions in the suite are only
   # meaningful when DAC actually applies, and the production data plane never
   # runs as root. PORTABLEFS_XFS_TEST_REQUIRED turns every gate skip into a
@@ -140,7 +178,7 @@ run_suite() {
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 25m ${PORTABLEFS_GO_TEST_FLAGS:-} \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 25m "${extra_go_test_flags[@]}" \
     ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... \
     >"$log" 2>&1
   status=$?

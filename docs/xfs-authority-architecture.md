@@ -14,7 +14,7 @@ their version handshake rather than enter a mixed mode.
 ## Root design
 
 ```text
-Linux FUSE mount     future verified FSKit mount     another mount
+Linux FUSE mount     macOS 27+ FSKit mount           another mount
        |                       |                    |
        +---------- authenticated TLS RPC ----------+
                                |
@@ -39,6 +39,23 @@ policy, quota entitlements, billing metadata, and short-lived credentials. It
 does not store file bytes, inode metadata, directory entries, locks, or the
 current filesystem tree and is not on the per-operation data path.
 
+The macOS frontend is not a second data plane. `portablefsd` owns the same v3
+authority client used by the Linux architecture: mutual TLS, access capability,
+authority epoch, replay slots, keepalive, route revision, visibility polling,
+fencing, and evidence-bearing detach. The FSKit extension receives only a
+versioned, ordered local stream describing the already-authenticated session and
+its cache obligations, and returns exact cursor acknowledgements. Authority TLS
+credentials and replay secrets never cross the local frontend socket.
+
+macOS 27 is the primary FSKit target because it is the first SDK line with
+module-initiated synchronous kernel data-cache control. That API is still beta
+as of August 2026 and its documented contract does not separately promise
+negative-name invalidation. Release therefore remains gated on the final SDK and
+the live namespace/data/attribute matrix; an OS version number is not accepted
+as proof. macOS 26, if shipped, selects an explicit compatibility cache policy
+implementing the same local visibility interface. It is never an automatic
+fallback and never changes the authority, filesystem, or session architecture.
+
 ## Source of truth
 
 For a live volume, the source of truth is exactly the mounted XFS instance:
@@ -47,10 +64,16 @@ state. Unflushed page-cache data is authoritative current state but is not
 durable across power loss; `fsync` is the boundary that asks XFS and the device
 to persist it.
 
-Runtime authority state is disposable: connections, open file descriptors,
+Filesystem authority state is disposable: connections, open file descriptors,
 advisory locks, cancellation state, and bounded reply slots for the current
 epoch. Losing that RAM interrupts mounts, but cannot roll the durable
-filesystem back to a different logical tree.
+filesystem back to a different logical tree. One small control-plane exception
+is durable strict-mount membership. It records only which cached kernel mounts a
+previous epoch admitted, so a *new* epoch refuses to serve until each of them is
+proven absent or externally fenced. It is not a live write gate: inside a running
+epoch a lost participant is fenced individually and mutations continue (see
+[Cache coherence](#cache-coherence)). It contains no paths, inodes, file bytes,
+mutations, or history and is bound to exactly one volume.
 
 There is no PortableFS checkpoint, manifest head, custom mutation log,
 segmented store, Pebble index, or garbage collector. EBS snapshots are
@@ -136,8 +159,12 @@ authority never follows client-controlled symlinks while addressing XFS.
 Only regular files, directories, and symlinks may be created. Device nodes,
 FIFOs, sockets, setuid execution, user-xattr writes, privileged xattrs,
 cross-filesystem mount traversal, and exported kernel handles are denied.
-Storage is mounted `nodev,nosuid,noexec`; encryption at rest and in transit is
-mandatory.
+Storage is mounted `nodev,nosuid,noexec,noatime`; encryption at rest and in
+transit is mandatory. `noatime` is a coherence invariant, not merely a tuning
+flag: ordinary reads must remain read-only at the authority instead of becoming
+hidden attribute mutations that would require the distributed write barrier.
+Applications may still set timestamps explicitly through ordinary filesystem
+operations.
 
 ## Ordering and retry semantics
 
@@ -152,6 +179,12 @@ Linux VFS/XFS provides each syscall's atomicity. The authority adds only:
 Different replay slots may execute concurrently. XFS supplies the same
 operation atomicity and locking it supplies to local processes; PortableFS does
 not serialize an entire volume behind a userspace global mutex.
+
+When at least one strict cached frontend is attached, cache-visible mutations
+are the deliberate exception: one volume-wide visibility ticket orders
+PREPARE, the XFS syscall, and COMPLETE. This serialization exists only to close
+and repair kernel publication gates. With no strict participants, it is absent
+and ordinary XFS concurrency remains unchanged.
 
 There is no honest way to atomically commit an arbitrary XFS syscall and a
 separate durable reply record. PortableFS makes the boundary explicit:
@@ -203,21 +236,97 @@ Read caching is a future measured optimization, not hidden baseline behavior.
 If measurements or application compatibility require caching or shared
 file-backed mapping, the only acceptable extension is a synchronous lease protocol: a
 writer waits until every live holder has flushed any authorized dirty mapping
-and completed kernel invalidation, or fences an expired holder, before changing
-XFS. An asynchronous event stream by itself is insufficient because a peer
+and completed kernel invalidation, or an external proof fences the exact kernel
+mount/host, before changing XFS. Lease expiry alone is not fencing. An
+asynchronous event stream by itself is insufficient because a peer
 could read stale pages before processing the event. Ordinary client dirty
 write-back remains out of scope.
 
 Apple's June 2026 FSKit beta adds `DataCacheHandler`, `noCache`, synchronous
 cache-state changes, invalidate, and revoke. The locally installed Xcode 26.6 /
 macOS 26.5 SDK does not contain those APIs. macOS production support therefore
-remains gated on a selected non-beta minimum OS plus direct tests for data,
+remains gated on the final macOS 27 SDK/OS plus direct tests for data,
 attributes, positive and negative dentries, rename, unlink, writable mappings,
-and failed revocation. There is no legacy refresh workaround in v3.
+and failed revocation. The macOS 27 path never falls back to synthetic VFS
+repair. macOS 26 compatibility, if explicitly selected, is a separate declared
+cache policy and retains its own stricter release gates.
 The platform gate is tracked against Apple's
 [FSKit updates](https://developer.apple.com/documentation/updates/fskit) and
 [`DataCacheHandler`](https://developer.apple.com/documentation/fskit/fsvolume/datacachehandler),
 not inferred from asynchronous notifications.
+
+The implemented strict protocol is fail-closed: every cached participant gets
+PREPARE before XFS apply; peers repair and acknowledge COMPLETE before the
+mutation reply; the initiating mount receives a deferred COMPLETE and must
+acknowledge its ordinary FSKit callback publication before the next mutation.
+Visibility polling and acknowledgements use a reserved client lane so the event
+stream cannot consume the last ordinary request slot.
+
+Failure has two scopes and the implementation never mixes them
+(`vcs/internal/volumeserver/visibility.go`).
+
+**A lost participant is fenced individually.** A broken session, a missed repair
+budget, or a cursor violation removes exactly that mount from admission to later
+barriers and ends its authority session immediately through the `SessionFencer`.
+The obligation already held by the running mutation is retained for one full
+additional declared repair-budget grace, then discharged. That grace is
+load-bearing only when the frontend can prove that its old kernel cache became
+unservable before the grace ends. Linux does this by revoking published FUSE
+bindings and aborting the connection. The macOS 27 frontend must prove the same
+property with native synchronous FSKit cache-state transitions plus terminal
+session handling; the current Swift watchdog only terminates protocol
+participation and does not prove kernel withdrawal. Consequently the production
+FSKit resolve guard remains closed. Once a frontend has that proof, a phase that
+first consumes its ordinary deadline costs at most two budgets rather than an
+unbounded volume outage, and later requests on the fenced mount must fail.
+
+**Poison is reserved for authority-internal invariant violations** — a completion
+naming a coordinate PREPARE did not, a participant found holding two outstanding
+events. Those are defects no mount can cause. Poison is permanent for the epoch
+and recovery needs a new epoch.
+
+Durable membership is deliberately *not* cleared by fencing. Only a
+session-bound mount-absence proof accepted by the configured
+`MountAbsenceVerifier` (`CleanDetach`) deactivates a record; a syntactically
+plausible client blob and a deployment with no verifier both fail closed. So a fenced mount is
+gone from this epoch's barrier while still recorded, and a replacement authority
+refuses to serve until an external fencing proof covers every recorded old kernel
+mount. Availability is preserved inside an epoch and paid for across one.
+
+The macOS 26 Swift implementation in this tree is a tested protocol/actuator
+foundation only. It is not wired into the v3 FSKit operations adapter, and its
+synthetic hidden-rename/truncate mechanism retains explicit provenance,
+transient-namespace, alias-resolution, and live-kernel proof gates. It must not
+be enabled as production exact coherence or silently selected as a fallback.
+The complete failure contract is in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
+
+## Machine-local routing
+
+`.portablefs/local-dirs` is protected volume-wide configuration, not an
+ordinary mount-writable file. Only admin `ApplyRoutes` may replace it. The
+authority canonicalizes the declaration, compare-and-swaps its revision under
+the topology writer, and pins that revision from request admission through XFS
+completion; an attach or existing session on another revision fails closed.
+Linux graft operations stay behind a confined machine-local directory
+capability and do not reach the authority data plane.
+
+Route activation also reads the root repository's shared `.git/index` through
+the confined XFS API and refuses a rule that already covers tracked content.
+Index versions 2 and 3 in SHA-1 or SHA-256 repositories are accepted only with
+an exact checksum and no split/sparse/unknown extension; unreadable, malformed,
+oversized, linked, or unsupported indexes are an unproven result and refuse the
+whole route change. This check runs in both the frontend and the authority, so a
+direct admin RPC cannot bypass it.
+
+That Git check is deliberately activation-time, not a transactional lifetime
+invariant. Git may later atomically replace `.git/index` through the shared
+filesystem after routes are active. Preventing a later `git add` from tracking
+a machine-local path requires an explicit Git-index transaction/interposition
+contract; the authority does not infer one by inspecting transient
+`.git/index.lock` writes. Operators should treat tracked paths as ineligible for
+machine-local routing and re-run `ApplyRoutes` (or restart validation) after
+changing that boundary.
 
 ## Multi-tenancy and quotas
 
@@ -232,6 +341,26 @@ precedes handle resolution. Capability expiry is an absolute session deadline,
 not something keepalive can renew. Per-tenant concurrency and I/O scheduling
 protect unrelated volumes; quota errors remain the kernel's `EDQUOT`/`ENOSPC`
 outcomes.
+
+That absolute deadline is the current standalone behavior, not the production
+mount lifecycle. A durable mount needs an additive v3 control-plane contract:
+the mount creates its TLS key locally, the control plane validates proof of
+possession and returns a short-lived client certificate plus a single-use
+Ed25519 grant bound to the leaf SPKI, and the authority verifies both end to
+end. The client private key never leaves the machine and the FSKit extension
+never receives it. Ambiguous grant creation returns one durable byte-identical
+receipt; ambiguous Attach replays the exact accepted session reply keyed by
+grant nonce, peer SPKI, and canonical Attach request instead of treating a lost
+success as credential reuse.
+
+Long-lived mounts renew authorization inside the existing session with a fresh
+single-use grant bound to the volume, authority epoch, session, peer SPKI,
+access, route revision, frontend cache policy, monotone authorization sequence,
+and new deadline. Reauthorization is an exact replay operation on a reserved
+lifecycle lane; it may extend the deadline but cannot broaden access or change
+cache/routing terms. Keepalive remains only a liveness proof. The current v2
+branch lease, HMAC token, TLS-terminating router, and journal-child registry are
+not reinterpreted as any part of this contract.
 
 The unprivileged request process verifies the root's project ID and
 `PROJINHERIT` flag but deliberately has no quota-administration capability.
@@ -333,13 +462,25 @@ to adopt a distributed filesystem, not to grow a custom inode database here.
 2. FUSE and target-version FSKit coherence tests for data, attributes,
    positive/negative dentries, rename-over, unlink, rejection of unsupported
    mappings, and any future synchronously leased mappings.
-3. Confinement fuzzing for symlink races, mount grafts, hard links, rename
+3. Frontend liveness tests proving that daemon freeze, an open-but-dead local
+   event socket, and authority partition make the exact kernel mount unservable
+   before the fencing grace expires.
+4. Confinement fuzzing for symlink races, mount grafts, hard links, rename
    exchange, malformed names, stale tokens, and cross-volume attempts.
-4. File/directory sync fault tests over process kill, kernel crash, detach,
+5. File/directory sync fault tests over process kill, kernel crash, detach,
    full disk, quota exhaustion, short writes, and injected `EIO`.
-5. Multi-tenant saturation tests proving bounded RAM/descriptors and fair
+6. Multi-tenant saturation tests proving bounded RAM/descriptors and fair
    progress for unrelated volumes.
-6. Recovery drills from live EBS and locked backup with measured RTO/RPO.
+7. Recovery drills from live EBS and locked backup with measured RTO/RPO.
+8. A fenced branchless XFS cell/runtime control plane that attests placement,
+   exclusive-writer state, project/quota identity, endpoint identity, and
+   authority epoch before issuing a mount grant.
+9. Lost-response tests for idempotent grant creation and Attach, plus saturated
+   in-session reauthorization tests proving a long-lived mount neither expires
+   at the short grant boundary nor silently broadens its authorization.
+10. Signed exact-mount-absence or host-fence verification that can deactivate
+    durable strict membership; a dead socket, expired session, or frontend blob
+    is not evidence that an old kernel cache is unservable.
 
 The segmented-log experiment remains evidence about append-only write
 amplification. It is not a production dependency and did not compare the

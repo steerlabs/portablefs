@@ -101,6 +101,10 @@ type ensureAttachRequest struct {
 	TLSCASHA256          string        `json:"tlsCaSha256,omitempty"`
 	MountPath            string        `json:"mountPath"`
 	Options              AttachOptions `json:"options"`
+	// V3 selects the daemon-owned authority-v3 attach mode (see v3attach.go).
+	// When present the attach is branchless, served by the standalone v3 data
+	// plane, and never touches the legacy clientcore path.
+	V3 *v3AttachRequest `json:"v3,omitempty"`
 }
 
 type attachStatus struct {
@@ -116,10 +120,14 @@ type attachStatus struct {
 	// because "degraded" plus a prose lastError is not something a program can
 	// branch on and the two credential faults call for different repairs.
 	// Empty means no credential fault at all.
-	Credential string           `json:"credential,omitempty"`
-	VolumeName string           `json:"volumeName,omitempty"`
-	LocalDirs  []string         `json:"localDirs,omitempty"`
-	WriteBack  *writeBackStatus `json:"writeBack,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+	VolumeName string   `json:"volumeName,omitempty"`
+	LocalDirs  []string `json:"localDirs,omitempty"`
+	// LocalDirsDeclared says the effective literal roots came from the
+	// volume declaration. It does not claim a canonical route revision: this
+	// daemon still supports only the anchored-literal subset.
+	LocalDirsDeclared bool             `json:"localDirsDeclared,omitempty"`
+	WriteBack         *writeBackStatus `json:"writeBack,omitempty"`
 }
 
 // writeBackStatus is the durability-debt view of an attach: the engine's
@@ -362,6 +370,18 @@ func newRegistry(stateDir string) *registry {
 			r.loadErr = fmt.Errorf("revive persisted attach %s: %w", e.Ref, err)
 			return r
 		}
+		if e.V3 != nil {
+			// A revived v3 record is permanently inactivatable (its strict
+			// session died with the previous process); it revives only so the
+			// exact unmount can still reconcile the kernel mount it names.
+			cfg, cfgErr := revivedV3AttachConfig(e.V3)
+			if cfgErr != nil {
+				r.loadErr = fmt.Errorf("revive persisted v3 attach %s: %w", e.Ref, cfgErr)
+				return r
+			}
+			a.v3Config = cfg
+			a.lastErr = "v3 strict session died with the previous daemon process; only an exact unmount resolves this attach"
+		}
 		a.persist = r.persist
 		a.schedulePersist = r.schedulePersist
 		a.journal = r.journal
@@ -459,8 +479,13 @@ func (r *registry) stopPersister() {
 func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach, bool, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
-	if req.VolumeID == "" || req.Branch == "" || req.AuthorityURL == "" || req.MountPath == "" {
+	if req.VolumeID == "" || req.AuthorityURL == "" || req.MountPath == "" ||
+		(req.Branch == "" && req.V3 == nil) {
 		return nil, false, fmt.Errorf("volumeId, branch, authorityUrl, and mountPath are required")
+	}
+	v3Config, err := v3ConfigForEnsure(req)
+	if err != nil {
+		return nil, false, err
 	}
 	if req.AttachRef != "" && !mountid.ValidAttachRef(req.AttachRef) {
 		return nil, false, fmt.Errorf("attachRef has invalid stable identity format")
@@ -496,6 +521,14 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 			req.TLSCASHA256 != a.tlsCASHA256 {
 			r.mu.Unlock()
 			return nil, false, fmt.Errorf("attach %s is already bound to a different authority transport; detach it before changing endpoint trust", a.ref)
+		}
+		// A mount identity never changes attach mode or strict contract in
+		// place: the v3 barrier declaration was admitted at the authority
+		// exactly once, so a different declaration is a different mount.
+		if (a.v3Config != nil) != (v3Config != nil) ||
+			(v3Config != nil && !a.v3Config.matches(v3Config)) {
+			r.mu.Unlock()
+			return nil, false, fmt.Errorf("attach %s is already bound to a different attach mode or v3 contract; detach it before changing the declaration", a.ref)
 		}
 		r.mu.Unlock()
 		// A revived attach has not opened its Volume yet, so resolve the
@@ -547,6 +580,7 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		return nil, false, fmt.Errorf("attachRef %s already belongs to a different mount identity", ref)
 	}
 	a := newAttach(ref, key, req, r.stateDir)
+	a.v3Config = v3Config
 	a.persist = r.persist
 	a.schedulePersist = r.schedulePersist
 	a.journal = r.journal
@@ -1019,6 +1053,14 @@ func (r *registry) runUnmountTransaction(
 		return true, jobID, fmt.Errorf("attach admissions are fail-frozen because the prepared-detach abort could not be persisted; restart portablefsd to reconcile the durable marker")
 	}
 	switch {
+	case a.isV3():
+		// The evidence-bearing v3 detach: exact kernel detach, getfsstat
+		// absence observation, proof delivery, then local release. It shares
+		// none of the prepared/force/journal machinery below because a v3
+		// attach has no WAL store to park and no drain barrier to run.
+		if err := r.detachV3(a, forceAuthorized || force, ops); err != nil {
+			return true, "", err
+		}
 	case prepared:
 		present, err := ops.present(a.mountPath, ref)
 		if err != nil {
@@ -1416,9 +1458,20 @@ type attach struct {
 	frontendSerial    sync.RWMutex
 	frontendNameLocks [64]sync.Mutex
 	vol               *clientcore.Volume
-	eventClient       *fsproto.Client
-	state             pfslocal.AttachStateState
-	lastErr           string
+	// v3Coherence is non-nil only for an authority-v3 attach. It is kept
+	// separate from the legacy clientcore Volume: the two data planes never
+	// share a session or reinterpret one another's events.
+	v3Coherence *v3CoherenceBridge
+	// v3Config marks an authority-v3 attach and carries its immutable declared
+	// contract; assigned before registration, never mutated (see v3attach.go).
+	// v3Data/v3Session are that attach's live data plane and authority session,
+	// installed by startV3 and guarded by mu like vol.
+	v3Config    *v3AttachConfig
+	v3Data      *v3DataPlane
+	v3Session   v3AuthoritySession
+	eventClient *fsproto.Client
+	state       pfslocal.AttachStateState
+	lastErr     string
 	// Terminal for this attach lifetime: once a correctness-bound kernel
 	// refresh fails, authority visibility was not proven. Operations fail
 	// closed until an explicit unmount/restart.
@@ -1530,6 +1583,11 @@ type attach struct {
 	localRoot                string
 	localFS                  *confinedfs.Root
 	localVersions            map[string]uint64
+	// volumeRoutesDeclared records whether the volume this attach serves
+	// publishes .portablefs/local-dirs. When it does, that file is the ONLY
+	// source of routing truth and per-machine additions are refused - at
+	// activation and at runtime alike. Set once, at activation; guarded by mu.
+	volumeRoutesDeclared bool
 	// legacyParked lists adopted pre-v5 session WALs whose unresolved replay
 	// blocks attach readiness (see legacydrain.go); merged into status
 	// ParkedWALs for dormant/revived attaches.
@@ -1638,6 +1696,15 @@ type attach struct {
 	testRefreshWindowTeardown func(path string, itemID uint64)
 }
 
+// v3CoherenceBridge returns the strict authority-v3 local stream, if this
+// attach owns one. The bridge's own lock protects its mutable protocol state;
+// the attach lock protects only installation and removal of the pointer.
+func (a *attach) v3CoherenceBridge() *v3CoherenceBridge {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.v3Coherence
+}
+
 type itemRecord struct {
 	item  pfslocal.Item
 	path  string
@@ -1735,7 +1802,7 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		conns:                  map[interface{ Close() error }]struct{}{},
 		eventReady:             make(chan struct{}),
 		localDirs:              localDirs,
-		localRoot:              filepath.Join(stateDir, "local", storageID),
+		localRoot:              LocalBackingRoot(stateDir, req.VolumeID, req.Branch),
 		localVersions:          map[string]uint64{},
 	}
 }
@@ -1755,7 +1822,7 @@ func newRevivedAttach(
 	a.detachForce = detachForce
 	a.detachJobID = detachJobID
 	if len(a.localDirs) > 0 {
-		root, err := confinedfs.Open(a.localRoot, 0o700)
+		root, err := openLocalBacking(a.localRoot)
 		if err != nil {
 			return nil, fmt.Errorf("open persisted local-dir backing: %w", err)
 		}
@@ -1812,6 +1879,7 @@ func (a *attach) persistedEntry() persistedAttachEntry {
 		DetachForce:         detachForce,
 		DetachJobID:         detachJobID,
 		Items:               items,
+		V3:                  a.v3Config.persisted(),
 	}
 }
 
@@ -1874,8 +1942,17 @@ func (a *attach) activateWithOptionsMode(
 		return false, fmt.Errorf("attach is quarantined by a durable prepared detach")
 	}
 	credentialPending := a.credentialPending
-	active := a.vol != nil && !a.credentialPending
+	active := (a.vol != nil || a.v3Data != nil) && !a.credentialPending
+	v3Terminal := error(nil)
+	if a.v3Data != nil {
+		v3Terminal = a.v3Data.terminalError()
+	}
 	a.mu.RUnlock()
+	if v3Terminal != nil {
+		// A dead strict session is never reactivated: a replacement session
+		// cannot prove what the kernel cached before it (see v3attach.go).
+		return false, fmt.Errorf("v3 attach is terminal: %w; unmount it before mounting again", v3Terminal)
+	}
 	if onlyIfPending && !credentialPending {
 		return false, nil
 	}
@@ -1912,7 +1989,11 @@ func (a *attach) activateWithOptionsMode(
 			return false, fmt.Errorf("persist revived local-dir routing: %w", err)
 		}
 	}
-	if err := a.start(ctx); err != nil {
+	start := a.start
+	if a.isV3() {
+		start = a.startV3
+	}
+	if err := start(ctx); err != nil {
 		a.setErr(err)
 		return false, err
 	}
@@ -2074,23 +2155,47 @@ func (a *attach) start(ctx context.Context) error {
 		return err
 	}
 	effectiveLocalDirs := append([]string(nil), a.options.LocalDirs...)
+	routesDeclared := false
 	if a.options.VolumeLocalDirs {
-		declared := localdirs.ReadVolumeConfig(ctx, vol, func(format string, args ...any) {
-			log.Printf("attach %s: "+format, append([]any{a.ref}, args...)...)
-		})
+		// Read exactly once through the strict bounded reader, then parse the
+		// whole declaration through localroutes. A second permissive reader used
+		// to ignore bad lines and reduced floating rules to root literals, so the
+		// daemon served topology different from the revision other clients saw.
+		data, present, readErr := localdirs.ReadRouteConfig(ctx, vol)
+		if readErr != nil {
+			_ = vol.Close()
+			return fmt.Errorf("resolve volume local routes: %w", readErr)
+		}
+		routesDeclared = present
+		declared, parseErr := declaredLocalDirsForFSKit(data)
+		if parseErr != nil {
+			_ = vol.Close()
+			return parseErr
+		}
+		if routesDeclared && len(a.options.LocalDirs) != 0 {
+			_ = vol.Close()
+			return volumeDeclaresRoutesError(a.options.LocalDirs, declared)
+		}
 		effectiveLocalDirs, err = localdirs.Normalize(append(effectiveLocalDirs, declared...))
 		if err != nil {
 			_ = vol.Close()
 			return fmt.Errorf("resolve volume local dirs: %w", err)
 		}
 	}
+	a.mu.Lock()
+	a.volumeRoutesDeclared = routesDeclared
+	a.mu.Unlock()
 	a.mu.RLock()
 	localFS := a.localFS
 	a.mu.RUnlock()
 	openedLocalFS := false
 	if len(effectiveLocalDirs) > 0 {
 		if localFS == nil {
-			localFS, err = confinedfs.Open(a.localRoot, 0o700)
+			// The case-safety probe lives inside this open. A backing that folds
+			// names the shared namespace keeps distinct refuses activation here,
+			// before a single graft rule can route an operation to it - see
+			// localcasesafety.go for why refusal is the fix rather than a warning.
+			localFS, err = openLocalBacking(a.localRoot)
 			if err != nil {
 				_ = vol.Close()
 				return fmt.Errorf("open local-dir backing capability: %w", err)
@@ -2463,6 +2568,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	events := a.eventClient
 	localFS := a.localFS
 	lifeCancel := a.lifeCancel
+	v3Data := a.v3Data
 	a.mu.Unlock()
 	a.nsMu.Unlock()
 	a.frontendSerial.Unlock()
@@ -2471,6 +2577,13 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	// resubscribe backoff against a closed client forever.
 	if lifeCancel != nil {
 		lifeCancel()
+	}
+	// A v3 attach's strict session must not outlive the attach. The clean
+	// unmount already delivered its absence proof and terminated the plane;
+	// every other detach path ends it here, closing the authority client so
+	// the session dies (and the authority fences it) rather than lingering.
+	if v3Data != nil {
+		_ = v3Data.fail(errV3AttachDetached)
 	}
 	if events != nil {
 		_ = events.Close()
@@ -2770,8 +2883,19 @@ func (a *attach) status() attachStatus {
 				"re-authenticating"
 		}
 	}
+	// A terminal v3 session is this attach's strongest verdict, reported ahead
+	// of any generic degraded reason: every operation answers ENOTCONN and
+	// only an exact unmount resolves it.
+	if d := a.v3Backend(); d != nil {
+		if err := d.terminalError(); err != nil && !errors.Is(err, errV3AttachDetached) {
+			state = pfslocal.AttachStateDegraded
+			lastErr = "v3 authority session is TERMINAL: " + err.Error() +
+				"; every operation on this mount fails closed (ENOTCONN) and only an exact unmount resolves it"
+		}
+	}
 	a.mu.RLock()
 	localDirs := append([]string(nil), a.localDirs...)
+	localDirsDeclared := a.volumeRoutesDeclared
 	legacyParked := append([]parkedWAL(nil), a.legacyParked...)
 	a.mu.RUnlock()
 	if len(legacyParked) > 0 {
@@ -2786,8 +2910,8 @@ func (a *attach) status() attachStatus {
 		Credential: credential,
 		Prefetch:   prefetchStatus{Done: pf.Done, EntriesWalked: pf.Entries},
 		Cache:      cacheStatus{AttrEntries: attrEntries, DiskBytes: diskBytes, DiskCapBytes: diskCap},
-		LocalDirs:  localDirs,
-		WriteBack:  wb,
+		LocalDirs:  localDirs, LocalDirsDeclared: localDirsDeclared,
+		WriteBack: wb,
 	}
 }
 
@@ -2831,7 +2955,10 @@ func (a *attach) setErr(err error) {
 		// 4x/second would spam subscribers without adding information.
 		if msg := err.Error(); a.lastErr != msg {
 			a.lastErr = msg
-			if a.vol == nil {
+			// A v3 attach never returns to credential-pending: its session is
+			// admitted exactly once, so an error is degraded/terminal, not "a
+			// fresh credential will revive this".
+			if a.vol == nil && a.v3Config == nil {
 				a.credentialPending = true
 			}
 			a.state = pfslocal.AttachStateDegraded
@@ -4537,11 +4664,6 @@ func (a *attach) renamePathLocked(oldp, newp string) {
 	if changed {
 		a.frontendPathEpoch.Add(1)
 	}
-	// A volume rename that moves an ancestor of a graft root carries the graft
-	// (and its machine-local backing) to the new location, mirroring how a
-	// mountpoint travels with its directory vnode. Persistence is the caller's
-	// job: every rename path already persists after releasing a.mu.
-	a.remapLocalDirsForRenameLocked(oldp, newp)
 	a.pendingBindings = append(a.pendingBindings, bindingJournalEntry{Ref: a.ref, Op: "rekey", From: oldp, To: newp})
 }
 
@@ -5083,7 +5205,7 @@ func (a *attach) isDetached() bool {
 func (a *attach) hasLiveVolume() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.vol != nil
+	return a.vol != nil || a.v3Data != nil
 }
 
 func (a *attach) statusState() pfslocal.AttachStateState {
@@ -5127,6 +5249,13 @@ func randomAttachRef() (string, error) {
 func stableStorageID(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return fmt.Sprintf("%x", sum[:16])
+}
+
+// LocalBackingRoot names portablefsd's machine-local graft tree for one
+// (volume, branch). It is exported for operator tooling that must inventory
+// daemon-owned backing without duplicating the storage-key algorithm.
+func LocalBackingRoot(stateDir, volumeID, branch string) string {
+	return filepath.Join(stateDir, "local", stableStorageID(storageKey(volumeID, branch)))
 }
 
 // attachKey identifies an ATTACH (a kernel mount of a volume at a path); two

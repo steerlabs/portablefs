@@ -20,6 +20,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/fusefrontend"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/modebits"
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/wal"
@@ -676,20 +677,18 @@ func (n *fuseNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 		return syscall.EXDEV
 	}
 	oldp, newp := n.child(name), np.child(newName)
+	// EXDEV across a route boundary, EBUSY for a shared directory holding
+	// machine-local backing or for a rename that would flip what the rules
+	// route. Anything the authority accepts needs no follow-up here: routing
+	// is a pure function of the declared rules, so there is nothing to remap.
 	if eno, handled := n.g.VolumeRenameCheck(oldp, newp); handled {
 		return eno
 	}
 	src, dst := n.childState(name), np.childState(newName)
-	st := fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationRename, Source: src, Target: dst}, fuseNodes(src, dst), []string{oldp, newp},
+	return errno(fuseMutateStatus(ctx, n, clientcore.MutationIntent{Kind: clientcore.MutationRename, Source: src, Target: dst}, fuseNodes(src, dst), []string{oldp, newp},
 		func(c context.Context) clientcore.Status {
 			return n.v.Rename(c, oldp, newp, src, dst)
-		})
-	if st == fsproto.OK {
-		// A volume rename of a graft root's ancestor carries the graft and
-		// its machine-local backing to the new location.
-		n.g.RemapForRename(oldp, newp)
-	}
-	return errno(st)
+		}))
 }
 
 func (n *fuseNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -942,9 +941,10 @@ type fuseMount struct {
 	renewWG   sync.WaitGroup
 	mountPath string
 	grafts    *localdirs.Grafts
-	// localDirs is the effective graft set served by this mount (flags +
-	// persisted state + the volume's .portablefs/local-dirs file).
-	localDirs []string
+	// routes is what this mount serves and the volume-declaration revision it
+	// answers for; routeBacking is the volume's machine-local backing tree.
+	routes       mountRoutes
+	routeBacking string
 	// detachExact proves and removes this server's recorded kernel mount with
 	// the one persisted mechanism. It never asks go-fuse to resolve PATH.
 	detachExact func() error
@@ -952,17 +952,94 @@ type fuseMount struct {
 
 // localDirsMountConfig configures machine-local dirs for one FUSE mount.
 type localDirsMountConfig struct {
-	// dirs are the flag/persistence-level graft roots (already validated).
+	// dirs are the flag/persistence-level literal roots (already validated).
+	// They are the LEGACY per-machine path and are accepted only on a volume
+	// that publishes no declaration; see resolveRoutes.
 	dirs []string
-	// backingRoot is <stateBase>/local/<storageID>; required when any graft
-	// can apply (the volume config file may add dirs even when dirs is empty).
+	// backingRoot is <stateBase>/local/<volume storage id>; required when any
+	// route can apply (the volume declaration may add rules even when dirs is
+	// empty).
 	backingRoot string
 	// disableVolumeFile skips the volume's .portablefs/local-dirs declaration
-	// (--no-local-dirs: grafts fully off for this mount).
+	// (--no-local-dirs: routes fully off for this mount).
 	disableVolumeFile bool
-	// onChange observes remaps (ancestor renames) so the CLI can persist the
-	// carried names.
-	onChange func([]string)
+	// onActivated reports the activated routing once, before the kernel mount
+	// goes live, so the caller can persist the revision it will answer for.
+	onActivated func(mountRoutes)
+}
+
+// mountRoutes is what one mount serves and what it answers for. The two are
+// deliberately separate fields, because they are separate facts.
+type mountRoutes struct {
+	// rules is the route set this mount actually serves.
+	rules localroutes.RuleSet
+	// revision is EXACTLY the volume declaration's revision — the hash of
+	// localroutes.Parse(<declaration bytes>) and of nothing else. It is the
+	// value the authority pins the attach to, so it must describe what the
+	// VOLUME declares, identically on every machine.
+	revision string
+	// declared reports that the volume publishes a declaration at all.
+	declared bool
+	// perMachine reports that rules came from this machine's --local-dir
+	// flags rather than from the volume. Only possible when !declared.
+	perMachine bool
+}
+
+// resolveRoutes decides one mount's routing.
+//
+// The revision a mount reports is the volume declaration's revision and
+// nothing else. Per-machine route additions are precisely the topology skew
+// the revision check exists to refuse: a machine that unilaterally hides a
+// directory its peers believe is shared re-creates the upload-into-a-hidden-
+// subtree hazard, and folding those additions into the hash would make every
+// machine's revision differ for a volume all of them agree on.
+//
+// So --local-dir is refused outright on a volume that publishes a
+// declaration: routing there is volume-wide state, changed by editing the
+// declaration and applying it, not by one machine's mount flags. On a volume
+// with NO declaration it stays accepted — the legacy path, for workspaces
+// nobody has declared routes for yet — and the rule stays uniform because the
+// revision is still the declaration's: the empty one.
+func resolveRoutes(ctx context.Context, vol localdirs.VolumeReader, cfg localDirsMountConfig) (mountRoutes, error) {
+	var (
+		text     []byte
+		declared bool
+	)
+	if !cfg.disableVolumeFile {
+		data, present, err := localdirs.ReadRouteConfig(ctx, vol)
+		if err != nil {
+			return mountRoutes{}, err
+		}
+		text, declared = data, present
+	}
+	declaredRules, err := localroutes.Parse(text)
+	if err != nil {
+		return mountRoutes{}, fmt.Errorf("%s: %w", localdirs.VolumeConfigPath, err)
+	}
+	out := mountRoutes{rules: declaredRules, revision: declaredRules.RevisionHex(), declared: declared}
+	if len(cfg.dirs) == 0 {
+		return out, nil
+	}
+	if declared {
+		return mountRoutes{}, fmt.Errorf(
+			"volume declares its machine-local routes in %s, so --local-dir is not accepted: a per-machine addition would hide from this machine a directory every peer still treats as shared. Add the rule to %s and apply it volume-wide (existing rules: %s)",
+			localdirs.VolumeConfigPath, localdirs.VolumeConfigPath, strings.Join(declaredRules.Patterns(), " "))
+	}
+	var flagText []byte
+	for _, dir := range cfg.dirs {
+		pattern, err := localroutes.LiteralPattern(dir)
+		if err != nil {
+			return mountRoutes{}, err
+		}
+		flagText = append(flagText, pattern...)
+		flagText = append(flagText, '\n')
+	}
+	flagRules, err := localroutes.Parse(flagText)
+	if err != nil {
+		return mountRoutes{}, fmt.Errorf("--local-dir: %w", err)
+	}
+	out.rules, out.perMachine = flagRules, true
+	return out, nil
 }
 
 // mountFUSE dials the authority and mounts it at mountPath, wiring push
@@ -1085,28 +1162,57 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 	// already been replaced.
 	tokens.bindDataPlane(vol, seedToken, seedExpiry)
 
-	// Effective grafts = flag/persisted dirs ∪ the volume's declaration file.
-	// Union semantics are permissive (dedupe, outer graft wins over nested)
-	// because the sources are independent; each flag list was already
-	// strictly validated at parse time.
-	var volumeDirs []string
-	if !localCfg.disableVolumeFile {
-		volumeDirs = localdirs.ReadVolumeConfig(context.Background(), vol, func(format string, args ...any) {
-			log.Printf("portablefs mount: "+format, args...)
-		})
-	}
-	effectiveDirs, err := localdirs.Normalize(append(append([]string(nil), localCfg.dirs...), volumeDirs...))
+	// The volume's declaration decides the routing and the revision. A
+	// malformed declaration fails the mount: serving a rule set nobody could
+	// parse in full, under a revision that claims otherwise, is not an
+	// option.
+	activationCtx := context.Background()
+	routes, err := resolveRoutes(activationCtx, vol, localCfg)
 	if err != nil {
 		_ = vol.Close()
-		return nil, fmt.Errorf("resolve local dirs: %w", err)
+		return nil, fmt.Errorf("resolve machine-local routes: %w", err)
 	}
-	if len(effectiveDirs) > 0 {
-		grafts, err = localdirs.New(localCfg.backingRoot, effectiveDirs, localCfg.onChange)
+	if !routes.rules.Empty() {
+		// Safety rail: a route over version-controlled content would hide
+		// committed files from every other machine while git still believes
+		// it owns them.
+		proven, unproven, err := localdirs.CheckGitTracked(activationCtx, vol, routes.rules)
 		if err != nil {
 			_ = vol.Close()
-			return nil, fmt.Errorf("configure local dirs: %w", err)
+			return nil, err
 		}
-		log.Printf("machine-local dirs: %s (backing %s)", strings.Join(effectiveDirs, ", "), localCfg.backingRoot)
+		if !proven {
+			_ = vol.Close()
+			return nil, fmt.Errorf("refuse machine-local routes because git-tracked content could not be proven safe: %s", unproven)
+		}
+		localdirs.WarnAnchoredShadowing(activationCtx, vol, routes.rules, func(format string, args ...any) {
+			log.Printf("portablefs mount: "+format, args...)
+		})
+		grafts, err = localdirs.New(localdirs.Config{
+			BackingRoot: localCfg.backingRoot,
+			Rules:       routes.rules,
+			OnShadow: func(root string) {
+				if names := localdirs.ShadowedEntries(context.Background(), vol, root, 16); len(names) > 0 {
+					log.Printf("portablefs mount: machine-local route %q now shadows the volume's existing directory (hidden, never deleted): %s",
+						root, strings.Join(names, ", "))
+				}
+			},
+		})
+		if err != nil {
+			_ = vol.Close()
+			return nil, fmt.Errorf("configure machine-local routes: %w", err)
+		}
+		origin := "declared by the volume"
+		if routes.perMachine {
+			// Say it loudly: these rules exist only on this machine, so no
+			// peer and no authority knows this directory is being hidden here.
+			origin = "PER-MACHINE --local-dir (this volume declares no routes; peers still treat these paths as shared)"
+		}
+		log.Printf("machine-local routes @%s [%s]: %s (backing %s)",
+			routes.revision[:12], origin, strings.Join(routes.rules.Patterns(), " "), localCfg.backingRoot)
+	}
+	if localCfg.onActivated != nil {
+		localCfg.onActivated(routes)
 	}
 
 	// Kernel caching default: file data is cached and
@@ -1158,7 +1264,7 @@ func mountFUSE(addr string, tokens *sessionTokenSource, transport dataPlaneTrans
 	}
 
 	ctx, stop := context.WithCancel(context.Background())
-	m := &fuseMount{server: server, vol: vol, stop: stop, mountPath: mountPath, grafts: grafts, localDirs: effectiveDirs}
+	m := &fuseMount{server: server, vol: vol, stop: stop, mountPath: mountPath, grafts: grafts, routes: routes, routeBacking: localCfg.backingRoot}
 	m.renewWG.Add(1)
 	go func() {
 		defer m.renewWG.Done()

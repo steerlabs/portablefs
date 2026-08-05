@@ -27,7 +27,16 @@ const (
 	// mount its kernel-coherence barrier permanently. Pairing a daemon that
 	// knows its bound with a frontend that ignores it is precisely the pairing
 	// that broke, so the two must not be able to pair at all.
-	ProtocolMinor = 7
+	//
+	// ProtocolMinor 8 adds the macOS v3 coherence contract, exact two-phase
+	// visibility events, and cursor acknowledgments. Ignoring those fields can
+	// leave stale kernel state serving, so the existing minimum-minor gate is
+	// the compatibility boundary.
+	//
+	// ProtocolMinor 9 adds the strict-v3 end-to-end liveness proof. A frontend
+	// which only knows that its UDS is live cannot distinguish a responsive
+	// daemon from one that has lost its authority session.
+	ProtocolMinor = 9
 	MaxFrameBytes = 16 << 20
 )
 
@@ -90,6 +99,28 @@ type ResolveReply struct {
 	Branch       string
 	VolumeName   string
 	Capabilities Capabilities
+	V3Coherence  *V3CoherenceContract
+}
+
+type V3CoherenceContract struct {
+	AuthorityProtocolMajor uint32
+	AuthorityEpoch         []byte
+	SessionID              []byte
+	CachePolicy            string
+	RepairBudgetMillis     uint64
+	// InitialCursor is absent for the genesis cut before the authority has
+	// emitted any visibility sequence. When present it is a positive COMPLETE.
+	InitialCursor *VisibilityCursor
+}
+
+type V3LivenessRequest struct {
+	AuthorityEpoch []byte
+	SessionID      []byte
+}
+
+type V3LivenessReply struct {
+	AuthorityEpoch []byte
+	SessionID      []byte
 }
 
 type Capabilities struct {
@@ -136,6 +167,7 @@ type Capabilities struct {
 type Item struct {
 	ItemID         uint64
 	ItemGeneration uint64
+	StableIdentity [16]byte
 }
 
 type ItemKind int32
@@ -386,6 +418,64 @@ type ReclaimReply struct{}
 
 type SubscribeEventsRequest struct{}
 type SubscribeEventsReply struct{}
+
+type VisibilityPhase int32
+
+const (
+	VisibilityPhaseUnspecified VisibilityPhase = 0
+	VisibilityPhasePrepare     VisibilityPhase = 1
+	VisibilityPhaseComplete    VisibilityPhase = 2
+)
+
+type VisibilityScope int32
+
+const (
+	VisibilityScopeUnspecified VisibilityScope = 0
+	VisibilityScopeNamespace   VisibilityScope = 1
+	VisibilityScopeData        VisibilityScope = 2
+	VisibilityScopeAttributes  VisibilityScope = 3
+)
+
+type VisibilityCursor struct {
+	Sequence uint64
+	Phase    VisibilityPhase
+}
+
+type VisibilityTarget struct {
+	Scope          VisibilityScope
+	Identity       []byte
+	ParentIdentity []byte
+	Name           []byte
+	Size           int64
+}
+
+type RoutesChange struct {
+	Revision []byte
+	Rules    []byte
+}
+
+type V3VisibilityEvent struct {
+	AuthorityEpoch     []byte
+	Cursor             VisibilityCursor
+	InitiatorSessionID []byte
+	MutationSlot       uint32
+	Targets            []VisibilityTarget
+	MutationSequence   uint64
+	Routes             *RoutesChange
+	// LocalOperationID is nonzero only for this mount's own authority
+	// mutation. It names the exact pfslocal publication unit that PREPARE must
+	// exempt and deferred COMPLETE must wait to observe published.
+	LocalOperationID uint64
+}
+
+type VisibilityAckRequest struct {
+	AuthorityEpoch []byte
+	Cursor         VisibilityCursor
+	Blocked        bool
+	Reason         string
+}
+
+type VisibilityAckReply struct{}
 
 type Event struct{ Kind any }
 

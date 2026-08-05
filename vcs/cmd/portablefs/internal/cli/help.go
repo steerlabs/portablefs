@@ -1,6 +1,14 @@
 package cli
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+)
+
+// localdirsConfigPath is the in-volume route declaration, named in help text
+// exactly as the code reads it.
+const localdirsConfigPath = localdirs.VolumeConfigPath
 
 func rootHelp() string {
 	return `portablefs — live, durable, branchable network filesystems for agent workspaces
@@ -43,11 +51,15 @@ SEARCH (no mount needed)
   grep <volumeId> <pattern>    search a branch's file bytes server-side
 
 MOUNTS (this machine)
-  mount <volumeId> <path>      attach the live volume (FSKit on macOS, FUSE on Linux)
+  mount <volumeId> <path>      attach the live volume through the v3 authority
+                               (FSKit on macOS, FUSE on Linux; direct credentials
+                               required — see help mount)
   umount <path>                sync and detach one mounted volume
   mounts                       list active mounts
   recovery list|resolve <path> inspect and resolve a mount's write-back recovery
                                jobs — the terminal ones block umount --force
+  route <path>                 is this path machine-local or shared, and by which rule
+  prune-local                  reclaim machine-local backing no route can reach
   daemon stop                  atomically stop portablefsd only when no attach exists
   mount-check                  inspect mount prerequisites (no network or mutation)
 
@@ -72,7 +84,7 @@ CONFIGURATION (precedence: flags > environment > config file)
   PORTABLEFS_API_TOKEN        volume API bearer token
   PORTABLEFS_MANAGER_URL      authority manager URL (defaults to the API URL)
   PORTABLEFS_MANAGER_TOKEN    authority manager token (defaults to the API token)
-  PORTABLEFS_MOUNT_TOKEN      data-plane token for mount --addr
+  PORTABLEFS_MOUNT_TOKEN      single-use volume mount capability for mount --addr
 
 Run ` + "`portablefs help <command>`" + ` for details and examples.
 `
@@ -234,6 +246,42 @@ the live-serving facts instead: the latest committed revision, the newest
 ready snapshot (and any still being written), and this machine's mounts of
 the branch with their health.
 `,
+		"route": `USAGE
+  portablefs route <path> [--json]
+
+Explain one path: which mount serves it, whether it comes from machine-local
+disk or from the shared volume, and exactly which rule decided that. When the
+path is machine-local it also prints the route root, the backing directory on
+this machine (with its size), and the revision of the rule set the mount
+activated — the same revision the authority pins the mount to.
+
+Routes are declared in the volume's ` + localdirsConfigPath + ` (one
+directory rule per line: "node_modules/" at any depth, "/target/" only at the
+volume root, '*' and '?' within one component, '**' across components). That
+declaration is the only source of a volume's routing, and the revision printed
+here is its hash — the value every machine mounting the volume must agree on.
+
+EXAMPLES
+  portablefs route ~/work/agent-app/node_modules/react
+  portablefs route ~/work/src/main.go --json
+`,
+		"prune-local": `USAGE
+  portablefs prune-local [--volume <volumeId>] [--dry-run] [--delete] [--json]
+
+List — and, with --delete, remove — machine-local backing trees that no route
+can reach any more: a directory whose rule was removed from the declaration,
+or a whole volume's backing left behind after the volume was retired. Backing
+is keyed by (volume, route root), so it deliberately survives unmount and
+remount; this is the explicit step that frees it.
+
+Dry-run is the DEFAULT: nothing is ever removed unless you pass --delete.
+Removing a rule from the declaration never deletes data by itself.
+
+EXAMPLES
+  portablefs prune-local                       # what could be reclaimed
+  portablefs prune-local --volume my-workspace
+  portablefs prune-local --delete              # actually reclaim it
+`,
 		"history": `USAGE
   portablefs history <volumeId> [--branch main] [--limit 50] [--json]
 
@@ -307,63 +355,68 @@ EXAMPLES
   portablefs grep my-workspace "TODO" --dir src
 `,
 		"mount": `USAGE
-  portablefs mount <volumeId> <mountPath> [--branch main]
-                   [--local-dir rel]... [--no-local-dirs]
-                   [--strategy auto|fskit|fuse] [--addr host:port]
-                   [--mount-token t] [--foreground] [--json]
+  portablefs mount <volumeId> <mountPath>
+                   --addr host:port --mount-token t
+                   --data-plane-transport tls-private-ca|tls-system-pki
+                   --data-plane-server-name name [--data-plane-ca ca.pem]
+                   --client-cert cert.pem --client-key key.pem
+                   [--coherence strict|uncached] [--no-local-dirs]
+                   [--strategy auto|fskit|fuse] [--foreground] [--json]
 
-Attach the live volume at mountPath. The default resolves the volume's current
-authority through the manager, mounts, and daemonizes — the command returns
-and the mount persists (state under ~/.local/state/portablefs/mounts).
---foreground stays attached; Ctrl-C unmounts.
+Attach the live volume at mountPath through the v3 authority stack, then
+daemonize — the command returns and the mount persists (state under
+~/.local/state/portablefs/mounts). --foreground stays attached; Ctrl-C
+unmounts.
 
-Write mode is not a mount property: the authority delegates write-back per
-scope adaptively, so build/install-heavy workloads acknowledge locally at
-local-disk speed while contended paths stay write-through. fsync(2) is
-always a REAL local-sync plus authority-durability barrier. Plain write(2)
-does not wait for physical local sync; the WAL group-sync normally runs
-within 5 ms. Linux FUSE also acknowledges
-peer invalidations after its kernel cache hook; macOS 26 FSKit has no such
-hook, so reads served wholly from FSKit's kernel cache are outside the exact
-peer-visibility claim. A WAL error fails later mutations until remount; it
-never switches them to write-through. (The
-retired --fast flag is an error: every mount is adaptive.)
+Every mount takes the direct v3 credential shape: the authority address
+(--addr), a single-use volume mount capability (--mount-token or
+PORTABLEFS_MOUNT_TOKEN), a verified TLS transport (--data-plane-transport
+tls-system-pki with --data-plane-server-name, or tls-private-ca with that
+name plus --data-plane-ca), and the manager-issued mutual-TLS client
+identity (--client-cert/--client-key; the key must be chmod 600). v3
+authority sessions are mutually authenticated TLS 1.3, so plaintext cannot
+mount. The retained authority manager mints only v2 leases and cannot admit
+a v3 session; a manager/lease-only invocation is refused with this shape
+named, never silently mounted on the retired v2 engine. A v3 volume is
+branchless: the retired --branch flag is an error.
 
---local-dir <rel> (repeatable) serves a workspace-relative directory —
-node_modules, .venv, target — from machine-local disk instead of the volume:
-installs run at local speed and platform-specific artifacts never travel
-between machines. The set persists per volume+branch+mountPath, so a plain
-remount reuses it; explicit flags win and update it; --no-local-dirs clears
-it. On Linux (FUSE) a .portablefs/local-dirs file in the volume (one path
-per line, # comments) is unioned in at mount time so a repo declares its
-per-machine dirs once for every machine. See docs/agents.md.
+There is no write-back cache: write(2) returns after the authority has
+applied the bytes to XFS, and fsync waits for the authoritative server
+descriptor. --coherence picks the kernel cache contract — strict (default:
+names and attributes are cached and repaired through the authority's
+synchronous visibility barrier) or uncached (cache nothing; Linux only).
+
+Machine-local directories — node_modules, .venv, target — are served from
+machine-local disk instead of the volume. WHICH directories is declared by
+the volume in .portablefs/local-dirs (one directory rule per line,
+# comments): the mount adopts the declaration at attach and the authority
+refuses a mount whose routing revision is not the volume's active one, so
+every machine routes identically. --local-dir is refused unconditionally — a
+per-machine route would hide from this machine a directory its peers still
+treat as shared — and --no-local-dirs refuses a declaring volume instead of
+ignoring its topology. macOS does not yet join the route adoption protocol:
+a volume that declares routes mounts from Linux.
 
 There is ONE transport per platform, with no fallbacks: macOS mounts through
 the PortableFS FSKit extension (install PortableFS.app and enable its File
 System Extension under System Settings once; the CLI manages the portablefsd
-daemon the extension talks to), and Linux mounts through FUSE (direct
-mounting or one root-managed fusermount3/fusermount helper is selected from
-uncached host facts before the transaction starts). A host that cannot serve
-its platform's transport fails with guidance instead of degrading to a
-weaker consistency model.
-
---addr mounts a VCS authority directly (skipping the manager); pass the data
-plane token via --mount-token, PORTABLEFS_MOUNT_TOKEN, or VCS_AUTH_TOKEN, and
-choose exactly one --data-plane-transport. tls-system-pki also requires
---data-plane-server-name; tls-private-ca requires that name plus
---data-plane-ca <ca.pem>; plaintext must be selected by name. No missing CA or
-environment variable silently selects plaintext. FSKit daemon sockets
-override explicitly via PORTABLEFS_FSKIT_SOCKET and
-PORTABLEFS_FSKIT_CONTROL_SOCKET. PORTABLEFS_FSKIT_TYPE may only assert the
-signed release type; it cannot select another provider. The daemon is
+daemon, which owns the authority session and never exposes credentials to
+the extension), and Linux mounts through FUSE. A host that cannot serve its
+platform's transport fails with guidance instead of degrading to a weaker
+consistency model. FSKit daemon sockets override explicitly via
+PORTABLEFS_FSKIT_SOCKET and PORTABLEFS_FSKIT_CONTROL_SOCKET.
+PORTABLEFS_FSKIT_TYPE may only assert the signed release type. The daemon is
 always the exact portablefsd sibling from the same installed release;
 PORTABLEFS_FSKIT_DAEMON is rejected.
 
 EXAMPLES
-  portablefs mount my-workspace ~/work
-  portablefs mount my-workspace ~/work --local-dir node_modules
-  portablefs mount my-workspace /tmp/w --branch experiment --foreground
-  portablefs mount my-workspace /mnt/w --addr 127.0.0.1:2050 --mount-token tok
+  portablefs mount my-workspace ~/work \
+    --addr 10.0.0.7:2050 --mount-token "$CAP" \
+    --data-plane-transport tls-private-ca --data-plane-server-name authority.internal \
+    --data-plane-ca ca.pem --client-cert client.pem --client-key client.key
+  portablefs mount my-workspace /mnt/w --addr 10.0.0.7:2050 \
+    --data-plane-transport tls-system-pki --data-plane-server-name authority.example.com \
+    --client-cert client.pem --client-key client.key --coherence uncached --foreground
 `,
 		"umount": `USAGE
   portablefs umount <mountPath> [--force] [--discard-record] [--json]

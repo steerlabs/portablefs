@@ -171,11 +171,11 @@ directories as machine-local dirs (grafts) and each machine keeps its own:
 portablefs mount myagent ~/work --local-dir node_modules --local-dir .venv
 ```
 
-Better, declare them once in the repository so every machine that mounts gets
+Better, define one declaration for the volume so every machine that mounts gets
 the same behavior with no flags:
 
 ```bash
-cat > ~/work/.portablefs/local-dirs <<'EOF'
+cat > local-dirs.rules <<'EOF'
 # per-machine dirs: served from local disk, never synced
 node_modules
 .venv
@@ -183,16 +183,54 @@ target
 EOF
 ```
 
-Linux FUSE and macOS FSKit mounts both union this declaration with the
-explicit/persisted `--local-dir` set. Pass `--no-local-dirs` to clear the
-persisted set and ignore the declaration for a particular mount; see
-[fskit-mount.md](./fskit-mount.md).
+On v3 the mounted `.portablefs` namespace is read-only. An administrator applies
+this file through the authority's compare-and-swap `ApplyRoutes` operation; an
+ordinary `cp` or editor write to `.portablefs/local-dirs` is refused. The
+standalone tree currently exposes that RPC and its integration client, but no
+end-user route-administration command, so product control-plane wiring is still
+a release gate for self-service route changes.
+
+### Never local-route irreplaceable user data
+
+The list above is deliberately only rebuildable artifacts. A local route is not
+a performance hint; it is a statement that the directory's contents are
+**disposable and reproducible on this machine**.
+
+`uploads/` is the named counterexample. A directory holding user-supplied
+files — uploads, attachments, generated reports a user will come back for,
+anything the machine cannot regenerate from a lockfile or a build — must never
+appear in a `local-dirs` declaration or a `--local-dir` flag. Route it local and
+it stops being part of the volume: it is not in checkpoints, not in forks, not
+on any other machine that mounts the same volume, and not in any backup that
+covers the volume. It lives on one machine's disk, and the day that machine is
+replaced or its state dir is cleared, it is gone with no error and no trace,
+because from the volume's point of view nothing was ever there.
+
+The test is one question: *if this machine were destroyed right now, could the
+directory be rebuilt by running a command?* `node_modules` and `target` pass.
+`uploads/` does not.
+
+Declaring it in the repository is not merely more convenient — once the file
+exists it is the **only** way to add a rule. A volume that publishes
+`.portablefs/local-dirs` owns its routing outright, and the v3 Linux mount
+**refuses** a per-machine `--local-dir`: a rule that
+existed on one machine only would hide a directory every peer still treats as
+shared, invisibly, with no revision recording it. Add the rule to the file and
+apply it volume-wide. `--no-local-dirs` fails the v3 attach when the volume has
+rules; it never ignores them and serves a different topology. The retained v2
+FSKit daemon supports only anchored literal declarations and is not a v3
+mixed-mount peer; see [fskit-mount.md](./fskit-mount.md).
 
 Inside a graft everything behaves like a local filesystem at local-disk speed
 (`npm install`, `npm ci`, `cargo build`). The graft shadows any same-named
 directory that exists on the volume, `rm -rf` plus recreate works normally, and
 a `mv` across the boundary falls back to copy+delete (EXDEV), exactly like a
-bind mount. Grafted content survives unmount/remount on the same machine but
+bind mount. Renaming a *shared* directory that still contains an active local
+route is refused with EBUSY instead — the errno Linux uses for a directory
+holding a mount point — because EXDEV there would invite exactly the recursive
+copy that would drag machine-local content into shared storage
+([architecture.md](./architecture.md#machine-local-dirs-grafts) records which
+frontends implement that yet). Grafted content survives unmount/remount on the same machine but
 never travels: it is not in checkpoints, forks, or other machines' mounts —
 which also means each machine must install its own dependencies once. Use
 `--exclude 'node_modules/'` at `adopt` time for the same reason: keep the

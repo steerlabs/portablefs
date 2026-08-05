@@ -8,6 +8,68 @@ private func bytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+private func strictV3Contract(
+    policy: String = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
+) -> PfsV3CoherenceContract {
+    var contract = PfsV3CoherenceContract()
+    contract.authorityProtocolMajor = 2
+    contract.authorityEpoch = Data(repeating: 0xA1, count: 16)
+    contract.sessionID = Data(repeating: 0xB2, count: 16)
+    contract.cachePolicy = policy
+    contract.repairBudgetMillis = 1_000
+    return contract
+}
+
+@Test func volumeCoreSelectsOnlyTheDeclaredMacOS26CachePolicy() async throws {
+    // The macOS 26 compatibility policy is the one declared policy this build
+    // implements: resolve accepts it and records the terms the FSKit adapter
+    // composes its coherence stack from.
+    let strictDaemon = try PfsLocalMockDaemon(
+        configuration: .init(v3Coherence: strictV3Contract())
+    )
+    defer { strictDaemon.stop() }
+    let strict = try await VolumeCore.connect(
+        socketPath: strictDaemon.socketPath,
+        attachRef: "mock"
+    )
+    #expect(await strict.strictV3Contract?.cachePolicy == .synchronousVFSRepairV1)
+    #expect(await strict.strictV3ResolveReply?.hasV3Coherence == true)
+    await strict.shutdown()
+
+    // The native macOS 27 policy stays gated on the final SDK, and an unknown
+    // policy string is a contract this build cannot honor. Both fail closed
+    // with the same close-first ENOTSUP discipline — never a silent fallback.
+    for refusedPolicy in [
+        PfsMacOSCachePolicy.nativeFSKitRevocationV1.rawValue,
+        "automatic"
+    ] {
+        let refusingDaemon = try PfsLocalMockDaemon(
+            configuration: .init(v3Coherence: strictV3Contract(policy: refusedPolicy))
+        )
+        defer { refusingDaemon.stop() }
+        do {
+            _ = try await VolumeCore.connect(
+                socketPath: refusingDaemon.socketPath,
+                attachRef: "mock"
+            )
+            Issue.record("expected policy \(refusedPolicy) to be refused")
+        } catch let error as PfsLocalClientError {
+            #expect(error == .v3CoherenceIntegrationUnavailable)
+            #expect(error.posixErrno == ENOTSUP)
+        }
+    }
+
+    // Legacy resolves continue through the exact same production entry point.
+    let legacyDaemon = try PfsLocalMockDaemon()
+    defer { legacyDaemon.stop() }
+    let legacy = try await VolumeCore.connect(
+        socketPath: legacyDaemon.socketPath,
+        attachRef: "mock"
+    )
+    #expect(await legacy.resolvedVolume?.volumeID == "mock-volume")
+    #expect(await legacy.strictV3Contract == nil)
+}
+
 @Test func clientRejectsDaemonWithoutAttrParentContract() async throws {
     let daemon = try PfsLocalMockDaemon(
         configuration: .init(protocolMinor: 4)

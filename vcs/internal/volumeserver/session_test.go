@@ -24,6 +24,20 @@ func testAuthorization(access Access) Authorization {
 	return Authorization{Access: access, Deadline: time.Unix(10_000, 0)}
 }
 
+func TestValidateAttachSlotsMatchesAttachAdmission(t *testing.T) {
+	a, _ := testAuthority(t)
+	for _, slots := range []uint32{0, 5} {
+		if err := a.ValidateAttachSlots(slots); !errors.Is(err, ErrSlotRange) {
+			t.Fatalf("ValidateAttachSlots(%d) = %v, want ErrSlotRange", slots, err)
+		}
+	}
+	for _, slots := range []uint32{1, 4} {
+		if err := a.ValidateAttachSlots(slots); err != nil {
+			t.Fatalf("ValidateAttachSlots(%d) = %v", slots, err)
+		}
+	}
+}
+
 func TestMutationDuplicateDoesNotReexecute(t *testing.T) {
 	a, _ := testAuthority(t)
 	cred, err := a.Attach(2, PeerIdentity{1}, testAuthorization(AccessRead|AccessWrite))
@@ -367,4 +381,41 @@ func TestSessionAdmissionIsBoundedAndReleased(t *testing.T) {
 	if _, err := a.Attach(1, PeerIdentity{2}, Authorization{Access: AccessRead, Deadline: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("Attach after release: %v", err)
 	}
+}
+
+// FenceSession is the action behind participant-scoped cache fencing. It must
+// end the session at once, close the terminal boundary the coordinator watches,
+// and be safe to repeat, because the path that fences and the watcher that sees
+// the result can both reach it.
+func TestFenceSessionEndsOneSessionIdempotently(t *testing.T) {
+	a, _ := testAuthority(t)
+	fenced, err := a.Attach(2, PeerIdentity{1}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	survivor, err := a.Attach(2, PeerIdentity{2}, testAuthorization(AccessRead|AccessWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := a.SessionTerminal(fenced.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.FenceSession(fenced.ID)
+	select {
+	case <-terminal:
+	default:
+		t.Fatal("fencing did not cross the session's terminal boundary")
+	}
+	if _, err := a.Begin(fenced); !errors.Is(err, ErrSessionFenced) && !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("fenced session Begin = %v, want a terminal session error", err)
+	}
+	a.FenceSession(fenced.ID)
+	a.FenceSession(SessionID{9})
+
+	use, err := a.Begin(survivor)
+	if err != nil {
+		t.Fatalf("fencing one session ended another: %v", err)
+	}
+	use.End()
 }

@@ -40,6 +40,12 @@ type options struct {
 	sessionLease                                   time.Duration
 	maxInFlight, maxConnections                    int
 	handshakeTimeout, idleTimeout, writeTimeout    time.Duration
+	visibilityMembership                           string
+	priorStrictMountsFenced                        bool
+	maxCachedNameCapacity                          uint64
+	maxRepairBudget, visibilityClockSkew           time.Duration
+	mountAbsenceVerifyCommand                      string
+	mountAbsenceVerifyTimeout                      time.Duration
 }
 
 func run() error {
@@ -72,13 +78,29 @@ func run() error {
 	flag.DurationVar(&o.handshakeTimeout, "tls-handshake-timeout", 10*time.Second, "maximum TLS handshake duration")
 	flag.DurationVar(&o.idleTimeout, "connection-idle-timeout", 5*time.Minute, "maximum interval without a complete request frame")
 	flag.DurationVar(&o.writeTimeout, "connection-write-timeout", 30*time.Second, "maximum response frame write duration")
+	flag.StringVar(&o.visibilityMembership, "visibility-membership-file", "", "absolute durable strict-mount membership file")
+	flag.BoolVar(&o.priorStrictMountsFenced, "prior-strict-mounts-fenced", false, "control plane proved every recorded prior strict kernel mount unusable")
+	flag.Uint64Var(&o.maxCachedNameCapacity, "max-cached-name-capacity", 1<<16, "largest kernel-cache bound a strict mount may declare; sizes the per-session resolved index")
+	// The default must admit the mount's own default repair budget, or a stock
+	// mount cannot attach to a stock authority at all. Both defaults are stated
+	// against each other rather than chosen independently.
+	flag.DurationVar(&o.maxRepairBudget, "max-repair-budget", 30*time.Second, "longest per-phase cache-repair deadline a strict mount may commit to before it is fenced; must be at least the mount's -repair-budget")
+	flag.DurationVar(&o.visibilityClockSkew, "visibility-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
+	// Without this command a strict mount can never cleanly leave durable
+	// membership: the authority cannot observe a remote kernel's mount table,
+	// so evidence must be corroborated by something the frontend does not
+	// control. Every authority restart after a strict mount then depends on
+	// the unverified -prior-strict-mounts-fenced assertion, which is exactly
+	// the operator burden this command exists to remove.
+	flag.StringVar(&o.mountAbsenceVerifyCommand, "mount-absence-verify-command", "", "program that corroborates a strict mount's kernel-absence claim (JSON on stdin; exit 0 verifies); unset means clean detach always fails closed")
+	flag.DurationVar(&o.mountAbsenceVerifyTimeout, "mount-absence-verify-timeout", 30*time.Second, "bound on one mount-absence verification command run")
 	flag.Parse()
 	if os.Geteuid() == 0 {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
 	}
 	if o.listen == "" || o.volumeID == "" || o.root == "" || o.projectID == 0 ||
-		o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" {
-		return errors.New("listen, volume-id, root, nonzero project-id, TLS files, client CA, and capability public key are required")
+		o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" {
+		return errors.New("listen, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, and visibility membership file are required")
 	}
 	maxUint32 := uint(^uint32(0))
 	if o.projectID > maxUint32 || o.maxFrame == 0 || o.maxFrame > maxUint32 ||
@@ -128,6 +150,67 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if o.maxCachedNameCapacity == 0 || o.maxRepairBudget <= 0 || o.visibilityClockSkew < 0 {
+		return errors.New("max-cached-name-capacity and max-repair-budget must be positive and visibility-clock-skew must not be negative")
+	}
+	membership, priorDisposition, err := volumeserver.OpenFileVisibilityMembership(o.visibilityMembership, o.volumeID, o.priorStrictMountsFenced)
+	if err != nil {
+		return fmt.Errorf("open durable visibility membership: %w", err)
+	}
+	defer membership.Close()
+	// -prior-strict-mounts-fenced is an unverified operator assertion and the
+	// only input that can erase this authority's memory of an unsafe mount. It
+	// is durably audited inside the membership record; saying it out loud here
+	// as well means nobody has to read a file to learn that it happened.
+	for _, cleared := range membership.ClearedByOperatorAssertion() {
+		fmt.Fprintf(os.Stderr, "portablefs-authority: operator asserted prior strict mount %x fenced; cleared from durable membership for volume %s\n", cleared, o.volumeID)
+	}
+	if priorDisposition != volumeserver.PriorEpochStrictMountsFenced {
+		return errors.New("prior strict mounts remain active; fence their kernel mounts before starting a new authority epoch")
+	}
+	var absenceVerifier volumeserver.MountAbsenceVerifier
+	if o.mountAbsenceVerifyCommand != "" {
+		if o.mountAbsenceVerifyTimeout <= 0 {
+			return errors.New("mount-absence-verify-timeout must be positive")
+		}
+		absenceVerifier = commandAbsenceVerifier{command: o.mountAbsenceVerifyCommand, timeout: o.mountAbsenceVerifyTimeout}
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: priorDisposition, Membership: membership, Fencer: runtime,
+		AbsenceVerifier:       absenceVerifier,
+		MaxCachedNameCapacity: o.maxCachedNameCapacity,
+		MaxRepairBudget:       o.maxRepairBudget,
+		MaxClockSkew:          o.visibilityClockSkew,
+		OnFence: func(id volumeserver.SessionID, reason error) {
+			// One mount left the barrier. This is deliberately not a process
+			// failure: the volume keeps serving every other mount.
+			fmt.Fprintf(os.Stderr, "portablefs-authority: fenced strict mount %x: %v\n", id, reason)
+		},
+		OnRefusedCommitment: func(id volumeserver.SessionID, reason error) {
+			// The mount only learns an errno, so this is the one place an
+			// operator can see which declared number exceeded which bound.
+			fmt.Fprintf(os.Stderr, "portablefs-authority: refused strict attach %x: %v\n", id, reason)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	// The authority is the source of truth for the machine-local routing
+	// topology, so it reads the declaration out of its own volume root before it
+	// serves anything. A volume with no loaded revision cannot tell an agreeing
+	// mount from a disagreeing one, so a declaration that will not parse stops
+	// the process here rather than admitting mounts against a topology this
+	// volume does not have.
+	routes, err := authorityrpc.NewRoutesController(store, visibility)
+	if err != nil {
+		return err
+	}
+	if err := routes.Load(); err != nil {
+		return fmt.Errorf("load machine-local routing declaration: %w", err)
+	}
+	if revision, err := routes.Revision(); err == nil {
+		fmt.Fprintf(os.Stderr, "portablefs-authority: volume %s routing revision %x\n", o.volumeID, revision)
+	}
 	publicKey, err := readEd25519PublicKey(o.capabilityPublicKey)
 	if err != nil {
 		return err
@@ -144,11 +227,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	storageFailure := make(chan error, 1)
+	coherenceFailure := make(chan error, 1)
 	// The transport bound and the advertised bound are one value here, and
 	// Serve refuses to start if the handler ever advertises anything else.
 	maxFrame, maxInFlight := uint32(o.maxFrame), o.maxInFlight
 	handler := &authorityrpc.VolumeHandler{
 		Store: store, Runtime: runtime, Authorizer: authorizer,
+		Visibility: visibility, Routes: routes,
 		MaxFrame: maxFrame, MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(maxInFlight),
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
@@ -156,6 +241,13 @@ func run() error {
 		OnStorageFailure: func(err error) {
 			select {
 			case storageFailure <- err:
+			default:
+			}
+			stop()
+		},
+		OnCoherenceFailure: func(err error) {
+			select {
+			case coherenceFailure <- err:
 			default:
 			}
 			stop()
@@ -186,6 +278,8 @@ func run() error {
 	select {
 	case failure := <-storageFailure:
 		return fmt.Errorf("authoritative storage failed and this epoch was fenced: %w", failure)
+	case failure := <-coherenceFailure:
+		return fmt.Errorf("strict cache coherence failed and this epoch was fenced: %w", failure)
 	default:
 		return serveErr
 	}
@@ -215,7 +309,7 @@ func serverTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert,
 		ClientCAs: pool, Certificates: []tls.Certificate{certificate},
-		NextProtos: []string{"portablefs-authority-v1"},
+		NextProtos: []string{authorityrpc.ProtocolALPN},
 	}, nil
 }
 

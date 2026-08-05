@@ -11,6 +11,16 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var writeRequests: Int
         public var enumerateRequests: Int
         public var getAttrRequests: Int
+        /// Lookups that actually crossed the socket. The reserved repair
+        /// namespace must be refused locally, and only the daemon can testify
+        /// that no probe of it ever became a request.
+        public var lookupRequests: Int
+        /// Namespace mutations that actually crossed the socket. The macOS 26
+        /// repair contract's central claim is that a consumed repair callback
+        /// produces no request at all, and only the daemon can testify to that.
+        public var createRequests: Int
+        public var removeRequests: Int
+        public var renameRequests: Int
         /// Setattr requests that arrived carrying `set_flags`. The frontend
         /// gate is invisible from the outside — a refused change and a
         /// forwarded-then-refused change both surface as ENOTSUP — so proving
@@ -19,6 +29,9 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var maxReadLength: UInt32
         public var maxWriteLength: Int
         public var publicationAcks: Int
+        public var visibilityAcks: Int
+        public var v3LivenessRequests: Int
+        public var syncVolumeRequests: Int
     }
 
     public struct Configuration: Sendable {
@@ -30,6 +43,15 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var lookupNoReplyNames: Set<String>
         public var strictItemNamespace: Bool
         public var protocolMinor: UInt32?
+        /// Optional strict-v3 coherence terms returned by resolve. Tests leave
+        /// this nil unless they are exercising the minor-9 strict-v3 stream.
+        public var v3Coherence: PfsV3CoherenceContract?
+        /// Test-only delay or identity corruption for the on-demand authority
+        /// liveness reply. A normal reply echoes the request exactly.
+        public var v3LivenessDelayNanoseconds: UInt64
+        public var v3LivenessEpochOverride: Data?
+        public var v3LivenessSessionOverride: Data?
+        public var v3LivenessOverrideAfterRequestCount: Int
         /// Mirrors the real daemon's per-attach AUTHORITY knowledge: it rides
         /// the resolve reply as `Capabilities.flagsSupported`, and a setattr
         /// carrying `setFlags` against an AUTHORITY-BACKED node without it is
@@ -64,6 +86,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             lookupNoReplyNames: Set<String> = [],
             strictItemNamespace: Bool = false,
             protocolMinor: UInt32? = nil,
+            v3Coherence: PfsV3CoherenceContract? = nil,
+            v3LivenessDelayNanoseconds: UInt64 = 0,
+            v3LivenessEpochOverride: Data? = nil,
+            v3LivenessSessionOverride: Data? = nil,
+            v3LivenessOverrideAfterRequestCount: Int = 0,
             flagsSupported: Bool = true,
             flagsUnderstood: Bool = true,
             graftBackedNames: Set<String> = [],
@@ -77,6 +104,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.lookupNoReplyNames = lookupNoReplyNames
             self.strictItemNamespace = strictItemNamespace
             self.protocolMinor = protocolMinor
+            self.v3Coherence = v3Coherence
+            self.v3LivenessDelayNanoseconds = v3LivenessDelayNanoseconds
+            self.v3LivenessEpochOverride = v3LivenessEpochOverride
+            self.v3LivenessSessionOverride = v3LivenessSessionOverride
+            self.v3LivenessOverrideAfterRequestCount = v3LivenessOverrideAfterRequestCount
             self.flagsSupported = flagsSupported
             self.flagsUnderstood = flagsUnderstood
             self.graftBackedNames = graftBackedNames
@@ -246,6 +278,22 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         }
     }
 
+    /// Publishes an authority-shaped minor-8 visibility event to every
+    /// subscribed client, preserving the same request-id-zero event lane as
+    /// the production daemon.
+    public func emitVisibility(_ visibility: PfsV3VisibilityEvent) {
+        var event = PfsEvent()
+        event.kind = .visibility(visibility)
+
+        var envelope = PfsEnvelope()
+        envelope.requestID = 0
+        envelope.body = .event(event)
+
+        for session in sessionSnapshot() where session.isSubscribed {
+            try? session.send(envelope)
+        }
+    }
+
     public func emitAttachState(_ state: PfsAttachState.State, detail: String = "") {
         var attachState = PfsAttachState()
         attachState.state = state
@@ -269,6 +317,14 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
     public func stats() async -> Stats {
         await fileSystem.stats()
+    }
+
+    public func visibilityAcknowledgements() async -> [PfsVisibilityAckRequest] {
+        await fileSystem.visibilityAcknowledgements()
+    }
+
+    public func v3LivenessRequests() async -> [PfsV3LivenessRequest] {
+        await fileSystem.v3LivenessRequestsSnapshot()
     }
 
     public func resetStats() async {
@@ -525,7 +581,19 @@ private actor MockFileSystem {
             var item = PfsItem()
             item.itemID = id
             item.itemGeneration = generation
+            item.stableIdentity = Node.stableIdentity(for: id)
             return item
+        }
+
+        /// A strict daemon supplies a 16-byte stable XFS identity for every
+        /// item; the v3 namespace/live-object indexes are keyed by it. The
+        /// mock derives one deterministically from the node ID so tests can
+        /// predict it.
+        static func stableIdentity(for id: UInt64) -> Data {
+            var identity = Data("pfsmock!".utf8)
+            var bigEndian = id.bigEndian
+            withUnsafeBytes(of: &bigEndian) { identity.append(contentsOf: $0) }
+            return identity
         }
     }
 
@@ -545,10 +613,17 @@ private actor MockFileSystem {
     private var writeRequests = 0
     private var enumerateRequests = 0
     private var getAttrRequests = 0
+    private var lookupRequests = 0
+    private var createRequests = 0
+    private var removeRequests = 0
+    private var renameRequests = 0
     private var flagChangeRequests = 0
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
     private var publicationAcks = 0
+    private var visibilityAcks: [PfsVisibilityAckRequest] = []
+    private var v3LivenessRequests: [PfsV3LivenessRequest] = []
+    private var syncVolumeRequests = 0
     private var pendingRetractions = 0
     private var pendingRetractionRefusals = 0
     private var pendingCloseFailures = 0
@@ -573,7 +648,11 @@ private actor MockFileSystem {
     }
 
     func rootIdentity() -> PfsItemIdentity {
-        PfsItemIdentity(itemID: 1, generation: 1)
+        PfsItemIdentity(
+            itemID: 1,
+            generation: 1,
+            stableIdentity: Node.stableIdentity(for: 1)
+        )
     }
 
     func stats() -> PfsLocalMockDaemon.Stats {
@@ -585,11 +664,26 @@ private actor MockFileSystem {
             writeRequests: writeRequests,
             enumerateRequests: enumerateRequests,
             getAttrRequests: getAttrRequests,
+            lookupRequests: lookupRequests,
+            createRequests: createRequests,
+            removeRequests: removeRequests,
+            renameRequests: renameRequests,
             flagChangeRequests: flagChangeRequests,
             maxReadLength: maxReadLength,
             maxWriteLength: maxWriteLength,
-            publicationAcks: publicationAcks
+            publicationAcks: publicationAcks,
+            visibilityAcks: visibilityAcks.count,
+            v3LivenessRequests: v3LivenessRequests.count,
+            syncVolumeRequests: syncVolumeRequests
         )
+    }
+
+    func visibilityAcknowledgements() -> [PfsVisibilityAckRequest] {
+        visibilityAcks
+    }
+
+    func v3LivenessRequestsSnapshot() -> [PfsV3LivenessRequest] {
+        v3LivenessRequests
     }
 
     func resetStats() {
@@ -599,10 +693,17 @@ private actor MockFileSystem {
         writeRequests = 0
         enumerateRequests = 0
         getAttrRequests = 0
+        lookupRequests = 0
+        createRequests = 0
+        removeRequests = 0
+        renameRequests = 0
         flagChangeRequests = 0
         maxReadLength = 0
         maxWriteLength = 0
         publicationAcks = 0
+        visibilityAcks.removeAll()
+        v3LivenessRequests.removeAll()
+        syncVolumeRequests = 0
     }
 
     func retractNextPublications(count: Int) {
@@ -714,8 +815,12 @@ private actor MockFileSystem {
                 capabilities.flagsSupported = configuration.flagsSupported && !configuration.predatesFlagFields
                 capabilities.flagsUnderstood = configuration.flagsUnderstood && !configuration.predatesFlagFields
                 response.capabilities = capabilities
+                if let v3Coherence = configuration.v3Coherence {
+                    response.v3Coherence = v3Coherence
+                }
                 reply.body = .resolveReply(response)
             case let .lookup(request):
+                lookupRequests += 1
                 let name = displayName(request.name)
                 if configuration.lookupNoReplyNames.contains(name) {
                     try await Task.sleep(nanoseconds: 3_600_000_000_000)
@@ -875,6 +980,7 @@ private actor MockFileSystem {
                 response.attr = attr(for: node)
                 reply.body = .writeReply(response)
             case let .create(request):
+                createRequests += 1
                 let directory = try node(for: request.dir)
                 guard directory.children[request.name] == nil else {
                     throw MockPOSIXError(errno: EEXIST, message: "exists")
@@ -890,6 +996,7 @@ private actor MockFileSystem {
                 response.handle = handle
                 reply.body = .createReply(response)
             case let .mkdir(request):
+                createRequests += 1
                 let directory = try node(for: request.dir)
                 guard directory.children[request.name] == nil else {
                     throw MockPOSIXError(errno: EEXIST, message: "exists")
@@ -901,6 +1008,7 @@ private actor MockFileSystem {
                 response.attr = attr(for: node)
                 reply.body = .mkdirReply(response)
             case let .remove(request):
+                removeRequests += 1
                 let directory = try node(for: request.dir)
                 guard let childID = directory.children[request.name], let child = nodes[childID] else {
                     throw MockPOSIXError(errno: ENOENT, message: "not found")
@@ -914,6 +1022,7 @@ private actor MockFileSystem {
                 bump(directory)
                 reply.body = .removeReply(PfsRemoveReply())
             case let .rename(request):
+                renameRequests += 1
                 let fromDirectory = try node(for: request.fromDir)
                 let toDirectory = try node(for: request.toDir)
                 guard let childID = fromDirectory.children[request.fromName] else {
@@ -940,6 +1049,7 @@ private actor MockFileSystem {
                 bump(toDirectory)
                 reply.body = .renameReply(PfsRenameReply())
             case let .symlink(request):
+                createRequests += 1
                 let directory = try node(for: request.dir)
                 guard directory.children[request.name] == nil else {
                     throw MockPOSIXError(errno: EEXIST, message: "exists")
@@ -961,6 +1071,7 @@ private actor MockFileSystem {
                 response.target = node.symlinkTarget
                 reply.body = .readlinkReply(response)
             case let .hardLink(request):
+                createRequests += 1
                 let item = try node(for: request.item)
                 let directory = try node(for: request.dir)
                 guard item.kind != .directory else {
@@ -1015,11 +1126,19 @@ private actor MockFileSystem {
                 response.freeFiles = 900_000
                 reply.body = .statfsReply(response)
             case .syncVolume:
+                syncVolumeRequests += 1
                 reply.body = .syncVolumeReply(PfsSyncVolumeReply())
             case .fsync:
                 reply.body = .fsyncReply(PfsFsyncReply())
             case let .reclaim(request):
-                _ = try node(for: request.item)
+                // Reclaim can legally arrive after unlink+close already reaped
+                // the node: the kernel's last reference is gone either way, so
+                // an absent node is a completed reclaim, not a stale item. A
+                // node that still exists under a different generation is.
+                if let node = nodes[request.item.itemID],
+                   node.generation != request.item.itemGeneration {
+                    throw MockPOSIXError(errno: ESTALE, message: "stale item")
+                }
                 reply.body = .reclaimReply(PfsReclaimReply())
             case .subscribeEvents:
                 session.setSubscribed()
@@ -1029,12 +1148,43 @@ private actor MockFileSystem {
                 // empty mock envelope outside the request multiplexer.
                 publicationAcks += 1
                 break
+            case let .visibilityAck(request):
+                visibilityAcks.append(request)
+                reply.body = .visibilityAckReply(PfsVisibilityAckReply())
+            case let .v3Liveness(request):
+                guard request.authorityEpoch.count == 16,
+                      request.sessionID.count == 16 else {
+                    throw MockPOSIXError(errno: EINVAL, message: "invalid v3 liveness identity")
+                }
+                if let contract = configuration.v3Coherence {
+                    guard request.authorityEpoch == contract.authorityEpoch,
+                          request.sessionID == contract.sessionID else {
+                        throw MockPOSIXError(errno: EINVAL, message: "wrong v3 liveness identity")
+                    }
+                }
+                v3LivenessRequests.append(request)
+                if configuration.v3LivenessDelayNanoseconds > 0 {
+                    try await Task.sleep(
+                        nanoseconds: configuration.v3LivenessDelayNanoseconds
+                    )
+                }
+                var response = PfsV3LivenessReply()
+                let applyOverrides = v3LivenessRequests.count
+                    > configuration.v3LivenessOverrideAfterRequestCount
+                response.authorityEpoch = applyOverrides
+                    ? (configuration.v3LivenessEpochOverride ?? request.authorityEpoch)
+                    : request.authorityEpoch
+                response.sessionID = applyOverrides
+                    ? (configuration.v3LivenessSessionOverride ?? request.sessionID)
+                    : request.sessionID
+                reply.body = .v3LivenessReply(response)
             case .helloReply, .resolveReply, .lookupReply, .enumerateReply, .getAttrReply,
                  .setAttrReply, .openReply, .closeReply, .readReply, .writeReply,
                  .createReply, .mkdirReply, .removeReply, .renameReply, .symlinkReply,
                  .readlinkReply, .xattrGetReply, .xattrSetReply, .xattrListReply,
                  .xattrRemoveReply, .statfsReply, .fsyncReply, .reclaimReply,
-                 .subscribeEventsReply, .hardLinkReply, .syncVolumeReply, .error, .event:
+                 .subscribeEventsReply, .hardLinkReply, .syncVolumeReply,
+                 .visibilityAckReply, .v3LivenessReply, .error, .event:
                 throw MockPOSIXError(errno: EINVAL, message: "daemon received reply body")
             }
         } catch let error as MockPOSIXError {

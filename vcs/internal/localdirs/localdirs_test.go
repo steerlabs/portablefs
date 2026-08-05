@@ -12,6 +12,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
 // These tests pin the graft CONTRACT at the backing-op layer (the layer every
@@ -90,22 +91,58 @@ target
 	}
 }
 
-func TestStorageIDStable(t *testing.T) {
-	a := StorageID("vol_1", "main", "/mnt/w")
-	if a != StorageID("vol_1", "main", "/mnt/w") {
+// TestBackingIdentityIsVolumeKeyed pins the storage identity: a machine-local
+// dependency tree belongs to the VOLUME, not to a mountpoint, a branch, or a
+// mount instance.
+func TestBackingIdentityIsVolumeKeyed(t *testing.T) {
+	a := StorageID("vol_1")
+	if a != StorageID("vol_1") {
 		t.Fatal("storage id must be deterministic")
 	}
-	if a == StorageID("vol_1", "dev", "/mnt/w") || a == StorageID("vol_1", "main", "/mnt/x") {
-		t.Fatal("distinct mount keys must not collide")
+	if a == StorageID("vol_2") {
+		t.Fatal("distinct volumes must not collide")
 	}
 	if len(a) != 32 {
 		t.Fatalf("storage id %q must keep portablefsd's 32-hex convention", a)
 	}
+	// The same volume remounted anywhere reuses its backing; a different
+	// volume at the same mountpoint can never inherit it.
+	base := t.TempDir()
+	if BackingRoot(base, "vol_1") != BackingRoot(base, "vol_1") {
+		t.Fatal("a remount of the same volume must reuse its backing tree")
+	}
+	if BackingRoot(base, "vol_1") == BackingRoot(base, "vol_2") {
+		t.Fatal("two volumes must never share a backing tree")
+	}
 }
 
+func rulesFor(t *testing.T, text string) localroutes.RuleSet {
+	t.Helper()
+	rs, err := localroutes.Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("parse rules %q: %v", text, err)
+	}
+	return rs
+}
+
+// newGrafts builds a graft set from literal (anchored) roots, the shape the
+// --local-dir flag produces.
 func newGrafts(t *testing.T, dirs ...string) *Grafts {
 	t.Helper()
-	g, err := New(filepath.Join(t.TempDir(), "local", "sid"), dirs, nil)
+	var text strings.Builder
+	for _, d := range dirs {
+		pattern, err := localroutes.LiteralPattern(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text.WriteString(pattern + "\n")
+	}
+	return newGraftsWithRules(t, rulesFor(t, text.String()))
+}
+
+func newGraftsWithRules(t *testing.T, rules localroutes.RuleSet) *Grafts {
+	t.Helper()
+	g, err := New(Config{BackingRoot: filepath.Join(t.TempDir(), "local", "sid"), Rules: rules})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,13 +173,73 @@ func TestOwnerAndNilFastPath(t *testing.T) {
 
 	// The nil receiver is the non-graft mount's hot path.
 	var nilG *Grafts
-	if nilG.Owner("node_modules") != "" || nilG.RootsUnder("") != nil {
+	if nilG.Owner("node_modules") != "" || nilG.Patterns() != nil {
 		t.Fatal("nil Grafts must behave as no grafts")
+	}
+	if roots, eno := nilG.ActiveRootsUnder(""); roots != nil || eno != 0 {
+		t.Fatal("nil Grafts must report no active roots")
 	}
 	if eno, handled := nilG.VolumeRenameCheck("a", "b"); handled || eno != 0 {
 		t.Fatal("nil Grafts must not intercept renames")
 	}
-	nilG.RemapForRename("a", "b") // must not panic
+	if nilG.HasActiveRouteUnder("a") {
+		t.Fatal("nil Grafts must hold no backing")
+	}
+}
+
+// TestFloatingRuleInstantiatesRootsAtAnyDepth pins the pattern-era rule that
+// no fixed list can express: a directory created at a depth nobody enumerated
+// becomes a graft root the moment it matches, and everything under it is
+// machine-local from that instant.
+func TestFloatingRuleInstantiatesRootsAtAnyDepth(t *testing.T) {
+	g := newGraftsWithRules(t, rulesFor(t, "node_modules/\n"))
+
+	deep := "services/api/handlers/node_modules"
+	if got := g.Owner(deep); got != deep {
+		t.Fatalf("Owner(%q)=%q; a floating rule must own it at any depth", deep, got)
+	}
+	if _, eno := g.Lstat(deep); eno != syscall.ENOENT {
+		t.Fatalf("pre-mkdir lstat errno=%d want ENOENT (rules never synthesize)", eno)
+	}
+	// mkdir instantiates the root, scaffold and all, exactly like a
+	// configured one.
+	if eno := g.Mkdir(deep, 0o755); eno != 0 {
+		t.Fatalf("mkdir at depth errno=%d", eno)
+	}
+	if st, eno := g.Lstat(deep); eno != 0 || st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		t.Fatalf("instantiated root lstat errno=%d mode=%o", eno, st.Mode)
+	}
+	fd, eno := g.Create(deep+"/pkg.json", uint32(os.O_RDWR), 0o644)
+	if eno != 0 {
+		t.Fatalf("create under instantiated root errno=%d", eno)
+	}
+	_ = syscall.Close(fd)
+	// It is a root, not a file: the same directory-rule guards apply.
+	if _, eno := g.Create(deep, uint32(os.O_RDWR), 0o644); eno != syscall.EISDIR {
+		t.Fatalf("create at instantiated root errno=%d want EISDIR", eno)
+	}
+	// A nested match is inside the outer root, which owns the whole subtree.
+	nested := deep + "/pkg/node_modules"
+	if got := g.Owner(nested); got != deep {
+		t.Fatalf("Owner(%q)=%q want the topmost root %q", nested, got, deep)
+	}
+	roots, eno := g.ActiveRootsUnder("")
+	if eno != 0 || strings.Join(roots, ",") != deep {
+		t.Fatalf("active roots = %v errno=%d", roots, eno)
+	}
+	// The parent listing merges it in without any configured list of roots.
+	merged, eno := g.MergeParentListing("services/api/handlers", []clientcore.DirEntry{
+		{Name: "node_modules", Attr: fsproto.Attr{Kind: "directory"}, Ino: 7},
+		{Name: "main.go", Attr: fsproto.Attr{Kind: "file"}, Ino: 8},
+	})
+	if eno != 0 || names(merged) != "main.go,node_modules" {
+		t.Fatalf("merged=%v errno=%d", merged, eno)
+	}
+	for _, e := range merged {
+		if e.Name == "node_modules" && e.Ino&localInoMarker == 0 {
+			t.Fatal("the instantiated root must be served locally, not by the volume entry")
+		}
+	}
 }
 
 // TestRootExistsExactlyWhenMkdirred pins the core rule: a graft rule owns the
@@ -272,7 +369,8 @@ func TestBoundarySemantics(t *testing.T) {
 			t.Fatalf("VolumeRenameCheck(%q -> %q) = (%d,%v) want EXDEV", tc[0], tc[1], eno, handled)
 		}
 	}
-	// An ancestor rename with no graft-owned endpoint passes through.
+	// An ancestor rename with no graft-owned endpoint, no active backing
+	// under it, and no change in what the rules route passes through.
 	if _, handled := g.VolumeRenameCheck("agent-app", "agent-app-v2"); handled {
 		t.Fatal("ancestor rename must reach the authority")
 	}
@@ -504,61 +602,95 @@ func TestOpenHandleSurvivesWholesaleRemoval(t *testing.T) {
 	}
 }
 
-// TestAncestorRenameCarriesGraft pins the carry: a volume rename of a graft
-// root's ancestor remaps the rule and relocates the backing content.
-func TestAncestorRenameCarriesGraft(t *testing.T) {
-	var observed [][]string
-	g, err := New(filepath.Join(t.TempDir(), "local", "sid"), []string{"agent-app/node_modules", "unrelated"}, func(dirs []string) {
-		observed = append(observed, dirs)
-	})
-	if err != nil {
-		t.Fatal(err)
+// TestAncestorRenameOfActiveGraftIsEBUSY pins the semantics that replaced the
+// old carry-and-persist behavior. A shared ancestor holding machine-local
+// backing cannot be renamed at all: the declared rules are the only source of
+// routing truth, so there is no rule to rewrite, and moving the backing under
+// a name the declaration never mentioned is exactly the drift that made the
+// revision guard the wrong object.
+func TestAncestorRenameOfActiveGraftIsEBUSY(t *testing.T) {
+	g := newGrafts(t, "agent-app/node_modules", "unrelated")
+	before := g.RevisionHex()
+
+	// With no backing yet there is nothing to break, and the rename is a pure
+	// routing question: agent-app-v2/node_modules is not a configured route,
+	// so ownership would flip — refuse it.
+	if eno, handled := g.VolumeRenameCheck("agent-app", "agent-app-v2"); !handled || eno != syscall.EBUSY {
+		t.Fatalf("ownership-flipping rename = (%d,%v) want EBUSY", eno, handled)
 	}
-	defer g.Close()
+
 	if eno := g.Mkdir("agent-app/node_modules", 0o755); eno != 0 {
 		t.Fatal(eno)
 	}
 	fd, _ := g.Create("agent-app/node_modules/keep.txt", uint32(os.O_RDWR), 0o644)
-	if _, err := syscall.Write(fd, []byte("carried")); err != nil {
+	if _, err := syscall.Write(fd, []byte("kept")); err != nil {
 		t.Fatal(err)
 	}
 	_ = syscall.Close(fd)
 
-	// The volume accepted rename agent-app -> agent-app-v2; carry the graft.
-	g.RemapForRename("agent-app", "agent-app-v2")
-
-	if got := strings.Join(g.Dirs(), ","); got != "agent-app-v2/node_modules,unrelated" {
-		t.Fatalf("remapped dirs=%v", got)
+	// Now the subtree holds real machine-local storage: EBUSY, the errno
+	// Linux answers for renaming a directory containing a mount point. NOT
+	// EXDEV — a copy+delete fallback would copy the backing into the volume.
+	if eno, handled := g.VolumeRenameCheck("agent-app", "agent-app-v2"); !handled || eno != syscall.EBUSY {
+		t.Fatalf("ancestor rename over active backing = (%d,%v) want EBUSY", eno, handled)
 	}
-	if g.Owner("agent-app/node_modules") != "" {
-		t.Fatal("old name must no longer be owned")
-	}
-	if g.Owner("agent-app-v2/node_modules/keep.txt") != "agent-app-v2/node_modules" {
-		t.Fatal("new name must be owned")
-	}
-	fd, eno := g.Open("agent-app-v2/node_modules/keep.txt", uint32(os.O_RDONLY))
-	if eno != 0 {
-		t.Fatalf("open carried file errno=%d", eno)
-	}
-	buf := make([]byte, 16)
-	n, _ := syscall.Read(fd, buf)
-	_ = syscall.Close(fd)
-	if string(buf[:n]) != "carried" {
-		t.Fatalf("carried content=%q", buf[:n])
-	}
-	if len(observed) != 1 || strings.Join(observed[0], ",") != "agent-app-v2/node_modules,unrelated" {
-		t.Fatalf("onChange observations=%v", observed)
+	// Renaming ONTO a name whose subtree holds backing is refused the same
+	// way, in the same direction of caution.
+	if eno, handled := g.VolumeRenameCheck("docs", "agent-app"); !handled || eno != syscall.EBUSY {
+		t.Fatalf("rename over an active subtree = (%d,%v) want EBUSY", eno, handled)
 	}
 
-	// A rename that touches no graft changes nothing and fires no callback.
-	g.RemapForRename("src", "src2")
-	if len(observed) != 1 {
-		t.Fatalf("unrelated rename must not fire onChange: %v", observed)
+	// The refusal changed nothing: the rules, the revision, and the backing
+	// are exactly as declared.
+	if got := strings.Join(g.Patterns(), ","); got != "/agent-app/node_modules/,/unrelated/" {
+		t.Fatalf("patterns=%v; a rename must never mutate the route set", got)
+	}
+	if g.RevisionHex() != before {
+		t.Fatal("a rename must never change the revision the mount reports")
+	}
+	if g.Owner("agent-app/node_modules/keep.txt") != "agent-app/node_modules" {
+		t.Fatal("the declared route must still own its path")
+	}
+	if g.Owner("agent-app-v2/node_modules") != "" {
+		t.Fatal("no route may appear at a name the declaration never mentioned")
 	}
 }
 
-// TestConcurrencySanity hammers matching, listing merges, creates, and a
-// remap concurrently; run with -race this pins the atomic-swap discipline.
+// TestRenameFlipRefusalIsPathBased pins the check that makes ownership flips
+// impossible without enumerating the volume: it is decided from the rules
+// alone, before the rename is applied.
+func TestRenameFlipRefusalIsPathBased(t *testing.T) {
+	// A floating rule routes by name at any depth, so moving a shared
+	// ancestor changes nothing about what is local — allowed.
+	g := newGraftsWithRules(t, rulesFor(t, "node_modules/\n"))
+	if eno, handled := g.VolumeRenameCheck("agent-app", "agent-app-v2"); handled {
+		t.Fatalf("floating rules must leave ancestor renames alone: (%d,%v)", eno, handled)
+	}
+	// …until the subtree actually holds backing.
+	if eno := g.Mkdir("agent-app/node_modules", 0o755); eno != 0 {
+		t.Fatal(eno)
+	}
+	if eno, handled := g.VolumeRenameCheck("agent-app", "agent-app-v2"); !handled || eno != syscall.EBUSY {
+		t.Fatalf("ancestor rename over active backing = (%d,%v) want EBUSY", eno, handled)
+	}
+
+	// A wildcard ancestor discriminates exactly like a literal one.
+	w := newGraftsWithRules(t, rulesFor(t, "/apps/*/dist/\n"))
+	if eno, handled := w.VolumeRenameCheck("apps/web", "apps/api"); handled {
+		t.Fatalf("a rename between two paths the same rule matches must pass: (%d,%v)", eno, handled)
+	}
+	if eno, handled := w.VolumeRenameCheck("apps/web", "vendor/web"); !handled || eno != syscall.EBUSY {
+		t.Fatalf("moving out of a wildcard's reach = (%d,%v) want EBUSY", eno, handled)
+	}
+	// Moving a plain shared directory around stays a plain rename.
+	if eno, handled := w.VolumeRenameCheck("docs", "papers"); handled {
+		t.Fatalf("unrelated rename = (%d,%v), want pass-through", eno, handled)
+	}
+}
+
+// TestConcurrencySanity hammers matching, listing merges, and creates
+// concurrently; run with -race this pins that the rule set is immutable and
+// shareable without synchronization.
 func TestConcurrencySanity(t *testing.T) {
 	g := newGrafts(t, "node_modules", "carry/kit")
 	if eno := g.Mkdir("node_modules", 0o755); eno != 0 {
@@ -587,9 +719,10 @@ func TestConcurrencySanity(t *testing.T) {
 			}
 		}(w)
 	}
-	g.RemapForRename("carry", "carried")
-	if g.Owner("carried/kit/x") != "carried/kit" {
-		t.Fatal("remap lost under concurrency")
+	for i := 0; i < 64; i++ {
+		if g.Owner("carry/kit/x") != "carry/kit" || g.Owner("carried/kit/x") != "" {
+			t.Fatal("routing must be a pure function of the declaration")
+		}
 	}
 	close(stop)
 	wg.Wait()
@@ -606,7 +739,7 @@ func TestGraftOperationsCannotEscapeBackingCapability(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("outside"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	g, err := New(backing, []string{"node_modules"}, nil)
+	g, err := New(Config{BackingRoot: backing, Rules: rulesFor(t, "/node_modules/\n")})
 	if err != nil {
 		t.Fatal(err)
 	}

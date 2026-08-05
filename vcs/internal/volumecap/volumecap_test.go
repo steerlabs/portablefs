@@ -51,7 +51,7 @@ func TestTamperedAndUnknownPermissionFailClosed(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(20_000, 0)
 	peer := [32]byte{4}
-	claims := Claims{VolumeID: "v", Subject: "s", Access: []string{"admin"}, NotBefore: now.Add(-time.Second).Unix(), Expires: now.Add(time.Minute).Unix(), PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: "n"}
+	claims := Claims{VolumeID: "v", Subject: "s", Access: []string{"root"}, NotBefore: now.Add(-time.Second).Unix(), Expires: now.Add(time.Minute).Unix(), PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: "n"}
 	token, _ := Sign(priv, claims)
 	a := testAuthorizer(t, pub, &now)
 	if _, err := a.Verify("v", token, peer); !errors.Is(err, ErrInvalid) {

@@ -4,6 +4,57 @@
 > journal/branch/write-back architecture. PortableFS v3's current-state-only
 > contract is in [the authoritative-XFS decision](./xfs-authority-architecture.md).
 
+> **Correction (supersedes the "Mount Visibility" section below).** This
+> document described a cached frontend kept coherent by version-gated caches
+> and a push-invalidation stream, with an exact content-and-size refresh
+> through live objects. The README states the opposite: no read is served from
+> a kernel cache at all. Both cannot be true, and the README matches the code.
+>
+> **The shipping v3 contract on Linux is: nothing is cached, so nothing has to
+> be invalidated.** `vcs/internal/fusev3` returns `FOPEN_DIRECT_IO` and never
+> `FOPEN_KEEP_CACHE` on every open and create, sets the entry and attribute
+> timeouts to exactly zero on every lookup, `GETATTR` and entry reply, and
+> explicitly disables `CAP_DIRECT_IO_ALLOW_MMAP` so the kernel cannot hold
+> shared file-backed pages over a direct-I/O inode. Every `read(2)`,
+> path resolution and `stat(2)` therefore reaches the authority, and the
+> authority reads the one authoritative XFS tree. There is no invalidation
+> schedule to be late, and no window in which a peer's write is invisible: a
+> mutation is visible to the other mount as soon as the authority has applied
+> it, because the other mount has nothing older to serve from.
+>
+> The cost of that guarantee is that it is not free: the frontend cannot serve
+> a repeated read without a round trip, and shared file-backed `mmap` is
+> unsupported rather than incoherent.
+>
+> **Correction to the correction (strict is no longer future work on Linux).**
+> The paragraphs above describe the `uncached` profile, which is still a
+> supported deployment profile and still gives the same POSIX answers. It is no
+> longer the only one. `vcs/internal/fusev3/coherence_linux.go` implements the
+> `strict` profile — the frontend caches names and attributes and pays for it by
+> executing the authority's two-phase visibility barrier synchronously — and
+> `vcs/cmd/portablefs-mount-v3` defaults `-coherence` to `strict`. Both profiles
+> are exercised by `scripts/coherence-matrix-linux.sh`
+> (`PORTABLEFS_COHERENCE=strict|uncached`) against the same case list, because
+> the whole point is that they must be indistinguishable to an application.
+>
+> The strict and uncached profiles are held to the same application-visible
+> contract. The strict matrix includes a concurrent same-directory mutation
+> storm and permits zero fenced participants; the package-manager matrix runs a
+> real installer while the peer enumerates the same shared tree. Whether
+> `strict` remains a shipping profile is decided by those executable gates, not
+> by this paragraph.
+>
+> What remains future work is the *macOS* cached frontend. The FSKit adapter is
+> not wired to the visibility transport; see
+> [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) for the
+> unmet gates. Do not read the retired v2 section below as a statement about
+> what any mount does today.
+>
+> This is verified, not asserted: `scripts/coherence-matrix-linux.sh` runs two
+> real kernel FUSE mounts of one authority and asserts each of these
+> properties on bytes actually read, directory entries actually enumerated and
+> inode numbers actually observed, with no polling and no tolerance window.
+
 PortableFS separates write acceptance from two linked durability layers:
 
 - **Local write acceptance:** under an active delegation, `write(2)` returns
@@ -63,6 +114,9 @@ After authority durability, a replacement authority rebuilds the working
 tree from the immutable base plus journal replay.
 
 ## Mount Visibility
+
+> Superseded for v3 by the correction at the top of this document. The
+> description in this section is the retired v2 cached-frontend design.
 
 Mount clients connected to the same VCS authority share one live working tree — never separate
 per-machine folder snapshots. Reads resolve against the authority's current state through

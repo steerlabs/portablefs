@@ -20,7 +20,7 @@ func graftAttachWithFile(t *testing.T, name string) (*attach, *itemRecord) {
 		VolumeID: "vol-" + name, Branch: "main",
 		MountPath: "/Volumes/" + name,
 		Options:   AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
 		t.Fatal(err)
 	}

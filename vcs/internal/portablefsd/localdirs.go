@@ -27,7 +27,8 @@ package portablefsd
 //     omitted from its parent's enumeration — no phantom directories;
 //   - renames across the graft boundary fail with EXDEV (callers fall back to
 //     copy+delete, exactly as they do across bind mounts);
-//   - renaming a volume ancestor of a graft root moves the graft with it.
+//   - renaming a volume ancestor of a graft root fails with EBUSY: routing is
+//     path-owned, so carrying the backing would rewrite the declared topology.
 
 import (
 	"context"
@@ -36,7 +37,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path"
 	"sort"
 	"strings"
 	"syscall"
@@ -44,54 +44,85 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
-	"github.com/steerlabs/portablefs/vcs/internal/confinedfs"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
-// normalizeLocalDirs cleans, validates, and deduplicates workspace-relative
-// graft roots. Dirs nested inside another configured dir are dropped because
-// the outer graft already owns the whole subtree.
+// normalizeLocalDirs is intentionally only a package-local name for the
+// shared literal-path contract. Requests can reach the daemon directly,
+// without passing through the CLI, so keeping a second validator here would
+// let the two activation boundaries disagree about protected names.
 func normalizeLocalDirs(dirs []string) ([]string, error) {
-	cleaned := make([]string, 0, len(dirs))
-	seen := map[string]bool{}
-	for _, raw := range dirs {
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "/") {
-			return nil, errors.New("local dirs must be workspace-relative paths: " + raw)
-		}
-		p := path.Clean(strings.Trim(strings.ReplaceAll(trimmed, "\\", "/"), "/"))
-		if p == "" || p == "." || p == ".." || strings.HasPrefix(p, "../") {
-			return nil, errors.New("local dirs must be workspace-relative paths: " + raw)
-		}
-		if p == ".portablefs" || p == localdirs.VolumeConfigPath {
-			return nil, errors.New("local dir would shadow the local-dirs declaration: " + raw)
-		}
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		cleaned = append(cleaned, p)
+	return localdirs.Normalize(dirs)
+}
+
+// declaredLocalDirsForFSKit parses the declaration with the one canonical
+// language implementation, then lowers only the subset portablefsd can serve
+// exactly: anchored, wildcard-free directory roots. A floating rule such as
+// node_modules/ also owns nested node_modules directories; treating it as the
+// one literal root "node_modules" would apply a different topology while
+// appearing to accept the declaration. Unsupported semantics therefore fail
+// activation as a whole.
+func declaredLocalDirsForFSKit(data []byte) ([]string, error) {
+	rules, err := localroutes.Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", localdirs.VolumeConfigPath, err)
 	}
-	sort.Strings(cleaned)
-	out := make([]string, 0, len(cleaned))
-	for _, p := range cleaned {
-		nested := false
-		for _, parent := range out {
-			if strings.HasPrefix(p, parent+"/") {
-				nested = true
-				break
-			}
+	dirs := make([]string, 0, len(rules.Patterns()))
+	for _, pattern := range rules.Patterns() {
+		if !strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, "*?") {
+			return nil, fmt.Errorf(
+				"%s contains route %q, whose floating or wildcard semantics this FSKit daemon cannot serve; "+
+					"portablefsd currently accepts only anchored literal rules such as /node_modules/ and refuses the whole declaration rather than applying a different topology",
+				localdirs.VolumeConfigPath, pattern,
+			)
 		}
-		if !nested {
-			out = append(out, p)
-		}
+		dirs = append(dirs, strings.TrimSuffix(strings.TrimPrefix(pattern, "/"), "/"))
 	}
-	return out, nil
+	return localdirs.Normalize(dirs)
+}
+
+// ── THE VOLUME'S DECLARATION IS THE ONLY SOURCE OF ROUTING TRUTH ───────────
+//
+// Route topology is volume-declared. .portablefs/local-dirs is the one place a
+// volume's machine-local routing is written, the revision every mount reports
+// at attach is the hash of that file, and the authority refuses a mount whose
+// revision disagrees.
+//
+// A per-machine addition breaks that. It would take a directory every peer
+// still treats as shared and hide it on ONE machine, with no peer able to see
+// that it happened and no revision reflecting it: an agent on the laptop would
+// write into local disk while an agent in the sandbox wrote into the volume,
+// under the same path, and neither would be wrong from where it stood.
+//
+// The Linux FUSE client already refuses this. The FSKit branch of `portablefs
+// mount` hands --local-dir straight to this daemon without reading the
+// declaration, so refusing it there is not enough - macOS could still skew the
+// topology. The refusal therefore also lives HERE, at both places a graft rule
+// can enter a live daemon: activation, and the runtime control API.
+//
+// When the volume publishes no declaration, the legacy per-machine path is
+// unchanged: there is no volume-wide topology for a per-machine rule to
+// contradict.
+var errVolumeDeclaresRoutes = errors.New("volume declares its machine-local routes")
+
+// volumeDeclaresRoutesError words the refusal exactly as the FUSE client words
+// it. Two frontends refusing the same thing for the same reason in two
+// different sentences is how an operator concludes they are two different
+// rules.
+func volumeDeclaresRoutesError(requested, declared []string) error {
+	existing := strings.Join(declared, " ")
+	if existing == "" {
+		existing = "(none; the declaration is present but declares no rules)"
+	}
+	return fmt.Errorf(
+		"%w in %s, so --local-dir is not accepted: a per-machine addition would hide from this machine a "+
+			"directory every peer still treats as shared. Add the rule to %s and apply it volume-wide "+
+			"(requested: %s; existing rules: %s)",
+		errVolumeDeclaresRoutes, localdirs.VolumeConfigPath, localdirs.VolumeConfigPath,
+		strings.Join(requested, " "), existing)
 }
 
 // localDirForLocked returns the configured graft root that owns p ("" if p is
@@ -184,11 +215,26 @@ func (a *attach) addLocalDirs(dirs []string) ([]string, error) {
 		return nil, err
 	}
 	if len(requested) > 0 {
+		// The runtime half of the volume-declaration gate. A rule that
+		// activation would have refused must not be able to arrive through the
+		// control API a moment later.
+		a.mu.RLock()
+		declaredOwnsRouting := a.volumeRoutesDeclared
+		declaredRules := append([]string(nil), a.localDirs...)
+		a.mu.RUnlock()
+		if declaredOwnsRouting {
+			return nil, volumeDeclaresRoutesError(requested, declaredRules)
+		}
 		a.mu.RLock()
 		hasCapability := a.localFS != nil
 		a.mu.RUnlock()
 		if !hasCapability {
-			root, openErr := confinedfs.Open(a.localRoot, 0o700)
+			// Adding a graft rule to a live attach acquires the backing for the
+			// first time, so it is a second activation boundary and carries the
+			// same case-safety probe (localcasesafety.go). A rule added at
+			// runtime must not be able to reach a backing that activation would
+			// have refused.
+			root, openErr := openLocalBacking(a.localRoot)
 			if openErr != nil {
 				return nil, openErr
 			}
@@ -269,36 +315,6 @@ func (a *attach) addLocalDirs(dirs []string) ([]string, error) {
 		return nil, fmt.Errorf("persist local-dir identity transition: %w", journalErr)
 	}
 	return merged, nil
-}
-
-// remapLocalDirsForRenameLocked follows a successful authority rename of a
-// volume path: graft roots under the renamed subtree move with it, and their
-// backing directories are relocated so contents survive. Callers hold a.mu.
-func (a *attach) remapLocalDirsForRenameLocked(oldp, newp string) bool {
-	changed := false
-	for i, dir := range a.localDirs {
-		np, ok := renamedPath(dir, oldp, newp)
-		if !ok {
-			continue
-		}
-		if err := a.localFS.MkdirAll(parentPath(np), 0o755); err == nil {
-			_ = a.localFS.Rename(dir, np)
-		}
-		a.localDirs[i] = np
-		if ver, ok := a.localVersions[dir]; ok {
-			delete(a.localVersions, dir)
-			a.localVersions[np] = ver
-		}
-		changed = true
-	}
-	if changed {
-		sort.Strings(a.localDirs)
-		// A carried graft becomes explicit persisted mount state so a
-		// remount keeps serving the backing under its new name even when the
-		// volume declaration still contains the pre-rename path.
-		a.options.LocalDirs = append([]string(nil), a.localDirs...)
-	}
-	return changed
 }
 
 // bumpLocalVersionLocked advances the namespace/content version of a local
@@ -527,19 +543,18 @@ func (a *attach) removeLocal(p string, directory bool) int32 {
 // rename that leaves or enters the graft never reaches here; the caller
 // answers EXDEV at the boundary).
 func (a *attach) renameLocal(oldp, newp string, noReplace bool) int32 {
+	replaced := false
 	if noReplace {
-		if _, err := a.localFS.Lstat(newp); err == nil {
-			return darwinEEXIST
-		} else if !errors.Is(err, fs.ErrNotExist) {
+		if err := a.localFS.RenameNoReplace(oldp, newp); err != nil {
 			return localErrno(err)
 		}
-	}
-	replaced := false
-	if _, err := a.localFS.Lstat(newp); err == nil {
-		replaced = true
-	}
-	if err := a.localFS.Rename(oldp, newp); err != nil {
-		return localErrno(err)
+	} else {
+		if _, err := a.localFS.Lstat(newp); err == nil {
+			replaced = true
+		}
+		if err := a.localFS.Rename(oldp, newp); err != nil {
+			return localErrno(err)
+		}
 	}
 	a.mu.Lock()
 	if replaced {

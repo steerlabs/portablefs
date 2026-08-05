@@ -3,14 +3,21 @@
 > **Frozen v2 document.** This is the retired v2 FSKit implementation. v3
 > macOS support is intentionally gated on the coherency APIs and tests listed
 > in [the authoritative-XFS decision](./xfs-authority-architecture.md).
+> No production FSKit adapter in this repository joins the v3 authority today;
+> present-tense behavior below describes the frozen v2 surface, not a supported
+> v3 macOS mount. The retained daemon now parses route declarations with the
+> shared parser but can lower only anchored literal rules (for example
+> `/node_modules/`); it refuses the entire attach for floating or wildcard
+> rules and does not claim a v3 global route revision.
 
-`portablefs mount` on macOS has exactly one transport: the `fskit` strategy.
+The retired v2 `portablefs mount` on macOS has exactly one transport: the
+`fskit` strategy.
 The CLI drives the same `portablefsd` + FSKit extension pair the PortableFS
 menu-bar app uses. There is deliberately no fallback transport: a Mac that
 cannot serve an FSKit mount fails with install guidance instead of degrading
-to the retired fallback transport. A mounted path gets authority-ordered
+to the retired fallback transport. A v2 mounted path got authority-ordered
 operations, real POSIX modes and symlinks, and the durability contract below.
-On macOS 26, PortableFS provides an exact pre-acknowledgment refresh for known
+On the retired macOS 26 path, PortableFS provided a pre-acknowledgment refresh for known
 regular-file data and size. FSKit does not expose a general kernel-cache
 invalidation primitive, so cached namespace bindings and other attributes
 remain a documented framework boundary.
@@ -39,14 +46,18 @@ on beta symbols. `VolumeCore` deliberately owns all pfslocal, identity, open
 handle, and filesystem semantics independently of the adapter so a future
 availability-guarded macOS 27 handler can reuse the same tested core.
 
-Before claiming macOS 27 support, build that handler against the final SDK,
+Before claiming macOS 27 support, build that handler in a separate SDK-27
+source target and CI lane against the final SDK,
 negotiate the least-permissive correct `DataCacheHandler` coherency mode, drive
 remote invalidations through the handler's cache-state API, and pass the
 signed live-kernel read/write/mmap/rename/unlink/remote-invalidation matrix on
-both macOS 26 and 27. Until then, macOS 26 keeps the descriptor-confined
-`ftruncate` plus `msync(MS_INVALIDATE)` refresh described by the implementation.
-There is no conditional beta implementation or silent downgrade in the
-production binary.
+macOS 27. `#available` cannot make unknown SDK symbols compile, and a compiler
+guard that hides an uncompiled implementation is not verification. If the
+separate macOS 26 compatibility policy ships, it must pass its own matrix on
+macOS 26. The retained v2 macOS 26 implementation uses the
+descriptor-confined `ftruncate` plus `msync(MS_INVALIDATE)` refresh described
+below; v3 does not select it as a fallback. There is no conditional beta
+implementation or silent downgrade in the v3 binary.
 
 Apple's stable `FSVolume.OpenModes` contains only read and write access bits;
 it does not carry `O_APPEND`. The new documentation does not change the
@@ -234,18 +245,96 @@ option.
 
 ## Machine-Local Dirs
 
-`--local-dir <rel>` grafts are served natively by `portablefsd`: the attach's
+In the retained v2 daemon, `--local-dir <rel>` grafts are served natively by
+`portablefsd`: the attach's
 `localDirs` shadow those workspace-relative paths from machine-local disk
-instead of the authority, under the same graft contract as the Linux FUSE
-client ([architecture.md](./architecture.md)).
+instead of the authority. This is not a claim of parity with v3 Linux's full
+floating/glob matcher or authority-pinned route revision.
 
-The daemon reads the volume's `.portablefs/local-dirs` declaration before it
-activates the attach and unions it with the explicit/persisted `--local-dir`
-set, matching Linux FUSE. `--no-local-dirs` clears persisted explicit grafts
-and tells the daemon to ignore the volume declaration for that mount. Attach
-status and the CLI readiness record report the effective union. Declaring
-`.portablefs` itself (or the declaration file) as a graft is rejected so the
-configuration cannot shadow its own source.
+### The backing filesystem must be case-exact, and a stock Mac's is not
+
+The shared namespace is byte-exact: XFS matches directory entries by raw bytes,
+so `node_modules/React` and `node_modules/react` are two files. APFS as shipped
+is case-insensitive *and* normalization-insensitive, so on a stock Mac those two
+names — and the NFC/NFD spellings of any non-ASCII name — are one file in the
+backing. A graft on such a backing would report both names as existing while one
+silently overwrote the other, and nothing above the backing could detect it.
+
+`portablefsd` therefore **probes the backing at graft activation** and refuses
+when it folds. The probe really creates two case-colliding and two
+Unicode-colliding names in a private directory inside the backing root and
+observes lookup, overwrite, and enumeration; it does not trust volume
+attributes, which describe the volume a path started on rather than the
+filesystem the backing actually lands on. It cleans up after itself on every
+outcome. A backing root that disappears mid-probe is reported as an *incomplete*
+probe, never as a folding one.
+
+Consequences an operator has to plan for:
+
+- **On a default Mac, `--local-dir` fails the attach.** The error names the
+  backing path and says what to provide. Nothing degrades silently and no graft
+  half-activates.
+- **The fix is a case-sensitive backing volume**, with the daemon state dir on
+  it: `portablefsd -state-dir <dir-on-an-APFS-(Case-sensitive)-volume>`.
+- **There is no supported workaround.** An existing case-insensitive APFS volume
+  cannot be converted; creating a case-sensitive APFS volume needs administrator
+  authorization, so a user-session daemon cannot do it; and a case-sensitive
+  sparse bundle or disk image is deliberately *not* accepted, because it would
+  hide the user's dependency tree inside a second filesystem with its own
+  attach lifecycle and its own failure modes.
+
+The same probe runs when a graft rule is added to a live attach through
+`POST /v1/attaches/{ref}/local-dirs`, so a rule added at runtime cannot reach a
+backing that activation would have refused.
+
+The daemon reads the volume's `.portablefs/local-dirs` declaration through the
+attach's own session before it activates grafts. (The Linux mount cannot do that
+— it must declare the routing revision *on* the attach request — so it learns the
+declaration from the authority's refusal payload instead and attaches again on
+the same capability. There is no pre-session read of the file anywhere.) `--no-local-dirs` clears persisted explicit grafts and
+tells the daemon to ignore the volume declaration for that mount. Attach status
+and the CLI readiness record report the effective set. Declaring `.portablefs`
+itself (or the declaration file) as a graft is rejected so the configuration
+cannot shadow its own source.
+
+### A declaring volume owns routing outright
+
+`.portablefs/local-dirs` is the single source of routing truth: the revision a
+mount reports at attach is the hash of that file, and the authority refuses a
+mount whose revision disagrees. So when the volume publishes a declaration, the
+daemon **refuses** per-machine `--local-dir` additions rather than unioning them
+in:
+
+```
+volume declares its machine-local routes in .portablefs/local-dirs, so
+--local-dir is not accepted: a per-machine addition would hide from this machine
+a directory every peer still treats as shared. Add the rule to
+.portablefs/local-dirs and apply it volume-wide (requested: build; existing
+rules: cache node_modules)
+```
+
+The reason is not tidiness. A per-machine rule would take a directory every peer
+treats as *shared* and hide it on one machine, with no peer able to observe that
+it happened and no revision reflecting it — an agent on the laptop writing to
+local disk while an agent in the sandbox writes to the volume, under the same
+path, neither one wrong from where it stands.
+
+Two properties of the refusal matter:
+
+- **Presence, not content.** A declaration holding only comments is still the
+  volume asserting that it owns routing, and still refuses additions. "Does the
+  file exist" and "what rules does it hold" are different questions.
+- **Both entry points.** Activation and the runtime
+  `POST /v1/attaches/{ref}/local-dirs` refuse identically, so a rule cannot be
+  refused at mount and then added a moment later.
+
+The Linux FUSE client enforces the same gate with the same wording. It has to
+exist in the daemon as well because `portablefs mount`'s FSKit branch passes
+`--local-dir` straight through without reading the declaration — enforcing it on
+the FUSE client alone left macOS able to skew the topology.
+
+When the volume publishes **no** declaration there is no volume-wide topology to
+contradict, and the per-machine `--local-dir` path is unchanged.
 
 Graft ownership is immutable for the lifetime of an FSKit Item. When the
 effective rule set changes—during revived activation or a live additive

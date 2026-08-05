@@ -180,8 +180,9 @@ func (e *cmdEnv) printManifestStatus(o *commonOpts, br *branchInfo, head *headRe
 	if mode == "" {
 		mode = "legacy_manifest"
 	}
+	routes := e.localRoutesOf(head.Volume.ID, head.Branch.Name)
 	if o.jsonOut {
-		return e.printJSON(map[string]any{
+		out := map[string]any{
 			"volumeId":          head.Volume.ID,
 			"branch":            head.Branch.Name,
 			"branchMode":        mode,
@@ -189,8 +190,13 @@ func (e *cmdEnv) printManifestStatus(o *commonOpts, br *branchInfo, head *headRe
 			"treeHash":          head.Head.TreeHash,
 			"activeLeases":      head.ActiveLeases,
 			"activeDelegations": head.ActiveDelegations,
-		})
+		}
+		if routes != nil {
+			out["localRoutes"] = routes
+		}
+		return e.printJSON(out)
 	}
+	defer e.printLocalRoutes(routes)
 	fmt.Fprintf(e.stdout, "volume       %s\n", head.Volume.ID)
 	fmt.Fprintf(e.stdout, "branch       %s\n", head.Branch.Name)
 	fmt.Fprintf(e.stdout, "mode         authoring (import in progress — finish with: portablefs activate %s)\n", head.Volume.ID)
@@ -224,6 +230,7 @@ func (e *cmdEnv) printLiveStatus(o *commonOpts, api *apiClient, volumeID string,
 		}
 	}
 	localMounts := e.localMountsOf(volumeID, br.Name)
+	localRoutes := e.localRoutesOf(volumeID, br.Name)
 
 	retiring := br.BranchMode == "retiring" || br.BranchMode == "retired"
 	modeLine := "live (served by a managed journal authority; mount to read or write)"
@@ -248,6 +255,9 @@ func (e *cmdEnv) printLiveStatus(o *commonOpts, api *apiClient, volumeID string,
 		}
 		if latestReady != nil {
 			out["latestReadySnapshot"] = latestReady
+		}
+		if localRoutes != nil {
+			out["localRoutes"] = localRoutes
 		}
 		return e.printJSON(out)
 	}
@@ -276,6 +286,7 @@ func (e *cmdEnv) printLiveStatus(o *commonOpts, api *apiClient, volumeID string,
 			fmt.Fprintf(e.stdout, "mounts       %s (%s)\n", m.MountPath, m.Health)
 		}
 	}
+	e.printLocalRoutes(localRoutes)
 	return 0
 }
 

@@ -193,7 +193,7 @@ func TestGraftControlWriteRevalidatesTheIdentityItReserved(t *testing.T) {
 		VolumeID: "vol-graft-identity", Branch: "main",
 		MountPath: "/Volumes/GraftIdentity",
 		Options:   AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
 		t.Fatal(err)
 	}

@@ -30,6 +30,14 @@
 // HelloReply.request_deadline_ms, which moves ownership of the per-request
 // reply bound from a constant compiled into the frontend to the daemon that
 // actually owns the budgets it has to exceed.
+// Protocol minor 8 adds the macOS v3 coherence contract, exact two-phase
+// visibility events, and cursor acknowledgments. A frontend that ignores these
+// additions can continue serving stale kernel state, so pairing with an older
+// minor is a correctness failure rather than a feature downgrade.
+// Protocol minor 9 adds V3LivenessRequest/V3LivenessReply. Strict-v3
+// frontends use this as an end-to-end proof that the daemon can still reach
+// the exact authority epoch/session from Resolve; a live UDS alone is not a
+// coherence proof.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -151,6 +159,8 @@ message Envelope {
     HardLinkRequest hard_link = 34;
     SyncVolumeRequest sync_volume = 35;
     PublicationAck publication_ack = 36;
+    VisibilityAckRequest visibility_ack = 37;
+    V3LivenessRequest v3_liveness = 38;
 
     // daemon → client (replies)
     HelloReply hello_reply = 60;
@@ -179,6 +189,8 @@ message Envelope {
     SubscribeEventsReply subscribe_events_reply = 83;
     HardLinkReply hard_link_reply = 84;
     SyncVolumeReply sync_volume_reply = 85;
+    VisibilityAckReply visibility_ack_reply = 86;
+    V3LivenessReply v3_liveness_reply = 87;
 
     // daemon → client (either)
     ErrorReply error = 90;   // reply position: op failed with errno
@@ -190,7 +202,7 @@ message Envelope {
 
 message Hello {
   uint32 protocol_major = 1; // 1
-  uint32 protocol_minor = 2; // 6
+  uint32 protocol_minor = 2; // 8
   string client_name = 3;    // e.g. "fskit-appex"
   string client_version = 4;
 }
@@ -243,6 +255,32 @@ message ResolveReply {
   string branch = 4;
   string volume_name = 5;      // display name for the mounted volume
   Capabilities capabilities = 6;
+  V3CoherenceContract v3_coherence = 7;
+}
+
+// Present exactly when the resolved attach is backed by the v3 authority and
+// the frontend must participate in its strict two-phase visibility protocol.
+message V3CoherenceContract {
+  uint32 authority_protocol_major = 1;
+  bytes authority_epoch = 2;
+  bytes session_id = 3;
+  string cache_policy = 4;
+  uint64 repair_budget_millis = 5;
+  VisibilityCursor initial_cursor = 6;
+}
+
+// A strict-v3 frontend sends the exact authority identity from Resolve. A
+// successful reply is emitted only after portablefsd completes an on-demand
+// authority KeepAlive on the session's reserved liveness lane. Mismatched
+// identities are a protocol error; there is no local-only fallback.
+message V3LivenessRequest {
+  bytes authority_epoch = 1;
+  bytes session_id = 2;
+}
+
+message V3LivenessReply {
+  bytes authority_epoch = 1;
+  bytes session_id = 2;
 }
 
 message Capabilities {
@@ -291,8 +329,11 @@ message Capabilities {
 // ---------- core types ----------
 
 message Item {
-  uint64 item_id = 1;         // authority ino
-  uint64 item_generation = 2; // guards against ino reuse
+  uint64 item_id = 1;         // daemon-local opaque item handle
+  uint64 item_generation = 2; // guards against daemon item reuse
+  // Immutable authority stable identity, shared by every hard-link alias.
+  // Empty for legacy v2 backends; exactly 16 bytes for authority-v3.
+  bytes stable_identity = 3;
 }
 
 enum ItemKind {
@@ -563,11 +604,67 @@ message ReclaimReply {}
 message SubscribeEventsRequest {}
 message SubscribeEventsReply {}
 
+enum VisibilityPhase {
+  VISIBILITY_PHASE_UNSPECIFIED = 0;
+  VISIBILITY_PHASE_PREPARE = 1;
+  VISIBILITY_PHASE_COMPLETE = 2;
+}
+
+enum VisibilityScope {
+  VISIBILITY_SCOPE_UNSPECIFIED = 0;
+  VISIBILITY_SCOPE_NAMESPACE = 1;
+  VISIBILITY_SCOPE_DATA = 2;
+  VISIBILITY_SCOPE_ATTRIBUTES = 3;
+}
+
+message VisibilityCursor {
+  uint64 sequence = 1;
+  VisibilityPhase phase = 2;
+}
+
+message VisibilityTarget {
+  VisibilityScope scope = 1;
+  bytes identity = 2;
+  bytes parent_identity = 3;
+  bytes name = 4;
+  int64 size = 5;
+}
+
+message RoutesChange {
+  bytes revision = 1;
+  bytes rules = 2;
+}
+
+message V3VisibilityEvent {
+  bytes authority_epoch = 1;
+  VisibilityCursor cursor = 2;
+  bytes initiator_session_id = 3;
+  uint32 mutation_slot = 4;
+  repeated VisibilityTarget targets = 5;
+  uint64 mutation_sequence = 6;
+  RoutesChange routes = 7;
+  // Nonzero only when the authority initiator is this daemon session. It names
+  // the exact pfslocal callback publication unit whose authority mutation
+  // carries mutation_slot/mutation_sequence. PREPARE excludes only this unit;
+  // deferred source COMPLETE waits for its PublicationAck before reopening.
+  uint64 local_operation_id = 8;
+}
+
+message VisibilityAckRequest {
+  bytes authority_epoch = 1;
+  VisibilityCursor cursor = 2;
+  bool blocked = 3;
+  string reason = 4;
+}
+
+message VisibilityAckReply {}
+
 // Emitted only after SubscribeEventsRequest on this connection.
 message Event {
   oneof kind {
     Invalidation invalidation = 1;
     AttachState attach_state = 2;
+    V3VisibilityEvent visibility = 3;
   }
 }
 

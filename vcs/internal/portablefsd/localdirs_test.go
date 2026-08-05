@@ -20,6 +20,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/coherence"
 	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
+	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -29,7 +31,7 @@ func TestControlLocalWriteRefreshesAfterReleasingNamespace(t *testing.T) {
 		Branch:    "main",
 		MountPath: "/Volumes/LocalRefresh",
 		Options:   AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ func TestControlLocalWriteRefreshesAfterReleasingNamespace(t *testing.T) {
 }
 
 func TestAddLocalDirsReincarnatesPublishedAuthorityItems(t *testing.T) {
-	stateDir := privateTestDir(t)
+	stateDir := graftTestDir(t)
 	a := newAttach("att-local-transition", "key", ensureAttachRequest{
 		VolumeID:  "vol-local-transition",
 		Branch:    "main",
@@ -137,7 +139,7 @@ func TestAddLocalDirsPersistFailureLeavesLiveRoutingUnchanged(t *testing.T) {
 		VolumeID:  "vol-local-persist-failure",
 		Branch:    "main",
 		MountPath: "/Volumes/LocalPersistFailure",
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	a.identityEpoch = 37
 	old := a.registerLocked("cache/file", fsproto.Attr{Ino: 501, Kind: "file"})
 	if eno := a.flushBindingDelta(); eno != 0 {
@@ -262,7 +264,7 @@ func TestExactGraftRefreshSamplesOnlyConfinedLocalFile(t *testing.T) {
 		VolumeID: "vol-local-exact", Branch: "main",
 		MountPath: "/Volumes/LocalExact", AuthorityURL: authority,
 		Options: AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"cache"}); err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +327,7 @@ func TestAuthorityFlushAllExcludesLiveAndDetachedGraftAfterAncestorRemap(t *test
 		VolumeID: "vol-graft-flush-origin", Branch: "main",
 		MountPath: "/Volumes/GraftFlushOrigin",
 		Options:   AttachOptions{LocalDirs: []string{"workspace/cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"workspace/cache"}); err != nil {
 		t.Fatal(err)
 	}
@@ -423,15 +425,54 @@ func TestNormalizeLocalDirs(t *testing.T) {
 			t.Fatalf("normalizeLocalDirs(%q) accepted, want error", bad)
 		}
 	}
-	for _, trap := range []string{".portablefs", ".portablefs/local-dirs"} {
+	for _, trap := range []string{
+		".git", ".git/objects", "src/.git", "src/.git/objects",
+		".portablefs", ".portablefs/local-dirs", ".portablefs/cache", "src/.portablefs/cache",
+		"node_*", "**/node_modules",
+	} {
 		if _, err := normalizeLocalDirs([]string{trap}); err == nil {
-			t.Fatalf("normalizeLocalDirs(%q) accepted config-shadowing graft", trap)
+			t.Fatalf("normalizeLocalDirs(%q) accepted protected or non-literal graft", trap)
 		}
 	}
 	// "." and empty entries are dropped rather than rejected.
 	got, err = normalizeLocalDirs([]string{"", "  "})
 	if err != nil || len(got) != 0 {
 		t.Fatalf("blank dirs=%v err=%v", got, err)
+	}
+}
+
+func TestDeclaredLocalDirsForFSKitRejectsSemanticDivergence(t *testing.T) {
+	got, err := declaredLocalDirsForFSKit([]byte("/node_modules/\n/apps/web/cache/\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "apps/web/cache,node_modules"; strings.Join(got, ",") != want {
+		t.Fatalf("anchored literal declaration = %v, want %s", got, want)
+	}
+
+	// node_modules/ is not shorthand for the root literal. It is a floating
+	// rule that also owns a nested directory, which portablefsd's fixed list
+	// cannot enforce yet.
+	floating, err := localroutes.Parse([]byte("node_modules/\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root, ok := floating.Match("apps/web/node_modules/react"); !ok || root != "apps/web/node_modules" {
+		t.Fatalf("test premise: floating node_modules nested match = (%q,%v)", root, ok)
+	}
+	for _, declaration := range []string{
+		"node_modules/\n",
+		"/cache-*/\n",
+		"**/apps/*/node_modules/\n",
+	} {
+		if _, err := declaredLocalDirsForFSKit([]byte(declaration)); err == nil {
+			t.Fatalf("portablefsd accepted unsupported declaration %q", declaration)
+		} else if !strings.Contains(err.Error(), "cannot serve") || !strings.Contains(err.Error(), "refuses the whole declaration") {
+			t.Fatalf("unsupported declaration error = %q", err)
+		}
+	}
+	if _, err := declaredLocalDirsForFSKit([]byte("/cache/\n!vendor/\n")); err == nil {
+		t.Fatal("portablefsd partially accepted a declaration containing an invalid rule")
 	}
 }
 
@@ -472,6 +513,9 @@ func startDaemonNoAttach(t *testing.T, _ string) (Config, *http.Client, context.
 
 func ensureLocalDirsAttach(t *testing.T, hc *http.Client, authority, volumeID, mountPath string, localDirs []string) string {
 	t.Helper()
+	// Every daemon-level graft test funnels through here, so the case-exact
+	// backing requirement is stated once. See requireCaseExactGraftBacking.
+	requireCaseExactGraftBacking(t)
 	return ensureAttachWithPolicyOptions(t, hc, authority, volumeID, "main", mountPath, "writethrough", map[string]any{
 		"localDirs": localDirs,
 	})
@@ -561,7 +605,7 @@ func TestDetachedGraftXattrsRemainUnsupportedAfterAncestorRemap(t *testing.T) {
 		VolumeID: "vol-graft-xattr-origin", Branch: "main",
 		MountPath: "/Volumes/GraftXattrOrigin",
 		Options:   AttachOptions{LocalDirs: []string{"workspace/cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"workspace/cache"}); err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +659,7 @@ func TestLocalCloseErrorRetiresDaemonHandle(t *testing.T) {
 		VolumeID: "vol-graft-close-error", Branch: "main",
 		MountPath: "/Volumes/GraftCloseError",
 		Options:   AttachOptions{LocalDirs: []string{"workspace/cache"}},
-	}, privateTestDir(t))
+	}, graftTestDir(t))
 	if _, err := a.addLocalDirs([]string{"workspace/cache"}); err != nil {
 		t.Fatal(err)
 	}
@@ -750,6 +794,7 @@ func TestDaemonLocalDirRenameOverRetainsExactOpenObject(t *testing.T) {
 }
 
 func TestDaemonReadsVolumeLocalDirsAndNoLocalDisablesThem(t *testing.T) {
+	requireCaseExactGraftBacking(t)
 	authority := serveAuthority(t)
 	remote, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})
 	if err != nil {
@@ -765,20 +810,26 @@ func TestDaemonReadsVolumeLocalDirsAndNoLocalDisablesThem(t *testing.T) {
 		t.Fatalf("create volume local-dirs st=%d", st)
 	}
 	cfgState := clientcore.NewNodeState(cfgAttr.Ino, cfgAttr.Ino != 0)
-	if n, st := remote.Write(ctx, ".portablefs/local-dirs", cfgState, 0, []byte("node_modules\ncache # generated files\n")); st != fsproto.OK || n == 0 {
+	if n, st := remote.Write(ctx, ".portablefs/local-dirs", cfgState, 0, []byte("/node_modules/\n/cache/ # generated files\n")); st != fsproto.OK || n == 0 {
 		t.Fatalf("write volume local-dirs n=%d st=%d", n, st)
 	}
 
 	cfg, hc, cancel := startDaemonNoAttach(t, authority)
 	defer cancel()
+	// No per-machine additions here: the volume publishes a declaration, so it
+	// owns routing outright and "build" would now be refused. That refusal has
+	// its own test below; what this one asserts is that the DECLARED rules take
+	// effect on their own.
 	withConfig := ensureAttachWithPolicyOptions(t, hc, authority, "vol-config-dirs", "main", "/Volumes/ConfigDirs", "writethrough", map[string]any{
-		"localDirs":       []string{"build"},
 		"volumeLocalDirs": true,
 	})
 	var status attachStatus
 	controlJSON(t, hc, http.MethodGet, "/v1/attaches/"+withConfig, nil, http.StatusOK, &status)
-	if strings.Join(status.LocalDirs, ",") != "build,cache,node_modules" {
+	if strings.Join(status.LocalDirs, ",") != "cache,node_modules" {
 		t.Fatalf("effective localDirs=%v", status.LocalDirs)
+	}
+	if !status.LocalDirsDeclared {
+		t.Fatal("declaration-derived local dirs lost their origin in attach status")
 	}
 
 	c := dialPFS(t, cfg.FrontendSocket)
@@ -800,6 +851,9 @@ func TestDaemonReadsVolumeLocalDirsAndNoLocalDisablesThem(t *testing.T) {
 	controlJSON(t, hc, http.MethodGet, "/v1/attaches/"+noLocal, nil, http.StatusOK, &status)
 	if len(status.LocalDirs) != 0 {
 		t.Fatalf("no-local effective localDirs=%v", status.LocalDirs)
+	}
+	if status.LocalDirsDeclared {
+		t.Fatal("--no-local-dirs status claimed declaration-derived routing")
 	}
 	c2 := dialPFS(t, cfg.FrontendSocket)
 	defer c2.close()
@@ -1219,9 +1273,11 @@ func TestDaemonLocalDirsSurviveDaemonRestart(t *testing.T) {
 	}
 }
 
-// TestDaemonLocalDirsAuthorityRenameCarriesGraft pins that renaming a volume
-// ancestor of a graft root moves the graft and its backing content with it.
-func TestDaemonLocalDirsAuthorityRenameCarriesGraft(t *testing.T) {
+// TestDaemonLocalDirsAuthorityRenameRefusesOwnershipFlip pins that a shared
+// ancestor cannot be renamed across a literal route. The declaration stays
+// authoritative: the daemon neither carries/re-writes the rule nor strands
+// its backing under a path the rule no longer owns.
+func TestDaemonLocalDirsAuthorityRenameRefusesOwnershipFlip(t *testing.T) {
 	authority := serveAuthority(t)
 
 	remote, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})
@@ -1244,19 +1300,47 @@ func TestDaemonLocalDirsAuthorityRenameCarriesGraft(t *testing.T) {
 	nm := mkdirItem(t, c, app.Item, "node_modules")
 	writeAll(t, c, nm.Item, "keep.txt", "carried")
 
-	c.call(&pfslocal.RenameRequest{FromDir: root, FromName: []byte("agent-app"), ToDir: root, ToName: []byte("agent-app-v2")})
+	if er := c.callErr(&pfslocal.RenameRequest{
+		FromDir: root, FromName: []byte("agent-app"),
+		ToDir: root, ToName: []byte("agent-app-v2"),
+	}); er.Errno != darwinEBUSY {
+		t.Fatalf("ancestor ownership-flip rename errno=%d want EBUSY", er.Errno)
+	}
 
-	appV2 := lookupItem(t, c, root, "agent-app-v2")
-	nmV2 := lookupItem(t, c, appV2.Item, "node_modules")
-	kept := lookupItem(t, c, nmV2.Item, "keep.txt")
+	appStill := lookupItem(t, c, root, "agent-app")
+	nmStill := lookupItem(t, c, appStill.Item, "node_modules")
+	kept := lookupItem(t, c, nmStill.Item, "keep.txt")
 	if got := readAll(t, c, kept.Item); got != "carried" {
-		t.Fatalf("carried read=%q", got)
+		t.Fatalf("preserved backing read=%q", got)
+	}
+	if er := c.callErr(&pfslocal.LookupRequest{Dir: root, Name: []byte("agent-app-v2")}); er.Errno != darwinENOENT {
+		t.Fatalf("refused rename published destination errno=%d want ENOENT", er.Errno)
 	}
 
 	var one attachStatus
 	controlJSON(t, hc, http.MethodGet, "/v1/attaches/"+ref, nil, http.StatusOK, &one)
-	if strings.Join(one.LocalDirs, ",") != "agent-app-v2/node_modules" {
-		t.Fatalf("remapped localDirs=%v", one.LocalDirs)
+	if strings.Join(one.LocalDirs, ",") != "agent-app/node_modules" {
+		t.Fatalf("refused rename rewrote localDirs=%v", one.LocalDirs)
+	}
+}
+
+func TestRenamePathNeverRewritesDeclaredRoutesIntoAttachOptions(t *testing.T) {
+	a := newAttach("att-declared-rename", "key", ensureAttachRequest{
+		VolumeID: "vol-declared-rename", Branch: "main",
+		MountPath: "/Volumes/DeclaredRename",
+	}, graftTestDir(t))
+	// This is the activation shape for a declaration-derived route: effective
+	// live routing contains the rule, while per-machine attach options do not.
+	a.localDirs = []string{"agent-app/node_modules"}
+	a.options.LocalDirs = nil
+	a.mu.Lock()
+	a.renamePathLocked("agent-app", "agent-app-v2")
+	a.mu.Unlock()
+	if got := strings.Join(a.localDirs, ","); got != "agent-app/node_modules" {
+		t.Fatalf("renamePathLocked rewrote declared live routes to %q", got)
+	}
+	if len(a.options.LocalDirs) != 0 {
+		t.Fatalf("renamePathLocked persisted declaration as per-machine options: %v", a.options.LocalDirs)
 	}
 }
 
@@ -1466,4 +1550,239 @@ func jsonBody(t *testing.T, v any) *strings.Reader {
 		t.Fatal(err)
 	}
 	return strings.NewReader(string(data))
+}
+
+// publishRouteDeclaration writes .portablefs/local-dirs into the volume through
+// an ordinary authority client, which is how a repository publishes it.
+func publishRouteDeclaration(t *testing.T, authority, body string) {
+	t.Helper()
+	remote, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	ctx := context.Background()
+	if _, st := remote.Mkdir(ctx, ".portablefs", 0o755); st != fsproto.OK {
+		t.Fatalf("mkdir .portablefs st=%d", st)
+	}
+	attr, st := remote.Create(ctx, localdirs.VolumeConfigPath, 0o644)
+	if st != fsproto.OK {
+		t.Fatalf("create %s st=%d", localdirs.VolumeConfigPath, st)
+	}
+	state := clientcore.NewNodeState(attr.Ino, attr.Ino != 0)
+	if n, st := remote.Write(ctx, localdirs.VolumeConfigPath, state, 0, []byte(body)); st != fsproto.OK || n == 0 {
+		t.Fatalf("write %s n=%d st=%d", localdirs.VolumeConfigPath, n, st)
+	}
+}
+
+// attachExpectingRefusal posts an attach that must be refused and returns the
+// refusal body.
+func attachExpectingRefusal(t *testing.T, hc *http.Client, authority, volumeID, mountPath string, options map[string]any) string {
+	t.Helper()
+	merged := map[string]any{"writePolicy": "writethrough", "negativeCache": true, "diskCacheMb": 1}
+	for k, v := range options {
+		merged[k] = v
+	}
+	body, err := json.Marshal(map[string]any{
+		"volumeId": volumeID, "branch": "main", "authorityUrl": authority, "mountPath": mountPath,
+		"dataPlaneTransport": "plaintext", "options": merged,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://portablefsd/v1/attaches", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("attach to %s succeeded; it had to be refused. body=%s", volumeID, payload)
+	}
+	return string(payload)
+}
+
+// TestVolumeRouteDeclarationRefusesPerMachineGrafts is the daemon half of a
+// gate the FUSE client already enforces.
+//
+// Route topology is volume-declared: .portablefs/local-dirs is the only source
+// of routing truth and the revision a mount reports at attach is the hash of
+// that file. A per-machine addition would hide, on ONE machine, a directory
+// every peer still treats as shared - with no peer able to see it and no
+// revision reflecting it.
+//
+// `portablefs mount`'s FSKit branch hands --local-dir straight to this daemon
+// without reading the declaration, so refusing it on the FUSE client alone left
+// macOS able to skew the topology. This asserts the daemon refuses it too, at
+// both places a rule can enter: activation and the runtime control API.
+func TestVolumeRouteDeclarationRefusesPerMachineGraftsAtActivation(t *testing.T) {
+	// Deliberately NOT gated on a case-exact backing: the refusal happens
+	// before the backing capability is ever opened, so this assertion runs on
+	// every host including a stock Mac.
+	authority := serveAuthority(t)
+	publishRouteDeclaration(t, authority, "/node_modules/\n/cache/ # generated\n")
+	_, hc, cancel := startDaemonNoAttach(t, authority)
+	defer cancel()
+
+	refusal := attachExpectingRefusal(t, hc, authority, "vol-declared-refuse", "/Volumes/DeclaredRefuse", map[string]any{
+		"localDirs":       []string{"build"},
+		"volumeLocalDirs": true,
+	})
+	for _, want := range []string{
+		"declares its machine-local routes",
+		localdirs.VolumeConfigPath,
+		"is not accepted",
+		"apply it volume-wide",
+		"build",
+	} {
+		if !strings.Contains(refusal, want) {
+			t.Fatalf("refusal does not contain %q: %s", want, refusal)
+		}
+	}
+}
+
+// TestVolumeRouteDeclarationRefusesRuntimeGraftAdditions is the other half: a
+// rule that activation refused must not be able to arrive through the control
+// API a moment later, on an attach that was admitted without it.
+func TestVolumeRouteDeclarationRefusesRuntimeGraftAdditions(t *testing.T) {
+	requireCaseExactGraftBacking(t)
+	authority := serveAuthority(t)
+	publishRouteDeclaration(t, authority, "/node_modules/\n/cache/ # generated\n")
+	_, hc, cancel := startDaemonNoAttach(t, authority)
+	defer cancel()
+
+	ref := ensureAttachWithPolicyOptions(t, hc, authority, "vol-declared-runtime", "main", "/Volumes/DeclaredRuntime", "writethrough", map[string]any{
+		"volumeLocalDirs": true,
+	})
+	var status attachStatus
+	controlJSON(t, hc, http.MethodGet, "/v1/attaches/"+ref, nil, http.StatusOK, &status)
+	if strings.Join(status.LocalDirs, ",") != "cache,node_modules" {
+		t.Fatalf("declared-only effective localDirs=%v, want the declaration's rules", status.LocalDirs)
+	}
+	if !status.LocalDirsDeclared {
+		t.Fatal("declared-only status did not identify the declaration as its source")
+	}
+	runtimeRefusal := struct {
+		Error string `json:"error"`
+	}{}
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/local-dirs",
+		map[string]any{"dirs": []string{"build"}}, http.StatusBadRequest, &runtimeRefusal)
+	if !strings.Contains(runtimeRefusal.Error, "declares its machine-local routes") {
+		t.Fatalf("runtime refusal = %q", runtimeRefusal.Error)
+	}
+	controlJSON(t, hc, http.MethodGet, "/v1/attaches/"+ref, nil, http.StatusOK, &status)
+	if strings.Join(status.LocalDirs, ",") != "cache,node_modules" {
+		t.Fatalf("a refused runtime addition changed the effective set: %v", status.LocalDirs)
+	}
+}
+
+// TestCommentOnlyRouteDeclarationStillOwnsRouting: a declaration that declares
+// no rules is still the volume asserting that IT owns routing. Presence and
+// content are two different questions, and only presence decides whether a
+// per-machine addition is allowed.
+func TestCommentOnlyRouteDeclarationStillOwnsRouting(t *testing.T) {
+	// Not gated either, for the same reason: the refusal precedes the backing.
+	authority := serveAuthority(t)
+	publishRouteDeclaration(t, authority, "# this repository routes nothing machine-local\n\n")
+	_, hc, cancel := startDaemonNoAttach(t, authority)
+	defer cancel()
+	refusal := attachExpectingRefusal(t, hc, authority, "vol-comment-only", "/Volumes/CommentOnly", map[string]any{
+		"localDirs":       []string{"node_modules"},
+		"volumeLocalDirs": true,
+	})
+	if !strings.Contains(refusal, "declares its machine-local routes") {
+		t.Fatalf("a comment-only declaration did not own routing: %s", refusal)
+	}
+	if !strings.Contains(refusal, "declares no rules") {
+		t.Fatalf("the refusal does not say the declaration is present but empty: %s", refusal)
+	}
+}
+
+func TestVolumeRouteDeclarationRefusesUnsupportedOrInvalidWholeSet(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "floating node_modules also owns nested roots",
+			body: "/cache/\nnode_modules/\n",
+			want: "floating or wildcard semantics",
+		},
+		{
+			name: "component glob",
+			body: "/cache/\n/cache-*/\n",
+			want: "floating or wildcard semantics",
+		},
+		{
+			name: "invalid line does not partially apply",
+			body: "/cache/\n!vendor/\n",
+			want: "negation is not supported",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			authority := serveAuthority(t)
+			publishRouteDeclaration(t, authority, tc.body)
+			_, hc, cancel := startDaemonNoAttach(t, authority)
+			defer cancel()
+			refusal := attachExpectingRefusal(t, hc, authority, "vol-declaration-divergence", "/Volumes/DeclarationDivergence", map[string]any{
+				"volumeLocalDirs": true,
+			})
+			for _, want := range []string{localdirs.VolumeConfigPath, tc.want} {
+				if !strings.Contains(refusal, want) {
+					t.Fatalf("refusal does not contain %q: %s", want, refusal)
+				}
+			}
+		})
+	}
+}
+
+// TestWithoutARouteDeclarationPerMachineGraftsStillWork: with no declaration in
+// the volume there is no volume-wide topology for a per-machine rule to
+// contradict, so the legacy path is untouched - at activation and at runtime.
+func TestWithoutARouteDeclarationPerMachineGraftsStillWork(t *testing.T) {
+	requireCaseExactGraftBacking(t)
+	authority := serveAuthority(t)
+	cfg, hc, cancel := startDaemonNoAttach(t, authority)
+	defer cancel()
+	ref := ensureAttachWithPolicyOptions(t, hc, authority, "vol-no-declaration", "main", "/Volumes/NoDeclaration", "writethrough", map[string]any{
+		"localDirs":       []string{"build"},
+		"volumeLocalDirs": true,
+	})
+	var status attachStatus
+	controlJSON(t, hc, http.MethodGet, "/v1/attaches/"+ref, nil, http.StatusOK, &status)
+	if strings.Join(status.LocalDirs, ",") != "build" {
+		t.Fatalf("legacy per-machine localDirs=%v, want [build]", status.LocalDirs)
+	}
+	if status.LocalDirsDeclared {
+		t.Fatal("per-machine grafts were mislabeled as declaration-derived")
+	}
+	var added struct {
+		LocalDirs []string `json:"localDirs"`
+	}
+	controlJSON(t, hc, http.MethodPost, "/v1/attaches/"+ref+"/local-dirs",
+		map[string]any{"dirs": []string{"vendor"}}, http.StatusOK, &added)
+	if strings.Join(added.LocalDirs, ",") != "build,vendor" {
+		t.Fatalf("runtime addition without a declaration = %v, want [build vendor]", added.LocalDirs)
+	}
+
+	// And the graft really serves: the rule is not just recorded.
+	c := dialPFS(t, cfg.FrontendSocket)
+	defer c.close()
+	root := resolveRoot(t, c, ref)
+	nm := mkdirItem(t, c, root, "vendor")
+	writeAll(t, c, nm.Item, "local-only", "local")
+	remote, err := clientcore.Dial(context.Background(), clientcore.Options{Addr: authority, Pool: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	if _, st := remote.Lookup(context.Background(), "vendor"); st != fsproto.ENOENT {
+		t.Fatalf("a legacy per-machine graft leaked to the authority: st=%d", st)
+	}
 }
