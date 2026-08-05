@@ -43,19 +43,19 @@ type mountState struct {
 	// (strategy, engine) pair — a v3 FUSE mount has no write-back tail to
 	// drain or park, and a v3 FSKit mount's evidence-bearing detach is owned
 	// entirely by the daemon.
-	Engine string `json:"engine,omitempty"`
-	FSType string `json:"fsType,omitempty"`
-	MountInstanceID      string `json:"mountInstanceId,omitempty"`
-	KernelMountID        string `json:"kernelMountId,omitempty"`
-	MountTargetDevice    uint64 `json:"mountTargetDevice,omitempty"`
-	MountTargetInode     uint64 `json:"mountTargetInode,omitempty"`
-	MountMechanism       string `json:"mountMechanism,omitempty"`
-	FUSEHelperPath       string `json:"fuseHelperPath,omitempty"`
-	DataPlaneCAPath      string `json:"dataPlaneCaPath,omitempty"`
-	DataPlaneCASHA256    string `json:"dataPlaneCaSha256,omitempty"`
-	DataPlaneTransport   string `json:"dataPlaneTransport,omitempty"`
-	DataPlaneServerName  string `json:"dataPlaneServerName,omitempty"`
-	AuthorityURL         string `json:"authorityUrl,omitempty"`
+	Engine              string `json:"engine,omitempty"`
+	FSType              string `json:"fsType,omitempty"`
+	MountInstanceID     string `json:"mountInstanceId,omitempty"`
+	KernelMountID       string `json:"kernelMountId,omitempty"`
+	MountTargetDevice   uint64 `json:"mountTargetDevice,omitempty"`
+	MountTargetInode    uint64 `json:"mountTargetInode,omitempty"`
+	MountMechanism      string `json:"mountMechanism,omitempty"`
+	FUSEHelperPath      string `json:"fuseHelperPath,omitempty"`
+	DataPlaneCAPath     string `json:"dataPlaneCaPath,omitempty"`
+	DataPlaneCASHA256   string `json:"dataPlaneCaSha256,omitempty"`
+	DataPlaneTransport  string `json:"dataPlaneTransport,omitempty"`
+	DataPlaneServerName string `json:"dataPlaneServerName,omitempty"`
+	AuthorityURL        string `json:"authorityUrl,omitempty"`
 	// AttachRef is the portablefsd attach this fskit mount serves (the
 	// release-scoped generic URL resource the kernel holds); umount
 	// diagnostics correlate on it.
@@ -93,9 +93,9 @@ type mountState struct {
 	AccessLeaseReleaseOperationID string `json:"accessLeaseReleaseOperationId,omitempty"`
 	// Status is the mount's health beyond pid-liveness. Empty means healthy
 	// ("live"); mountStatusCredentialExpired means the daemon is running but
-	// the control plane definitively rejected its credentials (revoked or
-	// expired), so filesystem access is degraded until the user runs
-	// `portablefs login` and remounts. Additive: older records have no field.
+	// this mount's credential ended, so filesystem access is degraded until
+	// the mount is made again with a fresh volume mount capability. Additive:
+	// older records have no field.
 	Status string `json:"status,omitempty"`
 	// StatusChangedAtMs is when Status last transitioned (unix ms).
 	StatusChangedAtMs int64 `json:"statusChangedAtMs,omitempty"`
@@ -106,24 +106,6 @@ type mountState struct {
 	ForceParkAcknowledged bool   `json:"forceParkAcknowledged,omitempty"`
 	ForceRecoveryJobID    string `json:"forceRecoveryJobId,omitempty"`
 }
-
-// These mirror the daemon's disjoint credential-plane faults (portablefsd
-// attachStatus.credential) on the DATA-PLANE path. They are deliberately
-// separate from mountStatusCredentialExpired, which is the CLI-side
-// lease-keeper's own persisted verdict: the two paths observe different things
-// (a control-plane renewal refusal vs a data-plane handshake outcome) and
-// collapsing them would make a mount claim a verdict nothing on that path ever
-// reached.
-//
-// attachCredentialRouterRefused is the third: the router answered, and its
-// answer was not about the credential at all (capacity, a lease transition, an
-// authority outage behind it). It is retryable, and `portablefs login` is not
-// its remedy — which is exactly what the mount used to say.
-const (
-	attachCredentialRejected            = "rejected"
-	attachCredentialPendingVerification = "pending-verification"
-	attachCredentialRouterRefused       = "router-refused"
-)
 
 // The recorded mount engines. Empty is deliberately NOT a constant: it is the
 // absence of a claim, the shape every record written by the retired

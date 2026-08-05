@@ -30,7 +30,7 @@ func TestForcedUnmountVerdictNeverPrescribesAnotherForce(t *testing.T) {
 	}
 	a, err := newRevivedAttach(
 		testFSKitAttachRef, attachKey(req.VolumeID, req.Branch, req.MountPath),
-		req, stateDir, 1, false, false, "", nil,
+		req, stateDir, 1, false, false, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -59,11 +59,6 @@ func TestForcedUnmountVerdictNeverPrescribesAnotherForce(t *testing.T) {
 		t.Fatalf("the forced verdict names no escalation that differs from re-running "+
 			"the same command:\n%s", msg)
 	}
-	if !strings.Contains(msg, "portablefs recovery resolve") {
-		t.Fatalf("the forced verdict does not name the resolution that unblocks an "+
-			"offline force refused by a terminal recovery job:\n%s", msg)
-	}
-
 	// The NON-forced verdict is unchanged: for a caller who has not forced,
 	// --force is a real next step.
 	plain := r.unmountInProgressVerdict(testFSKitAttachRef, false, nil)

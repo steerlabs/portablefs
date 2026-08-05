@@ -113,7 +113,7 @@ is production-ready. See the
 ## Build and test
 
 ```bash
-pnpm verify
+bash scripts/verify-local.sh
 
 go -C vcs test -race ./internal/authorityrpc ./internal/volumeserver \
   ./internal/volumecap ./internal/xfsstore

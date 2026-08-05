@@ -95,14 +95,3 @@ func TestPlatformUnmountRejectsStrategyOSMismatch(t *testing.T) {
 		t.Fatal("unknown strategy did not fail")
 	}
 }
-
-func TestSelectedFUSEHelperRefusesResolutionChangeAtMountBoundary(t *testing.T) {
-	err := validateSelectedFUSEHelperWith(
-		"/usr/bin/fusermount3",
-		func(string) error { return nil },
-		func() (string, bool) { return "/hostile/bin/fusermount3", true },
-	)
-	if err == nil || !strings.Contains(err.Error(), "resolution changed") {
-		t.Fatalf("PATH change error = %v", err)
-	}
-}

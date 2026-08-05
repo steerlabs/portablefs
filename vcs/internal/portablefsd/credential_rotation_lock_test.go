@@ -27,7 +27,7 @@ import (
 // It hangs against the pre-fix registry.activate, which takes mutationMu before
 // it looks at the attach at all.
 func TestLiveCredentialRotationDoesNotQueueBehindTheRegistryMutationLock(t *testing.T) {
-	a, _, _, _ := newMutationSeqAttach(t)
+	a := newLiveCredentialTestAttach(t)
 	a.ref = "rotation-ref"
 	a.key = "rotation-key"
 	r := &registry{
@@ -101,7 +101,7 @@ func TestLiveCredentialRotationDoesNotQueueBehindTheRegistryMutationLock(t *test
 // path, and it must still reach it — with the lock held, and with the same
 // error — rather than being answered by the lock-free shortcut.
 func TestCredentialRotationStillSerializesForEveryStateItDoesNotHandle(t *testing.T) {
-	a, _, _, _ := newMutationSeqAttach(t)
+	a := newLiveCredentialTestAttach(t)
 	a.ref = "detached-ref"
 	a.key = "detached-key"
 	a.mu.Lock()
@@ -137,4 +137,23 @@ func TestCredentialRotationStillSerializesForEveryStateItDoesNotHandle(t *testin
 	if found || err != nil {
 		t.Fatalf("unknown ref reported found=%v err=%v, want false/nil", found, err)
 	}
+}
+
+// newLiveCredentialTestAttach builds an attach in the one state the lock-free
+// rotation path exists for: LIVE — an installed authority-v3 data plane and no
+// pending credential. Nothing here dials; the rotation under test is a token
+// write, and what is being measured is which lock it has to take.
+func newLiveCredentialTestAttach(t *testing.T) *attach {
+	t.Helper()
+	a := newAttach("live-credential", "live-credential-key", ensureAttachRequest{
+		VolumeID:            "credential-volume",
+		AuthorityURL:        "127.0.0.1:1",
+		DataPlaneTransport:  "tls-system-pki",
+		DataPlaneServerName: "authority.invalid",
+		MountPath:           "/Volumes/PortableFSCredential",
+	}, privateTestDir(t))
+	a.persist = func() error { return nil }
+	a.schedulePersist = func() {}
+	a.v3Data = &v3DataPlane{}
+	return a
 }

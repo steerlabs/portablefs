@@ -291,15 +291,6 @@ type fskitAttachOptions struct {
 	VolumeLocalDirs bool     `json:"volumeLocalDirs,omitempty"`
 }
 
-func fskitOptionsFromPerf(perf perfOptions, localDirs []string, volumeLocalDirs bool) fskitAttachOptions {
-	return fskitAttachOptions{
-		NegativeCache:   perf.negativeCache,
-		NoNegativeCache: perf.negativeCacheOff,
-		LocalDirs:       localDirs,
-		VolumeLocalDirs: volumeLocalDirs,
-	}
-}
-
 type fskitEnsureAttachRequest struct {
 	AttachRef    string `json:"attachRef"`
 	VolumeID     string `json:"volumeId"`
@@ -357,11 +348,6 @@ func (c *fsdControl) ensureAttachDetailed(req fskitEnsureAttachRequest) (fskitEn
 	return reply, nil
 }
 
-func (c *fsdControl) ensureAttach(req fskitEnsureAttachRequest) (string, error) {
-	reply, err := c.ensureAttachDetailed(req)
-	return reply.AttachRef, err
-}
-
 func (c *fsdControl) stopIfIdle() error {
 	status, body, err := c.do(http.MethodPost, "/v1/lifecycle/stop-if-idle", map[string]any{})
 	if err != nil {
@@ -401,68 +387,6 @@ type cliAttachStatus struct {
 	Branch    string `json:"branch"`
 	State     string `json:"state"`
 	LastError string `json:"lastError"`
-	// Credential names WHICH credential fault a degraded attach has, so the
-	// CLI can print (and --json can carry) the difference between a
-	// proven-dead credential and an UNTESTED one instead of flattening both
-	// into the word "degraded".
-	Credential string              `json:"credential"`
-	WriteBack  *cliWriteBackStatus `json:"writeBack"`
-}
-
-type cliWriteBackStatus struct {
-	PendingRecords int   `json:"pendingRecords"`
-	PendingBytes   int64 `json:"pendingBytes"`
-	WALBytes       int64 `json:"walBytes"`
-	WALBudget      int64 `json:"walBudget"`
-	LastProgressMs int64 `json:"lastProgressMs"`
-	// Drain-time credit control: the pacing state that distinguishes a
-	// flusher deliberately holding writers back from one that is not draining
-	// at all. PendingRecords alone cannot tell those apart.
-	CreditSetpoint int64   `json:"creditSetpoint"`
-	CreditDebt     int64   `json:"creditDebt"`
-	CreditCeiling  int64   `json:"creditCeiling"`
-	AppliedRateBps float64 `json:"appliedRateBps"`
-	CreditWaiters  int     `json:"creditWaiters"`
-	DataLaneFull   bool    `json:"dataLaneFull"`
-	// CapacityRefused is the authority's live capacity verdict: writes refuse
-	// with ENOSPC, reads/metadata/truncate keep working, and it clears by itself
-	// when the authority releases. Distinct from Degraded on purpose.
-	CapacityRefused bool                `json:"capacityRefused,omitempty"`
-	Delegations     []cliDelegationView `json:"delegations"`
-	ParkedWALs      []cliParkedWAL      `json:"parkedWals"`
-	// Degraded and LastFailure are the engine's sticky health verdict and the
-	// reason behind it. Without them `portablefs mounts --json` could show a
-	// mount with a small, stable backlog and no visible problem while the
-	// flusher had already latched a stall — the exact blind spot the live
-	// battery hit. They are the same two fields the daemon publishes; the CLI
-	// simply carries them.
-	Degraded    bool   `json:"degraded,omitempty"`
-	LastFailure string `json:"lastFailure,omitempty"`
-}
-
-// paced reports the data lane holding writers back: either mutations are
-// currently blocked on credit or the bulk lane is sitting at its hard cap.
-func (w *cliWriteBackStatus) paced() bool {
-	return w != nil && (w.CreditWaiters > 0 || w.DataLaneFull)
-}
-
-type cliDelegationView struct {
-	Scope    string `json:"scope"`
-	Draining bool   `json:"draining"`
-	// DrainError is the RECORDED verdict of a release attempt that reached a
-	// definite outcome. Draining and DrainError are mutually exclusive at the
-	// daemon, so a scope that is neither draining nor erroring is simply held.
-	// Dropping it made every failed release look identical to an idle grant in
-	// `portablefs mounts --json` — including the one an unmount refusal names.
-	DrainError string `json:"drainError,omitempty"`
-}
-
-type cliParkedWAL struct {
-	Root         string `json:"root"`
-	Records      int    `json:"records"`
-	PayloadBytes int64  `json:"payloadBytes"`
-	AgeMs        int64  `json:"ageMs"`
-	LastError    string `json:"lastError"`
 }
 
 // verifyRecordedFskitAttach correlates a persisted mount/intent with the

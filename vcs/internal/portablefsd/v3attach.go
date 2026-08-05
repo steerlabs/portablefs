@@ -12,7 +12,6 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -426,7 +425,7 @@ func (c *frontendConn) handleV3Attached(
 	if operationID != 0 {
 		defer c.finishLogicalRequest(operationID)
 	}
-	ctx, cancelOperation := clientcore.WithOperationDeadline(ctx)
+	ctx, cancelOperation := withOperationDeadline(ctx)
 	defer cancelOperation()
 	gateCtx, participant, participates, publishes, err := c.beginLogicalOperation(
 		ctx, a, operationID, initializeOperation, body,

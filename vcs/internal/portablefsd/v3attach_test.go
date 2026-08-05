@@ -310,8 +310,8 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 		string(admitted.GetAccessToken()) != "capability" {
 		t.Fatalf("authority admitted contract %+v", admitted)
 	}
-	if a.hasLiveVolume() && a.vol != nil {
-		t.Fatal("v3 attach constructed a clientcore volume")
+	if !a.hasLiveVolume() {
+		t.Fatal("v3 attach did not install its authority session")
 	}
 
 	// The whole pfslocal surface through the real frontend connection.
@@ -378,12 +378,9 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	lookups, statfsCalls := handler.authorityCalls()
 	// The attach preflight issues one StatFS of its own; the frontend requests
 	// must have added theirs, which is what proves the ops surface is served by
-	// the authority-v3 backend and not by clientcore (a.vol stayed nil).
+	// the authority-v3 backend.
 	if lookups == 0 || statfsCalls < 2 {
 		t.Fatalf("authority served lookups=%d statfs=%d", lookups, statfsCalls)
-	}
-	if a.vol != nil {
-		t.Fatal("v3 frontend traffic touched the clientcore path")
 	}
 }
 
@@ -601,7 +598,7 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, eno := a.rootReply(context.Background()); eno != darwinENOTCONN {
+	if _, eno := a.v3RootReply(); eno != darwinENOTCONN {
 		t.Fatalf("terminal v3 resolve errno=%d, want %d", eno, darwinENOTCONN)
 	}
 	status := a.status()
@@ -613,9 +610,6 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 	if err := a.activate(context.Background(), "fresh-capability", 0); err == nil ||
 		!strings.Contains(err.Error(), "unmount") {
 		t.Fatalf("terminal v3 attach reactivation = %v, want an unmount-directing refusal", err)
-	}
-	if a.vol != nil {
-		t.Fatal("terminal v3 attach fell back into the clientcore path")
 	}
 }
 
@@ -644,7 +638,7 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 		!strings.Contains(err.Error(), "unmount") {
 		t.Fatalf("revived v3 activation = %v, want an unmount-directing refusal", err)
 	}
-	if _, eno := b.rootReply(context.Background()); eno != darwinEIO {
+	if _, eno := b.v3RootReply(); eno != darwinEIO {
 		t.Fatalf("revived v3 resolve errno=%d, want %d", eno, darwinEIO)
 	}
 	found, jobID, err := revived.unmountFSKitWith(ref, false, fskitKernelOps{

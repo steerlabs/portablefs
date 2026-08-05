@@ -162,20 +162,30 @@ if (workflow.includes("--clobber")) {
 }
 for (const releaseGate of [
   "Prove an exact stable tag at this source revision",
-  "run: pnpm verify",
-  "run: pnpm audit --prod --audit-level high",
+  "GOOS=darwin go -C vcs build ./...",
+  "GOOS=linux go -C vcs build ./...",
+  "go -C vcs vet ./...",
+  "go -C vcs test ./...",
+  "go -C vcs test -race ./...",
+  "sh -n scripts/install.sh",
+  "node scripts/check-workflow-pins.mjs",
+  "node scripts/check-install-release-trust.mjs",
   "govulncheck@v1.6.0",
   "args: check",
   "needs: validate",
   "needs: [validate, goreleaser]",
   "needs: [validate, goreleaser, macos-app]",
-  "needs: [validate, goreleaser, macos-app, docker]",
   "run: swift test --package-path swift/PortableFSKit",
 ]) {
   requireText(workflow, releaseGate, `release validation gate ${releaseGate}`);
 }
-if (/^\s+ghcr\.io\/.*:latest\s*$/m.test(workflow)) {
-  failures.push("release workflow publishes a mutable latest container tag");
+// The v3 tree publishes exactly two trust chains: the Linux archives (Sigstore
+// provenance) and the notarized macOS app. The journal-era control-plane
+// container images are gone, so the release workflow must not push any image.
+for (const retiredControlPlane of ["ghcr.io", "docker/build-push-action", "Dockerfile"]) {
+  if (workflow.includes(retiredControlPlane)) {
+    failures.push(`release workflow still publishes retired control-plane images (${retiredControlPlane})`);
+  }
 }
 
 if (failures.length > 0) {

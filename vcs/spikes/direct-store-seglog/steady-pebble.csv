@@ -1,6 +1,0 @@
-engine,target_utilization,live_cells,phase,window,operations,logical_bytes,kernel_disk_bytes,kernel_amplification,three_way_kernel_amplification,kernel_bytes_per_op,foreground_appended_bytes,clean_copied_bytes,clean_passes,reclaimed_bytes,index_disk_bytes,store_disk_bytes,live_bytes,total_log_bytes,occupancy,space_amplification,pebble_compacted_bytes,pebble_flush_bytes,pebble_wal_bytes,duration_ms,logical_mib_per_s,admit_wait_ms,admit_overruns
-pebble,0.70,262144,warmup,0,1572864,6442450944,25970171904,4.031101,12.093304,16511.391,0,0,0,0,-1,2758194618,0,0,,,13051168682,12712645073,6513993571,141436,43.440,0,0
-pebble,0.70,262144,steady,1,262144,1073741824,4195069952,3.906963,11.720890,16002.922,0,0,0,0,-1,2947781804,0,0,,,2059290195,2109184920,1085665609,22774,44.962,0,0
-pebble,0.70,262144,steady,2,262144,1073741824,5585444864,5.201851,15.605553,21306.781,0,0,0,0,-1,2820056248,0,0,,,3354167983,2172708928,1085665617,31165,32.857,0,0
-pebble,0.70,262144,steady,3,262144,1073741824,4926324736,4.587997,13.763992,18792.438,0,0,0,0,-1,2861253381,0,0,,,2684478263,2173594207,1085665612,27205,37.639,0,0
-pebble,0.70,262144,drain,0,0,0,399925248,,,,0,0,0,0,-1,2830289596,0,0,,,309593642,144210229,0,2418,0.000,0,0

@@ -12,10 +12,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-
 jobs:
+  # Supply-chain and release-trust policy. Both scripts are dependency-free
+  # single-file node programs (the repository has no JavaScript packages), so
+  # they run against the runner's preinstalled node with no install step.
   workflow-pins:
     runs-on: ubuntu-24.04
     steps:
@@ -24,25 +24,11 @@ jobs:
           persist-credentials: false
       - name: Enforce workflow pin policy (SHA pins, versioned runners, permissions)
         run: node scripts/check-workflow-pins.mjs .github/workflows
-
-  ts:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Enable corepack (pnpm 10 from packageManager)
-        run: corepack enable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Dependency vulnerability gate (production deps, high+)
-        run: pnpm audit --prod --audit-level high
-      - run: pnpm build
-      - run: pnpm -r --sort test
-      - run: pnpm -r --sort typecheck
+      - name: Enforce installer/release trust policy
+        run: |
+          set -euo pipefail
+          sh -n scripts/install.sh
+          node scripts/check-install-release-trust.mjs
 
   # The Swift suite covers the FSKit adapter, the installer core, and the
   # macOS 26 cache-coherence enforcement (reserved-namespace refusal, one-shot
@@ -70,6 +56,14 @@ jobs:
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
+      # Both target platforms are built here: the daemon and mount clients carry
+      # per-GOOS files, so a Linux-only build hides darwin breakage until the
+      # macOS release job runs.
+      - name: Build (darwin and linux)
+        run: |
+          set -euo pipefail
+          GOOS=darwin go -C vcs build ./...
+          GOOS=linux go -C vcs build ./...
       - run: go -C vcs vet ./...
       - name: Dependency vulnerability gate (govulncheck)
         run: |
@@ -150,39 +144,3 @@ jobs:
         env:
           PORTABLEFS_COHERENCE: uncached
         run: bash scripts/package-manager-matrix.sh
-
-  postgres-integration:
-    runs-on: ubuntu-24.04
-    services:
-      postgres:
-        # postgres:16 (digest-pinned like the workflow actions; bump via the
-        # tag when refreshing)
-        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: portablefs
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d portablefs"
-          --health-interval 2s
-          --health-timeout 3s
-          --health-retries 20
-    env:
-      VOLUME_DATABASE_URL: postgres://postgres:postgres@localhost:5432/portablefs
-      VOLUME_DATABASE_CONNECT_TIMEOUT_MS: "10000"
-      PORTABLEFS_TEST_POSTGRES: "true"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Enable corepack (pnpm 10 from packageManager)
-        run: corepack enable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Metadata DB Postgres suite (mirrors scripts/verify-postgres.sh)
-        run: pnpm test:postgres

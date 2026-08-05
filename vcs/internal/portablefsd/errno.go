@@ -1,9 +1,6 @@
 package portablefsd
 
-import (
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
-	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
-)
+import "fmt"
 
 const (
 	darwinEPERM  int32 = 1
@@ -11,9 +8,7 @@ const (
 	// darwinEIO is the EIO-class answer for a far end that stopped answering:
 	// the local store is intact, the authority is not applying. It is
 	// deliberately distinct from darwinENOSPC (28), which promises the operation
-	// can never fit locally. writeback.ErrUplinkStalled maps HERE, so an
-	// application under a dead uplink retries or reports an I/O error instead of
-	// deleting files to fix a network problem. See creditErrno in ops.go.
+	// can never fit locally.
 	darwinEIO          int32 = 5
 	darwinEINTR        int32 = 4
 	darwinENXIO        int32 = 6
@@ -57,55 +52,8 @@ const (
 	darwinENOATTR   int32 = 93 // "attribute not found" — the wire's Linux ENODATA
 )
 
-func toDarwinErr(st int32) int32 {
-	if clientcore.LaneChanged(st) {
-		// Not an errno and never an answer to a client: the classified
-		// operation's lane no longer holds and the engine refused to transition
-		// under the frontend's locks. It unwinds at the request dispatcher and
-		// re-classifies with every lock released (see mutationadmit.go).
-		return errnoLaneChanged
-	}
-	switch st {
-	case fsproto.OK:
-		return 0
-	case fsproto.EPERM:
-		return darwinEPERM
-	case fsproto.ENOENT:
-		return darwinENOENT
-	case fsproto.EIO:
-		return darwinEIO
-	case fsproto.EEXIST:
-		return darwinEEXIST
-	case fsproto.ENOTDIR:
-		return darwinENOTDIR
-	case fsproto.EISDIR:
-		return darwinEISDIR
-	case fsproto.EINVAL:
-		return darwinEINVAL
-	case fsproto.ENAMETOOLONG:
-		return darwinENAMETOOLONG
-	case fsproto.EBUSY:
-		return darwinEBUSY
-	case fsproto.EAGAIN:
-		return darwinEAGAIN
-	case fsproto.ESTALE:
-		return darwinESTALE
-	case fsproto.ENOTEMPTY:
-		return darwinENOTEMPTY
-	case fsproto.ENOSPC:
-		return darwinENOSPC
-	case fsproto.ENODATA:
-		return darwinENOATTR
-	case fsproto.E2BIG:
-		return darwinE2BIG
-	case fsproto.ERANGE:
-		return darwinERANGE
-	case fsproto.EOPNOTSUPP:
-		return darwinENOTSUP
-	default:
-		if st == 0 {
-			return 0
-		}
-		return darwinEIO
-	}
+// errMessage renders one operation's refusal for the pfslocal error reply. The
+// frontend surfaces the errno; the text names which operation produced it.
+func errMessage(op string, eno int32) string {
+	return fmt.Sprintf("%s failed: errno %d", op, eno)
 }
