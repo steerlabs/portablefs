@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bufio"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,13 +32,12 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
-	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 const mountTokenEnv = "PORTABLEFS_MOUNT_TOKEN"
 
 type mountOpts struct {
-	common              commonOpts
+	common commonOpts
 	// branch stays a field because the mount records, ownership locks, and
 	// persistence keys are branch-shaped; a v3 mount is branchless, so it is
 	// always empty (the --branch flag itself is retired).
@@ -932,18 +931,6 @@ func terminateUnidentifiedStartedMount(cmd *exec.Cmd, operation *mountOperation,
 	)
 }
 
-func releaseStartupAccessLease(keeper *leaseKeeper, operationID string) error {
-	if keeper == nil {
-		return nil
-	}
-	releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelRelease()
-	if err := keeper.releaseWithOperation(releaseCtx, operationID); err != nil {
-		return fmt.Errorf("release startup access lease: %w", err)
-	}
-	return nil
-}
-
 func detachFUSEWithPreparedIntent(operation *mountOperation, pid int, identity string, detach func() error) error {
 	if operation == nil || detach == nil {
 		return fmt.Errorf("missing FUSE detach transaction")
@@ -1207,61 +1194,6 @@ func (t *sessionTokenSource) get() (string, int64) {
 	return os.Getenv("VCS_AUTH_TOKEN"), 0
 }
 
-// resolveVolumeTeamID looks up the volume's tenant id through the volume API
-// so manager requests can carry it as teamId (journal-native production
-// managers key authorities and leases by the tenant namespace and require
-// it). Split deployments fail closed when the tenant cannot be resolved.
-//
-// Tenancy ownership is deployment-shaped. A UNIFIED control plane (the hosted
-// broker, where the manager and API share an origin) derives tenancy from the
-// credential and rejects a client-asserted teamId, so the client must not send
-// one. A SPLIT self-host deployment (a distinct volume-api and authority-
-// manager) has no server-side tenancy authority on the manager, so the client
-// resolves the volume's tenant and passes it through. The origin comparison is
-// exactly that distinction, not a heuristic.
-func (e *cmdEnv) resolveVolumeTeamID(s settings, volumeID, branch string) (string, error) {
-	unified, err := sameOrigin(s.managerURL, s.apiURL)
-	if err != nil {
-		return "", err
-	}
-	if unified {
-		return "", nil
-	}
-	if s.apiURL == "" || s.apiToken == "" {
-		return "", fmt.Errorf("split manager/API deployment requires an authenticated API endpoint to resolve tenant ownership")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	// Mode-agnostic metadata resolution is strict: an absent tenant identity
-	// is an error and is never converted into an unscoped manager request.
-	teamID, err := e.apiClient(s.apiURL, s.apiToken).resolveVolumeTenant(ctx, volumeID, branch)
-	if err != nil {
-		return "", err
-	}
-	if teamID == "" {
-		return "", fmt.Errorf("split deployment returned no tenant identity for %s@%s", volumeID, branch)
-	}
-	return teamID, nil
-}
-
-// sameOrigin reports whether two endpoint URLs share a scheme+host+port, i.e.
-// one control-plane origin fronts both the API and the manager. An empty
-// manager URL means the manager defaulted to the API origin (unified).
-func sameOrigin(managerURL, apiURL string) (bool, error) {
-	apiOrigin, err := canonicalOrigin(apiURL)
-	if err != nil {
-		return false, fmt.Errorf("invalid API origin: %w", err)
-	}
-	if managerURL == "" {
-		return true, nil
-	}
-	managerOrigin, err := canonicalOrigin(managerURL)
-	if err != nil {
-		return false, fmt.Errorf("invalid manager origin: %w", err)
-	}
-	return managerOrigin == apiOrigin, nil
-}
-
 func canonicalOrigin(raw string) (string, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || !parsed.IsAbs() || parsed.User != nil || parsed.Hostname() == "" {
@@ -1300,11 +1232,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	if o.readyFD > 0 {
 		readyPipe = os.NewFile(uintptr(o.readyFD), "portablefs-ready")
 	}
-	// keeper is always nil on the v3 path: a mount capability is single-use
-	// and never renewed, so there is no lease to keep. The scaffolding stays
-	// because unmount reconciliation of RECORDED v2 mounts still releases
-	// their leases; it goes when the v2 architecture is deleted.
-	var keeper *leaseKeeper
+	// A v3 mount capability is single-use and never renewed, so there is no
+	// access lease to keep, release, or reconcile: the whole lease-keeper
+	// stage went with the manager-backed architecture.
 	leaseCleanupSafe := true
 	leaseCleanupAttempted := false
 	startupCleanupComplete := false
@@ -1324,10 +1254,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	failReady := func(err error) int {
 		if leaseCleanupSafe && !startupCleanupComplete && operation != nil {
 			var releaseErr error
-			if keeper != nil && !leaseCleanupAttempted {
-				leaseCleanupAttempted = true
-				releaseErr = releaseStartupAccessLease(keeper, operation.leaseReleaseOp)
-			} else if operation.managerURL != "" && !leaseCleanupAttempted {
+			if operation.managerURL != "" && !leaseCleanupAttempted {
 				leaseCleanupAttempted = true
 				intent, readErr := readMountIntent(operation.intentPath, operation.mountPath)
 				if readErr != nil {
@@ -1488,24 +1415,24 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	}
 
 	state := mountState{
-		MountPath:                     mountPath,
-		VolumeID:                      volumeID,
-		Branch:                        o.branch,
-		PID:                           os.Getpid(),
-		ProcessStartIdentity:          processIdentity,
-		Strategy:                      strategy,
-		Engine:                        engine,
-		MountInstanceID:               mountInstanceID,
-		MountTargetDevice:             mountTargetIdentity.device,
-		MountTargetInode:              mountTargetIdentity.inode,
-		AuthorityURL:                  authorityURL,
-		StartedAtMs:                   operation.startedAtMs,
-		DataPlaneCAPath:               dataPlaneCAPath,
-		DataPlaneCASHA256:             dataPlaneCASHA256,
-		DataPlaneTransport:            transport.Mode,
-		DataPlaneServerName:           transport.ServerName,
-		MountMechanism: mountMechanism,
-		FUSEHelperPath: fuseHelperPath,
+		MountPath:            mountPath,
+		VolumeID:             volumeID,
+		Branch:               o.branch,
+		PID:                  os.Getpid(),
+		ProcessStartIdentity: processIdentity,
+		Strategy:             strategy,
+		Engine:               engine,
+		MountInstanceID:      mountInstanceID,
+		MountTargetDevice:    mountTargetIdentity.device,
+		MountTargetInode:     mountTargetIdentity.inode,
+		AuthorityURL:         authorityURL,
+		StartedAtMs:          operation.startedAtMs,
+		DataPlaneCAPath:      dataPlaneCAPath,
+		DataPlaneCASHA256:    dataPlaneCASHA256,
+		DataPlaneTransport:   transport.Mode,
+		DataPlaneServerName:  transport.ServerName,
+		MountMechanism:       mountMechanism,
+		FUSEHelperPath:       fuseHelperPath,
 	}
 	removePublishedState := func() error {
 		current, err := readMountState(stateDir, mountPath)
@@ -1525,24 +1452,10 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		return nil
 	}
 	publishCleanedResourcesAndFinalizeLease := func() error {
-		if keeper != nil {
-			lease := keeper.snapshot()
-			operation.accessLease = &lease
-		}
 		// This unconditional checkpoint bridges exact local teardown to
-		// state deletion for both manager-backed and direct --addr mounts.
+		// state deletion.
 		if err := operation.writeIntent("resources-cleaned", 0, ""); err != nil {
 			return fmt.Errorf("publish durable resources-cleaned fact: %w", err)
-		}
-		if keeper == nil {
-			return nil
-		}
-		leaseCleanupAttempted = true
-		if err := releaseStartupAccessLease(keeper, operation.leaseReleaseOp); err != nil {
-			return err
-		}
-		if err := operation.writeIntent("lease-released", 0, ""); err != nil {
-			return fmt.Errorf("publish durable released-lease fact: %w", err)
 		}
 		return nil
 	}
@@ -2133,16 +2046,12 @@ func cmdUmount(e *cmdEnv, args []string) int {
 				// refusal pointed back at --force. Both remaining moves are
 				// stated, in the order they apply.
 				return e.fail("umount", fmt.Errorf(
-					"%s; --force cannot durably park a tail without its exact owner/attach, so state and intent were preserved.\n"+
-						"Inspect what the local store still holds with\n"+
-						"    portablefs recovery list %s\n"+
-						"resolve any terminally conflict/corrupt job with\n"+
-						"    portablefs recovery resolve %s --all-terminal\n"+
-						"and, once nothing owns the path any more, end the bookkeeping with\n"+
+					"%s; --force cannot reconcile a mount without its exact owner/attach, so state and intent were preserved.\n"+
+						"Once nothing owns the path any more, end the bookkeeping with\n"+
 						"    portablefs umount --discard-record %s",
-					detail, mountPath, mountPath, mountPath))
+					detail, mountPath))
 			}
-			return e.fail("umount", fmt.Errorf("%s; nothing was unmounted and state was preserved (retry with `portablefs umount --force %s` only while its exact owner/attach remains available to park any durable recovery tail)", detail, mountPath))
+			return e.fail("umount", fmt.Errorf("%s; nothing was unmounted and state was preserved (retry with `portablefs umount --force %s` only while its exact owner/attach remains available)", detail, mountPath))
 		}
 		if err := publishResourcesCleanedIntent(operation, stateDir, mountPath); err != nil {
 			return e.fail("umount", fmt.Errorf("mount resources are gone but their durable cleanup fact could not be published; state and intent were preserved: %w", err))
@@ -2464,26 +2373,26 @@ func (e *cmdEnv) releaseRecordedAccessLease(o *commonOpts, stateDir string, reco
 	if latest != nil {
 		recorded = latest
 	}
-	if recorded.ManagerURL == "" || recorded.AccessLeaseReleaseOperationID == "" {
-		return fmt.Errorf("recorded access lease %s lacks exact manager/release-operation identity", recorded.AccessLease.AccessLeaseID)
+	if recorded.AccessLease == nil {
+		return nil
 	}
-	settings, err := e.resolveSettings(o)
-	if err != nil {
-		return err
-	}
-	managerURL, managerToken := settings.managerEndpoint()
-	if managerURL != recorded.ManagerURL {
-		return fmt.Errorf("configured manager %q does not match recorded lease manager %q", managerURL, recorded.ManagerURL)
-	}
-	keeper := newLeaseKeeper(
-		e.managerClient(managerURL, managerToken),
-		nil,
-		*recorded.AccessLease,
-		nil,
+	return legacyManagerLeaseRefusal(recorded.MountPath, recorded.AccessLease.AccessLeaseID)
+}
+
+// legacyManagerLeaseRefusal is what a mount RECORD written by the retired
+// manager-lease architecture gets. That lease was minted by the authority
+// manager, which this build no longer speaks to at all — there is no client
+// left that could release it, and pretending to release it would publish a
+// durable "lease-released" fact that never happened. The record is still
+// recognized so the refusal can name the one command that ends it.
+func legacyManagerLeaseRefusal(mountPath, leaseID string) error {
+	return fmt.Errorf(
+		"mount record at %s carries a manager-issued access lease (%s) from the retired v2 architecture, "+
+			"which this build cannot release: the authority manager is no longer part of the product. "+
+			"The kernel mount and its resources are already reconciled; discard the stale record with "+
+			"`portablefs umount --discard-record %s`, then mount again",
+		mountPath, leaseID, mountPath,
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return keeper.releaseWithOperation(ctx, recorded.AccessLeaseReleaseOperationID)
 }
 
 func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) ([]string, error) {
@@ -2851,45 +2760,15 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) ([]string
 
 func (e *cmdEnv) releaseIntentAccessLease(intent *mountIntent) error {
 	if intent == nil || intent.ManagerURL == "" {
+		// A v3 mount records no manager: its capability is single-use and
+		// expires on its own, so there is nothing to finalize.
 		return nil
 	}
-	settings, err := e.resolveSettings(&commonOpts{})
-	if err != nil {
-		return err
+	leaseID := ""
+	if intent.AccessLease != nil {
+		leaseID = intent.AccessLease.AccessLeaseID
 	}
-	managerURL, managerToken := settings.managerEndpoint()
-	if managerURL != intent.ManagerURL {
-		return fmt.Errorf("configured manager %q does not match intent manager %q", managerURL, intent.ManagerURL)
-	}
-	manager := e.managerClient(managerURL, managerToken)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	lease := intent.AccessLease
-	if lease == nil {
-		// Only the crash-before-create-response window needs to replay the
-		// permanent create receipt. Once the response was durably published,
-		// cleanup depends solely on the exact lease/release transaction.
-		session, err := manager.resolveAccessExact(
-			ctx,
-			intent.LeaseCreateOperationID,
-			intent.VolumeID,
-			intent.Branch,
-			intent.LeaseTeamID,
-			intent.LeaseConsumerID,
-		)
-		if err != nil {
-			return fmt.Errorf("replay exact access-lease create receipt: %w", err)
-		}
-		lease = session.Lease
-	}
-	if lease == nil {
-		return fmt.Errorf("replayed access-lease create returned no lease")
-	}
-	keeper := newLeaseKeeper(manager, nil, *lease, nil)
-	if err := keeper.releaseWithOperation(ctx, intent.LeaseReleaseOperationID); err != nil {
-		return fmt.Errorf("release access lease %s: %w", lease.AccessLeaseID, err)
-	}
-	return nil
+	return legacyManagerLeaseRefusal(intent.MountPath, leaseID)
 }
 
 // drainBeforeUnmount runs the REQUIRED normal-unmount drain barrier while
@@ -3042,9 +2921,9 @@ func (e *cmdEnv) forceParkFUSEMount(stateDir string, st *mountState) ([]string, 
 		time.Sleep(100 * time.Millisecond)
 	}
 	if acknowledged {
-		return nil, fmt.Errorf("forced write-back parking was acknowledged but exact kernel detach did not complete within %v", daemonStopTimeout)
+		return nil, fmt.Errorf("forced detach was acknowledged but exact kernel detach did not complete within %v", daemonStopTimeout)
 	}
-	return nil, fmt.Errorf("FUSE owner did not acknowledge durable forced parking within %v", daemonStopTimeout)
+	return nil, fmt.Errorf("FUSE owner did not acknowledge the durable forced detach within %v", daemonStopTimeout)
 }
 
 // forceParkAbandonedFUSEMount is the local-only continuation of a durable
@@ -3061,59 +2940,40 @@ func (e *cmdEnv) forceParkAbandonedFUSEMount(stateDir string, st *mountState) ([
 		return nil, fmt.Errorf("read durable FUSE force request: %w", err)
 	}
 	if intent == nil || (intent.Phase != "force-requested" && intent.Phase != "force-prepared") {
-		return nil, fmt.Errorf("abandoned FUSE store parking requires a durable force-requested intent")
+		return nil, fmt.Errorf("abandoned FUSE force continuation requires a durable force-requested intent")
 	}
 	if err := verifyCleanupIntentMatchesState(intent, st); err != nil {
 		return nil, fmt.Errorf("verify abandoned FUSE force identity: %w", err)
 	}
-	proof, err := writeback.ForceParkAbandonedStore(
-		filepath.Join(stateDir, "writeback", storageDirID(st.VolumeID, st.Branch)),
-		st.VolumeID,
-		st.Branch,
-		st.MountInstanceID,
-		"explicit forced FUSE unmount after exact owner death",
-	)
-	if err != nil {
-		if errors.Is(err, writeback.ErrRecoveryResolutionRequired) {
-			// The FUSE half of the same cycle. See recoverycmd.go: this refusal
-			// named a resolution that had no command, and --discard-record's
-			// refusal pointed straight back here.
-			return nil, fmt.Errorf(
-				"durably park abandoned FUSE store: %w\n"+
-					"this job blocks force-park and every attach until it is resolved. Inspect it with\n"+
-					"    portablefs recovery list %s\n"+
-					"and resolve it with\n"+
-					"    portablefs recovery resolve %s --all-terminal\n"+
-					"which quarantines the job's bytes (nothing is deleted) and reports exactly what was lost",
-				err, st.MountPath, st.MountPath,
-			)
-		}
-		return nil, fmt.Errorf("durably park abandoned FUSE store: %w", err)
-	}
-	jobID := ""
-	if len(proof.JobIDs) != 0 {
-		jobID = proof.JobIDs[len(proof.JobIDs)-1]
-	}
+	// THERE IS NOTHING LOCAL LEFT TO PARK.
+	//
+	// A v3 mount holds no client-side durability debt: write(2) returns only
+	// after the authority has applied the bytes, and fsync waits for the
+	// authoritative server descriptor. So the abandoned-owner continuation of
+	// a forced unmount has no store to quarantine and hands back no recovery
+	// handle — it publishes the same transaction-bound acknowledgement the
+	// live owner would have published, and the exact kernel detach proceeds
+	// from there.
 	updated, err := updateMountState(stateDir, st.MountPath, func(current *mountState) {
 		current.ForceParkAcknowledged = true
-		current.ForceRecoveryJobID = jobID
+		current.ForceRecoveryJobID = ""
 	})
 	if err != nil {
-		return nil, fmt.Errorf("publish abandoned FUSE park acknowledgement: %w", err)
+		return nil, fmt.Errorf("publish abandoned FUSE force acknowledgement: %w", err)
 	}
 	if !updated {
-		return nil, fmt.Errorf("mount state disappeared before abandoned FUSE park acknowledgement")
+		return nil, fmt.Errorf("mount state disappeared before abandoned FUSE force acknowledgement")
 	}
 	latest, err := readMountState(stateDir, st.MountPath)
 	if err != nil || latest == nil {
-		return nil, fmt.Errorf("read abandoned FUSE park acknowledgement: %w", err)
+		return nil, fmt.Errorf("read abandoned FUSE force acknowledgement: %w", err)
 	}
 	if err := verifyCleanupIntentMatchesState(intent, latest); err != nil {
 		return nil, fmt.Errorf("reverify abandoned FUSE force identity: %w", err)
 	}
 	operationIdentity, err := processStartIdentity(os.Getpid())
 	if err != nil {
-		return nil, fmt.Errorf("record abandoned FUSE parking owner: %w", err)
+		return nil, fmt.Errorf("record abandoned FUSE force owner: %w", err)
 	}
 	intent.Phase = "force-prepared"
 	intent.OperationOwnerPID = os.Getpid()
@@ -3123,7 +2983,7 @@ func (e *cmdEnv) forceParkAbandonedFUSEMount(stateDir string, st *mountState) ([
 	if err := writeMountIntentRecord(intentPath, intent); err != nil {
 		return nil, fmt.Errorf("publish abandoned FUSE force-prepared proof: %w", err)
 	}
-	return append([]string(nil), proof.JobIDs...), nil
+	return nil, nil
 }
 
 // parkedRecoveryJobs reads the on-disk recovery registry for this mount's
@@ -3235,10 +3095,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// Health folds pid-liveness and the persisted credential status:
 		// live | stale | credential-expired.
 		Health string `json:"health"`
-		// WriteBack carries the daemon's durability-debt view for fskit
-		// mounts: live un-flushed backlog plus parked WALs awaiting the
-		// background recovery job.
-		WriteBack *cliWriteBackStatus `json:"writeBack,omitempty"`
 		// AttachState is the daemon-reported attach state (degraded carries
 		// the daemon's last error in the printed line).
 		AttachState string `json:"attachState,omitempty"`
@@ -3246,17 +3102,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// printed line already shows it; the JSON view dropped it, so an agent
 		// reading --json could see attachState=degraded with no reason at all.
 		AttachError string `json:"attachError,omitempty"`
-		// AttachCredential names WHICH credential-plane fault a degraded attach
-		// has: "rejected" (the authority answered no -> log in again),
-		// "pending-verification" (the authority never answered at all -> the
-		// handshake is being torn down before the ack, so look at the router),
-		// or "router-refused" (the router answered, and its answer was not
-		// about the credential -> capacity, a lease transition, or an
-		// authority outage behind it; retryable, and re-authenticating changes
-		// none of them). Empty means no credential-plane fault. These are DELIBERATELY not folded
-		// into Health: Health carries the CLI-side lease-keeper verdict from
-		// persisted mount state, which is a different, disjoint path.
-		AttachCredential string `json:"attachCredential,omitempty"`
 		// CleanupRequired marks a durable operation intent with no matching
 		// mount-state record. It is deliberately a first-class inventory row:
 		// crash recovery must never disappear from the CLI or app view.
@@ -3299,10 +3144,8 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			StatusChangedAtMs:  st.StatusChangedAtMs,
 		}
 		if a, ok := daemonView[states[i].AttachRef]; ok {
-			row.WriteBack = a.WriteBack
 			row.AttachState = a.State
 			row.AttachError = a.LastError
-			row.AttachCredential = a.Credential
 		}
 		rows = append(rows, row)
 	}
@@ -3337,7 +3180,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			operationPhase:    row.OperationPhase,
 			statusChangedAtMs: row.StatusChangedAtMs,
 			attachState:       row.AttachState,
-			attachCredential:  row.AttachCredential,
 			attachLastError:   row.AttachError,
 		})
 		extras := ""
@@ -3347,25 +3189,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		if len(row.LocalRoutes) > 0 {
 			extras += "  local-routes:" + strings.Join(row.LocalRoutes, " ") +
 				" @" + revisionPrefix(row.LocalRouteRevision)
-		}
-		if wb := row.WriteBack; wb != nil {
-			parkedRecords := 0
-			for _, p := range wb.ParkedWALs {
-				parkedRecords += p.Records
-			}
-			if parkedRecords > 0 {
-				extras += fmt.Sprintf("  write-back:%d records pending recovery", parkedRecords)
-			} else if wb.PendingRecords > 0 {
-				extras += fmt.Sprintf("  write-back:%d records flushing", wb.PendingRecords)
-			}
-			// The credit controller is pacing writers on purpose; without this
-			// the backlog above is indistinguishable from a stalled flusher.
-			if wb.paced() {
-				extras += fmt.Sprintf("  data-lane:%d writer(s) paced, credit %d/%d B", wb.CreditWaiters, wb.CreditDebt, wb.CreditSetpoint)
-				if wb.DataLaneFull {
-					extras += ", at ceiling"
-				}
-			}
 		}
 		fmt.Fprintf(e.stdout, "%s  %s  %s  pid %d%s  %s\n", row.MountPath, volumeBranchLabel(row.VolumeID, row.Branch), row.Strategy, row.PID, extras, status)
 	}
@@ -3383,7 +3206,6 @@ type mountStatusInput struct {
 	operationPhase    string
 	statusChangedAtMs int64
 	attachState       string
-	attachCredential  string
 	// attachLastError is the daemon's own sentence for this degradation. A
 	// router refusal has three different conditions behind it with three
 	// different remedies, and a fixed status word cannot name which — so for
@@ -3411,45 +3233,22 @@ func mountStatusWord(row mountStatusInput) string {
 	case "cleanup-required":
 		return "cleanup-required (incomplete " + row.operationPhase + " operation; run `portablefs umount " + row.mountPath + "`)"
 	case mountStatusCredentialExpired:
-		// The CLI-side lease keeper's own persisted verdict. It stays exactly
-		// as it was: a control-plane renewal refusal is a different, disjoint
-		// path from anything the data-plane handshake observes.
+		// A persisted verdict from a mount whose credential ended. A v3 mount
+		// capability is single-use and never renewed, so remounting is the
+		// whole remedy.
 		since := ""
 		if row.statusChangedAtMs != 0 {
 			since = " since " + formatMs(row.statusChangedAtMs)
 		}
-		// The persisted verdict does not record WHICH typed answer ended the
-		// lease (see leaseEndMessage), and four of the five are ended LEASES
-		// rather than revoked credentials — so the word leads with the action
-		// that works for all five and qualifies the one that does not.
 		return "credential-expired" + since +
-			" (this mount's access lease ended and cannot be renewed; remount to " +
-			"re-establish it — run `portablefs login` first only if the saved " +
-			"account credential is also rejected; see the mount log for which)"
+			" (this mount's credential ended and cannot be renewed; mount again " +
+			"with a fresh volume mount capability)"
 	}
 	if row.attachState != "degraded" {
 		return "live"
 	}
-	switch row.attachCredential {
-	case attachCredentialPendingVerification:
-		return "degraded (credential pending-verification; the authority has " +
-			"neither accepted nor refused it — check the data-plane " +
-			"router/authority, not your login)"
-	case attachCredentialRejected:
-		return "degraded (credential rejected; run `portablefs login` and remount)"
-	case attachCredentialRouterRefused:
-		// The router refused for a reason that is NOT the credential, and the
-		// three reasons have three different remedies (wait out a full lease,
-		// remount through a lease transition, wait out an authority outage).
-		// A word that named one of them would be wrong for the other two, and
-		// the word this used to render — "credential rejected; run `portablefs
-		// login`" — was wrong for all three.
-		if row.attachLastError != "" {
-			return "degraded (data-plane tunnel refused, retrying: " +
-				row.attachLastError + ")"
-		}
-		return "degraded (data-plane tunnel refused, retrying; this is NOT a " +
-			"credential failure and `portablefs login` will not change it)"
+	if row.attachLastError != "" {
+		return "degraded (" + row.attachLastError + ")"
 	}
 	return "degraded"
 }
@@ -3478,4 +3277,20 @@ func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[str
 		out[a.AttachRef] = a
 	}
 	return out, nil
+}
+
+// volumeNamePattern mirrors the authority-side volume id constraints;
+// validating client-side turns a refused attach into an immediate, specific
+// error.
+var volumeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,220}$`)
+
+func validVolumeName(name string) bool { return volumeNamePattern.MatchString(name) }
+
+// formatMs renders a unix-millisecond instant for the human-readable mount
+// reports; the zero instant prints as "-".
+func formatMs(ms int64) string {
+	if ms == 0 {
+		return "-"
+	}
+	return time.UnixMilli(ms).Local().Format(time.RFC3339)
 }

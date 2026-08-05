@@ -29,7 +29,7 @@ import (
 //  2. The recorded mount owner process is gone (or was never identified).
 //  3. The incomplete operation's owner process is gone — the killed umount.
 //  4. portablefsd's DURABLE attach inventory does not name the path, so no
-//     unshipped write-back tail is being orphaned.
+//     daemon-side attach is being orphaned.
 //  5. A live portablefsd, if one is reachable, owns no attach at the path.
 //
 // Any one of those surviving is a refusal that names the exact command which
@@ -82,17 +82,13 @@ func (e *cmdEnv) discardMountRecord(
 		if filepath.Clean(entry.MountPath) != mountPath {
 			continue
 		}
-		// THE OTHER END OF THE CYCLE. This blocker sends the operator to
-		// `umount --force`, which is exactly what sent them here when a
-		// terminally conflict/corrupt recovery job refused the force. Naming
-		// only --force made the two refusals point at each other with no exit;
-		// naming the resolution too is what turns the cycle into a path.
+		// A durable attach is a claim on the path that only the exact unmount
+		// may retire. --discard-record removes bookkeeping; it must never
+		// orphan a daemon-side attach that still names this mount.
 		blockers = append(blockers, fmt.Errorf(
-			"portablefsd still holds a durable attach %s for %s, which may own an unshipped write-back tail; "+
-				"run `portablefs umount --force %s` to park it as a recovery job first "+
-				"(if that force refuses with a terminally conflict or corrupt recovery job, "+
-				"clear it with `portablefs recovery resolve %s --all-terminal`, then force again)",
-			entry.AttachRef, mountPath, mountPath, mountPath,
+			"portablefsd still holds a durable attach %s for %s; "+
+				"retire it with `portablefs umount --force %s` first",
+			entry.AttachRef, mountPath, mountPath,
 		))
 	}
 

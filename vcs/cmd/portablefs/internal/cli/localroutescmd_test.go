@@ -1,15 +1,12 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
-	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
@@ -432,104 +429,6 @@ func TestPruneLocalFailsClosedBeforeDeletingUnknownFSKitBacking(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("failed-closed prune changed %s: %v", p, err)
 		}
-	}
-}
-
-// declaringVolume is a VolumeReader stub carrying (or not carrying) a route
-// declaration, for the revision and --local-dir refusal rules.
-type declaringVolume struct{ declaration *string }
-
-func (d *declaringVolume) Lookup(_ context.Context, p string) (fsproto.Attr, clientcore.Status) {
-	if p == localdirs.VolumeConfigPath && d.declaration != nil {
-		return fsproto.Attr{Kind: "file", Size: int64(len(*d.declaration))}, fsproto.OK
-	}
-	return fsproto.Attr{}, fsproto.ENOENT
-}
-
-func (d *declaringVolume) Read(_ context.Context, p string, _ *clientcore.NodeState, _ int64, _ int) ([]byte, clientcore.Status) {
-	if p == localdirs.VolumeConfigPath && d.declaration != nil {
-		return []byte(*d.declaration), fsproto.OK
-	}
-	return nil, fsproto.ENOENT
-}
-
-func (d *declaringVolume) Readdir(_ context.Context, _ string) ([]clientcore.DirEntry, clientcore.Status) {
-	return nil, fsproto.ENOENT
-}
-
-// TestReportedRevisionIsTheDeclarationAlone pins the contract the authority
-// enforces: the revision a mount answers for is exactly the hash of the
-// volume's declaration, so every machine mounting one volume reports one
-// value. Per-machine route additions are the topology skew that check exists
-// to refuse, so they are rejected outright on a volume that declares routes,
-// and on a volume that declares none they leave the revision untouched.
-func TestReportedRevisionIsTheDeclarationAlone(t *testing.T) {
-	ctx := context.Background()
-	text := "# machine-local\nnode_modules/\n"
-	declared, err := localroutes.Parse([]byte(text))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Declaring volume, no flags: routes and revision both come from it.
-	routes, err := resolveRoutes(ctx, &declaringVolume{declaration: &text}, localDirsMountConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if routes.revision != declared.RevisionHex() || routes.perMachine || !routes.declared {
-		t.Fatalf("declared routing = %+v", routes)
-	}
-	if strings.Join(routes.rules.Patterns(), " ") != "**/node_modules/" {
-		t.Fatalf("declared patterns = %v", routes.rules.Patterns())
-	}
-
-	// Declaring volume plus --local-dir: refused, with a message that says
-	// where to put the rule instead.
-	_, err = resolveRoutes(ctx, &declaringVolume{declaration: &text}, localDirsMountConfig{dirs: []string{"target"}})
-	if err == nil {
-		t.Fatal("--local-dir on a declaring volume must be refused")
-	}
-	for _, want := range []string{localdirs.VolumeConfigPath, "shared", "--local-dir"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q must mention %q", err, want)
-		}
-	}
-
-	// A declaration holding only comments still means the volume owns
-	// routing, so the flag is refused there too.
-	commented := "# routes are managed centrally\n"
-	if _, err := resolveRoutes(ctx, &declaringVolume{declaration: &commented}, localDirsMountConfig{dirs: []string{"target"}}); err == nil {
-		t.Fatal("--local-dir must be refused whenever a declaration exists")
-	}
-
-	// Volume with NO declaration: the legacy per-machine path stays open, and
-	// the revision reported is still the declaration's — the empty one — so
-	// the rule "revision == hash(declaration)" holds without exception.
-	routes, err = resolveRoutes(ctx, &declaringVolume{}, localDirsMountConfig{dirs: []string{"node_modules"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !routes.perMachine || routes.declared {
-		t.Fatalf("undeclared routing = %+v", routes)
-	}
-	if routes.revision != emptyRoutesRevision() {
-		t.Fatalf("revision = %q, want the empty-declaration revision", routes.revision)
-	}
-	if strings.Join(routes.rules.Patterns(), " ") != "/node_modules/" {
-		t.Fatalf("per-machine patterns = %v", routes.rules.Patterns())
-	}
-	// A mount state recording that pair validates; claiming the flag rules'
-	// own hash as the revision does not.
-	st := validFuseMountState(t, t.TempDir())
-	st.LocalRoutes = routes.rules.Patterns()
-	st.LocalRouteRevision = routes.revision
-	st.LocalRoutesPerMachine = true
-	if err := validatePersistedLocalRoutes(&st); err != nil {
-		t.Fatalf("per-machine record rejected: %v", err)
-	}
-	st.LocalRouteRevision = routes.rules.RevisionHex()
-	if err := validatePersistedLocalRoutes(&st); err == nil {
-		t.Fatal("per-machine routes must not claim a revision of their own")
 	}
 }
 

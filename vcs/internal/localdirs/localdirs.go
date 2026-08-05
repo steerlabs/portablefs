@@ -1,7 +1,6 @@
 package localdirs
 
 import (
-	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -17,9 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/confinedfs"
-	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
@@ -153,55 +150,6 @@ func ParseVolumeConfig(data []byte) (dirs []string, badLines []string) {
 	}
 	return dirs, badLines
 }
-
-// ReadVolumeConfig reads the volume's VolumeConfigPath declaration through
-// the normal client read path. Absence is fine; other failures warn through
-// logf and degrade to flag-only config rather than failing the mount.
-func ReadVolumeConfig(ctx context.Context, vol *clientcore.Volume, logf func(string, ...any)) []string {
-	const maxConfigBytes = 1 << 16
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
-	a, st := vol.Lookup(ctx, VolumeConfigPath)
-	if st == fsproto.ENOENT {
-		return nil
-	}
-	if st != fsproto.OK {
-		logf("read %s: status %d; continuing without volume-declared local dirs", VolumeConfigPath, st)
-		return nil
-	}
-	n := clientcore.NewNodeState(a.Ino, a.Ino != 0)
-	data, st := vol.Read(ctx, VolumeConfigPath, n, 0, maxConfigBytes)
-	if st != fsproto.OK {
-		logf("read %s: status %d; continuing without volume-declared local dirs", VolumeConfigPath, st)
-		return nil
-	}
-	dirs, badLines := ParseVolumeConfig(data)
-	for _, line := range badLines {
-		logf("%s: ignoring invalid line %q", VolumeConfigPath, line)
-	}
-	return dirs
-}
-
-// ---- backing identity ----
-//
-// Machine-local backing is keyed by (volume, route root path) and by nothing
-// else. The volume half is this StorageID; the route-root half is structural,
-// because inside the volume's backing tree a route root's backing sits at
-// exactly its volume-relative path. That identity is the whole point of the
-// feature:
-//
-//   - node_modules survives unmount and remount of the same volume, and
-//     survives remounting it at a DIFFERENT path — the dependency tree is a
-//     property of the workspace, not of where it happens to be attached;
-//   - mounting a different volume at the same path can never inherit it;
-//   - nothing is random per mount, so nothing is orphaned by a clean restart.
-//
-// The consequence to know about: two simultaneous mounts of the same volume
-// (two paths, or two branches) share one machine-local backing tree, exactly
-// as two bind mounts of one directory would. Branch is deliberately NOT part
-// of the key — a machine-local dependency tree is not branch state, and
-// keying it per branch would rebuild node_modules on every branch switch.
 
 // StorageID keys one VOLUME's machine-local backing under the state dir,
 // keeping portablefsd's 32-hex storage-id convention.

@@ -1,7 +1,8 @@
 // Package cli implements the portablefs command-line interface. It is
 // cmd-local: the reusable mount/protocol machinery lives in the shared
-// internal packages (clientcore, fsproto, portablefsd, secure); this package only
-// adds config, HTTP control-plane clients, and command wiring.
+// internal packages (fusev3, mountv3, authorityrpc, portablefsd); this package
+// only adds this machine's mount records, transport selection, and command
+// wiring.
 package cli
 
 import (
@@ -23,9 +24,7 @@ type cmdEnv struct {
 	stdinIsTTY func() bool // nil = real character-device check on os.Stdin
 	getenv     func(string) string
 	version    string
-	configPath string              // empty = default (~/.config/portablefs/config.json)
 	sleepFn    func(time.Duration) // nil = time.Sleep (tests poll instantly)
-	openURLFn  func(string) error  // nil = platform browser open (tests record instead)
 	// Test-only override. Production lifecycle locking deliberately ignores
 	// XDG_STATE_HOME so environment variants cannot split the lock inode.
 	lifecycleStateDir string
@@ -80,56 +79,13 @@ func (e *cmdEnv) stdinIsTerminal() bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
-func (e *cmdEnv) resolveConfigPath() (string, error) {
-	if e.configPath != "" {
-		return e.configPath, nil
-	}
-	return defaultConfigPath()
-}
-
-func (e *cmdEnv) loadConfig() (*Config, string, error) {
-	path, err := e.resolveConfigPath()
-	if err != nil {
-		return nil, "", err
-	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return nil, "", err
-	}
-	return cfg, path, nil
-}
-
-// commonOpts are the flags every command accepts: connection overrides
-// (flags > env > config file), profile selection, and machine-readable output.
+// commonOpts are the flags every command accepts.
 type commonOpts struct {
-	apiURL       string
-	apiToken     string
-	managerURL   string
-	managerToken string
-	profile      string
-	jsonOut      bool
+	jsonOut bool
 }
 
 func addCommonFlags(fs *flag.FlagSet, o *commonOpts) {
-	fs.StringVar(&o.apiURL, "api-url", "", "volume API base URL (overrides env/config)")
-	fs.StringVar(&o.apiToken, "api-token", "", "volume API bearer token (overrides env/config)")
-	fs.StringVar(&o.managerURL, "manager-url", "", "authority manager base URL (overrides env/config)")
-	fs.StringVar(&o.managerToken, "manager-token", "", "authority manager bearer token (overrides env/config)")
-	fs.StringVar(&o.profile, "profile", "", "config profile to use (default: currentProfile)")
 	fs.BoolVar(&o.jsonOut, "json", false, "print machine-readable JSON")
-}
-
-func (e *cmdEnv) resolveSettings(o *commonOpts) (settings, error) {
-	cfg, _, err := e.loadConfig()
-	if err != nil {
-		return settings{}, err
-	}
-	return resolveSettings(cfg, o.profile, e.getenv, settings{
-		apiURL:       o.apiURL,
-		apiToken:     o.apiToken,
-		managerURL:   o.managerURL,
-		managerToken: o.managerToken,
-	}), nil
 }
 
 func (e *cmdEnv) printJSON(v any) int {
@@ -161,25 +117,9 @@ type command struct {
 
 func commands() []command {
 	return []command{
-		{"login", "authenticate to a PortableFS server and save credentials", cmdLogin},
-		{"logout", "remove saved credentials for a profile", cmdLogout},
-		{"create", "create a volume (with branch main)", cmdCreate},
-		{"adopt", "import an existing local directory into a new volume", cmdAdopt},
-		{"activate", "resume an interrupted adopt (adopt runs this automatically)", cmdActivate},
-		{"ls", "list volumes", cmdLs},
-		{"rm", "retire (delete) a volume; live mounts detach as their leases expire", cmdRm},
-		{"status", "show a branch head summary and activity counts", cmdStatus},
-		{"history", "show recent commits on a branch", cmdHistory},
-		{"snapshot", "create a named snapshot of a branch head", cmdSnapshot},
-		{"snapshots", "list snapshots", cmdSnapshots},
-		{"branch", "create a branch within a volume", cmdBranch},
-		{"branches", "list branches of a volume", cmdBranches},
-		{"fork", "fork a volume into a new volume (give every agent its own fork)", cmdFork},
-		{"grep", "search a branch's file bytes server-side", cmdGrep},
 		{"mount", "mount a live volume on this machine", cmdMount},
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
-		{"recovery", "list and resolve a mount's write-back recovery jobs", cmdRecovery},
 		{"route", "explain whether a path is served machine-locally or by the volume", cmdRoute},
 		{"prune-local", "reclaim machine-local backing that no route can reach", cmdPruneLocal},
 		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},

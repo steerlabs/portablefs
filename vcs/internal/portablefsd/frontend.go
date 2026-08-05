@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -170,7 +169,7 @@ type frontendOperationEntry struct {
 // repairLatePublication. That obligation holds for an expiry at 60s, at 200s,
 // or at any other number, which is the property a deadline could never have.
 func frontendRequestDeadline() time.Duration {
-	return frontendRequestDeadlineFactor * clientcore.OperationAdmissionBudget()
+	return frontendRequestDeadlineFactor * operationAdmissionBudgetValue()
 }
 
 // frontendRequestDeadlineFactor is how far the advertised bound sits above the
@@ -256,7 +255,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				c.errorReply(env.RequestID, darwinENOENT, "unknown attach_ref")
 				continue
 			}
-			rep, eno := a.rootReply(connCtx)
+			rep, eno := a.v3RootReply()
 			if eno != 0 {
 				c.errorReply(env.RequestID, eno, errMessage("resolve", eno))
 				continue
@@ -431,7 +430,6 @@ func (c *frontendConn) close() {
 			// function is on the connection's close and is about to join every
 			// handler. Its own failure verdict is terminal for the attach, which
 			// is where a failed coherence repair belongs.
-			go op.attach.dischargeFrontendPublicationFence(op)
 		}
 		// A handler may still be completing a local syscall or mutation after
 		// cancellation. Joining it here keeps connection teardown ordered
@@ -452,12 +450,6 @@ func (c *frontendConn) close() {
 				}
 				entry.op.attach.finishFrontendOperation(entry.op)
 			}
-		}
-		// The repair runs off the teardown path: it reaches the kernel through
-		// the mount, it retries until it converges, and this function is on the
-		// connection's close.
-		if a := c.currentAttach(); a != nil && len(unacknowledged) > 0 {
-			go a.repairDisconnectedPublications(unacknowledged)
 		}
 		if a := c.currentAttach(); a != nil {
 			a.removeConn(c.conn)
@@ -799,16 +791,6 @@ func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
 	c.publicationMu.Unlock()
 	if finish {
 		entry.op.attach.finishFrontendOperation(entry.op)
-		// The acknowledgement is the ONE moment at which the daemon knows the
-		// frontend has installed or discarded this operation's published state.
-		// If a delegation handoff was permitted to cross that state, this is
-		// therefore the earliest instant at which the repair can be issued —
-		// and issuing it any later would leave the stale install unchallenged
-		// for exactly as long as the delay.
-		entry.op.attach.dischargeFrontendPublicationFence(entry.op)
-		// An operation with no live request cannot expose a late reply, so this
-		// is only ever the retirement of a debt some earlier exposure recorded.
-		entry.op.attach.repairLatePublication(entry)
 	}
 	return true
 }
@@ -828,41 +810,7 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 	c.publicationMu.Unlock()
 	if finish {
 		entry.op.attach.finishFrontendOperation(entry.op)
-		// The other retirement order: the acknowledgement arrived while a
-		// request of the same callback was still running, so the operation is
-		// only now retired. The crossing debt is discharged from whichever of
-		// the two paths actually retires the operation, never from both.
-		entry.op.attach.dischargeFrontendPublicationFence(entry.op)
-		// THIS is the retirement order the timed-out publishing mutation takes:
-		// the acknowledgement arrived first (the callback gave up on the reply),
-		// the handler then committed and exposed its reply into an operation
-		// with a spent acknowledgement, and it is only now — with no request of
-		// the operation still running, and the frame already on the wire — that
-		// the debt that exposure recorded can be repaired.
-		entry.op.attach.repairLatePublication(entry)
 	}
-}
-
-// repairLatePublication discharges the debt a publishing reply left when it was
-// exposed after its operation had already been acknowledged.
-//
-// It is the same repair the disconnect path performs, for the same reason and
-// through the same machinery: the affected scopes are invalidated and exactly
-// refreshed through the mount, with retry, because the FSKit mount outlives any
-// one callback and any one connection and is therefore still reachable. It is
-// never a terminal verdict — the daemon's own answers were never in doubt, only
-// the kernel's cache was, and that is precisely what is being rewritten.
-//
-// It runs off the caller's goroutine for the same reason
-// dischargeFrontendPublicationFence does: the repair reaches the kernel through
-// the mount, retries until it converges, and its caller is on a request's
-// retirement path.
-func (a *attach) repairLatePublication(entry *frontendOperationEntry) {
-	if a == nil || entry == nil || entry.op == nil || !entry.lateExposure {
-		return
-	}
-	op := entry.op
-	go a.repairDisconnectedPublications([]*frontendOperation{op})
 }
 
 // reserveLogicalOperation runs only on the connection's serial frame-reader
@@ -1090,261 +1038,7 @@ func (c *frontendConn) handleAttached(
 	// handler: it keeps the logical-operation/PublicationAck ledger this
 	// connection owns but never enters the clientcore admission, mirror, or
 	// delegation machinery below (see v3attach.go).
-	if a.isV3() {
-		c.handleV3Attached(ctx, a, requestID, operationID, initializeOperation, body)
-		return
-	}
-
-	if operationID != 0 {
-		defer c.finishLogicalRequest(operationID)
-	}
-
-	// PHASE 0.
-	ctx, cancelOperation := clientcore.WithOperationDeadline(ctx)
-	defer cancelOperation()
-
-	// RESERVE. Holds nothing, waits for nothing except this logical
-	// operation's own reservation by its initializing request.
-	gateCtx, participant, participates, publishes, err := c.beginLogicalOperation(
-		ctx, a, operationID, initializeOperation, body,
-	)
-	if err != nil {
-		_ = c.conn.Close()
-		return
-	}
-	if participates {
-		defer a.finishFrontendParticipant(participant)
-	}
-
-	// PHASE 1, first pass. Holds nothing at all, and carries the reserved
-	// publication identity: the lane, the transition token and the deadline are
-	// phase 1's, the publication identity is the reservation's, and phase 3
-	// needs both.
-	opCtx, settleMutation, admitEno, classified := a.admitRequest(gateCtx, body, false)
-	settleOnce := func() {
-		if settleMutation != nil {
-			settleMutation()
-			settleMutation = nil
-		}
-	}
-	defer settleOnce()
-
-	// PHASE 2.
-	var unlockRequest func()
-	defer func() {
-		if unlockRequest != nil {
-			unlockRequest()
-		}
-	}()
-	unlockRequest, err = a.enterFrontendMirrors(gateCtx, body, participant)
-	if err != nil {
-		_ = c.conn.Close()
-		return
-	}
-	if err := a.frontendAdmissionError(); err != nil {
-		if publishes {
-			c.replyWithPublication(
-				requestID,
-				operationID,
-				&pfslocal.ErrorReply{
-					Errno: darwinEIO, Message: err.Error(),
-				},
-				true,
-			)
-		} else {
-			c.errorReplyForOperation(requestID, operationID, darwinEIO, err.Error())
-		}
-		return
-	}
-	started := time.Now()
-	var (
-		reply any
-		eno   int32
-	)
-	// PHASE 3, and the unwind it owns.
-	//
-	// Under the locks the transition state is only CHECKED; a check that fails
-	// unwinds with every frontend lock released and this request suspended out of
-	// the publication set, and the next pass resolves the authority lane
-	// unconditionally — not a claim about a grant, so a recall has nothing left
-	// to invalidate.
-	for {
-		if admitEno != 0 {
-			settleOnce()
-			reply, eno = nil, admitEno
-			break
-		}
-		if participant != nil && a.publicationRetracted(participant.op) {
-			// A HANDOFF CROSSED THIS OPERATION WHILE ITS ADMISSION RAN, SO THIS
-			// REQUEST MUST NOT EXECUTE.
-			//
-			// The crossing retracts everything the operation published, and the
-			// frontend answers by failing the whole framework callback. If this
-			// request had already run, that failure would be a lie about a
-			// mutation that really happened: the shape that reaches a crossing is
-			// a callback whose LAST request is the one that needed the delegation
-			// released, so `rm` would remove the file, be reported as interrupted,
-			// and answer ENOENT on the retry the interruption asks for.
-			//
-			// Refusing here is what makes the retraction safe for mutations, and
-			// it is reachable only because the release has ALREADY COMPLETED by
-			// the time it is checked. That is the whole difference from refusing
-			// the mutation up front: a refusal taken before the release leaves the
-			// delegation in place, so the retry runs the identical callback,
-			// exposes the identical sibling publication, and is refused again
-			// forever. Taken here, the delegation is gone, the retry has nothing
-			// left to release, and it reaches this point at most once.
-			//
-			// EINTR is the honest answer — nothing was attempted and nothing was
-			// published — and it is the errno the frontend was going to surface
-			// for the retraction anyway.
-			settleOnce()
-			reply, eno = nil, darwinEINTR
-			break
-		}
-		var replied bool
-		reply, eno, replied = a.dispatchRequest(opCtx, c, requestID, body)
-		settleOnce()
-		if replied {
-			return
-		}
-		if eno != errnoLaneChanged || !classified {
-			break
-		}
-		// UNWIND. Drop the mirrors and leave the publication set BEFORE
-		// re-admitting: the second pass's claim and delegation release are as
-		// unbounded as the first pass's and must be paid in the same place.
-		// Re-entry is the same reserve/mirrors/attempt-activation sequence the
-		// first pass used, so the second pass's gate wait is paid holding
-		// nothing too.
-		unlockRequest()
-		unlockRequest = nil
-		a.suspendFrontendParticipant(participant)
-		opCtx, settleMutation, admitEno, classified = a.admitRequest(gateCtx, body, true)
-		unlockRequest, err = a.enterFrontendMirrors(gateCtx, body, participant)
-		if err != nil {
-			settleOnce()
-			_ = c.conn.Close()
-			return
-		}
-	}
-	if eno == errnoLaneChanged {
-		// The sentinel escaped. It cannot: only a CLASSIFIED operation carries a
-		// resolved lane, and only a resolved lane lets the engine answer
-		// ErrLaneChanged — so an unclassified handler has no way to produce it.
-		// Reaching here means that invariant broke, and the one thing that must
-		// not happen is replying -1 to the kernel. Answer definitely instead.
-		eno = darwinEIO
-	}
-	if pfsdTrace {
-		log.Printf("pfsd-trace %s eno=%d duration=%s", traceOp(a, body), eno, time.Since(started))
-	}
-	if eno != 0 {
-		if publishes {
-			c.replyWithPublication(
-				requestID,
-				operationID,
-				&pfslocal.ErrorReply{
-					Errno:   eno,
-					Message: errMessage(fmt.Sprintf("%T", body), eno),
-				},
-				true,
-			)
-		} else {
-			c.errorReplyForOperation(
-				requestID, operationID, eno, errMessage(fmt.Sprintf("%T", body), eno),
-			)
-		}
-		return
-	}
-	a.synthesizeFrontendMutation(body, c.origin)
-	if c.replyWithPublication(requestID, operationID, reply, publishes) {
-		// THE ONE POINT AT WHICH A SIZE MUTATION HAS TOLD THE KERNEL ANYTHING.
-		//
-		// The handler marked its token when it committed and installed its
-		// post-op size into the registry; the registry agreeing with the engine
-		// is a fact about this daemon, not about the kernel. The frame that just
-		// went out is what carries that size back through the framework, so this
-		// is where the item's convergence generation advances — and it advances
-		// for no other publisher, for no reply that carried an errno (those
-		// return above), and for no retracted reply (the frontend discards a
-		// retracted operation wholesale). See repairwitness.go.
-		a.noteSizeMutationDelivered(opCtx)
-	}
-}
-
-// dispatchRequest runs one request's handler under the operation context the
-// pre-lock classifier produced. replied reports that the handler already
-// answered the connection itself, and the caller must return without replying
-// again.
-func (a *attach) dispatchRequest(
-	ctx context.Context,
-	c *frontendConn,
-	requestID uint64,
-	body any,
-) (reply any, eno int32, replied bool) {
-	switch req := body.(type) {
-	case *pfslocal.LookupRequest:
-		reply, eno = a.lookup(ctx, req)
-	case *pfslocal.EnumerateRequest:
-		reply, eno = a.enumerate(ctx, req)
-	case *pfslocal.GetAttrRequest:
-		reply, eno = a.getattr(ctx, req)
-	case *pfslocal.SetAttrRequest:
-		reply, eno = a.setattr(ctx, req)
-	case *pfslocal.OpenRequest:
-		reply, eno = a.open(ctx, req)
-	case *pfslocal.CloseRequest:
-		reply, eno = a.close(req)
-	case *pfslocal.ReadRequest:
-		reply, eno = a.read(ctx, req)
-	case *pfslocal.WriteRequest:
-		reply, eno = a.write(ctx, req)
-	case *pfslocal.CreateRequest:
-		reply, eno = a.create(ctx, req)
-	case *pfslocal.MkdirRequest:
-		reply, eno = a.mkdir(ctx, req)
-	case *pfslocal.RemoveRequest:
-		eno = a.remove(ctx, req)
-		reply = &pfslocal.RemoveReply{}
-	case *pfslocal.RenameRequest:
-		eno = a.rename(ctx, req)
-		reply = &pfslocal.RenameReply{}
-	case *pfslocal.SymlinkRequest:
-		reply, eno = a.symlink(ctx, req)
-	case *pfslocal.ReadlinkRequest:
-		reply, eno = a.readlink(ctx, req)
-	case *pfslocal.HardLinkRequest:
-		reply, eno = a.hardLink(ctx, req)
-	case *pfslocal.XattrGetRequest:
-		reply, eno = a.xattrGet(ctx, req)
-	case *pfslocal.XattrSetRequest:
-		reply, eno = a.xattrSet(ctx, req)
-	case *pfslocal.XattrListRequest:
-		reply, eno = a.xattrList(ctx, req)
-	case *pfslocal.XattrRemoveRequest:
-		reply, eno = a.xattrRemove(ctx, req)
-	case *pfslocal.StatfsRequest:
-		reply, eno = a.statfs()
-	case *pfslocal.SyncVolumeRequest:
-		reply, eno = a.syncVolume(ctx)
-	case *pfslocal.FsyncRequest:
-		eno = a.fsync(ctx, req)
-		reply = &pfslocal.FsyncReply{}
-	case *pfslocal.ReclaimRequest:
-		eno = a.reclaim(req)
-		reply = &pfslocal.ReclaimReply{}
-	case *pfslocal.SubscribeEventsRequest:
-		if err := c.subscribeEvents(a); err != nil {
-			c.errorReply(requestID, darwinEIO, err.Error())
-			return nil, 0, true
-		}
-		reply = &pfslocal.SubscribeEventsReply{}
-	default:
-		c.errorReply(requestID, darwinEINVAL, fmt.Sprintf("unsupported request %T", body))
-		return nil, 0, true
-	}
-	return reply, eno, false
+	c.handleV3Attached(ctx, a, requestID, operationID, initializeOperation, body)
 }
 
 func (c *frontendConn) handleVisibilityAck(ctx context.Context, requestID uint64, request *pfslocal.VisibilityAckRequest) {
@@ -1369,75 +1063,23 @@ func (c *frontendConn) handleVisibilityAck(ctx context.Context, requestID uint64
 	c.reply(requestID, &pfslocal.VisibilityAckReply{})
 }
 
-// pfsdTrace (PFSD_TRACE=1) logs every frontend op with its resolved paths and
-// errno — the pfslocal boundary is otherwise invisible, and kernel-side
-// caching bugs can only be diagnosed by seeing exactly what the extension
-// asked and what the daemon answered.
-var pfsdTrace = os.Getenv("PFSD_TRACE") == "1"
-
-func traceOp(a *attach, body any) string {
-	itemPath := func(item pfslocal.Item) string {
-		a.mu.RLock()
-		defer a.mu.RUnlock()
-		if rec := a.items[item.ItemID]; rec != nil {
-			return rec.path
-		}
-		return fmt.Sprintf("item#%d?", item.ItemID)
-	}
-	switch req := body.(type) {
-	case *pfslocal.LookupRequest:
-		return fmt.Sprintf("lookup dir=%q name=%q", itemPath(req.Dir), req.Name)
-	case *pfslocal.EnumerateRequest:
-		return fmt.Sprintf("enumerate dir=%q", itemPath(req.Dir))
-	case *pfslocal.GetAttrRequest:
-		return fmt.Sprintf("getattr %q", itemPath(req.Item))
-	case *pfslocal.OpenRequest:
-		return fmt.Sprintf("open %q", itemPath(req.Item))
-	case *pfslocal.CreateRequest:
-		return fmt.Sprintf("create dir=%q name=%q", itemPath(req.Dir), req.Name)
-	case *pfslocal.RemoveRequest:
-		return fmt.Sprintf("remove dir=%q name=%q", itemPath(req.Dir), req.Name)
-	case *pfslocal.RenameRequest:
-		return fmt.Sprintf("rename %q/%q -> %q/%q", itemPath(req.FromDir), req.FromName, itemPath(req.ToDir), req.ToName)
-	default:
-		return fmt.Sprintf("%T", body)
-	}
-}
-
 func (c *frontendConn) subscribeEvents(a *attach) error {
 	c.eventsMu.Lock()
 	defer c.eventsMu.Unlock()
-	if c.events != nil || c.v3Events {
+	if c.v3Events {
 		return nil
 	}
-	if bridge := a.v3CoherenceBridge(); bridge != nil {
-		c.v3Events = true
-		go func() {
-			err := bridge.run(c.connCtx, func(event *pfslocal.Event) error {
-				return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
-			})
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				log.Printf("portablefsd: attach %s v3 visibility stream failed: %v", a.ref, err)
-			}
-			_ = c.conn.Close()
-		}()
-		return nil
+	bridge := a.v3CoherenceBridge()
+	if bridge == nil {
+		return fmt.Errorf("attach has no visibility stream")
 	}
-	if !a.isCredentialPending() {
-		readyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if !a.waitEventsReady(readyCtx) {
-			return fmt.Errorf("authority event stream is not ready")
-		}
-	}
-	sub := a.subscribe(c.origin)
-	c.events = sub
+	c.v3Events = true
 	go func() {
-		for ev := range sub.ch {
-			if err := c.write(&pfslocal.Envelope{RequestID: 0, Body: &pfslocal.Event{Kind: ev.Kind}}); err != nil {
-				_ = c.conn.Close()
-				return
-			}
+		err := bridge.run(c.connCtx, func(event *pfslocal.Event) error {
+			return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
+		})
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+			log.Printf("portablefsd: attach %s v3 visibility stream failed: %v", a.ref, err)
 		}
 		_ = c.conn.Close()
 	}()

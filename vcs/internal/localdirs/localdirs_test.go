@@ -4,14 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
-	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
@@ -227,18 +224,10 @@ func TestFloatingRuleInstantiatesRootsAtAnyDepth(t *testing.T) {
 	if eno != 0 || strings.Join(roots, ",") != deep {
 		t.Fatalf("active roots = %v errno=%d", roots, eno)
 	}
-	// The parent listing merges it in without any configured list of roots.
-	merged, eno := g.MergeParentListing("services/api/handlers", []clientcore.DirEntry{
-		{Name: "node_modules", Attr: fsproto.Attr{Kind: "directory"}, Ino: 7},
-		{Name: "main.go", Attr: fsproto.Attr{Kind: "file"}, Ino: 8},
-	})
-	if eno != 0 || names(merged) != "main.go,node_modules" {
-		t.Fatalf("merged=%v errno=%d", merged, eno)
-	}
-	for _, e := range merged {
-		if e.Name == "node_modules" && e.Ino&localInoMarker == 0 {
-			t.Fatal("the instantiated root must be served locally, not by the volume entry")
-		}
+	// The instantiated root is served locally, so its inode carries the local
+	// marker the frontend routes on.
+	if st, eno := g.Lstat(deep); eno != 0 || LocalIno(st.Ino)&localInoMarker == 0 {
+		t.Fatalf("instantiated root ino %x lacks the local marker bit (errno=%d)", st.Ino, eno)
 	}
 }
 
@@ -463,58 +452,6 @@ func TestHardLinksStayInsideOneGraft(t *testing.T) {
 	}
 }
 
-// TestMergeParentListing pins the parent-of-root readdir rule: exactly once,
-// shadowing any same-named volume entry, and only when the local root exists.
-func TestMergeParentListing(t *testing.T) {
-	g := newGrafts(t, "node_modules")
-	volume := []clientcore.DirEntry{
-		{Name: "node_modules", Attr: fsproto.Attr{Kind: "directory"}, Ino: 41}, // linux-native install on the volume
-		{Name: "package.json", Attr: fsproto.Attr{Kind: "file"}, Ino: 42},
-	}
-
-	// Backing absent: the shadowed volume subtree is hidden AND the root is
-	// not synthesized — the name must not appear at all.
-	merged, eno := g.MergeParentListing("", volume)
-	if eno != 0 {
-		t.Fatalf("merge errno=%d", eno)
-	}
-	if names(merged) != "package.json" {
-		t.Fatalf("pre-mkdir merge=%v", merged)
-	}
-
-	// Backing present: exactly one entry, served locally.
-	if eno := g.Mkdir("node_modules", 0o755); eno != 0 {
-		t.Fatal(eno)
-	}
-	merged, eno = g.MergeParentListing("", volume)
-	if eno != 0 {
-		t.Fatalf("merge errno=%d", eno)
-	}
-	if names(merged) != "node_modules,package.json" {
-		t.Fatalf("post-mkdir merge=%v", merged)
-	}
-	for _, e := range merged {
-		if e.Name != "node_modules" {
-			continue
-		}
-		if e.Attr.Kind != "directory" {
-			t.Fatalf("graft root kind=%q", e.Attr.Kind)
-		}
-		if e.Ino&localInoMarker == 0 {
-			t.Fatalf("graft root ino %x lacks the local marker bit", e.Ino)
-		}
-		if e.Ino == 41 {
-			t.Fatal("graft root must not reuse the shadowed volume ino")
-		}
-	}
-
-	// Directories with no graft roots pass through untouched.
-	passthrough, eno := g.MergeParentListing("src", volume)
-	if eno != 0 || len(passthrough) != len(volume) {
-		t.Fatalf("passthrough=%v errno=%d", passthrough, eno)
-	}
-}
-
 // TestWholesaleRebuild pins the npm-ci pattern: rm -rf of the graft root
 // (children first, then the root) and recreation from scratch.
 func TestWholesaleRebuild(t *testing.T) {
@@ -548,9 +485,8 @@ func TestWholesaleRebuild(t *testing.T) {
 	if _, eno := g.Lstat("node_modules"); eno != syscall.ENOENT {
 		t.Fatalf("post-removal lstat errno=%d want ENOENT", eno)
 	}
-	merged, _ := g.MergeParentListing("", nil)
-	if len(merged) != 0 {
-		t.Fatalf("post-removal merge=%v want empty", merged)
+	if roots, eno := g.ActiveRootsUnder(""); eno != 0 || len(roots) != 0 {
+		t.Fatalf("post-removal active roots=%v errno=%d want empty", roots, eno)
 	}
 
 	// Recreate from scratch: fresh, empty directory.
@@ -710,7 +646,7 @@ func TestConcurrencySanity(t *testing.T) {
 				}
 				_ = g.Owner("node_modules/some/dep")
 				_ = g.Owner("src/main.go")
-				_, _ = g.MergeParentListing("", nil)
+				_, _ = g.ActiveRootsUnder("")
 				p := fmt.Sprintf("node_modules/w%d-%d", w, i%8)
 				if fd, eno := g.Create(p, uint32(os.O_RDWR), 0o644); eno == 0 {
 					_ = syscall.Close(fd)
@@ -837,13 +773,4 @@ func TestGraftOperationsCannotEscapeBackingCapability(t *testing.T) {
 	if err != nil || string(buf[:n]) != "ok" {
 		t.Fatalf("safe symlink read=%q, %v", buf[:n], err)
 	}
-}
-
-func names(ents []clientcore.DirEntry) string {
-	out := make([]string, 0, len(ents))
-	for _, e := range ents {
-		out = append(out, e.Name)
-	}
-	sort.Strings(out)
-	return strings.Join(out, ",")
 }

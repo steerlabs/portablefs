@@ -1,12 +1,8 @@
 package portablefsd
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -165,60 +161,6 @@ func TestFailFrozenPreparedAttachDoesNotDeadlockShutdown(t *testing.T) {
 	}
 }
 
-func TestForcedFSKitDetachWithoutParkProofRefuses(t *testing.T) {
-	stateDir := privateTestDir(t)
-	writeFSKitDetachFixture(t, stateDir, false, false)
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	found, jobID, err := r.unmountFSKitWith(testFSKitAttachRef, true, fskitKernelOps{
-		present: func(string, string) (bool, error) {
-			t.Fatal("force authorization without park proof reached kernel classification")
-			return false, nil
-		},
-		unmountExact: func(string, string, bool) error {
-			t.Fatal("force authorization without park proof reached exact detach")
-			return nil
-		},
-	})
-	if err == nil || !found || jobID != "" {
-		t.Fatalf("unmount=(%v,%q,%v), want preserved proof refusal", found, jobID, err)
-	}
-	entries, loadErr := loadPersistedAttaches(stateDir)
-	if loadErr != nil || len(entries) != 1 || !entries[0].DetachForce || entries[0].DetachPrepared {
-		t.Fatalf("force authorization evidence=%+v err=%v", entries, loadErr)
-	}
-}
-
-func TestForcedFSKitPreparedProofPermitsExactRecovery(t *testing.T) {
-	stateDir := privateTestDir(t)
-	writeFSKitDetachFixture(t, stateDir, true, true)
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	detaches := 0
-	forced := false
-	found, jobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-		present: func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(_, _ string, force bool) error {
-			detaches++
-			forced = force
-			return nil
-		},
-	})
-	if err != nil || !found || jobID != "" || detaches != 1 {
-		t.Fatalf("unmount=(%v,%q,%v) detaches=%d", found, jobID, err, detaches)
-	}
-	// A FORCE-AUTHORIZED reconciliation reaches the kernel AS a force.
-	//
-	// Every unmount used to call unmount(2) with flags 0, so a single open
-	// reference anywhere in the mount answered EBUSY to the escape hatch as
-	// well as to the clean path — and the reference observed live was the
-	// product's own mount supervisor holding a directory fd on the mount root.
-	// `umount --force` could not detach the mount it exists to abandon.
-	if !forced {
-		t.Fatal("force-authorized detach did not ask the kernel to force")
-	}
-}
-
 // A CLEAN unmount never forces. A mount that would need MNT_FORCE is not
 // cleanly unmountable, and saying so is the only way a leaked reference is ever
 // found rather than papered over.
@@ -242,126 +184,5 @@ func TestNormalFSKitDetachNeverForcesTheKernel(t *testing.T) {
 	}
 	if forced {
 		t.Fatal("clean unmount asked the kernel to force a busy mount")
-	}
-}
-
-func TestForcedFSKitJobWithoutExactStoreProofIsPreserved(t *testing.T) {
-	stateDir := privateTestDir(t)
-	const jobID = "jobaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{{
-		Ref:                testFSKitAttachRef,
-		VolumeID:           "vol-fskit-unmount",
-		Branch:             "main",
-		MountPath:          "/Volumes/PortableFSUnmountTest",
-		AuthorityURL:       "127.0.0.1:1",
-		DataPlaneTransport: "plaintext",
-		IdentityEpoch:      1,
-		DetachForce:        true,
-		DetachJobID:        jobID,
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	found, gotJobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-		present:      func(string, string) (bool, error) { return false, nil },
-		unmountExact: func(string, string, bool) error { t.Fatal("absent mount was detached"); return nil },
-	})
-	if err == nil || !found || gotJobID != jobID {
-		t.Fatalf("unmount=(%v,%q,%v), want exact-store proof refusal", found, gotJobID, err)
-	}
-	if r.get(testFSKitAttachRef) == nil {
-		t.Fatal("unproven forced attach was removed")
-	}
-}
-
-func TestRevivedForcedFSKitPublishesOfflineZeroTailProofBeforeDetach(t *testing.T) {
-	stateDir := privateTestDir(t)
-	req := ensureAttachRequest{
-		AttachRef:           testFSKitAttachRef,
-		VolumeID:            "vol-fskit-unmount",
-		Branch:              "main",
-		MountPath:           "/Volumes/PortableFSUnmountTest",
-		AuthorityURL:        serveAuthority(t),
-		DataPlaneTransport:  "plaintext",
-		DataPlaneServerName: "",
-	}
-	a := newAttach(testFSKitAttachRef, attachKey(req.VolumeID, req.Branch, req.MountPath), req, stateDir)
-	if err := a.activate(context.Background(), "", 0); err != nil {
-		t.Fatal(err)
-	}
-	a.mu.RLock()
-	vol := a.vol
-	a.mu.RUnlock()
-	if vol == nil || vol.Writeback() == nil {
-		t.Fatal("active attach did not open its write-back store")
-	}
-	// Model daemon death: descriptors and the store lock disappear without a
-	// close frame. The restarted registry has only durable attach metadata.
-	vol.Writeback().Abandon()
-	if err := vol.Close(); err != nil {
-		t.Fatal(err)
-	}
-	a.mu.Lock()
-	a.vol = nil
-	a.detachForce = true
-	a.credentialPending = true
-	a.mu.Unlock()
-	entry := a.persistedEntry()
-	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{entry}); err != nil {
-		t.Fatal(err)
-	}
-
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	detaches := 0
-	found, jobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-		present: func(path, ref string) (bool, error) { return true, nil },
-		unmountExact: func(path, ref string, _ bool) error {
-			detaches++
-			return nil
-		},
-	})
-	if err != nil || !found || jobID != "" || detaches != 1 {
-		t.Fatalf("unmount=(%v,%q,%v) detaches=%d", found, jobID, err, detaches)
-	}
-	if r.get(testFSKitAttachRef) != nil {
-		t.Fatal("offline-proven forced attach remained registered")
-	}
-}
-
-func TestControlLocalWriteWaitsForDetachGateAndHonorsQuarantine(t *testing.T) {
-	a := newAttach(testFSKitAttachRef, "key", ensureAttachRequest{
-		VolumeID: "vol-local", Branch: "main", MountPath: "/Volumes/Local",
-		AuthorityURL: "127.0.0.1:1", DataPlaneTransport: "plaintext",
-		Options: AttachOptions{LocalDirs: []string{"cache"}},
-	}, privateTestDir(t))
-	body := []byte(`{"path":"cache/file.txt","dataBase64":"` +
-		base64.StdEncoding.EncodeToString([]byte("must-not-land")) + `"}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/attaches/"+testFSKitAttachRef+"/fs/write", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	a.nsMu.Lock()
-	done := make(chan struct{})
-	go func() {
-		(&Server{}).controlFSWrite(rec, req, a)
-		close(done)
-	}()
-	select {
-	case <-done:
-		t.Fatal("local graft control write bypassed the detach namespace gate")
-	case <-time.After(100 * time.Millisecond):
-	}
-	a.mu.Lock()
-	a.detachPrepared = true
-	a.mu.Unlock()
-	a.nsMu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("control write did not resume after detach gate released")
-	}
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
 	}
 }

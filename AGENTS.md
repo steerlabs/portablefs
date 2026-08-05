@@ -6,45 +6,40 @@ agent that *uses* PortableFS workspaces, read
 
 ## Build And Test
 
-```bash
-pnpm install              # frozen lockfile; do not update pnpm-lock.yaml casually
-pnpm build                # all TypeScript workspaces
-pnpm test                 # TS suites + go -C vcs test ./...
-pnpm typecheck            # tsc --noEmit + go -C vcs vet ./...
-```
-
-Go-only iteration is faster when you are inside `vcs/`:
+There is no build system above the two languages and nothing to install:
 
 ```bash
+go -C vcs build ./...      # Go data plane (add GOOS=darwin / GOOS=linux to cross-check)
 go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
+
+swift test --package-path swift/PortableFSKit --parallel --num-workers 1
 ```
 
-Postgres integration suite (needs Docker): `pnpm verify:postgres`.
+`--num-workers 1` on the Swift suite is required, not a tuning choice: several
+tests bind fixed per-process resources and deadlock under multiple workers.
 
 ## Before You Finish
 
-Run `pnpm verify` and make it pass. It is the local merge gate: frozen install,
-full TS + Go suites, vet, the race suite, the manifest-index benchmark, and a stale
-legacy reference scan. Do not report a change as complete with a failing or skipped
-`pnpm verify`.
+Run `bash scripts/verify-local.sh` and make it pass. It is the local merge gate:
+darwin + linux builds and vet, the Go suite, the Go race suite, the Swift suite,
+the release-trust policy checks, and a stale-architecture scan. Do not report a
+change as complete with a failing or skipped `verify-local.sh`.
 
 ## Frozen Surfaces
 
 Read [COMPATIBILITY.md](./COMPATIBILITY.md) before changing: environment variable
-names (`VCS_*`, `VOLUME_*`, `PORTABLEFS_*`), `/v1` HTTP routes, the `fsproto` and
-`pfslocal` wire protocols, persisted formats (WAL, migrations, manifests, tree hash,
-digests), or the pinned repo layout (`vcs/cmd/*` binaries, `swift/PortableFSKit`,
-root Dockerfiles). Those are frozen: evolve additively (new route, new env var, new
-protocol version), never rename or repurpose. Postgres migrations are append-only —
-never edit a released file under `packages/metadata-db/migrations`.
+names (`VCS_*`, `VOLUME_*`, `PORTABLEFS_*`), `/v1` HTTP routes, the `pfslocal`
+wire protocol, persisted formats (WAL, manifests, tree hash, digests), or the
+pinned repo layout (`vcs/cmd/*` binaries, `swift/PortableFSKit`). Those are
+frozen: evolve additively (new route, new env var, new protocol version), never
+rename or repurpose.
 
 ## Code Style
 
 - Go: `gofmt`-clean; table-driven tests; wrap errors with context.
-- TypeScript: two-space indentation; `zod` validation at API boundaries; no `any`
-  casts; prefer clear names over comments.
+- Swift: follow the existing package's conventions; no force-unwraps on I/O paths.
 - Comments explain intent, invariants, and trade-offs — not what the code does.
 - No emojis in code, docs, or commit messages.
 - Match the register of [docs/architecture.md](./docs/architecture.md) when writing
@@ -55,7 +50,9 @@ never edit a released file under `packages/metadata-db/migrations`.
 - `vcs/`: Go data plane (authority server, Linux FUSE mount client, the macOS
   `portablefsd` daemon behind the FSKit extension, NFS compat, WAL,
   replication, checkpoints). Internals live under `vcs/internal/`.
-- `apps/volume-api`, `apps/authority-manager`: TypeScript control plane.
-- `packages/*`: shared TS libraries (protocol schemas, core tree/chunk/hash logic,
-  metadata DB, blob stores, testkit).
+- `swift/PortableFSKit`: the macOS FSKit extension, the app, and the installer core.
+- `pfslocal/`, `proto/`: the wire protocol sources shared by the Go daemon and the
+  Swift frontend, plus their golden frames.
+- `scripts/`: the local gate, the privileged Linux batteries, release packaging,
+  and the release-trust policy checkers.
 - `docs/`: contracts and guides; `docs/architecture.md` is the root contract.

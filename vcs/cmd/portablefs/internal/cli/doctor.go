@@ -2,11 +2,9 @@ package cli
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"os/exec"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -62,14 +60,6 @@ type doctorRun struct {
 	daemonAttaches func(controlSock string) ([]cliAttachStatus, error)
 	hostCheck      func(mounthost.Transport) mounthost.Facts
 	verifiedMount  func(mounthost.Transport) (string, bool, error)
-
-	// resolved once before the checks run
-	settings    settings
-	settingsErr error
-
-	// captured by the server/token probes for the version check
-	serverReached bool
-	minCLIVersion string
 }
 
 func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
@@ -112,9 +102,9 @@ func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
 	}
 }
 
-// doctorChecks is the check table, in order. Order is load-bearing: the
-// server and token probes capture the min-CLI-version header the version
-// check evaluates.
+// doctorChecks is the check table, in order. Every check is local: the CLI
+// speaks to this machine's mount records, its mount transport, and its
+// portablefsd, and to nothing over the network.
 func doctorChecks() []struct {
 	name string
 	run  func(*doctorRun) doctorResult
@@ -123,14 +113,10 @@ func doctorChecks() []struct {
 		name string
 		run  func(*doctorRun) doctorResult
 	}{
-		{"config", (*doctorRun).checkConfig},
-		{"server", (*doctorRun).checkServer},
-		{"token", (*doctorRun).checkToken},
-		{"version", (*doctorRun).checkVersion},
 		{"mount transport", (*doctorRun).checkMountTransport},
 		{"fskit inventory", (*doctorRun).checkFskitExtension},
 		{"portablefsd", (*doctorRun).checkDaemon},
-		{"write-back", (*doctorRun).checkWriteBack},
+		{"attaches", (*doctorRun).checkAttaches},
 		{"mounts", (*doctorRun).checkMounts},
 	}
 }
@@ -150,7 +136,6 @@ func cmdDoctor(e *cmdEnv, args []string) int {
 }
 
 func (r *doctorRun) execute() int {
-	r.settings, r.settingsErr = r.e.resolveSettings(&r.opts)
 	checks := doctorChecks()
 	results := make([]doctorResult, 0, len(checks))
 	failed := 0
@@ -197,125 +182,6 @@ func (r *doctorRun) execute() int {
 
 // checkConfig verifies the config file parses and lists every profile with
 // its server, flagging the one this run resolves against.
-func (r *doctorRun) checkConfig() doctorResult {
-	path, err := r.e.resolveConfigPath()
-	if err != nil {
-		return doctorFail(err.Error(), "ensure the current OS account has a real, uid-owned home directory")
-	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return doctorFail(err.Error(), "fix or remove the file, then run `portablefs login` to recreate it")
-	}
-	if len(cfg.Profiles) == 0 {
-		return doctorPass(fmt.Sprintf("%s parses (no profiles saved yet)", path))
-	}
-	active := r.opts.profile
-	if active == "" {
-		active = cfg.CurrentProfile
-	}
-	names := make([]string, 0, len(cfg.Profiles))
-	for name := range cfg.Profiles {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	res := doctorPass(fmt.Sprintf("%s parses (%d profile(s))", path, len(cfg.Profiles)))
-	for _, name := range names {
-		line := fmt.Sprintf("%s -> %s", name, cfg.Profiles[name].APIUrl)
-		if name == active {
-			line += "  (active)"
-		}
-		res.Lines = append(res.Lines, line)
-	}
-	return res
-}
-
-// probe issues one read-only GET against the API and reports the status plus
-// the min-CLI-version header. Any HTTP response counts as the server
-// answering — an unauthenticated 401/404 still proves it is there.
-func (r *doctorRun) probe(token string) (int, error) {
-	req, err := http.NewRequest("GET", r.settings.apiURL+"/v1/volumes", nil)
-	if err != nil {
-		return 0, err
-	}
-	if token != "" {
-		req.Header.Set("authorization", "Bearer "+token)
-	}
-	resp, err := r.httpDo(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if v := strings.TrimSpace(resp.Header.Get(minCLIVersionHeader)); v != "" {
-		r.minCLIVersion = v
-	}
-	return resp.StatusCode, nil
-}
-
-func (r *doctorRun) checkServer() doctorResult {
-	if r.settingsErr != nil {
-		return doctorSkip("connection settings unresolved (see config)")
-	}
-	if r.settings.apiURL == "" {
-		return doctorFail("no server configured", "run `portablefs login` (or set PORTABLEFS_API_URL)")
-	}
-	status, err := r.probe("")
-	if err != nil {
-		return doctorFail(fmt.Sprintf("%s is not reachable: %v", r.settings.apiURL, err),
-			"check the URL in the config file and your network; self-hosted stacks: confirm the server is running")
-	}
-	r.serverReached = true
-	return doctorPass(fmt.Sprintf("%s answered (HTTP %d)", r.settings.apiURL, status))
-}
-
-func (r *doctorRun) checkToken() doctorResult {
-	if r.settingsErr != nil || r.settings.apiURL == "" {
-		return doctorSkip("no server to verify a token against")
-	}
-	if r.settings.apiToken == "" {
-		return doctorSkip("no saved token for this profile; run `portablefs login` to mint one")
-	}
-	status, err := r.probe(r.settings.apiToken)
-	if err != nil {
-		return doctorFail(fmt.Sprintf("could not verify the token: %v", err),
-			"check the URL in the config file and your network; self-hosted stacks: confirm the server is running")
-	}
-	r.serverReached = true
-	// Mirrors verifyCredential: the server authenticates before routing, so
-	// any response other than 401/403 proves the token was accepted.
-	if status == 401 || status == 403 {
-		return doctorFail(fmt.Sprintf("the server rejected the saved token (HTTP %d)", status), "run `portablefs login`")
-	}
-	return doctorPass(fmt.Sprintf("saved token accepted (HTTP %d)", status))
-}
-
-func (r *doctorRun) checkVersion() doctorResult {
-	if !r.serverReached {
-		return doctorSkip("server unreachable; cannot read its minimum CLI version")
-	}
-	if r.minCLIVersion == "" {
-		return doctorSkip("server does not advertise a minimum CLI version")
-	}
-	minRequired, ok := parseSemver(r.minCLIVersion)
-	if !ok {
-		return doctorFail(
-			fmt.Sprintf("server sent invalid minimum CLI version %q", r.minCLIVersion),
-			"fix the server's "+minCLIVersionHeader+" response header before using this client")
-	}
-	cli, ok := parseSemver(r.e.version)
-	if !ok {
-		return doctorFail(
-			fmt.Sprintf("%q is not a stamped release version, so compatibility with server minimum %s cannot be verified", r.e.version, r.minCLIVersion),
-			"install a stamped release with: "+upgradeCommand())
-	}
-	if cli.less(minRequired) {
-		return doctorFail(
-			fmt.Sprintf("this CLI is %s but the server requires at least %s", r.e.version, r.minCLIVersion),
-			"upgrade with: "+upgradeCommand())
-	}
-	return doctorPass(fmt.Sprintf("CLI %s meets the server minimum %s", r.e.version, r.minCLIVersion))
-}
-
 func (r *doctorRun) checkMountTransport() doctorResult {
 	facts, err := observeMountHost(r.goos, "auto", r.hostCheck, r.verifiedMount)
 	if err != nil {
@@ -415,13 +281,12 @@ func (r *doctorRun) checkDaemon() doctorResult {
 	return doctorPass("not running (it starts on demand at mount time)")
 }
 
-// checkWriteBack surfaces the daemon's durability debt: degraded attaches and
-// parked write-back WALs the background recovery job is still retrying. This
-// is the operator-visible face of "no acknowledged write is ever silently
-// abandoned".
-func (r *doctorRun) checkWriteBack() doctorResult {
+// checkAttaches surfaces the daemon's live attaches and the reason behind any
+// degraded one. A v3 attach holds no client-side durability debt, so the only
+// thing to report is the attach's own state and the verdict that produced it.
+func (r *doctorRun) checkAttaches() doctorResult {
 	if r.goos != "darwin" {
-		return doctorSkip("write-back recovery status is read from portablefsd (macOS-only)")
+		return doctorSkip("attach status is read from portablefsd (macOS-only)")
 	}
 	cfg, err := fskitConfigFromEnv(r.e.getenv)
 	if err != nil {
@@ -447,49 +312,18 @@ func (r *doctorRun) checkWriteBack() doctorResult {
 		if a.State == "degraded" {
 			problems++
 		}
-		if wb := a.WriteBack; wb != nil {
-			for _, p := range wb.ParkedWALs {
-				problems++
-				detail := fmt.Sprintf("parked WAL: %d record(s), %s old", p.Records, (time.Duration(p.AgeMs) * time.Millisecond).Round(time.Second))
-				if p.Root != "" {
-					detail += ", subtree " + p.Root
-				}
-				if p.LastError != "" {
-					detail += ", last error: " + p.LastError
-				}
-				line += "\n        " + detail
-			}
-			if wb.PendingRecords > 0 && len(wb.ParkedWALs) == 0 {
-				line += fmt.Sprintf("  (%d record(s) flushing)", wb.PendingRecords)
-			}
-			// Data-lane pacing is the credit controller working, not a fault:
-			// it is reported so a backlog held back on purpose is never read
-			// as a hung flusher, and it does not count as a problem.
-			if wb.paced() {
-				detail := fmt.Sprintf("data-lane pacing (not a failure): %d writer(s) waiting on credit, debt %d of setpoint %d bytes (ceiling %d), authority applying %.0f B/s",
-					wb.CreditWaiters, wb.CreditDebt, wb.CreditSetpoint, wb.CreditCeiling, wb.AppliedRateBps)
-				if wb.DataLaneFull {
-					detail += "; bulk-data lane at its hard cap, metadata reserve still held"
-				}
-				if wb.LastProgressMs > 0 {
-					detail += fmt.Sprintf("; last drain progress %s ago", (time.Duration(wb.LastProgressMs) * time.Millisecond).Round(time.Second))
-				}
-				line += "\n        " + detail
-			}
-		}
 		lines = append(lines, line)
 	}
 	if problems > 0 {
 		res := doctorFail(
-			fmt.Sprintf("%d attach(es) with degraded state or parked write-back records", problems),
-			"the daemon retries recovery automatically; if it persists, read each attach's "+
-				"lastError — it names the exact condition and the action that changes it "+
-				"(a data-plane tunnel refusal, an unproven credential and a rejected one "+
-				"call for three different responses)")
+			fmt.Sprintf("%d degraded attach(es)", problems),
+			"read each attach's lastError — it names the exact condition and the "+
+				"action that changes it; a terminal authority session is resolved "+
+				"only by `portablefs umount` and mounting again")
 		res.Lines = lines
 		return res
 	}
-	res := doctorPass(fmt.Sprintf("%d attach(es), no parked write-back records", len(attaches)))
+	res := doctorPass(fmt.Sprintf("%d attach(es), none degraded", len(attaches)))
 	res.Lines = lines
 	return res
 }
@@ -530,9 +364,8 @@ func (r *doctorRun) checkMounts() doctorResult {
 	}
 	if len(expired) > 0 {
 		problems = append(problems, fmt.Sprintf("%d credential-expired", len(expired)))
-		remedies = append(remedies, "remount credential-expired paths to mint a fresh access lease "+
-			"(run `portablefs login` first only if the saved account credential is "+
-			"also rejected — the mount log names which)")
+		remedies = append(remedies, "mount credential-expired paths again with a fresh "+
+			"volume mount capability (a v3 capability is single-use and is never renewed)")
 	}
 	res := doctorFail(
 		fmt.Sprintf("%d mount(s): %s", len(states), strings.Join(problems, ", ")),
