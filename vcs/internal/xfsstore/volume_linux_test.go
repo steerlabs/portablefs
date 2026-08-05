@@ -537,32 +537,34 @@ func mustOpenDir(t *testing.T, v *Volume, item Capability) Capability {
 	return handle
 }
 
-// A name that disappears between resolution and export-handle derivation is
-// the ordinary two-mount race: a peer unlinks or renames the name while this
-// authority is still deriving its incarnation identity. NameToHandleAt
-// returns the zero FileHandle on every error, so the error must be inspected
-// before the handle is touched — the regression this guards against was a nil
-// dereference that took the whole authority process down. Both identity modes
-// must report ordinary staleness instead.
-func TestStableIdentityAtMissingNameIsStaleNotPanic(t *testing.T) {
+// A name that disappears while this authority still holds the object open is
+// the ordinary two-mount race: a peer unlinks or renames the name during a
+// create or lookup. The identity's subject is the open descriptor, not the
+// pathname, so derivation must keep working after the name is gone. Two
+// regressions hide here: an earlier revision re-resolved the pathname and
+// reported a healthy held-open object as stale, and the revision before that
+// touched NameToHandleAt's zero FileHandle before its error and took the
+// whole authority process down.
+func TestStableIdentityFDSurvivesConcurrentUnlink(t *testing.T) {
 	dir := t.TempDir()
-	dirfd, err := unix.Open(dir, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(dirfd)
 	path := filepath.Join(dir, "victim")
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
+	before, err := stableIdentityFD(int(f.Fd()), false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	for _, production := range []bool{false, true} {
-		if _, err := stableIdentityAt(dirfd, "victim", int(f.Fd()), production); !errors.Is(err, ErrStaleObject) {
-			t.Fatalf("production=%v: stableIdentityAt on unlinked name = %v, want ErrStaleObject", production, err)
-		}
+	after, err := stableIdentityFD(int(f.Fd()), false)
+	if err != nil {
+		t.Fatalf("identity of a held-open object with no name = %v; an open descriptor is the identity's subject", err)
+	}
+	if before != after {
+		t.Fatalf("identity changed across an unlink of the name: %x != %x", before, after)
 	}
 }
