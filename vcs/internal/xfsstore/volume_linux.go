@@ -225,7 +225,7 @@ func (v *Volume) openChild(parent Capability, name string) (int, [16]byte, error
 	if err != nil {
 		return -1, [16]byte{}, err
 	}
-	identity, err := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+	identity, err := stableIdentityFD(fd, v.productionIdentity)
 	if err != nil {
 		_ = unix.Close(fd)
 		return -1, [16]byte{}, err
@@ -316,7 +316,7 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		opens:              make(map[Capability]*openFile),
 		productionIdentity: requireXFS,
 	}
-	rootIdentity, err := stableIdentityAt(unix.AT_FDCWD, rootPath, fd, requireXFS)
+	rootIdentity, err := stableIdentityFD(fd, requireXFS)
 	if err != nil {
 		_ = unix.Flock(fd, unix.LOCK_UN)
 		return fail(fmt.Errorf("derive stable root identity: %w", err))
@@ -563,23 +563,23 @@ func fallbackIdentityFromAttr(attr Attr) [16]byte {
 	return identity
 }
 
-// stableIdentityAt copies the exact 12-byte XFS export handle plus its 4-byte
-// type. Linux export handles are designed for file-server identity and include
-// XFS i_generation. Holding fd prevents inode reuse while the pathname handle
-// is derived; the trailing stat comparison proves the path still names fd.
-func stableIdentityAt(dirfd int, path string, fd int, production bool) ([16]byte, error) {
+// stableIdentityFD copies the exact 12-byte XFS export handle plus its 4-byte
+// type, derived from the open descriptor itself (AT_EMPTY_PATH). Linux export
+// handles are designed for file-server identity and include XFS i_generation.
+//
+// The descriptor is the identity's subject, so no pathname is re-resolved: an
+// earlier revision derived the handle by walking dirfd/name again and proved
+// the pair still matched with a double stat, which turned an ordinary race —
+// a peer unlinking the name between open and derivation — into a stale-object
+// error for a healthy, held-open object. A local open(O_CREAT) never fails
+// that way, and neither does this.
+func stableIdentityFD(fd int, production bool) ([16]byte, error) {
 	var identity [16]byte
-	handle, _, err := unix.NameToHandleAt(dirfd, path, 0)
+	handle, _, err := unix.NameToHandleAt(fd, "", unix.AT_EMPTY_PATH)
 	if err != nil {
 		// The error must be inspected before the handle: on every error path
 		// NameToHandleAt returns the zero FileHandle, whose accessors
-		// dereference a nil pointer. ENOENT/ESTALE here is an ordinary race —
-		// another mount unlinked or renamed the name between resolution and
-		// handle derivation — so it is stale-object staleness, not an
-		// invariant break and never a reason to take the process down.
-		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
-			return identity, ErrStaleObject
-		}
+		// dereference a nil pointer.
 		if production {
 			return identity, fmt.Errorf("xfsstore: XFS export handle cannot provide incarnation identity: %w", err)
 		}
@@ -590,20 +590,10 @@ func stableIdentityAt(dirfd int, path string, fd int, production bool) ([16]byte
 		return fallbackIdentityFromAttr(attr), nil
 	}
 	packed, exact := exactXFSHandleIdentity(handle.Type(), handle.Bytes())
-	if exact || !production && len(handle.Bytes()) == 12 {
-		var held, named unix.Stat_t
-		if err := unix.Fstat(fd, &held); err != nil {
-			return identity, err
-		}
-		if err := unix.Fstatat(dirfd, path, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return identity, err
-		}
-		if held.Dev != named.Dev || held.Ino != named.Ino {
-			return identity, ErrStaleObject
-		}
-		if exact {
-			return packed, nil
-		}
+	if exact {
+		return packed, nil
+	}
+	if !production && len(handle.Bytes()) == 12 {
 		binary.BigEndian.PutUint32(identity[:4], uint32(handle.Type()))
 		copy(identity[4:], handle.Bytes())
 		return identity, nil

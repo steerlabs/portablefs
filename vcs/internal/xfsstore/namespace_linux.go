@@ -67,7 +67,7 @@ func (v *Volume) Create(parent Capability, name string, mode fs.FileMode, exclus
 	for range 16 {
 		fd, err := createRegular(p.fd(), name, unixMode)
 		if err == nil {
-			identity, identityErr := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+			identity, identityErr := stableIdentityFD(fd, v.productionIdentity)
 			if identityErr != nil {
 				_ = unix.Close(fd)
 				return Capability{}, Attr{}, outcomeUncertain(identityErr)
@@ -87,7 +87,7 @@ func (v *Volume) Create(parent Capability, name string, mode fs.FileMode, exclus
 			// Nothing was mutated on this path, so no failure below it can be
 			// an uncertain outcome: reporting one would re-establish the mount
 			// for an operation that provably did not touch XFS.
-			identity, identityErr := stableIdentityAt(p.fd(), name, existing, v.productionIdentity)
+			identity, identityErr := stableIdentityFD(existing, v.productionIdentity)
 			if identityErr != nil {
 				_ = unix.Close(existing)
 				return Capability{}, Attr{}, identityErr
@@ -202,7 +202,7 @@ func (v *Volume) Mkdir(parent Capability, name string, mode fs.FileMode) (Capabi
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
-	identity, identityErr := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+	identity, identityErr := stableIdentityFD(fd, v.productionIdentity)
 	if identityErr != nil {
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(identityErr)
@@ -258,7 +258,7 @@ func (v *Volume) Symlink(parent Capability, name, target string) (Capability, At
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
-	identity, identityErr := stableIdentityAt(p.fd(), name, fd, v.productionIdentity)
+	identity, identityErr := stableIdentityFD(fd, v.productionIdentity)
 	if identityErr != nil {
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(identityErr)
