@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
@@ -256,16 +257,25 @@ func visibilityCursorProto(cursor volumeserver.VisibilityCursor) *authoritypb.Vi
 	return &authoritypb.VisibilityCursor{Sequence: cursor.Sequence, Phase: visibilityPhaseProto(cursor.Phase)}
 }
 
+// visibilityTargetProto emits the scope-exact wire shape through the
+// visibilitywire constructors. The coordinator's struct carries both identity
+// arrays because Go arrays have no absent state; the wire does, and a decoder
+// is entitled to refuse a target whose unused identity is sixteen zero bytes
+// rather than absent. Emitting a field the scope does not define is therefore
+// an encoder defect, not decoder pedantry.
 func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.VisibilityTarget {
-	return &authoritypb.VisibilityTarget{
-		Scope:           visibilityScopeProto(target.Scope),
-		Identity:        append([]byte(nil), target.Identity[:]...),
-		ParentIdentity:  append([]byte(nil), target.ParentIdentity[:]...),
-		Name:            append([]byte(nil), target.Name...),
-		Size:            target.Size,
-		KernelIno:       target.KernelIno,
-		ParentKernelIno: target.ParentKernelIno,
-		Device:          target.Device,
+	switch target.Scope {
+	case volumeserver.VisibilityNamespace:
+		return visibilitywire.Namespace(target.ParentIdentity[:], target.Name, target.ParentKernelIno, target.Device)
+	case volumeserver.VisibilityData:
+		return visibilitywire.Data(target.Identity[:], target.KernelIno, target.Device, target.Size)
+	case volumeserver.VisibilityAttributes:
+		return visibilitywire.Attributes(target.Identity[:], target.KernelIno, target.Device)
+	default:
+		// An unknown scope cannot be encoded as anything a decoder would act
+		// on. Emit only the unspecified scope so every receiver fails closed
+		// on this exact target instead of repairing a guessed coordinate.
+		return &authoritypb.VisibilityTarget{}
 	}
 }
 
@@ -277,19 +287,6 @@ func visibilityPhaseProto(phase volumeserver.VisibilityPhase) authoritypb.Visibi
 		return authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE
 	default:
 		return authoritypb.VisibilityPhase_VISIBILITY_PHASE_UNSPECIFIED
-	}
-}
-
-func visibilityScopeProto(scope volumeserver.VisibilityScope) authoritypb.VisibilityScope {
-	switch scope {
-	case volumeserver.VisibilityNamespace:
-		return authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE
-	case volumeserver.VisibilityData:
-		return authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA
-	case volumeserver.VisibilityAttributes:
-		return authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES
-	default:
-		return authoritypb.VisibilityScope_VISIBILITY_SCOPE_UNSPECIFIED
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 )
 
 const (
@@ -582,9 +583,14 @@ func translateV3VisibilityEvent(epoch []byte, event *authoritypb.VisibilityEvent
 	return local, nil
 }
 
+// translateV3VisibilityTarget admits a target only through the shared wire
+// contract, then keeps the fields this daemon's frontends repair by. FSKit
+// indexes kernel state by stable item identity, so the kernel-inode
+// coordination facts a Linux FUSE frontend consumes are validated and dropped
+// here rather than forwarded.
 func translateV3VisibilityTarget(target *authoritypb.VisibilityTarget) (pfslocal.VisibilityTarget, error) {
-	if target == nil {
-		return pfslocal.VisibilityTarget{}, errors.New("portablefsd: nil visibility target")
+	if err := visibilitywire.ValidateTarget(target); err != nil {
+		return pfslocal.VisibilityTarget{}, fmt.Errorf("portablefsd: %w", err)
 	}
 	local := pfslocal.VisibilityTarget{
 		Identity:       append([]byte(nil), target.GetIdentity()...),
@@ -594,29 +600,15 @@ func translateV3VisibilityTarget(target *authoritypb.VisibilityTarget) (pfslocal
 	}
 	switch target.GetScope() {
 	case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
-		if len(local.Identity) != 0 || len(local.ParentIdentity) != 16 || !validV3Name(local.Name) || local.Size != 0 {
-			return pfslocal.VisibilityTarget{}, errors.New("portablefsd: malformed namespace visibility target")
-		}
 		local.Scope = pfslocal.VisibilityScopeNamespace
 	case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA:
-		if len(local.Identity) != 16 || len(local.ParentIdentity) != 0 || len(local.Name) != 0 || local.Size < 0 {
-			return pfslocal.VisibilityTarget{}, errors.New("portablefsd: malformed data visibility target")
-		}
 		local.Scope = pfslocal.VisibilityScopeData
 	case authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES:
-		if len(local.Identity) != 16 || len(local.ParentIdentity) != 0 || len(local.Name) != 0 || local.Size != 0 {
-			return pfslocal.VisibilityTarget{}, errors.New("portablefsd: malformed attribute visibility target")
-		}
 		local.Scope = pfslocal.VisibilityScopeAttributes
 	default:
 		return pfslocal.VisibilityTarget{}, errors.New("portablefsd: visibility target has an unknown scope")
 	}
 	return local, nil
-}
-
-func validV3Name(name []byte) bool {
-	return len(name) > 0 && len(name) <= 255 && !bytes.Equal(name, []byte(".")) &&
-		!bytes.Equal(name, []byte("..")) && !bytes.ContainsAny(name, "\x00/")
 }
 
 func validateAuthorityCursor(cursor *authoritypb.VisibilityCursor) error {

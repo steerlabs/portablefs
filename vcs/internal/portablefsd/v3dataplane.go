@@ -16,6 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -301,7 +302,7 @@ func (d *v3DataPlane) v3Liveness(ctx context.Context, request *pfslocal.V3Livene
 
 func (d *v3DataPlane) lookup(ctx context.Context, request *pfslocal.LookupRequest) (any, int32) {
 	parent, errno := d.item(request.Dir)
-	if errno != 0 || !validV3Name(request.Name) {
+	if errno != 0 || !visibilitywire.ValidName(request.Name) {
 		if errno == 0 {
 			errno = darwinEINVAL
 		}
@@ -560,7 +561,7 @@ func (d *v3DataPlane) create(ctx context.Context, operationID uint64, request *p
 	if errno != 0 {
 		return nil, errno
 	}
-	if !validV3Name(request.Name) {
+	if !visibilitywire.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
@@ -594,7 +595,7 @@ func (d *v3DataPlane) mkdir(ctx context.Context, operationID uint64, request *pf
 	if errno != 0 {
 		return nil, errno
 	}
-	if !validV3Name(request.Name) {
+	if !visibilitywire.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode}}})
@@ -620,7 +621,7 @@ func (d *v3DataPlane) remove(ctx context.Context, operationID uint64, request *p
 	if errno != 0 {
 		return nil, errno
 	}
-	if !validV3Name(request.Name) {
+	if !visibilitywire.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	_, errno = d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Directory: request.Directory}}})
@@ -639,7 +640,7 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 	if errno != 0 {
 		return nil, errno
 	}
-	if !validV3Name(request.FromName) || !validV3Name(request.ToName) {
+	if !visibilitywire.ValidName(request.FromName) || !visibilitywire.ValidName(request.ToName) {
 		return nil, darwinEINVAL
 	}
 	_, errno = d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
@@ -656,7 +657,7 @@ func (d *v3DataPlane) symlink(ctx context.Context, operationID uint64, request *
 	if errno != 0 {
 		return nil, errno
 	}
-	if !validV3Name(request.Name) || bytes.IndexByte(request.Target, 0) >= 0 {
+	if !visibilitywire.ValidName(request.Name) || bytes.IndexByte(request.Target, 0) >= 0 {
 		return nil, darwinEINVAL
 	}
 	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Target: cloneBytesV3(request.Target)}}})
@@ -701,7 +702,7 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 	if errno != 0 {
 		return nil, errno
 	}
-	if !validV3Name(request.Name) {
+	if !visibilitywire.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytesV3(item.token), NewParent: cloneBytesV3(parent.token), NewName: cloneBytesV3(request.Name)}}})
@@ -939,7 +940,7 @@ func (d *v3DataPlane) enumerate(ctx context.Context, _ uint64, request *pfslocal
 	}
 	reply := &pfslocal.EnumerateReply{DirVersion: v3VerifierVersion(page.GetVerifier())}
 	for _, entry := range page.GetEntries() {
-		if entry == nil || !validV3Name(entry.GetName()) || len(entry.GetNextCookie()) == 0 || entry.GetAttr() == nil {
+		if entry == nil || !visibilitywire.ValidName(entry.GetName()) || len(entry.GetNextCookie()) == 0 || entry.GetAttr() == nil {
 			return d.malformed("readdir-plus omitted name, cookie, or attributes")
 		}
 		if entry.GetItem() == nil {
