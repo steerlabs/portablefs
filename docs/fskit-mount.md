@@ -356,6 +356,25 @@ when both its `FSShortName` and `FSSupportedSchemes` differ from the OSS
 identity. Sharing a generic-resource scheme is ambiguous even when filesystem
 types differ, so the installer rejects either kind of collision.
 
+### "Final mount step ended with error: … already exists"
+
+Symptom: the module resolves, the extension activates, and macOS itself fails
+the last step of `mount -t pfs` with a file-exists error, for every volume and
+every mount path.
+
+This is FSKit host state, not PortableFS configuration. `fskitd` retains a
+record of a mounted volume until the extension completes `deactivateVolume`;
+an extension that dies abnormally — killed mid-teardown, or replaced on disk
+while its volume was live — leaves that record behind, and it can wedge the
+module's future activations. Registering, rebuilding, or toggling the
+extension does not clear it. Restart the FSKit host daemon (`sudo pkill
+fskitd`; launchd relaunches it on demand) or reboot.
+
+PortableFS reduces its exposure to this state by scoping each mount's FSKit
+volume identity to the attach — a record left by a dead incarnation can never
+collide with a live one by name — but the host daemon itself can still wedge
+after repeated abnormal teardown, and only its restart recovers it.
+
 ### Enabled, but "Loading resource: … Input/output error"
 
 The module is enabled and the kernel reached it, but the extension's

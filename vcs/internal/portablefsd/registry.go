@@ -107,6 +107,11 @@ type attachStatus struct {
 	// branch on. Empty means no credential fault at all.
 	Credential string `json:"credential,omitempty"`
 	VolumeName string `json:"volumeName,omitempty"`
+	// SessionTerminal reports that this attach's v3 authority session ended
+	// permanently. The mount supervisor's revocation watchdog branches on it:
+	// a terminal session can never repair the kernel's caches again, so the
+	// kernel mount must be made unservable within the repair budget.
+	SessionTerminal bool `json:"sessionTerminal,omitempty"`
 }
 
 type registry struct {
@@ -1710,10 +1715,15 @@ func (a *attach) status() attachStatus {
 	a.mu.RUnlock()
 	credential := ""
 	// A terminal v3 session is this attach's strongest verdict: every
-	// operation answers ENOTCONN and only an exact unmount resolves it.
+	// operation answers ENOTCONN and only an exact unmount resolves it. The
+	// verdict travels as its own boolean because the mount supervisor's
+	// revocation watchdog branches on it — "degraded" plus a prose lastError
+	// is not something a program can branch on (see Credential above).
+	sessionTerminal := false
 	if d := a.v3Backend(); d != nil {
 		if err := d.terminalError(); err != nil && !errors.Is(err, errV3AttachDetached) {
 			state = pfslocal.AttachStateDegraded
+			sessionTerminal = true
 			lastErr = "v3 authority session is TERMINAL: " + err.Error() +
 				"; every operation on this mount fails closed (ENOTCONN) and only an exact unmount resolves it"
 		}
@@ -1721,7 +1731,7 @@ func (a *attach) status() attachStatus {
 	return attachStatus{
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
-		Credential: credential,
+		Credential: credential, SessionTerminal: sessionTerminal,
 	}
 }
 
