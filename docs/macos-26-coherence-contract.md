@@ -590,6 +590,25 @@ mount. The following are therefore unproven:
   unproven. That, not the matrix score, is the honest state: single-mount
   macOS behaviour is solid and measured; simultaneous macOS↔Linux coherence
   is not yet demonstrated.
+
+  The failing step is now pinned exactly. With both mounts verified real (the
+  Linux peer checked with `stat -f` to be `fuse`, not the container directory
+  underneath — an earlier run measured that directory and produced a
+  meaningless disjoint view), a peer create drives a COMPLETE repair whose
+  first action is the daemon-issued scratch create in the repaired directory.
+  That syscall enters the kernel, is dispatched to this extension as a
+  reserved-name `createItem`, and never completes: it consumes the entire
+  15-second repair budget and then returns `EIO`, and the mount is fenced.
+  The reserved-name path is admission-exempt by construction, so the gate is
+  not what holds it — the extension is not serving that callback while its own
+  COMPLETE repair is in flight. The next step is to establish whether FSKit
+  serializes volume callbacks behind an in-flight repair (a platform
+  constraint that would retire the synthetic-VFS-repair actuator entirely in
+  favour of the macOS 27 native cache API) or whether the extension's own
+  executor is the blocker (fixable here). Until that is answered, macOS 26
+  cross-mount coherence has no delivery path, and this contract's cache-repair
+  half is unproven end to end no matter how much of its machinery is tested
+  offline.
 - **Bounded barrier latency under metadata-heavy workloads.**
 
 ### macOS 27
