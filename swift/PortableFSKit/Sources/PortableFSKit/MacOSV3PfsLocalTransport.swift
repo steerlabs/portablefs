@@ -379,6 +379,11 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         cursor: PfsMacOSVisibilityCursor?,
         reason: String
     ) async {
+        // This is the coherence stack's death sentence for the mount; the
+        // reason must reach the unified log from the layer that decided it.
+        pfsClientLogger.error(
+            "v3 coherence failing closed: \(reason, privacy: .public) at sequence \((self.lastDeliveredCursor ?? cursor)?.sequence ?? 0)"
+        )
         guard epoch == contract.epoch,
               let failedCursor = lastDeliveredCursor ?? cursor,
               failedCursor.sequence > 0 else {

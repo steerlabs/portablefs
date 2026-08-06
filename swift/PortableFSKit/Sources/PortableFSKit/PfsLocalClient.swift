@@ -1,5 +1,11 @@
 import Foundation
+import os
 @preconcurrency import Darwin
+
+/// Transport-layer diagnostics. Terminal events are logged at the layer that
+/// caused them; for a strict-v3 mount a closed connection is the mount's
+/// death, and the cause must reach the unified log with the error public.
+let pfsClientLogger = Logger(subsystem: "dev.portablefs.fskit", category: "PfsLocalClient")
 
 private final class PfsEventSink: @unchecked Sendable {
     let stream: AsyncStream<PfsEvent>
@@ -389,6 +395,24 @@ private func pfsRequestPublishes(
     case .lookup, .enumerate, .getAttr, .setAttr, .read, .write,
          .create, .mkdir, .remove, .rename, .symlink, .readlink,
          .hardLink, .xattrGet, .xattrSet, .xattrList, .xattrRemove:
+        return true
+    default:
+        return false
+    }
+}
+
+/// The requests the authority orders through its visibility barrier. A
+/// callback with one of these in flight is parked outside the barrier's
+/// critical section: its reply cannot arrive before the current barrier
+/// completes, because the authority orders it strictly after — so a PREPARE
+/// drain that waited for it would be waiting on itself. See
+/// `PfsMacOSFSKitPublicationBarrier.prepare`.
+func pfsRequestIsOrderedMutation(
+    _ body: PfsEnvelope.OneOf_Body
+) -> Bool {
+    switch body {
+    case .setAttr, .write, .create, .mkdir, .remove, .rename,
+         .symlink, .hardLink, .xattrSet, .xattrRemove:
         return true
     default:
         return false
@@ -935,6 +959,13 @@ public actor PfsLocalClient {
         guard connection?.id == connectionID else {
             return
         }
+        // The one place every connection teardown passes through. For a
+        // strict-v3 mount this close IS the mount's death sentence, so the
+        // cause is logged here, where it is always known, rather than
+        // reconstructed from whichever wrapper a caller happened to observe.
+        pfsClientLogger.error(
+            "pfslocal connection closed: \(String(describing: error), privacy: .public); strictV3=\(self.strictV3ConnectionID == connectionID)"
+        )
         if strictV3ConnectionID == connectionID {
             strictV3Terminal = true
             strictV3EventSink?.finish()
@@ -1037,6 +1068,18 @@ public actor PfsLocalClient {
         guard let connection else {
             throw PfsLocalClientError.connectionClosed
         }
+        // An authority-ordered mutation in flight parks this callback outside
+        // any barrier's PREPARE drain (see pfsRequestIsOrderedMutation): the
+        // authority orders the mutation strictly after the barrier, so its
+        // reply cannot arrive until the barrier completes. The flag is raised
+        // before the request can reach the daemon and settled on every
+        // completion path — reply, timeout, cancellation — by the defer.
+        var admissionTicket: PfsMacOSAdmittedCallbackTicket?
+        if pfsRequestIsOrderedMutation(body), let ticket = PfsMacOSCallbackAdmission.ticket {
+            ticket.orderedMutationSubmitted()
+            admissionTicket = ticket
+        }
+        defer { admissionTicket?.orderedMutationSettled() }
         var operationID: UInt64 = 0
         if let collector = PfsPublicationContext.collector {
             if pfsRequestPublishes(body) {

@@ -15,7 +15,9 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     private let lock = NSLock()
     private var operationID: UInt64?
     private var published = false
+    private var orderedMutationsInFlight = 0
     private var publicationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init() {}
 
@@ -35,11 +37,34 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
         return operationID
     }
 
+    /// Marks an authority-ordered mutation of this callback in flight. The
+    /// authority orders it strictly after any barrier it did not initiate, so
+    /// from this instant the callback is parked outside that barrier's
+    /// critical section and a PREPARE drain must release it (see
+    /// `waitUntilPublishedOrParked`).
+    public func orderedMutationSubmitted() {
+        lock.lock()
+        orderedMutationsInFlight += 1
+        let waiters = drainWaiters
+        drainWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    public func orderedMutationSettled() {
+        lock.lock()
+        orderedMutationsInFlight -= 1
+        lock.unlock()
+    }
+
     func markPublished() {
         lock.lock()
         published = true
-        let waiters = publicationWaiters
+        let waiters = publicationWaiters + drainWaiters
         publicationWaiters.removeAll()
+        drainWaiters.removeAll()
         lock.unlock()
         for waiter in waiters {
             waiter.resume()
@@ -55,6 +80,25 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
                 return
             }
             publicationWaiters.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    /// The PREPARE drain wait: returns when the callback's reply has crossed
+    /// the framework publication boundary, OR the moment the callback parks an
+    /// authority-ordered mutation. Waiting past that moment would be the
+    /// two-writer drain deadlock the coherence design forbids — the mutation's
+    /// reply needs the barrier to complete, and the barrier would be waiting
+    /// for the reply's publication.
+    func waitUntilPublishedOrParked() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if published || orderedMutationsInFlight > 0 {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            drainWaiters.append(continuation)
             lock.unlock()
         }
     }
@@ -135,12 +179,26 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         // this very barrier gates — and its operation ID was stamped when its
         // mutation request was sent, strictly before the authority could have
         // begun this barrier.
+        //
+        // The drain waits for a callback only while it is PUBLISHING — its
+        // reply is crossing the framework boundary, bounded local work. A
+        // callback that has parked an authority-ordered mutation is released
+        // immediately, and one that parks a mutation mid-drain is released at
+        // that instant: the authority orders that mutation strictly after
+        // this barrier, so its reply — and therefore its publication — cannot
+        // happen until this barrier completes, and waiting for it is the
+        // two-writer drain deadlock the coherence design forbids. Concurrent
+        // mutations (a `git init` copying hook templates) made this barrier
+        // wait on exactly that, and the mount died at its repair budget. The
+        // exempted callback's eventual publication reflects state the
+        // authority ordered after this barrier, so releasing it early
+        // publishes newer truth, never stale truth.
         let drain = admitted.values.filter { ticket in
             guard let exemptOperationID else { return true }
             return ticket.currentOperationID() != exemptOperationID
         }
         for ticket in drain {
-            await ticket.waitUntilPublished()
+            await ticket.waitUntilPublishedOrParked()
         }
     }
 
