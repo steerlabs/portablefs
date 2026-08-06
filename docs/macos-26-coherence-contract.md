@@ -541,23 +541,29 @@ mount. The following are therefore unproven:
   by an ordinary process against a real VFS rather than against the arm registry
   directly. This includes the specific question of whether the admission gate
   prevents observation of the transient hidden-rename interval.
-- **Intermittent PREPARE stall under concurrent mutation storms.** Under
-  `git init`-class workloads (hundreds of rapid mutations with overlapping
-  callbacks) live mounts have repeatedly missed the repair budget
-  acknowledging a PREPARE and been fenced. One contributing deadlock is
-  closed — the barrier now releases a callback the moment it parks an
-  authority-ordered mutation, with the exemption unit-tested — but no
-  storm-heavy battery has yet been proven green on an identity-verified live
-  mount, so the fix has no live survival evidence and the stall is not
-  root-caused. (An earlier revision claimed four surviving batteries; those
-  runs post-dated the mount's death and ran against the bare directory
-  beneath the mountpoint. The battery now asserts the kernel mount's
-  identity before every verdict so that class of false result cannot
-  recur.) When the stall fires the mount fails CLOSED (every operation
-  ENOTCONN; a remount recovers): an availability defect under storm, never a
-  coherence defect. Diagnostic instrumentation is in place at every teardown
-  choke point (client close causes, coherence fail-closed reasons, daemon
-  frontend refusal reasons, bridge terminal causes).
+- **The storm-death investigation, closed.** Under `git init`-class
+  workloads live mounts repeatedly missed the repair budget acknowledging a
+  PREPARE and were fenced. Instrumenting every teardown choke point exposed
+  three stacked defects, each fixed at the root: the daemon's frontend
+  reader enforced one global strictly-increasing request-ID watermark across
+  a two-lane transport whose control lane legally overtakes the request lane
+  (now one watermark per lane); a fast cancellation let an operation's
+  acknowledgment overtake its own request on the priority lane (now gated on
+  the stamped requests' write receipts); and — the deep one — the PREPARE
+  drain waited for admitted callbacks whose requests were still in flight,
+  while the authority parks affected-coordinate reads until every strict
+  mount acknowledges that very PREPARE: a cross-layer deadlock cycle the
+  Linux frontend never had because it drains nothing. The drain now waits
+  only for callbacks that are actually installing; a released callback with
+  a parked mutation installs normally (its result is ordered after the
+  barrier), and one released holding pre-barrier cache-producing replies is
+  refused at install with EINTR, the retraction verdict. Live evidence,
+  identity-verified on every assertion: fifteen consecutive `git init`s and
+  four consecutive full batteries (14/14 each) on one live mount that was
+  still serving afterwards. (An earlier revision claimed surviving batteries
+  that had in fact run against the bare directory beneath a dead mount; the
+  battery now asserts the kernel mount's identity from the mount table
+  before every verdict, so that class of false result cannot recur.)
 - **Verified deactivation of durable membership.** The restart-refusal half of
   the drill has been run live: an authority restart was refused while old
   strict membership existed, and the operator fencing assertion cleared it

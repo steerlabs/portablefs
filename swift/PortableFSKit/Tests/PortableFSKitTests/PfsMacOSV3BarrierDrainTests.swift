@@ -68,6 +68,47 @@ private actor DrainCompletion {
     func value() -> Bool { done }
 }
 
+// The release verdicts. A callback released for a parked MUTATION installs
+// normally — the authority orders that mutation after the barrier. A callback
+// released with only reads in flight that already holds cache-producing
+// replies may combine pre-barrier values into its install, so it is crossed
+// and the adapter refuses the install with EINTR.
+@available(macOS 26.0, *)
+@Test func releaseVerdictsCrossExactlyTheExposedReadCallbacks() {
+    let exposedReads = PfsMacOSAdmittedCallbackTicket()
+    exposedReads.ordinaryRequestSubmitted()
+    exposedReads.publishingReplyReceived()
+    exposedReads.markCrossedIfExposedReadsWereReleased()
+    #expect(exposedReads.isCrossed())
+
+    let freshRead = PfsMacOSAdmittedCallbackTicket()
+    freshRead.ordinaryRequestSubmitted()
+    freshRead.markCrossedIfExposedReadsWereReleased()
+    #expect(!freshRead.isCrossed())
+
+    let parkedMutation = PfsMacOSAdmittedCallbackTicket()
+    parkedMutation.publishingReplyReceived()
+    parkedMutation.orderedMutationSubmitted()
+    parkedMutation.markCrossedIfExposedReadsWereReleased()
+    #expect(!parkedMutation.isCrossed())
+
+    let installing = PfsMacOSAdmittedCallbackTicket()
+    installing.publishingReplyReceived()
+    installing.markCrossedIfExposedReadsWereReleased()
+    #expect(!installing.isCrossed())
+}
+
+@available(macOS 26.0, *)
+@Test func prepareReleasesACallbackWithAnOrdinaryReadInFlight() async throws {
+    let barrier = try PfsMacOSFSKitPublicationBarrier(
+        localAuthoritySessionID: drainLocalSession
+    )
+    let reading = try await barrier.admit()
+    reading.ordinaryRequestSubmitted()
+    try await barrier.prepare(drainEvent(initiatorSession: drainPeerSession))
+    #expect(!reading.isCrossed())
+}
+
 @available(macOS 26.0, *)
 @Test func prepareStillDrainsAPublishingCallback() async throws {
     let barrier = try PfsMacOSFSKitPublicationBarrier(

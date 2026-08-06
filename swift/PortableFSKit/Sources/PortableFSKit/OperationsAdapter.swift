@@ -623,7 +623,18 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             // reaches no adapter catch block. Map here so FSKit always sees a
             // POSIX/FSKit error. The mapping is idempotent for errors that
             // were already mapped.
-            reply.value(result.mapError { PfsErrorMapper.fsKitError(for: $0) as Error })
+            //
+            // A ticket the barrier crossed mid-flight (released from a PREPARE
+            // drain while holding pre-barrier cache-producing replies, with
+            // only reads outstanding) must not install its combined result:
+            // the values it holds predate a repair that has since run. EINTR
+            // is the same verdict a daemon retraction produces — the kernel
+            // reissues the operation and observes post-repair truth.
+            var verdict = result
+            if let ticket, ticket.isCrossed(), case .success = verdict {
+                verdict = .failure(PfsErrorMapper.fsKitError(for: PfsLocalClientError.publicationRetracted))
+            }
+            reply.value(verdict.mapError { PfsErrorMapper.fsKitError(for: $0) as Error })
             // The reply above IS the publication boundary the coherence
             // barrier drains to; marking it published before the daemon's
             // completion ack is what lets a deferred source COMPLETE observe

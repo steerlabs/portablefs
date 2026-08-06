@@ -587,8 +587,16 @@ private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0
     #expect(await barrier.isAdmissionClosed() == false)
 }
 
+// A callback whose only request is still in flight is RELEASED by the
+// PREPARE drain, not waited for. The authority parks a read on a
+// barrier-affected coordinate until every strict mount acknowledges PREPARE,
+// so a drain that waited for the read would be waiting on its own
+// acknowledgment — the read-side twin of the two-writer deadlock, and the
+// live failure that fenced storm-loaded mounts at their repair budget. The
+// released callback's reply arrives post-apply and installs newer truth, so
+// it is not crossed and must install normally.
 @available(macOS 26.0, *)
-@Test func prepareDrainsAdmittedCallbacksThroughTheirReplyBoundary() async throws {
+@Test func prepareReleasesAnInFlightReadInsteadOfDeadlockingOnIt() async throws {
     let harness = try await makeWiringHarness(
         daemonConfiguration: .init(lookupDelaysNanoseconds: ["slow": 250_000_000])
     )
@@ -614,14 +622,15 @@ private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0
         try await barrier.prepare(try peerEvent(phase: .prepare))
         prepared.set(true)
     }
-    try await Task.sleep(for: .milliseconds(60))
-    // The admitted lookup has not replied yet, so the drain must still be
-    // waiting on it.
-    #expect(prepared.get() == nil)
-    #expect(try await waitUntil { prepared.get() == true })
-    #expect(replied.get() == true)
+    // The drain must return while the lookup's reply is still in flight —
+    // well before the daemon's 250ms delay elapses.
+    #expect(try await waitUntil(.milliseconds(150)) { prepared.get() == true })
+    #expect(replied.get() == nil)
     try await prepareTask.value
     try await barrier.resume(try peerEvent(phase: .complete))
+    // The released read completes afterwards and installs normally: its
+    // single reply postdates the barrier, so nothing about it is stale.
+    #expect(try await waitUntil { replied.get() == true })
 }
 
 @available(macOS 26.0, *)

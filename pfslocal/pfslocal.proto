@@ -4,7 +4,14 @@
 // Transport: a SOCK_STREAM Unix domain socket. Every frame is a 4-byte
 // little-endian unsigned length N (N <= 16 MiB) followed by N bytes encoding one
 // Envelope. Client→daemon envelopes carry request bodies with a nonzero,
-// client-chosen, strictly-increasing request_id. PublicationAck is the sole
+// client-chosen request_id, strictly increasing WITHIN ITS ORDERING LANE.
+// There are two lanes: the reserved control lane (VisibilityAck and
+// V3Liveness), which the client writes ahead of everything else so a barrier
+// acknowledgment can never queue behind a request burst, and the ordinary
+// request lane for all other bodies. Each lane is FIFO with increasing IDs;
+// the two interleave on the wire, so a control frame may legally carry a
+// LOWER id than an already-received ordinary frame and the daemon keeps one
+// replay watermark per lane. PublicationAck is the sole
 // one-way client message and uses request_id 0; it confirms that an earlier
 // operation reply — including a cacheable negative/error such as ENOENT — has
 // been fully published to the kernel, not merely read from the socket.
