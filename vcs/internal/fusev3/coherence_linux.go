@@ -16,6 +16,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 	"golang.org/x/sys/unix"
 )
 
@@ -567,28 +568,21 @@ type visibilityKeys struct {
 func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visibilityKeys, error) {
 	var keys visibilityKeys
 	for _, target := range targets {
+		// The full shared wire contract is enforced, not just the fields this
+		// frontend repairs by. A frontend that silently tolerates a shape the
+		// other decoder refuses is how an encoder defect ships through every
+		// gate on one platform and revokes every mount on the other.
+		if err := visibilitywire.ValidateTarget(target); err != nil {
+			return visibilityKeys{}, fmt.Errorf("fusev3: %w", err)
+		}
+		if err := r.pinIdentityDevice(target.GetDevice()); err != nil {
+			return visibilityKeys{}, err
+		}
 		switch target.GetScope() {
 		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
-			if target.GetParentKernelIno() == 0 {
-				return visibilityKeys{}, errors.New("fusev3: namespace visibility target carried no parent kernel inode number")
-			}
-			if err := r.pinIdentityDevice(target.GetDevice()); err != nil {
-				return visibilityKeys{}, err
-			}
-			if len(target.GetName()) == 0 {
-				return visibilityKeys{}, errors.New("fusev3: namespace visibility target carried no name")
-			}
 			keys.names = append(keys.names, nameKey{parent: target.GetParentKernelIno(), name: string(target.GetName())})
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES:
-			if target.GetKernelIno() == 0 {
-				return visibilityKeys{}, errors.New("fusev3: inode visibility target carried no kernel inode number")
-			}
-			if err := r.pinIdentityDevice(target.GetDevice()); err != nil {
-				return visibilityKeys{}, err
-			}
-			keys.inodes = append(keys.inodes, target.GetKernelIno())
 		default:
-			return visibilityKeys{}, fmt.Errorf("fusev3: visibility target carried scope %d", target.GetScope())
+			keys.inodes = append(keys.inodes, target.GetKernelIno())
 		}
 	}
 	return keys, nil

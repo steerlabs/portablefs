@@ -12,6 +12,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 )
 
 type fakeV3DataClient struct {
@@ -164,7 +165,7 @@ func TestV3DataPlaneRegistersPublishingMutationBeforeSourcePrepare(t *testing.T)
 		client.next <- v3VisibilityResult{event: &authoritypb.VisibilityEvent{
 			Cursor:             &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE},
 			InitiatorSessionId: client.session, MutationSlot: identity.Slot, MutationSequence: identity.Sequence,
-			Targets: []*authoritypb.VisibilityTarget{{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, Identity: bytes.Repeat([]byte{0x40}, 16), Size: 3}},
+			Targets: []*authoritypb.VisibilityTarget{visibilitywire.Data(bytes.Repeat([]byte{0x40}, 16), 2, 0x700000001, 3)},
 		}}
 		pending, err := d.bridge.next(context.Background())
 		if err != nil {
@@ -194,11 +195,9 @@ func TestV3DataPlaneCreatePublishesItsExactNamespaceOperation(t *testing.T) {
 			InitiatorSessionId: client.session,
 			MutationSlot:       identity.Slot,
 			MutationSequence:   identity.Sequence,
-			Targets: []*authoritypb.VisibilityTarget{{
-				Scope:          authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE,
-				ParentIdentity: bytes.Repeat([]byte{0x20}, 16),
-				Name:           []byte("new"),
-			}},
+			Targets: []*authoritypb.VisibilityTarget{
+				visibilitywire.Namespace(bytes.Repeat([]byte{0x20}, 16), []byte("new"), 1, 0x700000001),
+			},
 		}}
 		pending, err := d.bridge.next(context.Background())
 		if err != nil {

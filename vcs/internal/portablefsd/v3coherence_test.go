@@ -13,6 +13,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -100,10 +101,9 @@ func testV3Event(client *fakeV3VisibilityClient, sequence uint64, phase authorit
 	return &authoritypb.VisibilityEvent{
 		Cursor:             &authoritypb.VisibilityCursor{Sequence: sequence, Phase: phase},
 		InitiatorSessionId: bytes.Repeat([]byte{0x44}, 16), MutationSlot: 3, MutationSequence: 9,
-		Targets: []*authoritypb.VisibilityTarget{{
-			Scope:          authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE,
-			ParentIdentity: bytes.Repeat([]byte{0x55}, 16), Name: []byte("entry"),
-		}},
+		Targets: []*authoritypb.VisibilityTarget{
+			visibilitywire.Namespace(bytes.Repeat([]byte{0x55}, 16), []byte("entry"), 42, 0x700000001),
+		},
 	}
 }
 
@@ -332,9 +332,9 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 		InitiatorSessionId: bytes.Repeat([]byte{0xa2}, 16), MutationSequence: 1,
 	}
 	for _, target := range []*authoritypb.VisibilityTarget{
-		{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE, ParentIdentity: bytes.Repeat([]byte{1}, 16), Name: []byte("name")},
-		{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, Identity: bytes.Repeat([]byte{2}, 16), Size: 42},
-		{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, Identity: bytes.Repeat([]byte{3}, 16)},
+		visibilitywire.Namespace(bytes.Repeat([]byte{1}, 16), []byte("name"), 42, 0x700000001),
+		visibilitywire.Data(bytes.Repeat([]byte{2}, 16), 7, 0x700000001, 42),
+		visibilitywire.Attributes(bytes.Repeat([]byte{3}, 16), 7, 0x700000001),
 	} {
 		event := proto.Clone(base).(*authoritypb.VisibilityEvent)
 		event.Targets = []*authoritypb.VisibilityTarget{target}
@@ -354,16 +354,23 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	invalid = append(invalid, badCursor)
 	badInitiator := proto.Clone(base).(*authoritypb.VisibilityEvent)
 	badInitiator.InitiatorSessionId = []byte{1}
-	badInitiator.Targets = []*authoritypb.VisibilityTarget{{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, Identity: bytes.Repeat([]byte{2}, 16)}}
+	badInitiator.Targets = []*authoritypb.VisibilityTarget{visibilitywire.Data(bytes.Repeat([]byte{2}, 16), 7, 0x700000001, 0)}
 	invalid = append(invalid, badInitiator)
 	badName := proto.Clone(base).(*authoritypb.VisibilityEvent)
-	badName.Targets = []*authoritypb.VisibilityTarget{{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE, ParentIdentity: bytes.Repeat([]byte{1}, 16), Name: []byte("a/b")}}
+	badName.Targets = []*authoritypb.VisibilityTarget{visibilitywire.Namespace(bytes.Repeat([]byte{1}, 16), []byte("a/b"), 42, 0x700000001)}
 	invalid = append(invalid, badName)
 	badData := proto.Clone(base).(*authoritypb.VisibilityEvent)
-	badData.Targets = []*authoritypb.VisibilityTarget{{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, Identity: bytes.Repeat([]byte{2}, 16), Size: -1}}
+	badData.Targets = []*authoritypb.VisibilityTarget{visibilitywire.Data(bytes.Repeat([]byte{2}, 16), 7, 0x700000001, -1)}
 	invalid = append(invalid, badData)
+	// The historical launch-blocking defect: an unused identity serialized as
+	// sixteen zero bytes instead of left absent. The daemon must refuse it.
+	zeroPadded := proto.Clone(base).(*authoritypb.VisibilityEvent)
+	paddedTarget := visibilitywire.Namespace(bytes.Repeat([]byte{1}, 16), []byte("name"), 42, 0x700000001)
+	paddedTarget.Identity = make([]byte, 16)
+	zeroPadded.Targets = []*authoritypb.VisibilityTarget{paddedTarget}
+	invalid = append(invalid, zeroPadded)
 	badRoutes := proto.Clone(routes).(*authoritypb.VisibilityEvent)
-	badRoutes.Targets = []*authoritypb.VisibilityTarget{{Scope: authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, Identity: bytes.Repeat([]byte{3}, 16)}}
+	badRoutes.Targets = []*authoritypb.VisibilityTarget{visibilitywire.Attributes(bytes.Repeat([]byte{3}, 16), 7, 0x700000001)}
 	invalid = append(invalid, badRoutes)
 	for i, event := range invalid {
 		if _, err := translateV3VisibilityEvent(epoch, event); err == nil {

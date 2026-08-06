@@ -79,7 +79,13 @@ func TestKernelDetachReportsHelperFailureWithItsOutput(t *testing.T) {
 func TestKernelDetachRefusesAnUntrustedHelper(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "umount")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o777); err != nil {
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod, not the WriteFile mode: the create mode is filtered by umask, and
+	// under a 022 umask the file lands 0755 — which a root test process also
+	// owns, making it a genuinely trusted helper and the test vacuous.
+	if err := os.Chmod(fake, 0o777); err != nil {
 		t.Fatal(err)
 	}
 	restore := kernelDetachHelper
