@@ -1092,18 +1092,33 @@ public actor PfsLocalClient {
         guard let connection else {
             throw PfsLocalClientError.connectionClosed
         }
-        // An authority-ordered mutation in flight parks this callback outside
-        // any barrier's PREPARE drain (see pfsRequestIsOrderedMutation): the
-        // authority orders the mutation strictly after the barrier, so its
-        // reply cannot arrive until the barrier completes. The flag is raised
-        // before the request can reach the daemon and settled on every
-        // completion path — reply, timeout, cancellation — by the defer.
-        var admissionTicket: PfsMacOSAdmittedCallbackTicket?
-        if pfsRequestIsOrderedMutation(body), let ticket = PfsMacOSCallbackAdmission.ticket {
-            ticket.orderedMutationSubmitted()
-            admissionTicket = ticket
+        // Any request in flight parks this callback outside a barrier's
+        // PREPARE drain — a callback awaiting a reply installs nothing, and
+        // waiting on it deadlocks against the authority, which parks
+        // affected-coordinate reads until this mount's PREPARE ack. Ordered
+        // mutations and ordinary requests are tracked separately because their
+        // release verdicts differ (see markCrossedIfExposedReadsWereReleased).
+        // Flags are raised before the request can reach the daemon and settled
+        // on every completion path — reply, timeout, cancellation — by the
+        // defer.
+        let admissionTicket = PfsMacOSCallbackAdmission.ticket
+        let orderedMutation = pfsRequestIsOrderedMutation(body)
+        if let admissionTicket {
+            if orderedMutation {
+                admissionTicket.orderedMutationSubmitted()
+            } else {
+                admissionTicket.ordinaryRequestSubmitted()
+            }
         }
-        defer { admissionTicket?.orderedMutationSettled() }
+        defer {
+            if let admissionTicket {
+                if orderedMutation {
+                    admissionTicket.orderedMutationSettled()
+                } else {
+                    admissionTicket.ordinaryRequestSettled()
+                }
+            }
+        }
         var operationID: UInt64 = 0
         if let collector = PfsPublicationContext.collector {
             if pfsRequestPublishes(body) {
@@ -1158,7 +1173,7 @@ public actor PfsLocalClient {
         envelope.operationID = operationID
         envelope.body = body
 
-        return try await withTaskCancellationHandler {
+        let replyEnvelope = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let timeoutTask = Task.detached { [
                     requestID,
@@ -1207,6 +1222,13 @@ public actor PfsLocalClient {
                 await self.cancelRequest(requestID)
             }
         }
+        if pfsRequestPublishes(body) {
+            // The barrier's release verdict for a mid-flight callback depends
+            // on whether it already holds cache-producing values; record the
+            // receipt before the in-flight counter settles.
+            admissionTicket?.publishingReplyReceived()
+        }
+        return replyEnvelope
     }
 
     private nonisolated func completePublications(_ tickets: [PfsPublicationTicket]) async {

@@ -16,6 +16,9 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     private var operationID: UInt64?
     private var published = false
     private var orderedMutationsInFlight = 0
+    private var ordinaryRequestsInFlight = 0
+    private var publishingRepliesReceived = 0
+    private var crossed = false
     private var publicationWaiters: [CheckedContinuation<Void, Never>] = []
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -59,6 +62,61 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Marks an ordinary (non-mutating) request of this callback in flight.
+    /// The authority parks a read on a barrier-affected coordinate until every
+    /// strict mount has acknowledged PREPARE, so a drain that waited for this
+    /// callback would wait on the very acknowledgment it is blocking — the
+    /// read-side twin of the two-writer deadlock. The drain releases it; what
+    /// keeps that sound is `markCrossedIfExposedReadsWereReleased` below.
+    public func ordinaryRequestSubmitted() {
+        lock.lock()
+        ordinaryRequestsInFlight += 1
+        let waiters = drainWaiters
+        drainWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    public func ordinaryRequestSettled() {
+        lock.lock()
+        ordinaryRequestsInFlight -= 1
+        lock.unlock()
+    }
+
+    /// Records that a cache-producing reply has been received by this
+    /// callback. A barrier that later releases the callback mid-flight must
+    /// know whether it is carrying pre-barrier values.
+    public func publishingReplyReceived() {
+        lock.lock()
+        publishingRepliesReceived += 1
+        lock.unlock()
+    }
+
+    /// Called by the barrier for each drained ticket it released. A callback
+    /// released because a MUTATION was parked installs normally: the authority
+    /// orders that mutation after the barrier, so its final result is newer
+    /// truth. A callback released with only reads in flight that had ALREADY
+    /// received cache-producing replies may combine pre-barrier values into
+    /// its final install, so it is marked crossed and the adapter refuses the
+    /// install with EINTR — the same verdict a daemon retraction produces:
+    /// never install what the coherence machinery no longer stands behind.
+    public func markCrossedIfExposedReadsWereReleased() {
+        lock.lock()
+        if !published, orderedMutationsInFlight == 0,
+           ordinaryRequestsInFlight > 0, publishingRepliesReceived > 0 {
+            crossed = true
+        }
+        lock.unlock()
+    }
+
+    public func isCrossed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return crossed
+    }
+
     func markPublished() {
         lock.lock()
         published = true
@@ -85,15 +143,17 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     }
 
     /// The PREPARE drain wait: returns when the callback's reply has crossed
-    /// the framework publication boundary, OR the moment the callback parks an
-    /// authority-ordered mutation. Waiting past that moment would be the
-    /// two-writer drain deadlock the coherence design forbids — the mutation's
-    /// reply needs the barrier to complete, and the barrier would be waiting
-    /// for the reply's publication.
+    /// the framework publication boundary, OR the moment the callback has ANY
+    /// request in flight to the daemon. A callback awaiting a reply is not
+    /// installing anything, and waiting for it closes a deadlock cycle on
+    /// both sides of the wire: a parked mutation's reply needs this barrier
+    /// to complete, and the authority parks affected-coordinate reads until
+    /// every strict mount has acknowledged this very PREPARE. The only work
+    /// the drain may wait on is bounded local installation.
     func waitUntilPublishedOrParked() async {
         await withCheckedContinuation { continuation in
             lock.lock()
-            if published || orderedMutationsInFlight > 0 {
+            if published || orderedMutationsInFlight > 0 || ordinaryRequestsInFlight > 0 {
                 lock.unlock()
                 continuation.resume()
                 return
@@ -199,6 +259,11 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         }
         for ticket in drain {
             await ticket.waitUntilPublishedOrParked()
+            // A released callback that had already received cache-producing
+            // replies and holds only reads in flight may combine pre-barrier
+            // values into its final install; it is marked crossed and the
+            // adapter refuses that install with EINTR (the kernel reissues).
+            ticket.markCrossedIfExposedReadsWereReleased()
         }
     }
 

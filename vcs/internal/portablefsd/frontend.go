@@ -197,7 +197,18 @@ func (c *frontendConn) serve(ctx context.Context) {
 	c.cancel = cancel
 	defer c.close()
 	defer cancel()
+	// Two watermarks, one per ordering lane. Request IDs are allocated in one
+	// strictly increasing sequence, but the frontend writes on two lanes: the
+	// reserved control lane (visibility acknowledgements, liveness) is
+	// dequeued ahead of ordinary requests precisely so a barrier ack can
+	// never queue behind a request burst. The lanes therefore interleave on
+	// the wire, and a single global watermark misreads that interleaving as
+	// replay: under a mutation storm the first visibility ack that overtook a
+	// queued ordinary request killed the connection — and with it the mount.
+	// Each lane is FIFO and increasing within itself, which is exactly the
+	// replay protection the check exists for.
 	var lastRequestID uint64
+	var lastControlRequestID uint64
 	state := frontendAwaitingHello
 	for {
 		env, err := pfslocal.ReadFrame(c.conn)
@@ -232,11 +243,11 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			continue
 		} else {
-			if env.RequestID == 0 || env.RequestID <= lastRequestID {
-				log.Printf("portablefsd frontend: closing connection: request id %d is not strictly above %d", env.RequestID, lastRequestID)
+			lane, ok := admitLaneRequestID(env.Body, env.RequestID, &lastRequestID, &lastControlRequestID)
+			if !ok {
+				log.Printf("portablefsd frontend: closing connection: %s-lane request id %d violated its lane's strictly-increasing order", lane, env.RequestID)
 				return
 			}
-			lastRequestID = env.RequestID
 		}
 		switch req := env.Body.(type) {
 		case *pfslocal.Hello:
@@ -758,6 +769,29 @@ func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32
 	_ = c.replyWithPublication(
 		req, operationID, &pfslocal.ErrorReply{Errno: eno, Message: msg}, false,
 	)
+}
+
+// admitLaneRequestID enforces per-lane replay protection. Request IDs are
+// allocated in one increasing sequence but written on two lanes, and the
+// control lane (visibility acknowledgments, liveness) deliberately overtakes
+// queued ordinary requests — so a control frame may legally arrive carrying a
+// lower ID than an ordinary frame already received. Each lane is FIFO with
+// increasing IDs within itself; that per-lane monotonicity is the replay
+// protection, and enforcing it globally once killed healthy mounts the
+// moment a barrier acknowledgment overtook a request burst.
+func admitLaneRequestID(body any, id uint64, lastRequest, lastControl *uint64) (lane string, ok bool) {
+	watermark := lastRequest
+	lane = "request"
+	switch body.(type) {
+	case *pfslocal.VisibilityAckRequest, *pfslocal.V3LivenessRequest:
+		watermark = lastControl
+		lane = "control"
+	}
+	if id == 0 || id <= *watermark {
+		return lane, false
+	}
+	*watermark = id
+	return lane, true
 }
 
 // acknowledgePublication retires the logical operation the frontend has
