@@ -132,9 +132,16 @@ primitive macOS 26 does provide. The stale window for a cached read on an
 already-open descriptor is therefore bounded by probe confirmation plus one
 forced unmount, inside the authority's one-budget fencing grace; bytes a
 process already copied into its own memory are out of scope on every platform.
-What remains open, below, is the live-kernel proof that a forced unmount of an
-FSKit volume revokes cached reads on held-open descriptors the way it does for
-kext-era filesystems.
+
+The load-bearing kernel claim is live-proven. On a real macOS 26 mount with a
+descriptor held open and its bytes cached, portablefsd was killed with
+`SIGKILL`: the descriptor answered from the kernel's cache for 8.6 seconds —
+the exact exposure the watchdog exists to bound — then the watchdog detected
+the death, force-unmounted the identity-proven kernel mount at ~10 seconds,
+and from that instant every further `pread` on the held descriptor failed
+`EIO`. The supervisor finalized locally with the session ending fenced and no
+stale record left behind. Ten seconds is inside the one-budget fencing grace,
+so the contract's bound holds end to end.
 
 What is *not* traded away: the fenced mount stays in durable membership, so the
 authority-restart gate below still applies to it in full. Availability is
@@ -479,13 +486,16 @@ contract.
   above, with the residual coalescing stated rather than hidden.
 - The authority carries kernel-cache coordination facts explicitly, so a strict
   repair against real XFS addresses the coordinate the frontend actually keys on.
-- The revocation watchdog is implemented in the per-mount supervisor: probes at
-  one third of the repair budget, confirmed daemon-death detection, one-probe
-  revocation of a terminal session (the daemon reports terminality as a
-  machine-readable field, not prose), identity-proven forced unmount, and local
-  finalization when no daemon barrier remains to run. The decision logic and the
-  forced detach are unit-tested; the kernel-side revocation effect is the open
-  gate below.
+- The revocation watchdog is implemented in the per-mount supervisor and
+  live-proven end to end: probes at one third of the repair budget, confirmed
+  daemon-death detection, one-probe revocation of a terminal session (the
+  daemon reports terminality as a machine-readable field, not prose),
+  identity-proven forced unmount, and local finalization when no daemon
+  barrier remains to run. In the live kill drill the forced unmount revoked a
+  held-open descriptor's cached reads at ~10 seconds after daemon death — the
+  8.6-second cached-read window before it is the bounded exposure the
+  contract declares, and `EIO` from the revocation instant onward is the
+  proof the bound is real.
 - Live-kernel evidence now exists for part of the path: a real `pfs` FSKit mount
   against a real XFS authority served reads, writes, creates, renames,
   symlinks, enumeration, and rename-over-an-open-descriptor with the strict
@@ -523,14 +533,19 @@ mount. The following are therefore unproven:
   by an ordinary process against a real VFS rather than against the arm registry
   directly. This includes the specific question of whether the admission gate
   prevents observation of the transient hidden-rename interval.
-- **Forced-unmount revocation semantics.** The watchdog's mechanism is
-  implemented and unit-tested, but the load-bearing kernel claim is not yet
-  proven live: that `umount -f` of an FSKit volume revokes the covered vnodes
-  so a subsequent read on an already-open descriptor fails instead of
-  answering from the kernel's cache, as it does for kext-era filesystems. The
-  experiment is one afternoon on a live mount — read, hold the descriptor,
-  kill portablefsd, force-unmount, demand the next `pread` fail — and until it
-  is run the fencing grace remains load-bearing on macOS.
+- **Intermittent PREPARE stall under concurrent mutation storms.** Twice
+  under `git init`-class workloads (hundreds of rapid mutations with
+  overlapping callbacks) a live mount missed its repair budget acknowledging
+  a PREPARE and was fenced; the same binaries then survived four consecutive
+  full batteries and repeated git storms on one long-lived mount. The
+  two-writer drain deadlock this suggested is closed — the barrier now
+  releases a callback the moment it parks an authority-ordered mutation, with
+  the exemption unit-tested — but the residual race is not yet root-caused.
+  When it fires the mount fails CLOSED (every operation ENOTCONN; a remount
+  recovers): it is an availability defect under storm, never a coherence
+  defect. Diagnostic instrumentation is now in place at every teardown choke
+  point (client close causes, coherence fail-closed reasons, daemon frontend
+  refusal reasons, bridge terminal causes).
 - **Verified deactivation of durable membership.** The restart-refusal half of
   the drill has been run live: an authority restart was refused while old
   strict membership existed, and the operator fencing assertion cleared it

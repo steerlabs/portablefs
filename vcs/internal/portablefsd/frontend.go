@@ -208,13 +208,21 @@ func (c *frontendConn) serve(ctx context.Context) {
 			return
 		}
 		if _, ack := env.Body.(*pfslocal.PublicationAck); ack {
+			// A protocol violation closes the connection — for a strict-v3
+			// mount that close is the mount's death sentence, so the exact
+			// violated condition is logged rather than the connection just
+			// vanishing with both ends blaming the other.
 			if state != frontendAttached || env.RequestID != 0 {
+				log.Printf("portablefsd frontend: closing connection: publication ack before attach or with request id %d", env.RequestID)
 				return
 			}
 			req := env.Body.(*pfslocal.PublicationAck)
-			if req.PublishedRequestID != 0 ||
-				req.OperationID == 0 ||
-				!c.acknowledgePublication(req.OperationID) {
+			if req.PublishedRequestID != 0 || req.OperationID == 0 {
+				log.Printf("portablefsd frontend: closing connection: malformed publication ack (publishedRequestID=%d operationID=%d)", req.PublishedRequestID, req.OperationID)
+				return
+			}
+			if !c.acknowledgePublication(req.OperationID) {
+				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
 				return
 			}
 			if a := c.currentAttach(); a != nil {
@@ -225,6 +233,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 			continue
 		} else {
 			if env.RequestID == 0 || env.RequestID <= lastRequestID {
+				log.Printf("portablefsd frontend: closing connection: request id %d is not strictly above %d", env.RequestID, lastRequestID)
 				return
 			}
 			lastRequestID = env.RequestID
