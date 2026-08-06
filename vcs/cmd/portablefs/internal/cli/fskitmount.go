@@ -985,16 +985,29 @@ func fskitPreflight(frontendSock, attachRef, expectedDaemonVersion string) error
 type fskitMountFailure string
 
 const (
-	fskitFailureUnknown       fskitMountFailure = ""
-	fskitFailureResourceLoad  fskitMountFailure = "resource-load"
-	fskitFailureModuleMissing fskitMountFailure = "module-unavailable"
+	fskitFailureUnknown        fskitMountFailure = ""
+	fskitFailureResourceLoad   fskitMountFailure = "resource-load"
+	fskitFailureModuleMissing  fskitMountFailure = "module-unavailable"
+	fskitFailureFinalMountStep fskitMountFailure = "final-mount-step"
 )
 
 // classifyFSKitMountFailure recognizes only evidence that distinguishes a
 // reached extension from the legacy mount-helper fallback. Generic errno text
 // is intentionally left unknown: the same errno can be produced by unrelated
 // mount point, policy, resource, and extension failures.
+//
+// Ordering is evidence-strength, not likelihood. mount(8) ALWAYS falls
+// through to the legacy helper when its FSKit path fails, so the
+// helper-missing lines appear in every FSKit failure and are only meaningful
+// when nothing more specific preceded them. Classifying by the fallback text
+// first once reported a completed module resolution and activation — the
+// failure was in the final mount step, host-side — as "the extension may
+// need to be enabled", which sends the operator to a Settings toggle that is
+// already on.
 func classifyFSKitMountFailure(fsType, message string) fskitMountFailure {
+	if strings.Contains(message, "Final mount step") {
+		return fskitFailureFinalMountStep
+	}
 	if strings.Contains(message, "Loading resource") {
 		return fskitFailureResourceLoad
 	}
@@ -1011,6 +1024,8 @@ func classifyFSKitMountFailure(fsType, message string) fskitMountFailure {
 func fskitMountHint(fsType string, err error) error {
 	message := err.Error()
 	switch classifyFSKitMountFailure(fsType, message) {
+	case fskitFailureFinalMountStep:
+		return fmt.Errorf("%w\nthe %q FSKit module resolved and its extension activated, but macOS failed the final mount step itself; this is FSKit host state, not PortableFS configuration — a record left by an abnormally ended mount can wedge fskitd until it is restarted (sudo pkill fskitd; it relaunches on demand) or the machine reboots", err, fsType)
 	case fskitFailureResourceLoad:
 		return fmt.Errorf("%w\nthe %q FSKit extension was reached but failed while loading its resource; verify portablefsd is reachable at the extension's exact app-group socket and inspect the underlying mount error", err, fsType)
 	case fskitFailureModuleMissing:
