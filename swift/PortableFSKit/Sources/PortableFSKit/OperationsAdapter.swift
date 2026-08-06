@@ -364,6 +364,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     /// offline suite can witness what a composed mount installed.
     let coherence: PfsMacOSV3VolumeCoherence?
     private let attachRef: String
+    private let mountRootHandoffSocket: String
 
     public static func make(
         core: VolumeCore,
@@ -394,6 +395,12 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             }
         }
         let statReply = try await core.statfs()
+        // The daemon socket's directory hosts the mount-root handoff socket;
+        // resolve it now so the synchronous actuator locator needs no async
+        // hop when the first repair arrives.
+        let handoffSocket = try await PfsMountRootHandoff.socketPath(
+            besideFrontendSocket: core.client.currentSocketPath()
+        )
         return PortableFSVolume(
             core: core,
             attachRef: attachRef,
@@ -401,7 +408,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             statReply: statReply,
             moduleIdentity: moduleIdentity,
             repairGate: installedCoherence?.repairGate ?? repairGate,
-            coherence: installedCoherence
+            coherence: installedCoherence,
+            mountRootHandoffSocket: handoffSocket
         )
     }
 
@@ -412,12 +420,14 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         statReply: PfsStatfsReply,
         moduleIdentity: PortableFSModuleIdentity,
         repairGate: (any PfsMacOS26RepairGate)?,
-        coherence: PfsMacOSV3VolumeCoherence?
+        coherence: PfsMacOSV3VolumeCoherence?,
+        mountRootHandoffSocket: String
     ) {
         self.core = core
         self.capabilities = resolved.capabilities
         self.repairGate = repairGate
         self.coherence = coherence
+        self.mountRootHandoffSocket = mountRootHandoffSocket
         self.attachRef = attachRef
         self.fileSystemTypeName = moduleIdentity.fileSystemTypeName
         self.cachedStatistics = PfsFSKitMapping.statfs(
@@ -1639,14 +1649,32 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         guard let coherence else { return }
         let typeName = fileSystemTypeName
         let attachRef = attachRef
+        let handoffSocket = mountRootHandoffSocket
         coherence.scheduleActuatorInstall {
-            try PfsMacOSMountRootLocator.openMountRoot(
-                fileSystemTypeName: typeName,
-                attachRef: attachRef,
-                // The root is authority item 1, projected through the platform
-                // identifier offset like every other inode this mount reports.
-                expectedRootFileID: try PfsFSKitMapping.itemIdentifier(from: 1).rawValue
-            )
+            // The root is authority item 1, projected through the platform
+            // identifier offset like every other inode this mount reports.
+            let expected = try PfsFSKitMapping.itemIdentifier(from: 1).rawValue
+            do {
+                // The daemon hands the descriptor across the sandbox boundary:
+                // the sandbox hides this extension's own mount from getfsstat,
+                // so in-process location cannot work (proven live — the first
+                // peer repair scanned fifteen mounts and found every volume on
+                // the machine except its own).
+                return try PfsMountRootHandoff.openRoot(
+                    handoffSocketPath: handoffSocket,
+                    attachRef: attachRef,
+                    expectedRootFileID: expected
+                )
+            } catch {
+                pfsClientLogger.error(
+                    "mount-root handoff failed (\(String(describing: error), privacy: .public)); falling back to the in-process mount scan"
+                )
+                return try PfsMacOSMountRootLocator.openMountRoot(
+                    fileSystemTypeName: typeName,
+                    attachRef: attachRef,
+                    expectedRootFileID: expected
+                )
+            }
         }
     }
 

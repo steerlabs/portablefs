@@ -66,8 +66,8 @@ func (s *Server) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	wg.Add(2)
+	errs := make(chan error, 3)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		if err := s.ServeFrontend(ctx); err != nil && ctx.Err() == nil {
@@ -77,6 +77,12 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		if err := s.ServeControl(ctx); err != nil && ctx.Err() == nil {
+			errs <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := s.ServeMountRootHandoff(ctx); err != nil && ctx.Err() == nil {
 			errs <- err
 		}
 	}()
