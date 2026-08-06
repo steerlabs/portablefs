@@ -425,10 +425,20 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             capabilities: resolved.capabilities,
             fileSystemTypeName: moduleIdentity.fileSystemTypeName
         )
+        // The FSKit volume identity is scoped to the ATTACH, not the backend
+        // volume, exactly like the container identity above. A v3 mount is one
+        // incarnation: a fenced or abnormally-ended incarnation never comes
+        // back, and its successor registers as a new one. Deriving this UUID
+        // from the backend volume ID gave every incarnation the same FSKit
+        // identity, so a volume record left in fskitd by an incarnation that
+        // died before completing deactivateVolume collided with every future
+        // mount of that volume — "a file with the same name already exists"
+        // at the final mount step, curable only by restarting fskitd. fskitd's
+        // record of a dead incarnation must never be able to name a live one.
         let volumeID = FSVolume.Identifier(
             uuid: PortableFSFileSystem.stableEntityUUID(
                 kind: "volume",
-                stableID: resolved.volumeID.isEmpty ? attachRef : resolved.volumeID,
+                stableID: attachRef,
                 moduleIdentity: moduleIdentity
             )
         )

@@ -1109,10 +1109,14 @@ public actor PfsLocalClient {
                     timeoutTask: timeoutTask,
                     publicationCollector: PfsPublicationContext.collector
                 )
-                if Task.isCancelled {
-                    cancelRequest(requestID)
-                    return
-                }
+                // The write is NOT skipped for an already-cancelled task. A
+                // publishing request may have just stamped a fresh operation ID
+                // into the collector, and the boundary will acknowledge that ID
+                // when the callback ends; an acknowledgement for an operation
+                // the daemon never saw on a request is a protocol violation
+                // that costs the whole connection. Writing unconditionally
+                // keeps the stamp and the daemon's view identical; the caller's
+                // cancellation is delivered by `onCancel` either way.
                 let outboundEnvelope = envelope
                 let writeReceipt = connection.writer.enqueue(
                     outboundEnvelope,
@@ -1200,16 +1204,34 @@ public actor PfsLocalClient {
         request.continuation.resume(throwing: PfsLocalClientError.timeout)
     }
 
+    /// Fails ONE request whose framework task was cancelled, and leaves the
+    /// connection — and therefore every other operation's publication —
+    /// untouched.
+    ///
+    /// ── WHY THIS NO LONGER RESETS THE CONNECTION ────────────────────────────
+    ///
+    /// It used to, for the same one-operation reasoning `timeoutRequest`
+    /// documents above, and with the same mount-wide blast radius: FSKit
+    /// cancels an operation's task when its initiating process is interrupted
+    /// or dies mid-syscall, which a burst of short-lived processes — a `git
+    /// init` copying hook templates — produces routinely. Closing the
+    /// connection stranded every OTHER in-flight operation's publication, the
+    /// daemon treated the disconnect as a kernel-coherence failure, the
+    /// authority fenced the mount at its repair budget, and one interrupted
+    /// process turned into a permanent whole-mount EIO. That is the live
+    /// failure signature this comment exists to keep dead.
+    ///
+    /// The late reply is already handled exactly as for a timeout: `receive`
+    /// finds no pending entry and drops the frame, and the operation's
+    /// acknowledgement obligation is discharged as a whole by the publication
+    /// boundary from the ticket its STAMP created (see
+    /// `PfsPublicationCollector.bind`), never from individual replies.
     private func cancelRequest(_ requestID: UInt64) {
         guard let request = pending.removeValue(forKey: requestID) else {
             return
         }
-        let connectionID = connection?.id
         request.timeoutTask?.cancel()
         request.continuation.resume(throwing: PfsLocalClientError.cancelled)
-        if let connectionID {
-            closeCurrentConnection(connectionID, error: PfsLocalClientError.cancelled)
-        }
     }
 
     private func writeFailed(_ requestID: UInt64, connectionID: UUID, error: Error) {

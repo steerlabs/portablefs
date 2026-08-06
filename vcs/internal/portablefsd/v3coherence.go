@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"syscall"
 	"time"
@@ -518,6 +519,11 @@ func (b *v3CoherenceBridge) fail(cause error) error {
 		cause = errV3VisibilityTerminal
 	}
 	b.failOnce.Do(func() {
+		// The cause is logged here, at the one point that always holds it.
+		// Callers propagate the terminal sentinel, and a log line built from
+		// what a caller happens to see reports the wrapper instead of the
+		// reason the stream died — which is the only thing an operator needs.
+		log.Printf("portablefsd: v3 coherence stream failed terminally: %v", cause)
 		b.mu.Lock()
 		b.terminal = cause
 		if b.pending != nil {

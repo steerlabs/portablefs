@@ -328,6 +328,75 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     #expect(await client.testingPendingRequestCount() == 0)
 }
 
+/// FSKit cancels one operation's task when its initiating process is
+/// interrupted or dies mid-syscall — a burst of short-lived processes (`git
+/// init` copying hook templates) produces this routinely. The cost must be
+/// exactly one operation. The old behavior closed the whole connection, which
+/// stranded every other in-flight operation's publication, made the daemon
+/// treat the disconnect as a kernel-coherence failure, and turned one
+/// interrupted process into a permanently fenced mount.
+@Test func requestCancellationLeavesTheStrictConnectionAndItsPublicationsIntact() async throws {
+    var contract = PfsV3CoherenceContract()
+    contract.authorityProtocolMajor = 2
+    contract.authorityEpoch = Data(repeating: 0xE1, count: 16)
+    contract.sessionID = Data(repeating: 0x51, count: 16)
+    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
+    contract.repairBudgetMillis = 2_500
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(lookupNoReplyNames: ["hung"], v3Coherence: contract)
+    )
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(requestDeadlineNanoseconds: 5_000_000_000)
+    )
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    let hung = Task {
+        try await client.withPublicationBoundary {
+            var request = PfsLookupRequest()
+            request.dir = resolved.root
+            request.name = transportBytes("hung")
+            return try await client.request(.lookup(request))
+        }
+    }
+    try await Task.sleep(nanoseconds: 20_000_000)
+    hung.cancel()
+    do {
+        _ = try await hung.value
+        Issue.record("expected cancellation")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .cancelled)
+    }
+
+    // The cancelled callback's stamped operation is still acknowledged as a
+    // whole: the daemon's handoff gate must never wait on a callback that has
+    // already given up, and the ack is created by the operation-ID stamp, not
+    // by the reply that never came.
+    var acks = 0
+    for _ in 0..<200 {
+        acks = await daemon.stats().publicationAcks
+        if acks >= 1 { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    #expect(acks == 1)
+
+    // A strict-v3 client never transparently reconnects, so a follow-up
+    // request that reaches the daemon proves the exact connection survived.
+    var followUp = PfsLookupRequest()
+    followUp.dir = resolved.root
+    followUp.name = transportBytes("present-after-cancel")
+    do {
+        _ = try await client.request(.lookup(followUp))
+    } catch let error as PfsLocalClientError {
+        guard case .daemon = error else {
+            Issue.record("the strict connection did not survive a single cancelled request: \(error)")
+            return
+        }
+    }
+}
+
 @Test func eventsAreResubscribedAfterReconnect() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
