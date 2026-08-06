@@ -384,7 +384,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 installedCoherence = try await PfsMacOSV3VolumeCoherence.compose(
                     client: core.client,
                     resolved: strictReply,
-                    contract: strictContract
+                    contract: strictContract,
+                    daemonActuation: (
+                        socketPath: PfsMountRootHandoff.socketPath(
+                            besideFrontendSocket: try await core.client.currentSocketPath()
+                        ),
+                        attachRef: attachRef
+                    )
                 )
             } catch {
                 // The resolve accepted a policy this adapter then failed to
@@ -576,11 +582,20 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
 
     private func publishAfterReply<Value>(
         exemptFromAdmission: @escaping @Sendable () async -> Bool = { false },
+        admissionNames: [Data] = [],
+        admissionItems: [FSItem?] = [],
         _ operation: @escaping () async throws -> Value,
         reply: @escaping (Result<Value, Error>) -> Void
     ) {
         let operation = PfsUncheckedSendableBox(operation)
         let reply = PfsUncheckedSendableBox(reply)
+        // The callback's declared coordinates, for scoped admission: a closed
+        // barrier holds only callbacks that could publish across its repair.
+        // Resolved eagerly — Data is Sendable where FSItem is not.
+        let scopeNames = admissionNames
+        let scopeIdentities = admissionItems.compactMap {
+            ($0 as? PortableFSItem)?.identity.stableIdentity
+        }
         Task {
             // Publication admission comes first: while a coherence barrier is
             // closed, an ordinary cache-producing callback must not even begin
@@ -592,7 +607,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             if let coherence = self.coherence {
                 if await !exemptFromAdmission() {
                     do {
-                        ticket = try await coherence.barrier.admit()
+                        ticket = try await coherence.barrier.admit(
+                            names: scopeNames,
+                            identities: scopeIdentities
+                        )
                     } catch {
                         reply.value(.failure(PfsErrorMapper.fsKitError(for: error)))
                         return
@@ -682,7 +700,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         of item: FSItem,
         replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.attributes(desiredAttributes, of: item)
         }, reply: { result in
             switch result {
@@ -1330,7 +1348,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         on item: FSItem,
         replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.setAttributes(newAttributes, on: item)
         }, reply: { result in
             switch result {
@@ -1345,7 +1363,12 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         inDirectory directory: FSItem,
         replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), {
+        // The lookup is THE repair-resolution path: the actuator's own VFS
+        // syscalls resolve ancestor components through this callback, so a
+        // closed gate that held every lookup deadlocked the repair against
+        // itself. The scope includes the directory so a lookup INSIDE a
+        // directory whose binding is being repaired still waits.
+        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), admissionNames: [name.data], admissionItems: [directory], {
             try await self.lookupItem(named: name, inDirectory: directory)
         }, reply: { result in
             switch result {
@@ -1359,7 +1382,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         _ item: FSItem,
         replyHandler reply: @escaping (Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.reclaimItem(item)
         }, reply: { result in
             switch result {
@@ -1390,7 +1413,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         attributes newAttributes: FSItem.SetAttributesRequest,
         replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), admissionNames: [name.data], {
             try await self.createItem(
                 named: name,
                 type: type,
@@ -1412,7 +1435,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         linkContents contents: FSFileName,
         replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), admissionNames: [name.data], {
             try await self.createSymbolicLink(
                 named: name,
                 inDirectory: directory,
@@ -1433,7 +1456,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         inDirectory directory: FSItem,
         replyHandler reply: @escaping (FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data]), admissionNames: [name.data], {
             try await self.createLink(to: item, named: name, inDirectory: directory)
         }, reply: { result in
             switch result {
@@ -1449,7 +1472,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         fromDirectory directory: FSItem,
         replyHandler reply: @escaping (Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data], items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(reservedNames: [name.data], items: [item]), admissionNames: [name.data], admissionItems: [item], {
             try await self.removeItem(item, named: name, fromDirectory: directory)
         }, reply: { result in
             switch result {
@@ -1518,7 +1541,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         modes: FSVolume.OpenModes,
         replyHandler reply: @escaping (Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.openItem(item, modes: modes)
         }, reply: { result in
             switch result {
@@ -1533,7 +1556,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         modes: FSVolume.OpenModes,
         replyHandler reply: @escaping (Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.closeItem(item, modes: modes)
         }, reply: { result in
             switch result {
@@ -1550,7 +1573,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         into buffer: FSMutableFileDataBuffer,
         replyHandler reply: @escaping (Int, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.read(from: item, at: offset, length: length, into: buffer)
         }, reply: { result in
             switch result {
@@ -1566,7 +1589,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         at offset: off_t,
         replyHandler reply: @escaping (Int, Error?) -> Void
     ) {
-        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), {
+        publishAfterReply(exemptFromAdmission: admissionExemption(items: [item]), admissionItems: [item], {
             try await self.write(contents: contents, to: item, at: offset)
         }, reply: { result in
             switch result {

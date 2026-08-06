@@ -1717,6 +1717,14 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// unmount request can ever race a live pin. See the pin's definition in
 		// runMountForeground.
 		releaseMountTargetPin()
+		// The mount is proven present and serving and nothing is in flight:
+		// the one sound moment to bind the daemon's repair root descriptor.
+		// Deriving it later would mean opening a path on this mount while a
+		// coherence barrier is closed, which asks the extension to serve a
+		// callback for the very repair it is waiting on.
+		if err := ctl.bindMountRoot(attachRef); err != nil {
+			return failAfterKernelMount(fmt.Errorf("bind the daemon's repair mount root: %w", err))
+		}
 		// There is no credential rotation to hand off: the mount capability is
 		// single-use, already consumed by the daemon's attach, and a v3 session
 		// is never re-authenticated from this supervisor.

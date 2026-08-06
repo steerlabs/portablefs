@@ -203,6 +203,28 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
+	case "bind-root":
+		// THE ROOT DESCRIPTOR IS BOUND WHILE THE MOUNT IS PROVEN HEALTHY, and
+		// never re-derived afterwards.
+		//
+		// Every path-based access to an FSKit mount is served by its
+		// extension. A repair actuation runs while the extension's publication
+		// barrier is closed for that exact repair, so opening the mount root
+		// by path AT THAT MOMENT asks the extension to serve a callback for
+		// the repair it is itself waiting on — a circular wait that spends the
+		// whole repair budget and fences the mount. Binding here breaks the
+		// cycle: `portablefs mount` calls this immediately after it has proven
+		// the kernel mount present and serving, when nothing is in flight, and
+		// the daemon keeps that descriptor for the attach's lifetime.
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := a.bindMountRoot(); err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "sync":
 		// The unmount-class durability barrier, exposed so `portablefs umount`
 		// syncs BEFORE the kernel unmount. A v3 attach holds no client-side
