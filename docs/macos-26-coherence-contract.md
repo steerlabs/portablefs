@@ -132,6 +132,12 @@ primitive macOS 26 does provide. The stale window for a cached read on an
 already-open descriptor is therefore bounded by probe confirmation plus one
 forced unmount, inside the authority's one-budget fencing grace; bytes a
 process already copied into its own memory are out of scope on every platform.
+Each forced-unmount attempt is itself bounded to a third of the repair budget
+— never the operator-scale 30-second platform unmount budget — and retried at
+the watchdog interval, so a wedged `/sbin/umount` cannot silently spend twice
+the grace inside one attempt. What no client can bound is a kernel that
+refuses forced unmount past the grace; that refusal is this contract's
+residual, and it is the same shape as a hung kernel on any platform.
 
 The load-bearing kernel claim is live-proven. On a real macOS 26 mount with a
 descriptor held open and its bytes cached, portablefsd was killed with
@@ -496,11 +502,13 @@ contract.
   8.6-second cached-read window before it is the bounded exposure the
   contract declares, and `EIO` from the revocation instant onward is the
   proof the bound is real.
-- Live-kernel evidence now exists for part of the path: a real `pfs` FSKit mount
-  against a real XFS authority served reads, writes, creates, renames,
-  symlinks, enumeration, and rename-over-an-open-descriptor with the strict
-  barrier completing on every mutation, and the authority-restart refusal plus
-  operator fencing assertion drill has been run once end to end.
+- Live-kernel evidence now exists for part of the path: a real `pfs` FSKit
+  mount against a real XFS authority has served reads, writes, creates,
+  renames, symlinks, enumeration, and rename-over-an-open-descriptor with the
+  strict barrier completing on those mutations, and the authority-restart
+  refusal plus operator fencing assertion drill has been run once end to end.
+  What has NOT been shown is a full storm-heavy battery completing green on an
+  identity-verified live mount — see the PREPARE-stall item below.
 - The offline Swift suite establishes operand unforgeability, one-shot
   consumption under concurrency, callback ordering, reserved-namespace refusal at
   the adapter with a mock daemon witnessing that no request crossed the socket,
@@ -533,19 +541,23 @@ mount. The following are therefore unproven:
   by an ordinary process against a real VFS rather than against the arm registry
   directly. This includes the specific question of whether the admission gate
   prevents observation of the transient hidden-rename interval.
-- **Intermittent PREPARE stall under concurrent mutation storms.** Twice
-  under `git init`-class workloads (hundreds of rapid mutations with
-  overlapping callbacks) a live mount missed its repair budget acknowledging
-  a PREPARE and was fenced; the same binaries then survived four consecutive
-  full batteries and repeated git storms on one long-lived mount. The
-  two-writer drain deadlock this suggested is closed — the barrier now
-  releases a callback the moment it parks an authority-ordered mutation, with
-  the exemption unit-tested — but the residual race is not yet root-caused.
-  When it fires the mount fails CLOSED (every operation ENOTCONN; a remount
-  recovers): it is an availability defect under storm, never a coherence
-  defect. Diagnostic instrumentation is now in place at every teardown choke
-  point (client close causes, coherence fail-closed reasons, daemon frontend
-  refusal reasons, bridge terminal causes).
+- **Intermittent PREPARE stall under concurrent mutation storms.** Under
+  `git init`-class workloads (hundreds of rapid mutations with overlapping
+  callbacks) live mounts have repeatedly missed the repair budget
+  acknowledging a PREPARE and been fenced. One contributing deadlock is
+  closed — the barrier now releases a callback the moment it parks an
+  authority-ordered mutation, with the exemption unit-tested — but no
+  storm-heavy battery has yet been proven green on an identity-verified live
+  mount, so the fix has no live survival evidence and the stall is not
+  root-caused. (An earlier revision claimed four surviving batteries; those
+  runs post-dated the mount's death and ran against the bare directory
+  beneath the mountpoint. The battery now asserts the kernel mount's
+  identity before every verdict so that class of false result cannot
+  recur.) When the stall fires the mount fails CLOSED (every operation
+  ENOTCONN; a remount recovers): an availability defect under storm, never a
+  coherence defect. Diagnostic instrumentation is in place at every teardown
+  choke point (client close causes, coherence fail-closed reasons, daemon
+  frontend refusal reasons, bridge terminal causes).
 - **Verified deactivation of durable membership.** The restart-refusal half of
   the drill has been run live: an authority restart was refused while old
   strict membership existed, and the operator fencing assertion cleared it

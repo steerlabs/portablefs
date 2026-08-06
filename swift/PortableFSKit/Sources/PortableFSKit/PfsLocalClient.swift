@@ -267,6 +267,14 @@ private struct PfsPendingRequest: Sendable {
 private struct PfsPublicationTicket: Sendable {
     var connection: PfsConnection
     var operationID: UInt64
+    // The write receipts of every request that carried this operation's ID.
+    // The acknowledgement is gated on them: the ack travels the priority
+    // publication lane, which dequeues ahead of the request lane, so an ack
+    // enqueued while a stamped request is still queued would reach the daemon
+    // before the request that creates the operation — a protocol violation
+    // the daemon answers by closing the whole strict connection. A fast
+    // cancellation produced exactly that ordering.
+    var stampedWrites: [PfsEnvelopeWriteReceipt]
 }
 
 private enum PfsExistingPublicationBinding {
@@ -368,8 +376,13 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         lock.lock()
         let result: [PfsPublicationTicket]
         if let operationID {
+            let writes = stampedWrites
             result = connections.values.map {
-                PfsPublicationTicket(connection: $0, operationID: operationID)
+                PfsPublicationTicket(
+                    connection: $0,
+                    operationID: operationID,
+                    stampedWrites: writes
+                )
             }
         } else {
             result = []
@@ -377,6 +390,17 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         lock.unlock()
         return result
     }
+
+    /// Records the write receipt of a request stamped with this operation's
+    /// ID. The acknowledgement must not be enqueued until every stamped
+    /// request's frame has left the writer; see `PfsPublicationTicket`.
+    func noteStampedWrite(_ receipt: PfsEnvelopeWriteReceipt) {
+        lock.lock()
+        stampedWrites.append(receipt)
+        lock.unlock()
+    }
+
+    private var stampedWrites: [PfsEnvelopeWriteReceipt] = []
 }
 
 private enum PfsPublicationContext {
@@ -1165,6 +1189,11 @@ public actor PfsLocalClient {
                     outboundEnvelope,
                     lane: lane
                 )
+                if operationID != 0 {
+                    // The operation's acknowledgement is gated on this frame
+                    // having left the writer; see PfsPublicationTicket.
+                    PfsPublicationContext.collector?.noteStampedWrite(writeReceipt)
+                }
                 Task.detached { [connectionID = connection.id, writeReceipt] in
                     do {
                         try await writeReceipt.wait()
@@ -1182,6 +1211,16 @@ public actor PfsLocalClient {
 
     private nonisolated func completePublications(_ tickets: [PfsPublicationTicket]) async {
         for ticket in tickets {
+            // Every stamped request frame must have left the writer before the
+            // acknowledgement is enqueued: the ack's priority lane would
+            // otherwise overtake a still-queued request, and the daemon
+            // rightly kills a connection that acknowledges an operation it
+            // has never been shown. A failed write resolves its receipt too —
+            // the connection is already closed then, and the ack enqueue
+            // below surfaces that through the existing terminal path.
+            for receipt in ticket.stampedWrites {
+                try? await receipt.wait()
+            }
             var ack = PfsPublicationAck()
             ack.operationID = ticket.operationID
             var envelope = PfsEnvelope()

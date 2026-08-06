@@ -12,8 +12,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
 // These tests pin the two live-battery failures against the daemon-v3 umount
@@ -56,7 +58,7 @@ func stubPlatformUnmount(t *testing.T, present *atomic.Bool) *atomic.Int32 {
 	t.Helper()
 	var detaches atomic.Int32
 	prior := platformUnmountOpsSource
-	platformUnmountOpsSource = func() unmountOps {
+	platformUnmountOpsSource = func(time.Duration) unmountOps {
 		return unmountOps{
 			goos: "darwin",
 			combinedOut: func(name string, args ...string) ([]byte, error) {
@@ -208,7 +210,14 @@ func TestForcedRevocationDetachesTheExactRecordedMount(t *testing.T) {
 	present := stubV3KernelMount(t, st)
 	var forced atomic.Int32
 	prior := platformUnmountOpsSource
-	platformUnmountOpsSource = func() unmountOps {
+	platformUnmountOpsSource = func(budget time.Duration) unmountOps {
+		// The revocation must never inherit the operator-scale platform
+		// budget: one attempt is bounded to a third of the repair budget so
+		// a wedged /sbin/umount cannot blow through the fencing grace it
+		// exists to honor.
+		if budget != mountv3.RepairBudget/3 {
+			t.Errorf("forced revocation budget = %v, want %v", budget, mountv3.RepairBudget/3)
+		}
 		return unmountOps{
 			goos: "darwin",
 			combinedOut: func(name string, args ...string) ([]byte, error) {

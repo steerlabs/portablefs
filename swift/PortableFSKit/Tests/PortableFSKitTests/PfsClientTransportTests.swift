@@ -397,6 +397,59 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
 }
 
+/// The lane-overtake race, pinned. A publishing request travels the ordinary
+/// lane; its operation's acknowledgement travels the priority publication
+/// lane, which the writer dequeues first. An immediate cancellation once let
+/// the acknowledgement reach the daemon before the request that creates the
+/// operation, and the daemon rightly closed the whole strict connection. The
+/// mock daemon now keeps the real reader's obligation ledger, so any
+/// recurrence kills the connection and fails the follow-up below.
+@Test func immediateCancellationNeverLetsTheAckOvertakeItsRequest() async throws {
+    var contract = PfsV3CoherenceContract()
+    contract.authorityProtocolMajor = 2
+    contract.authorityEpoch = Data(repeating: 0xE2, count: 16)
+    contract.sessionID = Data(repeating: 0x52, count: 16)
+    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
+    contract.repairBudgetMillis = 2_500
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(lookupNoReplyNames: ["hung"], v3Coherence: contract)
+    )
+    defer { daemon.stop() }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(requestDeadlineNanoseconds: 5_000_000_000)
+    )
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    for _ in 0..<25 {
+        let hung = Task {
+            try await client.withPublicationBoundary {
+                var request = PfsLookupRequest()
+                request.dir = resolved.root
+                request.name = transportBytes("hung")
+                return try await client.request(.lookup(request))
+            }
+        }
+        hung.cancel()
+        _ = try? await hung.value
+    }
+    // Give the boundary acknowledgements time to drain through the daemon's
+    // ledger before the liveness probe.
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    var followUp = PfsLookupRequest()
+    followUp.dir = resolved.root
+    followUp.name = transportBytes("alive-after-storm")
+    do {
+        _ = try await client.request(.lookup(followUp))
+    } catch let error as PfsLocalClientError {
+        guard case .daemon = error else {
+            Issue.record("an immediately-cancelled request cost the strict connection: \(error)")
+            return
+        }
+    }
+}
+
 @Test func eventsAreResubscribedAfterReconnect() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }

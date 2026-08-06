@@ -110,7 +110,16 @@ func (w *fskitRevocationWatchdog) decide(result fskitRevocationProbeResult) (boo
 // attempting once the kernel mount is gone. With the daemon or its attach
 // gone there is nothing to drain in v3 — every acknowledged write is already
 // durable at the authority — and the session ends fenced either way.
+//
+// It probes NOW rather than trusting the last observation. The kernel mount
+// can disappear before the watchdog's first interval ever elapses — daemon
+// and extension dying together does exactly that — and the stored observation
+// is then still the optimistic initial one. Deciding on it left a supervisor
+// retrying a dead daemon's barrier forever: a zombie process guarding a
+// mount that no longer existed.
 func (w *fskitRevocationWatchdog) daemonCanFinalize() bool {
+	w.lastResult = w.probe()
+	w.last = time.Now()
 	return w.lastResult.daemonHealthy && w.lastResult.attachPresent
 }
 
@@ -157,7 +166,14 @@ func forceRevokeFSKitKernelMount(st *mountState) error {
 	if !present {
 		return nil
 	}
-	ops := platformUnmountOpsSource()
+	// One attempt is bounded to a third of the repair budget — the watchdog's
+	// own probe interval — never the operator-scale platform budget: the
+	// revocation exists to fit inside the authority's one-budget fencing
+	// grace, and a helper allowed to block for 30 seconds would blow through
+	// the very bound it enforces. A wedged attempt is abandoned and retried
+	// at the next watchdog interval; a kernel that refuses forced unmount
+	// within the grace is the residual the coherence contract records.
+	ops := platformUnmountOpsSource(mountv3.RepairBudget / 3)
 	argv := []string{"/sbin/umount", "-f", st.MountPath}
 	out, err := ops.combinedOut(argv[0], argv[1:]...)
 	if err != nil {

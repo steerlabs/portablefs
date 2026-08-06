@@ -106,13 +106,17 @@ func TestRevocationWatchdogTreatsADetachingAttachAsHealthy(t *testing.T) {
 	}
 }
 
-func TestRevocationWatchdogFinalizationFollowsTheLastObservation(t *testing.T) {
-	w := watchdogWithResults(fskitRevocationProbeResult{})
-	if !w.daemonCanFinalize() {
-		t.Fatal("before any probe the daemon barrier must still be attempted")
+// The kernel mount can vanish before the watchdog's first interval elapses —
+// daemon and extension dying together does exactly that — so the finalization
+// decision must probe NOW. Trusting the optimistic initial observation left a
+// zombie supervisor retrying a dead daemon's barrier forever.
+func TestFinalizationProbesTheDaemonNowNotTheLastObservation(t *testing.T) {
+	dead := watchdogWithResults(fskitRevocationProbeResult{})
+	if dead.daemonCanFinalize() {
+		t.Fatal("a dead daemon's barrier would be retried forever; finalization must probe now")
 	}
-	advanceObserve(t, w, 1)
-	if w.daemonCanFinalize() {
-		t.Fatal("with the daemon gone the barrier must not be retried forever")
+	live := watchdogWithResults(fskitRevocationProbeResult{daemonHealthy: true, attachPresent: true})
+	if !live.daemonCanFinalize() {
+		t.Fatal("a live daemon that owns the attach must still run its barrier")
 	}
 }

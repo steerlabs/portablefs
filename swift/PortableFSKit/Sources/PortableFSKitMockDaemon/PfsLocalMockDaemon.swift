@@ -427,6 +427,33 @@ private final class MockSession: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// Mirrors the real daemon's obligation ledger: an operation exists on
+    /// this connection once its ID appears on a request, and it may be
+    /// acknowledged exactly once. The real frontend reader closes the whole
+    /// connection on a violation, so the mock must too — a lenient mock once
+    /// hid an ack that overtook its own request on the priority lane.
+    func noteOperationID(_ id: UInt64) {
+        guard id != 0 else { return }
+        stateLock.lock()
+        seenOperationIDs.insert(id)
+        stateLock.unlock()
+    }
+
+    func acknowledgeOperation(_ id: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard id != 0,
+              seenOperationIDs.contains(id),
+              !acknowledgedOperationIDs.contains(id) else {
+            return false
+        }
+        acknowledgedOperationIDs.insert(id)
+        return true
+    }
+
+    private var seenOperationIDs: Set<UInt64> = []
+    private var acknowledgedOperationIDs: Set<UInt64> = []
+
     func send(_ envelope: PfsEnvelope) throws {
         ioLock.lock()
         defer { ioLock.unlock() }
@@ -751,6 +778,7 @@ private actor MockFileSystem {
     }
 
     func handle(_ envelope: PfsEnvelope, session: MockSession) async -> PfsEnvelope {
+        session.noteOperationID(envelope.operationID)
         var reply = PfsEnvelope()
         reply.requestID = envelope.requestID
         do {
@@ -1143,10 +1171,18 @@ private actor MockFileSystem {
             case .subscribeEvents:
                 session.setSubscribed()
                 reply.body = .subscribeEventsReply(PfsSubscribeEventsReply())
-            case .publicationAck:
+            case let .publicationAck(request):
                 // One-way publication completion; requestID zero keeps the
-                // empty mock envelope outside the request multiplexer.
-                publicationAcks += 1
+                // empty mock envelope outside the request multiplexer. The
+                // ledger check mirrors the real daemon: an ack for an
+                // operation this connection never showed on a request — for
+                // example one that overtook its own request on the priority
+                // lane — or a duplicate ack, closes the connection.
+                if session.acknowledgeOperation(request.operationID) {
+                    publicationAcks += 1
+                } else {
+                    session.close()
+                }
                 break
             case let .visibilityAck(request):
                 visibilityAcks.append(request)
