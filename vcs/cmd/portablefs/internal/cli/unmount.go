@@ -40,17 +40,28 @@ var platformUnmountBudget = 30 * time.Second
 // kernel mount table (which always answers) to decide.
 var errPlatformUnmountAbandoned = errors.New("platform unmount helper did not return within its budget")
 
-func hostUnmountOps() unmountOps {
+// hostUnmountOps takes its helper budget explicitly because different callers
+// answer to different clocks: an operator-driven `portablefs umount` may wait
+// the full platform budget, but the revocation watchdog acts inside the
+// authority's fencing grace and a 30-second helper wait would blow straight
+// through a 15-second budget it exists to honor.
+func hostUnmountOps(budget time.Duration) unmountOps {
 	return unmountOps{
 		goos:           runtime.GOOS,
 		direct:         unix.Unmount,
-		combinedOut:    boundedCombinedOutput,
+		combinedOut:    boundedCombinedOutputWithBudget(budget),
 		validateHelper: mounthost.ValidateFUSEHelper,
 	}
 }
 
-func boundedCombinedOutput(name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), platformUnmountBudget)
+func boundedCombinedOutputWithBudget(budget time.Duration) func(string, ...string) ([]byte, error) {
+	return func(name string, args ...string) ([]byte, error) {
+		return boundedCombinedOutput(budget, name, args...)
+	}
+}
+
+func boundedCombinedOutput(budget time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	// A DETACH IS NEVER AN INTERACTIVE ACT. Handing the helper this process's
@@ -64,14 +75,15 @@ func boundedCombinedOutput(name string, args ...string) ([]byte, error) {
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
-		return out, fmt.Errorf("%w after %s", errPlatformUnmountAbandoned, platformUnmountBudget)
+		return out, fmt.Errorf("%w after %s", errPlatformUnmountAbandoned, budget)
 	}
 	return out, err
 }
 
 // platformUnmountOpsSource is a var so tests substitute the exec surface;
-// production never changes it.
-var platformUnmountOpsSource = hostUnmountOps
+// production never changes it. The budget is the caller's declared ceiling on
+// one helper run, and test substitutes receive it so they can assert it.
+var platformUnmountOpsSource func(time.Duration) unmountOps = hostUnmountOps
 
 // platformUnmountRecorded proves that the exact recorded kernel object is
 // the sole mount at the path immediately before issuing the path-based
@@ -85,7 +97,7 @@ func platformUnmountRecorded(st *mountState) error {
 	if !present {
 		return fmt.Errorf("refuse path unmount because the exact recorded kernel mount is absent")
 	}
-	return platformUnmountWith(st, platformUnmountOpsSource())
+	return platformUnmountWith(st, platformUnmountOpsSource(platformUnmountBudget))
 }
 
 func platformUnmountWith(st *mountState, ops unmountOps) error {

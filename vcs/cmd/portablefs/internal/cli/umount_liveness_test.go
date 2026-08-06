@@ -76,12 +76,8 @@ func TestPlatformUnmountHelperIsAbandonedRatherThanWaitedOn(t *testing.T) {
 	if sleep == "" {
 		t.Skip("no sleep binary available to model a wedged unmount helper")
 	}
-	restore := platformUnmountBudget
-	platformUnmountBudget = 150 * time.Millisecond
-	t.Cleanup(func() { platformUnmountBudget = restore })
-
 	start := time.Now()
-	_, err := boundedCombinedOutput(sleep, "30")
+	_, err := boundedCombinedOutput(150*time.Millisecond, sleep, "30")
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("a helper that never returns must not be reported as a completed unmount")

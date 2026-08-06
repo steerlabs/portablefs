@@ -2,9 +2,27 @@
 # PortableFS live-mount verification battery. Run with the volume mounted at $1 (default /tmp/pfs-live/mnt).
 set -u
 MNT="${1:-/tmp/pfs-live/mnt}"
+FSTYPE="${PFS_BATTERY_FSTYPE:-pfs}"
 PASS=0; FAIL=0
-ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+
+# THE MOUNT IDENTITY IS ASSERTED BEFORE EVERY VERDICT. A PortableFS mount that
+# dies mid-run leaves an ordinary directory underneath the mountpoint, and
+# every remaining case then "passes" against local disk — a full battery once
+# reported 14 green cases against bare APFS because its liveness check was a
+# plain `ls`, which a bare directory satisfies. The kernel mount table is the
+# only witness that does not traverse the filesystem, so it is consulted from
+# the verdict functions themselves: a vanished mount voids the run loudly
+# instead of counting local-disk passes.
+mount_alive() { /sbin/mount | /usr/bin/grep -q " on $MNT ($FSTYPE" ; }
+void_run() {
+  echo "BATTERY VOID: the $FSTYPE mount at $MNT is gone; every further case would run against the bare directory"
+  echo; echo "RESULT: VOID ($PASS passed, $FAIL failed before the mount vanished)"
+  exit 2
+}
+ok()   { mount_alive || void_run; PASS=$((PASS+1)); echo "PASS: $1"; }
+bad()  { mount_alive || void_run; FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+
+mount_alive || { echo "refusing to run: no $FSTYPE mount at $MNT (found only the underlying directory)"; exit 2; }
 T="$MNT/battery-$$"
 mkdir -p "$T" || { echo "cannot create test dir"; exit 1; }
 
@@ -67,28 +85,19 @@ d = os.pread(fd, 10, 0); os.close(fd)
 sys.exit(0 if d == b"data" else 1)
 EOF
 
-# 11. cross-client visibility (control API write -> kernel)
-python3 - "$T" <<'EOF' && ok "cross-client visibility" || bad "cross-client visibility"
-import base64, json, subprocess, sys, time, os
-t = sys.argv[1]
-rel = os.path.relpath(f"{t}/ext.txt", os.path.expanduser("/tmp/pfs-live/mnt"))
-body = json.dumps({"path": rel, "dataBase64": base64.b64encode(b"ext").decode()})
-subprocess.run(["curl","-s","--unix-socket","/tmp/pfs-live/run/control.sock","-X","POST","-H","content-type: application/json","-d",body,
-  "http://portablefsd/v1/attaches/att_O8vC7SepSumfOlqnM0VArp/fs/write"],check=True,capture_output=True)
-deadline = time.time()+5
-while time.time() < deadline:
-    try:
-        if open(f"{t}/ext.txt","rb").read() == b"ext": sys.exit(0)
-    except FileNotFoundError: pass
-    time.sleep(0.05)
-sys.exit(1)
-EOF
+# The v2-era "cross-client visibility" case is gone: it drove a retired
+# daemon control-API write route against a hard-coded socket and attach ref,
+# so it could only ever fail. Cross-client visibility is a two-mount property
+# and is proven by the coherence matrix (scripts/coherence-matrix-*.sh), not
+# by a single-mount battery.
 
 # 12. deep tree + enumerate
 mkdir -p "$T/deep/a/b/c" && for i in $(seq 1 60); do echo $i > "$T/deep/a/f$i"; done
 [ "$(ls "$T/deep/a" | wc -l | tr -d ' ')" = "61" ] && ok "60-entry enumerate" || bad "60-entry enumerate"
 
-# cleanup
+# cleanup — and one final identity assertion, so a mount that died after the
+# last case cannot present a green RESULT line.
+mount_alive || void_run
 rm -rf "$T"
 echo; echo "RESULT: $PASS passed, $FAIL failed"
 exit $FAIL
