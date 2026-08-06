@@ -69,6 +69,10 @@ func boundedCombinedOutput(name string, args ...string) ([]byte, error) {
 	return out, err
 }
 
+// platformUnmountOpsSource is a var so tests substitute the exec surface;
+// production never changes it.
+var platformUnmountOpsSource = hostUnmountOps
+
 // platformUnmountRecorded proves that the exact recorded kernel object is
 // the sole mount at the path immediately before issuing the path-based
 // detach. This prevents path reuse or a stacked foreign mount from turning a
@@ -81,7 +85,7 @@ func platformUnmountRecorded(st *mountState) error {
 	if !present {
 		return fmt.Errorf("refuse path unmount because the exact recorded kernel mount is absent")
 	}
-	return platformUnmountWith(st, hostUnmountOps())
+	return platformUnmountWith(st, platformUnmountOpsSource())
 }
 
 func platformUnmountWith(st *mountState, ops unmountOps) error {
