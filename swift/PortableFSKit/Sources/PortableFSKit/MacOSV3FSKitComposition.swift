@@ -398,15 +398,17 @@ public enum PfsMacOSMountRootLocator {
             throw PfsMacOSCoherenceError.posix(operation: "read mount table", errno: errno)
         }
 
+        var scanned: [String] = []
         for index in 0..<Int(min(filled, count)) {
             var entry = entries[index]
             let typeName = withUnsafeBytes(of: &entry.f_fstypename) { raw in
                 String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
             }
-            guard typeName == fileSystemTypeName else { continue }
             let source = withUnsafeBytes(of: &entry.f_mntfromname) { raw in
                 String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
             }
+            scanned.append("\(typeName):\(source)")
+            guard typeName == fileSystemTypeName else { continue }
             guard source.contains(attachRef) else { continue }
             let mountPath = withUnsafeBytes(of: &entry.f_mntonname) { raw in
                 String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
@@ -419,11 +421,21 @@ public enum PfsMacOSMountRootLocator {
             }
             var status = stat()
             guard fstat(fd, &status) == 0, status.st_ino == expectedRootFileID else {
+                let observed = status.st_ino
                 close(fd)
+                pfsClientLogger.error(
+                    "repair mount root attestation failed: st_ino \(observed) != expected \(expectedRootFileID) for \(fileSystemTypeName):\(attachRef, privacy: .public)"
+                )
                 throw PfsMacOSCoherenceError.posix(operation: "attest repair mount root", errno: ENXIO)
             }
             return fd
         }
+        // The failure that fenced the first live peer repair logged nothing
+        // about WHAT the sandboxed extension actually saw in its mount table;
+        // name every scanned entry so the next failure identifies itself.
+        pfsClientLogger.error(
+            "repair mount root not found for \(fileSystemTypeName, privacy: .public):\(attachRef, privacy: .public); scanned \(scanned.count) entries: \(scanned.joined(separator: ", "), privacy: .public)"
+        )
         throw PfsMacOSCoherenceError.posix(operation: "locate repair mount root", errno: ENXIO)
     }
 }

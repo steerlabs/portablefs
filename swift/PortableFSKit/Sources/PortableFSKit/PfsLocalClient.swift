@@ -501,6 +501,12 @@ public actor PfsLocalClient {
         eventSink.stream
     }
 
+    /// The socket path this client dials, resolved through the same provider
+    /// the connection uses. The mount-root handoff socket lives beside it.
+    public func currentSocketPath() async throws -> String {
+        try await socketPathProvider()
+    }
+
     public init(socketPath: String, configuration: Configuration = Configuration()) {
         self.socketPathProvider = { socketPath }
         self.configuration = configuration
