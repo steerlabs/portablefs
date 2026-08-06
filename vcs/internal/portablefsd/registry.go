@@ -1086,6 +1086,12 @@ func (r *registry) closeAll(ctx context.Context) error {
 }
 
 type attach struct {
+	// mountRootFD is this attach's kernel mount root, bound while the mount
+	// was proven healthy (see bindMountRoot). Zero means unbound. Every
+	// path-based access to an FSKit mount is served by its own extension, so
+	// this descriptor must never be re-derived during a coherence barrier.
+	mountRootFD int
+
 	ref                 string
 	key                 string
 	volumeID            string

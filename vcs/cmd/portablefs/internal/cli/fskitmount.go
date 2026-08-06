@@ -483,6 +483,22 @@ func (c *fsdControl) syncAttach(ref string) (syncVerdict, error) {
 // unmountAttach is the normal FSKit teardown transaction. portablefsd owns
 // the admission gate, final durability barrier, exact kernel identity check,
 // in-process kernel unmount, and durable attach removal in one request.
+// bindMountRoot tells the daemon to open and keep this attach's kernel mount
+// root. It is called exactly once, immediately after the mount is proven
+// present and serving: the macOS repair actuator runs through the daemon, and
+// a daemon that opened the root by path during a coherence barrier would be
+// asking the extension to serve a callback for the repair it is waiting on.
+func (c *fsdControl) bindMountRoot(ref string) error {
+	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/bind-root", nil)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return controlError(status, body)
+	}
+	return nil
+}
+
 func (c *fsdControl) unmountAttach(ref string) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/unmount", nil)
 	if err != nil {

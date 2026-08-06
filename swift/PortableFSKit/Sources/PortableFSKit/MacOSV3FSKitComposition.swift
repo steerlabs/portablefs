@@ -191,6 +191,18 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     private var terminal: Error?
     private var admitted: [ObjectIdentifier: PfsMacOSAdmittedCallbackTicket] = [:]
     private var admissionWaiters: [CheckedContinuation<Void, Error>] = []
+    // The closed barrier's affected coordinates. A closed gate holds only
+    // callbacks that could publish across THIS barrier's repair; everything
+    // else is admitted, because the repair actuator's own VFS syscalls
+    // resolve pathnames through the very kernel this extension serves, and
+    // those resolution upcalls are ordinary lookups of UNAFFECTED ancestor
+    // components. Holding them deadlocked the first live peer repair for its
+    // whole budget: the repair waited on a lookup the gate was holding for
+    // the repair. Empty sets mean the barrier is unscoped and holds
+    // everything, which is the conservative reading of an event that carried
+    // no repair coordinates.
+    private var closedAffectedNames: Set<Data> = []
+    private var closedAffectedIdentities: Set<Data> = []
 
     public init(localAuthoritySessionID: Data) throws {
         guard localAuthoritySessionID.count == 16 else {
@@ -203,9 +215,20 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     /// closed. Throws once the barrier has failed terminally: a mount whose
     /// coherence session is over must not publish anything further.
     public func admit() async throws -> PfsMacOSAdmittedCallbackTicket {
+        try await admit(names: [], identities: [])
+    }
+
+    /// Scoped admission: a callback that declares its coordinates is held by
+    /// a closed gate only when those coordinates intersect the barrier's
+    /// affected set. An undeclared callback (empty scope) always waits — the
+    /// gate can only be as precise as what the caller tells it.
+    public func admit(
+        names: [Data],
+        identities: [Data]
+    ) async throws -> PfsMacOSAdmittedCallbackTicket {
         while true {
             if let terminal { throw terminal }
-            if !closed {
+            if !closed || bypassesClosedGate(names: names, identities: identities) {
                 let ticket = PfsMacOSAdmittedCallbackTicket()
                 admitted[ObjectIdentifier(ticket)] = ticket
                 return ticket
@@ -214,6 +237,50 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
                 admissionWaiters.append(continuation)
             }
         }
+    }
+
+    private func bypassesClosedGate(names: [Data], identities: [Data]) -> Bool {
+        guard !closedAffectedNames.isEmpty || !closedAffectedIdentities.isEmpty else {
+            return false
+        }
+        guard !names.isEmpty || !identities.isEmpty else {
+            return false
+        }
+        for name in names where closedAffectedNames.contains(name) {
+            return false
+        }
+        for identity in identities where closedAffectedIdentities.contains(identity) {
+            return false
+        }
+        return true
+    }
+
+    private static func affectedCoordinates(
+        of repairs: [PfsMacOSCacheRepair]
+    ) -> (names: Set<Data>, identities: Set<Data>) {
+        var names: Set<Data> = []
+        var identities: Set<Data> = []
+        for repair in repairs {
+            switch repair {
+            case let .purgeNegative(_, _, name):
+                names.insert(name)
+            case let .evictBinding(path, _, itemIdentity):
+                if let name = path.name {
+                    names.insert(name)
+                }
+                identities.insert(itemIdentity.bytes)
+            case let .invalidateData(path, _, itemIdentity, _, _):
+                if let name = path.name {
+                    names.insert(name)
+                }
+                identities.insert(itemIdentity.bytes)
+            case let .invalidateDataObject(_, itemIdentity, _):
+                identities.insert(itemIdentity.bytes)
+            case let .invalidateAttributesObject(_, itemIdentity):
+                identities.insert(itemIdentity.bytes)
+            }
+        }
+        return (names, identities)
     }
 
     /// Marks the callback's reply as having crossed the framework publication
@@ -230,6 +297,9 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     public func prepare(_ event: PfsMacOSCoherenceEvent) async throws {
         if let terminal { throw terminal }
         closed = true
+        let affected = Self.affectedCoordinates(of: event.repairs)
+        closedAffectedNames = affected.names
+        closedAffectedIdentities = affected.identities
         let exemptOperationID = event.initiator.sessionID == localAuthoritySessionID
             ? event.initiator.localOperationID
             : nil
@@ -283,6 +353,8 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
             }
         }
         closed = false
+        closedAffectedNames = []
+        closedAffectedIdentities = []
         let waiters = admissionWaiters
         admissionWaiters.removeAll()
         for waiter in waiters {
@@ -299,6 +371,8 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         guard terminal == nil else { return }
         terminal = error
         closed = false
+        closedAffectedNames = []
+        closedAffectedIdentities = []
         let waiters = admissionWaiters
         admissionWaiters.removeAll()
         for waiter in waiters {
@@ -541,7 +615,8 @@ public final class PfsMacOSV3VolumeCoherence: @unchecked Sendable {
     static func compose(
         client: PfsLocalClient,
         resolved: PfsResolveReply,
-        contract: PfsMacOSV3LocalContract
+        contract: PfsMacOSV3LocalContract,
+        daemonActuation: (socketPath: String, attachRef: String)? = nil
     ) async throws -> PfsMacOSV3VolumeCoherence {
         let rootIdentity = try PfsMacOSStableIdentity(resolved.root.stableIdentity)
         let namespaceIndex = PfsMacOSNamespaceIndex(rootIdentity: rootIdentity)
@@ -570,11 +645,26 @@ public final class PfsMacOSV3VolumeCoherence: @unchecked Sendable {
             localAuthoritySessionID: contract.sessionID
         )
         let actuator = PfsMacOS26DeferredMountActuator()
+        // The repair syscalls are ISSUED by portablefsd, not this extension:
+        // the sandbox forbids the extension write-class VFS operations on its
+        // own mount, so the daemon performs the motion and this process
+        // authenticates the resulting kernel callbacks through the armed
+        // registry. When no daemon channel is supplied (offline tests), the
+        // in-process deferred actuator remains the backend's actuator.
+        let repairActuator: any PfsMacOS26RepairActuator
+        if let daemonActuation {
+            repairActuator = PfsMacOS26DaemonActuator(
+                socketPath: daemonActuation.socketPath,
+                attachRef: daemonActuation.attachRef
+            )
+        } else {
+            repairActuator = actuator
+        }
         let backend = try PfsMacOS26CoherenceBackend(
             localAuthoritySessionID: contract.sessionID,
             authenticator: authenticator,
             armer: registry,
-            actuator: actuator,
+            actuator: repairActuator,
             publicationBarrier: barrier
         )
         let runner = try await transport.makeRunner(backend: backend)

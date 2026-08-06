@@ -571,10 +571,25 @@ mount. The following are therefore unproven:
   whose mount-absence claim is corroborated by the configured verification
   command and deactivates membership without any operator assertion — has not
   been observed live.
-- **The live cross-platform matrix.** `scripts/coherence-matrix-macos.sh` runs the
-  same 23 cases against two already-mounted paths, including a remote Linux peer.
-  It has not been run against a live macOS mount, so no macOS-to-Linux result
-  exists.
+- **Cross-mount visibility on macOS — the central open item.** The matrix has
+  now been RUN live (macOS 26.5 FSKit mount + Linux 6.8 FUSE mount, one XFS
+  authority): 0/23, because the macOS mount was fenced at the first peer
+  repair. That run was worth more than its score, because it exposed three
+  premises that were false and are now fixed at the root: the macOS sandbox
+  hides an extension's own mount from `getfsstat` (so in-process mount-root
+  location can never work — the daemon now hands the descriptor across via
+  SCM_RIGHTS); the sandbox also denies the extension write-class VFS
+  operations on its own mount (so the daemon now issues the repair syscalls
+  itself, with the extension still sole authority over what its HMAC-armed
+  registry admits); and the mount root must be bound while the mount is
+  proven healthy, because opening it during a barrier asks the extension to
+  serve a callback for the repair it is waiting on. After those fixes a live
+  peer mutation completed with the barrier intact and BOTH mounts surviving —
+  the first time that has ever happened — but the mutation was still not
+  observed on the macOS side, so cross-mount visibility itself remains
+  unproven. That, not the matrix score, is the honest state: single-mount
+  macOS behaviour is solid and measured; simultaneous macOS↔Linux coherence
+  is not yet demonstrated.
 - **Bounded barrier latency under metadata-heavy workloads.**
 
 ### macOS 27
