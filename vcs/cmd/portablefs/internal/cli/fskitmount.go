@@ -388,6 +388,10 @@ type cliAttachStatus struct {
 	Branch    string `json:"branch"`
 	State     string `json:"state"`
 	LastError string `json:"lastError"`
+	// SessionTerminal is the daemon's machine-readable verdict that this
+	// attach's v3 authority session ended permanently; the mount supervisor's
+	// revocation watchdog branches on it.
+	SessionTerminal bool `json:"sessionTerminal"`
 }
 
 // errFskitAttachIdentityMismatch marks a daemon attach that carries the

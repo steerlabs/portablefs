@@ -605,6 +605,10 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 	if status.State != "degraded" || !strings.Contains(status.LastError, "TERMINAL") {
 		t.Fatalf("terminal v3 status = %+v", status)
 	}
+	// The revocation watchdog branches on the boolean, never on the prose.
+	if !status.SessionTerminal {
+		t.Fatalf("terminal v3 status did not set the machine-readable verdict: %+v", status)
+	}
 	// Never a silent retry, never a fallback: the terminal attach refuses
 	// reactivation and names the unmount as the one exit.
 	if err := a.activate(context.Background(), "fresh-capability", 0); err == nil ||

@@ -115,16 +115,26 @@ must make the old kernel cache unservable before the obligation is discharged.
 This bounds one failed phase at two budgets (its phase deadline plus fencing
 grace) without converting a broken laptop into an indefinite volume-wide outage.
 
-That paragraph is the required end-state. The Linux half of it is implemented and
-tested; the macOS half is not. The Swift runner races each delivered phase
-against the negotiated repair budget, cancels the repair, reports the cursor
-blocked, and terminates its pfslocal client and runner when the timer wins.
-Those actions stop the extension from participating in the authority session,
-but macOS 26 FSKit exposes no API that proves already-cached kernel state became
-unservable. The watchdog therefore detects and terminates; it does **not**
-self-revoke or force-unmount the kernel mount. That is an open gate, listed
-below, and it is the single largest difference between the declared policy and
-the exact contract Linux meets.
+That paragraph is the required end-state. The Linux half of it is implemented
+and tested. The macOS half is implemented in two cooperating layers. The Swift
+runner races each delivered phase against the negotiated repair budget,
+cancels the repair, reports the cursor blocked, and terminates its pfslocal
+client and runner when the timer wins — but macOS 26 FSKit exposes no API that
+proves already-cached kernel state became unservable, so the runner alone can
+only detect and terminate. The revocation itself lives in the per-mount
+supervisor process (`cmd/portablefs/internal/cli/fskit_revocation.go`), which
+is daemon-independent by construction: it probes the daemon's attach status at
+one third of the repair budget, and when the session is terminal, the daemon
+is unreachable, or the daemon no longer owns the attach, it force-unmounts the
+exact identity-proven kernel mount. `MNT_FORCE` revokes the covered vnodes at
+the VFS layer, which dead-ends every cached page — the one revocation
+primitive macOS 26 does provide. The stale window for a cached read on an
+already-open descriptor is therefore bounded by probe confirmation plus one
+forced unmount, inside the authority's one-budget fencing grace; bytes a
+process already copied into its own memory are out of scope on every platform.
+What remains open, below, is the live-kernel proof that a forced unmount of an
+FSKit volume revokes cached reads on held-open descriptors the way it does for
+kext-era filesystems.
 
 What is *not* traded away: the fenced mount stays in durable membership, so the
 authority-restart gate below still applies to it in full. Availability is
@@ -469,6 +479,18 @@ contract.
   above, with the residual coalescing stated rather than hidden.
 - The authority carries kernel-cache coordination facts explicitly, so a strict
   repair against real XFS addresses the coordinate the frontend actually keys on.
+- The revocation watchdog is implemented in the per-mount supervisor: probes at
+  one third of the repair budget, confirmed daemon-death detection, one-probe
+  revocation of a terminal session (the daemon reports terminality as a
+  machine-readable field, not prose), identity-proven forced unmount, and local
+  finalization when no daemon barrier remains to run. The decision logic and the
+  forced detach are unit-tested; the kernel-side revocation effect is the open
+  gate below.
+- Live-kernel evidence now exists for part of the path: a real `pfs` FSKit mount
+  against a real XFS authority served reads, writes, creates, renames,
+  symlinks, enumeration, and rename-over-an-open-descriptor with the strict
+  barrier completing on every mutation, and the authority-restart refusal plus
+  operator fencing assertion drill has been run once end to end.
 - The offline Swift suite establishes operand unforgeability, one-shot
   consumption under concurrency, callback ordering, reserved-namespace refusal at
   the adapter with a mock daemon witnessing that no request crossed the socket,
@@ -501,15 +523,21 @@ mount. The following are therefore unproven:
   by an ordinary process against a real VFS rather than against the arm registry
   directly. This includes the specific question of whether the admission gate
   prevents observation of the transient hidden-rename interval.
-- **Watchdog kernel-cache withdrawal.** A terminal action that makes the exact
-  macOS kernel mount unservable, or force-unmounts it and proves absence. Closing
-  pfslocal, cancelling the runner, and fencing authority credentials do not revoke
-  data already resident in the macOS kernel cache. This is the gate that keeps the
-  fencing grace from being load-bearing on macOS.
-- **Durable membership across authority restart.** The membership record and the
-  mount-absence verification command exist and are wired; the drill — restart the
-  authority with a live old mount and observe the refusal, then the verified
-  deactivation — has not been run end to end.
+- **Forced-unmount revocation semantics.** The watchdog's mechanism is
+  implemented and unit-tested, but the load-bearing kernel claim is not yet
+  proven live: that `umount -f` of an FSKit volume revokes the covered vnodes
+  so a subsequent read on an already-open descriptor fails instead of
+  answering from the kernel's cache, as it does for kext-era filesystems. The
+  experiment is one afternoon on a live mount — read, hold the descriptor,
+  kill portablefsd, force-unmount, demand the next `pread` fail — and until it
+  is run the fencing grace remains load-bearing on macOS.
+- **Verified deactivation of durable membership.** The restart-refusal half of
+  the drill has been run live: an authority restart was refused while old
+  strict membership existed, and the operator fencing assertion cleared it
+  after the kernel mount was proven absent. The other half — a clean detach
+  whose mount-absence claim is corroborated by the configured verification
+  command and deactivates membership without any operator assertion — has not
+  been observed live.
 - **The live cross-platform matrix.** `scripts/coherence-matrix-macos.sh` runs the
   same 23 cases against two already-mounted paths, including a remote Linux peer.
   It has not been run against a live macOS mount, so no macOS-to-Linux result

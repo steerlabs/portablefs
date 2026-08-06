@@ -1739,6 +1739,11 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		defer signal.Stop(sig)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
+		// The macOS 26 revocation watchdog: this supervisor is the process
+		// that makes the kernel's cached state unservable when nothing can
+		// repair it any more — a dead daemon cannot, and macOS 26 FSKit gives
+		// the extension no way to. See fskit_revocation.go for the contract.
+		watchdog := newFSKitRevocationWatchdog(fskitRevocationProber(fskitCfg.controlSock, &state))
 		for {
 			shutdownRequested := false
 			select {
@@ -1759,12 +1764,33 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				present = false
 			}
 			if present {
+				if revoke, reason := watchdog.observe(time.Now()); revoke {
+					fmt.Fprintf(e.stderr, "portablefs mount: revoking the kernel mount at %s: %s\n", mountPath, reason)
+					if err := forceRevokeFSKitKernelMount(&state); err != nil {
+						// The watchdog fires again at its next interval; a
+						// revocation that cannot complete is retried, never
+						// abandoned, because every retry-tick is inside the
+						// window a peer may still be fenced open for.
+						fmt.Fprintf(e.stderr, "portablefs mount: forced revocation did not complete: %v\n", err)
+					}
+				}
 				continue
 			}
 			// External exact unmount is the normal command-driven shutdown:
 			// no PID signal is needed. The wrapper observes disappearance,
 			// repeats the daemon durability barrier, and exits cooperatively.
 			if err := detach(); err != nil {
+				if !watchdog.daemonCanFinalize() {
+					// The kernel mount is proven gone and the daemon (or its
+					// attach) is too. A v3 mount has nothing to drain — every
+					// acknowledged write is already durable at the authority —
+					// and the session ends fenced either way, so local
+					// finalization is what remains. Retrying a barrier against
+					// a dead daemon forever would leave a stale record and a
+					// zombie supervisor as the price of daemon death.
+					fmt.Fprintf(e.stderr, "portablefs mount: kernel mount is gone and the daemon barrier is unavailable (%v); finalizing locally, the authority session ends fenced\n", err)
+					break
+				}
 				fmt.Fprintf(e.stderr, "portablefs mount: detach after kernel unmount refused; attach remains live: %v\n", err)
 				continue
 			}

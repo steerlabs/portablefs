@@ -199,6 +199,46 @@ func TestUmountV3NeverOverridesAnAttachIdentityMismatch(t *testing.T) {
 	}
 }
 
+func TestForcedRevocationDetachesTheExactRecordedMount(t *testing.T) {
+	mountPath, err := canonicalMountPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := v3FSKitMountState(t, mountPath)
+	present := stubV3KernelMount(t, st)
+	var forced atomic.Int32
+	prior := platformUnmountOpsSource
+	platformUnmountOpsSource = func() unmountOps {
+		return unmountOps{
+			goos: "darwin",
+			combinedOut: func(name string, args ...string) ([]byte, error) {
+				if name != "/sbin/umount" || len(args) != 2 || args[0] != "-f" || args[1] != st.MountPath {
+					t.Errorf("forced revocation ran %s %v; it must be exactly umount -f <recorded path>", name, args)
+				}
+				forced.Add(1)
+				present.Store(false)
+				return nil, nil
+			},
+		}
+	}
+	t.Cleanup(func() { platformUnmountOpsSource = prior })
+
+	if err := forceRevokeFSKitKernelMount(&st); err != nil {
+		t.Fatalf("forced revocation: %v", err)
+	}
+	if forced.Load() != 1 {
+		t.Fatalf("forced unmounts = %d, want exactly 1", forced.Load())
+	}
+	// Once the exact mount is absent, revocation is idempotently complete and
+	// must never run umount against whatever else is now at the path.
+	if err := forceRevokeFSKitKernelMount(&st); err != nil {
+		t.Fatalf("revocation of an absent mount: %v", err)
+	}
+	if forced.Load() != 1 {
+		t.Fatalf("an absent mount was force-unmounted again (%d total)", forced.Load())
+	}
+}
+
 func TestCanonicalMountPathResolvesSymlinkedAncestorOfADeadMount(t *testing.T) {
 	base := t.TempDir()
 	real := filepath.Join(base, "real")
