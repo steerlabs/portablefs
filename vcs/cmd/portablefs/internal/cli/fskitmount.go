@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -389,6 +390,11 @@ type cliAttachStatus struct {
 	LastError string `json:"lastError"`
 }
 
+// errFskitAttachIdentityMismatch marks a daemon attach that carries the
+// recorded ref but different coordinates. No flag ever overrides it: the ref
+// describes somebody else's mount and there is no correct way to detach it.
+var errFskitAttachIdentityMismatch = errors.New("recorded FSKit attach identity mismatch")
+
 // verifyRecordedFskitAttach correlates a persisted mount/intent with the
 // exact live daemon inventory before a lifecycle mutation. Absence is a
 // proven result; a reused attach ref with different coordinates is an error.
@@ -414,7 +420,8 @@ func recordedFskitAttachStatus(ctl *fsdControl, st *mountState) (*cliAttachStatu
 			attach.VolumeID != st.VolumeID ||
 			attach.Branch != st.Branch {
 			return nil, fmt.Errorf(
-				"attach %s identity mismatch: daemon has %s@%s at %s, record has %s@%s at %s",
+				"%w: attach %s: daemon has %s@%s at %s, record has %s@%s at %s",
+				errFskitAttachIdentityMismatch,
 				st.AttachRef,
 				attach.VolumeID,
 				attach.Branch,

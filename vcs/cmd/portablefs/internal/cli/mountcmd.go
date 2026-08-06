@@ -697,8 +697,18 @@ func canonicalMountPath(input string) (string, error) {
 		// is the remedy for exactly that state, so the CLI must not need a
 		// working filesystem to name the mount. Ask the kernel mount table
 		// instead: a mount whose mount point is this exact path proves the
-		// path is already canonical (the kernel records the fully resolved
-		// mount point), and the caller can proceed to the daemon-owned detach.
+		// path is canonical, and the caller can proceed to the detach.
+		//
+		// The kernel records the RESOLVED mount point — the healthy path below
+		// canonicalizes through EvalSymlinks before anything is mounted — so
+		// the dead path must be resolved the same way first or a symlinked
+		// ancestor (/tmp on macOS) makes the table lookup miss and turns the
+		// one state detaching exists for into a refusal. Only the ancestors
+		// are resolved; they live outside the dead filesystem, so resolving
+		// them never enters it.
+		if resolvedParent, resolveErr := filepath.EvalSymlinks(filepath.Dir(absolute)); resolveErr == nil {
+			absolute = filepath.Clean(filepath.Join(resolvedParent, filepath.Base(absolute)))
+		}
 		mount, tableErr := exactKernelMountAt(absolute)
 		if tableErr == nil && mount != nil {
 			return absolute, nil
@@ -1991,7 +2001,25 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 	if !mounted && !mountProcessMatches(st) {
 		var recoveryJobs []string
-		if st.Strategy == "fskit" && st.AttachRef != "" {
+		if st.Strategy == "fskit" && st.AttachRef != "" && st.Engine == mountEngineDaemonV3 {
+			// The kernel mount and the recorded owner are both gone, and a v3
+			// attach preserves no write-back state, so there is nothing that
+			// requires a daemon to reconcile — starting one just to hear "no
+			// such attach" would turn an absent daemon into a refusal. If one
+			// is already running and still lists the stale attach, it is
+			// asked, best effort, to drop it.
+			if cfg, cfgErr := fskitConfigFromEnv(e.getenv); cfgErr == nil {
+				ctl := newFsdControl(cfg.controlSock)
+				ctl.httpClient.Timeout = 3 * time.Second
+				if ctl.healthy() {
+					if attach, invErr := recordedFskitAttachStatus(ctl, st); invErr == nil && attach != nil {
+						if detachErr := ctl.unmountRecordedAttach(st); detachErr != nil {
+							fmt.Fprintf(e.stderr, "portablefs umount: daemon still lists attach %s and refused to drop it (%v); its kernel mount is gone, continuing reconciliation\n", st.AttachRef, detachErr)
+						}
+					}
+				}
+			}
+		} else if st.Strategy == "fskit" && st.AttachRef != "" {
 			cfg, cfgErr := fskitConfigFromEnv(e.getenv)
 			if cfgErr != nil {
 				return e.fail("umount", cfgErr)
@@ -2084,8 +2112,15 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	case force:
 		switch st.Strategy {
 		case "fskit":
-			// The daemon must durably park and acknowledge the exact attach
-			// before the kernel resource can be removed.
+			if st.Engine == mountEngineDaemonV3 {
+				fskitUnmountCompleted, err = e.v3FSKitDaemonDetach(st, true)
+				if err != nil {
+					return e.fail("umount", err)
+				}
+				break
+			}
+			// A legacy record: the daemon must durably park and acknowledge
+			// the exact attach before the kernel resource can be removed.
 			forcedJobs, err = e.forceDetachForUnmount(st)
 			if err != nil {
 				return e.fail("umount", err)
@@ -2118,7 +2153,12 @@ func cmdUmount(e *cmdEnv, args []string) int {
 		// A NORMAL unmount requires the full drain barrier. Failure aborts
 		// with the mount fully alive — never a silently parked tail behind a
 		// healthy-looking unmount.
-		if mounted && st.Strategy == "fskit" {
+		if mounted && st.Strategy == "fskit" && st.Engine == mountEngineDaemonV3 {
+			fskitUnmountCompleted, err = e.v3FSKitDaemonDetach(st, false)
+			if err != nil {
+				return e.fail("umount", err)
+			}
+		} else if mounted && st.Strategy == "fskit" {
 			cfg, err := fskitConfigFromEnv(e.getenv)
 			if err != nil {
 				return e.fail("umount", err)
@@ -2840,6 +2880,64 @@ func (e *cmdEnv) drainBeforeUnmount(st *mountState) error {
 // forceDetachForUnmount runs the required explicit force path against the
 // exact live daemon attach. The caller must not remove the kernel mount,
 // state, or intent unless this durable parking acknowledgement succeeds.
+// v3FSKitDaemonDetach runs the daemon-owned detach transaction for a v3
+// attach when the daemon still owns one, and reports whether that transaction
+// already performed the kernel detach.
+//
+// A v3 attach holds no write-back tail: every acknowledged write is already
+// durable at the authority, so there is never anything local to drain or
+// park. The daemon-owned transaction is still preferred — it settles the
+// attach registry and produces the mount-absence evidence the authority's
+// strict membership wants — but it is a courtesy, not a precondition. A dead
+// daemon, a restarted daemon with an empty registry, and an attach that ended
+// terminally after a coherence failure all leave exactly one real thing: an
+// identity-provable kernel mount, whose fskit source string carries the
+// attach ref, verifiable from the kernel table without any daemon. Refusing
+// the detach in those states left the system umount as the only recovery,
+// which is the failure this function removes.
+func (e *cmdEnv) v3FSKitDaemonDetach(st *mountState, force bool) (kernelDetached bool, err error) {
+	cfg, err := fskitConfigFromEnv(e.getenv)
+	if err != nil {
+		return false, err
+	}
+	stateDir, err := e.mountStateDir()
+	if err != nil {
+		return false, err
+	}
+	ctl, err := e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
+	if err != nil {
+		if !force {
+			return false, fmt.Errorf("connect exact FSKit daemon for unmount: %w; retry, or run `portablefs umount --force %s` to detach the kernel mount without the daemon transaction", err, st.MountPath)
+		}
+		fmt.Fprintf(e.stderr, "portablefs umount: daemon unavailable for forced detach (%v); proceeding with the exact identity-checked kernel detach\n", err)
+		return false, nil
+	}
+	attach, err := recordedFskitAttachStatus(ctl, st)
+	switch {
+	case err != nil && errors.Is(err, errFskitAttachIdentityMismatch):
+		return false, err
+	case err != nil && !force:
+		return false, fmt.Errorf("verify exact FSKit attach for unmount: %w; retry, or run `portablefs umount --force %s` to detach the kernel mount without the daemon transaction", err, st.MountPath)
+	case err != nil:
+		fmt.Fprintf(e.stderr, "portablefs umount: daemon attach inventory unavailable for forced detach (%v); proceeding with the exact identity-checked kernel detach\n", err)
+		return false, nil
+	case attach == nil:
+		fmt.Fprintf(e.stderr, "portablefs umount: daemon no longer owns attach %s; a v3 attach has nothing to drain, proceeding with the exact identity-checked kernel detach\n", st.AttachRef)
+		return false, nil
+	}
+	if force {
+		if _, err := ctl.forceDetach(st.AttachRef); err != nil {
+			fmt.Fprintf(e.stderr, "portablefs umount: daemon-owned forced detach failed (%v); proceeding with the exact identity-checked kernel detach\n", err)
+			return false, nil
+		}
+		return true, nil
+	}
+	if err := ctl.unmountRecordedAttach(st); err != nil {
+		return false, fmt.Errorf("daemon-owned FSKit unmount refused; mount remains live: %w; retry when the authority is reachable, or run `portablefs umount --force %s` to detach now (a v3 mount has no local tail to lose)", err, st.MountPath)
+	}
+	return true, nil
+}
+
 func (e *cmdEnv) forceDetachForUnmount(st *mountState) ([]string, error) {
 	if st.Strategy != "fskit" || !mountid.ValidAttachRef(st.AttachRef) {
 		return nil, fmt.Errorf("recorded FSKit attach identity is incomplete; refusing forced detach")
