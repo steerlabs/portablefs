@@ -34,9 +34,11 @@ product stored elsewhere.
    The one durable exception is strict-mount membership, which records only
    which cached kernel mounts a previous epoch admitted.
 
-4. **Acknowledgement means applied.** A successful `write(2)` means the authority
-   applied those bytes to XFS. There is no client-side durability debt, so there
-   is nothing to replay, park, or lose.
+4. **Data-plane acknowledgement means applied.** Linux direct-I/O `write(2)` and
+   every FSKit write callback complete after XFS application. macOS may return an
+   application `write(2)` from its ordinary kernel page cache before that
+   callback; `fsync`/synchronize is its authority boundary. PortableFS owns no
+   separate tail to replay or park.
 
 5. **Coherence is synchronous or absent.** A cached frontend either holds state
    the authority repaired synchronously before the mutation returned, or it holds
@@ -55,6 +57,12 @@ product stored elsewhere.
 8. **Unsupported is explicit.** Shared file-backed `mmap`, `setxattr`, device
    nodes, FIFOs, sockets, and cross-volume rename are refused with a real errno.
    They are never emulated with divergent semantics.
+   In particular, production macOS resolve advertises read/list/removal but
+   declares xattr set unsupported. FSKit validates and refuses set locally,
+   before emitting a daemon mutation, then translates its internal Darwin
+   `ENOTSUP` refusal to Darwin `EOPNOTSUPP` (102), because XNU otherwise creates
+   an AppleDouble `._*` sidecar. Linux and the authority expose `EOPNOTSUPP`
+   directly; neither client invents a second xattr store.
 
 ## What not to build
 

@@ -850,7 +850,9 @@ func (r *registry) runUnmountTransaction(
 		// The evidence-bearing v3 detach: exact kernel detach, getfsstat
 		// absence observation, proof delivery, then local release. It shares
 		// none of the prepared/force/journal machinery below because a v3
-		// attach has no WAL store to park and no drain barrier to run.
+		// attach has no daemon WAL store to drain. Its normal unforced kernel
+		// pass is still the mandatory FSKit synchronize/authority boundary;
+		// detachV3 alone owns that v3-specific sequence.
 		if err := r.detachV3(a, forceAuthorized || force, ops); err != nil {
 			return true, "", err
 		}
@@ -1087,10 +1089,12 @@ func (r *registry) closeAll(ctx context.Context) error {
 
 type attach struct {
 	// mountRootFD is this attach's kernel mount root, bound while the mount
-	// was proven healthy (see bindMountRoot). Zero means unbound. Every
+	// was proven healthy (see bindMountRoot). mountRootBound is separate so a
+	// valid descriptor 0 is representable. Every
 	// path-based access to an FSKit mount is served by its own extension, so
 	// this descriptor must never be re-derived during a coherence barrier.
-	mountRootFD int
+	mountRootFD    int
+	mountRootBound bool
 
 	ref                 string
 	key                 string
@@ -1670,6 +1674,11 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	if lifeCancel != nil {
 		lifeCancel()
 	}
+	// The macOS 26 repair root is attach-scoped. Terminal FSKit teardown has
+	// already removed (or deliberately abandoned) this incarnation's kernel
+	// mount, so retire the owner now. Each in-flight repair holds its own dup,
+	// preventing both descriptor reuse races and one leaked vnode per remount.
+	a.releaseMountRoot()
 	// A v3 attach's strict session must not outlive the attach. The clean
 	// unmount already delivered its absence proof and terminated the plane;
 	// every other detach path ends it here, closing the authority client so

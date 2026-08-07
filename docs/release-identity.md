@@ -271,7 +271,7 @@ push would catch.
   all four `.attestation.jsonl` asset names, still runs every validation gate
   (cross-OS builds, vet, the Go suite, the Go race suite, `sh -n
   scripts/install.sh`, both policy checkers, `govulncheck@v1.6.0`, `goreleaser
-  check`, `swift test --package-path swift/PortableFSKit`) with the three
+  check`, `swift test --package-path swift/PortableFSKit --no-parallel`) with the three
   `needs:` edges intact, and never uses `--clobber`.
 
 It also **bans container images from the release path outright.** If

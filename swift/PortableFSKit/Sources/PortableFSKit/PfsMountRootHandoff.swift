@@ -64,17 +64,47 @@ public final class PfsMacOS26DaemonActuator: PfsMacOS26RepairActuator, @unchecke
         let kind: String
         let parent: [Data]
         var name: Data?
+        var itemKind: PfsMacOSCachedItemKind?
         switch plan.kind {
         case .negativeScratch:
             kind = "scratch"
             parent = plan.path.components
-        case .positiveEviction, .dataInvalidation:
-            kind = plan.kind == .positiveEviction ? "evict" : "invalidate"
+            guard plan.itemKind == nil else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+        case .positiveEviction:
+            kind = "evict"
             guard let parentPath = plan.path.parent, let leaf = plan.path.name else {
                 throw PfsMacOSCoherenceError.invalidPathComponent
             }
             parent = parentPath.components
             name = leaf
+            guard let authenticatedKind = plan.itemKind else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            itemKind = authenticatedKind
+        case .attributeRefresh:
+            kind = "refresh"
+            guard let parentPath = plan.path.parent,
+                  let leaf = plan.path.name,
+                  let authenticatedKind = plan.itemKind,
+                  authenticatedKind != .symlink,
+                  plan.expectedVFSFileID != nil else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            parent = parentPath.components
+            name = leaf
+            itemKind = authenticatedKind
+        case .dataInvalidation:
+            kind = "invalidate"
+            guard let parentPath = plan.path.parent,
+                  let leaf = plan.path.name,
+                  plan.itemKind == .file else {
+                throw PfsMacOSCoherenceError.invalidPathComponent
+            }
+            parent = parentPath.components
+            name = leaf
+            itemKind = .file
         }
         var object: [String: Any] = [
             "kind": kind,
@@ -83,6 +113,9 @@ public final class PfsMacOS26DaemonActuator: PfsMacOS26RepairActuator, @unchecke
         ]
         if let name {
             object["name"] = name.base64EncodedString()
+        }
+        if let itemKind {
+            object["itemKind"] = itemKind.daemonWireValue
         }
         if let expected = plan.expectedVFSFileID {
             object["expectedFileId"] = expected

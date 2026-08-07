@@ -95,6 +95,55 @@ func abandonedKernelDetach(err error) bool {
 	return errors.As(err, &abandoned)
 }
 
+// kernelDetachHelperError preserves both the helper's wait failure and the
+// machine-classified errno printed by the system umount utility. Darwin's
+// /sbin/umount does not expose errno in its exit status, so the helper runs in
+// the C locale and this wrapper turns its exact strerror text back into the one
+// errno the v3 clean-detach protocol needs to distinguish: EBUSY after a
+// successful VFS_SYNC from every other refusal.
+type kernelDetachHelperError struct {
+	mountPath string
+	cause     error
+	output    string
+	errno     error
+}
+
+func (e *kernelDetachHelperError) Error() string {
+	return fmt.Sprintf(
+		"kernel detach helper for %s: %v%s",
+		e.mountPath,
+		e.cause,
+		kernelDetachOutputSuffix(e.output),
+	)
+}
+
+func (e *kernelDetachHelperError) Unwrap() []error {
+	if e.errno == nil {
+		return []error{e.cause}
+	}
+	return []error{e.cause, e.errno}
+}
+
+func classifyKernelDetachHelperError(mountPath string, cause error, output string) error {
+	var classified error
+	// /sbin/umount uses strerror(3). LC_ALL=C below makes this stable and
+	// locale-independent. Darwin 26 appends its exact diskutil hint while older
+	// releases stop after strerror. Match the complete diagnostic including the
+	// exact mount path so a path or unrelated line containing these words cannot
+	// authorize a force.
+	trimmed := strings.TrimSpace(output)
+	if trimmed == fmt.Sprintf("umount(%s): Resource busy -- try 'diskutil unmount'", mountPath) ||
+		trimmed == fmt.Sprintf("umount: %s: Resource busy", mountPath) {
+		classified = syscall.EBUSY
+	}
+	return &kernelDetachHelperError{
+		mountPath: mountPath,
+		cause:     cause,
+		output:    trimmed,
+		errno:     classified,
+	}
+}
+
 // validateKernelDetachHelper proves the helper is the system binary and not a
 // user-writable replacement. A daemon that would exec an attacker-controlled
 // path here would be handing out its own privileges.
@@ -156,7 +205,7 @@ func execKernelDetachHelper(budget time.Duration, mountPath string, args ...stri
 	// The helper must never inherit a working directory inside a mount, and it
 	// must never be able to demand input: a detach is not an interactive act.
 	cmd.Dir = "/"
-	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
+	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C"}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start kernel detach helper for %s: %w", mountPath, err)
 	}
@@ -172,9 +221,10 @@ func execKernelDetachHelper(budget time.Duration, mountPath string, args ...stri
 		if waitErr == nil {
 			return nil
 		}
-		return fmt.Errorf(
-			"kernel detach helper for %s: %w%s",
-			mountPath, waitErr, kernelDetachHelperOutput(logPath),
+		return classifyKernelDetachHelperError(
+			mountPath,
+			waitErr,
+			kernelDetachHelperOutput(logPath),
 		)
 	case <-timer.C:
 		// Best effort only. A helper pinned in an uninterruptible kernel wait
@@ -190,12 +240,19 @@ func kernelDetachHelperOutput(path string) string {
 	if err != nil {
 		return ""
 	}
-	text := strings.TrimSpace(string(body))
-	if text == "" {
+	output := strings.TrimSpace(string(body))
+	if output == "" {
 		return ""
 	}
-	if len(text) > 2048 {
-		text = text[:2048] + "…"
+	if len(output) > 2048 {
+		output = output[:2048] + "…"
 	}
-	return " (output: " + text + ")"
+	return output
+}
+
+func kernelDetachOutputSuffix(output string) string {
+	if output == "" {
+		return ""
+	}
+	return " (output: " + output + ")"
 }

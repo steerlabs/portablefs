@@ -13,8 +13,11 @@ func openVerifiedMountRoot(string, string) (int, error) {
 	return -1, errors.New("mount-root handoff is a macOS FSKit mechanism")
 }
 
-func closeMountRootFD(int)          {}
-func mountRootRights(int) []byte    { return nil }
+func closeMountRootFD(int) {}
+func duplicateMountRootFD(int) (int, error) {
+	return -1, errors.New("mount-root duplication is a macOS FSKit mechanism")
+}
+func mountRootRights(int) []byte { return nil }
 
 func actuateRepair(int, repairActuationPlan) (byte, error) {
 	return 0, errors.New("repair actuation is a macOS FSKit mechanism")

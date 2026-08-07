@@ -6,8 +6,9 @@ PortableFS v3 has one source of truth per volume: the mounted XFS instance the
 authority addresses. Everything the authority itself holds — sessions, open
 file descriptions, advisory locks, same-epoch replay slots, cancellation state
 — is disposable epoch state. There is no second inode tree, no mutation log, no
-client write-back cache, and no history. The architectural decision behind that
-is in [xfs-authority-architecture.md](./xfs-authority-architecture.md).
+PortableFS-managed or offline write-back cache, and no history. Ordinary kernel
+page caches still exist. The architectural decision behind that is in
+[xfs-authority-architecture.md](./xfs-authority-architecture.md).
 
 This document states what an application may rely on.
 
@@ -27,26 +28,32 @@ local folders. Mounts are not independent sources of truth and never reconcile
 with each other.
 
 One naming trap is worth stating plainly: the data-plane wire version is
-`ProtocolMajor = 2` and its ALPN identifier is `portablefs-authority-v2`
+`ProtocolMajor = 3` and its ALPN identifier is `portablefs-authority-v3`
 (`vcs/internal/authorityrpc/protocol.go`). That is the *protocol's* major
 version, not the product's. It is unrelated to the retired v2 architecture, and
 a v2 client and a v3 authority fail their handshake rather than enter a mixed
-mode.
+mode. Protocol 3 classifies Lookup and every other resource acquisition as an
+exact-replay operation, so a lost successful reply cannot allocate an
+unreachable second capability on retry.
 
 ## Write acceptance and durability
 
-There are no layers here. Acceptance and application are the same event.
+The data-plane acknowledgement and authority application are the same event.
+The application syscall boundary depends on the frontend kernel contract.
 
-- **`write(2)` returns only after the authority has applied the bytes to XFS.**
-  There is no client write-back engine, no local mutation log, and therefore no
-  local durability debt. An acknowledged byte never exists only in an unsent
-  client buffer.
+- **Linux direct-I/O `write(2)` returns only after authority application.**
+  There is no PortableFS write-back engine or local mutation log.
+- **macOS may first accept bytes into its kernel page cache.** Application
+  `write(2)` can return before FSKit submits those bytes. Every FSKit write
+  callback is still authority-through, and `fsync`/synchronize waits for the
+  authority. An application that needs a cross-machine completion boundary on
+  macOS must use `fsync`; `close` alone is not that boundary.
 - **`fsync`/`fdatasync` wait on the authoritative server file description.** A
   successful return means the authority completed `fsync(2)` or `fdatasync(2)`
   against that descriptor, with the ordinary
   [Linux durability contract](https://man7.org/linux/man-pages/man2/fsync.2.html).
-- **`close` is not an implicit `fsync`.** It never has been on Linux and it is
-  not here.
+- **`close` is not an implicit `fsync`.** It is not a remote durability or
+  cross-machine completion boundary on either frontend.
 - **`syncfs(2)` is not a remote durability boundary on ordinary FUSE.** The
   kernel currently issues `FUSE_SYNCFS` only for `fuseblk` mounts, so a
   `syncfs` completion on a PortableFS mount says nothing about XFS on the
@@ -110,7 +117,7 @@ exists only to close kernel publication gates, not to serialize the filesystem.
 
 `portablefs mount` on macOS runs the portablefsd v3 data plane plus the FSKit
 extension under the declared compatibility cache policy
-`macos26-synchronous-vfs-repair-v1`. FSKit requires `--coherence strict`;
+`macos26-synchronous-vfs-repair-v2`. FSKit requires `--coherence strict`;
 `uncached` is Linux-only and the CLI says so rather than silently downgrading.
 That policy's bounded semantics, its unmet gates, and the reasons it must not
 be treated as a silent fallback are in
@@ -186,11 +193,24 @@ hanging.
 [not charged to project quotas](https://www.kernel.org/pub/linux/utils/fs/xfs/docs/xfs_filesystem_structure.pdf),
 so project quotas cannot isolate user-xattr writes on a shared cell and a
 PortableFS-side counter could not commit atomically with XFS. Both the Linux
-frontend and a direct authority request return `EOPNOTSUPP`. Read, list and
-remove of pre-existing portable `user.*` attributes remain available;
-`vcs/internal/xfsstore` (`ValidateXattr`) admits only the `user.` namespace and
-excludes the reserved `user.portablefs.` prefix, so internal metadata,
-`security.*`, ACL internals and `trusted.*` never cross the remote boundary.
+frontend and a direct authority request return `EOPNOTSUPP`. Authority protocol
+v3 requires `user-xattr-readonly` at Attach, so Linux returns that fixed verdict
+locally after validating the FUSE flags; it does not consume a mutation replay
+sequence or visibility work for an operation the authority can never accept.
+Read, list and remove of pre-existing portable `user.*` attributes remain
+available; `vcs/internal/xfsstore` (`ValidateXattr`) admits only the `user.`
+namespace and excludes the reserved `user.portablefs.` prefix, so internal
+metadata, `security.*`, ACL internals and `trusted.*` never cross the remote
+boundary.
+
+The production v3 resolve contract carries both `xattrs=true` and
+`xattr_set_supported=false`. FSKit first validates the target item and xattr
+name, then refuses set/create/replace/upsert locally, before any daemon request
+or ordered mutation exists. Its internal refusal is Darwin `ENOTSUP` (45), but
+the FSKit boundary returns Darwin's distinct `EOPNOTSUPP` (102): XNU treats 45
+as a request to fall back to an AppleDouble `._*` file. This prevents a second
+durable xattr representation from appearing beside XFS. Read, list, and
+removal of a pre-existing portable attribute continue to forward normally.
 
 Writable xattrs require a substrate with one kernel-enforced aggregate capacity
 boundary. They will not be enabled by a per-inode limit or an in-memory

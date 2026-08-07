@@ -36,7 +36,28 @@ const (
 	// ProtocolMinor 9 adds the strict-v3 end-to-end liveness proof. A frontend
 	// which only knows that its UDS is live cannot distinguish a responsive
 	// daemon from one that has lost its authority session.
-	ProtocolMinor = 9
+	//
+	// ProtocolMinor 10 makes EnumerateRequest.Handle mandatory. Directory
+	// cookies are scoped to the retained authority handle that issued them, so
+	// the zero-value behavior cannot reproduce a correct multi-page walk.
+	//
+	// ProtocolMinor 11 adds Envelope.SourcePhaseQueueable. Ignoring the bit
+	// recreates the own-source PREPARE cycle it distinguishes, so the existing
+	// minimum-minor handshake is the compatibility boundary.
+	//
+	// ProtocolMinor 12 adds ResourceReplyDisposition. A successful resource
+	// reply can transfer handles to VolumeCore and a (possibly shorter) prefix
+	// of items to FSKit. Socket delivery proves neither ownership boundary, so
+	// the final disposition states both independently.
+	//
+	// ProtocolMinor 13 adds ordered-admission contention feedback on the exact
+	// peer COMPLETE Ack. Ignoring it is safe for coherence but silently loses
+	// the bounded FIFO compensation this daemon and frontend promise together.
+	//
+	// ProtocolMinor 14 carries an authority-attested post-binding identity on
+	// namespace targets. macOS needs the association to refresh a retained vnode
+	// through a new rename/hard-link coordinate without reusing a stale locator.
+	ProtocolMinor = 14
 	MaxFrameBytes = 16 << 20
 )
 
@@ -65,6 +86,11 @@ type Envelope struct {
 	// callback cannot return before its last request is answered. So a
 	// retraction always has a carrier that precedes the install.
 	PublicationRetracted bool
+	// SourcePhaseQueueable is valid only on an ordered mutating request with a
+	// nonzero OperationID. It is the frontend's request-scoped proof that this
+	// callback has issued no ordinary/cache-reading request and is therefore
+	// excluded from a distinct own-source PREPARE drain while it waits.
+	SourcePhaseQueueable bool
 	Body                 any
 }
 
@@ -88,6 +114,20 @@ type HelloReply struct {
 type PublicationAck struct {
 	PublishedRequestID uint64
 	OperationID        uint64
+}
+
+// ResourceReplyDisposition is the final ownership verdict for one successful
+// resource-bearing reply on this exact connection.
+type ResourceReplyDisposition struct {
+	TargetRequestID uint64
+	// AcceptHandles transfers every handle in this reply to VolumeCore. False
+	// abandons them. A Create reply can accept its handle independently of its
+	// item because those resources cross different ownership boundaries.
+	AcceptHandles bool
+	// AcceptedItemCount transfers this exact prefix of the reply's ordered item
+	// occurrence sequence to FSKit. A count, rather than item IDs, preserves
+	// duplicate hard-link entries and order.
+	AcceptedItemCount uint32
 }
 
 type ResolveRequest struct{ AttachRef string }
@@ -124,8 +164,16 @@ type V3LivenessReply struct {
 }
 
 type Capabilities struct {
-	Symlinks        bool
-	HardLinks       bool
+	Symlinks  bool
+	HardLinks bool
+	// Xattrs is true when the frontend may expose the pfslocal xattr operation
+	// family. It is not a promise that every operation succeeds for every
+	// backing: the production v3 XFS attach supports get, list, and removal of
+	// pre-existing portable user attributes while XattrSetSupported is false.
+	// FSKit validates set input, refuses it locally with the internal Darwin
+	// ENOTSUP representation, and translates that boundary verdict to Darwin's
+	// distinct EOPNOTSUPP so XNU cannot invoke AppleDouble fallback. False means
+	// the daemon has no xattr surface at all.
 	Xattrs          bool
 	CaseSensitive   bool
 	MaxNameBytes    uint32
@@ -156,6 +204,12 @@ type Capabilities struct {
 	// mount-time volume capability (FSKit doesNotSupportImmutableFiles) from
 	// it, because per-object refusal arrives as an errno on the request.
 	FlagsUnderstood bool
+	// XattrSetSupported is true exactly when this daemon accepts an
+	// XattrSetRequest for at least one ordinary volume object. Xattrs remains
+	// the operation-family capability: get/list/remove may remain available
+	// while this narrower mutation capability is false. Frontends validate the
+	// item and name before using this field as a local forwarding gate.
+	XattrSetSupported bool
 }
 
 // Item is the frontend-visible filesystem object identity. portablefsd keeps
@@ -213,6 +267,7 @@ type EnumerateRequest struct {
 	Cookie     uint64
 	MaxEntries uint32
 	WantAttrs  bool
+	Handle     uint64
 }
 
 type DirEntry struct {
@@ -447,6 +502,7 @@ type VisibilityTarget struct {
 	ParentIdentity []byte
 	Name           []byte
 	Size           int64
+	PostIdentity   []byte
 }
 
 type RoutesChange struct {
@@ -469,10 +525,11 @@ type V3VisibilityEvent struct {
 }
 
 type VisibilityAckRequest struct {
-	AuthorityEpoch []byte
-	Cursor         VisibilityCursor
-	Blocked        bool
-	Reason         string
+	AuthorityEpoch            []byte
+	Cursor                    VisibilityCursor
+	Blocked                   bool
+	Reason                    string
+	OrderedAdmissionContended bool
 }
 
 type VisibilityAckReply struct{}

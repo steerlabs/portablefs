@@ -16,6 +16,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -172,7 +173,11 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		bounds := h.Bounds()
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 			ProtocolMajor: authorityrpc.ProtocolMajor,
-			Features:      []string{"xfs-current-state", "session-exact-epoch", "direct-write"},
+			Features: []string{
+				"xfs-current-state", "session-exact-epoch", "direct-write",
+				"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
+				"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+			},
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
 			MaxInFlight: uint32(bounds.MaxInFlight),
 		}}
@@ -187,7 +192,8 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 				"write-through", "no-history", "no-branches", "direct-io-no-file-mmap",
 				"user-xattr-readonly", "single-principal", "distributed-posix-locks",
 				"stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier",
-				"strict-two-phase-visibility",
+				"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
+				"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
 			},
 			SessionLeaseMilliseconds: h.leaseMillis,
 		}}
@@ -206,6 +212,11 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		h.mu.Lock()
 		h.lookups++
 		h.mu.Unlock()
+		if mutation := req.GetMutation(); mutation != nil {
+			response.Mutation = &authoritypb.MutationState{
+				Slot: mutation.GetSlot(), AcceptedSequence: mutation.GetSequence(),
+			}
+		}
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
 			Item: &authoritypb.Item{
 				Token: bytes.Repeat([]byte{0x33}, 16), StableIdentity: bytes.Repeat([]byte{0x44}, 16),
@@ -305,7 +316,7 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 		admitted.GetCoherenceProfile() != authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT ||
 		admitted.GetCachedNameCapacity() != 1024 ||
 		admitted.GetRepairBudgetMillis() != 60_000 ||
-		admitted.GetNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE ||
+		admitted.GetNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED ||
 		hex.EncodeToString(admitted.GetRoutesRevision()) != strings.Repeat("ab", 32) ||
 		string(admitted.GetAccessToken()) != "capability" {
 		t.Fatalf("authority admitted contract %+v", admitted)
@@ -381,6 +392,23 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	// the authority-v3 backend.
 	if lookups == 0 || statfsCalls < 2 {
 		t.Fatalf("authority served lookups=%d statfs=%d", lookups, statfsCalls)
+	}
+}
+
+func TestV3NamespaceRepairMatchesCacheExecutionModel(t *testing.T) {
+	tests := []struct {
+		policy string
+		want   authoritypb.NamespaceRepair
+	}{
+		{v3CachePolicyMacOS26V1, authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED},
+		{v3CachePolicyMacOS26, authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED},
+		{v3CachePolicyFSKit, authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT},
+		{"unknown", authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED},
+	}
+	for _, test := range tests {
+		if got := v3NamespaceRepair(test.policy); got != test.want {
+			t.Fatalf("v3NamespaceRepair(%q) = %v, want %v", test.policy, got, test.want)
+		}
 	}
 }
 
@@ -465,6 +493,7 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 	var mu sync.Mutex
 	unmounted := false
 	detachesBeforeUnmount := 0
+	var kernelDetachModes []bool
 	ops := fskitKernelOps{
 		present: func(path, ref string) (bool, error) {
 			if path != a.mountPath || ref != a.ref {
@@ -477,8 +506,9 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 		unmountExact: func(path, ref string, force bool) error {
 			mu.Lock()
 			defer mu.Unlock()
-			if force {
-				t.Error("normal v3 unmount reached the kernel as a force")
+			kernelDetachModes = append(kernelDetachModes, force)
+			if !force {
+				return syscall.EBUSY
 			}
 			unmounted = true
 			if handler.recordedDetach() != nil {
@@ -493,6 +523,9 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 	}
 	if detachesBeforeUnmount != 0 {
 		t.Fatal("mount-absence proof reached the authority before the kernel detach")
+	}
+	if len(kernelDetachModes) != 2 || kernelDetachModes[0] || !kernelDetachModes[1] {
+		t.Fatalf("kernel detach modes=%v, want synchronized then forced", kernelDetachModes)
 	}
 	sent := handler.recordedDetach()
 	proof := sent.GetMountAbsence()
@@ -510,6 +543,40 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 	}
 	if !a.isDetached() {
 		t.Fatal("v3 attach did not publish its terminal detach state")
+	}
+}
+
+func TestV3NormalDetachNeverForcesPastASynchronizeFailure(t *testing.T) {
+	pki := newV3TestPKI(t)
+	handler := newV3TestAuthority()
+	address := startV3TestAuthority(t, handler, pki.serverTLS)
+	r := newRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(
+		address,
+		pki,
+		"/Volumes/PortableFSV3SyncFailure",
+	))
+
+	var kernelDetachModes []bool
+	found, _, err := r.unmountFSKitWith(a.ref, false, fskitKernelOps{
+		present: func(_, _ string) (bool, error) { return true, nil },
+		unmountExact: func(_, _ string, force bool) error {
+			kernelDetachModes = append(kernelDetachModes, force)
+			return syscall.EIO
+		},
+	})
+	if !found || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("v3 normal unmount=(%v,%v), want exact sync failure", found, err)
+	}
+	if len(kernelDetachModes) != 1 || kernelDetachModes[0] {
+		t.Fatalf("kernel detach modes=%v, want one synchronized attempt", kernelDetachModes)
+	}
+	if handler.recordedDetach() != nil {
+		t.Fatal("sync failure produced a false mount-absence proof")
+	}
+	if r.get(a.ref) == nil || a.isDetached() {
+		t.Fatal("sync failure did not leave the v3 attach live and retryable")
 	}
 }
 

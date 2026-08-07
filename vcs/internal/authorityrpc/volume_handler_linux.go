@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"sync"
 	"syscall"
 	"time"
@@ -36,8 +37,49 @@ type Authorizer interface {
 	Authorize(context.Context, string, []byte) (volumeserver.Authorization, error)
 }
 
+// volumeStore is the complete syscall-backed authority surface. Keeping the
+// handler dependent on this contract (rather than the concrete XFS carrier)
+// makes the pre-apply admission boundary fault-injectable while production has
+// exactly one implementation: *xfsstore.Volume.
+type volumeStore interface {
+	Root() (xfsstore.Capability, error)
+	Fence(error)
+	Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error)
+	Forget(xfsstore.Capability) error
+	Getattr(xfsstore.Capability) (xfsstore.Attr, error)
+	Identity(xfsstore.Capability) ([16]byte, error)
+	IdentityOpen(xfsstore.Capability) ([16]byte, error)
+	OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error)
+	CloseOpen(xfsstore.Capability) error
+	ReadAt(xfsstore.Capability, []byte, int64) (int, error)
+	WriteAt(xfsstore.Capability, []byte, int64) (int, error)
+	Append(xfsstore.Capability, []byte) (int, int64, error)
+	Truncate(xfsstore.Capability, int64) error
+	Fsync(xfsstore.Capability, bool) error
+	GetattrOpen(xfsstore.Capability) (xfsstore.Attr, error)
+	SyncFS() error
+	ReadDirOpen(xfsstore.Capability, uint64, [16]byte, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
+	StatOpenDirChild(xfsstore.Capability, string) (xfsstore.Attr, error)
+	Chmod(xfsstore.Capability, fs.FileMode) error
+	Chown(xfsstore.Capability, int, int) error
+	SetTimes(xfsstore.Capability, *int64, *int64, bool, bool) error
+	TruncateObject(xfsstore.Capability, int64) error
+	GetXattr(xfsstore.Capability, string) ([]byte, error)
+	SetXattr(xfsstore.Capability, string, []byte, xfsstore.XattrMode) error
+	RemoveXattr(xfsstore.Capability, string) error
+	ListXattr(xfsstore.Capability) ([]string, error)
+	StatFS() (xfsstore.FSStat, error)
+	Create(xfsstore.Capability, string, fs.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error)
+	Mkdir(xfsstore.Capability, string, fs.FileMode) (xfsstore.Capability, xfsstore.Attr, error)
+	Symlink(xfsstore.Capability, string, string) (xfsstore.Capability, xfsstore.Attr, error)
+	Readlink(xfsstore.Capability) (string, error)
+	Unlink(xfsstore.Capability, string, bool) error
+	Rename(xfsstore.Capability, string, xfsstore.Capability, string, xfsstore.RenameFlags) error
+	Link(xfsstore.Capability, xfsstore.Capability, string) (xfsstore.Attr, error)
+}
+
 type VolumeHandler struct {
-	Store       *xfsstore.Volume
+	Store       volumeStore
 	Runtime     *volumeserver.Authority
 	Authorizer  Authorizer
 	MaxFrame    uint32
@@ -94,6 +136,13 @@ type sessionResources struct {
 	// protocol carries; see protected_linux.go.
 	items map[xfsstore.Capability]bool
 	opens map[xfsstore.Capability]bool
+	// Reservations are capacity already charged to this session for an
+	// operation that has not reached XFS yet. Charging before apply is what
+	// makes admission refusal a definite, retryable outcome: Create/Mkdir/
+	// Symlink and truncating Open may not discover a full descriptor table
+	// after they have changed durable state.
+	reservedItems uint32
+	reservedOpens uint32
 	// reply holds the retained reply size for each of this session's replay
 	// slots. Its length is the slot count the runtime admitted.
 	reply     []uint32
@@ -104,6 +153,25 @@ type sessionResources struct {
 	// change makes every session whose revision is no longer active refuse its
 	// next request without any extra field on the wire.
 	routes [32]byte
+}
+
+type trackedCapability struct {
+	value     xfsstore.Capability
+	protected bool
+}
+
+// capabilityReservation owns descriptor-table capacity from immediately
+// before an operation reaches xfsstore until the returned capabilities are
+// atomically installed in the session sets. totalItems/totalOpens include both
+// live capabilities and these reservations, so the worker-wide bound cannot be
+// oversubscribed by concurrent applies.
+type capabilityReservation struct {
+	h         *VolumeHandler
+	id        volumeserver.SessionID
+	resources *sessionResources
+	items     uint32
+	opens     uint32
+	active    bool
 }
 
 // Epoch implements Handler. It is what the transport stamps on any response it
@@ -137,6 +205,12 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	}
 	if req == nil {
 		return h.errorResponse(0, fs.ErrInvalid, false)
+	}
+	// This is an authority trust boundary, not merely a daemon assertion. A
+	// mount credential authenticates the caller but does not entitle it to mark
+	// arbitrary requests safe to queue behind an own-source visibility phase.
+	if !validSourcePhaseQueueability(req) {
+		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}
 	if hello := req.GetHello(); hello != nil {
 		return h.hello(req.GetRequestId(), hello)
@@ -265,13 +339,16 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 		}
 		if body.AckVisibility.GetBlocked() {
-			// The frontend is reporting a cycle, not asking for time. It always
-			// ends this session, so the answer is always an error - ESTALE for an
-			// accepted report, the same for a rejected one. The session ends
-			// immediately; the current obligation remains for the fencing grace.
-			return h.errorResponse(req.GetRequestId(), h.Visibility.ReportBlocked(cred.ID, cursor), false)
+			// For an ordinary parent-exclusive namespace COMPLETE, this installs
+			// a scoped pre-apply interruption and the same mount goes on to repair
+			// and Ack. A routes report remains terminal because topology cannot be
+			// repaired by releasing one kernel parent lock.
+			if err := h.Visibility.ReportBlocked(ctx, cred.ID, cursor, body.AckVisibility.GetBlockedParentKernelInos()); err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			return h.success(req.GetRequestId())
 		}
-		if err := h.Visibility.Ack(cred.ID, cursor); err != nil {
+		if err := h.Visibility.AckWithContention(cred.ID, cursor, body.AckVisibility.GetOrderedAdmissionContended()); err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		return h.success(req.GetRequestId())
@@ -295,30 +372,37 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		resp.Body = &authoritypb.Response_ApplyRoutes{ApplyRoutes: reply}
 		return resp
 	case *authoritypb.Request_Lookup:
-		parent, err := h.item(cred.ID, body.Lookup.GetParent())
-		if err != nil {
-			return h.errorResponse(req.GetRequestId(), err, false)
-		}
-		// Resolving a name under the protected namespace is the only way a
-		// capability inside it can enter this session, so it is the only place
-		// the mark has to be applied for the set to be closed at every depth.
-		protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
-		item, attr, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
-		if err != nil {
-			return h.errorResponse(req.GetRequestId(), err, false)
-		}
-		if err := h.trackItem(cred.ID, item, protected); err != nil {
-			return h.errorResponse(req.GetRequestId(), err, false)
-		}
-		identity, err := h.Store.Identity(item)
-		if err != nil {
-			h.untrackItem(cred.ID, item)
-			h.forgetItem(item)
-			return h.errorResponse(req.GetRequestId(), err, false)
-		}
-		resp := h.success(req.GetRequestId())
-		resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, identity)}}
-		return resp
+		// Lookup allocates and transfers an authority item capability. It is
+		// read-only in XFS, but not side-effect-free in this session: replaying a
+		// response lost after trackItem would allocate a second unreachable
+		// capability. Exact replay therefore owns the transfer just as it owns an
+		// Open handle; the frontend's later Reclaim retires it idempotently.
+		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
+			parent, err := h.item(cred.ID, body.Lookup.GetParent())
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			// Resolving a name under the protected namespace is the only way a
+			// capability inside it can enter this session, so it is the only place
+			// the mark has to be applied for the set to be closed at every depth.
+			protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
+			item, attr, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			if err := h.trackItem(cred.ID, item, protected); err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			identity, err := h.Store.Identity(item)
+			if err != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
+				return h.errorResponse(0, err, false)
+			}
+			resp := h.success(0)
+			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, identity)}}
+			return resp
+		})
 	case *authoritypb.Request_GetAttr:
 		attr, err := h.getattr(ctx, cred.ID, body.GetAttr)
 		if err != nil {
@@ -480,9 +564,16 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err != nil {
 				return nil, err
 			}
-			targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
-			if existed && body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
-				targets = append(targets, inodeTarget(volumeserver.VisibilityData, existingCoordinate, existingSize), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0))
+			if !existed {
+				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
+			}
+			// Opening an existing name does not mutate its parent or binding. Keep
+			// the unavoidable replay-ordered no-op barrier scoped to the existing
+			// inode; O_TRUNC adds data, while a plain existing create completes with
+			// no targets and therefore performs no peer repair.
+			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
+			if body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
+				targets = append([]volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, existingSize)}, targets...)
 			}
 			return targets, nil
 		}
@@ -504,6 +595,11 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
 			}
+			reservation, err := h.reserveCapabilities(cred.ID, 1, 1)
+			if err != nil {
+				return h.errorResponse(0, err, false), nil
+			}
+			defer reservation.release()
 			item, attr, err := h.Store.Create(parent, string(body.Create.GetName()), mode, body.Create.GetExclusive())
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
@@ -515,20 +611,35 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				h.forgetItem(item)
 				return h.errorResponse(0, err, targets != nil), targets
 			}
-			if err := h.trackItemAndOpen(cred.ID, item, handle, false); err != nil {
+			if err := reservation.commit(
+				[]trackedCapability{{value: item}},
+				[]trackedCapability{{value: handle}},
+			); err != nil {
 				targets := createdTargets(item)
+				h.closeOpen(handle)
+				h.forgetItem(item)
 				return h.errorResponse(0, err, targets != nil), targets
+			}
+			cleanupUndeliverable := func() {
+				h.untrackOpen(cred.ID, handle)
+				h.closeOpen(handle)
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
 			}
 			if body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
 				post, err := h.Store.GetattrOpen(handle)
 				if err != nil {
-					return h.errorResponse(0, err, true), createdTargets(item)
+					targets := createdTargets(item)
+					cleanupUndeliverable()
+					return h.errorResponse(0, err, true), targets
 				}
 				attr = post
 			}
 			itemIdentity, identityErr := h.Store.Identity(item)
 			if identityErr != nil {
-				return h.errorResponse(0, identityErr, true), createdTargets(item)
+				targets := createdTargets(item)
+				cleanupUndeliverable()
+				return h.errorResponse(0, identityErr, true), targets
 			}
 			resp := h.success(0)
 			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemProto(item, attr, itemIdentity), Handle: handle[:]}}
@@ -559,17 +670,25 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
 			}
+			reservation, err := h.reserveCapabilities(cred.ID, 1, 0)
+			if err != nil {
+				return h.errorResponse(0, err, false), nil
+			}
+			defer reservation.release()
 			item, attr, err := h.Store.Mkdir(parent, string(body.Mkdir.GetName()), mode)
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
 				targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
-			if err := h.trackItem(cred.ID, item, false); err != nil {
+			if err := reservation.commit([]trackedCapability{{value: item}}, nil); err != nil {
+				h.forgetItem(item)
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			itemIdentity, identityErr := h.Store.Identity(item)
 			if identityErr != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
 				return h.errorResponse(0, identityErr, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			resp := h.success(0)
@@ -591,15 +710,15 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err == nil {
 				removedCoordinate, _, err = h.lookupCoordinate(parent, body.Unlink.GetName())
 			}
-			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Unlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}, err
+			return []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}, err
 		}
 		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			if err := h.Store.Unlink(parent, string(body.Unlink.GetName()), body.Unlink.GetDirectory()); err != nil {
 				resp := h.errorResponse(0, err, false)
-				targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Unlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
+				targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
-			targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Unlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
+			targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
 			return h.success(0), targets
 		})
 	case *authoritypb.Request_Rename:
@@ -630,7 +749,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err == nil {
 				replacedCoordinate, replaced, err = h.lookupCoordinateOptional(newParent, body.Rename.GetNewName())
 			}
-			targets := renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced)
+			targets := renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, false)
 			return targets, err
 		}
 		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
@@ -643,9 +762,9 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			}
 			if err := h.Store.Rename(oldParent, string(body.Rename.GetOldName()), newParent, string(body.Rename.GetNewName()), flags); err != nil {
 				resp := h.errorResponse(0, err, false)
-				return resp, uncertainVisibilityTargets(resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced))
+				return resp, uncertainVisibilityTargets(resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, false))
 			}
-			return h.success(0), renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced)
+			return h.success(0), renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, true)
 		})
 	case *authoritypb.Request_Link:
 		var source, parent xfsstore.Capability
@@ -665,18 +784,18 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err == nil {
 				parentCoordinate, err = h.coordinateItem(parent)
 			}
-			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Link.GetNewName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0)}, err
+			return linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false), err
 		}
 		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			attr, err := h.Store.Link(source, parent, string(body.Link.GetNewName()))
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
-				targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Link.GetNewName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0)}
+				targets := linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false)
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
 			resp := h.success(0)
 			resp.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: itemProto(source, attr, sourceCoordinate.identity)}}
-			targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Link.GetNewName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0)}
+			targets := linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, true)
 			return resp, targets
 		})
 	case *authoritypb.Request_Symlink:
@@ -694,17 +813,25 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
 		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			reservation, err := h.reserveCapabilities(cred.ID, 1, 0)
+			if err != nil {
+				return h.errorResponse(0, err, false), nil
+			}
+			defer reservation.release()
 			item, attr, err := h.Store.Symlink(parent, string(body.Symlink.GetName()), string(body.Symlink.GetTarget()))
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
 				targets := []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
-			if err := h.trackItem(cred.ID, item, false); err != nil {
+			if err := reservation.commit([]trackedCapability{{value: item}}, nil); err != nil {
+				h.forgetItem(item)
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			itemIdentity, identityErr := h.Store.Identity(item)
 			if identityErr != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
 				return h.errorResponse(0, identityErr, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			resp := h.success(0)
@@ -727,19 +854,35 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		resp.Body = &authoritypb.Response_Readlink{Readlink: &authoritypb.ReadlinkReply{Target: []byte(target)}}
 		return resp
 	case *authoritypb.Request_Open:
+		var openedHandle xfsstore.Capability
+		cleanupOpenedHandle := func() {
+			if openedHandle == (xfsstore.Capability{}) {
+				return
+			}
+			h.untrackOpen(cred.ID, openedHandle)
+			h.closeOpen(openedHandle)
+			openedHandle = xfsstore.Capability{}
+		}
 		openApply := func(item xfsstore.Capability) *authoritypb.Response {
 			// A handle inherits its object's protection, so a read-only open of
 			// the declaration cannot be turned into a write by presenting the
 			// handle in place of the item.
 			protected := h.protectedCapability(cred.ID, item)
+			reservation, err := h.reserveCapabilities(cred.ID, 0, 1)
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			defer reservation.release()
 			handle, err := h.Store.OpenFile(item, openFlags(body.Open.GetFlags()))
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
-			if err := h.trackOpen(cred.ID, handle, protected); err != nil {
+			if err := reservation.commit(nil, []trackedCapability{{value: handle, protected: protected}}); err != nil {
+				h.closeOpen(handle)
 				uncertain := body.Open.GetFlags() != nil && body.Open.GetFlags().GetTruncate()
 				return h.errorResponse(0, err, uncertain)
 			}
+			openedHandle = handle
 			resp := h.success(0)
 			resp.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: handle[:]}}
 			return resp
@@ -770,6 +913,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			}
 			attr, err := h.Store.Getattr(item)
 			if err != nil {
+				cleanupOpenedHandle()
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
@@ -852,10 +996,15 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				n, err = h.Store.WriteAt(handle, body.Write.GetData(), int64(body.Write.GetOffset()))
 			}
 			resp := h.writeOutcome(n, assigned, err)
-			if resp.GetErrno() == 0 && !resp.GetUncertain() {
+			if visibilityChanged(resp) {
+				// A positive short count is already authoritative XFS progress even
+				// when the store then dies. COMPLETE must carry the actual resulting
+				// EOF; protobuf's default zero is not evidence and would let a peer
+				// truncate its cached object incorrectly. Failure to read EOF after
+				// apply returns an empty completion, which poisons the epoch closed.
 				attr, attrErr := h.Store.GetattrOpen(handle)
 				if attrErr != nil {
-					if n != 0 {
+					if n != 0 || resp.GetUncertain() {
 						return h.errorResponse(0, attrErr, true), []volumeserver.VisibilityTarget{}
 					}
 					return h.errorResponse(0, attrErr, false), nil
@@ -1260,13 +1409,18 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	if hello.GetProtocolMajor() != ProtocolMajor {
 		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
 	}
+	if !hasFeatures(hello.GetFeatures(), requiredHelloFeatures) {
+		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
+	}
 	if !h.validBounds() {
 		return h.errorResponse(requestID, syscall.EINVAL, false)
 	}
 	bounds := h.Bounds()
+	features := append([]string(nil), requiredHelloFeatures...)
+	features = append(features, peerCompleteFIFOFeedbackFeature)
 	resp := h.success(requestID)
 	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-		ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+		ProtocolMajor: ProtocolMajor, Features: features,
 		MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: h.MaxRead, MaxWriteBytes: h.MaxWrite,
 		MaxInFlight: uint32(bounds.MaxInFlight),
 	}}
@@ -1409,7 +1563,7 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	resp := h.success(requestID)
 	features := append([]string(nil), requiredAttachFeatures...)
 	if profile == volumeserver.CoherenceStrict {
-		features = append(features, "strict-two-phase-visibility")
+		features = append(features, requiredStrictAttachFeatures...)
 	}
 	resp.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: cred.ID[:], SessionGeneration: cred.Generation, ResumeSecret: cred.Secret[:], Root: itemProto(root, attr, rootIdentity), Features: features, SessionLeaseMilliseconds: uint64(h.Runtime.SessionLease() / time.Millisecond), VisibilityCursor: initialCursor, RoutesRevision: append([]byte(nil), presented[:]...)}}
 	attached = false
@@ -1477,15 +1631,16 @@ func (h *VolumeHandler) mutateVisible(
 			resp, _ := apply()
 			return resp
 		}
-		// The directories this mount's kernel is holding for the whole of this
-		// call are declared before it queues for mutation order and released
-		// once it is no longer waiting. That is what lets the coordinator tell a
-		// proven repair cycle from a slow lock; see
-		// VisibilityCoordinator.ReportBlocked.
-		leave := h.Visibility.EnterMutationOrder(cred.ID, h.heldDirectories(cred.ID, req)...)
-		defer leave()
+		held, err := h.heldDirectories(cred.ID, req)
+		if err != nil {
+			// Failing closed here is a liveness requirement, not only input
+			// validation. Silently dropping a parent would hide the exact kernel
+			// lock that a peer COMPLETE may need and recreate the cycle the
+			// interruption protocol exists to break.
+			return h.errorResponse(0, err, false)
+		}
 		var resp *authoritypb.Response
-		err := h.Visibility.Execute(ctx, cred.ID, id, prepare, func() ([]volumeserver.VisibilityTarget, bool) {
+		err = h.Visibility.ExecuteWithHeldParents(ctx, cred.ID, id, held, prepare, func() ([]volumeserver.VisibilityTarget, bool) {
 			var complete []volumeserver.VisibilityTarget
 			resp, complete = apply()
 			// nil is the explicit no-visible-change result. A non-nil empty
@@ -1496,6 +1651,12 @@ func (h *VolumeHandler) mutateVisible(
 		if err != nil {
 			var barrier *volumeserver.VisibilityBarrierError
 			uncertain := errors.As(err, &barrier) && barrier.Applied
+			if uncertain {
+				log.Printf(
+					"portablefs-authority: visible mutation applied but cache completion failed source=%x slot=%d sequence=%d frontend_operation_id=%d: %v",
+					cred.ID, id.Slot, id.Sequence, id.FrontendOperationID, err,
+				)
+			}
 			return h.errorResponse(0, err, uncertain)
 		}
 		// The initiating mount caches the inode it just created, and that
@@ -1525,7 +1686,11 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 	// operation reaches XFS. Refusing here is retryable; refusing after the
 	// filesystem changed would not be.
 	reserve := h.requestReplyReserve(req)
-	id := volumeserver.MutationID{Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Hash: hash}
+	id := volumeserver.MutationID{
+		Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Hash: hash,
+		FrontendOperationID:  req.GetFrontendOperationId(),
+		SourcePhaseQueueable: req.GetSourcePhaseQueueable(),
+	}
 	reserved, err := h.reserveReplyBytes(cred.ID, id.Slot, reserve)
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
@@ -1881,6 +2046,17 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		errno = errnos.EINVAL
 	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN
+	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
+		// This is a definite pre-apply interruption, not a coherence
+		// failure. Linux consumes EINTR to release the execution lane needed
+		// by its pending repair. The explicit class lets an FSKit frontend
+		// translate it to ECANCELED: macOS 26 may replay mutating callbacks on
+		// EINTR, EBUSY, or EAGAIN, and that replay has a new operation identity.
+		errno = errnos.EINTR
+		resp := h.success(requestID)
+		resp.Errno, resp.Uncertain = errno, uncertain
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED
+		return resp
 	case isVisibilityFenced(err):
 		// One mount left the barrier. Its session is gone and it must revoke
 		// its own kernel mount; the volume itself is unaffected, so this is a
@@ -2058,14 +2234,41 @@ func (h *VolumeHandler) lookupCoordinateSizeOptional(parent xfsstore.Capability,
 	return attrCoordinate(identity, attr), attr.Size, true, nil
 }
 
+func linkVisibilityTargets(
+	newName []byte,
+	parent, source visibilityCoordinate,
+	attestPostBinding bool,
+) []volumeserver.VisibilityTarget {
+	nameTarget := namespaceTargetRelated(parent, newName, source)
+	if attestPostBinding {
+		nameTarget = namespaceTargetPost(parent, newName, source)
+	}
+	return []volumeserver.VisibilityTarget{
+		nameTarget,
+		inodeTarget(volumeserver.VisibilityAttributes, parent, 0),
+		inodeTarget(volumeserver.VisibilityAttributes, source, 0),
+	}
+}
+
 func renameVisibilityTargets(
 	rename *authoritypb.RenameRequest,
 	oldParent, newParent, moved, replaced visibilityCoordinate,
-	hasReplacement bool,
+	hasReplacement, attestPostBindings bool,
 ) []volumeserver.VisibilityTarget {
+	oldNameTarget := namespaceTargetRelated(oldParent, rename.GetOldName(), moved)
+	newNameTarget := namespaceTargetRelated(newParent, rename.GetNewName(), moved)
+	if attestPostBindings {
+		newNameTarget = namespaceTargetPost(newParent, rename.GetNewName(), moved)
+		if rename.GetExchange() && hasReplacement {
+			oldNameTarget = namespaceTargetPost(oldParent, rename.GetOldName(), replaced)
+		}
+	}
+	if hasReplacement {
+		newNameTarget.RelatedIdentities = append(newNameTarget.RelatedIdentities, replaced.identity)
+	}
 	targets := []volumeserver.VisibilityTarget{
-		namespaceTarget(oldParent, rename.GetOldName()),
-		namespaceTarget(newParent, rename.GetNewName()),
+		oldNameTarget,
+		newNameTarget,
 		inodeTarget(volumeserver.VisibilityAttributes, oldParent, 0),
 		inodeTarget(volumeserver.VisibilityAttributes, newParent, 0),
 		inodeTarget(volumeserver.VisibilityAttributes, moved, 0),
@@ -2099,42 +2302,107 @@ func untrackCapability(set map[xfsstore.Capability]bool, cap xfsstore.Capability
 	*total--
 }
 
+func (h *VolumeHandler) reserveCapabilities(id volumeserver.SessionID, items, opens uint32) (*capabilityReservation, error) {
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	resources := h.resources[id]
+	switch {
+	case resources == nil || resources.ended:
+		return nil, volumeserver.ErrSessionExpired
+	case uint64(len(resources.items))+uint64(resources.reservedItems)+uint64(items) > uint64(h.MaxItemsPerSession) ||
+		uint64(h.totalItems)+uint64(items) > uint64(h.MaxItems) ||
+		uint64(len(resources.opens))+uint64(resources.reservedOpens)+uint64(opens) > uint64(h.MaxOpensPerSession) ||
+		uint64(h.totalOpens)+uint64(opens) > uint64(h.MaxOpens):
+		return nil, volumeserver.ErrAdmission
+	}
+	resources.reservedItems += items
+	resources.reservedOpens += opens
+	h.totalItems += items
+	h.totalOpens += opens
+	return &capabilityReservation{
+		h: h, id: id, resources: resources, items: items, opens: opens, active: true,
+	}, nil
+}
+
+func (r *capabilityReservation) release() {
+	if r == nil || r.h == nil {
+		return
+	}
+	r.h.resourcesMu.Lock()
+	defer r.h.resourcesMu.Unlock()
+	if !r.active {
+		return
+	}
+	// Session cleanup is deferred until every admitted handler exits, so the
+	// resource record must still be the one the reservation was charged to.
+	// Keep the identity check nevertheless: violating that lifetime invariant
+	// must not corrupt a replacement session's accounting.
+	if r.h.resources[r.id] == r.resources && !r.resources.ended {
+		r.resources.reservedItems -= r.items
+		r.resources.reservedOpens -= r.opens
+		r.h.totalItems -= r.items
+		r.h.totalOpens -= r.opens
+	}
+	r.active = false
+}
+
+func (r *capabilityReservation) commit(items, opens []trackedCapability) error {
+	if r == nil || r.h == nil || uint32(len(items)) != r.items || uint32(len(opens)) != r.opens {
+		return errInternal
+	}
+	r.h.resourcesMu.Lock()
+	defer r.h.resourcesMu.Unlock()
+	if !r.active {
+		return errInternal
+	}
+	resources := r.h.resources[r.id]
+	if resources != r.resources || resources == nil || resources.ended {
+		return volumeserver.ErrSessionExpired
+	}
+	resources.reservedItems -= r.items
+	resources.reservedOpens -= r.opens
+	for _, item := range items {
+		if current, exists := resources.items[item.value]; exists {
+			resources.items[item.value] = current || item.protected
+			// The reservation was charged as a new descriptor but this session
+			// already owned the capability, so return the redundant charge.
+			r.h.totalItems--
+		} else {
+			resources.items[item.value] = item.protected
+		}
+	}
+	for _, open := range opens {
+		if current, exists := resources.opens[open.value]; exists {
+			resources.opens[open.value] = current || open.protected
+			r.h.totalOpens--
+		} else {
+			resources.opens[open.value] = open.protected
+		}
+	}
+	r.active = false
+	return nil
+}
+
 func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capability, protected bool) error {
 	h.resourcesMu.Lock()
 	resources := h.resources[id]
+	alreadyTracked := false
+	if resources != nil {
+		_, alreadyTracked = resources.items[item]
+	}
 	var err error
 	switch {
 	case resources == nil || resources.ended:
 		err = volumeserver.ErrSessionExpired
-	case uint32(len(resources.items)) >= h.MaxItemsPerSession || h.totalItems >= h.MaxItems:
+	case alreadyTracked:
+		resources.items[item] = resources.items[item] || protected
+	case uint64(len(resources.items))+uint64(resources.reservedItems) >= uint64(h.MaxItemsPerSession) || h.totalItems >= h.MaxItems:
 		err = volumeserver.ErrAdmission
 	default:
 		trackCapability(resources.items, item, protected, &h.totalItems)
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {
-		h.forgetItem(item)
-	}
-	return err
-}
-
-func (h *VolumeHandler) trackItemAndOpen(id volumeserver.SessionID, item, handle xfsstore.Capability, protected bool) error {
-	h.resourcesMu.Lock()
-	resources := h.resources[id]
-	var err error
-	switch {
-	case resources == nil || resources.ended:
-		err = volumeserver.ErrSessionExpired
-	case uint32(len(resources.items)) >= h.MaxItemsPerSession || h.totalItems >= h.MaxItems ||
-		uint32(len(resources.opens)) >= h.MaxOpensPerSession || h.totalOpens >= h.MaxOpens:
-		err = volumeserver.ErrAdmission
-	default:
-		trackCapability(resources.items, item, protected, &h.totalItems)
-		trackCapability(resources.opens, handle, protected, &h.totalOpens)
-	}
-	h.resourcesMu.Unlock()
-	if err != nil {
-		h.closeOpen(handle)
 		h.forgetItem(item)
 	}
 	return err
@@ -2151,11 +2419,17 @@ func (h *VolumeHandler) untrackItem(id volumeserver.SessionID, item xfsstore.Cap
 func (h *VolumeHandler) trackOpen(id volumeserver.SessionID, handle xfsstore.Capability, protected bool) error {
 	h.resourcesMu.Lock()
 	resources := h.resources[id]
+	alreadyTracked := false
+	if resources != nil {
+		_, alreadyTracked = resources.opens[handle]
+	}
 	var err error
 	switch {
 	case resources == nil || resources.ended:
 		err = volumeserver.ErrSessionExpired
-	case uint32(len(resources.opens)) >= h.MaxOpensPerSession || h.totalOpens >= h.MaxOpens:
+	case alreadyTracked:
+		resources.opens[handle] = resources.opens[handle] || protected
+	case uint64(len(resources.opens))+uint64(resources.reservedOpens) >= uint64(h.MaxOpensPerSession) || h.totalOpens >= h.MaxOpens:
 		err = volumeserver.ErrAdmission
 	default:
 		trackCapability(resources.opens, handle, protected, &h.totalOpens)
@@ -2191,15 +2465,18 @@ func (h *VolumeHandler) closeSessionResources(id volumeserver.SessionID) {
 	for item := range resources.items {
 		items = append(items, item)
 	}
-	// Every insertion incremented these counters exactly once, so the totals
-	// are the sum of the live sets and the subtraction is exact.
-	h.totalOpens -= uint32(len(handles))
-	h.totalItems -= uint32(len(items))
+	// Every insertion or pre-apply reservation incremented these counters
+	// exactly once, so the subtraction is exact even if cleanup follows a
+	// handler that was interrupted between reservation and commit.
+	h.totalOpens -= uint32(len(handles)) + resources.reservedOpens
+	h.totalItems -= uint32(len(items)) + resources.reservedItems
 	for _, size := range resources.reply {
 		h.retainedReplyBytes -= uint64(size)
 	}
 	resources.opens = nil
 	resources.items = nil
+	resources.reservedItems = 0
+	resources.reservedOpens = 0
 	resources.reply = nil
 	h.resourcesMu.Unlock()
 	for _, handle := range handles {

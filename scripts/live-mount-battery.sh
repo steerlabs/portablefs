@@ -59,22 +59,36 @@ new = open(f"{t}/keep").read()     # path must see new content
 sys.exit(0 if (old == b"old" and new == "new") else 1)
 EOF
 
-# 7. git end-to-end
-# AppleDouble ._* files are expected on macOS (the mount has no native xattrs) — exclude them from the clean-tree check.
-(cd "$T" && mkdir repo && cd repo && git init -q . && echo x > f && git add f && git commit -qm init && git log --oneline | grep -q init && [ "$(git status --porcelain | grep -cv '^?? \._')" = "0" ]) && ok "git init/add/commit/status" || bad "git init/add/commit/status"
+# 7. xattr refusal must stop at PortableFS. Darwin treats ENOTSUP as an
+# instruction to synthesize an AppleDouble ._* sidecar, so the FSKit boundary
+# deliberately exposes its distinct EOPNOTSUPP and the durable namespace must
+# remain sidecar-free.
+echo x > "$T/xattr-probe"
+python3 - "$T/xattr-probe" <<'EOF' && [ ! -e "$T/._xattr-probe" ] && ok "xattr EOPNOTSUPP without AppleDouble" || bad "xattr refusal or AppleDouble boundary"
+import ctypes, errno, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+libc.setxattr.restype = ctypes.c_int
+value = ctypes.create_string_buffer(b"must-refuse")
+result = libc.setxattr(os.fsencode(sys.argv[1]), b"user.portablefs.battery", value, len(value.raw) - 1, 0, 0)
+sys.exit(0 if result == -1 and ctypes.get_errno() == errno.EOPNOTSUPP else 1)
+EOF
 
-# 7b. git stash/branch churn (regression: .git dir deletion during stash)
+# 8. git end-to-end
+(cd "$T" && mkdir repo && cd repo && git init -q . && echo x > f && git add f && git commit -qm init && git log --oneline | grep -q init && [ -z "$(git status --porcelain)" ]) && ok "git init/add/commit/status" || bad "git init/add/commit/status"
+
+# 8b. git stash/branch churn (regression: .git dir deletion during stash)
 (cd "$T/repo" && echo tweak >> f && git stash -q && git stash pop -q && git checkout -q -b side && echo s > s.txt && git add s.txt && git commit -qm side && git checkout -q - && [ -d .git ] && git log --oneline | grep -q init) && ok "git stash/branch churn" || bad "git stash/branch churn"
 
-# 8. 8MiB hash round-trip
+# 9. 8MiB hash round-trip
 dd if=/dev/urandom of="$T/big" bs=1m count=8 2>/dev/null
 H1=$(shasum "$T/big" | cut -d' ' -f1); cp "$T/big" "$T/big2"; H2=$(shasum "$T/big2" | cut -d' ' -f1)
 [ "$H1" = "$H2" ] && ok "8MiB hash round-trip" || bad "8MiB hash round-trip"
 
-# 9. sqlite
+# 10. sqlite
 sqlite3 "$T/t.db" "create table t(x); insert into t values(1),(2); select count(*) from t;" 2>/dev/null | grep -q 2 && ok "sqlite" || bad "sqlite"
 
-# 10. unlink-while-open
+# 11. unlink-while-open
 python3 - "$T" <<'EOF' && ok "open-after-unlink" || bad "open-after-unlink"
 import sys, os
 t = sys.argv[1]
@@ -94,6 +108,8 @@ EOF
 # 12. deep tree + enumerate
 mkdir -p "$T/deep/a/b/c" && for i in $(seq 1 60); do echo $i > "$T/deep/a/f$i"; done
 [ "$(ls "$T/deep/a" | wc -l | tr -d ' ')" = "61" ] && ok "60-entry enumerate" || bad "60-entry enumerate"
+
+[ -z "$(find "$T" -name '._*' -print -quit)" ] && ok "no AppleDouble sidecars" || bad "AppleDouble sidecar leaked into durable namespace"
 
 # cleanup — and one final identity assertion, so a mount that died after the
 # last case cannot present a green RESULT line.

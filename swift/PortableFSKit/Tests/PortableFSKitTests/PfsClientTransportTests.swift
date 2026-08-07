@@ -73,6 +73,174 @@ private final class PfsWeakWriteReceiptBox {
     }
 }
 
+@Test func copiedResourceLeaseCompletesExactlyOnce() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    await daemon.resetStats()
+
+    var open = PfsOpenRequest()
+    open.item = resolved.root
+    open.mode = .read
+    let lease = try await client.requestResource(.open(open))
+    guard case let .openReply(reply)? = lease.envelope.body else {
+        Issue.record("mock open omitted its reply")
+        return
+    }
+    let copiedLease = lease
+    lease.acceptHandles()
+    await lease.complete(itemsPublished: true)
+    await copiedLease.complete(itemsPublished: false)
+
+    for _ in 0..<100 where await daemon.stats().resourceAccepts == 0 {
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    var stats = await daemon.stats()
+    #expect(stats.resourceAccepts == 1)
+    #expect(stats.resourceAbandons == 0)
+    #expect(stats.activeHandles == 1)
+
+    var close = PfsCloseRequest()
+    close.handle = reply.handle
+    _ = try await client.request(.close(close))
+    stats = await daemon.stats()
+    #expect(stats.activeHandles == 0)
+}
+
+@Test func canceledOpenExplicitlyAbandonsItsLateHandle() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    await daemon.delayNextOpen(nanoseconds: 100_000_000)
+    await daemon.resetStats()
+
+    var open = PfsOpenRequest()
+    open.item = resolved.root
+    open.mode = .read
+    let request = Task {
+        try await client.request(.open(open))
+    }
+    for _ in 0..<100 where await daemon.stats().openRequests == 0 {
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    request.cancel()
+    await #expect(throws: PfsLocalClientError.cancelled) {
+        try await request.value
+    }
+    for _ in 0..<300 where await daemon.stats().resourceAbandons == 0 {
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    let stats = await daemon.stats()
+    #expect(stats.resourceAccepts == 0)
+    #expect(stats.resourceAbandons == 1)
+    #expect(stats.activeHandles == 0)
+
+    // Late resource cleanup is request-scoped; it must not poison the mount.
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
+}
+
+@available(macOS 26.0, *)
+@Test func orderedRequestsStampExactSourcePhaseQueueabilityOnTheWire() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    var create = PfsCreateRequest()
+    create.dir = resolved.root
+    create.name = transportBytes("source-phase-queueability")
+    create.mode = 0o644
+    create.exclusive = true
+    let created = try await client.withPublicationBoundary {
+        try await client.request(.create(create))
+    }
+    guard case let .createReply(createReply)? = created.body else {
+        Issue.record("mock create omitted its reply")
+        return
+    }
+    await daemon.resetStats()
+
+    let orderedOnly = PfsMacOSAdmittedCallbackTicket(
+        scope: PfsMacOSCallbackScope(selectors: [.orderedMutation])
+    )
+    var firstWrite = PfsWriteRequest()
+    firstWrite.handle = createReply.handle
+    firstWrite.data = transportBytes("ordered-only")
+    _ = try await PfsMacOSCallbackAdmission.$ticket.withValue(orderedOnly) {
+        try await client.withPublicationBoundary {
+            try await client.request(.write(firstWrite))
+        }
+    }
+
+    let mixed = PfsMacOSAdmittedCallbackTicket(
+        scope: PfsMacOSCallbackScope(selectors: [.orderedMutation])
+    )
+    _ = try await PfsMacOSCallbackAdmission.$ticket.withValue(mixed) {
+        try await client.withPublicationBoundary {
+            // Opening is nonpublishing but still ordinary callback history. The
+            // following write must therefore tell the authority not to queue
+            // this callback behind a distinct own-source PREPARE.
+            var open = PfsOpenRequest()
+            open.item = createReply.attr.item
+            open.mode = .readWrite
+            let opened = try await client.request(.open(open))
+            guard case let .openReply(openReply)? = opened.body else {
+                throw PfsLocalClientError.unexpectedReply(
+                    String(describing: opened.body)
+                )
+            }
+            var write = PfsWriteRequest()
+            write.handle = openReply.handle
+            write.data = transportBytes("mixed")
+            return try await client.request(.write(write))
+        }
+    }
+
+    let stats = await daemon.stats()
+    #expect(stats.openRequests == 1)
+    #expect(stats.writeRequests == 2)
+    #expect(stats.orderedMutationSourcePhaseQueueable == [true, false])
+}
+
+@Test func queueableOrderedRequestWithoutOperationIdentityFailsLocally() throws {
+    do {
+        try pfsValidateSourcePhaseQueueability(true, operationID: 0)
+        Issue.record("queueable request without an operation ID succeeded")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .invalidFrame(
+            "source-phase-queueable ordered mutation requires an operation ID"
+        ))
+    }
+    #expect(throws: Never.self) {
+        try pfsValidateSourcePhaseQueueability(false, operationID: 0)
+    }
+    #expect(throws: Never.self) {
+        try pfsValidateSourcePhaseQueueability(true, operationID: 8)
+    }
+}
+
+@Test func daemonCannotSetRequestOnlySourcePhaseQueueability() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(
+        sourcePhaseQueueableOnReplies: true
+    ))
+    defer { daemon.stop() }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxReconnectAttempts: 1)
+    )
+
+    do {
+        _ = try await client.resolve(attachRef: "mock")
+        Issue.record("client accepted request-only metadata on a daemon reply")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .invalidFrame(
+            "daemon reply/event set request-only source_phase_queueable"
+        ))
+    }
+}
+
 private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     var envelope = PfsEnvelope()
     envelope.requestID = requestID
@@ -337,7 +505,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// interrupted process into a permanently fenced mount.
 @Test func requestCancellationLeavesTheStrictConnectionAndItsPublicationsIntact() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 2
+    contract.authorityProtocolMajor = 3
     contract.authorityEpoch = Data(repeating: 0xE1, count: 16)
     contract.sessionID = Data(repeating: 0x51, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
@@ -397,6 +565,100 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
 }
 
+/// Cancellation after an ordered mutation has crossed the socket cannot be
+/// reported as EINTR: the daemon still owns the exact authority request and
+/// may commit it. The frontend therefore drains the real result even though
+/// the initiating Swift task is cancelled.
+@Test func dispatchedMutationCancellationDrainsItsExactOutcome() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    let created = try await core.createFile(
+        in: root,
+        name: transportBytes("cancelled-write"),
+        mode: 0o644
+    )
+    await daemon.resetStats()
+    await daemon.delayNextWrite(nanoseconds: 100_000_000)
+
+    let write = Task {
+        try await core.write(
+            item: created.item,
+            offset: 0,
+            data: Data("committed".utf8)
+        )
+    }
+    for _ in 0..<200 {
+        if await daemon.stats().writeRequests == 1 { break }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    #expect(await daemon.stats().writeRequests == 1)
+    write.cancel()
+
+    let outcome = try await write.value
+    #expect(outcome.written == 9)
+    #expect(try await core.read(item: created.item, offset: 0, length: 9) == Data("committed".utf8))
+    #expect(await daemon.stats().writeRequests == 1)
+}
+
+/// A daemon-derived hard deadline is the point at which the exact mutation
+/// outcome is no longer recoverable. That is terminal for a strict mount: the
+/// client returns EIO and closes the participant instead of exposing a
+/// retryable timeout while the daemon may still apply the request.
+@Test func dispatchedMutationTimeoutTerminatesStrictMountAsUncertain() async throws {
+    var contract = PfsV3CoherenceContract()
+    contract.authorityProtocolMajor = 3
+    contract.authorityEpoch = Data(repeating: 0xE3, count: 16)
+    contract.sessionID = Data(repeating: 0x53, count: 16)
+    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
+    contract.repairBudgetMillis = 2_500
+    let daemon = try PfsLocalMockDaemon(configuration: .init(v3Coherence: contract))
+    defer { daemon.stop() }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(requestDeadlineNanoseconds: 20_000_000)
+    )
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    var create = PfsCreateRequest()
+    create.dir = resolved.root
+    create.name = transportBytes("timed-write")
+    create.mode = 0o644
+    create.exclusive = true
+    let created = try await client.withPublicationBoundary {
+        try await client.request(.create(create))
+    }
+    guard case let .createReply(createReply)? = created.body else {
+        Issue.record("mock create omitted its reply")
+        return
+    }
+
+    await daemon.delayNextWrite(nanoseconds: 100_000_000)
+    var write = PfsWriteRequest()
+    write.handle = createReply.handle
+    write.data = Data("late".utf8)
+    do {
+        _ = try await client.withPublicationBoundary {
+            try await client.request(.write(write))
+        }
+        Issue.record("expected the strict mutation deadline to terminate the mount")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EIO)
+        guard case .system(errno: ETIMEDOUT, operation: "ordered mutation outcome deadline") = error else {
+            Issue.record("unexpected terminal mutation error: \(error)")
+            return
+        }
+    }
+    #expect(await client.testingPendingRequestCount() == 0)
+    do {
+        _ = try await client.request(.statfs(PfsStatfsRequest()))
+        Issue.record("strict client reconnected after an uncertain mutation")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .connectionClosed)
+    }
+}
+
 /// The lane-overtake race, pinned. A publishing request travels the ordinary
 /// lane; its operation's acknowledgement travels the priority publication
 /// lane, which the writer dequeues first. An immediate cancellation once let
@@ -406,7 +668,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// recurrence kills the connection and fails the follow-up below.
 @Test func immediateCancellationNeverLetsTheAckOvertakeItsRequest() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 2
+    contract.authorityProtocolMajor = 3
     contract.authorityEpoch = Data(repeating: 0xE2, count: 16)
     contract.sessionID = Data(repeating: 0x52, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
@@ -510,7 +772,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     } catch let error as PfsLocalClientError {
         #expect(error == .connectionClosed)
     }
-    await complete()
+    await complete(false)
 
     var stats = await daemon.stats()
     #expect(stats.publicationAcks == 0)
@@ -574,7 +836,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     } catch let error as PfsLocalClientError {
         #expect(error == .connectionClosed)
     }
-    await complete()
+    await complete(false)
 
     let stats = await daemon.stats()
     #expect(stats.publicationAcks == 0)
@@ -661,13 +923,44 @@ private func settledAckBaseline(
     // about what the FRAMEWORK installs, not about the daemon's bookkeeping.
     // The retracted attempt's ack was sent before the reissue began, so the
     // reissue could not queue behind the handoff waiting for it.
-    await complete()
+    await complete(true)
     let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
     #expect(stats.publicationAcks == baseline + 2)
 
     // The connection is unaffected — a retraction is the daemon speaking on a
     // healthy connection, not a transport failure.
     _ = try await client.request(.statfs(PfsStatfsRequest()))
+}
+
+/// Retraction creates a fresh logical operation for the transparent retry, but
+/// the FSKit framework callback (and therefore its admission ticket) is the
+/// same. The barrier must see the surviving attempt's ID; retaining attempt
+/// one's already-acknowledged ID lets source COMPLETE pass without awaiting the
+/// actual framework publication.
+@Test func retractedRetryUpdatesAdmissionTicketToTheSurvivingOperationID() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+    let ticket = PfsMacOSAdmittedCallbackTicket()
+
+    await daemon.retractNextPublications()
+    let (result, complete) = await PfsMacOSCallbackAdmission.$ticket.withValue(ticket) {
+        await client.withDeferredPublication {
+            try await client.request(.getAttr(getattr))
+        }
+    }
+    _ = try result.get()
+
+    // Resolve is nonpublishing, so the retracted attempt owns ID 1 and the
+    // surviving retry owns ID 2 on this fresh connection.
+    #expect(ticket.currentOperationID() == 2)
+    await complete(true)
+    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: 2)
+    #expect(stats.publicationAcks == 2)
 }
 
 @Test func retractedPublicationBoundaryIsReissuedAndBothAttemptsAcknowledged() async throws {
@@ -728,7 +1021,7 @@ private func settledAckBaseline(
         #expect(error == .publicationRetracted)
     }
 
-    await complete()
+    await complete(false)
     // Both requests of an attempt share one operation ID, so each ATTEMPT owes
     // exactly one acknowledgement — and every attempt made is acknowledged.
     let attempts = PfsLocalClient.publicationRetractionReissueLimit
@@ -779,7 +1072,7 @@ private func settledAckBaseline(
         #expect(error == .publicationRetracted)
         #expect(error.posixErrno == EINTR)
     }
-    await complete()
+    await complete(false)
 
     // Every attempt is acknowledged; none of them mutated anything.
     let attempts = PfsLocalClient.publicationRetractionReissueLimit
@@ -821,7 +1114,7 @@ private func settledAckBaseline(
     }
     #expect(reply.attr.item.itemID == resolved.root.itemID)
 
-    await complete()
+    await complete(true)
     let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 1)
     #expect(stats.publicationAcks == baseline + 1)
 

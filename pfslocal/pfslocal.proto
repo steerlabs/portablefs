@@ -11,10 +11,12 @@
 // request lane for all other bodies. Each lane is FIFO with increasing IDs;
 // the two interleave on the wire, so a control frame may legally carry a
 // LOWER id than an already-received ordinary frame and the daemon keeps one
-// replay watermark per lane. PublicationAck is the sole
-// one-way client message and uses request_id 0; it confirms that an earlier
-// operation reply — including a cacheable negative/error such as ENOENT — has
-// been fully published to the kernel, not merely read from the socket.
+// replay watermark per lane. PublicationAck and ResourceReplyDisposition are
+// one-way client messages and use request_id 0. PublicationAck confirms that an
+// earlier operation reply — including a cacheable negative/error such as ENOENT
+// — has been fully published to the kernel, not merely read from the socket.
+// ResourceReplyDisposition transfers or abandons provisional daemon handles
+// and item capabilities.
 // Daemon→client envelopes either
 // echo a request_id (exactly one reply per request) or carry request_id 0 for
 // server-initiated Events. Requests may be pipelined; replies may arrive out of
@@ -45,6 +47,30 @@
 // frontends use this as an end-to-end proof that the daemon can still reach
 // the exact authority epoch/session from Resolve; a live UDS alone is not a
 // coherence proof.
+// Protocol minor 10 makes EnumerateRequest.handle mandatory. Authority
+// directory cookies belong to the retained open handle that issued them; a
+// frontend or daemon that omits this field cannot resume a multi-page walk
+// without either truncating it or silently repositioning it.
+// Protocol minor 11 adds Envelope.source_phase_queueable. The bit is the
+// frontend's per-request proof that an ordered-only callback can remain parked
+// behind a distinct callback's own-source visibility phase. An older daemon
+// would infer that proof from operation-ID inequality alone and can deadlock a
+// mixed read-then-mutate callback in PREPARE, so pairing across this boundary is
+// a correctness failure.
+// Protocol minor 12 adds ResourceReplyDisposition. OpenReply and CreateReply
+// carry daemon handles whose ownership cannot be inferred from socket delivery:
+// the frontend may cancel before observing the reply, or reject an otherwise
+// successful callback at its final framework-publication boundary. The daemon
+// therefore keeps each returned resource provisional until the frontend sends
+// exactly one handle/item ownership disposition for the reply's request ID.
+// Protocol minor 13 adds VisibilityAckRequest.ordered_admission_contended. The
+// exact peer COMPLETE Ack may carry one optional, liveness-only hint for
+// measured ordered-callback contention. A pre-13 daemon would discard the hint
+// and cannot preserve the one-shot effective-FIFO compensation tied to it.
+// Protocol minor 14 adds VisibilityTarget.post_identity. It binds a namespace
+// coordinate to its exact authority post-mutation owner, allowing macOS to
+// inode-attest a new rename/hard-link repair source instead of reusing an old
+// pathname whose authority stability ended at a namespace event.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -137,6 +163,15 @@ message Envelope {
   // its own, and that rejection IS the gate: it is the only mechanism that
   // can guarantee no connected frontend ignores the bit.
   bool publication_retracted = 4;
+  // Set only on a client-to-daemon ordered mutation with a nonzero operation
+  // ID. True means this exact request belongs to a callback that has submitted
+  // no ordinary/cache-reading request, so a distinct own-source PREPARE will
+  // exclude the callback from its drain while the authority parks this
+  // mutation. False is fail-safe: the authority interrupts before apply.
+  //
+  // This is scheduling metadata, not a capability. The daemon validates its
+  // wire shape and forwards it to the authority's visibility coordinator.
+  bool source_phase_queueable = 5;
   oneof body {
     // client → daemon
     Hello hello = 10;
@@ -168,6 +203,7 @@ message Envelope {
     PublicationAck publication_ack = 36;
     VisibilityAckRequest visibility_ack = 37;
     V3LivenessRequest v3_liveness = 38;
+    ResourceReplyDisposition resource_reply_disposition = 39;
 
     // daemon → client (replies)
     HelloReply hello_reply = 60;
@@ -223,6 +259,22 @@ message PublicationAck {
   // minors 2 and later leave it zero and acknowledge operation_id instead.
   uint64 published_request_id = 1;
   uint64 operation_id = 2;
+}
+
+// Final frontend ownership verdict for one successful resource-bearing reply.
+// The envelope request_id is zero and target_request_id names the original
+// request on this exact connection. Handle ownership and item publication are
+// deliberately independent: Create returns both, and VolumeCore can own its
+// installed handle even when the framework refuses the returned item.
+message ResourceReplyDisposition {
+  uint64 target_request_id = 1;
+  // True exactly when VolumeCore installed the reply's returned handle in its
+  // actor-owned handle table. The handle will subsequently retire via Close.
+  bool accept_handles = 2;
+  // Exact published prefix length in the reply's ordered provisional-item
+  // sequence. A count preserves duplicate hard links correctly. Zero abandons
+  // every item; a full count accepts all. Open replies have no item sequence.
+  uint32 accepted_item_count = 3;
 }
 
 message HelloReply {
@@ -293,6 +345,14 @@ message V3LivenessReply {
 message Capabilities {
   bool symlinks = 1;
   bool hard_links = 2;
+  // xattrs is TRUE when the frontend may expose the pfslocal xattr operation
+  // family. It is not a promise that every operation succeeds for every
+  // backing: the production v3 XFS attach supports get, list, and removal of
+  // pre-existing portable user attributes while xattr_set_supported is FALSE.
+  // FSKit validates set input, refuses it locally with the internal Darwin
+  // ENOTSUP representation, and translates that boundary verdict to Darwin's
+  // distinct EOPNOTSUPP so XNU cannot invoke AppleDouble fallback. FALSE is
+  // reserved for a daemon with no xattr surface at all.
   bool xattrs = 3;
   bool case_sensitive = 4;
   uint32 max_name_bytes = 5;    // e.g. 255
@@ -331,6 +391,15 @@ message Capabilities {
   // the kernel refuses changes that would have succeeded. Per-object refusal
   // comes back as an errno on the request that asked for it.
   bool flags_understood = 9;
+  // xattr_set_supported is TRUE exactly when this daemon will accept an
+  // XattrSetRequest for at least one ordinary volume object. Xattrs remains
+  // the operation-family capability: get/list/remove can stay available while
+  // this narrower mutation capability is FALSE. A frontend must validate the
+  // caller's item and name first, then refuse set/create/replace/upsert locally
+  // when this field is false so an unsupported user operation never enters the
+  // ordered-mutation/publication machinery. Process-local repair scratch is
+  // outside pfslocal and is therefore unaffected.
+  bool xattr_set_supported = 10;
 }
 
 // ---------- core types ----------
@@ -397,6 +466,7 @@ message EnumerateRequest {
   uint64 cookie = 2;      // 0 = start; else opaque continuation from prior reply
   uint32 max_entries = 3; // daemon may return fewer
   bool want_attrs = 4;    // readdir-plus
+  uint64 handle = 5;      // required retained read handle for this directory walk
 }
 message DirEntry {
   bytes name = 1;
@@ -582,12 +652,14 @@ message XattrRemoveReply {}
 
 // ---------- volume sync / statfs / reclaim ----------
 
-// SyncVolume is the REAL volume barrier behind FSKit's synchronize and the
-// CLI's pre-unmount drain. Success means the accepted tail is locally synced,
-// durable and applied at the authority, and every live protocol subscriber reached its
-// supported invalidation boundary. There is no local-only success: an
-// unreachable, slow, or fenced authority fails the request. `degraded` is
-// retired wire ballast and is always false.
+// SyncVolume is the authority durability barrier behind FSKit's synchronize
+// and the CLI's pre-unmount durability call. V3 has no client or daemon
+// write-back tail: mutations are synchronous authority calls against raw XFS.
+// Success means all prior authority operations are applied and the authority's
+// `syncfs` cut completed. Cache-visible mutations retain their separate
+// two-phase repair boundary. There is no local-only success: an unreachable,
+// slow, or fenced authority fails the request. `degraded` is retired wire
+// ballast and is always false.
 message SyncVolumeRequest {}
 message SyncVolumeReply {
   bool degraded = 1;
@@ -635,6 +707,8 @@ message VisibilityTarget {
   bytes parent_identity = 3;
   bytes name = 4;
   int64 size = 5;
+  // Authority-attested post-mutation owner for a namespace coordinate.
+  bytes post_identity = 6;
 }
 
 message RoutesChange {
@@ -662,6 +736,9 @@ message VisibilityAckRequest {
   VisibilityCursor cursor = 2;
   bool blocked = 3;
   string reason = 4;
+  // Liveness-only feedback carried on the exact peer COMPLETE Ack. It is false
+  // for PREPARE, source COMPLETE, terminal reports, and older minor peers.
+  bool ordered_admission_contended = 5;
 }
 
 message VisibilityAckReply {}

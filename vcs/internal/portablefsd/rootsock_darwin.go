@@ -32,8 +32,15 @@ func openVerifiedMountRoot(mountPath, attachRef string) (int, error) {
 	return fd, nil
 }
 
-func closeMountRootFD(fd int)        { _ = unix.Close(fd) }
-func mountRootRights(fd int) []byte  { return unix.UnixRights(fd) }
+func closeMountRootFD(fd int) { _ = unix.Close(fd) }
+func duplicateMountRootFD(fd int) (int, error) {
+	duplicated, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("duplicate mount root: %w", err)
+	}
+	return duplicated, nil
+}
+func mountRootRights(fd int) []byte { return unix.UnixRights(fd) }
 
 func cString(raw []byte) string {
 	for i, b := range raw {

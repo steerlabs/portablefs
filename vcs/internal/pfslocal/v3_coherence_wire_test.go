@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-func TestProtocolMinorIncludesV3CoherenceAndLiveness(t *testing.T) {
-	if ProtocolMinor != 9 {
-		t.Fatalf("ProtocolMinor = %d, want 9", ProtocolMinor)
+func TestProtocolMinorIncludesNamespacePostIdentity(t *testing.T) {
+	if ProtocolMinor != 14 {
+		t.Fatalf("ProtocolMinor = %d, want 14", ProtocolMinor)
 	}
 	if VisibilityPhasePrepare != 1 || VisibilityPhaseComplete != 2 {
 		t.Fatalf("visibility phase values changed: prepare=%d complete=%d", VisibilityPhasePrepare, VisibilityPhaseComplete)
@@ -16,6 +16,33 @@ func TestProtocolMinorIncludesV3CoherenceAndLiveness(t *testing.T) {
 	if VisibilityScopeNamespace != 1 || VisibilityScopeData != 2 || VisibilityScopeAttributes != 3 {
 		t.Fatalf("visibility scope values changed: namespace=%d data=%d attributes=%d",
 			VisibilityScopeNamespace, VisibilityScopeData, VisibilityScopeAttributes)
+	}
+}
+
+func TestResourceReplyDispositionRoundTrip(t *testing.T) {
+	for _, want := range []*ResourceReplyDisposition{
+		{TargetRequestID: 41},
+		{TargetRequestID: 41, AcceptHandles: true},
+		{TargetRequestID: 41, AcceptedItemCount: 2},
+		{TargetRequestID: 41, AcceptHandles: true, AcceptedItemCount: 1},
+	} {
+		decoded := roundTripBody(t, want)
+		if !reflect.DeepEqual(decoded, want) {
+			t.Fatalf("resource reply disposition round trip: got %#v, want %#v", decoded, want)
+		}
+		wire, err := MarshalEnvelope(&Envelope{RequestID: 0, Body: want})
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertWireField(t, wire, 39, wireBytes)
+		fields := []int{1}
+		if want.AcceptHandles {
+			fields = append(fields, 2)
+		}
+		if want.AcceptedItemCount != 0 {
+			fields = append(fields, 3)
+		}
+		assertWireFields(t, marshalResourceReplyDisposition(want), fields...)
 	}
 }
 
@@ -31,7 +58,7 @@ func TestV3CoherenceResolveReplyRoundTrip(t *testing.T) {
 			MaxNameBytes: 255, PreferredIOSize: 1 << 20,
 		},
 		V3Coherence: &V3CoherenceContract{
-			AuthorityProtocolMajor: 2,
+			AuthorityProtocolMajor: 3,
 			AuthorityEpoch:         bytes.Repeat([]byte{0xa1}, 16),
 			SessionID:              bytes.Repeat([]byte{0xb2}, 16),
 			CachePolicy:            "macos26-synchronous-vfs-repair-v1",
@@ -116,6 +143,7 @@ func TestV3VisibilityEventRoundTrip(t *testing.T) {
 				Scope:          VisibilityScopeNamespace,
 				ParentIdentity: bytes.Repeat([]byte{0x33}, 16),
 				Name:           []byte("renamed"),
+				PostIdentity:   bytes.Repeat([]byte{0x34}, 16),
 			},
 			{
 				Scope:    VisibilityScopeData,
@@ -141,7 +169,7 @@ func TestV3VisibilityEventRoundTrip(t *testing.T) {
 	visibility := want.Kind.(*V3VisibilityEvent)
 	assertWireFields(t, marshalV3VisibilityEvent(visibility), 1, 2, 3, 4, 5, 6, 8)
 	assertWireFields(t, marshalVisibilityCursor(&visibility.Cursor), 1, 2)
-	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[0]), 1, 3, 4)
+	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[0]), 1, 3, 4, 6)
 	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[1]), 1, 2, 5)
 	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[2]), 1, 2)
 }
@@ -169,10 +197,11 @@ func TestV3RoutesVisibilityEventRoundTrip(t *testing.T) {
 
 func TestVisibilityAckBodiesRoundTripAndPinEnvelopeFields(t *testing.T) {
 	want := &VisibilityAckRequest{
-		AuthorityEpoch: bytes.Repeat([]byte{0x71}, 16),
-		Cursor:         VisibilityCursor{Sequence: 101, Phase: VisibilityPhaseComplete},
-		Blocked:        true,
-		Reason:         "namespace repair waits on a callback lock",
+		AuthorityEpoch:            bytes.Repeat([]byte{0x71}, 16),
+		Cursor:                    VisibilityCursor{Sequence: 101, Phase: VisibilityPhaseComplete},
+		Blocked:                   true,
+		Reason:                    "namespace repair waits on a callback lock",
+		OrderedAdmissionContended: true,
 	}
 	decoded := roundTripBody(t, want)
 	if !reflect.DeepEqual(decoded, want) {
@@ -184,7 +213,7 @@ func TestVisibilityAckBodiesRoundTripAndPinEnvelopeFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertWireField(t, requestWire, 37, wireBytes)
-	assertWireFields(t, marshalVisibilityAckRequest(want), 1, 2, 3, 4)
+	assertWireFields(t, marshalVisibilityAckRequest(want), 1, 2, 3, 4, 5)
 
 	reply := &VisibilityAckReply{}
 	if got := roundTripBody(t, reply); !reflect.DeepEqual(got, reply) {

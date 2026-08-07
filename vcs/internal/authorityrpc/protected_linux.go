@@ -154,7 +154,7 @@ func (h *VolumeHandler) refuseProtectedNamespace(id volumeserver.SessionID, req 
 // value the peer can state wrongly. Operations that hold only a file's lock,
 // or no directory lock at all, contribute nothing: a file's i_rwsem is not what
 // fuse_reverse_inval_entry takes.
-func (h *VolumeHandler) heldDirectories(id volumeserver.SessionID, req *authoritypb.Request) [][16]byte {
+func (h *VolumeHandler) heldDirectories(id volumeserver.SessionID, req *authoritypb.Request) ([][16]byte, error) {
 	var raw [][]byte
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_Create:
@@ -170,19 +170,19 @@ func (h *VolumeHandler) heldDirectories(id volumeserver.SessionID, req *authorit
 	case *authoritypb.Request_Rename:
 		raw = [][]byte{body.Rename.GetOldParent(), body.Rename.GetNewParent()}
 	default:
-		return nil
+		return nil, nil
 	}
 	directories := make([][16]byte, 0, len(raw))
 	for _, token := range raw {
 		capability, err := h.item(id, token)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		identity, err := h.Store.Identity(capability)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		directories = append(directories, identity)
 	}
-	return directories
+	return directories, nil
 }

@@ -18,12 +18,11 @@ These are not regressions to be optimised away later. They are the price of the
 guarantees in [consistency-model.md](./consistency-model.md), and a change that
 removes one of them has to explain which guarantee it is trading.
 
-**Every acknowledged write crosses the wire.** There is no client write-back
-cache. `write(2)` returns after the authority applied the bytes to XFS, so the
-cost of a write is at least one round trip, and a workload that writes many small
-files pays that per file. A local filesystem answers from page cache and defers;
-PortableFS cannot, because deferring is exactly what would let one machine
-acknowledge data another machine cannot see.
+**Every data-plane write crosses the wire.** There is no PortableFS-managed
+write-back cache. Linux direct-I/O `write(2)` pays at least one authority round
+trip. macOS may coalesce application writes in its ordinary kernel page cache;
+each FSKit write callback crosses the authority, and `fsync` is the explicit
+completion boundary. Benchmarks must identify which syscall boundary they time.
 
 **`uncached` crosses the wire for every operation.** In the `uncached` profile
 names and attributes have zero TTL, so a path walk of depth *n* is *n* lookups on

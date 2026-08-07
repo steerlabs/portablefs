@@ -14,11 +14,12 @@ go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
 
-swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+swift test --package-path swift/PortableFSKit --no-parallel
 ```
 
-`--num-workers 1` on the Swift suite is required, not a tuning choice: several
-tests bind fixed per-process resources and deadlock under multiple workers.
+`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
+Testing can otherwise run cases concurrently inside one worker, and several
+tests share process resources or exercise hard protocol deadlines.
 
 ## Before You Finish
 

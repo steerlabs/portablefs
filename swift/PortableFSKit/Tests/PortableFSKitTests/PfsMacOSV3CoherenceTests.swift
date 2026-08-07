@@ -34,9 +34,16 @@ private actor RecordingTransport: PfsMacOSCoherenceTransport {
 private actor RecordingBackend: PfsMacOSCoherenceBackend {
     nonisolated let policy = PfsMacOSCachePolicy.synchronousVFSRepairV1
     private(set) var events: [PfsMacOSCoherenceEvent] = []
+    private(set) var acknowledgedEvents: [PfsMacOSCoherenceEvent] = []
 
     func repair(_ event: PfsMacOSCoherenceEvent) async throws { events.append(event) }
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async {
+        acknowledgedEvents.append(event)
+    }
     func count() -> Int { events.count }
+    func acknowledgedPhases() -> [PfsMacOSVisibilityPhase] {
+        acknowledgedEvents.map(\.phase)
+    }
 }
 
 @Test func coherenceRunnerOrdersBothPhasesAndIdempotentlyReacks() async throws {
@@ -75,6 +82,9 @@ private actor RecordingBackend: PfsMacOSCoherenceBackend {
     try await runner.consume(nextPrepare)
 
     #expect(await backend.count() == 3)
+    #expect(await backend.acknowledgedPhases() == [
+        .prepare, .complete, .complete, .prepare,
+    ])
     #expect(await transport.acks() == [
         PfsMacOSVisibilityCursor(sequence: 1, phase: .prepare),
         PfsMacOSVisibilityCursor(sequence: 1, phase: .complete),
@@ -103,6 +113,123 @@ private actor RecordingBackend: PfsMacOSCoherenceBackend {
     }
     #expect(await backend.count() == 0)
     #expect(await transport.acks().isEmpty)
+}
+
+@Test func coherenceRunnerRejectsInitiatorChangesAcrossBothPhaseDirections() async throws {
+    let otherInitiator = try PfsMacOSMutationInitiator(
+        sessionID: Data(repeating: 0x25, count: 16),
+        replaySlot: 4,
+        mutationSequence: 20,
+        localOperationID: 9
+    )
+    for (prepareInitiator, completeInitiator) in [
+        (testInitiator, otherInitiator),
+        (otherInitiator, testInitiator),
+    ] {
+        let backend = RecordingBackend()
+        let transport = RecordingTransport()
+        let runner = try PfsMacOSCoherenceRunner(
+            epoch: testEpoch,
+            backend: backend,
+            transport: transport
+        )
+        let prepare = try PfsMacOSCoherenceEvent(
+            epoch: testEpoch,
+            sequence: 1,
+            phase: .prepare,
+            initiator: prepareInitiator,
+            repairs: []
+        )
+        let mismatchedComplete = try PfsMacOSCoherenceEvent(
+            epoch: testEpoch,
+            sequence: 1,
+            phase: .complete,
+            initiator: completeInitiator,
+            repairs: []
+        )
+
+        try await runner.consume(prepare)
+        await #expect(throws: PfsMacOSCoherenceError.eventIdentityMismatch(1)) {
+            try await runner.consume(mismatchedComplete)
+        }
+        #expect(await backend.count() == 1)
+        #expect(await backend.acknowledgedPhases() == [.prepare])
+        #expect(await transport.acks() == [
+            PfsMacOSVisibilityCursor(sequence: 1, phase: .prepare),
+        ])
+    }
+}
+
+@Test func coherenceRunnerReacksOnlyTheExactImmutableAuthorityPayload() async throws {
+    let backend = RecordingBackend()
+    let transport = RecordingTransport()
+    let runner = try PfsMacOSCoherenceRunner(
+        epoch: testEpoch,
+        backend: backend,
+        transport: transport
+    )
+    let prepare = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .prepare,
+        initiator: testInitiator,
+        repairs: []
+    )
+    let complete = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: testInitiator,
+        authorityPayloadIdentity: Data([0xA1]),
+        repairs: []
+    )
+    let differentlyDerivedDuplicate = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: testInitiator,
+        authorityPayloadIdentity: Data([0xA1]),
+        repairs: [.purgeNegative(
+            parent: try PfsMacOSRelativePath(components: []),
+            parentIdentity: testParentIdentity,
+            name: Data("already-evicted".utf8)
+        )]
+    )
+    let changedInitiator = try PfsMacOSMutationInitiator(
+        sessionID: Data(repeating: 0x25, count: 16),
+        replaySlot: 4,
+        mutationSequence: 20,
+        localOperationID: 9
+    )
+    let mismatchedDuplicate = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: changedInitiator,
+        authorityPayloadIdentity: Data([0xA1]),
+        repairs: []
+    )
+    let mismatchedPayload = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: testInitiator,
+        authorityPayloadIdentity: Data([0xA2]),
+        repairs: []
+    )
+
+    try await runner.consume(prepare)
+    try await runner.consume(complete)
+    try await runner.consume(differentlyDerivedDuplicate)
+    await #expect(throws: PfsMacOSCoherenceError.eventIdentityMismatch(1)) {
+        try await runner.consume(mismatchedDuplicate)
+    }
+    await #expect(throws: PfsMacOSCoherenceError.eventIdentityMismatch(1)) {
+        try await runner.consume(mismatchedPayload)
+    }
+    #expect(await backend.count() == 2)
+    #expect(await backend.acknowledgedPhases() == [.prepare, .complete, .complete])
+    #expect(await transport.acks().count == 3)
 }
 
 @Test func coherenceRunnerAcceptsSparseParticipantSequences() async throws {
@@ -246,6 +373,7 @@ private actor FrozenBackend: PfsMacOSCoherenceBackend {
         await withCheckedContinuation { continuation = $0 }
         try Task.checkCancellation()
     }
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async {}
 
     func hasEntered() -> Bool { entered }
     func release() { continuation?.resume(); continuation = nil }
@@ -317,19 +445,27 @@ private actor FrozenBackend: PfsMacOSCoherenceBackend {
 private actor RecordingPublicationBarrier: PfsMacOSCallbackPublicationBarrier {
     private(set) var phases: [PfsMacOSVisibilityPhase] = []
     private(set) var initiators: [PfsMacOSMutationInitiator] = []
+    private(set) var repairSets: [[PfsMacOSCacheRepair]] = []
     func prepare(_ event: PfsMacOSCoherenceEvent) async throws {
         phases.append(.prepare)
         initiators.append(event.initiator)
+        repairSets.append(event.repairs)
     }
-    func resume(_ event: PfsMacOSCoherenceEvent) async throws { phases.append(.complete) }
+    func resume(_ event: PfsMacOSCoherenceEvent) async throws {
+        phases.append(.complete)
+        repairSets.append(event.repairs)
+    }
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async {}
     func recorded() -> [PfsMacOSVisibilityPhase] { phases }
     func recordedInitiators() -> [PfsMacOSMutationInitiator] { initiators }
+    func recordedRepairSets() -> [[PfsMacOSCacheRepair]] { repairSets }
 }
 
 private actor RecordingLease: PfsMacOS26RepairArmLease {
     private(set) var finished = false
     private(set) var cancelled = false
-    func finish() async throws { finished = true }
+    func validate() async throws {}
+    func release() async throws { finished = true }
     func cancel() async { cancelled = true }
     func state() -> (Bool, Bool) { (finished, cancelled) }
 }
@@ -342,6 +478,7 @@ private actor RecordingArmer: PfsMacOS26RepairArmer {
         return lease
     }
     func count() -> Int { plans.count }
+    func recordedPlans() -> [PfsMacOS26RepairPlan] { plans }
 }
 
 private actor RecordingActuator: PfsMacOS26RepairActuator {
@@ -401,6 +538,66 @@ private actor RecordingActuator: PfsMacOS26RepairActuator {
     #expect(await publication.recordedInitiators() == [testInitiator])
 }
 
+@Test func macOS26BackendCoalescesNegativeActuationPerParentWithoutNarrowingBarrierScope() async throws {
+    let authenticator = try PfsMacOS26RepairAuthenticator(
+        mountSessionID: UUID(),
+        secret: testSecret
+    )
+    let armer = RecordingArmer()
+    let actuator = RecordingActuator()
+    let publication = RecordingPublicationBarrier()
+    let backend = try PfsMacOS26CoherenceBackend(
+        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
+        authenticator: authenticator,
+        armer: armer,
+        actuator: actuator,
+        publicationBarrier: publication
+    )
+    let root = try PfsMacOSRelativePath(components: [])
+    let otherParent = try PfsMacOSStableIdentity(Data(repeating: 0x44, count: 16))
+    let repairs: [PfsMacOSCacheRepair] = [
+        .purgeNegative(
+            parent: root,
+            parentIdentity: testParentIdentity,
+            name: Data("first".utf8)
+        ),
+        .purgeNegative(
+            parent: root,
+            parentIdentity: testParentIdentity,
+            name: Data("second".utf8)
+        ),
+        .purgeNegative(
+            parent: root,
+            parentIdentity: otherParent,
+            name: Data("third".utf8)
+        ),
+    ]
+    let prepare = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 2,
+        phase: .prepare,
+        initiator: testInitiator,
+        repairs: repairs
+    )
+    let complete = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 2,
+        phase: .complete,
+        initiator: testInitiator,
+        repairs: repairs
+    )
+
+    try await backend.repair(prepare)
+    try await backend.repair(complete)
+
+    #expect(await publication.recordedRepairSets() == [repairs, repairs])
+    #expect(await armer.count() == 2)
+    #expect(await actuator.count() == 2)
+    let plans = await armer.recordedPlans()
+    #expect(plans.map(\.parentIdentity) == [testParentIdentity, otherParent])
+    #expect(plans.map(\.step) == [0, 2])
+}
+
 @Test func initiatingCompletePublishesNormallyWithoutNestedVFSRepair() async throws {
     let authenticator = try PfsMacOS26RepairAuthenticator(
         mountSessionID: UUID(),
@@ -437,7 +634,8 @@ private actor RecordingActuator: PfsMacOS26RepairActuator {
 
 private actor BlockingArmLease: PfsMacOS26RepairArmLease {
     private(set) var cancelled = false
-    func finish() async throws {}
+    func validate() async throws {}
+    func release() async throws {}
     func cancel() async { cancelled = true }
     func wasCancelled() -> Bool { cancelled }
 }

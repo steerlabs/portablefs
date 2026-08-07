@@ -30,25 +30,33 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
 ### The authority wire
 
 - **Transport is mutually authenticated TLS 1.3**, with ALPN
-  `portablefs-authority-v2` and authority protocol major `2`. Plaintext is
+  `portablefs-authority-v3` and authority protocol major `3`. Plaintext is
   refused; there is no fallback mode and no environment escape.
 
   The names are worth reading carefully, because two version numbers are in play
-  and they do not mean the same thing. `portablefs-authority-v2` and protocol
-  major `2` name the *authority protocol* generation, not the product
-  generation. The v3 product speaks authority protocol 2 because protocol 1 could
-  not express a mandatory attach-time routing revision: a client that cannot
-  state which routing topology it is joining must fail at `Hello` rather than
-  spend a single-use capability and fail later at `Attach`.
+  and they do not mean the same thing. `portablefs-authority-v3` and protocol
+  major `3` name the *authority protocol* generation, not the product
+  generation. Authority protocol 3 makes every capability acquisition an exact
+  replay operation. In particular, Lookup is not a side-effect-free read: its
+  reply transfers an item capability that must be returned exactly once or
+  explicitly reclaimed. A protocol-2 peer can leak the first capability when a
+  successful reply is lost, so peers fail at `Hello` rather than mix lifecycles.
 
 - **Both peers name what they require, and refuse on absence.** A session
-  requires the `xfs-current-state`, `session-exact-epoch`, and `direct-write`
-  features at `Hello`, and `write-through`, `no-history`, `no-branches`,
+  requires the `xfs-current-state`, `session-exact-epoch`, `direct-write`,
+  `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
+  `classified-visibility-interruption`, `source-phase-queueability`,
+  `namespace-post-binding-identity`, and `exact-resource-acquisition` features at `Hello`, and `write-through`,
+  `no-history`, `no-branches`,
   `direct-io-no-file-mmap`, `user-xattr-readonly`, `single-principal`,
   `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`, and
-  `volume-syncfs-barrier` at `Attach`. These strings are the contract's shape
-  written down: an authority that stopped meeting one of them would be refused
-  rather than silently tolerated.
+  `volume-syncfs-barrier`, and `exact-resource-acquisition` at `Attach`. A
+  strict attach additionally requires
+  `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
+  `classified-visibility-interruption`, `source-phase-queueability`, and
+  `namespace-post-binding-identity` in its attach reply. These strings are the contract's shape written down: an
+  authority that stopped meeting one of them would be refused rather than
+  silently tolerated.
 
 - **A wire-incompatible change gets a new exact protocol major and a new ALPN**,
   and requires a coordinated client and authority upgrade. PortableFS fails
@@ -70,6 +78,13 @@ independent POSIX record and `flock` lock namespaces.
 The explicit refusals are equally frozen, because programs depend on getting an
 errno rather than incoherent data: shared file-backed `mmap`, `setxattr`, device
 nodes, FIFOs, sockets, setuid execution, and cross-volume link and rename.
+The XFS authority and Linux expose unsupported xattr writes as `EOPNOTSUPP`.
+For a production v3 attach, pfslocal advertises the xattr family but separately
+advertises xattr set as unsupported. macOS validates the item and name, refuses
+set/create/replace/upsert before emitting a daemon mutation, and exposes
+Darwin's distinct `EOPNOTSUPP` (102), not `ENOTSUP` (45): XNU interprets 45 as
+permission to create an AppleDouble `._*` sidecar. PortableFS never substitutes
+that second xattr store. Read, list, and removal remain ordinary daemon calls.
 
 ### Mount transports
 
@@ -80,13 +95,53 @@ degrading to a weaker consistency model.
 
 ### Declared macOS cache policies
 
-A macOS mount names its cache policy and the authority validates it. Two names
-are declared: `macos26-synchronous-vfs-repair-v1`, the shipping compatibility
-policy, and `fskit-native-revocation-v1`, the macOS 27 native policy, which is
+A macOS mount names its cache policy and the authority validates it. Three names
+are declared: the frozen `macos26-synchronous-vfs-repair-v1`, the current
+`macos26-synchronous-vfs-repair-v2` compatibility policy, and
+`fskit-native-revocation-v1`, the macOS 27 native policy, which is
 declared so that it can be refused explicitly rather than approximated. An
 unknown policy fails closed with `ENOTSUP`. A policy name means exactly one set
 of semantics forever; a changed contract gets a new name. See
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
+
+The frozen execution semantics are load-bearing:
+
+- `macos26-synchronous-vfs-repair-v1` declares the authority's
+  `CALLBACK_SERIALIZED` participant profile. While that participant owes
+  PREPARE or deferred COMPLETE, its new or already-queued mutation is refused
+  definite-preapply with a classified `EINTR` and retained as that replay
+  outcome. The legacy FSKit boundary exposes that `EINTR` unchanged. An
+  overlapping FSKit callback arriving after local PREPARE is refused `EBUSY`
+  before any pfslocal request.
+- `macos26-synchronous-vfs-repair-v2` declares the identity-aware
+  `CALLBACK_SERIALIZED_PIPELINED` profile and translates classified authority
+  interruption to `ECANCELED` at the FSKit edge. macOS 26 may re-enter a
+  mutating callback after `EINTR`, `EBUSY`, or `EAGAIN` with a fresh replay
+  identity, so v2 never exposes those restartable outcomes for a publication
+  refusal. A peer repair, an unknown callback identity, another mutation from
+  the exact callback that initiated the outstanding source phase, or a request
+  whose `source_phase_queueable` proof is false is still interrupted
+  definite-preapply. A distinct nonzero callback from that source may queue
+  through its own PREPARE and deferred COMPLETE only when that exact ordered
+  request carries `source_phase_queueable=true`. True means the Swift frontend
+  committed the request while the callback had submitted no ordinary request
+  of any kind, and will therefore exclude that ordered-only callback from its
+  own-source PREPARE drain. A mixed callback carries false, is revoked and
+  drained locally, and its ordered mutation is interrupted before prepare or
+  apply at the authority. A pristine callback parks locally before dispatch.
+  Source repair never re-enters FSKit and COMPLETE waits only for the initiating
+  callback, so the explicitly proven ordered-only queue has no reverse
+  dependency. After a peer's local COMPLETE, overlapping callbacks likewise
+  park until the authority accepts that exact cursor; the ACK-only gap never
+  reaches mutation order.
+  Once any ordered mutation frame is dispatched, cancellation waits for its
+  exact outcome; loss of that outcome terminates the mount with `EIO`.
+- `fskit-native-revocation-v1` declares the `INDEPENDENT` participant profile.
+  It never inherits callback-serialized interruption; until native cache repair
+  is implemented, attach fails closed instead.
+
+Changing either profile, errno boundary, pre-apply guarantee, or replay meaning
+requires a new cache-policy name.
 
 ### The routing declaration
 
@@ -125,7 +180,7 @@ Additive evolution with versioning; consumers tolerate additions.
   the canonical request encoding rejects them — so a field is added on both sides
   or not at all.
 - `pfslocal` minor version bumps. The local protocol between `portablefsd` and
-  the FSKit extension is major 1, currently minor 9, and grows additively.
+  the FSKit extension is major 1, currently minor 14, and grows additively.
 - New environment variables, where leaving one unset preserves previous
   behaviour.
 - New authority bounds and timeouts. Their defaults may change; a deployment that

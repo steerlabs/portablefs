@@ -10,7 +10,8 @@ One volume is one XFS project directory on one Linux host, served by one
 PortableFS adds authentication, object capabilities, session-exact replay,
 distributed POSIX locks, and — for cached frontends — a synchronous visibility
 barrier. It adds no second inode tree, no mutation log, no checkpoint format,
-and no write-back cache.
+and no PortableFS-managed or offline write-back layer. Ordinary kernel page
+caches still obey each operating system's filesystem contract.
 
 ```text
 Linux FUSE mount            macOS FSKit mount
@@ -118,9 +119,11 @@ Full operator guidance — provisioning, credentials, bounds, restart, and backu
 - **XFS is the truth.** There is no PortableFS journal, manifest, checkpoint, or
   content index. XFS's own metadata journal is a crash-recovery mechanism inside
   XFS; it is not PortableFS history and is not user-visible.
-- **Writes are through.** A successful `write(2)` means the authority applied the
-  reported bytes to authoritative XFS state. No acknowledged byte lives only in
-  a client cache.
+- **Protocol writes are through.** Linux direct-I/O `write(2)`, and every write
+  callback FSKit sends, return only after the authority applied the reported
+  bytes to XFS. macOS may acknowledge an application `write(2)` into its ordinary
+  kernel page cache before invoking FSKit; `fsync`/synchronize is the explicit
+  authority boundary there. PortableFS adds no daemon or offline write-back tail.
 - **`fsync` means fsync.** A successful `fsync`/`fdatasync` means the authority
   completed it on the authoritative open file description. `close` is not an
   implicit `fsync`. On regular FUSE, `syncfs(2)` does not reach the authority at
@@ -161,13 +164,13 @@ Full operator guidance — provisioning, credentials, bounds, restart, and backu
 | Platform | Transport | Status |
 | --- | --- | --- |
 | Linux | kernel FUSE (`vcs/internal/fusev3`) | Production path. `strict` (default) and `uncached` profiles; proven by the privileged XFS + kernel-FUSE gate and the two-mount coherence matrix. |
-| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Runs under the declared compatibility cache policy `macos26-synchronous-vfs-repair-v1`. Bounded semantics, an accepted residual race, and live-kernel gates that have not been run. |
+| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Runs under the declared compatibility policy `macos26-synchronous-vfs-repair-v2`. The final macOS 26.5 breadth, retry-free saturation, same-vnode attribute/data, daemon-death revocation/recovery, and clean-detach runs are live-proven against Linux FUSE and raw XFS. Exact overlapping operations may surface definite-preapply `ECANCELED`; authority `EINTR` never crosses the FSKit edge. |
 | macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. No implementation exists; gated on the final SDK. Selecting the native policy today fails closed with `ENOTSUP`. |
 
 The macOS 26 policy is an explicitly declared, owner-accepted compatibility
-policy with a stated fidelity target — never an automatic fallback and never a
-silent downgrade. Its exact contract, its residual race, and the list of proofs
-that still require a live kernel are in
+policy with a bounded contract — never an automatic fallback and never a silent
+downgrade. Its exact callback-provenance deviations, live proofs, and remaining
+breadth/fault gates are in
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
 
 ## Development and verification
@@ -177,8 +180,8 @@ bash scripts/verify-local.sh        # the single local merge gate
 ```
 
 `verify-local.sh` runs cross-OS Go builds and vet, the Go suite, the Go race
-suite, the Swift suite (`swift test --package-path swift/PortableFSKit --parallel
---num-workers 1`; `--num-workers 1` is required, not a tuning knob), the
+suite, the Swift suite (`swift test --package-path swift/PortableFSKit
+--no-parallel`; serial execution is required, not a tuning knob), the
 release-trust policy checkers, and a stale-architecture scan.
 
 Deeper gates:

@@ -33,9 +33,11 @@ func hostFSKitKernelOps() fskitKernelOps {
 			// premise is that in-flight work is being abandoned — the durable
 			// tail has already been parked as a recovery job by the time this
 			// runs — so a detach that stops for a busy vnode is not an escape
-			// hatch at all. The clean path still passes no force flag: a mount
-			// that needs forcing is not cleanly unmountable, and saying so is
-			// the only way a leaked reference ever gets found.
+			// hatch at all. Legacy clean detach still passes no force flag.
+			// Authority-v3 has a stricter two-phase rule in detachV3: its first,
+			// unforced pass is the mandatory synchronous flush barrier, and only
+			// an exact EBUSY from that pass authorizes forced revocation of the
+			// root descriptor macOS 26 repair actuation must retain.
 			//
 			// THE SYSCALL IS ISSUED OUT OF PROCESS. `umount -f` is exactly
 			// unmount(2) with MNT_FORCE, and `umount` is exactly unmount(2) with

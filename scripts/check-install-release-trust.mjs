@@ -175,7 +175,7 @@ for (const releaseGate of [
   "needs: validate",
   "needs: [validate, goreleaser]",
   "needs: [validate, goreleaser, macos-app]",
-  "run: swift test --package-path swift/PortableFSKit",
+  "run: swift test --package-path swift/PortableFSKit --no-parallel",
 ]) {
   requireText(workflow, releaseGate, `release validation gate ${releaseGate}`);
 }

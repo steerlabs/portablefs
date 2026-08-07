@@ -93,9 +93,15 @@ type SessionCredential struct {
 }
 
 type MutationID struct {
-	Slot     uint32
-	Sequence uint64
-	Hash     RequestHash
+	Slot                uint32
+	Sequence            uint64
+	Hash                RequestHash
+	FrontendOperationID uint64
+	// SourcePhaseQueueable is a request-scoped frontend progress proof, not a
+	// replay identity or capability. It permits this mutation to wait behind a
+	// distinct own-source callback phase only when the frontend has promised
+	// the callback is ordered-only and therefore excluded from PREPARE's drain.
+	SourcePhaseQueueable bool
 }
 
 // Outcome is the exact wire-ready result retained for a duplicate request.

@@ -6,9 +6,10 @@ what you hand to an agent; this document explains the patterns and why they
 work.
 
 The model in one paragraph: a volume is a workspace that lives in the network,
-not a folder on one machine. One XFS authority owns its live state, so every
-mount — laptop, server, sandbox — is a window onto the same ordered filesystem,
-and `write(2)` returns only after the authority has applied the bytes. There is
+not a folder on one machine. One XFS authority owns its durable state, so every
+mount — laptop, server, sandbox — is a window onto the same ordered filesystem.
+Linux writes are direct; macOS applications use `fsync` when they need an
+explicit cross-machine completion boundary. There is
 no history graph, no branch, no snapshot and no fork: there is the current state
 of the workspace, and every machine that mounts it sees exactly that. Machines
 are disposable; the workspace is not.
@@ -38,11 +39,11 @@ cd /srv/work    # same files, same git state, same half-finished edit
 The handoff is safe with no barrier discipline at all, and that is the whole
 point:
 
-- **There is no local durability debt.** A v3 mount holds no write-back cache,
-  no WAL, and no unshipped tail. `write(2)` returns after the authority applied
-  the bytes to XFS; `fsync` waits for the authoritative server descriptor. There
-  is no flush window in which a laptop that dies takes work with it, because
-  there was never anything on the laptop to lose.
+- **There is no PortableFS durability debt.** A v3 mount holds no daemon WAL or
+  offline tail. Linux direct writes return after XFS application. macOS retains
+  ordinary kernel page-cache semantics, so an agent that needs a handoff or
+  durability boundary calls `fsync`, which waits for the authoritative server
+  descriptor. `close` alone is not that boundary.
 - **There is no stale handover, because there is no second truth.** Both mounts
   are windows onto the same live authority. Names and attributes may be cached
   under the `strict` profile, but only joined to the authority's synchronous

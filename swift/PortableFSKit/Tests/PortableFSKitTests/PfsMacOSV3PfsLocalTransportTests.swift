@@ -25,7 +25,7 @@ private func v3Contract(
     initialCursor: PfsVisibilityCursor? = nil
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 2
+    contract.authorityProtocolMajor = 3
     contract.authorityEpoch = epoch
     contract.sessionID = sessionID
     contract.cachePolicy = policy
@@ -41,7 +41,8 @@ private func v3Target(
     identity: Data = Data(),
     parentIdentity: Data = Data(),
     name: Data = Data(),
-    size: Int64 = 0
+    size: Int64 = 0,
+    postIdentity: Data = Data()
 ) -> PfsVisibilityTarget {
     var target = PfsVisibilityTarget()
     target.scope = scope
@@ -49,6 +50,7 @@ private func v3Target(
     target.parentIdentity = parentIdentity
     target.name = name
     target.size = size
+    target.postIdentity = postIdentity
     return target
 }
 
@@ -77,10 +79,19 @@ private func v3Identity(_ byte: UInt8) throws -> PfsMacOSStableIdentity {
 private actor V3TestBackend: PfsMacOSCoherenceBackend {
     nonisolated let policy = PfsMacOSCachePolicy.synchronousVFSRepairV1
     private var repairCount = 0
+    private let reportsContention: Bool
+
+    init(reportsContention: Bool = false) {
+        self.reportsContention = reportsContention
+    }
 
     func repair(_ event: PfsMacOSCoherenceEvent) async throws {
         repairCount += 1
     }
+    func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool {
+        reportsContention && event.phase == .complete
+    }
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async {}
 
     func count() -> Int { repairCount }
 }
@@ -112,7 +123,7 @@ private func nextV3Event(
     let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(
         v3Contract(initialCursor: complete)
     )
-    #expect(parsed.authorityProtocolMajor == 2)
+    #expect(parsed.authorityProtocolMajor == 3)
     #expect(parsed.epoch == v3Epoch)
     #expect(parsed.sessionID == v3LocalSession)
     #expect(parsed.cachePolicy == .synchronousVFSRepairV1)
@@ -183,6 +194,20 @@ private func nextV3Event(
     )
     #expect(
         try PfsLocalMacOSV3CoherenceTransport.decodeTarget(
+            v3Target(
+                scope: .namespace,
+                parentIdentity: parent,
+                name: name,
+                postIdentity: identity
+            )
+        ) == .namespacePost(
+            parentIdentity: PfsMacOSStableIdentity(parent),
+            name: name,
+            identity: PfsMacOSStableIdentity(identity)
+        )
+    )
+    #expect(
+        try PfsLocalMacOSV3CoherenceTransport.decodeTarget(
             v3Target(scope: .data, identity: identity, size: 4_096)
         ) == .data(identity: PfsMacOSStableIdentity(identity), size: 4_096)
     )
@@ -209,7 +234,14 @@ private func nextV3Event(
         v3Target(scope: .namespace, parentIdentity: parent, name: Data([0x61, 0, 0x62])),
         v3Target(scope: .namespace, parentIdentity: parent, name: Data(repeating: 0x61, count: 256)),
         v3Target(scope: .namespace, parentIdentity: parent, name: Data("x".utf8), size: 1),
+        v3Target(
+            scope: .namespace,
+            parentIdentity: parent,
+            name: Data("x".utf8),
+            postIdentity: Data(repeating: 1, count: 15)
+        ),
         v3Target(scope: .data, identity: Data(repeating: 1, count: 15)),
+        v3Target(scope: .data, identity: identity, postIdentity: identity),
         v3Target(scope: .data, identity: identity, parentIdentity: parent),
         v3Target(scope: .data, identity: identity, name: Data("x".utf8)),
         v3Target(scope: .data, identity: identity, size: -1),
@@ -217,6 +249,7 @@ private func nextV3Event(
         v3Target(scope: .attributes, identity: identity, parentIdentity: parent),
         v3Target(scope: .attributes, identity: identity, name: Data("x".utf8)),
         v3Target(scope: .attributes, identity: identity, size: 1),
+        v3Target(scope: .attributes, identity: identity, postIdentity: identity),
     ]
 
     for target in malformed {
@@ -259,14 +292,16 @@ private func nextV3Event(
     #expect(decoded.sequence == 1)
     #expect(decoded.phase == .prepare)
     #expect(decoded.initiator.localOperationID == nil)
-    #expect(decoded.repairs.count == 4)
-    guard case let .evictBinding(knownPath, knownParent, knownIdentity) = decoded.repairs[0] else {
-        Issue.record("expected exact positive binding eviction")
+    #expect(decoded.repairs.count == 2)
+    guard case let .invalidateData(dataPath, knownParent, knownIdentity, fileID, size) = decoded.repairs[0] else {
+        Issue.record("expected data invalidation to subsume the same-coordinate eviction")
         return
     }
-    #expect(knownPath.components == [Data("dir".utf8), Data("file".utf8)])
+    #expect(dataPath.components == [Data("dir".utf8), Data("file".utf8)])
     #expect(knownParent == directory)
     #expect(knownIdentity == file)
+    #expect(fileID == 41)
+    #expect(size == 7_000)
 
     guard case let .purgeNegative(parentPath, negativeParent, negativeName) = decoded.repairs[1] else {
         Issue.record("expected negative-cache purge")
@@ -276,13 +311,49 @@ private func nextV3Event(
     #expect(negativeParent == directory)
     #expect(negativeName == Data("missing".utf8))
 
-    guard case let .invalidateData(dataPath, _, _, fileID, size) = decoded.repairs[2] else {
-        Issue.record("expected data invalidation")
+}
+
+
+@Test func v3EventDecoderAcceptsPostBindingOnlyAfterApply() async throws {
+    let root = try v3Identity(1)
+    let directory = try v3Identity(2)
+    let file = try v3Identity(3)
+    let index = PfsMacOSNamespaceIndex(rootIdentity: root)
+    await index.record(
+        identity: directory,
+        entry: .init(parentIdentity: root, name: Data("dir".utf8), vfsFileID: 40)
+    )
+    let target = v3Target(
+        scope: .namespace,
+        parentIdentity: directory.bytes,
+        name: Data("alias".utf8),
+        postIdentity: file.bytes
+    )
+    let planner = PfsMacOSRepairPlanner(index: index)
+
+    await #expect(throws: PfsMacOSCoherenceError.invalidVisibilityTarget) {
+        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
+            v3Event(phase: .prepare, targets: [target]),
+            expectedEpoch: v3Epoch,
+            expectedSessionID: v3LocalSession,
+            planner: planner
+        )
+    }
+
+    let complete = try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
+        v3Event(phase: .complete, targets: [target]),
+        expectedEpoch: v3Epoch,
+        expectedSessionID: v3LocalSession,
+        planner: planner
+    )
+    #expect(complete.repairs.count == 1)
+    guard case let .purgeNegative(path, parent, name) = complete.repairs.first else {
+        Issue.record("expected a negative purge when this mount has no retained vnode")
         return
     }
-    #expect(dataPath.components == [Data("dir".utf8), Data("file".utf8)])
-    #expect(fileID == 41)
-    #expect(size == 7_000)
+    #expect(path.components == [Data("dir".utf8)])
+    #expect(parent == directory)
+    #expect(name == Data("alias".utf8))
 }
 
 @Test func v3EventDecoderBindsLocalEventsToOneExactPublicationOperation() async throws {
@@ -461,6 +532,10 @@ private func nextV3Event(
     #expect(decodedComplete.repairs.isEmpty)
 
     var routes = v3Event(targets: [])
+    routes.initiatorSessionID = Data(repeating: 0, count: 16)
+    routes.mutationSlot = 0
+    routes.mutationSequence = 0
+    routes.localOperationID = 0
     var change = PfsRoutesChange()
     change.revision = Data(repeating: 0xCC, count: 32)
     change.rules = Data("rules".utf8)
@@ -517,9 +592,9 @@ private func nextV3Event(
         for: [.attributes(identity: file)]
     )
     #expect(repairs.count == 2)
-    guard case let .evictBinding(first, _, _) = repairs[0],
-          case let .evictBinding(second, _, _) = repairs[1] else {
-        Issue.record("expected both hard-link aliases to be evicted")
+    guard case let .refreshAttributes(first, _, _, _, _) = repairs[0],
+          case let .refreshAttributes(second, _, _, _, _) = repairs[1] else {
+        Issue.record("expected both hard-link aliases to be refreshed")
         return
     }
     #expect(first.components == [Data("a".utf8)])
@@ -586,6 +661,39 @@ private func nextV3Event(
     #expect(await daemon.stats().visibilityAcks == 1)
 }
 
+@Test func completeAckCarriesOrderedAdmissionContentionFeedback() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(v3Coherence: v3Contract()))
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    defer { Task { await client.close() } }
+
+    let resolved = try await client.resolve(attachRef: "mock")
+    let root = try v3Identity(1)
+    let transport = try await PfsLocalMacOSV3CoherenceTransport.connect(
+        client: client,
+        resolved: resolved,
+        planner: PfsMacOSRepairPlanner(index: PfsMacOSNamespaceIndex(rootIdentity: root))
+    )
+    let runner = try await transport.makeRunner(
+        backend: V3TestBackend(reportsContention: true)
+    )
+    let target = v3Target(
+        scope: .attributes,
+        identity: Data(repeating: 0x44, count: 16)
+    )
+
+    daemon.emitVisibility(v3Event(phase: .prepare, targets: [target]))
+    try await runner.consume(try await nextV3Event(from: transport))
+    daemon.emitVisibility(v3Event(phase: .complete, targets: [target]))
+    try await runner.consume(try await nextV3Event(from: transport))
+
+    let acknowledgements = await daemon.visibilityAcknowledgements()
+    #expect(acknowledgements.count == 2)
+    #expect(!acknowledgements[0].orderedAdmissionContended)
+    #expect(acknowledgements[1].orderedAdmissionContended)
+    #expect(acknowledgements[1].cursor.phase == .complete)
+}
+
 @Test func v3TransportRefusesMissingContractBeforeSubscribing() async throws {
     let client = PfsLocalClient(socketPath: "/definitely/not/a/socket")
     defer { Task { await client.close() } }
@@ -631,7 +739,11 @@ private func nextV3Event(
         resolved: resolved,
         planner: PfsMacOSRepairPlanner(index: PfsMacOSNamespaceIndex(rootIdentity: root))
     )
-    var routeEvent = v3Event(sequence: 9, phase: .complete, targets: [])
+    var routeEvent = v3Event(sequence: 9, phase: .prepare, targets: [])
+    routeEvent.initiatorSessionID = Data(repeating: 0, count: 16)
+    routeEvent.mutationSlot = 0
+    routeEvent.mutationSequence = 0
+    routeEvent.localOperationID = 0
     var routes = PfsRoutesChange()
     routes.revision = Data(repeating: 0xDD, count: 32)
     routeEvent.routes = routes
@@ -650,7 +762,7 @@ private func nextV3Event(
     #expect(acknowledgements.count == 1)
     #expect(acknowledgements[0].blocked)
     #expect(acknowledgements[0].cursor.sequence == 9)
-    #expect(acknowledgements[0].cursor.phase == .complete)
+    #expect(acknowledgements[0].cursor.phase == .prepare)
     #expect(acknowledgements[0].reason.utf8.count <= 1_024)
     #expect(!acknowledgements[0].reason.isEmpty)
 }

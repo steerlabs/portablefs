@@ -14,10 +14,19 @@
 // Transport: a SOCK_STREAM Unix domain socket. Every frame is a 4-byte
 // little-endian unsigned length N (N <= 16 MiB) followed by N bytes encoding one
 // Envelope. Client→daemon envelopes carry request bodies with a nonzero,
-// client-chosen, strictly-increasing request_id. PublicationAck is the sole
-// one-way client message and uses request_id 0; it confirms that an earlier
-// operation reply — including a cacheable negative/error such as ENOENT — has
-// been fully published to the kernel, not merely read from the socket.
+// client-chosen request_id, strictly increasing WITHIN ITS ORDERING LANE.
+// There are two lanes: the reserved control lane (VisibilityAck and
+// V3Liveness), which the client writes ahead of everything else so a barrier
+// acknowledgment can never queue behind a request burst, and the ordinary
+// request lane for all other bodies. Each lane is FIFO with increasing IDs;
+// the two interleave on the wire, so a control frame may legally carry a
+// LOWER id than an already-received ordinary frame and the daemon keeps one
+// replay watermark per lane. PublicationAck and ResourceReplyDisposition are
+// one-way client messages and use request_id 0. PublicationAck confirms that an
+// earlier operation reply — including a cacheable negative/error such as ENOENT
+// — has been fully published to the kernel, not merely read from the socket.
+// ResourceReplyDisposition transfers or abandons provisional daemon handles
+// and item capabilities.
 // Daemon→client envelopes either
 // echo a request_id (exactly one reply per request) or carry request_id 0 for
 // server-initiated Events. Requests may be pipelined; replies may arrive out of
@@ -48,6 +57,30 @@
 // frontends use this as an end-to-end proof that the daemon can still reach
 // the exact authority epoch/session from Resolve; a live UDS alone is not a
 // coherence proof.
+// Protocol minor 10 makes EnumerateRequest.handle mandatory. Authority
+// directory cookies belong to the retained open handle that issued them; a
+// frontend or daemon that omits this field cannot resume a multi-page walk
+// without either truncating it or silently repositioning it.
+// Protocol minor 11 adds Envelope.source_phase_queueable. The bit is the
+// frontend's per-request proof that an ordered-only callback can remain parked
+// behind a distinct callback's own-source visibility phase. An older daemon
+// would infer that proof from operation-ID inequality alone and can deadlock a
+// mixed read-then-mutate callback in PREPARE, so pairing across this boundary is
+// a correctness failure.
+// Protocol minor 12 adds ResourceReplyDisposition. OpenReply and CreateReply
+// carry daemon handles whose ownership cannot be inferred from socket delivery:
+// the frontend may cancel before observing the reply, or reject an otherwise
+// successful callback at its final framework-publication boundary. The daemon
+// therefore keeps each returned resource provisional until the frontend sends
+// exactly one handle/item ownership disposition for the reply's request ID.
+// Protocol minor 13 adds VisibilityAckRequest.ordered_admission_contended. The
+// exact peer COMPLETE Ack may carry one optional, liveness-only hint for
+// measured ordered-callback contention. A pre-13 daemon would discard the hint
+// and cannot preserve the one-shot effective-FIFO compensation tied to it.
+// Protocol minor 14 adds VisibilityTarget.post_identity. It binds a namespace
+// coordinate to its exact authority post-mutation owner, allowing macOS to
+// inode-attest a new rename/hard-link repair source instead of reusing an old
+// pathname whose authority stability ended at a namespace event.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -260,18 +293,24 @@ public enum PfsVisibilityScope: SwiftProtobuf.Enum, Swift.CaseIterable {
 
 }
 
-public struct PfsEnvelope: Sendable {
+public struct PfsEnvelope: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  public var requestID: UInt64 = 0
+  public var requestID: UInt64 {
+    get {return _storage._requestID}
+    set {_uniqueStorage()._requestID = newValue}
+  }
 
   /// Set only on daemon replies whose result/error can be published into the
   /// frontend's kernel cache. The client must send exactly one PublicationAck
   /// for such a reply after the framework reply callback returns. Replies
   /// without this bit must not be acknowledged.
-  public var publicationAckRequired: Bool = false
+  public var publicationAckRequired: Bool {
+    get {return _storage._publicationAckRequired}
+    set {_uniqueStorage()._publicationAckRequired = newValue}
+  }
 
   /// Allocated strictly increasingly within one connection when a framework
   /// callback first issues a cache-producing request. Earlier nonpublishing
@@ -279,7 +318,10 @@ public struct PfsEnvelope: Sendable {
   /// nonzero ID, making a multi-RPC callback one admission and publication unit
   /// across handoffs. Protocol minor 3 introduced this lazy allocation rule;
   /// a fresh nonpublishing request with a nonzero ID is a protocol violation.
-  public var operationID: UInt64 = 0
+  public var operationID: UInt64 {
+    get {return _storage._operationID}
+    set {_uniqueStorage()._operationID = newValue}
+  }
 
   /// Set on a daemon reply for an operation whose ALREADY-DELIVERED results
   /// must never be installed into the frontend's cache. The daemon retracts
@@ -314,484 +356,511 @@ public struct PfsEnvelope: Sendable {
   /// missing feature. The daemon rejects any frontend whose minor is below
   /// its own, and that rejection IS the gate: it is the only mechanism that
   /// can guarantee no connected frontend ignores the bit.
-  public var publicationRetracted: Bool = false
+  public var publicationRetracted: Bool {
+    get {return _storage._publicationRetracted}
+    set {_uniqueStorage()._publicationRetracted = newValue}
+  }
 
-  public var body: PfsEnvelope.OneOf_Body? = nil
+  /// Set only on a client-to-daemon ordered mutation with a nonzero operation
+  /// ID. True means this exact request belongs to a callback that has submitted
+  /// no ordinary/cache-reading request, so a distinct own-source PREPARE will
+  /// exclude the callback from its drain while the authority parks this
+  /// mutation. False is fail-safe: the authority interrupts before apply.
+  ///
+  /// This is scheduling metadata, not a capability. The daemon validates its
+  /// wire shape and forwards it to the authority's visibility coordinator.
+  public var sourcePhaseQueueable: Bool {
+    get {return _storage._sourcePhaseQueueable}
+    set {_uniqueStorage()._sourcePhaseQueueable = newValue}
+  }
+
+  public var body: OneOf_Body? {
+    get {return _storage._body}
+    set {_uniqueStorage()._body = newValue}
+  }
 
   /// client → daemon
   public var hello: PfsHello {
     get {
-      if case .hello(let v)? = body {return v}
+      if case .hello(let v)? = _storage._body {return v}
       return PfsHello()
     }
-    set {body = .hello(newValue)}
+    set {_uniqueStorage()._body = .hello(newValue)}
   }
 
   public var resolve: PfsResolveRequest {
     get {
-      if case .resolve(let v)? = body {return v}
+      if case .resolve(let v)? = _storage._body {return v}
       return PfsResolveRequest()
     }
-    set {body = .resolve(newValue)}
+    set {_uniqueStorage()._body = .resolve(newValue)}
   }
 
   public var lookup: PfsLookupRequest {
     get {
-      if case .lookup(let v)? = body {return v}
+      if case .lookup(let v)? = _storage._body {return v}
       return PfsLookupRequest()
     }
-    set {body = .lookup(newValue)}
+    set {_uniqueStorage()._body = .lookup(newValue)}
   }
 
   public var enumerate: PfsEnumerateRequest {
     get {
-      if case .enumerate(let v)? = body {return v}
+      if case .enumerate(let v)? = _storage._body {return v}
       return PfsEnumerateRequest()
     }
-    set {body = .enumerate(newValue)}
+    set {_uniqueStorage()._body = .enumerate(newValue)}
   }
 
   public var getAttr: PfsGetAttrRequest {
     get {
-      if case .getAttr(let v)? = body {return v}
+      if case .getAttr(let v)? = _storage._body {return v}
       return PfsGetAttrRequest()
     }
-    set {body = .getAttr(newValue)}
+    set {_uniqueStorage()._body = .getAttr(newValue)}
   }
 
   public var setAttr: PfsSetAttrRequest {
     get {
-      if case .setAttr(let v)? = body {return v}
+      if case .setAttr(let v)? = _storage._body {return v}
       return PfsSetAttrRequest()
     }
-    set {body = .setAttr(newValue)}
+    set {_uniqueStorage()._body = .setAttr(newValue)}
   }
 
   public var `open`: PfsOpenRequest {
     get {
-      if case .open(let v)? = body {return v}
+      if case .open(let v)? = _storage._body {return v}
       return PfsOpenRequest()
     }
-    set {body = .open(newValue)}
+    set {_uniqueStorage()._body = .open(newValue)}
   }
 
   public var close: PfsCloseRequest {
     get {
-      if case .close(let v)? = body {return v}
+      if case .close(let v)? = _storage._body {return v}
       return PfsCloseRequest()
     }
-    set {body = .close(newValue)}
+    set {_uniqueStorage()._body = .close(newValue)}
   }
 
   public var read: PfsReadRequest {
     get {
-      if case .read(let v)? = body {return v}
+      if case .read(let v)? = _storage._body {return v}
       return PfsReadRequest()
     }
-    set {body = .read(newValue)}
+    set {_uniqueStorage()._body = .read(newValue)}
   }
 
   public var write: PfsWriteRequest {
     get {
-      if case .write(let v)? = body {return v}
+      if case .write(let v)? = _storage._body {return v}
       return PfsWriteRequest()
     }
-    set {body = .write(newValue)}
+    set {_uniqueStorage()._body = .write(newValue)}
   }
 
   public var create: PfsCreateRequest {
     get {
-      if case .create(let v)? = body {return v}
+      if case .create(let v)? = _storage._body {return v}
       return PfsCreateRequest()
     }
-    set {body = .create(newValue)}
+    set {_uniqueStorage()._body = .create(newValue)}
   }
 
   public var mkdir: PfsMkdirRequest {
     get {
-      if case .mkdir(let v)? = body {return v}
+      if case .mkdir(let v)? = _storage._body {return v}
       return PfsMkdirRequest()
     }
-    set {body = .mkdir(newValue)}
+    set {_uniqueStorage()._body = .mkdir(newValue)}
   }
 
   public var remove: PfsRemoveRequest {
     get {
-      if case .remove(let v)? = body {return v}
+      if case .remove(let v)? = _storage._body {return v}
       return PfsRemoveRequest()
     }
-    set {body = .remove(newValue)}
+    set {_uniqueStorage()._body = .remove(newValue)}
   }
 
   public var rename: PfsRenameRequest {
     get {
-      if case .rename(let v)? = body {return v}
+      if case .rename(let v)? = _storage._body {return v}
       return PfsRenameRequest()
     }
-    set {body = .rename(newValue)}
+    set {_uniqueStorage()._body = .rename(newValue)}
   }
 
   public var symlink: PfsSymlinkRequest {
     get {
-      if case .symlink(let v)? = body {return v}
+      if case .symlink(let v)? = _storage._body {return v}
       return PfsSymlinkRequest()
     }
-    set {body = .symlink(newValue)}
+    set {_uniqueStorage()._body = .symlink(newValue)}
   }
 
   public var readlink: PfsReadlinkRequest {
     get {
-      if case .readlink(let v)? = body {return v}
+      if case .readlink(let v)? = _storage._body {return v}
       return PfsReadlinkRequest()
     }
-    set {body = .readlink(newValue)}
+    set {_uniqueStorage()._body = .readlink(newValue)}
   }
 
   public var xattrGet: PfsXattrGetRequest {
     get {
-      if case .xattrGet(let v)? = body {return v}
+      if case .xattrGet(let v)? = _storage._body {return v}
       return PfsXattrGetRequest()
     }
-    set {body = .xattrGet(newValue)}
+    set {_uniqueStorage()._body = .xattrGet(newValue)}
   }
 
   public var xattrSet: PfsXattrSetRequest {
     get {
-      if case .xattrSet(let v)? = body {return v}
+      if case .xattrSet(let v)? = _storage._body {return v}
       return PfsXattrSetRequest()
     }
-    set {body = .xattrSet(newValue)}
+    set {_uniqueStorage()._body = .xattrSet(newValue)}
   }
 
   public var xattrList: PfsXattrListRequest {
     get {
-      if case .xattrList(let v)? = body {return v}
+      if case .xattrList(let v)? = _storage._body {return v}
       return PfsXattrListRequest()
     }
-    set {body = .xattrList(newValue)}
+    set {_uniqueStorage()._body = .xattrList(newValue)}
   }
 
   public var xattrRemove: PfsXattrRemoveRequest {
     get {
-      if case .xattrRemove(let v)? = body {return v}
+      if case .xattrRemove(let v)? = _storage._body {return v}
       return PfsXattrRemoveRequest()
     }
-    set {body = .xattrRemove(newValue)}
+    set {_uniqueStorage()._body = .xattrRemove(newValue)}
   }
 
   public var statfs: PfsStatfsRequest {
     get {
-      if case .statfs(let v)? = body {return v}
+      if case .statfs(let v)? = _storage._body {return v}
       return PfsStatfsRequest()
     }
-    set {body = .statfs(newValue)}
+    set {_uniqueStorage()._body = .statfs(newValue)}
   }
 
   public var fsync: PfsFsyncRequest {
     get {
-      if case .fsync(let v)? = body {return v}
+      if case .fsync(let v)? = _storage._body {return v}
       return PfsFsyncRequest()
     }
-    set {body = .fsync(newValue)}
+    set {_uniqueStorage()._body = .fsync(newValue)}
   }
 
   public var reclaim: PfsReclaimRequest {
     get {
-      if case .reclaim(let v)? = body {return v}
+      if case .reclaim(let v)? = _storage._body {return v}
       return PfsReclaimRequest()
     }
-    set {body = .reclaim(newValue)}
+    set {_uniqueStorage()._body = .reclaim(newValue)}
   }
 
   public var subscribeEvents: PfsSubscribeEventsRequest {
     get {
-      if case .subscribeEvents(let v)? = body {return v}
+      if case .subscribeEvents(let v)? = _storage._body {return v}
       return PfsSubscribeEventsRequest()
     }
-    set {body = .subscribeEvents(newValue)}
+    set {_uniqueStorage()._body = .subscribeEvents(newValue)}
   }
 
   public var hardLink: PfsHardLinkRequest {
     get {
-      if case .hardLink(let v)? = body {return v}
+      if case .hardLink(let v)? = _storage._body {return v}
       return PfsHardLinkRequest()
     }
-    set {body = .hardLink(newValue)}
+    set {_uniqueStorage()._body = .hardLink(newValue)}
   }
 
   public var syncVolume: PfsSyncVolumeRequest {
     get {
-      if case .syncVolume(let v)? = body {return v}
+      if case .syncVolume(let v)? = _storage._body {return v}
       return PfsSyncVolumeRequest()
     }
-    set {body = .syncVolume(newValue)}
+    set {_uniqueStorage()._body = .syncVolume(newValue)}
   }
 
   public var publicationAck: PfsPublicationAck {
     get {
-      if case .publicationAck(let v)? = body {return v}
+      if case .publicationAck(let v)? = _storage._body {return v}
       return PfsPublicationAck()
     }
-    set {body = .publicationAck(newValue)}
+    set {_uniqueStorage()._body = .publicationAck(newValue)}
   }
 
   public var visibilityAck: PfsVisibilityAckRequest {
     get {
-      if case .visibilityAck(let v)? = body {return v}
+      if case .visibilityAck(let v)? = _storage._body {return v}
       return PfsVisibilityAckRequest()
     }
-    set {body = .visibilityAck(newValue)}
+    set {_uniqueStorage()._body = .visibilityAck(newValue)}
   }
 
   public var v3Liveness: PfsV3LivenessRequest {
     get {
-      if case .v3Liveness(let v)? = body {return v}
+      if case .v3Liveness(let v)? = _storage._body {return v}
       return PfsV3LivenessRequest()
     }
-    set {body = .v3Liveness(newValue)}
+    set {_uniqueStorage()._body = .v3Liveness(newValue)}
+  }
+
+  public var resourceReplyDisposition: PfsResourceReplyDisposition {
+    get {
+      if case .resourceReplyDisposition(let v)? = _storage._body {return v}
+      return PfsResourceReplyDisposition()
+    }
+    set {_uniqueStorage()._body = .resourceReplyDisposition(newValue)}
   }
 
   /// daemon → client (replies)
   public var helloReply: PfsHelloReply {
     get {
-      if case .helloReply(let v)? = body {return v}
+      if case .helloReply(let v)? = _storage._body {return v}
       return PfsHelloReply()
     }
-    set {body = .helloReply(newValue)}
+    set {_uniqueStorage()._body = .helloReply(newValue)}
   }
 
   public var resolveReply: PfsResolveReply {
     get {
-      if case .resolveReply(let v)? = body {return v}
+      if case .resolveReply(let v)? = _storage._body {return v}
       return PfsResolveReply()
     }
-    set {body = .resolveReply(newValue)}
+    set {_uniqueStorage()._body = .resolveReply(newValue)}
   }
 
   public var lookupReply: PfsLookupReply {
     get {
-      if case .lookupReply(let v)? = body {return v}
+      if case .lookupReply(let v)? = _storage._body {return v}
       return PfsLookupReply()
     }
-    set {body = .lookupReply(newValue)}
+    set {_uniqueStorage()._body = .lookupReply(newValue)}
   }
 
   public var enumerateReply: PfsEnumerateReply {
     get {
-      if case .enumerateReply(let v)? = body {return v}
+      if case .enumerateReply(let v)? = _storage._body {return v}
       return PfsEnumerateReply()
     }
-    set {body = .enumerateReply(newValue)}
+    set {_uniqueStorage()._body = .enumerateReply(newValue)}
   }
 
   public var getAttrReply: PfsGetAttrReply {
     get {
-      if case .getAttrReply(let v)? = body {return v}
+      if case .getAttrReply(let v)? = _storage._body {return v}
       return PfsGetAttrReply()
     }
-    set {body = .getAttrReply(newValue)}
+    set {_uniqueStorage()._body = .getAttrReply(newValue)}
   }
 
   public var setAttrReply: PfsSetAttrReply {
     get {
-      if case .setAttrReply(let v)? = body {return v}
+      if case .setAttrReply(let v)? = _storage._body {return v}
       return PfsSetAttrReply()
     }
-    set {body = .setAttrReply(newValue)}
+    set {_uniqueStorage()._body = .setAttrReply(newValue)}
   }
 
   public var openReply: PfsOpenReply {
     get {
-      if case .openReply(let v)? = body {return v}
+      if case .openReply(let v)? = _storage._body {return v}
       return PfsOpenReply()
     }
-    set {body = .openReply(newValue)}
+    set {_uniqueStorage()._body = .openReply(newValue)}
   }
 
   public var closeReply: PfsCloseReply {
     get {
-      if case .closeReply(let v)? = body {return v}
+      if case .closeReply(let v)? = _storage._body {return v}
       return PfsCloseReply()
     }
-    set {body = .closeReply(newValue)}
+    set {_uniqueStorage()._body = .closeReply(newValue)}
   }
 
   public var readReply: PfsReadReply {
     get {
-      if case .readReply(let v)? = body {return v}
+      if case .readReply(let v)? = _storage._body {return v}
       return PfsReadReply()
     }
-    set {body = .readReply(newValue)}
+    set {_uniqueStorage()._body = .readReply(newValue)}
   }
 
   public var writeReply: PfsWriteReply {
     get {
-      if case .writeReply(let v)? = body {return v}
+      if case .writeReply(let v)? = _storage._body {return v}
       return PfsWriteReply()
     }
-    set {body = .writeReply(newValue)}
+    set {_uniqueStorage()._body = .writeReply(newValue)}
   }
 
   public var createReply: PfsCreateReply {
     get {
-      if case .createReply(let v)? = body {return v}
+      if case .createReply(let v)? = _storage._body {return v}
       return PfsCreateReply()
     }
-    set {body = .createReply(newValue)}
+    set {_uniqueStorage()._body = .createReply(newValue)}
   }
 
   public var mkdirReply: PfsMkdirReply {
     get {
-      if case .mkdirReply(let v)? = body {return v}
+      if case .mkdirReply(let v)? = _storage._body {return v}
       return PfsMkdirReply()
     }
-    set {body = .mkdirReply(newValue)}
+    set {_uniqueStorage()._body = .mkdirReply(newValue)}
   }
 
   public var removeReply: PfsRemoveReply {
     get {
-      if case .removeReply(let v)? = body {return v}
+      if case .removeReply(let v)? = _storage._body {return v}
       return PfsRemoveReply()
     }
-    set {body = .removeReply(newValue)}
+    set {_uniqueStorage()._body = .removeReply(newValue)}
   }
 
   public var renameReply: PfsRenameReply {
     get {
-      if case .renameReply(let v)? = body {return v}
+      if case .renameReply(let v)? = _storage._body {return v}
       return PfsRenameReply()
     }
-    set {body = .renameReply(newValue)}
+    set {_uniqueStorage()._body = .renameReply(newValue)}
   }
 
   public var symlinkReply: PfsSymlinkReply {
     get {
-      if case .symlinkReply(let v)? = body {return v}
+      if case .symlinkReply(let v)? = _storage._body {return v}
       return PfsSymlinkReply()
     }
-    set {body = .symlinkReply(newValue)}
+    set {_uniqueStorage()._body = .symlinkReply(newValue)}
   }
 
   public var readlinkReply: PfsReadlinkReply {
     get {
-      if case .readlinkReply(let v)? = body {return v}
+      if case .readlinkReply(let v)? = _storage._body {return v}
       return PfsReadlinkReply()
     }
-    set {body = .readlinkReply(newValue)}
+    set {_uniqueStorage()._body = .readlinkReply(newValue)}
   }
 
   public var xattrGetReply: PfsXattrGetReply {
     get {
-      if case .xattrGetReply(let v)? = body {return v}
+      if case .xattrGetReply(let v)? = _storage._body {return v}
       return PfsXattrGetReply()
     }
-    set {body = .xattrGetReply(newValue)}
+    set {_uniqueStorage()._body = .xattrGetReply(newValue)}
   }
 
   public var xattrSetReply: PfsXattrSetReply {
     get {
-      if case .xattrSetReply(let v)? = body {return v}
+      if case .xattrSetReply(let v)? = _storage._body {return v}
       return PfsXattrSetReply()
     }
-    set {body = .xattrSetReply(newValue)}
+    set {_uniqueStorage()._body = .xattrSetReply(newValue)}
   }
 
   public var xattrListReply: PfsXattrListReply {
     get {
-      if case .xattrListReply(let v)? = body {return v}
+      if case .xattrListReply(let v)? = _storage._body {return v}
       return PfsXattrListReply()
     }
-    set {body = .xattrListReply(newValue)}
+    set {_uniqueStorage()._body = .xattrListReply(newValue)}
   }
 
   public var xattrRemoveReply: PfsXattrRemoveReply {
     get {
-      if case .xattrRemoveReply(let v)? = body {return v}
+      if case .xattrRemoveReply(let v)? = _storage._body {return v}
       return PfsXattrRemoveReply()
     }
-    set {body = .xattrRemoveReply(newValue)}
+    set {_uniqueStorage()._body = .xattrRemoveReply(newValue)}
   }
 
   public var statfsReply: PfsStatfsReply {
     get {
-      if case .statfsReply(let v)? = body {return v}
+      if case .statfsReply(let v)? = _storage._body {return v}
       return PfsStatfsReply()
     }
-    set {body = .statfsReply(newValue)}
+    set {_uniqueStorage()._body = .statfsReply(newValue)}
   }
 
   public var fsyncReply: PfsFsyncReply {
     get {
-      if case .fsyncReply(let v)? = body {return v}
+      if case .fsyncReply(let v)? = _storage._body {return v}
       return PfsFsyncReply()
     }
-    set {body = .fsyncReply(newValue)}
+    set {_uniqueStorage()._body = .fsyncReply(newValue)}
   }
 
   public var reclaimReply: PfsReclaimReply {
     get {
-      if case .reclaimReply(let v)? = body {return v}
+      if case .reclaimReply(let v)? = _storage._body {return v}
       return PfsReclaimReply()
     }
-    set {body = .reclaimReply(newValue)}
+    set {_uniqueStorage()._body = .reclaimReply(newValue)}
   }
 
   public var subscribeEventsReply: PfsSubscribeEventsReply {
     get {
-      if case .subscribeEventsReply(let v)? = body {return v}
+      if case .subscribeEventsReply(let v)? = _storage._body {return v}
       return PfsSubscribeEventsReply()
     }
-    set {body = .subscribeEventsReply(newValue)}
+    set {_uniqueStorage()._body = .subscribeEventsReply(newValue)}
   }
 
   public var hardLinkReply: PfsHardLinkReply {
     get {
-      if case .hardLinkReply(let v)? = body {return v}
+      if case .hardLinkReply(let v)? = _storage._body {return v}
       return PfsHardLinkReply()
     }
-    set {body = .hardLinkReply(newValue)}
+    set {_uniqueStorage()._body = .hardLinkReply(newValue)}
   }
 
   public var syncVolumeReply: PfsSyncVolumeReply {
     get {
-      if case .syncVolumeReply(let v)? = body {return v}
+      if case .syncVolumeReply(let v)? = _storage._body {return v}
       return PfsSyncVolumeReply()
     }
-    set {body = .syncVolumeReply(newValue)}
+    set {_uniqueStorage()._body = .syncVolumeReply(newValue)}
   }
 
   public var visibilityAckReply: PfsVisibilityAckReply {
     get {
-      if case .visibilityAckReply(let v)? = body {return v}
+      if case .visibilityAckReply(let v)? = _storage._body {return v}
       return PfsVisibilityAckReply()
     }
-    set {body = .visibilityAckReply(newValue)}
+    set {_uniqueStorage()._body = .visibilityAckReply(newValue)}
   }
 
   public var v3LivenessReply: PfsV3LivenessReply {
     get {
-      if case .v3LivenessReply(let v)? = body {return v}
+      if case .v3LivenessReply(let v)? = _storage._body {return v}
       return PfsV3LivenessReply()
     }
-    set {body = .v3LivenessReply(newValue)}
+    set {_uniqueStorage()._body = .v3LivenessReply(newValue)}
   }
 
   /// daemon → client (either)
   public var error: PfsErrorReply {
     get {
-      if case .error(let v)? = body {return v}
+      if case .error(let v)? = _storage._body {return v}
       return PfsErrorReply()
     }
-    set {body = .error(newValue)}
+    set {_uniqueStorage()._body = .error(newValue)}
   }
 
   /// request_id 0: server-initiated
   public var event: PfsEvent {
     get {
-      if case .event(let v)? = body {return v}
+      if case .event(let v)? = _storage._body {return v}
       return PfsEvent()
     }
-    set {body = .event(newValue)}
+    set {_uniqueStorage()._body = .event(newValue)}
   }
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -827,6 +896,7 @@ public struct PfsEnvelope: Sendable {
     case publicationAck(PfsPublicationAck)
     case visibilityAck(PfsVisibilityAckRequest)
     case v3Liveness(PfsV3LivenessRequest)
+    case resourceReplyDisposition(PfsResourceReplyDisposition)
     /// daemon → client (replies)
     case helloReply(PfsHelloReply)
     case resolveReply(PfsResolveReply)
@@ -864,6 +934,8 @@ public struct PfsEnvelope: Sendable {
   }
 
   public init() {}
+
+  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
 public struct PfsHello: Sendable {
@@ -901,6 +973,32 @@ public struct PfsPublicationAck: Sendable {
   public var publishedRequestID: UInt64 = 0
 
   public var operationID: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Final frontend ownership verdict for one successful resource-bearing reply.
+/// The envelope request_id is zero and target_request_id names the original
+/// request on this exact connection. Handle ownership and item publication are
+/// deliberately independent: Create returns both, and VolumeCore can own its
+/// installed handle even when the framework refuses the returned item.
+public struct PfsResourceReplyDisposition: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var targetRequestID: UInt64 = 0
+
+  /// True exactly when VolumeCore installed the reply's returned handle in its
+  /// actor-owned handle table. The handle will subsequently retire via Close.
+  public var acceptHandles: Bool = false
+
+  /// Exact published prefix length in the reply's ordered provisional-item
+  /// sequence. A count preserves duplicate hard links correctly. Zero abandons
+  /// every item; a full count accepts all. Open replies have no item sequence.
+  public var acceptedItemCount: UInt32 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1094,6 +1192,14 @@ public struct PfsCapabilities: Sendable {
 
   public var hardLinks: Bool = false
 
+  /// xattrs is TRUE when the frontend may expose the pfslocal xattr operation
+  /// family. It is not a promise that every operation succeeds for every
+  /// backing: the production v3 XFS attach supports get, list, and removal of
+  /// pre-existing portable user attributes while xattr_set_supported is FALSE.
+  /// FSKit validates set input, refuses it locally with the internal Darwin
+  /// ENOTSUP representation, and translates that boundary verdict to Darwin's
+  /// distinct EOPNOTSUPP so XNU cannot invoke AppleDouble fallback. FALSE is
+  /// reserved for a daemon with no xattr surface at all.
   public var xattrs: Bool = false
 
   public var caseSensitive: Bool = false
@@ -1141,6 +1247,16 @@ public struct PfsCapabilities: Sendable {
   /// the kernel refuses changes that would have succeeded. Per-object refusal
   /// comes back as an errno on the request that asked for it.
   public var flagsUnderstood: Bool = false
+
+  /// xattr_set_supported is TRUE exactly when this daemon will accept an
+  /// XattrSetRequest for at least one ordinary volume object. Xattrs remains
+  /// the operation-family capability: get/list/remove can stay available while
+  /// this narrower mutation capability is FALSE. A frontend must validate the
+  /// caller's item and name first, then refuse set/create/replace/upsert locally
+  /// when this field is false so an unsupported user operation never enters the
+  /// ordered-mutation/publication machinery. Process-local repair scratch is
+  /// outside pfslocal and is therefore unaffected.
+  public var xattrSetSupported: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1354,6 +1470,9 @@ public struct PfsEnumerateRequest: Sendable {
 
   /// readdir-plus
   public var wantAttrs: Bool = false
+
+  /// required retained read handle for this directory walk
+  public var handle: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2222,12 +2341,14 @@ public struct PfsXattrRemoveReply: Sendable {
   public init() {}
 }
 
-/// SyncVolume is the REAL volume barrier behind FSKit's synchronize and the
-/// CLI's pre-unmount drain. Success means the accepted tail is locally synced,
-/// durable and applied at the authority, and every live protocol subscriber reached its
-/// supported invalidation boundary. There is no local-only success: an
-/// unreachable, slow, or fenced authority fails the request. `degraded` is
-/// retired wire ballast and is always false.
+/// SyncVolume is the authority durability barrier behind FSKit's synchronize
+/// and the CLI's pre-unmount durability call. V3 has no client or daemon
+/// write-back tail: mutations are synchronous authority calls against raw XFS.
+/// Success means all prior authority operations are applied and the authority's
+/// `syncfs` cut completed. Cache-visible mutations retain their separate
+/// two-phase repair boundary. There is no local-only success: an unreachable,
+/// slow, or fenced authority fails the request. `degraded` is retired wire
+/// ballast and is always false.
 public struct PfsSyncVolumeRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2362,6 +2483,9 @@ public struct PfsVisibilityTarget: @unchecked Sendable {
 
   public var size: Int64 = 0
 
+  /// Authority-attested post-mutation owner for a namespace coordinate.
+  public var postIdentity: Data = Data()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2447,6 +2571,10 @@ public struct PfsVisibilityAckRequest: @unchecked Sendable {
   public var blocked: Bool = false
 
   public var reason: String = String()
+
+  /// Liveness-only feedback carried on the exact peer COMPLETE Ack. It is false
+  /// for PREPARE, source COMPLETE, terminal reports, and older minor peers.
+  public var orderedAdmissionContended: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2659,6 +2787,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     2: .standard(proto: "publication_ack_required"),
     3: .standard(proto: "operation_id"),
     4: .standard(proto: "publication_retracted"),
+    5: .standard(proto: "source_phase_queueable"),
     10: .same(proto: "hello"),
     11: .same(proto: "resolve"),
     12: .same(proto: "lookup"),
@@ -2688,6 +2817,7 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     36: .standard(proto: "publication_ack"),
     37: .standard(proto: "visibility_ack"),
     38: .standard(proto: "v3_liveness"),
+    39: .standard(proto: "resource_reply_disposition"),
     60: .standard(proto: "hello_reply"),
     61: .standard(proto: "resolve_reply"),
     62: .standard(proto: "lookup_reply"),
@@ -2720,1053 +2850,1125 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
     91: .same(proto: "event"),
   ]
 
+  fileprivate class _StorageClass {
+    var _requestID: UInt64 = 0
+    var _publicationAckRequired: Bool = false
+    var _operationID: UInt64 = 0
+    var _publicationRetracted: Bool = false
+    var _sourcePhaseQueueable: Bool = false
+    var _body: PfsEnvelope.OneOf_Body?
+
+    #if swift(>=5.10)
+      // This property is used as the initial default value for new instances of the type.
+      // The type itself is protecting the reference to its storage via CoW semantics.
+      // This will force a copy to be made of this reference when the first mutation occurs;
+      // hence, it is safe to mark this as `nonisolated(unsafe)`.
+      static nonisolated(unsafe) let defaultInstance = _StorageClass()
+    #else
+      static let defaultInstance = _StorageClass()
+    #endif
+
+    private init() {}
+
+    init(copying source: _StorageClass) {
+      _requestID = source._requestID
+      _publicationAckRequired = source._publicationAckRequired
+      _operationID = source._operationID
+      _publicationRetracted = source._publicationRetracted
+      _sourcePhaseQueueable = source._sourcePhaseQueueable
+      _body = source._body
+    }
+  }
+
+  fileprivate mutating func _uniqueStorage() -> _StorageClass {
+    if !isKnownUniquelyReferenced(&_storage) {
+      _storage = _StorageClass(copying: _storage)
+    }
+    return _storage
+  }
+
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.requestID) }()
-      case 2: try { try decoder.decodeSingularBoolField(value: &self.publicationAckRequired) }()
-      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.operationID) }()
-      case 4: try { try decoder.decodeSingularBoolField(value: &self.publicationRetracted) }()
-      case 10: try {
-        var v: PfsHello?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .hello(let m) = current {v = m}
+    _ = _uniqueStorage()
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      while let fieldNumber = try decoder.nextFieldNumber() {
+        // The use of inline closures is to circumvent an issue where the compiler
+        // allocates stack space for every case branch when no optimizations are
+        // enabled. https://github.com/apple/swift-protobuf/issues/1034
+        switch fieldNumber {
+        case 1: try { try decoder.decodeSingularUInt64Field(value: &_storage._requestID) }()
+        case 2: try { try decoder.decodeSingularBoolField(value: &_storage._publicationAckRequired) }()
+        case 3: try { try decoder.decodeSingularUInt64Field(value: &_storage._operationID) }()
+        case 4: try { try decoder.decodeSingularBoolField(value: &_storage._publicationRetracted) }()
+        case 5: try { try decoder.decodeSingularBoolField(value: &_storage._sourcePhaseQueueable) }()
+        case 10: try {
+          var v: PfsHello?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .hello(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .hello(v)
+          }
+        }()
+        case 11: try {
+          var v: PfsResolveRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .resolve(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .resolve(v)
+          }
+        }()
+        case 12: try {
+          var v: PfsLookupRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .lookup(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .lookup(v)
+          }
+        }()
+        case 13: try {
+          var v: PfsEnumerateRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .enumerate(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .enumerate(v)
+          }
+        }()
+        case 14: try {
+          var v: PfsGetAttrRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .getAttr(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .getAttr(v)
+          }
+        }()
+        case 15: try {
+          var v: PfsSetAttrRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .setAttr(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .setAttr(v)
+          }
+        }()
+        case 16: try {
+          var v: PfsOpenRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .open(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .open(v)
+          }
+        }()
+        case 17: try {
+          var v: PfsCloseRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .close(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .close(v)
+          }
+        }()
+        case 18: try {
+          var v: PfsReadRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .read(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .read(v)
+          }
+        }()
+        case 19: try {
+          var v: PfsWriteRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .write(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .write(v)
+          }
+        }()
+        case 20: try {
+          var v: PfsCreateRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .create(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .create(v)
+          }
+        }()
+        case 21: try {
+          var v: PfsMkdirRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .mkdir(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .mkdir(v)
+          }
+        }()
+        case 22: try {
+          var v: PfsRemoveRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .remove(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .remove(v)
+          }
+        }()
+        case 23: try {
+          var v: PfsRenameRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .rename(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .rename(v)
+          }
+        }()
+        case 24: try {
+          var v: PfsSymlinkRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .symlink(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .symlink(v)
+          }
+        }()
+        case 25: try {
+          var v: PfsReadlinkRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .readlink(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .readlink(v)
+          }
+        }()
+        case 26: try {
+          var v: PfsXattrGetRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrGet(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrGet(v)
+          }
+        }()
+        case 27: try {
+          var v: PfsXattrSetRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrSet(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrSet(v)
+          }
+        }()
+        case 28: try {
+          var v: PfsXattrListRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrList(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrList(v)
+          }
+        }()
+        case 29: try {
+          var v: PfsXattrRemoveRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrRemove(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrRemove(v)
+          }
+        }()
+        case 30: try {
+          var v: PfsStatfsRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .statfs(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .statfs(v)
+          }
+        }()
+        case 31: try {
+          var v: PfsFsyncRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .fsync(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .fsync(v)
+          }
+        }()
+        case 32: try {
+          var v: PfsReclaimRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .reclaim(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .reclaim(v)
+          }
+        }()
+        case 33: try {
+          var v: PfsSubscribeEventsRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .subscribeEvents(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .subscribeEvents(v)
+          }
+        }()
+        case 34: try {
+          var v: PfsHardLinkRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .hardLink(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .hardLink(v)
+          }
+        }()
+        case 35: try {
+          var v: PfsSyncVolumeRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .syncVolume(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .syncVolume(v)
+          }
+        }()
+        case 36: try {
+          var v: PfsPublicationAck?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .publicationAck(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .publicationAck(v)
+          }
+        }()
+        case 37: try {
+          var v: PfsVisibilityAckRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .visibilityAck(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .visibilityAck(v)
+          }
+        }()
+        case 38: try {
+          var v: PfsV3LivenessRequest?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .v3Liveness(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .v3Liveness(v)
+          }
+        }()
+        case 39: try {
+          var v: PfsResourceReplyDisposition?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .resourceReplyDisposition(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .resourceReplyDisposition(v)
+          }
+        }()
+        case 60: try {
+          var v: PfsHelloReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .helloReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .helloReply(v)
+          }
+        }()
+        case 61: try {
+          var v: PfsResolveReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .resolveReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .resolveReply(v)
+          }
+        }()
+        case 62: try {
+          var v: PfsLookupReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .lookupReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .lookupReply(v)
+          }
+        }()
+        case 63: try {
+          var v: PfsEnumerateReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .enumerateReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .enumerateReply(v)
+          }
+        }()
+        case 64: try {
+          var v: PfsGetAttrReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .getAttrReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .getAttrReply(v)
+          }
+        }()
+        case 65: try {
+          var v: PfsSetAttrReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .setAttrReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .setAttrReply(v)
+          }
+        }()
+        case 66: try {
+          var v: PfsOpenReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .openReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .openReply(v)
+          }
+        }()
+        case 67: try {
+          var v: PfsCloseReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .closeReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .closeReply(v)
+          }
+        }()
+        case 68: try {
+          var v: PfsReadReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .readReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .readReply(v)
+          }
+        }()
+        case 69: try {
+          var v: PfsWriteReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .writeReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .writeReply(v)
+          }
+        }()
+        case 70: try {
+          var v: PfsCreateReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .createReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .createReply(v)
+          }
+        }()
+        case 71: try {
+          var v: PfsMkdirReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .mkdirReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .mkdirReply(v)
+          }
+        }()
+        case 72: try {
+          var v: PfsRemoveReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .removeReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .removeReply(v)
+          }
+        }()
+        case 73: try {
+          var v: PfsRenameReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .renameReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .renameReply(v)
+          }
+        }()
+        case 74: try {
+          var v: PfsSymlinkReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .symlinkReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .symlinkReply(v)
+          }
+        }()
+        case 75: try {
+          var v: PfsReadlinkReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .readlinkReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .readlinkReply(v)
+          }
+        }()
+        case 76: try {
+          var v: PfsXattrGetReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrGetReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrGetReply(v)
+          }
+        }()
+        case 77: try {
+          var v: PfsXattrSetReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrSetReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrSetReply(v)
+          }
+        }()
+        case 78: try {
+          var v: PfsXattrListReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrListReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrListReply(v)
+          }
+        }()
+        case 79: try {
+          var v: PfsXattrRemoveReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .xattrRemoveReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .xattrRemoveReply(v)
+          }
+        }()
+        case 80: try {
+          var v: PfsStatfsReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .statfsReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .statfsReply(v)
+          }
+        }()
+        case 81: try {
+          var v: PfsFsyncReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .fsyncReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .fsyncReply(v)
+          }
+        }()
+        case 82: try {
+          var v: PfsReclaimReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .reclaimReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .reclaimReply(v)
+          }
+        }()
+        case 83: try {
+          var v: PfsSubscribeEventsReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .subscribeEventsReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .subscribeEventsReply(v)
+          }
+        }()
+        case 84: try {
+          var v: PfsHardLinkReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .hardLinkReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .hardLinkReply(v)
+          }
+        }()
+        case 85: try {
+          var v: PfsSyncVolumeReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .syncVolumeReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .syncVolumeReply(v)
+          }
+        }()
+        case 86: try {
+          var v: PfsVisibilityAckReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .visibilityAckReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .visibilityAckReply(v)
+          }
+        }()
+        case 87: try {
+          var v: PfsV3LivenessReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .v3LivenessReply(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .v3LivenessReply(v)
+          }
+        }()
+        case 90: try {
+          var v: PfsErrorReply?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .error(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .error(v)
+          }
+        }()
+        case 91: try {
+          var v: PfsEvent?
+          var hadOneofValue = false
+          if let current = _storage._body {
+            hadOneofValue = true
+            if case .event(let m) = current {v = m}
+          }
+          try decoder.decodeSingularMessageField(value: &v)
+          if let v = v {
+            if hadOneofValue {try decoder.handleConflictingOneOf()}
+            _storage._body = .event(v)
+          }
+        }()
+        default: break
         }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .hello(v)
-        }
-      }()
-      case 11: try {
-        var v: PfsResolveRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .resolve(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .resolve(v)
-        }
-      }()
-      case 12: try {
-        var v: PfsLookupRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .lookup(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .lookup(v)
-        }
-      }()
-      case 13: try {
-        var v: PfsEnumerateRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .enumerate(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .enumerate(v)
-        }
-      }()
-      case 14: try {
-        var v: PfsGetAttrRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .getAttr(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .getAttr(v)
-        }
-      }()
-      case 15: try {
-        var v: PfsSetAttrRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .setAttr(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .setAttr(v)
-        }
-      }()
-      case 16: try {
-        var v: PfsOpenRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .open(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .open(v)
-        }
-      }()
-      case 17: try {
-        var v: PfsCloseRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .close(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .close(v)
-        }
-      }()
-      case 18: try {
-        var v: PfsReadRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .read(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .read(v)
-        }
-      }()
-      case 19: try {
-        var v: PfsWriteRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .write(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .write(v)
-        }
-      }()
-      case 20: try {
-        var v: PfsCreateRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .create(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .create(v)
-        }
-      }()
-      case 21: try {
-        var v: PfsMkdirRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .mkdir(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .mkdir(v)
-        }
-      }()
-      case 22: try {
-        var v: PfsRemoveRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .remove(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .remove(v)
-        }
-      }()
-      case 23: try {
-        var v: PfsRenameRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .rename(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .rename(v)
-        }
-      }()
-      case 24: try {
-        var v: PfsSymlinkRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .symlink(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .symlink(v)
-        }
-      }()
-      case 25: try {
-        var v: PfsReadlinkRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .readlink(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .readlink(v)
-        }
-      }()
-      case 26: try {
-        var v: PfsXattrGetRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrGet(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrGet(v)
-        }
-      }()
-      case 27: try {
-        var v: PfsXattrSetRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrSet(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrSet(v)
-        }
-      }()
-      case 28: try {
-        var v: PfsXattrListRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrList(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrList(v)
-        }
-      }()
-      case 29: try {
-        var v: PfsXattrRemoveRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrRemove(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrRemove(v)
-        }
-      }()
-      case 30: try {
-        var v: PfsStatfsRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .statfs(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .statfs(v)
-        }
-      }()
-      case 31: try {
-        var v: PfsFsyncRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .fsync(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .fsync(v)
-        }
-      }()
-      case 32: try {
-        var v: PfsReclaimRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .reclaim(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .reclaim(v)
-        }
-      }()
-      case 33: try {
-        var v: PfsSubscribeEventsRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .subscribeEvents(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .subscribeEvents(v)
-        }
-      }()
-      case 34: try {
-        var v: PfsHardLinkRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .hardLink(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .hardLink(v)
-        }
-      }()
-      case 35: try {
-        var v: PfsSyncVolumeRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .syncVolume(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .syncVolume(v)
-        }
-      }()
-      case 36: try {
-        var v: PfsPublicationAck?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .publicationAck(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .publicationAck(v)
-        }
-      }()
-      case 37: try {
-        var v: PfsVisibilityAckRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .visibilityAck(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .visibilityAck(v)
-        }
-      }()
-      case 38: try {
-        var v: PfsV3LivenessRequest?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .v3Liveness(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .v3Liveness(v)
-        }
-      }()
-      case 60: try {
-        var v: PfsHelloReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .helloReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .helloReply(v)
-        }
-      }()
-      case 61: try {
-        var v: PfsResolveReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .resolveReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .resolveReply(v)
-        }
-      }()
-      case 62: try {
-        var v: PfsLookupReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .lookupReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .lookupReply(v)
-        }
-      }()
-      case 63: try {
-        var v: PfsEnumerateReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .enumerateReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .enumerateReply(v)
-        }
-      }()
-      case 64: try {
-        var v: PfsGetAttrReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .getAttrReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .getAttrReply(v)
-        }
-      }()
-      case 65: try {
-        var v: PfsSetAttrReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .setAttrReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .setAttrReply(v)
-        }
-      }()
-      case 66: try {
-        var v: PfsOpenReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .openReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .openReply(v)
-        }
-      }()
-      case 67: try {
-        var v: PfsCloseReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .closeReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .closeReply(v)
-        }
-      }()
-      case 68: try {
-        var v: PfsReadReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .readReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .readReply(v)
-        }
-      }()
-      case 69: try {
-        var v: PfsWriteReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .writeReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .writeReply(v)
-        }
-      }()
-      case 70: try {
-        var v: PfsCreateReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .createReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .createReply(v)
-        }
-      }()
-      case 71: try {
-        var v: PfsMkdirReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .mkdirReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .mkdirReply(v)
-        }
-      }()
-      case 72: try {
-        var v: PfsRemoveReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .removeReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .removeReply(v)
-        }
-      }()
-      case 73: try {
-        var v: PfsRenameReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .renameReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .renameReply(v)
-        }
-      }()
-      case 74: try {
-        var v: PfsSymlinkReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .symlinkReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .symlinkReply(v)
-        }
-      }()
-      case 75: try {
-        var v: PfsReadlinkReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .readlinkReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .readlinkReply(v)
-        }
-      }()
-      case 76: try {
-        var v: PfsXattrGetReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrGetReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrGetReply(v)
-        }
-      }()
-      case 77: try {
-        var v: PfsXattrSetReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrSetReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrSetReply(v)
-        }
-      }()
-      case 78: try {
-        var v: PfsXattrListReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrListReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrListReply(v)
-        }
-      }()
-      case 79: try {
-        var v: PfsXattrRemoveReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .xattrRemoveReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .xattrRemoveReply(v)
-        }
-      }()
-      case 80: try {
-        var v: PfsStatfsReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .statfsReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .statfsReply(v)
-        }
-      }()
-      case 81: try {
-        var v: PfsFsyncReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .fsyncReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .fsyncReply(v)
-        }
-      }()
-      case 82: try {
-        var v: PfsReclaimReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .reclaimReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .reclaimReply(v)
-        }
-      }()
-      case 83: try {
-        var v: PfsSubscribeEventsReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .subscribeEventsReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .subscribeEventsReply(v)
-        }
-      }()
-      case 84: try {
-        var v: PfsHardLinkReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .hardLinkReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .hardLinkReply(v)
-        }
-      }()
-      case 85: try {
-        var v: PfsSyncVolumeReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .syncVolumeReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .syncVolumeReply(v)
-        }
-      }()
-      case 86: try {
-        var v: PfsVisibilityAckReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .visibilityAckReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .visibilityAckReply(v)
-        }
-      }()
-      case 87: try {
-        var v: PfsV3LivenessReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .v3LivenessReply(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .v3LivenessReply(v)
-        }
-      }()
-      case 90: try {
-        var v: PfsErrorReply?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .error(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .error(v)
-        }
-      }()
-      case 91: try {
-        var v: PfsEvent?
-        var hadOneofValue = false
-        if let current = self.body {
-          hadOneofValue = true
-          if case .event(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.body = .event(v)
-        }
-      }()
-      default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    // The use of inline closures is to circumvent an issue where the compiler
-    // allocates stack space for every if/case branch local when no optimizations
-    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-    // https://github.com/apple/swift-protobuf/issues/1182
-    if self.requestID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.requestID, fieldNumber: 1)
-    }
-    if self.publicationAckRequired != false {
-      try visitor.visitSingularBoolField(value: self.publicationAckRequired, fieldNumber: 2)
-    }
-    if self.operationID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.operationID, fieldNumber: 3)
-    }
-    if self.publicationRetracted != false {
-      try visitor.visitSingularBoolField(value: self.publicationRetracted, fieldNumber: 4)
-    }
-    switch self.body {
-    case .hello?: try {
-      guard case .hello(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
-    }()
-    case .resolve?: try {
-      guard case .resolve(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
-    }()
-    case .lookup?: try {
-      guard case .lookup(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 12)
-    }()
-    case .enumerate?: try {
-      guard case .enumerate(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
-    }()
-    case .getAttr?: try {
-      guard case .getAttr(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 14)
-    }()
-    case .setAttr?: try {
-      guard case .setAttr(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 15)
-    }()
-    case .open?: try {
-      guard case .open(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 16)
-    }()
-    case .close?: try {
-      guard case .close(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 17)
-    }()
-    case .read?: try {
-      guard case .read(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 18)
-    }()
-    case .write?: try {
-      guard case .write(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 19)
-    }()
-    case .create?: try {
-      guard case .create(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 20)
-    }()
-    case .mkdir?: try {
-      guard case .mkdir(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 21)
-    }()
-    case .remove?: try {
-      guard case .remove(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 22)
-    }()
-    case .rename?: try {
-      guard case .rename(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 23)
-    }()
-    case .symlink?: try {
-      guard case .symlink(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 24)
-    }()
-    case .readlink?: try {
-      guard case .readlink(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 25)
-    }()
-    case .xattrGet?: try {
-      guard case .xattrGet(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 26)
-    }()
-    case .xattrSet?: try {
-      guard case .xattrSet(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 27)
-    }()
-    case .xattrList?: try {
-      guard case .xattrList(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 28)
-    }()
-    case .xattrRemove?: try {
-      guard case .xattrRemove(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 29)
-    }()
-    case .statfs?: try {
-      guard case .statfs(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 30)
-    }()
-    case .fsync?: try {
-      guard case .fsync(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 31)
-    }()
-    case .reclaim?: try {
-      guard case .reclaim(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 32)
-    }()
-    case .subscribeEvents?: try {
-      guard case .subscribeEvents(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 33)
-    }()
-    case .hardLink?: try {
-      guard case .hardLink(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 34)
-    }()
-    case .syncVolume?: try {
-      guard case .syncVolume(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 35)
-    }()
-    case .publicationAck?: try {
-      guard case .publicationAck(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 36)
-    }()
-    case .visibilityAck?: try {
-      guard case .visibilityAck(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 37)
-    }()
-    case .v3Liveness?: try {
-      guard case .v3Liveness(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 38)
-    }()
-    case .helloReply?: try {
-      guard case .helloReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 60)
-    }()
-    case .resolveReply?: try {
-      guard case .resolveReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 61)
-    }()
-    case .lookupReply?: try {
-      guard case .lookupReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 62)
-    }()
-    case .enumerateReply?: try {
-      guard case .enumerateReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 63)
-    }()
-    case .getAttrReply?: try {
-      guard case .getAttrReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 64)
-    }()
-    case .setAttrReply?: try {
-      guard case .setAttrReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 65)
-    }()
-    case .openReply?: try {
-      guard case .openReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 66)
-    }()
-    case .closeReply?: try {
-      guard case .closeReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 67)
-    }()
-    case .readReply?: try {
-      guard case .readReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 68)
-    }()
-    case .writeReply?: try {
-      guard case .writeReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 69)
-    }()
-    case .createReply?: try {
-      guard case .createReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 70)
-    }()
-    case .mkdirReply?: try {
-      guard case .mkdirReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 71)
-    }()
-    case .removeReply?: try {
-      guard case .removeReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 72)
-    }()
-    case .renameReply?: try {
-      guard case .renameReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 73)
-    }()
-    case .symlinkReply?: try {
-      guard case .symlinkReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 74)
-    }()
-    case .readlinkReply?: try {
-      guard case .readlinkReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 75)
-    }()
-    case .xattrGetReply?: try {
-      guard case .xattrGetReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 76)
-    }()
-    case .xattrSetReply?: try {
-      guard case .xattrSetReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 77)
-    }()
-    case .xattrListReply?: try {
-      guard case .xattrListReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 78)
-    }()
-    case .xattrRemoveReply?: try {
-      guard case .xattrRemoveReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 79)
-    }()
-    case .statfsReply?: try {
-      guard case .statfsReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 80)
-    }()
-    case .fsyncReply?: try {
-      guard case .fsyncReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 81)
-    }()
-    case .reclaimReply?: try {
-      guard case .reclaimReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 82)
-    }()
-    case .subscribeEventsReply?: try {
-      guard case .subscribeEventsReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 83)
-    }()
-    case .hardLinkReply?: try {
-      guard case .hardLinkReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 84)
-    }()
-    case .syncVolumeReply?: try {
-      guard case .syncVolumeReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 85)
-    }()
-    case .visibilityAckReply?: try {
-      guard case .visibilityAckReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 86)
-    }()
-    case .v3LivenessReply?: try {
-      guard case .v3LivenessReply(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 87)
-    }()
-    case .error?: try {
-      guard case .error(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 90)
-    }()
-    case .event?: try {
-      guard case .event(let v)? = self.body else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 91)
-    }()
-    case nil: break
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every if/case branch local when no optimizations
+      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+      // https://github.com/apple/swift-protobuf/issues/1182
+      if _storage._requestID != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._requestID, fieldNumber: 1)
+      }
+      if _storage._publicationAckRequired != false {
+        try visitor.visitSingularBoolField(value: _storage._publicationAckRequired, fieldNumber: 2)
+      }
+      if _storage._operationID != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._operationID, fieldNumber: 3)
+      }
+      if _storage._publicationRetracted != false {
+        try visitor.visitSingularBoolField(value: _storage._publicationRetracted, fieldNumber: 4)
+      }
+      if _storage._sourcePhaseQueueable != false {
+        try visitor.visitSingularBoolField(value: _storage._sourcePhaseQueueable, fieldNumber: 5)
+      }
+      switch _storage._body {
+      case .hello?: try {
+        guard case .hello(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
+      }()
+      case .resolve?: try {
+        guard case .resolve(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
+      }()
+      case .lookup?: try {
+        guard case .lookup(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 12)
+      }()
+      case .enumerate?: try {
+        guard case .enumerate(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
+      }()
+      case .getAttr?: try {
+        guard case .getAttr(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 14)
+      }()
+      case .setAttr?: try {
+        guard case .setAttr(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 15)
+      }()
+      case .open?: try {
+        guard case .open(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 16)
+      }()
+      case .close?: try {
+        guard case .close(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 17)
+      }()
+      case .read?: try {
+        guard case .read(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 18)
+      }()
+      case .write?: try {
+        guard case .write(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 19)
+      }()
+      case .create?: try {
+        guard case .create(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 20)
+      }()
+      case .mkdir?: try {
+        guard case .mkdir(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 21)
+      }()
+      case .remove?: try {
+        guard case .remove(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 22)
+      }()
+      case .rename?: try {
+        guard case .rename(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 23)
+      }()
+      case .symlink?: try {
+        guard case .symlink(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 24)
+      }()
+      case .readlink?: try {
+        guard case .readlink(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 25)
+      }()
+      case .xattrGet?: try {
+        guard case .xattrGet(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 26)
+      }()
+      case .xattrSet?: try {
+        guard case .xattrSet(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 27)
+      }()
+      case .xattrList?: try {
+        guard case .xattrList(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 28)
+      }()
+      case .xattrRemove?: try {
+        guard case .xattrRemove(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 29)
+      }()
+      case .statfs?: try {
+        guard case .statfs(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 30)
+      }()
+      case .fsync?: try {
+        guard case .fsync(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 31)
+      }()
+      case .reclaim?: try {
+        guard case .reclaim(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 32)
+      }()
+      case .subscribeEvents?: try {
+        guard case .subscribeEvents(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 33)
+      }()
+      case .hardLink?: try {
+        guard case .hardLink(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 34)
+      }()
+      case .syncVolume?: try {
+        guard case .syncVolume(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 35)
+      }()
+      case .publicationAck?: try {
+        guard case .publicationAck(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 36)
+      }()
+      case .visibilityAck?: try {
+        guard case .visibilityAck(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 37)
+      }()
+      case .v3Liveness?: try {
+        guard case .v3Liveness(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 38)
+      }()
+      case .resourceReplyDisposition?: try {
+        guard case .resourceReplyDisposition(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 39)
+      }()
+      case .helloReply?: try {
+        guard case .helloReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 60)
+      }()
+      case .resolveReply?: try {
+        guard case .resolveReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 61)
+      }()
+      case .lookupReply?: try {
+        guard case .lookupReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 62)
+      }()
+      case .enumerateReply?: try {
+        guard case .enumerateReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 63)
+      }()
+      case .getAttrReply?: try {
+        guard case .getAttrReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 64)
+      }()
+      case .setAttrReply?: try {
+        guard case .setAttrReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 65)
+      }()
+      case .openReply?: try {
+        guard case .openReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 66)
+      }()
+      case .closeReply?: try {
+        guard case .closeReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 67)
+      }()
+      case .readReply?: try {
+        guard case .readReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 68)
+      }()
+      case .writeReply?: try {
+        guard case .writeReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 69)
+      }()
+      case .createReply?: try {
+        guard case .createReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 70)
+      }()
+      case .mkdirReply?: try {
+        guard case .mkdirReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 71)
+      }()
+      case .removeReply?: try {
+        guard case .removeReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 72)
+      }()
+      case .renameReply?: try {
+        guard case .renameReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 73)
+      }()
+      case .symlinkReply?: try {
+        guard case .symlinkReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 74)
+      }()
+      case .readlinkReply?: try {
+        guard case .readlinkReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 75)
+      }()
+      case .xattrGetReply?: try {
+        guard case .xattrGetReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 76)
+      }()
+      case .xattrSetReply?: try {
+        guard case .xattrSetReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 77)
+      }()
+      case .xattrListReply?: try {
+        guard case .xattrListReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 78)
+      }()
+      case .xattrRemoveReply?: try {
+        guard case .xattrRemoveReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 79)
+      }()
+      case .statfsReply?: try {
+        guard case .statfsReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 80)
+      }()
+      case .fsyncReply?: try {
+        guard case .fsyncReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 81)
+      }()
+      case .reclaimReply?: try {
+        guard case .reclaimReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 82)
+      }()
+      case .subscribeEventsReply?: try {
+        guard case .subscribeEventsReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 83)
+      }()
+      case .hardLinkReply?: try {
+        guard case .hardLinkReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 84)
+      }()
+      case .syncVolumeReply?: try {
+        guard case .syncVolumeReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 85)
+      }()
+      case .visibilityAckReply?: try {
+        guard case .visibilityAckReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 86)
+      }()
+      case .v3LivenessReply?: try {
+        guard case .v3LivenessReply(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 87)
+      }()
+      case .error?: try {
+        guard case .error(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 90)
+      }()
+      case .event?: try {
+        guard case .event(let v)? = _storage._body else { preconditionFailure() }
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 91)
+      }()
+      case nil: break
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PfsEnvelope, rhs: PfsEnvelope) -> Bool {
-    if lhs.requestID != rhs.requestID {return false}
-    if lhs.publicationAckRequired != rhs.publicationAckRequired {return false}
-    if lhs.operationID != rhs.operationID {return false}
-    if lhs.publicationRetracted != rhs.publicationRetracted {return false}
-    if lhs.body != rhs.body {return false}
+    if lhs._storage !== rhs._storage {
+      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
+        let _storage = _args.0
+        let rhs_storage = _args.1
+        if _storage._requestID != rhs_storage._requestID {return false}
+        if _storage._publicationAckRequired != rhs_storage._publicationAckRequired {return false}
+        if _storage._operationID != rhs_storage._operationID {return false}
+        if _storage._publicationRetracted != rhs_storage._publicationRetracted {return false}
+        if _storage._sourcePhaseQueueable != rhs_storage._sourcePhaseQueueable {return false}
+        if _storage._body != rhs_storage._body {return false}
+        return true
+      }
+      if !storagesAreEqual {return false}
+    }
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -3855,6 +4057,50 @@ extension PfsPublicationAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   public static func ==(lhs: PfsPublicationAck, rhs: PfsPublicationAck) -> Bool {
     if lhs.publishedRequestID != rhs.publishedRequestID {return false}
     if lhs.operationID != rhs.operationID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension PfsResourceReplyDisposition: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ResourceReplyDisposition"
+  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+    1: .standard(proto: "target_request_id"),
+    2: .standard(proto: "accept_handles"),
+    3: .standard(proto: "accepted_item_count"),
+  ]
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.targetRequestID) }()
+      case 2: try { try decoder.decodeSingularBoolField(value: &self.acceptHandles) }()
+      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.acceptedItemCount) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.targetRequestID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.targetRequestID, fieldNumber: 1)
+    }
+    if self.acceptHandles != false {
+      try visitor.visitSingularBoolField(value: self.acceptHandles, fieldNumber: 2)
+    }
+    if self.acceptedItemCount != 0 {
+      try visitor.visitSingularUInt32Field(value: self.acceptedItemCount, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: PfsResourceReplyDisposition, rhs: PfsResourceReplyDisposition) -> Bool {
+    if lhs.targetRequestID != rhs.targetRequestID {return false}
+    if lhs.acceptHandles != rhs.acceptHandles {return false}
+    if lhs.acceptedItemCount != rhs.acceptedItemCount {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4220,6 +4466,7 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     7: .standard(proto: "preferred_io_bytes"),
     8: .standard(proto: "flags_supported"),
     9: .standard(proto: "flags_understood"),
+    10: .standard(proto: "xattr_set_supported"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4237,6 +4484,7 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
       case 7: try { try decoder.decodeSingularUInt32Field(value: &self.preferredIoBytes) }()
       case 8: try { try decoder.decodeSingularBoolField(value: &self.flagsSupported) }()
       case 9: try { try decoder.decodeSingularBoolField(value: &self.flagsUnderstood) }()
+      case 10: try { try decoder.decodeSingularBoolField(value: &self.xattrSetSupported) }()
       default: break
       }
     }
@@ -4270,6 +4518,9 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     if self.flagsUnderstood != false {
       try visitor.visitSingularBoolField(value: self.flagsUnderstood, fieldNumber: 9)
     }
+    if self.xattrSetSupported != false {
+      try visitor.visitSingularBoolField(value: self.xattrSetSupported, fieldNumber: 10)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4283,6 +4534,7 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     if lhs.preferredIoBytes != rhs.preferredIoBytes {return false}
     if lhs.flagsSupported != rhs.flagsSupported {return false}
     if lhs.flagsUnderstood != rhs.flagsUnderstood {return false}
+    if lhs.xattrSetSupported != rhs.xattrSetSupported {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4643,6 +4895,7 @@ extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     2: .same(proto: "cookie"),
     3: .standard(proto: "max_entries"),
     4: .standard(proto: "want_attrs"),
+    5: .same(proto: "handle"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -4655,6 +4908,7 @@ extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.cookie) }()
       case 3: try { try decoder.decodeSingularUInt32Field(value: &self.maxEntries) }()
       case 4: try { try decoder.decodeSingularBoolField(value: &self.wantAttrs) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
       default: break
       }
     }
@@ -4677,6 +4931,9 @@ extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     if self.wantAttrs != false {
       try visitor.visitSingularBoolField(value: self.wantAttrs, fieldNumber: 4)
     }
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 5)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4685,6 +4942,7 @@ extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     if lhs.cookie != rhs.cookie {return false}
     if lhs.maxEntries != rhs.maxEntries {return false}
     if lhs.wantAttrs != rhs.wantAttrs {return false}
+    if lhs.handle != rhs.handle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6500,6 +6758,7 @@ extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     3: .standard(proto: "parent_identity"),
     4: .same(proto: "name"),
     5: .same(proto: "size"),
+    6: .standard(proto: "post_identity"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -6513,6 +6772,7 @@ extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
       case 3: try { try decoder.decodeSingularBytesField(value: &self.parentIdentity) }()
       case 4: try { try decoder.decodeSingularBytesField(value: &self.name) }()
       case 5: try { try decoder.decodeSingularInt64Field(value: &self.size) }()
+      case 6: try { try decoder.decodeSingularBytesField(value: &self.postIdentity) }()
       default: break
       }
     }
@@ -6534,6 +6794,9 @@ extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     if self.size != 0 {
       try visitor.visitSingularInt64Field(value: self.size, fieldNumber: 5)
     }
+    if !self.postIdentity.isEmpty {
+      try visitor.visitSingularBytesField(value: self.postIdentity, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6543,6 +6806,7 @@ extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     if lhs.parentIdentity != rhs.parentIdentity {return false}
     if lhs.name != rhs.name {return false}
     if lhs.size != rhs.size {return false}
+    if lhs.postIdentity != rhs.postIdentity {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6671,6 +6935,7 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
     2: .same(proto: "cursor"),
     3: .same(proto: "blocked"),
     4: .same(proto: "reason"),
+    5: .standard(proto: "ordered_admission_contended"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -6683,6 +6948,7 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
       case 2: try { try decoder.decodeSingularMessageField(value: &self._cursor) }()
       case 3: try { try decoder.decodeSingularBoolField(value: &self.blocked) }()
       case 4: try { try decoder.decodeSingularStringField(value: &self.reason) }()
+      case 5: try { try decoder.decodeSingularBoolField(value: &self.orderedAdmissionContended) }()
       default: break
       }
     }
@@ -6705,6 +6971,9 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
     if !self.reason.isEmpty {
       try visitor.visitSingularStringField(value: self.reason, fieldNumber: 4)
     }
+    if self.orderedAdmissionContended != false {
+      try visitor.visitSingularBoolField(value: self.orderedAdmissionContended, fieldNumber: 5)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6713,6 +6982,7 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
     if lhs._cursor != rhs._cursor {return false}
     if lhs.blocked != rhs.blocked {return false}
     if lhs.reason != rhs.reason {return false}
+    if lhs.orderedAdmissionContended != rhs.orderedAdmissionContended {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

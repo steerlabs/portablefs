@@ -36,6 +36,13 @@ const (
 	// routing topology. It is neither a storage failure nor a cache-coherence
 	// failure: the volume is healthy and this mount's configuration is wrong.
 	FailureClass_FAILURE_CLASS_ROUTES FailureClass = 4
+	// VISIBILITY_INTERRUPTED is a definite pre-apply refusal issued so a
+	// callback-serialized participant can release the execution lane needed by
+	// its pending repair. Linux consumes the accompanying EINTR directly. An
+	// policy-v2 FSKit frontend must translate the classified refusal to
+	// ECANCELED because macOS 26 may transparently re-enter a mutating callback
+	// after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
+	FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED FailureClass = 5
 )
 
 // Enum value maps for FailureClass.
@@ -46,13 +53,15 @@ var (
 		2: "FAILURE_CLASS_INTERNAL",
 		3: "FAILURE_CLASS_COHERENCE",
 		4: "FAILURE_CLASS_ROUTES",
+		5: "FAILURE_CLASS_VISIBILITY_INTERRUPTED",
 	}
 	FailureClass_value = map[string]int32{
-		"FAILURE_CLASS_UNSPECIFIED": 0,
-		"FAILURE_CLASS_STORAGE":     1,
-		"FAILURE_CLASS_INTERNAL":    2,
-		"FAILURE_CLASS_COHERENCE":   3,
-		"FAILURE_CLASS_ROUTES":      4,
+		"FAILURE_CLASS_UNSPECIFIED":            0,
+		"FAILURE_CLASS_STORAGE":                1,
+		"FAILURE_CLASS_INTERNAL":               2,
+		"FAILURE_CLASS_COHERENCE":              3,
+		"FAILURE_CLASS_ROUTES":                 4,
+		"FAILURE_CLASS_VISIBILITY_INTERRUPTED": 5,
 	}
 )
 
@@ -150,12 +159,29 @@ func (CoherenceProfile) EnumDescriptor() ([]byte, []int) {
 // operation can hold. A frontend may only declare it if that is true of its
 // kernel; there is no default, because guessing wrong turns a proven cycle into
 // an unbounded hang.
+//
+// CALLBACK_SERIALIZED is macOS 26 FSKit synchronous VFS repair. Repair enters
+// the same framework callback execution capacity that an unanswered ordered
+// mutation can occupy, even when the mutation and repair name disjoint
+// directories. While this participant owes a visibility phase, the authority
+// therefore interrupts its later visible mutations before they execute instead
+// of parking them behind the phase they would prevent it from repairing.
+//
+// CALLBACK_SERIALIZED_PIPELINED is the identity-aware current macOS 26
+// contract. Peer phases and mutations from the initiating callback retain the
+// interruption rule. A distinct nonzero frontend_operation_id may queue behind
+// an own-source phase only when that exact request also carries
+// source_phase_queueable: the frontend then excludes the already-dispatched
+// ordered-only callback from source PREPARE's drain. Mixed callbacks and zero
+// identities stay fail-safe and are interrupted before apply.
 type NamespaceRepair int32
 
 const (
-	NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED      NamespaceRepair = 0
-	NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE NamespaceRepair = 1
-	NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT      NamespaceRepair = 2
+	NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED                   NamespaceRepair = 0
+	NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE              NamespaceRepair = 1
+	NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT                   NamespaceRepair = 2
+	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED           NamespaceRepair = 3
+	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED NamespaceRepair = 4
 )
 
 // Enum value maps for NamespaceRepair.
@@ -164,11 +190,15 @@ var (
 		0: "NAMESPACE_REPAIR_UNSPECIFIED",
 		1: "NAMESPACE_REPAIR_PARENT_EXCLUSIVE",
 		2: "NAMESPACE_REPAIR_INDEPENDENT",
+		3: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED",
+		4: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED",
 	}
 	NamespaceRepair_value = map[string]int32{
-		"NAMESPACE_REPAIR_UNSPECIFIED":      0,
-		"NAMESPACE_REPAIR_PARENT_EXCLUSIVE": 1,
-		"NAMESPACE_REPAIR_INDEPENDENT":      2,
+		"NAMESPACE_REPAIR_UNSPECIFIED":                   0,
+		"NAMESPACE_REPAIR_PARENT_EXCLUSIVE":              1,
+		"NAMESPACE_REPAIR_INDEPENDENT":                   2,
+		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED":           3,
+		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED": 4,
 	}
 )
 
@@ -407,6 +437,19 @@ type Request struct {
 	Epoch     []byte                 `protobuf:"bytes,2,opt,name=epoch,proto3" json:"epoch,omitempty"` // 16 bytes after Hello/Attach
 	Session   *SessionProof          `protobuf:"bytes,3,opt,name=session,proto3" json:"session,omitempty"`
 	Mutation  *Mutation              `protobuf:"bytes,4,opt,name=mutation,proto3" json:"mutation,omitempty"` // required on mutating bodies
+	// Opaque logical publication/callback identity assigned by the filesystem
+	// frontend. A nonzero value lets CALLBACK_SERIALIZED_PIPELINED scheduling
+	// distinguish a later callback from another mutation issued by the initiating
+	// callback.
+	// Zero means unknown and preserves the fail-safe interruption rule. This is
+	// scheduling metadata only: it grants no authority and is not a replay ID.
+	FrontendOperationId uint64 `protobuf:"varint,5,opt,name=frontend_operation_id,json=frontendOperationId,proto3" json:"frontend_operation_id,omitempty"`
+	// Per-request frontend progress proof. True means this ordered mutation is
+	// from an ordered-only callback which the frontend will exclude from the
+	// drain of a distinct own-source visibility phase. False is fail-safe and
+	// requires definite pre-apply interruption while such a phase is pending.
+	// This is scheduling metadata only and grants no authority.
+	SourcePhaseQueueable bool `protobuf:"varint,6,opt,name=source_phase_queueable,json=sourcePhaseQueueable,proto3" json:"source_phase_queueable,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Request_Hello
@@ -505,6 +548,20 @@ func (x *Request) GetMutation() *Mutation {
 		return x.Mutation
 	}
 	return nil
+}
+
+func (x *Request) GetFrontendOperationId() uint64 {
+	if x != nil {
+		return x.FrontendOperationId
+	}
+	return 0
+}
+
+func (x *Request) GetSourcePhaseQueueable() bool {
+	if x != nil {
+		return x.SourcePhaseQueueable
+	}
+	return false
 }
 
 func (x *Request) GetBody() isRequest_Body {
@@ -2584,8 +2641,12 @@ type VisibilityTarget struct {
 	KernelIno       uint64 `protobuf:"varint,6,opt,name=kernel_ino,json=kernelIno,proto3" json:"kernel_ino,omitempty"`                     // attr inode of the data/attributes target
 	ParentKernelIno uint64 `protobuf:"varint,7,opt,name=parent_kernel_ino,json=parentKernelIno,proto3" json:"parent_kernel_ino,omitempty"` // attr inode of the namespace target's parent
 	Device          uint64 `protobuf:"fixed64,8,opt,name=device,proto3" json:"device,omitempty"`                                           // major<<32 | minor of the one backing filesystem
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Exact post-mutation owner of a namespace coordinate when authority can
+	// attest it. Empty for absent/unknown postconditions and for non-namespace
+	// scopes; unlike dependency metadata, this association is safe to actuate.
+	PostIdentity  []byte `protobuf:"bytes,9,opt,name=post_identity,json=postIdentity,proto3" json:"post_identity,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VisibilityTarget) Reset() {
@@ -2672,6 +2733,13 @@ func (x *VisibilityTarget) GetDevice() uint64 {
 		return x.Device
 	}
 	return 0
+}
+
+func (x *VisibilityTarget) GetPostIdentity() []byte {
+	if x != nil {
+		return x.PostIdentity
+	}
+	return nil
 }
 
 // RoutesChange makes a two-phase event say "this is a routing-topology change"
@@ -2991,12 +3059,12 @@ func (x *NextVisibilityRequest) GetAfter() *VisibilityCursor {
 type AckVisibilityRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Cursor *VisibilityCursor      `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	// blocked is a frontend saying it cannot service this phase, because doing so
-	// would wait on a kernel lock its own unanswered request to this authority
-	// holds. It is a report, not a request for more time: the authority fences
-	// this participant immediately, which is the same outcome its repair budget
-	// would eventually produce and is reached without stopping every other
-	// mount's mutations for the length of that budget.
+	// blocked is a frontend saying it cannot yet service this phase because an
+	// exact namespace repair needs a parent lock its own unanswered request to
+	// this authority holds. For an ordinary parent-exclusive COMPLETE, the
+	// authority installs a cursor+parent-scoped pre-apply interruption. The
+	// frontend drains the refused request, performs repair, and acknowledges the
+	// same phase without losing the mount. A routes change remains terminal.
 	//
 	// Only the frontend can evaluate this. It needs BOTH that the mount has an
 	// unanswered namespace mutation in the affected parent - which the authority
@@ -3005,11 +3073,24 @@ type AckVisibilityRequest struct {
 	// filter with no false negatives and therefore many false positives. A mount
 	// that has nothing cached to repair must acknowledge normally.
 	//
-	// The authority verifies the half it can see and treats an unsupported claim
-	// as a cursor violation, so this cannot be used to skip a repair.
-	Blocked       bool `protobuf:"varint,2,opt,name=blocked,proto3" json:"blocked,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The authority maps every reported inode through this exact pending event
+	// and enforces the interruption when the corresponding ordinary request is
+	// present or later arrives. This report never acknowledges the phase, so it
+	// cannot be used to skip repair; the ordinary phase deadline remains the
+	// fail-closed bound if the lock does not drain.
+	Blocked bool `protobuf:"varint,2,opt,name=blocked,proto3" json:"blocked,omitempty"`
+	// Exact parent coordination inodes whose cached bindings require reverse
+	// invalidation. The authority maps each one back to this pending event's
+	// stable parent identity before installing an interruption. Required for an
+	// ordinary namespace blocked report; empty for a terminal routes report.
+	BlockedParentKernelInos []uint64 `protobuf:"varint,3,rep,packed,name=blocked_parent_kernel_inos,json=blockedParentKernelInos,proto3" json:"blocked_parent_kernel_inos,omitempty"`
+	// Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
+	// pipelined frontend sets it when peer repair refused at least one otherwise
+	// queueable ordered callback before that exact Ack. It never acknowledges a
+	// blocked phase and cannot exempt a mutation from ordinary eligibility.
+	OrderedAdmissionContended bool `protobuf:"varint,4,opt,name=ordered_admission_contended,json=orderedAdmissionContended,proto3" json:"ordered_admission_contended,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *AckVisibilityRequest) Reset() {
@@ -3052,6 +3133,20 @@ func (x *AckVisibilityRequest) GetCursor() *VisibilityCursor {
 func (x *AckVisibilityRequest) GetBlocked() bool {
 	if x != nil {
 		return x.Blocked
+	}
+	return false
+}
+
+func (x *AckVisibilityRequest) GetBlockedParentKernelInos() []uint64 {
+	if x != nil {
+		return x.BlockedParentKernelInos
+	}
+	return nil
+}
+
+func (x *AckVisibilityRequest) GetOrderedAdmissionContended() bool {
+	if x != nil {
+		return x.OrderedAdmissionContended
 	}
 	return false
 }
@@ -5592,13 +5687,15 @@ var File_proto_authority_v1_authority_proto protoreflect.FileDescriptor
 
 const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\n" +
-	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xbb\x14\n" +
+	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xa5\x15\n" +
 	"\aRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\fR\x05epoch\x12?\n" +
 	"\asession\x18\x03 \x01(\v2%.portablefs.authority.v1.SessionProofR\asession\x12=\n" +
-	"\bmutation\x18\x04 \x01(\v2!.portablefs.authority.v1.MutationR\bmutation\x12=\n" +
+	"\bmutation\x18\x04 \x01(\v2!.portablefs.authority.v1.MutationR\bmutation\x122\n" +
+	"\x15frontend_operation_id\x18\x05 \x01(\x04R\x13frontendOperationId\x124\n" +
+	"\x16source_phase_queueable\x18\x06 \x01(\bR\x14sourcePhaseQueueable\x12=\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2%.portablefs.authority.v1.HelloRequestH\x00R\x05hello\x12@\n" +
 	"\x06attach\x18\v \x01(\v2&.portablefs.authority.v1.AttachRequestH\x00R\x06attach\x12@\n" +
@@ -5755,7 +5852,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x11target_request_id\x18\x01 \x01(\x04R\x0ftargetRequestId\"n\n" +
 	"\x10VisibilityCursor\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12>\n" +
-	"\x05phase\x18\x02 \x01(\x0e2(.portablefs.authority.v1.VisibilityPhaseR\x05phase\"\xa2\x02\n" +
+	"\x05phase\x18\x02 \x01(\x0e2(.portablefs.authority.v1.VisibilityPhaseR\x05phase\"\xc7\x02\n" +
 	"\x10VisibilityTarget\x12>\n" +
 	"\x05scope\x18\x01 \x01(\x0e2(.portablefs.authority.v1.VisibilityScopeR\x05scope\x12\x1a\n" +
 	"\bidentity\x18\x02 \x01(\fR\bidentity\x12'\n" +
@@ -5765,7 +5862,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\n" +
 	"kernel_ino\x18\x06 \x01(\x04R\tkernelIno\x12*\n" +
 	"\x11parent_kernel_ino\x18\a \x01(\x04R\x0fparentKernelIno\x12\x16\n" +
-	"\x06device\x18\b \x01(\x06R\x06device\"@\n" +
+	"\x06device\x18\b \x01(\x06R\x06device\x12#\n" +
+	"\rpost_identity\x18\t \x01(\fR\fpostIdentity\"@\n" +
 	"\fRoutesChange\x12\x1a\n" +
 	"\brevision\x18\x01 \x01(\fR\brevision\x12\x14\n" +
 	"\x05rules\x18\x02 \x01(\fR\x05rules\"\xdc\x02\n" +
@@ -5784,10 +5882,12 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\tcanonical\x18\x02 \x01(\fR\tcanonical\x12;\n" +
 	"\x19acknowledged_participants\x18\x03 \x01(\rR\x18acknowledgedParticipants\"X\n" +
 	"\x15NextVisibilityRequest\x12?\n" +
-	"\x05after\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x05after\"s\n" +
+	"\x05after\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x05after\"\xf0\x01\n" +
 	"\x14AckVisibilityRequest\x12A\n" +
 	"\x06cursor\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x06cursor\x12\x18\n" +
-	"\ablocked\x18\x02 \x01(\bR\ablocked\";\n" +
+	"\ablocked\x18\x02 \x01(\bR\ablocked\x12;\n" +
+	"\x1ablocked_parent_kernel_inos\x18\x03 \x03(\x04R\x17blockedParentKernelInos\x12>\n" +
+	"\x1bordered_admission_contended\x18\x04 \x01(\bR\x19orderedAdmissionContended\";\n" +
 	"\rLookupRequest\x12\x16\n" +
 	"\x06parent\x18\x01 \x01(\fR\x06parent\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\fR\x04name\"@\n" +
@@ -5975,20 +6075,23 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x0eSetLockRequest\x125\n" +
 	"\x04lock\x18\x01 \x01(\v2!.portablefs.authority.v1.LockSpecR\x04lock\x12\x12\n" +
 	"\x04wait\x18\x02 \x01(\bR\x04wait\x12\x16\n" +
-	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\x9b\x01\n" +
+	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xc5\x01\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15FAILURE_CLASS_STORAGE\x10\x01\x12\x1a\n" +
 	"\x16FAILURE_CLASS_INTERNAL\x10\x02\x12\x1b\n" +
 	"\x17FAILURE_CLASS_COHERENCE\x10\x03\x12\x18\n" +
-	"\x14FAILURE_CLASS_ROUTES\x10\x04*P\n" +
+	"\x14FAILURE_CLASS_ROUTES\x10\x04\x12(\n" +
+	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05*P\n" +
 	"\x10CoherenceProfile\x12\x1e\n" +
 	"\x1aCOHERENCE_PROFILE_UNCACHED\x10\x00\x12\x1c\n" +
-	"\x18COHERENCE_PROFILE_STRICT\x10\x01*|\n" +
+	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\xda\x01\n" +
 	"\x0fNamespaceRepair\x12 \n" +
 	"\x1cNAMESPACE_REPAIR_UNSPECIFIED\x10\x00\x12%\n" +
 	"!NAMESPACE_REPAIR_PARENT_EXCLUSIVE\x10\x01\x12 \n" +
-	"\x1cNAMESPACE_REPAIR_INDEPENDENT\x10\x02*p\n" +
+	"\x1cNAMESPACE_REPAIR_INDEPENDENT\x10\x02\x12(\n" +
+	"$NAMESPACE_REPAIR_CALLBACK_SERIALIZED\x10\x03\x122\n" +
+	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04*p\n" +
 	"\x0fVisibilityPhase\x12 \n" +
 	"\x1cVISIBILITY_PHASE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18VISIBILITY_PHASE_PREPARE\x10\x01\x12\x1d\n" +

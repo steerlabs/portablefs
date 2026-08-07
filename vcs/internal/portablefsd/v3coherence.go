@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	v3CachePolicyMacOS26 = "macos26-synchronous-vfs-repair-v1"
-	v3CachePolicyFSKit   = "fskit-native-revocation-v1"
+	v3CachePolicyMacOS26V1 = "macos26-synchronous-vfs-repair-v1"
+	v3CachePolicyMacOS26   = "macos26-synchronous-vfs-repair-v2"
+	v3CachePolicyFSKit     = "fskit-native-revocation-v1"
 )
 
-// V3CachePolicyMacOS26 is the macOS 26 synchronous-VFS-repair coherence
-// policy a v3 ensure request declares. Exported because the CLI builds that
+// V3CachePolicyMacOS26 is the current macOS 26 synchronous-VFS-repair
+// coherence policy a v3 ensure request declares. Exported because the CLI builds that
 // request and the policy string is a contract between the two processes, not
 // something either side may spell on its own.
 const V3CachePolicyMacOS26 = v3CachePolicyMacOS26
@@ -44,7 +45,8 @@ type v3VisibilityClient interface {
 	VisibilityRepairBudget() time.Duration
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
-	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor) error
+	AckVisibilityWithContention(context.Context, *authoritypb.VisibilityCursor, bool) error
+	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor, []uint64) error
 	SessionDone() <-chan struct{}
 	SessionError() error
 	Close() error
@@ -82,17 +84,32 @@ type v3CoherenceBridge struct {
 	operations   map[v3MutationTicket]uint64
 	visible      map[v3MutationTicket]bool
 	publications map[uint64]chan struct{}
-	subscribed   bool
-	terminal     error
-	failOnce     sync.Once
-	onFailure    func(error)
+	// publicationReservations is the serial frontend reader's proof that an
+	// operation ID is live. It is installed before the handler goroutine is
+	// launched, so a callback acknowledgement may safely close publications[id]
+	// before registerMutation has received an authority replay identity. The
+	// reservation is released when every already-reserved handler has exited;
+	// read-only operations and mutations refused before assignment therefore
+	// retain no per-operation state for the lifetime of the mount.
+	publicationReservations map[uint64]struct{}
+	subscribed              bool
+	detaching               bool
+	detachHadSubscriber     bool
+	// detachStreamEnding records that the subscribed frontend connection
+	// actually began ending under a planned kernel detach. If that detach then
+	// aborts, the mount has lost the only frontend that could prove its cache
+	// state and must become terminal instead of silently resuming.
+	detachStreamEnding bool
+	terminal           error
+	failOnce           sync.Once
+	onFailure          func(error)
 }
 
 func newV3CoherenceBridge(client v3VisibilityClient, cachePolicy string, onFailure func(error)) (*v3CoherenceBridge, error) {
 	if client == nil {
 		return nil, errors.New("portablefsd: v3 coherence needs an authority client")
 	}
-	if cachePolicy != v3CachePolicyMacOS26 && cachePolicy != v3CachePolicyFSKit {
+	if cachePolicy != v3CachePolicyMacOS26V1 && cachePolicy != v3CachePolicyMacOS26 && cachePolicy != v3CachePolicyFSKit {
 		return nil, fmt.Errorf("portablefsd: unsupported macOS v3 cache policy %q", cachePolicy)
 	}
 	epoch, session := client.Epoch(), client.SessionID()
@@ -113,13 +130,14 @@ func newV3CoherenceBridge(client v3VisibilityClient, cachePolicy string, onFailu
 		}
 	}
 	b := &v3CoherenceBridge{
-		client:       client,
-		budget:       budget,
-		cursor:       initial,
-		operations:   make(map[v3MutationTicket]uint64),
-		visible:      make(map[v3MutationTicket]bool),
-		publications: make(map[uint64]chan struct{}),
-		onFailure:    onFailure,
+		client:                  client,
+		budget:                  budget,
+		cursor:                  initial,
+		operations:              make(map[v3MutationTicket]uint64),
+		visible:                 make(map[v3MutationTicket]bool),
+		publications:            make(map[uint64]chan struct{}),
+		publicationReservations: make(map[uint64]struct{}),
+		onFailure:               onFailure,
 		contract: pfslocal.V3CoherenceContract{
 			AuthorityProtocolMajor: authorityrpc.ProtocolMajor,
 			AuthorityEpoch:         append([]byte(nil), epoch...),
@@ -134,6 +152,43 @@ func newV3CoherenceBridge(client v3VisibilityClient, cachePolicy string, onFailu
 	}
 	go b.watchSession()
 	return b, nil
+}
+
+// reserveFrontendPublication mirrors the frontend connection's wire-order
+// reservation into the authority bridge. It deliberately refreshes the
+// reservation after every successfully reserved nonzero frame rather than
+// duplicating the data-plane mutation classifier here: a callback may finish a
+// read request, become locally inactive, and then mutate in a later frame with
+// the same operation ID. The PublicationAck is ordered after all of those frames
+// on the same stream. releaseFrontendPublication gives nonmutation operations a
+// strict, request-activity-lifetime bound.
+func (b *v3CoherenceBridge) reserveFrontendPublication(localOperationID uint64) {
+	if localOperationID == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.terminal != nil {
+		return
+	}
+	b.publicationReservations[localOperationID] = struct{}{}
+	if b.publications[localOperationID] == nil {
+		b.publications[localOperationID] = make(chan struct{})
+	}
+}
+
+// releaseFrontendPublication closes the reservation lifetime once all request
+// handlers belonging to the operation have exited. A registered authority
+// mutation still owns the publication channel until its source COMPLETE;
+// otherwise the channel is bounded to this callback and removed here.
+func (b *v3CoherenceBridge) releaseFrontendPublication(localOperationID uint64) {
+	if localOperationID == 0 {
+		return
+	}
+	b.mu.Lock()
+	delete(b.publicationReservations, localOperationID)
+	b.retirePublicationLocked(localOperationID)
+	b.mu.Unlock()
 }
 
 // registerMutation links an authority replay identity to the pfslocal
@@ -209,7 +264,17 @@ func (b *v3CoherenceBridge) completeMutation(
 	if callErr != nil || response == nil || response.GetUncertain() ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		if callErr == nil {
-			callErr = errors.New("portablefsd: authority mutation ended without a definite session-safe result")
+			callErr = fmt.Errorf(
+				"portablefsd: authority mutation ended without a definite session-safe result: nil_response=%t uncertain=%t errno=%d failure=%d session_refused=%t slot=%d sequence=%d operation_id=%d",
+				response == nil,
+				response != nil && response.GetUncertain(),
+				response.GetErrno(),
+				response.GetFailure(),
+				response.GetRoutesMismatch().GetSessionRefused(),
+				identity.Slot,
+				identity.Sequence,
+				localOperationID,
+			)
 		}
 		return b.fail(callErr)
 	}
@@ -291,6 +356,9 @@ func (b *v3CoherenceBridge) run(ctx context.Context, deliver func(*pfslocal.Even
 		}
 		select {
 		case <-ctx.Done():
+			if b.acceptPlannedDetachCancellation(ctx.Err()) {
+				return ctx.Err()
+			}
 			return b.fail(ctx.Err())
 		case <-pending.advanced:
 		case <-b.client.SessionDone():
@@ -299,11 +367,66 @@ func (b *v3CoherenceBridge) run(ctx context.Context, deliver func(*pfslocal.Even
 	}
 }
 
+// beginDetach distinguishes the one intentional frontend disconnect from a
+// crash. A pending visibility event still owns a repair obligation, so detach
+// refuses until it is acknowledged rather than abandoning an in-flight cache
+// transition.
+func (b *v3CoherenceBridge) beginDetach() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.terminal != nil {
+		return errors.Join(errV3VisibilityTerminal, b.terminal)
+	}
+	if b.pending != nil || b.detaching {
+		return syscall.EBUSY
+	}
+	b.detaching = true
+	b.detachHadSubscriber = b.subscribed
+	b.detachStreamEnding = false
+	return nil
+}
+
+func (b *v3CoherenceBridge) acceptPlannedDetachCancellation(cause error) bool {
+	if cause == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.detaching || b.terminal != nil {
+		return false
+	}
+	b.detachStreamEnding = true
+	return true
+}
+
+// abortDetach returns an untouched frontend to service. If the FSKit stream
+// already started ending, there is no safe frontend to resume and the strict
+// authority session is fenced through the ordinary terminal path.
+func (b *v3CoherenceBridge) abortDetach(cause error) {
+	b.mu.Lock()
+	streamLost := b.detachStreamEnding || b.detachHadSubscriber && !b.subscribed
+	b.detaching = false
+	b.detachHadSubscriber = false
+	b.detachStreamEnding = false
+	b.mu.Unlock()
+	select {
+	case <-b.client.SessionDone():
+		streamLost = true
+	default:
+	}
+	if streamLost {
+		_ = b.fail(fmt.Errorf("planned kernel detach aborted after the FSKit frontend disconnected: %w", cause))
+	}
+}
+
 func (b *v3CoherenceBridge) bind() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.terminal != nil {
 		return errors.Join(errV3VisibilityTerminal, b.terminal)
+	}
+	if b.detaching {
+		return syscall.EBUSY
 	}
 	if b.subscribed {
 		return errV3VisibilitySubscriber
@@ -333,7 +456,42 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 	after := cloneAuthorityCursor(b.cursor)
 	b.mu.Unlock()
 
-	event, err := b.client.NextVisibility(ctx, after)
+	// The authority long poll must not inherit the frontend socket's lifetime
+	// during a planned kernel detach. FSKit closes that socket from its unmount
+	// callback before the daemon can observe exact kernel absence and deliver
+	// the proof. Canceling the authority call at that point races away the very
+	// strict session needed to leave the barrier cleanly. The detached poll is
+	// bounded by the authority session itself; successful Detach ends it, while
+	// every non-planned frontend loss closes the client immediately below.
+	type nextResult struct {
+		event *authoritypb.VisibilityEvent
+		err   error
+	}
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	polled := make(chan nextResult, 1)
+	go func() {
+		// The planned-detach branch deliberately leaves this poll alive until
+		// DetachAfterUnmount ends the authority session. Whichever event ends the
+		// poll still releases the child context here; cancellation is idempotent,
+		// so the ordinary-loss branch may also call it to wake NextVisibility.
+		defer cancelPoll()
+		event, err := b.client.NextVisibility(pollCtx, after)
+		polled <- nextResult{event: event, err: err}
+	}()
+	var event *authoritypb.VisibilityEvent
+	var err error
+	select {
+	case result := <-polled:
+		event, err = result.event, result.err
+	case <-ctx.Done():
+		if b.acceptPlannedDetachCancellation(ctx.Err()) {
+			// Do not cancel pollCtx: DetachAfterUnmount uses another authority
+			// lane, then ends the session and releases this one goroutine.
+			return nil, ctx.Err()
+		}
+		cancelPoll()
+		return nil, b.fail(ctx.Err())
+	}
 	if err != nil {
 		return nil, b.fail(err)
 	}
@@ -359,6 +517,14 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 		err := errors.Join(errV3VisibilityTerminal, b.terminal)
 		b.mu.Unlock()
 		return nil, err
+	}
+	if b.detaching {
+		// beginDetach won the race with this long poll. The authority event
+		// remains unacknowledged while exact kernel absence is established; the
+		// successful DetachAfterUnmount then removes this participant entirely.
+		b.detachStreamEnding = true
+		b.mu.Unlock()
+		return nil, context.Canceled
 	}
 	// Only one subscriber may poll, so another pending event here is an
 	// internal state-machine violation rather than a race to resolve.
@@ -426,7 +592,7 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 		return b.protocolViolation("visibility acknowledgement does not match the outstanding cursor")
 	}
 	if request.Blocked {
-		reportErr := b.client.ReportVisibilityBlocked(ctx, cursor)
+		reportErr := b.client.ReportVisibilityBlocked(ctx, cursor, nil)
 		if reportErr == nil {
 			reportErr = errors.New("portablefsd: authority accepted a blocked visibility report without fencing the session")
 		}
@@ -453,7 +619,11 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 			return b.fail(sessionFailure(b.client))
 		}
 	}
-	if err := b.client.AckVisibility(ctx, cursor); err != nil {
+	orderedAdmissionContended := request.OrderedAdmissionContended &&
+		b.contract.CachePolicy == v3CachePolicyMacOS26 &&
+		cursor.GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE &&
+		!bytes.Equal(pending.event.InitiatorSessionID, b.contract.SessionID)
+	if err := b.client.AckVisibilityWithContention(ctx, cursor, orderedAdmissionContended); err != nil {
 		return b.fail(err)
 	}
 	b.mu.Lock()
@@ -487,6 +657,9 @@ func (b *v3CoherenceBridge) protocolViolation(detail string) error {
 }
 
 func (b *v3CoherenceBridge) retirePublicationLocked(localOperationID uint64) {
+	if _, reserved := b.publicationReservations[localOperationID]; reserved {
+		return
+	}
 	for _, operationID := range b.operations {
 		if operationID == localOperationID {
 			return
@@ -511,6 +684,12 @@ func (b *v3CoherenceBridge) watchDeadline(pending *v3PendingVisibility) {
 
 func (b *v3CoherenceBridge) watchSession() {
 	<-b.client.SessionDone()
+	b.mu.Lock()
+	detaching := b.detaching
+	b.mu.Unlock()
+	if detaching {
+		return
+	}
 	_ = b.fail(sessionFailure(b.client))
 }
 
@@ -552,13 +731,12 @@ func translateV3VisibilityEvent(epoch []byte, event *authoritypb.VisibilityEvent
 	if err := validateAuthorityCursor(event.GetCursor()); err != nil {
 		return nil, err
 	}
-	if len(event.GetInitiatorSessionId()) != 16 || event.GetMutationSequence() == 0 {
-		return nil, errors.New("portablefsd: visibility event omitted its initiator ticket")
-	}
 	if event.GetRoutes() != nil {
 		if len(event.GetTargets()) != 0 || len(event.GetRoutes().GetRevision()) != 32 {
 			return nil, errors.New("portablefsd: malformed routing visibility event")
 		}
+	} else if len(event.GetInitiatorSessionId()) != 16 || event.GetMutationSequence() == 0 {
+		return nil, errors.New("portablefsd: visibility event omitted its initiator ticket")
 	} else if len(event.GetTargets()) == 0 && event.GetCursor().GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
 		// A definite failed or no-op visible mutation can legitimately finish
 		// with no coordinates changed. PREPARE must still name what is drained;
@@ -574,6 +752,10 @@ func translateV3VisibilityEvent(epoch []byte, event *authoritypb.VisibilityEvent
 		MutationSequence:   event.GetMutationSequence(),
 	}
 	for _, target := range event.GetTargets() {
+		if event.GetCursor().GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE &&
+			len(target.GetPostIdentity()) != 0 {
+			return nil, errors.New("portablefsd: visibility PREPARE attested an unapplied post-binding")
+		}
 		translated, err := translateV3VisibilityTarget(target)
 		if err != nil {
 			return nil, err
@@ -603,6 +785,7 @@ func translateV3VisibilityTarget(target *authoritypb.VisibilityTarget) (pfslocal
 		ParentIdentity: append([]byte(nil), target.GetParentIdentity()...),
 		Name:           append([]byte(nil), target.GetName()...),
 		Size:           target.GetSize(),
+		PostIdentity:   append([]byte(nil), target.GetPostIdentity()...),
 	}
 	switch target.GetScope() {
 	case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:

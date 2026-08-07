@@ -285,10 +285,20 @@ not expose the raw XFS mount to agent machines or containers.
 Note one launch restriction that surprises operators: **user-xattr writes are
 disabled.** XFS does not charge attribute-fork blocks to a project, so per-inode
 RPC limits cannot isolate a shared cell, and a separate logical counter would
-not be crash-atomic with XFS. The Linux frontend returns `EOPNOTSUPP` without
-sending a mutation, and the authority rejects a direct or older-client set-xattr
-request the same way. Read, list, and removal remain available for pre-existing
-portable user attributes.
+not be crash-atomic with XFS. Because authority protocol v3 requires the exact
+`user-xattr-readonly` feature at Attach, the Linux frontend validates the FUSE
+flags and returns `EOPNOTSUPP` locally without spending an authority RPC, replay
+sequence, or visibility transition. Direct authority requests receive the same
+answer. Read, list, and removal remain available for pre-existing portable user
+attributes.
+
+The macOS resolve contract separately declares xattr set unsupported while
+leaving read/list/removal enabled. FSKit validates set input and refuses it
+locally without a daemon mutation, reporting `EOPNOTSUPP` (Darwin errno 102) to
+callers. It must not expose its internal Darwin `ENOTSUP` (45), because XNU
+interprets 45 as permission to create an AppleDouble `._*` sidecar. A sidecar
+on a PortableFS mount is a contract violation, not an expected compatibility
+file.
 
 The authority prints its loaded routing revision at startup and refuses to serve
 at all if the volume's machine-local routing declaration will not parse: a volume
@@ -300,7 +310,7 @@ A mount presents two independent credentials, and the authority requires both.
 
 **Transport identity.** Sessions are mutual TLS 1.3 with
 `RequireAndVerifyClientCert` against `--client-ca`, and ALPN
-`portablefs-authority-v2`. Plaintext cannot mount.
+`portablefs-authority-v3`. Plaintext cannot mount.
 
 **A mount capability.** A capability is an Ed25519-signed token of the form
 `v1.<base64url payload>.<base64url signature>`, signed over a domain-separated
