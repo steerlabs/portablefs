@@ -294,27 +294,14 @@ allowed.
 State these plainly rather than reading the sections above as a description of a
 working pipeline.
 
-**`.goreleaser.yaml` names a command that no longer exists.** The `vcs` build
-still declares `main: ./cmd/vcs` with `binary: vcs`, and the `portablefs-server`
-archive is built from it. That package was removed at commit `dba5b8f`
-("v3: remove the v2 architecture entirely") — `vcs/cmd/` now contains only
-`portablefs`, `portablefs-authority`, `portablefs-mount-v3`, and `portablefsd`.
-Consequently:
-
-- the `goreleaser` job would fail at build time, before producing any archive;
-- the server archive membership contract in `release.yml` (`printf '%s\n' vcs`,
-  and the awk pass requiring exactly one regular file named `vcs`) asserts a
-  binary that cannot be produced;
-- the two server attestation steps and their two `.attestation.jsonl` assets
-  describe an artifact that does not exist;
-- the two binaries an operator actually needs for a v3 deployment,
-  `portablefs-authority` and `portablefs-mount-v3`, are not built or published by
-  the release at all.
-
-`goreleaser check` passes despite this, because it validates configuration
-syntax and not the existence of a main package. `check-install-release-trust.mjs`
-passes too, because it asserts the *contract strings* are present and does not
-resolve them against the source tree.
+The release configuration now names only binaries that exist in the v3 tree.
+GoReleaser builds the exact two-binary Linux client archive (`portablefs` and
+`portablefsd`) plus a separate one-binary server archive containing
+`portablefs-authority`; the workflow independently verifies both archive
+memberships before attestation. `portablefs-mount-v3` remains a standalone
+integration-harness binary rather than a published operator artifact: ordinary
+Linux users mount through `portablefs`, while operators deploy the authority
+from the server archive.
 
 **The release workflow has not been run since the v3 reset.** The tags in this
 repository are `v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.2.2`, and `v0.2.3`, all
