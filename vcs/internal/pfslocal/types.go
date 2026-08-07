@@ -4,7 +4,60 @@ package pfslocal
 
 const (
 	ProtocolMajor = 1
-	ProtocolMinor = 5
+	// ProtocolMinor 6 adds Envelope.PublicationRetracted.
+	//
+	// It is a MINOR BUMP rather than a silently additive field, which breaks
+	// with the rule the O_APPEND and chflags fields follow (see pfslocal.proto:
+	// "deliberately NOT gated behind a minor bump ... these fields default to
+	// false, which reproduces the previous behavior exactly"). Defaulting to
+	// false does NOT reproduce the previous behaviour here: a frontend that
+	// ignores the flag installs, into the kernel, state the daemon has already
+	// retracted because a delegation handoff crossed it. That is a silent
+	// correctness failure, not a missing feature, so the two sides must not be
+	// able to pair at all. The daemon refuses any frontend whose minor is below
+	// its own (portablefsd/frontend.go), and that refusal IS the gate.
+	//
+	// ProtocolMinor 7 adds HelloReply.RequestDeadlineMs.
+	//
+	// It is a MINOR BUMP for the same reason: the default does not reproduce
+	// the previous behaviour, it reproduces the DEFECT. A frontend that ignores
+	// the field keeps its own compiled-in reply deadline, and the whole point of
+	// the field is that a frontend's compiled-in deadline has no relationship to
+	// the daemon's budgets and was observed live to expire FIRST — costing the
+	// mount its kernel-coherence barrier permanently. Pairing a daemon that
+	// knows its bound with a frontend that ignores it is precisely the pairing
+	// that broke, so the two must not be able to pair at all.
+	//
+	// ProtocolMinor 8 adds the macOS v3 coherence contract, exact two-phase
+	// visibility events, and cursor acknowledgments. Ignoring those fields can
+	// leave stale kernel state serving, so the existing minimum-minor gate is
+	// the compatibility boundary.
+	//
+	// ProtocolMinor 9 adds the strict-v3 end-to-end liveness proof. A frontend
+	// which only knows that its UDS is live cannot distinguish a responsive
+	// daemon from one that has lost its authority session.
+	//
+	// ProtocolMinor 10 makes EnumerateRequest.Handle mandatory. Directory
+	// cookies are scoped to the retained authority handle that issued them, so
+	// the zero-value behavior cannot reproduce a correct multi-page walk.
+	//
+	// ProtocolMinor 11 adds Envelope.SourcePhaseQueueable. Ignoring the bit
+	// recreates the own-source PREPARE cycle it distinguishes, so the existing
+	// minimum-minor handshake is the compatibility boundary.
+	//
+	// ProtocolMinor 12 adds ResourceReplyDisposition. A successful resource
+	// reply can transfer handles to VolumeCore and a (possibly shorter) prefix
+	// of items to FSKit. Socket delivery proves neither ownership boundary, so
+	// the final disposition states both independently.
+	//
+	// ProtocolMinor 13 adds ordered-admission contention feedback on the exact
+	// peer COMPLETE Ack. Ignoring it is safe for coherence but silently loses
+	// the bounded FIFO compensation this daemon and frontend promise together.
+	//
+	// ProtocolMinor 14 carries an authority-attested post-binding identity on
+	// namespace targets. macOS needs the association to refresh a retained vnode
+	// through a new rename/hard-link coordinate without reusing a stale locator.
+	ProtocolMinor = 14
 	MaxFrameBytes = 16 << 20
 )
 
@@ -12,7 +65,33 @@ type Envelope struct {
 	RequestID              uint64
 	PublicationAckRequired bool
 	OperationID            uint64
-	Body                   any
+	// PublicationRetracted says that everything this envelope's LOGICAL
+	// OPERATION has published must not be installed. The frontend discards the
+	// operation's collected values and fails the framework callback rather than
+	// returning them, so nothing reaches the kernel; the syscall retries and
+	// reads state taken after the boundary that caused the retraction.
+	//
+	// ── WHY IT RIDES A REPLY AND IS NOT A MESSAGE OF ITS OWN ────────────────
+	//
+	// The retraction has to be observed BEFORE the framework installs the
+	// operation's results, and the install happens the instant the callback
+	// returns. A standalone message cannot promise that: the frontend dispatches
+	// received frames onto concurrent tasks, so a retraction written before the
+	// reply can still be PROCESSED after it. Riding the reply's own envelope
+	// removes the question — one frame, one delivery, no ordering to lose.
+	//
+	// And there is always such a reply. The only case that retracts is a handoff
+	// crossing an operation with participants left and all of them parked; a
+	// parked participant is a request in flight that will be answered, and the
+	// callback cannot return before its last request is answered. So a
+	// retraction always has a carrier that precedes the install.
+	PublicationRetracted bool
+	// SourcePhaseQueueable is valid only on an ordered mutating request with a
+	// nonzero OperationID. It is the frontend's request-scoped proof that this
+	// callback has issued no ordinary/cache-reading request and is therefore
+	// excluded from a distinct own-source PREPARE drain while it waits.
+	SourcePhaseQueueable bool
+	Body                 any
 }
 
 type Hello struct {
@@ -26,11 +105,29 @@ type HelloReply struct {
 	ProtocolMajor uint32
 	ProtocolMinor uint32
 	DaemonVersion string
+	// RequestDeadlineMs is how long a frontend must be willing to wait for one
+	// reply before concluding this daemon has stopped answering. See
+	// pfslocal.proto and Server.frontendRequestDeadline.
+	RequestDeadlineMs uint32
 }
 
 type PublicationAck struct {
 	PublishedRequestID uint64
 	OperationID        uint64
+}
+
+// ResourceReplyDisposition is the final ownership verdict for one successful
+// resource-bearing reply on this exact connection.
+type ResourceReplyDisposition struct {
+	TargetRequestID uint64
+	// AcceptHandles transfers every handle in this reply to VolumeCore. False
+	// abandons them. A Create reply can accept its handle independently of its
+	// item because those resources cross different ownership boundaries.
+	AcceptHandles bool
+	// AcceptedItemCount transfers this exact prefix of the reply's ordered item
+	// occurrence sequence to FSKit. A count, rather than item IDs, preserves
+	// duplicate hard-link entries and order.
+	AcceptedItemCount uint32
 }
 
 type ResolveRequest struct{ AttachRef string }
@@ -42,11 +139,41 @@ type ResolveReply struct {
 	Branch       string
 	VolumeName   string
 	Capabilities Capabilities
+	V3Coherence  *V3CoherenceContract
+}
+
+type V3CoherenceContract struct {
+	AuthorityProtocolMajor uint32
+	AuthorityEpoch         []byte
+	SessionID              []byte
+	CachePolicy            string
+	RepairBudgetMillis     uint64
+	// InitialCursor is absent for the genesis cut before the authority has
+	// emitted any visibility sequence. When present it is a positive COMPLETE.
+	InitialCursor *VisibilityCursor
+}
+
+type V3LivenessRequest struct {
+	AuthorityEpoch []byte
+	SessionID      []byte
+}
+
+type V3LivenessReply struct {
+	AuthorityEpoch []byte
+	SessionID      []byte
 }
 
 type Capabilities struct {
-	Symlinks        bool
-	HardLinks       bool
+	Symlinks  bool
+	HardLinks bool
+	// Xattrs is true when the frontend may expose the pfslocal xattr operation
+	// family. It is not a promise that every operation succeeds for every
+	// backing: the production v3 XFS attach supports get, list, and removal of
+	// pre-existing portable user attributes while XattrSetSupported is false.
+	// FSKit validates set input, refuses it locally with the internal Darwin
+	// ENOTSUP representation, and translates that boundary verdict to Darwin's
+	// distinct EOPNOTSUPP so XNU cannot invoke AppleDouble fallback. False means
+	// the daemon has no xattr surface at all.
 	Xattrs          bool
 	CaseSensitive   bool
 	MaxNameBytes    uint32
@@ -77,6 +204,12 @@ type Capabilities struct {
 	// mount-time volume capability (FSKit doesNotSupportImmutableFiles) from
 	// it, because per-object refusal arrives as an errno on the request.
 	FlagsUnderstood bool
+	// XattrSetSupported is true exactly when this daemon accepts an
+	// XattrSetRequest for at least one ordinary volume object. Xattrs remains
+	// the operation-family capability: get/list/remove may remain available
+	// while this narrower mutation capability is false. Frontends validate the
+	// item and name before using this field as a local forwarding gate.
+	XattrSetSupported bool
 }
 
 // Item is the frontend-visible filesystem object identity. portablefsd keeps
@@ -88,6 +221,7 @@ type Capabilities struct {
 type Item struct {
 	ItemID         uint64
 	ItemGeneration uint64
+	StableIdentity [16]byte
 }
 
 type ItemKind int32
@@ -133,6 +267,7 @@ type EnumerateRequest struct {
 	Cookie     uint64
 	MaxEntries uint32
 	WantAttrs  bool
+	Handle     uint64
 }
 
 type DirEntry struct {
@@ -338,6 +473,66 @@ type ReclaimReply struct{}
 
 type SubscribeEventsRequest struct{}
 type SubscribeEventsReply struct{}
+
+type VisibilityPhase int32
+
+const (
+	VisibilityPhaseUnspecified VisibilityPhase = 0
+	VisibilityPhasePrepare     VisibilityPhase = 1
+	VisibilityPhaseComplete    VisibilityPhase = 2
+)
+
+type VisibilityScope int32
+
+const (
+	VisibilityScopeUnspecified VisibilityScope = 0
+	VisibilityScopeNamespace   VisibilityScope = 1
+	VisibilityScopeData        VisibilityScope = 2
+	VisibilityScopeAttributes  VisibilityScope = 3
+)
+
+type VisibilityCursor struct {
+	Sequence uint64
+	Phase    VisibilityPhase
+}
+
+type VisibilityTarget struct {
+	Scope          VisibilityScope
+	Identity       []byte
+	ParentIdentity []byte
+	Name           []byte
+	Size           int64
+	PostIdentity   []byte
+}
+
+type RoutesChange struct {
+	Revision []byte
+	Rules    []byte
+}
+
+type V3VisibilityEvent struct {
+	AuthorityEpoch     []byte
+	Cursor             VisibilityCursor
+	InitiatorSessionID []byte
+	MutationSlot       uint32
+	Targets            []VisibilityTarget
+	MutationSequence   uint64
+	Routes             *RoutesChange
+	// LocalOperationID is nonzero only for this mount's own authority
+	// mutation. It names the exact pfslocal publication unit that PREPARE must
+	// exempt and deferred COMPLETE must wait to observe published.
+	LocalOperationID uint64
+}
+
+type VisibilityAckRequest struct {
+	AuthorityEpoch            []byte
+	Cursor                    VisibilityCursor
+	Blocked                   bool
+	Reason                    string
+	OrderedAdmissionContended bool
+}
+
+type VisibilityAckReply struct{}
 
 type Event struct{ Kind any }
 

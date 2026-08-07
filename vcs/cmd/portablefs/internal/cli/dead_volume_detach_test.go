@@ -16,9 +16,11 @@ import (
 // is the point: identification must not need a working filesystem.
 const deadVolumeMountPath = "/Volumes/portablefs-dead"
 
-// stubMountIdentification replaces the two ways this package learns about a
-// mount path: the path statter and the kernel mount table. Both are restored
-// when the test ends.
+// stubMountIdentification replaces the three ways this package learns about a
+// mount path: the path statter, the kernel mount table and the live daemon's
+// attach inventory. The inventory defaults to "no daemon is running" so a test
+// never depends on a real control socket; stubLiveDaemonAttaches overrides it.
+// All are restored when the test ends.
 func stubMountIdentification(
 	t *testing.T,
 	lstat func(string) (fs.FileInfo, error),
@@ -26,17 +28,48 @@ func stubMountIdentification(
 ) {
 	t.Helper()
 	priorLstat, priorTable := lstatMountPath, kernelMountsAt
+	priorAttaches := liveDaemonAttachMountPaths
 	if lstat != nil {
 		lstatMountPath = lstat
 	}
 	if table != nil {
 		kernelMountsAt = table
 	}
+	liveDaemonAttachMountPaths = func() ([]string, error) { return nil, nil }
 	t.Cleanup(func() {
 		lstatMountPath = priorLstat
 		kernelMountsAt = priorTable
+		liveDaemonAttachMountPaths = priorAttaches
 	})
 }
+
+// stubLiveDaemonAttaches makes a live portablefsd report exactly these attach
+// mount paths. Call it after stubMountIdentification.
+func stubLiveDaemonAttaches(t *testing.T, paths ...string) {
+	t.Helper()
+	prior := liveDaemonAttachMountPaths
+	liveDaemonAttachMountPaths = func() ([]string, error) {
+		return append([]string(nil), paths...), nil
+	}
+	t.Cleanup(func() { liveDaemonAttachMountPaths = prior })
+}
+
+// unresponsiveFilesystemStatter models the incident shape: the mount point
+// itself no longer answers — ETIMEDOUT while the kernel is still waiting on an
+// extension that will never reply.
+func unresponsiveFilesystemStatter(
+	deadPath string,
+	errno syscall.Errno,
+) func(string) (fs.FileInfo, error) {
+	return func(path string) (fs.FileInfo, error) {
+		if path == deadPath || strings.HasPrefix(path, deadPath+"/") {
+			return nil, &os.PathError{Op: "lstat", Path: path, Err: errno}
+		}
+		return os.Lstat(path)
+	}
+}
+
+func noKernelMounts(string) ([]kernelMountIdentity, error) { return nil, nil }
 
 // deadFilesystemStatter models a volume the kernel has marked dead: every
 // pathname that resolves through it — including its own mount point — fails
@@ -132,5 +165,124 @@ func TestCanonicalMountPathStillResolvesHealthyPaths(t *testing.T) {
 	}
 	if got == "" {
 		t.Fatal("canonicalMountPath returned an empty path for a healthy directory")
+	}
+}
+
+// TestCanonicalMountPathAcceptsDeadResidueWithALiveDaemonAttach is the §6
+// defect-3 reproduction.
+//
+// The incident left a shape the classification did not cover: the mount point
+// answered EIO, the kernel had NO mount at that path any more, and portablefsd
+// still owned a LIVE attach there holding the write-back tail. Only
+// EIO-with-a-matching-kernel-mount proceeded, so the CLI refused precisely
+// when the daemon-owned detach was the remedy, and the only recovery left was
+// calling the daemon control API by hand.
+func TestCanonicalMountPathAcceptsDeadResidueWithALiveDaemonAttach(t *testing.T) {
+	stubMountIdentification(t,
+		deadFilesystemStatter(deadVolumeMountPath),
+		noKernelMounts,
+	)
+	stubLiveDaemonAttaches(t, deadVolumeMountPath)
+	got, err := canonicalMountPath(deadVolumeMountPath)
+	if err != nil {
+		t.Fatalf("canonicalMountPath of dead residue with a live daemon attach: %v", err)
+	}
+	if got != deadVolumeMountPath {
+		t.Fatalf("canonicalMountPath = %q, want %q", got, deadVolumeMountPath)
+	}
+}
+
+// TestCanonicalMountPathAcceptsATimedOutMountPointWithALiveDaemonAttach:
+// ETIMEDOUT is the same fact as EIO — the pathname cannot be resolved THROUGH
+// the filesystem — and must classify identically.
+func TestCanonicalMountPathAcceptsATimedOutMountPointWithALiveDaemonAttach(t *testing.T) {
+	stubMountIdentification(t,
+		unresponsiveFilesystemStatter(deadVolumeMountPath, syscall.ETIMEDOUT),
+		noKernelMounts,
+	)
+	stubLiveDaemonAttaches(t, deadVolumeMountPath)
+	got, err := canonicalMountPath(deadVolumeMountPath)
+	if err != nil {
+		t.Fatalf("canonicalMountPath of a timed-out mount point with a live attach: %v", err)
+	}
+	if got != deadVolumeMountPath {
+		t.Fatalf("canonicalMountPath = %q, want %q", got, deadVolumeMountPath)
+	}
+}
+
+// TestCanonicalMountPathAcceptsATimedOutMountPointWithAMatchingKernelMount
+// keeps the already-covered arm working for ETIMEDOUT too.
+func TestCanonicalMountPathAcceptsATimedOutMountPointWithAMatchingKernelMount(t *testing.T) {
+	stubMountIdentification(t,
+		unresponsiveFilesystemStatter(deadVolumeMountPath, syscall.ETIMEDOUT),
+		livePortableFSMountTable(deadVolumeMountPath, "att_AAAAAAAAAAAAAAAAAAAAAA"),
+	)
+	got, err := canonicalMountPath(deadVolumeMountPath)
+	if err != nil {
+		t.Fatalf("canonicalMountPath of a timed-out mount point with a kernel mount: %v", err)
+	}
+	if got != deadVolumeMountPath {
+		t.Fatalf("canonicalMountPath = %q, want %q", got, deadVolumeMountPath)
+	}
+}
+
+// TestCanonicalMountPathKeepsAnUnresponsivePathWithNoAttachAndNoKernelMount is
+// the honest other half: with neither a kernel mount nor a live attach there is
+// no evidence this path is a PortableFS mount at all, so the underlying error
+// stands.
+func TestCanonicalMountPathKeepsAnUnresponsivePathWithNoAttachAndNoKernelMount(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EIO, syscall.ETIMEDOUT} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			stubMountIdentification(t,
+				unresponsiveFilesystemStatter(deadVolumeMountPath, errno),
+				noKernelMounts,
+			)
+			stubLiveDaemonAttaches(t, "/Volumes/some-other-mount")
+			_, err := canonicalMountPath(deadVolumeMountPath)
+			if err == nil {
+				t.Fatal("canonicalMountPath accepted an unreadable path with no kernel mount and no attach")
+			}
+			if !errors.Is(err, errno) {
+				t.Fatalf("canonicalMountPath error = %v, want the underlying %v", err, errno)
+			}
+		})
+	}
+}
+
+// TestCanonicalMountPathKeepsANonUnresponsiveErrorEvenWithALiveAttach: a
+// permission or name error is not the dead-residue shape. Only EIO/ETIMEDOUT
+// mean "the filesystem cannot answer"; everything else is a real refusal and
+// must not be laundered by the daemon inventory.
+func TestCanonicalMountPathKeepsANonUnresponsiveErrorEvenWithALiveAttach(t *testing.T) {
+	stubMountIdentification(t,
+		unresponsiveFilesystemStatter(deadVolumeMountPath, syscall.EACCES),
+		noKernelMounts,
+	)
+	stubLiveDaemonAttaches(t, deadVolumeMountPath)
+	_, err := canonicalMountPath(deadVolumeMountPath)
+	if err == nil {
+		t.Fatal("canonicalMountPath accepted a permission error as dead residue")
+	}
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("canonicalMountPath error = %v, want the underlying EACCES", err)
+	}
+}
+
+// TestCanonicalMountPathDoesNotConsultTheDaemonWhenAKernelMountAnswers keeps
+// the cheap identification first: the daemon is only asked once the kernel
+// mount table has come up empty.
+func TestCanonicalMountPathDoesNotConsultTheDaemonWhenAKernelMountAnswers(t *testing.T) {
+	stubMountIdentification(t,
+		deadFilesystemStatter(deadVolumeMountPath),
+		livePortableFSMountTable(deadVolumeMountPath, "att_AAAAAAAAAAAAAAAAAAAAAA"),
+	)
+	prior := liveDaemonAttachMountPaths
+	liveDaemonAttachMountPaths = func() ([]string, error) {
+		t.Error("a matching kernel mount must not need the daemon attach inventory")
+		return nil, nil
+	}
+	t.Cleanup(func() { liveDaemonAttachMountPaths = prior })
+	if _, err := canonicalMountPath(deadVolumeMountPath); err != nil {
+		t.Fatalf("canonicalMountPath: %v", err)
 	}
 }

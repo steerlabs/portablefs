@@ -117,6 +117,163 @@ func TestPublicationAckRequirementRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEnumerateRetainedHandleRoundTrip(t *testing.T) {
+	want := &EnumerateRequest{
+		Dir: Item{ItemID: 17, ItemGeneration: 19}, Cookie: 23,
+		MaxEntries: 29, WantAttrs: true, Handle: 31,
+	}
+	frame, err := EncodeFrame(&Envelope{RequestID: 37, Body: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := decoded.Body.(*EnumerateRequest)
+	if !ok || decoded.RequestID != 37 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("decoded enumerate = %#v body = %#v", decoded, decoded.Body)
+	}
+}
+
+// TestPublicationRetractionRoundTrip pins the field a delegation handoff uses to
+// tell a frontend that everything a crossed logical operation published must be
+// discarded rather than installed.
+func TestPublicationRetractionRoundTrip(t *testing.T) {
+	env := &Envelope{
+		RequestID:            42,
+		OperationID:          7,
+		PublicationRetracted: true,
+		Body:                 &RemoveReply{},
+	}
+	frame, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RequestID != 42 || decoded.OperationID != 7 || !decoded.PublicationRetracted {
+		t.Fatalf("decoded envelope = %#v", decoded)
+	}
+}
+
+func TestSourcePhaseQueueableRoundTrip(t *testing.T) {
+	env := &Envelope{
+		RequestID:            43,
+		OperationID:          8,
+		SourcePhaseQueueable: true,
+		Body:                 &WriteRequest{Handle: 9, Data: []byte("x")},
+	}
+	frame, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RequestID != 43 || decoded.OperationID != 8 ||
+		!decoded.SourcePhaseQueueable {
+		t.Fatalf("decoded envelope = %#v", decoded)
+	}
+	if _, ok := decoded.Body.(*WriteRequest); !ok {
+		t.Fatalf("decoded body = %T, want *WriteRequest", decoded.Body)
+	}
+}
+
+// The queueability proof is an envelope field consumed by Swift and Go before
+// the request body is dispatched. This golden prevents either implementation
+// from silently accepting field 5 as an unknown/default-false field.
+func TestGoldenSourcePhaseQueueableFrame(t *testing.T) {
+	env := &Envelope{
+		RequestID:            43,
+		OperationID:          8,
+		SourcePhaseQueueable: true,
+		Body:                 &WriteRequest{Handle: 9, Data: []byte("x")},
+	}
+	got, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := readGolden(t, "source_phase_queueable.hex"); !bytes.Equal(got, want) {
+		t.Fatalf("source-phase queueability frame\n got %x\nwant %x", got, want)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write, ok := decoded.Body.(*WriteRequest)
+	if !ok || decoded.RequestID != 43 || decoded.OperationID != 8 ||
+		!decoded.SourcePhaseQueueable || write.Handle != 9 ||
+		!bytes.Equal(write.Data, []byte("x")) {
+		t.Fatalf("decoded envelope = %#v body = %#v", decoded, decoded.Body)
+	}
+}
+
+// TestGoldenPublicationRetractedFrame is the CROSS-LANGUAGE pin for the
+// retraction, and it is the only golden that fixes all four envelope scalars
+// ahead of the body oneof.
+//
+// Every other fixture would still round-trip if field 4 were silently dropped
+// on one side, which is exactly the drift these files exist to catch: a
+// frontend that decodes the retraction as absent installs state the daemon has
+// already withdrawn, and does it silently.
+func TestGoldenPublicationRetractedFrame(t *testing.T) {
+	env := &Envelope{
+		RequestID:              7,
+		PublicationAckRequired: true,
+		OperationID:            3,
+		PublicationRetracted:   true,
+		Body: &GetAttrReply{Attr: Attr{
+			Item: Item{ItemID: 23, ItemGeneration: 29}, Kind: ItemKindFile,
+		}},
+	}
+	got, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := readGolden(t, "publication_retracted.hex"); !bytes.Equal(got, want) {
+		t.Fatalf("publication retraction frame\n got %x\nwant %x", got, want)
+	}
+	dec, err := ReadFrame(bytes.NewReader(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, ok := dec.Body.(*GetAttrReply)
+	if !ok ||
+		dec.RequestID != 7 ||
+		!dec.PublicationAckRequired ||
+		dec.OperationID != 3 ||
+		!dec.PublicationRetracted ||
+		rep.Attr.Item != (Item{ItemID: 23, ItemGeneration: 29}) ||
+		rep.Attr.Kind != ItemKindFile {
+		t.Fatalf("decoded envelope = %#v body = %#v", dec, dec.Body)
+	}
+}
+
+// TestUnretractedEnvelopeIsByteIdenticalToTheOlderEncoding is the compatibility
+// half of the same field. The overwhelmingly common envelope is not retracted,
+// and it must not have grown a byte: the goldens are shared with the Swift
+// frontend, and a silent encoding drift is exactly the cross-language skew they
+// exist to catch.
+func TestUnretractedEnvelopeIsByteIdenticalToTheOlderEncoding(t *testing.T) {
+	plain, err := EncodeFrame(&Envelope{RequestID: 3, Body: &RemoveReply{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit, err := EncodeFrame(&Envelope{
+		RequestID: 3, PublicationRetracted: false, Body: &RemoveReply{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plain, explicit) {
+		t.Fatalf("an unretracted envelope encoded differently\n got %x\nwant %x", explicit, plain)
+	}
+}
+
 func TestExactObjectHandlesRoundTrip(t *testing.T) {
 	mode := uint32(0o600)
 	size := uint64(17)
@@ -385,5 +542,46 @@ func TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse(t *testing.T) {
 	}
 	if !got.Capabilities.FlagsSupported || !got.Capabilities.Xattrs {
 		t.Fatalf("the fields the old daemon DID send were lost: %+v", got.Capabilities)
+	}
+}
+
+// TestCapabilitiesXattrSetSupportedRoundTrip pins the distinction between an
+// xattr operation surface and a writable xattr surface. Production v3 uses
+// xattrs=true with xattr_set_supported=false; writable mocks and future
+// backends opt in explicitly.
+func TestCapabilitiesXattrSetSupportedRoundTrip(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		want := Capabilities{
+			Xattrs: true, XattrSetSupported: supported, FlagsUnderstood: true,
+		}
+		decoded, err := parseCapabilitiesField(wireBytes, marshalCapabilities(&want))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Xattrs != want.Xattrs ||
+			decoded.XattrSetSupported != want.XattrSetSupported ||
+			decoded.FlagsUnderstood != want.FlagsUnderstood {
+			t.Fatalf("xattr capabilities round trip: got %+v, want %+v", decoded, want)
+		}
+	}
+}
+
+func TestCapabilitiesXattrSetSupportedAbsentDecodesFalse(t *testing.T) {
+	old := Capabilities{Xattrs: true, FlagsUnderstood: true}
+	encoded := marshalCapabilities(&old)
+	if err := scan(encoded, func(num int, _ int, _ []byte) error {
+		if num == 10 {
+			t.Fatalf("false xattr_set_supported encoded field 10: % x", encoded)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := parseCapabilitiesField(wireBytes, encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Xattrs || decoded.XattrSetSupported {
+		t.Fatalf("legacy xattr capabilities changed meaning: %+v", decoded)
 	}
 }

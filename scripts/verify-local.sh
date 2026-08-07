@@ -1,42 +1,108 @@
 #!/usr/bin/env bash
+# verify-local.sh — the repository's single local merge gate.
+#
+# PortableFS is a two-language tree: the Go data plane under vcs/ and the Swift
+# FSKit/app package under swift/PortableFSKit. There is no build system above
+# them and no package manager to install: this script is the gate, and it is
+# plain bash so that it runs identically on a developer Mac and on a Linux CI
+# runner.
+#
+# Run it from anywhere; it operates on the repository root.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-echo "== frozen install =="
-pnpm install --frozen-lockfile
+step() { printf '\n== %s ==\n' "$1"; }
 
-echo "== full local suite =="
-pnpm test
+# 1. Cross-platform compile. The daemon, the mount clients and the frontend
+# adapters all carry per-GOOS files, so building only the host platform hides
+# breakage on the other one until a release job runs. Both targets are built
+# before anything is executed: a compile error should surface in seconds.
+step "build (GOOS=darwin, GOOS=linux)"
+GOOS=darwin go -C vcs build ./...
+GOOS=linux go -C vcs build ./...
 
-echo "== typecheck + go vet =="
-pnpm typecheck
+step "vet (GOOS=darwin, GOOS=linux)"
+GOOS=darwin go -C vcs vet ./...
+GOOS=linux go -C vcs vet ./...
 
-echo "== VCS race suite =="
-pnpm vcs:test:race
+# 2. and 3. The Go suites run natively — the tests exercise real syscalls,
+# sockets and mounts, so they are only meaningful on the host platform.
+step "go suite (native)"
+go -C vcs test ./...
 
-echo "== manifest index benchmark =="
-pnpm bench:manifest-index
+step "go race suite (native)"
+go -C vcs test -race ./...
 
-echo "== release trust policy =="
-sh -n scripts/install.sh
-node scripts/check-workflow-pins.mjs
-node scripts/check-install-release-trust.mjs
+# 4. The Swift suite. Explicit serialization is REQUIRED and not a performance
+# knob: Swift Testing may run the whole corpus concurrently even when SwiftPM
+# is given one worker. Several tests bind shared process resources and exercise
+# hard protocol deadlines, so concurrent cases can starve one another and turn
+# one timeout into a mock-daemon/socket cascade. Skipped, loudly, when no Swift
+# toolchain is present (a Linux runner); the macOS CI job always runs it.
+step "swift suite (PortableFSKit)"
+if command -v swift >/dev/null 2>&1; then
+  swift test --package-path swift/PortableFSKit --no-parallel
+else
+  echo "SKIP: no swift toolchain on this host; the macOS CI job covers this suite"
+fi
 
-echo "== stale architecture scan =="
-# Guards against resurrecting the removed local-folder-sync architecture. The old
-# bare "daemon/" and "cli/" path patterns are gone: legitimate current components
-# (portablefsd, cmd/portablefs/internal/cli) collide with them in ordinary prose.
-# The old journal.js/lock.js FILENAME patterns are likewise gone: the journal-era
-# metadata-db module (src/journal.ts) is imported as "./journal.js" under ESM,
-# which is unrelated to the dead sync-journal files. The identifier patterns
-# below still catch the old architecture's actual API surface.
-if rg -n "volume-daemon|volume-cli|daemon-sync|bench:local-cache|test:hosted|test:cross-machine|test:multi-sandbox|JournalRecord\\b|acquireLocalLock" \
-  . -g '!node_modules' -g '!pnpm-lock.yaml' -g '!dist' -g '!scripts/verify-local.sh'
+# 5. Release-trust policy. Both checkers are dependency-free single-file node
+# programs (the repository carries no JavaScript packages); they read the
+# installer, the workflows and .goreleaser.yaml as text.
+step "release trust policy"
+if [ -f scripts/install.sh ]; then
+  sh -n scripts/install.sh
+fi
+if [ -f scripts/check-workflow-pins.mjs ]; then
+  node scripts/check-workflow-pins.mjs .github/workflows
+fi
+if [ -f scripts/check-install-release-trust.mjs ]; then
+  node scripts/check-install-release-trust.mjs
+fi
+
+# 6. Stale-architecture scan. v3 is the direct-store system: a Go data plane
+# addressing an XFS-backed authority, with the FSKit frontend on top. The
+# journal-era v2 architecture (a remote append-only journal, a TypeScript
+# control plane, and the client/writeback/history stack layered on them) was
+# deleted wholesale. These identifiers are that architecture's actual API and
+# package surface, so a match means it is growing back rather than that a
+# comment mentions history.
+#
+# The package identifiers are matched as import paths (internal/<pkg>), not as
+# bare words: "writeback" and "fsproto" are also ordinary nouns in the current
+# system's vocabulary — pfsbench has a -writeback flag for the kernel writeback
+# cache, pfslocal.proto's prose refers to the retired fsproto wire, and Go
+# comments legitimately explain "no fallback to the retired clientcore engine"
+# — so package terms are matched as import paths, which is what resurrection
+# actually looks like.
+#
+# Excluded: docs/ and CHANGELOG.md (history is supposed to name the thing it
+# replaced), this script, and scripts/package-manager-matrix.sh, which really
+# does drive pnpm as one of the package managers under test.
+step "stale architecture scan"
+if rg --hidden -n \
+  -e 'JournalRecord\b' \
+  -e '\bremotejournal\b' \
+  -e 'internal/clientcore\b' \
+  -e 'internal/fsproto\b' \
+  -e 'internal/writeback\b' \
+  -e '\bhistworker\b' \
+  -e '\bpfj3\b' \
+  -e 'volume-api' \
+  -e 'authority-manager' \
+  -e '\bpnpm\b' \
+  . \
+  -g '!.git' \
+  -g '!docs' \
+  -g '!CHANGELOG.md' \
+  -g '!scripts/verify-local.sh' \
+  -g '!scripts/package-manager-matrix.sh'
 then
-  echo "stale legacy references found"
+  echo "stale v2 (journal-era) references found" >&2
   exit 1
 fi
 
+echo
 echo "verify-local: ok"

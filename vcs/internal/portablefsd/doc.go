@@ -6,15 +6,17 @@
 // token of its own; authority credentials are stored per attach and renewed via
 // the credential endpoint for future fsproto reconnect handshakes.
 //
-// pfslocal exposes xattr and hard-link operations. Extended attributes are
-// served NATIVELY by the attached authority (xattrs are baseline; the
-// ResolveReply capability is per-attach): existing objects read from the
-// authority, while objects born inside a delegation keep their complete
-// xattr map in the same local WAL lane as file data. macOS therefore avoids
-// both AppleDouble ._ sidecars and a WAN drain/release cycle for each new
-// file. A v8 authority that does not advertise delegated xattrs still serves
-// the same operations through the exact authority lane selected during
-// protocol negotiation.
+// pfslocal exposes xattr and hard-link operations. Capabilities.Xattrs means
+// that the xattr operation family is available, not that every backing accepts
+// every mutation. The production v3 XFS authority serves get, list, and removal
+// of pre-existing portable user attributes but advertises
+// Capabilities.XattrSetSupported=false: XFS attribute-fork blocks are not
+// charged to project quotas, so writable xattrs would violate the volume's
+// aggregate storage boundary. FSKit validates set input and refuses it locally
+// before emitting a daemon or ordered-mutation frame; get, list, and removal
+// still forward normally. The FSKit boundary exposes Darwin EOPNOTSUPP rather
+// than ENOTSUP, so XNU does not create an AppleDouble sidecar. There is no local
+// WAL, delegated xattr map, or alternate metadata truth.
 //
 // The pfslocal Item identity returned to filesystem frontends is stable across
 // daemon restarts for a revived attach. portablefsd uses the authority inode as

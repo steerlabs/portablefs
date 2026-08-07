@@ -2,20 +2,15 @@ package portablefsd
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
-	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -109,7 +104,6 @@ func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"attachRef":  a.ref,
 			"volumeName": a.volumeName,
-			"localDirs":  a.status().LocalDirs,
 		})
 	case http.MethodGet:
 		var out []attachStatus
@@ -153,7 +147,10 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		force := r.URL.Query().Get("force") == "1"
-		found, jobID, err := s.registry.unmountFSKit(ref, force)
+		// The HTTP request's context bounds only THIS waiter: a client that
+		// hangs up (or its own timeout) must never abandon a transaction that
+		// owns durable state.
+		found, jobID, err := s.registry.unmountFSKit(r.Context(), ref, force)
 		if err != nil {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
@@ -176,14 +173,21 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			AuthToken     string `json:"authToken"`
-			OnlyIfPending bool   `json:"onlyIfPending,omitempty"`
+			AuthToken string `json:"authToken"`
+			// AuthTokenExpiresAtMs is the access lease's OWN stated expiry for
+			// this credential (unix ms). It is what bounds the UNPROVEN state:
+			// past it a credential no handshake ever accepted or refused
+			// hardens into the definite expired verdict instead of pending
+			// forever. OPTIONAL and additive — an older CLI omits it, the zero
+			// value states no deadline, and nothing hardens.
+			AuthTokenExpiresAtMs int64 `json:"authTokenExpiresAtMs,omitempty"`
+			OnlyIfPending        bool  `json:"onlyIfPending,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.OnlyIfPending)
+		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.AuthTokenExpiresAtMs, req.OnlyIfPending)
 		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, err.Error())
 			return
@@ -199,379 +203,54 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
-	case "flush":
+	case "bind-root":
+		// THE ROOT DESCRIPTOR IS BOUND WHILE THE MOUNT IS PROVEN HEALTHY, and
+		// never re-derived afterwards.
+		//
+		// Every path-based access to an FSKit mount is served by its
+		// extension. A repair actuation runs while the extension's publication
+		// barrier is closed for that exact repair, so opening the mount root
+		// by path AT THAT MOMENT asks the extension to serve a callback for
+		// the repair it is itself waiting on — a circular wait that spends the
+		// whole repair budget and fences the mount. Binding here breaks the
+		// cycle: `portablefs mount` calls this immediately after it has proven
+		// the kernel mount present and serving, when nothing is in flight, and
+		// the daemon keeps that descriptor for the attach's lifetime.
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		vol, eno := a.volOrErr()
-		if eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("flush", eno))
-			return
-		}
-		if err := vol.FlushToAuthority(r.Context()); err != nil {
-			writeHTTPError(w, http.StatusBadGateway, err.Error())
+		if err := a.bindMountRoot(); err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case "sync":
-		// The unmount-class drain barrier, exposed so `portablefs umount`
-		// drains BEFORE the kernel unmount. Success means authority-durable,
-		// applied, and peer-acknowledged; failure is an HTTP error carrying
-		// the unshipped backlog — the CLI then refuses the normal unmount.
+		// The unmount-class durability barrier, exposed so `portablefs umount`
+		// syncs BEFORE the kernel unmount. A v3 attach holds no client-side
+		// buffer, so this is exactly the authority's own SyncVolume: success
+		// means the authority has made this volume durable, and there is never
+		// an unshipped backlog to report.
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		vol, eno := a.volOrErr()
-		if eno != 0 {
+		d := a.v3Backend()
+		if d == nil {
+			writeHTTPError(w, httpStatusForErr(darwinENXIO), errMessage("sync", darwinENXIO))
+			return
+		}
+		if _, eno := d.syncVolume(r.Context()); eno != 0 {
 			writeHTTPError(w, httpStatusForErr(eno), errMessage("sync", eno))
 			return
 		}
-		if err := vol.SyncVolume(); err != nil {
-			recs, bytes := vol.WriteBackPending()
-			writeHTTPError(w, http.StatusBadGateway, fmt.Sprintf("drain failed with %d records (%d bytes) unshipped: %v", recs, bytes, err))
-			return
-		}
-		recs, bytes := vol.WriteBackPending()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"pendingRecords": recs,
-			"pendingBytes":   bytes,
+			"pendingRecords": 0,
+			"pendingBytes":   0,
 		})
-	case "local-dirs":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Dirs []string `json:"dirs"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		merged, err := a.addLocalDirs(req.Dirs)
-		if err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"localDirs": merged})
-	case "fs/list":
-		s.controlFSList(w, r, a)
-	case "fs/read":
-		s.controlFSRead(w, r, a)
-	case "fs/write":
-		s.controlFSWrite(w, r, a)
-	case "fs/stat":
-		s.controlFSStat(w, r, a)
 	default:
 		writeHTTPError(w, http.StatusNotFound, "unknown attach endpoint")
 	}
-}
-
-func (s *Server) controlFSList(w http.ResponseWriter, r *http.Request, a *attach) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		Path       string `json:"path"`
-		MaxEntries int    `json:"maxEntries"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeHTTPError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	unlockNamespace := a.lockExternalNamespaceRead()
-	defer unlockNamespace()
-	if err := a.controlAdmissionError(); err != nil {
-		writeHTTPError(w, http.StatusConflict, err.Error())
-		return
-	}
-	p := cleanControlPath(req.Path)
-	// freshDirListing is the same namespace the FSKit frontend serves: grafted
-	// directories list machine-local backing, graft parents merge graft roots
-	// over the authority listing, everything else is a plain volume readdir.
-	ents, _, eno := a.freshDirListing(r.Context(), p)
-	if eno != 0 {
-		writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/list", eno))
-		return
-	}
-	if req.MaxEntries > 0 && len(ents) > req.MaxEntries {
-		ents = ents[:req.MaxEntries]
-	}
-	type entry struct {
-		Name string       `json:"name"`
-		Attr pfslocalAttr `json:"attr"`
-	}
-	out := make([]entry, 0, len(ents))
-	for _, e := range ents {
-		out = append(out, entry{Name: e.Name, Attr: attrJSON(e.Attr)})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": out})
-}
-
-func (s *Server) controlFSRead(w http.ResponseWriter, r *http.Request, a *attach) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		Path   string `json:"path"`
-		Offset int64  `json:"offset"`
-		Length int    `json:"length"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeHTTPError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	unlockNamespace := a.lockExternalNamespaceRead()
-	defer unlockNamespace()
-	if err := a.controlAdmissionError(); err != nil {
-		writeHTTPError(w, http.StatusConflict, err.Error())
-		return
-	}
-	p := cleanControlPath(req.Path)
-	var data []byte
-	if graft := a.localDirFor(p); graft != "" {
-		local, eno := a.readLocalFile(p, req.Offset, req.Length)
-		if eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/read", eno))
-			return
-		}
-		data = local
-	} else {
-		vol, eno := a.volOrErr()
-		if eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/read", eno))
-			return
-		}
-		attr, st := vol.Lookup(r.Context(), p)
-		if st != fsproto.OK {
-			writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/read lookup", toDarwinErr(st)))
-			return
-		}
-		n := clientcore.NewNodeState(attr.Ino, attr.Ino != 0)
-		volData, st := vol.Read(r.Context(), p, n, req.Offset, req.Length)
-		if st != fsproto.OK {
-			writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/read", toDarwinErr(st)))
-			return
-		}
-		data = volData
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-PortableFS-Path", p)
-	w.Header().Set("X-PortableFS-Offset", strconv.FormatInt(req.Offset, 10))
-	w.Header().Set("X-PortableFS-Length", strconv.Itoa(len(data)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
-}
-
-func (s *Server) controlFSWrite(w http.ResponseWriter, r *http.Request, a *attach) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		Path       string `json:"path"`
-		DataBase64 string `json:"dataBase64"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeHTTPError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	data, err := base64.StdEncoding.DecodeString(req.DataBase64)
-	if err != nil {
-		writeHTTPError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// Hold the exclusive namespace gate for the complete logical operation.
-	// This also covers grafted local files, whose mutation path deliberately
-	// bypasses the remote Volume lifecycle.
-	unlockNamespace := a.lockExternalNamespaceWrite()
-	namespaceLocked := true
-	defer func() {
-		if namespaceLocked {
-			unlockNamespace()
-		}
-	}()
-	if err := a.controlAdmissionError(); err != nil {
-		writeHTTPError(w, http.StatusConflict, err.Error())
-		return
-	}
-	p := cleanControlPath(req.Path)
-	if graft := a.localDirFor(p); graft != "" {
-		refreshItemID, eno := a.writeLocalFile(p, graft, data)
-		if eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
-			return
-		}
-		unlockNamespace()
-		namespaceLocked = false
-		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
-		err := a.exactKernelRefresh(refreshCtx, refreshItemID)
-		cancelRefresh()
-		if err != nil {
-			a.failCoherence(err)
-			writeHTTPError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	vol, eno := a.volOrErr()
-	if eno != 0 {
-		writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/write", eno))
-		return
-	}
-	attr, st := vol.Lookup(r.Context(), p)
-	existed := st == fsproto.OK
-	if st == fsproto.ENOENT {
-		attr, st = vol.Create(r.Context(), p, 0o644)
-		if st == fsproto.OK {
-			a.mu.Lock()
-			created := a.registerCreatedLocked(p, attr)
-			a.mu.Unlock()
-			if created == nil {
-				writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
-				return
-			}
-		}
-	}
-	if st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write", toDarwinErr(st)))
-		return
-	}
-	candidateItemID := attr.Ino
-	if candidateItemID == 0 {
-		candidateItemID = clientcore.InoOf(p)
-	}
-	if _, ok := fskitItemID(candidateItemID); !ok {
-		writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
-		return
-	}
-	n := clientcore.NewNodeState(attr.Ino, attr.Ino != 0)
-	if rec := a.itemByPath(p); rec != nil {
-		n = rec.state
-	}
-	if st := vol.Open(r.Context(), p, n, true); st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write open", toDarwinErr(st)))
-		return
-	}
-	defer vol.CloseHandle(p, n)
-	if _, st := vol.Write(r.Context(), p, n, 0, data); st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write data", toDarwinErr(st)))
-		return
-	}
-	if _, st := vol.Setattr(r.Context(), p, n, clientcore.SetattrRequest{Size: int64(len(data)), SetSize: true}); st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/write truncate", toDarwinErr(st)))
-		return
-	}
-	if fresh, st := vol.Getattr(r.Context(), p, n); st == fsproto.OK {
-		attr = fresh
-	}
-	a.mu.Lock()
-	rec := a.registerLocked(p, attr)
-	if rec == nil {
-		a.mu.Unlock()
-		writeHTTPError(w, http.StatusInternalServerError, errMessage("fs/write item identity", darwinEIO))
-		return
-	}
-	refreshItemID := rec.item.ItemID
-	if !existed {
-		a.publishNamespaceInvalidationLocked(p, 0, 0)
-	}
-	a.publishContentInvalidationLocked(p, 0, 0)
-	a.mu.Unlock()
-	if eno := a.flushBindingDelta(); eno != 0 {
-		writeHTTPError(
-			w, httpStatusForErr(eno), errMessage("fs/write identity journal", eno),
-		)
-		return
-	}
-	// This write bypassed the kernel entirely. Do not acknowledge it until
-	// every live vnode reflects the composed local view; otherwise FSKit can
-	// serve pre-write pages after a successful control response.
-	unlockNamespace()
-	namespaceLocked = false
-	refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
-	err = a.exactKernelRefresh(refreshCtx, refreshItemID)
-	cancelRefresh()
-	if err != nil {
-		a.failCoherence(err)
-		writeHTTPError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) controlFSStat(w http.ResponseWriter, r *http.Request, a *attach) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		Path string `json:"path"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-		writeHTTPError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	unlockNamespace := a.lockExternalNamespaceRead()
-	defer unlockNamespace()
-	if err := a.controlAdmissionError(); err != nil {
-		writeHTTPError(w, http.StatusConflict, err.Error())
-		return
-	}
-	p := cleanControlPath(req.Path)
-	if graft := a.localDirFor(p); graft != "" {
-		attr, eno := a.statLocal(p)
-		if eno != 0 {
-			writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/stat", eno))
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"path": p, "attr": attrJSON(attr)})
-		return
-	}
-	vol, eno := a.volOrErr()
-	if eno != 0 {
-		writeHTTPError(w, httpStatusForErr(eno), errMessage("fs/stat", eno))
-		return
-	}
-	attr, st := vol.Lookup(r.Context(), p)
-	if st != fsproto.OK {
-		writeHTTPError(w, httpStatusForErr(toDarwinErr(st)), errMessage("fs/stat", toDarwinErr(st)))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"path": p, "attr": attrJSON(attr)})
-}
-
-type pfslocalAttr struct {
-	Kind    string `json:"kind"`
-	Mode    uint32 `json:"mode"`
-	Size    int64  `json:"size"`
-	MtimeMs int64  `json:"mtimeMs"`
-	CtimeMs int64  `json:"ctimeMs"`
-	AtimeMs int64  `json:"atimeMs"`
-	UID     uint32 `json:"uid"`
-	GID     uint32 `json:"gid"`
-	Nlink   uint32 `json:"nlink"`
-	Ino     uint64 `json:"ino"`
-}
-
-func attrJSON(a fsproto.Attr) pfslocalAttr {
-	return pfslocalAttr{
-		Kind: a.Kind, Mode: a.Mode, Size: a.Size, MtimeMs: a.MtimeMs, CtimeMs: a.CtimeMs,
-		AtimeMs: a.AtimeMs, UID: a.Uid, GID: a.Gid, Nlink: a.Nlink, Ino: a.Ino,
-	}
-}
-
-func cleanControlPath(p string) string {
-	p = strings.TrimPrefix(path.Clean("/"+p), "/")
-	if p == "." {
-		return ""
-	}
-	return p
 }
 
 func httpStatusForErr(eno int32) int {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -291,32 +292,46 @@ type fskitAttachOptions struct {
 	VolumeLocalDirs bool     `json:"volumeLocalDirs,omitempty"`
 }
 
-func fskitOptionsFromPerf(perf perfOptions, localDirs []string, volumeLocalDirs bool) fskitAttachOptions {
-	return fskitAttachOptions{
-		NegativeCache:   perf.negativeCache,
-		NoNegativeCache: perf.negativeCacheOff,
-		LocalDirs:       localDirs,
-		VolumeLocalDirs: volumeLocalDirs,
-	}
+type fskitEnsureAttachRequest struct {
+	AttachRef    string `json:"attachRef"`
+	VolumeID     string `json:"volumeId"`
+	Branch       string `json:"branch"`
+	AuthorityURL string `json:"authorityUrl"`
+	AuthToken    string `json:"authToken"`
+	// AuthTokenExpiresAtMs is the access lease's own stated expiry for
+	// AuthToken (unix ms), the deadline that bounds the daemon-side UNPROVEN
+	// credential state. Omitted (0) states no deadline.
+	AuthTokenExpiresAtMs int64              `json:"authTokenExpiresAtMs,omitempty"`
+	DataPlaneTransport   string             `json:"dataPlaneTransport"`
+	DataPlaneServerName  string             `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM             string             `json:"tlsCaPem,omitempty"`
+	TLSCASHA256          string             `json:"tlsCaSha256,omitempty"`
+	MountPath            string             `json:"mountPath"`
+	Options              fskitAttachOptions `json:"options"`
+	// V3 selects the daemon-owned authority-v3 attach (portablefsd's
+	// v3AttachRequest; see vcs/internal/portablefsd/v3attach.go). The daemon —
+	// never the FSKit extension — receives the mutual-TLS identity and dials
+	// the authority with it.
+	V3 *fskitV3AttachRequest `json:"v3,omitempty"`
 }
 
-type fskitEnsureAttachRequest struct {
-	AttachRef           string             `json:"attachRef"`
-	VolumeID            string             `json:"volumeId"`
-	Branch              string             `json:"branch"`
-	AuthorityURL        string             `json:"authorityUrl"`
-	AuthToken           string             `json:"authToken"`
-	DataPlaneTransport  string             `json:"dataPlaneTransport"`
-	DataPlaneServerName string             `json:"dataPlaneServerName,omitempty"`
-	TLSCAPEM            string             `json:"tlsCaPem,omitempty"`
-	TLSCASHA256         string             `json:"tlsCaSha256,omitempty"`
-	MountPath           string             `json:"mountPath"`
-	Options             fskitAttachOptions `json:"options"`
+// fskitV3AttachRequest mirrors portablefsd's v3AttachRequest JSON: the
+// mutual-TLS identity the daemon presents, the two numbers the authority
+// sizes the visibility barrier from, the declared coherence policy, and the
+// 64-hex routing revision this mount runs.
+type fskitV3AttachRequest struct {
+	ClientCertPEM      string `json:"clientCertPem"`
+	ClientKeyPEM       string `json:"clientKeyPem"`
+	CachedNameCapacity uint64 `json:"cachedNameCapacity"`
+	RepairBudgetMillis uint64 `json:"repairBudgetMillis"`
+	CachePolicy        string `json:"cachePolicy"`
+	RoutesRevision     string `json:"routesRevision"`
 }
 
 type fskitEnsureAttachReply struct {
-	AttachRef string   `json:"attachRef"`
-	LocalDirs []string `json:"localDirs,omitempty"`
+	AttachRef         string   `json:"attachRef"`
+	LocalDirs         []string `json:"localDirs,omitempty"`
+	LocalDirsDeclared bool     `json:"localDirsDeclared,omitempty"`
 }
 
 func (c *fsdControl) ensureAttachDetailed(req fskitEnsureAttachRequest) (fskitEnsureAttachReply, error) {
@@ -332,11 +347,6 @@ func (c *fsdControl) ensureAttachDetailed(req fskitEnsureAttachRequest) (fskitEn
 		return fskitEnsureAttachReply{}, fmt.Errorf("portablefsd attach reply carried no attachRef")
 	}
 	return reply, nil
-}
-
-func (c *fsdControl) ensureAttach(req fskitEnsureAttachRequest) (string, error) {
-	reply, err := c.ensureAttachDetailed(req)
-	return reply.AttachRef, err
 }
 
 func (c *fsdControl) stopIfIdle() error {
@@ -372,34 +382,22 @@ func (c *fsdControl) forceDetach(ref string) (jobID string, err error) {
 // cliAttachStatus is the slice of portablefsd's attach status the CLI reads
 // for `portablefs mounts` and `portablefs doctor`.
 type cliAttachStatus struct {
-	AttachRef string              `json:"attachRef"`
-	MountPath string              `json:"mountPath"`
-	VolumeID  string              `json:"volumeId"`
-	Branch    string              `json:"branch"`
-	State     string              `json:"state"`
-	LastError string              `json:"lastError"`
-	WriteBack *cliWriteBackStatus `json:"writeBack"`
+	AttachRef string `json:"attachRef"`
+	MountPath string `json:"mountPath"`
+	VolumeID  string `json:"volumeId"`
+	Branch    string `json:"branch"`
+	State     string `json:"state"`
+	LastError string `json:"lastError"`
+	// SessionTerminal is the daemon's machine-readable verdict that this
+	// attach's v3 authority session ended permanently; the mount supervisor's
+	// revocation watchdog branches on it.
+	SessionTerminal bool `json:"sessionTerminal"`
 }
 
-type cliWriteBackStatus struct {
-	PendingRecords int                 `json:"pendingRecords"`
-	PendingBytes   int64               `json:"pendingBytes"`
-	Delegations    []cliDelegationView `json:"delegations"`
-	ParkedWALs     []cliParkedWAL      `json:"parkedWals"`
-}
-
-type cliDelegationView struct {
-	Scope    string `json:"scope"`
-	Draining bool   `json:"draining"`
-}
-
-type cliParkedWAL struct {
-	Root         string `json:"root"`
-	Records      int    `json:"records"`
-	PayloadBytes int64  `json:"payloadBytes"`
-	AgeMs        int64  `json:"ageMs"`
-	LastError    string `json:"lastError"`
-}
+// errFskitAttachIdentityMismatch marks a daemon attach that carries the
+// recorded ref but different coordinates. No flag ever overrides it: the ref
+// describes somebody else's mount and there is no correct way to detach it.
+var errFskitAttachIdentityMismatch = errors.New("recorded FSKit attach identity mismatch")
 
 // verifyRecordedFskitAttach correlates a persisted mount/intent with the
 // exact live daemon inventory before a lifecycle mutation. Absence is a
@@ -426,7 +424,8 @@ func recordedFskitAttachStatus(ctl *fsdControl, st *mountState) (*cliAttachStatu
 			attach.VolumeID != st.VolumeID ||
 			attach.Branch != st.Branch {
 			return nil, fmt.Errorf(
-				"attach %s identity mismatch: daemon has %s@%s at %s, record has %s@%s at %s",
+				"%w: attach %s: daemon has %s@%s at %s, record has %s@%s at %s",
+				errFskitAttachIdentityMismatch,
 				st.AttachRef,
 				attach.VolumeID,
 				attach.Branch,
@@ -484,6 +483,22 @@ func (c *fsdControl) syncAttach(ref string) (syncVerdict, error) {
 // unmountAttach is the normal FSKit teardown transaction. portablefsd owns
 // the admission gate, final durability barrier, exact kernel identity check,
 // in-process kernel unmount, and durable attach removal in one request.
+// bindMountRoot tells the daemon to open and keep this attach's kernel mount
+// root. It is called exactly once, immediately after the mount is proven
+// present and serving: the macOS repair actuator runs through the daemon, and
+// a daemon that opened the root by path during a coherence barrier would be
+// asking the extension to serve a callback for the repair it is waiting on.
+func (c *fsdControl) bindMountRoot(ref string) error {
+	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/bind-root", nil)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return controlError(status, body)
+	}
+	return nil
+}
+
 func (c *fsdControl) unmountAttach(ref string) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/unmount", nil)
 	if err != nil {
@@ -498,17 +513,20 @@ func (c *fsdControl) unmountAttach(ref string) error {
 	return nil
 }
 
-func (c *fsdControl) setCredential(ref, token string) error {
-	return c.setCredentialWithMode(ref, token, false)
+func (c *fsdControl) setCredential(ref, token string, expiresAtMs int64) error {
+	return c.setCredentialWithMode(ref, token, expiresAtMs, false)
 }
 
-func (c *fsdControl) setCredentialIfPending(ref, token string) error {
-	return c.setCredentialWithMode(ref, token, true)
+func (c *fsdControl) setCredentialIfPending(ref, token string, expiresAtMs int64) error {
+	return c.setCredentialWithMode(ref, token, expiresAtMs, true)
 }
 
-func (c *fsdControl) setCredentialWithMode(ref, token string, onlyIfPending bool) error {
+// setCredentialWithMode pushes the credential AND the deadline its issuer
+// stated for it. The expiry is what bounds the daemon-side UNPROVEN state; a
+// zero states no deadline and preserves the pre-expiry behaviour exactly.
+func (c *fsdControl) setCredentialWithMode(ref, token string, expiresAtMs int64, onlyIfPending bool) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/credential",
-		map[string]any{"authToken": token, "onlyIfPending": onlyIfPending})
+		map[string]any{"authToken": token, "authTokenExpiresAtMs": expiresAtMs, "onlyIfPending": onlyIfPending})
 	if err != nil {
 		return err
 	}
@@ -534,7 +552,7 @@ func (c *fsdControl) unmountRecordedAttach(st *mountState) error {
 		if !validLeaseState(st.AccessLease) {
 			return fmt.Errorf("recorded access lease for attach %s is invalid", st.AttachRef)
 		}
-		if err := c.setCredentialIfPending(st.AttachRef, st.AccessLease.AccessToken); err != nil {
+		if err := c.setCredentialIfPending(st.AttachRef, st.AccessLease.AccessToken, st.AccessLease.ExpiresAtMs); err != nil {
 			return fmt.Errorf("reactivate attach %s with its recorded access lease: %w", st.AttachRef, err)
 		}
 	}
@@ -987,16 +1005,29 @@ func fskitPreflight(frontendSock, attachRef, expectedDaemonVersion string) error
 type fskitMountFailure string
 
 const (
-	fskitFailureUnknown       fskitMountFailure = ""
-	fskitFailureResourceLoad  fskitMountFailure = "resource-load"
-	fskitFailureModuleMissing fskitMountFailure = "module-unavailable"
+	fskitFailureUnknown        fskitMountFailure = ""
+	fskitFailureResourceLoad   fskitMountFailure = "resource-load"
+	fskitFailureModuleMissing  fskitMountFailure = "module-unavailable"
+	fskitFailureFinalMountStep fskitMountFailure = "final-mount-step"
 )
 
 // classifyFSKitMountFailure recognizes only evidence that distinguishes a
 // reached extension from the legacy mount-helper fallback. Generic errno text
 // is intentionally left unknown: the same errno can be produced by unrelated
 // mount point, policy, resource, and extension failures.
+//
+// Ordering is evidence-strength, not likelihood. mount(8) ALWAYS falls
+// through to the legacy helper when its FSKit path fails, so the
+// helper-missing lines appear in every FSKit failure and are only meaningful
+// when nothing more specific preceded them. Classifying by the fallback text
+// first once reported a completed module resolution and activation — the
+// failure was in the final mount step, host-side — as "the extension may
+// need to be enabled", which sends the operator to a Settings toggle that is
+// already on.
 func classifyFSKitMountFailure(fsType, message string) fskitMountFailure {
+	if strings.Contains(message, "Final mount step") {
+		return fskitFailureFinalMountStep
+	}
 	if strings.Contains(message, "Loading resource") {
 		return fskitFailureResourceLoad
 	}
@@ -1013,6 +1044,8 @@ func classifyFSKitMountFailure(fsType, message string) fskitMountFailure {
 func fskitMountHint(fsType string, err error) error {
 	message := err.Error()
 	switch classifyFSKitMountFailure(fsType, message) {
+	case fskitFailureFinalMountStep:
+		return fmt.Errorf("%w\nthe %q FSKit module resolved and its extension activated, but macOS failed the final mount step itself; this is FSKit host state, not PortableFS configuration — a record left by an abnormally ended mount can wedge fskitd until it is restarted (sudo pkill fskitd; it relaunches on demand) or the machine reboots", err, fsType)
 	case fskitFailureResourceLoad:
 		return fmt.Errorf("%w\nthe %q FSKit extension was reached but failed while loading its resource; verify portablefsd is reachable at the extension's exact app-group socket and inspect the underlying mount error", err, fsType)
 	case fskitFailureModuleMissing:
