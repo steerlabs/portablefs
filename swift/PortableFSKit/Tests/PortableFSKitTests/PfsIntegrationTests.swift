@@ -9,10 +9,10 @@ private func bytes(_ string: String) -> Data {
 }
 
 private func strictV3Contract(
-    policy: String = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
+    policy: String = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 2
+    contract.authorityProtocolMajor = 3
     contract.authorityEpoch = Data(repeating: 0xA1, count: 16)
     contract.sessionID = Data(repeating: 0xB2, count: 16)
     contract.cachePolicy = policy
@@ -32,7 +32,7 @@ private func strictV3Contract(
         socketPath: strictDaemon.socketPath,
         attachRef: "mock"
     )
-    #expect(await strict.strictV3Contract?.cachePolicy == .synchronousVFSRepairV1)
+    #expect(await strict.strictV3Contract?.cachePolicy == .synchronousVFSRepairV2)
     #expect(await strict.strictV3ResolveReply?.hasV3Coherence == true)
     await strict.shutdown()
 
@@ -70,6 +70,101 @@ private func strictV3Contract(
     #expect(await legacy.strictV3Contract == nil)
 }
 
+@Test func localRepairIdentifierPartitionOutlivesTheFormer4096EventBand() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let root = try await core.rootItem()
+    var identifiers: Set<UInt64> = []
+
+    // Keep this just beyond the former UInt64.max-4096 partition. A live peer
+    // create storm reached this boundary in minutes and made the repair
+    // scratch create fail ENOSPC even though both local storage and XFS were
+    // healthy. Releasing each object models an ordinary scratch lifecycle;
+    // identifiers still remain unique because FSKit may retain an unlinked
+    // vnode until its later reclaim callback.
+    for index in 0..<5_000 {
+        let item = try await core.mintLocalRepairItem(
+            parent: root,
+            name: Data("repair-\(index)".utf8),
+            mode: 0o600,
+            uid: 501,
+            gid: 20
+        )
+        #expect(item.identity.itemID >= PfsFSKitMapping.localRepairIdentifierFloor)
+        #expect(identifiers.insert(item.identity.itemID).inserted)
+        await core.releaseLocalRepairItem(item)
+    }
+    #expect(identifiers.count == 5_000)
+    #expect(await core.localRepairItemCount() == 0)
+    await core.shutdown()
+}
+
+@Test func failedDuplicateRepairCreateDoesNotConsumeAnIdentifier() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let root = try await core.rootItem()
+    let first = try await core.mintLocalRepairItem(
+        parent: root,
+        name: Data("same".utf8),
+        mode: 0o600,
+        uid: 501,
+        gid: 20
+    )
+    do {
+        _ = try await core.mintLocalRepairItem(
+            parent: root,
+            name: Data("same".utf8),
+            mode: 0o600,
+            uid: 501,
+            gid: 20
+        )
+        Issue.record("expected the duplicate repair binding to fail")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EEXIST)
+    }
+    let second = try await core.mintLocalRepairItem(
+        parent: root,
+        name: Data("different".utf8),
+        mode: 0o600,
+        uid: 501,
+        gid: 20
+    )
+    #expect(second.identity.itemID == first.identity.itemID - 1)
+    await core.releaseLocalRepairItem(first)
+    await core.releaseLocalRepairItem(second)
+    await core.shutdown()
+}
+
+@Test func daemonItemCannotEnterTheLocalRepairPartition() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let before = await core.testingDebugState()
+    do {
+        _ = try await core.testingAdoptDaemonItem(identity: PfsItemIdentity(
+            itemID: PfsFSKitMapping.localRepairIdentifierFloor,
+            generation: 1,
+            stableIdentity: Data(repeating: 0x7a, count: 16)
+        ))
+        Issue.record("expected the reserved daemon item identifier to fail")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EOVERFLOW)
+    }
+    #expect(await core.testingDebugState() == before)
+    await core.shutdown()
+}
+
 @Test func clientRejectsDaemonWithoutAttrParentContract() async throws {
     let daemon = try PfsLocalMockDaemon(
         configuration: .init(protocolMinor: 4)
@@ -90,6 +185,7 @@ private func strictV3Contract(
 
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
     let root = try await core.rootItem()
+    #expect(await core.resolvedVolume?.capabilities.xattrSetSupported == true)
 
     let created = try await core.createFile(in: root, name: bytes("hello.txt"), mode: 0o644)
     let write = try await core.write(item: created.item, offset: 0, data: bytes("hello"))
@@ -112,19 +208,19 @@ private func strictV3Contract(
     let renamed = try await core.lookup(in: root, name: bytes("renamed.txt"))
     #expect(renamed.attr.size == 5)
 
-    let linkName = try await core.hardLink(item: renamed.item, in: root, name: bytes("renamed.link"))
-    #expect(linkName == bytes("renamed.link"))
-    let linked = try await core.lookup(in: root, name: linkName)
+    let link = try await core.hardLink(item: renamed.item, in: root, name: bytes("renamed.link"))
+    #expect(link.canonicalName == bytes("renamed.link"))
+    let linked = try await core.lookup(in: root, name: link.canonicalName)
     #expect(linked.item.identity == renamed.item.identity)
     #expect(linked.attr.nlink == 2)
     try await core.remove(item: renamed.item, named: bytes("renamed.txt"), from: root, isDirectory: false)
-    let survivingLink = try await core.lookup(in: root, name: linkName)
+    let survivingLink = try await core.lookup(in: root, name: link.canonicalName)
     #expect(survivingLink.item.identity == renamed.item.identity)
     #expect(survivingLink.attr.nlink == 1)
     #expect(try await core.read(item: survivingLink.item, offset: 0, length: 5) == bytes("hello"))
 
-    let symlink = try await core.symlink(in: root, name: bytes("sym"), target: linkName)
-    #expect(try await core.readlink(item: symlink.item) == linkName)
+    let symlink = try await core.symlink(in: root, name: bytes("sym"), target: link.canonicalName)
+    #expect(try await core.readlink(item: symlink.item) == link.canonicalName)
 
     var names: [String] = []
     var cookie: UInt64 = 0

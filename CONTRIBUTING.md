@@ -32,7 +32,7 @@ go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
 
-swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+swift test --package-path swift/PortableFSKit --no-parallel
 ```
 
 The daemon, the mount clients, and the frontend adapters carry per-`GOOS` files,
@@ -45,10 +45,10 @@ GOOS=darwin go -C vcs build ./...
 GOOS=linux go -C vcs vet ./...
 ```
 
-`--num-workers 1` on the Swift suite is required, not a tuning choice: several
-tests bind fixed per-process resources — sockets, mount points, the shared
-app-group container — and multiple SwiftPM workers running them concurrently
-deadlock rather than fail.
+`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
+Testing can otherwise run cases concurrently inside one SwiftPM worker.
+Several tests share process resources — sockets, mount points, the app-group
+container — or exercise hard protocol deadlines, so they must run serially.
 
 ## The Local Gate
 
@@ -67,8 +67,8 @@ runner execute the same steps:
    syscalls, sockets, and mounts, so they are only meaningful on the host
    platform.
 4. **Native Go race suite** — `go -C vcs test -race ./...`.
-5. **Swift suite** — `swift test --package-path swift/PortableFSKit --parallel
-   --num-workers 1`. Skipped loudly, with a printed `SKIP`, when the host has no
+5. **Swift suite** — `swift test --package-path swift/PortableFSKit
+   --no-parallel`. Skipped loudly, with a printed `SKIP`, when the host has no
    Swift toolchain.
 6. **Release-trust policy** — a `sh -n` syntax check of `scripts/install.sh`,
    the workflow action-pin checker, and the installer release-trust checker.

@@ -300,7 +300,7 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 		"clientKeyPem":       "KEY",
 		"cachedNameCapacity": float64(1 << 16),
 		"repairBudgetMillis": float64(15_000),
-		"cachePolicy":        "macos26-synchronous-vfs-repair-v1",
+		"cachePolicy":        "macos26-synchronous-vfs-repair-v2",
 	} {
 		if v3[key] != want {
 			t.Fatalf("v3 block key %q = %v, want %v", key, v3[key], want)

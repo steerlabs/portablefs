@@ -96,6 +96,9 @@ func ValidateTarget(target *authoritypb.VisibilityTarget) error {
 		if target.GetParentKernelIno() == 0 {
 			return errors.New("visibilitywire: namespace target carries no parent kernel inode")
 		}
+		if len(target.GetPostIdentity()) != 0 && len(target.GetPostIdentity()) != IdentityLen {
+			return errors.New("visibilitywire: namespace post identity is not an export handle")
+		}
 	case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA:
 		if err := validateInodeTarget(target); err != nil {
 			return err
@@ -122,6 +125,9 @@ func ValidateTarget(target *authoritypb.VisibilityTarget) error {
 func validateInodeTarget(target *authoritypb.VisibilityTarget) error {
 	if len(target.GetIdentity()) != IdentityLen {
 		return errors.New("visibilitywire: inode target identity is not an export handle")
+	}
+	if len(target.GetPostIdentity()) != 0 {
+		return errors.New("visibilitywire: inode target carries a namespace post identity")
 	}
 	if len(target.GetParentIdentity()) != 0 {
 		return errors.New("visibilitywire: inode target carries a parent identity")

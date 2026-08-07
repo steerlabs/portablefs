@@ -567,6 +567,10 @@ func namespaceRepair(repair authoritypb.NamespaceRepair) (volumeserver.Namespace
 		return volumeserver.NamespaceRepairParentExclusive, nil
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT:
 		return volumeserver.NamespaceRepairIndependent, nil
+	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED:
+		return volumeserver.NamespaceRepairCallbackSerialized, nil
+	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED:
+		return volumeserver.NamespaceRepairCallbackSerializedPipelined, nil
 	default:
 		return volumeserver.NamespaceRepairUnspecified, syscall.EINVAL
 	}

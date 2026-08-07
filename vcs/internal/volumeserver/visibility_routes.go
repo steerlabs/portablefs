@@ -34,19 +34,22 @@ import (
 // commit installs the new rules durably and returns the revision that is active
 // afterwards. It runs between the two phases, with every strict frontend's
 // publication admission closed, exactly where a mutation's apply runs. If it
-// fails it must return the revision that is still active: COMPLETE is delivered
-// either way, because it is what reopens the frontends' gates, and it must tell
-// them the truth about which topology they are running.
+// fails it must return the revision that is still active. COMPLETE carries that
+// truthful active declaration to any participant that actually ACKed PREPARE
+// and remained live, allowing a future explicitly reversible frontend to reopen.
+// It does not resurrect a participant that already revoked and left.
 //
-// The two outcomes reach different audiences. Route topology is fixed for the
-// life of a mount, so a strict frontend that sees a *changed* revision in
-// PREPARE reports itself blocked — which fences it immediately — and revokes;
-// a successful change therefore normally completes against an audience those
-// participants have already left, and each returns by re-attaching under the
-// new revision. When commit fails, the revision is unchanged, no frontend
-// treats the event as terminal, and COMPLETE reopens the survivors' gates.
-// Neither outcome may wait out a repair budget for a mount that already said
-// it cannot serve.
+// Current production frontends treat a changed route PREPARE as terminal:
+// Linux reports blocked and macOS fails its strict bridge, so both are fenced
+// before commit and re-attach under the active revision. A successful change
+// therefore normally completes against an audience those participants have
+// already left. On commit failure, COMPLETE carries whichever revision commit
+// reports actually active — old for a definite pre-publication failure, next for
+// a post-rename durability-uncertain failure — only to nonterminal protocol
+// participants; it is not a claim that current
+// production mounts survived PREPARE. A blocked report avoids the phase
+// deadline; `awaitAll` waits only the required post-fence kernel-watchdog grace
+// before commit.
 func (c *VisibilityCoordinator) ExecuteRoutes(ctx context.Context, next RoutesChange, commit func() (RoutesChange, error)) (int, error) {
 	return c.ExecuteRoutesChecked(ctx, next, nil, commit)
 }
@@ -80,17 +83,16 @@ func (c *VisibilityCoordinator) ExecuteRoutesChecked(ctx context.Context, next R
 			return 0, err
 		}
 	}
-	// The write lock already excludes every Execute, so this cannot block on a
-	// mutation. It is taken anyway because the deferred source acknowledgment of
-	// the previous mutation is drained under it, and because a routing change
-	// claiming a sequence out of band from mutation order would make the
-	// per-participant cursor non-monotonic.
-	select {
-	case c.serial <- struct{}{}:
-	case <-ctx.Done():
-		return 0, ctx.Err()
+	// The write lock already excludes every Execute, so this normally grants
+	// immediately. It is taken anyway because the deferred source acknowledgment
+	// of the previous mutation is drained under it, and because a routing change
+	// claiming a sequence out of mutation order would make the per-participant
+	// cursor non-monotonic.
+	turn, err := c.order.acquire(ctx)
+	if err != nil {
+		return 0, err
 	}
-	defer func() { <-c.serial }()
+	defer turn.release()
 	if err := c.waitDeferred(ctx); err != nil {
 		return 0, &VisibilityBarrierError{Err: err}
 	}

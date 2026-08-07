@@ -57,7 +57,7 @@ private final class PfsWeakMacOSV3Transport: @unchecked Sendable {
     }
 }
 
-/// The concrete wire adapter between additive pfslocal minor 9 and the
+/// The concrete wire adapter between additive pfslocal minor 14 and the
 /// platform-independent `PfsMacOSCoherenceRunner`.
 ///
 /// portablefsd owns the authority connection. This type owns only the local
@@ -111,7 +111,7 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         let contract = try parseContract(resolved.v3Coherence)
         let stream = try await client.subscribeStrictV3Events()
         let events = PfsMacOSV3EventQueue()
-        let eventPump = Task {
+        let eventPump = Task(priority: .userInitiated) {
             for await event in stream {
                 await events.push(event)
             }
@@ -257,10 +257,10 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
     public static func parseContract(
         _ wire: PfsV3CoherenceContract
     ) throws -> PfsMacOSV3LocalContract {
-        // This is the authority protocol nested inside pfslocal 1.9, not the
-        // local UDS major. portablefs-authority-v2 is the only contract this
+        // This is the authority protocol nested inside pfslocal 1.14, not the
+        // local UDS major. portablefs-authority-v3 is the only contract this
         // repair model understands.
-        guard wire.authorityProtocolMajor == 2 else {
+        guard wire.authorityProtocolMajor == 3 else {
             throw PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(
                 wire.authorityProtocolMajor
             )
@@ -356,6 +356,18 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         epoch: Data,
         cursor: PfsMacOSVisibilityCursor
     ) async throws {
+        try await acknowledge(
+            epoch: epoch,
+            cursor: cursor,
+            orderedAdmissionContended: false
+        )
+    }
+
+    public func acknowledge(
+        epoch: Data,
+        cursor: PfsMacOSVisibilityCursor,
+        orderedAdmissionContended: Bool
+    ) async throws {
         guard epoch == contract.epoch else {
             throw PfsMacOSCoherenceError.epochChanged
         }
@@ -365,6 +377,7 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         var request = PfsVisibilityAckRequest()
         request.authorityEpoch = epoch
         request.cursor = Self.encodeCursor(cursor)
+        request.orderedAdmissionContended = orderedAdmissionContended
         try await client.acknowledgeVisibility(request)
         if lastDeliveredCursor == cursor {
             // A later independent liveness failure has no right to rewrite an
@@ -451,6 +464,12 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
             throw PfsMacOSCoherenceError.invalidSequence(0)
         }
         let cursor = try decodeCursor(wire.cursor)
+        if wire.hasRoutes {
+            guard wire.targets.isEmpty, wire.routes.revision.count == 32 else {
+                throw PfsMacOSCoherenceError.invalidRoutesChange
+            }
+            throw PfsMacOSCoherenceError.routesChangeRequiresRemount
+        }
         let isLocalInitiator = wire.initiatorSessionID == expectedSessionID
         guard isLocalInitiator ? wire.localOperationID > 0 : wire.localOperationID == 0 else {
             throw PfsMacOSCoherenceError.invalidVisibilityTarget
@@ -462,12 +481,6 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
             localOperationID: isLocalInitiator ? wire.localOperationID : nil
         )
 
-        if wire.hasRoutes {
-            guard wire.targets.isEmpty, wire.routes.revision.count == 32 else {
-                throw PfsMacOSCoherenceError.invalidRoutesChange
-            }
-            throw PfsMacOSCoherenceError.routesChangeRequiresRemount
-        }
         // A mutation that was definitely refused or proved to be a no-op still
         // sends COMPLETE so mounts reopen their PREPARE gate. It truthfully has
         // no repair targets. PREPARE must always name its intended footprint;
@@ -479,14 +492,25 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         var targets: [PfsMacOSVisibilityTarget] = []
         targets.reserveCapacity(wire.targets.count)
         for target in wire.targets {
+            // A post-binding is an authority statement about applied XFS truth.
+            // PREPARE describes only the intended footprint; attempting to use
+            // its not-yet-created coordinate as a repair source would deadlock
+            // the mutation on an expected ENOENT.
+            guard cursor.phase == .complete || target.postIdentity.isEmpty else {
+                throw PfsMacOSCoherenceError.invalidVisibilityTarget
+            }
             targets.append(try decodeTarget(target))
         }
-        let repairs = try await planner.repairs(for: targets)
+        let repairs = try await planner.repairs(
+            for: targets,
+            authorityNamespaceTruthChanged: cursor.phase == .complete
+        )
         return try PfsMacOSCoherenceEvent(
             epoch: wire.authorityEpoch,
             sequence: cursor.sequence,
             phase: cursor.phase,
             initiator: initiator,
+            authorityPayloadIdentity: try wire.serializedData(),
             repairs: repairs
         )
     }
@@ -503,14 +527,25 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
                 throw PfsMacOSCoherenceError.invalidVisibilityTarget
             }
             _ = try PfsMacOSRelativePath(components: [wire.name])
-            return .namespace(
+            if wire.postIdentity.isEmpty {
+                return .namespace(
+                    parentIdentity: try PfsMacOSStableIdentity(wire.parentIdentity),
+                    name: wire.name
+                )
+            }
+            guard wire.postIdentity.count == 16 else {
+                throw PfsMacOSCoherenceError.invalidVisibilityTarget
+            }
+            return .namespacePost(
                 parentIdentity: try PfsMacOSStableIdentity(wire.parentIdentity),
-                name: wire.name
+                name: wire.name,
+                identity: try PfsMacOSStableIdentity(wire.postIdentity)
             )
         case .data:
             guard wire.identity.count == 16,
                   wire.parentIdentity.isEmpty,
                   wire.name.isEmpty,
+                  wire.postIdentity.isEmpty,
                   wire.size >= 0 else {
                 throw PfsMacOSCoherenceError.invalidVisibilityTarget
             }
@@ -522,6 +557,7 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
             guard wire.identity.count == 16,
                   wire.parentIdentity.isEmpty,
                   wire.name.isEmpty,
+                  wire.postIdentity.isEmpty,
                   wire.size == 0 else {
                 throw PfsMacOSCoherenceError.invalidVisibilityTarget
             }

@@ -23,6 +23,7 @@ func MarshalEnvelope(e *Envelope) ([]byte, error) {
 	b = appendBool(b, 2, e.PublicationAckRequired)
 	b = appendU64(b, 3, e.OperationID)
 	b = appendBool(b, 4, e.PublicationRetracted)
+	b = appendBool(b, 5, e.SourcePhaseQueueable)
 	if e.Body == nil {
 		return b, nil
 	}
@@ -83,7 +84,17 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.OperationID = v
-		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
+		case 5:
+			if wt != wireVarint {
+				return nil, ErrMalformed
+			}
+			var v uint64
+			v, b, err = consumeVarint(b)
+			if err != nil {
+				return nil, err
+			}
+			e.SourcePhaseQueueable = v != 0
+		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
 			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 90, 91:
 			if wt != wireBytes {
 				return nil, ErrMalformed
@@ -168,6 +179,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 37, marshalVisibilityAckRequest(m), nil
 	case *V3LivenessRequest:
 		return 38, marshalV3LivenessRequest(m), nil
+	case *ResourceReplyDisposition:
+		return 39, marshalResourceReplyDisposition(m), nil
 	case *HelloReply:
 		return 60, marshalHelloReply(m), nil
 	case *ResolveReply:
@@ -293,6 +306,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalVisibilityAckRequest(b)
 	case 38:
 		return unmarshalV3LivenessRequest(b)
+	case 39:
+		return unmarshalResourceReplyDisposition(b)
 	case 60:
 		return unmarshalHelloReply(b)
 	case 61:
@@ -449,12 +464,41 @@ func unmarshalPublicationAck(b []byte) (*PublicationAck, error) {
 	})
 }
 
+func marshalResourceReplyDisposition(m *ResourceReplyDisposition) []byte {
+	var b []byte
+	b = appendU64(b, 1, m.TargetRequestID)
+	b = appendBool(b, 2, m.AcceptHandles)
+	return appendU32(b, 3, m.AcceptedItemCount)
+}
+
+func unmarshalResourceReplyDisposition(b []byte) (*ResourceReplyDisposition, error) {
+	m := &ResourceReplyDisposition{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		switch num {
+		case 1:
+			v, err := scalarU64(wt, raw)
+			m.TargetRequestID = v
+			return err
+		case 2:
+			v, err := scalarBool(wt, raw)
+			m.AcceptHandles = v
+			return err
+		case 3:
+			v, err := scalarU64(wt, raw)
+			m.AcceptedItemCount = uint32(v)
+			return err
+		}
+		return nil
+	})
+}
+
 func marshalVisibilityAckRequest(m *VisibilityAckRequest) []byte {
 	var b []byte
 	b = appendBytesField(b, 1, m.AuthorityEpoch)
 	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
 	b = appendBool(b, 3, m.Blocked)
 	b = appendString(b, 4, m.Reason)
+	b = appendBool(b, 5, m.OrderedAdmissionContended)
 	return b
 }
 
@@ -473,6 +517,8 @@ func unmarshalVisibilityAckRequest(b []byte) (*VisibilityAckRequest, error) {
 			var v []byte
 			v, err = scalarBytes(wt, raw)
 			m.Reason = string(v)
+		case 5:
+			m.OrderedAdmissionContended, err = scalarBool(wt, raw)
 		}
 		return err
 	})
@@ -636,6 +682,7 @@ func marshalCapabilities(m *Capabilities) []byte {
 	b = appendU32(b, 7, m.PreferredIOSize)
 	b = appendBool(b, 8, m.FlagsSupported)
 	b = appendBool(b, 9, m.FlagsUnderstood)
+	b = appendBool(b, 10, m.XattrSetSupported)
 	return b
 }
 
@@ -681,6 +728,10 @@ func parseCapabilitiesField(wt int, raw []byte) (Capabilities, error) {
 		case 9:
 			v, err := scalarBool(wt, raw)
 			m.FlagsUnderstood = v
+			return err
+		case 10:
+			v, err := scalarBool(wt, raw)
+			m.XattrSetSupported = v
 			return err
 		}
 		return nil
@@ -884,6 +935,7 @@ func marshalEnumerateRequest(m *EnumerateRequest) []byte {
 	b = appendU64(b, 2, m.Cookie)
 	b = appendU32(b, 3, m.MaxEntries)
 	b = appendBool(b, 4, m.WantAttrs)
+	b = appendU64(b, 5, m.Handle)
 	return b
 }
 
@@ -902,6 +954,8 @@ func unmarshalEnumerateRequest(b []byte) (*EnumerateRequest, error) {
 			m.MaxEntries = uint32(v)
 		case 4:
 			m.WantAttrs, err = scalarBool(wt, raw)
+		case 5:
+			m.Handle, err = scalarU64(wt, raw)
 		}
 		return err
 	})
@@ -1848,6 +1902,7 @@ func marshalVisibilityTarget(m *VisibilityTarget) []byte {
 	b = appendBytesField(b, 3, m.ParentIdentity)
 	b = appendBytesField(b, 4, m.Name)
 	b = appendI64(b, 5, m.Size)
+	b = appendBytesField(b, 6, m.PostIdentity)
 	return b
 }
 
@@ -1873,6 +1928,8 @@ func parseVisibilityTargetField(wt int, raw []byte) (VisibilityTarget, error) {
 			var v uint64
 			v, err = scalarU64(wt, raw)
 			m.Size = int64(v)
+		case 6:
+			m.PostIdentity, err = scalarBytes(wt, raw)
 		}
 		return err
 	})

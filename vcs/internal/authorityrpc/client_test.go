@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -41,14 +43,18 @@ func testBounds(maxInFlight int) TransportBounds {
 
 type mutationAssignmentHandler struct {
 	clientTestHandler
-	assigned  <-chan struct{}
-	mutations atomic.Int32
-	ordered   atomic.Bool
+	assigned          <-chan struct{}
+	mutations         atomic.Int32
+	frontendOperation atomic.Uint64
+	sourceQueueable   atomic.Bool
+	ordered           atomic.Bool
 }
 
 func (h *mutationAssignmentHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
 	if req.GetMutation() != nil {
 		h.mutations.Add(1)
+		h.frontendOperation.Store(req.GetFrontendOperationId())
+		h.sourceQueueable.Store(req.GetSourcePhaseQueueable())
 		select {
 		case <-h.assigned:
 			h.ordered.Store(true)
@@ -80,7 +86,9 @@ func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 	var first MutationIdentity
 	callbackCalls := 0
 	_, err = client.CallMutationWithIdentity(context.Background(), &authoritypb.Request{
-		Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Name: []byte("one")}},
+		FrontendOperationId:  77,
+		SourcePhaseQueueable: true,
+		Body:                 &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Name: []byte("one")}},
 	}, func(identity MutationIdentity) error {
 		callbackCalls++
 		first = identity
@@ -90,9 +98,12 @@ func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if callbackCalls != 1 || first.Sequence != 1 || !handler.ordered.Load() || handler.mutations.Load() != 1 {
-		t.Fatalf("assignment calls=%d identity=%+v ordered=%v mutations=%d",
-			callbackCalls, first, handler.ordered.Load(), handler.mutations.Load())
+	if callbackCalls != 1 || first.Sequence != 1 || !handler.ordered.Load() ||
+		handler.mutations.Load() != 1 || handler.frontendOperation.Load() != 77 ||
+		!handler.sourceQueueable.Load() {
+		t.Fatalf("assignment calls=%d identity=%+v ordered=%v mutations=%d frontend_operation_id=%d source_queueable=%v",
+			callbackCalls, first, handler.ordered.Load(), handler.mutations.Load(),
+			handler.frontendOperation.Load(), handler.sourceQueueable.Load())
 	}
 
 	wantErr := errors.New("local publication ledger refused mutation")
@@ -127,7 +138,10 @@ type clientTestHandler struct {
 	started           chan struct{}
 	once              *sync.Once
 	omitHelloFeature  bool
+	legacyHello       bool
 	omitAttachFeature bool
+	omitExactRepair   bool
+	attachCount       *atomic.Int32
 	keepAliveErrno    int32
 	maxInFlight       int
 }
@@ -144,15 +158,24 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 		if h.omitHelloFeature {
 			features = features[1:]
 		}
+		if h.legacyHello {
+			features = []string{"xfs-current-state", "session-exact-epoch", "direct-write"}
+		}
 		bounds := h.Bounds()
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{ProtocolMajor: ProtocolMajor, Features: features, MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: uint32(bounds.MaxInFlight)}}
 	case *authoritypb.Request_Attach:
+		if h.attachCount != nil {
+			h.attachCount.Add(1)
+		}
 		features := append([]string(nil), requiredAttachFeatures...)
 		if h.omitAttachFeature {
 			features = features[1:]
 		}
 		if req.GetAttach().GetCoherenceProfile() == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT {
-			features = append(features, "strict-two-phase-visibility")
+			features = append(features, requiredStrictAttachFeatures...)
+			if h.omitExactRepair {
+				features = features[:len(features)-1]
+			}
 		}
 		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: make([]byte, 16), SessionGeneration: 1, ResumeSecret: make([]byte, 32), Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000}}
 	case *authoritypb.Request_Resume:
@@ -207,13 +230,58 @@ func TestStrictClientReservesAnIndependentVisibilityLane(t *testing.T) {
 	}
 }
 
+func TestStrictClientRequiresExactParentRepairSemantics(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{
+		epoch: make([]byte, 16), maxInFlight: 5, omitExactRepair: true,
+	}, 5, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), ClientConfig{
+		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+		ReplaySlots: 5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+	})
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("strict client attached to an authority with the old terminal blocked-report semantics")
+	}
+}
+
+func TestClientRefusesLegacyHelloBeforeAttachSideEffects(t *testing.T) {
+	var attaches atomic.Int32
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{
+		epoch: make([]byte, 16), maxInFlight: 5, legacyHello: true, attachCount: &attaches,
+	}, 5, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), ClientConfig{
+		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("single-use-capability"),
+		ReplaySlots: 5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+	})
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("new client accepted an authority whose Hello predates exact repair semantics")
+	}
+	if got := attaches.Load(); got != 0 {
+		t.Fatalf("legacy Hello refusal reached Attach %d times and could spend its capability", got)
+	}
+}
+
 // strictContractHandler records exactly what a strict mount put on the wire.
 type strictContractHandler struct {
-	epoch       []byte
-	maxInFlight int
-	mu          sync.Mutex
-	attach      *authoritypb.AttachRequest
-	detach      *authoritypb.DetachRequest
+	epoch                    []byte
+	maxInFlight              int
+	advertiseContentionHints bool
+	mu                       sync.Mutex
+	attach                   *authoritypb.AttachRequest
+	detach                   *authoritypb.DetachRequest
+	blocked                  *authoritypb.AckVisibilityRequest
+	ack                      *authoritypb.AckVisibilityRequest
 }
 
 func (h *strictContractHandler) Epoch() []byte { return append([]byte(nil), h.epoch...) }
@@ -225,8 +293,12 @@ func (h *strictContractHandler) Handle(_ context.Context, req *authoritypb.Reque
 	switch {
 	case req.GetHello() != nil:
 		bounds := h.Bounds()
+		features := append([]string(nil), requiredHelloFeatures...)
+		if h.advertiseContentionHints {
+			features = append(features, peerCompleteFIFOFeedbackFeature)
+		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+			ProtocolMajor: ProtocolMajor, Features: features,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: uint32(bounds.MaxInFlight),
 		}}
 	case req.GetAttach() != nil:
@@ -234,7 +306,7 @@ func (h *strictContractHandler) Handle(_ context.Context, req *authoritypb.Reque
 		h.attach = req.GetAttach()
 		h.mu.Unlock()
 		features := append([]string(nil), requiredAttachFeatures...)
-		features = append(features, "strict-two-phase-visibility")
+		features = append(features, requiredStrictAttachFeatures...)
 		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
 			SessionId: make([]byte, 16), SessionGeneration: 1, ResumeSecret: make([]byte, 32),
 			Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000,
@@ -242,6 +314,14 @@ func (h *strictContractHandler) Handle(_ context.Context, req *authoritypb.Reque
 	case req.GetDetach() != nil:
 		h.mu.Lock()
 		h.detach = req.GetDetach()
+		h.mu.Unlock()
+	case req.GetAckVisibility() != nil && req.GetAckVisibility().GetBlocked():
+		h.mu.Lock()
+		h.blocked = proto.Clone(req.GetAckVisibility()).(*authoritypb.AckVisibilityRequest)
+		h.mu.Unlock()
+	case req.GetAckVisibility() != nil:
+		h.mu.Lock()
+		h.ack = proto.Clone(req.GetAckVisibility()).(*authoritypb.AckVisibilityRequest)
 		h.mu.Unlock()
 	default:
 		response.Errno = 95
@@ -253,6 +333,91 @@ func (h *strictContractHandler) recordedDetach() *authoritypb.DetachRequest {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.detach
+}
+
+func (h *strictContractHandler) recordedBlocked() *authoritypb.AckVisibilityRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.blocked
+}
+
+func (h *strictContractHandler) recordedAck() *authoritypb.AckVisibilityRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.ack
+}
+
+func TestBlockedVisibilityReportCarriesExactParentsAndKeepsSessionLive(t *testing.T) {
+	handler := &strictContractHandler{epoch: make([]byte, 16), maxInFlight: 5}
+	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), ClientConfig{
+		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+		ReplaySlots: 5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	cursor := &authoritypb.VisibilityCursor{Sequence: 7, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE}
+	if err := client.ReportVisibilityBlocked(context.Background(), cursor, []uint64{17, 23}); err != nil {
+		t.Fatal(err)
+	}
+	report := handler.recordedBlocked()
+	if report == nil || !report.GetBlocked() || !proto.Equal(report.GetCursor(), cursor) ||
+		!slices.Equal(report.GetBlockedParentKernelInos(), []uint64{17, 23}) {
+		t.Fatalf("blocked report = %+v, want cursor and exact parent inodes", report)
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatalf("accepted ordinary blocked report ended strict session: %v", client.SessionError())
+	default:
+	}
+}
+
+func TestVisibilityContentionFeedbackRequiresAdvertisedAuthorityFeature(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		advertise bool
+		want      bool
+	}{
+		{name: "advertised", advertise: true, want: true},
+		{name: "older authority", advertise: false, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &strictContractHandler{
+				epoch: make([]byte, 16), maxInFlight: 5,
+				advertiseContentionHints: tc.advertise,
+			}
+			address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+			defer stop()
+			client, err := DialClient(context.Background(), ClientConfig{
+				Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+				ReplaySlots: 5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+				CancelDrainTimeout: time.Second, MaxInFlight: 5,
+				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+				CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
+				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			cursor := &authoritypb.VisibilityCursor{
+				Sequence: 7, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE,
+			}
+			if err := client.AckVisibilityWithContention(context.Background(), cursor, true); err != nil {
+				t.Fatal(err)
+			}
+			if got := handler.recordedAck().GetOrderedAdmissionContended(); got != tc.want {
+				t.Fatalf("contention field = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // A strict mount has to state the two numbers the authority reasons from. It
@@ -929,7 +1094,7 @@ func TestCanonicalHashIsIndependentOfTheEnvelope(t *testing.T) {
 	body := &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: make([]byte, 16), Name: []byte("dir"), Mode: 0o755}}
 	bare := &authoritypb.Request{Body: body}
 	stamped := &authoritypb.Request{
-		RequestId: 91, Epoch: make([]byte, 16),
+		RequestId: 91, Epoch: make([]byte, 16), FrontendOperationId: 77, SourcePhaseQueueable: true,
 		Session:  &authoritypb.SessionProof{Id: make([]byte, 16), Generation: 3, ResumeSecret: make([]byte, 32)},
 		Mutation: &authoritypb.Mutation{Slot: 5, Sequence: 9, RequestHash: make([]byte, 32)},
 		Body:     body,

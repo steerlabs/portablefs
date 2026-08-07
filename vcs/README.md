@@ -8,8 +8,9 @@ It has three dependencies — `go-fuse`, `golang.org/x/sys`, and `protobuf` — 
 no build system above `go`. The directory is named `vcs` for historical reasons;
 nothing in it is a version control system.
 
-There is no journal, no history, no branch, no client write-back cache, and no
-control plane. XFS is the only durable filesystem truth. For why, read
+There is no journal, no history, no branch, no PortableFS-managed or offline
+write-back cache, and no control plane. XFS is the only durable filesystem truth.
+Ordinary OS kernel page caches remain part of each mount contract. For why, read
 [../docs/xfs-authority-architecture.md](../docs/xfs-authority-architecture.md).
 
 ## Commands
@@ -32,7 +33,7 @@ internal/
                    lock tables, the two-phase visibility barrier, durable strict
                    membership, and fail-closed fencing.
   authorityrpc/    The wire: TLS 1.3 mutual authentication, ALPN
-                   portablefs-authority-v2, canonical protobuf framing, the XFS
+                   portablefs-authority-v3, canonical protobuf framing, the XFS
                    request handler, routing topology, and visibility events.
   authoritypb/     Generated protobuf bindings for proto/authority/v1.
   volumecap/       Ed25519 mount capabilities: signed, single-use, short-lived,
@@ -43,7 +44,7 @@ internal/
   portablefsd/     The daemon: attach registry, control API, the v3 attach and
                    its coherence bridge, and the evidence-bearing detach.
   pfslocal/        The local protocol between the daemon and the FSKit
-                   extension. Major 1, currently minor 9, additive.
+                   extension. Major 1, currently minor 14, additive.
   mountv3/         The shared mount engine used by both the CLI and the
                    standalone mount binary.
   localdirs/       The .portablefs/local-dirs declaration: parsing,

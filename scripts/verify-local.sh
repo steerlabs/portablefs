@@ -35,14 +35,15 @@ go -C vcs test ./...
 step "go race suite (native)"
 go -C vcs test -race ./...
 
-# 4. The Swift suite. --num-workers 1 is REQUIRED and not a performance knob:
-# several tests bind fixed per-process resources (sockets, mount points, the
-# shared app-group container), and multiple SwiftPM workers running them
-# concurrently deadlock rather than fail. Skipped, loudly, when no Swift
+# 4. The Swift suite. Explicit serialization is REQUIRED and not a performance
+# knob: Swift Testing may run the whole corpus concurrently even when SwiftPM
+# is given one worker. Several tests bind shared process resources and exercise
+# hard protocol deadlines, so concurrent cases can starve one another and turn
+# one timeout into a mock-daemon/socket cascade. Skipped, loudly, when no Swift
 # toolchain is present (a Linux runner); the macOS CI job always runs it.
 step "swift suite (PortableFSKit)"
 if command -v swift >/dev/null 2>&1; then
-  swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+  swift test --package-path swift/PortableFSKit --no-parallel
 else
   echo "SKIP: no swift toolchain on this host; the macOS CI job covers this suite"
 fi

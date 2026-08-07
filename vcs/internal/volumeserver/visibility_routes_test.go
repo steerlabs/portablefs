@@ -254,16 +254,17 @@ func TestRoutesChangeFencesOnlyTheParticipantThatMissedItsOwnBudget(t *testing.T
 	}
 }
 
-// A failed commit must still release the frontends. PREPARE closed publication
-// admission on every mount; if COMPLETE were skipped, a routing change that
-// never happened would leave the whole volume unable to publish anything.
-func TestRoutesChangeCommitFailureStillReopensPublication(t *testing.T) {
+// This synthetic participant models a future frontend that can stage PREPARE
+// without revoking and explicitly roll back to the active declaration. Current
+// FUSE and FSKit frontends are covered separately: they terminate during route
+// PREPARE and never reach this COMPLETE path.
+func TestRoutesChangeCommitFailureSendsTruthfulCompleteToReversibleParticipant(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	mount := SessionID{1}
 	h.register(t, mount, testRepairBudget)
 
 	active, attempted := testRoutesChange(1), testRoutesChange(2)
-	seen := make(chan RoutesChange, 2)
+	seen := make(chan VisibilityEvent, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	go func() {
@@ -273,7 +274,7 @@ func TestRoutesChangeCommitFailureStillReopensPublication(t *testing.T) {
 			if err != nil {
 				return
 			}
-			seen <- *event.Routes
+			seen <- event
 			if err := h.coordinator.Ack(mount, event.Cursor); err != nil {
 				return
 			}
@@ -282,23 +283,67 @@ func TestRoutesChangeCommitFailureStillReopensPublication(t *testing.T) {
 	}()
 
 	refusal := errors.New("no space left on device")
-	if _, err := h.coordinator.ExecuteRoutes(context.Background(), attempted, func() (RoutesChange, error) {
+	acknowledged, err := h.coordinator.ExecuteRoutes(context.Background(), attempted, func() (RoutesChange, error) {
 		return active, refusal
-	}); !errors.Is(err, refusal) {
+	})
+	if !errors.Is(err, refusal) {
 		t.Fatalf("ExecuteRoutes = %v, want the commit failure", err)
 	}
-	prepare := <-seen
-	if prepare.Revision != attempted.Revision {
-		t.Fatalf("PREPARE announced %x, want the attempted revision %x", prepare.Revision, attempted.Revision)
+	if acknowledged != 0 {
+		t.Fatalf("failed commit returned %d acknowledgements", acknowledged)
 	}
-	complete := <-seen
-	// COMPLETE has to tell the truth about which topology the mount is running,
-	// which after a failed commit is the one it was already running.
-	if complete.Revision != active.Revision {
-		t.Fatalf("COMPLETE announced %x, want the still-active revision %x", complete.Revision, active.Revision)
+	prepare, complete := <-seen, <-seen
+	if prepare.Cursor.Phase != VisibilityPrepare || prepare.Routes == nil ||
+		prepare.Routes.Revision != attempted.Revision {
+		t.Fatalf("PREPARE = %+v, want attempted revision %x", prepare, attempted.Revision)
+	}
+	if complete.Cursor.Phase != VisibilityComplete || complete.Routes == nil ||
+		complete.Routes.Revision != active.Revision {
+		t.Fatalf("COMPLETE = %+v, want still-active revision %x", complete, active.Revision)
 	}
 	if h.fencer.wasFenced(mount) {
-		t.Fatal("a commit failure fenced a mount that answered every phase")
+		t.Fatal("explicitly reversible protocol participant was fenced")
+	}
+}
+
+func TestRoutesCommitFailurePreservesProductionPrepareFencing(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	mount := SessionID{1}
+	h.register(t, mount, 40*time.Millisecond)
+	active, attempted := testRoutesChange(1), testRoutesChange(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	reported := make(chan error, 1)
+	go func() {
+		prepare, err := h.coordinator.Next(ctx, mount, VisibilityCursor{})
+		if err != nil {
+			reported <- err
+			return
+		}
+		reported <- h.coordinator.ReportBlocked(ctx, mount, prepare.Cursor, nil)
+	}()
+
+	refusal := errors.New("definite route commit refusal")
+	acknowledged, err := h.coordinator.ExecuteRoutes(ctx, attempted, func() (RoutesChange, error) {
+		if !h.fencer.wasFenced(mount) {
+			t.Error("commit ran before production-style PREPARE fencing completed")
+		}
+		return active, refusal
+	})
+	if !errors.Is(err, refusal) {
+		t.Fatalf("ExecuteRoutes = %v, want commit refusal", err)
+	}
+	if acknowledged != 0 {
+		t.Fatalf("commit failure returned %d live production participants", acknowledged)
+	}
+	if reportErr := <-reported; !errors.Is(reportErr, ErrVisibilityBlocked) {
+		t.Fatalf("production PREPARE report = %v, want ErrVisibilityBlocked", reportErr)
+	}
+	if reason := h.fenceReasonFor(mount); !errors.Is(reason, ErrVisibilityBlocked) {
+		t.Fatalf("production PREPARE fence = %v", reason)
+	}
+	if _, err := h.coordinator.Next(ctx, mount, VisibilityCursor{}); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("departed production participant received COMPLETE: %v", err)
 	}
 }
 
@@ -317,8 +362,6 @@ func TestRoutesChangeAcceptsABlockedReportFromAParkedMount(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	leave := h.coordinator.EnterMutationOrder(parked, testVisibilityParent())
-	defer leave()
 	reported := make(chan time.Time, 1)
 	go func() {
 		// It can answer PREPARE - that needs no kernel lock - and reports the
@@ -335,7 +378,7 @@ func TestRoutesChangeAcceptsABlockedReportFromAParkedMount(t *testing.T) {
 			return
 		}
 		reported <- time.Now()
-		_ = h.coordinator.ReportBlocked(parked, complete.Cursor)
+		_ = h.coordinator.ReportBlocked(context.Background(), parked, complete.Cursor, nil)
 	}()
 
 	change := testRoutesChange(3)
@@ -368,9 +411,6 @@ func TestRoutesChangeDoesNotFenceABusyMountThatAcknowledges(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go serviceVisibility(ctx, h.coordinator, busy)
-	leave := h.coordinator.EnterMutationOrder(busy, testVisibilityParent())
-	defer leave()
-
 	change := testRoutesChange(4)
 	acknowledged, err := h.coordinator.ExecuteRoutes(context.Background(), change, func() (RoutesChange, error) {
 		return change, nil

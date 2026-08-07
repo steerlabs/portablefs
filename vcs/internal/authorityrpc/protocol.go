@@ -11,15 +11,16 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// ProtocolMajor is intentionally incompatible with every v2 fsproto/pfslocal
-// data path. Version 2 makes the attach-time routing revision mandatory; a v1
-// client cannot express that contract and must fail at Hello rather than spend
-// a capability only to fail later at Attach.
-const ProtocolMajor uint32 = 2
+// ProtocolMajor is intentionally incompatible with every earlier
+// fsproto/pfslocal data path. Version 3 makes every resource-acquiring request
+// (including Lookup) an exact-replay operation and requires explicit frontend
+// disposition of reply resources. An older peer can otherwise leak the first
+// capability when a successful reply is lost, so it must fail at Hello.
+const ProtocolMajor uint32 = 3
 
 // ProtocolALPN is exported so the production authority listener and the RPC
 // server package cannot drift onto different exact protocols.
-const ProtocolALPN = "portablefs-authority-v2"
+const ProtocolALPN = "portablefs-authority-v3"
 
 const protocolALPN = ProtocolALPN
 
@@ -59,9 +60,12 @@ const maxDirentBytes uint32 = 768
 // volume would be unusable rather than merely constrained.
 const MinimumFrameBytes uint32 = fixedMutationReplyBytes + responseEnvelopeReserve
 
+const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
+
 var (
-	requiredHelloFeatures  = []string{"xfs-current-state", "session-exact-epoch", "direct-write"}
-	requiredAttachFeatures = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier"}
+	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", "source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition"}
+	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition"}
+	requiredStrictAttachFeatures = []string{"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", "source-phase-queueability", "namespace-post-binding-identity"}
 )
 
 func hasFeatures(advertised, required []string) bool {
@@ -115,6 +119,35 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 	default:
 		return false
 	}
+}
+
+// requestIsVisibleOrderedMutation is the authority-side trust boundary for the
+// source-phase queueability proof. These are exactly the request bodies routed
+// through VolumeHandler.mutateVisible, and exactly the FSKit operations whose
+// frontend tickets can be classified as ordered-only. A directly authenticated
+// client must not be able to put an ordinary request or a non-visible replayed
+// mutation onto the exception path merely by setting the envelope bit.
+func requestIsVisibleOrderedMutation(req *authoritypb.Request) bool {
+	switch req.GetBody().(type) {
+	case *authoritypb.Request_SetAttr,
+		*authoritypb.Request_Write,
+		*authoritypb.Request_Create,
+		*authoritypb.Request_Mkdir,
+		*authoritypb.Request_Unlink,
+		*authoritypb.Request_Rename,
+		*authoritypb.Request_Symlink,
+		*authoritypb.Request_Link,
+		*authoritypb.Request_SetXattr,
+		*authoritypb.Request_RemoveXattr:
+		return true
+	default:
+		return false
+	}
+}
+
+func validSourcePhaseQueueability(req *authoritypb.Request) bool {
+	return !req.GetSourcePhaseQueueable() ||
+		(req.GetFrontendOperationId() != 0 && requestIsVisibleOrderedMutation(req))
 }
 
 // requestRequiresAdmin classifies an operation as volume-wide configuration

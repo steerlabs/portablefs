@@ -85,13 +85,13 @@ The canonical command, from the repository root:
 
 ```sh
 swift build --package-path swift/PortableFSKit
-swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+swift test --package-path swift/PortableFSKit --no-parallel
 ```
 
-**`--num-workers 1` is required, not a tuning choice.** Several tests bind fixed
-per-process resources — sockets, mount points, the shared app-group container —
-and multiple SwiftPM workers running them concurrently deadlock rather than
-fail. The same command with the same flags appears in `AGENTS.md`,
+**`--no-parallel` is required, not a tuning choice.** Swift Testing can run
+cases concurrently inside one SwiftPM worker. Several tests share process
+resources — sockets, mount points, the app-group container — or exercise hard
+protocol deadlines, so the corpus must run serially. The same command appears in `AGENTS.md`,
 `scripts/verify-local.sh`, the root `README.md`, and the `swift` job in
 `.github/workflows/ci.yml`.
 
@@ -113,16 +113,14 @@ anything. The one test that reaches outside the process,
 `PFS_LIVE_SOCKET` and `PFS_LIVE_ATTACH_REF` are set, and returns immediately
 otherwise — it still never involves the kernel.
 
-The consequence is load-bearing and must not be softened: **the live-kernel
-behaviours are unproven by this suite.** Negative and positive lookup,
-attributes, size and file data across quiesce/repair/resume boundaries, two
-simultaneous mutators from different mounts, initiating mutation plus local
-repair without nested-VFS deadlock, the admission gate hiding the transient
-hidden-rename interval, daemon freeze/disconnect/reconnect and exact unmount,
-authority restart with a live old mount, hostile races against every swallowed
-local operation, and bounded barrier latency under metadata-heavy workloads —
-all of those have to be exercised manually through an installed, enabled
-extension. The open gate list is the Release gates section of
+The consequence is load-bearing: **this suite alone does not prove live-kernel
+behaviour.** Installed-extension testing separately verifies callback dispatch,
+cross-mount namespace visibility, callback-serialized mutation storms, daemon
+death, forced unmount, and held-descriptor revocation. The final full matrix
+still exercises negative/positive lookup, attributes, data/EOF, concurrent
+mutators, direct source removal, hard links, rename-over-open descriptors,
+authority restart, hostile exact-callback races, and bounded metadata-storm
+latency. The current evidence and remaining matrix are in
 [../docs/macos-26-coherence-contract.md](../docs/macos-26-coherence-contract.md);
 see [Manual FSKit verification](#manual-fskit-verification) below for the loop.
 
@@ -274,8 +272,11 @@ mkdir -p /tmp/pfs
 ```
 
 6. Smoke-test the mounted tree with normal filesystem tools (`ls`, `stat`,
-   `cat`, create/write/rename/remove files, xattrs if available from the
-   daemon).
+   `cat`, create/write/rename/remove files). Xattrs are intentionally partial:
+   pre-existing portable attributes can be read/listed/removed. Production
+   resolve declares set unsupported, so FSKit validates and refuses it locally
+   with Darwin `EOPNOTSUPP` (102), emits no daemon mutation, and never permits
+   an AppleDouble `._*` file to appear.
 7. Unmount:
 
 ```sh

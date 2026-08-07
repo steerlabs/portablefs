@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 @preconcurrency import Darwin
 
 /// Cache-coherence behavior is an attach contract, not an inference from an OS
@@ -9,6 +10,12 @@ public enum PfsMacOSCachePolicy: String, Sendable, CaseIterable {
     /// macOS 26: synchronous, authenticated VFS operations drive the kernel's
     /// cache transitions before the authority mutation is acknowledged.
     case synchronousVFSRepairV1 = "macos26-synchronous-vfs-repair-v1"
+
+    /// macOS 26 corrected boundary: a classified authority pre-apply
+    /// interruption is surfaced as ECANCELED, never a kernel-restartable
+    /// result. The callback must release FSKit's namespace lane before the
+    /// nested VFS repair can run.
+    case synchronousVFSRepairV2 = "macos26-synchronous-vfs-repair-v2"
 
     /// macOS 27+: synchronous kernel cache revocation through Apple's native
     /// FSKit API. The Xcode 26 SDK intentionally has no implementation.
@@ -40,6 +47,7 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
     case invalidRoutesChange
     case routesChangeRequiresRemount
     case sequenceGap(expected: UInt64, received: UInt64)
+    case eventIdentityMismatch(UInt64)
     case epochChanged
     case invalidRepairOperand
     case unsupportedRepair
@@ -56,14 +64,11 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
     case repairAlreadyConsumed
     /// The callback is part of the plan but not the next one it declared.
     case repairCallbackOutOfOrder
-    /// A namespace transaction moved the user's name to the hidden operand and
-    /// then failed. `rolledBack` says whether the local namespace was restored.
-    case repairTransactionTorn(hiddenName: String, rolledBack: Bool)
-    /// A torn transaction permanently seals the registry: this mount can no
-    /// longer prove its own namespace state, so it runs no further surgery.
-    case repairRegistrySealed
     /// An identity mapping does not reach the mount root.
     case namespaceCycle
+    /// The mount demonstrably cached a target but retained no safe pathname or
+    /// native object operation capable of repairing it.
+    case cachedTargetUnrepresentable
 
     public var description: String {
         switch self {
@@ -107,6 +112,8 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
             return "visibility route change requires this mount to fail closed and remount"
         case let .sequenceGap(expected, received):
             return "repair sequence gap: expected \(expected), received \(received)"
+        case let .eventIdentityMismatch(sequence):
+            return "visibility event \(sequence) changed its mutation identity"
         case .epochChanged:
             return "coherence event belongs to a different authority epoch"
         case .invalidRepairOperand:
@@ -129,14 +136,10 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
             return "repair callback was already consumed once"
         case .repairCallbackOutOfOrder:
             return "repair callback arrived out of the order the plan declared"
-        case let .repairTransactionTorn(hiddenName, rolledBack):
-            return rolledBack
-                ? "repair transaction failed and was rolled back from \(hiddenName)"
-                : "repair transaction is torn: a name is stranded at \(hiddenName)"
-        case .repairRegistrySealed:
-            return "repair registry is sealed after a torn transaction"
         case .namespaceCycle:
             return "identity mapping does not reach the mount root"
+        case .cachedTargetUnrepresentable:
+            return "a cached visibility target has no representable local repair"
         }
     }
 }
@@ -155,6 +158,19 @@ public struct PfsMacOSStableIdentity: Sendable, Equatable, Hashable {
     }
 
     public static let zero = try! PfsMacOSStableIdentity(Data(repeating: 0, count: 16))
+}
+
+/// One exact child-name cache coordinate. Parent identity is part of the key:
+/// basenames alone are never a coherence scope because the same name in two
+/// directories is unrelated state.
+public struct PfsMacOSNamespaceCoordinate: Sendable, Equatable, Hashable {
+    public let parentIdentity: PfsMacOSStableIdentity
+    public let name: Data
+
+    public init(parentIdentity: PfsMacOSStableIdentity, name: Data) {
+        self.parentIdentity = parentIdentity
+        self.name = name
+    }
 }
 
 /// A path relative to the already-attested mount root. Components are bytes so
@@ -193,17 +209,24 @@ public struct PfsMacOSLiveObjectReference: @unchecked Sendable, Equatable {
     public let item: PortableFSItem
     /// `st_ino` as projected by this exact mount.
     public let vfsFileID: UInt64
+    /// Immutable kind learned when this vnode was published in a namespace.
+    public let itemKind: PfsMacOSCachedItemKind?
 
-    public init(item: PortableFSItem, vfsFileID: UInt64) {
+    public init(
+        item: PortableFSItem,
+        vfsFileID: UInt64,
+        itemKind: PfsMacOSCachedItemKind? = nil
+    ) {
         self.item = item
         self.vfsFileID = vfsFileID
+        self.itemKind = itemKind
     }
 
     public static func == (
         lhs: PfsMacOSLiveObjectReference,
         rhs: PfsMacOSLiveObjectReference
     ) -> Bool {
-        lhs.item === rhs.item && lhs.vfsFileID == rhs.vfsFileID
+        lhs.item === rhs.item && lhs.vfsFileID == rhs.vfsFileID && lhs.itemKind == rhs.itemKind
     }
 }
 
@@ -214,8 +237,9 @@ public enum PfsMacOSCacheRepair: Sendable, Equatable {
     /// `PortableFSVolume` consumes the matching `createItem` and `removeItem`
     /// callbacks against `PfsMacOS26RepairArmRegistry` and returns without
     /// issuing any pfslocal request, so neither call reaches the authority.
-    /// With no registry installed — the production configuration today — the
-    /// same two callbacks are refused with EPERM instead.
+    /// With no registry installed, the same two callbacks are refused with
+    /// EPERM instead. Production installs the registry and actuator together
+    /// or fails the mount closed.
     /// `name` is retained even though the macOS 26 synthetic actuator cannot
     /// address a negative dentry directly. The native macOS 27 adapter must
     /// not lose this coordinate before its live-kernel proof establishes what
@@ -232,7 +256,19 @@ public enum PfsMacOSCacheRepair: Sendable, Equatable {
     case evictBinding(
         path: PfsMacOSRelativePath,
         parentIdentity: PfsMacOSStableIdentity,
-        itemIdentity: PfsMacOSStableIdentity
+        itemIdentity: PfsMacOSStableIdentity,
+        itemKind: PfsMacOSCachedItemKind
+    )
+
+    /// Forces an exact retained vnode through FSKit setAttributes without
+    /// mutating authority truth; the adapter replies with a full authoritative
+    /// getattr snapshot so macOS replaces its attribute cache.
+    case refreshAttributes(
+        path: PfsMacOSRelativePath,
+        parentIdentity: PfsMacOSStableIdentity,
+        itemIdentity: PfsMacOSStableIdentity,
+        expectedVFSFileID: UInt64,
+        itemKind: PfsMacOSCachedItemKind
     )
 
     /// Purges cached data and size for the same authoritative item. The
@@ -314,6 +350,10 @@ public struct PfsMacOSCoherenceEvent: Sendable, Equatable {
     public let sequence: UInt64
     public let phase: PfsMacOSVisibilityPhase
     public let initiator: PfsMacOSMutationInitiator
+    /// Canonical immutable authority event bytes, captured before mutable local
+    /// indexes derive repair operands. Duplicate-cursor validation uses this
+    /// identity rather than comparing repairs that the first repair may change.
+    public let authorityPayloadIdentity: Data
     public let repairs: [PfsMacOSCacheRepair]
 
     public init(
@@ -321,6 +361,7 @@ public struct PfsMacOSCoherenceEvent: Sendable, Equatable {
         sequence: UInt64,
         phase: PfsMacOSVisibilityPhase,
         initiator: PfsMacOSMutationInitiator,
+        authorityPayloadIdentity: Data = Data(),
         repairs: [PfsMacOSCacheRepair]
     ) throws {
         guard epoch.count == 16 else {
@@ -333,6 +374,7 @@ public struct PfsMacOSCoherenceEvent: Sendable, Equatable {
         self.sequence = sequence
         self.phase = phase
         self.initiator = initiator
+        self.authorityPayloadIdentity = authorityPayloadIdentity
         self.repairs = repairs
     }
 }
@@ -350,15 +392,41 @@ public struct PfsMacOSVisibilityCursor: Sendable, Equatable {
 public protocol PfsMacOSCoherenceBackend: Sendable {
     var policy: PfsMacOSCachePolicy { get }
     func repair(_ event: PfsMacOSCoherenceEvent) async throws
+    /// Liveness-only feedback sampled after local COMPLETE repair and before
+    /// its exact authority acknowledgement. Safety never depends on this bit.
+    func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool
+    /// Called only after the authority has accepted this event's exact cursor.
+    /// A backend may use this edge to release work that was safe to park after
+    /// local repair but not before the distributed barrier actually advanced.
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async
 }
 
 /// Transport deliberately separates event delivery, cumulative acknowledgement,
 /// and terminal failure. A dropped connection, frozen actuator, cancellation, or
 /// failed syscall has no path to an acknowledgement.
+public extension PfsMacOSCoherenceBackend {
+    func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool { false }
+}
+
 public protocol PfsMacOSCoherenceTransport: Sendable {
     func nextEvent() async throws -> PfsMacOSCoherenceEvent?
     func acknowledge(epoch: Data, cursor: PfsMacOSVisibilityCursor) async throws
+    func acknowledge(
+        epoch: Data,
+        cursor: PfsMacOSVisibilityCursor,
+        orderedAdmissionContended: Bool
+    ) async throws
     func failClosed(epoch: Data, cursor: PfsMacOSVisibilityCursor?, reason: String) async
+}
+
+public extension PfsMacOSCoherenceTransport {
+    func acknowledge(
+        epoch: Data,
+        cursor: PfsMacOSVisibilityCursor,
+        orderedAdmissionContended: Bool
+    ) async throws {
+        try await acknowledge(epoch: epoch, cursor: cursor)
+    }
 }
 
 /// Resolves one operation/watchdog race without making the caller wait for a
@@ -413,6 +481,16 @@ public actor PfsMacOSCoherenceRunner {
     /// acknowledgment, so a lost, refused, or cancelled ack can only ever cost
     /// a repeated ack — never a second run of namespace surgery.
     private var lastCompletedCursor: PfsMacOSVisibilityCursor?
+    /// Immutable authority mutation identity retained beside the local cursor.
+    /// Repair operands are derived through mutable local indexes and may decode
+    /// differently when the same wire event is replayed after local surgery;
+    /// they are deliberately not part of duplicate identity.
+    private var lastCompletedInitiator: PfsMacOSMutationInitiator?
+    private var lastCompletedPayloadIdentity: Data?
+    /// COMPLETE must name the same mutation that PREPARE admitted. In
+    /// particular, changing source/peer identity between phases could either
+    /// skip peer repair or skip source publication waiting.
+    private var preparedInitiator: PfsMacOSMutationInitiator?
     /// The last cursor the transport confirmed it delivered to the authority.
     /// It exists for reporting and for `failClosed`; ordering never uses it.
     private var lastAcknowledgedCursor: PfsMacOSVisibilityCursor?
@@ -530,8 +608,20 @@ public actor PfsMacOSCoherenceRunner {
             // authority ever saw the ack, rerunning namespace surgery here
             // would be a second, differently-nonced set of real VFS mutations
             // against the user's namespace. Re-ack only.
-            try await transport.acknowledge(epoch: epoch, cursor: cursor)
+            guard let expectedInitiator = lastCompletedInitiator,
+                  let expectedPayloadIdentity = lastCompletedPayloadIdentity,
+                  event.initiator == expectedInitiator,
+                  event.authorityPayloadIdentity == expectedPayloadIdentity else {
+                throw PfsMacOSCoherenceError.eventIdentityMismatch(event.sequence)
+            }
+            let contended = await backend.orderedAdmissionContended(for: event)
+            try await transport.acknowledge(
+                epoch: epoch,
+                cursor: cursor,
+                orderedAdmissionContended: contended
+            )
             lastAcknowledgedCursor = cursor
+            await backend.acknowledged(event)
             return
         }
 
@@ -563,15 +653,32 @@ public actor PfsMacOSCoherenceRunner {
                 received: event.sequence
             )
         }
+        if event.phase == .complete, event.initiator != preparedInitiator {
+            throw PfsMacOSCoherenceError.eventIdentityMismatch(event.sequence)
+        }
 
         try Task.checkCancellation()
         try await backend.repair(event)
         // Ordering is the whole fix: the local ledger advances the instant the
         // surgery is done and before anything can fail on the wire.
         lastCompletedCursor = cursor
+        lastCompletedInitiator = event.initiator
+        lastCompletedPayloadIdentity = event.authorityPayloadIdentity
+        switch event.phase {
+        case .prepare:
+            preparedInitiator = event.initiator
+        case .complete:
+            preparedInitiator = nil
+        }
         try Task.checkCancellation()
-        try await transport.acknowledge(epoch: epoch, cursor: cursor)
+        let contended = await backend.orderedAdmissionContended(for: event)
+        try await transport.acknowledge(
+            epoch: epoch,
+            cursor: cursor,
+            orderedAdmissionContended: contended
+        )
         lastAcknowledgedCursor = cursor
+        await backend.acknowledged(event)
     }
 
     public func acknowledgedCursor() -> PfsMacOSVisibilityCursor? { lastAcknowledgedCursor }
@@ -593,6 +700,17 @@ public protocol PfsMacOSCallbackPublicationBarrier: Sendable {
     /// reopen. The authority deliberately defers that source COMPLETE so it
     /// never asks FSKit to perform nested VFS surgery behind the callback.
     func resume(_ event: PfsMacOSCoherenceEvent) async throws
+    /// Returns true only when this exact peer COMPLETE repair refused at least
+    /// one otherwise queueable ordered callback before acknowledgement.
+    func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool
+    /// Opens admission only after the authority accepted COMPLETE. Between
+    /// local repair completion and this edge, overlapping callbacks may park:
+    /// no further mounted-VFS work is needed, but mutation order is still held.
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async
+}
+
+public extension PfsMacOSCallbackPublicationBarrier {
+    func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool { false }
 }
 
 /// A future macOS 27 implementation supplies this interface with the SDK's
@@ -639,39 +757,74 @@ public struct PfsNativeFSKitCoherenceBackend: PfsMacOSCoherenceBackend {
             try await publicationBarrier.resume(event)
         }
     }
+
+    public func orderedAdmissionContended(
+        for event: PfsMacOSCoherenceEvent
+    ) async -> Bool {
+        await publicationBarrier.orderedAdmissionContended(for: event)
+    }
+
+    public func acknowledged(_ event: PfsMacOSCoherenceEvent) async {
+        await publicationBarrier.acknowledged(event)
+    }
 }
 
 public enum PfsMacOS26RepairKind: UInt8, Sendable, Equatable, CaseIterable {
     case negativeScratch = 1
     case positiveEviction = 2
     case dataInvalidation = 3
+    case attributeRefresh = 4
 }
 
-/// The exact NAME-CARRYING FSKit callbacks one repair plan consumes, in the
+/// Immutable item type recorded at the exact callback that published a
+/// binding. The macOS 26 actuator needs this local fact before its only
+/// `unlinkat(2)`: Darwin requires `AT_REMOVEDIR` for directories and rejects
+/// that flag for files and symlinks. Unknown wire kinds are never guessed.
+public enum PfsMacOSCachedItemKind: UInt8, Sendable, Equatable, Hashable, CaseIterable {
+    case file = 1
+    case directory = 2
+    case symlink = 3
+
+    public init(_ kind: PfsItemKind) throws {
+        switch kind {
+        case .file:
+            self = .file
+        case .directory:
+            self = .directory
+        case .symlink:
+            self = .symlink
+        case .unspecified, .UNRECOGNIZED:
+            throw PfsMacOSCoherenceError.invalidRepairOperand
+        }
+    }
+
+    var daemonWireValue: String {
+        switch self {
+        case .file: "file"
+        case .directory: "directory"
+        case .symlink: "symlink"
+        }
+    }
+}
+
+/// The exact reserved-name FSKit callbacks a scratch repair consumes, in the
 /// order the actuator's syscalls produce them. Arming a plan authorizes this
 /// list and nothing else, which is what lets the adapter answer "swallow or
 /// refuse?" per callback rather than per transaction.
 ///
-/// Only callbacks that carry the reserved operand name belong here: the name
-/// is the channel the HMAC rides. The data-invalidation open and truncate
-/// carry an `FSItem` and no name, so they are structurally impossible to
-/// consume through this list; they are authorized instead through the armed
-/// transaction's isolation window (`PfsMacOS26RepairGate.consumeArmedTruncate`
-/// and `isolatedRepairItem`), which exists only between the isolating rename
-/// and the removal of the hidden name. A callback case that the adapter could
-/// never present would make a declared plan unexecutable, so no such case
-/// exists.
+/// Positive and data repair never move a user name into the reserved namespace:
+/// they consume an exact authenticated source removal through
+/// `consumeArmedSourceRemoval`. A callback case that production cannot emit is
+/// deliberately absent from this privileged surface.
 public enum PfsMacOS26RepairCallback: UInt8, Sendable, Equatable, Hashable, CaseIterable {
     /// `createItem(named: operand)` for the negative-cache scratch entry.
     case createScratch = 1
-    /// `renameItem(source -> operand)`.
-    case renameIntoOperand = 2
     /// `removeItem(named: operand)`.
     case removeOperand = 5
-    /// `renameItem(operand -> source)`. Never required; authorized only while
-    /// the transaction has moved the user's name and has not yet removed it,
-    /// so a failed step can restore the local namespace it disturbed.
-    case rollbackRename = 6
+    /// Removes the exact authenticated user-visible source binding from the
+    /// macOS kernel only. Authority truth is untouched; a later lookup
+    /// republishes that binding from XFS.
+    case removeSource = 7
 }
 
 /// One authority-sequenced, mount-session-authenticated local repair operation.
@@ -690,30 +843,37 @@ public struct PfsMacOS26RepairPlan: Sendable, Equatable {
     public let authoritativeSize: UInt64?
     public let operand: Data?
 
+    /// Item type authenticated inside the operand. Keeping the behavior-changing
+    /// bit in the signed body means the gate's existing plan validation also
+    /// validates the daemon's unlink-versus-rmdir choice.
+    public var itemKind: PfsMacOSCachedItemKind? {
+        guard let operand else { return nil }
+        return PfsMacOS26RepairAuthenticator.authenticatedItemKind(in: operand)
+    }
+
     /// The user-namespace name the operand's HMAC is bound to, or `nil` for a
     /// scratch create that has no source. Validation must use exactly this.
     public var authenticatedSourceName: Data? {
         switch kind {
         case .negativeScratch:
             return nil
-        case .positiveEviction, .dataInvalidation:
+        case .positiveEviction, .dataInvalidation, .attributeRefresh:
             return path.name
         }
     }
 
     /// The ordered name-carrying callbacks the actuator's syscalls will
     /// produce. `finish()` requires every one of them to have been consumed
-    /// exactly once. Data invalidation's open and truncate carry no name and
-    /// are therefore authorized through the isolation window instead: the
-    /// gate refuses to consume `removeOperand` for a data plan until the
-    /// armed truncate has actually been consumed, so the nameless half cannot
-    /// be silently skipped.
+    /// exactly once. Positive and data repair consume `.removeSource` through
+    /// the exact coordinate-and-object gate instead.
     public var requiredCallbacks: [PfsMacOS26RepairCallback] {
         switch kind {
         case .negativeScratch:
             return [.createScratch, .removeOperand]
         case .positiveEviction, .dataInvalidation:
-            return [.renameIntoOperand, .removeOperand]
+            return [.removeSource]
+        case .attributeRefresh:
+            return []
         }
     }
 }
@@ -722,17 +882,51 @@ public struct PfsMacOS26RepairPlan: Sendable, Equatable {
 /// Implementations must consume each plan once and must reject every reserved
 /// operand that was not armed and authenticated.
 public protocol PfsMacOS26RepairArmLease: Sendable {
-    /// Confirms that every callback belonging to the armed transaction was
-    /// consumed locally. A partial create/rename transaction is a failure.
-    func finish() async throws
+    /// Selects this pre-armed plan as the one mounted-VFS syscall currently
+    /// executing. The production registry uses this to bind nameless callbacks
+    /// to one hard-link alias even when several plans share an item identity.
+    func activate() async throws
+    /// Confirms that every callback belonging to the armed plan was consumed,
+    /// but deliberately keeps source-item ownership armed. FSKit can deliver
+    /// teardown for an earlier syscall while a later plan in the same COMPLETE
+    /// event is running.
+    func validate() async throws
+    /// Ends repair ownership only after the COMPLETE publication barrier has
+    /// resumed. This is the event boundary, not an individual syscall return.
+    func release() async throws
     /// Revokes the transaction on every non-success exit, including task
     /// cancellation after arming but before the actuator starts.
     func cancel() async
 }
 
-/// The exact provenance one consumed armed truncate hands back to the
-/// adapter, so the swallowed `setAttributes(size:)` can synthesize a truthful
-/// local reply without a daemon round trip.
+public extension PfsMacOS26RepairArmLease {
+    /// Legacy/mock leases that do not multiplex a production registry have no
+    /// actuation selection state. The production lease overrides this method.
+    func activate() async throws {}
+
+    /// Convenience for a standalone plan outside the multi-plan backend.
+    func finish() async throws {
+        do {
+            try await validate()
+            try await release()
+        } catch {
+            await cancel()
+            throw error
+        }
+    }
+}
+
+/// The exact identity attestation an armed attribute-refresh callback hands
+/// back to the adapter. The adapter verifies its post-apply authoritative
+/// getattr before returning that complete snapshot to FSKit.
+public struct PfsMacOS26ArmedAttributeRefreshConsumption: Sendable, Equatable {
+    public let expectedVFSFileID: UInt64
+
+    public init(expectedVFSFileID: UInt64) {
+        self.expectedVFSFileID = expectedVFSFileID
+    }
+}
+
 public struct PfsMacOS26ArmedTruncateConsumption: Sendable, Equatable {
     public let expectedVFSFileID: UInt64
     public let size: UInt64
@@ -743,6 +937,17 @@ public struct PfsMacOS26ArmedTruncateConsumption: Sendable, Equatable {
     }
 }
 
+/// What authority truth says about the exact user-visible name removed only
+/// from this Mac's kernel cache. A positive eviction accompanies a namespace
+/// target and does not preserve an attested binding of this item at that
+/// coordinate. A data invalidation leaves the authority binding intact and may
+/// retain that coordinate solely as a bounded locator for an already-retained
+/// vnode.
+public enum PfsMacOS26ArmedSourceRemovalDisposition: Sendable, Equatable {
+    case positiveEviction
+    case dataInvalidation
+}
+
 /// The FSKit-callback side of the same one-shot authorization. `arm` publishes
 /// a transaction; the adapter asks this to decide, per callback, whether a
 /// reserved-namespace operation is that transaction's next step (consume it
@@ -751,42 +956,103 @@ public protocol PfsMacOS26RepairGate: Sendable {
     /// Atomically consumes the authorization for exactly one callback.
     ///
     /// - Parameter operand: the reserved name the callback names.
-    /// - Parameter sourceName: for the two rename callbacks, the user-namespace
-    ///   name on the other side of the rename; `nil` otherwise.
     /// - Parameter parentIdentity: the stable identity of the directory the
     ///   callback operates in, exactly as the adapter's directory item carries
     ///   it. The HMAC binds the plan's parent; consumption re-checks it here so
     ///   a same-basename operation in a different directory can never be
     ///   swallowed.
-    /// - Parameter item: for `renameIntoOperand`, the FSKit item being moved to
-    ///   the hidden operand. A data-invalidation transaction records it as the
-    ///   one object its isolation window may answer for; other kinds ignore it.
-    ///
     /// Throws — and consumes nothing — for an unarmed operand, a repeated
-    /// callback, an out-of-order callback, a mismatched source name, or a
-    /// mismatched parent.
+    /// callback, an out-of-order callback, or a mismatched parent.
     func consume(
         callback: PfsMacOS26RepairCallback,
         operand: Data,
-        sourceName: Data?,
-        parentIdentity: Data?,
-        item: PortableFSItem?
+        parentIdentity: Data?
     ) async throws
 
-    /// The one item a live data-invalidation isolation window may answer a
-    /// reserved-name lookup for, or `nil` when `operand` names no armed
-    /// transaction whose user name is currently parked at the hidden operand.
-    func isolatedRepairItem(operand: Data) async -> PortableFSItem?
+    /// Gives the armed negative repair ownership of the process-local scratch
+    /// object minted for its consumed create callback. Name removal and vnode
+    /// reclamation are distinct: the adapter retires the binding at remove,
+    /// and lease release/cancellation guarantees the binding is retired on
+    /// every partial path. The object itself remains locally classified until
+    /// FSKit emits reclaim; mount shutdown deterministically clears any vnode
+    /// the kernel retained without reclaiming first.
+    func adoptLocalRepairScratch(
+        operand: Data,
+        item: PortableFSItem,
+        retireBinding: @escaping @Sendable (PortableFSItem) async -> Void
+    ) async throws
 
-    /// True while a data-invalidation isolation window is live for exactly
-    /// this stable item identity. The adapter uses it to route the actuator's
-    /// own nameless re-entrant callbacks (open/close on the isolated file)
-    /// around ordinary publication admission.
+    /// True while an armed positive/data repair is about to resolve its exact
+    /// user-visible source coordinate. unlinkat(2) performs this lookup before
+    /// it emits the exact source-removal callback, so the lookup is repair-owned.
+    func isArmedRepairSource(
+        parentIdentity: Data,
+        name: Data
+    ) async -> Bool
+
+    /// True for one exact ancestor coordinate captured from the namespace
+    /// index when the event was armed. The daemon must traverse these names to
+    /// reach the final repaired parent; without this authorization its own
+    /// path lookup would wait behind the COMPLETE barrier it is servicing.
+    func isArmedRepairTraversal(
+        parentIdentity: Data,
+        name: Data
+    ) async -> Bool
+
+    /// True for an exact directory item reached through one of the armed
+    /// ancestor coordinates above. FSKit may emit open/getattr/close for each
+    /// directory vnode while the daemon walks to the repaired parent; those
+    /// item-only callbacks need the same provenance as the named lookup.
+    func isArmedRepairTraversalItem(itemIdentity: Data) async -> Bool
+
+    /// True while an armed positive/data repair is resolving the exact source
+    /// object named by its authenticated plan. FSKit asks for that object's
+    /// attributes after the source-name lookup and before it emits the remove
+    /// callback. That getattr is therefore part of path resolution, even
+    /// though it carries only an item and no name.
+    func isArmedRepairSourceItem(itemIdentity: Data) async -> Bool
+
+    /// Narrow open-only source exemption. Once removeSource is consumed, a new
+    /// open takes ordinary publication admission while teardown callbacks keep
+    /// using `isArmedRepairSourceItem` through lease release.
+    func isArmedRepairSourceOpenItem(itemIdentity: Data) async -> Bool
+
+    /// True while an event-scoped plan is traversing its exact parent
+    /// directory. The daemon actuator opens relative parent components before
+    /// it can issue the child cache operation; FSKit may surface the final
+    /// parent open/getattr/close while that same coordinate is closed.
+    func isArmedRepairParentItem(itemIdentity: Data) async -> Bool
+
+    /// Atomically consumes a kernel-only unlink for the exact authenticated
+    /// source coordinate and stable object identity. Returns `nil` when no
+    /// armed plan names that source, so ordinary user unlinks continue to the
+    /// authority unchanged. The disposition says whether authority truth still
+    /// owns this exact coordinate after the cache-only unlink.
+    func consumeArmedSourceRemoval(
+        parentIdentity: Data,
+        name: Data,
+        item: PortableFSItem
+    ) async throws -> PfsMacOS26ArmedSourceRemovalDisposition?
+
+    /// True after the exact source removal of a data repair and until its event
+    /// lease ends. The adapter uses it to route the actuator's held-descriptor
+    /// truncate callbacks around ordinary publication admission.
     func isArmedTruncateItem(itemIdentity: Data) async -> Bool
 
+    /// True only for the exact item of an armed attribute-refresh syscall.
+    func isArmedAttributeRefreshItem(itemIdentity: Data) async -> Bool
+
+    /// Consumes a nameless mode-only callback for the authenticated exact item.
+    /// More than one callback may be coalesced because FSKit exposes no caller
+    /// or repair token with which to distinguish the actuator's existing-mode
+    /// `fchmod` from a racing user request.
+    func consumeArmedAttributeRefresh(
+        itemIdentity: Data
+    ) async -> PfsMacOS26ArmedAttributeRefreshConsumption?
+
     /// Consumes an armed truncate: a size-only `setAttributes` whose item
-    /// stable identity and requested size exactly match a live isolation
-    /// window's authoritative post-state. Returns `nil` — and consumes
+    /// stable identity and requested size exactly match a live data repair's
+    /// authoritative post-state. Returns `nil` — and consumes
     /// nothing — for anything else; the adapter forwards those unchanged.
     func consumeArmedTruncate(
         itemIdentity: Data,
@@ -804,8 +1070,9 @@ public protocol PfsMacOS26RepairActuator: Sendable {
 
 public struct PfsMacOS26RepairAuthenticator: Sendable {
     public static let reservedPrefix = Data(".portablefs-v3-r1-".utf8)
-    private static let version: UInt8 = 1
+    private static let version: UInt8 = 2
     private static let tagBytes = 16
+    private static let operandBodyBytes = 3 + 8 + 4 + 8
 
     public let mountSessionID: UUID
     private let key: SymmetricKey
@@ -829,7 +1096,8 @@ public struct PfsMacOS26RepairAuthenticator: Sendable {
         kind: PfsMacOS26RepairKind,
         parentIdentity: PfsMacOSStableIdentity,
         itemIdentity: PfsMacOSStableIdentity,
-        sourceName: Data?
+        sourceName: Data?,
+        itemKind: PfsMacOSCachedItemKind? = nil
     ) throws -> Data {
         guard epoch.count == 16 else {
             throw PfsMacOSCoherenceError.invalidEpochLength(epoch.count)
@@ -839,7 +1107,30 @@ public struct PfsMacOS26RepairAuthenticator: Sendable {
         }
         var nonceGenerator = SystemRandomNumberGenerator()
         let nonce = UInt64.random(in: UInt64.min...UInt64.max, using: &nonceGenerator)
-        var operandBody = Data([Self.version, kind.rawValue])
+        let authenticatedItemKind: UInt8
+        switch kind {
+        case .negativeScratch:
+            guard itemKind == nil else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            authenticatedItemKind = 0
+        case .positiveEviction:
+            // File remains the default for source compatibility with focused
+            // callers that predate typed directory eviction. Production plans
+            // always pass the exact indexed kind explicitly.
+            authenticatedItemKind = (itemKind ?? .file).rawValue
+        case .dataInvalidation:
+            guard itemKind == nil || itemKind == .file else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            authenticatedItemKind = PfsMacOSCachedItemKind.file.rawValue
+        case .attributeRefresh:
+            guard let itemKind else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            authenticatedItemKind = itemKind.rawValue
+        }
+        var operandBody = Data([Self.version, kind.rawValue, authenticatedItemKind])
         operandBody.appendBigEndian(sequence)
         operandBody.appendBigEndian(step)
         operandBody.appendBigEndian(nonce)
@@ -867,7 +1158,7 @@ public struct PfsMacOS26RepairAuthenticator: Sendable {
     ) -> Bool {
         guard operand.starts(with: Self.reservedPrefix),
               let decoded = Data(hexEncoded: operand.dropFirst(Self.reservedPrefix.count)),
-              decoded.count == 2 + 8 + 4 + 8 + Self.tagBytes else {
+              decoded.count == Self.operandBodyBytes + Self.tagBytes else {
             return false
         }
         let operandBody = Data(decoded.dropLast(Self.tagBytes))
@@ -885,12 +1176,50 @@ public struct PfsMacOS26RepairAuthenticator: Sendable {
         var cursor = PfsMacOSByteCursor(operandBody)
         guard cursor.readUInt8() == Self.version,
               cursor.readUInt8() == kind.rawValue,
+              let authenticatedItemKind = cursor.readUInt8(),
               cursor.readUInt64() == sequence,
               cursor.readUInt32() == step else {
             return false
         }
+        switch kind {
+        case .negativeScratch:
+            guard authenticatedItemKind == 0 else { return false }
+        case .positiveEviction, .attributeRefresh:
+            guard PfsMacOSCachedItemKind(rawValue: authenticatedItemKind) != nil else {
+                return false
+            }
+        case .dataInvalidation:
+            guard authenticatedItemKind == PfsMacOSCachedItemKind.file.rawValue else {
+                return false
+            }
+        }
         _ = cursor.readUInt64() // nonce
         return cursor.isAtEnd
+    }
+
+    /// Reads the item kind from the signed operand body. Callers use this only
+    /// after the arm registry has authenticated the complete operand.
+    public static func authenticatedItemKind(in operand: Data) -> PfsMacOSCachedItemKind? {
+        guard operand.starts(with: reservedPrefix),
+              let decoded = Data(hexEncoded: operand.dropFirst(reservedPrefix.count)),
+              decoded.count == operandBodyBytes + tagBytes else {
+            return nil
+        }
+        var cursor = PfsMacOSByteCursor(Data(decoded.dropLast(tagBytes)))
+        guard cursor.readUInt8() == version,
+              let repairRaw = cursor.readUInt8(),
+              let repairKind = PfsMacOS26RepairKind(rawValue: repairRaw),
+              let itemRaw = cursor.readUInt8() else {
+            return nil
+        }
+        switch repairKind {
+        case .negativeScratch:
+            return nil
+        case .positiveEviction, .attributeRefresh:
+            return PfsMacOSCachedItemKind(rawValue: itemRaw)
+        case .dataInvalidation:
+            return itemRaw == PfsMacOSCachedItemKind.file.rawValue ? .file : nil
+        }
     }
 
     private func signedContext(
@@ -922,7 +1251,12 @@ public struct PfsMacOS26RepairAuthenticator: Sendable {
 /// then executed through the mounted VFS. Returning from `repair` is the local
 /// visibility barrier; the runner sends the authority ACK only afterward.
 public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
-    public let policy = PfsMacOSCachePolicy.synchronousVFSRepairV1
+    private static let signposter = OSSignposter(
+        subsystem: "dev.portablefs.fskit",
+        category: "MacOS26RepairActuation"
+    )
+
+    public let policy: PfsMacOSCachePolicy
     private let localAuthoritySessionID: Data
     private let authenticator: PfsMacOS26RepairAuthenticator
     private let armer: any PfsMacOS26RepairArmer
@@ -930,16 +1264,21 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
     private let publicationBarrier: any PfsMacOSCallbackPublicationBarrier
 
     public init(
+        policy: PfsMacOSCachePolicy = .synchronousVFSRepairV1,
         localAuthoritySessionID: Data,
         authenticator: PfsMacOS26RepairAuthenticator,
         armer: any PfsMacOS26RepairArmer,
         actuator: any PfsMacOS26RepairActuator,
         publicationBarrier: any PfsMacOSCallbackPublicationBarrier
     ) throws {
+        guard policy == .synchronousVFSRepairV1 || policy == .synchronousVFSRepairV2 else {
+            throw PfsMacOSCoherenceError.unsupportedRepair
+        }
         guard localAuthoritySessionID.count == 16 else {
             throw PfsMacOSCoherenceError.invalidSessionIDLength(localAuthoritySessionID.count)
         }
         self.localAuthoritySessionID = localAuthoritySessionID
+        self.policy = policy
         self.authenticator = authenticator
         self.armer = armer
         self.actuator = actuator
@@ -952,21 +1291,107 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
             return
         }
         if event.initiator.sessionID != localAuthoritySessionID {
-            for (index, repair) in event.repairs.enumerated() {
-                try Task.checkCancellation()
-                let plan = try makePlan(event: event, step: UInt32(index), repair: repair)
-                let lease = try await armer.arm(plan)
-                do {
-                    try Task.checkCancellation()
-                    try await actuator.apply(plan)
-                    try await lease.finish()
-                } catch {
-                    await lease.cancel()
-                    throw error
-                }
+            // Validate the complete repair set before the first mounted-VFS
+            // mutation. A later native-only/object repair must fail macOS 26
+            // closed without leaving earlier pathname surgery partially run.
+            let plans = try makePlans(event: event)
+            let actuationStarted = DispatchTime.now().uptimeNanoseconds
+            if Self.signposter.isEnabled {
+                Self.signposter.emitEvent(
+                    "RepairActuation",
+                    "edge=begin sequence=\(event.sequence) plans=\(plans.count) repairs=\(event.repairs.count)"
+                )
             }
+            var leases: [any PfsMacOS26RepairArmLease] = []
+            do {
+                // Arm and resolve the exact traversal coordinates for the
+                // whole event before the first cache mutation changes the
+                // local namespace index. This also proves every plan is
+                // executable before any mounted-VFS surgery begins.
+                for plan in plans {
+                    try Task.checkCancellation()
+                    leases.append(try await armer.arm(plan))
+                }
+                for (plan, lease) in zip(plans, leases) {
+                    try Task.checkCancellation()
+                    try await lease.activate()
+                    try await actuator.apply(plan)
+                    try await lease.validate()
+                }
+                // Keep every completed plan armed while the event barrier
+                // resumes: FSKit may emit a prior unlink's close/reclaim tail
+                // after unlinkat has returned and while the next plan runs.
+                try await publicationBarrier.resume(event)
+                for lease in leases {
+                    try await lease.release()
+                }
+                if Self.signposter.isEnabled {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    let elapsed = now < actuationStarted
+                        ? 0
+                        : (now - actuationStarted) / 1_000
+                    Self.signposter.emitEvent(
+                        "RepairActuation",
+                        "edge=end sequence=\(event.sequence) duration_us=\(elapsed) plans=\(plans.count)"
+                    )
+                }
+            } catch {
+                for lease in leases {
+                    await lease.cancel()
+                }
+                if Self.signposter.isEnabled {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    let elapsed = now < actuationStarted
+                        ? 0
+                        : (now - actuationStarted) / 1_000
+                    let nsError = error as NSError
+                    Self.signposter.emitEvent(
+                        "RepairActuation",
+                        "edge=failed sequence=\(event.sequence) duration_us=\(elapsed) plans=\(plans.count) domain=\(nsError.domain, privacy: .public) code=\(nsError.code)"
+                    )
+                }
+                throw error
+            }
+            return
         }
         try await publicationBarrier.resume(event)
+    }
+
+    public func orderedAdmissionContended(
+        for event: PfsMacOSCoherenceEvent
+    ) async -> Bool {
+        await publicationBarrier.orderedAdmissionContended(for: event)
+    }
+
+    public func acknowledged(_ event: PfsMacOSCoherenceEvent) async {
+        await publicationBarrier.acknowledged(event)
+    }
+
+    /// A negative-cache purge is a parent-directory transaction: one sibling
+    /// create+unlink invalidates every negative name cached in that directory.
+    /// PREPARE still receives the complete repair list and therefore closes all
+    /// exact callback scopes; only the redundant mounted-VFS actuations collapse.
+    private func makePlans(
+        event: PfsMacOSCoherenceEvent
+    ) throws -> [PfsMacOS26RepairPlan] {
+        let candidates = try event.repairs.enumerated().map { index, repair in
+            try makePlan(event: event, step: UInt32(index), repair: repair)
+        }
+        var plans: [PfsMacOS26RepairPlan] = []
+        var negativeParents: [PfsMacOSStableIdentity: PfsMacOSRelativePath] = [:]
+        for plan in candidates {
+            if plan.kind == .negativeScratch {
+                if let recordedParent = negativeParents[plan.parentIdentity] {
+                    guard recordedParent == plan.path else {
+                        throw PfsMacOSCoherenceError.invalidRepairOperand
+                    }
+                    continue
+                }
+                negativeParents[plan.parentIdentity] = plan.path
+            }
+            plans.append(plan)
+        }
+        return plans
     }
 
     private func makePlan(
@@ -997,7 +1422,7 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
                 authoritativeSize: nil,
                 operand: operand
             )
-        case let .evictBinding(path, parentIdentity, itemIdentity):
+        case let .evictBinding(path, parentIdentity, itemIdentity, itemKind):
             guard let name = path.name else { throw PfsMacOSCoherenceError.invalidPathComponent }
             let operand = try authenticator.makeOperand(
                 epoch: event.epoch,
@@ -1006,7 +1431,8 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
                 kind: .positiveEviction,
                 parentIdentity: parentIdentity,
                 itemIdentity: itemIdentity,
-                sourceName: name
+                sourceName: name,
+                itemKind: itemKind
             )
             return PfsMacOS26RepairPlan(
                 epoch: event.epoch,
@@ -1017,6 +1443,38 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
                 parentIdentity: parentIdentity,
                 itemIdentity: itemIdentity,
                 expectedVFSFileID: nil,
+                authoritativeSize: nil,
+                operand: operand
+            )
+        case let .refreshAttributes(
+            path,
+            parentIdentity,
+            itemIdentity,
+            expectedVFSFileID,
+            itemKind
+        ):
+            guard let name = path.name else {
+                throw PfsMacOSCoherenceError.invalidPathComponent
+            }
+            let operand = try authenticator.makeOperand(
+                epoch: event.epoch,
+                sequence: event.sequence,
+                step: step,
+                kind: .attributeRefresh,
+                parentIdentity: parentIdentity,
+                itemIdentity: itemIdentity,
+                sourceName: name,
+                itemKind: itemKind
+            )
+            return PfsMacOS26RepairPlan(
+                epoch: event.epoch,
+                sequence: event.sequence,
+                step: step,
+                kind: .attributeRefresh,
+                path: path,
+                parentIdentity: parentIdentity,
+                itemIdentity: itemIdentity,
+                expectedVFSFileID: expectedVFSFileID,
                 authoritativeSize: nil,
                 operand: operand
             )
@@ -1089,30 +1547,56 @@ public final class PfsMacOS26POSIXActuator: PfsMacOS26RepairActuator, @unchecked
         case .positiveEviction:
             guard let parent = plan.path.parent,
                   let source = plan.path.name,
-                  let operand = plan.operand else {
+                  plan.operand != nil,
+                  let itemKind = plan.itemKind else {
                 throw PfsMacOSCoherenceError.invalidPathComponent
             }
             let parentFD = try openDirectory(parent)
             defer { close(parentFD) }
-            let renamed = try source.withPOSIXName { sourceName in
-                try operand.withPOSIXName { destinationName in
-                    renameat(parentFD, sourceName, parentFD, destinationName)
-                }
+            let removalFlags: Int32 = itemKind == .directory ? AT_REMOVEDIR : 0
+            let unlinked = try source.withPOSIXName { sourceName in
+                unlinkat(parentFD, sourceName, removalFlags)
             }
-            guard renamed == 0 else {
+            guard unlinked == 0 || errno == ENOENT else {
                 throw PfsMacOSCoherenceError.posix(operation: "evict cached binding", errno: errno)
             }
-            try Self.afterIsolating(parentFD: parentFD, source: source, operand: operand) {
-                let unlinked = try operand.withPOSIXName { name in unlinkat(parentFD, name, 0) }
-                guard unlinked == 0 else {
-                    throw PfsMacOSCoherenceError.posix(operation: "remove evicted binding", errno: errno)
-                }
+
+        case .attributeRefresh:
+            guard let parent = plan.path.parent,
+                  let name = plan.path.name,
+                  let itemKind = plan.itemKind,
+                  itemKind != .symlink,
+                  let expectedVFSFileID = plan.expectedVFSFileID else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            let parentFD = try openDirectory(parent)
+            defer { close(parentFD) }
+            let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+                | (itemKind == .directory ? O_DIRECTORY : 0)
+            let itemFD = try name.withPOSIXName { component in
+                openat(parentFD, component, flags)
+            }
+            guard itemFD >= 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "open attribute repair source", errno: errno)
+            }
+            defer { close(itemFD) }
+            var status = stat()
+            guard fstat(itemFD, &status) == 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "stat attribute repair source", errno: errno)
+            }
+            guard status.st_ino == expectedVFSFileID else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            let permissions = mode_t(status.st_mode) & mode_t(0o7777)
+            guard fchmod(itemFD, permissions) == 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "refresh cached attributes", errno: errno)
             }
 
         case .dataInvalidation:
             guard let parent = plan.path.parent,
                   let name = plan.path.name,
-                  let operand = plan.operand,
+                  plan.operand != nil,
+                  plan.itemKind == .file,
                   let expectedVFSFileID = plan.expectedVFSFileID,
                   let size = plan.authoritativeSize,
                   size <= UInt64(off_t.max) else {
@@ -1120,91 +1604,46 @@ public final class PfsMacOS26POSIXActuator: PfsMacOS26RepairActuator, @unchecked
             }
             let parentFD = try openDirectory(parent)
             defer { close(parentFD) }
-            let renamed = try name.withPOSIXName { sourceName in
-                try operand.withPOSIXName { destinationName in
-                    renameat(parentFD, sourceName, parentFD, destinationName)
+            let fileFD = try name.withPOSIXName { component in
+                openat(parentFD, component, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+            }
+            guard fileFD >= 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "open data repair source", errno: errno)
+            }
+            defer { close(fileFD) }
+            var status = stat()
+            guard fstat(fileFD, &status) == 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "stat data repair source", errno: errno)
+            }
+            guard status.st_ino == expectedVFSFileID else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            let unlinked = try name.withPOSIXName { component in unlinkat(parentFD, component, 0) }
+            guard unlinked == 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "evict data repair source", errno: errno)
+            }
+            // Unconditional by design. On macOS 26 fstat may already report
+            // the new length while stale cached pages still expose the old EOF.
+            guard ftruncate(fileFD, off_t(size)) == 0 else {
+                throw PfsMacOSCoherenceError.posix(operation: "truncate data repair source", errno: errno)
+            }
+            let windows = try PfsMacOS26MappingWindows(fileSize: size)
+            for window in windows {
+                try Task.checkCancellation()
+                let address = mmap(nil, window.length, PROT_READ, MAP_SHARED, fileFD, off_t(window.offset))
+                guard address != MAP_FAILED else {
+                    throw PfsMacOSCoherenceError.posix(operation: "map data repair source", errno: errno)
+                }
+                let syncResult = msync(address, window.length, MS_INVALIDATE)
+                let syncErrno = errno
+                let unmapResult = munmap(address, window.length)
+                guard syncResult == 0 else {
+                    throw PfsMacOSCoherenceError.posix(operation: "invalidate data repair source", errno: syncErrno)
+                }
+                guard unmapResult == 0 else {
+                    throw PfsMacOSCoherenceError.posix(operation: "unmap data repair source", errno: errno)
                 }
             }
-            guard renamed == 0 else {
-                throw PfsMacOSCoherenceError.posix(operation: "isolate data repair target", errno: errno)
-            }
-            try Self.afterIsolating(parentFD: parentFD, source: name, operand: operand) {
-                let fileFD = try operand.withPOSIXName { component in
-                    openat(parentFD, component, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
-                }
-                guard fileFD >= 0 else {
-                    throw PfsMacOSCoherenceError.posix(operation: "open data repair target", errno: errno)
-                }
-                defer { close(fileFD) }
-                var status = stat()
-                guard fstat(fileFD, &status) == 0 else {
-                    throw PfsMacOSCoherenceError.posix(operation: "stat data repair target", errno: errno)
-                }
-                guard status.st_ino == expectedVFSFileID else {
-                    throw PfsMacOSCoherenceError.invalidRepairOperand
-                }
-                // Unconditional by design. On macOS 26, fstat may already report
-                // the new length while stale cached pages still expose the old EOF.
-                guard ftruncate(fileFD, off_t(size)) == 0 else {
-                    throw PfsMacOSCoherenceError.posix(operation: "truncate data repair target", errno: errno)
-                }
-                let windows = try PfsMacOS26MappingWindows(fileSize: size)
-                for window in windows {
-                    try Task.checkCancellation()
-                    let address = mmap(nil, window.length, PROT_READ, MAP_SHARED, fileFD, off_t(window.offset))
-                    guard address != MAP_FAILED else {
-                        throw PfsMacOSCoherenceError.posix(operation: "map data repair target", errno: errno)
-                    }
-                    let syncResult = msync(address, window.length, MS_INVALIDATE)
-                    let syncErrno = errno
-                    let unmapResult = munmap(address, window.length)
-                    guard syncResult == 0 else {
-                        throw PfsMacOSCoherenceError.posix(operation: "invalidate data repair target", errno: syncErrno)
-                    }
-                    guard unmapResult == 0 else {
-                        throw PfsMacOSCoherenceError.posix(operation: "unmap data repair target", errno: errno)
-                    }
-                }
-                let unlinked = try operand.withPOSIXName { component in unlinkat(parentFD, component, 0) }
-                guard unlinked == 0 else {
-                    throw PfsMacOSCoherenceError.posix(operation: "remove data repair target", errno: errno)
-                }
-            }
-        }
-    }
-
-    /// Runs the part of a namespace transaction that executes while the user's
-    /// name is parked at the hidden operand.
-    ///
-    /// Between the isolating rename and the removal there is exactly one state
-    /// in which a failure would strand a user's file under a name nothing else
-    /// knows: this closure's throw path. Rolling the rename back is the only
-    /// operation that returns the local namespace to what it was before the
-    /// repair began; it is not error recovery, because the original error is
-    /// re-thrown either way and the caller still fails closed. If the rollback
-    /// also fails, the thrown error names the stranded operand so the failure
-    /// is reported rather than silently left in the directory.
-    private static func afterIsolating(
-        parentFD: Int32,
-        source: Data,
-        operand: Data,
-        _ body: () throws -> Void
-    ) throws {
-        do {
-            try body()
-        } catch {
-            let restored = (try? operand.withPOSIXName { hidden in
-                try source.withPOSIXName { original in
-                    renameat(parentFD, hidden, parentFD, original)
-                }
-            }) == 0
-            if restored {
-                throw error
-            }
-            throw PfsMacOSCoherenceError.repairTransactionTorn(
-                hiddenName: String(decoding: operand, as: UTF8.self),
-                rolledBack: false
-            )
         }
     }
 

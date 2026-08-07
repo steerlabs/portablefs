@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -154,7 +155,7 @@ func validPersistedV3Attach(v3 *persistedV3Attach) error {
 		return errors.New("v3 attach requires a positive cachedNameCapacity and repairBudgetMillis")
 	}
 	switch v3.CachePolicy {
-	case v3CachePolicyMacOS26, v3CachePolicyFSKit:
+	case v3CachePolicyMacOS26V1, v3CachePolicyMacOS26, v3CachePolicyFSKit:
 	default:
 		return fmt.Errorf("unsupported v3 cache policy %q", v3.CachePolicy)
 	}
@@ -241,13 +242,21 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 // remote kernel and the two policies repair through different mechanisms:
 // macOS 26 repairs synchronously through the VFS — the repair traverses the
 // same namespace locks an unanswered directory mutation can hold, which is the
-// PARENT_EXCLUSIVE contract — while the native FSKit revocation API revokes
-// kernel cache entries without re-entering the namespace.
+// CALLBACK_SERIALIZED contract — live macOS 26 FSKit also serializes disjoint
+// mutation and repair callbacks through shared execution capacity. The native
+// FSKit revocation API revokes kernel cache entries without re-entering the
+// namespace and therefore declares INDEPENDENT.
 func v3NamespaceRepair(cachePolicy string) authoritypb.NamespaceRepair {
-	if cachePolicy == v3CachePolicyFSKit {
+	switch cachePolicy {
+	case v3CachePolicyMacOS26V1:
+		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED
+	case v3CachePolicyMacOS26:
+		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED
+	case v3CachePolicyFSKit:
 		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT
+	default:
+		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
 	}
-	return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
 }
 
 // v3AuthoritySession is the slice of authorityrpc.Client the attach lifecycle
@@ -419,6 +428,7 @@ func (c *frontendConn) handleV3Attached(
 	a *attach,
 	requestID uint64,
 	operationID uint64,
+	sourcePhaseQueueable bool,
 	initializeOperation bool,
 	body any,
 ) {
@@ -453,13 +463,21 @@ func (c *frontendConn) handleV3Attached(
 		reply any
 		eno   int32
 	)
+	resources := &v3ReplyResourceCollector{d: d}
+	switch body.(type) {
+	case *pfslocal.CreateRequest, *pfslocal.MkdirRequest, *pfslocal.SymlinkRequest:
+		resources.visible = true
+	}
+	dispatchCtx := context.WithValue(gateCtx, v3ReplyResourceContextKey{}, resources)
 	switch {
 	case d == nil:
 		eno = darwinEIO
 	case d.terminalError() != nil:
 		eno = darwinENOTCONN
 	default:
-		reply, eno = d.dispatch(gateCtx, operationID, body)
+		reply, eno = d.dispatchFrontend(
+			dispatchCtx, operationID, sourcePhaseQueueable, body,
+		)
 		if eno == darwinEIO && d.terminalError() != nil {
 			// The failure that produced this errno killed the session. Report
 			// the session verdict, not a per-operation I/O fault: FSKit must
@@ -468,6 +486,28 @@ func (c *frontendConn) handleV3Attached(
 		}
 	}
 	if eno != 0 {
+		if d != nil && (len(resources.items) != 0 || len(resources.handles) != 0) {
+			cleanup, prepareErr := d.abandonCollectedReplyResources(resources)
+			if cleanup != nil && prepareErr == nil {
+				if cleanup.required() {
+					go func() {
+						if err := cleanup.finish(); err != nil {
+							_ = d.fail(err)
+						}
+					}()
+				}
+			}
+			if prepareErr != nil {
+				_ = d.fail(prepareErr)
+			}
+			// Incomplete publication of a successful visible resource reply is
+			// detected by the synchronous disposition above. Re-read the terminal
+			// state after that transition so this callback reports the session
+			// verdict rather than its earlier per-operation errno.
+			if d.terminalError() != nil {
+				eno = darwinENOTCONN
+			}
+		}
 		failure := &pfslocal.ErrorReply{Errno: eno, Message: errMessage(fmt.Sprintf("%T", body), eno)}
 		if publishes {
 			c.replyWithPublication(requestID, operationID, failure, true)
@@ -475,6 +515,63 @@ func (c *frontendConn) handleV3Attached(
 			c.errorReplyForOperation(requestID, operationID, eno, failure.Message)
 		}
 		return
+	}
+	resourceReply, resourceErr := resourceBearingV3Reply(reply, resources)
+	if resourceErr != nil {
+		provisional, prepareErr := d.prepareReplyResources(resources)
+		if provisional != nil {
+			cleanup, cleanupErr := d.applyReplyResourceDisposition(
+				provisional, false, 0,
+			)
+			if cleanupErr == nil {
+				go func() {
+					if err := cleanup.finish(); err != nil {
+						_ = d.fail(err)
+					}
+				}()
+			} else {
+				prepareErr = errors.Join(prepareErr, cleanupErr)
+			}
+		}
+		resourceErr = errors.Join(resourceErr, prepareErr)
+		_ = d.fail(resourceErr)
+		_ = c.conn.Close()
+		return
+	}
+	if resourceReply {
+		provisional, err := d.prepareReplyResources(resources)
+		if err != nil {
+			if provisional != nil {
+				if cleanup, cleanupErr := d.applyReplyResourceDisposition(
+					provisional, false, 0,
+				); cleanupErr == nil {
+					go func() {
+						if finishErr := cleanup.finish(); finishErr != nil {
+							_ = d.fail(finishErr)
+						}
+					}()
+				} else {
+					err = errors.Join(err, cleanupErr)
+				}
+			}
+			_ = d.fail(err)
+			_ = c.conn.Close()
+			return
+		}
+		cleanup, registered, err := c.registerProvisionalResourceOrAbandon(requestID, provisional)
+		if !registered {
+			if err != nil {
+				_ = d.fail(err)
+			} else if cleanup.required() {
+				go func() {
+					if err := cleanup.finish(); err != nil {
+						_ = d.fail(err)
+					}
+				}()
+			}
+			_ = c.conn.Close()
+			return
+		}
 	}
 	c.replyWithPublication(requestID, operationID, reply, publishes)
 }
@@ -496,11 +593,33 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 		return fmt.Errorf("classify v3 FSKit detach: %w", err)
 	}
 	if present {
-		if err := ops.unmountExact(a.mountPath, a.ref, force); err != nil {
+		bridge := a.v3CoherenceBridge()
+		if bridge == nil {
+			return errors.New("v3 FSKit detach has no live coherence bridge")
+		}
+		if err := bridge.beginDetach(); err != nil {
+			return fmt.Errorf("begin v3 FSKit detach: %w", err)
+		}
+		detachErr := ops.unmountExact(a.mountPath, a.ref, force)
+		if detachErr != nil && !force && errors.Is(detachErr, syscall.EBUSY) {
+			// A normal v3 detach is deliberately two-phase on Darwin.
+			// dounmount without MNT_FORCE first runs ubc_umount and
+			// VFS_SYNC(MNT_WAIT), returning any sync error before it reaches
+			// vflush. PortableFS itself retains the mount-root descriptor that
+			// macOS 26 repair actuation requires, so that fully synchronized
+			// pass then answers EBUSY. Only that exact errno authorizes the
+			// second MNT_FORCE pass, which revokes the product-owned vnode and
+			// open user references but is not trusted as a flush barrier (XNU
+			// skips VFS_SYNC for forced unmounts). Any other first-pass error
+			// leaves the live mount attached.
+			detachErr = ops.unmountExact(a.mountPath, a.ref, true)
+		}
+		if detachErr != nil {
+			bridge.abortDetach(detachErr)
 			// The kernel mount remains (or its state is still owned by an
 			// abandoned helper); the attach keeps serving and the caller
 			// retries or escalates.
-			return err
+			return detachErr
 		}
 		present, err = ops.present(a.mountPath, a.ref)
 		if err == nil && present {

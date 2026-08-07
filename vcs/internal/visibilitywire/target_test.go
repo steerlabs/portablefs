@@ -15,6 +15,11 @@ func TestConstructorsProduceValidTargets(t *testing.T) {
 		target *authoritypb.VisibilityTarget
 	}{
 		{"namespace", Namespace(identity(1), []byte("victim"), 42, 0x700000001)},
+		{"namespace post-binding", func() *authoritypb.VisibilityTarget {
+			target := Namespace(identity(1), []byte("alias"), 42, 0x700000001)
+			target.PostIdentity = identity(4)
+			return target
+		}()},
 		{"data", Data(identity(2), 7, 0x700000001, 4096)},
 		{"data at zero size", Data(identity(2), 7, 0x700000001, 0)},
 		{"attributes", Attributes(identity(3), 7, 0x700000001)},
@@ -70,6 +75,7 @@ func TestValidateTargetRejectsEveryMalformedShape(t *testing.T) {
 		{"unspecified scope", &authoritypb.VisibilityTarget{}},
 		{"unknown scope", &authoritypb.VisibilityTarget{Scope: 99}},
 		{"namespace with object identity", mutate(func(t *authoritypb.VisibilityTarget) { t.Identity = identity(9) })},
+		{"namespace with short post identity", mutate(func(t *authoritypb.VisibilityTarget) { t.PostIdentity = identity(9)[:8] })},
 		{"namespace with short parent identity", mutate(func(t *authoritypb.VisibilityTarget) { t.ParentIdentity = t.ParentIdentity[:8] })},
 		{"namespace without a name", mutate(func(t *authoritypb.VisibilityTarget) { t.Name = nil })},
 		{"namespace with a path for a name", mutate(func(t *authoritypb.VisibilityTarget) { t.Name = []byte("a/b") })},
@@ -83,11 +89,17 @@ func TestValidateTargetRejectsEveryMalformedShape(t *testing.T) {
 		{"namespace without a device", mutate(func(t *authoritypb.VisibilityTarget) { t.Device = 0 })},
 		{"data without identity", mutateData(func(t *authoritypb.VisibilityTarget) { t.Identity = nil })},
 		{"data with parent identity", mutateData(func(t *authoritypb.VisibilityTarget) { t.ParentIdentity = identity(1) })},
+		{"data with post identity", mutateData(func(t *authoritypb.VisibilityTarget) { t.PostIdentity = identity(1) })},
 		{"data with a name", mutateData(func(t *authoritypb.VisibilityTarget) { t.Name = []byte("victim") })},
 		{"data with negative size", mutateData(func(t *authoritypb.VisibilityTarget) { t.Size = -1 })},
 		{"data without kernel inode", mutateData(func(t *authoritypb.VisibilityTarget) { t.KernelIno = 0 })},
 		{"data with parent kernel inode", mutateData(func(t *authoritypb.VisibilityTarget) { t.ParentKernelIno = 42 })},
 		{"data without a device", mutateData(func(t *authoritypb.VisibilityTarget) { t.Device = 0 })},
+		{"attributes with post identity", func() *authoritypb.VisibilityTarget {
+			t := Attributes(identity(3), 7, 0x700000001)
+			t.PostIdentity = identity(1)
+			return t
+		}()},
 		{"attributes with a size", func() *authoritypb.VisibilityTarget {
 			t := Attributes(identity(3), 7, 0x700000001)
 			t.Size = 1

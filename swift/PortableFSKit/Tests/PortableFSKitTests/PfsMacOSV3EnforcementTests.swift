@@ -77,9 +77,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         try await registry.consume(
             callback: .createScratch,
             operand: PfsMacOS26RepairAuthenticator.reservedPrefix + Data("deadbeef".utf8),
-            sourceName: nil,
-            parentIdentity: parentIdentity.bytes,
-            item: nil
+            parentIdentity: parentIdentity.bytes
         )
     }
 }
@@ -136,7 +134,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     }
 }
 
-@Test func oneShotConsumptionIsAtomicUnderConcurrentCallbacks() async throws {
+@Test func sourceRemovalConsumptionIsAtomicUnderConcurrentCallbacks() async throws {
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let plan = try makePlan(
@@ -145,23 +143,24 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         path: try PfsMacOSRelativePath(components: [Data("victim".utf8)])
     )
     _ = try await registry.arm(plan)
-    let operand = try #require(plan.operand)
+    let item = PortableFSItem(identity: .init(
+        itemID: 7,
+        generation: 1,
+        stableIdentity: itemIdentity.bytes
+    ))
 
-    // Sixty racing callbacks all naming the same legitimate operand. Exactly
+    // Sixty racing callbacks all name the exact authenticated source. Exactly
     // one may be swallowed; the rest must fail closed, because each extra
-    // success would be a real rename of a real user file.
+    // success would authorize another kernel-only unlink.
     let successes = await withTaskGroup(of: Bool.self) { group in
         for _ in 0..<60 {
             group.addTask {
                 do {
-                    try await registry.consume(
-                        callback: .renameIntoOperand,
-                        operand: operand,
-                        sourceName: Data("victim".utf8),
+                    return try await registry.consumeArmedSourceRemoval(
                         parentIdentity: parentIdentity.bytes,
-                        item: nil
-                    )
-                    return true
+                        name: Data("victim".utf8),
+                        item: item
+                    ) != nil
                 } catch {
                     return false
                 }
@@ -174,7 +173,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     #expect(successes == 1)
 }
 
-@Test func armedRenameRequiresTheExactAuthenticatedSourceName() async throws {
+@Test func armedSourceLookupRequiresTheExactAuthenticatedCoordinate() async throws {
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let plan = try makePlan(
@@ -184,19 +183,96 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     )
     _ = try await registry.arm(plan)
     let operand = try #require(plan.operand)
-    await #expect(throws: PfsMacOSCoherenceError.invalidRepairOperand) {
-        try await registry.consume(
-            callback: .renameIntoOperand,
-            operand: operand,
-            sourceName: Data("someone-elses-file".utf8),
-            parentIdentity: parentIdentity.bytes,
-            item: nil
-        )
-    }
-    #expect(await registry.pendingCallbacks(operand: operand) == [.renameIntoOperand, .removeOperand])
+    #expect(await registry.isArmedRepairSource(
+        parentIdentity: parentIdentity.bytes,
+        name: Data("victim".utf8)
+    ))
+    #expect(await registry.isArmedRepairSource(
+        parentIdentity: parentIdentity.bytes,
+        name: Data("someone-elses-file".utf8)
+    ) == false)
+    #expect(await registry.isArmedRepairSource(
+        parentIdentity: itemIdentity.bytes,
+        name: Data("victim".utf8)
+    ) == false)
+    #expect(await registry.isArmedRepairSourceOpenItem(itemIdentity: itemIdentity.bytes))
+    #expect(await registry.isArmedRepairSourceOpenItem(itemIdentity: parentIdentity.bytes) == false)
+    #expect(await registry.isArmedRepairSourceItem(itemIdentity: itemIdentity.bytes))
+    #expect(await registry.isArmedRepairSourceItem(itemIdentity: parentIdentity.bytes) == false)
+    #expect(await registry.pendingCallbacks(operand: operand) == [.removeSource])
 }
 
-@Test func callbacksMustArriveInTheOrderThePlanDeclared() async throws {
+@Test func armedSourceRemovalRequiresTheExactCoordinateAndStableObject() async throws {
+    let authenticator = try makeAuthenticator()
+    let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
+    let plan = try makePlan(
+        authenticator: authenticator,
+        kind: .positiveEviction,
+        path: try PfsMacOSRelativePath(components: [Data("victim".utf8)])
+    )
+    let lease = try await registry.arm(plan)
+    let operand = try #require(plan.operand)
+    let exact = PortableFSItem(identity: .init(
+        itemID: 7,
+        generation: 1,
+        stableIdentity: itemIdentity.bytes
+    ))
+    let wrong = PortableFSItem(identity: .init(
+        itemID: 8,
+        generation: 1,
+        stableIdentity: parentIdentity.bytes
+    ))
+    #expect(try await registry.consumeArmedSourceRemoval(
+        parentIdentity: parentIdentity.bytes,
+        name: Data("victim".utf8),
+        item: wrong
+    ) == nil)
+    #expect(try await registry.consumeArmedSourceRemoval(
+        parentIdentity: parentIdentity.bytes,
+        name: Data("someone-else".utf8),
+        item: exact
+    ) == nil)
+    #expect(try await registry.consumeArmedSourceRemoval(
+        parentIdentity: itemIdentity.bytes,
+        name: Data("victim".utf8),
+        item: exact
+    ) == nil)
+    #expect(try await registry.consumeArmedSourceRemoval(
+        parentIdentity: parentIdentity.bytes,
+        name: Data("victim".utf8),
+        item: exact
+    ) == .positiveEviction)
+    // FSKit carries no repair token on removeItem. A concurrent user's exact
+    // same-coordinate unlink is intentionally indistinguishable from the
+    // actuator callback and may win this one slot; every later callback is
+    // refused, and XFS remains authoritative either way.
+    await #expect(throws: PfsMacOSCoherenceError.repairCallbackOutOfOrder) {
+        _ = try await registry.consumeArmedSourceRemoval(
+            parentIdentity: parentIdentity.bytes,
+            name: Data("victim".utf8),
+            item: exact
+        )
+    }
+    #expect(await registry.pendingCallbacks(operand: operand).isEmpty)
+    #expect(await registry.isArmedRepairSourceOpenItem(itemIdentity: itemIdentity.bytes) == false)
+    #expect(await registry.isArmedRepairSourceItem(itemIdentity: itemIdentity.bytes))
+    try await lease.finish()
+}
+
+@Test func positiveEvictionMayFinishWhenTheKernelAlreadyProvedTheNameAbsent() async throws {
+    let authenticator = try makeAuthenticator()
+    let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
+    let plan = try makePlan(
+        authenticator: authenticator,
+        kind: .positiveEviction,
+        path: try PfsMacOSRelativePath(components: [Data("already-absent".utf8)])
+    )
+    let lease = try await registry.arm(plan)
+    try await lease.finish()
+    #expect(await registry.armedOperandCount() == 0)
+}
+
+@Test func reservedCallbacksCannotSubstituteForDirectSourceRemoval() async throws {
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let plan = try makePlan(
@@ -206,26 +282,15 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     )
     _ = try await registry.arm(plan)
     let operand = try #require(plan.operand)
-    // Removal before the isolating rename would unlink the user's own name.
+    // The direct source-unlink plan never authorizes a hidden operand callback.
     await #expect(throws: PfsMacOSCoherenceError.repairCallbackOutOfOrder) {
-        try await registry.consume(callback: .removeOperand, operand: operand, sourceName: nil, parentIdentity: parentIdentity.bytes, item: nil)
-    }
-    try await registry.consume(
-        callback: .renameIntoOperand,
-        operand: operand,
-        sourceName: Data("victim".utf8),
-        parentIdentity: parentIdentity.bytes,
-        item: nil
-    )
-    await #expect(throws: PfsMacOSCoherenceError.repairAlreadyConsumed) {
         try await registry.consume(
-            callback: .renameIntoOperand,
+            callback: .removeOperand,
             operand: operand,
-            sourceName: Data("victim".utf8),
-            parentIdentity: parentIdentity.bytes,
-            item: nil
+            parentIdentity: parentIdentity.bytes
         )
     }
+    #expect(await registry.pendingCallbacks(operand: operand) == [.removeSource])
 }
 
 @Test func dataInvalidationArmsUnderTheDeclaredMacOS26PolicyAndRestrictedRegistriesStillRefuse() async throws {
@@ -277,39 +342,22 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         authoritativeSize: 4096
     )
     let lease = try await registry.arm(plan)
-    let operand = try #require(plan.operand)
     let isolated = PortableFSItem(identity: .init(
         itemID: 9,
         generation: 1,
         stableIdentity: itemIdentity.bytes
     ))
 
-    // Before the isolating rename there is no window: nothing is consumable
-    // and no reserved lookup is answerable.
+    // Before the exact source removal there is no data-repair window.
     #expect(await registry.consumeArmedTruncate(
         itemIdentity: itemIdentity.bytes,
         size: 4096
     ) == nil)
-    #expect(await registry.isolatedRepairItem(operand: operand) == nil)
-    // Removal cannot end a window whose data half never executed.
-    await #expect(throws: PfsMacOSCoherenceError.repairCallbackOutOfOrder) {
-        try await registry.consume(
-            callback: .removeOperand,
-            operand: operand,
-            sourceName: nil,
-            parentIdentity: parentIdentity.bytes,
-            item: nil
-        )
-    }
-
-    try await registry.consume(
-        callback: .renameIntoOperand,
-        operand: operand,
-        sourceName: Data("data.bin".utf8),
+    #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: parentIdentity.bytes,
+        name: Data("data.bin".utf8),
         item: isolated
-    )
-    #expect(await registry.isolatedRepairItem(operand: operand) === isolated)
+    ) == .dataInvalidation)
     #expect(await registry.isArmedTruncateItem(itemIdentity: itemIdentity.bytes))
 
     // Wrong size, wrong item: never swallowed.
@@ -328,25 +376,17 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     ))
     #expect(consumed == .init(expectedVFSFileID: 77, size: 4096))
 
-    try await registry.consume(
-        callback: .removeOperand,
-        operand: operand,
-        sourceName: nil,
-        parentIdentity: parentIdentity.bytes,
-        item: nil
-    )
-    // The window closed with the removal; nothing further is consumable.
+    try await lease.finish()
+    // The event boundary closes the window; nothing further is consumable.
     #expect(await registry.consumeArmedTruncate(
         itemIdentity: itemIdentity.bytes,
         size: 4096
     ) == nil)
-    #expect(await registry.isolatedRepairItem(operand: operand) == nil)
     #expect(await registry.isArmedTruncateItem(itemIdentity: itemIdentity.bytes) == false)
-    try await lease.finish()
     #expect(await registry.armedOperandCount() == 0)
 }
 
-@Test func armedTruncateWindowClosesOnRollback() async throws {
+@Test func armedTruncateWindowClosesOnCancellation() async throws {
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let plan = try makePlan(
@@ -357,34 +397,22 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         authoritativeSize: 1024
     )
     let lease = try await registry.arm(plan)
-    let operand = try #require(plan.operand)
     let isolated = PortableFSItem(identity: .init(
         itemID: 10,
         generation: 1,
         stableIdentity: itemIdentity.bytes
     ))
-    try await registry.consume(
-        callback: .renameIntoOperand,
-        operand: operand,
-        sourceName: Data("data.bin".utf8),
+    #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: parentIdentity.bytes,
+        name: Data("data.bin".utf8),
         item: isolated
-    )
-    try await registry.consume(
-        callback: .rollbackRename,
-        operand: operand,
-        sourceName: Data("data.bin".utf8),
-        parentIdentity: parentIdentity.bytes,
-        item: nil
-    )
-    // Rollback restored the user's name; the window and its one-shot are gone.
+    ) == .dataInvalidation)
+    await lease.cancel()
+    // Cancellation ends the event-scoped window immediately.
     #expect(await registry.consumeArmedTruncate(
         itemIdentity: itemIdentity.bytes,
         size: 1024
     ) == nil)
-    #expect(await registry.isolatedRepairItem(operand: operand) == nil)
-    await lease.cancel()
-    #expect(await registry.tornRepairs().isEmpty)
 }
 
 @Test func consumeRefusesASameBasenameCallbackFromADifferentParent() async throws {
@@ -397,31 +425,21 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     )
     _ = try await registry.arm(plan)
     let operand = try #require(plan.operand)
-    // Exact operand, exact source basename — wrong directory. The HMAC binds
-    // the parent, and consumption re-checks it.
-    await #expect(throws: PfsMacOSCoherenceError.invalidRepairOperand) {
-        try await registry.consume(
-            callback: .renameIntoOperand,
-            operand: operand,
-            sourceName: Data("victim".utf8),
-            parentIdentity: itemIdentity.bytes,
-            item: nil
-        )
-    }
-    // A missing parent identity is refused too: fail closed, never open.
-    await #expect(throws: PfsMacOSCoherenceError.invalidRepairOperand) {
-        try await registry.consume(
-            callback: .renameIntoOperand,
-            operand: operand,
-            sourceName: Data("victim".utf8),
-            parentIdentity: nil,
-            item: nil
-        )
-    }
-    #expect(await registry.pendingCallbacks(operand: operand) == [.renameIntoOperand, .removeOperand])
+    let exact = PortableFSItem(identity: .init(
+        itemID: 7,
+        generation: 1,
+        stableIdentity: itemIdentity.bytes
+    ))
+    // Exact basename and object, wrong directory: never swallowed.
+    #expect(try await registry.consumeArmedSourceRemoval(
+        parentIdentity: itemIdentity.bytes,
+        name: Data("victim".utf8),
+        item: exact
+    ) == nil)
+    #expect(await registry.pendingCallbacks(operand: operand) == [.removeSource])
 }
 
-@Test func aPartiallyConsumedTransactionIsTornAndSealsTheRegistry() async throws {
+@Test func cancellingADirectEvictionNeverSealsFutureRepairs() async throws {
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let plan = try makePlan(
@@ -430,21 +448,18 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         path: try PfsMacOSRelativePath(components: [Data("victim".utf8)])
     )
     let lease = try await registry.arm(plan)
-    let operand = try #require(plan.operand)
-    try await registry.consume(
-        callback: .renameIntoOperand,
-        operand: operand,
-        sourceName: Data("victim".utf8),
+    let exact = PortableFSItem(identity: .init(
+        itemID: 7,
+        generation: 1,
+        stableIdentity: itemIdentity.bytes
+    ))
+    #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: parentIdentity.bytes,
-        item: nil
-    )
-    await #expect(throws: PfsMacOSCoherenceError.self) { try await lease.finish() }
-
-    let torn = await registry.tornRepairs()
-    #expect(torn.count == 1)
-    #expect(torn.first?.hiddenName == operand)
-    #expect(torn.first?.sourceName == Data("victim".utf8))
-    #expect(await registry.isSealed)
+        name: Data("victim".utf8),
+        item: exact
+    ) == .positiveEviction)
+    await lease.cancel()
+    #expect(await registry.armedOperandCount() == 0)
 
     let next = try makePlan(
         authenticator: authenticator,
@@ -452,12 +467,11 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         path: try PfsMacOSRelativePath(components: []),
         sequence: 2
     )
-    await #expect(throws: PfsMacOSCoherenceError.repairRegistrySealed) {
-        _ = try await registry.arm(next)
-    }
+    let nextLease = try await registry.arm(next)
+    await nextLease.cancel()
 }
 
-@Test func aRolledBackTransactionLeavesNoTear() async throws {
+@Test func aCancelledUnconsumedPlanLeavesNoTear() async throws {
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let plan = try makePlan(
@@ -466,45 +480,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         path: try PfsMacOSRelativePath(components: [Data("victim".utf8)])
     )
     let lease = try await registry.arm(plan)
-    let operand = try #require(plan.operand)
-    try await registry.consume(
-        callback: .renameIntoOperand,
-        operand: operand,
-        sourceName: Data("victim".utf8),
-        parentIdentity: parentIdentity.bytes,
-        item: nil
-    )
-    try await registry.consume(
-        callback: .rollbackRename,
-        operand: operand,
-        sourceName: Data("victim".utf8),
-        parentIdentity: parentIdentity.bytes,
-        item: nil
-    )
     await lease.cancel()
-    #expect(await registry.tornRepairs().isEmpty)
-    #expect(await registry.isSealed == false)
-}
-
-@Test func rollbackIsNotAuthorizedBeforeTheIsolatingRename() async throws {
-    let authenticator = try makeAuthenticator()
-    let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
-    let plan = try makePlan(
-        authenticator: authenticator,
-        kind: .positiveEviction,
-        path: try PfsMacOSRelativePath(components: [Data("victim".utf8)])
-    )
-    _ = try await registry.arm(plan)
-    let operand = try #require(plan.operand)
-    await #expect(throws: PfsMacOSCoherenceError.repairCallbackOutOfOrder) {
-        try await registry.consume(
-            callback: .rollbackRename,
-            operand: operand,
-            sourceName: Data("victim".utf8),
-            parentIdentity: parentIdentity.bytes,
-            item: nil
-        )
-    }
 }
 
 @Test func aFullyConsumedTransactionFinishesAndReleasesTheOperand() async throws {
@@ -517,13 +493,25 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     )
     let lease = try await registry.arm(plan)
     let operand = try #require(plan.operand)
-    try await registry.consume(callback: .createScratch, operand: operand, sourceName: nil, parentIdentity: parentIdentity.bytes, item: nil)
-    try await registry.consume(callback: .removeOperand, operand: operand, sourceName: nil, parentIdentity: parentIdentity.bytes, item: nil)
+    try await registry.consume(
+        callback: .createScratch,
+        operand: operand,
+        parentIdentity: parentIdentity.bytes
+    )
+    try await registry.consume(
+        callback: .removeOperand,
+        operand: operand,
+        parentIdentity: parentIdentity.bytes
+    )
     try await lease.finish()
     #expect(await registry.armedOperandCount() == 0)
     // The name is now ordinary again — and therefore refused again.
     await #expect(throws: PfsMacOSCoherenceError.repairNotArmed) {
-        try await registry.consume(callback: .createScratch, operand: operand, sourceName: nil, parentIdentity: parentIdentity.bytes, item: nil)
+        try await registry.consume(
+            callback: .createScratch,
+            operand: operand,
+            parentIdentity: parentIdentity.bytes
+        )
     }
 }
 
@@ -553,6 +541,7 @@ private actor CountingBackend: PfsMacOSCoherenceBackend {
     nonisolated let policy = PfsMacOSCachePolicy.synchronousVFSRepairV1
     private(set) var repairs = 0
     func repair(_ event: PfsMacOSCoherenceEvent) async throws { repairs += 1 }
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async {}
     func count() -> Int { repairs }
 }
 
@@ -775,6 +764,7 @@ private actor CountingBackend: PfsMacOSCoherenceBackend {
 private struct PassthroughPublicationBarrier: PfsMacOSCallbackPublicationBarrier {
     func prepare(_ event: PfsMacOSCoherenceEvent) async throws {}
     func resume(_ event: PfsMacOSCoherenceEvent) async throws {}
+    func acknowledged(_ event: PfsMacOSCoherenceEvent) async {}
 }
 
 private struct UnusedRepairActuator: PfsMacOS26RepairActuator {
@@ -838,6 +828,324 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         .attributes(identity: unknown)
     ])
     #expect(repairs.isEmpty)
+}
+
+@Test func plannerCoalescesParentAttributesIntoItsNamespaceRepairRegardlessOfTargetOrder() async throws {
+    let (index, root, directory, _) = try await makeIndexFixture()
+    let rootItem = PortableFSItem(identity: .init(
+        itemID: 1,
+        generation: 1,
+        stableIdentity: root.bytes
+    ))
+    let directoryItem = PortableFSItem(identity: .init(
+        itemID: 2,
+        generation: 1,
+        stableIdentity: directory.bytes
+    ))
+    let live = PfsMacOSLiveObjectIndex()
+    try await live.record(item: rootItem, vfsFileID: 2)
+    try await live.record(item: directoryItem, vfsFileID: 3)
+    let planner = PfsMacOSRepairPlanner(index: index, liveObjects: live)
+
+    for targets: [PfsMacOSVisibilityTarget] in [
+        [
+            .namespace(parentIdentity: directory, name: Data("peer-created".utf8)),
+            .attributes(identity: directory),
+        ],
+        [
+            .attributes(identity: directory),
+            .namespace(parentIdentity: directory, name: Data("peer-created".utf8)),
+        ],
+    ] {
+        let repairs = try await planner.repairs(for: targets)
+        #expect(repairs.count == 1)
+        guard case let .purgeNegative(parent, parentIdentity, name) = repairs.first else {
+            Issue.record("expected the namespace repair to own its parent attribute refresh")
+            continue
+        }
+        #expect(parent.components == [Data("projects".utf8)])
+        #expect(parentIdentity == directory)
+        #expect(name == Data("peer-created".utf8))
+    }
+
+    // A different directory's attribute obligation is not coalesced merely
+    // because some namespace transaction exists in the event.
+    let distinct = try await planner.repairs(for: [
+        .namespace(parentIdentity: directory, name: Data("peer-created".utf8)),
+        .attributes(identity: root),
+    ])
+    #expect(distinct.count == 2)
+    guard case let .invalidateAttributesObject(_, identity) = distinct[1] else {
+        Issue.record("expected the unrelated root attribute repair to remain")
+        return
+    }
+    #expect(identity == root)
+}
+
+@Test func plannerNormalizesCompleteAuthorityMutationTargetShapes() async throws {
+    let (index, _, directory, file) = try await makeIndexFixture()
+    let planner = PfsMacOSRepairPlanner(index: index)
+    let oldName = Data("notes.txt".utf8)
+    let newName = Data("moved.txt".utf8)
+
+    // Unlink repeats the removed item through NAMESPACE and ATTRIBUTES. The
+    // exact same pathname surgery must run once, or the second rename addresses
+    // a binding the first repair already retired.
+    let unlink = try await planner.repairs(for: [
+        .namespace(parentIdentity: directory, name: oldName),
+        .attributes(identity: directory),
+        .attributes(identity: file),
+    ])
+    #expect(unlink.count == 1)
+    guard case let .evictBinding(unlinkPath, _, unlinkIdentity, _) = unlink.first else {
+        Issue.record("expected one canonical unlink eviction")
+        return
+    }
+    #expect(unlinkPath.name == oldName)
+    #expect(unlinkIdentity == file)
+
+    // Write/truncate carries DATA plus ATTRIBUTES for the same item. The data
+    // actuator's post-apply getattr owns the attribute refresh; following it
+    // with an eviction would address the name it just removed.
+    for targets: [PfsMacOSVisibilityTarget] in [
+        [.data(identity: file, size: 4096), .attributes(identity: file)],
+        [.attributes(identity: file), .data(identity: file, size: 4096)],
+    ] {
+        let write = try await planner.repairs(for: targets)
+        #expect(write.count == 1)
+        guard case let .invalidateData(_, _, identity, _, size) = write.first else {
+            Issue.record("expected one canonical data invalidation")
+            continue
+        }
+        #expect(identity == file)
+        #expect(size == 4096)
+    }
+
+    // Rename repeats both the parent and moved-item attribute obligations.
+    // Its two namespace edges are the complete minimal repair set.
+    let rename = try await planner.repairs(for: [
+        .namespace(parentIdentity: directory, name: oldName),
+        .namespace(parentIdentity: directory, name: newName),
+        .attributes(identity: directory),
+        .attributes(identity: directory),
+        .attributes(identity: file),
+    ])
+    #expect(rename.count == 2)
+    let renameKinds = rename.map { repair -> Int in
+        switch repair {
+        case .evictBinding: 1
+        case .purgeNegative: 2
+        default: 0
+        }
+    }
+    guard Set(renameKinds) == Set([1, 2]) else {
+        Issue.record("expected old-name eviction plus new-name negative purge")
+        return
+    }
+
+    // Link creation refreshes the parent through its new-name scratch, but the
+    // source inode's nlink change still needs one existing alias eviction.
+    let link = try await planner.repairs(for: [
+        .namespace(parentIdentity: directory, name: Data("linked.txt".utf8)),
+        .attributes(identity: directory),
+        .attributes(identity: file),
+    ])
+    #expect(link.count == 2)
+    guard case .purgeNegative = link[0], case .refreshAttributes = link[1] else {
+        Issue.record("expected link-name purge plus source-attribute refresh")
+        return
+    }
+}
+
+
+@Test func authorityPostBindingRepairsRetainedVNodeAfterRenameThenHardLink() async throws {
+    let (index, _, directory, file) = try await makeIndexFixture()
+    let live = PfsMacOSLiveObjectIndex()
+    let item = PortableFSItem(identity: .init(
+        itemID: 77,
+        generation: 1,
+        stableIdentity: file.bytes
+    ))
+    try await live.record(
+        item: item,
+        vfsFileID: 41,
+        itemKind: .file
+    )
+    let planner = PfsMacOSRepairPlanner(index: index, liveObjects: live)
+    let oldName = Data("notes.txt".utf8)
+    let renamed = Data("renamed.txt".utf8)
+
+    // The rename COMPLETE attests the moved identity at its destination. The
+    // old positive coordinate is still the current local binding while the
+    // plan is derived, so its exact eviction owns the immediate refresh.
+    let rename = try await planner.repairs(for: [
+        .namespace(parentIdentity: directory, name: oldName),
+        .namespacePost(
+            parentIdentity: directory,
+            name: renamed,
+            identity: file
+        ),
+        .attributes(identity: file),
+    ])
+    #expect(rename.contains { repair in
+        if case let .evictBinding(path, _, identity, _) = repair {
+            return path.name == oldName && identity == file
+        }
+        return false
+    })
+
+    // Model the successful positive-eviction callback: the old coordinate is
+    // deliberately forgotten and must never become a repair locator.
+    await index.forget(parentIdentity: directory, name: oldName)
+    #expect(await index.entries(for: file).isEmpty)
+    #expect(await index.repairLocatorEntries(for: file).isEmpty)
+
+    // A later hard-link carries the new coordinate plus the same inode's nlink
+    // obligation. The authority post-binding and retained vnode's published
+    // kind/file-ID together make the alias an inode-attested repair source.
+    let alias = Data("alias.txt".utf8)
+    let link = try await planner.repairs(for: [
+        .namespacePost(
+            parentIdentity: directory,
+            name: alias,
+            identity: file
+        ),
+        .attributes(identity: file),
+    ])
+    #expect(link.count == 1)
+    guard case let .refreshAttributes(
+        path,
+        parentIdentity,
+        identity,
+        expectedVFSFileID,
+        itemKind
+    ) = link.first else {
+        Issue.record("expected post-binding attribute refresh through the new alias")
+        return
+    }
+    #expect(path.name == alias)
+    #expect(parentIdentity == directory)
+    #expect(identity == file)
+    #expect(expectedVFSFileID == 41)
+    #expect(itemKind == .file)
+    #expect(path.name != oldName)
+}
+
+@Test func plannerDeduplicatesOnlyTheExactHardLinkCoordinate() async throws {
+    let (index, _, directory, file) = try await makeIndexFixture()
+    let alias = Data("other-notes.txt".utf8)
+    await index.record(
+        identity: file,
+        entry: .init(parentIdentity: directory, name: alias, vfsFileID: 41)
+    )
+    let planner = PfsMacOSRepairPlanner(index: index)
+    let repairs = try await planner.repairs(for: [
+        .namespace(parentIdentity: directory, name: Data("notes.txt".utf8)),
+        .attributes(identity: directory),
+        .attributes(identity: file),
+    ])
+
+    // The unlinked coordinate is repeated and collapses; the other hard-link
+    // alias is a distinct cache obligation and must remain.
+    #expect(repairs.count == 2)
+    let names = repairs.compactMap { repair -> Data? in
+        switch repair {
+        case let .evictBinding(path, _, _, _),
+             let .refreshAttributes(path, _, _, _, _):
+            return path.name
+        default:
+            return nil
+        }
+    }
+    #expect(Set(names) == Set([Data("notes.txt".utf8), alias]))
+}
+
+@Test func plannerNormalizationIsOrderIndependentAndRejectsConflictingDataTruth() async throws {
+    let (index, _, directory, file) = try await makeIndexFixture()
+    let planner = PfsMacOSRepairPlanner(index: index)
+    let targets: [PfsMacOSVisibilityTarget] = [
+        .namespace(parentIdentity: directory, name: Data("notes.txt".utf8)),
+        .namespace(parentIdentity: directory, name: Data("notes.txt".utf8)),
+        .attributes(identity: directory),
+        .attributes(identity: file),
+        .attributes(identity: file),
+    ]
+    let forward = try await planner.repairs(for: targets)
+    let reverse = try await planner.repairs(for: Array(targets.reversed()))
+    #expect(forward == reverse)
+    #expect(forward.count == 1)
+
+    await #expect(throws: PfsMacOSCoherenceError.invalidVisibilityTarget) {
+        _ = try await planner.repairs(for: [
+            .data(identity: file, size: 1),
+            .data(identity: file, size: 2),
+        ])
+    }
+}
+
+@Test func plannerNeverAcknowledgesAKnownButUnpathableCachedTarget() async throws {
+    let root = try PfsMacOSStableIdentity(Data(repeating: 0x41, count: 16))
+    let missingAncestor = try PfsMacOSStableIdentity(Data(repeating: 0x42, count: 16))
+    let directory = try PfsMacOSStableIdentity(Data(repeating: 0x43, count: 16))
+    let file = try PfsMacOSStableIdentity(Data(repeating: 0x44, count: 16))
+    let index = PfsMacOSNamespaceIndex(rootIdentity: root)
+    await index.record(
+        identity: directory,
+        entry: .init(parentIdentity: missingAncestor, name: Data("detached".utf8), vfsFileID: 7)
+    )
+    await index.record(
+        identity: file,
+        entry: .init(parentIdentity: directory, name: Data("cached".utf8), vfsFileID: 8)
+    )
+    let planner = PfsMacOSRepairPlanner(index: index)
+
+    await #expect(throws: PfsMacOSCoherenceError.cachedTargetUnrepresentable) {
+        _ = try await planner.repairs(for: [
+            .namespace(parentIdentity: directory, name: Data("cached".utf8)),
+        ])
+    }
+    await #expect(throws: PfsMacOSCoherenceError.cachedTargetUnrepresentable) {
+        _ = try await planner.repairs(for: [.attributes(identity: file)])
+    }
+}
+
+@Test func rootAttributeTargetWithoutARepresentableRepairFailsClosed() async throws {
+    let root = try PfsMacOSStableIdentity(Data(repeating: 0x4A, count: 16))
+    let index = PfsMacOSNamespaceIndex(rootIdentity: root)
+    let planner = PfsMacOSRepairPlanner(index: index)
+
+    await #expect(throws: PfsMacOSCoherenceError.cachedTargetUnrepresentable) {
+        _ = try await planner.repairs(for: [.attributes(identity: root)])
+    }
+}
+
+@Test func plannerCoverageComesOnlyFromRepairsThatRemainSelected() async throws {
+    let (index, root, directory, file) = try await makeIndexFixture()
+    let live = PfsMacOSLiveObjectIndex()
+    let rootItem = PortableFSItem(identity: .init(
+        itemID: 1,
+        generation: 1,
+        stableIdentity: root.bytes
+    ))
+    try await live.record(item: rootItem, vfsFileID: 2)
+    let planner = PfsMacOSRepairPlanner(index: index, liveObjects: live)
+
+    let repairs = try await planner.repairs(for: [
+        .attributes(identity: root),
+        .attributes(identity: directory),
+        .attributes(identity: file),
+    ])
+    // The deepest file eviction refreshes the directory, so the directory's
+    // own eviction is removed. Because that removed repair never mutates root,
+    // root's independently cached object obligation must remain.
+    #expect(repairs.count == 2)
+    #expect(repairs.contains { if case .refreshAttributes = $0 { true } else { false } })
+    #expect(repairs.contains { repair in
+        if case let .invalidateAttributesObject(_, identity) = repair {
+            return identity == root
+        }
+        return false
+    })
 }
 
 @Test func openObjectsOnBothMountsSurviveUnlinkAndPlanNativeDataAndAttributeRepair() async throws {
@@ -941,6 +1249,11 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         phase: .complete,
         initiator: peerInitiator,
         repairs: [
+            .purgeNegative(
+                parent: try PfsMacOSRelativePath(components: []),
+                parentIdentity: parentIdentity,
+                name: Data("must-not-run".utf8)
+            ),
             .invalidateDataObject(
                 object: .init(item: item, vfsFileID: 71),
                 itemIdentity: itemIdentity,
@@ -969,7 +1282,7 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         )
     ])
     #expect(repairs.count == 1)
-    guard case let .evictBinding(path, parent, identity) = repairs[0] else {
+    guard case let .evictBinding(path, parent, identity, _) = repairs[0] else {
         Issue.record("expected a binding eviction")
         return
     }

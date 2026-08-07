@@ -14,6 +14,19 @@ message Request {
   bytes epoch = 2; // 16 bytes after Hello/Attach
   SessionProof session = 3;
   Mutation mutation = 4; // required on mutating bodies
+  // Opaque logical publication/callback identity assigned by the filesystem
+  // frontend. A nonzero value lets CALLBACK_SERIALIZED_PIPELINED scheduling
+  // distinguish a later callback from another mutation issued by the initiating
+  // callback.
+  // Zero means unknown and preserves the fail-safe interruption rule. This is
+  // scheduling metadata only: it grants no authority and is not a replay ID.
+  uint64 frontend_operation_id = 5;
+  // Per-request frontend progress proof. True means this ordered mutation is
+  // from an ordered-only callback which the frontend will exclude from the
+  // drain of a distinct own-source visibility phase. False is fail-safe and
+  // requires definite pre-apply interruption while such a phase is pending.
+  // This is scheduling metadata only and grants no authority.
+  bool source_phase_queueable = 6;
 
   oneof body {
     HelloRequest hello = 10;
@@ -129,6 +142,13 @@ enum FailureClass {
   // routing topology. It is neither a storage failure nor a cache-coherence
   // failure: the volume is healthy and this mount's configuration is wrong.
   FAILURE_CLASS_ROUTES = 4;
+  // VISIBILITY_INTERRUPTED is a definite pre-apply refusal issued so a
+  // callback-serialized participant can release the execution lane needed by
+  // its pending repair. Linux consumes the accompanying EINTR directly. An
+  // policy-v2 FSKit frontend must translate the classified refusal to
+  // ECANCELED because macOS 26 may transparently re-enter a mutating callback
+  // after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
+  FAILURE_CLASS_VISIBILITY_INTERRUPTED = 5;
 }
 
 // RoutesMismatch names both sides of a routing-topology disagreement. All
@@ -298,10 +318,27 @@ enum CoherenceProfile {
 // operation can hold. A frontend may only declare it if that is true of its
 // kernel; there is no default, because guessing wrong turns a proven cycle into
 // an unbounded hang.
+//
+// CALLBACK_SERIALIZED is macOS 26 FSKit synchronous VFS repair. Repair enters
+// the same framework callback execution capacity that an unanswered ordered
+// mutation can occupy, even when the mutation and repair name disjoint
+// directories. While this participant owes a visibility phase, the authority
+// therefore interrupts its later visible mutations before they execute instead
+// of parking them behind the phase they would prevent it from repairing.
+//
+// CALLBACK_SERIALIZED_PIPELINED is the identity-aware current macOS 26
+// contract. Peer phases and mutations from the initiating callback retain the
+// interruption rule. A distinct nonzero frontend_operation_id may queue behind
+// an own-source phase only when that exact request also carries
+// source_phase_queueable: the frontend then excludes the already-dispatched
+// ordered-only callback from source PREPARE's drain. Mixed callbacks and zero
+// identities stay fail-safe and are interrupted before apply.
 enum NamespaceRepair {
   NAMESPACE_REPAIR_UNSPECIFIED = 0;
   NAMESPACE_REPAIR_PARENT_EXCLUSIVE = 1;
   NAMESPACE_REPAIR_INDEPENDENT = 2;
+  NAMESPACE_REPAIR_CALLBACK_SERIALIZED = 3;
+  NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED = 4;
 }
 
 enum VisibilityPhase {
@@ -337,6 +374,10 @@ message VisibilityTarget {
   uint64 kernel_ino = 6;        // attr inode of the data/attributes target
   uint64 parent_kernel_ino = 7; // attr inode of the namespace target's parent
   fixed64 device = 8;           // major<<32 | minor of the one backing filesystem
+  // Exact post-mutation owner of a namespace coordinate when authority can
+  // attest it. Empty for absent/unknown postconditions and for non-namespace
+  // scopes; unlike dependency metadata, this association is safe to actuate.
+  bytes post_identity = 9;
 }
 
 // RoutesChange makes a two-phase event say "this is a routing-topology change"
@@ -388,12 +429,12 @@ message ApplyRoutesReply {
 message NextVisibilityRequest { VisibilityCursor after = 1; }
 message AckVisibilityRequest {
   VisibilityCursor cursor = 1;
-  // blocked is a frontend saying it cannot service this phase, because doing so
-  // would wait on a kernel lock its own unanswered request to this authority
-  // holds. It is a report, not a request for more time: the authority fences
-  // this participant immediately, which is the same outcome its repair budget
-  // would eventually produce and is reached without stopping every other
-  // mount's mutations for the length of that budget.
+  // blocked is a frontend saying it cannot yet service this phase because an
+  // exact namespace repair needs a parent lock its own unanswered request to
+  // this authority holds. For an ordinary parent-exclusive COMPLETE, the
+  // authority installs a cursor+parent-scoped pre-apply interruption. The
+  // frontend drains the refused request, performs repair, and acknowledges the
+  // same phase without losing the mount. A routes change remains terminal.
   //
   // Only the frontend can evaluate this. It needs BOTH that the mount has an
   // unanswered namespace mutation in the affected parent - which the authority
@@ -402,9 +443,22 @@ message AckVisibilityRequest {
   // filter with no false negatives and therefore many false positives. A mount
   // that has nothing cached to repair must acknowledge normally.
   //
-  // The authority verifies the half it can see and treats an unsupported claim
-  // as a cursor violation, so this cannot be used to skip a repair.
+  // The authority maps every reported inode through this exact pending event
+  // and enforces the interruption when the corresponding ordinary request is
+  // present or later arrives. This report never acknowledges the phase, so it
+  // cannot be used to skip repair; the ordinary phase deadline remains the
+  // fail-closed bound if the lock does not drain.
   bool blocked = 2;
+  // Exact parent coordination inodes whose cached bindings require reverse
+  // invalidation. The authority maps each one back to this pending event's
+  // stable parent identity before installing an interruption. Required for an
+  // ordinary namespace blocked report; empty for a terminal routes report.
+  repeated uint64 blocked_parent_kernel_inos = 3;
+  // Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
+  // pipelined frontend sets it when peer repair refused at least one otherwise
+  // queueable ordered callback before that exact Ack. It never acknowledges a
+  // blocked phase and cannot exempt a mutation from ordinary eligibility.
+  bool ordered_admission_contended = 4;
 }
 
 message LookupRequest { bytes parent = 1; bytes name = 2; }

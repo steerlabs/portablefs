@@ -492,61 +492,36 @@ func (c *coherence) apply(ctx context.Context, event *authoritypb.VisibilityEven
 				return err
 			}
 		}
-		directory, blocked, err := c.mount.raw.blockedRepair(event.GetTargets(), self)
+		completion, blocked, err := c.mount.raw.beginVisibilityComplete(event.GetTargets(), self)
 		if err != nil {
 			return err
 		}
 		if blocked {
-			return c.reportBlocked(ctx, event, directory)
+			// The gate is already closed, so this report is not speculative: an
+			// admitted callback holds a parent for which this frontend has exact
+			// cached-name repair work. The authority refuses those overlapping
+			// requests before apply; this mount then drains them and continues.
+			if err := c.mount.rpc.ReportVisibilityBlocked(ctx, event.GetCursor(), completion.parentKernelInos); err != nil {
+				return fmt.Errorf("fusev3: authority could not interrupt an overlapping namespace mutation for visibility repair: %w", err)
+			}
 		}
-		return c.mount.raw.completeVisibility(event.GetTargets(), self)
+		return c.mount.raw.finishVisibilityComplete(ctx, completion)
 	default:
 		return fmt.Errorf("fusev3: visibility event %d carried no phase", event.GetCursor().GetSequence())
 	}
 }
 
-// reportBlocked tells the authority that this mount provably cannot service the
-// phase it is holding, and then stops being a filesystem.
-//
-// The report replaces the acknowledgment rather than joining it -- it IS the
-// acknowledgment, carrying `blocked` -- so this returns an error, which ends the
-// visibility loop and revokes the mount. That is not a consolation prize: the
-// mount revokes immediately instead of spending the rest of its declared
-// repair budget serving names it can no longer take back. The authority keeps
-// the current mutation's obligation for its separate full fencing grace; this
-// report does not collapse that safety window.
-//
-// A failure to deliver the report is not recovered from either. The mount is
-// already in the one state it cannot serve from, so the only question is which
-// message the operator gets, and the original cause is the useful one.
-func (c *coherence) reportBlocked(ctx context.Context, event *authoritypb.VisibilityEvent, directory string) error {
-	return c.reportUnservable(ctx, event, blockedRepairCause(directory))
-}
-
 // reportUnservable delivers the blocked report for any terminal condition —
-// a provably unserviceable repair, or a routing revision this mount cannot
-// adopt — and returns the cause the mount revokes with. The report replaces
+// currently a routing revision this mount cannot adopt — and returns the cause
+// the mount revokes with. The report replaces
 // the acknowledgment (it IS the acknowledgment, carrying `blocked`), so the
 // authority discharges this participant's phase immediately instead of
 // waiting out the declared repair budget.
 func (c *coherence) reportUnservable(ctx context.Context, event *authoritypb.VisibilityEvent, cause error) error {
-	if err := c.mount.rpc.ReportVisibilityBlocked(ctx, event.GetCursor()); err != nil && ctx.Err() == nil {
+	if err := c.mount.rpc.ReportVisibilityBlocked(ctx, event.GetCursor(), nil); err != nil && ctx.Err() == nil {
 		return errors.Join(cause, fmt.Errorf("fusev3: the authority did not accept this mount's report that it cannot repair: %w", err))
 	}
 	return cause
-}
-
-// blockedRepairCause is the message a mount dies with when its own unanswered
-// namespace mutation is what stops it repairing.
-//
-// It names the directory, which is the whole reason the frontend is the party
-// that reports: the authority sees the parked mutation but knows the directory
-// only as a coordination identity, and it cannot see whether this mount holds
-// the binding at all. Only here are both facts -- the path, and what is actually
-// cached -- in one place.
-func blockedRepairCause(directory string) error {
-	return fmt.Errorf("fusev3: this mount cannot invalidate a cached name in %s while its own namespace operation in that directory is still waiting for the authority; making a binding unservable takes the directory's i_rwsem for write and that syscall holds it, so this mount reported itself blocked and has revoked itself -- unmount and mount again",
-		directory)
 }
 
 // visibilityKeys is one event's target set translated into this frontend's own
@@ -684,79 +659,6 @@ func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKe
 	}
 }
 
-// blockedRepair reports the namespace repair in this COMPLETE that this mount
-// provably cannot make, if there is one.
-//
-// Two facts have to be true together, and this is the only place in the system
-// where both are known:
-//
-//  1. This mount has an unanswered namespace mutation of its own in the parent
-//     directory the repair names. That syscall holds the parent's i_rwsem for
-//     write across the whole authority round trip, and
-//     fuse_reverse_inval_entry takes the same semaphore, unconditionally, with
-//     no trylock anywhere in fs/fuse. The authority can see this half too: it
-//     knows which of its sessions are parked and in which directories.
-//  2. This mount actually holds a cached binding this phase names. The
-//     authority cannot see this half at all. Its audience comes from a monotone
-//     filter with no false negatives, so it is full of false positives -- a
-//     mount is in the audience for names it may never have resolved. Guessing
-//     from that side would fence mounts that could have repaired perfectly
-//     well.
-//
-// Anything short of both is not reportable, and this returns false:
-//
-//   - a phase with only data or attribute targets, because
-//     fuse_reverse_inval_inode takes no parent lock and a parked mount can
-//     always service it;
-//   - a name this mount never cached, because there is nothing to invalidate;
-//   - a name in a directory this mount is not parked in, because the lock is
-//     free;
-//   - this mount's own mutation, which repairs nothing by construction.
-//
-// The default is to say nothing. Not reporting is always safe -- the bound is
-// then the repair budget this mount declared -- and the authority treats an
-// unsupported report as a cursor violation, so a speculative one is worse than
-// silence.
-func (r *rawFileSystem) blockedRepair(targets []*authoritypb.VisibilityTarget, self bool) (string, bool, error) {
-	if self || r.profile != CoherenceStrict {
-		return "", false, nil
-	}
-	keys, err := r.translate(targets)
-	if err != nil {
-		return "", false, err
-	}
-	if len(keys.names) == 0 {
-		return "", false, nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.parked) == 0 {
-		return "", false, nil
-	}
-	parked := make(map[uint64]*inodeRecord, len(r.parked))
-	for record := range r.parked {
-		parked[record.key.inode] = record
-	}
-	for _, key := range keys.names {
-		if r.cachedNames[key] == nil {
-			continue
-		}
-		record, held := parked[key.parent]
-		if !held {
-			continue
-		}
-		directory, ok := r.pathLocked(record)
-		switch {
-		case !ok:
-			directory = fmt.Sprintf("inode %d", key.parent)
-		case directory == "":
-			directory = "/"
-		}
-		return directory, true, nil
-	}
-	return "", false, nil
-}
-
 // repair is one kernel cache repair this frontend owes.
 type repair struct {
 	parent uint64
@@ -766,17 +668,100 @@ type repair struct {
 	data   bool
 }
 
-// completeVisibility repairs the affected kernel state and then reopens
-// admission. Targets are empty when the authority applied nothing, and the
-// phase is still required, because acknowledging it is what releases the
-// mutating machine.
-func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarget, self bool) error {
+// visibilityCompletion owns one COMPLETE's exact repair work and the parent
+// admission gates installed for its namespace notifications.
+type visibilityCompletion struct {
+	work             []repair
+	parents          map[uint64]struct{}
+	parentKernelInos []uint64
+}
+
+// beginVisibilityComplete resolves the event against the exact cache registry,
+// removes those entries from the registry, and closes parent admission in one
+// r.mu critical section. The returned boolean says that a callback was already
+// admitted in one of those exact parents and therefore needs the authority to
+// refuse its queued mutation before this frontend waits for it to drain.
+func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.VisibilityTarget, self bool) (visibilityCompletion, bool, error) {
 	keys, err := r.translate(targets)
 	if err != nil {
+		return visibilityCompletion{}, false, err
+	}
+	completion := visibilityCompletion{parents: make(map[uint64]struct{})}
+	r.mu.Lock()
+	if !self {
+		completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
+		for _, key := range keys.names {
+			record := r.cachedNames[key]
+			if record == nil {
+				continue
+			}
+			parent := r.directoryLocked(key.parent)
+			r.dropCachedNameLocked(key)
+			if parent == nil {
+				continue
+			}
+			completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name})
+			if _, already := completion.parents[key.parent]; !already {
+				completion.parents[key.parent] = struct{}{}
+				completion.parentKernelInos = append(completion.parentKernelInos, key.parent)
+			}
+		}
+		for _, inode := range keys.inodes {
+			record := r.byInodeLocked(inode)
+			if record != nil {
+				completion.work = append(completion.work, repair{inode: record.id, data: true})
+			}
+		}
+	}
+	for parent := range completion.parents {
+		r.repairingParents[parent]++
+	}
+	blocked := r.parkedOverlapLocked(completion.parents)
+	r.mu.Unlock()
+	return completion, blocked, nil
+}
+
+func (r *rawFileSystem) parkedOverlapLocked(parents map[uint64]struct{}) bool {
+	for record := range r.parked {
+		if _, overlap := parents[record.key.inode]; overlap {
+			return true
+		}
+	}
+	return false
+}
+
+// waitParkedParents waits on state transitions, not a timer. Progress comes from
+// the authority's definite pre-apply refusal of callbacks that won admission
+// before the gate. A callback arriving after the gate never parks at all.
+func (r *rawFileSystem) waitParkedParents(ctx context.Context, parents map[uint64]struct{}) error {
+	for {
+		r.mu.Lock()
+		if !r.parkedOverlapLocked(parents) {
+			r.mu.Unlock()
+			return nil
+		}
+		changed := r.parkedChanged
+		if changed == nil {
+			changed = make(chan struct{})
+			r.parkedChanged = changed
+		}
+		r.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("fusev3: visibility COMPLETE could not drain parent-exclusive callbacks: %w", ctx.Err())
+		}
+	}
+}
+
+// finishVisibilityComplete drains callbacks admitted before the gate, performs
+// the reverse notifications, then atomically reopens namespace and publication
+// admission. On failure both remain closed and the caller revokes the mount.
+func (r *rawFileSystem) finishVisibilityComplete(ctx context.Context, completion visibilityCompletion) error {
+	if err := r.waitParkedParents(ctx, completion.parents); err != nil {
 		return err
 	}
-	work := r.collectRepairs(keys, self)
-	for _, item := range work {
+	for _, item := range completion.work {
 		if err := r.applyRepair(item); err != nil {
 			// Admission stays closed on failure. The caller revokes this mount and,
 			// most importantly, must not acknowledge COMPLETE: a failed reverse
@@ -784,41 +769,37 @@ func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarg
 			return err
 		}
 	}
-	r.releaseHeld()
+	r.releaseComplete(completion.parents)
 	return nil
 }
 
-// collectRepairs resolves the affected identities against the exact set of
-// state this frontend published to its kernel. A binding this mount never
-// cached needs no notification, which is the whole reason the cached-name
-// registry is exact rather than an estimate.
-func (r *rawFileSystem) collectRepairs(keys visibilityKeys, self bool) []repair {
-	if self {
-		return nil
+// completeVisibility is retained as the direct, no-transport test seam. The
+// production path begins first so it can ask the authority to interrupt an
+// already-admitted overlap before finishing.
+func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarget, self bool) error {
+	completion, _, err := r.beginVisibilityComplete(targets, self)
+	if err != nil {
+		return err
 	}
+	return r.finishVisibilityComplete(context.Background(), completion)
+}
+
+func (r *rawFileSystem) releaseComplete(parents map[uint64]struct{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	work := make([]repair, 0, len(keys.names)+len(keys.inodes))
-	for _, key := range keys.names {
-		record := r.cachedNames[key]
-		if record == nil {
-			continue
+	for parent := range parents {
+		if r.repairingParents[parent]--; r.repairingParents[parent] <= 0 {
+			delete(r.repairingParents, parent)
 		}
-		parent := r.directoryLocked(key.parent)
-		r.dropCachedNameLocked(key)
-		if parent == nil {
-			continue
-		}
-		work = append(work, repair{parent: parent.id, child: record.id, name: key.name})
 	}
-	for _, inode := range keys.inodes {
-		record := r.byInodeLocked(inode)
-		if record == nil {
-			continue
-		}
-		work = append(work, repair{inode: record.id, data: true})
+	for _, key := range r.heldPhase.names {
+		delete(r.heldNames, key)
 	}
-	return work
+	for _, inode := range r.heldPhase.inodes {
+		delete(r.heldInodes, inode)
+	}
+	r.heldPhase = visibilityKeys{}
+	r.signalParkedLocked()
 }
 
 // applyRepair issues one reverse notification.

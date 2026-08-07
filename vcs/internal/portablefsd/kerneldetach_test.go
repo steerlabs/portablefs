@@ -1,10 +1,12 @@
 package portablefsd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -73,6 +75,38 @@ func TestKernelDetachReportsHelperFailureWithItsOutput(t *testing.T) {
 	}
 	if abandonedKernelDetach(err) {
 		t.Fatalf("a nonzero exit is a refusal, not an abandonment: %v", err)
+	}
+}
+
+func TestKernelDetachClassifiesOnlyExactCLocaleBusyRefusal(t *testing.T) {
+	for _, output := range []string{
+		"umount: /Volumes/pfs: Resource busy\n",
+		"umount(/Volumes/pfs): Resource busy -- try 'diskutil unmount'\n",
+	} {
+		busy := classifyKernelDetachHelperError(
+			"/Volumes/pfs",
+			errors.New("exit status 1"),
+			output,
+		)
+		if !errors.Is(busy, syscall.EBUSY) {
+			t.Fatalf("busy refusal was not classified as EBUSY: %v", busy)
+		}
+	}
+	for _, output := range []string{
+		"umount: /Volumes/Resource busy: Input/output error",
+		"umount: /Volumes/pfs: Input/output error",
+		"Resource busy but not an errno suffix",
+		"umount(/Volumes/other): Resource busy -- try 'diskutil unmount'",
+		"umount(/Volumes/pfs): Resource busy -- try 'diskutil unmount' plus noise",
+	} {
+		err := classifyKernelDetachHelperError(
+			"/Volumes/pfs",
+			errors.New("exit status 1"),
+			output,
+		)
+		if errors.Is(err, syscall.EBUSY) {
+			t.Fatalf("non-busy helper output was classified as EBUSY: %q", output)
+		}
 	}
 }
 

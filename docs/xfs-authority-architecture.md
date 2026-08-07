@@ -57,16 +57,19 @@ as proof. Nothing in this tree implements it, and the policy string that would
 select it fails closed.
 
 What ships on macOS today is an explicitly declared compatibility cache policy,
-`macos26-synchronous-vfs-repair-v1`, implementing the same local visibility
+`macos26-synchronous-vfs-repair-v2`, implementing the same local visibility
 interface through synthetic VFS repair. It is selected by name, validated on both
 sides, and refused if it does not match — never an automatic fallback, never a
 silent downgrade — and it does not change the authority, filesystem, or session
 architecture. It is composed and wired end to end: both client indexes, a real
-publication barrier, an installed repair gate, and data invalidation armed under
-exact one-shot provenance. It carries one known, exactly characterised residual
-race and a list of proofs that still require a live kernel. Both are in
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md), and neither
-is elided here.
+publication barrier, an installed repair gate, identity-aware callback-serialized
+authority ordering, and direct source, attribute, and data repair under exact
+provenance. Attribute refresh uses an authenticated no-op `fchmod` on the exact
+file or directory vnode; symlinks fail closed. Targeted attribute/data repair is
+live-proven. Four exactly characterised callback-coalescing limits and the open
+full breadth/fault matrix are recorded in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md); none is
+elided here.
 
 ## Source of truth
 
@@ -285,20 +288,35 @@ additional declared repair-budget grace, then discharged. That grace is
 load-bearing only when the frontend can prove that its old kernel cache became
 unservable before the grace ends. Linux does this by revoking published FUSE
 bindings and aborting the connection, after which every request on that mount
-fails `ENOTCONN`. macOS does not yet have that proof: the Swift watchdog
-terminates protocol participation and ends the session, but macOS 26 exposes no
-API that withdraws already-cached kernel state, and macOS 27's native transitions
-are unimplemented. On macOS the fencing grace therefore bounds the authority's
-obligation without bounding the stale window, and that is a stated deviation of
-the declared compatibility policy rather than an equivalence. Where a frontend
-does have the proof, a phase that first consumes its ordinary deadline costs at
-most two budgets rather than an unbounded volume outage, and later requests on
-the fenced mount must fail.
+fails `ENOTCONN`. macOS 26 uses an identity-checked `MNT_FORCE` watchdog. Live
+testing with cached bytes on a held descriptor proved that after daemon death
+the watchdog force-unmounted at about 10 seconds and every later `pread` failed
+`EIO`, inside the fencing grace. A kernel that refuses forced unmount past the
+grace remains the explicit residual. A phase that first consumes its ordinary
+deadline therefore costs at most two budgets rather than an unbounded volume
+outage, and later requests on the fenced mount must fail.
 
-A mount reports itself blocked before it revokes, and a routing change is a
-distinct event shape rather than an overloaded namespace target. Both exist so
-that a participant which cannot meet an obligation fences immediately and
-visibly, instead of burning its budget silently and being discovered late.
+Linux parent-exclusive repair breaks its one closed lock cycle without losing
+the mount. COMPLETE atomically closes admission only for parents with exact
+cached-name work. If a callback was admitted first, the frontend reports the
+exact parent coordination inode; the authority maps it through that pending
+event and returns definite-preapply `EINTR` only to an overlapping request. The
+callback releases `i_rwsem`, reverse invalidation completes, and the same mount
+acknowledges COMPLETE. A callback arriving after the gate is refused locally
+before an authority request. The interruption remains active through Ack, and
+stale or response-lost control replays cannot affect a later cursor.
+
+A routing change is different: releasing one parent lock cannot make a fixed
+mount topology adopt a new declaration. Its blocked report is therefore still
+terminal and revokes that participant immediately. Current production frontends revoke during route PREPARE and are fenced before
+the durable commit; a later commit failure does not resurrect them. The
+coordinator still sends the truthful reported active revision in COMPLETE to any
+future frontend that explicitly staged and ACKed PREPARE without leaving, but
+that path is not evidence that today's FUSE or FSKit mount survived. A definite
+pre-publication failure reports the old revision with `Applied=false`; a
+post-rename durability-uncertain failure reports the next revision with
+`Applied=true`. Fresh attaches use that reported active revision. The ordinary phase deadline remains the hard
+bound for every repair that does not drain.
 
 **Poison is reserved for authority-internal invariant violations** — a completion
 naming a coordinate PREPARE did not, a participant found holding two outstanding
@@ -317,13 +335,27 @@ The macOS 26 Swift implementation is composed into the production FSKit volume:
 the operations adapter maintains the namespace and live-object indexes, the
 publication barrier closes and reopens callback admission, and the repair gate is
 installed at resolve time so that a composition failure fails the mount rather
-than serving without coherence. Its synthetic hidden-rename and armed-truncate
-mechanism carries unforgeable one-shot provenance, but it retains a known
-residual coalescing and a set of live-kernel proofs that have not been run. It is
-a declared compatibility policy with a stated fidelity target, not exact
-coherence, and it is never selected as a fallback. The complete contract, the
-exact residual race, and the open gates are in
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
+than serving without coherence. Its identity-aware callback-serialized authority
+profile, direct exact-source removal, scratch repair, same-vnode attribute
+refresh, and held-vnode truncate carry unforgeable event-scoped provenance. The
+attribute path uses a no-op `fchmod` only after exact path, stable-item, kind, and
+projected-VFS-inode checks; the gate coalesces exact-item mode-only callbacks
+during the bounded actuator window and the adapter returns full authority
+attributes without emitting an authority
+mutation. Symlinks fail closed. Distinct repair locators are retained only after
+data invalidation, while authority still owns the exact pathname, and are
+invalidated at the next COMPLETE namespace target before planning. Positive
+eviction always forgets its old attested item/coordinate pair, including the
+already-absent path that emits no removal callback. Sequential actuation binds
+nameless attribute callbacks to one active hard-link plan rather than relying on
+pre-armed dictionary order. An unpathable object remains unsupported unless a
+later COMPLETE namespace target carries an authority-attested post-binding identity
+that can be matched to the retained mount-local vnode and inode projection. Four exact
+callback-coalescing limits, including a same-vnode mode-only setattr during
+armed attribute refresh, are declared. This
+is a bounded compatibility policy, not exact native equivalence, and it is never
+selected as a fallback. The complete contract and final live acceptance evidence
+are in [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 ## Machine-local routing
 
@@ -405,10 +437,20 @@ XFS attribute-fork blocks are
 Project quotas therefore cannot isolate user-xattr writes on a shared cell, and
 a PortableFS counter could not commit atomically with XFS. Launch does not
 expose `setxattr`: the Linux frontend and direct authority requests return
-`EOPNOTSUPP`. Read, list, and removal remain available for pre-existing
-portable `user.*` attributes. Writable xattrs require a future substrate with
-one kernel-enforced aggregate capacity boundary; they are not enabled by a
-per-inode limit or an in-memory counter.
+`EOPNOTSUPP`. Because authority protocol v3 makes `user-xattr-readonly` an exact
+Attach requirement, Linux rejects valid set modes locally without spending an
+RPC, replay sequence, or visibility transition. Read, list, and removal remain
+available for pre-existing portable `user.*` attributes. Writable xattrs
+require a future substrate with one kernel-enforced aggregate capacity boundary;
+they are not enabled by a per-inode limit or an in-memory counter.
+
+On macOS, resolve advertises the xattr family and independently declares xattr
+set unsupported. FSKit validates item/name/mode and refuses
+set/create/replace/upsert locally before emitting a daemon or ordered-mutation
+frame. Its internal refusal is `ENOTSUP` (45), but the FSKit xattr boundary
+exposes `EOPNOTSUPP` (102). XNU reserves 45 to request its AppleDouble `._*`
+fallback; returning 102 keeps XFS as the only durable truth. This local gate
+changes no successful daemon-forwarded read/list or pre-existing removal.
 
 The initial volume model is deliberately single-principal, like an agent's
 private workspace rather than a multi-user Unix server. Every XFS inode must be
@@ -518,26 +560,36 @@ something in the tree establishes it, and partial progress is stated as partial.
    verification command that corroborates a strict mount's kernel-absence claim,
    and clean detach fails closed when no command is configured. The frontend
    produces evidence-bearing detach to feed it.
+6. **Targeted macOS 26 attribute and data repair.** A real macOS 26.5 FSKit
+   mount and Linux FUSE peer against the XFS authority converged through a
+   `0755 -> 0700 -> 0755` mode cycle. Two hundred recursive `.git` traversals
+   during rapid Linux mode toggles reported zero mismatches and the mount stayed
+   healthy; 100 rapid data cycles reported zero size or content-hash mismatches.
+7. **Final macOS 26 breadth, saturation, and daemon-death run.** Bidirectional
+   namespace/data breadth, links, byte-invalid names, sparse I/O, xattrs, Git,
+   SQLite, and recursive macOS = Linux = raw-XFS manifests passed with zero
+   retries. Retry-free 4-by-50-per-side saturation verified every successful
+   prefix after bounded convergence and post-storm liveness. Killing the daemon
+   forced exact mount absence in 6.410 seconds, made a held descriptor return
+   `EIO`, and was followed by successful detach, remount, recovery smoke, and
+   clean FSKit/FUSE detach.
 
 **Open.**
 
-6. XFS comparison on repositories, package installs, compilers, metadata storms,
-   large I/O, sparse files, and concurrent mounts. The measurement tools exist;
-   no comparison has been published. See [performance.md](./performance.md).
-7. Live FSKit coherence on the target macOS, and the live macOS-to-Linux matrix.
-   Every gate is enumerated in
-   [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
-8. Frontend liveness proving that daemon freeze, an open-but-dead local event
-   socket, and authority partition make the exact kernel mount unservable before
-   the fencing grace expires. Linux revokes and aborts; macOS terminates
-   participation without withdrawing kernel cache state.
-9. File and directory sync fault tests over process kill, kernel crash, detach,
-   full disk, quota exhaustion, short writes, and injected `EIO`.
-10. Multi-tenant saturation tests proving bounded RAM and descriptors and fair
+8. Broader performance and soak comparison on package installs, compilers,
+   longer metadata storms, larger I/O, and more concurrent mounts. The final
+   correctness breadth report is published; this item is expansion rather than
+   a missing macOS 26 acceptance gate. See [performance.md](./performance.md).
+9. Frontend liveness fault expansion for daemon freeze, an open-but-dead local
+   event socket, and authority partition. Linux revoke/abort and macOS 26 forced
+   unmount are implemented; daemon-kill macOS revocation is live-proven.
+10. File and directory sync fault tests over process kill, kernel crash, detach,
+    full disk, quota exhaustion, short writes, and injected `EIO`.
+11. Multi-tenant saturation tests proving bounded RAM and descriptors and fair
     progress for unrelated volumes.
-11. Recovery drills from live EBS and locked backup with measured RTO/RPO, and
+12. Recovery drills from live EBS and locked backup with measured RTO/RPO, and
     the authority-restart drill against a live prior strict mount.
-12. A branchless XFS cell and runtime control plane that attests placement,
+13. A branchless XFS cell and runtime control plane that attests placement,
     exclusive-writer state, project and quota identity, endpoint identity, and
     authority epoch before issuing a mount grant — together with lost-response
     tests for idempotent grant creation and Attach, and saturated in-session

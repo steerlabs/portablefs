@@ -112,6 +112,7 @@ func (s *Server) handleMountRootHandoff(conn *net.UnixConn) {
 		refuse(err.Error())
 		return
 	}
+	defer closeMountRootFD(fd)
 	if _, _, err := conn.WriteMsgUnix([]byte{1}, mountRootRights(fd), nil); err != nil {
 		log.Printf("portablefsd: mount-root handoff send for %q: %v", ref, err)
 	}
@@ -120,13 +121,16 @@ func (s *Server) handleMountRootHandoff(conn *net.UnixConn) {
 // repairActuationPlan is the wire form of one macOS 26 repair actuation. All
 // names are base64 because filesystem names are bytes, not text.
 type repairActuationPlan struct {
-	// Kind is "scratch", "evict", or "invalidate".
+	// Kind is "scratch", "evict", "refresh", or "invalidate".
 	Kind string `json:"kind"`
 	// Parent is the repair target's parent directory as path components
 	// relative to the mount root.
 	Parent []string `json:"parent"`
 	// Name is the user-visible child name (empty for scratch).
 	Name string `json:"name,omitempty"`
+	// ItemKind is the authenticated immutable type of Name. It is required for
+	// evict/invalidate and absent for scratch.
+	ItemKind string `json:"itemKind,omitempty"`
 	// Operand is the HMAC-authenticated reserved name.
 	Operand string `json:"operand"`
 	// ExpectedFileID attests the isolated file's identity before truncation.
@@ -165,11 +169,15 @@ func (s *Server) handleRepairActuation(conn *net.UnixConn, reader *bufio.Reader,
 		refuse(err.Error())
 		return
 	}
+	defer closeMountRootFD(rootFD)
+	started := time.Now()
+	log.Printf("portablefsd: macOS repair actuation begin kind=%s parent_depth=%d", plan.Kind, len(plan.Parent))
 	if errnoValue, err := actuateRepair(rootFD, plan); err != nil {
-		log.Printf("portablefsd: repair actuation for %q failed: %v", ref, err)
+		log.Printf("portablefsd: repair actuation for %q failed after %s: %v", ref, time.Since(started), err)
 		answer(0, errnoValue)
 		return
 	}
+	log.Printf("portablefsd: macOS repair actuation end kind=%s elapsed=%s", plan.Kind, time.Since(started))
 	answer(1, 0)
 }
 
@@ -188,7 +196,7 @@ func (a *attach) bindMountRoot() error {
 		return err
 	}
 	a.mu.Lock()
-	if a.mountRootFD > 0 {
+	if a.mountRootBound {
 		previous := a.mountRootFD
 		a.mountRootFD = fd
 		a.mu.Unlock()
@@ -196,16 +204,37 @@ func (a *attach) bindMountRoot() error {
 		return nil
 	}
 	a.mountRootFD = fd
+	a.mountRootBound = true
 	a.mu.Unlock()
 	return nil
 }
 
+// mountRootDescriptor returns an owned duplicate. Repair actuation can overlap
+// terminal teardown; sharing the raw owner integer let a concurrent close and
+// descriptor reuse redirect an in-flight repair at an unrelated file. Taking
+// the duplicate while holding a.mu makes owner retirement atomic with lease
+// acquisition. The caller must close the result.
 func (a *attach) mountRootDescriptor() (int, error) {
 	a.mu.RLock()
+	defer a.mu.RUnlock()
 	fd := a.mountRootFD
-	a.mu.RUnlock()
-	if fd <= 0 {
+	if !a.mountRootBound {
 		return 0, errors.New("mount root is not bound; the mount was never proven healthy")
 	}
-	return fd, nil
+	return duplicateMountRootFD(fd)
+}
+
+// releaseMountRoot retires the attach-owned descriptor exactly once. Existing
+// repair calls keep their owned duplicates; later calls cannot acquire one.
+func (a *attach) releaseMountRoot() {
+	a.mu.Lock()
+	if !a.mountRootBound {
+		a.mu.Unlock()
+		return
+	}
+	fd := a.mountRootFD
+	a.mountRootFD = 0
+	a.mountRootBound = false
+	a.mu.Unlock()
+	closeMountRootFD(fd)
 }

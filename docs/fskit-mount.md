@@ -16,10 +16,11 @@ What is proven differs by layer, and this document is explicit about the
 boundary. The credential shape, the daemon-owned authority session, the kernel
 mount scheme, and the unmount transaction are implemented and tested here. The
 kernel-cache half is composed and wired — both client indexes, a real publication
-barrier, the installed repair gate, and armed data invalidation — but it runs
-under an explicitly declared compatibility cache policy with a stated fidelity
-target, one known residual race, and a set of proofs that still require a live
-kernel. `VolumeCore` admits exactly that declared policy and fails `ENOTSUP` on
+barrier, identity-aware callback-serialized authority ordering, the installed
+repair gate, and direct source/data repair — and targeted behavior is live-proven. It runs under
+an explicitly declared compatibility cache policy with a stated fidelity target
+and two exact callback-coalescing limits. `VolumeCore` admits exactly that
+declared policy and fails `ENOTSUP` on
 any other, including the macOS 27 native one. Every open gate is enumerated in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md). Read that
 document before treating a Mac as a shared-write peer.
@@ -118,12 +119,15 @@ The command then behaves like every `portablefs mount`: it returns only after
 the kernel reports the exact mount present and a real root enumeration succeeds,
 then daemonizes (state under `~/.local/state/portablefs/mounts/`).
 `portablefs umount` invokes one daemon-owned `POST /v1/attaches/{ref}/unmount`
-transaction. That request freezes every frontend and control admission,
-completes the final authority barrier, durably records the prepared detach,
-proves the exact `dev.portablefs.oss://<attachRef>` kernel mount, unmounts it
-in-process, and only then durably removes the attach. A failure preserves the
-attach and its exact recovery evidence; no second delete or path-based unmount
-can mutate one side of the boundary without the other. `DELETE
+transaction. For authority-v3 it begins planned detach, proves the exact
+`dev.portablefs.oss://<attachRef>` kernel mount, and issues a normal kernel
+unmount. That pass runs FSKit synchronize; the daemon accepts only success or
+exact `EBUSY` after synchronization, which authorizes the forced vnode-revocation
+pass required for PortableFS's retained repair-root descriptor. It then proves
+mount-table absence, delivers that evidence to the authority, and only then
+removes the local attach. A failure preserves the attach and its exact recovery
+evidence; no second delete or path-based unmount can mutate one side of the
+boundary without the other. `DELETE
 /v1/attaches/{ref}` is refused for that reason — it cannot prove exact kernel
 teardown.
 
@@ -147,7 +151,7 @@ The attach declares, and the authority validates:
 
 | field | value | meaning |
 |---|---|---|
-| cache policy | `macos26-synchronous-vfs-repair-v1` | the declared macOS 26 compatibility cache policy (`vcs/internal/portablefsd/v3coherence.go`) |
+| cache policy | `macos26-synchronous-vfs-repair-v2` | the current declared macOS 26 compatibility cache policy (`vcs/internal/portablefsd/v3coherence.go`) |
 | cached-name capacity | 65536 | the bound on directory bindings this mount may hold cached (`mountv3.CachedNameCapacity`) |
 | repair budget | 15s | the per-phase deadline the mount commits to before the authority may consider it blocked (`mountv3.RepairBudget`) |
 | routes revision | the empty rule set's revision | see [Machine-Local Dirs](#machine-local-dirs) |
@@ -267,9 +271,11 @@ keep synchronized.
 
 ## Write Path
 
-There is no write-back cache and no write-mode knob. `write(2)` returns after
-the authority has applied the bytes to XFS; `fsync` waits for the authoritative
-server descriptor. Nothing is buffered on the Mac on the volume's behalf, so:
+There is no PortableFS-managed or offline write-back layer and no write-mode
+knob. macOS still has its ordinary kernel page cache: `write(2)` may return when
+that cache accepts bytes, before FSKit sends them to the daemon. `fsync`, FSKit
+synchronize, and normal unmount wait through the authoritative server
+descriptor. PortableFS itself buffers no durable tail on the Mac, so:
 
 - there is no local WAL, no flush interval, no group-sync window, and no
   unshipped tail that could be lost with the machine;
@@ -279,10 +285,11 @@ server descriptor. Nothing is buffered on the Mac on the volume's behalf, so:
 - `POST /v1/attaches/{ref}/sync` is exactly the authority's own `SyncVolume`
   (backed by `syncfs(2)` on the authority host). Success means the authority has
   made this volume durable, and the reply's pending counters are structurally
-  zero — there is never a backlog to report. `portablefs umount` runs it before
-  the kernel unmount;
-- `portablefs umount --force` therefore has nothing to park. It gives up on
-  proving the drain, not on data the Mac was still holding.
+  zero — there is never a PortableFS-managed backlog to report. A normal kernel
+  unmount reaches this boundary through FSKit synchronize;
+- `portablefs umount --force` has no PortableFS tail to park, but it deliberately
+  skips the trustworthy kernel synchronize pass. It is a revocation path, not a
+  durability claim.
 
 This is what makes a mounted path a safe handoff point between machines without
 an explicit barrier discipline: an acknowledged write is already the volume's
@@ -292,6 +299,20 @@ pointer at this model.
 The cost side is equally plain: every mutation is a round trip to the authority,
 so latency to the authority is the write latency. See
 [performance.md](./performance.md).
+
+## Extended Attributes
+
+The production XFS authority exposes a deliberately read-only portable xattr
+surface: read/list and removal of pre-existing portable `user.*` attributes are
+real authority operations, while set is refused because XFS attribute-fork
+blocks are outside project-quota accounting. Linux receives `EOPNOTSUPP`
+directly. The production pfslocal resolve advertises `xattrs=true` and
+`xattr_set_supported=false`; macOS validates the item and name and refuses
+set/create/replace/upsert locally without emitting a daemon mutation. The FSKit
+boundary returns Darwin's distinct `EOPNOTSUPP` (102) instead of internal
+`ENOTSUP` (45), because XNU uses 45 to trigger AppleDouble `._*` emulation.
+PortableFS never permits that fallback; XFS remains the single durable
+representation. Read/list/removal continue to forward to the daemon.
 
 ## Machine-Local Dirs
 
@@ -434,7 +455,8 @@ the real one. One transport per platform keeps authority ordering uniform.
 
 Two framework boundaries stay explicit rather than being papered over. FSKit on
 macOS 26 exposes no general kernel-cache invalidation primitive, which is why
-the cache half of the contract is a release gate and not a claim
+the cache half uses the declared identity-aware callback-serialized
+compatibility contract and publishes its exact coalescing limits rather than claiming native equivalence
 ([macos-26-coherence-contract.md](./macos-26-coherence-contract.md)). And
 current FSKit write callbacks do not expose `O_APPEND` intent, so cross-machine
 atomic append cannot be inferred without misclassifying legitimate positional

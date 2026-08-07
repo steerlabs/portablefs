@@ -4,8 +4,8 @@ package fusev3
 
 import (
 	"context"
-	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -13,36 +13,35 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-// Reporting a repair this mount cannot make.
+// Draining a parent-exclusive callback before repair.
 //
 // The condition is a genuine cycle: a peer's COMPLETE needs a name invalidated
 // in directory D, invalidating a name takes D's i_rwsem for write, and one of
 // this mount's own namespace syscalls is holding that semaphore while it waits
-// for the authority to order it. Nobody can break it from inside -- the syscall
-// is waiting on the authority, the authority is waiting on this repair.
+// for the authority to order it. COMPLETE breaks that cycle at its only clean
+// edge: it closes local admission, asks the authority to refuse the already-
+// admitted operation before apply, drains it, and then notifies the kernel.
 //
 // The authority cannot decide it alone. It sees the parked mutation, but its
 // audience index is a monotone filter with no false negatives and therefore many
 // false positives, so it cannot tell whether this mount holds the named binding
 // at all; deciding from that half would fence mounts that could have repaired.
-// This frontend holds both facts, so this frontend reports -- and only when both
-// are true, because the authority treats an unsupported report as a cursor
-// violation, and because saying nothing is always safe: the bound is then the
-// repair budget this mount declared.
+// This frontend holds both facts, so only it can arm the exact parent scope. A
+// false-positive audience match therefore neither interrupts an operation nor
+// fences a mount.
 
 // blockedFixture is a strict frontend with one namespace mutation parked in a
 // named directory, which is condition (1) of a reportable phase.
 type blockedFixture struct {
 	*strictFixture
-	// directory is the volume-relative path of the parked directory, and
-	// parentInode is the coordination inode a visibility target names it by.
-	directory   string
+	// parentInode is the coordination inode a visibility target names the parked
+	// directory by.
 	parentInode uint64
-	nodeID      uint64
 	// release lets the parked mutation finish. Every test defers it so the
 	// mount tears down cleanly rather than leaving a goroutine on a dead
 	// authority.
 	release func()
+	status  <-chan fuse.Status
 }
 
 // newBlockedFixture resolves whatever the test needs cached, THEN parks a
@@ -74,11 +73,12 @@ func newBlockedFixture(t *testing.T, directory string, budget time.Duration, pre
 	f.rpc.mu.Lock()
 	f.rpc.block = block
 	f.rpc.mu.Unlock()
-	done := make(chan struct{})
+	done := make(chan fuse.Status, 1)
+	finished := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(finished)
 		out := &fuse.EntryOut{}
-		f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "child", out)
+		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "child", out)
 	}()
 	waitFor(t, "the directory mutation to park in the authority", func() bool {
 		return len(f.raw.parkedDirectories()) != 0
@@ -89,10 +89,11 @@ func newBlockedFixture(t *testing.T, directory string, budget time.Duration, pre
 
 	var once sync.Once
 	return &blockedFixture{
-		strictFixture: f, directory: directory, parentInode: parentInode, nodeID: parent.NodeId,
+		strictFixture: f, parentInode: parentInode,
+		status: done,
 		release: func() {
 			once.Do(func() { close(block) })
-			<-done
+			<-finished
 		},
 	}
 }
@@ -109,12 +110,9 @@ func (f *blockedFixture) acks() int {
 	return len(f.rpc.acked)
 }
 
-// (a) the genuine cycle
+// (a) an admitted callback in the exact repair parent is interrupted, not fenced
 
-func TestACompleteThisMountCannotRepairIsReportedAndEndsTheSession(t *testing.T) {
-	// A budget far longer than this test will wait. If the mount reached the
-	// fenced state by letting the budget expire instead of by reporting, the
-	// assertions below would time out rather than pass.
+func TestACompleteInterruptsTheOverlappingOperationAndRepairs(t *testing.T) {
 	const budget = 5 * time.Minute
 	// The binding the peer's COMPLETE names is one this mount really did cache,
 	// in the very directory its own mkdir goes on to hold.
@@ -122,40 +120,251 @@ func TestACompleteThisMountCannotRepairIsReportedAndEndsTheSession(t *testing.T)
 		f.lookup(t, parentNodeID, "victim")
 	})
 	defer f.release()
+	f.rpc.mu.Lock()
+	f.rpc.onBlocked = func() {
+		f.rpc.mu.Lock()
+		f.rpc.mkdirFailure = syscall.EINTR
+		f.rpc.mu.Unlock()
+		f.release()
+	}
+	f.rpc.mu.Unlock()
 
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(f.parentInode, "victim")}
 	f.rpc.events <- visibilityEvent(1, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE, testPeerSession, targets...)
 	f.rpc.events <- visibilityEvent(1, authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE, testPeerSession, targets...)
 
-	started := time.Now()
-	waitFor(t, "the mount to report that it cannot repair", func() bool { return len(f.reports()) == 1 })
-	if elapsed := time.Since(started); elapsed > budget/10 {
-		t.Fatalf("the report took %s of a %s budget; a blocked frontend must revoke immediately even though the authority retains the current obligation for its fencing grace", elapsed, budget)
-	}
+	waitFor(t, "the mount to request a pre-apply cycle break", func() bool { return len(f.reports()) == 1 })
 	if phase := f.reports()[0].GetPhase(); phase != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
 		t.Fatalf("reported phase = %v, want COMPLETE; PREPARE takes no lock this mount can be holding and is never reportable", phase)
 	}
-
-	// Reporting always ends the session. A mount that said it cannot repair must
-	// stop serving what it can no longer take back.
-	waitFor(t, "the mount to revoke itself after reporting", f.mount.isRevoked)
-	if errno := f.mount.acquireBulk(context.Background()); errno != revokedErrno {
-		t.Fatalf("a mount that reported itself blocked answered a request with %v, want %v", errno, revokedErrno)
+	f.rpc.mu.Lock()
+	reportedParents := f.rpc.blockedParents
+	f.rpc.mu.Unlock()
+	if len(reportedParents) != 1 || len(reportedParents[0]) != 1 ||
+		reportedParents[0][0] != targets[0].GetParentKernelIno() {
+		t.Fatalf("reported parents = %v, want exact kernel parent %d", reportedParents, targets[0].GetParentKernelIno())
 	}
-	waitFor(t, "the terminal cause to be recorded", func() bool { return f.mount.fatalError() != nil })
-	cause := f.mount.fatalError().Error()
-	if !strings.Contains(cause, f.directory) {
-		t.Fatalf("terminal cause %q does not name the directory; the authority knows it only as a coordination identity, so naming it is the reason the frontend is the party that reports", cause)
-	}
-	for _, want := range []string{"i_rwsem", "unmount and mount again"} {
-		if !strings.Contains(cause, want) {
-			t.Fatalf("terminal cause %q does not mention %q", cause, want)
+	waitFor(t, "both phases to be acknowledged after the drain", func() bool { return f.acks() == 2 })
+	select {
+	case status := <-f.status:
+		if status != fuse.Status(syscall.EINTR) {
+			t.Fatalf("overlapping mkdir = %v, want definite pre-apply EINTR", status)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("the authority cycle break did not release the parked mkdir")
 	}
-	// The COMPLETE was reported, not acknowledged: the report IS the
-	// acknowledgment, and sending both would be a cursor violation.
-	if acks := f.acks(); acks != 1 {
-		t.Fatalf("acknowledgments = %d, want exactly 1 (the PREPARE); the COMPLETE was reported instead", acks)
+	if f.mount.isRevoked() {
+		t.Fatalf("one pre-apply namespace interruption revoked the mount: %v", f.mount.fatalError())
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "victim" {
+		t.Fatalf("repairs = %+v, want the exact cached binding invalidated after the parked callback drained", calls)
+	}
+}
+
+func TestRepairGateRefusesLaterSameParentBeforeAuthorityRPC(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{}
+	parent := f.lookup(t, fuse.FUSE_ROOT_ID, "packages")
+	f.lookup(t, parent.NodeId, "victim")
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(parent.Attr.Ino, "victim")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatal(err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityComplete(targets, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked {
+		t.Fatal("a repair with no admitted callback was reported blocked")
+	}
+	f.rpc.mu.Lock()
+	before := f.rpc.calls
+	f.rpc.mu.Unlock()
+	status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "later", &fuse.EntryOut{})
+	if status != fuse.Status(syscall.EINTR) {
+		t.Fatalf("same-parent mkdir after the repair gate = %v, want EINTR", status)
+	}
+	f.rpc.mu.Lock()
+	after := f.rpc.calls
+	f.rpc.mu.Unlock()
+	if after != before {
+		t.Fatalf("refused callback made %d authority calls, want zero", after-before)
+	}
+	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "after", &fuse.EntryOut{}); !status.Ok() {
+		t.Fatalf("same-parent mkdir after COMPLETE reopened admission = %v", status)
+	}
+}
+
+func TestRepairGateIsExactToCachedWorkAndParent(t *testing.T) {
+	t.Run("different parent", func(t *testing.T) {
+		f := newStrictFixture(t)
+		f.rpc.byName = map[string]*authoritypb.Item{}
+		first := f.lookup(t, fuse.FUSE_ROOT_ID, "first")
+		second := f.lookup(t, fuse.FUSE_ROOT_ID, "second")
+		f.lookup(t, first.NodeId, "victim")
+		targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(first.Attr.Ino, "victim")}
+		completion, _, err := f.raw.beginVisibilityComplete(targets, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: second.NodeId}, Mode: 0o755}, "allowed", &fuse.EntryOut{}); !status.Ok() {
+			t.Fatalf("different-parent mkdir = %v, want success", status)
+		}
+		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("uncached namespace target", func(t *testing.T) {
+		f := newStrictFixture(t)
+		f.rpc.byName = map[string]*authoritypb.Item{}
+		parent := f.lookup(t, fuse.FUSE_ROOT_ID, "packages")
+		targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(parent.Attr.Ino, "never-cached")}
+		completion, blocked, err := f.raw.beginVisibilityComplete(targets, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocked || len(completion.parents) != 0 {
+			t.Fatalf("uncached target armed parents=%v blocked=%v", completion.parents, blocked)
+		}
+		if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "allowed", &fuse.EntryOut{}); !status.Ok() {
+			t.Fatalf("same-parent mkdir with no exact cached repair = %v", status)
+		}
+		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("inode-only target", func(t *testing.T) {
+		f := newStrictFixture(t)
+		f.rpc.byName = map[string]*authoritypb.Item{}
+		parent := f.lookup(t, fuse.FUSE_ROOT_ID, "packages")
+		targets := []*authoritypb.VisibilityTarget{inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, parent.Attr.Ino, 0)}
+		completion, blocked, err := f.raw.beginVisibilityComplete(targets, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocked || len(completion.parents) != 0 {
+			t.Fatalf("inode repair armed namespace parents=%v blocked=%v", completion.parents, blocked)
+		}
+		if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "allowed", &fuse.EntryOut{}); !status.Ok() {
+			t.Fatalf("mkdir beside inode-only repair = %v", status)
+		}
+		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestRepairGateRefusesRenameWhenEitherParentIsRepairing(t *testing.T) {
+	for _, repairOld := range []bool{true, false} {
+		name := "new parent"
+		if repairOld {
+			name = "old parent"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			f.rpc.byName = map[string]*authoritypb.Item{}
+			oldParent := f.lookup(t, fuse.FUSE_ROOT_ID, "old")
+			newParent := f.lookup(t, fuse.FUSE_ROOT_ID, "new")
+			repairParent := newParent
+			if repairOld {
+				repairParent = oldParent
+			}
+			f.lookup(t, repairParent.NodeId, "victim")
+			targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(repairParent.Attr.Ino, "victim")}
+			completion, _, err := f.raw.beginVisibilityComplete(targets, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status := f.raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: oldParent.NodeId}, Newdir: newParent.NodeId}, "source", "dest")
+			if status != fuse.Status(syscall.EINTR) {
+				t.Fatalf("rename with repairing %s = %v, want EINTR", name, status)
+			}
+			if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestParentRepairAdmissionLinearizesEveryRace(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{}
+	parent := f.lookup(t, fuse.FUSE_ROOT_ID, "packages")
+	parentRecord := f.raw.acquire(parent.NodeId)
+	if parentRecord == nil {
+		t.Fatal("parent was not interned")
+	}
+	defer f.raw.release(parentRecord)
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(parent.Attr.Ino, "victim")}
+	victim := f.lookup(t, parent.NodeId, "victim")
+	victimRecord := f.raw.acquire(victim.NodeId)
+	if victimRecord == nil {
+		t.Fatal("victim was not interned")
+	}
+	defer f.raw.release(victimRecord)
+	key := nameKey{parent: parent.Attr.Ino, name: "victim"}
+
+	for iteration := 0; iteration < 1000; iteration++ {
+		// Republish the exact registry fact each COMPLETE will own. The real
+		// lookup path establishing it is tested separately; doing 1,000 synthetic
+		// authority lookups here would test reclaim backpressure, not this lock.
+		f.raw.mu.Lock()
+		f.raw.cachedNames[key] = victimRecord
+		if victimRecord.names == nil {
+			victimRecord.names = make(map[nameKey]struct{})
+		}
+		victimRecord.names[key] = struct{}{}
+		f.raw.mu.Unlock()
+		start := make(chan struct{})
+		release := make(chan struct{})
+		admitted := make(chan syscall.Errno, 1)
+		go func() {
+			<-start
+			leave, errno := f.raw.enterParentExclusive(parentRecord)
+			admitted <- errno
+			if errno == 0 {
+				<-release
+				leave()
+			}
+		}()
+		type begun struct {
+			completion visibilityCompletion
+			blocked    bool
+			err        error
+		}
+		begunResult := make(chan begun, 1)
+		go func() {
+			<-start
+			completion, blocked, err := f.raw.beginVisibilityComplete(targets, false)
+			begunResult <- begun{completion: completion, blocked: blocked, err: err}
+		}()
+		close(start)
+		errno := <-admitted
+		result := <-begunResult
+		if result.err != nil {
+			t.Fatalf("iteration %d begin COMPLETE: %v", iteration, result.err)
+		}
+		switch errno {
+		case 0:
+			if !result.blocked {
+				t.Fatalf("iteration %d admitted callback won but COMPLETE did not see it parked", iteration)
+			}
+		case syscall.EINTR:
+			if result.blocked {
+				t.Fatalf("iteration %d COMPLETE won but also reported a parked callback", iteration)
+			}
+		default:
+			t.Fatalf("iteration %d admission errno = %v", iteration, errno)
+		}
+		close(release)
+		if err := f.raw.finishVisibilityComplete(context.Background(), result.completion); err != nil {
+			t.Fatalf("iteration %d finish COMPLETE: %v", iteration, err)
+		}
 	}
 }
 

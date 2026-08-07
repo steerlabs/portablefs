@@ -146,9 +146,11 @@ invocation missing any of the direct-credential flags is refused with the
 missing flags named. A v3 volume is branchless: the retired --branch flag is
 an error.
 
-There is no write-back cache: write(2) returns after the authority has
-applied the bytes to XFS, and fsync waits for the authoritative server
-descriptor. --coherence picks the kernel cache contract — strict (default:
+There is no PortableFS-managed or offline write-back layer. Linux direct-I/O
+write(2) returns after the authority has applied the bytes to XFS. On macOS,
+ordinary kernel page-cache writeback still applies: write(2) may return before
+FSKit sends the write, while fsync/synchronize waits through the authority's
+server descriptor. --coherence picks the kernel cache contract — strict (default:
 names and attributes are cached and repaired through the authority's
 synchronous visibility barrier) or uncached (cache nothing; Linux only).
 
@@ -187,23 +189,25 @@ EXAMPLES
 		"umount": `USAGE
   portablefs umount <mountPath> [--force] [--discard-record] [--json]
 
-Unmount a portablefs mount and stop its daemon. A NORMAL unmount first runs
-the full drain barrier — every accepted write is locally synced, reaches the authority, and
-every live protocol subscriber acknowledges its invalidations — and FAILS
-(mount stays attached, nonzero exit) if the drain cannot complete.
+Unmount a portablefs mount and stop its daemon. On macOS authority-v3, a NORMAL
+unmount begins planned detach and first asks the kernel for an unforced unmount.
+That pass invokes FSKit synchronize and the authority durability boundary. The
+daemon accepts only success or the exact EBUSY produced after that sync pass;
+EBUSY authorizes a second MNT_FORCE pass to revoke the retained mount-root vnode.
+Exact mount-table absence is then delivered to the authority before local attach
+removal. Any other first-pass failure leaves the mount attached.
 
---force detaches without draining. A v3 mount holds no client-side durability
-debt — every acknowledged write is already applied by the authority — so there
-is nothing to park and nothing to replay; --force simply gives up on proving
-the drain. Use it when the authority is unreachable and you need the mount
-gone NOW.
+--force skips the trustworthy unforced sync pass and revokes the exact mount
+immediately. A v3 mount has no PortableFS-managed tail to park or replay, but
+macOS kernel pages may still need the normal synchronize boundary. Use --force
+only when that boundary is unavailable and the mount must be made unservable.
 
-On macOS, portablefsd owns one frozen drain + exact FSKit kernel unmount +
-durable attach-removal transaction. On Linux, unmount uses exactly the direct
+Legacy macOS attaches still use their frozen drain transaction. On Linux,
+unmount uses exactly the direct
 or pinned-helper mechanism recorded when that mount was created; it never
 switches mechanisms after a failure. The command then reconciles the exact
 recorded process, resources, and mount state.
-Missing state or missing drain proof fails closed; PortableFS never substitutes
+Missing state or missing absence proof fails closed; PortableFS never substitutes
 an unverified plain unmount.
 
 --discard-record is the terminal for BOOKKEEPING, not for a mount. It unmounts

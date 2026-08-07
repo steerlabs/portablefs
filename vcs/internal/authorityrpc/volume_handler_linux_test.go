@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -41,6 +42,175 @@ func TestPostMutationLocalFailureIsMarkedUncertain(t *testing.T) {
 	response := h.errorResponse(7, errors.Join(xfsstore.ErrOutcomeUncertain, syscall.EMFILE), false)
 	if !response.GetUncertain() || response.GetErrno() != int32(syscall.EMFILE) {
 		t.Fatalf("response = %+v, want uncertain EMFILE", response)
+	}
+}
+
+func TestVisibilityInterruptedMapsToDefiniteEINTR(t *testing.T) {
+	h := &VolumeHandler{}
+	response := h.errorResponse(7, volumeserver.ErrVisibilityInterrupted, false)
+	if response.GetErrno() != errnos.EINTR {
+		t.Fatalf("visibility interruption errno = %d, want EINTR", response.GetErrno())
+	}
+	if response.GetUncertain() {
+		t.Fatal("pre-apply visibility interruption was marked uncertain")
+	}
+	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED {
+		t.Fatalf("visibility interruption failure class = %v, want VISIBILITY_INTERRUPTED", response.GetFailure())
+	}
+}
+
+func TestHandlerRejectsInvalidSourcePhaseQueueabilityBeforeDispatch(t *testing.T) {
+	h := &VolumeHandler{}
+	tests := []struct {
+		name    string
+		request *authoritypb.Request
+	}{
+		{name: "hello", request: &authoritypb.Request{Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{}}}},
+		{name: "attach", request: &authoritypb.Request{Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{}}}},
+		{name: "visibility control", request: &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{NextVisibility: &authoritypb.NextVisibilityRequest{}}}},
+		{name: "ordinary request", request: &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.request.RequestId = 19
+			test.request.FrontendOperationId = 7
+			test.request.SourcePhaseQueueable = true
+			response := h.Handle(context.Background(), test.request)
+			if response.GetErrno() != int32(syscall.EINVAL) || response.GetUncertain() {
+				t.Fatalf("invalid queueability response = %+v, want definite EINVAL", response)
+			}
+		})
+	}
+}
+
+// This exercises the retained-mutation path, not only errorResponse. A
+// callback-serialized source with deferred COMPLETE outstanding consumes one
+// mutation slot as a definite EINTR. Replaying that exact identity must return
+// the retained EINTR and must never enter visibility prepare or filesystem
+// apply on either delivery.
+func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T) {
+	runtime, err := volumeserver.New("visibility-eintr-replay", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := volumeserver.PeerIdentity{1}
+	cred, err := runtime.Attach(2, peer, volumeserver.Authorization{
+		Access:   volumeserver.AccessRead | volumeserver.AccessWrite,
+		Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 1024, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := make(chan struct{})
+	t.Cleanup(func() { close(terminal) })
+	if err := visibility.Register(cred.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 1024,
+		RepairBudget:       5 * time.Second,
+		NamespaceRepair:    volumeserver.NamespaceRepairCallbackSerialized,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Produce the source-deferred COMPLETE state against which the handler's
+	// mutation is refused.
+	parent := [16]byte{1}
+	targets := []volumeserver.VisibilityTarget{{
+		Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: []byte("first"),
+	}}
+	first := make(chan error, 1)
+	go func() {
+		first <- visibility.Execute(
+			context.Background(), cred.ID, volumeserver.MutationID{Sequence: 1},
+			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
+			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
+		)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	prepare, err := visibility.Next(ctx, cred.ID, volumeserver.VisibilityCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := visibility.Ack(cred.ID, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("seed mutation: %v", err)
+	}
+	complete, err := visibility.Next(ctx, cred.ID, prepare.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := testVolumeHandler()
+	h.Runtime = runtime
+	h.Visibility = visibility
+	if err := h.startSessionResources(cred.ID, xfsstore.Capability{1}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{
+		RequestId:           7,
+		FrontendOperationId: 77,
+		Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{
+			Item: []byte{1}, Name: []byte("user.replay"), Value: []byte("value"),
+		}},
+	}
+	stampMutation(t, request, 0, 1)
+	var prepareCalls, applyCalls atomic.Uint32
+	handlerPrepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepareCalls.Add(1)
+		return []volumeserver.VisibilityTarget{{
+			Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{2},
+		}}, nil
+	}
+	handlerApply := func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		applyCalls.Add(1)
+		response := h.success(0)
+		return response, []volumeserver.VisibilityTarget{{
+			Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{2},
+		}}
+	}
+
+	interrupted := h.mutateVisible(ctx, request, cred, handlerPrepare, handlerApply)
+	if interrupted.GetErrno() != errnos.EINTR || interrupted.GetUncertain() {
+		t.Fatalf("first interrupted mutation = %+v, want definite EINTR", interrupted)
+	}
+	if interrupted.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED {
+		t.Fatalf("interrupted failure class = %v, want VISIBILITY_INTERRUPTED", interrupted.GetFailure())
+	}
+	if interrupted.GetMutation().GetSlot() != 0 || interrupted.GetMutation().GetAcceptedSequence() != 1 {
+		t.Fatalf("interrupted mutation state = %v, want retained slot 0 sequence 1", interrupted.GetMutation())
+	}
+	if prepareCalls.Load() != 0 || applyCalls.Load() != 0 {
+		t.Fatalf("first interrupted delivery reached prepare=%d apply=%d", prepareCalls.Load(), applyCalls.Load())
+	}
+
+	request.RequestId = 8
+	// Queueability is scheduling metadata, not replay identity. Flipping it on
+	// an exact replay must return the retained definite interruption rather than
+	// execute prepare/apply again under a different scheduling decision.
+	request.SourcePhaseQueueable = true
+	replayed := h.mutateVisible(ctx, request, cred, handlerPrepare, handlerApply)
+	if replayed.GetErrno() != errnos.EINTR || replayed.GetUncertain() {
+		t.Fatalf("replayed interrupted mutation = %+v, want retained definite EINTR", replayed)
+	}
+	if replayed.GetMutation().GetSlot() != 0 || replayed.GetMutation().GetAcceptedSequence() != 1 {
+		t.Fatalf("replayed mutation state = %v, want retained slot 0 sequence 1", replayed.GetMutation())
+	}
+	if prepareCalls.Load() != 0 || applyCalls.Load() != 0 {
+		t.Fatalf("exact replay re-executed prepare=%d apply=%d", prepareCalls.Load(), applyCalls.Load())
+	}
+	if err := visibility.Ack(cred.ID, complete.Cursor); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -297,6 +467,338 @@ func TestSessionResourceAdmissionAndTerminalState(t *testing.T) {
 	}
 }
 
+func TestCapabilityReservationIsPreApplyAndSymmetric(t *testing.T) {
+	h := &VolumeHandler{
+		MaxItemsPerSession: 1, MaxOpensPerSession: 1,
+		MaxItems: 1, MaxOpens: 1,
+		MaxFrame: 1 << 20, MaxRetainedReplyBytes: 1 << 20,
+	}
+	first := volumeserver.SessionID{0x31}
+	second := volumeserver.SessionID{0x32}
+	for _, id := range []volumeserver.SessionID{first, second} {
+		if err := h.startSessionResources(id, xfsstore.Capability{0xF1}, 2, [32]byte{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reservation, err := h.reserveCapabilities(first, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.totalItems != 1 || h.totalOpens != 1 {
+		t.Fatalf("reservation charged %d items / %d opens, want 1 / 1", h.totalItems, h.totalOpens)
+	}
+	if _, err := h.reserveCapabilities(second, 1, 0); !errors.Is(err, volumeserver.ErrAdmission) {
+		t.Fatalf("item admitted past outstanding reservation: %v", err)
+	}
+	if _, err := h.reserveCapabilities(second, 0, 1); !errors.Is(err, volumeserver.ErrAdmission) {
+		t.Fatalf("open admitted past outstanding reservation: %v", err)
+	}
+
+	item := xfsstore.Capability{0x41}
+	open := xfsstore.Capability{0x42}
+	if err := reservation.commit(
+		[]trackedCapability{{value: item}},
+		[]trackedCapability{{value: open}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	reservation.release() // A committed reservation is an idempotent no-op.
+	resources := h.resources[first]
+	if !resources.items[item] || !resources.opens[open] {
+		// The bool is the protected bit, so explicitly inspect membership below
+		// when the unprotected value is false.
+		_, hasItem := resources.items[item]
+		_, hasOpen := resources.opens[open]
+		if !hasItem || !hasOpen {
+			t.Fatalf("committed capabilities missing: item=%v open=%v", hasItem, hasOpen)
+		}
+	}
+	if resources.reservedItems != 0 || resources.reservedOpens != 0 || h.totalItems != 1 || h.totalOpens != 1 {
+		t.Fatalf("commit accounting = reserved %d/%d total %d/%d", resources.reservedItems, resources.reservedOpens, h.totalItems, h.totalOpens)
+	}
+
+	h.closeSessionResources(first)
+	if h.totalItems != 0 || h.totalOpens != 0 {
+		t.Fatalf("cleanup left %d items / %d opens", h.totalItems, h.totalOpens)
+	}
+	if admitted, err := h.reserveCapabilities(second, 1, 1); err != nil {
+		t.Fatalf("cleanup did not release reserved capacity: %v", err)
+	} else {
+		admitted.release()
+	}
+}
+
+func TestCapabilityReservationReleaseReturnsCapacity(t *testing.T) {
+	h := &VolumeHandler{
+		MaxItemsPerSession: 1, MaxOpensPerSession: 1,
+		MaxItems: 1, MaxOpens: 1,
+		MaxFrame: 1 << 20, MaxRetainedReplyBytes: 1 << 20,
+	}
+	session := volumeserver.SessionID{0x33}
+	if err := h.startSessionResources(session, xfsstore.Capability{0xF2}, 2, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := h.reserveCapabilities(session, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.release()
+	reservation.release()
+	resources := h.resources[session]
+	if resources.reservedItems != 0 || resources.reservedOpens != 0 || h.totalItems != 0 || h.totalOpens != 0 {
+		t.Fatalf("release accounting = reserved %d/%d total %d/%d", resources.reservedItems, resources.reservedOpens, h.totalItems, h.totalOpens)
+	}
+	if admitted, err := h.reserveCapabilities(session, 1, 1); err != nil {
+		t.Fatalf("released capacity was not reusable: %v", err)
+	} else {
+		admitted.release()
+	}
+}
+
+func TestCapabilityReservationReleaseAfterSessionCleanupDoesNotUnderflow(t *testing.T) {
+	h := &VolumeHandler{
+		MaxItemsPerSession: 1, MaxOpensPerSession: 1,
+		MaxItems: 1, MaxOpens: 1,
+		MaxFrame: 1 << 20, MaxRetainedReplyBytes: 1 << 20,
+	}
+	session := volumeserver.SessionID{0x34}
+	if err := h.startSessionResources(session, xfsstore.Capability{0xF3}, 2, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := h.reserveCapabilities(session, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.closeSessionResources(session)
+	reservation.release()
+	if h.totalItems != 0 || h.totalOpens != 0 {
+		t.Fatalf("post-cleanup release underflowed totals to %d items / %d opens", h.totalItems, h.totalOpens)
+	}
+}
+
+type resourceAdmissionFaultStore struct {
+	volumeStore
+	failure    error
+	create     atomic.Uint32
+	mkdir      atomic.Uint32
+	symlink    atomic.Uint32
+	open       atomic.Uint32
+	lookup     atomic.Uint32
+	forget     atomic.Uint32
+	lookupItem xfsstore.Capability
+}
+
+func (s *resourceAdmissionFaultStore) Fence(error) {}
+func (s *resourceAdmissionFaultStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	return [16]byte{item[0]}, nil
+}
+func (s *resourceAdmissionFaultStore) Getattr(xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 1}, nil
+}
+func (s *resourceAdmissionFaultStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.lookup.Add(1)
+	if s.lookupItem != (xfsstore.Capability{}) {
+		return s.lookupItem, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 2, Mode: 0o600, Nlink: 1}, nil
+	}
+	return xfsstore.Capability{}, xfsstore.Attr{}, syscall.ENOENT
+}
+func (s *resourceAdmissionFaultStore) Forget(xfsstore.Capability) error {
+	s.forget.Add(1)
+	return nil
+}
+func (s *resourceAdmissionFaultStore) Create(xfsstore.Capability, string, os.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.create.Add(1)
+	return xfsstore.Capability{}, xfsstore.Attr{}, s.failure
+}
+func (s *resourceAdmissionFaultStore) Mkdir(xfsstore.Capability, string, os.FileMode) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.mkdir.Add(1)
+	return xfsstore.Capability{}, xfsstore.Attr{}, s.failure
+}
+func (s *resourceAdmissionFaultStore) Symlink(xfsstore.Capability, string, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.symlink.Add(1)
+	return xfsstore.Capability{}, xfsstore.Attr{}, s.failure
+}
+func (s *resourceAdmissionFaultStore) OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.open.Add(1)
+	return xfsstore.Capability{}, s.failure
+}
+
+func (s *resourceAdmissionFaultStore) calls(operation string) uint32 {
+	switch operation {
+	case "create":
+		return s.create.Load()
+	case "mkdir":
+		return s.mkdir.Load()
+	case "symlink":
+		return s.symlink.Load()
+	case "open":
+		return s.open.Load()
+	default:
+		return 0
+	}
+}
+
+func resourceAdmissionRequestHarness(
+	t *testing.T,
+	store volumeStore,
+	maxItems, maxOpens uint32,
+) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
+	t.Helper()
+	runtime, err := volumeserver.New("resource-admission", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := volumeserver.PeerIdentity{0x71}
+	cred, err := runtime.Attach(2, peer, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := &RoutesController{Visibility: visibility, loaded: true}
+	h := &VolumeHandler{
+		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}, Routes: routes,
+		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
+		MaxItemsPerSession: maxItems, MaxOpensPerSession: maxOpens,
+		MaxItems: maxItems, MaxOpens: maxOpens, MaxRetainedReplyBytes: 1 << 20,
+	}
+	root := xfsstore.Capability{0x72}
+	if err := h.startSessionResources(cred.ID, root, 2, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { runtime.FenceSession(cred.ID) })
+	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peer))
+	return h, ctx, cred, root
+}
+
+func resourceAcquisitionRequest(
+	t *testing.T,
+	operation string,
+	cred volumeserver.SessionCredential,
+	root xfsstore.Capability,
+) *authoritypb.Request {
+	t.Helper()
+	request := &authoritypb.Request{
+		RequestId: 1, Epoch: cred.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]},
+	}
+	switch operation {
+	case "create":
+		request.Body = &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+			Parent: root[:], Name: []byte("capacity-create"), Mode: 0o600,
+			Flags: &authoritypb.OpenFlags{Read: true, Write: true}, Exclusive: true,
+		}}
+	case "mkdir":
+		request.Body = &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{
+			Parent: root[:], Name: []byte("capacity-mkdir"), Mode: 0o700,
+		}}
+	case "symlink":
+		request.Body = &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{
+			Parent: root[:], Name: []byte("capacity-symlink"), Target: []byte("target"),
+		}}
+	case "open":
+		request.Body = &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
+			Item: root[:], Flags: &authoritypb.OpenFlags{Read: true},
+		}}
+	default:
+		t.Fatalf("unknown operation %q", operation)
+	}
+	stampMutation(t, request, 0, 1)
+	return request
+}
+
+func TestResourceCapacityRefusalPrecedesEveryStoreAllocation(t *testing.T) {
+	for _, operation := range []string{"create", "mkdir", "symlink", "open"} {
+		t.Run(operation, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
+			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 0, 0)
+			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
+			if response.GetErrno() != errnos.EAGAIN || response.GetUncertain() {
+				t.Fatalf("capacity response=%+v, want definite EAGAIN", response)
+			}
+			if calls := store.calls(operation); calls != 0 {
+				t.Fatalf("store %s calls=%d before capacity refusal", operation, calls)
+			}
+			if h.totalItems != 0 || h.totalOpens != 0 {
+				t.Fatalf("capacity refusal left totals %d/%d", h.totalItems, h.totalOpens)
+			}
+		})
+	}
+}
+
+func TestResourceStoreFailureReleasesExactReservation(t *testing.T) {
+	for _, operation := range []string{"create", "mkdir", "symlink", "open"} {
+		t.Run(operation, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
+			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 1, 1)
+			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
+			if response.GetErrno() != int32(syscall.EACCES) || response.GetUncertain() {
+				t.Fatalf("store failure response=%+v, want definite EACCES", response)
+			}
+			if calls := store.calls(operation); calls != 1 {
+				t.Fatalf("store %s calls=%d, want one", operation, calls)
+			}
+			resources := h.resources[cred.ID]
+			if resources.reservedItems != 0 || resources.reservedOpens != 0 || h.totalItems != 0 || h.totalOpens != 0 {
+				t.Fatalf("store failure left reserved %d/%d totals %d/%d", resources.reservedItems, resources.reservedOpens, h.totalItems, h.totalOpens)
+			}
+			items, opens := uint32(1), uint32(0)
+			if operation == "open" {
+				items, opens = 0, 1
+			} else if operation == "create" {
+				opens = 1
+			}
+			reservation, err := h.reserveCapabilities(cred.ID, items, opens)
+			if err != nil {
+				t.Fatalf("released capacity was not reusable: %v", err)
+			}
+			reservation.release()
+		})
+	}
+}
+
+func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
+	item := xfsstore.Capability{0x7a}
+	store := &resourceAdmissionFaultStore{lookupItem: item}
+	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 1, 1)
+	request := &authoritypb.Request{
+		RequestId: 11, Epoch: cred.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]},
+		Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{
+			Parent: root[:], Name: []byte("exact-lookup"),
+		}},
+	}
+	stampMutation(t, request, 0, 1)
+	first := h.Handle(ctx, request)
+	if first.GetErrno() != 0 || first.GetLookup().GetItem() == nil ||
+		!bytes.Equal(first.GetLookup().GetItem().GetToken(), item[:]) {
+		t.Fatalf("first lookup=%+v", first)
+	}
+	request.RequestId = 12
+	replayed := h.Handle(ctx, request)
+	if replayed.GetErrno() != 0 || replayed.GetMutation().GetAcceptedSequence() != 1 ||
+		!bytes.Equal(replayed.GetLookup().GetItem().GetToken(), item[:]) {
+		t.Fatalf("replayed lookup=%+v", replayed)
+	}
+	if calls := store.lookup.Load(); calls != 1 {
+		t.Fatalf("lookup store calls=%d, want one exact acquisition", calls)
+	}
+	resources := h.resources[cred.ID]
+	if len(resources.items) != 1 || h.totalItems != 1 {
+		t.Fatalf("lookup tracked items=%d total=%d, want one", len(resources.items), h.totalItems)
+	}
+}
+
 // Defect 11: tracking a capability twice incremented the worker-wide counter
 // twice while the set grew once, so cleanup subtracted less than was added and
 // the drift was absorbed by clamped subtractions instead of being impossible.
@@ -369,6 +871,35 @@ func TestCapabilitiesResolveOnlyInsideTheirSession(t *testing.T) {
 	}
 	if _, err := h.item(owner, item[:3]); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("malformed capability = %v", err)
+	}
+}
+
+func TestHeldDirectoriesRejectsUnresolvedRenameParent(t *testing.T) {
+	h := testVolumeHandler()
+	session := volumeserver.SessionID{1}
+	root := xfsstore.Capability{0xAA}
+	if err := h.startSessionResources(session, root, 2, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	untracked := xfsstore.Capability{0xBB}
+
+	for _, test := range []struct {
+		name string
+		old  []byte
+		want error
+	}{
+		{name: "malformed", old: []byte{1}, want: syscall.EINVAL},
+		{name: "untracked", old: untracked[:], want: xfsstore.ErrStaleObject},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+				OldParent: test.old,
+				NewParent: root[:],
+			}}}
+			if _, err := h.heldDirectories(session, request); !errors.Is(err, test.want) {
+				t.Fatalf("heldDirectories = %v, want %v", err, test.want)
+			}
+		})
 	}
 }
 
@@ -464,6 +995,77 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 		t.Fatalf("attach = %v", attach)
 	}
 	proof := &authoritypb.SessionProof{Id: attach.GetAttach().GetSessionId(), Generation: attach.GetAttach().GetSessionGeneration(), ResumeSecret: attach.GetAttach().GetResumeSecret()}
+	var sessionID volumeserver.SessionID
+	copy(sessionID[:], proof.GetId())
+
+	mkdir := func(requestID, sequence uint64, name string) *authoritypb.Item {
+		t.Helper()
+		request := &authoritypb.Request{RequestId: requestID, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{
+			Parent: attach.GetAttach().GetRoot().GetToken(), Name: []byte(name), Mode: 0o700,
+		}}}
+		stampMutation(t, request, 1, sequence)
+		response := h.Handle(ctx, request)
+		if response.GetErrno() != 0 || response.GetLookup().GetItem() == nil {
+			t.Fatalf("mkdir %q = %v", name, response)
+		}
+		t.Cleanup(func() {
+			if err := os.Remove(filepath.Join(root, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("remove test directory %q: %v", name, err)
+			}
+		})
+		return response.GetLookup().GetItem()
+	}
+	oldParent := mkdir(100, 1, "handler-e2e-old-parent")
+	newParent := mkdir(101, 2, "handler-e2e-new-parent")
+	var oldCapability, newCapability xfsstore.Capability
+	copy(oldCapability[:], oldParent.GetToken())
+	copy(newCapability[:], newParent.GetToken())
+	oldIdentity, err := store.Identity(oldCapability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newIdentity, err := store.Identity(newCapability)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		oldParent []byte
+		newParent []byte
+		want      [][16]byte
+	}{
+		{name: "old parent overlap", oldParent: oldParent.GetToken(), newParent: newParent.GetToken(), want: [][16]byte{oldIdentity, newIdentity}},
+		{name: "new parent overlap", oldParent: newParent.GetToken(), newParent: oldParent.GetToken(), want: [][16]byte{newIdentity, oldIdentity}},
+		{name: "same parent", oldParent: oldParent.GetToken(), newParent: oldParent.GetToken(), want: [][16]byte{oldIdentity, oldIdentity}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+				OldParent: test.oldParent,
+				NewParent: test.newParent,
+			}}}
+			got, err := h.heldDirectories(sessionID, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(test.want) {
+				t.Fatalf("held directories = %x, want %x", got, test.want)
+			}
+			for i := range test.want {
+				if got[i] != test.want[i] {
+					t.Fatalf("held directory %d = %x, want %x", i, got[i], test.want[i])
+				}
+			}
+		})
+	}
+
+	unknown := xfsstore.Capability{0xFE}
+	unresolvedRename := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+		OldParent: oldParent.GetToken(), NewParent: unknown[:],
+	}}}
+	if _, err := h.heldDirectories(sessionID, unresolvedRename); !errors.Is(err, xfsstore.ErrStaleObject) {
+		t.Fatalf("unresolved new rename parent = %v, want stale-object refusal", err)
+	}
 
 	create := &authoritypb.Request{RequestId: 2, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: attach.GetAttach().GetRoot().GetToken(), Name: []byte("handler-e2e"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
 	stampMutation(t, create, 0, 1)
@@ -574,7 +1176,9 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	itemToken := created.GetCreate().GetItem().GetToken()
 
 	// The waiter needs its own capability for the same object.
-	waiterLookup := h.Handle(ctx, &authoritypb.Request{RequestId: 4, Epoch: epoch, Session: waiterProof, Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: waiter.GetRoot().GetToken(), Name: []byte("lock-wait-target")}}})
+	waiterLookupRequest := &authoritypb.Request{RequestId: 4, Epoch: epoch, Session: waiterProof, Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: waiter.GetRoot().GetToken(), Name: []byte("lock-wait-target")}}}
+	stampMutation(t, waiterLookupRequest, 0, 1)
+	waiterLookup := h.Handle(ctx, waiterLookupRequest)
 	if waiterLookup.GetErrno() != 0 {
 		t.Fatalf("waiter lookup = %v", waiterLookup)
 	}
@@ -592,7 +1196,7 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	waitDone := make(chan *authoritypb.Response, 1)
 	go func() {
 		wait := &authoritypb.Request{RequestId: 6, Epoch: epoch, Session: waiterProof, Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: &authoritypb.LockSpec{Item: waiterToken, Owner: 2, Write: true, Range: wholeFile}, Wait: true}}}
-		stampMutation(t, wait, 0, 1)
+		stampMutation(t, wait, 0, 2)
 		waitDone <- h.Handle(waitCtx, wait)
 	}()
 	select {
@@ -648,10 +1252,16 @@ func TestRoutingRevisionContractRejectsTheOldExactProtocolAtHello(t *testing.T) 
 		t.Fatalf("old-protocol hello = %v, want EOPNOTSUPP before attach", old)
 	}
 	current := h.Handle(context.Background(), &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Hello{
-		Hello: &authoritypb.HelloRequest{ProtocolMajor: ProtocolMajor},
+		Hello: &authoritypb.HelloRequest{ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...)},
 	}})
 	if current.GetErrno() != 0 || current.GetHello().GetProtocolMajor() != ProtocolMajor {
 		t.Fatalf("current-protocol hello = %v", current)
+	}
+	legacy := h.Handle(context.Background(), &authoritypb.Request{RequestId: 3, Body: &authoritypb.Request_Hello{
+		Hello: &authoritypb.HelloRequest{ProtocolMajor: ProtocolMajor, Features: []string{"xfs-current-state", "session-exact-epoch", "direct-write"}},
+	}})
+	if legacy.GetErrno() != int32(syscall.EOPNOTSUPP) || legacy.GetHello() != nil {
+		t.Fatalf("legacy-feature hello = %v, want EOPNOTSUPP before attach", legacy)
 	}
 }
 

@@ -44,7 +44,7 @@ jobs:
       - name: Build the Swift package
         run: swift build --package-path swift/PortableFSKit
       - name: Swift suite (FSKit adapter, app core, macOS 26 coherence)
-        run: swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+        run: swift test --package-path swift/PortableFSKit --no-parallel
 
   go:
     runs-on: ubuntu-24.04

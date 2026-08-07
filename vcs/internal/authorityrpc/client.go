@@ -102,30 +102,31 @@ type lane struct {
 type Client struct {
 	cfg ClientConfig
 
-	lifecycle        sync.Mutex
-	conn             net.Conn
-	writeMu          sync.Mutex
-	pendingMu        sync.Mutex
-	pending          map[uint64]chan callResult
-	nextID           atomic.Uint64
-	ordinary         lane
-	blocking         lane
-	visibility       lane
-	liveness         lane
-	epoch            []byte
-	proof            *authoritypb.SessionProof
-	root             *authoritypb.Item
-	maxRead          uint32
-	maxWrite         uint32
-	lease            time.Duration
-	visibilityCursor *authoritypb.VisibilityCursor
-	frameMax         atomic.Uint32
-	poisoned         atomic.Bool
-	closed           bool
-	fatalOnce        sync.Once
-	fatalMu          sync.Mutex
-	fatalErr         error
-	fatalDone        chan struct{}
+	lifecycle            sync.Mutex
+	conn                 net.Conn
+	writeMu              sync.Mutex
+	pendingMu            sync.Mutex
+	pending              map[uint64]chan callResult
+	nextID               atomic.Uint64
+	ordinary             lane
+	blocking             lane
+	visibility           lane
+	liveness             lane
+	epoch                []byte
+	proof                *authoritypb.SessionProof
+	root                 *authoritypb.Item
+	maxRead              uint32
+	maxWrite             uint32
+	lease                time.Duration
+	visibilityCursor     *authoritypb.VisibilityCursor
+	peerCompleteFeedback atomic.Bool
+	frameMax             atomic.Uint32
+	poisoned             atomic.Bool
+	closed               bool
+	fatalOnce            sync.Once
+	fatalMu              sync.Mutex
+	fatalErr             error
+	fatalDone            chan struct{}
 }
 
 type clientSlot struct {
@@ -234,7 +235,10 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 	if err := conn.SetDeadline(handshakeDeadline); err != nil {
 		return fail(err)
 	}
-	helloReq := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{ProtocolMajor: ProtocolMajor}}}
+	helloReq := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
+		ProtocolMajor: ProtocolMajor,
+		Features:      append([]string(nil), requiredHelloFeatures...),
+	}}}
 	if err := writeFrame(conn, c.cfg.MaxFrame, helloReq); err != nil {
 		return fail(err)
 	}
@@ -248,6 +252,9 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 	if !hasFeatures(hello.GetHello().GetFeatures(), requiredHelloFeatures) {
 		return fail(errors.New("authorityrpc: authority omitted required current-state features"))
 	}
+	c.peerCompleteFeedback.Store(hasFeatures(
+		hello.GetHello().GetFeatures(), []string{peerCompleteFIFOFeedbackFeature},
+	))
 	if len(hello.GetEpoch()) != len(volumeserver.Epoch{}) {
 		return fail(errors.New("authorityrpc: protocol handshake omitted a valid authority epoch"))
 	}
@@ -322,8 +329,8 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 			return fail(errors.New("authorityrpc: authority omitted required ordinary-filesystem features"))
 		}
 		if c.cfg.CoherenceProfile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT &&
-			!hasFeatures(response.GetAttach().GetFeatures(), []string{"strict-two-phase-visibility"}) {
-			return fail(errors.New("authorityrpc: authority omitted strict visibility barriers"))
+			!hasFeatures(response.GetAttach().GetFeatures(), requiredStrictAttachFeatures) {
+			return fail(errors.New("authorityrpc: authority omitted required strict visibility semantics"))
 		}
 		if !equalBytes(response.GetEpoch(), hello.GetEpoch()) ||
 			len(response.GetAttach().GetSessionId()) != len(volumeserver.SessionID{}) ||
@@ -468,10 +475,36 @@ func (c *Client) endStrictMount(cause error) error {
 // AckVisibility is idempotent for the last accepted cursor, including when its
 // response was lost and a later phase is already pending.
 func (c *Client) AckVisibility(ctx context.Context, cursor *authoritypb.VisibilityCursor) error {
+	return c.AckVisibilityWithContention(ctx, cursor, false)
+}
+
+// AckVisibilityWithContention carries an optional liveness-only hint on the
+// exact successful COMPLETE Ack. If the authority did not advertise support,
+// the field remains absent and the frozen Ack encoding is preserved.
+func (c *Client) AckVisibilityWithContention(ctx context.Context, cursor *authoritypb.VisibilityCursor, orderedAdmissionContended bool) error {
 	if c.cfg.CoherenceProfile != authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT || cursor == nil {
 		return syscall.EINVAL
 	}
-	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{Cursor: cursor}}})
+	makeRequest := func() *authoritypb.Request {
+		return &authoritypb.Request{Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
+			Cursor: cursor,
+			OrderedAdmissionContended: orderedAdmissionContended &&
+				c.peerCompleteFeedback.Load(),
+		}}}
+	}
+	if c.poisoned.Load() {
+		return ErrTransportUncertain
+	}
+	response, err := c.Call(ctx, makeRequest())
+	if errors.Is(err, ErrTransportUncertain) {
+		if reconnectErr := c.Reconnect(ctx); reconnectErr != nil {
+			c.signalSessionEnd(reconnectErr)
+			return reconnectErr
+		}
+		// Rebuild after reconnect: the optional field is legal only when the
+		// exact newly active connection advertised it.
+		response, err = c.Call(ctx, makeRequest())
+	}
 	if err != nil {
 		return err
 	}
@@ -511,24 +544,28 @@ func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byt
 	return proto.Clone(response.GetApplyRoutes()).(*authoritypb.ApplyRoutesReply), nil
 }
 
-// ReportVisibilityBlocked tells the authority this mount cannot service the
-// phase it is holding, because the repair would wait on a kernel lock one of
-// this mount's own unanswered requests holds. It always ends this session, so
-// the caller must revoke locally on a return of any kind. The authority retains
-// the current obligation for one full fencing grace before the peer mutation
-// can finish; reporting does not shorten that safety window.
+// ReportVisibilityBlocked tells the authority this mount cannot yet service a
+// parent-exclusive namespace COMPLETE because the repair needs a kernel lock
+// one of this mount's own unanswered requests holds. An accepted ordinary
+// report installs a scoped pre-apply interruption; the caller then drains that
+// request, performs the repair, and acknowledges the same COMPLETE. A routes
+// report remains terminal because releasing a parent lock cannot adopt a new
+// topology.
 //
 // It may only be sent when BOTH halves are true: this mount has an unanswered
 // namespace mutation in the affected parent, and it actually holds a cached
 // binding this phase names. A mount with nothing cached to repair must
-// acknowledge normally; the authority checks the half it can see and treats an
-// unsupported report as a cursor violation.
-func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authoritypb.VisibilityCursor) error {
+// acknowledge normally. The authority maps every reported coordination inode
+// through the exact pending event and treats an unsupported report as a cursor
+// violation; the report itself never acknowledges or skips the repair.
+func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authoritypb.VisibilityCursor, parentKernelInos []uint64) error {
 	if c.cfg.CoherenceProfile != authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT || cursor == nil {
 		return syscall.EINVAL
 	}
 	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_AckVisibility{
-		AckVisibility: &authoritypb.AckVisibilityRequest{Cursor: cursor, Blocked: true},
+		AckVisibility: &authoritypb.AckVisibilityRequest{
+			Cursor: cursor, Blocked: true, BlockedParentKernelInos: append([]uint64(nil), parentKernelInos...),
+		},
 	}})
 	if err != nil {
 		c.signalSessionEnd(ErrSessionEnded)
@@ -537,10 +574,7 @@ func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authorityp
 	if response.GetErrno() != 0 {
 		return c.endStrictMount(syscall.Errno(response.GetErrno()))
 	}
-	// The authority is required to end this session, so a success is the one
-	// answer that means this client and that authority disagree about what just
-	// happened. Continuing to serve a cache on that footing is not an option.
-	return c.endStrictMount(errors.New("authorityrpc: authority accepted a blocked visibility report without fencing this mount"))
+	return nil
 }
 
 // VisibilityRepairBudget is the per-phase deadline this mount committed to at

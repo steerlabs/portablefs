@@ -160,18 +160,14 @@ type rawFileSystem struct {
 
 	// parked is the set of directories whose kernel i_rwsem this mount is
 	// holding for an authority mutation that has not been answered yet.
-	//
-	// It exists because of the one condition a strict Linux FUSE mount cannot
-	// repair its way out of: making a cached binding unservable needs the parent
-	// directory's i_rwsem for write (fs/fuse/dir.c, unconditional), and a
-	// namespace syscall holds that same semaphore across the whole authority
-	// round trip. If a peer's COMPLETE asks this mount to invalidate a name in a
-	// directory it is parked in, the wait is a closed cycle and the authority
-	// fences this participant rather than stalling the volume. The authority can
-	// prove that from the identities it already holds; what it cannot do is say
-	// WHICH directory in terms a person can act on. This mount can, so the
-	// message it dies with names it.
-	parked map[*inodeRecord]int
+	// repairingParents is the complementary admission gate: COMPLETE installs a
+	// parent here before attempting a reverse name notification. A callback can
+	// therefore be on exactly one side of the gate. If it entered first it is
+	// parked and COMPLETE asks the authority to refuse it pre-apply; if COMPLETE
+	// entered first the callback returns EINTR before making an authority request.
+	parked           map[*inodeRecord]int
+	repairingParents map[uint64]int
+	parkedChanged    chan struct{}
 
 	// identityDevice pins the one filesystem a volume is, as the authority's
 	// explicit major<<32|minor device fact. The kernel inode number alone keys
@@ -208,6 +204,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		heldNames:        make(map[nameKey]struct{}),
 		heldInodes:       make(map[uint64]struct{}),
 		parked:           make(map[*inodeRecord]int),
+		repairingParents: make(map[uint64]int),
 		publishingNames:  make(map[nameKey]int),
 		publishingInodes: make(map[uint64]int),
 		published:        make(chan struct{}),
@@ -576,18 +573,34 @@ func (r *rawFileSystem) acquireDirHandle(id uint64) (*handleRecord, *dirHandle) 
 	return handle, handle.dir
 }
 
-// enterParked declares the directories this mount's kernel is holding for one
-// unanswered namespace mutation. The returned function must be called exactly
-// once when the mutation is no longer outstanding.
+// signalParkedLocked wakes a COMPLETE waiting for an already-admitted namespace
+// callback to release its parent. The caller holds r.mu.
+func (r *rawFileSystem) signalParkedLocked() {
+	if r.parkedChanged != nil {
+		close(r.parkedChanged)
+		r.parkedChanged = nil
+	}
+}
+
+// enterParentExclusive admits one shared namespace callback. Linux has already
+// taken every listed parent's i_rwsem by the time this handler runs, so refusing
+// after a repair gate closes must be immediate: waiting here would hold the very
+// lock COMPLETE is about to acquire through fuse_reverse_inval_entry.
 //
-// It mirrors, on this side, what the authority derives from the request itself.
-// Declaring it here costs one map update per namespace mutation and buys the
-// one thing the authority cannot produce: a path, in a message a person reads.
-func (r *rawFileSystem) enterParked(records ...*inodeRecord) func() {
+// A successful admission declares the parents parked until the handler returns.
+// It is linearized with COMPLETE arming repairingParents by r.mu; that single
+// order is the liveness property, not timing or the repair-budget watchdog.
+func (r *rawFileSystem) enterParentExclusive(records ...*inodeRecord) (func(), syscall.Errno) {
 	if r.profile != CoherenceStrict {
-		return func() {}
+		return func() {}, 0
 	}
 	r.mu.Lock()
+	for _, record := range records {
+		if record != nil && r.repairingParents[record.key.inode] != 0 {
+			r.mu.Unlock()
+			return func() {}, syscall.EINTR
+		}
+	}
 	for _, record := range records {
 		if record != nil {
 			r.parked[record]++
@@ -607,8 +620,9 @@ func (r *rawFileSystem) enterParked(records ...*inodeRecord) func() {
 					delete(r.parked, record)
 				}
 			}
+			r.signalParkedLocked()
 		})
-	}
+	}, 0
 }
 
 // parkedDirectories names the directories this mount is currently holding for
@@ -739,7 +753,8 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 			return status
 		}
 	}
-	ctx := r.opContext()
+	ctx, finish := r.mutationContext()
+	defer finish()
 	item, errno := parent.node.Lookup(ctx, name)
 	if errno != 0 {
 		// A negative result is never cached. The authority emits a namespace
@@ -1029,9 +1044,13 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 			return fuse.OK
 		}
 	}
+	leave, errno := r.enterParentExclusive(parent)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(parent)()
 	item, handle, flags, errno := parent.node.Create(ctx, name, input.Flags, input.Mode)
 	if errno != 0 {
 		return fuse.Status(errno)
@@ -1092,9 +1111,13 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 			return fuse.OK
 		}
 	}
+	leave, errno := r.enterParentExclusive(parent)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(parent)()
 	item, errno := parent.node.Mknod(ctx, name, input.Mode, input.Rdev)
 	if errno != 0 {
 		return fuse.Status(errno)
@@ -1130,9 +1153,13 @@ func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name strin
 			return fuse.OK
 		}
 	}
+	leave, errno := r.enterParentExclusive(parent)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(parent)()
 	item, errno := parent.node.Mkdir(ctx, name, input.Mode)
 	if errno != 0 {
 		return fuse.Status(errno)
@@ -1176,9 +1203,13 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 			return fuse.Status(errno)
 		}
 	}
+	leave, admissionErr := r.enterParentExclusive(parent)
+	if admissionErr != 0 {
+		return fuse.Status(admissionErr)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(parent)()
 	var errno syscall.Errno
 	if directory {
 		errno = parent.node.Rmdir(ctx, name)
@@ -1235,9 +1266,13 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 			return fuse.Status(errno)
 		}
 	}
+	leave, admissionErr := r.enterParentExclusive(oldParent, newParent)
+	if admissionErr != 0 {
+		return fuse.Status(admissionErr)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(oldParent, newParent)()
 	errno := oldParent.node.Rename(ctx, oldName, newParent.node, newName, input.Flags)
 	if errno == 0 {
 		// The route set is a pure function of the declaration, so a rename that
@@ -1270,9 +1305,13 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 			return status
 		}
 	}
+	leave, admissionErr := r.enterParentExclusive(newParent)
+	if admissionErr != 0 {
+		return fuse.Status(admissionErr)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(newParent)()
 	item, errno := newParent.node.Link(ctx, source.node, name)
 	if errno != 0 {
 		return fuse.Status(errno)
@@ -1310,9 +1349,13 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 			return fuse.OK
 		}
 	}
+	leave, admissionErr := r.enterParentExclusive(parent)
+	if admissionErr != 0 {
+		return fuse.Status(admissionErr)
+	}
+	defer leave()
 	ctx, finish := r.mutationContext()
 	defer finish()
-	defer r.enterParked(parent)()
 	item, errno := parent.node.Symlink(ctx, pointedTo, linkName)
 	if errno != 0 {
 		return fuse.Status(errno)

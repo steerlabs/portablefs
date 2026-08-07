@@ -18,11 +18,12 @@ and a Linux CI runner execute the same steps:
    adapters all carry per-GOOS files;
 2. the native Go suite, then the native race suite — these tests exercise real
    syscalls, sockets, and mounts, so they are only meaningful on the host;
-3. `swift test --package-path swift/PortableFSKit --parallel --num-workers 1`.
-   The single worker is required, not a performance knob: several tests bind
-   fixed per-process resources (sockets, mount points, the shared app-group
-   container) and concurrent workers deadlock rather than fail. Skipped loudly
-   on a host with no Swift toolchain; the macOS CI job always runs it;
+3. `swift test --package-path swift/PortableFSKit --no-parallel`.
+   Serial execution is required, not a performance knob: Swift Testing can run
+   cases concurrently inside one worker, while several tests share process
+   resources (sockets, mount points, the app-group container) or exercise hard
+   protocol deadlines. Skipped loudly on a host with no Swift toolchain; the
+   macOS CI job always runs it;
 4. release-trust policy: `sh -n scripts/install.sh`, `scripts/check-workflow-pins.mjs`,
    and `scripts/check-install-release-trust.mjs` (dependency-free single-file
    node programs that read the installer, the workflows, and `.goreleaser.yaml`
@@ -37,7 +38,7 @@ GOOS=darwin go -C vcs build ./...
 GOOS=linux  go -C vcs vet ./...
 go -C vcs test ./...
 go -C vcs test -race ./...
-swift test --package-path swift/PortableFSKit --parallel --num-workers 1
+swift test --package-path swift/PortableFSKit --no-parallel
 ```
 
 

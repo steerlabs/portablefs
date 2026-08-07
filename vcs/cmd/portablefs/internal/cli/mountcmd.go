@@ -493,7 +493,16 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 	persistedByRef := make(map[string]portablefsd.PersistedAttachIdentity, len(persistedAttaches))
 	for _, attach := range persistedAttaches {
 		persistedByRef[attach.AttachRef] = attach
-		if attach.MountPath != mountPath && attach.VolumeID == volumeID && attach.Branch == branch {
+		// Kernel absence does not retire daemon authority for this path. A
+		// remount would spend a fresh capability before registration discovers
+		// the old attach; umount owns the exact durable recovery instead.
+		if attach.MountPath == mountPath {
+			return fmt.Errorf(
+				"mount path %s already has durable daemon attach %s; run `portablefs umount %s` first",
+				mountPath, attach.AttachRef, mountPath,
+			)
+		}
+		if attach.VolumeID == volumeID && attach.Branch == branch {
 			return fmt.Errorf(
 				"%s already has durable daemon attach %s at %s; run `portablefs umount %s` first",
 				volumeBranchLabel(volumeID, branch), attach.AttachRef, attach.MountPath, attach.MountPath,
@@ -517,11 +526,17 @@ func (e *cmdEnv) validateMountOwnership(stateDir, volumeID, branch, mountPath st
 			return fmt.Errorf("strict daemon attach inventory: %w", err)
 		}
 		for _, attach := range attaches {
+			if attach.MountPath == mountPath {
+				return fmt.Errorf(
+					"mount path %s already has live daemon attach %s; run `portablefs umount %s` first",
+					mountPath, attach.AttachRef, mountPath,
+				)
+			}
 			persisted, ok := persistedByRef[attach.AttachRef]
 			if !ok || persisted.VolumeID != attach.VolumeID || persisted.Branch != attach.Branch || persisted.MountPath != attach.MountPath {
 				return fmt.Errorf("live daemon attach %s is inconsistent with strict durable inventory", attach.AttachRef)
 			}
-			if attach.MountPath != mountPath && attach.VolumeID == volumeID && attach.Branch == branch {
+			if attach.VolumeID == volumeID && attach.Branch == branch {
 				return fmt.Errorf(
 					"%s already has daemon attach %s at %s; run `portablefs umount %s` first",
 					volumeBranchLabel(volumeID, branch), attach.AttachRef, attach.MountPath, attach.MountPath,

@@ -266,7 +266,11 @@ func visibilityCursorProto(cursor volumeserver.VisibilityCursor) *authoritypb.Vi
 func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.VisibilityTarget {
 	switch target.Scope {
 	case volumeserver.VisibilityNamespace:
-		return visibilitywire.Namespace(target.ParentIdentity[:], target.Name, target.ParentKernelIno, target.Device)
+		wire := visibilitywire.Namespace(target.ParentIdentity[:], target.Name, target.ParentKernelIno, target.Device)
+		if target.PostIdentity != ([16]byte{}) {
+			wire.PostIdentity = append([]byte(nil), target.PostIdentity[:]...)
+		}
+		return wire
 	case volumeserver.VisibilityData:
 		return visibilitywire.Data(target.Identity[:], target.KernelIno, target.Device, target.Size)
 	case volumeserver.VisibilityAttributes:
@@ -338,10 +342,26 @@ func (h *VolumeHandler) coordinateOpen(handle xfsstore.Capability) (visibilityCo
 }
 
 func namespaceTarget(parent visibilityCoordinate, name []byte) volumeserver.VisibilityTarget {
-	return volumeserver.VisibilityTarget{
+	return namespaceTargetRelated(parent, name)
+}
+
+func namespaceTargetPost(parent visibilityCoordinate, name []byte, post visibilityCoordinate) volumeserver.VisibilityTarget {
+	target := namespaceTargetRelated(parent, name, post)
+	target.PostIdentity = post.identity
+	return target
+}
+
+func namespaceTargetRelated(parent visibilityCoordinate, name []byte, related ...visibilityCoordinate) volumeserver.VisibilityTarget {
+	target := volumeserver.VisibilityTarget{
 		Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent.identity,
 		ParentKernelIno: parent.ino, Device: parent.device, Name: append([]byte(nil), name...),
 	}
+	for _, coordinate := range related {
+		if coordinate.identity != ([16]byte{}) {
+			target.RelatedIdentities = append(target.RelatedIdentities, coordinate.identity)
+		}
+	}
+	return target
 }
 
 func inodeTarget(scope volumeserver.VisibilityScope, coordinate visibilityCoordinate, size int64) volumeserver.VisibilityTarget {

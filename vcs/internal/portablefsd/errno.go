@@ -17,6 +17,12 @@ const (
 	darwinENOMEM       int32 = 12
 	darwinEACCES       int32 = 13
 	darwinEAGAIN       int32 = 35
+	// ECANCELED is deliberately named separately from EINTR/EAGAIN. On macOS
+	// 26 those retry-class results can be replayed by the VFS after FSKit has
+	// already returned them to userspace, which destroys a definite-preapply
+	// guarantee. Policy v2 uses ECANCELED for that boundary and verifies the
+	// kernel behavior with the live FSKit/XFS rig.
+	darwinECANCELED    int32 = 89
 	darwinEBUSY        int32 = 16
 	darwinEEXIST       int32 = 17
 	darwinEXDEV        int32 = 18

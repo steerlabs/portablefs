@@ -122,10 +122,13 @@ fencing grace — rather than an unbounded volume outage. The grace is
 load-bearing only when the frontend can prove its old kernel cache became
 unservable before the grace ends.
 
-Linux proves it (below). The macOS frontend does not yet: the current Swift
-watchdog terminates protocol participation but does not prove kernel
-withdrawal, so the production FSKit resolve guard remains closed. The unmet
-gates are enumerated in
+Linux proves it by detaching and aborting FUSE (below). macOS 26 proves it with
+the per-mount supervisor: after a daemon/session liveness failure it
+identity-checks and force-unmounts the exact FSKit mount. Live testing with a
+cached held descriptor showed reads continue for 8.6 seconds, the watchdog
+force-unmounts at about 10 seconds, and every later `pread` fails `EIO`, inside
+the fencing grace. A kernel that refuses forced unmount past the grace remains
+the stated platform residual. See
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 Participant-scoped fencing is reported to the client as `ESTALE`, never as a
@@ -225,7 +228,12 @@ on the same capability. A second refusal is a real disagreement and is surfaced
 verbatim; `routes_revision_mismatch` in the coherence matrix asserts that
 contract including the attempt count. A routing change applied while mounts are
 live revokes them with a remount message rather than letting two machines
-disagree about which paths are shared.
+disagree about which paths are shared. If durable commit fails after PREPARE, current production mounts have already
+revoked during PREPARE and are not preserved. A truthful reported-active COMPLETE is relevant only to a future frontend that
+explicitly staged and ACKed PREPARE without leaving. A definite pre-publication
+failure reports the old revision and `Applied=false`; a post-rename
+durability-uncertain failure reports the next revision and `Applied=true`.
+Fresh attaches use whichever revision the commit reports active.
 
 ## Launch topology
 

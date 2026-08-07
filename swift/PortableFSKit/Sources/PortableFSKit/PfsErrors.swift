@@ -42,6 +42,20 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
     /// interrupted. The frontend may therefore treat a retraction as "none of
     /// what I did not already observe happened" and let the syscall retry.
     case publicationRetracted
+    /// PREPARE was already closed before this FSKit callback could issue any
+    /// daemon request. Unlike a retraction, no attempt exists to acknowledge
+    /// or replay. macOS 26 transparently re-enters some EINTR callbacks: live
+    /// testing observed hidden replay after EINTR, EBUSY, and EAGAIN. Policy
+    /// v2 therefore uses the non-restartable ECANCELED verdict for this
+    /// definite-preapply boundary. It also releases FSKit's namespace lane so
+    /// the repair can run instead of deadlocking behind this callback.
+    case publicationAdmissionClosed
+    /// Ordinary local contention, and the frozen v1 admission verdict. Unlike
+    /// v2's non-restartable ECANCELED, legacy v1 exposed EBUSY at every local
+    /// definite-preapply boundary. Namespace-index reservation collisions are
+    /// also local contention rather than a coherence-policy refusal and use
+    /// this errno under every policy.
+    case publicationAdmissionBusy
 
     public var description: String {
         switch self {
@@ -73,6 +87,10 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
             return "\(operation) failed with errno \(errnoValue)"
         case .publicationRetracted:
             return "pfslocal publications retracted by the daemon"
+        case .publicationAdmissionClosed:
+            return "pfslocal publication admission is temporarily closed"
+        case .publicationAdmissionBusy:
+            return "pfslocal publication admission is busy"
         }
     }
 
@@ -97,6 +115,10 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
             // attempt has no delegation left to release and cannot be
             // retracted for the same reason.
             return EINTR
+        case .publicationAdmissionClosed:
+            return ECANCELED
+        case .publicationAdmissionBusy:
+            return EBUSY
         case .v3CoherenceIntegrationUnavailable:
             return ENOTSUP
         case .socketPath, .protocolMismatch, .missingBody, .unexpectedReply, .invalidFrame:

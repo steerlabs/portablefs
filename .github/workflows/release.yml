@@ -218,7 +218,7 @@ jobs:
           cache-dependency-path: vcs/go.sum
 
       - name: Test the Swift app and installer core
-        run: swift test --package-path swift/PortableFSKit
+        run: swift test --package-path swift/PortableFSKit --no-parallel
 
       - name: Import Developer ID identity
         env:

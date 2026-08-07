@@ -16,6 +16,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -41,6 +42,7 @@ type fakeRPC struct {
 	short          bool
 	writeFailure   syscall.Errno
 	closeFailure   syscall.Errno
+	mkdirFailure   syscall.Errno
 	reclaimFailure syscall.Errno
 	keepAliveErr   syscall.Errno
 	xattrValue     []byte
@@ -65,12 +67,16 @@ type fakeRPC struct {
 	// The strict cache contract. events is the programmed visibility stream;
 	// acked records every cursor the frontend acknowledged, which is what the
 	// liveness assertions read.
-	session       []byte
-	initial       *authoritypb.VisibilityCursor
-	events        chan *authoritypb.VisibilityEvent
-	acked         []*authoritypb.VisibilityCursor
-	blocked       []*authoritypb.VisibilityCursor
-	blockedErr    error
+	session        []byte
+	initial        *authoritypb.VisibilityCursor
+	events         chan *authoritypb.VisibilityEvent
+	acked          []*authoritypb.VisibilityCursor
+	blocked        []*authoritypb.VisibilityCursor
+	blockedParents [][]uint64
+	blockedErr     error
+	// onBlocked models the authority's nonterminal cycle break: it refuses the
+	// queued overlapping mutation before returning success to the report.
+	onBlocked     func()
 	detachProofs  []MountAbsenceProof
 	visibilityErr error
 	// mutationStates are attached, in order, to successful mutation responses.
@@ -215,6 +221,9 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 	case request.GetLookup() != nil:
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetLookup().GetName())}}}, nil
 	case request.GetMkdir() != nil:
+		if f.mkdirFailure != 0 {
+			return &authoritypb.Response{Errno: int32(f.mkdirFailure)}, nil
+		}
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetMkdir().GetName())}}}, nil
 	case request.GetSymlink() != nil:
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetSymlink().GetName())}}}, nil
@@ -1103,6 +1112,71 @@ func TestGetxattrSupportsSizeProbe(t *testing.T) {
 	}
 }
 
+func TestSetxattrReadonlyContractIsLocal(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	n := testNode(mount)
+	var beforeCalls, beforeSequence uint64
+	rpc.snapshot(func(f *fakeRPC) {
+		beforeCalls, beforeSequence = uint64(f.calls), f.mutationSeq
+	})
+
+	// VFS owns public xattr-name syntax before this callback. Once a valid set
+	// mode reaches the filesystem, user-xattr-readonly is the exact result even
+	// for a name a direct authority caller could not use.
+	for _, name := range []string{"user.test", "", "security.capability", "user.portablefs.internal"} {
+		for _, flags := range []uint32{0, unix.XATTR_CREATE, unix.XATTR_REPLACE} {
+			if errno := n.Setxattr(context.Background(), name, []byte("value"), flags); errno != syscall.EOPNOTSUPP {
+				t.Fatalf("Setxattr(%q, flags=%#x)=%v, want EOPNOTSUPP", name, flags, errno)
+			}
+		}
+	}
+	rpc.snapshot(func(f *fakeRPC) {
+		if uint64(f.calls) != beforeCalls || f.mutationSeq != beforeSequence {
+			t.Fatalf("local setxattr refusal advanced RPC calls %d->%d or mutation sequence %d->%d", beforeCalls, f.calls, beforeSequence, f.mutationSeq)
+		}
+	})
+}
+
+func TestSetxattrInvalidFlagsPrecedeReadonlyRefusal(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	n := testNode(mount)
+	for _, test := range []struct {
+		name  string
+		flags uint32
+	}{
+		{name: "user.test", flags: unix.XATTR_CREATE | unix.XATTR_REPLACE},
+		{name: "", flags: 1 << 31},
+	} {
+		if errno := n.Setxattr(context.Background(), test.name, nil, test.flags); errno != syscall.EINVAL {
+			t.Fatalf("Setxattr(%q, flags=%#x)=%v, want EINVAL", test.name, test.flags, errno)
+		}
+	}
+	rpc.snapshot(func(f *fakeRPC) {
+		if f.calls != 0 || f.mutationSeq != 0 {
+			t.Fatalf("invalid setxattr flags reached RPC: calls=%d mutation_sequence=%d", f.calls, f.mutationSeq)
+		}
+	})
+}
+
+func TestRemovexattrStillForwardsToAuthority(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	n := testNode(mount)
+	removed := 0
+	rpc.hook = func(request *authoritypb.Request) {
+		if remove := request.GetRemoveXattr(); remove != nil && string(remove.GetName()) == "user.test" {
+			removed++
+		}
+	}
+	if errno := n.Removexattr(context.Background(), "user.test"); errno != 0 {
+		t.Fatalf("Removexattr=%v", errno)
+	}
+	rpc.snapshot(func(f *fakeRPC) {
+		if removed != 1 || f.calls != 1 || f.mutationSeq != 1 {
+			t.Fatalf("remove forwarding: matched=%d calls=%d mutation_sequence=%d", removed, f.calls, f.mutationSeq)
+		}
+	})
+}
+
 func TestListxattrSupportsSizeProbe(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	rpc.xattrNames = [][]byte{[]byte("user.a"), []byte("user.bb")}
@@ -1404,15 +1478,18 @@ func (f *fakeRPC) AckVisibility(_ context.Context, cursor *authoritypb.Visibilit
 	return nil
 }
 
-// ReportVisibilityBlocked records the one acknowledgment that is a report
-// rather than a confirmation: this mount saying it cannot service the phase it
-// is holding. The authority always ends the session on it, so a test asserting
-// that it was sent is asserting that the mount chose to die here.
-func (f *fakeRPC) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor) error {
+// ReportVisibilityBlocked records the exact-cycle report and lets a test model
+// the authority's pre-apply interruption before the report returns.
+func (f *fakeRPC) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor, parents []uint64) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.blocked = append(f.blocked, proto.Clone(cursor).(*authoritypb.VisibilityCursor))
-	return f.blockedErr
+	f.blockedParents = append(f.blockedParents, append([]uint64(nil), parents...))
+	err, hook := f.blockedErr, f.onBlocked
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook()
+	}
+	return err
 }
 
 func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof) error {

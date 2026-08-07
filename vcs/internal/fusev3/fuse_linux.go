@@ -95,11 +95,13 @@ type RPC interface {
 	InitialVisibilityCursor() *authoritypb.VisibilityCursor
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
-	// ReportVisibilityBlocked says this mount cannot service the phase it is
-	// holding. It always ends the session, so it is never speculative: see
-	// rawFileSystem.blockedRepair for the two facts that must both be true, and
-	// note that only this frontend holds the second one.
-	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor) error
+	// ReportVisibilityBlocked arms a nonterminal cycle break for the exact kernel
+	// parents this frontend both needs to repair and already has a callback parked
+	// in. The authority maps them through the pending COMPLETE to stable parent
+	// identities and refuses those queued mutations pre-apply; ordinary COMPLETE
+	// acknowledgment later removes the scope. Route changes use an empty parent
+	// set as the terminal unable-to-serve report.
+	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor, []uint64) error
 	// DetachAfterUnmount may be called only with evidence that this frontend's
 	// kernel mount is gone.
 	DetachAfterUnmount(context.Context, MountAbsenceProof) error
@@ -804,7 +806,11 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 }
 
 func (n *node) Lookup(ctx context.Context, name string) (*authoritypb.Item, syscall.Errno) {
-	response, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name)}}})
+	// Lookup transfers a retained authority item capability. It is read-only in
+	// XFS but not side-effect-free in the session, so it uses exact replay: a
+	// lost response must return the same capability instead of allocating an
+	// unreachable second one.
+	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name)}}})
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1300,19 +1306,21 @@ func (n *node) Getxattr(ctx context.Context, name string, dest []byte) (uint32, 
 	return uint32(len(value)), 0
 }
 
-func (n *node) Setxattr(ctx context.Context, name string, value []byte, flags uint32) syscall.Errno {
-	mode := authoritypb.SetXattrRequest_UPSERT
+func (n *node) Setxattr(_ context.Context, _ string, _ []byte, flags uint32) syscall.Errno {
 	switch flags {
 	case 0:
 	case unix.XATTR_CREATE:
-		mode = authoritypb.SetXattrRequest_CREATE
 	case unix.XATTR_REPLACE:
-		mode = authoritypb.SetXattrRequest_REPLACE
 	default:
 		return syscall.EINVAL
 	}
-	_, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{Item: cloneBytes(n.item.GetToken()), Name: []byte(name), Value: cloneBytes(value), Mode: mode}}})
-	return errno
+	// Authority protocol v3 requires user-xattr-readonly at Attach, so every
+	// valid set mode has one exact result for the lifetime of this mount. Refuse
+	// it before allocating a replay sequence or visibility ticket. Linux VFS
+	// validates the public name before invoking the FUSE callback; once the
+	// callback is reached, the frozen read-only contract takes precedence just
+	// as the authority's SetXattr implementation does today.
+	return syscall.EOPNOTSUPP
 }
 
 func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
