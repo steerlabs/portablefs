@@ -31,12 +31,11 @@ body:
     attributes:
       label: Component
       options:
-        - VCS data plane (authority / journal / WAL)
+        - Authority server (direct store / XFS / WAL)
         - Mount client (Linux FUSE)
         - Mount client (macOS FSKit / portablefsd)
-        - volume-api
-        - authority-manager
         - CLI
+        - Installer / release artifacts
         - Docs
         - Other / not sure
     validations:
@@ -45,11 +44,11 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS + arch, mount transport, deployment shape (production flags, TLS, self-hosted vs quickstart), and version / commit.
+      description: OS + arch, mount transport, how the authority is deployed (flags, TLS, storage), and version / commit.
       placeholder: |
         - OS/arch: macOS 15 arm64 / Ubuntu 24.04 amd64
         - Transport: FSKit / FUSE
-        - Deployment: quickstart / self-hosted (production mode?)
+        - Authority: local binary / self-hosted (XFS backing store? TLS?)
         - Version or commit:
     validations:
       required: true

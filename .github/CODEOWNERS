@@ -5,12 +5,18 @@
 
 # Data plane and durability core (highest-risk changes)
 /vcs/                       @timjang3
-/packages/metadata-db/      @timjang3
+/swift/PortableFSKit/       @timjang3
 
-# Supply chain: workflows, release, and the pin policy gate them all
+# Frozen wire protocol sources
+/pfslocal/                  @timjang3
+/proto/                     @timjang3
+
+# Supply chain: workflows, release, and the policy gates
 /.github/workflows/         @timjang3
 /.goreleaser.yaml           @timjang3
 /scripts/check-workflow-pins.mjs @timjang3
+/scripts/check-install-release-trust.mjs @timjang3
+/scripts/install.sh         @timjang3
 
 # Security and legal
 /SECURITY.md                @timjang3

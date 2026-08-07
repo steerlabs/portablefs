@@ -33,12 +33,49 @@ func Open(backingRoot string, perm fs.FileMode) (*Root, error) {
 	if err := os.MkdirAll(backingRoot, perm); err != nil {
 		return nil, fmt.Errorf("create backing root: %w", err)
 	}
+	return openPinned(backingRoot)
+}
+
+// OpenExisting opens an already-present directory without creating any path.
+// The final component must itself be a directory, never a symlink. Identity is
+// checked before and after OpenRoot so a concurrent pathname swap cannot make
+// an inspection or prune operate on a different tree.
+func OpenExisting(backingRoot string) (*Root, error) {
+	if backingRoot == "" {
+		return nil, errors.New("confinedfs: backing root is required")
+	}
+	return openPinned(backingRoot)
+}
+
+func openPinned(backingRoot string) (*Root, error) {
+	before, err := os.Lstat(backingRoot)
+	if err != nil {
+		return nil, err
+	}
+	if !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("confinedfs: backing root must be a directory, not %s", before.Mode())
+	}
 	if err := platformProbe(backingRoot); err != nil {
 		return nil, err
 	}
 	r, err := os.OpenRoot(backingRoot)
 	if err != nil {
 		return nil, fmt.Errorf("open backing root capability: %w", err)
+	}
+	reject := func(cause error) (*Root, error) {
+		_ = r.Close()
+		return nil, cause
+	}
+	opened, err := r.Stat(".")
+	if err != nil {
+		return reject(fmt.Errorf("stat opened backing root: %w", err))
+	}
+	after, err := os.Lstat(backingRoot)
+	if err != nil {
+		return reject(fmt.Errorf("recheck backing root: %w", err))
+	}
+	if !os.SameFile(before, opened) || !os.SameFile(before, after) || after.Mode()&os.ModeSymlink != 0 {
+		return reject(errors.New("confinedfs: backing root changed while its capability was opened"))
 	}
 	return &Root{root: r}, nil
 }
@@ -129,6 +166,43 @@ func (r *Root) Rename(oldname, newname string) error {
 		return err
 	}
 	return r.root.Rename(oldname, newname)
+}
+
+// RenameNoReplace atomically renames oldname only when newname does not
+// exist. A pathname probe followed by Rename is not equivalent: another mount
+// or host process can create the destination between those syscalls. Parent
+// directories are opened through the confined root first, then the platform's
+// descriptor-relative no-replace primitive performs the one atomic step.
+func (r *Root) RenameNoReplace(oldname, newname string) error {
+	oldname, err := clean(oldname)
+	if err != nil {
+		return err
+	}
+	newname, err = clean(newname)
+	if err != nil {
+		return err
+	}
+	oldParent, oldBase := path.Split(oldname)
+	newParent, newBase := path.Split(newname)
+	oldParent = strings.TrimSuffix(oldParent, "/")
+	newParent = strings.TrimSuffix(newParent, "/")
+	if oldParent == "" {
+		oldParent = "."
+	}
+	if newParent == "" {
+		newParent = "."
+	}
+	oldDir, err := r.root.Open(oldParent)
+	if err != nil {
+		return err
+	}
+	defer oldDir.Close()
+	newDir, err := r.root.Open(newParent)
+	if err != nil {
+		return err
+	}
+	defer newDir.Close()
+	return platformRenameNoReplace(int(oldDir.Fd()), oldBase, int(newDir.Fd()), newBase)
 }
 
 func (r *Root) Link(oldname, newname string) error {

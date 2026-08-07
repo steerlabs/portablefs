@@ -34,21 +34,29 @@ type loadedAttachRegistry struct {
 }
 
 type persistedAttachEntry struct {
-	Ref                 string                `json:"ref"`
-	VolumeID            string                `json:"volumeId"`
-	Branch              string                `json:"branch"`
-	MountPath           string                `json:"mountPath"`
-	AuthorityURL        string                `json:"authorityUrl"`
-	DataPlaneTransport  string                `json:"dataPlaneTransport"`
-	DataPlaneServerName string                `json:"dataPlaneServerName,omitempty"`
-	TLSCAPEM            string                `json:"tlsCaPem,omitempty"`
-	TLSCASHA256         string                `json:"tlsCaSha256,omitempty"`
-	Options             AttachOptions         `json:"options"`
-	IdentityEpoch       uint64                `json:"identityEpoch,omitempty"`
-	DetachPrepared      bool                  `json:"detachPrepared,omitempty"`
-	DetachForce         bool                  `json:"detachForce,omitempty"`
-	DetachJobID         string                `json:"detachJobId,omitempty"`
-	Items               []persistedItemRecord `json:"items,omitempty"`
+	Ref                 string        `json:"ref"`
+	VolumeID            string        `json:"volumeId"`
+	Branch              string        `json:"branch"`
+	MountPath           string        `json:"mountPath"`
+	AuthorityURL        string        `json:"authorityUrl"`
+	DataPlaneTransport  string        `json:"dataPlaneTransport"`
+	DataPlaneServerName string        `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM            string        `json:"tlsCaPem,omitempty"`
+	TLSCASHA256         string        `json:"tlsCaSha256,omitempty"`
+	Options             AttachOptions `json:"options"`
+	IdentityEpoch       uint64        `json:"identityEpoch,omitempty"`
+	DetachPrepared      bool          `json:"detachPrepared,omitempty"`
+	DetachForce         bool          `json:"detachForce,omitempty"`
+	DetachJobID         string        `json:"detachJobId,omitempty"`
+	// Items is the retired client-journal architecture's FSKit item table. It
+	// is decoded so a legacy record still round-trips through revival (where
+	// it is refused with the unmount-and-remount remedy) and is never read.
+	Items []persistedItemRecord `json:"items,omitempty"`
+	// V3 marks an authority-v3 attach. It carries only the credential-free
+	// declared contract (see v3attach.go): the strict session dies with the
+	// daemon process, so a revived v3 entry supports exactly one operation —
+	// the exact unmount — and is never reactivated from disk.
+	V3 *persistedV3Attach `json:"v3,omitempty"`
 }
 
 type persistedItemRecord struct {
@@ -256,8 +264,24 @@ func validatePersistedAttach(e *persistedAttachEntry) error {
 	if strings.TrimSpace(e.VolumeID) == "" || strings.TrimSpace(e.VolumeID) != e.VolumeID {
 		return fmt.Errorf("volumeId is empty or has surrounding whitespace")
 	}
-	if strings.TrimSpace(e.Branch) == "" || strings.TrimSpace(e.Branch) != e.Branch {
-		return fmt.Errorf("branch is empty or has surrounding whitespace")
+	if strings.TrimSpace(e.Branch) != e.Branch {
+		return fmt.Errorf("branch has surrounding whitespace")
+	}
+	// A v3 attach is exactly the branchless case; every other attach still
+	// requires a branch, so the two modes cannot be confused in the inventory.
+	if e.Branch == "" && e.V3 == nil {
+		return fmt.Errorf("branch is empty")
+	}
+	if e.Branch != "" && e.V3 != nil {
+		return fmt.Errorf("a v3 attach must be branchless")
+	}
+	if e.V3 != nil {
+		if err := validPersistedV3Attach(e.V3); err != nil {
+			return fmt.Errorf("invalid v3 attach contract: %w", err)
+		}
+		if e.DataPlaneTransport != "tls-private-ca" && e.DataPlaneTransport != "tls-system-pki" {
+			return fmt.Errorf("v3 attach requires mutually authenticated TLS; transport %q is invalid", e.DataPlaneTransport)
+		}
 	}
 	if !filepath.IsAbs(e.MountPath) || filepath.Clean(e.MountPath) != e.MountPath {
 		return fmt.Errorf("mountPath %q is not canonical and absolute", e.MountPath)
@@ -268,17 +292,8 @@ func validatePersistedAttach(e *persistedAttachEntry) error {
 	if e.Options.DiskCacheMB < 0 {
 		return fmt.Errorf("negative diskCacheMb")
 	}
-	normalizedLocalDirs, err := normalizeLocalDirs(e.Options.LocalDirs)
-	if err != nil {
-		return fmt.Errorf("invalid persisted localDirs: %w", err)
-	}
-	if len(normalizedLocalDirs) != len(e.Options.LocalDirs) {
-		return fmt.Errorf("persisted localDirs are not canonical")
-	}
-	for i := range normalizedLocalDirs {
-		if normalizedLocalDirs[i] != e.Options.LocalDirs[i] {
-			return fmt.Errorf("persisted localDirs are not canonical")
-		}
+	if e.V3 != nil && (len(e.Options.LocalDirs) != 0 || e.Options.VolumeLocalDirs) {
+		return fmt.Errorf("a v3 attach carries no machine-local graft routing")
 	}
 	if err := (dataPlaneTransport{
 		mode:       e.DataPlaneTransport,
@@ -371,14 +386,6 @@ func validatePersistedItems(e persistedAttachEntry) error {
 func (r *registry) persist() error {
 	r.persistMu.Lock()
 	defer r.persistMu.Unlock()
-	// Hold the journal closed across snapshot+write+truncate: an append racing
-	// the snapshot could otherwise be truncated away while its binding change
-	// missed the snapshot — a lost delta. Appenders never hold attach locks
-	// while appending, so blocking them here cannot deadlock.
-	if r.journal != nil {
-		r.journal.mu.Lock()
-		defer r.journal.mu.Unlock()
-	}
 	entries := r.persistedEntries()
 	if r.preserveLegacyEmpty && len(entries) == 0 {
 		return nil
@@ -387,9 +394,6 @@ func (r *registry) persist() error {
 		return err
 	}
 	r.preserveLegacyEmpty = false
-	if r.journal != nil {
-		r.journal.truncateLocked()
-	}
 	return nil
 }
 

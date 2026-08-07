@@ -28,7 +28,7 @@ private final class PfsContinuationBox<T: Sendable>: @unchecked Sendable {
 }
 
 final class PfsAsyncSocket: @unchecked Sendable {
-    private static let connectQueue = DispatchQueue(label: "dev.portablefs.pfslocal.connect", qos: .utility)
+    private static let connectQueue = DispatchQueue(label: "dev.portablefs.pfslocal.connect", qos: .userInitiated)
 
     private let io: DispatchIO
     private let queue: DispatchQueue
@@ -38,7 +38,7 @@ final class PfsAsyncSocket: @unchecked Sendable {
 
     private init(fd: Int32, maxFrameLength: Int) throws {
         self.maxFrameLength = maxFrameLength
-        self.queue = DispatchQueue(label: "dev.portablefs.pfslocal.io.\(UUID().uuidString)", qos: .utility)
+        self.queue = DispatchQueue(label: "dev.portablefs.pfslocal.io.\(UUID().uuidString)", qos: .userInitiated)
         let ioFD = dup(fd)
         guard ioFD >= 0 else {
             let error = Darwin.errno

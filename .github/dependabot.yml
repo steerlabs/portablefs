@@ -1,16 +1,9 @@
-# Keeps the supply-chain pins fresh: npm packages, Go modules (vcs/), the
-# SHA-pinned GitHub Actions, and the digest-pinned Dockerfile base images.
+# Keeps the supply-chain pins fresh: Go modules (vcs/), the Swift package, and
+# the SHA-pinned GitHub Actions. The repository carries no npm packages and
+# publishes no container images.
 version: 2
 
 updates:
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-    groups:
-      npm-minor-patch:
-        update-types: [minor, patch]
-
   - package-ecosystem: gomod
     directory: /vcs
     schedule:
@@ -27,10 +20,10 @@ updates:
       github-actions:
         patterns: ["*"]
 
-  - package-ecosystem: docker
-    directory: /
+  - package-ecosystem: swift
+    directory: /swift/PortableFSKit
     schedule:
       interval: weekly
     groups:
-      docker-base-images:
-        patterns: ["*"]
+      swift-minor-patch:
+        update-types: [minor, patch]

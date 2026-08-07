@@ -5,7 +5,7 @@ package portablefsd
 import "fmt"
 
 func hostFSKitKernelOps() fskitKernelOps {
-	unsupported := func(_, _ string) error {
+	unsupported := func(_, _ string, _ bool) error {
 		return fmt.Errorf("daemon-owned FSKit unmount is supported only on macOS")
 	}
 	return fskitKernelOps{

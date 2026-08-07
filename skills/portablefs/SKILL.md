@@ -1,231 +1,167 @@
 ---
 name: portablefs
-description: "Durable, branchable, mountable workspaces for agents. Use when you need workspace continuity across machines/sessions, to fork a workspace for parallel attempts, to inspect workspace history, or to run commands against a PortableFS volume without mounting."
+description: "Live shared filesystems for agent workspaces. Use when you need one workspace mounted on several machines at once, workspace continuity across sessions, or to diagnose a PortableFS mount."
 ---
 
 # PortableFS Workspaces
 
-PortableFS gives you a workspace that is a place in the network, not a folder on one
-machine. Everything you need is the `portablefs` CLI and this file. Every command
-accepts `--json` for machine-readable output; parse that instead of scraping text.
+PortableFS gives you a workspace that is a place in the network, not a folder on
+one machine. You mount it, you use ordinary files, and another machine mounting
+the same volume sees the same live filesystem.
+
+Everything you need is the `portablefs` CLI and this file. Every command accepts
+`--json`; parse that instead of scraping text.
 
 ## Concepts
 
-- **Volume**: a workspace — one live filesystem plus its entire committed history.
-  Volume ids are client-chosen names (`[A-Za-z0-9_-]{1,220}`), so `myagent` is an id.
-- **Branch**: an independent line of history inside a volume; the default is `main`.
-  Commands take `--branch <name>`; `portablefs branch <volumeId> <name>` creates one.
-- **Snapshot**: a named, immutable checkpoint of a branch at a commit.
-- **Fork**: a new volume created from a snapshot; it diverges freely and never
-  affects the original.
-- **Authority**: the single server that owns the live state of an active branch. All
-  mounts of that branch talk to it, so every machine sees the same ordered state —
-  no sync, no merge, no conflict copies.
-- **Mount**: a real POSIX filesystem view of a branch on this machine. **Exec/grep**:
-  run a command or search server-side against an exact snapshot of the branch, no mount.
-- Writes are accepted immediately and checkpointed into history
-  automatically. On a mount, `fsync`, synchronize, dirty last-close, and
-  clean unmount are the explicit authority-durability boundaries; there is no
-  PortableFS-specific save, commit, or push step.
+- **Volume.** One workspace. It is one XFS directory on one Linux host, served by
+  one authority process. That directory is the truth.
+- **Authority.** The process that owns the volume. Every read and write goes
+  through it. It applies your bytes to the real filesystem before your `write(2)`
+  returns, so nothing you have written is stuck in a buffer somewhere.
+- **Mount.** One machine's live view of a volume. Several mounts can be live at
+  once, on different machines, and they see one filesystem.
+- **Machine-local routes.** Directories the volume declares as per-machine —
+  typically `node_modules`, `.venv`, `target`. They are served from local disk and
+  never travel. The declaration belongs to the volume, not to your machine.
 
-## Setup And Login
+There is no history, no branch, no snapshot, no fork, and no server-side command
+execution. If you need a second independent copy of a workspace, you need a
+second volume.
 
-Credentials live in `~/.config/portablefs/config.json`. Environment variables
-override the config file: `PORTABLEFS_API_URL`, `PORTABLEFS_API_TOKEN`,
-`PORTABLEFS_MANAGER_URL`, `PORTABLEFS_MANAGER_TOKEN`. Flags (`--api-url`,
-`--api-token`, `--manager-url`, `--manager-token`, on every command) override both.
+## Mounting
+
+A mount needs four things, all passed directly: the authority's address, a
+single-use mount capability, a verified TLS transport, and your mutual-TLS client
+identity.
 
 ```bash
-portablefs login --url https://api.example.com --token $TENANT_TOKEN \
-  --manager-url https://manager.example.com --manager-token $MANAGER_TOKEN
-portablefs version       # confirms the CLI works
-portablefs ls --json     # lists volumes; confirms auth works
+portablefs mount my-workspace ~/work \
+  --addr 10.0.0.7:2050 --mount-token "$PORTABLEFS_MOUNT_TOKEN" \
+  --data-plane-transport tls-private-ca \
+  --data-plane-server-name authority.internal --data-plane-ca ca.pem \
+  --client-cert client.pem --client-key client.key --json
 ```
 
-`--manager-url` defaults to the server URL and `--manager-token` to the API token,
-so a combined deployment needs only `--url` and `--token`. `portablefs logout`
-clears stored credentials.
+Use `--data-plane-transport tls-system-pki` with `--data-plane-server-name` when
+the authority has a publicly trusted certificate, and `tls-private-ca` with that
+name plus `--data-plane-ca` when it does not. Plaintext is refused. The client
+key must be `chmod 600`.
 
-## Mount vs Exec: Choose Deliberately
+The command daemonizes and returns; the mount persists. `--foreground` keeps it
+attached and unmounts on interrupt.
 
-**Mount** when you need full POSIX: builds, `git`, test suites, SQLite, editors,
-long-lived agent sessions. A mount is a normal directory; every tool works
-unchanged, and hot reads run at local page-cache speed.
+The capability is **single-use and never renewed**. When it ends, the mount ends.
+Mounting again with a fresh capability is what re-establishes it; there is
+nothing to refresh.
 
-Write mode is adaptive and has no mount flag: the authority delegates
-uncontended scopes for local-WAL acknowledgments and keeps contended paths
-write-through. Delegated `write(2)` is immediately visible locally and
-normally group-syncs within 5 ms, but it does not wait for physical sync.
-`fsync`, dirty last-close, synchronize, and normal unmount are real
-authority-durability barriers. A WAL error fails all later mutations until
-remount and never silently switches them to write-through. Use `--local-dir`
-for machine-specific build trees such as `node_modules`, `.venv`, or
-`target`.
-
-**Exec/grep** when you need one-shot answers and cannot or should not mount: no
-FUSE in this environment, a quick inspection of another workspace, or comparing
-forks. `exec` materializes an exact snapshot of the branch server-side, runs your
-command near the data, and returns output; `grep` searches the same snapshot. On a
-live branch the snapshot is captured at the moment of the call — every
-authority-visible write is included — at the cost of a few seconds of setup per
-call; tight loops should mount instead.
-
-## Golden Paths
-
-### Adopt an existing directory into a workspace
-
-`adopt` imports a local directory into a new volume without mounting anything —
-it hashes files locally, uploads only content the server does not already have,
-and commits one manifest. The source directory is never modified.
+Then just use the directory. Read, write, create, rename, lock. It is a
+filesystem.
 
 ```bash
-portablefs adopt ~/dev/myrepo --name myagent --json
-# {"volumeId":"myagent","branch":"main","commitId":"cmt_...","treeHash":"sha256:...",
-#  "files":1204,"dirs":211,"symlinks":3,"bytes":48211003,"skipped":0,
-#  "uploadedBlobs":980,"dedupedBlobs":224}
+portablefs umount ~/work --json
 ```
 
-Everything is included by default — `.git`, untracked files, `.env` — because the
-workspace IS the working directory. Skip paths with repeatable `--exclude`
-globs or a `.portablefsignore` file; preview with `--dry-run`; add
-`--mount <path>` to mount immediately after import. Re-running against an
-existing volume name fails with a clear error (choose another `--name`).
+A normal unmount runs the full drain barrier and fails, leaving the mount
+attached, if the drain cannot complete. `--force` skips the proof rather than
+abandoning data: a mount holds no local durability debt, because every
+acknowledged write is already applied at the authority. Use `--force` when the
+authority is unreachable and you need the mount gone now.
 
-### Create and mount a workspace
+## The commands that exist
+
+| Command | Use it for |
+| --- | --- |
+| `portablefs mount <volumeId> <path>` | Attach a volume on this machine. |
+| `portablefs umount <path>` | Drain and detach. `--force` skips the drain proof. |
+| `portablefs mounts` | This machine's mounts and their health: live, stale, or credential-expired. |
+| `portablefs route <path>` | Whether a path is machine-local or shared, and which rule decided. |
+| `portablefs prune-local` | Reclaim machine-local backing no route can reach. Dry-run by default; `--delete` to act. |
+| `portablefs mount-check` | Inspect this host's mount prerequisites. Contacts nothing, changes nothing. |
+| `portablefs doctor` | Read-only health check of transport, extension, daemon, and mounts. |
+| `portablefs daemon stop` | Stop the per-user daemon, only when it is atomically proven idle. |
+| `portablefs version` | The CLI version. |
+
+`portablefs help <command>` has the detailed text for each. Anything not in this
+table is either an installer surface or does not exist.
+
+## Working in a shared workspace
+
+Two agents on two machines writing the same volume is the normal case, and the
+coordination primitives are the ordinary filesystem ones.
+
+- **Write to distinct files.** This is the answer most of the time and it needs
+  no coordination at all.
+- **Use atomic rename for whole-file replacement.** Write a temporary file, then
+  rename it over the target. The later rename wins, completely. Contents are
+  never merged.
+- **Use POSIX record locks or `flock`** when two writers genuinely need the same
+  file. Both work across mounts and both are released when your process exits.
+- **Do not assume a shared `mmap`.** `MAP_SHARED` on a file is refused; use read
+  and write. `MAP_PRIVATE` works.
+- **Do not use SQLite WAL mode** on the shared volume. Rollback-journal mode
+  works; WAL requires all participants on one host. Keep a WAL database on
+  machine-local backing.
+
+## Keep dependency trees off the volume
+
+A `node_modules` or `.venv` directory is thousands of small files with no meaning
+on another machine. Shipping them through the authority is the single worst thing
+you can do to a workspace's speed.
+
+The volume declares which directories are machine-local in `.portablefs/local-dirs`.
+Your mount adopts that declaration when it attaches, and every machine routes
+identically. You cannot override it per machine: `--local-dir` is refused, because
+a per-machine route would hide from you a directory your peers still treat as
+shared.
 
 ```bash
-portablefs create myagent --json
-# {"volumeId":"myagent","tenantId":"local","branch":"main",
-#  "headCommitId":"cmt_1a2b...","treeHash":"sha256:..."}
-
-portablefs mount myagent ~/work --json
-# {"ok":true,"pid":52114,"strategy":"fuse","mountPath":"/home/user/work",
-#  "volumeId":"myagent","branch":"main"}
-
-cd ~/work
-# ... work normally: git clone, edit, build, run tests ...
+portablefs route ~/work/agent-app/node_modules/react   # machine-local, and why
+portablefs route ~/work/src/main.go                    # shared
 ```
 
-Writes checkpoint automatically. When done on this machine:
-`portablefs umount ~/work`. Clean unmount forces the local WAL, drains it to
-authority durability, and refuses to detach on failure.
+Machine-local backing survives unmount and remount deliberately. `prune-local`
+is the explicit step that frees it.
 
-### Inspect state and history
+**Never route a directory that holds irreplaceable data.** A machine-local
+directory is not backed up, not replicated, and not visible to anyone else. It is
+for reproducible build output. If losing that machine would lose something that
+matters, it does not belong behind a route.
 
-```bash
-portablefs status myagent --json
-# {"volumeId":"myagent","branch":"main","headCommitId":"cmt_51ab...",
-#  "treeHash":"sha256:...","activeLeases":1,"activeDelegations":0}
+macOS does not join the route adoption protocol. A volume that declares routes
+mounts from Linux.
 
-portablefs history myagent --limit 20 --json
-# {"commits":[
-#   {"id":"cmt_51ab...","treeHash":"sha256:...","createdAtMs":1751500449000,
-#    "mutationCount":42,"byteCount":18734,"parentCommitId":"cmt_40aa..."},
-#   ...]}
-```
+## Continuity
 
-`activeLeases` > 0 means the branch currently has a writer. Every checkpoint the
-workspace ever produced is in `history` — use it to see what an agent did and when.
+Your workspace outlives your session and your machine. Mount it from a laptop
+today and a sandbox tomorrow, with a fresh capability each time, and it is the
+same live filesystem — including whatever the last session left half-finished.
 
-### Snapshot before something risky
-
-```bash
-portablefs snapshot myagent --name before-rebase --json
-# {"snapshot":{"id":"snp_77cd...","volumeId":"myagent","commitId":"cmt_51ab...",
-#              "name":"before-rebase","createdAt":1751500449000}}
-portablefs snapshots myagent --json
-```
-
-Snapshots are metadata-only (cheap) and immutable. Fork one to recover or compare.
-
-### Fork for N parallel attempts, then compare
-
-Forks are the correct way to run multiple writing agents from one starting point:
-
-```bash
-portablefs snapshot myagent --name fanout-base
-for i in 1 2 3; do
-  portablefs fork myagent --snapshot fanout-base --name "attempt-$i" --json
-done
-# {"volumeId":"attempt-1","branch":"main","headCommitId":"cmt_...","snapshotId":"snp_..."}
-
-# run one agent per fork — mount each on its own machine/sandbox, or use exec:
-portablefs exec attempt-1 -- sh -c 'npm ci && npm test'
-portablefs exec attempt-2 -- sh -c 'npm ci && npm test'
-
-# compare outcomes without mounting anything:
-portablefs grep attempt-1 "FAIL" --json
-portablefs history attempt-2 --json
-```
-
-(`fork` without `--snapshot` snapshots the branch head for you.) Pick the winner
-and keep working in it; the losers cost only their unique bytes (content is
-deduplicated), and their history explains every attempt.
-
-### One-shot commands without a mount
-
-```bash
-portablefs exec myagent -- git log --oneline -5
-portablefs exec myagent --timeout 120s -- sh -c 'ls -la && cat package.json'
-# --json returns {"stdout":"...","stderr":"...","exitCode":0,...}; the CLI's own
-# exit code mirrors the remote command's.
-
-portablefs grep myagent "TODO" --dir src --json
-# {"matches":[{"file":"src/planner.ts","line":214,"text":"// TODO: retry budget"}],
-#  "stoppedReason":"completed","durationMs":2,"headCommitId":"cmt_51ab..."}
-# exit code follows grep(1): 0 = matches, 1 = none.
-```
-
-`exec` is read-only by default; pass `--write` to commit the command's filesystem
-changes back to the branch. Prefer a mount for anything interactive or multi-step.
-
-## Continuity: Resume On A New Machine
-
-The workspace outlives every machine. To continue exactly where work stopped —
-yours or another agent's:
-
-```bash
-portablefs login --url <api-url> --token $TENANT_TOKEN   # once per machine
-portablefs mount myagent ~/work
-cd ~/work    # identical state: same files, same git repo, same everything
-```
-
-Before a laptop closes or a sandbox is destroyed, run the application's
-normal `fsync` boundary or cleanly unmount. That guarantees the accepted tail
-is durable at the authority. All mounts of a branch attach to the same live
-authority; a new machine can then continue from that ordered state without
-copying or merging folders.
+Any Linux sandbox that can run a static binary and reach the authority can mount
+a workspace. It needs the address, its own capability, and its own client
+identity.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| `login` fails 401/403 | Wrong or admin-scoped token | Use a tenant token for the API. Check `PORTABLEFS_API_TOKEN` is not overriding a fresh `login` with a stale value. |
-| Commands fail: connection refused | Wrong URL or stack not running | Check the URL in `~/.config/portablefs/config.json` and any `PORTABLEFS_API_URL` override; `portablefs ls` to retest. |
-| `mount` says "no authority manager configured" | Manager coordinates unset | Re-run `login` with `--manager-url`/`--manager-token`, set the `PORTABLEFS_MANAGER_*` envs, or mount directly with `--addr <host:port> --mount-token <token>`. |
-| `mount` on macOS fails with FSKit extension guidance | The PortableFS FSKit extension is not registered on this machine | Install PortableFS.app and enable its File System Extension under System Settings → General → Login Items & Extensions, then retry. macOS mounts always use the FSKit strategy (`"strategy":"fskit"` in the JSON output); Linux mounts use FUSE. |
-| `exec --write` refuses on a live branch | Live branches take writes only through their single ordered authority | Write through a mount (`portablefs mount`). Read-only `exec` and `grep` always work — they run against an exact snapshot of the live state. |
-| `mount` on Linux: fusermount3 not found | FUSE tools missing | Install the `fuse3` package, or fall back to `portablefs exec`. |
-| Mountpoint errors (`Transport endpoint is not connected`, "already mounted") | Stale mount from a dead daemon | `portablefs mounts` lists mounts and marks dead ones `stale`; run `portablefs umount <path>` for the stale entry, then remount. |
-| A direct write attach fails with a busy-lease error | The branch's live authority holds the exclusive write lease while mounts are active | Make the change through a mount. `portablefs status --json` shows `activeLeases`. |
-| `exec` killed by signal | Remote command exceeded `--timeout` (default 60s) | Raise `--timeout`, split the command, or mount and run locally. |
-| `grep` exits 1 with no output | No matches (grep semantics) | Not an error; broaden the pattern or drop `--dir`. |
+| Symptom | What it means |
+| --- | --- |
+| `mount` fails naming the credential shape | A required flag is missing. All of `--addr`, `--mount-token`, `--data-plane-transport`, `--data-plane-server-name`, `--client-cert`, `--client-key` are needed. |
+| `mount` refuses `--branch` or `--local-dir` | Those are retired surfaces. A volume is branchless, and routes are declared volume-wide. |
+| `mounts` shows `credential-expired` | The single-use capability ended. Mount again with a fresh one. |
+| `mounts` shows `stale` | The daemon is gone. `portablefs umount <path>` cleans it up. |
+| On macOS, mount fails on the extension | `PortableFS.app` must be installed and its File System Extension enabled once under System Settings. `portablefs mount-check` reports the prerequisite; `portablefs doctor` reports the rest. |
+| Unmount refuses because an intent is stuck | `portablefs umount <path> --discard-record` removes bookkeeping only, and only after proving nothing is mounted and no owner survives. Never edit the mount state directory by hand. |
+| Everything on the mount returns `ENOTCONN` | The mount revoked itself after losing the authority for longer than its repair budget. Remount. |
 
-## Safety Notes
+## Safety notes
 
-- **One exclusive writer per branch by default.** One live authority holds the
-  branch's write lease; competing write attaches (another authority, `exec
-  --write` against a mounted branch) are rejected, not merged. Mounts of that
-  branch all write through the one authority.
-- **Fork for parallel attempts.** N agents attempting the same task means N forks,
-  one per agent — never N agents interleaving writes on one branch.
-- **Never point two writing agents at the same branch paths** unless the
-  deployment has set up delegations (subtree checkout/checkin) partitioning the
-  tree between them. Without delegation claims on disjoint subtrees, concurrent
-  same-file writes behave like a normal shared filesystem: ordered by the
-  authority, last writer wins.
-- **History is durable and visible.** Everything written becomes part of
-  checkpoint history that `history`/`fork` can reach. Do not write secrets into a
-  workspace you would not put in a repository.
-- Reads never block on writers: mounting read-heavy tooling alongside one writer
-  is always safe.
+- **Acknowledged means applied.** A returned `write(2)` is in the volume. There
+  is no flush window to wait out and no local tail to lose.
+- **`close` is not `fsync`.** If you need durability across power loss, `fsync`
+  the file and its parent directory, as you would locally.
+- **`syncfs(2)` does not reach the authority** on Linux FUSE. Use file and
+  directory `fsync`.
+- **There is no undo.** No history, no snapshots. A `rm -rf` on the volume is a
+  `rm -rf` on the volume.
+- **Reads never block on writers**, and one slow peer cannot stall the volume
+  indefinitely — it is fenced individually.

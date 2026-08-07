@@ -18,6 +18,15 @@ func TestClassifyFSKitMountFailureIsConservative(t *testing.T) {
 			fskitFailureResourceLoad,
 		},
 		{"missing helper", "mount_pfs: No such file or directory", fskitFailureModuleMissing},
+		{
+			// mount(8) always falls through to the legacy helper, so the
+			// helper-missing text accompanies EVERY FSKit failure; a final
+			// mount step error is the stronger evidence and reports FSKit
+			// host state, never an enablement problem.
+			"final mount step wins over helper fallback text",
+			"mount: Final mount step ended with error: The file couldn’t be saved because a file with the same name already exists.\nmount: exec /Library/Filesystems/pfs.fs/Contents/Resources/mount_pfs for /x: No such file or directory",
+			fskitFailureFinalMountStep,
+		},
 		{"helper named without missing evidence", "mount_pfs: permission denied", fskitFailureUnknown},
 		{"generic errno number", "mount failed with errno 45", fskitFailureUnknown},
 		{"operation unsupported", "Operation not supported", fskitFailureUnknown},

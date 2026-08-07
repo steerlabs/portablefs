@@ -241,7 +241,11 @@ func TestDecidePostUnmount(t *testing.T) {
 	}
 }
 
-func TestOwnerlessForceRequestRequiresExactOfflineStoreProof(t *testing.T) {
+// TestOwnerlessForceRequestRequiresDurableForceIntent pins what survives of
+// the abandoned-owner force continuation: a v3 mount has no client-side
+// durability debt to park, so the continuation's whole precondition is the
+// DURABLE force authorization — it never acts on an intent it cannot read.
+func TestOwnerlessForceRequestRequiresDurableForceIntent(t *testing.T) {
 	e, _, _ := testEnv(t)
 	stateDir := filepath.Join(t.TempDir(), "mounts")
 	mountPath := t.TempDir()
@@ -262,8 +266,8 @@ func TestOwnerlessForceRequestRequiresExactOfflineStoreProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := e.reconcileMountIntent(intent, true); err == nil ||
-		!strings.Contains(err.Error(), "abandoned FUSE store") {
-		t.Fatalf("ownerless force request bypassed exact offline store proof: %v", err)
+		!strings.Contains(err.Error(), "durable force-requested intent") {
+		t.Fatalf("ownerless force request bypassed its durable force authorization: %v", err)
 	}
 }
 

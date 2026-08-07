@@ -14,6 +14,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 func TestStartedChildIdentityFailurePreservesAdvancedIntent(t *testing.T) {
@@ -373,6 +376,110 @@ func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
 	}
 	if info, err := os.Lstat(controlSock); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("ownership check mutated stale socket: mode=%v err=%v", info, err)
+	}
+}
+
+func writeMountOwnershipV3Attach(t *testing.T, stateDir, mountPath, volumeID string) (string, string) {
+	t.Helper()
+	attachRef := "att_AAAAAAAAAAAAAAAAAAAAAA"
+	daemonStateDir := filepath.Join(filepath.Dir(stateDir), "portablefsd")
+	if err := privatepath.EnsureDir(daemonStateDir); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := json.Marshal(map[string]any{
+		"version": 2,
+		"attaches": []any{map[string]any{
+			"ref":                 attachRef,
+			"volumeId":            volumeID,
+			"branch":              "",
+			"mountPath":           mountPath,
+			"authorityUrl":        "127.0.0.1:2050",
+			"dataPlaneTransport":  dataPlaneTransportTLSSystemPKI,
+			"dataPlaneServerName": "authority.example",
+			"options":             map[string]any{},
+			"identityEpoch":       1,
+			"v3": map[string]any{
+				"cachedNameCapacity": uint64(1 << 16),
+				"repairBudgetMillis": uint64(15_000),
+				"cachePolicy":        portablefsd.V3CachePolicyMacOS26,
+				"routesRevision":     emptyRoutesRevision(),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryPath := filepath.Join(daemonStateDir, "attaches.json")
+	if err := privatepath.WriteFileAtomic(registryPath, append(registry, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	return attachRef, registryPath
+}
+
+// A watchdog may remove an unresponsive FSKit kernel mount without retiring
+// the daemon-owned attach. The durable attach remains the recovery authority
+// for umount; it is not permission for mount to spend another capability.
+func TestMountOwnershipRejectsSamePathDurableAttach(t *testing.T) {
+	e, _, _, stateDir := umountTestEnv(t)
+	mountPath, err := canonicalMountPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachRef, registryPath := writeMountOwnershipV3Attach(t, stateDir, mountPath, "vol_old")
+	before, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = e.validateMountOwnership(stateDir, "vol_old", "", mountPath)
+	if err == nil {
+		t.Fatal("same-path durable daemon attach was accepted for remount")
+	}
+	for _, want := range []string{attachRef, "durable daemon attach", "portablefs umount " + mountPath} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("ownership refusal %q does not contain %q", err, want)
+		}
+	}
+	after, readErr := os.ReadFile(registryPath)
+	if readErr != nil || !bytes.Equal(after, before) {
+		t.Fatalf("mount preflight changed durable recovery evidence: err=%v before=%q after=%q", readErr, before, after)
+	}
+}
+
+func TestMountCommandRejectsSamePathAttachBeforeCreatingIntent(t *testing.T) {
+	e, _, stderr, stateDir := umountTestEnv(t)
+	mountPath, err := canonicalMountPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachRef, _ := writeMountOwnershipV3Attach(t, stateDir, mountPath, "vol_old")
+	o := v3MountOpts(t)
+	args := []string{
+		"mount", "vol_new", mountPath,
+		"--addr", o.addr,
+		"--mount-token", o.mountToken,
+		"--data-plane-transport", o.dataPlaneTransport,
+		"--data-plane-server-name", o.dataPlaneServerName,
+		"--client-cert", o.clientCertPath,
+		"--client-key", o.clientKeyPath,
+		// Ownership preflight precedes strategy resolution. Keeping this invalid
+		// makes a regression fail without ever starting a mount child.
+		"--strategy", "invalid",
+	}
+	if rc := e.run(args); rc == 0 {
+		t.Fatal("mount accepted a path still owned by a daemon attach")
+	}
+	for _, want := range []string{attachRef, "portablefs umount " + mountPath} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("mount refusal %q does not contain %q", stderr.String(), want)
+		}
+	}
+	intents, err := listMountIntents(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 0 {
+		t.Fatalf("same-path attach preflight created mount intents: %+v", intents)
 	}
 }
 

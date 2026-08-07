@@ -11,7 +11,6 @@
 		2A0000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000102 /* AppModel.swift */; };
 		2A0000000000000000000003 /* PortableFSCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000103 /* PortableFSCLI.swift */; };
 		2A0000000000000000000005 /* MenuContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000105 /* MenuContent.swift */; };
-		2A0000000000000000000006 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000106 /* SignInView.swift */; };
 		2A0000000000000000000007 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000107 /* SettingsView.swift */; };
 		2A0000000000000000000008 /* FirstRunAssistant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000109 /* FirstRunAssistant.swift */; };
 		2A0000000000000000000011 /* ExtensionMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000201 /* ExtensionMain.swift */; };
@@ -49,7 +48,6 @@
 		200000000000000000000102 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		200000000000000000000103 /* PortableFSCLI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortableFSCLI.swift; sourceTree = "<group>"; };
 		200000000000000000000105 /* MenuContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuContent.swift; sourceTree = "<group>"; };
-		200000000000000000000106 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		200000000000000000000107 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		200000000000000000000108 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000109 /* FirstRunAssistant.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstRunAssistant.swift; sourceTree = "<group>"; };
@@ -98,7 +96,6 @@
 				200000000000000000000102 /* AppModel.swift */,
 				200000000000000000000103 /* PortableFSCLI.swift */,
 				200000000000000000000105 /* MenuContent.swift */,
-				200000000000000000000106 /* SignInView.swift */,
 				200000000000000000000107 /* SettingsView.swift */,
 				200000000000000000000109 /* FirstRunAssistant.swift */,
 				200000000000000000000108 /* Info.plist */,
@@ -266,7 +263,6 @@
 				2A0000000000000000000002 /* AppModel.swift in Sources */,
 				2A0000000000000000000003 /* PortableFSCLI.swift in Sources */,
 				2A0000000000000000000005 /* MenuContent.swift in Sources */,
-				2A0000000000000000000006 /* SignInView.swift in Sources */,
 				2A0000000000000000000007 /* SettingsView.swift in Sources */,
 				2A0000000000000000000008 /* FirstRunAssistant.swift in Sources */,
 			);

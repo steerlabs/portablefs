@@ -272,57 +272,6 @@ func TestMountsJSONNeverExposesPersistedAccessToken(t *testing.T) {
 	}
 }
 
-func TestSameOriginGatesTenancyOwnership(t *testing.T) {
-	cases := []struct {
-		name       string
-		managerURL string
-		apiURL     string
-		want       bool
-	}{
-		{"empty manager defaults to api origin", "", "https://cloud.example.com", true},
-		{"identical unified origin", "https://cloud.example.com", "https://cloud.example.com", true},
-		{"unified with differing paths", "https://cloud.example.com/x", "https://cloud.example.com/y", true},
-		{"case and default port normalized", "HTTPS://CLOUD.EXAMPLE.COM:443/x", "https://cloud.example.com/y", true},
-		{"split self-host ports", "http://127.0.0.1:18788", "http://127.0.0.1:18787", false},
-		{"split hosts", "https://mgr.example.com", "https://api.example.com", false},
-		{"scheme mismatch is split", "http://cloud.example.com", "https://cloud.example.com", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := sameOrigin(tc.managerURL, tc.apiURL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Fatalf("sameOrigin(%q, %q) = %v, want %v", tc.managerURL, tc.apiURL, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestResolveVolumeTeamIDUnifiedOriginSkipsLookup proves the CLI never asserts
-// tenancy (nor even calls the API) against a unified control plane; the split
-// path still resolves the volume's tenant from the API head call.
-func TestResolveVolumeTeamIDUnifiedOriginSkipsLookup(t *testing.T) {
-	e, _, _ := testEnv(t)
-	unified := settings{apiURL: "https://cloud.example.com", apiToken: "k", managerURL: "https://cloud.example.com"}
-	got, err := e.resolveVolumeTeamID(unified, "vol", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "" {
-		t.Fatalf("unified origin must not assert a teamId, got %q", got)
-	}
-}
-
-func TestSameOriginRejectsAmbiguousEndpoints(t *testing.T) {
-	for _, endpoint := range []string{"cloud.example.com", "https://user@cloud.example.com", "file:///tmp/socket", "https://cloud.example.com:bad", "https://cloud.example.com:0"} {
-		if _, err := sameOrigin(endpoint, "https://cloud.example.com"); err == nil {
-			t.Fatalf("ambiguous manager endpoint %q accepted", endpoint)
-		}
-	}
-}
-
 func TestReadMountStateRejectsPartialLeaseTransaction(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "mounts")
 	mountPath := filepath.Join(t.TempDir(), "mount")
