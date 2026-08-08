@@ -19,7 +19,7 @@ jobs:
   workflow-pins:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Enforce workflow pin policy (SHA pins, versioned runners, permissions)
@@ -40,7 +40,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Prove the Swift partitions cover every discovered test
@@ -120,7 +120,7 @@ jobs:
           - name: kit-t-z
             filter: 'PortableFSKitTests\.[T-Zt-z]'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Swift suite partition (FSKit adapter, app core, macOS 26 coherence)
@@ -182,10 +182,10 @@ jobs:
   go:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -220,7 +220,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify the runner can provide loop devices and /dev/fuse
@@ -248,7 +248,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify the runner can provide loop devices and /dev/fuse
