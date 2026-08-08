@@ -133,6 +133,7 @@ func (m *FileVisibilityMembership) Activate(id SessionID) error {
 	}
 	m.active[id] = struct{}{}
 	if err := m.persistLocked(); err != nil {
+		delete(m.active, id)
 		return err
 	}
 	return nil

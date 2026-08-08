@@ -8,6 +8,45 @@ import (
 	"testing"
 )
 
+func TestFileVisibilityMembershipActivateRollsBackAfterPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "strict-membership")
+	registry, _, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := SessionID{1}
+	registry.path = filepath.Join(dir, "missing", "strict-membership")
+	if err := registry.Activate(id); err == nil {
+		t.Fatal("activate succeeded without a durable membership path")
+	}
+	registry.path = path
+	if _, active := registry.active[id]; active {
+		t.Fatal("failed activation remained live in memory")
+	}
+	if err := registry.Activate(id); err != nil {
+		t.Fatalf("retry activation after restoring persistence: %v", err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, disposition, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if disposition != PriorEpochUnproven {
+		t.Fatalf("restart disposition = %v, want unproven", disposition)
+	}
+	if _, active := restarted.active[id]; !active {
+		t.Fatal("successful retry was not durable")
+	}
+}
+
 func TestFileVisibilityMembershipSurvivesRestartUntilFencingProof(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
