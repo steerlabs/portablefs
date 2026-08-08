@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"golang.org/x/sys/unix"
@@ -18,16 +21,69 @@ type unmountOps struct {
 	validateHelper func(string) error
 }
 
-func hostUnmountOps() unmountOps {
+// platformUnmountBudget bounds the external unmount helper.
+//
+// `/sbin/umount` on a wedged mount blocks in the same uninterruptible kernel
+// wait that made portablefsd unkillable, and the CLI used to wait on it with
+// exec.Command(...).CombinedOutput() — no deadline, and an output read that
+// cannot finish until every descriptor the child holds is closed. That is the
+// second half of why `portablefs umount` hung indefinitely.
+//
+// It is now bounded, the child is killed and its pipes are released at the
+// deadline (WaitDelay), and the command answers a definite verdict.
+//
+// A var so tests compress it; production never changes it.
+var platformUnmountBudget = 30 * time.Second
+
+// errPlatformUnmountAbandoned marks an unmount helper that never returned. The
+// detach is neither known-failed nor known-succeeded; the caller re-reads the
+// kernel mount table (which always answers) to decide.
+var errPlatformUnmountAbandoned = errors.New("platform unmount helper did not return within its budget")
+
+// hostUnmountOps takes its helper budget explicitly because different callers
+// answer to different clocks: an operator-driven `portablefs umount` may wait
+// the full platform budget, but the revocation watchdog acts inside the
+// authority's fencing grace and a 30-second helper wait would blow straight
+// through a 15-second budget it exists to honor.
+func hostUnmountOps(budget time.Duration) unmountOps {
 	return unmountOps{
-		goos:   runtime.GOOS,
-		direct: unix.Unmount,
-		combinedOut: func(name string, args ...string) ([]byte, error) {
-			return exec.Command(name, args...).CombinedOutput()
-		},
+		goos:           runtime.GOOS,
+		direct:         unix.Unmount,
+		combinedOut:    boundedCombinedOutputWithBudget(budget),
 		validateHelper: mounthost.ValidateFUSEHelper,
 	}
 }
+
+func boundedCombinedOutputWithBudget(budget time.Duration) func(string, ...string) ([]byte, error) {
+	return func(name string, args ...string) ([]byte, error) {
+		return boundedCombinedOutput(budget, name, args...)
+	}
+}
+
+func boundedCombinedOutput(budget time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	// A DETACH IS NEVER AN INTERACTIVE ACT. Handing the helper this process's
+	// stdin lets it stop and wait for input that a non-tty caller — a script, a
+	// CI job, the operator's own `< /dev/null` — can never supply. It gets
+	// nothing to read.
+	cmd.Stdin = nil
+	// WaitDelay is what makes the ceiling real: past it, Go closes the pipes it
+	// owns rather than waiting for a child that may be pinned in the kernel to
+	// release them.
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return out, fmt.Errorf("%w after %s", errPlatformUnmountAbandoned, budget)
+	}
+	return out, err
+}
+
+// platformUnmountOpsSource is a var so tests substitute the exec surface;
+// production never changes it. The budget is the caller's declared ceiling on
+// one helper run, and test substitutes receive it so they can assert it.
+var platformUnmountOpsSource func(time.Duration) unmountOps = hostUnmountOps
 
 // platformUnmountRecorded proves that the exact recorded kernel object is
 // the sole mount at the path immediately before issuing the path-based
@@ -41,7 +97,7 @@ func platformUnmountRecorded(st *mountState) error {
 	if !present {
 		return fmt.Errorf("refuse path unmount because the exact recorded kernel mount is absent")
 	}
-	return platformUnmountWith(st, hostUnmountOps())
+	return platformUnmountWith(st, platformUnmountOpsSource(platformUnmountBudget))
 }
 
 func platformUnmountWith(st *mountState, ops unmountOps) error {

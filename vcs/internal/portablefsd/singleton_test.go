@@ -247,8 +247,8 @@ func TestDaemonRestartReclaimsOnlyItsStaleCanonicalSockets(t *testing.T) {
 		StateDir:       filepath.Join(root, "state"),
 		Version:        "restart-test",
 	}
-	oldFrontend := leaveStaleUnixSocket(t, cfg.FrontendSocket)
-	oldControl := leaveStaleUnixSocket(t, cfg.ControlSocket)
+	_ = leaveStaleUnixSocket(t, cfg.FrontendSocket)
+	_ = leaveStaleUnixSocket(t, cfg.ControlSocket)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -258,16 +258,13 @@ func TestDaemonRestartReclaimsOnlyItsStaleCanonicalSockets(t *testing.T) {
 	waitUnix(t, cfg.FrontendSocket)
 	waitUnix(t, cfg.ControlSocket)
 
-	for path, oldInfo := range map[string]os.FileInfo{
-		cfg.FrontendSocket: oldFrontend,
-		cfg.ControlSocket:  oldControl,
-	} {
+	// A successful dial above proves that each closed stale socket was replaced
+	// by the daemon's live listener. Do not compare inode numbers here: Unix
+	// filesystems may immediately reuse the inode retired during reclamation.
+	for _, path := range []string{cfg.FrontendSocket, cfg.ControlSocket} {
 		current, err := os.Lstat(path)
 		if err != nil {
 			t.Fatal(err)
-		}
-		if os.SameFile(oldInfo, current) {
-			t.Fatalf("daemon reused stale socket inode at %s", path)
 		}
 		if current.Mode()&os.ModeSocket == 0 || current.Mode().Perm() != 0o600 {
 			t.Fatalf("replacement socket %s has unsafe mode %s", path, current.Mode())

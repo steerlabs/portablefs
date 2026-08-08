@@ -1,12 +1,11 @@
 # Third-Party Notices
 
 PortableFS is distributed under the Apache License 2.0 (see `LICENSE`). Its
-compiled artifacts — the `vcs` / mount / `portablefsd` / history-worker Go
-binaries and the Node.js control-plane services — statically or at runtime
-include third-party open-source components listed below. Each remains under its
-own license; the full license text ships with each dependency's source (in the
-Go module cache and in `node_modules`) and in each project's upstream
-repository.
+compiled artifacts — the `vcs`, `portablefs` and `portablefsd` Go binaries and
+the Swift `PortableFSKit` package — statically or at runtime include third-party
+open-source components listed below. Each remains under its own license; the
+full license text ships with each dependency's source (in the Go module cache)
+and in each project's upstream repository.
 
 No component below is under a copyleft license that would extend to
 PortableFS's own source (no GPL/AGPL). `golang-lru` is MPL-2.0 (file-level weak
@@ -35,23 +34,19 @@ copyleft, used unmodified as a library).
 origin; that notice is reproduced by the module source and applies to the NFS
 compatibility client.
 
-## Node.js runtime dependencies
+## Swift package (`swift/PortableFSKit`)
 
-The volume-api, authority-manager, and metadata-db services depend at runtime
-on:
+Beyond Apple's platform frameworks (FSKit, Foundation, AppKit), the Swift
+package resolves one exact-pinned dependency:
 
-| Package | License |
-| --- | --- |
-| pg | MIT |
-| zod | MIT |
-
-Development-only dependencies (TypeScript, Vitest, tooling) are not distributed
-in released artifacts and are omitted here.
+| Package | Version | License |
+| --- | --- | --- |
+| github.com/apple/swift-protobuf | 1.29.0 | Apache-2.0 |
 
 ## Regenerating this file
 
-Licenses are read from the resolved dependency sources. When `vcs/go.mod` or the
-service `package.json` runtime dependencies change, refresh the tables above
-(the license of a new module is in its `LICENSE`/`COPYING` file in
-`$(go env GOMODCACHE)`; npm package licenses are in each package's
-`package.json` `license` field).
+Licenses are read from the resolved dependency sources. When `vcs/go.mod` or
+`swift/PortableFSKit/Package.swift` changes, refresh the tables above — the
+license of a new Go module is in its `LICENSE`/`COPYING` file in
+`$(go env GOMODCACHE)`, and a Swift package's is in its checkout under
+`swift/PortableFSKit/.build/checkouts`.

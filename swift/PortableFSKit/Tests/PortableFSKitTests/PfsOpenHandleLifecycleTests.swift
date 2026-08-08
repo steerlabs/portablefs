@@ -7,6 +7,34 @@ private func lifecycleBytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+@Test func zeroHandleCreateReplyTerminallyFencesWithoutInvalidDisposition() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let root = try await core.rootItem()
+    await daemon.omitNextCreateHandle()
+    await daemon.resetStats()
+
+    await #expect(throws: PfsLocalClientError.connectionClosed) {
+        try await core.createFile(
+            in: root,
+            name: lifecycleBytes("missing-create-handle"),
+            mode: 0o644
+        )
+    }
+    let stats = await daemon.stats()
+    #expect(stats.activeHandles == 0)
+    #expect(stats.resourceAccepts == 0)
+    #expect(stats.resourceAbandons == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
+    await #expect(throws: PfsLocalClientError.shutdown) {
+        try await core.statfs()
+    }
+}
+
 @Test func finalCloseReleasesDaemonHandle() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -14,8 +42,10 @@ private func lifecycleBytes(_ string: String) -> Data {
     let file = try await closedTestFile(core: core, daemon: daemon, name: "final-close")
 
     try await core.open(item: file, mode: .read)
+    try await waitForLifecycleStats(daemon) { $0.resourceAccepts == 1 }
     #expect(await daemon.stats().openRequests == 1)
     #expect(await daemon.stats().activeHandles == 1)
+    #expect(await daemon.stats().resourceAcceptedItemCounts == [0])
 
     try await core.close(item: file, retainingModes: .unspecified)
     let stats = await daemon.stats()
@@ -23,6 +53,90 @@ private func lifecycleBytes(_ string: String) -> Data {
     #expect(stats.closeRequests == 1)
     #expect(stats.activeHandles == 0)
     #expect(await core.testingDebugState().openHandleCount == 0)
+}
+
+@Test func directLookupMappingFailureAbandonsItemAndKeepsConnectionHealthy() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    _ = try await closedTestFile(
+        core: core,
+        daemon: daemon,
+        name: "mapping-failure"
+    )
+    let root = try await core.rootItem()
+    let baseline = await core.testingDebugState()
+    await daemon.corruptNextLookupItemIdentifier()
+
+    do {
+        _ = try await core.lookup(
+            in: root,
+            name: lifecycleBytes("mapping-failure")
+        )
+        Issue.record("reserved daemon item identifier was adopted")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EOVERFLOW)
+    }
+    try await waitForLifecycleStats(daemon) { $0.resourceAbandons == 1 }
+    #expect(await daemon.stats().resourceAcceptedItemCounts == [0])
+    #expect(await core.testingDebugState() == baseline)
+    _ = try await core.statfs()
+}
+
+@Test func directOpenCancellationAbandonsLateHandleWithoutPoisoningCore() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let file = try await closedTestFile(
+        core: core,
+        daemon: daemon,
+        name: "cancel-open"
+    )
+    await daemon.delayNextOpen(nanoseconds: 100_000_000)
+    let opening = Task { try await core.open(item: file, mode: .read) }
+    try await waitForLifecycleStats(daemon) { $0.openRequests == 1 }
+    opening.cancel()
+    await #expect(throws: PfsLocalClientError.cancelled) {
+        try await opening.value
+    }
+    try await waitForLifecycleStats(daemon) {
+        $0.resourceAbandons == 1 && $0.activeHandles == 0
+    }
+    #expect(await core.testingDebugState().openHandleCount == 0)
+    _ = try await core.statfs()
+}
+
+@Test func zeroHandleOpenReplyTerminallyFencesWithoutInvalidDisposition() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let file = try await closedTestFile(
+        core: core,
+        daemon: daemon,
+        name: "missing-open-handle"
+    )
+    await daemon.omitNextOpenHandle()
+
+    await #expect(throws: PfsLocalClientError.connectionClosed) {
+        try await core.open(item: file, mode: .read)
+    }
+    let stats = await daemon.stats()
+    #expect(stats.activeHandles == 0)
+    #expect(stats.resourceAccepts == 0)
+    #expect(stats.resourceAbandons == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
+    await #expect(throws: PfsLocalClientError.shutdown) {
+        try await core.statfs()
+    }
 }
 
 @Test func openUpgradePartialCloseAndFinalCloseAreBalanced() async throws {

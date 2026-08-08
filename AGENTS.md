@@ -6,56 +6,60 @@ agent that *uses* PortableFS workspaces, read
 
 ## Build And Test
 
-```bash
-pnpm install              # frozen lockfile; do not update pnpm-lock.yaml casually
-pnpm build                # all TypeScript workspaces
-pnpm test                 # TS suites + go -C vcs test ./...
-pnpm typecheck            # tsc --noEmit + go -C vcs vet ./...
-```
-
-Go-only iteration is faster when you are inside `vcs/`:
+There is no build system above the two languages and nothing to install:
 
 ```bash
+go -C vcs build ./...      # Go data plane (add GOOS=darwin / GOOS=linux to cross-check)
 go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
+
+swift test --package-path swift/PortableFSKit --no-parallel
 ```
 
-Postgres integration suite (needs Docker): `pnpm verify:postgres`.
+`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
+Testing can otherwise run cases concurrently inside one worker, and several
+tests share process resources or exercise hard protocol deadlines.
 
 ## Before You Finish
 
-Run `pnpm verify` and make it pass. It is the local merge gate: frozen install,
-full TS + Go suites, vet, the race suite, the manifest-index benchmark, and a stale
-legacy reference scan. Do not report a change as complete with a failing or skipped
-`pnpm verify`.
+Run `bash scripts/verify-local.sh` and make it pass. It is the local merge gate:
+darwin + linux builds and vet, the Go suite, the Go race suite, the Swift suite,
+the release-trust policy checks, and a stale-architecture scan. Do not report a
+change as complete with a failing or skipped `verify-local.sh`.
 
 ## Frozen Surfaces
 
-Read [COMPATIBILITY.md](./COMPATIBILITY.md) before changing: environment variable
-names (`VCS_*`, `VOLUME_*`, `PORTABLEFS_*`), `/v1` HTTP routes, the `fsproto` and
-`pfslocal` wire protocols, persisted formats (WAL, migrations, manifests, tree hash,
-digests), or the pinned repo layout (`vcs/cmd/*` binaries, `swift/PortableFSKit`,
-root Dockerfiles). Those are frozen: evolve additively (new route, new env var, new
-protocol version), never rename or repurpose. Postgres migrations are append-only —
-never edit a released file under `packages/metadata-db/migrations`.
+Read [COMPATIBILITY.md](./COMPATIBILITY.md) before changing: the authority wire
+(ALPN, protocol major, required feature strings, canonical encoding), the
+declared macOS cache policy names, the `.portablefs/local-dirs` rule syntax and
+its revision hash, the `pfslocal` protocol between the daemon and the FSKit
+extension, `PORTABLEFS_*` environment variable names, the user-facing CLI
+commands and their documented flags, and the release identity chain. Those are
+frozen: evolve additively (new operation, new optional field, new env var), never
+rename or repurpose. A wire-incompatible change gets a new exact protocol major
+and refuses the old one at the handshake.
 
 ## Code Style
 
 - Go: `gofmt`-clean; table-driven tests; wrap errors with context.
-- TypeScript: two-space indentation; `zod` validation at API boundaries; no `any`
-  casts; prefer clear names over comments.
+- Swift: follow the existing package's conventions; no force-unwraps on I/O paths.
 - Comments explain intent, invariants, and trade-offs — not what the code does.
 - No emojis in code, docs, or commit messages.
-- Match the register of [docs/architecture.md](./docs/architecture.md) when writing
-  docs: concise, technical, honest.
+- Match the register of
+  [docs/xfs-authority-architecture.md](./docs/xfs-authority-architecture.md) when
+  writing docs: concise, technical, honest about what is unproven.
 
 ## Repo Shape
 
-- `vcs/`: Go data plane (authority server, Linux FUSE mount client, the macOS
-  `portablefsd` daemon behind the FSKit extension, NFS compat, WAL,
-  replication, checkpoints). Internals live under `vcs/internal/`.
-- `apps/volume-api`, `apps/authority-manager`: TypeScript control plane.
-- `packages/*`: shared TS libraries (protocol schemas, core tree/chunk/hash logic,
-  metadata DB, blob stores, testkit).
-- `docs/`: contracts and guides; `docs/architecture.md` is the root contract.
+- `vcs/`: the Go data plane — the XFS authority, the Linux kernel-FUSE mount
+  client, the macOS `portablefsd` v3 data plane behind the FSKit extension, and
+  the CLI. Internals live under `vcs/internal/`; see [vcs/README.md](./vcs/README.md).
+- `swift/`: the FSKit extension and its coherence stack (`PortableFSKit`), the
+  shipping app (`PortableFSApp`), and a manual-registration dev host.
+- `pfslocal/`, `proto/`: the wire protocol sources shared by the Go daemon and the
+  Swift frontend, plus their golden frames.
+- `scripts/`: the local gate, the privileged Linux batteries, the coherence
+  matrices, release packaging, and the release-trust policy checkers.
+- `docs/`: contracts and guides. `docs/architecture.md` states the product
+  contract; `docs/xfs-authority-architecture.md` is the core design document.

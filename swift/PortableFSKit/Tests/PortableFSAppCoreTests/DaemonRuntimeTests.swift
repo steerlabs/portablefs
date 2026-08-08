@@ -36,9 +36,3 @@ import PortableFSKit
     )
     #expect(MountTable.portableFSMounts(in: [openSteer, portableFS]) == [portableFS])
 }
-
-@Test func mountPointBuilderSanitizesVolumeIDs() {
-    #expect(PortableFSAppPaths.mountPoint(baseDirectory: "/Users/u/PortableFS", volumeID: "vol-a") == "/Users/u/PortableFS/vol-a")
-    #expect(PortableFSAppPaths.mountPoint(baseDirectory: "/base", volumeID: "../evil") == "/base/___evil")
-    #expect(PortableFSAppPaths.mountPoint(baseDirectory: "/base", volumeID: "a/b c") == "/base/a_b_c")
-}

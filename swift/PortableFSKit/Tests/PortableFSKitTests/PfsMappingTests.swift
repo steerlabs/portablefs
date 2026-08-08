@@ -4,12 +4,36 @@ import Testing
 @testable import PortableFSKit
 @preconcurrency import Darwin
 
+@Test func unsupportedXattrOperationsStopAtTheMacOSVFSBoundary() {
+    let unsupported = PfsLocalClientError.daemon(
+        errno: ENOTSUP,
+        message: "user xattrs are read-only"
+    )
+    #expect(PfsErrorMapper.fsKitError(for: unsupported).code == Int(ENOTSUP))
+    #expect(PfsErrorMapper.fsKitXattrError(for: unsupported).code == Int(EOPNOTSUPP))
+
+    let operationUnsupported = PfsLocalClientError.daemon(
+        errno: EOPNOTSUPP,
+        message: "user xattrs are unsupported"
+    )
+    #expect(PfsErrorMapper.fsKitXattrError(for: operationUnsupported).code == Int(EOPNOTSUPP))
+
+    let invalid = PfsLocalClientError.daemon(errno: EINVAL, message: "invalid xattr")
+    #expect(PfsErrorMapper.fsKitXattrError(for: invalid).code == Int(EINVAL))
+}
+
 @Test func itemIdentifiersRespectFSKitReservedValues() throws {
+    let floor = UInt64(1) << 63
+    #expect(PfsFSKitMapping.localRepairIdentifierFloor == floor)
+    #expect(PfsEnumerationCookies.daemonCookieMarker == floor)
     #expect(
         try PfsFSKitMapping.itemIdentifier(from: 1) == .rootDirectory
     )
     #expect(
         try PfsFSKitMapping.itemIdentifier(from: 2).rawValue == 3
+    )
+    #expect(
+        try PfsFSKitMapping.itemIdentifier(from: floor - 1).rawValue == floor
     )
 
     do {
@@ -36,8 +60,25 @@ import Testing
     #expect(detachedAttributes.linkCount == 0)
 
     do {
-        _ = try PfsFSKitMapping.itemIdentifier(from: UInt64.max)
-        Issue.record("expected an unrepresentable item identifier to fail")
+        _ = try PfsFSKitMapping.itemIdentifier(from: floor)
+        Issue.record("expected the local repair partition to be refused")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EOVERFLOW)
+    }
+
+    var local = PfsAttr()
+    local.item.itemID = floor
+    #expect(
+        try PfsFSKitMapping.localRepairAttributes(from: local).fileID.rawValue == floor + 1
+    )
+    local.item.itemID = UInt64.max - 1
+    #expect(
+        try PfsFSKitMapping.localRepairAttributes(from: local).fileID.rawValue == UInt64.max
+    )
+    local.item.itemID = UInt64.max
+    do {
+        _ = try PfsFSKitMapping.localRepairAttributes(from: local)
+        Issue.record("expected the terminal raw item identifier to fail")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EOVERFLOW)
     }

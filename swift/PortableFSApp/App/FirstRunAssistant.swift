@@ -118,10 +118,7 @@ private struct FirstRunAssistantView: View {
             Text("Try a real mount")
                 .font(.headline)
 
-            Text("Sign in from the PortableFS menu bar, then choose a volume and Mount. That mount attempt—not this assistant—is the authoritative extension check.")
-
-            Text("You can also mount from Terminal:")
-                .foregroundStyle(.secondary)
+            Text("Mount a volume from Terminal. That mount attempt—not this assistant—is the authoritative extension check; the menu bar then shows the mount and can unmount it.")
 
             HStack {
                 Text("portablefs mount <volume> <mount-directory>")
@@ -136,6 +133,10 @@ private struct FirstRunAssistantView: View {
                     )
                 }
             }
+
+            Text("A mount is admitted by direct authority credentials — address, single-use volume capability, and mutual-TLS client identity. Run `portablefs help mount` for the exact flags.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             .padding(12)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
 

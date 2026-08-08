@@ -99,14 +99,23 @@ func TestMountRejectsInvalidLocalDirsEarly(t *testing.T) {
 }
 
 // TestLocalDirsRecordSurvivesBesideBacking pins the storage convention: the
-// persisted record and the backing root share the portablefsd-style
+// persisted record sits BESIDE the volume's backing tree (never inside it,
+// where its name could collide with a route root) under the portablefsd-style
 // <stateBase>/local/<storageID> layout, so grafted content and its
 // configuration survive clean unmounts together.
 func TestLocalDirsRecordSurvivesBesideBacking(t *testing.T) {
 	mountsDir := filepath.Join(t.TempDir(), "state", "portablefs", "mounts")
-	backing := localDirsBackingRoot(mountsDir, "vol_1", "main", "/mnt/w")
+	backing := localDirsBackingRoot(mountsDir, "vol_1")
 	if !strings.HasPrefix(backing, filepath.Join(filepath.Dir(mountsDir), "local")+string(filepath.Separator)) {
 		t.Fatalf("backing root %q must live under <stateBase>/local/", backing)
+	}
+	for _, sidecar := range []string{
+		localDirsRecordPath(mountsDir, "vol_1", "main", "/mnt/w"),
+		localRoutesRecordPath(mountsDir, "vol_1"),
+	} {
+		if strings.HasPrefix(sidecar, backing+string(filepath.Separator)) {
+			t.Fatalf("sidecar %q must not live inside the backing tree", sidecar)
+		}
 	}
 	if err := writePersistedLocalDirs(mountsDir, "vol_1", "main", "/mnt/w", []string{"node_modules"}); err != nil {
 		t.Fatal(err)

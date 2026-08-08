@@ -6,20 +6,23 @@ import FSKit
 public struct PfsItemIdentity: Hashable, Sendable {
     public var itemID: UInt64
     public var generation: UInt64
+    public var stableIdentity: Data
 
-    public init(itemID: UInt64, generation: UInt64) {
+    public init(itemID: UInt64, generation: UInt64, stableIdentity: Data = Data()) {
         self.itemID = itemID
         self.generation = generation
+        self.stableIdentity = stableIdentity
     }
 
     public init(_ item: PfsItem) {
-        self.init(itemID: item.itemID, generation: item.itemGeneration)
+        self.init(itemID: item.itemID, generation: item.itemGeneration, stableIdentity: item.stableIdentity)
     }
 
     public var proto: PfsItem {
         var item = PfsItem()
         item.itemID = itemID
         item.itemGeneration = generation
+        item.stableIdentity = stableIdentity
         return item
     }
 }
@@ -60,17 +63,27 @@ public struct PfsLookupResult: Sendable {
     public var canonicalName: Data
 }
 
+public struct PfsHardLinkResult: Sendable {
+    public var canonicalName: Data
+    /// Fresh attributes for the linked item, including its immutable type and
+    /// post-link count.
+    public var attr: PfsAttr
+}
+
 public struct PfsDirectoryEntry: Sendable {
     public var name: Data
-    public var item: PortableFSItem
     public var attr: PfsAttr
     public var nextCookie: UInt64
+    public var resourceRequestID: UInt64
 }
 
 public struct PfsEnumerateResult: Sendable {
     public var entries: [PfsDirectoryEntry]
     public var verifier: UInt64
     public var nextCookie: UInt64
+    /// pfslocal request whose provisional page resources produced `entries`.
+    /// The FSKit adapter uses it to abandon a page suffix its packer declined.
+    public var resourceRequestID: UInt64
 }
 
 public struct PfsSetAttributes: Sendable {
@@ -129,14 +142,50 @@ public actor VolumeCore {
 
     public let client: PfsLocalClient
     public private(set) var resolvedVolume: PfsResolvedVolume?
+    /// The raw resolve reply and validated terms of a strict-v3 attach whose
+    /// declared cache policy this build implements. Set only for the macOS 26
+    /// compatibility policy; the FSKit adapter composes its coherence stack
+    /// from these before the volume may serve.
+    public private(set) var strictV3ResolveReply: PfsResolveReply?
+    public private(set) var strictV3Contract: PfsMacOSV3LocalContract?
 
     private var itemsByIdentity: [PfsItemIdentity: PortableFSItem] = [:]
     private var identitiesByObject: [ObjectIdentifier: PfsItemIdentity] = [:]
     private var itemsByObject: [ObjectIdentifier: PortableFSItem] = [:]
     private var deletedItemsByObject: [ObjectIdentifier: DeletedItemState] = [:]
     private var currentGenerationByItemID: [UInt64: UInt64] = [:]
+    private var publishedItemIdentities: Set<PfsItemIdentity> = []
+    private var provisionalItemReferences: [PfsItemIdentity: Int] = [:]
     private var openHandles: [ObjectIdentifier: OpenState] = [:]
     private var lifecycleGates: [ObjectIdentifier: LifecycleGateState] = [:]
+    /// Items that exist only inside this process, for the macOS 26 repair
+    /// scratch entry. FSKit's create callback must hand the kernel an `FSItem`,
+    /// but the entry it names must never be known to the daemon, so these are
+    /// deliberately absent from every identity table above. The only thing that
+    /// can reach one is the kernel reference the create callback returned.
+    private struct LocalRepairBindingKey: Hashable {
+        let parentIdentity: Data
+        let name: Data
+    }
+
+    private struct LocalRepairItemState {
+        let item: PortableFSItem
+        let binding: LocalRepairBindingKey
+        var attributes: PfsAttr
+        var xattrs: [String: Data] = [:]
+    }
+
+    private var localRepairItems: [ObjectIdentifier: LocalRepairItemState] = [:]
+    /// The scratch create is a real kernel namespace transition even though it
+    /// is not an authority mutation. A following unlink may resolve the name
+    /// again before FSKit sends removeItem, so the local object needs one
+    /// exact, process-local binding just like an ordinary filesystem object.
+    private var localRepairBindings: [LocalRepairBindingKey: PortableFSItem] = [:]
+    /// Minted downward through the high-half raw pfslocal identifier partition;
+    /// `daemonItem(for:)` refuses a daemon item that lands in it before the
+    /// object enters any identity table, so a synthetic identifier can never
+    /// be confused with an authority item.
+    private var nextLocalRepairItemID: UInt64 = UInt64.max - 1
 
     private struct OpenState: Sendable {
         var identity: PfsItemIdentity
@@ -186,7 +235,37 @@ public actor VolumeCore {
     @discardableResult
     public func resolve(attachRef: String) async throws -> PfsResolvedVolume {
         let reply = try await client.resolve(attachRef: attachRef)
-        let root = item(for: reply.root)
+        if reply.hasV3Coherence {
+            // Cache-coherence behavior is a DECLARED policy carried by the
+            // resolve contract, never an inference. This build implements
+            // exactly one policy — the macOS 26 compatibility policy — and a
+            // contract naming anything else fails closed with the same
+            // close-first discipline the old unconditional guard used, so
+            // portablefsd's bridge fails its authority session rather than
+            // waiting for a subscriber that will never exist. The native
+            // macOS 27 policy stays refused until the final SDK supplies its
+            // revocation API.
+            let contract: PfsMacOSV3LocalContract
+            do {
+                contract = try PfsLocalMacOSV3CoherenceTransport.parseContract(reply.v3Coherence)
+            } catch {
+                await client.close()
+                if case PfsMacOSCoherenceError.invalidCachePolicy = error {
+                    throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
+                }
+                throw error
+            }
+            switch contract.cachePolicy {
+            case .synchronousVFSRepairV1, .synchronousVFSRepairV2:
+                strictV3ResolveReply = reply
+                strictV3Contract = contract
+            case .nativeFSKitRevocationV1:
+                await client.close()
+                throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
+            }
+        }
+        let root = try daemonItem(for: reply.root)
+        publishedItemIdentities.insert(root.identity)
         let resolved = PfsResolvedVolume(
             root: root,
             rootAttr: reply.rootAttr,
@@ -204,6 +283,162 @@ public actor VolumeCore {
         try await client.subscribeEvents()
     }
 
+    /// Mints a process-local `FSItem` for a macOS 26 repair scratch entry.
+    ///
+    /// The identifier comes from the reserved top of the space that
+    /// `PfsFSKitMapping.itemIdentifier(from:)` refuses for daemon items, so the
+    /// kernel can never see one identifier standing for two different things.
+    /// The item is registered in no identity table: `identity(for:)` will
+    /// refuse it, which is the point — nothing can turn it into a pfslocal
+    /// request.
+    public func mintLocalRepairItem(
+        parent: PortableFSItem,
+        name: Data,
+        mode: UInt32,
+        uid: UInt32,
+        gid: UInt32
+    ) throws -> PortableFSItem {
+        let binding = LocalRepairBindingKey(
+            parentIdentity: parent.identity.stableIdentity,
+            name: name
+        )
+        guard localRepairBindings[binding] == nil else {
+            throw PfsLocalClientError.daemon(
+                errno: EEXIST,
+                message: "local repair binding already exists"
+            )
+        }
+        guard nextLocalRepairItemID >= PfsFSKitMapping.localRepairIdentifierFloor else {
+            throw PfsLocalClientError.daemon(
+                errno: ENOSPC,
+                message: "local repair identifier space exhausted"
+            )
+        }
+        let identity = PfsItemIdentity(itemID: nextLocalRepairItemID, generation: 0)
+        nextLocalRepairItemID -= 1
+        let item = PortableFSItem(identity: identity)
+        let nowMilliseconds = Int64(Date().timeIntervalSince1970 * 1_000)
+        var attributes = PfsAttr()
+        attributes.item = identity.proto
+        attributes.parent = parent.identity.proto
+        attributes.kind = .file
+        attributes.mode = mode
+        attributes.nlink = 1
+        attributes.uid = uid
+        attributes.gid = gid
+        attributes.flags = 0
+        attributes.size = 0
+        attributes.allocSize = 0
+        attributes.atimeMs = nowMilliseconds
+        attributes.mtimeMs = nowMilliseconds
+        attributes.ctimeMs = nowMilliseconds
+        attributes.birthtimeMs = nowMilliseconds
+        localRepairItems[ObjectIdentifier(item)] = LocalRepairItemState(
+            item: item,
+            binding: binding,
+            attributes: attributes
+        )
+        localRepairBindings[binding] = item
+        return item
+    }
+
+    public func isLocalRepairItem(_ item: PortableFSItem) -> Bool {
+        localRepairItems[ObjectIdentifier(item)] != nil
+    }
+
+    public func localRepairAttributes(_ item: PortableFSItem) -> PfsAttr? {
+        localRepairItems[ObjectIdentifier(item)]?.attributes
+    }
+
+    public func localRepairItem(
+        in parent: PortableFSItem,
+        named name: Data
+    ) -> PortableFSItem? {
+        localRepairBindings[
+            LocalRepairBindingKey(
+                parentIdentity: parent.identity.stableIdentity,
+                name: name
+            )
+        ]
+    }
+
+    /// Returns `nil` only when `item` is not a live synthetic repair item.
+    /// A live item with no value returns `.some(nil)`; the distinction keeps a
+    /// missing local xattr from accidentally falling through to the daemon.
+    public func localRepairXattr(
+        named name: String,
+        of item: PortableFSItem
+    ) -> Data?? {
+        guard let state = localRepairItems[ObjectIdentifier(item)] else {
+            return nil
+        }
+        return .some(state.xattrs[name])
+    }
+
+    public func localRepairXattrs(of item: PortableFSItem) -> [String]? {
+        guard let state = localRepairItems[ObjectIdentifier(item)] else {
+            return nil
+        }
+        return state.xattrs.keys.sorted()
+    }
+
+    /// Applies one normal xattr policy to the process-local scratch object.
+    /// `false` means the item is not local; every local outcome either applies
+    /// or throws the same POSIX error an authority-backed object would.
+    public func updateLocalRepairXattr(
+        named name: String,
+        value: Data?,
+        on item: PortableFSItem,
+        createOnly: Bool,
+        replaceOnly: Bool,
+        remove: Bool
+    ) throws -> Bool {
+        let key = ObjectIdentifier(item)
+        guard var state = localRepairItems[key] else { return false }
+        let exists = state.xattrs[name] != nil
+        if remove {
+            guard exists else {
+                throw PfsLocalClientError.daemon(errno: ENOATTR, message: "xattr missing")
+            }
+            state.xattrs.removeValue(forKey: name)
+        } else {
+            if createOnly && exists {
+                throw PfsLocalClientError.daemon(errno: EEXIST, message: "xattr exists")
+            }
+            if replaceOnly && !exists {
+                throw PfsLocalClientError.daemon(errno: ENOATTR, message: "xattr missing")
+            }
+            state.xattrs[name] = value ?? Data()
+        }
+        localRepairItems[key] = state
+        return true
+    }
+
+    public func releaseLocalRepairItem(_ item: PortableFSItem) {
+        if let state = localRepairItems.removeValue(forKey: ObjectIdentifier(item)) {
+            if localRepairBindings[state.binding] === item {
+                localRepairBindings.removeValue(forKey: state.binding)
+            }
+            state.item.markReclaimed()
+        }
+    }
+
+    /// Retires only the process-local namespace coordinate for a synthetic
+    /// repair item. `removeItem` is not the end of the item's vnode lifetime:
+    /// FSKit may still deliver getattr/open/close/reclaim while unlinkat(2) is
+    /// completing. Keeping the object classified locally until the repair
+    /// lease releases prevents that teardown tail from entering the closed
+    /// authority publication gate.
+    public func retireLocalRepairBinding(_ item: PortableFSItem) {
+        guard let state = localRepairItems[ObjectIdentifier(item)],
+              localRepairBindings[state.binding] === item else {
+            return
+        }
+        localRepairBindings.removeValue(forKey: state.binding)
+    }
+
+    public func localRepairItemCount() -> Int { localRepairItems.count }
+
     public func rootItem() throws -> PortableFSItem {
         guard let root = resolvedVolume?.root else {
             throw PfsLocalClientError.unexpectedReply("volume has not been resolved")
@@ -215,11 +450,20 @@ public actor VolumeCore {
         var request = PfsLookupRequest()
         request.dir = try identity(for: directory).proto
         request.name = name
-        let envelope = try await client.request(.lookup(request))
+        let lease = try await client.requestResource(.lookup(request))
+        let envelope = lease.envelope
         guard case let .lookupReply(reply)? = envelope.body else {
+            await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        let item = item(for: reply.attr.item)
+        let item: PortableFSItem
+        do {
+            item = try adoptReplyItem(reply.attr.item, lease: lease)
+        } catch {
+            await lease.complete(itemsPublished: false)
+            throw error
+        }
+        await lease.complete(itemsPublished: true)
         return PfsLookupResult(item: item, attr: reply.attr, canonicalName: name)
     }
 
@@ -229,25 +473,95 @@ public actor VolumeCore {
         wantAttributes: Bool,
         maxEntries: UInt32 = 256
     ) async throws -> PfsEnumerateResult {
-        var request = PfsEnumerateRequest()
-        request.dir = try identity(for: directory).proto
-        request.cookie = cookie
-        request.maxEntries = max(1, maxEntries)
-        request.wantAttrs = wantAttributes
-        let envelope = try await client.request(.enumerate(request))
-        guard case let .enumerateReply(reply)? = envelope.body else {
-            throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
-        }
+        try await withDescriptorHandle(item: directory, mode: .read) { handle in
+            var request = PfsEnumerateRequest()
+            request.dir = try identity(for: directory).proto
+            request.cookie = cookie
+            request.maxEntries = max(1, maxEntries)
+            request.wantAttrs = wantAttributes
+            request.handle = handle
+            let lease = try await client.requestResource(.enumerate(request))
+            let envelope = lease.envelope
+            guard case let .enumerateReply(reply)? = envelope.body else {
+                await lease.complete(itemsPublished: false)
+                throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+            }
 
-        let entries = reply.entries.map { entry in
-            PfsDirectoryEntry(
-                name: entry.name,
-                item: item(for: entry.attr.item),
-                attr: entry.attr,
-                nextCookie: entry.cookie
+            let entries = reply.entries.map { entry in
+                PfsDirectoryEntry(
+                    name: entry.name,
+                    attr: entry.attr,
+                    nextCookie: entry.cookie,
+                    resourceRequestID: envelope.requestID
+                )
+            }
+            // A typed direct caller receives raw directory metadata, not
+            // canonical FSItems. Default to accepting no reply items; the
+            // FSKit adapter overwrites this with its exact packed prefix before
+            // the outer publication boundary settles.
+            lease.acceptItemPrefix(0)
+            await lease.complete(itemsPublished: true)
+            return PfsEnumerateResult(
+                entries: entries,
+                verifier: reply.dirVersion,
+                nextCookie: reply.nextCookie,
+                resourceRequestID: envelope.requestID
             )
         }
-        return PfsEnumerateResult(entries: entries, verifier: reply.dirVersion, nextCookie: reply.nextCookie)
+    }
+
+    /// Adopts only directory entries FSKit's packer actually accepted. Raw
+    /// Enumerate pages stay outside the canonical item tables until this call,
+    /// so an unpacked suffix cannot leave stale local identities after its
+    /// daemon-side provisional resources are abandoned.
+    func adoptEnumeratedItems(
+        _ entries: [PfsDirectoryEntry]
+    ) throws -> [PortableFSItem] {
+        // A direct core.enumerate has already sent prefix 0, so its raw metadata
+        // is observational only. Adoption is valid solely inside the adapter's
+        // still-live outer publication collector, before that exact reply's
+        // disposition is emitted.
+        for requestID in Set(entries.map(\.resourceRequestID)) {
+            guard client.canAdoptResourceReply(requestID) else {
+                throw PfsLocalClientError.invalidFrame(
+                    "enumeration item adoption requires an unsettled resource reply"
+                )
+            }
+        }
+        // Validate the whole batch before mutating any canonical table.
+        for entry in entries {
+            guard entry.attr.item.itemID > 0,
+                  entry.attr.item.itemID < PfsFSKitMapping.localRepairIdentifierFloor else {
+                throw PfsLocalClientError.daemon(
+                    errno: EOVERFLOW,
+                    message: "daemon item identifier enters the local repair partition"
+                )
+            }
+        }
+        var adopted: [PortableFSItem] = []
+        adopted.reserveCapacity(entries.count)
+        var byRequest: [UInt64: [(PfsItemIdentity, PortableFSItem)]] = [:]
+        for entry in entries {
+            let (item, identity) = try adoptProvisionalDaemonItem(
+                for: entry.attr.item
+            )
+            adopted.append(item)
+            byRequest[entry.resourceRequestID, default: []].append((identity, item))
+        }
+        for (requestID, items) in byRequest {
+            client.registerResourceItemSettlement(targetRequestID: requestID) {
+                [weak self] acceptedCount in
+                guard let self else { return }
+                for (index, owned) in items.enumerated() {
+                    await self.settleProvisionalItem(
+                        identity: owned.0,
+                        item: owned.1,
+                        published: index < Int(acceptedCount)
+                    )
+                }
+            }
+        }
+        return adopted
     }
 
     public func getattr(item: PortableFSItem) async throws -> PfsAttr {
@@ -289,7 +603,7 @@ public actor VolumeCore {
         guard case let .getAttrReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        _ = self.item(for: reply.attr.item)
+        _ = try self.daemonItem(for: reply.attr.item)
         rememberAttrSnapshot(reply.attr, for: objectID)
         return reply.attr
     }
@@ -350,7 +664,7 @@ public actor VolumeCore {
         guard case let .setAttrReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        _ = self.item(for: reply.attr.item)
+        _ = try self.daemonItem(for: reply.attr.item)
         rememberAttrSnapshot(reply.attr, for: objectID)
         return reply.attr
     }
@@ -422,10 +736,13 @@ public actor VolumeCore {
             return
         }
 
-        let newHandle = try await openDaemonHandle(identity: identity, mode: retainedMode)
+        let opened = try await openDaemonHandle(
+            identity: identity,
+            mode: retainedMode
+        )
         var replacement = OpenState(
             identity: identity,
-            handle: newHandle,
+            handle: opened.handle,
             mode: retainedMode,
             isImplicit: state.isImplicit,
             attrSnapshot: state.attrSnapshot,
@@ -433,6 +750,8 @@ public actor VolumeCore {
         )
         replacement.pendingCloseHandles.append(state.handle)
         openHandles[objectID] = replacement
+        opened.lease.acceptHandles()
+        await opened.lease.complete(itemsPublished: true)
         try await closePendingDaemonHandles(objectID: objectID)
     }
 
@@ -487,18 +806,68 @@ public actor VolumeCore {
                 return result
             }
 
+            // ── COMMITTED PROGRESS OUTRANKS THE ERROR THAT FOLLOWED IT ──────
+            //
+            // One framework write callback becomes SEVERAL daemon requests, and
+            // every one of them is separately acknowledged: by the time chunk k
+            // fails, chunks 0..<k are already in the mount's stream WAL (or at
+            // the authority) and are as durable as anything this stack ever
+            // promises. Throwing here discarded that count and the adapter
+            // replied `(0, error)` — telling the kernel that nothing at all was
+            // written about bytes that are on media.
+            //
+            // That is a lie in the direction POSIX is least forgiving of, and
+            // the daemon already refuses to tell it on its own half of the same
+            // boundary: "A host short write reports both a count and an error.
+            // The count is committed progress and outranks the error for exactly
+            // the reason a post-commit failure does: reporting zero invites a
+            // retry that duplicates an append." (portablefsd/ops.go, attach.write).
+            // The two ends of one wire must not disagree about what a partially
+            // completed write looks like.
+            //
+            // So a failure that arrives with committed bytes behind it is
+            // reported as a SHORT WRITE, not as a failure. Nothing is swallowed:
+            // the kernel reissues the remainder as a fresh callback, that
+            // callback starts at totalWritten == 0, and whatever is still wrong
+            // surfaces there as the error it is — plus at the next fsync,
+            // synchronize or unmount barrier, which are the drain barriers this
+            // mount's durability contract is actually written about. An error is
+            // thrown from here only when NOTHING committed, which is the one
+            // case where the error is the whole truth.
             var totalWritten = 0
             var currentOffset = offset
             var latestAttr: PfsAttr?
             let chunkSize = ioChunkSize()
+
+            let fallbackAttr = openHandles[objectID]?.attrSnapshot ?? PfsAttr()
+            func committed() -> (written: UInt32, attr: PfsAttr) {
+                (UInt32(clamping: totalWritten), latestAttr ?? fallbackAttr)
+            }
+
             while totalWritten < data.count {
                 let end = min(data.count, totalWritten + chunkSize)
                 let chunk = data.subdata(in: totalWritten..<end)
-                let result = try await writeChunk(handle: handle, offset: currentOffset, data: chunk)
+                let result: (written: UInt32, attr: PfsAttr)
+                do {
+                    result = try await writeChunk(handle: handle, offset: currentOffset, data: chunk)
+                } catch {
+                    if totalWritten > 0 {
+                        return committed()
+                    }
+                    throw error
+                }
                 latestAttr = result.attr
                 rememberAttrSnapshot(result.attr, for: objectID)
                 let written = Int(result.written)
                 if written <= 0 {
+                    // A non-empty chunk that committed nothing and reported no
+                    // errno. The daemon refuses to produce this outcome
+                    // (attach.write answers EIO for it), so reaching here means
+                    // the invariant broke — but whatever earlier chunks
+                    // committed is still committed.
+                    if totalWritten > 0 {
+                        return committed()
+                    }
                     throw PfsLocalClientError.daemon(
                         errno: EIO,
                         message: "daemon write made no progress"
@@ -510,10 +879,7 @@ public actor VolumeCore {
                     break
                 }
             }
-            return (
-                UInt32(clamping: totalWritten),
-                latestAttr ?? openHandles[objectID]?.attrSnapshot ?? PfsAttr()
-            )
+            return committed()
         }
     }
 
@@ -535,21 +901,44 @@ public actor VolumeCore {
         request.name = name
         request.mode = mode
         request.exclusive = exclusive
-        let envelope = try await client.request(.create(request))
+        let lease = try await client.requestResource(.create(request))
+        let envelope = lease.envelope
         guard case let .createReply(reply)? = envelope.body else {
+            await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        let newItem = item(for: reply.attr.item)
-        if reply.handle != 0 {
-            openHandles[ObjectIdentifier(newItem)] = OpenState(
-                identity: PfsItemIdentity(reply.attr.item),
-                handle: reply.handle,
-                mode: .readWrite,
-                isImplicit: false,
-                attrSnapshot: reply.attr,
-                pendingCloseHandles: []
-            )
+        guard reply.handle != 0 else {
+            // Create's success contract transfers an open descriptor. Sending
+            // accept_handles for zero would itself violate minor 12; accepting
+            // only the item would publish a file whose required open state was
+            // never installed. Retire the ownership epoch instead.
+            await client.close()
+            throw PfsLocalClientError.connectionClosed
         }
+        let newItem: PortableFSItem
+        do {
+            newItem = try adoptReplyItem(
+                reply.attr.item,
+                lease: lease,
+                terminalOnAbandon: true
+            )
+        } catch {
+            // The namespace mutation is already durable at the daemon. A
+            // frontend that cannot map its successful post-apply reply cannot
+            // honestly publish or retry it, so strict mode fails terminally.
+            await client.close()
+            throw PfsLocalClientError.connectionClosed
+        }
+        openHandles[ObjectIdentifier(newItem)] = OpenState(
+            identity: PfsItemIdentity(reply.attr.item),
+            handle: reply.handle,
+            mode: .readWrite,
+            isImplicit: false,
+            attrSnapshot: reply.attr,
+            pendingCloseHandles: []
+        )
+        lease.acceptHandles()
+        await lease.complete(itemsPublished: true)
         return PfsCreateResult(item: newItem, attr: reply.attr, canonicalName: name)
     }
 
@@ -558,11 +947,25 @@ public actor VolumeCore {
         request.dir = try identity(for: directory).proto
         request.name = name
         request.mode = mode
-        let envelope = try await client.request(.mkdir(request))
+        let lease = try await client.requestResource(.mkdir(request))
+        let envelope = lease.envelope
         guard case let .mkdirReply(reply)? = envelope.body else {
+            await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        return PfsCreateResult(item: item(for: reply.attr.item), attr: reply.attr, canonicalName: name)
+        let item: PortableFSItem
+        do {
+            item = try adoptReplyItem(
+                reply.attr.item,
+                lease: lease,
+                terminalOnAbandon: true
+            )
+        } catch {
+            await client.close()
+            throw PfsLocalClientError.connectionClosed
+        }
+        await lease.complete(itemsPublished: true)
+        return PfsCreateResult(item: item, attr: reply.attr, canonicalName: name)
     }
 
     public func remove(item: PortableFSItem, named name: Data, from directory: PortableFSItem, isDirectory: Bool) async throws {
@@ -611,11 +1014,25 @@ public actor VolumeCore {
         request.dir = try identity(for: directory).proto
         request.name = name
         request.target = target
-        let envelope = try await client.request(.symlink(request))
+        let lease = try await client.requestResource(.symlink(request))
+        let envelope = lease.envelope
         guard case let .symlinkReply(reply)? = envelope.body else {
+            await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        return PfsCreateResult(item: item(for: reply.attr.item), attr: reply.attr, canonicalName: name)
+        let item: PortableFSItem
+        do {
+            item = try adoptReplyItem(
+                reply.attr.item,
+                lease: lease,
+                terminalOnAbandon: true
+            )
+        } catch {
+            await client.close()
+            throw PfsLocalClientError.connectionClosed
+        }
+        await lease.complete(itemsPublished: true)
+        return PfsCreateResult(item: item, attr: reply.attr, canonicalName: name)
     }
 
     public func readlink(item: PortableFSItem) async throws -> Data {
@@ -628,7 +1045,11 @@ public actor VolumeCore {
         return reply.target
     }
 
-    public func hardLink(item: PortableFSItem, in directory: PortableFSItem, name: Data) async throws -> Data {
+    public func hardLink(
+        item: PortableFSItem,
+        in directory: PortableFSItem,
+        name: Data
+    ) async throws -> PfsHardLinkResult {
         var request = PfsHardLinkRequest()
         request.item = try identity(for: item).proto
         request.dir = try identity(for: directory).proto
@@ -637,7 +1058,10 @@ public actor VolumeCore {
         guard case let .hardLinkReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        return reply.name.isEmpty ? name : reply.name
+        return PfsHardLinkResult(
+            canonicalName: reply.name.isEmpty ? name : reply.name,
+            attr: reply.attr
+        )
     }
 
     public func xattrGet(item: PortableFSItem, name: String) async throws -> Data {
@@ -677,6 +1101,33 @@ public actor VolumeCore {
         }
     }
 
+    /// Validate a set-xattr callback before it enters publication admission.
+    ///
+    /// A production XFS attach negotiates xattr-set as unsupported. That
+    /// verdict is independent of a coherence repair and must therefore reach
+    /// FSKit before an ordered callback can be refused by a closed PREPARE
+    /// gate. The same helper is reused by the forwarding path so item/name/
+    /// mode validation cannot drift between preflight and execution.
+    func preflightXattrSet(
+        item: PortableFSItem,
+        name: String,
+        createOnly: Bool,
+        replaceOnly: Bool
+    ) throws {
+        _ = try validatedXattrSetIdentity(
+            item: item,
+            name: name,
+            createOnly: createOnly,
+            replaceOnly: replaceOnly
+        )
+        guard resolvedVolume?.capabilities.xattrSetSupported == true else {
+            throw PfsLocalClientError.daemon(
+                errno: ENOTSUP,
+                message: "xattr set is not supported by this daemon"
+            )
+        }
+    }
+
     private func xattrSetLocked(
         item: PortableFSItem,
         objectID: ObjectIdentifier,
@@ -685,8 +1136,20 @@ public actor VolumeCore {
         createOnly: Bool,
         replaceOnly: Bool
     ) async throws {
+        let itemIdentity = try validatedXattrSetIdentity(
+            item: item,
+            name: name,
+            createOnly: createOnly,
+            replaceOnly: replaceOnly
+        )
+        guard resolvedVolume?.capabilities.xattrSetSupported == true else {
+            throw PfsLocalClientError.daemon(
+                errno: ENOTSUP,
+                message: "xattr set is not supported by this daemon"
+            )
+        }
         var request = PfsXattrSetRequest()
-        request.item = try identity(for: item).proto
+        request.item = itemIdentity.proto
         request.name = name
         request.value = value
         request.createOnly = createOnly
@@ -696,6 +1159,29 @@ public actor VolumeCore {
         guard case .xattrSetReply? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
+    }
+
+    private func validatedXattrSetIdentity(
+        item: PortableFSItem,
+        name: String,
+        createOnly: Bool,
+        replaceOnly: Bool
+    ) throws -> PfsItemIdentity {
+        // Validate request grammar before resolving the item, then consult the
+        // negotiated forwarding capability. This pins the public precedence:
+        // malformed request (EINVAL), reclaimed/foreign item (ESTALE), valid
+        // unsupported set (ENOTSUP, mapped to Darwin EOPNOTSUPP).
+        let nameBytes = name.utf8
+        guard !nameBytes.isEmpty,
+              nameBytes.count <= 255,
+              !nameBytes.contains(0),
+              !(createOnly && replaceOnly) else {
+            throw PfsLocalClientError.daemon(
+                errno: EINVAL,
+                message: "invalid xattr set request"
+            )
+        }
+        return try identity(for: item)
     }
 
     public func xattrList(item: PortableFSItem) async throws -> [String] {
@@ -749,16 +1235,14 @@ public actor VolumeCore {
         return reply
     }
 
-    /// The REAL volume barrier: the daemon drains outstanding write-back to
-    /// the authority, and success means authority-durable, applied, AND
-    /// acknowledged by every live protocol subscriber at its supported
-    /// frontend boundary. On macOS 26, known regular-file data and size are
-    /// refreshed before content acknowledgment. Cached namespace bindings
-    /// and other attributes remain outside FSKit's public cache-control
-    /// surface. There is
-    /// no degraded local-only success: an unreachable or slow authority
-    /// or a local WAL sync failure FAILS the barrier and surfaces to the
-    /// kernel caller.
+    /// The v3 authority durability barrier. There is no client or daemon
+    /// write-back tail: filesystem mutations are synchronous authority calls
+    /// against raw XFS. Success here means the authority applied every prior
+    /// operation in its order and completed its `syncfs` cut. Cache-visible
+    /// mutations use their own two-phase repair protocol; this call does not
+    /// invent an additional macOS cache-revocation boundary. There is no
+    /// degraded local-only success: an unreachable, slow, or fenced authority
+    /// fails the barrier and surfaces to the kernel caller.
     public func syncVolume() async throws {
         let envelope = try await client.request(.syncVolume(PfsSyncVolumeRequest()))
         guard case .syncVolumeReply? = envelope.body else {
@@ -812,6 +1296,31 @@ public actor VolumeCore {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
 
+        retireReclaimedItem(item, identity: identity, objectID: objectID)
+    }
+
+    /// Retires only this frontend's FSItem after a macOS 26 cache-actuator
+    /// unlink. The authority binding still exists and must not receive a real
+    /// Reclaim: the next lookup is expected to publish it again. A kernel
+    /// reclaim means no open descriptor can remain; fail closed if local
+    /// handle bookkeeping disproves that invariant.
+    public func reclaimLocalRepairSource(item: PortableFSItem) throws {
+        let objectID = ObjectIdentifier(item)
+        let identity = try identity(for: item)
+        guard openHandles[objectID] == nil else {
+            throw PfsLocalClientError.daemon(
+                errno: EIO,
+                message: "repair-source reclaim encountered a live daemon handle"
+            )
+        }
+        retireReclaimedItem(item, identity: identity, objectID: objectID)
+    }
+
+    private func retireReclaimedItem(
+        _ item: PortableFSItem,
+        identity: PfsItemIdentity,
+        objectID: ObjectIdentifier
+    ) {
         identitiesByObject.removeValue(forKey: objectID)
         itemsByObject.removeValue(forKey: objectID)
         deletedItemsByObject.removeValue(forKey: objectID)
@@ -830,10 +1339,19 @@ public actor VolumeCore {
         deletedItemsByObject.removeAll()
         currentGenerationByItemID.removeAll()
         openHandles.removeAll()
+        for state in localRepairItems.values {
+            state.item.markReclaimed()
+        }
+        localRepairItems.removeAll()
+        localRepairBindings.removeAll()
     }
 
     func testingAdoptItem(identity: PfsItemIdentity) -> PortableFSItem {
         item(for: identity.proto)
+    }
+
+    func testingAdoptDaemonItem(identity: PfsItemIdentity) throws -> PortableFSItem {
+        try daemonItem(for: identity.proto)
     }
 
     func testingDebugState() -> VolumeCoreDebugState {
@@ -951,10 +1469,13 @@ public actor VolumeCore {
             }
 
             let targetMode = Self.union(state.mode, requestedMode)
-            let newHandle = try await openDaemonHandle(identity: identity, mode: targetMode)
+            let opened = try await openDaemonHandle(
+                identity: identity,
+                mode: targetMode
+            )
             var replacement = OpenState(
                 identity: identity,
-                handle: newHandle,
+                handle: opened.handle,
                 mode: targetMode,
                 isImplicit: implicit && state.isImplicit,
                 attrSnapshot: state.attrSnapshot ?? attrSnapshot,
@@ -962,30 +1483,46 @@ public actor VolumeCore {
             )
             replacement.pendingCloseHandles.append(state.handle)
             openHandles[objectID] = replacement
+            opened.lease.acceptHandles()
+            await opened.lease.complete(itemsPublished: true)
             try await closePendingDaemonHandles(objectID: objectID)
             return
         }
 
-        let handle = try await openDaemonHandle(identity: identity, mode: requestedMode)
+        let opened = try await openDaemonHandle(
+            identity: identity,
+            mode: requestedMode
+        )
         openHandles[objectID] = OpenState(
             identity: identity,
-            handle: handle,
+            handle: opened.handle,
             mode: requestedMode,
             isImplicit: implicit,
             attrSnapshot: attrSnapshot,
             pendingCloseHandles: []
         )
+        opened.lease.acceptHandles()
+        await opened.lease.complete(itemsPublished: true)
     }
 
-    private func openDaemonHandle(identity: PfsItemIdentity, mode: PfsOpenMode) async throws -> UInt64 {
+    private func openDaemonHandle(
+        identity: PfsItemIdentity,
+        mode: PfsOpenMode
+    ) async throws -> (handle: UInt64, lease: PfsResourceReplyLease) {
         var request = PfsOpenRequest()
         request.item = identity.proto
         request.mode = mode
-        let envelope = try await client.request(.open(request))
+        let lease = try await client.requestResource(.open(request))
+        let envelope = lease.envelope
         guard case let .openReply(reply)? = envelope.body else {
+            await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        return reply.handle
+        guard reply.handle != 0 else {
+            await client.close()
+            throw PfsLocalClientError.connectionClosed
+        }
+        return (reply.handle, lease)
     }
 
     private struct DaemonCloseConfirmation {
@@ -1225,11 +1762,106 @@ public actor VolumeCore {
         }
     }
 
+    /// The single ingestion boundary for every daemon-originated object. A
+    /// reserved-range item must fail before it can enter the canonical tables
+    /// or reach an FSKit callback; checking only while mapping attributes is
+    /// too late because lookup/create return the `FSItem` itself.
+    private func daemonItem(for proto: PfsItem) throws -> PortableFSItem {
+        guard proto.itemID > 0,
+              proto.itemID < PfsFSKitMapping.localRepairIdentifierFloor else {
+            throw PfsLocalClientError.daemon(
+                errno: EOVERFLOW,
+                message: "daemon item identifier enters the local repair partition"
+            )
+        }
+        return item(for: proto)
+    }
+
+    /// Installs a reply item provisionally. The canonical object may be needed
+    /// to construct the framework result, but it becomes durable actor state
+    /// only if that callback publishes the item. Multiple concurrent replies
+    /// share one canonical object and independent provisional references, so
+    /// abandoning one can never remove an item another already published.
+    private func adoptProvisionalDaemonItem(
+        for proto: PfsItem
+    ) throws -> (PortableFSItem, PfsItemIdentity) {
+        guard proto.itemID > 0,
+              proto.itemID < PfsFSKitMapping.localRepairIdentifierFloor else {
+            throw PfsLocalClientError.daemon(
+                errno: EOVERFLOW,
+                message: "daemon item identifier enters the local repair partition"
+            )
+        }
+        let identity = PfsItemIdentity(proto)
+        if itemsByIdentity[identity] != nil,
+           provisionalItemReferences[identity] == nil {
+            // Canonical state that predates this provisional reply already has
+            // an owner (root, a prior callback, or a live kernel item).
+            publishedItemIdentities.insert(identity)
+        }
+        let item = item(for: proto)
+        provisionalItemReferences[identity, default: 0] += 1
+        return (item, identity)
+    }
+
+    private func adoptReplyItem(
+        _ proto: PfsItem,
+        lease: PfsResourceReplyLease,
+        terminalOnAbandon: Bool = false
+    ) throws -> PortableFSItem {
+        let (item, identity) = try adoptProvisionalDaemonItem(for: proto)
+        lease.registerItemSettlement { [weak self, weak item] acceptedCount in
+            guard let self, let item else { return }
+            if acceptedCount == 0, terminalOnAbandon {
+                await self.shutdown()
+                return
+            }
+            await self.settleProvisionalItem(
+                identity: identity,
+                item: item,
+                published: acceptedCount > 0
+            )
+        }
+        return item
+    }
+
+    private func settleProvisionalItem(
+        identity: PfsItemIdentity,
+        item: PortableFSItem,
+        published: Bool
+    ) {
+        let remaining = max(0, (provisionalItemReferences[identity] ?? 1) - 1)
+        if remaining == 0 {
+            provisionalItemReferences.removeValue(forKey: identity)
+        } else {
+            provisionalItemReferences[identity] = remaining
+        }
+        if published {
+            publishedItemIdentities.insert(identity)
+            return
+        }
+        guard remaining == 0,
+              !publishedItemIdentities.contains(identity),
+              itemsByIdentity[identity] === item,
+              openHandles[ObjectIdentifier(item)] == nil,
+              deletedItemsByObject[ObjectIdentifier(item)] == nil else {
+            return
+        }
+        forgetKnownItems(for: identity)
+        pruneGenerationIfUnused(itemID: identity.itemID)
+    }
+
+    /// Internal fixture adoption is deliberately separate from daemon
+    /// ingestion so tests can model stale/reclaimed generations directly.
     private func item(for proto: PfsItem) -> PortableFSItem {
         let identity = PfsItemIdentity(proto)
         if let currentGeneration = currentGenerationByItemID[identity.itemID],
            currentGeneration != identity.generation {
-            let oldIdentity = PfsItemIdentity(itemID: identity.itemID, generation: currentGeneration)
+            let oldIdentity = PfsItemIdentity(
+                itemID: identity.itemID,
+                generation: currentGeneration,
+                stableIdentity: identity.stableIdentity
+            )
             forgetKnownItems(for: oldIdentity)
             removeOpenHandles(for: oldIdentity)
         }
@@ -1266,6 +1898,8 @@ public actor VolumeCore {
 
     private func forgetKnownItems(for identity: PfsItemIdentity) {
         itemsByIdentity.removeValue(forKey: identity)
+        publishedItemIdentities.remove(identity)
+        provisionalItemReferences.removeValue(forKey: identity)
         let objectIDs = identitiesByObject.compactMap { objectID, knownIdentity in
             knownIdentity == identity ? objectID : nil
         }

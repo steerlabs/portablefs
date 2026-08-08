@@ -16,8 +16,8 @@ Thanks for contributing to PortableFS. Keep the description focused on WHY.
 
 <!-- How did you verify this? Paste the commands you ran. -->
 
-- [ ] `pnpm verify` (TS build/test/typecheck + Go vet/test + race)
-- [ ] `pnpm verify:postgres` (if metadata-db / migrations changed)
+- [ ] `bash scripts/verify-local.sh` (darwin+linux build/vet, Go suite, Go race suite, Swift suite, policy checks)
+- [ ] `bash scripts/xfs-fuse-integration.sh` (if the XFS store or the FUSE frontend changed; Linux only)
 - [ ] New or updated tests cover the change
 
 ## Checklist

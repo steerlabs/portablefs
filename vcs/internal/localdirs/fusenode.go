@@ -7,9 +7,6 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-
-	"github.com/steerlabs/portablefs/vcs/internal/clientcore"
-	"github.com/steerlabs/portablefs/vcs/internal/fsproto"
 )
 
 // localTTL is the kernel entry/attr timeout for grafted paths. The volume
@@ -178,63 +175,6 @@ func (g *Grafts) LinkChild(ctx context.Context, parent *fs.Inode, target fs.Inod
 	out.SetAttrTimeout(localTTL)
 	return g.attachChild(ctx, parent, &st), 0
 }
-
-// MergeParentListing merges graft roots into their parent directory's volume
-// listing: a graft root's name appears exactly once — shadowing any
-// same-named volume entry — and only when its local backing exists. Applied
-// per-readdir by the volume adapters, after (and outside) clientcore's dir
-// cache, which stays pure-volume.
-func (g *Grafts) MergeParentListing(dir string, ents []clientcore.DirEntry) ([]clientcore.DirEntry, syscall.Errno) {
-	roots := g.RootsUnder(dir)
-	if len(roots) == 0 {
-		return ents, 0
-	}
-	shadowed := map[string]bool{}
-	for _, root := range roots {
-		shadowed[baseName(root)] = true
-	}
-	merged := make([]clientcore.DirEntry, 0, len(ents)+len(roots))
-	for _, e := range ents {
-		if !shadowed[e.Name] {
-			merged = append(merged, e)
-		}
-	}
-	for _, root := range roots {
-		st, eno := g.Lstat(root)
-		if eno == syscall.ENOENT {
-			// The rule owns the name but nothing has created the directory
-			// yet; it is simply absent (no phantom entries).
-			continue
-		}
-		if eno != 0 {
-			return nil, eno
-		}
-		merged = append(merged, clientcore.DirEntry{
-			Name: baseName(root),
-			Attr: fsproto.Attr{Kind: "directory", Mode: uint32(st.Mode) & 0o7777, MtimeMs: statMtimeMs(&st), Nlink: 1},
-			Ino:  LocalIno(st.Ino),
-		})
-	}
-	return merged, 0
-}
-
-func baseName(p string) string {
-	if i := lastSlash(p); i >= 0 {
-		return p[i+1:]
-	}
-	return p
-}
-
-func lastSlash(p string) int {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' {
-			return i
-		}
-	}
-	return -1
-}
-
-// ---- Node operations (everything below routes to local backing) ----
 
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	return n.g.LookupChild(ctx, n.EmbeddedInode(), n.childPath(name), out)
