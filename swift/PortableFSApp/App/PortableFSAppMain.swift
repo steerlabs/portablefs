@@ -13,13 +13,6 @@ struct PortableFSAppMain: App {
                 .accessibilityLabel("PortableFS")
         }
 
-        Window("Sign In to PortableFS", id: SignInView.windowID) {
-            SignInView(model: model)
-        }
-        .windowResizability(.contentSize)
-        .defaultPosition(.center)
-        .defaultLaunchBehavior(.suppressed)
-
         Settings {
             SettingsView(model: model)
         }

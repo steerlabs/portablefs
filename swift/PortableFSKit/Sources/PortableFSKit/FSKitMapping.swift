@@ -17,6 +17,25 @@ public enum PfsErrorMapper {
         }
         return fs_errorForPOSIXError(EIO) as NSError
     }
+
+    /// Maps an xattr refusal at the macOS VFS boundary.
+    ///
+    /// Darwin gives `ENOTSUP` a filesystem-private meaning here: `vn_setxattr`
+    /// and `vn_removexattr` treat it as permission to invoke their AppleDouble
+    /// fallback unless the original caller supplied `XATTR_NODEFAULT`. A
+    /// normal `setxattr(2)` caller does not, so returning the authority's
+    /// honest `ENOTSUP` creates a durable `._name` sidecar and reports success
+    /// even though this volume declares user xattrs read-only. Darwin's
+    /// distinct `EOPNOTSUPP` is the authority's public refusal and, unlike
+    /// `ENOTSUP`, is terminal at the VFS boundary. Other failures retain their
+    /// exact errno. Linux exposes the same `EOPNOTSUPP` contract directly.
+    public static func fsKitXattrError(for error: Error) -> NSError {
+        let mapped = fsKitError(for: error)
+        if mapped.domain == NSPOSIXErrorDomain && mapped.code == Int(ENOTSUP) {
+            return fs_errorForPOSIXError(EOPNOTSUPP) as NSError
+        }
+        return mapped
+    }
 }
 
 public enum PfsFSKitMapping {
@@ -25,8 +44,21 @@ public enum PfsFSKitMapping {
     /// so expose the complete pfslocal identity space through one checked
     /// offset at the platform boundary. VolumeCore and portablefsd continue
     /// to use the unmodified durable identity.
+    ///
+    /// The high half of the identifier space is minted locally for macOS 26
+    /// repair scratch items, which the daemon must never know about. This is a
+    /// real namespace partition, not a small rollover window: one synthetic
+    /// vnode consumes one identifier for the process lifetime because FSKit
+    /// may retain that vnode after unlink until a later reclaim callback. The
+    /// former 4,096-ID band exhausted under an ordinary peer-create soak and
+    /// terminally broke coherence even though XFS had ample space.
+    ///
+    /// Refusing an authority item with the high bit set keeps the two spaces
+    /// provably disjoint while leaving 2^63-1 durable item identifiers.
+    public static let localRepairIdentifierFloor: UInt64 = 1 << 63
+
     public static func itemIdentifier(from itemID: UInt64) throws -> FSItem.Identifier {
-        guard itemID > 0, itemID < UInt64.max,
+        guard itemID > 0, itemID < localRepairIdentifierFloor,
               let identifier = FSItem.Identifier(rawValue: itemID + 1) else {
             throw PfsLocalClientError.daemon(
                 errno: EOVERFLOW,
@@ -121,6 +153,41 @@ public enum PfsFSKitMapping {
         from attr: PfsAttr,
         requested: FSItem.Attribute? = nil
     ) throws -> FSItem.Attributes {
+        try attributes(
+            from: attr,
+            requested: requested,
+            fileIdentifier: itemIdentifier(from: attr.item.itemID)
+        )
+    }
+
+    /// Builds the same complete attribute snapshot for the process-local item
+    /// returned by an authenticated macOS 26 repair create. Its identifier is
+    /// deliberately inside the range ordinary daemon items may never occupy,
+    /// so only this explicit entry point may project it into FSKit.
+    public static func localRepairAttributes(
+        from attr: PfsAttr,
+        requested: FSItem.Attribute? = nil
+    ) throws -> FSItem.Attributes {
+        guard attr.item.itemID >= localRepairIdentifierFloor,
+              attr.item.itemID < UInt64.max,
+              let identifier = FSItem.Identifier(rawValue: attr.item.itemID + 1) else {
+            throw PfsLocalClientError.daemon(
+                errno: EOVERFLOW,
+                message: "local repair identifier cannot be represented by FSKit"
+            )
+        }
+        return try attributes(
+            from: attr,
+            requested: requested,
+            fileIdentifier: identifier
+        )
+    }
+
+    private static func attributes(
+        from attr: PfsAttr,
+        requested: FSItem.Attribute?,
+        fileIdentifier: FSItem.Identifier
+    ) throws -> FSItem.Attributes {
         let attributes = FSItem.Attributes()
         if includes(.uid, in: requested) {
             attributes.uid = attr.uid
@@ -147,7 +214,7 @@ public enum PfsFSKitMapping {
             attributes.allocSize = attr.allocSize
         }
         if includes(.fileID, in: requested) {
-            attributes.fileID = try itemIdentifier(from: attr.item.itemID)
+            attributes.fileID = fileIdentifier
         }
         if includes(.parentID, in: requested) {
             attributes.parentID = try parentIdentifier(from: attr)

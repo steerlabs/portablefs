@@ -28,6 +28,9 @@ private func enumerationBytes(_ string: String) -> Data {
 
 @Test func initialDirectoryVerifierIsAlwaysAcceptedByAdapterPolicy() throws {
     #expect(FSDirectoryVerifier.initial.rawValue == 0)
+    #expect(PfsEnumerationCookies.isFreshStart(cookie: 0, verifier: 0))
+    #expect(PfsEnumerationCookies.isFreshStart(cookie: 2, verifier: 0))
+    #expect(!PfsEnumerationCookies.isFreshStart(cookie: 0, verifier: 41))
     #expect(try PfsEnumerationCookies.daemonCookie(for: FSDirectoryCookie.initial.rawValue, attributesRequested: true) == 0)
     #expect(try PfsEnumerationCookies.daemonCookie(for: FSDirectoryCookie.initial.rawValue, attributesRequested: false) == 0)
     let daemonCookie = PfsEnumerationCookies.daemonCookieMarker | 60
@@ -79,9 +82,64 @@ private func enumerationBytes(_ string: String) -> Data {
         cookie = page.nextCookie
     }
 
+    // Every page in the walk uses one retained directory descriptor. The
+    // authority's cookies belong to that open description; reopening per page
+    // resets its cursor and makes the first nonzero continuation ESTALE.
+    try await core.close(item: root, retainingModes: .unspecified)
+
     let stats = await daemon.stats()
     let allowedRPCs = ((1000 + Int(PfsEnumerationCookies.daemonPageSize) - 1) / Int(PfsEnumerationCookies.daemonPageSize)) + 1
     #expect(names.count == 1000)
+    #expect(stats.openRequests == 1)
+    #expect(stats.closeRequests == 1)
     #expect(stats.enumerateRequests <= allowedRPCs)
     #expect(stats.enumerateRequests == 5)
+}
+
+@Test func directCoreEnumerationMetadataCannotBeAdoptedAfterPrefixZeroSettlement() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let root = try await core.rootItem()
+    let peer = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await peer.resolve(attachRef: "mock")
+    for name in ["metadata-only-a", "metadata-only-b"] {
+        var create = PfsCreateRequest()
+        create.dir = resolved.root
+        create.name = enumerationBytes(name)
+        create.mode = 0o644
+        let envelope = try await peer.request(.create(create))
+        guard case let .createReply(reply)? = envelope.body else {
+            Issue.record("peer create omitted its reply")
+            return
+        }
+        var close = PfsCloseRequest()
+        close.handle = reply.handle
+        _ = try await peer.request(.close(close))
+    }
+    await daemon.resetStats()
+
+    let page = try await core.enumerate(
+        directory: root,
+        startingAt: 0,
+        wantAttributes: true,
+        maxEntries: 256
+    )
+    #expect(page.entries.count == 2)
+    #expect(await core.testingDebugState().itemCount == 1)
+    await #expect(throws: PfsLocalClientError.invalidFrame(
+        "enumeration item adoption requires an unsettled resource reply"
+    )) {
+        try await core.adoptEnumeratedItems(page.entries)
+    }
+    #expect(await core.testingDebugState().itemCount == 1)
+    for _ in 0..<100 {
+        if await daemon.stats().resourceAcceptedItemCounts.count >= 2 { break }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    #expect(await daemon.stats().resourceAcceptedItemCounts.allSatisfy { $0 == 0 })
+    try await core.close(item: root, retainingModes: .unspecified)
 }

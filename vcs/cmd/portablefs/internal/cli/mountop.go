@@ -24,6 +24,7 @@ type mountIntent struct {
 	VolumeID                    string      `json:"volumeId,omitempty"`
 	Branch                      string      `json:"branch,omitempty"`
 	Strategy                    string      `json:"strategy,omitempty"`
+	Engine                      string      `json:"engine,omitempty"`
 	AttachRef                   string      `json:"attachRef,omitempty"`
 	FSType                      string      `json:"fsType,omitempty"`
 	MountInstanceID             string      `json:"mountInstanceId"`
@@ -60,6 +61,7 @@ type mountOperation struct {
 	volumeID        string
 	branch          string
 	strategy        string
+	engine          string
 	attachRef       string
 	mountInstanceID string
 	kernelMountID   string
@@ -134,7 +136,11 @@ func acquireMountOperation(stateDir, mountPath, volumeID, branch, strategy strin
 		return nil, errors.Join(err, op.close(false))
 	}
 	if prior != nil && volumeID != "" {
-		conflictErr := fmt.Errorf("an incomplete prior mount operation (%s) remains for %s; run `portablefs umount %s` to reconcile it before mounting", prior.Phase, mountPath, mountPath)
+		conflictErr := fmt.Errorf(
+			"an incomplete prior mount operation (%s) remains for %s; run `portablefs umount %s` to reconcile it before mounting"+
+				" (if that operation's owner is gone and nothing is mounted there, `portablefs umount --discard-record %s` ends it)",
+			prior.Phase, mountPath, mountPath, mountPath,
+		)
 		return nil, errors.Join(conflictErr, op.close(false))
 	}
 	op.prior = prior
@@ -193,6 +199,19 @@ func validateMountIntent(path string, intent *mountIntent) error {
 	if intent.MountOwnerPID < 0 || (intent.MountOwnerPID > 0 && intent.MountOwnerStartIdentity == "") ||
 		intent.OperationOwnerPID <= 0 || intent.OperationOwnerStartIdentity == "" {
 		return fmt.Errorf("mount operation intent %s has incomplete owner identity", path)
+	}
+	switch intent.Engine {
+	case "":
+	case mountEngineFuseV3:
+		if intent.Strategy != "" && intent.Strategy != "fuse" {
+			return fmt.Errorf("mount operation intent %s has engine %q for strategy %q", path, intent.Engine, intent.Strategy)
+		}
+	case mountEngineDaemonV3:
+		if intent.Strategy != "" && intent.Strategy != "fskit" {
+			return fmt.Errorf("mount operation intent %s has engine %q for strategy %q", path, intent.Engine, intent.Strategy)
+		}
+	default:
+		return fmt.Errorf("mount operation intent %s has invalid engine %q", path, intent.Engine)
 	}
 	if intent.Phase != "starting" && intent.Phase != "cleanup-unverified" &&
 		!mountid.ValidMountInstance(intent.MountInstanceID) {
@@ -359,6 +378,7 @@ func (op *mountOperation) writeIntent(phase string, pid int, identity string) er
 		VolumeID:                    op.volumeID,
 		Branch:                      op.branch,
 		Strategy:                    op.strategy,
+		Engine:                      op.engine,
 		AttachRef:                   op.attachRef,
 		FSType:                      op.fsType,
 		MountInstanceID:             op.mountInstanceID,

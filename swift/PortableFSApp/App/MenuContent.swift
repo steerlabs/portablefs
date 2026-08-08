@@ -4,7 +4,6 @@ import SwiftUI
 
 struct MenuContent: View {
     let model: AppModel
-    @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -16,35 +15,7 @@ struct MenuContent: View {
                     model.quitApp()
                 }
             } else {
-                Text(model.signedInDescription)
-                Divider()
-
-                volumesSection
-                if !model.unlistedLocalMounts.isEmpty {
-                    Divider()
-                    Text("Local Mounts")
-                    ForEach(model.unlistedLocalMounts) { mount in
-                        Menu {
-                            Text("\(mount.volumeId)@\(mount.branch)")
-                            Text(mount.mountPath)
-                            if mount.requiresCleanup {
-                                Text(
-                                    mount.operationPhase.isEmpty
-                                        ? "Cleanup required"
-                                        : "Cleanup required (\(mount.operationPhase))"
-                                )
-                            } else {
-                                Text("Health: \(mount.health)")
-                            }
-                            Divider()
-                            Button(mount.requiresCleanup ? "Unmount / Reconcile" : "Unmount") {
-                                model.unmountLocalMount(mount)
-                            }
-                        } label: {
-                            Label(mount.volumeId, systemImage: "externaldrive.badge.questionmark")
-                        }
-                    }
-                }
+                mountsSection
                 Divider()
 
                 alertsSection
@@ -54,18 +25,6 @@ struct MenuContent: View {
                         await model.refreshAll()
                     }
                 }
-                Group {
-                    if model.isSignedIn {
-                        Button("Sign In / Switch Account…") {
-                            openSignInWindow()
-                        }
-                    } else {
-                        Button("Sign In…") {
-                            openSignInWindow()
-                        }
-                    }
-                }
-                .disabled(model.hasAccountEnvironmentOverrides)
                 Button("Settings…") {
                     NSApplication.shared.activate()
                     openSettings()
@@ -73,6 +32,10 @@ struct MenuContent: View {
                 Button("File System Extension Setup…") {
                     FirstRunAssistant.shared.present()
                 }
+                Button(model.isStoppingDaemon ? "Stopping Background Daemon…" : "Stop Background Daemon") {
+                    model.stopDaemon()
+                }
+                .disabled(!model.canStopDaemon)
                 Divider()
                 Button("Quit PortableFS") {
                     model.quitApp()
@@ -85,27 +48,18 @@ struct MenuContent: View {
         }
     }
 
-    private func openSignInWindow() {
-        NSApplication.shared.activate()
-        openWindow(id: SignInView.windowID)
-    }
-
     @ViewBuilder
-    private var volumesSection: some View {
-        if !model.isSignedIn {
-            Text("Sign in to list volumes")
-        } else if let error = model.volumesError {
-            Menu("Volume list unavailable") {
-                Button("Copy Error Details") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(error, forType: .string)
-                }
-            }
-        } else if model.volumes.isEmpty {
-            Text(model.isRefreshingVolumes ? "Loading volumes…" : "No volumes")
+    private var mountsSection: some View {
+        if !model.isMountInventoryKnown {
+            Text("Mount inventory unavailable")
+        } else if model.mounts.isEmpty {
+            // Mounting needs direct v3 credentials this app never holds, so
+            // the honest empty state points at the command that does.
+            Text("No mounted volumes")
+            Text("Mount with: portablefs mount <volume> <directory>")
         } else {
-            ForEach(model.volumes) { volume in
-                VolumeMenu(model: model, volume: volume)
+            ForEach(model.mounts) { mount in
+                MountMenu(model: model, mount: mount)
             }
         }
     }
@@ -132,61 +86,61 @@ struct MenuContent: View {
     }
 }
 
-private struct VolumeMenu: View {
+private struct MountMenu: View {
     let model: AppModel
-    let volume: ListedVolume
+    let mount: PortableFSCLIMountRow
 
     var body: some View {
-        let state = model.mountState(for: volume)
         Menu {
-            Text(state.menuStatusLabel)
-            if let path = state.mountPath {
-                Text(path)
+            Text(mount.mountPath)
+            Text(statusLabel)
+            if !mount.attachError.isEmpty {
+                Text(
+                    mount.attachError.count > 300
+                        ? String(mount.attachError.prefix(297)) + "…"
+                        : mount.attachError
+                )
             }
             Divider()
-            switch state {
-            case .mounted:
-                Button("Open in Finder") {
-                    model.openInFinder(volume)
+            if !mount.requiresCleanup {
+                Button("Reveal in Finder") {
+                    model.revealInFinder(mount)
                 }
-                Button("Unmount") {
-                    model.unmount(volume)
+            }
+            Button(mount.requiresCleanup ? "Unmount / Reconcile" : "Unmount") {
+                model.unmount(mount)
+            }
+            .disabled(model.isUnmounting(mount))
+            if !mount.attachError.isEmpty {
+                Button("Copy Attach Error") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(mount.attachError, forType: .string)
                 }
-            case .cleanupRequired:
-                Button("Unmount / Reconcile") {
-                    model.unmount(volume)
-                }
-            case .unmounted, .failed:
-                Button("Mount \(volume.volumeId)@\(volume.defaultBranch)") {
-                    model.mount(volume)
-                }
-                .disabled(!model.canMount(volume))
-                if case let .failed(message) = state {
-                    Button("Copy Error") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(message, forType: .string)
-                    }
-                }
-            default:
-                EmptyView()
             }
         } label: {
-            Label(volume.volumeId, systemImage: symbolName(for: state))
+            Label(mount.volumeId, systemImage: symbolName)
         }
     }
 
-    private func symbolName(for state: VolumeMountState) -> String {
-        switch state {
-        case .mounted:
-            return "circle.fill"
-        case .failed:
-            return "exclamationmark.triangle"
-        case .cleanupRequired:
-            return "exclamationmark.triangle"
-        case .unmounted:
-            return "circle"
-        default:
-            return "circle.dotted"
+    private var statusLabel: String {
+        if model.isUnmounting(mount) {
+            return "Unmounting…"
         }
+        if mount.requiresCleanup {
+            return mount.operationPhase.isEmpty
+                ? "Cleanup required"
+                : "Cleanup required (\(mount.operationPhase))"
+        }
+        if mount.attachState.isEmpty {
+            return "Health: \(mount.health)"
+        }
+        return "Health: \(mount.health), attach: \(mount.attachState)"
+    }
+
+    private var symbolName: String {
+        if mount.requiresCleanup || mount.health != "live" || mount.attachState == "degraded" {
+            return "exclamationmark.triangle"
+        }
+        return "circle.fill"
     }
 }

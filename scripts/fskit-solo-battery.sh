@@ -84,10 +84,29 @@ exec 7<&-
 
 echo "=== xattrs ==="
 wd 20 sh -c 'echo x > left/xf' || bad "prep xf"
-wd 20 xattr -w user.test somevalue left/xf && ok "xattr write" || bad "xattr write"
-XV=$(wd 20 xattr -p user.test left/xf)
-[ "$XV" = "somevalue" ] && ok "xattr read" || bad "xattr read (got: $XV)"
-wd 20 xattr -d user.test left/xf && ok "xattr delete" || bad "xattr delete"
+# The production XFS authority deliberately exposes a partial xattr surface:
+# list/get/remove of pre-existing portable attributes are real operations, but
+# set must fail because XFS attribute-fork blocks bypass project quotas.
+wd 20 python3 - <<'PYEOF' && ok "xattr write refused with exact EOPNOTSUPP" || bad "xattr write did not return exact EOPNOTSUPP"
+import ctypes, errno, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+libc.setxattr.restype = ctypes.c_int
+value = ctypes.create_string_buffer(b'somevalue')
+result = libc.setxattr(b'left/xf', b'user.test', value, len(value.raw) - 1, 0, 0)
+sys.exit(0 if result == -1 and ctypes.get_errno() == errno.EOPNOTSUPP else 1)
+PYEOF
+[ ! -e left/._xf ] && ok "xattr refusal created no AppleDouble sidecar" || bad "xattr refusal leaked an AppleDouble sidecar"
+wd 20 xattr -l left/xf >/dev/null && ok "xattr list" || bad "xattr list"
+wd 20 python3 - <<'PYEOF' && ok "xattr get reports the refused value absent" || bad "xattr get after refused write"
+import errno, os, sys
+try:
+    os.getxattr('left/xf', 'user.test')
+except OSError as error:
+    absent = {getattr(errno, 'ENOATTR', errno.ENODATA), errno.ENODATA}
+    sys.exit(0 if error.errno in absent else 2)
+sys.exit(1)
+PYEOF
 
 echo "=== symlink ==="
 wd 20 ln -s xf left/xf-link && ok "symlink create" || bad "symlink create"

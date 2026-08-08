@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,37 +28,6 @@ func doctorTestEnv(t *testing.T) (*cmdEnv, *bytes.Buffer, string) {
 		return baseGetenv(k)
 	}
 	return e, stdout, filepath.Join(e.stateDir, "mounts")
-}
-
-func writeDoctorProfile(t *testing.T, e *cmdEnv, token string) {
-	t.Helper()
-	cfg := &Config{CurrentProfile: "default", Profiles: map[string]Profile{
-		"default": {APIUrl: "https://api.example.com", APIToken: token},
-	}}
-	if err := saveConfig(e.configPath, cfg); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// doctorTransport fakes the probe transport: one status for unauthenticated
-// requests, one for bearer-authenticated ones, with an optional min-CLI
-// header on every response.
-func doctorTransport(unauthStatus, authStatus int, minVersion string) func(*http.Request) (*http.Response, error) {
-	return func(req *http.Request) (*http.Response, error) {
-		status := unauthStatus
-		if req.Header.Get("authorization") != "" {
-			status = authStatus
-		}
-		h := http.Header{}
-		if minVersion != "" {
-			h.Set(minCLIVersionHeader, minVersion)
-		}
-		return &http.Response{
-			StatusCode: status,
-			Header:     h,
-			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"UNAUTHORIZED","message":"x"}}`)),
-		}, nil
-	}
 }
 
 // fakeDoctor stubs every process/network boundary to a safe default; tests
@@ -87,14 +55,11 @@ func fakeDoctor(t *testing.T, e *cmdEnv, o commonOpts) *doctorRun {
 	return r
 }
 
-// doctorBaseline is a fully healthy Linux setup: saved profile, reachable
-// server (401 unauthenticated), accepted token (200).
+// doctorBaseline is a healthy Linux setup with nothing mounted.
 func doctorBaseline(t *testing.T) (*cmdEnv, *bytes.Buffer, *doctorRun, string) {
 	t.Helper()
 	e, stdout, stateDir := doctorTestEnv(t)
-	writeDoctorProfile(t, e, "tok")
 	r := fakeDoctor(t, e, commonOpts{})
-	r.httpDo = doctorTransport(401, 200, "")
 	return e, stdout, r, stateDir
 }
 
@@ -128,141 +93,13 @@ func TestDoctorAllChecksPassOnLinux(t *testing.T) {
 		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
 	}
 	requireContains(t, stdout.String(),
-		"PASS  config:",
-		"default -> https://api.example.com  (active)",
-		"PASS  server: https://api.example.com answered (HTTP 401)",
-		"PASS  token: saved token accepted (HTTP 200)",
-		"SKIP  version: server does not advertise a minimum CLI version",
 		"UNKNOWN  mount transport: no definite blocker found; mount not verified",
 		"SKIP  fskit inventory: FSKit is macOS-only",
 		"SKIP  portablefsd:",
+		"SKIP  attaches: attach status is read from portablefsd (macOS-only)",
 		"PASS  mounts: no mounts recorded",
 		"no definite problems found; 1 check(s) remain unverified",
 	)
-}
-
-func TestDoctorConfigParseFailure(t *testing.T) {
-	e, stdout, _ := doctorTestEnv(t)
-	if err := os.MkdirAll(filepath.Dir(e.configPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(e.configPath, []byte("{nope"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	r := fakeDoctor(t, e, commonOpts{})
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		"FAIL  config:",
-		"fix: fix or remove the file, then run `portablefs login` to recreate it",
-		"SKIP  server: connection settings unresolved",
-		"1 problem(s) found",
-	)
-}
-
-func TestDoctorNoServerConfigured(t *testing.T) {
-	e, stdout, _ := doctorTestEnv(t)
-	r := fakeDoctor(t, e, commonOpts{})
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		"PASS  config:",
-		"no profiles saved yet",
-		"FAIL  server: no server configured",
-		"fix: run `portablefs login`",
-		"SKIP  token: no server to verify a token against",
-	)
-}
-
-func TestDoctorServerUnreachable(t *testing.T) {
-	_, stdout, r, _ := doctorBaseline(t)
-	r.httpDo = func(*http.Request) (*http.Response, error) {
-		return nil, fmt.Errorf("dial tcp: connection refused")
-	}
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		"FAIL  server: https://api.example.com is not reachable: dial tcp: connection refused",
-		"fix: check the URL in the config file and your network",
-		"FAIL  token: could not verify the token",
-		"SKIP  version: server unreachable",
-	)
-}
-
-func TestDoctorTokenRejected(t *testing.T) {
-	_, stdout, r, _ := doctorBaseline(t)
-	r.httpDo = doctorTransport(401, 401, "")
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		"PASS  server:",
-		"FAIL  token: the server rejected the saved token (HTTP 401)",
-		"fix: run `portablefs login`",
-	)
-}
-
-func TestDoctorTokenSkippedWhenNoneSaved(t *testing.T) {
-	e, stdout, _ := doctorTestEnv(t)
-	writeDoctorProfile(t, e, "")
-	r := fakeDoctor(t, e, commonOpts{})
-	r.httpDo = doctorTransport(401, 200, "")
-	if rc := r.execute(); rc != 0 {
-		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(), "SKIP  token: no saved token for this profile")
-}
-
-func TestDoctorVersionSkewFails(t *testing.T) {
-	e, stdout, r, _ := doctorBaseline(t)
-	e.version = "v1.0.0"
-	r.httpDo = doctorTransport(401, 200, "9.9.9")
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		"FAIL  version: this CLI is v1.0.0 but the server requires at least 9.9.9",
-		"fix: upgrade with: curl -fsSL https://raw.githubusercontent.com/steerlabs/portablefs/main/scripts/install.sh | sh",
-	)
-}
-
-func TestDoctorVersionDevBuildFailsClosed(t *testing.T) {
-	e, stdout, r, _ := doctorBaseline(t)
-	e.version = "dev"
-	r.httpDo = doctorTransport(401, 200, "9.9.9")
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		`FAIL  version: "dev" is not a stamped release version, so compatibility with server minimum 9.9.9 cannot be verified`,
-		"fix: install a stamped release with: "+upgradeCommand(),
-	)
-}
-
-func TestDoctorInvalidServerMinimumFailsClosed(t *testing.T) {
-	e, stdout, r, _ := doctorBaseline(t)
-	e.version = "v9.9.9"
-	r.httpDo = doctorTransport(401, 200, "latest")
-	if rc := r.execute(); rc != 1 {
-		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(),
-		`FAIL  version: server sent invalid minimum CLI version "latest"`,
-		"fix: fix the server's "+minCLIVersionHeader+" response header",
-	)
-}
-
-func TestDoctorVersionMeetsMinimum(t *testing.T) {
-	e, stdout, r, _ := doctorBaseline(t)
-	e.version = "v2.1.0"
-	r.httpDo = doctorTransport(401, 200, "2.0.0")
-	if rc := r.execute(); rc != 0 {
-		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
-	}
-	requireContains(t, stdout.String(), "PASS  version: CLI v2.1.0 meets the server minimum 2.0.0")
 }
 
 func TestDoctorFskitExtensionStates(t *testing.T) {
@@ -417,7 +254,11 @@ func TestDoctorMountHealthFailures(t *testing.T) {
 		"FAIL  mounts: 2 mount(s): 1 stale, 1 credential-expired",
 		"/tmp/stale  vol1@main  fuse  stale",
 		"/tmp/expired  vol2@main  fuse  credential-expired",
-		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; run `portablefs login` and remount credential-expired paths",
+		// A v3 mount capability is single-use and is never renewed, so the
+		// only repair for a credential-expired mount is mounting again with a
+		// fresh one — which is what the remedy says, with no other command in
+		// it to send the operator somewhere that cannot help.
+		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; mount credential-expired paths again with a fresh volume mount capability (a v3 capability is single-use and is never renewed)",
 	)
 }
 
