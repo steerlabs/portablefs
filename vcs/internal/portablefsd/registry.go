@@ -77,6 +77,9 @@ type ensureAttachRequest struct {
 	Branch       string `json:"branch"`
 	AuthorityURL string `json:"authorityUrl"`
 	AuthToken    string `json:"authToken"`
+	// AuthSequence is the manager-assigned exact reauthorization sequence for
+	// an already-live v3 session. Zero is the initial attach credential.
+	AuthSequence uint64 `json:"authSequence,omitempty"`
 	// AuthTokenExpiresAtMs is the access lease's own stated expiry for
 	// AuthToken (unix ms). Additive and OPTIONAL: an older CLI omits it, the
 	// zero value means "no stated deadline", and nothing hardens — a daemon
@@ -361,7 +364,11 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 			return nil, false, fmt.Errorf("attach %s is already bound to a different attach mode or v3 contract; detach it before changing the declaration", a.ref)
 		}
 		r.mu.Unlock()
-		if err := a.activateWithOptions(ctx, req.AuthToken, req.AuthTokenExpiresAtMs, &req.Options); err != nil {
+		renewedCertificate := ""
+		if req.V3 != nil {
+			renewedCertificate = req.V3.ClientCertPEM
+		}
+		if err := a.activateWithOptions(ctx, req.AuthToken, req.AuthTokenExpiresAtMs, req.AuthSequence, renewedCertificate, &req.Options); err != nil {
 			return a, false, err
 		}
 		if err := r.persist(); err != nil {
@@ -403,7 +410,14 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 	r.byRef[ref] = a
 	r.byKey[key] = a
 	r.mu.Unlock()
-	if err := a.activate(ctx, req.AuthToken, req.AuthTokenExpiresAtMs); err != nil {
+	if req.AuthSequence != 0 {
+		r.mu.Lock()
+		delete(r.byRef, ref)
+		delete(r.byKey, key)
+		r.mu.Unlock()
+		return nil, false, errors.New("an initial v3 attach credential must use authSequence zero")
+	}
+	if err := a.activate(ctx, req.AuthToken, req.AuthTokenExpiresAtMs, 0, ""); err != nil {
 		r.mu.Lock()
 		delete(r.byRef, ref)
 		delete(r.byKey, key)
@@ -463,7 +477,7 @@ func (r *registry) get(ref string) *attach {
 // activate serializes credential-driven revival with every attach membership
 // mutation. Resolving the ref and publishing a live Volume therefore cannot
 // race an exact detach that is removing the same registry entry.
-func (r *registry) activate(ctx context.Context, ref, token string, expiresAtMs int64, onlyIfPending bool) (bool, bool, error) {
+func (r *registry) activate(ctx context.Context, ref, token string, expiresAtMs int64, sequence uint64, clientCertificatePEM string, onlyIfPending bool) (bool, bool, error) {
 	// ── A ROTATION INTO A LIVE ATTACH TAKES NO REGISTRY MUTATION LOCK ────────
 	//
 	// Round 15 took the mount-wide namespace lock off this path
@@ -503,8 +517,8 @@ func (r *registry) activate(ctx context.Context, ref, token string, expiresAtMs 
 	a := r.byRef[ref]
 	r.mu.RUnlock()
 	if a != nil {
-		if done, handled := a.rotateLiveCredential(token, expiresAtMs, onlyIfPending); handled {
-			return true, done, nil
+		if done, handled, err := a.rotateLiveCredential(ctx, token, expiresAtMs, sequence, clientCertificatePEM, onlyIfPending); handled {
+			return true, done, err
 		}
 	}
 	r.mutationMu.Lock()
@@ -516,10 +530,10 @@ func (r *registry) activate(ctx context.Context, ref, token string, expiresAtMs 
 		return false, false, nil
 	}
 	if onlyIfPending {
-		activated, err := a.activateIfPending(ctx, token, expiresAtMs)
+		activated, err := a.activateIfPending(ctx, token, expiresAtMs, sequence, clientCertificatePEM)
 		return true, activated, err
 	}
-	return true, true, a.activate(ctx, token, expiresAtMs)
+	return true, true, a.activate(ctx, token, expiresAtMs, sequence, clientCertificatePEM)
 }
 
 func (r *registry) list() []*attach {
@@ -1218,6 +1232,16 @@ type eventSubscriber struct {
 	ch     chan pfslocal.Event
 }
 
+func (a *attach) authorizationSessionID() string {
+	a.mu.RLock()
+	plane := a.v3Data
+	a.mu.RUnlock()
+	if plane == nil {
+		return ""
+	}
+	return plane.authorizationSessionID()
+}
+
 func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attach {
 	name := req.VolumeID
 	if req.Branch != "" {
@@ -1304,16 +1328,16 @@ func (a *attach) persistedEntry() persistedAttachEntry {
 	}
 }
 
-func (a *attach) activate(ctx context.Context, tok string, expiresAtMs int64) error {
-	return a.activateWithOptions(ctx, tok, expiresAtMs, nil)
+func (a *attach) activate(ctx context.Context, tok string, expiresAtMs int64, sequence uint64, clientCertificatePEM string) error {
+	return a.activateWithOptions(ctx, tok, expiresAtMs, sequence, clientCertificatePEM, nil)
 }
 
-func (a *attach) activateIfPending(ctx context.Context, tok string, expiresAtMs int64) (bool, error) {
-	return a.activateWithOptionsMode(ctx, tok, expiresAtMs, nil, true)
+func (a *attach) activateIfPending(ctx context.Context, tok string, expiresAtMs int64, sequence uint64, clientCertificatePEM string) (bool, error) {
+	return a.activateWithOptionsMode(ctx, tok, expiresAtMs, sequence, clientCertificatePEM, nil, true)
 }
 
-func (a *attach) activateWithOptions(ctx context.Context, tok string, expiresAtMs int64, options *AttachOptions) error {
-	_, err := a.activateWithOptionsMode(ctx, tok, expiresAtMs, options, false)
+func (a *attach) activateWithOptions(ctx context.Context, tok string, expiresAtMs int64, sequence uint64, clientCertificatePEM string, options *AttachOptions) error {
+	_, err := a.activateWithOptionsMode(ctx, tok, expiresAtMs, sequence, clientCertificatePEM, options, false)
 	return err
 }
 
@@ -1321,6 +1345,8 @@ func (a *attach) activateWithOptionsMode(
 	ctx context.Context,
 	tok string,
 	expiresAtMs int64,
+	sequence uint64,
+	clientCertificatePEM string,
 	options *AttachOptions,
 	onlyIfPending bool,
 ) (bool, error) {
@@ -1346,8 +1372,8 @@ func (a *attach) activateWithOptionsMode(
 	//
 	// So the rotation is separated out and takes nothing heavier than a.mu.
 	// Every other path keeps the lock it had.
-	if done, handled := a.rotateLiveCredential(tok, expiresAtMs, onlyIfPending); handled {
-		return done, nil
+	if done, handled, err := a.rotateLiveCredential(ctx, tok, expiresAtMs, sequence, clientCertificatePEM, onlyIfPending); handled {
+		return done, err
 	}
 	unlockNamespace := a.lockExternalNamespaceWrite()
 	defer unlockNamespace()
@@ -1439,10 +1465,13 @@ func (a *attach) activateWithOptionsMode(
 // See activateWithOptionsMode for why the rotation must not queue behind the
 // mount's write traffic.
 func (a *attach) rotateLiveCredential(
+	ctx context.Context,
 	tok string,
 	expiresAtMs int64,
+	sequence uint64,
+	clientCertificatePEM string,
 	onlyIfPending bool,
-) (bool, bool) {
+) (bool, bool, error) {
 	a.mu.RLock()
 	unavailable := a.detached || a.detachPrepared || a.detachForce
 	credentialPending := a.credentialPending
@@ -1454,16 +1483,29 @@ func (a *attach) rotateLiveCredential(
 	// the locked path and must not be short-circuited into a silent success.
 	active := plane != nil && !credentialPending && plane.terminalError() == nil
 	if unavailable || !active {
-		return false, false
+		return false, false, nil
 	}
 	if onlyIfPending {
 		// An active attach has no pending credential by definition, so a
 		// pending-only installation has nothing to do. Same answer the locked
 		// path gives, reached without the lock.
-		return false, true
+		return false, true, nil
+	}
+	if a.v3Config != nil {
+		if sequence == 0 {
+			return false, true, errors.New("a live v3 credential rotation requires a nonzero authSequence")
+		}
+		replacement, err := a.v3Config.replacementCertificate(clientCertificatePEM, time.Now())
+		if err != nil {
+			return false, true, err
+		}
+		if err := plane.reauthorize(ctx, []byte(tok), sequence); err != nil {
+			return false, true, fmt.Errorf("reauthorize live v3 session: %w", err)
+		}
+		a.v3Config.installReplacementCertificate(replacement)
 	}
 	a.setCredential(tok, expiresAtMs)
-	return true, true
+	return true, true, nil
 }
 
 // controlAdmissionError is called only while nsMu is held. A persisted

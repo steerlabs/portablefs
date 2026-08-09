@@ -94,8 +94,11 @@ must remount — for these reasons:
 - **A slot outside the negotiated range** (`ErrSlotRange`).
 - **Session lease expiry.** Keepalive is a liveness proof; a session that stops
   renewing is reaped along with its locks and handles.
-- **Capability expiry.** A capability's validity window is an absolute session
-  deadline. Keepalive cannot renew it — issue a new credential and mount again.
+- **Authorization expiry.** Keepalive cannot extend the signed authorization
+  deadline. A standalone mount must use a new credential and mount again. A
+  hosted live mount may extend its existing session only with the exact next
+  manager-signed `Reauthorize` grant; an expired, broadened, gapped, or changed
+  replay is refused and may fence the session.
 - **Strict participant fencing**, below.
 
 A fenced session never re-establishes itself under the same identity. A zombie

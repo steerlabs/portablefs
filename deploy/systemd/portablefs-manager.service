@@ -1,0 +1,59 @@
+[Unit]
+Description=PortableFS hosted control-plane manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/portablefs/manager/manager.env
+ExecStart=/usr/local/bin/portablefs-manager \
+  -listen=${PORTABLEFS_MANAGER_LISTEN} \
+  -state-file=/var/lib/portablefs-manager/manager.state \
+  -tls-cert=/etc/portablefs/manager/tls/manager.cert \
+  -tls-key=/etc/portablefs/manager/tls/manager.key \
+  -control-client-ca=/etc/portablefs/manager/trust/control-client-ca.pem \
+  -plan-signing-key=/etc/portablefs/manager/keys/plan-signing.key \
+  -capability-signing-key=/etc/portablefs/manager/keys/capability-signing.key \
+  -authority-ca-cert=/etc/portablefs/manager/trust/authority-ca.pem \
+  -authority-ca-key=/etc/portablefs/manager/keys/authority-ca.key \
+  -mount-client-ca-cert=/etc/portablefs/manager/trust/mount-client-ca.pem \
+  -mount-client-ca-key=/etc/portablefs/manager/keys/mount-client-ca.key \
+  -product-issuer-key=${PORTABLEFS_PRODUCT_ISSUER_KEY}
+Restart=on-failure
+RestartSec=3s
+User=portablefs-manager
+Group=portablefs-manager
+StateDirectory=portablefs-manager
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ReadWritePaths=/var/lib/portablefs-manager
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf io_uring_setup keyctl open_by_handle_at perf_event_open pidfd_getfd process_vm_readv process_vm_writev ptrace userfaultfd
+UMask=0077
+TasksMax=256
+LimitNOFILE=8192
+MemoryHigh=384M
+MemoryMax=512M
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target

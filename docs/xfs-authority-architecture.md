@@ -8,7 +8,7 @@ state. PortableFS does not maintain a second inode tree, content index,
 permanent operation history, branch graph, or write-back overlay.
 
 This was a deliberate compatibility reset. The v2 journal architecture and its
-control plane were removed rather than deprecated, and the protocol handshake
+journal control plane were removed rather than deprecated, and the protocol handshake
 refuses anything that does not speak the v3 contract rather than entering a
 mixed mode. See [../COMPATIBILITY.md](../COMPATIBILITY.md).
 
@@ -392,37 +392,36 @@ one-GiB memory or volume limit. Cell admission follows measured SSD capacity,
 IOPS, throughput, memory, descriptors, and recovery SLO.
 
 Short-lived capability claims include subject, volume, read/write access,
-credential validity, peer-certificate identity, and a nonce. Authorization
-precedes handle resolution. Capability expiry is an absolute session deadline,
-not something keepalive can renew. Per-tenant concurrency and I/O scheduling
+credential validity, peer-certificate identity, and a nonce. Hosted grants also
+pin cell, authority identity and generation, and contain the product's separate
+authorization assertion. Authorization precedes handle resolution. Keepalive
+cannot extend a signed authorization deadline. Per-tenant concurrency and I/O scheduling
 protect unrelated volumes; quota errors remain the kernel's `EDQUOT`/`ENOSPC`
 outcomes.
 
-That absolute deadline is the current standalone behavior, not the production
-mount lifecycle. A durable mount needs an additive v3 control-plane contract:
+An initial grant's absolute deadline is still the standalone behavior. The
+hosted lifecycle implements the additive v3 control-plane contract:
 the mount creates its TLS key locally, the control plane validates proof of
 possession and returns a short-lived client certificate plus a single-use
 Ed25519 grant bound to the leaf SPKI, and the authority verifies both end to
 end. The client private key never leaves the machine and the FSKit extension
 never receives it. Ambiguous grant creation returns one durable byte-identical
-receipt; ambiguous Attach replays the exact accepted session reply keyed by
-grant nonce, peer SPKI, and canonical Attach request instead of treating a lost
-success as credential reuse.
+receipt. A lost initial Attach still requires the product to request another
+short-lived grant; no client may reuse a spent capability.
 
 Long-lived mounts renew authorization inside the existing session with a fresh
-single-use grant bound to the volume, authority epoch, session, peer SPKI,
-access, route revision, frontend cache policy, monotone authorization sequence,
-and new deadline. Reauthorization is an exact replay operation on a reserved
-lifecycle lane; it may extend the deadline but cannot broaden access or change
-cache/routing terms. Keepalive remains only a liveness proof.
+grant bound to the volume, authority generation, session, peer SPKI, access,
+monotone authorization sequence, and new deadline. Reauthorization is an exact
+replay operation on a reserved lifecycle lane; it may extend the deadline and
+renew the same-key client certificate but cannot broaden access. Keepalive
+remains only a liveness proof. A changed replay or sequence gap fences the
+session.
 
-None of that control plane exists in this tree. Today an operator or an
-integration mints capabilities out of band and hands the mount its address, its
-single-use capability, and its client identity directly. That is sufficient for
-the standalone and test topologies and is deliberately not a production mount
-lifecycle: a long-lived mount currently ends at the capability's absolute
-deadline. Building it is future work, and the contract above is the shape it must
-take.
+`portablefs-manager`, the outbound cell agent, the narrow root helper, and the
+systemd units implementing that lifecycle now live in this tree. Standalone
+operators may continue minting direct credentials out of band. The hosted trust
+boundaries, lifecycle, API, and explicit single-manager/single-AZ limits are in
+[hosted-control-plane.md](./hosted-control-plane.md).
 
 The unprivileged request process verifies the root's project ID and
 `PROJINHERIT` flag but deliberately has no quota-administration capability.

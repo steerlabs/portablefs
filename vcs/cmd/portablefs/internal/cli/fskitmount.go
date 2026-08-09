@@ -329,9 +329,10 @@ type fskitV3AttachRequest struct {
 }
 
 type fskitEnsureAttachReply struct {
-	AttachRef         string   `json:"attachRef"`
-	LocalDirs         []string `json:"localDirs,omitempty"`
-	LocalDirsDeclared bool     `json:"localDirsDeclared,omitempty"`
+	AttachRef              string   `json:"attachRef"`
+	AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
+	LocalDirs              []string `json:"localDirs,omitempty"`
+	LocalDirsDeclared      bool     `json:"localDirsDeclared,omitempty"`
 }
 
 func (c *fsdControl) ensureAttachDetailed(req fskitEnsureAttachRequest) (fskitEnsureAttachReply, error) {

@@ -8,9 +8,10 @@ It has three dependencies — `go-fuse`, `golang.org/x/sys`, and `protobuf` — 
 no build system above `go`. The directory is named `vcs` for historical reasons;
 nothing in it is a version control system.
 
-There is no journal, no history, no branch, no PortableFS-managed or offline
-write-back cache, and no control plane. XFS is the only durable filesystem truth.
-Ordinary OS kernel page caches remain part of each mount contract. For why, read
+There is no file-data journal, history, branch, or PortableFS-managed offline
+write-back cache. XFS is the only durable filesystem truth. The optional hosted
+control plane manages placement and credentials, never file contents. Ordinary
+OS kernel page caches remain part of each mount contract. For why, read
 [../docs/xfs-authority-architecture.md](../docs/xfs-authority-architecture.md).
 
 ## Commands
@@ -19,12 +20,17 @@ Ordinary OS kernel page caches remain part of each mount contract. For why, read
 | --- | --- |
 | `cmd/portablefs` | The user-facing CLI: mount, umount, mounts, route, prune-local, daemon, doctor, mount-check, version, and the installer and lifecycle coordination subcommands. Linux and macOS. |
 | `cmd/portablefs-authority` | The volume authority. Linux only. One process serves exactly one volume, refuses to run as root, and terminates its epoch on any storage failure. |
+| `cmd/portablefs-manager` | The product-neutral hosted manager. It owns desired state, placement, PKI, grants, and fencing generations, but never filesystem contents. |
+| `cmd/portablefs-cell-agent` | The unprivileged outbound reconciliation loop on each Linux storage cell. |
+| `cmd/portablefs-cell-helper` | The narrow root helper that applies only a verified, manager-signed cell plan. Linux only. |
+| `cmd/portablefs-authority-launcher` | The fixed-argument systemd launcher for an isolated per-volume authority. Linux only. |
 | `cmd/portablefsd` | The per-user daemon. On macOS it is the v3 data plane behind the FSKit extension: it owns the authority session and never exposes authority credentials to the extension. |
 | `cmd/portablefs-mount-v3` | A standalone Linux mount client. This is what the coherence harnesses drive; ordinary users go through `portablefs mount`. |
 
 ## Layout
 
 ```text
+hostedauth/       Public product assertion signer and CSR SPKI helper.
 internal/
   xfsstore/        XFS-only, descriptor-relative volume backend: openat2 under
                    RESOLVE_BENEATH, *at syscalls, device verification, stable
@@ -38,6 +44,15 @@ internal/
   authoritypb/     Generated protobuf bindings for proto/authority/v1.
   volumecap/       Ed25519 mount capabilities: signed, single-use, short-lived,
                    volume- and peer-bound.
+  productauth/     Independent product authorization assertions bound to the
+                   same volume, access, subject, client key, nonce, and time.
+  controlplane/    Hosted desired state, placement, PKI, exact receipts, API,
+                   reconciliation, generation fencing, and release identity.
+  cellplan/        Canonical signed host plans with immutable isolation IDs.
+  cellagent/       Outbound-only unprivileged hosted cell reconciliation.
+  cellhelper/      Durable assignment pinning and the narrow root boundary.
+  cellhost/        Closed XFS quota, local authority identity, and systemd host
+                   operations derived only from signed volume assignments.
   fusev3/          The Linux frontend. Raw FUSE, direct I/O, the strict and
                    uncached cache profiles, kernel binding revocation, and
                    machine-local route grafts.

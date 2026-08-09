@@ -53,7 +53,7 @@ func TestLiveCredentialRotationDoesNotQueueBehindTheRegistryMutationLock(t *test
 	done := make(chan result, 1)
 	go func() {
 		found, activated, err := r.activate(
-			context.Background(), a.ref, rotated, expiry, false,
+			context.Background(), a.ref, rotated, expiry, 0, "", false,
 		)
 		done <- result{found, activated, err}
 	}()
@@ -118,7 +118,7 @@ func TestCredentialRotationStillSerializesForEveryStateItDoesNotHandle(t *testin
 	// non-pending branch, before and after this change; the verdict that matters
 	// is the error and whether anything was installed.
 	_, _, err := r.activate(
-		context.Background(), a.ref, "should-not-install", 0, false,
+		context.Background(), a.ref, "should-not-install", 0, 0, "", false,
 	)
 	if err == nil {
 		t.Fatal("rotating into a detached attach succeeded: the lock-free fast " +
@@ -133,7 +133,7 @@ func TestCredentialRotationStillSerializesForEveryStateItDoesNotHandle(t *testin
 
 	// A ref that does not exist is still not found, and the answer still comes
 	// from the re-resolve under mutationMu rather than from the lock-free read.
-	found, _, err := r.activate(context.Background(), "no-such-ref", "t", 0, false)
+	found, _, err := r.activate(context.Background(), "no-such-ref", "t", 0, 0, "", false)
 	if found || err != nil {
 		t.Fatalf("unknown ref reported found=%v err=%v, want false/nil", found, err)
 	}

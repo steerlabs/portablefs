@@ -61,6 +61,7 @@ const maxDirentBytes uint32 = 768
 const MinimumFrameBytes uint32 = fixedMutationReplyBytes + responseEnvelopeReserve
 
 const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
+const sessionReauthorizationFeature = "session-reauthorization-v1"
 
 var (
 	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", "source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition"}
@@ -168,6 +169,7 @@ func requestRequiresAdmin(req *authoritypb.Request) bool {
 func requestUsesTopology(req *authoritypb.Request) bool {
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_Resume, *authoritypb.Request_KeepAlive,
+		*authoritypb.Request_Reauthorize,
 		*authoritypb.Request_Detach, *authoritypb.Request_Cancel,
 		*authoritypb.Request_NextVisibility, *authoritypb.Request_AckVisibility,
 		*authoritypb.Request_ApplyRoutes:

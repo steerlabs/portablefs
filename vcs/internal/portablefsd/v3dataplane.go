@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
@@ -18,6 +19,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -144,8 +146,51 @@ type v3DataPlane struct {
 	nameMax         uint32
 	maxRead         uint32
 	maxWrite        uint32
+	reauthMu        sync.Mutex
+	reauthSequence  uint64
 
 	failOnce sync.Once
+}
+
+type v3ReauthorizingClient interface {
+	Reauthorize(context.Context, []byte, uint64) (time.Time, error)
+}
+
+type v3SessionIdentityClient interface {
+	AuthorizationSessionID() volumeserver.SessionID
+}
+
+func (d *v3DataPlane) authorizationSessionID() string {
+	client, ok := d.client.(v3SessionIdentityClient)
+	if !ok {
+		return ""
+	}
+	id := client.AuthorizationSessionID()
+	if id == (volumeserver.SessionID{}) {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(id[:])
+}
+
+func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence uint64) error {
+	client, ok := d.client.(v3ReauthorizingClient)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	d.reauthMu.Lock()
+	defer d.reauthMu.Unlock()
+	if sequence < d.reauthSequence || sequence > d.reauthSequence+1 {
+		return errors.New("reauthorization sequence is not current or exactly next")
+	}
+	deadline, err := client.Reauthorize(ctx, token, sequence)
+	if err != nil {
+		return err
+	}
+	if !deadline.After(time.Now()) {
+		return errors.New("reauthorization returned an expired deadline")
+	}
+	d.reauthSequence = sequence
+	return nil
 }
 
 func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane, error) {

@@ -25,11 +25,14 @@ Linux FUSE mount            macOS FSKit mount
         one XFS project directory (PROJINHERIT)
                      |
               encrypted SSD / EBS
+
+Optional hosted lifecycle (never on filesystem I/O):
+product authorization -> portablefs-manager -> outbound cell agent -> root helper/systemd
 ```
 
 ## What a two-machine demo looks like
 
-Two machines mount the same volume with direct credentials — an authority
+In standalone mode, two machines mount the same volume with direct credentials — an authority
 address, a single-use capability, and a mutual-TLS client identity. There is no
 control plane in between.
 
@@ -114,6 +117,26 @@ so every restart after a strict mount then depends on the operator asserting
 Full operator guidance — provisioning, credentials, bounds, restart, and backups
 — is in [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md).
 
+## Hosted lifecycle
+
+The repository also contains a product-neutral hosted foundation:
+
+- `portablefs-manager` allocates volumes, signs complete cell plans, issues
+  proof-of-possession client certificates, and mints exact dual-authorized mount
+  and reauthorization grants.
+- `portablefs-cell-agent` is unprivileged and outbound-only.
+- `portablefs-cell-helper` is the narrow root/XFS boundary and independently
+  verifies signed plans.
+- systemd owns each listener and supervises one sandboxed, unprivileged
+  authority per active volume.
+
+The manager is not in the read/write path. Client private keys are generated on
+the mount host and never delivered by the manager. Long-lived v3 mounts renew an
+existing session with an exact monotonic `Reauthorize` operation; access may
+narrow but never broaden. See
+[docs/hosted-control-plane.md](./docs/hosted-control-plane.md) and
+[docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md).
+
 ## What PortableFS guarantees
 
 - **XFS is the truth.** There is no PortableFS journal, manifest, checkpoint, or
@@ -145,8 +168,9 @@ Full operator guidance — provisioning, credentials, bounds, restart, and backu
 ## What PortableFS is not
 
 - **Not versioned storage.** No history, forks, branches, snapshots, commits, or
-  `adopt`. That was the v2 product, and the v3 reset removed it and its entire
-  journal architecture and control plane. See [COMPATIBILITY.md](./COMPATIBILITY.md).
+  `adopt`. That was the v2 product, and the v3 reset removed its journal and
+  journal control plane. The hosted v3 manager controls placement and access;
+  it never stores filesystem history. See [COMPATIBILITY.md](./COMPATIBILITY.md).
 - **Not eventually consistent.** There is no asynchronous invalidation stream
   that a reader can race. Either a mount holds no cached state for a name, or the
   authority repaired it synchronously before the mutation returned.
@@ -206,6 +230,10 @@ scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-
   full v3 design, failure model, security boundaries, and proof gates.
 - [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md) — running
   a volume yourself.
+- [docs/hosted-control-plane.md](./docs/hosted-control-plane.md) — the hosted
+  manager, authorization, lifecycle, fencing, and deliberate v1 limits.
+- [docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md) — deploying
+  the outbound agent, root helper, and systemd authority units on a cell.
 - [docs/consistency-model.md](./docs/consistency-model.md) — the exact
   visibility, durability, and retry rules.
 - [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a

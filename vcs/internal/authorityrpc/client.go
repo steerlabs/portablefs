@@ -102,31 +102,32 @@ type lane struct {
 type Client struct {
 	cfg ClientConfig
 
-	lifecycle            sync.Mutex
-	conn                 net.Conn
-	writeMu              sync.Mutex
-	pendingMu            sync.Mutex
-	pending              map[uint64]chan callResult
-	nextID               atomic.Uint64
-	ordinary             lane
-	blocking             lane
-	visibility           lane
-	liveness             lane
-	epoch                []byte
-	proof                *authoritypb.SessionProof
-	root                 *authoritypb.Item
-	maxRead              uint32
-	maxWrite             uint32
-	lease                time.Duration
-	visibilityCursor     *authoritypb.VisibilityCursor
-	peerCompleteFeedback atomic.Bool
-	frameMax             atomic.Uint32
-	poisoned             atomic.Bool
-	closed               bool
-	fatalOnce            sync.Once
-	fatalMu              sync.Mutex
-	fatalErr             error
-	fatalDone            chan struct{}
+	lifecycle              sync.Mutex
+	conn                   net.Conn
+	writeMu                sync.Mutex
+	pendingMu              sync.Mutex
+	pending                map[uint64]chan callResult
+	nextID                 atomic.Uint64
+	ordinary               lane
+	blocking               lane
+	visibility             lane
+	liveness               lane
+	epoch                  []byte
+	proof                  *authoritypb.SessionProof
+	root                   *authoritypb.Item
+	maxRead                uint32
+	maxWrite               uint32
+	lease                  time.Duration
+	visibilityCursor       *authoritypb.VisibilityCursor
+	peerCompleteFeedback   atomic.Bool
+	sessionReauthorization atomic.Bool
+	frameMax               atomic.Uint32
+	poisoned               atomic.Bool
+	closed                 bool
+	fatalOnce              sync.Once
+	fatalMu                sync.Mutex
+	fatalErr               error
+	fatalDone              chan struct{}
 }
 
 type clientSlot struct {
@@ -254,6 +255,9 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 	}
 	c.peerCompleteFeedback.Store(hasFeatures(
 		hello.GetHello().GetFeatures(), []string{peerCompleteFIFOFeedbackFeature},
+	))
+	c.sessionReauthorization.Store(hasFeatures(
+		hello.GetHello().GetFeatures(), []string{sessionReauthorizationFeature},
 	))
 	if len(hello.GetEpoch()) != len(volumeserver.Epoch{}) {
 		return fail(errors.New("authorityrpc: protocol handshake omitted a valid authority epoch"))
@@ -432,6 +436,53 @@ func (c *Client) SessionLease() time.Duration {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
 	return c.lease
+}
+
+// Reauthorize rotates the signed decision underneath an existing mount. The
+// manager assigns sequence and returns the same token for an idempotency key;
+// the authority accepts an exact retry and refuses gaps or broadened access.
+func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64) (time.Time, error) {
+	if len(token) == 0 || sequence == 0 {
+		return time.Time{}, syscall.EINVAL
+	}
+	if !c.sessionReauthorization.Load() {
+		return time.Time{}, syscall.EOPNOTSUPP
+	}
+	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{
+		AccessToken: append([]byte(nil), token...), Sequence: sequence,
+	}}})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if response.GetErrno() != 0 {
+		if response.GetErrno() == int32(syscall.ESTALE) || response.GetErrno() == int32(syscall.EINVAL) {
+			c.signalSessionEnd(ErrSessionEnded)
+		}
+		return time.Time{}, syscall.Errno(response.GetErrno())
+	}
+	if response.GetReauthorize() == nil || response.GetReauthorize().GetSequence() != sequence {
+		c.signalSessionEnd(ErrSessionEnded)
+		return time.Time{}, ErrSessionEnded
+	}
+	deadline := time.Unix(0, response.GetReauthorize().GetAuthorizationDeadlineUnixNanos())
+	if !deadline.After(time.Now()) {
+		c.signalSessionEnd(ErrSessionEnded)
+		return time.Time{}, ErrSessionEnded
+	}
+	return deadline, nil
+}
+
+// AuthorizationSessionID exposes the non-secret session identifier needed to
+// bind a manager reauthorization grant. The resume secret remains private to
+// this client and is never returned.
+func (c *Client) AuthorizationSessionID() volumeserver.SessionID {
+	c.lifecycle.Lock()
+	defer c.lifecycle.Unlock()
+	var id volumeserver.SessionID
+	if c.proof != nil && len(c.proof.GetId()) == len(id) {
+		copy(id[:], c.proof.GetId())
+	}
+	return id
 }
 
 func (c *Client) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
@@ -633,7 +684,7 @@ func (c *Client) signalSessionEnd(err error) {
 }
 
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
-	if request.GetKeepAlive() != nil && c.cfg.CoherenceProfile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT {
+	if request.GetReauthorize() != nil || request.GetKeepAlive() != nil && c.cfg.CoherenceProfile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT {
 		return &c.liveness
 	}
 	if request.GetNextVisibility() != nil || request.GetAckVisibility() != nil {

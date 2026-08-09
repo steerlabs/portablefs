@@ -20,7 +20,7 @@ func TestActivateIfPendingNeverRollsBackActiveCredential(t *testing.T) {
 	}, privateTestDir(t))
 	a.setCredential("newest-token", 0)
 
-	activated, err := a.activateIfPending(context.Background(), "stale-recorded-token", 0)
+	activated, err := a.activateIfPending(context.Background(), "stale-recorded-token", 0, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}

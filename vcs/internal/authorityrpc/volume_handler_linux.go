@@ -37,6 +37,10 @@ type Authorizer interface {
 	Authorize(context.Context, string, []byte) (volumeserver.Authorization, error)
 }
 
+type Reauthorizer interface {
+	Reauthorize(context.Context, string, volumeserver.SessionID, uint64, []byte) (volumeserver.Authorization, [32]byte, error)
+}
+
 // volumeStore is the complete syscall-backed authority surface. Keeping the
 // handler dependent on this contract (rather than the concrete XFS carrier)
 // makes the pre-apply admission boundary fault-injectable while production has
@@ -227,6 +231,24 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	cred, err := h.credential(ctx, req)
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
+	}
+	if reauthorize := req.GetReauthorize(); reauthorize != nil {
+		verifier, ok := h.Authorizer.(Reauthorizer)
+		if !ok || reauthorize.GetSequence() == 0 || len(reauthorize.GetAccessToken()) == 0 {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+		authorization, proof, err := verifier.Reauthorize(ctx, h.Runtime.VolumeID(), cred.ID, reauthorize.GetSequence(), reauthorize.GetAccessToken())
+		if err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		if err := h.Runtime.Reauthorize(cred, authorization, reauthorize.GetSequence(), proof); err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		resp := h.success(req.GetRequestId())
+		resp.Body = &authoritypb.Response_Reauthorize{Reauthorize: &authoritypb.ReauthorizeReply{
+			Sequence: reauthorize.GetSequence(), AuthorizationDeadlineUnixNanos: authorization.Deadline.UnixNano(),
+		}}
+		return resp
 	}
 	use, err := h.Runtime.Begin(cred)
 	if err != nil {
@@ -1417,7 +1439,7 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	}
 	bounds := h.Bounds()
 	features := append([]string(nil), requiredHelloFeatures...)
-	features = append(features, peerCompleteFIFOFeedbackFeature)
+	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature)
 	resp := h.success(requestID)
 	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 		ProtocolMajor: ProtocolMajor, Features: features,
@@ -1562,6 +1584,7 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	}
 	resp := h.success(requestID)
 	features := append([]string(nil), requiredAttachFeatures...)
+	features = append(features, sessionReauthorizationFeature)
 	if profile == volumeserver.CoherenceStrict {
 		features = append(features, requiredStrictAttachFeatures...)
 	}
@@ -2042,7 +2065,8 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 	switch {
 	case errors.Is(err, volumeserver.ErrEpochMismatch), errors.Is(err, volumeserver.ErrSessionExpired), errors.Is(err, volumeserver.ErrSessionFenced):
 		errno = errnos.ESTALE
-	case errors.Is(err, volumeserver.ErrSequenceGap), errors.Is(err, volumeserver.ErrRequestMismatch), errors.Is(err, volumeserver.ErrSlotRange):
+	case errors.Is(err, volumeserver.ErrSequenceGap), errors.Is(err, volumeserver.ErrRequestMismatch), errors.Is(err, volumeserver.ErrSlotRange),
+		errors.Is(err, volumeserver.ErrAuthorizationSequence), errors.Is(err, volumeserver.ErrAuthorizationBroadened):
 		errno = errnos.EINVAL
 	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN

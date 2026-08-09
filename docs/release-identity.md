@@ -3,14 +3,18 @@
 Status: **describes the release path as configured; not exercised since the v3
 reset (see [Known gaps](#known-gaps))**
 
-A PortableFS release has no identity endpoint and no runtime identity service.
-There is nothing to ask "which build are you?" — the v2 volume API, authority
-manager, Docker images, and Postgres migration lineage that once answered that
-question were removed with the v2 architecture. What establishes release
-identity today is entirely offline: a validated git tag, a version string
-stamped into the binaries and re-proved by the installer, and two independent
-cryptographic trust chains — Sigstore artifact attestations for the Linux
-archives, and Apple Developer ID notarization for the macOS app.
+The shipped client release identity is offline: a validated git tag, a version
+string stamped into the binaries and re-proved by the installer, and two
+independent cryptographic trust chains — Sigstore artifact attestations for the
+Linux archives, and Apple Developer ID notarization for the macOS app.
+
+The optional hosted foundation additionally reports runtime identity. The
+manager exposes its exact stamp at `GET /v1/release`; authenticated cell
+observations record separate manager-plan, cell-agent, and root-helper release
+stamps. Those hosted binaries currently default visibly to `dev` unless the
+builder sets `main.version` with `-ldflags`. They are not yet members of the
+frozen two-binary Linux client archive or macOS app identity described below,
+so an operator must bind their build and deployment provenance independently.
 
 Everything below is enforced by `.github/workflows/release.yml`,
 `.goreleaser.yaml`, `scripts/install.sh`, and the two policy checkers
