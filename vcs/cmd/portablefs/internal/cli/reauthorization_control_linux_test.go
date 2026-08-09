@@ -13,6 +13,36 @@ import (
 	"time"
 )
 
+func TestFuseReauthorizationControlUsesLifetimeScopedBoundedAddress(t *testing.T) {
+	first, err := newFuseReauthorizationSocketName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newFuseReauthorizationSocketName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(first, "@portablefs-reauthorization-") || len(first) >= 100 {
+		t.Fatalf("abstract control address = %q (length %d)", first, len(first))
+	}
+	if first == second {
+		t.Fatal("independent controls received the same unpredictable address")
+	}
+	if !validReauthorizationControlAddress(first) {
+		t.Fatalf("generated control address was not accepted: %q", first)
+	}
+	for _, invalid := range []string{
+		"/tmp/portablefs.sock",
+		"@portablefs-reauthorization-1-deadbeef",
+		strings.Replace(first, "@portablefs", "@another-product", 1),
+		first + "00",
+	} {
+		if validReauthorizationControlAddress(invalid) {
+			t.Fatalf("invalid control address was accepted: %q", invalid)
+		}
+	}
+}
+
 func TestReauthorizeCommandDeliversCredentialToExactLiveFuseSupervisor(t *testing.T) {
 	e, stdout, stderr := testEnv(t)
 	mountPath, err := canonicalMountPath(t.TempDir())
@@ -34,8 +64,6 @@ func TestReauthorizeCommandDeliversCredentialToExactLiveFuseSupervisor(t *testin
 	observed := make(chan observedRequest, 1)
 	deadline := time.Now().Add(10 * time.Minute).Truncate(time.Millisecond)
 	control, err := startFuseReauthorizationControl(
-		stateDir,
-		mountPath,
 		func(_ context.Context, token string, sequence uint64, certificate []byte) (time.Time, error) {
 			observed <- observedRequest{token: token, sequence: sequence, certificate: string(certificate)}
 			return deadline, nil
