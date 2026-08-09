@@ -9,11 +9,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +27,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -29,6 +35,8 @@ import (
 // for "localhost", and a mount client identity — the same three artifacts the
 // production manager issues.
 type v3TestPKI struct {
+	ca            *x509.Certificate
+	caKey         ed25519.PrivateKey
 	caPEM         string
 	caSHA256      string
 	serverTLS     *tls.Config
@@ -90,7 +98,7 @@ func newV3TestPKI(t *testing.T) v3TestPKI {
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
 	return v3TestPKI{
-		caPEM:    caPEM,
+		ca: ca, caKey: caKey, caPEM: caPEM,
 		caSHA256: hex.EncodeToString(caSum[:]),
 		serverTLS: &tls.Config{
 			MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{serverCert},
@@ -101,20 +109,56 @@ func newV3TestPKI(t *testing.T) v3TestPKI {
 	}
 }
 
+func (pki v3TestPKI) enrollmentCertificateForClientKey(t *testing.T, enrollmentID string, now time.Time) (string, time.Time) {
+	t.Helper()
+	keyBlock, rest := pem.Decode([]byte(pki.clientKeyPEM))
+	if keyBlock == nil || len(rest) != 0 {
+		t.Fatal("test client key is not PEM")
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, ok := parsed.(ed25519.PrivateKey)
+	if !ok {
+		t.Fatal("test client key is not Ed25519")
+	}
+	identity, err := url.Parse("spiffe://portablefs/mount-enrollment/" + enrollmentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := now.Add(time.Hour)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(4), Subject: pkix.Name{CommonName: enrollmentID},
+		NotBefore: now.Add(-time.Minute), NotAfter: expires,
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		URIs: []*url.URL{identity},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, pki.ca, key.Public(), pki.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), expires
+}
+
 // v3TestAuthority is an in-process strict authority behind the real
 // authorityrpc server transport: mutual TLS, the full Hello/Attach handshake,
 // and enough of the operation surface for the daemon's v3 data plane.
 type v3TestAuthority struct {
-	epoch       []byte
-	session     []byte
-	leaseMillis uint64
+	epoch                        []byte
+	session                      []byte
+	leaseMillis                  uint64
+	mountEnrollment              bool
+	initialAuthorizationDeadline int64
+	renewedAuthorizationDeadline int64
 
-	mu             sync.Mutex
-	keepAliveErrno int32
-	attach         *authoritypb.AttachRequest
-	detach         *authoritypb.DetachRequest
-	lookups        int
-	statfsCalls    int
+	mu               sync.Mutex
+	keepAliveErrno   int32
+	attach           *authoritypb.AttachRequest
+	detach           *authoritypb.DetachRequest
+	lookups          int
+	statfsCalls      int
+	reauthorizations int
 }
 
 func newV3TestAuthority() *v3TestAuthority {
@@ -153,6 +197,12 @@ func (h *v3TestAuthority) authorityCalls() (lookups, statfs int) {
 	return h.lookups, h.statfsCalls
 }
 
+func (h *v3TestAuthority) reauthorizationCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reauthorizations
+}
+
 func (h *v3TestAuthority) failKeepAlives() {
 	h.mu.Lock()
 	h.keepAliveErrno = 5
@@ -171,13 +221,17 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	switch req.GetBody().(type) {
 	case *authoritypb.Request_Hello:
 		bounds := h.Bounds()
+		features := []string{
+			"xfs-current-state", "session-exact-epoch", "direct-write",
+			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
+			"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+		}
+		if h.mountEnrollment {
+			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
+		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 			ProtocolMajor: authorityrpc.ProtocolMajor,
-			Features: []string{
-				"xfs-current-state", "session-exact-epoch", "direct-write",
-				"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-				"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
-			},
+			Features:      features,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
 			MaxInFlight: uint32(bounds.MaxInFlight),
 		}}
@@ -185,17 +239,29 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		h.mu.Lock()
 		h.attach = req.GetAttach()
 		h.mu.Unlock()
+		features := []string{
+			"write-through", "no-history", "no-branches", "direct-io-no-file-mmap",
+			"user-xattr-readonly", "single-principal", "distributed-posix-locks",
+			"stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier",
+			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
+			"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+		}
+		if h.mountEnrollment {
+			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
+		}
 		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
 			SessionId: append([]byte(nil), h.session...), SessionGeneration: 1,
 			ResumeSecret: make([]byte, 32), Root: h.rootItem(),
-			Features: []string{
-				"write-through", "no-history", "no-branches", "direct-io-no-file-mmap",
-				"user-xattr-readonly", "single-principal", "distributed-posix-locks",
-				"stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier",
-				"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-				"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
-			},
-			SessionLeaseMilliseconds: h.leaseMillis,
+			Features:                       features,
+			SessionLeaseMilliseconds:       h.leaseMillis,
+			AuthorizationDeadlineUnixNanos: h.initialAuthorizationDeadline,
+		}}
+	case *authoritypb.Request_Reauthorize:
+		h.mu.Lock()
+		h.reauthorizations++
+		h.mu.Unlock()
+		response.Body = &authoritypb.Response_Reauthorize{Reauthorize: &authoritypb.ReauthorizeReply{
+			Sequence: req.GetReauthorize().GetSequence(), AuthorizationDeadlineUnixNanos: h.renewedAuthorizationDeadline,
 		}}
 	case *authoritypb.Request_KeepAlive:
 		h.mu.Lock()
@@ -300,6 +366,134 @@ func ensureV3TestAttach(t *testing.T, r *registry, req ensureAttachRequest) *att
 	}
 	t.Cleanup(func() { a.fenceV3(errors.New("test cleanup")) })
 	return a
+}
+
+func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	pki := newV3TestPKI(t)
+	enrollmentID := "22222222-2222-4222-8222-222222222222"
+	enrollmentCertificate, enrollmentExpires := pki.enrollmentCertificateForClientKey(t, enrollmentID, now)
+	initialDeadline := now.Add(2 * time.Minute)
+	renewedDeadline := now.Add(10 * time.Minute)
+	handler := newV3TestAuthority()
+	handler.mountEnrollment = true
+	handler.initialAuthorizationDeadline = initialDeadline.UnixNano()
+	handler.renewedAuthorizationDeadline = renewedDeadline.UnixNano()
+	authorityAddress := startV3TestAuthority(t, handler, pki.serverTLS)
+
+	refreshes := make(chan struct{}, 1)
+	managerHandler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.TLS == nil || len(request.TLS.PeerCertificates) == 0 || len(request.TLS.PeerCertificates[0].URIs) != 1 ||
+			request.TLS.PeerCertificates[0].URIs[0].String() != "spiffe://portablefs/mount-enrollment/"+enrollmentID {
+			http.Error(writer, "wrong enrollment identity", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/reauthorizations"):
+			var body controlplane.RefreshMountEnrollmentRequest
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.Sequence != 1 || body.ClientCSRPEM == "" {
+				http.Error(writer, "bad refresh", http.StatusBadRequest)
+				return
+			}
+			wantSession := base64.RawURLEncoding.EncodeToString(handler.session)
+			if body.SessionID != wantSession {
+				http.Error(writer, "wrong session", http.StatusBadRequest)
+				return
+			}
+			select {
+			case refreshes <- struct{}{}:
+			default:
+			}
+			_ = json.NewEncoder(writer).Encode(controlplane.MountAuthorization{
+				VolumeID: "vol-v3", AuthorityEndpoint: authorityAddress, AuthorityServerName: "localhost",
+				AuthorityCAPEM: pki.caPEM, ClientCertificatePEM: pki.clientCertPEM, Capability: "renewed-capability",
+				Access: []string{"write"}, ExpiresUnix: renewedDeadline.Unix(), CertificateExpiresUnix: enrollmentExpires.Unix(),
+				AuthorityGeneration: 7, SessionID: body.SessionID, Sequence: body.Sequence, ReleaseID: "test",
+			})
+		case strings.HasSuffix(request.URL.Path, "/close"):
+			_ = json.NewEncoder(writer).Encode(controlplane.MountEnrollment{ID: enrollmentID, State: controlplane.MountEnrollmentClosed})
+		default:
+			http.NotFound(writer, request)
+		}
+	})
+	manager := httptest.NewUnstartedServer(managerHandler)
+	manager.TLS = pki.serverTLS.Clone()
+	manager.StartTLS()
+	t.Cleanup(manager.Close)
+
+	req := v3TestEnsureRequest(authorityAddress, pki, "/Volumes/PortableFSV3Automatic")
+	req.AuthTokenExpiresAtMs = initialDeadline.UnixMilli()
+	req.V3.Enrollment = &v3MountEnrollmentRequest{
+		ManagerURL: manager.URL, ManagerServerName: "localhost", ManagerCAPEM: pki.caPEM,
+		EnrollmentID: enrollmentID, EnrollmentCertificatePEM: enrollmentCertificate,
+		EnrollmentExpiresAtMs: enrollmentExpires.UnixMilli(), AuthorityGeneration: 7,
+		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
+	}
+	r := newRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	a := ensureV3TestAttach(t, r, req)
+	t.Cleanup(a.lifeCancel)
+
+	select {
+	case <-refreshes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("portablefsd automatic owner never refreshed its enrollment")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for handler.reauthorizationCalls() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("portablefsd automatic owner never installed the renewed authority grant")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.mu.RLock()
+	installedDeadline := a.authorizationDeadlineAtMs
+	a.mu.RUnlock()
+	if installedDeadline != renewedDeadline.UnixMilli() {
+		t.Fatalf("automatic authorization deadline = %d, want %d", installedDeadline, renewedDeadline.UnixMilli())
+	}
+	if _, handled, err := a.rotateLiveCredential(context.Background(), "manual", renewedDeadline.UnixMilli(), 2, pki.clientCertPEM, false); !handled || err == nil || !strings.Contains(err.Error(), "automatic reauthorization owner") {
+		t.Fatalf("manual fallback against automatic owner: handled=%t err=%v", handled, err)
+	}
+}
+
+func TestV3ManualReauthorizationUsesAuthorityDeadline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	pki := newV3TestPKI(t)
+	initialDeadline := now.Add(2 * time.Minute)
+	authorityDeadline := now.Add(10 * time.Minute)
+	callerClaimedDeadline := now.Add(30 * time.Minute)
+	handler := newV3TestAuthority()
+	handler.mountEnrollment = true
+	handler.initialAuthorizationDeadline = initialDeadline.UnixNano()
+	handler.renewedAuthorizationDeadline = authorityDeadline.UnixNano()
+	address := startV3TestAuthority(t, handler, pki.serverTLS)
+	r := newRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3ManualReauthorization")
+	req.AuthTokenExpiresAtMs = initialDeadline.UnixMilli()
+	a := ensureV3TestAttach(t, r, req)
+
+	done, handled, err := a.rotateLiveCredential(
+		context.Background(), "renewed-capability", callerClaimedDeadline.UnixMilli(), 1, pki.clientCertPEM, false,
+	)
+	if err != nil || !handled || !done {
+		t.Fatalf("manual reauthorization = done %t, handled %t, error %v", done, handled, err)
+	}
+	a.credMu.RLock()
+	installedCredentialDeadline := a.tokenExpiresAtMs
+	a.credMu.RUnlock()
+	if installedCredentialDeadline != authorityDeadline.UnixMilli() {
+		t.Fatalf("installed credential deadline = %d, want authority deadline %d (caller claimed %d)",
+			installedCredentialDeadline, authorityDeadline.UnixMilli(), callerClaimedDeadline.UnixMilli())
+	}
+	if got := a.authorizationDeadline(); got != authorityDeadline.UnixMilli() {
+		t.Fatalf("reported authorization deadline = %d, want %d", got, authorityDeadline.UnixMilli())
+	}
+	status := a.status()
+	if status.AuthorizationDeadlineAtMs != authorityDeadline.UnixMilli() || status.LastReauthorizationAtMs == 0 {
+		t.Fatalf("manual reauthorization status = %+v", status)
+	}
 }
 
 func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {

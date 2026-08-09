@@ -15,9 +15,9 @@ for relative in \
   portablefs-manager portablefs-manager.service manager.env \
   pki/tls/manager.cert pki/tls/manager.key \
   pki/trust/control-client-ca.pem pki/trust/authority-ca.pem \
-  pki/trust/mount-client-ca.pem pki/trust/product-public.pem \
+  pki/trust/mount-client-ca.pem pki/trust/mount-enrollment-ca.pem pki/trust/product-public.pem \
   pki/keys/plan-signing.key pki/keys/capability-signing.key \
-  pki/keys/authority-ca.key pki/keys/mount-client-ca.key; do
+  pki/keys/authority-ca.key pki/keys/mount-client-ca.key pki/keys/mount-enrollment-ca.key; do
   [[ -f $stage/$relative && ! -L $stage/$relative ]] || {
     echo "missing or unsafe staged file: $relative" >&2
     exit 66
@@ -44,10 +44,10 @@ install -o root -g root -m 0600 "$stage/manager.env" /etc/portablefs/manager/man
 install -o portablefs-manager -g portablefs-manager -m 0400 \
   "$stage/pki/tls/manager.key" /etc/portablefs/manager/tls/manager.key
 install -o root -g root -m 0444 "$stage/pki/tls/manager.cert" /etc/portablefs/manager/tls/manager.cert
-for name in control-client-ca.pem authority-ca.pem mount-client-ca.pem product-public.pem; do
+for name in control-client-ca.pem authority-ca.pem mount-client-ca.pem mount-enrollment-ca.pem product-public.pem; do
   install -o root -g root -m 0444 "$stage/pki/trust/$name" "/etc/portablefs/manager/trust/$name"
 done
-for name in plan-signing.key capability-signing.key authority-ca.key mount-client-ca.key; do
+for name in plan-signing.key capability-signing.key authority-ca.key mount-client-ca.key mount-enrollment-ca.key; do
   install -o portablefs-manager -g portablefs-manager -m 0400 "$stage/pki/keys/$name" "/etc/portablefs/manager/keys/$name"
 done
 

@@ -13,6 +13,26 @@ this file is the human-curated summary.
 
 Initial open-source release preparation. No tagged release yet.
 
+### Added
+
+- **Hosted live-mount reauthorization is public at the CLI boundary.** New
+  mounts return their non-secret `authorizationSessionId`, `portablefs version
+  --json` advertises `hosted-mount-reauthorization-v1`, and `portablefs
+  reauthorize` delivers an exact manager-issued sequence, capability, and
+  renewed certificate to the existing session. Linux uses a uid-checked private
+  mount-supervisor socket; macOS uses the paired `portablefsd` control socket.
+  Capabilities remain environment-only at the CLI and are never written to
+  mount or daemon state.
+- **Hosted mounts can renew themselves under a bounded Manager enrollment.**
+  An explicit `automatic_reauthorization` request creates a volume-, access-,
+  generation-, and mount-key-scoped enrollment. The Linux mount supervisor and macOS
+  `portablefsd` each own exactly one renewal sequence, install short-lived
+  grants into the existing session, close the enrollment on exact detach, and
+  fail closed before the installed grant expires. Natural tuple idempotency
+  prevents lost HTTP responses from producing two proofs for one sequence
+  without accumulating per-refresh response receipts; the enrollment is pinned
+  as the authority session's sole reauthorization issuer.
+
 ### Removed
 
 - **The v2 architecture, in its entirety.** The XFS authority, the `fusev3`

@@ -57,12 +57,15 @@ the unmount the last; the workspace carries all state between runs, including
 privileged Linux gate (`TestWorkloadGitAcrossMounts`,
 `TestWorkloadSQLiteAcrossMounts` — see [local-dev.md](./local-dev.md)).
 
-An initial mount capability is single-use. In direct/standalone mode it is not
-renewed: `portablefs mounts` reports an ended credential as
-`credential-expired`, and a fresh capability plus remount re-establishes it. A
-hosted integration may instead push the exact next manager-issued
-reauthorization into the live session; the daemon never invents or silently
-extends authorization on its own.
+An initial mount capability is single-use. A hosted mount that explicitly opts
+into automatic reauthorization also receives a bounded, volume- and key-scoped
+enrollment. The Linux mount supervisor or the
+existing macOS daemon then obtains and installs short-lived grants automatically
+without remounting; there is one sequencer per mount and the filesystem session,
+locks, handles, and strict-cache membership stay intact. A definitive denial or
+missed safety cutoff fails closed and detaches. Standalone mounts omit the
+enrollment and can use the explicit `portablefs reauthorize` command; they never
+silently switch modes.
 
 ## Parallel Agents
 

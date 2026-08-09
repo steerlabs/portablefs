@@ -55,9 +55,12 @@ func run() error {
 	authorityCAKey := flag.String("authority-ca-key", "", "authority TLS CA private key PEM")
 	clientCACert := flag.String("mount-client-ca-cert", "", "mount client CA certificate PEM")
 	clientCAKey := flag.String("mount-client-ca-key", "", "mount client CA private key PEM")
+	enrollmentCACert := flag.String("mount-enrollment-ca-cert", "", "Manager-facing mount enrollment CA certificate PEM")
+	enrollmentCAKey := flag.String("mount-enrollment-ca-key", "", "Manager-facing mount enrollment CA private key PEM")
 	flag.Var(&productKeys, "product-issuer-key", "trusted product authorization key as issuer=/absolute/public-key.pem; repeatable")
 	planLifetime := flag.Duration("plan-lifetime", 15*time.Minute, "signed cell plan lifetime")
 	grantLifetime := flag.Duration("grant-lifetime", 10*time.Minute, "mount grant lifetime")
+	enrollmentLifetime := flag.Duration("mount-enrollment-lifetime", 24*time.Hour, "maximum lifetime of one key-bound automatic mount enrollment")
 	productLifetime := flag.Duration("product-authorization-max-lifetime", 15*time.Minute, "maximum product assertion lifetime")
 	clientCertLifetime := flag.Duration("mount-client-cert-lifetime", time.Hour, "mount client certificate lifetime")
 	authorityCertLifetime := flag.Duration("authority-cert-lifetime", 24*time.Hour, "authority server certificate lifetime")
@@ -66,14 +69,15 @@ func run() error {
 	flag.Parse()
 	if flag.NArg() != 0 || *listen == "" || *stateFile == "" || *serverCert == "" || *serverKey == "" ||
 		*controlCA == "" || *planKey == "" || *capabilityKey == "" || *authorityCACert == "" ||
-		*authorityCAKey == "" || *clientCACert == "" || *clientCAKey == "" || len(productKeys) == 0 {
-		return errors.New("listen, state, TLS, control CA, signing keys, both data-plane CAs, and at least one product issuer key are required")
+		*authorityCAKey == "" || *clientCACert == "" || *clientCAKey == "" ||
+		*enrollmentCACert == "" || *enrollmentCAKey == "" || len(productKeys) == 0 {
+		return errors.New("listen, state, TLS, control CA, signing keys, authority, mount-client, mount-enrollment CAs, and at least one product issuer key are required")
 	}
 	if os.Geteuid() == 0 {
 		return errors.New("refuses to run as root")
 	}
 	for _, path := range []string{*stateFile, *serverCert, *serverKey, *controlCA, *planKey, *capabilityKey,
-		*authorityCACert, *authorityCAKey, *clientCACert, *clientCAKey} {
+		*authorityCACert, *authorityCAKey, *clientCACert, *clientCAKey, *enrollmentCACert, *enrollmentCAKey} {
 		if !cleanAbsolutePath(path) {
 			return fmt.Errorf("path must be clean and absolute: %q", path)
 		}
@@ -117,17 +121,34 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("mount client CA: %w", err)
 	}
+	enrollmentCA, err := readCA(*enrollmentCACert, *enrollmentCAKey)
+	if err != nil {
+		return fmt.Errorf("mount enrollment CA: %w", err)
+	}
 	manager, err := controlplane.NewManager(controlplane.ManagerConfig{
 		Store: store, PlanPrivateKey: planPrivate, CapabilityPrivateKey: capabilityPrivate,
-		ProductIssuers: issuers, AuthorityCA: authorityCA, ClientCA: clientCA,
+		ProductIssuers: issuers, AuthorityCA: authorityCA, ClientCA: clientCA, EnrollmentCA: enrollmentCA,
 		ReleaseID: version, PlanLifetime: *planLifetime, GrantLifetime: *grantLifetime,
+		EnrollmentLifetime: *enrollmentLifetime,
 		ProductMaxLifetime: *productLifetime, ClientCertLifetime: *clientCertLifetime,
 		AuthorityCertLifetime: *authorityCertLifetime, ObservedStaleAfter: *observedStale, ClockSkew: *clockSkew,
 	})
 	if err != nil {
 		return err
 	}
-	tlsConfig, err := controlTLSConfig(*serverCert, *serverKey, *controlCA)
+	tlsConfig, err := controlTLSConfig(*serverCert, *serverKey, *controlCA, *enrollmentCACert)
+	if err != nil {
+		return err
+	}
+	controlCAPEM, err := os.ReadFile(*controlCA)
+	if err != nil {
+		return err
+	}
+	enrollmentCAPEM, err := os.ReadFile(*enrollmentCACert)
+	if err != nil {
+		return err
+	}
+	authenticate, err := controlplane.NewRoleBoundMTLSAuthenticator(controlCAPEM, enrollmentCAPEM)
 	if err != nil {
 		return err
 	}
@@ -136,7 +157,7 @@ func run() error {
 		return err
 	}
 	server := &http.Server{
-		Handler: &controlplane.HTTPHandler{Manager: manager}, ReadHeaderTimeout: 10 * time.Second,
+		Handler: &controlplane.HTTPHandler{Manager: manager, Authenticate: authenticate}, ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -158,7 +179,7 @@ func cleanAbsolutePath(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path
 }
 
-func controlTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, error) {
+func controlTLSConfig(certPath, keyPath string, clientCAPaths ...string) (*tls.Config, error) {
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
 		return nil, err
@@ -171,13 +192,15 @@ func controlTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, erro
 	if err != nil {
 		return nil, err
 	}
-	clientCAPEM, err := os.ReadFile(clientCAPath)
-	if err != nil {
-		return nil, err
-	}
 	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
-		return nil, errors.New("control client CA has no certificates")
+	for _, clientCAPath := range clientCAPaths {
+		clientCAPEM, err := os.ReadFile(clientCAPath)
+		if err != nil {
+			return nil, err
+		}
+		if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
+			return nil, fmt.Errorf("client CA %s has no certificates", clientCAPath)
+		}
 	}
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert,

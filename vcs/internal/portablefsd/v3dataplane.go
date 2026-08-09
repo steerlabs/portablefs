@@ -172,25 +172,25 @@ func (d *v3DataPlane) authorizationSessionID() string {
 	return base64.RawURLEncoding.EncodeToString(id[:])
 }
 
-func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence uint64) error {
+func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence uint64) (time.Time, error) {
 	client, ok := d.client.(v3ReauthorizingClient)
 	if !ok {
-		return syscall.EOPNOTSUPP
+		return time.Time{}, syscall.EOPNOTSUPP
 	}
 	d.reauthMu.Lock()
 	defer d.reauthMu.Unlock()
 	if sequence < d.reauthSequence || sequence > d.reauthSequence+1 {
-		return errors.New("reauthorization sequence is not current or exactly next")
+		return time.Time{}, errors.New("reauthorization sequence is not current or exactly next")
 	}
 	deadline, err := client.Reauthorize(ctx, token, sequence)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if !deadline.After(time.Now()) {
-		return errors.New("reauthorization returned an expired deadline")
+		return time.Time{}, errors.New("reauthorization returned an expired deadline")
 	}
 	d.reauthSequence = sequence
-	return nil
+	return deadline, nil
 }
 
 func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane, error) {

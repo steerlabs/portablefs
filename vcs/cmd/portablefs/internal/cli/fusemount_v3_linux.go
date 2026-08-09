@@ -5,8 +5,10 @@ package cli
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
@@ -43,13 +45,15 @@ type fuseV3Config struct {
 	backingRoot string
 	// noLocalDirs refuses a volume that declares machine-local routes instead
 	// of serving them (adopt=false in the attach protocol).
-	noLocalDirs bool
+	noLocalDirs            bool
+	requireMountEnrollment bool
 }
 
 // fuseV3Mount is one live fusev3 kernel mount plus the routing it was
 // admitted with.
 type fuseV3Mount struct {
-	mount *fusev3.Mount
+	mount  *fusev3.Mount
+	client *authorityrpc.Client
 	// routes is the volume-declared route set this mount serves and the
 	// declaration revision the authority pinned the attach to. Never
 	// per-machine: the v3 attach protocol admits only the volume's topology.
@@ -60,6 +64,23 @@ type fuseV3Mount struct {
 func (m *fuseV3Mount) Unmount() error { return m.mount.Unmount() }
 func (m *fuseV3Mount) Wait()          { m.mount.Wait() }
 func (m *fuseV3Mount) Close() error   { return m.mount.Close() }
+func (m *fuseV3Mount) AuthorizationSessionID() string {
+	id := m.client.AuthorizationSessionID()
+	empty := true
+	for _, value := range id {
+		empty = empty && value == 0
+	}
+	if empty {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(id[:])
+}
+func (m *fuseV3Mount) InitialAuthorizationDeadline() time.Time {
+	return m.client.InitialAuthorizationDeadline()
+}
+func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
+	return m.client.ReauthorizeWithCertificate(ctx, []byte(token), sequence, certificatePEM, time.Now())
+}
 
 // mountFUSEv3 attaches the authority under the exact declared transport and
 // installs the fusev3 kernel mount. One attach, one capability: routing is
@@ -85,6 +106,7 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 		AccessToken: []byte(cfg.token), ReplaySlots: mountv3.ReplaySlots,
 		MaxFrame: mountv3.MaxFrame, DialTimeout: mountv3.DialTimeout,
 		CancelDrainTimeout: mountv3.CancelDrainTimeout, MaxInFlight: mountv3.MaxInFlight,
+		RequireMountEnrollmentReauthorization: cfg.requireMountEnrollment,
 		// The two numbers a strict mount declares are the two the authority
 		// needs to size the barrier: how much cached state this frontend can be
 		// holding, and how long it may take to withdraw it.
@@ -133,7 +155,8 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 		return nil, fmt.Errorf("mount %s: %w", cfg.mountPath, err)
 	}
 	return &fuseV3Mount{
-		mount: mount,
+		mount:  mount,
+		client: client,
 		routes: mountRoutes{
 			rules:    rules,
 			revision: rules.RevisionHex(),

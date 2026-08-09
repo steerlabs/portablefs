@@ -254,11 +254,9 @@ func TestDoctorMountHealthFailures(t *testing.T) {
 		"FAIL  mounts: 2 mount(s): 1 stale, 1 credential-expired",
 		"/tmp/stale  vol1@main  fuse  stale",
 		"/tmp/expired  vol2@main  fuse  credential-expired",
-		// The direct CLI does not acquire hosted reauthorization, so the
-		// only repair for a credential-expired mount is mounting again with a
-		// fresh one — which is what the remedy says, with no other command in
-		// it to send the operator somewhere that cannot help.
-		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; mount credential-expired paths again with a fresh volume mount capability (the direct CLI does not acquire hosted reauthorization)",
+		// Once the strict session's credential ended, neither automatic nor
+		// manual renewal can reconstruct its kernel-cache continuity.
+		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; mount credential-expired paths again with a fresh volume mount capability; an expired or denied enrollment cannot reconstruct the old strict session",
 	)
 }
 

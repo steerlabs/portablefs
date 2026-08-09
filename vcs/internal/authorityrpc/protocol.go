@@ -62,6 +62,7 @@ const MinimumFrameBytes uint32 = fixedMutationReplyBytes + responseEnvelopeReser
 
 const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
+const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
 
 var (
 	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", "source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition"}

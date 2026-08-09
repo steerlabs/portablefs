@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+const hostedMountReauthorizationFeature = "hosted-mount-reauthorization-v1"
+const hostedAutomaticMountReauthorizationFeature = "hosted-automatic-mount-reauthorization-v1"
+
 // cmdEnv carries the process environment a command runs in; tests substitute
 // writers, env lookups, the config path, and the poll sleeper.
 type cmdEnv struct {
@@ -118,6 +121,7 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"mount", "mount a live volume on this machine", cmdMount},
+		{"reauthorize", "rotate a hosted live mount authorization", cmdReauthorize},
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
 		{"route", "explain whether a path is served machine-locally or by the volume", cmdRoute},
@@ -203,7 +207,10 @@ func cmdVersion(e *cmdEnv, args []string) int {
 		return e.handleParseError("version", err)
 	}
 	if o.jsonOut {
-		return e.printJSON(map[string]string{"version": e.version})
+		return e.printJSON(struct {
+			Features []string `json:"features"`
+			Version  string   `json:"version"`
+		}{Features: []string{hostedMountReauthorizationFeature, hostedAutomaticMountReauthorizationFeature}, Version: e.version})
 	}
 	fmt.Fprintf(e.stdout, "portablefs %s\n", e.version)
 	return 0

@@ -1,7 +1,11 @@
 package controlplane
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +22,7 @@ const (
 	RoleOperator Role = "operator"
 	RoleProduct  Role = "product"
 	RoleCell     Role = "cell"
+	RoleMount    Role = "mount"
 )
 
 type Principal struct {
@@ -39,7 +44,8 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 	}
 	authenticate := handler.Authenticate
 	if authenticate == nil {
-		authenticate = AuthenticateMTLS
+		writeAPIError(writer, http.StatusServiceUnavailable, "manager mTLS authenticator unavailable")
+		return
 	}
 	principal, err := authenticate(request)
 	if err != nil {
@@ -193,6 +199,61 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			}
 			return handler.Manager.ReauthorizeMount(idempotencyKey(request), body)
 		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "mount-enrollments" && parts[3] == "reauthorizations" && request.Method == http.MethodPost:
+		enrollmentID := parts[2]
+		if principal.Role != RoleMount || principal.ID != enrollmentID {
+			writeAPIError(writer, http.StatusForbidden, "mount enrollment identity mismatch")
+			return
+		}
+		var body RefreshMountEnrollmentRequest
+		if err := decodeJSON(request, &body); err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		if idempotencyKey(request) == "" {
+			writeAPIError(writer, http.StatusBadRequest, "Idempotency-Key is required")
+			return
+		}
+		result, err := handler.Manager.RefreshMountEnrollment(idempotencyKey(request), enrollmentID, body)
+		handler.writeResult(writer, result, err)
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "mount-enrollments" && parts[3] == "close" && request.Method == http.MethodPost:
+		enrollmentID := parts[2]
+		if principal.Role != RoleMount || principal.ID != enrollmentID {
+			writeAPIError(writer, http.StatusForbidden, "mount enrollment identity mismatch")
+			return
+		}
+		var body TerminateMountEnrollmentRequest
+		if err := decodeJSON(request, &body); err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		if idempotencyKey(request) == "" {
+			writeAPIError(writer, http.StatusBadRequest, "Idempotency-Key is required")
+			return
+		}
+		result, err := handler.Manager.CloseMountEnrollment(idempotencyKey(request), enrollmentID, body)
+		handler.writeResult(writer, result, err)
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "mount-enrollments" && parts[3] == "revoke" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			enrollmentID := parts[2]
+			var body TerminateMountEnrollmentRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			var enrollment MountEnrollment
+			err := handler.Manager.cfg.Store.View(func(state State) error {
+				var ok bool
+				enrollment, ok = state.MountEnrollments[enrollmentID]
+				if !ok {
+					return ErrNotFound
+				}
+				return nil
+			})
+			if err != nil || handler.requireProductVolume(principal, enrollment.VolumeID) != nil {
+				return nil, ErrNotFound
+			}
+			return handler.Manager.RevokeMountEnrollment(idempotencyKey(request), enrollmentID, body)
+		})
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not found")
 	}
@@ -230,6 +291,13 @@ func AuthenticateMTLS(request *http.Request) (Principal, error) {
 		return Principal{}, errors.New("invalid control identity path")
 	}
 	parts := strings.Split(escapedPath[1:], "/")
+	if len(parts) == 2 && parts[0] == "mount-enrollment" && parts[1] != "" {
+		decodedID, err := url.PathUnescape(parts[1])
+		if err != nil || !cellplan.ValidID(decodedID) {
+			return Principal{}, errors.New("invalid mount enrollment identity")
+		}
+		return Principal{Role: RoleMount, ID: decodedID}, nil
+	}
 	if len(parts) != 3 || parts[0] != "control" || parts[2] == "" {
 		return Principal{}, errors.New("invalid control identity path")
 	}
@@ -242,6 +310,67 @@ func AuthenticateMTLS(request *http.Request) (Principal, error) {
 		return Principal{}, errors.New("invalid control identity")
 	}
 	return Principal{Role: role, ID: decodedID}, nil
+}
+
+// NewRoleBoundMTLSAuthenticator binds the identity URI to the CA realm that
+// issued it. The Manager listener trusts both realms at the TLS layer, so URI
+// parsing alone would let a mistakenly issued enrollment certificate claim a
+// control role (or vice versa).
+func NewRoleBoundMTLSAuthenticator(controlCAPEM, enrollmentCAPEM []byte) (Authenticator, error) {
+	controlRoots, err := certificateFingerprints(controlCAPEM)
+	if err != nil {
+		return nil, fmt.Errorf("control client CA bundle: %w", err)
+	}
+	enrollmentRoots, err := certificateFingerprints(enrollmentCAPEM)
+	if err != nil {
+		return nil, fmt.Errorf("mount enrollment CA bundle: %w", err)
+	}
+	for fingerprint := range controlRoots {
+		if _, overlaps := enrollmentRoots[fingerprint]; overlaps {
+			return nil, errors.New("control and mount enrollment CA realms must be disjoint")
+		}
+	}
+	return func(request *http.Request) (Principal, error) {
+		principal, err := AuthenticateMTLS(request)
+		if err != nil {
+			return Principal{}, err
+		}
+		expected := controlRoots
+		if principal.Role == RoleMount {
+			expected = enrollmentRoots
+		}
+		for _, chain := range request.TLS.VerifiedChains {
+			if len(chain) == 0 {
+				continue
+			}
+			fingerprint := sha256.Sum256(chain[len(chain)-1].Raw)
+			if _, trusted := expected[fingerprint]; trusted {
+				return principal, nil
+			}
+		}
+		return Principal{}, errors.New("client identity was issued by the wrong Manager trust realm")
+	}, nil
+}
+
+func certificateFingerprints(bundle []byte) (map[[32]byte]struct{}, error) {
+	fingerprints := make(map[[32]byte]struct{})
+	remaining := bytes.TrimSpace(bundle)
+	for len(remaining) != 0 {
+		block, rest := pem.Decode(remaining)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, errors.New("bundle must contain only CERTIFICATE PEM blocks")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil || !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return nil, errors.New("bundle contains a certificate that is not a signing CA")
+		}
+		fingerprints[sha256.Sum256(certificate.Raw)] = struct{}{}
+		remaining = bytes.TrimSpace(rest)
+	}
+	if len(fingerprints) == 0 {
+		return nil, errors.New("bundle contains no CA certificates")
+	}
+	return fingerprints, nil
 }
 
 func (handler *HTTPHandler) requireRole(writer http.ResponseWriter, request *http.Request, principal Principal, role Role, operation func() (any, error)) {
@@ -268,8 +397,10 @@ func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, 
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, ErrConflict), errors.Is(err, ErrCapacity), errors.Is(err, ErrQuarantined):
+	case errors.Is(err, ErrConflict), errors.Is(err, ErrCapacity), errors.Is(err, ErrEnrollmentCapacity), errors.Is(err, ErrQuarantined):
 		status = http.StatusConflict
+	case errors.Is(err, ErrEnrollmentEnded):
+		status = http.StatusGone
 	}
 	writeAPIError(writer, status, err.Error())
 }

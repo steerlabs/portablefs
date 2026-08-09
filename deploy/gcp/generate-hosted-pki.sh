@@ -56,6 +56,7 @@ new_signer() {
 new_ca control-ca "PortableFS hosted control CA"
 new_ca authority-ca "PortableFS hosted authority CA"
 new_ca mount-client-ca "PortableFS hosted mount client CA"
+new_ca mount-enrollment-ca "PortableFS hosted mount enrollment CA"
 
 manager_ext="$output/work/manager.ext"
 cat >"$manager_ext" <<EOF
@@ -113,6 +114,8 @@ cp "$output/offline/authority-ca.pem" "$output/manager/trust/authority-ca.pem"
 cp "$output/offline/authority-ca.key" "$output/manager/keys/authority-ca.key"
 cp "$output/offline/mount-client-ca.pem" "$output/manager/trust/mount-client-ca.pem"
 cp "$output/offline/mount-client-ca.key" "$output/manager/keys/mount-client-ca.key"
+cp "$output/offline/mount-enrollment-ca.pem" "$output/manager/trust/mount-enrollment-ca.pem"
+cp "$output/offline/mount-enrollment-ca.key" "$output/manager/keys/mount-enrollment-ca.key"
 cp "$output/product/product-signing.pem" "$output/manager/trust/product-public.pem"
 cp "$output/manager/keys/plan-signing.pem" "$output/cell/plan-public.pem"
 
@@ -126,6 +129,7 @@ openssl x509 -in "$output/operator/operator.cert" -noout -ext subjectAltName | g
 openssl x509 -in "$output/product/product-client.cert" -noout -ext subjectAltName | grep -Fq "URI:spiffe://portablefs/control/product/$product_issuer"
 openssl verify -CAfile "$output/offline/authority-ca.pem" "$output/offline/authority-ca.pem" >/dev/null
 openssl verify -CAfile "$output/offline/mount-client-ca.pem" "$output/offline/mount-client-ca.pem" >/dev/null
+openssl verify -CAfile "$output/offline/mount-enrollment-ca.pem" "$output/offline/mount-enrollment-ca.pem" >/dev/null
 
 find "$output" -type d -exec chmod 0700 {} +
 find "$output" -type f -name '*.key' -exec chmod 0600 {} +

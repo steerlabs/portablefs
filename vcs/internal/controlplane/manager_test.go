@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"testing"
@@ -36,6 +37,7 @@ func newManagerHarness(t *testing.T) managerHarness {
 	productPublic, productPrivate, _ := ed25519.GenerateKey(nil)
 	authorityCA := testCA(t, "authority-ca")
 	clientCA := testCA(t, "client-ca")
+	enrollmentCA := testCA(t, "enrollment-ca")
 	store, err := OpenStore(filepath.Join(t.TempDir(), "manager.state"))
 	if err != nil {
 		t.Fatal(err)
@@ -45,8 +47,10 @@ func newManagerHarness(t *testing.T) managerHarness {
 	manager, err := NewManager(ManagerConfig{
 		Store: store, PlanPrivateKey: planPrivate, CapabilityPrivateKey: capabilityPrivate,
 		ProductIssuers: map[string]ed25519.PublicKey{"opensteer": productPublic},
-		AuthorityCA:    authorityCA, ClientCA: clientCA, Now: func() time.Time { return now }, ReleaseID: "v3.1.0-test",
+		AuthorityCA:    authorityCA, ClientCA: clientCA, EnrollmentCA: enrollmentCA,
+		Now: func() time.Time { return now }, ReleaseID: "v3.1.0-test",
 		PlanLifetime: 10 * time.Minute, GrantLifetime: 10 * time.Minute, ProductMaxLifetime: 15 * time.Minute,
+		EnrollmentLifetime: 24 * time.Hour,
 		ClientCertLifetime: time.Hour, AuthorityCertLifetime: 24 * time.Hour,
 		ObservedStaleAfter: 2 * time.Minute, ClockSkew: 5 * time.Second,
 	})
@@ -119,9 +123,18 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer := sha256.Sum256(peerSPKI)
+	standalone, err := h.manager.IssueMount("standalone-mount", IssueMountRequest{
+		VolumeID:             volume.ID,
+		ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "standalone-mount", []string{"read"}),
+		ClientCSRPEM:         clientCSR, Access: []string{"read"},
+	})
+	if err != nil || standalone.EnrollmentID != "" || standalone.EnrollmentCertificatePEM != "" || standalone.EnrollmentExpiresUnix != 0 {
+		t.Fatalf("standalone mount received an unrequested enrollment = %+v, %v", standalone, err)
+	}
 	productToken := signedProductAuthorization(t, h, volume.Volume, peer, "mount-1", []string{"write"})
 	request := IssueMountRequest{
 		VolumeID: volume.ID, ProductAuthorization: productToken, ClientCSRPEM: clientCSR, Access: []string{"write"},
+		AutomaticReauthorization: true,
 	}
 	authorization, err := h.manager.IssueMount("mount-request-1", request)
 	if err != nil {
@@ -143,16 +156,154 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		AuthorityID: volume.AuthorityID, AuthorityGeneration: volume.AuthorityGeneration,
 		Now: func() time.Time { return *h.now }, MaxLifetime: 15 * time.Minute, MaxRetainedNonces: 32,
 	}
-	if _, err := capAuthorizer.Verify(volume.ID, []byte(authorization.Capability), peer); err != nil {
+	initialAccess, err := capAuthorizer.Verify(volume.ID, []byte(authorization.Capability), peer)
+	if err != nil {
 		t.Fatalf("hosted authority refused manager grant: %v", err)
 	}
-	var sessionID volumeserver.SessionID
-	copy(sessionID[:], []byte("session-id-12345"))
+	runtimeAuthority, err := volumeserver.New(volume.ID, volumeserver.Config{
+		SessionLease: 10 * time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 16,
+		Now: func() time.Time { return *h.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCredential, err := runtimeAuthority.Attach(1, volumeserver.PeerIdentity(peer), initialAccess)
+	if err != nil {
+		t.Fatalf("attach enrollment-owned authority session: %v", err)
+	}
+	if authorization.EnrollmentID == "" || authorization.EnrollmentCertificatePEM == "" || authorization.EnrollmentExpiresUnix <= authorization.ExpiresUnix {
+		t.Fatalf("initial mount omitted bounded automatic enrollment: %+v", authorization)
+	}
+	if initialAccess.MountEnrollmentID != authorization.EnrollmentID {
+		t.Fatalf("initial authority session owner = %q, want %q", initialAccess.MountEnrollmentID, authorization.EnrollmentID)
+	}
+	unboundManualSession := base64.RawURLEncoding.EncodeToString([]byte("other-session-id"))
+	unboundManual, err := h.manager.ReauthorizeMount("unbound-independent-session", ReauthorizeMountRequest{
+		VolumeID:             volume.ID,
+		ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "unbound-independent-session", []string{"read"}),
+		ClientCSRPEM:         clientCSR, Access: []string{"read"}, SessionID: unboundManualSession, Sequence: 1,
+	})
+	if err != nil || unboundManual.SessionID != unboundManualSession || unboundManual.EnrollmentID != "" {
+		t.Fatalf("unbound enrollment blocked an unrelated session = %+v, %v", unboundManual, err)
+	}
+	enrollmentBlock, _ := pem.Decode([]byte(authorization.EnrollmentCertificatePEM))
+	if enrollmentBlock == nil {
+		t.Fatal("mount enrollment certificate is not PEM")
+	}
+	enrollmentLeaf, err := x509.ParseCertificate(enrollmentBlock.Bytes)
+	if err != nil || len(enrollmentLeaf.URIs) != 1 || enrollmentLeaf.URIs[0].String() != "spiffe://portablefs/mount-enrollment/"+authorization.EnrollmentID {
+		t.Fatalf("mount enrollment identity = %v, %v", enrollmentLeaf.URIs, err)
+	}
+	enrollmentRoots := x509.NewCertPool()
+	enrollmentRoots.AddCert(h.manager.cfg.EnrollmentCA.Certificate)
+	if _, err := enrollmentLeaf.Verify(x509.VerifyOptions{
+		Roots: enrollmentRoots, CurrentTime: *h.now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Fatalf("mount enrollment identity is not enrollment-CA scoped: %v", err)
+	}
+	shortLivedRoots := x509.NewCertPool()
+	shortLivedRoots.AddCert(h.manager.cfg.ClientCA.Certificate)
+	if _, err := enrollmentLeaf.Verify(x509.VerifyOptions{
+		Roots: shortLivedRoots, CurrentTime: *h.now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err == nil {
+		t.Fatal("mount enrollment identity chained to the authority-facing short-lived client CA")
+	}
+	sessionID := runtimeCredential.ID
+	sessionEncoded := base64.RawURLEncoding.EncodeToString(sessionID[:])
+	automaticRequest := RefreshMountEnrollmentRequest{ClientCSRPEM: clientCSR, SessionID: sessionEncoded, Sequence: 1}
+	automatic, err := h.manager.RefreshMountEnrollment("automatic-1", authorization.EnrollmentID, automaticRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequenceAfterFirstRefresh := h.store.sequence
+	// Natural tuple idempotency is independent of the HTTP retry key. This is
+	// what prevents two proofs for one authority sequence after a lost reply.
+	automaticRetry, err := h.manager.RefreshMountEnrollment("automatic-1-retry", authorization.EnrollmentID, automaticRequest)
+	if err != nil || automaticRetry.Capability != automatic.Capability || automaticRetry.ClientCertificatePEM != automatic.ClientCertificatePEM {
+		t.Fatalf("natural automatic idempotency = %+v, %v", automaticRetry, err)
+	}
+	if h.store.sequence != sequenceAfterFirstRefresh {
+		t.Fatal("an exact automatic refresh retry appended another durable state record")
+	}
+	if err := h.store.View(func(state State) error {
+		if len(state.MountAuthorizationContexts) != 1 {
+			t.Fatalf("mount authorization contexts = %d, want one deduplicated Manager context", len(state.MountAuthorizationContexts))
+		}
+		enrollment := state.MountEnrollments[authorization.EnrollmentID]
+		if enrollment.Owner != volume.Owner || enrollment.LastAuthorization == nil || enrollment.LastAuthorizationContext == "" ||
+			enrollment.LastAuthorization.ClientCertificatePEM != automatic.ClientCertificatePEM ||
+			enrollment.LastAuthorization.Capability != automatic.Capability {
+			t.Fatalf("stored automatic replay = %+v", enrollment)
+		}
+		context := state.MountAuthorizationContexts[enrollment.LastAuthorizationContext]
+		if context.AuthorityCAPEM != automatic.AuthorityCAPEM || context.ReleaseID != automatic.ReleaseID {
+			t.Fatalf("deduplicated automatic replay context = %+v", context)
+		}
+		for _, receipt := range state.Receipts {
+			if receipt.Operation == "refresh-mount-enrollment" {
+				t.Fatal("automatic refresh created an unbounded generic response receipt")
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	automaticAccess, automaticProof, err := capAuthorizer.VerifyReauthorization(volume.ID, sessionID, 1, []byte(automatic.Capability), peer)
+	if err != nil || automaticAccess.Access != (volumeserver.AccessRead|volumeserver.AccessWrite) {
+		t.Fatalf("enrollment-backed authority grant = %+v, %v", automaticAccess, err)
+	}
+	if err := runtimeAuthority.Reauthorize(runtimeCredential, automaticAccess, 1, automaticProof); err != nil {
+		t.Fatalf("install Manager enrollment grant into live authority session: %v", err)
+	}
+	automaticRequest.Sequence = 2
+	if _, err := h.manager.RefreshMountEnrollment("automatic-too-fast", authorization.EnrollmentID, automaticRequest); !errors.Is(err, ErrConflict) {
+		t.Fatalf("automatic sequence advanced faster than its grant window = %v", err)
+	}
+	automaticRequest.Sequence = 3
+	if _, err := h.manager.RefreshMountEnrollment("automatic-gap", authorization.EnrollmentID, automaticRequest); !errors.Is(err, ErrConflict) {
+		t.Fatalf("automatic sequence gap = %v", err)
+	}
+	*h.now = h.now.Add(3 * time.Minute)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatalf("refresh cell liveness before sequence two: %v", err)
+	}
+	automaticRequest.Sequence = 2
+	automaticTwo, err := h.manager.RefreshMountEnrollment("automatic-2", authorization.EnrollmentID, automaticRequest)
+	if err != nil {
+		t.Fatalf("automatic sequence two: %v", err)
+	}
+	automaticAccessTwo, automaticProofTwo, err := capAuthorizer.VerifyReauthorization(volume.ID, sessionID, 2, []byte(automaticTwo.Capability), peer)
+	if err != nil || !automaticAccessTwo.Deadline.After(initialAccess.Deadline) {
+		t.Fatalf("extended enrollment-backed authority grant = %+v, %v", automaticAccessTwo, err)
+	}
+	if err := runtimeAuthority.Reauthorize(runtimeCredential, automaticAccessTwo, 2, automaticProofTwo); err != nil {
+		t.Fatalf("extend the existing authority session without remount: %v", err)
+	}
+	manualOwnerConflict := ReauthorizeMountRequest{
+		VolumeID:             volume.ID,
+		ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "manual-owner-conflict", []string{"read"}),
+		ClientCSRPEM:         clientCSR, Access: []string{"read"}, SessionID: sessionEncoded, Sequence: 1,
+	}
+	if _, err := h.manager.ReauthorizeMount("manual-owner-conflict", manualOwnerConflict); !errors.Is(err, ErrConflict) {
+		t.Fatalf("manual issuer competed with active enrollment = %v", err)
+	}
+	manualPublic, manualCSR := testCSR(t)
+	manualSPKI, err := x509.MarshalPKIXPublicKey(manualPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualPeer := sha256.Sum256(manualSPKI)
+	var manualSessionID volumeserver.SessionID
+	copy(manualSessionID[:], []byte("manual-session-1"))
+	manualSessionEncoded := base64.RawURLEncoding.EncodeToString(manualSessionID[:])
 	reauthorizationRequest := ReauthorizeMountRequest{
 		VolumeID:             volume.ID,
-		ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "mount-2", []string{"read"}),
-		ClientCSRPEM:         clientCSR, Access: []string{"read"},
-		SessionID: base64.RawURLEncoding.EncodeToString(sessionID[:]), Sequence: 1,
+		ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, manualPeer, "mount-2", []string{"read"}),
+		ClientCSRPEM:         manualCSR, Access: []string{"read"},
+		SessionID: manualSessionEncoded, Sequence: 1,
 	}
 	reauthorization, err := h.manager.ReauthorizeMount("reauthorize-1", reauthorizationRequest)
 	if err != nil {
@@ -163,9 +314,23 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		replayedReauthorization.ClientCertificatePEM != reauthorization.ClientCertificatePEM {
 		t.Fatalf("idempotent reauthorization = %+v, %v", replayedReauthorization, err)
 	}
-	renewedAccess, _, err := capAuthorizer.VerifyReauthorization(volume.ID, sessionID, 1, []byte(reauthorization.Capability), peer)
+	renewedAccess, _, err := capAuthorizer.VerifyReauthorization(volume.ID, manualSessionID, 1, []byte(reauthorization.Capability), manualPeer)
 	if err != nil || renewedAccess.Access != volumeserver.AccessRead {
 		t.Fatalf("hosted reauthorization = %+v, %v", renewedAccess, err)
+	}
+	if _, err := h.manager.RevokeMountEnrollment("revoke-enrollment", authorization.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "product access revoked"}); err != nil {
+		t.Fatalf("revoke mount enrollment: %v", err)
+	}
+	sequenceAfterRevocation := h.store.sequence
+	closedAfterRevoke, err := h.manager.CloseMountEnrollment(
+		"close-after-revoke", authorization.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "mount detached"},
+	)
+	if err != nil || closedAfterRevoke.State != MountEnrollmentRevoked || h.store.sequence != sequenceAfterRevocation {
+		t.Fatalf("terminal enrollment retry = %+v, sequence=%d want=%d, err=%v", closedAfterRevoke, h.store.sequence, sequenceAfterRevocation, err)
+	}
+	automaticRequest.Sequence = 2
+	if _, err := h.manager.RefreshMountEnrollment("automatic-after-revoke", authorization.EnrollmentID, automaticRequest); !errors.Is(err, ErrEnrollmentEnded) {
+		t.Fatalf("refresh after enrollment revocation = %v", err)
 	}
 
 	volume, err = h.manager.RestartVolume("restart-1", RestartVolumeRequest{VolumeID: volume.ID, Reason: "rotate authority"})
@@ -212,6 +377,96 @@ func TestCreateVolumeRejectsQuotaNotRepresentableInXFSKiB(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unaligned XFS quota = %v, want ErrInvalid", err)
+	}
+}
+
+func TestMountEnrollmentAdmissionBoundsActiveOwnersWithoutTombstoneExhaustion(t *testing.T) {
+	active := func(id, authorizationDomain, volume string, updated int64) MountEnrollment {
+		return MountEnrollment{ID: id, AuthorizationDomain: authorizationDomain, VolumeID: volume, State: MountEnrollmentActive, UpdatedUnix: updated}
+	}
+	terminal := func(id string, updated int64) MountEnrollment {
+		return MountEnrollment{ID: id, ProductIssuer: "old-product", VolumeID: "old-volume", State: MountEnrollmentClosed, UpdatedUnix: updated}
+	}
+
+	perVolume := NewState()
+	for i := 0; i < MaxActiveMountEnrollmentsPerVolume; i++ {
+		id := fmt.Sprintf("volume-%04d", i)
+		perVolume.MountEnrollments[id] = active(id, "product-a", "volume-a", 100)
+	}
+	if err := admitMountEnrollment(&perVolume, Volume{ID: "volume-a", AuthorizationDomain: "tenant-a"}); !errors.Is(err, ErrEnrollmentCapacity) {
+		t.Fatalf("per-volume admission = %v, want capacity refusal", err)
+	}
+	first := perVolume.MountEnrollments["volume-0000"]
+	first.State = MountEnrollmentClosed
+	perVolume.MountEnrollments[first.ID] = first
+	if err := admitMountEnrollment(&perVolume, Volume{ID: "volume-a", AuthorizationDomain: "tenant-a"}); err != nil {
+		t.Fatalf("terminal enrollment consumed active per-volume quota: %v", err)
+	}
+
+	perTenant := NewState()
+	for i := 0; i < MaxActiveMountEnrollmentsPerAuthorizationDomain; i++ {
+		id := fmt.Sprintf("tenant-%04d", i)
+		perTenant.MountEnrollments[id] = active(id, "tenant-a", fmt.Sprintf("volume-%04d", i), 100)
+	}
+	if err := admitMountEnrollment(&perTenant, Volume{ID: "new-volume", AuthorizationDomain: "tenant-a"}); !errors.Is(err, ErrEnrollmentCapacity) {
+		t.Fatalf("per-tenant admission = %v, want capacity refusal", err)
+	}
+
+	global := NewState()
+	for i := 0; i < MaxActiveMountEnrollments; i++ {
+		id := fmt.Sprintf("global-%04d", i)
+		global.MountEnrollments[id] = active(id, fmt.Sprintf("tenant-%d", i/MaxActiveMountEnrollmentsPerAuthorizationDomain), fmt.Sprintf("volume-%d", i/MaxActiveMountEnrollmentsPerVolume), 100)
+	}
+	if err := admitMountEnrollment(&global, Volume{ID: "new-volume", AuthorizationDomain: "new-tenant"}); !errors.Is(err, ErrEnrollmentCapacity) {
+		t.Fatalf("global admission = %v, want capacity refusal", err)
+	}
+
+	retained := NewState()
+	for i := 0; i < MaxRetainedMountEnrollments; i++ {
+		id := fmt.Sprintf("terminal-%04d", i)
+		retained.MountEnrollments[id] = terminal(id, int64(i+1))
+	}
+	if err := admitMountEnrollment(&retained, Volume{ID: "new-volume", AuthorizationDomain: "new-tenant"}); err != nil {
+		t.Fatalf("terminal tombstones exhausted new enrollment admission: %v", err)
+	}
+	if len(retained.MountEnrollments) != MaxRetainedMountEnrollments-1 {
+		t.Fatalf("retained enrollment count = %d", len(retained.MountEnrollments))
+	}
+	if _, ok := retained.MountEnrollments["terminal-0000"]; ok {
+		t.Fatal("admission did not evict the oldest terminal tombstone")
+	}
+}
+
+func TestPruneMountEnrollmentsRemovesExpiredOwnersAndOrphanedReplayContexts(t *testing.T) {
+	state := NewState()
+	context := MountAuthorizationContext{AuthorityCAPEM: "ca", ReleaseID: "release"}
+	contextID := mountAuthorizationContextID(context)
+	state.MountAuthorizationContexts[contextID] = context
+	state.MountEnrollments["expired"] = MountEnrollment{
+		ID: "expired", State: MountEnrollmentActive, ExpiresUnix: 100,
+		LastAuthorizationContext: contextID,
+	}
+	state.MountEnrollments["recent-terminal"] = MountEnrollment{
+		ID: "recent-terminal", State: MountEnrollmentClosed, UpdatedUnix: 100,
+	}
+	state.MountEnrollments["old-terminal"] = MountEnrollment{
+		ID: "old-terminal", State: MountEnrollmentRevoked, UpdatedUnix: 99,
+	}
+	now := int64(100) + int64(mountEnrollmentRetention/time.Second)
+	if !pruneMountEnrollments(&state, now) {
+		t.Fatal("prune reported no state change")
+	}
+	if _, ok := state.MountEnrollments["expired"]; ok {
+		t.Fatal("expired active enrollment was retained")
+	}
+	if _, ok := state.MountEnrollments["recent-terminal"]; ok {
+		t.Fatal("terminal enrollment at the retention boundary was retained")
+	}
+	if _, ok := state.MountEnrollments["old-terminal"]; ok {
+		t.Fatal("old terminal enrollment was retained")
+	}
+	if len(state.MountAuthorizationContexts) != 0 {
+		t.Fatal("orphaned replay context was retained")
 	}
 }
 

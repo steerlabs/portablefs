@@ -14,6 +14,8 @@ import (
 	"math/big"
 	"net/url"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
 )
 
 type CertificateAuthority struct {
@@ -59,6 +61,26 @@ func ParseCertificateAuthority(certificatePEM, privateKeyPEM []byte) (*Certifica
 }
 
 func (ca *CertificateAuthority) SignCSR(csrPEM []byte, commonName string, dnsNames []string, client bool, now time.Time, lifetime time.Duration) (string, time.Time, error) {
+	var identity *url.URL
+	if client {
+		identity, _ = url.Parse("spiffe://portablefs/client/" + commonName)
+	}
+	return ca.signCSR(csrPEM, commonName, dnsNames, identity, client, now, lifetime)
+}
+
+// SignClientCSR signs a client identity with an exact SPIFFE URI. It is used
+// for Manager-facing mount enrollment identities, which must be distinguishable
+// from the short-lived /client identities accepted by an authority.
+func (ca *CertificateAuthority) SignClientCSR(csrPEM []byte, commonName string, identity *url.URL, now time.Time, lifetime time.Duration) (string, time.Time, error) {
+	if identity == nil || identity.Scheme != "spiffe" || identity.Host != "portablefs" || identity.User != nil ||
+		identity.Opaque != "" || identity.RawQuery != "" || identity.ForceQuery || identity.Fragment != "" || identity.RawPath != "" ||
+		!cellplan.ValidID(commonName) || identity.Path != "/mount-enrollment/"+commonName {
+		return "", time.Time{}, ErrInvalid
+	}
+	return ca.signCSR(csrPEM, commonName, nil, identity, true, now, lifetime)
+}
+
+func (ca *CertificateAuthority) signCSR(csrPEM []byte, commonName string, dnsNames []string, identity *url.URL, client bool, now time.Time, lifetime time.Duration) (string, time.Time, error) {
 	if ca == nil || ca.Certificate == nil || ca.Signer == nil || commonName == "" || now.IsZero() || lifetime <= 0 {
 		return "", time.Time{}, ErrInvalid
 	}
@@ -103,7 +125,9 @@ func (ca *CertificateAuthority) SignCSR(csrPEM []byte, commonName string, dnsNam
 	}
 	if client {
 		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
-		identity, _ := url.Parse("spiffe://portablefs/client/" + commonName)
+		if identity == nil {
+			return "", time.Time{}, ErrInvalid
+		}
 		template.URIs = []*url.URL{identity}
 	} else {
 		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}

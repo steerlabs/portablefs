@@ -110,6 +110,50 @@ func TestAuthenticateMTLSRequiresOneExactRoleIdentity(t *testing.T) {
 	if _, err := AuthenticateMTLS(request); err == nil {
 		t.Fatal("non-UUID cell control identity was accepted")
 	}
+	mountID := "22222222-2222-4222-8222-222222222222"
+	mountIdentity, _ := url.Parse("spiffe://portablefs/mount-enrollment/" + mountID)
+	request.TLS.PeerCertificates[0].URIs = []*url.URL{mountIdentity}
+	principal, err = AuthenticateMTLS(request)
+	if err != nil || principal.Role != RoleMount || principal.ID != mountID {
+		t.Fatalf("valid mount enrollment identity = %+v, %v", principal, err)
+	}
+	shortLivedMount, _ := url.Parse("spiffe://portablefs/client/" + mountID)
+	request.TLS.PeerCertificates[0].URIs = []*url.URL{shortLivedMount}
+	if _, err := AuthenticateMTLS(request); err == nil {
+		t.Fatal("authority-facing short-lived client identity authenticated to the Manager")
+	}
+}
+
+func TestRoleBoundMTLSAuthenticatorRequiresTheMatchingCARoot(t *testing.T) {
+	controlCA := testCA(t, "control-ca")
+	enrollmentCA := testCA(t, "enrollment-ca")
+	authenticate, err := NewRoleBoundMTLSAuthenticator(
+		[]byte(controlCA.CertificatePEM), []byte(enrollmentCA.CertificatePEM),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlURI, _ := url.Parse("spiffe://portablefs/control/operator/operator-a")
+	mountURI, _ := url.Parse("spiffe://portablefs/mount-enrollment/22222222-2222-4222-8222-222222222222")
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{URIs: []*url.URL{controlURI}}}}
+	request.TLS.VerifiedChains = [][]*x509.Certificate{{request.TLS.PeerCertificates[0], controlCA.Certificate}}
+	if principal, err := authenticate(request); err != nil || principal.Role != RoleOperator {
+		t.Fatalf("control identity under control CA = %+v, %v", principal, err)
+	}
+	request.TLS.VerifiedChains = [][]*x509.Certificate{{request.TLS.PeerCertificates[0], enrollmentCA.Certificate}}
+	if _, err := authenticate(request); err == nil {
+		t.Fatal("control identity issued by the enrollment CA was accepted")
+	}
+	request.TLS.PeerCertificates[0].URIs = []*url.URL{mountURI}
+	request.TLS.VerifiedChains = [][]*x509.Certificate{{request.TLS.PeerCertificates[0], enrollmentCA.Certificate}}
+	if principal, err := authenticate(request); err != nil || principal.Role != RoleMount {
+		t.Fatalf("mount identity under enrollment CA = %+v, %v", principal, err)
+	}
+	request.TLS.VerifiedChains = [][]*x509.Certificate{{request.TLS.PeerCertificates[0], controlCA.Certificate}}
+	if _, err := authenticate(request); err == nil {
+		t.Fatal("mount identity issued by the control CA was accepted")
+	}
 }
 
 func testHTTPHandler(manager *Manager) *HTTPHandler {

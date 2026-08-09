@@ -223,35 +223,66 @@ func (store *Store) Transact(requestID, operation string, request any, now int64
 	}
 	requestHash := sha256.Sum256(requestBytes)
 	requestHex := hex.EncodeToString(requestHash[:])
+	return store.transact(requestID, operation, requestHex, now, true, func(state *State) (any, bool, error) {
+		response, err := apply(state)
+		return response, true, err
+	})
+}
+
+// TransactNatural durably applies an operation whose exact idempotency boundary
+// lives in the state it mutates. It deliberately creates no generic receipt.
+// Mount refreshes use this because each enrollment retains exactly one current
+// (session, sequence, request digest, response) tuple; retaining a second full
+// response per sequence would make healthy periodic renewal grow state forever.
+func (store *Store) TransactNatural(operation string, now int64, apply func(*State) (any, bool, error)) (json.RawMessage, error) {
+	if !validIdentity(operation) || now <= 0 || apply == nil {
+		return nil, ErrInvalid
+	}
+	raw, _, err := store.transact("", operation, "", now, false, apply)
+	return raw, err
+}
+
+func (store *Store) transact(requestID, operation, requestHex string, now int64, recordReceipt bool, apply func(*State) (any, bool, error)) (json.RawMessage, bool, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.file == nil {
 		return nil, false, os.ErrClosed
 	}
-	if receipt, exists := store.state.Receipts[requestID]; exists && receipt.CreatedUnix >= now-receiptRetentionSeconds {
-		if receipt.Operation != operation || receipt.RequestHash != requestHex {
-			return nil, false, ErrIdempotencyReuse
+	if recordReceipt {
+		if receipt, exists := store.state.Receipts[requestID]; exists && receipt.CreatedUnix >= now-receiptRetentionSeconds {
+			if receipt.Operation != operation || receipt.RequestHash != requestHex {
+				return nil, false, ErrIdempotencyReuse
+			}
+			return append(json.RawMessage(nil), receipt.Response...), true, nil
 		}
-		return append(json.RawMessage(nil), receipt.Response...), true, nil
 	}
 	next, err := cloneState(store.state)
 	if err != nil {
 		return nil, false, err
 	}
+	stateChanged := false
 	for id, receipt := range next.Receipts {
 		if receipt.CreatedUnix < now-receiptRetentionSeconds {
 			delete(next.Receipts, id)
+			stateChanged = true
 		}
 	}
-	response, err := apply(&next)
+	response, applied, err := apply(&next)
 	if err != nil {
 		return nil, false, err
 	}
+	stateChanged = stateChanged || applied
 	responseBytes, err := json.Marshal(response)
 	if err != nil {
 		return nil, false, err
 	}
-	next.Receipts[requestID] = Receipt{Operation: operation, RequestHash: requestHex, Response: responseBytes, CreatedUnix: now}
+	if recordReceipt {
+		next.Receipts[requestID] = Receipt{Operation: operation, RequestHash: requestHex, Response: responseBytes, CreatedUnix: now}
+		stateChanged = true
+	}
+	if !stateChanged {
+		return append(json.RawMessage(nil), responseBytes...), false, nil
+	}
 	if err := next.Validate(); err != nil {
 		return nil, false, err
 	}

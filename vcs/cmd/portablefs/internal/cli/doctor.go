@@ -365,7 +365,7 @@ func (r *doctorRun) checkMounts() doctorResult {
 	if len(expired) > 0 {
 		problems = append(problems, fmt.Sprintf("%d credential-expired", len(expired)))
 		remedies = append(remedies, "mount credential-expired paths again with a fresh "+
-			"volume mount capability (the direct CLI does not acquire hosted reauthorization)")
+			"volume mount capability; an expired or denied enrollment cannot reconstruct the old strict session")
 	}
 	res := doctorFail(
 		fmt.Sprintf("%d mount(s): %s", len(states), strings.Join(problems, ", ")),

@@ -164,6 +164,26 @@ func TestExactReauthorizationExtendsDeadlineAndRotatesPeer(t *testing.T) {
 	}
 }
 
+func TestEnrollmentOwnedSessionRefusesAnotherIssuerWithoutFencing(t *testing.T) {
+	a, now := testAuthority(t)
+	initial := Authorization{Access: AccessRead, Deadline: now.Add(time.Minute), MountEnrollmentID: "enrollment-a"}
+	cred, err := a.Attach(1, PeerIdentity{1}, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual := Authorization{Access: AccessRead, Deadline: now.Add(2 * time.Minute)}
+	if err := a.Reauthorize(cred, manual, 1, [32]byte{1}); !errors.Is(err, ErrAuthorizationOwner) {
+		t.Fatalf("competing issuer = %v, want ErrAuthorizationOwner", err)
+	}
+	if err := a.Resume(cred); err != nil {
+		t.Fatalf("competing issuer killed the healthy enrollment-owned session: %v", err)
+	}
+	enrolled := Authorization{Access: AccessRead, Deadline: now.Add(2 * time.Minute), MountEnrollmentID: "enrollment-a"}
+	if err := a.Reauthorize(cred, enrolled, 1, [32]byte{2}); err != nil {
+		t.Fatalf("enrollment owner could not continue after refused competitor: %v", err)
+	}
+}
+
 func TestReauthorizationCannotBroadenOrChangeAnExactReplay(t *testing.T) {
 	for name, change := range map[string]func(*SessionCredential, *Authorization, *[32]byte, *uint64){
 		"broaden": func(_ *SessionCredential, authorization *Authorization, _ *[32]byte, _ *uint64) {

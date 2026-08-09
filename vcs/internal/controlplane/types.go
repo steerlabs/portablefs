@@ -3,6 +3,8 @@
 package controlplane
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,17 +20,23 @@ import (
 )
 
 const (
-	StateSchemaVersion = 1
-	MaxVolumesPerCell  = 256
+	StateSchemaVersion                              = 1
+	MaxVolumesPerCell                               = 256
+	MaxActiveMountEnrollments                       = 2048
+	MaxActiveMountEnrollmentsPerAuthorizationDomain = 512
+	MaxActiveMountEnrollmentsPerVolume              = 256
+	MaxRetainedMountEnrollments                     = 4096
 )
 
 var (
-	ErrInvalid          = errors.New("controlplane: invalid request")
-	ErrNotFound         = errors.New("controlplane: not found")
-	ErrConflict         = errors.New("controlplane: conflict")
-	ErrCapacity         = errors.New("controlplane: no cell has sufficient capacity")
-	ErrIdempotencyReuse = errors.New("controlplane: idempotency key reused for a different request")
-	ErrQuarantined      = errors.New("controlplane: resource is quarantined")
+	ErrInvalid            = errors.New("controlplane: invalid request")
+	ErrNotFound           = errors.New("controlplane: not found")
+	ErrConflict           = errors.New("controlplane: conflict")
+	ErrCapacity           = errors.New("controlplane: no cell has sufficient capacity")
+	ErrEnrollmentCapacity = errors.New("controlplane: mount enrollment capacity reached")
+	ErrIdempotencyReuse   = errors.New("controlplane: idempotency key reused for a different request")
+	ErrQuarantined        = errors.New("controlplane: resource is quarantined")
+	ErrEnrollmentEnded    = errors.New("controlplane: mount enrollment has ended")
 )
 
 type VolumeState string
@@ -51,11 +59,13 @@ const (
 )
 
 type State struct {
-	SchemaVersion       uint32                        `json:"schema_version"`
-	Cells               map[string]Cell               `json:"cells"`
-	Volumes             map[string]Volume             `json:"volumes"`
-	Receipts            map[string]Receipt            `json:"receipts"`
-	AuthorizationNonces map[string]AuthorizationNonce `json:"authorization_nonces"`
+	SchemaVersion              uint32                               `json:"schema_version"`
+	Cells                      map[string]Cell                      `json:"cells"`
+	Volumes                    map[string]Volume                    `json:"volumes"`
+	Receipts                   map[string]Receipt                   `json:"receipts"`
+	AuthorizationNonces        map[string]AuthorizationNonce        `json:"authorization_nonces"`
+	MountEnrollments           map[string]MountEnrollment           `json:"mount_enrollments,omitempty"`
+	MountAuthorizationContexts map[string]MountAuthorizationContext `json:"mount_authorization_contexts,omitempty"`
 }
 
 type Cell struct {
@@ -122,6 +132,62 @@ type AuthorizationNonce struct {
 	ExpiresUnix int64  `json:"expires_unix"`
 }
 
+type MountEnrollmentState string
+
+const (
+	MountEnrollmentActive  MountEnrollmentState = "ACTIVE"
+	MountEnrollmentClosed  MountEnrollmentState = "CLOSED"
+	MountEnrollmentRevoked MountEnrollmentState = "REVOKED"
+)
+
+// MountEnrollment is the durable Manager decision that lets one already-live
+// mount obtain short-lived, session-bound grants without retaining or
+// refreshing the product's original authorization. It is bound to the exact
+// mount key, volume, access ceiling, and authority generation.
+type MountEnrollment struct {
+	ID                       string                    `json:"id"`
+	VolumeID                 string                    `json:"volume_id"`
+	Subject                  string                    `json:"subject"`
+	Owner                    string                    `json:"owner"`
+	Access                   []string                  `json:"access"`
+	PeerSPKI                 string                    `json:"peer_spki_sha256"`
+	AuthorizationDomain      string                    `json:"authorization_domain"`
+	ProductIssuer            string                    `json:"product_issuer"`
+	CellID                   string                    `json:"cell_id"`
+	AuthorityID              string                    `json:"authority_id"`
+	AuthorityGeneration      uint64                    `json:"authority_generation"`
+	CreatedUnix              int64                     `json:"created_unix"`
+	ExpiresUnix              int64                     `json:"expires_unix"`
+	State                    MountEnrollmentState      `json:"state"`
+	SessionID                string                    `json:"session_id,omitempty"`
+	LastSequence             uint64                    `json:"last_sequence,omitempty"`
+	LastRequestSHA256        string                    `json:"last_request_sha256,omitempty"`
+	LastAuthorization        *MountAuthorizationReplay `json:"last_authorization,omitempty"`
+	LastAuthorizationContext string                    `json:"last_authorization_context_sha256,omitempty"`
+	UpdatedUnix              int64                     `json:"updated_unix"`
+	TerminationReason        string                    `json:"termination_reason,omitempty"`
+}
+
+// MountAuthorizationReplay is the non-derivable portion of the exact current
+// refresh response. Manager-wide infrastructure material is deduplicated in a
+// MountAuthorizationContext, while volume/cell addressing is immutable for the
+// enrollment's pinned authority generation and is reconstructed on replay.
+type MountAuthorizationReplay struct {
+	AuthorityEndpoint      string `json:"authority_endpoint"`
+	AuthorityServerName    string `json:"authority_server_name"`
+	ClientCertificatePEM   string `json:"client_certificate_pem"`
+	Capability             string `json:"capability"`
+	ExpiresUnix            int64  `json:"expires_unix"`
+	CertificateExpiresUnix int64  `json:"certificate_expires_unix"`
+	SessionID              string `json:"session_id"`
+	Sequence               uint64 `json:"sequence"`
+}
+
+type MountAuthorizationContext struct {
+	AuthorityCAPEM string `json:"authority_ca_pem"`
+	ReleaseID      string `json:"release_id"`
+}
+
 type RegisterCellRequest struct {
 	ID               string `json:"id"`
 	AvailabilityZone string `json:"availability_zone"`
@@ -158,10 +224,11 @@ type RetireVolumeRequest struct {
 }
 
 type IssueMountRequest struct {
-	VolumeID             string   `json:"volume_id"`
-	ProductAuthorization string   `json:"product_authorization"`
-	ClientCSRPEM         string   `json:"client_csr_pem"`
-	Access               []string `json:"access"`
+	VolumeID                 string   `json:"volume_id"`
+	ProductAuthorization     string   `json:"product_authorization"`
+	ClientCSRPEM             string   `json:"client_csr_pem"`
+	Access                   []string `json:"access"`
+	AutomaticReauthorization bool     `json:"automatic_reauthorization,omitempty"`
 }
 
 type ReauthorizeMountRequest struct {
@@ -173,20 +240,33 @@ type ReauthorizeMountRequest struct {
 	Sequence             uint64   `json:"sequence"`
 }
 
+type RefreshMountEnrollmentRequest struct {
+	ClientCSRPEM string `json:"client_csr_pem"`
+	SessionID    string `json:"session_id"`
+	Sequence     uint64 `json:"sequence"`
+}
+
+type TerminateMountEnrollmentRequest struct {
+	Reason string `json:"reason"`
+}
+
 type MountAuthorization struct {
-	VolumeID               string   `json:"volume_id"`
-	AuthorityEndpoint      string   `json:"authority_endpoint"`
-	AuthorityServerName    string   `json:"authority_server_name"`
-	AuthorityCAPEM         string   `json:"authority_ca_pem"`
-	ClientCertificatePEM   string   `json:"client_certificate_pem"`
-	Capability             string   `json:"capability"`
-	Access                 []string `json:"access"`
-	ExpiresUnix            int64    `json:"expires_unix"`
-	CertificateExpiresUnix int64    `json:"certificate_expires_unix"`
-	AuthorityGeneration    uint64   `json:"authority_generation"`
-	SessionID              string   `json:"session_id,omitempty"`
-	Sequence               uint64   `json:"sequence,omitempty"`
-	ReleaseID              string   `json:"release_id"`
+	VolumeID                 string   `json:"volume_id"`
+	AuthorityEndpoint        string   `json:"authority_endpoint"`
+	AuthorityServerName      string   `json:"authority_server_name"`
+	AuthorityCAPEM           string   `json:"authority_ca_pem"`
+	ClientCertificatePEM     string   `json:"client_certificate_pem"`
+	Capability               string   `json:"capability"`
+	Access                   []string `json:"access"`
+	ExpiresUnix              int64    `json:"expires_unix"`
+	CertificateExpiresUnix   int64    `json:"certificate_expires_unix"`
+	AuthorityGeneration      uint64   `json:"authority_generation"`
+	SessionID                string   `json:"session_id,omitempty"`
+	Sequence                 uint64   `json:"sequence,omitempty"`
+	ReleaseID                string   `json:"release_id"`
+	EnrollmentID             string   `json:"enrollment_id,omitempty"`
+	EnrollmentCertificatePEM string   `json:"enrollment_certificate_pem,omitempty"`
+	EnrollmentExpiresUnix    int64    `json:"enrollment_expires_unix,omitempty"`
 }
 
 type CellObservation struct {
@@ -228,12 +308,22 @@ type VolumeView struct {
 }
 
 func NewState() State {
-	return State{SchemaVersion: StateSchemaVersion, Cells: map[string]Cell{}, Volumes: map[string]Volume{}, Receipts: map[string]Receipt{}, AuthorizationNonces: map[string]AuthorizationNonce{}}
+	return State{
+		SchemaVersion: StateSchemaVersion, Cells: map[string]Cell{}, Volumes: map[string]Volume{}, Receipts: map[string]Receipt{},
+		AuthorizationNonces: map[string]AuthorizationNonce{}, MountEnrollments: map[string]MountEnrollment{},
+		MountAuthorizationContexts: map[string]MountAuthorizationContext{},
+	}
 }
 
 func (state State) Validate() error {
 	if state.SchemaVersion != StateSchemaVersion || state.Cells == nil || state.Volumes == nil || state.Receipts == nil || state.AuthorizationNonces == nil {
 		return fmt.Errorf("%w: state schema", ErrInvalid)
+	}
+	if len(state.MountEnrollments) > MaxRetainedMountEnrollments {
+		return fmt.Errorf("%w: mount enrollment capacity", ErrInvalid)
+	}
+	if len(state.MountAuthorizationContexts) > len(state.MountEnrollments) {
+		return fmt.Errorf("%w: mount authorization context capacity", ErrInvalid)
 	}
 	projects := make(map[string]map[uint32]string)
 	uids := make(map[string]map[uint32]string)
@@ -271,6 +361,90 @@ func (state State) Validate() error {
 	for key, nonce := range state.AuthorizationNonces {
 		if key == "" || !validIdentity(nonce.RequestID) || nonce.ExpiresUnix <= 0 {
 			return fmt.Errorf("%w: authorization nonce", ErrInvalid)
+		}
+	}
+	activeEnrollments := 0
+	activeByAuthorizationDomain := make(map[string]int)
+	activeByVolume := make(map[string]int)
+	referencedAuthorizationContexts := make(map[string]struct{})
+	for id, enrollment := range state.MountEnrollments {
+		if id != enrollment.ID || !cellplan.ValidID(id) || !cellplan.ValidID(enrollment.VolumeID) ||
+			!validIdentity(enrollment.Subject) || !validIdentity(enrollment.Owner) || !validAccess(enrollment.Access) || enrollment.PeerSPKI == "" ||
+			!validIdentity(enrollment.AuthorizationDomain) || !validIdentity(enrollment.ProductIssuer) ||
+			!cellplan.ValidID(enrollment.CellID) || !validDNSName(enrollment.AuthorityID) ||
+			enrollment.AuthorityGeneration == 0 || enrollment.CreatedUnix <= 0 ||
+			enrollment.ExpiresUnix <= enrollment.CreatedUnix || enrollment.UpdatedUnix < enrollment.CreatedUnix ||
+			!validOptionalIdentity(enrollment.TerminationReason) {
+			return fmt.Errorf("%w: mount enrollment %q", ErrInvalid, id)
+		}
+		peer, err := hex.DecodeString(enrollment.PeerSPKI)
+		if err != nil || len(peer) != 32 || strings.ToLower(enrollment.PeerSPKI) != enrollment.PeerSPKI {
+			return fmt.Errorf("%w: mount enrollment peer", ErrInvalid)
+		}
+		volume, ok := state.Volumes[enrollment.VolumeID]
+		if !ok || volume.Owner != enrollment.Owner || volume.AuthorizationDomain != enrollment.AuthorizationDomain || volume.ProductIssuer != enrollment.ProductIssuer ||
+			volume.CellID != enrollment.CellID || volume.AuthorityID != enrollment.AuthorityID {
+			return fmt.Errorf("%w: mount enrollment volume binding", ErrInvalid)
+		}
+		switch enrollment.State {
+		case MountEnrollmentActive:
+			if enrollment.TerminationReason != "" {
+				return fmt.Errorf("%w: active mount enrollment termination", ErrInvalid)
+			}
+			if volume.AuthorityGeneration != enrollment.AuthorityGeneration {
+				return fmt.Errorf("%w: active mount enrollment authority generation", ErrInvalid)
+			}
+			activeEnrollments++
+			activeByAuthorizationDomain[enrollment.AuthorizationDomain]++
+			activeByVolume[enrollment.VolumeID]++
+		case MountEnrollmentClosed, MountEnrollmentRevoked:
+			if enrollment.TerminationReason == "" {
+				return fmt.Errorf("%w: terminated mount enrollment reason", ErrInvalid)
+			}
+		default:
+			return fmt.Errorf("%w: mount enrollment state", ErrInvalid)
+		}
+		if enrollment.SessionID == "" {
+			if enrollment.LastSequence != 0 || enrollment.LastRequestSHA256 != "" || enrollment.LastAuthorization != nil || enrollment.LastAuthorizationContext != "" {
+				return fmt.Errorf("%w: unbound mount enrollment sequence", ErrInvalid)
+			}
+		} else {
+			session, err := base64.RawURLEncoding.DecodeString(enrollment.SessionID)
+			if err != nil || len(session) != 16 || enrollment.LastSequence == 0 || !validSHA256Hex(enrollment.LastRequestSHA256) || enrollment.LastAuthorization == nil ||
+				enrollment.LastAuthorization.SessionID != enrollment.SessionID || enrollment.LastAuthorization.Sequence != enrollment.LastSequence ||
+				!validSHA256Hex(enrollment.LastAuthorizationContext) {
+				return fmt.Errorf("%w: bound mount enrollment sequence", ErrInvalid)
+			}
+			if _, _, err := net.SplitHostPort(enrollment.LastAuthorization.AuthorityEndpoint); err != nil ||
+				!validDNSName(enrollment.LastAuthorization.AuthorityServerName) ||
+				enrollment.LastAuthorization.ClientCertificatePEM == "" || len(enrollment.LastAuthorization.ClientCertificatePEM) > 16<<10 ||
+				enrollment.LastAuthorization.Capability == "" || len(enrollment.LastAuthorization.Capability) > 8192 ||
+				enrollment.LastAuthorization.ExpiresUnix <= 0 || enrollment.LastAuthorization.CertificateExpiresUnix <= 0 {
+				return fmt.Errorf("%w: mount authorization replay", ErrInvalid)
+			}
+			if _, ok := state.MountAuthorizationContexts[enrollment.LastAuthorizationContext]; !ok {
+				return fmt.Errorf("%w: missing mount authorization context", ErrInvalid)
+			}
+			referencedAuthorizationContexts[enrollment.LastAuthorizationContext] = struct{}{}
+		}
+	}
+	if activeEnrollments > MaxActiveMountEnrollments {
+		return fmt.Errorf("%w: active mount enrollment capacity", ErrInvalid)
+	}
+	for _, count := range activeByAuthorizationDomain {
+		if count > MaxActiveMountEnrollmentsPerAuthorizationDomain {
+			return fmt.Errorf("%w: authorization-domain mount enrollment capacity", ErrInvalid)
+		}
+	}
+	for _, count := range activeByVolume {
+		if count > MaxActiveMountEnrollmentsPerVolume {
+			return fmt.Errorf("%w: volume mount enrollment capacity", ErrInvalid)
+		}
+	}
+	for id, context := range state.MountAuthorizationContexts {
+		if _, referenced := referencedAuthorizationContexts[id]; !referenced || context.AuthorityCAPEM == "" || len(context.AuthorityCAPEM) > 4096 ||
+			!validIdentity(context.ReleaseID) || mountAuthorizationContextID(context) != id {
+			return fmt.Errorf("%w: mount authorization context", ErrInvalid)
 		}
 	}
 	for id, receipt := range state.Receipts {
@@ -378,6 +552,15 @@ func validOptionalIdentity(value string) bool { return value == "" || validIdent
 func validSHA256Hex(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && len(decoded) == 32 && strings.ToLower(value) == value
+}
+
+func mountAuthorizationContextID(context MountAuthorizationContext) string {
+	raw, err := json.Marshal(context)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
 }
 
 func nowUnix(now func() time.Time) int64 { return now().UTC().Unix() }

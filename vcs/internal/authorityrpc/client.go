@@ -1,8 +1,12 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -64,6 +68,10 @@ type ClientConfig struct {
 	// that routes a subtree to local disk hides it from every peer, so the
 	// authority refuses any mount whose topology is not the volume's active one.
 	RoutesRevision [32]byte
+	// RequireMountEnrollmentReauthorization makes automatic hosted renewal an
+	// attach-time contract. A mount configured with a Manager enrollment never
+	// starts against an authority that cannot verify enrollment-backed grants.
+	RequireMountEnrollmentReauthorization bool
 }
 
 // MutationIdentity is the replay identity assigned to one authority mutation.
@@ -115,6 +123,7 @@ type Client struct {
 	epoch                  []byte
 	proof                  *authoritypb.SessionProof
 	root                   *authoritypb.Item
+	authorizationDeadline  time.Time
 	maxRead                uint32
 	maxWrite               uint32
 	lease                  time.Duration
@@ -253,6 +262,11 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 	if !hasFeatures(hello.GetHello().GetFeatures(), requiredHelloFeatures) {
 		return fail(errors.New("authorityrpc: authority omitted required current-state features"))
 	}
+	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
+		hello.GetHello().GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
+	) {
+		return fail(errors.New("authorityrpc: authority does not support Manager-enrolled mount reauthorization"))
+	}
 	c.peerCompleteFeedback.Store(hasFeatures(
 		hello.GetHello().GetFeatures(), []string{peerCompleteFIFOFeedbackFeature},
 	))
@@ -332,6 +346,15 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 		if !hasFeatures(response.GetAttach().GetFeatures(), requiredAttachFeatures) {
 			return fail(errors.New("authorityrpc: authority omitted required ordinary-filesystem features"))
 		}
+		if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
+			response.GetAttach().GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
+		) {
+			return fail(errors.New("authorityrpc: attach omitted Manager-enrolled mount reauthorization"))
+		}
+		authorizationDeadline := time.Unix(0, response.GetAttach().GetAuthorizationDeadlineUnixNanos())
+		if c.cfg.RequireMountEnrollmentReauthorization && !authorizationDeadline.After(time.Now()) {
+			return fail(errors.New("authorityrpc: automatic mount attach omitted its signed authorization deadline"))
+		}
 		if c.cfg.CoherenceProfile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT &&
 			!hasFeatures(response.GetAttach().GetFeatures(), requiredStrictAttachFeatures) {
 			return fail(errors.New("authorityrpc: authority omitted required strict visibility semantics"))
@@ -349,6 +372,9 @@ func (c *Client) connect(ctx context.Context, resume bool) error {
 			return fail(errors.New("authorityrpc: attach returned malformed session state"))
 		}
 		c.epoch = append([]byte(nil), response.GetEpoch()...)
+		if response.GetAttach().GetAuthorizationDeadlineUnixNanos() != 0 {
+			c.authorizationDeadline = authorizationDeadline
+		}
 		c.proof = &authoritypb.SessionProof{Id: append([]byte(nil), response.GetAttach().GetSessionId()...), Generation: response.GetAttach().GetSessionGeneration(), ResumeSecret: append([]byte(nil), response.GetAttach().GetResumeSecret()...)}
 		c.root = proto.Clone(response.GetAttach().GetRoot()).(*authoritypb.Item)
 		c.maxRead = hello.GetHello().GetMaxReadBytes()
@@ -472,6 +498,76 @@ func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64)
 	return deadline, nil
 }
 
+// ReauthorizeWithCertificate validates a manager-renewed certificate for the
+// mount-local private key, rotates the live authorization, and only then makes
+// the certificate visible to a future transport resume. The exact current
+// connection performs Reauthorize under its still-valid identity; a failed
+// authority decision never changes the reconnect identity.
+func (c *Client) ReauthorizeWithCertificate(ctx context.Context, token []byte, sequence uint64, certificatePEM []byte, now time.Time) (time.Time, error) {
+	replacement, err := c.replacementClientCertificate(certificatePEM, now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	deadline, err := c.Reauthorize(ctx, token, sequence)
+	if err != nil {
+		return time.Time{}, err
+	}
+	c.lifecycle.Lock()
+	c.cfg.TLS.Certificates = []tls.Certificate{*replacement}
+	c.lifecycle.Unlock()
+	return deadline, nil
+}
+
+func (c *Client) replacementClientCertificate(certificatePEM []byte, now time.Time) (*tls.Certificate, error) {
+	c.lifecycle.Lock()
+	defer c.lifecycle.Unlock()
+	if c.cfg.TLS == nil || len(c.cfg.TLS.Certificates) != 1 || c.cfg.TLS.Certificates[0].PrivateKey == nil {
+		return nil, errors.New("authorityrpc: client identity is unavailable")
+	}
+	var chain [][]byte
+	rest := bytes.TrimSpace(certificatePEM)
+	for len(rest) != 0 {
+		block, remaining := pem.Decode(rest)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, errors.New("authorityrpc: renewed identity must contain only CERTIFICATE PEM blocks")
+		}
+		chain = append(chain, append([]byte(nil), block.Bytes...))
+		rest = bytes.TrimSpace(remaining)
+	}
+	if len(chain) == 0 {
+		return nil, errors.New("authorityrpc: renewed identity contains no certificate")
+	}
+	leaf, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		return nil, fmt.Errorf("authorityrpc: parse renewed client certificate: %w", err)
+	}
+	signer, ok := c.cfg.TLS.Certificates[0].PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, errors.New("authorityrpc: client private key is not a signer")
+	}
+	want, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return nil, err
+	}
+	got, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	if err != nil || !bytes.Equal(want, got) {
+		return nil, errors.New("authorityrpc: renewed certificate does not match the mount-local private key")
+	}
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) || !certificatePermitsClientAuth(leaf.ExtKeyUsage) {
+		return nil, errors.New("authorityrpc: renewed certificate is not currently valid for client authentication")
+	}
+	return &tls.Certificate{Certificate: chain, PrivateKey: signer, Leaf: leaf}, nil
+}
+
+func certificatePermitsClientAuth(usages []x509.ExtKeyUsage) bool {
+	for _, usage := range usages {
+		if usage == x509.ExtKeyUsageClientAuth || usage == x509.ExtKeyUsageAny {
+			return true
+		}
+	}
+	return false
+}
+
 // AuthorizationSessionID exposes the non-secret session identifier needed to
 // bind a manager reauthorization grant. The resume secret remains private to
 // this client and is never returned.
@@ -483,6 +579,12 @@ func (c *Client) AuthorizationSessionID() volumeserver.SessionID {
 		copy(id[:], c.proof.GetId())
 	}
 	return id
+}
+
+func (c *Client) InitialAuthorizationDeadline() time.Time {
+	c.lifecycle.Lock()
+	defer c.lifecycle.Unlock()
+	return c.authorizationDeadline
 }
 
 func (c *Client) InitialVisibilityCursor() *authoritypb.VisibilityCursor {

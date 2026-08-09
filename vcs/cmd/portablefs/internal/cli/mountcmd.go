@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
@@ -41,21 +43,29 @@ type mountOpts struct {
 	// branch stays a field because the mount records, ownership locks, and
 	// persistence keys are branch-shaped; a v3 mount is branchless, so it is
 	// always empty (the --branch flag itself is retired).
-	branch              string
-	strategy            string
-	addr                string
-	mountToken          string
-	dataPlaneTransport  string
-	dataPlaneServerName string
-	dataPlaneCAPath     string
-	clientCertPath      string
-	clientKeyPath       string
-	coherence           string
-	foreground          bool
-	readyFD             int
-	opLockFD            int
-	localDirs           stringListFlag
-	noLocalDirs         bool
+	branch                string
+	strategy              string
+	addr                  string
+	mountToken            string
+	dataPlaneTransport    string
+	dataPlaneServerName   string
+	dataPlaneCAPath       string
+	clientCertPath        string
+	clientKeyPath         string
+	authExpiresAtMs       int64
+	managerURL            string
+	managerServerName     string
+	managerCAPath         string
+	enrollmentID          string
+	enrollmentCertPath    string
+	enrollmentExpiresAtMs int64
+	authorityGeneration   uint64
+	coherence             string
+	foreground            bool
+	readyFD               int
+	opLockFD              int
+	localDirs             stringListFlag
+	noLocalDirs           bool
 }
 
 // errFastRetired is the typed refusal for the retired --fast flag: write
@@ -68,17 +78,28 @@ var errFastRetired = fmt.Errorf("--fast is retired: every mount is adaptive (the
 // nothing the flag could select.
 var errBranchRetired = fmt.Errorf("--branch is retired: a v3 volume is branchless; remove the flag")
 
+// A mount that is already absent cannot fail closed a second time. Keep a
+// bounded renewal-owner shutdown failure distinct from an authorization
+// failure so teardown reports the correct operational outcome and closes the
+// remote enrollment as an ordinary detach.
+var errAutomaticRenewalStopTimeout = errors.New("automatic mount renewal did not stop within its cancellation bound")
+
+// Once an automatic owner exists, remote closure is safe only after exact
+// local cleanup proves that owner and its kernel/daemon attach are terminal.
+func automaticEnrollmentCanCloseAfterStartupFailure(ownerEstablished, cleanupComplete bool) bool {
+	return !ownerEstablished || cleanupComplete
+}
+
 // errMountNeedsDirectV3Credentials is the refusal for a mount invocation that
-// still expects the legacy manager/lease flow. This direct CLI does not yet
-// call the hosted v3 manager, and there is deliberately no fallback to the
-// legacy clientcore mount — so the absent arguments are named instead of
-// silently mounting a weaker engine.
+// still expects the legacy manager/lease flow. The CLI never mints the initial
+// attach credential; an optional mount enrollment begins only after the exact
+// direct v3 credential has admitted the session.
 var errMountNeedsDirectV3Credentials = fmt.Errorf(
 	"portablefs mount attaches the v3 authority stack and needs direct credentials: pass " +
 		"--addr <host:port>, a mount capability via --mount-token (or " + mountTokenEnv + "), " +
 		"--data-plane-transport tls-private-ca|tls-system-pki (with --data-plane-server-name, and --data-plane-ca for a private CA), " +
 		"and the mutual-TLS client identity via --client-cert/--client-key. " +
-		"This direct CLI cannot mint v3 credentials or acquire them from the hosted manager, so a manager/lease-only invocation is refused rather than mounted on the retired v2 engine")
+		"The CLI cannot mint v3 credentials for the initial attach, so a manager/lease-only invocation is refused rather than mounted on the retired v2 engine")
 
 func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	addCommonFlags(fs, &o.common)
@@ -93,6 +114,14 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.dataPlaneCAPath, "data-plane-ca", "", "private CA PEM file for tls-private-ca")
 	fs.StringVar(&o.clientCertPath, "client-cert", "", "mutual-TLS client certificate PEM file")
 	fs.StringVar(&o.clientKeyPath, "client-key", "", "mutual-TLS client private key PEM file (must be chmod 600)")
+	fs.Int64Var(&o.authExpiresAtMs, "auth-expires-at-ms", 0, "initial Manager authorization expiry as unix milliseconds (required with automatic enrollment)")
+	fs.StringVar(&o.managerURL, "manager-url", "", "HTTPS origin of the hosted Manager for automatic mount authorization")
+	fs.StringVar(&o.managerServerName, "manager-server-name", "", "exact TLS verification name of the hosted Manager")
+	fs.StringVar(&o.managerCAPath, "manager-ca", "", "Manager private CA bundle PEM file")
+	fs.StringVar(&o.enrollmentID, "mount-enrollment-id", "", "Manager-issued key-bound mount enrollment identity")
+	fs.StringVar(&o.enrollmentCertPath, "mount-enrollment-cert", "", "Manager-issued mount enrollment certificate PEM file")
+	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
+	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
 	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (cache names and attributes, join the authority visibility barrier) or uncached (cache nothing; Linux only)")
 	fs.BoolFunc("fast", "retired: every mount is adaptive; passing this flag is an error", func(string) error {
 		return errFastRetired
@@ -132,10 +161,50 @@ func validateDirectV3MountOpts(o *mountOpts, getenv func(string) string) (dataPl
 	if o.clientCertPath == "" || o.clientKeyPath == "" {
 		return dataPlaneTransport{}, fmt.Errorf("a v3 mount authenticates with a mutual-TLS client identity: pass --client-cert and --client-key")
 	}
+	enrollmentFields := []bool{
+		o.managerURL != "", o.managerServerName != "", o.managerCAPath != "", o.enrollmentID != "",
+		o.enrollmentCertPath != "", o.enrollmentExpiresAtMs != 0, o.authorityGeneration != 0, o.authExpiresAtMs != 0,
+	}
+	var enrollmentSet int
+	for _, set := range enrollmentFields {
+		if set {
+			enrollmentSet++
+		}
+	}
+	if enrollmentSet != 0 && enrollmentSet != len(enrollmentFields) {
+		return dataPlaneTransport{}, errors.New("automatic mount authorization requires --manager-url, --manager-server-name, --manager-ca, --mount-enrollment-id, --mount-enrollment-cert, --mount-enrollment-expires-at-ms, --authority-generation, and --auth-expires-at-ms together")
+	}
+	if enrollmentSet != 0 && (o.authExpiresAtMs <= time.Now().UnixMilli() || o.enrollmentExpiresAtMs <= o.authExpiresAtMs) {
+		return dataPlaneTransport{}, errors.New("automatic mount enrollment and initial authorization must both be unexpired, with the enrollment outliving the initial authorization")
+	}
 	if o.coherence != "strict" && o.coherence != "uncached" {
 		return dataPlaneTransport{}, fmt.Errorf("--coherence must be strict or uncached, not %q", o.coherence)
 	}
 	return transport, nil
+}
+
+func (o *mountOpts) automaticEnrollment(clientIdentity *clientTLSIdentity, volumeID string) (*mountenrollment.Client, time.Time, error) {
+	if o.enrollmentID == "" {
+		return nil, time.Time{}, nil
+	}
+	managerCA, err := readBoundedRegularFile(o.managerCAPath, false)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("read --manager-ca: %w", err)
+	}
+	enrollmentCertificate, err := readBoundedRegularFile(o.enrollmentCertPath, false)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("read --mount-enrollment-cert: %w", err)
+	}
+	client, err := mountenrollment.NewClient(mountenrollment.Config{
+		ManagerURL: o.managerURL, ManagerServerName: o.managerServerName, ManagerCAPEM: managerCA,
+		EnrollmentID: o.enrollmentID, EnrollmentCertificatePEM: enrollmentCertificate,
+		ClientKeyPEM: clientIdentity.keyPEM, VolumeID: volumeID, AuthorityGeneration: o.authorityGeneration,
+		EnrollmentExpires: time.UnixMilli(o.enrollmentExpiresAtMs),
+	})
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	return client, time.UnixMilli(o.authExpiresAtMs), nil
 }
 
 // perfOptions carries the FUSE mount cache options plus the write-back
@@ -172,16 +241,17 @@ func storageDirID(volumeID, branch string) string {
 // mountReady is the readiness handshake between the daemonized child and the
 // parent `portablefs mount` invocation (one JSON line over a pipe).
 type mountReady struct {
-	OK        bool     `json:"ok"`
-	Cleaned   bool     `json:"cleaned,omitempty"`
-	Error     string   `json:"error,omitempty"`
-	PID       int      `json:"pid,omitempty"`
-	Strategy  string   `json:"strategy,omitempty"`
-	MountPath string   `json:"mountPath,omitempty"`
-	VolumeID  string   `json:"volumeId,omitempty"`
-	Branch    string   `json:"branch,omitempty"`
-	AttachRef string   `json:"attachRef,omitempty"`
-	LocalDirs []string `json:"localDirs,omitempty"`
+	OK                     bool     `json:"ok"`
+	Cleaned                bool     `json:"cleaned,omitempty"`
+	Error                  string   `json:"error,omitempty"`
+	PID                    int      `json:"pid,omitempty"`
+	Strategy               string   `json:"strategy,omitempty"`
+	MountPath              string   `json:"mountPath,omitempty"`
+	VolumeID               string   `json:"volumeId,omitempty"`
+	Branch                 string   `json:"branch,omitempty"`
+	AttachRef              string   `json:"attachRef,omitempty"`
+	AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
+	LocalDirs              []string `json:"localDirs,omitempty"`
 	// LocalRoutes is the FUSE mount's activated route set and
 	// LocalRouteRevision the VOLUME DECLARATION's revision it answers for.
 	// LocalRoutesPerMachine marks the legacy case where the rules came from
@@ -265,7 +335,11 @@ func cmdMount(e *cmdEnv, args []string) int {
 	// The identity files are proven readable (and the key private) here for
 	// the same reason: the child re-reads them, but a bad path or a
 	// world-readable key should stop the command before it forks anything.
-	if _, err := loadClientTLSIdentity(o.clientCertPath, o.clientKeyPath); err != nil {
+	parentIdentity, err := loadClientTLSIdentity(o.clientCertPath, o.clientKeyPath)
+	if err != nil {
+		return e.usageError("mount", err)
+	}
+	if _, _, err := o.automaticEnrollment(parentIdentity, volumeID); err != nil {
 		return e.usageError("mount", err)
 	}
 
@@ -827,6 +901,18 @@ func (e *cmdEnv) daemonizeMount(o *mountOpts, volumeID, mountPath, stateDir stri
 	if o.dataPlaneCAPath != "" {
 		childArgs = append(childArgs, "--data-plane-ca", o.dataPlaneCAPath)
 	}
+	if o.enrollmentID != "" {
+		childArgs = append(childArgs,
+			"--manager-url", o.managerURL,
+			"--manager-server-name", o.managerServerName,
+			"--manager-ca", o.managerCAPath,
+			"--mount-enrollment-id", o.enrollmentID,
+			"--mount-enrollment-cert", o.enrollmentCertPath,
+			"--mount-enrollment-expires-at-ms", strconv.FormatInt(o.enrollmentExpiresAtMs, 10),
+			"--authority-generation", strconv.FormatUint(o.authorityGeneration, 10),
+			"--auth-expires-at-ms", strconv.FormatInt(o.authExpiresAtMs, 10),
+		)
+	}
 	if o.noLocalDirs {
 		childArgs = append(childArgs, "--no-local-dirs")
 	}
@@ -1265,6 +1351,26 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	leaseCleanupSafe := true
 	leaseCleanupAttempted := false
 	startupCleanupComplete := false
+	var enrollmentClient *mountenrollment.Client
+	var initialAuthorizationDeadline time.Time
+	enrollmentCloseAttempted := false
+	automaticOwnerEstablished := false
+	closeFailedStartupEnrollment := func() {
+		if enrollmentClient == nil || enrollmentCloseAttempted {
+			return
+		}
+		if !automaticEnrollmentCanCloseAfterStartupFailure(automaticOwnerEstablished, startupCleanupComplete) {
+			log.Printf("portablefs mount: retaining failed-startup enrollment because its local attach is not yet proven terminal")
+			return
+		}
+		enrollmentCloseAttempted = true
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		closeErr := enrollmentClient.Close(closeCtx, "mount startup rolled back")
+		cancel()
+		if closeErr != nil {
+			log.Printf("portablefs mount: failed-startup enrollment could not be closed and will expire or be revoked remotely: %v", closeErr)
+		}
+	}
 	report := func(ready mountReady) {
 		line, _ := json.Marshal(ready)
 		if readyPipe != nil {
@@ -1301,6 +1407,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				err = errors.Join(err, releaseErr)
 			}
 		}
+		closeFailedStartupEnrollment()
 		report(mountReady{OK: false, Cleaned: startupCleanupComplete, Error: err.Error()})
 		if readyPipe != nil {
 			fmt.Fprintf(e.stderr, "portablefs mount: %v\n", err)
@@ -1361,6 +1468,10 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	}
 	mountToken := o.resolveMountToken(e.getenv)
 	clientIdentity, err := loadClientTLSIdentity(o.clientCertPath, o.clientKeyPath)
+	if err != nil {
+		return failReady(err)
+	}
+	enrollmentClient, initialAuthorizationDeadline, err = o.automaticEnrollment(clientIdentity, volumeID)
 	if err != nil {
 		return failReady(err)
 	}
@@ -1522,11 +1633,12 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			identity: clientIdentity, coherence: o.coherence,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
 			backingRoot: localDirsBackingRoot(stateDir, volumeID),
-			noLocalDirs: o.noLocalDirs,
+			noLocalDirs: o.noLocalDirs, requireMountEnrollment: enrollmentClient != nil,
 		})
 		if err != nil {
 			return failReady(err)
 		}
+		automaticOwnerEstablished = enrollmentClient != nil
 		kernelMountID, err := captureFUSEKernelMountID(mountPath, mountInstanceID)
 		if err != nil {
 			// A path-based unmount is unsafe when the kernel table is absent,
@@ -1541,13 +1653,50 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		releaseMountTargetPin()
 		state.KernelMountID = kernelMountID
 		operation.kernelMountID = kernelMountID
+		var unmountMu sync.Mutex
+		requestUnmount := func() error {
+			unmountMu.Lock()
+			defer unmountMu.Unlock()
+			return m.Unmount()
+		}
+		mountGone := make(chan struct{})
+		var mountGoneOnce sync.Once
+		markMountGone := func() { mountGoneOnce.Do(func() { close(mountGone) }) }
+		var reauthorizationControl fuseReauthorizationControl
+		var renewalCancel context.CancelFunc
+		var renewalDone chan error
+		stopRenewal := func() error {
+			if renewalCancel == nil {
+				return nil
+			}
+			renewalCancel()
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			var err error
+			select {
+			case err = <-renewalDone:
+			case <-timer.C:
+				err = errAutomaticRenewalStopTimeout
+			}
+			renewalCancel = nil
+			return err
+		}
 		cleanupMountedFUSE := func(cause error) int {
+			if renewalErr := stopRenewal(); renewalErr != nil {
+				cause = errors.Join(cause, renewalErr)
+			}
+			if reauthorizationControl != nil {
+				if controlErr := reauthorizationControl.Close(); controlErr != nil {
+					cause = errors.Join(cause, fmt.Errorf("close reauthorization control: %w", controlErr))
+				}
+			}
 			// Startup rollback runs the same exact teardown as a live unmount:
 			// kernel detach, then session release with its recorded verdict.
-			if unmountErr := m.Unmount(); unmountErr != nil {
+			if unmountErr := requestUnmount(); unmountErr != nil {
 				return failReady(errors.Join(cause, fmt.Errorf("transactional startup FUSE unmount failed: %w", unmountErr)))
 			}
 			m.Wait()
+			markMountGone()
 			if teardownErr := m.Close(); teardownErr != nil {
 				return failReady(errors.Join(cause, fmt.Errorf("close failed-startup FUSE resources: %w", teardownErr)))
 			}
@@ -1571,8 +1720,101 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		}
 		ready.LocalRoutes = state.LocalRoutes
 		ready.LocalRouteRevision = state.LocalRouteRevision
+		authorizationSessionID := m.AuthorizationSessionID()
+		if len(authorizationSessionID) != 22 {
+			return cleanupMountedFUSE(fmt.Errorf("authority attach returned no hosted reauthorization session identity"))
+		}
+		if enrollmentClient != nil {
+			authorityDeadline := m.InitialAuthorizationDeadline()
+			if !authorityDeadline.Equal(initialAuthorizationDeadline) {
+				return cleanupMountedFUSE(fmt.Errorf("authority installed authorization deadline %s, Manager response declared %s", authorityDeadline.UTC().Format(time.RFC3339Nano), initialAuthorizationDeadline.UTC().Format(time.RFC3339Nano)))
+			}
+			initialAuthorizationDeadline = authorityDeadline
+		}
+		state.AuthorizationSessionID = authorizationSessionID
+		if enrollmentClient == nil {
+			reauthorizationControl, err = startFuseReauthorizationControl(
+				stateDir,
+				mountPath,
+				func(ctx context.Context, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
+					return m.Reauthorize(ctx, token, sequence, certificatePEM)
+				},
+			)
+			if err != nil {
+				return cleanupMountedFUSE(err)
+			}
+			state.ReauthorizationControlSocket = reauthorizationControl.SocketPath()
+		} else {
+			state.MountEnrollmentID = o.enrollmentID
+			state.EnrollmentExpiresAtMs = o.enrollmentExpiresAtMs
+			state.AuthorizationDeadlineAtMs = initialAuthorizationDeadline.UnixMilli()
+		}
+		ready.AuthorizationSessionID = authorizationSessionID
 		if err := writeMountState(stateDir, state); err != nil {
 			return cleanupMountedFUSE(err)
+		}
+		if enrollmentClient != nil {
+			renewalCtx, cancel := context.WithCancel(context.Background())
+			renewalCancel = cancel
+			renewalDone = make(chan error, 1)
+			renewer := &mountenrollment.Renewer{
+				Source: enrollmentClient,
+				Observe: func(status mountenrollment.RenewalStatus) {
+					_, _ = updateMountState(stateDir, mountPath, func(current *mountState) {
+						if current.MountEnrollmentID != o.enrollmentID {
+							return
+						}
+						current.AuthorizationDeadlineAtMs = status.AuthorizationDeadline.UnixMilli()
+						if !status.LastSuccess.IsZero() {
+							current.LastReauthorizationAtMs = status.LastSuccess.UnixMilli()
+						}
+						if !status.NextAttempt.IsZero() {
+							current.NextReauthorizationAtMs = status.NextAttempt.UnixMilli()
+						}
+						current.ReauthorizationFailures = status.ConsecutiveFailures
+						current.ReauthorizationError = status.LastError
+					})
+				},
+			}
+			go func() {
+				renewErr := renewer.Run(renewalCtx, authorizationSessionID, initialAuthorizationDeadline, m.Reauthorize)
+				if renewErr != nil {
+					setMountStatus(stateDir, mountPath, mountStatusCredentialExpired, time.Now().UnixMilli())
+					log.Printf("portablefs mount: automatic reauthorization ended the mount: %v", renewErr)
+					backoff := 250 * time.Millisecond
+					attempts := 0
+				detachRetry:
+					for {
+						select {
+						case <-renewalCtx.Done():
+							break detachRetry
+						case <-mountGone:
+							break detachRetry
+						default:
+						}
+						attempts++
+						if unmountErr := requestUnmount(); unmountErr == nil {
+							break
+						} else if attempts == 1 || attempts%12 == 0 {
+							log.Printf("portablefs mount: retrying exact detach after automatic reauthorization failure: %v", unmountErr)
+						}
+						select {
+						case <-renewalCtx.Done():
+							break detachRetry
+						case <-mountGone:
+							break detachRetry
+						case <-time.After(backoff):
+						}
+						if backoff < 5*time.Second {
+							backoff *= 2
+							if backoff > 5*time.Second {
+								backoff = 5 * time.Second
+							}
+						}
+					}
+				}
+				renewalDone <- renewErr
+			}()
 		}
 		if err := operation.writeIntent("live", os.Getpid(), processIdentity); err != nil {
 			return cleanupMountedFUSE(err)
@@ -1589,7 +1831,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				// write-back tail in v3 — every acknowledged write is already
 				// durable at the authority — so there is nothing to park and no
 				// forced variant of this teardown.
-				if err := m.Unmount(); err != nil {
+				if err := requestUnmount(); err != nil {
 					log.Printf("portablefs mount: shutdown request refused: %v", err)
 					continue
 				}
@@ -1597,7 +1839,16 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			}
 		}()
 		m.Wait() // returns when the kernel mount is gone (signal or external umount)
+		markMountGone()
 		signal.Stop(sig)
+		renewalErr := stopRenewal()
+		renewalStopTimedOut := errors.Is(renewalErr, errAutomaticRenewalStopTimeout)
+		renewalFailed := renewalErr != nil && !renewalStopTimedOut
+		if reauthorizationControl != nil {
+			if err := reauthorizationControl.Close(); err != nil {
+				return e.fail("mount", fmt.Errorf("kernel mount is gone but reauthorization control did not close: %w", err))
+			}
+		}
 		// Close releases the authority session. After an external unmount it
 		// also delivers the mount-absence proof; after this supervisor's own
 		// Unmount it only reports any recorded fatal session verdict.
@@ -1614,6 +1865,24 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return e.fail("mount", fmt.Errorf("finalize clean mount operation: %w", err))
 		}
 		operation = nil
+		if enrollmentClient != nil {
+			closeReason := "mount detached"
+			if renewalFailed {
+				closeReason = "automatic reauthorization failed closed"
+			}
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			closeErr := enrollmentClient.Close(closeCtx, closeReason)
+			cancel()
+			if closeErr != nil {
+				log.Printf("portablefs mount: detached mount enrollment could not be closed and will expire or be revoked remotely: %v", closeErr)
+			}
+		}
+		if renewalStopTimedOut {
+			return e.fail("mount", fmt.Errorf("mount detached cleanly but its automatic renewal owner did not stop: %w", renewalErr))
+		}
+		if renewalFailed {
+			return e.fail("mount", fmt.Errorf("mount failed closed after automatic reauthorization failure: %w", renewalErr))
+		}
 		return 0
 
 	case "fskit":
@@ -1635,23 +1904,41 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return failReady(err)
 		}
 		leaseCleanupSafe = false
+		var daemonEnrollment *fskitV3MountEnrollmentRequest
+		if enrollmentClient != nil {
+			managerCA, readErr := readBoundedRegularFile(o.managerCAPath, false)
+			if readErr != nil {
+				return failReady(fmt.Errorf("read --manager-ca: %w", readErr))
+			}
+			enrollmentCertificate, readErr := readBoundedRegularFile(o.enrollmentCertPath, false)
+			if readErr != nil {
+				return failReady(fmt.Errorf("read --mount-enrollment-cert: %w", readErr))
+			}
+			daemonEnrollment = &fskitV3MountEnrollmentRequest{
+				ManagerURL: o.managerURL, ManagerServerName: o.managerServerName, ManagerCAPEM: string(managerCA),
+				EnrollmentID: o.enrollmentID, EnrollmentCertificatePEM: string(enrollmentCertificate),
+				EnrollmentExpiresAtMs: o.enrollmentExpiresAtMs, AuthorityGeneration: o.authorityGeneration,
+				InitialAuthorizationExpiresAtMs: o.authExpiresAtMs,
+			}
+		}
 		// The daemon-owned v3 attach: portablefsd dials the authority under
 		// this exact transport with the mutual-TLS identity below, declares the
 		// strict barrier contract, and never exposes the credentials to the
 		// FSKit extension. Branch is empty (a v3 volume is branchless) and the
 		// clientcore-only options are omitted — the daemon refuses both.
 		attachReply, err := ctl.ensureAttachDetailed(fskitEnsureAttachRequest{
-			AttachRef:           attachRef,
-			VolumeID:            volumeID,
-			Branch:              "",
-			AuthorityURL:        authorityURL,
-			AuthToken:           mountToken,
-			DataPlaneTransport:  transport.Mode,
-			DataPlaneServerName: transport.ServerName,
-			TLSCAPEM:            transport.CAPEM,
-			TLSCASHA256:         transport.CASHA256,
-			MountPath:           mountPath,
-			Options:             fskitAttachOptions{},
+			AttachRef:            attachRef,
+			VolumeID:             volumeID,
+			Branch:               "",
+			AuthorityURL:         authorityURL,
+			AuthToken:            mountToken,
+			AuthTokenExpiresAtMs: o.authExpiresAtMs,
+			DataPlaneTransport:   transport.Mode,
+			DataPlaneServerName:  transport.ServerName,
+			TLSCAPEM:             transport.CAPEM,
+			TLSCASHA256:          transport.CASHA256,
+			MountPath:            mountPath,
+			Options:              fskitAttachOptions{},
 			V3: &fskitV3AttachRequest{
 				ClientCertPEM:      string(clientIdentity.certPEM),
 				ClientKeyPEM:       string(clientIdentity.keyPEM),
@@ -1664,11 +1951,13 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				// both revisions named; declare the routes' removal or mount it
 				// from Linux, which adopts them.
 				RoutesRevision: emptyRoutesRevision(),
+				Enrollment:     daemonEnrollment,
 			},
 		})
 		if err != nil {
 			return failReady(err)
 		}
+		automaticOwnerEstablished = enrollmentClient != nil
 		if attachReply.AttachRef != attachRef {
 			return failReady(fmt.Errorf("portablefsd returned attach %s, want durable requested identity %s", attachReply.AttachRef, attachRef))
 		}
@@ -1740,10 +2029,19 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err := ctl.bindMountRoot(attachRef); err != nil {
 			return failAfterKernelMount(fmt.Errorf("bind the daemon's repair mount root: %w", err))
 		}
-		// There is no credential rotation to hand off from this direct CLI: the
-		// initial capability is already consumed by the daemon's attach. A hosted
-		// product can separately reauthorize the live daemon session.
+		// The daemon owns any configured automatic enrollment. In standalone
+		// mode it instead exposes the explicit manual reauthorization operation.
+		if len(attachReply.AuthorizationSessionID) != 22 {
+			return failAfterKernelMount(fmt.Errorf("portablefsd returned no hosted reauthorization session identity"))
+		}
 		ready.AttachRef = attachRef
+		ready.AuthorizationSessionID = attachReply.AuthorizationSessionID
+		state.AuthorizationSessionID = attachReply.AuthorizationSessionID
+		if enrollmentClient != nil {
+			state.MountEnrollmentID = o.enrollmentID
+			state.EnrollmentExpiresAtMs = o.enrollmentExpiresAtMs
+			state.AuthorizationDeadlineAtMs = initialAuthorizationDeadline.UnixMilli()
+		}
 		state.LocalDirs = attachReply.LocalDirs
 		state.LocalDirsDeclared = attachReply.LocalDirsDeclared
 		ready.LocalDirs = attachReply.LocalDirs
@@ -1767,6 +2065,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// repair it any more — a dead daemon cannot, and macOS 26 FSKit gives
 		// the extension no way to. See fskit_revocation.go for the contract.
 		watchdog := newFSKitRevocationWatchdog(fskitRevocationProber(fskitCfg.controlSock, &state))
+		var failClosedReason string
 		for {
 			shutdownRequested := false
 			select {
@@ -1788,6 +2087,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			}
 			if present {
 				if revoke, reason := watchdog.observe(time.Now()); revoke {
+					if failClosedReason == "" {
+						failClosedReason = reason
+					}
 					fmt.Fprintf(e.stderr, "portablefs mount: revoking the kernel mount at %s: %s\n", mountPath, reason)
 					if err := forceRevokeFSKitKernelMount(&state); err != nil {
 						// The watchdog fires again at its next interval; a
@@ -1829,6 +2131,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return e.fail("mount", fmt.Errorf("finalize clean mount operation: %w", err))
 		}
 		operation = nil
+		if failClosedReason != "" {
+			return e.fail("mount", fmt.Errorf("mount failed closed: %s", failClosedReason))
+		}
 		return 0
 
 	default:
@@ -3225,15 +3530,16 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		return e.fail("mounts", err)
 	}
 	type mountRow struct {
-		MountPath    string   `json:"mountPath"`
-		VolumeID     string   `json:"volumeId"`
-		Branch       string   `json:"branch"`
-		PID          int      `json:"pid"`
-		Strategy     string   `json:"strategy"`
-		AuthorityURL string   `json:"authorityUrl,omitempty"`
-		AttachRef    string   `json:"attachRef,omitempty"`
-		StartedAtMs  int64    `json:"startedAtMs"`
-		LocalDirs    []string `json:"localDirs,omitempty"`
+		MountPath              string   `json:"mountPath"`
+		VolumeID               string   `json:"volumeId"`
+		Branch                 string   `json:"branch"`
+		PID                    int      `json:"pid"`
+		Strategy               string   `json:"strategy"`
+		AuthorityURL           string   `json:"authorityUrl,omitempty"`
+		AttachRef              string   `json:"attachRef,omitempty"`
+		AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
+		StartedAtMs            int64    `json:"startedAtMs"`
+		LocalDirs              []string `json:"localDirs,omitempty"`
 		// LocalRoutes and LocalRouteRevision are the machine-local route set
 		// a FUSE mount activated and the revision it answers for.
 		LocalRoutes        []string `json:"localRoutes,omitempty"`
@@ -3254,8 +3560,15 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// CleanupRequired marks a durable operation intent with no matching
 		// mount-state record. It is deliberately a first-class inventory row:
 		// crash recovery must never disappear from the CLI or app view.
-		CleanupRequired bool   `json:"cleanupRequired,omitempty"`
-		OperationPhase  string `json:"operationPhase,omitempty"`
+		CleanupRequired           bool   `json:"cleanupRequired,omitempty"`
+		OperationPhase            string `json:"operationPhase,omitempty"`
+		MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
+		EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
+		AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
+		LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
+		NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
+		ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
+		ReauthorizationError      string `json:"reauthorizationError,omitempty"`
 	}
 	var daemonView map[string]cliAttachStatus
 	for i := range states {
@@ -3276,25 +3589,39 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// needs it for renewal. Never embed that persistence object in a
 		// presentation type: JSON output is routinely captured in agent logs.
 		row := mountRow{
-			MountPath:          st.MountPath,
-			VolumeID:           st.VolumeID,
-			Branch:             st.Branch,
-			PID:                st.PID,
-			Strategy:           st.Strategy,
-			AuthorityURL:       st.AuthorityURL,
-			AttachRef:          st.AttachRef,
-			StartedAtMs:        st.StartedAtMs,
-			LocalDirs:          st.LocalDirs,
-			LocalRoutes:        st.LocalRoutes,
-			LocalRouteRevision: st.LocalRouteRevision,
-			Alive:              mountProcessMatches(st),
-			Status:             st.Status,
-			Health:             e.classifyMount(st),
-			StatusChangedAtMs:  st.StatusChangedAtMs,
+			MountPath:              st.MountPath,
+			VolumeID:               st.VolumeID,
+			Branch:                 st.Branch,
+			PID:                    st.PID,
+			Strategy:               st.Strategy,
+			AuthorityURL:           st.AuthorityURL,
+			AttachRef:              st.AttachRef,
+			AuthorizationSessionID: st.AuthorizationSessionID,
+			StartedAtMs:            st.StartedAtMs,
+			LocalDirs:              st.LocalDirs,
+			LocalRoutes:            st.LocalRoutes,
+			LocalRouteRevision:     st.LocalRouteRevision,
+			Alive:                  mountProcessMatches(st),
+			Status:                 st.Status,
+			Health:                 e.classifyMount(st),
+			StatusChangedAtMs:      st.StatusChangedAtMs,
+			MountEnrollmentID:      st.MountEnrollmentID, EnrollmentExpiresAtMs: st.EnrollmentExpiresAtMs,
+			AuthorizationDeadlineAtMs: st.AuthorizationDeadlineAtMs, LastReauthorizationAtMs: st.LastReauthorizationAtMs,
+			NextReauthorizationAtMs: st.NextReauthorizationAtMs, ReauthorizationFailures: st.ReauthorizationFailures,
+			ReauthorizationError: st.ReauthorizationError,
 		}
 		if a, ok := daemonView[states[i].AttachRef]; ok {
 			row.AttachState = a.State
 			row.AttachError = a.LastError
+			if a.MountEnrollmentID != "" {
+				row.MountEnrollmentID = a.MountEnrollmentID
+				row.EnrollmentExpiresAtMs = a.EnrollmentExpiresAtMs
+				row.AuthorizationDeadlineAtMs = a.AuthorizationDeadlineAtMs
+				row.LastReauthorizationAtMs = a.LastReauthorizationAtMs
+				row.NextReauthorizationAtMs = a.NextReauthorizationAtMs
+				row.ReauthorizationFailures = a.ReauthorizationFailures
+				row.ReauthorizationError = a.ReauthorizationError
+			}
 		}
 		rows = append(rows, row)
 	}

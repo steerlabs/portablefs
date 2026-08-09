@@ -88,6 +88,45 @@ func TestValidateDirectV3MountOptsAcceptsTheDocumentedShape(t *testing.T) {
 	}
 }
 
+func TestValidateDirectV3MountOptsRefusesPartialOrExpiredAutomaticEnrollment(t *testing.T) {
+	o := v3MountOpts(t)
+	o.managerURL = "https://manager.example"
+	if _, err := validateDirectV3MountOpts(o, noEnv); err == nil || !strings.Contains(err.Error(), "requires --manager-url") {
+		t.Fatalf("partial automatic enrollment = %v", err)
+	}
+
+	now := time.Now()
+	o.managerServerName = "manager.example"
+	o.managerCAPath = "/manager-ca.pem"
+	o.enrollmentID = "22222222-2222-4222-8222-222222222222"
+	o.enrollmentCertPath = "/enrollment.pem"
+	o.authorityGeneration = 7
+	o.authExpiresAtMs = now.Add(time.Minute).UnixMilli()
+	o.enrollmentExpiresAtMs = now.Add(30 * time.Second).UnixMilli()
+	if _, err := validateDirectV3MountOpts(o, noEnv); err == nil || !strings.Contains(err.Error(), "outliving") {
+		t.Fatalf("enrollment shorter than grant = %v", err)
+	}
+}
+
+func TestAutomaticEnrollmentClosesOnlyBeforeOwnershipOrAfterExactCleanup(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		ownerEstablished bool
+		cleanupComplete  bool
+		want             bool
+	}{
+		{name: "not handed to mount owner", want: true},
+		{name: "live owner and unproven cleanup", ownerEstablished: true, want: false},
+		{name: "owner proven terminal", ownerEstablished: true, cleanupComplete: true, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := automaticEnrollmentCanCloseAfterStartupFailure(test.ownerEstablished, test.cleanupComplete); got != test.want {
+				t.Fatalf("close policy = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 // TestValidateDirectV3MountOptsNamesEveryMissingPiece pins that each refusal
 // names the exact flag the caller must add — the errors are the migration
 // path off the manager/lease flow, so their content is the contract.

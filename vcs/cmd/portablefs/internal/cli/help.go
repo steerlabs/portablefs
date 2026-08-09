@@ -33,6 +33,7 @@ MOUNTS (this machine)
   mount <volumeId> <path>      attach the live volume through the v3 authority
                                (FSKit on macOS, FUSE on Linux; direct credentials
                                required — see help mount)
+  reauthorize <path>           rotate a hosted mount's exact live authorization
   umount <path>                drain and detach one mounted volume
   mounts                       list this machine's mounts and their health
   route <path>                 is this path machine-local or shared, and by which rule
@@ -50,6 +51,7 @@ FLAGS (every command)
 
 ENVIRONMENT
   PORTABLEFS_MOUNT_TOKEN      single-use volume mount capability for ` + "`mount --addr`" + `
+                              or manager-issued live reauthorization capability
 
 Run ` + "`portablefs help <command>`" + ` for details and examples.
 `
@@ -58,6 +60,24 @@ Run ` + "`portablefs help <command>`" + ` for details and examples.
 // commandHelp returns detailed, example-driven help for one command.
 func commandHelp(name string) (string, bool) {
 	texts := map[string]string{
+		"reauthorize": `USAGE
+  PORTABLEFS_MOUNT_TOKEN=<manager-issued capability> portablefs reauthorize <mountPath>
+    --client-cert renewed-client.pem --auth-expires-at-ms <unix-ms>
+    --auth-sequence <positive-sequence> [--json]
+
+Rotate the signed authorization and mutual-TLS certificate underneath one
+exact live hosted mount. The manager binds the capability to the mount's
+non-secret authorizationSessionId and assigns the exact next sequence. Linux
+delivers it to the uid-owned mount supervisor over a private local socket;
+macOS delivers it to portablefsd. The capability is accepted only through the
+environment so it never appears in process arguments, and is never persisted.
+
+This command does not mint credentials, broaden access, remount, or create a
+replacement authority session. A mount created by an older CLI without an
+authorizationSessionId must be mounted once with the current CLI. A mount
+created with automatic Manager enrollment has one internal sequencer and
+refuses this manual path.
+`,
 		"daemon": `USAGE
   portablefs daemon stop [--json]
 
@@ -125,6 +145,11 @@ EXAMPLES
                    --data-plane-transport tls-private-ca|tls-system-pki
                    --data-plane-server-name name [--data-plane-ca ca.pem]
                    --client-cert cert.pem --client-key key.pem
+                   [--manager-url https://manager --manager-server-name name
+                    --manager-ca manager-ca.pem --mount-enrollment-id id
+                    --mount-enrollment-cert enrollment.pem
+                    --mount-enrollment-expires-at-ms ms
+                    --authority-generation n --auth-expires-at-ms ms]
                    [--coherence strict|uncached] [--no-local-dirs]
                    [--strategy auto|fskit|fuse] [--foreground] [--json]
 
@@ -140,11 +165,12 @@ tls-system-pki with --data-plane-server-name, or tls-private-ca with that
 name plus --data-plane-ca), and the manager-issued mutual-TLS client
 identity (--client-cert/--client-key; the key must be chmod 600). v3
 authority sessions are mutually authenticated TLS 1.3, so plaintext cannot
-mount. This direct CLI does not call the optional hosted manager: credentials
-are supplied by the deployment (see docs/xfs-authority-deployment.md), and an
-invocation missing any of the direct-credential flags is refused with the
-missing flags named. A v3 volume is branchless: the retired --branch flag is
-an error.
+mount. Standalone credentials may be supplied directly by the deployment. A
+hosted product may additionally pass the complete Manager enrollment group
+shown above. The Linux mount supervisor or macOS portablefsd then refreshes
+short-lived grants inside the same authority session. The group is all-or-none,
+has exactly one renewal owner, and never falls back to manual renewal. A v3
+volume is branchless: the retired --branch flag is an error.
 
 There is no PortableFS-managed or offline write-back layer. Linux direct-I/O
 write(2) returns after the authority has applied the bytes to XFS. On macOS,
@@ -229,9 +255,11 @@ and no umount path — including --force — ever reads standard input.
 
 List this machine's recorded mounts with their health: live (daemon serving),
 stale (daemon gone; umount cleans up), or credential-expired (the daemon is
-running but this mount's credential ended). A v3 mount capability is single-use
-and the direct CLI does not acquire hosted reauthorization, so mounting again
-with a fresh capability is what re-establishes one. The mount log under
+running but this mount's credential ended). A v3 mount capability is single-use.
+A hosted enrolled mount refreshes automatically before its safety cutoff.
+Standalone hosted integrations can call portablefs reauthorize explicitly;
+once the credential is already expired, a new capability and remount is
+required. The mount log under
 ~/.local/state/portablefs/mounts/ carries the daemon's own reason.
 `,
 		"mount-check": `USAGE
