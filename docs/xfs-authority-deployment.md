@@ -327,6 +327,12 @@ JSON payload with these claims:
 | `peer_spki_sha256` | base64url SHA-256 of the client certificate's SPKI |
 | `nonce` | makes the capability single-use |
 
+An automatic in-session grant additionally carries `mount_enrollment_id`, the
+exact authority session ID, and its monotonic sequence. It omits the expired
+product token: the Manager signature attests that the durable, originally
+product-authorized enrollment is still active. This basis is never accepted for
+an initial attach.
+
 The authority enforces the window against `--capability-max-lifetime`
 regardless of what was signed, so one minting mistake cannot produce a
 capability nothing can revoke. It retains accepted nonces until they expire and
@@ -358,9 +364,11 @@ audit, or revocation story.
 
 The hosted `portablefs-manager` implements grant minting bound to a locally
 generated client key, byte-identical idempotency receipts, independent product
-and infrastructure signatures, and in-session reauthorization that may extend
-a deadline but never broaden access. The manager does not authenticate end users
-itself; it verifies the product's signed authorization. See
+and infrastructure signatures, and bounded key-scoped mount enrollments. The
+per-mount owner uses an enrollment to obtain exact, short-lived in-session
+reauthorizations without keeping the original product assertion alive. The
+manager does not authenticate end users itself; it verifies the product's
+signed authorization at enrollment creation. See
 [hosted-control-plane.md](./hosted-control-plane.md). A standalone mount still
 ends at its initial capability's deadline.
 

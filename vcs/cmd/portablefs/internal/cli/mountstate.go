@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,8 +60,21 @@ type mountState struct {
 	// AttachRef is the portablefsd attach this fskit mount serves (the
 	// release-scoped generic URL resource the kernel holds); umount
 	// diagnostics correlate on it.
-	AttachRef   string `json:"attachRef,omitempty"`
-	StartedAtMs int64  `json:"startedAtMs"`
+	AttachRef string `json:"attachRef,omitempty"`
+	// AuthorizationSessionID is the non-secret authority session identity a
+	// hosted product binds its exact next reauthorization grant to. The Linux
+	// supervisor additionally publishes a private local control socket; macOS
+	// routes the same operation through portablefsd's existing control socket.
+	AuthorizationSessionID       string `json:"authorizationSessionId,omitempty"`
+	ReauthorizationControlSocket string `json:"reauthorizationControlSocket,omitempty"`
+	MountEnrollmentID            string `json:"mountEnrollmentId,omitempty"`
+	EnrollmentExpiresAtMs        int64  `json:"enrollmentExpiresAtMs,omitempty"`
+	AuthorizationDeadlineAtMs    int64  `json:"authorizationDeadlineAtMs,omitempty"`
+	LastReauthorizationAtMs      int64  `json:"lastReauthorizationAtMs,omitempty"`
+	NextReauthorizationAtMs      int64  `json:"nextReauthorizationAtMs,omitempty"`
+	ReauthorizationFailures      uint64 `json:"reauthorizationFailures,omitempty"`
+	ReauthorizationError         string `json:"reauthorizationError,omitempty"`
+	StartedAtMs                  int64  `json:"startedAtMs"`
 	// LocalDirs are the machine-local graft roots an FSKit mount serves, as
 	// literal paths (the macOS daemon's shape).
 	LocalDirs         []string `json:"localDirs,omitempty"`
@@ -394,6 +408,9 @@ func validateMountStateRecord(path string, st *mountState) error {
 		default:
 			return fmt.Errorf("mount state %s has invalid FUSE mount mechanism %q", path, st.MountMechanism)
 		}
+		if st.ReauthorizationControlSocket != "" && !validAbsoluteCleanPath(st.ReauthorizationControlSocket) {
+			return fmt.Errorf("mount state %s has invalid reauthorization control socket", path)
+		}
 	case "fskit":
 		if st.Engine != "" && st.Engine != mountEngineDaemonV3 {
 			return fmt.Errorf("mount state %s has engine %q for an FSKit mount", path, st.Engine)
@@ -404,8 +421,31 @@ func validateMountStateRecord(path string, st *mountState) error {
 		if st.MountMechanism != "fskit-system" || st.FUSEHelperPath != "" {
 			return fmt.Errorf("mount state %s has invalid FSKit mount mechanism %q", path, st.MountMechanism)
 		}
+		if st.ReauthorizationControlSocket != "" {
+			return fmt.Errorf("mount state %s has a FUSE reauthorization socket for FSKit", path)
+		}
 	default:
 		return fmt.Errorf("mount state %s has invalid strategy %q", path, st.Strategy)
+	}
+	if st.AuthorizationSessionID != "" {
+		decoded, err := base64.RawURLEncoding.DecodeString(st.AuthorizationSessionID)
+		if err != nil || len(decoded) != 16 {
+			return fmt.Errorf("mount state %s has invalid authorization session identity", path)
+		}
+	}
+	if st.ReauthorizationControlSocket != "" && st.AuthorizationSessionID == "" {
+		return fmt.Errorf("mount state %s has reauthorization control without a session identity", path)
+	}
+	if st.MountEnrollmentID != "" {
+		if !validStateString(st.MountEnrollmentID, 256) || st.AuthorizationSessionID == "" ||
+			st.EnrollmentExpiresAtMs <= 0 || st.AuthorizationDeadlineAtMs <= 0 ||
+			st.LastReauthorizationAtMs < 0 || st.NextReauthorizationAtMs < 0 ||
+			st.ReauthorizationError != "" && !validStateString(st.ReauthorizationError, 2048) || st.ReauthorizationControlSocket != "" {
+			return fmt.Errorf("mount state %s has invalid automatic mount enrollment state", path)
+		}
+	} else if st.EnrollmentExpiresAtMs != 0 || st.AuthorizationDeadlineAtMs != 0 ||
+		st.LastReauthorizationAtMs != 0 || st.NextReauthorizationAtMs != 0 || st.ReauthorizationFailures != 0 || st.ReauthorizationError != "" {
+		return fmt.Errorf("mount state %s has renewal health without a mount enrollment", path)
 	}
 
 	if err := validatePersistedDataPlaneTransport(st); err != nil {

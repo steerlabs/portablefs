@@ -62,6 +62,11 @@ type Claims struct {
 	// The manager signs the infrastructure envelope around it; the authority
 	// verifies both signatures and the pinned owner/domain/issuer.
 	ProductAuthorization string `json:"product_authorization,omitempty"`
+	// MountEnrollmentID names a durable, key-bound Manager authorization.
+	// It is valid only for an in-session reauthorization; the authority trusts
+	// the Manager's short-lived envelope instead of requiring the original
+	// product decision to remain alive for the whole mount.
+	MountEnrollmentID string `json:"mount_enrollment_id,omitempty"`
 	// SessionID and Sequence are present only on an in-session
 	// reauthorization. They make retrying the same signed token harmless and
 	// make replay against any other session impossible.
@@ -218,7 +223,9 @@ func (a *Authorizer) verify(volumeID string, token []byte, peer [32]byte, sessio
 			return volumeserver.Authorization{}, [32]byte{}, err
 		}
 	}
-	return volumeserver.Authorization{Access: access, Deadline: time.Unix(claims.Expires, 0)}, sha256.Sum256(token), nil
+	return volumeserver.Authorization{
+		Access: access, Deadline: time.Unix(claims.Expires, 0), MountEnrollmentID: claims.MountEnrollmentID,
+	}, sha256.Sum256(token), nil
 }
 
 func (a *Authorizer) verifyHosted(claims Claims, peer [32]byte, now time.Time) error {
@@ -226,7 +233,7 @@ func (a *Authorizer) verifyHosted(claims Claims, peer [32]byte, now time.Time) e
 		a.AuthorizationDomain != "" || a.Owner != "" || a.CellID != "" ||
 		a.AuthorityID != "" || a.AuthorityGeneration != 0
 	if !configured {
-		if claims.ProductAuthorization != "" || claims.CellID != "" || claims.AuthorityID != "" || claims.AuthorityGeneration != 0 {
+		if claims.ProductAuthorization != "" || claims.MountEnrollmentID != "" || claims.CellID != "" || claims.AuthorityID != "" || claims.AuthorityGeneration != 0 {
 			return ErrInvalid
 		}
 		return nil
@@ -234,7 +241,27 @@ func (a *Authorizer) verifyHosted(claims Claims, peer [32]byte, now time.Time) e
 	if len(a.ProductPublicKey) != ed25519.PublicKeySize || a.ProductIssuer == "" || a.ProductAudience == "" ||
 		a.AuthorizationDomain == "" || a.Owner == "" || a.CellID == "" || a.AuthorityID == "" ||
 		a.AuthorityGeneration == 0 || claims.CellID != a.CellID || claims.AuthorityID != a.AuthorityID ||
-		claims.AuthorityGeneration != a.AuthorityGeneration || claims.ProductAuthorization == "" {
+		claims.AuthorityGeneration != a.AuthorityGeneration {
+		return ErrInvalid
+	}
+	if claims.MountEnrollmentID != "" {
+		if len(claims.MountEnrollmentID) > 256 || strings.TrimSpace(claims.MountEnrollmentID) != claims.MountEnrollmentID {
+			return ErrInvalid
+		}
+		if claims.SessionID != "" {
+			if claims.ProductAuthorization != "" || claims.Sequence == 0 {
+				return ErrInvalid
+			}
+			return nil
+		}
+		// The initial enrollment-owned attach still carries and verifies the
+		// product decision. Naming the enrollment here pins the sole issuer into
+		// the authority session before sequence one is requested.
+		if claims.Sequence != 0 || claims.ProductAuthorization == "" {
+			return ErrInvalid
+		}
+	}
+	if claims.ProductAuthorization == "" {
 		return ErrInvalid
 	}
 	verified, err := productauth.Verify(a.ProductPublicKey, []byte(claims.ProductAuthorization), productauth.Expectations{

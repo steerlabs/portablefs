@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -25,10 +27,12 @@ type ManagerConfig struct {
 	ProductIssuers        map[string]ed25519.PublicKey
 	AuthorityCA           *CertificateAuthority
 	ClientCA              *CertificateAuthority
+	EnrollmentCA          *CertificateAuthority
 	Now                   func() time.Time
 	ReleaseID             string
 	PlanLifetime          time.Duration
 	GrantLifetime         time.Duration
+	EnrollmentLifetime    time.Duration
 	ProductMaxLifetime    time.Duration
 	ClientCertLifetime    time.Duration
 	AuthorityCertLifetime time.Duration
@@ -44,14 +48,18 @@ type Manager struct {
 	heartbeats             map[string]CellHeartbeat
 }
 
+const mountEnrollmentRetention = 15 * time.Minute
+
 func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.Store == nil || len(cfg.PlanPrivateKey) != ed25519.PrivateKeySize ||
 		len(cfg.CapabilityPrivateKey) != ed25519.PrivateKeySize || len(cfg.ProductIssuers) == 0 ||
 		cfg.AuthorityCA == nil || cfg.AuthorityCA.Certificate == nil || cfg.AuthorityCA.Signer == nil ||
 		cfg.ClientCA == nil || cfg.ClientCA.Certificate == nil || cfg.ClientCA.Signer == nil || !validIdentity(cfg.ReleaseID) ||
+		cfg.EnrollmentCA == nil || cfg.EnrollmentCA.Certificate == nil || cfg.EnrollmentCA.Signer == nil ||
 		len(cfg.AuthorityCA.CertificatePEM) == 0 || len(cfg.AuthorityCA.CertificatePEM) > 4096 ||
 		len(cfg.ClientCA.CertificatePEM) == 0 || len(cfg.ClientCA.CertificatePEM) > 4096 ||
-		cfg.PlanLifetime <= 0 || cfg.GrantLifetime <= 0 || cfg.ProductMaxLifetime <= 0 ||
+		len(cfg.EnrollmentCA.CertificatePEM) == 0 || len(cfg.EnrollmentCA.CertificatePEM) > 4096 ||
+		cfg.PlanLifetime <= 0 || cfg.GrantLifetime <= 0 || cfg.EnrollmentLifetime <= cfg.GrantLifetime || cfg.ProductMaxLifetime <= 0 ||
 		cfg.ClientCertLifetime <= 0 || cfg.AuthorityCertLifetime <= 0 || cfg.ObservedStaleAfter <= 0 || cfg.ClockSkew < 0 {
 		return nil, ErrInvalid
 	}
@@ -61,6 +69,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	now := cfg.Now().UTC()
 	if now.IsZero() || now.Before(cfg.AuthorityCA.Certificate.NotBefore) || !now.Before(cfg.AuthorityCA.Certificate.NotAfter) ||
 		now.Before(cfg.ClientCA.Certificate.NotBefore) || !now.Before(cfg.ClientCA.Certificate.NotAfter) {
+		return nil, ErrInvalid
+	}
+	if now.Before(cfg.EnrollmentCA.Certificate.NotBefore) || !now.Before(cfg.EnrollmentCA.Certificate.NotAfter) {
 		return nil, ErrInvalid
 	}
 	for issuer, key := range cfg.ProductIssuers {
@@ -251,6 +262,7 @@ func (manager *Manager) RestartVolume(requestID string, request RestartVolumeReq
 		volume.PriorStrictFenced = false
 		volume.StrictFenceEvidence = ""
 		volume.UpdatedUnix = now
+		terminateVolumeEnrollments(state, volume.ID, "authority restart", now)
 		cell := state.Cells[volume.CellID]
 		manager.bumpPlan(&cell, now)
 		state.Cells[cell.ID] = cell
@@ -289,6 +301,7 @@ func (manager *Manager) RetireVolume(requestID string, request RetireVolumeReque
 		}
 		volume.State = VolumeRetired
 		volume.UpdatedUnix = now
+		terminateVolumeEnrollments(state, volume.ID, "volume retired", now)
 		cell := state.Cells[volume.CellID]
 		manager.bumpPlan(&cell, now)
 		state.Cells[cell.ID] = cell
@@ -299,6 +312,7 @@ func (manager *Manager) RetireVolume(requestID string, request RetireVolumeReque
 func (manager *Manager) updateVolume(requestID, operation string, request any, apply func(*State, *Volume, int64) error) (VolumeView, error) {
 	now := nowUnix(manager.cfg.Now)
 	raw, _, err := manager.cfg.Store.Transact(requestID, operation, request, now, func(state *State) (any, error) {
+		pruneMountEnrollments(state, now)
 		volumeID := ""
 		switch typed := request.(type) {
 		case RestartVolumeRequest:
@@ -367,7 +381,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 				cell.QuarantineReason = "cell reported an unassigned volume"
 				for id, assigned := range state.Volumes {
 					if assigned.CellID == cell.ID && assigned.State != VolumeRetired {
-						manager.quarantineVolume(&assigned, "cell reported an unassigned volume", now)
+						manager.quarantineVolume(state, &assigned, "cell reported an unassigned volume", now)
 						state.Volumes[id] = assigned
 					}
 				}
@@ -377,7 +391,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			if _, duplicate := seen[volume.ID]; duplicate {
 				cell.Health = CellQuarantined
 				cell.QuarantineReason = "cell reported a duplicate volume observation"
-				manager.quarantineVolume(&volume, "cell reported a duplicate volume observation", now)
+				manager.quarantineVolume(state, &volume, "cell reported a duplicate volume observation", now)
 				manager.bumpPlan(&cell, now)
 				state.Volumes[volume.ID] = volume
 				continue
@@ -385,7 +399,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			seen[volume.ID] = struct{}{}
 			if observed.ProjectID != volume.ProjectID || observed.ServiceUID != volume.ServiceUID ||
 				observed.ServiceGID != volume.ServiceGID || observed.ListenPort != volume.ListenPort {
-				manager.quarantineVolume(&volume, "observed isolation identifiers differ from the signed assignment", now)
+				manager.quarantineVolume(state, &volume, "observed isolation identifiers differ from the signed assignment", now)
 				manager.bumpPlan(&cell, now)
 				state.Volumes[volume.ID] = volume
 				cell.Health = CellQuarantined
@@ -393,7 +407,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			}
 			if observed.AuthorityGeneration != volume.AuthorityGeneration || observed.AuthorityRunning && !observed.Provisioned ||
 				observed.AuthorityRunning && observed.AuthorityAbsent {
-				manager.quarantineVolume(&volume, "observed authority identity or lifecycle state is impossible", now)
+				manager.quarantineVolume(state, &volume, "observed authority identity or lifecycle state is impossible", now)
 				manager.bumpPlan(&cell, now)
 				state.Volumes[volume.ID] = volume
 				cell.Health = CellQuarantined
@@ -418,7 +432,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			volume.LastObservedUnix = observation.ObservedUnix
 			if volume.State == VolumeProvisioning || volume.State == VolumeReady {
 				if observed.AuthorityCSRPEM != "" && volume.AuthorityCSRPEM != "" && observed.AuthorityCSRPEM != volume.AuthorityCSRPEM {
-					manager.quarantineVolume(&volume, "authority CSR changed within one authority generation", now)
+					manager.quarantineVolume(state, &volume, "authority CSR changed within one authority generation", now)
 					manager.bumpPlan(&cell, now)
 					cell.Health = CellQuarantined
 					state.Volumes[volume.ID] = volume
@@ -430,7 +444,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 					certificate, expires, err := manager.cfg.AuthorityCA.SignCSR([]byte(observed.AuthorityCSRPEM), volume.AuthorityID,
 						[]string{volume.AuthorityServerName}, false, nowTime, manager.cfg.AuthorityCertLifetime)
 					if err != nil {
-						manager.quarantineVolume(&volume, "authority CSR proof of possession is invalid", now)
+						manager.quarantineVolume(state, &volume, "authority CSR proof of possession is invalid", now)
 						manager.bumpPlan(&cell, now)
 						cell.Health = CellQuarantined
 						state.Volumes[volume.ID] = volume
@@ -463,6 +477,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 					break
 				}
 				if observed.AuthorityAbsent && volume.PriorStrictFenced {
+					terminateVolumeEnrollments(state, volume.ID, "authority generation changed", now)
 					volume.AuthorityGeneration++
 					volume.AuthorityCSRPEM = ""
 					volume.AuthorityCertificate = ""
@@ -481,7 +496,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			if _, present := seen[id]; !present {
 				cell.Health = CellQuarantined
 				cell.QuarantineReason = "cell omitted an assigned volume observation"
-				manager.quarantineVolume(&volume, "cell omitted an assigned volume observation", now)
+				manager.quarantineVolume(state, &volume, "cell omitted an assigned volume observation", now)
 				manager.bumpPlan(&cell, now)
 				state.Volumes[id] = volume
 			}
@@ -601,7 +616,7 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 }
 
 func (manager *Manager) IssueMount(requestID string, request IssueMountRequest) (MountAuthorization, error) {
-	return manager.issueMount(requestID, "issue-mount", request.VolumeID, request.ProductAuthorization, request.ClientCSRPEM, request.Access, "", 0, request)
+	return manager.issueMount(requestID, "issue-mount", request.VolumeID, request.ProductAuthorization, request.ClientCSRPEM, request.Access, "", 0, request, request.AutomaticReauthorization)
 }
 
 func (manager *Manager) ReauthorizeMount(requestID string, request ReauthorizeMountRequest) (MountAuthorization, error) {
@@ -612,10 +627,10 @@ func (manager *Manager) ReauthorizeMount(requestID string, request ReauthorizeMo
 	if err != nil || len(session) != 16 {
 		return MountAuthorization{}, ErrInvalid
 	}
-	return manager.issueMount(requestID, "reauthorize-mount", request.VolumeID, request.ProductAuthorization, request.ClientCSRPEM, request.Access, request.SessionID, request.Sequence, request)
+	return manager.issueMount(requestID, "reauthorize-mount", request.VolumeID, request.ProductAuthorization, request.ClientCSRPEM, request.Access, request.SessionID, request.Sequence, request, false)
 }
 
-func (manager *Manager) issueMount(requestID, operation, volumeID, productToken, csrPEM string, access []string, sessionID string, sequence uint64, request any) (MountAuthorization, error) {
+func (manager *Manager) issueMount(requestID, operation, volumeID, productToken, csrPEM string, access []string, sessionID string, sequence uint64, request any, createEnrollment bool) (MountAuthorization, error) {
 	if !cellplan.ValidID(volumeID) || productToken == "" || csrPEM == "" || !validAccess(access) {
 		return MountAuthorization{}, ErrInvalid
 	}
@@ -626,6 +641,7 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 	nowTime := manager.cfg.Now().UTC()
 	now := nowTime.Unix()
 	raw, _, err := manager.cfg.Store.Transact(requestID, operation, request, now, func(state *State) (any, error) {
+		pruneMountEnrollments(state, now)
 		for key, nonce := range state.AuthorizationNonces {
 			if nonce.ExpiresUnix <= now {
 				delete(state.AuthorizationNonces, key)
@@ -638,6 +654,20 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 		cell := state.Cells[volume.CellID]
 		if volume.State != VolumeReady || cell.Health != CellHealthy || !manager.cellFresh(cell, now) {
 			return nil, ErrConflict
+		}
+		// Once an enrollment binds sequence one, Manager refuses another issuer
+		// for that exact session. An unbound enrollment cannot identify a session;
+		// treating it as volume-wide ownership would let an abandoned enrollment
+		// deny renewal to every unrelated mount. The authority already pins the
+		// enrollment ID at initial attach and refuses a wrong issuer without
+		// fencing, which closes that pre-bind race without a volume-wide lockout.
+		if sessionID != "" {
+			for _, enrollment := range state.MountEnrollments {
+				if enrollment.State == MountEnrollmentActive && now < enrollment.ExpiresUnix &&
+					enrollment.VolumeID == volumeID && enrollment.SessionID == sessionID {
+					return nil, ErrConflict
+				}
+			}
 		}
 		productKey := manager.cfg.ProductIssuers[volume.ProductIssuer]
 		verified, err := productauth.Verify(productKey, []byte(productToken), productauth.Expectations{
@@ -657,6 +687,27 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 		if productExpiry := time.Unix(verified.Claims.Expires, 0); productExpiry.Before(expires) {
 			expires = productExpiry
 		}
+		var enrollmentID, enrollmentCertificate string
+		var enrollmentExpires time.Time
+		if createEnrollment {
+			if err := admitMountEnrollment(state, volume); err != nil {
+				return nil, err
+			}
+			enrollmentID = newUUID()
+			identity, err := url.Parse("spiffe://portablefs/mount-enrollment/" + enrollmentID)
+			if err != nil {
+				return nil, err
+			}
+			enrollmentCertificate, enrollmentExpires, err = manager.cfg.EnrollmentCA.SignClientCSR(
+				[]byte(csrPEM), enrollmentID, identity, nowTime, manager.cfg.EnrollmentLifetime,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !enrollmentExpires.After(expires) {
+				return nil, errors.New("mount enrollment CA cannot issue an enrollment that outlives the initial grant")
+			}
+		}
 		clientName := base64.RawURLEncoding.EncodeToString(peer[:])
 		certificate, certificateExpires, err := manager.cfg.ClientCA.SignCSR([]byte(csrPEM), clientName, nil, true, nowTime, manager.cfg.ClientCertLifetime)
 		if err != nil {
@@ -667,24 +718,200 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 			NotBefore: nowTime.Add(-manager.cfg.ClockSkew).Unix(), Expires: expires.Unix(),
 			PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: newNonce(),
 			CellID: volume.CellID, AuthorityID: volume.AuthorityID, AuthorityGeneration: volume.AuthorityGeneration,
-			ProductAuthorization: productToken, SessionID: sessionID, Sequence: sequence,
+			ProductAuthorization: productToken, MountEnrollmentID: enrollmentID, SessionID: sessionID, Sequence: sequence,
 		}
 		capability, err := volumecap.Sign(manager.cfg.CapabilityPrivateKey, claims)
 		if err != nil {
 			return nil, err
 		}
-		return MountAuthorization{
+		authorization := MountAuthorization{
 			VolumeID: volume.ID, AuthorityEndpoint: net.JoinHostPort(cell.AuthorityHost, fmt.Sprint(volume.ListenPort)),
 			AuthorityServerName: volume.AuthorityServerName, AuthorityCAPEM: manager.cfg.AuthorityCA.CertificatePEM,
 			ClientCertificatePEM: certificate, Capability: string(capability), Access: append([]string(nil), access...),
 			ExpiresUnix: expires.Unix(), CertificateExpiresUnix: certificateExpires.Unix(), AuthorityGeneration: volume.AuthorityGeneration,
 			SessionID: sessionID, Sequence: sequence, ReleaseID: manager.cfg.ReleaseID,
-		}, nil
+		}
+		if createEnrollment {
+			if state.MountEnrollments == nil {
+				state.MountEnrollments = make(map[string]MountEnrollment)
+			}
+			state.MountEnrollments[enrollmentID] = MountEnrollment{
+				ID: enrollmentID, VolumeID: volume.ID, Subject: verified.Claims.Subject, Owner: volume.Owner,
+				Access: append([]string(nil), access...), PeerSPKI: hex.EncodeToString(peer[:]),
+				AuthorizationDomain: volume.AuthorizationDomain, ProductIssuer: volume.ProductIssuer,
+				CellID: volume.CellID, AuthorityID: volume.AuthorityID, AuthorityGeneration: volume.AuthorityGeneration,
+				CreatedUnix: now, ExpiresUnix: enrollmentExpires.Unix(), State: MountEnrollmentActive, UpdatedUnix: now,
+			}
+			authorization.EnrollmentID = enrollmentID
+			authorization.EnrollmentCertificatePEM = enrollmentCertificate
+			authorization.EnrollmentExpiresUnix = enrollmentExpires.Unix()
+		}
+		return authorization, nil
 	})
 	if err != nil {
 		return MountAuthorization{}, err
 	}
 	return decode[MountAuthorization](raw)
+}
+
+// RefreshMountEnrollment mints the exact next short-lived grant for one live
+// session. The durable (session, sequence, request digest) tuple is the
+// idempotency boundary, so an HTTP retry remains safe even if its transport
+// idempotency key changes.
+func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, request RefreshMountEnrollmentRequest) (MountAuthorization, error) {
+	if !validIdentity(requestID) || !cellplan.ValidID(enrollmentID) || request.ClientCSRPEM == "" || request.Sequence == 0 {
+		return MountAuthorization{}, ErrInvalid
+	}
+	session, err := base64.RawURLEncoding.DecodeString(request.SessionID)
+	if err != nil || len(session) != 16 {
+		return MountAuthorization{}, ErrInvalid
+	}
+	peer, err := ParseCSRSPKI([]byte(request.ClientCSRPEM))
+	if err != nil {
+		return MountAuthorization{}, err
+	}
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		return MountAuthorization{}, err
+	}
+	requestSHA := sha256.Sum256(requestBytes)
+	requestDigest := hex.EncodeToString(requestSHA[:])
+	nowTime := manager.cfg.Now().UTC()
+	now := nowTime.Unix()
+	raw, err := manager.cfg.Store.TransactNatural("refresh-mount-enrollment", now, func(state *State) (any, bool, error) {
+		pruned := pruneMountEnrollments(state, now)
+		enrollment, ok := state.MountEnrollments[enrollmentID]
+		if !ok {
+			return nil, false, ErrNotFound
+		}
+		volume, volumeOK := state.Volumes[enrollment.VolumeID]
+		cell, cellOK := state.Cells[enrollment.CellID]
+		if enrollment.State != MountEnrollmentActive || now >= enrollment.ExpiresUnix || !volumeOK ||
+			volume.AuthorityGeneration != enrollment.AuthorityGeneration || volume.AuthorityID != enrollment.AuthorityID {
+			return nil, false, ErrEnrollmentEnded
+		}
+		if !cellOK || volume.State != VolumeReady || cell.Health != CellHealthy || !manager.cellFresh(cell, now) {
+			return nil, false, ErrConflict
+		}
+		if enrollment.PeerSPKI != hex.EncodeToString(peer[:]) {
+			return nil, false, ErrInvalid
+		}
+		if enrollment.SessionID == "" {
+			if request.Sequence != 1 {
+				return nil, false, ErrConflict
+			}
+			enrollment.SessionID = request.SessionID
+		} else if enrollment.SessionID != request.SessionID {
+			return nil, false, ErrConflict
+		}
+		if request.Sequence == enrollment.LastSequence {
+			if enrollment.LastRequestSHA256 != requestDigest || enrollment.LastAuthorization == nil {
+				return nil, false, ErrConflict
+			}
+			context, ok := state.MountAuthorizationContexts[enrollment.LastAuthorizationContext]
+			if !ok {
+				return nil, false, ErrInvalid
+			}
+			return replayMountAuthorization(enrollment, *enrollment.LastAuthorization, context), pruned, nil
+		}
+		if request.Sequence != enrollment.LastSequence+1 {
+			return nil, false, ErrConflict
+		}
+		if request.Sequence > 1 && now < enrollment.UpdatedUnix+minimumEnrollmentRefreshInterval(manager.cfg.GrantLifetime) {
+			return nil, false, ErrConflict
+		}
+		expires := nowTime.Add(manager.cfg.GrantLifetime)
+		if enrollmentExpiry := time.Unix(enrollment.ExpiresUnix, 0); enrollmentExpiry.Before(expires) {
+			expires = enrollmentExpiry
+		}
+		clientName := base64.RawURLEncoding.EncodeToString(peer[:])
+		certificate, certificateExpires, err := manager.cfg.ClientCA.SignCSR(
+			[]byte(request.ClientCSRPEM), clientName, nil, true, nowTime, manager.cfg.ClientCertLifetime,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		claims := volumecap.Claims{
+			VolumeID: enrollment.VolumeID, Subject: enrollment.Subject, Access: append([]string(nil), enrollment.Access...),
+			NotBefore: nowTime.Add(-manager.cfg.ClockSkew).Unix(), Expires: expires.Unix(),
+			PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: newNonce(),
+			CellID: enrollment.CellID, AuthorityID: enrollment.AuthorityID, AuthorityGeneration: enrollment.AuthorityGeneration,
+			MountEnrollmentID: enrollment.ID, SessionID: request.SessionID, Sequence: request.Sequence,
+		}
+		capability, err := volumecap.Sign(manager.cfg.CapabilityPrivateKey, claims)
+		if err != nil {
+			return nil, false, err
+		}
+		authorization := MountAuthorization{
+			VolumeID: enrollment.VolumeID, AuthorityEndpoint: net.JoinHostPort(cell.AuthorityHost, fmt.Sprint(volume.ListenPort)),
+			AuthorityServerName: volume.AuthorityServerName, AuthorityCAPEM: manager.cfg.AuthorityCA.CertificatePEM,
+			ClientCertificatePEM: certificate, Capability: string(capability), Access: append([]string(nil), enrollment.Access...),
+			ExpiresUnix: expires.Unix(), CertificateExpiresUnix: certificateExpires.Unix(), AuthorityGeneration: enrollment.AuthorityGeneration,
+			SessionID: request.SessionID, Sequence: request.Sequence, ReleaseID: manager.cfg.ReleaseID,
+		}
+		enrollment.LastSequence = request.Sequence
+		enrollment.LastRequestSHA256 = requestDigest
+		replay := MountAuthorizationReplay{
+			AuthorityEndpoint: authorization.AuthorityEndpoint, AuthorityServerName: authorization.AuthorityServerName,
+			ClientCertificatePEM: authorization.ClientCertificatePEM, Capability: authorization.Capability,
+			ExpiresUnix: authorization.ExpiresUnix, CertificateExpiresUnix: authorization.CertificateExpiresUnix,
+			SessionID: authorization.SessionID, Sequence: authorization.Sequence,
+		}
+		context := MountAuthorizationContext{AuthorityCAPEM: authorization.AuthorityCAPEM, ReleaseID: authorization.ReleaseID}
+		contextID := mountAuthorizationContextID(context)
+		if state.MountAuthorizationContexts == nil {
+			state.MountAuthorizationContexts = make(map[string]MountAuthorizationContext)
+		}
+		state.MountAuthorizationContexts[contextID] = context
+		enrollment.LastAuthorization = &replay
+		enrollment.LastAuthorizationContext = contextID
+		enrollment.UpdatedUnix = now
+		state.MountEnrollments[enrollmentID] = enrollment
+		pruneMountAuthorizationContexts(state)
+		return authorization, true, nil
+	})
+	if err != nil {
+		return MountAuthorization{}, err
+	}
+	return decode[MountAuthorization](raw)
+}
+
+func (manager *Manager) CloseMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest) (MountEnrollment, error) {
+	return manager.terminateMountEnrollment(requestID, enrollmentID, request, MountEnrollmentClosed)
+}
+
+func (manager *Manager) RevokeMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest) (MountEnrollment, error) {
+	return manager.terminateMountEnrollment(requestID, enrollmentID, request, MountEnrollmentRevoked)
+}
+
+func (manager *Manager) terminateMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest, target MountEnrollmentState) (MountEnrollment, error) {
+	if !validIdentity(requestID) || !cellplan.ValidID(enrollmentID) || !validIdentity(request.Reason) ||
+		target != MountEnrollmentClosed && target != MountEnrollmentRevoked {
+		return MountEnrollment{}, ErrInvalid
+	}
+	now := nowUnix(manager.cfg.Now)
+	raw, err := manager.cfg.Store.TransactNatural("terminate-mount-enrollment", now, func(state *State) (any, bool, error) {
+		pruned := pruneMountEnrollments(state, now)
+		enrollment, ok := state.MountEnrollments[enrollmentID]
+		if !ok {
+			return nil, false, ErrNotFound
+		}
+		if enrollment.State != MountEnrollmentActive {
+			// The first terminal decision and reason are the durable audit fact.
+			// Later close/revoke retries are hygiene and return that exact fact
+			// without another state record or a reason-dependent conflict.
+			return enrollment, pruned, nil
+		}
+		enrollment.State = target
+		enrollment.TerminationReason = request.Reason
+		enrollment.UpdatedUnix = now
+		state.MountEnrollments[enrollmentID] = enrollment
+		return enrollment, true, nil
+	})
+	if err != nil {
+		return MountEnrollment{}, err
+	}
+	return decode[MountEnrollment](raw)
 }
 
 func (manager *Manager) ReleaseIdentity() string  { return manager.cfg.ReleaseID }
@@ -697,10 +924,115 @@ func (manager *Manager) bumpPlan(cell *Cell, now int64) {
 	cell.PlanExpiresUnix = now + int64(manager.cfg.PlanLifetime/time.Second)
 }
 
-func (manager *Manager) quarantineVolume(volume *Volume, reason string, now int64) {
+func (manager *Manager) quarantineVolume(state *State, volume *Volume, reason string, now int64) {
+	terminateVolumeEnrollments(state, volume.ID, reason, now)
 	volume.State = VolumeQuarantined
 	volume.QuarantineReason = reason
 	volume.UpdatedUnix = now
+}
+
+func terminateVolumeEnrollments(state *State, volumeID, reason string, now int64) {
+	for id, enrollment := range state.MountEnrollments {
+		if enrollment.VolumeID != volumeID || enrollment.State != MountEnrollmentActive {
+			continue
+		}
+		enrollment.State = MountEnrollmentRevoked
+		enrollment.TerminationReason = reason
+		enrollment.UpdatedUnix = now
+		state.MountEnrollments[id] = enrollment
+	}
+}
+
+func admitMountEnrollment(state *State, volume Volume) error {
+	activeTotal, activeAuthorizationDomain, activeVolume := 0, 0, 0
+	for _, enrollment := range state.MountEnrollments {
+		if enrollment.State != MountEnrollmentActive {
+			continue
+		}
+		activeTotal++
+		if enrollment.AuthorizationDomain == volume.AuthorizationDomain {
+			activeAuthorizationDomain++
+		}
+		if enrollment.VolumeID == volume.ID {
+			activeVolume++
+		}
+	}
+	if activeTotal >= MaxActiveMountEnrollments || activeAuthorizationDomain >= MaxActiveMountEnrollmentsPerAuthorizationDomain ||
+		activeVolume >= MaxActiveMountEnrollmentsPerVolume {
+		return ErrEnrollmentCapacity
+	}
+	for len(state.MountEnrollments) >= MaxRetainedMountEnrollments {
+		oldestID := ""
+		var oldestUpdated int64
+		for id, enrollment := range state.MountEnrollments {
+			if enrollment.State == MountEnrollmentActive {
+				continue
+			}
+			if oldestID == "" || enrollment.UpdatedUnix < oldestUpdated ||
+				enrollment.UpdatedUnix == oldestUpdated && id < oldestID {
+				oldestID, oldestUpdated = id, enrollment.UpdatedUnix
+			}
+		}
+		if oldestID == "" {
+			return ErrEnrollmentCapacity
+		}
+		delete(state.MountEnrollments, oldestID)
+	}
+	pruneMountAuthorizationContexts(state)
+	return nil
+}
+
+func replayMountAuthorization(
+	enrollment MountEnrollment,
+	replay MountAuthorizationReplay,
+	context MountAuthorizationContext,
+) MountAuthorization {
+	return MountAuthorization{
+		VolumeID: enrollment.VolumeID, AuthorityEndpoint: replay.AuthorityEndpoint,
+		AuthorityServerName: replay.AuthorityServerName, AuthorityCAPEM: context.AuthorityCAPEM,
+		ClientCertificatePEM: replay.ClientCertificatePEM, Capability: replay.Capability,
+		Access: append([]string(nil), enrollment.Access...), ExpiresUnix: replay.ExpiresUnix,
+		CertificateExpiresUnix: replay.CertificateExpiresUnix, AuthorityGeneration: enrollment.AuthorityGeneration,
+		SessionID: replay.SessionID, Sequence: replay.Sequence, ReleaseID: context.ReleaseID,
+	}
+}
+
+func pruneMountEnrollments(state *State, now int64) bool {
+	retention := int64(mountEnrollmentRetention / time.Second)
+	changed := false
+	for id, enrollment := range state.MountEnrollments {
+		if enrollment.State == MountEnrollmentActive && enrollment.ExpiresUnix <= now ||
+			enrollment.State != MountEnrollmentActive && enrollment.UpdatedUnix+retention <= now {
+			delete(state.MountEnrollments, id)
+			changed = true
+		}
+	}
+	return pruneMountAuthorizationContexts(state) || changed
+}
+
+func pruneMountAuthorizationContexts(state *State) bool {
+	referenced := make(map[string]struct{})
+	for _, enrollment := range state.MountEnrollments {
+		if enrollment.LastAuthorizationContext != "" {
+			referenced[enrollment.LastAuthorizationContext] = struct{}{}
+		}
+	}
+	changed := false
+	for id := range state.MountAuthorizationContexts {
+		if _, ok := referenced[id]; !ok {
+			delete(state.MountAuthorizationContexts, id)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func minimumEnrollmentRefreshInterval(grantLifetime time.Duration) int64 {
+	seconds := int64(grantLifetime / (4 * time.Second))
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func validAccess(access []string) bool {

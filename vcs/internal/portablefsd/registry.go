@@ -114,7 +114,14 @@ type attachStatus struct {
 	// permanently. The mount supervisor's revocation watchdog branches on it:
 	// a terminal session can never repair the kernel's caches again, so the
 	// kernel mount must be made unservable within the repair budget.
-	SessionTerminal bool `json:"sessionTerminal,omitempty"`
+	SessionTerminal           bool   `json:"sessionTerminal,omitempty"`
+	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
+	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
+	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
+	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
+	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
+	ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
+	ReauthorizationError      string `json:"reauthorizationError,omitempty"`
 }
 
 type registry struct {
@@ -1179,11 +1186,16 @@ type attach struct {
 	// contract; assigned before registration, never mutated (see v3attach.go).
 	// v3Data/v3Session are that attach's live data plane and authority session,
 	// installed by startV3 and guarded by mu.
-	v3Config  *v3AttachConfig
-	v3Data    *v3DataPlane
-	v3Session v3AuthoritySession
-	state     pfslocal.AttachStateState
-	lastErr   string
+	v3Config                  *v3AttachConfig
+	v3Data                    *v3DataPlane
+	v3Session                 v3AuthoritySession
+	authorizationDeadlineAtMs int64
+	lastReauthorizationAtMs   int64
+	nextReauthorizationAtMs   int64
+	reauthorizationFailures   uint64
+	reauthorizationError      string
+	state                     pfslocal.AttachStateState
+	lastErr                   string
 	// Terminal for this attach lifetime: once a correctness-bound kernel
 	// refresh fails, authority visibility was not proven. Operations fail
 	// closed until an explicit unmount/restart.
@@ -1491,7 +1503,11 @@ func (a *attach) rotateLiveCredential(
 		// path gives, reached without the lock.
 		return false, true, nil
 	}
+	installedExpiresAtMs := expiresAtMs
 	if a.v3Config != nil {
+		if a.v3Config.enrollmentClient != nil {
+			return false, true, errors.New("this mount has one automatic reauthorization owner; manual credential rotation is disabled")
+		}
 		if sequence == 0 {
 			return false, true, errors.New("a live v3 credential rotation requires a nonzero authSequence")
 		}
@@ -1499,12 +1515,24 @@ func (a *attach) rotateLiveCredential(
 		if err != nil {
 			return false, true, err
 		}
-		if err := plane.reauthorize(ctx, []byte(tok), sequence); err != nil {
+		deadline, err := plane.reauthorize(ctx, []byte(tok), sequence)
+		if err != nil {
 			return false, true, fmt.Errorf("reauthorize live v3 session: %w", err)
 		}
 		a.v3Config.installReplacementCertificate(replacement)
+		installedExpiresAtMs = deadline.UnixMilli()
+		a.mu.Lock()
+		a.authorizationDeadlineAtMs = installedExpiresAtMs
+		a.lastReauthorizationAtMs = time.Now().UnixMilli()
+		a.nextReauthorizationAtMs = 0
+		a.reauthorizationFailures = 0
+		a.reauthorizationError = ""
+		a.mu.Unlock()
 	}
-	a.setCredential(tok, expiresAtMs)
+	// The authority's reply is the installed truth for a v3 session. Never let
+	// a copied request timestamp extend the daemon's watchdog or reported
+	// authorization state beyond the deadline the authority actually accepted.
+	a.setCredential(tok, installedExpiresAtMs)
 	return true, true, nil
 }
 
@@ -1547,6 +1575,12 @@ func (a *attach) setCredential(tok string, expiresAtMs int64) {
 	a.token = tok
 	a.tokenExpiresAtMs = expiresAtMs
 	a.credMu.Unlock()
+}
+
+func (a *attach) authorizationDeadline() int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.authorizationDeadlineAtMs
 }
 
 // detach tears the attach down. NORMAL (force=false): the full drain barrier
@@ -1707,6 +1741,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	a.publishLocked(pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDetaching, Detail: "detaching"}})
 	lifeCancel := a.lifeCancel
 	v3Data := a.v3Data
+	v3Config := a.v3Config
 	a.mu.Unlock()
 	a.nsMu.Unlock()
 	a.frontendSerial.Unlock()
@@ -1715,6 +1750,12 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	// client forever.
 	if lifeCancel != nil {
 		lifeCancel()
+	}
+	enrollmentCloseReason := "mount detached"
+	if v3Data != nil {
+		if terminalErr := v3Data.terminalError(); terminalErr != nil && !errors.Is(terminalErr, errV3AttachDetached) {
+			enrollmentCloseReason = "mount failed closed"
+		}
 	}
 	// The macOS 26 repair root is attach-scoped. Terminal FSKit teardown has
 	// already removed (or deliberately abandoned) this incarnation's kernel
@@ -1738,6 +1779,17 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 		delete(a.conns, c)
 	}
 	a.mu.Unlock()
+	// Remote enrollment closure is hygiene after every local kernel, session,
+	// descriptor, and connection owner is already terminal. Manager reachability
+	// therefore cannot block the local terminal transition or leave it dirty.
+	if v3Config != nil && v3Config.enrollmentClient != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		closeErr := v3Config.enrollmentClient.Close(closeCtx, enrollmentCloseReason)
+		cancel()
+		if closeErr != nil {
+			log.Printf("portablefsd: detached mount enrollment %s could not be closed and will expire or be revoked remotely: %v", v3Config.enrollmentID, closeErr)
+		}
+	}
 	return jobID, priorErr
 }
 
@@ -1769,6 +1821,17 @@ func (a *attach) status() attachStatus {
 	state := a.currentStateLocked()
 	lastErr := a.lastErr
 	volumeName := a.volumeName
+	authorizationDeadlineAtMs := a.authorizationDeadlineAtMs
+	lastReauthorizationAtMs := a.lastReauthorizationAtMs
+	nextReauthorizationAtMs := a.nextReauthorizationAtMs
+	reauthorizationFailures := a.reauthorizationFailures
+	reauthorizationError := a.reauthorizationError
+	enrollmentID := ""
+	enrollmentExpiresAtMs := int64(0)
+	if a.v3Config != nil {
+		enrollmentID = a.v3Config.enrollmentID
+		enrollmentExpiresAtMs = a.v3Config.enrollmentExpires.UnixMilli()
+	}
 	a.mu.RUnlock()
 	credential := ""
 	// A terminal v3 session is this attach's strongest verdict: every
@@ -1789,6 +1852,10 @@ func (a *attach) status() attachStatus {
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
 		Credential: credential, SessionTerminal: sessionTerminal,
+		MountEnrollmentID: enrollmentID, EnrollmentExpiresAtMs: enrollmentExpiresAtMs,
+		AuthorizationDeadlineAtMs: authorizationDeadlineAtMs, LastReauthorizationAtMs: lastReauthorizationAtMs,
+		NextReauthorizationAtMs: nextReauthorizationAtMs, ReauthorizationFailures: reauthorizationFailures,
+		ReauthorizationError: reauthorizationError,
 	}
 }
 

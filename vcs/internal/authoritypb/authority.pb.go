@@ -2285,8 +2285,12 @@ type AttachReply struct {
 	// the same value the mount presented - an attach that disagreed was refused -
 	// so it is an explicit confirmation rather than a value to adopt.
 	RoutesRevision []byte `protobuf:"bytes,8,opt,name=routes_revision,json=routesRevision,proto3" json:"routes_revision,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// authorization_deadline_unix_nanos is the exact signed deadline installed
+	// for this session. Automatic renewal schedules from this authority-verified
+	// value, never from a caller's untrusted copy of the Manager response.
+	AuthorizationDeadlineUnixNanos int64 `protobuf:"varint,9,opt,name=authorization_deadline_unix_nanos,json=authorizationDeadlineUnixNanos,proto3" json:"authorization_deadline_unix_nanos,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *AttachReply) Reset() {
@@ -2373,6 +2377,13 @@ func (x *AttachReply) GetRoutesRevision() []byte {
 		return x.RoutesRevision
 	}
 	return nil
+}
+
+func (x *AttachReply) GetAuthorizationDeadlineUnixNanos() int64 {
+	if x != nil {
+		return x.AuthorizationDeadlineUnixNanos
+	}
+	return 0
 }
 
 type ResumeRequest struct {
@@ -5971,7 +5982,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x14cached_name_capacity\x18\x06 \x01(\x04R\x12cachedNameCapacity\x120\n" +
 	"\x14repair_budget_millis\x18\a \x01(\x04R\x12repairBudgetMillis\x12'\n" +
 	"\x0froutes_revision\x18\b \x01(\fR\x0eroutesRevision\x12S\n" +
-	"\x10namespace_repair\x18\t \x01(\x0e2(.portablefs.authority.v1.NamespaceRepairR\x0fnamespaceRepairJ\x04\b\x03\x10\x04\"\x8e\x03\n" +
+	"\x10namespace_repair\x18\t \x01(\x0e2(.portablefs.authority.v1.NamespaceRepairR\x0fnamespaceRepairJ\x04\b\x03\x10\x04\"\xd9\x03\n" +
 	"\vAttachReply\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\fR\tsessionId\x12-\n" +
@@ -5981,7 +5992,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\bfeatures\x18\x05 \x03(\tR\bfeatures\x12<\n" +
 	"\x1asession_lease_milliseconds\x18\x06 \x01(\x04R\x18sessionLeaseMilliseconds\x12V\n" +
 	"\x11visibility_cursor\x18\a \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x10visibilityCursor\x12'\n" +
-	"\x0froutes_revision\x18\b \x01(\fR\x0eroutesRevision\"\x0f\n" +
+	"\x0froutes_revision\x18\b \x01(\fR\x0eroutesRevision\x12I\n" +
+	"!authorization_deadline_unix_nanos\x18\t \x01(\x03R\x1eauthorizationDeadlineUnixNanos\"\x0f\n" +
 	"\rResumeRequest\"\x12\n" +
 	"\x10KeepAliveRequest\"S\n" +
 	"\x12ReauthorizeRequest\x12!\n" +

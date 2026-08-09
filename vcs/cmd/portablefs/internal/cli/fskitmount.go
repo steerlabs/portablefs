@@ -320,12 +320,24 @@ type fskitEnsureAttachRequest struct {
 // sizes the visibility barrier from, the declared coherence policy, and the
 // 64-hex routing revision this mount runs.
 type fskitV3AttachRequest struct {
-	ClientCertPEM      string `json:"clientCertPem"`
-	ClientKeyPEM       string `json:"clientKeyPem"`
-	CachedNameCapacity uint64 `json:"cachedNameCapacity"`
-	RepairBudgetMillis uint64 `json:"repairBudgetMillis"`
-	CachePolicy        string `json:"cachePolicy"`
-	RoutesRevision     string `json:"routesRevision"`
+	ClientCertPEM      string                         `json:"clientCertPem"`
+	ClientKeyPEM       string                         `json:"clientKeyPem"`
+	CachedNameCapacity uint64                         `json:"cachedNameCapacity"`
+	RepairBudgetMillis uint64                         `json:"repairBudgetMillis"`
+	CachePolicy        string                         `json:"cachePolicy"`
+	RoutesRevision     string                         `json:"routesRevision"`
+	Enrollment         *fskitV3MountEnrollmentRequest `json:"enrollment,omitempty"`
+}
+
+type fskitV3MountEnrollmentRequest struct {
+	ManagerURL                      string `json:"managerUrl"`
+	ManagerServerName               string `json:"managerServerName"`
+	ManagerCAPEM                    string `json:"managerCaPem"`
+	EnrollmentID                    string `json:"enrollmentId"`
+	EnrollmentCertificatePEM        string `json:"enrollmentCertificatePem"`
+	EnrollmentExpiresAtMs           int64  `json:"enrollmentExpiresAtMs"`
+	AuthorityGeneration             uint64 `json:"authorityGeneration"`
+	InitialAuthorizationExpiresAtMs int64  `json:"initialAuthorizationExpiresAtMs"`
 }
 
 type fskitEnsureAttachReply struct {
@@ -392,7 +404,14 @@ type cliAttachStatus struct {
 	// SessionTerminal is the daemon's machine-readable verdict that this
 	// attach's v3 authority session ended permanently; the mount supervisor's
 	// revocation watchdog branches on it.
-	SessionTerminal bool `json:"sessionTerminal"`
+	SessionTerminal           bool   `json:"sessionTerminal"`
+	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
+	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
+	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
+	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
+	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
+	ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
+	ReauthorizationError      string `json:"reauthorizationError,omitempty"`
 }
 
 // errFskitAttachIdentityMismatch marks a daemon attach that carries the
@@ -520,6 +539,33 @@ func (c *fsdControl) setCredential(ref, token string, expiresAtMs int64) error {
 
 func (c *fsdControl) setCredentialIfPending(ref, token string, expiresAtMs int64) error {
 	return c.setCredentialWithMode(ref, token, expiresAtMs, true)
+}
+
+func (c *fsdControl) reauthorizeCredential(ref, token string, expiresAtMs int64, sequence uint64, clientCertificatePEM string) (time.Time, error) {
+	if sequence == 0 || clientCertificatePEM == "" {
+		return time.Time{}, fmt.Errorf("complete hosted reauthorization credential is required")
+	}
+	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/credential",
+		map[string]any{
+			"authToken": token, "authTokenExpiresAtMs": expiresAtMs,
+			"authSequence": sequence, "clientCertPem": clientCertificatePEM,
+		})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if status < 200 || status >= 300 {
+		return time.Time{}, controlError(status, body)
+	}
+	var response struct {
+		AuthorizationDeadlineUnixMs int64 `json:"authorizationDeadlineUnixMs"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return time.Time{}, fmt.Errorf("decode portablefsd reauthorization result: %w", err)
+	}
+	if response.AuthorizationDeadlineUnixMs == 0 {
+		return time.Time{}, fmt.Errorf("portablefsd did not report the installed authorization deadline")
+	}
+	return time.UnixMilli(response.AuthorizationDeadlineUnixMs), nil
 }
 
 // setCredentialWithMode pushes the credential AND the deadline its issuer

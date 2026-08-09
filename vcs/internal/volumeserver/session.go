@@ -24,6 +24,7 @@ var (
 	ErrAdmission              = errors.New("volumeserver: runtime admission bound reached")
 	ErrAuthorizationSequence  = errors.New("volumeserver: authorization sequence is not the exact next value")
 	ErrAuthorizationBroadened = errors.New("volumeserver: reauthorization attempted to broaden access")
+	ErrAuthorizationOwner     = errors.New("volumeserver: reauthorization issuer does not own this session")
 )
 
 type Epoch [16]byte
@@ -53,8 +54,9 @@ const (
 // session is attached or exactly reauthorized. Ordinary lease renewal never
 // extends Deadline; only a new session-bound signed authorization can do so.
 type Authorization struct {
-	Access   Access
-	Deadline time.Time
+	Access            Access
+	Deadline          time.Time
+	MountEnrollmentID string
 }
 
 type Config struct {
@@ -127,6 +129,7 @@ type session struct {
 	authorizationDeadline time.Time
 	authorizationSequence uint64
 	authorizationProof    [32]byte
+	mountEnrollmentID     string
 	// lockLease publishes leaseExpires to the lock table. It is written under
 	// s.mu wherever leaseExpires is, so the table can never read a lease
 	// boundary the authority has not granted.
@@ -282,6 +285,7 @@ func (a *Authority) Attach(slots uint32, peer PeerIdentity, authorization Author
 		authorizationDeadline: authorization.Deadline,
 		slots:                 make([]replaySlot, slots),
 		terminal:              make(chan struct{}),
+		mountEnrollmentID:     authorization.MountEnrollmentID,
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -498,6 +502,13 @@ func (a *Authority) Reauthorize(cred SessionCredential, authorization Authorizat
 	}
 	if cred.Generation != sessionCredentialGeneration || subtle.ConstantTimeCompare(s.secret[:], cred.Secret[:]) != 1 {
 		return fail(ErrSessionFenced, true)
+	}
+	if s.mountEnrollmentID != authorization.MountEnrollmentID {
+		// A valid credential from the wrong issuer is not evidence that the live
+		// mount itself is corrupt. Refuse it without killing the enrollment-owned
+		// session; sequence and changed-replay violations from the actual owner
+		// retain their fail-closed fencing semantics below.
+		return fail(ErrAuthorizationOwner, false)
 	}
 	if sequence == s.authorizationSequence {
 		if subtle.ConstantTimeCompare(s.authorizationProof[:], proof[:]) != 1 ||

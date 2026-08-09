@@ -3,6 +3,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -14,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -144,6 +146,87 @@ type clientTestHandler struct {
 	attachCount       *atomic.Int32
 	keepAliveErrno    int32
 	maxInFlight       int
+	mountEnrollment   bool
+}
+
+type clientReauthorizationHandler struct {
+	clientTestHandler
+	requests atomic.Int32
+}
+
+func (h *clientReauthorizationHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	response := h.clientTestHandler.Handle(ctx, request)
+	if hello := response.GetHello(); hello != nil {
+		hello.Features = append(hello.Features, sessionReauthorizationFeature)
+	}
+	if reauthorization := request.GetReauthorize(); reauthorization != nil {
+		h.requests.Add(1)
+		response.Errno = 0
+		response.Body = &authoritypb.Response_Reauthorize{Reauthorize: &authoritypb.ReauthorizeReply{
+			Sequence:                       reauthorization.GetSequence(),
+			AuthorizationDeadlineUnixNanos: time.Now().Add(10 * time.Minute).UnixNano(),
+		}}
+	}
+	return response
+}
+
+func TestClientReauthorizationInstallsOnlyAValidatedReplacementCertificate(t *testing.T) {
+	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 4}}
+	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), ClientConfig{
+		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+		ReplaySlots: 4, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 4,
+		CoherenceProfile: authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	renewed := renewedCertificateForExistingKey(t, clientTLS.Certificates[0], 9001)
+	deadline, err := client.ReauthorizeWithCertificate(context.Background(), []byte("renewed"), 1, renewed, time.Now())
+	if err != nil || !deadline.After(time.Now()) || handler.requests.Load() != 1 {
+		t.Fatalf("reauthorize deadline=%v requests=%d err=%v", deadline, handler.requests.Load(), err)
+	}
+	if got := client.cfg.TLS.Certificates[0].Leaf; got == nil || got.SerialNumber.Int64() != 9001 {
+		t.Fatalf("installed certificate = %+v", got)
+	}
+	_, otherKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := certificateForSigner(t, otherKey, 9002)
+	if _, err := client.ReauthorizeWithCertificate(context.Background(), []byte("wrong"), 2, wrong, time.Now()); err == nil {
+		t.Fatal("reauthorization accepted a certificate for another private key")
+	}
+	if handler.requests.Load() != 1 {
+		t.Fatal("invalid replacement reached the authority")
+	}
+}
+
+func renewedCertificateForExistingKey(t *testing.T, existing tls.Certificate, serial int64) []byte {
+	t.Helper()
+	signer, ok := existing.PrivateKey.(crypto.Signer)
+	if !ok {
+		t.Fatal("test client key is not a signer")
+	}
+	return certificateForSigner(t, signer, serial)
+}
+
+func certificateForSigner(t *testing.T, signer crypto.Signer, serial int64) []byte {
+	t.Helper()
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "renewed-client"},
+		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, signer.Public(), signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 func (h clientTestHandler) Epoch() []byte { return append([]byte(nil), h.epoch...) }
@@ -155,6 +238,9 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	switch req.GetBody().(type) {
 	case *authoritypb.Request_Hello:
 		features := append([]string(nil), requiredHelloFeatures...)
+		if h.mountEnrollment {
+			features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
+		}
 		if h.omitHelloFeature {
 			features = features[1:]
 		}
@@ -168,6 +254,9 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 			h.attachCount.Add(1)
 		}
 		features := append([]string(nil), requiredAttachFeatures...)
+		if h.mountEnrollment {
+			features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
+		}
 		if h.omitAttachFeature {
 			features = features[1:]
 		}
@@ -177,7 +266,11 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 				features = features[:len(features)-1]
 			}
 		}
-		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: make([]byte, 16), SessionGeneration: 1, ResumeSecret: make([]byte, 32), Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000}}
+		deadline := int64(0)
+		if h.mountEnrollment {
+			deadline = time.Now().Add(time.Minute).UnixNano()
+		}
+		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: make([]byte, 16), SessionGeneration: 1, ResumeSecret: make([]byte, 32), Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000, AuthorizationDeadlineUnixNanos: deadline}}
 	case *authoritypb.Request_Resume:
 	case *authoritypb.Request_KeepAlive:
 		response.Errno = h.keepAliveErrno
@@ -619,6 +712,37 @@ func TestClientRequiresArchitectureFeatures(t *testing.T) {
 			}
 			stop()
 		})
+	}
+}
+
+func TestClientConfiguredForMountEnrollmentRefusesAnOlderV3Authority(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
+	defer stop()
+	_, err := DialClient(context.Background(), ClientConfig{
+		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+		ReplaySlots: 4, MaxFrame: testMaxFrame, DialTimeout: time.Second, CancelDrainTimeout: time.Second, MaxInFlight: 4,
+		RequireMountEnrollmentReauthorization: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Manager-enrolled") {
+		t.Fatalf("automatic mount against older v3 authority = %v", err)
+	}
+}
+
+func TestClientConfiguredForMountEnrollmentPinsAuthorityDeadline(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight, mountEnrollment: true}, testMaxInFlight, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), ClientConfig{
+		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+		ReplaySlots: 4, MaxFrame: testMaxFrame, DialTimeout: time.Second, CancelDrainTimeout: time.Second, MaxInFlight: 4,
+		RequireMountEnrollmentReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	deadline := client.InitialAuthorizationDeadline()
+	if !deadline.After(time.Now()) || deadline.After(time.Now().Add(2*time.Minute)) {
+		t.Fatalf("authority-pinned initial deadline = %s", deadline)
 	}
 }
 

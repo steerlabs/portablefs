@@ -18,6 +18,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -85,7 +86,19 @@ type v3AttachRequest struct {
 	// RoutesRevision is the 64-hex-digit digest of the canonical machine-local
 	// routing rules this mount runs. The authority refuses any mount whose
 	// topology is not the volume's active one.
-	RoutesRevision string `json:"routesRevision"`
+	RoutesRevision string                    `json:"routesRevision"`
+	Enrollment     *v3MountEnrollmentRequest `json:"enrollment,omitempty"`
+}
+
+type v3MountEnrollmentRequest struct {
+	ManagerURL                      string `json:"managerUrl"`
+	ManagerServerName               string `json:"managerServerName"`
+	ManagerCAPEM                    string `json:"managerCaPem"`
+	EnrollmentID                    string `json:"enrollmentId"`
+	EnrollmentCertificatePEM        string `json:"enrollmentCertificatePem"`
+	EnrollmentExpiresAtMs           int64  `json:"enrollmentExpiresAtMs"`
+	AuthorityGeneration             uint64 `json:"authorityGeneration"`
+	InitialAuthorizationExpiresAtMs int64  `json:"initialAuthorizationExpiresAtMs"`
 }
 
 // persistedV3Attach is the durable, credential-free record of a v3 attach.
@@ -103,12 +116,16 @@ type persistedV3Attach struct {
 // after construction; the mutable session state lives on attach.v3Data.
 type v3AttachConfig struct {
 	// identity is nil exactly when revived is true.
-	identityMu         sync.RWMutex
-	identity           *tls.Certificate
-	cachedNameCapacity uint64
-	repairBudget       time.Duration
-	cachePolicy        string
-	routesRevision     [32]byte
+	identityMu                   sync.RWMutex
+	identity                     *tls.Certificate
+	cachedNameCapacity           uint64
+	repairBudget                 time.Duration
+	cachePolicy                  string
+	routesRevision               [32]byte
+	enrollmentClient             *mountenrollment.Client
+	enrollmentID                 string
+	enrollmentExpires            time.Time
+	initialAuthorizationDeadline time.Time
 	// revived marks a record loaded from disk after a daemon restart. Its
 	// strict session died with the previous process, and a replacement session
 	// cannot prove what the kernel cached before it, so a revived v3 attach is
@@ -230,7 +247,8 @@ func (c *v3AttachConfig) matches(other *v3AttachConfig) bool {
 		c.cachedNameCapacity == other.cachedNameCapacity &&
 		c.repairBudget == other.repairBudget &&
 		c.cachePolicy == other.cachePolicy &&
-		c.routesRevision == other.routesRevision
+		c.routesRevision == other.routesRevision &&
+		c.enrollmentID == other.enrollmentID
 }
 
 func parseV3RoutesRevision(value string) ([32]byte, error) {
@@ -327,12 +345,37 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	var enrollmentClient *mountenrollment.Client
+	var enrollmentID string
+	var enrollmentExpires time.Time
+	var initialAuthorizationDeadline time.Time
+	if v3.Enrollment != nil {
+		enrollment := v3.Enrollment
+		if req.AuthTokenExpiresAtMs != enrollment.InitialAuthorizationExpiresAtMs ||
+			enrollment.InitialAuthorizationExpiresAtMs <= time.Now().UnixMilli() ||
+			enrollment.EnrollmentExpiresAtMs <= enrollment.InitialAuthorizationExpiresAtMs {
+			return nil, errors.New("v3 automatic enrollment requires matching, unexpired authorization lifetimes")
+		}
+		enrollmentClient, err = mountenrollment.NewClient(mountenrollment.Config{
+			ManagerURL: enrollment.ManagerURL, ManagerServerName: enrollment.ManagerServerName,
+			ManagerCAPEM: []byte(enrollment.ManagerCAPEM), EnrollmentID: enrollment.EnrollmentID,
+			EnrollmentCertificatePEM: []byte(enrollment.EnrollmentCertificatePEM), ClientKeyPEM: []byte(v3.ClientKeyPEM),
+			VolumeID: req.VolumeID, AuthorityGeneration: enrollment.AuthorityGeneration,
+			EnrollmentExpires: time.UnixMilli(enrollment.EnrollmentExpiresAtMs),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("invalid v3 automatic mount enrollment: %w", err)
+		}
+		enrollmentID = enrollment.EnrollmentID
+		enrollmentExpires = time.UnixMilli(enrollment.EnrollmentExpiresAtMs)
+		initialAuthorizationDeadline = time.UnixMilli(enrollment.InitialAuthorizationExpiresAtMs)
+	}
 	return &v3AttachConfig{
-		identity:           &identity,
-		cachedNameCapacity: v3.CachedNameCapacity,
-		repairBudget:       time.Duration(v3.RepairBudgetMillis) * time.Millisecond,
-		cachePolicy:        v3.CachePolicy,
-		routesRevision:     revision,
+		identity: &identity, cachedNameCapacity: v3.CachedNameCapacity,
+		repairBudget: time.Duration(v3.RepairBudgetMillis) * time.Millisecond,
+		cachePolicy:  v3.CachePolicy, routesRevision: revision,
+		enrollmentClient: enrollmentClient, enrollmentID: enrollmentID, enrollmentExpires: enrollmentExpires,
+		initialAuthorizationDeadline: initialAuthorizationDeadline,
 	}, nil
 }
 
@@ -430,23 +473,29 @@ func (a *attach) startV3(ctx context.Context) error {
 	token := a.token
 	a.credMu.RUnlock()
 	client, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
-		Address:            a.authorityAddr,
-		TLS:                tlsCfg,
-		VolumeID:           a.volumeID,
-		AccessToken:        []byte(token),
-		ReplaySlots:        v3AttachReplaySlots,
-		MaxFrame:           v3AttachMaxFrame,
-		DialTimeout:        v3AttachDialTimeout,
-		CancelDrainTimeout: v3AttachCancelDrainTimeout,
-		MaxInFlight:        v3AttachMaxInFlight,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: cfg.cachedNameCapacity,
-		RepairBudget:       cfg.repairBudget,
-		NamespaceRepair:    v3NamespaceRepair(cfg.cachePolicy),
-		RoutesRevision:     cfg.routesRevision,
+		Address:                               a.authorityAddr,
+		TLS:                                   tlsCfg,
+		VolumeID:                              a.volumeID,
+		AccessToken:                           []byte(token),
+		ReplaySlots:                           v3AttachReplaySlots,
+		MaxFrame:                              v3AttachMaxFrame,
+		DialTimeout:                           v3AttachDialTimeout,
+		CancelDrainTimeout:                    v3AttachCancelDrainTimeout,
+		MaxInFlight:                           v3AttachMaxInFlight,
+		CoherenceProfile:                      authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+		CachedNameCapacity:                    cfg.cachedNameCapacity,
+		RepairBudget:                          cfg.repairBudget,
+		NamespaceRepair:                       v3NamespaceRepair(cfg.cachePolicy),
+		RoutesRevision:                        cfg.routesRevision,
+		RequireMountEnrollmentReauthorization: cfg.enrollmentClient != nil,
 	})
 	if err != nil {
 		return fmt.Errorf("attach v3 authority session: %w", err)
+	}
+	if cfg.enrollmentClient != nil && !client.InitialAuthorizationDeadline().Equal(cfg.initialAuthorizationDeadline) {
+		_ = client.Close()
+		return fmt.Errorf("authority installed authorization deadline %s, Manager response declared %s",
+			client.InitialAuthorizationDeadline().UTC().Format(time.RFC3339Nano), cfg.initialAuthorizationDeadline.UTC().Format(time.RFC3339Nano))
 	}
 	// The data plane owns the client from here: every constructor failure path
 	// inside newV3DataPlane records a terminal cause and closes it.
@@ -471,9 +520,52 @@ func (a *attach) startV3(ctx context.Context) error {
 	a.v3Data = d
 	a.v3Session = client
 	a.v3Coherence = d.bridge
+	if cfg.enrollmentClient != nil {
+		a.authorizationDeadlineAtMs = cfg.initialAuthorizationDeadline.UnixMilli()
+	}
 	a.mu.Unlock()
 	go a.watchV3Terminal(d)
+	if cfg.enrollmentClient != nil {
+		go a.runAutomaticMountRenewal(cfg, d)
+	}
 	return nil
+}
+
+func (a *attach) runAutomaticMountRenewal(cfg *v3AttachConfig, d *v3DataPlane) {
+	renewer := &mountenrollment.Renewer{
+		Source: cfg.enrollmentClient, MinimumSafetyMargin: cfg.repairBudget,
+		Observe: func(status mountenrollment.RenewalStatus) {
+			a.mu.Lock()
+			a.authorizationDeadlineAtMs = status.AuthorizationDeadline.UnixMilli()
+			if !status.LastSuccess.IsZero() {
+				a.lastReauthorizationAtMs = status.LastSuccess.UnixMilli()
+			}
+			if !status.NextAttempt.IsZero() {
+				a.nextReauthorizationAtMs = status.NextAttempt.UnixMilli()
+			}
+			a.reauthorizationFailures = status.ConsecutiveFailures
+			a.reauthorizationError = status.LastError
+			a.mu.Unlock()
+		},
+	}
+	err := renewer.Run(a.lifetime(), d.authorizationSessionID(), cfg.initialAuthorizationDeadline,
+		func(ctx context.Context, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
+			replacement, err := cfg.replacementCertificate(string(certificatePEM), time.Now())
+			if err != nil {
+				return time.Time{}, err
+			}
+			deadline, err := d.reauthorize(ctx, []byte(token), sequence)
+			if err != nil {
+				return time.Time{}, err
+			}
+			cfg.installReplacementCertificate(replacement)
+			return deadline, nil
+		})
+	if err == nil || a.isDetached() {
+		return
+	}
+	a.setErr(fmt.Errorf("automatic mount reauthorization failed closed: %w", err))
+	_ = d.fail(err)
 }
 
 // watchV3Terminal publishes the data plane's terminal verdict onto the attach

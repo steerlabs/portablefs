@@ -270,6 +270,10 @@ message AttachReply {
   // the same value the mount presented - an attach that disagreed was refused -
   // so it is an explicit confirmation rather than a value to adopt.
   bytes routes_revision = 8;
+  // authorization_deadline_unix_nanos is the exact signed deadline installed
+  // for this session. Automatic renewal schedules from this authority-verified
+  // value, never from a caller's untrusted copy of the Manager response.
+  int64 authorization_deadline_unix_nanos = 9;
 }
 message ResumeRequest {}
 message KeepAliveRequest {}

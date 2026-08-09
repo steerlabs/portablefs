@@ -1439,7 +1439,7 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	}
 	bounds := h.Bounds()
 	features := append([]string(nil), requiredHelloFeatures...)
-	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature)
+	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
 	resp := h.success(requestID)
 	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 		ProtocolMajor: ProtocolMajor, Features: features,
@@ -1584,11 +1584,11 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	}
 	resp := h.success(requestID)
 	features := append([]string(nil), requiredAttachFeatures...)
-	features = append(features, sessionReauthorizationFeature)
+	features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
 	if profile == volumeserver.CoherenceStrict {
 		features = append(features, requiredStrictAttachFeatures...)
 	}
-	resp.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: cred.ID[:], SessionGeneration: cred.Generation, ResumeSecret: cred.Secret[:], Root: itemProto(root, attr, rootIdentity), Features: features, SessionLeaseMilliseconds: uint64(h.Runtime.SessionLease() / time.Millisecond), VisibilityCursor: initialCursor, RoutesRevision: append([]byte(nil), presented[:]...)}}
+	resp.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: cred.ID[:], SessionGeneration: cred.Generation, ResumeSecret: cred.Secret[:], Root: itemProto(root, attr, rootIdentity), Features: features, SessionLeaseMilliseconds: uint64(h.Runtime.SessionLease() / time.Millisecond), VisibilityCursor: initialCursor, RoutesRevision: append([]byte(nil), presented[:]...), AuthorizationDeadlineUnixNanos: authorization.Deadline.UnixNano()}}
 	attached = false
 	return resp
 }
@@ -2066,7 +2066,8 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 	case errors.Is(err, volumeserver.ErrEpochMismatch), errors.Is(err, volumeserver.ErrSessionExpired), errors.Is(err, volumeserver.ErrSessionFenced):
 		errno = errnos.ESTALE
 	case errors.Is(err, volumeserver.ErrSequenceGap), errors.Is(err, volumeserver.ErrRequestMismatch), errors.Is(err, volumeserver.ErrSlotRange),
-		errors.Is(err, volumeserver.ErrAuthorizationSequence), errors.Is(err, volumeserver.ErrAuthorizationBroadened):
+		errors.Is(err, volumeserver.ErrAuthorizationSequence), errors.Is(err, volumeserver.ErrAuthorizationBroadened),
+		errors.Is(err, volumeserver.ErrAuthorizationOwner):
 		errno = errnos.EINVAL
 	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN

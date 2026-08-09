@@ -43,14 +43,26 @@ directories. The control CA private key and product private key do not belong
 on the manager host.
 
 The manager server certificate must name the exact private DNS name configured
-in every cell's `PORTABLEFS_MANAGER_SERVER_NAME`. Control client certificates
-have exactly one URI SAN:
+in every cell's `PORTABLEFS_MANAGER_SERVER_NAME`. Manager client certificates
+have exactly one URI SAN. Control clients are issued from the control-client
+CA:
 
 ```text
 spiffe://portablefs/control/operator/<id>
 spiffe://portablefs/control/product/<product-issuer>
 spiffe://portablefs/control/cell/<cell-uuid>
 ```
+
+Mount enrollment clients are issued from a separate mount-enrollment CA:
+
+```text
+spiffe://portablefs/mount-enrollment/<enrollment-id>
+```
+
+The listener trusts both the control-client CA and the mount-enrollment CA.
+The authority does not trust the mount-enrollment CA, and the Manager does not
+trust the authority-facing mount-client CA. Exact URI role parsing further
+limits a mount-enrollment certificate to its own refresh and close endpoints.
 
 ## Install and configure
 
@@ -70,11 +82,13 @@ account and root-owned configuration hierarchy:
 /etc/portablefs/manager/trust/control-client-ca.pem
 /etc/portablefs/manager/trust/authority-ca.pem
 /etc/portablefs/manager/trust/mount-client-ca.pem
+/etc/portablefs/manager/trust/mount-enrollment-ca.pem
 /etc/portablefs/manager/trust/product-public.pem
 /etc/portablefs/manager/keys/plan-signing.key
 /etc/portablefs/manager/keys/capability-signing.key
 /etc/portablefs/manager/keys/authority-ca.key
 /etc/portablefs/manager/keys/mount-client-ca.key
+/etc/portablefs/manager/keys/mount-enrollment-ca.key
 ```
 
 `manager.env` is root-owned mode `0600` and contains no private key bytes:

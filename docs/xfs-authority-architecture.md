@@ -393,9 +393,17 @@ IOPS, throughput, memory, descriptors, and recovery SLO.
 
 Short-lived capability claims include subject, volume, read/write access,
 credential validity, peer-certificate identity, and a nonce. Hosted grants also
-pin cell, authority identity and generation, and contain the product's separate
-authorization assertion. Authorization precedes handle resolution. Keepalive
-cannot extend a signed authorization deadline. Per-tenant concurrency and I/O scheduling
+pin cell, authority identity and generation. Initial grants contain the
+product's separate authorization assertion; live-session grants may instead
+name the bounded mount enrollment created by that assertion. Authorization
+precedes handle resolution. For those live-session grants, the Manager's
+durable enrollment is the intentionally retained proof of the original
+product-authorized subject, authorization domain, owner, access ceiling, mount
+key, and volume. The authority does not try to re-verify the now-expired
+product assertion; it instead pins the enrollment ID, volume, cell, authority
+generation, session, key, sequence, and non-broadening access on every renewal.
+Attach returns the authority-verified deadline and
+keepalive cannot extend it. Per-tenant concurrency and I/O scheduling
 protect unrelated volumes; quota errors remain the kernel's `EDQUOT`/`ENOSPC`
 outcomes.
 
@@ -593,9 +601,10 @@ something in the tree establishes it, and partial progress is stated as partial.
     authority epoch before issuing a mount grant — together with lost-response
     tests for idempotent grant creation and Attach, and saturated in-session
     reauthorization tests proving a long-lived mount neither expires at the short
-    grant boundary nor silently broadens its authorization. None of this exists
-    yet; mounts are credentialed directly.
-13. Per-RPC observability at the authority, without which several matrix
+    grant boundary nor silently broadens its authorization. The hosted Manager,
+    automatic per-mount renewal owners, and exact sequence tests implement this
+    control path; multi-cell recovery drills remain deployment work.
+14. Per-RPC observability at the authority, without which several matrix
     assertions can only check behaviour and not work performed.
 
 The segmented-log experiment remains evidence about append-only write

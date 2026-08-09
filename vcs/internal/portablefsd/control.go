@@ -205,6 +205,17 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if req.AuthSequence != 0 {
+			deadline := a.authorizationDeadline()
+			if deadline == 0 {
+				writeHTTPError(w, http.StatusInternalServerError, "authority did not report the installed authorization deadline")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"authorizationDeadlineUnixMs": deadline,
+			})
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case "bind-root":
 		// THE ROOT DESCRIPTOR IS BOUND WHILE THE MOUNT IS PROVEN HEALTHY, and

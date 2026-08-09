@@ -153,7 +153,7 @@ different revision fails closed.
 
 ### The CLI surface
 
-`portablefs mount`, `umount`, `mounts`, `route`, `prune-local`, `daemon`,
+`portablefs mount`, `reauthorize`, `umount`, `mounts`, `route`, `prune-local`, `daemon`,
 `doctor`, `mount-check`, and `version` are the user-facing commands, along with
 `--json` on every one of them and the `PORTABLEFS_MOUNT_TOKEN` environment
 variable. Documented flags keep their meaning; new flags and new JSON fields may
@@ -178,7 +178,9 @@ Additive evolution with versioning; consumers tolerate additions.
   handshake, where an authority that lacks them still serves the frozen set.
   `session-reauthorization-v1` is one such optional feature: it adds an exact,
   session-bound `Reauthorize` operation without making older v3 authorities
-  invalid for standalone mounts.
+  invalid for standalone mounts. `mount-enrollment-reauthorization-v1` names
+  the Manager-enrollment grant basis; an automatic mount requires it and fails
+  its handshake against an older authority instead of changing renewal modes.
 - New optional protobuf fields. Unknown fields are not part of the protocol —
   the canonical request encoding rejects them — so a field is added on both sides
   or not at all.
