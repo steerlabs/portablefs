@@ -1734,8 +1734,6 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		state.AuthorizationSessionID = authorizationSessionID
 		if enrollmentClient == nil {
 			reauthorizationControl, err = startFuseReauthorizationControl(
-				stateDir,
-				mountPath,
 				func(ctx context.Context, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
 					return m.Reauthorize(ctx, token, sequence, certificatePEM)
 				},

@@ -110,7 +110,3 @@ func cmdReauthorize(e *cmdEnv, args []string) int {
 	fmt.Fprintf(e.stdout, "reauthorized %s through sequence %s\n", mountPath, strconv.FormatUint(o.authSequence, 10))
 	return 0
 }
-
-func reauthorizationSocketPath(stateDir, mountPath string) string {
-	return filepath.Join(stateDir, mountStateKey(mountPath)+".reauthorize.sock")
-}

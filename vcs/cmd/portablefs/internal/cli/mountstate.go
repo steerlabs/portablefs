@@ -408,7 +408,7 @@ func validateMountStateRecord(path string, st *mountState) error {
 		default:
 			return fmt.Errorf("mount state %s has invalid FUSE mount mechanism %q", path, st.MountMechanism)
 		}
-		if st.ReauthorizationControlSocket != "" && !validAbsoluteCleanPath(st.ReauthorizationControlSocket) {
+		if st.ReauthorizationControlSocket != "" && !validReauthorizationControlAddress(st.ReauthorizationControlSocket) {
 			return fmt.Errorf("mount state %s has invalid reauthorization control socket", path)
 		}
 	case "fskit":

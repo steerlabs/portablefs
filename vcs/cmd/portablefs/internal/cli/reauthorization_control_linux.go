@@ -5,12 +5,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +21,8 @@ import (
 )
 
 const maxLocalReauthorizationRequestBytes = (32 << 10) + maxClientIdentityBytes + 4096
+
+const fuseReauthorizationSocketPrefix = "@portablefs-reauthorization-"
 
 type localReauthorizationRequest struct {
 	Capability           string `json:"capability"`
@@ -35,43 +40,56 @@ type localReauthorizationResponse struct {
 type unixReauthorizationControl struct {
 	done     chan struct{}
 	handler  fuseReauthorizationHandler
-	identity os.FileInfo
 	listener *net.UnixListener
 	once     sync.Once
 	path     string
 }
 
-func startFuseReauthorizationControl(stateDir, mountPath string, handler fuseReauthorizationHandler) (fuseReauthorizationControl, error) {
+func startFuseReauthorizationControl(handler fuseReauthorizationHandler) (fuseReauthorizationControl, error) {
 	if handler == nil {
 		return nil, errors.New("reauthorization handler is required")
 	}
-	path := reauthorizationSocketPath(stateDir, mountPath)
-	if _, err := os.Lstat(path); err == nil {
-		return nil, fmt.Errorf("reauthorization control socket already exists at %s", path)
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("inspect reauthorization control socket: %w", err)
+	path, err := newFuseReauthorizationSocketName()
+	if err != nil {
+		return nil, err
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return nil, fmt.Errorf("listen on reauthorization control socket: %w", err)
 	}
-	cleanup := func(cause error) (fuseReauthorizationControl, error) {
-		_ = listener.Close()
-		_ = os.Remove(path)
-		return nil, cause
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return cleanup(fmt.Errorf("protect reauthorization control socket: %w", err))
-	}
-	identity, err := os.Lstat(path)
-	if err != nil || identity.Mode()&os.ModeSocket == 0 {
-		return cleanup(fmt.Errorf("pin reauthorization control socket identity: %w", err))
-	}
 	control := &unixReauthorizationControl{
-		done: make(chan struct{}), handler: handler, identity: identity, listener: listener, path: path,
+		done: make(chan struct{}), handler: handler, listener: listener, path: path,
 	}
 	go control.serve()
 	return control, nil
+}
+
+// newFuseReauthorizationSocketName allocates a lifetime-scoped Linux abstract
+// Unix socket. This control endpoint belongs to the live mount supervisor, not
+// to durable mount state: an abstract address disappears with its listener and
+// cannot leave a stale filesystem node after a crash. A cryptographic nonce
+// prevents another process from predicting and pre-binding the address, while
+// requireSameUserPeer remains the authorization boundary after connect.
+//
+// Keeping the address independent of stateDir is also correctness-critical:
+// sockaddr_un.sun_path is bounded even when a valid home or XDG state path is
+// not. The complete address below is always far inside that kernel bound.
+func newFuseReauthorizationSocketName() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("allocate reauthorization control identity: %w", err)
+	}
+	return fmt.Sprintf("%s%d-%x", fuseReauthorizationSocketPrefix, os.Geteuid(), nonce), nil
+}
+
+func validReauthorizationControlAddress(address string) bool {
+	prefix := fmt.Sprintf("%s%d-", fuseReauthorizationSocketPrefix, os.Geteuid())
+	nonce := strings.TrimPrefix(address, prefix)
+	if nonce == address || len(nonce) != 32 {
+		return false
+	}
+	decoded, err := hex.DecodeString(nonce)
+	return err == nil && len(decoded) == 16
 }
 
 func (c *unixReauthorizationControl) SocketPath() string { return c.path }
@@ -81,13 +99,6 @@ func (c *unixReauthorizationControl) Close() error {
 	c.once.Do(func() {
 		closeErr = c.listener.Close()
 		<-c.done
-		if current, err := os.Lstat(c.path); err == nil && os.SameFile(c.identity, current) {
-			if removeErr := os.Remove(c.path); removeErr != nil {
-				closeErr = errors.Join(closeErr, removeErr)
-			}
-		} else if err != nil && !os.IsNotExist(err) {
-			closeErr = errors.Join(closeErr, err)
-		}
 	})
 	if errors.Is(closeErr, net.ErrClosed) {
 		return nil
