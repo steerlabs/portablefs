@@ -5,7 +5,7 @@ This is the PortableFS v3 stability contract.
 ## v2 is gone
 
 v3 is a breaking reset, not a migration. The v2 product — the remote
-append-only journal, its TypeScript control plane, the client write-back stack,
+append-only journal, its TypeScript journal control plane, the client write-back stack,
 and the history, branch, fork, snapshot, and lease surfaces built on them — was
 deleted from the tree, not deprecated. There are no tombstones, because there is
 no service left to answer with one, and there is no conversion path, because
@@ -176,6 +176,9 @@ Additive evolution with versioning; consumers tolerate additions.
 
 - New authority operations and new feature strings behind the existing
   handshake, where an authority that lacks them still serves the frozen set.
+  `session-reauthorization-v1` is one such optional feature: it adds an exact,
+  session-bound `Reauthorize` operation without making older v3 authorities
+  invalid for standalone mounts.
 - New optional protobuf fields. Unknown fields are not part of the protocol —
   the canonical request encoding rejects them — so a field is added on both sides
   or not at all.
@@ -202,6 +205,12 @@ daemon version, executable digest, and control protocol before issuing any
 operational request. This is deliberately stricter than the additive `pfslocal`
 policy: an older live daemon is left untouched and the operation fails closed
 until it is cleanly drained.
+
+The hosted manager HTTP API, signed cell-plan schema, helper durable state, and
+manager state file are likewise internal in this initial foundation. They fail
+closed on unknown fields and carry explicit schema/version fields, but they are
+not frozen public APIs yet. The authority protocol additions they use remain
+additive under the rules above.
 
 ## Changing a frozen surface
 

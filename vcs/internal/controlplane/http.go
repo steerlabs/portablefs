@@ -1,0 +1,306 @@
+package controlplane
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
+)
+
+type Role string
+
+const (
+	RoleOperator Role = "operator"
+	RoleProduct  Role = "product"
+	RoleCell     Role = "cell"
+)
+
+type Principal struct {
+	Role Role
+	ID   string
+}
+
+type Authenticator func(*http.Request) (Principal, error)
+
+type HTTPHandler struct {
+	Manager      *Manager
+	Authenticate Authenticator
+}
+
+func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if handler.Manager == nil {
+		writeAPIError(writer, http.StatusServiceUnavailable, "manager unavailable")
+		return
+	}
+	authenticate := handler.Authenticate
+	if authenticate == nil {
+		authenticate = AuthenticateMTLS
+	}
+	principal, err := authenticate(request)
+	if err != nil {
+		writeAPIError(writer, http.StatusUnauthorized, "mutual TLS identity required")
+		return
+	}
+	path := strings.Trim(request.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	switch {
+	case request.Method == http.MethodGet && path == "healthz":
+		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok", "release_id": handler.Manager.ReleaseIdentity()})
+	case request.Method == http.MethodGet && path == "v1/release":
+		writeJSON(writer, http.StatusOK, map[string]string{"release_id": handler.Manager.ReleaseIdentity()})
+	case request.Method == http.MethodPost && path == "v1/cells":
+		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
+			var body RegisterCellRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			return handler.Manager.RegisterCell(idempotencyKey(request), body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "plan" && request.Method == http.MethodGet:
+		cellID := parts[2]
+		if principal.Role != RoleCell || principal.ID != cellID {
+			writeAPIError(writer, http.StatusForbidden, "cell identity mismatch")
+			return
+		}
+		plan, err := handler.Manager.CellPlan(cellID)
+		handler.writeResult(writer, plan, err)
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "observations" && request.Method == http.MethodPost:
+		cellID := parts[2]
+		if principal.Role != RoleCell || principal.ID != cellID {
+			writeAPIError(writer, http.StatusForbidden, "cell identity mismatch")
+			return
+		}
+		var body CellObservation
+		if err := decodeJSON(request, &body); err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		if body.CellID != cellID {
+			handler.writeResult(writer, nil, ErrInvalid)
+			return
+		}
+		if idempotencyKey(request) == "" {
+			writeAPIError(writer, http.StatusBadRequest, "Idempotency-Key is required")
+			return
+		}
+		result, err := handler.Manager.ObserveCell(idempotencyKey(request), body)
+		handler.writeResult(writer, result, err)
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "heartbeat" && request.Method == http.MethodPost:
+		cellID := parts[2]
+		if principal.Role != RoleCell || principal.ID != cellID {
+			writeAPIError(writer, http.StatusForbidden, "cell identity mismatch")
+			return
+		}
+		var body CellHeartbeat
+		if err := decodeJSON(request, &body); err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		if body.CellID != cellID {
+			handler.writeResult(writer, nil, ErrInvalid)
+			return
+		}
+		err := handler.Manager.HeartbeatCell(body)
+		if err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
+	case request.Method == http.MethodPost && path == "v1/volumes":
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body CreateVolumeRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(body.ProductIssuer) != principal.ID {
+				return nil, ErrNotFound
+			}
+			return handler.Manager.CreateVolume(idempotencyKey(request), body)
+		})
+	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "volumes" && request.Method == http.MethodGet:
+		if principal.Role != RoleProduct && principal.Role != RoleOperator {
+			writeAPIError(writer, http.StatusForbidden, "role not permitted")
+			return
+		}
+		result, err := handler.Manager.GetVolume(parts[2])
+		if err == nil && principal.Role == RoleProduct && result.ProductIssuer != principal.ID {
+			err = ErrNotFound
+		}
+		handler.writeResult(writer, result, err)
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "restart" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body RestartVolumeRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if body.VolumeID != parts[2] {
+				return nil, ErrInvalid
+			}
+			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+				return nil, err
+			}
+			return handler.Manager.RestartVolume(idempotencyKey(request), body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "strict-fence" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
+			var body ConfirmStrictFenceRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if body.VolumeID != parts[2] {
+				return nil, ErrInvalid
+			}
+			return handler.Manager.ConfirmStrictMountsFenced(idempotencyKey(request), body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "retire" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body RetireVolumeRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if body.VolumeID != parts[2] {
+				return nil, ErrInvalid
+			}
+			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+				return nil, err
+			}
+			return handler.Manager.RetireVolume(idempotencyKey(request), body)
+		})
+	case request.Method == http.MethodPost && path == "v1/mount-authorizations":
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body IssueMountRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+				return nil, err
+			}
+			return handler.Manager.IssueMount(idempotencyKey(request), body)
+		})
+	case request.Method == http.MethodPost && path == "v1/mount-reauthorizations":
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body ReauthorizeMountRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+				return nil, err
+			}
+			return handler.Manager.ReauthorizeMount(idempotencyKey(request), body)
+		})
+	default:
+		writeAPIError(writer, http.StatusNotFound, "not found")
+	}
+}
+
+func (handler *HTTPHandler) requireProductVolume(principal Principal, volumeID string) error {
+	if principal.Role != RoleProduct {
+		return ErrNotFound
+	}
+	volume, err := handler.Manager.GetVolume(volumeID)
+	if err != nil {
+		return err
+	}
+	if volume.ProductIssuer != principal.ID {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func AuthenticateMTLS(request *http.Request) (Principal, error) {
+	if request.TLS == nil || len(request.TLS.VerifiedChains) == 0 || len(request.TLS.PeerCertificates) == 0 {
+		return Principal{}, errors.New("verified client certificate required")
+	}
+	leaf := request.TLS.PeerCertificates[0]
+	if len(leaf.URIs) != 1 {
+		return Principal{}, errors.New("one control identity URI is required")
+	}
+	identity := leaf.URIs[0]
+	if identity.Scheme != "spiffe" || identity.Host != "portablefs" || identity.User != nil || identity.Opaque != "" ||
+		identity.RawQuery != "" || identity.ForceQuery || identity.Fragment != "" {
+		return Principal{}, errors.New("invalid control identity URI")
+	}
+	escapedPath := identity.EscapedPath()
+	if !strings.HasPrefix(escapedPath, "/") || strings.HasSuffix(escapedPath, "/") {
+		return Principal{}, errors.New("invalid control identity path")
+	}
+	parts := strings.Split(escapedPath[1:], "/")
+	if len(parts) != 3 || parts[0] != "control" || parts[2] == "" {
+		return Principal{}, errors.New("invalid control identity path")
+	}
+	role := Role(parts[1])
+	if role != RoleOperator && role != RoleProduct && role != RoleCell {
+		return Principal{}, errors.New("unknown control role")
+	}
+	decodedID, err := url.PathUnescape(parts[2])
+	if err != nil || !validIdentity(decodedID) || role == RoleCell && !cellplan.ValidID(decodedID) {
+		return Principal{}, errors.New("invalid control identity")
+	}
+	return Principal{Role: role, ID: decodedID}, nil
+}
+
+func (handler *HTTPHandler) requireRole(writer http.ResponseWriter, request *http.Request, principal Principal, role Role, operation func() (any, error)) {
+	if principal.Role != role {
+		writeAPIError(writer, http.StatusForbidden, "role not permitted")
+		return
+	}
+	if idempotencyKey(request) == "" {
+		writeAPIError(writer, http.StatusBadRequest, "Idempotency-Key is required")
+		return
+	}
+	result, err := operation()
+	handler.writeResult(writer, result, err)
+}
+
+func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, err error) {
+	if err == nil {
+		writeJSON(writer, http.StatusOK, result)
+		return
+	}
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, ErrInvalid), errors.Is(err, ErrIdempotencyReuse):
+		status = http.StatusBadRequest
+	case errors.Is(err, ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, ErrConflict), errors.Is(err, ErrCapacity), errors.Is(err, ErrQuarantined):
+		status = http.StatusConflict
+	}
+	writeAPIError(writer, status, err.Error())
+}
+
+func decodeJSON(request *http.Request, target any) error {
+	defer request.Body.Close()
+	payload, err := io.ReadAll(io.LimitReader(request.Body, (1<<20)+1))
+	if err != nil || len(payload) > 1<<20 {
+		return fmt.Errorf("%w: JSON body exceeds one MiB", ErrInvalid)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("%w: malformed JSON", ErrInvalid)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing JSON", ErrInvalid)
+	}
+	return nil
+}
+
+func idempotencyKey(request *http.Request) string {
+	return strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+}
+
+func writeJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+func writeAPIError(writer http.ResponseWriter, status int, detail string) {
+	writeJSON(writer, status, map[string]string{"error": detail})
+}

@@ -15,13 +15,15 @@ import (
 )
 
 var (
-	ErrEpochMismatch   = errors.New("volumeserver: authority epoch changed")
-	ErrSessionExpired  = errors.New("volumeserver: session expired")
-	ErrSessionFenced   = errors.New("volumeserver: session fenced")
-	ErrSequenceGap     = errors.New("volumeserver: mutation sequence gap")
-	ErrRequestMismatch = errors.New("volumeserver: operation identity reused with different request")
-	ErrSlotRange       = errors.New("volumeserver: replay slot is outside the negotiated range")
-	ErrAdmission       = errors.New("volumeserver: runtime admission bound reached")
+	ErrEpochMismatch          = errors.New("volumeserver: authority epoch changed")
+	ErrSessionExpired         = errors.New("volumeserver: session expired")
+	ErrSessionFenced          = errors.New("volumeserver: session fenced")
+	ErrSequenceGap            = errors.New("volumeserver: mutation sequence gap")
+	ErrRequestMismatch        = errors.New("volumeserver: operation identity reused with different request")
+	ErrSlotRange              = errors.New("volumeserver: replay slot is outside the negotiated range")
+	ErrAdmission              = errors.New("volumeserver: runtime admission bound reached")
+	ErrAuthorizationSequence  = errors.New("volumeserver: authorization sequence is not the exact next value")
+	ErrAuthorizationBroadened = errors.New("volumeserver: reauthorization attempted to broaden access")
 )
 
 type Epoch [16]byte
@@ -48,9 +50,8 @@ const (
 )
 
 // Authorization is the complete, signed authorization installed when a
-// session is attached. Deadline is an absolute, non-renewable boundary: lease
-// renewal can keep an otherwise idle session alive, but can never extend the
-// authority granted by the control plane.
+// session is attached or exactly reauthorized. Ordinary lease renewal never
+// extends Deadline; only a new session-bound signed authorization can do so.
 type Authorization struct {
 	Access   Access
 	Deadline time.Time
@@ -73,12 +74,9 @@ type Config struct {
 	Now                      func() time.Time
 }
 
-// sessionCredentialGeneration is the single credential generation an authority
-// mints for a session. The authority has no in-session credential rotation
-// path, so this is a protocol constant rather than a counter, and any other
-// value in a presented credential is stale or forged and fences the session.
-// If rotation is ever added, this becomes per-session state and every
-// comparison site it needs already exists.
+// sessionCredentialGeneration identifies the authority-minted resume secret.
+// Reauthorization rotates the signed access decision and optionally its TLS
+// peer key, not this secret, so the wire credential generation remains one.
 const sessionCredentialGeneration uint64 = 1
 
 type SessionCredential struct {
@@ -127,6 +125,8 @@ type session struct {
 	access                Access
 	leaseExpires          time.Time
 	authorizationDeadline time.Time
+	authorizationSequence uint64
+	authorizationProof    [32]byte
 	// lockLease publishes leaseExpires to the lock table. It is written under
 	// s.mu wherever leaseExpires is, so the table can never read a lease
 	// boundary the authority has not granted.
@@ -462,6 +462,74 @@ func (a *Authority) Resume(cred SessionCredential) error {
 		return err
 	}
 	use.End()
+	return nil
+}
+
+// Reauthorize installs the exact next signed authorization for a live session.
+// It is idempotent for a lost response, cannot broaden access, and may replace
+// the TLS peer identity only because the new grant was verified against that
+// peer before this method is called.
+func (a *Authority) Reauthorize(cred SessionCredential, authorization Authorization, sequence uint64, proof [32]byte) error {
+	if cred.Epoch != a.epoch || sequence == 0 || proof == ([32]byte{}) {
+		return ErrEpochMismatch
+	}
+	a.mu.Lock()
+	s := a.sessions[cred.ID]
+	if s == nil {
+		a.mu.Unlock()
+		return ErrSessionExpired
+	}
+	s.mu.Lock()
+	fail := func(err error, fence bool) error {
+		cleanup := false
+		if fence {
+			s.fenced = true
+			cleanup = a.endSessionLocked(cred.ID, s)
+		}
+		s.mu.Unlock()
+		a.mu.Unlock()
+		if cleanup {
+			a.finishSession(cred.ID)
+		}
+		return err
+	}
+	if s.fenced || s.ending {
+		return fail(ErrSessionFenced, true)
+	}
+	if cred.Generation != sessionCredentialGeneration || subtle.ConstantTimeCompare(s.secret[:], cred.Secret[:]) != 1 {
+		return fail(ErrSessionFenced, true)
+	}
+	if sequence == s.authorizationSequence {
+		if subtle.ConstantTimeCompare(s.authorizationProof[:], proof[:]) != 1 ||
+			subtle.ConstantTimeCompare(s.peer[:], cred.Peer[:]) != 1 {
+			return fail(ErrRequestMismatch, true)
+		}
+		s.mu.Unlock()
+		a.mu.Unlock()
+		return nil
+	}
+	if sequence != s.authorizationSequence+1 {
+		return fail(ErrAuthorizationSequence, true)
+	}
+	if authorization.Access&AccessRead == 0 || authorization.Access&^(AccessRead|AccessWrite|AccessAdmin) != 0 {
+		return fail(ErrSessionFenced, true)
+	}
+	if authorization.Access&^s.access != 0 {
+		return fail(ErrAuthorizationBroadened, true)
+	}
+	now := a.cfg.Now()
+	if authorization.Deadline.IsZero() || !now.Before(authorization.Deadline) {
+		return fail(ErrSessionExpired, true)
+	}
+	s.peer = cred.Peer
+	s.access = authorization.Access
+	s.authorizationDeadline = authorization.Deadline
+	s.authorizationSequence = sequence
+	s.authorizationProof = proof
+	s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), authorization.Deadline)
+	s.lockLease.Renew(s.leaseExpires)
+	s.mu.Unlock()
+	a.mu.Unlock()
 	return nil
 }
 

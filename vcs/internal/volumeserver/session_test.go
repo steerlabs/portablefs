@@ -134,6 +134,75 @@ func TestAuthorizationDeadlineCannotBeRenewed(t *testing.T) {
 	}
 }
 
+func TestExactReauthorizationExtendsDeadlineAndRotatesPeer(t *testing.T) {
+	a, now := testAuthority(t)
+	originalDeadline := now.Add(90 * time.Second)
+	cred, err := a.Attach(1, PeerIdentity{1}, Authorization{Access: AccessRead | AccessWrite, Deadline: originalDeadline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(30 * time.Second)
+	cred.Peer = PeerIdentity{2}
+	proof := [32]byte{9, 8, 7}
+	newDeadline := now.Add(5 * time.Minute)
+	if err := a.Reauthorize(cred, Authorization{Access: AccessRead, Deadline: newDeadline}, 1, proof); err != nil {
+		t.Fatalf("Reauthorize = %v", err)
+	}
+	if err := a.Reauthorize(cred, Authorization{Access: AccessRead, Deadline: newDeadline}, 1, proof); err != nil {
+		t.Fatalf("idempotent Reauthorize = %v", err)
+	}
+	if access, err := a.Access(cred); err != nil || access != AccessRead {
+		t.Fatalf("Access = %v, %v", access, err)
+	}
+	*now = now.Add(50 * time.Second)
+	if err := a.Resume(cred); err != nil {
+		t.Fatalf("lease renewal under the rotated authorization failed: %v", err)
+	}
+	*now = originalDeadline.Add(time.Second)
+	if err := a.Resume(cred); err != nil {
+		t.Fatalf("renewed authorization expired at the original deadline: %v", err)
+	}
+}
+
+func TestReauthorizationCannotBroadenOrChangeAnExactReplay(t *testing.T) {
+	for name, change := range map[string]func(*SessionCredential, *Authorization, *[32]byte, *uint64){
+		"broaden": func(_ *SessionCredential, authorization *Authorization, _ *[32]byte, _ *uint64) {
+			authorization.Access = AccessRead | AccessWrite
+		},
+		"sequence gap": func(_ *SessionCredential, _ *Authorization, _ *[32]byte, sequence *uint64) {
+			*sequence = 2
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, now := testAuthority(t)
+			cred, err := a.Attach(1, PeerIdentity{1}, Authorization{Access: AccessRead, Deadline: now.Add(time.Minute)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorization := Authorization{Access: AccessRead, Deadline: now.Add(2 * time.Minute)}
+			proof := [32]byte{1}
+			sequence := uint64(1)
+			change(&cred, &authorization, &proof, &sequence)
+			if err := a.Reauthorize(cred, authorization, sequence, proof); err == nil {
+				t.Fatal("unsafe reauthorization succeeded")
+			}
+			if err := a.Resume(cred); !errors.Is(err, ErrSessionExpired) && !errors.Is(err, ErrSessionFenced) {
+				t.Fatalf("unsafe reauthorization did not fence the session: %v", err)
+			}
+		})
+	}
+
+	a, now := testAuthority(t)
+	cred, _ := a.Attach(1, PeerIdentity{1}, Authorization{Access: AccessRead, Deadline: now.Add(time.Minute)})
+	authorization := Authorization{Access: AccessRead, Deadline: now.Add(2 * time.Minute)}
+	if err := a.Reauthorize(cred, authorization, 1, [32]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reauthorize(cred, authorization, 1, [32]byte{2}); !errors.Is(err, ErrRequestMismatch) {
+		t.Fatalf("changed exact replay = %v, want ErrRequestMismatch", err)
+	}
+}
+
 func TestSessionCleanupWaitsForAdmittedOperations(t *testing.T) {
 	a, _ := testAuthority(t)
 	cred, err := a.Attach(1, PeerIdentity{1}, testAuthorization(AccessRead))

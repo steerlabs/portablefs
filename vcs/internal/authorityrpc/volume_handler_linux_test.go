@@ -950,6 +950,45 @@ func (a allowAuthorizer) Authorize(context.Context, string, []byte) (volumeserve
 	return volumeserver.Authorization{Access: a.access, Deadline: time.Now().Add(time.Hour)}, nil
 }
 
+type reauthorizationTestAuthorizer struct {
+	session  volumeserver.SessionID
+	sequence uint64
+	deadline time.Time
+	proof    [32]byte
+}
+
+func (authorizer reauthorizationTestAuthorizer) Authorize(context.Context, string, []byte) (volumeserver.Authorization, error) {
+	return volumeserver.Authorization{}, errors.New("unexpected initial authorization")
+}
+
+func (authorizer reauthorizationTestAuthorizer) Reauthorize(_ context.Context, _ string, session volumeserver.SessionID, sequence uint64, token []byte) (volumeserver.Authorization, [32]byte, error) {
+	if session != authorizer.session || sequence != authorizer.sequence || string(token) != "renewed" {
+		return volumeserver.Authorization{}, [32]byte{}, errors.New("wrong reauthorization binding")
+	}
+	return volumeserver.Authorization{Access: volumeserver.AccessRead, Deadline: authorizer.deadline}, authorizer.proof, nil
+}
+
+func TestVolumeHandlerReauthorizesExactLiveSessionBeforeOrdinaryPeerAdmission(t *testing.T) {
+	handler, ctx, credential, _ := resourceAdmissionRequestHarness(t, &resourceAdmissionFaultStore{}, 8, 8)
+	deadline := time.Now().Add(2 * time.Hour).Round(0)
+	proof := [32]byte{0x99}
+	handler.Authorizer = reauthorizationTestAuthorizer{session: credential.ID, sequence: 1, deadline: deadline, proof: proof}
+	request := &authoritypb.Request{
+		RequestId: 7, Epoch: credential.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]},
+		Body:    &authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{AccessToken: []byte("renewed"), Sequence: 1}},
+	}
+	response := handler.Handle(ctx, request)
+	if response.GetErrno() != 0 || response.GetReauthorize() == nil || response.GetReauthorize().GetSequence() != 1 ||
+		response.GetReauthorize().GetAuthorizationDeadlineUnixNanos() != deadline.UnixNano() {
+		t.Fatalf("reauthorization response = %+v", response)
+	}
+	access, err := handler.Runtime.Access(credential)
+	if err != nil || access != volumeserver.AccessRead {
+		t.Fatalf("reauthorized access = %v, %v", access, err)
+	}
+}
+
 func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	root := os.Getenv("PORTABLEFS_XFS_TEST_ROOT")
 	projectRaw := os.Getenv("PORTABLEFS_XFS_TEST_PROJECT")

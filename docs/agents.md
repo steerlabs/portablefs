@@ -57,10 +57,12 @@ the unmount the last; the workspace carries all state between runs, including
 privileged Linux gate (`TestWorkloadGitAcrossMounts`,
 `TestWorkloadSQLiteAcrossMounts` — see [local-dev.md](./local-dev.md)).
 
-A mount capability is single-use and is never renewed. `portablefs mounts`
-reports a mount whose credential ended as `credential-expired`; mounting again
-with a fresh capability is what re-establishes it. Nothing in the runtime rotates
-credentials behind your back.
+An initial mount capability is single-use. In direct/standalone mode it is not
+renewed: `portablefs mounts` reports an ended credential as
+`credential-expired`, and a fresh capability plus remount re-establishes it. A
+hosted integration may instead push the exact next manager-issued
+reauthorization into the live session; the daemon never invents or silently
+extends authorization on its own.
 
 ## Parallel Agents
 
@@ -99,7 +101,7 @@ commands, and content search is `rg` inside a mount like anywhere else. An
 environment that cannot mount needs a different isolated runner that can, not a
 weaker remote-command surface.
 
-A sandbox mounts with direct credentials and nothing else:
+A standalone sandbox mounts with direct credentials and nothing else:
 
 - `--addr host:port` — the authority;
 - `--mount-token` (or `PORTABLEFS_MOUNT_TOKEN`) — one single-use volume mount
@@ -108,6 +110,10 @@ A sandbox mounts with direct credentials and nothing else:
   `tls-private-ca` with that name plus `--data-plane-ca ca.pem`;
 - `--client-cert` / `--client-key` — the mutual-TLS client identity (the key
   must be `chmod 600`).
+
+The hosted manager returns the same credential shape from a proof-of-possession
+CSR and can renew the live session without receiving the private key. See
+[hosted-control-plane.md](./hosted-control-plane.md).
 
 v3 authority sessions are mutually authenticated TLS 1.3, so plaintext cannot
 mount and there is no transport fallback to configure. Copy the static

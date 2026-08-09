@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -15,6 +16,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +32,11 @@ type options struct {
 	listen, volumeID, root                         string
 	projectID                                      uint
 	tlsCert, tlsKey, clientCA, capabilityPublicKey string
+	productAuthorizationPublicKey                  string
+	productIssuer, productAudience                 string
+	authorizationDomain, owner                     string
+	cellID, authorityID                            string
+	authorityGeneration                            uint64
 	maxFrame, maxRead, maxWrite                    uint
 	replaySlots                                    uint
 	maxSessions, maxLockRecords                    uint
@@ -58,6 +66,14 @@ func run() error {
 	flag.StringVar(&o.tlsKey, "tls-key", "", "server private key PEM")
 	flag.StringVar(&o.clientCA, "client-ca", "", "client CA bundle PEM")
 	flag.StringVar(&o.capabilityPublicKey, "capability-public-key", "", "Ed25519 capability public key PEM")
+	flag.StringVar(&o.productAuthorizationPublicKey, "product-authorization-public-key", "", "hosted mode: Ed25519 product authorization public key PEM")
+	flag.StringVar(&o.productIssuer, "product-issuer", "", "hosted mode: exact trusted product issuer")
+	flag.StringVar(&o.productAudience, "product-audience", "portablefs-manager", "hosted mode: exact product authorization audience")
+	flag.StringVar(&o.authorizationDomain, "authorization-domain", "", "hosted mode: immutable volume authorization domain")
+	flag.StringVar(&o.owner, "owner", "", "hosted mode: immutable volume owner")
+	flag.StringVar(&o.cellID, "cell-id", "", "hosted mode: exact storage cell identity")
+	flag.StringVar(&o.authorityID, "authority-id", "", "hosted mode: exact authority routing identity")
+	flag.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "hosted mode: monotonic authority generation")
 	flag.UintVar(&o.maxFrame, "max-frame-bytes", 16<<20, "hard protobuf frame allocation bound")
 	flag.UintVar(&o.maxRead, "max-read-bytes", 1<<20, "maximum bytes in one read reply")
 	flag.UintVar(&o.maxWrite, "max-write-bytes", 1<<20, "maximum bytes in one write request")
@@ -98,9 +114,15 @@ func run() error {
 	if os.Geteuid() == 0 {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
 	}
-	if o.listen == "" || o.volumeID == "" || o.root == "" || o.projectID == 0 ||
+	if (o.listen == "" && !systemdSocketAvailable()) || o.volumeID == "" || o.root == "" || o.projectID == 0 ||
 		o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" {
-		return errors.New("listen, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, and visibility membership file are required")
+		return errors.New("a listen address or one systemd socket, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, and visibility membership file are required")
+	}
+	hosted := o.productAuthorizationPublicKey != "" || o.productIssuer != "" || o.authorizationDomain != "" ||
+		o.owner != "" || o.cellID != "" || o.authorityID != "" || o.authorityGeneration != 0
+	if hosted && (o.productAuthorizationPublicKey == "" || o.productIssuer == "" || o.productAudience == "" ||
+		o.authorizationDomain == "" || o.owner == "" || o.cellID == "" || o.authorityID == "" || o.authorityGeneration == 0) {
+		return errors.New("hosted authority requires product key, issuer, audience, authorization domain, owner, cell, authority identity, and nonzero generation together")
 	}
 	maxUint32 := uint(^uint32(0))
 	if o.projectID > maxUint32 || o.maxFrame == 0 || o.maxFrame > maxUint32 ||
@@ -215,9 +237,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	var productPublicKey ed25519.PublicKey
+	var productAudience string
+	if hosted {
+		productPublicKey, err = readEd25519PublicKey(o.productAuthorizationPublicKey)
+		if err != nil {
+			return fmt.Errorf("read product authorization public key: %w", err)
+		}
+		productAudience = o.productAudience
+	}
 	authorizer := &volumecap.Authorizer{
 		PublicKey: publicKey, ClockSkew: 5 * time.Second,
 		MaxLifetime: o.capabilityLifetime, MaxRetainedNonces: int(o.capabilityNonces),
+		ProductPublicKey: productPublicKey, ProductIssuer: o.productIssuer, ProductAudience: productAudience,
+		AuthorizationDomain: o.authorizationDomain, Owner: o.owner, CellID: o.cellID,
+		AuthorityID: o.authorityID, AuthorityGeneration: o.authorityGeneration,
 	}
 	tlsConfig, err := serverTLSConfig(o.tlsCert, o.tlsKey, o.clientCA)
 	if err != nil {
@@ -258,7 +292,7 @@ func run() error {
 		MaxFrameBytesInFlight: o.maxFrameBytesInFlight,
 		HandshakeTimeout:      o.handshakeTimeout, IdleTimeout: o.idleTimeout, WriteTimeout: o.writeTimeout,
 	}
-	listener, err := net.Listen("tcp", o.listen)
+	listener, err := authorityListener(o.listen)
 	if err != nil {
 		return err
 	}
@@ -285,6 +319,35 @@ func run() error {
 	}
 }
 
+func systemdSocketAvailable() bool {
+	pid, err := strconv.Atoi(os.Getenv("LISTEN_PID"))
+	if err != nil || pid != os.Getpid() {
+		return false
+	}
+	fds, err := strconv.Atoi(os.Getenv("LISTEN_FDS"))
+	return err == nil && fds == 1
+}
+
+func authorityListener(address string) (net.Listener, error) {
+	if !systemdSocketAvailable() {
+		return net.Listen("tcp", address)
+	}
+	file := os.NewFile(uintptr(3), "systemd-authority-listener")
+	if file == nil {
+		return nil, errors.New("systemd listener fd 3 is unavailable")
+	}
+	listener, err := net.FileListener(file)
+	_ = file.Close()
+	if err != nil {
+		return nil, fmt.Errorf("adopt systemd authority listener: %w", err)
+	}
+	if _, ok := listener.(*net.TCPListener); !ok {
+		_ = listener.Close()
+		return nil, errors.New("systemd authority listener is not TCP")
+	}
+	return listener, nil
+}
+
 func serverTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
@@ -306,11 +369,41 @@ func serverTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, errors.New("client CA contains no certificates")
 	}
+	var identityMu sync.Mutex
+	cachedPEM := append([]byte(nil), certPEM...)
+	cachedIdentity := certificate
+	loadIdentity := func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		currentPEM, err := os.ReadFile(certFile)
+		if err != nil {
+			return nil, fmt.Errorf("reload server TLS certificate: %w", err)
+		}
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		if !bytes.Equal(currentPEM, cachedPEM) {
+			current, err := tls.X509KeyPair(currentPEM, keyPEM)
+			if err != nil {
+				return nil, fmt.Errorf("reload server TLS identity: %w", err)
+			}
+			cachedPEM = append(cachedPEM[:0], currentPEM...)
+			cachedIdentity = current
+		}
+		identity := cachedIdentity
+		identity.Certificate = cloneTLSChain(cachedIdentity.Certificate)
+		return &identity, nil
+	}
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs: pool, Certificates: []tls.Certificate{certificate},
+		ClientCAs: pool, GetCertificate: loadIdentity,
 		NextProtos: []string{authorityrpc.ProtocolALPN},
 	}, nil
+}
+
+func cloneTLSChain(chain [][]byte) [][]byte {
+	copy := make([][]byte, len(chain))
+	for index := range chain {
+		copy[index] = append([]byte(nil), chain[index]...)
+	}
+	return copy
 }
 
 func readPrivateFile(path string) ([]byte, error) {

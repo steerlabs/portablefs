@@ -1,0 +1,14 @@
+[Unit]
+Description=PortableFS authority listener for volume %i
+BindsTo=portablefs-authority@%i.service
+Before=portablefs-authority@%i.service
+
+[Socket]
+Accept=no
+Service=portablefs-authority@%i.service
+NoDelay=true
+Backlog=512
+FileDescriptorName=authority
+
+[Install]
+WantedBy=sockets.target

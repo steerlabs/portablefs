@@ -21,7 +21,8 @@ suspected vulnerabilities.
 Include what you can: the affected component — the authority
 (`portablefs-authority`), the Linux FUSE mount client (`portablefs-mount-v3`),
 the macOS `portablefsd` daemon or the FSKit extension, or the `portablefs` CLI
-and its installer (`scripts/install.sh`) — a reproduction or proof of concept,
+and its installer (`scripts/install.sh`), the hosted manager, cell agent, root
+helper, or authority launcher — a reproduction or proof of concept,
 the deployment shape (authority flags, TLS material, capability issuance), and
 impact.
 
@@ -50,9 +51,16 @@ flaws in them are in scope.
   once — if the single-use record cannot be retained, the authority refuses the
   capability instead of silently dropping replay protection
   (`vcs/internal/volumecap`).
-- **An absolute, non-renewable deadline.** The verified expiry becomes the
-  session's deadline. Lease renewal can keep an otherwise idle session alive but
-  can never extend the authority the capability granted.
+- **Signed deadline extension only.** The verified expiry becomes the session's
+  deadline. Keepalive can keep an otherwise idle session alive but cannot extend
+  authorization. Hosted reauthorization requires a fresh dual-signed grant
+  bound to the exact session and next sequence; it may preserve or narrow access
+  and fences changed replays, gaps, or attempted broadening.
+- **Dual authorization in hosted mode.** The product signs the user/owner/domain
+  decision and the manager signs exact placement, authority generation, access,
+  and client SPKI. The authority verifies both signatures and their agreement.
+  The client key is generated locally and only a proof-of-possession CSR reaches
+  the manager.
 - **Write is not admin.** An ordinary write claim covers file content and the
   namespace. Changing a volume's machine-local routing is a separate `admin`
   claim: mount mutation under `.portablefs/` is refused outright, the routing
@@ -107,8 +115,22 @@ attack under the race detector, are in
   capabilities, open file descriptions, accepted TLS connections, retained reply
   bytes, and inbound frame bytes in flight. The worker refuses to start without
   positive bounds.
+- **Immutable hosted isolation assignments.** Project ID, service UID/GID, TCP
+  port, cell, owner/domain, and authority identity are signed and durably pinned.
+  The helper refuses substitutions, same-generation plan equivocation, skipped
+  authority generations, or a successor without both local process absence and
+  external strict-mount fencing. Product mTLS principals cannot operate on a
+  different product issuer's volume.
 
 ### Local boundaries
+
+On a hosted Linux cell, the network-facing agent is unprivileged and outbound
+only. The root helper listens only on a root-owned Unix socket, authenticates the
+exact agent UID with `SO_PEERCRED`, and independently verifies the complete
+manager-signed plan. Its interface contains typed volume assignments, not raw
+paths, commands, environment, unit text, or executables. systemd owns the TCP
+listener and runs each authority under its unique service UID with a private
+network and exactly one volume/config/state bind-mount set.
 
 Per-account mount state, the daemon control socket, and the app-group socket
 reject foreign ownership, unsafe permissions, and symlinked paths before they

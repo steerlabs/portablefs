@@ -254,11 +254,11 @@ func TestDoctorMountHealthFailures(t *testing.T) {
 		"FAIL  mounts: 2 mount(s): 1 stale, 1 credential-expired",
 		"/tmp/stale  vol1@main  fuse  stale",
 		"/tmp/expired  vol2@main  fuse  credential-expired",
-		// A v3 mount capability is single-use and is never renewed, so the
+		// The direct CLI does not acquire hosted reauthorization, so the
 		// only repair for a credential-expired mount is mounting again with a
 		// fresh one — which is what the remedy says, with no other command in
 		// it to send the operator somewhere that cannot help.
-		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; mount credential-expired paths again with a fresh volume mount capability (a v3 capability is single-use and is never renewed)",
+		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; mount credential-expired paths again with a fresh volume mount capability (the direct CLI does not acquire hosted reauthorization)",
 	)
 }
 

@@ -219,13 +219,15 @@ before upgrading.
   API. Authority credentials live only in daemon memory and are never written
   into the daemon's durable attach registry, so a restarted daemon revives
   attaches inert.
-- **The mount capability is single-use and is never renewed.** There is no
-  credential rotation and no lease keeper. When a mount's credential ends,
-  `portablefs mounts` reports it as `credential-expired`; mounting again with a
-  fresh capability is what re-establishes the mount. `POST
-  /v1/attaches/{ref}/credential` exists to hand a revived daemon back the exact
-  credential recorded for an attach it is about to tear down, not to keep a live
-  mount alive.
+- **The initial mount capability is single-use.** In standalone mode, expiry
+  ends the session and a fresh capability plus remount re-establishes it. In
+  hosted mode, `POST /v1/attaches/{ref}/credential` can carry the exact next
+  nonzero authorization sequence, a session-bound grant, and a renewed
+  same-key client certificate. The daemon invokes the authority's
+  `Reauthorize` operation before publishing that credential. It cannot broaden
+  access, skip a sequence, change the mount key, or turn keepalive into
+  authorization. The endpoint also retains its earlier pending-attach recovery
+  role after a daemon restart.
 - **Outlives mounts.** Exact unmount durably removes the attach but leaves the
   daemon running for the next mount. A v3 attach carries no client-side
   durability debt, so a daemon with no attaches owns nothing and is safe to

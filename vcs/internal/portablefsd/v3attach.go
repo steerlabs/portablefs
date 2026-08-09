@@ -1,13 +1,18 @@
 package portablefsd
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -98,6 +103,7 @@ type persistedV3Attach struct {
 // after construction; the mutable session state lives on attach.v3Data.
 type v3AttachConfig struct {
 	// identity is nil exactly when revived is true.
+	identityMu         sync.RWMutex
 	identity           *tls.Certificate
 	cachedNameCapacity uint64
 	repairBudget       time.Duration
@@ -108,6 +114,99 @@ type v3AttachConfig struct {
 	// cannot prove what the kernel cached before it, so a revived v3 attach is
 	// permanently inactivatable and exists only to be exactly unmounted.
 	revived bool
+}
+
+func (c *v3AttachConfig) clientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	if c == nil {
+		return nil, errors.New("v3 client identity is unavailable")
+	}
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	if c.identity == nil {
+		return nil, errors.New("v3 client identity is unavailable")
+	}
+	identity := *c.identity
+	identity.Certificate = cloneCertificateChain(c.identity.Certificate)
+	return &identity, nil
+}
+
+// replacementCertificate validates a manager-renewed certificate against the
+// private key that was generated locally for this mount. Reauthorization may
+// renew a certificate for that key; changing the key would change the mTLS
+// principal and requires a new mount/session.
+func (c *v3AttachConfig) replacementCertificate(certificatePEM string, now time.Time) (*tls.Certificate, error) {
+	if c == nil || certificatePEM == "" {
+		return nil, errors.New("v3 reauthorization requires a renewed client certificate")
+	}
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	if c.identity == nil || c.identity.PrivateKey == nil {
+		return nil, errors.New("v3 client identity is unavailable")
+	}
+	chain, leaf, err := parseCertificateChain([]byte(certificatePEM))
+	if err != nil {
+		return nil, err
+	}
+	signer, ok := c.identity.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, errors.New("v3 client private key is not a signer")
+	}
+	want, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return nil, err
+	}
+	got, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	if err != nil || !bytes.Equal(want, got) {
+		return nil, errors.New("renewed client certificate does not match the mount-local private key")
+	}
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) || !permitsClientAuth(leaf.ExtKeyUsage) {
+		return nil, errors.New("renewed client certificate is not currently valid for client authentication")
+	}
+	return &tls.Certificate{Certificate: chain, PrivateKey: c.identity.PrivateKey, Leaf: leaf}, nil
+}
+
+func (c *v3AttachConfig) installReplacementCertificate(identity *tls.Certificate) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.identity = identity
+}
+
+func parseCertificateChain(raw []byte) ([][]byte, *x509.Certificate, error) {
+	var chain [][]byte
+	rest := raw
+	for len(rest) != 0 {
+		block, remaining := pem.Decode(rest)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, nil, errors.New("renewed client identity must contain only CERTIFICATE PEM blocks")
+		}
+		chain = append(chain, append([]byte(nil), block.Bytes...))
+		rest = bytes.TrimSpace(remaining)
+	}
+	if len(chain) == 0 {
+		return nil, nil, errors.New("renewed client identity contains no certificate")
+	}
+	leaf, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		return nil, nil, err
+	}
+	return chain, leaf, nil
+}
+
+func permitsClientAuth(usages []x509.ExtKeyUsage) bool {
+	for _, usage := range usages {
+		if usage == x509.ExtKeyUsageClientAuth || usage == x509.ExtKeyUsageAny {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneCertificateChain(chain [][]byte) [][]byte {
+	copy := make([][]byte, len(chain))
+	for index := range chain {
+		copy[index] = append([]byte(nil), chain[index]...)
+	}
+	return copy
 }
 
 func (c *v3AttachConfig) persisted() *persistedV3Attach {
@@ -325,7 +424,8 @@ func (a *attach) startV3(ctx context.Context) error {
 		// dial below must never run without endpoint verification.
 		return errors.New("v3 attach requires a verified TLS transport")
 	}
-	tlsCfg.Certificates = []tls.Certificate{*cfg.identity}
+	tlsCfg.Certificates = nil
+	tlsCfg.GetClientCertificate = cfg.clientCertificate
 	a.credMu.RLock()
 	token := a.token
 	a.credMu.RUnlock()

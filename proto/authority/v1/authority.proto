@@ -37,6 +37,7 @@ message Request {
     CancelRequest cancel = 15;
     NextVisibilityRequest next_visibility = 16;
     AckVisibilityRequest ack_visibility = 17;
+    ReauthorizeRequest reauthorize = 19;
     LookupRequest lookup = 20;
     GetAttrRequest get_attr = 21;
     SetAttrRequest set_attr = 22;
@@ -106,6 +107,7 @@ message Response {
     VisibilityEvent visibility = 33;
     ApplyRoutesReply apply_routes = 34;
     SyncFSReply sync_fs = 35;
+    ReauthorizeReply reauthorize = 36;
   }
 }
 
@@ -271,6 +273,18 @@ message AttachReply {
 }
 message ResumeRequest {}
 message KeepAliveRequest {}
+// Reauthorize replaces only the signed access decision of this exact live
+// session. The token is bound to the session ID, the TLS peer SPKI, and this
+// monotonic sequence. Retrying an identical sequence after a lost reply is
+// idempotent; a gap, changed token, or broader access fences the session.
+message ReauthorizeRequest {
+  bytes access_token = 1;
+  uint64 sequence = 2;
+}
+message ReauthorizeReply {
+  uint64 sequence = 1;
+  int64 authorization_deadline_unix_nanos = 2;
+}
 // MountAbsenceProof is the evidence a strict frontend presents that its own
 // kernel mount is gone. It replaced a boolean the client could only ever set to
 // true: a flag records an intention, an observation records a fact. The

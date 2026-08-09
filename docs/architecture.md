@@ -64,6 +64,13 @@ product stored elsewhere.
    an AppleDouble `._*` sidecar. Linux and the authority expose `EOPNOTSUPP`
    directly; neither client invents a second xattr store.
 
+9. **Lifecycle control stays out of filesystem I/O.** The optional hosted
+   manager may store placement, quota entitlement, PKI, authorization receipts,
+   desired state, and observed health. It never stores file bytes or metadata
+   and is not consulted by ordinary reads, writes, locks, or visibility repair.
+   Cells poll it outbound; network input never becomes a privileged path,
+   command, unit file, or executable.
+
 ## What not to build
 
 - A second durable store, index, or operation log beside XFS.
@@ -82,6 +89,8 @@ product stored elsewhere.
 | Exact visibility, durability, and retry rules | [consistency-model.md](./consistency-model.md) |
 | What a process observes when something breaks | [failure-modes.md](./failure-modes.md) |
 | Running a volume | [xfs-authority-deployment.md](./xfs-authority-deployment.md) |
+| Hosted placement, credentials, reauthorization, and fencing | [hosted-control-plane.md](./hosted-control-plane.md) |
+| Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
 | macOS 26's declared cache policy and its open gates | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
 | How a macOS mount is established | [fskit-mount.md](./fskit-mount.md) |
 | Machine-local routing and its confinement boundary | [graft-security.md](./graft-security.md) |

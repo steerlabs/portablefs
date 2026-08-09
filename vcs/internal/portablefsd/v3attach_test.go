@@ -678,7 +678,7 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 	}
 	// Never a silent retry, never a fallback: the terminal attach refuses
 	// reactivation and names the unmount as the one exit.
-	if err := a.activate(context.Background(), "fresh-capability", 0); err == nil ||
+	if err := a.activate(context.Background(), "fresh-capability", 0, 1, ""); err == nil ||
 		!strings.Contains(err.Error(), "unmount") {
 		t.Fatalf("terminal v3 attach reactivation = %v, want an unmount-directing refusal", err)
 	}
@@ -705,7 +705,7 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 	if b == nil || !b.isV3() || b.v3Config == nil || !b.v3Config.revived {
 		t.Fatalf("revived v3 attach = %+v", b)
 	}
-	if err := b.activate(context.Background(), "capability", 0); err == nil ||
+	if err := b.activate(context.Background(), "capability", 0, 1, ""); err == nil ||
 		!strings.Contains(err.Error(), "unmount") {
 		t.Fatalf("revived v3 activation = %v, want an unmount-directing refusal", err)
 	}

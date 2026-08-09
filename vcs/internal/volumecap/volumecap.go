@@ -9,6 +9,7 @@ import (
 	"container/heap"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/productauth"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
@@ -50,16 +52,41 @@ type Claims struct {
 	// presentation, so a captured token is not a reusable credential for the
 	// remainder of its validity window.
 	Nonce string `json:"nonce"`
+	// Hosted grants additionally bind the exact storage placement and
+	// authority generation. A stale authority can verify only grants from its
+	// own generation, even when it still has an otherwise trusted signing key.
+	CellID              string `json:"cell_id,omitempty"`
+	AuthorityID         string `json:"authority_id,omitempty"`
+	AuthorityGeneration uint64 `json:"authority_generation,omitempty"`
+	// ProductAuthorization is the product's independently signed decision.
+	// The manager signs the infrastructure envelope around it; the authority
+	// verifies both signatures and the pinned owner/domain/issuer.
+	ProductAuthorization string `json:"product_authorization,omitempty"`
+	// SessionID and Sequence are present only on an in-session
+	// reauthorization. They make retrying the same signed token harmless and
+	// make replay against any other session impossible.
+	SessionID string `json:"session_id,omitempty"`
+	Sequence  uint64 `json:"sequence,omitempty"`
 }
 
 type Authorizer struct {
 	PublicKey ed25519.PublicKey
-	Now       func() time.Time
-	ClockSkew time.Duration
+	// The following fields are all required together for a hosted authority.
+	// Leaving all of them empty preserves the standalone, one-signature mode.
+	ProductPublicKey    ed25519.PublicKey
+	ProductIssuer       string
+	ProductAudience     string
+	AuthorizationDomain string
+	Owner               string
+	CellID              string
+	AuthorityID         string
+	AuthorityGeneration uint64
+	Now                 func() time.Time
+	ClockSkew           time.Duration
 	// MaxLifetime is the longest validity window this authority will honour,
 	// regardless of what the control plane signed. The verified expiry becomes
-	// the session's absolute, non-renewable deadline, so without this bound one
-	// minting mistake produces a capability nothing can revoke.
+	// the initial session deadline or the exact reauthorization deadline, so
+	// without this bound one minting mistake produces an excessively long grant.
 	MaxLifetime time.Duration
 	// MaxRetainedNonces bounds the single-use records held at once. Retention
 	// is bounded in time by MaxLifetime, so this bounds memory as a function of
@@ -78,45 +105,79 @@ func (a *Authorizer) Authorize(ctx context.Context, volumeID string, token []byt
 }
 
 func (a *Authorizer) Verify(volumeID string, token []byte, peer [32]byte) (volumeserver.Authorization, error) {
+	authorization, _, err := a.verify(volumeID, token, peer, volumeserver.SessionID{}, 0, true)
+	return authorization, err
+}
+
+// Reauthorize verifies a retryable, session-bound grant. Unlike an attach
+// capability it is not spent in the process-global nonce set: its exact
+// session ID and monotonic sequence are the replay boundary, and the runtime
+// retains the token digest for an idempotent lost-response retry.
+func (a *Authorizer) Reauthorize(ctx context.Context, volumeID string, sessionID volumeserver.SessionID, sequence uint64, token []byte) (volumeserver.Authorization, [32]byte, error) {
+	peer, ok := authorityrpc.PeerIdentity(ctx)
+	if !ok || sessionID == (volumeserver.SessionID{}) || sequence == 0 {
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
+	}
+	return a.VerifyReauthorization(volumeID, sessionID, sequence, token, peer)
+}
+
+// VerifyReauthorization is the explicit-peer form used by non-transport
+// callers and conformance tests. Production RPC obtains peer only from the
+// verified TLS connection and calls Reauthorize above.
+func (a *Authorizer) VerifyReauthorization(volumeID string, sessionID volumeserver.SessionID, sequence uint64, token []byte, peer [32]byte) (volumeserver.Authorization, [32]byte, error) {
+	if sessionID == (volumeserver.SessionID{}) || sequence == 0 {
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
+	}
+	return a.verify(volumeID, token, peer, sessionID, sequence, false)
+}
+
+func (a *Authorizer) verify(volumeID string, token []byte, peer [32]byte, sessionID volumeserver.SessionID, sequence uint64, spend bool) (volumeserver.Authorization, [32]byte, error) {
 	if len(a.PublicKey) != ed25519.PublicKeySize || len(token) == 0 || len(token) > 8192 || volumeID == "" ||
 		a.ClockSkew < 0 || a.MaxLifetime <= 0 || a.MaxRetainedNonces <= 0 {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	parts := strings.Split(string(token), ".")
 	if len(parts) != 3 || parts[0] != "v1" {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil || len(payload) == 0 || len(payload) > 4096 {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(signature) != ed25519.SignatureSize ||
 		!ed25519.Verify(a.PublicKey, append([]byte(domain), payload...), signature) {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
 	var claims Claims
 	if err := dec.Decode(&claims); err != nil {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	if claims.VolumeID != volumeID || claims.Subject == "" || claims.Nonce == "" || claims.Expires <= claims.NotBefore {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
+	}
+	if spend {
+		if claims.SessionID != "" || claims.Sequence != 0 {
+			return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
+		}
+	} else if claims.SessionID != base64.RawURLEncoding.EncodeToString(sessionID[:]) || claims.Sequence != sequence {
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	boundPeer, err := base64.RawURLEncoding.DecodeString(claims.PeerSPKI)
 	if err != nil || len(boundPeer) != len(peer) || subtle.ConstantTimeCompare(boundPeer, peer[:]) != 1 {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	now := time.Now()
 	if a.Now != nil {
 		now = a.Now()
 	}
 	if now.Add(a.ClockSkew).Unix() < claims.NotBefore || now.Add(-a.ClockSkew).Unix() >= claims.Expires {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	// "Short-lived" has to be a property this authority enforces, not a promise
 	// the minting service makes. Both the declared window and the remaining
@@ -124,7 +185,7 @@ func (a *Authorizer) Verify(volumeID string, token []byte, peer [32]byte) (volum
 	// expiry, the second refuses one whose not_before is far in the past.
 	seconds := int64(a.MaxLifetime / time.Second)
 	if seconds <= 0 || claims.Expires-claims.NotBefore > seconds || claims.Expires-now.Unix() > seconds {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	var access volumeserver.Access
 	for _, permission := range claims.Access {
@@ -140,19 +201,51 @@ func (a *Authorizer) Verify(volumeID string, token []byte, peer [32]byte) (volum
 			// .portablefs/local-dirs changes what every other machine can see.
 			access |= volumeserver.AccessRead | volumeserver.AccessWrite | volumeserver.AccessAdmin
 		default:
-			return volumeserver.Authorization{}, ErrInvalid
+			return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 		}
 	}
 	if access&volumeserver.AccessRead == 0 {
-		return volumeserver.Authorization{}, ErrInvalid
+		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
+	}
+	if err := a.verifyHosted(claims, peer, now); err != nil {
+		return volumeserver.Authorization{}, [32]byte{}, err
 	}
 	// Spending the nonce is the last step: a token is only consumed once it
 	// would otherwise have been accepted, so a malformed or misdirected
 	// presentation cannot burn a legitimate capability.
-	if err := a.spent.spend(claims.Nonce, time.Unix(claims.Expires, 0), now, a.MaxRetainedNonces); err != nil {
-		return volumeserver.Authorization{}, err
+	if spend {
+		if err := a.spent.spend(claims.Nonce, time.Unix(claims.Expires, 0), now, a.MaxRetainedNonces); err != nil {
+			return volumeserver.Authorization{}, [32]byte{}, err
+		}
 	}
-	return volumeserver.Authorization{Access: access, Deadline: time.Unix(claims.Expires, 0)}, nil
+	return volumeserver.Authorization{Access: access, Deadline: time.Unix(claims.Expires, 0)}, sha256.Sum256(token), nil
+}
+
+func (a *Authorizer) verifyHosted(claims Claims, peer [32]byte, now time.Time) error {
+	configured := len(a.ProductPublicKey) != 0 || a.ProductIssuer != "" || a.ProductAudience != "" ||
+		a.AuthorizationDomain != "" || a.Owner != "" || a.CellID != "" ||
+		a.AuthorityID != "" || a.AuthorityGeneration != 0
+	if !configured {
+		if claims.ProductAuthorization != "" || claims.CellID != "" || claims.AuthorityID != "" || claims.AuthorityGeneration != 0 {
+			return ErrInvalid
+		}
+		return nil
+	}
+	if len(a.ProductPublicKey) != ed25519.PublicKeySize || a.ProductIssuer == "" || a.ProductAudience == "" ||
+		a.AuthorizationDomain == "" || a.Owner == "" || a.CellID == "" || a.AuthorityID == "" ||
+		a.AuthorityGeneration == 0 || claims.CellID != a.CellID || claims.AuthorityID != a.AuthorityID ||
+		claims.AuthorityGeneration != a.AuthorityGeneration || claims.ProductAuthorization == "" {
+		return ErrInvalid
+	}
+	verified, err := productauth.Verify(a.ProductPublicKey, []byte(claims.ProductAuthorization), productauth.Expectations{
+		Issuer: a.ProductIssuer, Audience: a.ProductAudience, AuthorizationDomain: a.AuthorizationDomain,
+		Owner: a.Owner, VolumeID: claims.VolumeID, PeerSPKI: peer, Now: now,
+		ClockSkew: a.ClockSkew, MaxLifetime: a.MaxLifetime,
+	})
+	if err != nil || verified.Claims.Subject != claims.Subject || !productauth.Allows(verified.Claims.Access, claims.Access) {
+		return ErrInvalid
+	}
+	return nil
 }
 
 // spentNonces retains accepted capability nonces until they expire. Expiry is

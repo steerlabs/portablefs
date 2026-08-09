@@ -1,0 +1,47 @@
+[Unit]
+Description=PortableFS privileged cell helper for cell %i
+After=local-fs.target
+Before=portablefs-cell-agent@%i.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/portablefs/cells/%i.env
+ExecStart=/usr/local/libexec/portablefs-cell-helper -cell-id %i -agent-uid ${PORTABLEFS_AGENT_UID} -agent-gid ${PORTABLEFS_AGENT_GID} -socket /run/portablefs-cell-helper/%i.sock -plan-public-key /etc/portablefs/trust/plan-public.pem
+Restart=on-failure
+RestartSec=2s
+User=root
+Group=portablefs-agent
+RuntimeDirectory=portablefs-cell-helper
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StateDirectory=portablefs-cell-helper
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ReadWritePaths=/run/portablefs-cell-helper /srv/portablefs /etc/portablefs/volumes /etc/systemd/system /var/lib/portablefs /var/lib/portablefs-cell-helper
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# RestrictSUIDSGID's seccomp filter rejects openat2 outright. The helper needs
+# read-only openat2 with RESOLVE_BENEATH/NO_MAGICLINKS/NO_XDEV for confinement;
+# NoNewPrivileges and the writable-path allowlist remain the privilege boundary.
+SystemCallArchitectures=native
+UMask=0077
+TasksMax=256
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

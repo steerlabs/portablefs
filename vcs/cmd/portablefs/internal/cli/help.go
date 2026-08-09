@@ -140,8 +140,8 @@ tls-system-pki with --data-plane-server-name, or tls-private-ca with that
 name plus --data-plane-ca), and the manager-issued mutual-TLS client
 identity (--client-cert/--client-key; the key must be chmod 600). v3
 authority sessions are mutually authenticated TLS 1.3, so plaintext cannot
-mount. There is no manager or lease flow: credentials are minted by the
-deployment's own provisioning (see docs/xfs-authority-deployment.md), and an
+mount. This direct CLI does not call the optional hosted manager: credentials
+are supplied by the deployment (see docs/xfs-authority-deployment.md), and an
 invocation missing any of the direct-credential flags is refused with the
 missing flags named. A v3 volume is branchless: the retired --branch flag is
 an error.
@@ -230,9 +230,9 @@ and no umount path — including --force — ever reads standard input.
 List this machine's recorded mounts with their health: live (daemon serving),
 stale (daemon gone; umount cleans up), or credential-expired (the daemon is
 running but this mount's credential ended). A v3 mount capability is single-use
-and never renewed, so mounting again with a fresh capability is what
-re-establishes one. The mount log under ~/.local/state/portablefs/mounts/
-carries the daemon's own reason.
+and the direct CLI does not acquire hosted reauthorization, so mounting again
+with a fresh capability is what re-establishes one. The mount log under
+~/.local/state/portablefs/mounts/ carries the daemon's own reason.
 `,
 		"mount-check": `USAGE
   portablefs mount-check [--strategy auto|fskit|fuse] [--json]

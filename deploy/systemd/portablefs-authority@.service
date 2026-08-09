@@ -1,0 +1,46 @@
+[Unit]
+Description=PortableFS authority for volume %i
+Requires=portablefs-authority@%i.socket
+After=portablefs-authority@%i.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/portablefs-authority-launcher
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateUsers=no
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# RestrictSUIDSGID rejects openat2, which is the authority's descriptor-relative
+# path-confinement primitive. NoNewPrivileges, an empty capability set, and the
+# nosuid/noexec XFS mount prevent set-ID files from becoming a privilege path.
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf io_uring_setup keyctl open_by_handle_at perf_event_open pidfd_getfd process_vm_readv process_vm_writev ptrace userfaultfd
+UMask=0077
+TasksMax=4096
+LimitNOFILE=131072
+MemoryHigh=1G
+MemoryMax=2G
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

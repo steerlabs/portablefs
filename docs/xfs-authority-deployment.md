@@ -15,12 +15,14 @@ The launch topology is one active authority process per volume over one
 encrypted XFS filesystem. It is single-AZ durable storage, not multi-AZ high
 availability, and it has no automatic second writer.
 
-Two things an operator has to accept before deploying:
+Two things an operator has to decide or accept before deploying:
 
-- **There is no control plane in this tree.** Nothing here mints mount
-  capabilities, issues client certificates, or renews an authorization inside a
-  live session. Minting is currently an operator or integration responsibility;
-  see [Issuing credentials](#issuing-credentials).
+- **Choose standalone or hosted lifecycle.** This runbook shows a directly
+  operated authority and out-of-band credentials. The same repository now also
+  contains a standalone hosted manager, outbound cell agent, narrow root helper,
+  and systemd templates; see
+  [hosted-control-plane.md](./hosted-control-plane.md) and
+  [hosted-cell-deployment.md](./hosted-cell-deployment.md).
 - **Clean strict detach fails closed by default.** Without
   `--mount-absence-verify-command`, a strict mount can never leave durable
   membership on its own, so every authority restart after a strict mount depends
@@ -188,7 +190,7 @@ All nine are mandatory and startup refuses without them.
 | `--mount-absence-verify-command` | *(unset)* | program that corroborates a strict mount's kernel-absence claim. **Unset means clean detach always fails closed.** |
 | `--mount-absence-verify-timeout` | `30s` | bound on one verification command run |
 | `--prior-strict-mounts-fenced` | `false` | operator assertion that every recorded prior strict kernel mount was proven unusable |
-| `--capability-max-lifetime` | `15m` | longest capability validity window this authority will honour; the verified expiry is an absolute non-renewable session deadline |
+| `--capability-max-lifetime` | `15m` | longest signed grant window the authority will honour; keepalive cannot extend it, while hosted reauthorization requires a fresh grant |
 | `--session-lease` | `2m` | renewable session lease |
 | `--max-repair-budget` | `30s` | longest per-phase cache-repair deadline a strict mount may commit to before it is fenced. Must be at least the mount's own `--repair-budget`, whose default is `15s`. |
 | `--visibility-clock-skew` | `5s` | clock disagreement tolerated when a mount timestamps its own kernel-mount absence |
@@ -329,19 +331,19 @@ The authority enforces the window against `--capability-max-lifetime`
 regardless of what was signed, so one minting mistake cannot produce a
 capability nothing can revoke. It retains accepted nonces until they expire and
 refuses a second presentation; if it cannot retain the record it refuses rather
-than silently dropping replay protection. **Expiry is an absolute, non-renewable
-mount-session deadline.** Keepalive is liveness only. Issue a new credential and
-remount instead of extending an old grant.
+than silently dropping replay protection. In standalone mode, **expiry is the
+absolute mount-session deadline**. Keepalive is liveness only. Hosted mode can
+extend the deadline only through the separately signed, session-bound,
+monotonic `Reauthorize` operation described below.
 
 Note that `write` deliberately does not imply `admin`: changing
 `.portablefs/local-dirs` changes what every *other* machine can see, so an
 ordinary mount's capability must not be able to do it.
 
-### There is no minting service in this tree
+### Standalone minting and the hosted issuer
 
-Nothing in this repository runs as a control plane that authenticates a user,
-places a volume, issues a client certificate, or mints a capability. Today an
-operator or an integration mints capabilities out of band with
+For a standalone authority, an operator or integration mints capabilities out
+of band with
 `volumecap.Sign` and hands each mount its address, its single-use capability,
 and its client identity directly.
 
@@ -354,11 +356,13 @@ is one the authority will actually accept. It is a test harness tool, not a
 production issuer: it writes private keys to a directory and has no identity,
 audit, or revocation story.
 
-The v3 control plane — grant minting bound to a locally generated client key,
-ambiguous-creation receipts, and in-session reauthorization that may extend a
-deadline but never broaden access — is future work. Its required contract is
-described in [xfs-authority-architecture.md](./xfs-authority-architecture.md).
-Until it exists, a long-lived mount ends at its capability's absolute deadline.
+The hosted `portablefs-manager` implements grant minting bound to a locally
+generated client key, byte-identical idempotency receipts, independent product
+and infrastructure signatures, and in-session reauthorization that may extend
+a deadline but never broaden access. The manager does not authenticate end users
+itself; it verifies the product's signed authorization. See
+[hosted-control-plane.md](./hosted-control-plane.md). A standalone mount still
+ends at its initial capability's deadline.
 
 ## Mounting from Linux
 

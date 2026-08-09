@@ -69,16 +69,16 @@ var errFastRetired = fmt.Errorf("--fast is retired: every mount is adaptive (the
 var errBranchRetired = fmt.Errorf("--branch is retired: a v3 volume is branchless; remove the flag")
 
 // errMountNeedsDirectV3Credentials is the refusal for a mount invocation that
-// still expects the legacy manager/lease flow. The retained manager mints
-// only v2 HMAC leases, which cannot admit a v3 authority session, and there
-// is deliberately no fallback to the legacy clientcore mount — so the absent
-// arguments are named instead of silently mounting a weaker engine.
+// still expects the legacy manager/lease flow. This direct CLI does not yet
+// call the hosted v3 manager, and there is deliberately no fallback to the
+// legacy clientcore mount — so the absent arguments are named instead of
+// silently mounting a weaker engine.
 var errMountNeedsDirectV3Credentials = fmt.Errorf(
 	"portablefs mount attaches the v3 authority stack and needs direct credentials: pass " +
 		"--addr <host:port>, a mount capability via --mount-token (or " + mountTokenEnv + "), " +
 		"--data-plane-transport tls-private-ca|tls-system-pki (with --data-plane-server-name, and --data-plane-ca for a private CA), " +
 		"and the mutual-TLS client identity via --client-cert/--client-key. " +
-		"The retained authority manager cannot mint v3 credentials, so a manager/lease-only invocation is refused rather than mounted on the retired v2 engine")
+		"This direct CLI cannot mint v3 credentials or acquire them from the hosted manager, so a manager/lease-only invocation is refused rather than mounted on the retired v2 engine")
 
 func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	addCommonFlags(fs, &o.common)
@@ -1259,9 +1259,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	if o.readyFD > 0 {
 		readyPipe = os.NewFile(uintptr(o.readyFD), "portablefs-ready")
 	}
-	// A v3 mount capability is single-use and never renewed, so there is no
-	// access lease to keep, release, or reconcile: the whole lease-keeper
-	// stage went with the manager-backed architecture.
+	// A v3 mount capability is single-use and this direct CLI does not acquire
+	// hosted reauthorization, so there is no access lease for this supervisor to
+	// keep, release, or reconcile.
 	leaseCleanupSafe := true
 	leaseCleanupAttempted := false
 	startupCleanupComplete := false
@@ -1740,9 +1740,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err := ctl.bindMountRoot(attachRef); err != nil {
 			return failAfterKernelMount(fmt.Errorf("bind the daemon's repair mount root: %w", err))
 		}
-		// There is no credential rotation to hand off: the mount capability is
-		// single-use, already consumed by the daemon's attach, and a v3 session
-		// is never re-authenticated from this supervisor.
+		// There is no credential rotation to hand off from this direct CLI: the
+		// initial capability is already consumed by the daemon's attach. A hosted
+		// product can separately reauthorize the live daemon session.
 		ready.AttachRef = attachRef
 		state.LocalDirs = attachReply.LocalDirs
 		state.LocalDirsDeclared = attachReply.LocalDirsDeclared
@@ -3382,15 +3382,15 @@ func mountStatusWord(row mountStatusInput) string {
 	case "cleanup-required":
 		return "cleanup-required (incomplete " + row.operationPhase + " operation; run `portablefs umount " + row.mountPath + "`)"
 	case mountStatusCredentialExpired:
-		// A persisted verdict from a mount whose credential ended. A v3 mount
-		// capability is single-use and never renewed, so remounting is the
-		// whole remedy.
+		// A persisted verdict from a mount whose signed authorization already
+		// ended. Reauthorization must happen before that deadline, so remounting
+		// is now the whole remedy.
 		since := ""
 		if row.statusChangedAtMs != 0 {
 			since = " since " + formatMs(row.statusChangedAtMs)
 		}
 		return "credential-expired" + since +
-			" (this mount's credential ended and cannot be renewed; mount again " +
+			" (this mount's authorization ended and can no longer be renewed; mount again " +
 			"with a fresh volume mount capability)"
 	}
 	if row.attachState != "degraded" {

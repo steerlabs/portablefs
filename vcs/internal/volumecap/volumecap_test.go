@@ -64,8 +64,8 @@ func TestTamperedAndUnknownPermissionFailClosed(t *testing.T) {
 }
 
 // Defect 5: Verify only required Expires > NotBefore, so a capability minted
-// with an expiry in the year 3000 verified and became the session's absolute,
-// non-renewable deadline. No keepalive limit, sweep, or lease expiry can revoke
+// with an expiry in the year 3000 verified and became the session's effective
+// authorization deadline. No keepalive limit, sweep, or lease expiry can revoke
 // that, so "short-lived" has to be enforced here.
 func TestAbsurdCapabilityLifetimeIsRefused(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)

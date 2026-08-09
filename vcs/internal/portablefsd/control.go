@@ -102,8 +102,9 @@ func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"attachRef":  a.ref,
-			"volumeName": a.volumeName,
+			"attachRef":              a.ref,
+			"volumeName":             a.volumeName,
+			"authorizationSessionId": a.authorizationSessionID(),
 		})
 	case http.MethodGet:
 		var out []attachStatus
@@ -180,14 +181,16 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			// hardens into the definite expired verdict instead of pending
 			// forever. OPTIONAL and additive — an older CLI omits it, the zero
 			// value states no deadline, and nothing hardens.
-			AuthTokenExpiresAtMs int64 `json:"authTokenExpiresAtMs,omitempty"`
-			OnlyIfPending        bool  `json:"onlyIfPending,omitempty"`
+			AuthTokenExpiresAtMs int64  `json:"authTokenExpiresAtMs,omitempty"`
+			AuthSequence         uint64 `json:"authSequence,omitempty"`
+			ClientCertPEM        string `json:"clientCertPem,omitempty"`
+			OnlyIfPending        bool   `json:"onlyIfPending,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.AuthTokenExpiresAtMs, req.OnlyIfPending)
+		found, activated, err := s.registry.activate(r.Context(), ref, req.AuthToken, req.AuthTokenExpiresAtMs, req.AuthSequence, req.ClientCertPEM, req.OnlyIfPending)
 		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, err.Error())
 			return
