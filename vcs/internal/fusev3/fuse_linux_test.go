@@ -790,6 +790,41 @@ func TestMountVolumeRequiresACompleteConfiguration(t *testing.T) {
 	}
 }
 
+func TestFailedStartupCleanRequiresExactSessionRelease(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		detachErr error
+		wantClean bool
+	}{
+		{name: "released", wantClean: true},
+		{name: "detach refused", detachErr: syscall.EIO, wantClean: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rpc := newFakeRPC()
+			rpc.detachErr = test.detachErr
+			cfg := testConfig(8)
+			cfg.Coherence = CoherenceStrict
+			cfg.MaxInFlight = 0
+			_, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg)
+			if err == nil {
+				t.Fatal("an incomplete mount configuration was accepted")
+			}
+			wrapped := fmt.Errorf("supervisor boundary: %w", err)
+			if got := FailedStartupClean(wrapped); got != test.wantClean {
+				t.Fatalf("FailedStartupClean(%v) = %t, want %t", err, got, test.wantClean)
+			}
+			rpc.snapshot(func(f *fakeRPC) {
+				if len(f.detachProofs) != 1 {
+					t.Fatalf("detach proofs = %d, want 1", len(f.detachProofs))
+				}
+				if f.closes != 1 {
+					t.Fatalf("RPC closes = %d, want 1", f.closes)
+				}
+			})
+		})
+	}
+}
+
 // --- Defect 12: mknod ------------------------------------------------------
 
 func TestMknodCreatesRegularFilesAndRefusesUnrepresentableTypes(t *testing.T) {

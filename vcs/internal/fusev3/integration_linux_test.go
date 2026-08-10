@@ -1161,6 +1161,9 @@ func TestFailedKernelMountDischargesStrictMembership(t *testing.T) {
 		}
 		t.Fatalf("mount on a non-searchable target = (%v, %v), want startup refusal", mount, err)
 	}
+	if !FailedStartupClean(err) {
+		t.Fatalf("proven-absent failed startup was not classified clean: %v", err)
+	}
 	if isMounted(t, mountpoint) {
 		t.Fatal("failed startup left a kernel mount installed")
 	}

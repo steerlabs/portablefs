@@ -130,3 +130,6 @@ privileged XFS and kernel-FUSE suite.
   installed a kernel mount. Every Linux frontend now assigns a random source to
   each attempt; after mount creation fails, the supervisor proves that exact
   source absent from `mountinfo` and cleanly detaches the authenticated session.
+  That exact cleanup verdict now also completes the CLI's failed-startup
+  transaction, removing its local mount intent and closing any automatic
+  enrollment; ambiguous failures retain both recovery anchors.

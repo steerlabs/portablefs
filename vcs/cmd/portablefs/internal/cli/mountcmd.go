@@ -1628,17 +1628,20 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// The v3 engine. The mount capability is single-use — its nonce is
 		// spent by the attach below — so from here every failure path must
 		// tear down exactly, never retry the attach.
-		m, err := mountFUSEv3(fuseV3Config{
+		m, authorityAttached, err := mountFUSEv3(fuseV3Config{
 			addr: authorityURL, token: mountToken, transport: transport,
 			identity: clientIdentity, coherence: o.coherence,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
 			backingRoot: localDirsBackingRoot(stateDir, volumeID),
 			noLocalDirs: o.noLocalDirs, requireMountEnrollment: enrollmentClient != nil,
 		})
+		automaticOwnerEstablished = enrollmentClient != nil && authorityAttached
 		if err != nil {
+			if failedFUSEStartupClean(err) {
+				return finalizeCleanedStartup(err)
+			}
 			return failReady(err)
 		}
-		automaticOwnerEstablished = enrollmentClient != nil
 		kernelMountID, err := captureFUSEKernelMountID(mountPath, mountInstanceID)
 		if err != nil {
 			// A path-based unmount is unsafe when the kernel table is absent,

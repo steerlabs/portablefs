@@ -150,6 +150,29 @@ type Config struct {
 	LocalBacking string
 }
 
+// cleanStartupFailure is an error whose failed mount attempt has no remaining
+// kernel mount or authority session. It is deliberately private: callers may
+// inspect the verdict, but only this package owns the evidence that creates it.
+type cleanStartupFailure struct {
+	cause error
+}
+
+func (e *cleanStartupFailure) Error() string { return e.cause.Error() }
+func (e *cleanStartupFailure) Unwrap() error { return e.cause }
+
+// FailedStartupClean reports whether err proves that a failed mount startup
+// left neither a kernel mount nor an authority session behind. Supervisors may
+// use this verdict to remove their durable startup intent. Any unclassified
+// error must remain recoverable and be reconciled explicitly.
+func FailedStartupClean(err error) bool {
+	var clean *cleanStartupFailure
+	return errors.As(err, &clean)
+}
+
+func markCleanStartupFailure(cause error) error {
+	return &cleanStartupFailure{cause: cause}
+}
+
 type Mount struct {
 	server *fuse.Server
 	// kernelConnectionDone closes only after go-fuse has stopped every request
@@ -243,7 +266,10 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	}
 	fsName := "portablefs:" + cfg.MountInstanceID
 	failBeforeKernelMount := func(cause error) (*Mount, error) {
-		return nil, errors.Join(cause, releaseUninstalledSession(rpc, cfg.Coherence, fsName, mountpoint))
+		if err := releaseUninstalledSession(rpc, cfg.Coherence, fsName, mountpoint); err != nil {
+			return nil, errors.Join(cause, err)
+		}
+		return nil, markCleanStartupFailure(cause)
 	}
 	if cfg.RequestTimeout <= 0 || cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.MaxInFlight < minMaxInFlight {
 		return failBeforeKernelMount(fmt.Errorf("fusev3: complete mount configuration is required with at least %d authority in-flight slots", minMaxInFlight))
@@ -326,14 +352,15 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 func releaseUninstalledSession(rpc RPC, profile CoherenceProfile, fsName, mountpoint string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
 	defer cancel()
+	proof, err := observePlannedKernelMountAbsent(fsName, mountpoint)
+	if err != nil {
+		return errors.Join(fmt.Errorf("fusev3: establish failed-startup mount absence: %w", err), rpc.Close())
+	}
 	if profile != CoherenceStrict {
 		_, _ = rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
 		return rpc.Close()
 	}
-	proof, err := observePlannedKernelMountAbsent(fsName, mountpoint)
-	if err == nil {
-		err = rpc.DetachAfterUnmount(ctx, proof)
-	}
+	err = rpc.DetachAfterUnmount(ctx, proof)
 	if err != nil {
 		err = fmt.Errorf("fusev3: release failed-startup strict session: %w", err)
 	}
@@ -399,14 +426,26 @@ func (m *Mount) start(lease time.Duration) {
 }
 
 // abortMount removes a kernel mount that was installed but cannot be served,
-// then releases the authority session. It always reports the original cause.
+// then releases the authority session. Only exact absence plus a clean session
+// close upgrades the original error to a clean-startup verdict.
 func (m *Mount) abortMount(cause error) error {
 	_ = m.server.Unmount()
 	m.Wait()
-	if err := m.Close(); err != nil {
+	absenceErr := m.failedStartupKernelAbsent()
+	closeErr := m.Close()
+	if err := errors.Join(absenceErr, closeErr); err != nil {
 		return errors.Join(cause, err)
 	}
-	return cause
+	return markCleanStartupFailure(cause)
+}
+
+func (m *Mount) failedStartupKernelAbsent() error {
+	if m.kernelMount.point != "" {
+		_, err := m.kernelMount.absent()
+		return err
+	}
+	_, err := observePlannedKernelMountAbsent(m.plannedFSName, m.plannedMountpoint)
+	return err
 }
 
 // mountOptions builds the kernel interface this frontend is willing to speak.
