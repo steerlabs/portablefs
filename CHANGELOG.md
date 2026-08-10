@@ -125,3 +125,8 @@ privileged XFS and kernel-FUSE suite.
   different identity.
 - Preserve atomic in-place upgrades from the immediately preceding signed FSKit
   identity while staged releases remain current-identity-only.
+- A Linux mount attempt that joined strict membership and then failed inside
+  `fusermount3` retained a durable participant forever even though it had never
+  installed a kernel mount. Every Linux frontend now assigns a random source to
+  each attempt; after mount creation fails, the supervisor proves that exact
+  source absent from `mountinfo` and cleanly detaches the authenticated session.

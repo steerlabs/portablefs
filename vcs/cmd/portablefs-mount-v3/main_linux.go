@@ -21,6 +21,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 	"golang.org/x/sys/unix"
 )
@@ -112,6 +113,10 @@ func run() error {
 	if profile == fusev3.CoherenceStrict && (*cachedNames <= 0 || *repairBudget <= 0) {
 		return errors.New("strict coherence requires a positive cached-name capacity and repair budget; both are declared to the authority")
 	}
+	mountInstanceID, err := mountid.NewMountInstance()
+	if err != nil {
+		return fmt.Errorf("create unique mount identity: %w", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	attach := authorityrpc.ClientConfig{
@@ -160,7 +165,7 @@ func run() error {
 		return err
 	}
 	mount, err := fusev3.MountVolume(context.Background(), absoluteMount, transport, fusev3.Config{
-		FSName: "portablefs:" + *volumeID, RequestTimeout: *requestTimeout,
+		MountInstanceID: mountInstanceID, RequestTimeout: *requestTimeout,
 		MaxBackground: *maxBackground, MaxInFlight: *maxInFlight, ReclaimQueue: *reclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
 		Coherence: profile, CachedNameCapacity: *cachedNames, RepairBudget: *repairBudget,

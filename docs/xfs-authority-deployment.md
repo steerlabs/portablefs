@@ -243,7 +243,10 @@ The report is produced after platform-specific terminal conditions:
 - Linux requires the recorded mount ID to disappear from `/proc/self/mountinfo`
   and the exact go-fuse serve loop to finish. This matters because `MNT_DETACH`
   may hide a mount while a retained file or working directory keeps its FUSE
-  connection alive.
+  connection alive. If `fusermount3` fails before there is a mount ID, the
+  supervisor instead scans the complete mount table for that attempt's random
+  FUSE source. It reports clean detach only when the source is absent and no
+  serving loop remains capable of installing or serving it.
 
 Only then does the authority remove that exact participant and durably
 deactivate its membership. No independent host-attestation daemon or verifier

@@ -289,7 +289,7 @@ func (f *fakeRPC) snapshot(read func(*fakeRPC)) {
 
 func testConfig(watermark int) Config {
 	return Config{
-		FSName: "portablefs-test", RequestTimeout: 2 * time.Second,
+		MountInstanceID: "mnt_AAAAAAAAAAAAAAAAAAAAAA", RequestTimeout: 2 * time.Second,
 		MaxBackground: 8, MaxInFlight: 16, ReclaimQueue: watermark,
 		PresentedUID: 501, PresentedGID: 20,
 	}
@@ -762,6 +762,18 @@ func TestMountVolumeRejectsBoundsBelowTheKernelWriteFloor(t *testing.T) {
 
 func TestMountVolumeRequiresACompleteConfiguration(t *testing.T) {
 	cfg := testConfig(8)
+	cfg.MountInstanceID = "volume-wide-source"
+	rpc := newFakeRPC()
+	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg); err == nil {
+		t.Fatal("a non-random mount identity must be refused")
+	}
+	rpc.mu.Lock()
+	closes := rpc.closes
+	rpc.mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("RPC closes after invalid mount identity = %d, want 1", closes)
+	}
+	cfg = testConfig(8)
 	cfg.MaxInFlight = 0
 	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
 		t.Fatal("a mount without the authority in-flight budget cannot reserve a liveness lane and must be refused")
@@ -771,7 +783,7 @@ func TestMountVolumeRequiresACompleteConfiguration(t *testing.T) {
 	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
 		t.Fatal("an in-flight budget too small to carve lanes from must be refused")
 	}
-	rpc := newFakeRPC()
+	rpc = newFakeRPC()
 	rpc.root = nil
 	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, testConfig(8)); err == nil {
 		t.Fatal("a missing authority root must be refused")

@@ -46,6 +46,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionExpiryReleasesABlockedLockWait"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts"
   # The strict-profile cache-coherence battery. These are the only tests that
