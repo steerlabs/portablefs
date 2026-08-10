@@ -77,10 +77,12 @@ Initial open-source release preparation. No tagged release yet.
   real, the repair gate is installed at resolve, and data invalidation is armed
   under exact one-shot provenance. Its residual race and its open live-kernel
   gates are stated in `docs/macos-26-coherence-contract.md`.
-- **`portablefs-authority` gained a wireable mount-absence verification command**,
-  so a clean detach can deactivate durable strict membership. Without it, clean
-  detach fails closed and every restart after a strict mount depends on the
-  operator asserting that prior mounts were fenced.
+- **Strict clean detach now has one explicit cooperative-client trust boundary.**
+  The authority accepts a mount-absence observation only on the authenticated
+  request for that exact session. FSKit reports only after exact `getfsstat`
+  absence; Linux additionally waits for the exact FUSE serving connection to
+  terminate, covering lazy-unmount references. Crashes and ambiguous teardown
+  still retain durable membership and require fencing before restart.
 
 ### Fixed
 

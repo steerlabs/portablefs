@@ -321,11 +321,11 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		if profile == volumeserver.CoherenceStrict {
-			// A strict mount leaves the barrier only against evidence that its
-			// kernel mount is gone. Without evidence there is nothing to accept
-			// here: the frontend must let its session die instead, which fences
-			// it, and durable membership keeps naming it until an operator says
-			// the mount was made unusable.
+			// credential() authenticated this request as cred.ID and DetachRequest
+			// contains no caller-selected session. CleanDetach therefore trusts
+			// only the official supervisor for this exact mount. A frontend that
+			// cannot establish terminal kernel state sends no observation and lets
+			// the session die fenced, leaving durable membership active.
 			if h.Visibility == nil {
 				return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
 			}

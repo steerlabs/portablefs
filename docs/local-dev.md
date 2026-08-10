@@ -52,7 +52,7 @@ bash scripts/xfs-fuse-integration.sh --in-container   # container side; needs ro
 Runs a throwaway privileged container against a real XFS loopback filesystem
 with project quotas and real kernel FUSE mounts. The same script is the CI entry
 point and the local reproduction, so a green CI run and a developer run execute
-byte-identical provisioning. It enumerates 43 required tests by name: a test
+byte-identical provisioning. It enumerates 44 required tests by name: a test
 that is renamed, deleted, or skipped fails the job rather than quietly shrinking
 privileged coverage.
 

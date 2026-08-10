@@ -82,11 +82,10 @@ const (
 	visibilityReserve = 1
 )
 
-// MountAbsenceProof is evidence that this mount's kernel mount is gone. The
-// authority stops holding the whole volume hostage for a departed strict
-// participant only against evidence; a closed connection or a tidy shutdown is
-// not evidence, so a frontend that cannot observe its own absence must let the
-// session die instead of detaching cleanly.
+// MountAbsenceProof is the official supervisor's local observation that this
+// mount's exact kernel identity is gone. It is sent only after the same Mount
+// has also observed its go-fuse serving connection terminate. A frontend that
+// cannot establish both conditions lets the session die fenced.
 type MountAbsenceProof struct {
 	ObservedUnixNanos int64
 	Observation       []byte
@@ -342,11 +341,11 @@ func observeKernelMount(mountpoint string) (kernelMount, error) {
 // path: a different filesystem mounted at the same path afterwards must not be
 // mistaken for this one still being there.
 //
-// A lazily detached mount also leaves mountinfo while processes that were
-// already inside it keep their references, so absence alone would be a weaker
-// claim than it looks. Revocation is what closes that: it aborts the connection
-// before any detach can be attempted, and after an abort there is no request
-// this frontend could answer at all.
+// A lazily detached mount leaves mountinfo while processes that were already
+// inside it may retain references, so this function alone is not authorization
+// to report clean detach. Mount.detach additionally waits for the exact go-fuse
+// serving connection to terminate, then calls absent again for the final
+// timestamped observation.
 func (k kernelMount) absent() (MountAbsenceProof, error) {
 	data, err := os.ReadFile(mountInfoPath)
 	if err != nil {
@@ -968,26 +967,50 @@ func (m *Mount) setNotifier(notify kernelNotifier) {
 	m.notify = notify
 }
 
-// detach releases the authority session. A strict mount may only detach
-// cleanly against evidence that its kernel mount is gone; without that
-// evidence the correct behaviour is to say nothing and let the session die,
-// because the authority must keep treating this participant as a possible
-// holder of stale names.
-func (m *Mount) detach() {
+// detach releases the authority session. A strict mount may send a clean-detach
+// statement only after both its exact mount identity is absent and its exact
+// FUSE serving connection is terminal. Linux lazy unmount makes either fact on
+// its own insufficient. A failed check is returned to the supervisor and the
+// RPC close leaves durable membership active.
+func (m *Mount) detach() error {
 	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
 	defer cancel()
 	if m.profile != CoherenceStrict {
+		// An uncached mount has no visibility membership to discharge. Detach is
+		// best-effort resource cleanup; connection close is sufficient if the
+		// authority is already unavailable.
 		_, _ = m.rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
-		return
+		return nil
 	}
 	if m.kernelMount.point == "" {
-		return
+		return errors.New("fusev3: strict detach has no recorded kernel mount identity")
 	}
+	// Refuse a live mount immediately. If it is absent because MNT_DETACH was
+	// used, wait below for retained references to release the old connection.
+	if _, err := m.kernelMount.absent(); err != nil {
+		return fmt.Errorf("fusev3: strict detach cannot establish exact mount absence: %w", err)
+	}
+	if m.kernelConnectionDone == nil {
+		return errors.New("fusev3: strict detach cannot observe the FUSE serving connection")
+	}
+	select {
+	case <-m.kernelConnectionDone:
+	case <-ctx.Done():
+		return fmt.Errorf("fusev3: strict detach waited for the exact FUSE serving connection: %w", ctx.Err())
+	}
+	// Produce the statement after connection termination so its timestamp names
+	// the complete condition, not merely the earlier namespace detach.
 	proof, err := m.kernelMount.absent()
-	if err != nil || !proof.valid() {
-		return
+	if err != nil {
+		return fmt.Errorf("fusev3: strict detach cannot re-establish exact mount absence: %w", err)
 	}
-	_ = m.rpc.DetachAfterUnmount(ctx, proof)
+	if !proof.valid() {
+		return errors.New("fusev3: strict detach produced an incomplete mount-absence observation")
+	}
+	if err := m.rpc.DetachAfterUnmount(ctx, proof); err != nil {
+		return fmt.Errorf("fusev3: deliver authenticated clean detach: %w", err)
+	}
+	return nil
 }
 
 const detachTimeout = 5 * time.Second

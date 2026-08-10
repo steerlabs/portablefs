@@ -104,20 +104,11 @@ const (
 
 // DurableVisibilityMembership is outside the disposable authority runtime.
 // Activate must durably record a strict mount before attach returns. Deactivate
-// must durably record verified kernel unmount/host fencing before the authority
-// drops the mount's barrier obligation.
+// must durably record an authenticated clean detach or host fencing before the
+// authority drops the mount's barrier obligation.
 type DurableVisibilityMembership interface {
 	Activate(SessionID) error
 	Deactivate(SessionID) error
-}
-
-// MountAbsenceVerifier authenticates evidence that the exact kernel mount bound
-// to a strict session is no longer capable of serving cache state. Syntax and a
-// plausible timestamp are not proof: the frontend controls those bytes. A
-// deployment without a verifier therefore cannot cleanly deactivate durable
-// membership and must use external/operator fencing after the session ends.
-type MountAbsenceVerifier interface {
-	VerifyMountAbsence(SessionID, MountAbsenceProof) error
 }
 
 // SessionFencer ends one session's authority-side liveness immediately.
@@ -240,12 +231,12 @@ type VisibilityEvent struct {
 	Routes *RoutesChange
 }
 
-// MountAbsenceProof is the evidence a strict frontend presents that its own
-// kernel mount is gone. Observation is opaque to the authority: no authority
-// can re-derive a remote kernel's mount table, and pretending otherwise is how
-// the previous unconditional boolean came to exist. What the authority enforces
-// is the ordering that makes the evidence mean something - see
-// VisibilityCoordinator.CleanDetach.
+// MountAbsenceProof is the authenticated supervisor's observation that its own
+// exact kernel mount is gone. Observation is opaque diagnostic context: a
+// remote authority cannot independently inspect the client's kernel. The trust
+// boundary is the session-authenticated Detach request, and the frontend is
+// responsible for making the statement only after its platform-specific mount
+// identity and serving connection are terminal. See CleanDetach.
 type MountAbsenceProof struct {
 	ObservedUnixNanos int64
 	Observation       []byte
@@ -497,10 +488,6 @@ type VisibilityConfig struct {
 	Prior      PriorEpochDisposition
 	Membership DurableVisibilityMembership
 	Fencer     SessionFencer
-	// AbsenceVerifier is optional at construction so deployments without a host
-	// attestation service can still serve conservatively. CleanDetach fails closed
-	// while it is nil and leaves durable membership active.
-	AbsenceVerifier MountAbsenceVerifier
 	// MaxCachedNameCapacity is the largest resolved-index size this deployment
 	// will allocate per strict mount. An attach declaring more is refused rather
 	// than clamped, so what a mount was admitted on and what it is running
@@ -753,17 +740,17 @@ func (c *VisibilityCoordinator) InitialCursor(id SessionID) (VisibilityCursor, e
 	return p.acked, nil
 }
 
-// CleanDetach removes a participant that has proven its own kernel mount is
-// gone. Verified absence is stronger than cache repair - there is no longer a
-// mount that can serve the stale name - so a valid proof also discharges an
-// outstanding barrier obligation.
+// CleanDetach removes the exact participant whose authenticated supervisor says
+// its kernel mount is gone. Terminal mount absence is stronger than cache
+// repair - there is no longer a mount that can serve the stale name - so a
+// valid observation also discharges an outstanding barrier obligation.
 //
-// The proof is opaque, so what is checked is the ordering that makes it
-// evidence rather than an assertion: the observation must postdate this mount's
-// registration, must postdate the obligation it is discharging, and must not be
-// dated in the future. An observation taken before the outstanding event was
-// created says nothing about that event. A frontend with nothing to observe has
-// no proof to send and must let its session die instead, which fences it.
+// The authority cannot inspect a remote kernel, so it does not pretend the
+// opaque bytes are independent attestation. The caller must have authenticated
+// this request as id's current authority session. The coordinator still checks
+// that the observation is complete, temporally belongs to this mount, postdates
+// the obligation it discharges, and is not dated in the future. A frontend with
+// nothing to observe sends nothing and lets its session die fenced.
 func (c *VisibilityCoordinator) CleanDetach(id SessionID, proof MountAbsenceProof) error {
 	now := c.cfg.Now()
 	c.mu.Lock()
@@ -776,17 +763,6 @@ func (c *VisibilityCoordinator) CleanDetach(id SessionID, proof MountAbsenceProo
 		c.mu.Unlock()
 		return err
 	}
-	if c.cfg.AbsenceVerifier == nil {
-		c.mu.Unlock()
-		return fmt.Errorf("%w: no mount-absence verifier is configured", ErrVisibilityProof)
-	}
-	// Verification runs while the participant is still in the set and while the
-	// current pending obligation cannot change. Verifiers must be bounded local
-	// attestation checks and must not call back into the coordinator.
-	if err := c.cfg.AbsenceVerifier.VerifyMountAbsence(id, proof); err != nil {
-		c.mu.Unlock()
-		return fmt.Errorf("%w: %w", ErrVisibilityProof, err)
-	}
 	delete(c.participants, id)
 	delete(c.fairness, id)
 	pending := p.pending
@@ -794,7 +770,8 @@ func (c *VisibilityCoordinator) CleanDetach(id SessionID, proof MountAbsenceProo
 	p.signalLocked()
 	close(p.left)
 	c.mu.Unlock()
-	// The mount is already proven absent, so nothing waits on the durable write.
+	// The authenticated supervisor has already made the mount terminal, so
+	// nothing waits on the durable write.
 	if pending != nil {
 		pending.finish(nil)
 	}

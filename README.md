@@ -105,14 +105,14 @@ portablefs-authority \
   -tls-cert server.pem -tls-key server.key \
   -client-ca clients-ca.pem \
   -capability-public-key capability.pub.pem \
-  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership \
-  -mount-absence-verify-command /usr/local/libexec/portablefs-verify-absence
+  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership
 ```
 
-Then mount it, as above. Without `-mount-absence-verify-command` a clean detach
-always fails closed: the authority cannot observe a remote kernel's mount table,
-so every restart after a strict mount then depends on the operator asserting
-`-prior-strict-mounts-fenced`.
+Then mount it, as above. On clean unmount the official mount supervisor first
+makes its exact kernel mount terminal, then sends a session-authenticated detach
+observation. The authority deactivates only that session's durable membership.
+If the supervisor crashes, cannot establish terminal mount state, or cannot
+deliver the detach, membership remains active and restart still fails closed.
 
 Full operator guidance — provisioning, credentials, bounds, restart, and backups
 — is in [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md).
@@ -211,7 +211,7 @@ release-trust policy checkers, and a stale-architecture scan.
 Deeper gates:
 
 ```bash
-bash scripts/xfs-fuse-integration.sh    # privileged: real XFS + kernel FUSE, 43 required tests
+bash scripts/xfs-fuse-integration.sh    # privileged: real XFS + kernel FUSE, 44 required tests
 bash scripts/coherence-matrix-linux.sh  # 23-case two-mount black-box matrix, with falsifiability controls
 bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume, recorded not gated
 ```

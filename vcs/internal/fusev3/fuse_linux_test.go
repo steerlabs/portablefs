@@ -78,6 +78,7 @@ type fakeRPC struct {
 	// queued overlapping mutation before returning success to the report.
 	onBlocked     func()
 	detachProofs  []MountAbsenceProof
+	detachErr     error
 	visibilityErr error
 	// mutationStates are attached, in order, to successful mutation responses.
 	// afterMutation runs after the envelope has been attached but before the
@@ -1496,5 +1497,5 @@ func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.detachProofs = append(f.detachProofs, proof)
-	return nil
+	return f.detachErr
 }

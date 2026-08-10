@@ -23,10 +23,10 @@ Two things an operator has to decide or accept before deploying:
   and systemd templates; see
   [hosted-control-plane.md](./hosted-control-plane.md) and
   [hosted-cell-deployment.md](./hosted-cell-deployment.md).
-- **Clean strict detach fails closed by default.** Without
-  `--mount-absence-verify-command`, a strict mount can never leave durable
-  membership on its own, so every authority restart after a strict mount depends
-  on an unverified operator assertion. See [Restarting the
+- **Clean strict detach trusts the official mount supervisor.** The authority
+  accepts a terminal-mount observation only on the authenticated request for
+  that exact session. A missing or failed observation keeps durable membership
+  active. See [Clean detach](#clean-detach) and [Restarting the
   authority](#restarting-the-authority).
 
 ## Host and disk
@@ -162,7 +162,6 @@ portablefs-authority \
   --capability-public-key /run/portablefs/capability-public.pem \
   --visibility-membership-file \
     /srv/portablefs/.portablefs-control/vol_01JXYZ/strict-membership \
-  --mount-absence-verify-command /usr/local/libexec/portablefs-verify-absence \
   --max-sessions 1024 \
   --max-lock-records 65536
 ```
@@ -187,8 +186,6 @@ All nine are mandatory and startup refuses without them.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--mount-absence-verify-command` | *(unset)* | program that corroborates a strict mount's kernel-absence claim. **Unset means clean detach always fails closed.** |
-| `--mount-absence-verify-timeout` | `30s` | bound on one verification command run |
 | `--prior-strict-mounts-fenced` | `false` | operator assertion that every recorded prior strict kernel mount was proven unusable |
 | `--capability-max-lifetime` | `15m` | longest signed grant window the authority will honour; keepalive cannot extend it, while hosted reauthorization requires a fresh grant |
 | `--session-lease` | `2m` | renewable session lease |
@@ -230,30 +227,30 @@ least one maximal request, `--connection-idle-timeout` must exceed `--session-le
 and `--max-in-flight` must be at least 2 so an ordinary request can proceed
 alongside a blocking lock wait.
 
-### Clean detach and the absence verifier
+### Clean detach
 
-The authority cannot observe a remote kernel's mount table, and the proof bytes
-arrive from the very frontend whose absence they claim. So a strict mount's
-claim that its kernel mount is gone is never self-verifying, and the only honest
-verifier is one the operator supplies.
+The authority cannot inspect a remote kernel. PortableFS therefore makes the
+trust boundary explicit: the official mount supervisor is trusted to report its
+own completed teardown, and the authority accepts that report only through the
+current session credential bound to the authenticated peer. A request has no
+field with which it can select another session.
 
-`--mount-absence-verify-command` names one program, executed directly and never
-through a shell. It receives a single JSON document on stdin with the fields
-`sessionId` (hex), `observedUnixNanos`, `component`, and `observationBase64` —
-the frontend's claim forwarded verbatim, for the verifier to corroborate, never
-trusted by the authority itself. **Exit status is the whole verdict: exit 0
-verifies, anything else refuses.** There is no partial credit and no retry; a
-refusal leaves the session to end fenced, exactly as if no verifier were
-configured. The run is bounded by `--mount-absence-verify-timeout`.
+The report is produced after platform-specific terminal conditions:
 
-A correct verifier checks the claim against evidence the frontend does not
-control: a host agent's own mount scan, an infrastructure fence record, or a
-signed attestation. Treat that as a deployment gate. Never substitute a verifier
-that accepts the frontend's opaque bytes on trust.
+- macOS `portablefsd` unmounts the exact FSKit attach reference and re-reads
+  `getfsstat`; an unreadable table or a remaining/mismatched mount refuses the
+  report.
+- Linux requires the recorded mount ID to disappear from `/proc/self/mountinfo`
+  and the exact go-fuse serve loop to finish. This matters because `MNT_DETACH`
+  may hide a mount while a retained file or working directory keeps its FUSE
+  connection alive.
 
-If the flag is unset, clean detach always fails closed. The volume still serves;
-what you lose is the ability for a strict mount to leave durable membership, so
-the next authority restart requires `--prior-strict-mounts-fenced`.
+Only then does the authority remove that exact participant and durably
+deactivate its membership. No independent host-attestation daemon or verifier
+command is involved. A compromised supervisor could lie; PortableFS's client
+model is cooperative, not Byzantine. A process crash, unavailable mount table,
+live connection, rejected request, or network loss sends no successful report
+and leaves membership active for explicit fencing.
 
 ### Restarting the authority
 

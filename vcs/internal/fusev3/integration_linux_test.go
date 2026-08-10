@@ -1063,6 +1063,60 @@ func TestUnmountRemountObservesDurableState(t *testing.T) {
 	requireContent(t, f.join(0, "durable", "after"), []byte("new epoch"), "written after the remount")
 }
 
+// TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach pins the Linux
+// distinction between namespace detach and connection termination. MNT_DETACH
+// removes the mount from mountinfo immediately, but an already-open file keeps
+// the old FUSE connection capable of issuing requests. Durable membership must
+// remain active through that interval.
+func TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	path := f.join(0, "retained")
+	mustWrite(t, path, []byte("still referenced"), 0o600)
+	retained := mustOpenFile(t, path, os.O_RDONLY, 0)
+	mount := f.mounts[0]
+
+	connectionDone := make(chan struct{})
+	go func() {
+		mount.Wait()
+		close(connectionDone)
+	}()
+	if output, err := exec.Command("fusermount3", "-u", "-z", f.mountPath(0)).CombinedOutput(); err != nil {
+		_ = retained.Close()
+		t.Fatalf("lazy unmount: %v (%s)", err, output)
+	}
+	if isMounted(t, f.mountPath(0)) {
+		_ = retained.Close()
+		t.Fatal("lazy unmount left the mount in this namespace")
+	}
+	select {
+	case <-connectionDone:
+		_ = retained.Close()
+		t.Fatal("FUSE serving connection ended while an open descriptor still retained the lazy mount")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if count := f.membership.activeCount(); count != 1 {
+		_ = retained.Close()
+		t.Fatalf("durable membership during retained lazy mount = %d, want 1", count)
+	}
+
+	if err := retained.Close(); err != nil {
+		t.Logf("closing the retained descriptor after lazy unmount reported %v", err)
+	}
+	select {
+	case <-connectionDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("FUSE serving connection did not end after the final retained reference closed")
+	}
+	if err := mount.Close(); err != nil {
+		t.Fatalf("clean detach after lazy mount connection termination: %v", err)
+	}
+	if count := f.membership.activeCount(); count != 0 {
+		t.Fatalf("durable membership after terminal lazy mount = %d, want 0", count)
+	}
+	// The fixture must not issue a second teardown against the mount we consumed.
+	f.mounts[0] = nil
+}
+
 // TestWorkloadGitAcrossMounts runs a real git repository on the mount and reads
 // it back through the other one.
 func TestWorkloadGitAcrossMounts(t *testing.T) {

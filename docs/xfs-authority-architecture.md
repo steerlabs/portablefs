@@ -85,7 +85,7 @@ epoch. Losing that RAM interrupts mounts, but cannot roll the durable
 filesystem back to a different logical tree. One small control-plane exception
 is durable strict-mount membership. It records only which cached kernel mounts a
 previous epoch admitted, so a *new* epoch refuses to serve until each of them is
-proven absent or externally fenced. It is not a live write gate: inside a running
+cleanly detached or externally fenced. It is not a live write gate: inside a running
 epoch a lost participant is fenced individually and mutations continue (see
 [Cache coherence](#cache-coherence)). It contains no paths, inodes, file bytes,
 mutations, or history and is bound to exactly one volume.
@@ -323,13 +323,17 @@ naming a coordinate PREPARE did not, a participant found holding two outstanding
 events. Those are defects no mount can cause. Poison is permanent for the epoch
 and recovery needs a new epoch.
 
-Durable membership is deliberately *not* cleared by fencing. Only a
-session-bound mount-absence proof accepted by the configured
-`MountAbsenceVerifier` (`CleanDetach`) deactivates a record; a syntactically
-plausible client blob and a deployment with no verifier both fail closed. So a fenced mount is
-gone from this epoch's barrier while still recorded, and a replacement authority
-refuses to serve until an external fencing proof covers every recorded old kernel
-mount. Availability is preserved inside an epoch and paid for across one.
+Durable membership is deliberately *not* cleared by fencing. A record is
+deactivated only by `CleanDetach` on the authenticated request for that exact
+session. The official supervisor makes its platform mount terminal before it
+sends the observation: FSKit checks the exact attach reference is absent from
+`getfsstat`; Linux checks the exact mount ID is absent and waits for the exact
+FUSE serving connection to finish. The authority cannot inspect a remote kernel
+and does not claim independent attestation. This is an explicit cooperative-
+client trust boundary. A crash, missing observation, ambiguous kernel state, or
+delivery failure leaves membership active. A fenced mount is therefore gone
+from this epoch's barrier while still recorded, and a replacement authority
+refuses to serve until fencing covers every recorded old kernel mount.
 
 The macOS 26 Swift implementation is composed into the production FSKit volume:
 the operations adapter maintains the namespace and live-object indexes, the
@@ -543,7 +547,7 @@ something in the tree establishes it, and partial progress is stated as partial.
 
 1. **Linux coherence on a real kernel.** `scripts/xfs-fuse-integration.sh` builds
    a disposable project-quota XFS filesystem in a privileged container, runs the
-   production provisioning script against it, and executes 43 required tests
+   production provisioning script against it, and executes 44 required tests
    against real kernel FUSE mounts as an unprivileged service account.
    `scripts/coherence-matrix-linux.sh` then drives 23 black-box cases across two
    real mounts in both `strict` and `uncached` profiles, bracketed by two
@@ -563,10 +567,12 @@ something in the tree establishes it, and partial progress is stated as partial.
 4. **Storage-failure fencing.** Corruption and shutdown errnos — `EIO`,
    `EUCLEAN`, `ESHUTDOWN`, `ENOTRECOVERABLE` — fence the volume and carry the
    storage failure class rather than being reported as ordinary errors.
-5. **A mount-absence verification hook.** `portablefs-authority` accepts a
-   verification command that corroborates a strict mount's kernel-absence claim,
-   and clean detach fails closed when no command is configured. The frontend
-   produces evidence-bearing detach to feed it.
+5. **Authenticated cooperative clean detach.** The authority accepts an absence
+   observation only from the current credential for that exact mount session.
+   macOS produces it after exact FSKit mount-table absence. Linux produces it
+   only after exact mount-ID absence and termination of the corresponding FUSE
+   serving connection, so lazy detach with retained references cannot clear
+   membership. Missing or failed delivery remains fenced and recorded.
 6. **Targeted macOS 26 attribute and data repair.** A real macOS 26.5 FSKit
    mount and Linux FUSE peer against the XFS authority converged through a
    `0755 -> 0700 -> 0755` mode cycle. Two hundred recursive `.git` traversals

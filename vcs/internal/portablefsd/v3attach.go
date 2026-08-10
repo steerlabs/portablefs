@@ -55,8 +55,8 @@ const (
 	// under unmountTransactionBudget so the transaction can still publish a
 	// verdict for the request that started it.
 	v3DetachProofBudget = 15 * time.Second
-	// v3DetachProofComponent names the local component that observed the
-	// kernel-mount absence inside the proof the authority retains.
+	// v3DetachProofComponent names the trusted local supervisor component that
+	// observed the kernel-mount absence.
 	v3DetachProofComponent = "portablefsd/getfsstat"
 )
 
@@ -402,7 +402,8 @@ func v3NamespaceRepair(cachePolicy string) authoritypb.NamespaceRepair {
 }
 
 // v3AuthoritySession is the slice of authorityrpc.Client the attach lifecycle
-// itself needs beyond the data plane: leaving the barrier with evidence.
+// itself needs beyond the data plane: an authenticated clean detach for this
+// exact session.
 type v3AuthoritySession interface {
 	DetachAfterUnmount(context.Context, *authoritypb.MountAbsenceProof) error
 }

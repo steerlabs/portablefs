@@ -52,16 +52,6 @@ type testFencer struct {
 	fenced    []SessionID
 }
 
-type allowMountAbsenceVerifier struct{}
-
-func (allowMountAbsenceVerifier) VerifyMountAbsence(SessionID, MountAbsenceProof) error { return nil }
-
-type rejectMountAbsenceVerifier struct{ err error }
-
-func (v rejectMountAbsenceVerifier) VerifyMountAbsence(SessionID, MountAbsenceProof) error {
-	return v.err
-}
-
 func newTestFencer() *testFencer {
 	return &testFencer{terminals: make(map[SessionID]chan struct{})}
 }
@@ -124,7 +114,7 @@ func newVisibilityHarness(t *testing.T, prior PriorEpochDisposition) *visibility
 	fencer := newTestFencer()
 	h := &visibilityHarness{membership: membership, fencer: fencer, fenceReason: make(map[SessionID]error)}
 	coordinator, err := NewVisibilityCoordinator(VisibilityConfig{
-		Prior: prior, Membership: membership, Fencer: fencer, AbsenceVerifier: allowMountAbsenceVerifier{},
+		Prior: prior, Membership: membership, Fencer: fencer,
 		MaxCachedNameCapacity: 1 << 20, MaxRepairBudget: time.Minute, MaxClockSkew: 0,
 		OnFence: func(id SessionID, reason error) {
 			h.fenceMu.Lock()
@@ -955,10 +945,10 @@ func TestVisibilityDetachWithoutEvidenceIsRefused(t *testing.T) {
 	}
 }
 
-// Opaque frontend bytes are not evidence on their own. Without a deployment
-// verifier, even a syntactically plausible observation must leave the strict
-// participant and its durable membership intact.
-func TestVisibilityDetachFailsClosedWithoutAnAbsenceVerifier(t *testing.T) {
+// Clean detach is a cooperative-client statement: the transport authenticates
+// the exact session and the official supervisor observes its own kernel. No
+// second host-attestation service sits in that trust path.
+func TestVisibilityDetachAcceptsAuthenticatedSupervisorObservation(t *testing.T) {
 	membership := newTestDurableVisibilityMembership()
 	fencer := newTestFencer()
 	coordinator, err := NewVisibilityCoordinator(VisibilityConfig{
@@ -976,38 +966,14 @@ func TestVisibilityDetachFailsClosedWithoutAnAbsenceVerifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	proof := testMountAbsence(time.Now())
-	if err := coordinator.CleanDetach(id, proof); !errors.Is(err, ErrVisibilityProof) {
-		t.Fatalf("CleanDetach without verifier = %v, want ErrVisibilityProof", err)
+	if err := coordinator.CleanDetach(id, proof); err != nil {
+		t.Fatalf("CleanDetach with authenticated supervisor observation: %v", err)
 	}
-	if !membership.contains(id) {
-		t.Fatal("an unverified frontend observation cleared durable membership")
+	if membership.contains(id) {
+		t.Fatal("authenticated clean detach left durable membership active")
 	}
-}
-
-func TestVisibilityDetachRejectsAForgedAbsenceAttestation(t *testing.T) {
-	membership := newTestDurableVisibilityMembership()
-	fencer := newTestFencer()
-	forged := errors.New("attestation signature does not bind this session")
-	coordinator, err := NewVisibilityCoordinator(VisibilityConfig{
-		Prior: PriorEpochStrictMountsFenced, Membership: membership, Fencer: fencer,
-		AbsenceVerifier:       rejectMountAbsenceVerifier{err: forged},
-		MaxCachedNameCapacity: 1024, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := SessionID{2}
-	terminal := fencer.attach(id)
-	if err := coordinator.Register(id, CoherenceStrict, terminal, VisibilityCommitment{
-		CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairParentExclusive,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := coordinator.CleanDetach(id, testMountAbsence(time.Now())); !errors.Is(err, ErrVisibilityProof) || !errors.Is(err, forged) {
-		t.Fatalf("CleanDetach with forged attestation = %v, want proof and verifier failures", err)
-	}
-	if !membership.contains(id) {
-		t.Fatal("a rejected attestation cleared durable membership")
+	if fencer.wasFenced(id) {
+		t.Fatal("clean detach fenced the authority session instead of leaving normally")
 	}
 }
 
