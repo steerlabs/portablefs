@@ -20,6 +20,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -108,9 +109,13 @@ type RPC interface {
 }
 
 type Config struct {
-	FSName         string
-	RequestTimeout time.Duration
-	MaxBackground  int
+	// MountInstanceID is the random identity created before attach. MountVolume
+	// derives the kernel source from it, so every attempt is distinguishable even
+	// when several clients mount the same volume. Product supervisors persist it
+	// as part of their recoverable mounting intent.
+	MountInstanceID string
+	RequestTimeout  time.Duration
+	MaxBackground   int
 	// MaxInFlight must be the same concurrent-call bound the RPC transport was
 	// configured with. The frontend subtracts its liveness and cleanup lanes
 	// from this number and admits bulk kernel work only against the remainder,
@@ -182,11 +187,17 @@ type Mount struct {
 	repairBudget time.Duration
 	raw          *rawFileSystem
 	kernelMount  kernelMount
-	revoked      atomic.Bool
-	revokeOnce   sync.Once
-	notifyMu     sync.Mutex
-	notify       kernelNotifier
-	publications mutationPublicationLedger
+	// plannedFSName is the unique source identity for this mount attempt and
+	// plannedMountpoint is its validated target. They let failed startup prove
+	// that this exact mount was never installed even when no kernel mount ID was
+	// available to record.
+	plannedFSName     string
+	plannedMountpoint string
+	revoked           atomic.Bool
+	revokeOnce        sync.Once
+	notifyMu          sync.Mutex
+	notify            kernelNotifier
+	publications      mutationPublicationLedger
 
 	// grafts serves the machine-local routes, nil when the volume declares
 	// none. routesRevision is the declaration this mount attached with, and is
@@ -218,33 +229,46 @@ func (m *Mount) publishAttr(out *fuse.AttrOut, attr *authoritypb.Attr) {
 // executing the authority's two-phase visibility barrier, so a change made on
 // another machine is repaired here before that machine's syscall returns.
 func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
-	if mountpoint == "" || rpc == nil || cfg.FSName == "" || cfg.RequestTimeout <= 0 ||
-		cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.MaxInFlight < minMaxInFlight {
-		return nil, fmt.Errorf("fusev3: complete mount configuration is required with at least %d authority in-flight slots", minMaxInFlight)
+	if rpc == nil {
+		return nil, errors.New("fusev3: authority session is required")
+	}
+	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) {
+		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
 	if cfg.Coherence != CoherenceUncached && cfg.Coherence != CoherenceStrict {
-		return nil, errors.New("fusev3: unknown coherence profile")
+		// With no valid profile, the frontend cannot know whether this session
+		// joined strict membership. Close it without claiming a clean detach;
+		// the authority will retain strict membership if one exists.
+		return nil, errors.Join(errors.New("fusev3: unknown coherence profile"), rpc.Close())
+	}
+	fsName := "portablefs:" + cfg.MountInstanceID
+	failBeforeKernelMount := func(cause error) (*Mount, error) {
+		return nil, errors.Join(cause, releaseUninstalledSession(rpc, cfg.Coherence, fsName, mountpoint))
+	}
+	if cfg.RequestTimeout <= 0 || cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.MaxInFlight < minMaxInFlight {
+		return failBeforeKernelMount(fmt.Errorf("fusev3: complete mount configuration is required with at least %d authority in-flight slots", minMaxInFlight))
 	}
 	if cfg.Coherence == CoherenceStrict && len(rpc.SessionID()) == 0 {
-		return nil, errors.New("fusev3: strict coherence requires the authority session identity; without it this mount cannot recognise -- and would deadlock against -- its own mutations")
+		return failBeforeKernelMount(errors.New("fusev3: strict coherence requires the authority session identity; without it this mount cannot recognise -- and would deadlock against -- its own mutations"))
 	}
 	rootItem := rpc.Root()
 	if rootItem == nil || rootItem.GetAttr() == nil || len(rootItem.GetToken()) == 0 {
-		return nil, errors.New("fusev3: authority omitted root identity")
+		return failBeforeKernelMount(errors.New("fusev3: authority omitted root identity"))
 	}
 	maxRead, maxWrite := rpc.IOLimits()
 	lease := rpc.SessionLease()
 	if maxRead == 0 || maxWrite == 0 || lease <= 0 || rpc.SessionDone() == nil {
-		return nil, errors.New("fusev3: invalid negotiated authority bounds")
+		return failBeforeKernelMount(errors.New("fusev3: invalid negotiated authority bounds"))
 	}
 	if maxRead < kernelMinMaxWrite || maxWrite < kernelMinMaxWrite {
-		return nil, fmt.Errorf("fusev3: authority I/O bounds (read %d, write %d) are below the %d-byte floor the Linux FUSE driver applies to max_write", maxRead, maxWrite, kernelMinMaxWrite)
+		return failBeforeKernelMount(fmt.Errorf("fusev3: authority I/O bounds (read %d, write %d) are below the %d-byte floor the Linux FUSE driver applies to max_write", maxRead, maxWrite, kernelMinMaxWrite))
 	}
 	options := mountOptions(cfg, maxWrite)
 	if err := verifyMountDecisions(options); err != nil {
-		return nil, err
+		return failBeforeKernelMount(err)
 	}
 	m := newMount(parent, rpc, cfg)
+	m.plannedFSName, m.plannedMountpoint = fsName, mountpoint
 	// The machine-local serving state is built before the kernel mount exists.
 	// A mount that cannot serve the routes it declared at attach is serving a
 	// different topology than the authority admitted it with, so this fails the
@@ -252,17 +276,14 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	grafts, err := localdirs.New(localdirs.Config{BackingRoot: cfg.LocalBacking, Rules: cfg.Routes})
 	if err != nil {
 		m.cancel()
-		_ = rpc.Close()
-		return nil, fmt.Errorf("fusev3: serve machine-local routes: %w", err)
+		return failBeforeKernelMount(fmt.Errorf("fusev3: serve machine-local routes: %w", err))
 	}
 	m.grafts, m.backing = grafts, cfg.LocalBacking
 	root := &node{mount: m, item: cloneItem(rootItem), requestTimeout: cfg.RequestTimeout, maxRead: maxRead, maxWrite: maxWrite}
 	server, err := fuse.NewServer(newRawFileSystem(m, root), mountpoint, options)
 	if err != nil {
 		m.cancel()
-		_ = grafts.Close()
-		_ = rpc.Close()
-		return nil, fmt.Errorf("mount PortableFS v3: %w", err)
+		return failBeforeKernelMount(errors.Join(fmt.Errorf("mount PortableFS v3: %w", err), grafts.Close()))
 	}
 	m.server = server
 	m.setNotifier(server)
@@ -295,6 +316,28 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		return nil, m.abortMount(err)
 	}
 	return m, nil
+}
+
+// releaseUninstalledSession discharges an authority session whose unique FUSE
+// source is proven absent before a kernel mount ID could be recorded. Closing
+// the connection alone is deliberately insufficient for strict membership:
+// without this observation the authority must assume a failed startup may
+// still have installed a cache-bearing kernel mount.
+func releaseUninstalledSession(rpc RPC, profile CoherenceProfile, fsName, mountpoint string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
+	defer cancel()
+	if profile != CoherenceStrict {
+		_, _ = rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
+		return rpc.Close()
+	}
+	proof, err := observePlannedKernelMountAbsent(fsName, mountpoint)
+	if err == nil {
+		err = rpc.DetachAfterUnmount(ctx, proof)
+	}
+	if err != nil {
+		err = fmt.Errorf("fusev3: release failed-startup strict session: %w", err)
+	}
+	return errors.Join(err, rpc.Close())
 }
 
 func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
@@ -373,7 +416,7 @@ func (m *Mount) abortMount(cause error) error {
 // buffered reads, which FOPEN_DIRECT_IO already excludes.
 func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 	return &fuse.MountOptions{
-		FsName:        cfg.FSName,
+		FsName:        "portablefs:" + cfg.MountInstanceID,
 		Name:          "portablefs",
 		MaxWrite:      int(maxWrite),
 		MaxBackground: cfg.MaxBackground,

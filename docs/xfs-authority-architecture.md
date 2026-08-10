@@ -572,7 +572,10 @@ something in the tree establishes it, and partial progress is stated as partial.
    macOS produces it after exact FSKit mount-table absence. Linux produces it
    only after exact mount-ID absence and termination of the corresponding FUSE
    serving connection, so lazy detach with retained references cannot clear
-   membership. Missing or failed delivery remains fenced and recorded.
+   membership. A Linux startup that fails before obtaining a mount ID may use
+   the attempt's random FUSE source as its exact identity, but only after that
+   source is absent from the complete mount table and no serving loop can still
+   install it. Missing or failed delivery remains fenced and recorded.
 6. **Targeted macOS 26 attribute and data repair.** A real macOS 26.5 FSKit
    mount and Linux FUSE peer against the XFS authority converged through a
    `0755 -> 0700 -> 0755` mode cycle. Two hundred recursive `.git` traversals

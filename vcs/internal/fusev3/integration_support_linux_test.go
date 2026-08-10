@@ -30,6 +30,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
@@ -432,8 +433,12 @@ func (f *integrationFixture) start() {
 
 	for i := range f.paths {
 		client, transport := f.dialClient()
+		mountInstanceID, err := mountid.NewMountInstance()
+		if err != nil {
+			t.Fatalf("create mount %d identity: %v", i, err)
+		}
 		mount, err := MountVolume(context.Background(), f.paths[i], transport, Config{
-			FSName: fmt.Sprintf("portablefs-test-%d", i), RequestTimeout: integrationRequestTimeout,
+			MountInstanceID: mountInstanceID, RequestTimeout: integrationRequestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend reserves its liveness, cleanup, and visibility lanes
 			// out of this number, so it must be exactly the transport's bound.

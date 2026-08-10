@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -820,6 +821,40 @@ func TestMountAbsenceRefusesAMountThatIsStillInstalled(t *testing.T) {
 	if _, err := installed.absent(); err == nil {
 		t.Fatal("a mount that is still installed was reported absent")
 	}
+}
+
+func TestPlannedMountSourceAbsenceProducesExactStartupProof(t *testing.T) {
+	fsName := fmt.Sprintf("portablefs-unit-never-installed-%d", time.Now().UnixNano())
+	proof, err := observePlannedKernelMountAbsent(fsName, "/nonexistent-portablefs-startup-target")
+	if err != nil {
+		t.Fatalf("observe planned source absence: %v", err)
+	}
+	if !proof.valid() || proof.Component != mountInfoPath ||
+		!strings.Contains(string(proof.Observation), "mount-source="+fsName) ||
+		!strings.Contains(string(proof.Observation), "stage=startup") {
+		t.Fatalf("startup absence proof = %+v", proof)
+	}
+}
+
+func TestPlannedMountSourceAbsenceRefusesAnInstalledSource(t *testing.T) {
+	data, err := os.ReadFile(mountInfoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		for separator := 6; separator+2 < len(fields); separator++ {
+			if fields[separator] != "-" {
+				continue
+			}
+			source := unescapeMountField(fields[separator+2])
+			if _, err := observePlannedKernelMountAbsent(source, "/irrelevant-to-source-identity"); err == nil {
+				t.Fatalf("installed mount source %q was reported absent", source)
+			}
+			return
+		}
+	}
+	t.Fatal("mountinfo contained no installed source to test")
 }
 
 func TestMountInfoPathsAreUnescaped(t *testing.T) {

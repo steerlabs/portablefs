@@ -141,10 +141,9 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 		return nil, err
 	}
 	mount, err := fusev3.MountVolume(context.Background(), cfg.mountPath, transport, fusev3.Config{
-		// The kernel source is "portablefs:<mountInstanceID>": the same
-		// instance-bound identity the legacy engine records, so the exact-mount
-		// classification in mount_identity_linux.go holds for both engines.
-		FSName: "portablefs:" + cfg.mountInstanceID, RequestTimeout: mountv3.RequestTimeout,
+		// The mount core derives "portablefs:<mountInstanceID>", the same
+		// instance-bound kernel source mount_identity_linux.go verifies.
+		MountInstanceID: cfg.mountInstanceID, RequestTimeout: mountv3.RequestTimeout,
 		MaxBackground: mountv3.MaxInFlight, MaxInFlight: mountv3.MaxInFlight, ReclaimQueue: mountv3.ReclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
 		Coherence: profile, CachedNameCapacity: mountv3.CachedNameCapacity, RepairBudget: mountv3.RepairBudget,

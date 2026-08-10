@@ -4,6 +4,7 @@ package fusev3
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"golang.org/x/sys/unix"
 )
 
@@ -1115,6 +1117,61 @@ func TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach(t *testing.T)
 	}
 	// The fixture must not issue a second teardown against the mount we consumed.
 	f.mounts[0] = nil
+}
+
+// TestFailedKernelMountDischargesStrictMembership covers the startup boundary
+// where the authority has already admitted a strict session but fusermount3
+// refuses before a kernel mount ID can be recorded. The unique planned FUSE
+// source is still exact evidence: once NewServer returns without a server and
+// mountinfo contains no such source, this session cannot retain kernel caches.
+func TestFailedKernelMountDischargesStrictMembership(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	if count := f.membership.activeCount(); count != 1 {
+		t.Fatalf("initial strict membership = %d, want 1", count)
+	}
+
+	client, transport := f.dialClient()
+	if count := f.membership.activeCount(); count != 2 {
+		t.Fatalf("membership after failed-startup attach = %d, want 2", count)
+	}
+
+	mountRoot := t.TempDir()
+	mountpoint := filepath.Join(mountRoot, "non-searchable")
+	if err := os.Mkdir(mountpoint, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backing := filepath.Join(mountRoot, "local")
+	if err := os.Mkdir(backing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mountInstanceID, err := mountid.NewMountInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount, err := MountVolume(context.Background(), mountpoint, transport, Config{
+		MountInstanceID: mountInstanceID, RequestTimeout: integrationRequestTimeout,
+		MaxBackground: 64, MaxInFlight: integrationMaxInFlight, ReclaimQueue: 1024,
+		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
+		Coherence: CoherenceStrict, CachedNameCapacity: integrationCachedNames,
+		RepairBudget: integrationRepairBudget, Routes: f.cfg.rules, LocalBacking: backing,
+	})
+	if err == nil || mount != nil {
+		if mount != nil {
+			_ = mount.Unmount()
+		}
+		t.Fatalf("mount on a non-searchable target = (%v, %v), want startup refusal", mount, err)
+	}
+	if isMounted(t, mountpoint) {
+		t.Fatal("failed startup left a kernel mount installed")
+	}
+	if count := f.membership.activeCount(); count != 1 {
+		t.Fatalf("membership after proven-absent failed startup = %d, want only the fixture mount", count)
+	}
+	select {
+	case <-client.SessionDone():
+	default:
+		t.Fatal("failed-startup authority client remained open after clean detach")
+	}
 }
 
 // TestWorkloadGitAcrossMounts runs a real git repository on the mount and reads

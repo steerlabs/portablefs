@@ -181,6 +181,10 @@ some machine.
   request for that exact session deactivates a record. The supervisor first
   establishes its platform's terminal mount conditions; a crash, missing
   observation, ambiguous kernel state, or delivery failure keeps the record.
+- A Linux attach that fails before kernel mount creation uses its random
+  per-attempt FUSE source as the identity. The session is deactivated only if
+  that source is absent everywhere in `mountinfo` and no serving loop can still
+  install it; path absence alone is not evidence.
 - On startup, a replacement authority refuses to serve until every recorded
   prior strict kernel mount is proven absent, or the operator asserts
   `--prior-strict-mounts-fenced` once after the control plane has actually

@@ -336,6 +336,62 @@ func observeKernelMount(mountpoint string) (kernelMount, error) {
 	return kernelMount{}, fmt.Errorf("fusev3: %s does not list a mount at %s", mountInfoPath, mountpoint)
 }
 
+// observePlannedKernelMountAbsent proves that a FUSE mount with this mount
+// attempt's unique source identity was never installed, or has already been
+// removed before its kernel mount ID could be recorded. MountVolume uses this
+// only on failed startup: FSName contains the random mount-instance ID, and no
+// server remains that could install it after this observation.
+//
+// This is deliberately not a path-only check. Another filesystem may race onto
+// the validated mountpoint after our attempt fails; that says nothing about
+// whether this exact PortableFS mount still exists. Conversely, finding the
+// unique source anywhere in the namespace is enough to refuse clean detach.
+func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
+	if fsName == "" || mountpoint == "" {
+		return MountAbsenceProof{}, errors.New("fusev3: planned mount identity is incomplete")
+	}
+	data, err := os.ReadFile(mountInfoPath)
+	if err != nil {
+		return MountAbsenceProof{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
+	}
+	records := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		separator := -1
+		for i := 6; i < len(fields); i++ {
+			if fields[i] == "-" {
+				separator = i
+				break
+			}
+		}
+		if separator < 0 || separator+2 >= len(fields) {
+			continue
+		}
+		records++
+		if unescapeMountField(fields[separator+2]) == fsName {
+			return MountAbsenceProof{}, fmt.Errorf(
+				"fusev3: planned mount source %s is still installed as mount %s at %s",
+				fsName, fields[0], unescapeMountField(fields[4]),
+			)
+		}
+	}
+	if records == 0 {
+		return MountAbsenceProof{}, fmt.Errorf("fusev3: %s produced no mount records; absence cannot be observed", mountInfoPath)
+	}
+	observation := fmt.Sprintf(
+		"mount-source=%s mountpoint=%s present=false records=%d stage=startup",
+		fsName, mountpoint, records,
+	)
+	return MountAbsenceProof{
+		ObservedUnixNanos: time.Now().UnixNano(),
+		Observation:       []byte(observation),
+		Component:         mountInfoPath,
+	}, nil
+}
+
 // absent reports whether this exact mount is no longer installed, and returns
 // the observation that says so. The recorded mount ID is compared, not the
 // path: a different filesystem mounted at the same path afterwards must not be
@@ -983,7 +1039,29 @@ func (m *Mount) detach() error {
 		return nil
 	}
 	if m.kernelMount.point == "" {
-		return errors.New("fusev3: strict detach has no recorded kernel mount identity")
+		// Startup may have installed a FUSE connection and then failed before
+		// mountinfo yielded its kernel ID. Once that connection is terminal, the
+		// unique planned source is the exact remaining identity to check. If
+		// MountVolume never supplied that identity (as in raw unit fixtures), the
+		// session remains fenced.
+		if m.plannedFSName == "" || m.plannedMountpoint == "" {
+			return errors.New("fusev3: strict detach has no recorded or planned kernel mount identity")
+		}
+		if m.kernelConnectionStarted {
+			select {
+			case <-m.kernelConnectionDone:
+			case <-ctx.Done():
+				return fmt.Errorf("fusev3: strict detach waited for the failed-startup FUSE serving connection: %w", ctx.Err())
+			}
+		}
+		proof, err := observePlannedKernelMountAbsent(m.plannedFSName, m.plannedMountpoint)
+		if err != nil {
+			return fmt.Errorf("fusev3: strict detach cannot establish failed-startup mount absence: %w", err)
+		}
+		if err := m.rpc.DetachAfterUnmount(ctx, proof); err != nil {
+			return fmt.Errorf("fusev3: deliver authenticated failed-startup clean detach: %w", err)
+		}
+		return nil
 	}
 	// Refuse a live mount immediately. If it is absent because MNT_DETACH was
 	// used, wait below for retained references to release the old connection.
