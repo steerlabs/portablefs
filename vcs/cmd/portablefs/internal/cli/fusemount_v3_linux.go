@@ -86,19 +86,23 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 // installs the fusev3 kernel mount. One attach, one capability: routing is
 // adopted from the attach refusal when the volume declares it (see
 // mountv3.AttachWithRoutes), never read over a second session.
-func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
+//
+// authorityAttached stays true even when later startup fails. That distinction
+// keeps a Manager enrollment alive when cleanup is ambiguous, while a failure
+// before attach can close an enrollment that was never handed to a session.
+func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ error) {
 	profile, wireProfile, err := mountv3.Profile(cfg.coherence)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	tlsCfg, err := cfg.transport.tlsConfig()
 	if err != nil {
-		return nil, fmt.Errorf("data-plane transport: %w", err)
+		return nil, false, fmt.Errorf("data-plane transport: %w", err)
 	}
 	if tlsCfg == nil {
 		// Refused earlier by flag validation; kept as a structural guard so the
 		// dial below can never run without endpoint verification.
-		return nil, fmt.Errorf("v3 authority sessions require mutually authenticated TLS; %q cannot carry one", cfg.transport.Mode)
+		return nil, false, fmt.Errorf("v3 authority sessions require mutually authenticated TLS; %q cannot carry one", cfg.transport.Mode)
 	}
 	tlsCfg.Certificates = []tls.Certificate{cfg.identity.certificate}
 	attach := authorityrpc.ClientConfig{
@@ -129,7 +133,7 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 		// It is surfaced exactly as it arrived: the operator is told what the
 		// volume routes and what this mount asked for, and retrying in a loop
 		// against a volume that is being reconfigured is not an answer.
-		return nil, err
+		return nil, false, err
 	}
 	backing := ""
 	if !rules.Empty() {
@@ -138,7 +142,7 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 	transport, err := mountv3.NewTransport(client, profile)
 	if err != nil {
 		_ = client.Close()
-		return nil, err
+		return nil, true, err
 	}
 	mount, err := fusev3.MountVolume(context.Background(), cfg.mountPath, transport, fusev3.Config{
 		// The mount core derives "portablefs:<mountInstanceID>", the same
@@ -151,7 +155,7 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 	})
 	if err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("mount %s: %w", cfg.mountPath, err)
+		return nil, true, fmt.Errorf("mount %s: %w", cfg.mountPath, err)
 	}
 	return &fuseV3Mount{
 		mount:  mount,
@@ -162,5 +166,9 @@ func mountFUSEv3(cfg fuseV3Config) (*fuseV3Mount, error) {
 			declared: !rules.Empty(),
 		},
 		backing: backing,
-	}, nil
+	}, true, nil
+}
+
+func failedFUSEStartupClean(err error) bool {
+	return fusev3.FailedStartupClean(err)
 }
