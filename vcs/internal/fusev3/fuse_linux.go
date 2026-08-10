@@ -146,18 +146,25 @@ type Config struct {
 }
 
 type Mount struct {
-	server         *fuse.Server
-	rpc            RPC
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	mu             sync.Mutex
-	closed         bool
-	abort          sync.Once
-	fatalMu        sync.Mutex
-	fatalErr       error
-	reclaim        *reclaimQueue
-	reclaimWorkers int
+	server *fuse.Server
+	// kernelConnectionDone closes only after go-fuse has stopped every request
+	// loop, closed this mount's /dev/fuse descriptor, and run OnUnmount. Mount
+	// table absence alone is insufficient on Linux: MNT_DETACH can hide a mount
+	// while retained references keep the same FUSE connection alive.
+	kernelConnectionDone    chan struct{}
+	kernelConnectionStarted bool
+	rpc                     RPC
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	wg                      sync.WaitGroup
+	mu                      sync.Mutex
+	closed                  bool
+	closeErr                error
+	abort                   sync.Once
+	fatalMu                 sync.Mutex
+	fatalErr                error
+	reclaim                 *reclaimQueue
+	reclaimWorkers          int
 	// bulk admits kernel-driven authority calls. Its capacity is strictly less
 	// than the transport's own in-flight bound, so a keepalive or a reclaim can
 	// never be queued behind saturated bulk I/O.
@@ -265,6 +272,11 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	// self-revocation needs its device to abort the connection.
 	installed, err := observeKernelMount(mountpoint)
 	if err != nil {
+		// go-fuse prepares one request-loop reference in NewServer, so even an
+		// unserved mount needs Serve to consume it before Unmount can finish. The
+		// canceled context makes this failure-only loop incapable of useful I/O.
+		m.cancel()
+		m.startKernelConnection()
 		return nil, m.abortMount(err)
 	}
 	m.kernelMount = installed
@@ -272,7 +284,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	// A request that fails the mount inside Serve reaches Unmount -> wg.Wait,
 	// which must never observe a counter that is still being raised from zero.
 	m.start(lease)
-	go server.Serve()
+	m.startKernelConnection()
 	if err := server.WaitMount(); err != nil {
 		// NewServer has already installed the kernel mount. If INIT or the
 		// readiness probe fails, remove it before releasing the authority
@@ -304,16 +316,17 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	}
 	return &Mount{
 		rpc: rpc, ctx: ctx, cancel: cancel,
-		reclaim:        newReclaimQueue(cfg.ReclaimQueue),
-		reclaimWorkers: workers,
-		bulk:           make(chan struct{}, cfg.MaxInFlight-workers-reserved),
-		requestTimeout: cfg.RequestTimeout,
-		uid:            cfg.PresentedUID,
-		gid:            cfg.PresentedGID,
-		profile:        cfg.Coherence,
-		nameCapacity:   cfg.CachedNameCapacity,
-		repairBudget:   cfg.RepairBudget,
-		routesRevision: cfg.Routes.Revision(),
+		kernelConnectionDone: make(chan struct{}),
+		reclaim:              newReclaimQueue(cfg.ReclaimQueue),
+		reclaimWorkers:       workers,
+		bulk:                 make(chan struct{}, cfg.MaxInFlight-workers-reserved),
+		requestTimeout:       cfg.RequestTimeout,
+		uid:                  cfg.PresentedUID,
+		gid:                  cfg.PresentedGID,
+		profile:              cfg.Coherence,
+		nameCapacity:         cfg.CachedNameCapacity,
+		repairBudget:         cfg.RepairBudget,
+		routesRevision:       cfg.Routes.Revision(),
 	}
 }
 
@@ -346,7 +359,7 @@ func (m *Mount) start(lease time.Duration) {
 // then releases the authority session. It always reports the original cause.
 func (m *Mount) abortMount(cause error) error {
 	_ = m.server.Unmount()
-	m.server.Wait()
+	m.Wait()
 	if err := m.Close(); err != nil {
 		return errors.Join(cause, err)
 	}
@@ -687,7 +700,22 @@ func (m *Mount) deferReclaim(token []byte) {
 	m.reclaim.push(cloneBytes(token))
 }
 
-func (m *Mount) Wait() { m.server.Wait() }
+// Wait returns only after the exact FUSE serving connection is terminal. This
+// is deliberately stronger than waiting for the mountpoint to disappear from
+// mountinfo, because a lazy unmount can do that while retained references keep
+// the connection live.
+func (m *Mount) Wait() { <-m.kernelConnectionDone }
+
+func (m *Mount) startKernelConnection() {
+	if m.kernelConnectionStarted {
+		panic("fusev3: FUSE serving connection started twice")
+	}
+	m.kernelConnectionStarted = true
+	go func() {
+		m.server.Serve()
+		close(m.kernelConnectionDone)
+	}()
+}
 
 func (m *Mount) Unmount() error {
 	m.mu.Lock()
@@ -702,7 +730,8 @@ func (m *Mount) Unmount() error {
 }
 
 // Close releases the authority session after the kernel mount has already
-// disappeared (for example, an administrator unmounted it externally).
+// disappeared (for example, an administrator unmounted it externally). A
+// strict close also requires the exact FUSE connection to have terminated.
 func (m *Mount) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -711,15 +740,16 @@ func (m *Mount) Close() error {
 
 func (m *Mount) closeLocked() error {
 	if m.closed {
-		return m.fatalError()
+		return m.closeErr
 	}
 	m.closed = true
 	m.cancel()
 	m.wg.Wait()
 	// Any capability still queued for reclaim is released by Detach: ending the
 	// session drops every item and open this session holds.
-	m.detach()
-	return errors.Join(m.fatalError(), m.grafts.Close(), m.rpc.Close())
+	detachErr := m.detach()
+	m.closeErr = errors.Join(m.fatalError(), detachErr, m.grafts.Close(), m.rpc.Close())
+	return m.closeErr
 }
 
 func (m *Mount) fatalError() error {

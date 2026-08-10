@@ -59,10 +59,9 @@ func NewTransport(client *authorityrpc.Client, profile fusev3.CoherenceProfile) 
 
 func (t *Transport) SessionID() []byte { return t.session }
 
-// DetachAfterUnmount forwards the frontend's observation that its kernel mount
-// is gone. The proof is refused rather than downgraded when it is incomplete:
-// a strict participant that detaches without evidence is exactly what the
-// authority must never accept.
+// DetachAfterUnmount forwards the official supervisor's observation that its
+// exact mount and serving connection are terminal. The report is refused when
+// incomplete and authorityrpc binds it to this transport's current session.
 func (t *Transport) DetachAfterUnmount(ctx context.Context, proof fusev3.MountAbsenceProof) error {
 	if proof.ObservedUnixNanos == 0 || len(proof.Observation) == 0 || proof.Component == "" {
 		return errors.New("mount absence proof is incomplete")

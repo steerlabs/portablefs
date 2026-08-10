@@ -52,8 +52,6 @@ type options struct {
 	priorStrictMountsFenced                        bool
 	maxCachedNameCapacity                          uint64
 	maxRepairBudget, visibilityClockSkew           time.Duration
-	mountAbsenceVerifyCommand                      string
-	mountAbsenceVerifyTimeout                      time.Duration
 }
 
 func run() error {
@@ -102,14 +100,6 @@ func run() error {
 	// against each other rather than chosen independently.
 	flag.DurationVar(&o.maxRepairBudget, "max-repair-budget", 30*time.Second, "longest per-phase cache-repair deadline a strict mount may commit to before it is fenced; must be at least the mount's -repair-budget")
 	flag.DurationVar(&o.visibilityClockSkew, "visibility-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
-	// Without this command a strict mount can never cleanly leave durable
-	// membership: the authority cannot observe a remote kernel's mount table,
-	// so evidence must be corroborated by something the frontend does not
-	// control. Every authority restart after a strict mount then depends on
-	// the unverified -prior-strict-mounts-fenced assertion, which is exactly
-	// the operator burden this command exists to remove.
-	flag.StringVar(&o.mountAbsenceVerifyCommand, "mount-absence-verify-command", "", "program that corroborates a strict mount's kernel-absence claim (JSON on stdin; exit 0 verifies); unset means clean detach always fails closed")
-	flag.DurationVar(&o.mountAbsenceVerifyTimeout, "mount-absence-verify-timeout", 30*time.Second, "bound on one mount-absence verification command run")
 	flag.Parse()
 	if os.Geteuid() == 0 {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
@@ -190,16 +180,8 @@ func run() error {
 	if priorDisposition != volumeserver.PriorEpochStrictMountsFenced {
 		return errors.New("prior strict mounts remain active; fence their kernel mounts before starting a new authority epoch")
 	}
-	var absenceVerifier volumeserver.MountAbsenceVerifier
-	if o.mountAbsenceVerifyCommand != "" {
-		if o.mountAbsenceVerifyTimeout <= 0 {
-			return errors.New("mount-absence-verify-timeout must be positive")
-		}
-		absenceVerifier = commandAbsenceVerifier{command: o.mountAbsenceVerifyCommand, timeout: o.mountAbsenceVerifyTimeout}
-	}
 	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
 		Prior: priorDisposition, Membership: membership, Fencer: runtime,
-		AbsenceVerifier:       absenceVerifier,
 		MaxCachedNameCapacity: o.maxCachedNameCapacity,
 		MaxRepairBudget:       o.maxRepairBudget,
 		MaxClockSkew:          o.visibilityClockSkew,

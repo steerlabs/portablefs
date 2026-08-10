@@ -736,12 +736,12 @@ func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authorityp
 // fenced its session and begun the separate grace before the volume moves on.
 func (c *Client) VisibilityRepairBudget() time.Duration { return c.cfg.RepairBudget }
 
-// DetachAfterUnmount leaves the barrier against evidence that this mount's
-// kernel mount is gone. The proof is produced by whichever local component can
-// observe that absence; this client deliberately cannot synthesize one, because
-// the previous design's unconditional boolean is exactly what made a detach an
-// assertion instead of an observation. A strict caller with no proof to present
-// must close instead and let its session die, which fences it.
+// DetachAfterUnmount leaves the barrier with the official supervisor's local
+// observation that this mount is terminal. The request is authenticated as this
+// exact session by Call; there is no session selector in DetachRequest. This
+// client deliberately cannot synthesize an observation. A strict caller that
+// cannot establish its platform's terminal conditions closes instead and lets
+// its session die fenced.
 func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.MountAbsenceProof) error {
 	request := &authoritypb.DetachRequest{}
 	if c.cfg.CoherenceProfile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT {

@@ -728,7 +728,9 @@ func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 	f.mount.profile = CoherenceStrict
 	// No kernel mount was ever recorded, so no absence can be observed and the
 	// session must be left to die rather than released.
-	f.mount.detach()
+	if err := f.mount.detach(); err == nil {
+		t.Fatal("strict detach without a kernel mount identity succeeded")
+	}
 	f.rpc.mu.Lock()
 	proofs := len(f.rpc.detachProofs)
 	f.rpc.mu.Unlock()
@@ -736,9 +738,14 @@ func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 		t.Fatalf("a strict mount detached with %d proofs and no observation; the authority must keep treating it as a possible holder of stale names", proofs)
 	}
 	// A mount ID that is not in mountinfo is exactly the observation the
-	// authority needs.
+	// authority needs, provided the serving connection is also terminal.
 	f.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent-portablefs-mount"}
-	f.mount.detach()
+	done := make(chan struct{})
+	close(done)
+	f.mount.kernelConnectionDone = done
+	if err := f.mount.detach(); err != nil {
+		t.Fatalf("detach after exact mount and connection termination: %v", err)
+	}
 	f.rpc.mu.Lock()
 	defer f.rpc.mu.Unlock()
 	if len(f.rpc.detachProofs) != 1 {
@@ -747,6 +754,59 @@ func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 	proof := f.rpc.detachProofs[0]
 	if !proof.valid() || proof.Component != mountInfoPath || !strings.Contains(string(proof.Observation), "present=false") {
 		t.Fatalf("proof = %+v; it must name the component it came from and say what was observed", proof)
+	}
+}
+
+func TestStrictDetachWaitsForTheExactFUSEConnection(t *testing.T) {
+	f := newStrictFixture(t)
+	f.mount.kernelMount = kernelMount{id: "999999998", device: "0:998", point: "/nonexistent-portablefs-lazy-mount"}
+	f.mount.kernelConnectionDone = make(chan struct{})
+
+	result := make(chan error, 1)
+	go func() { result <- f.mount.detach() }()
+	time.Sleep(50 * time.Millisecond)
+	f.rpc.mu.Lock()
+	proofsBeforeConnectionExit := len(f.rpc.detachProofs)
+	f.rpc.mu.Unlock()
+	if proofsBeforeConnectionExit != 0 {
+		t.Fatal("a mount hidden by lazy unmount detached while its FUSE connection could still serve retained references")
+	}
+	close(f.mount.kernelConnectionDone)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("detach after FUSE connection exit: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("detach did not proceed after the exact FUSE connection terminated")
+	}
+	f.rpc.mu.Lock()
+	defer f.rpc.mu.Unlock()
+	if len(f.rpc.detachProofs) != 1 {
+		t.Fatalf("detach proofs after connection exit = %d, want 1", len(f.rpc.detachProofs))
+	}
+}
+
+func TestStrictClosePreservesDetachDeliveryFailure(t *testing.T) {
+	f := newStrictFixture(t)
+	f.mount.kernelMount = kernelMount{id: "999999997", device: "0:997", point: "/nonexistent-portablefs-detach-failure"}
+	done := make(chan struct{})
+	close(done)
+	f.mount.kernelConnectionDone = done
+	delivery := errors.New("authority refused clean detach")
+	f.rpc.detachErr = delivery
+
+	first := f.mount.Close()
+	if !errors.Is(first, delivery) {
+		t.Fatalf("first Close = %v, want detach delivery failure", first)
+	}
+	if second := f.mount.Close(); !errors.Is(second, delivery) {
+		t.Fatalf("second Close = %v, want preserved detach delivery failure", second)
+	}
+	f.rpc.mu.Lock()
+	defer f.rpc.mu.Unlock()
+	if len(f.rpc.detachProofs) != 1 || f.rpc.closes != 1 {
+		t.Fatalf("detach deliveries = %d, RPC closes = %d; Close must execute teardown once", len(f.rpc.detachProofs), f.rpc.closes)
 	}
 }
 

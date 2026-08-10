@@ -378,9 +378,9 @@ REGISTERING -> ACTIVE -> QUIESCED -> ACTIVE
 
 A broken event socket, daemon death, missed repair budget, cursor violation,
 expired session, or partition fences only that mount. Fencing ends its session
-and removes it from later barriers, but durable membership remains until exact
-kernel mount absence is verified. A new mount is a new incarnation; a fenced
-incarnation never becomes active again.
+and removes it from later barriers, but durable membership remains until the
+official supervisor reports exact kernel mount absence. A new mount is a new
+incarnation; a fenced incarnation never becomes active again.
 
 The authority retains the current obligation for one additional repair-budget
 grace. The per-mount supervisor probes at no more than one third of that budget.
@@ -407,14 +407,16 @@ creating the next live test incarnation.
 ## Durable membership and authority restart
 
 Membership is stored on the authoritative XFS control area. Authority restart
-never forgets a prior strict cached mount. Startup refuses service until a
-configured verifier proves every recorded prior kernel mount fenced or absent.
-The live rig uses an XFS-backed membership ledger and an external exact-absence
-verifier; `--prior-strict-mounts-fenced` is an explicit fencing assertion, not a
-data reset.
+never forgets a prior strict cached mount. An ordinary clean detach deactivates
+only the exact session whose authenticated `portablefsd` supervisor first
+unmounted the exact attach reference and observed it absent in `getfsstat`.
+Otherwise startup refuses service until every recorded prior kernel mount is
+fenced or absent. `--prior-strict-mounts-fenced` is an explicit fencing
+assertion, not a data reset.
 
-Only evidence-bearing clean detach deactivates membership. Disconnect, an
-unmount callback, daemon state cleanup, or operator intent is insufficient.
+Only the supervisor's session-authenticated clean detach after exact
+`getfsstat` absence deactivates membership. Disconnect, an unmount callback,
+daemon state cleanup, or operator intent is insufficient.
 
 ## Verification state
 

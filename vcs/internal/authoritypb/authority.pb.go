@@ -2566,16 +2566,15 @@ func (x *ReauthorizeReply) GetAuthorizationDeadlineUnixNanos() int64 {
 	return 0
 }
 
-// MountAbsenceProof is the evidence a strict frontend presents that its own
-// kernel mount is gone. It replaced a boolean the client could only ever set to
-// true: a flag records an intention, an observation records a fact. The
-// authority cannot re-derive a remote kernel's mount table, so it does not try
-// to interpret `observation`. What it does enforce is the ordering that makes
-// the evidence load-bearing: the absence must have been observed after this
-// session attached and after the barrier obligation it is being used to
-// discharge was created, and it must not be dated in the future. A frontend
-// that cannot observe its own mount's absence has nothing to send and must let
-// its session die instead, which fences it.
+// MountAbsenceProof is the authenticated supervisor's observation that its own
+// exact kernel mount is gone. It replaced a boolean the client could only ever
+// set to true: the official frontend must instead make and describe a local
+// platform observation. The authority cannot re-derive a remote kernel's mount
+// table and does not interpret `observation` as independent attestation. The
+// trust boundary is the current session credential. The authority enforces that
+// the observation belongs to this mount and postdates any barrier obligation it
+// discharges. A frontend that cannot establish terminal mount state has nothing
+// to send and must let its session die fenced.
 type MountAbsenceProof struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	ObservedUnixNanos int64                  `protobuf:"varint,1,opt,name=observed_unix_nanos,json=observedUnixNanos,proto3" json:"observed_unix_nanos,omitempty"`

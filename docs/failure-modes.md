@@ -177,10 +177,10 @@ some machine.
 
 - It is deliberately **not** cleared by fencing. A fenced mount is gone from
   this epoch's barrier while still recorded.
-- Only a session-bound mount-absence proof accepted by the configured
-  verifier deactivates a record. With
-  `--mount-absence-verify-command` unset, clean detach always fails closed: a
-  syntactically plausible client blob is not evidence.
+- Only the official supervisor's mount-absence observation on the authenticated
+  request for that exact session deactivates a record. The supervisor first
+  establishes its platform's terminal mount conditions; a crash, missing
+  observation, ambiguous kernel state, or delivery failure keeps the record.
 - On startup, a replacement authority refuses to serve until every recorded
   prior strict kernel mount is proven absent, or the operator asserts
   `--prior-strict-mounts-fenced` once after the control plane has actually

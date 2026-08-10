@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -26,6 +27,118 @@ func testVolumeHandler() *VolumeHandler {
 		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
 		MaxItemsPerSession: 64, MaxOpensPerSession: 64, MaxItems: 128, MaxOpens: 128,
 		MaxRetainedReplyBytes: 1 << 20,
+	}
+}
+
+type detachMembership struct {
+	mu     sync.Mutex
+	active map[volumeserver.SessionID]bool
+}
+
+func (m *detachMembership) Activate(id volumeserver.SessionID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active == nil {
+		m.active = make(map[volumeserver.SessionID]bool)
+	}
+	m.active[id] = true
+	return nil
+}
+
+func (m *detachMembership) Deactivate(id volumeserver.SessionID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.active, id)
+	return nil
+}
+
+func (m *detachMembership) contains(id volumeserver.SessionID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.active[id]
+}
+
+func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
+	runtime, err := volumeserver.New("authenticated-detach", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 4, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership := &detachMembership{}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: membership, Fencer: runtime,
+		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testVolumeHandler()
+	h.Store = &resourceAdmissionFaultStore{}
+	h.Runtime = runtime
+	h.Authorizer = allowAuthorizer{access: volumeserver.AccessRead}
+	h.Visibility = visibility
+	h.Routes = &RoutesController{Visibility: visibility, loaded: true}
+
+	peers := []volumeserver.PeerIdentity{{0x31}, {0x32}, {0x33}}
+	credentials := make([]volumeserver.SessionCredential, len(peers))
+	for index, peer := range peers {
+		credential, err := runtime.Attach(2, peer, volumeserver.Authorization{Access: volumeserver.AccessRead, Deadline: time.Now().Add(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		credentials[index] = credential
+		if err := h.startSessionResources(credential.ID, xfsstore.Capability{byte(index + 1)}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+			t.Fatal(err)
+		}
+		terminal, err := runtime.SessionTerminal(credential.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requestFor := func(id uint64, credential volumeserver.SessionCredential) *authoritypb.Request {
+		return &authoritypb.Request{
+			RequestId: id, Epoch: credential.Epoch[:],
+			Session: &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]},
+			Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{MountAbsence: &authoritypb.MountAbsenceProof{
+				ObservedUnixNanos: time.Now().UnixNano(), Observation: []byte("exact kernel mount absent"), Component: "official-supervisor",
+			}}},
+		}
+	}
+
+	// A valid secret presented from the other authenticated peer cannot detach
+	// this session. The credential binds both the peer and the exact session.
+	wrongPeer := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peers[1]))
+	if response := h.Handle(wrongPeer, requestFor(1, credentials[0])); response.GetErrno() == 0 {
+		t.Fatal("a different authenticated peer detached the first mount session")
+	}
+	if !membership.contains(credentials[0].ID) || !membership.contains(credentials[1].ID) || !membership.contains(credentials[2].ID) {
+		t.Fatal("a refused cross-session detach changed durable membership")
+	}
+
+	// Peer mismatch permanently fences the attacked credential, so use the two
+	// untouched sessions to prove normal clean detach removes only its caller.
+	for index := 1; index < len(credentials); index++ {
+		credential := credentials[index]
+		ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peers[index]))
+		if response := h.Handle(ctx, requestFor(uint64(index+2), credential)); response.GetErrno() != 0 {
+			t.Fatalf("session %d clean detach = %+v", index, response)
+		}
+		if membership.contains(credential.ID) {
+			t.Fatalf("session %d clean detach left its durable membership active", index)
+		}
+		if !membership.contains(credentials[0].ID) {
+			t.Fatal("clean detach cleared the fenced victim's durable membership")
+		}
+		if index == 1 && !membership.contains(credentials[2].ID) {
+			t.Fatal("detaching one healthy session cleared the other session's membership")
+		}
 	}
 }
 
