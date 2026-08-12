@@ -150,6 +150,15 @@ const daemonControl = await readFile(
 );
 const workflow = await readFile(path.join(root, ".github/workflows/release.yml"), "utf8");
 const ciWorkflow = await readFile(path.join(root, ".github/workflows/ci.yml"), "utf8");
+const xcodeSwiftGate = await readFile(path.join(root, "scripts/test-swift-xcode.sh"), "utf8");
+const xcodeEvidenceVerifier = await readFile(
+  path.join(root, "scripts/verify_xcode_tests.py"),
+  "utf8"
+);
+const xcodeEvidenceTests = await readFile(
+  path.join(root, "scripts/test_verify_xcode_tests.py"),
+  "utf8"
+);
 const goreleaser = await readFile(path.join(root, ".goreleaser.yaml"), "utf8");
 const qualificationSource = await readFile(
   path.join(
@@ -916,9 +925,68 @@ for (const releaseGate of [
   "needs: validate",
   "needs: [validate, goreleaser]",
   "needs: [validate, goreleaser, macos-app]",
-  "run: swift test --package-path swift/PortableFSKit --no-parallel",
+  "run: bash scripts/test-swift-xcode.sh",
 ]) {
   requireText(workflow, releaseGate, `release validation gate ${releaseGate}`);
+}
+for (const ciGate of [
+  "swift-xcode-native:",
+  "name: swift-xcode-native",
+  "run: bash scripts/test-swift-xcode.sh",
+]) {
+  requireText(ciWorkflow, ciGate, `CI Xcode-native Swift gate ${ciGate}`);
+}
+for (const gateContract of [
+  "-enumerate-tests",
+  "-test-enumeration-format json",
+  "-parallel-testing-enabled NO",
+  "-onlyUsePackageVersionsFromResolvedFile",
+  "test-without-building",
+  "xcresulttool get test-results tests",
+  "scripts/test_verify_xcode_tests.py",
+  "scripts/verify_xcode_tests.py",
+]) {
+  requireText(xcodeSwiftGate, gateContract, `Xcode-native Swift contract ${gateContract}`);
+}
+for (const evidenceContract of [
+  'EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests"})',
+  'value.get("disabledTests") != []',
+  'value.get("nodeType") == "Test Case"',
+  'result != "Passed"',
+  "missing = sorted(set(expected) - set(actual))",
+  "unexpected = sorted(set(actual) - set(expected))",
+]) {
+  requireText(
+    xcodeEvidenceVerifier,
+    evidenceContract,
+    `Xcode test evidence verifier ${evidenceContract}`
+  );
+}
+for (const negativeEvidenceTest of [
+  "test_enumeration_rejects_errors_disabled_duplicates_and_unknown_modules",
+  "test_results_reject_failure_missing_unexpected_duplicate_and_wrong_destination",
+  "test_json_loader_rejects_duplicate_keys_and_unbounded_input",
+]) {
+  requireText(
+    xcodeEvidenceTests,
+    negativeEvidenceTest,
+    `Xcode test evidence negative test ${negativeEvidenceTest}`
+  );
+}
+for (const forbiddenSwiftPMWorkaround of [
+  "swift-partition-coverage",
+  "SWIFT_TEST_FILTER",
+  "swift-test-attempt",
+  "swiftpm-testing-helper",
+  "process.wait(timeout=240)",
+]) {
+  if (
+    ciWorkflow.includes(forbiddenSwiftPMWorkaround) ||
+    workflow.includes(forbiddenSwiftPMWorkaround) ||
+    xcodeSwiftGate.includes(forbiddenSwiftPMWorkaround)
+  ) {
+    failures.push(`Swift verification retains workaround ${forbiddenSwiftPMWorkaround}`);
+  }
 }
 // The v3 tree publishes exactly two trust chains: the Linux archives (Sigstore
 // provenance) and the notarized macOS app. The journal-era control-plane

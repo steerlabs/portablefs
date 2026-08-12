@@ -1,11 +1,37 @@
 import Foundation
 import Testing
 @testable import PortableFSKit
-import PortableFSKitMockDaemon
+@testable import PortableFSKitMockDaemon
 @preconcurrency import Darwin
 
 private func transportBytes(_ string: String) -> Data {
     Data(string.utf8)
+}
+
+private func writeRawTransportFrame(fd: Int32, envelope: PfsEnvelope) throws {
+    let frame = try PfsFrameCodec().encode(envelope)
+    try frame.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.baseAddress else {
+            return
+        }
+        var offset = 0
+        while offset < frame.count {
+            let written = Darwin.send(
+                fd,
+                baseAddress.advanced(by: offset),
+                frame.count - offset,
+                0
+            )
+            if written > 0 {
+                offset += written
+                continue
+            }
+            if written < 0, errno == EINTR {
+                continue
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
 }
 
 private actor PfsTestAsyncGate {
@@ -48,6 +74,84 @@ private actor PfsTestAsyncGate {
 
     #expect(Darwin.lstat(socketPath, &socketStatus) != 0 && errno == ENOENT)
     #expect(Darwin.lstat(directory, &directoryStatus) != 0 && errno == ENOENT)
+}
+
+@Test func mockDaemonStopOwnsBackpressuredResponseWrites() throws {
+    let daemon = try PfsLocalMockDaemon()
+    let peerFD = try PfsUnixSocket.connect(path: daemon.socketPath)
+    defer { PfsUnixSocket.close(peerFD) }
+
+    // A peer that deliberately does not read creates real socket backpressure.
+    // Repeated Hello frames are side-effect-free and each has a definite reply,
+    // so the pending-response observation below proves the writer is blocked
+    // without relying on a guessed Darwin buffer capacity.
+    var receiveBufferBytes: Int32 = 1_024
+    #expect(
+        setsockopt(
+            peerFD,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &receiveBufferBytes,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0
+    )
+    for requestID in 1...4_096 {
+        var hello = PfsHello()
+        hello.protocolMajor = 1
+        hello.protocolMinor = 12
+        hello.clientName = "backpressure-owner"
+        hello.clientVersion = "1"
+        var envelope = PfsEnvelope()
+        envelope.requestID = UInt64(requestID)
+        envelope.body = .hello(hello)
+        try writeRawTransportFrame(fd: peerFD, envelope: envelope)
+    }
+
+    let backlogDeadline = ContinuousClock.now + .seconds(2)
+    while daemon.testingPendingResponseCount() == 0,
+          ContinuousClock.now < backlogDeadline {
+        Thread.sleep(forTimeInterval: 0.001)
+    }
+    #expect(daemon.testingPendingResponseCount() > 0)
+
+    // stop() is the exact ownership boundary: it interrupts the blocking
+    // writer, joins every client reader and async handler, then removes the
+    // private socket state. There is no timeout or detached cleanup path.
+    daemon.stop()
+    #expect(daemon.testingPendingResponseCount() == 0)
+    var status = stat()
+    #expect(Darwin.lstat(daemon.socketPath, &status) != 0 && errno == ENOENT)
+}
+
+@Test func mockDaemonStopCancelsAndJoinsDelayedRequestHandlers() async throws {
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(lookupNoReplyNames: ["owned-delay"])
+    )
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    var request = PfsLookupRequest()
+    request.dir = resolved.root
+    request.name = transportBytes("owned-delay")
+    let delayed = Task {
+        try await client.request(.lookup(request))
+    }
+    let enteredDeadline = ContinuousClock.now + .seconds(2)
+    while await daemon.stats().lookupRequests == 0,
+          ContinuousClock.now < enteredDeadline {
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(await daemon.stats().lookupRequests == 1)
+
+    daemon.stop()
+    do {
+        _ = try await delayed.value
+        Issue.record("stopped daemon unexpectedly delivered a delayed reply")
+    } catch {
+        // The exact error is owned by the client-side socket close race. The
+        // invariant under test is that the one-hour mock handler was cancelled
+        // and joined before stop returned, not reclassified as a reply.
+    }
 }
 
 private actor PfsWrittenRequestIDs {

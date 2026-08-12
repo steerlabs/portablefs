@@ -18,12 +18,13 @@ and a Linux CI runner execute the same steps:
    adapters all carry per-GOOS files;
 2. the native Go suite, then the native race suite — these tests exercise real
    syscalls, sockets, and mounts, so they are only meaningful on the host;
-3. `swift test --package-path swift/PortableFSKit --no-parallel`.
-   Serial execution is required, not a performance knob: Swift Testing can run
-   cases concurrently inside one worker, while several tests share process
-   resources (sockets, mount points, the app-group container) or exercise hard
-   protocol deadlines. Skipped loudly on a host with no Swift toolchain; the
-   macOS CI job always runs it;
+3. `bash scripts/test-swift-xcode.sh` on macOS. The gate asks Xcode to
+   enumerate the complete package inventory, executes that already-built
+   inventory once through Xcode's native serial test runner, and rejects the
+   result unless the `.xcresult` contains the same unique all-passing set. This
+   avoids SwiftPM's separate Darwin helper process while preserving exact
+   coverage. Non-macOS hosts skip this macOS-only package loudly; the macOS CI
+   job always runs it;
 4. release-trust policy: `sh -n scripts/install.sh`, `scripts/check-workflow-pins.mjs`,
    and `scripts/check-install-release-trust.mjs` (dependency-free single-file
    node programs that read the installer, the workflows, and `.goreleaser.yaml`
@@ -38,7 +39,7 @@ GOOS=darwin go -C vcs build ./...
 GOOS=linux  go -C vcs vet ./...
 go -C vcs test ./...
 go -C vcs test -race ./...
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh
 ```
 
 
