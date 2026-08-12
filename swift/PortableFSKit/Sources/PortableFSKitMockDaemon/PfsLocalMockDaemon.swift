@@ -1,6 +1,77 @@
 import Foundation
 import PortableFSKit
+@preconcurrency import Dispatch
 @preconcurrency import Darwin
+
+/// Owns every Swift task created by the mock server. Socket reads and writes
+/// belong to dedicated Dispatch queues, while protocol handling remains async
+/// because the in-memory filesystem is an actor and several tests inject
+/// cancellable delays. Keeping those tasks in an explicit registry gives
+/// `stop()` one exact cancellation-and-join boundary instead of leaving
+/// detached work behind for the process to reap.
+private final class PfsMockRequestRegistry: @unchecked Sendable {
+    private let condition = NSCondition()
+    private let group = DispatchGroup()
+    private var accepting = true
+    private var registrationsInFlight = 0
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var completedBeforeRegistration: Set<UUID> = []
+
+    func spawn(_ operation: @escaping @Sendable () async -> Void) {
+        let id = UUID()
+
+        condition.lock()
+        guard accepting else {
+            condition.unlock()
+            return
+        }
+        registrationsInFlight += 1
+        group.enter()
+        condition.unlock()
+
+        let task = Task.detached(priority: .userInitiated) { [self] in
+            defer { finish(id) }
+            await operation()
+        }
+
+        condition.lock()
+        if completedBeforeRegistration.remove(id) == nil {
+            tasks[id] = task
+        }
+        registrationsInFlight -= 1
+        let shouldCancel = !accepting
+        condition.broadcast()
+        condition.unlock()
+
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    func cancelAndWait() {
+        condition.lock()
+        accepting = false
+        while registrationsInFlight != 0 {
+            condition.wait()
+        }
+        let active = Array(tasks.values)
+        condition.unlock()
+
+        for task in active {
+            task.cancel()
+        }
+        group.wait()
+    }
+
+    private func finish(_ id: UUID) {
+        condition.lock()
+        if tasks.removeValue(forKey: id) == nil {
+            completedBeforeRegistration.insert(id)
+        }
+        condition.unlock()
+        group.leave()
+    }
+}
 
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
@@ -168,9 +239,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     private let fileSystem: MockFileSystem
     private let sessionLock = NSLock()
     private var sessions: [Int32: MockSession] = [:]
-    private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .utility)
-    private let clientQueue = DispatchQueue(label: "dev.portablefs.mock.client", qos: .utility, attributes: .concurrent)
+    private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .userInitiated)
+    private let clientQueue = DispatchQueue(label: "dev.portablefs.mock.client", qos: .userInitiated, attributes: .concurrent)
     private let acceptGroup = DispatchGroup()
+    private let clientGroup = DispatchGroup()
+    private let requests = PfsMockRequestRegistry()
     private let lifecycleLock = NSLock()
     private var acceptWorkItem: DispatchWorkItem?
     private var stopped = false
@@ -220,12 +293,19 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
             PfsUnixSocket.close(wakeFD)
         }
-        _ = acceptGroup.wait(timeout: .now() + 2)
-        Darwin.shutdown(serverFD, SHUT_RDWR)
-        PfsUnixSocket.close(serverFD)
+        // The wake connection makes accept return. This is an ownership join,
+        // not a best-effort timeout: cleanup must not race an accept that can
+        // still publish a new session.
+        acceptGroup.wait()
         for session in sessionSnapshot() {
             session.close()
         }
+        // Closing each peer interrupts its blocking reader. Once all readers
+        // have left, no new protocol task can enter the request registry.
+        clientGroup.wait()
+        requests.cancelAndWait()
+        Darwin.shutdown(serverFD, SHUT_RDWR)
+        PfsUnixSocket.close(serverFD)
         unlink(socketPath)
         rmdir(socketDirectory)
     }
@@ -354,7 +434,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.body = .event(event)
 
         for session in sessionSnapshot() where session.isSubscribed {
-            try? session.send(envelope)
+            session.send(envelope)
         }
     }
 
@@ -370,7 +450,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.body = .event(event)
 
         for session in sessionSnapshot() where session.isSubscribed {
-            try? session.send(envelope)
+            session.send(envelope)
         }
     }
 
@@ -387,7 +467,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.body = .event(event)
 
         for session in sessionSnapshot() where session.isSubscribed {
-            try? session.send(envelope)
+            session.send(envelope)
         }
     }
 
@@ -411,6 +491,14 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.resetStats()
     }
 
+    /// Test-only observation of responses that have left protocol handling but
+    /// have not yet completed their dedicated blocking socket write. It lets a
+    /// lifecycle regression prove shutdown while real backpressure exists,
+    /// rather than assuming a particular kernel socket-buffer size.
+    func testingPendingResponseCount() -> Int {
+        sessionSnapshot().reduce(0) { $0 + $1.pendingResponseCount }
+    }
+
     private func acceptLoop() {
         defer {
             acceptGroup.leave()
@@ -424,7 +512,10 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
                 }
                 let session = MockSession(fd: clientFD)
                 addSession(session)
-                clientQueue.async { [weak self, session] in
+                clientGroup.enter()
+                let group = clientGroup
+                clientQueue.async { [weak self, session, group] in
+                    defer { group.leave() }
                     self?.clientLoop(session: session)
                 }
             } catch {
@@ -445,9 +536,9 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         while !isStopped {
             do {
                 let envelope = try reader.readFrame()
-                Task.detached { [fileSystem, session] in
+                requests.spawn { [fileSystem, session] in
                     let reply = await fileSystem.handle(envelope, session: session)
-                    try? session.send(reply)
+                    session.send(reply)
                 }
             } catch {
                 return
@@ -484,10 +575,24 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
 private final class MockSession: @unchecked Sendable {
     let fd: Int32
-    private let ioLock = NSLock()
+    /// Blocking `send(2)` must never run on Swift's cooperative executor. A
+    /// full peer receive buffer previously let one response hold `ioLock`
+    /// while more detached request tasks blocked behind it, exhausting the
+    /// executor that the client needed to consume those responses. One owned
+    /// serial Dispatch queue is the socket's write executor and preserves
+    /// complete-frame ordering without consuming Swift task threads.
+    private let writeQueue = DispatchQueue(
+        label: "dev.portablefs.mock.session.write.\(UUID().uuidString)",
+        qos: .userInitiated
+    )
+    private let closeLock = NSLock()
+    private let closeGroup = DispatchGroup()
+    private let pendingResponseLock = NSLock()
     private let stateLock = NSLock()
     private var subscribed = false
-    private var closed = false
+    private var closeStarted = false
+    private var fdClosed = false
+    private var pendingResponses = 0
 
     var isSubscribed: Bool {
         stateLock.lock()
@@ -498,6 +603,7 @@ private final class MockSession: @unchecked Sendable {
 
     init(fd: Int32) {
         self.fd = fd
+        closeGroup.enter()
         PfsMockFrameIO.disableSigPipe(fd: fd)
     }
 
@@ -534,23 +640,105 @@ private final class MockSession: @unchecked Sendable {
     private var seenOperationIDs: Set<UInt64> = []
     private var acknowledgedOperationIDs: Set<UInt64> = []
 
-    func send(_ envelope: PfsEnvelope) throws {
-        ioLock.lock()
-        defer { ioLock.unlock() }
-        guard !closed else {
-            throw PfsLocalClientError.connectionClosed
+    func send(_ envelope: PfsEnvelope) {
+        let frame: Data
+        do {
+            frame = try PfsMockFrameIO.encode(envelope: envelope)
+        } catch {
+            close()
+            return
         }
-        try PfsMockFrameIO.writeFrame(fd: fd, envelope: envelope)
+
+        // Serialize admission with the close transition. Every admitted block
+        // is therefore ahead of close()'s writeQueue.sync barrier, and no
+        // response closure can appear after stop has joined the session.
+        closeLock.lock()
+        guard !closeStarted else {
+            closeLock.unlock()
+            return
+        }
+        pendingResponseLock.lock()
+        pendingResponses += 1
+        pendingResponseLock.unlock()
+        writeQueue.async { [self] in
+            defer {
+                pendingResponseLock.lock()
+                pendingResponses -= 1
+                pendingResponseLock.unlock()
+            }
+            guard !isClosing else {
+                return
+            }
+            do {
+                try PfsMockFrameIO.writeFrame(fd: fd, frame: frame)
+            } catch {
+                closeFromWriteQueue()
+            }
+        }
+        closeLock.unlock()
+    }
+
+    var pendingResponseCount: Int {
+        pendingResponseLock.lock()
+        let value = pendingResponses
+        pendingResponseLock.unlock()
+        return value
     }
 
     func close() {
-        ioLock.lock()
-        defer { ioLock.unlock() }
-        let shouldClose = !closed
-        closed = true
-        if shouldClose {
-            PfsUnixSocket.close(fd)
+        if beginClose() {
+            // shutdown(2) is deliberately outside the serial write queue: it
+            // is what interrupts a write already blocked in send(2). Exactly
+            // one caller can reach it, so the descriptor cannot be shut down
+            // after another caller has closed and the fd number was reused.
+            Darwin.shutdown(fd, SHUT_RDWR)
+            writeQueue.sync { [self] in
+                finishCloseOnWriteQueue()
+            }
+        } else {
+            closeGroup.wait()
         }
+    }
+
+    private var isClosing: Bool {
+        closeLock.lock()
+        let value = closeStarted
+        closeLock.unlock()
+        return value
+    }
+
+    private func beginClose() -> Bool {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        guard !closeStarted else {
+            return false
+        }
+        closeStarted = true
+        return true
+    }
+
+    /// The error originates on `writeQueue`, so this variant must not call
+    /// `writeQueue.sync`. It shares the same one-winner close transition as an
+    /// external stop and publishes completion through `closeGroup`.
+    private func closeFromWriteQueue() {
+        guard beginClose() else {
+            return
+        }
+        Darwin.shutdown(fd, SHUT_RDWR)
+        finishCloseOnWriteQueue()
+    }
+
+    private func finishCloseOnWriteQueue() {
+        closeLock.lock()
+        guard !fdClosed else {
+            closeLock.unlock()
+            return
+        }
+        fdClosed = true
+        closeLock.unlock()
+
+        PfsUnixSocket.close(fd)
+        closeGroup.leave()
     }
 }
 
@@ -603,15 +791,21 @@ private enum PfsMockFrameIO {
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &value, socklen_t(MemoryLayout<Int32>.size))
     }
 
-    static func writeFrame(fd: Int32, envelope: PfsEnvelope, maxFrameLength: Int = PfsFrameCodec.defaultMaxFrameLength) throws {
-        let data = try PfsFrameCodec(maxFrameLength: maxFrameLength).encode(envelope)
-        try data.withUnsafeBytes { rawBuffer in
+    static func encode(
+        envelope: PfsEnvelope,
+        maxFrameLength: Int = PfsFrameCodec.defaultMaxFrameLength
+    ) throws -> Data {
+        try PfsFrameCodec(maxFrameLength: maxFrameLength).encode(envelope)
+    }
+
+    static func writeFrame(fd: Int32, frame: Data) throws {
+        try frame.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else {
                 return
             }
             var offset = 0
-            while offset < data.count {
-                let sent = Darwin.send(fd, base.advanced(by: offset), data.count - offset, 0)
+            while offset < frame.count {
+                let sent = Darwin.send(fd, base.advanced(by: offset), frame.count - offset, 0)
                 if sent > 0 {
                     offset += sent
                     continue
