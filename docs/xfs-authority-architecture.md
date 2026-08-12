@@ -53,8 +53,10 @@ module-initiated synchronous kernel data-cache control. That API is still beta
 as of August 2026 and its documented contract does not separately promise
 negative-name invalidation. Release therefore remains gated on the final SDK and
 the live namespace/data/attribute matrix; an OS version number is not accepted
-as proof. Nothing in this tree implements it, and the policy string that would
-select it fails closed.
+as proof. Nothing in this tree implements the complete policy, and the policy
+string that would select it fails closed. The documented SDK boundary and
+required live matrix are recorded in
+[macos-27-native-coherence.md](./macos-27-native-coherence.md).
 
 What ships on macOS today is an explicitly declared compatibility cache policy,
 `macos26-synchronous-vfs-repair-v2`, implementing the same local visibility

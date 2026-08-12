@@ -23,11 +23,15 @@ const (
 	v3CachePolicyFSKit     = "fskit-native-revocation-v1"
 )
 
-// V3CachePolicyMacOS26 is the current macOS 26 synchronous-VFS-repair
-// coherence policy a v3 ensure request declares. Exported because the CLI builds that
-// request and the policy string is a contract between the two processes, not
-// something either side may spell on its own.
-const V3CachePolicyMacOS26 = v3CachePolicyMacOS26
+// The exported policy names are the exact contracts a v3 ensure request may
+// declare. They are exported because the CLI builds that request and the
+// policy string is a contract between two processes, not something either
+// side may spell on its own.
+const (
+	V3CachePolicyMacOS26V1 = v3CachePolicyMacOS26V1
+	V3CachePolicyMacOS26   = v3CachePolicyMacOS26
+	V3CachePolicyFSKit     = v3CachePolicyFSKit
+)
 
 var (
 	errV3VisibilitySubscriber = errors.New("portablefsd: a v3 coherence stream already has a frontend subscriber")

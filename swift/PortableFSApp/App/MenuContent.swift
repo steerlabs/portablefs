@@ -32,10 +32,6 @@ struct MenuContent: View {
                 Button("File System Extension Setup…") {
                     FirstRunAssistant.shared.present()
                 }
-                Button(model.isStoppingDaemon ? "Stopping Background Daemon…" : "Stop Background Daemon") {
-                    model.stopDaemon()
-                }
-                .disabled(!model.canStopDaemon)
                 Divider()
                 Button("Quit PortableFS") {
                     model.quitApp()

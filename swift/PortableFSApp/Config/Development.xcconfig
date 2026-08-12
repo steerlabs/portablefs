@@ -3,3 +3,8 @@
 // Unsigned verification builds use CODE_SIGNING_ALLOWED=NO and ignore this.
 DEVELOPMENT_TEAM = B47U2LLKHW
 PORTABLEFS_APP_GROUP = $(TeamIdentifierPrefix)pfsoss
+// The nested SMAppService daemon has a different restricted-code identity
+// contract from the Xcode-signed host and extension. Forks must override both
+// this identity and DEVELOPMENT_TEAM together.
+PORTABLEFS_SERVICE_SIGN_IDENTITY = Developer ID Application: TrendUp AI, Inc. (B47U2LLKHW)
+PORTABLEFS_NATIVE_QUALIFICATION =

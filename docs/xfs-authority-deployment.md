@@ -471,13 +471,23 @@ fails with guidance rather than degrading to a weaker consistency model.
    app never claims the toggle is on; only a successful mount verifies it.
 3. Mount with the same `portablefs mount` command shape as Linux.
 
-The CLI manages the `portablefsd` daemon, which owns the authority session.
+The host's launchd-managed `portablefsd` owns the authority session; the CLI
+adopts it through the external owner-private control socket or wakes the exact
+containing app through NSWorkspace.
+An NSWorkspace callback timeout is an ambiguous request outcome, not a failed
+or successful daemon launch. The CLI proceeds only to a bounded exact control
+socket and release-identity proof; an explicit callback error still fails. The
+native bridge issues the request only from the process main thread and pumps
+that thread's RunLoop until the callback or timeout. A wrong-thread call is a
+definite pre-request refusal, never launch ambiguity.
 Authority TLS credentials and replay secrets never cross the local frontend
-socket to the extension. The daemon is always the exact `portablefsd` sibling
-from the same installed release; `PORTABLEFS_FSKIT_DAEMON` is rejected.
-`PORTABLEFS_FSKIT_SOCKET` and `PORTABLEFS_FSKIT_CONTROL_SOCKET` may override the
-daemon sockets explicitly, and `PORTABLEFS_FSKIT_TYPE` may only assert the
-signed release type.
+socket to the extension. The daemon is always the exact `portablefsd` inside
+the sealed `PortableFSDService.app` from the same installed release;
+`PORTABLEFS_FSKIT_DAEMON` is rejected. The
+frontend sockets are fixed by the release's signed app-group identity and the
+control socket is fixed under canonical account state, so
+`PORTABLEFS_FSKIT_SOCKET` and `PORTABLEFS_FSKIT_CONTROL_SOCKET` are rejected.
+`PORTABLEFS_FSKIT_TYPE` may only assert the signed release type.
 
 Two current macOS restrictions:
 

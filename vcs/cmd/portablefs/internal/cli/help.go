@@ -38,7 +38,7 @@ MOUNTS (this machine)
   mounts                       list this machine's mounts and their health
   route <path>                 is this path machine-local or shared, and by which rule
   prune-local                  reclaim machine-local backing no route can reach
-  daemon stop                  atomically stop portablefsd only when no attach exists
+  daemon stop                  stop an idle daemon (Linux; host-owned update only on macOS)
   mount-check                  inspect mount prerequisites (no network or mutation)
 
 THIS MACHINE
@@ -81,16 +81,23 @@ refuses this manual path.
 		"daemon": `USAGE
   portablefs daemon stop [--json]
 
-Atomically stop the per-user portablefsd only when it has no live attach.
+On Linux, atomically stop the per-user portablefsd only when it has no live attach.
 Credential-pending restart metadata does not block a clean stop because it
 holds no live session, WAL handle, or frontend service. The daemon first
 closes attach admission and persists its final idle state; if any live attach
 exists, the command fails without signaling or changing the daemon. The
-installer never invokes this automatically.
+installer never invokes this automatically. On macOS portablefsd is an
+always-running ServiceManagement agent, so this command refuses without
+mutation; only the host-owned zero-mount update transaction may unregister it.
 `,
 		"lifecycle": `USAGE
   portablefs lifecycle hold-shared --json
   portablefs lifecycle hold-account-exclusive --json
+  portablefs lifecycle hold-install-exclusive --json \
+    [--expected-daemon-version <version> \
+     --expected-daemon-sha256 <lowercase-sha256> \
+     --expected-pfslocal-major <major> \
+     --expected-pfslocal-minor <minor>]
   portablefs lifecycle identity --json
 
 Internal app/installer coordination protocol. Acquires the fixed per-user
@@ -100,6 +107,17 @@ The account-exclusive form additionally performs strict mount and daemon
 attach inventory while held, then reports
 {"schemaVersion":1,"held":true,"mounts":0,"attaches":0}; the app holds it
 across atomic profile/config mutation.
+The install-exclusive form nonblockingly acquires both the account-session and
+mount-lifecycle exclusive guards, proves zero kernel mounts, mount records,
+mount intents, durable daemon attaches, and live daemon attaches, then reports
+one schema-1 ` + "`service-update`" + ` readiness frame. The macOS host keeps its
+stdin open across the exact ServiceManagement unregister/register transaction;
+closing stdin releases both guards.
+When replacing a previously registered release, the host supplies all four
+expected-daemon fields from its persisted, signature-validated registration
+identity. A healthy old daemon must match that complete tuple before the CLI
+reads its attach inventory. The four fields are all-or-none; omission is valid
+only when no prior live daemon needs adoption.
 Identity prints the linker-stamped FSKit app group for packaging validation;
 portablefsd exposes the same JSON with ` + "`portablefsd -identity-json`" + `.
 `,
@@ -193,13 +211,15 @@ a volume that declares routes mounts from Linux.
 
 There is ONE transport per platform, with no fallbacks: macOS mounts through
 the PortableFS FSKit extension (install PortableFS.app and enable its File
-System Extension under System Settings once; the CLI manages the portablefsd
-daemon, which owns the authority session and never exposes credentials to
-the extension), and Linux mounts through FUSE. A host that cannot serve its
+System Extension under System Settings once; the host's launchd-managed
+portablefsd owns the authority session and never exposes credentials to the
+extension), and Linux mounts through FUSE. A host that cannot serve its
 platform's transport fails with guidance instead of degrading to a weaker
-consistency model. FSKit daemon sockets override explicitly via
-PORTABLEFS_FSKIT_SOCKET and PORTABLEFS_FSKIT_CONTROL_SOCKET.
-PORTABLEFS_FSKIT_TYPE may only assert the signed release type. The daemon is
+consistency model. The FSKit frontend is fixed by the release's signed
+app-group identity, while the unentitled CLI uses the fixed external private
+control socket; PORTABLEFS_FSKIT_SOCKET and
+PORTABLEFS_FSKIT_CONTROL_SOCKET are rejected. PORTABLEFS_FSKIT_TYPE may only
+assert the signed release type. The daemon is
 always the exact portablefsd sibling from the same installed release;
 PORTABLEFS_FSKIT_DAEMON is rejected.
 
@@ -306,6 +326,9 @@ Print the CLI version.
 	}
 	if t, ok := texts[name]; ok {
 		return t, true
+	}
+	if text, ok := qualificationCommandHelp(name); ok {
+		return text, true
 	}
 	if name == "help" {
 		return rootHelp(), true

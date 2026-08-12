@@ -325,8 +325,9 @@ coordinate nor an authenticated data locator, macOS 26 cannot represent its
 repair and the mount fails closed rather than leaving attributes stale. A later COMPLETE
 namespace target may supply an authority-attested post-binding identity; PREPARE
 never does, and that fresh coordinate can be inode-attested and used instead of the discarded old
-locator. macOS 27's native object API
-is expected to replace this residual, subject to final-SDK and live-kernel proof.
+locator. The macOS 27 SDK's item-scoped data cache API does not replace this
+attribute gap; a future native policy still needs a documented kernel operation
+for it.
 
 ## Saturation contract
 
@@ -495,8 +496,10 @@ filesystem architecture. It keeps:
 - namespace/live-object indexes; and
 - fencing and exact absence proof.
 
-It changes the participant execution profile to `INDEPENDENT` and replaces the
-four macOS 26 VFS actuator shapes with native item/object revocation. The final
-SDK must prove negative names, positive bindings, attributes, data/EOF, and
-open-but-unlinked objects on a live kernel. Until then the native policy remains
-declared but unimplemented and fails closed.
+It changes the participant execution profile to `INDEPENDENT` and would need to
+replace all four macOS 26 VFS actuator shapes with documented native cache
+operations. SDK 27 supplies an item-scoped data operation, but no name-entry or
+kernel attribute-cache notification. Negative names, positive bindings,
+attributes, data/EOF, and open-but-unlinked objects still require live-kernel
+proof. Until every shape is representable, the native policy remains declared
+but unimplemented and fails closed.

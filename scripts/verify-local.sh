@@ -15,17 +15,35 @@ cd "$ROOT"
 
 step() { printf '\n== %s ==\n' "$1"; }
 
-# 1. Cross-platform compile. The daemon, the mount clients and the frontend
-# adapters all carry per-GOOS files, so building only the host platform hides
-# breakage on the other one until a release job runs. Both targets are built
-# before anything is executed: a compile error should surface in seconds.
-step "build (GOOS=darwin, GOOS=linux)"
-GOOS=darwin go -C vcs build ./...
-GOOS=linux go -C vcs build ./...
+# 1. Cross-platform compile. Linux releases are static CGO-disabled binaries.
+# Darwin helpers call Foundation's app-group API through cgo; only a native
+# macOS build can compile and link that product boundary. A Linux host still
+# compiles the deliberate Darwin !cgo refusal stub, but labels it honestly —
+# CI's macOS lane is the required Foundation proof.
+case "$(uname -s)" in
+  Darwin)
+    step "build (Darwin Foundation/cgo, Linux static)"
+    CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...
+    CGO_ENABLED=0 GOOS=linux go -C vcs build ./...
 
-step "vet (GOOS=darwin, GOOS=linux)"
-GOOS=darwin go -C vcs vet ./...
-GOOS=linux go -C vcs vet ./...
+    step "vet (Darwin Foundation/cgo, Linux static)"
+    CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...
+    CGO_ENABLED=0 GOOS=linux go -C vcs vet ./...
+    ;;
+  Linux)
+    step "build (Linux static, Darwin fail-closed !cgo stub)"
+    CGO_ENABLED=0 GOOS=linux go -C vcs build ./...
+    CGO_ENABLED=0 GOOS=darwin go -C vcs build ./...
+
+    step "vet (Linux static, Darwin fail-closed !cgo stub)"
+    CGO_ENABLED=0 GOOS=linux go -C vcs vet ./...
+    CGO_ENABLED=0 GOOS=darwin go -C vcs vet ./...
+    ;;
+  *)
+    echo "unsupported verification host: $(uname -s)" >&2
+    exit 1
+    ;;
+esac
 
 # 2. and 3. The Go suites run natively — the tests exercise real syscalls,
 # sockets and mounts, so they are only meaningful on the host platform.

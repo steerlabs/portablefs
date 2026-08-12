@@ -7,10 +7,13 @@ mounted tree is the product.
 
 One volume is one XFS project directory on one Linux host, served by one
 `portablefs-authority` process. XFS is the only durable filesystem truth.
-PortableFS adds authentication, object capabilities, session-exact replay,
-distributed POSIX locks, and — for cached frontends — a synchronous visibility
-barrier. It adds no second inode tree, no mutation log, no checkpoint format,
-and no PortableFS-managed or offline write-back layer. Ordinary kernel page
+PortableFS adds authentication, object capabilities, session-exact replay, an
+authority implementation of distributed POSIX locks, and — for cached
+frontends — a synchronous visibility barrier. Linux FUSE forwards those locks;
+macOS FSKit exposes no advisory-lock callbacks, so Mac applications must use
+authority-serialized exclusive create or atomic rename for cross-machine
+coordination. PortableFS adds no second inode tree, mutation log, checkpoint
+format, or PortableFS-managed or offline write-back layer. Ordinary kernel page
 caches still obey each operating system's filesystem contract.
 
 ```text
@@ -78,8 +81,9 @@ On macOS there is no standalone CLI. PortableFS ships only as the notarized
 extension as one signed unit. The installer audits the zip before extraction,
 then checks the Developer ID signature, the hardened runtime, Gatekeeper
 assessment, and the exact bundle identity: team ID, bundle identifier, app
-group, FSKit type, and resource scheme, with the CLI, daemon, and extension all
-agreeing on that tuple. Enabling the extension under System Settings is a
+group, FSKit type, and resource scheme. Host, daemon, and extension share the
+exact app-group entitlement; the shell CLI is explicitly unentitled while its
+stamped routing identity still matches. Enabling the extension under System Settings is a
 one-time manual step Apple does not let an installer perform.
 
 What establishes a release's identity, and the one known gap in the release
@@ -161,9 +165,11 @@ narrow but never broaden. See
   a cache-affecting mutation quiesces every participant, applies to XFS, repairs
   and collects acknowledgements, and only then returns. A mount that misses its
   declared repair budget is fenced individually; the volume keeps serving.
-- **POSIX stays POSIX.** Atomic rename decides whole-file replacement. Open
-  descriptors keep working after unlink until final close. POSIX record locks and
-  BSD `flock` are distributed and independent of each other.
+- **The platform contract stays explicit.** Atomic rename decides whole-file
+  replacement, and open descriptors keep working after unlink until final
+  close. Linux POSIX record locks and BSD `flock` are distributed and
+  independent. FSKit has no advisory-lock or append-intent callbacks, so macOS
+  does not advertise those two cross-machine guarantees.
 
 ## What PortableFS is not
 
@@ -189,7 +195,7 @@ narrow but never broaden. See
 | --- | --- | --- |
 | Linux | kernel FUSE (`vcs/internal/fusev3`) | Production path. `strict` (default) and `uncached` profiles; proven by the privileged XFS + kernel-FUSE gate and the two-mount coherence matrix. |
 | macOS 26 | `portablefsd` v3 data plane + FSKit extension | Runs under the declared compatibility policy `macos26-synchronous-vfs-repair-v2`. The final macOS 26.5 breadth, retry-free saturation, same-vnode attribute/data, daemon-death revocation/recovery, and clean-detach runs are live-proven against Linux FUSE and raw XFS. Exact overlapping operations may surface definite-preapply `ECANCELED`; authority `EINTR` never crosses the FSKit edge. |
-| macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. No implementation exists; gated on the final SDK. Selecting the native policy today fails closed with `ENOTSUP`. |
+| macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. A separate SDK-27 package and signed development host compile the documented data-only invalidator; no complete policy implementation exists. The ordinary CLI refuses macOS 27 before attach. Only an explicitly build-stamped qualification CLI can exercise the development adapter. |
 
 The macOS 26 policy is an explicitly declared, owner-accepted compatibility
 policy with a bounded contract — never an automatic fallback and never a silent

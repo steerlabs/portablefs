@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -142,6 +143,30 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch strings.Join(parts[1:], "/") {
+	case "frontend-preflight":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := s.preflightFrontend(ref); err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case "native-frontend-ready":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := a.requireNativeFrontendReady(); err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, errNativeFrontendWrongPolicy) {
+				status = http.StatusConflict
+			}
+			writeHTTPError(w, status, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "unmount":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)

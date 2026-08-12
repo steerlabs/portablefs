@@ -9,7 +9,8 @@ agent that *uses* PortableFS workspaces, read
 There is no build system above the two languages and nothing to install:
 
 ```bash
-go -C vcs build ./...      # Go data plane (add GOOS=darwin / GOOS=linux to cross-check)
+CGO_ENABLED=1 GOOS=darwin go -C vcs build ./... # on macOS; Foundation resolver
+CGO_ENABLED=0 GOOS=linux go -C vcs build ./...  # static Linux release
 go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
@@ -24,9 +25,12 @@ tests share process resources or exercise hard protocol deadlines.
 ## Before You Finish
 
 Run `bash scripts/verify-local.sh` and make it pass. It is the local merge gate:
-darwin + linux builds and vet, the Go suite, the Go race suite, the Swift suite,
-the release-trust policy checks, and a stale-architecture scan. Do not report a
-change as complete with a failing or skipped `verify-local.sh`.
+on macOS it builds and vets the real Foundation/cgo Darwin boundary plus static
+Linux, while Linux compiles its native product plus Darwin's deliberate !cgo
+refusal stub. CI always supplies the required native macOS Foundation lane. The
+gate also runs the native Go and race suites, the Swift suite, the release-trust
+policy checks, and a stale-architecture scan. Do not report a change as complete
+with a failing `verify-local.sh`.
 
 ## Frozen Surfaces
 

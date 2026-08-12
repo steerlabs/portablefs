@@ -713,9 +713,139 @@ public extension PfsMacOSCallbackPublicationBarrier {
     func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool { false }
 }
 
-/// A future macOS 27 implementation supplies this interface with the SDK's
-/// native synchronous revoke API. Keeping the interface independent of those
-/// symbols lets Xcode 26 compile without pretending the API exists.
+/// SDK-independent mirror of the three cache requests introduced by macOS 27
+/// `FSVolume.DataCacheHandler`. Keeping this decision outside the SDK adapter
+/// makes the no-write-back rule testable by the stable Xcode lane.
+public enum PfsFSKitNativeDataCacheRequest: Sendable, Equatable, CaseIterable {
+    case none
+    case read
+    case readWrite
+}
+
+/// The complete set of cache grants PortableFS can return. `writeBack` is
+/// deliberately unrepresentable: a successful PortableFS write cannot leave
+/// its only dirty copy in the client kernel after returning to the caller.
+public enum PfsFSKitNativeDataCacheGrant: Sendable, Equatable {
+    case noCache
+    case readCache
+    case writeThrough
+}
+
+public enum PfsFSKitNativeDataCachePolicy {
+    public static func grant(
+        for request: PfsFSKitNativeDataCacheRequest
+    ) -> PfsFSKitNativeDataCacheGrant {
+        switch request {
+        case .none:
+            .noCache
+        case .read:
+            .readCache
+        case .readWrite:
+            .writeThrough
+        }
+    }
+}
+
+/// One exact data target that Apple's documented SDK-27 cache API can address.
+/// The linked form still needs the adapter's retained live-object index to
+/// resolve its stable identity to the exact FSItem before touching the kernel.
+public enum PfsFSKitNativeDataInvalidation: Sendable, Equatable {
+    case linked(
+        path: PfsMacOSRelativePath,
+        parentIdentity: PfsMacOSStableIdentity,
+        itemIdentity: PfsMacOSStableIdentity,
+        expectedVFSFileID: UInt64,
+        authoritativeSize: UInt64
+    )
+    case object(
+        reference: PfsMacOSLiveObjectReference,
+        itemIdentity: PfsMacOSStableIdentity,
+        authoritativeSize: UInt64
+    )
+}
+
+/// Implemented by the SDK-27 target with synchronous `setCacheState`. It has
+/// no namespace or attribute method because Apple's published API does not
+/// promise those transitions.
+public protocol PfsFSKitNativeDataCacheInvalidator: Sendable {
+    func invalidate(_ target: PfsFSKitNativeDataInvalidation) async throws
+}
+
+/// Single-assignment bridge used while constructing a native FSKit volume.
+/// The authority transport and repair runner are prepared before FSKit can see
+/// the volume; the concrete SDK-27 invalidator is then installed on that exact
+/// volume before the runner starts. A missing or duplicate installation is a
+/// terminal integration error, never a reason to acknowledge an event.
+public actor PfsFSKitNativeDataCacheInvalidatorSlot:
+    PfsFSKitNativeDataCacheInvalidator
+{
+    private var invalidator: (any PfsFSKitNativeDataCacheInvalidator)?
+
+    public init() {}
+
+    public func install(
+        _ invalidator: any PfsFSKitNativeDataCacheInvalidator
+    ) throws {
+        guard self.invalidator == nil else {
+            throw PfsMacOSCoherenceError.nativeRevocationUnavailable
+        }
+        self.invalidator = invalidator
+    }
+
+    public func invalidate(
+        _ target: PfsFSKitNativeDataInvalidation
+    ) async throws {
+        guard let invalidator else {
+            throw PfsMacOSCoherenceError.nativeRevocationUnavailable
+        }
+        try await invalidator.invalidate(target)
+    }
+}
+
+/// The currently documented subset of the native cache-revocation policy.
+/// Unsupported repair families fail before the backend resumes publication;
+/// live-kernel qualification may extend this only after proving an SDK-backed
+/// operation with the required semantics.
+public struct PfsFSKitDocumentedNativeCacheRevoker: PfsFSKitNativeCacheRevoker {
+    private let invalidator: any PfsFSKitNativeDataCacheInvalidator
+
+    public init(invalidator: any PfsFSKitNativeDataCacheInvalidator) {
+        self.invalidator = invalidator
+    }
+
+    public func revoke(_ repair: PfsMacOSCacheRepair) async throws {
+        switch repair {
+        case let .invalidateData(
+            path,
+            parentIdentity,
+            itemIdentity,
+            expectedVFSFileID,
+            authoritativeSize
+        ):
+            try await invalidator.invalidate(.linked(
+                path: path,
+                parentIdentity: parentIdentity,
+                itemIdentity: itemIdentity,
+                expectedVFSFileID: expectedVFSFileID,
+                authoritativeSize: authoritativeSize
+            ))
+        case let .invalidateDataObject(object, itemIdentity, authoritativeSize):
+            try await invalidator.invalidate(.object(
+                reference: object,
+                itemIdentity: itemIdentity,
+                authoritativeSize: authoritativeSize
+            ))
+        case .purgeNegative, .evictBinding, .refreshAttributes,
+             .invalidateAttributesObject:
+            throw PfsMacOSCoherenceError.unsupportedRepair
+        }
+    }
+}
+
+/// A macOS 27 implementation supplies this interface with the SDK's native
+/// synchronous cache API. Keeping the interface independent of those symbols
+/// lets Xcode 26 compile the ordering and refusal tests without pretending the
+/// SDK implementation exists.
 public protocol PfsFSKitNativeCacheRevoker: Sendable {
     func revoke(_ repair: PfsMacOSCacheRepair) async throws
 }

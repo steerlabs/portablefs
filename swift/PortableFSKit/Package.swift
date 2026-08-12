@@ -32,6 +32,9 @@ let package = Package(
             name: "PortableFSAppCore",
             dependencies: [
                 "PortableFSKit"
+            ],
+            linkerSettings: [
+                .linkedLibrary("bsm", .when(platforms: [.macOS]))
             ]
         ),
         .testTarget(

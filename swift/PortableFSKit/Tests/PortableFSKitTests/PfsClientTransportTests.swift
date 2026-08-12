@@ -31,6 +31,25 @@ private actor PfsTestAsyncGate {
     }
 }
 
+@Test func mockDaemonUsesPrivateEphemeralSocketStateAndCleansIt() throws {
+    let daemon = try PfsLocalMockDaemon()
+    let socketPath = daemon.socketPath
+    let directory = (socketPath as NSString).deletingLastPathComponent
+    var directoryStatus = stat()
+    var socketStatus = stat()
+    #expect(Darwin.lstat(directory, &directoryStatus) == 0)
+    #expect(directoryStatus.st_mode & S_IFMT == S_IFDIR)
+    #expect(directoryStatus.st_mode & 0o777 == 0o700)
+    #expect(Darwin.lstat(socketPath, &socketStatus) == 0)
+    #expect(socketStatus.st_mode & S_IFMT == S_IFSOCK)
+    #expect(socketStatus.st_mode & 0o777 == 0o600)
+
+    daemon.stop()
+
+    #expect(Darwin.lstat(socketPath, &socketStatus) != 0 && errno == ENOENT)
+    #expect(Darwin.lstat(directory, &directoryStatus) != 0 && errno == ENOENT)
+}
+
 private actor PfsWrittenRequestIDs {
     private var ids: [UInt64] = []
 
@@ -1151,14 +1170,30 @@ private func nextEvent(from stream: AsyncStream<PfsEvent>) async throws -> PfsEv
 
 private final class PfsRawServer: @unchecked Sendable {
     let socketPath: String
+    private let socketDirectory: String
     private let serverFD: Int32
     private let queue = DispatchQueue(label: "dev.portablefs.tests.rawserver", qos: .utility)
     private let group = DispatchGroup()
     private var stopped = false
 
     init(onClient: @escaping @Sendable (Int32) -> Void) throws {
-        socketPath = "/tmp/pfs-raw-\(UUID().uuidString.prefix(12)).sock"
-        serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+        var template = Array("/tmp/pfs-raw.XXXXXX".utf8CString)
+        guard let created = Darwin.mkdtemp(&template) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let directory = String(cString: created)
+        socketDirectory = directory
+        socketPath = directory + "/pfs.sock"
+        do {
+            serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+            guard Darwin.chmod(socketPath, 0o600) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch {
+            unlink(socketPath)
+            rmdir(directory)
+            throw error
+        }
         group.enter()
         queue.async { [serverFD, weak self] in
             defer {
@@ -1187,6 +1222,7 @@ private final class PfsRawServer: @unchecked Sendable {
         Darwin.shutdown(serverFD, SHUT_RDWR)
         PfsUnixSocket.close(serverFD)
         unlink(socketPath)
+        rmdir(socketDirectory)
     }
 
     static func sendAll(fd: Int32, data: Data) throws {

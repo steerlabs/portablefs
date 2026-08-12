@@ -143,11 +143,12 @@ public actor VolumeCore {
     public let client: PfsLocalClient
     public private(set) var resolvedVolume: PfsResolvedVolume?
     /// The raw resolve reply and validated terms of a strict-v3 attach whose
-    /// declared cache policy this build implements. Set only for the macOS 26
-    /// compatibility policy; the FSKit adapter composes its coherence stack
-    /// from these before the volume may serve.
+    /// declared cache policy exactly matches this frontend adapter. The FSKit
+    /// adapter composes its coherence stack from these before the volume may
+    /// serve; a different declared policy is never treated as a fallback.
     public private(set) var strictV3ResolveReply: PfsResolveReply?
     public private(set) var strictV3Contract: PfsMacOSV3LocalContract?
+    private let supportedCachePolicies: Set<PfsMacOSCachePolicy>
 
     private var itemsByIdentity: [PfsItemIdentity: PortableFSItem] = [:]
     private var identitiesByObject: [ObjectIdentifier: PfsItemIdentity] = [:]
@@ -221,13 +222,31 @@ public actor VolumeCore {
         var waiters: [LifecycleWaiter] = []
     }
 
-    public init(client: PfsLocalClient) {
+    public init(
+        client: PfsLocalClient,
+        supportedCachePolicies: Set<PfsMacOSCachePolicy> = [
+            .synchronousVFSRepairV1,
+            .synchronousVFSRepairV2,
+        ]
+    ) {
         self.client = client
+        self.supportedCachePolicies = supportedCachePolicies
     }
 
-    public static func connect(socketPath: String, attachRef: String, configuration: PfsLocalClient.Configuration = .init()) async throws -> VolumeCore {
+    public static func connect(
+        socketPath: String,
+        attachRef: String,
+        supportedCachePolicies: Set<PfsMacOSCachePolicy> = [
+            .synchronousVFSRepairV1,
+            .synchronousVFSRepairV2,
+        ],
+        configuration: PfsLocalClient.Configuration = .init()
+    ) async throws -> VolumeCore {
         let client = PfsLocalClient(socketPath: socketPath, configuration: configuration)
-        let core = VolumeCore(client: client)
+        let core = VolumeCore(
+            client: client,
+            supportedCachePolicies: supportedCachePolicies
+        )
         try await core.resolve(attachRef: attachRef)
         return core
     }
@@ -237,14 +256,13 @@ public actor VolumeCore {
         let reply = try await client.resolve(attachRef: attachRef)
         if reply.hasV3Coherence {
             // Cache-coherence behavior is a DECLARED policy carried by the
-            // resolve contract, never an inference. This build implements
-            // exactly one policy — the macOS 26 compatibility policy — and a
-            // contract naming anything else fails closed with the same
-            // close-first discipline the old unconditional guard used, so
-            // portablefsd's bridge fails its authority session rather than
-            // waiting for a subscriber that will never exist. The native
-            // macOS 27 policy stays refused until the final SDK supplies its
-            // revocation API.
+            // resolve contract, never an OS inference. Every frontend adapter
+            // declares the exact named policies it implements. The macOS 26
+            // adapter keeps both frozen compatibility revisions; the native
+            // adapter declares only its native policy. A mismatch follows the
+            // same close-first discipline as an unknown policy, so portablefsd
+            // fails its authority session rather than waiting for a subscriber
+            // that will never honor the promised repair contract.
             let contract: PfsMacOSV3LocalContract
             do {
                 contract = try PfsLocalMacOSV3CoherenceTransport.parseContract(reply.v3Coherence)
@@ -255,14 +273,12 @@ public actor VolumeCore {
                 }
                 throw error
             }
-            switch contract.cachePolicy {
-            case .synchronousVFSRepairV1, .synchronousVFSRepairV2:
-                strictV3ResolveReply = reply
-                strictV3Contract = contract
-            case .nativeFSKitRevocationV1:
+            guard supportedCachePolicies.contains(contract.cachePolicy) else {
                 await client.close()
                 throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
             }
+            strictV3ResolveReply = reply
+            strictV3Contract = contract
         }
         let root = try daemonItem(for: reply.root)
         publishedItemIdentities.insert(root.identity)

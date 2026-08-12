@@ -99,6 +99,19 @@ private func expectEEXIST(_ error: any Error) {
     #expect((error as NSError).code == Int(EEXIST))
 }
 
+private func waitForBoundaryCallback(
+    _ deadline: Duration = .seconds(2),
+    _ delivered: () async -> Bool
+) async throws -> Bool {
+    let clock = ContinuousClock()
+    let end = clock.now + deadline
+    while clock.now < end {
+        if await delivered() { return true }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    return await delivered()
+}
+
 private actor BoundaryXattrReply {
     private var result: (delivered: Bool, hadValue: Bool, errno: Int?) = (false, false, nil)
 
@@ -566,7 +579,9 @@ private actor BoundaryCallbackGate {
     ) { value, error in
         Task { await reply.record(value: value, error: error) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await reply.snapshot()).delivered
+    })
     let snapshot = await reply.snapshot()
     #expect(snapshot.delivered)
     #expect(!snapshot.hadValue)
@@ -687,7 +702,9 @@ private actor BoundaryCallbackGate {
         let errorCode = error.map { ($0 as NSError).code }
         Task { await parentOpenReply.record(errno: errorCode) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await parentOpenReply.snapshot()).delivered
+    })
     let parentOpenSnapshot = await parentOpenReply.snapshot()
     #expect(parentOpenSnapshot.delivered)
     #expect(parentOpenSnapshot.errno == nil)
@@ -696,7 +713,9 @@ private actor BoundaryCallbackGate {
         let errorCode = error.map { ($0 as NSError).code }
         Task { await parentCloseReply.record(errno: errorCode) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await parentCloseReply.snapshot()).delivered
+    })
     let parentCloseSnapshot = await parentCloseReply.snapshot()
     #expect(parentCloseSnapshot.delivered)
     #expect(parentCloseSnapshot.errno == nil)
@@ -713,7 +732,9 @@ private actor BoundaryCallbackGate {
             await reply.record(hadItem: hadItem, name: nameData, errno: errorCode)
         }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await reply.snapshot()).delivered
+    })
     let snapshot = await reply.snapshot()
     #expect(snapshot.delivered)
     #expect(snapshot.hadItem)
@@ -731,7 +752,9 @@ private actor BoundaryCallbackGate {
             await attributesReply.record(hadAttributes: hadAttributes, errno: errorCode)
         }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await attributesReply.snapshot()).delivered
+    })
     let attributesSnapshot = await attributesReply.snapshot()
     #expect(attributesSnapshot.delivered)
     #expect(attributesSnapshot.hadAttributes)
@@ -773,7 +796,9 @@ private actor BoundaryCallbackGate {
         let errorCode = error.map { ($0 as NSError).code }
         Task { await openReply.record(errno: errorCode) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await openReply.snapshot()).delivered
+    })
     let openSnapshot = await openReply.snapshot()
     #expect(openSnapshot.delivered)
     #expect(openSnapshot.errno == nil)
@@ -783,7 +808,9 @@ private actor BoundaryCallbackGate {
         let errorCode = error.map { ($0 as NSError).code }
         Task { await closeReply.record(errno: errorCode) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await closeReply.snapshot()).delivered
+    })
     let closeSnapshot = await closeReply.snapshot()
     #expect(closeSnapshot.delivered)
     #expect(closeSnapshot.errno == nil)
@@ -800,7 +827,9 @@ private actor BoundaryCallbackGate {
         let errorCode = error.map { ($0 as NSError).code }
         Task { await removeReply.record(errno: errorCode) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await removeReply.snapshot()).delivered
+    })
     let removeSnapshot = await removeReply.snapshot()
     #expect(removeSnapshot.delivered)
     #expect(removeSnapshot.errno == nil)
@@ -834,7 +863,9 @@ private actor BoundaryCallbackGate {
         let errorCode = error.map { ($0 as NSError).code }
         Task { await reclaimReply.record(errno: errorCode) }
     }
-    try await Task.sleep(for: .milliseconds(100))
+    #expect(try await waitForBoundaryCallback {
+        (await reclaimReply.snapshot()).delivered
+    })
     let reclaimSnapshot = await reclaimReply.snapshot()
     #expect(reclaimSnapshot.delivered)
     #expect(reclaimSnapshot.errno == nil)

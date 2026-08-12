@@ -79,12 +79,15 @@ for every mount:
 - **Atomic rename.** Write to a temporary file, then `rename(2)` over the
   target. Another mount observes either the old inode with the old bytes or the
   new inode with the new bytes, never a mixture.
-- **POSIX locks.** `fcntl` byte-range locks and `flock` are held by the
-  authority, not by one kernel, so they coordinate across mounts. A blocked
-  waiter is released when the holder's session ends rather than hanging forever.
+- **Linux POSIX locks.** On Linux, `fcntl` byte-range locks and `flock` are held
+  by the authority, not by one kernel, so they coordinate across mounts. A
+  blocked waiter is released when the holder's session ends rather than hanging
+  forever. FSKit exposes no advisory-lock callbacks: a macOS agent must use
+  `O_EXCL` create, atomic rename, or disjoint files for cross-machine
+  coordination, and must not treat a locally successful lock as distributed.
 
 Concurrent whole-record overwrites of one file leave one writer's record, never
-a mixture; concurrent `O_APPEND` writers lose no record and tear no record,
+a mixture; concurrent Linux `O_APPEND` writers lose no record and tear no record,
 though the interleaving is free. Those are named cases in the two-mount
 coherence matrix ([cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md)).
 

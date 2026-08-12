@@ -16,10 +16,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
+	"github.com/steerlabs/portablefs/vcs/internal/apphost"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
@@ -32,16 +32,15 @@ import (
 // FSKit strategy: the ONE macOS mount path.
 //
 // The CLI drives exactly the portablefsd + FSKit extension pair the menu-bar
-// app uses: ensure a per-user portablefsd (adopt a healthy one, else spawn),
-// register the attach over its control socket (authority endpoint + data-
-// plane credential + tuning), then hand the kernel the attach reference via
+// app owns: adopt a healthy per-user launchd agent or wake the exact host,
+// register the attach over the external control socket (authority endpoint +
+// data-plane credential + tuning), then hand the kernel the attach reference via
 // `/sbin/mount -t <fstype> <scheme>://<attachRef> <mountPath>`. The registered
 // FSKit extension dials the daemon's frontend socket inside the PortableFS
 // app-group container (PFSAppGroupIdentifier in the extension Info.plist),
-// so the frontend socket this CLI serves MUST be that same path. The app
-// group is the one location a sandboxed extension may connect(2) to a unix
-// socket — the app sandbox only grants network-outbound on app-group paths,
-// so a socket under /tmp is unreachable regardless of file exceptions.
+// while this deliberately unentitled CLI never resolves or dials that path.
+// The daemon performs the exact frontend Hello+Resolve preflight through its
+// versioned control API before the CLI asks the kernel to mount.
 //
 // There is deliberately no fallback transport: a missing extension fails
 // closed with install guidance, never a silently weaker mount.
@@ -58,50 +57,66 @@ const (
 	// its own FSShortName, generic-resource URL scheme, and app group): a
 	// unique mount type, globally scoped URL scheme, and private app-group
 	// socket directory guarantee the products never collide when installed on
-	// the same machine. Extension coordinates are overridable via
-	// PORTABLEFS_FSKIT_* for bespoke deployments; the executable peer is not.
+	// the same machine. Neither the signed socket identity nor the executable
+	// peer is runtime-configurable.
 	defaultFskitType = fskitidentity.FSType
 )
 
-// defaultFskitSocketDir is the daemon socket directory inside the app-group
-// container. The unsandboxed daemon and CLI address it by its well-known
-// path; the sandboxed extension resolves the identical path via
-// containerURL(forSecurityApplicationGroupIdentifier:).
-func defaultFskitSocketDir() (string, error) {
-	home, err := accountpath.Home()
+var resolveFSKitAccountHome = accountpath.Home
+var launchExactPortableFSHost = func() error {
+	executable, err := os.Executable()
 	if err != nil {
-		return "", fmt.Errorf("resolve canonical account home for FSKit sockets: %w", err)
+		return fmt.Errorf("resolve PortableFS executable for host launch: %w", err)
 	}
-	return filepath.Join(home, "Library", "Group Containers", fskitidentity.AppGroup, "portablefsd"), nil
+	return apphost.LaunchContainingApp(executable)
+}
+
+// defaultFskitControlSocket is deliberately outside the Data Vault protected
+// app-group. A shell CLI is not the responsible app and must never resolve,
+// inspect, create, or dial the group container. Only the host, launch agent,
+// and FSKit extension cross that boundary; the CLI addresses the daemon through
+// this exact owner-private account state directory.
+func defaultFskitControlSocket() (string, error) {
+	home, err := resolveFSKitAccountHome()
+	if err != nil {
+		return "", fmt.Errorf("resolve canonical account home for FSKit control: %w", err)
+	}
+	return filepath.Join(home, ".local", "state", "portablefs", "portablefsd", "control.sock"), nil
 }
 
 // fskitConfig resolves the extension coordinates for this host. The
-// filesystem type is a signed release identity and cannot be changed at
-// runtime. Socket overrides exist for development builds that preserve that
-// identity while using a different app-group container.
+// filesystem type and socket paths are a signed release identity and cannot
+// be changed at runtime. A development product uses its own compiled app-group
+// identity and matching signed helpers rather than an environment override.
 type fskitConfig struct {
 	fsType            string
-	frontendSock      string
 	controlSock       string
 	daemonPathForTest string // tests inject a peer without adding a production override
 	legacyStateDir    string // empty only in isolated tests
 }
 
 func fskitConfigFromEnv(getenv func(string) string) (fskitConfig, error) {
-	socketDir, err := defaultFskitSocketDir()
+	controlSocket, err := defaultFskitControlSocket()
 	if err != nil {
 		return fskitConfig{}, err
 	}
 	cfg := fskitConfig{
-		fsType:       defaultFskitType,
-		frontendSock: filepath.Join(socketDir, "pfs.sock"),
-		controlSock:  filepath.Join(socketDir, "control.sock"),
+		fsType:      defaultFskitType,
+		controlSock: controlSocket,
 	}
 	if daemonOverride := getenv(fskitDaemonEnv); daemonOverride != "" {
 		return fskitConfig{}, fmt.Errorf(
 			"%s is unsupported: portablefsd must be the exact sibling embedded with this portablefs executable",
 			fskitDaemonEnv,
 		)
+	}
+	for _, variable := range []string{fskitSocketEnv, fskitControlEnv} {
+		if value := getenv(variable); value != "" {
+			return fskitConfig{}, fmt.Errorf(
+				"%s is unsupported: FSKit sockets are fixed by this release's signed app-group identity",
+				variable,
+			)
+		}
 	}
 	home, err := accountpath.Home()
 	if err != nil {
@@ -115,17 +130,6 @@ func fskitConfigFromEnv(getenv func(string) string) (fskitConfig, error) {
 			v,
 			defaultFskitType,
 		)
-	}
-	if v := getenv(fskitSocketEnv); v != "" {
-		cfg.frontendSock = v
-		// A custom frontend implies a paired control socket next to it
-		// unless one is given explicitly.
-		if getenv(fskitControlEnv) == "" {
-			cfg.controlSock = filepath.Join(filepath.Dir(v), "control.sock")
-		}
-	}
-	if v := getenv(fskitControlEnv); v != "" {
-		cfg.controlSock = v
 	}
 	return cfg, nil
 }
@@ -235,6 +239,25 @@ func (c *fsdControl) requireCompatibleIdentityWithin(
 	executableSHA256 string,
 	timeout time.Duration,
 ) error {
+	return c.requireExactIdentityWithin(daemonctl.Identity{
+		SchemaVersion:    daemonctl.IdentitySchemaVersion,
+		ControlProtocol:  daemonctl.ControlProtocolVersion,
+		DaemonVersion:    cliVersion,
+		ExecutableSHA256: executableSHA256,
+		PFSLocalMajor:    pfslocal.ProtocolMajor,
+		PFSLocalMinor:    pfslocal.ProtocolMinor,
+	}, timeout)
+}
+
+// requireExactIdentityWithin proves every private paired-release axis before
+// the CLI sends an operational control request. Service replacement may pass
+// the previously registered identity here after the app bundle has changed;
+// that permits read-only attach inventory of exactly that old release without
+// trusting or executing an old path.
+func (c *fsdControl) requireExactIdentityWithin(
+	expected daemonctl.Identity,
+	timeout time.Duration,
+) error {
 	identity, err := c.identityWithin(timeout)
 	if err != nil {
 		return fmt.Errorf(
@@ -242,21 +265,22 @@ func (c *fsdControl) requireCompatibleIdentityWithin(
 			c.socketPath, err,
 		)
 	}
-	if identity.SchemaVersion != daemonctl.IdentitySchemaVersion ||
-		identity.ControlProtocol != daemonctl.ControlProtocolVersion ||
-		identity.PFSLocalMajor != pfslocal.ProtocolMajor ||
-		identity.DaemonVersion != cliVersion ||
-		identity.ExecutableSHA256 != executableSHA256 {
+	if identity != expected {
 		return fmt.Errorf(
-			"the running portablefsd on %s is incompatible (daemon %q, CLI %q, executable %q, expected %q, control protocol %d, pfslocal %d.%d); cleanly unmount PortableFS volumes, stop that daemon, and retry (PortableFS will not replace a live daemon automatically)",
+			"the running portablefsd on %s is incompatible (daemon %q, expected %q, executable %q, expected %q, schema %d/%d, control protocol %d/%d, pfslocal %d.%d/%d.%d); cleanly unmount PortableFS volumes and retry (PortableFS will not replace an unproven live daemon)",
 			c.socketPath,
 			identity.DaemonVersion,
-			cliVersion,
+			expected.DaemonVersion,
 			identity.ExecutableSHA256,
-			executableSHA256,
+			expected.ExecutableSHA256,
+			identity.SchemaVersion,
+			expected.SchemaVersion,
 			identity.ControlProtocol,
+			expected.ControlProtocol,
 			identity.PFSLocalMajor,
 			identity.PFSLocalMinor,
+			expected.PFSLocalMajor,
+			expected.PFSLocalMinor,
 		)
 	}
 	return nil
@@ -519,6 +543,42 @@ func (c *fsdControl) bindMountRoot(ref string) error {
 	return nil
 }
 
+// preflightAttach asks the authorized daemon to exercise the exact frontend
+// socket itself. The shell CLI deliberately cannot dial the Data Vault path.
+func (c *fsdControl) preflightAttach(ref string) error {
+	status, body, err := c.do(
+		http.MethodPost,
+		"/v1/attaches/"+url.PathEscape(ref)+"/frontend-preflight",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return controlError(status, body)
+	}
+	return nil
+}
+
+// requireNativeFrontendReady asks portablefsd to attest a live shipping
+// `portablefskit` connection which has completed Resolve for this exact native
+// attach. Unlike legacy bind-root, this performs no I/O through the mounted
+// path and creates no repair-root descriptor channel.
+func (c *fsdControl) requireNativeFrontendReady(ref string) error {
+	status, body, err := c.do(
+		http.MethodPost,
+		"/v1/attaches/"+url.PathEscape(ref)+"/native-frontend-ready",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return controlError(status, body)
+	}
+	return nil
+}
+
 func (c *fsdControl) unmountAttach(ref string) error {
 	status, body, err := c.do(http.MethodPost, "/v1/attaches/"+url.PathEscape(ref)+"/unmount", nil)
 	if err != nil {
@@ -702,7 +762,12 @@ func openPortablefsdPeer(path string) (*portablefsdPeer, error) {
 	return peer, nil
 }
 
-// exactPortablefsdPath resolves only the daemon packaged beside this exact CLI.
+const macOSPortableFSDRelativePath = "Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd"
+
+// exactPortablefsdPath resolves only the daemon inside the sealed service app
+// belonging to the exact host that contains this CLI. The CLI is intentionally
+// not a sibling of the daemon: the app-like wrapper is what lets
+// ServiceManagement launch the entitled daemon under its own release identity.
 // There is no PATH search or environment-selected executable in production.
 func exactPortablefsdPath(executable string) (string, error) {
 	if executable == "" {
@@ -722,7 +787,15 @@ func exactPortablefsdPath(executable string) (string, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return "", fmt.Errorf("portablefs executable %s is not a real executable file", resolved)
 	}
-	return filepath.Join(filepath.Dir(resolved), "portablefsd"), nil
+	helpers := filepath.Dir(resolved)
+	if filepath.Base(helpers) != "Helpers" {
+		return "", fmt.Errorf("portablefs executable is not sealed under Contents/Helpers: %s", resolved)
+	}
+	contents := filepath.Dir(helpers)
+	if filepath.Base(contents) != "Contents" {
+		return "", fmt.Errorf("portablefs executable is not sealed under an app Contents directory: %s", resolved)
+	}
+	return filepath.Join(contents, filepath.FromSlash(macOSPortableFSDRelativePath)), nil
 }
 
 func findPortablefsd(testPath string) (string, error) {
@@ -747,11 +820,20 @@ func findPortablefsd(testPath string) (string, error) {
 	return path, nil
 }
 
-// ensurePortablefsd adopts a healthy daemon on the control socket or spawns
-// one detached. The daemon is per-user and multi-attach: one instance serves
-// every mount, so an already-running daemon (this CLI's or the app's, when
-// they share sockets) is adopted, never duplicated.
+// ensurePortablefsd adopts a healthy daemon on the external owner-private
+// control socket. When none answers it wakes the exact containing host app;
+// only that app may register/start the ServiceManagement agent that holds the
+// Data Vault token needed for the FSKit frontend socket. There is deliberately
+// no direct CLI spawn path or app-group access fallback.
 func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdControl, error) {
+	expectedControl := filepath.Join(stateRoot, "portablefsd", "control.sock")
+	if cfg.controlSock != expectedControl {
+		return nil, fmt.Errorf(
+			"portablefsd control socket %q does not match canonical account state %q",
+			cfg.controlSock,
+			expectedControl,
+		)
+	}
 	if cfg.legacyStateDir != "" {
 		if err := checkPortablefsdStateRoots(filepath.Join(stateRoot, "portablefsd"), cfg.legacyStateDir); err != nil {
 			return nil, err
@@ -773,161 +855,47 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 		}
 		return ctl, nil
 	}
-	for _, sock := range []string{cfg.frontendSock, cfg.controlSock} {
-		if err := privatepath.EnsureDir(filepath.Dir(sock)); err != nil {
-			return nil, fmt.Errorf("validate socket directory: %w", err)
-		}
-	}
-	daemonStateDir := filepath.Join(stateRoot, "portablefsd")
-	if err := privatepath.EnsureDir(daemonStateDir); err != nil {
-		return nil, fmt.Errorf("validate portablefsd state dir: %w", err)
-	}
-	logFile, err := privatepath.OpenFileAppend(filepath.Join(stateRoot, "portablefsd.log"))
-	if err != nil {
-		return nil, err
-	}
-	defer logFile.Close()
-
 	if err := daemon.validate(); err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(daemon.path,
-		"-frontend-socket", cfg.frontendSock,
-		"-control-socket", cfg.controlSock,
-		"-state-dir", daemonStateDir,
-	)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	// Its own session: the daemon outlives this mount process and serves
-	// later mounts too.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	// Revalidate at the final userspace boundary immediately before exec.
-	if err := daemon.validate(); err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start portablefsd: %w", err)
-	}
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-	stopSpawned := func() error {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-waitCh:
-			return nil
-		case <-time.After(35 * time.Second):
-			return fmt.Errorf("spawned portablefsd did not stop within its 30-second drain budget and was left running")
-		}
-	}
-	if err := daemon.validate(); err != nil {
-		if stopErr := stopSpawned(); stopErr != nil {
-			return nil, fmt.Errorf("%w; cleanup: %v", err, stopErr)
-		}
-		return nil, err
+	if err := launchExactPortableFSHost(); err != nil &&
+		!errors.Is(err, apphost.ErrLaunchCompletionAmbiguous) {
+		return nil, fmt.Errorf(
+			"wake the exact PortableFS host for its launchd-managed daemon: %w",
+			err,
+		)
 	}
 
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		select {
-		case waitErr := <-waitCh:
-			if waitErr == nil {
-				return nil, fmt.Errorf(
-					"portablefsd exited without becoming healthy on %s (log: %s)",
-					cfg.controlSock,
-					filepath.Join(stateRoot, "portablefsd.log"),
-				)
-			}
-			return nil, fmt.Errorf(
-				"portablefsd exited before becoming healthy on %s: %w (log: %s)",
-				cfg.controlSock,
-				waitErr,
-				filepath.Join(stateRoot, "portablefsd.log"),
-			)
-		default:
-		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
 		}
 		probeTimeout := min(250*time.Millisecond, remaining)
 		if ctl.healthyWithin(probeTimeout) {
-			remaining = time.Until(deadline)
-			if remaining <= 0 {
-				break
-			}
-			identityCh := make(chan error, 1)
-			go func() {
-				identityCh <- ctl.requireCompatibleIdentityWithin(cliVersion, daemon.sha256, remaining)
-			}()
-			select {
-			case waitErr := <-waitCh:
-				if waitErr == nil {
-					return nil, fmt.Errorf(
-						"portablefsd exited without becoming healthy on %s (log: %s)",
-						cfg.controlSock,
-						filepath.Join(stateRoot, "portablefsd.log"),
-					)
-				}
-				return nil, fmt.Errorf(
-					"portablefsd exited before identity verification on %s: %w (log: %s)",
-					cfg.controlSock,
-					waitErr,
-					filepath.Join(stateRoot, "portablefsd.log"),
-				)
-			case err := <-identityCh:
-				if err == nil {
-					return ctl, nil
-				}
-				if stopErr := stopSpawned(); stopErr != nil {
-					return nil, fmt.Errorf("%w; cleanup: %v", err, stopErr)
-				}
+			if err := daemon.validate(); err != nil {
 				return nil, err
-			case <-time.After(remaining):
-				if stopErr := stopSpawned(); stopErr != nil {
-					return nil, fmt.Errorf(
-						"portablefsd identity did not become verifiable on %s within 15s (log: %s); cleanup: %w",
-						cfg.controlSock,
-						filepath.Join(stateRoot, "portablefsd.log"),
-						stopErr,
-					)
-				}
-				return nil, fmt.Errorf(
-					"portablefsd identity did not become verifiable on %s within 15s (log: %s)",
-					cfg.controlSock,
-					filepath.Join(stateRoot, "portablefsd.log"),
-				)
 			}
+			if err := ctl.requireCompatibleIdentityWithin(
+				cliVersion,
+				daemon.sha256,
+				min(2*time.Second, remaining),
+			); err != nil {
+				return nil, err
+			}
+			return ctl, nil
 		}
 		remaining = time.Until(deadline)
 		if remaining <= 0 {
 			break
 		}
-		select {
-		case waitErr := <-waitCh:
-			if waitErr == nil {
-				return nil, fmt.Errorf(
-					"portablefsd exited without becoming healthy on %s (log: %s)",
-					cfg.controlSock,
-					filepath.Join(stateRoot, "portablefsd.log"),
-				)
-			}
-			return nil, fmt.Errorf(
-				"portablefsd exited before becoming healthy on %s: %w (log: %s)",
-				cfg.controlSock,
-				waitErr,
-				filepath.Join(stateRoot, "portablefsd.log"),
-			)
-		case <-time.After(min(150*time.Millisecond, remaining)):
-		}
+		time.Sleep(min(150*time.Millisecond, remaining))
 	}
-	if err := stopSpawned(); err != nil {
-		return nil, fmt.Errorf("portablefsd did not become healthy on %s within 15s (log: %s); cleanup: %w",
-			cfg.controlSock, filepath.Join(stateRoot, "portablefsd.log"), err)
-	}
-	return nil, fmt.Errorf("portablefsd did not become healthy on %s within 15s (log: %s)",
-		cfg.controlSock, filepath.Join(stateRoot, "portablefsd.log"))
+	return nil, fmt.Errorf(
+		"launchd-managed portablefsd did not become healthy on %s within 15s; open PortableFS to review Background Items approval",
+		cfg.controlSock,
+	)
 }
 
 func rejectLegacyPortablefsdStateAt(legacy string) error {
@@ -995,58 +963,6 @@ func connectCompatiblePortablefsd(cfg fskitConfig, cliVersion string) (*fsdContr
 		return nil, err
 	}
 	return ctl, nil
-}
-
-// fskitPreflight proves the attach is resolvable over the SAME frontend
-// socket the registered extension will dial: Hello + Resolve(attachRef). It
-// catches the one foreseeable misconfiguration — the CLI attached to daemon
-// A while the installed extension's Info.plist points at daemon B — as a
-// typed error before the kernel mount, instead of an opaque I/O error after.
-func fskitPreflight(frontendSock, attachRef, expectedDaemonVersion string) error {
-	conn, err := net.DialTimeout("unix", frontendSock, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("portablefsd frontend socket %s is not answering: %w", frontendSock, err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	call := func(id uint64, body any) (any, error) {
-		if err := pfslocal.WriteFrame(conn, &pfslocal.Envelope{RequestID: id, Body: body}); err != nil {
-			return nil, err
-		}
-		for {
-			env, err := pfslocal.ReadFrame(conn)
-			if err != nil {
-				return nil, err
-			}
-			if env.RequestID != id {
-				continue
-			}
-			if er, ok := env.Body.(*pfslocal.ErrorReply); ok {
-				return nil, fmt.Errorf("errno %d: %s", er.Errno, er.Message)
-			}
-			return env.Body, nil
-		}
-	}
-	helloBody, err := call(1, &pfslocal.Hello{ProtocolMajor: pfslocal.ProtocolMajor, ProtocolMinor: pfslocal.ProtocolMinor, ClientName: "portablefs-cli", ClientVersion: "preflight"})
-	if err != nil {
-		return fmt.Errorf("portablefsd frontend handshake on %s: %w", frontendSock, err)
-	}
-	hello, ok := helloBody.(*pfslocal.HelloReply)
-	if !ok || hello.ProtocolMajor != pfslocal.ProtocolMajor || hello.DaemonVersion != expectedDaemonVersion {
-		gotMajor := uint32(0)
-		gotVersion := ""
-		if ok {
-			gotMajor = hello.ProtocolMajor
-			gotVersion = hello.DaemonVersion
-		}
-		return fmt.Errorf("portablefsd frontend handshake on %s returned incompatible %T (protocol %d, daemon %q; want major %d, daemon %q)",
-			frontendSock, helloBody, gotMajor, gotVersion, pfslocal.ProtocolMajor, expectedDaemonVersion)
-	}
-	if _, err := call(2, &pfslocal.ResolveRequest{AttachRef: attachRef}); err != nil {
-		return fmt.Errorf("attach %s is not resolvable on frontend %s (is the registered FSKit extension pointed at a different daemon? set %s/%s to your extension's socket pair): %w",
-			attachRef, frontendSock, fskitSocketEnv, fskitControlEnv, err)
-	}
-	return nil
 }
 
 type fskitMountFailure string

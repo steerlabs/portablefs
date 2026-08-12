@@ -16,7 +16,27 @@ public enum PortableFSAccountHomeError: Error, CustomStringConvertible {
 /// and XDG environment overrides, then proves it is one real owned directory.
 public enum PortableFSAccountHome {
     public static func resolve() throws -> String {
-        let path = FileManager.default.homeDirectoryForCurrentUser.path
+        var entry = passwd()
+        var result: UnsafeMutablePointer<passwd>?
+        let recommended = sysconf(_SC_GETPW_R_SIZE_MAX)
+        let capacity = recommended > 0 ? max(Int(recommended), 16_384) : 16_384
+        var storage = [CChar](repeating: 0, count: capacity)
+        let code = storage.withUnsafeMutableBufferPointer { buffer in
+            getpwuid_r(
+                geteuid(),
+                &entry,
+                buffer.baseAddress,
+                buffer.count,
+                &result
+            )
+        }
+        guard code == 0, result != nil, let directory = entry.pw_dir else {
+            let failure = code == 0 ? ENOENT : code
+            throw PortableFSAccountHomeError.invalid(
+                "account database lookup failed: \(String(cString: strerror(failure)))"
+            )
+        }
+        let path = String(cString: directory)
         guard path.hasPrefix("/") else {
             throw PortableFSAccountHomeError.invalid("account database returned non-absolute path \(path)")
         }
