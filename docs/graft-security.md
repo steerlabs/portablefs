@@ -94,13 +94,15 @@ Two-machine routing isolation is proven separately and black box by the
 Run the FSKit protocol and adapter suite on macOS:
 
 ```bash
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh
 ```
 
-`--no-parallel` is required rather than a performance choice: several tests
-share process resources or exercise hard protocol deadlines. This suite covers
-the FSKit frontend, not graft confinement — the macOS graft refusal is a
-Go-side property and is covered by the `portablefsd` suite above.
+The shared gate disables Xcode parallel testing because several tests share
+process resources or exercise hard protocol deadlines. It separately
+enumerates and then proves the exact executed test set from the native
+`.xcresult`. This suite covers the FSKit frontend, not graft confinement — the
+macOS graft refusal is a Go-side property and is covered by the `portablefsd`
+suite above.
 
 `bash scripts/verify-local.sh` is the repository's single local merge gate and
 runs the Go and Swift suites together.

@@ -224,7 +224,7 @@ jobs:
           CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
 
       - name: Test the Swift app and installer core
-        run: swift test --package-path swift/PortableFSKit --no-parallel
+        run: bash scripts/test-swift-xcode.sh
 
       - name: Import Developer ID identity
         env:

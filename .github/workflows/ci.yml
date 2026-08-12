@@ -30,154 +30,21 @@ jobs:
           sh -n scripts/install.sh
           node scripts/check-install-release-trust.mjs
 
-  # The Swift suite covers the FSKit adapter, the installer core, and the
-  # macOS 26 cache-coherence enforcement (reserved-namespace refusal, one-shot
-  # repair provenance, and the real-syscall actuator paths). It ran only in
-  # release.yml, so every one of those assertions was invisible to pull
-  # requests; a regression could reach a tag before anything executed it.
-  swift-partition-coverage:
-    name: swift-partition-coverage
+  # The Swift suite covers the FSKit adapter, installer core, service updater,
+  # and macOS 26/27 coherence boundaries. Xcode first enumerates the package
+  # inventory, then its native serial runner executes the already-built test
+  # bundles. The shared gate requires exact set equality and all-passing
+  # xcresult leaves, with no helper retry or alternate success path.
+  swift-xcode-native:
+    name: swift-xcode-native
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Prove the Swift partitions cover every discovered test
-        run: |
-          set -euo pipefail
-          # Keep discovery in its own job. Some hosted SwiftPM runners leave a
-          # testing helper alive after an invocation; a later invocation in the
-          # same job can then wait forever on package state.
-          ulimit -Sn 4096
-          test_names="$(swift test --package-path swift/PortableFSKit list)"
-          total="$(printf '%s\n' "$test_names" | grep -Ec '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\(\)$')"
-          app_core="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSAppCoreTests\.')"
-          kit_a_m="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.[A-Ma-m]')"
-          kit_n="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.[Nn]')"
-          kit_o_other="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.(open|ordered|ordinary|outbound|overlapping)')"
-          kit_operations_ack="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapterAcknowledges')"
-          kit_operations_concurrent="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapterConcurrent')"
-          kit_operations_directory="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapterDirectory')"
-          kit_operations_drains="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapterDrains')"
-          kit_operations_e_i="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapter[E-Ie-i]')"
-          kit_operations_j_r="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapter[J-Rj-r]')"
-          kit_operations_s_z="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.operationsAdapter[S-Zs-z]')"
-          kit_p="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.[Pp]')"
-          kit_q_s="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.[Q-Sq-s]')"
-          kit_t_z="$(printf '%s\n' "$test_names" | grep -Ec '^PortableFSKitTests\.[T-Zt-z]')"
-          test "$total" -gt 0
-          test "$app_core" -gt 0
-          test "$kit_a_m" -gt 0
-          test "$kit_n" -gt 0
-          test "$kit_o_other" -gt 0
-          test "$kit_operations_ack" -gt 0
-          test "$kit_operations_concurrent" -gt 0
-          test "$kit_operations_directory" -gt 0
-          test "$kit_operations_drains" -gt 0
-          test "$kit_operations_e_i" -gt 0
-          test "$kit_operations_j_r" -gt 0
-          test "$kit_operations_s_z" -gt 0
-          test "$kit_p" -gt 0
-          test "$kit_q_s" -gt 0
-          test "$kit_t_z" -gt 0
-          test "$total" -eq "$((app_core + kit_a_m + kit_n + kit_o_other + kit_operations_ack + kit_operations_concurrent + kit_operations_directory + kit_operations_drains + kit_operations_e_i + kit_operations_j_r + kit_operations_s_z + kit_p + kit_q_s + kit_t_z))"
-
-  swift:
-    name: swift-${{ matrix.partition.name }}
-    runs-on: macos-26
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        partition:
-          - name: app-core
-            filter: 'PortableFSAppCoreTests\.'
-          - name: kit-a-m
-            filter: 'PortableFSKitTests\.[A-Ma-m]'
-          - name: kit-n
-            filter: 'PortableFSKitTests\.[Nn]'
-          - name: kit-o-other
-            filter: 'PortableFSKitTests\.(open|ordered|ordinary|outbound|overlapping)'
-          - name: kit-operations-ack
-            filter: 'PortableFSKitTests\.operationsAdapterAcknowledges'
-          - name: kit-operations-concurrent
-            filter: 'PortableFSKitTests\.operationsAdapterConcurrent'
-          - name: kit-operations-directory
-            filter: 'PortableFSKitTests\.operationsAdapterDirectory'
-          - name: kit-operations-drains
-            filter: 'PortableFSKitTests\.operationsAdapterDrains'
-          - name: kit-operations-e-i
-            filter: 'PortableFSKitTests\.operationsAdapter[E-Ie-i]'
-          - name: kit-operations-j-r
-            filter: 'PortableFSKitTests\.operationsAdapter[J-Rj-r]'
-          - name: kit-operations-s-z
-            filter: 'PortableFSKitTests\.operationsAdapter[S-Zs-z]'
-          - name: kit-p
-            filter: 'PortableFSKitTests\.[Pp]'
-          - name: kit-q-s
-            filter: 'PortableFSKitTests\.[Q-Sq-s]'
-          - name: kit-t-z
-            filter: 'PortableFSKitTests\.[T-Zt-z]'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Swift suite partition (FSKit adapter, app core, macOS 26 coherence)
-        env:
-          SWIFT_TEST_FILTER: ${{ matrix.partition.filter }}
-        run: |
-          set -euo pipefail
-          # A matrix cell owns only one exact filter, so no helper or descriptor
-          # state crosses partition boundaries. SwiftPM's testing helper can
-          # still intermittently stop making progress after a successful build
-          # on hosted macOS. Bound that external-tool failure, kill only the
-          # exact attempt's process group, and retry it once. Ordinary test or
-          # build failures are never retried. The separate coverage job proves
-          # these filters cover every discovered test exactly once.
-          ulimit -Sn 4096
-          echo "swift-test-soft-nofile=$(ulimit -Sn)"
-          python3 - "$SWIFT_TEST_FILTER" <<'PY'
-          import os
-          import signal
-          import subprocess
-          import sys
-
-          command = [
-              "swift", "test",
-              "--package-path", "swift/PortableFSKit",
-              "--no-parallel",
-              "--filter", sys.argv[1],
-          ]
-          for attempt in (1, 2):
-              print(f"swift-test-attempt={attempt}", flush=True)
-              process = subprocess.Popen(command, start_new_session=True)
-              try:
-                  returncode = process.wait(timeout=240)
-              except subprocess.TimeoutExpired:
-                  print(
-                      f"swift test did not complete within 240s "
-                      f"(attempt {attempt}); terminating its exact process group",
-                      file=sys.stderr,
-                      flush=True,
-                  )
-                  try:
-                      os.killpg(process.pid, signal.SIGTERM)
-                  except ProcessLookupError:
-                      pass
-                  try:
-                      process.wait(timeout=15)
-                  except subprocess.TimeoutExpired:
-                      try:
-                          os.killpg(process.pid, signal.SIGKILL)
-                      except ProcessLookupError:
-                          pass
-                      process.wait()
-                  if attempt == 1:
-                      continue
-                  sys.exit(124)
-              sys.exit(returncode)
-          PY
+      - name: Xcode-native complete Swift suite
+        run: bash scripts/test-swift-xcode.sh
 
   go:
     runs-on: ubuntu-24.04

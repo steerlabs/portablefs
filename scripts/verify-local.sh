@@ -53,17 +53,15 @@ go -C vcs test ./...
 step "go race suite (native)"
 go -C vcs test -race ./...
 
-# 4. The Swift suite. Explicit serialization is REQUIRED and not a performance
-# knob: Swift Testing may run the whole corpus concurrently even when SwiftPM
-# is given one worker. Several tests bind shared process resources and exercise
-# hard protocol deadlines, so concurrent cases can starve one another and turn
-# one timeout into a mock-daemon/socket cascade. Skipped, loudly, when no Swift
-# toolchain is present (a Linux runner); the macOS CI job always runs it.
+# 4. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
+# separately enumerates the complete inventory, and requires the xcresult to
+# contain the same unique all-passing set. Other hosts skip this macOS-only
+# package loudly; the macOS CI job always runs it.
 step "swift suite (PortableFSKit)"
-if command -v swift >/dev/null 2>&1; then
-  swift test --package-path swift/PortableFSKit --no-parallel
+if [[ "$(uname -s)" == Darwin ]]; then
+  bash scripts/test-swift-xcode.sh
 else
-  echo "SKIP: no swift toolchain on this host; the macOS CI job covers this suite"
+  echo "SKIP: Xcode-native Swift verification requires macOS; the macOS CI job covers this suite"
 fi
 
 # 5. Release-trust policy. Both checkers are dependency-free single-file node
