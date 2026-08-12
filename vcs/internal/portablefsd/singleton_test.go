@@ -416,26 +416,42 @@ func TestStaleSocketReclamationRefusesUnsafeEntries(t *testing.T) {
 	}
 }
 
-func TestDaemonRefusesNonCanonicalSocketPair(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		frontend string
-		control  string
-	}{
-		{name: "same entry", frontend: "run/control.sock", control: "run/control.sock"},
-		{name: "different directories", frontend: "frontend/pfs.sock", control: "control/control.sock"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root := privateTestDir(t)
-			err := NewServer(Config{
-				FrontendSocket: filepath.Join(root, test.frontend),
-				ControlSocket:  filepath.Join(root, test.control),
-				StateDir:       filepath.Join(root, "state"),
-			}).Run(context.Background())
-			if err == nil || !strings.Contains(err.Error(), "distinct entries in the singleton socket directory") {
-				t.Fatalf("socket-pair verdict = %v", err)
-			}
-		})
+func TestDaemonRefusesSameFrontendAndControlEntry(t *testing.T) {
+	root := shortDaemonSocketDir(t)
+	socket := filepath.Join(root, "run", "control.sock")
+	err := NewServer(Config{
+		FrontendSocket: socket,
+		ControlSocket:  socket,
+		StateDir:       filepath.Join(root, "state"),
+	}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "distinct entries under their pinned exact roots") {
+		t.Fatalf("socket-pair verdict = %v", err)
+	}
+}
+
+func TestDaemonServesSeparatePinnedFrontendAndControlRoots(t *testing.T) {
+	root := shortDaemonSocketDir(t)
+	cfg := Config{
+		FrontendSocket: filepath.Join(root, "frontend", "pfs.sock"),
+		ControlSocket:  filepath.Join(root, "control", "control.sock"),
+		StateDir:       filepath.Join(root, "state"),
+		Version:        "test",
+	}
+	server := NewServer(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+	waitUnix(t, cfg.FrontendSocket)
+	waitUnix(t, cfg.ControlSocket)
+	waitUnix(t, filepath.Join(filepath.Dir(cfg.FrontendSocket), mountRootSocketName))
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("separate-root daemon shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("separate-root daemon did not stop")
 	}
 }
 

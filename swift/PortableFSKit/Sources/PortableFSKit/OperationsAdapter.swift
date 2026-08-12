@@ -199,11 +199,18 @@ enum PfsEnumerationCookies {
 /// macOS 26 FSKit entry point backed by `VolumeCore`.
 @available(macOS 26.0, *)
 public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, @unchecked Sendable {
+    public typealias VolumeFactory = @Sendable (
+        _ socketPath: String,
+        _ attachRef: String,
+        _ moduleIdentity: PortableFSModuleIdentity
+    ) async throws -> PortableFSVolume
+
     private let logger = Logger(subsystem: "dev.portablefs.fskit", category: "PortableFSFileSystem")
     private let volumeLock = NSLock()
     private var volumes: [String: PortableFSVolume] = [:]
     private let moduleIdentity: PortableFSModuleIdentity
     private let resolverFactory: @Sendable () -> PfsSocketPathResolver
+    private let volumeFactory: VolumeFactory
 
     public override convenience init() {
         self.init(moduleIdentity: Self.mainBundleIdentity())
@@ -221,14 +228,42 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         )
     }
 
+    /// Platform adapters share resource routing and lifecycle ownership while
+    /// supplying only their exact volume-construction policy. The signed
+    /// module identity still comes from the running extension bundle.
+    public convenience init(
+        resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = {
+            PfsSocketPathResolver(bundle: .main)
+        },
+        volumeFactory: @escaping VolumeFactory
+    ) {
+        self.init(
+            moduleIdentity: Self.mainBundleIdentity(),
+            resolverFactory: resolverFactory,
+            volumeFactory: volumeFactory
+        )
+    }
+
     public init(
         moduleIdentity: PortableFSModuleIdentity,
         resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = {
             PfsSocketPathResolver(bundle: .main)
+        },
+        volumeFactory: @escaping VolumeFactory = { socketPath, attachRef, moduleIdentity in
+            let core = try await VolumeCore.connect(
+                socketPath: socketPath,
+                attachRef: attachRef
+            )
+            return try await PortableFSVolume.make(
+                core: core,
+                attachRef: attachRef,
+                moduleIdentity: moduleIdentity
+            )
         }
     ) {
         self.moduleIdentity = moduleIdentity
         self.resolverFactory = resolverFactory
+        self.volumeFactory = volumeFactory
         super.init()
     }
 
@@ -267,11 +302,10 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
                 do {
                     let socketPath = try resolverFactory().resolve()
                     logger.info("loadResource resolving via socket \(socketPath, privacy: .public) for ref \(attachRef, privacy: .public)")
-                    let core = try await VolumeCore.connect(socketPath: socketPath, attachRef: attachRef)
-                    let volume = try await PortableFSVolume.make(
-                        core: core,
-                        attachRef: attachRef,
-                        moduleIdentity: moduleIdentity
+                    let volume = try await volumeFactory(
+                        socketPath,
+                        attachRef,
+                        moduleIdentity
                     )
                     storeVolume(volume, attachRef: attachRef)
                     containerStatus = .ready
@@ -439,8 +473,20 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     /// the volume is a legacy mount and records nothing. Internal so the
     /// offline suite can witness what a composed mount installed.
     let coherence: PfsMacOSV3VolumeCoherence?
+    /// The SDK-27-native strict context. It is mutually exclusive with the
+    /// macOS 26 compatibility context above and is started only after its
+    /// concrete DataCacheHandler driver is installed on this exact volume.
+    public let nativeCoherence: PfsMacOSV3NativeVolumeCoherence?
     private let attachRef: String
-    private let mountRootHandoffSocket: String
+    /// Present only for the macOS 26 synchronous-VFS repair policy. The
+    /// macOS 27 native DataCacheHandler policy has no repair-root descriptor
+    /// channel and must never derive or request one.
+    private let mountRootHandoffSocket: String?
+
+    private var coherenceContext: (any PfsMacOSV3CoherenceContext)? {
+        if let nativeCoherence { return nativeCoherence }
+        return coherence
+    }
 
     private struct PendingBindingPublication {
         let reservation: PfsMacOSNamespaceIndex.RecordReservation
@@ -476,6 +522,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
            let strictReply = await core.strictV3ResolveReply,
            let strictContract = await core.strictV3Contract {
             do {
+                guard strictContract.cachePolicy == .synchronousVFSRepairV1
+                        || strictContract.cachePolicy == .synchronousVFSRepairV2 else {
+                    throw PfsMacOSCoherenceError.unsupportedRepair
+                }
                 installedCoherence = try await PfsMacOSV3VolumeCoherence.compose(
                     client: core.client,
                     resolved: strictReply,
@@ -511,8 +561,51 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             moduleIdentity: moduleIdentity,
             repairGate: installedCoherence?.repairGate ?? repairGate,
             coherence: installedCoherence,
+            nativeCoherence: nil,
             mountRootHandoffSocket: handoffSocket
         )
+    }
+
+    /// Constructs the SDK-27-native volume without starting its visibility
+    /// runner. The SDK-27 target must immediately call
+    /// `startNativeCoherence(with:)` before returning the volume to FSKit.
+    /// Splitting these two steps is required because `setCacheState` must run
+    /// on the exact framework-visible FSVolume instance.
+    public static func makeNative(
+        core: VolumeCore,
+        attachRef: String,
+        moduleIdentity: PortableFSModuleIdentity = PortableFSIdentity.moduleIdentity
+    ) async throws -> PortableFSVolume {
+        guard let resolved = await core.resolvedVolume,
+              let strictReply = await core.strictV3ResolveReply,
+              let strictContract = await core.strictV3Contract,
+              strictContract.cachePolicy == .nativeFSKitRevocationV1 else {
+            await core.shutdown()
+            throw PfsMacOSCoherenceError.unsupportedRepair
+        }
+        do {
+            let nativeCoherence = try await PfsMacOSV3NativeVolumeCoherence.prepare(
+                client: core.client,
+                resolved: strictReply,
+                rootItem: resolved.root,
+                contract: strictContract
+            )
+            let statReply = try await core.statfs()
+            return PortableFSVolume(
+                core: core,
+                attachRef: attachRef,
+                resolved: resolved,
+                statReply: statReply,
+                moduleIdentity: moduleIdentity,
+                repairGate: nil,
+                coherence: nil,
+                nativeCoherence: nativeCoherence,
+                mountRootHandoffSocket: nil
+            )
+        } catch {
+            await core.shutdown()
+            throw error
+        }
     }
 
     private init(
@@ -523,12 +616,14 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         moduleIdentity: PortableFSModuleIdentity,
         repairGate: (any PfsMacOS26RepairGate)?,
         coherence: PfsMacOSV3VolumeCoherence?,
-        mountRootHandoffSocket: String
+        nativeCoherence: PfsMacOSV3NativeVolumeCoherence?,
+        mountRootHandoffSocket: String?
     ) {
         self.core = core
         self.capabilities = resolved.capabilities
         self.repairGate = repairGate
         self.coherence = coherence
+        self.nativeCoherence = nativeCoherence
         self.mountRootHandoffSocket = mountRootHandoffSocket
         self.attachRef = attachRef
         self.fileSystemTypeName = moduleIdentity.fileSystemTypeName
@@ -617,7 +712,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     public func deactivate(options: FSDeactivateOptions = []) async throws {
-        coherence?.shutdown()
+        coherenceContext?.shutdown()
         await core.shutdown()
     }
 
@@ -630,7 +725,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     public func unmount() async {
-        coherence?.shutdown()
+        coherenceContext?.shutdown()
         await core.shutdown()
     }
 
@@ -800,7 +895,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             kind: callbackKind,
             scope: admissionScope
         )
-        let ingressReservation = coherence?.barrier.reserveCallbackIngress(
+        let ingressReservation = coherenceContext?.barrier.reserveCallbackIngress(
             scope: admissionScope,
             callbackKind: trace.kind,
             ingressUptimeNanoseconds: trace.ingressUptimeNanoseconds
@@ -826,7 +921,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 let mapped = PfsErrorMapper.fsKitError(for: error)
                 reply.value(.failure(mapped))
                 trace.emit("FrameworkReplyReturned", detail: "stage=preflight")
-                if let ingressReservation, let coherence = self.coherence {
+                if let ingressReservation, let coherence = self.coherenceContext {
                     await coherence.barrier.callbackReplyReturned(ingressReservation)
                 }
                 trace.finish(outcome: "preflight-refused")
@@ -839,7 +934,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             // callback drains, parks, or is refused.
             var ticket: PfsMacOSAdmittedCallbackTicket?
             var bypassedAdmission = false
-            if let coherence = self.coherence {
+            if let coherence = self.coherenceContext {
                 bypassedAdmission = await exemptFromAdmission()
                 do {
                     if let ingressReservation {
@@ -903,7 +998,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             reply.value(verdict.mapError { PfsErrorMapper.fsKitError(for: $0) as Error })
             trace.emit("FrameworkReplyReturned")
 
-            if let coherence = self.coherence {
+            if let coherence = self.coherenceContext {
                 if let ingressReservation {
                     await coherence.barrier.callbackReplyReturned(ingressReservation)
                 } else if let ticket {
@@ -2260,6 +2355,63 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         })
     }
 
+    /// SDK-27 `DataCacheHandler.close` has no error channel: the framework
+    /// considers the item closed once its reply returns. Keep that real reply
+    /// inside the ordinary publication boundary, and retire the strict mount
+    /// completely before replying if authority descriptor cleanup failed.
+    /// Calling the ordinary `closeItem` callback and launching shutdown from
+    /// its reply would publish too early because the async shutdown would run
+    /// after the outer reply closure returned.
+    public func closeNativeDataCacheItem(
+        _ item: FSItem,
+        replyHandler reply: @escaping @Sendable () -> Void
+    ) {
+        publishAfterReply(exemptFromAdmission: admissionExemption(
+            repairSourceItems: [item],
+            repairParentItems: [item],
+            items: [item]
+        ), admissionScope: admissionScope(items: [item]), {
+            do {
+                try await self.closeItem(item, modes: [])
+            } catch {
+                // No error may cross the SDK-27 close reply. Closing the
+                // transport and clearing every live handle before that reply
+                // is the fail-closed substitute.
+                await self.shutdown()
+            }
+        }, reply: { _ in
+            reply()
+        })
+    }
+
+    /// Places SDK-27's cache-upgrade reply on the same exact callback
+    /// ingress/publication edge as data-cache open. Upgrade performs no
+    /// authority operation, but granting a more permissive cache state still
+    /// overlaps an item repair and therefore must not appear after a peer
+    /// COMPLETE that failed to observe this callback.
+    public func admitNativeDataCacheUpgrade(
+        _ item: FSItem,
+        replyHandler reply: @escaping @Sendable ((any Error)?) -> Void
+    ) {
+        publishAfterReply(
+            callbackKind: #function,
+            admissionScope: admissionScope(items: [item]),
+            {
+                // Admission itself is the operation. The SDK-27 adapter
+                // computes the result before calling this method and sends it
+                // only from the real FSKit reply closure below.
+            },
+            reply: { result in
+                switch result {
+                case .success:
+                    reply(nil)
+                case let .failure(error):
+                    reply(error)
+                }
+            }
+        )
+    }
+
     public func read(
         from item: FSItem,
         at offset: off_t,
@@ -2370,8 +2522,51 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     public func shutdown() async {
-        coherence?.shutdown()
+        coherenceContext?.shutdown()
         await core.shutdown()
+    }
+
+    /// Installs the concrete SDK-27 cache driver and only then admits native
+    /// visibility events. This method is single-use; replacement would let an
+    /// event cross between two kernel-volume identities.
+    public func startNativeCoherence(
+        with invalidator: any PfsFSKitNativeDataCacheInvalidator
+    ) async throws {
+        guard let nativeCoherence, coherence == nil else {
+            throw PfsMacOSCoherenceError.nativeRevocationUnavailable
+        }
+        try await nativeCoherence.invalidatorSlot.install(invalidator)
+        try nativeCoherence.start()
+    }
+
+    /// Resolves a native data repair to the exact retained FSItem that created
+    /// the kernel cache entry. The authority identity and this mount's VFS file
+    /// ID must both agree; choosing a merely equivalent pathname would allow a
+    /// rename or replacement race to invalidate the wrong vnode.
+    public func nativeDataItem(
+        for target: PfsFSKitNativeDataInvalidation
+    ) async throws -> PortableFSItem {
+        guard let nativeCoherence, coherence == nil else {
+            throw PfsMacOSCoherenceError.nativeRevocationUnavailable
+        }
+        switch target {
+        case let .object(reference, itemIdentity, _):
+            guard reference.item.identity.stableIdentity == itemIdentity.bytes else {
+                throw PfsMacOSCoherenceError.invalidRepairOperand
+            }
+            return reference.item
+        case let .linked(_, _, itemIdentity, expectedVFSFileID, _):
+            let objects = await nativeCoherence.liveObjects.objects(
+                for: itemIdentity
+            )
+            guard let reference = objects.first(where: {
+                $0.vfsFileID == expectedVFSFileID
+                    && $0.item.identity.stableIdentity == itemIdentity.bytes
+            }) else {
+                throw PfsMacOSCoherenceError.cachedTargetUnrepresentable
+            }
+            return reference.item
+        }
     }
 
     private func setCachedStatistics(_ statistics: FSStatFSResult) {
@@ -2417,35 +2612,23 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     /// once. Failure stays loud at repair time: an uninstalled actuator fails
     /// every repair closed and the barrier reports the cursor blocked.
     private func scheduleRepairRootInstall() {
-        guard let coherence else { return }
-        let typeName = fileSystemTypeName
+        guard let coherence, let handoffSocket = mountRootHandoffSocket else {
+            return
+        }
         let attachRef = attachRef
-        let handoffSocket = mountRootHandoffSocket
         coherence.scheduleActuatorInstall {
             // The root is authority item 1, projected through the platform
             // identifier offset like every other inode this mount reports.
             let expected = try PfsFSKitMapping.itemIdentifier(from: 1).rawValue
-            do {
-                // The daemon hands the descriptor across the sandbox boundary:
-                // the sandbox hides this extension's own mount from getfsstat,
-                // so in-process location cannot work (proven live — the first
-                // peer repair scanned fifteen mounts and found every volume on
-                // the machine except its own).
-                return try PfsMountRootHandoff.openRoot(
-                    handoffSocketPath: handoffSocket,
-                    attachRef: attachRef,
-                    expectedRootFileID: expected
-                )
-            } catch {
-                pfsClientLogger.error(
-                    "mount-root handoff failed (\(String(describing: error), privacy: .public)); falling back to the in-process mount scan"
-                )
-                return try PfsMacOSMountRootLocator.openMountRoot(
-                    fileSystemTypeName: typeName,
-                    attachRef: attachRef,
-                    expectedRootFileID: expected
-                )
-            }
+            // The daemon hands the descriptor across the sandbox boundary.
+            // The sandbox hides this extension's own mount from getfsstat, so
+            // an in-process scan cannot locate it. Handoff failure is therefore
+            // terminal for this repair attempt; there is no weaker locator.
+            return try PfsMountRootHandoff.openRoot(
+                handoffSocketPath: handoffSocket,
+                attachRef: attachRef,
+                expectedRootFileID: expected
+            )
         }
     }
 
@@ -2470,7 +2653,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         name: Data,
         itemKind: PfsMacOSCachedItemKind
     ) async throws -> PendingBindingPublication? {
-        guard let coherence else { return nil }
+        guard let coherence = coherenceContext else { return nil }
         let parentIdentity = try strictStableIdentity(of: try portableItem(parent))
         guard let reservation = try await coherence.namespaceIndex.reserveRecord(
             parentIdentity: parentIdentity,
@@ -2494,7 +2677,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         _ pending: PendingBindingPublication?,
         child: PortableFSItem
     ) async throws {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         do {
             let childIdentity = try strictStableIdentity(of: child)
             let vfsFileID = try PfsFSKitMapping.itemIdentifier(
@@ -2529,7 +2712,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     private func cancelBindingPublication(_ pending: PendingBindingPublication?) async {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         await coherence.namespaceIndex.cancel(pending.reservation)
     }
 
@@ -2538,7 +2721,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         name: Data,
         child: PortableFSItem
     ) async throws -> PendingBindingForget? {
-        guard let coherence else { return nil }
+        guard let coherence = coherenceContext else { return nil }
         let reservation = try await coherence.namespaceIndex.reserveForget(
             parentIdentity: try strictStableIdentity(of: try portableItem(parent)),
             name: name,
@@ -2548,12 +2731,12 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     private func commitBindingForget(_ pending: PendingBindingForget?) async {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         await coherence.namespaceIndex.commitForget(pending.reservation)
     }
 
     private func cancelBindingForget(_ pending: PendingBindingForget?) async {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         await coherence.namespaceIndex.cancel(pending.reservation)
     }
 
@@ -2564,7 +2747,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         name destinationName: Data,
         child: PortableFSItem
     ) async throws -> PendingBindingMove? {
-        guard let coherence else { return nil }
+        guard let coherence = coherenceContext else { return nil }
         let reservation = try await coherence.namespaceIndex.reserveMove(
             parentIdentity: try strictStableIdentity(of: try portableItem(sourceParent)),
             name: sourceName,
@@ -2576,17 +2759,17 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     private func commitBindingMove(_ pending: PendingBindingMove?) async {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         await coherence.namespaceIndex.commitMove(pending.reservation)
     }
 
     private func cancelBindingMove(_ pending: PendingBindingMove?) async {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         await coherence.namespaceIndex.cancel(pending.reservation)
     }
 
     private func reserveLiveObject() async throws -> PendingLiveObject? {
-        guard let coherence else { return nil }
+        guard let coherence = coherenceContext else { return nil }
         guard let reservation = await coherence.liveObjects.reserve(
             capacity: coherence.liveObjectCapacity
         ) else {
@@ -2602,7 +2785,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         _ pending: PendingLiveObject?,
         item: PortableFSItem
     ) async throws {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         do {
             let identity = try strictStableIdentity(of: item)
             let vfsFileID = try PfsFSKitMapping.itemIdentifier(
@@ -2622,7 +2805,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     private func cancelLiveObject(_ pending: PendingLiveObject?) async {
-        guard let coherence, let pending else { return }
+        guard let coherence = coherenceContext, let pending else { return }
         await coherence.liveObjects.cancel(pending.reservation)
     }
 
@@ -2639,7 +2822,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         child: PortableFSItem,
         itemKind: PfsItemKind? = nil
     ) async throws {
-        guard let coherence else { return }
+        guard let coherence = coherenceContext else { return }
         let parentIdentity = try strictStableIdentity(of: try portableItem(parent))
         let childIdentity = try strictStableIdentity(of: child)
         let cachedItemKind: PfsMacOSCachedItemKind
@@ -2679,7 +2862,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         name destinationName: Data,
         child: PortableFSItem
     ) async throws {
-        guard let coherence else { return }
+        guard let coherence = coherenceContext else { return }
         try await coherence.namespaceIndex.move(
             parentIdentity: try strictStableIdentity(of: try portableItem(sourceParent)),
             name: sourceName,
@@ -2694,7 +2877,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         name: Data,
         child: PortableFSItem
     ) async throws {
-        guard let coherence else { return }
+        guard let coherence = coherenceContext else { return }
         try await coherence.namespaceIndex.retainDataRepairLocator(
             parentIdentity: try strictStableIdentity(of: try portableItem(parent)),
             name: name,
@@ -2703,7 +2886,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     private func forgetPublishedBinding(parent: FSItem, name: Data) async throws {
-        guard let coherence else { return }
+        guard let coherence = coherenceContext else { return }
         let parentIdentity = try strictStableIdentity(of: try portableItem(parent))
         await coherence.namespaceIndex.forget(parentIdentity: parentIdentity, name: name)
     }
@@ -2711,7 +2894,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     /// Records one kernel object with live open state. Unlink retires the
     /// namespace coordinate but never this record; only reclaim does.
     private func recordLiveObject(_ item: PortableFSItem) async throws {
-        guard let coherence else { return }
+        guard let coherence = coherenceContext else { return }
         _ = try strictStableIdentity(of: item)
         let vfsFileID = try PfsFSKitMapping.itemIdentifier(from: item.identity.itemID).rawValue
         do {
@@ -2736,7 +2919,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     private func forgetLiveObject(_ item: PortableFSItem) async {
-        guard let coherence else { return }
+        guard let coherence = coherenceContext else { return }
         await coherence.liveObjects.forget(item: item)
     }
 

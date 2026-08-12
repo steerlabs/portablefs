@@ -24,7 +24,7 @@ func TestResolveStrategyMatrix(t *testing.T) {
 		{"linux explicit fskit", "fskit", "linux", "", "darwin"},
 		{"darwin explicit fuse", "fuse", "darwin", "", "fskit"},
 		{"retired webdav strategy", "webdav", "darwin", "", "unknown --strategy"},
-		{"unsupported os", "auto", "windows", "", "not supported"},
+		{"windows auto is primitive-gated", "auto", "windows", "", "authority-forwarded byte-range locks and synchronous cache control"},
 		{"unknown strategy", "webdav", "linux", "", "unknown --strategy"},
 	}
 	for _, tc := range cases {

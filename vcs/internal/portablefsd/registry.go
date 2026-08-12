@@ -1216,11 +1216,16 @@ type attach struct {
 	nextOrigin        uint64
 	subscribers       map[*eventSubscriber]struct{}
 	conns             map[interface{ Close() error }]struct{}
-	eventReady        chan struct{}
-	eventOnce         sync.Once
-	detached          bool
-	detachPrepared    bool
-	detachForce       bool
+	// nativeFrontendWitnesses contains only live `portablefskit` connections
+	// that completed Resolve for this exact native-policy attach. It is the
+	// macOS 27 readiness primitive; legacy macOS 26 policies instead retain a
+	// verified mount-root descriptor. Guarded by mu.
+	nativeFrontendWitnesses map[*frontendConn]struct{}
+	eventReady              chan struct{}
+	eventOnce               sync.Once
+	detached                bool
+	detachPrepared          bool
+	detachForce             bool
 	// detachFailFrozen is process-local. The durable prepared marker and this
 	// explicit flag reject every admission, while nsMu remains releasable so
 	// daemon shutdown/restart can perform the required recovery.
@@ -1734,6 +1739,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 		return existingJobID, priorErr
 	}
 	a.detached = true
+	a.retireNativeFrontendWitnessesLocked()
 	if jobID != "" {
 		a.detachJobID = jobID
 	}

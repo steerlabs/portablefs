@@ -189,14 +189,14 @@ jobs:
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
-      # Both target platforms are built here: the daemon and mount clients carry
-      # per-GOOS files, so a Linux-only build hides darwin breakage until the
-      # macOS release job runs.
-      - name: Build (darwin and linux)
+      # Linux releases are static CGO-disabled binaries. Darwin now has a
+      # Foundation-backed app-group resolver and is verified in the dedicated
+      # macOS job below; a CGO-disabled cross-build would exercise only its
+      # deliberate fail-closed stub and is not product coverage.
+      - name: Build (linux)
         run: |
           set -euo pipefail
-          GOOS=darwin go -C vcs build ./...
-          GOOS=linux go -C vcs build ./...
+          CGO_ENABLED=0 GOOS=linux go -C vcs build ./...
       - run: go -C vcs vet ./...
       - name: Dependency vulnerability gate (govulncheck)
         run: |
@@ -208,6 +208,85 @@ jobs:
       - run: go -C vcs test ./...
       - name: Race suite
         run: go -C vcs test -race ./...
+
+  go-darwin:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+      - name: Build and vet the Foundation-enabled Darwin boundary
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...
+          CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...
+      - name: Test the Foundation-enabled Darwin data plane
+        run: CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
+
+  macos-app-unsigned:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+      - name: Build and verify the exact unsigned universal shipping app
+        env:
+          PORTABLEFS_APP_GROUP: B47U2LLKHW.pfsoss
+          PORTABLEFS_PACKAGE_DIR: ${{ runner.temp }}/portablefs-macos-package
+          PORTABLEFS_UNSIGNED: "1"
+        run: scripts/package-macos-app.sh 0.2.3
+      - name: Build and verify the macOS 26 development host identity
+        run: |
+          set -euo pipefail
+          derived="$RUNNER_TEMP/portablefs-kit-dev-derived"
+          expected_group=B47U2LLKHW.pfsoss
+          expected_version=0.2.3
+          xcodebuild \
+            -project swift/PortableFSKitDev/PortableFSKitDev.xcodeproj \
+            -scheme PortableFSKitDev \
+            -configuration Debug \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath "$derived" \
+            PORTABLEFS_APP_GROUP="$expected_group" \
+            MARKETING_VERSION="$expected_version" \
+            PORTABLEFS_NATIVE_QUALIFICATION= \
+            PORTABLEFS_GO="$(realpath "$(command -v go)")" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+          app="$derived/Build/Products/Debug/PortableFSKitDev.app"
+          extension="$app/Contents/Extensions/PortableFSDev.appex"
+          service="$app/Contents/Library/LaunchAgents/PortableFSDService.app"
+          cli="$app/Contents/Helpers/portablefs"
+          daemon="$service/Contents/MacOS/portablefsd"
+          test -d "$app"
+          test -d "$extension"
+          test -d "$service"
+          test -x "$cli"
+          test -x "$daemon"
+          host_group=$(/usr/libexec/PlistBuddy -c "Print :PFSAppGroupIdentifier" "$app/Contents/Info.plist")
+          extension_group=$(/usr/libexec/PlistBuddy -c "Print :PFSAppGroupIdentifier" "$extension/Contents/Info.plist")
+          host_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
+          extension_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$extension/Contents/Info.plist")
+          service_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$service/Contents/Info.plist")
+          test "$host_group" = "$expected_group"
+          test "$extension_group" = "$expected_group"
+          test "$host_group" = "$extension_group"
+          test "$host_version" = "$expected_version"
+          test "$extension_version" = "$expected_version"
+          test "$service_version" = "$expected_version"
+          test "$host_version" = "$extension_version"
+          test "$host_version" = "$service_version"
+          test "$("$cli" version)" = "portablefs $expected_version"
+          test "$("$daemon" -version)" = "$expected_version"
 
   # The privileged Linux data-plane suite. Everything below `go test ./...` in
   # the `go` job runs on an ordinary tmpfs with no XFS project quotas and no

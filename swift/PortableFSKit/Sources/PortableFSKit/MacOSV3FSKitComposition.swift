@@ -1408,78 +1408,22 @@ public final class PfsMacOS26DeferredMountActuator: PfsMacOS26RepairActuator, @u
     }
 }
 
-/// Locates this exact FSKit kernel mount in the mount table so the actuator
-/// can address it. Matching is deliberately narrow: the filesystem type name
-/// must be this module's, the mount source must name this attach, and the
-/// opened root must project the root file identifier this adapter mints.
-/// Anything else is refused rather than guessed at — actuating repairs against
-/// the wrong mount is namespace surgery on someone else's files.
-public enum PfsMacOSMountRootLocator {
-    /// `statfs` names both the Darwin struct and the syscall; the alias keeps
-    /// the struct usable in expression position.
-    private typealias MountTableEntry = statfs
-
-    public static func openMountRoot(
-        fileSystemTypeName: String,
-        attachRef: String,
-        expectedRootFileID: UInt64
-    ) throws -> Int32 {
-        let count = getfsstat(nil, 0, MNT_NOWAIT)
-        guard count > 0 else {
-            throw PfsMacOSCoherenceError.posix(operation: "count mounted filesystems", errno: errno)
-        }
-        var entries = [MountTableEntry](repeating: MountTableEntry(), count: Int(count))
-        let size = Int32(MemoryLayout<MountTableEntry>.stride * entries.count)
-        let filled = entries.withUnsafeMutableBufferPointer { buffer in
-            getfsstat(buffer.baseAddress, size, MNT_NOWAIT)
-        }
-        guard filled > 0 else {
-            throw PfsMacOSCoherenceError.posix(operation: "read mount table", errno: errno)
-        }
-
-        var scanned: [String] = []
-        for index in 0..<Int(min(filled, count)) {
-            var entry = entries[index]
-            let typeName = withUnsafeBytes(of: &entry.f_fstypename) { raw in
-                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
-            }
-            let source = withUnsafeBytes(of: &entry.f_mntfromname) { raw in
-                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
-            }
-            scanned.append("\(typeName):\(source)")
-            guard typeName == fileSystemTypeName else { continue }
-            guard source.contains(attachRef) else { continue }
-            let mountPath = withUnsafeBytes(of: &entry.f_mntonname) { raw in
-                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
-            }
-            let fd = mountPath.withCString { path in
-                open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            }
-            guard fd >= 0 else {
-                throw PfsMacOSCoherenceError.posix(operation: "open repair mount root", errno: errno)
-            }
-            var status = stat()
-            guard fstat(fd, &status) == 0, status.st_ino == expectedRootFileID else {
-                let observed = status.st_ino
-                close(fd)
-                pfsClientLogger.error(
-                    "repair mount root attestation failed: st_ino \(observed) != expected \(expectedRootFileID) for \(fileSystemTypeName):\(attachRef, privacy: .public)"
-                )
-                throw PfsMacOSCoherenceError.posix(operation: "attest repair mount root", errno: ENXIO)
-            }
-            return fd
-        }
-        // The failure that fenced the first live peer repair logged nothing
-        // about WHAT the sandboxed extension actually saw in its mount table;
-        // name every scanned entry so the next failure identifies itself.
-        pfsClientLogger.error(
-            "repair mount root not found for \(fileSystemTypeName, privacy: .public):\(attachRef, privacy: .public); scanned \(scanned.count) entries: \(scanned.joined(separator: ", "), privacy: .public)"
-        )
-        throw PfsMacOSCoherenceError.posix(operation: "locate repair mount root", errno: ENXIO)
-    }
-}
-
 // MARK: - Composed strict-v3 volume coherence
+
+/// Shared state required by the callback adapter for any strict macOS cache
+/// policy. The macOS 26 and macOS 27 backends differ only in how COMPLETE
+/// repairs reach the kernel; namespace tracking, live-object ownership,
+/// publication admission, capacities, and terminal lifecycle stay common.
+public protocol PfsMacOSV3CoherenceContext: AnyObject, Sendable {
+    var contract: PfsMacOSV3LocalContract? { get }
+    var namespaceIndex: PfsMacOSNamespaceIndex { get }
+    var liveObjects: PfsMacOSLiveObjectIndex { get }
+    var barrier: PfsMacOSFSKitPublicationBarrier { get }
+    var namespaceCapacity: Int { get }
+    var liveObjectCapacity: Int { get }
+
+    func shutdown()
+}
 
 /// Everything the macOS 26 compatibility cache policy installs into one strict
 /// FSKit volume: the namespace and live-object indexes the planner derives
@@ -1488,7 +1432,10 @@ public enum PfsMacOSMountRootLocator {
 /// cache policy names a supported macOS 26 synchronous-VFS repair version —
 /// the policy is a
 /// declared selection, never an inference.
-public final class PfsMacOSV3VolumeCoherence: @unchecked Sendable {
+public final class PfsMacOSV3VolumeCoherence:
+    PfsMacOSV3CoherenceContext,
+    @unchecked Sendable
+{
     /// Default hard bound for exact records. Bindings past the bound fail the
     /// publishing callback closed; records are never dropped by silent LRU,
     /// because a dropped record is a kernel cache entry this mount can no
@@ -1685,5 +1632,163 @@ public final class PfsMacOSV3VolumeCoherence: @unchecked Sendable {
             withExtendedLifetime(transport) {}
         })
         return coherence
+    }
+}
+
+/// Native FSKit coherence context. Construction prepares the exact authority
+/// subscription and runner but deliberately does not start it. The SDK-27
+/// adapter must first bind `invalidatorSlot` to the same `FSVolume` instance
+/// that it returns to FSKit, then call `start()`. This removes the otherwise
+/// unavoidable initialization race between the first visibility event and the
+/// kernel cache driver becoming addressable.
+public final class PfsMacOSV3NativeVolumeCoherence:
+    PfsMacOSV3CoherenceContext,
+    @unchecked Sendable
+{
+    public static let defaultNamespaceCapacity =
+        PfsMacOSV3VolumeCoherence.defaultNamespaceCapacity
+    public static let defaultLiveObjectCapacity =
+        PfsMacOSV3VolumeCoherence.defaultLiveObjectCapacity
+
+    public let contract: PfsMacOSV3LocalContract?
+    public let namespaceIndex: PfsMacOSNamespaceIndex
+    public let liveObjects: PfsMacOSLiveObjectIndex
+    public let barrier: PfsMacOSFSKitPublicationBarrier
+    public let namespaceCapacity: Int
+    public let liveObjectCapacity: Int
+    public let invalidatorSlot: PfsFSKitNativeDataCacheInvalidatorSlot
+
+    private let lock = NSLock()
+    private var runner: PfsMacOSCoherenceRunner?
+    private var transport: PfsLocalMacOSV3CoherenceTransport?
+    private var runnerTask: Task<Void, Never>?
+
+    private init(
+        contract: PfsMacOSV3LocalContract,
+        namespaceIndex: PfsMacOSNamespaceIndex,
+        liveObjects: PfsMacOSLiveObjectIndex,
+        barrier: PfsMacOSFSKitPublicationBarrier,
+        invalidatorSlot: PfsFSKitNativeDataCacheInvalidatorSlot,
+        runner: PfsMacOSCoherenceRunner,
+        transport: PfsLocalMacOSV3CoherenceTransport,
+        namespaceCapacity: Int,
+        liveObjectCapacity: Int
+    ) {
+        self.contract = contract
+        self.namespaceIndex = namespaceIndex
+        self.liveObjects = liveObjects
+        self.barrier = barrier
+        self.invalidatorSlot = invalidatorSlot
+        self.runner = runner
+        self.transport = transport
+        self.namespaceCapacity = namespaceCapacity
+        self.liveObjectCapacity = liveObjectCapacity
+    }
+
+    public static func prepare(
+        client: PfsLocalClient,
+        resolved: PfsResolveReply,
+        rootItem: PortableFSItem,
+        contract: PfsMacOSV3LocalContract,
+        namespaceCapacity: Int = defaultNamespaceCapacity,
+        liveObjectCapacity: Int = defaultLiveObjectCapacity
+    ) async throws -> PfsMacOSV3NativeVolumeCoherence {
+        guard contract.cachePolicy == .nativeFSKitRevocationV1 else {
+            throw PfsMacOSCoherenceError.unsupportedRepair
+        }
+        let rootIdentity = try PfsMacOSStableIdentity(
+            resolved.root.stableIdentity
+        )
+        guard rootItem.identity.stableIdentity == rootIdentity.bytes else {
+            throw PfsMacOSCoherenceError.invalidVisibilityTarget
+        }
+
+        let namespaceIndex = PfsMacOSNamespaceIndex(
+            rootIdentity: rootIdentity
+        )
+        let liveObjects = PfsMacOSLiveObjectIndex()
+        let rootVFSFileID = try PfsFSKitMapping.itemIdentifier(
+            from: rootItem.identity.itemID
+        ).rawValue
+        guard try await liveObjects.record(
+            item: rootItem,
+            vfsFileID: rootVFSFileID,
+            itemKind: .directory,
+            capacity: liveObjectCapacity
+        ) else {
+            throw PfsLocalClientError.daemon(
+                errno: EIO,
+                message: "strict-v3 native root live-object index is at capacity"
+            )
+        }
+
+        let planner = PfsMacOSRepairPlanner(
+            index: namespaceIndex,
+            liveObjects: liveObjects
+        )
+        let transport = try await PfsLocalMacOSV3CoherenceTransport.connect(
+            client: client,
+            resolved: resolved,
+            planner: planner
+        )
+        let barrier = try PfsMacOSFSKitPublicationBarrier(
+            localAuthoritySessionID: contract.sessionID,
+            policy: contract.cachePolicy
+        )
+        let invalidatorSlot = PfsFSKitNativeDataCacheInvalidatorSlot()
+        let revoker = PfsFSKitDocumentedNativeCacheRevoker(
+            invalidator: invalidatorSlot
+        )
+        let backend = try PfsNativeFSKitCoherenceBackend(
+            localAuthoritySessionID: contract.sessionID,
+            revoker: revoker,
+            publicationBarrier: barrier
+        )
+        let runner = try await transport.makeRunner(backend: backend)
+
+        return PfsMacOSV3NativeVolumeCoherence(
+            contract: contract,
+            namespaceIndex: namespaceIndex,
+            liveObjects: liveObjects,
+            barrier: barrier,
+            invalidatorSlot: invalidatorSlot,
+            runner: runner,
+            transport: transport,
+            namespaceCapacity: namespaceCapacity,
+            liveObjectCapacity: liveObjectCapacity
+        )
+    }
+
+    public func start() throws {
+        lock.lock()
+        guard runnerTask == nil,
+              let runner,
+              let transport else {
+            lock.unlock()
+            throw PfsMacOSCoherenceError.nativeRevocationUnavailable
+        }
+        self.runner = nil
+        self.transport = nil
+        let barrier = self.barrier
+        let task = Task(priority: .userInitiated) {
+            do {
+                try await runner.run()
+            } catch {
+                await barrier.fail(error)
+            }
+            withExtendedLifetime(transport) {}
+        }
+        runnerTask = task
+        lock.unlock()
+    }
+
+    public func shutdown() {
+        lock.lock()
+        let task = runnerTask
+        runnerTask = nil
+        runner = nil
+        transport = nil
+        lock.unlock()
+        task?.cancel()
     }
 }

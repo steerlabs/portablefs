@@ -26,6 +26,40 @@ func TestFSKitConfigRejectsDaemonOverride(t *testing.T) {
 	}
 }
 
+func TestFSKitConfigRejectsSocketOverrides(t *testing.T) {
+	for _, variable := range []string{fskitSocketEnv, fskitControlEnv} {
+		t.Run(variable, func(t *testing.T) {
+			_, err := fskitConfigFromEnv(func(name string) string {
+				if name == variable {
+					return "/tmp/untrusted.sock"
+				}
+				return ""
+			})
+			if err == nil || !strings.Contains(err.Error(), variable+" is unsupported") {
+				t.Fatalf("expected unsupported socket override error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestFSKitConfigUsesOnlyCanonicalExternalControlState(t *testing.T) {
+	home, err := resolveFSKitAccountHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := fskitConfigFromEnv(func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".local", "state", "portablefs", "portablefsd", "control.sock")
+	if cfg.controlSock != want {
+		t.Fatalf("control socket = %q, want %q", cfg.controlSock, want)
+	}
+	if strings.Contains(cfg.controlSock, "Group Containers") {
+		t.Fatalf("shell CLI control entered the app-group path: %q", cfg.controlSock)
+	}
+}
+
 func TestFindPortablefsdNeverSearchesPATH(t *testing.T) {
 	dir := t.TempDir()
 	pathCandidate := filepath.Join(dir, "portablefsd")
@@ -37,10 +71,41 @@ func TestFindPortablefsdNeverSearchesPATH(t *testing.T) {
 		if got == pathCandidate {
 			t.Fatalf("findPortablefsd selected PATH candidate %s", got)
 		}
-		t.Fatalf("expected the test executable to have no embedded sibling, got %s", got)
+		t.Fatalf("expected the test executable to have no embedded service peer, got %s", got)
 	}
 	if strings.Contains(err.Error(), pathCandidate) {
 		t.Fatalf("PATH candidate leaked into exact-sibling resolution: %v", err)
+	}
+}
+
+func TestExactPortablefsdPathUsesSealedServiceApp(t *testing.T) {
+	app := filepath.Join(t.TempDir(), "PortableFS.app")
+	cli := filepath.Join(app, "Contents", "Helpers", "portablefs")
+	if err := os.MkdirAll(filepath.Dir(cli), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutablePeer(t, cli, "cli")
+
+	got, err := exactPortablefsdPath(cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(
+		app,
+		"Contents", "Library", "LaunchAgents", "PortableFSDService.app",
+		"Contents", "MacOS", "portablefsd",
+	)
+	if got != want {
+		t.Fatalf("daemon path = %q, want %q", got, want)
+	}
+}
+
+func TestExactPortablefsdPathRejectsUnsealedCLI(t *testing.T) {
+	cli := filepath.Join(t.TempDir(), "portablefs")
+	writeExecutablePeer(t, cli, "cli")
+	if _, err := exactPortablefsdPath(cli); err == nil ||
+		!strings.Contains(err.Error(), "Contents/Helpers") {
+		t.Fatalf("unsealed CLI error = %v", err)
 	}
 }
 

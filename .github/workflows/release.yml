@@ -36,15 +36,14 @@ jobs:
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
-      # The Go data plane is the whole shipped tree. The Swift half of the gate
-      # runs in the macos-app job below (this runner has no Swift toolchain),
-      # and the release-trust policy scripts run as plain node scripts — the
-      # repository carries no JavaScript dependencies to install or audit.
-      - name: Verify the exact tagged tree
+      # This Linux runner verifies the exact static Linux release boundary.
+      # Darwin helpers use Foundation through cgo and are built, vetted, and
+      # tested on the macOS release runner below; a CGO-disabled Darwin cross
+      # build would cover only the intentional refusal stub.
+      - name: Verify the exact tagged Linux tree
         run: |
           set -euo pipefail
-          GOOS=darwin go -C vcs build ./...
-          GOOS=linux go -C vcs build ./...
+          CGO_ENABLED=0 GOOS=linux go -C vcs build ./...
           go -C vcs vet ./...
           go -C vcs test ./...
           go -C vcs test -race ./...
@@ -217,6 +216,13 @@ jobs:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
 
+      - name: Verify the Foundation-enabled Darwin data plane
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...
+          CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...
+          CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
+
       - name: Test the Swift app and installer core
         run: swift test --package-path swift/PortableFSKit --no-parallel
 
@@ -273,7 +279,10 @@ jobs:
           PORTABLEFS_DEVELOPER_ID_EXPORT: "1"
           PORTABLEFS_NOTARY_PROFILE: portablefs-release
           PORTABLEFS_BUILD_NUMBER: ${{ github.run_number }}
-        run: scripts/package-macos-app.sh "${GITHUB_REF_NAME#v}"
+        run: |
+          set -euo pipefail
+          export PORTABLEFS_GO="$(realpath "$(command -v go)")"
+          scripts/package-macos-app.sh "${GITHUB_REF_NAME#v}"
 
       - name: Upload notarized app
         env:

@@ -58,6 +58,13 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   authority that stopped meeting one of them would be refused rather than
   silently tolerated.
 
+  Feature advertisement proves what the authority can execute; it does not
+  manufacture a callback that a host filesystem API does not expose. In
+  particular, `distributed-posix-locks` proves the authority's lock operations
+  for frontends that forward them. Linux FUSE does. macOS FSKit exposes no
+  advisory-lock callback, so a macOS process does not receive cross-machine
+  `fcntl` or `flock` exclusion from that feature.
+
 - **A wire-incompatible change gets a new exact protocol major and a new ALPN**,
   and requires a coordinated client and authority upgrade. PortableFS fails
   closed instead of carrying a second compatibility execution path.
@@ -72,8 +79,13 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
 The guarantees in [docs/consistency-model.md](./docs/consistency-model.md) are
 frozen: write-through acknowledgement, `fsync` on the authoritative descriptor,
 `close` is not an implicit `fsync`, session-exact replay inside an epoch, no
-silent continuation across an epoch, atomic rename, open-after-unlink, and
-independent POSIX record and `flock` lock namespaces.
+silent continuation across an epoch, atomic rename, and open-after-unlink. The
+authority implements independent POSIX record and `flock` lock namespaces, and
+Linux FUSE forwards both. macOS FSKit exposes neither lock callback; macOS uses
+authority-serialized `O_EXCL` create or atomic rename for cross-machine
+coordination. FSKit also omits append intent, so cross-machine append atomicity
+is a Linux-only guarantee. These frontend limits are part of the contract, not
+fallback behavior.
 
 The explicit refusals are equally frozen, because programs depend on getting an
 errno rather than incoherent data: shared file-backed `mmap`, `setxattr`, device
@@ -92,6 +104,15 @@ Linux mounts through kernel FUSE; macOS mounts through the FSKit extension and
 the `portablefsd` v3 data plane. One transport per platform, no fallback. A host
 that cannot serve its platform's transport fails with guidance rather than
 degrading to a weaker consistency model.
+
+Windows has no declared transport, released client binary, or install path yet.
+The pure `auto` selector carries a stable primitive-gate refusal that any future
+Windows build must reach before attach: the evaluated signed user-mode
+filesystem runtimes do not expose both authority-forwarded byte-range locks and
+synchronous cache control. PortableFS does not turn a locally coherent Windows
+drive into a falsely multi-writer mount. The evidence and the gates for
+declaring a future transport are in
+[docs/windows-mount.md](./docs/windows-mount.md).
 
 ### Declared macOS cache policies
 
@@ -137,8 +158,11 @@ The frozen execution semantics are load-bearing:
   Once any ordered mutation frame is dispatched, cancellation waits for its
   exact outcome; loss of that outcome terminates the mount with `EIO`.
 - `fskit-native-revocation-v1` declares the `INDEPENDENT` participant profile.
-  It never inherits callback-serialized interruption; until native cache repair
-  is implemented, attach fails closed instead.
+  It never inherits callback-serialized interruption. The ordinary CLI refuses
+  macOS 27 before attach until every native repair family is qualified. A
+  separately build-stamped SDK-27 qualification client may exercise the signed
+  development adapter, but an unrepresentable repair terminates that mount
+  before COMPLETE; it is not a supported product attach.
 
 Changing either profile, errno boundary, pre-apply guarantee, or replay meaning
 requires a new cache-policy name.
@@ -158,8 +182,12 @@ different revision fails closed.
 `--json` on every one of them and the `PORTABLEFS_MOUNT_TOKEN` environment
 variable. Documented flags keep their meaning; new flags and new JSON fields may
 appear, and consumers must ignore unknown fields. `lifecycle`,
-`internal-root-probe`, `install-macos-app`, and `install-linux-release` are
-installer and app coordination surfaces, not a user contract.
+`install-macos-app`, and `install-linux-release` are installer and app
+coordination surfaces, not a user contract. Native macOS readiness never asks
+the shell process to open the mounted path: it proves the exact kernel mount,
+requires a live resolved `portablefskit` frontend witness from the daemon, then
+re-proves the kernel identity. Legacy macOS policies retain their separately
+declared descriptor-root handoff.
 
 ### Release identity
 

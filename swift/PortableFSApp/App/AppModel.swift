@@ -20,16 +20,15 @@ struct AppAlert: Identifiable, Equatable {
 /// volume capability, mutual-TLS client identity — which arrive through
 /// `portablefs mount`. The app mints none of them and therefore does not mount.
 /// What it owns is the LIFECYCLE of mounts that already exist: the inventory
-/// the bundled CLI reports, unmount and crash reconciliation, the per-user
-/// daemon, and the one-time file system extension enablement. Every one of
-/// those runs through the exact signed CLI inside this bundle, which is the
-/// sole owner of mount, daemon, and lifecycle-lock state.
+/// the bundled CLI reports, unmount and crash reconciliation, and one-time
+/// file system extension enablement. ServiceManagement owns the per-user
+/// daemon lifecycle; the exact bundled CLI owns mount and lifecycle-lock state.
 @MainActor
 @Observable
 final class AppModel {
     // MARK: Account identity
 
-    private let startupPathError: String?
+    private var startupPathError: String?
 
     // MARK: Mount inventory
 
@@ -39,7 +38,6 @@ final class AppModel {
 
     // MARK: Daemon
 
-    private(set) var isStoppingDaemon = false
     private(set) var cliVersion: String?
 
     // MARK: Errors / quit
@@ -48,7 +46,9 @@ final class AppModel {
     private(set) var isQuitting = false
 
     private let cli = PortableFSCLI()
+    private var serviceUpdateServer: PortableFSDServiceUpdateServer?
     private var lifecycleHold: PortableFSCLILease?
+    private var lifecycleAcquireTask: Task<Void, Never>?
     private var mountPollTask: Task<Void, Never>?
     private var interactiveSessionActivated = false
     private var isRefreshingMounts = false
@@ -64,14 +64,67 @@ final class AppModel {
     }
 
     init() {
+        startupPathError = nil
+        var startupFailure: String?
         do {
             _ = try PortableFSAccountHome.resolve()
-            startupPathError = nil
         } catch {
-            startupPathError = String(describing: error)
+            startupFailure = String(describing: error)
         }
-        Task {
-            await acquireAppLifecycle()
+
+        var shouldAcquireLifecycle = false
+        if startupFailure == nil {
+            do {
+                let server = try PortableFSDServiceUpdateServer.start(
+                    callbacks: .init(
+                        quiesceNormalLifecycle: { [weak self] in
+                            guard let self else {
+                                throw PortableFSCLIError(
+                                    command: "PortableFS update",
+                                    status: nil,
+                                    detail: "host lifecycle owner disappeared"
+                                )
+                            }
+                            var outcome: Result<Void, any Error>?
+                            DispatchQueue.main.sync {
+                                outcome = Result {
+                                    try self.quiesceForInstallerUpdate()
+                                }
+                            }
+                            try outcome!.get()
+                        },
+                        resumeNormalLifecycle: { [weak self] in
+                            DispatchQueue.main.async {
+                                self?.scheduleLifecycleAcquisition()
+                            }
+                        },
+                        requestHostExit: {
+                            DispatchQueue.main.async {
+                                NSApplication.shared.terminate(nil)
+                            }
+                        }
+                    )
+                )
+                serviceUpdateServer = server
+                switch server.startupDisposition {
+                case .normal:
+                    if try PortableFSDServiceCoordinator.prepareAndRegister() == .requiresApproval {
+                        startupFailure = "Allow PortableFS in System Settings > General > Login Items, then reopen the app."
+                    } else {
+                        shouldAcquireLifecycle = true
+                    }
+                case .installerControlled:
+                    // The tokenized update session owns activation. Normal
+                    // registration before it completes would violate fencing.
+                    break
+                }
+            } catch {
+                startupFailure = "PortableFS could not start its signed service/update boundary: \(error.localizedDescription)"
+            }
+        }
+        startupPathError = startupFailure
+        if shouldAcquireLifecycle || startupFailure != nil {
+            scheduleLifecycleAcquisition()
         }
     }
 
@@ -103,6 +156,16 @@ final class AppModel {
         }
     }
 
+    private func scheduleLifecycleAcquisition() {
+        guard lifecycleAcquireTask == nil,
+              lifecycleHold == nil,
+              !isQuitting else { return }
+        lifecycleAcquireTask = Task {
+            await acquireAppLifecycle()
+            lifecycleAcquireTask = nil
+        }
+    }
+
     private func acquireAppLifecycle() async {
         if let startupPathError {
             let alert = NSAlert()
@@ -113,29 +176,53 @@ final class AppModel {
             NSApplication.shared.terminate(nil)
             return
         }
-        do {
-            let hold = try await cli.holdLifecycle()
-            lifecycleHold = hold
-            isLifecycleReady = true
-            Task {
-                if let failure = await hold.waitForUnexpectedExit() {
-                    handleUnexpectedLifecycleExit(failure)
+        let deadline = Date().addingTimeInterval(10)
+        var lastError: Error?
+        while !Task.isCancelled && Date() < deadline {
+            do {
+                let hold = try await cli.holdLifecycle()
+                lifecycleHold = hold
+                isLifecycleReady = true
+                Task {
+                    if let failure = await hold.waitForUnexpectedExit() {
+                        handleUnexpectedLifecycleExit(failure)
+                    }
                 }
+                if interactiveSessionRequested {
+                    startInteractivePolling()
+                }
+                if FirstRunAssistant.shared.shouldPresentAtLaunch {
+                    FirstRunAssistant.shared.present()
+                }
+                return
+            } catch {
+                lastError = error
+                try? await Task.sleep(for: .milliseconds(100))
             }
-            if interactiveSessionRequested {
-                startInteractivePolling()
-            }
-            if FirstRunAssistant.shared.shouldPresentAtLaunch {
-                FirstRunAssistant.shared.present()
-            }
-        } catch {
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "PortableFS Could Not Start"
-            alert.informativeText = "PortableFS is being installed or updated, or its lifecycle lock could not be acquired.\n\n\(error.localizedDescription)"
-            alert.runModal()
-            NSApplication.shared.terminate(nil)
         }
+        guard !Task.isCancelled else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "PortableFS Could Not Start"
+        alert.informativeText = "PortableFS is being installed or updated, or its lifecycle lock could not be acquired.\n\n\(lastError?.localizedDescription ?? "timed out")"
+        alert.runModal()
+        NSApplication.shared.terminate(nil)
+    }
+
+    private func quiesceForInstallerUpdate() throws {
+        guard isLifecycleReady, let hold = lifecycleHold else {
+            throw PortableFSCLIError(
+                command: "PortableFS update",
+                status: nil,
+                detail: "normal app lifecycle is not held"
+            )
+        }
+        isLifecycleReady = false
+        mountPollTask?.cancel()
+        mountPollTask = nil
+        interactiveSessionActivated = false
+        lifecycleHold = nil
+        try hold.releaseAndWait()
     }
 
     private func handleUnexpectedLifecycleExit(_ error: PortableFSCLIError) {
@@ -228,36 +315,6 @@ final class AppModel {
         NSWorkspace.shared.open(URL(fileURLWithPath: row.mountPath, isDirectory: true))
     }
 
-    // MARK: Daemon
-
-    /// The daemon serves every mount on this account, so stopping it is
-    /// offered only when this app sees no mounts at all. The CLI still proves
-    /// idleness atomically; this is the presentation half of that refusal.
-    var canStopDaemon: Bool {
-        isLifecycleReady && isMountInventoryKnown && mounts.isEmpty && !isStoppingDaemon
-    }
-
-    func stopDaemon() {
-        guard canStopDaemon else {
-            return
-        }
-        Task {
-            isStoppingDaemon = true
-            defer {
-                isStoppingDaemon = false
-            }
-            do {
-                try await cli.stopDaemon()
-            } catch {
-                reportError(
-                    title: "Stop background daemon failed",
-                    detail: String(describing: error)
-                )
-            }
-            await refreshMounts()
-        }
-    }
-
     // MARK: Errors / quit
 
     func reportError(title: String, detail: String) {
@@ -283,9 +340,11 @@ final class AppModel {
             return
         }
         isQuitting = true
+        lifecycleAcquireTask?.cancel()
         mountPollTask?.cancel()
         lifecycleHold?.release()
         lifecycleHold = nil
+        serviceUpdateServer?.stop()
         NSApplication.shared.terminate(nil)
     }
 }

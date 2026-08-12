@@ -166,6 +166,59 @@ private func waitUntil(
 }
 
 @available(macOS 26.0, *)
+@Test func nativeDataCacheUpgradePublishesAfterTheRealReplyReturns() async throws {
+    let harness = try await makeWiringHarness(
+        cachePolicy: .nativeFSKitRevocationV1
+    )
+    let replyEntered = PfsReplyBox<Int>()
+    let releaseReply = DispatchSemaphore(value: 0)
+
+    harness.volume.admitNativeDataCacheUpgrade(harness.root) { error in
+        replyEntered.set((error as NSError?)?.code ?? 0)
+        releaseReply.wait()
+    }
+
+    #expect(try await waitUntil { replyEntered.get() != nil })
+    #expect(replyEntered.get() == 0)
+    #expect(await harness.coherence.barrier.admittedCallbackCount() == 1)
+
+    releaseReply.signal()
+    #expect(try await waitUntil {
+        await harness.coherence.barrier.admittedCallbackCount() == 0
+    })
+}
+
+@available(macOS 26.0, *)
+@Test func nativeDataCacheCloseFailureRetiresBeforeItsRealReply() async throws {
+    let harness = try await makeWiringHarness(
+        cachePolicy: .nativeFSKitRevocationV1
+    )
+    try await harness.volume.openItem(harness.root, modes: [.read])
+    await harness.daemon.failNextClose()
+
+    let replyEntered = PfsReplyBox<Bool>()
+    let releaseReply = DispatchSemaphore(value: 0)
+    harness.volume.closeNativeDataCacheItem(harness.root) {
+        replyEntered.set(true)
+        releaseReply.wait()
+    }
+
+    #expect(try await waitUntil { replyEntered.get() == true })
+    #expect(await harness.coherence.barrier.admittedCallbackCount() == 1)
+    do {
+        _ = try await harness.core.statfs()
+        Issue.record("native data-cache close failure left the volume live")
+    } catch {
+        #expect(error is PfsLocalClientError)
+    }
+
+    releaseReply.signal()
+    #expect(try await waitUntil {
+        await harness.coherence.barrier.admittedCallbackCount() == 0
+    })
+}
+
+@available(macOS 26.0, *)
 @Test func productionVolumeAdvertisesTheXFSXattrCeiling() async throws {
     let harness = try await makeWiringHarness()
     #expect(harness.volume.maximumXattrSize == 64 * 1024)

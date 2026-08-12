@@ -54,7 +54,12 @@ read/write/mmap/rename/unlink/remote-invalidation matrix on macOS 27.
 hides an uncompiled implementation is not verification. The macOS 26
 compatibility policy is selected explicitly, never as an automatic fallback, and
 must pass its own matrix on macOS 26; there is no conditional beta
-implementation or silent downgrade in the binary.
+implementation or silent downgrade in the binary. See
+[macos-27-native-coherence.md](./macos-27-native-coherence.md) for the SDK-27
+data-cache contract and the namespace and attribute rows that remain unproven.
+The ordinary CLI consequently refuses macOS 27 before authority attach. Only
+the separately signed and build-stamped qualification lane can select the
+native policy; macOS 28 and later remain refused until independently proven.
 
 Apple's stable `FSVolume.OpenModes` contains only read and write access bits; it
 does not carry `O_APPEND`. That is the append boundary described under
@@ -69,16 +74,28 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
       (CLI)        (HTTP over UDS)  (per-user daemon)    (pfslocal)   (PortableFSExt.appex)
 ```
 
-1. **Ensure the daemon.** The CLI probes the `portablefsd` control socket
+1. **Ensure the daemon.** The CLI probes the external owner-private
+   `portablefsd` control socket under
+   `~/.local/state/portablefs/portablefsd/control.sock`
    (`GET /healthz`) and requires an exact `/v1/identity` match for the
    CLI/daemon release, exact daemon executable SHA-256, private control
    protocol, and `pfslocal` major protocol. A healthy compatible daemon is
    adopted — the daemon is per-user and multi-attach, so one instance serves
-   every mount, whether the CLI or the menu-bar app started it. An incompatible
+   every mount. An incompatible
    live daemon fails closed with clean-stop guidance; the CLI never replaces it
-   automatically. Otherwise the CLI spawns one, detached into its own session so
-   it outlives the mount process and serves later mounts. The daemon must be the
-   exact `portablefsd` sibling of the canonical real `portablefs` executable.
+   automatically. Otherwise the unentitled CLI asks `NSWorkspace` to launch the
+   exact app bundle that contains it, with running-app substitution disabled,
+   and waits for the host's registered ServiceManagement agent. The
+   asynchronous `NSWorkspace` completion callback is not an identity or
+   readiness proof: a bounded callback timeout is treated as ambiguous and may
+   continue only into the exact daemon control identity check below. An explicit
+   callback error is a launch failure. The native request runs only on the
+   process main thread and pumps the main RunLoop until the callback or bounded
+   timeout; a wrong-thread call is refused before issuing the request. The CLI never starts
+   a daemon directly and never enters the app-group container. The daemon must be the
+   exact executable sealed at
+   `Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd`
+   in the app that contains the canonical real `portablefs` executable.
    The CLI pins and hashes that file and requires the running daemon to report
    the same executable identity; it never searches `PATH` or accepts an
    executable override.
@@ -106,18 +123,33 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
    sandbox permits `connect(2)` on a unix socket only inside app-group container
    paths, so a socket anywhere else — `/tmp` included — is unreachable from the
    sandboxed extension no matter what file-access exceptions it holds. The
-   daemon the CLI ensures must therefore serve exactly that container socket
-   (see the overrides below).
+   daemon the CLI ensures must therefore serve exactly that container socket.
+   macOS also protects another team's group-container path from an ordinary
+   unentitled process. Exactly the signed host, embedded daemon, and extension
+   carry the same single app-group entitlement. The CLI explicitly carries no
+   app-group entitlement and uses only the external private control socket.
+   There is no alternate container bypass (see the overrides below).
 
-Before the kernel mount the CLI performs one preflight on the *same* frontend
-socket the registered extension will dial — `Hello` plus `Resolve(attachRef)` —
+Before the kernel mount the CLI calls a versioned daemon control endpoint. The
+authorized daemon then performs one preflight on the *same* frontend socket the
+registered extension will dial — `Hello` plus `Resolve(attachRef)` —
 so the one foreseeable misconfiguration (the CLI attached to daemon A while the
 installed extension's Info.plist points at daemon B) surfaces as a typed error
 rather than an opaque I/O error afterwards.
 
-The command then behaves like every `portablefs mount`: it returns only after
-the kernel reports the exact mount present and a real root enumeration succeeds,
-then daemonizes (state under `~/.local/state/portablefs/mounts/`).
+The command returns only after two matching kernel mount-table proofs surround
+the exact readiness witness declared by the cache policy. macOS 26's
+`macos26-synchronous-vfs-repair-v1/v2` witness is the daemon opening, attesting,
+and retaining the mount-root descriptor its VFS repair channel needs. macOS
+27's qualification-only `fskit-native-revocation-v1` witness is instead a live
+`portablefskit` connection which completed `Hello` and `Resolve` for this exact
+attach. The native policy never opens the mounted path and never installs a
+root-descriptor repair channel. A control self-preflight uses a different
+client name and cannot satisfy this witness. In both cases, a changed second
+kernel identity is a substitution failure, not a retry.
+
+After that proof the command daemonizes (state under
+`~/.local/state/portablefs/mounts/`).
 `portablefs umount` invokes one daemon-owned `POST /v1/attaches/{ref}/unmount`
 transaction. For authority-v3 it begins planned detach, proves the exact
 `dev.portablefs.oss://<attachRef>` kernel mount, and issues a normal kernel
@@ -185,34 +217,42 @@ release installer refuses publication when it finds another provider, such as
 the dev harness's `PortableFSDev.appex`; remove that provider explicitly before
 installing the release app.
 
-The release archive is one `PortableFS.app`. Its CLI and daemon live under
-`Contents/Helpers/`, and its FSKit extension lives under `Contents/Extensions/`
-as exactly one `PortableFSExt.appex`. The installer verifies that code
+The release archive is one `PortableFS.app`. Its unentitled CLI lives at
+`Contents/Helpers/portablefs`; its entitled daemon lives only inside
+`Contents/Library/LaunchAgents/PortableFSDService.app`, next to the sealed
+RunAtLoad/KeepAlive LaunchAgent plist; and its FSKit extension lives under
+`Contents/Extensions/` as exactly one `PortableFSExt.appex`. The installer verifies that code
 hierarchy, takes the exclusive per-user mount lifecycle lock, rechecks exact
 kernel mounts, mount records, running PortableFS processes, and canonical
-sockets, and atomically replaces the whole bundle plus CLI symlink. It never
-updates a live app, daemon, or mount. Cleanly unmount volumes and quit the app
-before upgrading.
+sockets. On upgrade, the installed host alone unregisters the old service,
+hands the installer a one-use prepared token, and exits; the installer then
+reacquires both exclusive guards, re-inventories, and atomically exchanges the
+whole bundle while retaining the displaced release. It retires that rollback
+copy only after the new host and daemon prove the exact sealed release.
+Cleanly unmount volumes before upgrading.
 
 ## Daemon Lifecycle
 
-- **Per-user, multi-attach.** One `portablefsd` serves every attach for the
-  user. The CLI adopts a healthy daemon only when its exact control identity is
-  compatible and never duplicates or automatically replaces it. CLI and app
-  mounts can ride the same compatible daemon when they share sockets.
-- **Spawn.** When nothing healthy answers, the CLI starts
-  `portablefsd -frontend-socket ... -control-socket ...` with a state dir at
-  `~/.local/state/portablefs/portablefsd`, detached, and waits up to 15 seconds
-  for `/healthz` and a verified identity before failing with the log path. A
+- **Per-user, multi-attach.** One launchd-managed `portablefsd` serves every
+  attach for the user. The CLI adopts it only when its exact external control
+  identity is compatible and never duplicates or automatically replaces it.
+- **Start.** When nothing healthy answers, the CLI launches the exact containing
+  app through `NSWorkspace`; the host owns registration of the always-running
+  ServiceManagement agent. Launch completion alone is never success; the CLI
+  requires the exact embedded daemon release on the owner-private control
+  socket within the bounded wake interval. There is no direct helper spawn or weaker fallback.
+  A
   crashed daemon or reboot can leave socket inodes behind; after acquiring both
-  the state and socket singleton locks, the new daemon reclaims only a private,
+  the state, external-control, and app-group-frontend singleton locks, the new daemon reclaims only a private,
   same-UID, single-link canonical socket that refuses a connection. It moves
   that exact inode aside with an atomic no-replace rename before removal, so a
   concurrent replacement is restored rather than unlinked.
-- **Log.** A CLI-spawned daemon appends to
-  `~/.local/state/portablefs/portablefsd.log`. Per-mount logs are separate,
-  under `~/.local/state/portablefs/mounts/`. The menu-bar app invokes the same
-  embedded CLI and does not own another daemon or state root.
+- **Roots.** Control lives under the canonical owner-private daemon state.
+  The frontend socket lives under the app-group because only the sandboxed
+  FSKit peer consumes it. The macOS 26 compatibility policy also uses the
+  canonical mount-root handoff socket there; the macOS 27 native policy has no
+  such channel. These roots are independently pinned, locked, and safely
+  reconciled; the CLI never resolves the app-group root.
 - **Sockets are the authentication boundary.** The daemon creates the socket
   directory 0700 and the sockets 0600; same-user filesystem access is the
   control plane's entire auth model — there is no bearer token on the control
@@ -229,30 +269,108 @@ before upgrading.
   authorization. The endpoint also retains its earlier pending-attach recovery
   role after a daemon restart.
 - **Outlives mounts.** Exact unmount durably removes the attach but leaves the
-  daemon running for the next mount. A v3 attach carries no client-side
-  durability debt, so a daemon with no attaches owns nothing and is safe to
-  stop; `portablefs daemon stop` (`POST /v1/lifecycle/stop-if-idle`) refuses
-  while any live attach exists.
+  launchd agent running for the next mount. `portablefs daemon stop` is refused
+  on macOS; only the host-owned update transaction may prove zero kernel mounts
+  and zero daemon attaches, unregister the agent, and permit app replacement.
+- **Two-phase updates.** The installer wakes the exact installed host and uses
+  a credential-checked owner-private Unix-socket session. Before unregistering,
+  that host durably records a five-minute activation lease containing the exact
+  old and target release identities, phase, and SHA-256 of a one-use random
+  token; plaintext token material remains only in installer memory. The host
+  proves an empty inventory, authenticates the daemon on its control socket,
+  and binds a kernel process witness to the peer's exact audit-token PID and
+  PID version. It then unregisters the old agent and requires Service
+  Management to report `notRegistered`, all three runtime socket names to be
+  absent, and the exact witnessed execution to deliver `NOTE_EXIT`; unrelated
+  or uninspectable processes are never scanned. If a newly registered daemon
+  failed before it exposed an authenticated control peer, the equivalent
+  no-publication proof is a safely pinned, nonblocking acquisition of the
+  canonical state-singleton lock, which the daemon acquires first and releases
+  last. Only then does the host release its guards and return the token. The
+  installer takes both account and mount exclusives, repeats the exact
+  inventory, and token-commits the old host's exit. Every host-exit path first
+  closes the update listener and removes only its pinned, owned socket inode,
+  then re-proves the canonical name absent before acknowledging or terminating.
+  A replaced or otherwise unsafe inode leaves the durable phase intact and the
+  host running; it is never unlinked. If the commit reply is lost, the installer
+  retains the plaintext token. An exact `old-absent` lease plus disappearance of
+  the authenticated prepared-host PID enters the ordinary tokenized
+  prepublication rollback; an exact `rollback-complete` marker is accepted only
+  after the installed old hierarchy and live daemon full tuple are re-proved.
+  A stale socket pathname alone is neither process identity nor transaction
+  authority.
+
+  While the host remains live, its accept loop re-proves that exact listener
+  inode before every attempt and retries only `EINTR` or `ECONNABORTED` from an
+  abandoned queued client. Any other accept failure unpublishes the listener
+  fail-closed instead of recreating it in-process.
+
+  The target host sees the durable lease before normal startup, so it cannot
+  register merely because the app was launched. A distinct same-UID,
+  token-bound session makes it register and live-prove only the exact sealed
+  target. The installer independently proves the same control identity and
+  retains the displaced app until that activation is accepted. An acknowledged
+  activation failure first unregisters and fences the target; only then does an
+  atomic exchange restore the displaced app and a third token-bound session
+  live-prove the old release. Cancel before old-host commit similarly restores
+  the old service while holding an empty-inventory guard. Wrong, replayed,
+  expired, malformed, or ambiguous state never triggers registration or
+  rollback; both exact app copies and the lease remain for reconciliation. No
+  mutable notification, launch argument, `launchctl`, daemon self-unregister,
+  or shell-accessible app-group path participates.
+
+  A completion reply may be lost after the host has durably replaced the active
+  phase with `target-complete` or `rollback-complete`. The installer treats that
+  as complete only when the owner-private terminal marker still matches the
+  token hash and exact old/target tuples, transaction finalization has already
+  retired the alternate app, the installed signed hierarchy and service tuple
+  equal the marker's active release, and the live daemon independently proves
+  the full tuple; the mutable marker and identity are rechecked. The terminal
+  marker does not expire or disappear. A later authenticated prepare may
+  replace it only after re-proving the exact sealed, registered, and live active
+  release. Any weaker observation remains ambiguous. Conversely, an
+  expired/orphaned nonterminal lease never authorizes automatic registration,
+  fencing, deletion, or rollback: the host stays fail-closed and requires
+  explicit operator recovery. There is intentionally no tokenless stale-lease
+  recovery path in this release.
+
+  Activation reply loss is also phase-exact. A ready reply that cannot be
+  validated causes the host to fence itself to `rollback-absent`; the installer
+  waits for that token-bound phase plus disappearance of the authenticated host
+  PID and listener before restoring or retrying. Once acceptance is durable,
+  the service is never implicitly fenced. Instead, the installer reconnects
+  with `resume-target` or `resume-rollback`, carrying its still-memory-only
+  token and both release identities. The host accepts that request only for the
+  corresponding exact active phase and only after re-proving its sealed and
+  live release, then exposes completion on the new connection. Duplicate,
+  replayed, wrong-token, expired, terminal, or cross-release resumes cause no
+  state change.
+
+  The installer also treats time as transaction state, not as unrelated
+  request timeouts. Before launching an activation host or sending
+  Accept/Complete, it admits that child operation only when the shared parent
+  deadline still contains the full downstream reconciliation reserve plus a
+  fixed scheduling/cancellation margin at each nested boundary. A late
+  host action can therefore be resolved after its child request expires. If a
+  ready release lacks enough time to accept safely, the installer uses the
+  official token-bound Fence, proves the exact host and listener absent, and
+  restores or retains the rollback transaction; it never starts an irreversible
+  edge with no time left to determine its durable outcome.
 
 The complete control API is `/healthz`, `/v1/identity`, `/v1/attaches`,
-`/v1/attaches/{ref}`, `/v1/attaches/{ref}/unmount`,
+`/v1/attaches/{ref}`, `/v1/attaches/{ref}/frontend-preflight`, `/v1/attaches/{ref}/unmount`,
 `/v1/attaches/{ref}/credential`, `/v1/attaches/{ref}/sync`, and
 `/v1/lifecycle/stop-if-idle` (`vcs/internal/portablefsd/control.go`).
 
-## Environment Overrides
+## Signed runtime identity
 
-Defaults match PortableFS.app's extension. The socket overrides exist for dev
-extensions that use a separate app-group container:
-
-| variable | default | meaning |
-|---|---|---|
-| `PORTABLEFS_FSKIT_TYPE` | `pfs` | optional assertion of the release's signed filesystem type; a different value is rejected |
-| `PORTABLEFS_FSKIT_SOCKET` | `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock` | the daemon frontend socket the extension dials (resolved from `PFSAppGroupIdentifier` in the extension's Info.plist) |
-| `PORTABLEFS_FSKIT_CONTROL_SOCKET` | `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/control.sock` | the daemon control socket the CLI drives; setting a custom frontend socket implies a `control.sock` next to it unless this is set explicitly |
-
-`PORTABLEFS_FSKIT_DAEMON` is rejected. A fork or development build packages its
-matching CLI and daemon as one sibling pair rather than selecting code from the
-environment.
+The filesystem type, resource scheme, app group, sockets, CLI, and daemon form
+one signed release identity. `PORTABLEFS_FSKIT_TYPE` may assert the compiled
+`pfs` type, but cannot change it. `PORTABLEFS_FSKIT_SOCKET`,
+`PORTABLEFS_FSKIT_CONTROL_SOCKET`, and `PORTABLEFS_FSKIT_DAEMON` are rejected.
+A fork or development product compiles its own app-group identity and packages
+its matching extension, CLI, and nested daemon service as one sealed hierarchy
+rather than selecting any of them from the environment.
 
 The OSS resource scheme is the immutable `dev.portablefs.oss`; it is not an
 environment override. The matching app and CLI are installed atomically and the
@@ -268,6 +386,10 @@ it these overrides are read-only facts, not knobs. The packaging build stamps
 one `PORTABLEFS_APP_GROUP` value derived from the signing team into the
 extension Info.plist, its signed entitlement, the CLI, and the daemon
 (`portablefs lifecycle identity` and `portablefsd -identity-json` print it).
+The host, extension, and daemon signatures must each contain that same single
+app-group entitlement. The CLI must contain none. Packaging and installation
+reject a missing, extra, or mismatched privileged entitlement and reject an
+app-group entitlement on the CLI.
 Forks set their signing team once; there are no independent source constants to
 keep synchronized.
 
@@ -402,32 +524,24 @@ after repeated abnormal teardown, and only its restart recovers it.
 
 The module is enabled and the kernel reached it, but the extension's
 `loadResource` failed — almost always because it could not reach `portablefsd`'s
-frontend socket. The extension may only connect to sockets inside its app-group
-container; if the CLI was pointed elsewhere via `PORTABLEFS_FSKIT_SOCKET`, the
-extension cannot follow it there. Clear the override (or align it with the
-extension's `PFSAppGroupIdentifier` container) and remount. A rebuilt extension
-can also linger as a stale process from a previous version; `pkill -x
+frontend socket. Every process independently resolves the exact signed
+app-group container through Foundation, and the CLI and daemon reject any
+different root or socket. A rebuilt extension can also linger as a stale
+process from a previous version; `pkill -x
 PortableFSDev` (or the app's extension name) forces a fresh instance on the next
 mount.
 
-### A foreign daemon owns the sockets
+### A foreign daemon owns a socket
 
 The CLI requires both liveness and an exact control identity on the control
 socket. A stale dev build or older release is refused before an attach is
-created. The sockets live in the canonical account home's per-user app-group
-container, so unlike a `/tmp` path they cannot belong to another account.
+created. The external control socket is under the canonical account's private
+state root; the frontend sockets are under the signed app-group root.
 
-The fix depends on which extension you run:
-
-- Stock PortableFS.app extension: it dials the default frontend socket, so the
-  default sockets must be yours. Stop the foreign daemon (unmount its attaches,
-  then terminate the `portablefsd` process) and remount; the CLI spawns a fresh
-  daemon on the now-free sockets.
-- Dev extension with its own Info.plist socket: point the CLI at your own
-  sockets — `PORTABLEFS_FSKIT_SOCKET` (frontend) and
-  `PORTABLEFS_FSKIT_CONTROL_SOCKET` — and package the matching
-  `portablefs`/`portablefsd` sibling pair. The signed filesystem type remains
-  `pfs`.
+Stop the foreign daemon only after cleanly unmounting its attaches and use the
+host-owned agent lifecycle; the CLI never replaces or directly spawns it.
+A development extension that needs a different container must use a distinct
+compiled app-group identity and matching signed helper pair.
 
 ### The daemon does not become healthy
 

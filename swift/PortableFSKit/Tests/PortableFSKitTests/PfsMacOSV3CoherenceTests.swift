@@ -461,6 +461,206 @@ private actor RecordingPublicationBarrier: PfsMacOSCallbackPublicationBarrier {
     func recordedRepairSets() -> [[PfsMacOSCacheRepair]] { repairSets }
 }
 
+private actor RecordingNativeDataInvalidator: PfsFSKitNativeDataCacheInvalidator {
+    private let failureIndex: Int?
+    private var targets: [PfsFSKitNativeDataInvalidation] = []
+
+    init(failureIndex: Int? = nil) {
+        self.failureIndex = failureIndex
+    }
+
+    func invalidate(_ target: PfsFSKitNativeDataInvalidation) async throws {
+        if targets.count == failureIndex {
+            throw PfsMacOSCoherenceError.nativeRevocationUnavailable
+        }
+        targets.append(target)
+    }
+
+    func recorded() -> [PfsFSKitNativeDataInvalidation] { targets }
+}
+
+private func linkedNativeDataRepair(
+    name: String,
+    size: UInt64
+) throws -> PfsMacOSCacheRepair {
+    .invalidateData(
+        path: try PfsMacOSRelativePath(components: [Data(name.utf8)]),
+        parentIdentity: testParentIdentity,
+        itemIdentity: testItemIdentity,
+        expectedVFSFileID: 41,
+        authoritativeSize: size
+    )
+}
+
+private func objectNativeDataRepair(size: UInt64) -> PfsMacOSCacheRepair {
+    let item = PortableFSItem(identity: PfsItemIdentity(
+        itemID: 42,
+        generation: 7,
+        stableIdentity: testItemIdentity.bytes
+    ))
+    return .invalidateDataObject(
+        object: PfsMacOSLiveObjectReference(
+            item: item,
+            vfsFileID: 42,
+            itemKind: .file
+        ),
+        itemIdentity: testItemIdentity,
+        authoritativeSize: size
+    )
+}
+
+@Test func nativeDataCachePolicyMapsEveryRequestWithoutAWriteBackGrant() {
+    #expect(PfsFSKitNativeDataCacheRequest.allCases == [
+        .none,
+        .read,
+        .readWrite,
+    ])
+    #expect(PfsFSKitNativeDataCachePolicy.grant(for: .none) == .noCache)
+    #expect(PfsFSKitNativeDataCachePolicy.grant(for: .read) == .readCache)
+    #expect(PfsFSKitNativeDataCachePolicy.grant(for: .readWrite) == .writeThrough)
+}
+
+@Test func nativeBackendInvalidatesEverySupportedPeerDataTargetBeforeResuming() async throws {
+    let localSession = Data(repeating: 0x99, count: 16)
+    let invalidator = RecordingNativeDataInvalidator()
+    let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
+    let publication = RecordingPublicationBarrier()
+    let backend = try PfsNativeFSKitCoherenceBackend(
+        localAuthoritySessionID: localSession,
+        revoker: revoker,
+        publicationBarrier: publication
+    )
+    let repairs: [PfsMacOSCacheRepair] = [
+        try linkedNativeDataRepair(name: "linked", size: 4096),
+        objectNativeDataRepair(size: 8192),
+    ]
+    let prepare = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .prepare,
+        initiator: testInitiator,
+        repairs: repairs
+    )
+    let complete = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: testInitiator,
+        repairs: repairs
+    )
+
+    try await backend.repair(prepare)
+    #expect(await invalidator.recorded().isEmpty)
+    try await backend.repair(complete)
+
+    #expect(await invalidator.recorded().count == repairs.count)
+    #expect(await publication.recorded() == [.prepare, .complete])
+}
+
+@Test func nativeBackendDoesNotRevokeTheSourceMountsOwnPublishedMutation() async throws {
+    let localSession = Data(repeating: 0x99, count: 16)
+    let localInitiator = try PfsMacOSMutationInitiator(
+        sessionID: localSession,
+        replaySlot: 7,
+        mutationSequence: 23,
+        localOperationID: 91
+    )
+    let repair = try linkedNativeDataRepair(name: "source", size: 12)
+    let invalidator = RecordingNativeDataInvalidator()
+    let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
+    let publication = RecordingPublicationBarrier()
+    let backend = try PfsNativeFSKitCoherenceBackend(
+        localAuthoritySessionID: localSession,
+        revoker: revoker,
+        publicationBarrier: publication
+    )
+    let complete = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: localInitiator,
+        repairs: [repair]
+    )
+
+    try await backend.repair(complete)
+
+    #expect(await invalidator.recorded().isEmpty)
+    #expect(await publication.recorded() == [.complete])
+}
+
+@Test func nativeBackendFailsBeforePublicationResumeWhenAnyRepairCannotRevoke() async throws {
+    let invalidator = RecordingNativeDataInvalidator(failureIndex: 1)
+    let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
+    let publication = RecordingPublicationBarrier()
+    let backend = try PfsNativeFSKitCoherenceBackend(
+        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
+        revoker: revoker,
+        publicationBarrier: publication
+    )
+    let repairs: [PfsMacOSCacheRepair] = [
+        try linkedNativeDataRepair(name: "first", size: 1),
+        try linkedNativeDataRepair(name: "second", size: 2),
+    ]
+    let complete = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: testInitiator,
+        repairs: repairs
+    )
+
+    await #expect(throws: PfsMacOSCoherenceError.nativeRevocationUnavailable) {
+        try await backend.repair(complete)
+    }
+
+    #expect(await invalidator.recorded().count == 1)
+    #expect(await publication.recorded().isEmpty)
+}
+
+@Test func documentedNativeRevokerRejectsNamespaceAndAttributeRepairsBeforeResume() async throws {
+    let invalidator = RecordingNativeDataInvalidator()
+    let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
+    let root = try PfsMacOSRelativePath(components: [])
+    let unsupported: [PfsMacOSCacheRepair] = [
+        .purgeNegative(
+            parent: root,
+            parentIdentity: testParentIdentity,
+            name: Data("missing".utf8)
+        ),
+        .refreshAttributes(
+            path: try PfsMacOSRelativePath(components: [Data("item".utf8)]),
+            parentIdentity: testParentIdentity,
+            itemIdentity: testItemIdentity,
+            expectedVFSFileID: 41,
+            itemKind: .file
+        ),
+    ]
+    for repair in unsupported {
+        await #expect(throws: PfsMacOSCoherenceError.unsupportedRepair) {
+            try await revoker.revoke(repair)
+        }
+    }
+    #expect(await invalidator.recorded().isEmpty)
+
+    let publication = RecordingPublicationBarrier()
+    let backend = try PfsNativeFSKitCoherenceBackend(
+        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
+        revoker: revoker,
+        publicationBarrier: publication
+    )
+    let complete = try PfsMacOSCoherenceEvent(
+        epoch: testEpoch,
+        sequence: 1,
+        phase: .complete,
+        initiator: testInitiator,
+        repairs: [unsupported[0]]
+    )
+    await #expect(throws: PfsMacOSCoherenceError.unsupportedRepair) {
+        try await backend.repair(complete)
+    }
+    #expect(await publication.recorded().isEmpty)
+}
+
 private actor RecordingLease: PfsMacOS26RepairArmLease {
     private(set) var finished = false
     private(set) var cancelled = false

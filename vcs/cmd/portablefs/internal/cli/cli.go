@@ -13,6 +13,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 )
 
 const hostedMountReauthorizationFeature = "hosted-mount-reauthorization-v1"
@@ -36,8 +38,11 @@ type cmdEnv struct {
 	// Test-only presentation seam. Production always performs the exact
 	// process + kernel mount identity checks in mountHealth.
 	mountHealthFn func(*mountState) string
-	// Test-only daemon lifecycle seam. Production always adopts or starts the
-	// exact portablefsd sibling through ensurePortablefsd.
+	// Test-only daemon inventory seam. Production proves the exact installed
+	// daemon identity before reading its live attaches.
+	daemonAttachStatusesFn func(*daemonctl.Identity) (map[string]cliAttachStatus, error)
+	// Test-only daemon lifecycle seam. Production adopts the exact launchd
+	// agent or wakes the exact containing host through ensurePortablefsd.
 	ensurePortablefsdFn func(fskitConfig, string, string) (*fsdControl, error)
 	// Test-only account-inventory seam. Production always reads the live
 	// kernel mount table before changing credentials or profiles.
@@ -63,6 +68,15 @@ func (e *cmdEnv) ensureFskitDaemon(cfg fskitConfig, stateRoot string) (*fsdContr
 		return e.ensurePortablefsdFn(cfg, stateRoot, e.version)
 	}
 	return ensurePortablefsd(cfg, stateRoot, e.version)
+}
+
+func (e *cmdEnv) daemonAttachStatuses(
+	expected *daemonctl.Identity,
+) (map[string]cliAttachStatus, error) {
+	if e.daemonAttachStatusesFn != nil {
+		return e.daemonAttachStatusesFn(expected)
+	}
+	return fskitAttachStatusesForIdentity(e.getenv, e.version, expected)
 }
 
 func (e *cmdEnv) stdinReader() io.Reader {
@@ -119,7 +133,7 @@ type command struct {
 }
 
 func commands() []command {
-	return []command{
+	commands := []command{
 		{"mount", "mount a live volume on this machine", cmdMount},
 		{"reauthorize", "rotate a hosted live mount authorization", cmdReauthorize},
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
@@ -130,11 +144,11 @@ func commands() []command {
 		{"lifecycle", "hold the internal mount/update lifecycle guard", cmdLifecycle},
 		{"install-macos-app", "install the signed macOS app bundle", cmdInstallMacOSApp},
 		{"mount-check", "inspect this host's mount transport without changing it", cmdMountCheck},
-		{"internal-root-probe", "internal bounded mount-root usability probe", cmdInternalRootProbe},
 		{"doctor", "check this machine's PortableFS setup and report problems", cmdDoctor},
 		{"install-linux-release", "atomically activate a verified Linux release", cmdInstallLinuxRelease},
 		{"version", "print the CLI version", cmdVersion},
 	}
+	return append(commands, qualificationCommands()...)
 }
 
 func findCommand(name string) (command, bool) {

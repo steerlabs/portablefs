@@ -15,6 +15,34 @@ build_number=${PORTABLEFS_BUILD_NUMBER:-}
 out_root=${PORTABLEFS_PACKAGE_DIR:-"$repo_root/dist/macos"}
 archive="$out_root/PortableFS-$version.xcarchive"
 project="$repo_root/swift/PortableFSApp/PortableFSApp.xcodeproj"
+go_binary=${PORTABLEFS_GO:-}
+
+if [ "$release" = "1" ] && [ -z "$go_binary" ]; then
+  echo "PORTABLEFS_RELEASE=1 requires an explicit exact PORTABLEFS_GO" >&2
+  exit 1
+fi
+if [ -z "$go_binary" ]; then
+  go_candidate=$(command -v go || true)
+  [ -n "$go_candidate" ] ||
+    { echo "PortableFS packaging requires Go" >&2; exit 1; }
+  # Resolve an exact module-selected toolchain once, outside Xcode's sanitized
+  # Run Script environment. The embed phase then disables toolchain switching.
+  go_root=$(GOTOOLCHAIN=auto "$go_candidate" -C "$repo_root/vcs" env GOROOT)
+  go_binary=$(/bin/realpath "$go_root/bin/go")
+fi
+case "$go_binary" in
+  /*) ;;
+  *) echo "PORTABLEFS_GO must resolve to an absolute Go executable" >&2; exit 1 ;;
+esac
+[ -f "$go_binary" ] && [ ! -L "$go_binary" ] && [ -x "$go_binary" ] ||
+  { echo "PORTABLEFS_GO must be a regular, non-symlink executable" >&2; exit 1; }
+required_go_version=$(/usr/bin/awk '
+  $1 == "go" && NF == 2 { print "go" $2; declarations += 1 }
+  END { if (declarations != 1) exit 1 }
+' "$repo_root/vcs/go.mod")
+actual_go_version=$("$go_binary" version | /usr/bin/awk '{ print $3 }')
+[ "$actual_go_version" = "$required_go_version" ] ||
+  { echo "PORTABLEFS_GO is $actual_go_version but vcs/go.mod requires $required_go_version" >&2; exit 1; }
 
 if [ "$release" = "1" ]; then
   [ "$unsigned" = "0" ] ||
@@ -63,7 +91,9 @@ set -- xcodebuild \
   ONLY_ACTIVE_ARCH=NO \
   MARKETING_VERSION="$version" \
   CURRENT_PROJECT_VERSION="$build_number" \
-  PORTABLEFS_APP_GROUP="$app_group"
+  PORTABLEFS_APP_GROUP="$app_group" \
+  PORTABLEFS_NATIVE_QUALIFICATION= \
+  PORTABLEFS_GO="$go_binary"
 
 if [ -n "${PORTABLEFS_APPLE_API_KEY_PATH:-}" ]; then
   [ -n "${PORTABLEFS_APPLE_API_KEY_ID:-}" ] ||
@@ -95,7 +125,7 @@ if [ "${PORTABLEFS_DEVELOPER_ID_EXPORT:-0}" = "1" ]; then
   [ "$unsigned" != "1" ] ||
     { echo "PORTABLEFS_DEVELOPER_ID_EXPORT=1 requires signed packaging" >&2; exit 1; }
   export_options="$verify_tmp/ExportOptions.plist"
-  plutil -create xml "$export_options"
+  plutil -create xml1 "$export_options"
   plutil -insert method -string developer-id "$export_options"
   plutil -insert signingStyle -string automatic "$export_options"
   plutil -insert teamID -string "$team_id" "$export_options"
@@ -121,12 +151,16 @@ fi
 
 app_executable="$app/Contents/MacOS/PortableFS"
 cli="$app/Contents/Helpers/portablefs"
-daemon="$app/Contents/Helpers/portablefsd"
+service="$app/Contents/Library/LaunchAgents/PortableFSDService.app"
+daemon="$service/Contents/MacOS/portablefsd"
+launch_agent="$app/Contents/Library/LaunchAgents/dev.portablefs.PortableFSApp.portablefsd.plist"
 extension="$app/Contents/Extensions/PortableFSExt.appex"
 extension_executable="$extension/Contents/MacOS/PortableFSExt"
 [ -x "$app_executable" ] || { echo "packaged app has no PortableFS executable" >&2; exit 1; }
 [ -x "$cli" ] || { echo "packaged app has no executable portablefs helper" >&2; exit 1; }
-[ -x "$daemon" ] || { echo "packaged app has no executable portablefsd helper" >&2; exit 1; }
+[ -d "$service" ] || { echo "packaged app has no PortableFSDService.app" >&2; exit 1; }
+[ -x "$daemon" ] || { echo "packaged service app has no executable portablefsd" >&2; exit 1; }
+[ -f "$launch_agent" ] || { echo "packaged app has no sealed PortableFS LaunchAgent plist" >&2; exit 1; }
 [ -d "$extension" ] || { echo "packaged app has no FSKit extension" >&2; exit 1; }
 [ -x "$extension_executable" ] ||
   { echo "packaged app has no PortableFSExt executable" >&2; exit 1; }
@@ -139,6 +173,15 @@ app_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$a
 app_build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$app/Contents/Info.plist")
 extension_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$extension/Contents/Info.plist")
 extension_build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$extension/Contents/Info.plist")
+service_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$service/Contents/Info.plist")
+service_build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$service/Contents/Info.plist")
+service_bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$service/Contents/Info.plist")
+service_executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$service/Contents/Info.plist")
+launch_label=$(/usr/libexec/PlistBuddy -c "Print :Label" "$launch_agent")
+launch_program=$(/usr/libexec/PlistBuddy -c "Print :BundleProgram" "$launch_agent")
+launch_run_at_load=$(/usr/libexec/PlistBuddy -c "Print :RunAtLoad" "$launch_agent")
+launch_keep_alive=$(/usr/libexec/PlistBuddy -c "Print :KeepAlive" "$launch_agent")
+host_group=$(/usr/libexec/PlistBuddy -c "Print :PFSAppGroupIdentifier" "$app/Contents/Info.plist")
 extension_group=$(/usr/libexec/PlistBuddy -c "Print :PFSAppGroupIdentifier" "$extension/Contents/Info.plist")
 extension_fs_type=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSShortName" "$extension/Contents/Info.plist")
 extension_personality=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSPersonalities:PortableFSPersonality:FSName" "$extension/Contents/Info.plist")
@@ -146,10 +189,32 @@ extension_scheme=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:F
 extension_generic_urls=$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSSupportsGenericURLResources" "$extension/Contents/Info.plist")
 [ "$app_version" = "$version" ] || { echo "app version $app_version != $version" >&2; exit 1; }
 [ "$extension_version" = "$version" ] || { echo "extension version $extension_version != $version" >&2; exit 1; }
+[ "$service_version" = "$version" ] || { echo "daemon service version $service_version != $version" >&2; exit 1; }
 [ "$app_build" = "$build_number" ] || { echo "app build $app_build != $build_number" >&2; exit 1; }
 [ "$extension_build" = "$build_number" ] || { echo "extension build $extension_build != $build_number" >&2; exit 1; }
+[ "$service_build" = "$build_number" ] || { echo "daemon service build $service_build != $build_number" >&2; exit 1; }
+[ "$service_bundle_id" = "dev.portablefs.PortableFSApp.PortableFSDService" ] ||
+  { echo "daemon service has unexpected bundle identifier $service_bundle_id" >&2; exit 1; }
+[ "$service_executable" = portablefsd ] ||
+  { echo "daemon service has unexpected executable $service_executable" >&2; exit 1; }
+[ "$launch_label" = "dev.portablefs.PortableFSApp.portablefsd" ] ||
+  { echo "LaunchAgent has unexpected label $launch_label" >&2; exit 1; }
+[ "$launch_program" = "Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd" ] ||
+  { echo "LaunchAgent has unexpected BundleProgram $launch_program" >&2; exit 1; }
+[ "$launch_run_at_load" = true ] && [ "$launch_keep_alive" = true ] ||
+  { echo "LaunchAgent must be RunAtLoad and KeepAlive" >&2; exit 1; }
+if /usr/libexec/PlistBuddy -c "Print :Program" "$launch_agent" >/dev/null 2>&1; then
+  echo "LaunchAgent must use only sealed BundleProgram" >&2
+  exit 1
+fi
+[ ! -e "$service/Contents/embedded.provisionprofile" ] ||
+  { echo "daemon service must not embed a provisioning profile" >&2; exit 1; }
+[ "$host_group" = "$app_group" ] ||
+  { echo "host app group $host_group != $app_group" >&2; exit 1; }
 [ "$extension_group" = "$app_group" ] ||
   { echo "extension app group $extension_group != $app_group" >&2; exit 1; }
+[ "$host_group" = "$extension_group" ] ||
+  { echo "host and extension app groups do not match" >&2; exit 1; }
 [ -n "$extension_fs_type" ] && [ "$extension_personality" = "$extension_fs_type" ] ||
   { echo "extension filesystem type and personality do not match" >&2; exit 1; }
 printf '%s\n' "$extension_scheme" | LC_ALL=C grep -Eq '^[a-z][a-z0-9+.-]*$' ||
@@ -184,7 +249,7 @@ daemon_scheme=$(plutil -extract resourceScheme raw -o - "$daemon_identity")
 
 if [ "$unsigned" != "1" ]; then
   codesign --verify --deep --strict --verbose=2 "$app"
-  for code in "$app" "$extension" "$cli" "$daemon"; do
+  for code in "$app" "$extension" "$service" "$cli" "$daemon"; do
     code_identity=$(codesign -dv --verbose=4 "$code" 2>&1)
     printf '%s\n' "$code_identity" |
       grep -Fx "TeamIdentifier=$team_id" >/dev/null ||
@@ -198,13 +263,55 @@ if [ "$unsigned" != "1" ]; then
         { echo "$code is not signed with the hardened runtime" >&2; exit 1; }
     fi
   done
-  entitlements="$verify_tmp/extension-entitlements.plist"
-  codesign -d --entitlements :- "$extension" >"$entitlements"
-  entitlement_group=$(/usr/libexec/PlistBuddy \
-    -c "Print :com.apple.security.application-groups:0" \
-    "$entitlements")
-  [ "$entitlement_group" = "$app_group" ] ||
-    { echo "signed extension entitlement $entitlement_group != $app_group" >&2; exit 1; }
+  verify_app_group_entitlement() {
+    entitlement_code=$1
+    entitlement_label=$2
+    entitlement_plist="$verify_tmp/$entitlement_label-entitlements.plist"
+    codesign -d --entitlements :- "$entitlement_code" >"$entitlement_plist"
+    entitlement_group=$(/usr/libexec/PlistBuddy \
+      -c "Print :com.apple.security.application-groups:0" \
+      "$entitlement_plist") || {
+        echo "could not read signed $entitlement_label app-group entitlement" >&2
+        exit 1
+      }
+    [ "$entitlement_group" = "$app_group" ] || {
+      echo "signed $entitlement_label entitlement $entitlement_group != $app_group" >&2
+      exit 1
+    }
+    if /usr/libexec/PlistBuddy \
+      -c "Print :com.apple.security.application-groups:1" \
+      "$entitlement_plist" >/dev/null 2>&1; then
+      echo "signed $entitlement_label has more than one app-group entitlement" >&2
+      exit 1
+    fi
+  }
+  verify_no_app_group_entitlement() {
+    entitlement_code=$1
+    entitlement_label=$2
+    entitlement_plist="$verify_tmp/$entitlement_label-entitlements.plist"
+    codesign -d --entitlements :- "$entitlement_code" >"$entitlement_plist"
+    if /usr/libexec/PlistBuddy \
+      -c "Print :com.apple.security.application-groups" \
+      "$entitlement_plist" >/dev/null 2>&1; then
+      echo "signed $entitlement_label must not carry an app-group entitlement" >&2
+      exit 1
+    fi
+  }
+  verify_exact_service_entitlements() {
+    entitlement_plist="$verify_tmp/service-exact-entitlements.plist"
+    codesign -d --entitlements :- "$service" >"$entitlement_plist"
+    /usr/bin/plutil -remove com.apple.security.application-groups "$entitlement_plist"
+    remaining=$(/usr/bin/plutil -convert json -o - "$entitlement_plist")
+    [ "$remaining" = "{}" ] || {
+      echo "signed daemon service carries entitlements beyond its exact app group: $remaining" >&2
+      exit 1
+    }
+  }
+  verify_app_group_entitlement "$app" host
+  verify_app_group_entitlement "$extension" extension
+  verify_app_group_entitlement "$daemon" daemon
+  verify_exact_service_entitlements
+  verify_no_app_group_entitlement "$cli" cli
 fi
 
 if [ "$release" = "1" ]; then

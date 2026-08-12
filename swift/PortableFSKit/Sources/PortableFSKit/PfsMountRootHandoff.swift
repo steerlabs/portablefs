@@ -15,8 +15,9 @@ import Foundation
 /// Wire form: send the attach ref and a newline; receive one status byte —
 /// 1 with the O_DIRECTORY descriptor attached, 0 with nothing. The received
 /// descriptor is attested locally (`fstat` must project this adapter's root
-/// file identifier) before it is trusted, exactly like the scan-based
-/// locator attested its own open.
+/// file identifier) before it is trusted. This handoff is used only by the
+/// macOS 26 repair policies; macOS 27 native mounts never open their mount
+/// root and instead use the live native-frontend witness.
 /// Performs one repair actuation through portablefsd.
 ///
 /// The macOS sandbox denies the extension write-class VFS operations on its

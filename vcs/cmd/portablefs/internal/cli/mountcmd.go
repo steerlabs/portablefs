@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
@@ -347,6 +348,17 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mount", err)
 	}
+	// An ordinary macOS 27 build must reach its native-policy refusal without
+	// touching the protected app-group container. Preserve the older strict
+	// ownership-first ordering for malformed selectors: durable recovery
+	// evidence still takes precedence over an unrelated option typo.
+	fskitCachePolicy := ""
+	if runtime.GOOS == "darwin" && (o.strategy == "auto" || o.strategy == "fskit") {
+		fskitCachePolicy, err = currentFSKitCachePolicy()
+		if err != nil {
+			return e.fail("mount", err)
+		}
+	}
 	if err := e.validateMountOwnership(stateDir, volumeID, o.branch, mountPath); err != nil {
 		return e.fail("mount", err)
 	}
@@ -354,8 +366,14 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mount", err)
 	}
+	if selectedStrategy == "fskit" && fskitCachePolicy == "" {
+		fskitCachePolicy, err = currentFSKitCachePolicy()
+		if err != nil {
+			return e.fail("mount", err)
+		}
+	}
 	if selectedStrategy == "fskit" && o.coherence != "strict" {
-		return e.usageError("mount", fmt.Errorf("the macOS FSKit engine declares the strict %s coherence policy; --coherence %s is Linux-only", portablefsd.V3CachePolicyMacOS26, o.coherence))
+		return e.usageError("mount", fmt.Errorf("the macOS FSKit engine declares the strict %s coherence policy; --coherence %s is Linux-only", fskitCachePolicy, o.coherence))
 	}
 	var operation *mountOperation
 	if o.opLockFD > 0 {
@@ -1345,9 +1363,10 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	if o.readyFD > 0 {
 		readyPipe = os.NewFile(uintptr(o.readyFD), "portablefs-ready")
 	}
-	// A v3 mount capability is single-use and this direct CLI does not acquire
-	// hosted reauthorization, so there is no access lease for this supervisor to
-	// keep, release, or reconcile.
+	// A v3 mount capability is single-use. Automatic hosted reauthorization, when
+	// requested, is owned by the distinct enrollment client below; this cleanup
+	// state tracks only the initial Manager mount request until the local attach
+	// has durably taken ownership.
 	leaseCleanupSafe := true
 	leaseCleanupAttempted := false
 	startupCleanupComplete := false
@@ -1440,6 +1459,13 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	strategy, err := resolveStrategy(o.strategy, runtime.GOOS)
 	if err != nil {
 		return failReady(err)
+	}
+	fskitCachePolicy := ""
+	if strategy == "fskit" {
+		fskitCachePolicy, err = currentFSKitCachePolicy()
+		if err != nil {
+			return failReady(err)
+		}
 	}
 	hostFacts := mounthost.Check(mounthost.Transport(strategy))
 	if hostFacts.State == mounthost.Blocked {
@@ -1945,7 +1971,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				ClientKeyPEM:       string(clientIdentity.keyPEM),
 				CachedNameCapacity: mountv3.CachedNameCapacity,
 				RepairBudgetMillis: uint64(mountv3.RepairBudget / time.Millisecond),
-				CachePolicy:        portablefsd.V3CachePolicyMacOS26,
+				CachePolicy:        fskitCachePolicy,
 				// The daemon does not join the route adoption protocol, so the
 				// revision declared here is the empty rule set's. A volume that
 				// declares machine-local routes is refused by the authority with
@@ -1983,7 +2009,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			}
 			return finalizeCleanedStartup(cause)
 		}
-		if err := fskitPreflight(fskitCfg.frontendSock, attachRef, e.version); err != nil {
+		if err := ctl.preflightAttach(attachRef); err != nil {
 			return failAfterAttach(err)
 		}
 		state.AttachRef = attachRef
@@ -2004,32 +2030,40 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err := operation.writeIntent("kernel-mounted", os.Getpid(), processIdentity); err != nil {
 			return failAfterKernelMount(err)
 		}
-		if err := waitForFSKitRoot(
+		attestReadiness, err := fskitReadinessProbeForPolicy(
+			fskitCachePolicy,
+			func() error { return ctl.bindMountRoot(attachRef) },
+			func() error { return ctl.requireNativeFrontendReady(attachRef) },
+		)
+		if err != nil {
+			return failAfterKernelMount(err)
+		}
+		if err := waitForFSKitReady(
 			mountPath,
 			fskitCfg.fsType,
 			fskitidentity.ResourcePrefix+attachRef,
+			attestReadiness,
 			15*time.Second,
 		); err != nil {
 			return failAfterKernelMount(err)
 		}
 		// THE MOUNT IS PROVEN; DROP THE PIN BEFORE ANYONE CAN ASK TO UNMOUNT.
 		//
-		// waitForFSKitRoot has confirmed the exact kernel mount for this attach
-		// is present and serving, so the validate→mount window this fd exists to
-		// protect is closed. From here on the fd is only a covered-vnode
+		// waitForFSKitReady has confirmed the exact kernel mount for this attach
+		// around the policy's exact readiness witness: a retained, attested root
+		// descriptor for macOS 26, or a live resolved `portablefskit` connection
+		// for native macOS 27. The validate→mount window this fd exists to protect
+		// is closed. From here on the fd is only a covered-vnode
 		// reference, and the one thing it can still do is answer EBUSY to this
 		// mount's own unmount. Release it BEFORE readiness is reported, so no
 		// unmount request can ever race a live pin. See the pin's definition in
 		// runMountForeground.
 		releaseMountTargetPin()
-		// The mount is proven present and serving and nothing is in flight:
-		// the one sound moment to bind the daemon's repair root descriptor.
-		// Deriving it later would mean opening a path on this mount while a
-		// coherence barrier is closed, which asks the extension to serve a
-		// callback for the very repair it is waiting on.
-		if err := ctl.bindMountRoot(attachRef); err != nil {
-			return failAfterKernelMount(fmt.Errorf("bind the daemon's repair mount root: %w", err))
-		}
+		// Readiness already established the exact repair primitive for this
+		// policy. macOS 26 bound and retained the mount root descriptor inside
+		// attestReadiness; native macOS 27 proved a resolved FSKit frontend and
+		// must never path-open the mounted network volume from the background
+		// service. Do not add a second unconditional bind here.
 		// The daemon owns any configured automatic enrollment. In standalone
 		// mode it instead exposes the explicit manual reauthorization operation.
 		if len(attachReply.AuthorizationSessionID) != 22 {
@@ -2142,38 +2176,77 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	}
 }
 
-// waitForFSKitRoot waits for a kernel-visible mount whose root can answer a
-// real filesystem operation. mount(8) may return before the FSKit resource
-// has completed loading; reporting readiness in that gap makes the first
-// user operation fail even though the mount becomes usable moments later.
-func waitForFSKitRoot(mountPath, expectedFSType, expectedSource string, timeout time.Duration) error {
+// waitForFSKitReady waits for one exact kernel FSKit mount around the exact
+// readiness primitive declared by its cache policy. The initiating CLI never
+// opens the mounted path: macOS applies the requesting process's Network
+// Volumes privacy policy to that I/O. Legacy macOS 26 attests and retains the
+// root descriptor its VFS repair channel needs. Native macOS 27 instead proves
+// that the shipping FSKit frontend has a live, resolved connection for this
+// exact attach; the native DataCacheHandler policy has no root-descriptor
+// actuation channel.
+func waitForFSKitReady(
+	mountPath, expectedFSType, expectedSource string,
+	attestReadiness func() error,
+	timeout time.Duration,
+) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
-		if err := verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource); err != nil {
-			lastErr = err
-		} else {
-			remaining := time.Until(deadline)
-			if remaining > time.Second {
-				remaining = time.Second
-			}
-			if remaining > 0 {
-				if err := probeFSKitRootOnce(mountPath, remaining); err != nil {
-					lastErr = err
-				} else if err := verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource); err != nil {
-					lastErr = fmt.Errorf("kernel mount identity changed after root probe: %w", err)
-				} else {
-					return nil
-				}
-			}
+		retry, err := proveFSKitReadyOnce(
+			func() error {
+				return verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource)
+			},
+			attestReadiness,
+		)
+		if err == nil {
+			return nil
 		}
+		if !retry {
+			return err
+		}
+		lastErr = err
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf(
-				"FSKit mounted %s but its root did not become usable within %s: %w",
+				"FSKit mounted %s but policy readiness was not attested within %s: %w",
 				mountPath, timeout, lastErr,
 			)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// proveFSKitReadyOnce preserves the security-critical
+// kernel→policy-witness→kernel order. Once a witness succeeds, any identity
+// change is a mount substitution and fails immediately instead of retrying
+// against the replacement.
+func proveFSKitReadyOnce(verifyIdentity, attestReadiness func() error) (retry bool, err error) {
+	if err := verifyIdentity(); err != nil {
+		return true, err
+	}
+	if err := attestReadiness(); err != nil {
+		return true, fmt.Errorf("attest the exact FSKit frontend: %w", err)
+	}
+	if err := verifyIdentity(); err != nil {
+		return false, fmt.Errorf("kernel mount identity changed after readiness attestation: %w", err)
+	}
+	return false, nil
+}
+
+// fskitReadinessProbeForPolicy keeps the descriptor and native connection
+// channels disjoint. A native mount can never call bind-root; a legacy mount
+// can never treat a self/frontend connection witness as its repair actuator.
+func fskitReadinessProbeForPolicy(
+	cachePolicy string,
+	bindLegacyRoot func() error,
+	requireNativeFrontend func() error,
+) (func() error, error) {
+	switch cachePolicy {
+	case portablefsd.V3CachePolicyMacOS26V1, portablefsd.V3CachePolicyMacOS26:
+		return bindLegacyRoot, nil
+	case portablefsd.V3CachePolicyFSKit:
+		return requireNativeFrontend, nil
+	default:
+		return nil, fmt.Errorf("unsupported FSKit readiness policy %q", cachePolicy)
 	}
 }
 
@@ -3731,6 +3804,14 @@ func mountStatusWord(row mountStatusInput) string {
 }
 
 func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[string]cliAttachStatus, error) {
+	return fskitAttachStatusesForIdentity(getenv, cliVersion, nil)
+}
+
+func fskitAttachStatusesForIdentity(
+	getenv func(string) string,
+	cliVersion string,
+	expected *daemonctl.Identity,
+) (map[string]cliAttachStatus, error) {
 	cfg, err := fskitConfigFromEnv(getenv)
 	if err != nil {
 		return nil, err
@@ -3740,7 +3821,15 @@ func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[str
 	if !liveness.healthy() {
 		return nil, nil
 	}
-	ctl, err := connectCompatiblePortablefsd(cfg, cliVersion)
+	var ctl *fsdControl
+	if expected == nil {
+		ctl, err = connectCompatiblePortablefsd(cfg, cliVersion)
+	} else {
+		ctl = newFsdControl(cfg.controlSock)
+		if identityErr := ctl.requireExactIdentityWithin(*expected, 3*time.Second); identityErr != nil {
+			err = identityErr
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("portablefsd identity: %w", err)
 	}

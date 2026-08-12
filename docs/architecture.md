@@ -45,14 +45,19 @@ product stored elsewhere.
    no cached state at all. There is no asynchronous invalidation stream that a
    reader can outrun.
 
-6. **Shared writing uses filesystem semantics.** Atomic rename, POSIX record
-   locks, `flock`, and distinct files are the coordination primitives. PortableFS
-   does not merge file contents and does not invent a conflict resolution model.
+6. **Shared writing uses declared filesystem semantics.** Atomic rename,
+   authority-serialized exclusive create, and distinct files work across the
+   supported frontends. Linux additionally forwards POSIX record locks,
+   `flock`, and append intent to the authority. FSKit exposes none of those
+   callbacks, so macOS must not claim them. PortableFS does not merge file
+   contents or invent a conflict-resolution model to hide a platform gap.
 
-7. **One transport per platform, with no fallback.** Linux mounts through kernel
-   FUSE; macOS mounts through the FSKit extension and the `portablefsd` v3 data
-   plane. A host that cannot serve its platform's transport fails with guidance
-   rather than degrading to a weaker consistency model.
+7. **One transport per supported platform, with no fallback.** Linux mounts
+   through kernel FUSE; macOS mounts through the FSKit extension and the
+   `portablefsd` v3 data plane. Windows remains primitive-gated rather than
+   selecting a frontend that cannot forward locks or control caching exactly.
+   A host that cannot serve its platform's transport fails with guidance rather
+   than degrading to a weaker consistency model.
 
 8. **Unsupported is explicit.** Shared file-backed `mmap`, `setxattr`, device
    nodes, FIFOs, sockets, and cross-volume rename are refused with a real errno.
@@ -93,6 +98,7 @@ product stored elsewhere.
 | Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
 | macOS 26's declared cache policy and its open gates | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
 | How a macOS mount is established | [fskit-mount.md](./fskit-mount.md) |
+| Why Windows currently fails closed and what a native frontend must prove | [windows-mount.md](./windows-mount.md) |
 | Machine-local routing and its confinement boundary | [graft-security.md](./graft-security.md) |
 | What is actually verified, and how | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |
 | Compatibility and what can be pinned | [../COMPATIBILITY.md](../COMPATIBILITY.md) |

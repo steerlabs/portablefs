@@ -162,6 +162,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     }
 
     public let socketPath: String
+    private let socketDirectory: String
     private let configuration: Configuration
     private let serverFD: Int32
     private let fileSystem: MockFileSystem
@@ -176,10 +177,24 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
     public init(configuration: Configuration = Configuration()) throws {
         self.configuration = configuration
-        let suffix = UUID().uuidString.prefix(12)
-        self.socketPath = "/tmp/pfs-\(suffix).sock"
+        var template = Array("/tmp/pfs-mock.XXXXXX".utf8CString)
+        guard let created = Darwin.mkdtemp(&template) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let directory = String(cString: created)
+        self.socketDirectory = directory
+        self.socketPath = directory + "/pfs.sock"
         self.fileSystem = MockFileSystem(configuration: configuration)
-        self.serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+        do {
+            self.serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+            guard Darwin.chmod(socketPath, 0o600) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch {
+            unlink(socketPath)
+            rmdir(directory)
+            throw error
+        }
         let workItem = DispatchWorkItem { [weak self] in
             self?.acceptLoop()
         }
@@ -212,6 +227,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             session.close()
         }
         unlink(socketPath)
+        rmdir(socketDirectory)
     }
 
     public func dropConnections() {

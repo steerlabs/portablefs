@@ -20,25 +20,54 @@ private func strictV3Contract(
     return contract
 }
 
-@Test func volumeCoreSelectsOnlyTheDeclaredMacOS26CachePolicy() async throws {
-    // The macOS 26 compatibility policy is the one declared policy this build
-    // implements: resolve accepts it and records the terms the FSKit adapter
-    // composes its coherence stack from.
-    let strictDaemon = try PfsLocalMockDaemon(
-        configuration: .init(v3Coherence: strictV3Contract())
-    )
-    defer { strictDaemon.stop() }
-    let strict = try await VolumeCore.connect(
-        socketPath: strictDaemon.socketPath,
-        attachRef: "mock"
-    )
-    #expect(await strict.strictV3Contract?.cachePolicy == .synchronousVFSRepairV2)
-    #expect(await strict.strictV3ResolveReply?.hasV3Coherence == true)
-    await strict.shutdown()
+@Test func volumeCoreRequiresTheFrontendAdaptersExactDeclaredPolicySet() async throws {
+    // The shipping macOS 26 adapter preserves both frozen compatibility
+    // revisions. Resolve records only a declared member of that exact set.
+    for policy in [
+        PfsMacOSCachePolicy.synchronousVFSRepairV1,
+        .synchronousVFSRepairV2,
+    ] {
+        let strictDaemon = try PfsLocalMockDaemon(
+            configuration: .init(v3Coherence: strictV3Contract(
+                policy: policy.rawValue
+            ))
+        )
+        defer { strictDaemon.stop() }
+        let strict = try await VolumeCore.connect(
+            socketPath: strictDaemon.socketPath,
+            attachRef: "mock"
+        )
+        #expect(await strict.strictV3Contract?.cachePolicy == policy)
+        #expect(await strict.strictV3ResolveReply?.hasV3Coherence == true)
+        await strict.shutdown()
+    }
 
-    // The native macOS 27 policy stays gated on the final SDK, and an unknown
-    // policy string is a contract this build cannot honor. Both fail closed
-    // with the same close-first ENOTSUP discipline — never a silent fallback.
+    // A future SDK-27 adapter may name the native policy explicitly. This
+    // admits only the local contract; it does not enable that adapter or claim
+    // the kernel cache matrix has passed.
+    let nativeDaemon = try PfsLocalMockDaemon(
+        configuration: .init(v3Coherence: strictV3Contract(
+            policy: PfsMacOSCachePolicy.nativeFSKitRevocationV1.rawValue
+        ))
+    )
+    defer { nativeDaemon.stop() }
+    let native = try await VolumeCore.connect(
+        socketPath: nativeDaemon.socketPath,
+        attachRef: "mock",
+        supportedCachePolicies: [.nativeFSKitRevocationV1]
+    )
+    #expect(await native.strictV3Contract?.cachePolicy == .nativeFSKitRevocationV1)
+    // Policy parsing is not production wiring. The shipping macOS 26 volume
+    // composition must still refuse this core until the SDK-27 target supplies
+    // its own native revoker and Handler adapter.
+    await #expect(throws: PfsMacOSCoherenceError.unsupportedRepair) {
+        _ = try await PortableFSVolume.make(core: native, attachRef: "mock")
+    }
+    await native.shutdown()
+
+    // The current macOS 26 adapter still refuses native, and an unknown policy
+    // is a contract no adapter can honor. Both fail closed with the same
+    // close-first ENOTSUP discipline — never a silent fallback.
     for refusedPolicy in [
         PfsMacOSCachePolicy.nativeFSKitRevocationV1.rawValue,
         "automatic"
@@ -57,6 +86,24 @@ private func strictV3Contract(
             #expect(error == .v3CoherenceIntegrationUnavailable)
             #expect(error.posixErrno == ENOTSUP)
         }
+    }
+
+    // Native selection is equally exact in the other direction. It cannot
+    // reinterpret a macOS 26 attach as its own policy.
+    let compatibilityDaemon = try PfsLocalMockDaemon(
+        configuration: .init(v3Coherence: strictV3Contract())
+    )
+    defer { compatibilityDaemon.stop() }
+    do {
+        _ = try await VolumeCore.connect(
+            socketPath: compatibilityDaemon.socketPath,
+            attachRef: "mock",
+            supportedCachePolicies: [.nativeFSKitRevocationV1]
+        )
+        Issue.record("expected native adapter policy selection to be exact")
+    } catch let error as PfsLocalClientError {
+        #expect(error == .v3CoherenceIntegrationUnavailable)
+        #expect(error.posixErrno == ENOTSUP)
     }
 
     // Legacy resolves continue through the exact same production entry point.

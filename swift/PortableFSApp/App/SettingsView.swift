@@ -7,7 +7,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Mount Runtime") {
-                Text("The signed portablefs CLI inside this app owns mounts, daemon state, and lifecycle coordination. This app presents that state and drives unmount, reconciliation, and the per-user daemon.")
+                Text("launchd supervises the signed per-user PortableFS daemon. The bundled portablefs CLI owns mount lifecycle state; this app presents that state and drives unmount and reconciliation.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 LabeledContent("PortableFS", value: model.cliVersion ?? "—")

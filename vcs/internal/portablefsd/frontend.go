@@ -55,11 +55,15 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 }
 
 type frontendConn struct {
-	srv     *Server
-	conn    net.Conn
-	origin  uint64
-	connCtx context.Context
-	cancel  context.CancelFunc
+	srv    *Server
+	conn   net.Conn
+	origin uint64
+	// helloClientName is frozen by the one accepted Hello frame. It is used
+	// only to distinguish the shipping FSKit frontend from daemon self-probes;
+	// the app-group socket remains the peer authorization boundary.
+	helloClientName string
+	connCtx         context.Context
+	cancel          context.CancelFunc
 
 	writeMu sync.Mutex
 
@@ -282,6 +286,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				c.errorReply(env.RequestID, darwinEINVAL, "unsupported protocol version")
 				return
 			}
+			c.helloClientName = req.ClientName
 			c.reply(env.RequestID, &pfslocal.HelloReply{
 				ProtocolMajor:     pfslocal.ProtocolMajor,
 				ProtocolMinor:     pfslocal.ProtocolMinor,
@@ -307,7 +312,10 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			state = frontendAttached
-			c.reply(env.RequestID, &rep)
+			if c.reply(env.RequestID, &rep) &&
+				c.helloClientName == nativeFSKitFrontendClientName {
+				a.registerNativeFrontendWitness(c)
+			}
 		default:
 			if state != frontendAttached {
 				return
@@ -400,6 +408,12 @@ func (c *frontendConn) serve(ctx context.Context) {
 
 func (c *frontendConn) close() {
 	c.closeOnce.Do(func() {
+		// A closing transport is not a live native FSKit witness. Retire the
+		// witness before any handler join or publication cleanup can block, so
+		// mount readiness never observes a connection whose teardown has begun.
+		if a := c.currentAttach(); a != nil {
+			a.removeNativeFrontendWitness(c)
+		}
 		// A resource-bearing reply remains owned by this connection until the
 		// VolumeCore ownership disposition arrives. Once the connection is gone no
 		// such verdict can arrive, so every provisional handle/item is abandoned.
@@ -543,8 +557,8 @@ func (c *frontendConn) write(env *pfslocal.Envelope) error {
 	return pfslocal.WriteFrame(c.conn, env)
 }
 
-func (c *frontendConn) reply(req uint64, body any) {
-	c.replyWithPublication(req, 0, body, false)
+func (c *frontendConn) reply(req uint64, body any) bool {
+	return c.replyWithPublication(req, 0, body, false)
 }
 
 func resourceBearingV3Reply(body any, collected *v3ReplyResourceCollector) (bool, error) {
