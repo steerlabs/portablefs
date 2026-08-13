@@ -118,6 +118,7 @@ private func nextV3Event(
     }
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func v3ContractParsingAcceptsOnlyCompleteValidatedTerms() throws {
     let complete = v3Cursor(sequence: 12, phase: .complete)
     let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(
@@ -935,7 +936,6 @@ private func nextV3Event(
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
 }
-
 @Test func strictV3PeriodicLivenessMismatchTerminatesWithoutReconnectOrSync() async throws {
     let contract = v3Contract(repairBudgetMillis: 60)
     let daemon = try PfsLocalMockDaemon(configuration: .init(
@@ -974,4 +974,5 @@ private func nextV3Event(
     await #expect(throws: PfsLocalClientError.shutdown) {
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
+}
 }

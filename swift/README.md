@@ -85,19 +85,17 @@ The canonical command, from the repository root:
 
 ```sh
 swift build --package-path swift/PortableFSKit
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh # from the repository root
 ```
 
-**`--no-parallel` is required, not a tuning choice.** Swift Testing can run
-cases concurrently inside one SwiftPM worker. Several tests share process
-resources — sockets, mount points, the app-group container — or exercise hard
-protocol deadlines, so the corpus must run serially. The same command appears in `AGENTS.md`,
-`scripts/verify-local.sh`, the root `README.md`, and the `swift` job in
-`.github/workflows/ci.yml`.
+The native gate separately enumerates the package, executes one Xcode test
+process, and proves exact equality with the unique all-passing xcresult leaves.
+Socket-backed integration tests declare their process-wide resource constraint
+with a serialized Swift Testing suite. Pure value and protocol tests remain
+parallel within the process.
 
-The suite is swift-testing, not XCTest, so a passing run ends with a line of the
-form `Test run with N tests in 0 suites passed`. It currently reports **186
-tests**, covering the pfslocal transport and wire goldens, the Operations
+The suite is swift-testing, not XCTest. It currently reports **361 tests**,
+covering the pfslocal transport and wire goldens, the Operations
 adapter and its open-handle lifecycle, attribute and error mapping, enumeration
 paging, write acknowledgement, and the macOS 26 coherence stack (namespace and
 live-object indexes, the publication barrier, the repair gate and authenticator,

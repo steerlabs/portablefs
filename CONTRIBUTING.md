@@ -32,7 +32,7 @@ go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
 
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh # macOS: authoritative native Swift gate
 ```
 
 The daemon, the mount clients, and the frontend adapters carry per-`GOOS` files,
@@ -45,10 +45,10 @@ GOOS=darwin go -C vcs build ./...
 GOOS=linux go -C vcs vet ./...
 ```
 
-`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
-Testing can otherwise run cases concurrently inside one SwiftPM worker.
-Several tests share process resources — sockets, mount points, the app-group
-container — or exercise hard protocol deadlines, so they must run serially.
+The native gate runs one Xcode test process and proves exact equality between
+the enumerated inventory and the all-passing xcresult. Socket-backed integration
+tests declare their process-wide resource constraint with a serialized Swift
+Testing suite; pure tests remain parallel.
 
 ## The Local Gate
 
@@ -67,9 +67,8 @@ runner execute the same steps:
    syscalls, sockets, and mounts, so they are only meaningful on the host
    platform.
 4. **Native Go race suite** — `go -C vcs test -race ./...`.
-5. **Swift suite** — `swift test --package-path swift/PortableFSKit
-   --no-parallel`. Skipped loudly, with a printed `SKIP`, when the host has no
-   Swift toolchain.
+5. **Swift suite** — `bash scripts/test-swift-xcode.sh`. Skipped loudly, with a
+   printed `SKIP`, on non-macOS hosts; the required macOS CI lane runs it.
 6. **Release-trust policy** — a `sh -n` syntax check of `scripts/install.sh`,
    the workflow action-pin checker, and the installer release-trust checker.
 7. **Stale-architecture scan** — an `rg` pass that fails the gate if the deleted

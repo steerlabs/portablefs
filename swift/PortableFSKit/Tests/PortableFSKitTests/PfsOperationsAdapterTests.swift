@@ -206,6 +206,7 @@ private func makeAdapterHarness(
     return AdapterHarness(daemon: daemon, core: core, volume: volume, root: root)
 }
 
+extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func enumerationTransfersOnlyTheExactPackedItemPrefix() async throws {
     let harness = try await makeAdapterHarness()
@@ -1644,4 +1645,5 @@ private func adapterErrno(
         #expect(Set(names) == expected.union([".", ".."]), "packer capacity \(capacity) lost or repeated entries")
         #expect(Set(names).count == names.count, "packer capacity \(capacity) repeated an entry")
     }
+}
 }

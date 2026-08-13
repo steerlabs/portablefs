@@ -44,6 +44,7 @@ private func payload(_ count: Int, seed: UInt8) -> Data {
 /// three daemon write requests inside one `VolumeCore.write`.
 private let chunkBytes = 1 << 20
 
+extension PfsLocalMockDaemonTests {
 @Test func committedChunksSurviveALaterChunksFailure() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -118,4 +119,5 @@ private let chunkBytes = 1 << 20
     )
     let readBack = try await core.read(item: file.item, offset: 0, length: UInt32(short) + 16)
     #expect(readBack.count == short)
+}
 }

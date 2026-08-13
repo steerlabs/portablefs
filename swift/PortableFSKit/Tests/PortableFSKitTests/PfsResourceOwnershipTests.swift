@@ -44,6 +44,7 @@ private func waitForAcceptedItemCounts(
     return stats
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func partialEnumerationPrefixPreservesDuplicateHardLinkOccurrences() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -149,4 +150,5 @@ private func waitForAcceptedItemCounts(
     #expect(stats.enumerateRequests == 3)
     #expect(stats.resourceAcceptedItemCounts.filter { $0 > 0 }.sorted() == [44, 128, 128])
     #expect(await core.testingDebugState().itemCount == 301)
+}
 }

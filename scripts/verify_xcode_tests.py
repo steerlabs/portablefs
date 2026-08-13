@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 from collections import Counter
 from typing import Any
@@ -14,6 +15,8 @@ from typing import Any
 TEST_URL_PREFIX = "test://com.apple.xcode/PortableFSKit/"
 EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests"})
 MAX_JSON_BYTES = 16 * 1024 * 1024
+SUITE_COMPONENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+TEST_COMPONENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(\)\Z")
 
 
 class VerificationError(ValueError):
@@ -42,6 +45,22 @@ def load_json(path: pathlib.Path) -> Any:
         raise VerificationError(f"cannot decode {path}: {exc}") from exc
 
 
+def parse_test_identifier(identifier: Any, *, source: str) -> tuple[str, ...]:
+    if not isinstance(identifier, str):
+        raise VerificationError(f"invalid {source} test identifier: {identifier!r}")
+    components = tuple(identifier.split("/"))
+    if len(components) < 2:
+        raise VerificationError(f"invalid {source} test identifier: {identifier!r}")
+    module, *suites, test = components
+    if module not in EXPECTED_TEST_MODULES:
+        raise VerificationError(f"unexpected {source} test module: {module!r}")
+    if any(SUITE_COMPONENT.fullmatch(suite) is None for suite in suites):
+        raise VerificationError(f"invalid {source} test suite path: {identifier!r}")
+    if TEST_COMPONENT.fullmatch(test) is None:
+        raise VerificationError(f"invalid {source} test case: {identifier!r}")
+    return components
+
+
 def parse_enumeration(document: Any) -> tuple[str, ...]:
     if not isinstance(document, dict):
         raise VerificationError("Xcode enumeration root is not a dictionary")
@@ -64,11 +83,7 @@ def parse_enumeration(document: Any) -> tuple[str, ...]:
             if not isinstance(test, dict):
                 raise VerificationError("Xcode enumeration contains a non-dictionary test")
             identifier = test.get("identifier")
-            if not isinstance(identifier, str) or identifier.count("/") != 1:
-                raise VerificationError(f"invalid enumerated test identifier: {identifier!r}")
-            module, name = identifier.split("/", 1)
-            if module not in EXPECTED_TEST_MODULES or not name.endswith("()"):
-                raise VerificationError(f"unexpected enumerated test identifier: {identifier}")
+            parse_test_identifier(identifier, source="enumerated")
             identifiers.append(identifier)
 
     if not identifiers:
@@ -94,7 +109,9 @@ def _walk_test_cases(value: Any, cases: list[tuple[str, str]]) -> None:
                 raise VerificationError(f"unexpected Xcode test URL: {url!r}")
             if not isinstance(result, str):
                 raise VerificationError(f"test {url} has no string result")
-            cases.append((url.removeprefix(TEST_URL_PREFIX), result))
+            identifier = url.removeprefix(TEST_URL_PREFIX)
+            parse_test_identifier(identifier, source="result")
+            cases.append((identifier, result))
         for child in value.values():
             _walk_test_cases(child, cases)
     elif isinstance(value, list):

@@ -82,7 +82,7 @@ echo "test-swift-xcode: Xcode-native enumeration ($destination)"
 )
 python3 "$repo_root/scripts/verify_xcode_tests.py" --enumeration "$enumeration"
 
-echo "test-swift-xcode: Xcode-native serial execution"
+echo "test-swift-xcode: Xcode-native single-process execution"
 set +e
 (
   cd "$package_path"

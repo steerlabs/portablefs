@@ -233,47 +233,38 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     }
 
     public let socketPath: String
-    private let socketDirectory: String
-    private let configuration: Configuration
-    private let serverFD: Int32
     private let fileSystem: MockFileSystem
-    private let sessionLock = NSLock()
-    private var sessions: [Int32: MockSession] = [:]
-    private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .userInitiated)
-    private let clientQueue = DispatchQueue(label: "dev.portablefs.mock.client", qos: .userInitiated, attributes: .concurrent)
-    private let acceptGroup = DispatchGroup()
-    private let clientGroup = DispatchGroup()
-    private let requests = PfsMockRequestRegistry()
-    private let lifecycleLock = NSLock()
-    private var acceptWorkItem: DispatchWorkItem?
-    private var stopped = false
+    private let runtime: PfsMockDaemonRuntime
 
     public init(configuration: Configuration = Configuration()) throws {
-        self.configuration = configuration
         var template = Array("/tmp/pfs-mock.XXXXXX".utf8CString)
         guard let created = Darwin.mkdtemp(&template) else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         let directory = String(cString: created)
-        self.socketDirectory = directory
         self.socketPath = directory + "/pfs.sock"
         self.fileSystem = MockFileSystem(configuration: configuration)
+        let serverFD: Int32
         do {
-            self.serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+            let boundFD = try PfsUnixSocket.bindAndListen(path: socketPath)
             guard Darwin.chmod(socketPath, 0o600) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                let failure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                PfsUnixSocket.close(boundFD)
+                throw failure
             }
+            serverFD = boundFD
         } catch {
             unlink(socketPath)
             rmdir(directory)
             throw error
         }
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.acceptLoop()
-        }
-        self.acceptWorkItem = workItem
-        self.acceptGroup.enter()
-        self.acceptQueue.async(execute: workItem)
+        self.runtime = PfsMockDaemonRuntime(
+            serverFD: serverFD,
+            socketPath: socketPath,
+            socketDirectory: directory,
+            fileSystem: fileSystem
+        )
+        runtime.start()
     }
 
     deinit {
@@ -281,39 +272,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     }
 
     public func stop() {
-        lifecycleLock.lock()
-        guard !stopped else {
-            lifecycleLock.unlock()
-            return
-        }
-        stopped = true
-        lifecycleLock.unlock()
-
-        acceptWorkItem?.cancel()
-        if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
-            PfsUnixSocket.close(wakeFD)
-        }
-        // The wake connection makes accept return. This is an ownership join,
-        // not a best-effort timeout: cleanup must not race an accept that can
-        // still publish a new session.
-        acceptGroup.wait()
-        for session in sessionSnapshot() {
-            session.close()
-        }
-        // Closing each peer interrupts its blocking reader. Once all readers
-        // have left, no new protocol task can enter the request registry.
-        clientGroup.wait()
-        requests.cancelAndWait()
-        Darwin.shutdown(serverFD, SHUT_RDWR)
-        PfsUnixSocket.close(serverFD)
-        unlink(socketPath)
-        rmdir(socketDirectory)
+        runtime.stop()
     }
 
     public func dropConnections() {
-        for session in sessionSnapshot() {
-            session.close()
-        }
+        runtime.dropConnections()
     }
 
     /// Causes the next daemon close request to fail before releasing its
@@ -433,7 +396,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.requestID = 0
         envelope.body = .event(event)
 
-        for session in sessionSnapshot() where session.isSubscribed {
+        for session in runtime.sessionSnapshot() where session.isSubscribed {
             session.send(envelope)
         }
     }
@@ -449,7 +412,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.requestID = 0
         envelope.body = .event(event)
 
-        for session in sessionSnapshot() where session.isSubscribed {
+        for session in runtime.sessionSnapshot() where session.isSubscribed {
             session.send(envelope)
         }
     }
@@ -466,7 +429,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.requestID = 0
         envelope.body = .event(event)
 
-        for session in sessionSnapshot() where session.isSubscribed {
+        for session in runtime.sessionSnapshot() where session.isSubscribed {
             session.send(envelope)
         }
     }
@@ -496,17 +459,101 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     /// lifecycle regression prove shutdown while real backpressure exists,
     /// rather than assuming a particular kernel socket-buffer size.
     func testingPendingResponseCount() -> Int {
-        sessionSnapshot().reduce(0) { $0 + $1.pendingResponseCount }
+        runtime.sessionSnapshot().reduce(0) { $0 + $1.pendingResponseCount }
+    }
+
+}
+
+/// Owns every blocking worker independently of the public daemon object.
+///
+/// A dispatch closure that calls a long-running instance method retains that
+/// instance for the entire call, even when the closure captured it weakly.
+/// Keeping the worker graph in this runtime lets `PfsLocalMockDaemon.deinit`
+/// synchronously stop and join the graph instead of being retained by it.
+private final class PfsMockDaemonRuntime: @unchecked Sendable {
+    private let serverFD: Int32
+    private let socketPath: String
+    private let socketDirectory: String
+    private let fileSystem: MockFileSystem
+    private let sessionLock = NSLock()
+    private var sessions: [Int32: MockSession] = [:]
+    private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .userInitiated)
+    private let clientQueue = DispatchQueue(
+        label: "dev.portablefs.mock.client",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private let acceptGroup = DispatchGroup()
+    private let clientGroup = DispatchGroup()
+    private let requests = PfsMockRequestRegistry()
+    private let lifecycleLock = NSLock()
+    private var started = false
+    private var stopped = false
+
+    init(
+        serverFD: Int32,
+        socketPath: String,
+        socketDirectory: String,
+        fileSystem: MockFileSystem
+    ) {
+        self.serverFD = serverFD
+        self.socketPath = socketPath
+        self.socketDirectory = socketDirectory
+        self.fileSystem = fileSystem
+    }
+
+    func start() {
+        lifecycleLock.lock()
+        precondition(!started && !stopped)
+        started = true
+        acceptGroup.enter()
+        lifecycleLock.unlock()
+        acceptQueue.async { [runtime = self] in
+            defer { runtime.acceptGroup.leave() }
+            runtime.acceptLoop()
+        }
+    }
+
+    func stop() {
+        lifecycleLock.lock()
+        guard !stopped else {
+            lifecycleLock.unlock()
+            return
+        }
+        stopped = true
+        lifecycleLock.unlock()
+
+        if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
+            PfsUnixSocket.close(wakeFD)
+        }
+        // The wake connection makes accept return. This is an ownership join,
+        // not a best-effort timeout: cleanup must not race an accept that can
+        // still publish a new session.
+        acceptGroup.wait()
+        for session in sessionSnapshot() {
+            session.close()
+        }
+        // Closing each peer interrupts its blocking reader. Once all readers
+        // have left, no new protocol task can enter the request registry.
+        clientGroup.wait()
+        requests.cancelAndWait()
+        Darwin.shutdown(serverFD, SHUT_RDWR)
+        PfsUnixSocket.close(serverFD)
+        unlink(socketPath)
+        rmdir(socketDirectory)
+    }
+
+    func dropConnections() {
+        for session in sessionSnapshot() {
+            session.close()
+        }
     }
 
     private func acceptLoop() {
-        defer {
-            acceptGroup.leave()
-        }
-        while !isStopped && acceptWorkItem?.isCancelled != true {
+        while !isStopped {
             do {
                 let clientFD = try PfsUnixSocket.accept(serverFD)
-                if isStopped || acceptWorkItem?.isCancelled == true {
+                if isStopped {
                     PfsUnixSocket.close(clientFD)
                     return
                 }
@@ -565,7 +612,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         sessionLock.unlock()
     }
 
-    private func sessionSnapshot() -> [MockSession] {
+    func sessionSnapshot() -> [MockSession] {
         sessionLock.lock()
         let snapshot = Array(sessions.values)
         sessionLock.unlock()

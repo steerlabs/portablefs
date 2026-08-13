@@ -165,6 +165,7 @@ private func waitUntil(
     return await condition()
 }
 
+extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func nativeDataCacheUpgradePublishesAfterTheRealReplyReturns() async throws {
     let harness = try await makeWiringHarness(
@@ -829,10 +830,13 @@ private func expectEIO(_ error: any Error) {
         == [.removeSource])
 }
 
+}
+
 private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0x66, count: 16))
 
 // MARK: - Publication barrier
 
+extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func barrierClosesAdmissionAtPrepareAndReopensAfterPeerCompleteAck() async throws {
     let harness = try await makeWiringHarness(cachePolicy: .synchronousVFSRepairV2)
@@ -1266,4 +1270,5 @@ private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3Cohere
 
     // The mount keeps serving after the barrier.
     _ = try await volume.lookupItem(named: FSFileName(string: "wired"), inDirectory: root)
+}
 }

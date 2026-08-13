@@ -65,6 +65,7 @@ private func drainLocalEvent(
     )
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func callbackAdmissionDiagnosticSummaryContainsNoIdentityOrNameMaterial() throws {
     let parent = try PfsMacOSStableIdentity(Data(repeating: 0x73, count: 16))
     let rawName = Data("private-callback-name".utf8)
@@ -2014,4 +2015,5 @@ private actor DrainPublicationGate {
     try await prepare.value
     #expect(await prepared.value())
     await barrier.published(disjoint)
+}
 }
