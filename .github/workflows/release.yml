@@ -207,14 +207,6 @@ jobs:
     needs: [validate, goreleaser]
     runs-on: macos-26
     environment: release
-    env:
-      PORTABLEFS_DEVELOPMENT_KEYCHAIN: ${{ runner.temp }}/portablefs-development.keychain-db
-      PORTABLEFS_SIGNING_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db
-      PORTABLEFS_NOTARY_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db
-      PORTABLEFS_DEVELOPMENT_P12_PATH: ${{ runner.temp }}/portablefs-apple-development.p12
-      PORTABLEFS_DISTRIBUTION_P12_PATH: ${{ runner.temp }}/portablefs-developer-id.p12
-      PORTABLEFS_DEVELOPER_ID_PROFILE_PATH: ${{ runner.temp }}/portablefs-fskit-developer-id.provisionprofile
-      PORTABLEFS_APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_portablefs_release.p8
     permissions:
       contents: write # upload the notarized app to the draft release
     steps:
@@ -239,6 +231,11 @@ jobs:
 
       - name: Import exact archive and distribution identities
         env:
+          PORTABLEFS_DEVELOPMENT_KEYCHAIN: ${{ runner.temp }}/portablefs-development.keychain-db
+          PORTABLEFS_SIGNING_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db
+          PORTABLEFS_DEVELOPMENT_P12_PATH: ${{ runner.temp }}/portablefs-apple-development.p12
+          PORTABLEFS_DISTRIBUTION_P12_PATH: ${{ runner.temp }}/portablefs-developer-id.p12
+          PORTABLEFS_DEVELOPER_ID_PROFILE_PATH: ${{ runner.temp }}/portablefs-fskit-developer-id.provisionprofile
           DEVELOPMENT_P12_BASE64: ${{ secrets.PORTABLEFS_APPLE_DEVELOPMENT_P12_BASE64 }}
           DEVELOPMENT_P12_PASSWORD: ${{ secrets.PORTABLEFS_APPLE_DEVELOPMENT_P12_PASSWORD }}
           DEVELOPER_ID_P12_BASE64: ${{ secrets.PORTABLEFS_DEVELOPER_ID_P12_BASE64 }}
@@ -361,6 +358,8 @@ jobs:
 
       - name: Configure App Store Connect API key
         env:
+          PORTABLEFS_SIGNING_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db
+          PORTABLEFS_APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_portablefs_release.p8
           API_KEY_BASE64: ${{ secrets.PORTABLEFS_APPLE_API_KEY_P8_BASE64 }}
           API_KEY_ID: ${{ secrets.PORTABLEFS_APPLE_API_KEY_ID }}
           API_ISSUER_ID: ${{ secrets.PORTABLEFS_APPLE_API_ISSUER_ID }}
@@ -373,11 +372,14 @@ jobs:
             --key-id "$API_KEY_ID" \
             --issuer "$API_ISSUER_ID" \
             --keychain "$PORTABLEFS_SIGNING_KEYCHAIN"
-          printf 'PORTABLEFS_APPLE_API_KEY_ID=%s\n' "$API_KEY_ID" >>"$GITHUB_ENV"
-          printf 'PORTABLEFS_APPLE_API_ISSUER_ID=%s\n' "$API_ISSUER_ID" >>"$GITHUB_ENV"
 
       - name: Build, sign, notarize, staple, and verify PortableFS.app
         env:
+          PORTABLEFS_NOTARY_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db
+          PORTABLEFS_DEVELOPER_ID_PROFILE_PATH: ${{ runner.temp }}/portablefs-fskit-developer-id.provisionprofile
+          PORTABLEFS_APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_portablefs_release.p8
+          PORTABLEFS_APPLE_API_KEY_ID: ${{ secrets.PORTABLEFS_APPLE_API_KEY_ID }}
+          PORTABLEFS_APPLE_API_ISSUER_ID: ${{ secrets.PORTABLEFS_APPLE_API_ISSUER_ID }}
           PORTABLEFS_RELEASE: "1"
           PORTABLEFS_UNSIGNED: "0"
           PORTABLEFS_DEVELOPER_ID_EXPORT: "1"
@@ -385,7 +387,8 @@ jobs:
           PORTABLEFS_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          export PORTABLEFS_GO="$(realpath "$(command -v go)")"
+          portablefs_go="$(realpath "$(command -v go)")"
+          export PORTABLEFS_GO="$portablefs_go"
           scripts/package-macos-app.sh "${GITHUB_REF_NAME#v}"
 
       - name: Upload notarized app
@@ -399,6 +402,13 @@ jobs:
 
       - name: Remove ephemeral signing keychain
         if: always()
+        env:
+          PORTABLEFS_DEVELOPMENT_KEYCHAIN: ${{ runner.temp }}/portablefs-development.keychain-db
+          PORTABLEFS_SIGNING_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db
+          PORTABLEFS_DEVELOPMENT_P12_PATH: ${{ runner.temp }}/portablefs-apple-development.p12
+          PORTABLEFS_DISTRIBUTION_P12_PATH: ${{ runner.temp }}/portablefs-developer-id.p12
+          PORTABLEFS_DEVELOPER_ID_PROFILE_PATH: ${{ runner.temp }}/portablefs-fskit-developer-id.provisionprofile
+          PORTABLEFS_APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_portablefs_release.p8
         run: |
           set -euo pipefail
           cleanup_status=0

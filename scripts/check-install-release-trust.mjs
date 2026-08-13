@@ -339,8 +339,13 @@ requireText(
 );
 requireText(
   workflow,
-  'export PORTABLEFS_GO="$(realpath "$(command -v go)")"',
+  'portablefs_go="$(realpath "$(command -v go)")"',
   "release workflow exact Go compiler input"
+);
+requireText(
+  workflow,
+  'export PORTABLEFS_GO="$portablefs_go"',
+  "release workflow exports its already-proven exact Go compiler input"
 );
 requireText(
   installer,

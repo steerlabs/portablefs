@@ -13,17 +13,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Supply-chain and release-trust policy. Both scripts are dependency-free
-  # single-file node programs (the repository has no JavaScript packages), so
-  # they run against the runner's preinstalled node with no install step.
+  # Supply-chain, workflow-semantics, and release-trust policy. The repository
+  # checks its offline policy first, then actionlint validates GitHub's complete
+  # workflow schema/context contract before any product gate can merge.
   workflow-pins:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
       - name: Enforce workflow pin policy (SHA pins, versioned runners, permissions)
         run: node scripts/check-workflow-pins.mjs .github/workflows
+      - name: Validate GitHub Actions workflow semantics
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/actionlint-bin" \
+            go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.10
+          "$RUNNER_TEMP/actionlint-bin/actionlint" .github/workflows/*.yml
       - name: Enforce installer/release trust policy
         run: |
           set -euo pipefail

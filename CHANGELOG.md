@@ -26,6 +26,9 @@ this file is the human-curated summary.
 - Verify universal release binaries one architecture at a time so the same
   packaging contract is accepted by both the Xcode 26 and Xcode 27 `lipo`
   implementations.
+- Validate every GitHub Actions workflow with a version-frozen semantic parser
+  in pull requests, including context-availability and shell diagnostics that
+  the repository's offline pin/trust checks deliberately do not reimplement.
 
 ## [0.2.4] - 2026-08-12
 
