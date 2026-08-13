@@ -388,9 +388,23 @@ if (/PORTABLEFS_EXPECTED_/.test(canonicalPolicy)) {
 }
 
 const attestationIndex = installer.indexOf('"$tmp/gh" attestation verify');
-const extractionIndex = installer.indexOf('tar -xzf "$tmp/$archive"');
-if (attestationIndex < 0 || extractionIndex < 0 || attestationIndex >= extractionIndex) {
+const cliExtractionIndex = installer.indexOf(
+  'tar -xOzf "$tmp/$archive" "$BINARY" >"$tmp/$BINARY"'
+);
+const daemonExtractionIndex = installer.indexOf(
+  'tar -xOzf "$tmp/$archive" "$DAEMON" >"$tmp/$DAEMON"'
+);
+if (
+  attestationIndex < 0 ||
+  cliExtractionIndex < 0 ||
+  daemonExtractionIndex < 0 ||
+  attestationIndex >= cliExtractionIndex ||
+  cliExtractionIndex >= daemonExtractionIndex
+) {
   failures.push("PortableFS archive extraction can happen before provenance verification");
+}
+if (installer.includes('tar -xzf "$tmp/$archive"')) {
+  failures.push("PortableFS archive extraction can materialize untrusted archive ownership metadata");
 }
 for (const archiveContract of [
   "id: portablefs-client",
@@ -408,6 +422,8 @@ for (const exactMemberCheck of [
   'printf \'%s\\n\' "$BINARY" "$DAEMON"',
   "does not contain exactly the PortableFS CLI/daemon pair",
   "contains a link, special entry, or duplicate binary",
+  'tar -xOzf "$tmp/$archive" "$BINARY" >"$tmp/$BINARY"',
+  'tar -xOzf "$tmp/$archive" "$DAEMON" >"$tmp/$DAEMON"',
 ]) {
   requireText(installer, exactMemberCheck, `exact installer archive membership check ${exactMemberCheck}`);
 }
