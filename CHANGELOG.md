@@ -10,6 +10,16 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-12
+
+### Fixed
+
+- Make Linux archive extraction account-owned by construction. After the
+  installer verifies provenance and proves the archive is exactly two regular
+  files, it streams each named member into its private staging directory
+  instead of materializing tar uid/gid metadata. This gives root and non-root
+  installations the same fail-closed ownership contract.
+
 ## [0.2.5] - 2026-08-12
 
 ### Fixed

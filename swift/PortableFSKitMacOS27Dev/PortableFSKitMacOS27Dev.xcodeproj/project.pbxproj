@@ -394,7 +394,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 0.2.5;
+				MARKETING_VERSION = 0.2.6;
 				INFOPLIST_KEY_CFBundleDisplayName = "PortableFS OSS Dev";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev;
 				PRODUCT_NAME = PortableFSKitDev;
@@ -421,7 +421,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 0.2.5;
+				MARKETING_VERSION = 0.2.6;
 				INFOPLIST_KEY_CFBundleDisplayName = "PortableFS OSS Dev";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev;
 				PRODUCT_NAME = PortableFSKitDev;
@@ -448,7 +448,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 0.2.5;
+				MARKETING_VERSION = 0.2.6;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev.PortableFSDev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -476,7 +476,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 0.2.5;
+				MARKETING_VERSION = 0.2.6;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev.PortableFSDev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;

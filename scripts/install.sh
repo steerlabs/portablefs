@@ -621,10 +621,16 @@ awk -v cli="$BINARY" -v daemon="$DAEMON" '
 ' "$tmp/portablefs-member-types.txt" ||
   die "$archive contains a link, special entry, or duplicate binary"
 
-# Extract the exact CLI/daemon pair (the CLI resolves portablefsd as a sibling
-# on the mount path).
-tar -xzf "$tmp/$archive" -C "$tmp" "$BINARY" "$DAEMON" 2>/dev/null ||
-  die "could not extract $BINARY and $DAEMON from $archive"
+# Stream each already-proven regular member into the installer's private
+# staging directory. Redirection creates both leaves as the invoking account;
+# archive uid/gid metadata can therefore never cross the trust boundary (tar
+# may otherwise preserve it when the installer is run by root). Materializing
+# the archive namespace is unnecessary because the exact two-member/type gate
+# above has already rejected duplicates, links, special files, and extra paths.
+tar -xOzf "$tmp/$archive" "$BINARY" >"$tmp/$BINARY" ||
+  die "could not extract $BINARY from $archive"
+tar -xOzf "$tmp/$archive" "$DAEMON" >"$tmp/$DAEMON" ||
+  die "could not extract $DAEMON from $archive"
 [ -f "$tmp/$BINARY" ] && [ ! -L "$tmp/$BINARY" ] ||
   die "$archive does not contain a real non-symlink $BINARY binary"
 [ -f "$tmp/$DAEMON" ] && [ ! -L "$tmp/$DAEMON" ] ||
