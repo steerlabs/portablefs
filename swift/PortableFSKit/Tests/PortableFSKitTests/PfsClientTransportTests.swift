@@ -1008,6 +1008,27 @@ private func waitForTransportPublicationAcks(
     return await daemon.stats()
 }
 
+/// PublicationAck is also a one-way serial-reader transition. A subsequent
+/// ordinary reply is therefore an exact acknowledgement barrier, not a timing
+/// hint. Suspending the ack makes the former detached-dispatch model allow
+/// Statfs to reply while the operation was still unacknowledged.
+@Test func publicationAckPrecedesFollowingOrdinaryReply() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    await daemon.delayNextPublicationAck(nanoseconds: 250_000_000)
+
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+    _ = try await client.withPublicationBoundary {
+        try await client.request(.getAttr(getattr))
+    }
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
+
+    #expect(await daemon.stats().publicationAcks == 1)
+}
+
 /// Captures an acknowledgement baseline that a later `==` can be trusted
 /// against.
 ///

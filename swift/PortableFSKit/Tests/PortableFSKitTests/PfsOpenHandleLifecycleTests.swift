@@ -56,6 +56,39 @@ extension PfsLocalMockDaemonTests {
     #expect(await core.testingDebugState().openHandleCount == 0)
 }
 
+/// A resource disposition is a one-way ownership transition, but it is still
+/// a production reader barrier: once the daemon replies to a following Close,
+/// the earlier disposition has necessarily been applied. The injected delay
+/// makes an unordered mock deterministic — Close would overtake the suspended
+/// disposition and that late accept would leak across `resetStats()`.
+@Test func resourceDispositionPrecedesFollowingOrdinaryReply() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath,
+        attachRef: "mock"
+    )
+    let root = try await core.rootItem()
+    await daemon.delayNextResourceDisposition(nanoseconds: 250_000_000)
+
+    let created = try await core.createFile(
+        in: root,
+        name: lifecycleBytes("reader-ordered-disposition"),
+        mode: 0o644
+    )
+    try await core.close(item: created.item, retainingModes: .unspecified)
+    await daemon.resetStats()
+
+    // Give an incorrectly detached control task ample time to contaminate the
+    // new epoch. Correct reader ordering has no work left to arrive here.
+    try await Task.sleep(nanoseconds: 300_000_000)
+    let stats = await daemon.stats()
+    #expect(stats.resourceAccepts == 0)
+    #expect(stats.resourceAbandons == 0)
+    #expect(stats.resourceAcceptedItemCounts.isEmpty)
+    #expect(stats.activeHandles == 0)
+}
+
 @Test func directLookupMappingFailureAbandonsItemAndKeepsConnectionHealthy() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }

@@ -92,9 +92,12 @@ The native gate separately enumerates the package, executes one Xcode test
 process, and proves exact equality with the unique all-passing xcresult leaves.
 Socket-backed integration tests declare their process-wide resource constraint
 with a serialized Swift Testing suite. Pure value and protocol tests remain
-parallel within the process.
+parallel within the process. The mock keeps ordinary filesystem requests
+concurrent, but consumes one-way ownership dispositions and publication
+acknowledgements on its serial socket reader before admitting the next frame,
+matching the production daemon's wire-order boundary.
 
-The suite is swift-testing, not XCTest. It currently reports **361 tests**,
+The suite is swift-testing, not XCTest. It currently reports **363 tests**,
 covering the pfslocal transport and wire goldens, the Operations
 adapter and its open-handle lifecycle, attribute and error mapping, enumeration
 paging, write acknowledgement, and the macOS 26 coherence stack (namespace and
