@@ -401,9 +401,15 @@ integration-harness binary rather than a published operator artifact: ordinary
 Linux users mount through `portablefs`, while operators deploy the authority
 from the server archive.
 
-Tags through `v0.2.3` point at commits that predate `dba5b8f`. `v0.2.4` is the
-first release of the v3 tree and is accepted only when its immutable tag runs
-this complete workflow successfully: exact source/version proof, Linux archive
-membership and attestations, native Xcode tests, Developer ID export,
-notarization, stapling, and final publication. A tag or draft release alone is
-not release authority.
+Tags through `v0.2.3` point at commits that predate `dba5b8f`. `v0.2.4` marks
+the first tagged v3 tree but is not release authority: its draft pipeline
+correctly stopped before publication when archive signing had no independently
+modeled Apple Development identity. `v0.2.5` is the first releasable v3 tree.
+It is accepted only when its immutable tag runs this complete workflow
+successfully: exact source/version proof, Linux archive membership and
+attestations, native Xcode tests, exact isolated Apple Development archive
+signing, separately isolated Developer ID export, notarization, stapling, and
+final publication. Developer ID export is manual and locally rooted in the
+exact release identity plus the frozen FSKit direct-distribution profile; it
+must never fall back to cloud-managed certificate or profile creation. A tag or
+draft release alone is not release authority.
