@@ -73,6 +73,39 @@ private final class PfsMockRequestRegistry: @unchecked Sendable {
     }
 }
 
+/// Bridges one actor-isolated wire-control transition back to the dedicated
+/// blocking socket reader. The reader thread is allowed to wait; Swift's
+/// cooperative executor is not. This is an ownership join with no timeout or
+/// alternate path: production consumes these one-way frames before it reads
+/// the next request, so the mock must establish the same ordering boundary.
+private enum PfsMockWireControlOutcome: Sendable {
+    case continueReading
+    case closeConnection
+}
+
+private final class PfsMockWireControlCompletion: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var outcome: PfsMockWireControlOutcome?
+
+    func complete(_ outcome: PfsMockWireControlOutcome) {
+        condition.lock()
+        precondition(self.outcome == nil)
+        self.outcome = outcome
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait() -> PfsMockWireControlOutcome {
+        condition.lock()
+        while outcome == nil {
+            condition.wait()
+        }
+        let resolved = outcome!
+        condition.unlock()
+        return resolved
+    }
+}
+
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
         public var openRequests: Int
@@ -350,6 +383,20 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.delayNextClose(nanoseconds: nanoseconds)
     }
 
+    /// Holds the next ownership-disposition transition inside the mock's
+    /// reader-order boundary. Tests use this to prove that a following
+    /// ordinary request cannot overtake the one-way frame.
+    public func delayNextResourceDisposition(nanoseconds: UInt64) async {
+        await fileSystem.delayNextResourceDisposition(nanoseconds: nanoseconds)
+    }
+
+    /// Holds the next publication-acknowledgement transition inside the
+    /// reader-order boundary. This is the acknowledgement counterpart to
+    /// `delayNextResourceDisposition`.
+    public func delayNextPublicationAck(nanoseconds: UInt64) async {
+        await fileSystem.delayNextPublicationAck(nanoseconds: nanoseconds)
+    }
+
     public func delayNextRead(nanoseconds: UInt64) async {
         await fileSystem.delayNextRead(nanoseconds: nanoseconds)
     }
@@ -583,6 +630,21 @@ private final class PfsMockDaemonRuntime: @unchecked Sendable {
         while !isStopped {
             do {
                 let envelope = try reader.readFrame()
+                // The production reader reserves an operation before its
+                // ordinary handler can run. Recording the ID in a detached
+                // handler allowed a priority-lane PublicationAck to overtake
+                // the very request that created its obligation.
+                session.noteOperationID(envelope.operationID)
+                switch envelope.body {
+                case .publicationAck?, .resourceReplyDisposition?:
+                    guard handleWireControl(envelope, session: session)
+                        == .continueReading else {
+                        return
+                    }
+                    continue
+                default:
+                    break
+                }
                 requests.spawn { [fileSystem, session] in
                     let reply = await fileSystem.handle(envelope, session: session)
                     session.send(reply)
@@ -591,6 +653,27 @@ private final class PfsMockDaemonRuntime: @unchecked Sendable {
                 return
             }
         }
+    }
+
+    /// Production handles ownership dispositions and publication
+    /// acknowledgements on the serial connection reader and emits no reply.
+    /// Ordinary filesystem bodies remain concurrent. The actor transition is
+    /// therefore joined here, on the dedicated Dispatch reader, before another
+    /// frame can be consumed; the task itself is owned by that joined reader
+    /// rather than escaping into the ordinary-request registry.
+    private func handleWireControl(
+        _ envelope: PfsEnvelope,
+        session: MockSession
+    ) -> PfsMockWireControlOutcome {
+        let completion = PfsMockWireControlCompletion()
+        Task.detached(priority: .userInitiated) { [fileSystem, session, completion] in
+            let outcome = await fileSystem.handleWireControl(
+                envelope,
+                session: session
+            )
+            completion.complete(outcome)
+        }
+        return completion.wait()
     }
 
     private var isStopped: Bool {
@@ -989,6 +1072,8 @@ private actor MockFileSystem {
     private var pendingCreateHandlesToOmit = 0
     private var pendingOpenHandlesToOmit = 0
     private var pendingLookupItemIdentifiersToCorrupt = 0
+    private var pendingResourceDispositionDelaysNanoseconds: [UInt64] = []
+    private var pendingPublicationAckDelaysNanoseconds: [UInt64] = []
     private struct ProvisionalResource {
         var handle: UInt64
         var itemCount: UInt32
@@ -1132,6 +1217,14 @@ private actor MockFileSystem {
         pendingCloseDelaysNanoseconds.append(nanoseconds)
     }
 
+    func delayNextResourceDisposition(nanoseconds: UInt64) {
+        pendingResourceDispositionDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func delayNextPublicationAck(nanoseconds: UInt64) {
+        pendingPublicationAckDelaysNanoseconds.append(nanoseconds)
+    }
+
     func delayNextRead(nanoseconds: UInt64) {
         pendingReadDelaysNanoseconds.append(nanoseconds)
     }
@@ -1149,7 +1242,6 @@ private actor MockFileSystem {
     }
 
     func handle(_ envelope: PfsEnvelope, session: MockSession) async -> PfsEnvelope {
-        session.noteOperationID(envelope.operationID)
         var reply = PfsEnvelope()
         reply.requestID = envelope.requestID
         do {
@@ -1605,44 +1697,8 @@ private actor MockFileSystem {
             case .subscribeEvents:
                 session.setSubscribed()
                 reply.body = .subscribeEventsReply(PfsSubscribeEventsReply())
-            case let .publicationAck(request):
-                // One-way publication completion; requestID zero keeps the
-                // empty mock envelope outside the request multiplexer. The
-                // ledger check mirrors the real daemon: an ack for an
-                // operation this connection never showed on a request — for
-                // example one that overtook its own request on the priority
-                // lane — or a duplicate ack, closes the connection.
-                if session.acknowledgeOperation(request.operationID) {
-                    publicationAcks += 1
-                } else {
-                    session.close()
-                }
-                break
-            case let .resourceReplyDisposition(request):
-                guard let resource = provisionalResourcesByRequestID.removeValue(
-                    forKey: request.targetRequestID
-                ) else {
-                    throw MockPOSIXError(
-                        errno: EINVAL,
-                        message: "unknown or duplicate resource reply disposition"
-                    )
-                }
-                guard request.acceptedItemCount <= resource.itemCount,
-                      !request.acceptHandles || resource.handle != 0 else {
-                    session.close()
-                    break
-                }
-                resourceAcceptedItemCounts.append(request.acceptedItemCount)
-                if request.acceptHandles || request.acceptedItemCount > 0 {
-                    resourceAccepts += 1
-                } else {
-                    resourceAbandons += 1
-                }
-                if resource.handle != 0, !request.acceptHandles,
-                   let nodeID = handles.removeValue(forKey: resource.handle) {
-                    reapIfUnlinked(nodeID: nodeID)
-                }
-                break
+            case .publicationAck, .resourceReplyDisposition:
+                preconditionFailure("reader-ordered wire control reached ordinary dispatcher")
             case let .visibilityAck(request):
                 visibilityAcks.append(request)
                 reply.body = .visibilityAckReply(PfsVisibilityAckReply())
@@ -1695,6 +1751,57 @@ private actor MockFileSystem {
         }
         reply.sourcePhaseQueueable = configuration.sourcePhaseQueueableOnReplies
         return reply
+    }
+
+    /// Applies one-way control frames in exact connection-reader order. A
+    /// false result is the real daemon's fail-closed verdict: the reader owns
+    /// connection retirement and sends no synthetic request-ID-zero reply.
+    func handleWireControl(
+        _ envelope: PfsEnvelope,
+        session: MockSession
+    ) async -> PfsMockWireControlOutcome {
+        switch envelope.body {
+        case let .publicationAck(request):
+            if !pendingPublicationAckDelaysNanoseconds.isEmpty {
+                let delay = pendingPublicationAckDelaysNanoseconds.removeFirst()
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard envelope.requestID == 0,
+                  session.acknowledgeOperation(request.operationID) else {
+                return .closeConnection
+            }
+            publicationAcks += 1
+            return .continueReading
+
+        case let .resourceReplyDisposition(request):
+            if !pendingResourceDispositionDelaysNanoseconds.isEmpty {
+                let delay = pendingResourceDispositionDelaysNanoseconds.removeFirst()
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard envelope.requestID == 0,
+                  request.targetRequestID != 0,
+                  let resource = provisionalResourcesByRequestID.removeValue(
+                    forKey: request.targetRequestID
+                  ),
+                  request.acceptedItemCount <= resource.itemCount,
+                  !request.acceptHandles || resource.handle != 0 else {
+                return .closeConnection
+            }
+            resourceAcceptedItemCounts.append(request.acceptedItemCount)
+            if request.acceptHandles || request.acceptedItemCount > 0 {
+                resourceAccepts += 1
+            } else {
+                resourceAbandons += 1
+            }
+            if resource.handle != 0, !request.acceptHandles,
+               let nodeID = handles.removeValue(forKey: resource.handle) {
+                reapIfUnlinked(nodeID: nodeID)
+            }
+            return .continueReading
+
+        default:
+            preconditionFailure("ordinary frame entered wire-control dispatcher")
+        }
     }
 
     private func node(for item: PfsItem) throws -> Node {

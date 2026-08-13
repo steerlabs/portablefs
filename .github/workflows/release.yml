@@ -32,6 +32,9 @@ jobs:
           test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
           test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(cat VERSION)"
+          printf '%s\n' "$version" | cmp -s - VERSION
+          test "$GITHUB_REF_NAME" = "v$version"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: vcs/go.mod
