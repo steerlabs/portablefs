@@ -1,7 +1,7 @@
 # Release identity
 
-Status: **describes the release path as configured; not exercised since the v3
-reset (see [Known gaps](#known-gaps))**
+Status: **enforced release contract; a release is authoritative only after its
+immutable tag completes the whole workflow successfully**
 
 The shipped client release identity is offline: a validated git tag, a version
 string stamped into the binaries and re-proved by the installer, and two
@@ -21,7 +21,7 @@ Everything below is enforced by `.github/workflows/release.yml`,
 `scripts/check-install-release-trust.mjs` and `scripts/check-workflow-pins.mjs`,
 which run in both `release.yml` and `ci.yml`.
 
-## The git tag is the identity
+## The tag and checked-in version are one identity
 
 Releases are triggered only by a pushed tag matching `v*`, and the first thing
 the `validate` job does — step *"Prove an exact stable tag at this source
@@ -35,17 +35,23 @@ fi
 test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
 test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
 test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+version="$(cat VERSION)"
+printf '%s\n' "$version" | cmp -s - VERSION
+test "$GITHUB_REF_NAME" = "v$version"
 ```
 
-That is four separate claims: the name is stable SemVer with no prerelease,
-build metadata, or leading zeroes; the ref really is a tag ref; the tag peels to
-the commit the push event named; and the tree actually checked out is that same
-commit. The checkout is `fetch-depth: 0` with `persist-credentials: false`, so
-the tag is resolved against real history rather than a shallow graft.
+These checks bind the stable SemVer tag, the push event's commit, the checked-out
+tree, and the repository's exact newline-terminated `VERSION` file. The checkout
+is `fetch-depth: 0` with `persist-credentials: false`, so the tag is resolved
+against real history rather than a shallow graft.
 
-Everything downstream derives its version from that one string as
-`"${GITHUB_REF_NAME#v}"`. There is no second source of truth and no build-arg
-override.
+`VERSION` is the local/Xcode authority: the production, macOS 26, and macOS 27
+projects must each contain exactly four matching `MARKETING_VERSION` settings;
+CI reads it directly; and the macOS packager rejects both environment overrides
+and positional arguments that do not equal it. The tag is the publication
+authority used by GoReleaser and artifact names. The equality gate makes these
+two representations one release identity instead of allowing either to
+override the other.
 
 Publication is immutable by construction. Before uploading anything the workflow
 proves no release exists for the tag — a `404` from
@@ -395,9 +401,9 @@ integration-harness binary rather than a published operator artifact: ordinary
 Linux users mount through `portablefs`, while operators deploy the authority
 from the server archive.
 
-**The release workflow has not been run since the v3 reset.** The tags in this
-repository are `v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.2.2`, and `v0.2.3`, all
-pointing at commits that predate `dba5b8f`. No tag names the current tree, so
-none of the v3 release path — attestation, membership, macOS identity — has been
-exercised end to end against it. Treat the first v3 tag as an unproven run, not
-a routine one.
+Tags through `v0.2.3` point at commits that predate `dba5b8f`. `v0.2.4` is the
+first release of the v3 tree and is accepted only when its immutable tag runs
+this complete workflow successfully: exact source/version proof, Linux archive
+membership and attestations, native Xcode tests, Developer ID export,
+notarization, stapling, and final publication. A tag or draft release alone is
+not release authority.

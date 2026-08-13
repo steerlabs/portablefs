@@ -113,13 +113,14 @@ jobs:
           PORTABLEFS_APP_GROUP: B47U2LLKHW.pfsoss
           PORTABLEFS_PACKAGE_DIR: ${{ runner.temp }}/portablefs-macos-package
           PORTABLEFS_UNSIGNED: "1"
-        run: scripts/package-macos-app.sh 0.2.3
+        run: scripts/package-macos-app.sh
       - name: Build and verify the macOS 26 development host identity
         run: |
           set -euo pipefail
           derived="$RUNNER_TEMP/portablefs-kit-dev-derived"
           expected_group=B47U2LLKHW.pfsoss
-          expected_version=0.2.3
+          expected_version="$(cat VERSION)"
+          printf '%s\n' "$expected_version" | cmp -s - VERSION
           xcodebuild \
             -project swift/PortableFSKitDev/PortableFSKitDev.xcodeproj \
             -scheme PortableFSKitDev \

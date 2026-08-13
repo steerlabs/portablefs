@@ -175,8 +175,12 @@ verifies the complete code hierarchy, and emits a clearly marked development
 zip:
 
 ```sh
-scripts/package-macos-app.sh 0.2.3
+scripts/package-macos-app.sh
 ```
+
+The packager reads the repository's exact `VERSION` file. An optional version
+argument is accepted only when it equals that file, so local, CI, Xcode, and
+tagged release builds cannot drift onto different product versions.
 
 Distribution builds set `PORTABLEFS_RELEASE=1`, a monotonic
 `PORTABLEFS_BUILD_NUMBER`, `PORTABLEFS_DEVELOPER_ID_EXPORT=1`, and a

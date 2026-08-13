@@ -4,8 +4,23 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-version=${1:-${PORTABLEFS_VERSION:-0.2.3}}
-version=${version#v}
+version_file="$repo_root/VERSION"
+[ -f "$version_file" ] && [ ! -L "$version_file" ] ||
+  { echo "PortableFS packaging requires a regular VERSION file" >&2; exit 1; }
+version=$(/bin/cat "$version_file")
+printf '%s\n' "$version" | /usr/bin/cmp -s - "$version_file" ||
+  { echo "VERSION must contain exactly one newline-terminated version" >&2; exit 1; }
+[ "$#" -le 1 ] ||
+  { echo "usage: scripts/package-macos-app.sh [vMAJOR.MINOR.PATCH]" >&2; exit 1; }
+if [ -n "${PORTABLEFS_VERSION:-}" ]; then
+  echo "macOS packaging is versioned only by VERSION, not PORTABLEFS_VERSION" >&2
+  exit 1
+fi
+if [ "$#" = 1 ]; then
+  requested_version=${1#v}
+  [ "$requested_version" = "$version" ] ||
+    { echo "requested macOS package version $requested_version != VERSION $version" >&2; exit 1; }
+fi
 team_id=${PORTABLEFS_APPLE_TEAM_ID:-B47U2LLKHW}
 app_group=${PORTABLEFS_APP_GROUP:-"$team_id.pfsoss"}
 configuration=${PORTABLEFS_XCODE_CONFIGURATION:-Release}

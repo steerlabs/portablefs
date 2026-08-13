@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const versionFile = await readFile(path.join(root, "VERSION"), "utf8");
 const installer = await readFile(path.join(root, "scripts/install.sh"), "utf8");
 const packager = await readFile(
   path.join(root, "scripts/package-macos-app.sh"),
@@ -213,6 +214,13 @@ const macOS27DevelopmentHost = await readFile(
 );
 
 const failures = [];
+const versionMatch = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\n$/.exec(
+  versionFile
+);
+const releaseVersion = versionMatch?.[1] ?? "";
+if (!versionMatch) {
+  failures.push("VERSION must contain one newline-terminated stable SemVer without leading zeroes");
+}
 const requireText = (source, text, label) => {
   if (!source.includes(text)) failures.push(`missing ${label}`);
 };
@@ -463,13 +471,26 @@ for (const { relativePath, contents } of appGroupBuildConfigs) {
     }
   }
 }
-for (const { relativePath, contents } of developmentProjects) {
-  const exactVersions = contents.match(/MARKETING_VERSION = 0\.2\.3;/g) ?? [];
-  if (exactVersions.length !== 4 || /MARKETING_VERSION = (?!0\.2\.3;)/.test(contents)) {
+for (const { relativePath, contents } of [
+  {
+    relativePath: "swift/PortableFSApp/PortableFSApp.xcodeproj/project.pbxproj",
+    contents: productionProject,
+  },
+  ...developmentProjects,
+]) {
+  const projectVersions = [
+    ...contents.matchAll(/MARKETING_VERSION = ([^;]+);/g),
+  ].map((match) => match[1]);
+  if (
+    projectVersions.length !== 4 ||
+    projectVersions.some((version) => version !== releaseVersion)
+  ) {
     failures.push(
-      `${relativePath} must give all four development build configurations exact release version 0.2.3`
+      `${relativePath} must give all four build configurations exact VERSION ${releaseVersion || "<invalid>"}`
     );
   }
+}
+for (const { relativePath, contents } of developmentProjects) {
   for (const contract of [
     'name = "Embed PortableFS tools";',
     "../PortableFSApp/Scripts/embed-portablefs-tools.sh",
@@ -697,6 +718,11 @@ for (const verification of [
   requireText(packager, verification, `packager ${verification}`);
 }
 for (const unsignedBuildVerification of [
+  'version_file="$repo_root/VERSION"',
+  'printf \'%s\\n\' "$version" | /usr/bin/cmp -s - "$version_file"',
+  'requested_version=${1#v}',
+  '[ "$requested_version" = "$version" ]',
+  'macOS packaging is versioned only by VERSION, not PORTABLEFS_VERSION',
   '[ "$host_group" = "$app_group" ]',
   '[ "$extension_group" = "$app_group" ]',
   '[ "$host_group" = "$extension_group" ]',
@@ -909,6 +935,8 @@ if (workflow.includes("--clobber")) {
 }
 for (const releaseGate of [
   "Prove an exact stable tag at this source revision",
+  'version="$(cat VERSION)"',
+  'test "$GITHUB_REF_NAME" = "v$version"',
   "CGO_ENABLED=0 GOOS=linux go -C vcs build ./...",
   "Verify the Foundation-enabled Darwin data plane",
   "CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...",
@@ -933,6 +961,8 @@ for (const ciGate of [
   "swift-xcode-native:",
   "name: swift-xcode-native",
   "run: bash scripts/test-swift-xcode.sh",
+  'expected_version="$(cat VERSION)"',
+  "run: scripts/package-macos-app.sh",
 ]) {
   requireText(ciWorkflow, ciGate, `CI Xcode-native Swift gate ${ciGate}`);
 }
