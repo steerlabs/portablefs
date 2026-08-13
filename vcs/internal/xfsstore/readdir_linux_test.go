@@ -33,68 +33,46 @@ func readDirAll(t *testing.T, v *Volume, handle Capability, page int) []Dirent {
 	}
 }
 
-// TestReadDirSurvivesConcurrentUnlink is failure A of the readdir defect: a
-// second client removing one entry between getdents and the per-entry stat
-// aborted the whole page with that entry's ENOENT, so an ls of a busy
+// TestReadDirSurvivesUnlinkAfterGetdents is failure A of the readdir defect: a
+// second client removing one entry between getdents and the compatibility
+// stat aborted the whole page with that entry's ENOENT, so an ls of a busy
 // directory failed outright. A local ls never does that.
-func TestReadDirSurvivesConcurrentUnlink(t *testing.T) {
+//
+// Model that exact syscall boundary directly instead of trying to win a
+// scheduler race. The name and d_type arguments are the values already
+// returned by getdents; Unlink makes the subsequent stat observe ENOENT.
+func TestReadDirSurvivesUnlinkAfterGetdents(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
-	const total = 200
-	for i := range total {
-		if _, _, err := v.Create(root, fmt.Sprintf("entry-%03d", i), 0o600, true); err != nil {
-			t.Fatal(err)
-		}
+	if _, _, err := v.Create(root, "victim", 0o600, true); err != nil {
+		t.Fatal(err)
 	}
 	handle := mustOpenDir(t, v, root)
 
-	// Every call below starts a fresh enumeration, so none of them can be
-	// answered with a staleness error: a first page is always readable. What
-	// used to break it is that entries removed between getdents and the
-	// per-entry stat returned ENOENT, and one such entry failed the page.
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(done)
-		for i := range total {
-			if err := v.Unlink(root, fmt.Sprintf("entry-%03d", i), false); err != nil {
-				t.Errorf("Unlink: %v", err)
-				return
-			}
-		}
-	}()
-	pages, failure := 0, error(nil)
-	for failure == nil {
-		entries, _, _, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, total)
-		if err != nil {
-			failure = err
-			break
-		}
-		for _, entry := range entries {
-			if entry.Kind != KindRegular || entry.Ino == 0 {
-				failure = fmt.Errorf("entry %q listed as kind %d ino %d", entry.Name, entry.Kind, entry.Ino)
-				break
-			}
-		}
-		pages++
-		select {
-		case <-done:
-			wg.Wait()
-			if pages < 2 {
-				t.Fatal("the unlink loop finished before two pages were read")
-			}
-			if entries, _, _, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, total); err != nil || len(entries) != 0 {
-				t.Fatalf("emptied directory = %d entries, %v", len(entries), err)
-			}
-			return
-		default:
-		}
+	v.mu.RLock()
+	opened := v.opens[handle]
+	v.mu.RUnlock()
+	if opened == nil {
+		t.Fatal("open directory handle disappeared")
 	}
-	<-done
-	wg.Wait()
-	t.Fatalf("first page during a concurrent unlink: %v", failure)
+	if err := v.Unlink(root, "victim", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// XFS with ftype reports DT_REG, so the normal path needs no stat and
+	// retains the exact type captured by getdents even after the unlink.
+	if kind, err := opened.entryKind(unix.DT_REG, "victim"); err != nil || kind != KindRegular {
+		t.Fatalf("known getdents type after unlink = %d, %v", kind, err)
+	}
+	// A filesystem returning DT_UNKNOWN takes the compatibility stat path.
+	// ENOENT here means only that the captured entry raced with unlink; it is
+	// represented as opaque rather than failing the complete directory page.
+	if kind, err := opened.entryKind(unix.DT_UNKNOWN, "victim"); err != nil || kind != KindOpaque {
+		t.Fatalf("unknown getdents type after unlink = %d, %v", kind, err)
+	}
+	if entries, _, _, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, 1); err != nil || len(entries) != 0 {
+		t.Fatalf("emptied directory = %d entries, %v", len(entries), err)
+	}
 }
 
 // TestReadDirListsForbiddenInodeTypes is failure B: one FIFO or device node in
