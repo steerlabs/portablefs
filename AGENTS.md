@@ -15,12 +15,13 @@ go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
 
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh # macOS: authoritative native Swift gate
 ```
 
-`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
-Testing can otherwise run cases concurrently inside one worker, and several
-tests share process resources or exercise hard protocol deadlines.
+The native gate runs one Xcode test process and proves exact equality between
+the enumerated inventory and the all-passing xcresult. Socket-backed integration
+tests declare their process-wide resource constraint with a serialized Swift
+Testing suite; pure tests remain parallel.
 
 ## Before You Finish
 

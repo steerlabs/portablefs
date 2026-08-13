@@ -57,6 +57,31 @@ private actor PfsTestAsyncGate {
     }
 }
 
+extension PfsLocalMockDaemonTests {
+@Test func mockDaemonReleaseStopsAndJoinsItsRuntimeWithoutExplicitStop() throws {
+    for _ in 0..<64 {
+        weak var daemonReference: PfsLocalMockDaemon?
+        var socketPath = ""
+        var socketDirectory = ""
+        var peerFD: Int32?
+        do {
+            let daemon = try PfsLocalMockDaemon()
+            daemonReference = daemon
+            socketPath = daemon.socketPath
+            socketDirectory = (socketPath as NSString).deletingLastPathComponent
+            peerFD = try PfsUnixSocket.connect(path: socketPath)
+        }
+        if let peerFD {
+            PfsUnixSocket.close(peerFD)
+        }
+
+        try #require(daemonReference == nil)
+        var status = stat()
+        #expect(Darwin.lstat(socketPath, &status) != 0 && errno == ENOENT)
+        #expect(Darwin.lstat(socketDirectory, &status) != 0 && errno == ENOENT)
+    }
+}
+
 @Test func mockDaemonUsesPrivateEphemeralSocketStateAndCleansIt() throws {
     let daemon = try PfsLocalMockDaemon()
     let socketPath = daemon.socketPath
@@ -1372,4 +1397,5 @@ private final class PfsRawServer: @unchecked Sendable {
             throw PfsLocalClientError.system(errno: Darwin.errno, operation: "recv")
         }
     }
+}
 }

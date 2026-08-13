@@ -20,6 +20,7 @@ private func strictV3Contract(
     return contract
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func volumeCoreRequiresTheFrontendAdaptersExactDeclaredPolicySet() async throws {
     // The shipping macOS 26 adapter preserves both frozen compatibility
     // revisions. Resolve records only a declared member of that exact set.
@@ -612,4 +613,5 @@ private func strictV3Contract(
     // Everything an old daemon DOES understand keeps working.
     let modeOnly = try await core.setattr(item: created.item, attributes: .init(mode: 0o600))
     #expect(modeOnly.mode == 0o600)
+}
 }

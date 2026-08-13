@@ -49,7 +49,7 @@ def results(*cases: tuple[str, str], architecture: str = "arm64") -> dict:
 class XcodeEvidenceTests(unittest.TestCase):
     identifiers = (
         "PortableFSAppCoreTests/appCorePasses()",
-        "PortableFSKitTests/kitPasses()",
+        "PortableFSKitTests/PfsLocalMockDaemonTests/kitPasses()",
     )
 
     def test_exact_enumeration_and_results_pass(self) -> None:
@@ -70,6 +70,34 @@ class XcodeEvidenceTests(unittest.TestCase):
             with self.subTest(candidate=candidate):
                 with self.assertRaises(verify_xcode_tests.VerificationError):
                     verify_xcode_tests.parse_enumeration(candidate)
+
+    def test_identifier_parser_accepts_nested_suites_and_rejects_noncanonical_paths(self) -> None:
+        accepted = (
+            "PortableFSKitTests/kitPasses()",
+            "PortableFSKitTests/PfsLocalMockDaemonTests/kitPasses()",
+            "PortableFSKitTests/OuterSuite/InnerSuite/kitPasses()",
+        )
+        for identifier in accepted:
+            with self.subTest(identifier=identifier):
+                self.assertEqual(
+                    "/".join(verify_xcode_tests.parse_test_identifier(identifier, source="test")),
+                    identifier,
+                )
+
+        rejected = (
+            "PortableFSKitTests",
+            "PortableFSKitTests//kitPasses()",
+            "PortableFSKitTests/../kitPasses()",
+            "PortableFSKitTests/Suite()/kitPasses()",
+            "PortableFSKitTests/Suite/kitPasses",
+            "PortableFSKitTests/Suite/kit passes()",
+            "/PortableFSKitTests/kitPasses()",
+            "OtherTests/Suite/kitPasses()",
+        )
+        for identifier in rejected:
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(verify_xcode_tests.VerificationError):
+                    verify_xcode_tests.parse_test_identifier(identifier, source="test")
 
     def test_results_reject_failure_missing_unexpected_duplicate_and_wrong_destination(self) -> None:
         enum = enumeration(*self.identifiers)

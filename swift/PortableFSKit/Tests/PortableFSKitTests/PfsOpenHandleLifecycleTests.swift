@@ -7,6 +7,7 @@ private func lifecycleBytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func zeroHandleCreateReplyTerminallyFencesWithoutInvalidDisposition() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -562,4 +563,5 @@ private func waitForLifecycleStats(
         try await Task.sleep(nanoseconds: 1_000_000)
     }
     throw LifecycleStatsTimeout()
+}
 }

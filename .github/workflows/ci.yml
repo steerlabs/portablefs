@@ -32,9 +32,12 @@ jobs:
 
   # The Swift suite covers the FSKit adapter, installer core, service updater,
   # and macOS 26/27 coherence boundaries. Xcode first enumerates the package
-  # inventory, then its native serial runner executes the already-built test
-  # bundles. The shared gate requires exact set equality and all-passing
-  # xcresult leaves, with no helper retry or alternate success path.
+  # inventory, then one native test process executes the already-built test
+  # bundles. Socket-backed integration cases declare their shared process
+  # resource through a serialized Swift Testing suite; pure cases remain
+  # parallel within that process. The shared gate requires exact set equality
+  # and all-passing xcresult leaves, with no helper retry or alternate success
+  # path.
   swift-xcode-native:
     name: swift-xcode-native
     runs-on: macos-26

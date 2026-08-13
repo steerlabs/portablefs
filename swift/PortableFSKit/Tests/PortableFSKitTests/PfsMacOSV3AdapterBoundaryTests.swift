@@ -187,6 +187,7 @@ private actor BoundaryCallbackGate {
     }
 }
 
+extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func adapterReservesCallbackSynchronouslyBeforeItsTaskCanEnterPreflight() async throws {
     let daemon = try PfsLocalMockDaemon()
@@ -1305,4 +1306,5 @@ private actor BoundaryCallbackGate {
     _ = try PfsFSKitMapping.itemIdentifier(
         from: PfsFSKitMapping.localRepairIdentifierFloor - 1
     )
+}
 }
