@@ -10,6 +10,23 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-12
+
+### Fixed
+
+- Model Apple's two-stage direct-distribution signing pipeline explicitly in
+  release CI: a sole Apple Development identity signs the Xcode archive and a
+  separately isolated Developer ID identity signs the exported, notarized app.
+  Each credential is imported into its own ephemeral keychain and validated for
+  exact role, team, and cardinality before Xcode runs; neither identity can
+  silently substitute for the other.
+- Make Developer ID export deterministic and local: the release workflow uses
+  the frozen FSKit direct-distribution profile and exact Developer ID identity,
+  rather than asking Xcode to create cloud-managed signing assets.
+- Verify universal release binaries one architecture at a time so the same
+  packaging contract is accepted by both the Xcode 26 and Xcode 27 `lipo`
+  implementations.
+
 ## [0.2.4] - 2026-08-12
 
 First tagged release of the direct-store v3 architecture.

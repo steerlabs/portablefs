@@ -957,6 +957,94 @@ for (const releaseGate of [
 ]) {
   requireText(workflow, releaseGate, `release validation gate ${releaseGate}`);
 }
+for (const signingRoleContract of [
+  "Import exact archive and distribution identities",
+  "secrets.PORTABLEFS_APPLE_DEVELOPMENT_P12_BASE64",
+  "secrets.PORTABLEFS_APPLE_DEVELOPMENT_P12_PASSWORD",
+  "secrets.PORTABLEFS_DEVELOPER_ID_P12_BASE64",
+  "secrets.PORTABLEFS_DEVELOPER_ID_P12_PASSWORD",
+  "secrets.PORTABLEFS_DEVELOPER_ID_PROFILE_BASE64",
+  "PORTABLEFS_DEVELOPMENT_KEYCHAIN: ${{ runner.temp }}/portablefs-development.keychain-db",
+  "PORTABLEFS_SIGNING_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db",
+  "PORTABLEFS_NOTARY_KEYCHAIN: ${{ runner.temp }}/portablefs-distribution.keychain-db",
+  "PORTABLEFS_DEVELOPMENT_P12_PATH: ${{ runner.temp }}/portablefs-apple-development.p12",
+  "PORTABLEFS_DISTRIBUTION_P12_PATH: ${{ runner.temp }}/portablefs-developer-id.p12",
+  "PORTABLEFS_DEVELOPER_ID_PROFILE_PATH: ${{ runner.temp }}/portablefs-fskit-developer-id.provisionprofile",
+  "PORTABLEFS_APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_portablefs_release.p8",
+  '"Apple Development: Tim Seokboem Jang (F5R8J7D2YC)"',
+  'require_dn_field "$subject" CN "$expected_name"',
+  'require_dn_field "$subject" OU "$team_id"',
+  'require_dn_field "$subject" O "TrendUp AI, Inc."',
+  'require_dn_field "$issuer" CN "$expected_issuer_name"',
+  'require_dn_field "$issuer" OU "$expected_issuer_organizational_unit"',
+  '"Apple Worldwide Developer Relations Certification Authority"',
+  "dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f",
+  'require_identity "$PORTABLEFS_SIGNING_KEYCHAIN"',
+  '"Developer ID Application: TrendUp AI, Inc. ($team_id)"',
+  '"Developer ID Certification Authority"',
+  '"Apple Certification Authority"',
+  "7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f",
+  'openssl x509 -noout -checkend 0',
+  'security list-keychains -d user -s',
+  'security delete-keychain "$PORTABLEFS_DEVELOPMENT_KEYCHAIN"',
+  'security delete-keychain "$PORTABLEFS_SIGNING_KEYCHAIN"',
+  'rm -f "$PORTABLEFS_DEVELOPMENT_P12_PATH" "$PORTABLEFS_DISTRIBUTION_P12_PATH"',
+  '"$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH"',
+  '"$PORTABLEFS_APPLE_API_KEY_PATH"',
+  'exit "$cleanup_status"',
+]) {
+  requireText(
+    workflow,
+    signingRoleContract,
+    `two-role macOS release signing contract ${signingRoleContract}`
+  );
+}
+for (const developerIDExportContract of [
+  'PORTABLEFS_DEVELOPER_ID_EXPORT=1 requires PORTABLEFS_DEVELOPER_ID_PROFILE_PATH',
+  'developer_id_profile_sha256=fc1cfa7617c47019c4f0db112b0d63184b3c08a377fb88507ed54545900bacae',
+  'plutil -insert signingStyle -string manual',
+  '"Developer ID Application: TrendUp AI, Inc. ($team_id)"',
+  'dev.portablefs.PortableFSApp.PortableFSExt',
+  'PortableFSApp FSKit Developer ID',
+  'refusing to replace existing provisioning profile',
+  "trap 'exit 129' HUP",
+  "trap 'exit 130' INT",
+  "trap 'exit 143' TERM",
+  'for required_arch in arm64 x86_64; do',
+  '/usr/bin/lipo "$executable" -verify_arch "$required_arch"',
+  'codesign -d --xml --entitlements - "$service"',
+  '-c "Delete :com.apple.security.application-groups"',
+]) {
+  requireText(
+    packager,
+    developerIDExportContract,
+    `manual Developer ID export contract ${developerIDExportContract}`
+  );
+}
+if (packager.includes('plutil -insert signingStyle -string automatic')) {
+  failures.push("macOS release export must not request cloud-managed automatic signing");
+}
+if (packager.includes("codesign -d --entitlements :-")) {
+  failures.push("macOS packaging must use codesign's current XML entitlement output contract");
+}
+if (packager.includes('/usr/bin/lipo "$executable" -verify_arch arm64 x86_64')) {
+  failures.push("macOS packaging must use the Xcode 26/27-compatible per-architecture lipo contract");
+}
+if (
+  /-exportArchive[\s\S]*?-allowProvisioningUpdates/.test(packager) ||
+  /-exportArchive[\s\S]*?-authenticationKeyPath/.test(packager)
+) {
+  failures.push("manual Developer ID export must not request cloud provisioning or signing");
+}
+for (const conflatedSigningRole of [
+  "- name: Import Developer ID identity",
+  '\n          P12_BASE64: ${{ secrets.PORTABLEFS_DEVELOPER_ID_P12_BASE64 }}',
+  'security delete-keychain "$PORTABLEFS_SIGNING_KEYCHAIN" || true',
+]) {
+  if (workflow.includes(conflatedSigningRole)) {
+    failures.push(`release workflow conflates or weakens signing roles (${conflatedSigningRole})`);
+  }
+}
 for (const ciGate of [
   "swift-xcode-native:",
   "name: swift-xcode-native",

@@ -31,6 +31,7 @@ out_root=${PORTABLEFS_PACKAGE_DIR:-"$repo_root/dist/macos"}
 archive="$out_root/PortableFS-$version.xcarchive"
 project="$repo_root/swift/PortableFSApp/PortableFSApp.xcodeproj"
 go_binary=${PORTABLEFS_GO:-}
+developer_id_profile_sha256=fc1cfa7617c47019c4f0db112b0d63184b3c08a377fb88507ed54545900bacae
 
 if [ "$release" = "1" ] && [ -z "$go_binary" ]; then
   echo "PORTABLEFS_RELEASE=1 requires an explicit exact PORTABLEFS_GO" >&2
@@ -94,7 +95,34 @@ esac
 
 mkdir -p "$out_root"
 verify_tmp=$(mktemp -d "$out_root/package-verify-$version.XXXXXX")
-trap 'rm -rf "$verify_tmp"' EXIT HUP INT TERM
+installed_profile=
+remove_installed_profile() {
+  [ -n "$installed_profile" ] || return 0
+  [ -f "$installed_profile" ] && [ ! -L "$installed_profile" ] || {
+    echo "installed Developer ID profile changed type before cleanup" >&2
+    return 1
+  }
+  installed_profile_sha256=$(shasum -a 256 "$installed_profile" | awk '{ print $1 }')
+  [ "$installed_profile_sha256" = "$developer_id_profile_sha256" ] || {
+    echo "installed Developer ID profile changed before cleanup" >&2
+    return 1
+  }
+  rm -f "$installed_profile"
+  installed_profile=
+}
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if ! remove_installed_profile; then
+    status=1
+  fi
+  rm -rf "$verify_tmp"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 set -- xcodebuild \
   -project "$project" \
@@ -139,27 +167,54 @@ app="$archive/Products/Applications/PortableFS.app"
 if [ "${PORTABLEFS_DEVELOPER_ID_EXPORT:-0}" = "1" ]; then
   [ "$unsigned" != "1" ] ||
     { echo "PORTABLEFS_DEVELOPER_ID_EXPORT=1 requires signed packaging" >&2; exit 1; }
+  [ -n "${PORTABLEFS_DEVELOPER_ID_PROFILE_PATH:-}" ] ||
+    { echo "PORTABLEFS_DEVELOPER_ID_EXPORT=1 requires PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" >&2; exit 1; }
+  case "$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" in
+    /*) ;;
+    *) echo "PORTABLEFS_DEVELOPER_ID_PROFILE_PATH must be absolute" >&2; exit 1 ;;
+  esac
+  [ -f "$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" ] &&
+    [ ! -L "$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" ] ||
+    { echo "PORTABLEFS_DEVELOPER_ID_PROFILE_PATH must be a regular, non-symlink file" >&2; exit 1; }
+  actual_profile_sha256=$(shasum -a 256 "$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" | awk '{ print $1 }')
+  [ "$actual_profile_sha256" = "$developer_id_profile_sha256" ] ||
+    { echo "Developer ID profile does not match the frozen release profile" >&2; exit 1; }
   export_options="$verify_tmp/ExportOptions.plist"
   plutil -create xml1 "$export_options"
   plutil -insert method -string developer-id "$export_options"
-  plutil -insert signingStyle -string automatic "$export_options"
+  plutil -insert signingStyle -string manual "$export_options"
+  plutil -insert signingCertificate -string \
+    "Developer ID Application: TrendUp AI, Inc. ($team_id)" \
+    "$export_options"
   plutil -insert teamID -string "$team_id" "$export_options"
+  plutil -insert provisioningProfiles -xml \
+    '<dict><key>dev.portablefs.PortableFSApp.PortableFSExt</key><string>PortableFSApp FSKit Developer ID</string></dict>' \
+    "$export_options"
   export_dir="$verify_tmp/export"
   mkdir "$export_dir"
+
+  profile_root="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+  mkdir -p "$profile_root"
+  profile_uuid=$(security cms -D -i "$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" |
+    plutil -extract UUID raw -o - -- -)
+  printf '%s\n' "$profile_uuid" |
+    LC_ALL=C grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ||
+    { echo "Developer ID profile has a noncanonical UUID" >&2; exit 1; }
+  installed_profile="$profile_root/$profile_uuid.provisionprofile"
+  [ ! -e "$installed_profile" ] ||
+    { echo "refusing to replace existing provisioning profile $installed_profile" >&2; exit 1; }
+  install -m 0600 "$PORTABLEFS_DEVELOPER_ID_PROFILE_PATH" "$installed_profile"
+  installed_profile_sha256=$(shasum -a 256 "$installed_profile" | awk '{ print $1 }')
+  [ "$installed_profile_sha256" = "$developer_id_profile_sha256" ] ||
+    { echo "installed Developer ID profile does not match its pinned source" >&2; exit 1; }
 
   set -- xcodebuild \
     -exportArchive \
     -archivePath "$archive" \
     -exportPath "$export_dir" \
-    -exportOptionsPlist "$export_options" \
-    -allowProvisioningUpdates
-  if [ -n "${PORTABLEFS_APPLE_API_KEY_PATH:-}" ]; then
-    set -- "$@" \
-      -authenticationKeyPath "$PORTABLEFS_APPLE_API_KEY_PATH" \
-      -authenticationKeyID "$PORTABLEFS_APPLE_API_KEY_ID" \
-      -authenticationKeyIssuerID "$PORTABLEFS_APPLE_API_ISSUER_ID"
-  fi
+    -exportOptionsPlist "$export_options"
   "$@"
+  remove_installed_profile
   app="$export_dir/PortableFS.app"
   [ -d "$app" ] || { echo "Developer ID export did not produce $app" >&2; exit 1; }
 fi
@@ -181,7 +236,9 @@ extension_executable="$extension/Contents/MacOS/PortableFSExt"
   { echo "packaged app has no PortableFSExt executable" >&2; exit 1; }
 
 for executable in "$app_executable" "$cli" "$daemon" "$extension_executable"; do
-  /usr/bin/lipo "$executable" -verify_arch arm64 x86_64
+  for required_arch in arm64 x86_64; do
+    /usr/bin/lipo "$executable" -verify_arch "$required_arch"
+  done
 done
 
 app_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
@@ -282,7 +339,7 @@ if [ "$unsigned" != "1" ]; then
     entitlement_code=$1
     entitlement_label=$2
     entitlement_plist="$verify_tmp/$entitlement_label-entitlements.plist"
-    codesign -d --entitlements :- "$entitlement_code" >"$entitlement_plist"
+    codesign -d --xml --entitlements - "$entitlement_code" >"$entitlement_plist"
     entitlement_group=$(/usr/libexec/PlistBuddy \
       -c "Print :com.apple.security.application-groups:0" \
       "$entitlement_plist") || {
@@ -304,7 +361,7 @@ if [ "$unsigned" != "1" ]; then
     entitlement_code=$1
     entitlement_label=$2
     entitlement_plist="$verify_tmp/$entitlement_label-entitlements.plist"
-    codesign -d --entitlements :- "$entitlement_code" >"$entitlement_plist"
+    codesign -d --xml --entitlements - "$entitlement_code" >"$entitlement_plist"
     if /usr/libexec/PlistBuddy \
       -c "Print :com.apple.security.application-groups" \
       "$entitlement_plist" >/dev/null 2>&1; then
@@ -314,8 +371,10 @@ if [ "$unsigned" != "1" ]; then
   }
   verify_exact_service_entitlements() {
     entitlement_plist="$verify_tmp/service-exact-entitlements.plist"
-    codesign -d --entitlements :- "$service" >"$entitlement_plist"
-    /usr/bin/plutil -remove com.apple.security.application-groups "$entitlement_plist"
+    codesign -d --xml --entitlements - "$service" >"$entitlement_plist"
+    /usr/libexec/PlistBuddy \
+      -c "Delete :com.apple.security.application-groups" \
+      "$entitlement_plist"
     remaining=$(/usr/bin/plutil -convert json -o - "$entitlement_plist")
     [ "$remaining" = "{}" ] || {
       echo "signed daemon service carries entitlements beyond its exact app group: $remaining" >&2
