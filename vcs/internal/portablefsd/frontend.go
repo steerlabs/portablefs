@@ -219,18 +219,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			return
 		}
-		// Validate this envelope metadata before dispatching any body, including
-		// handshake and reserved control-lane bodies. Otherwise those early paths
-		// could silently accept a proof bit whose meaning they cannot uphold.
-		if !validFrontendSourcePhaseQueueability(
-			env.Body, env.OperationID, env.SourcePhaseQueueable,
-		) {
-			log.Printf(
-				"portablefsd frontend: closing connection: source-phase-queueable request has operation id %d and body %T",
-				env.OperationID, env.Body,
-			)
-			return
-		}
 		if disposition, ok := env.Body.(*pfslocal.ResourceReplyDisposition); ok {
 			if state != frontendAttached || env.RequestID != 0 || env.OperationID != 0 || disposition.TargetRequestID == 0 {
 				log.Printf("portablefsd frontend: closing connection: malformed resource reply disposition")
@@ -255,18 +243,35 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			req := env.Body.(*pfslocal.PublicationAck)
-			if req.PublishedRequestID != 0 || req.OperationID == 0 {
-				log.Printf("portablefsd frontend: closing connection: malformed publication ack (publishedRequestID=%d operationID=%d)", req.PublishedRequestID, req.OperationID)
-				return
-			}
-			if !c.acknowledgePublication(req.OperationID) {
-				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+			if req.OperationID == 0 ||
+				(req.SemanticCommit != pfslocal.PublicationSemanticCommitPublished &&
+					req.SemanticCommit != pfslocal.PublicationSemanticCommitNotPublished) {
+				log.Printf(
+					"portablefsd frontend: closing connection: malformed publication ack (operationID=%d semanticCommit=%d)",
+					req.OperationID, req.SemanticCommit,
+				)
 				return
 			}
 			if a := c.currentAttach(); a != nil {
 				if bridge := a.v3CoherenceBridge(); bridge != nil {
-					_ = bridge.acknowledgePublication(req.OperationID)
+					known, err := bridge.acknowledgePublication(req.OperationID, req.SemanticCommit)
+					if err != nil {
+						// The source coordinator made the terminal decision while it
+						// still owned the exact lease. Fence the attach before any
+						// frontend publication bookkeeping can release a broader gate.
+						a.fenceV3(err)
+						log.Printf("portablefsd frontend: closing connection: publication semantic commit failed for operation %d: %v", req.OperationID, err)
+						return
+					}
+					if !known {
+						log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+						return
+					}
 				}
+			}
+			if !c.acknowledgePublication(req.OperationID) {
+				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+				return
 			}
 			continue
 		} else {
@@ -321,9 +326,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			// Visibility acknowledgement is the strict mount's reserved control
-			// lane. It bypasses ordinary admission and frontend namespace locks,
-			// and runs off the serial reader so a source COMPLETE can wait for a
-			// PublicationAck arriving later on this same connection.
+			// lane. It bypasses ordinary admission and frontend namespace locks.
 			if ack, ok := req.(*pfslocal.VisibilityAckRequest); ok {
 				if env.OperationID != 0 {
 					return
@@ -386,7 +389,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 				a *attach,
 				requestID uint64,
 				operationID uint64,
-				sourcePhaseQueueable bool,
 				initializeOperation bool,
 				body any,
 			) {
@@ -397,11 +399,10 @@ func (c *frontendConn) serve(ctx context.Context) {
 					a,
 					requestID,
 					operationID,
-					sourcePhaseQueueable,
 					initializeOperation,
 					body,
 				)
-			}(c.currentAttach(), env.RequestID, env.OperationID, env.SourcePhaseQueueable, initializeOperation, req)
+			}(c.currentAttach(), env.RequestID, env.OperationID, initializeOperation, req)
 		}
 	}
 }
@@ -493,6 +494,9 @@ func (c *frontendConn) close() {
 			c.cancel()
 		}
 		_ = c.conn.Close()
+		for _, resources := range orphanedResources {
+			consumeV3ProvisionalResponses(resources)
+		}
 		// A handler may still be completing a local syscall or mutation after
 		// cancellation. Joining it here keeps connection teardown ordered
 		// behind its own handlers; it no longer gates any delegation handoff.
@@ -503,8 +507,8 @@ func (c *frontendConn) close() {
 		c.publicationMu.Unlock()
 		for operationID, entry := range pending {
 			<-entry.ready
-			c.finishLogicalOperation(entry)
 			c.releaseFrontendPublication(operationID)
+			c.finishLogicalOperation(operationID, entry)
 		}
 		if a := c.currentAttach(); a != nil {
 			a.removeConn(c.conn)
@@ -701,9 +705,27 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 		resources, disposition.AcceptHandles, disposition.AcceptedItemCount,
 	)
 	if err != nil {
-		_ = resources.d.fail(err)
+		// Validation failed before applyReplyResourceDisposition could transfer
+		// or retire anything. The table entry is already detached, so explicitly
+		// abandon the exact provisional reply before revoking the connection;
+		// otherwise its handle/item capabilities would become unreachable until
+		// whole-attach teardown.
+		abandonCleanup, abandonErr := resources.d.applyReplyResourceDisposition(resources, false, 0)
+		if abandonErr != nil {
+			err = errors.Join(err, abandonErr)
+		}
+		c.revokeV3ResponseConsumption(c.currentAttach(), err)
+		consumeV3ProvisionalResponses(resources)
+		if abandonCleanup.required() {
+			go func() {
+				if finishErr := abandonCleanup.finish(); finishErr != nil {
+					_ = resources.d.fail(finishErr)
+				}
+			}()
+		}
 		return false
 	}
+	consumeV3ProvisionalResponses(resources)
 	if cleanup.required() {
 		go func() {
 			if err := cleanup.finish(); err != nil {
@@ -725,9 +747,46 @@ func (c *frontendConn) replyWithPublication(
 	body any,
 	ackRequired bool,
 ) (delivered bool) {
-	if ackRequired && !c.markPublicationReplyExposed(operationID) {
-		_ = c.conn.Close()
-		return false
+	delivered, _ = c.replyWithPublicationWriteStatus(req, operationID, body, ackRequired)
+	return delivered
+}
+
+// replyWithPublicationWriteStatus additionally distinguishes a physically
+// written retraction from a frame that never reached the frontend. The former
+// is a valid terminal-response consumption boundary even though the callback
+// must not install the returned filesystem state.
+func (c *frontendConn) replyWithPublicationWriteStatus(
+	req uint64,
+	operationID uint64,
+	body any,
+	ackRequired bool,
+) (delivered bool, written bool) {
+	delivered, written, _ = c.replyWithPublicationDisposition(
+		req, operationID, body, ackRequired, false,
+	)
+	return delivered, written
+}
+
+// replyWithPublicationDisposition reports a third outcome for a response
+// which arrived after its callback had already acknowledged NOT_PUBLISHED (or
+// had already published another response in the same logical operation). A
+// proven read-only/definite-no-apply response is discarded without a frame;
+// an applied mutation is never eligible for this path.
+func (c *frontendConn) replyWithPublicationDisposition(
+	req uint64,
+	operationID uint64,
+	body any,
+	ackRequired bool,
+	lateDiscardable bool,
+) (delivered bool, written bool, discarded bool) {
+	if ackRequired {
+		exposed, lateDiscarded := c.markPublicationReplyExposedForV3(operationID, lateDiscardable)
+		if !exposed {
+			if !lateDiscarded {
+				_ = c.conn.Close()
+			}
+			return false, false, lateDiscarded
+		}
 	}
 	// THE VERDICT AND THE FRAME ARE ONE GATE TRANSITION.
 	//
@@ -746,6 +805,7 @@ func (c *frontendConn) replyWithPublication(
 	if err := c.write(&pfslocal.Envelope{
 		RequestID:              req,
 		PublicationAckRequired: ackRequired,
+		OperationID:            operationID,
 		Body:                   body,
 		// THE RETRACTION RIDES THE REPLY, AND THAT IS THE WHOLE ORDERING.
 		//
@@ -766,9 +826,9 @@ func (c *frontendConn) replyWithPublication(
 	}); err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
-		return false
+		return false, false, false
 	}
-	return !retracted
+	return !retracted, true, false
 }
 
 // publicationRetracted answers whether a delegation handoff has crossed this
@@ -845,15 +905,27 @@ func (c *frontendConn) captureRetraction(operationID uint64) (bool, func()) {
 }
 
 func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
+	exposed, _ := c.markPublicationReplyExposedForV3(operationID, false)
+	return exposed
+}
+
+func (c *frontendConn) markPublicationReplyExposedForV3(
+	operationID uint64,
+	lateDiscardable bool,
+) (exposed bool, discarded bool) {
 	c.publicationMu.Lock()
 	entry := c.operations[operationID]
 	if c.publicationClosed ||
 		entry == nil ||
 		entry.op == nil {
 		c.publicationMu.Unlock()
-		return false
+		return false, false
 	}
 	if entry.ackPending {
+		if lateDiscardable {
+			c.publicationMu.Unlock()
+			return false, true
+		}
 		// The callback has ended, so this frame cannot be installed and cannot
 		// acquire a second acknowledgement. If the request was a visible mutation,
 		// its authority result may already be durable while the source kernel still
@@ -866,7 +938,7 @@ func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 			"%w: logical operation %d produced a publishing reply after its callback acknowledged",
 			errFrontendPublicationUnprovable, operationID,
 		))
-		return false
+		return false, false
 	}
 	entry.replyExposed = true
 	op := entry.op
@@ -886,7 +958,7 @@ func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
 	// back into a connection's publication table, so the two locks stay
 	// unordered with respect to each other rather than newly nested.
 	op.attach.notePublicationExposed(op)
-	return true
+	return true, false
 }
 
 func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
@@ -966,7 +1038,7 @@ func (c *frontendConn) acknowledgePublication(operationID uint64) bool {
 	}
 	c.publicationMu.Unlock()
 	if finish {
-		c.finishLogicalOperation(entry)
+		c.finishLogicalOperation(operationID, entry)
 	}
 	return true
 }
@@ -989,21 +1061,23 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 		c.releaseFrontendPublication(operationID)
 	}
 	if finish {
-		c.finishLogicalOperation(entry)
+		c.finishLogicalOperation(operationID, entry)
 	}
 }
 
-func (c *frontendConn) finishLogicalOperation(entry *frontendOperationEntry) {
+func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *frontendOperationEntry) {
 	if entry != nil && entry.op != nil {
-		entry.op.attach.finishFrontendOperation(entry.op)
+		a := entry.op.attach
+		a.finishFrontendOperation(entry.op)
+		if bridge := a.v3CoherenceBridge(); bridge != nil {
+			_ = bridge.finishFrontendPublication(operationID)
+		}
 	}
 }
 
 // releaseFrontendPublication closes the authority bridge's serial-reader
-// reservation when activeRequests reaches zero. That point proves no handler
-// can still enter registerMutation. A state with no mutation ticket is therefore
-// a read-only publication or a pre-dispatch refusal and is safe to discard; a
-// visible mutation ticket keeps the channel through source COMPLETE.
+// reservation when activeRequests reaches zero. A source lease is released
+// only after both this retirement and the callback's PublicationAck.
 func (c *frontendConn) releaseFrontendPublication(operationID uint64) {
 	if a := c.currentAttach(); a != nil {
 		if bridge := a.v3CoherenceBridge(); bridge != nil {
@@ -1179,7 +1253,6 @@ func (c *frontendConn) handleAttached(
 	a *attach,
 	requestID uint64,
 	operationID uint64,
-	sourcePhaseQueueable bool,
 	initializeOperation bool,
 	body any,
 ) {
@@ -1239,7 +1312,7 @@ func (c *frontendConn) handleAttached(
 	// connection owns but never enters the clientcore admission, mirror, or
 	// delegation machinery below (see v3attach.go).
 	c.handleV3Attached(
-		ctx, a, requestID, operationID, sourcePhaseQueueable,
+		ctx, a, requestID, operationID,
 		initializeOperation, body,
 	)
 }

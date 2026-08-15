@@ -10,36 +10,30 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 	"golang.org/x/sys/unix"
 )
 
 // CoherenceProfile is the kernel-cache contract a mount declares to the
-// authority. It describes what this frontend does with its kernel's caches,
-// never which operating system it runs on.
-//
-// CoherenceUncached is a supported deployment profile, not a degraded mode: it
-// caches nothing, so it owes the authority no repair and joins no barrier.
-// CoherenceStrict caches names and attributes and pays for that by executing
-// the authority's two-phase visibility barrier synchronously.
+// authority. Protocol 5 has one coherent mount semantics: every frontend joins
+// the visibility barrier and owns its kernel publications through the physical
+// reply write. Zero is deliberately invalid so a legacy uncached attachment is
+// rejected rather than silently acquiring different semantics.
 type CoherenceProfile uint8
 
-const (
-	CoherenceUncached CoherenceProfile = iota
-	CoherenceStrict
-)
+const CoherenceStrict CoherenceProfile = 1
 
 func (p CoherenceProfile) String() string {
 	if p == CoherenceStrict {
 		return "strict"
 	}
-	return "uncached"
+	return "invalid"
 }
 
 const (
@@ -105,206 +99,114 @@ type nameKey struct {
 	name   string
 }
 
-type mutationTicket struct {
-	slot     uint32
-	sequence uint64
-}
-
-type mutationPublicationSlot struct {
-	// through is the greatest sequence whose response publication has settled.
-	// seen holds only later, out-of-order responses until every gap before them
-	// settles; transport concurrency bounds it independently of mount lifetime.
-	through uint64
-	seen    map[uint64]bool
-}
-
-// mutationPublicationLedger joins the transport's replay identity to the raw
-// FUSE callback which is publishing that mutation's reply. It retains one
-// watermark per replay slot plus only the concurrently out-of-order tail, so
-// its size is bounded by replay-slot and transport concurrency rather than by
-// mount lifetime. Every mutation response advances the slot: failed mutations
-// settle immediately, while every successful one settles only when its raw
-// callback returns. Tracking all successes avoids duplicating the authority's
-// visibility classification here; a new mutation kind cannot accidentally be
-// acknowledged before its reply merely because the frontend did not know it
-// could emit an event. An event which arrives first creates no entry at all,
-// preventing a malformed remote ticket from growing local state.
-type mutationPublicationLedger struct {
-	mu      sync.Mutex
-	bySlot  map[uint32]*mutationPublicationSlot
-	changed chan struct{}
-}
-
-func (l *mutationPublicationLedger) signalLocked() {
-	if l.changed != nil {
-		close(l.changed)
-	}
-	l.changed = make(chan struct{})
-}
-
-func advanceMutationSlot(slot *mutationPublicationSlot) {
-	for slot.seen[slot.through+1] {
-		delete(slot.seen, slot.through+1)
-		slot.through++
-	}
-}
-
-func (l *mutationPublicationLedger) accept(ticket mutationTicket, settled bool) error {
-	if ticket.sequence == 0 {
-		return errors.New("fusev3: authority returned a zero mutation sequence")
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.bySlot == nil {
-		l.bySlot = make(map[uint32]*mutationPublicationSlot)
-	}
-	slot := l.bySlot[ticket.slot]
-	if slot == nil {
-		slot = &mutationPublicationSlot{seen: make(map[uint64]bool)}
-		l.bySlot[ticket.slot] = slot
-	}
-	if ticket.sequence <= slot.through {
-		return fmt.Errorf("fusev3: duplicate mutation publication ticket for slot %d sequence %d", ticket.slot, ticket.sequence)
-	}
-	if _, exists := slot.seen[ticket.sequence]; exists {
-		return fmt.Errorf("fusev3: duplicate mutation publication ticket for slot %d sequence %d", ticket.slot, ticket.sequence)
-	}
-	slot.seen[ticket.sequence] = settled
-	advanceMutationSlot(slot)
-	l.signalLocked()
-	return nil
-}
-
-func (l *mutationPublicationLedger) complete(ticket mutationTicket) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	slot := l.bySlot[ticket.slot]
-	if slot == nil || ticket.sequence <= slot.through {
-		return
-	}
-	if _, exists := slot.seen[ticket.sequence]; !exists {
-		return
-	}
-	slot.seen[ticket.sequence] = true
-	advanceMutationSlot(slot)
-	l.signalLocked()
-}
-
-func (l *mutationPublicationLedger) wait(ctx context.Context, ticket mutationTicket) error {
-	if ticket.sequence == 0 {
-		return errors.New("fusev3: self COMPLETE omitted its mutation sequence")
-	}
-	for {
-		l.mu.Lock()
-		if slot := l.bySlot[ticket.slot]; slot != nil && slot.through >= ticket.sequence {
-			l.mu.Unlock()
-			return nil
-		}
-		if l.changed == nil {
-			l.changed = make(chan struct{})
-		}
-		changed := l.changed
-		l.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return fmt.Errorf("fusev3: wait for raw reply publication of mutation slot %d sequence %d: %w", ticket.slot, ticket.sequence, ctx.Err())
-		}
-	}
-}
-
 type mutationCallbackKey struct{}
 
 type mutationCallback struct {
-	ledger  *mutationPublicationLedger
-	mu      sync.Mutex
-	tickets []mutationTicket
-	done    bool
-}
-
-func (c *mutationCallback) accept(ticket mutationTicket) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.done {
-		return fmt.Errorf("fusev3: mutation slot %d sequence %d arrived after its raw callback returned", ticket.slot, ticket.sequence)
-	}
-	if err := c.ledger.accept(ticket, false); err != nil {
-		return err
-	}
-	c.tickets = append(c.tickets, ticket)
-	return nil
+	publication replyPublication
+	mount       *Mount
 }
 
 func (c *mutationCallback) finish() {
-	c.mu.Lock()
-	if c.done {
-		c.mu.Unlock()
+	lease := c.publication.source
+	if lease != nil && lease.terminalAtCallbackReturn() {
+		lease.revoke()
+		lease.r.mount.revoke(errors.New("fusev3: visible mutation returned without completing its source publication result"))
+		c.publication.consumeAuthorityResponse()
 		return
 	}
-	c.done = true
-	tickets := append([]mutationTicket(nil), c.tickets...)
-	c.mu.Unlock()
-	for _, ticket := range tickets {
-		c.ledger.complete(ticket)
+	// A malformed authority result has no kernel state worth publishing. Once
+	// its callback revokes the local serving boundary, returning the terminal
+	// delivery receipt is safe and lets the fenced authority finish teardown
+	// without waiting for a /dev/fuse reply which the revoked mount may drop.
+	if c.mount != nil && c.mount.isRevoked() {
+		c.publication.consumeAuthorityResponse()
 	}
 }
 
-func mutationResponseNeedsCallback(request *authoritypb.Request, response *authoritypb.Response) bool {
-	if request.GetReclaim() != nil {
-		// A reclaim retires a capability the kernel has already forgotten, so
-		// its reply publishes nothing and its replay sequence settles the
-		// moment it is accepted. It still must settle: a reclaim consumes a
-		// sequence on its slot like any other mutation, and leaving that
-		// sequence unrecorded would leave a permanent hole in the slot's
-		// publication watermark, deadlocking the deferred self-COMPLETE of the
-		// next visible mutation the client assigns to the same slot.
-		return false
+func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem, gate *authoritypb.SourcePublicationGate) (*sourcePublicationLease, error) {
+	if c.publication.source != nil {
+		return nil, errors.New("fusev3: raw callback attempted more than one visible source mutation")
 	}
-	if responseErrno(response) == 0 {
-		return true
+	lease, err := raw.acquireSourcePublication(ctx, gate)
+	if err != nil {
+		return nil, err
 	}
-	// write(2) is the one Linux mutation which may commit a prefix and also
-	// report an error. The raw frontend returns that positive progress and the
-	// authority emits a DATA event for it, so its callback has the same source
-	// publication obligation as a wholly successful write.
-	return request.GetWrite() != nil && response.GetWrite().GetCount() != 0
+	c.publication.source = lease
+	return lease, nil
 }
 
-// recordMutationResponse is called while the raw callback is still active,
-// immediately after the transport has returned the authority's accepted replay
-// identity. Failed mutations have no COMPLETE to wait for, so they settle
-// immediately and advance the per-slot watermark. Every successful mutation
-// remains pending until the callback has finished its raw reply; that makes the
-// handshake future-proof against the authority adding a new visible operation.
-func (m *Mount) recordMutationResponse(ctx context.Context, request *authoritypb.Request, response *authoritypb.Response, callErr error) error {
-	if m.profile != CoherenceStrict || callErr != nil || response == nil || response.GetUncertain() {
+func sourceLeaseFromContext(ctx context.Context) *sourcePublicationLease {
+	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+	if callback == nil {
 		return nil
 	}
-	state := response.GetMutation()
-	if state == nil {
-		if mutationResponseNeedsCallback(request, response) {
-			return errors.New("fusev3: successful mutation response omitted its replay identity")
-		}
-		return nil
-	}
-	ticket := mutationTicket{slot: state.GetSlot(), sequence: state.GetAcceptedSequence()}
-	if !mutationResponseNeedsCallback(request, response) {
-		return m.publications.accept(ticket, true)
-	}
-	callback, ok := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
-	if !ok || callback == nil {
-		return errors.New("fusev3: successful mutation response escaped its raw FUSE callback lifecycle")
-	}
-	return callback.accept(ticket)
+	return callback.publication.source
 }
 
-func (r *rawFileSystem) mutationContext() (context.Context, func()) {
+func replyPublicationFromContext(ctx context.Context) *replyPublication {
+	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+	if callback == nil {
+		return nil
+	}
+	return &callback.publication
+}
+
+func retainAuthorityResponse(ctx context.Context, consumption authorityrpc.ResponseConsumption) error {
+	if consumption == nil {
+		return nil
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return errors.New("fusev3: authority response escaped its physical kernel reply lifecycle")
+	}
+	publication.responseConsumptions = append(publication.responseConsumptions, consumption)
+	return nil
+}
+
+func completeSourcePublication(ctx context.Context) error {
+	lease := sourceLeaseFromContext(ctx)
+	if lease == nil {
+		return nil
+	}
+	if err := lease.markCallbackPublicationReady(); err != nil {
+		return err
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return errors.New("fusev3: source publication escaped its reply ownership")
+	}
+	publication.needsPostVFS = true
+	return nil
+}
+
+// completeDefiniteNoChangePublication closes an assigned source mutation whose
+// structured result proves no filesystem state was changed. Its response must
+// be physically ordered, but must not request a post-VFS receipt because the
+// kernel has no new state to install.
+func completeDefiniteNoChangePublication(ctx context.Context) error {
+	lease := sourceLeaseFromContext(ctx)
+	if lease == nil {
+		return errors.New("fusev3: definite no-change mutation escaped its source publication ownership")
+	}
+	lease.resolveAllNoBinding()
+	return lease.markDefiniteNoChange()
+}
+
+func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(), fuse.Status) {
 	ctx := r.opContext()
-	if r.profile != CoherenceStrict {
-		return ctx, func() {}
+	callback := &mutationCallback{mount: r.mount}
+	if err := r.registerReplyPublication(unique, &callback.publication); err != nil {
+		// Registration is the ownership reservation for every fact this callback
+		// could make cacheable. It happens before any lookup/mutation RPC, so an
+		// impossible zero/reused FUSE identity cannot race an untracked success
+		// reply onto /dev/fuse.
+		r.mount.revoke(err)
+		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
 	}
-	callback := &mutationCallback{ledger: &r.mount.publications}
-	return context.WithValue(ctx, mutationCallbackKey{}, callback), callback.finish
+	return context.WithValue(ctx, mutationCallbackKey{}, callback), func() {
+		callback.finish()
+		r.finishReplyPublicationRegistration(unique, &callback.publication)
+	}, fuse.OK
 }
 
 // kernelMount is the identity of the installed FUSE mount, read once from
@@ -346,7 +248,13 @@ func observeKernelMount(mountpoint string) (kernelMount, error) {
 // the validated mountpoint after our attempt fails; that says nothing about
 // whether this exact PortableFS mount still exists. Conversely, finding the
 // unique source anywhere in the namespace is enough to refuse clean detach.
-func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
+// ObservePlannedKernelMountAbsent proves that the exact, attempt-unique FUSE
+// source has not been published into this mount namespace. Mount supervisors
+// use it both immediately before handing an ACTIVE authority session to
+// MountVolume and inside MountVolume's failed-startup cleanup. Exporting this
+// one primitive keeps those two ownership boundaries backed by the identical
+// /proc/self/mountinfo observation rather than two subtly different parsers.
+func ObservePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
 	if fsName == "" || mountpoint == "" {
 		return MountAbsenceProof{}, errors.New("fusev3: planned mount identity is incomplete")
 	}
@@ -390,6 +298,10 @@ func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsencePro
 		Observation:       []byte(observation),
 		Component:         mountInfoPath,
 	}, nil
+}
+
+func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
+	return ObservePlannedKernelMountAbsent(fsName, mountpoint)
 }
 
 // absent reports whether this exact mount is no longer installed, and returns
@@ -476,8 +388,8 @@ type coherence struct {
 func (c *coherence) run(ctx context.Context) {
 	defer c.mount.wg.Done()
 	cursor := c.mount.rpc.InitialVisibilityCursor()
+	event, err := c.mount.rpc.NextVisibility(ctx, cursor)
 	for {
-		event, err := c.mount.rpc.NextVisibility(ctx, cursor)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -489,14 +401,8 @@ func (c *coherence) run(ctx context.Context) {
 			c.mount.revoke(err)
 			return
 		}
-		if err := c.mount.rpc.AckVisibility(ctx, event.GetCursor()); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			c.mount.revoke(fmt.Errorf("fusev3: visibility acknowledgment refused: %w", err))
-			return
-		}
 		cursor = event.GetCursor()
+		event, err = c.mount.rpc.NextVisibilityAfterAck(ctx, cursor, false)
 	}
 }
 
@@ -534,6 +440,9 @@ func (c *coherence) apply(ctx context.Context, event *authoritypb.VisibilityEven
 	// repair -- the VFS updates its own dcache from the reply to that syscall,
 	// under that same lock, which is strictly more precise than a notification.
 	self := len(c.session) != 0 && bytes.Equal(event.GetInitiatorSessionId(), c.session)
+	if self && event.GetRoutes() == nil {
+		return errors.New("fusev3: authority delivered this source a filesystem visibility phase; protocol 5 excludes the source because its exact publication gate already owns that cut")
+	}
 	switch event.GetCursor().GetPhase() {
 	case authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE:
 		// PREPARE is never reportable. It closes cache admission by publishing
@@ -541,13 +450,7 @@ func (c *coherence) apply(ctx context.Context, event *authoritypb.VisibilityEven
 		// holding, so there is no phase here that this mount cannot service.
 		return c.mount.raw.prepareVisibility(ctx, event.GetTargets(), self)
 	case authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE:
-		if self {
-			ticket := mutationTicket{slot: event.GetMutationSlot(), sequence: event.GetMutationSequence()}
-			if err := c.mount.publications.wait(ctx, ticket); err != nil {
-				return err
-			}
-		}
-		completion, blocked, err := c.mount.raw.beginVisibilityComplete(event.GetTargets(), self)
+		completion, blocked, err := c.mount.raw.beginVisibilityCompleteAt(event.GetTargets(), self, event.GetCursor().GetSequence())
 		if err != nil {
 			return err
 		}
@@ -583,7 +486,17 @@ func (c *coherence) reportUnservable(ctx context.Context, event *authoritypb.Vis
 // cache keys.
 type visibilityKeys struct {
 	names  []nameKey
-	inodes []uint64
+	inodes []visibilityInodeKey
+}
+
+// visibilityInodeKey is one normalized inode repair. A data target dominates
+// any attribute target for the same kernel inode because dropping cached pages
+// also requires dropping the cached attributes that describe them.
+type visibilityInodeKey struct {
+	inode    uint64
+	identity publicationIdentity
+	data     bool
+	size     uint64
 }
 
 // translate converts VisibilityTargets into cache keys. This frontend keys its
@@ -596,7 +509,9 @@ type visibilityKeys struct {
 // The one backing device is pinned on first sight and any later disagreement is
 // a violation of the one-volume contract, not something to paper over.
 func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visibilityKeys, error) {
-	var keys visibilityKeys
+	// Validate the complete raw event before normalizing or pinning any state.
+	// In particular, a malformed ATTRIBUTES target must not disappear merely
+	// because an earlier DATA target for the same inode dominates its repair.
 	for _, target := range targets {
 		// The full shared wire contract is enforced, not just the fields this
 		// frontend repairs by. A frontend that silently tolerates a shape the
@@ -605,14 +520,57 @@ func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visi
 		if err := visibilitywire.ValidateTarget(target); err != nil {
 			return visibilityKeys{}, fmt.Errorf("fusev3: %w", err)
 		}
-		if err := r.pinIdentityDevice(target.GetDevice()); err != nil {
+	}
+	var device uint64
+	for _, target := range targets {
+		if device == 0 {
+			device = target.GetDevice()
+		} else if device != target.GetDevice() {
+			return visibilityKeys{}, fmt.Errorf("fusev3: authority reported coordination identities from two devices (%x and %x); a volume is exactly one filesystem", device, target.GetDevice())
+		}
+	}
+	if device != 0 {
+		if err := r.pinIdentityDevice(device); err != nil {
 			return visibilityKeys{}, err
 		}
+	}
+
+	var keys visibilityKeys
+	var inodeIndexes map[uint64]int
+	for _, target := range targets {
 		switch target.GetScope() {
 		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
 			keys.names = append(keys.names, nameKey{parent: target.GetParentKernelIno(), name: string(target.GetName())})
-		default:
-			keys.inodes = append(keys.inodes, target.GetKernelIno())
+		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES:
+			inode := target.GetKernelIno()
+			data := target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA
+			identity, ok := publicationIdentityFromBytes(target.GetIdentity())
+			if !ok {
+				return visibilityKeys{}, errors.New("fusev3: visibility inode target carried an invalid stable identity")
+			}
+			if inodeIndexes == nil {
+				inodeIndexes = make(map[uint64]int)
+			}
+			if index, exists := inodeIndexes[inode]; exists {
+				key := &keys.inodes[index]
+				if key.identity != identity {
+					return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two stable identities in one visibility event", inode)
+				}
+				if data {
+					size := uint64(target.GetSize())
+					if key.data && key.size != size {
+						return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two authoritative DATA sizes (%d and %d)", inode, key.size, size)
+					}
+					key.data, key.size = true, size
+				}
+				continue
+			}
+			inodeIndexes[inode] = len(keys.inodes)
+			key := visibilityInodeKey{inode: inode, identity: identity, data: data}
+			if data {
+				key.size = uint64(target.GetSize())
+			}
+			keys.inodes = append(keys.inodes, key)
 		}
 	}
 	return keys, nil
@@ -644,41 +602,25 @@ func (r *rawFileSystem) pinIdentityDevice(device uint64) error {
 // pre-mutation truth -- which is still the truth, because the authority has not
 // applied yet -- while leaving nothing behind for COMPLETE to have to repair.
 func (r *rawFileSystem) prepareVisibility(ctx context.Context, targets []*authoritypb.VisibilityTarget, self bool) error {
+	if self {
+		return errors.New("fusev3: source filesystem PREPARE is forbidden by the source-owned publication protocol")
+	}
 	keys, err := r.translate(targets)
 	if err != nil {
 		return err
 	}
-	r.mu.Lock()
-	if self {
-		// The initiating mount does not gate its own names. The VFS resolves
-		// the affected binding under the parent's i_rwsem and rebinds it from
-		// this operation's own reply under the same lock, so a concurrent local
-		// lookup of that name is already ordered against the mutation. Inode
-		// state has no such lock, so attributes and data stay gated.
-		keys.names = nil
+	if err := r.acquirePeerPublication(ctx, targets, keys); err != nil {
+		return err
 	}
-	for _, key := range keys.names {
-		r.heldNames[key] = struct{}{}
-	}
-	for _, inode := range keys.inodes {
-		r.heldInodes[inode] = struct{}{}
-	}
-	r.heldPhase = keys
-	r.mu.Unlock()
 	// Admission is closed; now wait out the publications that were already
 	// decided cacheable before it closed. They are pure local work with no
 	// authority round trip inside them, and no mutation waits on them, so this
 	// drain cannot participate in the barrier's own dependency cycle.
 	//
-	// The drain ends when the reply has been handed back to go-fuse, not when
-	// the kernel has installed it, and closing that last gap is the kernel's
-	// job rather than this frontend's. For a name it is the parent's i_rwsem:
-	// lookup_slow holds it across the entire round trip including
-	// d_splice_alias, and fuse_reverse_inval_entry takes it exclusively, so an
-	// invalidation can never interleave with an installation. For an inode it
-	// is fuse_change_attributes, which discards a reply whose attr_version
-	// predates the last invalidation. Both are load-bearing; the drain alone
-	// would leave a window.
+	// Publication remains counted through the real /dev/fuse response write.
+	// Publication-bearing replies and reverse notifications share go-fuse's
+	// writer ordering boundary, so an acknowledged PREPARE cannot be followed
+	// by installation of a stale reply that was merely returned by RawFS first.
 	return r.drainPublications(ctx, keys)
 }
 
@@ -694,7 +636,7 @@ func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKe
 		}
 		if !busy {
 			for _, inode := range keys.inodes {
-				if r.publishingInodes[inode] != 0 {
+				if r.publishingInodes[inode.inode] != 0 {
 					busy = true
 					break
 				}
@@ -716,11 +658,13 @@ func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKe
 
 // repair is one kernel cache repair this frontend owes.
 type repair struct {
-	parent uint64
-	child  uint64
-	name   string
-	inode  uint64
-	data   bool
+	parent   uint64
+	child    uint64
+	name     string
+	inode    uint64
+	data     bool
+	size     uint64
+	sequence uint64
 }
 
 // visibilityCompletion owns one COMPLETE's exact repair work and the parent
@@ -736,36 +680,46 @@ type visibilityCompletion struct {
 // r.mu critical section. The returned boolean says that a callback was already
 // admitted in one of those exact parents and therefore needs the authority to
 // refuse its queued mutation before this frontend waits for it to drain.
-func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.VisibilityTarget, self bool) (visibilityCompletion, bool, error) {
+func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.VisibilityTarget, self bool, sequence uint64) (visibilityCompletion, bool, error) {
+	if self {
+		return visibilityCompletion{}, false, errors.New("fusev3: source filesystem COMPLETE is forbidden by the source-owned publication protocol")
+	}
+	if sequence == 0 {
+		return visibilityCompletion{}, false, errors.New("fusev3: visibility COMPLETE carried no sequence")
+	}
 	keys, err := r.translate(targets)
 	if err != nil {
 		return visibilityCompletion{}, false, err
 	}
 	completion := visibilityCompletion{parents: make(map[uint64]struct{})}
 	r.mu.Lock()
-	if !self {
-		completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
-		for _, key := range keys.names {
-			record := r.cachedNames[key]
-			if record == nil {
-				continue
-			}
-			parent := r.directoryLocked(key.parent)
-			r.dropCachedNameLocked(key)
-			if parent == nil {
-				continue
-			}
-			completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name})
-			if _, already := completion.parents[key.parent]; !already {
-				completion.parents[key.parent] = struct{}{}
-				completion.parentKernelInos = append(completion.parentKernelInos, key.parent)
-			}
+	for _, inode := range keys.inodes {
+		if record := r.byInodeLocked(inode.inode); record != nil && record.identity != inode.identity {
+			r.mu.Unlock()
+			return visibilityCompletion{}, false, fmt.Errorf("fusev3: visibility target for inode %d does not match the cached stable identity", inode.inode)
 		}
-		for _, inode := range keys.inodes {
-			record := r.byInodeLocked(inode)
-			if record != nil {
-				completion.work = append(completion.work, repair{inode: record.id, data: true})
-			}
+	}
+	completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
+	for _, key := range keys.names {
+		record := r.cachedNames[key]
+		if record == nil {
+			continue
+		}
+		parent := r.directoryLocked(key.parent)
+		r.dropCachedNameLocked(key)
+		if parent == nil {
+			continue
+		}
+		completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name})
+		if _, already := completion.parents[key.parent]; !already {
+			completion.parents[key.parent] = struct{}{}
+			completion.parentKernelInos = append(completion.parentKernelInos, key.parent)
+		}
+	}
+	for _, inode := range keys.inodes {
+		record := r.byInodeLocked(inode.inode)
+		if record != nil {
+			completion.work = append(completion.work, repair{inode: record.id, data: inode.data, size: inode.size, sequence: sequence})
 		}
 	}
 	for parent := range completion.parents {
@@ -774,6 +728,12 @@ func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.Visibilit
 	blocked := r.parkedOverlapLocked(completion.parents)
 	r.mu.Unlock()
 	return completion, blocked, nil
+}
+
+// beginVisibilityComplete is the direct test seam. Production always supplies
+// the authority cursor sequence through beginVisibilityCompleteAt.
+func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.VisibilityTarget, self bool) (visibilityCompletion, bool, error) {
+	return r.beginVisibilityCompleteAt(targets, self, 1)
 }
 
 func (r *rawFileSystem) parkedOverlapLocked(parents map[uint64]struct{}) bool {
@@ -851,9 +811,10 @@ func (r *rawFileSystem) releaseComplete(parents map[uint64]struct{}) {
 		delete(r.heldNames, key)
 	}
 	for _, inode := range r.heldPhase.inodes {
-		delete(r.heldInodes, inode)
+		delete(r.heldInodes, inode.inode)
 	}
 	r.heldPhase = visibilityKeys{}
+	r.releasePeerPublicationLocked()
 	r.signalParkedLocked()
 }
 
@@ -872,15 +833,17 @@ func (r *rawFileSystem) applyRepair(item repair) error {
 	if server == nil {
 		return errors.New("fusev3: kernel cache repair has no notification channel")
 	}
-	if item.data {
-		// Offset -1 is attribute-only invalidation; offset 0 with no length
-		// additionally drops every cached page. Data and attribute targets are
-		// both repaired the strong way because the authoritative post-mutation
-		// size cannot be *installed* through any Linux notification -- the
-		// kernel only forgets, it never accepts a new value here -- so the
-		// following GETATTR is what carries the new size, and it must not be
-		// answered from a cache.
-		if status := server.InodeNotify(item.inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+	if item.inode != 0 {
+		if item.data {
+			// The private notify installs the exact post-mutation EOF at this
+			// visibility sequence and invalidates every cached page, including
+			// same-size overwrites where an EOF delta alone would do nothing.
+			if status := server.PFSSizeNotify(item.inode, item.size, item.sequence); !status.Ok() && status != fuse.ENOENT {
+				return fmt.Errorf("fusev3: publish exact size %d at sequence %d for inode %d: %v", item.size, item.sequence, item.inode, status)
+			}
+			return nil
+		}
+		if status := server.InodeNotify(item.inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
 			return fmt.Errorf("fusev3: invalidate inode %d: %v", item.inode, status)
 		}
 		// ENOENT is the strongest successful outcome for invalidation: the
@@ -920,9 +883,10 @@ func (r *rawFileSystem) releaseHeld() {
 		delete(r.heldNames, key)
 	}
 	for _, inode := range r.heldPhase.inodes {
-		delete(r.heldInodes, inode)
+		delete(r.heldInodes, inode.inode)
 	}
 	r.heldPhase = visibilityKeys{}
+	r.releasePeerPublicationLocked()
 }
 
 // revokeCachedNames walks the exact set of bindings this mount published and
@@ -941,6 +905,8 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 		work = append(work, repair{parent: parent.id, child: record.id, name: key.name})
 	}
 	r.cachedNames = make(map[nameKey]*inodeRecord)
+	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
+	r.cachedNameStable = make(map[nameKey]publicationNamespace)
 	r.mu.Unlock()
 	server := r.mount.notifier()
 	if server == nil {
@@ -1003,6 +969,7 @@ func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 // tested without a kernel; *fuse.Server is the only production implementation.
 type kernelNotifier interface {
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
+	PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status
 	EntryNotify(parent uint64, name string) fuse.Status
 	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
 }
@@ -1031,13 +998,6 @@ func (m *Mount) setNotifier(notify kernelNotifier) {
 func (m *Mount) detach() error {
 	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
 	defer cancel()
-	if m.profile != CoherenceStrict {
-		// An uncached mount has no visibility membership to discharge. Detach is
-		// best-effort resource cleanup; connection close is sufficient if the
-		// authority is already unavailable.
-		_, _ = m.rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
-		return nil
-	}
 	if m.kernelMount.point == "" {
 		// Startup may have installed a FUSE connection and then failed before
 		// mountinfo yielded its kernel ID. Once that connection is terminal, the

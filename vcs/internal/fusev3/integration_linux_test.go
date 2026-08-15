@@ -932,14 +932,11 @@ func TestAuthorityLossFailsCleanlyInsteadOfHanging(t *testing.T) {
 		if err == nil {
 			t.Fatal("a read through a descriptor of a destroyed authority succeeded")
 		}
-		// A strict mount answers ENOTCONN rather than EIO here, and the
-		// difference is the point of the change: losing the authority means
-		// this frontend can no longer be told that what it cached has changed,
-		// so it revokes itself and stops being a filesystem at all. EIO
-		// remains correct for the uncached profile, which caches nothing and
-		// therefore only ever fails the individual operation.
-		if !errors.Is(err, syscall.ENOTCONN) && !errors.Is(err, syscall.EIO) {
-			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked) or EIO", err)
+		// Losing the authority means this frontend can no longer be told that
+		// what it cached has changed, so it revokes itself and stops being a
+		// filesystem rather than failing only this operation.
+		if !errors.Is(err, syscall.ENOTCONN) {
+			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked)", err)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("a read through a descriptor of a destroyed authority hung")
@@ -1546,96 +1543,53 @@ func TestVisibilityAcknowledgmentSurvivesSaturatedIO(t *testing.T) {
 	}
 }
 
-// TestUncachedProfileRemainsFullyCorrect keeps the other supported deployment
-// profile honest against a real kernel. It caches nothing, joins no barrier,
-// and must still be exactly coherent.
-func TestUncachedProfileRemainsFullyCorrect(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Uncached: true})
-	mustWrite(t, f.join(0, "shared"), []byte("one"), 0o600)
-	requireContent(t, f.join(1, "shared"), []byte("one"), "uncached cross-mount read")
-
-	// Nothing is cached, so every resolution reaches the authority. That is the
-	// profile's defining property, not a defect.
-	reached := f.countRequests("lookup", func() {
-		for range 3 {
-			if _, err := os.Lstat(f.join(1, "shared")); err != nil {
-				t.Fatal(err)
-			}
-		}
-	})
-	if reached == 0 {
-		t.Fatal("an uncached mount answered a path walk without the authority; it has no way to be told the answer changed")
-	}
-	mustWrite(t, f.join(0, "shared"), []byte("two"), 0o600)
-	requireContent(t, f.join(1, "shared"), []byte("two"), "uncached cross-mount read after a remote write")
-	if err := os.Remove(f.join(0, "shared")); err != nil {
-		t.Fatal(err)
-	}
-	requireAbsent(t, f.join(1, "shared"), "uncached mount after a remote unlink")
-}
-
 // TestMetadataWorkloadRPCCost measures the thing this whole change is for, on a
-// real workload, on both supported profiles. `git status` re-lstats every
-// tracked path; with nothing cacheable that is one authority round trip per
-// path component per invocation, which is the multiplier that made this
-// frontend unusable at scale.
+// real workload. `git status` re-lstats every tracked path; the coherent name
+// cache must collapse those repeated walks rather than reintroduce one
+// authority round trip per path component per invocation.
 //
 // The assertion is on name resolution alone. That is the part a name and
 // attribute cache is responsible for; the rest of what `git status` does --
 // reading its index, listing directories, and re-hashing any file git considers
-// racily clean -- reaches the authority on both profiles by design, and how
+// racily clean -- reaches the authority by design, and how
 // much of it happens depends on wall-clock timing git owns, not on coherence.
 // All of it is logged, because the interesting number is the whole shape.
 func TestMetadataWorkloadRPCCost(t *testing.T) {
 	requireWorkloadEnvironment(t)
 	const files = 200
 	kinds := []string{"lookup", "getattr", "reclaim", "other"}
-	measure := func(t *testing.T, uncached bool) (lookups, total int) {
-		t.Helper()
-		f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Uncached: uncached})
-		repository := f.join(0, "repo")
-		f.runWorkload("git", "init", "-q", repository)
-		f.runWorkload("git", "-C", repository, "config", "user.email", "portablefs@example.invalid")
-		f.runWorkload("git", "-C", repository, "config", "user.name", "PortableFS Test")
-		for i := range files {
-			mustWrite(t, filepath.Join(repository, fmt.Sprintf("source-%03d.txt", i)), []byte("content\n"), 0o600)
-		}
-		f.runWorkload("git", "-C", repository, "add", ".")
-		f.runWorkload("git", "-C", repository, "commit", "-q", "-m", "exercise PortableFS")
-		// git treats a file whose mtime is not strictly older than its index as
-		// racily clean and re-reads its contents, and mtime comparison there is
-		// at one-second granularity. Letting the second turn over before the
-		// warm-up run is what makes the measured run a steady state on both
-		// profiles instead of a race against how fast the profile happens to be.
-		time.Sleep(1100 * time.Millisecond)
-		f.runWorkload("git", "-C", repository, "status", "--porcelain")
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	repository := f.join(0, "repo")
+	f.runWorkload("git", "init", "-q", repository)
+	f.runWorkload("git", "-C", repository, "config", "user.email", "portablefs@example.invalid")
+	f.runWorkload("git", "-C", repository, "config", "user.name", "PortableFS Test")
+	for i := range files {
+		mustWrite(t, filepath.Join(repository, fmt.Sprintf("source-%03d.txt", i)), []byte("content\n"), 0o600)
+	}
+	f.runWorkload("git", "-C", repository, "add", ".")
+	f.runWorkload("git", "-C", repository, "commit", "-q", "-m", "exercise PortableFS")
+	// Make the measured invocation a steady-state walk instead of a race with
+	// git's one-second racily-clean mtime rule.
+	time.Sleep(1100 * time.Millisecond)
+	f.runWorkload("git", "-C", repository, "status", "--porcelain")
 
-		before := make([]int, len(kinds))
-		for i, kind := range kinds {
-			before[i] = f.counter.count(kind)
-		}
-		f.runWorkload("git", "-C", repository, "status", "--porcelain")
-		breakdown := make([]string, 0, len(kinds))
-		for i, kind := range kinds {
-			delta := f.counter.count(kind) - before[i]
-			total += delta
-			if kind == "lookup" {
-				lookups = delta
-			}
-			breakdown = append(breakdown, fmt.Sprintf("%s=%d", kind, delta))
-		}
-		t.Logf("%s: %d authority requests for one `git status` over %d tracked files (%s)",
-			map[bool]string{true: "uncached", false: "strict"}[uncached], total, files, strings.Join(breakdown, " "))
-		return lookups, total
+	before := make([]int, len(kinds))
+	for i, kind := range kinds {
+		before[i] = f.counter.count(kind)
 	}
-	var strictLookups, strictTotal, uncachedLookups, uncachedTotal int
-	t.Run("strict", func(t *testing.T) { strictLookups, strictTotal = measure(t, false) })
-	t.Run("uncached", func(t *testing.T) { uncachedLookups, uncachedTotal = measure(t, true) })
-	t.Logf("strict=%d requests (%d LOOKUP) uncached=%d requests (%d LOOKUP)", strictTotal, strictLookups, uncachedTotal, uncachedLookups)
-	if uncachedLookups < files {
-		t.Fatalf("the uncached profile issued %d LOOKUPs for %d tracked files; the measurement is not measuring the walk", uncachedLookups, files)
+	f.runWorkload("git", "-C", repository, "status", "--porcelain")
+	lookups, total := 0, 0
+	breakdown := make([]string, 0, len(kinds))
+	for i, kind := range kinds {
+		delta := f.counter.count(kind) - before[i]
+		total += delta
+		if kind == "lookup" {
+			lookups = delta
+		}
+		breakdown = append(breakdown, fmt.Sprintf("%s=%d", kind, delta))
 	}
-	if strictLookups*4 > uncachedLookups {
-		t.Fatalf("strict issued %d LOOKUPs against uncached %d; a strict mount must resolve a cached path without the authority", strictLookups, uncachedLookups)
+	t.Logf("%d authority requests for one steady-state `git status` over %d tracked files (%s)", total, files, strings.Join(breakdown, " "))
+	if lookups >= files/4 {
+		t.Fatalf("coherent cache issued %d LOOKUPs for %d tracked files; repeated path walks must stay below one lookup per four files", lookups, files)
 	}
 }

@@ -277,6 +277,7 @@ private struct PfsPendingRequest: Sendable {
 private struct PfsPublicationTicket: Sendable {
     var connection: PfsConnection
     var operationID: UInt64
+    var semanticCommit: PfsPublicationSemanticCommit
     // The write receipts of every request that carried this operation's ID.
     // The acknowledgement is gated on them: the ack travels the priority
     // publication lane, which dequeues ahead of the request lane, so an ack
@@ -469,6 +470,7 @@ private final class PfsPublicationCollector: @unchecked Sendable {
                 PfsPublicationTicket(
                     connection: $0,
                     operationID: operationID,
+                    semanticCommit: itemsPublished ? .published : .notPublished,
                     stampedWrites: writes
                 )
             }
@@ -662,20 +664,6 @@ private func pfsRequestRequiresExactLifecycleOutcome(
         return true
     default:
         return false
-    }
-}
-
-/// Validates the request-only source-phase scheduling proof before the frame
-/// enters the writer. A malformed true value would make the daemon close the
-/// strict connection, so local composition must fail without touching it.
-func pfsValidateSourcePhaseQueueability(
-    _ sourcePhaseQueueable: Bool,
-    operationID: UInt64
-) throws {
-    guard !sourcePhaseQueueable || operationID != 0 else {
-        throw PfsLocalClientError.invalidFrame(
-            "source-phase-queueable ordered mutation requires an operation ID"
-        )
     }
 }
 
@@ -1332,20 +1320,6 @@ public actor PfsLocalClient {
             return
         }
 
-        // This field is client-to-daemon scheduling metadata only. Accepting it
-        // on a reply or event would erase directionality and make a peer bug
-        // look like a valid proof. Retire the exact connection before any body
-        // can be published or delivered.
-        guard !envelope.sourcePhaseQueueable else {
-            closeCurrentConnection(
-                connectionID,
-                error: PfsLocalClientError.invalidFrame(
-                    "daemon reply/event set request-only source_phase_queueable"
-                )
-            )
-            return
-        }
-
         if envelope.requestID == 0 {
             if case let .event(event)? = envelope.body {
                 if case let .attachState(state)? = event.kind, state.state == .detaching {
@@ -1492,9 +1466,6 @@ public actor PfsLocalClient {
         // daemon-to-authority liveness round trip on its resolved session.
         // Protocol minor 10: directory enumeration carries the retained read
         // handle whose authority cursor issued every continuation cookie.
-        // Protocol minor 11: each ordered request carries the ticket's exact
-        // source-phase queueability verdict. A daemon that infers this from
-        // operation-ID inequality can deadlock a mixed read-then-write callback.
         // Protocol minor 12: every successful reply that allocates new daemon
         // or authority resources remains provisional until the frontend sends
         // its final framework ownership verdict.
@@ -1502,7 +1473,11 @@ public actor PfsLocalClient {
         // ordered-admission contention bit used for bounded FIFO compensation.
         // Protocol minor 14: namespace targets can carry the exact authority
         // post-binding used to inode-attest a new rename/hard-link coordinate.
-        hello.protocolMinor = 14
+        // Protocol minor 15: the nested authority session is protocol 5 and was
+        // activated only after its mandatory DATA and CONTROL bindings existed;
+        // source publication is daemon-gated and every PublicationAck carries
+        // an explicit callback semantic-commit verdict.
+        hello.protocolMinor = 15
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -1510,7 +1485,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 14 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 15 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
         // ADOPT THE DAEMON'S BOUND, AND NEVER SHORTEN IT.
@@ -1572,23 +1547,21 @@ public actor PfsLocalClient {
             throw PfsLocalClientError.cancelled
         }
         var trackedOrderedMutation = false
-        var sourcePhaseQueueable = false
         var ordinaryRequestID: UInt64?
         if let admissionTicket {
             if orderedMutation {
-                let submission: PfsMacOSOrderedMutationSubmission?
+                let submitted: Bool
                 do {
-                    submission = try await admissionTicket
-                        .orderedMutationSubmissionWhenPermitted()
+                    submitted = try await admissionTicket
+                        .orderedMutationSubmittedWhenPermitted()
                 } catch is CancellationError {
                     throw PfsLocalClientError.cancelled
                 }
-                guard let submission else {
+                guard submitted else {
                     pfsClientLogger.error("v2 ordered mutation reached a revoked admission ticket before dispatch")
                     throw admissionTicket.admissionRefusalError()
                 }
                 trackedOrderedMutation = true
-                sourcePhaseQueueable = submission.sourcePhaseQueueable
             } else {
                 let submittedRequestID: UInt64?
                 do {
@@ -1614,9 +1587,8 @@ public actor PfsLocalClient {
                 }
             }
         }
-        // Parking above yields the client actor. A terminal transport change
-        // while the source COMPLETE was outstanding must not dispatch this
-        // callback on the retired ownership epoch captured before the wait.
+        // Admission above yields the client actor. A terminal transport change
+        // must not dispatch this callback on the retired ownership epoch.
         guard self.connection?.id == connection.id else {
             throw PfsLocalClientError.connectionClosed
         }
@@ -1633,12 +1605,6 @@ public actor PfsLocalClient {
                     throw PfsLocalClientError.connectionClosed
                 }
                 operationID = binding.id
-                // The publication-barrier ticket must learn this callback's
-                // logical operation ID at the same instant the daemon does:
-                // it is the identity a source COMPLETE names, and stamping it
-                // any later would let a PREPARE barrier mistake the initiating
-                // callback for an ordinary one and deadlock draining it.
-                PfsMacOSCallbackAdmission.ticket?.noteOperationID(binding.id)
                 if binding.isNew {
                     guard connection.nextOperationID != UInt64.max else {
                         connection.socket.close()
@@ -1666,29 +1632,12 @@ public actor PfsLocalClient {
             }
         }
 
-        // A true value is a scheduling proof, not an optional hint. The daemon
-        // must reject it without an operation identity, which would close the
-        // strict mount. Catch an impossible local composition here so one bad
-        // callback fails before any malformed frame reaches the connection.
-        do {
-            try pfsValidateSourcePhaseQueueability(
-                sourcePhaseQueueable,
-                operationID: operationID
-            )
-        } catch {
-            pfsClientLogger.fault(
-                "source-phase-queueable ordered mutation has no operation ID"
-            )
-            throw error
-        }
-
         let requestID = nextRequestID
         nextRequestID += 1
 
         var envelope = PfsEnvelope()
         envelope.requestID = requestID
         envelope.operationID = operationID
-        envelope.sourcePhaseQueueable = sourcePhaseQueueable
         envelope.body = body
 
         let replyEnvelope = try await withTaskCancellationHandler {
@@ -1759,8 +1708,8 @@ public actor PfsLocalClient {
         return replyEnvelope
     }
 
-    /// Settles resource ownership before releasing publication gates. A source
-    /// COMPLETE may let a competing mutation run as soon as PublicationAck is
+    /// Settles resource ownership before releasing publication gates. The
+    /// daemon may admit an overlapping peer as soon as PublicationAck is
     /// observed, so accepting/retiring every provisional resource first keeps
     /// capacity and ownership in the same callback order as kernel visibility.
     private nonisolated func completeBoundary(
@@ -1817,6 +1766,7 @@ public actor PfsLocalClient {
             }
             var ack = PfsPublicationAck()
             ack.operationID = ticket.operationID
+            ack.semanticCommit = ticket.semanticCommit
             var envelope = PfsEnvelope()
             envelope.requestID = 0
             envelope.body = .publicationAck(ack)

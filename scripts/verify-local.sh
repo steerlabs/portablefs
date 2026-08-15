@@ -53,6 +53,16 @@ go -C vcs test ./...
 step "go race suite (native)"
 go -C vcs test -race ./...
 
+# The maintained go-fuse fork is a nested module, so `go test ./...` above
+# deliberately does not enter it. Its PortableFS patch surface is the physical
+# reply-publication seam; gate that seam explicitly without depending on a
+# host FUSE mount utility or changing unrelated upstream integration tests.
+step "maintained go-fuse reply-publication seam"
+go -C vcs/third_party/go-fuse build ./fuse
+go -C vcs/third_party/go-fuse vet ./fuse
+go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+
 # 4. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
 # contain the same unique all-passing set. Other hosts skip this macOS-only
@@ -117,6 +127,27 @@ if rg --hidden -n \
   -g '!scripts/package-manager-matrix.sh'
 then
   echo "stale v2 (journal-era) references found" >&2
+  exit 1
+fi
+
+# Protocol 5 has one coherent mount contract. The old non-participant profile
+# name remains reserved in the source schema (and therefore in generated
+# descriptor bytes), while docs and the changelog may describe its retirement.
+# It must not re-enter executable code, tests, scripts, or configuration.
+if rg --hidden -n \
+  -e 'CoherenceUncached' \
+  -e 'COHERENCE_PROFILE_UNCACHED' \
+  -e 'PORTABLEFS_COHERENCE' \
+  -e '--coherence uncached' \
+  . \
+  -g '!.git' \
+  -g '!docs' \
+  -g '!CHANGELOG.md' \
+  -g '!proto/authority/v1/authority.proto' \
+  -g '!vcs/internal/authoritypb/authority.pb.go' \
+  -g '!scripts/verify-local.sh'
+then
+  echo "retired non-participant coherence profile references found" >&2
   exit 1
 fi
 

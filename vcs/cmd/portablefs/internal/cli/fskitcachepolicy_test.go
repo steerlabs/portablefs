@@ -14,8 +14,6 @@ func TestFSKitCachePolicyRequiresAnExactQualifiedBuildAndOS(t *testing.T) {
 		qualification string
 		want          string
 	}{
-		{"macOS 26 release", "26.0", "", portablefsd.V3CachePolicyMacOS26},
-		{"macOS 26 ignores native stamp", "26.6.1", sdk27QualificationStamp, portablefsd.V3CachePolicyMacOS26},
 		{"macOS 27 qualification build", "27.0", sdk27QualificationStamp, portablefsd.V3CachePolicyFSKit},
 	}
 	for _, tt := range tests {
@@ -31,6 +29,27 @@ func TestFSKitCachePolicyRequiresAnExactQualifiedBuildAndOS(t *testing.T) {
 				t.Fatalf("policy = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFSKitCachePolicyRefusesEveryProductionMacOSBeforeAttach(t *testing.T) {
+	for _, version := range []string{"26.0", "26.6.1", "27.0"} {
+		t.Run(version, func(t *testing.T) {
+			if _, err := fskitCachePolicyForProductVersion(version, ""); err == nil {
+				t.Fatalf("production macOS %s was admitted", version)
+			} else if !strings.Contains(err.Error(), "protocol 5") ||
+				!strings.Contains(err.Error(), "no authority attach was attempted") {
+				t.Fatalf("production refusal = %q", err)
+			}
+		})
+	}
+}
+
+func TestFSKitCachePolicyNeverTreatsTheMacOS27StampAsMacOS26Proof(t *testing.T) {
+	if _, err := fskitCachePolicyForProductVersion("26.6.1", sdk27QualificationStamp); err == nil {
+		t.Fatal("native macOS 27 qualification stamp admitted legacy macOS 26")
+	} else if !strings.Contains(err.Error(), "source post-mutation attributes") {
+		t.Fatalf("macOS 26 refusal omitted its exact source gap: %v", err)
 	}
 }
 
@@ -57,7 +76,7 @@ func TestFSKitCachePolicyRefusesUnqualifiedMacOS27Build(t *testing.T) {
 				qualification,
 			); err == nil {
 				t.Fatalf("qualification %q admitted the native policy", qualification)
-			} else if !strings.Contains(err.Error(), "not admitted by this build") {
+			} else if !strings.Contains(err.Error(), "cannot mount PortableFS protocol 5") {
 				t.Fatalf("unexpected gate error: %v", err)
 			}
 		})

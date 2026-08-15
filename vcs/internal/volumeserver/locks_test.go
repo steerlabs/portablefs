@@ -351,6 +351,55 @@ func TestWaitLockCancellationAndRelease(t *testing.T) {
 	}
 }
 
+func TestInterruptWaitersRetiresWholeQueueBeforeAnyGrant(t *testing.T) {
+	holder := LockOwner{Session: SessionID{1}}
+	waiting := []LockOwner{
+		{Session: SessionID{2}, Kernel: 1},
+		{Session: SessionID{3}, Kernel: 2},
+	}
+	table := testLockTable(t, 64, 64, holder.Session, waiting[0].Session, waiting[1].Session)
+	object := ObjectKey{1}
+	if err := table.Set(writeLock(object, holder, ToEOF(0))); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, len(waiting))
+	for _, owner := range waiting {
+		owner := owner
+		go func() { done <- table.Wait(context.Background(), writeLock(object, owner, ToEOF(0))) }()
+	}
+	waitForQueued(t, table, object, len(waiting))
+
+	table.InterruptWaiters(ErrSessionExpired)
+	for range waiting {
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrSessionExpired) {
+				t.Fatalf("interrupted waiter = %v, want ErrSessionExpired", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("interrupted waiter did not exit")
+		}
+	}
+	if got := heldRecords(table, object); len(got) != 1 || got[0].Owner != holder {
+		t.Fatalf("interrupt changed held records: %#v", got)
+	}
+	table.mu.Lock()
+	queued := table.waiting
+	table.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("interrupt left %d queued records", queued)
+	}
+
+	// Releasing the holder after the global interruption must not resurrect a
+	// request from the retired queue.
+	if err := table.Unlock(object, holder, ToEOF(0)); err != nil {
+		t.Fatal(err)
+	}
+	if got := heldRecords(table, object); len(got) != 0 {
+		t.Fatalf("retired waiter was granted after holder release: %#v", got)
+	}
+}
+
 func TestDisjointWaiterBypassesBlockedRange(t *testing.T) {
 	held := LockOwner{Session: SessionID{1}}
 	blocked := LockOwner{Session: SessionID{2}}
@@ -448,7 +497,9 @@ func TestDowngradeWakesBlockedWaiter(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- table.Wait(context.Background(), readLock(object, reader, LockRange{Start: 0, End: 99})) }()
+	go func() {
+		done <- table.Wait(context.Background(), readLock(object, reader, LockRange{Start: 0, End: 99}))
+	}()
 	waitForQueued(t, table, object, 1)
 
 	if err := table.Set(readLock(object, holder, LockRange{Start: 0, End: 99})); err != nil {
@@ -480,7 +531,9 @@ func TestNonBlockingSetDoesNotJumpQueuedRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- table.Wait(context.Background(), writeLock(object, writer, LockRange{Start: 0, End: 99})) }()
+	go func() {
+		done <- table.Wait(context.Background(), writeLock(object, writer, LockRange{Start: 0, End: 99}))
+	}()
 	waitForQueued(t, table, object, 1)
 
 	if err := table.Set(readLock(object, barger, LockRange{Start: 0, End: 99})); !errors.Is(err, ErrLockConflict) {

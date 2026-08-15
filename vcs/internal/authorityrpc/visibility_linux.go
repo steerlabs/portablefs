@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -39,10 +40,9 @@ func namespaceName(name []byte) error {
 	return xfsstore.ValidateComponent(string(name))
 }
 
-// strictCache returns the coordinator to record into, or nil when this session
-// keeps no kernel cache the barrier has to reason about. An uncached mount is a
-// supported deployment profile, not a degraded one: it has no remote repair
-// obligation, so none of this work applies to it.
+// strictCache returns the one protocol-5 coherence coordinator. A missing or
+// non-coherent session returns nil only on an already-invalid runtime path; no
+// attach can activate such a session.
 func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.VisibilityCoordinator {
 	if h.Visibility == nil || !h.strictSession(id) {
 		return nil
@@ -77,35 +77,6 @@ func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.Sessi
 	}
 	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
 	return err
-}
-
-// recordReplyItem indexes the inode a mutation reply just handed this mount.
-// The coordinator already indexes the coordinates the mutation named, but a
-// create names a parent and a name, not the inode it produced, and that inode
-// is exactly what the reply asks the frontend to cache.
-func (h *VolumeHandler) recordReplyItem(id volumeserver.SessionID, resp *authoritypb.Response) {
-	coordinator := h.strictCache(id)
-	if coordinator == nil || resp == nil || resp.GetErrno() != 0 {
-		return
-	}
-	var token []byte
-	switch {
-	case resp.GetCreate() != nil:
-		token = resp.GetCreate().GetItem().GetToken()
-	case resp.GetLookup() != nil:
-		token = resp.GetLookup().GetItem().GetToken()
-	case resp.GetLink() != nil:
-		token = resp.GetLink().GetItem().GetToken()
-	default:
-		return
-	}
-	item, err := capability(token)
-	if err != nil {
-		return
-	}
-	if identity, err := h.Store.Identity(item); err == nil {
-		coordinator.RecordResolvedInode(id, identity)
-	}
 }
 
 // lookupForSession answers one name resolution. For a strict mount the answer
@@ -184,12 +155,14 @@ func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeser
 
 func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.CoherenceProfile, error) {
 	switch profile {
-	case authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED:
-		return volumeserver.CoherenceUncached, nil
 	case authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT:
 		return volumeserver.CoherenceStrict, nil
 	default:
-		return 0, syscall.EOPNOTSUPP
+		// Zero is both protobuf's omitted value and the value emitted by the
+		// retired UNCACHED profile. Protocol 5 never normalizes it into the one
+		// coherent contract: an old frontend has not installed source gates or
+		// peer visibility and must be refused before activation.
+		return 0, syscall.EINVAL
 	}
 }
 
@@ -283,6 +256,189 @@ func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.Vi
 	}
 }
 
+// normalizeVisibilityTargets gives every cache coordinate exactly one repair
+// instruction before the coordinator indexes, projects, and serializes it. A
+// DATA repair subsumes an ATTRIBUTES repair for the same stable identity; its
+// size is the authoritative post-mutation EOF and must survive regardless of
+// which scope appeared first. Duplicate namespace coordinates union their
+// dependency identities in first-occurrence order.
+//
+// Validate the complete raw list first. Normalizing as validation proceeds
+// would let a valid DATA target hide a malformed ATTRIBUTES target that it
+// dominates. It would also make the accepted language depend on target order.
+func normalizeVisibilityTargets(targets []volumeserver.VisibilityTarget) ([]volumeserver.VisibilityTarget, error) {
+	for index, target := range targets {
+		if err := validateAuthorityVisibilityTarget(target); err != nil {
+			return nil, fmt.Errorf("%w: target %d: %v", volumeserver.ErrVisibilityTargets, index, err)
+		}
+	}
+	if len(targets) == 0 {
+		return targets, nil
+	}
+
+	normalized := make([]volumeserver.VisibilityTarget, 0, len(targets))
+	inodeIndexes := make(map[[16]byte]int)
+	type namespaceKey struct {
+		parent [16]byte
+		name   string
+	}
+	namespaceIndexes := make(map[namespaceKey]int)
+	for _, target := range targets {
+		if target.Scope == volumeserver.VisibilityNamespace {
+			key := namespaceKey{parent: target.ParentIdentity, name: string(target.Name)}
+			index, exists := namespaceIndexes[key]
+			if !exists {
+				namespaceIndexes[key] = len(normalized)
+				target.RelatedIdentities = appendUniqueVisibilityIdentities(nil, target.RelatedIdentities)
+				normalized = append(normalized, target)
+				continue
+			}
+			prior := &normalized[index]
+			if prior.ParentKernelIno != target.ParentKernelIno || prior.Device != target.Device {
+				return nil, fmt.Errorf(
+					"%w: namespace coordinate %x/%q has conflicting kernel coordinates",
+					volumeserver.ErrVisibilityTargets, target.ParentIdentity, target.Name,
+				)
+			}
+			if prior.PostIdentity != target.PostIdentity {
+				return nil, fmt.Errorf(
+					"%w: namespace coordinate %x/%q has conflicting post identities",
+					volumeserver.ErrVisibilityTargets, target.ParentIdentity, target.Name,
+				)
+			}
+			prior.RelatedIdentities = appendUniqueVisibilityIdentities(prior.RelatedIdentities, target.RelatedIdentities)
+			continue
+		}
+		index, exists := inodeIndexes[target.Identity]
+		if !exists {
+			inodeIndexes[target.Identity] = len(normalized)
+			normalized = append(normalized, target)
+			continue
+		}
+
+		prior := normalized[index]
+		if prior.KernelIno != target.KernelIno || prior.Device != target.Device {
+			return nil, fmt.Errorf(
+				"%w: inode identity %x has conflicting kernel coordinates",
+				volumeserver.ErrVisibilityTargets, target.Identity,
+			)
+		}
+		switch {
+		case prior.Scope == volumeserver.VisibilityData && target.Scope == volumeserver.VisibilityData:
+			if prior.Size != target.Size {
+				return nil, fmt.Errorf(
+					"%w: inode identity %x has conflicting authoritative sizes %d and %d",
+					volumeserver.ErrVisibilityTargets, target.Identity, prior.Size, target.Size,
+				)
+			}
+			// Exact duplicate DATA target.
+		case prior.Scope == volumeserver.VisibilityAttributes && target.Scope == volumeserver.VisibilityData:
+			// Keep the coordinate's first position but replace its weaker repair
+			// with DATA, including DATA's authoritative size.
+			normalized[index] = target
+		case prior.Scope == volumeserver.VisibilityData && target.Scope == volumeserver.VisibilityAttributes:
+			// DATA already dominates this exact ATTRIBUTES coordinate.
+		case prior.Scope == volumeserver.VisibilityAttributes && target.Scope == volumeserver.VisibilityAttributes:
+			// Exact duplicate ATTRIBUTES target.
+		default:
+			// Validation above makes this unreachable. Keep it fail-closed so a
+			// future scope cannot silently inherit today's dominance rule.
+			return nil, fmt.Errorf("%w: inode identity %x has incompatible scopes", volumeserver.ErrVisibilityTargets, target.Identity)
+		}
+	}
+	return normalized, nil
+}
+
+func appendUniqueVisibilityIdentities(dst, src [][16]byte) [][16]byte {
+	if len(dst) == 0 && len(src) == 0 {
+		return nil
+	}
+	unique := make([][16]byte, 0, len(dst)+len(src))
+	seen := make(map[[16]byte]struct{}, len(dst)+len(src))
+	for _, identities := range [][][16]byte{dst, src} {
+		for _, identity := range identities {
+			if _, exists := seen[identity]; exists {
+				continue
+			}
+			seen[identity] = struct{}{}
+			unique = append(unique, identity)
+		}
+	}
+	return unique
+}
+
+// validateAuthorityVisibilityTarget is the in-memory half of the exact wire
+// shape. It includes RelatedIdentities, which are authority-private and cannot
+// be checked after visibilityTargetProto deliberately omits them.
+func validateAuthorityVisibilityTarget(target volumeserver.VisibilityTarget) error {
+	zero := [16]byte{}
+	if target.Device == 0 {
+		return errors.New("visibility target carries no backing device")
+	}
+	switch target.Scope {
+	case volumeserver.VisibilityNamespace:
+		if target.ParentIdentity == zero {
+			return errors.New("namespace target carries no parent identity")
+		}
+		if target.Identity != zero {
+			return errors.New("namespace target carries an object identity")
+		}
+		if !visibilitywire.ValidName(target.Name) {
+			return errors.New("namespace target name is not a single valid component")
+		}
+		if target.Size != 0 {
+			return errors.New("namespace target carries a size")
+		}
+		if target.KernelIno != 0 {
+			return errors.New("namespace target carries an object kernel inode")
+		}
+		if target.ParentKernelIno == 0 {
+			return errors.New("namespace target carries no parent kernel inode")
+		}
+		postIsDependency := target.PostIdentity == zero
+		for _, identity := range target.RelatedIdentities {
+			if identity == zero {
+				return errors.New("namespace target carries a zero related identity")
+			}
+			postIsDependency = postIsDependency || identity == target.PostIdentity
+		}
+		if !postIsDependency {
+			return errors.New("namespace post identity is not a declared dependency")
+		}
+	case volumeserver.VisibilityData, volumeserver.VisibilityAttributes:
+		if target.Identity == zero {
+			return errors.New("inode target carries no identity")
+		}
+		if target.ParentIdentity != zero {
+			return errors.New("inode target carries a parent identity")
+		}
+		if len(target.Name) != 0 {
+			return errors.New("inode target carries a name")
+		}
+		if target.PostIdentity != zero {
+			return errors.New("inode target carries a namespace post identity")
+		}
+		if len(target.RelatedIdentities) != 0 {
+			return errors.New("inode target carries namespace dependencies")
+		}
+		if target.KernelIno == 0 {
+			return errors.New("inode target carries no kernel inode")
+		}
+		if target.ParentKernelIno != 0 {
+			return errors.New("inode target carries a parent kernel inode")
+		}
+		if target.Scope == volumeserver.VisibilityData && target.Size < 0 {
+			return errors.New("data target carries a negative size")
+		}
+		if target.Scope == volumeserver.VisibilityAttributes && target.Size != 0 {
+			return errors.New("attributes target carries a size")
+		}
+	default:
+		return fmt.Errorf("visibility target carries scope %d", target.Scope)
+	}
+	return nil
+}
+
 func visibilityPhaseProto(phase volumeserver.VisibilityPhase) authoritypb.VisibilityPhase {
 	switch phase {
 	case volumeserver.VisibilityPrepare:
@@ -372,7 +528,22 @@ func inodeTarget(scope volumeserver.VisibilityScope, coordinate visibilityCoordi
 }
 
 func visibilityChanged(resp *authoritypb.Response) bool {
-	return resp != nil && (resp.GetErrno() == 0 || resp.GetUncertain())
+	if resp == nil {
+		return false
+	}
+	if transaction := resp.GetWriteTransaction(); transaction != nil {
+		// A structured REJECTED result has outer errno zero so it can carry the
+		// private kernel rejection reason, but it is explicit proof that XFS did
+		// not change. Only COMMITTED opens a DATA/ATTR COMPLETE phase.
+		return transaction.GetFlags()&writeTransactionReplyCommitted != 0
+	}
+	if fallocate := resp.GetFallocate(); fallocate != nil {
+		return fallocate.GetFlags()&rangeReplyApplied != 0
+	}
+	if copyRange := resp.GetCopyFileRange(); copyRange != nil {
+		return copyRange.GetFlags()&rangeReplyApplied != 0
+	}
+	return resp.GetErrno() == 0 || resp.GetUncertain()
 }
 
 func uncertainVisibilityTargets(resp *authoritypb.Response, targets []volumeserver.VisibilityTarget) []volumeserver.VisibilityTarget {

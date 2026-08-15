@@ -83,7 +83,7 @@ public enum PortableFSDServiceCoordinator {
     private static let identitySchemaVersion = 1
     private static let controlProtocolVersion = 1
     private static let pfsLocalMajor: UInt32 = 1
-    private static let pfsLocalMinor: UInt32 = 14
+    private static let pfsLocalMinor: UInt32 = 15
     // CS_RUNTIME from Security/CSCommon.h. Swift does not import that C enum
     // case, but SecCode returns the same documented static-signature bitset.
     static let hardenedRuntimeFlag: UInt32 = 0x0001_0000

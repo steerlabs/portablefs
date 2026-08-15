@@ -16,7 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
-// The Linux mount engine: one strict (or uncached) fusev3 session against the
+// The Linux mount engine: one strict fusev3 session against the
 // v3 XFS authority. This replaces the legacy clientcore FUSE engine for
 // `portablefs mount`; the lifecycle contract around it — canonical state
 // root, mount records, locks, exact unmount — is unchanged and lives in
@@ -105,6 +105,10 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		return nil, false, fmt.Errorf("v3 authority sessions require mutually authenticated TLS; %q cannot carry one", cfg.transport.Mode)
 	}
 	tlsCfg.Certificates = []tls.Certificate{cfg.identity.certificate}
+	preKernelAbsence, err := mountv3.PreKernelMountAbsenceObserver(cfg.mountPath, cfg.mountInstanceID)
+	if err != nil {
+		return nil, false, fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
+	}
 	attach := authorityrpc.ClientConfig{
 		Address: cfg.addr, TLS: tlsCfg, VolumeID: cfg.volumeID,
 		AccessToken: []byte(cfg.token), ReplaySlots: mountv3.ReplaySlots,
@@ -115,6 +119,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		// needs to size the barrier: how much cached state this frontend can be
 		// holding, and how long it may take to withdraw it.
 		CoherenceProfile: wireProfile, CachedNameCapacity: mountv3.CachedNameCapacity, RepairBudget: mountv3.RepairBudget,
+		ObservePreKernelMountAbsence: preKernelAbsence,
 	}
 	// How this frontend's kernel makes a cached binding unservable. It is
 	// declared rather than inferred because the authority cannot observe a
@@ -124,9 +129,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 	// round trip. Saying so is what lets the authority tell a provably closed
 	// repair cycle apart from an ordinary slow lock, and fence one participant
 	// immediately instead of stalling the volume for a whole repair budget.
-	if profile == fusev3.CoherenceStrict {
-		attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
-	}
+	attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
 	client, rules, err := mountv3.AttachWithRoutes(context.Background(), attach, !cfg.noLocalDirs)
 	if err != nil {
 		// A routing refusal names both revisions and the volume's declaration.
@@ -139,11 +142,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 	if !rules.Empty() {
 		backing = cfg.backingRoot
 	}
-	transport, err := mountv3.NewTransport(client, profile)
-	if err != nil {
-		_ = client.Close()
-		return nil, true, err
-	}
+	transport := mountv3.NewTransport(client)
 	mount, err := fusev3.MountVolume(context.Background(), cfg.mountPath, transport, fusev3.Config{
 		// The mount core derives "portablefs:<mountInstanceID>", the same
 		// instance-bound kernel source mount_identity_linux.go verifies.
@@ -154,7 +153,10 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		Routes: rules, LocalBacking: backing,
 	})
 	if err != nil {
-		_ = client.Close()
+		// MountVolume owns the ACTIVE session as soon as it is called. Its
+		// failed-startup path supplies the same exact source-bound absence proof
+		// and closes the client, so a second release here would be a second
+		// lifecycle transition rather than cleanup.
 		return nil, true, fmt.Errorf("mount %s: %w", cfg.mountPath, err)
 	}
 	return &fuseV3Mount{

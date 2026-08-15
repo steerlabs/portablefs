@@ -8,12 +8,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type fskitKernelMount struct {
-	path   string
-	fsType string
-	source string
-}
-
 func hostFSKitKernelOps() fskitKernelOps {
 	return fskitKernelOps{
 		present: exactFSKitMountPresent,

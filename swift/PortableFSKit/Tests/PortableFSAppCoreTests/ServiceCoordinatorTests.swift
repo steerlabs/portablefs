@@ -52,7 +52,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
         identitySchema: 1,
         controlProtocol: 1,
         pfslocalMajor: 1,
-        pfslocalMinor: 14
+        pfslocalMinor: 15
     )
     try identity.validate()
     let object = try #require(
@@ -72,7 +72,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
             identitySchema: 1,
             controlProtocol: 1,
             pfslocalMajor: 1,
-            pfslocalMinor: 14
+            pfslocalMinor: 15
         ).validate()
     }
 

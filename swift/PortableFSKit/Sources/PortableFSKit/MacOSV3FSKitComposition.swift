@@ -16,8 +16,8 @@ public enum PfsMacOSAdmissionSelector: Sendable, Equatable, Hashable {
     /// This callback can submit an authority-ordered mutation. macOS 26 FSKit
     /// can withhold synthetic-repair callbacks behind one such callback even
     /// when paths differ. This selector therefore overlaps every active repair;
-    /// local PREPARE releases it and the callback-serialized authority refuses
-    /// the mutation definite-preapply instead of leaving it parked.
+    /// peer PREPARE refuses it so the callback lane remains available to the
+    /// authenticated repair actuator.
     case orderedMutation
 
     fileprivate func overlaps(_ other: Self) -> Bool {
@@ -105,17 +105,6 @@ public struct PfsMacOSCallbackScope: Sendable, Equatable {
         return "conservative=\(isConservative) ordered=\(canSubmitOrderedMutation) namespace=\(namespaceCount) directory=\(directoryCount) item=\(itemCount)"
     }
 
-}
-
-/// The immutable source-phase classification of one ordered request.
-///
-/// A distinct callback is safe for the macOS 26 pipelined source exception
-/// only when it has issued ordered requests and nothing else.  The verdict is
-/// captured under the ticket lock at the same instant this request commits to
-/// dispatch; deriving it later would race an ordinary request's history and
-/// let the frontend and authority make opposite PREPARE-drain decisions.
-public struct PfsMacOSOrderedMutationSubmission: Sendable, Equatable {
-    public let sourcePhaseQueueable: Bool
 }
 
 /// Synchronous accounting for an FSKit upcall before its asynchronous callback
@@ -214,28 +203,12 @@ private final class PfsMacOSCallbackIngressRegistry: @unchecked Sendable {
 /// One ordinary cache-producing FSKit callback, from admission until its
 /// reply crosses the framework publication boundary.
 ///
-/// The ticket is the barrier's unit of accounting and the pfslocal client's
-/// reporting channel: `PfsLocalClient` stamps the callback's logical operation
-/// ID onto the current task's ticket the moment it allocates one, which is
-/// what lets a PREPARE barrier exempt exactly the initiating callback rather
-/// than guessing from paths.
+/// The ticket is the barrier's exact unit of framework-publication accounting.
 public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     private static let signposter = OSSignposter(
         subsystem: "dev.portablefs.fskit",
         category: "MacOSV3Admission"
     )
-
-    private enum OrderedSubmissionAttempt {
-        case submitted(PfsMacOSOrderedMutationSubmission)
-        case parked
-        case revoked
-    }
-
-    private enum OrdinarySubmissionAttempt {
-        case submitted(UInt64)
-        case parked
-        case revoked
-    }
 
     private struct OrdinaryRequest {
         var cancel: (@Sendable () -> Void)?
@@ -247,27 +220,17 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     let diagnosticID: UInt64
     let callbackKind: String
     let ingressUptimeNanoseconds: UInt64
-    private var operationID: UInt64?
     private var published = false
     private var orderedMutationsInFlight = 0
     private var orderedMutationEverSubmitted = false
-    private var ordinaryRequestEverSubmitted = false
     private var futureRequestsRevoked = false
     /// v2 PREPARE closes new request admission but lets already-issued reads
     /// publish naturally. Terminal failure flips this back to false and invokes
     /// every installed cancellation so teardown still cannot hang.
     private var ordinaryRequestsDrainNaturally = false
-    /// A source PREPARE has already identified this ticket as work that is
-    /// authority-ordered after the initiating callback (or as a callback that
-    /// has not issued any request at all). Existing ordered requests may drain
-    /// at the authority, but no later request from the callback may cross the
-    /// source's deferred COMPLETE boundary.
-    private var futureRequestsParkedForSource = false
     private var ordinaryRequestsInFlight = 0
     private var nextOrdinaryRequestID: UInt64 = 1
     private var ordinaryRequests: [UInt64: OrdinaryRequest] = [:]
-    private var sourceParkWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
-    private var ordinaryAdmissionWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var crossed = false
     private var publicationWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
@@ -305,100 +268,32 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
         scope.overlaps(repairScope)
     }
 
-    /// Records the pfslocal logical operation ID for the callback's current
-    /// publication attempt. Most callbacks own one ID, but a daemon retraction
-    /// transparently reissues the whole operation with a fresh collector and a
-    /// fresh ID. Replacing the prior attempt here is what lets the source
-    /// PREPARE/COMPLETE pair exempt and await the surviving attempt rather than
-    /// an already-acknowledged one.
-    public func noteOperationID(_ id: UInt64) {
-        lock.lock()
-        operationID = id
-        lock.unlock()
-        if Self.signposter.isEnabled {
-            Self.signposter.emitEvent(
-                "OperationAssigned",
-                "ticket=\(self.diagnosticID) kind=\(self.callbackKind, privacy: .public)"
-            )
-        }
-    }
-
-    func currentOperationID() -> UInt64? {
-        lock.lock()
-        defer { lock.unlock() }
-        return operationID
-    }
-
     /// Marks an authority-ordered mutation of this callback in flight. The
     /// callback-serialized authority gives it an exact pre/post-apply outcome;
     /// PREPARE waits through framework publication before repair begins.
     @discardableResult
     public func orderedMutationSubmitted() -> Bool {
-        orderedMutationSubmission() != nil
+        orderedMutationSubmission()
     }
 
-    /// Non-waiting test/helper form of production ordered admission.  The
-    /// returned token belongs to this exact request and must be stamped on its
-    /// pfslocal envelope; it is not a callback-wide value that may be sampled
-    /// later.
-    public func orderedMutationSubmission() -> PfsMacOSOrderedMutationSubmission? {
+    /// Non-waiting test/helper form of production ordered admission.
+    public func orderedMutationSubmission() -> Bool {
         lock.lock()
-        if futureRequestsRevoked || futureRequestsParkedForSource {
+        if futureRequestsRevoked {
             lock.unlock()
-            return nil
+            return false
         }
-        let submission = PfsMacOSOrderedMutationSubmission(
-            sourcePhaseQueueable: !ordinaryRequestEverSubmitted
-        )
         orderedMutationEverSubmitted = true
         orderedMutationsInFlight += 1
         lock.unlock()
-        return submission
+        return true
     }
 
-    /// Production request admission. A callback that was already inside FSKit
-    /// when its own mount's PREPARE arrived is parked rather than failed if it
-    /// had not exposed any request yet. The synchronous helper above remains a
-    /// precise non-waiting probe for focused tests.
+    /// Production request admission. Peer PREPARE closes the ticket
+    /// synchronously, so admission is a single fail-closed decision.
     public func orderedMutationSubmittedWhenPermitted() async throws -> Bool {
-        try await orderedMutationSubmissionWhenPermitted() != nil
-    }
-
-    /// Commits one ordered request and atomically captures whether the
-    /// authority may queue this distinct callback through its own source phase.
-    /// Once any ordinary request has entered the ticket, every later ordered
-    /// submission is conservatively nonqueueable even after that request has
-    /// settled.
-    public func orderedMutationSubmissionWhenPermitted() async throws
-        -> PfsMacOSOrderedMutationSubmission? {
-        while true {
-            try Task.checkCancellation()
-            switch trySubmitOrderedMutation() {
-            case let .submitted(submission):
-                return submission
-            case .revoked:
-                return nil
-            case .parked:
-                try await waitForSourceParkToEnd()
-            }
-        }
-    }
-
-    private func trySubmitOrderedMutation() -> OrderedSubmissionAttempt {
-        lock.lock()
-        defer { lock.unlock() }
-        if futureRequestsRevoked {
-            return .revoked
-        }
-        if !futureRequestsParkedForSource {
-            let submission = PfsMacOSOrderedMutationSubmission(
-                sourcePhaseQueueable: !ordinaryRequestEverSubmitted
-            )
-            orderedMutationEverSubmitted = true
-            orderedMutationsInFlight += 1
-            return .submitted(submission)
-        }
-        return .parked
+        try Task.checkCancellation()
+        return orderedMutationSubmission()
     }
 
     /// Frozen-v1/terminal admission closure. A future ordered request is
@@ -413,25 +308,14 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     func revokeFutureRequests() {
         lock.lock()
         futureRequestsRevoked = true
-        futureRequestsParkedForSource = false
         ordinaryRequestsDrainNaturally = false
         if ordinaryRequestsInFlight > 0, !orderedMutationEverSubmitted {
             crossed = true
         }
         let cancellations = ordinaryRequests.values.compactMap(\.cancel)
-        let parkWaiters = Array(sourceParkWaiters.values)
-        sourceParkWaiters.removeAll()
-        let ordinaryWaiters = Array(ordinaryAdmissionWaiters.values)
-        ordinaryAdmissionWaiters.removeAll()
         lock.unlock()
         for cancel in cancellations {
             cancel()
-        }
-        for waiter in parkWaiters {
-            waiter.resume(returning: true)
-        }
-        for waiter in ordinaryWaiters {
-            waiter.resume(returning: true)
         }
     }
 
@@ -443,112 +327,14 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     func closeFutureRequestsForNaturalDrain() {
         lock.lock()
         futureRequestsRevoked = true
-        futureRequestsParkedForSource = false
         ordinaryRequestsDrainNaturally = true
-        let parkWaiters = Array(sourceParkWaiters.values)
-        sourceParkWaiters.removeAll()
-        let ordinaryWaiters = Array(ordinaryAdmissionWaiters.values)
-        ordinaryAdmissionWaiters.removeAll()
         lock.unlock()
-        for waiter in parkWaiters {
-            waiter.resume(returning: true)
-        }
-        for waiter in ordinaryWaiters {
-            waiter.resume(returning: true)
-        }
-    }
-
-    enum LocalSourcePrepareDisposition: Equatable {
-        case initiatingOperation
-        case parkedPristine
-        case parkedDistinctOrderedOperation
-        case parkedOrderedIdentityPending
-        case mustRevokeAndDrain
-    }
-
-    /// Atomically classifies an already-admitted callback at a source PREPARE.
-    ///
-    /// Operation-ID *ordering* is deliberately not used here. A higher-ID read
-    /// can execute before the initiating mutation and still carry stale data.
-    /// Equality identifies the one initiating callback; beyond that, only two
-    /// histories are safe to preserve:
-    ///
-    /// - no request of any kind has ever been submitted, so the callback cannot
-    ///   hold an authority result or cache value; or
-    /// - it has submitted ordered mutations under a different logical operation
-    ///   and no ordinary request. The authority serializes that distinct
-    ///   frontend operation after the source callback and holds it until the
-    ///   deferred COMPLETE is acknowledged.
-    ///
-    /// Both classes have their *future* requests parked through exact COMPLETE
-    /// acknowledgement. Anything that has submitted an ordinary request stays
-    /// in the exact drain audience; v2 lets that issued request finish
-    /// naturally while closing all future requests on the ticket.
-    func prepareForLocalSource(
-        initiatingOperationID: UInt64
-    ) -> LocalSourcePrepareDisposition {
-        lock.lock()
-        defer { lock.unlock() }
-        if operationID == initiatingOperationID {
-            return .initiatingOperation
-        }
-        guard !futureRequestsRevoked, !ordinaryRequestEverSubmitted else {
-            return .mustRevokeAndDrain
-        }
-        if orderedMutationEverSubmitted, operationID == nil {
-            // Request admission won the ticket lock, so this exact request is
-            // already committed to dispatch even though collector stamping has
-            // not run yet. It cannot be the source initiator (that event names a
-            // request already stamped and observed by the daemon); the strict
-            // connection's next operation ID is therefore necessarily distinct.
-            // Park later requests, but let this committed dispatch finish
-            // acquiring its identity and queue behind the source at authority.
-            futureRequestsParkedForSource = true
-            return .parkedOrderedIdentityPending
-        }
-        if !orderedMutationEverSubmitted, operationID == nil {
-            futureRequestsParkedForSource = true
-            return .parkedPristine
-        }
-        if orderedMutationEverSubmitted, operationID != nil {
-            futureRequestsParkedForSource = true
-            return .parkedDistinctOrderedOperation
-        }
-        // A submitted ordered request without an identity is malformed once no
-        // dispatch commit is in progress. Keep the conservative failure path.
-        return .mustRevokeAndDrain
-    }
-
-    func releaseSourcePark() {
-        lock.lock()
-        futureRequestsParkedForSource = false
-        let waiters = Array(sourceParkWaiters.values)
-        sourceParkWaiters.removeAll()
-        let ordinaryWaiters = Array(ordinaryAdmissionWaiters.values)
-        ordinaryAdmissionWaiters.removeAll()
-        lock.unlock()
-        for waiter in waiters {
-            waiter.resume(returning: true)
-        }
-        for waiter in ordinaryWaiters {
-            waiter.resume(returning: true)
-        }
     }
 
     public func orderedMutationSettled() {
         lock.lock()
         orderedMutationsInFlight -= 1
-        let ordinaryWaiters: [CheckedContinuation<Bool, Never>]
-        if orderedMutationsInFlight == 0 {
-            ordinaryWaiters = Array(ordinaryAdmissionWaiters.values)
-            ordinaryAdmissionWaiters.removeAll()
-        } else {
-            ordinaryWaiters = []
-        }
         lock.unlock()
-        for waiter in ordinaryWaiters {
-            waiter.resume(returning: true)
-        }
     }
 
     /// Once this callback has dispatched an ordered mutation, no local
@@ -571,7 +357,7 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     @discardableResult
     public func ordinaryRequestSubmitted() -> UInt64? {
         lock.lock()
-        if futureRequestsRevoked || ordinaryRequestMustWaitLocked() {
+        if futureRequestsRevoked {
             lock.unlock()
             return nil
         }
@@ -581,7 +367,6 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
         }
         let requestID = nextOrdinaryRequestID
         nextOrdinaryRequestID += 1
-        ordinaryRequestEverSubmitted = true
         ordinaryRequests[requestID] = OrdinaryRequest()
         ordinaryRequestsInFlight += 1
         lock.unlock()
@@ -589,48 +374,8 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
     }
 
     public func ordinaryRequestSubmittedWhenPermitted() async throws -> UInt64? {
-        while true {
-            try Task.checkCancellation()
-            switch trySubmitOrdinaryRequest() {
-            case let .submitted(requestID):
-                return requestID
-            case .revoked:
-                return nil
-            case .parked:
-                try await waitForOrdinaryAdmission()
-            }
-        }
-    }
-
-    private func trySubmitOrdinaryRequest() -> OrdinarySubmissionAttempt {
-        lock.lock()
-        defer { lock.unlock() }
-        if futureRequestsRevoked {
-            return .revoked
-        }
-        if !ordinaryRequestMustWaitLocked() {
-            guard nextOrdinaryRequestID != UInt64.max else {
-                return .revoked
-            }
-            let requestID = nextOrdinaryRequestID
-            nextOrdinaryRequestID += 1
-            ordinaryRequestEverSubmitted = true
-            ordinaryRequests[requestID] = OrdinaryRequest()
-            ordinaryRequestsInFlight += 1
-            return .submitted(requestID)
-        }
-        return .parked
-    }
-
-    /// An ordered-only request's queueability proof remains true until its
-    /// exact outcome settles. Letting an ordinary request from the same ticket
-    /// dispatch concurrently would retroactively turn the callback mixed after
-    /// the authority had already accepted the proof. Production waits; the
-    /// synchronous helper conservatively refuses until the ordered request is
-    /// no longer in flight.
-    private func ordinaryRequestMustWaitLocked() -> Bool {
-        futureRequestsParkedForSource
-            || (!ordinaryRequestEverSubmitted && orderedMutationsInFlight > 0)
+        try Task.checkCancellation()
+        return ordinaryRequestSubmitted()
     }
 
     public func installOrdinaryRequestCancellation(
@@ -725,77 +470,6 @@ public final class PfsMacOSAdmittedCallbackTicket: @unchecked Sendable {
         waiter?.resume(returning: false)
     }
 
-    private func waitForSourceParkToEnd() async throws {
-        let waiterID = UUID()
-        let didWake = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                lock.lock()
-                if !futureRequestsParkedForSource || futureRequestsRevoked {
-                    lock.unlock()
-                    continuation.resume(returning: true)
-                    return
-                }
-                if Task.isCancelled {
-                    lock.unlock()
-                    continuation.resume(returning: false)
-                    return
-                }
-                sourceParkWaiters[waiterID] = continuation
-                lock.unlock()
-            }
-        } onCancel: {
-            self.cancelSourceParkWaiter(waiterID)
-        }
-        guard didWake else { throw CancellationError() }
-        try Task.checkCancellation()
-    }
-
-    private func cancelSourceParkWaiter(_ id: UUID) {
-        lock.lock()
-        let waiter = sourceParkWaiters.removeValue(forKey: id)
-        lock.unlock()
-        waiter?.resume(returning: false)
-    }
-
-    private func waitForOrdinaryAdmission() async throws {
-        let waiterID = UUID()
-        let didWake = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                lock.lock()
-                if !ordinaryRequestMustWaitLocked() || futureRequestsRevoked {
-                    lock.unlock()
-                    continuation.resume(returning: true)
-                    return
-                }
-                if Task.isCancelled {
-                    lock.unlock()
-                    continuation.resume(returning: false)
-                    return
-                }
-                ordinaryAdmissionWaiters[waiterID] = continuation
-                lock.unlock()
-            }
-        } onCancel: {
-            self.cancelOrdinaryAdmissionWaiter(waiterID)
-        }
-        guard didWake else { throw CancellationError() }
-        try Task.checkCancellation()
-    }
-
-    private func cancelOrdinaryAdmissionWaiter(_ id: UUID) {
-        lock.lock()
-        let waiter = ordinaryAdmissionWaiters.removeValue(forKey: id)
-        lock.unlock()
-        waiter?.resume(returning: false)
-    }
-
-    func pendingOrdinaryAdmissionWaiterCount() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return ordinaryAdmissionWaiters.count
-    }
-
-
 }
 
 /// Task-local bridge from the FSKit callback that admitted itself to the
@@ -810,10 +484,9 @@ public enum PfsMacOSCallbackAdmission {
 ///
 /// PREPARE closes publication only for callbacks whose typed selectors overlap
 /// the repair and drains only overlapping already-admitted callbacks,
-/// exempting the exact initiating operation. While mounted-VFS repair may still
-/// be needed, an overlapping callback is refused immediately so it releases
-/// FSKit's callback lane. Once local repair is complete, overlapping callbacks
-/// may safely park, but they are admitted only after the authority accepts the
+/// while an overlapping callback is refused immediately so it releases FSKit's
+/// callback lane. Once local repair is complete, overlapping callbacks may
+/// safely park, but they are admitted only after the authority accepts the
 /// exact COMPLETE cursor. Authenticated actuator callbacks bypass admission.
 public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier {
     private enum AdmissionState {
@@ -828,12 +501,11 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
 
     private let localAuthoritySessionID: Data
     private let admissionRefusal: PfsLocalClientError
-    private let allowsLocalSourcePipelining: Bool
+    private let allowsNaturalPeerDrain: Bool
     private nonisolated let ingressRegistry: PfsMacOSCallbackIngressRegistry
     private var admissionState = AdmissionState.open
     private var terminal: Error?
     private var admitted: [ObjectIdentifier: PfsMacOSAdmittedCallbackTicket] = [:]
-    private var sourceParkedTickets: [ObjectIdentifier: PfsMacOSAdmittedCallbackTicket] = [:]
     private var admissionWaiters: [UUID: AdmissionWaiter] = [:]
     /// Exact cache coordinates touched by the current repair. They scope the
     /// PREPARE drain and post-PREPARE refusal. Namespace mutators declare a
@@ -843,11 +515,6 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     /// synthetic repair needs. Unrelated item reads and other parents remain
     /// live.
     private var closedRepairScope: PfsMacOSCallbackScope?
-    /// A source mount never actuates its own COMPLETE: its initiating VFS
-    /// callback already performed the local cache transition. Once that exact
-    /// callback publishes, callbacks can park without blocking repair, but they
-    /// cannot be admitted while the authority still holds mutation order.
-    private var localInitiatorAwaitingPublication: UInt64?
     private var activeEpoch: Data?
     private var activeSequence: UInt64?
     // Diagnostic counters for callbacks that had to release FSKit execution
@@ -869,20 +536,20 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
             throw PfsMacOSCoherenceError.invalidSessionIDLength(localAuthoritySessionID.count)
         }
         let admissionRefusal: PfsLocalClientError
-        let allowsLocalSourcePipelining: Bool
+        let allowsNaturalPeerDrain: Bool
         switch policy {
         case .synchronousVFSRepairV1:
             admissionRefusal = .publicationAdmissionBusy
-            allowsLocalSourcePipelining = false
+            allowsNaturalPeerDrain = false
         case .synchronousVFSRepairV2:
             admissionRefusal = .publicationAdmissionClosed
-            allowsLocalSourcePipelining = true
+            allowsNaturalPeerDrain = true
         case .nativeFSKitRevocationV1:
             admissionRefusal = .publicationAdmissionClosed
-            allowsLocalSourcePipelining = false
+            allowsNaturalPeerDrain = false
         }
         self.admissionRefusal = admissionRefusal
-        self.allowsLocalSourcePipelining = allowsLocalSourcePipelining
+        self.allowsNaturalPeerDrain = allowsNaturalPeerDrain
         ingressRegistry = PfsMacOSCallbackIngressRegistry(
             admissionRefusal: admissionRefusal
         )
@@ -923,7 +590,6 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         let wasPending = ingressRegistry.remove(reservation)
         if exemptFromAdmission {
             admitted.removeValue(forKey: key)
-            sourceParkedTickets.removeValue(forKey: key)
             return nil
         }
         if admitted[key] != nil {
@@ -1082,7 +748,6 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     public func published(_ ticket: PfsMacOSAdmittedCallbackTicket) {
         let key = ObjectIdentifier(ticket)
         admitted.removeValue(forKey: key)
-        sourceParkedTickets.removeValue(forKey: key)
         guard ticket.markPublished() else { return }
         if signposter.isEnabled {
             let now = DispatchTime.now().uptimeNanoseconds
@@ -1092,16 +757,6 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
                 "CallbackPublished",
                 "ticket=\(ticket.diagnosticID) kind=\(ticket.callbackKind, privacy: .public) sequence=\(self.activeSequence ?? 0) ingress_to_publish_us=\(elapsed)"
             )
-        }
-        guard terminal == nil else { return }
-        if let operationID = localInitiatorAwaitingPublication,
-           ticket.currentOperationID() == operationID {
-            // The source callback's reply is the source mount's local cache
-            // transition. COMPLETE carries no local actuator work, so newer
-            // overlapping callbacks may park without closing an FSKit repair
-            // cycle. They still cannot reach the authority before its exact
-            // COMPLETE acknowledgement releases mutation order.
-            admissionState = .awaitingAuthorityAcknowledgement
         }
     }
 
@@ -1117,6 +772,9 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
 
     public func prepare(_ event: PfsMacOSCoherenceEvent) async throws {
         if let terminal { throw terminal }
+        guard event.initiator.sessionID != localAuthoritySessionID else {
+            throw PfsMacOSCoherenceError.sourceVisibilityEventForbidden
+        }
         // This lock-linearized cut is before PREPARE's first suspension. Every
         // framework upcall that arrived first becomes an ordinary admitted
         // ticket; every later upcall resolves against the closed actor state.
@@ -1132,36 +790,21 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         completeUptimeNanoseconds = nil
         let repairScope = Self.repairScope(of: event.repairs)
         closedRepairScope = repairScope
-        let isLocalInitiator = event.initiator.sessionID == localAuthoritySessionID
         if signposter.isEnabled {
             signposter.emitEvent(
                 "VisibilityPhase",
-                "edge=prepare sequence=\(event.sequence) local=\(isLocalInitiator) adopted_ingress=\(ingressReservations.count) repairs=\(event.repairs.count) scope=\(repairScope.diagnosticSummary, privacy: .public)"
+                "edge=prepare sequence=\(event.sequence) adopted_ingress=\(ingressReservations.count) repairs=\(event.repairs.count) scope=\(repairScope.diagnosticSummary, privacy: .public)"
             )
         }
         // A peer COMPLETE may need authenticated mounted-VFS surgery, so peer
         // PREPARE closes new overlapping admission and drains the callbacks in
         // its exact audience before reusing FSKit's actuator lane. Under v2 an
         // already-issued ordinary request finishes naturally; frozen v1 still
-        // revokes it. A source event never actuates its own mount:
-        // the initiating callback is the cache transition. New overlapping
-        // callbacks can therefore park from PREPARE onward without creating a
-        // repair cycle, and must remain parked through exact COMPLETE ACK.
-        admissionState = isLocalInitiator
-            ? .awaitingAuthorityAcknowledgement
-            : .repairActive
-        let exemptOperationID = isLocalInitiator
-            ? event.initiator.localOperationID
-            : nil
-        if let exemptOperationID {
-            localInitiatorAwaitingPublication = exemptOperationID
-        }
+        // revokes it. Source mutations publish through their own callback and
+        // never enter this peer repair stream.
+        admissionState = .repairActive
         // Snapshot before waiting: callbacks admitted later are held at the
-        // gate and are not this barrier's obligation. The initiating callback
-        // must not be waited on — it is waiting for the authority reply that
-        // this very barrier gates — and its operation ID was stamped when its
-        // mutation request was sent, strictly before the authority could have
-        // begun this barrier.
+        // gate and are not this barrier's obligation.
         //
         // The drain waits for bounded local publication after request admission
         // closes. In v2, already-issued ordinary requests in this PREPARE's
@@ -1171,27 +814,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         let drain = admitted.values.filter { ticket in
             let intersects = ticket.intersects(repairScope)
             guard intersects else { return false }
-            if let exemptOperationID, isLocalInitiator,
-               allowsLocalSourcePipelining {
-                switch ticket.prepareForLocalSource(
-                    initiatingOperationID: exemptOperationID
-                ) {
-                case .initiatingOperation:
-                    return false
-                case .parkedPristine, .parkedDistinctOrderedOperation,
-                     .parkedOrderedIdentityPending:
-                    sourceParkedTickets[ObjectIdentifier(ticket)] = ticket
-                    return false
-                case .mustRevokeAndDrain:
-                    break
-                }
-            } else if let exemptOperationID,
-                      ticket.currentOperationID() == exemptOperationID {
-                // Frozen v1 (and profiles without the v2 pipelined contract)
-                // retain exact-initiator-only exemption.
-                return false
-            }
-            if allowsLocalSourcePipelining {
+            if allowsNaturalPeerDrain {
                 ticket.closeFutureRequestsForNaturalDrain()
             } else {
                 ticket.revokeFutureRequests()
@@ -1220,26 +843,8 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
             let elapsed = completeNow < prepare ? 0 : (completeNow - prepare) / 1_000
             signposter.emitEvent(
                 "VisibilityPhase",
-                "edge=complete sequence=\(event.sequence) local=\(event.initiator.sessionID == self.localAuthoritySessionID) prepare_to_complete_us=\(elapsed) repairs=\(event.repairs.count)"
+                "edge=complete sequence=\(event.sequence) prepare_to_complete_us=\(elapsed) repairs=\(event.repairs.count)"
             )
-        }
-        if event.initiator.sessionID == localAuthoritySessionID,
-           let operationID = event.initiator.localOperationID {
-            // The deferred source COMPLETE: acknowledged only after the exact
-            // initiating callback published its ordinary FSKit reply. If no
-            // admitted ticket carries the ID, the callback has already
-            // published — a ticket leaves `admitted` only through `published`,
-            // and the daemon names only operations it observed on a request.
-            if let ticket = admitted.values.first(
-                where: { $0.currentOperationID() == operationID }
-            ) {
-                try await ticket.waitUntilPublished()
-                try Task.checkCancellation()
-                if let terminal { throw terminal }
-            }
-            if localInitiatorAwaitingPublication == operationID {
-                localInitiatorAwaitingPublication = nil
-            }
         }
         // Local repair is complete, so an overlapping callback no longer has
         // to fail in order to release FSKit's actuator lane. It parks until the
@@ -1256,7 +861,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     public func orderedAdmissionContended(
         for event: PfsMacOSCoherenceEvent
     ) async -> Bool {
-        guard allowsLocalSourcePipelining,
+        guard allowsNaturalPeerDrain,
               event.phase == .complete,
               event.initiator.sessionID != localAuthoritySessionID,
               event.epoch == activeEpoch,
@@ -1287,7 +892,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         if signposter.isEnabled {
             signposter.emitEvent(
                 "VisibilityPhase",
-                "edge=ack-open sequence=\(event.sequence) prepare_to_complete_us=\(prepareToComplete) complete_to_ack_us=\(completeToAck) parked=\(self.sourceParkedTickets.count) waiters=\(self.admissionWaiters.count)"
+                "edge=ack-open sequence=\(event.sequence) prepare_to_complete_us=\(prepareToComplete) complete_to_ack_us=\(completeToAck) waiters=\(self.admissionWaiters.count)"
             )
         }
         admissionState = .open
@@ -1296,12 +901,6 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         activeSequence = nil
         prepareUptimeNanoseconds = nil
         completeUptimeNanoseconds = nil
-        localInitiatorAwaitingPublication = nil
-        let parkedTickets = Array(sourceParkedTickets.values)
-        sourceParkedTickets.removeAll()
-        for ticket in parkedTickets {
-            ticket.releaseSourcePark()
-        }
 
         // Wake parked callbacks only. Each one re-enters `admit`, checks task
         // cancellation, and then mints its ticket. Returning tickets directly
@@ -1324,18 +923,11 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         terminal = error
         admissionState = .open
         closedRepairScope = nil
-        localInitiatorAwaitingPublication = nil
         activeEpoch = nil
         activeSequence = nil
         prepareUptimeNanoseconds = nil
         completeUptimeNanoseconds = nil
-        let parkedTickets = Array(sourceParkedTickets.values)
-        sourceParkedTickets.removeAll()
-        var terminalTickets = admitted
-        for ticket in parkedTickets {
-            terminalTickets[ObjectIdentifier(ticket)] = ticket
-        }
-        for ticket in terminalTickets.values {
+        for ticket in admitted.values {
             ticket.revokeFutureRequests()
         }
         let waiters = Array(admissionWaiters.values)
@@ -1425,13 +1017,12 @@ public protocol PfsMacOSV3CoherenceContext: AnyObject, Sendable {
     func shutdown()
 }
 
-/// Everything the macOS 26 compatibility cache policy installs into one strict
-/// FSKit volume: the namespace and live-object indexes the planner derives
-/// repairs from, the callback publication barrier, the repair gate, and the
-/// running coherence session. Constructed only when the resolve contract's
-/// cache policy names a supported macOS 26 synchronous-VFS repair version —
-/// the policy is a
-/// declared selection, never an inference.
+/// Everything the non-shipping macOS 26 qualification policy installs into one
+/// strict FSKit volume: the namespace and live-object indexes the planner
+/// derives repairs from, the callback publication barrier, the repair gate,
+/// and the running coherence session. Shipping composition refuses before
+/// Resolve. Qualification construction still requires one exact declared
+/// synchronous-VFS policy name; it never infers or falls back between names.
 public final class PfsMacOSV3VolumeCoherence:
     PfsMacOSV3CoherenceContext,
     @unchecked Sendable
@@ -1603,7 +1194,6 @@ public final class PfsMacOSV3VolumeCoherence:
         }
         let backend = try PfsMacOS26CoherenceBackend(
             policy: contract.cachePolicy,
-            localAuthoritySessionID: contract.sessionID,
             authenticator: authenticator,
             armer: registry,
             actuator: repairActuator,
@@ -1740,7 +1330,6 @@ public final class PfsMacOSV3NativeVolumeCoherence:
             invalidator: invalidatorSlot
         )
         let backend = try PfsNativeFSKitCoherenceBackend(
-            localAuthoritySessionID: contract.sessionID,
             revoker: revoker,
             publicationBarrier: barrier
         )

@@ -142,6 +142,7 @@ func TestValidateDirectV3MountOptsNamesEveryMissingPiece(t *testing.T) {
 		"no client cert":   {func(o *mountOpts) { o.clientCertPath = "" }, "--client-cert"},
 		"no client key":    {func(o *mountOpts) { o.clientKeyPath = "" }, "--client-key"},
 		"bad coherence":    {func(o *mountOpts) { o.coherence = "eventual" }, "--coherence"},
+		"retired uncached": {func(o *mountOpts) { o.coherence = "uncached" }, "--coherence must be strict"},
 		"local-dir":        {func(o *mountOpts) { o.localDirs = stringListFlag{"node_modules"} }, "declared volume-wide"},
 		"lease-only shape": {func(o *mountOpts) { o.addr = ""; o.dataPlaneTransport = ""; o.mountToken = "" }, "cannot mint v3 credentials"},
 	}

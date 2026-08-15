@@ -120,6 +120,12 @@ The script refuses rather than repairs. It requires:
    lives there — beside the volumes but outside the user-visible project
    directory, so an authority restart cannot forget a still-mounted kernel while
    agents can never reach or mutate the record through PortableFS.
+6. **Creates private transactional-write staging.** The 0700
+   `<mount>/.portablefs-control/<volume-name>/write-staging` directory is owned by
+   the service identity, carries the volume's exact XFS project ID and
+   `PROJINHERIT`, and remains outside the served namespace. Unnamed O_TMPFILE
+   staging therefore consumes the same hard quota as visible volume data rather
+   than becoming an unbounded cell-wide side channel.
 
 On success it prints the destination, project, owner, limits, and the exact
 membership path to pass to the authority.
@@ -162,13 +168,16 @@ portablefs-authority \
   --capability-public-key /run/portablefs/capability-public.pem \
   --visibility-membership-file \
     /srv/portablefs/.portablefs-control/vol_01JXYZ/strict-membership \
+  --write-staging-dir \
+    /srv/portablefs/.portablefs-control/vol_01JXYZ/write-staging \
   --max-sessions 1024 \
+  --max-connections 4096 \
   --max-lock-records 65536
 ```
 
 ### Required flags
 
-All nine are mandatory and startup refuses without them.
+All ten are mandatory and startup refuses without them.
 
 | Flag | Meaning |
 | --- | --- |
@@ -181,6 +190,7 @@ All nine are mandatory and startup refuses without them.
 | `--client-ca` | client CA bundle PEM |
 | `--capability-public-key` | one `PUBLIC KEY` PEM block holding an Ed25519 key; anything else is refused |
 | `--visibility-membership-file` | absolute durable strict-mount membership file |
+| `--write-staging-dir` | private 0700 directory for unnamed transactional-write staging; the provisioner places it outside the served namespace under the volume's XFS project quota |
 
 ### Coherence and mount-lifecycle flags
 
@@ -190,6 +200,7 @@ All nine are mandatory and startup refuses without them.
 | `--capability-max-lifetime` | `15m` | longest signed grant window the authority will honour; keepalive cannot extend it, while hosted reauthorization requires a fresh grant |
 | `--session-lease` | `2m` | renewable session lease |
 | `--max-repair-budget` | `30s` | longest per-phase cache-repair deadline a strict mount may commit to before it is fenced. Must be at least the mount's own `--repair-budget`, whose default is `15s`. |
+| `--terminal-delivery-timeout` | `45s` | bounded drain for an exact terminal applied-state reply, its local kernel publication, and the receipt ACK. Must be at least `--max-repair-budget`; size it above the mount's response-consumption bound plus transport latency. |
 | `--visibility-clock-skew` | `5s` | clock disagreement tolerated when a mount timestamps its own kernel-mount absence |
 | `--max-cached-name-capacity` | `65536` | largest kernel-cache bound a strict mount may declare; sizes the per-session resolved index |
 
@@ -214,7 +225,7 @@ the worker class and workload measurements.
 | `--max-retained-reply-bytes` | `512 MiB` |
 | `--max-frame-bytes-in-flight` | `512 MiB` |
 | `--max-in-flight` | `256` |
-| `--max-connections` | `2048` |
+| `--max-connections` | `4096` |
 | `--capability-nonce-records` | `65536` |
 | `--tls-handshake-timeout` | `10s` |
 | `--connection-idle-timeout` | `5m` |
@@ -225,7 +236,22 @@ must leave a fixed reserve around each read/write payload, `--max-retained-reply
 must admit at least one maximal reply, `--max-frame-bytes-in-flight` must admit at
 least one maximal request, `--connection-idle-timeout` must exceed `--session-lease`,
 and `--max-in-flight` must be at least 2 so an ordinary request can proceed
-alongside a blocking lock wait.
+alongside a blocking lock wait. Protocol 5 also requires `--max-connections` to
+be at least four times `--max-sessions`: two slots hold each mount's current
+DATA and CONTROL lanes, while exact pair recovery must authenticate both
+candidate roles before either old generation can be retired. The authority
+refuses startup when that invariant is false; neither the old 2048-connection
+default nor a 3072 three-slot configuration can recover every saturated mount
+without waiting for an old connection to time out.
+
+Protocol-5 frames retain protocol 4's accounting of protobuf metadata and the one optional bulk body
+together against both `--max-frame-bytes` and
+`--max-frame-bytes-in-flight`. The inbound reservation is retained through the
+authority handler because a reconstructed write-transaction DATA fragment
+points directly into that buffer. It is released after the staging operation
+returns; an out-of-line body on anything except
+`WriteTransactionRequest.Data` in its DATA phase (or, in the reverse direction,
+`ReadReply.Data`) closes the connection as malformed.
 
 ### Clean detach
 
@@ -287,8 +313,8 @@ not expose the raw XFS mount to agent machines or containers.
 Note one launch restriction that surprises operators: **user-xattr writes are
 disabled.** XFS does not charge attribute-fork blocks to a project, so per-inode
 RPC limits cannot isolate a shared cell, and a separate logical counter would
-not be crash-atomic with XFS. Because authority protocol v3 requires the exact
-`user-xattr-readonly` feature at Attach, the Linux frontend validates the FUSE
+not be crash-atomic with XFS. Because authority protocol v5 requires the exact
+`user-xattr-readonly` feature at Activate, the Linux frontend validates the FUSE
 flags and returns `EOPNOTSUPP` locally without spending an authority RPC, replay
 sequence, or visibility transition. Direct authority requests receive the same
 answer. Read, list, and removal remain available for pre-existing portable user
@@ -312,7 +338,9 @@ A mount presents two independent credentials, and the authority requires both.
 
 **Transport identity.** Sessions are mutual TLS 1.3 with
 `RequireAndVerifyClientCert` against `--client-ca`, and ALPN
-`portablefs-authority-v3`. Plaintext cannot mount.
+`portablefs-authority-v5`. Plaintext cannot mount. Every active session owns one
+DATA and one CONTROL connection in the same authenticated connection set; a
+single transport can neither attach active nor fall back to protocol 4.
 
 **A mount capability.** A capability is an Ed25519-signed token of the form
 `v1.<base64url payload>.<base64url signature>`, signed over a domain-separated
@@ -396,11 +424,17 @@ required and must be `tls-private-ca` (with `--data-plane-server-name` and
 `plaintext` is refused with the reason named. `--client-key` must be mode 0600.
 Store the token and key in ordinary `0600` files.
 
-`--coherence` picks the kernel cache contract: `strict` (default — names and
-attributes are cached and repaired through the authority's synchronous
-visibility barrier) or `uncached` (cache nothing; Linux only). `--foreground`
-stays attached and unmounts on Ctrl-C. `--branch` and `--fast` are retired and
-passing either is an error.
+Protocol 5 has one kernel-cache contract. `--coherence strict` names it and is
+the default: every mount joins the authority's visibility ordering, and every
+cache-visible filesystem mutation installs its source-publication gate before
+dispatch. On Linux that gate is released only after the kernel's
+operation-specific postprocessing and the physical ACK of its forced
+`FUSE_PFS_PUBLISH`; completion of the daemon's ordinary reply write is not the
+publication boundary.
+`--coherence uncached` is retired and rejected before Attach; it is never an
+alias for `strict` and never selects a fallback. `--foreground` stays attached
+and unmounts on Ctrl-C. `--branch` and `--fast` are also retired and passing any
+of these retired options is an error.
 
 Machine-local directories are declared volume-wide in `.portablefs/local-dirs`,
 not per mount. `--local-dir` is refused unconditionally, because a route only
@@ -425,9 +459,10 @@ portablefs-mount-v3 \
 ```
 
 All eight of those are required. Notable optional flags are `--coherence`
-(`strict` default, or `uncached`), `--cached-name-capacity` (default `65536`),
-`--repair-budget` (default `15s`, and the authority's `--max-repair-budget` must
-be at least this), `--max-in-flight` (`128`), `--max-background` (`128`),
+(`strict` is the only accepted value), `--cached-name-capacity` (default
+`65536`), `--repair-budget` (default `15s`, and the authority's
+`--max-repair-budget` must be at least this), `--max-in-flight` (`128`),
+`--max-background` (`128`),
 `--reclaim-queue` (`4096`), `--dial-timeout` (`10s`), `--cancel-drain-timeout`
 (`10s`), `--request-timeout` (`45s`), `--local-backing`, and `--no-local-dirs`.
 `--local-dir` exists only to be refused with an explanation. The mountpoint must
@@ -444,8 +479,10 @@ a synchronous lease/invalidation design is implemented and proven.
 There is no write-back cache: `write(2)` returns after the authority has applied
 the bytes to XFS, and `fsync` waits for the authoritative server descriptor. Use
 `fsync`/`fdatasync` on files and `fsync` on changed parent directories for
-durability. Linux currently does not forward `syncfs(2)` to ordinary FUSE
-userspace servers, so it is not a remote durability boundary for this mount.
+targeted durability. The pinned strict kernel also forwards `syncfs(2)` through
+mandatory `FUSE_SYNCFS`; success means the authority completed its volume sync,
+while an ordinary durability errno propagates and ENOSYS/transport/protocol
+failure fences the mount. Stock ordinary-FUSE behavior is not admitted.
 
 SQLite is verified in rollback-journal mode. WAL mode is outside the
 multi-machine contract because SQLite's wal-index requires shared memory among
@@ -459,9 +496,12 @@ and nothing is replayed — `--force` simply gives up on proving the drain.
 
 ## Mounting from macOS
 
-macOS mounts through the PortableFS FSKit extension. There is one transport per
-platform and no fallback: a host that cannot serve its platform's transport
-fails with guidance rather than degrading to a weaker consistency model.
+The shipping macOS build currently refuses protocol-5 FSKit mounting before it
+constructs an authority transport or sends Attach. Current public FSKit has no
+exact peer namespace/attribute invalidation primitive, and the macOS 26 callback
+result shapes cannot publish the complete post-mutation attributes required by
+the source-publication contract. This is a production admission decision, not a
+runtime feature flag: there is no opt-in, `uncached` mode, or fallback.
 
 1. Install PortableFS.app from the notarized release (see
    [release-identity.md](./release-identity.md)).
@@ -469,7 +509,9 @@ fails with guidance rather than degrading to a weaker consistency model.
    General -> Login Items & Extensions -> File System Extensions. This is an
    interactive user-controlled toggle and is deliberately not automatable. The
    app never claims the toggle is on; only a successful mount verifies it.
-3. Mount with the same `portablefs mount` command shape as Linux.
+3. Do not issue a production mount until a release explicitly qualifies the
+   native FSKit repair contract. The current daemon returns the admission error
+   without opening an authority session.
 
 The host's launchd-managed `portablefsd` owns the authority session; the CLI
 adopts it through the external owner-private control socket or wakes the exact
@@ -489,16 +531,12 @@ control socket is fixed under canonical account state, so
 `PORTABLEFS_FSKIT_SOCKET` and `PORTABLEFS_FSKIT_CONTROL_SOCKET` are rejected.
 `PORTABLEFS_FSKIT_TYPE` may only assert the signed release type.
 
-Two current macOS restrictions:
-
-- `--coherence uncached` is Linux only.
-- macOS does not yet join the route adoption protocol, so a volume that declares
-  machine-local routes mounts from Linux.
-
-The macOS coherence policy that ships today is an explicitly declared
-compatibility policy with open live-kernel gates. Read
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md) before
-treating a macOS mount as equivalent to a Linux one.
+A separately build-stamped qualification artifact may exercise the candidate
+native-revocation policy and remains fail-closed on any unrepresentable repair;
+it is not a shipping compatibility path. macOS also does not yet join the route
+adoption protocol. Read
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md) for the live
+evidence and remaining platform gates.
 
 ## Verifying cross-mount coherence
 

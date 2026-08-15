@@ -45,13 +45,11 @@ production provisioner, mints credentials with the production capability signer
 * An atomic replacement is compared against the inode number the *other* mount
   resolves, not against content alone, because a stale binding can serve the
   right bytes from the wrong inode.
-* Nothing polls or retries. The correct answer is the first answer. In the
-  `uncached` profile the frontend holds no cache at all; in the `strict`
-  profile (the default) names and attributes are cached but every remote
-  mutation completes its two-phase repair on every mount *before* the
-  mutator's own call returns, so there is still no interval in which a settled
-  answer differs from the first one. A case that needed a settling delay would
-  be reporting a defect, not a timing artefact.
+* Nothing polls or retries. The correct answer is the first answer. Names and
+  attributes may be cached, but every mount participates in strict
+  source-publication and peer-visibility ordering: a remote mutation completes
+  repair before its result is published. A case that needed a settling delay
+  would be reporting a defect, not a timing artefact.
 
 ## Falsifiability
 
@@ -227,7 +225,6 @@ Linux (`scripts/coherence-matrix-linux.sh`):
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `PORTABLEFS_COHERENCE` | `strict` | the kernel-cache contract the mounts declare (`strict` or `uncached`), matching `portablefs-mount-v3`'s own default |
 | `PORTABLEFS_ATOMIC_REPLACE_ROUNDS` | `20` | rounds of the atomic replacement case |
 | `PORTABLEFS_ALT_GID` | `200002` | supplementary GID for the ownership case |
 | `PORTABLEFS_CACHED_NAME_CAPACITY` | `65536` | strict-mount kernel-cache bound, set on both sides |

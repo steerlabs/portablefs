@@ -18,18 +18,11 @@ import (
 // participant is in the audience unconditionally. There is nothing an index
 // could rule out.
 //
-// The second is exclusion. A mutation shares the registration read lock, so
-// mutations run concurrently when no strict mount exists. A routing change takes
-// the write side. That is what makes the revision switch airtight for mounts
-// that are not barrier participants at all: an uncached mount never receives an
-// event, so the only thing that can keep it from operating under a topology it
-// does not run is the fact that no request of its own can be executing at the
-// instant the active revision changes, and no attach can be in progress either.
-// Holding the write lock across the whole change is exactly that instant being
-// empty. What refuses the uncached mount afterwards is its recorded attach
-// revision no longer matching the active one - see the authority handler - which
-// is authority-held state rather than a value the mount echoes back, so a mount
-// cannot present agreement it does not have.
+// The second is exclusion. Ordinary mutations and attaches share the
+// registration read lock; a routing change takes the write side. Holding it
+// across the whole change prevents any request or attach from straddling the
+// revision switch, while the peer-only phases close every active frontend's
+// publication admission around the commit.
 //
 // commit installs the new rules durably and returns the revision that is active
 // afterwards. It runs between the two phases, with every strict frontend's
@@ -84,19 +77,14 @@ func (c *VisibilityCoordinator) ExecuteRoutesChecked(ctx context.Context, next R
 		}
 	}
 	// The write lock already excludes every Execute, so this normally grants
-	// immediately. It is taken anyway because the deferred source acknowledgment
-	// of the previous mutation is drained under it, and because a routing change
-	// claiming a sequence out of mutation order would make the per-participant
-	// cursor non-monotonic.
+	// immediately. It is taken anyway because a routing change claiming a
+	// sequence out of mutation order would make the per-participant cursor
+	// non-monotonic.
 	turn, err := c.order.acquire(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer turn.release()
-	if err := c.waitDeferred(ctx); err != nil {
-		return 0, &VisibilityBarrierError{Err: err}
-	}
-
 	ticket := VisibilityEvent{Routes: next.clone()}
 	audience, deliveries, err := c.openRoutesBarrier(&ticket)
 	if err != nil {

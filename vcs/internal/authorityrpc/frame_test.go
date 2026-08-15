@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -23,6 +27,27 @@ func (w *shortWriter) Write(value []byte) (int, error) {
 		value = value[:w.max]
 	}
 	return w.Buffer.Write(value)
+}
+
+var errInjectedFrameWrite = errors.New("injected frame write failure")
+
+type failAfterWriter struct {
+	bytes.Buffer
+	remaining int
+}
+
+func (w *failAfterWriter) Write(value []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, errInjectedFrameWrite
+	}
+	if len(value) <= w.remaining {
+		w.remaining -= len(value)
+		return w.Buffer.Write(value)
+	}
+	value = value[:w.remaining]
+	w.remaining = 0
+	n, _ := w.Buffer.Write(value)
+	return n, errInjectedFrameWrite
 }
 
 func TestWriteFrameCompletesShortWrites(t *testing.T) {
@@ -56,8 +81,363 @@ func TestFrameRoundTripAndBound(t *testing.T) {
 
 	var oversized bytes.Buffer
 	_ = binary.Write(&oversized, binary.BigEndian, uint32(1025))
+	_ = binary.Write(&oversized, binary.BigEndian, uint32(0))
 	if err := readFrame(&oversized, 1024, nil, 0, &decoded); !errors.Is(err, ErrFrameBounds) {
 		t.Fatalf("readFrame=%v", err)
+	}
+}
+
+func TestFrameCarriesWriteTransactionDataOutsideProtobuf(t *testing.T) {
+	data := bytes.Repeat([]byte{0xA5}, 64<<10)
+	want := &authoritypb.Request{
+		RequestId: 8,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 17, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: data,
+		}},
+	}
+	var frame bytes.Buffer
+	if err := writeFrame(&frame, 128<<10, want); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(want.GetWriteTransaction().GetData(), data) {
+		t.Fatal("writeFrame did not restore the caller-owned request payload")
+	}
+	metadataSize := binary.BigEndian.Uint32(frame.Bytes()[:4])
+	bulkSize := binary.BigEndian.Uint32(frame.Bytes()[4:8])
+	if bulkSize != uint32(len(data)) {
+		t.Fatalf("bulk size = %d, want %d", bulkSize, len(data))
+	}
+	var metadata authoritypb.Request
+	if err := proto.Unmarshal(frame.Bytes()[frameHeaderBytes:frameHeaderBytes+int(metadataSize)], &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata.GetWriteTransaction().GetData()) != 0 {
+		t.Fatal("write data was duplicated inside protobuf metadata")
+	}
+
+	var got authoritypb.Request
+	if err := readFrame(bytes.NewReader(frame.Bytes()), 128<<10, nil, 0, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(want, &got) {
+		t.Fatalf("round trip differs: got %v", &got)
+	}
+}
+
+func TestWriteFramePartialPrefixAndBulkFailuresPreserveExactReplayBody(t *testing.T) {
+	data := bytes.Repeat([]byte{0x6D}, 4096)
+	request := &authoritypb.Request{
+		RequestId: 81,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 23, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: data,
+		}},
+	}
+	var complete bytes.Buffer
+	if err := writeFrame(&complete, 8192, request); err != nil {
+		t.Fatal(err)
+	}
+	metadataSize := int(binary.BigEndian.Uint32(complete.Bytes()[:4]))
+	prefixSize := frameHeaderBytes + metadataSize
+	for _, limit := range []int{0, 1, prefixSize - 1, prefixSize, prefixSize + len(data)/2} {
+		t.Run(fmt.Sprintf("after-%d", limit), func(t *testing.T) {
+			writer := &failAfterWriter{remaining: limit}
+			if err := writeFrame(writer, 8192, request); !errors.Is(err, errInjectedFrameWrite) {
+				t.Fatalf("writeFrame = %v, want injected failure", err)
+			}
+			if !bytes.Equal(request.GetWriteTransaction().GetData(), data) {
+				t.Fatal("failed write changed the caller-owned replay body")
+			}
+			if !bytes.Equal(writer.Bytes(), complete.Bytes()[:limit]) {
+				t.Fatal("partial frame differs from the exact successful frame prefix")
+			}
+			var replay bytes.Buffer
+			if err := writeFrame(&replay, 8192, request); err != nil {
+				t.Fatalf("replay after partial write: %v", err)
+			}
+			var decoded authoritypb.Request
+			if err := readFrame(&replay, 8192, nil, 0, &decoded); err != nil {
+				t.Fatalf("decode replay: %v", err)
+			}
+			if !proto.Equal(request, &decoded) {
+				t.Fatal("replay body changed after partial write")
+			}
+		})
+	}
+}
+
+func TestFrameCarriesReadDataOutsideProtobuf(t *testing.T) {
+	data := bytes.Repeat([]byte{0x3C}, 64<<10)
+	want := &authoritypb.Response{
+		RequestId: 9,
+		Body:      &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: data}},
+	}
+	var frame bytes.Buffer
+	if err := writeFrame(&frame, 128<<10, want); err != nil {
+		t.Fatal(err)
+	}
+	if binary.BigEndian.Uint32(frame.Bytes()[4:8]) != uint32(len(data)) {
+		t.Fatal("read data was not encoded as the frame bulk body")
+	}
+	var got authoritypb.Response
+	if err := readFrame(bytes.NewReader(frame.Bytes()), 128<<10, nil, 0, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(want, &got) {
+		t.Fatal("read frame did not reconstruct the response")
+	}
+}
+
+func TestFrameRejectsBulkWithoutItsExactCarrier(t *testing.T) {
+	metadata, err := proto.Marshal(&authoritypb.Request{
+		RequestId: 10,
+		Body:      &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame bytes.Buffer
+	_ = binary.Write(&frame, binary.BigEndian, uint32(len(metadata)))
+	_ = binary.Write(&frame, binary.BigEndian, uint32(3))
+	frame.Write(metadata)
+	frame.WriteString("bad")
+	var got authoritypb.Request
+	if err := readFrame(&frame, 4096, nil, 0, &got); !errors.Is(err, ErrFramePayload) {
+		t.Fatalf("readFrame = %v, want ErrFramePayload", err)
+	}
+}
+
+func TestFrameRejectsInlineBulkCopy(t *testing.T) {
+	metadata, err := proto.Marshal(&authoritypb.Request{
+		RequestId: 10,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+			Data: []byte("inline is not protocol 5"),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame bytes.Buffer
+	_ = binary.Write(&frame, binary.BigEndian, uint32(len(metadata)))
+	_ = binary.Write(&frame, binary.BigEndian, uint32(0))
+	frame.Write(metadata)
+	var got authoritypb.Request
+	if err := readFrame(&frame, 4096, nil, 0, &got); !errors.Is(err, ErrFramePayload) {
+		t.Fatalf("readFrame = %v, want ErrFramePayload", err)
+	}
+}
+
+func encodedRawFrame(metadata, bulk []byte) []byte {
+	frame := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata)+len(bulk))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(metadata)))
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(bulk)))
+	frame = append(frame, metadata...)
+	return append(frame, bulk...)
+}
+
+func TestFrameRejectsNonCanonicalMetadataBeforeDecode(t *testing.T) {
+	valid, err := proto.Marshal(&authoritypb.Request{
+		RequestId: 17,
+		Body:      &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		metadata []byte
+	}{
+		{
+			name: "unknown top-level field",
+			metadata: protowire.AppendVarint(
+				protowire.AppendTag(append([]byte(nil), valid...), 63, protowire.VarintType), 1,
+			),
+		},
+		{
+			name: "duplicate singular field",
+			metadata: protowire.AppendVarint(
+				protowire.AppendTag(append([]byte(nil), valid...), 1, protowire.VarintType), 18,
+			),
+		},
+		{
+			name: "two oneof bodies",
+			metadata: protowire.AppendBytes(
+				protowire.AppendTag(append([]byte(nil), valid...), 10, protowire.BytesType), nil,
+			),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var decoded authoritypb.Request
+			err := readFrame(bytes.NewReader(encodedRawFrame(test.metadata, nil)), 4096, nil, 0, &decoded)
+			if !errors.Is(err, ErrFrameEncoding) {
+				t.Fatalf("readFrame = %v, want ErrFrameEncoding", err)
+			}
+			if decoded.GetRequestId() != 0 || decoded.GetBody() != nil {
+				t.Fatalf("non-canonical metadata reached protobuf decode: %+v", &decoded)
+			}
+		})
+	}
+}
+
+func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
+	features := make([]string, maxWireFeatureElements+1)
+	request := &authoritypb.Request{
+		RequestId: 19,
+		Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
+			ProtocolMajor: ProtocolMajor,
+			Features:      features,
+		}},
+	}
+	metadata, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded authoritypb.Request
+	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("oversized repeated field = %v, want ErrFrameEncoding", err)
+	}
+	if decoded.GetHello() != nil {
+		t.Fatal("repeated-field amplification reached protobuf decode")
+	}
+	// The sender runs the exact same grammar, so an internal producer cannot
+	// put a frame on the wire that every conforming receiver must reject.
+	if err := writeFrame(io.Discard, 4096, request); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("writeFrame oversized repeated field = %v, want ErrFrameEncoding", err)
+	}
+}
+
+func TestFrameBoundsPackedRepeatedElements(t *testing.T) {
+	atLimit := &authoritypb.Request{
+		RequestId: 20,
+		Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
+			BlockedParentKernelInos: make([]uint64, maxWireRepeatedElements),
+		}},
+	}
+	var atLimitFrame bytes.Buffer
+	if err := writeFrame(&atLimitFrame, 1<<20, atLimit); err != nil {
+		t.Fatalf("writeFrame at exact repeated bound: %v", err)
+	}
+	var atLimitDecoded authoritypb.Request
+	if err := readFrame(&atLimitFrame, 1<<20, nil, 0, &atLimitDecoded); err != nil {
+		t.Fatalf("readFrame at exact repeated bound: %v", err)
+	}
+	if got := len(atLimitDecoded.GetAckVisibility().GetBlockedParentKernelInos()); got != maxWireRepeatedElements {
+		t.Fatalf("decoded repeated elements = %d, want %d", got, maxWireRepeatedElements)
+	}
+
+	request := &authoritypb.Request{
+		RequestId: 21,
+		Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
+			BlockedParentKernelInos: make([]uint64, maxWireRepeatedElements+1),
+		}},
+	}
+	metadata, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded authoritypb.Request
+	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), uint32(len(metadata)+frameHeaderBytes), nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("oversized packed field = %v, want ErrFrameEncoding", err)
+	}
+}
+
+func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
+	targets := make([]*authoritypb.VisibilityTarget, maxWireRepeatedElements+1)
+	for i := range targets {
+		targets[i] = &authoritypb.VisibilityTarget{
+			Scope:    authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA,
+			Identity: []byte{byte(i)},
+		}
+	}
+	response := &authoritypb.Response{
+		RequestId: 22,
+		Body: &authoritypb.Response_Visibility{Visibility: &authoritypb.VisibilityEvent{
+			Targets: targets,
+		}},
+	}
+	metadata, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded authoritypb.Response
+	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("nested allocation amplification = %v, want ErrFrameEncoding", err)
+	}
+	if decoded.GetBody() != nil {
+		t.Fatal("nested allocation amplification reached protobuf decode")
+	}
+	if err := writeFrame(io.Discard, 1<<20, response); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("writeFrame nested allocation amplification = %v, want ErrFrameEncoding", err)
+	}
+}
+
+func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
+	request := &authoritypb.Request{
+		RequestId: 11,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: bytes.Repeat([]byte{7}, 4096),
+		}},
+	}
+	var frame bytes.Buffer
+	if err := writeFrame(&frame, 8192, request); err != nil {
+		t.Fatal(err)
+	}
+	total := binary.BigEndian.Uint32(frame.Bytes()[:4]) + binary.BigEndian.Uint32(frame.Bytes()[4:8])
+	budget := newFrameBudget(uint64(total))
+	var got authoritypb.Request
+	release, err := readFrameRetained(bytes.NewReader(frame.Bytes()), 8192, budget, time.Second, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := budget.acquire(context.Background(), 1, 20*time.Millisecond); !errors.Is(err, ErrFrameBudget) {
+		t.Fatalf("budget while handler owns bulk = %v, want ErrFrameBudget", err)
+	}
+	release()
+	if err := budget.acquire(context.Background(), total, time.Second); err != nil {
+		t.Fatalf("budget after handler release = %v", err)
+	}
+	budget.release(total)
+}
+
+// BenchmarkWriteBulkFrameAllocations1MiB isolates framing allocations. The
+// discard sink accepts the bulk slice without copying it, so bytes/second from
+// this benchmark would be fictitious transport throughput and is deliberately
+// not reported.
+func BenchmarkWriteBulkFrameAllocations1MiB(b *testing.B) {
+	request := &authoritypb.Request{
+		RequestId: 12,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: make([]byte, 1<<20),
+		}},
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := writeFrame(io.Discard, 2<<20, request); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadBulkFrame1MiB(b *testing.B) {
+	request := &authoritypb.Request{
+		RequestId: 13,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: make([]byte, 1<<20),
+		}},
+	}
+	var encoded bytes.Buffer
+	if err := writeFrame(&encoded, 2<<20, request); err != nil {
+		b.Fatal(err)
+	}
+	wire := encoded.Bytes()
+	b.ReportAllocs()
+	b.SetBytes(1 << 20)
+	for b.Loop() {
+		var got authoritypb.Request
+		if err := readFrame(bytes.NewReader(wire), 2<<20, nil, 0, &got); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -69,7 +449,7 @@ func TestFrameBudgetBoundsConcurrentAllocation(t *testing.T) {
 	if err := writeFrame(&frame, 1024, request); err != nil {
 		t.Fatal(err)
 	}
-	size := binary.BigEndian.Uint32(frame.Bytes()[:4])
+	size := binary.BigEndian.Uint32(frame.Bytes()[:4]) + binary.BigEndian.Uint32(frame.Bytes()[4:8])
 
 	budget := newFrameBudget(uint64(size))
 	if err := budget.acquire(context.Background(), size, time.Second); err != nil {
@@ -90,12 +470,35 @@ func TestFrameBudgetBoundsConcurrentAllocation(t *testing.T) {
 
 type echoHandler struct{ epoch []byte }
 
-func (h echoHandler) Epoch() []byte { return append([]byte(nil), h.epoch...) }
+var frameTestNeverTerminal = make(chan struct{})
+
+func (h echoHandler) Epoch() []byte                                     { return append([]byte(nil), h.epoch...) }
+func (echoHandler) RegisterSessionEndHook(func(volumeserver.SessionID)) {}
+func (echoHandler) SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return volumeserver.SessionStateProvisional, true
+}
+func (echoHandler) SessionTerminalForTransport(volumeserver.SessionID) (<-chan struct{}, bool) {
+	return frameTestNeverTerminal, true
+}
 func (h echoHandler) Bounds() TransportBounds {
 	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 4}
 }
 func (h echoHandler) Handle(_ context.Context, req *authoritypb.Request) *authoritypb.Response {
-	return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch()}
+	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch()}
+	switch req.GetBody().(type) {
+	case *authoritypb.Request_Hello:
+		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{ProtocolMajor: ProtocolMajor}}
+	case *authoritypb.Request_Attach:
+		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
+			SessionId: make([]byte, 16), Generation: 1, ResumeSecret: make([]byte, 32),
+			ProvisionalDeadlineUnixNanos: time.Now().Add(time.Minute).UnixNano(),
+		}}
+		response.GetAttach().SessionId[0] = 1
+		response.GetAttach().ResumeSecret[0] = 2
+	case *authoritypb.Request_Activate:
+		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
+	}
+	return response
 }
 
 func testServeSession(t *testing.T, s *Server, conn net.Conn) chan error {
@@ -104,7 +507,9 @@ func testServeSession(t *testing.T, s *Server, conn net.Conn) chan error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
+	if s.budget == nil {
+		s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -114,22 +519,109 @@ func testServeSession(t *testing.T, s *Server, conn net.Conn) chan error {
 	return done
 }
 
+type activeTestPair struct {
+	data, control net.Conn
+	dataDone      chan error
+	controlDone   chan error
+	epoch         []byte
+	proof         *authoritypb.SessionProof
+}
+
+func startActiveTestPair(t *testing.T, s *Server) activeTestPair {
+	t.Helper()
+	dataClient, dataServer := net.Pipe()
+	controlClient, controlServer := net.Pipe()
+	pair := activeTestPair{
+		data: dataClient, control: controlClient,
+		dataDone: testServeSession(t, s, dataServer), controlDone: testServeSession(t, s, controlServer),
+		epoch: s.Handler.Epoch(),
+	}
+	setID := make([]byte, 32)
+	setID[0] = 7
+	hello := func(conn net.Conn, role authoritypb.TransportRole) {
+		t.Helper()
+		request := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
+			ProtocolMajor: ProtocolMajor, Role: role, ConnectionSetId: append([]byte(nil), setID...),
+		}}}
+		if err := writeFrame(conn, 4096, request); err != nil {
+			t.Fatal(err)
+		}
+		var response authoritypb.Response
+		if err := readFrame(conn, 4096, nil, 0, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.GetHello() == nil || response.GetHello().GetRole() != role ||
+			!bytes.Equal(response.GetHello().GetConnectionSetId(), setID) {
+			t.Fatalf("%s Hello response = %v", role, &response)
+		}
+	}
+	hello(dataClient, authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
+	hello(controlClient, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)
+	attempt := make([]byte, 32)
+	attempt[0] = 8
+	if err := writeFrame(dataClient, 4096, &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{
+		AttachAttemptId: attempt,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	var attachResponse authoritypb.Response
+	if err := readFrame(dataClient, 4096, nil, 0, &attachResponse); err != nil {
+		t.Fatal(err)
+	}
+	attach := attachResponse.GetAttach()
+	if attach == nil || attach.GetDataBindingGeneration() == 0 || attach.GetControlBindingGeneration() == 0 {
+		t.Fatalf("Attach response = %v", &attachResponse)
+	}
+	pair.proof = &authoritypb.SessionProof{Id: append([]byte(nil), attach.GetSessionId()...), Generation: attach.GetGeneration(), ResumeSecret: append([]byte(nil), attach.GetResumeSecret()...)}
+	activate := &authoritypb.Request{
+		RequestId: 2, Epoch: append([]byte(nil), pair.epoch...), Session: proto.Clone(pair.proof).(*authoritypb.SessionProof),
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: attempt, DataBindingGeneration: attach.GetDataBindingGeneration(), ControlBindingGeneration: attach.GetControlBindingGeneration(),
+		}},
+	}
+	if err := writeFrame(controlClient, 4096, activate); err != nil {
+		t.Fatal(err)
+	}
+	var activateResponse authoritypb.Response
+	if err := readFrame(controlClient, 4096, nil, 0, &activateResponse); err != nil {
+		t.Fatal(err)
+	}
+	if activateResponse.GetActivate().GetState() != authoritypb.SessionState_SESSION_STATE_ACTIVE {
+		t.Fatalf("Activate response = %v", &activateResponse)
+	}
+	return pair
+}
+
+func (p activeTestPair) close(t *testing.T) {
+	t.Helper()
+	_ = p.data.Close()
+	_ = p.control.Close()
+	for _, done := range []chan error{p.dataDone, p.controlDone} {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestServerMultiplexesRequestIDs(t *testing.T) {
-	client, server := net.Pipe()
 	s := &Server{
 		Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
 		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
-	done := testServeSession(t, s, server)
+	pair := startActiveTestPair(t, s)
+	defer pair.close(t)
 	for _, id := range []uint64{9, 3} {
-		if err := writeFrame(client, 4096, &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{ProtocolMajor: 1}}}); err != nil {
+		if err := writeFrame(pair.data, 4096, &authoritypb.Request{
+			RequestId: id, Epoch: append([]byte(nil), pair.epoch...), Session: proto.Clone(pair.proof).(*authoritypb.SessionProof),
+			Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}},
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	seen := map[uint64]bool{}
 	for range 2 {
 		var response authoritypb.Response
-		if err := readFrame(client, 4096, nil, 0, &response); err != nil {
+		if err := readFrame(pair.data, 4096, nil, 0, &response); err != nil {
 			t.Fatal(err)
 		}
 		seen[response.GetRequestId()] = true
@@ -137,19 +629,25 @@ func TestServerMultiplexesRequestIDs(t *testing.T) {
 	if !seen[9] || !seen[3] {
 		t.Fatalf("seen=%v", seen)
 	}
-	_ = client.Close()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
 }
 
 type nilResponseHandler struct{ epoch []byte }
 
-func (h nilResponseHandler) Epoch() []byte { return append([]byte(nil), h.epoch...) }
+func (h nilResponseHandler) Epoch() []byte                                     { return append([]byte(nil), h.epoch...) }
+func (nilResponseHandler) RegisterSessionEndHook(func(volumeserver.SessionID)) {}
+func (nilResponseHandler) SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return volumeserver.SessionStateProvisional, true
+}
+func (nilResponseHandler) SessionTerminalForTransport(volumeserver.SessionID) (<-chan struct{}, bool) {
+	return frameTestNeverTerminal, true
+}
 func (h nilResponseHandler) Bounds() TransportBounds {
 	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 4}
 }
-func (h nilResponseHandler) Handle(context.Context, *authoritypb.Request) *authoritypb.Response {
+func (h nilResponseHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	if request.GetHello() != nil || request.GetAttach() != nil || request.GetActivate() != nil {
+		return (echoHandler{epoch: h.epoch}).Handle(ctx, request)
+	}
 	return nil
 }
 
@@ -158,17 +656,20 @@ func (h nilResponseHandler) Handle(context.Context, *authoritypb.Request) *autho
 // told to remount after a failover that never happened.
 func TestNilHandlerResponseKeepsTheAuthorityEpoch(t *testing.T) {
 	epoch := bytes.Repeat([]byte{0xA5}, 16)
-	client, server := net.Pipe()
 	s := &Server{
 		Handler: nilResponseHandler{epoch: epoch}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
 		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
-	done := testServeSession(t, s, server)
-	if err := writeFrame(client, 4096, &authoritypb.Request{RequestId: 5, Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}); err != nil {
+	pair := startActiveTestPair(t, s)
+	defer pair.close(t)
+	if err := writeFrame(pair.data, 4096, &authoritypb.Request{
+		RequestId: 5, Epoch: append([]byte(nil), pair.epoch...), Session: proto.Clone(pair.proof).(*authoritypb.SessionProof),
+		Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var response authoritypb.Response
-	if err := readFrame(client, 4096, nil, 0, &response); err != nil {
+	if err := readFrame(pair.data, 4096, nil, 0, &response); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(response.GetEpoch(), epoch) {
@@ -177,10 +678,6 @@ func TestNilHandlerResponseKeepsTheAuthorityEpoch(t *testing.T) {
 	if response.GetRequestId() != 5 || !response.GetUncertain() ||
 		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL {
 		t.Fatalf("response = %v, want an internal, uncertain failure for request 5", &response)
-	}
-	_ = client.Close()
-	if err := <-done; err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -239,6 +736,7 @@ func TestRetainedReplyEnvelopeFitsItsReserve(t *testing.T) {
 	stamped.Epoch = bytes.Repeat([]byte{0xFF}, 16)
 	stamped.Errno = 0x7FFFFFFF
 	stamped.Mutation = &authoritypb.MutationState{Slot: ^uint32(0), AcceptedSequence: ^uint64(0)}
+	stamped.TerminalDeliveryToken = bytes.Repeat([]byte{0xFF}, 16)
 	if delta := proto.Size(stamped) - len(encoded); uint32(delta) > responseEnvelopeReserve {
 		t.Fatalf("envelope delta %d exceeds responseEnvelopeReserve %d", delta, responseEnvelopeReserve)
 	}

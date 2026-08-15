@@ -4,7 +4,8 @@ This module is the whole non-Swift half of PortableFS: the authority that owns
 an XFS volume, the Linux kernel-FUSE frontend, the macOS `portablefsd` data
 plane behind the FSKit extension, and the `portablefs` CLI.
 
-It has three dependencies — `go-fuse`, `golang.org/x/sys`, and `protobuf` — and
+It has four direct dependencies — `go-fuse`, `golang.org/x/sys`, `protobuf`,
+and HighwayHash for authority-private replay fingerprints — and
 no build system above `go`. The directory is named `vcs` for historical reasons;
 nothing in it is a version control system.
 
@@ -39,8 +40,10 @@ internal/
                    lock tables, the two-phase visibility barrier, durable strict
                    membership, and fail-closed fencing.
   authorityrpc/    The wire: TLS 1.3 mutual authentication, ALPN
-                   portablefs-authority-v3, canonical protobuf framing, the XFS
-                   request handler, routing topology, and visibility events.
+                   portablefs-authority-v5, mandatory DATA/CONTROL transports,
+                   provisional activation, schema-bound bulk framing,
+                   canonical replay fingerprinting, the XFS request handler, routing
+                   topology, and visibility events.
   authoritypb/     Generated protobuf bindings for proto/authority/v1.
   volumecap/       Ed25519 mount capabilities: signed, single-use, short-lived,
                    volume- and peer-bound.
@@ -53,13 +56,13 @@ internal/
   cellhelper/      Durable assignment pinning and the narrow root boundary.
   cellhost/        Closed XFS quota, local authority identity, and systemd host
                    operations derived only from signed volume assignments.
-  fusev3/          The Linux frontend. Raw FUSE, direct I/O, the strict and
-                   uncached cache profiles, kernel binding revocation, and
+  fusev3/          The Linux frontend. Raw FUSE, direct I/O, strict source and
+                   peer publication ordering, kernel binding revocation, and
                    machine-local route grafts.
   portablefsd/     The daemon: attach registry, control API, the v3 attach and
                    its coherence bridge, and the evidence-bearing detach.
   pfslocal/        The local protocol between the daemon and the FSKit
-                   extension. Major 1, currently minor 14, additive.
+                   extension. Major 1, currently minor 15, additive.
   mountv3/         The shared mount engine used by both the CLI and the
                    standalone mount binary.
   localdirs/       The .portablefs/local-dirs declaration: parsing,

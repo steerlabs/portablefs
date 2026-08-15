@@ -731,7 +731,6 @@ private actor CountingBackend: PfsMacOSCoherenceBackend {
             supportedKinds: [.negativeScratch, .positiveEviction]
         )
         let backend = try PfsMacOS26CoherenceBackend(
-            localAuthoritySessionID: Data(repeating: 0x99, count: 16),
             authenticator: authenticator,
             armer: registry,
             actuator: try PfsMacOS26POSIXActuator(rootFileDescriptor: rootFD),
@@ -1219,7 +1218,6 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
     let authenticator = try makeAuthenticator()
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let backend = try PfsMacOS26CoherenceBackend(
-        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
         authenticator: authenticator,
         armer: registry,
         actuator: UnusedRepairActuator(),

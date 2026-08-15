@@ -123,7 +123,7 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.enrollmentCertPath, "mount-enrollment-cert", "", "Manager-issued mount enrollment certificate PEM file")
 	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
-	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (cache names and attributes, join the authority visibility barrier) or uncached (cache nothing; Linux only)")
+	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-5 coherence mode)")
 	fs.BoolFunc("fast", "retired: every mount is adaptive; passing this flag is an error", func(string) error {
 		return errFastRetired
 	})
@@ -178,8 +178,8 @@ func validateDirectV3MountOpts(o *mountOpts, getenv func(string) string) (dataPl
 	if enrollmentSet != 0 && (o.authExpiresAtMs <= time.Now().UnixMilli() || o.enrollmentExpiresAtMs <= o.authExpiresAtMs) {
 		return dataPlaneTransport{}, errors.New("automatic mount enrollment and initial authorization must both be unexpired, with the enrollment outliving the initial authorization")
 	}
-	if o.coherence != "strict" && o.coherence != "uncached" {
-		return dataPlaneTransport{}, fmt.Errorf("--coherence must be strict or uncached, not %q", o.coherence)
+	if o.coherence != "strict" {
+		return dataPlaneTransport{}, fmt.Errorf("--coherence must be strict, not %q", o.coherence)
 	}
 	return transport, nil
 }

@@ -62,29 +62,39 @@ const (
 	minMaxInFlight = 8
 
 	// coherentOpenFlags is the only OpenOut.OpenFlags value this frontend may
-	// ever return. FOPEN_DIRECT_IO is the single load-bearing line of the whole
+	// ever return for an authority-backed regular file. FOPEN_DIRECT_IO is the
+	// single load-bearing line of the whole
 	// coherence claim: it keeps file data out of this kernel's page cache, and
 	// (without CAP_DIRECT_IO_ALLOW_MMAP) it is also what makes the kernel
 	// refuse every shared mmap. Adding FOPEN_KEEP_CACHE, or dropping
 	// FOPEN_DIRECT_IO, would silently let one machine serve reads that never
 	// reached the authority.
-	coherentOpenFlags = fuse.FOPEN_DIRECT_IO
+	// FOPEN_PFS_SHARED is the explicit per-handle authority marker consumed by
+	// the negotiated kernel transactional-write path.
+	coherentOpenFlags = fuse.FOPEN_DIRECT_IO | fuse.FOPEN_PFS_SHARED
 )
 
 // RPC is the exact authority contract required by the mount. Keeping this
 // interface narrow makes kernel mapping independently fault-testable.
 //
-// The last five methods are the strict cache contract. An uncached mount never
-// calls them, so a transport that only implements the first seven can still
-// serve CoherenceUncached, which remains a supported deployment profile.
+// The visibility and exact-detach methods are part of every protocol-5 mount.
+// A transport which cannot serve them cannot provide coherent multi-machine
+// filesystem semantics.
 type RPC interface {
 	Root() *authoritypb.Item
 	IOLimits() (uint32, uint32)
+	MaxWriteTransactionBytes() uint64
 	SessionLease() time.Duration
 	SessionDone() <-chan struct{}
 	SessionError() error
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+	CallReadRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
+	CallIdempotent(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+	CallIdempotentRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
+	CallIdempotentOwnedRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
+	CallMutationWithIdentityRetained(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	Close() error
 
 	// SessionID is this mount's authority session identity. It is the only way
@@ -95,7 +105,7 @@ type RPC interface {
 	// anywhere else is a protocol violation the authority fences.
 	InitialVisibilityCursor() *authoritypb.VisibilityCursor
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
-	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
+	NextVisibilityAfterAck(context.Context, *authoritypb.VisibilityCursor, bool) (*authoritypb.VisibilityEvent, error)
 	// ReportVisibilityBlocked arms a nonterminal cycle break for the exact kernel
 	// parents this frontend both needs to repair and already has a callback parked
 	// in. The authority maps them through the pending COMPLETE to stable parent
@@ -148,6 +158,9 @@ type Config struct {
 	// required whenever Routes is non-empty, because a route that cannot be
 	// served locally is not a route.
 	LocalBacking string
+	// Debug enables the underlying FUSE request/reply trace. It is diagnostic
+	// only and leaves the negotiated protocol and serving semantics unchanged.
+	Debug bool
 }
 
 // cleanStartupFailure is an error whose failed mount attempt has no remaining
@@ -201,11 +214,10 @@ type Mount struct {
 	uid            uint32
 	gid            uint32
 
-	// The strict cache contract. raw is the kernel-facing table that owns the
+	// The cache contract. raw is the kernel-facing table that owns the
 	// cached-name registry and the publication gate; kernelMount is the
 	// installed mount's identity, which is what makes both self-revocation and
 	// a mount-absence proof exact rather than path-shaped guesses.
-	profile      CoherenceProfile
 	nameCapacity int
 	repairBudget time.Duration
 	raw          *rawFileSystem
@@ -220,7 +232,6 @@ type Mount struct {
 	revokeOnce        sync.Once
 	notifyMu          sync.Mutex
 	notify            kernelNotifier
-	publications      mutationPublicationLedger
 
 	// grafts serves the machine-local routes, nil when the volume declares
 	// none. routesRevision is the declaration this mount attached with, and is
@@ -231,14 +242,21 @@ type Mount struct {
 }
 
 // publishAttr routes one stat answer through the cache contract. A mount with
-// no kernel-facing table yet (or an uncached one) publishes no lifetime at all.
-func (m *Mount) publishAttr(out *fuse.AttrOut, attr *authoritypb.Attr) {
+// no kernel-facing table yet publishes no lifetime at all.
+func (m *Mount) publishAttr(ctx context.Context, out *fuse.AttrOut, item *authoritypb.Item, attr *authoritypb.Attr) {
 	if m.raw == nil {
 		fillAttr(attr, &out.Attr, m.uid, m.gid)
 		out.SetTimeout(0)
 		return
 	}
-	m.raw.publishAttr(out, attr)
+	identity, ok := publicationIdentityFromItem(item)
+	if !ok {
+		m.revoke(errors.New("fusev3: attribute publication has no stable item identity"))
+		fillAttr(attr, &out.Attr, m.uid, m.gid)
+		out.SetTimeout(0)
+		return
+	}
+	m.raw.publishAttr(ctx, out, identity, attr)
 }
 
 // MountVolume mounts one authority session without a write-back cache.
@@ -246,11 +264,9 @@ func (m *Mount) publishAttr(out *fuse.AttrOut, attr *authoritypb.Attr) {
 // File data is never cached: direct I/O keeps every completed read on the wire
 // to the one active volume authority, and shared mmap stays unavailable because
 // no kernel primitive can revoke a mapped page coherently across machines.
-// Names and attributes are a different question, and the answer depends on the
-// declared profile. CoherenceUncached publishes nothing with a lifetime and
-// owes the authority nothing. CoherenceStrict caches both and pays for them by
-// executing the authority's two-phase visibility barrier, so a change made on
-// another machine is repaired here before that machine's syscall returns.
+// Names and attributes are cached only under the authority's two-phase
+// visibility barrier, so a change made on another machine is repaired here
+// before that machine's syscall returns.
 func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
@@ -258,15 +274,14 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) {
 		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
-	if cfg.Coherence != CoherenceUncached && cfg.Coherence != CoherenceStrict {
-		// With no valid profile, the frontend cannot know whether this session
-		// joined strict membership. Close it without claiming a clean detach;
-		// the authority will retain strict membership if one exists.
-		return nil, errors.Join(errors.New("fusev3: unknown coherence profile"), rpc.Close())
+	if cfg.Coherence != CoherenceStrict {
+		// Zero is the legacy uncached wire value. It must fail closed: translating
+		// it would let an old sender attach with semantics it did not request.
+		return nil, errors.Join(errors.New("fusev3: strict coherence is required"), rpc.Close())
 	}
 	fsName := "portablefs:" + cfg.MountInstanceID
 	failBeforeKernelMount := func(cause error) (*Mount, error) {
-		if err := releaseUninstalledSession(rpc, cfg.Coherence, fsName, mountpoint); err != nil {
+		if err := releaseUninstalledSession(rpc, fsName, mountpoint); err != nil {
 			return nil, errors.Join(cause, err)
 		}
 		return nil, markCleanStartupFailure(cause)
@@ -274,11 +289,11 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	if cfg.RequestTimeout <= 0 || cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.MaxInFlight < minMaxInFlight {
 		return failBeforeKernelMount(fmt.Errorf("fusev3: complete mount configuration is required with at least %d authority in-flight slots", minMaxInFlight))
 	}
-	if cfg.Coherence == CoherenceStrict && len(rpc.SessionID()) == 0 {
+	if len(rpc.SessionID()) == 0 {
 		return failBeforeKernelMount(errors.New("fusev3: strict coherence requires the authority session identity; without it this mount cannot recognise -- and would deadlock against -- its own mutations"))
 	}
 	rootItem := rpc.Root()
-	if rootItem == nil || rootItem.GetAttr() == nil || len(rootItem.GetToken()) == 0 {
+	if !validItem(rootItem) {
 		return failBeforeKernelMount(errors.New("fusev3: authority omitted root identity"))
 	}
 	maxRead, maxWrite := rpc.IOLimits()
@@ -288,6 +303,10 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	}
 	if maxRead < kernelMinMaxWrite || maxWrite < kernelMinMaxWrite {
 		return failBeforeKernelMount(fmt.Errorf("fusev3: authority I/O bounds (read %d, write %d) are below the %d-byte floor the Linux FUSE driver applies to max_write", maxRead, maxWrite, kernelMinMaxWrite))
+	}
+	requiredTransaction := kernelMaxRWCount()
+	if got := rpc.MaxWriteTransactionBytes(); got < requiredTransaction {
+		return failBeforeKernelMount(fmt.Errorf("fusev3: authority stages at most %d transaction bytes; this kernel can issue one %d-byte write and PortableFS does not split one syscall into visible mutations", got, requiredTransaction))
 	}
 	options := mountOptions(cfg, maxWrite)
 	if err := verifyMountDecisions(options); err != nil {
@@ -313,6 +332,13 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	}
 	m.server = server
 	m.setNotifier(server)
+	if !m.raw.replyLifecycleReady() {
+		// NewServer has already installed the mount and consumed INIT, but Serve
+		// must run once to release go-fuse's prepared request-loop reference.
+		m.cancel()
+		m.startKernelConnection()
+		return nil, m.abortMount(errors.New("fusev3: strict mount did not arm physical FUSE reply publication"))
+	}
 	// NewServer has installed the kernel mount, so it is now observable. Its
 	// identity is recorded before anything can use the mount: its later absence
 	// is the only thing that authorises a clean strict detach, and
@@ -338,7 +364,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		// session so callers can never observe a mounted but unserved path.
 		return nil, m.abortMount(fmt.Errorf("initialize PortableFS v3 mount: %w", err))
 	}
-	if err := verifyKernelGuarantees(server.KernelSettings(), maxWrite, cfg.Coherence); err != nil {
+	if err := verifyKernelGuarantees(server.KernelSettings(), maxWrite); err != nil {
 		return nil, m.abortMount(err)
 	}
 	return m, nil
@@ -349,16 +375,12 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 // the connection alone is deliberately insufficient for strict membership:
 // without this observation the authority must assume a failed startup may
 // still have installed a cache-bearing kernel mount.
-func releaseUninstalledSession(rpc RPC, profile CoherenceProfile, fsName, mountpoint string) error {
+func releaseUninstalledSession(rpc RPC, fsName, mountpoint string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
 	defer cancel()
 	proof, err := observePlannedKernelMountAbsent(fsName, mountpoint)
 	if err != nil {
 		return errors.Join(fmt.Errorf("fusev3: establish failed-startup mount absence: %w", err), rpc.Close())
-	}
-	if profile != CoherenceStrict {
-		_, _ = rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
-		return rpc.Close()
 	}
 	err = rpc.DetachAfterUnmount(ctx, proof)
 	if err != nil {
@@ -376,14 +398,11 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	if cfg.RepairBudget <= 0 {
 		cfg.RepairBudget = defaultRepairBudget
 	}
-	reserved := livenessReserve
-	if cfg.Coherence == CoherenceStrict {
-		// The visibility loop owns a transport slot no bulk request can take.
-		// Acknowledging is what releases the mutating machine on every other
-		// participant in the volume, so starving this lane behind saturated I/O
-		// would convert local load into a volume-wide stall.
-		reserved += visibilityReserve
-	}
+	// The visibility loop owns a transport slot no bulk request can take.
+	// Acknowledging is what releases the mutating machine on every other
+	// participant in the volume, so starving this lane behind saturated I/O
+	// would convert local load into a volume-wide stall.
+	reserved := livenessReserve + visibilityReserve
 	return &Mount{
 		rpc: rpc, ctx: ctx, cancel: cancel,
 		kernelConnectionDone: make(chan struct{}),
@@ -393,7 +412,6 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		requestTimeout:       cfg.RequestTimeout,
 		uid:                  cfg.PresentedUID,
 		gid:                  cfg.PresentedGID,
-		profile:              cfg.Coherence,
 		nameCapacity:         cfg.CachedNameCapacity,
 		repairBudget:         cfg.RepairBudget,
 		routesRevision:       cfg.Routes.Revision(),
@@ -417,9 +435,6 @@ func (m *Mount) start(lease time.Duration) {
 	go m.watchSession(m.ctx, m.rpc.SessionDone())
 	for range m.reclaimWorkers {
 		go m.reclaimLoop(m.ctx)
-	}
-	if m.profile != CoherenceStrict {
-		return
 	}
 	m.wg.Add(1)
 	go (&coherence{mount: m, session: cloneBytes(m.rpc.SessionID()), budget: m.repairBudget}).run(m.ctx)
@@ -459,6 +474,7 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 		Name:          "portablefs",
 		MaxWrite:      int(maxWrite),
 		MaxBackground: cfg.MaxBackground,
+		Debug:         cfg.Debug,
 		EnableLocks:   true,
 		// READDIRPLUS stays refused. Now that a strict mount does publish
 		// nonzero entry lifetimes the old reason no longer holds, but the
@@ -474,7 +490,13 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 		// cannot revoke kernel-cached pages when another machine mutates the
 		// same file, so the capability is disabled for the whole mount even if
 		// a future kernel or library change starts offering it by default.
-		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP,
+		// Atomic truncate is required, not an optimization. Without it Linux
+		// decomposes open(O_TRUNC) into SETATTR(size=0) followed by OPEN, creating
+		// two independently ordered authority mutations and an avoidable window in
+		// which the truncate applied but the open failed. With it the authority's
+		// OPEN mutation and its exact source gate are the single operation.
+		ExtraCapabilities:    fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 | fuse.CAP_PFS_STRICT_COHERENCE,
+		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP | fuse.CAP_PASSTHROUGH | fuse.CAP_NO_OPEN_SUPPORT | fuse.CAP_NO_OPENDIR_SUPPORT,
 		Options:              []string{"default_permissions"},
 	}
 }
@@ -486,8 +508,25 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 		options.DisabledCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP == 0 {
 		return errors.New("fusev3: shared mmap over direct I/O must be disabled for the whole mount; cross-machine page coherence cannot be provided")
 	}
+	if options.DisabledCapabilities&fuse.CAP_PASSTHROUGH == 0 ||
+		options.DisabledCapabilities&fuse.CAP_NO_OPEN_SUPPORT == 0 ||
+		options.DisabledCapabilities&fuse.CAP_NO_OPENDIR_SUPPORT == 0 {
+		return errors.New("fusev3: passthrough and no-open shortcuts must be disabled; every strict handle requires an explicit classified OPEN/OPENDIR reply")
+	}
 	if !options.EnableLocks {
 		return errors.New("fusev3: file locks must be forwarded to the authority; the local kernel lock manager cannot exclude another machine")
+	}
+	if options.ExtraCapabilities&fuse.CAP_ATOMIC_O_TRUNC == 0 {
+		return errors.New("fusev3: atomic open-truncate must be requested; splitting it into SETATTR then OPEN is not one filesystem operation")
+	}
+	if options.ExtraCapabilities&fuse.CAP_HANDLE_KILLPRIV_V2 == 0 {
+		return errors.New("fusev3: HANDLE_KILLPRIV_V2 must be requested so every transactional write has exact privilege-removal intent")
+	}
+	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 {
+		return errors.New("fusev3: transactional shared writes, classified inodes, publication receipts, and exact-size notify must be requested as one kernel contract")
+	}
+	if options.ExtraCapabilities&fuse.CAP_HAS_RESEND != 0 {
+		return errors.New("fusev3: HAS_RESEND is incompatible with strict publication identity ownership and must not be requested")
 	}
 	return nil
 }
@@ -499,33 +538,57 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 // evidence at all: on a kernel that does not support forwarded locks the mount
 // silently falls back to the local lock manager, two mounts on one host still
 // exclude each other, and only mounts on different hosts lose exclusion.
-func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32, profile CoherenceProfile) error {
+func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 	if settings == nil {
 		return errors.New("fusev3: kernel INIT settings are unavailable; the mount guarantees cannot be verified")
 	}
-	granted := settings.Flags64()
-	if granted&fuse.CAP_POSIX_LOCKS == 0 || granted&fuse.CAP_FLOCK_LOCKS == 0 {
-		return fmt.Errorf("fusev3: kernel does not forward POSIX and BSD file locks (INIT flags %#x); cross-machine lock exclusion is unavailable", granted)
+	if settings.Major != 7 || settings.Minor != 41 {
+		return fmt.Errorf("fusev3: strict coherence requires the pinned FUSE protocol 7.41 exactly; kernel offered %d.%d", settings.Major, settings.Minor)
+	}
+	offered := settings.Flags64()
+	if offered&fuse.CAP_ATOMIC_O_TRUNC == 0 {
+		return fmt.Errorf("fusev3: kernel does not support atomic open-truncate (INIT flags %#x); PortableFS will not split one O_TRUNC syscall across SETATTR and OPEN mutations", offered)
+	}
+	if offered&fuse.CAP_PFS_STRICT_COHERENCE == 0 {
+		return fmt.Errorf("fusev3: kernel does not support the PortableFS strict-coherence contract (INIT flags %#x)", offered)
+	}
+	if offered&fuse.CAP_HANDLE_KILLPRIV_V2 == 0 {
+		return fmt.Errorf("fusev3: kernel does not support HANDLE_KILLPRIV_V2 (INIT flags %#x); shared writes could preserve stale file privileges", offered)
+	}
+	// InitIn reports what the kernel offers, not what the daemon selected.
+	// Linux advertises RESEND, passthrough, and no-open support for non-strict
+	// mounts even when this daemon correctly declines them in InitOut. The mount
+	// options forbid selecting those capabilities, and the strict kernel rejects
+	// an InitOut that selects any of them.
+	if offered&fuse.CAP_POSIX_LOCKS == 0 || offered&fuse.CAP_FLOCK_LOCKS == 0 {
+		return fmt.Errorf("fusev3: kernel does not forward POSIX and BSD file locks (INIT flags %#x); cross-machine lock exclusion is unavailable", offered)
 	}
 	// A strict mount publishes names and attributes with a lifetime, and the
 	// only thing that makes that safe is being able to take them back. Both
 	// notifications are protocol 7.12; a kernel that cannot receive them cannot
 	// host this profile, and the mount must be refused rather than served with
 	// a cache nothing can revoke.
-	if profile == CoherenceStrict &&
-		(!settings.SupportsNotify(fuse.NOTIFY_INVAL_ENTRY) || !settings.SupportsNotify(fuse.NOTIFY_INVAL_INODE)) {
+	if !settings.SupportsNotify(fuse.NOTIFY_INVAL_ENTRY) || !settings.SupportsNotify(fuse.NOTIFY_INVAL_INODE) || !settings.SupportsNotify(fuse.NOTIFY_PFS_SIZE) {
 		return fmt.Errorf("fusev3: kernel FUSE protocol %d.%d cannot receive entry and inode invalidations; strict coherence has no way to revoke what it caches",
 			settings.Major, settings.Minor)
 	}
-	if uint64(maxWrite) > uint64(kernelDefaultMaxPages)*uint64(syscall.Getpagesize()) && granted&fuse.CAP_MAX_PAGES == 0 {
+	if uint64(maxWrite) > uint64(kernelDefaultMaxPages)*uint64(syscall.Getpagesize()) && offered&fuse.CAP_MAX_PAGES == 0 {
 		return fmt.Errorf("fusev3: kernel caps every request at %d pages and cannot carry the negotiated %d-byte write as one request", kernelDefaultMaxPages, maxWrite)
 	}
 	return nil
 }
 
+// kernelMaxRWCount mirrors Linux MAX_RW_COUNT: INT_MAX rounded down to the
+// local page boundary. The authority must stage this entire operation even
+// though each DATA frame remains bounded by max_write.
+func kernelMaxRWCount() uint64 {
+	page := uint64(syscall.Getpagesize())
+	return uint64(^uint32(0)>>1) & ^(page - 1)
+}
+
 func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 	defer m.wg.Done()
-	interval := keepAliveInterval(lease, m.profile, m.repairBudget)
+	interval := keepAliveInterval(lease, m.repairBudget)
 	timer := time.NewTicker(interval)
 	defer timer.Stop()
 	for {
@@ -562,12 +625,10 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 // how the frontend learns it must abort even though it never received the
 // event that would have started a phase timer. One interval to start a renewal
 // plus one interval for its deadline is at most two thirds of RepairBudget.
-func keepAliveInterval(lease time.Duration, profile CoherenceProfile, repairBudget time.Duration) time.Duration {
+func keepAliveInterval(lease time.Duration, repairBudget time.Duration) time.Duration {
 	interval := lease / 3
-	if profile == CoherenceStrict {
-		if strict := repairBudget / 3; strict < interval {
-			interval = strict
-		}
+	if strict := repairBudget / 3; strict < interval {
+		interval = strict
 	}
 	if interval <= 0 {
 		// Mount admission already requires positive bounds. This floor merely
@@ -605,16 +666,15 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 		}
 		callCtx, cancel := context.WithTimeout(ctx, m.requestTimeout)
 		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: token}}}
-		response, err := m.rpc.CallMutation(callCtx, request)
+		response, consumption, err := m.rpc.CallMutationWithIdentityRetained(
+			callCtx, request, nil, m.forceTerminalResponseRevocation,
+		)
 		cancel()
 		if ctx.Err() != nil {
-			return
-		}
-		// A reclaim runs on no raw callback, but it still occupies a replay
-		// sequence on its slot, and the publication ledger must see that
-		// sequence settle or the slot's watermark stops advancing forever.
-		if publicationErr := m.recordMutationResponse(ctx, request, response, err); publicationErr != nil {
-			m.revoke(publicationErr)
+			if consumption != nil {
+				m.revoke(errors.New("fusev3: mount ended before an authority reclaim response was consumed"))
+				consumption.Consume()
+			}
 			return
 		}
 		if err != nil || responseErrno(response) != 0 {
@@ -622,7 +682,13 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 				err = fmt.Errorf("reclaim refused: %w", responseErrno(response))
 			}
 			m.cleanupFailed("object reclaim", err)
+			if consumption != nil {
+				consumption.Consume()
+			}
 			return
+		}
+		if consumption != nil {
+			consumption.Consume()
 		}
 	}
 }
@@ -638,7 +704,7 @@ func (m *Mount) cleanupFailed(operation string, err error) {
 		// Teardown already released everything through Detach.
 		return
 	}
-	m.failAsync(fmt.Errorf("fusev3: authority refused %s of a frontend-owned resource: %w", operation, err))
+	m.revoke(fmt.Errorf("fusev3: authority refused %s of a frontend-owned resource: %w", operation, err))
 }
 
 // acquireBulk admits one kernel-driven authority call. The non-blocking attempt
@@ -849,10 +915,9 @@ type node struct {
 }
 
 type fileHandle struct {
-	node   *node
-	token  []byte
-	append bool
-	once   sync.Once
+	node  *node
+	token []byte
+	once  sync.Once
 }
 
 type dirHandle struct {
@@ -898,8 +963,138 @@ func (n *node) read(parent context.Context, request *authoritypb.Request) (*auth
 		return nil, errno
 	}
 	defer n.mount.releaseBulk()
-	response, err := n.mount.rpc.CallRead(ctx, request)
+	response, consumption, err := n.mount.rpc.CallReadRetained(ctx, request, n.mount.forceTerminalResponseRevocation)
+	if consumption != nil {
+		if retainErr := retainAuthorityResponse(parent, consumption); retainErr != nil {
+			n.mount.revoke(retainErr)
+			consumption.Consume()
+			return response, syscall.ENOTCONN
+		}
+	}
 	return response, rpcErrno(response, err)
+}
+
+func (m *Mount) forceTerminalResponseRevocation(cause error) {
+	if cause == nil {
+		cause = authorityrpc.ErrSessionEnded
+	}
+	m.revoke(fmt.Errorf("fusev3: authority terminal response was not locally published within its drain bound: %w", cause))
+}
+
+// callMutation owns the source-publication transition around one transport
+// mutation. The exact local gate is closed and drained before replay identity
+// assignment. Once assignment occurs, any outcome the transport cannot prove
+// is terminal and the gate stays closed through mount revocation.
+func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	gate := request.GetSourcePublicationGate()
+	requiresGate := requestRequiresSourcePublication(request)
+	if requiresGate != (gate != nil) {
+		return nil, errors.New("fusev3: mutation source-publication declaration does not match its operation")
+	}
+	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+	if callback == nil || m.raw == nil {
+		return nil, errors.New("fusev3: strict mutation escaped its raw callback publication lifecycle")
+	}
+	if !requiresGate {
+		response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(
+			ctx, request, nil, m.forceTerminalResponseRevocation,
+		)
+		if consumption != nil {
+			if retainErr := retainAuthorityResponse(ctx, consumption); retainErr != nil {
+				m.revoke(retainErr)
+				consumption.Consume()
+				return response, retainErr
+			}
+		}
+		return response, callErr
+	}
+	lease, err := callback.acquireSource(ctx, m.raw, gate)
+	if err != nil {
+		return nil, err
+	}
+	assignmentFailed := false
+	response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(ctx, request, func(authorityrpc.MutationIdentity) error {
+		if err := lease.markAssigned(); err != nil {
+			assignmentFailed = true
+			lease.revoke()
+			m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
+			return err
+		}
+		return nil
+	}, m.forceTerminalResponseRevocation)
+	if consumption != nil {
+		if retainErr := retainAuthorityResponse(ctx, consumption); retainErr != nil {
+			m.revoke(retainErr)
+			consumption.Consume()
+			return response, retainErr
+		}
+	}
+	assigned := lease.isAssigned()
+	if !assignmentFailed && !assigned && callErr == nil {
+		// A transport response is impossible before the assignment callback: the
+		// callback is the exact boundary immediately before the first send and is
+		// also replayed for the retained identity. Treat a client which bypasses
+		// that ownership transition as terminal even when it returned an errno;
+		// otherwise the lease could reopen around an untracked applied mutation.
+		assignmentFailed = true
+		lease.revoke()
+		lifecycleErr := errors.New("fusev3: source mutation transport returned without assigning its replay identity")
+		m.revoke(lifecycleErr)
+		callErr = lifecycleErr
+	}
+	if !assignmentFailed && assigned && (callErr != nil || response == nil || response.GetUncertain()) {
+		lease.revoke()
+		cause := callErr
+		if cause == nil {
+			cause = authorityrpc.ErrTransportUncertain
+		}
+		m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
+	}
+	definiteNoChange := response != nil && responseErrno(response) != 0
+	if !assignmentFailed && callErr == nil && response != nil && !response.GetUncertain() && definiteNoChange {
+		lease.resolveAllNoBinding()
+		if err := lease.markDefiniteNoChange(); err != nil {
+			lease.revoke()
+			m.revoke(fmt.Errorf("fusev3: source mutation could not record its definite refusal: %w", err))
+		}
+	} else if !assignmentFailed && !assigned && callErr != nil {
+		lease.resolveAllNoBinding()
+		if err := lease.markDefiniteNoChange(); err != nil {
+			lease.revoke()
+			m.revoke(fmt.Errorf("fusev3: source mutation could not record its pre-dispatch refusal: %w", err))
+		}
+	}
+	return response, callErr
+}
+
+// requestRequiresSourcePublication is the Linux-side grammar boundary for
+// filesystem-visible mutations. Keeping it next to callMutation makes a
+// missing gate an invariant failure before replay assignment or transport,
+// rather than a compatibility path which can apply without local ownership.
+func requestRequiresSourcePublication(request *authoritypb.Request) bool {
+	if request == nil {
+		return false
+	}
+	switch body := request.GetBody().(type) {
+	case *authoritypb.Request_Open:
+		return body.Open.GetFlags().GetTruncate()
+	case *authoritypb.Request_Create,
+		*authoritypb.Request_Mkdir,
+		*authoritypb.Request_Unlink,
+		*authoritypb.Request_Rename,
+		*authoritypb.Request_Link,
+		*authoritypb.Request_Symlink,
+		*authoritypb.Request_SetAttr,
+		*authoritypb.Request_SetXattr,
+		*authoritypb.Request_RemoveXattr,
+		*authoritypb.Request_Fallocate,
+		*authoritypb.Request_CopyFileRange:
+		return true
+	case *authoritypb.Request_WriteTransaction:
+		return body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT
+	default:
+		return false
+	}
 }
 
 func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*authoritypb.Response, syscall.Errno) {
@@ -909,11 +1104,7 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 		return nil, errno
 	}
 	defer n.mount.releaseBulk()
-	response, err := n.mount.rpc.CallMutation(ctx, request)
-	if publicationErr := n.mount.recordMutationResponse(parent, request, response, err); publicationErr != nil {
-		n.mount.revoke(publicationErr)
-		return response, syscall.EIO
-	}
+	response, err := n.mount.callMutation(ctx, request)
 	return response, rpcErrno(response, err)
 }
 
@@ -946,7 +1137,7 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 	if attr == nil {
 		return syscall.EIO
 	}
-	n.mount.publishAttr(out, attr)
+	n.mount.publishAttr(ctx, out, n.item, attr)
 	return 0
 }
 
@@ -955,14 +1146,22 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: openFlags}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: openFlags}}}
+	if openFlags.GetTruncate() {
+		gate, err := itemSourceGate(n.item, true)
+		if err != nil {
+			return nil, 0, syscall.EIO
+		}
+		request.SourcePublicationGate = gate
+	}
+	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, 0, errno
 	}
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
 	}
-	return &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), append: openFlags.GetAppend()}, coherentOpenFlags, 0
+	return &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle())}, coherentOpenFlags, 0
 }
 
 func (n *node) Read(ctx context.Context, handle *fileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -990,60 +1189,6 @@ func (n *node) Read(ctx context.Context, handle *fileHandle, dest []byte, off in
 		}
 	}
 	return fuse.ReadResultData(dest[:written]), 0
-}
-
-func (n *node) Write(ctx context.Context, handle *fileHandle, data []byte, off int64) (uint32, syscall.Errno) {
-	if handle == nil || off < 0 {
-		return 0, syscall.EBADF
-	}
-	if len(data) == 0 {
-		return 0, 0
-	}
-	// MaxWrite is negotiated with the kernel at mount time. Splitting one
-	// kernel write here would turn it into multiple independently ordered
-	// authority mutations and violate the operation boundary.
-	if n.maxWrite == 0 || uint64(len(data)) > uint64(n.maxWrite) {
-		return 0, syscall.EIO
-	}
-	ctx, cancel := n.opContext(ctx)
-	defer cancel()
-	if errno := n.mount.acquireBulk(ctx); errno != 0 {
-		return 0, errno
-	}
-	defer n.mount.releaseBulk()
-	requestOffset := uint64(off)
-	if handle.append {
-		requestOffset = 0
-	}
-	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: cloneBytes(handle.token), Offset: requestOffset, Data: cloneBytes(data), Append: handle.append}}}
-	response, err := n.mount.rpc.CallMutation(ctx, request)
-	if publicationErr := n.mount.recordMutationResponse(ctx, request, response, err); publicationErr != nil {
-		n.mount.revoke(publicationErr)
-		return 0, syscall.EIO
-	}
-	if err != nil {
-		return 0, rpcErrno(response, err)
-	}
-	errno := responseErrno(response)
-	if response == nil || response.GetWrite() == nil {
-		if errno != 0 {
-			return 0, errno
-		}
-		return 0, syscall.EIO
-	}
-	count := response.GetWrite().GetCount()
-	if count > uint32(len(data)) {
-		return 0, syscall.EIO
-	}
-	if count > 0 {
-		// Linux cannot return both positive progress and errno from write(2).
-		// Preserve the committed prefix; a caller may retry the remainder.
-		return count, 0
-	}
-	if errno != 0 {
-		return 0, errno
-	}
-	return 0, syscall.EIO
 }
 
 func (n *node) Fsync(ctx context.Context, handle *fileHandle, flags uint32) syscall.Errno {
@@ -1088,7 +1233,7 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
 	}
-	return &dirHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle())}, 0, 0
+	return &dirHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle())}, fuse.FOPEN_PFS_SHARED, 0
 }
 
 // peek returns the next directory entry without consuming it, fetching another
@@ -1231,7 +1376,13 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777, Flags: openFlags, Exclusive: flags&uint32(syscall.O_EXCL) != 0}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777, Flags: openFlags, Exclusive: flags&uint32(syscall.O_EXCL) != 0}}}
+	gate, err := namespaceSourceGate(n.item, name, openFlags.GetTruncate())
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
@@ -1241,7 +1392,34 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	}
 	item := cloneItem(created.GetItem())
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
-	return item, &fileHandle{node: child, token: cloneBytes(created.GetHandle()), append: openFlags.GetAppend()}, coherentOpenFlags, 0
+	return item, &fileHandle{node: child, token: cloneBytes(created.GetHandle())}, coherentOpenFlags, 0
+}
+
+func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.Item, *fileHandle, uint32, syscall.Errno) {
+	openFlags, errno := protocolOpenFlags(flags)
+	if errno != 0 || !openFlags.GetWrite() {
+		if errno == 0 {
+			errno = syscall.EINVAL
+		}
+		return nil, nil, 0, errno
+	}
+	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Tmpfile{Tmpfile: &authoritypb.TmpfileRequest{
+		Parent: cloneBytes(n.item.GetToken()), Mode: mode & 0o7777, Flags: openFlags,
+		Exclusive: flags&uint32(syscall.O_EXCL) != 0,
+	}}})
+	if errno != 0 {
+		return nil, nil, 0, errno
+	}
+	created := response.GetTmpfile()
+	if created == nil || created.GetItem() == nil || created.GetItem().GetAttr() == nil || len(created.GetHandle()) == 0 {
+		return nil, nil, 0, syscall.EIO
+	}
+	item := cloneItem(created.GetItem())
+	if item.GetAttr().GetKind() != authoritypb.Attr_REGULAR {
+		return nil, nil, 0, syscall.EIO
+	}
+	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
+	return item, &fileHandle{node: child, token: cloneBytes(created.GetHandle())}, coherentOpenFlags, 0
 }
 
 // Mknod exists so that mkfifo(3) and bind(2) on a unix domain socket inside the
@@ -1263,10 +1441,16 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 	if rdev != 0 {
 		return nil, syscall.EPERM
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
 		Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777,
 		Flags: &authoritypb.OpenFlags{Write: true}, Exclusive: true,
-	}}})
+	}}}
+	gate, gateErr := namespaceSourceGate(n.item, name, false)
+	if gateErr != nil {
+		return nil, syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1287,7 +1471,13 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 }
 
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32) (*authoritypb.Item, syscall.Errno) {
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777}}}
+	gate, err := namespaceSourceGate(n.item, name, false)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1299,28 +1489,89 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32) (*authorityp
 }
 
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
-	_, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name)}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name)}}}
+	gate, err := namespaceSourceGate(n.item, name, false)
+	if err != nil {
+		return syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	_, errno := n.mutate(ctx, request)
+	if errno == 0 {
+		identity, _ := publicationIdentityFromItem(n.item)
+		sourceLeaseFromContext(ctx).resolveNoBinding(publicationNamespace{parent: identity, name: name})
+	}
 	return errno
 }
 
 func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
-	_, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Directory: true}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Directory: true}}}
+	gate, err := namespaceSourceGate(n.item, name, false)
+	if err != nil {
+		return syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	_, errno := n.mutate(ctx, request)
+	if errno == 0 {
+		identity, _ := publicationIdentityFromItem(n.item)
+		sourceLeaseFromContext(ctx).resolveNoBinding(publicationNamespace{parent: identity, name: name})
+	}
 	return errno
 }
 
-func (n *node) Rename(ctx context.Context, name string, parent *node, newName string, flags uint32) syscall.Errno {
+func (n *node) Rename(ctx context.Context, name string, parent *node, newName string, flags uint32) (bool, syscall.Errno) {
 	if parent == nil || flags&^(renameNoReplace|renameExchange) != 0 || flags == renameNoReplace|renameExchange {
-		return syscall.EINVAL
+		return false, syscall.EINVAL
 	}
-	_, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{OldParent: cloneBytes(n.item.GetToken()), OldName: []byte(name), NewParent: cloneBytes(parent.item.GetToken()), NewName: []byte(newName), NoReplace: flags&renameNoReplace != 0, Exchange: flags&renameExchange != 0}}})
-	return errno
+	request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{OldParent: cloneBytes(n.item.GetToken()), OldName: []byte(name), NewParent: cloneBytes(parent.item.GetToken()), NewName: []byte(newName), NoReplace: flags&renameNoReplace != 0, Exchange: flags&renameExchange != 0}}}
+	gate, err := renameSourceGate(n.item, name, parent.item, newName)
+	if err != nil {
+		return false, syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	response, errno := n.mutate(ctx, request)
+	if errno != 0 {
+		return false, errno
+	}
+	reply := response.GetRename()
+	newPost, valid := publicationIdentityFromBytes(reply.GetNewPostIdentity())
+	if !valid {
+		return false, syscall.EIO
+	}
+	var oldPost *publicationIdentity
+	if raw := reply.GetOldPostIdentity(); len(raw) != 0 {
+		identity, valid := publicationIdentityFromBytes(raw)
+		if !valid || flags&renameExchange == 0 && identity != newPost {
+			return false, syscall.EIO
+		}
+		oldPost = &identity
+	} else if flags&renameExchange != 0 {
+		return false, syscall.EIO
+	}
+	lease := sourceLeaseFromContext(ctx)
+	oldParentIdentity, _ := publicationIdentityFromItem(n.item)
+	newParentIdentity, _ := publicationIdentityFromItem(parent.item)
+	if err := lease.attachRename(ctx,
+		publicationNamespace{parent: oldParentIdentity, name: name},
+		publicationNamespace{parent: newParentIdentity, name: newName},
+		newPost, oldPost,
+	); err != nil {
+		n.mount.revoke(err)
+		return false, syscall.ENOTCONN
+	}
+	return oldPost != nil, 0
 }
 
 func (n *node) Link(ctx context.Context, source *node, name string) (*authoritypb.Item, syscall.Errno) {
 	if source == nil {
 		return nil, syscall.EXDEV
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytes(source.item.GetToken()), NewParent: cloneBytes(n.item.GetToken()), NewName: []byte(name)}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytes(source.item.GetToken()), NewParent: cloneBytes(n.item.GetToken()), NewName: []byte(name)}}}
+	gate, err := namespaceSourceGate(n.item, name, false, source.item)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1332,7 +1583,13 @@ func (n *node) Link(ctx context.Context, source *node, name string) (*authorityp
 }
 
 func (n *node) Symlink(ctx context.Context, target, name string) (*authoritypb.Item, syscall.Errno) {
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Target: []byte(target)}}})
+	request := &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Target: []byte(target)}}}
+	gate, err := namespaceSourceGate(n.item, name, false)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	request.SourcePublicationGate = gate
+	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1391,14 +1648,19 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	if request.Mode == nil && request.Size == nil && request.AtimeNs == nil && request.MtimeNs == nil && !request.GetAtimeNow() && !request.GetMtimeNow() {
 		return n.Getattr(ctx, fh, out)
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: request}})
+	gate, err := itemSourceGate(n.item, request.Size != nil)
+	if err != nil {
+		return syscall.EIO
+	}
+	wire := &authoritypb.Request{SourcePublicationGate: gate, Body: &authoritypb.Request_SetAttr{SetAttr: request}}
+	response, errno := n.mutate(ctx, wire)
 	if errno != 0 {
 		return errno
 	}
 	if response.GetPostAttr() == nil {
 		return syscall.EIO
 	}
-	n.mount.publishAttr(out, response.GetPostAttr())
+	n.mount.publishAttr(ctx, out, n.item, response.GetPostAttr())
 	return 0
 }
 
@@ -1426,7 +1688,7 @@ func (n *node) Setxattr(_ context.Context, _ string, _ []byte, flags uint32) sys
 	default:
 		return syscall.EINVAL
 	}
-	// Authority protocol v3 requires user-xattr-readonly at Attach, so every
+	// Authority protocol v4 requires user-xattr-readonly at Attach, so every
 	// valid set mode has one exact result for the lifetime of this mount. Refuse
 	// it before allocating a replay sequence or visibility ticket. Linux VFS
 	// validates the public name before invoking the FUSE callback; once the
@@ -1460,7 +1722,11 @@ func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errn
 }
 
 func (n *node) Removexattr(ctx context.Context, name string) syscall.Errno {
-	_, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{Item: cloneBytes(n.item.GetToken()), Name: []byte(name)}}})
+	gate, err := itemSourceGate(n.item, false)
+	if err != nil {
+		return syscall.EIO
+	}
+	_, errno := n.mutate(ctx, &authoritypb.Request{SourcePublicationGate: gate, Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{Item: cloneBytes(n.item.GetToken()), Name: []byte(name)}}})
 	return errno
 }
 
@@ -1525,11 +1791,7 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 		return errno
 	}
 	defer n.mount.releaseBulk()
-	response, err := n.mount.rpc.CallMutation(ctx, request)
-	if publicationErr := n.mount.recordMutationResponse(ctx, request, response, err); publicationErr != nil {
-		n.mount.revoke(publicationErr)
-		return syscall.EIO
-	}
+	response, err := n.mount.callMutation(ctx, request)
 	return rpcErrno(response, err)
 }
 
@@ -1564,6 +1826,7 @@ func fillAttr(attr *authoritypb.Attr, out *fuse.Attr, uid, gid uint32) {
 	out.Size = uint64(max(attr.GetSize(), 0))
 	out.Blocks = attr.GetBlocks()
 	out.Mode = kindMode(attr.GetKind()) | attr.GetMode()
+	out.Flags = fuse.FUSE_ATTR_PFS_SHARED
 	out.Nlink = attr.GetNlink()
 	out.Uid, out.Gid = uid, gid
 	setTime(attr.GetAtimeNs(), &out.Atime, &out.Atimensec)
@@ -1604,6 +1867,9 @@ func kindMode(kind authoritypb.Attr_Kind) uint32 {
 
 func rpcErrno(response *authoritypb.Response, err error) syscall.Errno {
 	if err != nil {
+		if errors.Is(err, errSourcePublicationInterrupted) {
+			return syscall.EINTR
+		}
 		if errno := contextErrno(err); errno != 0 {
 			return errno
 		}

@@ -153,9 +153,10 @@ narrow but never broaden. See
   authority boundary there. PortableFS adds no daemon or offline write-back tail.
 - **`fsync` means fsync.** A successful `fsync`/`fdatasync` means the authority
   completed it on the authoritative open file description. `close` is not an
-  implicit `fsync`. On regular FUSE, `syncfs(2)` does not reach the authority at
-  all, so applications that need a durability boundary use file and directory
-  `fsync`.
+  implicit `fsync`. The pinned strict kernel also forwards `syncfs(2)` through
+  mandatory `FUSE_SYNCFS`, and a successful return means the authority's volume
+  sync completed. Stock regular-FUSE kernels that omit that request cannot
+  negotiate the profile.
 - **Execution is session-exact.** Duplicate delivery inside a live epoch returns
   the retained outcome from a replay slot and never re-executes. Nothing is
   silently continued across an epoch: a mutation whose reply is lost to authority
@@ -193,14 +194,13 @@ narrow but never broaden. See
 
 | Platform | Transport | Status |
 | --- | --- | --- |
-| Linux | kernel FUSE (`vcs/internal/fusev3`) | Production path. `strict` (default) and `uncached` profiles; proven by the privileged XFS + kernel-FUSE gate and the two-mount coherence matrix. |
-| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Runs under the declared compatibility policy `macos26-synchronous-vfs-repair-v2`. The final macOS 26.5 breadth, retry-free saturation, same-vnode attribute/data, daemon-death revocation/recovery, and clean-detach runs are live-proven against Linux FUSE and raw XFS. Exact overlapping operations may surface definite-preapply `ECANCELED`; authority `EINTR` never crosses the FSKit edge. |
+| Linux | pinned Linux 6.12.100 kernel FUSE (`vcs/internal/fusev3`) | Strict implementation candidate. Stock kernels and any partial capability set are refused. The checked-in patch series and userspace tests are deterministic; release qualification still requires the documented live patched-kernel XFS, KASAN/lockdep, and two-mount gates. |
+| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Shipping mounts are refused before Attach. A separately build-stamped qualification lane retains historical evidence, but public FSKit cannot express the complete source result and peer namespace/attribute invalidation contract. |
 | macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. A separate SDK-27 package and signed development host compile the documented data-only invalidator; no complete policy implementation exists. The ordinary CLI refuses macOS 27 before attach. Only an explicitly build-stamped qualification CLI can exercise the development adapter. |
 
-The macOS 26 policy is an explicitly declared, owner-accepted compatibility
-policy with a bounded contract — never an automatic fallback and never a silent
-downgrade. Its exact callback-provenance deviations, live proofs, and remaining
-breadth/fault gates are in
+The macOS 26 policy is an explicitly declared qualification contract, never a
+shipping fallback or silent downgrade. Its exact callback-provenance
+deviations, historical live proofs, and remaining platform gates are in
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
 
 ## Development and verification
@@ -220,8 +220,8 @@ pure tests remain parallel.
 Deeper gates:
 
 ```bash
-bash scripts/xfs-fuse-integration.sh    # privileged: real XFS + kernel FUSE, 44 required tests
-bash scripts/coherence-matrix-linux.sh  # 23-case two-mount black-box matrix, with falsifiability controls
+bash scripts/xfs-fuse-integration.sh    # privileged: exact patched kernel + real XFS, 44 required tests
+bash scripts/coherence-matrix-linux.sh  # exact patched kernel, two-mount black-box matrix
 bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume, recorded not gated
 ```
 

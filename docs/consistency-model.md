@@ -28,13 +28,25 @@ local folders. Mounts are not independent sources of truth and never reconcile
 with each other.
 
 One naming trap is worth stating plainly: the data-plane wire version is
-`ProtocolMajor = 3` and its ALPN identifier is `portablefs-authority-v3`
+`ProtocolMajor = 5` and its ALPN identifier is `portablefs-authority-v5`
 (`vcs/internal/authorityrpc/protocol.go`). That is the *protocol's* major
 version, not the product's. It is unrelated to the retired v2 architecture, and
 a v2 client and a v3 authority fail their handshake rather than enter a mixed
-mode. Protocol 3 classifies Lookup and every other resource acquisition as an
-exact-replay operation, so a lost successful reply cannot allocate an
-unreachable second capability on retry.
+mode. Protocol 5 requires one authenticated DATA transport and one authenticated
+CONTROL transport in the same connection set. Attach creates only a provisional
+credential; Activate publishes the root and makes the session usable only after
+both binding generations are proven. Abort names the exact provisional attach
+attempt. There is no single-transport or direct-active-attach path.
+
+Protocol 5 retains protocol 4's exact replay for Lookup and every other resource
+acquisition, so a lost successful reply cannot allocate an unreachable second
+capability on retry. A mutation carries only its client-owned replay slot and
+sequence; the authority binds that identity to the exact canonical mutation
+body with a secret keyed fingerprint scoped to the same authority epoch. The
+fingerprint is never trusted from, or returned to, a client. Protocol 5
+transports write and read bytes as the frame's single schema-checked bulk body
+rather than copying them through nested protobuf allocations. This is one exact
+wire format, not an optional fast path.
 
 ## Write acceptance and durability
 
@@ -43,7 +55,8 @@ The application syscall boundary depends on the frontend kernel contract.
 
 - **Linux direct-I/O `write(2)` returns only after authority application.**
   There is no PortableFS write-back engine or local mutation log.
-- **macOS may first accept bytes into its kernel page cache.** Application
+- **In the separately build-stamped macOS qualification policy, macOS may first
+  accept bytes into its kernel page cache.** Application
   `write(2)` can return before FSKit submits those bytes. Every FSKit write
   callback is still authority-through, and `fsync`/synchronize waits for the
   authority. An application that needs a cross-machine completion boundary on
@@ -54,13 +67,12 @@ The application syscall boundary depends on the frontend kernel contract.
   [Linux durability contract](https://man7.org/linux/man-pages/man2/fsync.2.html).
 - **`close` is not an implicit `fsync`.** It is not a remote durability or
   cross-machine completion boundary on either frontend.
-- **`syncfs(2)` is not a remote durability boundary on ordinary FUSE.** The
-  kernel currently issues `FUSE_SYNCFS` only for `fuseblk` mounts, so a
-  `syncfs` completion on a PortableFS mount says nothing about XFS on the
-  authority. Applications use file `fsync` plus `fsync` of the changed parent
-  directory or directories, exactly as on local Linux. PortableFS does not
-  pretend otherwise; see the
-  [current kernel implementation](https://github.com/torvalds/linux/blob/master/fs/fuse/inode.c#L721-L759).
+- **`syncfs(2)` is forwarded by the pinned strict kernel.** It always issues
+  mandatory `FUSE_SYNCFS` after draining local writes; a successful return
+  means the authority completed its volume sync, and an ordinary authority
+  durability errno propagates. ENOSYS, malformed replies, and transport loss
+  fence the strict connection instead of caching a local-success fallback.
+  Stock regular-FUSE kernels that do not provide this path fail INIT.
 - **A namespace operation is atomically visible when its XFS syscall
   completes.** Making it durable across power loss is the caller's ordinary
   file-and-directory `fsync` discipline.
@@ -72,55 +84,58 @@ to park and nothing to replay: it only gives up on proving the drain.
 
 ## Cross-mount visibility
 
-The application-visible boundary is the same on both Linux profiles: if a
-mutation `M` returned success before an operation `R` began on any mount of the
-same volume, `R` does not observe namespace, attributes, size, or data older
-than `M`, unless something ordered after `M` changed them again. An operation
-that overlaps `M` may observe either side, as it could between two processes on
-one machine.
+Protocol 5 has one coherent mount profile. If a mutation `M` returned success
+before an operation `R` began on any mount of the same volume, `R` does not
+observe namespace, attributes, size, or data older than `M`, unless something
+ordered after `M` changed them again. An operation that overlaps `M` may observe
+either side, as it could between two processes on one machine.
 
-Two profiles reach that boundary by opposite means, and `--coherence` selects
-between them (`vcs/internal/fusev3`):
+Every active filesystem mount participates, including read-only mounts that can
+cache what a peer writes. Names and attributes may be cached only under this
+synchronous contract: for a cache-visible mutation, the initiating frontend
+first closes and drains an exact item-and-namespace publication gate for the
+footprint its callback may publish. The authority independently
+derives and validates that declaration; then every *other* affected participant
+receives PREPARE, the XFS syscall runs, and those peers repair and acknowledge
+COMPLETE *before* the mutation's reply is returned to its caller. The source
+receives neither phase. On Linux its local gate remains closed through the
+operation-specific kernel/VFS postprocessing and the physical ACK of the
+forced `FUSE_PFS_PUBLISH`; returning from the daemon's ordinary `/dev/fuse`
+reply write is too early. A qualification frontend must provide an equally
+explicit framework publication verdict. A post-apply publication failure ends
+that mount rather than serving through unproven state.
 
-- **`uncached`** (Linux only) caches nothing, so there is nothing to
-  invalidate. Entry and attribute timeouts are zero on every reply, regular
-  files open with `FOPEN_DIRECT_IO`, and every `read(2)`, `stat(2)` and path
-  resolution reaches the authority. There is no invalidation schedule that can
-  be late, because there is no cached answer to be stale. The cost is that a
-  repeated read cannot be served without a round trip.
-- **`strict`** (the default) caches names and attributes in the kernel and pays
-  for them by executing the authority's visibility barrier synchronously: for a
-  cache-visible mutation, every strict participant receives PREPARE, the XFS
-  syscall runs, and peers repair and acknowledge COMPLETE *before* the
-  mutation's reply is returned to its caller. The initiating mount receives a
-  deferred COMPLETE and must acknowledge its own kernel publication before its
-  next mutation. Visibility polling and acknowledgements use a reserved client
-  lane so the event stream cannot consume the last ordinary request slot.
+Visibility polling and acknowledgements use the CONTROL transport so events
+cannot queue behind bulk DATA frames. On Linux, each successful repair
+atomically acknowledges its exact cursor and waits for the next phase in one
+request. This removes empty control round trips and source self-round trips
+without moving peer acknowledgment ahead of repair or XFS ahead of PREPARE.
+There is no non-participating filesystem session and no no-participant execution
+path: a visible mutation from a session that was not installed in this runtime
+is refused before XFS.
 
-Both profiles are held to the same contract and are run against the same case
-list by `scripts/coherence-matrix-linux.sh`
-(`PORTABLEFS_COHERENCE=strict|uncached`), because the entire point is that an
-application cannot tell them apart. That matrix is black box: it drives two
-real mountpoints through ordinary syscalls, compares content against the bytes
-a descriptor actually returns when read to EOF rather than against `stat.Size`,
+`--coherence strict` names this sole contract and remains the CLI default.
+`uncached` is a retired value; the CLI and authority client reject it before
+Attach rather than aliasing it to `strict` or falling back to weaker semantics.
+The black-box `scripts/coherence-matrix-linux.sh` therefore exercises one
+contract through two real mountpoints. It compares content against the bytes a
+descriptor actually returns when read to EOF rather than against `stat.Size`,
 compares the namespace against the entries `readdir` actually enumerates,
 compares an atomic replacement against the inode number the *other* mount
 resolves, and never polls or retries. It also proves a red result is reachable
 before reporting a green one. See
 [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md).
 
-When no strict participant is attached, the volume-wide visibility ticket is
-absent entirely and ordinary XFS concurrency is unchanged. The serialization
-exists only to close kernel publication gates, not to serialize the filesystem.
-
 ### macOS
 
-`portablefs mount` on macOS runs the portablefsd v3 data plane plus the FSKit
-extension under the declared compatibility cache policy
-`macos26-synchronous-vfs-repair-v2`. FSKit requires `--coherence strict`;
-`uncached` is Linux-only and the CLI says so rather than silently downgrading.
-That policy's bounded semantics, its unmet gates, and the reasons it must not
-be treated as a silent fallback are in
+Shipping macOS builds currently refuse a protocol-5 FSKit mount before
+constructing an authority transport or sending Attach. Current public FSKit has
+no exact peer namespace/attribute invalidation primitive, and the legacy macOS
+26 callback result shapes cannot publish the complete post-mutation attributes
+the source side requires. There is no runtime opt-in, `uncached` mode, or weaker
+fallback. A separately build-stamped qualification artifact may exercise the
+candidate native-revocation policy, but that artifact is not production
+support. The evidence and remaining platform gates are in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 ### Shared file-backed mmap is unsupported, not incoherent
@@ -154,9 +169,9 @@ There is no honest way to atomically commit an arbitrary XFS syscall together
 with a separate durable reply record, so the boundary is made explicit rather
 than hidden:
 
-- **Duplicate delivery inside a live epoch returns the cached outcome.** A
-  replayed identity whose request hash matches the recorded one returns the
-  stored outcome and never re-executes
+- **Duplicate delivery inside a live epoch returns the cached outcome.** The
+  authority recomputes its private fingerprint over the replayed body; an exact
+  match returns the stored outcome and never re-executes
   (`ExecuteMutation`, `vcs/internal/volumeserver`).
 - **A client state defect fences the session.** Reusing a slot identity with a
   different request, or gapping the slot sequence, proves the client lost
@@ -194,7 +209,7 @@ hanging.
 so project quotas cannot isolate user-xattr writes on a shared cell and a
 PortableFS-side counter could not commit atomically with XFS. Both the Linux
 frontend and a direct authority request return `EOPNOTSUPP`. Authority protocol
-v3 requires `user-xattr-readonly` at Attach, so Linux returns that fixed verdict
+5 requires `user-xattr-readonly` at Activate, so Linux returns that fixed verdict
 locally after validating the FUSE flags; it does not consume a mutation replay
 sequence or visibility work for an operation the authority can never accept.
 Read, list and remove of pre-existing portable `user.*` attributes remain
@@ -254,7 +269,8 @@ volume-wide, and pinned to a revision the authority compares at attach. See
 
 - Transparent exactly-once mutation across authority death.
 - Shared file-backed `mmap`.
-- `syncfs(2)` as a remote durability barrier on ordinary FUSE.
+- `syncfs(2)` on a stock ordinary-FUSE kernel; only the pinned strict kernel's
+  mandatory forwarded `FUSE_SYNCFS` is a remote volume durability barrier.
 - Multiple POSIX principals inside one volume.
 - Writable extended attributes.
 - Read caching beyond the two declared profiles. Any future caching must be a

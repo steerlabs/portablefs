@@ -29,6 +29,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 // v3TestPKI is one private trust domain: a CA, an authority server identity
@@ -154,6 +155,7 @@ type v3TestAuthority struct {
 
 	mu               sync.Mutex
 	keepAliveErrno   int32
+	statfsNameMax    uint32
 	attach           *authoritypb.AttachRequest
 	detach           *authoritypb.DetachRequest
 	lookups          int
@@ -161,15 +163,25 @@ type v3TestAuthority struct {
 	reauthorizations int
 }
 
+var v3TestNeverTerminal = make(chan struct{})
+
 func newV3TestAuthority() *v3TestAuthority {
 	return &v3TestAuthority{
-		epoch:       bytes.Repeat([]byte{0x5a}, 16),
-		session:     bytes.Repeat([]byte{0x6b}, 16),
-		leaseMillis: 30_000,
+		epoch:         bytes.Repeat([]byte{0x5a}, 16),
+		session:       bytes.Repeat([]byte{0x6b}, 16),
+		leaseMillis:   30_000,
+		statfsNameMax: 255,
 	}
 }
 
-func (h *v3TestAuthority) Epoch() []byte { return append([]byte(nil), h.epoch...) }
+func (h *v3TestAuthority) Epoch() []byte                                       { return append([]byte(nil), h.epoch...) }
+func (h *v3TestAuthority) RegisterSessionEndHook(func(volumeserver.SessionID)) {}
+func (h *v3TestAuthority) SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return volumeserver.SessionStateProvisional, true
+}
+func (h *v3TestAuthority) SessionTerminalForTransport(volumeserver.SessionID) (<-chan struct{}, bool) {
+	return v3TestNeverTerminal, true
+}
 
 func (h *v3TestAuthority) Bounds() authorityrpc.TransportBounds {
 	return authorityrpc.TransportBounds{
@@ -222,9 +234,11 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	case *authoritypb.Request_Hello:
 		bounds := h.Bounds()
 		features := []string{
-			"xfs-current-state", "session-exact-epoch", "direct-write",
+			"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1",
+			"authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1",
 			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-			"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+			"source-publication-gate-v1", "namespace-post-binding-identity", "exact-resource-acquisition",
+			"transactional-shared-write-v1", "strict-linux-mutation-suite-v1", "terminal-applied-delivery-receipt-v1",
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
@@ -233,29 +247,44 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			ProtocolMajor: authorityrpc.ProtocolMajor,
 			Features:      features,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
-			MaxInFlight: uint32(bounds.MaxInFlight),
+			MaxInFlight: uint32(bounds.MaxInFlight), MaxWriteTransactionBytes: authorityrpc.RequiredWriteTransactionBytes,
 		}}
 	case *authoritypb.Request_Attach:
 		h.mu.Lock()
 		h.attach = req.GetAttach()
 		h.mu.Unlock()
+		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
+			SessionId: append([]byte(nil), h.session...), Generation: 1,
+			ResumeSecret: make([]byte, 32), ProvisionalDeadlineUnixNanos: time.Now().Add(time.Minute).UnixNano(),
+		}}
+	case *authoritypb.Request_Activate:
 		features := []string{
 			"write-through", "no-history", "no-branches", "direct-io-no-file-mmap",
 			"user-xattr-readonly", "single-principal", "distributed-posix-locks",
 			"stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier",
 			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-			"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+			"source-publication-gate-v1", "namespace-post-binding-identity", "exact-resource-acquisition",
+			"transactional-shared-write-v1",
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
 		}
-		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
-			SessionId: append([]byte(nil), h.session...), SessionGeneration: 1,
-			ResumeSecret: make([]byte, 32), Root: h.rootItem(),
-			Features:                       features,
-			SessionLeaseMilliseconds:       h.leaseMillis,
+		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
+			Root:                     h.rootItem(),
+			Features:                 features,
+			SessionLeaseMilliseconds: h.leaseMillis,
+			VisibilityCursor: &authoritypb.VisibilityCursor{
+				Sequence: 1,
+				Phase:    authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE,
+			},
 			AuthorizationDeadlineUnixNanos: h.initialAuthorizationDeadline,
+			RoutesRevision:                 bytes.Repeat([]byte{0xab}, 32),
+			State:                          authoritypb.SessionState_SESSION_STATE_ACTIVE,
 		}}
+	case *authoritypb.Request_Resume:
+		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
+	case *authoritypb.Request_AbortAttach:
+		response.Body = &authoritypb.Response_AbortAttach{AbortAttach: &authoritypb.AbortAttachReply{State: authoritypb.SessionState_SESSION_STATE_ABORTED}}
 	case *authoritypb.Request_Reauthorize:
 		h.mu.Lock()
 		h.reauthorizations++
@@ -270,9 +299,10 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	case *authoritypb.Request_StatFs:
 		h.mu.Lock()
 		h.statfsCalls++
+		nameMax := h.statfsNameMax
 		h.mu.Unlock()
 		response.Body = &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{
-			BlockSize: 4096, Blocks: 1 << 20, BlocksAvailable: 1 << 19, NameMax: 255,
+			BlockSize: 4096, Blocks: 1 << 20, BlocksAvailable: 1 << 19, NameMax: nameMax,
 		}}
 	case *authoritypb.Request_Lookup:
 		h.mu.Lock()
@@ -335,7 +365,7 @@ func startV3TestAuthority(t *testing.T, handler *v3TestAuthority, serverTLS *tls
 }
 
 func v3TestEnsureRequest(address string, pki v3TestPKI, mountPath string) ensureAttachRequest {
-	return ensureAttachRequest{
+	req := ensureAttachRequest{
 		VolumeID:            "vol-v3",
 		AuthorityURL:        address,
 		AuthToken:           "capability",
@@ -353,6 +383,14 @@ func v3TestEnsureRequest(address string, pki v3TestPKI, mountPath string) ensure
 			RoutesRevision:     strings.Repeat("ab", 32),
 		},
 	}
+	req.observePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+		return &authoritypb.MountAbsenceProof{
+			ObservedUnixNanos: time.Now().UnixNano(),
+			Observation:       []byte("test getfsstat exact attach source present=false stage=startup"),
+			Component:         "portablefsd-test/exact-mount-inventory",
+		}, nil
+	}
+	return req
 }
 
 func ensureV3TestAttach(t *testing.T, r *registry, req ensureAttachRequest) *attach {
@@ -366,6 +404,40 @@ func ensureV3TestAttach(t *testing.T, r *registry, req ensureAttachRequest) *att
 	}
 	t.Cleanup(func() { a.fenceV3(errors.New("test cleanup")) })
 	return a
+}
+
+func TestProductionV3EnsureRefusesBeforeAuthorityTransport(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	pki := newV3TestPKI(t)
+	r := newRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	req := v3TestEnsureRequest(listener.Addr().String(), pki, "/Volumes/PortableFSV3Refused")
+	if _, created, err := r.ensure(context.Background(), req); err == nil ||
+		created || !strings.Contains(err.Error(), "not production-admitted") ||
+		!strings.Contains(err.Error(), "authority session was not opened") {
+		t.Fatalf("production EnsureAttach = created=%t err=%v", created, err)
+	}
+	if len(r.list()) != 0 {
+		t.Fatal("production refusal allocated a daemon attach")
+	}
+	if tcp, ok := listener.(*net.TCPListener); ok {
+		if err := tcp.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	connection, acceptErr := listener.Accept()
+	if connection != nil {
+		_ = connection.Close()
+		t.Fatal("production refusal opened an authority transport")
+	}
+	var networkErr net.Error
+	if !errors.As(acceptErr, &networkErr) || !networkErr.Timeout() {
+		t.Fatalf("authority transport absence probe = %v, want timeout", acceptErr)
+	}
 }
 
 func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
@@ -429,7 +501,7 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		EnrollmentExpiresAtMs: enrollmentExpires.UnixMilli(), AuthorityGeneration: 7,
 		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
 	}
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, req)
 	t.Cleanup(a.lifeCancel)
@@ -440,17 +512,19 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		t.Fatal("portablefsd automatic owner never refreshed its enrollment")
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for handler.reauthorizationCalls() == 0 {
+	var installedDeadline int64
+	for {
+		a.mu.RLock()
+		installedDeadline = a.authorizationDeadlineAtMs
+		a.mu.RUnlock()
+		if installedDeadline == renewedDeadline.UnixMilli() {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatal("portablefsd automatic owner never installed the renewed authority grant")
+			t.Fatalf("portablefsd automatic owner never installed the renewed authority grant: calls=%d deadline=%d want=%d",
+				handler.reauthorizationCalls(), installedDeadline, renewedDeadline.UnixMilli())
 		}
 		time.Sleep(5 * time.Millisecond)
-	}
-	a.mu.RLock()
-	installedDeadline := a.authorizationDeadlineAtMs
-	a.mu.RUnlock()
-	if installedDeadline != renewedDeadline.UnixMilli() {
-		t.Fatalf("automatic authorization deadline = %d, want %d", installedDeadline, renewedDeadline.UnixMilli())
 	}
 	if _, handled, err := a.rotateLiveCredential(context.Background(), "manual", renewedDeadline.UnixMilli(), 2, pki.clientCertPEM, false); !handled || err == nil || !strings.Contains(err.Error(), "automatic reauthorization owner") {
 		t.Fatalf("manual fallback against automatic owner: handled=%t err=%v", handled, err)
@@ -468,7 +542,7 @@ func TestV3ManualReauthorizationUsesAuthorityDeadline(t *testing.T) {
 	handler.initialAuthorizationDeadline = initialDeadline.UnixNano()
 	handler.renewedAuthorizationDeadline = authorityDeadline.UnixNano()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3ManualReauthorization")
 	req.AuthTokenExpiresAtMs = initialDeadline.UnixMilli()
@@ -500,7 +574,7 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	pki := newV3TestPKI(t)
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3"))
 
@@ -626,7 +700,7 @@ func TestV3AttachEnsureRefusesUnsupportedShapes(t *testing.T) {
 		"identity":           func(req *ensureAttachRequest) { req.V3.ClientKeyPEM = "not a key" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			r := newRegistry(privateTestDir(t))
+			r := newFSKitQualificationRegistry(privateTestDir(t))
 			t.Cleanup(r.stopPersister)
 			req := base
 			v3 := *base.V3
@@ -648,7 +722,7 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 
 	t.Run("foreign CA refused", func(t *testing.T) {
-		r := newRegistry(privateTestDir(t))
+		r := newFSKitQualificationRegistry(privateTestDir(t))
 		t.Cleanup(r.stopPersister)
 		foreign := newV3TestPKI(t)
 		req := v3TestEnsureRequest(address, foreign, "/Volumes/PortableFSV3WrongCA")
@@ -660,7 +734,7 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 		}
 	})
 	t.Run("wrong exact server name refused", func(t *testing.T) {
-		r := newRegistry(privateTestDir(t))
+		r := newFSKitQualificationRegistry(privateTestDir(t))
 		t.Cleanup(r.stopPersister)
 		req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3WrongName")
 		req.DataPlaneServerName = "other.example"
@@ -676,11 +750,36 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 	}
 }
 
+func TestV3DataPlanePreflightFailureReleasesActiveSessionBeforeFSKitMount(t *testing.T) {
+	pki := newV3TestPKI(t)
+	handler := newV3TestAuthority()
+	// Zero NAME_MAX is an exact, post-ACTIVE constructor failure: the authority
+	// session exists, but portablefsd has not exposed this attach to FSKit.
+	handler.statfsNameMax = 0
+	address := startV3TestAuthority(t, handler, pki.serverTLS)
+	r := newFSKitQualificationRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3PreflightFailure")
+	if _, _, err := r.ensure(context.Background(), req); err == nil || !strings.Contains(err.Error(), "NAME_MAX") {
+		t.Fatalf("v3 preflight failure = %v, want NAME_MAX refusal", err)
+	}
+	if len(r.list()) != 0 {
+		t.Fatal("failed pre-FSKit v3 attach stayed registered")
+	}
+	proof := handler.recordedDetach()
+	if proof == nil || proof.GetMountAbsence() == nil ||
+		proof.GetMountAbsence().GetObservedUnixNanos() == 0 ||
+		proof.GetMountAbsence().GetComponent() != "portablefsd-test/exact-mount-inventory" ||
+		!strings.Contains(string(proof.GetMountAbsence().GetObservation()), "stage=startup") {
+		t.Fatalf("pre-FSKit ACTIVE cleanup delivered proof %+v", proof)
+	}
+}
+
 func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 	pki := newV3TestPKI(t)
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Detach"))
 
@@ -744,7 +843,7 @@ func TestV3NormalDetachNeverForcesPastASynchronizeFailure(t *testing.T) {
 	pki := newV3TestPKI(t)
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(
 		address,
@@ -778,7 +877,7 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 	pki := newV3TestPKI(t)
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Fence"))
 
@@ -840,7 +939,7 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 	pki := newV3TestPKI(t)
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
+	r := newFSKitQualificationRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Terminal")
 	// A short repair budget makes the liveness pulse fast (min(lease,budget)/3)
@@ -883,14 +982,14 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	stateDir := privateTestDir(t)
-	first := newRegistry(stateDir)
+	first := newFSKitQualificationRegistry(stateDir)
 	a := ensureV3TestAttach(t, first, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Revive"))
 	ref := a.ref
 	first.stopPersister()
 	// The previous daemon process is gone; its strict session dies with it.
 	a.fenceV3(errors.New("previous daemon process exited"))
 
-	revived := newRegistry(stateDir)
+	revived := newFSKitQualificationRegistry(stateDir)
 	t.Cleanup(revived.stopPersister)
 	if revived.loadErr != nil {
 		t.Fatal(revived.loadErr)

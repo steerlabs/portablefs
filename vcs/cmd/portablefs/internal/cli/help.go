@@ -168,7 +168,7 @@ EXAMPLES
                     --mount-enrollment-cert enrollment.pem
                     --mount-enrollment-expires-at-ms ms
                     --authority-generation n --auth-expires-at-ms ms]
-                   [--coherence strict|uncached] [--no-local-dirs]
+                   [--coherence strict] [--no-local-dirs]
                    [--strategy auto|fskit|fuse] [--foreground] [--json]
 
 Attach the live volume at mountPath through the v3 authority stack, then
@@ -194,9 +194,9 @@ There is no PortableFS-managed or offline write-back layer. Linux direct-I/O
 write(2) returns after the authority has applied the bytes to XFS. On macOS,
 ordinary kernel page-cache writeback still applies: write(2) may return before
 FSKit sends the write, while fsync/synchronize waits through the authority's
-server descriptor. --coherence picks the kernel cache contract — strict (default:
-names and attributes are cached and repaired through the authority's
-synchronous visibility barrier) or uncached (cache nothing; Linux only).
+server descriptor. Protocol 5 has one coherence contract: names and attributes
+are cached and repaired through the authority's synchronous visibility barrier.
+--coherence may only be strict; legacy uncached mounts are rejected.
 
 Machine-local directories — node_modules, .venv, target — are served from
 machine-local disk instead of the volume. WHICH directories is declared by
@@ -230,7 +230,7 @@ EXAMPLES
     --data-plane-ca ca.pem --client-cert client.pem --client-key client.key
   portablefs mount my-workspace /mnt/w --addr 10.0.0.7:2050 \
     --data-plane-transport tls-system-pki --data-plane-server-name authority.example.com \
-    --client-cert client.pem --client-key client.key --coherence uncached --foreground
+    --client-cert client.pem --client-key client.key --coherence strict --foreground
 `,
 		"umount": `USAGE
   portablefs umount <mountPath> [--force] [--discard-record] [--json]

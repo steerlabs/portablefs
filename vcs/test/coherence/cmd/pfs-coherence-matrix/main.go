@@ -61,6 +61,13 @@ type expectation struct {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == isolatedChildArgument {
+		if err := serveIsolatedChild(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "pfs-coherence-matrix isolated child: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
 	if err := runMatrix(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "pfs-coherence-matrix: %v\n", err)
 		os.Exit(1)
@@ -115,7 +122,7 @@ func runMatrix(arguments []string) error {
 			"shell command that attaches with a stale routing revision without adopting, then adopts and retries, printing a key=value summary; without it that case skips")
 		jsonOut    = flags.String("json", "", "write the machine readable result to this file")
 		expects    = expectFlag{}
-		timeoutArg = flags.Duration("case-timeout", 5*time.Minute, "per-case wall clock bound")
+		timeoutArg = flags.Duration("case-timeout", 5*time.Minute, "per-case worker-process wall clock bound")
 		staleCheck = flags.Bool("self-check-stale", false,
 			"falsifiability control: replay the first successful pathname observation on mount A; declared stale-sensitive cases must turn red")
 		expectDisjoint = flags.Bool("expect-disjoint-namespace", false,
@@ -141,6 +148,9 @@ func runMatrix(arguments []string) error {
 	if *mountA == "" || *mountB == "" {
 		return fmt.Errorf("--a and --b are required")
 	}
+	if *timeoutArg <= 0 {
+		return fmt.Errorf("--case-timeout must be positive")
+	}
 	known := map[string]bool{}
 	for _, entry := range cases {
 		known[entry.name] = true
@@ -161,51 +171,32 @@ func runMatrix(arguments []string) error {
 		}
 	}
 
-	local, err := newLocalActor("mount-A", *mountA)
-	if err != nil {
-		return err
-	}
-	defer local.close()
-	var first actor = local
 	if *staleCheck {
-		first = newStaleActor(local)
 		fmt.Printf("SELF-CHECK: mount-A observations are being served from a frozen first answer.\n")
 		fmt.Printf("SELF-CHECK: every declared stale-sensitive case must FAIL below.\n\n")
 	}
 
-	var second actor
-	if *sshTarget != "" {
-		remote, err := newRemoteActor("mount-B", *sshTarget, *sshBinary, *mountB, []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10"})
-		if err != nil {
-			return fmt.Errorf("attach the second mount over ssh: %w", err)
-		}
-		second = remote
-	} else {
-		local, err := newLocalActor("mount-B", *mountB)
-		if err != nil {
-			return err
-		}
-		second = local
-	}
-	defer second.close()
-
 	runID := fmt.Sprintf("coherence-%d", time.Now().UnixNano())
-	if out, err := first.exec(request{Op: "mkdirall", Path: runID, Mode: 0o755}); err != nil || out.Err != "" {
-		return fmt.Errorf("create the run directory %s on mount-A: %v%s", runID, err, out.Err)
+	workerBase := isolatedSpec{
+		MountA:         *mountA,
+		MountB:         *mountB,
+		SSHTarget:      *sshTarget,
+		SSHBinary:      *sshBinary,
+		StaleCheck:     *staleCheck,
+		ExpectDisjoint: *expectDisjoint,
+		RunID:          runID,
+		AltGID:         *altGID,
+		FenceCmd:       *fenceCmd,
+		Replaces:       *replaces,
+		LocalRoute:     *localRoute,
+		RoutesContract: *routesContract,
 	}
-	// The two roots must actually be the same volume. Running the matrix
-	// against two unrelated directories would produce a wall of failures that
-	// look like product defects, so the shared namespace is proven up front —
-	// and a misconfigured run stops here instead of continuing under a note
-	// nobody reads. The disjoint-namespace control run inverts the probe
-	// explicitly: there the second root must NOT share the namespace, and a
-	// control that accidentally pointed at the volume would validate nothing.
-	if out, err := second.exec(request{Op: "stat", Path: runID}); err != nil {
-		return fmt.Errorf("probe the run directory from the second mount: %w", err)
-	} else if out.Err != "" && !*expectDisjoint {
-		return fmt.Errorf("the second mount cannot see %s created by the first (%s); the two roots do not share a namespace, so this run would measure nothing — fix the mounts or pass -expect-disjoint-namespace for the control phase", runID, out.Err)
-	} else if out.Err == "" && *expectDisjoint {
-		return fmt.Errorf("-expect-disjoint-namespace was passed but the second root can see %s created by the first; a disjoint control pointed at the real volume proves nothing", runID)
+	// Even setup runs in an owned process. os.Stat on an unhealthy FUSE mount
+	// can block just as permanently as a syscall in a case, so doing this probe
+	// in the driver would recreate the exact teardown leak the per-case process
+	// boundary is intended to eliminate.
+	if err := executeIsolatedProbe(workerBase, *timeoutArg); err != nil {
+		return err
 	}
 
 	header := *label
@@ -232,13 +223,16 @@ func runMatrix(arguments []string) error {
 		if len(selected) != 0 && !selected[entry.name] {
 			continue
 		}
-		result := executeCase(entry, first, second, runID, caseInputs{
+		result, err := executeIsolatedCase(entry, workerBase, caseInputs{
 			altGID:         *altGID,
 			fenceCmd:       *fenceCmd,
 			replaces:       *replaces,
 			localRoute:     *localRoute,
 			routesContract: *routesContract,
 		}, *timeoutArg)
+		if err != nil {
+			return fmt.Errorf("case %s lost its process boundary: %w", entry.name, err)
+		}
 		want := expectation{status: statusPass}
 		if declared, ok := expects[entry.name]; ok {
 			want = declared
@@ -266,73 +260,6 @@ type caseInputs struct {
 	replaces       int
 	localRoute     string
 	routesContract string
-}
-
-func executeCase(entry coherenceCase, a, b actor, runID string, inputs caseInputs, timeout time.Duration) (result outcome) {
-	run := &caseRun{
-		a: a, b: b, dir: runID + "/" + entry.name,
-		altGID: inputs.altGID, fenceCmd: inputs.fenceCmd, replaces: inputs.replaces,
-		localRoute: inputs.localRoute, routesContract: inputs.routesContract,
-	}
-	result = outcome{Name: entry.name, What: entry.what}
-	started := time.Now()
-	defer func() {
-		notes, failures, skip := run.snapshot()
-		result.DurationMs = time.Since(started).Milliseconds()
-		result.Notes, result.Failures = notes, failures
-		if recovered := recover(); recovered != nil {
-			aborted, ok := recovered.(abortCase)
-			if !ok {
-				panic(recovered)
-			}
-			if skip != "" {
-				result.Status = statusSkip
-				result.Reason = skip
-				return
-			}
-			result.Status = statusFail
-			result.Failures = append(result.Failures, "aborted: "+aborted.reason)
-			return
-		}
-		if skip != "" {
-			result.Status = statusSkip
-			result.Reason = skip
-			return
-		}
-		if len(failures) != 0 {
-			result.Status = statusFail
-			return
-		}
-		result.Status = statusPass
-	}()
-
-	if out, err := a.exec(request{Op: "mkdirall", Path: run.dir, Mode: 0o755}); err != nil {
-		run.abort("create the case directory: %v", err)
-	} else if out.Err != "" {
-		run.abort("create the case directory: %s", out.Err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				if aborted, ok := recovered.(abortCase); ok {
-					if _, _, skip := run.snapshot(); skip == "" {
-						run.fail("aborted: %s", aborted.reason)
-					}
-					return
-				}
-				panic(recovered)
-			}
-		}()
-		entry.run(run)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		run.fail("case did not complete within %s; a hung operation is a failure, not a pass", timeout)
-	}
-	return result
 }
 
 func printCase(result outcome) {

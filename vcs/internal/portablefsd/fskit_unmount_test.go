@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -118,6 +119,50 @@ func TestPreparedFSKitIdentityMismatchPreservesAttach(t *testing.T) {
 	entries, loadErr := loadPersistedAttaches(stateDir)
 	if loadErr != nil || len(entries) != 1 || !entries[0].DetachPrepared {
 		t.Fatalf("prepared evidence=%+v err=%v", entries, loadErr)
+	}
+}
+
+// A completed failure is not durable transaction state. The next request must
+// re-observe the kernel instead of joining a completed transaction in the
+// close(done)-before-delete window. Repeat this aggressively because the old
+// ordering surfaced chiefly under the race detector.
+func TestFailedUnmountRetryNeverJoinsStaleCompletedOutcome(t *testing.T) {
+	for range 200 {
+		stateDir := privateTestDir(t)
+		writeFSKitDetachFixture(t, stateDir, true, false)
+		r := newRegistry(stateDir)
+		var observations atomic.Int32
+		first := errors.New("first mount observation failed")
+		found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
+			present: func(string, string) (bool, error) {
+				observations.Add(1)
+				return false, first
+			},
+			unmountExact: func(string, string, bool) error {
+				t.Fatal("failed observation reached unmount")
+				return nil
+			},
+		})
+		if !found || !errors.Is(err, first) {
+			t.Fatalf("first unmount=(%v,%v)", found, err)
+		}
+		found, _, err = r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
+			present: func(string, string) (bool, error) {
+				observations.Add(1)
+				return false, nil
+			},
+			unmountExact: func(string, string, bool) error {
+				t.Fatal("absent mount reached unmount")
+				return nil
+			},
+		})
+		if err != nil || !found {
+			t.Fatalf("retry joined stale outcome: found=%v err=%v", found, err)
+		}
+		if got := observations.Load(); got != 2 {
+			t.Fatalf("kernel observations=%d, want one per transaction", got)
+		}
+		r.stopPersister()
 	}
 }
 

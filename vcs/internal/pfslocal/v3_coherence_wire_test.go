@@ -2,13 +2,14 @@ package pfslocal
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 )
 
-func TestProtocolMinorIncludesNamespacePostIdentity(t *testing.T) {
-	if ProtocolMinor != 14 {
-		t.Fatalf("ProtocolMinor = %d, want 14", ProtocolMinor)
+func TestProtocolMinorRequiresAuthorityProtocolV5(t *testing.T) {
+	if ProtocolMinor != 15 {
+		t.Fatalf("ProtocolMinor = %d, want 15", ProtocolMinor)
 	}
 	if VisibilityPhasePrepare != 1 || VisibilityPhaseComplete != 2 {
 		t.Fatalf("visibility phase values changed: prepare=%d complete=%d", VisibilityPhasePrepare, VisibilityPhaseComplete)
@@ -17,6 +18,45 @@ func TestProtocolMinorIncludesNamespacePostIdentity(t *testing.T) {
 		t.Fatalf("visibility scope values changed: namespace=%d data=%d attributes=%d",
 			VisibilityScopeNamespace, VisibilityScopeData, VisibilityScopeAttributes)
 	}
+}
+
+func TestPublicationAckSemanticCommitRoundTripAndValidation(t *testing.T) {
+	for _, verdict := range []PublicationSemanticCommit{
+		PublicationSemanticCommitPublished,
+		PublicationSemanticCommitNotPublished,
+	} {
+		want := &PublicationAck{OperationID: 41, SemanticCommit: verdict}
+		if got := roundTripBody(t, want); !reflect.DeepEqual(got, want) {
+			t.Fatalf("publication ack round trip: got %#v, want %#v", got, want)
+		}
+		assertWireFields(t, marshalPublicationAck(want), 2, 3)
+	}
+
+	for _, verdict := range []PublicationSemanticCommit{
+		PublicationSemanticCommitUnspecified,
+		PublicationSemanticCommit(3),
+	} {
+		wire, err := MarshalEnvelope(&Envelope{Body: &PublicationAck{
+			OperationID: 41, SemanticCommit: verdict,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := UnmarshalEnvelope(wire); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("semantic commit %d decoded with err %v, want ErrMalformed", verdict, err)
+		}
+	}
+}
+
+func TestRenameReplyPostIdentitiesRoundTrip(t *testing.T) {
+	want := &RenameReply{
+		NewPostIdentity: bytes.Repeat([]byte{0xa1}, 16),
+		OldPostIdentity: bytes.Repeat([]byte{0xb2}, 16),
+	}
+	if got := roundTripBody(t, want); !reflect.DeepEqual(got, want) {
+		t.Fatalf("rename post identities round trip: got %#v, want %#v", got, want)
+	}
+	assertWireFields(t, marshalRenameReply(want), 1, 2)
 }
 
 func TestResourceReplyDispositionRoundTrip(t *testing.T) {
@@ -58,7 +98,7 @@ func TestV3CoherenceResolveReplyRoundTrip(t *testing.T) {
 			MaxNameBytes: 255, PreferredIOSize: 1 << 20,
 		},
 		V3Coherence: &V3CoherenceContract{
-			AuthorityProtocolMajor: 3,
+			AuthorityProtocolMajor: 5,
 			AuthorityEpoch:         bytes.Repeat([]byte{0xa1}, 16),
 			SessionID:              bytes.Repeat([]byte{0xb2}, 16),
 			CachePolicy:            "macos26-synchronous-vfs-repair-v1",
@@ -156,7 +196,6 @@ func TestV3VisibilityEventRoundTrip(t *testing.T) {
 			},
 		},
 		MutationSequence: 89,
-		LocalOperationID: 144,
 	}}
 
 	decoded := roundTripBody(t, want)
@@ -167,7 +206,7 @@ func TestV3VisibilityEventRoundTrip(t *testing.T) {
 	encoded := marshalEvent(want)
 	assertWireField(t, encoded, 3, wireBytes)
 	visibility := want.Kind.(*V3VisibilityEvent)
-	assertWireFields(t, marshalV3VisibilityEvent(visibility), 1, 2, 3, 4, 5, 6, 8)
+	assertWireFields(t, marshalV3VisibilityEvent(visibility), 1, 2, 3, 4, 5, 6)
 	assertWireFields(t, marshalVisibilityCursor(&visibility.Cursor), 1, 2)
 	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[0]), 1, 3, 4, 6)
 	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[1]), 1, 2, 5)

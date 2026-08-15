@@ -8,11 +8,12 @@ work.
 The model in one paragraph: a volume is a workspace that lives in the network,
 not a folder on one machine. One XFS authority owns its durable state, so every
 mount — laptop, server, sandbox — is a window onto the same ordered filesystem.
-Linux writes are direct; macOS applications use `fsync` when they need an
-explicit cross-machine completion boundary. There is
-no history graph, no branch, no snapshot and no fork: there is the current state
-of the workspace, and every machine that mounts it sees exactly that. Machines
-are disposable; the workspace is not.
+Linux production writes are direct. Shipping macOS builds currently refuse a
+production mount before Attach; separately build-stamped qualification builds
+use `fsync` when they need an explicit cross-machine completion boundary. There
+is no history graph, no branch, no snapshot and no fork: there is the current
+state of the workspace, and every machine that mounts it sees exactly that.
+Machines are disposable; the workspace is not.
 
 ## Continuity: The Workspace Outlives The Session
 
@@ -40,30 +41,33 @@ The handoff is safe with no barrier discipline at all, and that is the whole
 point:
 
 - **There is no PortableFS durability debt.** A v3 mount holds no daemon WAL or
-  offline tail. Linux direct writes return after XFS application. macOS retains
-  ordinary kernel page-cache semantics, so an agent that needs a handoff or
-  durability boundary calls `fsync`, which waits for the authoritative server
-  descriptor. `close` alone is not that boundary.
+  offline tail. Linux direct writes return after XFS application. In the macOS
+  qualification policy, ordinary kernel page-cache semantics remain, so an
+  agent that needs a handoff or durability boundary calls `fsync`, which waits
+  for the authoritative server descriptor. `close` alone is not that boundary.
 - **There is no stale handover, because there is no second truth.** Both mounts
-  are windows onto the same live authority. Names and attributes may be cached
-  under the `strict` profile, but only joined to the authority's synchronous
-  visibility barrier: a mutation that returned on one mount is not observable as
-  older state on another. `--coherence uncached` (Linux) caches nothing and is
-  the same contract with the cache removed.
+  are windows onto the same live authority. Names and attributes are cached only
+  while every mount participates in the authority's synchronous visibility
+  barrier: a mutation that returned on one mount is not observable as older
+  state on another. A writer installs its exact source-publication gate before
+  dispatch, and peers repair before that writer's result is released. Protocol
+  5 has no non-participating mount mode.
 
 For scheduled or resumable agents, make the mount the first step of the job and
 the unmount the last; the workspace carries all state between runs, including
 `.git`, caches, and SQLite files. Both are exercised across two mounts by the
-privileged Linux gate (`TestWorkloadGitAcrossMounts`,
-`TestWorkloadSQLiteAcrossMounts` — see [local-dev.md](./local-dev.md)).
+required privileged Linux gate (`TestWorkloadGitAcrossMounts`,
+`TestWorkloadSQLiteAcrossMounts` — see [local-dev.md](./local-dev.md)). That gate
+counts for the strict profile only when its host is booted into the checked-in
+patched Linux 6.12.100 kernel; a stock-kernel refusal is expected.
 
 An initial mount capability is single-use. A hosted mount that explicitly opts
 into automatic reauthorization also receives a bounded, volume- and key-scoped
-enrollment. The Linux mount supervisor or the
-existing macOS daemon then obtains and installs short-lived grants automatically
-without remounting; there is one sequencer per mount and the filesystem session,
-locks, handles, and strict-cache membership stay intact. A definitive denial or
-missed safety cutoff fails closed and detaches. Standalone mounts omit the
+enrollment. The Linux mount supervisor or the macOS qualification daemon then
+obtains and installs short-lived grants automatically without remounting; there
+is one sequencer per mount and the filesystem session, locks, handles, and
+strict-cache membership stay intact. A definitive denial or missed safety
+cutoff fails closed and detaches. Standalone mounts omit the
 enrollment and can use the explicit `portablefs reauthorize` command; they never
 silently switch modes.
 
@@ -82,9 +86,10 @@ for every mount:
 - **Linux POSIX locks.** On Linux, `fcntl` byte-range locks and `flock` are held
   by the authority, not by one kernel, so they coordinate across mounts. A
   blocked waiter is released when the holder's session ends rather than hanging
-  forever. FSKit exposes no advisory-lock callbacks: a macOS agent must use
-  `O_EXCL` create, atomic rename, or disjoint files for cross-machine
-  coordination, and must not treat a locally successful lock as distributed.
+  forever. In macOS qualification builds, FSKit exposes no advisory-lock
+  callbacks: an agent must use `O_EXCL` create, atomic rename, or disjoint files
+  for cross-machine coordination, and must not treat a locally successful lock
+  as distributed.
 
 Concurrent whole-record overwrites of one file leave one writer's record, never
 a mixture; concurrent Linux `O_APPEND` writers lose no record and tear no record,
@@ -106,6 +111,15 @@ server-side `exec` and no server-side `grep`: the storage plane never runs tenan
 commands, and content search is `rg` inside a mount like anywhere else. An
 environment that cannot mount needs a different isolated runner that can, not a
 weaker remote-command surface.
+
+Protocol 5 accepts one coherence profile. `strict` is the default and every
+mount participates; `--coherence uncached` is rejected before Attach rather
+than mapped to another mode. Shipping macOS builds currently fail even earlier,
+before constructing an authority transport, because public FSKit cannot yet
+prove exact peer namespace/attribute invalidation or publish every required
+post-mutation attribute. Only the separately build-stamped qualification
+artifact exercises the candidate native repair policy; production agent mounts
+currently use Linux FUSE.
 
 A standalone sandbox mounts with direct credentials and nothing else:
 

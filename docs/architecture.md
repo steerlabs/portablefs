@@ -34,11 +34,11 @@ product stored elsewhere.
    The one durable exception is strict-mount membership, which records only
    which cached kernel mounts a previous epoch admitted.
 
-4. **Data-plane acknowledgement means applied.** Linux direct-I/O `write(2)` and
-   every FSKit write callback complete after XFS application. macOS may return an
-   application `write(2)` from its ordinary kernel page cache before that
-   callback; `fsync`/synchronize is its authority boundary. PortableFS owns no
-   separate tail to replay or park.
+4. **Data-plane acknowledgement means applied.** Linux direct-I/O `write(2)`
+   completes after XFS application. The retained FSKit qualification adapter
+   also forwards callbacks synchronously, but current FSKit cannot satisfy the
+   complete cache-coherence contract and is not a production data plane.
+   PortableFS owns no separate tail to replay or park.
 
 5. **Coherence is synchronous or absent.** A cached frontend either holds state
    the authority repaired synchronously before the mutation returned, or it holds
@@ -46,28 +46,26 @@ product stored elsewhere.
    reader can outrun.
 
 6. **Shared writing uses declared filesystem semantics.** Atomic rename,
-   authority-serialized exclusive create, and distinct files work across the
-   supported frontends. Linux additionally forwards POSIX record locks,
-   `flock`, and append intent to the authority. FSKit exposes none of those
-   callbacks, so macOS must not claim them. PortableFS does not merge file
-   contents or invent a conflict-resolution model to hide a platform gap.
+   authority-serialized exclusive create, distinct files, POSIX record locks,
+   `flock`, and append intent work through the supported Linux frontend. FSKit
+   exposes neither the lock/append callbacks nor all cache primitives required
+   by this contract, so production macOS mounts are refused rather than claiming
+   a partial shared-writing model. PortableFS does not merge file contents or
+   invent conflict resolution to hide a platform gap.
 
 7. **One transport per supported platform, with no fallback.** Linux mounts
-   through kernel FUSE; macOS mounts through the FSKit extension and the
-   `portablefsd` v3 data plane. Windows remains primitive-gated rather than
-   selecting a frontend that cannot forward locks or control caching exactly.
-   A host that cannot serve its platform's transport fails with guidance rather
-   than degrading to a weaker consistency model.
+   through kernel FUSE. macOS and Windows remain primitive-gated rather than
+   selecting frontends that cannot control caching exactly. On macOS, the CLI,
+   shipping FSKit extension, and portablefsd each refuse protocol 5 before
+   authority Attach or transport. A host without a supported transport fails
+   with guidance rather than degrading to a weaker consistency model.
 
 8. **Unsupported is explicit.** Shared file-backed `mmap`, `setxattr`, device
    nodes, FIFOs, sockets, and cross-volume rename are refused with a real errno.
-   They are never emulated with divergent semantics.
-   In particular, production macOS resolve advertises read/list/removal but
-   declares xattr set unsupported. FSKit validates and refuses set locally,
-   before emitting a daemon mutation, then translates its internal Darwin
-   `ENOTSUP` refusal to Darwin `EOPNOTSUPP` (102), because XNU otherwise creates
-   an AppleDouble `._*` sidecar. Linux and the authority expose `EOPNOTSUPP`
-   directly; neither client invents a second xattr store.
+   They are never emulated with divergent semantics. Linux and the authority
+   expose unsupported xattr mutation as `EOPNOTSUPP`; no client invents a
+   second xattr store. Current macOS is refused at the platform gate before any
+   per-operation capability is advertised.
 
 9. **Lifecycle control stays out of filesystem I/O.** The optional hosted
    manager may store placement, quota entitlement, PKI, authorization receipts,
@@ -96,8 +94,8 @@ product stored elsewhere.
 | Running a volume | [xfs-authority-deployment.md](./xfs-authority-deployment.md) |
 | Hosted placement, credentials, reauthorization, and fencing | [hosted-control-plane.md](./hosted-control-plane.md) |
 | Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
-| macOS 26's declared cache policy and its open gates | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
-| How a macOS mount is established | [fskit-mount.md](./fskit-mount.md) |
+| Why current macOS fails before Attach and what a future FSKit must prove | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
+| The retained non-shipping FSKit qualification mount path | [fskit-mount.md](./fskit-mount.md) |
 | Why Windows currently fails closed and what a native frontend must prove | [windows-mount.md](./windows-mount.md) |
 | Machine-local routing and its confinement boundary | [graft-security.md](./graft-security.md) |
 | What is actually verified, and how | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |
@@ -108,5 +106,7 @@ product stored elsewhere.
 A change to this system is not complete until `bash scripts/verify-local.sh`
 passes. A change to the authority, the frontends, or the coherence protocol is
 not complete until `bash scripts/xfs-fuse-integration.sh` passes on real XFS with
-a real kernel FUSE mount, and `bash scripts/coherence-matrix-linux.sh` passes in
-both `strict` and `uncached` profiles with its falsifiability controls intact.
+a real FUSE mount booted from the exact patched Linux 6.12.100 series, and
+`bash scripts/coherence-matrix-linux.sh` passes on that same kernel in the
+strict protocol with its falsifiability controls intact. A stock-kernel run is
+a refusal test, not substitute evidence.

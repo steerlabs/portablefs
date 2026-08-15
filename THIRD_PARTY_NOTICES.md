@@ -3,9 +3,10 @@
 PortableFS is distributed under the Apache License 2.0 (see `LICENSE`). Its
 compiled artifacts — the `vcs`, `portablefs` and `portablefsd` Go binaries and
 the Swift `PortableFSKit` package — statically or at runtime include third-party
-open-source components listed below. Each remains under its own license; the
-full license text ships with each dependency's source (in the Go module cache)
-and in each project's upstream repository.
+open-source components listed below. Each remains under its own license. The
+go-fuse license ships with the source-pinned fork at
+`vcs/third_party/go-fuse/LICENSE`; other dependency license texts are available
+from their resolved source and upstream repositories.
 
 No component below is under a copyleft license that would extend to
 PortableFS's own source (no GPL/AGPL). `golang-lru` is MPL-2.0 (file-level weak
@@ -16,7 +17,8 @@ copyleft, used unmodified as a library).
 | Module | Version | License |
 | --- | --- | --- |
 | github.com/go-git/go-billy/v5 | v5.9.0 | Apache-2.0 |
-| github.com/hanwen/go-fuse/v2 | v2.10.1 | BSD-3-Clause (New BSD) |
+| github.com/hanwen/go-fuse/v2 | v2.10.1, source-pinned fork | BSD-3-Clause (New BSD) |
+| github.com/minio/highwayhash | v1.0.4 | BSD-3-Clause |
 | github.com/jackc/pgx/v5 | v5.9.2 | MIT |
 | github.com/willscott/go-nfs | v0.0.4 | Apache-2.0 |
 | github.com/willscott/go-nfs-client | (pinned pseudo-version) | BSD-2-Clause (derived from VMware go-nfs-client; see its `NOTICE.txt`) |
@@ -33,6 +35,11 @@ copyleft, used unmodified as a library).
 `github.com/willscott/go-nfs-client` carries a `NOTICE.txt` from its VMware
 origin; that notice is reproduced by the module source and applies to the NFS
 compatibility client.
+
+The maintained go-fuse fork is pinned to upstream v2.10.1 and carries only the
+PortableFS reply-publication lifecycle patch. Its upstream identity, source
+hash, and local modification surface are documented in
+`vcs/third_party/go-fuse/PORTABLEFS_FORK.md`.
 
 ## Swift package (`swift/PortableFSKit`)
 

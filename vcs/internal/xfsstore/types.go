@@ -7,6 +7,7 @@ package xfsstore
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"syscall"
 
@@ -52,6 +53,19 @@ var (
 // the errno. Giving it one would also make every uncertain outcome look like
 // the storage EIO that fences the volume.
 var ErrOutcomeUncertain = errors.New("xfsstore: operation changed XFS before a later local step failed")
+
+// ErrWritePostApply identifies a write whose data placement and exact post
+// attributes are known, but whose required post-apply step failed. The caller
+// must publish the committed size before returning the embedded errno: hiding
+// the successful prefix would let a kernel retain pre-write inode state and
+// would make a retry duplicate already-applied bytes.
+var ErrWritePostApply = errors.New("xfsstore: write committed before a required post-apply step failed")
+
+// ErrWritePrivilege marks failure to remove a privilege-bearing mode bit or
+// security.capability after a write. Unlike an ordinary durability error this
+// is a security boundary: the authority must fence the storage epoch even when
+// the underlying errno is not one of Linux's filesystem-fatal errnos.
+var ErrWritePrivilege = errors.New("xfsstore: write could not remove inode privileges")
 
 // outcomeUncertain marks a failure that happened after XFS was already
 // modified. It refuses a nil cause so the marker can never travel alone and
@@ -113,6 +127,105 @@ type Attr struct {
 	BirthTimeNS int64
 }
 
+// ObjectCoordinate is the immutable identity needed to address one inode in
+// the visibility protocol. Stable is the XFS export-handle incarnation; Ino
+// and Device are the kernel-cache coordinate projected to frontends. None of
+// these change for a live open file description, so the store retains them at
+// object installation instead of rediscovering them with fstat before every
+// write.
+type ObjectCoordinate struct {
+	Stable      [16]byte
+	Ino         uint64
+	DeviceMajor uint32
+	DeviceMinor uint32
+}
+
+// WriteMode is the one per-syscall placement decision captured by the private
+// kernel transaction. It is never inherited from the authority descriptor:
+// fcntl(F_SETFL), RWF_APPEND, and RWF_NOAPPEND may change that decision for
+// every call on the same open file description.
+type WriteMode uint8
+
+const (
+	WritePositioned WriteMode = iota + 1
+	WriteAppend
+)
+
+// WriteCommit is the immutable placement and durability contract captured at
+// BEGIN. Sync is stronger than DataSync; callers set at most one, but the store
+// treats Sync as authoritative if both are true and never inherits either bit
+// from the retained descriptor.
+type WriteCommit struct {
+	RequestedSize uint64
+	Position      uint64
+	// RLimitSize is the raw Linux rlim_cur: math.MaxUint64 means
+	// RLIM_INFINITY and zero is a finite zero-byte ceiling.
+	RLimitSize  uint64
+	FileMaxSize uint64
+	Mode        WriteMode
+	DataSync    bool
+	Sync        bool
+	// KillPrivileges implements FUSE_WRITE_KILL_SUIDGID/HANDLE_KILLPRIV_V2
+	// inside the same stable-inode writer critical section as the data. It is a
+	// per-call kernel decision, never retained on the open description.
+	KillPrivileges bool
+}
+
+// FallocateSpec is the complete authority-side contract for one private
+// SHARED fallocate request. Mode is the closed Linux fallocate bitset validated
+// by the caller and again by the store. Limits are supplied independently so
+// RLIMIT_FSIZE remains distinguishable from the filesystem size ceiling. Once
+// the XFS syscall starts, any error may follow a partial internal transaction
+// and must therefore be returned with exact post state as post-apply.
+type FallocateSpec struct {
+	Offset         uint64
+	Length         uint64
+	RLimitSize     uint64
+	FileMaxSize    uint64
+	Mode           uint32
+	KillPrivileges bool
+}
+
+// CopyFileRangeSpec freezes both ranges and the destination growth limits for
+// one whole SHARED-to-SHARED server-side copy. The store holds a canonical
+// source-read/destination-write stable-identity lock set through the syscall
+// and exact post-state capture.
+type CopyFileRangeSpec struct {
+	InputOffset    uint64
+	OutputOffset   uint64
+	Length         uint64
+	RLimitSize     uint64
+	FileMaxSize    uint64
+	KillPrivileges bool
+}
+
+// WriteLimitError distinguishes the two Linux EFBIG boundaries. Crossing
+// RLIMIT_FSIZE requires SIGXFSZ; crossing s_maxbytes/MAX_NON_LFS does not. Only
+// the authority knows the true EOF for append, so the distinction survives the
+// storage layer as typed evidence instead of being inferred from errno text.
+type WriteLimitError struct{ RLimit bool }
+
+func (e *WriteLimitError) Error() string {
+	if e != nil && e.RLimit {
+		return "xfsstore: write reached RLIMIT_FSIZE"
+	}
+	return "xfsstore: write reached filesystem size limit"
+}
+
+func (*WriteLimitError) Unwrap() error { return syscall.EFBIG }
+
+// WriteTarget is one pinned writable open description and its immutable XFS
+// identity. Pinning separates handle-table lifetime from one staged write:
+// CLOSE may retire the client handle while a previously accepted transaction
+// still owns the descriptor. CommitWrite is the only shared-file write
+// primitive; the private kernel protocol maps one whole write syscall to one
+// call even when its payload spans many transport frames.
+type WriteTarget interface {
+	Coordinate() ObjectCoordinate
+	CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (committedSize, assignedOffset uint64, post Attr, err error)
+	Close() error
+}
+
 type Dirent struct {
 	Name string
 	Kind Kind
@@ -139,6 +252,9 @@ const (
 
 // OpenFlags is the intentionally small set of file-open behavior exposed on
 // the remote protocol. Arbitrary Linux flags are never accepted from a peer.
+// Sync and DataSync are immutable logical handle state: the authority keeps
+// its data fd non-sticky so a fragmented transaction does not flush once per
+// fragment, then performs the one operation-level sync Linux requires.
 type OpenFlags struct {
 	Read     bool
 	Write    bool

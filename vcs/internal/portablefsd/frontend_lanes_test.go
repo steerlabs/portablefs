@@ -5,10 +5,13 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -98,6 +101,14 @@ func publicationTestAttach(t *testing.T) (*attach, *v3DataPlane) {
 	return a, d
 }
 
+type countingV3ResponseConsumption struct{ count *atomic.Int32 }
+
+func (c *countingV3ResponseConsumption) Consume() {
+	if c != nil && c.count != nil {
+		c.count.Add(1)
+	}
+}
+
 // A request-local frontend timeout can acknowledge the callback while its
 // daemon handler is still running. If that handler later produces a publishing
 // reply, no callback remains to install it and no second PublicationAck can
@@ -112,7 +123,7 @@ func TestPublishingReplyAfterCallbackAcknowledgementFencesBeforeExposure(t *test
 	if !c.acknowledgePublication(operationID) {
 		t.Fatal("early callback acknowledgement was refused")
 	}
-	if !d.bridge.acknowledgePublication(operationID) {
+	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 		t.Fatal("early callback acknowledgement missed the authority publication ledger")
 	}
 	if c.markPublicationReplyExposed(operationID) {
@@ -153,6 +164,20 @@ func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T)
 	defer peer.Close()
 	c := &frontendConn{conn: server, attach: a}
 	op, participant := publicationTestOperation(t, c, a, operationID)
+	gate, err := v3ItemSourceGate(testV3PublicationItem(1, 0x5a), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := d.bridge.sourcePublication.acquireSource(context.Background(), operationID, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.markAssigned(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.markCommitted(); err != nil {
+		t.Fatal(err)
+	}
 	if !c.markPublicationReplyExposed(operationID) {
 		t.Fatal("publishing reply was not exposed")
 	}
@@ -184,13 +209,644 @@ func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T)
 	if !completed || active {
 		t.Fatalf("disconnect gate retirement = completed=%v active=%v", completed, active)
 	}
+	d.bridge.sourcePublication.mu.Lock()
+	released, sourceTerminal := lease.released, d.bridge.sourcePublication.terminal
+	d.bridge.sourcePublication.mu.Unlock()
+	if released || sourceTerminal == nil {
+		t.Fatalf("disconnect reopened source lease: released=%t terminal=%v", released, sourceTerminal)
+	}
 	a.finishFrontendParticipant(participant)
+}
+
+// A successful authority COMMIT is not consumed at the Go return boundary.
+// The receipt remains owned by the exact logical operation while its pfslocal
+// frame is written and while the callback owes PublicationAck. Only the joint
+// Ack + handler-retirement boundary may send the terminal delivery receipt.
+func TestV3RetainedMutationReceiptWaitsForPhysicalReplyAndPublicationAck(t *testing.T) {
+	const operationID = uint64(305)
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "receipt-test", v3Data: d, v3Coherence: d.bridge}
+	_, handle := openTestV3File(t, d, false)
+
+	var consumed atomic.Int32
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer server.Close()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	_, participant := publicationTestOperation(t, c, a, operationID)
+
+	reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+		Handle: handle, Data: []byte("receipt"),
+	})
+	if errno != 0 || reply == nil {
+		t.Fatalf("write=(%#v,%d)", reply, errno)
+	}
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("authority return consumed receipt %d time(s), want 0", got)
+	}
+
+	readResult := make(chan error, 1)
+	go func() {
+		envelope, err := pfslocal.ReadFrame(peer)
+		if err == nil && (!envelope.PublicationAckRequired || envelope.RequestID != 1) {
+			err = errors.New("physical reply omitted its publication identity")
+		}
+		readResult <- err
+	}()
+	if !c.replyWithPublication(1, operationID, reply, true) {
+		t.Fatal("write reply was not physically exposed")
+	}
+	if err := <-readResult; err != nil {
+		t.Fatal(err)
+	}
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("physical reply consumed receipt %d time(s) before PublicationAck", got)
+	}
+
+	if !acknowledgeBridgePublished(t, d.bridge, operationID) ||
+		!c.acknowledgePublication(operationID) {
+		t.Fatal("PublicationAck was refused")
+	}
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("PublicationAck consumed receipt %d time(s) before handler retirement", got)
+	}
+	a.finishFrontendParticipant(participant)
+	c.finishLogicalRequest(operationID)
+	if got := consumed.Load(); got != 3 {
+		t.Fatalf("completed logical publication consumed receipt %d time(s), want BEGIN+DATA+COMMIT=3", got)
+	}
+	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
+		t.Fatal(err)
+	}
+	if got := consumed.Load(); got != 3 {
+		t.Fatalf("duplicate finish consumed receipt %d time(s), want exactly 3", got)
+	}
+}
+
+// If the authority's bounded terminal drain expires before PublicationAck,
+// its force callback must revoke the strict data plane synchronously. Only
+// after connection teardown retires the revoked logical operation may its
+// retained response be consumed.
+func TestV3RetainedMutationReceiptTimeoutRevokesBeforeConsumption(t *testing.T) {
+	const operationID = uint64(306)
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "receipt-timeout-test", v3Data: d, v3Coherence: d.bridge}
+	_, handle := openTestV3File(t, d, false)
+
+	var consumed atomic.Int32
+	var forceCallback func(error)
+	client.newConsumption = func(force func(error)) authorityrpc.ResponseConsumption {
+		forceCallback = force
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	_, participant := publicationTestOperation(t, c, a, operationID)
+	var revoked atomic.Bool
+	revokeStarted := make(chan struct{})
+	dispatchCtx := context.WithValue(
+		context.Background(),
+		v3ResponseConsumptionRevokerContextKey{},
+		v3ResponseConsumptionRevoker(func(cause error) {
+			close(revokeStarted)
+			c.revokeV3ResponseConsumption(a, cause)
+			revoked.Store(true)
+		}),
+	)
+	if reply, errno := d.dispatchFrontend(dispatchCtx, operationID, &pfslocal.WriteRequest{
+		Handle: handle, Data: []byte("timeout"),
+	}); errno != 0 || reply == nil {
+		t.Fatalf("write=(%#v,%d)", reply, errno)
+	}
+	if forceCallback == nil {
+		t.Fatal("retained mutation omitted its bounded-drain force callback")
+	}
+	c.writeMu.Lock()
+	forced := make(chan struct{})
+	go func() {
+		forceCallback(errors.New("terminal receipt deadline"))
+		close(forced)
+	}()
+	<-revokeStarted
+	select {
+	case <-forced:
+		c.writeMu.Unlock()
+		t.Fatal("forced receipt drain crossed an active pfslocal frame writer")
+	default:
+	}
+	c.writeMu.Unlock()
+	select {
+	case <-forced:
+	case <-time.After(time.Second):
+		t.Fatal("forced receipt drain did not finish after the pfslocal writer retired")
+	}
+	if !revoked.Load() {
+		t.Fatal("forced receipt drain returned before revoking the pfslocal serving boundary")
+	}
+	if terminal := d.terminalError(); terminal == nil ||
+		!strings.Contains(terminal.Error(), "frontend delivery bound") {
+		t.Fatalf("forced receipt drain did not revoke the data plane: %v", terminal)
+	}
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("forced revocation consumed receipt %d time(s) before local teardown", got)
+	}
+
+	a.finishFrontendParticipant(participant)
+	c.close()
+	if got := consumed.Load(); got != 3 {
+		t.Fatalf("revoked logical publication consumed receipt %d time(s), want BEGIN+DATA+COMMIT=3", got)
+	}
+}
+
+func TestV3PlainResponseReceiptWaitsForPhysicalFrontendFrame(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "plain-receipt-test", v3Data: d, v3Coherence: d.bridge}
+	var consumed atomic.Int32
+	created := make(chan struct{}, 1)
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		created <- struct{}{}
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 401, 0, false, &pfslocal.StatfsRequest{})
+		close(done)
+	}()
+	<-created
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("plain authority response consumed before frontend frame: %d", got)
+	}
+	if _, err := pfslocal.ReadFrame(peer); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("plain frontend handler did not retire after frame write")
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("plain response consumption after physical frame = %d, want 1", got)
+	}
+}
+
+func TestV3PublishingReadReceiptWaitsForFrameAckAndHandlerRetirement(t *testing.T) {
+	const operationID = uint64(404)
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "publishing-read-receipt-test", v3Data: d, v3Coherence: d.bridge}
+	lookupAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.LookupRequest{
+		Dir: d.resolveReply().Root, Name: []byte("file"),
+	})
+	if errno != 0 {
+		t.Fatalf("lookup errno=%d", errno)
+	}
+	file := lookupAny.(*pfslocal.LookupReply).Attr.Item
+	var consumed atomic.Int32
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	initialize, ok := c.reserveLogicalOperation(operationID, true)
+	if !ok || !initialize {
+		t.Fatal("publishing read operation was not reserved")
+	}
+	d.bridge.reserveFrontendPublication(operationID)
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 404, operationID, initialize, &pfslocal.GetAttrRequest{Item: file})
+		close(done)
+	}()
+	envelope, err := pfslocal.ReadFrame(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !envelope.PublicationAckRequired || envelope.OperationID != operationID {
+		t.Fatalf("publishing read frame = %+v, want exact PublicationAck identity", envelope)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("publishing read handler did not retire after frame write")
+	}
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("publishing read consumed receipt before PublicationAck: %d", got)
+	}
+	if !c.acknowledgePublication(operationID) {
+		t.Fatal("publishing read PublicationAck was refused")
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("publishing read receipt consumption after frame, Ack, and retirement = %d, want 1", got)
+	}
+}
+
+// FSKit can cancel a callback after the daemon dispatched its authority read
+// but before that read returns. Its NOT_PUBLISHED acknowledgement is a complete
+// verdict for that callback: a later healthy read must be discarded, its
+// receipt must still retire at the callback boundary, and the mount must remain
+// usable. Treating the late result like an applied mutation turns every benign
+// request timeout into a volume-wide outage.
+func TestV3LateHealthyReadAfterNotPublishedAckIsDiscarded(t *testing.T) {
+	const operationID = uint64(406)
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "late-read-receipt-test", v3Data: d, v3Coherence: d.bridge}
+	file, _ := openTestV3File(t, d, false)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client.read = func(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetGetAttr() == nil {
+			return nil, errors.New("unexpected authority request in late-read test")
+		}
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+		}}}, nil
+	}
+	var consumed atomic.Int32
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer server.Close()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	initialize, ok := c.reserveLogicalOperation(operationID, true)
+	if !ok || !initialize {
+		t.Fatal("late read operation was not reserved")
+	}
+	d.bridge.reserveFrontendPublication(operationID)
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 406, operationID, initialize, &pfslocal.GetAttrRequest{Item: file})
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("authority read was not dispatched")
+	}
+	known, err := d.bridge.acknowledgePublication(
+		operationID, pfslocal.PublicationSemanticCommitNotPublished,
+	)
+	if err != nil || !known {
+		t.Fatalf("early NOT_PUBLISHED bridge ack = (%t,%v)", known, err)
+	}
+	if !c.acknowledgePublication(operationID) {
+		t.Fatal("early NOT_PUBLISHED frontend ack was refused")
+	}
+	close(release)
+
+	_ = peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if envelope, err := pfslocal.ReadFrame(peer); err == nil {
+		t.Fatalf("late read exposed a frame after NOT_PUBLISHED: %+v", envelope)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("late read handler did not retire")
+	}
+	if terminal := d.terminalError(); terminal != nil {
+		t.Fatalf("late healthy read fenced the session: %v", terminal)
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("late read receipt consumed %d time(s), want exactly once after handler retirement", got)
+	}
+	c.publicationMu.Lock()
+	_, retained := c.operations[operationID]
+	c.publicationMu.Unlock()
+	if retained {
+		t.Fatal("late read operation remained after ack and handler retirement")
+	}
+}
+
+func TestV3LateLookupAfterNotPublishedAckWithdrawsProvisionalItem(t *testing.T) {
+	const operationID = uint64(407)
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "late-lookup-resource-test", v3Data: d, v3Coherence: d.bridge}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReclaim() != nil {
+			return exactTestMutationReply(identity), nil
+		}
+		if request.GetLookup() == nil {
+			return nil, errors.New("unexpected authority mutation in late-lookup test")
+		}
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		response := exactTestMutationReply(identity)
+		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
+			Item: authorityTestItem(2, authoritypb.Attr_REGULAR, 0x30, 0x40),
+		}}
+		return response, nil
+	}
+	var consumed atomic.Int32
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer server.Close()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	initialize, ok := c.reserveLogicalOperation(operationID, true)
+	if !ok || !initialize {
+		t.Fatal("late lookup operation was not reserved")
+	}
+	d.bridge.reserveFrontendPublication(operationID)
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 407, operationID, initialize, &pfslocal.LookupRequest{
+			Dir: d.resolveReply().Root, Name: []byte("late"),
+		})
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("authority lookup was not dispatched")
+	}
+	known, err := d.bridge.acknowledgePublication(
+		operationID, pfslocal.PublicationSemanticCommitNotPublished,
+	)
+	if err != nil || !known {
+		t.Fatalf("early NOT_PUBLISHED bridge ack = (%t,%v)", known, err)
+	}
+	if !c.acknowledgePublication(operationID) {
+		t.Fatal("early NOT_PUBLISHED frontend ack was refused")
+	}
+	close(release)
+
+	_ = peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if envelope, err := pfslocal.ReadFrame(peer); err == nil {
+		t.Fatalf("late lookup exposed a frame after NOT_PUBLISHED: %+v", envelope)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("late lookup handler did not retire")
+	}
+	if terminal := d.terminalError(); terminal != nil {
+		t.Fatalf("late healthy lookup fenced the session: %v", terminal)
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("late lookup receipt consumed %d time(s), want exactly once", got)
+	}
+	d.mu.Lock()
+	itemCount := len(d.itemsByID)
+	_, retainedItem := d.itemsByID[2]
+	d.mu.Unlock()
+	if retainedItem || itemCount != 1 {
+		t.Fatalf("discarded lookup retained provisional item: retained=%t item_count=%d", retainedItem, itemCount)
+	}
+}
+
+func TestV3TerminalPlainResponsesRevokeBeforeConsumptionAndWriteNoFrame(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body any
+	}{
+		{name: "read", body: &pfslocal.StatfsRequest{}},
+		{name: "replay mutation", body: &pfslocal.SyncVolumeRequest{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newFakeV3DataClient()
+			d := testV3DataPlane(t, client)
+			a := &attach{ref: "terminal-plain-receipt-test", v3Data: d, v3Coherence: d.bridge}
+			if test.name == "read" {
+				client.read = func(context.Context, *authoritypb.Request) (*authoritypb.Response, error) {
+					return &authoritypb.Response{Errno: int32(errnos.EIO), Failure: authoritypb.FailureClass_FAILURE_CLASS_STORAGE}, nil
+				}
+			} else {
+				client.mutation = func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error) {
+					return &authoritypb.Response{Errno: int32(errnos.EIO), Failure: authoritypb.FailureClass_FAILURE_CLASS_STORAGE}, nil
+				}
+			}
+			var consumed atomic.Int32
+			client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+				return &fakeV3ResponseConsumption{consume: func() {
+					if d.terminalError() == nil {
+						t.Error("terminal plain response consumed before data-plane revocation")
+					}
+					consumed.Add(1)
+				}}
+			}
+			server, peer := net.Pipe()
+			defer peer.Close()
+			c := &frontendConn{conn: server, attach: a}
+			done := make(chan struct{})
+			go func() {
+				c.handleV3Attached(context.Background(), a, 405, 0, false, test.body)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("terminal plain response did not finish")
+			}
+			if got := consumed.Load(); got != 1 {
+				t.Fatalf("terminal plain response consumed %d time(s), want once after revoke", got)
+			}
+			if d.terminalError() == nil {
+				t.Fatal("terminal plain response did not revoke data plane")
+			}
+			_ = peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			if _, err := pfslocal.ReadFrame(peer); err == nil {
+				t.Fatal("terminal plain response exposed a pfslocal frame")
+			}
+		})
+	}
+}
+
+func TestV3OpenReceiptWaitsForResourceDisposition(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "open-receipt-test", v3Data: d, v3Coherence: d.bridge}
+	lookupAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.LookupRequest{
+		Dir: d.resolveReply().Root, Name: []byte("file"),
+	})
+	if errno != 0 {
+		t.Fatalf("lookup errno=%d", errno)
+	}
+	file := lookupAny.(*pfslocal.LookupReply).Attr.Item
+	var consumed atomic.Int32
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 402, 0, false, &pfslocal.OpenRequest{
+			Item: file, Mode: pfslocal.OpenModeReadWrite,
+		})
+		close(done)
+	}()
+	if _, err := pfslocal.ReadFrame(peer); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Open handler did not retire after frame write")
+	}
+	if got := consumed.Load(); got != 0 {
+		t.Fatalf("Open receipt consumed at physical frame before disposition: %d", got)
+	}
+	if !c.settleProvisionalResource(&pfslocal.ResourceReplyDisposition{
+		TargetRequestID: 402, AcceptHandles: true,
+	}) {
+		t.Fatal("valid Open resource disposition was refused")
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("Open receipt consumption after resource disposition = %d, want 1", got)
+	}
+}
+
+func TestV3InvalidResourceDispositionRevokesBeforeReceiptConsumption(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "invalid-disposition-test", v3Data: d, v3Coherence: d.bridge}
+	lookupAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.LookupRequest{
+		Dir: d.resolveReply().Root, Name: []byte("file"),
+	})
+	if errno != 0 {
+		t.Fatalf("lookup errno=%d", errno)
+	}
+	file := lookupAny.(*pfslocal.LookupReply).Attr.Item
+	var consumed atomic.Int32
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &fakeV3ResponseConsumption{consume: func() {
+			if d.terminalError() == nil {
+				t.Error("invalid disposition consumed receipt before fencing data plane")
+			}
+			consumed.Add(1)
+		}}
+	}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 403, 0, false, &pfslocal.OpenRequest{
+			Item: file, Mode: pfslocal.OpenModeReadWrite,
+		})
+		close(done)
+	}()
+	envelope, err := pfslocal.ReadFrame(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openReply, ok := envelope.Body.(*pfslocal.OpenReply)
+	if !ok || openReply.Handle == 0 {
+		t.Fatalf("Open reply = %#v", envelope.Body)
+	}
+	handleID := openReply.Handle
+	<-done
+	if c.settleProvisionalResource(&pfslocal.ResourceReplyDisposition{
+		TargetRequestID: 403, AcceptHandles: true, AcceptedItemCount: 1,
+	}) {
+		t.Fatal("invalid Open disposition was accepted")
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("invalid disposition consumed receipt %d time(s), want 1 after revoke", got)
+	}
+	if d.terminalError() == nil {
+		t.Fatal("invalid disposition did not fence data plane")
+	}
+	c.resourceMu.Lock()
+	_, provisional := c.provisional[403]
+	c.resourceMu.Unlock()
+	d.mu.Lock()
+	_, handleLive := d.handles[handleID]
+	d.mu.Unlock()
+	if provisional || handleLive {
+		t.Fatalf("invalid disposition leaked resources: provisional=%t handle_live=%t", provisional, handleLive)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := pfslocal.ReadFrame(peer); err == nil {
+		t.Fatal("pfslocal connection remained writable after invalid disposition")
+	}
+}
+
+// A malformed parsed COMMIT can itself carry the terminal delivery token. It
+// must take the same synchronized local-revocation path as the bounded force
+// callback before the callMutation defer consumes (and therefore receipts)
+// that response.
+func TestV3MalformedRetainedMutationRevokesBeforeReceiptConsumption(t *testing.T) {
+	const operationID = uint64(307)
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "receipt-malformed-test", v3Data: d, v3Coherence: d.bridge}
+	_, handle := openTestV3File(t, d, false)
+
+	var consumed atomic.Int32
+	var revoked atomic.Bool
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		response := exactTestWriteCommit(identity, request)
+		response.Uncertain = true
+		return response, nil
+	}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	_, participant := publicationTestOperation(t, c, a, operationID)
+	dispatchCtx := context.WithValue(
+		context.Background(),
+		v3ResponseConsumptionRevokerContextKey{},
+		v3ResponseConsumptionRevoker(func(cause error) {
+			if got := consumed.Load(); got != 0 {
+				t.Errorf("receipt was consumed %d time(s) before local revocation", got)
+			}
+			c.revokeV3ResponseConsumption(a, cause)
+			revoked.Store(true)
+		}),
+	)
+	if reply, errno := d.dispatchFrontend(dispatchCtx, operationID, &pfslocal.WriteRequest{
+		Handle: handle, Data: []byte("malformed"),
+	}); errno != darwinEIO || reply != nil {
+		t.Fatalf("malformed retained result=(%#v,%d), want terminal EIO", reply, errno)
+	}
+	if !revoked.Load() {
+		t.Fatal("malformed retained result did not revoke the pfslocal boundary")
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("malformed retained result consumed receipt %d time(s), want 1 after revocation", got)
+	}
+	a.finishFrontendParticipant(participant)
+	c.close()
 }
 
 // Visible mutation replies carry both a PublicationAck obligation and a
 // provisional item capability. Abandoning the item is itself terminal because
-// source COMPLETE may have assumed it was published, but on disconnect the
-// missing publication acknowledgement is the earlier and more exact failure.
+// its source gate remains fail-closed, but on disconnect the missing
+// publication acknowledgement is the earlier and more exact failure.
 // Closing the resource table must prevent new transfers without allowing the
 // generic visible-abandon cause to steal failOnce.
 func TestLostPublicationCauseWinsVisibleProvisionalAbandonment(t *testing.T) {
@@ -271,7 +927,7 @@ func TestFrontendDisconnectDoesNotFenceHarmlessPublicationStates(t *testing.T) {
 			}
 			if test.acknowledge {
 				if !c.acknowledgePublication(operationID) ||
-					!d.bridge.acknowledgePublication(operationID) {
+					!acknowledgeBridgePublished(t, d.bridge, operationID) {
 					t.Fatal("publication acknowledgement was refused")
 				}
 			}
@@ -281,36 +937,6 @@ func TestFrontendDisconnectDoesNotFenceHarmlessPublicationStates(t *testing.T) {
 				t.Fatalf("harmless teardown fenced v3 session: %v", terminal)
 			}
 			a.finishFrontendParticipant(participant)
-		})
-	}
-}
-
-func TestSourcePhaseQueueabilityWireShape(t *testing.T) {
-	for _, test := range []struct {
-		name        string
-		body        any
-		operationID uint64
-		queueable   bool
-		want        bool
-	}{
-		{name: "absent ordinary", body: &pfslocal.GetAttrRequest{}, want: true},
-		{name: "absent ordered", body: &pfslocal.WriteRequest{}, want: true},
-		{name: "ordered identified", body: &pfslocal.WriteRequest{}, operationID: 9, queueable: true, want: true},
-		{name: "ordered unidentified", body: &pfslocal.WriteRequest{}, queueable: true},
-		{name: "ordinary identified", body: &pfslocal.GetAttrRequest{}, operationID: 9, queueable: true},
-		{name: "nonpublishing identified", body: &pfslocal.OpenRequest{}, operationID: 9, queueable: true},
-		{name: "hello control body", body: &pfslocal.Hello{}, operationID: 9, queueable: true},
-		{name: "resolve control body", body: &pfslocal.ResolveRequest{}, operationID: 9, queueable: true},
-		{name: "visibility ack control body", body: &pfslocal.VisibilityAckRequest{}, operationID: 9, queueable: true},
-		{name: "publication ack control body", body: &pfslocal.PublicationAck{}, operationID: 9, queueable: true},
-		{name: "liveness control body", body: &pfslocal.V3LivenessRequest{}, operationID: 9, queueable: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := validFrontendSourcePhaseQueueability(
-				test.body, test.operationID, test.queueable,
-			); got != test.want {
-				t.Fatalf("validity = %v, want %v", got, test.want)
-			}
 		})
 	}
 }

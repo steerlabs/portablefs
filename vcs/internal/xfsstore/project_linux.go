@@ -22,9 +22,37 @@ type fsxattr struct {
 }
 
 const (
-	fsIOCFSGetXattr    = 0x801c581f
+	fsIOCFSGetXattr = 0x801c581f
+	// XFS_IOC_FSGEOMETRY_V1 is the stable 112-byte XFS geometry ABI. The
+	// first two fields are the data-block size and realtime extent size in
+	// data blocks, exactly the inputs to xfs_inode_alloc_unitsize.
+	xfsIOCFsGeometryV1 = 0x80705864
+	fsXFlagRealtime    = 0x00000001
 	fsXFlagProjInherit = 0x00000200
 )
+
+type xfsFSGeometryV1 struct {
+	BlockSize    uint32
+	RTextSize    uint32
+	AGBlocks     uint32
+	AGCount      uint32
+	LogBlocks    uint32
+	SectSize     uint32
+	InodeSize    uint32
+	IMaxPct      uint32
+	DataBlocks   uint64
+	RTBlocks     uint64
+	RTExtents    uint64
+	LogStart     uint64
+	UUID         [16]byte
+	SUnit        uint32
+	SWidth       uint32
+	Version      int32
+	Flags        uint32
+	LogSectSize  uint32
+	RTSectSize   uint32
+	DirBlockSize uint32
+}
 
 // projectOf reads an inode's XFS project identity. It requires a descriptor
 // opened for access: ioctl(2) rejects an O_PATH descriptor with EBADF, and
@@ -38,6 +66,36 @@ func projectOf(fd int) (fsxattr, error) {
 		return fsxattr{}, fmt.Errorf("query XFS project: %w", errno)
 	}
 	return attr, nil
+}
+
+// xfsFallocateAllocationUnit reproduces xfs_inode_alloc_unitsize for the
+// collapse/insert alignment checks. Ordinary XFS files use one filesystem
+// block; realtime files use one realtime extent. Guessing from statfs or from
+// an extent-size hint would get realtime files wrong and could reorder EINVAL
+// behind a caller RLIMIT failure, spuriously delivering SIGXFSZ.
+func xfsFallocateAllocationUnit(fd int) (uint64, error) {
+	attr, err := projectOf(fd)
+	if err != nil {
+		return 0, err
+	}
+	var geometry xfsFSGeometryV1
+	if unsafe.Sizeof(geometry) != 112 {
+		return 0, fmt.Errorf("unexpected XFS geometry ABI size %d", unsafe.Sizeof(geometry))
+	}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), xfsIOCFsGeometryV1, uintptr(unsafe.Pointer(&geometry))); errno != 0 {
+		return 0, fmt.Errorf("query XFS geometry: %w", errno)
+	}
+	if geometry.BlockSize == 0 {
+		return 0, fmt.Errorf("invalid XFS block size 0")
+	}
+	unit := uint64(geometry.BlockSize)
+	if attr.XFlags&fsXFlagRealtime != 0 {
+		if geometry.RTextSize == 0 || unit > ^uint64(0)/uint64(geometry.RTextSize) {
+			return 0, fmt.Errorf("invalid XFS realtime geometry block=%d extent=%d", geometry.BlockSize, geometry.RTextSize)
+		}
+		unit *= uint64(geometry.RTextSize)
+	}
+	return unit, nil
 }
 
 // verifyProject fails closed when an inode is not accounted to this volume's

@@ -1,13 +1,42 @@
 # macOS 27 native FSKit coherence
 
-Status: **SDK-27 data invalidator compiles; not a supported mount policy**
+Status: **all production protocol-5 macOS mounts are refused before attach**
 
-Production PortableFS does not select `fskit-native-revocation-v1` yet. The
-ordinary CLI refuses macOS 27 before authority attach because the SDK-27
-adapter cannot satisfy every visibility repair the authority may send. The
-current macOS 26 adapter remains separate and continues to select
-`macos26-synchronous-vfs-repair-v2` explicitly on macOS 26. Neither adapter may
-reinterpret the other policy or fall back to it.
+No currently documented FSKit release supplies the complete primitives that a
+strict shared PortableFS mount requires. The shipping CLI therefore refuses
+macOS 26, macOS 27, and unknown later versions before contacting portablefsd;
+the shipping extension independently refuses before resolving its Unix socket;
+and portablefsd independently refuses a protocol-5 EnsureAttach before it can
+construct or dial an authority transport. There is no alternate policy,
+runtime opt-in, or degraded mode.
+
+The macOS 26 synchronous-VFS adapter and macOS 27 native-data adapter remain
+only as test and separately signed qualification lanes. They must not be read
+as supported production mount paths.
+
+## Exact missing primitives
+
+Protocol 5 has two distinct publication obligations. A source mutation must
+return every exact post-mutation attribute snapshot that its initiating FSKit
+callback publishes. A peer mutation must synchronously make the affected
+kernel namespace, attributes, and data unobservable before COMPLETE is
+acknowledged.
+
+| FSKit generation | source callback boundary | peer repair boundary |
+| --- | --- | --- |
+| macOS 26 `FSVolume.Operations` | `setAttributes` can return item attributes, but create, symlink, link, remove, rename, and write cannot return their complete item/parent post-state | no supported namespace, inode-attribute, or data-cache invalidation API |
+| macOS 27 `FSVolume.Handler` | typed results add child/parent, linked/parent, removed/parent, renamed/both-parents/overwritten, write-item, and setattr-item attributes; the xattr result still carries only free space | `DataCacheHandler` can act on retained item data, but there is still no supported namespace or inode-attribute invalidation API |
+
+Keeping a source publication gate closed does not fix either absence: local
+reads may still consume stale kernel attributes, and a peer COMPLETE cannot be
+acknowledged until its kernel effects are exact. A synthetic nested VFS
+operation is also not a contract. It is reentrant, can cycle on the callback's
+own locks, cannot address a newly created item before the outer reply installs
+it, and depends on undocumented cache side effects.
+
+Apple DTS has now stated directly that inode/attribute invalidation “currently
+doesn't exist” and that FSKit does not yet fully support shared/network file
+systems: [Apple Developer Forums thread 821376](https://developer.apple.com/forums/thread/821376).
 
 ## Documented SDK 27 contract
 
@@ -88,13 +117,14 @@ directory in the hope that child name entries disappear is also an assumption.
 The production adapter must not do either unless the final SDK contract says so
 and the installed-kernel matrix proves the required behavior.
 
-Until every row has a proven representation, no shipping app links the native
-adapter and the ordinary CLI refuses macOS 27 before starting an authority
-attach. The separately signed development host may serve a qualification mount
-only when paired with a CLI carrying the exact build-time qualification stamp;
-an unsupported repair then fails the mount terminally before COMPLETE rather
-than acknowledging partial coherence. It never substitutes the macOS 26
-synthetic repair mechanism under the native policy name.
+Until every row has a supported representation, no shipping app links the
+native adapter and production selection refuses every macOS version before
+starting a daemon or authority attach. The separately signed development host
+may serve a qualification mount only when paired with a CLI and portablefsd
+carrying the exact build-time qualification tag; an unsupported repair then
+fails the mount terminally before COMPLETE rather than acknowledging partial
+coherence. It never substitutes the macOS 26 synthetic repair mechanism under
+the native policy name.
 
 ## Adapter boundary
 
@@ -153,19 +183,21 @@ and test lane.
 The macOS 26 target must continue to compile without SDK-27 symbols. A compiler
 condition that hides uncompiled native code is not a verification lane.
 
-`VolumeCore` requires an adapter to declare its exact supported policy set
-before Resolve. The macOS 26 set retains both frozen compatibility revisions;
-the SDK-27 qualification adapter contains only
-`fskit-native-revocation-v1`. A mismatch closes the pfslocal connection and
-returns `ENOTSUP`.
+Inside qualification and unit-test composition, `VolumeCore` still requires an
+adapter to declare its exact policy set before Resolve. The macOS 26 test set
+retains both frozen experimental revisions; the SDK-27 qualification adapter
+contains only `fskit-native-revocation-v1`. A mismatch closes the pfslocal
+connection and returns `ENOTSUP`. Shipping composition never reaches Resolve.
 
 The CLI has a second, independent gate. Its normal build contains no native
-qualification stamp, so macOS 27 fails before attach. The signed development
-lane may stamp exactly `sdk27-live-qualification-only` into
-`nativeFSKitPolicyQualification` with Go `-ldflags -X`. This is a build
-identity, not a runtime environment toggle. macOS 28 and later remain refused
-even by that build until their kernels are independently qualified. OS version
-detection alone never authorizes the policy.
+qualification stamp, so both macOS 26 and macOS 27 fail before attach. The
+signed development lane may stamp exactly `sdk27-live-qualification-only` into
+`nativeFSKitPolicyQualification` with Go `-ldflags -X`; the same build lane
+tags portablefsd so its defensive EnsureAttach gate recognizes that exact
+qualification artifact. This is a build identity, not a runtime environment
+toggle. macOS 26 remains refused even with the macOS 27 stamp, and macOS 28 and
+later remain refused until independently qualified. OS version detection alone
+never authorizes a policy.
 
 Qualification mount readiness is also policy-specific. After `/sbin/mount`
 returns, the CLI proves the exact `pfs` kernel identity, asks `portablefsd` to

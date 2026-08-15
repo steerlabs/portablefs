@@ -50,7 +50,7 @@ func run() error {
 		dialTimeout        = flag.Duration("dial-timeout", mountv3.DialTimeout, "authority dial and TLS timeout")
 		cancelDrainTimeout = flag.Duration("cancel-drain-timeout", mountv3.CancelDrainTimeout, "time to obtain an exact result after interrupting an in-flight request")
 		requestTimeout     = flag.Duration("request-timeout", mountv3.RequestTimeout, "non-blocking filesystem operation timeout")
-		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (cache names and attributes, join the authority visibility barrier) or uncached (cache nothing)")
+		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (the only protocol-5 coherence mode)")
 		cachedNames        = flag.Int("cached-name-capacity", mountv3.CachedNameCapacity, "directory bindings a strict mount may leave resident in its kernel")
 		repairBudget       = flag.Duration("repair-budget", mountv3.RepairBudget, "per-phase deadline a strict mount commits to before revoking itself")
 		localBacking       = flag.String("local-backing", "", "per-machine directory holding the volume's machine-local route subtrees")
@@ -110,12 +110,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if profile == fusev3.CoherenceStrict && (*cachedNames <= 0 || *repairBudget <= 0) {
+	if *cachedNames <= 0 || *repairBudget <= 0 {
 		return errors.New("strict coherence requires a positive cached-name capacity and repair budget; both are declared to the authority")
 	}
 	mountInstanceID, err := mountid.NewMountInstance()
 	if err != nil {
 		return fmt.Errorf("create unique mount identity: %w", err)
+	}
+	preKernelAbsence, err := mountv3.PreKernelMountAbsenceObserver(absoluteMount, mountInstanceID)
+	if err != nil {
+		return fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -127,6 +131,7 @@ func run() error {
 		// needs to size the barrier: how much cached state this frontend can be
 		// holding, and how long it may take to withdraw it.
 		CoherenceProfile: protocolProfile, CachedNameCapacity: uint64(*cachedNames), RepairBudget: *repairBudget,
+		ObservePreKernelMountAbsence: preKernelAbsence,
 	}
 	// How this frontend's kernel makes a cached binding unservable. It is
 	// declared rather than inferred because the authority cannot observe a
@@ -136,9 +141,7 @@ func run() error {
 	// round trip. Saying so is what lets the authority tell a provably closed
 	// repair cycle apart from an ordinary slow lock, and fence one participant
 	// immediately instead of stalling the volume for a whole repair budget.
-	if profile == fusev3.CoherenceStrict {
-		attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
-	}
+	attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
 	if len(localDirs) != 0 {
 		return fmt.Errorf("machine-local routes are declared volume-wide in %s; -local-dir would add a route only this machine knows about, which desynchronizes the routing topology the authority pins every mount to", fusev3.LocalDirsPath)
 	}
@@ -155,15 +158,11 @@ func run() error {
 		return err
 	}
 	if !routes.Empty() && *localBacking == "" {
-		_ = client.Close()
-		return fmt.Errorf("this volume declares machine-local routes in %s (%s); -local-backing must name the per-machine directory that serves them",
+		cause := fmt.Errorf("this volume declares machine-local routes in %s (%s); -local-backing must name the per-machine directory that serves them",
 			fusev3.LocalDirsPath, strings.Join(routes.Patterns(), " "))
+		return releaseClientBeforeKernelMount(client, *cancelDrainTimeout, cause)
 	}
-	transport, err := mountv3.NewTransport(client, profile)
-	if err != nil {
-		_ = client.Close()
-		return err
-	}
+	transport := mountv3.NewTransport(client)
 	mount, err := fusev3.MountVolume(context.Background(), absoluteMount, transport, fusev3.Config{
 		MountInstanceID: mountInstanceID, RequestTimeout: *requestTimeout,
 		MaxBackground: *maxBackground, MaxInFlight: *maxInFlight, ReclaimQueue: *reclaimQueue,
@@ -183,6 +182,12 @@ func run() error {
 	case <-ctx.Done():
 		return shutdown(mount, done, absoluteMount)
 	}
+}
+
+func releaseClientBeforeKernelMount(client *authorityrpc.Client, timeout time.Duration, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return errors.Join(cause, client.ReleaseBeforeMount(ctx))
 }
 
 // shutdown removes the kernel mount before this process exits.

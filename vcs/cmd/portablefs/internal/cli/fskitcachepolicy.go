@@ -17,12 +17,14 @@ const sdk27QualificationStamp = "sdk27-live-qualification-only"
 // repair family in fskit-native-revocation-v1.
 var nativeFSKitPolicyQualification = ""
 
-// fskitCachePolicyForProductVersion selects the one cache contract implemented
-// by this exact frontend build on this exact OS generation. macOS 26 uses the
-// frozen synchronous-VFS-repair contract. macOS 27 remains production-gated;
-// only the separately signed live-qualification build may ask for the native
-// policy. Later OS generations are refused until independently qualified.
-// There is no probe-based fallback between policy names.
+// fskitCachePolicyForProductVersion is the pre-daemon, pre-authority admission
+// gate for an FSKit mount. No currently documented FSKit version has the
+// complete primitives protocol 5 requires: legacy macOS 26 callbacks cannot
+// publish all source post-mutation attributes, and neither macOS 26 nor 27 can
+// invalidate peer namespace/attribute state exactly. Shipping builds therefore
+// refuse every macOS version here. Only the separately signed macOS 27 live-
+// qualification artifact may select its native data-cache policy, and that is
+// a test lane rather than a compatibility fallback.
 func fskitCachePolicyForProductVersion(
 	productVersion string,
 	nativeQualification string,
@@ -34,10 +36,10 @@ func fskitCachePolicyForProductVersion(
 	}
 	switch major {
 	case 26:
-		return portablefsd.V3CachePolicyMacOS26, nil
+		return "", fmt.Errorf("macOS 26 FSKit cannot mount PortableFS protocol 5: legacy mutation callbacks cannot publish complete source post-mutation attributes and FSKit exposes no exact peer namespace or attribute invalidation; no authority attach was attempted")
 	case 27:
 		if nativeQualification != sdk27QualificationStamp {
-			return "", fmt.Errorf("macOS 27 native FSKit mounting is not admitted by this build: the SDK-27 adapter has not completed the namespace and attribute coherence gates")
+			return "", fmt.Errorf("macOS 27 FSKit cannot mount PortableFS protocol 5 in production: FSKit exposes no exact peer namespace or attribute invalidation; no authority attach was attempted")
 		}
 		return portablefsd.V3CachePolicyFSKit, nil
 	default:
