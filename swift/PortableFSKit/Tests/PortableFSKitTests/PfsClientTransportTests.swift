@@ -1201,6 +1201,7 @@ private final class PfsRawServer: @unchecked Sendable {
     private let serverFD: Int32
     private let queue = DispatchQueue(label: "dev.portablefs.tests.rawserver", qos: .utility)
     private let group = DispatchGroup()
+    private let stateLock = NSLock()
     private var stopped = false
 
     init(onClient: @escaping @Sendable (Int32) -> Void) throws {
@@ -1228,20 +1229,24 @@ private final class PfsRawServer: @unchecked Sendable {
             }
             do {
                 let fd = try PfsUnixSocket.accept(serverFD)
-                if self?.stopped == true {
+                if self?.isStopped() == true {
                     PfsUnixSocket.close(fd)
                     return
                 }
                 onClient(fd)
                 PfsUnixSocket.close(fd)
-            } catch {
-                if self?.stopped != true {}
-            }
+            } catch {}
         }
     }
 
     func stop() {
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
         stopped = true
+        stateLock.unlock()
         if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
             PfsUnixSocket.close(wakeFD)
         }
@@ -1250,6 +1255,12 @@ private final class PfsRawServer: @unchecked Sendable {
         PfsUnixSocket.close(serverFD)
         unlink(socketPath)
         rmdir(socketDirectory)
+    }
+
+    private func isStopped() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped
     }
 
     static func sendAll(fd: Int32, data: Data) throws {

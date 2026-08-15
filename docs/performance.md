@@ -82,6 +82,38 @@ reads at one strict mount, but hardware, network, concurrency, cache state, and
 success semantics differ. These numbers establish that the exact architecture
 is not intrinsically throughput-starved; they do not establish a vendor ranking.
 
+## August 15, 2026 macOS client-path guardrail
+
+There is deliberately no mounted macOS protocol-5 throughput number yet. The
+public macOS 26 FSKit API cannot invalidate peer namespace and inode-attribute
+caches with the exact post-publication ordering required by PortableFS. Shipping
+macOS builds therefore refuse protocol-5 Attach before mounting instead of
+silently weakening consistency. This is a functional safety boundary, not a
+performance fallback. The separately pinned macOS 27 adapter also remains a
+qualification target rather than a shipping claim until an SDK 27 host can run
+the complete native cache matrix described in
+[macos-27-native-coherence.md](./macos-27-native-coherence.md).
+
+The currently usable measurement is a lower-layer client-pipeline guardrail. On
+an 18-core Apple M5 Max MacBook Pro with 128 GiB RAM, macOS 26.5, Xcode 26.6,
+and Swift 6.3.3, the release-build
+`readWriteChunkingRoundTripsTwentyMiBFile` test performs an exact 20 MiB write
+and 20 MiB read through `VolumeCore`, the production Unix-socket framing, and
+the mock data-plane implementation. It verifies every returned byte and proves
+that both directions remain split into at most 1 MiB protocol requests. Ten warm
+runs completed in 0.040-0.066 seconds, with a 0.0445-second median. That is about
+899 MiB/s of combined verified client-pipeline byte movement. It excludes a
+mounted FSKit kernel path, authority TLS, XFS, durability, and peer publication,
+so it is useful for detecting local framing/copy regressions but must not be
+compared directly with the Linux end-to-end or historical Archil figures.
+
+The same macOS tree passed all 340 Xcode-native tests, ten complete Xcode test
+iterations, the full Swift package under Thread Sanitizer and Address Sanitizer,
+and signed app/extension/service verification. Thread Sanitizer found one race
+in a test-only raw-socket server's stop flag; the helper now owns that lifecycle
+under a lock, and both sanitizer suites pass after the fix. No production data
+path race was reported.
+
 The first controlled v3/protocol-4 investigation was run on August 12-13, 2026.
 The results below are engineering measurements, not a published service SLO.
 Every older benchmark this project published measured the deleted v2 write-back
