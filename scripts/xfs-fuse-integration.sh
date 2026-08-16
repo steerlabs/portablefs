@@ -226,7 +226,9 @@ run_suite() {
 
 run_root_boundary_suite() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
-  local log=/var/tmp/portablefs-root-boundary.log
+  local log=/var/tmp/portablefs-kernel-boundary.log
+  local cellhost_log=/var/tmp/portablefs-cellhost-boundary.log
+  local combined_log=/var/tmp/portablefs-root-boundary.log
   local status=0
   # Load the only optional module before dropping to the production uid.  The
   # test process then receives CAP_SYS_ADMIN plus DAC_OVERRIDE for the
@@ -255,13 +257,38 @@ run_root_boundary_suite() {
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_STRICT_STACK_TEST_SCRIPT=/work/kernel/linux-6.12.100-portablefs-append/tests/test_strict_stacking.py \
     go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
-    -run '^(TestStrictKernelRefusesStackingExportAndLoopBacking|TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota)$' \
-    ./internal/fusev3/... ./internal/cellhost >"$log" 2>&1
+    -run '^TestStrictKernelRefusesStackingExportAndLoopBacking$' \
+    ./internal/fusev3/... >"$log" 2>&1
   status=$?
   set -e
   cat -- "$log"
-  [[ $status -eq 0 ]] || fail "root kernel-boundary test exited $status" "$status"
-  verify_exact_tests "$log" "${REQUIRED_ROOT_TESTS[@]}"
+  [[ $status -eq 0 ]] || fail "kernel backing-boundary test exited $status" "$status"
+
+  # Write-staging creation is the cell helper's root-only responsibility, not a
+  # capability of the authority service identity. Run that exact boundary as
+  # root against the same provisioned XFS cell while retaining the production
+  # service UID/GID as the directory ownership being verified.
+  set +e
+  env -i \
+    HOME=/root \
+    PATH=/usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TMPDIR=/var/tmp \
+    GOCACHE=/var/tmp/portablefs-cellhost-gocache \
+    GOMODCACHE=/home/portablefs/gomodcache \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=readonly \
+    PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
+    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
+    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
+    -run '^TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota$' \
+    ./internal/cellhost >"$cellhost_log" 2>&1
+  status=$?
+  set -e
+  cat -- "$cellhost_log"
+  [[ $status -eq 0 ]] || fail "root cell-helper boundary test exited $status" "$status"
+  cat "$log" "$cellhost_log" >"$combined_log"
+  verify_exact_tests "$combined_log" "${REQUIRED_ROOT_TESTS[@]}"
   echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
 }
 
