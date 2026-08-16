@@ -115,29 +115,32 @@ run_host() {
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
-  local -a host_kernel_mounts=()
-  if [[ -d /lib/modules/$(uname -r) ]]; then
-    host_kernel_mounts=(-v /lib/modules:/lib/modules:ro)
-  fi
   echo "xfs-fuse-integration: launching ${PORTABLEFS_CI_IMAGE}"
   # The working tree is mounted read-only: the container provisions its own XFS
   # image and must never be able to mutate the checkout it is testing.
-  docker run --rm --privileged \
-    --tmpfs /var/tmp:exec,mode=1777 \
-    -v "${root}/vcs:/work/vcs:ro" \
-    -v "${root}/scripts:/work/scripts:ro" \
-    -v "${root}/kernel/linux-6.12.100-portablefs-append:/work/kernel/linux-6.12.100-portablefs-append:ro" \
-    "${host_kernel_mounts[@]}" \
-    -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
-    -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
-    -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
-    -e "PORTABLEFS_PROJECT_ID=${PORTABLEFS_PROJECT_ID}" \
-    -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
-    -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
-	-e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
-    -w /work \
-    "${PORTABLEFS_CI_IMAGE}" \
-    bash /work/scripts/xfs-fuse-integration.sh --in-container
+  run_container() {
+    docker run --rm --privileged \
+      --tmpfs /var/tmp:exec,mode=1777 \
+      -v "${root}/vcs:/work/vcs:ro" \
+      -v "${root}/scripts:/work/scripts:ro" \
+      -v "${root}/kernel/linux-6.12.100-portablefs-append:/work/kernel/linux-6.12.100-portablefs-append:ro" \
+      "$@" \
+      -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
+      -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
+      -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
+      -e "PORTABLEFS_PROJECT_ID=${PORTABLEFS_PROJECT_ID}" \
+      -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
+      -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
+      -e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
+      -w /work \
+      "${PORTABLEFS_CI_IMAGE}" \
+      bash /work/scripts/xfs-fuse-integration.sh --in-container
+  }
+  if [[ -d /lib/modules/$(uname -r) ]]; then
+    run_container -v /lib/modules:/lib/modules:ro
+  else
+    run_container
+  fi
 }
 
 install_container_dependencies() {
@@ -252,7 +255,7 @@ run_root_boundary_suite() {
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_STRICT_STACK_TEST_SCRIPT=/work/kernel/linux-6.12.100-portablefs-append/tests/test_strict_stacking.py \
     go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
-    -run '^TestStrictKernelRefusesStackingExportAndLoopBacking$' \
+    -run '^(TestStrictKernelRefusesStackingExportAndLoopBacking|TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota)$' \
     ./internal/fusev3/... ./internal/cellhost >"$log" 2>&1
   status=$?
   set -e
