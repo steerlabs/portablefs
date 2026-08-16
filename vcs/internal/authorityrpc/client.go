@@ -902,20 +902,13 @@ func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byt
 	return proto.Clone(response.GetApplyRoutes()).(*authoritypb.ApplyRoutesReply), nil
 }
 
-// ReportVisibilityBlocked tells the authority this mount cannot yet service a
-// parent-exclusive namespace COMPLETE because the repair needs a kernel lock
-// one of this mount's own unanswered requests holds. An accepted ordinary
-// report installs a scoped pre-apply interruption; the caller then drains that
-// request, performs the repair, and acknowledges the same COMPLETE. A routes
-// report remains terminal because releasing a parent lock cannot adopt a new
-// topology.
-//
-// It may only be sent when BOTH halves are true: this mount has an unanswered
-// namespace mutation in the affected parent, and it actually holds a cached
-// binding this phase names. A mount with nothing cached to repair must
-// acknowledge normally. The authority maps every reported coordination inode
-// through the exact pending event and treats an unsupported report as a cursor
-// violation; the report itself never acknowledges or skips the repair.
+// ReportVisibilityBlocked is the terminal inability report for a routing
+// revision. A fixed mount topology cannot adopt a new declaration in place, so
+// the participant says so before revocation and the authority can fence it
+// without waiting the full repair budget. Ordinary Linux namespace phases never
+// call this method: the admitted kernel profile expires dentries locklessly.
+// Nonempty parentKernelInos are retained only to reject the retired development
+// profile deterministically.
 func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authoritypb.VisibilityCursor, parentKernelInos []uint64) error {
 	if c.cfg.CoherenceProfile != authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT || cursor == nil {
 		return syscall.EINVAL

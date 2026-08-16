@@ -97,7 +97,7 @@ func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *
 	if ProtocolMajor != 5 || ProtocolALPN != "portablefs-authority-v5" {
 		t.Fatalf("authority protocol=(major %d, ALPN %q), want (5, portablefs-authority-v5)", ProtocolMajor, ProtocolALPN)
 	}
-	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature, sequencedItemVisibilityRetryFeature}
+	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature, sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature}
 	if !hasFeatures(requiredHelloFeatures, required) {
 		t.Fatalf("Hello features %v omit protocol-5 requirements %v", requiredHelloFeatures, required)
 	}
@@ -118,8 +118,8 @@ func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *
 	if !hasFeatures(requiredStrictAttachFeatures, sourceGate) {
 		t.Fatalf("strict Attach features %v omit source-publication-gate-v1", requiredStrictAttachFeatures)
 	}
-	if !hasFeatures(requiredStrictAttachFeatures, []string{sequencedItemVisibilityRetryFeature}) {
-		t.Fatalf("strict Attach features %v omit %s", requiredStrictAttachFeatures, sequencedItemVisibilityRetryFeature)
+	if !hasFeatures(requiredStrictAttachFeatures, []string{sequencedVisibilityRetryFeature}) {
+		t.Fatalf("strict Attach features %v omit %s", requiredStrictAttachFeatures, sequencedVisibilityRetryFeature)
 	}
 }
 
@@ -181,7 +181,7 @@ func TestSourcePublicationGatePresenceMatchesVisibleOperationMatrix(t *testing.T
 	}
 }
 
-func TestVisibilityRetryRequestShapeIsLinuxItemOnly(t *testing.T) {
+func TestVisibilityRetryRequestShapeAdmitsExactNamespaceGate(t *testing.T) {
 	identity := make([]byte, 16)
 	identity[0] = 1
 	itemWire := &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{{
@@ -202,7 +202,22 @@ func TestVisibilityRetryRequestShapeIsLinuxItemOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !validVisibilityRetryRequestShape(itemRequest, decoded) {
-		t.Fatal("exact item-only retry proof was refused")
+		t.Fatal("exact item retry proof was refused")
+	}
+	namespaceRequest := proto.Clone(itemRequest).(*authoritypb.Request)
+	namespaceRequest.SourcePublicationGate = &authoritypb.SourcePublicationGate{
+		Targets: []*authoritypb.SourcePublicationTarget{{
+			Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+				ParentIdentity: identity, Name: []byte("child"),
+			}},
+		}},
+	}
+	namespaceGate, err := decodeSourcePublicationGate(namespaceRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validVisibilityRetryRequestShape(namespaceRequest, namespaceGate) {
+		t.Fatal("exact namespace retry proof was refused")
 	}
 
 	for name, mutate := range map[string]func(*authoritypb.Request){
@@ -210,17 +225,6 @@ func TestVisibilityRetryRequestShapeIsLinuxItemOnly(t *testing.T) {
 		"read-only request": func(request *authoritypb.Request) {
 			request.SourcePublicationGate = nil
 			request.Body = &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{}}
-		},
-		"namespace gate": func(request *authoritypb.Request) {
-			request.SourcePublicationGate = &authoritypb.SourcePublicationGate{
-				Targets: []*authoritypb.SourcePublicationTarget{
-					{
-						Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
-							ParentIdentity: identity, Name: []byte("child"),
-						}},
-					},
-				},
-			}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

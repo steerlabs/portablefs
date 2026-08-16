@@ -43,14 +43,16 @@ const (
 	// ECANCELED because macOS 26 may transparently re-enter a mutating callback
 	// after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
 	FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED FailureClass = 5
-	// VISIBILITY_ITEM_RETRY is a Linux item-only scheduling handoff, never an
+	// VISIBILITY_RETRY is a Linux scheduling handoff, never an
 	// application errno. The authority has definitely not applied the mutation
 	// and, for a staged write, has retained the inert bytes. The Linux frontend
-	// releases its local item gate, lets the older peer repair finish, and
+	// releases its local publication gate, lets the older peer repair finish, and
 	// resubmits with a fresh mutation identity inside the same FUSE callback.
-	// Namespace callbacks and callback-serialized frontends never receive this
-	// class because retaining their callback would preserve the repair cycle.
-	FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY FailureClass = 6
+	// A Linux namespace callback may retain this handoff because the strict
+	// kernel's notification path expires the cached binding without acquiring
+	// the parent lock held by that callback. Callback-serialized frontends never
+	// receive this class.
+	FailureClass_FAILURE_CLASS_VISIBILITY_RETRY FailureClass = 6
 )
 
 // Enum value maps for FailureClass.
@@ -62,7 +64,7 @@ var (
 		3: "FAILURE_CLASS_COHERENCE",
 		4: "FAILURE_CLASS_ROUTES",
 		5: "FAILURE_CLASS_VISIBILITY_INTERRUPTED",
-		6: "FAILURE_CLASS_VISIBILITY_ITEM_RETRY",
+		6: "FAILURE_CLASS_VISIBILITY_RETRY",
 	}
 	FailureClass_value = map[string]int32{
 		"FAILURE_CLASS_UNSPECIFIED":            0,
@@ -71,7 +73,7 @@ var (
 		"FAILURE_CLASS_COHERENCE":              3,
 		"FAILURE_CLASS_ROUTES":                 4,
 		"FAILURE_CLASS_VISIBILITY_INTERRUPTED": 5,
-		"FAILURE_CLASS_VISIBILITY_ITEM_RETRY":  6,
+		"FAILURE_CLASS_VISIBILITY_RETRY":       6,
 	}
 )
 
@@ -270,14 +272,10 @@ func (CoherenceProfile) EnumDescriptor() ([]byte, []int) {
 // authority cannot see a remote kernel and the two answers have different
 // provable properties.
 //
-// PARENT_EXCLUSIVE is Linux FUSE. fs/fuse/dir.c:1351 takes
-// down_write(&parent->i_rwsem) unconditionally - before the FUSE_EXPIRE_ONLY
-// test at dir.c:1367 - and fs/namei.c:4389 / :3895 / :4975 hold that same
-// semaphore for write across the whole server round trip of any directory
-// mutation. A mount with an unanswered directory mutation in that parent
-// therefore cannot repair a name in it, and if the authority is the party that
-// owes the answer, the wait is a closed cycle rather than a slow lock. See the
-// proof at VisibilityCoordinator.ReportBlocked.
+// PARENT_EXCLUSIVE is the retired stock-FUSE model. It is parseable so an old
+// client receives an explicit commitment refusal, but protocol 5 does not
+// admit it: breaking its parent-i_rwsem cycle required surfacing a synthetic
+// EINTR to ordinary applications.
 //
 // INDEPENDENT means repair never waits on a lock the mount's own unanswered
 // operation can hold. A frontend may only declare it if that is true of its
@@ -300,11 +298,17 @@ func (CoherenceProfile) EnumDescriptor() ([]byte, []int) {
 type NamespaceRepair int32
 
 const (
-	NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED                   NamespaceRepair = 0
+	NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED NamespaceRepair = 0
+	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 	NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE              NamespaceRepair = 1
 	NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT                   NamespaceRepair = 2
 	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED           NamespaceRepair = 3
 	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED NamespaceRepair = 4
+	// LOCKLESS_EXPIRATION is the patched Linux FUSE contract. Strict reverse
+	// namespace notifications expire a binding under dcache locks only; they do
+	// not acquire the parent inode's i_rwsem and therefore cannot deadlock with
+	// an unanswered local create/unlink/rename callback which holds that lock.
+	NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION NamespaceRepair = 5
 )
 
 // Enum value maps for NamespaceRepair.
@@ -315,6 +319,7 @@ var (
 		2: "NAMESPACE_REPAIR_INDEPENDENT",
 		3: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED",
 		4: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED",
+		5: "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION",
 	}
 	NamespaceRepair_value = map[string]int32{
 		"NAMESPACE_REPAIR_UNSPECIFIED":                   0,
@@ -322,6 +327,7 @@ var (
 		"NAMESPACE_REPAIR_INDEPENDENT":                   2,
 		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED":           3,
 		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED": 4,
+		"NAMESPACE_REPAIR_LOCKLESS_EXPIRATION":           5,
 	}
 )
 
@@ -632,8 +638,8 @@ type Request struct {
 	// operands and refuses any mismatch before XFS. It is part of the retained
 	// replay fingerprint: an exact replay carries the exact same local cut.
 	SourcePublicationGate *SourcePublicationGate `protobuf:"bytes,7,opt,name=source_publication_gate,json=sourcePublicationGate,proto3" json:"source_publication_gate,omitempty"`
-	// Present only when a Linux item-only mutation is resubmitted after an
-	// authority VISIBILITY_ITEM_RETRY. The value is the exact COMPLETE sequence
+	// Present only when a Linux mutation is resubmitted after an authority
+	// VISIBILITY_RETRY. The value is the exact COMPLETE sequence
 	// the frontend has repaired locally. The authority accepts it only while it
 	// retains the one-shot fairness debt issued to this frontend_operation_id;
 	// it therefore cannot be forged into a general barrier bypass. Keeping this
@@ -1716,7 +1722,7 @@ type Response struct {
 	// Present only on the final response that carries a volume-terminal exact
 	// outcome. The source returns it after its kernel publication boundary.
 	TerminalDeliveryToken []byte `protobuf:"bytes,9,opt,name=terminal_delivery_token,json=terminalDeliveryToken,proto3" json:"terminal_delivery_token,omitempty"` // exactly 16 nonzero bytes
-	// Present exactly with VISIBILITY_ITEM_RETRY. It names the already-delivered
+	// Present exactly with VISIBILITY_RETRY. It names the already-delivered
 	// peer phase whose local repair must finish before the Linux frontend may
 	// resubmit. This cross-lane identity prevents transport-speed retry loops.
 	VisibilityRetrySequence uint64 `protobuf:"varint,43,opt,name=visibility_retry_sequence,json=visibilityRetrySequence,proto3" json:"visibility_retry_sequence,omitempty"`
@@ -4365,30 +4371,13 @@ func (x *NextVisibilityRequest) GetOrderedAdmissionContended() bool {
 type AckVisibilityRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Cursor *VisibilityCursor      `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	// blocked is a frontend saying it cannot yet service this phase because an
-	// exact namespace repair needs a parent lock its own unanswered request to
-	// this authority holds. For an ordinary parent-exclusive COMPLETE, the
-	// authority installs a cursor+parent-scoped pre-apply interruption. The
-	// frontend drains the refused request, performs repair, and acknowledges the
-	// same phase without losing the mount. A routes change remains terminal.
+	// Retired protocol-5 development fields. They remain parseable so an old
+	// client receives a deterministic refusal, but no admitted profile sends
+	// them. Lockless Linux namespace expiration removed the parent-lock cycle.
 	//
-	// Only the frontend can evaluate this. It needs BOTH that the mount has an
-	// unanswered namespace mutation in the affected parent - which the authority
-	// also knows - and that the mount actually holds a cached binding this phase
-	// names, which the authority does not: its audience comes from a monotone
-	// filter with no false negatives and therefore many false positives. A mount
-	// that has nothing cached to repair must acknowledge normally.
-	//
-	// The authority maps every reported inode through this exact pending event
-	// and enforces the interruption when the corresponding ordinary request is
-	// present or later arrives. This report never acknowledges the phase, so it
-	// cannot be used to skip repair; the ordinary phase deadline remains the
-	// fail-closed bound if the lock does not drain.
+	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 	Blocked bool `protobuf:"varint,2,opt,name=blocked,proto3" json:"blocked,omitempty"`
-	// Exact parent coordination inodes whose cached bindings require reverse
-	// invalidation. The authority maps each one back to this pending event's
-	// stable parent identity before installing an interruption. Required for an
-	// ordinary namespace blocked report; empty for a terminal routes report.
+	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 	BlockedParentKernelInos []uint64 `protobuf:"varint,3,rep,packed,name=blocked_parent_kernel_inos,json=blockedParentKernelInos,proto3" json:"blocked_parent_kernel_inos,omitempty"`
 	// Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
 	// pipelined frontend sets it when peer repair refused at least one eligible
@@ -4436,6 +4425,7 @@ func (x *AckVisibilityRequest) GetCursor() *VisibilityCursor {
 	return nil
 }
 
+// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 func (x *AckVisibilityRequest) GetBlocked() bool {
 	if x != nil {
 		return x.Blocked
@@ -4443,6 +4433,7 @@ func (x *AckVisibilityRequest) GetBlocked() bool {
 	return false
 }
 
+// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 func (x *AckVisibilityRequest) GetBlockedParentKernelInos() []uint64 {
 	if x != nil {
 		return x.BlockedParentKernelInos
@@ -7955,11 +7946,11 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x15NextVisibilityRequest\x12?\n" +
 	"\x05after\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x05after\x12+\n" +
 	"\x11acknowledge_after\x18\x02 \x01(\bR\x10acknowledgeAfter\x12>\n" +
-	"\x1bordered_admission_contended\x18\x03 \x01(\bR\x19orderedAdmissionContended\"\xf0\x01\n" +
+	"\x1bordered_admission_contended\x18\x03 \x01(\bR\x19orderedAdmissionContended\"\xf8\x01\n" +
 	"\x14AckVisibilityRequest\x12A\n" +
-	"\x06cursor\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x06cursor\x12\x18\n" +
-	"\ablocked\x18\x02 \x01(\bR\ablocked\x12;\n" +
-	"\x1ablocked_parent_kernel_inos\x18\x03 \x03(\x04R\x17blockedParentKernelInos\x12>\n" +
+	"\x06cursor\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x06cursor\x12\x1c\n" +
+	"\ablocked\x18\x02 \x01(\bB\x02\x18\x01R\ablocked\x12?\n" +
+	"\x1ablocked_parent_kernel_inos\x18\x03 \x03(\x04B\x02\x18\x01R\x17blockedParentKernelInos\x12>\n" +
 	"\x1bordered_admission_contended\x18\x04 \x01(\bR\x19orderedAdmissionContended\";\n" +
 	"\rLookupRequest\x12\x16\n" +
 	"\x06parent\x18\x01 \x01(\fR\x06parent\x12\x12\n" +
@@ -8209,15 +8200,15 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x0eSetLockRequest\x125\n" +
 	"\x04lock\x18\x01 \x01(\v2!.portablefs.authority.v1.LockSpecR\x04lock\x12\x12\n" +
 	"\x04wait\x18\x02 \x01(\bR\x04wait\x12\x16\n" +
-	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xee\x01\n" +
+	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xe9\x01\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15FAILURE_CLASS_STORAGE\x10\x01\x12\x1a\n" +
 	"\x16FAILURE_CLASS_INTERNAL\x10\x02\x12\x1b\n" +
 	"\x17FAILURE_CLASS_COHERENCE\x10\x03\x12\x18\n" +
 	"\x14FAILURE_CLASS_ROUTES\x10\x04\x12(\n" +
-	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05\x12'\n" +
-	"#FAILURE_CLASS_VISIBILITY_ITEM_RETRY\x10\x06*d\n" +
+	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05\x12\"\n" +
+	"\x1eFAILURE_CLASS_VISIBILITY_RETRY\x10\x06*d\n" +
 	"\rTransportRole\x12\x1e\n" +
 	"\x1aTRANSPORT_ROLE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13TRANSPORT_ROLE_DATA\x10\x01\x12\x1a\n" +
@@ -8230,13 +8221,14 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x16SESSION_STATE_TERMINAL\x10\x04*o\n" +
 	"\x10CoherenceProfile\x12!\n" +
 	"\x1dCOHERENCE_PROFILE_UNSPECIFIED\x10\x00\x12\x1c\n" +
-	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\x1aCOHERENCE_PROFILE_UNCACHED*\xda\x01\n" +
+	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\x1aCOHERENCE_PROFILE_UNCACHED*\x88\x02\n" +
 	"\x0fNamespaceRepair\x12 \n" +
-	"\x1cNAMESPACE_REPAIR_UNSPECIFIED\x10\x00\x12%\n" +
-	"!NAMESPACE_REPAIR_PARENT_EXCLUSIVE\x10\x01\x12 \n" +
+	"\x1cNAMESPACE_REPAIR_UNSPECIFIED\x10\x00\x12)\n" +
+	"!NAMESPACE_REPAIR_PARENT_EXCLUSIVE\x10\x01\x1a\x02\b\x01\x12 \n" +
 	"\x1cNAMESPACE_REPAIR_INDEPENDENT\x10\x02\x12(\n" +
 	"$NAMESPACE_REPAIR_CALLBACK_SERIALIZED\x10\x03\x122\n" +
-	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04*p\n" +
+	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04\x12(\n" +
+	"$NAMESPACE_REPAIR_LOCKLESS_EXPIRATION\x10\x05*p\n" +
 	"\x0fVisibilityPhase\x12 \n" +
 	"\x1cVISIBILITY_PHASE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18VISIBILITY_PHASE_PREPARE\x10\x01\x12\x1d\n" +

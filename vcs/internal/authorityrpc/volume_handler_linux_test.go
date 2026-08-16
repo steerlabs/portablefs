@@ -269,8 +269,8 @@ func TestWireErrnoPreservesLinuxSyscall(t *testing.T) {
 	if got := wireErrno(volumeserver.ErrVisibilityInterrupted); got != errnos.EINTR {
 		t.Fatalf("wireErrno(visibility interruption) = %d, want EINTR", got)
 	}
-	if got := wireErrno(volumeserver.ErrVisibilityItemRetry); got != errnos.EINTR {
-		t.Fatalf("wireErrno(item visibility retry) = %d, want EINTR", got)
+	if got := wireErrno(volumeserver.ErrVisibilityRetry); got != errnos.EINTR {
+		t.Fatalf("wireErrno(visibility retry) = %d, want EINTR", got)
 	}
 	// Delegated killpriv and logical sync can both fail after one clean
 	// mutation. The authority retains both causes, but the syscall-visible
@@ -307,29 +307,29 @@ func TestVisibilityInterruptedMapsToDefiniteEINTR(t *testing.T) {
 	}
 }
 
-func TestVisibilityItemRetryMapsToInternalDefiniteEINTR(t *testing.T) {
+func TestVisibilityRetryMapsToInternalDefiniteEINTR(t *testing.T) {
 	h := &VolumeHandler{}
-	response := h.errorResponse(7, &volumeserver.VisibilityItemRetryError{Sequence: 9}, false)
+	response := h.errorResponse(7, &volumeserver.VisibilityRetryError{Sequence: 9}, false)
 	if response.GetErrno() != errnos.EINTR {
-		t.Fatalf("item visibility retry errno = %d, want EINTR", response.GetErrno())
+		t.Fatalf("visibility retry errno = %d, want EINTR", response.GetErrno())
 	}
 	if response.GetUncertain() || response.GetBody() != nil {
-		t.Fatalf("item visibility retry carried an uncertain or state-bearing result: %+v", response)
+		t.Fatalf("visibility retry carried an uncertain or state-bearing result: %+v", response)
 	}
-	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY {
-		t.Fatalf("item visibility retry failure class = %v, want VISIBILITY_ITEM_RETRY", response.GetFailure())
+	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
+		t.Fatalf("visibility retry failure class = %v, want VISIBILITY_RETRY", response.GetFailure())
 	}
 	if response.GetVisibilityRetrySequence() != 9 {
-		t.Fatalf("item visibility retry sequence = %d, want 9", response.GetVisibilityRetrySequence())
+		t.Fatalf("visibility retry sequence = %d, want 9", response.GetVisibilityRetrySequence())
 	}
 }
 
-func TestVisibilityItemRetryWithoutSequenceFailsClosed(t *testing.T) {
+func TestVisibilityRetryWithoutSequenceFailsClosed(t *testing.T) {
 	h := &VolumeHandler{}
-	response := h.errorResponse(7, volumeserver.ErrVisibilityItemRetry, false)
+	response := h.errorResponse(7, volumeserver.ErrVisibilityRetry, false)
 	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
 		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || response.GetVisibilityRetrySequence() != 0 {
-		t.Fatalf("unsequenced item visibility retry = %+v, want uncertain internal EIO", response)
+		t.Fatalf("unsequenced visibility retry = %+v, want uncertain internal EIO", response)
 	}
 }
 
@@ -2003,35 +2003,6 @@ func TestCapabilitiesResolveOnlyInsideTheirSession(t *testing.T) {
 	}
 }
 
-func TestHeldDirectoriesRejectsUnresolvedRenameParent(t *testing.T) {
-	h := testVolumeHandler()
-	session := volumeserver.SessionID{1}
-	root := xfsstore.Capability{0xAA}
-	if err := h.startSessionResources(session, root, 2, [32]byte{}); err != nil {
-		t.Fatal(err)
-	}
-	untracked := xfsstore.Capability{0xBB}
-
-	for _, test := range []struct {
-		name string
-		old  []byte
-		want error
-	}{
-		{name: "malformed", old: []byte{1}, want: syscall.EINVAL},
-		{name: "untracked", old: untracked[:], want: xfsstore.ErrStaleObject},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
-				OldParent: test.old,
-				NewParent: root[:],
-			}}}
-			if _, err := h.heldDirectories(session, request); !errors.Is(err, test.want) {
-				t.Fatalf("heldDirectories = %v, want %v", err, test.want)
-			}
-		})
-	}
-}
-
 // Defect 11: a cancellation acknowledgment went through the lease-renewing
 // path, so a peer could keep a session alive indefinitely using only cancels.
 func TestCancelAcknowledgmentDoesNotRenewTheLease(t *testing.T) {
@@ -2281,7 +2252,7 @@ func protocol5AttachRequest(id uint64) *authoritypb.Request {
 		RoutesRevision: emptyRoutesRevision(), AttachAttemptId: testAttachAttempt(id),
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 64, RepairBudgetMillis: 1000,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 	}
 	return &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{Attach: attach}}
 }
@@ -2983,7 +2954,7 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 		VolumeId: "volume-e2e", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 64, RepairBudgetMillis: 1000,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 	})
 	var sessionID volumeserver.SessionID
 	copy(sessionID[:], proof.GetId())
@@ -2992,76 +2963,6 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	rootIdentity, err := store.Identity(rootCapability)
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	mkdir := func(requestID, sequence uint64, name string) *authoritypb.Item {
-		t.Helper()
-		request := &authoritypb.Request{RequestId: requestID, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{
-			Parent: activated.GetRoot().GetToken(), Name: []byte(name), Mode: 0o700,
-		}}}
-		stampNamespacePublication(request, requestID, rootIdentity, []byte(name))
-		stampMutation(t, request, 1, sequence)
-		response := h.Handle(ctx, request)
-		if response.GetErrno() != 0 || response.GetLookup().GetItem() == nil {
-			t.Fatalf("mkdir %q = %v", name, response)
-		}
-		t.Cleanup(func() {
-			if err := os.Remove(filepath.Join(root, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("remove test directory %q: %v", name, err)
-			}
-		})
-		return response.GetLookup().GetItem()
-	}
-	oldParent := mkdir(100, 1, "handler-e2e-old-parent")
-	newParent := mkdir(101, 2, "handler-e2e-new-parent")
-	var oldCapability, newCapability xfsstore.Capability
-	copy(oldCapability[:], oldParent.GetToken())
-	copy(newCapability[:], newParent.GetToken())
-	oldIdentity, err := store.Identity(oldCapability)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newIdentity, err := store.Identity(newCapability)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, test := range []struct {
-		name      string
-		oldParent []byte
-		newParent []byte
-		want      [][16]byte
-	}{
-		{name: "old parent overlap", oldParent: oldParent.GetToken(), newParent: newParent.GetToken(), want: [][16]byte{oldIdentity, newIdentity}},
-		{name: "new parent overlap", oldParent: newParent.GetToken(), newParent: oldParent.GetToken(), want: [][16]byte{newIdentity, oldIdentity}},
-		{name: "same parent", oldParent: oldParent.GetToken(), newParent: oldParent.GetToken(), want: [][16]byte{oldIdentity, oldIdentity}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
-				OldParent: test.oldParent,
-				NewParent: test.newParent,
-			}}}
-			got, err := h.heldDirectories(sessionID, request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(got) != len(test.want) {
-				t.Fatalf("held directories = %x, want %x", got, test.want)
-			}
-			for i := range test.want {
-				if got[i] != test.want[i] {
-					t.Fatalf("held directory %d = %x, want %x", i, got[i], test.want[i])
-				}
-			}
-		})
-	}
-
-	unknown := xfsstore.Capability{0xFE}
-	unresolvedRename := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
-		OldParent: oldParent.GetToken(), NewParent: unknown[:],
-	}}}
-	if _, err := h.heldDirectories(sessionID, unresolvedRename); !errors.Is(err, xfsstore.ErrStaleObject) {
-		t.Fatalf("unresolved new rename parent = %v, want stale-object refusal", err)
 	}
 
 	create := &authoritypb.Request{RequestId: 2, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: activated.GetRoot().GetToken(), Name: []byte("handler-e2e"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
@@ -3154,7 +3055,7 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 			VolumeId: "volume-lockwait", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
 			CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 			CachedNameCapacity: 64, RepairBudgetMillis: 1000,
-			NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+			NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		})
 	}
 	holder, epoch, holderProof := attachSession(1)

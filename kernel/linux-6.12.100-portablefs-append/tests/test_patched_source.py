@@ -194,16 +194,37 @@ class PatchedSourceTests(unittest.TestCase):
         )
 
         directory = self.source("fs/fuse/dir.c")
-        start = directory.index("int fuse_reverse_inval_entry")
-        end = directory.index("static inline bool fuse_permissible_uidgid", start)
+        start = directory.index("static int fuse_pfs_reverse_expire_entry")
+        end = directory.index("int fuse_reverse_inval_entry", start)
         repair = directory[start:end]
         lookup = repair.index("entry = d_lookup")
         child_class = repair.index("FUSE_PFS_CLASS_SHARED", lookup)
-        child_identity = repair.index("get_node_id(d_inode(entry))", lookup)
+        child_identity = repair.index("get_node_id(child)", lookup)
         first_mutation = repair.index("fuse_dir_changed(parent)", lookup)
         self.assertLess(child_class, first_mutation)
         self.assertLess(child_identity, first_mutation)
         self.assertIn("err = -EPROTO", repair[lookup:first_mutation])
+        self.assertIn("fuse_invalidate_entry_cache(entry)", repair)
+        self.assertIn("fsnotify_name", repair)
+        for forbidden in (
+            "inode_lock",
+            "d_invalidate",
+            "d_delete",
+            "clear_nlink",
+            "dont_mount",
+        ):
+            self.assertNotIn(forbidden, repair)
+
+        stock_start = directory.index("int fuse_reverse_inval_entry", end)
+        stock_end = directory.index(
+            "static inline bool fuse_permissible_uidgid", stock_start
+        )
+        stock = directory[stock_start:stock_end]
+        self.assertLess(
+            stock.index("if (fc->pfs_strict_coherence)"),
+            stock.index("inode_lock_nested(parent"),
+        )
+        self.assertIn("fuse_pfs_reverse_expire_entry", stock)
 
     def test_strict_init_forbids_posix_acl_cache_without_publication(self) -> None:
         text = self.source("fs/fuse/inode.c")

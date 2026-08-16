@@ -367,9 +367,6 @@ func (r *rawFileSystem) writeTransactionCommit(input *fuse.PFSWriteIn, out *fuse
 	request := writeTransactionAuthorityRequest(tx, input, nil)
 	request.SourcePublicationGate = gate
 	response, callErr := r.writeTransactionCall(ctx, request, true)
-	if errors.Is(callErr, errSourcePublicationInterrupted) {
-		return r.rejectLocallyInterruptedWriteCommit(ctx, input, tx, out)
-	}
 	if callErr != nil || response == nil || response.GetUncertain() || responseErrno(response) != 0 {
 		responseNil, uncertain, errno, failure := response == nil, false, syscall.Errno(0), authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED
 		if response != nil {
@@ -458,44 +455,5 @@ func (r *rawFileSystem) writeTransactionCommit(input *fuse.PFSWriteIn, out *fuse
 		return fuse.Status(syscall.ENOTCONN)
 	}
 	fillWriteTransactionOut(out, input.Txid, reply)
-	return fuse.OK
-}
-
-// rejectLocallyInterruptedWriteCommit closes the inert authority staging left
-// behind when a peer PREPARE wins the frontend's source-publication cut before
-// COMMIT assignment. Returning a raw FUSE EINTR here is not valid: the strict
-// kernel quite correctly treats an unclassified COMMIT transport error as an
-// ambiguous outcome and aborts the mount. An acknowledged ABORT is the exact
-// no-change proof which lets us return the protocol's structured
-// REJECTED/EINTR result. Linux can then release this callback lane and retry
-// the original write after the winning peer repair, with no leaked staging and
-// no application-visible false EIO.
-func (r *rawFileSystem) rejectLocallyInterruptedWriteCommit(ctx context.Context, input *fuse.PFSWriteIn, tx *writeTransaction, out *fuse.PFSWriteOut) fuse.Status {
-	abortInput := *input
-	abortInput.Phase = fuse.PFS_WRITE_ABORT
-	abortInput.FragmentOffset = 0
-	abortInput.Size = 0
-	response, abortErr := r.writeTransactionCall(ctx, writeTransactionAuthorityRequest(tx, &abortInput, nil), false)
-	if abortErr != nil || response == nil || responseErrno(response) != 0 ||
-		!validWriteTransactionReply(response.GetWriteTransaction(), tx.authorityTxid, fuse.PFS_WRITE_OUT_ABORTED) {
-		r.mount.revoke(fmt.Errorf("fusev3: locally interrupted write COMMIT could not retire inert authority staging: call=%v response_nil=%t errno=%d",
-			abortErr, response == nil, responseErrno(response)))
-		return fuse.Status(syscall.ENOTCONN)
-	}
-	publication := replyPublicationFromContext(ctx)
-	if publication == nil || publication.source != nil {
-		r.mount.revoke(errors.New("fusev3: locally interrupted write COMMIT acquired unexpected publication state"))
-		return fuse.Status(syscall.ENOTCONN)
-	}
-	r.writeMu.Lock()
-	if r.writeTx[input.Txid] != tx || tx.commitResolved || tx.lease != nil {
-		r.writeMu.Unlock()
-		r.mount.revoke(errors.New("fusev3: locally interrupted write COMMIT lost transaction ownership"))
-		return fuse.Status(syscall.ENOTCONN)
-	}
-	tx.commitResolved = true
-	publication.writeKernelTx = input.Txid
-	r.writeMu.Unlock()
-	*out = fuse.PFSWriteOut{Txid: input.Txid, Flags: fuse.PFS_WRITE_OUT_REJECTED, Error: -int32(syscall.EINTR)}
 	return fuse.OK
 }

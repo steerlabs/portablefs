@@ -1351,7 +1351,7 @@ func retainedV3ResponseTerminalCause(response *authoritypb.Response, callErr err
 	if response.GetUncertain() ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
-		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY ||
+		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
 		response.GetVisibilityRetrySequence() != 0 ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		return errors.New("portablefsd: authority returned a terminal retained outcome")
@@ -1582,8 +1582,8 @@ func (d *v3DataPlane) classify(response *authoritypb.Response, callErr error, mu
 		_ = d.fail(errors.New("portablefsd: authority returned a terminal or malformed outcome"))
 		return nil, darwinEIO
 	}
-	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY || response.GetVisibilityRetrySequence() != 0 {
-		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only item visibility retry to a callback-serialized frontend"))
+	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY || response.GetVisibilityRetrySequence() != 0 {
+		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only visibility retry to a callback-serialized frontend"))
 		return nil, darwinEIO
 	}
 	if response.GetErrno() != 0 {

@@ -231,7 +231,7 @@ func TestPFSWriteConsumesItemRetryInternallyAndReusesOneStagedTransaction(t *tes
 		if commitCalls == 1 {
 			close(firstRetry)
 			return &authoritypb.Response{
-				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
 				VisibilityRetrySequence: 17,
 			}, nil
 		}

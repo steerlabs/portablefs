@@ -1446,7 +1446,7 @@ func TestLinuxFrontendRejectsItemRetryOutsideItemMutation(t *testing.T) {
 				return nil, errors.New("unexpected request in ungated item-retry test")
 			}
 			return &authoritypb.Response{
-				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
 				VisibilityRetrySequence: 1,
 			}, nil
 		}
@@ -1465,7 +1465,7 @@ func TestLinuxFrontendRejectsItemRetryOutsideItemMutation(t *testing.T) {
 				return nil, errors.New("unexpected request in read item-retry test")
 			}
 			return &authoritypb.Response{
-				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
 				VisibilityRetrySequence: 1,
 			}, nil
 		}

@@ -834,7 +834,7 @@ func TestWriteTransactionCommitAppliesStagedPrefixOnceAndReplaysRetainedResult(t
 	}
 }
 
-func TestWriteTransactionVisibilityItemRetryReusesStagedBytesAndPreservesFIFO(t *testing.T) {
+func TestWriteTransactionVisibilityRetryReusesStagedBytesAndPreservesFIFO(t *testing.T) {
 	h, credential, store := newWriteTransactionHarness(t, nil)
 	beginAndStageWriteTransaction(t, h, credential, []byte("abc"))
 	target := store.targets[0]
@@ -851,7 +851,7 @@ func TestWriteTransactionVisibilityItemRetryReusesStagedBytesAndPreservesFIFO(t 
 	t.Cleanup(func() { close(terminal) })
 	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
 		CachedNameCapacity: 1024, RepairBudget: 5 * time.Second,
-		NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+		NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -887,7 +887,7 @@ func TestWriteTransactionVisibilityItemRetryReusesStagedBytesAndPreservesFIFO(t 
 	first.FrontendOperationId = 77
 	response := h.commitWriteTransaction(ctx, first, credential, first.GetWriteTransaction())
 	if response.GetErrno() != int32(syscall.EINTR) || response.GetUncertain() || response.GetWriteTransaction() != nil ||
-		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY {
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
 		t.Fatalf("first COMMIT item retry = %+v", response)
 	}
 	if response.GetVisibilityRetrySequence() != complete.Cursor.Sequence {

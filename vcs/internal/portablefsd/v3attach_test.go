@@ -236,8 +236,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		features := []string{
 			"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1",
 			"authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1",
-			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-			"sequenced-item-visibility-retry-v1",
+			"strict-two-phase-visibility", "classified-visibility-interruption",
+			"sequenced-visibility-retry-v1",
+			"lockless-namespace-repair-v1",
 			"source-publication-gate-v1", "namespace-post-binding-identity", "exact-resource-acquisition",
 			"transactional-shared-write-v1", "strict-linux-mutation-suite-v1", "terminal-applied-delivery-receipt-v1",
 		}
@@ -263,8 +264,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			"write-through", "no-history", "no-branches", "direct-io-no-file-mmap",
 			"user-xattr-readonly", "single-principal", "distributed-posix-locks",
 			"stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier",
-			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-			"sequenced-item-visibility-retry-v1",
+			"strict-two-phase-visibility", "classified-visibility-interruption",
+			"sequenced-visibility-retry-v1",
+			"lockless-namespace-repair-v1",
 			"source-publication-gate-v1", "namespace-post-binding-identity", "exact-resource-acquisition",
 			"transactional-shared-write-v1",
 		}

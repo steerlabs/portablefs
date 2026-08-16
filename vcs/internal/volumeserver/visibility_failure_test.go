@@ -980,7 +980,7 @@ func TestVisibilityProjectedPrepareDoesNotCoverRacedOmittedTarget(t *testing.T) 
 func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
 	parent := testVisibilityParent()
 	var file [16]byte
 	file[0] = 2
@@ -1028,7 +1028,7 @@ func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.
 func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
 	gate := testSourcePublicationGate("existing")
 	var returnedIdentity [16]byte
 	returnedIdentity[0] = 0xA1
@@ -2067,7 +2067,7 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
 	ownerPreparing := make(chan struct{})
 	releaseOwner := make(chan struct{})
 	owner := make(chan error, 1)
@@ -2130,7 +2130,7 @@ func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T)
 func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
 	var identity [16]byte
 	identity[0] = 31
 	h.coordinator.RecordResolvedInode(source, identity)
@@ -2175,8 +2175,8 @@ func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *tes
 	}
 	select {
 	case err := <-sourceResult:
-		if !errors.Is(err, ErrVisibilityItemRetry) {
-			t.Fatalf("queued item source = %v, want ErrVisibilityItemRetry", err)
+		if !errors.Is(err, ErrVisibilityRetry) {
+			t.Fatalf("queued item source = %v, want ErrVisibilityRetry", err)
 		}
 	case <-ctx.Done():
 		t.Fatal("queued item source did not wake for overlapping PREPARE")
@@ -2242,14 +2242,14 @@ func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *tes
 func TestVisibilityLinuxItemRetryProofIsExactAndMandatory(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
 	var identity [16]byte
 	identity[0] = 32
 	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: identity, Attributes: true}}}
 	h.coordinator.mu.Lock()
 	h.coordinator.fairness[source] = mutationFairnessDebt{
 		sequence: 41, ordinal: h.coordinator.order.reserveOrdinal(), operationID: 77,
-		claimSameOperation: true, observed: true,
+		claimSameOperation: true, gate: cloneSourcePublicationGate(gate), observed: true,
 	}
 	h.coordinator.mu.Unlock()
 
@@ -2265,6 +2265,18 @@ func TestVisibilityLinuxItemRetryProofIsExactAndMandatory(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("wrong gate", func(t *testing.T) {
+		otherIdentity := identity
+		otherIdentity[1] = 1
+		otherGate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: otherIdentity, Attributes: true}}}
+		_, err := h.coordinator.acquireMutationOrder(t.Context(), source, MutationID{
+			Sequence: 2, FrontendOperationID: 77, VisibilityRetryAfterSequence: 41,
+		}, nil, &otherGate)
+		if !errors.Is(err, ErrSourcePublicationGate) {
+			t.Fatalf("changed-gate retry proof error = %v, want ErrSourcePublicationGate", err)
+		}
+	})
 }
 
 // A create/rename lease cannot know the identity a prior queued mutation is
@@ -2275,7 +2287,7 @@ func TestVisibilityLinuxItemRetryProofIsExactAndMandatory(t *testing.T) {
 func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
 	var newlyBound [16]byte
 	newlyBound[0] = 41
 	h.coordinator.RecordResolvedInode(source, newlyBound)
@@ -2301,7 +2313,7 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 	var prepared atomic.Bool
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2}, gate,
+		result <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2, FrontendOperationID: 77}, gate,
 			func() (SourcePublicationGate, error) { return gate, nil },
 			func() ([]VisibilityTarget, error) {
 				prepared.Store(true)
@@ -2320,8 +2332,8 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 	}
 	select {
 	case err := <-result:
-		if !errors.Is(err, ErrVisibilityInterrupted) {
-			t.Fatalf("queued unresolved namespace source = %v, want ErrVisibilityInterrupted", err)
+		if !errors.Is(err, ErrVisibilityRetry) {
+			t.Fatalf("queued unresolved namespace source = %v, want ErrVisibilityRetry", err)
 		}
 	case <-ctx.Done():
 		t.Fatal("unresolved namespace source did not wake for item PREPARE")
@@ -2332,6 +2344,87 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 	runBarrierFrom(t, h.coordinator, source, prepare)
 	if err := <-owner; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestVisibilityLocklessNamespaceRetryKeepsItsFIFOPositionThroughCompleteAck(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	source := SessionID{1}
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.resolve(t, source, "same-name")
+	targets := testVisibilityTargets("same-name")
+	gate := testSourcePublicationGate("same-name")
+
+	peer := make(chan error, 1)
+	go func() {
+		peer <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			func() ([]VisibilityTarget, error) { return targets, nil },
+			func() ([]VisibilityTarget, bool) { return targets, true })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = h.coordinator.ExecuteWithSourceGateSequence(ctx, source, MutationID{
+		Sequence: 2, FrontendOperationID: 88,
+	}, gate, func() (SourcePublicationGate, error) { return gate, nil },
+		func() ([]VisibilityTarget, error) {
+			t.Fatal("namespace retry reached prepare before its peer repair")
+			return nil, nil
+		}, func(uint64) ([]VisibilityTarget, bool) {
+			t.Fatal("namespace retry reached apply before its peer repair")
+			return nil, false
+		}, func() ([]VisibilityResolution, error) { return nil, nil })
+	retrySequence, ok := VisibilityRetrySequence(err)
+	if !ok || retrySequence != prepare.Cursor.Sequence {
+		t.Fatalf("namespace first attempt = %v sequence=%d, want retry for %d", err, retrySequence, prepare.Cursor.Sequence)
+	}
+
+	if err := h.coordinator.Ack(source, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := h.coordinator.Next(ctx, source, prepare.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prepared, applied atomic.Bool
+	retried := make(chan error, 1)
+	go func() {
+		_, executeErr := h.coordinator.ExecuteWithSourceGateSequence(ctx, source, MutationID{
+			Sequence: 3, FrontendOperationID: 88, VisibilityRetryAfterSequence: complete.Cursor.Sequence,
+		}, gate, func() (SourcePublicationGate, error) { return gate, nil },
+			func() ([]VisibilityTarget, error) {
+				prepared.Store(true)
+				return targets, nil
+			}, func(uint64) ([]VisibilityTarget, bool) {
+				applied.Store(true)
+				return targets, true
+			}, func() ([]VisibilityResolution, error) { return nil, nil })
+		retried <- executeErr
+	}()
+	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	select {
+	case err := <-retried:
+		t.Fatalf("proved namespace retry escaped before COMPLETE Ack: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if prepared.Load() || applied.Load() {
+		t.Fatal("proved namespace retry reached filesystem work before COMPLETE Ack")
+	}
+	if err := h.coordinator.Ack(source, complete.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-peer; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-retried; err != nil {
+		t.Fatal(err)
+	}
+	if !prepared.Load() || !applied.Load() {
+		t.Fatalf("namespace retry prepare=%t apply=%t, want both after Ack", prepared.Load(), applied.Load())
 	}
 }
 

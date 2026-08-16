@@ -11,24 +11,24 @@ import (
 	"time"
 )
 
-// VisibilityItemRetryError identifies the exact peer phase a Linux item-only
-// mutation must wait behind. Sequence is mandatory: DATA and CONTROL are
+// VisibilityRetryError identifies the exact peer phase a Linux mutation must
+// wait behind. Sequence is mandatory: DATA and CONTROL are
 // independent transport lanes, so the frontend cannot infer which repair made
 // this definite-preapply handoff necessary from arrival order.
-type VisibilityItemRetryError struct {
+type VisibilityRetryError struct {
 	Sequence uint64
 }
 
-func (e *VisibilityItemRetryError) Error() string {
-	return fmt.Sprintf("%v (visibility sequence %d)", ErrVisibilityItemRetry, e.Sequence)
+func (e *VisibilityRetryError) Error() string {
+	return fmt.Sprintf("%v (visibility sequence %d)", ErrVisibilityRetry, e.Sequence)
 }
 
-func (e *VisibilityItemRetryError) Is(target error) bool {
-	return target == ErrVisibilityItemRetry
+func (e *VisibilityRetryError) Is(target error) bool {
+	return target == ErrVisibilityRetry
 }
 
-func VisibilityItemRetrySequence(err error) (uint64, bool) {
-	var retry *VisibilityItemRetryError
+func VisibilityRetrySequence(err error) (uint64, bool) {
+	var retry *VisibilityRetryError
 	if !errors.As(err, &retry) || retry.Sequence == 0 {
 		return 0, false
 	}
@@ -56,13 +56,13 @@ var (
 	// callback. Parent-exclusive repair is scoped to an overlapping held parent.
 	// The caller may retry after the phase; no filesystem mutation was executed.
 	ErrVisibilityInterrupted = errors.New("volumeserver: visible mutation interrupted by this participant's pending cache repair")
-	// ErrVisibilityItemRetry is the item-only form of the same pre-apply
-	// dependency for a Linux parent-exclusive participant. The authority must
-	// release the request's FIFO turn, but the frontend can release its inode
-	// source gate and retry inside the same FUSE callback; no kernel namespace
-	// lock or callback-capacity dependency requires surfacing an application
-	// EINTR. Staged write bytes remain inert and reusable across this handoff.
-	ErrVisibilityItemRetry = errors.New("volumeserver: item mutation must retry after this participant's pending cache repair")
+	// ErrVisibilityRetry is an internal, definite-preapply dependency for the
+	// lockless Linux frontend. The authority releases the request's FIFO turn;
+	// the frontend releases its source gate, completes the named peer repair,
+	// and retries inside the same FUSE callback. Namespace repair does not need
+	// the callback's parent i_rwsem, so no application-visible EINTR is needed.
+	// Staged write bytes remain inert and reusable across this handoff.
+	ErrVisibilityRetry = errors.New("volumeserver: mutation must retry after this participant's pending cache repair")
 	// ErrSourcePublicationGate means a strict initiating frontend did not prove
 	// the exact local publication cut required before mutation dispatch. It is a
 	// participant protocol violation, not an authority-epoch defect.
@@ -99,12 +99,10 @@ const (
 	// NamespaceRepairUnspecified is refused. A strict mount that does not say
 	// how it repairs has not agreed to the contract the barrier is built on.
 	NamespaceRepairUnspecified NamespaceRepair = iota
-	// NamespaceRepairParentExclusive is Linux FUSE: making a binding unservable
-	// requires the parent directory's i_rwsem for write, and the mount's own
-	// in-flight directory syscall in that parent holds it for the whole
-	// authority round trip. An exact ReportBlocked handshake installs a scoped
-	// pre-apply interruption for an overlapping request while the frontend's
-	// local gate refuses later arrivals.
+	// NamespaceRepairParentExclusive is the retired stock-FUSE model. Protocol
+	// 5 no longer admits it because its cycle break exposed synthetic EINTR to
+	// ordinary applications. The value remains parseable only so an old client
+	// receives an explicit commitment refusal instead of being misclassified.
 	NamespaceRepairParentExclusive
 	// NamespaceRepairIndependent means repair never waits on a lock this
 	// mount's own unanswered operation can hold.
@@ -119,6 +117,11 @@ const (
 	// nonzero callback identity exists only to preserve fair retry order after
 	// that phase completes.
 	NamespaceRepairCallbackSerializedPipelined
+	// NamespaceRepairLocklessExpiration is the patched Linux contract. A strict
+	// reverse namespace notification expires one binding under dcache locks and
+	// never acquires the parent inode's i_rwsem, so repair can run while an
+	// unanswered local namespace callback holds that semaphore.
+	NamespaceRepairLocklessExpiration
 )
 
 // PriorEpochDisposition is supplied by the durable control plane when a new
@@ -349,6 +352,16 @@ func sameSourcePublicationShape(left, right SourcePublicationGate) bool {
 	return true
 }
 
+func cloneSourcePublicationGate(gate SourcePublicationGate) SourcePublicationGate {
+	cloned := SourcePublicationGate{Targets: make([]SourcePublicationTarget, len(gate.Targets))}
+	for index, target := range gate.Targets {
+		target.Name = bytes.Clone(target.Name)
+		target.BoundIdentities = append([][16]byte(nil), target.BoundIdentities...)
+		cloned.Targets[index] = target
+	}
+	return cloned
+}
+
 // key is the exact cache coordinate this target names. Size is excluded: it is
 // the post-mutation value of the state at that coordinate, not part of it.
 func (t VisibilityTarget) key() []byte {
@@ -543,9 +556,14 @@ type mutationFairnessDebt struct {
 	ordinal            uint64
 	operationID        uint64
 	claimSameOperation bool
-	observed           bool
-	active             bool
-	deadline           time.Time
+	// gate is the immutable authority-derived callback footprint which earned a
+	// Linux retry. FrontendOperationID is not trusted by itself: a malformed
+	// client must not reuse that number to turn one repair proof into admission
+	// for a different namespace or inode mutation.
+	gate     SourcePublicationGate
+	observed bool
+	active   bool
+	deadline time.Time
 }
 
 const mutationFairnessClaimWindow = time.Second
@@ -971,12 +989,13 @@ func (c *VisibilityCoordinator) ValidateCommitment(commitment VisibilityCommitme
 	case commitment.NamespaceRepair != NamespaceRepairParentExclusive &&
 		commitment.NamespaceRepair != NamespaceRepairIndependent &&
 		commitment.NamespaceRepair != NamespaceRepairCallbackSerialized &&
-		commitment.NamespaceRepair != NamespaceRepairCallbackSerializedPipelined:
+		commitment.NamespaceRepair != NamespaceRepairCallbackSerializedPipelined &&
+		commitment.NamespaceRepair != NamespaceRepairLocklessExpiration:
 		// There is no default here on purpose. Assuming "independent" would let
 		// the authority wait out a proven cycle as though it were a slow lock;
 		// assuming "parent-exclusive" would fence a mount that could have
 		// repaired. Both are worse than refusing a mount that did not say.
-		refusal = fmt.Errorf("%w: mount declared no namespace-repair model; a strict mount must state whether repair is parent-exclusive, callback-serialized, callback-serialized-pipelined, or independent",
+		refusal = fmt.Errorf("%w: mount declared an unsupported namespace-repair model; a strict mount must state lockless-expiration, callback-serialized, callback-serialized-pipelined, or independent",
 			ErrVisibilityProfile)
 	default:
 		return nil
@@ -1186,12 +1205,25 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParents(ctx context.
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, published)
 }
 
-// ExecuteWithSourceGateAndHeldParentsSequence is the one variant whose result
-// must carry the visibility order chosen by the coordinator. Transactional
-// append uses it so the source kernel's exact-size publication and every peer's
-// COMPLETE notification compare one authority-issued sequence. The sequence is
-// allocated by openBarrier immediately before PREPARE; callers never supply or
-// maintain a second counter.
+// ExecuteWithSourceGateSequence returns the visibility order chosen by the
+// coordinator. Transactional writes and range mutations use it so the source
+// kernel's exact publication and every peer COMPLETE compare one
+// authority-issued sequence. Lockless Linux namespace repair needs no separate
+// parent-lock declaration: the exact source gate is the complete footprint.
+func (c *VisibilityCoordinator) ExecuteWithSourceGateSequence(ctx context.Context, source SessionID, mutation MutationID,
+	gate SourcePublicationGate, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
+	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) (uint64, error) {
+	var sequence uint64
+	err := c.execute(ctx, source, mutation, &gate, nil, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
+		sequence = chosen
+		return apply(chosen)
+	}, published)
+	return sequence, err
+}
+
+// ExecuteWithSourceGateAndHeldParentsSequence is retained for the coordinator's
+// retired parent-exclusive model tests. No protocol-5 Attach can select that
+// profile, and production Linux uses ExecuteWithSourceGateSequence above.
 func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx context.Context, source SessionID, mutation MutationID,
 	gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) (uint64, error) {
@@ -1387,12 +1419,12 @@ func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source
 		var yieldErr error
 		fairnessEligible := eligibleForFairness(participant, mutation, gate)
 		if !retryProofValidated && mutation.VisibilityRetryAfterSequence != 0 {
-			if !c.validItemRetryProofLocked(source, participant, mutation, held, gate) {
+			if !c.validVisibilityRetryProofLocked(source, participant, mutation, gate) {
 				c.mu.Unlock()
 				return nil, ErrSourcePublicationGate
 			}
 			retryProofValidated = true
-		} else if !retryProofValidated && c.itemRetryProofRequiredLocked(source, participant, mutation, held, gate) {
+		} else if !retryProofValidated && c.visibilityRetryProofRequiredLocked(source, participant, mutation, gate) {
 			c.mu.Unlock()
 			return nil, ErrSourcePublicationGate
 		}
@@ -1459,7 +1491,7 @@ func eligibleForFairness(participant *visibilityParticipant, mutation MutationID
 	if participant.repair == NamespaceRepairCallbackSerializedPipelined {
 		return true
 	}
-	return participant.repair == NamespaceRepairParentExclusive && gate != nil && !gate.hasNamespace()
+	return participant.repair == NamespaceRepairLocklessExpiration && gate != nil
 }
 
 func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, participant *visibilityParticipant, mutation MutationID,
@@ -1483,8 +1515,9 @@ func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, pa
 			// carry the same one-shot credit to the new sequence and preserve its
 			// earliest ordinal. The frontend will repair that phase and return the
 			// new proof; this is coalescing, never a second credit.
-			if participant.repair == NamespaceRepairParentExclusive && debt.claimSameOperation &&
-				debt.operationID == mutation.FrontendOperationID {
+			if participant.repair == NamespaceRepairLocklessExpiration && debt.claimSameOperation &&
+				debt.operationID == mutation.FrontendOperationID && gate != nil &&
+				sameSourcePublicationShape(debt.gate, *gate) {
 				debt.sequence = event.Cursor.Sequence
 				debt.observed = true
 				debt.active = false
@@ -1513,13 +1546,17 @@ func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, pa
 	if turn != nil {
 		ordinal = turn.ordinal
 	}
-	c.fairness[source] = mutationFairnessDebt{
+	debt = mutationFairnessDebt{
 		sequence:           event.Cursor.Sequence,
 		ordinal:            ordinal,
 		operationID:        mutation.FrontendOperationID,
-		claimSameOperation: participant.repair == NamespaceRepairParentExclusive,
+		claimSameOperation: participant.repair == NamespaceRepairLocklessExpiration,
 		observed:           true,
 	}
+	if debt.claimSameOperation {
+		debt.gate = cloneSourcePublicationGate(*gate)
+	}
+	c.fairness[source] = debt
 }
 
 func (c *VisibilityCoordinator) claimFairnessLocked(source SessionID, mutation MutationID, eligible bool) uint64 {
@@ -1535,7 +1572,7 @@ func (c *VisibilityCoordinator) claimFairnessLocked(source SessionID, mutation M
 		return 0
 	}
 	if debt.claimSameOperation {
-		// Linux item retries may claim a dormant credit before the CONTROL ACK
+		// Linux retries may claim a dormant credit before the CONTROL ACK
 		// reaches the authority. The queue node then waits behind the barrier's
 		// current owner and is already in its preserved FIFO position when that
 		// owner releases. The exact proof is what makes claiming before activation
@@ -1554,15 +1591,15 @@ func (c *VisibilityCoordinator) claimFairnessLocked(source SessionID, mutation M
 	return debt.ordinal
 }
 
-// validItemRetryProofLocked authenticates a cross-lane retry against the exact
+// validVisibilityRetryProofLocked authenticates a cross-lane retry against the exact
 // off-list debt created when this operation was previously refused. The proof
 // is deliberately not a general assertion that a frontend is repaired: it is
-// valid only for the same Linux parent-exclusive participant, item-only gate,
-// callback identity, and authority sequence. The caller holds c.mu.
-func (c *VisibilityCoordinator) validItemRetryProofLocked(source SessionID, participant *visibilityParticipant,
-	mutation MutationID, held [][16]byte, gate *SourcePublicationGate) bool {
+// valid only for the same lockless Linux participant, callback identity,
+// source gate, and authority sequence. The caller holds c.mu.
+func (c *VisibilityCoordinator) validVisibilityRetryProofLocked(source SessionID, participant *visibilityParticipant,
+	mutation MutationID, gate *SourcePublicationGate) bool {
 	if mutation.VisibilityRetryAfterSequence == 0 || mutation.FrontendOperationID == 0 || participant == nil ||
-		participant.repair != NamespaceRepairParentExclusive || len(held) != 0 || gate == nil || gate.hasNamespace() {
+		participant.repair != NamespaceRepairLocklessExpiration || gate == nil {
 		return false
 	}
 	debt, exists := c.fairness[source]
@@ -1571,17 +1608,17 @@ func (c *VisibilityCoordinator) validItemRetryProofLocked(source SessionID, part
 		return false
 	}
 	return exists && debt.observed && debt.claimSameOperation && debt.operationID == mutation.FrontendOperationID &&
-		debt.sequence == mutation.VisibilityRetryAfterSequence
+		debt.sequence == mutation.VisibilityRetryAfterSequence && sameSourcePublicationShape(debt.gate, *gate)
 }
 
-// itemRetryProofRequiredLocked rejects a fresh mutation identity which tries
+// visibilityRetryProofRequiredLocked rejects a fresh mutation identity which tries
 // to continue the exact Linux callback after receiving a retry but omits the
 // sequence proof. Frontend operation IDs are unique for a strict mount, so an
 // outstanding same-operation debt can only belong to this callback.
-func (c *VisibilityCoordinator) itemRetryProofRequiredLocked(source SessionID, participant *visibilityParticipant,
-	mutation MutationID, held [][16]byte, gate *SourcePublicationGate) bool {
-	if mutation.FrontendOperationID == 0 || participant == nil || participant.repair != NamespaceRepairParentExclusive ||
-		len(held) != 0 || gate == nil || gate.hasNamespace() {
+func (c *VisibilityCoordinator) visibilityRetryProofRequiredLocked(source SessionID, participant *visibilityParticipant,
+	mutation MutationID, gate *SourcePublicationGate) bool {
+	if mutation.FrontendOperationID == 0 || participant == nil || participant.repair != NamespaceRepairLocklessExpiration ||
+		gate == nil {
 		return false
 	}
 	debt, exists := c.fairness[source]
@@ -1610,7 +1647,7 @@ func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutat
 	}
 	pending := participant.pending.event
 	if pending.Routes == nil && gate != nil && gate.overlaps(pending.Targets) {
-		if participant.repair == NamespaceRepairParentExclusive && len(held) == 0 && !gate.hasNamespace() {
+		if participant.repair == NamespaceRepairLocklessExpiration {
 			// acquireMutationOrder authenticated this proof against the exact
 			// retained debt before it could claim/enqueue. Matching the still-pending
 			// sequence is therefore safe to wait behind: local repair is complete,
@@ -1619,7 +1656,7 @@ func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutat
 			if mutation.VisibilityRetryAfterSequence == pending.Cursor.Sequence {
 				return nil
 			}
-			return &VisibilityItemRetryError{Sequence: pending.Cursor.Sequence}
+			return &VisibilityRetryError{Sequence: pending.Cursor.Sequence}
 		}
 		return ErrVisibilityInterrupted
 	}
@@ -2344,7 +2381,7 @@ func (c *VisibilityCoordinator) AckWithContention(id SessionID, cursor Visibilit
 
 func (c *VisibilityCoordinator) activateFairnessLocked(id SessionID, p *visibilityParticipant, event VisibilityEvent, orderedAdmissionContended bool) {
 	if event.Cursor.Phase != VisibilityComplete || event.Initiator == id || event.Routes != nil ||
-		p.repair != NamespaceRepairCallbackSerializedPipelined && p.repair != NamespaceRepairParentExclusive {
+		p.repair != NamespaceRepairCallbackSerializedPipelined && p.repair != NamespaceRepairLocklessExpiration {
 		return
 	}
 	now := c.cfg.Now()

@@ -322,15 +322,17 @@ requests on the fenced mount must fail. The SDK-26 force-unmount measurements
 below are historical qualification evidence; they do not admit a production
 macOS participant.
 
-Linux parent-exclusive repair breaks its one closed lock cycle without losing
-the mount. COMPLETE atomically closes admission only for parents with exact
-cached-name work. If a callback was admitted first, the frontend reports the
-exact parent coordination inode; the authority maps it through that pending
-event and returns definite-preapply `EINTR` only to an overlapping request. The
-callback releases `i_rwsem`, reverse invalidation completes, and the same mount
-acknowledges COMPLETE. A callback arriving after the gate is refused locally
-before an authority request. The interruption remains active through Ack, and
-stale or response-lost control replays cannot affect a later cursor.
+Linux namespace repair uses a strict-kernel dentry-expiration primitive which
+never takes the parent inode's `i_rwsem` and never synthesizes a local unlink.
+The repair validates the exact shared parent and, for a resident positive
+binding, the exact shared child before changing cache state. The authority can
+therefore order namespace PREPARE/COMPLETE exactly like data and attribute
+repair without creating the old callback-versus-repair lock cycle. If an
+already-admitted source callback meets an older peer phase, the authority
+returns a sequenced internal retry; the frontend repairs that exact COMPLETE
+and resubmits the same callback with the one-shot proof. No synthetic `EINTR`
+escapes to the application, and the retired parent-exclusive profile is
+refused during Attach rather than retained as a compatibility execution path.
 
 A routing change is different: releasing one parent lock cannot make a fixed
 mount topology adopt a new declaration. Its blocked report is therefore still

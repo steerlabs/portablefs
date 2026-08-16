@@ -184,7 +184,7 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 					RoutesRevision: test.revision, AttachAttemptId: testAttachAttempt(1),
 					CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 					CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-					NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+					NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 				}}})
 			if response.GetAttach() != nil {
 				t.Fatal("a mount running another topology was admitted")
@@ -923,7 +923,7 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 				RoutesRevision: revision, AttachAttemptId: testAttachAttempt(id),
 				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 				CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 			}}})
 	}
 
@@ -981,13 +981,13 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 				VolumeId: "routes-volume", ReplaySlots: 2,
 				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 				CachedNameCapacity: 1<<16 + 1, RepairBudgetMillis: 1000,
-				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 			},
 			valid: &authoritypb.AttachRequest{
 				VolumeId: "routes-volume", ReplaySlots: 2,
 				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 				CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 			},
 		},
 	} {
@@ -1019,7 +1019,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 					attach.RepairBudgetMillis = 1000
 				}
 				if attach.NamespaceRepair == authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
-					attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+					attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
 				}
 			}
 			test.invalid.AttachAttemptId = testAttachAttempt(1)
@@ -1058,7 +1058,7 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 		RoutesRevision:     append([]byte(nil), revision[:]...),
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		AttachAttemptId: testAttachAttempt(1),
 	}
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{1})
@@ -1165,5 +1165,15 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("route writer did not resume after filesystem completion")
+	}
+}
+
+func TestRetiredParentExclusiveNamespaceRepairIsRefused(t *testing.T) {
+	repair, err := namespaceRepair(authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE)
+	if !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("namespaceRepair(PARENT_EXCLUSIVE) error = %v, want EOPNOTSUPP", err)
+	}
+	if repair != volumeserver.NamespaceRepairUnspecified {
+		t.Fatalf("namespaceRepair(PARENT_EXCLUSIVE) = %v, want unspecified", repair)
 	}
 }

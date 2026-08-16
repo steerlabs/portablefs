@@ -76,7 +76,7 @@ func finishPeerVisibility(t *testing.T, raw *rawFileSystem, targets []*authority
 		t.Fatal(err)
 	}
 	if blocked {
-		t.Fatal("visibility completion unexpectedly found a parent-exclusive callback")
+		t.Fatal("lockless visibility completion unexpectedly reported blocked")
 	}
 	if err := raw.finishVisibilityComplete(context.Background(), completion); err != nil {
 		t.Fatal(err)
@@ -637,7 +637,7 @@ func TestMutationGateGrammarFailsBeforeReplayAssignmentOrTransport(t *testing.T)
 	})
 }
 
-func TestPeerFirstSourceGateReturnsEINTRBeforeAssignmentOrTransport(t *testing.T) {
+func TestPeerFirstNamespaceGateWaitsWithoutApplicationEINTR(t *testing.T) {
 	f := newStrictFixture(t)
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "blocked")}
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
@@ -647,49 +647,89 @@ func TestPeerFirstSourceGateReturnsEINTRBeforeAssignmentOrTransport(t *testing.T
 	beforeCalls, beforeAssignments := f.rpc.calls, f.rpc.assignments
 	f.rpc.mu.Unlock()
 
-	status := f.rawCall(func(unique uint64) fuse.Status {
-		return f.raw.Mkdir(nil, &fuse.MkdirIn{
+	const unique = uint64(398)
+	done := make(chan fuse.Status, 1)
+	go func() {
+		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{
 			InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
 			Mode:     0o755,
 		}, "blocked", &fuse.EntryOut{})
-	})
-	if status != fuse.Status(syscall.EINTR) {
-		t.Fatalf("peer-first mkdir = %v, want EINTR", status)
+	}()
+	select {
+	case status := <-done:
+		t.Fatalf("peer-first mkdir escaped before the older repair: %v", status)
+	case <-time.After(50 * time.Millisecond):
 	}
 	f.rpc.mu.Lock()
 	afterCalls, afterAssignments := f.rpc.calls, f.rpc.assignments
 	f.rpc.mu.Unlock()
 	if afterCalls != beforeCalls || afterAssignments != beforeAssignments {
-		t.Fatalf("peer-first refusal crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
-	}
-	if f.mount.isRevoked() || f.mount.fatalError() != nil {
-		t.Fatalf("definite pre-assignment contention terminalized the mount: %v", f.mount.fatalError())
+		t.Fatalf("waiting namespace gate crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
 	}
 	finishPeerVisibility(t, f.raw, targets)
+	select {
+	case status := <-done:
+		if !status.Ok() {
+			t.Fatalf("namespace mutation after repair = %v, want success", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace mutation did not resume after the peer repair")
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, unique)
 }
 
-func TestNamespaceMutationRejectsItemOnlyInternalRetryClass(t *testing.T) {
+func TestNamespaceMutationConsumesSequencedInternalRetry(t *testing.T) {
 	f := newStrictFixture(t)
-	f.mount.abort.Do(func() {})
+	item := testItem(398, authoritypb.Attr_DIRECTORY, 398)
+	firstReturned := make(chan struct{})
+	var attempts int
 	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
 		if request.GetMkdir() == nil {
-			return nil, errors.New("unexpected request in namespace item-retry test")
+			return nil, errors.New("unexpected request in namespace visibility-retry test")
 		}
-		return &authoritypb.Response{
-			Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
-			VisibilityRetrySequence: 1,
-		}, nil
+		attempts++
+		if attempts == 1 {
+			close(firstReturned)
+			return &authoritypb.Response{
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
+				VisibilityRetrySequence: 1,
+			}, nil
+		}
+		if request.GetVisibilityRetryAfterSequence() != 1 {
+			return nil, errors.New("retried namespace mutation omitted its exact visibility sequence")
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}}, nil
 	}
-	const unique = uint64(398)
-	status := f.raw.Mkdir(nil, &fuse.MkdirIn{
-		InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o755,
-	}, "must-not-retry", &fuse.EntryOut{})
-	if status != fuse.EIO {
-		t.Fatalf("namespace mutation with item-only retry class = %v, want fail-closed EIO", status)
+	const unique = uint64(400)
+	done := make(chan fuse.Status, 1)
+	go func() {
+		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{
+			InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o755,
+		}, "retry-inside-callback", &fuse.EntryOut{})
+	}()
+	<-firstReturned
+	select {
+	case status := <-done:
+		t.Fatalf("namespace retry escaped to the kernel before COMPLETE: %v", status)
+	case <-time.After(50 * time.Millisecond):
 	}
-	if !f.mount.isRevoked() || f.mount.fatalError() == nil {
-		t.Fatal("namespace mutation accepted an item-only internal retry class")
+	f.raw.releaseComplete(visibilityCompletion{sequence: 1})
+	select {
+	case status := <-done:
+		if !status.Ok() {
+			t.Fatalf("namespace retry returned %v, want success without EINTR", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace retry did not resume after exact COMPLETE")
 	}
+	if attempts != 2 || f.mount.isRevoked() {
+		t.Fatalf("namespace retry attempts=%d revoked=%t cause=%v", attempts, f.mount.isRevoked(), f.mount.fatalError())
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, unique)
 }
 
 func TestSourceFirstReturnedBindingAndReplyWritePrecedePeerPrepare(t *testing.T) {

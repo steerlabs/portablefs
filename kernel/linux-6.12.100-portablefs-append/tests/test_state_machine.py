@@ -353,8 +353,6 @@ def strict_notify(
         if code == "DELETE" and child != resident_child.nodeid:
             raise ProtocolError("DELETE child identity mismatch")
         inode.cache_generation += 1
-        if code == "DELETE":
-            resident_child.nlink = 0
     if code == "PFS_SIZE":
         if inode.is_dir:
             raise ProtocolError("PFS_SIZE target is not a regular file")
@@ -1067,6 +1065,19 @@ class PublicationAndNotifyTests(unittest.TestCase):
             )
         self.assertEqual(
             (shared_dir.cache_generation, shared_child.nlink), before
+        )
+
+        strict_notify(
+            "DELETE",
+            shared_dir,
+            child=shared_child.nodeid,
+            resident_child=shared_child,
+        )
+        self.assertEqual(shared_dir.cache_generation, before[0] + 1)
+        self.assertEqual(
+            shared_child.nlink,
+            before[1],
+            "peer repair expires the binding but does not synthesize a local unlink",
         )
 
     def test_shared_splice_reads_never_reuse_page_cache(self) -> None:

@@ -106,12 +106,9 @@ type RPC interface {
 	InitialVisibilityCursor() *authoritypb.VisibilityCursor
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	NextVisibilityAfterAck(context.Context, *authoritypb.VisibilityCursor, bool) (*authoritypb.VisibilityEvent, error)
-	// ReportVisibilityBlocked arms a nonterminal cycle break for the exact kernel
-	// parents this frontend both needs to repair and already has a callback parked
-	// in. The authority maps them through the pending COMPLETE to stable parent
-	// identities and refuses those queued mutations pre-apply; ordinary COMPLETE
-	// acknowledgment later removes the scope. Route changes use an empty parent
-	// set as the terminal unable-to-serve report.
+	// ReportVisibilityBlocked is the terminal unable-to-serve report for a route
+	// revision. Lockless namespace repair never reports an ordinary filesystem
+	// phase blocked.
 	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor, []uint64) error
 	// DetachAfterUnmount may be called only with evidence that this frontend's
 	// kernel mount is gone.
@@ -964,12 +961,12 @@ func (n *node) read(parent context.Context, request *authoritypb.Request) (*auth
 	}
 	defer n.mount.releaseBulk()
 	response, consumption, err := n.mount.rpc.CallReadRetained(ctx, request, n.mount.forceTerminalResponseRevocation)
-	if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY ||
+	if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
 		response.GetVisibilityRetrySequence() != 0) {
 		if consumption != nil {
 			consumption.Consume()
 		}
-		n.mount.revoke(errors.New("fusev3: authority returned an item visibility retry for a read-only request"))
+		n.mount.revoke(errors.New("fusev3: authority returned a visibility retry for a read-only request"))
 		return response, syscall.ENOTCONN
 	}
 	if consumption != nil {
@@ -1014,12 +1011,12 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 		response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(
 			ctx, request, nil, m.forceTerminalResponseRevocation,
 		)
-		if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY ||
+		if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
 			response.GetVisibilityRetrySequence() != 0) {
 			if consumption != nil {
 				consumption.Consume()
 			}
-			protocolErr := errors.New("fusev3: authority returned an item visibility retry for a mutation with no source gate")
+			protocolErr := errors.New("fusev3: authority returned a visibility retry for a mutation with no source gate")
 			m.revoke(protocolErr)
 			return response, protocolErr
 		}
@@ -1048,7 +1045,7 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 			return nil
 		}, m.forceTerminalResponseRevocation)
 		assigned := lease.isAssigned()
-		if response != nil && response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY &&
+		if response != nil && response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY &&
 			response.GetVisibilityRetrySequence() != 0 {
 			if consumption != nil {
 				consumption.Consume()
@@ -1058,26 +1055,26 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 			m.revoke(protocolErr)
 			return response, protocolErr
 		}
-		if response != nil && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY {
+		if response != nil && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
 			validRetry := callErr == nil && assigned && !assignmentFailed && !response.GetUncertain() &&
 				responseErrno(response) == syscall.EINTR && response.GetBody() == nil &&
 				response.GetPostAttr() == nil && response.GetRoutesMismatch() == nil && len(response.GetTerminalDeliveryToken()) == 0 &&
-				response.GetVisibilityRetrySequence() != 0 && sourcePublicationGateItemOnly(gate)
+				response.GetVisibilityRetrySequence() != 0
 			if !validRetry {
 				if consumption != nil {
 					consumption.Consume()
 				}
 				lease.revoke()
-				protocolErr := errors.New("fusev3: authority returned a malformed item-only visibility retry")
+				protocolErr := errors.New("fusev3: authority returned a malformed visibility retry")
 				m.revoke(protocolErr)
 				return response, protocolErr
 			}
 			if consumption != nil {
 				consumption.Consume()
 			}
-			if err := callback.releaseItemRetry(lease); err != nil {
+			if err := callback.releaseVisibilityRetry(lease); err != nil {
 				lease.revoke()
-				m.revoke(fmt.Errorf("fusev3: release item-only visibility retry: %w", err))
+				m.revoke(fmt.Errorf("fusev3: release visibility retry: %w", err))
 				return response, err
 			}
 			if err := m.raw.waitForVisibilityCompletion(ctx, response.GetVisibilityRetrySequence()); err != nil {
@@ -1134,18 +1131,6 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 		}
 		return response, callErr
 	}
-}
-
-func sourcePublicationGateItemOnly(gate *authoritypb.SourcePublicationGate) bool {
-	if gate == nil || len(gate.GetTargets()) == 0 {
-		return false
-	}
-	for _, target := range gate.GetTargets() {
-		if target.GetItem() == nil || target.GetNamespace() != nil {
-			return false
-		}
-	}
-	return true
 }
 
 // requestRequiresSourcePublication is the Linux-side grammar boundary for
@@ -1948,9 +1933,6 @@ func kindMode(kind authoritypb.Attr_Kind) uint32 {
 
 func rpcErrno(response *authoritypb.Response, err error) syscall.Errno {
 	if err != nil {
-		if errors.Is(err, errSourcePublicationInterrupted) {
-			return syscall.EINTR
-		}
 		if errno := contextErrno(err); errno != 0 {
 			return errno
 		}

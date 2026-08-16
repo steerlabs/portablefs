@@ -400,17 +400,17 @@ func TestTranslateValidatesDominatedRawTargetsBeforeNormalization(t *testing.T) 
 	}
 }
 
-func TestNamespaceRepairFallsBackToEntryInvalidationWhenDeleteIsRefused(t *testing.T) {
+func TestNamespaceRepairNeverFallsBackFromExactChildExpiration(t *testing.T) {
 	f := newStrictFixture(t)
 	f.notify.deleteST = fuse.Status(syscall.ENOSYS)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
-		t.Fatalf("COMPLETE: %v", err)
+	if err := f.raw.completeVisibility(targets, false); err == nil {
+		t.Fatal("COMPLETE accepted an exact-child repair the kernel refused")
 	}
 	calls := f.notify.snapshot()
-	if len(calls) != 2 || calls[0].kind != "delete" || calls[1].kind != "entry" || calls[1].name != "victim" {
-		t.Fatalf("notifications = %+v; when the delete half is refused the invalidation still has to happen", calls)
+	if len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "victim" {
+		t.Fatalf("notifications = %+v; an exact-child refusal must not degrade to name-only invalidation", calls)
 	}
 }
 
@@ -500,20 +500,19 @@ func TestEvictedDentryAlreadySatisfiesNameInvalidation(t *testing.T) {
 	// The kernel evicts dentries independently of FORGET: the second alias of
 	// a hard link, a name whose inode an open descriptor pins, and ordinary
 	// dcache pressure all leave cachedNames entries whose dentry is gone. Both
-	// notification halves then answer ENOENT, which is the invalidated state —
+	// the exact notification answers ENOENT, which is the invalidated state —
 	// the regression this guards against treated it as a repair failure and
 	// revoked a healthy mount (the same defect the inode path already fixed).
 	f := newStrictFixture(t)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	f.notify.deleteST = fuse.ENOENT
-	f.notify.entryST = fuse.ENOENT
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
 	if err := f.raw.completeVisibility(targets, false); err != nil {
 		t.Fatalf("COMPLETE over an evicted dentry: %v", err)
 	}
 	calls := f.notify.snapshot()
-	if len(calls) != 2 || calls[0].kind != "delete" || calls[1].kind != "entry" || calls[1].name != "victim" {
-		t.Fatalf("notifications = %+v, want the delete then entry pair, each answered ENOENT", calls)
+	if len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "victim" {
+		t.Fatalf("notifications = %+v, want one exact expiration answered ENOENT", calls)
 	}
 	if f.mount.isRevoked() {
 		t.Fatal("an already-evicted binding revoked a healthy mount")
@@ -526,11 +525,10 @@ func TestFailedFinalRepairRevokesWithoutAcknowledgingComplete(t *testing.T) {
 		prepare func(*strictFixture) []*authoritypb.VisibilityTarget
 	}{
 		{
-			name: "namespace delete and fallback both fail",
+			name: "exact namespace expiration fails",
 			prepare: func(f *strictFixture) []*authoritypb.VisibilityTarget {
 				f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 				f.notify.deleteST = fuse.Status(syscall.ENOSYS)
-				f.notify.entryST = fuse.Status(syscall.EIO)
 				return []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
 			},
 		},

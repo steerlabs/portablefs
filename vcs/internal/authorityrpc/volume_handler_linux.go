@@ -2065,14 +2065,6 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			resp, _ := apply(1)
 			return resp
 		}
-		held, err := h.heldDirectories(cred.ID, req)
-		if err != nil {
-			// Failing closed here is a liveness requirement, not only input
-			// validation. Silently dropping a parent would hide the exact kernel
-			// lock that a peer COMPLETE may need and recreate the cycle the
-			// interruption protocol exists to break.
-			return h.errorResponse(0, err, false)
-		}
 		var resp *authoritypb.Response
 		normalizedPrepare := func() ([]volumeserver.VisibilityTarget, error) {
 			targets, prepareErr := prepare()
@@ -2105,7 +2097,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 				return h.errorResponse(0, err, false)
 			}
 		}
-		_, err = h.Visibility.ExecuteWithSourceGateAndHeldParentsSequence(ctx, cred.ID, id, expectedGate, held, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
+		_, err = h.Visibility.ExecuteWithSourceGateSequence(ctx, cred.ID, id, expectedGate, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
 			var complete []volumeserver.VisibilityTarget
 			resp, complete = apply(sequence)
 			// nil is the explicit no-visible-change result. A non-nil empty
@@ -2136,7 +2128,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 					return resp
 				}
 				if !uncertain {
-					if errors.Is(err, volumeserver.ErrVisibilityItemRetry) {
+					if errors.Is(err, volumeserver.ErrVisibilityRetry) {
 						if resetErr := h.resetWriteTransactionForRetry(cred.ID, body); resetErr != nil {
 							return h.errorResponse(0, resetErr, false)
 						}
@@ -2577,19 +2569,19 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		errno = errnos.EBUSY
 	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN
-	case errors.Is(err, volumeserver.ErrVisibilityItemRetry):
+	case errors.Is(err, volumeserver.ErrVisibilityRetry):
 		// This is internal protocol flow, not an application-visible EINTR. The
-		// Linux item frontend releases its source gate and resubmits inside the
+		// Linux frontend releases its source gate and resubmits inside the
 		// same FUSE callback. The separate class proves a staged COMMIT remained
 		// reusable and prevents confusing it with a callback/namespace unwind.
-		sequence, ok := volumeserver.VisibilityItemRetrySequence(err)
+		sequence, ok := volumeserver.VisibilityRetrySequence(err)
 		if !ok {
-			return h.errorResponse(requestID, fmt.Errorf("%w: item visibility retry omitted its sequence", errInternal), true)
+			return h.errorResponse(requestID, fmt.Errorf("%w: visibility retry omitted its sequence", errInternal), true)
 		}
 		errno = errnos.EINTR
 		resp := h.success(requestID)
 		resp.Errno, resp.Uncertain = errno, uncertain
-		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY
 		resp.VisibilityRetrySequence = sequence
 		return resp
 	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
@@ -3076,7 +3068,7 @@ func wireErrno(err error) int32 {
 	// essential when two mounts race on one inode: Linux releases the losing
 	// callback lane and retries after the winner's repair without surfacing a
 	// false EIO to the application.
-	if errors.Is(err, volumeserver.ErrVisibilityInterrupted) || errors.Is(err, volumeserver.ErrVisibilityItemRetry) {
+	if errors.Is(err, volumeserver.ErrVisibilityInterrupted) || errors.Is(err, volumeserver.ErrVisibilityRetry) {
 		return errnos.EINTR
 	}
 	var errno syscall.Errno

@@ -81,8 +81,8 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   `visibility-ack-next-v1`, `mandatory-dual-transport-v1`,
   `transactional-shared-write-v1`, `strict-linux-mutation-suite-v1`,
   `terminal-applied-delivery-receipt-v1`,
-  `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
-  `classified-visibility-interruption`, `sequenced-item-visibility-retry-v1`,
+  `strict-two-phase-visibility`, `classified-visibility-interruption`,
+  `sequenced-visibility-retry-v1`, `lockless-namespace-repair-v1`,
   `source-publication-gate-v1`,
   `namespace-post-binding-identity`, and `exact-resource-acquisition` features at `Hello`, and `write-through`,
   `no-history`, `no-branches`,
@@ -90,20 +90,23 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`,
   `volume-syncfs-barrier`, and `exact-resource-acquisition` at `Activate`. A
   strict attach additionally requires
-  `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
-  `classified-visibility-interruption`, `sequenced-item-visibility-retry-v1`,
+  `strict-two-phase-visibility`, `classified-visibility-interruption`,
+  `sequenced-visibility-retry-v1`, `lockless-namespace-repair-v1`,
   `source-publication-gate-v1`, and
   `namespace-post-binding-identity` in its Activate reply. These strings are the contract's shape written down: an
   authority that stopped meeting one of them would be refused rather than
   silently tolerated.
 
-  The sequenced item retry is an internal Linux liveness transaction, not an
-  application errno or a timed retry. The authority names the exact peer
-  COMPLETE that blocked an item-only callback; after repairing it, the frontend
+  The sequenced visibility retry is an internal Linux liveness transaction,
+  not an application errno or a timed retry. The authority names the exact
+  peer COMPLETE that blocked a callback; after repairing it, the frontend
   resubmits with that sequence. The authority accepts the proof only for the
-  same callback identity and its retained one-shot FIFO debt. This lets DATA
-  wait behind a CONTROL ACK already in flight without allowing a stale, forged,
-  namespace, or FSKit request to bypass visibility ordering.
+  same callback identity and its retained one-shot FIFO debt. This lets both
+  namespace and inode operations wait behind a CONTROL ACK already in flight
+  without allowing a stale, forged, or FSKit request to bypass visibility
+  ordering. Strict Linux namespace repair is lockless dentry expiration; the
+  retired parent-lock profile is refused rather than translated into an
+  application-visible synthetic `EINTR`.
 
   Feature advertisement proves what the authority can execute; it does not
   manufacture a callback that a host filesystem API does not expose. In

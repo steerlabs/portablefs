@@ -29,8 +29,8 @@ message Request {
   // operands and refuses any mismatch before XFS. It is part of the retained
   // replay fingerprint: an exact replay carries the exact same local cut.
   SourcePublicationGate source_publication_gate = 7;
-  // Present only when a Linux item-only mutation is resubmitted after an
-  // authority VISIBILITY_ITEM_RETRY. The value is the exact COMPLETE sequence
+  // Present only when a Linux mutation is resubmitted after an authority
+  // VISIBILITY_RETRY. The value is the exact COMPLETE sequence
   // the frontend has repaired locally. The authority accepts it only while it
   // retains the one-shot fairness debt issued to this frontend_operation_id;
   // it therefore cannot be forged into a general barrier bypass. Keeping this
@@ -162,7 +162,7 @@ message Response {
   // Present only on the final response that carries a volume-terminal exact
   // outcome. The source returns it after its kernel publication boundary.
   bytes terminal_delivery_token = 9; // exactly 16 nonzero bytes
-  // Present exactly with VISIBILITY_ITEM_RETRY. It names the already-delivered
+  // Present exactly with VISIBILITY_RETRY. It names the already-delivered
   // peer phase whose local repair must finish before the Linux frontend may
   // resubmit. This cross-lane identity prevents transport-speed retry loops.
   uint64 visibility_retry_sequence = 43;
@@ -255,14 +255,16 @@ enum FailureClass {
   // ECANCELED because macOS 26 may transparently re-enter a mutating callback
   // after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
   FAILURE_CLASS_VISIBILITY_INTERRUPTED = 5;
-  // VISIBILITY_ITEM_RETRY is a Linux item-only scheduling handoff, never an
+  // VISIBILITY_RETRY is a Linux scheduling handoff, never an
   // application errno. The authority has definitely not applied the mutation
   // and, for a staged write, has retained the inert bytes. The Linux frontend
-  // releases its local item gate, lets the older peer repair finish, and
+  // releases its local publication gate, lets the older peer repair finish, and
   // resubmits with a fresh mutation identity inside the same FUSE callback.
-  // Namespace callbacks and callback-serialized frontends never receive this
-  // class because retaining their callback would preserve the repair cycle.
-  FAILURE_CLASS_VISIBILITY_ITEM_RETRY = 6;
+  // A Linux namespace callback may retain this handoff because the strict
+  // kernel's notification path expires the cached binding without acquiring
+  // the parent lock held by that callback. Callback-serialized frontends never
+  // receive this class.
+  FAILURE_CLASS_VISIBILITY_RETRY = 6;
 }
 
 // RoutesMismatch names both sides of a routing-topology disagreement. All
@@ -500,14 +502,10 @@ enum CoherenceProfile {
 // authority cannot see a remote kernel and the two answers have different
 // provable properties.
 //
-// PARENT_EXCLUSIVE is Linux FUSE. fs/fuse/dir.c:1351 takes
-// down_write(&parent->i_rwsem) unconditionally - before the FUSE_EXPIRE_ONLY
-// test at dir.c:1367 - and fs/namei.c:4389 / :3895 / :4975 hold that same
-// semaphore for write across the whole server round trip of any directory
-// mutation. A mount with an unanswered directory mutation in that parent
-// therefore cannot repair a name in it, and if the authority is the party that
-// owes the answer, the wait is a closed cycle rather than a slow lock. See the
-// proof at VisibilityCoordinator.ReportBlocked.
+// PARENT_EXCLUSIVE is the retired stock-FUSE model. It is parseable so an old
+// client receives an explicit commitment refusal, but protocol 5 does not
+// admit it: breaking its parent-i_rwsem cycle required surfacing a synthetic
+// EINTR to ordinary applications.
 //
 // INDEPENDENT means repair never waits on a lock the mount's own unanswered
 // operation can hold. A frontend may only declare it if that is true of its
@@ -529,10 +527,15 @@ enum CoherenceProfile {
 // gate before dispatch and never receives its own PREPARE or COMPLETE.
 enum NamespaceRepair {
   NAMESPACE_REPAIR_UNSPECIFIED = 0;
-  NAMESPACE_REPAIR_PARENT_EXCLUSIVE = 1;
+  NAMESPACE_REPAIR_PARENT_EXCLUSIVE = 1 [deprecated = true];
   NAMESPACE_REPAIR_INDEPENDENT = 2;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED = 3;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED = 4;
+  // LOCKLESS_EXPIRATION is the patched Linux FUSE contract. Strict reverse
+  // namespace notifications expire a binding under dcache locks only; they do
+  // not acquire the parent inode's i_rwsem and therefore cannot deadlock with
+  // an unanswered local create/unlink/rename callback which holds that lock.
+  NAMESPACE_REPAIR_LOCKLESS_EXPIRATION = 5;
 }
 
 enum VisibilityPhase {
@@ -634,31 +637,11 @@ message NextVisibilityRequest {
 }
 message AckVisibilityRequest {
   VisibilityCursor cursor = 1;
-  // blocked is a frontend saying it cannot yet service this phase because an
-  // exact namespace repair needs a parent lock its own unanswered request to
-  // this authority holds. For an ordinary parent-exclusive COMPLETE, the
-  // authority installs a cursor+parent-scoped pre-apply interruption. The
-  // frontend drains the refused request, performs repair, and acknowledges the
-  // same phase without losing the mount. A routes change remains terminal.
-  //
-  // Only the frontend can evaluate this. It needs BOTH that the mount has an
-  // unanswered namespace mutation in the affected parent - which the authority
-  // also knows - and that the mount actually holds a cached binding this phase
-  // names, which the authority does not: its audience comes from a monotone
-  // filter with no false negatives and therefore many false positives. A mount
-  // that has nothing cached to repair must acknowledge normally.
-  //
-  // The authority maps every reported inode through this exact pending event
-  // and enforces the interruption when the corresponding ordinary request is
-  // present or later arrives. This report never acknowledges the phase, so it
-  // cannot be used to skip repair; the ordinary phase deadline remains the
-  // fail-closed bound if the lock does not drain.
-  bool blocked = 2;
-  // Exact parent coordination inodes whose cached bindings require reverse
-  // invalidation. The authority maps each one back to this pending event's
-  // stable parent identity before installing an interruption. Required for an
-  // ordinary namespace blocked report; empty for a terminal routes report.
-  repeated uint64 blocked_parent_kernel_inos = 3;
+  // Retired protocol-5 development fields. They remain parseable so an old
+  // client receives a deterministic refusal, but no admitted profile sends
+  // them. Lockless Linux namespace expiration removed the parent-lock cycle.
+  bool blocked = 2 [deprecated = true];
+  repeated uint64 blocked_parent_kernel_inos = 3 [deprecated = true];
   // Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
   // pipelined frontend sets it when peer repair refused at least one eligible
   // later ordered callback before that exact Ack. It never acknowledges a

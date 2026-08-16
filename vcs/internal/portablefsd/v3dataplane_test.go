@@ -2121,7 +2121,7 @@ func TestV3DataPlaneRejectsLinuxOnlyItemVisibilityRetry(t *testing.T) {
 	d := testV3DataPlane(t, client)
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
 		return &authoritypb.Response{
-			Errno: errnos.EINTR, Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+			Errno: errnos.EINTR, Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
 			VisibilityRetrySequence: 1,
 			Mutation:                &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
 		}, nil
