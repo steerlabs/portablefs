@@ -4,7 +4,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=exec
 EnvironmentFile=/etc/portablefs/manager/manager.env
 ExecStart=/opt/portablefs/current/bin/portablefs-manager \
   -listen=${PORTABLEFS_MANAGER_LISTEN} \
