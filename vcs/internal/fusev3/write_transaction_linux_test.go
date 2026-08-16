@@ -12,6 +12,8 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"google.golang.org/protobuf/proto"
 )
 
 func openWriteTransactionTestHandle(t *testing.T, fixture *strictFixture) (uint64, uint64) {
@@ -191,6 +193,147 @@ func TestPFSWriteStagesAppendFragmentsThenPublishesOneServerPositionedCommit(t *
 			}
 		}
 	})
+}
+
+func TestPFSWriteConsumesItemRetryInternallyAndReusesOneStagedTransaction(t *testing.T) {
+	fixture := newStrictFixture(t)
+	nodeID, handle := openWriteTransactionTestHandle(t, fixture)
+	const kernelTxid = uint64(0x7612)
+
+	begin := writeTransactionInput(nodeID, handle, kernelTxid, 3, fuse.PFS_WRITE_BEGIN)
+	if status := callWriteTransaction(fixture, begin, nil, &fuse.PFSWriteOut{}); !status.Ok() {
+		t.Fatalf("BEGIN = %v", status)
+	}
+	data := writeTransactionInput(nodeID, handle, kernelTxid, 3, fuse.PFS_WRITE_DATA)
+	data.Size = 3
+	if status := callWriteTransaction(fixture, data, []byte("abc"), &fuse.PFSWriteOut{}); !status.Ok() {
+		t.Fatalf("DATA = %v", status)
+	}
+
+	internal := &recordingResponseConsumption{}
+	committed := &recordingResponseConsumption{}
+	firstRetry := make(chan struct{})
+	secondCommit := make(chan struct{})
+	fixture.rpc.mu.Lock()
+	fixture.rpc.retainedConsumptions = []authorityrpc.ResponseConsumption{internal, committed}
+	var commitCalls int
+	var frontendOperationIDs []uint64
+	var retryAfterSequences []uint64
+	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		write := request.GetWriteTransaction()
+		if write == nil || write.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
+			return nil, errors.New("unexpected request while testing item-only COMMIT retry")
+		}
+		fixture.rpc.writeTransactions = append(fixture.rpc.writeTransactions, proto.Clone(write).(*authoritypb.WriteTransactionRequest))
+		frontendOperationIDs = append(frontendOperationIDs, request.GetFrontendOperationId())
+		retryAfterSequences = append(retryAfterSequences, request.GetVisibilityRetryAfterSequence())
+		commitCalls++
+		if commitCalls == 1 {
+			close(firstRetry)
+			return &authoritypb.Response{
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+				VisibilityRetrySequence: 17,
+			}, nil
+		}
+		close(secondCommit)
+		reply := &authoritypb.WriteTransactionReply{
+			TransactionId: write.GetTransactionId(), Flags: fuse.PFS_WRITE_OUT_COMMITTED,
+			CommittedSize: 3, AssignedOffset: 100, PostSize: 103, VisibilitySequence: 17,
+		}
+		return &authoritypb.Response{
+			Body:     &authoritypb.Response_WriteTransaction{WriteTransaction: reply},
+			PostAttr: &authoritypb.Attr{Inode: fixture.rpc.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 103},
+		}, nil
+	}
+	fixture.rpc.mu.Unlock()
+
+	commit := writeTransactionInput(nodeID, handle, kernelTxid, 3, fuse.PFS_WRITE_COMMIT)
+	commit.FragmentOffset = 3
+	unique := fixture.unique.Add(2)
+	commit.Unique = unique
+	out := &fuse.PFSWriteOut{}
+	result := make(chan fuse.Status, 1)
+	go func() { result <- fixture.raw.PFSWrite(nil, commit, nil, out) }()
+	select {
+	case <-firstRetry:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first COMMIT did not reach the internal retry response")
+	}
+	select {
+	case <-secondCommit:
+		t.Fatal("COMMIT resubmitted before the matching local visibility repair completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	fixture.raw.mu.Lock()
+	fixture.raw.completedVisibilitySequence = 17
+	fixture.raw.signalSourceChangedLocked()
+	fixture.raw.mu.Unlock()
+	var status fuse.Status
+	select {
+	case status = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("COMMIT did not resume after the matching local visibility repair")
+	}
+	if !status.Ok() {
+		t.Fatalf("internally retried COMMIT = %v", status)
+	}
+	if out.Flags != fuse.PFS_WRITE_OUT_COMMITTED || out.CommittedSize != 3 || out.AssignedOffset != 100 || out.PostSize != 103 {
+		t.Fatalf("internally retried COMMIT result = %+v", out)
+	}
+	if got := internal.calls.Load(); got != 1 {
+		t.Fatalf("internal retry response consumption = %d, want immediate 1", got)
+	}
+	if got := committed.calls.Load(); got != 0 {
+		t.Fatalf("committed response consumed before publication = %d", got)
+	}
+	fixture.rpc.snapshot(func(rpc *fakeRPC) {
+		want := []authoritypb.WriteTransactionPhase{
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN,
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT,
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT,
+		}
+		if len(rpc.writeTransactions) != len(want) {
+			t.Fatalf("authority write phases = %+v", rpc.writeTransactions)
+		}
+		for index, phase := range want {
+			if rpc.writeTransactions[index].GetPhase() != phase || rpc.writeTransactions[index].GetTransactionId() != 1 {
+				t.Fatalf("authority write phase[%d] = %+v", index, rpc.writeTransactions[index])
+			}
+		}
+		if len(frontendOperationIDs) != 2 || frontendOperationIDs[0] == 0 || frontendOperationIDs[0] != frontendOperationIDs[1] {
+			t.Fatalf("COMMIT frontend operation identities = %v", frontendOperationIDs)
+		}
+		if len(retryAfterSequences) != 2 || retryAfterSequences[0] != 0 || retryAfterSequences[1] != 17 {
+			t.Fatalf("COMMIT visibility retry proofs = %v, want [0 17]", retryAfterSequences)
+		}
+	})
+	if !fixture.raw.ReplyPublishMarked(unique, nodeID, fuse.PFS_WRITE_OPCODE) {
+		t.Fatal("internally retried COMMIT was not publication-marked")
+	}
+	fixture.raw.ReplyWritten(unique, fuse.OK)
+	if fixture.mount.isRevoked() {
+		t.Fatalf("mount revoked after committed reply write: %v", fixture.mount.fatalError())
+	}
+	if got := committed.calls.Load(); got != 0 {
+		t.Fatalf("committed response consumed at original reply = %d", got)
+	}
+	publishUnique := fixture.unique.Add(2)
+	publishOut := &fuse.PFSPublishOut{}
+	if status := fixture.raw.PFSPublish(nil, &fuse.PFSPublishIn{
+		InHeader: fuse.InHeader{Unique: publishUnique}, RequestUnique: unique,
+		PublicationID: 1, Nodeid: nodeID, Opcode: fuse.PFS_WRITE_OPCODE,
+	}, publishOut); !status.Ok() {
+		t.Fatalf("PFS_PUBLISH after internally retried COMMIT = %v (fatal=%v)", status, fixture.mount.fatalError())
+	}
+	if publishOut.RequestUnique != unique || publishOut.PublicationID != 1 || publishOut.Nodeid != nodeID ||
+		publishOut.Opcode != fuse.PFS_WRITE_OPCODE || publishOut.Flags != fuse.PFS_PUBLISH_ACK {
+		t.Fatalf("PFS_PUBLISH ACK = %+v", publishOut)
+	}
+	fixture.raw.ReplyWritten(publishUnique, fuse.OK)
+	if got := committed.calls.Load(); got != 1 {
+		t.Fatalf("committed response consumption after publication = %d, want 1", got)
+	}
 }
 
 func TestPFSWritePositionedModeFreezesAndCommitsExactPosition(t *testing.T) {

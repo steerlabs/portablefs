@@ -3,6 +3,7 @@
 package authorityrpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -830,6 +831,110 @@ func TestWriteTransactionCommitAppliesStagedPrefixOnceAndReplaysRetainedResult(t
 	}
 	if calls, _ := target.commitSnapshot(); calls != 1 {
 		t.Fatalf("exact replay applied storage %d times, want 1", calls)
+	}
+}
+
+func TestWriteTransactionVisibilityItemRetryReusesStagedBytesAndPreservesFIFO(t *testing.T) {
+	h, credential, store := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("abc"))
+	target := store.targets[0]
+	target.setCommitResult(3, 0, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 3, Mode: 0o600, Nlink: 1}, nil)
+
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 1024, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := make(chan struct{})
+	t.Cleanup(func() { close(terminal) })
+	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 1024, RepairBudget: 5 * time.Second,
+		NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	identity := target.Coordinate().Stable
+	visibility.RecordResolvedInode(credential.ID, identity)
+	h.Visibility = visibility
+
+	peerResult := make(chan error, 1)
+	targets := []volumeserver.VisibilityTarget{
+		{Scope: volumeserver.VisibilityData, Identity: identity},
+		{Scope: volumeserver.VisibilityAttributes, Identity: identity},
+	}
+	go func() {
+		peerResult <- visibility.Execute(t.Context(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
+			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true })
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	prepare, err := visibility.Next(ctx, credential.ID, testInitialVisibilityCursor(t, visibility, credential.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := visibility.Ack(credential.ID, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := visibility.Next(ctx, credential.ID, prepare.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := writeTransactionTestCommitRequest(3, 1, 3, identity)
+	first.FrontendOperationId = 77
+	response := h.commitWriteTransaction(ctx, first, credential, first.GetWriteTransaction())
+	if response.GetErrno() != int32(syscall.EINTR) || response.GetUncertain() || response.GetWriteTransaction() != nil ||
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY {
+		t.Fatalf("first COMMIT item retry = %+v", response)
+	}
+	if response.GetVisibilityRetrySequence() != complete.Cursor.Sequence {
+		t.Fatalf("first COMMIT retry sequence = %d, want pending peer %d", response.GetVisibilityRetrySequence(), complete.Cursor.Sequence)
+	}
+	if mutation := response.GetMutation(); mutation.GetSlot() != 0 || mutation.GetAcceptedSequence() != 1 {
+		t.Fatalf("first COMMIT mutation state = %+v", mutation)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatalf("item retry dispatched storage %d times", calls)
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := acquireWriteTransaction(resources, 1)
+	if transaction == nil {
+		t.Fatal("item retry discarded the staged transaction")
+	}
+	transaction.mu.Lock()
+	state, staged, stage := transaction.state, transaction.staged, transaction.stage
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+	if state != writeTransactionStaging || staged != 3 || stage == nil {
+		t.Fatalf("item retry transaction = state %v, staged %d, stage %T", state, staged, stage)
+	}
+
+	if err := visibility.Ack(credential.ID, complete.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-peerResult; err != nil {
+		t.Fatal(err)
+	}
+	second := writeTransactionTestCommitRequest(4, 1, 3, identity)
+	second.FrontendOperationId = 77
+	second.VisibilityRetryAfterSequence = complete.Cursor.Sequence
+	second.Mutation.Sequence = 2
+	committed := h.commitWriteTransaction(ctx, second, credential, second.GetWriteTransaction())
+	if committed.GetErrno() != 0 || committed.GetWriteTransaction().GetFlags() != writeTransactionReplyCommitted ||
+		committed.GetWriteTransaction().GetCommittedSize() != 3 {
+		t.Fatalf("retried COMMIT = %+v", committed)
+	}
+	if mutation := committed.GetMutation(); mutation.GetSlot() != 0 || mutation.GetAcceptedSequence() != 2 {
+		t.Fatalf("retried COMMIT mutation state = %+v", mutation)
+	}
+	if calls, data := target.commitSnapshot(); calls != 1 || len(data) != 1 || string(data[0]) != "abc" {
+		t.Fatalf("retried storage COMMIT = %d calls, data %q", calls, data)
 	}
 }
 

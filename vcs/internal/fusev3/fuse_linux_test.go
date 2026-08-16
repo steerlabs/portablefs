@@ -91,10 +91,11 @@ type fakeRPC struct {
 	// afterMutation runs after the envelope has been attached but before the
 	// response is returned to the frontend, allowing ordering tests to place a
 	// raw callback precisely on either side of transport delivery.
-	mutationStates      []*authoritypb.MutationState
-	mutationSeq         uint64
-	afterMutation       func()
-	retainedConsumption authorityrpc.ResponseConsumption
+	mutationStates       []*authoritypb.MutationState
+	mutationSeq          uint64
+	afterMutation        func()
+	retainedConsumption  authorityrpc.ResponseConsumption
+	retainedConsumptions []authorityrpc.ResponseConsumption
 
 	// observeCancel makes every call wait briefly on its own context so a test
 	// can prove whether the kernel's INTERRUPT reached the authority.
@@ -147,7 +148,7 @@ func (f *fakeRPC) CallReadRetained(
 ) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
 	response, err := f.CallRead(ctx, request)
 	f.mu.Lock()
-	consumption := f.retainedConsumption
+	consumption := f.takeRetainedConsumptionLocked()
 	f.mu.Unlock()
 	return response, consumption, err
 }
@@ -163,7 +164,7 @@ func (f *fakeRPC) CallIdempotentRetained(
 ) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
 	response, err := f.CallIdempotent(ctx, request)
 	f.mu.Lock()
-	consumption := f.retainedConsumption
+	consumption := f.takeRetainedConsumptionLocked()
 	f.mu.Unlock()
 	return response, consumption, err
 }
@@ -221,9 +222,18 @@ func (f *fakeRPC) CallMutationWithIdentityRetained(
 ) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
 	response, err := f.CallMutationWithIdentity(ctx, request, assigned)
 	f.mu.Lock()
-	consumption := f.retainedConsumption
+	consumption := f.takeRetainedConsumptionLocked()
 	f.mu.Unlock()
 	return response, consumption, err
+}
+
+func (f *fakeRPC) takeRetainedConsumptionLocked() authorityrpc.ResponseConsumption {
+	if len(f.retainedConsumptions) == 0 {
+		return f.retainedConsumption
+	}
+	consumption := f.retainedConsumptions[0]
+	f.retainedConsumptions = f.retainedConsumptions[1:]
+	return consumption
 }
 
 type recordingResponseConsumption struct{ calls atomic.Int32 }
@@ -1424,6 +1434,46 @@ func TestSyncFSPropagatesDefiniteErrorAndRejectsMalformedSuccess(t *testing.T) {
 			Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID,
 		}}); status != fuse.Status(syscall.ENOTCONN) || !mount.isRevoked() {
 			t.Fatalf("malformed SYNCFS success = %v, revoked=%t fatal=%v", status, mount.isRevoked(), mount.fatalError())
+		}
+	})
+}
+
+func TestLinuxFrontendRejectsItemRetryOutsideItemMutation(t *testing.T) {
+	t.Run("ungated mutation", func(t *testing.T) {
+		frontend, mount, rpc := testRawFileSystem(t, 8)
+		rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+			if request.GetSyncFs() == nil {
+				return nil, errors.New("unexpected request in ungated item-retry test")
+			}
+			return &authoritypb.Response{
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+				VisibilityRetrySequence: 1,
+			}, nil
+		}
+		if status := frontend.SyncFS(nil, &fuse.SyncFSIn{InHeader: fuse.InHeader{
+			Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID,
+		}}); status != fuse.EIO || !mount.isRevoked() {
+			t.Fatalf("ungated item retry = %v, revoked=%t fatal=%v", status, mount.isRevoked(), mount.fatalError())
+		}
+	})
+
+	t.Run("read-only request", func(t *testing.T) {
+		f := newStrictFixture(t)
+		entry := f.lookup(t, fuse.FUSE_ROOT_ID, "read-retry")
+		f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+			if request.GetGetAttr() == nil {
+				return nil, errors.New("unexpected request in read item-retry test")
+			}
+			return &authoritypb.Response{
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+				VisibilityRetrySequence: 1,
+			}, nil
+		}
+		status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{
+			Unique: nextTestRequestUnique(), NodeId: entry.NodeId,
+		}}, &fuse.AttrOut{})
+		if status != fuse.Status(syscall.ENOTCONN) || !f.mount.isRevoked() {
+			t.Fatalf("read-only item retry = %v, revoked=%t fatal=%v", status, f.mount.isRevoked(), f.mount.fatalError())
 		}
 	})
 }

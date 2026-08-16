@@ -82,6 +82,15 @@ const strictLinuxMutationSuiteFeature = "strict-linux-mutation-suite-v1"
 // reply that carries the exact post-mutation state.
 const terminalAppliedDeliveryFeature = "terminal-applied-delivery-receipt-v1"
 
+// sequencedItemVisibilityRetryFeature proves both sides implement the exact
+// Linux item-only handoff: the authority returns the blocking peer sequence and
+// the frontend waits for that local repair before resubmitting with an
+// authority-authenticated, replay-bound proof. The proof lets the retried DATA
+// request wait behind an in-flight CONTROL ACK without reopening the source-gate
+// cycle. Without this negotiation, an older protocol-5 frontend could leak the
+// internal EINTR to an application or spin across those independent lanes.
+const sequencedItemVisibilityRetryFeature = "sequenced-item-visibility-retry-v1"
+
 // RequiredWriteTransactionBytes is Linux MAX_RW_COUNT on the smallest
 // supported page size. Larger-page kernels have a slightly smaller bound, so
 // this fixed authority contract can stage every legal write_iter without a
@@ -89,9 +98,9 @@ const terminalAppliedDeliveryFeature = "terminal-applied-delivery-receipt-v1"
 const RequiredWriteTransactionBytes uint64 = 0x7ffff000
 
 var (
-	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
+	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", sequencedItemVisibilityRetryFeature, "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
 	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition", strictWriteTransactionFeature}
-	requiredStrictAttachFeatures = []string{"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", "namespace-post-binding-identity", "source-publication-gate-v1"}
+	requiredStrictAttachFeatures = []string{"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption", sequencedItemVisibilityRetryFeature, "namespace-post-binding-identity", "source-publication-gate-v1"}
 )
 
 func hasFeatures(advertised, required []string) bool {
@@ -197,6 +206,29 @@ func requestIsVisibleMutation(req *authoritypb.Request) bool {
 
 func validSourcePublicationGatePresence(req *authoritypb.Request) bool {
 	return (req.GetSourcePublicationGate() != nil) == requestIsVisibleMutation(req)
+}
+
+// validVisibilityRetryRequestShape is the wire-level half of the item retry
+// proof. The visibility coordinator validates the stateful half against the
+// exact one-shot debt it issued. Keeping the cheap structural checks here
+// prevents a retry proof from entering lifecycle, read-only, namespace, or
+// callback-serialized paths where it has no meaning.
+func validVisibilityRetryRequestShape(req *authoritypb.Request, gate *volumeserver.SourcePublicationGate) bool {
+	if req == nil {
+		return false
+	}
+	if req.GetVisibilityRetryAfterSequence() == 0 {
+		return true
+	}
+	if !requestIsVisibleMutation(req) || req.GetFrontendOperationId() == 0 || gate == nil || len(gate.Targets) == 0 {
+		return false
+	}
+	for _, target := range gate.Targets {
+		if target.ParentIdentity != ([16]byte{}) {
+			return false
+		}
+	}
+	return true
 }
 
 // decodeSourcePublicationGate validates the one canonical wire declaration
@@ -360,7 +392,11 @@ func canonicalFingerprint(runtime *volumeserver.Authority, req *authoritypb.Requ
 	// materializing one payload-sized byte slice at every protobuf nesting level.
 	// The tiny envelope below deliberately shares the body; canonicalWrite only
 	// reads it.
-	body := &authoritypb.Request{SourcePublicationGate: req.GetSourcePublicationGate(), Body: req.GetBody()}
+	body := &authoritypb.Request{
+		SourcePublicationGate:        req.GetSourcePublicationGate(),
+		VisibilityRetryAfterSequence: req.GetVisibilityRetryAfterSequence(),
+		Body:                         req.GetBody(),
+	}
 	return runtime.ReplayFingerprint(func(writer io.Writer) error {
 		return canonicalWrite(writer, body.ProtoReflect())
 	})

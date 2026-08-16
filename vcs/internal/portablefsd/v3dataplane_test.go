@@ -2116,6 +2116,27 @@ func TestV3DataPlaneMapsClassifiedPreApplyInterruptionToECANCELEDWithoutFencing(
 	}
 }
 
+func TestV3DataPlaneRejectsLinuxOnlyItemVisibilityRetry(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
+		return &authoritypb.Response{
+			Errno: errnos.EINTR, Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+			VisibilityRetrySequence: 1,
+			Mutation:                &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+		}, nil
+	}
+	root := d.resolveReply().Root
+	if _, errno := dispatchV3Test(d, context.Background(), 74, &pfslocal.RenameRequest{
+		FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new"),
+	}); errno != darwinEIO {
+		t.Fatalf("Linux-only item retry on FSKit = %d, want fail-closed EIO", errno)
+	}
+	if d.terminalError() == nil {
+		t.Fatal("Linux-only item retry did not terminalize callback-serialized frontend")
+	}
+}
+
 func TestV3DataPlaneAssignedUncertaintyFailsClosedAcrossPublicationAck(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)

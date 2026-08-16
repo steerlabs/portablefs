@@ -455,9 +455,13 @@ func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
 	}
 	f.raw.mu.Lock()
 	held := len(f.raw.peerHeldPhase) != 0 || len(f.raw.peerHolds) != 0
+	completed := f.raw.completedVisibilitySequence
 	f.raw.mu.Unlock()
 	if held {
 		t.Fatal("ENOENT exact-size repair left the peer visibility cut held")
+	}
+	if completed != 27 {
+		t.Fatalf("local completed visibility sequence = %d, want 27", completed)
 	}
 }
 

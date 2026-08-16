@@ -272,13 +272,14 @@ type rawFileSystem struct {
 	// Source-owned gates close publication before the mutation gets a replay
 	// identity or can put bytes on the wire. Unlike peer visibility state, these
 	// maps are keyed only by stable filesystem identities and exact names.
-	sourceHolds                map[publicationCoordinate]*sourcePublicationLease
-	sourcePublishing           map[publicationCoordinate]int
-	peerHolds                  map[publicationCoordinate]int
-	sourceUnresolvedAttributes map[*sourcePublicationLease]int
-	sourceUnresolvedData       map[*sourcePublicationLease]int
-	peerHeldPhase              []publicationCoordinate
-	sourceChanged              chan struct{}
+	sourceHolds                 map[publicationCoordinate]*sourcePublicationLease
+	sourcePublishing            map[publicationCoordinate]int
+	peerHolds                   map[publicationCoordinate]int
+	sourceUnresolvedAttributes  map[*sourcePublicationLease]int
+	sourceUnresolvedData        map[*sourcePublicationLease]int
+	peerHeldPhase               []publicationCoordinate
+	sourceChanged               chan struct{}
+	completedVisibilitySequence uint64
 
 	// parked is the set of directories whose kernel i_rwsem this mount is
 	// holding for an authority mutation that has not been answered yet.

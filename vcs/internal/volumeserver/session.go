@@ -117,10 +117,11 @@ type SessionCredential struct {
 }
 
 type MutationID struct {
-	Slot                uint32
-	Sequence            uint64
-	Fingerprint         RequestFingerprint
-	FrontendOperationID uint64
+	Slot                         uint32
+	Sequence                     uint64
+	Fingerprint                  RequestFingerprint
+	FrontendOperationID          uint64
+	VisibilityRetryAfterSequence uint64
 }
 
 // Outcome is the exact wire-ready result retained for a duplicate request.

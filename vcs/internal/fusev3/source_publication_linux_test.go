@@ -668,6 +668,30 @@ func TestPeerFirstSourceGateReturnsEINTRBeforeAssignmentOrTransport(t *testing.T
 	finishPeerVisibility(t, f.raw, targets)
 }
 
+func TestNamespaceMutationRejectsItemOnlyInternalRetryClass(t *testing.T) {
+	f := newStrictFixture(t)
+	f.mount.abort.Do(func() {})
+	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetMkdir() == nil {
+			return nil, errors.New("unexpected request in namespace item-retry test")
+		}
+		return &authoritypb.Response{
+			Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY,
+			VisibilityRetrySequence: 1,
+		}, nil
+	}
+	const unique = uint64(398)
+	status := f.raw.Mkdir(nil, &fuse.MkdirIn{
+		InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o755,
+	}, "must-not-retry", &fuse.EntryOut{})
+	if status != fuse.EIO {
+		t.Fatalf("namespace mutation with item-only retry class = %v, want fail-closed EIO", status)
+	}
+	if !f.mount.isRevoked() || f.mount.fatalError() == nil {
+		t.Fatal("namespace mutation accepted an item-only internal retry class")
+	}
+}
+
 func TestSourceFirstReturnedBindingAndReplyWritePrecedePeerPrepare(t *testing.T) {
 	f := newStrictFixture(t)
 	child := testItem(44, authoritypb.Attr_DIRECTORY, 44)

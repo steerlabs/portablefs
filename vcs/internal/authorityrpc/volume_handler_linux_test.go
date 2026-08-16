@@ -269,6 +269,9 @@ func TestWireErrnoPreservesLinuxSyscall(t *testing.T) {
 	if got := wireErrno(volumeserver.ErrVisibilityInterrupted); got != errnos.EINTR {
 		t.Fatalf("wireErrno(visibility interruption) = %d, want EINTR", got)
 	}
+	if got := wireErrno(volumeserver.ErrVisibilityItemRetry); got != errnos.EINTR {
+		t.Fatalf("wireErrno(item visibility retry) = %d, want EINTR", got)
+	}
 	// Delegated killpriv and logical sync can both fail after one clean
 	// mutation. The authority retains both causes, but the syscall-visible
 	// result must deterministically preserve the security failure while the EIO
@@ -301,6 +304,32 @@ func TestVisibilityInterruptedMapsToDefiniteEINTR(t *testing.T) {
 	}
 	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED {
 		t.Fatalf("visibility interruption failure class = %v, want VISIBILITY_INTERRUPTED", response.GetFailure())
+	}
+}
+
+func TestVisibilityItemRetryMapsToInternalDefiniteEINTR(t *testing.T) {
+	h := &VolumeHandler{}
+	response := h.errorResponse(7, &volumeserver.VisibilityItemRetryError{Sequence: 9}, false)
+	if response.GetErrno() != errnos.EINTR {
+		t.Fatalf("item visibility retry errno = %d, want EINTR", response.GetErrno())
+	}
+	if response.GetUncertain() || response.GetBody() != nil {
+		t.Fatalf("item visibility retry carried an uncertain or state-bearing result: %+v", response)
+	}
+	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY {
+		t.Fatalf("item visibility retry failure class = %v, want VISIBILITY_ITEM_RETRY", response.GetFailure())
+	}
+	if response.GetVisibilityRetrySequence() != 9 {
+		t.Fatalf("item visibility retry sequence = %d, want 9", response.GetVisibilityRetrySequence())
+	}
+}
+
+func TestVisibilityItemRetryWithoutSequenceFailsClosed(t *testing.T) {
+	h := &VolumeHandler{}
+	response := h.errorResponse(7, volumeserver.ErrVisibilityItemRetry, false)
+	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || response.GetVisibilityRetrySequence() != 0 {
+		t.Fatalf("unsequenced item visibility retry = %+v, want uncertain internal EIO", response)
 	}
 }
 

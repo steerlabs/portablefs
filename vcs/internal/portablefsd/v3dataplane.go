@@ -1351,6 +1351,8 @@ func retainedV3ResponseTerminalCause(response *authoritypb.Response, callErr err
 	if response.GetUncertain() ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
+		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY ||
+		response.GetVisibilityRetrySequence() != 0 ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		return errors.New("portablefsd: authority returned a terminal retained outcome")
 	}
@@ -1373,6 +1375,10 @@ func (d *v3DataPlane) revokeRetainedResponse(ctx context.Context, cause error) {
 func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.SourcePublicationGate) (*authoritypb.Response, int32) {
 	if operationID == 0 || request == nil {
 		return nil, darwinEINVAL
+	}
+	if request.GetVisibilityRetryAfterSequence() != 0 {
+		_ = d.fail(errors.New("portablefsd: callback-serialized mutation carried a Linux-only visibility retry proof"))
+		return nil, darwinEIO
 	}
 	lease, err := d.bridge.sourcePublication.acquireSource(ctx, operationID, gate)
 	if err != nil {
@@ -1574,6 +1580,10 @@ func (d *v3DataPlane) classify(response *authoritypb.Response, callErr error, mu
 	}
 	if response == nil || response.GetUncertain() || response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE || response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || response.GetRoutesMismatch().GetSessionRefused() {
 		_ = d.fail(errors.New("portablefsd: authority returned a terminal or malformed outcome"))
+		return nil, darwinEIO
+	}
+	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY || response.GetVisibilityRetrySequence() != 0 {
+		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only item visibility retry to a callback-serialized frontend"))
 		return nil, darwinEIO
 	}
 	if response.GetErrno() != 0 {

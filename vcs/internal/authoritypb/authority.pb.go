@@ -43,6 +43,14 @@ const (
 	// ECANCELED because macOS 26 may transparently re-enter a mutating callback
 	// after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
 	FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED FailureClass = 5
+	// VISIBILITY_ITEM_RETRY is a Linux item-only scheduling handoff, never an
+	// application errno. The authority has definitely not applied the mutation
+	// and, for a staged write, has retained the inert bytes. The Linux frontend
+	// releases its local item gate, lets the older peer repair finish, and
+	// resubmits with a fresh mutation identity inside the same FUSE callback.
+	// Namespace callbacks and callback-serialized frontends never receive this
+	// class because retaining their callback would preserve the repair cycle.
+	FailureClass_FAILURE_CLASS_VISIBILITY_ITEM_RETRY FailureClass = 6
 )
 
 // Enum value maps for FailureClass.
@@ -54,6 +62,7 @@ var (
 		3: "FAILURE_CLASS_COHERENCE",
 		4: "FAILURE_CLASS_ROUTES",
 		5: "FAILURE_CLASS_VISIBILITY_INTERRUPTED",
+		6: "FAILURE_CLASS_VISIBILITY_ITEM_RETRY",
 	}
 	FailureClass_value = map[string]int32{
 		"FAILURE_CLASS_UNSPECIFIED":            0,
@@ -62,6 +71,7 @@ var (
 		"FAILURE_CLASS_COHERENCE":              3,
 		"FAILURE_CLASS_ROUTES":                 4,
 		"FAILURE_CLASS_VISIBILITY_INTERRUPTED": 5,
+		"FAILURE_CLASS_VISIBILITY_ITEM_RETRY":  6,
 	}
 )
 
@@ -622,6 +632,14 @@ type Request struct {
 	// operands and refuses any mismatch before XFS. It is part of the retained
 	// replay fingerprint: an exact replay carries the exact same local cut.
 	SourcePublicationGate *SourcePublicationGate `protobuf:"bytes,7,opt,name=source_publication_gate,json=sourcePublicationGate,proto3" json:"source_publication_gate,omitempty"`
+	// Present only when a Linux item-only mutation is resubmitted after an
+	// authority VISIBILITY_ITEM_RETRY. The value is the exact COMPLETE sequence
+	// the frontend has repaired locally. The authority accepts it only while it
+	// retains the one-shot fairness debt issued to this frontend_operation_id;
+	// it therefore cannot be forged into a general barrier bypass. Keeping this
+	// proof on the retried request closes the independent DATA/CONTROL-lane race
+	// where local repair finishes just before its ACK reaches the authority.
+	VisibilityRetryAfterSequence uint64 `protobuf:"varint,8,opt,name=visibility_retry_after_sequence,json=visibilityRetryAfterSequence,proto3" json:"visibility_retry_after_sequence,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Request_Hello
@@ -741,6 +759,13 @@ func (x *Request) GetSourcePublicationGate() *SourcePublicationGate {
 		return x.SourcePublicationGate
 	}
 	return nil
+}
+
+func (x *Request) GetVisibilityRetryAfterSequence() uint64 {
+	if x != nil {
+		return x.VisibilityRetryAfterSequence
+	}
+	return 0
 }
 
 func (x *Request) GetBody() isRequest_Body {
@@ -1691,6 +1716,10 @@ type Response struct {
 	// Present only on the final response that carries a volume-terminal exact
 	// outcome. The source returns it after its kernel publication boundary.
 	TerminalDeliveryToken []byte `protobuf:"bytes,9,opt,name=terminal_delivery_token,json=terminalDeliveryToken,proto3" json:"terminal_delivery_token,omitempty"` // exactly 16 nonzero bytes
+	// Present exactly with VISIBILITY_ITEM_RETRY. It names the already-delivered
+	// peer phase whose local repair must finish before the Linux frontend may
+	// resubmit. This cross-lane identity prevents transport-speed retry loops.
+	VisibilityRetrySequence uint64 `protobuf:"varint,43,opt,name=visibility_retry_sequence,json=visibilityRetrySequence,proto3" json:"visibility_retry_sequence,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Response_Hello
@@ -1816,6 +1845,13 @@ func (x *Response) GetTerminalDeliveryToken() []byte {
 		return x.TerminalDeliveryToken
 	}
 	return nil
+}
+
+func (x *Response) GetVisibilityRetrySequence() uint64 {
+	if x != nil {
+		return x.VisibilityRetrySequence
+	}
+	return 0
 }
 
 func (x *Response) GetBody() isResponse_Body {
@@ -7647,7 +7683,7 @@ var File_proto_authority_v1_authority_proto protoreflect.FileDescriptor
 
 const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\n" +
-	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xe8\x1a\n" +
+	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xaf\x1b\n" +
 	"\aRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -7655,7 +7691,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\asession\x18\x03 \x01(\v2%.portablefs.authority.v1.SessionProofR\asession\x12=\n" +
 	"\bmutation\x18\x04 \x01(\v2!.portablefs.authority.v1.MutationR\bmutation\x122\n" +
 	"\x15frontend_operation_id\x18\x05 \x01(\x04R\x13frontendOperationId\x12f\n" +
-	"\x17source_publication_gate\x18\a \x01(\v2..portablefs.authority.v1.SourcePublicationGateR\x15sourcePublicationGate\x12=\n" +
+	"\x17source_publication_gate\x18\a \x01(\v2..portablefs.authority.v1.SourcePublicationGateR\x15sourcePublicationGate\x12E\n" +
+	"\x1fvisibility_retry_after_sequence\x18\b \x01(\x04R\x1cvisibilityRetryAfterSequence\x12=\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2%.portablefs.authority.v1.HelloRequestH\x00R\x05hello\x12@\n" +
 	"\x06attach\x18\v \x01(\v2&.portablefs.authority.v1.AttachRequestH\x00R\x06attach\x12@\n" +
@@ -7720,7 +7757,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\fR\x04name\x12)\n" +
 	"\x10bound_attributes\x18\x03 \x01(\bR\x0fboundAttributes\x12\x1d\n" +
 	"\n" +
-	"bound_data\x18\x04 \x01(\bR\tboundData\"\xdb\x12\n" +
+	"bound_data\x18\x04 \x01(\bR\tboundData\"\x97\x13\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -7731,7 +7768,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\bmutation\x18\x06 \x01(\v2&.portablefs.authority.v1.MutationStateR\bmutation\x12?\n" +
 	"\afailure\x18\a \x01(\x0e2%.portablefs.authority.v1.FailureClassR\afailure\x12P\n" +
 	"\x0froutes_mismatch\x18\b \x01(\v2'.portablefs.authority.v1.RoutesMismatchR\x0eroutesMismatch\x126\n" +
-	"\x17terminal_delivery_token\x18\t \x01(\fR\x15terminalDeliveryToken\x12;\n" +
+	"\x17terminal_delivery_token\x18\t \x01(\fR\x15terminalDeliveryToken\x12:\n" +
+	"\x19visibility_retry_sequence\x18+ \x01(\x04R\x17visibilityRetrySequence\x12;\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2#.portablefs.authority.v1.HelloReplyH\x00R\x05hello\x12>\n" +
 	"\x06attach\x18\v \x01(\v2$.portablefs.authority.v1.AttachReplyH\x00R\x06attach\x12>\n" +
@@ -8171,14 +8209,15 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x0eSetLockRequest\x125\n" +
 	"\x04lock\x18\x01 \x01(\v2!.portablefs.authority.v1.LockSpecR\x04lock\x12\x12\n" +
 	"\x04wait\x18\x02 \x01(\bR\x04wait\x12\x16\n" +
-	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xc5\x01\n" +
+	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xee\x01\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15FAILURE_CLASS_STORAGE\x10\x01\x12\x1a\n" +
 	"\x16FAILURE_CLASS_INTERNAL\x10\x02\x12\x1b\n" +
 	"\x17FAILURE_CLASS_COHERENCE\x10\x03\x12\x18\n" +
 	"\x14FAILURE_CLASS_ROUTES\x10\x04\x12(\n" +
-	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05*d\n" +
+	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05\x12'\n" +
+	"#FAILURE_CLASS_VISIBILITY_ITEM_RETRY\x10\x06*d\n" +
 	"\rTransportRole\x12\x1e\n" +
 	"\x1aTRANSPORT_ROLE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13TRANSPORT_ROLE_DATA\x10\x01\x12\x1a\n" +

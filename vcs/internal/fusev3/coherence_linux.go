@@ -104,6 +104,7 @@ type mutationCallbackKey struct{}
 type mutationCallback struct {
 	publication replyPublication
 	mount       *Mount
+	operationID uint64
 }
 
 func (c *mutationCallback) finish() {
@@ -133,6 +134,25 @@ func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem
 	}
 	c.publication.source = lease
 	return lease, nil
+}
+
+// releaseItemRetry closes one definite-preapply item attempt without exposing
+// it to the kernel. The authority retained no filesystem result (and retains
+// staged write bytes separately), so the exact response-consumption boundary
+// is this local decision. Clearing source permits the same FUSE callback to
+// acquire a fresh cut after the older peer repair; namespace callbacks never
+// use this transition.
+func (c *mutationCallback) releaseItemRetry(lease *sourcePublicationLease) error {
+	if c == nil || lease == nil || c.publication.source != lease {
+		return errors.New("fusev3: item retry lost its source publication lease")
+	}
+	lease.resolveAllNoBinding()
+	if err := lease.markDefiniteNoChange(); err != nil {
+		return err
+	}
+	lease.release()
+	c.publication.source = nil
+	return nil
 }
 
 func sourceLeaseFromContext(ctx context.Context) *sourcePublicationLease {
@@ -194,7 +214,7 @@ func completeDefiniteNoChangePublication(ctx context.Context) error {
 
 func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(), fuse.Status) {
 	ctx := r.opContext()
-	callback := &mutationCallback{mount: r.mount}
+	callback := &mutationCallback{mount: r.mount, operationID: unique}
 	if err := r.registerReplyPublication(unique, &callback.publication); err != nil {
 		// Registration is the ownership reservation for every fact this callback
 		// could make cacheable. It happens before any lookup/mutation RPC, so an
@@ -673,6 +693,7 @@ type visibilityCompletion struct {
 	work             []repair
 	parents          map[uint64]struct{}
 	parentKernelInos []uint64
+	sequence         uint64
 }
 
 // beginVisibilityComplete resolves the event against the exact cache registry,
@@ -691,7 +712,7 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 	if err != nil {
 		return visibilityCompletion{}, false, err
 	}
-	completion := visibilityCompletion{parents: make(map[uint64]struct{})}
+	completion := visibilityCompletion{parents: make(map[uint64]struct{}), sequence: sequence}
 	r.mu.Lock()
 	for _, inode := range keys.inodes {
 		if record := r.byInodeLocked(inode.inode); record != nil && record.identity != inode.identity {
@@ -784,7 +805,7 @@ func (r *rawFileSystem) finishVisibilityComplete(ctx context.Context, completion
 			return err
 		}
 	}
-	r.releaseComplete(completion.parents)
+	r.releaseComplete(completion)
 	return nil
 }
 
@@ -799,10 +820,10 @@ func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarg
 	return r.finishVisibilityComplete(context.Background(), completion)
 }
 
-func (r *rawFileSystem) releaseComplete(parents map[uint64]struct{}) {
+func (r *rawFileSystem) releaseComplete(completion visibilityCompletion) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for parent := range parents {
+	for parent := range completion.parents {
 		if r.repairingParents[parent]--; r.repairingParents[parent] <= 0 {
 			delete(r.repairingParents, parent)
 		}
@@ -814,6 +835,9 @@ func (r *rawFileSystem) releaseComplete(parents map[uint64]struct{}) {
 		delete(r.heldInodes, inode.inode)
 	}
 	r.heldPhase = visibilityKeys{}
+	if completion.sequence > r.completedVisibilitySequence {
+		r.completedVisibilitySequence = completion.sequence
+	}
 	r.releasePeerPublicationLocked()
 	r.signalParkedLocked()
 }

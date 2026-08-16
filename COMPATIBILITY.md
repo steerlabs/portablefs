@@ -82,7 +82,8 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   `transactional-shared-write-v1`, `strict-linux-mutation-suite-v1`,
   `terminal-applied-delivery-receipt-v1`,
   `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
-  `classified-visibility-interruption`, `source-publication-gate-v1`,
+  `classified-visibility-interruption`, `sequenced-item-visibility-retry-v1`,
+  `source-publication-gate-v1`,
   `namespace-post-binding-identity`, and `exact-resource-acquisition` features at `Hello`, and `write-through`,
   `no-history`, `no-branches`,
   `direct-io-no-file-mmap`, `user-xattr-readonly`, `single-principal`,
@@ -90,10 +91,19 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   `volume-syncfs-barrier`, and `exact-resource-acquisition` at `Activate`. A
   strict attach additionally requires
   `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
-  `classified-visibility-interruption`, `source-publication-gate-v1`, and
+  `classified-visibility-interruption`, `sequenced-item-visibility-retry-v1`,
+  `source-publication-gate-v1`, and
   `namespace-post-binding-identity` in its Activate reply. These strings are the contract's shape written down: an
   authority that stopped meeting one of them would be refused rather than
   silently tolerated.
+
+  The sequenced item retry is an internal Linux liveness transaction, not an
+  application errno or a timed retry. The authority names the exact peer
+  COMPLETE that blocked an item-only callback; after repairing it, the frontend
+  resubmits with that sequence. The authority accepts the proof only for the
+  same callback identity and its retained one-shot FIFO debt. This lets DATA
+  wait behind a CONTROL ACK already in flight without allowing a stale, forged,
+  namespace, or FSKit request to bypass visibility ordering.
 
   Feature advertisement proves what the authority can execute; it does not
   manufacture a callback that a host filesystem API does not expose. In

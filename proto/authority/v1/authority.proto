@@ -29,6 +29,14 @@ message Request {
   // operands and refuses any mismatch before XFS. It is part of the retained
   // replay fingerprint: an exact replay carries the exact same local cut.
   SourcePublicationGate source_publication_gate = 7;
+  // Present only when a Linux item-only mutation is resubmitted after an
+  // authority VISIBILITY_ITEM_RETRY. The value is the exact COMPLETE sequence
+  // the frontend has repaired locally. The authority accepts it only while it
+  // retains the one-shot fairness debt issued to this frontend_operation_id;
+  // it therefore cannot be forged into a general barrier bypass. Keeping this
+  // proof on the retried request closes the independent DATA/CONTROL-lane race
+  // where local repair finishes just before its ACK reaches the authority.
+  uint64 visibility_retry_after_sequence = 8;
   reserved 33;
   reserved "write";
 
@@ -154,6 +162,10 @@ message Response {
   // Present only on the final response that carries a volume-terminal exact
   // outcome. The source returns it after its kernel publication boundary.
   bytes terminal_delivery_token = 9; // exactly 16 nonzero bytes
+  // Present exactly with VISIBILITY_ITEM_RETRY. It names the already-delivered
+  // peer phase whose local repair must finish before the Linux frontend may
+  // resubmit. This cross-lane identity prevents transport-speed retry loops.
+  uint64 visibility_retry_sequence = 43;
   reserved 26;
   reserved "write";
 
@@ -243,6 +255,14 @@ enum FailureClass {
   // ECANCELED because macOS 26 may transparently re-enter a mutating callback
   // after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
   FAILURE_CLASS_VISIBILITY_INTERRUPTED = 5;
+  // VISIBILITY_ITEM_RETRY is a Linux item-only scheduling handoff, never an
+  // application errno. The authority has definitely not applied the mutation
+  // and, for a staged write, has retained the inert bytes. The Linux frontend
+  // releases its local item gate, lets the older peer repair finish, and
+  // resubmits with a fresh mutation identity inside the same FUSE callback.
+  // Namespace callbacks and callback-serialized frontends never receive this
+  // class because retaining their callback would preserve the repair cycle.
+  FAILURE_CLASS_VISIBILITY_ITEM_RETRY = 6;
 }
 
 // RoutesMismatch names both sides of a routing-topology disagreement. All

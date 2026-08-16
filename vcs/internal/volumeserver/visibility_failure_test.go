@@ -2127,7 +2127,7 @@ func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T)
 // phase, the source waiter must wake and abandon FIFO immediately; otherwise
 // the peer frontend waits for the source lease while the source waits for the
 // peer-owned turn.
-func TestVisibilityQueuedItemGateWakesForNewPeerPrepare(t *testing.T) {
+func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
 	h.register(t, source, testRepairBudget)
@@ -2156,7 +2156,7 @@ func TestVisibilityQueuedItemGateWakesForNewPeerPrepare(t *testing.T) {
 	var prepared atomic.Bool
 	sourceResult := make(chan error, 1)
 	go func() {
-		sourceResult <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2}, gate,
+		sourceResult <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2, FrontendOperationID: 77}, gate,
 			func() (SourcePublicationGate, error) { return gate, nil },
 			func() ([]VisibilityTarget, error) {
 				prepared.Store(true)
@@ -2175,8 +2175,8 @@ func TestVisibilityQueuedItemGateWakesForNewPeerPrepare(t *testing.T) {
 	}
 	select {
 	case err := <-sourceResult:
-		if !errors.Is(err, ErrVisibilityInterrupted) {
-			t.Fatalf("queued item source = %v, want ErrVisibilityInterrupted", err)
+		if !errors.Is(err, ErrVisibilityItemRetry) {
+			t.Fatalf("queued item source = %v, want ErrVisibilityItemRetry", err)
 		}
 	case <-ctx.Done():
 		t.Fatal("queued item source did not wake for overlapping PREPARE")
@@ -2184,9 +2184,86 @@ func TestVisibilityQueuedItemGateWakesForNewPeerPrepare(t *testing.T) {
 	if prepared.Load() {
 		t.Fatal("interrupted item source reached prepare")
 	}
-	runBarrierFrom(t, h.coordinator, source, prepare)
+	h.coordinator.mu.Lock()
+	dormant, exists := h.coordinator.fairness[source]
+	h.coordinator.mu.Unlock()
+	if !exists || dormant.active || !dormant.observed || dormant.operationID != 77 || !dormant.claimSameOperation || dormant.ordinal == 0 {
+		t.Fatalf("dormant Linux item retry credit = %+v, present=%t", dormant, exists)
+	}
+	if err := h.coordinator.Ack(source, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := h.coordinator.Next(ctx, source, prepare.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model the independent transport lanes exactly: the frontend has finished
+	// the COMPLETE repair and sends its retry proof on DATA while the combined
+	// COMPLETE ACK is still in flight on CONTROL. The proof may claim the
+	// dormant ordinal, but it must remain behind the barrier owner until ACK.
+	type acquired struct {
+		turn *mutationOrderWaiter
+		err  error
+	}
+	retried := make(chan acquired, 1)
+	go func() {
+		turn, err := h.coordinator.acquireMutationOrder(ctx, source, MutationID{
+			Sequence: 3, FrontendOperationID: 77,
+			VisibilityRetryAfterSequence: complete.Cursor.Sequence,
+		}, nil, &gate)
+		retried <- acquired{turn: turn, err: err}
+	}()
+	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	select {
+	case got := <-retried:
+		if got.turn != nil {
+			got.turn.release()
+		}
+		t.Fatalf("proved retry escaped before COMPLETE ACK: %+v", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := h.coordinator.Ack(source, complete.Cursor); err != nil {
+		t.Fatal(err)
+	}
 	if err := <-owner; err != nil {
 		t.Fatal(err)
+	}
+	got := <-retried
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.turn.ordinal != dormant.ordinal {
+		t.Fatalf("retried item ordinal = %d, want preserved %d", got.turn.ordinal, dormant.ordinal)
+	}
+	got.turn.release()
+}
+
+func TestVisibilityLinuxItemRetryProofIsExactAndMandatory(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	source := SessionID{1}
+	h.register(t, source, testRepairBudget)
+	var identity [16]byte
+	identity[0] = 32
+	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: identity, Attributes: true}}}
+	h.coordinator.mu.Lock()
+	h.coordinator.fairness[source] = mutationFairnessDebt{
+		sequence: 41, ordinal: h.coordinator.order.reserveOrdinal(), operationID: 77,
+		claimSameOperation: true, observed: true,
+	}
+	h.coordinator.mu.Unlock()
+
+	for name, mutation := range map[string]MutationID{
+		"omitted":         {Sequence: 2, FrontendOperationID: 77},
+		"wrong sequence":  {Sequence: 2, FrontendOperationID: 77, VisibilityRetryAfterSequence: 40},
+		"wrong operation": {Sequence: 2, FrontendOperationID: 78, VisibilityRetryAfterSequence: 41},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := h.coordinator.acquireMutationOrder(t.Context(), source, mutation, nil, &gate)
+			if !errors.Is(err, ErrSourcePublicationGate) {
+				t.Fatalf("retry proof error = %v, want ErrSourcePublicationGate", err)
+			}
+		})
 	}
 }
 

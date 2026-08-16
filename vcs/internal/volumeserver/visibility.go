@@ -11,6 +11,30 @@ import (
 	"time"
 )
 
+// VisibilityItemRetryError identifies the exact peer phase a Linux item-only
+// mutation must wait behind. Sequence is mandatory: DATA and CONTROL are
+// independent transport lanes, so the frontend cannot infer which repair made
+// this definite-preapply handoff necessary from arrival order.
+type VisibilityItemRetryError struct {
+	Sequence uint64
+}
+
+func (e *VisibilityItemRetryError) Error() string {
+	return fmt.Sprintf("%v (visibility sequence %d)", ErrVisibilityItemRetry, e.Sequence)
+}
+
+func (e *VisibilityItemRetryError) Is(target error) bool {
+	return target == ErrVisibilityItemRetry
+}
+
+func VisibilityItemRetrySequence(err error) (uint64, bool) {
+	var retry *VisibilityItemRetryError
+	if !errors.As(err, &retry) || retry.Sequence == 0 {
+		return 0, false
+	}
+	return retry.Sequence, true
+}
+
 var (
 	// ErrVisibilityLost fences one strict cache holder that disappeared without
 	// a durable, post-unmount detach. It is deliberately scoped to that one
@@ -32,6 +56,13 @@ var (
 	// callback. Parent-exclusive repair is scoped to an overlapping held parent.
 	// The caller may retry after the phase; no filesystem mutation was executed.
 	ErrVisibilityInterrupted = errors.New("volumeserver: visible mutation interrupted by this participant's pending cache repair")
+	// ErrVisibilityItemRetry is the item-only form of the same pre-apply
+	// dependency for a Linux parent-exclusive participant. The authority must
+	// release the request's FIFO turn, but the frontend can release its inode
+	// source gate and retry inside the same FUSE callback; no kernel namespace
+	// lock or callback-capacity dependency requires surfacing an application
+	// EINTR. Staged write bytes remain inert and reusable across this handoff.
+	ErrVisibilityItemRetry = errors.New("volumeserver: item mutation must retry after this participant's pending cache repair")
 	// ErrSourcePublicationGate means a strict initiating frontend did not prove
 	// the exact local publication cut required before mutation dispatch. It is a
 	// participant protocol violation, not an authority-epoch defect.
@@ -170,6 +201,15 @@ const maxSourcePublicationTargets = 16
 // those are peer-repair coordinates, not portable frontend identities.
 type SourcePublicationGate struct {
 	Targets []SourcePublicationTarget
+}
+
+func (g SourcePublicationGate) hasNamespace() bool {
+	for _, target := range g.Targets {
+		if target.namespace() {
+			return true
+		}
+	}
+	return false
 }
 
 // SourcePublicationTarget is either one item coordinate (Identity) or one
@@ -499,12 +539,13 @@ type visibilityInterruption struct {
 // COMPLETE Ack. A wholly local frontend refusal activates the PREPARE-time cut
 // at the same edge. Neither form owns mutation order while unclaimed.
 type mutationFairnessDebt struct {
-	sequence    uint64
-	ordinal     uint64
-	operationID uint64
-	observed    bool
-	active      bool
-	deadline    time.Time
+	sequence           uint64
+	ordinal            uint64
+	operationID        uint64
+	claimSameOperation bool
+	observed           bool
+	active             bool
+	deadline           time.Time
 }
 
 const mutationFairnessClaimWindow = time.Second
@@ -1220,13 +1261,16 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		// after refreshing those identities and before any prepare/apply work.
 		c.mu.Lock()
 		participant := c.participants[source]
-		interrupted := participant != nil && c.mutationMustYieldLocked(source, mutation, participant, held, gate)
-		if interrupted {
-			c.recordDormantFairnessLocked(source, participant, mutation, turn)
+		yieldErr := error(nil)
+		if participant != nil {
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+		}
+		if yieldErr != nil {
+			c.recordDormantFairnessLocked(source, participant, mutation, turn, gate)
 		}
 		c.mu.Unlock()
-		if interrupted {
-			return ErrVisibilityInterrupted
+		if yieldErr != nil {
+			return yieldErr
 		}
 	}
 
@@ -1335,22 +1379,33 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source SessionID, mutation MutationID,
 	held [][16]byte, gate *SourcePublicationGate) (*mutationOrderWaiter, error) {
 	var turn *mutationOrderWaiter
+	retryProofValidated := false
 	for {
 		c.mu.Lock()
 		participant := c.participants[source]
 		var changed <-chan struct{}
-		interrupted := false
-		fairnessEligible := eligibleForFairness(participant, mutation)
+		var yieldErr error
+		fairnessEligible := eligibleForFairness(participant, mutation, gate)
+		if !retryProofValidated && mutation.VisibilityRetryAfterSequence != 0 {
+			if !c.validItemRetryProofLocked(source, participant, mutation, held, gate) {
+				c.mu.Unlock()
+				return nil, ErrSourcePublicationGate
+			}
+			retryProofValidated = true
+		} else if !retryProofValidated && c.itemRetryProofRequiredLocked(source, participant, mutation, held, gate) {
+			c.mu.Unlock()
+			return nil, ErrSourcePublicationGate
+		}
 		if participant != nil {
-			interrupted = c.mutationMustYieldLocked(source, mutation, participant, held, gate)
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
 			if gate != nil || participant.repair == NamespaceRepairCallbackSerialized ||
 				participant.repair == NamespaceRepairCallbackSerializedPipelined ||
 				(participant.repair == NamespaceRepairParentExclusive && len(held) != 0) {
 				changed = participant.changed
 			}
 		}
-		if interrupted {
-			c.recordDormantFairnessLocked(source, participant, mutation, turn)
+		if yieldErr != nil {
+			c.recordDormantFairnessLocked(source, participant, mutation, turn, gate)
 			if turn != nil {
 				// Retire the exact node while c.mu still excludes COMPLETE Ack,
 				// linearizing ordinal capture and removal before the debt can become
@@ -1363,8 +1418,8 @@ func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source
 			turn = c.order.enqueueFor(reserved)
 		}
 		c.mu.Unlock()
-		if interrupted {
-			return nil, ErrVisibilityInterrupted
+		if yieldErr != nil {
+			return nil, yieldErr
 		}
 
 		select {
@@ -1373,15 +1428,18 @@ func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source
 			// owner. Re-read under c.mu before allowing prepare to run.
 			c.mu.Lock()
 			participant = c.participants[source]
-			interrupted = participant != nil && c.mutationMustYieldLocked(source, mutation, participant, held, gate)
-			if interrupted {
-				c.recordDormantFairnessLocked(source, participant, mutation, turn)
+			yieldErr = nil
+			if participant != nil {
+				yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+			}
+			if yieldErr != nil {
+				c.recordDormantFairnessLocked(source, participant, mutation, turn, gate)
 				turn.abandon()
 				turn = nil
 			}
 			c.mu.Unlock()
-			if interrupted {
-				return nil, ErrVisibilityInterrupted
+			if yieldErr != nil {
+				return nil, yieldErr
 			}
 			return turn, nil
 		case <-changed:
@@ -1394,14 +1452,19 @@ func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source
 	}
 }
 
-func eligibleForFairness(participant *visibilityParticipant, mutation MutationID) bool {
-	return participant != nil &&
-		participant.repair == NamespaceRepairCallbackSerializedPipelined &&
-		mutation.FrontendOperationID != 0
+func eligibleForFairness(participant *visibilityParticipant, mutation MutationID, gate *SourcePublicationGate) bool {
+	if participant == nil || mutation.FrontendOperationID == 0 {
+		return false
+	}
+	if participant.repair == NamespaceRepairCallbackSerializedPipelined {
+		return true
+	}
+	return participant.repair == NamespaceRepairParentExclusive && gate != nil && !gate.hasNamespace()
 }
 
-func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, participant *visibilityParticipant, mutation MutationID, turn *mutationOrderWaiter) {
-	if !eligibleForFairness(participant, mutation) || participant.pending == nil {
+func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, participant *visibilityParticipant, mutation MutationID,
+	turn *mutationOrderWaiter, gate *SourcePublicationGate) {
+	if !eligibleForFairness(participant, mutation, gate) || participant.pending == nil {
 		return
 	}
 	event := participant.pending.event
@@ -1414,11 +1477,30 @@ func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, pa
 		exists = false
 	}
 	if exists {
-		if debt.active || debt.sequence != event.Cursor.Sequence {
+		if debt.active {
+			// A Linux retry can be overtaken only by work which already owned an
+			// earlier FIFO position. If that work opens a second overlapping phase,
+			// carry the same one-shot credit to the new sequence and preserve its
+			// earliest ordinal. The frontend will repair that phase and return the
+			// new proof; this is coalescing, never a second credit.
+			if participant.repair == NamespaceRepairParentExclusive && debt.claimSameOperation &&
+				debt.operationID == mutation.FrontendOperationID {
+				debt.sequence = event.Cursor.Sequence
+				debt.observed = true
+				debt.active = false
+				debt.deadline = time.Time{}
+				if turn != nil && turn.ordinal < debt.ordinal {
+					debt.ordinal = turn.ordinal
+				}
+				c.fairness[source] = debt
+			}
+			return
+		}
+		if debt.sequence != event.Cursor.Sequence {
 			return
 		}
 		debt.observed = true
-		if debt.operationID == 0 {
+		if debt.operationID == 0 && participant.repair == NamespaceRepairCallbackSerializedPipelined {
 			debt.operationID = mutation.FrontendOperationID
 		}
 		if turn != nil && turn.ordinal < debt.ordinal {
@@ -1432,10 +1514,11 @@ func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, pa
 		ordinal = turn.ordinal
 	}
 	c.fairness[source] = mutationFairnessDebt{
-		sequence:    event.Cursor.Sequence,
-		ordinal:     ordinal,
-		operationID: mutation.FrontendOperationID,
-		observed:    true,
+		sequence:           event.Cursor.Sequence,
+		ordinal:            ordinal,
+		operationID:        mutation.FrontendOperationID,
+		claimSameOperation: participant.repair == NamespaceRepairParentExclusive,
+		observed:           true,
 	}
 }
 
@@ -1444,21 +1527,75 @@ func (c *VisibilityCoordinator) claimFairnessLocked(source SessionID, mutation M
 		return 0
 	}
 	debt, exists := c.fairness[source]
-	if !exists || !debt.active {
+	if !exists {
 		return 0
 	}
-	if c.cfg.Now().After(debt.deadline) {
+	if debt.active && c.cfg.Now().After(debt.deadline) {
 		delete(c.fairness, source)
 		return 0
 	}
-	if debt.operationID != 0 && debt.operationID == mutation.FrontendOperationID {
+	if debt.claimSameOperation {
+		// Linux item retries may claim a dormant credit before the CONTROL ACK
+		// reaches the authority. The queue node then waits behind the barrier's
+		// current owner and is already in its preserved FIFO position when that
+		// owner releases. The exact proof is what makes claiming before activation
+		// safe; an ordinary or forged request cannot take this branch.
+		if mutation.VisibilityRetryAfterSequence != debt.sequence ||
+			mutation.FrontendOperationID == 0 || mutation.FrontendOperationID != debt.operationID {
+			return 0
+		}
+	} else if !debt.active {
+		return 0
+	}
+	if debt.operationID != 0 && (debt.operationID == mutation.FrontendOperationID) != debt.claimSameOperation {
 		return 0
 	}
 	delete(c.fairness, source)
 	return debt.ordinal
 }
 
-// mutationMustYieldLocked reports the exact pending-repair dependency that a
+// validItemRetryProofLocked authenticates a cross-lane retry against the exact
+// off-list debt created when this operation was previously refused. The proof
+// is deliberately not a general assertion that a frontend is repaired: it is
+// valid only for the same Linux parent-exclusive participant, item-only gate,
+// callback identity, and authority sequence. The caller holds c.mu.
+func (c *VisibilityCoordinator) validItemRetryProofLocked(source SessionID, participant *visibilityParticipant,
+	mutation MutationID, held [][16]byte, gate *SourcePublicationGate) bool {
+	if mutation.VisibilityRetryAfterSequence == 0 || mutation.FrontendOperationID == 0 || participant == nil ||
+		participant.repair != NamespaceRepairParentExclusive || len(held) != 0 || gate == nil || gate.hasNamespace() {
+		return false
+	}
+	debt, exists := c.fairness[source]
+	if exists && debt.active && c.cfg.Now().After(debt.deadline) {
+		delete(c.fairness, source)
+		return false
+	}
+	return exists && debt.observed && debt.claimSameOperation && debt.operationID == mutation.FrontendOperationID &&
+		debt.sequence == mutation.VisibilityRetryAfterSequence
+}
+
+// itemRetryProofRequiredLocked rejects a fresh mutation identity which tries
+// to continue the exact Linux callback after receiving a retry but omits the
+// sequence proof. Frontend operation IDs are unique for a strict mount, so an
+// outstanding same-operation debt can only belong to this callback.
+func (c *VisibilityCoordinator) itemRetryProofRequiredLocked(source SessionID, participant *visibilityParticipant,
+	mutation MutationID, held [][16]byte, gate *SourcePublicationGate) bool {
+	if mutation.FrontendOperationID == 0 || participant == nil || participant.repair != NamespaceRepairParentExclusive ||
+		len(held) != 0 || gate == nil || gate.hasNamespace() {
+		return false
+	}
+	debt, exists := c.fairness[source]
+	if !exists || !debt.observed || !debt.claimSameOperation || debt.operationID != mutation.FrontendOperationID {
+		return false
+	}
+	if debt.active && c.cfg.Now().After(debt.deadline) {
+		delete(c.fairness, source)
+		return false
+	}
+	return true
+}
+
+// mutationYieldErrorLocked reports the exact pending-repair dependency that a
 // new mutation from source would close. Every filesystem phase is now a peer
 // phase: the initiating frontend pre-closes its own footprint and receives no
 // PREPARE/COMPLETE. If that footprint overlaps a pending peer phase, the peer
@@ -1466,32 +1603,43 @@ func (c *VisibilityCoordinator) claimFairnessLocked(source SessionID, mutation M
 // request wait for mutation order would close a cycle, so it is refused
 // definite-preapply. Callback serialization and Linux parent-lock conflicts
 // retain their stronger platform-specific interruption rules.
-func (c *VisibilityCoordinator) mutationMustYieldLocked(source SessionID, mutation MutationID,
-	participant *visibilityParticipant, held [][16]byte, gate *SourcePublicationGate) bool {
+func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutation MutationID,
+	participant *visibilityParticipant, held [][16]byte, gate *SourcePublicationGate) error {
 	if participant == nil || participant.pending == nil {
-		return false
+		return nil
 	}
 	pending := participant.pending.event
 	if pending.Routes == nil && gate != nil && gate.overlaps(pending.Targets) {
-		return true
+		if participant.repair == NamespaceRepairParentExclusive && len(held) == 0 && !gate.hasNamespace() {
+			// acquireMutationOrder authenticated this proof against the exact
+			// retained debt before it could claim/enqueue. Matching the still-pending
+			// sequence is therefore safe to wait behind: local repair is complete,
+			// and only its CONTROL-lane ACK remains. A different phase must produce a
+			// fresh internal retry so the source gate can reopen for that repair.
+			if mutation.VisibilityRetryAfterSequence == pending.Cursor.Sequence {
+				return nil
+			}
+			return &VisibilityItemRetryError{Sequence: pending.Cursor.Sequence}
+		}
+		return ErrVisibilityInterrupted
 	}
 	switch participant.repair {
 	case NamespaceRepairCallbackSerialized:
-		return true
+		return ErrVisibilityInterrupted
 	case NamespaceRepairCallbackSerializedPipelined:
-		return true
+		return ErrVisibilityInterrupted
 	case NamespaceRepairParentExclusive:
 		interrupt := participant.interrupt
 		if interrupt == nil || participant.pending.event.Cursor != interrupt.cursor {
-			return false
+			return nil
 		}
 		for _, parent := range held {
 			if _, conflict := interrupt.parents[parent]; conflict {
-				return true
+				return ErrVisibilityInterrupted
 			}
 		}
 	}
-	return false
+	return nil
 }
 
 // recordSourceGate publishes the frontend's pre-dispatch cut into the source
@@ -2196,7 +2344,7 @@ func (c *VisibilityCoordinator) AckWithContention(id SessionID, cursor Visibilit
 
 func (c *VisibilityCoordinator) activateFairnessLocked(id SessionID, p *visibilityParticipant, event VisibilityEvent, orderedAdmissionContended bool) {
 	if event.Cursor.Phase != VisibilityComplete || event.Initiator == id || event.Routes != nil ||
-		p.repair != NamespaceRepairCallbackSerializedPipelined {
+		p.repair != NamespaceRepairCallbackSerializedPipelined && p.repair != NamespaceRepairParentExclusive {
 		return
 	}
 	now := c.cfg.Now()

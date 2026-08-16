@@ -377,6 +377,32 @@ func (r *rawFileSystem) signalSourceChangedLocked() {
 	r.sourceChanged = make(chan struct{})
 }
 
+// waitForVisibilityCompletion joins an item-only mutation retry to the exact
+// peer repair which caused it. The sequence is authority-assigned and globally
+// monotonic for the volume. Waiting on the local completion counter makes the
+// independent DATA and CONTROL lanes deterministic without polling or retry
+// backoff; a repair that completed before the retry response arrived satisfies
+// the wait immediately.
+func (r *rawFileSystem) waitForVisibilityCompletion(ctx context.Context, sequence uint64) error {
+	if sequence == 0 {
+		return errors.New("fusev3: item visibility retry carried no sequence")
+	}
+	for {
+		r.mu.Lock()
+		if r.completedVisibilitySequence >= sequence {
+			r.mu.Unlock()
+			return nil
+		}
+		changed := r.sourceChanged
+		r.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("fusev3: wait for visibility sequence %d: %w", sequence, ctx.Err())
+		}
+	}
+}
+
 func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
 	for coordinate := range coordinates {
 		if held := r.sourceHolds[coordinate]; held != nil && held != owner {
