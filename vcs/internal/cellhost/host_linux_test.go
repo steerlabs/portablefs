@@ -285,6 +285,9 @@ func TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota(t *testing.T) 
 		}
 	}
 	volumeControlPath := filepath.Join(cellRoot, ".portablefs-control", volumeID)
+	if err := os.Chown(volumeControlPath, 0, int(plan.ServiceGID)); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(volumeControlPath, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -294,6 +297,14 @@ func TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota(t *testing.T) 
 	}
 	if _, err := host.ensureWriteStaging(context.Background(), plan); err != nil {
 		t.Fatal(err)
+	}
+	controlInfo, err := os.Stat(volumeControlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlStat := controlInfo.Sys().(*syscall.Stat_t)
+	if controlStat.Uid != 0 || controlStat.Gid != 0 || controlInfo.Mode().Perm() != 0o711 {
+		t.Fatalf("reconciled control parent = %d:%d %o, want 0:0 711", controlStat.Uid, controlStat.Gid, controlInfo.Mode().Perm())
 	}
 	if err := os.Chmod(stagingPath, 0o777); err != nil {
 		t.Fatal(err)

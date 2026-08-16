@@ -607,9 +607,13 @@ func ensureRootDirectoryAt(parentFD int, name string, mode uint32) (int, error) 
 		_ = unix.Close(fd)
 		return -1, err
 	}
-	if stat.Uid != 0 || stat.Gid != 0 {
+	if stat.Uid != 0 {
 		_ = unix.Close(fd)
 		return -1, errors.New("cellhost: privileged control directory is not root-owned")
+	}
+	if err := unix.Fchown(fd, 0, 0); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
 	}
 	if err := unix.Fchmod(fd, mode); err != nil {
 		_ = unix.Close(fd)
