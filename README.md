@@ -109,7 +109,8 @@ portablefs-authority \
   -tls-cert server.pem -tls-key server.key \
   -client-ca clients-ca.pem \
   -capability-public-key capability.pub.pem \
-  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership
+  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership \
+  -write-staging-dir /srv/portablefs/.portablefs-control/my-workspace/write-staging
 ```
 
 Then mount it, as above. On clean unmount the official mount supervisor first

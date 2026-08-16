@@ -25,6 +25,7 @@ The reference paths are:
 | Path | Owner/mode | Purpose |
 | --- | --- | --- |
 | `/srv/portablefs` | root, not tenant-writable | XFS cell root |
+| `/srv/portablefs/.portablefs-control/<volume>/write-staging` | volume UID `0700`, root-pinned parent | unnamed protocol-5 write transactions, charged to the volume's exact XFS project quota |
 | `/etc/portablefs/trust` | root | manager CA and plan public key |
 | `/etc/portablefs/cells` | root | cell mTLS identity and root-owned environment |
 | `/etc/portablefs/volumes` | root | generated per-volume authority config/keys/certs |
@@ -34,23 +35,32 @@ The reference paths are:
 | `/run/portablefs-cell-helper` | root:agent `0750` | cell-specific local helper sockets |
 | `/run/portablefs-cell-helper/<cell-uuid>.sock` | root:agent `0660` | local signed-plan boundary |
 
-## Install the four host binaries
+## Install one immutable hosted release
 
-Install root-owned, non-group-writable binaries at these reference locations:
+Build one clean-commit release with `scripts/build-hosted-linux-release.sh`.
+The bundle contains all five hosted executables and all five unit templates;
+each executable reports the same `pfs-hosted-YYYYMMDD-<commit>` identity and the
+bundle has exact-member SHA-256 verification. Install it beneath:
 
 ```text
-/usr/local/bin/portablefs-cell-agent
-/usr/local/bin/portablefs-authority
-/usr/local/libexec/portablefs-cell-helper
-/usr/local/libexec/portablefs-authority-launcher
+/opt/portablefs/releases/<release-id>
+/opt/portablefs/current -> /opt/portablefs/releases/<release-id>
 ```
 
-The launcher refuses an authority binary that is not a root-owned regular file
-or is writable by group/other. Build production binaries with an exact release
-stamp, for example `-ldflags '-X main.version=v3.x.y+build-id'`; `dev` is visible
-and should never be mistaken for a release.
+`deploy/gcp/activate-hosted-release.sh` verifies every member and binary release
+identity before stopping a control process, installs the release under its
+immutable name, swaps the one `current` symlink, reloads systemd, and verifies
+the new process executable. A failed activation restores the former link and
+unit files. The launcher also refuses an authority binary that is not a
+root-owned regular file or is writable by group/other.
 
-Install the four units from `deploy/systemd/`:
+A cell software activation restarts only the cell helper and agent. It never
+restarts an active authority: replacing the one XFS writer remains a manager
+restart request, a strict-mount fence proof, local process-absence observation,
+and a monotonic authority generation. The next generation starts from the new
+release root.
+
+The release carries these five units from `deploy/systemd/`:
 
 ```text
 portablefs-cell-helper@.service
@@ -61,10 +71,22 @@ portablefs-authority@.service
 
 The helper generates only typed per-volume drop-ins. The service template gives
 an authority an empty capability set, `NoNewPrivileges`, private devices/tmp/
-network, a read-only system, syscall restrictions, and exactly three bind
-mounts. The socket unit owns the public TCP listener and passes one descriptor
+network, a read-only system, syscall restrictions, and exactly four bind
+mounts: the served XFS project, read-only configuration, runtime state, and a
+separate write-staging directory under that same XFS project quota. The two
+control parents are root-owned and non-replaceable by the service identity.
+The socket unit owns the public TCP listener and passes one descriptor
 to the authority. Do not add a second `ListenStream` or a second authority unit
 for the same volume.
+
+For a new host, keep credentials in a separate root-only configuration stage
+and run:
+
+```bash
+sudo deploy/gcp/install-cell.sh \
+  /absolute/portablefs-hosted_<release>_linux_<arch> \
+  /absolute/cell-config-stage CELL_UUID AGENT_UID AGENT_GID
+```
 
 ## Cell trust and identity
 
@@ -131,6 +153,12 @@ verifies both name-to-ID and ID-to-name mappings before it creates or starts
 the authority. The long-running helper does not receive general write access
 to `/etc`. These system users and groups are persistent and are not deleted on
 retirement because allocator identities are never reused.
+
+Each successful volume assignment also records the exact helper release that
+applied it. Installing a new helper release therefore re-applies an unchanged
+signed plan once before it can return to observation. This is how new mandatory
+host resources are migrated without weakening plan identity or requiring an
+operator to manufacture a semantically empty plan change.
 
 XFS project assignment and hard-limit changes also run as fixed short-lived
 systemd units in the host mount namespace. Do not add `PrivateDevices` or

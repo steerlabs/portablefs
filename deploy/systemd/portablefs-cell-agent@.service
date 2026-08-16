@@ -7,7 +7,7 @@ Requires=portablefs-cell-helper@%i.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/portablefs/cells/%i.env
-ExecStart=/usr/local/bin/portablefs-cell-agent -cell-id %i -manager-url ${PORTABLEFS_MANAGER_URL} -manager-server-name ${PORTABLEFS_MANAGER_SERVER_NAME} -tls-cert /etc/portablefs/cells/%i.cert -tls-key /etc/portablefs/cells/%i.key -manager-ca /etc/portablefs/trust/manager-ca.pem -plan-public-key /etc/portablefs/trust/plan-public.pem -helper-socket /run/portablefs-cell-helper/%i.sock
+ExecStart=/opt/portablefs/current/bin/portablefs-cell-agent -cell-id %i -manager-url ${PORTABLEFS_MANAGER_URL} -manager-server-name ${PORTABLEFS_MANAGER_SERVER_NAME} -tls-cert /etc/portablefs/cells/%i.cert -tls-key /etc/portablefs/cells/%i.key -manager-ca /etc/portablefs/trust/manager-ca.pem -plan-public-key /etc/portablefs/trust/plan-public.pem -helper-socket /run/portablefs-cell-helper/%i.sock
 Restart=always
 RestartSec=3s
 User=portablefs-agent

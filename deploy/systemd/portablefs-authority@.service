@@ -5,7 +5,7 @@ After=portablefs-authority@%i.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/local/libexec/portablefs-authority-launcher
+ExecStart=/opt/portablefs/current/libexec/portablefs-authority-launcher
 Restart=no
 NoNewPrivileges=yes
 CapabilityBoundingSet=

@@ -99,6 +99,7 @@ REQUIRED_TESTS=(
 # module, renamed test, or accidental skip from masquerading as qualification.
 REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelRefusesStackingExportAndLoopBacking"
+  "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota"
 )
 
 fail() {
@@ -202,6 +203,9 @@ run_suite() {
     GOFLAGS=-mod=readonly \
     PORTABLEFS_XFS_TEST_ROOT="$volume" \
     PORTABLEFS_XFS_TEST_PROJECT="$PORTABLEFS_PROJECT_ID" \
+    PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
+    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
+    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
     PORTABLEFS_XFS_TEST_CELL=/srv/portablefs \
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_WORKLOAD_TEST=1 \
@@ -249,7 +253,7 @@ run_root_boundary_suite() {
     PORTABLEFS_STRICT_STACK_TEST_SCRIPT=/work/kernel/linux-6.12.100-portablefs-append/tests/test_strict_stacking.py \
     go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
     -run '^TestStrictKernelRefusesStackingExportAndLoopBacking$' \
-    ./internal/fusev3/... >"$log" 2>&1
+    ./internal/fusev3/... ./internal/cellhost >"$log" 2>&1
   status=$?
   set -e
   cat -- "$log"

@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/portablefs/manager/manager.env
-ExecStart=/usr/local/bin/portablefs-manager \
+ExecStart=/opt/portablefs/current/bin/portablefs-manager \
   -listen=${PORTABLEFS_MANAGER_LISTEN} \
   -state-file=/var/lib/portablefs-manager/manager.state \
   -tls-cert=/etc/portablefs/manager/tls/manager.cert \

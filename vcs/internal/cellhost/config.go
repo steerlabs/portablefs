@@ -79,6 +79,7 @@ func AuthorityArguments(config AuthorityConfig) []string {
 		"-authority-id", config.AuthorityID,
 		"-authority-generation", generation,
 		"-visibility-membership-file", "/var/lib/portablefs-volume/visibility.membership",
+		"-write-staging-dir", "/var/lib/portablefs-write-staging",
 	}
 	if config.PriorStrictMountsFenced {
 		arguments = append(arguments, "-prior-strict-mounts-fenced")

@@ -65,8 +65,10 @@ before a local process-absence proof.
 one strict root-owned config, constructs a fixed authority argument shape, and
 execs a root-owned authority binary. The authority itself runs under a unique
 service UID, receives its listener from systemd, sees only one bind-mounted
-volume/config/state triple, has no network namespace of its own, and refuses
-root.
+volume/config/state/staging set, has no network namespace of its own, and
+refuses root. Staging is outside the served namespace but inherits the exact
+volume XFS project and hard quota; its bind source cannot be replaced by the
+authority UID.
 
 ## Authorization is deliberately two-party
 

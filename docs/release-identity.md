@@ -11,10 +11,13 @@ Linux archives, and Apple Developer ID notarization for the macOS app.
 The optional hosted foundation additionally reports runtime identity. The
 manager exposes its exact stamp at `GET /v1/release`; authenticated cell
 observations record separate manager-plan, cell-agent, and root-helper release
-stamps. Those hosted binaries currently default visibly to `dev` unless the
-builder sets `main.version` with `-ldflags`. They are not yet members of the
-frozen two-binary Linux client archive or macOS app identity described below,
-so an operator must bind their build and deployment provenance independently.
+stamps. `scripts/build-hosted-linux-release.sh` builds manager, agent, helper,
+authority, and launcher from one clean commit, stamps every executable with one
+`pfs-hosted-YYYYMMDD-<commit>` identity, and emits an exact-member SHA-256
+bundle. The hosted activator verifies every hash and executable identity before
+installing the immutable release and atomically swapping the one runtime root.
+These operator artifacts remain intentionally separate from the frozen
+two-binary end-user Linux archive and macOS app identity described below.
 
 Everything below is enforced by `.github/workflows/release.yml`,
 `.goreleaser.yaml`, `scripts/install.sh`, and the two policy checkers

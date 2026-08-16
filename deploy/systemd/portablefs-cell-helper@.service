@@ -6,7 +6,7 @@ Before=portablefs-cell-agent@%i.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/portablefs/cells/%i.env
-ExecStart=/usr/local/libexec/portablefs-cell-helper -cell-id %i -agent-uid ${PORTABLEFS_AGENT_UID} -agent-gid ${PORTABLEFS_AGENT_GID} -socket /run/portablefs-cell-helper/%i.sock -plan-public-key /etc/portablefs/trust/plan-public.pem
+ExecStart=/opt/portablefs/current/libexec/portablefs-cell-helper -cell-id %i -agent-uid ${PORTABLEFS_AGENT_UID} -agent-gid ${PORTABLEFS_AGENT_GID} -socket /run/portablefs-cell-helper/%i.sock -plan-public-key /etc/portablefs/trust/plan-public.pem
 Restart=on-failure
 RestartSec=2s
 User=root
