@@ -179,7 +179,8 @@ create_service_identity() {
   install -d -m 0700 -o "$PORTABLEFS_SERVICE_UID" -g "$PORTABLEFS_SERVICE_GID" \
     /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache \
     /home/portablefs/tmp /home/portablefs/bin /home/portablefs/creds \
-    /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs
+    /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs \
+    /home/portablefs/write-staging
 }
 
 # as_service runs a command as the unprivileged volume identity with a clean
@@ -210,7 +211,22 @@ start_authority() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
   local control=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME
   local membership=$control/strict-membership
-  local write_staging=$control/write-staging
+  local write_staging_source=$control/write-staging
+  local write_staging=/home/portablefs/write-staging
+  # Production gives the authority a private staging root through systemd's
+  # BindPaths boundary.  Do the same here: the cell's root-owned 0711 control
+  # directory is deliberately traversable-but-not-readable by the volume uid,
+  # while privatepath.OpenExistingDir deliberately opens every component and
+  # therefore must see only the service-owned 0700 presentation.  Both names
+  # resolve to the same project-inheriting XFS inode, so quota accounting cannot
+  # diverge from the visible volume.
+  mount --bind "$write_staging_source" "$write_staging"
+  WRITE_STAGING_BIND=$write_staging
+  [[ $(stat -c '%u:%g:%a' -- "$write_staging") == \
+      "$PORTABLEFS_SERVICE_UID:$PORTABLEFS_SERVICE_GID:700" ]] ||
+    fail "bound write staging is not the exact service-owned 0700 directory" 70
+  [[ $(findmnt -n -r -o TARGET --target "$write_staging") == "$write_staging" ]] ||
+    fail "write staging bind mount is not installed at $write_staging" 70
   as_service /home/portablefs/bin/pfs-coherence-credentials \
     --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 ||
     fail "minting the credential set failed" 70
@@ -352,6 +368,9 @@ teardown() {
   [[ -n ${MOUNT_B_PID:-} ]] && kill "$MOUNT_B_PID" 2>/dev/null
   [[ -n ${AUTHORITY_PID:-} ]] && kill "$AUTHORITY_PID" 2>/dev/null
   wait 2>/dev/null
+  if [[ -n ${WRITE_STAGING_BIND:-} ]]; then
+    umount "$WRITE_STAGING_BIND" 2>/dev/null || true
+  fi
   echo "==== route declaration apply log ===="
   cat /home/portablefs/logs/apply-routes.log 2>/dev/null
   echo "==== authority log ===="

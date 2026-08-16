@@ -16,8 +16,9 @@ network.
 
 - Isolated Lima VZ arm64 VM: 12 vCPU, 24 GiB RAM, running exactly
   `6.12.100-pfs-strict`.
-- Kernel patch SHA-256 values: `096d01915824d909316498fdc9de9252730ac4292294fd421a7fa4b24fffa417`
-  and `2534c6889f73d02bd2166791298da6e1a8a7689e92166bbf6fd74945c19cc786`.
+- Kernel patch SHA-256 values: `096d01915824d909316498fdc9de9252730ac4292294fd421a7fa4b24fffa417`,
+  `2534c6889f73d02bd2166791298da6e1a8a7689e92166bbf6fd74945c19cc786`,
+  and `eb7cddd8726ecc40a0e8fa210aab9694f8e65dbda63f341dd9b2fe94d60bba9f`.
 - Dedicated 32 GiB XFS disk mounted with
   `prjquota,nodev,nosuid,noexec,noatime`; the workload ran as uid/gid 200001 in
   project 43001 with an 8 GiB block ceiling.
@@ -40,21 +41,29 @@ Latency values are milliseconds. Bulk values are MiB/s.
 
 | operation | direct XFS | strict, one mount | strict, active peer |
 | --- | ---: | ---: | ---: |
-| create p50 / p99 | 0.062 / 0.221 | 0.884 / 1.323 | 1.129 / 1.546 |
-| 4 KiB write p50 / p99 | 0.016 / 0.039 | 0.822 / 57.434 | 1.053 / 28.776 |
-| fsync p50 / p99 | 0.293 / 0.593 | 0.443 / 1.046 | 0.453 / 0.724 |
-| warm stat p50 / p99 | 0.004 / 0.018 | 0.222 / 0.482 | 0.220 / 0.391 |
-| open/read/close p50 / p99 | 0.019 / 0.037 | 0.796 / 1.114 | 0.815 / 1.047 |
-| rename p50 / p99 | 0.057 / 0.230 | 1.091 / 1.402 | 1.367 / 1.748 |
-| unlink p50 / p99 | 0.040 / 0.267 | 0.577 / 0.924 | 0.844 / 1.136 |
-| 64 MiB acknowledged write | 1,781.1 | 140.2 (124.3–163.3) | 201.9 (137.6–215.4) |
-| 64 MiB read | 2,181.9 | 105.6 (99.9–109.0) | 110.5 (107.7–110.9) |
-| complete workload wall time | 0.194 s | 2.611 s | 3.867 s |
+| create p50 / p99 | 0.071 / 0.324 | 0.820 / 1.176 | 1.021 / 1.421 |
+| 4 KiB write p50 / p99 | 0.015 / 0.046 | 0.800 / 67.589 | 0.992 / 68.158 |
+| fsync p50 / p99 | 0.293 / 0.830 | 0.440 / 0.791 | 0.435 / 1.021 |
+| warm stat p50 / p99 | 0.004 / 0.014 | 0.185 / 0.424 | 0.216 / 0.519 |
+| open/read/close p50 / p99 | 0.018 / 0.046 | 0.715 / 1.056 | 0.783 / 0.991 |
+| rename p50 / p99 | 0.057 / 0.191 | 0.996 / 1.375 | 1.343 / 1.785 |
+| unlink p50 / p99 | 0.052 / 0.251 | 0.526 / 0.857 | 0.812 / 1.097 |
+| 64 MiB acknowledged write | 1,782.2 | 158.5 (136.9–238.0) | 170.6 (126.2–264.1) |
+| 64 MiB read | 2,228.9 | 105.9 (103.8–125.9) | 115.4 (112.7–123.1) |
+| complete workload wall time | 0.194 s | 2.472 s | 3.824 s |
 
 The two strict write-throughput ranges overlap; the higher two-mount median is
 measurement variance, not a claim that a peer makes writes faster. The stable
 comparison is semantic: both strict cases hash the same bytes, and the active
 peer has repaired them before the source syscall returns.
+
+Against the immediately preceding protocol-5 measurement on this same VM, the
+lockless namespace-repair and internal sequenced-retry candidate reduced the
+one-mount p50 for the measured metadata operations by about 3–17%, reduced the
+complete one-mount workload by 5.3%, and raised its median acknowledged bulk
+write rate by 13.1%. Active-peer metadata p50 improved by about 2–10% and the
+complete workload by 1.1%. The active-peer write-throughput distributions
+overlap too broadly to call their median change an optimization result.
 
 The investigation also removed a real payload-sized client copy. Staged
 BEGIN/DATA/ABORT messages now use an explicit caller-owned idempotent API; the
@@ -65,8 +74,9 @@ writer itself is already out-of-line and measures about 0.34 microseconds,
 machine. On the exact VM, post-change profiling reduced `runtime.memmove` from
 0.39 seconds to 0.04 seconds for the workload; TLS/kernel syscalls now dominate.
 
-The 4 KiB write tail is not hidden: periodic 29–57 ms p99 and 75 ms median-run
-maximums remain on this diagnostic kernel. System-call tracing found no
+The 4 KiB write tail is not hidden: the five runs observed one-mount p99 values
+of 45–79 ms and active-peer p99 values of 9–71 ms on this diagnostic kernel.
+System-call tracing found no
 corresponding 50–100 ms XFS operation, and Go scheduler/GC profiling did not
 show a stop-the-world pause of that size. Treat it as an open diagnostic-kernel
 tail investigation, not as a production tail SLO.
@@ -77,7 +87,7 @@ No current Archil endpoint or test account was placed in scope, so no new
 Archil workload was provisioned or charged. The historical cross-cloud
 observation below remains the only comparison: Archil measured 71.5/107.8 MiB/s
 sequential writes and 102.9/232.5 MiB/s reads at 1/8 jobs. The protocol-5 local
-diagnostic run above measures 140.2 MiB/s acknowledged writes and 105.6 MiB/s
+diagnostic run above measures 158.5 MiB/s acknowledged writes and 105.9 MiB/s
 reads at one strict mount, but hardware, network, concurrency, cache state, and
 success semantics differ. These numbers establish that the exact architecture
 is not intrinsically throughput-starved; they do not establish a vendor ranking.
@@ -101,13 +111,14 @@ and Swift 6.3.3, the release-build
 and 20 MiB read through `VolumeCore`, the production Unix-socket framing, and
 the mock data-plane implementation. It verifies every returned byte and proves
 that both directions remain split into at most 1 MiB protocol requests. Ten warm
-runs completed in 0.040-0.066 seconds, with a 0.0445-second median. That is about
-899 MiB/s of combined verified client-pipeline byte movement. It excludes a
+runs completed in 0.044-0.049 seconds, with an approximately 0.047-second
+median. That is about 851 MiB/s of combined verified client-pipeline byte
+movement. It excludes a
 mounted FSKit kernel path, authority TLS, XFS, durability, and peer publication,
 so it is useful for detecting local framing/copy regressions but must not be
 compared directly with the Linux end-to-end or historical Archil figures.
 
-The same macOS tree passed all 340 Xcode-native tests, ten complete Xcode test
+The same macOS tree passed all 342 Xcode-native tests, ten complete Xcode test
 iterations, the full Swift package under Thread Sanitizer and Address Sanitizer,
 and signed app/extension/service verification. Thread Sanitizer found one race
 in a test-only raw-socket server's stop flag; the helper now owns that lifecycle
