@@ -751,8 +751,8 @@ func (r *rawFileSystem) finishVisibilityComplete(ctx context.Context, completion
 }
 
 // completeVisibility is retained as the direct, no-transport test seam. The
-// production path begins first so it can ask the authority to interrupt an
-// already-admitted overlap before finishing.
+// production path uses the same begin/finish split to bind repair work to the
+// authority cursor before it emits any reverse notification.
 func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarget, self bool) error {
 	completion, _, err := r.beginVisibilityComplete(targets, self)
 	if err != nil {
@@ -779,14 +779,10 @@ func (r *rawFileSystem) releaseComplete(completion visibilityCompletion) {
 
 // applyRepair issues one reverse notification.
 //
-// NotifyDelete is preferred for a namespace binding because it is the only
-// notification that reaches inotify at all: without it a remote unlink is
-// invisible to every watcher on this machine. It is also a superset of
-// NotifyEntry -- the kernel invalidates the entry first and only then attempts
-// the delete against the child it was told about -- so when the delete half is
-// refused (the binding now names a different object, the entry is a mount
-// point, an old kernel does not implement it) the invalidation still has to be
-// made unconditionally, which is what the second call does.
+// Strict NotifyDelete is the one exact namespace primitive: the patched kernel
+// validates the cached child identity, expires the binding without taking the
+// parent inode lock, and emits the watcher event. A weaker name-only fallback
+// would be able to expire a newer binding and is therefore forbidden.
 func (r *rawFileSystem) applyRepair(item repair) error {
 	server := r.mount.notifier()
 	if server == nil {
