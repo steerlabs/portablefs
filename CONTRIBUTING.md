@@ -10,7 +10,7 @@ FSKit/app package under `swift/PortableFSKit`. There is no build system above
 those two languages and nothing to install:
 
 - **Go**, at the version pinned in [vcs/go.mod](./vcs/go.mod) (currently
-  1.26.5). It builds every binary under `vcs/cmd/`: `portablefs`,
+  1.26.6). It builds every binary under `vcs/cmd/`: `portablefs`,
   `portablefs-authority`, `portablefs-mount-v3`, and `portablefsd`.
 - **A Swift toolchain** for `swift/PortableFSKit`. The package declares
   `swift-tools-version: 6.2` and targets macOS 26, so the Swift suite runs on a
@@ -63,15 +63,18 @@ runner execute the same steps:
 1. **Cross-OS build** — `GOOS=darwin` and `GOOS=linux` builds of `vcs/...`,
    before anything is executed, so a compile error surfaces in seconds.
 2. **Cross-OS vet** — `go vet` for both targets.
-3. **Native Go suite** — `go -C vcs test ./...`. The Go tests exercise real
+3. **Dependency vulnerability gate** — the exact pinned `govulncheck` scans
+   reachable calls using the Go version required by `vcs/go.mod`.
+4. **Native Go suite** — `go -C vcs test ./...`. The Go tests exercise real
    syscalls, sockets, and mounts, so they are only meaningful on the host
    platform.
-4. **Native Go race suite** — `go -C vcs test -race ./...`.
-5. **Swift suite** — `bash scripts/test-swift-xcode.sh`. Skipped loudly, with a
+5. **Native Go race suite** — `go -C vcs test -race ./...`.
+6. **Swift suite** — `bash scripts/test-swift-xcode.sh`. Skipped loudly, with a
    printed `SKIP`, on non-macOS hosts; the required macOS CI lane runs it.
-6. **Release-trust policy** — a `sh -n` syntax check of `scripts/install.sh`,
-   the workflow action-pin checker, and the installer release-trust checker.
-7. **Stale-architecture scan** — an `rg` pass that fails the gate if the deleted
+7. **Workflow and release-trust policy** — the exact pinned `actionlint`, a
+   `sh -n` syntax check of `scripts/install.sh`, the workflow action-pin
+   checker, and the installer release-trust checker.
+8. **Stale-architecture scan** — an `rg` pass that fails the gate if the deleted
    v2 journal-era architecture's API and package identifiers reappear anywhere
    outside `docs/`, `CHANGELOG.md`, and the two scripts that legitimately name
    them.

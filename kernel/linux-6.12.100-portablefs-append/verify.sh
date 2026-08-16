@@ -18,7 +18,7 @@ readonly DEBIAN_PATCHES_SHA="c345b6b78e43f8e80580e15869d17828ed8eff44ac62e00965c
 # bootstrap, while leaving the tag floating makes yesterday's qualification
 # irreproducible tomorrow. Keep this identical to the privileged userspace CI
 # toolchain image so both sides compile against one named environment.
-readonly BUILD_IMAGE="golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651"
+readonly BUILD_IMAGE="golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36"
 
 BUILD=1
 if [[ "${1:-}" == "--no-build" ]]; then

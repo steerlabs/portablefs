@@ -45,7 +45,13 @@ case "$(uname -s)" in
     ;;
 esac
 
-# 2. and 3. The Go suites run natively — the tests exercise real syscalls,
+# 2. The vulnerability gate uses the same exact tool version as CI. Running it
+# through `go run` keeps the checker reproducible without installing a global
+# executable; the application toolchain itself is pinned by vcs/go.mod.
+step "dependency vulnerability gate"
+go -C vcs run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+# 3. and 4. The Go suites run natively — the tests exercise real syscalls,
 # sockets and mounts, so they are only meaningful on the host platform.
 step "go suite (native)"
 go -C vcs test ./...
@@ -63,7 +69,7 @@ go -C vcs/third_party/go-fuse vet ./fuse
 go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
 go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
 
-# 4. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
+# 5. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
 # contain the same unique all-passing set. Other hosts skip this macOS-only
 # package loudly; the macOS CI job always runs it.
@@ -74,10 +80,13 @@ else
   echo "SKIP: Xcode-native Swift verification requires macOS; the macOS CI job covers this suite"
 fi
 
-# 5. Release-trust policy. Both checkers are dependency-free single-file node
+# 6. Workflow semantics and release-trust policy. actionlint is version-pinned
+# exactly like CI and reads .github/actionlint.yaml for the one approved custom
+# runner label. The two project checkers are dependency-free single-file node
 # programs (the repository carries no JavaScript packages); they read the
 # installer, the workflows and .goreleaser.yaml as text.
 step "release trust policy"
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.10 .github/workflows/*.yml
 if [ -f scripts/install.sh ]; then
   sh -n scripts/install.sh
 fi
@@ -88,7 +97,7 @@ if [ -f scripts/check-install-release-trust.mjs ]; then
   node scripts/check-install-release-trust.mjs
 fi
 
-# 6. Stale-architecture scan. v3 is the direct-store system: a Go data plane
+# 7. Stale-architecture scan. v3 is the direct-store system: a Go data plane
 # addressing an XFS-backed authority, with the FSKit frontend on top. The
 # journal-era v2 architecture (a remote append-only journal, a TypeScript
 # control plane, and the client/writeback/history stack layered on them) was

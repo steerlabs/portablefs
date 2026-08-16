@@ -209,13 +209,14 @@ deviations, historical live proofs, and remaining platform gates are in
 bash scripts/verify-local.sh        # the single local merge gate
 ```
 
-`verify-local.sh` runs cross-OS Go builds and vet, the Go suite, the Go race
-suite, the native Xcode Swift gate on macOS, the release-trust policy checkers,
-and a stale-architecture scan. The Xcode gate separately enumerates the test
-inventory, executes one test process, and requires the xcresult to contain the
-same unique all-passing set. Socket-backed integration tests declare their
-process-wide resource constraint through a serialized Swift Testing suite;
-pure tests remain parallel.
+`verify-local.sh` runs cross-OS Go builds and vet, the pinned reachable-call
+vulnerability scan, the Go suite, the Go race suite, the native Xcode Swift
+gate on macOS, pinned workflow semantic validation, the release-trust policy
+checkers, and a stale-architecture scan. The Xcode gate separately enumerates
+the test inventory, executes one test process, and requires the xcresult to
+contain the same unique all-passing set. Socket-backed integration tests
+declare their process-wide resource constraint through a serialized Swift
+Testing suite; pure tests remain parallel.
 
 Deeper gates:
 

@@ -13,8 +13,8 @@
 set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository.
-# Evidence: golang:1.26.5-bookworm (matches the toolchain in vcs/go.mod).
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651}"
+# Evidence: golang:1.26.6-bookworm (matches the toolchain in vcs/go.mod).
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
 : "${PORTABLEFS_XFS_IMAGE_SIZE:=1G}"
 : "${PORTABLEFS_SERVICE_UID:=200001}"
 : "${PORTABLEFS_SERVICE_GID:=200001}"

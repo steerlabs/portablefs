@@ -1,6 +1,6 @@
 module github.com/steerlabs/portablefs/vcs
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/hanwen/go-fuse/v2 v2.10.1
