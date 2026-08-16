@@ -113,6 +113,27 @@ for exact peer repair. PortableFS therefore rejects current macOS production
 mounts before Attach. It does not poll, disable caching, weaken coherence, or
 pretend a development adapter is production support.
 
+The production path was also exercised against the live generation-7 hosted
+volume, not only in unit tests. A fresh manager-issued, single-use authorization
+was passed to the exact universal macOS CLI. On macOS 26.5 it returned the
+unsupported-FSKit error before authority Attach, created no kernel mount or
+mount record, and left the authorization unconsumed. The same authorization
+then mounted successfully through the exact Linux FUSE client.
+
+That proof was repeated while the Linux mount completed 300 fsync-and-rename
+cycles. The simultaneous macOS attempt refused in 0.00 seconds without
+disturbing the writer; its still-unused authorization then admitted a second
+strict FUSE peer. The two Linux peers subsequently produced 1,000/1,000 unique
+atomic append records with identical hashes and immediate bidirectional name
+and byte visibility. Both mounts detached cleanly, both temporary enrollments
+were revoked, and the hosted kernel ended with zero strict mounts, taint 0, and
+zero kernel failure-scan matches.
+
+The two macOS admission-attempt logs are retained in local qualification
+evidence with SHA-256 values
+`297d567136fc17c21134a8ba99c1254eaac180b983be3c4ef04d3af5a9aae30a`
+and `ee58b7fff0215c394c7257ad06d261ff21de23d31f6487cd3ccc6bda835c87c2`.
+
 ## Explicit product boundaries
 
 - Writable xattrs remain `EOPNOTSUPP`: XFS attribute-fork blocks are not
