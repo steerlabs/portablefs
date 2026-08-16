@@ -62,6 +62,7 @@ type attachFixture struct {
 	served     chan error
 	listener   net.Listener
 	store      *xfsstore.Volume
+	staging    *authorityrpc.WriteTransactionStaging
 }
 
 // attachCounter records every attach the authority was asked to perform and how
@@ -77,6 +78,12 @@ type attachCounter struct {
 
 func (c *attachCounter) Epoch() []byte                        { return c.inner.Epoch() }
 func (c *attachCounter) Bounds() authorityrpc.TransportBounds { return c.inner.Bounds() }
+func (c *attachCounter) SessionStateForTransport(id volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return c.inner.SessionStateForTransport(id)
+}
+func (c *attachCounter) SessionTerminalForTransport(id volumeserver.SessionID) (<-chan struct{}, bool) {
+	return c.inner.SessionTerminalForTransport(id)
+}
 
 func (c *attachCounter) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	attach := request.GetAttach() != nil
@@ -127,6 +134,23 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		t.Fatalf("open XFS volume: %v", err)
 	}
 	f.store = store
+	stagingRoot := volumeRoot + ".write-staging"
+	if err := os.Mkdir(stagingRoot, 0o700); err != nil {
+		t.Fatalf("create write-transaction staging root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(stagingRoot) })
+	f.staging, err = authorityrpc.OpenWriteTransactionStaging(stagingRoot)
+	if err != nil {
+		t.Fatalf("open write-transaction staging root: %v", err)
+	}
+	t.Cleanup(func() {
+		if f.staging != nil {
+			if err := f.staging.Close(); err != nil {
+				t.Errorf("close write-transaction staging: %v", err)
+			}
+			f.staging = nil
+		}
+	})
 
 	authority, err := volumeserver.New(attachVolumeID, volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 64, MaxSessions: 8, MaxLockRecords: 1024,
@@ -141,7 +165,7 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	if err != nil {
 		t.Fatalf("create visibility coordinator: %v", err)
 	}
-	routes, err := authorityrpc.NewRoutesController(store, visibility)
+	routes, err := authorityrpc.NewRoutesController(store, visibility, authority.Locks())
 	if err != nil {
 		t.Fatalf("create routing controller: %v", err)
 	}
@@ -183,7 +207,16 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		},
 		MaxFrame: 4 << 20, MaxRead: 1 << 20, MaxWrite: 1 << 20, MaxInFlight: 64,
 		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 4096, MaxOpens: 4096,
-		MaxRetainedReplyBytes: 32 << 20,
+		MaxRetainedReplyBytes:           32 << 20,
+		WriteStaging:                    f.staging,
+		MaxWriteTransactionBytes:        authorityrpc.RequiredWriteTransactionBytes,
+		MaxWriteStagingBytesPerSession:  16 << 30,
+		MaxWriteStagingBytes:            64 << 30,
+		MaxWriteTransactionsPerSession:  8,
+		MaxWriteTransactions:            64,
+		WriteTransactionProgressTimeout: 2 * time.Minute,
+		WriteTransactionAbsoluteTimeout: 30 * time.Minute,
+		TerminalDeliveryTimeout:         45 * time.Second,
 	}
 	f.attaches = &attachCounter{inner: handler}
 
@@ -227,6 +260,13 @@ func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 15 * time.Second,
 		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+			return &authoritypb.MountAbsenceProof{
+				ObservedUnixNanos: time.Now().UnixNano(),
+				Observation:       []byte("test exact unique FUSE source present=false before mount"),
+				Component:         "portablefs-mount-v3-test/mount-inventory",
+			}, nil
+		},
 	}
 }
 
@@ -244,6 +284,15 @@ func randomSuffix(t *testing.T) string {
 	return hex.EncodeToString(value[:])
 }
 
+func releaseTestClientBeforeMount(t *testing.T, client *authorityrpc.Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.ReleaseBeforeMount(ctx); err != nil {
+		t.Errorf("release ACTIVE test session before mount: %v", err)
+	}
+}
+
 // --- a volume with no declaration: one attach, no retry ---
 
 func TestADefaultMountAttachesOnceOnAVolumeWithNoRoutes(t *testing.T) {
@@ -252,7 +301,7 @@ func TestADefaultMountAttachesOnceOnAVolumeWithNoRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default mount could not attach to a volume with no routing declaration: %v", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer releaseTestClientBeforeMount(t, client)
 	if !rules.Empty() {
 		t.Fatalf("a volume with no declaration produced rules %v", rules.Patterns())
 	}
@@ -273,7 +322,7 @@ func TestADefaultMountAdoptsTheVolumesRoutesOnOneCapability(t *testing.T) {
 		t.Fatalf("default mount could not attach to a volume that declares routes: %v\n"+
 			"if this is EPERM, the capability was spent by the refused attach and the authority half of the fix has not landed", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer releaseTestClientBeforeMount(t, client)
 
 	expected, err := localroutes.Parse([]byte(declaration))
 	if err != nil {
@@ -314,7 +363,7 @@ func TestARoutingRefusalDoesNotSpendTheCapability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the capability was spent by a refusal it was never accepted for: %v", err)
 	}
-	_ = client.Close()
+	releaseTestClientBeforeMount(t, client)
 }
 
 func TestARoutingRefusalCarriesTheVolumesDeclaration(t *testing.T) {
@@ -359,7 +408,7 @@ func TestNoLocalDirsRefusesAVolumeThatDeclaresRoutes(t *testing.T) {
 	f := newAttachFixture(t, "node_modules/\n")
 	client, _, err := attachWithRoutes(context.Background(), f.attachConfig(), false)
 	if err == nil {
-		_ = client.Close()
+		releaseTestClientBeforeMount(t, client)
 		t.Fatal("-no-local-dirs mounted a volume that routes node_modules; the subtree would have been served from shared storage on this machine and machine-local on every other")
 	}
 	if !strings.Contains(err.Error(), localroutes.ConfigPath) {

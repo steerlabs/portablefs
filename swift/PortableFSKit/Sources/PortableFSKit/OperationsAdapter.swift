@@ -211,6 +211,7 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     private let moduleIdentity: PortableFSModuleIdentity
     private let resolverFactory: @Sendable () -> PfsSocketPathResolver
     private let volumeFactory: VolumeFactory
+    private let admitsQualificationMounts: Bool
 
     public override convenience init() {
         self.init(moduleIdentity: Self.mainBundleIdentity())
@@ -248,22 +249,34 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         moduleIdentity: PortableFSModuleIdentity,
         resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = {
             PfsSocketPathResolver(bundle: .main)
-        },
-        volumeFactory: @escaping VolumeFactory = { socketPath, attachRef, moduleIdentity in
-            let core = try await VolumeCore.connect(
-                socketPath: socketPath,
-                attachRef: attachRef
-            )
-            return try await PortableFSVolume.make(
-                core: core,
-                attachRef: attachRef,
-                moduleIdentity: moduleIdentity
-            )
         }
     ) {
         self.moduleIdentity = moduleIdentity
         self.resolverFactory = resolverFactory
+        self.volumeFactory = { _, _, _ in
+            throw PfsLocalClientError.daemon(
+                errno: ENOTSUP,
+                message: "PortableFS protocol-5 macOS mounting is not production-admitted: current FSKit has no exact peer namespace or attribute invalidation primitive"
+            )
+        }
+        self.admitsQualificationMounts = false
+        super.init()
+    }
+
+    /// Explicit composition seam for separately signed qualification targets
+    /// and unit tests. Shipping extensions use the initializer above and can
+    /// never reach this transport-owning factory.
+    public init(
+        moduleIdentity: PortableFSModuleIdentity,
+        resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = {
+            PfsSocketPathResolver(bundle: .main)
+        },
+        volumeFactory: @escaping VolumeFactory
+    ) {
+        self.moduleIdentity = moduleIdentity
+        self.resolverFactory = resolverFactory
         self.volumeFactory = volumeFactory
+        self.admitsQualificationMounts = true
         super.init()
     }
 
@@ -298,6 +311,12 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         let reply = PfsLoadResourceReply(replyHandler)
         do {
             let attachRef = try attachRef(from: resource)
+            guard admitsQualificationMounts else {
+                throw PfsLocalClientError.daemon(
+                    errno: ENOTSUP,
+                    message: "PortableFS protocol-5 macOS mounting is not production-admitted: current FSKit has no exact peer namespace or attribute invalidation primitive; no local or authority transport was opened"
+                )
+            }
             Task(priority: .userInitiated) {
                 do {
                     let socketPath = try resolverFactory().resolve()
@@ -1598,8 +1617,9 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 name: destinationName.data,
                 child: sourceItem
             )
+            let sourceBindingRemains: Bool
             do {
-                try await core.rename(
+                sourceBindingRemains = try await core.rename(
                     item: sourceItem,
                     from: sourceParent,
                     sourceName: sourceName.data,
@@ -1611,10 +1631,15 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 await cancelBindingMove(moving)
                 throw error
             }
-            // Both edges of the rename are published coordinates: the source
-            // binding is retired, the destination binding (replacing any
-            // rename-over victim at that exact coordinate) is published.
-            await commitBindingMove(moving)
+            if sourceBindingRemains {
+                // POSIX same-inode hard-link rename is a successful no-op:
+                // both names stay bound to the same object.
+                await cancelBindingMove(moving)
+            } else {
+                // Both edges of the rename are published coordinates: the
+                // source binding is retired and the destination is published.
+                await commitBindingMove(moving)
+            }
             return destinationName
           } catch {
               throw PfsErrorMapper.fsKitError(for: error)

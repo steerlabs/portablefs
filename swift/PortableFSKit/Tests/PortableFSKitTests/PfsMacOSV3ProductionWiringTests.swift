@@ -30,25 +30,6 @@ private func peerEvent(
     )
 }
 
-private func localEvent(
-    sequence: UInt64 = 1,
-    phase: PfsMacOSVisibilityPhase,
-    localOperationID: UInt64
-) throws -> PfsMacOSCoherenceEvent {
-    try PfsMacOSCoherenceEvent(
-        epoch: wiringEpoch,
-        sequence: sequence,
-        phase: phase,
-        initiator: try PfsMacOSMutationInitiator(
-            sessionID: wiringLocalSession,
-            replaySlot: 1,
-            mutationSequence: 7,
-            localOperationID: localOperationID
-        ),
-        repairs: []
-    )
-}
-
 @available(macOS 26.0, *)
 private struct WiringHarness {
     let daemon: PfsLocalMockDaemon
@@ -85,7 +66,7 @@ private func makeWiringHarness(
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let contract = cachePolicy.map { policy in
         PfsMacOSV3LocalContract(
-            authorityProtocolMajor: 3,
+            authorityProtocolMajor: 5,
             epoch: wiringEpoch,
             sessionID: wiringLocalSession,
             cachePolicy: policy,
@@ -984,7 +965,6 @@ extension PfsLocalMockDaemonTests {
 
     var stats = await harness.daemon.stats()
     #expect(stats.xattrSetRequests == 0)
-    #expect(stats.orderedMutationSourcePhaseQueueable.isEmpty)
 
     // Request validation remains ahead of capability refusal as well. An
     // invalid name is EINVAL, never EOPNOTSUPP or the barrier's ECANCELED.
@@ -1028,7 +1008,6 @@ extension PfsLocalMockDaemonTests {
 
     stats = await harness.daemon.stats()
     #expect(stats.xattrSetRequests == 0)
-    #expect(stats.orderedMutationSourcePhaseQueueable.isEmpty)
 
     let complete = try peerEvent(phase: .complete)
     try await barrier.resume(complete)
@@ -1085,70 +1064,6 @@ extension PfsLocalMockDaemonTests {
     _ = try await harness.core.statfs()
 }
 
-@available(macOS 26.0, *)
-@Test func prepareExemptsExactlyTheInitiatingCallbackAndResumeWaitsForItsReply() async throws {
-    let harness = try await makeWiringHarness(
-        daemonConfiguration: .init(lookupDelaysNanoseconds: ["mutant": 300_000_000])
-    )
-    let barrier = harness.coherence.barrier
-
-    // The first publishing request on this connection takes logical operation
-    // ID 1; the daemon's delay keeps the callback in flight across both
-    // phases.
-    let replied = PfsReplyBox<Bool>()
-    harness.volume.lookupItem(
-        named: FSFileName(string: "mutant"),
-        inDirectory: harness.root
-    ) { _, _, error in
-        replied.set(error != nil)
-    }
-    #expect(try await waitUntil { await barrier.admittedCallbackCount() == 1 })
-
-    // PREPARE with the initiator exemption returns without draining the
-    // still-unpublished initiating callback: draining it would deadlock the
-    // very mutation this barrier serves.
-    let prepared = PfsReplyBox<Bool>()
-    let prepareTask = Task {
-        try await barrier.prepare(try localEvent(phase: .prepare, localOperationID: 1))
-        prepared.set(true)
-    }
-    #expect(try await waitUntil(.milliseconds(150)) { prepared.get() == true })
-    #expect(replied.get() == nil)
-    try await prepareTask.value
-
-    // The source callback's publication finishes this mount's cache change, so
-    // a newer callback can safely park. It cannot reach the authority until
-    // the deferred COMPLETE acknowledgement releases mutation order.
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(await barrier.isAdmissionClosed())
-    #expect(try await waitUntil { replied.get() == true })
-    #expect(await barrier.isAdmissionClosed())
-
-    let parked = PfsReplyBox<Bool>()
-    let parkedAdmission = Task {
-        let ticket = try await barrier.admit(scope: PfsMacOSCallbackScope(
-            selectors: [.orderedMutation]
-        ))
-        parked.set(true)
-        return ticket
-    }
-    try await Task.sleep(for: .milliseconds(30))
-    #expect(parked.get() == nil)
-
-    // Receiving COMPLETE locally still does not release the parked callback.
-    let complete = try localEvent(phase: .complete, localOperationID: 1)
-    try await barrier.resume(complete)
-    #expect(replied.get() == true)
-    try await Task.sleep(for: .milliseconds(30))
-    #expect(parked.get() == nil)
-    #expect(await barrier.isAdmissionClosed())
-
-    await barrier.acknowledged(complete)
-    let admitted = try await parkedAdmission.value
-    #expect(parked.get() == true)
-    #expect(await barrier.isAdmissionClosed() == false)
-    await barrier.published(admitted)
-}
 
 @available(macOS 26.0, *)
 @Test func aFailedBarrierRefusesAdmissionInsteadOfHanging() async throws {
@@ -1178,7 +1093,7 @@ extension PfsLocalMockDaemonTests {
 
 private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 5
     contract.authorityEpoch = wiringEpoch
     contract.sessionID = wiringLocalSession
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue

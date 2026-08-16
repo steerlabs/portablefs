@@ -112,7 +112,30 @@ func (v *Volume) TruncateObject(id Capability, size int64) error {
 	if size < 0 {
 		return fs.ErrInvalid
 	}
-	return v.withDataFD(id, true, func(fd int) error { return unix.Ftruncate(fd, size) })
+	obj, err := v.holdObject(id)
+	if err != nil {
+		return err
+	}
+	defer obj.release()
+	if obj.kind == KindSymlink {
+		return syscall.EOPNOTSUPP
+	}
+	flags := unix.O_RDONLY
+	if obj.kind == KindRegular {
+		flags = unix.O_RDWR
+	}
+	if obj.kind == KindDirectory {
+		flags |= unix.O_DIRECTORY
+	}
+	fd, err := v.reopen(obj.fd(), flags, obj.kind)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	mutation := v.inodeMutationLock(obj.coordinate.Stable)
+	mutation.Lock()
+	defer mutation.Unlock()
+	return unix.Ftruncate(fd, size)
 }
 
 func (v *Volume) GetXattr(id Capability, name string) ([]byte, error) {

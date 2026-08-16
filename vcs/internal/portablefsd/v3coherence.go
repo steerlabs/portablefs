@@ -66,11 +66,6 @@ type v3PendingVisibility struct {
 
 func (p *v3PendingVisibility) advance() { p.advanceOnce.Do(func() { close(p.advanced) }) }
 
-type v3MutationTicket struct {
-	slot     uint32
-	sequence uint64
-}
-
 // v3CoherenceBridge is the lossless local half of one strict authority
 // participant. At most one event is outstanding. It remains pending until the
 // authority accepts the exact cursor; a frontend socket loss is terminal for
@@ -81,24 +76,19 @@ type v3CoherenceBridge struct {
 	contract pfslocal.V3CoherenceContract
 	budget   time.Duration
 
-	mu           sync.Mutex
-	ackMu        sync.Mutex
-	cursor       *authoritypb.VisibilityCursor
-	pending      *v3PendingVisibility
-	operations   map[v3MutationTicket]uint64
-	visible      map[v3MutationTicket]bool
-	publications map[uint64]chan struct{}
-	// publicationReservations is the serial frontend reader's proof that an
-	// operation ID is live. It is installed before the handler goroutine is
-	// launched, so a callback acknowledgement may safely close publications[id]
-	// before registerMutation has received an authority replay identity. The
-	// reservation is released when every already-reserved handler has exited;
-	// read-only operations and mutations refused before assignment therefore
-	// retain no per-operation state for the lifetime of the mount.
-	publicationReservations map[uint64]struct{}
-	subscribed              bool
-	detaching               bool
-	detachHadSubscriber     bool
+	mu      sync.Mutex
+	ackMu   sync.Mutex
+	cursor  *authoritypb.VisibilityCursor
+	pending *v3PendingVisibility
+	// sourcePublication owns the exact stable-coordinate cut between source
+	// callbacks and peer repair. Source filesystem mutations never enter the event
+	// stream: the callback acquired this gate before its DATA request could be
+	// assigned. A PUBLISHED Ack plus handler retirement releases it locally; a
+	// NOT_PUBLISHED Ack after authority commit terminally freezes it.
+	sourcePublication   *v3SourcePublicationCoordinator
+	subscribed          bool
+	detaching           bool
+	detachHadSubscriber bool
 	// detachStreamEnding records that the subscribed frontend connection
 	// actually began ending under a planned kernel detach. If that detach then
 	// aborts, the mount has lost the only frontend that could prove its cache
@@ -134,14 +124,11 @@ func newV3CoherenceBridge(client v3VisibilityClient, cachePolicy string, onFailu
 		}
 	}
 	b := &v3CoherenceBridge{
-		client:                  client,
-		budget:                  budget,
-		cursor:                  initial,
-		operations:              make(map[v3MutationTicket]uint64),
-		visible:                 make(map[v3MutationTicket]bool),
-		publications:            make(map[uint64]chan struct{}),
-		publicationReservations: make(map[uint64]struct{}),
-		onFailure:               onFailure,
+		client:            client,
+		budget:            budget,
+		cursor:            initial,
+		sourcePublication: newV3SourcePublicationCoordinator(),
+		onFailure:         onFailure,
 		contract: pfslocal.V3CoherenceContract{
 			AuthorityProtocolMajor: authorityrpc.ProtocolMajor,
 			AuthorityEpoch:         append([]byte(nil), epoch...),
@@ -158,160 +145,65 @@ func newV3CoherenceBridge(client v3VisibilityClient, cachePolicy string, onFailu
 	return b, nil
 }
 
-// reserveFrontendPublication mirrors the frontend connection's wire-order
-// reservation into the authority bridge. It deliberately refreshes the
-// reservation after every successfully reserved nonzero frame rather than
-// duplicating the data-plane mutation classifier here: a callback may finish a
-// read request, become locally inactive, and then mutate in a later frame with
-// the same operation ID. The PublicationAck is ordered after all of those frames
-// on the same stream. releaseFrontendPublication gives nonmutation operations a
-// strict, request-activity-lifetime bound.
+// reserveFrontendPublication publishes the serial reader's callback identity
+// before its handler can run. An early PublicationAck can therefore close the
+// operation before a delayed handler attempts to acquire a source gate; that
+// handler is refused before replay assignment instead of reopening a callback
+// that FSKit has already completed.
 func (b *v3CoherenceBridge) reserveFrontendPublication(localOperationID uint64) {
-	if localOperationID == 0 {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.terminal != nil {
-		return
-	}
-	b.publicationReservations[localOperationID] = struct{}{}
-	if b.publications[localOperationID] == nil {
-		b.publications[localOperationID] = make(chan struct{})
-	}
+	b.sourcePublication.reserve(localOperationID)
 }
 
-// releaseFrontendPublication closes the reservation lifetime once all request
-// handlers belonging to the operation have exited. A registered authority
-// mutation still owns the publication channel until its source COMPLETE;
-// otherwise the channel is bounded to this callback and removed here.
+// releaseFrontendPublication closes only the handler reservation. The logical
+// operation remains until PublicationAck even when it acquired no source lease:
+// minor 15 makes the callback semantic verdict mandatory and the daemon must
+// reject an unknown, omitted, or duplicate verdict rather than infer success.
 func (b *v3CoherenceBridge) releaseFrontendPublication(localOperationID uint64) {
-	if localOperationID == 0 {
-		return
-	}
-	b.mu.Lock()
-	delete(b.publicationReservations, localOperationID)
-	b.retirePublicationLocked(localOperationID)
-	b.mu.Unlock()
+	b.sourcePublication.retire(localOperationID)
 }
 
-// registerMutation links an authority replay identity to the pfslocal
-// publication unit that initiated it. The authorityrpc observer calls this
-// before it writes the mutation request, so PREPARE cannot arrive first.
-func (b *v3CoherenceBridge) registerMutation(slot uint32, sequence, localOperationID uint64) error {
-	if sequence == 0 || localOperationID == 0 {
-		return syscall.EINVAL
+// finishFrontendPublication is later than source-gate retirement: the
+// frontend has received the exact PublicationAck and has retired the broader
+// logical operation which carried the pfslocal reply. Only this boundary may
+// send an authority terminal-delivery receipt. If the frontend ledger and the
+// source ledger disagree, revoke the strict mount first and only then consume
+// the retained response under that fail-closed verdict.
+func (b *v3CoherenceBridge) finishFrontendPublication(localOperationID uint64) error {
+	consumptions, err := b.sourcePublication.finishFrontendPublication(localOperationID)
+	if err != nil {
+		err = b.fail(err)
+		// fail marks the source coordinator terminal. That terminal state is the
+		// proof that local serving was revoked, so the second finish is allowed
+		// to transfer any response which the malformed lifecycle stranded.
+		consumptions, _ = b.sourcePublication.finishFrontendPublication(localOperationID)
 	}
-	key := v3MutationTicket{slot: slot, sequence: sequence}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.terminal != nil {
-		return errors.Join(errV3VisibilityTerminal, b.terminal)
+	for _, consumption := range consumptions {
+		if consumption != nil {
+			consumption.Consume()
+		}
 	}
-	if existing := b.operations[key]; existing != 0 && existing != localOperationID {
-		return errors.New("portablefsd: authority mutation ticket was bound to two local operations")
-	}
-	b.operations[key] = localOperationID
-	if b.publications[localOperationID] == nil {
-		b.publications[localOperationID] = make(chan struct{})
-	}
-	return nil
+	return err
 }
 
 // acknowledgePublication is called from the existing pfslocal PublicationAck
-// retirement point. Source COMPLETE cannot reach the authority before this
-// exact callback has crossed the FSKit framework publication boundary.
-func (b *v3CoherenceBridge) acknowledgePublication(localOperationID uint64) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	published := b.publications[localOperationID]
-	if published == nil {
-		return false
-	}
-	select {
-	case <-published:
-		return false
-	default:
-		close(published)
-		return true
-	}
-}
-
-// abandonMutation removes a ticket only when authorityrpc proves the request
-// was refused before recording or entering visibility. It must never be used
-// for an uncertain outcome or after a PREPARE was observed.
-func (b *v3CoherenceBridge) abandonMutation(slot uint32, sequence, localOperationID uint64) {
-	key := v3MutationTicket{slot: slot, sequence: sequence}
-	b.mu.Lock()
-	if b.operations[key] == localOperationID &&
-		(b.pending == nil || b.pending.event.MutationSlot != slot || b.pending.event.MutationSequence != sequence) {
-		delete(b.operations, key)
-		b.retirePublicationLocked(localOperationID)
-	}
-	b.mu.Unlock()
-}
-
-// completeMutation settles the local half of an assigned replay identity once
-// authorityrpc has a definite result. A visible mutation keeps its ticket until
-// source COMPLETE crosses the FSKit publication boundary; a recorded mutation
-// which emitted no PREPARE can be retired immediately. The latter is safe only
-// because v3 data-plane admission requires this bridge to be bound: the
-// authority cannot return a visible mutation before this same bridge has
-// received and acknowledged its source PREPARE.
-func (b *v3CoherenceBridge) completeMutation(
-	identity authorityrpc.MutationIdentity,
+// retirement point. PUBLISHED releases the exact source gate after handler
+// retirement. NOT_PUBLISHED is safe only when no visible authority mutation in
+// the operation committed; otherwise this call terminalizes the mount. There
+// is no source visibility event or authority acknowledgement to wait for.
+func (b *v3CoherenceBridge) acknowledgePublication(
 	localOperationID uint64,
-	response *authoritypb.Response,
-	callErr error,
-) error {
-	key := v3MutationTicket{slot: identity.Slot, sequence: identity.Sequence}
-	if callErr != nil || response == nil || response.GetUncertain() ||
-		response.GetRoutesMismatch().GetSessionRefused() {
-		if callErr == nil {
-			callErr = fmt.Errorf(
-				"portablefsd: authority mutation ended without a definite session-safe result: nil_response=%t uncertain=%t errno=%d failure=%d session_refused=%t slot=%d sequence=%d operation_id=%d",
-				response == nil,
-				response != nil && response.GetUncertain(),
-				response.GetErrno(),
-				response.GetFailure(),
-				response.GetRoutesMismatch().GetSessionRefused(),
-				identity.Slot,
-				identity.Sequence,
-				localOperationID,
-			)
-		}
-		return b.fail(callErr)
+	semanticCommit pfslocal.PublicationSemanticCommit,
+) (bool, error) {
+	known, err := b.sourcePublication.acknowledge(localOperationID, semanticCommit)
+	if err != nil {
+		return known, b.fail(err)
 	}
-	b.mu.Lock()
-	if b.terminal != nil {
-		err := errors.Join(errV3VisibilityTerminal, b.terminal)
-		b.mu.Unlock()
-		return err
-	}
-	if b.operations[key] != localOperationID {
-		b.mu.Unlock()
-		return b.fail(errors.New("portablefsd: authority mutation result lost its local publication identity"))
-	}
-	state := response.GetMutation()
-	if state != nil && (state.GetSlot() != identity.Slot || state.GetAcceptedSequence() != identity.Sequence) {
-		b.mu.Unlock()
-		return b.fail(errors.New("portablefsd: authority mutation result changed its assigned replay identity"))
-	}
-	// No MutationState means the authority refused before recording anything.
-	// A recorded result with no observed PREPARE is a successful or failed
-	// non-visible operation such as Open, Close, or ReadDir.
-	if state == nil || !b.visible[key] {
-		delete(b.operations, key)
-		delete(b.visible, key)
-		b.retirePublicationLocked(localOperationID)
-	}
-	b.mu.Unlock()
-	return nil
+	return known, nil
 }
 
 // readyForOperations closes the attach-ordering gap between Resolve and the
 // event subscription. Strict operations cannot reach the authority until the
-// one lossless visibility consumer is bound; otherwise a source PREPARE could
+// one lossless visibility consumer is bound; otherwise a peer PREPARE could
 // block the authority while no local component owns its repair deadline.
 func (b *v3CoherenceBridge) readyForOperations() error {
 	b.mu.Lock()
@@ -510,11 +402,31 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 		// than being acknowledged as though it were a repair.
 		return nil, b.fail(authorityrpc.ErrRoutesMismatch)
 	}
+	if bytes.Equal(local.InitiatorSessionID, b.contract.SessionID) {
+		return nil, b.fail(errors.New("portablefsd: authority delivered a filesystem visibility phase to its source participant"))
+	}
 	pending := &v3PendingVisibility{
 		event:    local,
 		cursor:   cloneAuthorityCursor(event.GetCursor()),
 		deadline: time.Now().Add(b.budget),
 		advanced: make(chan struct{}),
+	}
+	switch local.Cursor.Phase {
+	case pfslocal.VisibilityPhasePrepare:
+		gateContext, cancelGate := context.WithDeadline(ctx, pending.deadline)
+		err = b.sourcePublication.acquirePeer(
+			gateContext, local.Cursor.Sequence, event.GetTargets(),
+		)
+		cancelGate()
+		if err != nil {
+			return nil, b.fail(err)
+		}
+	case pfslocal.VisibilityPhaseComplete:
+		if err := b.sourcePublication.validateComplete(local.Cursor.Sequence); err != nil {
+			return nil, b.fail(err)
+		}
+	default:
+		return nil, b.fail(errors.New("portablefsd: visibility event has no publication phase"))
 	}
 	b.mu.Lock()
 	if b.terminal != nil {
@@ -535,17 +447,6 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 	if b.pending != nil {
 		b.mu.Unlock()
 		return nil, b.fail(errors.New("portablefsd: concurrent v3 visibility poll installed two pending events"))
-	}
-	if bytes.Equal(local.InitiatorSessionID, b.contract.SessionID) {
-		key := v3MutationTicket{
-			slot: local.MutationSlot, sequence: local.MutationSequence,
-		}
-		local.LocalOperationID = b.operations[key]
-		if local.LocalOperationID == 0 {
-			b.mu.Unlock()
-			return nil, b.fail(errors.New("portablefsd: source visibility event has no local publication identity"))
-		}
-		b.visible[key] = true
 	}
 	b.pending = pending
 	b.mu.Unlock()
@@ -602,31 +503,14 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 		}
 		return b.fail(reportErr)
 	}
-	if cursor.GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE &&
-		bytes.Equal(pending.event.InitiatorSessionID, b.contract.SessionID) {
-		b.mu.Lock()
-		published := b.publications[pending.event.LocalOperationID]
-		deadline := pending.deadline
-		b.mu.Unlock()
-		if published == nil {
-			return b.fail(errors.New("portablefsd: source COMPLETE lost its local publication ledger"))
-		}
-		timer := time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
-		select {
-		case <-published:
-		case <-ctx.Done():
-			return b.fail(ctx.Err())
-		case <-timer.C:
-			return b.fail(errors.New("portablefsd: source COMPLETE reached its deadline before callback publication"))
-		case <-b.client.SessionDone():
-			return b.fail(sessionFailure(b.client))
-		}
-	}
 	orderedAdmissionContended := request.OrderedAdmissionContended &&
 		b.contract.CachePolicy == v3CachePolicyMacOS26 &&
+		cursor.GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE
+	if b.contract.CachePolicy == v3CachePolicyMacOS26 &&
 		cursor.GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE &&
-		!bytes.Equal(pending.event.InitiatorSessionID, b.contract.SessionID)
+		b.sourcePublication.peerContention(cursor.GetSequence()) {
+		orderedAdmissionContended = true
+	}
 	if err := b.client.AckVisibilityWithContention(ctx, cursor, orderedAdmissionContended); err != nil {
 		return b.fail(err)
 	}
@@ -639,16 +523,11 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 	if b.pending == pending {
 		b.cursor = cloneAuthorityCursor(cursor)
 		b.pending = nil
-		if cursor.GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE &&
-			bytes.Equal(pending.event.InitiatorSessionID, b.contract.SessionID) {
-			operationID := pending.event.LocalOperationID
-			delete(b.operations, v3MutationTicket{
-				slot: pending.event.MutationSlot, sequence: pending.event.MutationSequence,
-			})
-			delete(b.visible, v3MutationTicket{
-				slot: pending.event.MutationSlot, sequence: pending.event.MutationSequence,
-			})
-			b.retirePublicationLocked(operationID)
+		if cursor.GetPhase() == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
+			if err := b.sourcePublication.releasePeer(cursor.GetSequence()); err != nil {
+				b.mu.Unlock()
+				return b.fail(err)
+			}
 		}
 		pending.advance()
 	}
@@ -658,18 +537,6 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 
 func (b *v3CoherenceBridge) protocolViolation(detail string) error {
 	return b.fail(fmt.Errorf("%w: %s", syscall.EINVAL, detail))
-}
-
-func (b *v3CoherenceBridge) retirePublicationLocked(localOperationID uint64) {
-	if _, reserved := b.publicationReservations[localOperationID]; reserved {
-		return
-	}
-	for _, operationID := range b.operations {
-		if operationID == localOperationID {
-			return
-		}
-	}
-	delete(b.publications, localOperationID)
 }
 
 func (b *v3CoherenceBridge) watchDeadline(pending *v3PendingVisibility) {
@@ -697,6 +564,20 @@ func (b *v3CoherenceBridge) watchSession() {
 	_ = b.fail(sessionFailure(b.client))
 }
 
+// abandonBeforeMount retires constructor-side state without closing the
+// authority transport. Before FSKit publication, only Client.ReleaseBeforeMount
+// may end ACTIVE membership: it observes the attempt-unique kernel source and
+// sends the authenticated clean detach. Marking this bridge as detaching makes
+// its session watcher stand down when that transition closes the client.
+func (b *v3CoherenceBridge) abandonBeforeMount() {
+	b.mu.Lock()
+	b.detaching = true
+	if b.pending != nil {
+		b.pending.advance()
+	}
+	b.mu.Unlock()
+}
+
 func (b *v3CoherenceBridge) fail(cause error) error {
 	if cause == nil {
 		cause = errV3VisibilityTerminal
@@ -713,6 +594,7 @@ func (b *v3CoherenceBridge) fail(cause error) error {
 			b.pending.advance()
 		}
 		b.mu.Unlock()
+		b.sourcePublication.fail(cause)
 		_ = b.client.Close()
 		if b.onFailure != nil {
 			b.onFailure(cause)

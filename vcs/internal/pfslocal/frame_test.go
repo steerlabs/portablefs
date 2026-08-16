@@ -159,59 +159,6 @@ func TestPublicationRetractionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSourcePhaseQueueableRoundTrip(t *testing.T) {
-	env := &Envelope{
-		RequestID:            43,
-		OperationID:          8,
-		SourcePhaseQueueable: true,
-		Body:                 &WriteRequest{Handle: 9, Data: []byte("x")},
-	}
-	frame, err := EncodeFrame(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := ReadFrame(bytes.NewReader(frame))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decoded.RequestID != 43 || decoded.OperationID != 8 ||
-		!decoded.SourcePhaseQueueable {
-		t.Fatalf("decoded envelope = %#v", decoded)
-	}
-	if _, ok := decoded.Body.(*WriteRequest); !ok {
-		t.Fatalf("decoded body = %T, want *WriteRequest", decoded.Body)
-	}
-}
-
-// The queueability proof is an envelope field consumed by Swift and Go before
-// the request body is dispatched. This golden prevents either implementation
-// from silently accepting field 5 as an unknown/default-false field.
-func TestGoldenSourcePhaseQueueableFrame(t *testing.T) {
-	env := &Envelope{
-		RequestID:            43,
-		OperationID:          8,
-		SourcePhaseQueueable: true,
-		Body:                 &WriteRequest{Handle: 9, Data: []byte("x")},
-	}
-	got, err := EncodeFrame(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := readGolden(t, "source_phase_queueable.hex"); !bytes.Equal(got, want) {
-		t.Fatalf("source-phase queueability frame\n got %x\nwant %x", got, want)
-	}
-	decoded, err := ReadFrame(bytes.NewReader(got))
-	if err != nil {
-		t.Fatal(err)
-	}
-	write, ok := decoded.Body.(*WriteRequest)
-	if !ok || decoded.RequestID != 43 || decoded.OperationID != 8 ||
-		!decoded.SourcePhaseQueueable || write.Handle != 9 ||
-		!bytes.Equal(write.Data, []byte("x")) {
-		t.Fatalf("decoded envelope = %#v body = %#v", decoded, decoded.Body)
-	}
-}
-
 // TestGoldenPublicationRetractedFrame is the CROSS-LANGUAGE pin for the
 // retraction, and it is the only golden that fixes all four envelope scalars
 // ahead of the body oneof.

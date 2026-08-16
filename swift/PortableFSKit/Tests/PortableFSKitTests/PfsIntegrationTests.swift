@@ -12,7 +12,7 @@ private func strictV3Contract(
     policy: String = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 5
     contract.authorityEpoch = Data(repeating: 0xA1, count: 16)
     contract.sessionID = Data(repeating: 0xB2, count: 16)
     contract.cachePolicy = policy

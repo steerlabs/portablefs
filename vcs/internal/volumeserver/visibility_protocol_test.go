@@ -19,7 +19,7 @@ func TestVisibilityAckRetryAfterNextPhaseIsPending(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	prepare, err := h.coordinator.Next(ctx, participant, VisibilityCursor{})
+	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestVisibilityLateRegistrationStartsAtCurrentCompleteCursor(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	complete := runBarrier(t, h.coordinator, first, VisibilityCursor{})
+	complete := runBarrier(t, h.coordinator, first, initialVisibilityCursor(t, h.coordinator, first))
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

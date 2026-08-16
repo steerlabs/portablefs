@@ -57,7 +57,7 @@ private final class PfsWeakMacOSV3Transport: @unchecked Sendable {
     }
 }
 
-/// The concrete wire adapter between additive pfslocal minor 14 and the
+/// The concrete wire adapter between additive pfslocal minor 15 and the
 /// platform-independent `PfsMacOSCoherenceRunner`.
 ///
 /// portablefsd owns the authority connection. This type owns only the local
@@ -257,10 +257,10 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
     public static func parseContract(
         _ wire: PfsV3CoherenceContract
     ) throws -> PfsMacOSV3LocalContract {
-        // This is the authority protocol nested inside pfslocal 1.14, not the
-        // local UDS major. portablefs-authority-v3 is the only contract this
+        // This is the authority protocol nested inside pfslocal 1.15, not the
+        // local UDS major. portablefs-authority-v5 is the only contract this
         // repair model understands.
-        guard wire.authorityProtocolMajor == 3 else {
+        guard wire.authorityProtocolMajor == 5 else {
             throw PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(
                 wire.authorityProtocolMajor
             )
@@ -470,15 +470,13 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
             }
             throw PfsMacOSCoherenceError.routesChangeRequiresRemount
         }
-        let isLocalInitiator = wire.initiatorSessionID == expectedSessionID
-        guard isLocalInitiator ? wire.localOperationID > 0 : wire.localOperationID == 0 else {
+        guard wire.initiatorSessionID != expectedSessionID else {
             throw PfsMacOSCoherenceError.invalidVisibilityTarget
         }
         let initiator = try PfsMacOSMutationInitiator(
             sessionID: wire.initiatorSessionID,
             replaySlot: wire.mutationSlot,
-            mutationSequence: wire.mutationSequence,
-            localOperationID: isLocalInitiator ? wire.localOperationID : nil
+            mutationSequence: wire.mutationSequence
         )
 
         // A mutation that was definitely refused or proved to be a no-op still

@@ -21,67 +21,53 @@ func testRoutesChange(seed byte) RoutesChange {
 // topology reader is held to prove the topology and participant locks are
 // independent rather than recursively deadlocking.
 func TestTopologyReadGuardExcludesRouteCASForPausedRequestsAndAttaches(t *testing.T) {
-	for _, profile := range []CoherenceProfile{CoherenceUncached, CoherenceStrict} {
-		for _, operation := range []string{"request", "attach"} {
-			name := operation + "-uncached"
-			if profile == CoherenceStrict {
-				name = operation + "-strict"
+	for _, operation := range []string{"request", "attach"} {
+		t.Run(operation, func(t *testing.T) {
+			h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+			id := SessionID{1}
+			var cancel context.CancelFunc
+			if operation == "request" {
+				h.register(t, id, testRepairBudget)
+				var ctx context.Context
+				ctx, cancel = context.WithCancel(context.Background())
+				go serviceVisibility(ctx, h.coordinator, id)
 			}
-			t.Run(name, func(t *testing.T) {
-				h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-				id := SessionID{1}
-				var cancel context.CancelFunc
-				if operation == "request" {
-					if profile == CoherenceStrict {
-						h.register(t, id, testRepairBudget)
-						var ctx context.Context
-						ctx, cancel = context.WithCancel(context.Background())
-						go serviceVisibility(ctx, h.coordinator, id)
-					} else if err := h.coordinator.Register(id, CoherenceUncached, nil, VisibilityCommitment{}); err != nil {
-						t.Fatal(err)
-					}
-				}
-				guard := h.coordinator.AcquireTopologyRead()
-				if operation == "attach" {
-					if profile == CoherenceStrict {
-						h.register(t, id, testRepairBudget)
-						var ctx context.Context
-						ctx, cancel = context.WithCancel(context.Background())
-						go serviceVisibility(ctx, h.coordinator, id)
-					} else if err := h.coordinator.Register(id, CoherenceUncached, nil, VisibilityCommitment{}); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if cancel != nil {
-					defer cancel()
-				}
+			guard := h.coordinator.AcquireTopologyRead()
+			if operation == "attach" {
+				h.register(t, id, testRepairBudget)
+				var ctx context.Context
+				ctx, cancel = context.WithCancel(context.Background())
+				go serviceVisibility(ctx, h.coordinator, id)
+			}
+			if cancel != nil {
+				defer cancel()
+			}
 
-				checked := make(chan struct{})
-				done := make(chan error, 1)
-				change := testRoutesChange(40)
-				go func() {
-					_, err := h.coordinator.ExecuteRoutesChecked(context.Background(), change, func() (bool, error) {
-						close(checked)
-						return true, nil
-					}, func() (RoutesChange, error) { return change, nil })
-					done <- err
-				}()
-				select {
-				case <-checked:
-					t.Fatal("route CAS ran while old-topology admission was still pinned")
-				case <-time.After(50 * time.Millisecond):
+			checked := make(chan struct{})
+			done := make(chan error, 1)
+			change := testRoutesChange(40)
+			go func() {
+				_, err := h.coordinator.ExecuteRoutesChecked(context.Background(), change, func() (bool, error) {
+					close(checked)
+					return true, nil
+				}, func() (RoutesChange, error) { return change, nil })
+				done <- err
+			}()
+			select {
+			case <-checked:
+				t.Fatal("route CAS ran while old-topology admission was still pinned")
+			case <-time.After(50 * time.Millisecond):
+			}
+			guard.Release()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
 				}
-				guard.Release()
-				select {
-				case err := <-done:
-					if err != nil {
-						t.Fatal(err)
-					}
-				case <-time.After(2 * time.Second):
-					t.Fatal("route writer did not resume after topology admission ended")
-				}
-			})
-		}
+			case <-time.After(2 * time.Second):
+				t.Fatal("route writer did not resume after topology admission ended")
+			}
+		})
 	}
 }
 
@@ -139,7 +125,11 @@ func TestRoutesChangeQuiescesEveryStrictParticipantAndCommitsBetweenPhases(t *te
 	observe := func(id SessionID) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		var after VisibilityCursor
+		after, err := h.coordinator.InitialCursor(id)
+		if err != nil {
+			t.Errorf("%x: initial cursor: %v", id, err)
+			return
+		}
 		for range 2 {
 			event, err := h.coordinator.Next(ctx, id, after)
 			if err != nil {
@@ -215,7 +205,7 @@ func TestRoutesChangeFencesOnlyTheParticipantThatMissedItsOwnBudget(t *testing.T
 	// The silent mount answers PREPARE and then stops, so what expires is its
 	// COMPLETE budget rather than its PREPARE one.
 	go func() {
-		event, err := h.coordinator.Next(ctx, silent, VisibilityCursor{})
+		event, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, silent)
 		if err != nil {
 			return
 		}
@@ -267,8 +257,9 @@ func TestRoutesChangeCommitFailureSendsTruthfulCompleteToReversibleParticipant(t
 	seen := make(chan VisibilityEvent, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	initial := initialVisibilityCursor(t, h.coordinator, mount)
 	go func() {
-		var after VisibilityCursor
+		after := initial
 		for range 2 {
 			event, err := h.coordinator.Next(ctx, mount, after)
 			if err != nil {
@@ -315,7 +306,7 @@ func TestRoutesCommitFailurePreservesProductionPrepareFencing(t *testing.T) {
 	defer cancel()
 	reported := make(chan error, 1)
 	go func() {
-		prepare, err := h.coordinator.Next(ctx, mount, VisibilityCursor{})
+		prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, mount)
 		if err != nil {
 			reported <- err
 			return
@@ -342,7 +333,7 @@ func TestRoutesCommitFailurePreservesProductionPrepareFencing(t *testing.T) {
 	if reason := h.fenceReasonFor(mount); !errors.Is(reason, ErrVisibilityBlocked) {
 		t.Fatalf("production PREPARE fence = %v", reason)
 	}
-	if _, err := h.coordinator.Next(ctx, mount, VisibilityCursor{}); !errors.Is(err, ErrSessionExpired) {
+	if _, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, mount); !errors.Is(err, ErrSessionExpired) {
 		t.Fatalf("departed production participant received COMPLETE: %v", err)
 	}
 }
@@ -366,7 +357,7 @@ func TestRoutesChangeAcceptsABlockedReportFromAParkedMount(t *testing.T) {
 	go func() {
 		// It can answer PREPARE - that needs no kernel lock - and reports the
 		// cycle on COMPLETE.
-		prepare, err := h.coordinator.Next(ctx, parked, VisibilityCursor{})
+		prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, parked)
 		if err != nil {
 			return
 		}

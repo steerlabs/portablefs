@@ -1,20 +1,107 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"google.golang.org/protobuf/proto"
 )
 
-func TestAuthorityProtocolV3RequiresExactResourceAcquisition(t *testing.T) {
-	if ProtocolMajor != 3 || ProtocolALPN != "portablefs-authority-v3" {
-		t.Fatalf("authority protocol=(major %d, ALPN %q), want (3, portablefs-authority-v3)", ProtocolMajor, ProtocolALPN)
+var (
+	benchmarkRequest *authoritypb.Request
+	benchmarkValue   any
+)
+
+// BenchmarkWriteMutationEncoding keeps the large-write hot path visible. A
+// write is already durable-current-state work; replay identity and framing may
+// authenticate and encode those bytes, but should not manufacture additional
+// payload-sized copies just to do so.
+func BenchmarkWriteMutationEncoding(b *testing.B) {
+	request := &authoritypb.Request{Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+		TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+		Handle: make([]byte, 16), Data: make([]byte, 1<<20), FragmentOffset: 4096,
+	}}}
+	runtime, err := volumeserver.New("benchmark", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+	})
+	if err != nil {
+		b.Fatal(err)
 	}
-	required := []string{"exact-resource-acquisition"}
+	b.SetBytes(1 << 20)
+	b.Run("authority-fingerprint", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkValue, _ = canonicalFingerprint(runtime, request)
+		}
+	})
+	b.Run("clone", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkRequest = proto.Clone(request).(*authoritypb.Request)
+		}
+	})
+	b.Run("marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkValue, _ = proto.MarshalOptions{Deterministic: true}.Marshal(request)
+		}
+	})
+}
+
+func TestCanonicalStreamMatchesFrozenEncoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *authoritypb.Request
+		want    []byte
+	}{
+		{
+			name: "write-transaction-data",
+			request: &authoritypb.Request{Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+				TransactionId: 1, FragmentOffset: 129, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+				Handle: []byte{0x31, 0x32}, Data: []byte{0xA5, 0x5A},
+			}}},
+			// request field 46; WriteTransactionRequest fields 1, 2, 4, 10, 11.
+			want: []byte{0xF2, 0x02, 0x0F, 0x08, 0x01, 0x12, 0x02, 0x31, 0x32, 0x20, 0x81, 0x01, 0x50, 0x02, 0x5A, 0x02, 0xA5, 0x5A},
+		},
+		{
+			name: "setattr",
+			request: &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{
+				Item: []byte{0x42, 0x43}, Mode: proto.Uint32(0o755), MtimeNs: proto.Int64(-2),
+			}}},
+			// request field 22; SetAttrRequest fields 1, 3, and 8.
+			want: []byte{0xB2, 0x01, 0x12, 0x0A, 0x02, 0x42, 0x43, 0x18, 0xED, 0x03, 0x40, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01},
+		},
+		{
+			name:    "reclaim",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: []byte{1, 2, 3}}}},
+			want:    []byte{0xA2, 0x02, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var got bytes.Buffer
+			if err := canonicalWrite(&got, test.request.ProtoReflect()); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got.Bytes(), test.want) {
+				t.Fatalf("canonical encoding differs\n got %x\nwant %x", got.Bytes(), test.want)
+			}
+		})
+	}
+}
+
+func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *testing.T) {
+	if ProtocolMajor != 5 || ProtocolALPN != "portablefs-authority-v5" {
+		t.Fatalf("authority protocol=(major %d, ALPN %q), want (5, portablefs-authority-v5)", ProtocolMajor, ProtocolALPN)
+	}
+	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
 	if !hasFeatures(requiredHelloFeatures, required) {
-		t.Fatalf("Hello features %v omit exact-resource-acquisition", requiredHelloFeatures)
+		t.Fatalf("Hello features %v omit protocol-5 requirements %v", requiredHelloFeatures, required)
 	}
-	if !hasFeatures(requiredAttachFeatures, required) {
+	if !hasFeatures(requiredAttachFeatures, []string{"exact-resource-acquisition"}) {
 		t.Fatalf("Attach features %v omit exact-resource-acquisition", requiredAttachFeatures)
 	}
 	postBinding := []string{"namespace-post-binding-identity"}
@@ -23,6 +110,71 @@ func TestAuthorityProtocolV3RequiresExactResourceAcquisition(t *testing.T) {
 	}
 	if !hasFeatures(requiredStrictAttachFeatures, postBinding) {
 		t.Fatalf("strict Attach features %v omit namespace-post-binding-identity", requiredStrictAttachFeatures)
+	}
+	sourceGate := []string{"source-publication-gate-v1"}
+	if !hasFeatures(requiredHelloFeatures, sourceGate) {
+		t.Fatalf("Hello features %v omit source-publication-gate-v1", requiredHelloFeatures)
+	}
+	if !hasFeatures(requiredStrictAttachFeatures, sourceGate) {
+		t.Fatalf("strict Attach features %v omit source-publication-gate-v1", requiredStrictAttachFeatures)
+	}
+}
+
+func TestSourcePublicationGatePresenceMatchesVisibleOperationMatrix(t *testing.T) {
+	visible := []struct {
+		name    string
+		request *authoritypb.Request
+	}{
+		{name: "setattr", request: &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{}}}},
+		{name: "fallocate", request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{}}}},
+		{name: "copy-file-range", request: &authoritypb.Request{Body: &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{}}}},
+		{name: "create", request: &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{}}}},
+		{name: "mkdir", request: &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{}}}},
+		{name: "unlink", request: &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{}}}},
+		{name: "rename", request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{}}}},
+		{name: "link", request: &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{}}}},
+		{name: "symlink", request: &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{}}}},
+		{name: "setxattr", request: &authoritypb.Request{Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{}}}},
+		{name: "removexattr", request: &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{}}}},
+		{name: "open truncate", request: &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Flags: &authoritypb.OpenFlags{Truncate: true}}}}},
+	}
+	for _, test := range visible {
+		t.Run(test.name, func(t *testing.T) {
+			request := proto.Clone(test.request).(*authoritypb.Request)
+			if validSourcePublicationGatePresence(request) {
+				t.Fatal("visible mutation without source publication gate was accepted")
+			}
+			request.SourcePublicationGate = &authoritypb.SourcePublicationGate{}
+			if !validSourcePublicationGatePresence(request) {
+				t.Fatal("visible mutation with source publication gate was refused")
+			}
+		})
+	}
+
+	nonVisible := []struct {
+		name    string
+		request *authoritypb.Request
+	}{
+		{name: "lookup", request: &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}},
+		{name: "open", request: &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Flags: &authoritypb.OpenFlags{Read: true}}}}},
+		{name: "close", request: &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{}}}},
+		{name: "read", request: &authoritypb.Request{Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{}}}},
+		{name: "tmpfile", request: &authoritypb.Request{Body: &authoritypb.Request_Tmpfile{Tmpfile: &authoritypb.TmpfileRequest{}}}},
+		{name: "readdir", request: &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{}}}},
+		{name: "reclaim", request: &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{}}}},
+		{name: "setlock", request: &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{}}}},
+	}
+	for _, test := range nonVisible {
+		t.Run(test.name, func(t *testing.T) {
+			request := proto.Clone(test.request).(*authoritypb.Request)
+			if !validSourcePublicationGatePresence(request) {
+				t.Fatal("non-visible operation without source publication gate was refused")
+			}
+			request.SourcePublicationGate = &authoritypb.SourcePublicationGate{}
+			if validSourcePublicationGatePresence(request) {
+				t.Fatal("non-visible operation carrying source publication gate was accepted")
+			}
+		})
 	}
 }
 
@@ -51,93 +203,13 @@ func TestRequestUsesTopologyReleasesBlockingLockWaits(t *testing.T) {
 	if !requestUsesTopology(&authoritypb.Request{Body: &authoritypb.Request_GetLock{GetLock: &authoritypb.GetLockRequest{}}}) {
 		t.Fatal("a lock query completes immediately and keeps the guard")
 	}
-}
-
-func TestSourcePhaseQueueabilityRequiresOperationIdentityAndVisibleMutation(t *testing.T) {
-	tests := []struct {
-		name      string
-		request   *authoritypb.Request
-		wantValid bool
-	}{
-		{
-			name: "absent proof remains compatible",
-			request: &authoritypb.Request{
-				Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}},
-			},
-			wantValid: true,
-		},
-		{
-			name: "ordered visible mutation with operation identity",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}},
-			},
-			wantValid: true,
-		},
-		{
-			name: "missing operation identity",
-			request: &authoritypb.Request{
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}},
-			},
-		},
-		{
-			name: "ordinary request",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}},
-			},
-		},
-		{
-			name: "hello control request",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{}},
-			},
-		},
-		{
-			name: "attach control request",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{}},
-			},
-		},
-		{
-			name: "visibility control request",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{}},
-			},
-		},
-		{
-			name: "non-visible mutation",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body:                 &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{}},
-			},
-		},
-		{
-			name: "open truncate does not carry the FSKit ordered-only proof",
-			request: &authoritypb.Request{
-				FrontendOperationId:  7,
-				SourcePhaseQueueable: true,
-				Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
-					Flags: &authoritypb.OpenFlags{Write: true, Truncate: true},
-				}},
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := validSourcePhaseQueueability(test.request); got != test.wantValid {
-				t.Fatalf("validSourcePhaseQueueability() = %v, want %v", got, test.wantValid)
-			}
-		})
+	for _, request := range []*authoritypb.Request{
+		{Body: &authoritypb.Request_Resume{Resume: &authoritypb.ResumeRequest{}}},
+		{Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{}}},
+		{Body: &authoritypb.Request_AbortAttach{AbortAttach: &authoritypb.AbortAttachRequest{}}},
+	} {
+		if requestUsesTopology(request) {
+			t.Fatalf("lifecycle request %T must own its explicit topology boundary", request.GetBody())
+		}
 	}
 }

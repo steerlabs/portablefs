@@ -42,7 +42,8 @@ const (
 	envWorkload   = "PORTABLEFS_WORKLOAD_TEST"
 	// envRequired is set by the privileged CI job. It converts every gate that
 	// would otherwise skip into a hard failure.
-	envRequired = "PORTABLEFS_XFS_TEST_REQUIRED"
+	envRequired  = "PORTABLEFS_XFS_TEST_REQUIRED"
+	envFUSEDebug = "PORTABLEFS_FUSE_DEBUG"
 )
 
 type integrationEnv struct {
@@ -119,6 +120,19 @@ const (
 	// The strict cache commitment every mount in this fixture declares.
 	integrationCachedNames  = 4096
 	integrationRepairBudget = 20 * time.Second
+
+	// Match the production authority's strict write-transaction admission
+	// profile. RequiredWriteTransactionBytes is the frozen MAX_RW_COUNT wire
+	// commitment; the remaining bounds admit the same per-session transaction
+	// concurrency as production without making the integration fixture a weaker
+	// peer than the mount it is qualifying.
+	integrationWriteStagingBytesPerSession = 16 << 30
+	integrationWriteStagingBytes           = 64 << 30
+	integrationWriteTransactionsPerSession = 8
+	integrationWriteTransactions           = 4096
+	integrationWriteProgressTimeout        = 2 * time.Minute
+	integrationWriteAbsoluteTimeout        = 30 * time.Minute
+	integrationTerminalDeliveryTimeout     = 45 * time.Second
 )
 
 type integrationAuthorizer struct{ now func() time.Time }
@@ -140,17 +154,11 @@ type integrationConfig struct {
 	// SessionLease overrides the authority session lease. Only the session
 	// lifecycle tests need a short one.
 	SessionLease time.Duration
-	// Uncached selects CoherenceUncached for every mount in this fixture.
-	// Strict is the default because it is the shipping profile; the uncached
-	// tests opt out so both profiles stay covered by real kernel mounts.
-	Uncached bool
 	// Routes is the machine-local route declaration every mount in this fixture
 	// activates, in the syntax the volume file carries. Empty means the volume
 	// declares nothing and every path is served from the authority.
 	Routes string
 
-	// Coherence is derived from Uncached, never set by a caller.
-	Coherence CoherenceProfile
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
 	rules localroutes.RuleSet
 }
@@ -235,7 +243,12 @@ type integrationFixture struct {
 	// production project gate, no test can observe another test's names, and the
 	// exclusive lock xfsstore takes on a volume root never collides.
 	volumeRoot string
-	paths      []string
+	// writeStagingRoot is a sibling of volumeRoot. It inherits the provisioned
+	// XFS project but is outside the authoritative namespace, so inert payloads
+	// can only exist in private unnamed O_TMPFILE stages.
+	writeStagingRoot string
+	writeStaging     *authorityrpc.WriteTransactionStaging
+	paths            []string
 	// backing is one per-machine tree per mount: these mounts stand in for
 	// different machines, and machine-local storage is not shared between them.
 	backing []string
@@ -270,10 +283,6 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 	if cfg.SessionLease <= 0 {
 		cfg.SessionLease = time.Minute
 	}
-	cfg.Coherence = CoherenceStrict
-	if cfg.Uncached {
-		cfg.Coherence = CoherenceUncached
-	}
 	rules, err := ActivateRoutes([]byte(cfg.Routes))
 	if err != nil {
 		t.Fatalf("compile route declaration: %v", err)
@@ -292,6 +301,20 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 			t.Errorf("remove per-test volume root: %v", err)
 		}
 	})
+	f.writeStagingRoot = f.volumeRoot + ".write-staging"
+	if err := os.Mkdir(f.writeStagingRoot, 0o700); err != nil {
+		t.Fatalf("create per-test write staging root: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(f.writeStagingRoot); err != nil {
+			t.Errorf("remove per-test write staging root: %v", err)
+		}
+	})
+	f.writeStaging, err = authorityrpc.OpenWriteTransactionStaging(f.writeStagingRoot)
+	if err != nil {
+		t.Fatalf("open per-test write staging root: %v", err)
+	}
+	t.Cleanup(f.closeWriteStaging)
 
 	mountRoot := t.TempDir()
 	for i := range cfg.Mounts {
@@ -396,7 +419,7 @@ func (f *integrationFixture) start() {
 	// not the active one. The fixture therefore installs the declaration these
 	// mounts are about to agree with, through the same barrier a live operator's
 	// change would use.
-	routes, err := authorityrpc.NewRoutesController(store, visibility)
+	routes, err := authorityrpc.NewRoutesController(store, visibility, authority.Locks())
 	if err != nil {
 		t.Fatalf("create routing controller: %v", err)
 	}
@@ -416,7 +439,16 @@ func (f *integrationFixture) start() {
 		MaxFrame: integrationMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        integrationServerInFlight,
 		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
-		MaxRetainedReplyBytes: integrationAllocationBudget,
+		MaxRetainedReplyBytes:           integrationAllocationBudget,
+		WriteStaging:                    f.writeStaging,
+		MaxWriteTransactionBytes:        authorityrpc.RequiredWriteTransactionBytes,
+		MaxWriteStagingBytesPerSession:  integrationWriteStagingBytesPerSession,
+		MaxWriteStagingBytes:            integrationWriteStagingBytes,
+		MaxWriteTransactionsPerSession:  integrationWriteTransactionsPerSession,
+		MaxWriteTransactions:            integrationWriteTransactions,
+		WriteTransactionProgressTimeout: integrationWriteProgressTimeout,
+		WriteTransactionAbsoluteTimeout: integrationWriteAbsoluteTimeout,
+		TerminalDeliveryTimeout:         integrationTerminalDeliveryTimeout,
 	}
 	f.counter = &countingHandler{inner: handler}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -444,9 +476,10 @@ func (f *integrationFixture) start() {
 			// out of this number, so it must be exactly the transport's bound.
 			MaxInFlight:  integrationMaxInFlight,
 			PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-			Coherence: f.cfg.Coherence, CachedNameCapacity: integrationCachedNames,
+			Coherence: CoherenceStrict, CachedNameCapacity: integrationCachedNames,
 			RepairBudget: integrationRepairBudget,
 			Routes:       f.cfg.rules, LocalBacking: f.backing[i],
+			Debug: os.Getenv(envFUSEDebug) == "1",
 		})
 		if err != nil {
 			t.Fatalf("mount %s: %v", f.paths[i], err)
@@ -466,31 +499,33 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 		CancelDrainTimeout: 5 * time.Second, MaxInFlight: integrationMaxInFlight,
 	}
 	// Every mount declares the routing it is about to serve. The authority
-	// refuses a mount whose revision is not the volume's active one, for every
-	// profile, so this is not a strict-only field.
+	// refuses a mount whose revision is not the volume's active one.
 	cfg.RoutesRevision = f.cfg.rules.Revision()
-	if f.cfg.Coherence == CoherenceStrict {
-		cfg.CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT
-		cfg.CachedNameCapacity = integrationCachedNames
-		cfg.RepairBudget = integrationRepairBudget
-		// Linux FUSE makes a cached binding unservable through
-		// fuse_reverse_inval_entry, which takes the parent directory's i_rwsem
-		// for write. Declaring it is what lets the authority tell a provably
-		// closed repair cycle apart from a slow lock.
-		cfg.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+	cfg.CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT
+	cfg.CachedNameCapacity = integrationCachedNames
+	cfg.RepairBudget = integrationRepairBudget
+	// Linux FUSE makes a cached binding unservable through
+	// fuse_reverse_inval_entry, which takes the parent directory's i_rwsem
+	// for write. Declaring it is what lets the authority tell a provably
+	// closed repair cycle apart from a slow lock.
+	cfg.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+	cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+		return &authoritypb.MountAbsenceProof{
+			ObservedUnixNanos: time.Now().UnixNano(),
+			Observation:       []byte("integration fixture exact unique mount source absent before mount"),
+			Component:         "fusev3-integration-test/mount-inventory",
+		}, nil
 	}
 	client, err := authorityrpc.DialClient(context.Background(), cfg)
 	if err != nil {
 		f.t.Fatalf("dial authority: %v", err)
 	}
 	transport := &integrationTransport{Client: client}
-	if f.cfg.Coherence == CoherenceStrict {
-		id, ok := f.membership.last()
-		if !ok {
-			f.t.Fatal("attach registered no strict visibility participant")
-		}
-		transport.session = append([]byte(nil), id[:]...)
+	id, ok := f.membership.last()
+	if !ok {
+		f.t.Fatal("attach registered no visibility participant")
 	}
+	transport.session = append([]byte(nil), id[:]...)
 	return client, transport
 }
 
@@ -529,6 +564,16 @@ func (f *integrationFixture) closeStore() {
 	f.store = nil
 }
 
+func (f *integrationFixture) closeWriteStaging() {
+	if f.writeStaging == nil {
+		return
+	}
+	if err := f.writeStaging.Close(); err != nil {
+		f.t.Errorf("close write-transaction staging: %v", err)
+	}
+	f.writeStaging = nil
+}
+
 // shutdown is the cleanup path. It tolerates mounts that already aborted
 // themselves, because several tests deliberately destroy the authority.
 func (f *integrationFixture) shutdown() {
@@ -543,13 +588,14 @@ func (f *integrationFixture) shutdown() {
 		// released it is reported as a failure here, and then force-detached so
 		// it cannot poison every later test in this binary.
 		if isMounted(f.t, f.paths[i]) {
-			f.t.Errorf("%s was still installed after Unmount and Close", f.paths[i])
+			f.t.Errorf("%s was still installed after Unmount and Close (frontend fatal cause: %v)", f.paths[i], f.mounts[i].fatalError())
 			_ = exec.Command("fusermount3", "-u", "-z", f.paths[i]).Run()
 		}
 	}
 	f.mounts, f.clients, f.transports = nil, nil, nil
 	f.stopAuthority()
 	f.closeStore()
+	f.closeWriteStaging()
 }
 
 // remount recreates the entire authority on the same XFS directory: mounts are
@@ -748,11 +794,15 @@ func (f *integrationFixture) runWorkload(name string, args ...string) {
 func (f *integrationFixture) sessionDiagnostics() string {
 	parts := make([]string, 0, len(f.clients))
 	for i, client := range f.clients {
+		var frontendErr error
+		if i < len(f.mounts) && f.mounts[i] != nil {
+			frontendErr = f.mounts[i].fatalError()
+		}
 		select {
 		case <-client.SessionDone():
-			parts = append(parts, fmt.Sprintf("mount %d ended: %v", i, client.SessionError()))
+			parts = append(parts, fmt.Sprintf("mount %d ended: %v (frontend: %v)", i, client.SessionError(), frontendErr))
 		default:
-			parts = append(parts, fmt.Sprintf("mount %d live", i))
+			parts = append(parts, fmt.Sprintf("mount %d live (frontend: %v)", i, frontendErr))
 		}
 	}
 	return strings.Join(parts, "; ")
@@ -816,6 +866,12 @@ type countingHandler struct {
 
 func (h *countingHandler) Epoch() []byte                        { return h.inner.Epoch() }
 func (h *countingHandler) Bounds() authorityrpc.TransportBounds { return h.inner.Bounds() }
+func (h *countingHandler) SessionStateForTransport(id volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return h.inner.SessionStateForTransport(id)
+}
+func (h *countingHandler) SessionTerminalForTransport(id volumeserver.SessionID) (<-chan struct{}, bool) {
+	return h.inner.SessionTerminalForTransport(id)
+}
 
 func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	h.mu.Lock()
@@ -865,8 +921,8 @@ func requestKind(request *authoritypb.Request) string {
 		return "close"
 	case request.GetReadDir() != nil:
 		return "readdir"
-	case request.GetWrite() != nil:
-		return "write"
+	case request.GetWriteTransaction() != nil:
+		return "write-transaction"
 	case request.GetRead() != nil:
 		return "read"
 	case request.GetSetAttr() != nil:

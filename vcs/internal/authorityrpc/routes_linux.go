@@ -65,6 +65,15 @@ const routesDirMode fs.FileMode = 0o755
 type RoutesController struct {
 	Store      *xfsstore.Volume
 	Visibility *volumeserver.VisibilityCoordinator
+	Locks      *volumeserver.LockTable
+
+	// lockWaitAdmission is a topology transition gate only for blocking byte-
+	// range lock admission. A wait holds the read side just long enough to
+	// validate its route revision and publish itself in Locks; Apply holds the
+	// write side while atomically interrupting the old queue and changing the
+	// revision. Unlike the main topology guard, it is never held while F_SETLKW
+	// sleeps, so one lock waiter cannot stall unrelated volume I/O.
+	lockWaitAdmission sync.RWMutex
 
 	mu        sync.RWMutex
 	loaded    bool
@@ -83,14 +92,14 @@ func (r *RoutesController) AcquireTopologyRead() *volumeserver.TopologyReadGuard
 	return r.Visibility.AcquireTopologyRead()
 }
 
-func NewRoutesController(store *xfsstore.Volume, visibility *volumeserver.VisibilityCoordinator) (*RoutesController, error) {
-	if store == nil || visibility == nil {
-		return nil, errors.New("authorityrpc: routing needs the volume store and the visibility coordinator")
+func NewRoutesController(store *xfsstore.Volume, visibility *volumeserver.VisibilityCoordinator, locks *volumeserver.LockTable) (*RoutesController, error) {
+	if store == nil || visibility == nil || locks == nil {
+		return nil, errors.New("authorityrpc: routing needs the volume store, visibility coordinator, and epoch lock table")
 	}
 	if routesDirName == "" || routesFileName == "" {
 		return nil, fmt.Errorf("authorityrpc: %q is not a two-component in-volume path", localroutes.ConfigPath)
 	}
-	return &RoutesController{Store: store, Visibility: visibility}, nil
+	return &RoutesController{Store: store, Visibility: visibility, Locks: locks}, nil
 }
 
 // Load reads the declaration out of this authority's own volume root and makes
@@ -173,6 +182,12 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		return nil, fmt.Errorf("%w: %w", errRoutesInvalid, err)
 	}
 	next := volumeserver.RoutesChange{Revision: rules.Revision(), Canonical: rules.Canonical()}
+	// Serialize only blocking-lock admission, not ordinary filesystem work. A
+	// waiter admitted before this boundary is already visible in Locks and is
+	// interrupted in the checked transition below. A waiter arriving after it
+	// cannot validate the old revision until the topology change has finished.
+	r.lockWaitAdmission.Lock()
+	defer r.lockWaitAdmission.Unlock()
 
 	var active [32]byte
 	var activeCanonical []byte
@@ -199,6 +214,10 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		if next.Revision == active {
 			return false, nil
 		}
+		// Retire the complete old-revision queue before PREPARE can fence a lock
+		// holder. Otherwise releasing that holder can grant a stale waiter for a
+		// session that the same routing transition is about to destroy.
+		r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
 		apply = true
 		return true, nil
 	}, func() (volumeserver.RoutesChange, error) {
@@ -233,6 +252,18 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		Canonical:                append([]byte(nil), next.Canonical...),
 		AcknowledgedParticipants: uint32(acknowledged),
 	}, nil
+}
+
+// beginLockWait admits one blocking byte-range lock against the active route
+// revision and publishes it into the epoch lock table as one indivisible short
+// critical section. The returned waiter owns no routing lock while it sleeps.
+func (r *RoutesController) beginLockWait(admit func() error, lock volumeserver.Lock) (*volumeserver.PendingLock, error) {
+	r.lockWaitAdmission.RLock()
+	defer r.lockWaitAdmission.RUnlock()
+	if err := admit(); err != nil {
+		return nil, err
+	}
+	return r.Locks.BeginWait(lock)
 }
 
 var errRoutesInvalid = errors.New("authorityrpc: routing declaration is not valid")

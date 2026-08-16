@@ -1,0 +1,1988 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim Jang <timjang3@gmail.com>
+Date: Thu, 13 Aug 2026 08:30:38 -0700
+Subject: [PATCH 1/2] fs: add post-VFS reply publication scopes
+
+---
+ fs/Makefile                      |   1 +
+ fs/aio.c                         |  32 ++++-
+ fs/attr.c                        |  12 +-
+ fs/namei.c                       | 219 +++++++++++++++++++++++++++----
+ fs/open.c                        |   8 +-
+ fs/read_write.c                  | 205 ++++++++++++++++++++++++-----
+ fs/reply_publish.c               | 200 ++++++++++++++++++++++++++++
+ fs/splice.c                      | 101 +++++++++++---
+ fs/xattr.c                       |  15 ++-
+ include/linux/fs.h               |   7 +-
+ include/linux/fs_reply_publish.h |  84 ++++++++++++
+ include/linux/sched.h            |   4 +
+ io_uring/rw.c                    |  74 ++++++++++-
+ kernel/fork.c                    |   1 +
+ 14 files changed, 876 insertions(+), 87 deletions(-)
+ create mode 100644 fs/reply_publish.c
+ create mode 100644 include/linux/fs_reply_publish.h
+
+diff --git a/fs/Makefile b/fs/Makefile
+index 61679fd58..eb6001cef 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -11,6 +11,7 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		char_dev.o stat.o exec.o pipe.o namei.o fcntl.o \
+ 		ioctl.o readdir.o select.o dcache.o inode.o \
+ 		attr.o bad_inode.o file.o filesystems.o namespace.o \
++		reply_publish.o \
+ 		seq_file.o xattr.o libfs.o fs-writeback.o \
+ 		pnode.o splice.o sync.o utimes.o d_path.o \
+ 		stack.o fs_struct.o statfs.o fs_pin.o nsfs.o \
+diff --git a/fs/aio.c b/fs/aio.c
+index e8920178b..0f8767575 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -24,6 +24,8 @@
+ 
+ #include <linux/sched/signal.h>
+ #include <linux/fs.h>
++#include <linux/fs_reply_publish.h>
++#include <linux/fsnotify.h>
+ #include <linux/file.h>
+ #include <linux/mm.h>
+ #include <linux/mman.h>
+@@ -1607,9 +1609,12 @@ static int aio_read(struct kiocb *req, const struct iocb *iocb,
+ static int aio_write(struct kiocb *req, const struct iocb *iocb,
+ 			 bool vectored, bool compat)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	struct iovec inline_vecs[UIO_FASTIOV], *iovec = inline_vecs;
+ 	struct iov_iter iter;
+ 	struct file *file;
++	u64 applied_bytes;
++	ssize_t io_result;
+ 	int ret;
+ 
+ 	ret = aio_prep_rw(req, iocb, WRITE);
+@@ -1630,9 +1635,34 @@ static int aio_write(struct kiocb *req, const struct iocb *iocb,
+ 		if (S_ISREG(file_inode(file)->i_mode))
+ 			kiocb_start_write(req);
+ 		req->ki_flags |= IOCB_WRITE;
+-		aio_rw_done(req, file->f_op->write_iter(req, &iter));
++		fs_reply_publish_scope_enter_write(&publish_scope,
++					   file_inode(file)->i_sb);
++		io_result = file->f_op->write_iter(req, &iter);
++		/* Strict PortableFS transactions are synchronous by contract. */
++		if (io_result == -EIOCBQUEUED &&
++		    fs_reply_publish_scope_has_tokens(&publish_scope)) {
++			fs_reply_publish_scope_abort(&publish_scope);
++			io_result = -ENOTCONN;
++		} else if (io_result != -EIOCBQUEUED) {
++			if (fs_reply_publish_scope_has_tokens(&publish_scope) &&
++			    req->ki_flags & IOCB_WRITE &&
++			    S_ISREG(file_inode(file)->i_mode)) {
++				kiocb_end_write(req);
++				req->ki_flags &= ~IOCB_WRITE;
++			}
++			if (fs_reply_publish_scope_has_tokens(&publish_scope) &&
++			    fs_reply_publish_write_applied(io_result,
++							   &applied_bytes))
++				fsnotify_modify(file);
++			io_result = fs_reply_publish_scope_finish(&publish_scope,
++							       io_result);
++		} else {
++			fs_reply_publish_scope_abort(&publish_scope);
++		}
++		aio_rw_done(req, io_result);
+ 	}
+ 	kfree(iovec);
++	/* Completion is now arranged; io_submit must not destroy req again. */
+ 	return ret;
+ }
+ 
+diff --git a/fs/attr.c b/fs/attr.c
+index c04d19b58..69135b751 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -13,6 +13,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/capability.h>
+ #include <linux/fsnotify.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/fcntl.h>
+ #include <linux/filelock.h>
+ #include <linux/security.h>
+@@ -377,6 +378,8 @@ EXPORT_SYMBOL(may_setattr);
+ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		  struct iattr *attr, struct inode **delegated_inode)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	struct inode *inode = dentry->d_inode;
+ 	umode_t mode = inode->i_mode;
+ 	int error;
+@@ -499,15 +502,20 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 			return error;
+ 	}
+ 
+-	if (inode->i_op->setattr)
++	if (inode->i_op->setattr) {
++		fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
++		publish_started = true;
+ 		error = inode->i_op->setattr(idmap, dentry, attr);
+-	else
++	} else {
+ 		error = simple_setattr(idmap, dentry, attr);
++	}
+ 
+ 	if (!error) {
+ 		fsnotify_change(dentry, ia_valid);
+ 		security_inode_post_setattr(idmap, dentry, ia_valid);
+ 	}
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 
+ 	return error;
+ }
+diff --git a/fs/namei.c b/fs/namei.c
+index ffa68aa99..ab50f1c96 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -25,6 +25,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/sched/mm.h>
+ #include <linux/fsnotify.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/personality.h>
+ #include <linux/security.h>
+ #include <linux/syscalls.h>
+@@ -869,10 +870,22 @@ static bool try_to_unlazy_next(struct nameidata *nd, struct dentry *dentry)
+ 
+ static inline int d_revalidate(struct dentry *dentry, unsigned int flags)
+ {
+-	if (unlikely(dentry->d_flags & DCACHE_OP_REVALIDATE))
+-		return dentry->d_op->d_revalidate(dentry, flags);
+-	else
++	if (unlikely(dentry->d_flags & DCACHE_OP_REVALIDATE)) {
++		struct fs_reply_publish_scope scope;
++		int status;
++
++		/* RCU walk may not invalidate dentries or wait for PUBLISH. */
++		if (flags & LOOKUP_RCU)
++			return dentry->d_op->d_revalidate(dentry, flags);
++		fs_reply_publish_scope_enter(&scope, dentry->d_sb);
++		status = dentry->d_op->d_revalidate(dentry, flags);
++		if (!status)
++			d_invalidate(dentry);
++		status = fs_reply_publish_scope_finish(&scope, status);
++		return status < 0 ? status : !!status;
++	} else {
+ 		return 1;
++	}
+ }
+ 
+ /**
+@@ -1608,8 +1621,6 @@ static struct dentry *lookup_dcache(const struct qstr *name,
+ 	if (dentry) {
+ 		int error = d_revalidate(dentry, flags);
+ 		if (unlikely(error <= 0)) {
+-			if (!error)
+-				d_invalidate(dentry);
+ 			dput(dentry);
+ 			return ERR_PTR(error);
+ 		}
+@@ -1631,6 +1642,8 @@ struct dentry *lookup_one_qstr_excl(const struct qstr *name,
+ 	struct dentry *dentry = lookup_dcache(name, base, flags);
+ 	struct dentry *old;
+ 	struct inode *dir = base->d_inode;
++	struct fs_reply_publish_scope publish_scope;
++	ssize_t publish_result;
+ 
+ 	if (dentry)
+ 		return dentry;
+@@ -1643,11 +1656,19 @@ struct dentry *lookup_one_qstr_excl(const struct qstr *name,
+ 	if (unlikely(!dentry))
+ 		return ERR_PTR(-ENOMEM);
+ 
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 	old = dir->i_op->lookup(dir, dentry, flags);
+ 	if (unlikely(old)) {
+ 		dput(dentry);
+ 		dentry = old;
+ 	}
++	publish_result = fs_reply_publish_scope_finish(&publish_scope,
++					      IS_ERR(dentry) ? PTR_ERR(dentry) : 0);
++	if (publish_result == -ENOTCONN) {
++		if (!IS_ERR(dentry))
++			dput(dentry);
++		dentry = ERR_PTR(-ENOTCONN);
++	}
+ 	return dentry;
+ }
+ EXPORT_SYMBOL(lookup_one_qstr_excl);
+@@ -1670,6 +1691,7 @@ static struct dentry *lookup_fast(struct nameidata *nd)
+ {
+ 	struct dentry *dentry, *parent = nd->path.dentry;
+ 	int status = 1;
++	bool rcu_zero = false;
+ 
+ 	/*
+ 	 * Rename seqlock is not required here because in the off chance
+@@ -1694,11 +1716,14 @@ static struct dentry *lookup_fast(struct nameidata *nd)
+ 		status = d_revalidate(dentry, nd->flags);
+ 		if (likely(status > 0))
+ 			return dentry;
++		rcu_zero = !status;
+ 		if (!try_to_unlazy_next(nd, dentry))
+ 			return ERR_PTR(-ECHILD);
+-		if (status == -ECHILD)
++		if (status == -ECHILD) {
+ 			/* we'd been told to redo it in non-rcu mode */
+ 			status = d_revalidate(dentry, nd->flags);
++			rcu_zero = false;
++		}
+ 	} else {
+ 		dentry = __d_lookup(parent, &nd->last);
+ 		if (unlikely(!dentry))
+@@ -1706,7 +1731,8 @@ static struct dentry *lookup_fast(struct nameidata *nd)
+ 		status = d_revalidate(dentry, nd->flags);
+ 	}
+ 	if (unlikely(status <= 0)) {
+-		if (!status)
++		/* The RCU callback returned zero before we acquired references. */
++		if (!status && rcu_zero)
+ 			d_invalidate(dentry);
+ 		dput(dentry);
+ 		return ERR_PTR(status);
+@@ -1734,7 +1760,6 @@ static struct dentry *__lookup_slow(const struct qstr *name,
+ 		int error = d_revalidate(dentry, flags);
+ 		if (unlikely(error <= 0)) {
+ 			if (!error) {
+-				d_invalidate(dentry);
+ 				dput(dentry);
+ 				goto again;
+ 			}
+@@ -1742,8 +1767,20 @@ static struct dentry *__lookup_slow(const struct qstr *name,
+ 			dentry = ERR_PTR(error);
+ 		}
+ 	} else {
++		struct fs_reply_publish_scope publish_scope;
++		ssize_t publish_result;
++
++		fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
+ 		old = inode->i_op->lookup(inode, dentry, flags);
+ 		d_lookup_done(dentry);
++		publish_result = fs_reply_publish_scope_finish(&publish_scope,
++						 IS_ERR(old) ? PTR_ERR(old) : 0);
++		if (publish_result == -ENOTCONN) {
++			dput(dentry);
++			if (old && !IS_ERR(old))
++				dput(old);
++			return ERR_PTR(-ENOTCONN);
++		}
+ 		if (unlikely(old)) {
+ 			dput(dentry);
+ 			dentry = old;
+@@ -3298,6 +3335,7 @@ static inline umode_t vfs_prepare_mode(struct mnt_idmap *idmap,
+ int vfs_create(struct mnt_idmap *idmap, struct inode *dir,
+ 	       struct dentry *dentry, umode_t mode, bool want_excl)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	int error;
+ 
+ 	error = may_create(idmap, dir, dentry);
+@@ -3311,9 +3349,11 @@ int vfs_create(struct mnt_idmap *idmap, struct inode *dir,
+ 	error = security_inode_create(dir, dentry, mode);
+ 	if (error)
+ 		return error;
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 	error = dir->i_op->create(idmap, dir, dentry, mode, want_excl);
+ 	if (!error)
+ 		fsnotify_create(dir, dentry);
++	error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_create);
+@@ -3546,7 +3586,6 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
+ 			break;
+ 		if (error)
+ 			goto out_dput;
+-		d_invalidate(dentry);
+ 		dput(dentry);
+ 		dentry = NULL;
+ 	}
+@@ -3590,9 +3629,21 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
+ 	}
+ 
+ 	if (d_in_lookup(dentry)) {
+-		struct dentry *res = dir_inode->i_op->lookup(dir_inode, dentry,
+-							     nd->flags);
++		struct dentry *res;
++		struct fs_reply_publish_scope publish_scope;
++		ssize_t publish_result;
++
++		fs_reply_publish_scope_enter(&publish_scope, dir_inode->i_sb);
++		res = dir_inode->i_op->lookup(dir_inode, dentry, nd->flags);
+ 		d_lookup_done(dentry);
++		publish_result = fs_reply_publish_scope_finish(&publish_scope,
++						 IS_ERR(res) ? PTR_ERR(res) : 0);
++		if (publish_result == -ENOTCONN) {
++			if (res && !IS_ERR(res))
++				dput(res);
++			error = -ENOTCONN;
++			goto out_dput;
++		}
+ 		if (unlikely(res)) {
+ 			if (IS_ERR(res)) {
+ 				error = PTR_ERR(res);
+@@ -3665,7 +3716,9 @@ static struct dentry *lookup_fast_for_open(struct nameidata *nd, int open_flag)
+ }
+ 
+ static const char *open_last_lookups(struct nameidata *nd,
+-		   struct file *file, const struct open_flags *op)
++		   struct file *file, const struct open_flags *op,
++		   struct fs_reply_publish_scope *open_publish_scope,
++		   bool *open_publish_entered)
+ {
+ 	struct dentry *dir = nd->path.dentry;
+ 	int open_flag = op->open_flag;
+@@ -3711,12 +3764,67 @@ static const char *open_last_lookups(struct nameidata *nd,
+ 		inode_lock(dir->d_inode);
+ 	else
+ 		inode_lock_shared(dir->d_inode);
+-	dentry = lookup_open(nd, file, op, got_write);
+-	if (!IS_ERR(dentry)) {
+-		if (file->f_mode & FMODE_CREATED)
+-			fsnotify_create(dir->d_inode, dentry);
+-		if (file->f_mode & FMODE_OPENED)
+-			fsnotify_open(file);
++	{
++		struct fs_reply_publish_scope publish_scope;
++		ssize_t publish_result;
++		bool merge_attempted = false;
++
++		if (!*open_publish_entered) {
++			/* `dir` is the final parent after all mount/symlink walks. */
++			fs_reply_publish_scope_enter(open_publish_scope,
++						     dir->d_sb);
++			*open_publish_entered = true;
++		}
++
++		fs_reply_publish_scope_enter(&publish_scope, dir->d_sb);
++		dentry = lookup_open(nd, file, op, got_write);
++		if (!IS_ERR(dentry)) {
++			if (file->f_mode & FMODE_CREATED)
++				fsnotify_create(dir->d_inode, dentry);
++			if (file->f_mode & FMODE_OPENED)
++				fsnotify_open(file);
++		}
++		if (!IS_ERR(dentry) &&
++		    (file->f_mode & (FMODE_OPENED | FMODE_CREATED)) &&
++		    fs_reply_publish_scope_has_tokens(&publish_scope)) {
++			struct fs_reply_publish_token *token;
++
++			/* CREATE is durable even if a later post-open hook fails. */
++			list_for_each_entry(token, &publish_scope.tokens, link)
++				token->publish_on_operation_error = true;
++			merge_attempted = true;
++			publish_result = fs_reply_publish_scope_merge(
++				open_publish_scope, &publish_scope);
++		} else {
++			publish_result = fs_reply_publish_scope_finish(
++				&publish_scope,
++				IS_ERR(dentry) ? PTR_ERR(dentry) : 0);
++		}
++		if ((merge_attempted && publish_result) ||
++		    publish_result == -ENOTCONN ||
++		    publish_result == -EPROTO) {
++			/* A failed merge leaves the child scope live: unwind both. */
++			if (current->fs_reply_publish_scope == &publish_scope)
++				fs_reply_publish_scope_abort(&publish_scope);
++			if (*open_publish_entered &&
++			    current->fs_reply_publish_scope == open_publish_scope) {
++				fs_reply_publish_scope_abort(open_publish_scope);
++				*open_publish_entered = false;
++			}
++			if (!IS_ERR(dentry))
++				dput(dentry);
++			dentry = ERR_PTR(-ENOTCONN);
++		} else if (*open_publish_entered &&
++			   !fs_reply_publish_scope_has_tokens(open_publish_scope)) {
++			publish_result = fs_reply_publish_scope_finish(
++				open_publish_scope,
++				IS_ERR(dentry) ? PTR_ERR(dentry) : 0);
++			*open_publish_entered = false;
++			if (publish_result == -ENOTCONN && !IS_ERR(dentry)) {
++				dput(dentry);
++				dentry = ERR_PTR(-ENOTCONN);
++			}
++		}
+ 	}
+ 	if (open_flag & O_CREAT)
+ 		inode_unlock(dir->d_inode);
+@@ -3750,6 +3858,7 @@ static const char *open_last_lookups(struct nameidata *nd,
+ static int do_open(struct nameidata *nd,
+ 		   struct file *file, const struct open_flags *op)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	struct mnt_idmap *idmap;
+ 	int open_flag = op->open_flag;
+ 	bool do_truncate;
+@@ -3790,12 +3899,15 @@ static int do_open(struct nameidata *nd,
+ 		do_truncate = true;
+ 	}
+ 	error = may_open(idmap, &nd->path, acc_mode, open_flag);
++	fs_reply_publish_scope_enter(&publish_scope,
++				     d_inode(nd->path.dentry)->i_sb);
+ 	if (!error && !(file->f_mode & FMODE_OPENED))
+ 		error = vfs_open(&nd->path, file);
+ 	if (!error)
+ 		error = security_file_post_open(file, op->acc_mode);
+ 	if (!error && do_truncate)
+ 		error = handle_truncate(idmap, file);
++	error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	if (unlikely(error > 0)) {
+ 		WARN_ON(1);
+ 		error = -EINVAL;
+@@ -3827,6 +3939,7 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
+ 	struct dentry *child;
+ 	struct inode *dir = d_inode(parentpath->dentry);
+ 	struct inode *inode;
++	struct fs_reply_publish_scope publish_scope;
+ 	int error;
+ 	int open_flag = file->f_flags;
+ 
+@@ -3846,16 +3959,17 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
+ 	file->f_path.mnt = parentpath->mnt;
+ 	file->f_path.dentry = child;
+ 	mode = vfs_prepare_mode(idmap, dir, mode, mode, mode);
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 	error = dir->i_op->tmpfile(idmap, dir, file, mode);
+ 	dput(child);
+ 	if (file->f_mode & FMODE_OPENED)
+ 		fsnotify_open(file);
+ 	if (error)
+-		return error;
++		goto out_publish;
+ 	/* Don't check for other permissions, the inode was just created */
+ 	error = may_open(idmap, &file->f_path, 0, file->f_flags);
+ 	if (error)
+-		return error;
++		goto out_publish;
+ 	inode = file_inode(file);
+ 	if (!(open_flag & O_EXCL)) {
+ 		spin_lock(&inode->i_lock);
+@@ -3863,7 +3977,8 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
+ 		spin_unlock(&inode->i_lock);
+ 	}
+ 	security_inode_post_create_tmpfile(idmap, inode);
+-	return 0;
++out_publish:
++	return fs_reply_publish_scope_finish(&publish_scope, error);
+ }
+ 
+ /**
+@@ -3937,6 +4052,8 @@ static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+ static struct file *path_openat(struct nameidata *nd,
+ 			const struct open_flags *op, unsigned flags)
+ {
++	struct fs_reply_publish_scope open_publish_scope;
++	bool open_publish_entered = false;
+ 	struct file *file;
+ 	int error;
+ 
+@@ -3950,12 +4067,32 @@ static struct file *path_openat(struct nameidata *nd,
+ 		error = do_o_path(nd, flags, file);
+ 	} else {
+ 		const char *s = path_init(nd, flags);
++
+ 		while (!(error = link_path_walk(s, nd)) &&
+-		       (s = open_last_lookups(nd, file, op)) != NULL)
++		       (s = open_last_lookups(nd, file, op,
++					      &open_publish_scope,
++					      &open_publish_entered)) != NULL)
+ 			;
+-		if (!error)
++		if (!error) {
++			/*
++			 * A cached final dentry can skip lookup_open() entirely, but
++			 * a strict shared O_TRUNC OPEN still needs a scope through
++			 * handle_truncate and the post-open security hook.  Enter only
++			 * after final mount/symlink resolution so the scope is keyed to
++			 * the actual target superblock.
++			 */
++			if (!open_publish_entered) {
++				fs_reply_publish_scope_enter(&open_publish_scope,
++						nd->path.dentry->d_sb);
++				open_publish_entered = true;
++			}
+ 			error = do_open(nd, file, op);
++		}
+ 		terminate_walk(nd);
++		if (open_publish_entered &&
++		    current->fs_reply_publish_scope == &open_publish_scope)
++			error = fs_reply_publish_scope_finish(
++				&open_publish_scope, error);
+ 	}
+ 	if (likely(!error)) {
+ 		if (likely(file->f_mode & FMODE_OPENED))
+@@ -4134,6 +4271,7 @@ EXPORT_SYMBOL(user_path_create);
+ int vfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+ 	      struct dentry *dentry, umode_t mode, dev_t dev)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	bool is_whiteout = S_ISCHR(mode) && dev == WHITEOUT_DEV;
+ 	int error = may_create(idmap, dir, dentry);
+ 
+@@ -4156,9 +4294,11 @@ int vfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+ 	if (error)
+ 		return error;
+ 
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 	error = dir->i_op->mknod(idmap, dir, dentry, mode, dev);
+ 	if (!error)
+ 		fsnotify_create(dir, dentry);
++	error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_mknod);
+@@ -4260,6 +4400,7 @@ SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode, unsigned, d
+ int vfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+ 	      struct dentry *dentry, umode_t mode)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	int error;
+ 	unsigned max_links = dir->i_sb->s_max_links;
+ 
+@@ -4278,9 +4419,11 @@ int vfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+ 	if (max_links && dir->i_nlink >= max_links)
+ 		return -EMLINK;
+ 
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 	error = dir->i_op->mkdir(idmap, dir, dentry, mode);
+ 	if (!error)
+ 		fsnotify_mkdir(dir, dentry);
++	error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_mkdir);
+@@ -4341,6 +4484,8 @@ SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
+ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
+ 		     struct dentry *dentry)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	int error = may_delete(idmap, dir, dentry, 1);
+ 
+ 	if (error)
+@@ -4361,6 +4506,8 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
+ 	if (error)
+ 		goto out;
+ 
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
++	publish_started = true;
+ 	error = dir->i_op->rmdir(dir, dentry);
+ 	if (error)
+ 		goto out;
+@@ -4375,6 +4522,8 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
+ 	dput(dentry);
+ 	if (!error)
+ 		d_delete_notify(dir, dentry);
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_rmdir);
+@@ -4470,6 +4619,8 @@ SYSCALL_DEFINE1(rmdir, const char __user *, pathname)
+ int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
+ 	       struct dentry *dentry, struct inode **delegated_inode)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	struct inode *target = dentry->d_inode;
+ 	int error = may_delete(idmap, dir, dentry, 0);
+ 
+@@ -4490,6 +4641,8 @@ int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
+ 			error = try_break_deleg(target, delegated_inode);
+ 			if (error)
+ 				goto out;
++			fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
++			publish_started = true;
+ 			error = dir->i_op->unlink(dir, dentry);
+ 			if (!error) {
+ 				dont_mount(dentry);
+@@ -4507,6 +4660,8 @@ int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
+ 		fsnotify_link_count(target);
+ 		d_delete_notify(dir, dentry);
+ 	}
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 
+ 	return error;
+ }
+@@ -4623,6 +4778,7 @@ SYSCALL_DEFINE1(unlink, const char __user *, pathname)
+ int vfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+ 		struct dentry *dentry, const char *oldname)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	int error;
+ 
+ 	error = may_create(idmap, dir, dentry);
+@@ -4636,9 +4792,11 @@ int vfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+ 	if (error)
+ 		return error;
+ 
++	fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 	error = dir->i_op->symlink(idmap, dir, dentry, oldname);
+ 	if (!error)
+ 		fsnotify_create(dir, dentry);
++	error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_symlink);
+@@ -4716,6 +4874,8 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
+ 	     struct inode *dir, struct dentry *new_dentry,
+ 	     struct inode **delegated_inode)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	struct inode *inode = old_dentry->d_inode;
+ 	unsigned max_links = dir->i_sb->s_max_links;
+ 	int error;
+@@ -4759,8 +4919,11 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
+ 		error = -EMLINK;
+ 	else {
+ 		error = try_break_deleg(inode, delegated_inode);
+-		if (!error)
++		if (!error) {
++			fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
++			publish_started = true;
+ 			error = dir->i_op->link(old_dentry, dir, new_dentry);
++		}
+ 	}
+ 
+ 	if (!error && (inode->i_state & I_LINKABLE)) {
+@@ -4771,6 +4934,8 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
+ 	inode_unlock(inode);
+ 	if (!error)
+ 		fsnotify_link(dir, inode, new_dentry);
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_link);
+@@ -4915,6 +5080,8 @@ SYSCALL_DEFINE2(link, const char __user *, oldname, const char __user *, newname
+  */
+ int vfs_rename(struct renamedata *rd)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	int error;
+ 	struct inode *old_dir = rd->old_dir, *new_dir = rd->new_dir;
+ 	struct dentry *old_dentry = rd->old_dentry;
+@@ -5034,6 +5201,8 @@ int vfs_rename(struct renamedata *rd)
+ 		if (error)
+ 			goto out;
+ 	}
++	fs_reply_publish_scope_enter(&publish_scope, old_dir->i_sb);
++	publish_started = true;
+ 	error = old_dir->i_op->rename(rd->new_mnt_idmap, old_dir, old_dentry,
+ 				      new_dir, new_dentry, flags);
+ 	if (error)
+@@ -5068,6 +5237,8 @@ int vfs_rename(struct renamedata *rd)
+ 		}
+ 	}
+ 	release_dentry_name_snapshot(&old_name);
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 
+ 	return error;
+ }
+diff --git a/fs/open.c b/fs/open.c
+index be7b55260..8af9a0f94 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -28,6 +28,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/audit.h>
+ #include <linux/falloc.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/fs_struct.h>
+ #include <linux/dnotify.h>
+ #include <linux/compat.h>
+@@ -245,6 +246,7 @@ COMPAT_SYSCALL_DEFINE3(ftruncate64, unsigned int, fd,
+ 
+ int vfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	struct inode *inode = file_inode(file);
+ 	long ret;
+ 	loff_t sum;
+@@ -330,6 +332,7 @@ int vfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+ 		return -EOPNOTSUPP;
+ 
+ 	file_start_write(file);
++	fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
+ 	ret = file->f_op->fallocate(file, mode, offset, len);
+ 
+ 	/*
+@@ -339,10 +342,11 @@ int vfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+ 	 * This implies that events are even created if the file size remains
+ 	 * unchanged, e.g. when using flag FALLOC_FL_KEEP_SIZE.
+ 	 */
+-	if (ret == 0)
++	if (ret == 0 ||
++	    fs_reply_publish_scope_requires_flush(&publish_scope))
+ 		fsnotify_modify(file);
+-
+ 	file_end_write(file);
++	ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(vfs_fallocate);
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 430c06993..d14cad671 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -18,6 +18,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/splice.h>
+ #include <linux/compat.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/mount.h>
+ #include <linux/fs.h>
+ #include "internal.h"
+@@ -581,6 +582,7 @@ static ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t
+ {
+ 	struct kiocb kiocb;
+ 	struct iov_iter iter;
++	u64 applied_bytes;
+ 	ssize_t ret;
+ 
+ 	init_sync_kiocb(&kiocb, filp);
+@@ -589,7 +591,7 @@ static ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t
+ 
+ 	ret = filp->f_op->write_iter(&kiocb, &iter);
+ 	BUG_ON(ret == -EIOCBQUEUED);
+-	if (ret > 0 && ppos)
++	if (ppos && fs_reply_publish_write_applied(ret, &applied_bytes))
+ 		*ppos = kiocb.ki_pos;
+ 	return ret;
+ }
+@@ -598,6 +600,9 @@ static ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t
+ ssize_t __kernel_write_iter(struct file *file, struct iov_iter *from, loff_t *pos)
+ {
+ 	struct kiocb kiocb;
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_owner;
++	u64 applied_bytes;
+ 	ssize_t ret;
+ 
+ 	if (WARN_ON_ONCE(!(file->f_mode & FMODE_WRITE)))
+@@ -613,14 +618,18 @@ ssize_t __kernel_write_iter(struct file *file, struct iov_iter *from, loff_t *po
+ 
+ 	init_sync_kiocb(&kiocb, file);
+ 	kiocb.ki_pos = pos ? *pos : 0;
++	publish_owner = fs_reply_publish_scope_enter_write(
++		&publish_scope, file_inode(file)->i_sb);
+ 	ret = file->f_op->write_iter(&kiocb, from);
+-	if (ret > 0) {
++	if (fs_reply_publish_write_applied(ret, &applied_bytes)) {
+ 		if (pos)
+ 			*pos = kiocb.ki_pos;
+ 		fsnotify_modify(file);
+-		add_wchar(current, ret);
++		add_wchar(current, applied_bytes);
+ 	}
+ 	inc_syscw(current);
++	if (publish_owner)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 	return ret;
+ }
+ 
+@@ -662,6 +671,9 @@ EXPORT_SYMBOL(kernel_write);
+ 
+ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_owner;
++	u64 applied_bytes;
+ 	ssize_t ret;
+ 
+ 	if (!(file->f_mode & FMODE_WRITE))
+@@ -676,6 +688,8 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 		return ret;
+ 	if (count > MAX_RW_COUNT)
+ 		count =  MAX_RW_COUNT;
++	publish_owner = fs_reply_publish_scope_enter_write(
++		&publish_scope, file_inode(file)->i_sb);
+ 	file_start_write(file);
+ 	if (file->f_op->write)
+ 		ret = file->f_op->write(file, buf, count, pos);
+@@ -683,12 +697,14 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 		ret = new_sync_write(file, buf, count, pos);
+ 	else
+ 		ret = -EINVAL;
+-	if (ret > 0) {
++	if (fs_reply_publish_write_applied(ret, &applied_bytes)) {
+ 		fsnotify_modify(file);
+-		add_wchar(current, ret);
++		add_wchar(current, applied_bytes);
+ 	}
+ 	inc_syscw(current);
+ 	file_end_write(file);
++	if (publish_owner)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 	return ret;
+ }
+ 
+@@ -725,6 +741,8 @@ SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+ {
+ 	struct fd f = fdget_pos(fd);
++	struct fs_reply_publish_scope publish_scope;
++	u64 applied_bytes;
+ 	ssize_t ret = -EBADF;
+ 
+ 	if (fd_file(f)) {
+@@ -733,9 +751,13 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+ 			pos = *ppos;
+ 			ppos = &pos;
+ 		}
++		fs_reply_publish_scope_enter_write(&publish_scope,
++					   file_inode(fd_file(f))->i_sb);
+ 		ret = vfs_write(fd_file(f), buf, count, ppos);
+-		if (ret >= 0 && ppos)
++		if (ppos && (ret >= 0 ||
++		    fs_reply_publish_scope_get_applied_bytes(&applied_bytes)))
+ 			fd_file(f)->f_pos = pos;
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 		fdput_pos(f);
+ 	}
+ 
+@@ -935,6 +957,9 @@ EXPORT_SYMBOL(vfs_iter_read);
+ ssize_t vfs_iocb_iter_write(struct file *file, struct kiocb *iocb,
+ 			    struct iov_iter *iter)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_owner;
++	u64 applied_bytes;
+ 	size_t tot_len;
+ 	ssize_t ret = 0;
+ 
+@@ -953,11 +978,15 @@ ssize_t vfs_iocb_iter_write(struct file *file, struct kiocb *iocb,
+ 		return ret;
+ 
+ 	kiocb_start_write(iocb);
++	publish_owner = fs_reply_publish_scope_enter_write(
++		&publish_scope, file_inode(file)->i_sb);
+ 	ret = file->f_op->write_iter(iocb, iter);
+ 	if (ret != -EIOCBQUEUED)
+ 		kiocb_end_write(iocb);
+-	if (ret > 0)
++	if (fs_reply_publish_write_applied(ret, &applied_bytes))
+ 		fsnotify_modify(file);
++	if (publish_owner)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 
+ 	return ret;
+ }
+@@ -966,6 +995,9 @@ EXPORT_SYMBOL(vfs_iocb_iter_write);
+ ssize_t vfs_iter_write(struct file *file, struct iov_iter *iter, loff_t *ppos,
+ 		       rwf_t flags)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_owner;
++	u64 applied_bytes;
+ 	size_t tot_len;
+ 	ssize_t ret;
+ 
+@@ -985,10 +1017,14 @@ ssize_t vfs_iter_write(struct file *file, struct iov_iter *iter, loff_t *ppos,
+ 		return ret;
+ 
+ 	file_start_write(file);
++	publish_owner = fs_reply_publish_scope_enter_write(
++		&publish_scope, file_inode(file)->i_sb);
+ 	ret = do_iter_readv_writev(file, iter, ppos, WRITE, flags);
+-	if (ret > 0)
++	if (fs_reply_publish_write_applied(ret, &applied_bytes))
+ 		fsnotify_modify(file);
+ 	file_end_write(file);
++	if (publish_owner)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 
+ 	return ret;
+ }
+@@ -1035,9 +1071,12 @@ static ssize_t vfs_readv(struct file *file, const struct iovec __user *vec,
+ static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
+ 			  unsigned long vlen, loff_t *pos, rwf_t flags)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_owner;
+ 	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov = iovstack;
+ 	struct iov_iter iter;
++	u64 applied_bytes;
+ 	size_t tot_len;
+ 	ssize_t ret = 0;
+ 
+@@ -1060,13 +1099,20 @@ static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
+ 		goto out;
+ 
+ 	file_start_write(file);
++	publish_owner = fs_reply_publish_scope_enter_write(
++		&publish_scope, file_inode(file)->i_sb);
+ 	if (file->f_op->write_iter)
+ 		ret = do_iter_readv_writev(file, &iter, pos, WRITE, flags);
+ 	else
+ 		ret = do_loop_readv_writev(file, &iter, pos, WRITE, flags);
+-	if (ret > 0)
++	if (fs_reply_publish_write_applied(ret, &applied_bytes)) {
+ 		fsnotify_modify(file);
++		if (ret < 0)
++			add_wchar(current, applied_bytes);
++	}
+ 	file_end_write(file);
++	if (publish_owner)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ out:
+ 	kfree(iov);
+ 	return ret;
+@@ -1100,6 +1146,8 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
+ 			 unsigned long vlen, rwf_t flags)
+ {
+ 	struct fd f = fdget_pos(fd);
++	struct fs_reply_publish_scope publish_scope;
++	u64 applied_bytes;
+ 	ssize_t ret = -EBADF;
+ 
+ 	if (fd_file(f)) {
+@@ -1108,9 +1156,13 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
+ 			pos = *ppos;
+ 			ppos = &pos;
+ 		}
++		fs_reply_publish_scope_enter_write(&publish_scope,
++					   file_inode(fd_file(f))->i_sb);
+ 		ret = vfs_writev(fd_file(f), vec, vlen, ppos, flags);
+-		if (ret >= 0 && ppos)
++		if (ppos && (ret >= 0 ||
++		    fs_reply_publish_scope_get_applied_bytes(&applied_bytes)))
+ 			fd_file(f)->f_pos = pos;
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 		fdput_pos(f);
+ 	}
+ 
+@@ -1320,7 +1372,9 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+ 	struct pipe_inode_info *opipe;
+ 	loff_t pos;
+ 	loff_t out_pos;
++	loff_t *write_pos;
+ 	ssize_t retval;
++	bool remote_output;
+ 	int fl;
+ 
+ 	/*
+@@ -1358,6 +1412,9 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+ 	in_inode = file_inode(fd_file(in));
+ 	out_inode = file_inode(fd_file(out));
+ 	out_pos = fd_file(out)->f_pos;
++	remote_output =
++		fd_file(out)->f_mode & FMODE_REMOTE_SIZE_AUTHORITY;
++	write_pos = remote_output ? &fd_file(out)->f_pos : &out_pos;
+ 
+ 	if (!max)
+ 		max = min(in_inode->i_sb->s_maxbytes, out_inode->i_sb->s_maxbytes);
+@@ -1385,7 +1442,7 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+ 		retval = rw_verify_area(WRITE, fd_file(out), &out_pos, count);
+ 		if (retval < 0)
+ 			goto fput_out;
+-		retval = do_splice_direct(fd_file(in), &pos, fd_file(out), &out_pos,
++		retval = do_splice_direct(fd_file(in), &pos, fd_file(out), write_pos,
+ 					  count, fl);
+ 	} else {
+ 		if (fd_file(out)->f_flags & O_NONBLOCK)
+@@ -1398,8 +1455,10 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+ 		add_rchar(current, retval);
+ 		add_wchar(current, retval);
+ 		fsnotify_access(fd_file(in));
+-		fsnotify_modify(fd_file(out));
+-		fd_file(out)->f_pos = out_pos;
++		if (!remote_output)
++			fsnotify_modify(fd_file(out));
++		if (!remote_output)
++			fd_file(out)->f_pos = out_pos;
+ 		if (ppos)
+ 			*ppos = pos;
+ 		else
+@@ -1504,12 +1563,17 @@ COMPAT_SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd,
+  */
+ static int generic_copy_file_checks(struct file *file_in, loff_t pos_in,
+ 				    struct file *file_out, loff_t pos_out,
+-				    size_t *req_count, unsigned int flags)
++				    size_t *req_count, unsigned int flags,
++				    u64 *write_rlimit_fsize,
++				    u64 *write_file_max_size)
+ {
+ 	struct inode *inode_in = file_inode(file_in);
+ 	struct inode *inode_out = file_inode(file_out);
+ 	uint64_t count = *req_count;
+ 	loff_t size_in;
++	bool remote_source = file_in->f_mode & FMODE_REMOTE_SIZE_AUTHORITY;
++	bool remote_dest = file_out->f_mode & FMODE_REMOTE_SIZE_AUTHORITY;
++	bool remote_size_authority;
+ 	int ret;
+ 
+ 	ret = generic_file_rw_checks(file_in, file_out);
+@@ -1543,23 +1607,69 @@ static int generic_copy_file_checks(struct file *file_in, loff_t pos_in,
+ 	if (IS_SWAPFILE(inode_in) || IS_SWAPFILE(inode_out))
+ 		return -ETXTBSY;
+ 
++	/*
++	 * A remote size authority must observe both ends of the copy.  Mixing
++	 * one such handle with a locally bounded handle is a storage-domain
++	 * crossing, not a request that can be safely shortened from cached
++	 * inode state.
++	 */
++	if (remote_source != remote_dest)
++		return -EXDEV;
++	remote_size_authority = remote_source && remote_dest;
++	/* Internal callers must never decompose an authority copy into splice. */
++	if (remote_size_authority && (flags & COPY_FILE_SPLICE))
++		return -EOPNOTSUPP;
++
+ 	/* Ensure offsets don't wrap. */
+ 	if (pos_in + count < pos_in || pos_out + count < pos_out)
+ 		return -EOVERFLOW;
+ 
+-	/* Shorten the copy to EOF */
+-	size_in = i_size_read(inode_in);
+-	if (pos_in >= size_in)
+-		count = 0;
+-	else
+-		count = min(count, size_in - (uint64_t)pos_in);
++	/* Shorten locally bounded copies to EOF. */
++	if (!remote_size_authority) {
++		size_in = i_size_read(inode_in);
++		if (pos_in >= size_in)
++			count = 0;
++		else
++			count = min(count, size_in - (uint64_t)pos_in);
++	}
+ 
+-	ret = generic_write_check_limits(file_out, pos_out, &count);
+-	if (ret)
+-		return ret;
++	*write_rlimit_fsize = rlimit(RLIMIT_FSIZE);
++	*write_file_max_size = inode_out->i_sb->s_maxbytes;
++	if (!(file_out->f_flags & O_LARGEFILE))
++		*write_file_max_size = min_t(u64, *write_file_max_size,
++					       MAX_NON_LFS);
++	/*
++	 * A zero-length copy never reaches the remote authority, but Linux
++	 * still checks the destination limits before returning zero.  Preserve
++	 * that ordering locally; a nonzero remote request leaves the equivalent
++	 * check to the authority after it clips against the authoritative source
++	 * EOF.
++	 */
++	if (remote_size_authority && count == 0) {
++		if (*write_rlimit_fsize != RLIM_INFINITY &&
++		    pos_out >= *write_rlimit_fsize) {
++			send_sig(SIGXFSZ, current, 0);
++			return -EFBIG;
++		}
++		if (unlikely(pos_out >= *write_file_max_size))
++			return -EFBIG;
++	}
++	if (!remote_size_authority &&
++	    *write_rlimit_fsize != RLIM_INFINITY) {
++		if (pos_out >= *write_rlimit_fsize) {
++			send_sig(SIGXFSZ, current, 0);
++			return -EFBIG;
++		}
++		count = min_t(u64, count, *write_rlimit_fsize - pos_out);
++	}
++	if (!remote_size_authority) {
++		if (unlikely(pos_out >= *write_file_max_size))
++			return -EFBIG;
++		count = min_t(u64, count, *write_file_max_size - pos_out);
++	}
+ 
+ 	/* Don't allow overlapped copying within the same file. */
+-	if (inode_in == inode_out &&
++	if (!remote_size_authority && inode_in == inode_out &&
+ 	    pos_out + count > pos_in &&
+ 	    pos_out < pos_in + count)
+ 		return -EINVAL;
+@@ -1577,15 +1687,21 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
+ 			    struct file *file_out, loff_t pos_out,
+ 			    size_t len, unsigned int flags)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	ssize_t ret;
++	u64 write_rlimit_fsize;
++	u64 write_file_max_size;
++	bool publish_owner;
+ 	bool splice = flags & COPY_FILE_SPLICE;
+ 	bool samesb = file_inode(file_in)->i_sb == file_inode(file_out)->i_sb;
++	u64 applied_bytes = 0;
+ 
+ 	if (flags & ~COPY_FILE_SPLICE)
+ 		return -EINVAL;
+ 
+ 	ret = generic_copy_file_checks(file_in, pos_in, file_out, pos_out, &len,
+-				       flags);
++				       flags, &write_rlimit_fsize,
++				       &write_file_max_size);
+ 	if (unlikely(ret))
+ 		return ret;
+ 
+@@ -1607,7 +1723,11 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
+ 	if (splice || !file_out->f_op->copy_file_range || in_compat_syscall())
+ 		len = min_t(size_t, MAX_RW_COUNT, len);
+ 
++	publish_owner = fs_reply_publish_scope_enter_if_needed(
++		&publish_scope, file_inode(file_out)->i_sb);
+ 	file_start_write(file_out);
++	fs_reply_publish_scope_set_write_limits(write_rlimit_fsize,
++						write_file_max_size);
+ 
+ 	/*
+ 	 * Cloning is supported by more file systems, so we implement copy on
+@@ -1629,11 +1749,16 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
+ 		splice = true;
+ 	}
+ 
+-	file_end_write(file_out);
+-
+ 	if (!splice)
+ 		goto done;
+ 
++	/*
++	 * Preserve the upstream cross-superblock lock order.  A strict shared
++	 * PortableFS copy always takes its private ->copy_file_range path and
++	 * can never reach this stock splice fallback.
++	 */
++	file_end_write(file_out);
++
+ 	/*
+ 	 * We can get here for same sb copy of filesystems that do not implement
+ 	 * ->copy_file_range() in case filesystem does not support clone or in
+@@ -1656,11 +1781,22 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
+ 	ret = do_splice_direct(file_in, &pos_in, file_out, &pos_out, len, 0);
+ done:
+ 	if (ret > 0) {
++		applied_bytes = ret;
++	} else if (fs_reply_publish_scope_requires_flush(
++					publish_owner ? &publish_scope :
++					current->fs_reply_publish_scope)) {
++		fs_reply_publish_scope_get_applied_bytes(&applied_bytes);
++	}
++	if (applied_bytes) {
+ 		fsnotify_access(file_in);
+-		add_rchar(current, ret);
++		add_rchar(current, applied_bytes);
+ 		fsnotify_modify(file_out);
+-		add_wchar(current, ret);
++		add_wchar(current, applied_bytes);
+ 	}
++	if (!splice)
++		file_end_write(file_out);
++	if (publish_owner)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 
+ 	inc_syscr(current);
+ 	inc_syscw(current);
+@@ -1676,6 +1812,8 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
+ 	loff_t pos_in;
+ 	loff_t pos_out;
+ 	ssize_t ret = -EBADF;
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_scope_entered = false;
+ 
+ 	CLASS(fd, f_in)(fd_in);
+ 	if (fd_empty(f_in))
+@@ -1702,8 +1840,11 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
+ 	if (flags != 0)
+ 		return -EINVAL;
+ 
+-	ret = vfs_copy_file_range(fd_file(f_in), pos_in, fd_file(f_out), pos_out, len,
+-				  flags);
++	fs_reply_publish_scope_enter_write(&publish_scope,
++				   file_inode(fd_file(f_out))->i_sb);
++	publish_scope_entered = true;
++	ret = vfs_copy_file_range(fd_file(f_in), pos_in, fd_file(f_out), pos_out,
++				  len, flags);
+ 	if (ret > 0) {
+ 		pos_in += ret;
+ 		pos_out += ret;
+@@ -1722,6 +1863,8 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
+ 			fd_file(f_out)->f_pos = pos_out;
+ 		}
+ 	}
++	if (publish_scope_entered)
++		ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+ 	return ret;
+ }
+ 
+diff --git a/fs/reply_publish.c b/fs/reply_publish.c
+new file mode 100644
+index 000000000..767d8f0c2
+--- /dev/null
++++ b/fs/reply_publish.c
+@@ -0,0 +1,200 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/export.h>
++#include <linux/fs.h>
++#include <linux/fs_reply_publish.h>
++#include <linux/sched.h>
++
++void fs_reply_publish_scope_enter(struct fs_reply_publish_scope *scope,
++				  struct super_block *sb)
++{
++	scope->parent = current->fs_reply_publish_scope;
++	scope->sb = sb;
++	INIT_LIST_HEAD(&scope->tokens);
++	scope->active = !!(sb && (sb->s_iflags & SB_I_REPLY_PUBLISH));
++	scope->accepts_write_token = false;
++	scope->write_limits_valid = false;
++	scope->applied_bytes_valid = false;
++	current->fs_reply_publish_scope = scope;
++}
++
++bool fs_reply_publish_scope_enter_write(
++		struct fs_reply_publish_scope *scope, struct super_block *sb)
++{
++	struct fs_reply_publish_scope *current_scope =
++		current->fs_reply_publish_scope;
++
++	if (current_scope && current_scope->active &&
++	    current_scope->sb == sb && current_scope->accepts_write_token)
++		return false;
++	fs_reply_publish_scope_enter(scope, sb);
++	scope->accepts_write_token = scope->active;
++	return true;
++}
++
++bool fs_reply_publish_scope_enter_if_needed(
++		struct fs_reply_publish_scope *scope, struct super_block *sb)
++{
++	if (current->fs_reply_publish_scope &&
++	    current->fs_reply_publish_scope->active &&
++	    current->fs_reply_publish_scope->sb == sb)
++		return false;
++	fs_reply_publish_scope_enter(scope, sb);
++	return true;
++}
++
++static void fs_reply_publish_scope_leave(struct fs_reply_publish_scope *scope)
++{
++	WARN_ON_ONCE(current->fs_reply_publish_scope != scope);
++	current->fs_reply_publish_scope = scope->parent;
++	scope->active = false;
++}
++
++void fs_reply_publish_scope_abort(struct fs_reply_publish_scope *scope)
++{
++	struct fs_reply_publish_token *token, *next;
++
++	list_for_each_entry_safe(token, next, &scope->tokens, link) {
++		list_del_init(&token->link);
++		token->cancel(token);
++	}
++	fs_reply_publish_scope_leave(scope);
++}
++
++int fs_reply_publish_scope_flush(struct fs_reply_publish_scope *scope)
++{
++	struct fs_reply_publish_token *token;
++	int err = 0;
++
++	while (!list_empty(&scope->tokens)) {
++		token = list_first_entry(&scope->tokens,
++					 struct fs_reply_publish_token, link);
++		list_del_init(&token->link);
++		err = token->publish(token);
++		if (err)
++			break;
++	}
++	if (err) {
++		struct fs_reply_publish_token *next;
++
++		list_for_each_entry_safe(token, next, &scope->tokens, link) {
++			list_del_init(&token->link);
++			token->cancel(token);
++		}
++	}
++	/*
++	 * A later token failure must fence every mutation represented by this
++	 * scope, even though earlier token ACKs may already be physical.  The
++	 * connection abort is the terminal result; callers must not retry.
++	 */
++	fs_reply_publish_scope_leave(scope);
++	return err;
++}
++
++ssize_t fs_reply_publish_scope_finish(struct fs_reply_publish_scope *scope,
++				       ssize_t result)
++{
++	bool has_tokens = fs_reply_publish_scope_has_tokens(scope);
++	bool publish_after_error =
++		fs_reply_publish_scope_requires_flush(scope);
++	int err;
++
++	if (result >= 0 || publish_after_error) {
++		err = fs_reply_publish_scope_flush(scope);
++		return err ? -ENOTCONN : result;
++	}
++
++	fs_reply_publish_scope_abort(scope);
++	/* A definite marked mutation followed by local failure is ambiguous. */
++	return has_tokens ? -ENOTCONN : result;
++}
++
++int fs_reply_publish_add_to(struct fs_reply_publish_scope *scope,
++			    struct fs_reply_publish_token *token)
++{
++	if (!scope || !scope->active || scope->sb != token->sb ||
++	    !list_empty(&token->link))
++		return -EPROTO;
++	list_add_tail(&token->link, &scope->tokens);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(fs_reply_publish_add_to);
++
++int fs_reply_publish_scope_merge(struct fs_reply_publish_scope *parent,
++				 struct fs_reply_publish_scope *child)
++{
++	/* Non-participating filesystems still need to unwind the stack scope. */
++	if (!child->active) {
++		if (current->fs_reply_publish_scope != child ||
++		    child->parent != parent || !list_empty(&child->tokens))
++			return -EPROTO;
++		fs_reply_publish_scope_leave(child);
++		return 0;
++	}
++	if (!child->active || child->parent != parent || !parent ||
++	    !parent->active || parent->sb != child->sb)
++		return -EPROTO;
++	list_splice_tail_init(&child->tokens, &parent->tokens);
++	fs_reply_publish_scope_leave(child);
++	return 0;
++}
++
++int fs_reply_publish_add(struct fs_reply_publish_token *token)
++{
++	return fs_reply_publish_add_to(current->fs_reply_publish_scope, token);
++}
++EXPORT_SYMBOL_GPL(fs_reply_publish_add);
++
++bool fs_reply_publish_scope_requires_flush(
++		const struct fs_reply_publish_scope *scope)
++{
++	const struct fs_reply_publish_token *token;
++
++	list_for_each_entry(token, &scope->tokens, link)
++		if (token->publish_on_operation_error)
++			return true;
++	return false;
++}
++
++void fs_reply_publish_scope_set_write_limits(u64 rlimit_fsize,
++					     u64 file_max_size)
++{
++	struct fs_reply_publish_scope *scope = current->fs_reply_publish_scope;
++
++	if (!scope || !scope->active)
++		return;
++	scope->write_rlimit_fsize = rlimit_fsize;
++	scope->write_file_max_size = file_max_size;
++	scope->write_limits_valid = true;
++}
++
++bool fs_reply_publish_scope_get_write_limits(u64 *rlimit_fsize,
++					     u64 *file_max_size)
++{
++	struct fs_reply_publish_scope *scope = current->fs_reply_publish_scope;
++
++	if (!scope || !scope->active || !scope->write_limits_valid)
++		return false;
++	*rlimit_fsize = scope->write_rlimit_fsize;
++	*file_max_size = scope->write_file_max_size;
++	return true;
++}
++
++void fs_reply_publish_scope_set_applied_bytes(u64 applied_bytes)
++{
++	struct fs_reply_publish_scope *scope = current->fs_reply_publish_scope;
++
++	if (!scope || !scope->active)
++		return;
++	scope->applied_bytes = applied_bytes;
++	scope->applied_bytes_valid = true;
++}
++
++bool fs_reply_publish_scope_get_applied_bytes(u64 *applied_bytes)
++{
++	struct fs_reply_publish_scope *scope = current->fs_reply_publish_scope;
++
++	if (!scope || !scope->active || !scope->applied_bytes_valid)
++		return false;
++	*applied_bytes = scope->applied_bytes;
++	return true;
++}
+diff --git a/fs/splice.c b/fs/splice.c
+index ed8177f6d..c406cff8d 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -30,6 +30,7 @@
+ #include <linux/export.h>
+ #include <linux/syscalls.h>
+ #include <linux/uio.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/fsnotify.h>
+ #include <linux/security.h>
+ #include <linux/gfp.h>
+@@ -675,6 +676,7 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 	};
+ 	int nbufs = pipe->max_usage;
+ 	struct bio_vec *array;
++	bool publish_failed_after_apply = false;
+ 	ssize_t ret;
+ 
+ 	if (!out->f_op->write_iter)
+@@ -689,9 +691,11 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 	splice_from_pipe_begin(&sd);
+ 	while (sd.total_len) {
+ 		struct kiocb kiocb;
++		struct fs_reply_publish_scope publish_scope;
+ 		struct iov_iter from;
+ 		unsigned int head, tail, mask;
+-		size_t left;
++		u64 applied_bytes = 0;
++		size_t left, written;
+ 		int n;
+ 
+ 		ret = splice_from_pipe_next(pipe, &sd);
+@@ -740,24 +744,47 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 		iov_iter_bvec(&from, ITER_SOURCE, array, n, sd.total_len - left);
+ 		init_sync_kiocb(&kiocb, out);
+ 		kiocb.ki_pos = sd.pos;
++		fs_reply_publish_scope_enter_write(&publish_scope,
++					   file_inode(out)->i_sb);
+ 		ret = out->f_op->write_iter(&kiocb, &from);
+-		sd.pos = kiocb.ki_pos;
+-		if (ret <= 0)
++		if (ret > 0) {
++			applied_bytes = ret;
++		} else if (fs_reply_publish_scope_requires_flush(&publish_scope) &&
++			 !fs_reply_publish_scope_get_applied_bytes(&applied_bytes)) {
++			fs_reply_publish_scope_abort(&publish_scope);
++			publish_failed_after_apply = true;
++			ret = -ENOTCONN;
+ 			break;
+-		WARN_ONCE(ret > sd.total_len - left,
++		}
++		if (!applied_bytes) {
++			ret = fs_reply_publish_scope_finish(&publish_scope, ret);
++			break;
++		}
++		WARN_ONCE(applied_bytes > sd.total_len - left,
+ 			  "Splice Exceeded! ret=%zd tot=%zu left=%zu\n",
+-			  ret, sd.total_len, left);
++			  (ssize_t)applied_bytes, sd.total_len, left);
++		if (unlikely(applied_bytes > sd.total_len - left)) {
++			fs_reply_publish_scope_abort(&publish_scope);
++			ret = -ENOTCONN;
++			break;
++		}
+ 
+-		sd.num_spliced += ret;
+-		sd.total_len -= ret;
++		written = applied_bytes;
++		sd.pos = kiocb.ki_pos;
+ 		*ppos = sd.pos;
++		sd.num_spliced += written;
++		sd.total_len -= written;
+ 
+-		/* dismiss the fully eaten buffers, adjust the partial one */
++		/*
++		 * The remote write is already committed.  Consume exactly that
++		 * prefix before PUBLISH so a lost ACK cannot expose the same pipe
++		 * bytes for a duplicate retry.
++		 */
+ 		tail = pipe->tail;
+-		while (ret) {
++		while (written) {
+ 			struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+-			if (ret >= buf->len) {
+-				ret -= buf->len;
++			if (written >= buf->len) {
++				written -= buf->len;
+ 				buf->len = 0;
+ 				pipe_buf_release(pipe, buf);
+ 				tail++;
+@@ -765,11 +792,32 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 				if (pipe->files)
+ 					sd.need_wakeup = true;
+ 			} else {
+-				buf->offset += ret;
+-				buf->len -= ret;
+-				ret = 0;
++				buf->offset += written;
++				buf->len -= written;
++				written = 0;
+ 			}
+ 		}
++		if (out->f_mode & FMODE_REMOTE_SIZE_AUTHORITY)
++			fsnotify_modify(out);
++
++		/*
++		 * The operation-local position, pipe consumption, and modify
++		 * event are now final for this transaction.  Only now may the
++		 * daemon release its retained source gate and admit the next
++		 * fragment.
++		 *
++		 * A positive committed prefix must remain positive here even if
++		 * the private mutation also reported a post-apply error.  Returning
++		 * that errno would make splice_direct_to_actor rewind the source
++		 * position and offer already-committed bytes again.
++		 */
++		ret = fs_reply_publish_scope_flush(&publish_scope);
++		if (ret) {
++			publish_failed_after_apply = true;
++			ret = -ENOTCONN;
++			break;
++		}
++		ret = applied_bytes;
+ 	}
+ done:
+ 	kfree(array);
+@@ -777,7 +825,8 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 
+ 	pipe_unlock(pipe);
+ 
+-	if (sd.num_spliced)
++	/* A later pre-apply failure cannot hide an already published prefix. */
++	if (sd.num_spliced && !publish_failed_after_apply)
+ 		ret = sd.num_spliced;
+ 
+ 	return ret;
+@@ -1333,14 +1382,26 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 
+ 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
+ 	} else if (ipipe) {
++		loff_t *write_pos;
++		bool remote_output =
++			out->f_mode & FMODE_REMOTE_SIZE_AUTHORITY;
++
+ 		if (off_in)
+ 			return -ESPIPE;
+ 		if (off_out) {
+ 			if (!(out->f_mode & FMODE_PWRITE))
+ 				return -EINVAL;
+ 			offset = *off_out;
++			write_pos = &offset;
+ 		} else {
+ 			offset = out->f_pos;
++			/*
++			 * Strict remote writes publish each write_iter before the
++			 * next transaction.  Give that boundary the actual shared
++			 * file-description position instead of copying it later from
++			 * a stack temporary.
++			 */
++			write_pos = remote_output ? &out->f_pos : &offset;
+ 		}
+ 
+ 		if (unlikely(out->f_flags & O_APPEND))
+@@ -1354,13 +1415,14 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 			flags |= SPLICE_F_NONBLOCK;
+ 
+ 		file_start_write(out);
+-		ret = do_splice_from(ipipe, out, &offset, len, flags);
++		ret = do_splice_from(ipipe, out, write_pos, len, flags);
+ 		file_end_write(out);
+ 
+-		if (!off_out)
++		if (!off_out && !remote_output)
+ 			out->f_pos = offset;
+ 		else
+-			*off_out = offset;
++			if (off_out)
++				*off_out = offset;
+ 	} else if (opipe) {
+ 		if (off_out)
+ 			return -ESPIPE;
+@@ -1395,7 +1457,8 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 		 * do_splice_from() may've already sent modify out,
+ 		 * and this ensures the events get merged.
+ 		 */
+-		fsnotify_modify(out);
++		if (!(out->f_mode & FMODE_REMOTE_SIZE_AUTHORITY))
++			fsnotify_modify(out);
+ 		fsnotify_access(in);
+ 	}
+ 
+diff --git a/fs/xattr.c b/fs/xattr.c
+index 23b9e4b1f..36d925a2d 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -22,6 +22,7 @@
+ #include <linux/audit.h>
+ #include <linux/vmalloc.h>
+ #include <linux/posix_acl_xattr.h>
++#include <linux/fs_reply_publish.h>
+ 
+ #include <linux/uaccess.h>
+ 
+@@ -224,6 +225,8 @@ int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
+ 			  const void *value, size_t size, int flags)
+ {
+ 	struct inode *inode = dentry->d_inode;
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	int error = -EAGAIN;
+ 	int issec = !strncmp(name, XATTR_SECURITY_PREFIX,
+ 				   XATTR_SECURITY_PREFIX_LEN);
+@@ -231,6 +234,8 @@ int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
+ 	if (issec)
+ 		inode->i_flags &= ~S_NOSEC;
+ 	if (inode->i_opflags & IOP_XATTR) {
++		fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
++		publish_started = true;
+ 		error = __vfs_setxattr(idmap, dentry, inode, name, value,
+ 				       size, flags);
+ 		if (!error) {
+@@ -254,6 +259,8 @@ int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
+ 				fsnotify_xattr(dentry);
+ 		}
+ 	}
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 
+ 	return error;
+ }
+@@ -536,6 +543,8 @@ __vfs_removexattr_locked(struct mnt_idmap *idmap,
+ 			 struct inode **delegated_inode)
+ {
+ 	struct inode *inode = dentry->d_inode;
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	int error;
+ 
+ 	error = xattr_permission(idmap, inode, name, MAY_WRITE);
+@@ -550,14 +559,18 @@ __vfs_removexattr_locked(struct mnt_idmap *idmap,
+ 	if (error)
+ 		goto out;
+ 
++	fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
++	publish_started = true;
+ 	error = __vfs_removexattr(idmap, dentry, name);
+ 	if (error)
+-		return error;
++		goto out;
+ 
+ 	fsnotify_xattr(dentry);
+ 	security_inode_post_removexattr(dentry, name);
+ 
+ out:
++	if (publish_started)
++		error = fs_reply_publish_scope_finish(&publish_scope, error);
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(__vfs_removexattr_locked);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 466a76771..cce19f88b 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -171,7 +171,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ 
+ #define	FMODE_NOREUSE		((__force fmode_t)(1 << 23))
+ 
+-/* FMODE_* bit 24 */
++/* The filesystem, rather than cached i_size, authoritatively bounds copies. */
++#define FMODE_REMOTE_SIZE_AUTHORITY ((__force fmode_t)(1 << 24))
+ 
+ /* File is embedded in backing_file object */
+ #define FMODE_BACKING		((__force fmode_t)(1 << 25))
+@@ -347,6 +348,9 @@ struct readahead_control;
+ /* kiocb is a read or write operation submitted by fs/aio.c. */
+ #define IOCB_AIO_RW		(1 << 23)
+ 
++/* Private core marker: a short write is a final transactional result. */
++#define IOCB_PFS_TERMINAL_SHORT	(1 << 24)
++
+ /* for use in trace events */
+ #define TRACE_IOCB_STRINGS \
+ 	{ IOCB_HIPRI,		"HIPRI" }, \
+@@ -1238,6 +1242,7 @@ extern int send_sigurg(struct file *file);
+ #define SB_I_RETIRED	0x00000800	/* superblock shouldn't be reused */
+ #define SB_I_NOUMASK	0x00001000	/* VFS does not apply umask */
+ #define SB_I_NOIDMAP	0x00002000	/* No idmapped mounts on this superblock */
++#define SB_I_REPLY_PUBLISH 0x00004000 /* post-VFS reply publication scopes */
+ 
+ /* Possible states of 'frozen' field */
+ enum {
+diff --git a/include/linux/fs_reply_publish.h b/include/linux/fs_reply_publish.h
+new file mode 100644
+index 000000000..f4a8dc7ad
+--- /dev/null
++++ b/include/linux/fs_reply_publish.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_FS_REPLY_PUBLISH_H
++#define _LINUX_FS_REPLY_PUBLISH_H
++
++#include <linux/list.h>
++#include <linux/types.h>
++
++struct super_block;
++
++/*
++ * A filesystem reply may make a remote result durable before the VFS has
++ * finished publishing the corresponding dentry, inode, cache, or file
++ * position.  A reply token is therefore attached to the exact stack-scoped
++ * VFS operation and acknowledged only at that operation's true publication
++ * point.
++ */
++struct fs_reply_publish_token {
++	struct list_head link;
++	struct super_block *sb;
++	int (*publish)(struct fs_reply_publish_token *token);
++	void (*cancel)(struct fs_reply_publish_token *token);
++	bool publish_on_operation_error;
++};
++
++struct fs_reply_publish_scope {
++	struct fs_reply_publish_scope *parent;
++	struct super_block *sb;
++	struct list_head tokens;
++	u64 write_rlimit_fsize;
++	u64 write_file_max_size;
++	u64 applied_bytes;
++	bool active;
++	bool accepts_write_token;
++	bool write_limits_valid;
++	bool applied_bytes_valid;
++};
++
++void fs_reply_publish_scope_enter(struct fs_reply_publish_scope *scope,
++				  struct super_block *sb);
++bool fs_reply_publish_scope_enter_if_needed(
++		struct fs_reply_publish_scope *scope, struct super_block *sb);
++bool fs_reply_publish_scope_enter_write(
++		struct fs_reply_publish_scope *scope, struct super_block *sb);
++int fs_reply_publish_scope_flush(struct fs_reply_publish_scope *scope);
++void fs_reply_publish_scope_abort(struct fs_reply_publish_scope *scope);
++ssize_t fs_reply_publish_scope_finish(struct fs_reply_publish_scope *scope,
++				       ssize_t result);
++int fs_reply_publish_add_to(struct fs_reply_publish_scope *scope,
++			    struct fs_reply_publish_token *token);
++int fs_reply_publish_scope_merge(struct fs_reply_publish_scope *parent,
++				 struct fs_reply_publish_scope *child);
++int fs_reply_publish_add(struct fs_reply_publish_token *token);
++bool fs_reply_publish_scope_requires_flush(
++		const struct fs_reply_publish_scope *scope);
++void fs_reply_publish_scope_set_write_limits(u64 rlimit_fsize,
++					     u64 file_max_size);
++bool fs_reply_publish_scope_get_write_limits(u64 *rlimit_fsize,
++					     u64 *file_max_size);
++void fs_reply_publish_scope_set_applied_bytes(u64 applied_bytes);
++bool fs_reply_publish_scope_get_applied_bytes(u64 *applied_bytes);
++
++/*
++ * A reply may have committed bytes and then reported a post-apply error.
++ * Callers use this independently of the externally visible return value so
++ * position, fsnotify, and accounting are published exactly once before ACK.
++ */
++static inline bool fs_reply_publish_write_applied(ssize_t result,
++						  u64 *applied_bytes)
++{
++	if (result > 0) {
++		*applied_bytes = result;
++		return true;
++	}
++	return fs_reply_publish_scope_get_applied_bytes(applied_bytes) &&
++	       *applied_bytes;
++}
++
++static inline bool
++fs_reply_publish_scope_has_tokens(const struct fs_reply_publish_scope *scope)
++{
++	return scope->active && !list_empty(&scope->tokens);
++}
++
++#endif /* _LINUX_FS_REPLY_PUBLISH_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index f9ffe42ca..e7dd89b96 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -80,6 +80,7 @@ struct signal_struct;
+ struct task_delay_info;
+ struct task_group;
+ struct task_struct;
++struct fs_reply_publish_scope;
+ struct user_event_mm;
+ 
+ #include <linux/sched/ext.h>
+@@ -1241,6 +1242,9 @@ struct task_struct {
+ 	/* Journalling filesystem info: */
+ 	void				*journal_info;
+ 
++	/* Stack-scoped post-VFS filesystem reply publication. */
++	struct fs_reply_publish_scope	*fs_reply_publish_scope;
++
+ 	/* Stacked block device info: */
+ 	struct bio_list			*bio_list;
+ 
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index a744cb5d2..6566ac986 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -2,6 +2,7 @@
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
+ #include <linux/fs.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/file.h>
+ #include <linux/blk-mq.h>
+ #include <linux/mm.h>
+@@ -588,13 +589,44 @@ static inline void io_rw_done(struct kiocb *kiocb, ssize_t ret)
+ }
+ 
+ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
+-		      struct io_br_sel *sel, unsigned int issue_flags)
++		      struct io_br_sel *sel, unsigned int issue_flags,
++		      struct fs_reply_publish_scope *publish_scope)
+ {
+ 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
++	u64 applied_bytes;
+ 	unsigned final_ret = io_fixup_rw_res(req, ret);
+ 
+-	if (ret >= 0 && req->flags & REQ_F_CUR_POS)
++	if ((ret >= 0 ||
++	     (publish_scope &&
++	      fs_reply_publish_scope_get_applied_bytes(&applied_bytes))) &&
++	    req->flags & REQ_F_CUR_POS)
+ 		req->file->f_pos = rw->kiocb.ki_pos;
++	if (publish_scope) {
++		u32 cflags = 0;
++
++		/*
++		 * A strict PortableFS transaction completes synchronously.  End
++		 * write accounting and emit fsnotify before acknowledging the
++		 * daemon's retained source gate, but before exposing the CQE.
++		 */
++		/* A committed private mutation is terminal for this SQE. */
++		if (unlikely(ret != req->cqe.res)) {
++			req_set_fail(req);
++			req->cqe.res = ret;
++		}
++		io_req_io_end(req);
++		ret = fs_reply_publish_scope_finish(publish_scope, ret);
++		final_ret = io_fixup_rw_res(req, ret);
++		if (ret < 0) {
++			req_set_fail(req);
++			req->cqe.res = ret;
++		}
++		if (sel)
++			cflags = io_put_kbuf(req, ret, sel->buf_list);
++		io_req_set_res(req, final_ret, cflags);
++		io_req_rw_cleanup(req, issue_flags);
++		return IOU_OK;
++	}
+ 	if (ret >= 0 && (rw->kiocb.ki_complete == io_complete_rw)) {
+ 		if (!__io_complete_rw_common(req, ret)) {
+ 			u32 cflags = 0;
+@@ -957,7 +989,7 @@ int io_read(struct io_kiocb *req, unsigned int issue_flags)
+ 
+ 	ret = __io_read(req, &sel, issue_flags);
+ 	if (ret >= 0)
+-		return kiocb_done(req, ret, &sel, issue_flags);
++		return kiocb_done(req, ret, &sel, issue_flags, NULL);
+ 
+ 	if (req->flags & REQ_F_BUFFERS_COMMIT)
+ 		io_kbuf_recycle(req, sel.buf_list, issue_flags);
+@@ -1055,6 +1087,8 @@ static bool io_kiocb_start_write(struct io_kiocb *req, struct kiocb *kiocb)
+ 
+ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ {
++	struct fs_reply_publish_scope publish_scope;
++	struct fs_reply_publish_scope *publish_scopep = NULL;
+ 	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
+ 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+ 	struct io_async_rw *io = req->async_data;
+@@ -1093,6 +1127,8 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ 	if (unlikely(!io_kiocb_start_write(req, kiocb)))
+ 		return -EAGAIN;
+ 	kiocb->ki_flags |= IOCB_WRITE;
++	fs_reply_publish_scope_enter_write(&publish_scope,
++				   file_inode(req->file)->i_sb);
+ 
+ 	if (likely(req->file->f_op->write_iter))
+ 		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
+@@ -1100,10 +1136,28 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ 		ret2 = loop_rw_iter(WRITE, rw, &io->iter);
+ 	else
+ 		ret2 = -EINVAL;
++	if (ret2 == -EIOCBQUEUED &&
++	    fs_reply_publish_scope_has_tokens(&publish_scope)) {
++		fs_reply_publish_scope_abort(&publish_scope);
++		ret2 = -ENOTCONN;
++	} else if (ret2 != -EIOCBQUEUED) {
++		if (fs_reply_publish_scope_has_tokens(&publish_scope))
++			publish_scopep = &publish_scope;
++		else
++			ret2 = fs_reply_publish_scope_finish(&publish_scope, ret2);
++	} else {
++		fs_reply_publish_scope_abort(&publish_scope);
++	}
+ 
+ 	if (req->flags & REQ_F_REISSUE) {
+ 		req->flags &= ~REQ_F_REISSUE;
+-		ret2 = -EAGAIN;
++		if (publish_scopep) {
++			fs_reply_publish_scope_abort(publish_scopep);
++			publish_scopep = NULL;
++			ret2 = -ENOTCONN;
++		} else {
++			ret2 = -EAGAIN;
++		}
+ 	}
+ 
+ 	/*
+@@ -1120,7 +1174,8 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ 		if (ret2 == -EAGAIN && (req->ctx->flags & IORING_SETUP_IOPOLL))
+ 			goto ret_eagain;
+ 
+-		if (ret2 != req->cqe.res && ret2 >= 0 && need_complete_io(req)) {
++		if (ret2 != req->cqe.res && ret2 >= 0 && need_complete_io(req) &&
++		    !(kiocb->ki_flags & IOCB_PFS_TERMINAL_SHORT)) {
+ 			trace_io_uring_short_write(req->ctx, kiocb->ki_pos - ret2,
+ 						req->cqe.res, ret2);
+ 
+@@ -1137,9 +1192,16 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ 			return -EAGAIN;
+ 		}
+ done:
+-		return kiocb_done(req, ret2, NULL, issue_flags);
++		return kiocb_done(req, ret2, NULL, issue_flags,
++				  publish_scopep);
+ 	} else {
+ ret_eagain:
++		if (publish_scopep) {
++			fs_reply_publish_scope_abort(publish_scopep);
++			publish_scopep = NULL;
++			ret2 = -ENOTCONN;
++			goto done;
++		}
+ 		iov_iter_restore(&io->iter, &io->iter_state);
+ 		if (kiocb->ki_flags & IOCB_WRITE)
+ 			io_req_end_write(req);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 2b7577edf..1b42f029c 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2362,6 +2362,7 @@ __latent_entropy struct task_struct *copy_process(
+ #endif
+ 
+ 	p->pagefault_disabled = 0;
++	p->fs_reply_publish_scope = NULL;
+ 
+ #ifdef CONFIG_LOCKDEP
+ 	lockdep_init_task(p);

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -107,6 +108,17 @@ jobs:
       - name: Test the Foundation-enabled Darwin data plane
         run: CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
 
+  kernel-strict-static:
+    name: kernel-strict-static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify exact Linux 6.12.100 patch series, UAPI, hooks, and state models
+        run: kernel/linux-6.12.100-portablefs-append/verify.sh --no-build
+
   macos-app-unsigned:
     runs-on: macos-26
     timeout-minutes: 20
@@ -169,6 +181,11 @@ jobs:
           test "$("$cli" version)" = "portablefs $expected_version"
           test "$("$daemon" -version)" = "$expected_version"
 
+  # The live privileged jobs are intentionally not run on stock hosted runners.
+  # The strict dialect requires the checked-in patched Linux 6.12.100 kernel;
+  # stock Ubuntu must fail INIT and cannot provide weaker evidence. A separate
+  # qualification runner boots that exact kernel and invokes these same scripts.
+  #
   # The privileged Linux data-plane suite. Everything below `go test ./...` in
   # the `go` job runs on an ordinary tmpfs with no XFS project quotas and no
   # kernel FUSE mount, so the two-mount coherence, locking, paging, session and
@@ -177,7 +194,8 @@ jobs:
   # the script additionally verifies that each required test reported PASS, so a
   # provisioning regression or a deleted test cannot present as a green run.
   linux-xfs-fuse:
-    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, linux, arm64, portablefs-strict-6-12-100]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -205,7 +223,8 @@ jobs:
   # coherence case must fail) and fails the job if a control does not turn a case
   # red. So a green result here is evidence rather than an absence of evidence.
   linux-coherence-matrix:
-    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, linux, arm64, portablefs-strict-6-12-100]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -217,23 +236,11 @@ jobs:
           sudo modprobe fuse
           test -e /dev/loop-control
           test -e /dev/fuse
-      # Both profiles run against a volume that really declares machine-local
-      # routes: the script installs the declaration through the admin
-      # ApplyRoutes call before either mount attaches, so every run also
+      # The strict protocol runs against a volume that really declares
+      # machine-local routes: the script installs the declaration through the
+      # admin ApplyRoutes call before either mount attaches, so the run also
       # exercises the mount's adopt-and-retry attach path.
-      - name: Two-mount cross-mount coherence matrix (strict profile)
-        env:
-          PORTABLEFS_COHERENCE: strict
+      - name: Two-mount cross-mount coherence matrix
         run: bash scripts/coherence-matrix-linux.sh
-      - name: Two-mount cross-mount coherence matrix (uncached profile)
-        env:
-          PORTABLEFS_COHERENCE: uncached
-        run: bash scripts/coherence-matrix-linux.sh
-      - name: Package-manager concurrent-reader matrix (strict profile)
-        env:
-          PORTABLEFS_COHERENCE: strict
-        run: bash scripts/package-manager-matrix.sh
-      - name: Package-manager concurrent-reader matrix (uncached profile)
-        env:
-          PORTABLEFS_COHERENCE: uncached
+      - name: Package-manager concurrent-reader matrix
         run: bash scripts/package-manager-matrix.sh

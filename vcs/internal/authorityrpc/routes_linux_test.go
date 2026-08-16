@@ -39,15 +39,23 @@ func emptyRoutesRevision() []byte {
 // testRoutesController builds a controller over a real volume, for the
 // privileged end-to-end test.
 func testRoutesController(t *testing.T, store *xfsstore.Volume) *RoutesController {
+	return testRoutesControllerWithFencer(t, store, noopFencer{})
+}
+
+func testRoutesControllerWithFencer(t *testing.T, store *xfsstore.Volume, fencer volumeserver.SessionFencer) *RoutesController {
 	t.Helper()
 	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: fencer,
 		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	routes, err := NewRoutesController(store, visibility)
+	locks := volumeserver.NewLockTable(1024, 1024, time.Now)
+	if authority, ok := fencer.(*volumeserver.Authority); ok {
+		locks = authority.Locks()
+	}
+	routes, err := NewRoutesController(store, visibility, locks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +73,53 @@ func (noopMembership) Deactivate(volumeserver.SessionID) error { return nil }
 type noopFencer struct{}
 
 func (noopFencer) FenceSession(volumeserver.SessionID) {}
+
+func TestRouteLockWaitAdmissionCannotSlipPastTransition(t *testing.T) {
+	id := volumeserver.SessionID{1}
+	locks := volumeserver.NewLockTable(16, 16, time.Now)
+	locks.RegisterSession(id, time.Now().Add(time.Hour))
+	routes := &RoutesController{Locks: locks}
+	routes.lockWaitAdmission.Lock()
+
+	active := true
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := routes.beginLockWait(func() error {
+			if !active {
+				return volumeserver.ErrSessionExpired
+			}
+			return nil
+		}, volumeserver.Lock{
+			Object: volumeserver.ObjectKey{1},
+			Owner:  volumeserver.LockOwner{Session: id},
+			Type:   volumeserver.LockWrite,
+			Range:  volumeserver.ToEOF(0),
+		})
+		done <- err
+	}()
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("wait admission crossed a held topology writer: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Apply changes the authoritative revision while it owns the writer. The
+	// queued admission can run only afterwards and must see the new verdict.
+	active = false
+	locks.InterruptWaiters(volumeserver.ErrSessionExpired)
+	routes.lockWaitAdmission.Unlock()
+	select {
+	case err := <-done:
+		if !errors.Is(err, volumeserver.ErrSessionExpired) {
+			t.Fatalf("post-transition lock admission = %v, want ErrSessionExpired", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-transition lock admission remained blocked")
+	}
+}
 
 // loadedRoutes is a controller whose active revision is set directly. Every
 // check below runs before any storage access - a routing disagreement is
@@ -101,9 +156,10 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 	active := routesRevisionOf("node_modules\n")
 	mount := routesRevisionOf("target\n")
 	h := testVolumeHandler()
-	h.Store = &xfsstore.Volume{}
+	h.Store = &resourceAdmissionFaultStore{}
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
 	h.Routes = loadedRoutes("node_modules\n")
+	h.Visibility = h.Routes.Visibility
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -125,7 +181,10 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 			response := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{
 				Attach: &authoritypb.AttachRequest{
 					VolumeId: "routes-volume", AccessToken: []byte("test-only"), ReplaySlots: 2,
-					RoutesRevision: test.revision,
+					RoutesRevision: test.revision, AttachAttemptId: testAttachAttempt(1),
+					CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+					CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
+					NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
 				}}})
 			if response.GetAttach() != nil {
 				t.Fatal("a mount running another topology was admitted")
@@ -172,16 +231,14 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 	}
 }
 
-// An uncached mount is in no barrier, so it is never told a routing change
-// happened. What stops it operating under a topology the volume has replaced is
-// the revision this authority recorded when it admitted the session: once that
-// is no longer the active one, every request it makes is refused, and the
-// refusal says why.
+// Every mount joins route barriers. The recorded revision remains an independent
+// admission invariant: if a session presents a stale topology, every request is
+// refused actionably even before filesystem execution.
 func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 	first := routesRevisionOf("node_modules\n")
 	second := routesRevisionOf("node_modules\ntarget\n")
 	h := testVolumeHandler()
-	h.Store = &xfsstore.Volume{}
+	h.Store = &resourceAdmissionFaultStore{}
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
 	h.Routes = loadedRoutes("node_modules\n")
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
@@ -191,7 +248,7 @@ func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Runtime = runtime
-	cred, err := runtime.Attach(2, volumeserver.PeerIdentity{1},
+	cred, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{1},
 		volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +321,7 @@ func TestVisibilityControlIsNotRoutesGated(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Runtime = runtime
-	cred, err := runtime.Attach(2, volumeserver.PeerIdentity{1},
+	cred, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{1},
 		volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
@@ -386,8 +443,8 @@ func TestProtectedNamespaceRefusesEveryMountMutation(t *testing.T) {
 			Item: declaration[:], Name: []byte("user.x")}}},
 		"remove an xattr from it": {Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{
 			Item: declaration[:], Name: []byte("user.x")}}},
-		"write through a handle on it": {Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
-			Handle: handle[:], Data: []byte("node_modules\n")}}},
+		"fallocate through a handle on it": {Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{
+			Handle: handle[:], Offset: 0, Length: 1, FileMaxSize: 1 << 20}}},
 		"open it for writing": {Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
 			Item: declaration[:], Flags: &authoritypb.OpenFlags{Write: true}}}},
 		"open it for truncation": {Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
@@ -528,7 +585,8 @@ func TestRoutesControllerRoundTripsThroughTheVolumeOnXFS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	routes, err := NewRoutesController(store, visibility)
+	locks := volumeserver.NewLockTable(1024, 1024, time.Now)
+	routes, err := NewRoutesController(store, visibility, locks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +614,7 @@ func TestRoutesControllerRoundTripsThroughTheVolumeOnXFS(t *testing.T) {
 	// A second controller over the same volume is a restarted authority epoch.
 	// It has to arrive at exactly the same revision, or a mount admitted before
 	// the restart and one admitted after would disagree.
-	restarted, err := NewRoutesController(store, visibility)
+	restarted, err := NewRoutesController(store, visibility, locks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +721,7 @@ func TestRoutesControllerTreatsRenameAsPublishedWhenDirectorySyncFails(t *testin
 
 	// Rename publication is immediately visible even though its durability is
 	// uncertain. A fresh controller must not reconstruct the old revision.
-	restarted, err := NewRoutesController(store, routes.Visibility)
+	restarted, err := NewRoutesController(store, routes.Visibility, routes.Locks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +748,7 @@ func TestRoutesControllerRefusesAProtectedDeclarationWithAnOutsideHardLink(t *te
 		t.Fatalf("create outside hard-link alias: %v", err)
 	}
 
-	restarted, err := NewRoutesController(store, routes.Visibility)
+	restarted, err := NewRoutesController(store, routes.Visibility, routes.Locks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,6 +906,7 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 	h.Store = &xfsstore.Volume{}
 	h.Authorizer = authorizer
 	h.Routes = loadedRoutes("node_modules\n")
+	h.Visibility = h.Routes.Visibility
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -861,7 +920,10 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 		return h.Handle(ctx, &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{
 			Attach: &authoritypb.AttachRequest{
 				VolumeId: "routes-volume", AccessToken: capability, ReplaySlots: 2,
-				RoutesRevision: revision,
+				RoutesRevision: revision, AttachAttemptId: testAttachAttempt(id),
+				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+				CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
+				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
 			}}})
 	}
 
@@ -932,7 +994,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			authorizer := &singleUseAuthorizer{access: volumeserver.AccessRead | volumeserver.AccessWrite}
 			h := testVolumeHandler()
-			h.Store = &xfsstore.Volume{}
+			h.Store = &resourceAdmissionFaultStore{}
 			h.Authorizer = authorizer
 			h.Routes = loadedRoutes("")
 			h.Visibility = h.Routes.Visibility
@@ -949,7 +1011,19 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 			for _, attach := range []*authoritypb.AttachRequest{test.invalid, test.valid} {
 				attach.AccessToken = token
 				attach.RoutesRevision = append([]byte(nil), revision[:]...)
+				attach.CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT
+				if attach.CachedNameCapacity == 0 {
+					attach.CachedNameCapacity = 1024
+				}
+				if attach.RepairBudgetMillis == 0 {
+					attach.RepairBudgetMillis = 1000
+				}
+				if attach.NamespaceRepair == authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
+					attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+				}
 			}
+			test.invalid.AttachAttemptId = testAttachAttempt(1)
+			test.valid.AttachAttemptId = testAttachAttempt(2)
 			if response := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: test.invalid}}); response.GetErrno() == 0 {
 				t.Fatal("invalid attach was admitted")
 			}
@@ -965,149 +1039,131 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 }
 
 func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T) {
-	for _, profile := range []authoritypb.CoherenceProfile{
-		authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED,
-		authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-	} {
-		name := "uncached"
-		if profile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT {
-			name = "strict"
-		}
-		t.Run(name, func(t *testing.T) {
-			routes := loadedRoutes("")
-			authorizer := blockingAuthorizer{entered: make(chan struct{}), release: make(chan struct{})}
-			h := testVolumeHandler()
-			h.Store = &xfsstore.Volume{}
-			h.Authorizer = authorizer
-			h.Routes, h.Visibility = routes, routes.Visibility
-			runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-				SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			h.Runtime = runtime
-			revision := routesRevisionOf("")
-			attach := &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", AccessToken: []byte("token"), ReplaySlots: 2,
-				RoutesRevision: append([]byte(nil), revision[:]...), CoherenceProfile: profile,
-			}
-			if profile == authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT {
-				attach.CachedNameCapacity = 1024
-				attach.RepairBudgetMillis = 1000
-				attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
-			}
-			ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{1})
-			attachDone := make(chan struct{})
-			go func() {
-				defer close(attachDone)
-				_ = h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: attach}})
-			}()
-			select {
-			case <-authorizer.entered:
-			case <-time.After(time.Second):
-				t.Fatal("attach did not pause inside authorization")
-			}
+	routes := loadedRoutes("")
+	authorizer := blockingAuthorizer{entered: make(chan struct{}), release: make(chan struct{})}
+	h := testVolumeHandler()
+	h.Store = &resourceAdmissionFaultStore{}
+	h.Authorizer = authorizer
+	h.Routes, h.Visibility = routes, routes.Visibility
+	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Runtime = runtime
+	revision := routesRevisionOf("")
+	attach := &authoritypb.AttachRequest{
+		VolumeId: "routes-volume", AccessToken: []byte("token"), ReplaySlots: 2,
+		RoutesRevision:     append([]byte(nil), revision[:]...),
+		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+		CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		AttachAttemptId: testAttachAttempt(1),
+	}
+	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{1})
+	attachDone := make(chan struct{})
+	go func() {
+		defer close(attachDone)
+		_ = h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: attach}})
+	}()
+	select {
+	case <-authorizer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("attach did not pause inside authorization")
+	}
 
-			checked := make(chan struct{})
-			writerDone := make(chan error, 1)
-			go func() {
-				_, err := routes.Visibility.ExecuteRoutesChecked(context.Background(), volumeserver.RoutesChange{}, func() (bool, error) {
-					close(checked)
-					return false, nil
-				}, func() (volumeserver.RoutesChange, error) { panic("no-op CAS committed") })
-				writerDone <- err
-			}()
-			select {
-			case <-checked:
-				t.Fatal("route CAS ran while attach admission was paused")
-			case <-time.After(50 * time.Millisecond):
-			}
-			close(authorizer.release)
-			select {
-			case <-attachDone:
-			case <-time.After(time.Second):
-				t.Fatal("attach did not finish after authorization resumed")
-			}
-			select {
-			case err := <-writerDone:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(time.Second):
-				t.Fatal("route writer did not resume after attach admission finished")
-			}
-		})
+	checked := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := routes.Visibility.ExecuteRoutesChecked(context.Background(), volumeserver.RoutesChange{}, func() (bool, error) {
+			close(checked)
+			return false, nil
+		}, func() (volumeserver.RoutesChange, error) { panic("no-op CAS committed") })
+		writerDone <- err
+	}()
+	select {
+	case <-checked:
+		t.Fatal("route CAS ran while attach admission was paused")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(authorizer.release)
+	select {
+	case <-attachDone:
+	case <-time.After(time.Second):
+		t.Fatal("attach did not finish after authorization resumed")
+	}
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route writer did not resume after attach admission finished")
 	}
 }
 
 func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testing.T) {
-	for _, profile := range []volumeserver.CoherenceProfile{volumeserver.CoherenceUncached, volumeserver.CoherenceStrict} {
-		name := "uncached"
-		if profile == volumeserver.CoherenceStrict {
-			name = "strict"
-		}
-		t.Run(name, func(t *testing.T) {
-			routes := loadedRoutes("")
-			h := testVolumeHandler()
-			h.Routes, h.Visibility = routes, routes.Visibility
-			id := volumeserver.SessionID{1}
-			revision := routesRevisionOf("")
-			if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision, profile); err != nil {
-				t.Fatal(err)
-			}
-			if profile == volumeserver.CoherenceStrict {
-				if err := routes.Visibility.Register(id, profile, make(chan struct{}), volumeserver.VisibilityCommitment{
-					CachedNameCapacity: 1024, RepairBudget: time.Second,
-					NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
-				}); err != nil {
-					t.Fatal(err)
-				}
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					defer cancel()
-					var after volumeserver.VisibilityCursor
-					for range 2 {
-						event, err := routes.Visibility.Next(ctx, id, after)
-						if err != nil {
-							return
-						}
-						if err := routes.Visibility.Ack(id, event.Cursor); err != nil {
-							return
-						}
-						after = event.Cursor
-					}
-				}()
-			}
-
-			guard, err := h.beginTopologyRequest(id)
+	routes := loadedRoutes("")
+	h := testVolumeHandler()
+	h.Routes, h.Visibility = routes, routes.Visibility
+	id := volumeserver.SessionID{1}
+	revision := routesRevisionOf("")
+	if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	if err := routes.Visibility.Register(id, volumeserver.CoherenceStrict, make(chan struct{}), volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 1024, RepairBudget: time.Second,
+		NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := routes.Visibility.InitialCursor(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		after := initial
+		for range 2 {
+			event, err := routes.Visibility.Next(ctx, id, after)
 			if err != nil {
-				t.Fatal(err)
+				return
 			}
-			checked := make(chan struct{})
-			writerDone := make(chan error, 1)
-			next := volumeserver.RoutesChange{Revision: [32]byte{1}, Canonical: []byte("node_modules\n")}
-			go func() {
-				_, err := routes.Visibility.ExecuteRoutesChecked(context.Background(), next, func() (bool, error) {
-					close(checked)
-					return true, nil
-				}, func() (volumeserver.RoutesChange, error) { return next, nil })
-				writerDone <- err
-			}()
-			select {
-			case <-checked:
-				t.Fatal("route CAS ran while an admitted filesystem request was paused")
-			case <-time.After(50 * time.Millisecond):
+			if err := routes.Visibility.Ack(id, event.Cursor); err != nil {
+				return
 			}
-			guard.Release()
-			select {
-			case err := <-writerDone:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("route writer did not resume after filesystem completion")
-			}
-		})
+			after = event.Cursor
+		}
+	}()
+
+	guard, err := h.beginTopologyRequest(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := make(chan struct{})
+	writerDone := make(chan error, 1)
+	next := volumeserver.RoutesChange{Revision: [32]byte{1}, Canonical: []byte("node_modules\n")}
+	go func() {
+		_, err := routes.Visibility.ExecuteRoutesChecked(context.Background(), next, func() (bool, error) {
+			close(checked)
+			return true, nil
+		}, func() (volumeserver.RoutesChange, error) { return next, nil })
+		writerDone <- err
+	}()
+	select {
+	case <-checked:
+		t.Fatal("route CAS ran while an admitted filesystem request was paused")
+	case <-time.After(50 * time.Millisecond):
+	}
+	guard.Release()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("route writer did not resume after filesystem completion")
 	}
 }

@@ -119,8 +119,7 @@ private actor RecordingBackend: PfsMacOSCoherenceBackend {
     let otherInitiator = try PfsMacOSMutationInitiator(
         sessionID: Data(repeating: 0x25, count: 16),
         replaySlot: 4,
-        mutationSequence: 20,
-        localOperationID: 9
+        mutationSequence: 20
     )
     for (prepareInitiator, completeInitiator) in [
         (testInitiator, otherInitiator),
@@ -198,8 +197,7 @@ private actor RecordingBackend: PfsMacOSCoherenceBackend {
     let changedInitiator = try PfsMacOSMutationInitiator(
         sessionID: Data(repeating: 0x25, count: 16),
         replaySlot: 4,
-        mutationSequence: 20,
-        localOperationID: 9
+        mutationSequence: 20
     )
     let mismatchedDuplicate = try PfsMacOSCoherenceEvent(
         epoch: testEpoch,
@@ -521,12 +519,10 @@ private func objectNativeDataRepair(size: UInt64) -> PfsMacOSCacheRepair {
 }
 
 @Test func nativeBackendInvalidatesEverySupportedPeerDataTargetBeforeResuming() async throws {
-    let localSession = Data(repeating: 0x99, count: 16)
     let invalidator = RecordingNativeDataInvalidator()
     let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
     let publication = RecordingPublicationBarrier()
     let backend = try PfsNativeFSKitCoherenceBackend(
-        localAuthoritySessionID: localSession,
         revoker: revoker,
         publicationBarrier: publication
     )
@@ -557,43 +553,12 @@ private func objectNativeDataRepair(size: UInt64) -> PfsMacOSCacheRepair {
     #expect(await publication.recorded() == [.prepare, .complete])
 }
 
-@Test func nativeBackendDoesNotRevokeTheSourceMountsOwnPublishedMutation() async throws {
-    let localSession = Data(repeating: 0x99, count: 16)
-    let localInitiator = try PfsMacOSMutationInitiator(
-        sessionID: localSession,
-        replaySlot: 7,
-        mutationSequence: 23,
-        localOperationID: 91
-    )
-    let repair = try linkedNativeDataRepair(name: "source", size: 12)
-    let invalidator = RecordingNativeDataInvalidator()
-    let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
-    let publication = RecordingPublicationBarrier()
-    let backend = try PfsNativeFSKitCoherenceBackend(
-        localAuthoritySessionID: localSession,
-        revoker: revoker,
-        publicationBarrier: publication
-    )
-    let complete = try PfsMacOSCoherenceEvent(
-        epoch: testEpoch,
-        sequence: 1,
-        phase: .complete,
-        initiator: localInitiator,
-        repairs: [repair]
-    )
-
-    try await backend.repair(complete)
-
-    #expect(await invalidator.recorded().isEmpty)
-    #expect(await publication.recorded() == [.complete])
-}
 
 @Test func nativeBackendFailsBeforePublicationResumeWhenAnyRepairCannotRevoke() async throws {
     let invalidator = RecordingNativeDataInvalidator(failureIndex: 1)
     let revoker = PfsFSKitDocumentedNativeCacheRevoker(invalidator: invalidator)
     let publication = RecordingPublicationBarrier()
     let backend = try PfsNativeFSKitCoherenceBackend(
-        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
         revoker: revoker,
         publicationBarrier: publication
     )
@@ -644,7 +609,6 @@ private func objectNativeDataRepair(size: UInt64) -> PfsMacOSCacheRepair {
 
     let publication = RecordingPublicationBarrier()
     let backend = try PfsNativeFSKitCoherenceBackend(
-        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
         revoker: revoker,
         publicationBarrier: publication
     )
@@ -696,7 +660,6 @@ private actor RecordingActuator: PfsMacOS26RepairActuator {
     let actuator = RecordingActuator()
     let publication = RecordingPublicationBarrier()
     let backend = try PfsMacOS26CoherenceBackend(
-        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
         authenticator: authenticator,
         armer: armer,
         actuator: actuator,
@@ -747,7 +710,6 @@ private actor RecordingActuator: PfsMacOS26RepairActuator {
     let actuator = RecordingActuator()
     let publication = RecordingPublicationBarrier()
     let backend = try PfsMacOS26CoherenceBackend(
-        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
         authenticator: authenticator,
         armer: armer,
         actuator: actuator,
@@ -798,42 +760,10 @@ private actor RecordingActuator: PfsMacOS26RepairActuator {
     #expect(plans.map(\.step) == [0, 2])
 }
 
-@Test func initiatingCompletePublishesNormallyWithoutNestedVFSRepair() async throws {
-    let authenticator = try PfsMacOS26RepairAuthenticator(
-        mountSessionID: UUID(),
-        secret: testSecret
-    )
-    let armer = RecordingArmer()
-    let actuator = RecordingActuator()
-    let publication = RecordingPublicationBarrier()
-    let backend = try PfsMacOS26CoherenceBackend(
-        localAuthoritySessionID: testInitiator.sessionID,
-        authenticator: authenticator,
-        armer: armer,
-        actuator: actuator,
-        publicationBarrier: publication
-    )
-    let event = try PfsMacOSCoherenceEvent(
-        epoch: testEpoch,
-        sequence: 1,
-        phase: .complete,
-        initiator: testInitiator,
-        repairs: [.purgeNegative(
-            parent: try PfsMacOSRelativePath(components: []),
-            parentIdentity: testParentIdentity,
-            name: Data("missing".utf8)
-        )]
-    )
-
-    try await backend.repair(event)
-
-    #expect(await armer.count() == 0)
-    #expect(await actuator.count() == 0)
-    #expect(await publication.recorded() == [.complete])
-}
 
 private actor BlockingArmLease: PfsMacOS26RepairArmLease {
     private(set) var cancelled = false
+    func activate() async throws {}
     func validate() async throws {}
     func release() async throws {}
     func cancel() async { cancelled = true }
@@ -859,7 +789,6 @@ private actor BlockingArmer: PfsMacOS26RepairArmer {
     let authenticator = try PfsMacOS26RepairAuthenticator(mountSessionID: UUID(), secret: testSecret)
     let armer = BlockingArmer()
     let backend = try PfsMacOS26CoherenceBackend(
-        localAuthoritySessionID: Data(repeating: 0x99, count: 16),
         authenticator: authenticator,
         armer: armer,
         actuator: RecordingActuator(),

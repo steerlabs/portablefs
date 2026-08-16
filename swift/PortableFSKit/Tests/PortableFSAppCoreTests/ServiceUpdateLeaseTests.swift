@@ -29,7 +29,7 @@ private func updateTestIdentity(_ marker: Character) -> PortableFSDReleaseIdenti
         identitySchema: 1,
         controlProtocol: 1,
         pfslocalMajor: 1,
-        pfslocalMinor: 14
+        pfslocalMinor: 15
     )
 }
 

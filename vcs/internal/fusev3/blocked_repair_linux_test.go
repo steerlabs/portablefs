@@ -78,7 +78,7 @@ func newBlockedFixture(t *testing.T, directory string, budget time.Duration, pre
 	go func() {
 		defer close(finished)
 		out := &fuse.EntryOut{}
-		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "child", out)
+		done <- f.mkdir(parent.NodeId, "child", out)
 	}()
 	waitFor(t, "the directory mutation to park in the authority", func() bool {
 		return len(f.raw.parkedDirectories()) != 0
@@ -180,7 +180,7 @@ func TestRepairGateRefusesLaterSameParentBeforeAuthorityRPC(t *testing.T) {
 	f.rpc.mu.Lock()
 	before := f.rpc.calls
 	f.rpc.mu.Unlock()
-	status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "later", &fuse.EntryOut{})
+	status := f.mkdir(parent.NodeId, "later", &fuse.EntryOut{})
 	if status != fuse.Status(syscall.EINTR) {
 		t.Fatalf("same-parent mkdir after the repair gate = %v, want EINTR", status)
 	}
@@ -193,7 +193,7 @@ func TestRepairGateRefusesLaterSameParentBeforeAuthorityRPC(t *testing.T) {
 	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
 		t.Fatal(err)
 	}
-	if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "after", &fuse.EntryOut{}); !status.Ok() {
+	if status := f.mkdir(parent.NodeId, "after", &fuse.EntryOut{}); !status.Ok() {
 		t.Fatalf("same-parent mkdir after COMPLETE reopened admission = %v", status)
 	}
 }
@@ -210,7 +210,7 @@ func TestRepairGateIsExactToCachedWorkAndParent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: second.NodeId}, Mode: 0o755}, "allowed", &fuse.EntryOut{}); !status.Ok() {
+		if status := f.mkdir(second.NodeId, "allowed", &fuse.EntryOut{}); !status.Ok() {
 			t.Fatalf("different-parent mkdir = %v, want success", status)
 		}
 		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
@@ -218,7 +218,7 @@ func TestRepairGateIsExactToCachedWorkAndParent(t *testing.T) {
 		}
 	})
 
-	t.Run("uncached namespace target", func(t *testing.T) {
+	t.Run("unpublished namespace target", func(t *testing.T) {
 		f := newStrictFixture(t)
 		f.rpc.byName = map[string]*authoritypb.Item{}
 		parent := f.lookup(t, fuse.FUSE_ROOT_ID, "packages")
@@ -228,9 +228,9 @@ func TestRepairGateIsExactToCachedWorkAndParent(t *testing.T) {
 			t.Fatal(err)
 		}
 		if blocked || len(completion.parents) != 0 {
-			t.Fatalf("uncached target armed parents=%v blocked=%v", completion.parents, blocked)
+			t.Fatalf("unpublished target armed parents=%v blocked=%v", completion.parents, blocked)
 		}
-		if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "allowed", &fuse.EntryOut{}); !status.Ok() {
+		if status := f.mkdir(parent.NodeId, "allowed", &fuse.EntryOut{}); !status.Ok() {
 			t.Fatalf("same-parent mkdir with no exact cached repair = %v", status)
 		}
 		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
@@ -250,7 +250,7 @@ func TestRepairGateIsExactToCachedWorkAndParent(t *testing.T) {
 		if blocked || len(completion.parents) != 0 {
 			t.Fatalf("inode repair armed namespace parents=%v blocked=%v", completion.parents, blocked)
 		}
-		if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "allowed", &fuse.EntryOut{}); !status.Ok() {
+		if status := f.mkdir(parent.NodeId, "allowed", &fuse.EntryOut{}); !status.Ok() {
 			t.Fatalf("mkdir beside inode-only repair = %v", status)
 		}
 		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
@@ -280,7 +280,7 @@ func TestRepairGateRefusesRenameWhenEitherParentIsRepairing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			status := f.raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: oldParent.NodeId}, Newdir: newParent.NodeId}, "source", "dest")
+			status := f.rename(oldParent.NodeId, newParent.NodeId, "source", "dest", 0)
 			if status != fuse.Status(syscall.EINTR) {
 				t.Fatalf("rename with repairing %s = %v, want EINTR", name, status)
 			}
@@ -394,7 +394,7 @@ func TestAParkedMountThatHasNothingCachedAcknowledgesNormally(t *testing.T) {
 
 // (c) parked, but the phase touches only inode state
 
-func TestAParkedMountStillRepairsDataAndAttributeTargets(t *testing.T) {
+func TestAParkedMountRepairsDataAndAttributeTargetsAfterItsUnknownBindingPublishes(t *testing.T) {
 	var content uint64
 	f := newBlockedFixture(t, "packages", 5*time.Minute, func(f *strictFixture, _ uint64) {
 		entry := f.lookup(t, fuse.FUSE_ROOT_ID, "content")
@@ -402,15 +402,23 @@ func TestAParkedMountStillRepairsDataAndAttributeTargets(t *testing.T) {
 	})
 	defer f.release()
 
-	// fuse_reverse_inval_inode takes no parent lock, so a parked mount can
-	// always service data and attribute repair. A blanket "I am parked, I cannot
-	// repair" would give up work it is perfectly able to do.
+	// fuse_reverse_inval_inode takes no parent lock. The peer must nevertheless
+	// wait while the parked mkdir's returned binding is still unknown: that
+	// namespace wildcard could resolve to the item the phase names. Once the
+	// mkdir reply physically publishes and resolves the wildcard, inode repair
+	// proceeds without a blocked-parent report.
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, content, 16),
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, content, 0),
 	}
 	f.rpc.events <- visibilityEvent(1, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE, testPeerSession, targets...)
 	f.rpc.events <- visibilityEvent(1, authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE, testPeerSession, targets...)
+	waitFor(t, "the peer cut to close before draining the unknown source binding", func() bool {
+		f.raw.mu.Lock()
+		defer f.raw.mu.Unlock()
+		return len(f.raw.peerHeldPhase) != 0
+	})
+	f.release()
 
 	waitFor(t, "the inode repair to be made and acknowledged", func() bool { return f.acks() == 2 })
 	if reports := f.reports(); len(reports) != 0 {
@@ -423,7 +431,7 @@ func TestAParkedMountStillRepairsDataAndAttributeTargets(t *testing.T) {
 	defer f.notify.mu.Unlock()
 	repaired := false
 	for _, call := range f.notify.calls {
-		if call.kind == "inode" {
+		if call.kind == "size" {
 			repaired = true
 		}
 	}

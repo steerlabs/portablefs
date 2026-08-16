@@ -1,0 +1,4084 @@
+From 80205ca4bb1ab232f6a3d5113b5e743a00e0d6d5 Mon Sep 17 00:00:00 2001
+From: Tim Jang <timjang3@gmail.com>
+Date: Thu, 13 Aug 2026 08:30:45 -0700
+Subject: [PATCH] fuse: add PortableFS strict-coherence profile
+
+---
+ drivers/block/loop.c                         |    2 +
+ drivers/md/md.c                              |    2 +
+ drivers/mtd/nand/raw/nandsim.c               |    4 +
+ drivers/nvme/target/io-cmd-file.c            |    4 +
+ drivers/target/target_core_file.c            |    8 +
+ drivers/usb/gadget/function/storage_common.c |    4 +
+ fs/aio.c                                     |    4 +-
+ fs/cachefiles/namei.c                        |    7 +
+ fs/coda/file.c                               |    7 +
+ fs/erofs/super.c                             |    7 +
+ fs/fuse/dev.c                                |  450 +++++++-
+ fs/fuse/dir.c                                |  360 +++++-
+ fs/fuse/file.c                               | 1035 +++++++++++++++++-
+ fs/fuse/fuse_i.h                             |   78 +-
+ fs/fuse/fuse_trace.h                         |    4 +
+ fs/fuse/inode.c                              |  228 +++-
+ fs/fuse/ioctl.c                              |   13 +-
+ fs/fuse/readdir.c                            |    8 +-
+ fs/fuse/xattr.c                              |   49 +-
+ fs/overlayfs/params.c                        |   11 +
+ fs/read_write.c                              |   12 +-
+ fs/reply_publish.c                           |   12 +
+ fs/smb/server/smb2pdu.c                      |    6 +-
+ fs/smb/server/vfs.c                          |    7 +
+ fs/splice.c                                  |   12 +-
+ include/linux/fs.h                           |    6 +
+ include/linux/fs_reply_publish.h             |    2 +
+ include/uapi/linux/fuse.h                    |  126 +++
+ io_uring/rw.c                                |   22 +-
+ mm/swapfile.c                                |    4 +
+ 30 files changed, 2364 insertions(+), 130 deletions(-)
+
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index dd4117192..978665072 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -508,6 +508,8 @@ static int loop_check_backing_file(struct file *file)
+ {
+ 	if (!file->f_op->read_iter)
+ 		return -EINVAL;
++	if (!file_can_back_independent_cache(file))
++		return -EOPNOTSUPP;
+ 
+ 	if ((file->f_mode & FMODE_WRITE) && !file->f_op->write_iter)
+ 		return -EINVAL;
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 1aff3e541..3f6705297 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -7237,6 +7237,8 @@ static int set_bitmap_file(struct mddev *mddev, int fd)
+ 			pr_warn("%s: error: bitmap file is already in use\n",
+ 				mdname(mddev));
+ 			err = -EBUSY;
++		} else if (!file_can_back_independent_cache(f)) {
++			err = -EOPNOTSUPP;
+ 		}
+ 		if (err) {
+ 			fput(f);
+diff --git a/drivers/mtd/nand/raw/nandsim.c b/drivers/mtd/nand/raw/nandsim.c
+index df48b7d01..d05201110 100644
+--- a/drivers/mtd/nand/raw/nandsim.c
++++ b/drivers/mtd/nand/raw/nandsim.c
+@@ -542,6 +542,10 @@ static int __init ns_alloc_device(struct nandsim *ns)
+ 		cfile = filp_open(cache_file, O_CREAT | O_RDWR | O_LARGEFILE, 0600);
+ 		if (IS_ERR(cfile))
+ 			return PTR_ERR(cfile);
++		if (!file_can_back_independent_cache(cfile)) {
++			err = -EOPNOTSUPP;
++			goto err_close_filp;
++		}
+ 		if (!(cfile->f_mode & FMODE_CAN_READ)) {
+ 			NS_ERR("alloc_device: cache file not readable\n");
+ 			err = -EINVAL;
+diff --git a/drivers/nvme/target/io-cmd-file.c b/drivers/nvme/target/io-cmd-file.c
+index 2d068439b..25099b66b 100644
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@ -46,6 +46,10 @@ int nvmet_file_ns_enable(struct nvmet_ns *ns)
+ 		ns->file = NULL;
+ 		return ret;
+ 	}
++	if (!file_can_back_independent_cache(ns->file)) {
++		ret = -EOPNOTSUPP;
++		goto err;
++	}
+ 
+ 	nvmet_file_ns_revalidate(ns);
+ 
+diff --git a/drivers/target/target_core_file.c b/drivers/target/target_core_file.c
+index 2d78ef746..bd2b51cb4 100644
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@ -144,6 +144,10 @@ static int fd_configure_device(struct se_device *dev)
+ 		goto fail;
+ 	}
+ 	fd_dev->fd_file = file;
++	if (!file_can_back_independent_cache(file)) {
++		ret = -EOPNOTSUPP;
++		goto fail;
++	}
+ 	/*
+ 	 * If using a block backend with this struct file, we extract
+ 	 * fd_dev->fd_[block,dev]_size from struct block_device.
+@@ -853,6 +857,10 @@ static int fd_init_prot(struct se_device *dev)
+ 		ret = PTR_ERR(prot_file);
+ 		return ret;
+ 	}
++	if (!file_can_back_independent_cache(prot_file)) {
++		fput(prot_file);
++		return -EOPNOTSUPP;
++	}
+ 	fd_dev->fd_prot_file = prot_file;
+ 
+ 	return 0;
+diff --git a/drivers/usb/gadget/function/storage_common.c b/drivers/usb/gadget/function/storage_common.c
+index 75831f2c7..a5e60c82d 100644
+--- a/drivers/usb/gadget/function/storage_common.c
++++ b/drivers/usb/gadget/function/storage_common.c
+@@ -201,6 +201,10 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
+ 		LINFO(curlun, "unable to open backing file: %s\n", filename);
+ 		return PTR_ERR(filp);
+ 	}
++	if (!file_can_back_independent_cache(filp)) {
++		rc = -EOPNOTSUPP;
++		goto out;
++	}
+ 
+ 	if (!(filp->f_mode & FMODE_WRITE))
+ 		ro = 1;
+diff --git a/fs/aio.c b/fs/aio.c
+index 0f8767575..f5be94319 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -1635,8 +1635,8 @@ static int aio_write(struct kiocb *req, const struct iocb *iocb,
+ 		if (S_ISREG(file_inode(file)->i_mode))
+ 			kiocb_start_write(req);
+ 		req->ki_flags |= IOCB_WRITE;
+-		fs_reply_publish_scope_enter_write(&publish_scope,
+-					   file_inode(file)->i_sb);
++		fs_reply_publish_scope_enter_write_child(&publish_scope,
++						 file_inode(file)->i_sb);
+ 		io_result = file->f_op->write_iter(req, &iter);
+ 		/* Strict PortableFS transactions are synchronous by contract. */
+ 		if (io_result == -EIOCBQUEUED &&
+diff --git a/fs/cachefiles/namei.c b/fs/cachefiles/namei.c
+index 2b3f9935d..5631207ae 100644
+--- a/fs/cachefiles/namei.c
++++ b/fs/cachefiles/namei.c
+@@ -466,6 +466,11 @@ struct file *cachefiles_create_tmpfile(struct cachefiles_object *object)
+ 			cachefiles_io_error_obj(object, "Failed to create tmpfile");
+ 		goto err;
+ 	}
++	if (!file_can_back_independent_cache(file)) {
++		ret = -EOPNOTSUPP;
++		fput(file);
++		goto err;
++	}
+ 
+ 	trace_cachefiles_tmpfile(object, file_inode(file));
+ 
+@@ -570,6 +575,8 @@ static bool cachefiles_open_file(struct cachefiles_object *object,
+ 					   cachefiles_trace_open_error);
+ 		goto error;
+ 	}
++	if (!file_can_back_independent_cache(file))
++		goto error_fput;
+ 
+ 	if (unlikely(!file->f_op->read_iter) ||
+ 	    unlikely(!file->f_op->write_iter)) {
+diff --git a/fs/coda/file.c b/fs/coda/file.c
+index 148856a58..8640fd305 100644
+--- a/fs/coda/file.c
++++ b/fs/coda/file.c
+@@ -244,6 +244,13 @@ int coda_open(struct inode *coda_inode, struct file *coda_file)
+ 		kfree(cfi);
+ 		return error;
+ 	}
++	if (!file_can_back_independent_cache(host_file)) {
++		venus_close(coda_inode->i_sb, coda_i2f(coda_inode), coda_flags,
++			    coda_file->f_cred->fsuid);
++		fput(host_file);
++		kfree(cfi);
++		return -EOPNOTSUPP;
++	}
+ 
+ 	host_file->f_flags |= coda_file->f_flags & (O_APPEND | O_SYNC);
+ 
+diff --git a/fs/erofs/super.c b/fs/erofs/super.c
+index 1640ebc26..34676b1f0 100644
+--- a/fs/erofs/super.c
++++ b/fs/erofs/super.c
+@@ -200,6 +200,9 @@ static int erofs_init_device(struct erofs_buf *buf, struct super_block *sb,
+ 		} else if (!S_ISREG(file_inode(file)->i_mode)) {
+ 			fput(file);
+ 			return -EINVAL;
++		} else if (!file_can_back_independent_cache(file)) {
++			fput(file);
++			return -EOPNOTSUPP;
+ 		}
+ 		dif->file = file;
+ 	}
+@@ -776,6 +779,10 @@ static int erofs_fc_get_tree(struct fs_context *fc)
+ 		file = filp_open(fc->source, O_RDONLY | O_LARGEFILE, 0);
+ 		if (IS_ERR(file))
+ 			return PTR_ERR(file);
++		if (!file_can_back_independent_cache(file)) {
++			fput(file);
++			return -EOPNOTSUPP;
++		}
+ 		sbi->dif0.file = file;
+ 
+ 		if (S_ISREG(file_inode(sbi->dif0.file)->i_mode) &&
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index c3e726751..a58f2d458 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -49,6 +49,7 @@ static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
+ {
+ 	INIT_LIST_HEAD(&req->list);
+ 	INIT_LIST_HEAD(&req->intr_entry);
++	INIT_LIST_HEAD(&req->pfs_publish_token.link);
+ 	init_waitqueue_head(&req->waitq);
+ 	refcount_set(&req->count, 1);
+ 	__set_bit(FR_PENDING, &req->flags);
+@@ -67,6 +68,8 @@ static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags)
+ static void fuse_request_free(struct fuse_req *req)
+ {
+ 	WARN_ON(!list_empty(&req->intr_entry));
++	WARN_ON(!list_empty(&req->pfs_publish_token.link));
++	WARN_ON(req->pfs_publish_scope);
+ 	kmem_cache_free(fuse_req_cachep, req);
+ }
+ 
+@@ -219,8 +222,15 @@ EXPORT_SYMBOL_GPL(fuse_len_args);
+ 
+ static u64 fuse_get_unique_locked(struct fuse_iqueue *fiq)
+ {
+-	fiq->reqctr += FUSE_REQ_ID_STEP;
+-	return fiq->reqctr;
++	struct fuse_conn *fc = container_of(fiq, struct fuse_conn, iq);
++	u64 next = fiq->reqctr + FUSE_REQ_ID_STEP;
++
++	if (fc->pfs_strict_coherence &&
++	    (!next || (next & (FUSE_PFS_UNIQUE_PUBLISH |
++			      FUSE_UNIQUE_RESEND))))
++		return 0;
++	fiq->reqctr = next;
++	return next;
+ }
+ 
+ u64 fuse_get_unique(struct fuse_iqueue *fiq)
+@@ -230,6 +240,8 @@ u64 fuse_get_unique(struct fuse_iqueue *fiq)
+ 	spin_lock(&fiq->lock);
+ 	ret = fuse_get_unique_locked(fiq);
+ 	spin_unlock(&fiq->lock);
++	if (unlikely(!ret))
++		fuse_abort_conn(container_of(fiq, struct fuse_conn, iq));
+ 
+ 	return ret;
+ }
+@@ -237,7 +249,9 @@ EXPORT_SYMBOL_GPL(fuse_get_unique);
+ 
+ static unsigned int fuse_req_hash(u64 unique)
+ {
+-	return hash_long(unique & ~FUSE_INT_REQ_BIT, FUSE_PQ_HASH_BITS);
++	return hash_long(unique & ~(FUSE_INT_REQ_BIT |
++				  FUSE_PFS_UNIQUE_PUBLISH),
++			 FUSE_PQ_HASH_BITS);
+ }
+ 
+ /*
+@@ -289,8 +303,20 @@ static void fuse_dev_queue_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ {
+ 	spin_lock(&fiq->lock);
+ 	if (fiq->connected) {
+-		if (req->in.h.opcode != FUSE_NOTIFY_REPLY)
++		if (req->in.h.opcode != FUSE_NOTIFY_REPLY) {
+ 			req->in.h.unique = fuse_get_unique_locked(fiq);
++			if (unlikely(!req->in.h.unique)) {
++				struct fuse_conn *fc =
++					container_of(fiq, struct fuse_conn, iq);
++
++				spin_unlock(&fiq->lock);
++				fuse_abort_conn(fc);
++				req->out.h.error = -EOVERFLOW;
++				clear_bit(FR_PENDING, &req->flags);
++				fuse_request_end(req);
++				return;
++			}
++		}
+ 		list_add_tail(&req->list, &fiq->pending);
+ 		fuse_dev_wake_and_unlock(fiq);
+ 	} else {
+@@ -360,6 +386,19 @@ void fuse_request_end(struct fuse_req *req)
+ 	if (test_and_set_bit(FR_FINISHED, &req->flags))
+ 		goto put_request;
+ 
++	/*
++	 * The strict profile has no daemon-ENOSYS compatibility path.  Every
++	 * operation which is intentionally local or unsupported is decided before
++	 * a request is queued.  Seeing ENOSYS here therefore proves that the
++	 * negotiated, indivisible protocol was not implemented by the daemon.
++	 * Apply the rule here so synchronous and background requests cannot drift
++	 * into separate no_* fallback policies.
++	 */
++	if (fc->pfs_strict_coherence && req->out.h.error == -ENOSYS) {
++		req->out.h.error = -ENOTCONN;
++		fuse_abort_conn(fc);
++	}
++
+ 	trace_fuse_request_end(req);
+ 	/*
+ 	 * test_and_set_bit() implies smp_mb() between bit
+@@ -540,6 +579,69 @@ static void fuse_args_to_req(struct fuse_req *req, struct fuse_args *args)
+ 		__set_bit(FR_ASYNC, &req->flags);
+ }
+ 
++static int fuse_pfs_publish_token_send(struct fs_reply_publish_token *token)
++{
++	struct fuse_req *original = container_of(token, struct fuse_req,
++						pfs_publish_token);
++	struct fuse_mount *fm = original->fm;
++	struct fuse_conn *fc = fm->fc;
++	struct fuse_pfs_publish_in in = {
++		.request_unique = original->in.h.unique & ~FUSE_UNIQUE_RESEND,
++		.nodeid = original->in.h.nodeid,
++		.opcode = original->in.h.opcode,
++	};
++	struct fuse_pfs_publish_out out = {};
++	struct fuse_args args = {
++		.opcode = FUSE_PFS_PUBLISH,
++		.nodeid = original->in.h.nodeid,
++		.in_numargs = 1,
++		.out_numargs = 1,
++		.force = true,
++		.nocreds = true,
++	};
++	s64 publication_id;
++	int err;
++
++	/* Normal FUSE request IDs are even (FUSE_REQ_ID_STEP == 2). */
++	publication_id = atomic64_add_return(2, &fc->pfs_publication_id);
++	if (unlikely(publication_id <= 0)) {
++		err = -EOVERFLOW;
++		goto abort;
++	}
++	in.publication_id = publication_id;
++	args.in_args[0].size = sizeof(in);
++	args.in_args[0].value = &in;
++	args.out_args[0].size = sizeof(out);
++	args.out_args[0].value = &out;
++
++	err = fuse_simple_request(fm, &args);
++	if (err)
++		goto abort;
++	if (out.request_unique != in.request_unique ||
++	    out.publication_id != in.publication_id ||
++	    out.nodeid != in.nodeid || out.opcode != in.opcode ||
++	    out.flags != FUSE_PFS_PUBLISH_ACK) {
++		err = -EPROTO;
++		goto abort;
++	}
++	fuse_put_request(original);
++	return 0;
++
++abort:
++	fuse_abort_conn(fc);
++	fuse_put_request(original);
++	return err;
++}
++
++static void fuse_pfs_publish_token_cancel(struct fs_reply_publish_token *token)
++{
++	struct fuse_req *req = container_of(token, struct fuse_req,
++					   pfs_publish_token);
++
++	fuse_abort_conn(req->fm->fc);
++	fuse_put_request(req);
++}
++
+ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
+ 			      struct fuse_mount *fm,
+ 			      struct fuse_args *args)
+@@ -547,6 +649,7 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
+ 	struct fuse_conn *fc = fm->fc;
+ 	struct fuse_req *req;
+ 	ssize_t ret;
++	bool reply_success;
+ 
+ 	if (args->force) {
+ 		atomic_inc(&fc->num_waiting);
+@@ -565,17 +668,75 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
+ 	}
+ 
+ 	/* Needs to be done after fuse_get_req() so that fc->minor is valid */
++	args->pfs_reply_marked = false;
++	args->pfs_reply_token = NULL;
+ 	fuse_adjust_compat(fc, args);
+ 	fuse_args_to_req(req, args);
++	if (fc->pfs_strict_coherence &&
++	    args->pfs_publish_policy != FUSE_PFS_PUBLISH_FORBID) {
++		struct fs_reply_publish_scope *scope =
++			current->fs_reply_publish_scope;
++
++		/* A publication-bearing operation must name its final VFS edge. */
++		if (args->end || !scope || !scope->active ||
++		    scope->sb != fm->sb) {
++			fuse_abort_conn(fc);
++			fuse_put_request(req);
++			return -ENOTCONN;
++		}
++		req->pfs_publish_scope = scope;
++	}
+ 
+ 	if (!args->noreply)
+ 		__set_bit(FR_ISREPLY, &req->flags);
+ 	__fuse_request_send(req);
+ 	ret = req->out.h.error;
++	reply_success = !ret ||
++		(args->opcode == FUSE_LOOKUP && ret == -ENOENT);
+ 	if (!ret && args->out_argvar) {
+ 		BUG_ON(args->out_numargs == 0);
+ 		ret = args->out_args[args->out_numargs - 1].size;
+ 	}
++	if (fc->pfs_strict_coherence &&
++	    ((args->pfs_reply_marked &&
++	      (!reply_success || args->pfs_publish_policy ==
++				 FUSE_PFS_PUBLISH_FORBID)) ||
++	     (!args->pfs_reply_marked && reply_success &&
++	      args->pfs_publish_policy ==
++				 FUSE_PFS_PUBLISH_REQUIRE_SUCCESS))) {
++		fuse_abort_conn(fc);
++		ret = -ENOTCONN;
++	} else if (reply_success && args->pfs_reply_marked) {
++		struct fs_reply_publish_token *token =
++			&req->pfs_publish_token;
++		struct fs_reply_publish_scope *scope = req->pfs_publish_scope;
++
++		token->sb = fm->sb;
++		token->publish = fuse_pfs_publish_token_send;
++		token->cancel = fuse_pfs_publish_token_cancel;
++		/*
++		 * A marked LOOKUP has installed either a positive or a negative
++		 * namespace fact even when an enclosing open subsequently returns
++		 * an errno.  It must cross the post-dentry publication boundary in
++		 * that case.  Private mutation validators opt in separately, only
++		 * after validating their marked body as a definite applied outcome.
++		 */
++		token->publish_on_operation_error = args->opcode == FUSE_LOOKUP;
++		__fuse_get_request(req);
++		if (scope != current->fs_reply_publish_scope)
++			ret = -EPROTO;
++		else
++			ret = fs_reply_publish_add_to(scope, token);
++		if (ret) {
++			fuse_abort_conn(fc);
++			fuse_put_request(req);
++		} else {
++			args->pfs_reply_token = token;
++		}
++	}
++	/* A retained publication token owns only req/fm and copied headers. */
++	req->pfs_publish_scope = NULL;
++	req->args = NULL;
+ 	fuse_put_request(req);
+ 
+ 	return ret;
+@@ -1141,20 +1302,31 @@ static struct fuse_forget_link *fuse_dequeue_forget(struct fuse_iqueue *fiq,
+ 	return head;
+ }
+ 
+-static int fuse_read_single_forget(struct fuse_iqueue *fiq,
++static int fuse_read_single_forget(struct fuse_conn *fc,
++				   struct fuse_iqueue *fiq,
+ 				   struct fuse_copy_state *cs,
+ 				   size_t nbytes)
+ __releases(fiq->lock)
+ {
+ 	int err;
+-	struct fuse_forget_link *forget = fuse_dequeue_forget(fiq, 1, NULL);
+-	struct fuse_forget_in arg = {
++	u64 unique = fuse_get_unique_locked(fiq);
++	struct fuse_forget_link *forget;
++	struct fuse_forget_in arg;
++	struct fuse_in_header ih;
++
++	if (unlikely(!unique)) {
++		spin_unlock(&fiq->lock);
++		fuse_abort_conn(fc);
++		return -EOVERFLOW;
++	}
++	forget = fuse_dequeue_forget(fiq, 1, NULL);
++	arg = (struct fuse_forget_in) {
+ 		.nlookup = forget->forget_one.nlookup,
+ 	};
+-	struct fuse_in_header ih = {
++	ih = (struct fuse_in_header) {
+ 		.opcode = FUSE_FORGET,
+ 		.nodeid = forget->forget_one.nodeid,
+-		.unique = fuse_get_unique_locked(fiq),
++		.unique = unique,
+ 		.len = sizeof(ih) + sizeof(arg),
+ 	};
+ 
+@@ -1174,7 +1346,8 @@ __releases(fiq->lock)
+ 	return ih.len;
+ }
+ 
+-static int fuse_read_batch_forget(struct fuse_iqueue *fiq,
++static int fuse_read_batch_forget(struct fuse_conn *fc,
++				  struct fuse_iqueue *fiq,
+ 				   struct fuse_copy_state *cs, size_t nbytes)
+ __releases(fiq->lock)
+ {
+@@ -1182,10 +1355,18 @@ __releases(fiq->lock)
+ 	unsigned max_forgets;
+ 	unsigned count;
+ 	struct fuse_forget_link *head;
++	u64 unique = fuse_get_unique_locked(fiq);
+ 	struct fuse_batch_forget_in arg = { .count = 0 };
+-	struct fuse_in_header ih = {
++	struct fuse_in_header ih;
++
++	if (unlikely(!unique)) {
++		spin_unlock(&fiq->lock);
++		fuse_abort_conn(fc);
++		return -EOVERFLOW;
++	}
++	ih = (struct fuse_in_header) {
+ 		.opcode = FUSE_BATCH_FORGET,
+-		.unique = fuse_get_unique_locked(fiq),
++		.unique = unique,
+ 		.len = sizeof(ih) + sizeof(arg),
+ 	};
+ 
+@@ -1229,9 +1410,9 @@ static int fuse_read_forget(struct fuse_conn *fc, struct fuse_iqueue *fiq,
+ __releases(fiq->lock)
+ {
+ 	if (fc->minor < 16 || fiq->forget_list_head.next->next == NULL)
+-		return fuse_read_single_forget(fiq, cs, nbytes);
++		return fuse_read_single_forget(fc, fiq, cs, nbytes);
+ 	else
+-		return fuse_read_batch_forget(fiq, cs, nbytes);
++		return fuse_read_batch_forget(fc, fiq, cs, nbytes);
+ }
+ 
+ /*
+@@ -1254,6 +1435,10 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+ 	struct fuse_args *args;
+ 	unsigned reqsize;
+ 	unsigned int hash;
++	size_t fixed_in = sizeof(struct fuse_write_in);
++
++	if (fc->pfs_strict_coherence)
++		fixed_in = max(fixed_in, sizeof(struct fuse_pfs_write_in));
+ 
+ 	/*
+ 	 * Require sane minimum read buffer - that has capacity for fixed part
+@@ -1269,8 +1454,7 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+ 	 */
+ 	if (nbytes < max_t(size_t, FUSE_MIN_READ_BUFFER,
+ 			   sizeof(struct fuse_in_header) +
+-			   sizeof(struct fuse_write_in) +
+-			   fc->max_write))
++			   fixed_in + fc->max_write))
+ 		return -EINVAL;
+ 
+  restart:
+@@ -1481,6 +1665,72 @@ static int fuse_notify_poll(struct fuse_conn *fc, unsigned int size,
+ 	return err;
+ }
+ 
++/*
++ * Strict reverse repairs may address only an inode already classified as
++ * authority-backed.  Holding this reference across the stock invalidation
++ * helper keeps the validated inode resident until that helper has looked it up
++ * and applied the repair.  A missing inode is already absent locally and
++ * remains the stock benign -ENOENT result.
++ */
++static struct inode *fuse_pfs_notify_target(struct fuse_conn *fc, u64 nodeid,
++					    bool require_dir)
++{
++	struct inode *inode;
++
++	inode = fuse_ilookup(fc, nodeid, NULL);
++	if (!inode)
++		return NULL;
++	if (get_fuse_inode(inode)->pfs_class != FUSE_PFS_CLASS_SHARED ||
++	    (require_dir && !S_ISDIR(inode->i_mode))) {
++		iput(inode);
++		return ERR_PTR(-EPROTO);
++	}
++	return inode;
++}
++
++static int fuse_pfs_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
++					loff_t off, loff_t len)
++{
++	struct inode *target;
++	int err;
++
++	target = fuse_pfs_notify_target(fc, nodeid, false);
++	if (IS_ERR(target))
++		return PTR_ERR(target);
++	if (!target)
++		return -ENOENT;
++	err = fuse_reverse_inval_inode(fc, nodeid, off, len);
++	iput(target);
++	return err;
++}
++
++static int fuse_pfs_reverse_inval_entry(struct fuse_conn *fc, u64 parent,
++					u64 child, struct qstr *name,
++					u32 flags)
++{
++	struct inode *target;
++	int err;
++
++	target = fuse_pfs_notify_target(fc, parent, true);
++	if (IS_ERR(target))
++		return PTR_ERR(target);
++	if (!target)
++		return -ENOENT;
++	err = fuse_reverse_inval_entry(fc, parent, child, name, flags);
++	iput(target);
++	return err;
++}
++
++static bool fuse_pfs_notify_name_valid(const char *name, u32 len)
++{
++	if (!len || name[len] != '\0' || memchr(name, '\0', len) ||
++	    memchr(name, '/', len))
++		return false;
++	if (name[0] == '.' && (len == 1 || (len == 2 && name[1] == '.')))
++		return false;
++	return true;
++}
++
+ static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
+ 				   struct fuse_copy_state *cs)
+ {
+@@ -1494,15 +1744,71 @@ static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
+ 	if (err)
+ 		goto err;
+ 	fuse_copy_finish(cs);
++	if (fc->pfs_strict_coherence &&
++	    (!outarg.ino || outarg.off != -1 || outarg.len != 0))
++		goto protocol_error;
+ 
+ 	down_read(&fc->killsb);
+-	err = fuse_reverse_inval_inode(fc, outarg.ino,
+-				       outarg.off, outarg.len);
++	if (fc->pfs_strict_coherence)
++		err = fuse_pfs_reverse_inval_inode(fc, outarg.ino,
++						    outarg.off, outarg.len);
++	else
++		err = fuse_reverse_inval_inode(fc, outarg.ino,
++					       outarg.off, outarg.len);
+ 	up_read(&fc->killsb);
++	if (err == -EPROTO)
++		goto protocol_error;
+ 	return err;
+ 
+ err:
+ 	fuse_copy_finish(cs);
++	if (fc->pfs_strict_coherence)
++		goto protocol_error;
++	return err;
++
++protocol_error:
++	fuse_abort_conn(fc);
++	return -EPROTO;
++}
++
++static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
++				struct fuse_copy_state *cs)
++{
++	struct fuse_notify_pfs_size_out outarg;
++	struct inode *inode;
++	int err = -EPROTO;
++
++	if (!fc->pfs_strict_coherence || size != sizeof(outarg))
++		goto abort_copy;
++	err = fuse_copy_one(cs, &outarg, sizeof(outarg));
++	if (err)
++		goto abort_copy;
++	err = -EPROTO;
++	if (!outarg.nodeid || !outarg.sequence || outarg.sequence > S64_MAX ||
++	    outarg.size > S64_MAX)
++		goto abort_copy;
++	fuse_copy_finish(cs);
++
++	down_read(&fc->killsb);
++	err = -ENOENT;
++	inode = fuse_ilookup(fc, outarg.nodeid, NULL);
++	if (inode) {
++		if (!S_ISREG(inode->i_mode) ||
++		    get_fuse_inode(inode)->pfs_class != FUSE_PFS_CLASS_SHARED)
++			err = -EPROTO;
++		else
++			err = fuse_pfs_update_size(inode, outarg.size,
++						   outarg.sequence);
++		iput(inode);
++	}
++	up_read(&fc->killsb);
++	if (err && err != -ENOENT)
++		fuse_abort_conn(fc);
++	return err;
++
++abort_copy:
++	fuse_copy_finish(cs);
++	fuse_abort_conn(fc);
+ 	return err;
+ }
+ 
+@@ -1540,18 +1846,37 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
+ 	if (err)
+ 		goto err;
+ 	fuse_copy_finish(cs);
++	if (fc->pfs_strict_coherence &&
++	    (!outarg.parent || outarg.flags ||
++	     !fuse_pfs_notify_name_valid(buf, outarg.namelen)))
++		goto protocol_error;
+ 	buf[outarg.namelen] = 0;
+ 
+ 	down_read(&fc->killsb);
+-	err = fuse_reverse_inval_entry(fc, outarg.parent, 0, &name, outarg.flags);
++	if (fc->pfs_strict_coherence)
++		err = fuse_pfs_reverse_inval_entry(fc, outarg.parent, 0,
++						    &name, outarg.flags);
++	else
++		err = fuse_reverse_inval_entry(fc, outarg.parent, 0, &name,
++					       outarg.flags);
+ 	up_read(&fc->killsb);
+ 	kfree(buf);
++	if (err == -EPROTO)
++		goto protocol_error_no_buf;
+ 	return err;
+ 
+ err:
+ 	kfree(buf);
+ 	fuse_copy_finish(cs);
++	if (fc->pfs_strict_coherence)
++		goto protocol_error_no_buf;
+ 	return err;
++
++protocol_error:
++	kfree(buf);
++protocol_error_no_buf:
++	fuse_abort_conn(fc);
++	return -EPROTO;
+ }
+ 
+ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
+@@ -1588,18 +1913,37 @@ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
+ 	if (err)
+ 		goto err;
+ 	fuse_copy_finish(cs);
++	if (fc->pfs_strict_coherence &&
++	    (!outarg.parent || !outarg.child || outarg.padding ||
++	     !fuse_pfs_notify_name_valid(buf, outarg.namelen)))
++		goto protocol_error;
+ 	buf[outarg.namelen] = 0;
+ 
+ 	down_read(&fc->killsb);
+-	err = fuse_reverse_inval_entry(fc, outarg.parent, outarg.child, &name, 0);
++	if (fc->pfs_strict_coherence)
++		err = fuse_pfs_reverse_inval_entry(fc, outarg.parent,
++						    outarg.child, &name, 0);
++	else
++		err = fuse_reverse_inval_entry(fc, outarg.parent, outarg.child,
++					       &name, 0);
+ 	up_read(&fc->killsb);
+ 	kfree(buf);
++	if (err == -EPROTO)
++		goto protocol_error_no_buf;
+ 	return err;
+ 
+ err:
+ 	kfree(buf);
+ 	fuse_copy_finish(cs);
++	if (fc->pfs_strict_coherence)
++		goto protocol_error_no_buf;
+ 	return err;
++
++protocol_error:
++	kfree(buf);
++protocol_error_no_buf:
++	fuse_abort_conn(fc);
++	return -EPROTO;
+ }
+ 
+ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
+@@ -1904,6 +2248,17 @@ static int fuse_notify_resend(struct fuse_conn *fc)
+ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
+ 		       unsigned int size, struct fuse_copy_state *cs)
+ {
++	if (fc->pfs_strict_coherence &&
++	    code != FUSE_NOTIFY_INVAL_INODE &&
++	    code != FUSE_NOTIFY_INVAL_ENTRY &&
++	    code != FUSE_NOTIFY_DELETE &&
++	    code != FUSE_NOTIFY_PFS_SIZE) {
++		/* The strict dialect has a closed reverse-notification surface. */
++		fuse_copy_finish(cs);
++		fuse_abort_conn(fc);
++		return -EPROTO;
++	}
++
+ 	/* Don't try to move pages (yet) */
+ 	cs->move_pages = 0;
+ 
+@@ -1927,8 +2282,15 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
+ 		return fuse_notify_delete(fc, size, cs);
+ 
+ 	case FUSE_NOTIFY_RESEND:
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			return -EPROTO;
++		}
+ 		return fuse_notify_resend(fc);
+ 
++	case FUSE_NOTIFY_PFS_SIZE:
++		return fuse_notify_pfs_size(fc, size, cs);
++
+ 	default:
+ 		fuse_copy_finish(cs);
+ 		return -EINVAL;
+@@ -1984,6 +2346,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 	struct fuse_pqueue *fpq = &fud->pq;
+ 	struct fuse_req *req;
+ 	struct fuse_out_header oh;
++	bool pfs_marked;
+ 
+ 	err = -EINVAL;
+ 	if (nbytes < sizeof(struct fuse_out_header))
+@@ -2005,6 +2368,13 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 		err = fuse_notify(fc, oh.error, nbytes - sizeof(oh), cs);
+ 		goto copy_finish;
+ 	}
++	pfs_marked = oh.unique & FUSE_PFS_UNIQUE_PUBLISH;
++	oh.unique &= ~FUSE_PFS_UNIQUE_PUBLISH;
++	if (fc->pfs_strict_coherence && (oh.unique & FUSE_UNIQUE_RESEND)) {
++		fuse_abort_conn(fc);
++		err = -EPROTO;
++		goto copy_finish;
++	}
+ 
+ 	err = -EINVAL;
+ 	if (oh.error <= -512 || oh.error > 0)
+@@ -2021,6 +2391,23 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 		goto copy_finish;
+ 	}
+ 
++	if (pfs_marked &&
++	    (!fc->pfs_strict_coherence ||
++	     !req->pfs_publish_scope || test_bit(FR_ASYNC, &req->flags) ||
++	     (oh.error && !(req->in.h.opcode == FUSE_LOOKUP &&
++			   oh.error == -ENOENT)) ||
++	     (oh.unique & FUSE_INT_REQ_BIT) ||
++	     req->in.h.opcode == FUSE_PFS_PUBLISH ||
++	     (req->in.h.opcode == FUSE_PFS_WRITE &&
++	      req->args->in_args[0].value &&
++	      ((const struct fuse_pfs_write_in *)
++	       req->args->in_args[0].value)->phase != FUSE_PFS_WRITE_COMMIT))) {
++		spin_unlock(&fpq->lock);
++		fuse_abort_conn(fc);
++		err = -EPROTO;
++		goto copy_finish;
++	}
++
+ 	/* Is it an interrupt reply ID? */
+ 	if (oh.unique & FUSE_INT_REQ_BIT) {
+ 		__fuse_get_request(req);
+@@ -2029,8 +2416,14 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 		err = 0;
+ 		if (nbytes != sizeof(struct fuse_out_header))
+ 			err = -EINVAL;
+-		else if (oh.error == -ENOSYS)
+-			fc->no_interrupt = 1;
++		else if (oh.error == -ENOSYS) {
++			if (fc->pfs_strict_coherence) {
++				fuse_abort_conn(fc);
++				err = -EPROTO;
++			} else {
++				fc->no_interrupt = 1;
++			}
++		}
+ 		else if (oh.error == -EAGAIN)
+ 			err = queue_interrupt(req);
+ 
+@@ -2042,6 +2435,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 	clear_bit(FR_SENT, &req->flags);
+ 	list_move(&req->list, &fpq->io);
+ 	req->out.h = oh;
++	req->args->pfs_reply_marked = pfs_marked;
+ 	set_bit(FR_LOCKED, &req->flags);
+ 	spin_unlock(&fpq->lock);
+ 	cs->req = req;
+@@ -2073,6 +2467,18 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+ 	goto out;
+ }
+ 
++int fuse_pfs_require_publication(struct fuse_mount *fm,
++				 struct fuse_args *args, bool required)
++{
++	struct fuse_conn *fc = fm->fc;
++
++	if (!fc->pfs_strict_coherence || args->pfs_reply_marked != required) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	return 0;
++}
++
+ static ssize_t fuse_dev_write(struct kiocb *iocb, struct iov_iter *from)
+ {
+ 	struct fuse_copy_state cs;
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index ce7324d0d..f11b829cc 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -228,36 +228,82 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
+ 		attr_version = fuse_get_attr_version(fm->fc);
+ 
+ 		parent = dget_parent(entry);
++		fi = get_fuse_inode(d_inode(parent));
+ 		fuse_lookup_init(fm->fc, &args, get_node_id(d_inode(parent)),
+ 				 &entry->d_name, &outarg);
++		if (fm->fc->pfs_strict_coherence)
++			args.pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL;
+ 		ret = fuse_simple_request(fm, &args);
+ 		dput(parent);
+ 		/* Zero nodeid is same as -ENOENT */
+ 		if (!ret && !outarg.nodeid)
+ 			ret = -ENOENT;
+ 		if (!ret) {
+-			fi = get_fuse_inode(inode);
++			u32 class_bits = outarg.attr.flags &
++				(FUSE_ATTR_PFS_SHARED | FUSE_ATTR_PFS_LOCAL);
++
++			if (fm->fc->pfs_strict_coherence &&
++			    (class_bits != FUSE_ATTR_PFS_SHARED &&
++			     class_bits != FUSE_ATTR_PFS_LOCAL)) {
++				fuse_abort_conn(fm->fc);
++				fuse_queue_forget(fm->fc, forget,
++						  outarg.nodeid, 1);
++				forget = NULL;
++				ret = -ENOTCONN;
++				goto out_revalidate;
++			}
++			if (fm->fc->pfs_strict_coherence &&
++			    fuse_pfs_require_publication(fm, &args,
++				class_bits == FUSE_ATTR_PFS_SHARED)) {
++				fuse_queue_forget(fm->fc, forget,
++						  outarg.nodeid, 1);
++				forget = NULL;
++				ret = -ENOTCONN;
++				goto out_revalidate;
++			}
+ 			if (outarg.nodeid != get_node_id(inode) ||
+ 			    (bool) IS_AUTOMOUNT(inode) != (bool) (outarg.attr.flags & FUSE_ATTR_SUBMOUNT)) {
+ 				fuse_queue_forget(fm->fc, forget,
+ 						  outarg.nodeid, 1);
+ 				goto invalid;
+ 			}
++			/*
++			 * Revalidation adds a new lookup reference to an existing
++			 * inode.  Reject a contradictory class before incrementing
++			 * nlookup so the error path can return the daemon's reference
++			 * exactly once with the preallocated FORGET record.
++			 */
++			if (fm->fc->pfs_strict_coherence &&
++			    fuse_pfs_classify_attr(fm->fc, inode, &outarg.attr)) {
++				fuse_abort_conn(fm->fc);
++				fuse_queue_forget(fm->fc, forget,
++						  outarg.nodeid, 1);
++				forget = NULL;
++				ret = -ENOTCONN;
++				goto out_revalidate;
++			}
++			fi = get_fuse_inode(inode);
+ 			spin_lock(&fi->lock);
+ 			fi->nlookup++;
+ 			spin_unlock(&fi->lock);
+ 		}
++		if (ret == -ENOENT && fm->fc->pfs_strict_coherence &&
++		    fuse_pfs_require_publication(fm, &args,
++			fi->pfs_class == FUSE_PFS_CLASS_SHARED))
++			ret = -ENOTCONN;
++out_revalidate:
+ 		kfree(forget);
+-		if (ret == -ENOMEM || ret == -EINTR)
++		if (ret == -ENOMEM || ret == -EINTR || ret == -ENOTCONN)
+ 			goto out;
+ 		if (ret || fuse_invalid_attr(&outarg.attr) ||
+ 		    fuse_stale_inode(inode, outarg.generation, &outarg.attr))
+ 			goto invalid;
+ 
+ 		forget_all_cached_acls(inode);
+-		fuse_change_attributes(inode, &outarg.attr, NULL,
+-				       ATTR_TIMEOUT(&outarg),
+-				       attr_version);
++		ret = fuse_change_attributes(inode, &outarg.attr, NULL,
++					     ATTR_TIMEOUT(&outarg), attr_version);
++		if (ret)
++			goto out;
+ 		fuse_change_entry_timeout(entry, &outarg);
+ 	} else if (inode) {
+ 		fi = get_fuse_inode(inode);
+@@ -361,7 +407,8 @@ bool fuse_invalid_attr(struct fuse_attr *attr)
+ }
+ 
+ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
+-		     struct fuse_entry_out *outarg, struct inode **inode)
++		     struct fuse_entry_out *outarg, struct inode **inode,
++		     bool pfs_publish)
+ {
+ 	struct fuse_mount *fm = get_fuse_mount_super(sb);
+ 	FUSE_ARGS(args);
+@@ -383,10 +430,18 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
+ 	attr_version = fuse_get_attr_version(fm->fc);
+ 
+ 	fuse_lookup_init(fm->fc, &args, nodeid, name, outarg);
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL;
+ 	err = fuse_simple_request(fm, &args);
+ 	/* Zero nodeid is same as -ENOENT, but with valid timeout */
+-	if (err || !outarg->nodeid)
++	if (err || !outarg->nodeid) {
++		bool negative = err == -ENOENT || (!err && !outarg->nodeid);
++
++		if (fm->fc->pfs_strict_coherence && negative &&
++		    fuse_pfs_require_publication(fm, &args, pfs_publish))
++			err = -ENOTCONN;
+ 		goto out_put_forget;
++	}
+ 
+ 	err = -EIO;
+ 	if (fuse_invalid_attr(&outarg->attr))
+@@ -404,6 +459,15 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
+ 		fuse_queue_forget(fm->fc, forget, outarg->nodeid, 1);
+ 		goto out;
+ 	}
++	if (fm->fc->pfs_strict_coherence &&
++	    fuse_pfs_require_publication(fm, &args,
++		get_fuse_inode(*inode)->pfs_class == FUSE_PFS_CLASS_SHARED)) {
++		iput(*inode);
++		*inode = NULL;
++		fuse_queue_forget(fm->fc, forget, outarg->nodeid, 1);
++		err = -ENOTCONN;
++		goto out;
++	}
+ 	err = 0;
+ 
+  out_put_forget:
+@@ -427,7 +491,9 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
+ 
+ 	locked = fuse_lock_inode(dir);
+ 	err = fuse_lookup_name(dir->i_sb, get_node_id(dir), &entry->d_name,
+-			       &outarg, &inode);
++			       &outarg, &inode,
++			       get_fuse_inode(dir)->pfs_class ==
++				       FUSE_PFS_CLASS_SHARED);
+ 	fuse_unlock_inode(dir, locked);
+ 	if (err == -ENOENT) {
+ 		outarg_valid = false;
+@@ -672,6 +738,8 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+ 	outopenp = &ff->args->open_outarg;
+ 	args.out_args[1].size = sizeof(*outopenp);
+ 	args.out_args[1].value = outopenp;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL;
+ 
+ 	err = get_create_ext(idmap, &args, dir, entry, mode);
+ 	if (err)
+@@ -699,6 +767,21 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+ 		err = -ENOMEM;
+ 		goto out_err;
+ 	}
++	if (fm->fc->pfs_strict_coherence &&
++	    fuse_pfs_require_publication(fm, &args,
++		get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_SHARED)) {
++		fuse_sync_release(get_fuse_inode(inode), ff, flags);
++		fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
++		iput(inode);
++		return -ENOTCONN;
++	}
++	if (fuse_pfs_validate_open(inode, ff, false)) {
++		fuse_abort_conn(fm->fc);
++		fuse_sync_release(get_fuse_inode(inode), ff, flags);
++		fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
++		iput(inode);
++		return -ENOTCONN;
++	}
+ 	kfree(forget);
+ 	d_instantiate(entry, inode);
+ 	fuse_change_entry_timeout(entry, &outentry);
+@@ -742,7 +825,40 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
+ 		return -EIO;
+ 
+ 	if (d_in_lookup(entry)) {
++		struct fs_reply_publish_scope publish_scope;
++		ssize_t publish_result;
++
++		fs_reply_publish_scope_enter(&publish_scope, dir->i_sb);
+ 		res = fuse_lookup(dir, entry, 0);
++		if (!IS_ERR(res) && (res ? d_really_is_positive(res) :
++					       d_really_is_positive(entry))) {
++			d_lookup_done(entry);
++			publish_result = fs_reply_publish_scope_finish(
++				&publish_scope, 0);
++		} else if (!IS_ERR(res) && current->fs_reply_publish_scope ==
++							 &publish_scope &&
++			   publish_scope.parent) {
++			/*
++			 * Keep a negative lookup private until atomic CREATE has
++			 * finished.  Core atomic_open() performs d_lookup_done() and
++			 * the outer scope then publishes the combined result.
++			 */
++			publish_result = fs_reply_publish_scope_merge(
++				publish_scope.parent, &publish_scope);
++		} else {
++			publish_result = fs_reply_publish_scope_finish(
++				&publish_scope, PTR_ERR(res));
++		}
++		if (publish_result < 0 &&
++		    (!IS_ERR(res) || publish_result != PTR_ERR(res))) {
++			/* A failed merge leaves the child scope on current's stack. */
++			if (current->fs_reply_publish_scope == &publish_scope)
++				fs_reply_publish_scope_abort(&publish_scope);
++			if (res && !IS_ERR(res))
++				dput(res);
++			fuse_abort_conn(fc);
++			return -ENOTCONN;
++		}
+ 		if (IS_ERR(res))
+ 			return PTR_ERR(res);
+ 
+@@ -756,11 +872,22 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
+ 	/* Only creates */
+ 	file->f_mode |= FMODE_CREATED;
+ 
+-	if (fc->no_create)
++	if (fc->no_create) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			err = -ENOTCONN;
++			goto out_dput;
++		}
+ 		goto mknod;
++	}
+ 
+ 	err = fuse_create_open(idmap, dir, entry, file, flags, mode, FUSE_CREATE);
+ 	if (err == -ENOSYS) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			err = -ENOTCONN;
++			goto out_dput;
++		}
+ 		fc->no_create = 1;
+ 		goto mknod;
+ 	} else if (err == -EEXIST)
+@@ -802,6 +929,8 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+ 	args->out_numargs = 1;
+ 	args->out_args[0].size = sizeof(outarg);
+ 	args->out_args[0].value = &outarg;
++	if (fm->fc->pfs_strict_coherence)
++		args->pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL;
+ 
+ 	if (args->opcode != FUSE_LINK) {
+ 		err = get_create_ext(idmap, args, dir, entry, mode);
+@@ -811,6 +940,10 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+ 
+ 	err = fuse_simple_idmap_request(idmap, fm, args);
+ 	free_ext_value(args);
++	if (err == -ENOSYS && fm->fc->pfs_strict_coherence) {
++		fuse_abort_conn(fm->fc);
++		err = -ENOTCONN;
++	}
+ 	if (err)
+ 		goto out_put_forget_req;
+ 
+@@ -827,6 +960,13 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+ 		fuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
+ 		return -ENOMEM;
+ 	}
++	if (fm->fc->pfs_strict_coherence &&
++	    fuse_pfs_require_publication(fm, args,
++		get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_SHARED)) {
++		fuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
++		iput(inode);
++		return -ENOTCONN;
++	}
+ 	kfree(forget);
+ 
+ 	d_drop(entry);
+@@ -885,12 +1025,21 @@ static int fuse_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+ 	struct fuse_conn *fc = get_fuse_conn(dir);
+ 	int err;
+ 
+-	if (fc->no_tmpfile)
++	if (fc->no_tmpfile) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			return -ENOTCONN;
++		}
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	err = fuse_create_open(idmap, dir, file->f_path.dentry, file,
+ 			       file->f_flags, mode, FUSE_TMPFILE);
+ 	if (err == -ENOSYS) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			return -ENOTCONN;
++		}
+ 		fc->no_tmpfile = 1;
+ 		err = -EOPNOTSUPP;
+ 	}
+@@ -994,7 +1143,17 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
+ 	args.in_numargs = 1;
+ 	args.in_args[0].size = entry->d_name.len + 1;
+ 	args.in_args[0].value = entry->d_name.name;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(d_inode(entry))->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
++	if (err == -ENOSYS && fm->fc->pfs_strict_coherence) {
++		fuse_abort_conn(fm->fc);
++		return -ENOTCONN;
++	}
+ 	if (!err) {
+ 		fuse_dir_changed(dir);
+ 		fuse_entry_unlinked(entry);
+@@ -1017,7 +1176,17 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
+ 	args.in_numargs = 1;
+ 	args.in_args[0].size = entry->d_name.len + 1;
+ 	args.in_args[0].value = entry->d_name.name;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(d_inode(entry))->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
++	if (err == -ENOSYS && fm->fc->pfs_strict_coherence) {
++		fuse_abort_conn(fm->fc);
++		return -ENOTCONN;
++	}
+ 	if (!err) {
+ 		fuse_dir_changed(dir);
+ 		fuse_entry_unlinked(entry);
+@@ -1035,6 +1204,14 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
+ 	struct fuse_mount *fm = get_fuse_mount(olddir);
+ 	FUSE_ARGS(args);
+ 
++	if (fm->fc->pfs_strict_coherence &&
++	    ((d_really_is_positive(newent) &&
++	      get_fuse_inode(d_inode(oldent))->pfs_class !=
++		get_fuse_inode(d_inode(newent))->pfs_class) ||
++	     get_fuse_inode(olddir)->pfs_class !=
++		get_fuse_inode(newdir)->pfs_class))
++		return -EXDEV;
++
+ 	memset(&inarg, 0, argsize);
+ 	inarg.newdir = get_node_id(newdir);
+ 	inarg.flags = flags;
+@@ -1047,7 +1224,17 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
+ 	args.in_args[1].value = oldent->d_name.name;
+ 	args.in_args[2].size = newent->d_name.len + 1;
+ 	args.in_args[2].value = newent->d_name.name;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(d_inode(oldent))->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_idmap_request(idmap, fm, &args);
++	if (err == -ENOSYS && fm->fc->pfs_strict_coherence) {
++		fuse_abort_conn(fm->fc);
++		return -ENOTCONN;
++	}
+ 	if (!err) {
+ 		/* ctime changes */
+ 		fuse_update_ctime(d_inode(oldent));
+@@ -1090,14 +1277,23 @@ static int fuse_rename2(struct mnt_idmap *idmap, struct inode *olddir,
+ 		return -EINVAL;
+ 
+ 	if (flags) {
+-		if (fc->no_rename2 || fc->minor < 23)
++		if (fc->no_rename2 || fc->minor < 23) {
++			if (fc->pfs_strict_coherence) {
++				fuse_abort_conn(fc);
++				return -ENOTCONN;
++			}
+ 			return -EINVAL;
++		}
+ 
+ 		err = fuse_rename_common((flags & RENAME_WHITEOUT) ? idmap : &invalid_mnt_idmap,
+ 					 olddir, oldent, newdir, newent, flags,
+ 					 FUSE_RENAME2,
+ 					 sizeof(struct fuse_rename2_in));
+ 		if (err == -ENOSYS) {
++			if (fc->pfs_strict_coherence) {
++				fuse_abort_conn(fc);
++				return -ENOTCONN;
++			}
+ 			fc->no_rename2 = 1;
+ 			err = -EINVAL;
+ 		}
+@@ -1119,6 +1315,11 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
+ 	struct fuse_mount *fm = get_fuse_mount(inode);
+ 	FUSE_ARGS(args);
+ 
++	if (fm->fc->pfs_strict_coherence &&
++	    get_fuse_inode(inode)->pfs_class !=
++		get_fuse_inode(newdir)->pfs_class)
++		return -EXDEV;
++
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.oldnodeid = get_node_id(inode);
+ 	args.opcode = FUSE_LINK;
+@@ -1204,6 +1405,11 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
+ 	u64 attr_version = fuse_get_attr_version(fm->fc);
+ 	FUSE_ARGS(args);
+ 
++	if (fm->fc->pfs_strict_coherence) {
++		fuse_abort_conn(fm->fc);
++		return -ENOTCONN;
++	}
++
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	memset(&outarg, 0, sizeof(outarg));
+ 	/* Directories have separate file-handle space */
+@@ -1224,6 +1430,8 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
+ 	args.out_numargs = 1;
+ 	args.out_args[0].size = sizeof(outarg);
+ 	args.out_args[0].value = &outarg;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy = FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err)
+ 		return err;
+@@ -1238,8 +1446,9 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
+ 
+ 	fuse_statx_to_attr(&outarg.stat, &attr);
+ 	if ((sx->mask & STATX_BASIC_STATS) == STATX_BASIC_STATS) {
+-		fuse_change_attributes(inode, &attr, &outarg.stat,
+-				       ATTR_TIMEOUT(&outarg), attr_version);
++		if (fuse_change_attributes(inode, &attr, &outarg.stat,
++					   ATTR_TIMEOUT(&outarg), attr_version))
++			return -ENOTCONN;
+ 	}
+ 
+ 	if (stat) {
+@@ -1256,6 +1465,7 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
+ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+ 			   struct kstat *stat, struct file *file)
+ {
++	struct fs_reply_publish_scope publish_scope;
+ 	int err;
+ 	struct fuse_getattr_in inarg;
+ 	struct fuse_attr_out outarg;
+@@ -1282,6 +1492,13 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+ 	args.out_numargs = 1;
+ 	args.out_args[0].size = sizeof(outarg);
+ 	args.out_args[0].value = &outarg;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(inode)->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
++	fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
+ 	err = fuse_simple_request(fm, &args);
+ 	if (!err) {
+ 		if (fuse_invalid_attr(&outarg.attr) ||
+@@ -1289,14 +1506,15 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+ 			fuse_make_bad(inode);
+ 			err = -EIO;
+ 		} else {
+-			fuse_change_attributes(inode, &outarg.attr, NULL,
+-					       ATTR_TIMEOUT(&outarg),
+-					       attr_version);
+-			if (stat)
++			if (fuse_change_attributes(inode, &outarg.attr, NULL,
++						   ATTR_TIMEOUT(&outarg),
++						   attr_version))
++				err = -ENOTCONN;
++			else if (stat)
+ 				fuse_fillattr(idmap, inode, &outarg.attr, stat);
+ 		}
+ 	}
+-	return err;
++	return fs_reply_publish_scope_finish(&publish_scope, err);
+ }
+ 
+ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1385,6 +1603,14 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+ 	dput(dir);
+ 	if (!entry)
+ 		goto unlock;
++	if (fc->pfs_strict_coherence && d_really_is_positive(entry) &&
++	    (get_fuse_inode(d_inode(entry))->pfs_class !=
++					FUSE_PFS_CLASS_SHARED ||
++	     (child_nodeid &&
++	      get_node_id(d_inode(entry)) != child_nodeid))) {
++		err = -EPROTO;
++		goto out_entry;
++	}
+ 
+ 	fuse_dir_changed(parent);
+ 	if (!(flags & FUSE_EXPIRE_ONLY))
+@@ -1419,6 +1645,8 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+ 	} else {
+ 		err = 0;
+ 	}
++
++ out_entry:
+ 	dput(entry);
+ 
+  unlock:
+@@ -1706,15 +1934,26 @@ static int fuse_dir_fsync(struct file *file, loff_t start, loff_t end,
+ 	if (fuse_is_bad(inode))
+ 		return -EIO;
+ 
+-	if (fc->no_fsyncdir)
++	if (fc->no_fsyncdir) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			return -ENOTCONN;
++		}
+ 		return 0;
++	}
+ 
+ 	inode_lock(inode);
+ 	err = fuse_fsync_common(file, start, end, datasync, FUSE_FSYNCDIR);
+ 	if (err == -ENOSYS) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			err = -ENOTCONN;
++			goto out;
++		}
+ 		fc->no_fsyncdir = 1;
+ 		err = 0;
+ 	}
++out:
+ 	inode_unlock(inode);
+ 
+ 	return err;
+@@ -1904,8 +2143,8 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
+  * vmtruncate() doesn't allow for this case, so do the rlimit checking
+  * and the actual truncation by hand.
+  */
+-int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+-		    struct iattr *attr, struct file *file)
++static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
++			     struct iattr *attr, struct file *file)
+ {
+ 	struct inode *inode = d_inode(dentry);
+ 	struct fuse_mount *fm = get_fuse_mount(inode);
+@@ -1921,6 +2160,7 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	int err;
+ 	bool trust_local_cmtime = is_wb;
+ 	bool fault_blocked = false;
++	bool pfs_data_locked = false;
+ 	u64 attr_version;
+ 
+ 	if (!fc->default_permissions)
+@@ -1956,8 +2196,10 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 			 * truncation has already been done by OPEN.  But still
+ 			 * need to truncate page cache.
+ 			 */
+-			i_size_write(inode, 0);
+-			truncate_pagecache(inode, 0);
++			if (!fc->pfs_strict_coherence) {
++				i_size_write(inode, 0);
++				truncate_pagecache(inode, 0);
++			}
+ 			goto out;
+ 		}
+ 		file = NULL;
+@@ -2009,6 +2251,11 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 
+ 	attr_version = fuse_get_attr_version(fm->fc);
+ 	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
++	if (fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			fi->pfs_class == FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err) {
+ 		if (err == -EINTR)
+@@ -2022,6 +2269,18 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		err = -EIO;
+ 		goto error;
+ 	}
++	if (unlikely(fuse_pfs_classify_attr(fc, inode, &outarg.attr))) {
++		fuse_abort_conn(fc);
++		err = -ENOTCONN;
++		goto error;
++	}
++	if (fc->pfs_strict_coherence && is_truncate &&
++	    fi->pfs_class == FUSE_PFS_CLASS_SHARED) {
++		/* The marked SETATTR reply now retains the source gate. */
++		mutex_lock(&fi->pfs_publish_mutex);
++		filemap_invalidate_lock(mapping);
++		pfs_data_locked = true;
++	}
+ 
+ 	spin_lock(&fi->lock);
+ 	/* the kernel maintains i_mtime locally */
+@@ -2062,15 +2321,25 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if ((is_truncate || !is_wb) &&
+ 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
+ 		truncate_pagecache(inode, outarg.attr.size);
+-		invalidate_inode_pages2(mapping);
++		err = invalidate_inode_pages2(mapping);
++		if (err && fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			err = -ENOTCONN;
++			goto out;
++		}
++		err = 0;
+ 	}
+ 
+ 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+ out:
++	if (pfs_data_locked) {
++		filemap_invalidate_unlock(mapping);
++		mutex_unlock(&fi->pfs_publish_mutex);
++	}
+ 	if (fault_blocked)
+ 		filemap_invalidate_unlock(mapping);
+ 
+-	return 0;
++	return err;
+ 
+ error:
+ 	if (is_truncate)
+@@ -2083,6 +2352,20 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	return err;
+ }
+ 
++int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
++		    struct iattr *attr, struct file *file)
++{
++	struct fs_reply_publish_scope publish_scope;
++	struct inode *inode = d_inode(dentry);
++	bool owner;
++	int err;
++
++	owner = fs_reply_publish_scope_enter_if_needed(&publish_scope,
++						       inode->i_sb);
++	err = __fuse_do_setattr(idmap, dentry, attr, file);
++	return owner ? fs_reply_publish_scope_finish(&publish_scope, err) : err;
++}
++
+ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
+ 			struct iattr *attr)
+ {
+@@ -2195,6 +2478,30 @@ static const struct inode_operations fuse_dir_inode_operations = {
+ 	.fileattr_set	= fuse_fileattr_set,
+ };
+ 
++/* Strict publication requires LOOKUP to finish before a following CREATE. */
++static const struct inode_operations fuse_pfs_dir_inode_operations = {
++	.lookup		= fuse_lookup,
++	.mkdir		= fuse_mkdir,
++	.symlink	= fuse_symlink,
++	.unlink		= fuse_unlink,
++	.rmdir		= fuse_rmdir,
++	.rename		= fuse_rename2,
++	.link		= fuse_link,
++	.setattr	= fuse_setattr,
++	.create		= fuse_create,
++	.atomic_open	= fuse_atomic_open,
++	.tmpfile	= fuse_tmpfile,
++	.mknod		= fuse_mknod,
++	.permission	= fuse_permission,
++	.getattr	= fuse_getattr,
++	.listxattr	= fuse_listxattr,
++	.get_inode_acl	= fuse_get_inode_acl,
++	.get_acl	= fuse_get_acl,
++	.set_acl	= fuse_set_acl,
++	.fileattr_get	= fuse_fileattr_get,
++	.fileattr_set	= fuse_fileattr_set,
++};
++
+ static const struct file_operations fuse_dir_operations = {
+ 	.llseek		= generic_file_llseek,
+ 	.read		= generic_read_dir,
+@@ -2234,7 +2541,8 @@ void fuse_init_dir(struct inode *inode)
+ {
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+ 
+-	inode->i_op = &fuse_dir_inode_operations;
++	inode->i_op = get_fuse_conn(inode)->pfs_strict_coherence ?
++		&fuse_pfs_dir_inode_operations : &fuse_dir_inode_operations;
+ 	inode->i_fop = &fuse_dir_operations;
+ 
+ 	spin_lock_init(&fi->rdc.lock);
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 1f71ef3ea..6b7de3647 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -19,10 +19,11 @@
+ #include <linux/uio.h>
+ #include <linux/fs.h>
+ #include <linux/filelock.h>
++#include <linux/fadvise.h>
+ #include <linux/splice.h>
+ #include <linux/task_io_accounting_ops.h>
+ 
+-static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
++static int fuse_send_open(struct fuse_mount *fm, struct inode *inode, u64 nodeid,
+ 			  unsigned int open_flags, int opcode,
+ 			  struct fuse_open_out *outargp)
+ {
+@@ -47,10 +48,46 @@ static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
+ 	args.out_numargs = 1;
+ 	args.out_args[0].size = sizeof(*outargp);
+ 	args.out_args[0].value = outargp;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			S_ISREG(inode->i_mode) && (open_flags & O_TRUNC) &&
++			get_fuse_inode(inode)->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 
+ 	return fuse_simple_request(fm, &args);
+ }
+ 
++int fuse_pfs_validate_open(struct inode *inode, const struct fuse_file *ff,
++			   bool isdir)
++{
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	u32 class_bits = ff->open_flags &
++		(FOPEN_PFS_SHARED | FOPEN_PFS_LOCAL);
++
++	if (!fc->pfs_strict_coherence)
++		return class_bits ? -EPROTO : 0;
++	if ((fi->pfs_class == FUSE_PFS_CLASS_SHARED &&
++	     class_bits != FOPEN_PFS_SHARED) ||
++	    (fi->pfs_class == FUSE_PFS_CLASS_LOCAL &&
++	     class_bits != FOPEN_PFS_LOCAL) ||
++	    fi->pfs_class == FUSE_PFS_CLASS_UNKNOWN)
++		return -EPROTO;
++	if (!isdir && S_ISREG(inode->i_mode) &&
++	    class_bits == FOPEN_PFS_SHARED) {
++		/* Exact allowlist: in particular NOFLUSH may not bypass FLUSH. */
++		if (ff->open_flags !=
++		    (FOPEN_DIRECT_IO | FOPEN_PFS_SHARED))
++			return -EPROTO;
++	}
++	if (isdir && class_bits == FOPEN_PFS_SHARED &&
++	    ff->open_flags != FOPEN_PFS_SHARED)
++		return -EPROTO;
++	return 0;
++}
++
+ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release)
+ {
+ 	struct fuse_file *ff;
+@@ -95,6 +132,14 @@ static void fuse_release_end(struct fuse_mount *fm, struct fuse_args *args,
+ {
+ 	struct fuse_release_args *ra = container_of(args, typeof(*ra), args);
+ 
++	/*
++	 * A strict daemon must consume every RELEASE/RELEASEDIR.  VFS cannot
++	 * report an asynchronous close error, so make any failed reply terminal
++	 * instead of silently leaving a live remote capability behind.
++	 */
++	if (fm->fc->pfs_strict_coherence && error)
++		fuse_abort_conn(fm->fc);
++
+ 	iput(ra->inode);
+ 	kfree(ra);
+ }
+@@ -113,8 +158,9 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
+ 		} else if (args->opcode == FUSE_RELEASE && ff->fm->fc->no_open) {
+ 			fuse_release_end(ff->fm, args, 0);
+ 		} else if (sync) {
+-			fuse_simple_request(ff->fm, args);
+-			fuse_release_end(ff->fm, args, 0);
++			int error = fuse_simple_request(ff->fm, args);
++
++			fuse_release_end(ff->fm, args, error);
+ 		} else {
+ 			args->end = fuse_release_end;
+ 			if (fuse_simple_background(ff->fm, args,
+@@ -125,8 +171,9 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
+ 	}
+ }
+ 
+-struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+-				 unsigned int open_flags, bool isdir)
++struct fuse_file *fuse_file_open(struct fuse_mount *fm, struct inode *inode,
++				 u64 nodeid, unsigned int open_flags,
++				 bool isdir)
+ {
+ 	struct fuse_conn *fc = fm->fc;
+ 	struct fuse_file *ff;
+@@ -154,7 +201,8 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+ 		struct fuse_open_out *outargp = &ff->args->open_outarg;
+ 		int err;
+ 
+-		err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp);
++		err = fuse_send_open(fm, inode, nodeid, open_flags, opcode,
++				     outargp);
+ 		if (!err) {
+ 			ff->fh = outargp->fh;
+ 			ff->open_flags = outargp->open_flags;
+@@ -162,6 +210,11 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+ 			fuse_file_free(ff);
+ 			return ERR_PTR(err);
+ 		} else {
++			if (fc->pfs_strict_coherence) {
++				fuse_file_free(ff);
++				fuse_abort_conn(fc);
++				return ERR_PTR(-ENOTCONN);
++			}
+ 			if (isdir) {
+ 				/* No release needed */
+ 				kfree(ff->args);
+@@ -178,13 +231,26 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+ 
+ 	ff->nodeid = nodeid;
+ 
++	/*
++	 * Keep strict handle classification at the primitive OPEN boundary.
++	 * Internal users such as fileattr ioctls do not pass through
++	 * fuse_do_open(), and permitting them to skip this check would turn a
++	 * missing or contradictory class marker into a silent legacy handle.
++	 */
++	if (fuse_pfs_validate_open(inode, ff, isdir)) {
++		fuse_abort_conn(fc);
++		fuse_file_free(ff);
++		return ERR_PTR(-ENOTCONN);
++	}
++
+ 	return ff;
+ }
+ 
+ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
+ 		 bool isdir)
+ {
+-	struct fuse_file *ff = fuse_file_open(fm, nodeid, file->f_flags, isdir);
++	struct fuse_file *ff = fuse_file_open(fm, file_inode(file), nodeid,
++					     file->f_flags, isdir);
+ 
+ 	if (!IS_ERR(ff))
+ 		file->private_data = ff;
+@@ -223,6 +289,10 @@ int fuse_finish_open(struct inode *inode, struct file *file)
+ 	else if (ff->open_flags & FOPEN_NONSEEKABLE)
+ 		nonseekable_open(inode, file);
+ 
++	if (fc->pfs_strict_coherence && S_ISREG(inode->i_mode) &&
++	    (ff->open_flags & FOPEN_PFS_SHARED))
++		file->f_mode |= FMODE_REMOTE_SIZE_AUTHORITY;
++
+ 	if ((file->f_mode & FMODE_WRITE) && fc->writeback_cache)
+ 		fuse_link_write_file(file);
+ 
+@@ -252,6 +322,9 @@ static int fuse_open(struct inode *inode, struct file *file)
+ 	bool is_truncate = (file->f_flags & O_TRUNC) && fc->atomic_o_trunc;
+ 	bool is_wb_truncate = is_truncate && fc->writeback_cache;
+ 	bool dax_truncate = is_truncate && FUSE_IS_DAX(inode);
++	bool pfs_truncate = is_truncate && fc->pfs_strict_coherence;
++	bool lock_truncate = is_wb_truncate || dax_truncate;
++	bool pfs_truncate_done = false;
+ 
+ 	if (fuse_is_bad(inode))
+ 		return -EIO;
+@@ -260,7 +333,7 @@ static int fuse_open(struct inode *inode, struct file *file)
+ 	if (err)
+ 		return err;
+ 
+-	if (is_wb_truncate || dax_truncate)
++	if (lock_truncate)
+ 		inode_lock(inode);
+ 
+ 	if (dax_truncate) {
+@@ -279,14 +352,33 @@ static int fuse_open(struct inode *inode, struct file *file)
+ 		err = fuse_finish_open(inode, file);
+ 		if (err)
+ 			fuse_sync_release(fi, ff, file->f_flags);
+-		else if (is_truncate)
++		else if (pfs_truncate) {
++			/*
++			 * The marked OPEN reply retains the source gate.  Acquire
++			 * cache locks only after that reply, never while requesting the
++			 * gate, and publish an exact empty cache before PUBLISH.
++			 */
++			mutex_lock(&fi->pfs_publish_mutex);
++			filemap_invalidate_lock(inode->i_mapping);
+ 			fuse_truncate_update_attr(inode, file);
++			truncate_pagecache(inode, 0);
++			err = invalidate_inode_pages2(inode->i_mapping);
++			filemap_invalidate_unlock(inode->i_mapping);
++			mutex_unlock(&fi->pfs_publish_mutex);
++			pfs_truncate_done = !err;
++			if (err) {
++				fuse_abort_conn(fc);
++				err = -ENOTCONN;
++			}
++		} else if (is_truncate) {
++			fuse_truncate_update_attr(inode, file);
++		}
+ 	}
+ 
+ 	if (is_wb_truncate || dax_truncate)
+ 		fuse_release_nowrite(inode);
+ 	if (!err) {
+-		if (is_truncate)
++		if (is_truncate && !pfs_truncate_done)
+ 			truncate_pagecache(inode, 0);
+ 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+ 			invalidate_inode_pages2(inode->i_mapping);
+@@ -294,7 +386,7 @@ static int fuse_open(struct inode *inode, struct file *file)
+ 	if (dax_truncate)
+ 		filemap_invalidate_unlock(inode->i_mapping);
+ out_inode_unlock:
+-	if (is_wb_truncate || dax_truncate)
++	if (lock_truncate)
+ 		inode_unlock(inode);
+ 
+ 	return err;
+@@ -550,8 +642,13 @@ static int fuse_flush(struct file *file, fl_owner_t id)
+ 		return err;
+ 
+ 	err = 0;
+-	if (fm->fc->no_flush)
++	if (fm->fc->no_flush) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		goto inval_attr_out;
++	}
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.fh = ff->fh;
+@@ -565,6 +662,10 @@ static int fuse_flush(struct file *file, fl_owner_t id)
+ 
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err == -ENOSYS) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		fm->fc->no_flush = 1;
+ 		err = 0;
+ 	}
+@@ -635,11 +736,21 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
+ 	if (err)
+ 		goto out;
+ 
+-	if (fc->no_fsync)
++	if (fc->no_fsync) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			err = -ENOTCONN;
++		}
+ 		goto out;
++	}
+ 
+ 	err = fuse_fsync_common(file, start, end, datasync, FUSE_FSYNC);
+ 	if (err == -ENOSYS) {
++		if (fc->pfs_strict_coherence) {
++			fuse_abort_conn(fc);
++			err = -ENOTCONN;
++			goto out;
++		}
+ 		fc->no_fsync = 1;
+ 		err = 0;
+ 	}
+@@ -1119,6 +1230,12 @@ static ssize_t fuse_send_write(struct fuse_io_args *ia, loff_t pos,
+ 	struct file *file = iocb->ki_filp;
+ 	struct fuse_file *ff = file->private_data;
+ 	struct fuse_mount *fm = ff->fm;
++
++	if (unlikely(fm->fc->pfs_strict_coherence &&
++		     (ff->open_flags & FOPEN_PFS_SHARED))) {
++		fuse_abort_conn(fm->fc);
++		return -ENOTCONN;
++	}
+ 	struct fuse_write_in *inarg = &ia->write.in;
+ 	ssize_t err;
+ 
+@@ -1742,6 +1859,468 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 	return res;
+ }
+ 
++static u32 fuse_pfs_operation_flags(const struct kiocb *iocb)
++{
++	u32 flags = 0;
++
++	if (iocb->ki_flags & IOCB_APPEND)
++		flags |= O_APPEND;
++	if (iocb_is_dsync(iocb))
++		flags |= O_DSYNC;
++	if (iocb->ki_flags & IOCB_SYNC)
++		flags |= O_SYNC;
++	return flags;
++}
++
++static u64 fuse_pfs_file_max_end(const struct file *file)
++{
++	u64 max_end = file_inode(file)->i_sb->s_maxbytes;
++
++	if (!(file->f_flags & O_LARGEFILE))
++		max_end = min_t(u64, max_end, MAX_NON_LFS);
++	return max_end;
++}
++
++static u64 fuse_pfs_rlimit_fsize(void)
++{
++	/* Raw 64-bit rlim_cur: U64_MAX is infinity and zero is a real limit. */
++	return rlimit(RLIMIT_FSIZE);
++}
++
++static ssize_t fuse_pfs_positioned_checks(struct kiocb *iocb,
++					  struct iov_iter *from,
++					  u64 rlimit_fsize,
++					  u64 file_max_size)
++{
++	struct inode *inode = file_inode(iocb->ki_filp);
++	u64 pos;
++	u64 count = iov_iter_count(from);
++
++	if (IS_SWAPFILE(inode))
++		return -ETXTBSY;
++	if (!count)
++		return 0;
++	if (iocb->ki_pos < 0)
++		return -EINVAL;
++	if (iocb->ki_flags & IOCB_NOWAIT)
++		return -EAGAIN;
++
++	pos = iocb->ki_pos;
++	if (pos >= rlimit_fsize) {
++		send_sig(SIGXFSZ, current, 0);
++		return -EFBIG;
++	}
++	count = min(count, rlimit_fsize - pos);
++	if (pos >= file_max_size)
++		return -EFBIG;
++	count = min(count, file_max_size - pos);
++	iov_iter_truncate(from, count);
++	return iov_iter_count(from);
++}
++
++static void fuse_pfs_write_in_freeze(struct fuse_pfs_write_in *in,
++				     struct kiocb *iocb, u64 txid,
++				     u64 requested_size, u64 position,
++				     u64 rlimit_fsize, u64 file_max_size)
++{
++	struct fuse_file *ff = iocb->ki_filp->private_data;
++	struct fuse_conn *fc = ff->fm->fc;
++	fl_owner_t owner = current->files;
++
++	*in = (struct fuse_pfs_write_in) {
++		.fh = ff->fh,
++		.txid = txid,
++		.requested_size = requested_size,
++		.position = position,
++		.rlimit_fsize = rlimit_fsize,
++		.file_max_size = file_max_size,
++		.flags = fuse_pfs_operation_flags(iocb),
++		.phase = FUSE_PFS_WRITE_BEGIN,
++	};
++	if (owner) {
++		in->write_flags |= FUSE_WRITE_LOCKOWNER;
++		in->lock_owner = fuse_lock_owner_id(fc, owner);
++	}
++	if (!capable(CAP_FSETID))
++		in->write_flags |= FUSE_WRITE_KILL_SUIDGID;
++}
++
++enum fuse_pfs_write_outcome {
++	FUSE_PFS_WRITE_OUTCOME_INVALID,
++	FUSE_PFS_WRITE_OUTCOME_ACK,
++	FUSE_PFS_WRITE_OUTCOME_COMMITTED,
++	FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR,
++	FUSE_PFS_WRITE_OUTCOME_REJECTED,
++	FUSE_PFS_WRITE_OUTCOME_REJECTED_RLIMIT,
++};
++
++static int fuse_pfs_validate_write_out(const struct fuse_pfs_write_out *out,
++				       u64 txid, u32 expected,
++				       bool allow_rejected,
++				       enum fuse_pfs_write_outcome *outcome)
++{
++	*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++	if (out->txid != txid)
++		return -EPROTO;
++	if (out->flags == FUSE_PFS_WRITE_OUT_REJECTED ||
++	    out->flags == FUSE_PFS_WRITE_OUT_REJECTED_RLIMIT) {
++		if (!allow_rejected || out->error >= 0 ||
++		    out->error < -MAX_ERRNO || out->committed_size ||
++		    out->assigned_offset || out->post_size || out->sequence ||
++		    (out->flags == FUSE_PFS_WRITE_OUT_REJECTED_RLIMIT &&
++		     out->error != -EFBIG))
++			return -EPROTO;
++		*outcome = out->flags == FUSE_PFS_WRITE_OUT_REJECTED_RLIMIT ?
++			FUSE_PFS_WRITE_OUTCOME_REJECTED_RLIMIT :
++			FUSE_PFS_WRITE_OUTCOME_REJECTED;
++		return out->error;
++	}
++	if (expected == FUSE_PFS_WRITE_OUT_COMMITTED) {
++		if (out->flags == (FUSE_PFS_WRITE_OUT_COMMITTED |
++				   FUSE_PFS_WRITE_OUT_POSTAPPLY_ERROR)) {
++			if (out->error >= 0 || out->error < -MAX_ERRNO)
++				return -EPROTO;
++		} else if (out->flags != FUSE_PFS_WRITE_OUT_COMMITTED ||
++			   out->error) {
++			return -EPROTO;
++		}
++	} else if (out->flags != expected) {
++		return -EPROTO;
++	}
++	if (expected != FUSE_PFS_WRITE_OUT_COMMITTED &&
++	    (out->error || out->committed_size || out->assigned_offset ||
++	     out->post_size || out->sequence))
++		return -EPROTO;
++	if (out->flags == (FUSE_PFS_WRITE_OUT_COMMITTED |
++			  FUSE_PFS_WRITE_OUT_POSTAPPLY_ERROR))
++		*outcome = FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR;
++	else if (out->flags == FUSE_PFS_WRITE_OUT_COMMITTED)
++		*outcome = FUSE_PFS_WRITE_OUTCOME_COMMITTED;
++	else
++		*outcome = FUSE_PFS_WRITE_OUTCOME_ACK;
++	return 0;
++}
++
++static int fuse_pfs_write_control(struct kiocb *iocb,
++				  const struct fuse_pfs_write_in *frozen,
++				  u32 phase, u64 staged_size,
++				  bool allow_rejected,
++				  struct fuse_pfs_write_out *out,
++				  enum fuse_pfs_write_outcome *outcome,
++				  struct fs_reply_publish_token **publish_token)
++{
++	struct fuse_file *ff = iocb->ki_filp->private_data;
++	struct fuse_pfs_write_in in = *frozen;
++	struct fuse_args args = {
++		.opcode = FUSE_PFS_WRITE,
++		.nodeid = ff->nodeid,
++		.in_numargs = 1,
++		.out_numargs = 1,
++	};
++	u32 expected;
++	int err;
++
++	*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++	if (publish_token)
++		*publish_token = NULL;
++	memset(out, 0, sizeof(*out));
++	in.fragment_offset = phase == FUSE_PFS_WRITE_COMMIT ? staged_size : 0;
++	in.size = 0;
++	in.phase = phase;
++	args.in_args[0].size = sizeof(in);
++	args.in_args[0].value = &in;
++	args.out_args[0].size = sizeof(*out);
++	args.out_args[0].value = out;
++	if (phase == FUSE_PFS_WRITE_COMMIT || phase == FUSE_PFS_WRITE_ABORT) {
++		args.force = true;
++		args.nocreds = phase == FUSE_PFS_WRITE_ABORT;
++	}
++	if (phase == FUSE_PFS_WRITE_COMMIT)
++		args.pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL;
++
++	err = fuse_simple_request(ff->fm, &args);
++	if (err)
++		return err;
++	switch (phase) {
++	case FUSE_PFS_WRITE_BEGIN:
++		expected = FUSE_PFS_WRITE_OUT_BEGUN;
++		break;
++	case FUSE_PFS_WRITE_COMMIT:
++		expected = FUSE_PFS_WRITE_OUT_COMMITTED;
++		break;
++	case FUSE_PFS_WRITE_ABORT:
++		expected = FUSE_PFS_WRITE_OUT_ABORTED;
++		break;
++	default:
++		return -EPROTO;
++	}
++	err = fuse_pfs_validate_write_out(out, frozen->txid, expected,
++					  allow_rejected, outcome);
++	if (phase == FUSE_PFS_WRITE_COMMIT) {
++		bool committed =
++			*outcome == FUSE_PFS_WRITE_OUTCOME_COMMITTED ||
++			*outcome == FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR;
++
++		if (fuse_pfs_require_publication(ff->fm, &args, committed)) {
++			*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++			return -ENOTCONN;
++		}
++		if (committed) {
++			if (WARN_ON_ONCE(!args.pfs_reply_token)) {
++				*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++				return -EPROTO;
++			}
++			if (publish_token)
++				*publish_token = args.pfs_reply_token;
++		}
++	}
++	return err;
++}
++
++static void fuse_pfs_write_abort(struct kiocb *iocb,
++				 const struct fuse_pfs_write_in *frozen)
++{
++	struct fuse_file *ff = iocb->ki_filp->private_data;
++	struct fuse_pfs_write_out out;
++	enum fuse_pfs_write_outcome outcome;
++	int err;
++
++	/* BEGIN/DATA are inert; cleanup is best effort and idempotent. */
++	err = fuse_pfs_write_control(iocb, frozen, FUSE_PFS_WRITE_ABORT, 0,
++				     false, &out, &outcome, NULL);
++	if (err == -EPROTO)
++		fuse_abort_conn(ff->fm->fc);
++}
++
++static void fuse_pfs_write_data_args(struct fuse_io_args *ia,
++				     const struct fuse_pfs_write_in *frozen,
++				     u64 fragment_offset, size_t size)
++{
++	struct fuse_args *args = &ia->ap.args;
++	struct fuse_pfs_write_out *out = &ia->pfs_write.out;
++
++	ia->pfs_write.in = *frozen;
++	ia->pfs_write.in.fragment_offset = fragment_offset;
++	ia->pfs_write.in.size = size;
++	ia->pfs_write.in.phase = FUSE_PFS_WRITE_DATA;
++	memset(out, 0, sizeof(*out));
++	args->opcode = FUSE_PFS_WRITE;
++	args->nodeid = ia->ff->nodeid;
++	args->in_numargs = 2;
++	args->in_args[0].size = sizeof(ia->pfs_write.in);
++	args->in_args[0].value = &ia->pfs_write.in;
++	args->in_args[1].size = size;
++	args->out_numargs = 1;
++	args->out_args[0].size = sizeof(*out);
++	args->out_args[0].value = out;
++}
++
++static int fuse_pfs_write_data_send(struct fuse_io_args *ia,
++				    const struct fuse_pfs_write_in *frozen)
++{
++	enum fuse_pfs_write_outcome outcome;
++	int err;
++
++	err = fuse_simple_request(ia->ff->fm, &ia->ap.args);
++	if (err)
++		return err;
++	return fuse_pfs_validate_write_out(&ia->pfs_write.out, frozen->txid,
++					   FUSE_PFS_WRITE_OUT_STAGED, false,
++					   &outcome);
++}
++
++static ssize_t fuse_pfs_write_transaction(struct kiocb *iocb,
++					  struct iov_iter *from)
++{
++	struct file *file = iocb->ki_filp;
++	struct inode *inode = file_inode(file);
++	struct fuse_file *ff = file->private_data;
++	struct fuse_conn *fc = ff->fm->fc;
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
++	struct fuse_pfs_write_in frozen;
++	struct fuse_pfs_write_out out;
++	enum fuse_pfs_write_outcome outcome;
++	struct fs_reply_publish_token *publish_token = NULL;
++	u64 requested, position, rlimit_fsize, file_max_size, max_end;
++	u64 staged = 0, advanced = 0;
++	s64 txid;
++	int err;
++	bool append = iocb->ki_flags & IOCB_APPEND;
++	bool extraction_failed = false;
++
++	if (unlikely(!fc->pfs_strict_coherence ||
++		     !(ff->open_flags & FOPEN_PFS_SHARED))) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	rlimit_fsize = fuse_pfs_rlimit_fsize();
++	file_max_size = fuse_pfs_file_max_end(file);
++	if (unlikely(!file_max_size || file_max_size > S64_MAX)) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	if (append) {
++		if (IS_SWAPFILE(inode))
++			return -ETXTBSY;
++		if (iocb->ki_flags & IOCB_NOWAIT)
++			return -EAGAIN;
++		position = 0;
++	} else {
++		err = fuse_pfs_positioned_checks(iocb, from, rlimit_fsize,
++						 file_max_size);
++		if (err <= 0)
++			return err;
++		position = iocb->ki_pos;
++	}
++	requested = iov_iter_count(from);
++	if (!requested)
++		return 0;
++	max_end = min(rlimit_fsize, file_max_size);
++	txid = atomic64_inc_return(&fc->pfs_write_txid);
++	if (unlikely(txid <= 0)) {
++		fuse_abort_conn(fc);
++		return -EOVERFLOW;
++	}
++	fuse_pfs_write_in_freeze(&frozen, iocb, txid, requested, position,
++				 rlimit_fsize, file_max_size);
++	err = fuse_pfs_write_control(iocb, &frozen, FUSE_PFS_WRITE_BEGIN, 0,
++				     false, &out, &outcome, NULL);
++	if (err) {
++		fuse_pfs_write_abort(iocb, &frozen);
++		if (err == -EPROTO) {
++			fuse_abort_conn(fc);
++			return -ENOTCONN;
++		}
++		return err;
++	}
++
++	while (iov_iter_count(from)) {
++		struct fuse_io_args *ia;
++		unsigned int max_pages;
++		size_t nbytes;
++
++		max_pages = iov_iter_npages(from, fc->max_pages);
++		ia = fuse_io_alloc(&io, max_pages);
++		if (!ia) {
++			err = -ENOMEM;
++			break;
++		}
++		ia->ff = ff;
++		nbytes = min_t(size_t, iov_iter_count(from), fc->max_write);
++		fuse_pfs_write_data_args(ia, &frozen, staged, nbytes);
++		err = fuse_get_user_pages(&ia->ap, from, &nbytes, 1,
++					  max_pages, fc->use_pages_for_kvec_io);
++		advanced += nbytes;
++		extraction_failed = err < 0;
++		if (!nbytes) {
++			fuse_io_free(ia);
++			break;
++		}
++		ia->pfs_write.in.size = nbytes;
++		ia->ap.args.in_args[1].size = nbytes;
++		err = fuse_pfs_write_data_send(ia, &frozen);
++		fuse_release_user_pages(&ia->ap, err ? 0 : nbytes, false);
++		fuse_io_free(ia);
++		if (err)
++			break;
++		staged += nbytes;
++		if (extraction_failed) {
++			err = -EFAULT;
++			break;
++		}
++	}
++	if (!staged) {
++		fuse_pfs_write_abort(iocb, &frozen);
++		if (advanced)
++			iov_iter_revert(from, advanced);
++		if (err == -EPROTO) {
++			fuse_abort_conn(fc);
++			return -ENOTCONN;
++		}
++		return err ?: -EFAULT;
++	}
++	if (err) {
++		/* A user fault after a prefix keeps Linux partial-write semantics. */
++		if (err != -EFAULT && err != -ENOMEM) {
++			fuse_pfs_write_abort(iocb, &frozen);
++			if (err == -EPROTO) {
++				fuse_abort_conn(fc);
++				err = -ENOTCONN;
++			}
++			iov_iter_revert(from, advanced);
++			return err;
++		}
++	}
++
++	err = fuse_pfs_write_control(iocb, &frozen, FUSE_PFS_WRITE_COMMIT,
++				     staged, true, &out, &outcome,
++				     &publish_token);
++	if (err) {
++		iov_iter_revert(from, advanced);
++		if (outcome == FUSE_PFS_WRITE_OUTCOME_REJECTED_RLIMIT) {
++			if (!append || rlimit_fsize == RLIM_INFINITY) {
++				fuse_abort_conn(fc);
++				return -ENOTCONN;
++			}
++			send_sig(SIGXFSZ, current, 0);
++			return err;
++		}
++		if (outcome == FUSE_PFS_WRITE_OUTCOME_REJECTED)
++			return err;
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	if (outcome != FUSE_PFS_WRITE_OUTCOME_COMMITTED &&
++	    outcome != FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR) {
++		fuse_abort_conn(fc);
++		iov_iter_revert(from, advanced);
++		return -ENOTCONN;
++	}
++	if (!(out.flags & FUSE_PFS_WRITE_OUT_COMMITTED) ||
++	    out.committed_size > staged || !out.sequence ||
++	    out.sequence > S64_MAX || out.post_size > inode->i_sb->s_maxbytes ||
++	    (!out.committed_size &&
++	     (outcome != FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR ||
++	      out.assigned_offset)) ||
++	    (out.committed_size &&
++	     ((!append && out.assigned_offset != position) ||
++	      out.assigned_offset > max_end ||
++	      out.committed_size > max_end - out.assigned_offset ||
++	      (append && out.post_size !=
++			 out.assigned_offset + out.committed_size) ||
++	      out.post_size < out.assigned_offset + out.committed_size))) {
++		fuse_abort_conn(fc);
++		iov_iter_revert(from, advanced);
++		return -ENOTCONN;
++	}
++	if (out.committed_size < advanced)
++		iov_iter_revert(from, advanced - out.committed_size);
++
++	/*
++	 * COMMIT retained the source gate, so no peer update can overlap this.
++	 * Do not take i_rwsem here: another local mutation may hold it while
++	 * waiting to acquire the retained source gate.
++	 */
++	err = fuse_pfs_update_source_size(inode, out.post_size, out.sequence);
++	if (!err && out.committed_size)
++		iocb->ki_pos = out.assigned_offset + out.committed_size;
++	if (err) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	if (WARN_ON_ONCE(!publish_token)) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	publish_token->publish_on_operation_error = true;
++	if (out.committed_size) {
++		fs_reply_publish_scope_set_applied_bytes(out.committed_size);
++		iocb->ki_flags |= IOCB_PFS_TERMINAL_SHORT;
++		task_io_account_write(out.committed_size);
++	}
++	return out.error ?: out.committed_size;
++}
++
+ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ {
+ 	struct file *file = iocb->ki_filp;
+@@ -1768,9 +2347,28 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 	struct file *file = iocb->ki_filp;
+ 	struct fuse_file *ff = file->private_data;
+ 	struct inode *inode = file_inode(file);
++	ssize_t ret;
+ 
+ 	if (fuse_is_bad(inode))
+ 		return -EIO;
++	if (ff->open_flags & FOPEN_PFS_SHARED) {
++		struct fs_reply_publish_scope *scope =
++			current->fs_reply_publish_scope;
++
++		/*
++		 * Only a core caller which owns the exact position/fsnotify/accounting
++		 * edge may begin a shared transaction.  Self-publishing here would ACK
++		 * before an enclosing caller installs those states.  Unknown direct or
++		 * out-of-tree ->write_iter callers therefore fail before BEGIN.
++		 */
++		if (!scope || !scope->active || scope->sb != inode->i_sb ||
++		    !scope->accepts_write_token) {
++			fuse_abort_conn(ff->fm->fc);
++			return -ENOTCONN;
++		}
++		ret = fuse_pfs_write_transaction(iocb, from);
++		return ret;
++	}
+ 
+ 	if (FUSE_IS_DAX(inode))
+ 		return fuse_dax_write_iter(iocb, from);
+@@ -1790,6 +2388,10 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
+ {
+ 	struct fuse_file *ff = in->private_data;
+ 
++	/* Shared handles must never populate or consume the page cache. */
++	if (ff->open_flags & FOPEN_PFS_SHARED)
++		return copy_splice_read(in, ppos, pipe, len, flags);
++
+ 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
+ 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
+ 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
+@@ -2845,6 +3447,10 @@ static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
+ 	struct fuse_lseek_out outarg;
+ 	int err;
+ 
++	/* Strict PortableFS has no server LSEEK dialect and never emulates it. */
++	if (fm->fc->pfs_strict_coherence)
++		return -EOPNOTSUPP;
++
+ 	if (fm->fc->no_lseek)
+ 		goto fallback;
+ 
+@@ -2966,6 +3572,10 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
+ 	FUSE_ARGS(args);
+ 	int err;
+ 
++	/* Strict poll is deliberately local and never has an RPC fallback. */
++	if (fm->fc->pfs_strict_coherence)
++		return DEFAULT_POLLMASK;
++
+ 	if (fm->fc->no_poll)
+ 		return DEFAULT_POLLMASK;
+ 
+@@ -3150,6 +3760,220 @@ static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
+ 	return err;
+ }
+ 
++enum fuse_pfs_range_outcome {
++	FUSE_PFS_RANGE_OUTCOME_INVALID,
++	FUSE_PFS_RANGE_OUTCOME_APPLIED,
++	FUSE_PFS_RANGE_OUTCOME_POSTAPPLY_ERROR,
++	FUSE_PFS_RANGE_OUTCOME_REJECTED,
++	FUSE_PFS_RANGE_OUTCOME_REJECTED_RLIMIT,
++	FUSE_PFS_RANGE_OUTCOME_NOOP,
++};
++
++static int fuse_pfs_validate_range_out(const struct fuse_pfs_range_out *out,
++				       bool allow_noop,
++				       bool rlimit_carries_pre_size,
++				       enum fuse_pfs_range_outcome *outcome)
++{
++	*outcome = FUSE_PFS_RANGE_OUTCOME_INVALID;
++	if (out->flags == FUSE_PFS_RANGE_OUT_REJECTED ||
++	    out->flags == FUSE_PFS_RANGE_OUT_REJECTED_RLIMIT) {
++		if (out->result_size || out->sequence ||
++		    out->error >= 0 || out->error < -MAX_ERRNO ||
++		    (out->flags == FUSE_PFS_RANGE_OUT_REJECTED &&
++		     out->post_size) ||
++		    (out->flags == FUSE_PFS_RANGE_OUT_REJECTED_RLIMIT &&
++		     !rlimit_carries_pre_size && out->post_size) ||
++		    (out->flags == FUSE_PFS_RANGE_OUT_REJECTED_RLIMIT &&
++		     out->error != -EFBIG))
++			return -EPROTO;
++		*outcome = out->flags == FUSE_PFS_RANGE_OUT_REJECTED_RLIMIT ?
++			FUSE_PFS_RANGE_OUTCOME_REJECTED_RLIMIT :
++			FUSE_PFS_RANGE_OUTCOME_REJECTED;
++		return 0;
++	}
++	if (out->flags == FUSE_PFS_RANGE_OUT_NOOP) {
++		if (!allow_noop || out->result_size || out->post_size ||
++		    out->sequence || out->error)
++			return -EPROTO;
++		*outcome = FUSE_PFS_RANGE_OUTCOME_NOOP;
++		return 0;
++	}
++	if (out->flags == (FUSE_PFS_RANGE_OUT_APPLIED |
++			  FUSE_PFS_RANGE_OUT_POSTAPPLY_ERROR)) {
++		if (out->error >= 0 || out->error < -MAX_ERRNO)
++			return -EPROTO;
++		*outcome = FUSE_PFS_RANGE_OUTCOME_POSTAPPLY_ERROR;
++	} else if (out->flags == FUSE_PFS_RANGE_OUT_APPLIED) {
++		if (out->error)
++			return -EPROTO;
++		*outcome = FUSE_PFS_RANGE_OUTCOME_APPLIED;
++	} else {
++		return -EPROTO;
++	}
++	if (!out->sequence || out->sequence > S64_MAX)
++		return -EPROTO;
++	return 0;
++}
++
++static bool fuse_pfs_valid_fallocate_mode(u32 mode)
++{
++	switch (mode) {
++	case FALLOC_FL_ALLOCATE_RANGE:
++	case FALLOC_FL_KEEP_SIZE:
++	case FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE:
++	case FALLOC_FL_ZERO_RANGE:
++	case FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE:
++	case FALLOC_FL_COLLAPSE_RANGE:
++	case FALLOC_FL_INSERT_RANGE:
++	case FALLOC_FL_UNSHARE_RANGE:
++	case FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool fuse_pfs_fallocate_end_growth_mode(u32 mode)
++{
++	return mode == FALLOC_FL_ALLOCATE_RANGE ||
++	       mode == FALLOC_FL_ZERO_RANGE ||
++	       mode == FALLOC_FL_UNSHARE_RANGE;
++}
++
++static bool fuse_pfs_fallocate_rlimit_rejection_valid(
++		const struct fuse_pfs_fallocate_in *in, u64 pre_size, u64 end)
++{
++	u64 new_size;
++
++	if (in->rlimit_fsize == RLIM_INFINITY ||
++	    pre_size > in->file_max_size)
++		return false;
++
++	if (in->mode == FALLOC_FL_INSERT_RANGE) {
++		/* XFS checks the size ceiling and offset before inode_newsize_ok. */
++		if (check_add_overflow(pre_size, in->length, &new_size) ||
++		    new_size > in->file_max_size || in->offset >= pre_size)
++			return false;
++		return new_size > in->rlimit_fsize;
++	}
++
++	if (!fuse_pfs_fallocate_end_growth_mode(in->mode))
++		return false;
++	/* xfs_falloc_newsize() invokes inode_newsize_ok only for growth. */
++	return pre_size < end && end > in->rlimit_fsize;
++}
++
++static long fuse_pfs_fallocate(struct file *file, int mode, loff_t offset,
++			       loff_t length)
++{
++	struct fuse_file *ff = file->private_data;
++	struct inode *inode = file_inode(file);
++	struct fuse_conn *fc = ff->fm->fc;
++	struct fuse_pfs_fallocate_in in = {
++		.fh = ff->fh,
++		.offset = offset,
++		.length = length,
++		.rlimit_fsize = fuse_pfs_rlimit_fsize(),
++		/* vfs_fallocate() is limited by s_maxbytes, not O_LARGEFILE. */
++		.file_max_size = inode->i_sb->s_maxbytes,
++		.mode = mode,
++	};
++	struct fuse_pfs_range_out out = {};
++	struct fuse_args args = {
++		.opcode = FUSE_PFS_FALLOCATE,
++		.nodeid = ff->nodeid,
++		.in_numargs = 1,
++		.out_numargs = 1,
++		.pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL,
++		.force = true,
++	};
++	enum fuse_pfs_range_outcome outcome;
++	struct fs_reply_publish_token *publish_token;
++	u64 end;
++	bool applied;
++	int err;
++
++	if (!fuse_pfs_valid_fallocate_mode(mode) || offset < 0 || length <= 0 ||
++	    check_add_overflow((u64)offset, (u64)length, &end) ||
++	    end > inode->i_sb->s_maxbytes || !in.file_max_size ||
++	    in.file_max_size > S64_MAX)
++		goto protocol_error;
++	if (!capable(CAP_FSETID))
++		in.write_flags = FUSE_WRITE_KILL_SUIDGID;
++	args.in_args[0].size = sizeof(in);
++	args.in_args[0].value = &in;
++	args.out_args[0].size = sizeof(out);
++	args.out_args[0].value = &out;
++
++	err = fuse_simple_request(ff->fm, &args);
++	if (err)
++		goto protocol_error;
++	err = fuse_pfs_validate_range_out(&out, false, true, &outcome);
++	applied = !err &&
++		(outcome == FUSE_PFS_RANGE_OUTCOME_APPLIED ||
++		 outcome == FUSE_PFS_RANGE_OUTCOME_POSTAPPLY_ERROR);
++	if (fuse_pfs_require_publication(ff->fm, &args, applied))
++		return -ENOTCONN;
++	if (err)
++		goto protocol_error;
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_REJECTED_RLIMIT) {
++		/*
++		 * Sole REJECTED_RLIMIT repurposes post_size as the authoritative
++		 * pre-operation EOF.  This is proof for INSERT's S + length limit
++		 * decision without sampling a stale local inode size.
++		 */
++		if (!fuse_pfs_fallocate_rlimit_rejection_valid(&in,
++							      out.post_size, end))
++			goto protocol_error;
++		send_sig(SIGXFSZ, current, 0);
++		return out.error;
++	}
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_REJECTED)
++		return out.error;
++	if (!applied || out.result_size ||
++	    out.post_size > inode->i_sb->s_maxbytes)
++		goto protocol_error;
++	/*
++	 * Only a clean APPLIED result promises the mode's final size formula.
++	 * A post-dispatch XFS error may leave any exact intermediate EOF; that
++	 * state is still authoritative and must be invalidated and published.
++	 */
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_APPLIED &&
++	    mode == FALLOC_FL_INSERT_RANGE &&
++	    (out.post_size <= end || out.post_size > in.file_max_size ||
++	     (in.rlimit_fsize != RLIM_INFINITY &&
++	      out.post_size > in.rlimit_fsize)))
++		goto protocol_error;
++	/*
++	 * For a clean collapse, authoritative S becomes S - length and XFS
++	 * requires offset + length < S.  Therefore the returned EOF must be
++	 * strictly greater than offset.  Also, because S must not exceed the
++	 * filesystem ceiling, S - length cannot exceed file_max_size - length.
++	 * Both bounds are provable without sampling stale local S.
++	 */
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_APPLIED &&
++	    mode == FALLOC_FL_COLLAPSE_RANGE &&
++	    (out.post_size <= in.offset ||
++	     out.post_size > in.file_max_size - in.length))
++		goto protocol_error;
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_APPLIED &&
++	    fuse_pfs_fallocate_end_growth_mode(mode) &&
++	    out.post_size < end)
++		goto protocol_error;
++	publish_token = args.pfs_reply_token;
++	if (!publish_token)
++		goto protocol_error;
++	err = fuse_pfs_update_source_size(inode, out.post_size, out.sequence);
++	if (err)
++		goto protocol_error;
++	publish_token->publish_on_operation_error = true;
++	return out.error;
++
++protocol_error:
++	fuse_abort_conn(fc);
++	return -ENOTCONN;
++}
++
+ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 				loff_t length)
+ {
+@@ -3169,10 +3993,12 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 		(!(mode & FALLOC_FL_KEEP_SIZE) ||
+ 		 (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)));
+ 
+-	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+-		     FALLOC_FL_ZERO_RANGE))
++	if (!fuse_pfs_valid_fallocate_mode(mode))
+ 		return -EOPNOTSUPP;
+ 
++	if (fm->fc->pfs_strict_coherence &&
++	    ff->open_flags & FOPEN_PFS_SHARED)
++		return fuse_pfs_fallocate(file, mode, offset, length);
+ 	if (fm->fc->no_fallocate)
+ 		return -EOPNOTSUPP;
+ 
+@@ -3211,6 +4037,11 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 	args.in_numargs = 1;
+ 	args.in_args[0].size = sizeof(inarg);
+ 	args.in_args[0].value = &inarg;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			fi->pfs_class == FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err == -ENOSYS) {
+ 		fm->fc->no_fallocate = 1;
+@@ -3244,6 +4075,118 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 	return err;
+ }
+ 
++static ssize_t fuse_pfs_copy_file_range(struct file *file_in, loff_t pos_in,
++					struct file *file_out, loff_t pos_out,
++					size_t len, unsigned int flags)
++{
++	struct fuse_file *ff_in = file_in->private_data;
++	struct fuse_file *ff_out = file_out->private_data;
++	struct inode *inode_in = file_inode(file_in);
++	struct inode *inode_out = file_inode(file_out);
++	struct fuse_conn *fc = ff_in->fm->fc;
++	struct fuse_pfs_copy_file_range_in in = {
++		.fh_in = ff_in->fh,
++		.off_in = pos_in,
++		.nodeid_out = ff_out->nodeid,
++		.fh_out = ff_out->fh,
++		.off_out = pos_out,
++		.len = len,
++		.flags = flags,
++	};
++	struct fuse_pfs_range_out out = {};
++	struct fuse_args args = {
++		.opcode = FUSE_PFS_COPY_FILE_RANGE,
++		.nodeid = ff_in->nodeid,
++		.in_numargs = 1,
++		.out_numargs = 1,
++		.pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL,
++		.force = true,
++	};
++	enum fuse_pfs_range_outcome outcome;
++	struct fs_reply_publish_token *publish_token;
++	bool applied;
++	int err;
++
++	if (flags)
++		return -EOPNOTSUPP;
++	if (!(file_in->f_mode & FMODE_REMOTE_SIZE_AUTHORITY) ||
++	    !(file_out->f_mode & FMODE_REMOTE_SIZE_AUTHORITY))
++		goto protocol_error;
++	if (!fs_reply_publish_scope_get_write_limits(
++			&in.rlimit_fsize, &in.file_max_size) ||
++	    !in.file_max_size || in.file_max_size > S64_MAX)
++		goto protocol_error;
++	if (!capable(CAP_FSETID))
++		in.write_flags = FUSE_WRITE_KILL_SUIDGID;
++	args.in_args[0].size = sizeof(in);
++	args.in_args[0].value = &in;
++	args.out_args[0].size = sizeof(out);
++	args.out_args[0].value = &out;
++
++	err = fuse_simple_request(ff_in->fm, &args);
++	if (err)
++		goto protocol_error;
++	err = fuse_pfs_validate_range_out(&out, true, false, &outcome);
++	applied = !err &&
++		(outcome == FUSE_PFS_RANGE_OUTCOME_APPLIED ||
++		 outcome == FUSE_PFS_RANGE_OUTCOME_POSTAPPLY_ERROR);
++	if (fuse_pfs_require_publication(ff_in->fm, &args, applied))
++		return -ENOTCONN;
++	if (err)
++		goto protocol_error;
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_REJECTED_RLIMIT) {
++		if (in.rlimit_fsize == RLIM_INFINITY ||
++		    in.off_out < in.rlimit_fsize)
++			goto protocol_error;
++		send_sig(SIGXFSZ, current, 0);
++		return out.error;
++	}
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_REJECTED)
++		return out.error;
++	if (outcome == FUSE_PFS_RANGE_OUTCOME_NOOP) {
++		/* EOF clipping never suppresses the output-limit precedence. */
++		if (in.off_out >= in.file_max_size ||
++		    (in.rlimit_fsize != RLIM_INFINITY &&
++		     in.off_out >= in.rlimit_fsize))
++			goto protocol_error;
++		return 0;
++	}
++	if (!applied ||
++	    (!out.result_size &&
++	     outcome != FUSE_PFS_RANGE_OUTCOME_POSTAPPLY_ERROR) ||
++	    out.result_size > len ||
++	    out.result_size > SSIZE_MAX || in.off_out >= in.file_max_size ||
++	    out.result_size > in.file_max_size - in.off_out ||
++	    (in.rlimit_fsize != RLIM_INFINITY &&
++	     (in.off_out >= in.rlimit_fsize ||
++	      out.result_size > in.rlimit_fsize - in.off_out)) ||
++	    (out.result_size &&
++	     out.post_size < in.off_out + out.result_size) ||
++	    out.post_size > inode_out->i_sb->s_maxbytes)
++		goto protocol_error;
++	publish_token = args.pfs_reply_token;
++	if (!publish_token)
++		goto protocol_error;
++	err = fuse_pfs_update_source_size(inode_out, out.post_size, out.sequence);
++	if (err)
++		goto protocol_error;
++	if (inode_in != inode_out)
++		fuse_invalidate_attr(inode_in);
++	if (out.result_size)
++		fs_reply_publish_scope_set_applied_bytes(out.result_size);
++	publish_token->publish_on_operation_error = true;
++	/*
++	 * A copied prefix is the syscall result even when the authority reports
++	 * a post-apply error.  Returning the error would let callers retry bytes
++	 * which have already been made visible and published.
++	 */
++	return out.result_size ?: out.error;
++
++protocol_error:
++	fuse_abort_conn(fc);
++	return -ENOTCONN;
++}
++
+ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+ 				      struct file *file_out, loff_t pos_out,
+ 				      size_t len, unsigned int flags)
+@@ -3323,6 +4266,12 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+ 	args.out_numargs = 1;
+ 	args.out_args[0].size = sizeof(outarg);
+ 	args.out_args[0].value = &outarg;
++	if (fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(inode_out)->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err == -ENOSYS) {
+ 		fc->no_copy_file_range = 1;
+@@ -3358,15 +4307,58 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+ 				    struct file *dst_file, loff_t dst_off,
+ 				    size_t len, unsigned int flags)
+ {
++	struct fuse_inode *src_fi = get_fuse_inode(file_inode(src_file));
++	struct fuse_inode *dst_fi = get_fuse_inode(file_inode(dst_file));
++	struct fuse_file *src_ff = src_file->private_data;
++	struct fuse_file *dst_ff = dst_file->private_data;
++	struct fuse_conn *fc = dst_ff->fm->fc;
+ 	ssize_t ret;
+ 
+-	ret = __fuse_copy_file_range(src_file, src_off, dst_file, dst_off,
+-				     len, flags);
++	if (!fc->pfs_strict_coherence) {
++		ret = __fuse_copy_file_range(src_file, src_off, dst_file,
++					     dst_off, len, flags);
++		if (ret == -EOPNOTSUPP || ret == -EXDEV)
++			ret = splice_copy_file_range(src_file, src_off, dst_file,
++						     dst_off, len);
++		return ret;
++	}
++	if (file_inode(src_file)->i_sb != file_inode(dst_file)->i_sb ||
++	    src_ff->fm != dst_ff->fm)
++		return -EXDEV;
++	if (src_fi->pfs_class == FUSE_PFS_CLASS_UNKNOWN ||
++	    dst_fi->pfs_class == FUSE_PFS_CLASS_UNKNOWN) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	if (src_fi->pfs_class != dst_fi->pfs_class)
++		return -EXDEV;
++	if (dst_fi->pfs_class == FUSE_PFS_CLASS_SHARED)
++		return fuse_pfs_copy_file_range(src_file, src_off, dst_file,
++						dst_off, len, flags);
+ 
+-	if (ret == -EOPNOTSUPP || ret == -EXDEV)
+-		ret = splice_copy_file_range(src_file, src_off, dst_file,
+-					     dst_off, len);
+-	return ret;
++	/* LOCAL-to-LOCAL uses only the daemon's direct local backend opcode. */
++	return __fuse_copy_file_range(src_file, src_off, dst_file, dst_off,
++				      len, flags);
++}
++
++static int fuse_file_fadvise(struct file *file, loff_t offset, loff_t len,
++			     int advice)
++{
++	struct fuse_file *ff = file->private_data;
++	struct fuse_conn *fc = ff->fm->fc;
++
++	/*
++	 * generic_fadvise(WILLNEED) calls the address-space readahead path even
++	 * for a FUSE direct-I/O handle.  That would let an unsequenced READ
++	 * populate SHARED page cache after an exact DATA invalidation.  Advice is
++	 * optional by definition, so deliberately ignore WILLNEED while retaining
++	 * the stock local hint/invalidation behavior for every other advice.
++	 */
++	if (fc->pfs_strict_coherence &&
++	    (ff->open_flags & FOPEN_PFS_SHARED) &&
++	    advice == POSIX_FADV_WILLNEED)
++		return len < 0 ? -EINVAL : 0;
++	return generic_fadvise(file, offset, len, advice);
+ }
+ 
+ static const struct file_operations fuse_file_operations = {
+@@ -3388,6 +4380,7 @@ static const struct file_operations fuse_file_operations = {
+ 	.poll		= fuse_file_poll,
+ 	.fallocate	= fuse_file_fallocate,
+ 	.copy_file_range = fuse_copy_file_range,
++	.fadvise	= fuse_file_fadvise,
+ };
+ 
+ static const struct address_space_operations fuse_file_aops  = {
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 28cf319c1..cc95c17fe 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -29,6 +29,7 @@
+ #include <linux/kref.h>
+ #include <linux/xattr.h>
+ #include <linux/pid_namespace.h>
++#include <linux/fs_reply_publish.h>
+ #include <linux/refcount.h>
+ #include <linux/user_namespace.h>
+ 
+@@ -120,6 +121,17 @@ struct fuse_inode {
+ 	/** Version of last attribute change */
+ 	u64 attr_version;
+ 
++	/* Immutable PortableFS inode class and ordered exact-size state. */
++	u8 pfs_class;
++	u64 pfs_size_sequence;
++	u64 pfs_sequence_size;
++	/*
++	 * Serializes exact shared-data publication without i_rwsem.  A source
++	 * COMMIT retains the userspace visibility gate and must not wait for an
++	 * i_rwsem holder which can itself be waiting to enter that gate.
++	 */
++	struct mutex pfs_publish_mutex;
++
+ 	union {
+ 		/* read/write io cache (regular file only) */
+ 		struct {
+@@ -195,6 +207,12 @@ struct fuse_inode {
+ #endif
+ };
+ 
++enum fuse_pfs_inode_class {
++	FUSE_PFS_CLASS_UNKNOWN,
++	FUSE_PFS_CLASS_SHARED,
++	FUSE_PFS_CLASS_LOCAL,
++};
++
+ /** FUSE inode state bits */
+ enum {
+ 	/** Advise readdirplus  */
+@@ -291,6 +309,12 @@ struct fuse_page_desc {
+ 	unsigned int offset;
+ };
+ 
++enum fuse_pfs_publish_policy {
++	FUSE_PFS_PUBLISH_FORBID,
++	FUSE_PFS_PUBLISH_REQUIRE_SUCCESS,
++	FUSE_PFS_PUBLISH_OPTIONAL,
++};
++
+ struct fuse_args {
+ 	uint64_t nodeid;
+ 	uint32_t opcode;
+@@ -310,6 +334,10 @@ struct fuse_args {
+ 	bool is_ext:1;
+ 	bool is_pinned:1;
+ 	bool invalidate_vmap:1;
++	bool pfs_reply_marked:1;
++	u8 pfs_publish_policy:2;
++	/* Non-NULL only after a marked reply is retained by its VFS scope. */
++	struct fs_reply_publish_token *pfs_reply_token;
+ 	struct fuse_in_arg in_args[3];
+ 	struct fuse_arg out_args[2];
+ 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
+@@ -428,6 +456,11 @@ struct fuse_req {
+ 		struct fuse_out_header h;
+ 	} out;
+ 
++	/* Preallocated: a definite reply must never need post-reply memory. */
++	struct fs_reply_publish_token pfs_publish_token;
++	/* Requester-owned exact post-VFS scope, captured before queueing. */
++	struct fs_reply_publish_scope *pfs_publish_scope;
++
+ 	/** Used to wake up the task waiting for completion of request*/
+ 	wait_queue_head_t waitq;
+ 
+@@ -639,6 +672,10 @@ struct fuse_conn {
+ 	/** The next unique kernel file handle */
+ 	atomic64_t khctr;
+ 
++	/** Nonwrapping private transaction and publication identities. */
++	atomic64_t pfs_write_txid;
++	atomic64_t pfs_publication_id;
++
+ 	/** rbtree of fuse_files waiting for poll events indexed by ph */
+ 	struct rb_root polled_files;
+ 
+@@ -697,6 +734,9 @@ struct fuse_conn {
+ 	/** Do not send separate SETATTR request before open(O_TRUNC)  */
+ 	unsigned atomic_o_trunc:1;
+ 
++	/** Indivisible private PortableFS strict-coherence profile. */
++	unsigned pfs_strict_coherence:1;
++
+ 	/** Filesystem supports NFS exporting.  Only set in INIT */
+ 	unsigned export_support:1;
+ 
+@@ -1046,7 +1086,8 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+ 			u64 attr_valid, u64 attr_version);
+ 
+ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
+-		     struct fuse_entry_out *outarg, struct inode **inode);
++		     struct fuse_entry_out *outarg, struct inode **inode,
++		     bool pfs_publish);
+ 
+ /**
+  * Send FORGET command
+@@ -1065,11 +1106,15 @@ struct fuse_io_args {
+ 			struct fuse_read_in in;
+ 			u64 attr_ver;
+ 		} read;
+-		struct {
+-			struct fuse_write_in in;
+-			struct fuse_write_out out;
+-			bool page_locked;
+-		} write;
++	struct {
++		struct fuse_write_in in;
++		struct fuse_write_out out;
++		bool page_locked;
++	} write;
++	struct {
++		struct fuse_pfs_write_in in;
++		struct fuse_pfs_write_out out;
++	} pfs_write;
+ 	};
+ 	struct fuse_args_pages ap;
+ 	struct fuse_io_priv *io;
+@@ -1083,6 +1128,8 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
+ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release);
+ void fuse_file_free(struct fuse_file *ff);
+ int fuse_finish_open(struct inode *inode, struct file *file);
++int fuse_pfs_validate_open(struct inode *inode, const struct fuse_file *ff,
++			   bool isdir);
+ 
+ void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
+ 		       unsigned int flags);
+@@ -1127,9 +1174,9 @@ void fuse_init_symlink(struct inode *inode);
+ /**
+  * Change attributes of an inode
+  */
+-void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+-			    struct fuse_statx *sx,
+-			    u64 attr_valid, u64 attr_version);
++int fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
++			   struct fuse_statx *sx,
++			   u64 attr_valid, u64 attr_version);
+ 
+ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
+ 				   struct fuse_statx *sx,
+@@ -1181,6 +1228,14 @@ void fuse_request_end(struct fuse_req *req);
+ void fuse_abort_conn(struct fuse_conn *fc);
+ void fuse_wait_aborted(struct fuse_conn *fc);
+ 
++int fuse_pfs_require_publication(struct fuse_mount *fm,
++				 struct fuse_args *args, bool required);
++int fuse_pfs_classify_attr(struct fuse_conn *fc, struct inode *inode,
++			   const struct fuse_attr *attr);
++int fuse_pfs_update_size_locked(struct inode *inode, u64 size, u64 sequence);
++int fuse_pfs_update_size(struct inode *inode, u64 size, u64 sequence);
++int fuse_pfs_update_source_size(struct inode *inode, u64 size, u64 sequence);
++
+ /**
+  * Invalidate inode attributes
+  */
+@@ -1417,8 +1472,9 @@ int fuse_file_io_open(struct file *file, struct inode *inode);
+ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
+ 
+ /* file.c */
+-struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+-				 unsigned int open_flags, bool isdir);
++struct fuse_file *fuse_file_open(struct fuse_mount *fm, struct inode *inode,
++				 u64 nodeid, unsigned int open_flags,
++				 bool isdir);
+ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
+ 		       unsigned int open_flags, fl_owner_t id, bool isdir);
+ 
+diff --git a/fs/fuse/fuse_trace.h b/fs/fuse/fuse_trace.h
+index bbe9ddd8c..d3dbd5ec9 100644
+--- a/fs/fuse/fuse_trace.h
++++ b/fs/fuse/fuse_trace.h
+@@ -58,6 +58,10 @@
+ 	EM( FUSE_SYNCFS,		"FUSE_SYNCFS")		\
+ 	EM( FUSE_TMPFILE,		"FUSE_TMPFILE")		\
+ 	EM( FUSE_STATX,			"FUSE_STATX")		\
++	EM(FUSE_PFS_WRITE,		"FUSE_PFS_WRITE")	\
++	EM(FUSE_PFS_PUBLISH,		"FUSE_PFS_PUBLISH")	\
++	EM(FUSE_PFS_FALLOCATE,		"FUSE_PFS_FALLOCATE")	\
++	EM(FUSE_PFS_COPY_FILE_RANGE,	"FUSE_PFS_COPY_FILE_RANGE") \
+ 	EMe(CUSE_INIT,			"CUSE_INIT")
+ 
+ /*
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 153f3102f..55fdc963e 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -100,6 +100,7 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
+ 
+ 	fi->inval_mask = ~0;
+ 	mutex_init(&fi->mutex);
++	mutex_init(&fi->pfs_publish_mutex);
+ 	spin_lock_init(&fi->lock);
+ 	fi->forget = fuse_alloc_forget();
+ 	if (!fi->forget)
+@@ -292,9 +293,9 @@ u32 fuse_get_cache_mask(struct inode *inode)
+ 	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
+ }
+ 
+-void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+-			    struct fuse_statx *sx,
+-			    u64 attr_valid, u64 attr_version)
++int fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
++			   struct fuse_statx *sx,
++			   u64 attr_valid, u64 attr_version)
+ {
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+@@ -302,6 +303,11 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+ 	loff_t oldsize;
+ 	struct timespec64 old_mtime;
+ 
++	if (unlikely(fuse_pfs_classify_attr(fc, inode, attr))) {
++		fuse_abort_conn(fc);
++		return -EPROTO;
++	}
++
+ 	spin_lock(&fi->lock);
+ 	/*
+ 	 * In case of writeback_cache enabled, writes update mtime, ctime and
+@@ -324,7 +330,7 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+ 	if ((attr_version != 0 && fi->attr_version > attr_version) ||
+ 	    test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state)) {
+ 		spin_unlock(&fi->lock);
+-		return;
++		return 0;
+ 	}
+ 
+ 	old_mtime = inode_get_mtime(inode);
+@@ -367,6 +373,90 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+ 
+ 	if (IS_ENABLED(CONFIG_FUSE_DAX))
+ 		fuse_dax_dontcache(inode, attr->flags);
++	return 0;
++}
++
++int fuse_pfs_update_size_locked(struct inode *inode, u64 size, u64 sequence)
++{
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	struct address_space *mapping = inode->i_mapping;
++	int err = 0;
++
++	lockdep_assert_held(&fi->pfs_publish_mutex);
++	if (!fc->pfs_strict_coherence || !sequence || sequence > S64_MAX ||
++	    size > inode->i_sb->s_maxbytes ||
++	    fi->pfs_class != FUSE_PFS_CLASS_SHARED)
++		return -EPROTO;
++
++	spin_lock(&fi->lock);
++	if (sequence < fi->pfs_size_sequence) {
++		spin_unlock(&fi->lock);
++		return 0;
++	}
++	if (sequence == fi->pfs_size_sequence) {
++		err = fi->pfs_sequence_size == size ? 0 : -EPROTO;
++		spin_unlock(&fi->lock);
++		return err;
++	}
++	spin_unlock(&fi->lock);
++
++	/*
++	 * Serialize against filemap faults as well as truncation.  Merely
++	 * scanning the page cache can race a MAP_PRIVATE fault which inserts a
++	 * stale page immediately after the scan.  The ordered sequence is not
++	 * published until the exact size and complete data invalidation have
++	 * both succeeded.
++	 */
++	filemap_invalidate_lock(mapping);
++	i_size_write(inode, size);
++	fuse_invalidate_attr(inode);
++	forget_all_cached_acls(inode);
++	truncate_pagecache(inode, size);
++	err = invalidate_inode_pages2(mapping);
++	if (err) {
++		filemap_invalidate_unlock(mapping);
++		return err;
++	}
++
++	spin_lock(&fi->lock);
++	/* pfs_publish_mutex excludes another exact-size publisher. */
++	if (WARN_ON_ONCE(sequence <= fi->pfs_size_sequence)) {
++		err = -EPROTO;
++	} else {
++		fi->pfs_size_sequence = sequence;
++		fi->pfs_sequence_size = size;
++		fi->attr_version = atomic64_inc_return(&fc->attr_version);
++	}
++	spin_unlock(&fi->lock);
++	filemap_invalidate_unlock(mapping);
++	return err;
++}
++
++int fuse_pfs_update_size(struct inode *inode, u64 size, u64 sequence)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	int err;
++
++	mutex_lock(&fi->pfs_publish_mutex);
++	err = fuse_pfs_update_size_locked(inode, size, sequence);
++	mutex_unlock(&fi->pfs_publish_mutex);
++	return err;
++}
++
++int fuse_pfs_update_source_size(struct inode *inode, u64 size, u64 sequence)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	int err;
++
++	mutex_lock(&fi->pfs_publish_mutex);
++	spin_lock(&fi->lock);
++	err = sequence <= fi->pfs_size_sequence ? -EPROTO : 0;
++	spin_unlock(&fi->lock);
++	if (!err)
++		err = fuse_pfs_update_size_locked(inode, size, sequence);
++	mutex_unlock(&fi->pfs_publish_mutex);
++	return err;
+ }
+ 
+ static void fuse_init_submount_lookup(struct fuse_submount_lookup *sl,
+@@ -405,6 +495,31 @@ static void fuse_init_inode(struct inode *inode, struct fuse_attr *attr,
+ 		inode->i_acl = inode->i_default_acl = ACL_DONT_CACHE;
+ }
+ 
++int fuse_pfs_classify_attr(struct fuse_conn *fc, struct inode *inode,
++			   const struct fuse_attr *attr)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	u32 bits = attr->flags &
++		(FUSE_ATTR_PFS_SHARED | FUSE_ATTR_PFS_LOCAL);
++	u8 class;
++
++	if (!fc->pfs_strict_coherence)
++		return bits ? -EPROTO : 0;
++	if (bits == FUSE_ATTR_PFS_SHARED)
++		class = FUSE_PFS_CLASS_SHARED;
++	else if (bits == FUSE_ATTR_PFS_LOCAL)
++		class = FUSE_PFS_CLASS_LOCAL;
++	else
++		return -EPROTO;
++	spin_lock(&fi->lock);
++	if (fi->pfs_class == FUSE_PFS_CLASS_UNKNOWN)
++		fi->pfs_class = class;
++	else if (fi->pfs_class != class)
++		class = FUSE_PFS_CLASS_UNKNOWN;
++	spin_unlock(&fi->lock);
++	return class == FUSE_PFS_CLASS_UNKNOWN ? -EPROTO : 0;
++}
++
+ static int fuse_inode_eq(struct inode *inode, void *_nodeidp)
+ {
+ 	u64 nodeid = *(u64 *) _nodeidp;
+@@ -438,8 +553,6 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+ 	 */
+ 	if (fc->auto_submounts && (attr->flags & FUSE_ATTR_SUBMOUNT) &&
+ 	    S_ISDIR(attr->mode)) {
+-		struct fuse_inode *fi;
+-
+ 		inode = new_inode(sb);
+ 		if (!inode)
+ 			return NULL;
+@@ -484,7 +597,26 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+ 	fi->nlookup++;
+ 	spin_unlock(&fi->lock);
+ done:
+-	fuse_change_attributes(inode, attr, NULL, attr_valid, attr_version);
++	if (fuse_pfs_classify_attr(fc, inode, attr)) {
++		fuse_abort_conn(fc);
++		spin_lock(&fi->lock);
++		WARN_ON_ONCE(!fi->nlookup);
++		if (fi->nlookup)
++			fi->nlookup--;
++		spin_unlock(&fi->lock);
++		iput(inode);
++		return NULL;
++	}
++	if (fuse_change_attributes(inode, attr, NULL, attr_valid,
++				   attr_version)) {
++		spin_lock(&fi->lock);
++		WARN_ON_ONCE(!fi->nlookup);
++		if (fi->nlookup)
++			fi->nlookup--;
++		spin_unlock(&fi->lock);
++		iput(inode);
++		return NULL;
++	}
+ 
+ 	return inode;
+ }
+@@ -696,8 +828,8 @@ static int fuse_sync_fs(struct super_block *sb, int wait)
+ 	/* The filesystem is being unmounted.  Nothing to do. */
+ 	if (!sb->s_root)
+ 		return 0;
+-
+-	if (!fc->sync_fs)
++	/* Strict durability always reaches the authoritative volume-wide cut. */
++	if (!fc->pfs_strict_coherence && !fc->sync_fs)
+ 		return 0;
+ 
+ 	fuse_sync_fs_writes(fc);
+@@ -712,6 +844,9 @@ static int fuse_sync_fs(struct super_block *sb, int wait)
+ 
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err == -ENOSYS) {
++		/* Central strict reply validation has already fenced this case. */
++		if (fc->pfs_strict_coherence)
++			return -ENOTCONN;
+ 		fc->sync_fs = 0;
+ 		err = 0;
+ 	}
+@@ -932,6 +1067,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
+ 	fc->max_background = FUSE_DEFAULT_MAX_BACKGROUND;
+ 	fc->congestion_threshold = FUSE_DEFAULT_CONGESTION_THRESHOLD;
+ 	atomic64_set(&fc->khctr, 0);
++	atomic64_set(&fc->pfs_write_txid, 0);
++	/* Private publication identities occupy the positive odd domain. */
++	atomic64_set(&fc->pfs_publication_id, -1);
+ 	fc->polled_files = RB_ROOT;
+ 	fc->blocked = 0;
+ 	fc->initialized = 0;
+@@ -1026,7 +1164,7 @@ static struct dentry *fuse_get_dentry(struct super_block *sb,
+ 			goto out_err;
+ 
+ 		err = fuse_lookup_name(sb, handle->nodeid, &name, &outarg,
+-				       &inode);
++				       &inode, false);
+ 		if (err && err != -ENOENT)
+ 			goto out_err;
+ 		if (err || !inode) {
+@@ -1127,7 +1265,7 @@ static struct dentry *fuse_get_parent(struct dentry *child)
+ 		return ERR_PTR(-ESTALE);
+ 
+ 	err = fuse_lookup_name(child_inode->i_sb, get_node_id(child_inode),
+-			       &dotdot_name, &outarg, &inode);
++			       &dotdot_name, &outarg, &inode, false);
+ 	if (err) {
+ 		if (err == -ENOENT)
+ 			return ERR_PTR(-ESTALE);
+@@ -1236,6 +1374,9 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 		ok = false;
+ 	else {
+ 		unsigned long ra_pages;
++		unsigned int stack_depth = 0;
++		const struct export_operations *export_ops =
++			&fuse_export_operations;
+ 
+ 		process_init_limits(fc, arg);
+ 
+@@ -1259,7 +1400,42 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 			}
+ 			if (flags & FUSE_ATOMIC_O_TRUNC)
+ 				fc->atomic_o_trunc = 1;
+-			if (arg->minor >= 9) {
++			if (flags & FUSE_PFS_STRICT_COHERENCE) {
++				struct fuse_inode *root_fi =
++					get_fuse_inode(fm->sb->s_root->d_inode);
++
++				if (arg->minor != FUSE_KERNEL_MINOR_VERSION ||
++				    !fc->default_permissions ||
++				    !(flags & FUSE_ATOMIC_O_TRUNC) ||
++				    !(flags & FUSE_HANDLE_KILLPRIV_V2) ||
++				    !(flags & FUSE_POSIX_LOCKS) ||
++				    !(flags & FUSE_FLOCK_LOCKS) ||
++				    fc->no_lock || fc->no_flock ||
++				    fc->iq.ops != &fuse_dev_fiq_ops ||
++				    (flags & (FUSE_EXPORT_SUPPORT | FUSE_SUBMOUNTS |
++					      FUSE_NO_OPEN_SUPPORT |
++					      FUSE_NO_OPENDIR_SUPPORT |
++					      FUSE_DO_READDIRPLUS |
++					      FUSE_READDIRPLUS_AUTO |
++					      FUSE_POSIX_ACL |
++					      FUSE_PASSTHROUGH |
++					      FUSE_HAS_RESEND)) ||
++				    (flags & (FUSE_WRITEBACK_CACHE |
++					      FUSE_DIRECT_IO_ALLOW_MMAP |
++					      FUSE_HAS_INODE_DAX))) {
++					ok = false;
++				} else {
++					fc->pfs_strict_coherence = 1;
++					/* Strict attrs use classified FUSE_GETATTR only. */
++					fc->no_statx = 1;
++					fc->export_support = 0;
++					stack_depth = FILESYSTEM_MAX_STACK_DEPTH;
++					export_ops = NULL;
++					root_fi->pfs_class = FUSE_PFS_CLASS_SHARED;
++					fuse_init_dir(&root_fi->inode);
++				}
++			}
++			if (arg->minor >= 9 && !fc->pfs_strict_coherence) {
+ 				/* LOOKUP has dependency on proto version */
+ 				if (flags & FUSE_EXPORT_SUPPORT)
+ 					fc->export_support = 1;
+@@ -1341,10 +1517,11 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 			    !(flags & FUSE_WRITEBACK_CACHE))  {
+ 				fc->passthrough = 1;
+ 				fc->max_stack_depth = arg->max_stack_depth;
+-				fm->sb->s_stack_depth = arg->max_stack_depth;
++				stack_depth = arg->max_stack_depth;
+ 			}
+-			if (flags & FUSE_NO_EXPORT_SUPPORT)
+-				fm->sb->s_export_op = &fuse_export_fid_operations;
++			if ((flags & FUSE_NO_EXPORT_SUPPORT) &&
++			    !fc->pfs_strict_coherence)
++				export_ops = &fuse_export_fid_operations;
+ 			if (flags & FUSE_ALLOW_IDMAP) {
+ 				if (fc->default_permissions)
+ 					fm->sb->s_iflags &= ~SB_I_NOIDMAP;
+@@ -1357,6 +1534,12 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 			fc->no_flock = 1;
+ 		}
+ 
++		if (ok) {
++			if (!fc->pfs_strict_coherence)
++				fm->sb->s_iflags &= ~SB_I_REPLY_PUBLISH;
++			fm->sb->s_stack_depth = stack_depth;
++			fm->sb->s_export_op = export_ops;
++		}
+ 		fm->sb->s_bdi->ra_pages =
+ 				min(fm->sb->s_bdi->ra_pages, ra_pages);
+ 		fc->minor = arg->minor;
+@@ -1398,7 +1581,8 @@ void fuse_send_init(struct fuse_mount *fm)
+ 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
+ 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+-		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP;
++		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
++		FUSE_PFS_STRICT_COHERENCE;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+@@ -1564,6 +1748,10 @@ static void fuse_fill_attr_from_inode(struct fuse_attr *attr,
+ 		.rdev		= fi->inode.i_rdev,
+ 		.blksize	= 1u << fi->inode.i_blkbits,
+ 	};
++	if (fi->pfs_class == FUSE_PFS_CLASS_SHARED)
++		attr->flags |= FUSE_ATTR_PFS_SHARED;
++	else if (fi->pfs_class == FUSE_PFS_CLASS_LOCAL)
++		attr->flags |= FUSE_ATTR_PFS_LOCAL;
+ }
+ 
+ static void fuse_sb_defaults(struct super_block *sb)
+@@ -1701,6 +1889,14 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
+ 
+ 	rcu_assign_pointer(fc->curr_bucket, fuse_sync_bucket_alloc());
+ 	fuse_sb_defaults(sb);
++	/*
++	 * The superblock becomes mount-visible before the asynchronous INIT reply.
++	 * Keep it ineligible as a stacking layer until INIT selects its final
++	 * protocol profile and stack depth.
++	 */
++	sb->s_iflags |= SB_I_REPLY_PUBLISH;
++	sb->s_stack_depth = FILESYSTEM_MAX_STACK_DEPTH;
++	sb->s_export_op = NULL;
+ 
+ 	if (ctx->is_bdev) {
+ #ifdef CONFIG_BLOCK
+diff --git a/fs/fuse/ioctl.c b/fs/fuse/ioctl.c
+index 572ce8a82..ef13638ca 100644
+--- a/fs/fuse/ioctl.c
++++ b/fs/fuse/ioctl.c
+@@ -413,6 +413,7 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_file *ff = file->private_data;
+ 
+ 	if (!fuse_allow_current_process(fc))
+ 		return -EACCES;
+@@ -420,6 +421,11 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
+ 	if (fuse_is_bad(inode))
+ 		return -EIO;
+ 
++	/* No unclassified ioctl may bypass strict shared mutation ordering. */
++	if (fc->pfs_strict_coherence &&
++	    ff->open_flags & FOPEN_PFS_SHARED)
++		return -EOPNOTSUPP;
++
+ 	return fuse_do_ioctl(file, cmd, arg, flags);
+ }
+ 
+@@ -493,7 +499,7 @@ static struct fuse_file *fuse_priv_ioctl_prepare(struct inode *inode)
+ 	if (!S_ISREG(inode->i_mode) && !isdir)
+ 		return ERR_PTR(-ENOTTY);
+ 
+-	return fuse_file_open(fm, get_node_id(inode), O_RDONLY, isdir);
++	return fuse_file_open(fm, inode, get_node_id(inode), O_RDONLY, isdir);
+ }
+ 
+ static void fuse_priv_ioctl_cleanup(struct inode *inode, struct fuse_file *ff)
+@@ -547,6 +553,11 @@ int fuse_fileattr_set(struct mnt_idmap *idmap,
+ 	struct fsxattr xfa;
+ 	int err;
+ 
++	/* SETFLAGS/FSSETXATTR are mutations with no strict transaction ABI. */
++	if (get_fuse_conn(inode)->pfs_strict_coherence &&
++	    get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_SHARED)
++		return -EOPNOTSUPP;
++
+ 	ff = fuse_priv_ioctl_prepare(inode);
+ 	if (IS_ERR(ff))
+ 		return PTR_ERR(ff);
+diff --git a/fs/fuse/readdir.c b/fs/fuse/readdir.c
+index 78e6ad3f8..de3dd14d1 100644
+--- a/fs/fuse/readdir.c
++++ b/fs/fuse/readdir.c
+@@ -227,9 +227,11 @@ static int fuse_direntplus_link(struct file *file,
+ 		spin_unlock(&fi->lock);
+ 
+ 		forget_all_cached_acls(inode);
+-		fuse_change_attributes(inode, &o->attr, NULL,
+-				       ATTR_TIMEOUT(o),
+-				       attr_version);
++		if (fuse_change_attributes(inode, &o->attr, NULL,
++					   ATTR_TIMEOUT(o), attr_version)) {
++			dput(dentry);
++			return -ENOTCONN;
++		}
+ 		/*
+ 		 * The other branch comes via fuse_iget()
+ 		 * which bumps nlookup inside
+diff --git a/fs/fuse/xattr.c b/fs/fuse/xattr.c
+index 9f568d345..8e47c0a8a 100644
+--- a/fs/fuse/xattr.c
++++ b/fs/fuse/xattr.c
+@@ -19,6 +19,10 @@ int fuse_setxattr(struct inode *inode, const char *name, const void *value,
+ 	struct fuse_setxattr_in inarg;
+ 	int err;
+ 
++	/* Strict PortableFS deliberately exposes user xattrs read-only. */
++	if (fm->fc->pfs_strict_coherence)
++		return -EOPNOTSUPP;
++
+ 	if (fm->fc->no_setxattr)
+ 		return -EOPNOTSUPP;
+ 
+@@ -37,6 +41,12 @@ int fuse_setxattr(struct inode *inode, const char *name, const void *value,
+ 	args.in_args[1].value = name;
+ 	args.in_args[2].size = size;
+ 	args.in_args[2].value = value;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(inode)->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err == -ENOSYS) {
+ 		fm->fc->no_setxattr = 1;
+@@ -57,8 +67,13 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name, void *value,
+ 	struct fuse_getxattr_out outarg;
+ 	ssize_t ret;
+ 
+-	if (fm->fc->no_getxattr)
++	if (fm->fc->no_getxattr) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.size = size;
+@@ -83,6 +98,10 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name, void *value,
+ 	if (!ret && !size)
+ 		ret = min_t(size_t, outarg.size, XATTR_SIZE_MAX);
+ 	if (ret == -ENOSYS) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		fm->fc->no_getxattr = 1;
+ 		ret = -EOPNOTSUPP;
+ 	}
+@@ -121,8 +140,13 @@ ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
+ 	if (!fuse_allow_current_process(fm->fc))
+ 		return -EACCES;
+ 
+-	if (fm->fc->no_listxattr)
++	if (fm->fc->no_listxattr) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.size = size;
+@@ -147,6 +171,10 @@ ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
+ 	if (ret > 0 && size)
+ 		ret = fuse_verify_xattr_list(list, ret);
+ 	if (ret == -ENOSYS) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		fm->fc->no_listxattr = 1;
+ 		ret = -EOPNOTSUPP;
+ 	}
+@@ -159,16 +187,31 @@ int fuse_removexattr(struct inode *inode, const char *name)
+ 	FUSE_ARGS(args);
+ 	int err;
+ 
+-	if (fm->fc->no_removexattr)
++	if (fm->fc->no_removexattr) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	args.opcode = FUSE_REMOVEXATTR;
+ 	args.nodeid = get_node_id(inode);
+ 	args.in_numargs = 1;
+ 	args.in_args[0].size = strlen(name) + 1;
+ 	args.in_args[0].value = name;
++	if (fm->fc->pfs_strict_coherence)
++		args.pfs_publish_policy =
++			get_fuse_inode(inode)->pfs_class ==
++				FUSE_PFS_CLASS_SHARED ?
++			FUSE_PFS_PUBLISH_REQUIRE_SUCCESS :
++			FUSE_PFS_PUBLISH_FORBID;
+ 	err = fuse_simple_request(fm, &args);
+ 	if (err == -ENOSYS) {
++		if (fm->fc->pfs_strict_coherence) {
++			fuse_abort_conn(fm->fc);
++			return -ENOTCONN;
++		}
+ 		fm->fc->no_removexattr = 1;
+ 		err = -EOPNOTSUPP;
+ 	}
+diff --git a/fs/overlayfs/params.c b/fs/overlayfs/params.c
+index d8b1a4337..7dd7c00b6 100644
+--- a/fs/overlayfs/params.c
++++ b/fs/overlayfs/params.c
+@@ -298,6 +298,17 @@ static int ovl_mount_dir_check(struct fs_context *fc, const struct path *path,
+ 	if (!d_is_dir(path->dentry))
+ 		return invalfc(fc, "%s is not a directory", name);
+ 
++	/*
++	 * Reject an unstackable filesystem immediately after resolving the layer.
++	 * Waiting for ovl_get_lowerstack() is too late: upper/lower setup calls
++	 * statfs and other filesystem operations first.  In particular, a FUSE
++	 * superblock is mount-visible before its asynchronous INIT completes, and
++	 * those callbacks would otherwise wait on the very daemon whose strict
++	 * profile is meant to make the filesystem unstackable.
++	 */
++	if (path->mnt->mnt_sb->s_stack_depth >= FILESYSTEM_MAX_STACK_DEPTH)
++		return invalfc(fc, "maximum fs stacking depth exceeded on %s", name);
++
+ 	/*
+ 	 * Root dentries of case-insensitive capable filesystems might
+ 	 * not have the dentry operations set, but still be incompatible
+diff --git a/fs/read_write.c b/fs/read_write.c
+index d14cad671..5afd32ac4 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -751,8 +751,8 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+ 			pos = *ppos;
+ 			ppos = &pos;
+ 		}
+-		fs_reply_publish_scope_enter_write(&publish_scope,
+-					   file_inode(fd_file(f))->i_sb);
++		fs_reply_publish_scope_enter_write_child(&publish_scope,
++						 file_inode(fd_file(f))->i_sb);
+ 		ret = vfs_write(fd_file(f), buf, count, ppos);
+ 		if (ppos && (ret >= 0 ||
+ 		    fs_reply_publish_scope_get_applied_bytes(&applied_bytes)))
+@@ -1156,8 +1156,8 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
+ 			pos = *ppos;
+ 			ppos = &pos;
+ 		}
+-		fs_reply_publish_scope_enter_write(&publish_scope,
+-					   file_inode(fd_file(f))->i_sb);
++		fs_reply_publish_scope_enter_write_child(&publish_scope,
++						 file_inode(fd_file(f))->i_sb);
+ 		ret = vfs_writev(fd_file(f), vec, vlen, ppos, flags);
+ 		if (ppos && (ret >= 0 ||
+ 		    fs_reply_publish_scope_get_applied_bytes(&applied_bytes)))
+@@ -1840,8 +1840,8 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
+ 	if (flags != 0)
+ 		return -EINVAL;
+ 
+-	fs_reply_publish_scope_enter_write(&publish_scope,
+-				   file_inode(fd_file(f_out))->i_sb);
++	fs_reply_publish_scope_enter_write_child(&publish_scope,
++					 file_inode(fd_file(f_out))->i_sb);
+ 	publish_scope_entered = true;
+ 	ret = vfs_copy_file_range(fd_file(f_in), pos_in, fd_file(f_out), pos_out,
+ 				  len, flags);
+diff --git a/fs/reply_publish.c b/fs/reply_publish.c
+index 767d8f0c2..302252343 100644
+--- a/fs/reply_publish.c
++++ b/fs/reply_publish.c
+@@ -31,6 +31,18 @@ bool fs_reply_publish_scope_enter_write(
+ 	return true;
+ }
+ 
++void fs_reply_publish_scope_enter_write_child(
++		struct fs_reply_publish_scope *scope, struct super_block *sb)
++{
++	/*
++	 * Repeated write_iter callers such as splice need an independent exact
++	 * publication cut before they may dispatch the next iteration.  They
++	 * must never inherit/defer to a compatible outer write scope.
++	 */
++	fs_reply_publish_scope_enter(scope, sb);
++	scope->accepts_write_token = scope->active;
++}
++
+ bool fs_reply_publish_scope_enter_if_needed(
+ 		struct fs_reply_publish_scope *scope, struct super_block *sb)
+ {
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index b7e48e086..099559b56 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -3164,6 +3164,10 @@ int smb2_open(struct ksmbd_work *work)
+ 					&parent_path, &path, 1);
+ 	if (!rc) {
+ 		file_present = true;
++		if (path.dentry->d_sb->s_iflags & SB_I_REPLY_PUBLISH) {
++			rc = -EOPNOTSUPP;
++			goto err_out;
++		}
+ 
+ 		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
+ 			/*
+@@ -3195,7 +3199,6 @@ int smb2_open(struct ksmbd_work *work)
+ 			    name, rc);
+ 		rc = 0;
+ 	}
+-
+ 	if (stream_name) {
+ 		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
+ 			if (s_type == DATA_STREAM) {
+@@ -3346,7 +3349,6 @@ int smb2_open(struct ksmbd_work *work)
+ 		pr_err("dentry open for dir failed, rc %d\n", rc);
+ 		goto err_out;
+ 	}
+-
+ 	if (file_present) {
+ 		if (!(open_flags & O_TRUNC))
+ 			file_info = FILE_OPENED;
+diff --git a/fs/smb/server/vfs.c b/fs/smb/server/vfs.c
+index d77c3e956..d336b45d2 100644
+--- a/fs/smb/server/vfs.c
++++ b/fs/smb/server/vfs.c
+@@ -1209,6 +1209,8 @@ static int ksmbd_vfs_lookup_in_dir(const struct path *dir, char *name,
+ 		.um		= um,
+ 	};
+ 
++	if (dir->dentry->d_sb->s_iflags & SB_I_REPLY_PUBLISH)
++		return -EOPNOTSUPP;
+ 	dfilp = dentry_open(dir, flags, current_cred());
+ 	if (IS_ERR(dfilp))
+ 		return PTR_ERR(dfilp);
+@@ -1342,6 +1344,11 @@ struct dentry *ksmbd_vfs_kern_path_create(struct ksmbd_work *work,
+ 		putname(filename);
+ 		return ERR_PTR(err);
+ 	}
++	if (path->mnt->mnt_sb->s_iflags & SB_I_REPLY_PUBLISH) {
++		path_put(path);
++		putname(filename);
++		return ERR_PTR(-EOPNOTSUPP);
++	}
+ 
+ 	err = mnt_want_write(path->mnt);
+ 	if (err) {
+diff --git a/fs/splice.c b/fs/splice.c
+index c406cff8d..5e3dc554f 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -744,17 +744,13 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 		iov_iter_bvec(&from, ITER_SOURCE, array, n, sd.total_len - left);
+ 		init_sync_kiocb(&kiocb, out);
+ 		kiocb.ki_pos = sd.pos;
+-		fs_reply_publish_scope_enter_write(&publish_scope,
+-					   file_inode(out)->i_sb);
++		fs_reply_publish_scope_enter_write_child(&publish_scope,
++						 file_inode(out)->i_sb);
+ 		ret = out->f_op->write_iter(&kiocb, &from);
+ 		if (ret > 0) {
+ 			applied_bytes = ret;
+-		} else if (fs_reply_publish_scope_requires_flush(&publish_scope) &&
+-			 !fs_reply_publish_scope_get_applied_bytes(&applied_bytes)) {
+-			fs_reply_publish_scope_abort(&publish_scope);
+-			publish_failed_after_apply = true;
+-			ret = -ENOTCONN;
+-			break;
++		} else if (fs_reply_publish_scope_requires_flush(&publish_scope)) {
++			fs_reply_publish_scope_get_applied_bytes(&applied_bytes);
+ 		}
+ 		if (!applied_bytes) {
+ 			ret = fs_reply_publish_scope_finish(&publish_scope, ret);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index cce19f88b..2babc32d0 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1073,6 +1073,12 @@ struct file {
+ } __randomize_layout
+   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+ 
++/* Independent caches cannot observe a remote authority's invalidations. */
++static inline bool file_can_back_independent_cache(const struct file *file)
++{
++	return !(file->f_mode & FMODE_REMOTE_SIZE_AUTHORITY);
++}
++
+ struct file_handle {
+ 	__u32 handle_bytes;
+ 	int handle_type;
+diff --git a/include/linux/fs_reply_publish.h b/include/linux/fs_reply_publish.h
+index f4a8dc7ad..2cfa76a83 100644
+--- a/include/linux/fs_reply_publish.h
++++ b/include/linux/fs_reply_publish.h
+@@ -41,6 +41,8 @@ bool fs_reply_publish_scope_enter_if_needed(
+ 		struct fs_reply_publish_scope *scope, struct super_block *sb);
+ bool fs_reply_publish_scope_enter_write(
+ 		struct fs_reply_publish_scope *scope, struct super_block *sb);
++void fs_reply_publish_scope_enter_write_child(
++		struct fs_reply_publish_scope *scope, struct super_block *sb);
+ int fs_reply_publish_scope_flush(struct fs_reply_publish_scope *scope);
+ void fs_reply_publish_scope_abort(struct fs_reply_publish_scope *scope);
+ ssize_t fs_reply_publish_scope_finish(struct fs_reply_publish_scope *scope,
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index f1e99458e..39670d5df 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -372,6 +372,9 @@ struct fuse_file_lock {
+ #define FOPEN_NOFLUSH		(1 << 5)
+ #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
+ #define FOPEN_PASSTHROUGH	(1 << 7)
++/* Private PortableFS strict-coherence inode class. */
++#define FOPEN_PFS_SHARED	(1 << 8)
++#define FOPEN_PFS_LOCAL		(1 << 9)
+ 
+ /**
+  * INIT request/reply flags
+@@ -471,6 +474,8 @@ struct fuse_file_lock {
+ /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
+ #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
+ #define FUSE_ALLOW_IDMAP	(1ULL << 40)
++/* Private, indivisible PortableFS strict-coherence profile. */
++#define FUSE_PFS_STRICT_COHERENCE (1ULL << 63)
+ 
+ /**
+  * CUSE INIT request/reply flags
+@@ -557,6 +562,8 @@ struct fuse_file_lock {
+  */
+ #define FUSE_ATTR_SUBMOUNT      (1 << 0)
+ #define FUSE_ATTR_DAX		(1 << 1)
++#define FUSE_ATTR_PFS_SHARED	(1 << 2)
++#define FUSE_ATTR_PFS_LOCAL	(1 << 3)
+ 
+ /**
+  * Open flags
+@@ -639,6 +646,12 @@ enum fuse_opcode {
+ 	FUSE_TMPFILE		= 51,
+ 	FUSE_STATX		= 52,
+ 
++	/* Private PortableFS strict-coherence operations. */
++	FUSE_PFS_WRITE		= 4097,
++	FUSE_PFS_PUBLISH	= 4098,
++	FUSE_PFS_FALLOCATE	= 4099,
++	FUSE_PFS_COPY_FILE_RANGE = 4100,
++
+ 	/* CUSE specific operations */
+ 	CUSE_INIT		= 4096,
+ 
+@@ -656,6 +669,7 @@ enum fuse_notify_code {
+ 	FUSE_NOTIFY_DELETE = 6,
+ 	FUSE_NOTIFY_RESEND = 7,
+ 	FUSE_NOTIFY_CODE_MAX,
++	FUSE_NOTIFY_PFS_SIZE = 10,
+ };
+ 
+ /* The read buffer is required to be at least 8k, but may be much larger */
+@@ -825,6 +839,111 @@ struct fuse_write_out {
+ 	uint32_t	padding;
+ };
+ 
++/* Private PortableFS transactional shared-write phases. */
++#define FUSE_PFS_WRITE_BEGIN	1
++#define FUSE_PFS_WRITE_DATA	2
++#define FUSE_PFS_WRITE_COMMIT	3
++#define FUSE_PFS_WRITE_ABORT	4
++
++#define FUSE_PFS_WRITE_OUT_BEGUN	(1 << 0)
++#define FUSE_PFS_WRITE_OUT_STAGED	(1 << 1)
++#define FUSE_PFS_WRITE_OUT_COMMITTED	(1 << 2)
++#define FUSE_PFS_WRITE_OUT_ABORTED	(1 << 3)
++#define FUSE_PFS_WRITE_OUT_REJECTED	(1 << 4)
++#define FUSE_PFS_WRITE_OUT_POSTAPPLY_ERROR	(1 << 5)
++#define FUSE_PFS_WRITE_OUT_REJECTED_RLIMIT	(1 << 6)
++
++struct fuse_pfs_write_in {
++	uint64_t	fh;
++	uint64_t	txid;
++	uint64_t	requested_size;
++	uint64_t	fragment_offset;
++	uint64_t	position;
++	uint64_t	rlimit_fsize;
++	uint64_t	file_max_size;
++	uint64_t	lock_owner;
++	uint32_t	size;
++	uint32_t	write_flags;
++	uint32_t	flags;
++	uint32_t	phase;
++};
++
++struct fuse_pfs_write_out {
++	uint64_t	txid;
++	/* May be zero only for COMMITTED | POSTAPPLY_ERROR. */
++	uint64_t	committed_size;
++	/* Must be zero for a zero-byte POSTAPPLY_ERROR. */
++	uint64_t	assigned_offset;
++	uint64_t	post_size;
++	uint64_t	sequence;
++	uint32_t	flags;
++	int32_t		error;
++};
++
++/* Private PortableFS post-VFS publication handshake. */
++#define FUSE_PFS_PUBLISH_ACK	(1 << 0)
++
++struct fuse_pfs_publish_in {
++	uint64_t	request_unique;
++	uint64_t	publication_id;
++	uint64_t	nodeid;
++	uint32_t	opcode;
++	uint32_t	flags;
++};
++
++struct fuse_pfs_publish_out {
++	uint64_t	request_unique;
++	uint64_t	publication_id;
++	uint64_t	nodeid;
++	uint32_t	opcode;
++	uint32_t	flags;
++};
++
++/* Private PortableFS one-shot range-mutation result flags. */
++#define FUSE_PFS_RANGE_OUT_APPLIED		(1 << 0)
++#define FUSE_PFS_RANGE_OUT_REJECTED		(1 << 1)
++#define FUSE_PFS_RANGE_OUT_POSTAPPLY_ERROR	(1 << 2)
++#define FUSE_PFS_RANGE_OUT_REJECTED_RLIMIT	(1 << 3)
++#define FUSE_PFS_RANGE_OUT_NOOP			(1 << 4)
++
++struct fuse_pfs_fallocate_in {
++	uint64_t	fh;
++	uint64_t	offset;
++	uint64_t	length;
++	uint64_t	rlimit_fsize;
++	uint64_t	file_max_size;
++	uint32_t	mode;
++	uint32_t	write_flags;
++};
++
++struct fuse_pfs_copy_file_range_in {
++	uint64_t	fh_in;
++	uint64_t	off_in;
++	uint64_t	nodeid_out;
++	uint64_t	fh_out;
++	uint64_t	off_out;
++	uint64_t	len;
++	uint64_t	rlimit_fsize;
++	uint64_t	file_max_size;
++	uint32_t	write_flags;
++	uint32_t	flags;
++};
++
++struct fuse_pfs_range_out {
++	/* FALLOCATE uses zero; CFR's marked clean APPLIED uses a positive count. */
++	uint64_t	result_size;
++	/*
++	 * Exact post-operation EOF for APPLIED.  For the sole
++	 * FUSE_PFS_FALLOCATE REJECTED_RLIMIT shape this instead carries the
++	 * authoritative pre-operation EOF needed to prove a limit rejection.
++	 * It is zero for every other unmarked rejection and for NOOP.
++	 */
++	uint64_t	post_size;
++	uint64_t	sequence;
++	uint32_t	flags;
++	int32_t		error;
++};
++
+ #define FUSE_COMPAT_STATFS_SIZE 48
+ 
+ struct fuse_statfs_out {
+@@ -987,6 +1106,7 @@ struct fuse_fallocate_in {
+  * Indicates whether this is a resend request. The receiver should handle this
+  * request accordingly.
+  */
++#define FUSE_PFS_UNIQUE_PUBLISH (1ULL << 62)
+ #define FUSE_UNIQUE_RESEND (1ULL << 63)
+ 
+ /**
+@@ -1055,6 +1175,12 @@ struct fuse_notify_inval_inode_out {
+ 	int64_t		len;
+ };
+ 
++struct fuse_notify_pfs_size_out {
++	uint64_t	nodeid;
++	uint64_t	size;
++	uint64_t	sequence;
++};
++
+ struct fuse_notify_inval_entry_out {
+ 	uint64_t	parent;
+ 	uint32_t	namelen;
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index 6566ac986..dd821aead 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -593,12 +593,13 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
+ 		      struct fs_reply_publish_scope *publish_scope)
+ {
+ 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+-	u64 applied_bytes;
++	u64 applied_bytes = 0;
++	bool has_applied_bytes = publish_scope &&
++		fs_reply_publish_scope_get_applied_bytes(&applied_bytes) &&
++		applied_bytes;
+ 	unsigned final_ret = io_fixup_rw_res(req, ret);
+ 
+-	if ((ret >= 0 ||
+-	     (publish_scope &&
+-	      fs_reply_publish_scope_get_applied_bytes(&applied_bytes))) &&
++	if ((ret >= 0 || has_applied_bytes) &&
+ 	    req->flags & REQ_F_CUR_POS)
+ 		req->file->f_pos = rw->kiocb.ki_pos;
+ 	if (publish_scope) {
+@@ -606,15 +607,18 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
+ 
+ 		/*
+ 		 * A strict PortableFS transaction completes synchronously.  End
+-		 * write accounting and emit fsnotify before acknowledging the
+-		 * daemon's retained source gate, but before exposing the CQE.
++		 * write accounting and, when bytes applied, emit fsnotify before
++		 * acknowledging the daemon's retained source gate and exposing the
++		 * CQE.  A zero-byte post-apply attr mutation has no modify event.
+ 		 */
+ 		/* A committed private mutation is terminal for this SQE. */
+ 		if (unlikely(ret != req->cqe.res)) {
+ 			req_set_fail(req);
+ 			req->cqe.res = ret;
+ 		}
+-		io_req_io_end(req);
++		io_req_end_write(req);
++		if (ret > 0 || has_applied_bytes)
++			fsnotify_modify(req->file);
+ 		ret = fs_reply_publish_scope_finish(publish_scope, ret);
+ 		final_ret = io_fixup_rw_res(req, ret);
+ 		if (ret < 0) {
+@@ -1127,8 +1131,8 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
+ 	if (unlikely(!io_kiocb_start_write(req, kiocb)))
+ 		return -EAGAIN;
+ 	kiocb->ki_flags |= IOCB_WRITE;
+-	fs_reply_publish_scope_enter_write(&publish_scope,
+-				   file_inode(req->file)->i_sb);
++	fs_reply_publish_scope_enter_write_child(&publish_scope,
++					 file_inode(req->file)->i_sb);
+ 
+ 	if (likely(req->file->f_op->write_iter))
+ 		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 552df432c..a8e5df7a3 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3411,6 +3411,10 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 		swap_file = NULL;
+ 		goto bad_swap;
+ 	}
++	if (!file_can_back_independent_cache(swap_file)) {
++		error = -EOPNOTSUPP;
++		goto bad_swap;
++	}
+ 
+ 	si->swap_file = swap_file;
+ 	mapping = swap_file->f_mapping;
+-- 
+2.39.5
+

@@ -13,8 +13,8 @@
 set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository.
-# Evidence: golang:1.26.5-bookworm (matches the toolchain in vcs/go.mod).
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651}"
+# Evidence: golang:1.26.6-bookworm (matches the toolchain in vcs/go.mod).
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
 : "${PORTABLEFS_XFS_IMAGE_SIZE:=1G}"
 : "${PORTABLEFS_SERVICE_UID:=200001}"
 : "${PORTABLEFS_SERVICE_GID:=200001}"
@@ -61,8 +61,16 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUncachedProfileRemainsFullyCorrect"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost"
+  # The patched-kernel syscall surface must be exercised through real VFS
+  # syscalls. Unit calls into rawFileSystem do not prove kernel negotiation,
+  # transaction fragmentation, post-VFS publication, or stock/private opcode
+  # routing.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelLargeWriteTransactionsPreservePositionedAndAppendData"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelSharedFallocateMutations"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelSyncfsSucceeds"
   # Machine-local routing must be proven against the real kernel and the real
   # authority transport. Keep the zero-RPC tests here in particular: the
   # cross-process matrix proves two-machine isolation, but intentionally does
@@ -82,6 +90,17 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
 )
 
+# These boundaries require CAP_SYS_ADMIN and therefore cannot run under the
+# capability-free identity used for the POSIX/DAC suite above. They still run
+# in the same throwaway container, as the same production uid against the same
+# authority/frontend code and provisioned XFS volume. The process receives
+# SYS_ADMIN for the admission calls and DAC_OVERRIDE solely to open the
+# root-owned loop control devices. Keeping an exact required list prevents a missing
+# module, renamed test, or accidental skip from masquerading as qualification.
+REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelRefusesStackingExportAndLoopBacking"
+)
+
 fail() {
   echo "xfs-fuse-integration: $1" >&2
   exit "${2:-1}"
@@ -95,6 +114,10 @@ run_host() {
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
+  local -a host_kernel_mounts=()
+  if [[ -d /lib/modules/$(uname -r) ]]; then
+    host_kernel_mounts=(-v /lib/modules:/lib/modules:ro)
+  fi
   echo "xfs-fuse-integration: launching ${PORTABLEFS_CI_IMAGE}"
   # The working tree is mounted read-only: the container provisions its own XFS
   # image and must never be able to mutate the checkout it is testing.
@@ -102,12 +125,15 @@ run_host() {
     --tmpfs /var/tmp:exec,mode=1777 \
     -v "${root}/vcs:/work/vcs:ro" \
     -v "${root}/scripts:/work/scripts:ro" \
+    -v "${root}/kernel/linux-6.12.100-portablefs-append:/work/kernel/linux-6.12.100-portablefs-append:ro" \
+    "${host_kernel_mounts[@]}" \
     -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
     -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
     -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
     -e "PORTABLEFS_PROJECT_ID=${PORTABLEFS_PROJECT_ID}" \
     -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
     -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
+	-e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
     -w /work \
     "${PORTABLEFS_CI_IMAGE}" \
     bash /work/scripts/xfs-fuse-integration.sh --in-container
@@ -118,7 +144,7 @@ install_container_dependencies() {
   apt-get update -qq
   # xfsprogs: mkfs.xfs and xfs_quota. fuse3: the setuid fusermount3 helper the
   # unprivileged test process needs. sqlite3/git: the real application workload.
-  apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux >/dev/null
+  apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux kmod >/dev/null
 }
 
 provision_xfs() {
@@ -180,6 +206,7 @@ run_suite() {
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
+	PORTABLEFS_FUSE_DEBUG="${PORTABLEFS_FUSE_DEBUG:-}" \
     go -C /work/vcs test -v -count=1 -p 1 -timeout 25m "${extra_go_test_flags[@]}" \
     ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... \
     >"$log" 2>&1
@@ -190,12 +217,60 @@ run_suite() {
   verify_required_tests "$log"
 }
 
+run_root_boundary_suite() {
+  local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
+  local log=/var/tmp/portablefs-root-boundary.log
+  local status=0
+  # Load the only optional module before dropping to the production uid.  The
+  # test process then receives CAP_SYS_ADMIN plus DAC_OVERRIDE for the
+  # root-owned loop device nodes, and no broader root identity. It can exercise
+  # mount/backend admission while xfsstore continues to prove the exact service
+  # owner on every private ancestor.
+  modprobe overlay
+  modprobe loop
+  set +e
+  setpriv \
+    --reuid="$PORTABLEFS_SERVICE_UID" \
+    --regid="$PORTABLEFS_SERVICE_GID" \
+    --clear-groups \
+    --inh-caps=+sys_admin,+dac_override \
+    --ambient-caps=+sys_admin,+dac_override \
+    env -i \
+    HOME=/home/portablefs \
+    PATH=/usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TMPDIR=/var/tmp \
+    GOCACHE=/var/tmp/portablefs-root-gocache \
+    GOMODCACHE=/home/portablefs/gomodcache \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=readonly \
+    PORTABLEFS_XFS_TEST_ROOT="$volume" \
+    PORTABLEFS_XFS_TEST_PROJECT="$PORTABLEFS_PROJECT_ID" \
+    PORTABLEFS_FUSE_TEST=1 \
+    PORTABLEFS_STRICT_STACK_TEST_SCRIPT=/work/kernel/linux-6.12.100-portablefs-append/tests/test_strict_stacking.py \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
+    -run '^TestStrictKernelRefusesStackingExportAndLoopBacking$' \
+    ./internal/fusev3/... >"$log" 2>&1
+  status=$?
+  set -e
+  cat -- "$log"
+  [[ $status -eq 0 ]] || fail "root kernel-boundary test exited $status" "$status"
+  verify_exact_tests "$log" "${REQUIRED_ROOT_TESTS[@]}"
+  echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
+}
+
 # go test reports a skipped test as "--- SKIP" and a passing one as "--- PASS".
 # Matching the exact package/test pairs catches a renamed, deleted, or silently
 # skipped privileged test, which a plain exit code cannot.
 verify_required_tests() {
+  local log=$1
+  verify_exact_tests "$log" "${REQUIRED_TESTS[@]}"
+  echo "xfs-fuse-integration: all ${#REQUIRED_TESTS[@]} required privileged tests passed"
+}
+
+verify_exact_tests() {
   local log=$1 entry package name missing=0
-  for entry in "${REQUIRED_TESTS[@]}"; do
+  shift
+  for entry in "$@"; do
     package=${entry%%:*}
     name=${entry##*:}
     if ! grep -Fq -- "--- PASS: ${name} (" "$log"; then
@@ -204,7 +279,6 @@ verify_required_tests() {
     fi
   done
   [[ $missing -eq 0 ]] || fail "required privileged tests did not run to a PASS" 70
-  echo "xfs-fuse-integration: all ${#REQUIRED_TESTS[@]} required privileged tests passed"
 }
 
 run_container() {
@@ -214,6 +288,7 @@ run_container() {
   provision_xfs
   provision_volume
   run_suite
+  run_root_boundary_suite
 }
 
 case "${1:-}" in

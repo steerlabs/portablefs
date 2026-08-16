@@ -3,15 +3,18 @@
 package xfsstore
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -68,7 +71,7 @@ func TestOpenAfterUnlinkUsesRetainedFD(t *testing.T) {
 	}
 }
 
-func TestAppendHandleRequiresAppendIntent(t *testing.T) {
+func TestPinnedAppendIsPerCallAndSurvivesHandleClose(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
 	item, _, err := v.Create(root, "append", 0o600, true)
@@ -79,12 +82,955 @@ func TestAppendHandleRequiresAppendIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer v.CloseOpen(handle)
-	if _, err := v.WriteAt(handle, []byte("wrong-intent"), 0); !errors.Is(err, fs.ErrInvalid) {
-		t.Fatalf("WriteAt on append handle = %v, want invalid intent", err)
+	// OPEN-time append intent never makes the authority descriptor sticky.
+	if n, err := v.WriteAt(handle, []byte("p"), 0); n != 1 || err != nil {
+		t.Fatalf("positional write on append-intent handle = (%d, %v)", n, err)
 	}
-	if n, off, err := v.Append(handle, []byte("ok")); n != 2 || off != 0 || err != nil {
-		t.Fatalf("Append = (%d, %d, %v)", n, off, err)
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.CloseOpen(handle); err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	data := []byte("ayload")
+	committed, assigned, post, err := target.CommitWrite(bytes.NewReader(data), WriteCommit{RequestedSize: uint64(len(data)), RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 3))
+	if err != nil || committed != uint64(len(data)) || assigned != 1 || post.Size != int64(1+len(data)) {
+		t.Fatalf("CommitWrite = (%d,%d,%+v,%v)", committed, assigned, post, err)
+	}
+	reader, err := v.OpenFile(item, OpenFlags{Read: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(reader)
+	got := make([]byte, post.Size)
+	if n, err := v.ReadAt(reader, got, 0); err != nil || int64(n) != post.Size || string(got) != "payload" {
+		t.Fatalf("post append = %q n=%d err=%v", got, n, err)
+	}
+}
+
+func TestOpenSyncIntentIsLogicalNotSticky(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		flags    OpenFlags
+		wantSync bool
+		wantData bool
+	}{
+		{name: "sync", flags: OpenFlags{Write: true, Sync: true}, wantSync: true},
+		{name: "datasync", flags: OpenFlags{Write: true, DataSync: true}, wantData: true},
+		{name: "sync-wins", flags: OpenFlags{Write: true, Sync: true, DataSync: true}, wantSync: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			v := openTestVolume(t)
+			root, _ := v.Root()
+			item, _, err := v.Create(root, "logical-sync", 0o600, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := v.OpenFile(item, test.flags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer v.CloseOpen(handle)
+			file, err := v.holdOpen(handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.release()
+			gotFlags, err := unix.FcntlInt(uintptr(file.fd()), unix.F_GETFL, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotFlags&(unix.O_SYNC|unix.O_DSYNC) != 0 {
+				t.Fatalf("retained fd flags = %#x, want no sticky sync bits", gotFlags)
+			}
+			if file.sync != test.wantSync || file.dataSync != test.wantData {
+				t.Fatalf("logical sync = (%v,%v), want (%v,%v)", file.sync, file.dataSync, test.wantSync, test.wantData)
+			}
+		})
+	}
+}
+
+func TestCommitWriteSyncsOnceAfterAllFragments(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		commit   WriteCommit
+		wantFull int
+		wantData int
+	}{
+		{name: "sync", commit: WriteCommit{Sync: true}, wantFull: 1},
+		{name: "datasync", commit: WriteCommit{DataSync: true}, wantData: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			v := openTestVolume(t)
+			root, _ := v.Root()
+			item, _, err := v.Create(root, "aggregate-sync", 0o600, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := v.OpenFile(item, OpenFlags{Write: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := v.PinWriteTarget(handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer target.Close()
+			var writes, fullSyncs, dataSyncs int
+			pwrite := v.pwrite
+			v.pwrite = func(fd int, data []byte, offset int64) (int, error) {
+				writes++
+				return pwrite(fd, data, offset)
+			}
+			v.fsync = func(int) error { fullSyncs++; return nil }
+			v.fdatasync = func(int) error { dataSyncs++; return nil }
+			data := []byte("eightbyt")
+			test.commit.RequestedSize = uint64(len(data))
+			test.commit.RLimitSize = math.MaxUint64
+			test.commit.FileMaxSize = math.MaxInt64
+			test.commit.Mode = WritePositioned
+			committed, _, _, err := target.CommitWrite(bytes.NewReader(data), test.commit, make([]byte, 2))
+			if err != nil || committed != uint64(len(data)) {
+				t.Fatalf("CommitWrite = (%d,%v)", committed, err)
+			}
+			if writes != 4 || fullSyncs != test.wantFull || dataSyncs != test.wantData {
+				t.Fatalf("calls = writes:%d fsync:%d fdatasync:%d, want 4/%d/%d", writes, fullSyncs, dataSyncs, test.wantFull, test.wantData)
+			}
+		})
+	}
+}
+
+func TestCommitWritePrivilegeFailureStillAttemptsAndJoinsLogicalSync(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "aggregate-sync-after-killpriv", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	defer v.CloseOpen(handle)
+
+	var privilegeCalls, syncCalls int
+	v.removeWritePrivileges = func(int, uint32, bool) error {
+		privilegeCalls++
+		return errors.Join(ErrWritePrivilege, syscall.EPERM)
+	}
+	v.fsync = func(int) error {
+		syncCalls++
+		return syscall.EIO
+	}
+	committed, assigned, post, err := target.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+		Mode: WritePositioned, Sync: true, KillPrivileges: true,
+	}, make([]byte, 1))
+	if committed != 1 || assigned != 0 || post.Size != 1 || privilegeCalls != 1 || syncCalls != 1 ||
+		!errors.Is(err, ErrWritePostApply) || !errors.Is(err, ErrWritePrivilege) ||
+		!errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("CommitWrite = (%d,%d,%+v,%v), privilege=%d sync=%d", committed, assigned, post, err, privilegeCalls, syncCalls)
+	}
+}
+
+func TestAbsentFileCapabilityNeedsNoPrivilegedRemoval(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "no-file-capability-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := removeWritePrivileges(int(file.Fd()), 0o600, false); err != nil {
+		t.Fatalf("ordinary unprivileged file was treated as a failed capability removal: %v", err)
+	}
+}
+
+func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
+	t.Run("fallocate-post-sync-error", func(t *testing.T) {
+		v := openTestVolume(t)
+		root, _ := v.Root()
+		item, _, err := v.Create(root, "sync-fallocate", 0o600, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle, err := v.OpenFile(item, OpenFlags{Write: true, Sync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(handle)
+		v.fallocate = func(int, uint32, int64, int64) error { return nil }
+		var syncs int
+		v.fsync = func(int) error { syncs++; return syscall.EIO }
+		post, err := v.Fallocate(handle, FallocateSpec{
+			Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE),
+		})
+		if syncs != 1 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
+		}
+	})
+
+	t.Run("fallocate-killpriv-failure-still-syncs-and-backend-error-does-not", func(t *testing.T) {
+		v := openTestVolume(t)
+		root, _ := v.Root()
+		item, _, err := v.Create(root, "sync-fallocate-killpriv", 0o600, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle, err := v.OpenFile(item, OpenFlags{Write: true, Sync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(handle)
+		v.fallocate = func(int, uint32, int64, int64) error { return nil }
+		v.removeWritePrivileges = func(int, uint32, bool) error {
+			return errors.Join(ErrWritePrivilege, syscall.EPERM)
+		}
+		var syncs int
+		v.fsync = func(int) error { syncs++; return syscall.EIO }
+		post, err := v.Fallocate(handle, FallocateSpec{
+			Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE), KillPrivileges: true,
+		})
+		if syncs != 1 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) ||
+			!errors.Is(err, ErrWritePrivilege) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("clean Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
+		}
+
+		syncs = 0
+		v.fallocate = func(int, uint32, int64, int64) error { return syscall.ENOSPC }
+		v.removeWritePrivileges = removeWritePrivileges
+		post, err = v.Fallocate(handle, FallocateSpec{
+			Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE),
+		})
+		if syncs != 0 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+			t.Fatalf("failed Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
+		}
+	})
+
+	t.Run("source-datasync-forces-destination", func(t *testing.T) {
+		v := openTestVolume(t)
+		root, _ := v.Root()
+		sourceItem, _, err := v.Create(root, "sync-copy-source", 0o600, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := v.OpenFile(sourceItem, OpenFlags{Read: true, Write: true, DataSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(source)
+		if n, err := v.WriteAt(source, []byte("x"), 0); n != 1 || err != nil {
+			t.Fatalf("seed source = (%d,%v)", n, err)
+		}
+		destinationItem, _, err := v.Create(root, "sync-copy-destination", 0o600, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		destination, err := v.OpenFile(destinationItem, OpenFlags{Write: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(destination)
+		v.copyFileRange = func(input int, inputOffset *int64, output int, outputOffset *int64, length, flags int) (int, error) {
+			buf := make([]byte, length)
+			n, err := unix.Pread(input, buf, *inputOffset)
+			if err != nil {
+				return n, err
+			}
+			n, err = unix.Pwrite(output, buf[:n], *outputOffset)
+			*inputOffset += int64(n)
+			*outputOffset += int64(n)
+			return n, err
+		}
+		var dataSyncs int
+		v.fdatasync = func(int) error { dataSyncs++; return syscall.EIO }
+		v.removeWritePrivileges = func(int, uint32, bool) error {
+			return errors.Join(ErrWritePrivilege, syscall.EPERM)
+		}
+		copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+			Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, KillPrivileges: true,
+		})
+		if copied != 1 || post.Size != 1 || dataSyncs != 1 || !errors.Is(err, ErrWritePostApply) ||
+			!errors.Is(err, ErrWritePrivilege) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("CopyFileRange = (%d,%+v,%v), fdatasyncs=%d", copied, post, err, dataSyncs)
+		}
+
+		dataSyncs = 0
+		v.removeWritePrivileges = removeWritePrivileges
+		v.copyFileRange = func(int, *int64, int, *int64, int, int) (int, error) {
+			return -1, syscall.ENOSPC
+		}
+		copied, post, err = v.CopyFileRange(source, destination, CopyFileRangeSpec{
+			Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+		})
+		if copied != 0 || post.Size != 1 || dataSyncs != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+			t.Fatalf("failed CopyFileRange = (%d,%+v,%v), fdatasyncs=%d", copied, post, err, dataSyncs)
+		}
+	})
+}
+
+func TestCommitWriteZeroByteBackendErrorPublishesExactMetadataState(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "zero-write-postapply", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := v.CloseOpen(handle); err != nil {
+		t.Fatal(err)
+	}
+	realPwrite := v.pwrite
+	v.pwrite = func(fd int, _ []byte, _ int64) (int, error) {
+		if err := unix.Fchmod(fd, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		return 0, syscall.ENOSPC
+	}
+	t.Cleanup(func() { v.pwrite = realPwrite })
+	committed, assigned, post, err := target.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}, make([]byte, 1))
+	if committed != 0 || assigned != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("zero-byte CommitWrite = (%d, %d, %+v, %v), want exact postapply ENOSPC", committed, assigned, post, err)
+	}
+	if post.Kind != KindRegular || post.Size != 0 || post.Mode.Perm() != 0o640 {
+		t.Fatalf("zero-byte CommitWrite post attr = %+v", post)
+	}
+}
+
+func TestCommitWriteZeroByteBackendErrorWithLostPostStatIsUncertain(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "zero-write-unknown", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := v.CloseOpen(handle); err != nil {
+		t.Fatal(err)
+	}
+	v.pwrite = func(int, []byte, int64) (int, error) { return 0, syscall.ENOSPC }
+	v.postStat = func(int) (Attr, error) { return Attr{}, syscall.EIO }
+	committed, _, post, err := target.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}, make([]byte, 1))
+	if committed != 0 || post != (Attr{}) || !errors.Is(err, ErrOutcomeUncertain) || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("zero-byte CommitWrite lost post-stat = (%d, %+v, %v), want uncertain EIO", committed, post, err)
+	}
+}
+
+func TestFallocateUsesActualEOFAndPreservesKeepSize(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "fallocate", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	post, err := v.Fallocate(handle, FallocateSpec{
+		Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	})
+	if err != nil || post.Size != 4096 {
+		t.Fatalf("allocating fallocate = (size %d, %v), want 4096", post.Size, err)
+	}
+	post, err = v.Fallocate(handle, FallocateSpec{
+		Offset: 8192, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+		Mode: uint32(unix.FALLOC_FL_KEEP_SIZE),
+	})
+	if err != nil || post.Size != 4096 {
+		t.Fatalf("KEEP_SIZE fallocate = (size %d, %v), want unchanged 4096", post.Size, err)
+	}
+	post, err = v.Fallocate(handle, FallocateSpec{
+		Offset: 4096, Length: 1, RLimitSize: 4096, FileMaxSize: math.MaxInt64,
+	})
+	var limit *WriteLimitError
+	if !errors.As(err, &limit) || !limit.RLimit {
+		t.Fatalf("RLIMIT fallocate = %v, want typed RLIMIT refusal", err)
+	}
+	if fresh, statErr := v.GetattrOpen(handle); statErr != nil || fresh.Size != 4096 || post.Kind != KindRegular || post.Size != fresh.Size {
+		t.Fatalf("post-refusal state = (%+v, returned %+v, %v), want exact unchanged pre-size proof", fresh, post, statErr)
+	}
+}
+
+func TestFallocateFullModeExpectedSizeAndLimitPrecedence(t *testing.T) {
+	const unlimited = uint64(math.MaxInt64)
+	tests := []struct {
+		name string
+		spec FallocateSpec
+		want uint64
+	}{
+		{name: "allocate within EOF", spec: FallocateSpec{Offset: 10, Length: 20, RLimitSize: math.MaxUint64, FileMaxSize: unlimited}, want: 100},
+		{name: "allocate grows", spec: FallocateSpec{Offset: 90, Length: 20, RLimitSize: math.MaxUint64, FileMaxSize: unlimited}, want: 110},
+		{name: "keep", spec: FallocateSpec{Offset: 90, Length: 20, RLimitSize: 1, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_KEEP_SIZE)}, want: 100},
+		{name: "punch", spec: FallocateSpec{Offset: 10, Length: 20, RLimitSize: 1, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE)}, want: 100},
+		{name: "zero grows", spec: FallocateSpec{Offset: 90, Length: 20, RLimitSize: math.MaxUint64, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_ZERO_RANGE)}, want: 110},
+		{name: "zero keep", spec: FallocateSpec{Offset: 90, Length: 20, RLimitSize: 1, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_ZERO_RANGE | unix.FALLOC_FL_KEEP_SIZE)}, want: 100},
+		{name: "collapse", spec: FallocateSpec{Offset: 20, Length: 10, RLimitSize: 1, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_COLLAPSE_RANGE)}, want: 90},
+		{name: "insert", spec: FallocateSpec{Offset: 20, Length: 10, RLimitSize: math.MaxUint64, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_INSERT_RANGE)}, want: 110},
+		{name: "unshare grows", spec: FallocateSpec{Offset: 90, Length: 20, RLimitSize: math.MaxUint64, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_UNSHARE_RANGE)}, want: 110},
+		{name: "unshare keep", spec: FallocateSpec{Offset: 90, Length: 20, RLimitSize: 1, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_UNSHARE_RANGE | unix.FALLOC_FL_KEEP_SIZE)}, want: 100},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := fallocateExpectedSize(100, tc.spec)
+			if err != nil || got != tc.want {
+				t.Fatalf("fallocateExpectedSize = (%d, %v), want (%d, nil)", got, err, tc.want)
+			}
+		})
+	}
+
+	t.Run("collapse may not meet EOF", func(t *testing.T) {
+		_, err := fallocateExpectedSize(100, FallocateSpec{Offset: 90, Length: 10, RLimitSize: math.MaxUint64, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_COLLAPSE_RANGE)})
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("collapse error = %v, want EINVAL", err)
+		}
+	})
+	t.Run("insert file maximum precedes offset", func(t *testing.T) {
+		_, err := fallocateExpectedSize(100, FallocateSpec{Offset: 100, Length: 10, RLimitSize: 1, FileMaxSize: 105, Mode: uint32(unix.FALLOC_FL_INSERT_RANGE)})
+		var limit *WriteLimitError
+		if !errors.As(err, &limit) || limit.RLimit {
+			t.Fatalf("insert error = %v, want filesystem limit", err)
+		}
+	})
+	t.Run("insert offset precedes rlimit", func(t *testing.T) {
+		_, err := fallocateExpectedSize(100, FallocateSpec{Offset: 100, Length: 10, RLimitSize: 1, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_INSERT_RANGE)})
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("insert error = %v, want EINVAL", err)
+		}
+	})
+	t.Run("insert authoritative EOF proves rlimit", func(t *testing.T) {
+		_, err := fallocateExpectedSize(100, FallocateSpec{Offset: 20, Length: 10, RLimitSize: 109, FileMaxSize: unlimited, Mode: uint32(unix.FALLOC_FL_INSERT_RANGE)})
+		var limit *WriteLimitError
+		if !errors.As(err, &limit) || !limit.RLimit {
+			t.Fatalf("insert error = %v, want RLIMIT", err)
+		}
+	})
+}
+
+func TestXFSFallocateGeometryABI(t *testing.T) {
+	if got := unsafe.Sizeof(xfsFSGeometryV1{}); got != 112 {
+		t.Fatalf("xfs_fsop_geom_v1 size = %d, want 112", got)
+	}
+	if !fallocateNeedsAlignment(uint32(unix.FALLOC_FL_COLLAPSE_RANGE)) ||
+		!fallocateNeedsAlignment(uint32(unix.FALLOC_FL_INSERT_RANGE)) || fallocateNeedsAlignment(0) {
+		t.Fatal("collapse/insert alignment classification is not exact")
+	}
+}
+
+func TestFallocateGeometryQueryFailureIsDefiniteBeforeDispatch(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "geometry-refusal", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+
+	queryErr := errors.New("geometry unavailable")
+	v.fallocateAllocationUnit = func(int) (uint64, error) { return 0, queryErr }
+	dispatched := 0
+	v.fallocate = func(int, uint32, int64, int64) error {
+		dispatched++
+		return nil
+	}
+	post, err := v.Fallocate(handle, FallocateSpec{
+		Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+		Mode: uint32(unix.FALLOC_FL_COLLAPSE_RANGE),
+	})
+	if !errors.Is(err, queryErr) || errors.Is(err, ErrOutcomeUncertain) || errors.Is(err, ErrWritePostApply) {
+		t.Fatalf("Fallocate geometry error = %v, want definite query refusal", err)
+	}
+	if dispatched != 0 || post != (Attr{}) {
+		t.Fatalf("Fallocate geometry refusal = (post=%+v, dispatched=%d), want no state and no syscall", post, dispatched)
+	}
+}
+
+func TestFallocateSyscallErrorPublishesExactPartialMutation(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "partial-fallocate", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	if n, err := v.WriteAt(handle, []byte("abcdef"), 0); n != 6 || err != nil {
+		t.Fatalf("seed = (%d, %v)", n, err)
+	}
+
+	realFallocate := v.fallocate
+	v.fallocate = func(fd int, _ uint32, _ int64, _ int64) error {
+		if n, err := unix.Pwrite(fd, []byte{'X'}, 1); n != 1 || err != nil {
+			t.Fatalf("partial mutation = (%d, %v)", n, err)
+		}
+		return syscall.ENOSPC
+	}
+	t.Cleanup(func() { v.fallocate = realFallocate })
+	post, err := v.Fallocate(handle, FallocateSpec{
+		Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	})
+	if !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) || errors.Is(err, ErrOutcomeUncertain) {
+		t.Fatalf("Fallocate error = %v, want exact post-apply ENOSPC", err)
+	}
+	if post.Kind != KindRegular || post.Size != 6 {
+		t.Fatalf("post attr = %+v, want exact unchanged EOF 6", post)
+	}
+	got := make([]byte, 6)
+	if n, readErr := v.ReadAt(handle, got, 0); n != 6 || readErr != nil || string(got) != "aXcdef" {
+		t.Fatalf("partially mutated data = %q (%d, %v)", got, n, readErr)
+	}
+}
+
+func TestCopyFileRangeUsesAuthoritativeSourceEOFAndExactDestinationSize(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	sourceItem, _, err := v.Create(root, "copy-source", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := v.OpenFile(sourceItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(source)
+	if n, err := v.WriteAt(source, []byte("abcdef"), 0); n != 6 || err != nil {
+		t.Fatalf("seed source = (%d, %v)", n, err)
+	}
+	destinationItem, _, err := v.Create(root, "copy-destination", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := v.OpenFile(destinationItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(destination)
+	copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		Length: 6, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	})
+	if err != nil || copied != 6 || post.Size != 6 {
+		t.Fatalf("CopyFileRange = (%d, size %d, %v), want 6", copied, post.Size, err)
+	}
+	got := make([]byte, 6)
+	if n, err := v.ReadAt(destination, got, 0); n != 6 || err != nil || string(got) != "abcdef" {
+		t.Fatalf("copied bytes = %q (%d, %v)", got, n, err)
+	}
+	if copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		InputOffset: 6, OutputOffset: 12, Length: 4, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	}); copied != 0 || err != nil || post != (Attr{}) {
+		t.Fatalf("source EOF copy = (%d, %+v, %v), want exact no-op", copied, post, err)
+	}
+}
+
+func TestCopyFileRangeZeroByteBackendErrorPublishesExactMetadataState(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	sourceItem, _, err := v.Create(root, "zero-copy-source", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := v.OpenFile(sourceItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(source)
+	if n, err := v.WriteAt(source, []byte("x"), 0); n != 1 || err != nil {
+		t.Fatal(n, err)
+	}
+	destinationItem, _, err := v.Create(root, "zero-copy-destination", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := v.OpenFile(destinationItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(destination)
+	realCopy := v.copyFileRange
+	v.copyFileRange = func(_ int, _ *int64, output int, _ *int64, _ int, _ int) (int, error) {
+		if err := unix.Fchmod(output, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		return 0, syscall.ENOSPC
+	}
+	t.Cleanup(func() { v.copyFileRange = realCopy })
+	copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	})
+	if copied != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("zero-byte CopyFileRange = (%d, %+v, %v), want exact postapply ENOSPC", copied, post, err)
+	}
+	if post.Kind != KindRegular || post.Size != 0 || post.Mode.Perm() != 0o640 {
+		t.Fatalf("zero-byte CopyFileRange post attr = %+v", post)
+	}
+}
+
+func TestCopyFileRangeCanonicalizesRawLinuxNegativeOneError(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	sourceItem, _, err := v.Create(root, "negative-copy-source", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := v.OpenFile(sourceItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(source)
+	if n, err := v.WriteAt(source, []byte("x"), 0); n != 1 || err != nil {
+		t.Fatal(n, err)
+	}
+	destinationItem, _, err := v.Create(root, "negative-copy-destination", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := v.OpenFile(destinationItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(destination)
+	v.copyFileRange = func(_ int, _ *int64, output int, _ *int64, _ int, _ int) (int, error) {
+		if err := unix.Fchmod(output, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		return -1, syscall.ENOSPC
+	}
+	copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	})
+	if copied != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) || errors.Is(err, ErrOutcomeUncertain) {
+		t.Fatalf("raw -1 CopyFileRange = (%d, %+v, %v), want exact zero-byte postapply ENOSPC", copied, post, err)
+	}
+	if post.Kind != KindRegular || post.Size != 0 || post.Mode.Perm() != 0o640 {
+		t.Fatalf("raw -1 CopyFileRange post attr = %+v", post)
+	}
+}
+
+func TestCopyFileRangeRLimitConstrainsOverwriteBelowExistingEOF(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	sourceItem, _, err := v.Create(root, "limit-source", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := v.OpenFile(sourceItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(source)
+	if n, err := v.WriteAt(source, []byte("abcdefghij"), 0); n != 10 || err != nil {
+		t.Fatal(n, err)
+	}
+	destinationItem, _, err := v.Create(root, "limit-destination", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := v.OpenFile(destinationItem, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(destination)
+	if n, err := v.WriteAt(destination, bytes.Repeat([]byte{'x'}, 32), 0); n != 32 || err != nil {
+		t.Fatal(n, err)
+	}
+	if copied, _, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		OutputOffset: 9, Length: 1, RLimitSize: 8, FileMaxSize: math.MaxInt64,
+	}); copied != 0 {
+		t.Fatalf("copy above RLIMIT applied %d bytes", copied)
+	} else {
+		var limit *WriteLimitError
+		if !errors.As(err, &limit) || !limit.RLimit {
+			t.Fatalf("copy above existing EOF-independent RLIMIT = %v, want typed RLIMIT refusal", err)
+		}
+	}
+	copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		OutputOffset: 6, Length: 4, RLimitSize: 8, FileMaxSize: math.MaxInt64,
+	})
+	if copied != 2 || err != nil || post.Size != 32 {
+		t.Fatalf("copy crossing RLIMIT = (%d, size %d, %v), want short 2 and unchanged EOF", copied, post.Size, err)
+	}
+}
+
+func TestCopyFileRangeChecksOutputCeilingsBeforeSourceEOFNoop(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	sourceItem, _, err := v.Create(root, "empty-limit-source", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := v.OpenFile(sourceItem, OpenFlags{Read: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(source)
+	destinationItem, _, err := v.Create(root, "empty-limit-destination", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := v.OpenFile(destinationItem, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(destination)
+
+	for _, test := range []struct {
+		name       string
+		offset     uint64
+		rlimit     uint64
+		fileMax    uint64
+		wantLimit  bool
+		wantRLimit bool
+	}{
+		{name: "below both", offset: 7, rlimit: 8, fileMax: 9},
+		{name: "at rlimit", offset: 8, rlimit: 8, fileMax: 9, wantLimit: true, wantRLimit: true},
+		{name: "rlimit precedes file max", offset: 9, rlimit: 8, fileMax: 9, wantLimit: true, wantRLimit: true},
+		{name: "at file max", offset: 9, rlimit: math.MaxUint64, fileMax: 9, wantLimit: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
+				OutputOffset: test.offset,
+				Length:       1,
+				RLimitSize:   test.rlimit,
+				FileMaxSize:  test.fileMax,
+			})
+			if copied != 0 || post != (Attr{}) {
+				t.Fatalf("CopyFileRange = (%d, %+v, %v), want zero result", copied, post, err)
+			}
+			var limit *WriteLimitError
+			if errors.As(err, &limit) != test.wantLimit {
+				t.Fatalf("limit error = %v, wantLimit=%t", err, test.wantLimit)
+			}
+			if test.wantLimit && limit.RLimit != test.wantRLimit {
+				t.Fatalf("RLIMIT classification = %t, want %t", limit.RLimit, test.wantRLimit)
+			}
+			if !test.wantLimit && err != nil {
+				t.Fatalf("source-EOF copy below ceilings = %v, want no-op", err)
+			}
+		})
+	}
+}
+
+func TestSameInodeCopyOverlapUsesEOFClippedLength(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "same-copy", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	if n, err := v.WriteAt(handle, []byte("abcdef"), 0); n != 6 || err != nil {
+		t.Fatal(n, err)
+	}
+	// Requested ranges overlap, but clipping input [4,14) to EOF produces
+	// [4,6), which is disjoint from output [8,10). This must not be rejected.
+	copied, post, err := v.CopyFileRange(handle, handle, CopyFileRangeSpec{
+		InputOffset: 4, OutputOffset: 8, Length: 10, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	})
+	if err != nil || copied != 2 || post.Size != 10 {
+		t.Fatalf("EOF-clipped nonoverlap = (%d, size %d, %v), want 2/10", copied, post.Size, err)
+	}
+	if _, _, err := v.CopyFileRange(handle, handle, CopyFileRangeSpec{
+		InputOffset: 0, OutputOffset: 2, Length: 4, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+	}); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("true same-inode overlap = %v, want EINVAL", err)
+	}
+}
+
+func TestCanonicalCopyLocksCannotDeadlockReverseDirections(t *testing.T) {
+	v := openTestVolume(t)
+	left, right := [16]byte{1}, [16]byte{2}
+	done := make(chan struct{}, 2)
+	start := make(chan struct{})
+	for _, pair := range [][2][16]byte{{left, right}, {right, left}} {
+		go func(source, destination [16]byte) {
+			<-start
+			for range 1000 {
+				unlock := lockCopyMutation(v, source, destination)
+				unlock()
+			}
+			done <- struct{}{}
+		}(pair[0], pair[1])
+	}
+	close(start)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for range 2 {
+		select {
+		case <-done:
+		case <-deadline.C:
+			t.Fatal("reverse-direction canonical copy locks deadlocked")
+		}
+	}
+}
+
+func TestWriteTransactionRLimitUsesRawLinuxEncoding(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "rlimit", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = v.CloseOpen(handle) })
+
+	zero, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, _, _, err := zero.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+		RequestedSize: 1, RLimitSize: 0, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}, make([]byte, 1))
+	_ = zero.Close()
+	var limit *WriteLimitError
+	if committed != 0 || !errors.As(err, &limit) || !limit.RLimit {
+		t.Fatalf("finite zero RLIMIT = committed %d, err %v; want RLIMIT EFBIG", committed, err)
+	}
+
+	unlimited, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, assigned, post, err := unlimited.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}, make([]byte, 1))
+	_ = unlimited.Close()
+	if err != nil || committed != 1 || assigned != 0 || post.Size != 1 {
+		t.Fatalf("RLIM_INFINITY write = (%d, %d, size %d, %v)", committed, assigned, post.Size, err)
+	}
+}
+
+func TestWriteTransactionReturnsPositivePrefixAtLimits(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		rlimit    uint64
+		fileLimit uint64
+	}{
+		{name: "rlimit", rlimit: 2, fileLimit: 8},
+		{name: "file", rlimit: math.MaxUint64, fileLimit: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			v := openTestVolume(t)
+			root, _ := v.Root()
+			item, _, err := v.Create(root, "partial", 0o600, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := v.OpenFile(item, OpenFlags{Write: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = v.CloseOpen(handle) })
+			target, err := v.PinWriteTarget(handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer target.Close()
+			committed, assigned, post, err := target.CommitWrite(bytes.NewReader([]byte("abcd")), WriteCommit{
+				RequestedSize: 4, RLimitSize: test.rlimit, FileMaxSize: test.fileLimit, Mode: WritePositioned,
+			}, make([]byte, 4))
+			var limit *WriteLimitError
+			if committed != 2 || assigned != 0 || post.Size != 2 || !errors.As(err, &limit) {
+				t.Fatalf("limit prefix = (%d, %d, size %d, %v), want positive prefix and typed limit", committed, assigned, post.Size, err)
+			}
+			if limit.RLimit != (test.name == "rlimit") {
+				t.Fatalf("limit kind = RLIMIT %v, want %v", limit.RLimit, test.name == "rlimit")
+			}
+		})
+	}
+}
+
+func TestPinnedAppendAcrossAliasesSerializesWholeTransactions(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "source", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Link(item, root, "alias"); err != nil {
+		t.Fatal(err)
+	}
+	alias, _, err := v.Lookup(root, "alias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Forget(alias)
+	first, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := v.OpenFile(alias, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(first)
+	defer v.CloseOpen(second)
+	left, err := v.PinWriteTarget(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := v.PinWriteTarget(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+	defer right.Close()
+	type result struct {
+		assigned uint64
+		err      error
+	}
+	results := make(chan result, 2)
+	for target, data := range map[WriteTarget]string{left: "aaa", right: "bbb"} {
+		go func(target WriteTarget, data string) {
+			_, assigned, _, err := target.CommitWrite(bytes.NewReader([]byte(data)), WriteCommit{RequestedSize: uint64(len(data)), RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 2))
+			results <- result{assigned: assigned, err: err}
+		}(target, data)
+	}
+	a, b := <-results, <-results
+	if a.err != nil || b.err != nil || a.assigned == b.assigned || a.assigned+b.assigned != 3 {
+		t.Fatalf("alias append results = %+v %+v", a, b)
 	}
 }
 
@@ -103,10 +1049,17 @@ func TestRenameKeepsObjectIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := v.WriteAt(handle, []byte("identity"), 0); err != nil {
+	t.Cleanup(func() { _ = v.CloseOpen(handle) })
+	coordinateBefore, err := v.CoordinateOpen(handle)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := v.CloseOpen(handle); err != nil {
+	if coordinateBefore.Stable != stableBefore || coordinateBefore.Ino != before.Ino ||
+		coordinateBefore.DeviceMajor != before.DeviceMajor || coordinateBefore.DeviceMinor != before.DeviceMinor {
+		t.Fatalf("retained open coordinate = %+v, want identity %x inode %d device %d:%d",
+			coordinateBefore, stableBefore, before.Ino, before.DeviceMajor, before.DeviceMinor)
+	}
+	if _, err := v.WriteAt(handle, []byte("identity"), 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := v.Chmod(item, 0o640); err != nil {
@@ -136,6 +1089,16 @@ func TestRenameKeepsObjectIdentity(t *testing.T) {
 	}
 	if stableAfter != stableBefore {
 		t.Fatalf("write/chmod/rename changed stable identity: %x -> %x", stableBefore, stableAfter)
+	}
+	coordinateAfter, err := v.CoordinateOpen(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coordinateAfter != coordinateBefore {
+		t.Fatalf("write/chmod/rename changed retained open coordinate: %+v -> %+v", coordinateBefore, coordinateAfter)
+	}
+	if err := v.CloseOpen(handle); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -995,6 +995,7 @@ public actor VolumeCore {
         }
     }
 
+    @discardableResult
     public func rename(
         item: PortableFSItem,
         from sourceDirectory: PortableFSItem,
@@ -1002,8 +1003,8 @@ public actor VolumeCore {
         to destinationDirectory: PortableFSItem,
         destinationName: Data,
         noReplace: Bool
-    ) async throws {
-        _ = try identity(for: item)
+    ) async throws -> Bool {
+        let sourceIdentity = try identity(for: item)
         var request = PfsRenameRequest()
         request.fromDir = try identity(for: sourceDirectory).proto
         request.fromName = sourceName
@@ -1011,9 +1012,22 @@ public actor VolumeCore {
         request.toName = destinationName
         request.noReplace = noReplace
         let envelope = try await client.request(.rename(request))
-        guard case .renameReply? = envelope.body else {
+        guard case let .renameReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
+        guard reply.newPostIdentity.count == 16,
+              reply.newPostIdentity == sourceIdentity.stableIdentity,
+              reply.oldPostIdentity.isEmpty || (
+                reply.oldPostIdentity.count == 16
+                    && reply.oldPostIdentity == sourceIdentity.stableIdentity
+              ) else {
+            // The authority mutation already succeeded. Publishing a rename
+            // from a malformed or different identity would corrupt the local
+            // namespace index, so this callback cannot return a usable result.
+            await client.close()
+            throw PfsLocalClientError.connectionClosed
+        }
+        return !reply.oldPostIdentity.isEmpty
     }
 
     public func recordRenameReplacement(replacedItem: PortableFSItem) throws {
