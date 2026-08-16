@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -338,7 +339,11 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	if !validSourcePublicationGatePresence(req) {
 		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}
-	if _, err := decodeSourcePublicationGate(req); err != nil {
+	decodedGate, err := decodeSourcePublicationGate(req)
+	if err != nil {
+		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+	}
+	if !validVisibilityRetryRequestShape(req, decodedGate) {
 		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}
 	if hello := req.GetHello(); hello != nil {
@@ -1659,6 +1664,8 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 		CachedNameCapacity: attach.GetCachedNameCapacity(),
 		RepairBudget:       time.Duration(attach.GetRepairBudgetMillis()) * time.Millisecond,
 		NamespaceRepair:    repair,
+		CompatibilityWriter: repair == volumeserver.NamespaceRepairCallbackSerialized ||
+			repair == volumeserver.NamespaceRepairCallbackSerializedPipelined,
 	}
 	if err := h.Visibility.ValidateCommitment(commitment); err != nil {
 		return h.errorResponse(requestID, err, false)
@@ -2060,14 +2067,6 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			resp, _ := apply(1)
 			return resp
 		}
-		held, err := h.heldDirectories(cred.ID, req)
-		if err != nil {
-			// Failing closed here is a liveness requirement, not only input
-			// validation. Silently dropping a parent would hide the exact kernel
-			// lock that a peer COMPLETE may need and recreate the cycle the
-			// interruption protocol exists to break.
-			return h.errorResponse(0, err, false)
-		}
 		var resp *authoritypb.Response
 		normalizedPrepare := func() ([]volumeserver.VisibilityTarget, error) {
 			targets, prepareErr := prepare()
@@ -2100,7 +2099,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 				return h.errorResponse(0, err, false)
 			}
 		}
-		_, err = h.Visibility.ExecuteWithSourceGateAndHeldParentsSequence(ctx, cred.ID, id, expectedGate, held, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
+		_, err = h.Visibility.ExecuteWithSourceGateSequence(ctx, cred.ID, id, expectedGate, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
 			var complete []volumeserver.VisibilityTarget
 			resp, complete = apply(sequence)
 			// nil is the explicit no-visible-change result. A non-nil empty
@@ -2131,6 +2130,12 @@ func (h *VolumeHandler) mutateVisibleSequence(
 					return resp
 				}
 				if !uncertain {
+					if errors.Is(err, volumeserver.ErrVisibilityRetry) {
+						if resetErr := h.resetWriteTransactionForRetry(cred.ID, body); resetErr != nil {
+							return h.errorResponse(0, resetErr, false)
+						}
+						return h.errorResponse(0, err, false)
+					}
 					if rejected := h.rejectPendingWriteTransaction(cred.ID, body, err); rejected != nil {
 						return rejected
 					}
@@ -2177,7 +2182,8 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 	reserve := h.requestReplyReserve(req)
 	id := volumeserver.MutationID{
 		Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Fingerprint: fingerprint,
-		FrontendOperationID: req.GetFrontendOperationId(),
+		FrontendOperationID:          req.GetFrontendOperationId(),
+		VisibilityRetryAfterSequence: req.GetVisibilityRetryAfterSequence(),
 	}
 	var reserved uint32
 	settled := false
@@ -2565,6 +2571,21 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		errno = errnos.EBUSY
 	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN
+	case errors.Is(err, volumeserver.ErrVisibilityRetry):
+		// This is internal protocol flow, not an application-visible EINTR. The
+		// Linux frontend releases its source gate and resubmits inside the
+		// same FUSE callback. The separate class proves a staged COMMIT remained
+		// reusable and prevents confusing it with a callback/namespace unwind.
+		sequence, ok := volumeserver.VisibilityRetrySequence(err)
+		if !ok {
+			return h.errorResponse(requestID, fmt.Errorf("%w: visibility retry omitted its sequence", errInternal), true)
+		}
+		errno = errnos.EINTR
+		resp := h.success(requestID)
+		resp.Errno, resp.Uncertain = errno, uncertain
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY
+		resp.VisibilityRetrySequence = sequence
+		return resp
 	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
 		// This is a definite pre-apply interruption, not a coherence
 		// failure. Linux consumes EINTR to release the execution lane needed
@@ -3049,8 +3070,11 @@ func wireErrno(err error) int32 {
 	// essential when two mounts race on one inode: Linux releases the losing
 	// callback lane and retries after the winner's repair without surfacing a
 	// false EIO to the application.
-	if errors.Is(err, volumeserver.ErrVisibilityInterrupted) {
+	if errors.Is(err, volumeserver.ErrVisibilityInterrupted) || errors.Is(err, volumeserver.ErrVisibilityRetry) {
 		return errnos.EINTR
+	}
+	if errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+		return errnos.EBUSY
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) && errno > 0 {

@@ -1,18 +1,14 @@
 # macOS 27 native FSKit coherence
 
-Status: **all production protocol-5 macOS mounts are refused before attach**
+Status: **SDK-27 exact-coherence candidate; shipping macOS 26 uses the separate
+best-effort policy**
 
-No currently documented FSKit release supplies the complete primitives that a
-strict shared PortableFS mount requires. The shipping CLI therefore refuses
-macOS 26, macOS 27, and unknown later versions before contacting portablefsd;
-the shipping extension independently refuses before resolving its Unix socket;
-and portablefsd independently refuses a protocol-5 EnsureAttach before it can
-construct or dial an authority transport. There is no alternate policy,
-runtime opt-in, or degraded mode.
-
-The macOS 26 synchronous-VFS adapter and macOS 27 native-data adapter remain
-only as test and separately signed qualification lanes. They must not be read
-as supported production mount paths.
+No currently documented FSKit release supplies the complete primitives that an
+exact shared PortableFS mount requires. The shipping CLI admits macOS 26 only
+under `macos26-synchronous-vfs-repair-v2`, whose limits are documented as a
+best-effort tier. The macOS 27 native-data adapter remains separately signed and
+build-stamped test code until the missing namespace and attribute primitives
+exist and pass the complete live matrix. Unknown policies fail before Attach.
 
 ## Exact missing primitives
 
@@ -114,17 +110,14 @@ attribute-cache notification operation.
 Calling `revoke` on a renamed item would exceed Apple's stated contract because
 the item still exists and may have open descriptors. Calling it on the parent
 directory in the hope that child name entries disappear is also an assumption.
-The production adapter must not do either unless the final SDK contract says so
+The exact adapter must not do either unless the final SDK contract says so
 and the installed-kernel matrix proves the required behavior.
 
-Until every row has a supported representation, no shipping app links the
-native adapter and production selection refuses every macOS version before
-starting a daemon or authority attach. The separately signed development host
-may serve a qualification mount only when paired with a CLI and portablefsd
-carrying the exact build-time qualification tag; an unsupported repair then
-fails the mount terminally before COMPLETE rather than acknowledging partial
-coherence. It never substitutes the macOS 26 synthetic repair mechanism under
-the native policy name.
+Until every row has a supported representation, no shipping app selects the
+native SDK-27 adapter. The separately signed development host may serve a test
+mount only when paired with a CLI and portablefsd carrying the exact build-time
+tag; an unsupported repair then fails the mount terminally before COMPLETE. It
+never substitutes the macOS 26 repair mechanism under the native policy name.
 
 ## Adapter boundary
 
@@ -190,14 +183,14 @@ contains only `fskit-native-revocation-v1`. A mismatch closes the pfslocal
 connection and returns `ENOTSUP`. Shipping composition never reaches Resolve.
 
 The CLI has a second, independent gate. Its normal build contains no native
-qualification stamp, so both macOS 26 and macOS 27 fail before attach. The
-signed development lane may stamp exactly `sdk27-live-qualification-only` into
-`nativeFSKitPolicyQualification` with Go `-ldflags -X`; the same build lane
-tags portablefsd so its defensive EnsureAttach gate recognizes that exact
-qualification artifact. This is a build identity, not a runtime environment
-toggle. macOS 26 remains refused even with the macOS 27 stamp, and macOS 28 and
-later remain refused until independently qualified. OS version detection alone
-never authorizes a policy.
+qualification stamp, so macOS 27 fails before attach; macOS 26 independently
+selects its shipping best-effort v2 policy. The signed development lane may
+stamp exactly `sdk27-live-qualification-only` into
+`nativeFSKitPolicyQualification` with Go `-ldflags -X`; its packaging tag
+selects the matching SDK-27 app/extension layout. This is a build identity, not
+a runtime environment toggle. It does not alter macOS 26's policy, and macOS 28
+and later remain refused until independently qualified. OS version detection
+alone never authorizes the native policy.
 
 Qualification mount readiness is also policy-specific. After `/sbin/mount`
 returns, the CLI proves the exact `pfs` kernel identity, asks `portablefsd` to

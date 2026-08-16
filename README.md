@@ -109,7 +109,8 @@ portablefs-authority \
   -tls-cert server.pem -tls-key server.key \
   -client-ca clients-ca.pem \
   -capability-public-key capability.pub.pem \
-  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership
+  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership \
+  -write-staging-dir /srv/portablefs/.portablefs-control/my-workspace/write-staging
 ```
 
 Then mount it, as above. On clean unmount the official mount supervisor first
@@ -195,12 +196,13 @@ narrow but never broaden. See
 | Platform | Transport | Status |
 | --- | --- | --- |
 | Linux | pinned Linux 6.12.100 kernel FUSE (`vcs/internal/fusev3`) | Strict implementation candidate. Stock kernels and any partial capability set are refused. The checked-in patch series and userspace tests are deterministic; release qualification still requires the documented live patched-kernel XFS, KASAN/lockdep, and two-mount gates. |
-| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Shipping mounts are refused before Attach. A separately build-stamped qualification lane retains historical evidence, but public FSKit cannot express the complete source result and peer namespace/attribute invalidation contract. |
+| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Supported best-effort mount. One active Mac owns the volume writer lease; Linux peers may read but receive `EBUSY` for visible mutation until clean handoff. FSKit's missing exact namespace/attribute invalidation remains an explicit platform boundary. |
 | macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. A separate SDK-27 package and signed development host compile the documented data-only invalidator; no complete policy implementation exists. The ordinary CLI refuses macOS 27 before attach. Only an explicitly build-stamped qualification CLI can exercise the development adapter. |
 
-The macOS 26 policy is an explicitly declared qualification contract, never a
-shipping fallback or silent downgrade. Its exact callback-provenance
-deviations, historical live proofs, and remaining platform gates are in
+The macOS 26 policy is an explicitly declared best-effort product contract,
+never a silent downgrade or fallback. Its writer-ownership rule, measured
+high-churn `ESTALE` edge, exact callback-provenance deviations, live proofs, and
+remaining platform gates are in
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
 
 ## Development and verification

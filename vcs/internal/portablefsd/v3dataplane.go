@@ -659,8 +659,11 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	appendWrite := handle.append || request.Append
 	if appendWrite {
 		// Server-positioned append is a mandatory patched-Linux transaction.
-		// Current FSKit production is refused before Attach and qualification
-		// mode must not silently route append through positional Write.
+		// The macOS 26 FSKit API supplies only a kernel-chosen position here;
+		// it cannot carry the authority-owned append intent required for atomic
+		// cross-client append. Refuse an explicit append bit rather than silently
+		// routing it through positional Write. Ordinary macOS O_APPEND remains
+		// inside the documented best-effort platform boundary.
 		return nil, darwinENOTSUP
 	}
 	gate, err := v3ItemSourceGate(item.item, true)
@@ -689,7 +692,7 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	}
 	d.updateAttr(item, response.GetPostAttr())
 	if reply.GetFlags() == v3WriteReplyCommitted|v3WriteReplyPostApply {
-		_ = d.fail(fmt.Errorf("portablefsd: authority committed %d write bytes but FSKit qualification ABI cannot publish post-apply errno %d", reply.GetCommittedSize(), reply.GetError()))
+		_ = d.fail(fmt.Errorf("portablefsd: authority committed %d write bytes but macOS 26 FSKit cannot publish post-apply errno %d", reply.GetCommittedSize(), reply.GetError()))
 		return nil, darwinEIO
 	}
 	return &pfslocal.WriteReply{Written: uint32(reply.GetCommittedSize()), Attr: attr}, 0
@@ -1351,6 +1354,8 @@ func retainedV3ResponseTerminalCause(response *authoritypb.Response, callErr err
 	if response.GetUncertain() ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
+		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
+		response.GetVisibilityRetrySequence() != 0 ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		return errors.New("portablefsd: authority returned a terminal retained outcome")
 	}
@@ -1373,6 +1378,10 @@ func (d *v3DataPlane) revokeRetainedResponse(ctx context.Context, cause error) {
 func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.SourcePublicationGate) (*authoritypb.Response, int32) {
 	if operationID == 0 || request == nil {
 		return nil, darwinEINVAL
+	}
+	if request.GetVisibilityRetryAfterSequence() != 0 {
+		_ = d.fail(errors.New("portablefsd: callback-serialized mutation carried a Linux-only visibility retry proof"))
+		return nil, darwinEIO
 	}
 	lease, err := d.bridge.sourcePublication.acquireSource(ctx, operationID, gate)
 	if err != nil {
@@ -1574,6 +1583,10 @@ func (d *v3DataPlane) classify(response *authoritypb.Response, callErr error, mu
 	}
 	if response == nil || response.GetUncertain() || response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE || response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || response.GetRoutesMismatch().GetSessionRefused() {
 		_ = d.fail(errors.New("portablefsd: authority returned a terminal or malformed outcome"))
+		return nil, darwinEIO
+	}
+	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY || response.GetVisibilityRetrySequence() != 0 {
+		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only visibility retry to a callback-serialized frontend"))
 		return nil, darwinEIO
 	}
 	if response.GetErrno() != 0 {

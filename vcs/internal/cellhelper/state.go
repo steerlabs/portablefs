@@ -72,8 +72,8 @@ func loadState(path, cellID string) (State, error) {
 			if digest, err := hex.DecodeString(assignment.AppliedPlanHash); err != nil || len(digest) != 32 {
 				return State{}, errors.New("cellhelper: applied assignment has an invalid plan digest")
 			}
-		} else if assignment.AppliedPlanHash != "" {
-			return State{}, errors.New("cellhelper: failed assignment retained an applied plan digest")
+		} else if assignment.AppliedPlanHash != "" || assignment.AppliedHelperRelease != "" {
+			return State{}, errors.New("cellhelper: failed assignment retained applied identity")
 		}
 	}
 	return state, nil

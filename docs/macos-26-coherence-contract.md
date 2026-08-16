@@ -1,200 +1,150 @@
 # macOS FSKit coherence support boundary
 
-Status: **no production protocol-5 macOS mount is admitted on any currently
-documented FSKit version**
+Status: **macOS 26 is a supported best-effort FSKit tier; Linux remains the
+exact shared-filesystem tier**
 
-PortableFS is a strict shared filesystem. Returning from a mutation is not
-enough: the source mount must publish the exact authoritative result to its
-kernel cache, and every peer must make older namespace, attribute, and data
-state unobservable before acknowledging COMPLETE. Current FSKit cannot close
-both boundaries.
+PortableFS now names these guarantees instead of pretending both operating
+systems expose the same cache controls:
 
-Production therefore fails before authority Attach. It does not select a short
-TTL, reinterpret a cache-policy name, switch to a local filesystem, or continue
-with weaker semantics.
+- Linux 6.12.100 with the strict PortableFS FUSE profile provides the exact
+  protocol-5 publication and invalidation contract.
+- macOS 26 uses `macos26-synchronous-vfs-repair-v2`. It provides ordinary
+  mounted filesystem behavior, authenticated protocol-5 access, synchronous
+  repair attempts, and fail-closed error handling. It does not claim an exact
+  multi-writer cache cut that FSKit 26 cannot express.
+- The macOS 27 handler remains a separate test target until its complete
+  callback and invalidation behavior is qualified on the deployed SDK and OS.
 
-## Production selection
+This is not a hidden compatibility mode. The CLI, daemon, and extension select
+one named policy, report it through diagnostics, and refuse any unknown policy.
+There is no TTL downgrade, local-filesystem substitution, or protocol fallback.
 
-The refusal is enforced independently at three layers:
+## What works on macOS 26
 
-1. The ordinary macOS CLI rejects macOS 26, macOS 27, and unknown later
-   versions before starting portablefsd or requesting an authority Attach.
-2. The shipping FSKit extension rejects `loadResource` before resolving or
-   opening the local daemon socket.
-3. A shipping portablefsd rejects every protocol-5 FSKit `EnsureAttach` before
-   constructing or dialing an authority transport.
+The shipping FSKit composition is `PortableFSFileSystem.macOS26BestEffort()`.
+It uses the same protocol-5 authority, replay identities, source-publication
+operations, transaction staging, TLS identity checks, and terminal fencing as
+the Linux client.
 
-The duplication is intentional. A stale CLI, a directly invoked extension, or
-a direct daemon control request cannot bypass the unsupported-platform fact.
-There is no runtime opt-in.
+The following behavior has been exercised against the hosted protocol-5 stack,
+including runs with a simultaneously attached Linux reader:
 
-The SDK-26 and SDK-27 adapters remain as compile, unit-test, and separately
-signed qualification code. The SDK-27 live lane requires both the exact CLI
-build stamp `sdk27-live-qualification-only` and the portablefsd compile tag
-`portablefs_macos27_qualification`. The embedding build applies the tag to both
-helpers. The stamp does not admit macOS 26, macOS 28, or the shipping
-extension. A qualification artifact is not a supported product mount.
+- create, open, read, write, positioned write, `fsync`, close, unlink, rename,
+  mkdir, rmdir, hard link, symbolic link, and truncate;
+- immediate Mac-to-Linux visibility and Linux-to-Mac visibility for newly
+  created files;
+- multi-megabyte and 64 MiB files with SHA-256 verification;
+- exact refusal of unsupported writable xattrs;
+- authority loss, repair refusal, and terminal-session handling that stop the
+  Mac mount instead of continuing after an unproven repair.
 
-## The missing source boundary
+The best-effort label has one measured namespace edge. During 100 back-to-back
+Mac `fsync`+rename replacements, a Linux peer completed 2,996 of 3,000
+enumerate-and-read observations and received four transient `ESTALE` results
+(0.13%). It observed zero torn or mismatched generations, both mounts remained
+healthy, and 1,000 subsequent observations passed. Ordinary workloads did not
+produce this error. PortableFS reports the stale handle rather than concealing
+it with a retry or fallback; applications that require a zero-transient-error
+multi-writer namespace must use the exact Linux tier.
 
-After a successful authority mutation, the initiating FSKit callback must
-return every post-state attribute snapshot that the framework may cache. The
-snapshot must be authoritative and tied to the exact stable identity; a later
-`getattr`, a guessed local value, or an assumed framework refresh is not the
-same transaction.
+macOS 26 owns the volume's compatibility writer lease while it is mounted.
+Linux peers may remain mounted and read Mac changes, but their visible
+mutations return `EBUSY` before prepare or XFS apply. A clean Mac unmount
+releases the lease; Linux can then write, and a later Mac mount starts from the
+new authority state. Only one macOS 26 compatibility writer can attach at a
+time; a second is refused with `EBUSY` before durable membership or runtime
+activation. This explicit handoff is the intended macOS 26 operating envelope.
 
-The legacy macOS 26 `FSVolume.Operations` result surface is incomplete:
+## The macOS 26 limit
 
-| mutation | attributes the strict callback must publish | macOS 26 result |
-| --- | --- | --- |
-| set attributes / truncate | item | item attributes available |
-| write | item, including post-write size and times | no item attributes |
-| create, mkdir, symlink | created item and parent | no item or parent attributes |
-| hard link | linked item and parent | no item or parent attributes |
-| remove | removed item and parent | no item or parent attributes |
-| rename | moved item, source parent, destination parent, and overwritten item when present | none of these attributes |
-| set/remove xattr | affected item | no affected-item attributes |
+FSKit 26 has no documented module-initiated namespace or inode-attribute cache
+invalidation API. It also lacks source-result attributes for several mutation
+callbacks. PortableFS 26 therefore performs authenticated synchronous repair
+through its own FSKit callback lane. That mechanism can refresh ordinary
+cached state, but it cannot create the exact peer cache transaction available
+in the patched Linux VFS.
 
-This is not only a response-schema gap. The legacy callback has no supported
-place to consume the missing values. In particular, a cached parent `getattr`
-may remain stale after a local namespace mutation because the callback neither
-returns the parent snapshot nor invokes a documented parent-attribute
-invalidation primitive.
+Qualification before the writer lease was added showed why this boundary is
+needed. A Linux truncate of a file already cached by the Mac reached FSKit's
+synthetic callback lane; the framework returned an error and PortableFS fenced
+the Mac rather than accepting unproven state. The authority now refuses that
+second writer with `EBUSY` before mutation dispatch. This keeps both mounts
+healthy and makes the unsupported case predictable instead of workload-
+dependent.
 
-macOS 27 `FSVolume.Handler` adds typed result attributes for create, symlink,
-link, remove, rename, write, and setattr. That is a stronger source boundary,
-but the xattr result still reports only free-space information, and source
-results do not solve peer invalidation.
+Two related facilities are not available through the FSKit 26 callback API:
 
-## The missing peer boundary
+- cross-machine advisory locks (`fcntl`/`flock`); and
+- an authority-visible atomic append intent for Mac write callbacks.
 
-A peer PREPARE must close overlapping local admission. After authority apply,
-the peer must revoke every affected kernel name, inode attribute, and data
-entry before COMPLETE is acknowledged. An asynchronous notification or a
-future TTL expiry cannot establish that cut because the kernel may answer from
-cache without re-entering the extension.
+Single-writer append works because the Mac kernel supplies an offset. Multiple
+clients must not use the same file as a concurrent append log through a macOS
+26 mount. Workloads that need exact simultaneous mutation, distributed locks,
+or atomic cross-client append must use strict Linux clients with no macOS 26
+writer lease active.
 
-No currently documented FSKit version exposes an exact module-initiated
-namespace or inode-attribute invalidation API. The macOS 27 data-cache handler
-can act on retained item data, but it does not invalidate names or attributes.
-Apple DTS has also stated that inode/attribute invalidation currently does not
-exist and that FSKit does not yet fully support shared/network filesystems:
-[Apple Developer Forums thread 821376](https://developer.apple.com/forums/thread/821376).
+## Ordering retained by the best-effort tier
 
-Consequently, SDK 27 cannot acknowledge a general peer COMPLETE exactly even
-when its source callback can return most post-state attributes.
+Even where the platform guarantee is weaker, PortableFS does not weaken its own
+protocol bookkeeping:
 
-## Why the existing mechanisms are not substitutes
+- every visible callback owns one source-publication operation keyed by stable
+  identities and namespace coordinates;
+- authority responses remain retained until the physical FSKit reply,
+  `PublicationAck`, duplicate-handler retirement, and resource disposition
+  boundaries are complete;
+- write BEGIN, DATA, COMMIT, and ABORT responses belong to the same logical
+  publication lifetime;
+- a terminal authority response cannot be acknowledged before the local reply
+  boundary it represents;
+- a definite pre-apply rejection publishes no mutation, while an assigned or
+  post-apply uncertain result is terminal;
+- repair refusal, malformed replies, lost transport, or missing completion
+  fences the session instead of retrying through a different path.
 
-The protocol-5 source-publication gate is necessary, but it cannot itself edit
-FSKit's kernel caches. Holding it longer only prevents later ordered mutations;
-reads on the initiating mount may still consume an old parent or item
-attribute.
+These rules keep the daemon and authority state machine exact. The best-effort
+label covers only the missing FSKit kernel cache primitive.
 
-A nested synthetic VFS callback is not a root transaction. It can re-enter the
-outer callback's own locks, cannot address a newly created item before the
-outer reply installs it, and relies on undocumented cache side effects. The
-same objection applies to rename-to-scratch, chmod-as-refresh, truncate-based
-data eviction, lookup probes, and provenance-based callback swallowing. Those
-paths remain qualification experiments, not production correctness primitives.
+## Live performance snapshot
 
-Force-unmount is a terminal fencing action. It limits how long a failed mount
-can continue serving; it cannot turn a successful mutation callback or peer
-COMPLETE into an exact cache publication.
+The current hosted test used an Apple M5 Max Mac, a VZ Linux 6.12.100 guest,
+TLS, XFS authority storage, and an attached strict Linux peer. Five 64 MiB runs
+produced:
 
-Returning `ECANCELED`, shortening TTLs, mounting through another local path, or
-retrying automatically would likewise change behavior without closing the
-missing cache boundary. None is a supported fallback.
+| path | median |
+| --- | ---: |
+| macOS FSKit durable write (`write` + `fsync`) | 128.2 MiB/s |
+| macOS FSKit `F_NOCACHE` read with SHA verification | 71.1 MiB/s |
+| Linux strict durable write with Mac peer attached (pre-lease diagnostic) | 100.8 MiB/s |
+| Linux strict durable write after clean Mac handoff | 120.9 MiB/s |
+| Linux strict read after clean Mac handoff | 135.3 MiB/s |
+| direct XFS durable write in the guest | 3033.7 MiB/s |
 
-## Protocol implemented in qualification code
+The matched-stack Mac durable-write runs were 29.7–144.1 MiB/s; four of five
+were 117.8–144.1 MiB/s. The low run is retained rather than discarded. Linux
+post-handoff write runs were 103.3–127.1 MiB/s and reads were 112.3–161.6
+MiB/s, with every digest matching. Small-operation Mac medians included create 15.4 ms, `fsync` 3.6 ms, cached
+stat 0.001 ms, negative lookup 1.0 ms, open/read/close 2.3 ms, rename 16.7 ms,
+and unlink 16.1 ms. The ordinary Mac `write` return rate is page-cache
+acceptance and is not reported as durable throughput.
 
-The retained adapters exercise the root protocol without claiming that FSKit
-can complete its platform half:
+Historical Archil numbers used a different machine, transport, cache policy,
+and completion boundary. They remain useful context, not an exact ranking.
 
-- Every visible mutation derives one canonical source gate from stable
-  identities before replay assignment or send. Item targets use ATTR or DATA,
-  where DATA implies ATTR. Namespace targets use parent stable identity plus
-  raw name and an exact bound-item ATTR/DATA scope.
-- Setattr gates the item (DATA for a size change); write gates item DATA;
-  create, mkdir, symlink, and unlink gate parent ATTR plus the name's bound ATTR;
-  rename gates both parent ATTR coordinates and both names; hard link also
-  gates the existing item; xattr mutations gate item ATTR.
-- Item and handle identities must agree. An unknown post-binding remains a
-  conservative scoped wildcard until the authority reply supplies its exact
-  stable identity or proves that no binding remains. Per-call claim counts keep
-  concurrent requests in one callback from resolving each other's wildcard.
-- Source-first ordering holds the local gate while peers receive PREPARE,
-  repair COMPLETE, and acknowledge it. The source receives no filesystem
-  visibility event. Peer-first overlapping source admission fails definite
-  pre-apply before replay identity assignment or authority send; disjoint work
-  remains independent.
-- Exact replay retains the same logical lease. An assigned uncertain result is
-  terminal. A definite pre-apply interruption can return and release normally.
-- The gate releases only after both the daemon request reservation retires and
-  the exact FSKit callback sends `PublicationAck(PUBLISHED)`. Disconnect before
-  that acknowledgement is terminal. `NOT_PUBLISHED` is terminal whenever any
-  visible authority mutation in the logical operation committed.
-- Peer PREPARE owns its cut through paired COMPLETE publication and authority
-  acknowledgement. There is no mount-wide source gate, source PREPARE/COMPLETE,
-  source ticket, boolean publication attestation, or compatibility path.
+## Future exact macOS tier
 
-These invariants prevent daemon/authority ordering bugs and remain useful when
-FSKit eventually supplies the missing platform primitives. They do not make a
-current macOS mount production-safe.
+A future FSKit release can be promoted to exact only after all of these are
+available and pass a mounted two-peer matrix:
 
-## Why post-attribute wire expansion is deferred
+1. every mutation callback can publish the complete authoritative post-state
+   for all affected items and parents;
+2. the module can synchronously invalidate exact names, inode attributes, and
+   retained data on a peer;
+3. invalidation has a completion point that can remain inside PREPARE/COMPLETE;
+4. failure is observable and terminal; and
+5. source-first, peer-first, cancellation, disconnect, rename-over,
+   open-unlinked, lock, append, and cached-data races pass without relying on a
+   later cache miss.
 
-A generic authoritative post-mutation attribute set would be the cleanest
-authority response shape: stable-identity keyed, canonical, unique, bounded,
-and retained exactly by replay. It would need to cover the actual callback
-completion identities—parents, moved or linked items, and removed or replaced
-items where the framework result publishes them.
-
-That schema is deliberately not added yet. macOS 26 has no callback result that
-can consume most of it, and no current FSKit version can invalidate the peer's
-namespace and attribute caches. Adding snapshots without an exact consumer
-would create a misleading half-contract rather than a working architecture.
-
-## Boundary for future production support
-
-A future macOS/FSKit combination can be considered only when all of these are
-documented and available at the actual deployment target:
-
-1. Every visible source callback can publish the complete authoritative
-   post-state attribute set for all affected stable identities.
-2. A module can synchronously invalidate an exact peer namespace coordinate,
-   exact inode attributes, and exact retained data without a path guess or
-   synthetic filesystem mutation.
-3. The invalidation operation has a completion boundary strong enough to keep
-   PREPARE closed until local repair finishes and COMPLETE is acknowledged.
-4. Failure is observable and terminal; the framework cannot report completion
-   while stale state remains servable.
-
-The supported SDK surface must then pass a mounted two-machine matrix, not only
-unit tests:
-
-- Prime source item and parent attributes, run every namespace and data
-  mutation, and immediately read them back without relying on an unrelated
-  callback to refresh the cache.
-- Prime peer positive and negative names, item attributes, sizes, bytes, hard
-  links, and open-unlinked objects; mutate from the other machine; prove no
-  pre-COMPLETE value is observable after acknowledgement.
-- Exercise source-first and peer-first races, same-name and disjoint operations,
-  rename-over and same-inode rename, callback cancellation, lost replies,
-  daemon disconnect, and forced fencing.
-- Count the documented result/invalidation calls so an incidental cache miss or
-  TTL expiry cannot make the test pass.
-
-Observed automatic refresh on one kernel build is not enough to replace a
-documented primitive. Until the entire boundary exists and the matrix passes,
-production macOS remains refused before Attach.
-
-## Historical qualification evidence
-
-Earlier macOS 26.5 experiments exercised authenticated synthetic namespace,
-attribute, and data actuators, saturation, and daemon-death fencing. Those runs
-were valuable for finding callback cycles and shaping the source-owned gate.
-They did not prove a supported cache transaction, and they are not a production
-compatibility claim. Performance measurements from those qualification mounts
-must be labeled as such; they cannot be compared as supported multi-writer
-product results.
+Until then, macOS 26 remains useful and supported for its stated best-effort
+envelope, while Linux is the exact shared-mutation client.

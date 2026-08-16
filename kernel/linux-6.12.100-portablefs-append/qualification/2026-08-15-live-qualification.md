@@ -2,9 +2,9 @@
 
 Status: **qualified for the exact matching Linux protocol-5 candidate**.
 
-Captured on 2026-08-15 (America/Los_Angeles) in the isolated Lima
-`pfs-k612100-qual` VZ/aarch64 VM. The final boot ID was
-`783c232f-f7ce-4ae7-b055-14ea1d8177c7` and the running release was exactly
+Captured on 2026-08-15 through 2026-08-16 (America/Los_Angeles) in the isolated
+Lima `pfs-k612100-qual` VZ/aarch64 VM. The final post-rebuild boot ID was
+`cd507f3c-efe2-43b7-a0f7-77b3b2c8483a` and the running release was exactly
 `6.12.100-pfs-strict`.
 
 This receipt completes the boundary left open by
@@ -16,29 +16,26 @@ performance SLO.
 
 ## Exact inputs and booted artifacts
 
-- Base repository commit: `e13ea8ee695460833028503ebe15409a30a6be58` on
-  `codex/root-performance-architecture`.
-- Qualified tracked working-tree delta, excluding this self-referential receipt:
-  134 paths; binary-diff SHA-256
-  `42f1cbb5816d34d5bbac61bbbc2b8c252d73c17bac7bd1ad3d1a465da07f1d50`.
-- Qualified untracked source payload, excluding the local checkpatch scratch
-  file, a built CLI binary, Python caches, and this receipt: 339 files;
-  path-sorted content-manifest SHA-256
-  `d2ab59d44b74f1f20b376f3de36593d74c2aa9ca8df9411ec92891457e2f09d5`.
+- Final userspace repository commit:
+  `759873f63b520658cfe7f22ec8c7dc001f789e8d` on
+  `codex/protocol5-hosted-gcp`. The guest qualification clone was clean at this
+  exact commit.
 - Upstream `linux-6.12.100.tar.xz` SHA-256:
   `67f973533406492e86774bacbcefae50d50d5c34cbf703c47ec526a5efdcee90`.
 - Patch 1 SHA-256:
   `096d01915824d909316498fdc9de9252730ac4292294fd421a7fa4b24fffa417`.
 - Patch 2 SHA-256:
   `2534c6889f73d02bd2166791298da6e1a8a7689e92166bbf6fd74945c19cc786`.
+- Patch 3 SHA-256:
+  `eb7cddd8726ecc40a0e8fa210aab9694f8e65dbda63f341dd9b2fe94d60bba9f`.
 - Reconstructed final kernel source commit:
   `7904f7b40640682e3e3650661ca0095572d48c9c`.
 - Installed kernel image SHA-256:
-  `5a850cbf7caaf1f818a188b23789ea66dc7ebdb67032bbd1b5c4bf0176aa844b`.
+  `71cfbaf788756554f6efef9c9b640288111ea9dfc2a37288e832ba9f7ba1e3b4`.
 - Installed config SHA-256:
   `45148991bfb952bdffd4392262c401abd1a078ac79cfb6b44ba78e1641f58972`.
 - Installed initramfs SHA-256:
-  `ccda7852c9be851ea90d8131e9e7c1d81df880c3b1ef9276d1936338adf377b2`.
+  `1b8d4b546322271b37fa17e34eaefdba85662181a30a95da856119cec7d30d2c`.
 
 The config has built-in FUSE and XFS plus XFS debug, generic KASAN,
 lockdep/`PROVE_LOCKING`, `DEBUG_ATOMIC_SLEEP`, and kernel fault-injection
@@ -55,8 +52,9 @@ facilities. The persistent GRUB default remained stock Debian
   `rw,nosuid,nodev,noexec,noatime,attr2,inode64,logbufs=8,logbsize=32k,prjquota`.
 - Performance project: id 43001, uid/gid 200001, 8 GiB block limit and
   500,000-inode limit.
-- Final root/XFS use: 10,502,307,840 / 101,240,397,824 bytes and
-  273,043,456 / 34,290,532,352 bytes. The 70 GiB actual-use stop was never
+- Final root/XFS use after hosted requalification: 19,415,687,168 /
+  101,240,397,824 bytes and 414,863,360 / 34,290,532,352 bytes. The 70 GiB
+  actual-use stop was never
   approached.
 
 No shared host Docker state was pruned. The stock recovery kernel was retained.
@@ -111,7 +109,7 @@ fixture update:
 - Linux `go vet ./...`: passed.
 - `scripts/verify-local.sh`: passed Darwin+cgo and Linux-static build/vet,
   native Go normal/race, the maintained go-fuse reply-publication seam,
-  release trust/stale-architecture scans, and 340/340 Xcode-native Swift tests.
+  release trust/stale-architecture scans, and 342/342 Xcode-native Swift tests.
 - Focused owned-idempotent request and retained-response race tests passed ten
   repeated race-enabled runs.
 
@@ -154,10 +152,10 @@ this receipt.
 After all static, direct-XFS, live FUSE, two-mount, performance, and race work:
 
 - `/proc/sys/kernel/tainted` was `0`;
-- lockdep remained initialized and `/proc/lockdep_stats` reported 1,631 lock
-  classes and 18,112 direct dependencies;
+- lockdep remained initialized and `/proc/lockdep_stats` reported 1,618 lock
+  classes and 17,738 direct dependencies;
 - final `dmesg` SHA-256 was
-  `32182e461c5d3599a741a808e84972c97c85df1e72a64d0ee996905b4259d98b`;
+  `778936804ddb3caefeee04421200c0ae8a07112c4b1d108a35daae1410b39e37`;
 - the failure scan found zero KASAN reports, BUG/WARNING splats, circular-lock
   warnings, deadlocks, XFS corruption/shutdown, use-after-free, or
   out-of-bounds reports. The expected boot line saying KASAN was initialized

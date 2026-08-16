@@ -504,11 +504,10 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 	cfg.CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT
 	cfg.CachedNameCapacity = integrationCachedNames
 	cfg.RepairBudget = integrationRepairBudget
-	// Linux FUSE makes a cached binding unservable through
-	// fuse_reverse_inval_entry, which takes the parent directory's i_rwsem
-	// for write. Declaring it is what lets the authority tell a provably
-	// closed repair cycle apart from a slow lock.
-	cfg.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+	// Strict Linux makes a cached binding unservable with exact lockless dentry
+	// expiration. Declaring that private primitive prevents accidental admission
+	// of the retired stock parent-lock profile.
+	cfg.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
 	cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 		return &authoritypb.MountAbsenceProof{
 			ObservedUnixNanos: time.Now().UnixNano(),

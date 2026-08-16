@@ -76,7 +76,7 @@ func finishPeerVisibility(t *testing.T, raw *rawFileSystem, targets []*authority
 		t.Fatal(err)
 	}
 	if blocked {
-		t.Fatal("visibility completion unexpectedly found a parent-exclusive callback")
+		t.Fatal("lockless visibility completion unexpectedly reported blocked")
 	}
 	if err := raw.finishVisibilityComplete(context.Background(), completion); err != nil {
 		t.Fatal(err)
@@ -507,9 +507,10 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			}
 
 			// A source cannot be granted while an older peer COMPLETE still has
-			// an exact-size notification physically outstanding. Peer-first is a
-			// definite pre-assignment EINTR, so retry is safe and no authority
-			// mutation can overtake the old size.
+			// an exact-size notification physically outstanding. Item-only
+			// mutations wait behind that older inode repair: surfacing a synthetic
+			// EINTR would make ordinary concurrent writes/truncates fail even
+			// though no application signal interrupted them.
 			if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 				t.Fatal(err)
 			}
@@ -534,15 +535,24 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			f.rpc.mu.Lock()
 			beforeCalls, beforeAssignments := f.rpc.calls, f.rpc.assignments
 			f.rpc.mu.Unlock()
-			refusedUnique := f.unique.Add(2)
-			if status := test.run(f, refusedUnique, entry.NodeId); status != fuse.Status(syscall.EINTR) {
-				t.Fatalf("source while prior exact-size notify is outstanding = %v, want EINTR", status)
+			sourceUnique := f.unique.Add(2)
+			sourceStarted := make(chan struct{})
+			sourceDone := make(chan fuse.Status, 1)
+			go func() {
+				close(sourceStarted)
+				sourceDone <- test.run(f, sourceUnique, entry.NodeId)
+			}()
+			<-sourceStarted
+			select {
+			case status := <-sourceDone:
+				t.Fatalf("item-only source overtook prior exact-size repair: %v", status)
+			case <-time.After(50 * time.Millisecond):
 			}
 			f.rpc.mu.Lock()
 			afterCalls, afterAssignments := f.rpc.calls, f.rpc.assignments
 			f.rpc.mu.Unlock()
 			if afterCalls != beforeCalls || afterAssignments != beforeAssignments {
-				t.Fatalf("peer-first source crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
+				t.Fatalf("waiting item-only source crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
 			}
 
 			close(notifyBlock)
@@ -553,12 +563,16 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			f.notify.block, f.notify.onSize = nil, nil
 			f.notify.mu.Unlock()
 
-			// Once the old COMPLETE is acknowledged, this source mutation wins
-			// the FIFO cut. A later peer PREPARE must then remain behind it through
-			// the original response write and the true post-VFS PUBLISH ACK.
-			sourceUnique := f.unique.Add(2)
-			if status := test.run(f, sourceUnique, entry.NodeId); !status.Ok() {
-				t.Fatalf("source after prior COMPLETE = %v", status)
+			// Once the old COMPLETE is acknowledged, the waiting source mutation
+			// wins the FIFO cut. A later peer PREPARE must then remain behind it
+			// through the original response write and true post-VFS PUBLISH ACK.
+			select {
+			case status := <-sourceDone:
+				if !status.Ok() {
+					t.Fatalf("waiting source after prior COMPLETE = %v", status)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("waiting source did not resume after prior COMPLETE")
 			}
 			if !f.raw.ReplyWriteOrdered(sourceUnique) {
 				t.Fatal("successful truncate did not retain source publication ownership")
@@ -623,7 +637,7 @@ func TestMutationGateGrammarFailsBeforeReplayAssignmentOrTransport(t *testing.T)
 	})
 }
 
-func TestPeerFirstSourceGateReturnsEINTRBeforeAssignmentOrTransport(t *testing.T) {
+func TestPeerFirstNamespaceGateWaitsWithoutApplicationEINTR(t *testing.T) {
 	f := newStrictFixture(t)
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "blocked")}
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
@@ -633,25 +647,89 @@ func TestPeerFirstSourceGateReturnsEINTRBeforeAssignmentOrTransport(t *testing.T
 	beforeCalls, beforeAssignments := f.rpc.calls, f.rpc.assignments
 	f.rpc.mu.Unlock()
 
-	status := f.rawCall(func(unique uint64) fuse.Status {
-		return f.raw.Mkdir(nil, &fuse.MkdirIn{
+	const unique = uint64(398)
+	done := make(chan fuse.Status, 1)
+	go func() {
+		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{
 			InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
 			Mode:     0o755,
 		}, "blocked", &fuse.EntryOut{})
-	})
-	if status != fuse.Status(syscall.EINTR) {
-		t.Fatalf("peer-first mkdir = %v, want EINTR", status)
+	}()
+	select {
+	case status := <-done:
+		t.Fatalf("peer-first mkdir escaped before the older repair: %v", status)
+	case <-time.After(50 * time.Millisecond):
 	}
 	f.rpc.mu.Lock()
 	afterCalls, afterAssignments := f.rpc.calls, f.rpc.assignments
 	f.rpc.mu.Unlock()
 	if afterCalls != beforeCalls || afterAssignments != beforeAssignments {
-		t.Fatalf("peer-first refusal crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
-	}
-	if f.mount.isRevoked() || f.mount.fatalError() != nil {
-		t.Fatalf("definite pre-assignment contention terminalized the mount: %v", f.mount.fatalError())
+		t.Fatalf("waiting namespace gate crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
 	}
 	finishPeerVisibility(t, f.raw, targets)
+	select {
+	case status := <-done:
+		if !status.Ok() {
+			t.Fatalf("namespace mutation after repair = %v, want success", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace mutation did not resume after the peer repair")
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, unique)
+}
+
+func TestNamespaceMutationConsumesSequencedInternalRetry(t *testing.T) {
+	f := newStrictFixture(t)
+	item := testItem(398, authoritypb.Attr_DIRECTORY, 398)
+	firstReturned := make(chan struct{})
+	var attempts int
+	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetMkdir() == nil {
+			return nil, errors.New("unexpected request in namespace visibility-retry test")
+		}
+		attempts++
+		if attempts == 1 {
+			close(firstReturned)
+			return &authoritypb.Response{
+				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
+				VisibilityRetrySequence: 1,
+			}, nil
+		}
+		if request.GetVisibilityRetryAfterSequence() != 1 {
+			return nil, errors.New("retried namespace mutation omitted its exact visibility sequence")
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}}, nil
+	}
+	const unique = uint64(400)
+	done := make(chan fuse.Status, 1)
+	go func() {
+		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{
+			InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o755,
+		}, "retry-inside-callback", &fuse.EntryOut{})
+	}()
+	<-firstReturned
+	select {
+	case status := <-done:
+		t.Fatalf("namespace retry escaped to the kernel before COMPLETE: %v", status)
+	case <-time.After(50 * time.Millisecond):
+	}
+	f.raw.releaseComplete(visibilityCompletion{sequence: 1})
+	select {
+	case status := <-done:
+		if !status.Ok() {
+			t.Fatalf("namespace retry returned %v, want success without EINTR", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace retry did not resume after exact COMPLETE")
+	}
+	if attempts != 2 || f.mount.isRevoked() {
+		t.Fatalf("namespace retry attempts=%d revoked=%t cause=%v", attempts, f.mount.isRevoked(), f.mount.fatalError())
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, unique)
 }
 
 func TestSourceFirstReturnedBindingAndReplyWritePrecedePeerPrepare(t *testing.T) {

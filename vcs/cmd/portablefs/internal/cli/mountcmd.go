@@ -375,6 +375,12 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if selectedStrategy == "fskit" && o.coherence != "strict" {
 		return e.usageError("mount", fmt.Errorf("the macOS FSKit engine declares the strict %s coherence policy; --coherence %s is Linux-only", fskitCachePolicy, o.coherence))
 	}
+	if selectedStrategy == "fskit" &&
+		fskitCachePolicy == portablefsd.V3CachePolicyMacOS26 &&
+		o.readyFD == 0 {
+		fmt.Fprintln(e.stderr,
+			"portablefs mount: macOS FSKit uses the macos26-synchronous-vfs-repair-v2 best-effort tier and owns the volume writer lease while mounted; other clients may read but visible mutations return EBUSY until this Mac cleanly unmounts, and a second Mac writer is refused; extreme cross-client rename churn may return transient ESTALE instead of uncertain data")
+	}
 	var operation *mountOperation
 	if o.opLockFD > 0 {
 		operation, err = adoptMountOperation(o.opLockFD, stateDir, mountPath)

@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -272,24 +270,14 @@ type rawFileSystem struct {
 	// Source-owned gates close publication before the mutation gets a replay
 	// identity or can put bytes on the wire. Unlike peer visibility state, these
 	// maps are keyed only by stable filesystem identities and exact names.
-	sourceHolds                map[publicationCoordinate]*sourcePublicationLease
-	sourcePublishing           map[publicationCoordinate]int
-	peerHolds                  map[publicationCoordinate]int
-	sourceUnresolvedAttributes map[*sourcePublicationLease]int
-	sourceUnresolvedData       map[*sourcePublicationLease]int
-	peerHeldPhase              []publicationCoordinate
-	sourceChanged              chan struct{}
-
-	// parked is the set of directories whose kernel i_rwsem this mount is
-	// holding for an authority mutation that has not been answered yet.
-	// repairingParents is the complementary admission gate: COMPLETE installs a
-	// parent here before attempting a reverse name notification. A callback can
-	// therefore be on exactly one side of the gate. If it entered first it is
-	// parked and COMPLETE asks the authority to refuse it pre-apply; if COMPLETE
-	// entered first the callback returns EINTR before making an authority request.
-	parked           map[*inodeRecord]int
-	repairingParents map[uint64]int
-	parkedChanged    chan struct{}
+	sourceHolds                 map[publicationCoordinate]*sourcePublicationLease
+	sourcePublishing            map[publicationCoordinate]int
+	peerHolds                   map[publicationCoordinate]int
+	sourceUnresolvedAttributes  map[*sourcePublicationLease]int
+	sourceUnresolvedData        map[*sourcePublicationLease]int
+	peerHeldPhase               []publicationCoordinate
+	sourceChanged               chan struct{}
+	completedVisibilitySequence uint64
 
 	// identityDevice pins the one filesystem a volume is, as the authority's
 	// explicit major<<32|minor device fact. The kernel inode number alone keys
@@ -330,8 +318,6 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		cachedNameStable:           make(map[nameKey]publicationNamespace),
 		heldNames:                  make(map[nameKey]struct{}),
 		heldInodes:                 make(map[uint64]struct{}),
-		parked:                     make(map[*inodeRecord]int),
-		repairingParents:           make(map[uint64]int),
 		publishingNames:            make(map[nameKey]int),
 		publishingInodes:           make(map[uint64]int),
 		published:                  make(chan struct{}),
@@ -960,79 +946,6 @@ func (r *rawFileSystem) acquireDirHandle(id uint64) (*handleRecord, *dirHandle) 
 	return handle, handle.dir
 }
 
-// signalParkedLocked wakes a COMPLETE waiting for an already-admitted namespace
-// callback to release its parent. The caller holds r.mu.
-func (r *rawFileSystem) signalParkedLocked() {
-	if r.parkedChanged != nil {
-		close(r.parkedChanged)
-		r.parkedChanged = nil
-	}
-}
-
-// enterParentExclusive admits one shared namespace callback. Linux has already
-// taken every listed parent's i_rwsem by the time this handler runs, so refusing
-// after a repair gate closes must be immediate: waiting here would hold the very
-// lock COMPLETE is about to acquire through fuse_reverse_inval_entry.
-//
-// A successful admission declares the parents parked until the handler returns.
-// It is linearized with COMPLETE arming repairingParents by r.mu; that single
-// order is the liveness property, not timing or the repair-budget watchdog.
-func (r *rawFileSystem) enterParentExclusive(records ...*inodeRecord) (func(), syscall.Errno) {
-	r.mu.Lock()
-	for _, record := range records {
-		if record != nil && r.repairingParents[record.key.inode] != 0 {
-			r.mu.Unlock()
-			return func() {}, syscall.EINTR
-		}
-	}
-	for _, record := range records {
-		if record != nil {
-			r.parked[record]++
-		}
-	}
-	r.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			for _, record := range records {
-				if record == nil {
-					continue
-				}
-				if r.parked[record]--; r.parked[record] <= 0 {
-					delete(r.parked, record)
-				}
-			}
-			r.signalParkedLocked()
-		})
-	}, 0
-}
-
-// parkedDirectories names the directories this mount is currently holding for
-// an unanswered authority mutation, deepest information first: the volume path
-// when it is known, and the coordination inode when it is not.
-func (r *rawFileSystem) parkedDirectories() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.parked) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(r.parked))
-	for record := range r.parked {
-		if path, ok := r.pathLocked(record); ok {
-			if path == "" {
-				path = "/"
-			}
-			names = append(names, path)
-			continue
-		}
-		names = append(names, fmt.Sprintf("inode %d", record.key.inode))
-	}
-	sort.Strings(names)
-	return names
-}
-
 // acquireGraftFileHandle admits one operation on an open machine-local file.
 func (r *rawFileSystem) acquireGraftFileHandle(id uint64) (*handleRecord, *graftHandle) {
 	r.mu.Lock()
@@ -1500,11 +1413,6 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 			return fuse.OK
 		}
 	}
-	leave, errno := r.enterParentExclusive(parent)
-	if errno != 0 {
-		return fuse.Status(errno)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -1653,11 +1561,6 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 			return fuse.OK
 		}
 	}
-	leave, errno := r.enterParentExclusive(parent)
-	if errno != 0 {
-		return fuse.Status(errno)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -1705,11 +1608,6 @@ func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name strin
 			return fuse.OK
 		}
 	}
-	leave, errno := r.enterParentExclusive(parent)
-	if errno != 0 {
-		return fuse.Status(errno)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -1765,11 +1663,6 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 			return fuse.Status(errno)
 		}
 	}
-	leave, admissionErr := r.enterParentExclusive(parent)
-	if admissionErr != 0 {
-		return fuse.Status(admissionErr)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -1784,8 +1677,8 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 	if errno == 0 {
 		// The VFS drops the dentry from this operation's own reply, under the
 		// parent's i_rwsem. The binding is gone from the kernel, so this
-		// frontend no longer owes a repair for it -- and must not attempt one,
-		// because the notification would need the same lock this syscall holds.
+		// frontend no longer owes a repair for it; its source-publication gate
+		// already retains the exact post-VFS boundary for peers.
 		r.unbindSelf(parent.key.inode, name)
 		r.unbindPath(parent, name)
 		if err := completeSourcePublication(ctx); err != nil {
@@ -1835,11 +1728,6 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 			return fuse.Status(errno)
 		}
 	}
-	leave, admissionErr := r.enterParentExclusive(oldParent, newParent)
-	if admissionErr != 0 {
-		return fuse.Status(admissionErr)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -1886,11 +1774,6 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 			return status
 		}
 	}
-	leave, admissionErr := r.enterParentExclusive(newParent)
-	if admissionErr != 0 {
-		return fuse.Status(admissionErr)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -1940,11 +1823,6 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 			return fuse.OK
 		}
 	}
-	leave, admissionErr := r.enterParentExclusive(parent)
-	if admissionErr != 0 {
-		return fuse.Status(admissionErr)
-	}
-	defer leave()
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -2388,28 +2266,6 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 	}
 }
 
-// withParkedContext names the directories this mount was holding for an
-// unanswered authority mutation when it died.
-//
-// It is what makes the one failure a strict Linux FUSE mount cannot repair its
-// way out of diagnosable. The authority fences a participant whose COMPLETE
-// provably cannot run because that participant's own kernel holds the affected
-// directory exclusively -- and the authority knows that directory only as a
-// coordination identity. This mount knows its path. Saying it here is the
-// difference between "your mount was fenced" and "your mount was fenced while
-// it was in the middle of a mkdir in <path>".
-func (m *Mount) withParkedContext(err error) error {
-	if m.raw == nil {
-		return err
-	}
-	directories := m.raw.parkedDirectories()
-	if len(directories) == 0 {
-		return err
-	}
-	return fmt.Errorf("%w (this mount was holding %s for an authority mutation it had not been answered for; a strict Linux mount cannot invalidate a name in a directory its own unanswered namespace operation is holding)",
-		err, strings.Join(directories, ", "))
-}
-
 // abortAsync is safe from FORGET: it only cancels local contexts and schedules
 // unmount/detach I/O on a separate goroutine.
 func (m *Mount) abortAsync() {
@@ -2420,7 +2276,6 @@ func (m *Mount) failAsync(err error) {
 	if err == nil {
 		err = errors.New("fusev3: mount aborted")
 	}
-	err = m.withParkedContext(err)
 	// Failure discovery and teardown ownership are separate. Several terminal
 	// edges can race (for example SessionDone can arrive while coherence already
 	// holds a route-specific cause). The first edge owns cancellation and

@@ -43,6 +43,7 @@ func main() {
 }
 
 func run() error {
+	showVersion := flag.Bool("version", false, "print exact release identity and exit")
 	var productKeys issuerKeyFlags
 	listen := flag.String("listen", "", "mTLS control address")
 	stateFile := flag.String("state-file", "", "absolute durable manager state path")
@@ -67,6 +68,10 @@ func run() error {
 	observedStale := flag.Duration("observed-stale-after", 2*time.Minute, "maximum cell observation age for mount issuance")
 	clockSkew := flag.Duration("clock-skew", 5*time.Second, "maximum authenticated clock disagreement")
 	flag.Parse()
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	if flag.NArg() != 0 || *listen == "" || *stateFile == "" || *serverCert == "" || *serverKey == "" ||
 		*controlCA == "" || *planKey == "" || *capabilityKey == "" || *authorityCACert == "" ||
 		*authorityCAKey == "" || *clientCACert == "" || *clientCAKey == "" ||

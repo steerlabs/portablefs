@@ -21,7 +21,7 @@ func TestClientExposesItsSessionID(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {

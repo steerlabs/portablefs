@@ -97,7 +97,7 @@ func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *
 	if ProtocolMajor != 5 || ProtocolALPN != "portablefs-authority-v5" {
 		t.Fatalf("authority protocol=(major %d, ALPN %q), want (5, portablefs-authority-v5)", ProtocolMajor, ProtocolALPN)
 	}
-	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
+	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature, sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature}
 	if !hasFeatures(requiredHelloFeatures, required) {
 		t.Fatalf("Hello features %v omit protocol-5 requirements %v", requiredHelloFeatures, required)
 	}
@@ -117,6 +117,9 @@ func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *
 	}
 	if !hasFeatures(requiredStrictAttachFeatures, sourceGate) {
 		t.Fatalf("strict Attach features %v omit source-publication-gate-v1", requiredStrictAttachFeatures)
+	}
+	if !hasFeatures(requiredStrictAttachFeatures, []string{sequencedVisibilityRetryFeature}) {
+		t.Fatalf("strict Attach features %v omit %s", requiredStrictAttachFeatures, sequencedVisibilityRetryFeature)
 	}
 }
 
@@ -175,6 +178,103 @@ func TestSourcePublicationGatePresenceMatchesVisibleOperationMatrix(t *testing.T
 				t.Fatal("non-visible operation carrying source publication gate was accepted")
 			}
 		})
+	}
+}
+
+func TestVisibilityRetryRequestShapeAdmitsExactNamespaceGate(t *testing.T) {
+	identity := make([]byte, 16)
+	identity[0] = 1
+	itemWire := &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{{
+		Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+			Identity: identity, Attributes: true,
+		}},
+	}}}
+	itemRequest := &authoritypb.Request{
+		FrontendOperationId:          77,
+		VisibilityRetryAfterSequence: 41,
+		SourcePublicationGate:        itemWire,
+		Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{
+			Item: make([]byte, 16), Name: []byte("user.retry"), Value: []byte("v"),
+		}},
+	}
+	decoded, err := decodeSourcePublicationGate(itemRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validVisibilityRetryRequestShape(itemRequest, decoded) {
+		t.Fatal("exact item retry proof was refused")
+	}
+	namespaceRequest := proto.Clone(itemRequest).(*authoritypb.Request)
+	namespaceRequest.SourcePublicationGate = &authoritypb.SourcePublicationGate{
+		Targets: []*authoritypb.SourcePublicationTarget{{
+			Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+				ParentIdentity: identity, Name: []byte("child"),
+			}},
+		}},
+	}
+	namespaceGate, err := decodeSourcePublicationGate(namespaceRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validVisibilityRetryRequestShape(namespaceRequest, namespaceGate) {
+		t.Fatal("exact namespace retry proof was refused")
+	}
+
+	for name, mutate := range map[string]func(*authoritypb.Request){
+		"missing operation identity": func(request *authoritypb.Request) { request.FrontendOperationId = 0 },
+		"read-only request": func(request *authoritypb.Request) {
+			request.SourcePublicationGate = nil
+			request.Body = &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := proto.Clone(itemRequest).(*authoritypb.Request)
+			mutate(request)
+			gate, err := decodeSourcePublicationGate(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if validVisibilityRetryRequestShape(request, gate) {
+				t.Fatal("invalid visibility retry request shape was accepted")
+			}
+		})
+	}
+}
+
+func TestVisibilityRetryProofEntersReplayFingerprint(t *testing.T) {
+	runtime, err := volumeserver.New("retry-proof-fingerprint", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := make([]byte, 16)
+	identity[0] = 1
+	request := &authoritypb.Request{
+		SourcePublicationGate: &authoritypb.SourcePublicationGate{
+			Targets: []*authoritypb.SourcePublicationTarget{
+				{
+					Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+						Identity: identity, Attributes: true,
+					}},
+				},
+			},
+		},
+		Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{
+			Item: make([]byte, 16), Name: []byte("user.retry"), Value: []byte("v"),
+		}},
+	}
+	without, err := canonicalFingerprint(runtime, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.VisibilityRetryAfterSequence = 41
+	with, err := canonicalFingerprint(runtime, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if without == with {
+		t.Fatal("visibility retry proof was omitted from the retained replay identity")
 	}
 }
 

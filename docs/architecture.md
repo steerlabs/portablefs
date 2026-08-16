@@ -35,9 +35,8 @@ product stored elsewhere.
    which cached kernel mounts a previous epoch admitted.
 
 4. **Data-plane acknowledgement means applied.** Linux direct-I/O `write(2)`
-   completes after XFS application. The retained FSKit qualification adapter
-   also forwards callbacks synchronously, but current FSKit cannot satisfy the
-   complete cache-coherence contract and is not a production data plane.
+   completes after XFS application. The macOS 26 FSKit tier also forwards
+   callbacks synchronously, while stating its weaker kernel-cache boundary.
    PortableFS owns no separate tail to replay or park.
 
 5. **Coherence is synchronous or absent.** A cached frontend either holds state
@@ -47,25 +46,25 @@ product stored elsewhere.
 
 6. **Shared writing uses declared filesystem semantics.** Atomic rename,
    authority-serialized exclusive create, distinct files, POSIX record locks,
-   `flock`, and append intent work through the supported Linux frontend. FSKit
-   exposes neither the lock/append callbacks nor all cache primitives required
-   by this contract, so production macOS mounts are refused rather than claiming
-   a partial shared-writing model. PortableFS does not merge file contents or
-   invent conflict resolution to hide a platform gap.
+   `flock`, and append intent work through the exact Linux frontend. An active
+   macOS 26 mount owns one compatibility writer lease: Linux peers can read,
+   but their visible mutations return `EBUSY` until the Mac unmounts. macOS 26
+   does not provide distributed locks or authority atomic append. PortableFS
+   does not merge file contents or invent conflict resolution to hide a
+   platform gap.
 
 7. **One transport per supported platform, with no fallback.** Linux mounts
-   through kernel FUSE. macOS and Windows remain primitive-gated rather than
-   selecting frontends that cannot control caching exactly. On macOS, the CLI,
-   shipping FSKit extension, and portablefsd each refuse protocol 5 before
-   authority Attach or transport. A host without a supported transport fails
-   with guidance rather than degrading to a weaker consistency model.
+   through kernel FUSE. macOS 26 mounts through one named FSKit best-effort
+   policy. Unknown Mac policies and Windows remain primitive-gated. A host
+   without a supported transport fails with guidance rather than substituting
+   a different filesystem or protocol.
 
 8. **Unsupported is explicit.** Shared file-backed `mmap`, `setxattr`, device
    nodes, FIFOs, sockets, and cross-volume rename are refused with a real errno.
    They are never emulated with divergent semantics. Linux and the authority
    expose unsupported xattr mutation as `EOPNOTSUPP`; no client invents a
-   second xattr store. Current macOS is refused at the platform gate before any
-   per-operation capability is advertised.
+   second xattr store. macOS advertises its operation-level limits and returns
+   the matching errno.
 
 9. **Lifecycle control stays out of filesystem I/O.** The optional hosted
    manager may store placement, quota entitlement, PKI, authorization receipts,
@@ -94,8 +93,8 @@ product stored elsewhere.
 | Running a volume | [xfs-authority-deployment.md](./xfs-authority-deployment.md) |
 | Hosted placement, credentials, reauthorization, and fencing | [hosted-control-plane.md](./hosted-control-plane.md) |
 | Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
-| Why current macOS fails before Attach and what a future FSKit must prove | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
-| The retained non-shipping FSKit qualification mount path | [fskit-mount.md](./fskit-mount.md) |
+| The macOS 26 best-effort boundary and future exact requirements | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
+| The shipping macOS FSKit mount path | [fskit-mount.md](./fskit-mount.md) |
 | Why Windows currently fails closed and what a native frontend must prove | [windows-mount.md](./windows-mount.md) |
 | Machine-local routing and its confinement boundary | [graft-security.md](./graft-security.md) |
 | What is actually verified, and how | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |

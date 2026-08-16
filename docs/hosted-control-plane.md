@@ -7,9 +7,8 @@ hosted stack adds a product-neutral manager and a narrow storage-cell control
 loop around the same authority data plane. It does not put the manager in the
 filesystem I/O path and it does not create a second filesystem truth.
 
-Current production mount transport is Linux FUSE. The retained macOS data-plane
-code is a non-shipping qualification lane and is refused before Attach by an
-ordinary release.
+The exact mount transport is Linux FUSE. Shipping macOS 26 uses the named
+best-effort FSKit data plane against the same hosted authority.
 
 ```text
 product backend                    Linux mount
@@ -65,8 +64,10 @@ before a local process-absence proof.
 one strict root-owned config, constructs a fixed authority argument shape, and
 execs a root-owned authority binary. The authority itself runs under a unique
 service UID, receives its listener from systemd, sees only one bind-mounted
-volume/config/state triple, has no network namespace of its own, and refuses
-root.
+volume/config/state/staging set, has no network namespace of its own, and
+refuses root. Staging is outside the served namespace but inherits the exact
+volume XFS project and hard quota; its bind source cannot be replaced by the
+authority UID.
 
 ## Authorization is deliberately two-party
 
@@ -86,9 +87,9 @@ useless. The manager's mTLS API also binds every product operation to the exact
 product issuer in its control certificate; a product principal cannot inspect,
 restart, retire, or mint for another product's volume.
 
-The client private key is generated on the Linux mount host or sandbox. A
-separately signed macOS qualification harness exercises the same key-custody
-boundary, but is not a production mount. Only a signed CSR crosses the network.
+The client private key is generated on the Linux mount host, sandbox, or macOS
+host. The signed macOS product exercises the same key-custody boundary. Only a
+signed CSR crosses the network.
 The manager verifies proof of possession, overwrites CSR identity fields, and
 returns a client certificate and capability bound to the CSR's SPKI. It never
 receives or generates the client private key.
@@ -133,9 +134,8 @@ Linux FUSE supervisor is the one renewal owner. There is no global mount daemon
 and no second sequencer, and an automatic mount exposes no manual rotation
 socket.
 
-The retained macOS qualification data plane has an equivalent single renewer
-inside its portablefsd attach and refuses manual rotation. That code is not a
-production owner while current FSKit is refused before Attach.
+The macOS data plane has an equivalent single renewer inside its portablefsd
+attach and refuses manual rotation.
 
 The owner immediately asks
 `POST /v1/mount-enrollments/{id}/reauthorizations` for sequence one, then

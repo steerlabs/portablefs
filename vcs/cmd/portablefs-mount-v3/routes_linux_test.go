@@ -259,7 +259,7 @@ func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 		DialTimeout: 10 * time.Second, CancelDrainTimeout: 5 * time.Second, MaxInFlight: 64,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 15 * time.Second,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return &authoritypb.MountAbsenceProof{
 				ObservedUnixNanos: time.Now().UnixNano(),

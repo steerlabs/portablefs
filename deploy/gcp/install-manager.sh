@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ $# == 1 && $1 == /* && -d $1 ]] || {
-  echo "usage: $0 /absolute/manager-stage" >&2
+[[ $# == 2 && $1 == /* && -d $1 && $2 == /* && -d $2 ]] || {
+  echo "usage: $0 /absolute/hosted-release /absolute/manager-config-stage" >&2
   exit 64
 }
 [[ $(id -u) == 0 ]] || {
@@ -10,9 +10,10 @@ set -euo pipefail
   exit 77
 }
 
-stage=$1
+release=$1
+stage=$2
 for relative in \
-  portablefs-manager portablefs-manager.service manager.env \
+  manager.env \
   pki/tls/manager.cert pki/tls/manager.key \
   pki/trust/control-client-ca.pem pki/trust/authority-ca.pem \
   pki/trust/mount-client-ca.pem pki/trust/mount-enrollment-ca.pem pki/trust/product-public.pem \
@@ -36,8 +37,6 @@ fi
   exit 65
 }
 
-install -o root -g root -m 0755 "$stage/portablefs-manager" /usr/local/bin/portablefs-manager
-install -o root -g root -m 0644 "$stage/portablefs-manager.service" /etc/systemd/system/portablefs-manager.service
 install -d -o root -g root -m 0755 /etc/portablefs/manager/{tls,trust,keys}
 install -o root -g root -m 0600 "$stage/manager.env" /etc/portablefs/manager/manager.env
 
@@ -51,7 +50,8 @@ for name in plan-signing.key capability-signing.key authority-ca.key mount-clien
   install -o portablefs-manager -g portablefs-manager -m 0400 "$stage/pki/keys/$name" "/etc/portablefs/manager/keys/$name"
 done
 
+"$(dirname -- "$0")/activate-hosted-release.sh" "$release" manager >/dev/null
+
 systemd-analyze verify /etc/systemd/system/portablefs-manager.service
-systemctl daemon-reload
-systemctl enable --now portablefs-manager.service
+systemctl enable portablefs-manager.service
 systemctl --quiet is-active portablefs-manager.service

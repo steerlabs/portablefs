@@ -28,6 +28,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var version = "dev"
+
 type options struct {
 	listen, volumeID, root                         string
 	projectID                                      uint
@@ -64,6 +66,7 @@ type options struct {
 
 func run() error {
 	var o options
+	showVersion := flag.Bool("version", false, "print exact release identity and exit")
 	flag.StringVar(&o.listen, "listen", "", "TCP address to listen on")
 	flag.StringVar(&o.volumeID, "volume-id", "", "exact volume identity served by this process")
 	flag.StringVar(&o.root, "root", "", "absolute provisioned XFS project-directory root")
@@ -117,6 +120,10 @@ func run() error {
 	flag.DurationVar(&o.maxRepairBudget, "max-repair-budget", 30*time.Second, "longest per-phase cache-repair deadline a strict mount may commit to before it is fenced; must be at least the mount's -repair-budget")
 	flag.DurationVar(&o.visibilityClockSkew, "visibility-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
 	flag.Parse()
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	if os.Geteuid() == 0 {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
 	}

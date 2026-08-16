@@ -135,13 +135,11 @@ func run() error {
 	}
 	// How this frontend's kernel makes a cached binding unservable. It is
 	// declared rather than inferred because the authority cannot observe a
-	// remote kernel, and on Linux FUSE the answer is load-bearing: making a
-	// binding unservable takes the parent directory's i_rwsem for write, which
-	// is the same lock a namespace syscall holds across the whole authority
-	// round trip. Saying so is what lets the authority tell a provably closed
-	// repair cycle apart from an ordinary slow lock, and fence one participant
-	// immediately instead of stalling the volume for a whole repair budget.
-	attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+	// remote kernel. The strict Linux answer is load-bearing: its private
+	// reverse notification expires one exact binding under dcache locks without
+	// taking the parent inode's i_rwsem. A stock parent-lock implementation is
+	// refused rather than translated into synthetic application EINTR.
+	attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
 	if len(localDirs) != 0 {
 		return fmt.Errorf("machine-local routes are declared volume-wide in %s; -local-dir would add a route only this machine knows about, which desynchronizes the routing topology the authority pins every mount to", fusev3.LocalDirsPath)
 	}

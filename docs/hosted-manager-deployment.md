@@ -66,14 +66,25 @@ limits a mount-enrollment certificate to its own refresh and close endpoints.
 
 ## Install and configure
 
-Install a root-owned, non-group-writable, release-stamped Linux binary at:
+Build and verify the same immutable hosted release used by its cells. The
+manager executes through the single atomic release root:
 
 ```text
-/usr/local/bin/portablefs-manager
+/opt/portablefs/current/bin/portablefs-manager
 ```
 
-Install `deploy/systemd/portablefs-manager.service`. Create the stable service
-account and root-owned configuration hierarchy:
+Keep keys and certificates in a separate root-only configuration stage, then
+run:
+
+```bash
+sudo deploy/gcp/install-manager.sh \
+  /absolute/portablefs-hosted_<release>_linux_<arch> \
+  /absolute/manager-config-stage
+```
+
+This verifies every release member and executable identity before atomically
+activating the release and starting `portablefs-manager.service`. Create the
+stable service account and root-owned configuration hierarchy:
 
 ```text
 /etc/portablefs/manager/manager.env

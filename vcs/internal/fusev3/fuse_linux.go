@@ -106,12 +106,9 @@ type RPC interface {
 	InitialVisibilityCursor() *authoritypb.VisibilityCursor
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	NextVisibilityAfterAck(context.Context, *authoritypb.VisibilityCursor, bool) (*authoritypb.VisibilityEvent, error)
-	// ReportVisibilityBlocked arms a nonterminal cycle break for the exact kernel
-	// parents this frontend both needs to repair and already has a callback parked
-	// in. The authority maps them through the pending COMPLETE to stable parent
-	// identities and refuses those queued mutations pre-apply; ordinary COMPLETE
-	// acknowledgment later removes the scope. Route changes use an empty parent
-	// set as the terminal unable-to-serve report.
+	// ReportVisibilityBlocked is the terminal unable-to-serve report for a route
+	// revision. Lockless namespace repair never reports an ordinary filesystem
+	// phase blocked.
 	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor, []uint64) error
 	// DetachAfterUnmount may be called only with evidence that this frontend's
 	// kernel mount is gone.
@@ -964,6 +961,14 @@ func (n *node) read(parent context.Context, request *authoritypb.Request) (*auth
 	}
 	defer n.mount.releaseBulk()
 	response, consumption, err := n.mount.rpc.CallReadRetained(ctx, request, n.mount.forceTerminalResponseRevocation)
+	if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
+		response.GetVisibilityRetrySequence() != 0) {
+		if consumption != nil {
+			consumption.Consume()
+		}
+		n.mount.revoke(errors.New("fusev3: authority returned a visibility retry for a read-only request"))
+		return response, syscall.ENOTCONN
+	}
 	if consumption != nil {
 		if retainErr := retainAuthorityResponse(parent, consumption); retainErr != nil {
 			n.mount.revoke(retainErr)
@@ -995,10 +1000,26 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 	if callback == nil || m.raw == nil {
 		return nil, errors.New("fusev3: strict mutation escaped its raw callback publication lifecycle")
 	}
+	if callback.operationID == 0 || request.GetFrontendOperationId() != 0 && request.GetFrontendOperationId() != callback.operationID {
+		return nil, errors.New("fusev3: mutation carried an invalid frontend operation identity")
+	}
+	if request.GetVisibilityRetryAfterSequence() != 0 {
+		return nil, errors.New("fusev3: mutation entered its callback with a pre-populated visibility retry proof")
+	}
+	request.FrontendOperationId = callback.operationID
 	if !requiresGate {
 		response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(
 			ctx, request, nil, m.forceTerminalResponseRevocation,
 		)
+		if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
+			response.GetVisibilityRetrySequence() != 0) {
+			if consumption != nil {
+				consumption.Consume()
+			}
+			protocolErr := errors.New("fusev3: authority returned a visibility retry for a mutation with no source gate")
+			m.revoke(protocolErr)
+			return response, protocolErr
+		}
 		if consumption != nil {
 			if retainErr := retainAuthorityResponse(ctx, consumption); retainErr != nil {
 				m.revoke(retainErr)
@@ -1008,63 +1029,108 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 		}
 		return response, callErr
 	}
-	lease, err := callback.acquireSource(ctx, m.raw, gate)
-	if err != nil {
-		return nil, err
-	}
-	assignmentFailed := false
-	response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(ctx, request, func(authorityrpc.MutationIdentity) error {
-		if err := lease.markAssigned(); err != nil {
+	for {
+		lease, err := callback.acquireSource(ctx, m.raw, gate)
+		if err != nil {
+			return nil, err
+		}
+		assignmentFailed := false
+		response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(ctx, request, func(authorityrpc.MutationIdentity) error {
+			if err := lease.markAssigned(); err != nil {
+				assignmentFailed = true
+				lease.revoke()
+				m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
+				return err
+			}
+			return nil
+		}, m.forceTerminalResponseRevocation)
+		assigned := lease.isAssigned()
+		if response != nil && response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY &&
+			response.GetVisibilityRetrySequence() != 0 {
+			if consumption != nil {
+				consumption.Consume()
+			}
+			lease.revoke()
+			protocolErr := errors.New("fusev3: authority attached a visibility retry sequence to a non-retry response")
+			m.revoke(protocolErr)
+			return response, protocolErr
+		}
+		if response != nil && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
+			validRetry := callErr == nil && assigned && !assignmentFailed && !response.GetUncertain() &&
+				responseErrno(response) == syscall.EINTR && response.GetBody() == nil &&
+				response.GetPostAttr() == nil && response.GetRoutesMismatch() == nil && len(response.GetTerminalDeliveryToken()) == 0 &&
+				response.GetVisibilityRetrySequence() != 0
+			if !validRetry {
+				if consumption != nil {
+					consumption.Consume()
+				}
+				lease.revoke()
+				protocolErr := errors.New("fusev3: authority returned a malformed visibility retry")
+				m.revoke(protocolErr)
+				return response, protocolErr
+			}
+			if consumption != nil {
+				consumption.Consume()
+			}
+			if err := callback.releaseVisibilityRetry(lease); err != nil {
+				lease.revoke()
+				m.revoke(fmt.Errorf("fusev3: release visibility retry: %w", err))
+				return response, err
+			}
+			if err := m.raw.waitForVisibilityCompletion(ctx, response.GetVisibilityRetrySequence()); err != nil {
+				m.revoke(err)
+				return response, err
+			}
+			// The local repair is complete, but its combined ACK+NEXT request may
+			// still be in flight on the independent CONTROL lane. Bind the next
+			// replay identity to the exact authority-issued sequence so the server
+			// can wait behind that ACK without reopening the original gate cycle.
+			request.VisibilityRetryAfterSequence = response.GetVisibilityRetrySequence()
+			continue
+		}
+		if consumption != nil {
+			if retainErr := retainAuthorityResponse(ctx, consumption); retainErr != nil {
+				m.revoke(retainErr)
+				consumption.Consume()
+				return response, retainErr
+			}
+		}
+		if !assignmentFailed && !assigned && callErr == nil {
+			// A transport response is impossible before the assignment callback: the
+			// callback is the exact boundary immediately before the first send and is
+			// also replayed for the retained identity. Treat a client which bypasses
+			// that ownership transition as terminal even when it returned an errno;
+			// otherwise the lease could reopen around an untracked applied mutation.
 			assignmentFailed = true
 			lease.revoke()
-			m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
-			return err
+			lifecycleErr := errors.New("fusev3: source mutation transport returned without assigning its replay identity")
+			m.revoke(lifecycleErr)
+			callErr = lifecycleErr
 		}
-		return nil
-	}, m.forceTerminalResponseRevocation)
-	if consumption != nil {
-		if retainErr := retainAuthorityResponse(ctx, consumption); retainErr != nil {
-			m.revoke(retainErr)
-			consumption.Consume()
-			return response, retainErr
-		}
-	}
-	assigned := lease.isAssigned()
-	if !assignmentFailed && !assigned && callErr == nil {
-		// A transport response is impossible before the assignment callback: the
-		// callback is the exact boundary immediately before the first send and is
-		// also replayed for the retained identity. Treat a client which bypasses
-		// that ownership transition as terminal even when it returned an errno;
-		// otherwise the lease could reopen around an untracked applied mutation.
-		assignmentFailed = true
-		lease.revoke()
-		lifecycleErr := errors.New("fusev3: source mutation transport returned without assigning its replay identity")
-		m.revoke(lifecycleErr)
-		callErr = lifecycleErr
-	}
-	if !assignmentFailed && assigned && (callErr != nil || response == nil || response.GetUncertain()) {
-		lease.revoke()
-		cause := callErr
-		if cause == nil {
-			cause = authorityrpc.ErrTransportUncertain
-		}
-		m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
-	}
-	definiteNoChange := response != nil && responseErrno(response) != 0
-	if !assignmentFailed && callErr == nil && response != nil && !response.GetUncertain() && definiteNoChange {
-		lease.resolveAllNoBinding()
-		if err := lease.markDefiniteNoChange(); err != nil {
+		if !assignmentFailed && assigned && (callErr != nil || response == nil || response.GetUncertain()) {
 			lease.revoke()
-			m.revoke(fmt.Errorf("fusev3: source mutation could not record its definite refusal: %w", err))
+			cause := callErr
+			if cause == nil {
+				cause = authorityrpc.ErrTransportUncertain
+			}
+			m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
 		}
-	} else if !assignmentFailed && !assigned && callErr != nil {
-		lease.resolveAllNoBinding()
-		if err := lease.markDefiniteNoChange(); err != nil {
-			lease.revoke()
-			m.revoke(fmt.Errorf("fusev3: source mutation could not record its pre-dispatch refusal: %w", err))
+		definiteNoChange := response != nil && responseErrno(response) != 0
+		if !assignmentFailed && callErr == nil && response != nil && !response.GetUncertain() && definiteNoChange {
+			lease.resolveAllNoBinding()
+			if err := lease.markDefiniteNoChange(); err != nil {
+				lease.revoke()
+				m.revoke(fmt.Errorf("fusev3: source mutation could not record its definite refusal: %w", err))
+			}
+		} else if !assignmentFailed && !assigned && callErr != nil {
+			lease.resolveAllNoBinding()
+			if err := lease.markDefiniteNoChange(); err != nil {
+				lease.revoke()
+				m.revoke(fmt.Errorf("fusev3: source mutation could not record its pre-dispatch refusal: %w", err))
+			}
 		}
+		return response, callErr
 	}
-	return response, callErr
 }
 
 // requestRequiresSourcePublication is the Linux-side grammar boundary for
@@ -1867,9 +1933,6 @@ func kindMode(kind authoritypb.Attr_Kind) uint32 {
 
 func rpcErrno(response *authoritypb.Response, err error) syscall.Errno {
 	if err != nil {
-		if errors.Is(err, errSourcePublicationInterrupted) {
-			return syscall.EINTR
-		}
 		if errno := contextErrno(err); errno != 0 {
 			return errno
 		}

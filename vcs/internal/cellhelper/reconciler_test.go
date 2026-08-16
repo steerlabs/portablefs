@@ -85,6 +85,39 @@ func TestReconcilerRequiresFenceBeforeAuthorityGeneration(t *testing.T) {
 	}
 }
 
+func TestReconcilerReappliesUnchangedPlanForNewHelperRelease(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_900_000_000, 0)
+	host := &fakeHost{}
+	statePath := filepath.Join(t.TempDir(), "state")
+	reconciler := &Reconciler{
+		CellID: "11111111-1111-4111-8111-111111111111", PlanPublicKey: publicKey,
+		ClockSkew: 10 * time.Second, PlanLifetime: 5 * time.Minute, Now: func() time.Time { return now },
+		StatePath: statePath, Host: host, ReleaseID: "helper-one",
+	}
+	plan := helperPlan(now, reconciler.CellID, 1, 1, cellplan.PhaseServe)
+	envelope := signedHelperPlan(t, privateKey, plan)
+	if _, err := reconciler.Reconcile(context.Background(), envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.calls) != 1 || len(host.observes) != 0 {
+		t.Fatalf("initial apply=%d observe=%d", len(host.calls), len(host.observes))
+	}
+	reconciler.ReleaseID = "helper-two"
+	if _, err := reconciler.Reconcile(context.Background(), envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.calls) != 2 || len(host.observes) != 0 {
+		t.Fatalf("release migration apply=%d observe=%d", len(host.calls), len(host.observes))
+	}
+	if _, err := reconciler.Reconcile(context.Background(), envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.calls) != 2 || len(host.observes) != 1 {
+		t.Fatalf("settled release apply=%d observe=%d", len(host.calls), len(host.observes))
+	}
+}
+
 func TestReconcilerRejectsSameGenerationEquivocationAndIDSwap(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_900_000_000, 0)

@@ -934,10 +934,52 @@ func (h *VolumeHandler) markWriteTransactionCommitting(id volumeserver.SessionID
 		transaction.refs.Done()
 		return h.fenceWriteTransactionMismatch(id)
 	}
-	// From this point the transaction cannot be swept or aborted. The replay
-	// slot owns every terminal outcome, including a definite refusal while
-	// waiting for visibility order.
+	// From this point the transaction cannot be swept or aborted. A terminal
+	// outcome consumes it through the replay slot. The one nonterminal outcome
+	// is a Linux item-only visibility handoff: resetWriteTransactionForRetry
+	// returns these inert staged bytes to STAGING before that classified reply
+	// is retained, so the frontend can retry COMMIT with a fresh mutation ID.
 	transaction.state = writeTransactionCommitting
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+	return nil
+}
+
+// resetWriteTransactionForRetry preserves inert staged bytes across the
+// authority's item-only visibility handoff. No XFS callback ran, so retaining
+// the staging file is both exact and avoids copying the user's write into a
+// second BEGIN/DATA sequence. The transaction's absolute lifetime remains
+// fixed; only its ordinary progress deadline advances, bounded by that limit.
+func (h *VolumeHandler) resetWriteTransactionForRetry(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) error {
+	resources, err := h.writeTransactionResources(id)
+	if err != nil {
+		return err
+	}
+	metadata, err := writeTransactionMetadataFromRequest(body)
+	if err != nil {
+		return err
+	}
+	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
+	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+		if transaction != nil {
+			transaction.refs.Done()
+		}
+		return h.fenceWriteTransactionMismatch(id)
+	}
+	transaction.mu.Lock()
+	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionCommitting ||
+		transaction.staged != body.GetFragmentOffset() {
+		transaction.mu.Unlock()
+		transaction.refs.Done()
+		return h.fenceWriteTransactionMismatch(id)
+	}
+	now := time.Now()
+	progress := now.Add(h.WriteTransactionProgressTimeout)
+	if progress.After(transaction.absoluteDeadline) {
+		progress = transaction.absoluteDeadline
+	}
+	transaction.state = writeTransactionStaging
+	transaction.progressDeadline = progress
 	transaction.mu.Unlock()
 	transaction.refs.Done()
 	return nil

@@ -7,9 +7,8 @@ stack. Most of that ledger is gone with the code it described. What remains
 below are the items whose subject matter survives the reset — an unexplained
 observation, four macOS platform gaps, and one design question that must be
 re-asked rather than carried forward as an answer. The platform gaps now form
-part of the reason production protocol-5 macOS is refused before Attach. Any
-new live experiment uses a separately signed qualification artifact and cannot
-by itself promote current FSKit to support.
+part of the reason macOS 26 is a named best-effort tier rather than the exact
+Linux tier. New live experiments must identify which tier they exercise.
 
 ## Open
 
@@ -45,7 +44,8 @@ kernels, not for substituting an undocumented contract.
   directory's cache. Cross-machine "stat-poll until it appears" cannot work.
   Enumeration happened to consult the filesystem in those experiments, but
   using it as a discovery workaround would not satisfy protocol-5 namespace
-  visibility. This absence is a production refusal, not a bounded cache claim;
+  visibility. The SDK-26 product uses authenticated synchronous repair, but the
+  absence prevents an exact cache claim;
   see
   [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 - **No advisory-lock operations.** FSKit exposes no lock callbacks, so
@@ -53,26 +53,25 @@ kernels, not for substituting an undocumented contract.
   v3 adapter conforms to the operations, open/close, read/write, xattr, and
   pathconf protocols and to nothing else, so this is unchanged. Qualification
   can exercise authority-serialized `O_EXCL` create, but there is no supported
-  production macOS mutual-exclusion surface. Linux is not in this position:
+  cross-machine Mac mutual-exclusion surface. Linux is not in this position:
   the Linux frontend refuses to mount unless the kernel forwards both POSIX
   record locks and `flock` (see [consistency-model.md](./consistency-model.md)),
   so the two platforms differ here by design and the difference must stay stated.
 - **No append intent.** `FSVolume.OpenModes` carries only read and write access
   bits and writes arrive with kernel-resolved offsets, so cross-machine
   `O_APPEND` interleaving cannot be expressed on FSKit; FUSE mounts do get true
-  authority-assigned append offsets. This is an additional qualification gap,
-  not a production usage recommendation. The boundary is stated in
+  authority-assigned append offsets. This is a stated best-effort-tier gap, not
+  a concurrent-append usage recommendation. The boundary is stated in
   [fskit-mount.md](./fskit-mount.md).
 - **Replacing the hosting app tears down live mounts.** Replacing or
   re-registering an app that hosts an FSKit extension makes `pkd` `SIGTERM` the
   running extension instance, killing every live mount mid-write. Installers and
   updaters must drain mounts first. This one has a concrete v3 consequence that
   is not yet designed: the release installer replaces PortableFS.app, so the
-  qualification install path and live qualification mount lifecycle must remain
-  coordinated. Production does not reach a kernel mount today.
+  shipping install path and live mount lifecycle must remain coordinated.
 
-These facts remain input to the platform support gate. They do not define a
-weaker macOS consistency tier.
+These facts define the limits of the named macOS 26 best-effort tier and the
+requirements for a future exact tier.
 
 ### Path-scoped repair versus inode-shared objects — re-ask, do not assume
 

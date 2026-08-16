@@ -4,8 +4,8 @@ Requires=portablefs-authority@%i.socket
 After=portablefs-authority@%i.socket
 
 [Service]
-Type=simple
-ExecStart=/usr/local/libexec/portablefs-authority-launcher
+Type=exec
+ExecStart=/opt/portablefs/current/libexec/portablefs-authority-launcher
 Restart=no
 NoNewPrivileges=yes
 CapabilityBoundingSet=

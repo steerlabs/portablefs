@@ -25,26 +25,27 @@ type Host interface {
 }
 
 type Assignment struct {
-	VolumeID            string               `json:"volume_id"`
-	AuthorizationDomain string               `json:"authorization_domain"`
-	Owner               string               `json:"owner"`
-	ProductIssuer       string               `json:"product_issuer"`
-	ProductPublicKeyPEM string               `json:"product_public_key_pem"`
-	CellID              string               `json:"cell_id"`
-	ProjectID           uint32               `json:"project_id"`
-	ServiceUID          uint32               `json:"service_uid"`
-	ServiceGID          uint32               `json:"service_gid"`
-	ListenPort          uint16               `json:"listen_port"`
-	QuotaBytes          uint64               `json:"quota_bytes"`
-	QuotaInodes         uint64               `json:"quota_inodes"`
-	AuthorityID         string               `json:"authority_id"`
-	AuthorityServerName string               `json:"authority_server_name"`
-	AuthorityGeneration uint64               `json:"authority_generation"`
-	LastPhase           cellplan.VolumePhase `json:"last_phase"`
-	AuthorityAbsent     bool                 `json:"authority_absent"`
-	QuotaApplied        bool                 `json:"quota_applied"`
-	Applied             bool                 `json:"applied"`
-	AppliedPlanHash     string               `json:"applied_plan_sha256,omitempty"`
+	VolumeID             string               `json:"volume_id"`
+	AuthorizationDomain  string               `json:"authorization_domain"`
+	Owner                string               `json:"owner"`
+	ProductIssuer        string               `json:"product_issuer"`
+	ProductPublicKeyPEM  string               `json:"product_public_key_pem"`
+	CellID               string               `json:"cell_id"`
+	ProjectID            uint32               `json:"project_id"`
+	ServiceUID           uint32               `json:"service_uid"`
+	ServiceGID           uint32               `json:"service_gid"`
+	ListenPort           uint16               `json:"listen_port"`
+	QuotaBytes           uint64               `json:"quota_bytes"`
+	QuotaInodes          uint64               `json:"quota_inodes"`
+	AuthorityID          string               `json:"authority_id"`
+	AuthorityServerName  string               `json:"authority_server_name"`
+	AuthorityGeneration  uint64               `json:"authority_generation"`
+	LastPhase            cellplan.VolumePhase `json:"last_phase"`
+	AuthorityAbsent      bool                 `json:"authority_absent"`
+	QuotaApplied         bool                 `json:"quota_applied"`
+	Applied              bool                 `json:"applied"`
+	AppliedPlanHash      string               `json:"applied_plan_sha256,omitempty"`
+	AppliedHelperRelease string               `json:"applied_helper_release,omitempty"`
 }
 
 type State struct {
@@ -128,7 +129,7 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 			previous = assignmentFromPlan(volume, reconciler.CellID)
 		}
 		observed := controlplane.VolumeObservation{}
-		if previous.Applied && previous.AppliedPlanHash == volumeDigestHex {
+		if previous.Applied && previous.AppliedPlanHash == volumeDigestHex && previous.AppliedHelperRelease == reconciler.ReleaseID {
 			observed = reconciler.Host.Observe(ctx, volume, previous)
 		} else {
 			observed = reconciler.Host.Apply(ctx, volume, previous)
@@ -148,6 +149,7 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 		assignment.Applied = observed.Error == ""
 		if assignment.Applied {
 			assignment.AppliedPlanHash = volumeDigestHex
+			assignment.AppliedHelperRelease = reconciler.ReleaseID
 		}
 		state.Assignments[volume.VolumeID] = assignment
 	}

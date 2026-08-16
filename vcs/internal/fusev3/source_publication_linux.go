@@ -55,13 +55,6 @@ type publicationNamespace struct {
 	name   string
 }
 
-// errSourcePublicationInterrupted is a definite, pre-dispatch refusal. The
-// peer visibility cut already owns an overlapping coordinate, so a Linux raw
-// callback must yield immediately instead of waiting while it may hold a VFS
-// lock COMPLETE needs. No replay identity has been assigned and no bytes have
-// been sent; returning EINTR to the kernel is therefore safe and retryable.
-var errSourcePublicationInterrupted = errors.New("fusev3: source publication yielded to an overlapping peer visibility cut")
-
 type namespaceBounds struct {
 	attributes bool
 	data       bool
@@ -314,8 +307,10 @@ func (r *rawFileSystem) peerPublicationOverlapLocked(coordinates map[publication
 
 // acquirePeerPublication linearizes a peer PREPARE with both source gates and
 // ordinary cached-reply admission. The peer cut is installed first. Existing
-// source owners drain through it, while every later overlapping source yields
-// before assignment instead of extending the drain indefinitely.
+// source owners drain through it. A later source yields before assignment and
+// receives one authority-sequenced internal retry after the exact peer repair.
+// Namespace and inode coordinates use the same FIFO rule because strict Linux
+// namespace expiration takes no parent inode lock.
 func (r *rawFileSystem) acquirePeerPublication(ctx context.Context, targets []*authoritypb.VisibilityTarget, keys visibilityKeys) error {
 	coordinates, err := coordinatesForVisibilityTargets(targets)
 	if err != nil {
@@ -373,6 +368,32 @@ func (r *rawFileSystem) releasePeerPublicationLocked() {
 func (r *rawFileSystem) signalSourceChangedLocked() {
 	close(r.sourceChanged)
 	r.sourceChanged = make(chan struct{})
+}
+
+// waitForVisibilityCompletion joins a mutation retry to the exact
+// peer repair which caused it. The sequence is authority-assigned and globally
+// monotonic for the volume. Waiting on the local completion counter makes the
+// independent DATA and CONTROL lanes deterministic without polling or retry
+// backoff; a repair that completed before the retry response arrived satisfies
+// the wait immediately.
+func (r *rawFileSystem) waitForVisibilityCompletion(ctx context.Context, sequence uint64) error {
+	if sequence == 0 {
+		return errors.New("fusev3: visibility retry carried no sequence")
+	}
+	for {
+		r.mu.Lock()
+		if r.completedVisibilitySequence >= sequence {
+			r.mu.Unlock()
+			return nil
+		}
+		changed := r.sourceChanged
+		r.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("fusev3: wait for visibility sequence %d: %w", sequence, ctx.Err())
+		}
+	}
 }
 
 func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
@@ -516,12 +537,19 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *auth
 				addBoundCoordinates(coordinates, record.identity, bounds)
 			}
 		}
-		// Peer-first is an asymmetric yield, never a wait: this raw callback
-		// may already hold the VFS lock peer COMPLETE needs. Because the source
-		// gate is still pre-assignment, the refusal is definite and retryable.
+		// The strict kernel expires namespace bindings without the parent inode
+		// lock, so every source gate can wait behind an older peer publication.
+		// This is an internal scheduling boundary: no synthetic EINTR escapes to
+		// applications for either namespace or inode mutations.
 		if r.peerPublicationHeldLocked(coordinates) || r.peerOverlapUnresolvedLocked(lease.unresolvedAttributes, lease.unresolvedData) {
+			changed := r.sourceChanged
 			r.mu.Unlock()
-			return nil, errSourcePublicationInterrupted
+			select {
+			case <-changed:
+				continue
+			case <-ctx.Done():
+				return nil, fmt.Errorf("fusev3: wait for prior peer publication: %w", ctx.Err())
+			}
 		}
 		if r.sourceLeaseOverlapLocked(coordinates, nil) ||
 			r.unresolvedSourceOverlapLocked(coordinates, nil) ||

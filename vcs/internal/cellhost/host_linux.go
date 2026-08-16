@@ -170,6 +170,14 @@ func (host *Host) observeProvisioned(plan cellplan.VolumePlan) (bool, string, er
 	if err := verifyProvisionedVolume(volumeFD, plan); err != nil {
 		return false, "", err
 	}
+	stagingFD, err := host.openWriteStaging(plan.VolumeID)
+	if err != nil {
+		return false, "", fmt.Errorf("cellhost: write staging is absent or unsafe: %w", err)
+	}
+	defer unix.Close(stagingFD)
+	if err := verifyProjectDirectory(stagingFD, plan, plan.ServiceUID, plan.ServiceGID, 0o700, "write staging"); err != nil {
+		return false, "", err
+	}
 	csrPath := filepath.Join(host.cfg.ConfigRoot, plan.VolumeID, fmt.Sprintf("authority-%d.csr", plan.AuthorityGeneration))
 	info, err := os.Lstat(csrPath)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
@@ -223,6 +231,10 @@ func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, apply
 		}
 	}
 	if err := verifyProvisionedVolume(volumeFD, plan); err != nil {
+		return false, "", err
+	}
+	stagingPath, err := host.ensureWriteStaging(ctx, plan)
+	if err != nil {
 		return false, "", err
 	}
 	configDirectory := filepath.Join(host.cfg.ConfigRoot, plan.VolumeID)
@@ -281,7 +293,7 @@ func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, apply
 	if err := writeAtomic(filepath.Join(configDirectory, "authority.json"), configBytes, 0, int(plan.ServiceGID), 0o440); err != nil {
 		return false, csr, err
 	}
-	if err := host.writeSystemdDropIns(plan, volumePath, configDirectory, stateDirectory); err != nil {
+	if err := host.writeSystemdDropIns(plan, volumePath, configDirectory, stateDirectory, stagingPath); err != nil {
 		return false, csr, err
 	}
 	return true, csr, nil
@@ -410,15 +422,11 @@ func (host *Host) openVolumeDirectory(volumeID string, create bool) (int, error)
 	if !cellplan.ValidID(volumeID) {
 		return -1, ErrInvalid
 	}
-	rootFD, err := unix.Open(host.cfg.CellRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	rootFD, err := host.openCellRoot()
 	if err != nil {
 		return -1, err
 	}
 	defer unix.Close(rootFD)
-	var fs unix.Statfs_t
-	if err := unix.Fstatfs(rootFD, &fs); err != nil || uint64(fs.Type) != xfsMagic {
-		return -1, errors.New("cellhost: cell root is not XFS")
-	}
 	if create {
 		if err := unix.Mkdirat(rootFD, volumeID, 0o700); err != nil && !errors.Is(err, unix.EEXIST) {
 			return -1, err
@@ -430,22 +438,249 @@ func (host *Host) openVolumeDirectory(volumeID string, create bool) (int, error)
 	})
 }
 
-func verifyProvisionedVolume(fd int, plan cellplan.VolumePlan) error {
-	var attributes fsXAttr
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), fsIOCFSGetXattr, uintptr(unsafe.Pointer(&attributes))); errno != 0 {
-		return fmt.Errorf("cellhost: query XFS project identity: %w", errno)
+func (host *Host) openCellRoot() (int, error) {
+	rootFD, err := unix.Open(host.cfg.CellRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, err
 	}
-	if attributes.ProjectID != plan.ProjectID || attributes.XFlags&fsXFlagProjInherit == 0 {
-		return fmt.Errorf("cellhost: XFS project isolation mismatch: got project=%d inherit=%t, want project=%d inherit=true",
-			attributes.ProjectID, attributes.XFlags&fsXFlagProjInherit != 0, plan.ProjectID)
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(rootFD, &filesystem); err != nil || uint64(filesystem.Type) != xfsMagic {
+		_ = unix.Close(rootFD)
+		return -1, errors.New("cellhost: cell root is not XFS")
+	}
+	var rootStat, parentStat unix.Stat_t
+	if err := unix.Fstat(rootFD, &rootStat); err != nil {
+		_ = unix.Close(rootFD)
+		return -1, err
+	}
+	if err := unix.Stat(filepath.Dir(host.cfg.CellRoot), &parentStat); err != nil {
+		_ = unix.Close(rootFD)
+		return -1, err
+	}
+	if rootStat.Dev == parentStat.Dev {
+		_ = unix.Close(rootFD)
+		return -1, errors.New("cellhost: cell root is not a dedicated XFS mountpoint")
+	}
+	return rootFD, nil
+}
+
+func (host *Host) openWriteStaging(volumeID string) (int, error) {
+	if !cellplan.ValidID(volumeID) {
+		return -1, ErrInvalid
+	}
+	rootFD, err := host.openCellRoot()
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(rootFD)
+	controlFD, err := openDirectoryAt(rootFD, ".portablefs-control")
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(controlFD)
+	if err := verifyRootControlDirectory(controlFD); err != nil {
+		return -1, err
+	}
+	volumeControlFD, err := openDirectoryAt(controlFD, volumeID)
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(volumeControlFD)
+	if err := verifyRootControlDirectory(volumeControlFD); err != nil {
+		return -1, err
+	}
+	return openDirectoryAt(volumeControlFD, "write-staging")
+}
+
+func (host *Host) ensureWriteStaging(ctx context.Context, plan cellplan.VolumePlan) (string, error) {
+	if !cellplan.ValidID(plan.VolumeID) {
+		return "", ErrInvalid
+	}
+	rootFD, err := host.openCellRoot()
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(rootFD)
+	controlFD, err := ensureRootDirectoryAt(rootFD, ".portablefs-control", 0o711)
+	if err != nil {
+		return "", fmt.Errorf("cellhost: prepare control root: %w", err)
+	}
+	defer unix.Close(controlFD)
+	volumeControlFD, err := ensureRootDirectoryAt(controlFD, plan.VolumeID, 0o711)
+	if err != nil {
+		return "", fmt.Errorf("cellhost: prepare volume control root: %w", err)
+	}
+	defer unix.Close(volumeControlFD)
+
+	const stagingName = "write-staging"
+	stagingFD, err := openDirectoryAt(volumeControlFD, stagingName)
+	if errors.Is(err, unix.ENOENT) {
+		const prepareName = ".write-staging.prepare"
+		prepareFD, prepareErr := ensureRootDirectoryAt(volumeControlFD, prepareName, 0o700)
+		if prepareErr != nil {
+			return "", fmt.Errorf("cellhost: prepare write staging transaction: %w", prepareErr)
+		}
+		if emptyErr := requireEmptyDirectory(prepareFD); emptyErr != nil {
+			_ = unix.Close(prepareFD)
+			return "", emptyErr
+		}
+		preparePath := filepath.Join(host.cfg.CellRoot, ".portablefs-control", plan.VolumeID, prepareName)
+		projectCommand := fmt.Sprintf("project -s -p %s %d", preparePath, plan.ProjectID)
+		projectArguments := transientArguments(
+			"portablefs-xfs-staging-"+plan.VolumeID, host.cfg.XFSQuotaBinary,
+			[]string{"-x", "-c", projectCommand, host.cfg.CellRoot},
+			"CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN", false,
+		)
+		if output, runErr := host.cfg.Runner.Run(ctx, host.cfg.SystemdRunBinary, projectArguments...); runErr != nil {
+			_ = unix.Close(prepareFD)
+			return "", commandError("assign write staging XFS project", output, runErr)
+		}
+		if verifyErr := verifyProjectDirectory(prepareFD, plan, 0, 0, 0o700, "prepared write staging"); verifyErr != nil {
+			_ = unix.Close(prepareFD)
+			return "", verifyErr
+		}
+		if syncErr := unix.Fsync(prepareFD); syncErr != nil {
+			_ = unix.Close(prepareFD)
+			return "", syncErr
+		}
+		_ = unix.Close(prepareFD)
+		if renameErr := unix.Renameat2(volumeControlFD, prepareName, volumeControlFD, stagingName, unix.RENAME_NOREPLACE); renameErr != nil && !errors.Is(renameErr, unix.EEXIST) {
+			return "", renameErr
+		}
+		if syncErr := unix.Fsync(volumeControlFD); syncErr != nil {
+			return "", syncErr
+		}
+		stagingFD, err = openDirectoryAt(volumeControlFD, stagingName)
+	}
+	if err != nil {
+		return "", fmt.Errorf("cellhost: open write staging: %w", err)
+	}
+	defer unix.Close(stagingFD)
+	var stat unix.Stat_t
+	if err := unix.Fstat(stagingFD, &stat); err != nil {
+		return "", err
+	}
+	if !((stat.Uid == 0 && stat.Gid == 0) || (stat.Uid == plan.ServiceUID && stat.Gid == plan.ServiceGID)) {
+		return "", errors.New("cellhost: write staging has an unexpected owner")
+	}
+	if err := verifyProjectIdentityAndQuota(stagingFD, plan, "write staging"); err != nil {
+		return "", err
+	}
+	if err := unix.Fchown(stagingFD, int(plan.ServiceUID), int(plan.ServiceGID)); err != nil {
+		return "", err
+	}
+	if err := unix.Fchmod(stagingFD, 0o700); err != nil {
+		return "", err
+	}
+	if err := verifyProjectDirectory(stagingFD, plan, plan.ServiceUID, plan.ServiceGID, 0o700, "write staging"); err != nil {
+		return "", err
+	}
+	if err := unix.Fsync(stagingFD); err != nil {
+		return "", err
+	}
+	if err := unix.Syncfs(rootFD); err != nil {
+		return "", err
+	}
+	return filepath.Join(host.cfg.CellRoot, ".portablefs-control", plan.VolumeID, stagingName), nil
+}
+
+func openDirectoryAt(parentFD int, name string) (int, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		return -1, ErrInvalid
+	}
+	return unix.Openat2(parentFD, name, &unix.OpenHow{
+		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
+	})
+}
+
+func ensureRootDirectoryAt(parentFD int, name string, mode uint32) (int, error) {
+	if err := unix.Mkdirat(parentFD, name, mode); err != nil && !errors.Is(err, unix.EEXIST) {
+		return -1, err
+	}
+	fd, err := openDirectoryAt(parentFD, name)
+	if err != nil {
+		return -1, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	if stat.Uid != 0 {
+		_ = unix.Close(fd)
+		return -1, errors.New("cellhost: privileged control directory is not root-owned")
+	}
+	if err := unix.Fchown(fd, 0, 0); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	if err := unix.Fchmod(fd, mode); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func verifyRootControlDirectory(fd int) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o711 {
+		return errors.New("cellhost: privileged control directory ownership or mode changed")
+	}
+	return nil
+}
+
+func requireEmptyDirectory(fd int) error {
+	dupFD, err := unix.Dup(fd)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(dupFD), "write-staging-prepare")
+	if directory == nil {
+		_ = unix.Close(dupFD)
+		return errors.New("cellhost: duplicate staging directory returned no file")
+	}
+	defer directory.Close()
+	names, err := directory.Readdirnames(1)
+	if err == nil || len(names) != 0 {
+		return errors.New("cellhost: prepared write staging directory is not empty")
+	}
+	if !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+func verifyProvisionedVolume(fd int, plan cellplan.VolumePlan) error {
+	return verifyProjectDirectory(fd, plan, plan.ServiceUID, plan.ServiceGID, 0o700, "volume")
+}
+
+func verifyProjectDirectory(fd int, plan cellplan.VolumePlan, uid, gid, mode uint32, label string) error {
+	if err := verifyProjectIdentityAndQuota(fd, plan, label); err != nil {
+		return err
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return err
 	}
-	if stat.Uid != plan.ServiceUID || stat.Gid != plan.ServiceGID || stat.Mode&0o777 != 0o700 {
-		return fmt.Errorf("cellhost: volume ownership/mode mismatch: got %d:%d %#o, want %d:%d 0700",
-			stat.Uid, stat.Gid, stat.Mode&0o777, plan.ServiceUID, plan.ServiceGID)
+	if stat.Uid != uid || stat.Gid != gid || stat.Mode&0o777 != mode {
+		return fmt.Errorf("cellhost: %s ownership/mode mismatch: got %d:%d %#o, want %d:%d %#o",
+			label, stat.Uid, stat.Gid, stat.Mode&0o777, uid, gid, mode)
+	}
+	return nil
+}
+
+func verifyProjectIdentityAndQuota(fd int, plan cellplan.VolumePlan, label string) error {
+	var attributes fsXAttr
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), fsIOCFSGetXattr, uintptr(unsafe.Pointer(&attributes))); errno != 0 {
+		return fmt.Errorf("cellhost: query %s XFS project identity: %w", label, errno)
+	}
+	if attributes.ProjectID != plan.ProjectID || attributes.XFlags&fsXFlagProjInherit == 0 {
+		return fmt.Errorf("cellhost: %s XFS project isolation mismatch: got project=%d inherit=%t, want project=%d inherit=true",
+			label, attributes.ProjectID, attributes.XFlags&fsXFlagProjInherit != 0, plan.ProjectID)
 	}
 	var filesystem unix.Statfs_t
 	if err := unix.Fstatfs(fd, &filesystem); err != nil {
@@ -456,13 +691,13 @@ func verifyProvisionedVolume(fd int, plan cellplan.VolumePlan) error {
 	}
 	reportedBytes := filesystem.Blocks * uint64(filesystem.Bsize)
 	if reportedBytes != plan.QuotaBytes || filesystem.Files != plan.QuotaInodes {
-		return fmt.Errorf("cellhost: XFS hard quota mismatch: got bytes=%d inodes=%d, want bytes=%d inodes=%d",
-			reportedBytes, filesystem.Files, plan.QuotaBytes, plan.QuotaInodes)
+		return fmt.Errorf("cellhost: %s XFS hard quota mismatch: got bytes=%d inodes=%d, want bytes=%d inodes=%d",
+			label, reportedBytes, filesystem.Files, plan.QuotaBytes, plan.QuotaInodes)
 	}
 	return nil
 }
 
-func (host *Host) writeSystemdDropIns(plan cellplan.VolumePlan, volumePath, configPath, statePath string) error {
+func (host *Host) writeSystemdDropIns(plan cellplan.VolumePlan, volumePath, configPath, statePath, stagingPath string) error {
 	serviceDirectory := filepath.Join(host.cfg.SystemdUnitRoot, "portablefs-authority@"+plan.VolumeID+".service.d")
 	socketDirectory := filepath.Join(host.cfg.SystemdUnitRoot, "portablefs-authority@"+plan.VolumeID+".socket.d")
 	if err := ensureManagedDirectory(serviceDirectory, 0, 0, 0o755); err != nil {
@@ -471,12 +706,16 @@ func (host *Host) writeSystemdDropIns(plan cellplan.VolumePlan, volumePath, conf
 	if err := ensureManagedDirectory(socketDirectory, 0, 0, 0o755); err != nil {
 		return err
 	}
-	service := fmt.Sprintf("[Service]\nUser=%d\nGroup=%d\nBindPaths=%s:/srv/portablefs-volume\nBindReadOnlyPaths=%s:/run/portablefs-volume\nBindPaths=%s:/var/lib/portablefs-volume\n", plan.ServiceUID, plan.ServiceGID, volumePath, configPath, statePath)
+	service := authorityServiceDropIn(plan, volumePath, configPath, statePath, stagingPath)
 	socket := fmt.Sprintf("[Socket]\nListenStream=\nListenStream=0.0.0.0:%d\n", plan.ListenPort)
 	if err := writeAtomic(filepath.Join(serviceDirectory, "10-portablefs.conf"), []byte(service), 0, 0, 0o644); err != nil {
 		return err
 	}
 	return writeAtomic(filepath.Join(socketDirectory, "10-portablefs.conf"), []byte(socket), 0, 0, 0o644)
+}
+
+func authorityServiceDropIn(plan cellplan.VolumePlan, volumePath, configPath, statePath, stagingPath string) string {
+	return fmt.Sprintf("[Service]\nUser=%d\nGroup=%d\nBindPaths=%s:/srv/portablefs-volume\nBindReadOnlyPaths=%s:/run/portablefs-volume\nBindPaths=%s:/var/lib/portablefs-volume\nBindPaths=%s:/var/lib/portablefs-write-staging\n", plan.ServiceUID, plan.ServiceGID, volumePath, configPath, statePath, stagingPath)
 }
 
 func (host *Host) start(ctx context.Context, plan cellplan.VolumePlan) error {

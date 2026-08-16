@@ -99,6 +99,7 @@ REQUIRED_TESTS=(
 # module, renamed test, or accidental skip from masquerading as qualification.
 REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelRefusesStackingExportAndLoopBacking"
+  "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota"
 )
 
 fail() {
@@ -114,29 +115,32 @@ run_host() {
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
-  local -a host_kernel_mounts=()
-  if [[ -d /lib/modules/$(uname -r) ]]; then
-    host_kernel_mounts=(-v /lib/modules:/lib/modules:ro)
-  fi
   echo "xfs-fuse-integration: launching ${PORTABLEFS_CI_IMAGE}"
   # The working tree is mounted read-only: the container provisions its own XFS
   # image and must never be able to mutate the checkout it is testing.
-  docker run --rm --privileged \
-    --tmpfs /var/tmp:exec,mode=1777 \
-    -v "${root}/vcs:/work/vcs:ro" \
-    -v "${root}/scripts:/work/scripts:ro" \
-    -v "${root}/kernel/linux-6.12.100-portablefs-append:/work/kernel/linux-6.12.100-portablefs-append:ro" \
-    "${host_kernel_mounts[@]}" \
-    -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
-    -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
-    -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
-    -e "PORTABLEFS_PROJECT_ID=${PORTABLEFS_PROJECT_ID}" \
-    -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
-    -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
-	-e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
-    -w /work \
-    "${PORTABLEFS_CI_IMAGE}" \
-    bash /work/scripts/xfs-fuse-integration.sh --in-container
+  run_container() {
+    docker run --rm --privileged \
+      --tmpfs /var/tmp:exec,mode=1777 \
+      -v "${root}/vcs:/work/vcs:ro" \
+      -v "${root}/scripts:/work/scripts:ro" \
+      -v "${root}/kernel/linux-6.12.100-portablefs-append:/work/kernel/linux-6.12.100-portablefs-append:ro" \
+      "$@" \
+      -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
+      -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
+      -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
+      -e "PORTABLEFS_PROJECT_ID=${PORTABLEFS_PROJECT_ID}" \
+      -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
+      -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
+      -e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
+      -w /work \
+      "${PORTABLEFS_CI_IMAGE}" \
+      bash /work/scripts/xfs-fuse-integration.sh --in-container
+  }
+  if [[ -d /lib/modules/$(uname -r) ]]; then
+    run_container -v /lib/modules:/lib/modules:ro
+  else
+    run_container
+  fi
 }
 
 install_container_dependencies() {
@@ -202,6 +206,9 @@ run_suite() {
     GOFLAGS=-mod=readonly \
     PORTABLEFS_XFS_TEST_ROOT="$volume" \
     PORTABLEFS_XFS_TEST_PROJECT="$PORTABLEFS_PROJECT_ID" \
+    PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
+    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
+    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
     PORTABLEFS_XFS_TEST_CELL=/srv/portablefs \
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_WORKLOAD_TEST=1 \
@@ -219,7 +226,9 @@ run_suite() {
 
 run_root_boundary_suite() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
-  local log=/var/tmp/portablefs-root-boundary.log
+  local log=/var/tmp/portablefs-kernel-boundary.log
+  local cellhost_log=/var/tmp/portablefs-cellhost-boundary.log
+  local combined_log=/var/tmp/portablefs-root-boundary.log
   local status=0
   # Load the only optional module before dropping to the production uid.  The
   # test process then receives CAP_SYS_ADMIN plus DAC_OVERRIDE for the
@@ -253,8 +262,33 @@ run_root_boundary_suite() {
   status=$?
   set -e
   cat -- "$log"
-  [[ $status -eq 0 ]] || fail "root kernel-boundary test exited $status" "$status"
-  verify_exact_tests "$log" "${REQUIRED_ROOT_TESTS[@]}"
+  [[ $status -eq 0 ]] || fail "kernel backing-boundary test exited $status" "$status"
+
+  # Write-staging creation is the cell helper's root-only responsibility, not a
+  # capability of the authority service identity. Run that exact boundary as
+  # root against the same provisioned XFS cell while retaining the production
+  # service UID/GID as the directory ownership being verified.
+  set +e
+  env -i \
+    HOME=/root \
+    PATH=/usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TMPDIR=/var/tmp \
+    GOCACHE=/var/tmp/portablefs-cellhost-gocache \
+    GOMODCACHE=/home/portablefs/gomodcache \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=readonly \
+    PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
+    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
+    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
+    -run '^TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota$' \
+    ./internal/cellhost >"$cellhost_log" 2>&1
+  status=$?
+  set -e
+  cat -- "$cellhost_log"
+  [[ $status -eq 0 ]] || fail "root cell-helper boundary test exited $status" "$status"
+  cat "$log" "$cellhost_log" >"$combined_log"
+  verify_exact_tests "$combined_log" "${REQUIRED_ROOT_TESTS[@]}"
   echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
 }
 

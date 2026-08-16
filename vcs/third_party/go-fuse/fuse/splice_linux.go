@@ -31,6 +31,15 @@ func (s *Server) setSplice() {
 // would carry the wrong total length, so we return an error and let the
 // caller fall back to a Pread-based path.
 func (ms *Server) trySplice(req *request, readResult ReadResult) error {
+	// Classify the result before acquiring or growing a pipe. In-memory
+	// ReadResultData has no descriptor to splice; attempting to provision a
+	// payload-sized pipe first is pure overhead and, for a full 1 MiB FUSE read,
+	// exceeds the common 1 MiB pipe ceiling once the response header is added.
+	// Keep byte results on the existing writer-stage writev path and reserve
+	// splice for results that can actually supply a descriptor.
+	if !readResultCanSplice(readResult) {
+		return errRecoverSplice
+	}
 	// The caller (handleRequest) already called req.serializeHeader with
 	// readResult.Size(), so req.outHeaderBuf is correct for the optimistic case.
 	total := len(req.outHeaderBuf) + len(req.outDataBuf) + readResult.Size()
@@ -96,6 +105,14 @@ func (ms *Server) trySplice(req *request, readResult ReadResult) error {
 	// Write header + payload to /dev/fuse.
 	_, err = pair.WriteTo(uintptr(ms.mountFd), total)
 	return err
+}
+
+func readResultCanSplice(readResult ReadResult) bool {
+	if _, ok := readResult.(seekableResult); ok {
+		return true
+	}
+	_, ok := readResult.(statefulResult)
+	return ok
 }
 
 type pipeReadResult struct {

@@ -128,14 +128,17 @@ before reporting a green one. See
 
 ### macOS
 
-Shipping macOS builds currently refuse a protocol-5 FSKit mount before
-constructing an authority transport or sending Attach. Current public FSKit has
-no exact peer namespace/attribute invalidation primitive, and the legacy macOS
-26 callback result shapes cannot publish the complete post-mutation attributes
-the source side requires. There is no runtime opt-in, `uncached` mode, or weaker
-fallback. A separately build-stamped qualification artifact may exercise the
-candidate native-revocation policy, but that artifact is not production
-support. The evidence and remaining platform gates are in
+Shipping macOS 26 builds admit the named
+`macos26-synchronous-vfs-repair-v2` best-effort policy. The Mac owns an
+exclusive compatibility writer lease while mounted; Linux peers may read but
+receive `EBUSY` for visible mutations, and another Mac writer is refused. A
+clean unmount transfers ownership. Authority ordering, terminal delivery,
+durability, and fail-closed repair remain exact, while FSKit's missing exact
+peer namespace/attribute invalidation is an explicit platform limit. There is
+no runtime opt-in, `uncached` mode, hidden retry, or fallback. A separately
+build-stamped macOS 27 artifact may exercise the candidate native-revocation
+policy, but that artifact is not product support. The evidence and remaining
+platform gates are in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 ### Shared file-backed mmap is unsupported, not incoherent

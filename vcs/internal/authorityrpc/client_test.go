@@ -59,7 +59,7 @@ func coherentTestClientConfig(address string, clientTLS *tls.Config, volumeID st
 		CancelDrainTimeout: time.Second, MaxInFlight: maxInFlight,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 128, RepairBudget: time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	}
 }
@@ -103,7 +103,7 @@ func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 3,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 128, RepairBudget: time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -209,7 +209,7 @@ func TestClientReauthorizationInstallsOnlyAValidatedReplacementCertificate(t *te
 		CancelDrainTimeout: time.Second, MaxInFlight: 4,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 128, RepairBudget: time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -371,7 +371,7 @@ func TestStrictClientReservesAnIndependentVisibilityLane(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -404,7 +404,7 @@ func TestStrictClientRequiresExactParentRepairSemantics(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err == nil {
@@ -425,7 +425,7 @@ func TestClientRefusesLegacyHelloBeforeAttachSideEffects(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err == nil {
@@ -632,7 +632,7 @@ func strictCleanupClientConfig(address string, clientTLS *tls.Config, observer f
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 128, RepairBudget: time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: observer,
 	}
 }
@@ -892,7 +892,7 @@ func TestBlockedVisibilityReportCarriesExactParentsAndKeepsSessionLive(t *testin
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -970,7 +970,7 @@ func TestStrictClientMustDeclareItsCacheContract(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	}
 	for _, missing := range []ClientConfig{
@@ -1012,8 +1012,8 @@ func TestStrictClientMustDeclareItsCacheContract(t *testing.T) {
 		t.Fatalf("attach carried capacity %d budget %dms, want 4096 and 2000",
 			attach.GetCachedNameCapacity(), attach.GetRepairBudgetMillis())
 	}
-	if attach.GetNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE {
-		t.Fatalf("attach carried namespace repair %v, want PARENT_EXCLUSIVE", attach.GetNamespaceRepair())
+	if attach.GetNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION {
+		t.Fatalf("attach carried namespace repair %v, want LOCKLESS_EXPIRATION", attach.GetNamespaceRepair())
 	}
 	// Every profile declares the topology it runs, so the authority can refuse
 	// a mount that would hide a subtree from its peers.
@@ -1035,7 +1035,7 @@ func TestStrictDetachRequiresSuppliedEvidence(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -1698,7 +1698,7 @@ func TestIdleDataLossReconnectsOnlyDataRole(t *testing.T) {
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
 		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		CachedNameCapacity: 128, RepairBudget: time.Second,
-		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		NamespaceRepair:              authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {

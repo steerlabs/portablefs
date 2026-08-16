@@ -8,11 +8,13 @@ work.
 The model in one paragraph: a volume is a workspace that lives in the network,
 not a folder on one machine. One XFS authority owns its durable state, so every
 mount — laptop, server, sandbox — is a window onto the same ordered filesystem.
-Linux production writes are direct. Shipping macOS builds currently refuse a
-production mount before Attach; separately build-stamped qualification builds
-use `fsync` when they need an explicit cross-machine completion boundary. There
-is no history graph, no branch, no snapshot and no fork: there is the current
-state of the workspace, and every machine that mounts it sees exactly that.
+Linux production writes are direct and provide the exact shared-mutation tier.
+Shipping macOS 26 builds provide the named best-effort FSKit tier, own the
+compatibility writer lease while mounted, and use `fsync` plus clean unmount
+for an explicit durability and handoff boundary. There is no
+history graph, no branch, no snapshot and no fork: there is the current state
+of the workspace. Sustained simultaneous mutation, distributed locks, and
+atomic cross-client append remain Linux-only.
 Machines are disposable; the workspace is not.
 
 ## Continuity: The Workspace Outlives The Session
@@ -37,21 +39,23 @@ portablefs mount refactor-auth /srv/work \
 cd /srv/work    # same files, same git state, same half-finished edit
 ```
 
-The handoff is safe with no barrier discipline at all, and that is the whole
-point:
+Linux-to-Linux handoff needs no extra barrier discipline. A handoff away from a
+macOS 26 writer uses `fsync` followed by a clean unmount so the authority can
+release its writer lease:
 
 - **There is no PortableFS durability debt.** A v3 mount holds no daemon WAL or
   offline tail. Linux direct writes return after XFS application. In the macOS
-  qualification policy, ordinary kernel page-cache semantics remain, so an
+  best-effort policy, ordinary kernel page-cache semantics remain, so an
   agent that needs a handoff or durability boundary calls `fsync`, which waits
   for the authoritative server descriptor. `close` alone is not that boundary.
 - **There is no stale handover, because there is no second truth.** Both mounts
   are windows onto the same live authority. Names and attributes are cached only
   while every mount participates in the authority's synchronous visibility
-  barrier: a mutation that returned on one mount is not observable as older
-  state on another. A writer installs its exact source-publication gate before
-  dispatch, and peers repair before that writer's result is released. Protocol
-  5 has no non-participating mount mode.
+  barrier on exact Linux clients. A writer installs its source-publication gate
+  before dispatch, and peers repair before that writer's result is released.
+  macOS 26 performs synchronous best-effort source publication. While it is
+  mounted, another client's visible mutation returns `EBUSY`; unmount the Mac
+  before transferring write ownership.
 
 For scheduled or resumable agents, make the mount the first step of the job and
 the unmount the last; the workspace carries all state between runs, including
@@ -63,7 +67,7 @@ patched Linux 6.12.100 kernel; a stock-kernel refusal is expected.
 
 An initial mount capability is single-use. A hosted mount that explicitly opts
 into automatic reauthorization also receives a bounded, volume- and key-scoped
-enrollment. The Linux mount supervisor or the macOS qualification daemon then
+enrollment. The Linux mount supervisor or the macOS daemon then
 obtains and installs short-lived grants automatically without remounting; there
 is one sequencer per mount and the filesystem session, locks, handles, and
 strict-cache membership stay intact. A definitive denial or missed safety

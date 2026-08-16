@@ -51,7 +51,8 @@ func (s *Server) acceptTransportHello(
 	hello := request.GetHello()
 	if request.GetRequestId() == 0 || hello == nil || request.GetBody() == nil ||
 		len(request.GetEpoch()) != 0 || request.GetSession() != nil || request.GetMutation() != nil ||
-		request.GetFrontendOperationId() != 0 || request.GetSourcePublicationGate() != nil {
+		request.GetFrontendOperationId() != 0 || request.GetSourcePublicationGate() != nil ||
+		request.GetVisibilityRetryAfterSequence() != 0 {
 		return nil, nil, fmt.Errorf("%w: first frame must be a bare nonzero Hello", ErrTransportBinding)
 	}
 	if !validTransportRole(hello.GetRole()) {

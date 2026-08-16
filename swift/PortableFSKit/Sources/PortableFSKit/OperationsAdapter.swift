@@ -210,11 +210,35 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     private var volumes: [String: PortableFSVolume] = [:]
     private let moduleIdentity: PortableFSModuleIdentity
     private let resolverFactory: @Sendable () -> PfsSocketPathResolver
-    private let volumeFactory: VolumeFactory
-    private let admitsQualificationMounts: Bool
+    private let volumeFactory: VolumeFactory?
 
     public override convenience init() {
         self.init(moduleIdentity: Self.mainBundleIdentity())
+    }
+
+    /// The supported macOS 26 product composition.
+    ///
+    /// This is deliberately named rather than inferred from the host version:
+    /// the signed application chooses the declared best-effort cache tier at
+    /// build time, while the generic adapter initializer remains unconfigured.
+    /// The authority still enforces protocol-5 ordering and the mount still
+    /// fails closed if synchronous VFS repair cannot complete.
+    public static func macOS26BestEffort() -> PortableFSFileSystem {
+        PortableFSFileSystem(
+            moduleIdentity: Self.mainBundleIdentity(),
+            resolverFactory: { PfsSocketPathResolver(bundle: .main) },
+            volumeFactory: { socketPath, attachRef, moduleIdentity in
+                let core = try await VolumeCore.connect(
+                    socketPath: socketPath,
+                    attachRef: attachRef
+                )
+                return try await PortableFSVolume.make(
+                    core: core,
+                    attachRef: attachRef,
+                    moduleIdentity: moduleIdentity
+                )
+            }
+        )
     }
 
     /// Source-compatible initializer for embedders that customize only
@@ -253,19 +277,13 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     ) {
         self.moduleIdentity = moduleIdentity
         self.resolverFactory = resolverFactory
-        self.volumeFactory = { _, _, _ in
-            throw PfsLocalClientError.daemon(
-                errno: ENOTSUP,
-                message: "PortableFS protocol-5 macOS mounting is not production-admitted: current FSKit has no exact peer namespace or attribute invalidation primitive"
-            )
-        }
-        self.admitsQualificationMounts = false
+        self.volumeFactory = nil
         super.init()
     }
 
-    /// Explicit composition seam for separately signed qualification targets
-    /// and unit tests. Shipping extensions use the initializer above and can
-    /// never reach this transport-owning factory.
+    /// Explicit composition seam for a signed product adapter or unit test.
+    /// Shipping macOS 26 extensions use `macOS26BestEffort()` so the cache tier
+    /// remains visible at the call site instead of becoming a runtime fallback.
     public init(
         moduleIdentity: PortableFSModuleIdentity,
         resolverFactory: @escaping @Sendable () -> PfsSocketPathResolver = {
@@ -276,7 +294,6 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         self.moduleIdentity = moduleIdentity
         self.resolverFactory = resolverFactory
         self.volumeFactory = volumeFactory
-        self.admitsQualificationMounts = true
         super.init()
     }
 
@@ -311,10 +328,10 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         let reply = PfsLoadResourceReply(replyHandler)
         do {
             let attachRef = try attachRef(from: resource)
-            guard admitsQualificationMounts else {
+            guard let volumeFactory else {
                 throw PfsLocalClientError.daemon(
                     errno: ENOTSUP,
-                    message: "PortableFS protocol-5 macOS mounting is not production-admitted: current FSKit has no exact peer namespace or attribute invalidation primitive; no local or authority transport was opened"
+                    message: "this FSKit adapter has no product cache tier configured; no local or authority transport was opened"
                 )
             }
             Task(priority: .userInitiated) {
